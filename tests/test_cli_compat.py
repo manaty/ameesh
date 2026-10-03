@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Compatibilité v0 : commandes et surtout JSON des hooks, à l'octet près."""
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """work_items — la machine à états des lots, reprise de l'IMA (spec §5 point 4).
 
     intake → build → qa → merged → promoted

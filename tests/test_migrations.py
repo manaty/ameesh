@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Migrations versionnées : application, idempotence, immuabilité."""
 from __future__ import annotations
 

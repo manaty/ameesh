@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Registre et baux : course, expiration, fencing, consignes en attente."""
 from __future__ import annotations
 

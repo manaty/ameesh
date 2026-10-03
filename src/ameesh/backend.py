@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Les deux backends de la CLI : Postgres (nominal) et fichiers (repli v0).
 
 Le repli fichier écrit exactement là où la v0 écrit

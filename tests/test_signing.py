@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Ed25519 : vecteurs RFC 8032, falsifications, backends, clés sur disque.
 
 La clé de test est éphémère et locale au test. La clé réelle du propriétaire
