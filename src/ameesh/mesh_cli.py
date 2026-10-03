@@ -16,6 +16,8 @@
   agent-mesh import-v0 [--agents a,b] [--dry-run]     bascule : boîte fichier v0 → Postgres
   agent-mesh export-v0 [--agents a,b] [--keep]        retour arrière : Postgres → boîte v0
   agent-mesh migrate | doctor [--notify-test]
+  agent-mesh canon check|show|sync [--json] [--host H]   canon OKF (spec §4)
+  agent-mesh agent spawn <nom> --by <créateur> --ttl 2h   agent éphémère (R14)
 
 L'autorité du propriétaire ne se déduit jamais d'un texte : elle se prouve par
 une signature Ed25519 dont la clé publique est dans agent_registry, liée au
@@ -134,6 +136,14 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         print("session  : %s" % (row.get("session_id") or "—"))
         print("bail     : %s" % _lease(row))
         print("modèle   : %-9s budget : %s" % (row.get("model") or "—", _budget(row)))
+        print("responsable : %s   équipe : %s%s" % (
+            row.get("responsible") or "aucun (non réclamable si requis)",
+            row.get("team") or "—",
+            "   éphémère créé par %s, échéance %s" % (
+                row.get("created_by") or "?", _fmt_moment(row.get("ephemeral_expires_ts")))
+            if row.get("ephemeral") else ""))
+        if row.get("canon_ref"):
+            print("canon    : %s" % row["canon_ref"])
         print("clé      : %s" % (
             "%s (rôle %s%s)" % (row.get("public_key_fingerprint") or "",
                                 row.get("key_role") or "agent",
@@ -637,6 +647,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc = sub.add_parser("doctor")
     p_doc.add_argument("--notify-test", action="store_true")
     p_doc.set_defaults(func=cmd_doctor)
+
+    from . import canon_cli
+    canon_cli.add_parsers(sub)
     return parser
 
 

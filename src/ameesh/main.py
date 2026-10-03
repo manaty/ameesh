@@ -11,7 +11,9 @@
   ameesh approve | approvals | verify   approbations signées ;
   ameesh work …               lots (work_items) ;
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
-  ameesh migrate | doctor     schéma et diagnostic.
+  ameesh migrate | doctor     schéma et diagnostic ;
+  ameesh canon check|show|sync          canon OKF : validation, fiches, registre ;
+  ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Rien d'autre : ce fichier ne fait que router vers les modules, pour que
 `agent-mail` et `agent-runner` continuent de fonctionner à l'identique.
@@ -23,7 +25,7 @@ import sys
 #: sous-commandes servies par mesh_cli (parseur déjà en place)
 MESH_COMMANDS = (
     "list", "show", "key", "approve", "approvals", "verify", "work",
-    "migrate", "doctor", "import-v0", "export-v0",
+    "migrate", "doctor", "import-v0", "export-v0", "canon", "agent",
 )
 
 
