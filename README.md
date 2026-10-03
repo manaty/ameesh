@@ -7,19 +7,20 @@ signature.
 Spec: [`MESH-SPEC.md`](MESH-SPEC.md). v0 (local, files, still in production):
 `agent-mail.v0.py`, `nexlink-agent.v0.sh` — **not touched by v1**.
 
-## State — v1 points 1 and 2 are built
+## State — v1 points 1 to 5 are built (bench)
 
 | v1 (spec §5) | State |
 |---|---|
 | 1. agent-mail on Postgres (`agent_registry`, `agent_mailbox`, migrations, LISTEN/NOTIFY, CLI compatible v0) | **done** — [`docs/V1-MAILBOX-RUNNER.md`](docs/V1-MAILBOX-RUNNER.md) |
 | 2. one runner per machine, 3 harness adapters with session resume, leases, wake on NOTIFY | **done** — same document |
-| 3. owner authority by Ed25519 signature through the governance gate | not started (`signature` columns are in place) |
-| 4. board stays in git, `work_items` tracks packages | not started (IMA side) |
-| 5. `mesh list` observability | partly: `agent-mail list` shows host, lease, unread, budget; the `agent_mesh_overview` view is ready |
+| 3. owner authority by Ed25519 signature, content- and expiry-bound; approvals with single use | **done** — [`docs/V1-AUTORITE-MESH.md`](docs/V1-AUTORITE-MESH.md) |
+| 4. `work_items` state machine (intake → build → qa → merged → promoted, + blocked/waiting_human), loop bound, event ledger | **done**; the board stays in git |
+| 5. `mesh list` observability | **done** — `agent-mesh list` / `show`, on `agent_mesh_overview` |
 
 Nothing is wired to the real agents yet: v1 runs on a **test bench** (fake
 harnesses, a local Postgres container). `~/.local/bin/agent-mail` and the v0
-scripts are untouched.
+scripts are untouched. The switch is described step by step, with rollback, in
+[`docs/BASCULE.md`](docs/BASCULE.md) — to be executed with the owner.
 
 ## Quickstart (bench)
 
@@ -37,7 +38,16 @@ python3 -m agent_mesh.runner --max-turns 1
 
 # talk to it
 python3 -m agent_mesh send deepseek7 "ton lot a bougé"
-python3 -m agent_mesh list
+python3 -m agent_mesh list            # mesh list: host, lease, unread, budget, key
+
+# owner authority (test key only on the bench — the real key is the owner's act)
+python3 -m agent_mesh.mesh_cli key generate --out /tmp/cles --name test --i-am-the-owner
+python3 -m agent_mesh.mesh_cli key register proprietaire --public-key /tmp/cles/test.pub
+python3 -m agent_mesh.cli send deepseek7 "décision" --sign --key /tmp/cles/test.key --expires 12h
+
+# work items
+python3 -m agent_mesh.mesh_cli work add --title "un lot" --app nexlink --assignee deepseek7
+python3 -m agent_mesh.mesh_cli work list
 ```
 
 Repo-local wrappers: `bin/agent-mail`, `bin/agent-runner`, `bin/agent-mesh`
@@ -63,6 +73,19 @@ agent-mail doctor [--notify-test]              # pilote, schéma, migrations, LI
 If Postgres is unreachable, the CLI falls back to the v0 file mailbox
 (`~/.local/state/agent-mail`) with a readable warning on stderr; hooks fall back
 silently and never fail the agent.
+
+`agent-mesh` (observability, authority, work items):
+
+```
+agent-mesh list [--json] | show <agent>
+agent-mesh key generate --out DIR --i-am-the-owner     # owner's act, never an agent
+agent-mesh key register <agent> --public-key FICHIER | key show|list|revoke <agent>
+agent-mesh approve --key FICHIER --action A --hash H [--kind K] [--expires 48h]
+agent-mesh approvals [--action A] [--hash H] | verify --action A --hash H [--consume]
+agent-mesh work add|list|show|move|note …
+agent-mesh import-v0 | export-v0                       # v0 → Postgres and back
+agent-mesh migrate | doctor [--notify-test]
+```
 
 `agent-runner`:
 
@@ -90,12 +113,16 @@ scripts/test.sh                      # starts the container, runs the suite twic
 scripts/test.sh tests.test_runner    # one module
 ```
 
-63 tests against the local container: migrations and immutability, mailbox and
-LISTEN/NOTIFY round trips, lease races on 2 and 4 concurrent connections,
-**two runner processes competing for the same lease**, lease expiry takeover,
-fencing of a stale runner, notification waking a runner in service mode, the
-three adapters (argv + session resume, via fake harness binaries that never call
-the real CLIs), v0 hook-JSON equality, and the file fallback.
+110 tests against the local container, run twice (`psql`, then `psycopg` with
+`cryptography`): migrations and immutability, mailbox and LISTEN/NOTIFY round
+trips, lease races on 2 and 4 concurrent connections, **two runner processes
+competing for the same lease**, lease expiry takeover, fencing of a stale
+runner, notification waking a runner in service mode, the three adapters (argv +
+session resume, via fake harness binaries that never call the real CLIs), v0
+hook-JSON equality, the file fallback, RFC 8032 vectors, **OpenSSL cross-check**
+of the Ed25519 implementation, signed/unsigned/tampered/expired messages,
+approval single use, `mesh list`, the work_items state machine and its loop
+bound, and v0 import/export.
 
 ## Layout
 
@@ -108,7 +135,11 @@ src/agent_mesh/
   registry.py     agent_registry: presence, leases, prompts, budget
   mail.py         agent_mailbox: send, unread, deliver, history
   migrations.py   NNNN_name.sql, checksummed, advisory-locked
-  migrations/     0001_init.sql, 0002_overview.sql
+  migrations/     0001_init.sql … 0004_work_items.sql
+  mesh_cli.py     agent-mesh: mesh list, keys, approvals, work items, import/export v0
+  authority.py    Ed25519 proofs bound to content and expiry; approvals
+  signing.py      Ed25519 (pure RFC 8032 + optional cryptography/nacl), key files
+  work.py         work_items state machine, loop bound, event ledger
   backend.py      Postgres backend + v0 file fallback
   identity.py     v0 alias/name resolution (shared aliases.tsv)
 tests/            unittest suite + fakebin/ fake harnesses

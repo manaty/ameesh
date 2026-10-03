@@ -225,11 +225,9 @@ les sessions réelles.
   remplaçant `nexlink-agent` par `agent-runner` — outil par outil.
 * **Un agent reste épinglé à son hôte** (v1) : déplacer une session est un
   chantier séparé (R1/R5).
-* **L'autorité du propriétaire (R4)** n'est pas encore prouvée : les colonnes
-  `signature`/`signature_key` sont là, la vérification Ed25519 viendra avec la
-  porte de gouvernance d'IMA (point 3).
-* **`mesh list`** (point 5) n'est pas encore une commande : la vue
-  `agent_mesh_overview` et `agent-mail list` en tiennent lieu.
+* **L'autorité du propriétaire (R4)** et **`mesh list`** sont traités dans
+  [`V1-AUTORITE-MESH.md`](V1-AUTORITE-MESH.md) (points 3 à 5), avec
+  `signing.py`, `authority.py` et `mesh_cli.py`.
 * **Budget** : `budget_usd` / `spent_usd` sont stockés et alimentés quand le
   harnais annonce un coût ; le contrôle (refuser un tour au-delà du budget)
   n'est pas implémenté.

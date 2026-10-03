@@ -3,7 +3,7 @@ PYTHON ?= python3
 export PYTHONPATH := src$(if $(PYTHONPATH),:$(PYTHONPATH))
 export AGENT_MESH_DSN ?= postgresql://agent_mesh:agent_mesh@127.0.0.1:55432/agent_mesh
 
-.PHONY: help pg-up migrate doctor test list clean-schemas
+.PHONY: help pg-up migrate doctor test list mesh-list keys work clean-schemas
 
 help:
 	@sed -n '1,20p' Makefile
@@ -20,8 +20,17 @@ doctor:            ## diagnostic complet (pilote, schéma, LISTEN/NOTIFY)
 test:              ## suite complète, deux pilotes (psql puis psycopg)
 	./scripts/test.sh
 
-list:              ## agents connus, hôte, bail, non lus
+list:              ## agents connus, hôte, bail, non lus (vue v0-compatible)
 	$(PYTHON) -m agent_mesh list
+
+mesh-list:         ## mesh list : statut, bail, budget, clé
+	$(PYTHON) -m agent_mesh.mesh_cli list
+
+keys:              ## clés publiques enregistrées
+	$(PYTHON) -m agent_mesh.mesh_cli key list
+
+work:              ## lots en cours
+	$(PYTHON) -m agent_mesh.mesh_cli work list
 
 clean-schemas:     ## supprime les schémas de test restants (t_*)
 	@psql "$(AGENT_MESH_DSN)" -X -A -t -c \
