@@ -11,8 +11,7 @@ generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:30:00+02:00" 
 
 | # | Question | Recommandation de mesh-design |
 |---|---|---|
-| Q1 (ex-M3) | Quel Postgres durable ? La question change de nature : si Nexlink ou une messagerie porte les messages, ameesh n'a besoin que d'un état d'exécution. | Banc local tant qu'aucun agent réel n'est branché ; décider après le modèle de données v2. |
-| Q2 (ex-M4) | Première machine en plus du PC. | Un petit VPS, avec d'abord les agents DeepSeek (clé d'API, pas d'identifiants d'abonnement sur un serveur). Toute dépense attend l'accord du propriétaire. |
+| Q1 (ex-M3) | Quelle base pour l'état d'exécution ? Elle suit désormais le profil d'hébergement ([0011](decisions/0011-hebergement-configurable.md)) ; reste à savoir si le profil local peut se contenter de SQLite (pas de LISTEN/NOTIFY). | Postgres partout pour la v1 ; SQLite à étudier pour le profil local. |
 | Q3 | La cérémonie de clé Ed25519 sur le PC est-elle abandonnée au profit d'ameesh-approve (passkey sur le téléphone) ? | Oui : une clé lisible par les agents ne prouve rien. |
 | Q4 | Licence d'ameesh avant le passage public. | À instruire (compatibilité avec les dépendances AGPL éventuelles côté connecteurs). |
 | Q5 | L'orchestrateur Nexlink devient-il un agent à tours (réveillé par sa surveillance) pour pouvoir quitter le PC ? | Oui à terme ; c'est ce qui rend utile une deuxième machine. |

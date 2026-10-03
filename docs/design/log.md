@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-04 (Q2)
+* **Décision** : [hébergement configurable et provisionnement par le harnais de l'utilisateur](decisions/0011-hebergement-configurable.md) ; Q2 close, Q1 reformulée.
+
 ## 2026-10-04 (revue codex3)
 * **Correction** : R8 — pas de délégation d'`approve` aux agents ; approbation permanente bornée signée par un humain.
 * **Correction** : R14 et [0008](decisions/0008-agents-dans-le-canon.md) — un agent éphémère hérite de l'humain responsable de son créateur.
