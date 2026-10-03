@@ -7,14 +7,14 @@ import tempfile
 import unittest
 from unittest import mock
 
-from agent_mesh import adapters
+from ameesh import adapters
 
 from .support import FAKEBIN
 
 
 class AdapterTest(unittest.TestCase):
-    def test_binaires_resolus_par_agent_mesh_bin_dir(self):
-        with mock.patch.dict(os.environ, {"AGENT_MESH_BIN_DIR": FAKEBIN}):
+    def test_binaires_resolus_par_ameesh_bin_dir(self):
+        with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN}):
             for harness in ("claude", "codex", "deepseek"):
                 with self.subTest(harness=harness):
                     adapter = adapters.adapter_for(harness)
@@ -22,8 +22,8 @@ class AdapterTest(unittest.TestCase):
 
     def test_binaire_manquant(self):
         with tempfile.TemporaryDirectory() as vide, \
-                mock.patch.dict(os.environ, {"AGENT_MESH_BIN_DIR": vide, "PATH": vide}):
-            os.environ.pop("AGENT_MESH_CLAUDE_BIN", None)
+                mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": vide, "PATH": vide}):
+            os.environ.pop("AMEESH_CLAUDE_BIN", None)
             with self.assertRaises(adapters.HarnessMissing):
                 adapters.adapter_for("claude")
 
@@ -32,7 +32,7 @@ class AdapterTest(unittest.TestCase):
             adapters.adapter_for("gemini")
 
     def test_lignes_de_commande_claude(self):
-        with mock.patch.dict(os.environ, {"AGENT_MESH_BIN_DIR": FAKEBIN}):
+        with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN}):
             adapter = adapters.adapter_for("claude")
             self.assertEqual(
                 adapter.command("fais X"),
@@ -47,7 +47,7 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(adapter.env(), {"CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"})
 
     def test_lignes_de_commande_codex(self):
-        with mock.patch.dict(os.environ, {"AGENT_MESH_BIN_DIR": FAKEBIN}):
+        with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN}):
             adapter = adapters.adapter_for("codex")
             self.assertEqual(
                 adapter.command("fais X"),
@@ -62,7 +62,7 @@ class AdapterTest(unittest.TestCase):
             )
 
     def test_lignes_de_commande_deepseek(self):
-        with mock.patch.dict(os.environ, {"AGENT_MESH_BIN_DIR": FAKEBIN}):
+        with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN}):
             adapter = adapters.adapter_for("deepseek")
             self.assertEqual(
                 adapter.command("fais X"),
@@ -76,7 +76,7 @@ class AdapterTest(unittest.TestCase):
             self.assertEqual(adapter.env(), {"DSH_PERMISSION_MODE": "danger-full-access"})
 
     def test_lecture_flux_claude(self):
-        with mock.patch.dict(os.environ, {"AGENT_MESH_BIN_DIR": FAKEBIN}):
+        with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN}):
             adapter = adapters.adapter_for("claude")
         init = adapter.parse(json.dumps(
             {"type": "system", "subtype": "init", "session_id": "s1"}))
@@ -92,7 +92,7 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(adapter.parse("pas du json"), {})
 
     def test_lecture_flux_codex(self):
-        with mock.patch.dict(os.environ, {"AGENT_MESH_BIN_DIR": FAKEBIN}):
+        with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN}):
             adapter = adapters.adapter_for("codex")
         self.assertEqual(
             adapter.parse(json.dumps({"type": "thread.started", "thread_id": "t1"}))["session"],
@@ -108,7 +108,7 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(erreur["error"], "boom")
 
     def test_lecture_flux_deepseek(self):
-        with mock.patch.dict(os.environ, {"AGENT_MESH_BIN_DIR": FAKEBIN}):
+        with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN}):
             adapter = adapters.adapter_for("deepseek")
         self.assertEqual(
             adapter.parse(json.dumps({"type": "session", "sessionId": "d1"}))["session"], "d1")

@@ -5,12 +5,16 @@
 # réseau. Le volume nommé garde les données entre deux démarrages.
 set -euo pipefail
 
-NAME=${AGENT_MESH_PG_NAME:-agent-mesh-pg}
-PORT=${AGENT_MESH_PG_PORT:-55432}
-IMAGE=${AGENT_MESH_PG_IMAGE:-postgres:17}
-USER=${AGENT_MESH_PG_USER:-agent_mesh}
-PASSWORD=${AGENT_MESH_PG_PASSWORD:-agent_mesh}
-DB=${AGENT_MESH_PG_DB:-agent_mesh}
+# AMEESH_PG_* est le nom courant ; AGENT_MESH_PG_* reste accepté (alias).
+NAME=${AMEESH_PG_NAME:-${AGENT_MESH_PG_NAME:-ameesh-pg}}
+PORT=${AMEESH_PG_PORT:-${AGENT_MESH_PG_PORT:-55432}}
+IMAGE=${AMEESH_PG_IMAGE:-${AGENT_MESH_PG_IMAGE:-postgres:17}}
+USER=${AMEESH_PG_USER:-${AGENT_MESH_PG_USER:-agent_mesh}}
+PASSWORD=${AMEESH_PG_PASSWORD:-${AGENT_MESH_PG_PASSWORD:-agent_mesh}}
+DB=${AMEESH_PG_DB:-${AGENT_MESH_PG_DB:-agent_mesh}}
+#: volume : le banc historique vit dans agent-mesh-pg-data (le conteneur
+#: renommé le garde) ; une machine neuve crée ameesh-pg-data.
+VOLUME=${AMEESH_PG_VOLUME:-ameesh-pg-data}
 
 if docker inspect "$NAME" >/dev/null 2>&1; then
   if [ "$(docker inspect -f '{{.State.Running}}' "$NAME")" != "true" ]; then
@@ -22,7 +26,7 @@ else
   docker run -d --name "$NAME" \
     -e POSTGRES_USER="$USER" -e POSTGRES_PASSWORD="$PASSWORD" -e POSTGRES_DB="$DB" \
     -p "127.0.0.1:$PORT:5432" \
-    -v agent-mesh-pg-data:/var/lib/postgresql/data \
+    -v "$VOLUME":/var/lib/postgresql/data \
     --health-cmd "pg_isready -U $USER -d $DB" \
     --health-interval 2s --health-timeout 3s --health-retries 30 \
     "$IMAGE" >/dev/null

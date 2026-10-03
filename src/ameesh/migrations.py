@@ -17,7 +17,7 @@ from .db import DbError, PsqlDriver, PsycopgDriver, quote_ident
 
 MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations")
 _FILE_RE = re.compile(r"^(\d{4})_([A-Za-z0-9._-]+)\.sql$")
-_LOCK = "agent_mesh_migrations"
+_LOCK = "ameesh_migrations"
 
 BOOTSTRAP = """
 create table if not exists schema_migrations (

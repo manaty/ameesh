@@ -320,19 +320,28 @@ class AgentWorker(threading.Thread):
 
         env = os.environ.copy()
         env.update(adapter.env())
-        env.update({
+        identite = {
             "AGENT_MAIL_NAME": self.name,
-            "AGENT_MESH_DSN": self.cfg.dsn,
-            "AGENT_MESH_SCHEMA": self.cfg.schema,
-            "AGENT_MESH_STATE": self.cfg.state_dir,
             "AGENT_MAIL_STATE": self.cfg.v0_state,
             "AGENT_MAIL_CONFIG": self.cfg.config_dir,
+            # Noms courants (ameesh) — et les anciens en alias, pour que
+            # l'outillage agent-mesh d'hier continue de fonctionner.
+            "AMEESH_DSN": self.cfg.dsn,
+            "AGENT_MESH_DSN": self.cfg.dsn,
+            "AMEESH_SCHEMA": self.cfg.schema,
+            "AGENT_MESH_SCHEMA": self.cfg.schema,
+            "AMEESH_STATE": self.cfg.state_dir,
+            "AGENT_MESH_STATE": self.cfg.state_dir,
+            "AMEESH_HOST": self.cfg.host,
             "AGENT_MESH_HOST": self.cfg.host,
+            "AMEESH_RUNNER_ID": self.runner.runner_id,
             "AGENT_MESH_RUNNER_ID": self.runner.runner_id,
-            # lie l'identité agent-mail au bail : sans ce triplet, le hook ne
+            # Lie l'identité agent-mail au bail : sans ce triplet, le hook ne
             # consomme rien (et le dossier ne donne jamais d'identité).
+            "AMEESH_LEASE_EPOCH": str(self.epoch),
             "AGENT_MESH_LEASE_EPOCH": str(self.epoch),
-        })
+        }
+        env.update(identite)
         events_path = self._path("events.jsonl")
         stderr_path = self._path("stderr.log")
         started = time.time()

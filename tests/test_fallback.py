@@ -10,14 +10,14 @@ import unittest
 from .support import REPO, PgTestCase
 
 #: port fermé sur la boucle locale : la base est « absente »
-UNREACHABLE = "postgresql://agent_mesh:agent_mesh@127.0.0.1:5599/agent_mesh"
+UNREACHABLE = "postgresql://ameesh:ameesh@127.0.0.1:5599/ameesh"
 TS = 1770000000.0
 
 
 class FallbackTest(PgTestCase):
     def env_bad(self, **extra: str) -> dict:
         return self.env(
-            AGENT_MESH_DSN=UNREACHABLE, AGENT_MESH_CONNECT_TIMEOUT="1", **extra
+            AMEESH_DSN=UNREACHABLE, AMEESH_CONNECT_TIMEOUT="1", **extra
         )
 
     def test_send_replie_et_previent(self):
@@ -110,7 +110,7 @@ class FallbackTest(PgTestCase):
         self.assertEqual(len(fichiers), 1)
 
     def test_backend_pg_force_echoue_sans_repli(self):
-        proc = self.cli("send", "beta", "non", env=self.env_bad(AGENT_MESH_BACKEND="pg"))
+        proc = self.cli("send", "beta", "non", env=self.env_bad(AMEESH_BACKEND="pg"))
         self.assertEqual(proc.returncode, 1)
         self.assertNotIn("déposé", proc.stdout)
         self.assertIn("erreur", proc.stderr)
@@ -120,7 +120,7 @@ class FallbackTest(PgTestCase):
         schema = "t_pasmigre_%s" % os.urandom(4).hex()
         self.db.execute('CREATE SCHEMA "%s"' % schema)
         try:
-            proc = self.cli("send", "beta", "non", env=self.env(AGENT_MESH_SCHEMA=schema))
+            proc = self.cli("send", "beta", "non", env=self.env(AMEESH_SCHEMA=schema))
             self.assertEqual(proc.returncode, 1)
             self.assertIn("migrate", proc.stderr)
             self.assertNotIn("déposé", proc.stdout)

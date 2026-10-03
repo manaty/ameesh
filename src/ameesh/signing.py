@@ -250,7 +250,8 @@ _CACHE: dict[str, object] = {}
 
 def backend(name: str | None = None):
     """Backend demandé (`AGENT_MESH_SIGNING_BACKEND`) ou le meilleur disponible."""
-    wanted = name or os.environ.get("AGENT_MESH_SIGNING_BACKEND") or "auto"
+    wanted = (name or os.environ.get("AMEESH_SIGNING_BACKEND")
+              or os.environ.get("AGENT_MESH_SIGNING_BACKEND") or "auto")
     if wanted in _CACHE:
         return _CACHE[wanted]
     if wanted == "auto":

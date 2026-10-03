@@ -17,26 +17,29 @@ import time
 import unittest
 import uuid
 
-from agent_mesh import config as config_mod
-from agent_mesh import db as db_mod
-from agent_mesh import migrations
+from ameesh import config as config_mod
+from ameesh import db as db_mod
+from ameesh import migrations
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(REPO, "src")
 FAKEBIN = os.path.join(REPO, "tests", "fakebin")
 TEST_DSN = os.environ.get(
-    "AGENT_MESH_TEST_DSN",
-    "postgresql://agent_mesh:agent_mesh@127.0.0.1:55432/agent_mesh",
+    "AMEESH_TEST_DSN", os.environ.get(
+        "AGENT_MESH_TEST_DSN",
+        "postgresql://agent_mesh:agent_mesh@127.0.0.1:55432/agent_mesh",
+    ),
 )
-REQUIRE_DB = os.environ.get("AGENT_MESH_REQUIRE_DB", "1") != "0"
+REQUIRE_DB = os.environ.get(
+    "AMEESH_REQUIRE_DB", os.environ.get("AGENT_MESH_REQUIRE_DB", "1")) != "0"
 
 
 def child_env(**extra: str) -> dict:
     """Environnement d'un sous-processus de test (CLI ou exécuteur)."""
     env = dict(os.environ)
-    env["AGENT_MESH_DSN"] = TEST_DSN
+    env["AMEESH_DSN"] = TEST_DSN
     env["PYTHONPATH"] = SRC + os.pathsep + env.get("PYTHONPATH", "")
-    env["AGENT_MESH_BIN_DIR"] = FAKEBIN
+    env["AMEESH_BIN_DIR"] = FAKEBIN
     env.update({k: str(v) for k, v in extra.items() if v is not None})
     return env
 
@@ -58,18 +61,18 @@ class PgTestCase(unittest.TestCase):
         for path in (cls.state, cls.v0state, cls.conf):
             os.makedirs(path, exist_ok=True)
         cls.cfg = config_mod.load(env=child_env(
-            AGENT_MESH_SCHEMA=cls.schema,
-            AGENT_MESH_STATE=cls.state,
+            AMEESH_SCHEMA=cls.schema,
+            AMEESH_STATE=cls.state,
             AGENT_MAIL_STATE=cls.v0state,
             AGENT_MAIL_CONFIG=cls.conf,
-            AGENT_MESH_TEST_LOG=cls.turns_log,
+            AMEESH_TEST_LOG=cls.turns_log,
         ))
         try:
             cls.db = db_mod.connect(cls.cfg)
         except db_mod.Unavailable as exc:
             message = (
                 "Postgres injoignable (%s) : lancez scripts/pg-up.sh, ou "
-                "AGENT_MESH_REQUIRE_DB=0 pour ignorer ces tests. Détail : %s"
+                "AMEESH_REQUIRE_DB=0 pour ignorer ces tests. Détail : %s"
                 % (TEST_DSN, exc)
             )
             if REQUIRE_DB:
@@ -99,11 +102,11 @@ class PgTestCase(unittest.TestCase):
     @classmethod
     def env(cls, **extra: str) -> dict:
         base = dict(
-            AGENT_MESH_SCHEMA=cls.schema,
-            AGENT_MESH_STATE=cls.state,
+            AMEESH_SCHEMA=cls.schema,
+            AMEESH_STATE=cls.state,
             AGENT_MAIL_STATE=cls.v0state,
             AGENT_MAIL_CONFIG=cls.conf,
-            AGENT_MESH_TEST_LOG=cls.turns_log,
+            AMEESH_TEST_LOG=cls.turns_log,
         )
         base.update(extra)
         return child_env(**base)
@@ -114,7 +117,7 @@ class PgTestCase(unittest.TestCase):
     def cli(self, *args: str, env: dict | None = None, stdin: str | None = None,
             timeout: float = 60.0) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, "-m", "agent_mesh.cli", *args],
+            [sys.executable, "-m", "ameesh.cli", *args],
             input=stdin, capture_output=True, text=True, timeout=timeout,
             env=env or self.env(), cwd=self.tmp,
         )
@@ -122,7 +125,7 @@ class PgTestCase(unittest.TestCase):
     def runner(self, *args: str, env: dict | None = None, timeout: float = 60.0,
                ) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, "-m", "agent_mesh.runner", *args],
+            [sys.executable, "-m", "ameesh.runner", *args],
             capture_output=True, text=True, timeout=timeout,
             env=env or self.env(), cwd=self.tmp,
         )
@@ -130,14 +133,14 @@ class PgTestCase(unittest.TestCase):
     def mesh(self, *args: str, env: dict | None = None, timeout: float = 60.0,
              ) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, "-m", "agent_mesh.mesh_cli", *args],
+            [sys.executable, "-m", "ameesh.main", *args],
             capture_output=True, text=True, timeout=timeout,
             env=env or self.env(), cwd=self.tmp,
         )
 
     def runner_popen(self, *args: str, env: dict | None = None) -> subprocess.Popen:
         return subprocess.Popen(
-            [sys.executable, "-m", "agent_mesh.runner", *args],
+            [sys.executable, "-m", "ameesh.runner", *args],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             env=env or self.env(), cwd=self.tmp,
         )
@@ -165,7 +168,7 @@ class PgTestCase(unittest.TestCase):
 
     def make_test_key(self, name: str = "test-owner") -> tuple[str, str, str]:
         """Paire de clés de TEST dans le bac à sable — jamais une clé réelle."""
-        from agent_mesh import signing
+        from ameesh import signing
         directory = os.path.join(self.tmp, "keys")
         return signing.write_keypair(directory, name)
 

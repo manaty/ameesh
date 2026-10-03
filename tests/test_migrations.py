@@ -6,7 +6,7 @@ import tempfile
 import unittest
 import uuid
 
-from agent_mesh import authority, db as db_mod, mail, migrations, registry, signing
+from ameesh import authority, db as db_mod, mail, migrations, registry, signing
 
 from .support import PgTestCase
 

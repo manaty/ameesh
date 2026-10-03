@@ -3,7 +3,8 @@
 Une session a une identité si, et seulement si :
 
 1. `AGENT_MAIL_NAME` est posée (le runner la pose pour le harnais qu'il lance) ;
-2. si `AGENT_MESH_RUNNER_ID` et `AGENT_MESH_LEASE_EPOCH` sont aussi posées,
+2. si `AMEESH_RUNNER_ID` et `AMEESH_LEASE_EPOCH` sont aussi posées (les
+   anciens `AGENT_MESH_*` restent lus en alias),
    le bail correspondant doit être **vivant et détenu par ce runner** : c'est
    l'identité *liée au bail*, qui empêche une session périmée ou une autre
    machine de consommer le courrier ;
@@ -88,14 +89,15 @@ def resolve_binding(cfg: Config, db=None) -> Binding:
     name = os.environ.get("AGENT_MAIL_NAME") or ""
     if not name or not NAME_RE.match(name):
         return Binding(reason="AGENT_MAIL_NAME absente (le runner la pose pour le harnais)")
-    runner_id = os.environ.get("AGENT_MESH_RUNNER_ID") or ""
-    epoch_text = os.environ.get("AGENT_MESH_LEASE_EPOCH") or ""
+    runner_id = os.environ.get("AMEESH_RUNNER_ID") or os.environ.get("AGENT_MESH_RUNNER_ID") or ""
+    epoch_text = (os.environ.get("AMEESH_LEASE_EPOCH")
+                  or os.environ.get("AGENT_MESH_LEASE_EPOCH") or "")
     if runner_id and epoch_text and db is not None:
         try:
             epoch = int(epoch_text)
         except ValueError:
             return Binding(name=name, source="runner", runner_id=runner_id,
-                           reason="AGENT_MESH_LEASE_EPOCH illisible")
+                           reason="AMEESH_LEASE_EPOCH illisible")
         from . import registry  # import tardif : identity ne dépend pas de la base
         ok, reason = registry.lease_matches(db, name, runner_id, epoch)
         return Binding(name=name, source="runner", runner_id=runner_id, epoch=epoch,

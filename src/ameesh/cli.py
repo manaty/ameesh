@@ -4,7 +4,7 @@
   agent-mail send <dest> <texte…> [--from NOM]   dépose un message (dest = nom, ou "all")
   agent-mail list                                agents, hôte, bail, non lus
   agent-mail inbox [NOM]                         messages non lus de NOM (sans les marquer lus)
-  agent-mail whoami [--cwd DIR]                  nom résolu pour un dossier
+  agent-mail whoami                              identité liée ; --cwd = diagnostic
   agent-mail alias <NOM> <DOSSIER> [CHANTIER]    nomme les sessions dont le dossier commence par DOSSIER
   agent-mail status "<travail en cours>"         état de l'agent (registre + titre du terminal)
   agent-mail hook <claude|codex|deepseek>        hook : lit le JSON sur stdin, livre les non-lus
@@ -12,11 +12,15 @@
   agent-mail migrate                             applique les migrations versionnées
   agent-mail doctor [--notify-test]              diagnostic : pilote, schéma, migrations, LISTEN/NOTIFY
 
-Identité d'une session : $AGENT_MAIL_NAME, sinon le plus long préfixe de
-~/.config/agent-mail/aliases.tsv qui contient son dossier, sinon le nom du dossier.
+Identité d'une session : $AGENT_MAIL_NAME (le runner la pose pour le harnais
+qu'il lance). Si $AMEESH_RUNNER_ID et $AMEESH_LEASE_EPOCH sont aussi posées, le
+bail doit être vivant et détenu par ce runner — l'identité est liée au bail.
+Le dossier courant ne donne JAMAIS d'identité : lire dans le worktree d'un
+autre agent ne consomme pas son courrier. Les anciens noms AGENT_MESH_* restent
+acceptés en alias.
 
-Backend : Postgres (AGENT_MESH_DSN, schéma AGENT_MESH_SCHEMA). Si la base est
-absente et que AGENT_MESH_BACKEND=auto, repli lisible sur les fichiers v0
+Backend : Postgres (AMEESH_DSN, schéma AMEESH_SCHEMA). Si la base est
+absente et que AMEESH_BACKEND=auto, repli lisible sur les fichiers v0
 (~/.local/state/agent-mail) : mêmes commandes, mêmes JSON de hook, rien ne casse.
 Les hooks ne font jamais échouer l'agent : toute erreur → sortie 0 sans rien.
 Un message d'agent n'a jamais l'autorité du propriétaire : l'expéditeur est affiché.
@@ -469,7 +473,7 @@ def cmd_doctor(cfg: Config, notify_test: bool) -> int:
     print("non lus    : %d" % unread)
     verdict = 0
     if notify_test:
-        channel = "agent_mesh_doctor"
+        channel = "ameesh_doctor"
         listener = db_mod.listener(db, [channel])
         if listener is None:
             print("notify     : pilote sans LISTEN/NOTIFY")
@@ -495,7 +499,7 @@ def cmd_doctor(cfg: Config, notify_test: bool) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if not argv:
+    if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
         return 0
     command, rest = argv[0], argv[1:]

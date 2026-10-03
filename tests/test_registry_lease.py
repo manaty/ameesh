@@ -5,7 +5,7 @@ import threading
 import time
 import unittest
 
-from agent_mesh import registry
+from ameesh import registry
 
 from .support import PgTestCase
 
@@ -36,7 +36,7 @@ class RegistryTest(PgTestCase):
         self.assertEqual(registry.get(self.db, "alpha")["harness"], "deepseek")
 
     def test_overview_compte_les_non_lus(self):
-        from agent_mesh import mail
+        from ameesh import mail
         registry.upsert(self.db, "alpha", harness="claude", host="laptop")
         mail.send(self.db, "beta", "alpha", "un")
         mail.send(self.db, "beta", "alpha", "deux")

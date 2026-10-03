@@ -11,7 +11,7 @@ import os
 import time
 import unittest
 
-from agent_mesh import authority, db as db_mod, mail, registry, signing
+from ameesh import authority, db as db_mod, mail, registry, signing
 
 from .support import PgTestCase
 

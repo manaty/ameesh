@@ -16,9 +16,10 @@ dependencies = []
 psycopg = ["psycopg[binary]>=3.1"]
 
 [project.scripts]
-agent-mail = "agent_mesh.cli:main"
-agent-runner = "agent_mesh.runner:main"
-agent-mesh = "agent_mesh.mesh_cli:main"
+ameesh = "ameesh.main:main"
+#: alias conservés : les hooks des trois harnais appellent agent-mail
+agent-mail = "ameesh.cli:main"
+agent-runner = "ameesh.runner:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
@@ -27,4 +28,4 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-agent_mesh = ["migrations/*.sql"]
+ameesh = ["migrations/*.sql"]

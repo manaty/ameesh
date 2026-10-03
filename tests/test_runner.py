@@ -10,8 +10,8 @@ import time
 import unittest
 from unittest import mock
 
-from agent_mesh import adapters, db as db_mod, mail, registry
-from agent_mesh.runner import AgentWorker, Runner
+from ameesh import adapters, db as db_mod, mail, registry
+from ameesh.runner import AgentWorker, Runner
 
 from .support import PgTestCase
 
@@ -84,7 +84,7 @@ class RunnerTest(PgTestCase):
     def test_harnais_absent_marque_bloque_sans_boucle(self):
         cwd = self._cwd("sansharnais")
         self.register("sansharnais", "claude", cwd=cwd, prompt="tour")
-        env = self.env(AGENT_MESH_CLAUDE_BIN=os.path.join(self.tmp, "claude-inexistant"))
+        env = self.env(AMEESH_CLAUDE_BIN=os.path.join(self.tmp, "claude-inexistant"))
         proc = self.runner("--once", "--agents", "sansharnais", env=env)
         self.assertEqual(proc.returncode, 0)
         row = registry.get(self.db, "sansharnais")
@@ -97,7 +97,7 @@ class RunnerTest(PgTestCase):
         """Sonde codex3 (6) : un tour qui ne démarre pas ne perd pas sa consigne."""
         cwd = self._cwd("restaure")
         self.register("restaure", "claude", cwd=cwd, prompt="consigne à retrouver")
-        env = self.env(AGENT_MESH_CLAUDE_BIN=os.path.join(self.tmp, "claude-absent"))
+        env = self.env(AMEESH_CLAUDE_BIN=os.path.join(self.tmp, "claude-absent"))
         proc = self.runner("--once", "--agents", "restaure", env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         row = registry.get(self.db, "restaure")
@@ -152,7 +152,7 @@ class RunnerTest(PgTestCase):
         """Deux processus concurrents : un seul tour, un 0 et un 3."""
         cwd = self._cwd("coureur")
         self.register("coureur", "claude", cwd=cwd, prompt="course")
-        env = self.env(AGENT_MESH_TEST_SLEEP="4")
+        env = self.env(AMEESH_TEST_SLEEP="4")
         premier = self.runner_popen("--once", "--agents", "coureur", env=env)
         second = self.runner_popen("--once", "--agents", "coureur", env=env)
         sortie1, _ = premier.communicate(timeout=60)
@@ -195,7 +195,7 @@ class RunnerTest(PgTestCase):
         """Si le bail est volé, le harnais est terminé et le tour n'est pas compté."""
         cwd = self._cwd("vole")
         self.register("vole", "claude", cwd=cwd, prompt="long tour")
-        env = self.env(AGENT_MESH_TEST_SLEEP="12", AGENT_MESH_LEASE_TTL="3")
+        env = self.env(AMEESH_TEST_SLEEP="12", AMEESH_LEASE_TTL="3")
         proc = self.runner_popen("--agents", "vole", "--lease-ttl", "3", "--poll", "2", env=env)
         lignes: list[str] = []
         threading.Thread(
@@ -296,7 +296,7 @@ class RunnerTest(PgTestCase):
     def test_anomalie_du_harnais_marque_bloque(self):
         cwd = self._cwd("plante")
         self.register("plante", "codex", cwd=cwd, prompt="tour")
-        env = self.env(AGENT_MESH_TEST_EXIT="2")
+        env = self.env(AMEESH_TEST_EXIT="2")
         proc = self.runner("--once", "--agents", "plante", env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         row = registry.get(self.db, "plante")
@@ -311,7 +311,7 @@ class RunnerTest(PgTestCase):
         """B6a (variante SIGKILL) : le harnais tué ne fait pas perdre la consigne."""
         cwd = self._cwd("tue")
         self.register("tue", "claude", cwd=cwd, prompt="consigne d'un tour tué")
-        env = self.env(AGENT_MESH_TEST_KILL_SELF="1")
+        env = self.env(AMEESH_TEST_KILL_SELF="1")
         proc = self.runner("--once", "--agents", "tue", env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         row = registry.get(self.db, "tue")
@@ -346,10 +346,10 @@ class RunnerTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         env = self.turns()[0]["env"]
         self.assertEqual(env["AGENT_MAIL_NAME"], "lie")
-        self.assertTrue(env["AGENT_MESH_RUNNER_ID"])
+        self.assertTrue(env["AMEESH_RUNNER_ID"])
         # le tour tourne sous le premier bail ; le rendre en sortant incrémente
         # l'epoch en base, donc on compare au bail du moment, pas à l'après.
-        self.assertEqual(int(env["AGENT_MESH_LEASE_EPOCH"]), 1)
+        self.assertEqual(int(env["AMEESH_LEASE_EPOCH"]), 1)
 
     def test_battement_se_reveille_a_l_echeance_du_bail(self):
         """B5a : with a long interval, the heartbeat still wakes at the deadline."""
@@ -372,7 +372,7 @@ class RunnerTest(PgTestCase):
         """Sonde codex3 (2) : la clôture d'un tour au bail perdu restaure la consigne."""
         cwd = self._cwd("perdu")
         self.register("perdu", "claude", cwd=cwd, prompt="consigne du tour perdu")
-        env = self.env(AGENT_MESH_TEST_SLEEP="12", AGENT_MESH_LEASE_TTL="3")
+        env = self.env(AMEESH_TEST_SLEEP="12", AMEESH_LEASE_TTL="3")
         proc = self.runner_popen("--agents", "perdu", "--lease-ttl", "3", "--poll", "2", env=env)
         try:
             self.wait_for(lambda: len(self.turns()) == 1, timeout=20)

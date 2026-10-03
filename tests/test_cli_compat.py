@@ -10,7 +10,7 @@ import sys
 import unittest
 from unittest import mock
 
-from agent_mesh import cli
+from ameesh import cli
 
 from .support import REPO, PgTestCase
 
@@ -128,7 +128,7 @@ class CliCompatTest(PgTestCase):
     def test_hook_identite_liee_au_bail(self):
         """Identité liée : il faut le nom, le runner ET l'epoch du bail vivant."""
         import dataclasses
-        from agent_mesh import registry
+        from ameesh import registry
         name = "juliette"
         registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
         lease = registry.claim(self.db, name, "runner-tests", 60)
@@ -136,15 +136,15 @@ class CliCompatTest(PgTestCase):
         self._seed(name, "beta", "courrier lié")
         payload = json.dumps({"hook_event_name": "SessionStart", "cwd": self.tmp})
 
-        lie = self.env(AGENT_MAIL_NAME=name, AGENT_MESH_RUNNER_ID="runner-tests",
-                       AGENT_MESH_LEASE_EPOCH=str(epoch))
+        lie = self.env(AGENT_MAIL_NAME=name, AMEESH_RUNNER_ID="runner-tests",
+                       AMEESH_LEASE_EPOCH=str(epoch))
         proc = self.cli("hook", "claude", env=lie, stdin=payload)
         self.assertIn("courrier lié", proc.stdout)
 
         # mauvais epoch : rien n'est consommé et rien n'est livré
         self._seed(name, "beta", "courrier suivant")
-        perime = self.env(AGENT_MAIL_NAME=name, AGENT_MESH_RUNNER_ID="runner-tests",
-                          AGENT_MESH_LEASE_EPOCH=str(epoch + 1))
+        perime = self.env(AGENT_MAIL_NAME=name, AMEESH_RUNNER_ID="runner-tests",
+                          AMEESH_LEASE_EPOCH=str(epoch + 1))
         proc = self.cli("hook", "claude", env=perime, stdin=payload)
         self.assertEqual(proc.stdout, "")
         self.assertIn("non liée", proc.stderr)
@@ -154,8 +154,8 @@ class CliCompatTest(PgTestCase):
         self.assertEqual(restant, 1, "seul le premier message a été remis")
 
         # autre runner : refusé aussi
-        autre = self.env(AGENT_MAIL_NAME=name, AGENT_MESH_RUNNER_ID="runner-voisin",
-                         AGENT_MESH_LEASE_EPOCH=str(epoch))
+        autre = self.env(AGENT_MAIL_NAME=name, AMEESH_RUNNER_ID="runner-voisin",
+                         AMEESH_LEASE_EPOCH=str(epoch))
         self.assertEqual(self.cli("hook", "claude", env=autre, stdin=payload).stdout, "")
 
     def test_whoami_et_send_sans_identite(self):

@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import unittest
 
-from agent_mesh import signing
+from ameesh import signing
 
 # RFC 8032 §7.1 : (germe, clé publique, message, signature)
 RFC_VECTORS = [

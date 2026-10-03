@@ -9,18 +9,19 @@ import time
 
 def main() -> int:
     args = sys.argv[1:]
-    log = os.environ.get("AGENT_MESH_TEST_LOG")
+    log = os.environ.get("AMEESH_TEST_LOG")
     if log:
         with open(log, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({
                 "harness": "codex", "argv": args,
                 "env": {k: os.environ.get(k) for k in (
-                    "AGENT_MAIL_NAME", "AGENT_MESH_RUNNER_ID", "AGENT_MESH_LEASE_EPOCH",
-                    "AGENT_MESH_HOST", "AGENT_MESH_SCHEMA")},
+                    "AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
+                    "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
+                    "AMEESH_HOST", "AMEESH_SCHEMA")},
             }) + "\n")
-    if os.environ.get("AGENT_MESH_TEST_SLEEP"):
-        time.sleep(float(os.environ["AGENT_MESH_TEST_SLEEP"]))
-    if os.environ.get("AGENT_MESH_TEST_KILL_SELF"):
+    if os.environ.get("AMEESH_TEST_SLEEP"):
+        time.sleep(float(os.environ["AMEESH_TEST_SLEEP"]))
+    if os.environ.get("AMEESH_TEST_KILL_SELF"):
         os.kill(os.getpid(), signal.SIGKILL)
     thread = "codex-thread-1"
     if "resume" in args:
@@ -30,7 +31,7 @@ def main() -> int:
         "type": "agent_message", "text": "bonjour du faux codex (fil %s)" % thread}}), flush=True)
     print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10,
                                                           "output_tokens": 5}}), flush=True)
-    return int(os.environ.get("AGENT_MESH_TEST_EXIT", "0"))
+    return int(os.environ.get("AMEESH_TEST_EXIT", "0"))
 
 
 if __name__ == "__main__":

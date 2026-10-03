@@ -2,7 +2,8 @@
 
 Une seule source de vérité, lue dans cet ordre :
 1. `~/.config/agent-mesh/config.json` (facultatif) ;
-2. les variables d'environnement `AGENT_MESH_*` ;
+2. les variables d'environnement `AMEESH_*` (`AGENT_MESH_*` reste accepté
+   en alias, comme `agent-mail` pour la commande) ;
 3. les valeurs par défaut.
 
 Les chemins v0 (`~/.local/state/agent-mail`, `~/.config/agent-mail`) restent les
@@ -18,8 +19,10 @@ import socket
 from dataclasses import dataclass, replace
 
 DEFAULT_DSN = "postgresql://agent_mesh:agent_mesh@127.0.0.1:55432/agent_mesh"
-DEFAULT_CONFIG = "~/.config/agent-mesh/config.json"
-DEFAULT_STATE = "~/.local/state/agent-mesh"
+DEFAULT_CONFIG = "~/.config/ameesh/config.json"
+LEGACY_CONFIG = "~/.config/agent-mesh/config.json"
+DEFAULT_STATE = "~/.local/state/ameesh"
+LEGACY_STATE = "~/.local/state/agent-mesh"
 DEFAULT_V0_STATE = "~/.local/state/agent-mail"
 DEFAULT_V0_CONFIG = "~/.config/agent-mail"
 
@@ -83,7 +86,10 @@ class Config:
 def load(env: dict | None = None) -> Config:
     env = dict(os.environ if env is None else env)
     cfg = Config()
-    cfg_path = _expand(env.get("AGENT_MESH_CONFIG", DEFAULT_CONFIG))
+    legacy_cfg = _expand(env.get("AGENT_MESH_CONFIG") or LEGACY_CONFIG)
+    cfg_path = _expand(env.get("AMEESH_CONFIG") or env.get("AGENT_MESH_CONFIG") or DEFAULT_CONFIG)
+    if not os.path.exists(cfg_path) and os.path.exists(legacy_cfg):
+        cfg_path = legacy_cfg  # une config agent-mesh existante reste lue
     if os.path.exists(cfg_path):
         try:
             with open(cfg_path, encoding="utf-8") as fh:
@@ -99,23 +105,33 @@ def load(env: dict | None = None) -> Config:
                 return env[name]
         return default
 
+    # AMEESH_* est le nom courant ; AGENT_MESH_* reste accepté (alias).
+    state_brut = pick("AMEESH_STATE", "AGENT_MESH_STATE", default=None)
+    if state_brut:
+        state_dir = _expand(state_brut)
+    else:
+        neuf, ancien = _expand(DEFAULT_STATE), _expand(LEGACY_STATE)
+        state_dir = ancien if (os.path.isdir(ancien) and not os.path.isdir(neuf)) else neuf
     cfg = replace(
         cfg,
-        dsn=pick("AGENT_MESH_DSN", "AGENT_MESH_DATABASE_URL", default=cfg.dsn),
-        schema=pick("AGENT_MESH_SCHEMA", default=cfg.schema),
-        driver=pick("AGENT_MESH_DRIVER", default=cfg.driver),
-        backend=pick("AGENT_MESH_BACKEND", default=cfg.backend),
-        state_dir=_expand(pick("AGENT_MESH_STATE", default=cfg.state_dir)),
+        dsn=pick("AMEESH_DSN", "AGENT_MESH_DSN", "AMEESH_DATABASE_URL",
+                 "AGENT_MESH_DATABASE_URL", default=cfg.dsn),
+        schema=pick("AMEESH_SCHEMA", "AGENT_MESH_SCHEMA", default=cfg.schema),
+        driver=pick("AMEESH_DRIVER", "AGENT_MESH_DRIVER", default=cfg.driver),
+        backend=pick("AMEESH_BACKEND", "AGENT_MESH_BACKEND", default=cfg.backend),
+        state_dir=state_dir,
         v0_state=_expand(pick("AGENT_MAIL_STATE", default=cfg.v0_state)),
         config_dir=_expand(pick("AGENT_MAIL_CONFIG", default=cfg.config_dir)),
-        host=pick("AGENT_MESH_HOST", default=cfg.host),
-        runner_id=pick("AGENT_MESH_RUNNER_ID", default=cfg.runner_id),
-        connect_timeout=_as_float(env.get("AGENT_MESH_CONNECT_TIMEOUT"), cfg.connect_timeout),
-        statement_timeout_ms=_as_float(env.get("AGENT_MESH_STATEMENT_TIMEOUT_MS"),
-                                       cfg.statement_timeout_ms),
-        lease_ttl=_as_float(env.get("AGENT_MESH_LEASE_TTL"), cfg.lease_ttl),
-        idle_nudge=_as_float(env.get("AGENT_MESH_IDLE_NUDGE"), cfg.idle_nudge),
-        poll=_as_float(env.get("AGENT_MESH_POLL"), cfg.poll),
+        host=pick("AMEESH_HOST", "AGENT_MESH_HOST", default=cfg.host),
+        runner_id=pick("AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID", default=cfg.runner_id),
+        connect_timeout=_as_float(pick("AMEESH_CONNECT_TIMEOUT", "AGENT_MESH_CONNECT_TIMEOUT"),
+                                  cfg.connect_timeout),
+        statement_timeout_ms=_as_float(
+            pick("AMEESH_STATEMENT_TIMEOUT_MS", "AGENT_MESH_STATEMENT_TIMEOUT_MS"),
+            cfg.statement_timeout_ms),
+        lease_ttl=_as_float(pick("AMEESH_LEASE_TTL", "AGENT_MESH_LEASE_TTL"), cfg.lease_ttl),
+        idle_nudge=_as_float(pick("AMEESH_IDLE_NUDGE", "AGENT_MESH_IDLE_NUDGE"), cfg.idle_nudge),
+        poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
     )
     if not SCHEMA_RE.match(cfg.schema):
         raise SystemExit("AGENT_MESH_SCHEMA invalide : %r" % cfg.schema)

@@ -9,13 +9,13 @@ import time
 
 def main() -> int:
     args = sys.argv[1:]
-    log = os.environ.get("AGENT_MESH_TEST_LOG")
+    log = os.environ.get("AMEESH_TEST_LOG")
     if log:
         with open(log, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"harness": "deepseek", "argv": args}) + "\n")
-    if os.environ.get("AGENT_MESH_TEST_SLEEP"):
-        time.sleep(float(os.environ["AGENT_MESH_TEST_SLEEP"]))
-    if os.environ.get("AGENT_MESH_TEST_KILL_SELF"):
+    if os.environ.get("AMEESH_TEST_SLEEP"):
+        time.sleep(float(os.environ["AMEESH_TEST_SLEEP"]))
+    if os.environ.get("AMEESH_TEST_KILL_SELF"):
         os.kill(os.getpid(), signal.SIGKILL)
     session = "dsh-session-1"
     if "--session-id" in args:
@@ -24,7 +24,7 @@ def main() -> int:
     print(json.dumps({"type": "text", "text": "bonjour du faux dsh (session %s)" % session}),
           flush=True)
     print(json.dumps({"type": "final", "text": "fini", "cost_usd": 0.002}), flush=True)
-    return int(os.environ.get("AGENT_MESH_TEST_EXIT", "0"))
+    return int(os.environ.get("AMEESH_TEST_EXIT", "0"))
 
 
 if __name__ == "__main__":

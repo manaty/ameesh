@@ -5,7 +5,7 @@ import threading
 import time
 import unittest
 
-from agent_mesh import work
+from ameesh import work
 
 from .support import PgTestCase
 

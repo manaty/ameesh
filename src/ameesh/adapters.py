@@ -10,8 +10,8 @@ Les lignes de commande reprennent exactement celles de `nexlink-agent.v0.sh` :
 * **deepseek** : `DSH_PERMISSION_MODE=danger-full-access dsh --profile agent
                  --json [--session-id SID] TEXTE`
 
-Le binaire est résolu par `AGENT_MESH_<HARNAIS>_BIN`, puis
-`AGENT_MESH_BIN_DIR/<nom>`, puis le PATH — ce qui permet au banc de test
+Le binaire est résolu par `AMEESH_<HARNAIS>_BIN` (ou l'ancien
+`AGENT_MESH_<HARNAIS>_BIN`), puis `AMEESH_BIN_DIR/<nom>`, puis le PATH — ce qui permet au banc de test
 d'utiliser des faux harnais sans jamais toucher aux vrais.
 """
 from __future__ import annotations
@@ -33,10 +33,12 @@ IDLE_PROMPT = (
 )
 
 BIN_ENV = {
-    "claude": "AGENT_MESH_CLAUDE_BIN",
-    "codex": "AGENT_MESH_CODEX_BIN",
-    "deepseek": "AGENT_MESH_DSH_BIN",
+    "claude": ("AMEESH_CLAUDE_BIN", "AGENT_MESH_CLAUDE_BIN"),
+    "codex": ("AMEESH_CODEX_BIN", "AGENT_MESH_CODEX_BIN"),
+    "deepseek": ("AMEESH_DSH_BIN", "AGENT_MESH_DSH_BIN"),
 }
+#: anciens noms acceptés en repli (renommage agent-mesh → ameesh)
+BIN_DIR_ENV = ("AMEESH_BIN_DIR", "AGENT_MESH_BIN_DIR")
 DEFAULT_BIN = {"claude": "claude", "codex": "codex", "deepseek": "dsh"}
 
 
@@ -45,17 +47,19 @@ class HarnessMissing(RuntimeError):
 
 
 def resolve_binary(harness: str, override: str | None = None) -> str:
-    key = BIN_ENV.get(harness)
-    if not key:
+    keys = BIN_ENV.get(harness)
+    if not keys:
         raise HarnessMissing("harnais inconnu : %r (connus : %s)" % (harness, ", ".join(HARNESSES)))
     candidates = []
     if override:
         candidates.append(override)
-    if os.environ.get(key):
-        candidates.append(os.environ[key])
-    bindir = os.environ.get("AGENT_MESH_BIN_DIR")
-    if bindir:
-        candidates.append(os.path.join(bindir, DEFAULT_BIN[harness]))
+    for key in keys:
+        if os.environ.get(key):
+            candidates.append(os.environ[key])
+    for nom in BIN_DIR_ENV:
+        bindir = os.environ.get(nom)
+        if bindir:
+            candidates.append(os.path.join(bindir, DEFAULT_BIN[harness]))
     for candidate in candidates:
         path = os.path.expanduser(candidate)
         if os.path.isfile(path) and os.access(path, os.X_OK):
@@ -66,7 +70,7 @@ def resolve_binary(harness: str, override: str | None = None) -> str:
     if not found:
         raise HarnessMissing(
             "binaire %s introuvable : installez-le, mettez %s=/chemin/vers/%s "
-            "ou AGENT_MESH_BIN_DIR" % (DEFAULT_BIN[harness], key, DEFAULT_BIN[harness])
+            "ou AMEESH_BIN_DIR" % (DEFAULT_BIN[harness], keys[0], DEFAULT_BIN[harness])
         )
     return found
 

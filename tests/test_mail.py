@@ -4,9 +4,9 @@ from __future__ import annotations
 import time
 import unittest
 
-from agent_mesh import mail
-from agent_mesh import registry
-from agent_mesh.backend import PgBackend
+from ameesh import mail
+from ameesh import registry
+from ameesh.backend import PgBackend
 
 from .support import PgTestCase
 

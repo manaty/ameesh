@@ -7,7 +7,7 @@ import os
 import re
 import unittest
 
-from agent_mesh import authority, mail, migrations, registry, signing
+from ameesh import authority, mail, migrations, registry, signing
 
 from .support import PgTestCase
 
