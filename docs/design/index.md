@@ -1,5 +1,6 @@
 # Conception d'ameesh
 
+* [Spécification d'ameesh v1](specification.md) - Périmètre, architecture, canon, actions, reçus, plan de lots.
 * [Exigences (R1–R18)](exigences.md) - Les exigences d'origine généralisées et celles ajoutées le 2026-10-03.
 * [Questions ouvertes](questions-ouvertes.md) - Ce qui attend une décision du propriétaire ou une étude.
 * [Décisions du propriétaire](decisions/) - Une décision par fichier, rapportée par mesh-design.

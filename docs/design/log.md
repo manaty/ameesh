@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-04 (spec v1)
+* **Création** : [spécification d'ameesh v1](specification.md) et plan de lots L1–L9.
+
 ## 2026-10-04 (Q1, Q8)
 * **Décision** : [stockage](decisions/0016-stockage.md) ; Q1 close. Q8 close (instantané public, voir [0015](decisions/0015-interfaces-des-facades.md)). Plus aucune question n'attend le propriétaire.
 
