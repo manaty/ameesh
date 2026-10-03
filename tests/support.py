@@ -37,6 +37,12 @@ REQUIRE_DB = os.environ.get(
 def child_env(**extra: str) -> dict:
     """Environnement d'un sous-processus de test (CLI ou exécuteur)."""
     env = dict(os.environ)
+    # le canon et la règle R14 de la machine ne fuient pas dans les tests :
+    # chaque test qui en a besoin les pose explicitement
+    for name in ("AMEESH_CANON", "AMEESH_CANON_REF", "AMEESH_CANON_UNTRUSTED",
+                 "AMEESH_REQUIRE_RESPONSIBLE", "AGENT_MESH_CANON", "AGENT_MESH_CANON_REF",
+                 "AGENT_MESH_CANON_UNTRUSTED", "AGENT_MESH_REQUIRE_RESPONSIBLE"):
+        env.pop(name, None)
     env["AMEESH_DSN"] = TEST_DSN
     env["PYTHONPATH"] = SRC + os.pathsep + env.get("PYTHONPATH", "")
     env["AMEESH_BIN_DIR"] = FAKEBIN

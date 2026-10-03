@@ -23,7 +23,10 @@ AGENT_COLUMNS = """
     lease_owner, lease_epoch,
     extract(epoch from lease_expires_at)::float8 as lease_expires_ts,
     extract(epoch from last_seen)::float8         as last_seen_ts,
-    extract(epoch from last_turn_at)::float8      as last_turn_ts
+    extract(epoch from last_turn_at)::float8      as last_turn_ts,
+    responsible, team, provider, credential_mode, capabilities, canon_ref,
+    ephemeral, created_by,
+    extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts
 """
 
 
@@ -91,7 +94,9 @@ def overview(db: Db) -> list[dict]:
         SELECT name, chantier, harness, host, cwd, session_id, status, status_text,
                model, budget_usd, spent_usd, turns, pending_prompt, last_error,
                lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
-               public_key_fingerprint, key_role, key_ready, has_owner_key, unread
+               public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
+               responsible, team, provider, credential_mode, capabilities, canon_ref,
+               ephemeral, created_by, ephemeral_expires_ts, responsible_ok
         FROM agent_mesh_overview
         ORDER BY last_seen_ts DESC NULLS LAST
         """
@@ -203,15 +208,29 @@ def release(db: Db, name: str, owner: str, epoch: int) -> bool:
     return bool(rows)
 
 
-def claimable(db: Db, host: str, names: Sequence[str] | None = None) -> list[dict]:
-    """Agents de cet hôte sans bail vivant (libres, expirés, ou morts)."""
+def claimable(db: Db, host: str, names: Sequence[str] | None = None, *,
+              require_responsible: bool | None = None) -> list[dict]:
+    """Agents de cet hôte sans bail vivant (libres, expirés, ou morts).
+
+    R14 (C3) : un éphémère échu n'est jamais réclamable ; et quand le
+    responsable est requis (`AMEESH_REQUIRE_RESPONSIBLE`, vrai par défaut dès
+    qu'un canon est configuré), un agent sans humain responsable résolu non
+    plus. `canon sync` n'écrit `responsible` que résolu ; un éphémère
+    l'hérite de son créateur.
+    """
+    if require_responsible is None:
+        cfg = getattr(db, "cfg", None)
+        require_responsible = bool(cfg is not None and cfg.responsible_required)
     sql = """
         SELECT %s
         FROM agent_registry
         WHERE host = %%s
           AND status <> 'stopped'
           AND (lease_owner IS NULL OR lease_expires_at < now())
+          AND (NOT ephemeral OR ephemeral_expires_at > now())
     """ % AGENT_COLUMNS
+    if require_responsible:
+        sql += " AND coalesce(responsible, '') <> ''"
     params: list[Any] = [host]
     if names:
         sql += " AND name IN (%s)" % _name_list(names)
