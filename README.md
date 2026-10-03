@@ -27,27 +27,27 @@ scripts are untouched. The switch is described step by step, with rollback, in
 ```bash
 scripts/pg-up.sh                    # container agent-mesh-pg, postgres:17, 127.0.0.1:55432
 export PYTHONPATH=src
-export AGENT_MESH_DSN=postgresql://agent_mesh:agent_mesh@127.0.0.1:55432/agent_mesh
+export AMEESH_DSN=postgresql://agent_mesh:agent_mesh@127.0.0.1:55432/agent_mesh
 
-python3 -m agent_mesh migrate       # versioned migrations, idempotent
-python3 -m agent_mesh doctor --notify-test
+python3 -m ameesh migrate       # versioned migrations, idempotent
+python3 -m ameesh doctor --notify-test
 
 # register an agent pinned to this host, then run the machine's runner
-python3 -m agent_mesh.runner register deepseek7 deepseek --cwd ~/development/manaty/agent-mesh
-python3 -m agent_mesh.runner --max-turns 1
+python3 -m ameesh.runner register deepseek7 deepseek --cwd ~/development/manaty/agent-mesh
+python3 -m ameesh.runner --max-turns 1
 
 # talk to it
-python3 -m agent_mesh send deepseek7 "ton lot a bougé"
-python3 -m agent_mesh list            # mesh list: host, lease, unread, budget, key
+python3 -m ameesh send deepseek7 "ton lot a bougé"
+python3 -m ameesh list            # mesh list: host, lease, unread, budget, key
 
 # owner authority (test key only on the bench — the real key is the owner's act)
-python3 -m agent_mesh.mesh_cli key generate --out /tmp/cles --name test --i-am-the-owner
-python3 -m agent_mesh.mesh_cli key register proprietaire --public-key /tmp/cles/test.pub
-python3 -m agent_mesh.cli send deepseek7 "décision" --sign --key /tmp/cles/test.key --expires 12h
+python3 -m ameesh.mesh_cli key generate --out /tmp/cles --name test --i-am-the-owner
+python3 -m ameesh.mesh_cli key register proprietaire --public-key /tmp/cles/test.pub
+python3 -m ameesh.cli send deepseek7 "décision" --sign --key /tmp/cles/test.key --expires 12h
 
 # work items
-python3 -m agent_mesh.mesh_cli work add --title "un lot" --app nexlink --assignee deepseek7
-python3 -m agent_mesh.mesh_cli work list
+python3 -m ameesh.mesh_cli work add --title "un lot" --app nexlink --assignee deepseek7
+python3 -m ameesh.mesh_cli work list
 ```
 
 Repo-local wrappers: `bin/agent-mail`, `bin/agent-runner`, `bin/agent-mesh`
@@ -138,7 +138,7 @@ directory.
 ## Layout
 
 ```
-src/agent_mesh/
+src/ameesh/
   cli.py          agent-mail (v0-compatible)
   runner.py       agent-runner: leases, turns, NOTIFY wake, CLI
   adapters.py     claude / codex / deepseek command lines and JSONL readers

@@ -58,7 +58,7 @@ cat > ~/.config/agent-mesh/config.json <<'JSON'
 JSON
 chmod 600 ~/.config/agent-mesh/config.json
 export PYTHONPATH=~/development/manaty/agent-mesh/src
-python3 -m agent_mesh.mesh_cli doctor --notify-test   # migrations 4/4, notify OK
+python3 -m ameesh.mesh_cli doctor --notify-test   # migrations 4/4, notify OK
 ```
 
 Exercice de restauration obligatoire : `pg_dump` vers un fichier, restauration
@@ -77,7 +77,7 @@ python3 -m venv ~/.local/share/agent-mesh/venv
 ln -s ~/.local/share/agent-mesh/venv/bin/agent-mesh ~/.local/bin/agent-mesh
 ln -s ~/.local/share/agent-mesh/venv/bin/agent-runner ~/.local/bin/agent-runner
 
-python3 -m agent_mesh.mesh_cli migrate     # migrations versionnées, idempotentes
+python3 -m ameesh.mesh_cli migrate     # migrations versionnées, idempotentes
 agent-mesh doctor --notify-test
 #   → une migration de mise à niveau rétro-remplit le ledger des approbations
 #     déjà consommées (0007) ; une clé enregistrée avant 0005 devient « agent »
@@ -171,8 +171,8 @@ Choisir un agent dont la session peut être relancée sans risque (par exemple
    l'égalité pour un message non signé).
 
    **Identité** : en v1, le dossier ne donne plus d'identité. Un agent lancé par
-   `agent-runner` reçoit `AGENT_MAIL_NAME`, `AGENT_MESH_RUNNER_ID` et
-   `AGENT_MESH_LEASE_EPOCH` — le hook ne livre que si le bail est vivant et
+   `agent-runner` reçoit `AGENT_MAIL_NAME`, `AMEESH_RUNNER_ID` et
+   `AMEESH_LEASE_EPOCH` — le hook ne livre que si le bail est vivant et
    détenu par ce runner. Une session lancée à la main (orchestrateur, revue)
    doit poser `AGENT_MAIL_NAME=<nom>` dans l'environnement de ses hooks ; sinon
    elle ne consomme rien (c'est voulu : un `cd` dans un worktree étranger ne
@@ -234,7 +234,7 @@ Description=agent-mesh runner (un par machine)
 After=network-online.target
 
 [Service]
-EnvironmentFile=%h/.config/agent-mesh/env      # AGENT_MESH_DSN, AGENT_MESH_HOST
+EnvironmentFile=%h/.config/agent-mesh/env      # AMEESH_DSN, AMEESH_HOST
 ExecStart=%h/.local/share/agent-mesh/venv/bin/agent-runner --poll 5
 Restart=always
 RestartSec=5

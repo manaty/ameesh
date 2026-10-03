@@ -117,7 +117,7 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   l'heure où un remplaçant peut réclamer l'agent. Le `statement_timeout` reste
   la borne serveur, le délai client `psql` la borne du sous-processus.
 * **Requêtes bornées** — chaque connexion pose un `statement_timeout`
-  (`AGENT_MESH_STATEMENT_TIMEOUT_MS`, défaut 30 s) : un renouvellement de bail
+  (`AMEESH_STATEMENT_TIMEOUT_MS`, défaut 30 s) : un renouvellement de bail
   qui pend (verrou, requête lente) est annulé par le serveur ; le pilote `psql`
   ajoute un délai client (le même + 5 s) qui abandonne le sous-processus si le
   serveur ne répond plus du tout. Les migrations, elles, lèvent le délai le
@@ -206,8 +206,8 @@ test (trois messages → trois notifications) a attrapé le bug.
   disque (reprise après crash), stderr dans `stderr.log`.
 * **Chemin de reprise** : la session est relue depuis le registre, sinon depuis
   le fichier `session`.
-* **Binaire des harnais** : `AGENT_MESH_<HARNAIS>_BIN`, puis
-  `AGENT_MESH_BIN_DIR/<nom>`, puis le PATH. C'est ce qui permet au banc
+* **Binaire des harnais** : `AMEESH_<HARNAIS>_BIN`, puis
+  `AMEESH_BIN_DIR/<nom>`, puis le PATH. C'est ce qui permet au banc
   d'utiliser de faux harnais sans jamais appeler les vrais.
 * **Arrêt** : SIGTERM/SIGINT → les baux sont rendus (l'agent repart aussitôt
   ailleurs) ; SIGKILL → expiration naturelle.
@@ -228,7 +228,7 @@ script v0 et celle de la v1 pour les quatre événements.
 
 **Identité liée au bail, jamais au dossier (incident mesh-design du 2026-10-09).**
 Une session n'a d'identité que si `AGENT_MAIL_NAME` est posée ; si
-`AGENT_MESH_RUNNER_ID` et `AGENT_MESH_LEASE_EPOCH` le sont aussi (c'est le
+`AMEESH_RUNNER_ID` et `AMEESH_LEASE_EPOCH` le sont aussi (c'est le
 runner qui les pose pour le harnais qu'il lance), le bail doit être **vivant et
 détenu par ce runner à cet epoch** — sinon le hook ne consomme rien et rien
 n'est livré. Sans ces variables, une session qui lit dans le worktree d'un
@@ -243,7 +243,7 @@ vidé (`flush`) *avant* de marquer les messages remis ; si le harnais a fermé s
 entrée (BrokenPipe), la remise n'a pas lieu et le courrier reste pour le tour
 suivant.
 
-**Repli** : si Postgres est injoignable et que `AGENT_MESH_BACKEND=auto`
+**Repli** : si Postgres est injoignable et que `AMEESH_BACKEND=auto`
 (défaut), la CLI écrit dans la boîte fichier v0
 (`~/.local/state/agent-mail`, mêmes noms de fichiers, même JSON) et affiche un
 avertissement lisible sur stderr. En mode `pg`, elle échoue franchement. Un

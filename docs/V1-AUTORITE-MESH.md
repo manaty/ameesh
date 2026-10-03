@@ -74,7 +74,7 @@ base à la main.
 | `cryptography` | si importable | accélération, contre-vérification croisée |
 | `nacl` | si importable | idem |
 
-`AGENT_MESH_SIGNING_BACKEND=auto|pure|cryptography|nacl` choisit. L'implémentation
+`AMEESH_SIGNING_BACKEND=auto|pure|cryptography|nacl` choisit. L'implémentation
 pure est la RFC 8032 ; elle est validée par :
 
 * les **vecteurs de test RFC 8032 §7.1** (dont le message de 1024 octets) ;
