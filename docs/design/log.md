@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-04 (Q3)
+* **Décision** : [abandon de la cérémonie Ed25519, autorité par ameesh-approve](decisions/0012-autorite-par-ameesh-approve.md) ; Q3 close, Q6 ouverte (application native TPK).
+
 ## 2026-10-04 (revue codex3, B3)
 * **Correction** : R5 — identité d'action stable (clé d'idempotence) distincte du nonce d'autorisation ; nouvelle action après issue inconnue seulement par décision humaine assumant le doublon ; `Message-ID` ramené à une poignée de réconciliation.
 
