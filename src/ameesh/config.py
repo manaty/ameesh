@@ -90,12 +90,15 @@ def load(env: dict | None = None) -> Config:
     cfg_path = _expand(env.get("AMEESH_CONFIG") or env.get("AGENT_MESH_CONFIG") or DEFAULT_CONFIG)
     if not os.path.exists(cfg_path) and os.path.exists(legacy_cfg):
         cfg_path = legacy_cfg  # une config agent-mesh existante reste lue
+    raw: dict = {}
     if os.path.exists(cfg_path):
         try:
             with open(cfg_path, encoding="utf-8") as fh:
                 raw = json.load(fh)
         except (OSError, ValueError) as exc:  # config cassée : on le dit, on continue
             raise SystemExit("config illisible %s : %s" % (cfg_path, exc))
+        if not isinstance(raw, dict):
+            raise SystemExit("config illisible %s : objet JSON attendu" % cfg_path)
         known = {f for f in Config.__dataclass_fields__}  # type: ignore[attr-defined]
         cfg = replace(cfg, **{k: v for k, v in raw.items() if k in known})
 
@@ -106,14 +109,15 @@ def load(env: dict | None = None) -> Config:
         return default
 
     # AMEESH_* est le nom courant ; AGENT_MESH_* reste accepté (alias).
-    # Priorité : variable d'environnement > fichier de config > défaut, avec le
-    # repli sur l'ancien dossier (agent-mesh) seulement si rien n'est configuré
-    # (revue codex3 : un state_dir du JSON ne doit pas être écrasé).
+    # Priorité : variable d'environnement > fichier de config > défaut. Le repli
+    # sur l'ancien dossier (agent-mesh) ne vaut que si le JSON **ne dit rien** de
+    # `state_dir` : une valeur explicite égale au défaut reste un choix, et
+    # l'égalité de valeur ne prouve pas l'absence du champ (verdict codex3 B1).
     state_brut = pick("AMEESH_STATE", "AGENT_MESH_STATE", default=None)
     if state_brut:
         state_dir = _expand(state_brut)
-    elif cfg.state_dir != _expand(DEFAULT_STATE):
-        state_dir = _expand(cfg.state_dir)  # fixé par le fichier de config
+    elif "state_dir" in raw:
+        state_dir = _expand(str(raw["state_dir"] or DEFAULT_STATE))
     else:
         neuf, ancien = _expand(DEFAULT_STATE), _expand(LEGACY_STATE)
         state_dir = ancien if (os.path.isdir(ancien) and not os.path.isdir(neuf)) else neuf

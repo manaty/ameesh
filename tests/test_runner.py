@@ -440,6 +440,46 @@ class RunnerTest(PgTestCase):
             thread.join(timeout=5)
         self.assertFalse(thread.is_alive())
 
+    def test_attente_du_battement_ne_depasse_pas_l_echeance(self):
+        """Verdict codex3 B5a : `wait_timeout` n'a aucun plancher positif.
+
+        Nouvelle sonde réelle : bail à +20 ms ; un plancher de 50 ms laissait
+        l'ancien harnais vivant et `lease_lost=False` après l'échéance, pendant
+        qu'un vrai remplaçant réclamait l'agent. Ici le vrai `_heartbeat` reçoit
+        l'attente calculée : elle vaut le temps restant (~20 ms), et exactement
+        0 une fois l'échéance passée.
+        """
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "papa", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.02},
+        )
+        self.assertLessEqual(worker.wait_timeout(300), 0.03)
+        self.assertGreaterEqual(worker.wait_timeout(300), 0.0)
+
+        stop = mock.Mock()
+        stop.wait.return_value = False  # un tour de boucle, puis renew() coupe
+        with mock.patch.object(AgentWorker, "renew", return_value=False) as renew:
+            worker._heartbeat(stop)
+        renew.assert_called_once()
+        attente = stop.wait.call_args[0][0]
+        self.assertLessEqual(attente, 0.03, "le battement dort au-delà de l'échéance")
+        self.assertGreaterEqual(attente, 0.0)
+
+        expire = AgentWorker(
+            runner,
+            {"name": "quebec", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() - 1},
+        )
+        self.assertEqual(expire.wait_timeout(300), 0.0)  # aucun plancher
+        stop_expire = mock.Mock()
+        stop_expire.wait.return_value = False
+        with mock.patch.object(AgentWorker, "renew", return_value=False) as renew2:
+            expire._heartbeat(stop_expire)
+        self.assertEqual(stop_expire.wait.call_args[0][0], 0.0)
+        renew2.assert_called_once()
+
     def test_branche_bail_perdu_ne_perd_pas_la_consigne(self):
         """Sonde codex3 (2) : la clôture d'un tour au bail perdu restaure la consigne."""
         cwd = self._cwd("perdu")

@@ -251,9 +251,16 @@ class AgentWorker(threading.Thread):
             log("[%s] groupe toujours vivant après SIGKILL (état noyau ?)" % self.name)
 
     def wait_timeout(self, cap: float) -> float:
-        """Attente bornée par l'échéance du bail : on ne dort pas au-delà (B5a)."""
+        """Attente bornée par l'échéance du bail, **sans plancher positif**.
+
+        Un `max(0.05, …)` laissait le battement dormir jusqu'à 50 ms après une
+        échéance atteinte : le remplaçant pouvait réclamer l'agent pendant que
+        l'ancien harnais vivait encore (verdict codex3 B5a, bail à 20 ms).
+        À l'échéance dépassée, l'attente vaut exactement 0 et `renew()` coupe
+        immédiatement le harnais.
+        """
         if self.lease_deadline > 0:
-            return max(0.05, min(cap, self.lease_deadline - time.time()))
+            return max(0.0, min(cap, self.lease_deadline - time.time()))
         return cap
 
     def _heartbeat(self, stop_event: threading.Event) -> None:

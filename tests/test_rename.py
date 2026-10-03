@@ -57,6 +57,42 @@ class RenameTest(PgTestCase):
             cfg2 = config_mod.load(env={"AMEESH_CONFIG": cfg_path, "AMEESH_STATE": env_state})
             self.assertEqual(cfg2.state_dir, os.path.abspath(env_state))
 
+    def test_state_dir_json_egal_au_defaut_reste_un_choix(self):
+        """Verdict codex3 B1 : valeur égale au défaut ≠ champ absent.
+
+        JSON choisissant explicitement le nouveau DEFAULT_STATE, ancien dossier
+        présent et nouveau absent : la présence du champ doit gagner. Comparer
+        la valeur au défaut faisait basculer sur l'ancien dossier.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as dossier:
+            cfg_path = os.path.join(dossier, "config.json")
+            nouveau = os.path.join(dossier, "nouveau")
+            ancien = os.path.join(dossier, "ancien")
+            os.makedirs(ancien, exist_ok=True)
+
+            # Les constantes de chemin par défaut sont adaptées aux fixtures :
+            # le JSON contient donc exactement la valeur du défaut.
+            with mock.patch.object(config_mod, "DEFAULT_STATE", nouveau), \
+                    mock.patch.object(config_mod, "LEGACY_STATE", ancien):
+                with open(cfg_path, "w", encoding="utf-8") as fh:
+                    json.dump({"state_dir": nouveau}, fh)
+                cfg = config_mod.load(env={"AMEESH_CONFIG": cfg_path})
+                self.assertEqual(cfg.state_dir, os.path.abspath(nouveau))
+
+                # La variable d'environnement reste prioritaire, JSON présent.
+                env_state = os.path.join(dossier, "env-state")
+                cfg_env = config_mod.load(
+                    env={"AMEESH_CONFIG": cfg_path, "AMEESH_STATE": env_state})
+                self.assertEqual(cfg_env.state_dir, os.path.abspath(env_state))
+
+                # Champ réellement absent : là seulement, repli sur l'ancien
+                # dossier (présent) puisque le nouveau est absent.
+                with open(cfg_path, "w", encoding="utf-8") as fh:
+                    json.dump({}, fh)
+                cfg_vide = config_mod.load(env={"AMEESH_CONFIG": cfg_path})
+                self.assertEqual(cfg_vide.state_dir, os.path.abspath(ancien))
+
     def test_identite_lit_les_deux_noms(self):
         cfg = config_mod.load(env={})
         with mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": "alpha"}, clear=False):
