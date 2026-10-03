@@ -75,16 +75,29 @@ class _Incomplete(YamlError):
 # YAML : PyYAML si présent, sinon lecteur minimal
 # ==========================================================================
 
-def _normalize(value: Any) -> Any:
-    """Dates → texte ISO, récursivement : les deux lecteurs rendent la même chose."""
+def _normalize(value: Any, memo: dict | None = None) -> Any:
+    """Dates → texte ISO, récursivement : les deux lecteurs rendent la même chose.
+
+    Les objets partagés par des alias restent partagés (mémo par identité) :
+    une chaîne d'alias ne se déplie pas en une structure exponentielle.
+    """
     if isinstance(value, (_dt.datetime, _dt.date)):
         return value.isoformat()
+    if not isinstance(value, (dict, list)):
+        return value
+    memo = {} if memo is None else memo
+    if id(value) in memo:
+        return memo[id(value)]
     if isinstance(value, dict):
-        return {(_normalize(k) if not isinstance(k, str) else k): _normalize(v)
-                for k, v in value.items()}
-    if isinstance(value, list):
-        return [_normalize(v) for v in value]
-    return value
+        out: Any = {}
+        memo[id(value)] = out
+        for k, v in value.items():
+            out[_normalize(k, memo) if not isinstance(k, str) else k] = _normalize(v, memo)
+        return out
+    out = []
+    memo[id(value)] = out
+    out.extend(_normalize(v, memo) for v in value)
+    return out
 
 
 if _yaml is not None:
@@ -112,16 +125,17 @@ def load_yaml(text: str, *, use_pyyaml: bool | None = None) -> Any:
     """Document YAML → valeurs Python. `use_pyyaml=False` force le lecteur minimal."""
     if use_pyyaml is None:
         use_pyyaml = _yaml is not None
-    if use_pyyaml:
-        if _yaml is None:
-            raise YamlError("PyYAML indisponible")
-        try:
-            return _normalize(_yaml.load(text, Loader=_StrictLoader))  # noqa: S506 (SafeLoader)
-        except YamlError:
-            raise
-        except _yaml.YAMLError as exc:
-            raise YamlError(" ".join(str(exc).split())) from exc
-    return _MiniYaml(text).parse()
+    try:
+        if use_pyyaml:
+            if _yaml is None:
+                raise YamlError("PyYAML indisponible")
+            try:
+                return _normalize(_yaml.load(text, Loader=_StrictLoader))  # noqa: S506 (SafeLoader)
+            except _yaml.YAMLError as exc:
+                raise YamlError(" ".join(str(exc).split())) from exc
+        return _MiniYaml(text).parse()
+    except RecursionError as exc:
+        raise YamlError("imbrication trop profonde") from exc
 
 
 _INT_RE = re.compile(r"^[-+]?(0|[1-9][0-9]*)$")
@@ -981,6 +995,21 @@ def _remote_of(repo: str, rev: str) -> str:
     return head if head in remotes else DEFAULT_REMOTE
 
 
+def _norm_url(url: str) -> str:
+    """URL de dépôt comparable : sans schéma, utilisateur, `.git` ni `/` final."""
+    text = url.strip()
+    scp = re.match(r"^[\w.-]+@([^:/]+):(.*)$", text)
+    if scp:
+        text = "%s/%s" % (scp.group(1), scp.group(2))
+    else:
+        text = re.sub(r"^[a-z][a-z0-9+.-]*://", "", text, flags=re.I)
+        text = re.sub(r"^[^@/]+@", "", text)
+    text = text.rstrip("/")
+    if text.endswith(".git"):
+        text = text[:-4]
+    return text.lower()
+
+
 def git_fetch(repo: str, remote: str) -> str:
     """`git fetch` sans crochets ; renvoie '' ou le message d'erreur."""
     try:
@@ -1105,6 +1134,19 @@ class _Loader:
             self.add("canon-git-error", ERROR, str(exc), member=member)
             return None
 
+    def _check_repository(self, source: Source, entry: dict | None) -> None:
+        """Le dépôt lu est-il celui que le manifeste déclare ? (diagnostic)"""
+        declared = str((entry or {}).get("repository") or "")
+        if source.mode != "git" or not declared:
+            return
+        remote = source.rev.split("/", 1)[0] if "/" in source.rev else DEFAULT_REMOTE
+        actual = _git_out(source.repo, "remote", "get-url", "--", remote) or ""
+        if _norm_url(actual) != _norm_url(declared):
+            self.add("member-repository-mismatch", WARNING,
+                     "le dépôt %s de %s (%s) n'est pas celui du manifeste (%s)"
+                     % (remote, source.member, actual or "absent", declared),
+                     member=source.member)
+
     def _read_manifest(self, source: Source) -> bytes | None:
         if source.mode == "git":
             path = (source.prefix + "/" if source.prefix else "") + "federation.yaml"
@@ -1179,6 +1221,7 @@ class _Loader:
                     return self.canon
                 raw = self._read_manifest(root)
                 manifest = self._parse_manifest(raw, root_id) if raw is not None else None
+            self._check_repository(root, root_entry)
         self.canon.federation = manifest
         self.canon.sources.append(root)
         if manifest is not None:
@@ -1245,6 +1288,8 @@ class _Loader:
             source = self._source(member, directory, "%s/%s" % (DEFAULT_REMOTE, branch),
                                   False, same_repo_commit=anchor)
             if source is not None:
+                if source.repo != root.repo:
+                    self._check_repository(source, entry)
                 self.canon.sources.append(source)
 
     # -- fiches ------------------------------------------------------------------

@@ -186,6 +186,19 @@ class YamlTest(unittest.TestCase):
                     with self.assertRaises(canon.YamlError):
                         canon.load_yaml(text, use_pyyaml=use)
 
+    def test_entrees_hostiles(self):
+        # chaîne d'alias : les objets restent partagés, rien ne se déplie
+        lignes = ["a0: &a0 [x, x, x, x, x, x, x, x, x, x]"]
+        lignes += ["a%d: &a%d [*a%d, *a%d, *a%d, *a%d, *a%d, *a%d, *a%d, *a%d]"
+                   % ((i, i) + (i - 1,) * 8) for i in range(1, 30)]
+        text = "\n".join(lignes) + "\n"
+        for use in ([False, True] if HAS_PYYAML else [False]):
+            with self.subTest(pyyaml=use):
+                data = canon.load_yaml(text, use_pyyaml=use)
+                self.assertIs(data["a29"][0], data["a29"][1])
+                with self.assertRaises(canon.YamlError):
+                    canon.load_yaml("a: " + "[" * 5000 + "]" * 5000 + "\n", use_pyyaml=use)
+
     def test_lecteur_par_defaut(self):
         """Sans PyYAML importable, le lecteur minimal prend le relais."""
         with mock.patch.object(canon, "_yaml", None):
@@ -521,7 +534,8 @@ class FederationTest(_TmpMixin, unittest.TestCase):
         "  - id: home\n    repository: https://example.invalid/home\n    ref: main\n"
         "    bundle: .\n    entrypoint: index.md\n    workspace_path: home\n"
         "    enforcement: required\n"
-        "  - id: equipe\n    ref: main\n    bundle: knowledge\n    workspace_path: equipe\n"
+        "  - id: equipe\n    repository: __EQUIPE__\n    ref: main\n    bundle: knowledge\n"
+        "    workspace_path: equipe\n"
         "  - id: absente\n    ref: main\n    bundle: .\n    workspace_path: absente\n"
         "roles:\n  project-maintainers:\n    resolver:\n      kind: literal\n"
         "      members: [human:alice]\n"
@@ -533,7 +547,10 @@ class FederationTest(_TmpMixin, unittest.TestCase):
         _b, self.home = publish(self.workspace, "home")
         for sub in ("membres", "hotes"):
             shutil.copytree(os.path.join(EXAMPLE, sub), os.path.join(self.home, sub))
-        write(self.home, "federation.yaml", self.MANIFEST)
+        # le dépôt d'equipe est déclaré par son chemin, avec un `/` final toléré
+        self.manifest = self.MANIFEST.replace(
+            "__EQUIPE__", os.path.join(self.workspace, "remotes", "equipe.git/"))
+        write(self.home, "federation.yaml", self.manifest)
         commit_all(self.home)
         _b, self.equipe = publish(self.workspace, "equipe")
         for sub in ("agents", "placements"):
@@ -546,7 +563,11 @@ class FederationTest(_TmpMixin, unittest.TestCase):
         loaded = canon.load(self.home)
         findings = canon.validate(loaded)
         self.assertEqual(codes(findings, canon.ERROR), set(), findings)
-        self.assertEqual(codes(findings, canon.WARNING), {"member-absent"})
+        self.assertEqual(codes(findings, canon.WARNING),
+                         {"member-absent", "member-repository-mismatch"})
+        # seul home déclare un dépôt (fictif) qui n'est pas son origin
+        self.assertEqual([f.member for f in findings
+                          if f.code == "member-repository-mismatch"], ["home"])
         self.assertEqual(sorted(s.member for s in loaded.sources), ["equipe", "home"])
         ref = loaded.agent("ouvrier").fiche.ref
         self.assertEqual(ref, "equipe:knowledge/agents/ouvrier.md@%s" % self.equipe_main)
@@ -554,8 +575,15 @@ class FederationTest(_TmpMixin, unittest.TestCase):
                          ["human:alice"])
         self.assertEqual(loaded.review_policies["self_approval"], "forbidden")
 
+    def test_urls_de_depot_comparables(self):
+        forms = ("git@github.com:acme/home.git", "https://github.com/acme/home",
+                 "ssh://git@github.com/acme/home.git/", "HTTPS://GitHub.com/acme/home/")
+        self.assertEqual(len({canon._norm_url(u) for u in forms}), 1)
+        self.assertNotEqual(canon._norm_url("https://github.com/acme/home"),
+                            canon._norm_url("https://github.com/autre/home"))
+
     def test_chemin_qui_sort_du_dossier_de_travail(self):
-        write(self.home, "federation.yaml", self.MANIFEST.replace(
+        write(self.home, "federation.yaml", self.manifest.replace(
             "workspace_path: equipe", "workspace_path: ../../etc"))
         commit_all(self.home)
         findings = canon.validate(canon.load(self.home))
