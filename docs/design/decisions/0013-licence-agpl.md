@@ -20,27 +20,33 @@ le propriétaire a choisi l'AGPL.
 # Décision
 
 - ameesh est publié sous **GNU Affero General Public License v3**, variante
-  **`AGPL-3.0-only`** : les termes sont figés à la v3, personne d'autre que
-  Manaty ne peut les faire évoluer.
+  **`AGPL-3.0-only`** : la version de la licence est fixée à la v3 ; seul un
+  titulaire des droits sur le code concerné peut décider de la changer.
 - Les **contributions externes** sont acceptées seulement sous un **accord de
-  contribution** (CLA) qui laisse à Manaty la possibilité de relicencier
-  (passage ultérieur à `or-later`, à une future version, ou double licence).
+  contribution** (CLA, à rédiger) destiné à laisser à Manaty la possibilité de
+  relicencier (passage ultérieur à `or-later`, à une future version, ou double
+  licence).
 
 # Conséquences
 
 - Quiconque fait tourner une version **modifiée** d'ameesh comme service
   accessible par le réseau doit en offrir le code source à ses utilisateurs.
-- **Manaty, titulaire des droits, n'est pas contraint par sa propre licence** :
-  il peut proposer une licence commerciale à côté (double licence) et intégrer
-  ameesh à Nexlink librement ; l'accord de contribution préserve cette liberté
-  quand des contributeurs externes arrivent.
+- **Politique visée, conditionnée aux droits effectivement détenus** : pour le
+  code dont Manaty détient les droits, Manaty n'est pas contraint par sa propre
+  licence (double licence, intégration dans Nexlink). Pour le code d'autres
+  auteurs, cette liberté dépend des droits concédés par le CLA, qui n'est pas
+  encore rédigé ; **aucune garantie de relicenciement de code tiers** n'est
+  donnée ici. La titularité des contributions produites par des agents
+  opérés pour Manaty est à confirmer dans le même travail.
 - `or-later` a été écarté : il permettrait de choisir une future version de la
   licence qui pourrait être plus permissive (par exemple sans la clause réseau).
-  Grâce à l'accord de contribution, `only` ne ferme aucune porte.
-- Dépendances : MIT, BSD, Apache-2.0, LGPL et MPL-2.0 sont compatibles avec
-  l'AGPL v3 (py_webauthn BSD-3, python-fido2 BSD-2, SDK MCP…). Se connecter par
-  API à des services AGPL (Zammad, Synapse) ne pose pas de question.
-- À faire avant le passage public : fichier `LICENSE` (texte officiel), CLA et
-  sa vérification sur les PR,
-  métadonnées du paquet, en-têtes SPDX, retrait du DSN de banc codé en dur,
-  détection de secrets sur l'historique.
+  Avec un CLA adéquat, `only` laisse ouverte une évolution ultérieure.
+- **Compatibilité des dépendances et des intégrations : étude à faire**, pas un
+  résultat acquis. Elle portera sur les licences et versions exactes de chaque
+  dépendance distribuée (bibliothèques WebAuthn, SDK MCP…) et sur la topologie
+  des intégrations (appel par API de services sous AGPL comme Zammad ou
+  Synapse, ou distribution combinée).
+- À faire avant le passage public : fichier `LICENSE` (texte officiel),
+  métadonnées du paquet, en-têtes SPDX, retrait du DSN de banc codé en dur
+  (lot en cours chez deepseek7) ; CLA et sa vérification sur les PR ; étude de
+  compatibilité des licences ; détection de secrets sur l'historique.

@@ -17,6 +17,10 @@ generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:30:00+02:00" 
 
 # Attend une étude ou un prototype
 
+- Licences : rédaction du CLA et titularité des contributions produites par
+  des agents ; compatibilité, version par version, des dépendances distribuées
+  et des intégrations avec l'AGPL-3.0-only ([0013](decisions/0013-licence-agpl.md)).
+
 - Profil ameesh d'OKF Federation : types `Agent`, `Team`, `WorkPackage`,
   `Pipeline` ; liaison `human:<id>` → passkey / clé d'appareil ; `agent:<id>` → compte.
   Une partie pourrait remonter dans okf-federation.
