@@ -671,6 +671,49 @@ class RunnerTest(PgTestCase):
                 proc.kill()
                 proc.wait(timeout=5)
 
+    def test_panne_de_base_definitive_tue_avant_tout_journal(self):
+        """Revue codex3 de 852c8da : au 3e échec de base, le journal partait
+        avant le test définitif et le SIGKILL.
+
+        Un journal bloqué ne doit pas retarder l'arrêt : ici l'ordre est
+        instrumenté, le premier événement doit être le signal.
+        """
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "uniform", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 3600},
+        )
+        worker.proc = proc
+        worker.pgid = proc.pid
+        worker.renew_failures = AgentWorker.MAX_RENEW_FAILURES - 1
+        ordre: list[tuple] = []
+        vrai_signal = AgentWorker._signal_group
+
+        def signal_trace(pgid, cible, sig):
+            ordre.append(("signal", sig))
+            vrai_signal(pgid, cible, sig)
+
+        def log_trace(message):
+            ordre.append(("log", message))
+
+        try:
+            with mock.patch.object(AgentWorker, "_signal_group",
+                                   staticmethod(signal_trace)), \
+                    mock.patch("ameesh.runner.log", side_effect=log_trace), \
+                    mock.patch.object(registry, "renew",
+                                      side_effect=db_mod.DbError("base injoignable")):
+                self.assertFalse(worker.renew())
+            self.assertTrue(worker.lease_lost.is_set())
+            self.assertTrue(ordre, "l'arrêt doit être tracé")
+            self.assertEqual(ordre[0][0], "signal", "un journal précède le SIGKILL")
+            self.assertEqual(ordre[0][1], signal.SIGKILL)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
 
 if __name__ == "__main__":
     unittest.main()

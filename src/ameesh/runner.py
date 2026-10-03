@@ -157,14 +157,21 @@ class AgentWorker(threading.Thread):
             return False
         if error is not None:
             self.renew_failures += 1
-            log("[%s] battement : base injoignable (%s) — échec %d/%d"
-                % (self.name, error, self.renew_failures, self.MAX_RENEW_FAILURES))
-            if self.renew_failures >= self.MAX_RENEW_FAILURES or time.time() >= self.lease_deadline:
-                self.lease_lost.set()
-                self.terminate(grace=0, hard=True)
-                log("[%s] bail considéré perdu (base injoignable) : arrêt du harnais" % self.name)
-                return False
-            return True  # on laisse une chance au prochain battement
+            echec = ("[%s] battement : base injoignable (%s) — échec %d/%d"
+                     % (self.name, error, self.renew_failures, self.MAX_RENEW_FAILURES))
+            definitive = (self.renew_failures >= self.MAX_RENEW_FAILURES
+                          or time.time() >= self.lease_deadline)
+            if not definitive:
+                log(echec)  # pas encore définitif : diagnostic, aucun arrêt
+                return True  # on laisse une chance au prochain battement
+            # Perte définitive : arrêter avant d'écrire quoi que ce soit (un
+            # journal bloqué ne doit pas retarder le SIGKILL, comme sur les
+            # autres chemins de perte — revue codex3 de 852c8da).
+            self.lease_lost.set()
+            self.terminate(grace=0, hard=True)
+            log(echec)
+            log("[%s] bail considéré perdu (base injoignable) : arrêt du harnais" % self.name)
+            return False
         if expires is None:
             self.lease_lost.set()
             self.terminate(grace=0, hard=True)  # SIGKILL direct : plus de chevauchement
