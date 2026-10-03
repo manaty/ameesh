@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-04 (Q6)
+* **Décision** : [aucun client nommé, interfaces publiques des façades](decisions/0015-interfaces-des-facades.md) ; Q6 close ; mentions de clients retirées des documents ; Q8 ouverte (historique avant passage public).
+
 ## 2026-10-04 (Q5)
 * **Décision** : [orchestrateurs à tours et placement gouverné](decisions/0014-orchestrateurs-a-tours-et-placement.md) ; exigence R18 ; Q5 close.
 
@@ -7,7 +10,7 @@
 * **Décision** : [licence AGPL-3.0-only avec accord de contribution](decisions/0013-licence-agpl.md) ; Q4 close.
 
 ## 2026-10-04 (Q3)
-* **Décision** : [abandon de la cérémonie Ed25519, autorité par ameesh-approve](decisions/0012-autorite-par-ameesh-approve.md) ; Q3 close, Q6 ouverte (application native TPK).
+* **Décision** : [abandon de la cérémonie Ed25519, autorité par ameesh-approve](decisions/0012-autorite-par-ameesh-approve.md) ; Q3 close, Q6 ouverte (application native).
 
 ## 2026-10-04 (revue codex3, B3)
 * **Correction** : R5 — identité d'action stable (clé d'idempotence) distincte du nonce d'autorisation ; nouvelle action après issue inconnue seulement par décision humaine assumant le doublon ; `Message-ID` ramené à une poignée de réconciliation.

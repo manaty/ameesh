@@ -3,7 +3,7 @@
 **Status:** documentation of the working setup (2026-10-03) and a v1 proposal.
 The proposal (§5) waits for the owner's decisions (§6). Companion of
 `README.md` (distributed agent-mail AM1–AM9, Slack replacement AM10–AM15) and
-of `issue-manager-agent/docs/MULTI_AGENT_MESH_DESIGN.md` (ThePackengers).
+of `issue-manager-agent/docs/MULTI_AGENT_MESH_DESIGN.md`.
 
 ## 1. State of the art (October 2026)
 
@@ -63,7 +63,7 @@ tembo.io/blog/claude-code-multi-agent-orchestration.
 - the owner's authority is a convention, not a proof;
 - there is one machine: when it lost power on 2026-10-03, everything stopped.
 
-## 3. What issue-manager-agent (IMA, ThePackengers) already has
+## 3. What issue-manager-agent (IMA) already has
 
 - **Postgres state**: `work_items`, a cross-pipeline state machine
   (`intake → build → qa → merged → promoted`, plus `blocked` and

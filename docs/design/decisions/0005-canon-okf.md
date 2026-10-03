@@ -12,7 +12,7 @@ generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:00:00+02:00" 
 
 # Contexte
 
-Le propriétaire maintient déjà des fédérations OKF (manaty/okf-federation, thepackengers/home niveau 1).
+Le propriétaire maintient déjà la spécification OKF Federation (manaty/okf-federation) et des fédérations qui l'appliquent.
 
 # Décision
 
