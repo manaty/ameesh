@@ -30,6 +30,7 @@ import argparse
 import dataclasses
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -43,6 +44,47 @@ from .config import load as load_config
 
 def log(message: str) -> None:
     print("%s %s" % (time.strftime("%H:%M:%S"), message), flush=True)
+
+
+class _AsyncLog:
+    """Journal non bloquant pour le fil du battement (sondes codex3 B5a-N).
+
+    Un `print`+flush sur un tube plein bloque indéfiniment : le fil du
+    battement n'atteint plus l'échéance, le bail expire et un remplaçant peut
+    réclamer l'agent pendant que l'ancien harnais vit encore. Les messages
+    partent donc par une file **bornée**, écrite par un fil dédié ; si le puits
+    sature, le message est abandonné et la perte comptée, jamais attendue.
+    """
+
+    def __init__(self, maxsize: int = 1024) -> None:
+        self.queue: "queue.Queue[str]" = queue.Queue(maxsize)
+        self.perdus = 0
+        self.thread = threading.Thread(target=self._drain, name="journal", daemon=True)
+        self.thread.start()
+
+    def _drain(self) -> None:
+        while True:
+            message = self.queue.get()
+            if message is None:
+                return
+            if self.perdus:
+                perdus, self.perdus = self.perdus, 0
+                log("[journal] %d message(s) abandonné(s) : puits saturé" % perdus)
+            log(message)
+
+    def write(self, message: str) -> None:
+        try:
+            self.queue.put_nowait(message)
+        except queue.Full:
+            self.perdus += 1
+
+
+_journal = _AsyncLog()
+
+
+def log_async(message: str) -> None:
+    """Journal d'un chemin qui ne doit **jamais** attendre le puits (battement)."""
+    _journal.write(message)
 
 
 class AgentWorker(threading.Thread):
@@ -73,6 +115,9 @@ class AgentWorker(threading.Thread):
         self.renew_failures = 0
         self.lease_deadline = float(lease.get("lease_expires_ts") or 0.0)
         self.pgid: int | None = None  # groupe du harnais en cours
+        self.watchdog_lock = threading.Lock()
+        self.watchdog_on = False
+        self.watchdog_stop = threading.Event()
 
     # -- état local --------------------------------------------------------
     def _path(self, name: str) -> str:
@@ -146,14 +191,14 @@ class AgentWorker(threading.Thread):
             # on ne tente même pas le renouvellement, on arrête tout de suite.
             self.lease_lost.set()
             self.terminate(grace=0, hard=True)
-            log("[%s] échéance du bail atteinte : arrêt du harnais" % self.name)
+            log_async("[%s] échéance du bail atteinte : arrêt du harnais" % self.name)
             return False
         answered, expires, error = self._renew_call()
         if not answered:
             self.lease_lost.set()
             self.terminate(grace=0, hard=True)
-            log("[%s] renouvellement sans réponse au-delà du bail : arrêt du harnais"
-                % self.name)
+            log_async("[%s] renouvellement sans réponse au-delà du bail : arrêt du harnais"
+                      % self.name)
             return False
         if error is not None:
             self.renew_failures += 1
@@ -162,26 +207,31 @@ class AgentWorker(threading.Thread):
             definitive = (self.renew_failures >= self.MAX_RENEW_FAILURES
                           or time.time() >= self.lease_deadline)
             if not definitive:
-                log(echec)  # pas encore définitif : diagnostic, aucun arrêt
+                # Diagnostic par la file non bloquante : le fil du battement
+                # doit continuer à surveiller l'échéance même si le puits est
+                # plein (sonde codex3 B5a-N).
+                log_async(echec)
                 return True  # on laisse une chance au prochain battement
             # Perte définitive : arrêter avant d'écrire quoi que ce soit (un
             # journal bloqué ne doit pas retarder le SIGKILL, comme sur les
             # autres chemins de perte — revue codex3 de 852c8da).
             self.lease_lost.set()
             self.terminate(grace=0, hard=True)
-            log(echec)
-            log("[%s] bail considéré perdu (base injoignable) : arrêt du harnais" % self.name)
+            log_async(echec)
+            log_async("[%s] bail considéré perdu (base injoignable) : arrêt du harnais"
+                      % self.name)
             return False
         if expires is None:
             self.lease_lost.set()
             self.terminate(grace=0, hard=True)  # SIGKILL direct : plus de chevauchement
-            log("[%s] bail perdu (epoch %d) : arrêt du tour" % (self.name, self.epoch))
+            log_async("[%s] bail perdu (epoch %d) : arrêt du tour" % (self.name, self.epoch))
             return False
         self.renew_failures = 0
         self.lease_deadline = float(expires)
         return True
 
     def release_lease(self) -> None:
+        self.watchdog_stop.set()  # le veilleur n'a plus de bail à défendre
         if self.lease_lost.is_set():
             return
         try:
@@ -260,7 +310,7 @@ class AgentWorker(threading.Thread):
         # Le signal part avant le journal : un print+flush sur le chemin
         # critique laissait le temps à un remplaçant de réclamer sous charge.
         self._signal_group(pgid, proc, signal.SIGKILL)
-        log("[%s] le groupe du harnais survit : SIGKILL" % self.name)
+        log_async("[%s] le groupe du harnais survit : SIGKILL" % self.name)
         # SIGKILL est asynchrone. On moissonne d'abord l'enfant direct (sinon
         # son zombie garde le groupe « vivant »), puis on attend la disparition
         # du groupe entier, dans le même budget de 2 s.
@@ -273,7 +323,7 @@ class AgentWorker(threading.Thread):
         while time.monotonic() < fin and self._group_alive(pgid):
             time.sleep(0.005)
         if self._group_alive(pgid):
-            log("[%s] groupe toujours vivant après SIGKILL (état noyau ?)" % self.name)
+            log_async("[%s] groupe toujours vivant après SIGKILL (état noyau ?)" % self.name)
 
     def wait_timeout(self, cap: float) -> float:
         """Attente bornée par l'échéance du bail, **sans plancher positif**.
@@ -288,7 +338,50 @@ class AgentWorker(threading.Thread):
             return max(0.0, min(cap, self.lease_deadline - time.time()))
         return cap
 
+    #: réveil maximal du veilleur : il relit l'échéance au moins à ce rythme.
+    WATCHDOG_TICK = 0.25
+
+    def ensure_watchdog(self) -> None:
+        """Démarre le veilleur d'échéance, une seule fois par agent."""
+        with self.watchdog_lock:
+            if self.watchdog_on:
+                return
+            self.watchdog_on = True
+        threading.Thread(target=self._deadline_watchdog, daemon=True,
+                         name="%s-watchdog" % self.name).start()
+
+    def _deadline_watchdog(self) -> None:
+        """Seul juge de l'échéance (sonde codex3 B5a-N) : **aucune E/S**.
+
+        Il ne dépend d'aucun autre fil : même si le battement est bloqué dans un
+        journal, une requête ou une écriture de fichier, il arrête le harnais
+        dès que l'échéance connue du bail est atteinte. Il ne lit que
+        `lease_deadline` et `time.time`, n'attend que sur un Event (borné par
+        `WATCHDOG_TICK`), puis pose `lease_lost` et envoie le SIGKILL.
+        """
+        while (not self.watchdog_stop.is_set() and not self.stopping.is_set()
+               and not self.lease_lost.is_set()):
+            deadline = self.lease_deadline
+            if deadline <= 0:
+                self.watchdog_stop.wait(self.WATCHDOG_TICK)
+                continue
+            reste = deadline - time.time()
+            if reste > 0:
+                # Réveil au plus tard à l'échéance ; relecture régulière pour
+                # voir une échéance repoussée (renouvellement) ou modifiée.
+                self.watchdog_stop.wait(min(reste, self.WATCHDOG_TICK))
+                continue
+            if self.watchdog_stop.is_set() or self.stopping.is_set():
+                return
+            if self.lease_deadline > time.time():
+                continue  # bail renouvelé entre-temps : rien à faire
+            self.lease_lost.set()
+            log_async("[%s] échéance du bail atteinte : arrêt du harnais" % self.name)
+            self.terminate(grace=0, hard=True)
+            return
+
     def _heartbeat(self, stop_event: threading.Event) -> None:
+        self.ensure_watchdog()
         interval = max(3.0, self.runner.lease_ttl / 3.0)
         while not stop_event.wait(self.wait_timeout(interval)):
             if not self.renew():
@@ -492,6 +585,7 @@ class AgentWorker(threading.Thread):
     # -- boucles -----------------------------------------------------------
     def process_once(self, wait_seconds: float) -> bool:
         """Mode banc : au plus un tour, en attendant `wait_seconds` du travail."""
+        self.ensure_watchdog()
         deadline = time.monotonic() + max(0.0, wait_seconds)
         while True:
             spec = self.pick()
@@ -505,6 +599,7 @@ class AgentWorker(threading.Thread):
 
     def run(self) -> None:
         """Mode service : boucle jusqu'à l'arrêt, réveillée par NOTIFY."""
+        self.ensure_watchdog()
         try:
             while not self.stopping.is_set() and not self.runner.stop.is_set():
                 if not self.renew():

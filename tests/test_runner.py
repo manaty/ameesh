@@ -714,6 +714,106 @@ class RunnerTest(PgTestCase):
                 proc.kill()
                 proc.wait(timeout=5)
 
+    def test_journal_bloque_ne_bloque_pas_le_battement(self):
+        """Sonde codex3 B5a-N : un puits de journal saturé ne doit pas
+        immobiliser le fil du battement.
+
+        Le diagnostic d'une erreur non définitive passe par une file bornée
+        (perte comptée) : `renew` rend la main tout de suite, puis l'échéance
+        tue quand même le harnais.
+        """
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "xray", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 30},
+        )
+        worker.proc = proc
+        worker.pgid = proc.pid
+        bloque = threading.Event()
+
+        def puits_bloque(message):
+            bloque.wait(2)  # le puits ne rend pas la main
+
+        try:
+            with mock.patch("ameesh.runner.log", side_effect=puits_bloque), \
+                    mock.patch.object(registry, "renew",
+                                      side_effect=db_mod.DbError("base injoignable")):
+                debut = time.monotonic()
+                self.assertTrue(worker.renew())  # 1er échec : non définitif
+                self.assertLess(time.monotonic() - debut, 0.3,
+                                "le journal bloqué immobilise le battement")
+                self.assertFalse(worker.lease_lost.is_set())
+                # l'échéance tombe : le battement doit encore pouvoir arrêter
+                worker.lease_deadline = time.time() - 1
+                bloque.set()  # libère le puits pour la fin du test
+                self.assertFalse(worker.renew())
+            self.assertTrue(worker.lease_lost.is_set())
+            self.assertIsNotNone(proc.poll())
+        finally:
+            bloque.set()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_veilleur_arrete_meme_battement_bloque(self):
+        """Sonde codex3 B5a-N traitée par classe : le veilleur d'échéance est
+        indépendant du battement.
+
+        Même si `renew` ne rend jamais la main (journal, requête, fichier),
+        le harnais est arrêté à l'échéance connue du bail.
+        """
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "whiskey", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.3},
+        )
+        worker.proc = proc
+        worker.pgid = proc.pid
+        bloque = threading.Event()
+        stop = threading.Event()
+        try:
+            with mock.patch.object(AgentWorker, "renew",
+                                   side_effect=lambda: bloque.wait(5)):
+                thread = threading.Thread(target=worker._heartbeat, args=(stop,), daemon=True)
+                thread.start()
+                self.wait_for(lambda: worker.lease_lost.is_set(), timeout=3, interval=0.01)
+            self.assertIsNotNone(proc.poll(), "le veilleur doit tuer à l'échéance")
+        finally:
+            bloque.set()
+            stop.set()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_veilleur_ne_tue_pas_un_bail_renouvele(self):
+        """Le veilleur n'est pas un minuteur : une échéance repoussée par un
+        renouvellement réussi ne doit pas tuer le harnais."""
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "yankee", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.25},
+        )
+        worker.proc = proc
+        worker.pgid = proc.pid
+        try:
+            worker.ensure_watchdog()
+            time.sleep(0.1)
+            worker.lease_deadline = time.time() + 1.5  # renouvellement réussi
+            time.sleep(0.4)  # bien au-delà de l'ancienne échéance
+            self.assertFalse(worker.lease_lost.is_set(), "un bail renouvelé a été tué")
+            self.assertIsNone(proc.poll(), "le harnais doit rester vivant")
+        finally:
+            worker.watchdog_stop.set()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
 
 if __name__ == "__main__":
     unittest.main()

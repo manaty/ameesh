@@ -130,6 +130,25 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   exemple), le battement conclut à la perte du bail et arrête le harnais à
   l'heure où un remplaçant peut réclamer l'agent. Le `statement_timeout` reste
   la borne serveur, le délai client `psql` la borne du sous-processus.
+* **Veilleur d'échéance indépendant, journal non bloquant** — un fil dédié
+  (`_deadline_watchdog`) ne fait que lire `lease_deadline` et `time.time`, puis
+  poser `lease_lost` et envoyer le SIGKILL dès que l'échéance connue est
+  atteinte. Il n'écrit rien, n'appelle ni la base ni un fichier et n'attend
+  aucun autre fil : même si le battement est bloqué dans un journal plein, une
+  requête ou une écriture, l'arrêt part à l'échéance (sonde codex3 B5a-N,
+  classe des E/S bloquantes sur ce chemin). Les journaux du chemin de perte de
+  bail (battement, `terminate`) passent par une file bornée écrite par un fil
+  dédié : si le puits sature, le message est abandonné et la perte comptée et
+  signalée, jamais attendue.
+  **Inventaire des E/S restantes sur le chemin du bail, avec leur borne :**
+  l'appel `renew` tourne dans un fil séparé, rejoint au plus tard au temps
+  restant du bail (`call_budget`, plancher 0), avec `statement_timeout` serveur
+  (30 s par défaut) et délai client `psql` (+5 s) ; les diagnostics du battement
+  passent par la file bornée (aucune attente) ; sur perte du bail, `terminate`
+  envoie le SIGKILL avant tout journal, moissonne l'enfant direct et borne
+  l'attente du groupe à 2 s ; le veilleur lui-même n'a aucune E/S. Le seul fil
+  qui peut rester bloqué est l'écrivain de journal, qui ne perd alors que des
+  messages.
 * **Requêtes bornées** — chaque connexion pose un `statement_timeout`
   (`AMEESH_STATEMENT_TIMEOUT_MS`, défaut 30 s) : un renouvellement de bail
   qui pend (verrou, requête lente) est annulé par le serveur ; le pilote `psql`
