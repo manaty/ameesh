@@ -920,6 +920,46 @@ class RunnerTest(PgTestCase):
         self.assertIn(("terminate", True), ordre)
         self.assertLess(ordre.index(("terminate", True)), ordre.index(("release", None)))
 
+    def test_publication_tardive_apres_relachement_est_tuee(self):
+        """Sonde codex3 B5a-Q : une publication tardive après un shutdown qui a
+        rendu le bail et arrêté le veilleur doit être tuée, même si l'ancienne
+        échéance n'est pas encore atteinte.
+        """
+        cwd = self._cwd("pubshutdown")
+        self.register("pubshutdown", "claude", cwd=cwd, prompt="tour")
+        runner = Runner(self.cfg, self.db, once=True)
+        lease = registry.claim(self.db, "pubshutdown", runner.runner_id, 3600)
+        self.assertIsNotNone(lease)
+        agent = registry.get(self.db, "pubshutdown")
+        worker = AgentWorker(runner, agent, lease)
+        vrai_popen = subprocess.Popen
+
+        def popen_retarde(*args, **kwargs):
+            proc = vrai_popen(*args, **kwargs)
+            # shutdown a rendu le bail et arrêté le veilleur pendant la création
+            worker.stopping.set()
+            worker.watchdog_stop.set()
+            time.sleep(0.05)
+            return proc
+
+        fakebin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakebin")
+        env = {"AMEESH_BIN_DIR": fakebin, "AMEESH_TEST_SLEEP": "5",
+               "AMEESH_TEST_LOG": self.turns_log}
+        debut = time.monotonic()
+        try:
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch("ameesh.runner.subprocess.Popen", side_effect=popen_retarde):
+                ok = worker.run_turn({"kind": "prompt", "prompt": "tour", "ids": []})
+            ecoule = time.monotonic() - debut
+            self.assertFalse(ok)
+            self.assertLess(ecoule, 2.0, "le harnais publié doit être tué, pas attendu")
+            self.assertTrue(worker.lease_lost.is_set())
+        finally:
+            if worker.proc is not None and worker.proc.poll() is None:
+                worker.proc.kill()
+                worker.proc.wait(timeout=5)
+            worker.watchdog_stop.set()
+
 
 if __name__ == "__main__":
     unittest.main()

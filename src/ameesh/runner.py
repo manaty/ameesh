@@ -326,15 +326,18 @@ class AgentWorker(threading.Thread):
             log_async("[%s] groupe toujours vivant après SIGKILL (état noyau ?)" % self.name)
 
     def kill_if_lease_lost(self) -> bool:
-        """Rattrape une perte de bail survenue pendant la création du harnais.
+        """Rattrape une publication tardive du harnais, après la perte du bail.
 
-        Le veilleur peut conclure entre `Popen` et la publication de `self.proc`
-        (il voit alors `proc=None` et ne peut rien tuer) ; sans ce recontrôle,
-        le harnais publié survivrait au bail, sans stdout, jusqu'à la fin du
-        tour (sonde codex3 B5a-P). Renvoie True si le harnais vient d'être
-        arrêté.
+        Le veilleur (ou l'arrêt du worker) peut conclure entre `Popen` et la
+        publication de `self.proc` : il voit alors `proc=None` et ne peut rien
+        tuer. Sans ce recontrôle, le harnais publié survivrait, sans stdout,
+        jusqu'à la fin du tour (sonde codex3 B5a-P) — y compris après un
+        `shutdown()` qui a rendu le bail et arrêté le veilleur, alors même que
+        l'ancienne échéance n'est pas encore atteinte (sonde codex3 B5a-Q).
+        Renvoie True si le harnais vient d'être arrêté.
         """
-        if not (self.lease_lost.is_set() or self.deadline_passed()):
+        if not (self.lease_lost.is_set() or self.deadline_passed()
+                or self.stopping.is_set() or self.watchdog_stop.is_set()):
             return False
         self.lease_lost.set()
         self.terminate(grace=0, hard=True)

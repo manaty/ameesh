@@ -158,7 +158,11 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   direct. Enfin, **la publication du `Popen` est recontrôlée** : le veilleur
   peut conclure entre la création du processus et l'affectation de `self.proc`
   (il voit alors `proc=None`) ; sans ce recontrôle, un harnais sans stdout
-  survivrait au bail jusqu'à la fin du tour (sonde codex3 B5a-P).
+  survivrait au bail jusqu'à la fin du tour (sonde codex3 B5a-P). Le recontrôle
+  couvre aussi la fermeture du worker (`stopping`) et le relâchement du bail
+  (`watchdog_stop`) : une publication tardive après un `shutdown()` qui a rendu
+  le bail est tuée, même si l'ancienne échéance n'est pas atteinte (sonde
+  codex3 B5a-Q).
 * **Requêtes bornées** — chaque connexion pose un `statement_timeout`
   (`AMEESH_STATEMENT_TIMEOUT_MS`, défaut 30 s) : un renouvellement de bail
   qui pend (verrou, requête lente) est annulé par le serveur ; le pilote `psql`
