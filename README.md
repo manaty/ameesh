@@ -87,6 +87,47 @@ agent-mesh import-v0 | export-v0                       # v0 → Postgres and bac
 agent-mesh migrate | doctor [--notify-test]
 ```
 
+### Canon (v1, lot L2)
+
+The OKF canon declares members (`Member`, humans), hosts (`Host` + policy),
+agents (`Agent`) and placements (`Placement`) — spec §4. ameesh reads only the
+frontmatter, and only from the **approved source**: the git objects of the
+merged canonical branch (`AMEESH_CANON_REF`, else the root member's `ref` in
+`federation.yaml` as `origin/<ref>`, else `origin/main`). Uncommitted edits and
+unpushed local commits are reported, never used. A directory that is not a git
+repository is read only with `AMEESH_CANON_UNTRUSTED=1` (tests, prototypes), and
+every finding and sync line is then tagged `[NON APPROUVÉ]`.
+
+```
+ameesh canon check [--json] [--canon DIR] [--ref REV] [--fetch]   # exit 1 on any error
+ameesh canon show  [--json] …                                     # cards read, and from which commit
+ameesh canon sync  [--host H] [--json] …                          # canon → registry of host H
+ameesh agent spawn <name> --by <creator> --ttl 2h [--cwd DIR] [--prompt TEXT]
+```
+
+| Setting | Meaning |
+|---|---|
+| `AMEESH_CANON` (config `canon`) | root of the OKF bundle; members of `federation.yaml` present locally (`workspace_path`) are followed |
+| `AMEESH_CANON_REF` (config `canon_ref`) | canonical revision to read (e.g. `origin/main`) |
+| `AMEESH_CANON_UNTRUSTED=1` | allow a non-git canon (never by default) |
+| `AMEESH_REQUIRE_RESPONSIBLE` (config `require_responsible`) | R14 in `claimable`: an agent without a resolved human `responsible` is not claimable. **Default: on when a canon is configured, off otherwise** (bench compatibility). `0`/`1` force it. Expired ephemeral agents are never claimable, whatever this setting. |
+
+`canon sync` writes only **declarative** columns (`harness`, `host`, `cwd`,
+`model`, `budget_usd`, `responsible`, `team`, `provider`, `credential_mode`,
+`capabilities`, `canon_ref` = `<member>:<path>@<commit>`), never state columns
+(lease, session, status, spend, prompt). `responsible` is written only when it
+resolves to a unique human `Member` and the agent has no blocking error;
+otherwise it is cleared (not claimable). An error tied to an agent blocks that
+agent, one tied to a host blocks the agents placed there, any other error
+(federation, unreadable profile card) blocks every agent of the host. An agent
+removed from the canon is set `stopped`; if it is in a turn, sync only marks
+`status_text` (nothing is killed) and the next sync stops it once the turn is
+over. Agents registered by hand (no `canon_ref`) and ephemeral agents are left
+alone. `agent spawn` creates an ephemeral agent whose `responsible` is copied
+from its creator at creation (R14), with capabilities ⊆ `{read, propose}` (and
+⊆ the creator's), a mandatory expiry (max 7 days, never beyond an ephemeral
+creator's). A fictitious example canon lives in [`examples/canon/`](examples/canon/).
+
 `agent-runner`:
 
 ```
@@ -147,11 +188,15 @@ src/ameesh/
   registry.py     agent_registry: presence, leases, prompts, budget
   mail.py         agent_mailbox: send, unread, deliver, history
   migrations.py   NNNN_name.sql, checksummed, advisory-locked
-  migrations/     0001_init.sql … 0004_work_items.sql
+  migrations/     0001_init.sql … 0008_canon.sql
   mesh_cli.py     agent-mesh: mesh list, keys, approvals, work items, import/export v0
   authority.py    Ed25519 proofs bound to content and expiry; approvals
   signing.py      Ed25519 (pure RFC 8032 + optional cryptography/nacl), key files
   work.py         work_items state machine, loop bound, event ledger
+  canon.py        OKF canon: git-object reading, minimal YAML, profile, validation,
+                  placement_violations (host policy)
+  canon_sync.py   canon → registry (declarative columns), ephemeral agents
+  canon_cli.py    ameesh canon check|show|sync, ameesh agent spawn
   backend.py      Postgres backend + v0 file fallback
   identity.py     v0 alias/name resolution (shared aliases.tsv)
 tests/            unittest suite + fakebin/ fake harnesses
