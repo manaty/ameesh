@@ -13,3 +13,4 @@
 * [L'hébergement est une configuration, préparée par le harnais de l'utilisateur](0011-hebergement-configurable.md) - Local, page Nexlink ou VPS provisionné ; installation conduite par le harnais que l'utilisateur a déjà.
 * [Abandon de la cérémonie Ed25519 ; autorité par ameesh-approve](0012-autorite-par-ameesh-approve.md) - Passkey, application Nexlink ou application native ; un seul format de reçu.
 * [Licence d'ameesh : AGPL-3.0-only, avec accord de contribution](0013-licence-agpl.md) - Termes figés à la v3 ; CLA pour les contributions externes.
+* [Orchestrateurs à tours ; placement décidé par les humains responsables](0014-orchestrateurs-a-tours-et-placement.md) - Attachement interactif ; politique par hôte ; clé d'API ou forfait choisi par le responsable.

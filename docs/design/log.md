@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-04 (Q5)
+* **Décision** : [orchestrateurs à tours et placement gouverné](decisions/0014-orchestrateurs-a-tours-et-placement.md) ; exigence R18 ; Q5 close.
+
 ## 2026-10-04 (Q4)
 * **Décision** : [licence AGPL-3.0-only avec accord de contribution](decisions/0013-licence-agpl.md) ; Q4 close.
 
