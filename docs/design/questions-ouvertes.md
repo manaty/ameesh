@@ -9,9 +9,8 @@ generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:30:00+02:00" 
 
 # Attend le propriétaire
 
-| # | Question | Recommandation de mesh-design |
-|---|---|---|
-| Q1 (ex-M3) | Quelle base pour l'état d'exécution ? Elle suit désormais le profil d'hébergement ([0011](decisions/0011-hebergement-configurable.md)) ; reste à savoir si le profil local peut se contenter de SQLite (pas de LISTEN/NOTIFY). | Postgres partout pour la v1 ; SQLite à étudier pour le profil local. |
+Aucune question n'attend le propriétaire au 2026-10-04 (Q1 à Q8 tranchées, voir
+les [décisions](decisions/)).
 
 # Attend une étude ou un prototype
 

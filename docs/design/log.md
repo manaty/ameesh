@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-04 (Q1, Q8)
+* **Décision** : [stockage](decisions/0016-stockage.md) ; Q1 close. Q8 close (instantané public, voir [0015](decisions/0015-interfaces-des-facades.md)). Plus aucune question n'attend le propriétaire.
+
 ## 2026-10-04 (Q6)
 * **Décision** : [aucun client nommé, interfaces publiques des façades](decisions/0015-interfaces-des-facades.md) ; Q6 close ; mentions de clients retirées des documents ; Q8 ouverte (historique avant passage public).
 

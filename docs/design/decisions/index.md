@@ -15,3 +15,4 @@
 * [Licence d'ameesh : AGPL-3.0-only, avec accord de contribution](0013-licence-agpl.md) - Termes figés à la v3 ; CLA pour les contributions externes.
 * [Orchestrateurs à tours ; placement décidé par les humains responsables](0014-orchestrateurs-a-tours-et-placement.md) - Attachement interactif ; politique par hôte ; clé d'API ou forfait choisi par le responsable.
 * [Aucun client nommé ; interfaces publiques pour bâtir les façades](0015-interfaces-des-facades.md) - Applications tierces, dont mobiles natives, sans imposer Nexlink.
+* [Stockage : Postgres en v1, SQL derrière une interface, SQLite plus tard](0016-stockage.md) - Postgres installé par l'installateur en local ; pilote SQLite pour le mode perso ensuite.
