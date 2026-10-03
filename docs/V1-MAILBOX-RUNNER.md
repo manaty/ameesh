@@ -121,8 +121,12 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   harnais, au lieu de dormir 50 ms de plus pendant qu'un remplaçant réclame
   l'agent.
   À la perte du bail, le groupe reçoit SIGKILL **directement** (pas de SIGTERM
-  préalable) :
-  même si la base ne répond plus du tout (réponse retenue par un proxy, par
+  préalable) et **avant tout journal** : un print+flush sur ce chemin critique
+  laissait, sous charge, un remplaçant réclamer pendant que l'ancien harnais
+  vivait encore (sonde codex3 b731f4f). L'enfant direct est ensuite moissonné :
+  un zombie reste compté vivant par `killpg(pid, 0)`, ce qui faisait durer
+  l'attente 2 s et journalisait un faux « groupe toujours vivant ».
+  Même si la base ne répond plus du tout (réponse retenue par un proxy, par
   exemple), le battement conclut à la perte du bail et arrête le harnais à
   l'heure où un remplaçant peut réclamer l'agent. Le `statement_timeout` reste
   la borne serveur, le délai client `psql` la borne du sous-processus.

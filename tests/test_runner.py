@@ -603,6 +603,74 @@ class RunnerTest(PgTestCase):
                 proc.kill()
                 proc.wait(timeout=5)
 
+    def test_terminate_moissonne_le_zombie_sans_attendre_deux_secondes(self):
+        """Constat codex3 b731f4f : un zombie est compté vivant par killpg(0).
+
+        `terminate(hard=True)` doit moissonner l'enfant direct après le SIGKILL ;
+        sinon le zombie garde le groupe « vivant » et l'arrêt attend 2 s pour
+        rien, avec un faux « groupe toujours vivant après SIGKILL ».
+        """
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "romeo", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 3600},
+        )
+        worker.proc = proc
+        worker.pgid = proc.pid
+        try:
+            debut = time.monotonic()
+            worker.terminate(grace=0, hard=True)
+            ecoule = time.monotonic() - debut
+            self.assertIsNotNone(proc.poll(), "le harnais doit être mort et moissonné")
+            self.assertFalse(AgentWorker._group_alive(proc.pid))
+            self.assertLess(ecoule, 1.0, "un zombie ne doit pas faire durer l'arrêt 2 s")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_le_sigkill_part_avant_tout_journal(self):
+        """Sonde codex3 b731f4f : le journal avant le signal laissait, sous
+        charge, un remplaçant réclamer pendant que l'ancien harnais vivait.
+
+        Ici l'ordre est instrumenté : sur une échéance atteinte, le premier
+        événement doit être le signal, pas une écriture de journal.
+        """
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "tango", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() - 1},
+        )
+        worker.proc = proc
+        worker.pgid = proc.pid
+        ordre: list[tuple] = []
+        vrai_signal = AgentWorker._signal_group
+
+        def signal_trace(pgid, cible, sig):
+            ordre.append(("signal", sig))
+            vrai_signal(pgid, cible, sig)
+
+        def log_trace(message):
+            ordre.append(("log", message))
+
+        try:
+            with mock.patch.object(AgentWorker, "_signal_group",
+                                   staticmethod(signal_trace)), \
+                    mock.patch("ameesh.runner.log", side_effect=log_trace):
+                self.assertFalse(worker.renew())
+            self.assertTrue(worker.lease_lost.is_set())
+            self.assertTrue(ordre, "l'arrêt doit être tracé")
+            self.assertEqual(ordre[0][0], "signal", "un journal précède le SIGKILL")
+            self.assertEqual(ordre[0][1], signal.SIGKILL)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
 
 if __name__ == "__main__":
     unittest.main()

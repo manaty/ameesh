@@ -132,37 +132,43 @@ class AgentWorker(threading.Thread):
 
     def renew(self) -> bool:
         """Prolonge le bail. Une panne de base ne laisse pas le harnais tourner
-        sans bail : après quelques échecs ou à l'échéance connue, on l'arrête."""
+        sans bail : après quelques échecs ou à l'échéance connue, on l'arrête.
+
+        Sur toute perte de bail, l'ordre est : drapeau `lease_lost` (bon
+        marché, sans E/S), **SIGKILL**, puis journal. Écrire le journal avant
+        le signal a laissé, sous charge, un remplaçant réclamer le bail pendant
+        que l'ancien harnais vivait encore (sonde codex3 b731f4f : +12 ms).
+        """
         if self.lease_lost.is_set():
             return False
         if self.deadline_passed():
             # Échéance déjà atteinte (réveil tardif, horloge, bail raccourci) :
             # on ne tente même pas le renouvellement, on arrête tout de suite.
-            log("[%s] échéance du bail atteinte : arrêt du harnais" % self.name)
             self.lease_lost.set()
             self.terminate(grace=0, hard=True)
+            log("[%s] échéance du bail atteinte : arrêt du harnais" % self.name)
             return False
         answered, expires, error = self._renew_call()
         if not answered:
-            log("[%s] renouvellement sans réponse au-delà du bail : arrêt du harnais"
-                % self.name)
             self.lease_lost.set()
             self.terminate(grace=0, hard=True)
+            log("[%s] renouvellement sans réponse au-delà du bail : arrêt du harnais"
+                % self.name)
             return False
         if error is not None:
             self.renew_failures += 1
             log("[%s] battement : base injoignable (%s) — échec %d/%d"
                 % (self.name, error, self.renew_failures, self.MAX_RENEW_FAILURES))
             if self.renew_failures >= self.MAX_RENEW_FAILURES or time.time() >= self.lease_deadline:
-                log("[%s] bail considéré perdu (base injoignable) : arrêt du harnais" % self.name)
                 self.lease_lost.set()
                 self.terminate(grace=0, hard=True)
+                log("[%s] bail considéré perdu (base injoignable) : arrêt du harnais" % self.name)
                 return False
             return True  # on laisse une chance au prochain battement
         if expires is None:
-            log("[%s] bail perdu (epoch %d) : arrêt du tour" % (self.name, self.epoch))
             self.lease_lost.set()
             self.terminate(grace=0, hard=True)  # SIGKILL direct : plus de chevauchement
+            log("[%s] bail perdu (epoch %d) : arrêt du tour" % (self.name, self.epoch))
             return False
         self.renew_failures = 0
         self.lease_deadline = float(expires)
@@ -218,35 +224,47 @@ class AgentWorker(threading.Thread):
         """Arrête le harnais et tout son groupe.
 
         Par défaut : SIGTERM, 3 secondes de grâce, puis SIGKILL. `hard=True`
-        (perte du bail) envoie SIGKILL **directement** : le remplaçant peut
-        réclamer l'agent à l'échéance, chaque milliseconde de plus est un
-        chevauchement (verdict codex3 B5a).
+        (perte du bail) envoie SIGKILL **directement, avant tout journal** : le
+        remplaçant peut réclamer l'agent à l'échéance, chaque milliseconde de
+        plus est un chevauchement (verdicts codex3 B5a et b731f4f).
 
         L'escalade ne dépend pas de la survie du **parent** : un harnais peut
         mourir sur SIGTERM en laissant un descendant qui l'ignore, et le groupe
         doit alors être tué (sonde codex3 B5b). Le groupe est mémorisé au
         lancement, donc il reste tuable même après la disparition du parent.
+
+        L'enfant direct est moissonné après le SIGKILL : un zombie reste compté
+        vivant par `killpg(pid, 0)` et faisait croire à un groupe survivant
+        pendant les 2 s d'attente, en plus de fausser le constat « terminate est
+        revenu donc le groupe est mort » (constat codex3 b731f4f).
         """
         with self.lock:
             proc = self.proc
         if proc is None:
             return
         pgid = self._group(proc)
-        vivant = proc.poll() is None
-        if vivant and not hard:
+        if proc.poll() is None and not hard:
             self._signal_group(pgid, proc, signal.SIGTERM)
             deadline = time.monotonic() + max(0.0, self.TERMINATE_GRACE if grace is None else grace)
             while time.monotonic() < deadline and proc.poll() is None:
                 time.sleep(0.05)
         if not self._group_alive(pgid):
             return
-        log("[%s] le groupe du harnais survit : SIGKILL" % self.name)
+        # Le signal part avant le journal : un print+flush sur le chemin
+        # critique laissait le temps à un remplaçant de réclamer sous charge.
         self._signal_group(pgid, proc, signal.SIGKILL)
-        # SIGKILL est asynchrone : on attend que le noyau l'ait pris en compte,
-        # pour que « terminate est revenu » veuille dire « le groupe est mort ».
+        log("[%s] le groupe du harnais survit : SIGKILL" % self.name)
+        # SIGKILL est asynchrone. On moissonne d'abord l'enfant direct (sinon
+        # son zombie garde le groupe « vivant »), puis on attend la disparition
+        # du groupe entier, dans le même budget de 2 s.
         fin = time.monotonic() + 2.0
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=max(0.0, fin - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
         while time.monotonic() < fin and self._group_alive(pgid):
-            time.sleep(0.02)
+            time.sleep(0.005)
         if self._group_alive(pgid):
             log("[%s] groupe toujours vivant après SIGKILL (état noyau ?)" % self.name)
 
