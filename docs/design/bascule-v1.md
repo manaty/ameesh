@@ -74,13 +74,26 @@ bloquées (comportement sûr).
 
 # Étape 4 — un agent pilote
 
-Comme `BASCULE.md` étape 4 (`deepseek7`) : `import-v0 --agents deepseek7`,
-`agent-runner --agents deepseek7`, aller-retour, vérifier que le message
-apparaît dans le **fil** (`ameesh fil show`), arrêter la boucle v0 de cet agent.
+**Jamais deux boucles sur la même session** : la boucle v0 ne connaît pas le bail
+v1, et deux harnais reprendraient la même session. Le fonctionnement en double
+de l'ancien plan est réservé aux agents factices indépendants (essais).
+
+Pour le pilote réel (`deepseek7`), dans cet ordre :
+
+1. attendre la fin de son tour en cours ; `nexlink-agent stop deepseek7` ;
+2. **attendre la mort de tout le groupe de processus** de la boucle v0 (aucun
+   harnais restant sur sa session) ;
+3. `ameesh import-v0 --agents deepseek7` (courrier, session) sur cet état stable ;
+4. `agent-runner --agents deepseek7` ; aller-retour ; vérifier que le message
+   apparaît dans le **fil** (`ameesh fil show`).
+
+**Retour arrière, symétrique** : arrêter l'exécuteur v1 pour cet agent
+(SIGTERM, bail rendu) et attendre la mort de son groupe ; `ameesh export-v0
+--agents deepseek7` ; relancer la boucle v0 sur la même session.
 
 # Étape 5 — les autres agents, par vagues
 
-Comme `BASCULE.md` étape 5. Après chaque vague : `ameesh list`,
+Même procédure que l'étape 4, agent par agent (arrêt v0 et mort du groupe avant tout démarrage v1). Après chaque vague : `ameesh list`,
 `ameesh canon check`, `ameesh fil list`.
 
 # Étape 6 — les orchestrateurs
