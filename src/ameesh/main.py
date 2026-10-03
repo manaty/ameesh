@@ -10,6 +10,7 @@
   ameesh key …                clés publiques (propriétaire / agent) ;
   ameesh approve | approvals | verify   approbations signées ;
   ameesh work …               lots (work_items) ;
+  ameesh receipt verify | authenticator list   reçus d'approbation (spec §8) ;
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
   ameesh migrate | doctor     schéma et diagnostic.
 
@@ -25,6 +26,8 @@ MESH_COMMANDS = (
     "list", "show", "key", "approve", "approvals", "verify", "work",
     "migrate", "doctor", "import-v0", "export-v0",
 )
+#: sous-commandes des reçus d'approbation (receipts_cli)
+RECEIPT_COMMANDS = ("receipt", "authenticator")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,6 +45,9 @@ def main(argv: list[str] | None = None) -> int:
     if command in MESH_COMMANDS:
         from . import mesh_cli
         return mesh_cli.main(argv)
+    if command in RECEIPT_COMMANDS:
+        from . import receipts_cli
+        return receipts_cli.main(argv)
     print("ameesh : sous-commande inconnue %r" % command, file=sys.stderr)
     print(__doc__)
     return 2

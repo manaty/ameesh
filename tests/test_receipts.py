@@ -1,0 +1,1020 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Reçus ameesh-receipt/1 : cas valides et chaque falsification (spec §8, C7).
+
+Tout passe par des authentificateurs LOGICIELS (tests/webauthn_soft.py) et le
+registre de confiance est rempli par `sync_authenticators`, comme le ferait
+`ameesh canon sync`. Aucune vraie clé, aucun service réseau.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import threading
+import time
+import unittest
+from unittest import mock
+
+from ameesh import jcs, p256, receipts
+
+from .support import PgTestCase
+from .webauthn_soft import (
+    ORIGIN, RP_ID, SoftDevice, SoftEd25519, SoftES256Key, SoftWebAuthn, b64u, make_receipt,
+    make_request, new_action_id, sha,
+)
+
+ALICE = "human:alice"
+BOB = "human:bob"
+CAROL = "human:carol"
+COMMIT = "a" * 40
+NEXT_COMMIT = "b" * 40
+POLICY = receipts.Policy(rp_id=RP_ID, origins=(ORIGIN,))
+
+
+def member(title: str, *entries: dict, commit: str = COMMIT) -> dict:
+    return {"title": title, "canon_ref": "members/%s.md@%s" % (title, commit),
+            "authenticators": list(entries)}
+
+
+class ReceiptsBase(PgTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.execute(
+            "TRUNCATE authenticators, standing_approvals, standing_reservations, "
+            "mesh_consumed_nonces RESTART IDENTITY CASCADE")
+        self.alice = SoftWebAuthn("ES256")
+        self.alice_ed = SoftWebAuthn("EdDSA")
+        self.alice_device = SoftDevice()
+        self.alice_tool = SoftEd25519()
+        self.bob = SoftWebAuthn("ES256")
+        self.carol_key = SoftWebAuthn("ES256")                       # clé matérielle : BE=0
+        self.carol_synced = SoftWebAuthn("ES256", backup_eligible=True, backup_state=True)
+        self.members = [
+            member("alice", self.alice.entry(), self.alice_ed.entry(),
+                   self.alice_device.entry(), self.alice_tool.entry()),
+            member("bob", self.bob.entry()),
+            member("carol", self.carol_key.entry(level="eleve"), self.carol_synced.entry()),
+        ]
+        result = receipts.sync_authenticators(self.db, self.members)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(len(result["added"]), 7)
+
+    def verify(self, receipt, policy=POLICY, **kwargs):
+        return receipts.verify_receipt(self.db, receipt, policy, **kwargs)
+
+    def consume(self, receipt, by="porte", db=None, policy=POLICY):
+        """Comme la porte : consommation liée à l'action qu'elle connaît."""
+        request = receipt["request"]
+        return receipts.verify_receipt(
+            db or self.db, receipt, policy, consume_by=by,
+            expected_digest=request["digest"], expected_action_id=request["action_id"])
+
+    def assertRefused(self, verdict, code: str):
+        self.assertFalse(verdict.ok, "accepté à tort : %s" % verdict.reason)
+        self.assertEqual(verdict.code, code, verdict.reason)
+
+
+# --------------------------------------------------------------------------
+# empreintes et forme
+# --------------------------------------------------------------------------
+
+class DigestsTest(unittest.TestCase):
+    def test_challenge_connu(self):
+        """Le challenge est exactement SHA-256(domaine ‖ JCS) : interopérable."""
+        request = {
+            "v": 1, "approver": ALICE, "action_id": "act_0123456789ABCDEFGHJKMNPQRS",
+            "digest": "sha256:" + "1" * 64, "decision": "approve",
+            "summary_digest": "sha256:" + "2" * 64, "requested_by": "agent:deepseek7",
+            "nonce": "AAAAAAAAAAAAAAAAAAAAAA", "iat": 1790000000, "exp": 1790000600,
+        }
+        canonical = (
+            '{"action_id":"act_0123456789ABCDEFGHJKMNPQRS","approver":"human:alice",'
+            '"decision":"approve","digest":"sha256:' + "1" * 64 + '","exp":1790000600,'
+            '"iat":1790000000,"nonce":"AAAAAAAAAAAAAAAAAAAAAA","requested_by":"agent:deepseek7",'
+            '"summary_digest":"sha256:' + "2" * 64 + '","v":1}')
+        self.assertEqual(jcs.dumps(request), canonical)
+        self.assertEqual(receipts.challenge(request),
+                         hashlib.sha256(b"ameesh-approval/1\x00" + canonical.encode()).digest())
+        self.assertEqual(receipts.check_request(request), "action")
+
+    def test_empreinte_d_action(self):
+        fields = {"action_id": new_action_id(), "project": "ameesh", "connector": "git-merge",
+                  "operation": "merge", "target": "o/r#42", "args": {"pr": 42, "method": "merge"},
+                  "amount": None, "currency": None, "policy_version": 3}
+        digest = receipts.action_digest(fields)
+        self.assertRegex(digest, r"^sha256:[0-9a-f]{64}$")
+        canonical = jcs.canonicalize(fields)
+        self.assertEqual(digest, "sha256:" + hashlib.sha256(
+            b"ameesh-action/1\x00" + canonical).hexdigest())
+        # l'ordre des clés est sans effet ; chaque champ compte
+        self.assertEqual(receipts.action_digest(dict(reversed(list(fields.items())))), digest)
+        for key, value in (("target", "o/r#43"), ("args", {"pr": 42}), ("amount", 1),
+                           ("policy_version", 4), ("project", "autre")):
+            with self.subTest(key=key):
+                self.assertNotEqual(receipts.action_digest(fields, **{key: value}), digest)
+        with self.assertRaises(receipts.ReceiptError):
+            receipts.action_digest({k: v for k, v in fields.items() if k != "target"})
+        with self.assertRaises(receipts.ReceiptError):
+            receipts.action_digest(fields, extra=1)
+        with self.assertRaises(receipts.ReceiptError):
+            receipts.action_digest(fields, amount=12.5)
+        with self.assertRaises(receipts.ReceiptError):
+            receipts.action_digest(fields, amount=-1)
+
+    def test_forme_stricte(self):
+        good = make_request(ALICE)
+        self.assertEqual(receipts.check_request(good), "action")
+        cases = {
+            "champ inconnu": dict(good, extra=1),
+            "champ manquant": {k: v for k, v in good.items() if k != "summary_digest"},
+            "v texte": dict(good, v="1"),
+            "v booléen": dict(good, v=True),
+            "agent approbateur": dict(good, approver="agent:deepseek7"),
+            "approbateur nu": dict(good, approver="alice"),
+            "décision": dict(good, decision="approved"),
+            "nonce court": dict(good, nonce=b64u(os.urandom(8))),
+            "nonce rembourré": dict(good, nonce=b64u(os.urandom(16)) + "=="),
+            "nonce base64 standard": dict(good, nonce="+/" + b64u(os.urandom(16))[2:]),
+            "iat flottant": dict(good, iat=float(good["iat"])),
+            "exp avant iat": dict(good, exp=good["iat"]),
+            "digest": dict(good, digest="sha256:XYZ"),
+            "action_id": dict(good, action_id="act_court"),
+            "action et standing": dict(good, standing={}),
+            # `$` des regex Python accepte un saut de ligne final : refusé ici
+            "approbateur + saut de ligne": dict(good, approver=ALICE + "\n"),
+            "digest + saut de ligne": dict(good, digest=good["digest"] + "\n"),
+            "action_id + saut de ligne": dict(good, action_id=good["action_id"] + "\n"),
+            "nonce + saut de ligne": dict(good, nonce=good["nonce"] + "\n"),
+            "décision liste": dict(good, decision=["approve"]),
+        }
+        for label, request in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(receipts.ReceiptError):
+                    receipts.check_request(request)
+
+
+# --------------------------------------------------------------------------
+# cas valides
+# --------------------------------------------------------------------------
+
+class ReceiptsValidTest(ReceiptsBase):
+    def test_webauthn_es256_valide_puis_consomme(self):
+        request = make_request(ALICE)
+        receipt = self.alice.receipt(request)
+        verdict = self.verify(receipt, expected_digest=request["digest"],
+                              expected_action_id=request["action_id"])
+        self.assertTrue(verdict.ok, verdict.reason)
+        self.assertTrue(verdict.authority)
+        self.assertEqual((verdict.approver, verdict.facade, verdict.kind),
+                         (ALICE, "webauthn", "action"))
+        self.assertEqual(verdict.flags["up"], True)
+        self.assertEqual(verdict.flags["uv"], True)
+        self.assertEqual(verdict.flags["be"], False)
+        self.assertFalse(verdict.consumed)
+        # consommer sans dire quelle action : refusé, rien n'est consommé
+        self.assertRefused(self.verify(receipt, consume_by="porte"), receipts.UNBOUND)
+        self.assertRefused(self.verify(receipt, consume_by="porte",
+                                       expected_digest=request["digest"]), receipts.UNBOUND)
+        consumed = self.consume(receipt)
+        self.assertTrue(consumed.ok, consumed.reason)
+        self.assertTrue(consumed.consumed)
+        row = self.db.query("SELECT consumed_by, challenge FROM mesh_consumed_nonces "
+                            "WHERE approver = %s AND nonce = %s", (ALICE, request["nonce"]))[0]
+        self.assertEqual(row["consumed_by"], "porte")
+        self.assertEqual(row["challenge"], receipts.challenge(request).hex())
+
+    def test_texte_json_du_reçu(self):
+        receipt = self.alice.receipt(make_request(ALICE))
+        self.assertTrue(self.verify(json.dumps(receipt)).ok)
+        self.assertTrue(self.verify(json.dumps(receipt).encode("utf-8")).ok)
+
+    def test_webauthn_eddsa_valide(self):
+        verdict = self.verify(self.alice_ed.receipt(make_request(ALICE)))
+        self.assertTrue(verdict.ok, verdict.reason)
+
+    def test_device_es256_valide(self):
+        verdict = self.verify(self.alice_device.receipt(make_request(ALICE)))
+        self.assertTrue(verdict.ok, verdict.reason)
+        self.assertEqual(verdict.facade, "device-es256")
+
+    def test_device_es256_cle_cose(self):
+        device = SoftDevice(cose=True)
+        self.members[0]["authenticators"].append(device.entry())
+        self.assertEqual(receipts.sync_authenticators(self.db, self.members)["errors"], [])
+        self.assertTrue(self.verify(device.receipt(make_request(ALICE))).ok)
+
+    def test_decision_deny(self):
+        receipt = self.alice.receipt(make_request(ALICE, decision="deny"))
+        self.assertRefused(self.verify(receipt), receipts.DECISION)
+        verdict = self.verify(receipt, expect_decision="deny")
+        self.assertTrue(verdict.ok, verdict.reason)
+        self.assertFalse(verdict.authority)
+
+    def test_iat_dans_la_tolerance(self):
+        request = make_request(ALICE, iat=int(time.time()) + 60)
+        self.assertTrue(self.verify(self.alice.receipt(request)).ok)
+
+    def test_les_deux_backends_es256(self):
+        receipt = self.alice.receipt(make_request(ALICE))
+        tampered = json.loads(json.dumps(receipt))
+        tampered["request"]["summary_digest"] = sha("autre résumé")
+        for name in p256.available_backends():
+            with self.subTest(backend=name):
+                with mock.patch.dict(os.environ, {"AMEESH_ECDSA_BACKEND": name}):
+                    self.assertEqual(p256.backend().name, name)
+                    self.assertTrue(self.verify(receipt).ok)
+                    self.assertFalse(self.verify(tampered).ok)
+
+
+# --------------------------------------------------------------------------
+# falsifications
+# --------------------------------------------------------------------------
+
+class ReceiptsForgeryTest(ReceiptsBase):
+    def test_challenge_d_une_autre_demande(self):
+        signed = make_request(ALICE)
+        other = make_request(ALICE)
+        receipt = make_receipt(other, "webauthn", self.alice.credential_id,
+                               self.alice.proof(receipts.challenge(signed)))
+        self.assertRefused(self.verify(receipt), receipts.CHALLENGE)
+
+    def test_demande_modifiee_apres_signature(self):
+        request = make_request(ALICE)
+        for key, value in (("digest", sha("autre action")), ("exp", request["exp"] + 3600),
+                           ("approver", BOB), ("decision", "deny")):
+            with self.subTest(key=key):
+                receipt = self.alice.receipt(request)
+                receipt["request"] = dict(request, **{key: value})
+                verdict = self.verify(receipt, expect_decision=None)
+                self.assertFalse(verdict.ok)
+                self.assertIn(verdict.code, (receipts.CHALLENGE, receipts.FOREIGN_AUTHENTICATOR))
+
+    def test_empreinte_ou_action_attendue_differente(self):
+        request = make_request(ALICE)
+        receipt = self.alice.receipt(request)
+        self.assertRefused(self.verify(receipt, expected_digest=sha("autre")),
+                           receipts.DIGEST_MISMATCH)
+        self.assertRefused(self.verify(receipt, expected_action_id=new_action_id()),
+                           receipts.ACTION_MISMATCH)
+
+    def test_autre_origine(self):
+        receipt = self.alice.receipt(make_request(ALICE), origin="https://evil.example.test")
+        self.assertRefused(self.verify(receipt), receipts.ORIGIN)
+        # même origine que le RP mais en http
+        receipt = self.alice.receipt(make_request(ALICE), origin="http://approve.example.test")
+        self.assertRefused(self.verify(receipt), receipts.ORIGIN)
+
+    def test_rp_id_different(self):
+        receipt = self.alice.receipt(make_request(ALICE), rp_id="evil.example.test")
+        self.assertRefused(self.verify(receipt), receipts.RP_ID)
+        good = self.alice.receipt(make_request(ALICE))
+        other_policy = receipts.Policy(rp_id="example.test", origins=(ORIGIN,))
+        self.assertRefused(self.verify(good, other_policy), receipts.RP_ID)
+
+    def test_up_0(self):
+        receipt = self.alice.receipt(make_request(ALICE), up=False)
+        self.assertRefused(self.verify(receipt), receipts.USER_PRESENCE)
+
+    def test_uv_0(self):
+        receipt = self.alice.receipt(make_request(ALICE), uv=False)
+        self.assertRefused(self.verify(receipt), receipts.USER_VERIFICATION)
+
+    def test_be_1_au_niveau_eleve(self):
+        eleve = receipts.Policy(rp_id=RP_ID, origins=(ORIGIN,), level="eleve")
+        # clé matérielle enrôlée « élevé », BE=0 : acceptée au niveau élevé
+        self.assertTrue(self.verify(self.carol_key.receipt(make_request(CAROL)), eleve).ok)
+        # la même clé qui annoncerait BE=1 : refusée
+        receipt = self.carol_key.receipt(make_request(CAROL), be=True)
+        self.assertRefused(self.verify(receipt, eleve), receipts.BACKUP)
+        # enrôlée « élevé » mais BE=1 : refusée même sous la politique standard
+        self.assertRefused(self.verify(receipt), receipts.BACKUP)
+        # passkey synchronisée de niveau standard : refusée au niveau élevé…
+        synced = self.carol_synced.receipt(make_request(CAROL))
+        self.assertRefused(self.verify(synced, eleve), receipts.LEVEL)
+        # … acceptée au niveau standard (BE et BS exposés)
+        verdict = self.verify(synced)
+        self.assertTrue(verdict.ok, verdict.reason)
+        self.assertEqual((verdict.flags["be"], verdict.flags["bs"]), (True, True))
+
+    def test_bs_sans_be(self):
+        receipt = self.alice.receipt(make_request(ALICE), be=False, bs=True)
+        self.assertRefused(self.verify(receipt), receipts.AUTH_DATA)
+
+    def test_authenticator_data_mal_forme(self):
+        cases = {
+            "AT dans une assertion": dict(extra_flags=receipts.FLAG_AT),
+            "octets en trop": dict(auth_suffix=b"\x00"),
+            "ED sans extensions": dict(extra_flags=receipts.FLAG_ED),
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(label):
+                receipt = self.alice.receipt(make_request(ALICE), **kwargs)
+                self.assertRefused(self.verify(receipt), receipts.AUTH_DATA)
+        # ED avec une table d'extensions bien formée : accepté
+        receipt = self.alice.receipt(make_request(ALICE), extra_flags=receipts.FLAG_ED,
+                                     auth_suffix=bytes([0xA1, 0x61, 0x78, 0xF5]))
+        self.assertTrue(self.verify(receipt).ok)
+
+    def test_client_data_refuse(self):
+        cases = {
+            receipts.CLIENT_TYPE: dict(type="webauthn.create"),
+            receipts.CROSS_ORIGIN: dict(cross_origin=True),
+        }
+        for code, kwargs in cases.items():
+            with self.subTest(code):
+                receipt = self.alice.receipt(make_request(ALICE), **kwargs)
+                self.assertRefused(self.verify(receipt), code)
+        receipt = self.alice.receipt(make_request(ALICE), cross_origin=False)
+        self.assertTrue(self.verify(receipt).ok)
+        receipt = self.alice.receipt(make_request(ALICE), top_origin="https://evil.example.test")
+        self.assertRefused(self.verify(receipt), receipts.CROSS_ORIGIN)
+        receipt = self.alice.receipt(make_request(ALICE), cross_origin="false")
+        self.assertRefused(self.verify(receipt), receipts.CROSS_ORIGIN)
+
+    def test_client_data_cle_en_double(self):
+        request = make_request(ALICE)
+        receipt = self.alice.receipt(request)
+        client = receipts.b64u_decode(receipt["proof"]["clientDataJSON"]).decode()
+        doubled = client[:-1] + ',"type":"webauthn.get"}'
+        receipt["proof"]["clientDataJSON"] = b64u(doubled.encode())
+        self.assertRefused(self.verify(receipt), receipts.CLIENT_DATA)
+
+    def test_signature_alteree(self):
+        request = make_request(ALICE)
+        receipt = self.alice.receipt(request)
+        der = bytearray(receipts.b64u_decode(receipt["proof"]["signature"]))
+        der[-1] ^= 0x01
+        receipt["proof"]["signature"] = b64u(bytes(der))
+        self.assertRefused(self.verify(receipt), receipts.SIGNATURE)
+
+        # clientDataJSON modifié après signature (champ ajouté) : seule la
+        # signature peut le voir
+        receipt = self.alice.receipt(make_request(ALICE))
+        client = json.loads(receipts.b64u_decode(receipt["proof"]["clientDataJSON"]))
+        client["extra"] = "x"
+        receipt["proof"]["clientDataJSON"] = b64u(json.dumps(client).encode())
+        self.assertRefused(self.verify(receipt), receipts.SIGNATURE)
+
+        # compteur modifié dans authenticatorData
+        receipt = self.alice.receipt(make_request(ALICE))
+        auth = bytearray(receipts.b64u_decode(receipt["proof"]["authenticatorData"]))
+        auth[36] ^= 0x01
+        receipt["proof"]["authenticatorData"] = b64u(bytes(auth))
+        self.assertRefused(self.verify(receipt), receipts.SIGNATURE)
+
+        for soft in (self.alice_ed, ):
+            receipt = soft.receipt(make_request(ALICE))
+            sig = bytearray(receipts.b64u_decode(receipt["proof"]["signature"]))
+            sig[0] ^= 0x80
+            receipt["proof"]["signature"] = b64u(bytes(sig))
+            self.assertRefused(self.verify(receipt), receipts.SIGNATURE)
+
+        receipt = self.alice_device.receipt(make_request(ALICE))
+        receipt["request"] = dict(receipt["request"], nonce=b64u(os.urandom(16)))
+        self.assertRefused(self.verify(receipt), receipts.SIGNATURE)
+
+        tools = receipts.Policy(allow_facades={"ed25519"})
+        receipt = self.alice_tool.receipt(make_request(ALICE))
+        receipt["request"] = dict(receipt["request"], exp=receipt["request"]["exp"] - 1)
+        self.assertRefused(self.verify(receipt, tools), receipts.SIGNATURE)
+
+    def test_entrees_hostiles_donnent_un_verdict(self):
+        """Jamais d'exception : toute entrée mal formée donne un refus FORMAT."""
+        good = self.alice.receipt(make_request(ALICE))
+        hostile = [
+            [good], "pas du json", b"\xff\xfe", "null", '{"v": "ameesh-receipt/1"}',
+            dict(good, credential_id=good["credential_id"] + "\n"),
+            dict(good, credential_id=["x"]),
+            dict(good, facade=["webauthn"]),
+            dict(good, proof=dict(good["proof"], signature=good["proof"]["signature"] + "\n")),
+            dict(good, proof=dict(good["proof"], signature="A")),
+            dict(good, proof=dict(good["proof"], signature=None)),
+            dict(good, proof=dict(good["proof"], extra="x")),
+            dict(good, proof="x"),
+            dict(good, request=dict(good["request"], standing={"class": {"x": 1}})),
+            dict(good, extra=1),
+            dict(good, v="ameesh-receipt/2"),
+            dict(good, request=dict(good["request"], iat=2 ** 60)),
+        ]
+        for index, receipt in enumerate(hostile):
+            with self.subTest(index=index):
+                self.assertRefused(self.verify(receipt), receipts.FORMAT)
+        duplicated = json.dumps(good)[:-1] + ', "facade": "webauthn"}'
+        self.assertRefused(self.verify(duplicated), receipts.FORMAT)
+        # une preuve dont le clientDataJSON n'est pas du JSON
+        broken = dict(good, proof=dict(good["proof"], clientDataJSON=b64u(b"\xff{")))
+        self.assertRefused(self.verify(broken), receipts.CLIENT_DATA)
+        broken = dict(good, proof=dict(good["proof"], clientDataJSON=b64u(b"[1]")))
+        self.assertRefused(self.verify(broken), receipts.CLIENT_DATA)
+        broken = dict(good, proof=dict(good["proof"], authenticatorData=b64u(b"\x00" * 10)))
+        self.assertRefused(self.verify(broken), receipts.AUTH_DATA)
+
+    def test_signature_non_canonique_refusee_a_la_forme(self):
+        receipt = self.alice.receipt(make_request(ALICE))
+        receipt["proof"]["signature"] += "="
+        self.assertRefused(self.verify(receipt), receipts.FORMAT)
+
+    def test_cle_d_un_autre_approbateur(self):
+        # le credential de bob présenté au nom d'alice
+        receipt = self.bob.receipt(make_request(ALICE))
+        self.assertRefused(self.verify(receipt), receipts.FOREIGN_AUTHENTICATOR)
+        # le credential_id d'alice, mais signé par la clé de bob
+        request = make_request(ALICE)
+        receipt = make_receipt(request, "webauthn", self.alice.credential_id,
+                               self.alice.proof(receipts.challenge(request), signer=self.bob.key))
+        self.assertRefused(self.verify(receipt), receipts.SIGNATURE)
+        # une clé d'appareil inconnue sous un identifiant d'alice
+        request = make_request(ALICE)
+        receipt = self.alice_device.receipt(request, signer=SoftES256Key())
+        self.assertRefused(self.verify(receipt), receipts.SIGNATURE)
+
+    def test_approbateur_ou_credential_inconnu(self):
+        stranger = SoftWebAuthn()
+        self.assertRefused(self.verify(stranger.receipt(make_request("human:mallory"))),
+                           receipts.UNKNOWN_APPROVER)
+        self.assertRefused(self.verify(stranger.receipt(make_request(ALICE))),
+                           receipts.UNKNOWN_AUTHENTICATOR)
+        # bon credential, mauvaise façade annoncée
+        receipt = self.alice.receipt(make_request(ALICE))
+        receipt["facade"] = "device-es256"
+        self.assertRefused(self.verify(receipt), receipts.FORMAT)  # forme de preuve webauthn
+        receipt = self.alice_device.receipt(make_request(ALICE))
+        receipt["facade"] = "ed25519"
+        tools = receipts.Policy(allow_facades={"ed25519"})
+        self.assertRefused(self.verify(receipt, tools), receipts.UNKNOWN_AUTHENTICATOR)
+
+    def test_agent_ne_peut_pas_approuver(self):
+        receipt = self.alice.receipt(make_request("agent:deepseek7"))
+        self.assertRefused(self.verify(receipt), receipts.FORMAT)
+
+    def test_authentificateur_revoque(self):
+        receipt = self.alice.receipt(make_request(ALICE))
+        self.assertTrue(self.verify(receipt).ok)
+        self.members[0]["authenticators"] = [
+            e for e in self.members[0]["authenticators"]
+            if e["credential_id"] != self.alice.credential_id]
+        result = receipts.sync_authenticators(self.db, self.members)
+        self.assertEqual(result["revoked"], ["%s/webauthn/%s" % (ALICE, self.alice.credential_id)])
+        self.assertRefused(self.verify(receipt), receipts.REVOKED)
+        self.assertRefused(self.verify(self.alice.receipt(make_request(ALICE))), receipts.REVOKED)
+
+    def test_expire(self):
+        request = make_request(ALICE, iat=int(time.time()) - 700, ttl=600)
+        self.assertRefused(self.verify(self.alice.receipt(request)), receipts.EXPIRED)
+        request = make_request(ALICE)
+        receipt = self.alice.receipt(request)
+        self.assertRefused(self.verify(receipt, now=request["exp"]), receipts.EXPIRED)
+        self.assertTrue(self.verify(receipt, now=request["exp"] - 1).ok)
+
+    def test_iat_futur(self):
+        request = make_request(ALICE, iat=int(time.time()) + 600)
+        self.assertRefused(self.verify(self.alice.receipt(request)), receipts.NOT_YET)
+
+    def test_duree_de_vie_bornee(self):
+        request = make_request(ALICE, ttl=receipts.DEFAULT_MAX_TTL + 60)
+        self.assertRefused(self.verify(self.alice.receipt(request)), receipts.TTL)
+
+    def test_nonce_rejoue(self):
+        receipt = self.alice.receipt(make_request(ALICE))
+        self.assertTrue(self.consume(receipt).ok)
+        self.assertRefused(self.verify(receipt), receipts.REPLAY)
+        self.assertRefused(self.consume(receipt), receipts.REPLAY)
+        # nouvelle preuve WebAuthn pour la même demande : même nonce, refusée
+        again = self.alice.receipt(receipt["request"])
+        self.assertRefused(self.consume(again, by="autre"), receipts.REPLAY)
+        # même nonce sous une autre façade (clé d'appareil d'alice) : refusé aussi
+        device = self.alice_device.receipt(receipt["request"])
+        self.assertRefused(self.consume(device, by="autre"), receipts.REPLAY)
+
+    def test_nonce_rejoue_en_concurrence(self):
+        receipt = self.alice.receipt(make_request(ALICE))
+        workers = 8
+        barrier = threading.Barrier(workers)
+        verdicts: list = []
+        lock = threading.Lock()
+
+        def attempt(index: int) -> None:
+            db = self.connect()
+            try:
+                barrier.wait(timeout=30)
+                verdict = self.consume(receipt, by="porte-%d" % index, db=db)
+            finally:
+                db.close()
+            with lock:
+                verdicts.append(verdict)
+
+        threads = [threading.Thread(target=attempt, args=(i,)) for i in range(workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+        self.assertEqual(len(verdicts), workers)
+        self.assertEqual(sum(1 for v in verdicts if v.ok), 1, [v.reason for v in verdicts])
+        self.assertTrue(all(v.code == receipts.REPLAY for v in verdicts if not v.ok))
+
+    def test_facade_ed25519_refusee_pour_une_autorite_humaine(self):
+        receipt = self.alice_tool.receipt(make_request(ALICE))
+        self.assertRefused(self.verify(receipt), receipts.FACADE)
+        tools = receipts.Policy(allow_facades={"ed25519"})
+        self.assertTrue(self.verify(receipt, tools).ok)
+        # et une politique qui n'admet que WebAuthn refuse la clé d'appareil
+        webauthn_only = receipts.Policy(rp_id=RP_ID, origins=(ORIGIN,),
+                                        allow_facades={"webauthn"})
+        self.assertRefused(self.verify(self.alice_device.receipt(make_request(ALICE)),
+                                       webauthn_only), receipts.FACADE)
+
+    def test_politique_webauthn_incomplete(self):
+        receipt = self.alice.receipt(make_request(ALICE))
+        self.assertRefused(self.verify(receipt, receipts.Policy()), receipts.POLICY)
+
+    def test_canon_attendu(self):
+        receipt = self.alice.receipt(make_request(ALICE))
+        policy = receipts.Policy(rp_id=RP_ID, origins=(ORIGIN,), canon_commit=COMMIT)
+        self.assertTrue(self.verify(receipt, policy).ok)
+        policy = receipts.Policy(rp_id=RP_ID, origins=(ORIGIN,), canon_commit=NEXT_COMMIT)
+        self.assertRefused(self.verify(receipt, policy), receipts.CANON)
+
+    def test_cle_injectee_en_base_hors_canon_est_signalee(self):
+        """Une ligne ajoutée en base sans passer par le canon ressort."""
+        intruder = SoftWebAuthn()
+        raw = receipts.b64u_decode(intruder.public_key())
+        self.db.query(
+            "INSERT INTO authenticators (approver, facade, credential_id, public_key, "
+            "key_fingerprint, level, canon_ref) VALUES (%s, 'webauthn', %s, %s, %s, "
+            "'standard', %s) RETURNING id",
+            (ALICE, intruder.credential_id, intruder.public_key(),
+             hashlib.sha256(raw).hexdigest(), "members/alice.md@" + "f" * 40))
+        flagged = receipts.mismatched_authenticators(self.db, COMMIT)
+        self.assertEqual([row["credential_id"] for row in flagged], [intruder.credential_id])
+        policy = receipts.Policy(rp_id=RP_ID, origins=(ORIGIN,), canon_commit=COMMIT)
+        self.assertRefused(self.verify(intruder.receipt(make_request(ALICE)), policy),
+                           receipts.CANON)
+        # et la synchronisation suivante la révoque (absente du canon)
+        result = receipts.sync_authenticators(self.db, self.members)
+        self.assertEqual(result["revoked"], ["%s/webauthn/%s" % (ALICE, intruder.credential_id)])
+
+
+# --------------------------------------------------------------------------
+# approbations permanentes bornées (§8.3)
+# --------------------------------------------------------------------------
+
+def standing(**overrides) -> dict:
+    value = {"connector": "shell-noop", "operations": ["refund", "label"], "class": "costly",
+             "max_amount": 100, "currency": "EUR", "until": int(time.time()) + 3600}
+    value.update(overrides)
+    return value
+
+
+def action(**overrides) -> dict:
+    value = {"action_id": new_action_id(), "connector": "shell-noop", "operation": "refund",
+             "class": "costly", "amount": 30, "currency": "EUR"}
+    value.update(overrides)
+    return value
+
+
+class StandingTest(ReceiptsBase):
+    def register(self, soft=None, approver=ALICE, **overrides):
+        soft = soft or self.alice
+        receipt = soft.receipt(make_request(approver, standing=standing(**overrides)))
+        verdict, grant = receipts.register_standing(self.db, receipt, POLICY, registered_by="porte")
+        self.assertTrue(verdict.ok, verdict.reason)
+        return grant, receipt
+
+    def reserve(self, grant, act):
+        return receipts.standing_reserve(
+            self.db, grant, act["action_id"], act["amount"], connector=act["connector"],
+            operation=act["operation"], action_class=act["class"], currency=act["currency"])
+
+    def consumed(self, grant) -> int:
+        return int(receipts.get_standing(self.db, grant)["consumed_amount"])
+
+    def test_cycle_reserver_reutiliser_liberer(self):
+        grant, _receipt = self.register()
+        first = action()
+        reserved = self.reserve(grant, first)
+        self.assertIsNotNone(reserved)
+        self.assertEqual((reserved["reserved_amount"], reserved["grant_consumed"],
+                          reserved["reused"]), (30, 30, False))
+        # même action (nouvelle tentative après issue inconnue + déduplication
+        # garantie) : même réservation, rien de plus n'est prélevé
+        again = self.reserve(grant, first)
+        self.assertEqual((again["reservation_id"], again["reused"]),
+                         (reserved["reservation_id"], True))
+        self.assertEqual(self.consumed(grant), 30)
+        with self.assertRaises(receipts.ReceiptError):
+            self.reserve(grant, dict(first, amount=31))
+        # issue inconnue : jamais de libération
+        with self.assertRaises(receipts.ReceiptError):
+            receipts.standing_release(self.db, reserved["reservation_id"], outcome="unknown")
+        self.assertEqual(self.consumed(grant), 30)
+        # échec certain : libérée une fois
+        released = receipts.standing_release(self.db, reserved["reservation_id"])
+        self.assertEqual(released["released_amount"], 30)
+        self.assertEqual(self.consumed(grant), 0)
+        self.assertIsNone(receipts.standing_release(self.db, reserved["reservation_id"]))
+        self.assertEqual(self.consumed(grant), 0)
+        # une nouvelle tentative de la même action peut réserver de nouveau
+        self.assertEqual(self.reserve(grant, first)["reused"], False)
+        self.assertEqual(self.consumed(grant), 30)
+
+    def test_plafond_cumule(self):
+        grant, _ = self.register()
+        self.assertIsNotNone(self.reserve(grant, action(amount=60)))
+        self.assertIsNotNone(self.reserve(grant, action(amount=40)))
+        self.assertIsNone(self.reserve(grant, action(amount=1)))
+        self.assertIsNotNone(self.reserve(grant, action(amount=0)))
+        self.assertEqual(self.consumed(grant), 100)
+
+    def test_plafond_en_concurrence(self):
+        grant, _ = self.register()
+        workers = 10
+        barrier = threading.Barrier(workers)
+        results: list = []
+        lock = threading.Lock()
+
+        def attempt() -> None:
+            db = self.connect()
+            act = action(amount=30)
+            try:
+                barrier.wait(timeout=30)
+                result = receipts.standing_reserve(
+                    db, grant, act["action_id"], 30, connector="shell-noop",
+                    operation="refund", action_class="costly", currency="EUR")
+            finally:
+                db.close()
+            with lock:
+                results.append(result)
+
+        threads = [threading.Thread(target=attempt) for _ in range(workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+        self.assertEqual(len(results), workers)
+        self.assertEqual(sum(1 for r in results if r), 3)
+        self.assertEqual(self.consumed(grant), 90)
+        count = self.db.query("SELECT count(*)::int AS n FROM standing_reservations "
+                              "WHERE released_at IS NULL")[0]["n"]
+        self.assertEqual(count, 3)
+
+    def test_meme_action_en_concurrence(self):
+        grant, _ = self.register()
+        act = action(amount=30)
+        workers = 6
+        barrier = threading.Barrier(workers)
+        results: list = []
+        lock = threading.Lock()
+
+        def attempt() -> None:
+            db = self.connect()
+            try:
+                barrier.wait(timeout=30)
+                result = receipts.standing_reserve(
+                    db, grant, act["action_id"], 30, connector="shell-noop",
+                    operation="refund", action_class="costly", currency="EUR")
+            finally:
+                db.close()
+            with lock:
+                results.append(result)
+
+        threads = [threading.Thread(target=attempt) for _ in range(workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+        self.assertTrue(all(results))
+        self.assertEqual(len({r["reservation_id"] for r in results}), 1)
+        self.assertEqual(sum(1 for r in results if not r["reused"]), 1)
+        self.assertEqual(self.consumed(grant), 30)
+
+    def test_enregistrement_rejoue(self):
+        grant, receipt = self.register()
+        verdict, again = receipts.register_standing(self.db, receipt, POLICY, registered_by="x")
+        self.assertIsNone(again)
+        self.assertRefused(verdict, receipts.REPLAY)
+
+    def test_enregistrement_concurrent(self):
+        receipt = self.alice.receipt(make_request(ALICE, standing=standing()))
+        workers = 6
+        barrier = threading.Barrier(workers)
+        grants: list = []
+        lock = threading.Lock()
+
+        def attempt() -> None:
+            db = self.connect()
+            try:
+                barrier.wait(timeout=30)
+                _verdict, grant = receipts.register_standing(db, receipt, POLICY,
+                                                             registered_by="porte")
+            finally:
+                db.close()
+            with lock:
+                grants.append(grant)
+
+        threads = [threading.Thread(target=attempt) for _ in range(workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+        self.assertEqual(sum(1 for g in grants if g), 1)
+        self.assertEqual(self.db.query("SELECT count(*)::int AS n FROM standing_approvals")[0]["n"], 1)
+
+    def test_refus_apres_until(self):
+        grant, _ = self.register()
+        self.db.execute("UPDATE standing_approvals SET valid_until = now() - interval '1 second' "
+                        "WHERE id = %s", (grant,))
+        self.assertIsNone(self.reserve(grant, action()))
+        # un reçu standing déjà échu ne s'enregistre pas
+        until = int(time.time()) + 60
+        receipt = self.alice.receipt(make_request(ALICE, standing=standing(until=until)))
+        verdict, none = receipts.register_standing(self.db, receipt, POLICY, registered_by="x",
+                                                   now=until + 1)
+        self.assertIsNone(none)
+        self.assertFalse(verdict.ok)
+
+    def test_grant_trop_long(self):
+        receipt = self.alice.receipt(make_request(
+            ALICE, standing=standing(until=int(time.time()) + receipts.DEFAULT_MAX_STANDING + 60)))
+        verdict, grant = receipts.register_standing(self.db, receipt, POLICY, registered_by="x")
+        self.assertIsNone(grant)
+        self.assertRefused(verdict, receipts.TTL)
+
+    def test_refus_apres_revocation(self):
+        grant, _ = self.register()
+        reserved_action = action()
+        self.assertIsNotNone(self.reserve(grant, reserved_action))
+        self.assertTrue(receipts.revoke_standing(self.db, grant, by="human:alice"))
+        self.assertFalse(receipts.revoke_standing(self.db, grant, by="human:alice"))
+        self.assertIsNone(self.reserve(grant, action()))
+        # la réservation déjà faite n'autorise plus de nouvelle tentative non plus
+        self.assertIsNone(self.reserve(grant, reserved_action))
+        self.assertIsNone(receipts.standing_cover(self.db, reserved_action))
+
+    def test_authentificateur_revoque_tue_le_grant(self):
+        grant, _ = self.register()
+        self.assertIsNotNone(self.reserve(grant, action()))
+        self.members[0]["authenticators"] = [
+            e for e in self.members[0]["authenticators"]
+            if e["credential_id"] != self.alice.credential_id]
+        receipts.sync_authenticators(self.db, self.members)
+        self.assertIsNone(self.reserve(grant, action()))
+
+    def test_couverture_exacte(self):
+        grant, _ = self.register()
+        for label, act in {
+            "connecteur": action(connector="git-merge"),
+            "opération": action(operation="ship"),
+            "classe": action(**{"class": "irreversible"}),
+            "devise": action(currency="USD"),
+            "sans devise": action(currency=None),
+        }.items():
+            with self.subTest(label):
+                self.assertIsNone(self.reserve(grant, act))
+        self.assertEqual(self.consumed(grant), 0)
+        # sans montant : couvert quelle que soit la devise
+        self.assertIsNotNone(self.reserve(grant, action(amount=None, currency=None)))
+
+    def test_standing_cover(self):
+        small, _ = self.register(max_amount=40)
+        large, _ = self.register(max_amount=500, until=int(time.time()) + 7200)
+        act = action(amount=30)
+        first = receipts.standing_cover(self.db, act)
+        self.assertEqual(first["standing_id"], small)      # celui qui échoit le premier
+        self.assertEqual(receipts.standing_cover(self.db, act)["reservation_id"],
+                         first["reservation_id"])
+        second = receipts.standing_cover(self.db, action(amount=30))
+        self.assertEqual(second["standing_id"], large)     # le premier n'a plus la place
+        self.assertIsNone(receipts.standing_cover(self.db, action(operation="ship")))
+
+    def test_natures_non_interchangeables(self):
+        standing_receipt = self.alice.receipt(make_request(ALICE, standing=standing()))
+        self.assertRefused(self.verify(standing_receipt), receipts.KIND)
+        self.assertRefused(self.verify(standing_receipt, kind=None, consume_by="porte"),
+                           receipts.KIND)
+        self.assertTrue(self.verify(standing_receipt, kind=None).ok)
+        action_receipt = self.alice.receipt(make_request(ALICE))
+        verdict, grant = receipts.register_standing(self.db, action_receipt, POLICY,
+                                                    registered_by="x")
+        self.assertIsNone(grant)
+        self.assertRefused(verdict, receipts.KIND)
+        deny = self.alice.receipt(make_request(ALICE, standing=standing(), decision="deny"))
+        verdict, grant = receipts.register_standing(self.db, deny, POLICY, registered_by="x")
+        self.assertIsNone(grant)
+        self.assertRefused(verdict, receipts.DECISION)
+
+    def test_forme_du_standing(self):
+        for label, overrides in {
+            "classe": {"class": "gratuit"},
+            "plafond flottant": {"max_amount": 10.5},
+            "plafond sans devise": {"currency": None},
+            "devise": {"currency": "euro"},
+            "opérations vides": {"operations": []},
+            "opérations en double": {"operations": ["refund", "refund"]},
+        }.items():
+            with self.subTest(label):
+                # la forme est contrôlée avant toute preuve : une preuve factice suffit
+                receipt = make_receipt(make_request(ALICE, standing=standing(**overrides)),
+                                       "webauthn", self.alice.credential_id,
+                                       self.alice.proof(b"\x00" * 32))
+                verdict, grant = receipts.register_standing(self.db, receipt, POLICY,
+                                                            registered_by="x")
+                self.assertIsNone(grant)
+                self.assertRefused(verdict, receipts.FORMAT)
+
+
+# --------------------------------------------------------------------------
+# synchronisation du registre
+# --------------------------------------------------------------------------
+
+class SyncTest(ReceiptsBase):
+    def test_sync_idempotente_et_mise_a_jour(self):
+        result = receipts.sync_authenticators(self.db, self.members)
+        self.assertEqual((result["added"], result["revoked"], result["updated"]), ([], [], []))
+        self.assertEqual(result["unchanged"], 7)
+        # nouveau commit du canon : la provenance de chaque ligne suit
+        moved = [member("alice", self.alice.entry(level="eleve"), self.alice_ed.entry(),
+                        self.alice_device.entry(), self.alice_tool.entry(), commit=NEXT_COMMIT),
+                 member("bob", self.bob.entry(), commit=NEXT_COMMIT),
+                 member("carol", self.carol_key.entry(level="eleve"),
+                        self.carol_synced.entry(), commit=NEXT_COMMIT)]
+        result = receipts.sync_authenticators(self.db, moved)
+        self.assertEqual(len(result["updated"]), 7)
+        self.assertEqual(receipts.mismatched_authenticators(self.db, NEXT_COMMIT), [])
+        self.assertEqual(len(receipts.mismatched_authenticators(self.db, COMMIT)), 7)
+        rows = receipts.list_authenticators(self.db, approver=ALICE)
+        level = {row["credential_id"]: row["level"] for row in rows}
+        self.assertEqual(level[self.alice.credential_id], "eleve")
+
+    def test_changement_de_cle(self):
+        replaced = SoftWebAuthn()
+        replaced.credential_id = self.alice.credential_id
+        self.members[0]["authenticators"][0] = replaced.entry()
+        result = receipts.sync_authenticators(self.db, self.members)
+        label = "%s/webauthn/%s" % (ALICE, self.alice.credential_id)
+        self.assertEqual((result["revoked"], result["added"]), ([label], [label]))
+        self.assertRefused(self.verify(self.alice.receipt(make_request(ALICE))),
+                           receipts.SIGNATURE)
+        self.assertTrue(self.verify(replaced.receipt(make_request(ALICE))).ok)
+        history = receipts.list_authenticators(self.db, approver=ALICE, include_revoked=True)
+        self.assertEqual(sum(1 for row in history
+                             if row["credential_id"] == self.alice.credential_id), 2)
+
+    def test_membre_retire_et_credential_deplace(self):
+        # bob disparaît du canon ; son credential est déclaré pour carol
+        self.members[1]["authenticators"] = []
+        self.members[2]["authenticators"].append(self.bob.entry())
+        result = receipts.sync_authenticators(self.db, self.members)
+        self.assertIn("%s/webauthn/%s" % (BOB, self.bob.credential_id), result["revoked"])
+        self.assertIn("%s/webauthn/%s" % (CAROL, self.bob.credential_id), result["added"])
+        self.assertRefused(self.verify(self.bob.receipt(make_request(BOB))),
+                           receipts.REVOKED)
+        self.assertTrue(self.verify(self.bob.receipt(make_request(CAROL))).ok)
+
+    def test_entree_sans_reference_de_commit(self):
+        """Constat d'erreur, aucune écriture pour l'entrée — même pas une révocation."""
+        newcomer = SoftWebAuthn()
+        members = [dict(m) for m in self.members]
+        members[0] = dict(members[0], canon_ref=None, authenticators=[
+            dict(self.alice.entry()),                                   # existante
+            dict(newcomer.entry()),                                     # nouvelle
+            dict(self.alice_ed.entry(), canon_ref="members/alice.md"),  # chemin sans SHA
+            dict(self.alice_device.entry(), canon_ref="members/alice.md@" + COMMIT),
+        ])
+        before = receipts.list_authenticators(self.db, approver=ALICE)
+        result = receipts.sync_authenticators(self.db, members)
+        self.assertEqual(len(result["errors"]), 3, result["errors"])
+        self.assertTrue(all("référence de commit" in e for e in result["errors"]))
+        self.assertEqual(result["added"], [])
+        # la ligne existante d'alice/webauthn est restée telle quelle ; l'outil
+        # ed25519, absent de la liste, est révoqué normalement
+        self.assertEqual(result["revoked"],
+                         ["%s/ed25519/%s" % (ALICE, self.alice_tool.credential_id)])
+        after = {row["credential_id"]: row for row in
+                 receipts.list_authenticators(self.db, approver=ALICE)}
+        for row in before:
+            if row["facade"] in ("webauthn", "device-es256"):
+                self.assertEqual(after[row["credential_id"]]["canon_ref"], row["canon_ref"])
+        self.assertNotIn(newcomer.credential_id, after)
+
+    def test_entrees_invalides(self):
+        broken_key = dict(SoftWebAuthn().entry(), public_key=b64u(b"pas une cle COSE"))
+        private = SoftWebAuthn()
+        x, y = (v.to_bytes(32, "big") for v in private.key.point)
+        from .webauthn_soft import cbor
+        with_private = dict(private.entry(), public_key=b64u(cbor(
+            {1: 2, 3: -7, -1: 1, -2: x, -3: y, -4: private.key.private.to_bytes(32, "big")})))
+        bad_level = dict(SoftWebAuthn().entry(), level="maximal")
+        bad_facade = dict(SoftWebAuthn().entry(), facade="sms")
+        dup = SoftWebAuthn()
+        members = self.members + [
+            member("dave", broken_key, with_private, bad_level, bad_facade, dup.entry()),
+            member("erin", dup.entry()),
+            {"title": "pas un nom valide !", "authenticators": []},
+        ]
+        result = receipts.sync_authenticators(self.db, members)
+        joined = "\n".join(result["errors"])
+        self.assertIn("COSE", joined)
+        self.assertIn("PRIVÉE", joined)
+        self.assertIn("niveau inconnu", joined)
+        self.assertIn("façade ou credential_id invalide", joined)
+        self.assertIn("déclaré 2 fois", joined)
+        self.assertIn("titre invalide", joined)
+        self.assertEqual(result["added"], [])
+        self.assertEqual(receipts.list_authenticators(self.db, approver="human:dave"), [])
+
+    def test_cles_en_base64_standard_acceptees_du_canon(self):
+        device = SoftDevice()
+        raw = receipts.b64u_decode(device.public_key())
+        import base64
+        entry = dict(device.entry(), public_key=base64.b64encode(raw).decode())
+        self.members[0]["authenticators"].append(entry)
+        result = receipts.sync_authenticators(self.db, self.members)
+        self.assertEqual(result["errors"], [])
+        self.assertTrue(self.verify(device.receipt(make_request(ALICE))).ok)
+
+    def test_aaguid_normalise(self):
+        entry = self.alice.entry(aaguid="ADCE0002-35BC-C60A-648B-0B25F1F05503")
+        self.members[0]["authenticators"][0] = entry
+        receipts.sync_authenticators(self.db, self.members)
+        row = [r for r in receipts.list_authenticators(self.db, approver=ALICE)
+               if r["credential_id"] == self.alice.credential_id][0]
+        self.assertEqual(row["aaguid"], "adce0002-35bc-c60a-648b-0b25f1f05503")
+
+    def test_mismatched_par_correspondance(self):
+        rows = receipts.list_authenticators(self.db)
+        expected = {(r["approver"], r["facade"], r["credential_id"]): r["canon_ref"] for r in rows}
+        self.assertEqual(receipts.mismatched_authenticators(self.db, expected), [])
+        first = rows[0]
+        expected[(first["approver"], first["facade"], first["credential_id"])] = "x@" + "c" * 40
+        self.assertEqual([r["id"] for r in receipts.mismatched_authenticators(self.db, expected)],
+                         [first["id"]])
+        with self.assertRaises(receipts.ReceiptError):
+            receipts.mismatched_authenticators(self.db, "main")
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+class ReceiptsCliTest(ReceiptsBase):
+    def write(self, receipt) -> str:
+        path = os.path.join(self.tmp, "recu-%s.json" % os.urandom(4).hex())
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(receipt, fh)
+        return path
+
+    def test_receipt_verify(self):
+        request = make_request(ALICE)
+        path = self.write(self.alice.receipt(request))
+        args = ["receipt", "verify", path, "--rp-id", RP_ID, "--origin", ORIGIN]
+        proc = self.mesh(*args)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reçu VALIDE", proc.stdout)
+        self.assertIn("disponible", proc.stdout)
+        proc = self.mesh(*args, "--json", "--digest", request["digest"])
+        self.assertEqual(json.loads(proc.stdout)["code"], "ok")
+        proc = self.mesh(*args, "--consume", "--by", "cli")
+        self.assertEqual(proc.returncode, 2)                  # consommer sans lier : refusé
+        bound = ["--digest", request["digest"], "--action-id", request["action_id"]]
+        proc = self.mesh(*args, "--consume", "--by", "cli", *bound)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("consommé", proc.stdout)
+        proc = self.mesh(*args, "--consume", "--by", "cli", *bound)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("[replay]", proc.stderr)
+
+    def test_receipt_verify_refus(self):
+        path = self.write(self.alice.receipt(make_request(ALICE), origin="https://evil.test"))
+        proc = self.mesh("receipt", "verify", path, "--rp-id", RP_ID, "--origin", ORIGIN)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("[origin]", proc.stderr)
+        path = self.write(self.alice_tool.receipt(make_request(ALICE)))
+        proc = self.mesh("receipt", "verify", path)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("[facade_refused]", proc.stderr)
+        proc = self.mesh("receipt", "verify", path, "--allow-facade", "ed25519")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.mesh("receipt", "verify", path, "--consume")
+        self.assertEqual(proc.returncode, 2)
+
+    def test_receipt_verify_variables_d_environnement(self):
+        path = self.write(self.alice.receipt(make_request(ALICE)))
+        env = self.env(AMEESH_APPROVE_RP_ID=RP_ID, AMEESH_APPROVE_ORIGINS="https://x.test, " + ORIGIN)
+        proc = self.mesh("receipt", "verify", path, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_authenticator_list(self):
+        proc = self.mesh("authenticator", "list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(ALICE, proc.stdout)
+        self.assertIn("members/bob.md@" + COMMIT, proc.stdout)
+        proc = self.mesh("authenticator", "list", "--approver", BOB, "--json")
+        rows = json.loads(proc.stdout)
+        self.assertEqual([row["credential_id"] for row in rows], [self.bob.credential_id])
+        proc = self.mesh("authenticator", "list", "--expect-commit", NEXT_COMMIT)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("HORS CANON ATTENDU", proc.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
