@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-04 (revue codex3, B3)
+* **Correction** : R5 — identité d'action stable (clé d'idempotence) distincte du nonce d'autorisation ; nouvelle action après issue inconnue seulement par décision humaine assumant le doublon ; `Message-ID` ramené à une poignée de réconciliation.
+
 ## 2026-10-04 (Q2)
 * **Décision** : [hébergement configurable et provisionnement par le harnais de l'utilisateur](decisions/0011-hebergement-configurable.md) ; Q2 close, Q1 reformulée.
 

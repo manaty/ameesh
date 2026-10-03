@@ -18,7 +18,7 @@ sources:
 | R2 | N'importe quel harnais, par ses **standards** : MCP pour le sortant, pilotage par stream-json, app-server ou **ACP** pour le réveil. | adaptateurs → standards ([0007](decisions/0007-standards-des-harnais.md)) |
 | R3 | Un agent tourne à un seul endroit à la fois (bail) ; un **objet métier** (ticket, préparation) est traité par un seul membre à la fois. | baux sur objets externes |
 | R4 | L'autorité d'un humain est **prouvée** par une signature faite sur un appareil que les agents ne contrôlent pas, liée à l'empreinte exacte de ce qui est approuvé. | propriétaire → tout humain habilité ; clé hors de portée des agents |
-| R5 | Rien ne se perd : courrier durable, tour rejouable, bail qui expire. Une **action irréversible** suit le protocole d'exécution ci-dessous : jamais exécutée deux fois, jamais réessayée à l'aveugle quand son issue est inconnue. | idempotence et issue inconnue |
+| R5 | Rien ne se perd : courrier durable, tour rejouable, bail qui expire. Une **action irréversible** suit le protocole d'exécution ci-dessous : elle n'est **jamais relancée tant que le risque de doublon n'est pas levé** (déduplication garantie ou réconciliation) **ou explicitement assumé par un humain habilité**. | idempotence et issue inconnue |
 | R6 | Transport interchangeable : Nexlink (natif), pile open source (Matrix, Zulip), outils courants (Slack, Teams, Google Chat, e-mail). | [0003](decisions/0003-ameesh-et-nexlink.md), [0004](decisions/0004-open-source-et-outils-courants.md) |
 | R7 | Budget et modèle par agent ; vue des abonnements ; budget par projet. | budget par projet |
 
@@ -47,26 +47,41 @@ d'enlèvement, fusion) passe par la porte (ameesh-gate) et par des états
 proposée → approuvée → lancée → confirmée | échouée | inconnue
 ```
 
-1. **Clé d'idempotence** : chaque action approuvée reçoit une clé dérivée du
-   reçu (son nonce). Elle est transmise au système externe quand il le permet
-   (`Idempotency-Key` d'une API de paiement, `Message-ID` d'un e-mail, référence
-   client d'une expédition).
-2. **« lancée » est écrit avant l'appel externe.** Le reçu est consommé à ce
-   moment : il ne peut plus servir à une autre exécution.
-3. **Issue inconnue** (effet peut-être fait, réponse perdue : coupure, délai
-   dépassé) : l'état passe à `inconnue` et **aucune nouvelle tentative
-   automatique** n'a lieu, sauf si le connecteur garantit la déduplication par
-   la clé d'idempotence.
-4. **Réconciliation** : le connecteur déclare comment retrouver l'issue par la
-   clé (chercher le `Message-ID` dans les envoyés, l'expédition par sa référence,
-   le remboursement par sa clé). Résultat trouvé → `confirmée` ou `échouée` ;
-   introuvable ou connecteur sans réconciliation → **attente d'un humain**, avec
-   le contexte, dans sa file de décisions (R17).
-5. Une nouvelle tentative après `échouée` ou une décision humaine sur
-   `inconnue` exige une **nouvelle approbation** (nouveau reçu, nouvelle clé).
+Deux identifiants distincts :
 
-Chaque connecteur d'action irréversible déclare donc, dans le canon : s'il
-accepte une clé d'idempotence, et comment réconcilier une issue inconnue.
+- l'**identité de l'action** (`action_id`) : attribuée à la proposition, **stable
+  à travers toutes les tentatives** de la même action. C'est la **clé
+  d'idempotence** transmise au système externe quand il le permet ;
+- le **nonce d'autorisation** : propre à chaque reçu signé, consommé une fois.
+  Un reçu autorise une tentative d'une action donnée ; il ne crée jamais une
+  nouvelle action.
+
+1. **« lancée » est écrit avant l'appel externe** ; le reçu est consommé à ce
+   moment et ne peut plus servir.
+2. **Issue inconnue** (effet peut-être fait, réponse perdue) : état `inconnue`,
+   **aucune nouvelle tentative automatique**.
+3. **Déduplication garantie** : si le connecteur déclare que le système externe
+   déduplique sur la clé d'idempotence (par exemple un en-tête
+   `Idempotency-Key` documenté par une API de paiement), une nouvelle tentative
+   **de la même action** — même `action_id`, nouveau reçu — est sans risque de
+   doublon.
+4. **Réconciliation** : sinon, le connecteur retrouve l'issue par une lecture
+   (chercher l'e-mail dans les envoyés par son `Message-ID`, l'expédition par sa
+   référence). Trouvée → `confirmée` ou `échouée`.
+5. **Ni déduplication ni réconciliation concluante** : attente d'un humain
+   (R17), avec le contexte. Seule une **décision explicite d'un humain habilité,
+   qui assume le risque de doublon**, peut créer une **nouvelle action**
+   (nouvel `action_id`) ; cette décision est signée et liée à l'action
+   `inconnue` qu'elle remplace.
+6. Après `échouée` (échec certain, aucun effet), une nouvelle tentative de la
+   même action demande un nouveau reçu ; elle garde le même `action_id`.
+
+**`Message-ID` n'est pas une garantie de déduplication** : les serveurs SMTP ne
+dédupliquent pas sur cet en-tête. Il ne sert que de **poignée de réconciliation**.
+
+Chaque connecteur d'action irréversible déclare donc, dans le canon : si le
+système externe **garantit** la déduplication sur une clé (avec la référence de
+sa documentation), et comment réconcilier une issue inconnue.
 
 # Principes d'architecture qui en découlent
 
