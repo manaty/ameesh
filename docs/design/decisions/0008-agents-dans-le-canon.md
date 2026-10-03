@@ -19,7 +19,7 @@ Aujourd'hui l'existence d'un agent tient à ses scripts de lancement et à des m
 - Chaque agent a une **fiche** dans le canon OKF (type `Agent`) : humain responsable, équipe, rôle et capacités (`read`, `report-drift`, `propose`, jamais `approve`), harnais et modèle, machine prévue, budget, outils autorisés, relecteurs.
 - La fiche ne change que par **PR revue**.
 - **L'état** (session, bail, machine courante, statut, dépense, courrier) reste dans ameesh.
-- Les **agents éphémères**, limités à la lecture et à la proposition, peuvent exister sans fiche.
+- Les **agents éphémères**, limités à la lecture et à la proposition, peuvent exister sans fiche ; ils ont quand même un humain responsable, **hérité de l'agent qui les a créés** et enregistré par ameesh à leur création (R14).
 
 # Conséquences
 
