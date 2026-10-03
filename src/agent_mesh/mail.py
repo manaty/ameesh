@@ -14,8 +14,10 @@ from .db import Db
 
 MAIL_COLUMNS = """
     id, sender, recipient, body, kind, payload, status, host,
-    extract(epoch from created_at)::float8  as created_ts,
-    extract(epoch from delivered_at)::float8 as delivered_ts
+    signature, signature_key, signed_payload, nonce,
+    extract(epoch from created_at)::float8 as created_ts,
+    extract(epoch from delivered_at)::float8 as delivered_ts,
+    extract(epoch from signature_expires_at)::float8 as signature_expires_ts
 """
 
 
@@ -31,19 +33,32 @@ def send(
     work_item_id: str | None = None,
     signature: str | None = None,
     signature_key: str | None = None,
+    signed_payload: str | None = None,
+    nonce: str | None = None,
+    created_us: int | None = None,
+    expires_us: int | None = None,
 ) -> int:
-    """Dépose un message pour UN destinataire. Renvoie son id."""
+    """Dépose un message pour UN destinataire. Renvoie son id.
+
+    Les champs `signed_*` viennent de `authority.sign_message` : un message
+    signé fixe son propre horodatage (c'est lui qui est couvert par la
+    signature) et son échéance.
+    """
     rows = db.query(
         """
         INSERT INTO agent_mailbox
             (sender, recipient, body, host, kind, payload, work_item_id,
-             signature, signature_key)
-        VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s)
+             signature, signature_key, signed_payload, nonce,
+             created_at, signature_expires_at)
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s,
+                coalesce(to_timestamp(%s::bigint / 1000000.0), now()),
+                to_timestamp(%s::bigint / 1000000.0))
         RETURNING id
         """,
         (sender, recipient, body, host, kind,
          json.dumps(payload or {}, ensure_ascii=False), work_item_id,
-         signature, signature_key),
+         signature, signature_key, signed_payload, nonce,
+         created_us, expires_us),
     )
     return int(rows[0]["id"])
 
@@ -120,6 +135,12 @@ def normalize(row: dict) -> dict:
         "kind": row.get("kind") or "notify",
         "payload": row.get("payload") or {},
         "host": row.get("host"),
+        # champs d'autorité (R4) : absents en repli fichier, présents en base
+        "signature": row.get("signature"),
+        "signature_key": row.get("signature_key"),
+        "signed_payload": row.get("signed_payload"),
+        "nonce": row.get("nonce"),
+        "signature_expires_ts": row.get("signature_expires_ts"),
     }
 
 

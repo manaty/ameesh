@@ -88,12 +88,13 @@ class PgTestCase(unittest.TestCase):
     # -- utilitaires -------------------------------------------------------
     def setUp(self) -> None:
         """Chaque test part d'une base et d'un disque propres."""
-        self.db.execute("TRUNCATE agent_registry, agent_mailbox RESTART IDENTITY CASCADE")
+        self.db.execute(
+            "TRUNCATE agent_registry, agent_mailbox, mesh_approvals, "
+            "work_items, work_item_events RESTART IDENTITY CASCADE")
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        os.makedirs(self.tmp, exist_ok=True)
         for path in (self.state, self.v0state, self.conf):
-            shutil.rmtree(path, ignore_errors=True)
             os.makedirs(path, exist_ok=True)
-        if os.path.exists(self.turns_log):
-            os.unlink(self.turns_log)
 
     @classmethod
     def env(cls, **extra: str) -> dict:
@@ -126,6 +127,14 @@ class PgTestCase(unittest.TestCase):
             env=env or self.env(), cwd=self.tmp,
         )
 
+    def mesh(self, *args: str, env: dict | None = None, timeout: float = 60.0,
+             ) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "agent_mesh.mesh_cli", *args],
+            capture_output=True, text=True, timeout=timeout,
+            env=env or self.env(), cwd=self.tmp,
+        )
+
     def runner_popen(self, *args: str, env: dict | None = None) -> subprocess.Popen:
         return subprocess.Popen(
             [sys.executable, "-m", "agent_mesh.runner", *args],
@@ -153,6 +162,12 @@ class PgTestCase(unittest.TestCase):
                 return value
             time.sleep(interval)
         self.fail("condition non remplie après %ss" % timeout)
+
+    def make_test_key(self, name: str = "test-owner") -> tuple[str, str, str]:
+        """Paire de clés de TEST dans le bac à sable — jamais une clé réelle."""
+        from agent_mesh import signing
+        directory = os.path.join(self.tmp, "keys")
+        return signing.write_keypair(directory, name)
 
     def register(self, name: str, harness: str, **kwargs) -> subprocess.CompletedProcess:
         args = ["register", name, harness]

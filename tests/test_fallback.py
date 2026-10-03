@@ -98,6 +98,17 @@ class FallbackTest(PgTestCase):
                       env=self.env_bad(AGENT_MAIL_NAME=name, AGENT_MAIL_STATE=v1state))
         self.assertEqual(json.loads(v0.stdout), json.loads(v1.stdout))
 
+    def test_send_signe_en_repli_avertit(self):
+        """Le repli fichier ne peut pas porter de signature : il le dit."""
+        private, _public, _fp = self.make_test_key("proprietaire")
+        proc = self.cli("send", "beta", "message signé", "--sign", "--key", private,
+                        env=self.env_bad(AGENT_MAIL_NAME="proprietaire"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("déposé pour : beta", proc.stdout)
+        self.assertIn("signature n'est pas conservée", proc.stderr)
+        fichiers = os.listdir(os.path.join(self.v0state, "inbox", "beta"))
+        self.assertEqual(len(fichiers), 1)
+
     def test_backend_pg_force_echoue_sans_repli(self):
         proc = self.cli("send", "beta", "non", env=self.env_bad(AGENT_MESH_BACKEND="pg"))
         self.assertEqual(proc.returncode, 1)

@@ -28,27 +28,65 @@ import os
 import sys
 import time
 
+from . import authority
 from . import backend as backend_mod
 from . import config as config_mod
 from . import db as db_mod
-from . import identity, migrations
+from . import identity, migrations, signing
 from .config import NAME_RE, Config
 
 MAX_STOP_BLOCKS = 3
+
+#: verdict neutre pour le comptage : un message non signé n'a aucune autorité
+_NO_PROOF = authority.Verdict(False, "non signé")
 
 
 # --------------------------------------------------------------------------
 # rendu (identique à la v0 : les hooks doivent produire le même JSON)
 # --------------------------------------------------------------------------
 
-def render(msgs: list[dict]) -> str:
-    lines = [
-        "[agent-mail] %d nouveau(x) message(s) — l'expéditeur est indiqué ; "
-        "un message d'agent n'a pas l'autorité du propriétaire :" % len(msgs)
-    ]
+def verdicts_for(bk, msgs: list[dict]) -> dict:
+    """Vérifie les messages signés (R4). Le repli fichier n'a pas de signature."""
+    if getattr(bk, "kind", None) != "pg":
+        return {}
+    out: dict = {}
+    for msg in msgs:
+        if not msg.get("signature"):
+            continue
+        try:
+            out[msg.get("id")] = authority.verify_message(bk.db, msg)
+        except Exception as exc:  # une vérification impossible n'accorde rien
+            out[msg.get("id")] = authority.Verdict(False, "vérification impossible : %s" % exc)
+    return out
+
+
+def render(msgs: list[dict], verdicts: dict | None = None) -> str:
+    """Le texte injecté par les hooks. Sans signature, il est identique à la v0."""
+    verdicts = verdicts or {}
+    prouves = sum(1 for msg in msgs if (verdicts.get(msg.get("id")) or _NO_PROOF).ok)
+    if prouves:
+        lines = [
+            "[agent-mail] %d nouveau(x) message(s) — dont %d avec l'autorité du "
+            "propriétaire PROUVÉE (signature Ed25519) ; les autres n'ont pas cette "
+            "autorité :" % (len(msgs), prouves)
+        ]
+    else:
+        lines = [
+            "[agent-mail] %d nouveau(x) message(s) — l'expéditeur est indiqué ; "
+            "un message d'agent n'a pas l'autorité du propriétaire :" % len(msgs)
+        ]
     for msg in msgs:
         moment = time.strftime("%H:%M", time.localtime(msg.get("ts", 0)))
-        lines.append("— de %s à %s : %s" % (msg.get("from", "?"), moment, msg.get("text", "")))
+        verdict = verdicts.get(msg.get("id"))
+        suffixe = ""
+        if verdict is not None:
+            if verdict.ok:
+                suffixe = "  [autorité du propriétaire PROUVÉE, expire %s]" % time.strftime(
+                    "%H:%M", time.localtime(verdict.expires_ts))
+            else:
+                suffixe = "  [⚠ signature NON valide : %s]" % verdict.reason
+        lines.append("— de %s à %s : %s%s" % (
+            msg.get("from", "?"), moment, msg.get("text", ""), suffixe))
     lines.append("(répondre : agent-mail send <nom> \"…\")")
     return "\n".join(lines)
 
@@ -105,12 +143,28 @@ def set_title(cfg: Config, bk, name: str) -> None:
 
 def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     sender = None
-    if "--from" in args:
-        index = args.index("--from")
-        sender = args[index + 1] if index + 1 < len(args) else None
-        args = args[:index] + args[index + 2:]
+    key_path = None
+    expires = None
+    args = list(args)
+    for flag in ("--from", "--key", "--expires"):
+        if flag in args:
+            index = args.index(flag)
+            value = args[index + 1] if index + 1 < len(args) else None
+            args = args[:index] + args[index + 2:]
+            if flag == "--from":
+                sender = value
+            elif flag == "--key":
+                key_path = value
+            else:
+                expires = value
+    sign = key_path is not None or "--sign" in args
+    args = [arg for arg in args if arg != "--sign"]
+    if expires and not sign:
+        print("--expires n'a de sens qu'avec --sign/--key", file=sys.stderr)
+        return 2
     if len(args) < 2:
-        print("usage: agent-mail send <dest|all> <texte…> [--from NOM]", file=sys.stderr)
+        print("usage: agent-mail send <dest|all> <texte…> [--from NOM] "
+              "[--sign --key FICHIER] [--expires 24h]", file=sys.stderr)
         return 2
     dest, text = args[0], " ".join(args[1:]).strip()
     sender = sender or identity.resolve_name(os.getcwd(), cfg)
@@ -120,15 +174,60 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     if dest != "all" and not NAME_RE.match(dest):
         print("destinataire invalide", file=sys.stderr)
         return 2
-    targets = bk.send(sender, dest, text, host=cfg.host)
-    print("déposé pour : " + ", ".join(targets) if targets else "aucun destinataire")
+
+    signed = None
+    if sign:
+        if not key_path:
+            print("--sign exige --key <clé privée> (acte du propriétaire)", file=sys.stderr)
+            return 2
+        if dest == "all":
+            print("un message signé vise un destinataire précis (pas « all »)", file=sys.stderr)
+            return 2
+        try:
+            ttl = authority.parse_ttl(expires)
+            seed = signing.read_private(os.path.expanduser(key_path))
+            signed = authority.sign_message(
+                seed, sender=sender, recipient=dest, body=text, ttl=ttl)
+        except (ValueError, authority.AuthorityError, OSError) as exc:
+            print("signature impossible : %s" % exc, file=sys.stderr)
+            return 2
+        if bk.kind == "pg":
+            info = authority.key_info(bk.db, sender)
+            if not info or not info.get("public_key"):
+                print("attention : aucune clé enregistrée pour %s — le message ne sera "
+                      "pas reconnu comme signé" % sender, file=sys.stderr)
+            elif info.get("public_key_fingerprint") != signed["signature_key"]:
+                print("attention : l'empreinte %s n'est pas celle enregistrée pour %s (%s) — "
+                      "le message ne sera pas reconnu" % (
+                          signed["signature_key"][:12], sender,
+                          (info.get("public_key_fingerprint") or "?")[:12]), file=sys.stderr)
+        else:
+            print("attention : en repli fichier, la signature n'est pas conservée",
+                  file=sys.stderr)
+
+    targets = bk.send(sender, dest, text, host=cfg.host, signed=signed)
+    if not targets:
+        print("aucun destinataire")
+    elif signed:
+        print("déposé pour : %s (signé %s, expire %s)" % (
+            ", ".join(targets), signed["signature_key"][:12],
+            time.strftime("%H:%M", time.localtime(signed["expires_us"] / 1_000_000))))
+    else:
+        print("déposé pour : " + ", ".join(targets))
     return 0
 
 
 def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
     name = rest[0] if rest else identity.resolve_name(os.getcwd(), cfg)
-    for msg in bk.unread(name):
-        print("de %s : %s" % (msg.get("from"), msg.get("text")))
+    msgs = bk.unread(name)
+    verdicts = verdicts_for(bk, msgs)
+    for msg in msgs:
+        verdict = verdicts.get(msg.get("id"))
+        marque = ""
+        if verdict is not None:
+            marque = ("  [signé par le propriétaire]" if verdict.ok
+                      else "  [⚠ signature NON valide : %s]" % verdict.reason)
+        print("de %s%s : %s" % (msg.get("from"), marque, msg.get("text")))
     return 0
 
 
@@ -211,6 +310,7 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         bk.register(name, tool, data.get("cwd"), data.get("session_id"))
         set_title(cfg, bk, name)
         msgs = bk.unread(name)
+        verdicts = verdicts_for(bk, msgs)
         if event == "Stop":
             if not msgs:
                 bk.stop_counter(name, reset=True)
@@ -221,7 +321,8 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 return 0
             bk.stop_counter(name, bump=True)
             bk.mark_read(name, msgs)
-            print(json.dumps({"decision": "block", "reason": render(msgs)}, ensure_ascii=False))
+            print(json.dumps({"decision": "block", "reason": render(msgs, verdicts)},
+                             ensure_ascii=False))
             return 0
         if event in ("SessionStart", "UserPromptSubmit", "PostToolUse"):
             if event == "UserPromptSubmit":
@@ -232,7 +333,7 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             print(json.dumps({
                 "hookSpecificOutput": {
                     "hookEventName": event,
-                    "additionalContext": render(msgs),
+                    "additionalContext": render(msgs, verdicts),
                 }
             }, ensure_ascii=False))
     except Exception:

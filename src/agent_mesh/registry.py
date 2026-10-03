@@ -91,7 +91,7 @@ def overview(db: Db) -> list[dict]:
         SELECT name, chantier, harness, host, cwd, session_id, status, status_text,
                model, budget_usd, spent_usd, turns, pending_prompt, last_error,
                lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
-               unread
+               public_key_fingerprint, key_ready, unread
         FROM agent_mesh_overview
         ORDER BY last_seen_ts DESC NULLS LAST
         """

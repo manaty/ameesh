@@ -43,7 +43,10 @@ class FileBackend:
         return os.path.join(self.agents_dir(), name + ".status")
 
     # -- messages ----------------------------------------------------------
-    def send(self, sender: str, dest: str, text: str, host: str | None = None) -> list[str]:
+    def send(self, sender: str, dest: str, text: str, host: str | None = None,
+             signed: dict | None = None) -> list[str]:
+        # Le repli fichier ne stocke pas de signature (format v0 strict) : la
+        # CLI prévient l'appelant, le message part quand même.
         if dest == "all":
             targets = [
                 f[:-5]
@@ -186,7 +189,8 @@ class PgBackend:
         self.db = db
 
     # -- messages ----------------------------------------------------------
-    def send(self, sender: str, dest: str, text: str, host: str | None = None) -> list[str]:
+    def send(self, sender: str, dest: str, text: str, host: str | None = None,
+             signed: dict | None = None) -> list[str]:
         if dest == "all":
             targets = [
                 row["name"]
@@ -196,7 +200,9 @@ class PgBackend:
         else:
             targets = [dest]
         for target in targets:
-            mail.send(self.db, sender, target, text, host=host)
+            # `signed` vient de authority.sign_message : signature, payload,
+            # nonce, horodatage et échéance signés.
+            mail.send(self.db, sender, target, text, host=host, **dict(signed or {}))
             registry.upsert(self.db, target, host=host)
         return targets
 

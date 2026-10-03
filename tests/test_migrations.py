@@ -17,13 +17,26 @@ class MigrationsTest(PgTestCase):
         rows = self.db.query(
             "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
         )
-        self.assertEqual([row["version"] for row in rows], [1, 2])
-        self.assertEqual([row["name"] for row in rows], ["init", "overview"])
+        self.assertEqual([row["version"] for row in rows], [1, 2, 3, 4])
+        self.assertEqual([row["name"] for row in rows],
+                         ["init", "overview", "authority", "work_items"])
         for row in rows:
             self.assertEqual(len(row["checksum"]), 64)
         # la vue d'observabilité et les deux triggers de notification existent
-        view = self.db.query("SELECT to_regclass('agent_mesh_overview') IS NOT NULL AS ok")[0]
-        self.assertTrue(view["ok"])
+        for relation in ("agent_mesh_overview", "mesh_approvals_status"):
+            with self.subTest(relation=relation):
+                found = self.db.query(
+                    "SELECT to_regclass(%s) IS NOT NULL AS ok", (relation,))[0]
+                self.assertTrue(found["ok"])
+        # les colonnes d'autorité et de signature sont bien là
+        colonnes = {row["column_name"] for row in self.db.query(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'agent_registry'")}
+        self.assertTrue({"public_key", "public_key_fingerprint", "key_revoked_at"} <= colonnes)
+        colonnes = {row["column_name"] for row in self.db.query(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'agent_mailbox'")}
+        self.assertTrue({"nonce", "signed_payload", "signature_expires_at"} <= colonnes)
         triggers = self.db.query(
             "SELECT t.tgname FROM pg_trigger t "
             "JOIN pg_class c ON c.oid = t.tgrelid "
@@ -36,7 +49,7 @@ class MigrationsTest(PgTestCase):
     def test_remigration_idempotente(self):
         self.assertEqual(migrations.migrate(self.db), [])
         count = self.db.query("SELECT count(*)::int AS n FROM schema_migrations")[0]["n"]
-        self.assertEqual(count, 2)
+        self.assertEqual(count, 4)
 
     def test_migration_modifiee_refusee(self):
         connue = migrations.discover()[0].checksum
@@ -70,14 +83,14 @@ class MigrationsTest(PgTestCase):
                 "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %s) AS ok", (schema,)
             )[0]["ok"])
             done = migrations.migrate(db)
-            self.assertEqual([m.version for m in done], [1, 2])
+            self.assertEqual([m.version for m in done], [1, 2, 3, 4])
             tables = db.query(
                 "SELECT count(*)::int AS n FROM information_schema.tables "
                 "WHERE table_schema = %s AND table_name IN ('agent_registry','agent_mailbox',"
-                "'schema_migrations')",
+                "'schema_migrations','mesh_approvals','work_items','work_item_events')",
                 (schema,),
             )[0]["n"]
-            self.assertEqual(tables, 3)
+            self.assertEqual(tables, 6)
         finally:
             db.close()
             self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
