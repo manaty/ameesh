@@ -10,9 +10,8 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
-classifiers = [
-  "License :: OSI Approved :: GNU Affero General Public License v3",
-]
+# Pas de classifier `License ::` : depuis PEP 639, il est incompatible avec
+# l'expression SPDX ci-dessus (setuptools refuse le build — verdict codex3 B1).
 # psycopg est optionnel : sans lui, la couche db utilise le binaire psql.
 dependencies = []
 
