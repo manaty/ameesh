@@ -149,6 +149,16 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   l'attente du groupe à 2 s ; le veilleur lui-même n'a aucune E/S. Le seul fil
   qui peut rester bloqué est l'écrivain de journal, qui ne perd alors que des
   messages.
+  Le veilleur **reste actif pendant un arrêt gracieux** (`stopping`, grâce
+  SIGTERM de 3 s) : il ne s'arrête qu'au relâchement du bail (`release_lease`)
+  ou une fois la perte consommée, sinon un harnais qui ignore SIGTERM
+  survivrait à l'échéance pendant la grâce (sonde codex3 B5a-S). La fin de tour
+  passe par l'arrêt escaladé (SIGTERM puis SIGKILL), plus par un
+  `Popen.terminate()` sec ; et le bail perdu en cours de lecture est un SIGKILL
+  direct. Enfin, **la publication du `Popen` est recontrôlée** : le veilleur
+  peut conclure entre la création du processus et l'affectation de `self.proc`
+  (il voit alors `proc=None`) ; sans ce recontrôle, un harnais sans stdout
+  survivrait au bail jusqu'à la fin du tour (sonde codex3 B5a-P).
 * **Requêtes bornées** — chaque connexion pose un `statement_timeout`
   (`AMEESH_STATEMENT_TIMEOUT_MS`, défaut 30 s) : un renouvellement de bail
   qui pend (verrou, requête lente) est annulé par le serveur ; le pilote `psql`

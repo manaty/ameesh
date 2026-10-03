@@ -325,6 +325,21 @@ class AgentWorker(threading.Thread):
         if self._group_alive(pgid):
             log_async("[%s] groupe toujours vivant après SIGKILL (état noyau ?)" % self.name)
 
+    def kill_if_lease_lost(self) -> bool:
+        """Rattrape une perte de bail survenue pendant la création du harnais.
+
+        Le veilleur peut conclure entre `Popen` et la publication de `self.proc`
+        (il voit alors `proc=None` et ne peut rien tuer) ; sans ce recontrôle,
+        le harnais publié survivrait au bail, sans stdout, jusqu'à la fin du
+        tour (sonde codex3 B5a-P). Renvoie True si le harnais vient d'être
+        arrêté.
+        """
+        if not (self.lease_lost.is_set() or self.deadline_passed()):
+            return False
+        self.lease_lost.set()
+        self.terminate(grace=0, hard=True)
+        return True
+
     def wait_timeout(self, cap: float) -> float:
         """Attente bornée par l'échéance du bail, **sans plancher positif**.
 
@@ -351,16 +366,20 @@ class AgentWorker(threading.Thread):
                          name="%s-watchdog" % self.name).start()
 
     def _deadline_watchdog(self) -> None:
-        """Seul juge de l'échéance (sonde codex3 B5a-N) : **aucune E/S**.
+        """Seul juge de l'échéance (sondes codex3 B5a-N et B5a-S) : **aucune E/S**.
 
         Il ne dépend d'aucun autre fil : même si le battement est bloqué dans un
         journal, une requête ou une écriture de fichier, il arrête le harnais
         dès que l'échéance connue du bail est atteinte. Il ne lit que
         `lease_deadline` et `time.time`, n'attend que sur un Event (borné par
         `WATCHDOG_TICK`), puis pose `lease_lost` et envoie le SIGKILL.
+
+        Il reste actif pendant un arrêt gracieux (`stopping`) : la grâce
+        SIGTERM de 3 s ne doit pas laisser expirer le bail sans arrêt effectif
+        (sonde codex3 B5a-S). Seuls le relâchement du bail (`watchdog_stop`,
+        posé par `release_lease`) ou la perte déjà consommée l'arrêtent.
         """
-        while (not self.watchdog_stop.is_set() and not self.stopping.is_set()
-               and not self.lease_lost.is_set()):
+        while not self.watchdog_stop.is_set() and not self.lease_lost.is_set():
             deadline = self.lease_deadline
             if deadline <= 0:
                 self.watchdog_stop.wait(self.WATCHDOG_TICK)
@@ -371,7 +390,7 @@ class AgentWorker(threading.Thread):
                 # voir une échéance repoussée (renouvellement) ou modifiée.
                 self.watchdog_stop.wait(min(reste, self.WATCHDOG_TICK))
                 continue
-            if self.watchdog_stop.is_set() or self.stopping.is_set():
+            if self.watchdog_stop.is_set():
                 return
             if self.lease_deadline > time.time():
                 continue  # bail renouvelé entre-temps : rien à faire
@@ -503,6 +522,12 @@ class AgentWorker(threading.Thread):
             with self.lock:
                 self.proc = proc
                 self.pgid = proc.pid  # start_new_session : le groupe porte son pid
+            # Course de publication : le veilleur a pu conclure pendant que ce
+            # Popen n'était pas encore publié (proc=None). Sans ce recontrôle,
+            # le harnais survivrait au bail sans produire de stdout (B5a-P).
+            if self.kill_if_lease_lost():
+                log_async("[%s] bail perdu pendant le lancement : arrêt du harnais"
+                          % self.name)
             log("[%s] tour %s : %s" % (self.name, label, " ".join(argv[:6]) + " …"))
             with open(events_path, "a", encoding="utf-8") as events:
                 for line in proc.stdout or ():
@@ -524,17 +549,18 @@ class AgentWorker(threading.Thread):
                         error = str(parsed["error"])
                     if self.lease_lost.is_set():
                         error = "bail perdu en cours de tour"
-                        self.terminate()
+                        self.terminate(grace=0, hard=True)
                         break
             result_code = proc.wait()
         finally:
             heartbeat_done.set()
+            # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
+            # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
+            # du veilleur une fois `self.proc` effacé (sonde codex3 B5a-S).
+            self.terminate()
             with self.lock:
-                running = self.proc
                 self.proc = None
                 self.pgid = None
-            if running is not None and running.poll() is None:
-                running.terminate()
 
         duration = time.time() - started
         lost = self.lease_lost.is_set()
@@ -739,6 +765,10 @@ class Runner:
         deadline = time.monotonic() + 8.0
         for worker in workers:
             worker.join(timeout=max(0.1, deadline - time.monotonic()))
+            # Le tour a pu publier son harnais après le terminate initial
+            # (course de publication) : rien ne doit survivre au relâchement
+            # du bail (sonde codex3 B5a-P).
+            worker.terminate(grace=0, hard=True)
             worker.release_lease()
         log("arrêt : %d bail(aux) rendu(s), %d tour(s)" % (len(workers), self.turns))
 
