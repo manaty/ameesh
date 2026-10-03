@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# agent-mesh-pg — le Postgres local du banc (Docker, postgres:17).
+#
+# Le port n'est publié que sur la boucle locale : la base n'est pas exposée au
+# réseau. Le volume nommé garde les données entre deux démarrages.
+set -euo pipefail
+
+NAME=${AGENT_MESH_PG_NAME:-agent-mesh-pg}
+PORT=${AGENT_MESH_PG_PORT:-55432}
+IMAGE=${AGENT_MESH_PG_IMAGE:-postgres:17}
+USER=${AGENT_MESH_PG_USER:-agent_mesh}
+PASSWORD=${AGENT_MESH_PG_PASSWORD:-agent_mesh}
+DB=${AGENT_MESH_PG_DB:-agent_mesh}
+
+if docker inspect "$NAME" >/dev/null 2>&1; then
+  if [ "$(docker inspect -f '{{.State.Running}}' "$NAME")" != "true" ]; then
+    echo "démarrage du conteneur $NAME"
+    docker start "$NAME" >/dev/null
+  fi
+else
+  echo "création du conteneur $NAME ($IMAGE, 127.0.0.1:$PORT)"
+  docker run -d --name "$NAME" \
+    -e POSTGRES_USER="$USER" -e POSTGRES_PASSWORD="$PASSWORD" -e POSTGRES_DB="$DB" \
+    -p "127.0.0.1:$PORT:5432" \
+    -v agent-mesh-pg-data:/var/lib/postgresql/data \
+    --health-cmd "pg_isready -U $USER -d $DB" \
+    --health-interval 2s --health-timeout 3s --health-retries 30 \
+    "$IMAGE" >/dev/null
+fi
+
+for _ in $(seq 1 60); do
+  status=$(docker inspect -f '{{.State.Health.Status}}' "$NAME" 2>/dev/null || echo unknown)
+  [ "$status" = healthy ] && { echo "$NAME prêt sur 127.0.0.1:$PORT"; exit 0; }
+  sleep 1
+done
+echo "le conteneur $NAME n'est pas devenu sain" >&2
+docker logs --tail 20 "$NAME" >&2 || true
+exit 1

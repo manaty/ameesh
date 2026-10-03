@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Faux harnais "codex" du banc de test — n'appelle jamais Codex CLI."""
+import json
+import os
+import sys
+import time
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    log = os.environ.get("AGENT_MESH_TEST_LOG")
+    if log:
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"harness": "codex", "argv": args}) + "\n")
+    if os.environ.get("AGENT_MESH_TEST_SLEEP"):
+        time.sleep(float(os.environ["AGENT_MESH_TEST_SLEEP"]))
+    thread = "codex-thread-1"
+    if "resume" in args:
+        thread = args[args.index("resume") + 1]
+    print(json.dumps({"type": "thread.started", "thread_id": thread}), flush=True)
+    print(json.dumps({"type": "item.completed", "item": {
+        "type": "agent_message", "text": "bonjour du faux codex (fil %s)" % thread}}), flush=True)
+    print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10,
+                                                          "output_tokens": 5}}), flush=True)
+    return int(os.environ.get("AGENT_MESH_TEST_EXIT", "0"))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

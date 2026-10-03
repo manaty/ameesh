@@ -1,0 +1,259 @@
+"""Exécuteur : tours, reprise de session, baux, expiration, réveil sur NOTIFY."""
+from __future__ import annotations
+
+import os
+import threading
+import time
+import unittest
+
+from agent_mesh import adapters, mail, registry
+
+from .support import PgTestCase
+
+HARNESSES = {
+    "claude": {"session": "claude-sess-1", "reprise": ["--resume", "claude-sess-1"]},
+    "codex": {"session": "codex-thread-1", "reprise": ["resume", "codex-thread-1"]},
+    "deepseek": {"session": "dsh-session-1", "reprise": ["--session-id", "dsh-session-1"]},
+}
+
+
+class RunnerTest(PgTestCase):
+    def _cwd(self, name: str) -> str:
+        path = os.path.join(self.tmp, "work", name)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _messages(self) -> list[str]:
+        return [m["body"] for m in mail.unread(self.db, "orchestrateur")]
+
+    # -- tours et sessions -------------------------------------------------
+    def test_un_tour_par_harnais_puis_reprise_de_session(self):
+        for harness, attendu in HARNESSES.items():
+            with self.subTest(harness=harness):
+                name = "agent-" + harness
+                cwd = self._cwd(name)
+                self.assertEqual(
+                    self.register(name, harness, cwd=cwd, prompt="premier tour").returncode, 0)
+                proc = self.runner("--once", "--agents", name)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+                row = registry.get(self.db, name)
+                self.assertEqual(row["session_id"], attendu["session"])
+                self.assertEqual(int(row["turns"]), 1)
+                self.assertEqual(row["status"], "idle")
+                self.assertIn("consigne", row["status_text"])
+                # l'événement brut du harnais est journalisé sur disque
+                events = os.path.join(self.state, name, "events.jsonl")
+                self.assertTrue(os.path.exists(events))
+                with open(events, encoding="utf-8") as fh:
+                    self.assertIn(attendu["session"], fh.read())
+
+                # deuxième consigne : la session est reprise
+                self.register(name, harness, prompt="deuxième tour")
+                proc = self.runner("--once", "--agents", name)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                appels = [t for t in self.turns() if t["harness"] == harness]
+                self.assertEqual(len(appels), 2, appels)
+                self.assertEqual(appels[1]["argv"][-1], "deuxième tour")
+                for marqueur in attendu["reprise"]:
+                    self.assertIn(marqueur, appels[1]["argv"])
+                self.assertEqual(int(registry.get(self.db, name)["turns"]), 2)
+
+    def test_cout_et_session_enregistres(self):
+        cwd = self._cwd("couteux")
+        self.register("couteux", "claude", cwd=cwd, prompt="tour")
+        self.runner("--once", "--agents", "couteux")
+        row = registry.get(self.db, "couteux")
+        self.assertAlmostEqual(float(row["spent_usd"]), 0.0125, places=4)
+
+    def test_dry_run_n_execute_rien(self):
+        cwd = self._cwd("sec")
+        self.register("sec", "claude", cwd=cwd, prompt="tour")
+        proc = self.runner("--once", "--dry-run", "--agents", "sec")
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("dry-run", proc.stdout)
+        self.assertEqual(self.turns(), [])
+        row = registry.get(self.db, "sec")
+        self.assertEqual(int(row["turns"]), 0)
+
+    def test_harnais_absent_marque_bloque_sans_boucle(self):
+        cwd = self._cwd("sansharnais")
+        self.register("sansharnais", "claude", cwd=cwd, prompt="tour")
+        env = self.env(AGENT_MESH_CLAUDE_BIN=os.path.join(self.tmp, "claude-inexistant"))
+        proc = self.runner("--once", "--agents", "sansharnais", env=env)
+        self.assertEqual(proc.returncode, 0)
+        row = registry.get(self.db, "sansharnais")
+        self.assertEqual(row["status"], "blocked")
+        self.assertIn("introuvable", row["last_error"])
+        self.assertEqual(self.turns(), [])
+        self.assertEqual(proc.stdout.count("introuvable"), 1)
+
+    def test_dossier_absent_marque_bloque(self):
+        self.register("sansdossier", "claude", cwd=os.path.join(self.tmp, "jamais-cree"),
+                      prompt="tour")
+        proc = self.runner("--once", "--agents", "sansdossier")
+        self.assertEqual(proc.returncode, 0)
+        row = registry.get(self.db, "sansdossier")
+        self.assertEqual(row["status"], "blocked")
+        self.assertIn("dossier", row["last_error"])
+
+    # -- baux --------------------------------------------------------------
+    def test_deux_executeurs_se_disputent_un_bail(self):
+        """Deux processus concurrents : un seul tour, un 0 et un 3."""
+        cwd = self._cwd("coureur")
+        self.register("coureur", "claude", cwd=cwd, prompt="course")
+        env = self.env(AGENT_MESH_TEST_SLEEP="4")
+        premier = self.runner_popen("--once", "--agents", "coureur", env=env)
+        second = self.runner_popen("--once", "--agents", "coureur", env=env)
+        sortie1, _ = premier.communicate(timeout=60)
+        sortie2, _ = second.communicate(timeout=60)
+        codes = sorted([premier.returncode, second.returncode])
+        self.assertEqual(codes, [0, 3], "codes %r\n%s\n%s" % (codes, sortie1, sortie2))
+        self.assertEqual(len(self.turns()), 1, "un seul tour doit avoir lieu")
+        gagnant = [s for s in (sortie1, sortie2) if "bail acquis" in s]
+        perdant = [s for s in (sortie1, sortie2) if "bail acquis" not in s]
+        self.assertEqual(len(gagnant), 1)
+        self.assertIn("aucun travail disponible", perdant[0])
+        self.assertEqual(int(registry.get(self.db, "coureur")["turns"]), 1)
+        # le gagnant a rendu le bail en sortant
+        self.assertIsNone(registry.get(self.db, "coureur")["lease_owner"])
+
+    def test_bail_expire_repris_par_un_autre_executeur(self):
+        cwd = self._cwd("tombe")
+        self.register("tombe", "claude", cwd=cwd, prompt="après expiration")
+        registry.upsert(self.db, "tombe", harness="claude", host=self.cfg.host, cwd=cwd)
+        registry.claim(self.db, "tombe", "runner-mort", 1.0)
+        time.sleep(1.3)  # l'exécuteur est mort, son bail a expiré
+        proc = self.runner("--once", "--agents", "tombe")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        row = registry.get(self.db, "tombe")
+        self.assertGreaterEqual(int(row["lease_epoch"]), 2)
+        self.assertEqual(int(row["turns"]), 1)
+        self.assertEqual(len(self.turns()), 1)
+
+    def test_bail_vivant_n_est_pas_vole(self):
+        cwd = self._cwd("vivant")
+        self.register("vivant", "claude", cwd=cwd, prompt="pas touche")
+        registry.upsert(self.db, "vivant", harness="claude", host=self.cfg.host, cwd=cwd)
+        registry.claim(self.db, "vivant", "runner-actif", 300)
+        proc = self.runner("--once", "--agents", "vivant")
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertEqual(self.turns(), [])
+        self.assertEqual(registry.get(self.db, "vivant")["lease_owner"], "runner-actif")
+
+    def test_bail_perdu_interrompt_le_tour(self):
+        """Si le bail est volé, le harnais est terminé et le tour n'est pas compté."""
+        cwd = self._cwd("vole")
+        self.register("vole", "claude", cwd=cwd, prompt="long tour")
+        env = self.env(AGENT_MESH_TEST_SLEEP="12", AGENT_MESH_LEASE_TTL="3")
+        proc = self.runner_popen("--agents", "vole", "--lease-ttl", "3", "--poll", "2", env=env)
+        lignes: list[str] = []
+        threading.Thread(
+            target=lambda: [lignes.append(line) for line in proc.stdout], daemon=True
+        ).start()
+        try:
+            self.wait_for(lambda: len(self.turns()) == 1, timeout=20)  # le tour a démarré
+            debut = time.monotonic()
+            self.db.execute(
+                "UPDATE agent_registry SET lease_owner = 'voleur', "
+                "lease_epoch = lease_epoch + 1, lease_expires_at = now() + interval '60 seconds', "
+                "status = 'running' WHERE name = 'vole'"
+            )
+            self.wait_for(lambda: any("bail perdu" in l for l in lignes), timeout=10)
+            self.assertLess(
+                time.monotonic() - debut, 7.0,
+                "le harnais aurait dû être terminé par le battement de bail (12 s de sommeil)",
+            )
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+        # end_turn est fencé : le tour volé n'est pas compté
+        self.assertEqual(int(registry.get(self.db, "vole")["turns"]), 0)
+
+    # -- NOTIFY ------------------------------------------------------------
+    def test_notify_reveille_un_executeur_en_service(self):
+        cwd = self._cwd("dort")
+        self.register("dort", "claude", cwd=cwd)
+        proc = self.runner_popen("--max-turns", "1", "--poll", "60")
+        try:
+            time.sleep(2.0)  # LISTEN établi (pilote psql : ~0,5 s), aucun tour à faire
+            self.assertEqual(self.turns(), [])
+            debut = time.monotonic()
+            envoi = self.cli("send", "dort", "réveille-toi",
+                             env=self.env(AGENT_MAIL_NAME="orchestrateur"))
+            self.assertEqual(envoi.returncode, 0)
+            sortie, _ = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=10)
+        self.assertLess(time.monotonic() - debut, 25.0)
+        self.assertEqual(proc.returncode, 0, sortie)
+        self.assertIn("message pour dort : réveil du tour", sortie)
+        tours = self.turns()
+        self.assertEqual(len(tours), 1, sortie)
+        self.assertEqual(tours[0]["argv"][-1], adapters.MAIL_PROMPT)
+        # le message a été remis, le tour a été compté
+        self.assertEqual(mail.unread(self.db, "dort"), [])
+        self.assertEqual(int(registry.get(self.db, "dort")["turns"]), 1)
+
+    def test_notify_lease_reveille_apres_liberation(self):
+        """Un bail qui se libère réveille les autres exécuteurs de l'hôte.
+
+        Le sondage est à 60 s : sans NOTIFY, le test ne passerait pas.
+        """
+        cwd = self._cwd("libre")
+        self.register("libre", "claude", cwd=cwd, prompt="reprends")
+        registry.upsert(self.db, "libre", harness="claude", host=self.cfg.host, cwd=cwd)
+        registry.claim(self.db, "libre", "runner-parti", 300)
+
+        proc = self.runner_popen("--max-turns", "1", "--poll", "60")
+        try:
+            time.sleep(2.0)  # LISTEN établi
+            self.assertEqual(self.turns(), [], "rien ne doit tourner sous bail")
+            debut = time.monotonic()
+            registry.release(self.db, "libre", "runner-parti", 1)
+            sortie, _ = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=10)
+        self.assertLess(time.monotonic() - debut, 25.0)
+        self.assertEqual(proc.returncode, 0, sortie)
+        self.assertEqual(len(self.turns()), 1, sortie)
+
+    # -- cycle de vie ------------------------------------------------------
+    def test_agent_arrete_n_est_plus_reclame(self):
+        self.register("fini", "claude", cwd=self._cwd("fini"), prompt="non")
+        stop = self.runner("stop", "fini")
+        self.assertEqual(stop.returncode, 0)
+        self.assertEqual(registry.get(self.db, "fini")["status"], "stopped")
+        proc = self.runner("--once")
+        self.assertEqual(proc.returncode, 3)
+        self.assertEqual(self.turns(), [])
+
+    def test_register_ecrit_modele_budget_et_consigne(self):
+        self.register("riche", "codex", cwd=self._cwd("riche"), prompt="tour",
+                      model="gpt-5", budget="3.5", chantier="nexlink")
+        row = registry.get(self.db, "riche")
+        self.assertEqual(row["harness"], "codex")
+        self.assertEqual(row["model"], "gpt-5")
+        self.assertEqual(float(row["budget_usd"]), 3.5)
+        self.assertEqual(row["chantier"], "nexlink")
+        self.assertEqual(row["pending_prompt"], "tour")
+        self.assertEqual(row["status"], "queued")
+
+    def test_anomalie_du_harnais_marque_bloque(self):
+        cwd = self._cwd("plante")
+        self.register("plante", "codex", cwd=cwd, prompt="tour")
+        env = self.env(AGENT_MESH_TEST_EXIT="2")
+        proc = self.runner("--once", "--agents", "plante", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        row = registry.get(self.db, "plante")
+        self.assertEqual(row["status"], "blocked")
+        self.assertIn("code 2", row["last_error"])
+        self.assertEqual(int(row["turns"]), 1)  # le tour a eu lieu, il a échoué
+
+
+if __name__ == "__main__":
+    unittest.main()
