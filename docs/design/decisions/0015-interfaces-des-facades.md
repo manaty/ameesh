@@ -21,6 +21,8 @@ cette organisation.
 - **Le projet ameesh ne mentionne aucun client** : ni nom, ni système interne,
   ni dépôt d'une organisation cliente, dans le code, la documentation ou les
   exemples.
+- **Nexlink**, produit de Manaty, n'est pas un client : ameesh le nomme et
+  l'intègre nativement ([0003](0003-ameesh-et-nexlink.md)).
 - ameesh **ne développe pas d'application pour un client** : il **prévoit les
   interfaces** qui permettront à une organisation de développer la sienne
   (notamment une application mobile native), **pour ne pas avoir à imposer
