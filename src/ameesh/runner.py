@@ -107,7 +107,9 @@ class AgentWorker(threading.Thread):
         """
         if self.lease_deadline <= 0:
             return max(3.0, self.runner.lease_ttl / 3.0)
-        return max(0.05, self.lease_deadline - time.time())
+        # Temps restant exact, sans plancher : un appel entamé 20 ms avant
+        # l'échéance ne doit pas survivre 50 ms de plus (verdict codex3 B5a).
+        return max(0.0, self.lease_deadline - time.time())
 
     def _renew_call(self) -> tuple[bool, float | None, Exception | None]:
         """`registry.renew` avec une borne dure, même si l'appel se bloque."""
@@ -138,14 +140,14 @@ class AgentWorker(threading.Thread):
             # on ne tente même pas le renouvellement, on arrête tout de suite.
             log("[%s] échéance du bail atteinte : arrêt du harnais" % self.name)
             self.lease_lost.set()
-            self.terminate(grace=0)
+            self.terminate(grace=0, hard=True)
             return False
         answered, expires, error = self._renew_call()
         if not answered:
             log("[%s] renouvellement sans réponse au-delà du bail : arrêt du harnais"
                 % self.name)
             self.lease_lost.set()
-            self.terminate(grace=0)
+            self.terminate(grace=0, hard=True)
             return False
         if error is not None:
             self.renew_failures += 1
@@ -154,13 +156,13 @@ class AgentWorker(threading.Thread):
             if self.renew_failures >= self.MAX_RENEW_FAILURES or time.time() >= self.lease_deadline:
                 log("[%s] bail considéré perdu (base injoignable) : arrêt du harnais" % self.name)
                 self.lease_lost.set()
-                self.terminate(grace=0)
+                self.terminate(grace=0, hard=True)
                 return False
             return True  # on laisse une chance au prochain battement
         if expires is None:
             log("[%s] bail perdu (epoch %d) : arrêt du tour" % (self.name, self.epoch))
             self.lease_lost.set()
-            self.terminate(grace=0)  # pas de grâce : le remplaçant peut déjà tourner
+            self.terminate(grace=0, hard=True)  # SIGKILL direct : plus de chevauchement
             return False
         self.renew_failures = 0
         self.lease_deadline = float(expires)
@@ -212,11 +214,13 @@ class AgentWorker(threading.Thread):
         except PermissionError:
             return True
 
-    def terminate(self, grace: float | None = None) -> None:
-        """Arrête le harnais et tout son groupe : SIGTERM, puis SIGKILL.
+    def terminate(self, grace: float | None = None, hard: bool = False) -> None:
+        """Arrête le harnais et tout son groupe.
 
-        `grace=0` (perte du bail) tue tout de suite : pendant une grâce, le
-        remplaçant peut réclamer l'agent alors que l'ancien enfant vit encore.
+        Par défaut : SIGTERM, 3 secondes de grâce, puis SIGKILL. `hard=True`
+        (perte du bail) envoie SIGKILL **directement** : le remplaçant peut
+        réclamer l'agent à l'échéance, chaque milliseconde de plus est un
+        chevauchement (verdict codex3 B5a).
 
         L'escalade ne dépend pas de la survie du **parent** : un harnais peut
         mourir sur SIGTERM en laissant un descendant qui l'ignore, et le groupe
@@ -229,7 +233,7 @@ class AgentWorker(threading.Thread):
             return
         pgid = self._group(proc)
         vivant = proc.poll() is None
-        if vivant:
+        if vivant and not hard:
             self._signal_group(pgid, proc, signal.SIGTERM)
             deadline = time.monotonic() + max(0.0, self.TERMINATE_GRACE if grace is None else grace)
             while time.monotonic() < deadline and proc.poll() is None:

@@ -393,7 +393,35 @@ class RunnerTest(PgTestCase):
             {"lease_epoch": 1, "lease_expires_ts": time.time() - 5},
         )
         self.assertTrue(expire.deadline_passed())
-        self.assertLessEqual(expire.call_budget(), 0.06)
+        self.assertEqual(expire.call_budget(), 0.0)  # aucun plancher au-delà
+
+        # entré juste avant l'échéance : le budget vaut le temps restant exact
+        juste = AgentWorker(
+            runner,
+            {"name": "lima", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.02},
+        )
+        self.assertLessEqual(juste.call_budget(), 0.03)
+
+    def test_appel_entame_juste_avant_l_echeance_ne_survit_pas(self):
+        """Verdict codex3 B5a : entré 20 ms avant l'échéance, l'appel est coupé."""
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "mike", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.05},
+        )
+
+        def bloque(*_args, **_kwargs):
+            time.sleep(5)
+            return time.time() + 300
+
+        debut = time.monotonic()
+        with mock.patch.object(registry, "renew", side_effect=bloque):
+            self.assertFalse(worker.renew())
+        ecoule = time.monotonic() - debut
+        self.assertTrue(worker.lease_lost.is_set())
+        self.assertLess(ecoule, 0.4, "l'appel ne doit pas survivre à l'échéance")
 
     def test_battement_se_reveille_a_l_echeance_du_bail(self):
         """B5a : with a long interval, the heartbeat still wakes at the deadline."""

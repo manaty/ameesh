@@ -41,6 +41,22 @@ class RenameTest(PgTestCase):
         self.assertTrue(config_mod.DEFAULT_CONFIG.endswith("ameesh/config.json"))
         self.assertTrue(config_mod.LEGACY_CONFIG.endswith("agent-mesh/config.json"))
 
+    def test_state_dir_du_fichier_de_config_est_respecte(self):
+        """Revue codex3 : le calcul du state_dir ne doit pas écraser le JSON."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as dossier:
+            cfg_path = os.path.join(dossier, "config.json")
+            custom = os.path.join(dossier, "custom-state")
+            with open(cfg_path, "w", encoding="utf-8") as fh:
+                json.dump({"state_dir": custom}, fh)
+            cfg = config_mod.load(env={"AMEESH_CONFIG": cfg_path})
+            self.assertEqual(cfg.state_dir, os.path.abspath(custom))
+
+            # la variable d'environnement reste prioritaire sur le fichier
+            env_state = os.path.join(dossier, "env-state")
+            cfg2 = config_mod.load(env={"AMEESH_CONFIG": cfg_path, "AMEESH_STATE": env_state})
+            self.assertEqual(cfg2.state_dir, os.path.abspath(env_state))
+
     def test_identite_lit_les_deux_noms(self):
         cfg = config_mod.load(env={})
         with mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": "alpha"}, clear=False):

@@ -106,9 +106,14 @@ def load(env: dict | None = None) -> Config:
         return default
 
     # AMEESH_* est le nom courant ; AGENT_MESH_* reste accepté (alias).
+    # Priorité : variable d'environnement > fichier de config > défaut, avec le
+    # repli sur l'ancien dossier (agent-mesh) seulement si rien n'est configuré
+    # (revue codex3 : un state_dir du JSON ne doit pas être écrasé).
     state_brut = pick("AMEESH_STATE", "AGENT_MESH_STATE", default=None)
     if state_brut:
         state_dir = _expand(state_brut)
+    elif cfg.state_dir != _expand(DEFAULT_STATE):
+        state_dir = _expand(cfg.state_dir)  # fixé par le fichier de config
     else:
         neuf, ancien = _expand(DEFAULT_STATE), _expand(LEGACY_STATE)
         state_dir = ancien if (os.path.isdir(ancien) and not os.path.isdir(neuf)) else neuf

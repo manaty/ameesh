@@ -113,8 +113,10 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
 * **Renouvellement borné par l'échéance, pas par un délai fixe** — si
   l'échéance est déjà atteinte au réveil, le harnais est arrêté **sans même
   appeler la base** ; sinon l'appel `renew` tourne dans un fil et est abandonné
-  au plus tard à `lease_deadline` (budget = temps restant, sans marge ni
-  plancher) :
+  au plus tard à `lease_deadline` (budget = temps restant exact, **aucun
+  plancher** : entré 20 ms avant l'échéance, l'appel ne dispose que de 20 ms).
+  À la perte du bail, le groupe reçoit SIGKILL **directement** (pas de SIGTERM
+  préalable) :
   même si la base ne répond plus du tout (réponse retenue par un proxy, par
   exemple), le battement conclut à la perte du bail et arrête le harnais à
   l'heure où un remplaçant peut réclamer l'agent. Le `statement_timeout` reste

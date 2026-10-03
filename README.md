@@ -113,7 +113,7 @@ scripts/test.sh                      # starts the container, runs the suite twic
 scripts/test.sh tests.test_runner    # one module
 ```
 
-156 tests against the local container, run twice (`psql`, then `psycopg` with
+158 tests against the local container, run twice (`psql`, then `psycopg` with
 `cryptography`): migrations and immutability, mailbox and LISTEN/NOTIFY round
 trips, lease races on 2 and 4 concurrent connections, **two runner processes
 competing for the same lease**, lease expiry takeover, fencing of a stale
