@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-04 (Q4)
+* **Décision** : [licence AGPL-3.0-only avec accord de contribution](decisions/0013-licence-agpl.md) ; Q4 close.
+
 ## 2026-10-04 (Q3)
 * **Décision** : [abandon de la cérémonie Ed25519, autorité par ameesh-approve](decisions/0012-autorite-par-ameesh-approve.md) ; Q3 close, Q6 ouverte (application native TPK).
 

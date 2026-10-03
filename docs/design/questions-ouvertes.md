@@ -13,10 +13,13 @@ generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:30:00+02:00" 
 |---|---|---|
 | Q1 (ex-M3) | Quelle base pour l'état d'exécution ? Elle suit désormais le profil d'hébergement ([0011](decisions/0011-hebergement-configurable.md)) ; reste à savoir si le profil local peut se contenter de SQLite (pas de LISTEN/NOTIFY). | Postgres partout pour la v1 ; SQLite à étudier pour le profil local. |
 | Q6 | Application mobile native pour TPK : application ameesh générique (open source, éventuellement aux couleurs de TPK) ou intégrée aux applications mobiles existantes de TPK ? Pour les approbations seulement, ou aussi pour le travail quotidien (fils, notifications) ? | À instruire avec le propriétaire et TPK. |
-| Q4 | Licence d'ameesh avant le passage public. | À instruire (compatibilité avec les dépendances AGPL éventuelles côté connecteurs). |
 | Q5 | L'orchestrateur Nexlink devient-il un agent à tours (réveillé par sa surveillance) pour pouvoir quitter le PC ? | Oui à terme ; c'est ce qui rend utile une deuxième machine. |
 
 # Attend une étude ou un prototype
+
+- Licences : rédaction du CLA et titularité des contributions produites par
+  des agents ; compatibilité, version par version, des dépendances distribuées
+  et des intégrations avec l'AGPL-3.0-only ([0013](decisions/0013-licence-agpl.md)).
 
 - Profil ameesh d'OKF Federation : types `Agent`, `Team`, `WorkPackage`,
   `Pipeline` ; liaison `human:<id>` → passkey / clé d'appareil ; `agent:<id>` → compte.

@@ -12,3 +12,4 @@
 * [Responsabilité humaine, projets vivants, orchestrateurs multiples](0010-responsabilite-et-orchestrateurs.md) - Tout agent a un humain responsable ; un projet peut se scinder ; un humain peut avoir plusieurs orchestrateurs et un projet plusieurs humains. mesh-design devient l'orchestrateur d'ameesh.
 * [L'hébergement est une configuration, préparée par le harnais de l'utilisateur](0011-hebergement-configurable.md) - Local, page Nexlink ou VPS provisionné ; installation conduite par le harnais que l'utilisateur a déjà.
 * [Abandon de la cérémonie Ed25519 ; autorité par ameesh-approve](0012-autorite-par-ameesh-approve.md) - Passkey, application Nexlink ou application native ; un seul format de reçu.
+* [Licence d'ameesh : AGPL-3.0-only, avec accord de contribution](0013-licence-agpl.md) - Termes figés à la v3 ; CLA pour les contributions externes.
