@@ -37,6 +37,10 @@ REQUIRE_DB = os.environ.get(
 def child_env(**extra: str) -> dict:
     """Environnement d'un sous-processus de test (CLI ou exécuteur)."""
     env = dict(os.environ)
+    # Les fils vont sous l'état du test (AMEESH_STATE/fils), jamais dans un
+    # dossier réel hérité de l'environnement du développeur.
+    for name in ("AMEESH_THREADS", "AMEESH_PROJECT", "AMEESH_HUMANS"):
+        env.pop(name, None)
     env["AMEESH_DSN"] = TEST_DSN
     env["PYTHONPATH"] = SRC + os.pathsep + env.get("PYTHONPATH", "")
     env["AMEESH_BIN_DIR"] = FAKEBIN
@@ -93,7 +97,7 @@ class PgTestCase(unittest.TestCase):
         """Chaque test part d'une base et d'un disque propres."""
         self.db.execute(
             "TRUNCATE agent_registry, agent_mailbox, mesh_approvals, "
-            "work_items, work_item_events RESTART IDENTITY CASCADE")
+            "work_items, work_item_events, thread_index RESTART IDENTITY CASCADE")
         shutil.rmtree(self.tmp, ignore_errors=True)
         os.makedirs(self.tmp, exist_ok=True)
         for path in (self.state, self.v0state, self.conf):

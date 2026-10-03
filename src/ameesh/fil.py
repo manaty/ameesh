@@ -1,0 +1,702 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Fil lisible (spec §6, C5, R12) : chaque message passé par ameesh, en clair.
+
+La boîte Postgres (`agent_mailbox`) n'est que la file de distribution (hooks,
+réveil des exécuteurs) ; le **fil** est la référence lisible et auditable par
+les humains, y compris pour les échanges d'agent à agent (décision 0006).
+
+* `ThreadRef` = (projet, lot) ; sans lot, c'est le fil du projet.
+* `Entry` = auteur (`human:`/`agent:`), horodatage, destinataire, texte en
+  langage naturel (autosuffisant) et métadonnées structurées **en plus**.
+* `Transport` : `post(thread, entry) -> id externe`, `read(thread, since)`.
+  Transport v1 : `file`, un fichier Markdown par fil sous `AMEESH_THREADS`
+  (défaut `<état>/fils/<projet>/<lot ou _projet>.md`), en ajout seulement,
+  une entrée complète écrite d'un bloc sous verrou `flock`.
+
+Une écriture de fil qui échoue ne fait JAMAIS perdre le message : `record()`
+ne lève pas, il le dit sur stderr, et le message reste dans la boîte.
+
+Format d'une entrée :
+
+    ### 2026-10-04T10:15:30+02:00 — agent:alpha → agent:beta
+
+    Le texte du message, tel quel (les lignes qui ressembleraient à un
+    en-tête d'entrée sont échappées par une barre oblique inverse).
+
+    <!-- ameesh {"ids": [12], "host": "laptop"} -->
+
+  ameesh fil list                               les fils connus (index + disque)
+  ameesh fil show <projet> [<lot>] [--last N]   lire un fil
+  ameesh fil tail <projet> [<lot>] [--last N]   suivre un fil (Ctrl-C pour sortir)
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import re
+import sys
+import time
+import unicodedata
+from dataclasses import dataclass, field
+from typing import Iterable, Iterator, Protocol, Sequence
+
+from .config import Config
+
+DEFAULT_PROJECT = "default"
+#: nom de fichier du fil d'un projet (un lot assaini ne commence jamais par `_`)
+PROJECT_THREAD = "_projet"
+#: au-delà, un bloc sans espace en alphabet base64/hex est une donnée encodée
+MAX_BLOB = 200
+SEGMENT_MAX = 64
+
+_HEADING_RE = re.compile(r"^### (\S+) — (.+?) → (.*)$")
+_META_RE = re.compile(r"^<!-- ameesh (\{.*\}) -->$")
+_ESCAPED_RE = re.compile(r"^\\+(###|<!-- ameesh)")
+_TO_ESCAPE_RE = re.compile(r"^\\*(###|<!-- ameesh)")
+_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_BLOB_RE = re.compile(r"[A-Za-z0-9+/=_-]{%d,}" % (MAX_BLOB + 1))
+_ALLOW_HINT = "(--allow-structured est réservé aux tests et aux outils)"
+
+
+class UnreadableBody(ValueError):
+    """Corps de message refusé : il n'est pas du texte lisible par un humain."""
+
+
+class ThreadError(RuntimeError):
+    """Fil inaccessible (emplacement hors de la racine, identifiant étranger…)."""
+
+
+# --------------------------------------------------------------------------
+# modèle
+# --------------------------------------------------------------------------
+
+def safe_segment(name) -> str:
+    """Nom de projet ou de lot utilisable comme segment de chemin.
+
+    Translittère les accents, remplace tout le reste par `-`, retire points,
+    tirets et soulignés de bord : jamais de `/`, de `..`, de fichier caché ni
+    de nom qui commence par `_` (réservé au fil du projet).
+    """
+    if name is None:
+        return ""
+    text = unicodedata.normalize("NFKD", str(name))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = _UNSAFE_RE.sub("-", text).strip("._-")
+    return text[:SEGMENT_MAX].strip("._-")
+
+
+@dataclass(frozen=True)
+class ThreadRef:
+    """Un fil : celui d'un lot, ou celui du projet (`lot` absent)."""
+
+    project: str
+    lot: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "project", safe_segment(self.project) or DEFAULT_PROJECT)
+        lot = safe_segment(self.lot) if self.lot not in (None, "") else ""
+        object.__setattr__(self, "lot", lot or None)
+
+    @property
+    def stem(self) -> str:
+        return self.lot or PROJECT_THREAD
+
+    @property
+    def key(self) -> str:
+        return "%s/%s" % (self.project, self.stem)
+
+    def describe(self) -> str:
+        return ("%s / lot %s" % (self.project, self.lot)) if self.lot \
+            else "%s (fil du projet)" % self.project
+
+
+@dataclass
+class Entry:
+    """Une entrée de fil : un message lisible, et ses métadonnées en plus."""
+
+    author: str                     # human:<id> | agent:<id>
+    recipient: str                  # agent:<id>[, agent:<id>…] | tous
+    text: str
+    ts: float = field(default_factory=time.time)
+    meta: dict = field(default_factory=dict)
+    id: str | None = None           # id externe (renseigné par post/read)
+
+    @property
+    def when(self) -> str:
+        return iso_local(self.ts)
+
+
+class Transport(Protocol):
+    name: str
+
+    def post(self, thread: ThreadRef, entry: Entry) -> str: ...
+
+    def read(self, thread: ThreadRef, since: str | None = None) -> list[Entry]: ...
+
+
+# --------------------------------------------------------------------------
+# texte : lisibilité, nettoyage, échappement
+# --------------------------------------------------------------------------
+
+def unreadable_reason(body) -> str | None:
+    """Pourquoi ce corps n'est pas du texte lisible (None s'il l'est)."""
+    if body is None or not str(body).strip():
+        return "corps vide : un message doit contenir du texte lisible"
+    body = str(body)
+    for ch in body:
+        if ch in "\n\t\r":
+            continue
+        if unicodedata.category(ch) in ("Cc", "Cs"):
+            return ("caractère de contrôle ou binaire U+%04X : le fil n'accepte que du "
+                    "texte (retirez les couleurs de terminal et les données binaires)"
+                    % ord(ch))
+    stripped = body.strip()
+    if stripped[0] in "{[":
+        try:
+            value = json.loads(stripped)
+        except ValueError:
+            value = None
+        if isinstance(value, (dict, list)):
+            return ("le corps n'est que du JSON : écrivez en phrases ce que le destinataire "
+                    "doit savoir ; les données structurées accompagnent le texte, elles ne "
+                    "le remplacent pas")
+    for match in _BLOB_RE.finditer(body):
+        blob = match.group(0)
+        if re.search(r"[A-Za-z0-9]", blob) and not _path_like(blob):
+            return ("bloc encodé de %d caractères sans espace (base64 ou hexadécimal) : "
+                    "décrivez-le en clair et transmettez la donnée par un autre moyen"
+                    % len(blob))
+    return None
+
+
+def _path_like(run: str) -> bool:
+    """Un long chemin (ou chemin d'URL) n'est pas un bloc encodé.
+
+    Un chemin a des segments courts séparés par `/` ; un base64 n'a un `/` que
+    tous les 64 caractères en moyenne, un hexadécimal jamais. Seuils mesurés :
+    moins de 0,1 % des base64 aléatoires de plus de 200 caractères passent.
+    """
+    if "/" not in run:
+        return False
+    longueurs = [len(s) for s in run.split("/")]
+    return max(longueurs) <= 48 and sum(longueurs) / len(longueurs) <= 40
+
+
+def ensure_readable(body, allow_structured: bool = False) -> None:
+    """Lève `UnreadableBody` si le corps n'est pas lisible (sauf outils et tests)."""
+    if allow_structured:
+        return
+    reason = unreadable_reason(body)
+    if reason:
+        raise UnreadableBody("message refusé — %s %s" % (reason, _ALLOW_HINT))
+
+
+def clean_text(text) -> str:
+    """Texte prêt pour le fil : fins de ligne normalisées, contrôles neutralisés."""
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    out = []
+    for ch in text:
+        if ch not in "\n\t" and unicodedata.category(ch) in ("Cc", "Cs"):
+            out.append("�")
+        else:
+            out.append(ch)
+    return "".join(out).strip()
+
+
+def _one_line(text) -> str:
+    return " ".join(clean_text(text).split())
+
+
+def excerpt(text, limit: int = 120) -> str:
+    line = _one_line(text)
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+def iso_local(ts: float) -> str:
+    """Date ISO 8601 locale, à la seconde, avec le décalage (2026-10-04T10:15:30+02:00)."""
+    return datetime.datetime.fromtimestamp(float(ts)).astimezone().isoformat(timespec="seconds")
+
+
+def _parse_iso(text: str) -> float:
+    try:
+        return datetime.datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _meta_line(meta: dict) -> str:
+    # `>` et `<` n'apparaissent que dans des chaînes JSON : leur forme \u…
+    # garde le commentaire HTML fermé au bon endroit.
+    data = json.dumps(meta, ensure_ascii=False, sort_keys=True, default=str)
+    return "<!-- ameesh %s -->" % data.replace("<", "\\u003c").replace(">", "\\u003e")
+
+
+def format_entry(entry: Entry, *, meta: bool = True) -> str:
+    """Le Markdown d'une entrée, terminé par une ligne vide."""
+    lines = ["### %s — %s → %s" % (iso_local(entry.ts), _one_line(entry.author) or "?",
+                                   _one_line(entry.recipient) or "?"), ""]
+    body = clean_text(entry.text)
+    if body:
+        lines += [("\\" + line) if _TO_ESCAPE_RE.match(line) else line
+                  for line in body.split("\n")]
+    else:
+        lines.append("_(corps vide)_")
+    lines.append("")
+    if meta and entry.meta:
+        lines += [_meta_line(entry.meta), ""]
+    return "\n".join(lines) + "\n"
+
+
+def header(thread: ThreadRef) -> str:
+    return (
+        "# Fil — %s\n\n"
+        "Fil lisible tenu par ameesh : une entrée par message, en ajout seulement.\n"
+        "Les métadonnées de chaque entrée sont dans un commentaire `ameesh` discret.\n\n"
+        % thread.describe()
+    )
+
+
+def parse(data: bytes, *, base: int = 0, key: str = "") -> list[Entry]:
+    """Les entrées d'un fil (ou d'un morceau de fil commençant à l'octet `base`)."""
+    entries: list[Entry] = []
+    current: tuple[int, re.Match, list[str]] | None = None
+
+    def close() -> None:
+        if current is None:
+            return
+        offset, match, lines = current
+        while lines and not lines[-1].strip():
+            lines.pop()
+        meta: dict = {}
+        if lines:
+            found = _META_RE.match(lines[-1])
+            if found:
+                try:
+                    meta = json.loads(found.group(1))
+                except ValueError:
+                    meta = {}
+                if isinstance(meta, dict):
+                    lines.pop()
+                else:
+                    meta = {}
+        while lines and not lines[-1].strip():
+            lines.pop()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        text = "\n".join(line[1:] if _ESCAPED_RE.match(line) else line for line in lines)
+        entries.append(Entry(
+            author=match.group(2), recipient=match.group(3), text=text,
+            ts=_parse_iso(match.group(1)), meta=meta,
+            id="%s#%d" % (key, offset) if key else str(offset)))
+
+    position = base
+    for raw in data.split(b"\n"):
+        line = raw.decode("utf-8", "replace")
+        match = _HEADING_RE.match(line)
+        if match:
+            close()
+            current = (position, match, [])
+        elif current is not None:
+            current[2].append(line)
+        position += len(raw) + 1
+    close()
+    return entries
+
+
+# --------------------------------------------------------------------------
+# transport v1 : fichiers Markdown
+# --------------------------------------------------------------------------
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+class FileTransport:
+    """Un fichier Markdown par fil, ajout seulement, verrou `flock` par fichier."""
+
+    name = "file"
+
+    def __init__(self, root: str):
+        self.root = os.path.abspath(os.path.expanduser(root))
+
+    def location(self, thread: ThreadRef) -> str:
+        """Chemin du fil ; refuse tout ce qui sortirait de la racine."""
+        path = os.path.join(self.root, thread.project, thread.stem + ".md")
+        root_real = os.path.realpath(self.root)
+        real = os.path.realpath(path)
+        if os.path.commonpath([root_real, real]) != root_real or real == root_real:
+            raise ThreadError("emplacement de fil hors de %s : %s" % (self.root, real))
+        return path
+
+    def post(self, thread: ThreadRef, entry: Entry) -> str:
+        path = self.location(thread)
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        data = format_entry(entry).encode("utf-8")
+        flags = (os.O_RDWR | os.O_APPEND | os.O_CREAT
+                 | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, flags, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            size = os.fstat(fd).st_size
+            if size == 0:
+                prefix = header(thread).encode("utf-8")
+            elif os.pread(fd, 1, size - 1) != b"\n":
+                # une écriture précédente interrompue : repartir sur une ligne neuve
+                prefix = b"\n"
+            else:
+                prefix = b""
+            try:
+                _write_all(fd, prefix + data)
+                os.fsync(fd)
+            except BaseException:
+                # tout ou rien : on ne laisse pas une entrée à moitié écrite
+                try:
+                    os.ftruncate(fd, size)
+                except OSError:
+                    pass
+                raise
+        finally:
+            os.close(fd)  # libère le verrou
+        entry.id = "%s#%d" % (thread.key, size + len(prefix))
+        return entry.id
+
+    def _offset(self, thread: ThreadRef, since: str) -> int:
+        key, sep, offset = str(since).rpartition("#")
+        if not sep or key != thread.key or not offset.isdigit():
+            raise ThreadError("id d'entrée %r étranger au fil %s" % (since, thread.key))
+        return int(offset)
+
+    def read(self, thread: ThreadRef, since: str | None = None) -> list[Entry]:
+        """Les entrées du fil, ou celles postérieures à l'id `since`."""
+        start = self._offset(thread, since) if since else 0
+        try:
+            fd = os.open(self.location(thread), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        except FileNotFoundError:
+            return []
+        with open(fd, "rb") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_SH)  # jamais une entrée en cours d'écriture
+            fh.seek(start)
+            data = fh.read()
+        entries = parse(data, base=start, key=thread.key)
+        if since:
+            entries = [e for e in entries if int(e.id.rpartition("#")[2]) > start]
+        return entries
+
+    def threads(self) -> Iterator[ThreadRef]:
+        """Les fils présents sur disque."""
+        try:
+            projects = sorted(os.listdir(self.root))
+        except OSError:
+            return
+        for project in projects:
+            directory = os.path.join(self.root, project)
+            if not os.path.isdir(directory) or safe_segment(project) != project:
+                continue
+            for filename in sorted(os.listdir(directory)):
+                if not filename.endswith(".md"):
+                    continue
+                stem = filename[:-3]
+                thread = ThreadRef(project, None if stem == PROJECT_THREAD else stem)
+                if thread.stem == stem:
+                    yield thread
+
+
+def transport_for(cfg: Config) -> FileTransport:
+    """Le transport des fils (v1 : `file` seulement)."""
+    return FileTransport(cfg.threads_root)
+
+
+# --------------------------------------------------------------------------
+# écriture d'un message dans son fil (appelée par mail.send et les backends)
+# --------------------------------------------------------------------------
+
+def member(cfg: Config, name: str) -> str:
+    """`human:<nom>` pour un humain déclaré (AMEESH_HUMANS), `agent:<nom>` sinon."""
+    if name == "all":
+        return "tous"
+    if name.startswith(("human:", "agent:")):
+        return name
+    return ("human:%s" if name in cfg.human_names else "agent:%s") % name
+
+
+def project_for(cfg: Config, *chantiers) -> str:
+    """Projet d'un message : chantier de l'expéditeur, du destinataire, AMEESH_PROJECT, default."""
+    for chantier in chantiers:
+        if chantier and str(chantier).strip():
+            return str(chantier).strip()
+    return cfg.project or DEFAULT_PROJECT
+
+
+def _warn(text: str) -> None:
+    try:
+        print("ameesh fil : %s" % text, file=sys.stderr)
+    except Exception:
+        pass
+
+
+def record(cfg: Config, db, *, sender: str, recipients: Sequence[str], text: str,
+           ts: float | None = None, project: str | None = None, lot=None,
+           mailbox_ids: Sequence[int] = (), meta: dict | None = None,
+           transport: Transport | None = None) -> str | None:
+    """Écrit un message déjà déposé dans son fil, et met l'index à jour.
+
+    Ne lève JAMAIS : le message est déjà dans la boîte (ou dans le repli
+    fichier) ; un fil inaccessible se dit sur stderr, il ne perd rien.
+    """
+    ids: list[int] = []
+    try:
+        ids = [int(i) for i in mailbox_ids]
+        transport = transport or transport_for(cfg)
+        thread = ThreadRef(project or project_for(cfg), lot)
+        entry_meta: dict = {}
+        if ids:
+            entry_meta["ids"] = ids
+        if lot not in (None, ""):
+            entry_meta["lot"] = str(lot)
+        entry_meta.update({k: v for k, v in (meta or {}).items() if v not in (None, "")})
+        entry = Entry(author=member(cfg, sender),
+                      recipient=", ".join(member(cfg, r) for r in recipients),
+                      text=text, ts=float(ts) if ts else time.time(), meta=entry_meta)
+        external_id = transport.post(thread, entry)
+    except Exception as exc:
+        _warn("écriture du fil impossible (%s) — message conservé %s" % (
+            " ".join(str(exc).split())[:200],
+            "dans la boîte (id %s)" % ", ".join(map(str, ids)) if ids
+            else "dans la boîte fichier"))
+        return None
+    if db is not None:
+        try:
+            index(db, cfg, transport, thread, entry, external_id, ids)
+        except Exception as exc:
+            _warn("index des fils non mis à jour (%s) — le fil et le message sont intacts ; "
+                  "« ameesh migrate » ?" % " ".join(str(exc).split())[:200])
+    return external_id
+
+
+_INDEX_UPSERT = """
+INSERT INTO thread_index
+    (project, lot, transport, host, location, last_entry_id, last_mailbox_id,
+     last_author, last_excerpt, last_at, entries)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, to_timestamp(%s), 1)
+ON CONFLICT (project, lot, transport, host) DO UPDATE SET
+    location        = excluded.location,
+    entries         = thread_index.entries + 1,
+    last_entry_id   = CASE WHEN thread_index.last_at IS NULL
+                             OR excluded.last_at >= thread_index.last_at
+                           THEN excluded.last_entry_id ELSE thread_index.last_entry_id END,
+    last_mailbox_id = CASE WHEN thread_index.last_at IS NULL
+                             OR excluded.last_at >= thread_index.last_at
+                           THEN excluded.last_mailbox_id ELSE thread_index.last_mailbox_id END,
+    last_author     = CASE WHEN thread_index.last_at IS NULL
+                             OR excluded.last_at >= thread_index.last_at
+                           THEN excluded.last_author ELSE thread_index.last_author END,
+    last_excerpt    = CASE WHEN thread_index.last_at IS NULL
+                             OR excluded.last_at >= thread_index.last_at
+                           THEN excluded.last_excerpt ELSE thread_index.last_excerpt END,
+    last_at         = greatest(thread_index.last_at, excluded.last_at),
+    updated_at      = now()
+"""
+
+
+def index(db, cfg: Config, transport, thread: ThreadRef, entry: Entry, external_id: str,
+          mailbox_ids: Sequence[int] = ()) -> None:
+    """Met à jour `thread_index` et note l'id externe dans `agent_mailbox.meta`."""
+    ids = sorted({int(i) for i in mailbox_ids})
+    host = cfg.host if transport.name == "file" else ""
+    params: tuple = (
+        thread.project, thread.lot or "", transport.name, host,
+        transport.location(thread) if hasattr(transport, "location") else thread.key,
+        external_id, ids[-1] if ids else None, entry.author, excerpt(entry.text),
+        float(entry.ts),
+    )
+    sql = _INDEX_UPSERT
+    if ids:
+        # Un CTE qui modifie s'exécute même s'il n'est pas lu : une seule
+        # requête pour l'index et la trace dans la boîte.
+        sql = ("WITH trace AS (UPDATE agent_mailbox SET meta = meta || %%s::jsonb "
+               "WHERE id IN (%s)) " % ", ".join(str(i) for i in ids)) + _INDEX_UPSERT
+        params = (json.dumps({"fil": {"transport": transport.name, "id": external_id,
+                                      "host": host}}, ensure_ascii=False),) + params
+    db.execute(sql, params)
+
+
+def v0_recorded(cfg: Config) -> set[str]:
+    """Messages du repli fichier déjà écrits dans un fil (`<dest>/<fichier v0>`).
+
+    `import-v0` s'en sert pour ne pas écrire deux fois le même message.
+    """
+    transport = transport_for(cfg)
+    seen: set[str] = set()
+    for thread in transport.threads():
+        try:
+            entries = transport.read(thread)
+        except (OSError, ThreadError):
+            continue
+        for entry in entries:
+            for item in entry.meta.get("v0") or ():
+                seen.add(str(item))
+    return seen
+
+
+# --------------------------------------------------------------------------
+# CLI : ameesh fil list | show | tail
+# --------------------------------------------------------------------------
+
+def _moment(ts) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "—"
+
+
+def _write(text: str) -> None:
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def cmd_list(cfg: Config, _args: argparse.Namespace) -> int:
+    from . import db as db_mod
+    rows: list[dict] = []
+    try:
+        db = db_mod.connect(cfg)
+        try:
+            rows = db.query(
+                """
+                SELECT project, lot, transport, host, location, last_entry_id,
+                       last_author, last_excerpt, entries,
+                       extract(epoch from last_at)::float8 AS last_ts
+                  FROM thread_index
+                 ORDER BY last_at DESC NULLS LAST, project, lot
+                """)
+        finally:
+            db.close()
+    except db_mod.DbError as exc:
+        print("index des fils indisponible (%s) : fils trouvés sur disque seulement"
+              % " ".join(str(exc).split())[:200], file=sys.stderr)
+    # Les fils écrits en repli fichier (base absente) ne sont pas indexés.
+    transport = transport_for(cfg)
+    indexed = {(row["project"], row["lot"] or "") for row in rows
+               if row["transport"] == transport.name and row["host"] == cfg.host}
+    for thread in transport.threads():
+        if (thread.project, thread.lot or "") in indexed:
+            continue
+        entries = transport.read(thread)
+        last = entries[-1] if entries else None
+        rows.append({
+            "project": thread.project, "lot": thread.lot or "", "transport": transport.name,
+            "host": cfg.host, "location": transport.location(thread) + "  (hors index)",
+            "entries": len(entries), "last_ts": last.ts if last else None,
+            "last_author": last.author if last else "",
+        })
+    if not rows:
+        print("aucun fil")
+        return 0
+    print("%-20s %-12s %7s  %-16s %-20s %s" % (
+        "PROJET", "LOT", "ENTRÉES", "DERNIÈRE", "AUTEUR", "EMPLACEMENT"))
+    for row in rows:
+        location = row.get("location") or ""
+        if row.get("transport") != transport.name:
+            location = "%s:%s" % (row["transport"], location)
+        elif row.get("host") and row["host"] != cfg.host:
+            location = "%s:%s" % (row["host"], location)
+        print("%-20s %-12s %7d  %-16s %-20s %s" % (
+            row["project"][:20], (row.get("lot") or "—")[:12], int(row.get("entries") or 0),
+            _moment(row.get("last_ts")), (row.get("last_author") or "—")[:20], location))
+    return 0
+
+
+def _thread_from(args: argparse.Namespace) -> ThreadRef:
+    return ThreadRef(args.project, args.lot)
+
+
+def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
+    thread = _thread_from(args)
+    transport = transport_for(cfg)
+    path = transport.location(thread)
+    if not os.path.exists(path):
+        print("aucun fil %s (%s)" % (thread.describe(), path), file=sys.stderr)
+        return 1
+    entries = transport.read(thread)
+    if args.last is not None:
+        entries = entries[-args.last:] if args.last > 0 else []
+    for entry in entries:
+        _write(format_entry(entry, meta=args.meta))
+    return 0
+
+
+def cmd_tail(cfg: Config, args: argparse.Namespace) -> int:
+    thread = _thread_from(args)
+    transport = transport_for(cfg)
+    try:
+        entries = transport.read(thread)
+        for entry in (entries[-args.last:] if args.last > 0 else []):
+            _write(format_entry(entry, meta=args.meta))
+        cursor = entries[-1].id if entries else None
+        print("(suivi de %s — Ctrl-C pour sortir)" % thread.describe(), file=sys.stderr)
+        while True:
+            time.sleep(args.interval)
+            for entry in transport.read(thread, since=cursor):
+                _write(format_entry(entry, meta=args.meta))
+                cursor = entry.id
+    except KeyboardInterrupt:
+        return 0
+
+
+def _positive(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("entier attendu : %r" % text)
+    if value < 0:
+        raise argparse.ArgumentTypeError("entier positif attendu : %r" % text)
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ameesh fil", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command")
+    p_list = sub.add_parser("list", help="les fils connus")
+    p_list.set_defaults(func=cmd_list)
+    for name, func, last, aide in (
+            ("show", cmd_show, None, "lire un fil"),
+            ("tail", cmd_tail, 10, "suivre un fil (Ctrl-C pour sortir)")):
+        p_cmd = sub.add_parser(name, help=aide)
+        p_cmd.add_argument("project", metavar="projet")
+        p_cmd.add_argument("lot", nargs="?", default=None)
+        p_cmd.add_argument("--last", type=_positive, default=last,
+                           help="seulement les N dernières entrées")
+        p_cmd.add_argument("--meta", action="store_true",
+                           help="afficher aussi les métadonnées de chaque entrée")
+        if name == "tail":
+            p_cmd.add_argument("--interval", type=float, default=0.5,
+                               help="période de relecture en secondes (défaut 0,5)")
+        p_cmd.set_defaults(func=func)
+    return parser
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    from . import config as config_mod
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    if not argv:
+        parser.print_help()
+        return 0
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 2
+    cfg = config_mod.load()
+    try:
+        return args.func(cfg, args)
+    except (ThreadError, OSError) as exc:
+        print("erreur : %s" % exc, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

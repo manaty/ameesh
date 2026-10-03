@@ -58,7 +58,7 @@ Repo-local wrappers: `bin/agent-mail`, `bin/agent-runner`, `bin/agent-mesh`
 `agent-mail` keeps the v0 interface — and the v0 hook JSON, byte for byte:
 
 ```
-agent-mail send <dest> <texte…> [--from NOM]   # dest = nom ou "all"
+agent-mail send <dest> <texte…> [--from NOM] [--lot ID]   # dest = nom ou "all"
 agent-mail list                                # nom, outil, âge, non lus, dossier, hôte, bail
 agent-mail inbox [NOM]                         # non lus, sans les marquer lus
 agent-mail whoami                              # identité liée (nom + bail), jamais le dossier
@@ -73,6 +73,21 @@ agent-mail doctor [--notify-test]              # pilote, schéma, migrations, LI
 If Postgres is unreachable, the CLI falls back to the v0 file mailbox
 (`~/.local/state/agent-mail`) with a readable warning on stderr; hooks fall back
 silently and never fail the agent.
+
+Every message (Postgres or file fallback) is also appended to a **readable
+thread** (R12): one Markdown file per thread under `AMEESH_THREADS` (default
+`~/.local/state/ameesh/fils/<project>/<lot or _projet>.md`). The project is the
+sender's `chantier`, else the recipient's, else `AMEESH_PROJECT`, else
+`default`; the lot is `--lot`. A thread write failure is reported on stderr and
+never loses the message. Unreadable bodies (empty, JSON only, control/binary
+characters, base64/hex blobs over 200 characters) are refused;
+`--allow-structured` is for tests and tools only.
+
+```
+ameesh fil list                                 # threads (index + local files)
+ameesh fil show <projet> [<lot>] [--last N] [--meta]
+ameesh fil tail <projet> [<lot>] [--last N]     # follow; Ctrl-C to exit
+```
 
 `agent-mesh` (observability, authority, work items):
 
@@ -146,8 +161,9 @@ src/ameesh/
   db.py           psycopg or psql; LISTEN/NOTIFY; JSON row marshalling
   registry.py     agent_registry: presence, leases, prompts, budget
   mail.py         agent_mailbox: send, unread, deliver, history
+  fil.py          readable threads: Transport, file transport, index, ameesh fil
   migrations.py   NNNN_name.sql, checksummed, advisory-locked
-  migrations/     0001_init.sql … 0004_work_items.sql
+  migrations/     0001_init.sql … 0007, 0009_threads.sql (0008 reserved)
   mesh_cli.py     agent-mesh: mesh list, keys, approvals, work items, import/export v0
   authority.py    Ed25519 proofs bound to content and expiry; approvals
   signing.py      Ed25519 (pure RFC 8032 + optional cryptography/nacl), key files

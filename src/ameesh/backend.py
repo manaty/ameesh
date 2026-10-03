@@ -4,6 +4,9 @@ Le repli fichier écrit exactement là où la v0 écrit
 (`~/.local/state/agent-mail`), avec les mêmes noms de fichiers et le même JSON :
 si Postgres est absent, les agents continuent de se parler, et la v0 peut
 reprendre la main sans migration de données.
+
+Dans les deux cas, le message est aussi écrit dans son fil lisible (R12) ; un
+envoi à « all » donne une seule entrée par projet, pas une par destinataire.
 """
 from __future__ import annotations
 
@@ -14,7 +17,7 @@ import time
 
 from . import config as config_mod
 from . import db as db_mod
-from . import identity, mail, registry
+from . import fil, identity, mail, registry
 from .config import Config
 
 
@@ -44,9 +47,11 @@ class FileBackend:
 
     # -- messages ----------------------------------------------------------
     def send(self, sender: str, dest: str, text: str, host: str | None = None,
-             signed: dict | None = None) -> list[str]:
+             signed: dict | None = None, work_item_id: str | None = None,
+             allow_structured: bool = False) -> list[str]:
         # Le repli fichier ne stocke pas de signature (format v0 strict) : la
         # CLI prévient l'appelant, le message part quand même.
+        fil.ensure_readable(text, allow_structured)
         if dest == "all":
             targets = [
                 f[:-5]
@@ -56,6 +61,7 @@ class FileBackend:
         else:
             targets = [dest]
         now = time.time()
+        written: list[tuple[str, str]] = []
         for target in targets:
             filename = "%d-%s-%d.json" % (int(now * 1000), sender, os.getpid())
             tmp = os.path.join(self.inbox_dir(target), "." + filename)
@@ -66,6 +72,27 @@ class FileBackend:
                     fh, ensure_ascii=False,
                 )
             os.replace(tmp, os.path.join(self.inbox_dir(target), filename))
+            written.append((target, filename))
+        # Le fil, après le dépôt : une erreur ici ne perd rien (fil.record ne
+        # lève pas). `v0` permet à import-v0 de ne pas réécrire ces messages.
+        def chantier(name: str) -> str:
+            try:
+                return identity.chantier_of(name, self.cfg)
+            except (OSError, ValueError):  # alias illisible : projet par défaut
+                return ""
+
+        sender_chantier = chantier(sender)
+        groups: dict[str, list[tuple[str, str]]] = {}
+        for target, filename in written:
+            project = fil.project_for(self.cfg, sender_chantier, chantier(target))
+            groups.setdefault(project, []).append((target, filename))
+        for project, sent in groups.items():
+            fil.record(
+                self.cfg, None, sender=sender, recipients=[t for t, _ in sent], text=text,
+                ts=now, project=project, lot=work_item_id,
+                meta={"repli": "fichier", "host": host or socket.gethostname(),
+                      "diffusion": "all" if dest == "all" else None,
+                      "v0": ["%s/%s" % (t, f) for t, f in sent]})
         return targets
 
     def unread(self, name: str) -> list[dict]:
@@ -190,20 +217,34 @@ class PgBackend:
 
     # -- messages ----------------------------------------------------------
     def send(self, sender: str, dest: str, text: str, host: str | None = None,
-             signed: dict | None = None) -> list[str]:
+             signed: dict | None = None, work_item_id: str | None = None,
+             allow_structured: bool = False) -> list[str]:
+        fil.ensure_readable(text, allow_structured)
+        chantiers: dict[str, str] = {}
         if dest == "all":
-            targets = [
-                row["name"]
-                for row in registry.overview(self.db)
-                if row["name"] != sender
-            ]
+            rows = registry.overview(self.db)
+            chantiers = {row["name"]: row.get("chantier") or "" for row in rows}
+            targets = [row["name"] for row in rows if row["name"] != sender]
         else:
             targets = [dest]
+        groups: dict[str, list[tuple[str, int]]] = {}
         for target in targets:
             # `signed` vient de authority.sign_message : signature, payload,
-            # nonce, horodatage et échéance signés.
-            mail.send(self.db, sender, target, text, host=host, **dict(signed or {}))
+            # nonce, horodatage et échéance signés. Un envoi simple écrit son
+            # fil dans mail.send ; un envoi à « all » est regroupé ci-dessous.
+            message_id = mail.send(
+                self.db, sender, target, text, host=host, work_item_id=work_item_id,
+                allow_structured=allow_structured, thread=(dest != "all"),
+                **dict(signed or {}))
             registry.upsert(self.db, target, host=host)
+            if dest == "all":
+                project = fil.project_for(self.cfg, chantiers.get(sender), chantiers.get(target))
+                groups.setdefault(project, []).append((target, message_id))
+        for project, sent in groups.items():
+            fil.record(
+                self.cfg, self.db, sender=sender, recipients=[t for t, _ in sent], text=text,
+                project=project, lot=work_item_id, mailbox_ids=[i for _, i in sent],
+                meta={"host": host, "diffusion": "all"})
         return targets
 
     def unread(self, name: str) -> list[dict]:
