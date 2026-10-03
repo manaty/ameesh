@@ -13,8 +13,6 @@ generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:30:00+02:00" 
 |---|---|---|
 | Q1 (ex-M3) | Quelle base pour l'état d'exécution ? Elle suit désormais le profil d'hébergement ([0011](decisions/0011-hebergement-configurable.md)) ; reste à savoir si le profil local peut se contenter de SQLite (pas de LISTEN/NOTIFY). | Postgres partout pour la v1 ; SQLite à étudier pour le profil local. |
 | Q6 | Application mobile native pour TPK : application ameesh générique (open source, éventuellement aux couleurs de TPK) ou intégrée aux applications mobiles existantes de TPK ? Pour les approbations seulement, ou aussi pour le travail quotidien (fils, notifications) ? | À instruire avec le propriétaire et TPK. |
-| Q4 bis | Variante de l'AGPL : `AGPL-3.0-only` ou `AGPL-3.0-or-later` ? | `or-later` (recommandation de la FSF, compatibilité avec une future version). |
-| Q7 | Accord de contribution pour les contributeurs externes (CLA, cession ou DCO seul) — conditionne la double licence. | CLA léger avant d'accepter la première contribution externe. |
 | Q5 | L'orchestrateur Nexlink devient-il un agent à tours (réveillé par sa surveillance) pour pouvoir quitter le PC ? | Oui à terme ; c'est ce qui rend utile une deuxième machine. |
 
 # Attend une étude ou un prototype
