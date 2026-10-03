@@ -62,8 +62,8 @@ Contrôle : `ameesh canon check` sans erreur, puis `ameesh canon sync`.
    `localhost`) et un domaine stable (RP ID). Le téléphone n'atteint pas le
    `localhost` du PC : il faut une adresse HTTPS joignable par le téléphone —
    par exemple un réseau privé avec certificat (type Tailscale), une page
-   Nexlink, ou un petit domaine. **Décision du propriétaire à prendre à cette
-   étape** (aucune dépense ni exposition sans son accord).
+   Nexlink, ou un petit domaine. **Décision : une page Nexlink**
+   ([0017](decisions/0017-approbation-via-page-nexlink.md)) ; la mise en ligne reste un acte du propriétaire.
 3. Enrôlement de la passkey du propriétaire : le service produit une PR au
    canon (`Member.authenticators`) ; le propriétaire la fusionne.
 4. Essai : une action `shell-noop` de classe `irreversible` reste bloquée sans

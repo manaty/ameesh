@@ -89,7 +89,20 @@ autre hôte) et ne partage avec ameesh que des reçus.
 `AMEESH_CANON` (ou `canon` dans la configuration) désigne la racine d'un bundle
 OKF ; si un `federation.yaml` s'y trouve, ameesh suit ses membres présents
 localement (`workspace_path`). Lecture **seule**, au démarrage et sur demande
-(`ameesh canon reload`), jamais au milieu d'un tour. Un canon invalide n'arrête
+(`ameesh canon reload`), jamais au milieu d'un tour.
+
+**Source approuvée** : ameesh ne lit pas les fichiers de travail du clone. Il
+lit le canon **à la révision fusionnée de la branche canonique** (le `ref` du
+manifeste, par exemple `origin/main` après `git fetch`), par les objets git
+(`git show <commit>:<chemin>`), et enregistre ce commit (`canon_ref`) avec
+chaque donnée synchronisée. Un arbre de travail modifié ou un commit absent de
+la branche canonique distante est **ignoré** (diagnostic, aucune donnée prise
+en compte). La branche canonique est protégée par la politique de revue de la
+fédération (aucun agent n'a la capacité de fusionner). Limite v1 (§11) : tant
+que les agents partagent l'utilisateur Unix d'ameesh, ils peuvent altérer le
+clone ou la configuration git ; seule une vérification faite par un composant
+isolé (`ameesh-approve`, autre utilisateur) est opposable à un agent
+malveillant. Un canon invalide n'arrête
 pas les agents déjà réclamés : il empêche les nouvelles réclamations et produit
 un diagnostic.
 
@@ -174,8 +187,13 @@ Inchangé par rapport au banc actuel, sauf :
 - **Réclamation** (`claimable`) : un agent n'est réclamable que si `responsible`
   est résolu (C3) et que son placement est admis par la politique de l'hôte
   (C4). La raison du refus est écrite dans `status_text`.
-- **Invariant de bail** (travaux B5a) : aucun processus du groupe d'un agent
-  n'est vivant après l'échéance connue de son bail, sauf renouvellement réussi.
+- **Invariant de bail (cible)** : aucun processus du groupe d'un agent n'est
+  vivant après l'échéance connue de son bail, sauf renouvellement réussi,
+  **à une marge d'ordonnancement près** (délai entre l'échéance et l'effet du
+  SIGKILL, documenté et mesuré par les tests). La garantie absolue n'est pas
+  promise : suspension arbitraire du processus par le système, et chemins
+  encore ouverts au moment de la rédaction (revue B5a-S/P), sont des limites
+  documentées.
 - **Événements** (C9) : `kind = 'event'` dans la boîte ; ils réveillent l'agent
   comme un message, avec un **regroupement** : au plus un réveil par
   `AMEESH_EVENT_COALESCE` secondes (défaut 120) sauf événement marqué `urgent`.
@@ -237,7 +255,9 @@ target, args, amount, currency, policy_version}))`.
    la couvre. Les classes `read` et `reversible` n'exigent pas de reçu sauf
    politique contraire.
 2. `approved` → `launched` : **écrit et validé en base avant l'appel externe** ;
-   le nonce du reçu est consommé dans la même transaction.
+   dans la même transaction, le nonce du reçu est consommé (reçu propre à
+   l'action) ou le montant est réservé sur le grant (approbation permanente,
+   §8.3).
 3. L'appel passe la **clé d'idempotence = `action_id`** au connecteur.
 4. Résultat certain → `confirmed` | `failed`. Pas de résultat (coupure, délai)
    → `unknown`.
@@ -305,9 +325,14 @@ des nonces consommés (existant, `mesh_consumed_nonces`).
 ## 8.3 Approbations permanentes bornées (R8)
 
 Un reçu dont `request` porte `standing = {connector, operations, class,
-max_amount, currency, until}` au lieu d'un `action_id` autorise toute action
-couverte jusqu'à `until`, dans la limite cumulée `max_amount` ; révocable par une
-entrée du canon ou `ameesh standing revoke` (qui exige elle-même un reçu).
+max_amount, currency, until}` au lieu d'un `action_id` crée un **grant**. Son
+nonce est consommé **une fois, à l'enregistrement du grant**. Ensuite, chaque
+tentative couverte ne consomme pas de nonce : elle **réserve atomiquement** son
+montant sur le plafond cumulé (`cumul + montant <= max_amount`, `until` non
+dépassé, grant non révoqué) et la réservation est liée à l'`action_id` de la
+tentative. Une réservation n'est libérée que sur un échec **certain**
+(`failed`), jamais sur `unknown`. Révocable par une entrée du canon ou
+`ameesh standing revoke` (qui exige elle-même un reçu).
 
 # 9. ameesh-approve (C8)
 
@@ -342,7 +367,7 @@ propres au pilote. Le pilote Postgres actuel (psycopg | psql) est le seul en v1.
 | Garanti en v1 | Pas encore (v1.x) |
 |---|---|
 | un agent sans responsable ou mal placé ne tourne pas | isolation des agents entre eux (même utilisateur Unix) |
-| aucune action irréversible sans reçu valide **par la porte d'ameesh** | une action faite en contournant la porte (agent qui appelle `curl` lui-même) : à fermer par bac à sable réseau et proxy MCP |
+| aucune action irréversible sans reçu valide **quand elle passe par la porte d'ameesh** — protection contre l'erreur et l'injection de consignes, pas contre un agent malveillant qui partage l'utilisateur Unix d'ameesh (il peut lire les identifiants métier, modifier ameesh ou sa base) | porte et identifiants métier sous un utilisateur distinct des agents ; bac à sable réseau ; proxy MCP |
 | reçus liés à l'empreinte, à usage unique, avec échéance | non-répudiation forte pour les passkeys synchronisées (niveau élevé = clé matérielle) |
 | registre des authentificateurs modifiable seulement par PR revue | signatures de provenance des messages d'agents |
 | fil lisible de tous les messages passés par ameesh | messages échangés hors ameesh |
