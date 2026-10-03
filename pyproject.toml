@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-mesh"
+version = "0.1.0"
+description = "Mesh multi-harnais : boîte aux lettres durable sur Postgres, un exécuteur par machine, baux d'agents."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+# psycopg est optionnel : sans lui, la couche db utilise le binaire psql.
+dependencies = []
+
+[project.optional-dependencies]
+psycopg = ["psycopg[binary]>=3.1"]
+
+[project.scripts]
+agent-mail = "agent_mesh.cli:main"
+agent-runner = "agent_mesh.runner:main"
+agent-mesh = "agent_mesh.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agent_mesh = ["migrations/*.sql"]

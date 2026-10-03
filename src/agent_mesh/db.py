@@ -1,0 +1,586 @@
+"""Accès Postgres pour agent-mesh.
+
+Deux pilotes, une seule interface :
+
+* **psycopg** (v3) s'il est importable : le chemin nominal, LISTEN/NOTIFY natif ;
+* **psql** sinon : le binaire libpq, présent partout où Postgres est utilisé.
+  Les requêtes sont alors exécutées par un sous-processus `psql`, les SELECT
+  encapsulés en `json_agg` et les notifications lues sur un `psql` persistant
+  qui écoute (`LISTEN` + `SELECT pg_sleep(...)`) — vérifié sur le conteneur.
+
+Règles communes :
+
+* les requêtes sont écrites avec des marqueurs `%s` (style psycopg) ; le pilote
+  psql les remplace par des littéraux SQL échappés (`'` doublé, jamais de
+  concaténation de chaîne non contrôlée) ;
+* `query()` renvoie une liste de dicts, `execute()` un nombre de lignes (0 avec
+  psql : utiliser `query()` avec `RETURNING` quand le compte importe) ;
+* `script()` applique un script multi-instructions dans une transaction.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pty
+import queue
+import re
+import shutil
+import subprocess
+import threading
+from collections import deque
+from decimal import Decimal
+from typing import Any, Iterable, Sequence, Union
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
+
+from .config import Config, mask_dsn
+
+_SQL_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+_NOTIFY_RE = re.compile(
+    r'^Asynchronous notification "([^"]+)" with payload "(.*)" received from server process'
+)
+_LISTEN_SLEEP = 31536000  # un an : le processus meurt avec l'exécuteur
+_CONNECT_HINTS = (
+    "could not connect",
+    "connection refused",
+    "connection to server",
+    "no such file or directory",
+    "timeout expired",
+    "server closed the connection",
+    "password authentication failed",
+    "database \"",
+    "role \"",
+    "n'a pas pu",
+)
+
+
+class DbError(RuntimeError):
+    """Erreur SQL ou de protocole."""
+
+
+class Unavailable(DbError):
+    """La base n'est pas joignable (ou le pilote n'existe pas)."""
+
+
+class SchemaMissing(DbError):
+    """La base répond mais les tables agent-mesh ne sont pas migrées."""
+
+
+# --------------------------------------------------------------------------
+# échappement
+# --------------------------------------------------------------------------
+
+def quote_ident(name: str) -> str:
+    """Identifiant SQL sûr (noms de schéma, de canal) : refus sinon."""
+    if not _SQL_IDENT.match(name or ""):
+        raise DbError("identifiant SQL invalide : %r" % (name,))
+    return '"%s"' % name
+
+
+def sql_literal(value: Any) -> str:
+    """Littéral SQL échappé. Utilisé uniquement par le pilote psql."""
+    if value is None:
+        return "NULL"
+    if value is True:
+        return "TRUE"
+    if value is False:
+        return "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, (bytes, bytearray)):
+        return "'\\x%s'::bytea" % bytes(value).hex()
+    text = value if isinstance(value, str) else str(value)
+    if "\x00" in text:
+        raise DbError("caractère NUL interdit dans un paramètre SQL")
+    return "'" + text.replace("'", "''") + "'"
+
+
+def bind(sql: str, params: Sequence[Any]) -> str:
+    """Remplace les `%s` par des littéraux échappés (pilote psql).
+
+    Le SQL de ce paquet ne contient jamais `%s` dans une chaîne littérale :
+    c'est une contrainte volontaire, vérifiée par les tests.
+    """
+    chunks = sql.split("%s")
+    if len(chunks) - 1 != len(params):
+        raise DbError("SQL : %d marqueurs pour %d paramètres" % (len(chunks) - 1, len(params)))
+    out: list[str] = []
+    for chunk, param in zip(chunks, params):
+        out.append(chunk)
+        out.append(sql_literal(param))
+    out.append(chunks[-1])
+    return "".join(out)
+
+
+_DML_RE = re.compile(r"\b(insert|update|delete)\b", re.I)
+
+
+def _json_query(sql: str) -> str:
+    """Encapsule un SELECT (ou un DML avec RETURNING) en un seul texte JSON.
+
+    Un DML est reconnu soit directement (`UPDATE … RETURNING`), soit derrière un
+    `WITH` : dans les deux cas il est imbriqué dans un CTE, parce qu'un DML ne
+    peut pas être mis en sous-requête du FROM.
+    """
+    direct = re.match(r"\s*(insert|update|delete)\b", sql, re.I)
+    modifying = bool(direct) or (
+        re.match(r"\s*with\b", sql, re.I) and bool(_DML_RE.search(sql))
+    )
+    if modifying:
+        if not re.search(r"\breturning\b", sql, re.I):
+            raise DbError("query() sur un DML sans RETURNING : %.60s" % sql)
+        return (
+            "WITH __dml AS (\n%s\n)\n"
+            "SELECT coalesce(json_agg(row_to_json(__dml)), '[]'::json)::text FROM __dml" % sql
+        )
+    return (
+        "SELECT coalesce(json_agg(row_to_json(t)), '[]'::json)::text\n"
+        "FROM (\n%s\n) t" % sql
+    )
+
+
+def _normalize(value: Any) -> Any:
+    import datetime
+    import uuid
+
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, memoryview):
+        return bytes(value).hex()
+    return value
+
+
+def _normalize_row(row: dict) -> dict:
+    return {key: _normalize(value) for key, value in row.items()}
+
+
+# --------------------------------------------------------------------------
+# DSN
+# --------------------------------------------------------------------------
+
+def split_password(dsn: str) -> tuple[str, str]:
+    """(mot de passe, DSN sans mot de passe) — le secret ne traîne pas en argv."""
+    if "://" in dsn:
+        parts = urlsplit(dsn)
+        password = ""
+        if parts.netloc and "@" in parts.netloc:
+            creds, host = parts.netloc.rsplit("@", 1)
+            user, _, pwd = creds.partition(":")
+            password = unquote(pwd)
+            netloc = "%s@%s" % (quote(user), host)
+            dsn = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    else:
+        match = re.search(r"(?:^|\s)password=(\S+)", dsn)
+        password = match.group(1).strip("'\"") if match else ""
+        if match:
+            dsn = (dsn[: match.start()] + " " + dsn[match.end():]).strip()
+    return password, dsn
+
+
+# --------------------------------------------------------------------------
+# pilote psql
+# --------------------------------------------------------------------------
+
+class PsqlDriver:
+    """Pilote par sous-processus `psql` (aucune dépendance Python)."""
+
+    name = "psql"
+
+    def __init__(self, cfg: Config):
+        binary = shutil.which("psql")
+        if not binary:
+            raise Unavailable("psql introuvable dans le PATH")
+        self.binary = binary
+        self.cfg = cfg
+        self.password, base = split_password(cfg.dsn)
+        self.env = os.environ.copy()
+        self.env["PGCONNECT_TIMEOUT"] = str(max(1, int(cfg.connect_timeout)))
+        if self.password:
+            self.env["PGPASSWORD"] = self.password
+        base_args = [
+            binary, "-X", "-q", "-A", "-t", "-P", "pager=off",
+            "-v", "ON_ERROR_STOP=1", "-d", base,
+        ]
+        self._args = list(base_args)
+        # Un `psql -c` ne lit jamais stdin : l'écouteur interactif a donc sa
+        # propre ligne de commande, et reçoit le search_path par son amorce.
+        self._interactive_args = list(base_args)
+        self._bootstrap = ""
+        if cfg.schema != "public":
+            # Schéma autoportant : pas de repli sur public, sinon un
+            # `CREATE TABLE IF NOT EXISTS` verrait la table de public et ne
+            # créerait rien (isolation des tests et des chantiers).
+            schema = "SET search_path TO %s;" % quote_ident(cfg.schema)
+            self._args += ["-c", schema[:-1]]
+            self._bootstrap = schema + "\n"
+        self._check()
+
+    # -- interne -----------------------------------------------------------
+    def _run(self, extra: list[str], stdin: str | None = None) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                self._args + extra, input=stdin, capture_output=True, text=True,
+                env=self.env, timeout=None,
+            )
+        except OSError as exc:
+            raise Unavailable("psql n'a pas pu démarrer : %s" % exc) from exc
+
+    def _check(self) -> None:
+        proc = self._run(["-c", "SELECT 1"])
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            message = detail[-1] if detail else "code %d" % proc.returncode
+            low = (proc.stderr or "").lower()
+            if proc.returncode == 2 or any(hint in low for hint in _CONNECT_HINTS):
+                raise Unavailable("psql : %s" % message)
+            raise DbError("psql : %s" % message)
+
+    def _fail(self, proc: subprocess.CompletedProcess) -> DbError:
+        lines = [l for l in (proc.stderr or "").strip().splitlines() if l.strip()]
+        message = lines[-1] if lines else "code %d" % proc.returncode
+        for line in reversed(lines):
+            if "ERROR" in line or "ERREUR" in line:
+                message = line.strip()
+                break
+        low = (proc.stderr or "").lower()
+        if proc.returncode == 2 or any(hint in low for hint in _CONNECT_HINTS):
+            return Unavailable("psql : %s" % message)
+        return DbError("psql : %s" % message)
+
+    # -- interface ---------------------------------------------------------
+    def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
+        proc = self._run(["-c", _json_query(bind(sql, params))])
+        if proc.returncode != 0:
+            raise self._fail(proc)
+        text = proc.stdout.strip()
+        if not text:
+            return []
+        try:
+            rows = json.loads(text)
+        except ValueError as exc:
+            raise DbError("réponse JSON illisible de psql : %.120s" % text) from exc
+        if isinstance(rows, dict):
+            rows = [rows]
+        return [_normalize_row(row) for row in rows]
+
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
+        proc = self._run(["-c", bind(sql, params)])
+        if proc.returncode != 0:
+            raise self._fail(proc)
+        return 0
+
+    def script(self, sql: str) -> None:
+        proc = self._run(["-1", "-f", "-"], stdin=sql)
+        if proc.returncode != 0:
+            raise self._fail(proc)
+
+    def listen(self, channels: Iterable[str]) -> "Listener":
+        return _PsqlListener(self, list(channels))
+
+    def close(self) -> None:
+        pass
+
+    def ping(self) -> None:
+        self._check()
+
+
+class _PsqlListener:
+    """Écoute LISTEN/NOTIFY avec `psql` (sans psycopg).
+
+    Deux contraintes de psql, vérifiées sur le conteneur :
+
+    * il ne vide son stdout (bloqué en `pg_sleep`) qu'à la fin de la requête ;
+    * il n'imprime les notifications qu'en mode interactif, au tour de boucle
+      suivant.
+
+    D'où ce montage : `psql` tourne sur un pty (stdin+stdout), on lui envoie un
+    battement `SELECT 1` deux fois par seconde, et on filtre la sortie sur la
+    ligne « Asynchronous notification … ». La latence de réveil est donc de
+    ~0,5 s, contre 5 s pour le sondage de repli.
+    """
+
+    HEARTBEAT = 0.5
+
+    def __init__(self, driver: PsqlDriver, channels: list[str]):
+        self.channels = channels
+        self._queue: queue.Queue = queue.Queue()
+        self._lines: list[str] = []
+        self._down = threading.Event()
+        self._stop = threading.Event()
+        self._buf = ""
+        self.master, slave = pty.openpty()
+        try:
+            self.proc = subprocess.Popen(
+                driver._interactive_args, stdin=slave, stdout=slave, stderr=slave,
+                close_fds=True, env=driver.env,
+            )
+        except OSError as exc:
+            os.close(self.master)
+            os.close(slave)
+            raise Unavailable("psql n'a pas pu démarrer : %s" % exc) from exc
+        os.close(slave)
+        threading.Thread(target=self._read_pty, daemon=True).start()
+        threading.Thread(target=self._heartbeat, daemon=True).start()
+        self._write(
+            "\\set PROMPT1 ''\n\\set PROMPT2 ''\n"
+            + driver._bootstrap
+            + "".join("LISTEN %s;\n" % quote_ident(c) for c in channels)
+        )
+
+    def _write(self, text: str) -> None:
+        try:
+            os.write(self.master, text.encode("utf-8"))
+        except OSError:
+            self._down.set()
+
+    def _heartbeat(self) -> None:
+        while not self._stop.wait(self.HEARTBEAT):
+            if self.proc.poll() is not None:
+                break
+            self._write("SELECT 1;\n")
+
+    def _read_pty(self) -> None:
+        try:
+            while not self._stop.is_set():
+                try:
+                    data = os.read(self.master, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                self._buf += data.decode("utf-8", "replace")
+                *complete, self._buf = self._buf.split("\n")
+                for raw in complete:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    match = _NOTIFY_RE.match(line)
+                    if match:
+                        self._queue.put({"channel": match.group(1), "payload": match.group(2)})
+                    else:
+                        self._lines.append(line)
+                        del self._lines[:-20]
+        finally:
+            self._down.set()
+            self._queue.put({"event": "down", "error": self.error})
+
+    @property
+    def error(self) -> str:
+        return self._lines[-1] if self._lines else ""
+
+    def wait(self, timeout: float) -> dict | None:
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            if self._down.is_set():
+                return {"event": "down", "error": self.error}
+            return None
+
+    def close(self) -> None:
+        self._stop.set()
+        self._write("\\q\n")
+        if self.proc.poll() is None:
+            try:
+                self.proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# pilote psycopg
+# --------------------------------------------------------------------------
+
+class PsycopgDriver:
+    """Pilote psycopg 3 : connexion directe, LISTEN/NOTIFY natif."""
+
+    name = "psycopg"
+
+    def __init__(self, cfg: Config):
+        try:
+            import psycopg  # noqa: F401
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise Unavailable("psycopg (v3) absent : %s" % exc) from exc
+        self._psycopg = psycopg
+        self._dict_row = dict_row
+        self.cfg = cfg
+        self.conn = self._connect()
+        self._check()
+
+    def _connect(self):
+        try:
+            return self._psycopg.connect(
+                self.cfg.dsn, autocommit=True,
+                connect_timeout=max(1, int(self.cfg.connect_timeout)),
+                row_factory=self._dict_row,
+            )
+        except Exception as exc:  # psycopg.OperationalError et cie
+            raise Unavailable("psycopg : %s" % _one_line(exc)) from exc
+
+    def _check(self) -> None:
+        if self.cfg.schema != "public":
+            self.conn.execute("SET search_path TO %s" % quote_ident(self.cfg.schema))
+        try:
+            self.conn.execute("SELECT 1").fetchone()
+        except Exception as exc:
+            raise Unavailable("psycopg : %s" % _one_line(exc)) from exc
+
+    def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
+        try:
+            with self.conn.cursor() as cur:
+                if params:
+                    cur.execute(sql, tuple(params))
+                else:
+                    cur.execute(sql)
+                return [_normalize_row(dict(row)) for row in cur.fetchall()]
+        except Exception as exc:
+            raise _map_error(exc) from exc
+
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
+        try:
+            with self.conn.cursor() as cur:
+                if params:
+                    cur.execute(sql, tuple(params))
+                else:
+                    cur.execute(sql)
+                return cur.rowcount
+        except Exception as exc:
+            raise _map_error(exc) from exc
+
+    def script(self, sql: str) -> None:
+        try:
+            with self.conn.transaction():
+                self.conn.execute(sql)
+        except Exception as exc:
+            raise _map_error(exc) from exc
+
+    def listen(self, channels: Iterable[str]) -> "Listener":
+        try:
+            conn = self._connect()
+            for channel in channels:
+                conn.execute("LISTEN %s" % quote_ident(channel))
+        except AttributeError as exc:  # psycopg trop ancien
+            raise Unavailable("psycopg sans support LISTEN : %s" % exc) from exc
+        return _PsycopgListener(conn, list(channels))
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def ping(self) -> None:
+        self._check()
+
+
+class _PsycopgListener:
+    """Écoute LISTEN/NOTIFY avec psycopg 3.
+
+    `Connection.notifies(stop_after=1)` jette les notifications non consommées
+    à la fermeture du générateur : on draine donc la connexion entière dans un
+    tampon (`notifies(timeout=0)`), puis on rend les notifications une à une.
+    """
+
+    def __init__(self, conn, channels: list[str]):
+        self.conn = conn
+        self.channels = channels
+        self._pending: deque = deque()
+
+    def wait(self, timeout: float) -> dict | None:
+        import select
+
+        attente = timeout
+        while True:
+            try:
+                if not self._pending:
+                    self._pending.extend(self.conn.notifies(timeout=0))
+            except Exception as exc:
+                return {"event": "down", "error": _one_line(exc)}
+            if self._pending:
+                notify = self._pending.popleft()
+                return {"channel": notify.channel, "payload": notify.payload}
+            try:
+                pret, _, _ = select.select([self.conn], [], [], attente)
+            except Exception as exc:
+                return {"event": "down", "error": _one_line(exc)}
+            if not pret:
+                return None
+            attente = 0  # réveillé : ne pas re-bloquer
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+
+def _one_line(exc: BaseException) -> str:
+    return " ".join(str(exc).split())[:300]
+
+
+def _map_error(exc: Exception) -> DbError:
+    text = _one_line(exc).lower()
+    if any(hint in text for hint in _CONNECT_HINTS):
+        return Unavailable(_one_line(exc))
+    if "does not exist" in text and ("relation" in text or "table" in text):
+        return SchemaMissing(_one_line(exc))
+    return DbError(_one_line(exc))
+
+
+# --------------------------------------------------------------------------
+# fabrique
+# --------------------------------------------------------------------------
+
+def connect(cfg: Config, driver: str | None = None) -> PsqlDriver | PsycopgDriver:
+    """Ouvre une connexion. Lève `Unavailable` si la base (ou le pilote) manque."""
+    wanted = driver or cfg.driver
+    errors: list[str] = []
+    if wanted in ("auto", "psycopg"):
+        try:
+            return PsycopgDriver(cfg)
+        except Unavailable as exc:
+            errors.append(str(exc))
+            if wanted == "psycopg":
+                raise
+    if wanted in ("auto", "psql"):
+        try:
+            return PsqlDriver(cfg)
+        except Unavailable as exc:
+            errors.append(str(exc))
+    raise Unavailable(" ; ".join(errors) or "aucun pilote Postgres disponible")
+
+
+def require_schema(db: PsqlDriver | PsycopgDriver) -> None:
+    """Vérifie que les migrations sont passées, avec un message actionnable."""
+    row = db.query("SELECT to_regclass('agent_registry') IS NOT NULL AS ok")[0]
+    if not row.get("ok"):
+        raise SchemaMissing(
+            "schéma agent-mesh absent (base %s, schéma %s) : lancez « agent-mesh migrate »"
+            % (mask_dsn(db.cfg.dsn), db.cfg.schema)
+        )
+
+
+def listener(db: PsqlDriver | PsycopgDriver, channels: Iterable[str]) -> "Listener | None":
+    """Ouvre un écouteur, ou None si le pilote ne sait pas écouter."""
+    try:
+        return db.listen(channels)
+    except (Unavailable, DbError, NotImplementedError):
+        return None
+
+
+#: type commun aux deux pilotes
+Db = Union[PsqlDriver, PsycopgDriver]
+Listener = Union[_PsqlListener, _PsycopgListener]
