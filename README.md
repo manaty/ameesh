@@ -113,7 +113,7 @@ scripts/test.sh                      # starts the container, runs the suite twic
 scripts/test.sh tests.test_runner    # one module
 ```
 
-129 tests against the local container, run twice (`psql`, then `psycopg` with
+135 tests against the local container, run twice (`psql`, then `psycopg` with
 `cryptography`): migrations and immutability, mailbox and LISTEN/NOTIFY round
 trips, lease races on 2 and 4 concurrent connections, **two runner processes
 competing for the same lease**, lease expiry takeover, fencing of a stale
@@ -126,7 +126,9 @@ bound, v0 import/export, and the codex3 verdict probes: two key roles
 (owner/agent), signed expiry and creation time bound to the row, nonce-based
 single-use approvals, live-lease checks in renew/begin_turn/take_pending_prompt,
 heartbeat stopping the harness on DB failure, durable `current_prompt`, and the
-hook marking mail delivered only after a successful write.
+hook marking mail delivered only after a successful write, heartbeat waking at
+the lease deadline, SIGTERM→SIGKILL escalation, prompt restored after a failed
+or killed turn, and the consumed-nonce ledger backfilled on upgrade (0007).
 
 ## Layout
 

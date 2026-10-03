@@ -6,8 +6,7 @@ import tempfile
 import unittest
 import uuid
 
-from agent_mesh import db as db_mod
-from agent_mesh import migrations
+from agent_mesh import authority, db as db_mod, mail, migrations, registry, signing
 
 from .support import PgTestCase
 
@@ -17,10 +16,10 @@ class MigrationsTest(PgTestCase):
         rows = self.db.query(
             "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
         )
-        self.assertEqual([row["version"] for row in rows], [1, 2, 3, 4, 5, 6])
+        self.assertEqual([row["version"] for row in rows], [1, 2, 3, 4, 5, 6, 7])
         self.assertEqual([row["name"] for row in rows],
                          ["init", "overview", "authority", "work_items", "key_roles",
-                          "authority_fixes"])
+                          "authority_fixes", "nonces_backfill"])
         for row in rows:
             self.assertEqual(len(row["checksum"]), 64)
         # la vue d'observabilité et les deux triggers de notification existent
@@ -51,7 +50,7 @@ class MigrationsTest(PgTestCase):
     def test_remigration_idempotente(self):
         self.assertEqual(migrations.migrate(self.db), [])
         count = self.db.query("SELECT count(*)::int AS n FROM schema_migrations")[0]["n"]
-        self.assertEqual(count, 6)
+        self.assertEqual(count, 7)
 
     def test_migration_modifiee_refusee(self):
         connue = migrations.discover()[0].checksum
@@ -85,7 +84,7 @@ class MigrationsTest(PgTestCase):
                 "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %s) AS ok", (schema,)
             )[0]["ok"])
             done = migrations.migrate(db)
-            self.assertEqual([m.version for m in done], [1, 2, 3, 4, 5, 6])
+            self.assertEqual([m.version for m in done], [1, 2, 3, 4, 5, 6, 7])
             tables = db.query(
                 "SELECT count(*)::int AS n FROM information_schema.tables "
                 "WHERE table_schema = %s AND table_name IN ('agent_registry','agent_mailbox',"
@@ -93,6 +92,95 @@ class MigrationsTest(PgTestCase):
                 (schema,),
             )[0]["n"]
             self.assertEqual(tables, 6)
+        finally:
+            db.close()
+            self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
+
+    def test_mise_a_niveau_remplit_le_ledger_des_consommations(self):
+        """Sonde codex3 (B3 upgrade) : un reçu consommé avant 0006 ne se rejoue pas.
+
+        On rejoue le chemin réel : schéma 0001–0004, approbation signée déjà
+        consommée (colonne seule), puis application de 0005–0007, suppression et
+        réinsertion du même reçu signé — find_approval doit refuser.
+        """
+        schema = "t_upgrade_%s" % uuid.uuid4().hex[:8]
+        db = self.connect(schema)
+        try:
+            # 1) un schéma à l'ancienne : uniquement 0001–0004
+            import tempfile
+            with tempfile.TemporaryDirectory() as ancien:
+                for name in sorted(os.listdir(migrations.MIGRATIONS_DIR)):
+                    if name[:4] in ("0001", "0002", "0003", "0004"):
+                        with open(os.path.join(migrations.MIGRATIONS_DIR, name), encoding="utf-8") as src:
+                            with open(os.path.join(ancien, name), "w", encoding="utf-8") as dst:
+                                dst.write(src.read())
+                done = migrations.migrate(db, directory=ancien)
+                self.assertEqual([m.version for m in done], [1, 2, 3, 4])
+
+            # 2) l'ancien monde écrit avec les colonnes de 0003 seulement
+            #    (le code v1 d'aujourd'hui connaît current_prompt/key_role, pas
+            #    ce schéma : on simule l'ancien code, pas le nouveau).
+            seed = signing.backend("pure").generate_seed()
+            public = signing.backend("pure").public_from_seed(seed)
+            db.execute(
+                "INSERT INTO agent_registry (name, harness, host, public_key, "
+                "public_key_fingerprint, key_updated_at) VALUES (%s, %s, %s, %s, %s, now())",
+                ("proprietaire", "claude", "laptop", authority.b64(public),
+                 signing.fingerprint(public)),
+            )
+            built = authority.build_approval(
+                seed, approver="proprietaire", action="merge", artifact_kind="diff",
+                artifact_hash=authority.hash_artifact("diff d'avant migration"), ttl=3600)
+            approval_id = db.query(
+                """
+                INSERT INTO mesh_approvals
+                    (approver, action, artifact_kind, artifact_hash, decision, nonce,
+                     signed_payload, signature, signature_key, created_at, expires_at,
+                     consumed_at, consumed_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        to_timestamp(%s::bigint / 1000000.0),
+                        to_timestamp(%s::bigint / 1000000.0), now(), 'avant')
+                RETURNING id
+                """,
+                (built["approver"], built["action"], built["artifact_kind"],
+                 built["artifact_hash"], built["decision"], built["nonce"],
+                 built["signed_payload"], built["signature"], built["signature_key"],
+                 built["created_us"], built["expires_us"]),
+            )[0]["id"]
+            artifact = built["artifact_hash"]
+            built["id"] = int(approval_id)
+
+            # 3) migration réelle : 0005, 0006, 0007 (le backfill). Une clé
+            #    enregistrée avant 0005 devient « agent » (moindre privilège) :
+            #    l'acte explicite --role owner est rejoué, comme à la bascule.
+            done = migrations.migrate(db)
+            self.assertEqual([m.version for m in done], [5, 6, 7])
+            db.execute("UPDATE agent_registry SET key_role = 'owner' "
+                       "WHERE name = 'proprietaire'")
+            ledger = db.query(
+                "SELECT approver, nonce, consumed_by FROM mesh_consumed_nonces")
+            self.assertEqual(len(ledger), 1)
+            self.assertEqual(ledger[0]["consumed_by"], "avant")
+
+            # 4) suppression puis réinsertion du même reçu signé : refusé
+            db.execute("DELETE FROM mesh_approvals WHERE id = %s", (built["id"],))
+            db.query(
+                """
+                INSERT INTO mesh_approvals
+                    (approver, action, artifact_kind, artifact_hash, decision, nonce,
+                     signed_payload, signature, signature_key, created_at, expires_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        to_timestamp(%s::bigint / 1000000.0), to_timestamp(%s::bigint / 1000000.0))
+                RETURNING id
+                """,
+                (built["approver"], built["action"], built["artifact_kind"],
+                 built["artifact_hash"], built["decision"], built["nonce"],
+                 built["signed_payload"], built["signature"], built["signature_key"],
+                 built["created_us"], built["expires_us"]),
+            )
+            row, verdict = authority.find_approval(db, "merge", artifact)
+            self.assertIsNone(row, "le reçu réinséré ne doit pas être reconsommable")
+            self.assertIn("nonce déjà consommé", verdict.reason)
         finally:
             db.close()
             self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)

@@ -113,13 +113,20 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
 * **Battement robuste** — une panne de base pendant un tour ne laisse pas le
   harnais tourner sans bail : le battement compte les échecs
   (`max(3, ttl/3)` secondes d'intervalle), et arrête le processus dès que la
-  base reste injoignable ou que l'échéance connue du bail est atteinte.
+  base reste injoignable ou que l'échéance connue du bail est atteinte. Il ne
+  dort **jamais au-delà de l'échéance** (le réveil est borné par
+  `lease_deadline`), même si l'intervalle nominal est plus long.
+* **Arrêt du harnais** — `terminate` envoie SIGTERM, laisse 3 secondes, puis
+  SIGKILL : un processus qui ignore SIGTERM ne survit pas à la perte du bail.
 * **Consigne durable (R5)** — `pick` ne vide plus `pending_prompt` : la
   consigne est *déplacée* dans `current_prompt` quand le tour démarre, effacée
-  par `end_turn` en cas de succès, et **restaurée en attente** si l'agent
-  change de main (bail expiré, exécuteur mort) ou si le tour n'a pas pu
-  démarrer (harnais absent, dossier disparu). Au pire un tour est rejoué,
-  jamais une consigne perdue.
+  par `end_turn` **uniquement si le tour a abouti**, et restaurée en attente
+  dans tous les autres cas : tour en échec (y compris harnais tué), harnais
+  absent, dossier disparu, changement de main — y compris quand le même
+  `--runner-id` reprend un bail expiré. Si une consigne était déjà en attente
+  pendant un tour interrompu, **les deux sont conservées** (l'ancienne puis la
+  nouvelle, séparées par une ligne vide). Au pire un tour est rejoué, jamais
+  une consigne perdue.
 * **Expiration** — si l'exécuteur meurt (SIGKILL, coupure), le bail expire ;
   n'importe quel exécuteur du même hôte le reprend (`lease_expires_at < now()`).
   `reap()` marque `dead` les agents dont le bail a expiré en plein tour.

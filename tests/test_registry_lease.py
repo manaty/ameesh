@@ -180,6 +180,43 @@ class RegistryTest(PgTestCase):
             registry.take_pending_prompt(self.db, "alpha", "runner-b", int(nouveau["lease_epoch"])),
             "travail à ne pas perdre")
 
+    def test_reprise_par_le_meme_executeur_restaure_la_consigne(self):
+        """B6b : un redémarrage avec le même --runner-id ne perd pas la consigne."""
+        registry.upsert(self.db, "alpha", harness="claude", host="laptop")
+        registry.set_pending_prompt(self.db, "alpha", "travail interrompu")
+        lease = registry.claim(self.db, "alpha", "runner-a", 60)
+        epoch = int(lease["lease_epoch"])
+        registry.take_pending_prompt(self.db, "alpha", "runner-a", epoch)
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
+            "WHERE name = 'alpha'")
+        again = registry.claim(self.db, "alpha", "runner-a", 60)  # même identifiant
+        self.assertIsNotNone(again)
+        self.assertEqual(registry.get(self.db, "alpha")["pending_prompt"],
+                         "travail interrompu")
+        self.assertEqual(
+            registry.take_pending_prompt(self.db, "alpha", "runner-a", int(again["lease_epoch"])),
+            "travail interrompu")
+
+    def test_deux_consignes_conservees_a_la_reprise(self):
+        """B6c : current A + pending B → les deux survivent, dans l'ordre."""
+        registry.upsert(self.db, "alpha", harness="claude", host="laptop")
+        registry.set_pending_prompt(self.db, "alpha", "A interrompue")
+        lease = registry.claim(self.db, "alpha", "runner-a", 60)
+        registry.take_pending_prompt(self.db, "alpha", "runner-a", int(lease["lease_epoch"]))
+        registry.set_pending_prompt(self.db, "alpha", "B en attente")
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
+            "WHERE name = 'alpha'")
+        nouveau = registry.claim(self.db, "alpha", "runner-b", 60)
+        row = registry.get(self.db, "alpha")
+        self.assertEqual(row["pending_prompt"], "A interrompue\n\nB en attente")
+        self.assertIsNone(row["current_prompt"])
+        self.assertEqual(
+            registry.take_pending_prompt(self.db, "alpha", "runner-b",
+                                         int(nouveau["lease_epoch"])),
+            "A interrompue\n\nB en attente")
+
     def test_restore_prompt(self):
         registry.upsert(self.db, "alpha", harness="claude", host="laptop")
         registry.set_pending_prompt(self.db, "alpha", "consigne")

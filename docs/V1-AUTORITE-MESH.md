@@ -57,7 +57,10 @@ Les approbations (`mesh_approvals`) suivent le même modèle avec, en plus, une
 ligne mais une table à part, `mesh_consumed_nonces`, clé primaire
 `(approver, nonce)` : réinsérer le même reçu signé sous un nouvel id — ou
 supprimer la ligne consommée puis la recréer — ne permet pas de le rejouer, et
-un index unique sur `(approver, nonce)` bloque la copie directe. `verify_approval`
+un index unique sur `(approver, nonce)` bloque la copie directe. **À la mise à
+niveau** d'un schéma antérieur, la migration `0007` rétro-remplit ce ledger
+depuis les `consumed_at` historiques : une approbation consommée avant 0006 ne
+redevient pas consommable après migration (0006 reste immuable). `verify_approval`
 refuse toute clé qui n'est pas `owner`, y compris si la ligne a été insérée en
 base à la main.
 
@@ -181,6 +184,9 @@ puis `psycopg` dans un venv avec `cryptography`). Couverture des points 3-5 :
 * sondes codex3 sur le gel 345aca6, désormais couvertes : `expires_at` ou
   `created_at` modifiés en base → refusés ; reçu consommé supprimé puis
   réinséré → « nonce déjà consommé » ; copie directe → index unique ;
+* **mise à niveau** : schéma 0001–0004 avec une approbation déjà consommée,
+  application réelle de 0005–0007, reçu supprimé puis réinséré → toujours
+  refusé par le ledger rétro-rempli ;
 * `mesh list`/`show` (texte et JSON), cycle de vie des clés par la CLI ;
 * `work_items` : cycle, transitions refusées, boucle bornée, journal,
   déplacement concurrent (un seul gagnant), NOTIFY ;

@@ -128,18 +128,44 @@ class AgentWorker(threading.Thread):
         except db_mod.DbError:
             pass
 
+    #: délai laissé au harnais entre SIGTERM et SIGKILL
+    TERMINATE_GRACE = 3.0
+
     def terminate(self) -> None:
+        """Arrête le harnais : SIGTERM, puis SIGKILL s'il l'ignore (B5b).
+
+        Un processus qui traite SIGTERM sort en quelques dizaines de
+        millisecondes ; un `sleep` qui l'ignore ne doit pas continuer à tourner
+        alors que le bail est perdu.
+        """
         with self.lock:
             proc = self.proc
-        if proc and proc.poll() is None:
-            try:
-                proc.terminate()
-            except OSError:
-                pass
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except OSError:
+            return
+        deadline = time.monotonic() + self.TERMINATE_GRACE
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return
+            time.sleep(0.05)
+        log("[%s] le harnais ignore SIGTERM : SIGKILL" % self.name)
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+    def wait_timeout(self, cap: float) -> float:
+        """Attente bornée par l'échéance du bail : on ne dort pas au-delà (B5a)."""
+        if self.lease_deadline > 0:
+            return max(0.2, min(cap, self.lease_deadline - time.time() + 0.2))
+        return cap
 
     def _heartbeat(self, stop_event: threading.Event) -> None:
         interval = max(3.0, self.runner.lease_ttl / 3.0)
-        while not stop_event.wait(interval):
+        while not stop_event.wait(self.wait_timeout(interval)):
             if not self.renew():
                 return
 
@@ -288,6 +314,10 @@ class AgentWorker(threading.Thread):
             registry.end_turn(self.db, self.name, self.runner.runner_id, self.epoch,
                               status="dead", status_text="bail perdu", error=error)
             return False
+        if not ok:
+            # B6a : le tour n'a pas abouti, la consigne repart en attente au lieu
+            # d'être effacée par end_turn. Au pire elle est rejouée.
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
         registry.end_turn(
             self.db, self.name, self.runner.runner_id, self.epoch,
             status=status,
@@ -338,7 +368,8 @@ class AgentWorker(threading.Thread):
                     break
                 spec = self.pick()
                 if spec is None:
-                    self.wake.wait(timeout=min(self.runner.poll, max(1.0, self.runner.lease_ttl / 3.0)))
+                    self.wake.wait(timeout=self.wait_timeout(
+                        min(self.runner.poll, max(1.0, self.runner.lease_ttl / 3.0))))
                     self.wake.clear()
                     continue
                 if not self.run_turn(spec):

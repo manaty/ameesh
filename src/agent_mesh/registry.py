@@ -107,14 +107,25 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
            SET lease_owner      = %s,
                lease_expires_at = now() + make_interval(secs => %s),
                lease_epoch      = lease_epoch + 1,
-               -- R5 : si l'agent change de main avec un tour inachevé, la
-               -- consigne repart en attente au lieu d'être perdue.
+               -- R5 : si le bail n'était plus vivant (autre main, ou même
+               -- exécuteur relancé avec le même identifiant), la consigne
+               -- inachevée repart en attente. Si une consigne était déjà en
+               -- attente, les deux sont conservées (B6b, B6c).
                pending_prompt   = CASE
-                   WHEN lease_owner IS DISTINCT FROM %s AND current_prompt IS NOT NULL
-                   THEN coalesce(pending_prompt, current_prompt)
+                   WHEN current_prompt IS NOT NULL
+                        AND (lease_owner IS DISTINCT FROM %s
+                             OR lease_expires_at IS NULL
+                             OR lease_expires_at < now())
+                   THEN CASE
+                       WHEN pending_prompt IS NULL THEN current_prompt
+                       ELSE current_prompt || E'\n\n' || pending_prompt
+                   END
                    ELSE pending_prompt END,
                current_prompt   = CASE
-                   WHEN lease_owner IS DISTINCT FROM %s THEN NULL
+                   WHEN lease_owner IS DISTINCT FROM %s
+                        OR lease_expires_at IS NULL
+                        OR lease_expires_at < now()
+                   THEN NULL
                    ELSE current_prompt END,
                status           = CASE WHEN status = 'dead' THEN 'idle' ELSE status END,
                updated_at       = now()

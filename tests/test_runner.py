@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -300,6 +302,61 @@ class RunnerTest(PgTestCase):
         self.assertEqual(row["status"], "blocked")
         self.assertIn("code 2", row["last_error"])
         self.assertEqual(int(row["turns"]), 1)  # le tour a eu lieu, il a échoué
+        # B6a : un tour en échec ne consomme pas la consigne
+        self.assertEqual(row["pending_prompt"], "tour")
+        self.assertIsNone(row["current_prompt"])
+
+    def test_consigne_survit_a_un_harnais_tue(self):
+        """B6a (variante SIGKILL) : le harnais tué ne fait pas perdre la consigne."""
+        cwd = self._cwd("tue")
+        self.register("tue", "claude", cwd=cwd, prompt="consigne d'un tour tué")
+        env = self.env(AGENT_MESH_TEST_KILL_SELF="1")
+        proc = self.runner("--once", "--agents", "tue", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        row = registry.get(self.db, "tue")
+        self.assertEqual(row["status"], "blocked")
+        self.assertEqual(row["pending_prompt"], "consigne d'un tour tué")
+        self.assertIsNone(row["current_prompt"])
+
+    def test_battement_se_reveille_a_l_echeance_du_bail(self):
+        """B5a : with a long interval, the heartbeat still wakes at the deadline."""
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "delta", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 1},
+        )
+        stop = threading.Event()
+        with mock.patch.object(registry, "renew", side_effect=db_mod.DbError("base absente")):
+            thread = threading.Thread(target=worker._heartbeat, args=(stop,), daemon=True)
+            thread.start()
+            self.wait_for(lambda: worker.lease_lost.is_set(), timeout=5)
+            stop.set()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+
+    def test_terminate_escalade_vers_sigkill(self):
+        """B5b : un harnais qui ignore SIGTERM est tué, pas laissé vivant."""
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"])
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "echo", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 3600},
+        )
+        worker.proc = proc
+        try:
+            debut = time.monotonic()
+            worker.terminate()
+            self.assertIsNotNone(proc.poll(), "le harnais doit être arrêté")
+            self.assertLess(time.monotonic() - debut, 8.0)
+            self.assertLess(proc.returncode, 0)  # tué par un signal (SIGKILL)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
 
 
 if __name__ == "__main__":

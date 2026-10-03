@@ -7,6 +7,7 @@ AGENT_MESH_TEST_SLEEP (secondes de sommeil) et AGENT_MESH_TEST_EXIT (code).
 """
 import json
 import os
+import signal
 import sys
 import time
 
@@ -19,6 +20,8 @@ def main() -> int:
             fh.write(json.dumps({"harness": "claude", "argv": args}) + "\n")
     if os.environ.get("AGENT_MESH_TEST_SLEEP"):
         time.sleep(float(os.environ["AGENT_MESH_TEST_SLEEP"]))
+    if os.environ.get("AGENT_MESH_TEST_KILL_SELF"):
+        os.kill(os.getpid(), signal.SIGKILL)
     session = "claude-sess-1"
     if "--resume" in args:
         session = args[args.index("--resume") + 1]

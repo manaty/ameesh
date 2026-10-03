@@ -77,8 +77,11 @@ python3 -m venv ~/.local/share/agent-mesh/venv
 ln -s ~/.local/share/agent-mesh/venv/bin/agent-mesh ~/.local/bin/agent-mesh
 ln -s ~/.local/share/agent-mesh/venv/bin/agent-runner ~/.local/bin/agent-runner
 
-python3 -m agent_mesh.mesh_cli migrate     # 4 migrations
+python3 -m agent_mesh.mesh_cli migrate     # migrations versionnées, idempotentes
 agent-mesh doctor --notify-test
+#   → une migration de mise à niveau rétro-remplit le ledger des approbations
+#     déjà consommées (0007) ; une clé enregistrée avant 0005 devient « agent »
+#     (moindre privilège) et se ré-enregistre explicitement --role owner
 agent-mail whoami                           # les alias v0 sont partagés
 agent-mesh import-v0 --dry-run              # ce qui serait importé, sans rien toucher
 ```

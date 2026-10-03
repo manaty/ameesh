@@ -2,6 +2,7 @@
 """Faux harnais "codex" du banc de test — n'appelle jamais Codex CLI."""
 import json
 import os
+import signal
 import sys
 import time
 
@@ -14,6 +15,8 @@ def main() -> int:
             fh.write(json.dumps({"harness": "codex", "argv": args}) + "\n")
     if os.environ.get("AGENT_MESH_TEST_SLEEP"):
         time.sleep(float(os.environ["AGENT_MESH_TEST_SLEEP"]))
+    if os.environ.get("AGENT_MESH_TEST_KILL_SELF"):
+        os.kill(os.getpid(), signal.SIGKILL)
     thread = "codex-thread-1"
     if "resume" in args:
         thread = args[args.index("resume") + 1]
