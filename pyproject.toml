@@ -18,7 +18,7 @@ psycopg = ["psycopg[binary]>=3.1"]
 [project.scripts]
 agent-mail = "agent_mesh.cli:main"
 agent-runner = "agent_mesh.runner:main"
-agent-mesh = "agent_mesh.cli:main"
+agent-mesh = "agent_mesh.mesh_cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
