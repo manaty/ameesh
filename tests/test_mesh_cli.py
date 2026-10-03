@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import unittest
 
 from agent_mesh import authority, mail, migrations, registry, signing
@@ -40,9 +41,12 @@ class MeshCliTest(PgTestCase):
         self.assertIn("NON LUS", proc.stdout)
         lignes = [l for l in proc.stdout.splitlines() if l.startswith(AGENT)]
         self.assertEqual(len(lignes), 1)
-        colonnes = lignes[0].split()
-        self.assertEqual(colonnes[-1], "0s")  # vu récemment
-        self.assertIn("1", colonnes)          # un non lu
+        # La fraîcheur est un âge, pas une valeur figée : sous charge, « 0s »
+        # peut être « 2s » (suite complète, 279 s). On borne, on ne fige pas.
+        # Le compte de non-lus est vérifié plus haut sur la sortie JSON.
+        age = re.search(r"il y a\s+(\d+)s", lignes[0])
+        self.assertIsNotNone(age, lignes[0])
+        self.assertLessEqual(int(age.group(1)), 60)
         ligne_owner = [l for l in proc.stdout.splitlines() if l.startswith(OWNER)][0]
         self.assertIn("owner", ligne_owner)  # clé propriétaire enregistrée
 
@@ -133,6 +137,24 @@ class MeshCliTest(PgTestCase):
         proc = self.mesh("verify", "--action", "merge", "--hash", artifact)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("consommée", proc.stderr)
+
+    def test_approve_sans_identite_refuse(self):
+        """Signer une approbation ne se déduit pas du dossier (incident mesh-design)."""
+        authority.register_key(self.db, OWNER, self.public, role="owner")
+        artifact = authority.hash_artifact("diff sans identité")
+        env = self.env()
+        env.pop("AGENT_MAIL_NAME", None)
+        proc = self.mesh("approve", "--key", self.key_path, "--action", "merge",
+                         "--hash", artifact, env=env)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("non lié", proc.stderr)
+        self.assertEqual(authority.list_approvals(self.db), [])
+
+        # identité explicite : l'approbation passe, sans --as
+        proc = self.mesh("approve", "--key", self.key_path, "--action", "merge",
+                         "--hash", artifact, env=self.env(AGENT_MAIL_NAME=OWNER))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(authority.list_approvals(self.db)), 1)
 
     def test_approve_refuse_avec_cle_d_agent(self):
         """Une clé d'agent ne peut pas approuver, même enregistrée."""

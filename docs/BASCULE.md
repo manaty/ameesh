@@ -170,6 +170,14 @@ Choisir un agent dont la session peut être relancée sans risque (par exemple
    basculé. Vérifier le JSON (le test `tests/test_cli_compat.py` garantit
    l'égalité pour un message non signé).
 
+   **Identité** : en v1, le dossier ne donne plus d'identité. Un agent lancé par
+   `agent-runner` reçoit `AGENT_MAIL_NAME`, `AGENT_MESH_RUNNER_ID` et
+   `AGENT_MESH_LEASE_EPOCH` — le hook ne livre que si le bail est vivant et
+   détenu par ce runner. Une session lancée à la main (orchestrateur, revue)
+   doit poser `AGENT_MAIL_NAME=<nom>` dans l'environnement de ses hooks ; sinon
+   elle ne consomme rien (c'est voulu : un `cd` dans un worktree étranger ne
+   doit pas voler son courrier). `send` accepte alors `--from NOM`.
+
 **Retour arrière (par agent) :**
 
 ```bash

@@ -246,7 +246,14 @@ def cmd_approve(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
         seed = signing.read_private(os.path.expanduser(args.key))
-        approver = args.as_agent or identity.resolve_name(os.getcwd(), cfg)
+        # Signer une approbation est un acte d'autorité : l'approbateur ne se
+        # déduit pas du dossier. Identité liée, ou --as explicite.
+        binding = identity.resolve_binding(cfg, db)
+        approver = args.as_agent or (binding.name if binding.ok else "")
+        if not approver:
+            print("approbateur non lié : posez AGENT_MAIL_NAME (le runner le fait) "
+                  "ou passez --as NOM", file=sys.stderr)
+            return 2
         ttl = authority.parse_ttl(args.expires)
         meta = json.loads(args.meta) if args.meta else {}
         built = authority.create_approval(

@@ -139,6 +139,35 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
     return rows[0] if rows else None
 
 
+def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]:
+    """Le bail est-il vivant et détenu par ce runner à cet epoch ?
+
+    C'est ce qui lie une identité agent-mail à un bail (et non à un dossier) :
+    une session dont le bail a expiré ou a changé de main ne peut plus
+    consommer le courrier de l'agent.
+    """
+    rows = db.query(
+        """
+        SELECT lease_owner, lease_epoch, status,
+               (lease_expires_at IS NOT NULL AND lease_expires_at > now()) AS live
+          FROM agent_registry WHERE name = %s
+        """,
+        (name,),
+    )
+    if not rows:
+        return False, "agent %s inconnu du registre" % name
+    row = rows[0]
+    if row.get("status") == "stopped":
+        return False, "agent arrêté"
+    if (row.get("lease_owner") or "") != owner:
+        return False, "bail détenu par %s" % (row.get("lease_owner") or "personne")
+    if int(row.get("lease_epoch") or 0) != int(epoch):
+        return False, "epoch %s au registre, %s dans la session" % (row.get("lease_epoch"), epoch)
+    if not row.get("live"):
+        return False, "bail expiré"
+    return True, ""
+
+
 def renew(db: Db, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
     """Prolonge le bail. None si on ne le détient plus (fencing par epoch)."""
     rows = db.query(

@@ -61,7 +61,7 @@ Repo-local wrappers: `bin/agent-mail`, `bin/agent-runner`, `bin/agent-mesh`
 agent-mail send <dest> <texte…> [--from NOM]   # dest = nom ou "all"
 agent-mail list                                # nom, outil, âge, non lus, dossier, hôte, bail
 agent-mail inbox [NOM]                         # non lus, sans les marquer lus
-agent-mail whoami [--cwd DIR]                  # identité résolue (alias v0 partagés)
+agent-mail whoami                              # identité liée (nom + bail), jamais le dossier
 agent-mail alias <NOM> <DOSSIER> [CHANTIER]
 agent-mail status "<travail en cours>"
 agent-mail hook <claude|codex|deepseek>        # JSON identique à la v0
@@ -113,7 +113,7 @@ scripts/test.sh                      # starts the container, runs the suite twic
 scripts/test.sh tests.test_runner    # one module
 ```
 
-140 tests against the local container, run twice (`psql`, then `psycopg` with
+147 tests against the local container, run twice (`psql`, then `psycopg` with
 `cryptography`): migrations and immutability, mailbox and LISTEN/NOTIFY round
 trips, lease races on 2 and 4 concurrent connections, **two runner processes
 competing for the same lease**, lease expiry takeover, fencing of a stale
@@ -129,9 +129,11 @@ heartbeat stopping the harness on DB failure, durable `current_prompt`, and the
 hook marking mail delivered only after a successful write, heartbeat waking at
 the lease deadline, SIGTERM→SIGKILL escalation, prompt restored after a failed
 or killed turn, the consumed-nonce ledger backfilled on upgrade (0007), and a
-statement timeout (server and client) so a hanging renewal cannot stall the
-lease heartbeat, process-group termination with SIGKILL on lease loss, and the
-merge of two prompts when a turn is restored.
+statement timeout (server and client) and a renewal call abandoned at the lease
+deadline, process-group termination with SIGKILL on lease loss (even after the
+parent dies), the merge of two prompts when a turn is restored, and a
+lease-bound agent-mail identity that is never derived from the working
+directory.
 
 ## Layout
 

@@ -319,6 +319,38 @@ class RunnerTest(PgTestCase):
         self.assertEqual(row["pending_prompt"], "consigne d'un tour tué")
         self.assertIsNone(row["current_prompt"])
 
+    def test_renouvellement_borne_par_l_echeance_meme_si_l_appel_bloque(self):
+        """Sonde codex3 : un renew qui pend ne dépasse pas l'échéance du bail."""
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "golf", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 1},
+        )
+
+        def bloque(*_args, **_kwargs):
+            time.sleep(30)
+            return time.time() + 300
+
+        debut = time.monotonic()
+        with mock.patch.object(registry, "renew", side_effect=bloque):
+            self.assertFalse(worker.renew())
+        self.assertLess(time.monotonic() - debut, 3.0)
+        self.assertTrue(worker.lease_lost.is_set())
+
+    def test_le_harnais_recoit_son_bail_dans_l_environnement(self):
+        """L'identité du harnais est liée au bail : nom, runner et epoch."""
+        cwd = self._cwd("lie")
+        self.register("lie", "claude", cwd=cwd, prompt="tour lié")
+        proc = self.runner("--once", "--agents", "lie")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        env = self.turns()[0]["env"]
+        self.assertEqual(env["AGENT_MAIL_NAME"], "lie")
+        self.assertTrue(env["AGENT_MESH_RUNNER_ID"])
+        # le tour tourne sous le premier bail ; le rendre en sortant incrémente
+        # l'epoch en base, donc on compare au bail du moment, pas à l'après.
+        self.assertEqual(int(env["AGENT_MESH_LEASE_EPOCH"]), 1)
+
     def test_battement_se_reveille_a_l_echeance_du_bail(self):
         """B5a : with a long interval, the heartbeat still wakes at the deadline."""
         runner = Runner(self.cfg, self.db, once=True)
@@ -381,11 +413,52 @@ class RunnerTest(PgTestCase):
             {"lease_epoch": 1, "lease_expires_ts": time.time() + 3600},
         )
         worker.proc = parent
+        worker.pgid = parent.pid
         try:
             worker.terminate(grace=0)
             self.assertIsNotNone(parent.poll())
             self.wait_for(
                 lambda: not os.path.exists("/proc/%d" % enfant_pid), timeout=5)
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+            try:
+                os.kill(enfant_pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def test_terminate_tue_un_descendant_qui_ignore_sigterm(self):
+        """Sonde codex3 B5b : le parent meurt sur SIGTERM, l'enfant l'ignore.
+
+        L'escalade ne doit pas s'arrêter à la mort du parent.
+        """
+        pidfile = os.path.join(self.tmp, "enfant-recalcitrant.pid")
+        parent = subprocess.Popen(
+            [sys.executable, "-c",
+             "import os, signal, subprocess, sys, time;"
+             "child = subprocess.Popen([sys.executable, '-c',"
+             " 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)']);"
+             "open(sys.argv[1], 'w').write(str(child.pid));"
+             "time.sleep(60)", pidfile],
+            start_new_session=True,
+        )
+        for _ in range(50):
+            if os.path.exists(pidfile):
+                break
+            time.sleep(0.1)
+        enfant_pid = int(open(pidfile, encoding="utf-8").read())
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "hotel", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 3600},
+        )
+        worker.proc = parent
+        worker.pgid = parent.pid
+        try:
+            worker.terminate(grace=1.0)
+            self.assertIsNotNone(parent.poll())
+            self.wait_for(lambda: not os.path.exists("/proc/%d" % enfant_pid), timeout=5)
         finally:
             if parent.poll() is None:
                 parent.kill()
@@ -406,6 +479,7 @@ class RunnerTest(PgTestCase):
             {"lease_epoch": 1, "lease_expires_ts": time.time() + 3600},
         )
         worker.proc = proc
+        worker.pgid = proc.pid
         try:
             debut = time.monotonic()
             worker.terminate()

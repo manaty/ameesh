@@ -110,6 +110,12 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   re-`claim` (nouvel epoch) pour continuer ; `end_turn` reste fencé par
   `lease_owner` + `lease_epoch`, pour qu'un tour commencé sous bail valide
   puisse être enregistré.
+* **Renouvellement borné par l'échéance, pas par un délai fixe** — l'appel
+  `renew` tourne dans un fil et est abandonné au plus tard à `lease_deadline` :
+  même si la base ne répond plus du tout (réponse retenue par un proxy, par
+  exemple), le battement conclut à la perte du bail et arrête le harnais à
+  l'heure où un remplaçant peut réclamer l'agent. Le `statement_timeout` reste
+  la borne serveur, le délai client `psql` la borne du sous-processus.
 * **Requêtes bornées** — chaque connexion pose un `statement_timeout`
   (`AGENT_MESH_STATEMENT_TIMEOUT_MS`, défaut 30 s) : un renouvellement de bail
   qui pend (verrou, requête lente) est annulé par le serveur ; le pilote `psql`
@@ -123,11 +129,14 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   dort **jamais au-delà de l'échéance** (le réveil est borné par
   `lease_deadline`), même si l'intervalle nominal est plus long.
 * **Arrêt du harnais** — `terminate` signale le **groupe de processus** (le
-  harnais est lancé dans sa propre session) : ses descendants ne survivent pas.
-  SIGTERM, 3 secondes de grâce pour un arrêt propre, puis SIGKILL — sauf à la
-  perte du bail, où la grâce est nulle : le remplaçant peut réclamer l'agent
-  immédiatement, l'ancien enfant ne doit plus tourner. `terminate` attend que
-  le noyau ait pris le SIGKILL, pour que « arrêté » veuille dire arrêté.
+  harnais est lancé dans sa propre session, le pgid est mémorisé au lancement) :
+  ses descendants ne survivent pas. SIGTERM, 3 secondes de grâce pour un arrêt
+  propre, puis SIGKILL — sauf à la perte du bail, où la grâce est nulle : le
+  remplaçant peut réclamer l'agent immédiatement, l'ancien enfant ne doit plus
+  tourner. L'escalade ne dépend pas de la survie du **parent** : si le parent
+  meurt sur SIGTERM en laissant un descendant qui l'ignore, le groupe restant
+  est tué quand même. `terminate` attend que le noyau ait pris le SIGKILL,
+  pour que « arrêté » veuille dire arrêté.
 * **Consigne durable (R5)** — `pick` ne vide plus `pending_prompt` : la
   consigne est *déplacée* dans `current_prompt` quand le tour démarre, effacée
   par `end_turn` **uniquement si le tour a abouti**, et restaurée en attente
@@ -216,6 +225,18 @@ Les hooks produisent le **même JSON** que la v0 (y compris la décision `Stop`
 et le plafond de 3 relances, compté localement dans
 `~/.local/state/agent-mesh/hooks/<nom>.stops`) : un test compare la sortie du
 script v0 et celle de la v1 pour les quatre événements.
+
+**Identité liée au bail, jamais au dossier (incident mesh-design du 2026-10-09).**
+Une session n'a d'identité que si `AGENT_MAIL_NAME` est posée ; si
+`AGENT_MESH_RUNNER_ID` et `AGENT_MESH_LEASE_EPOCH` le sont aussi (c'est le
+runner qui les pose pour le harnais qu'il lance), le bail doit être **vivant et
+détenu par ce runner à cet epoch** — sinon le hook ne consomme rien et rien
+n'est livré. Sans ces variables, une session qui lit dans le worktree d'un
+autre agent ne prend plus son courrier : le dossier ne donne aucune identité,
+seulement un nom d'affichage pour la barre d'état et `whoami --cwd`
+(explicitement marqué « diagnostic, non autoritaire »). `send` exige alors
+`--from`, `status` et `whoami` refusent, et `inbox <nom>` reste une lecture
+sans consommation.
 
 **Hooks : écrire d'abord, marquer ensuite.** Le JSON est écrit sur stdout et
 vidé (`flush`) *avant* de marquer les messages remis ; si le harnais a fermé son

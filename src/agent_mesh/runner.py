@@ -72,6 +72,7 @@ class AgentWorker(threading.Thread):
         self.state_dir = self.cfg.agent_dir(self.name)
         self.renew_failures = 0
         self.lease_deadline = float(lease.get("lease_expires_ts") or 0.0)
+        self.pgid: int | None = None  # groupe du harnais en cours
 
     # -- état local --------------------------------------------------------
     def _path(self, name: str) -> str:
@@ -93,18 +94,51 @@ class AgentWorker(threading.Thread):
             pass
 
     # -- bail --------------------------------------------------------------
+    def call_budget(self) -> float:
+        """Temps qu'on accepte d'attendre une réponse avant de conclure.
+
+        Borné par l'échéance du bail : un renouvellement qui pend ne doit pas
+        nous faire dépasser le moment où un remplaçant peut réclamer l'agent.
+        """
+        if self.lease_deadline > 0:
+            return max(0.5, self.lease_deadline - time.time() + 0.2)
+        return max(3.0, self.runner.lease_ttl / 3.0)
+
+    def _renew_call(self) -> tuple[bool, float | None, Exception | None]:
+        """`registry.renew` avec une borne dure, même si l'appel se bloque."""
+        result: dict = {}
+
+        def call() -> None:
+            try:
+                result["expires"] = registry.renew(
+                    self.db, self.name, self.runner.runner_id, self.epoch,
+                    self.runner.lease_ttl)
+            except Exception as exc:  # DbError, mais aussi tout imprévu
+                result["error"] = exc
+
+        thread = threading.Thread(target=call, daemon=True)
+        thread.start()
+        thread.join(timeout=self.call_budget())
+        if thread.is_alive():
+            return False, None, None
+        return True, result.get("expires"), result.get("error")
+
     def renew(self) -> bool:
         """Prolonge le bail. Une panne de base ne laisse pas le harnais tourner
         sans bail : après quelques échecs ou à l'échéance connue, on l'arrête."""
         if self.lease_lost.is_set():
             return False
-        try:
-            expires = registry.renew(self.db, self.name, self.runner.runner_id, self.epoch,
-                                     self.runner.lease_ttl)
-        except db_mod.DbError as exc:
+        answered, expires, error = self._renew_call()
+        if not answered:
+            log("[%s] renouvellement sans réponse au-delà du bail : arrêt du harnais"
+                % self.name)
+            self.lease_lost.set()
+            self.terminate(grace=0)
+            return False
+        if error is not None:
             self.renew_failures += 1
             log("[%s] battement : base injoignable (%s) — échec %d/%d"
-                % (self.name, exc, self.renew_failures, self.MAX_RENEW_FAILURES))
+                % (self.name, error, self.renew_failures, self.MAX_RENEW_FAILURES))
             if self.renew_failures >= self.MAX_RENEW_FAILURES or time.time() >= self.lease_deadline:
                 log("[%s] bail considéré perdu (base injoignable) : arrêt du harnais" % self.name)
                 self.lease_lost.set()
@@ -131,14 +165,19 @@ class AgentWorker(threading.Thread):
     #: délai laissé au harnais entre SIGTERM et SIGKILL
     TERMINATE_GRACE = 3.0
 
-    @staticmethod
-    def _signal_tree(proc: subprocess.Popen, sig: int) -> None:
-        """Signale le groupe du harnais (sinon ses descendants survivent)."""
+    def _group(self, proc: subprocess.Popen) -> int | None:
+        """Le groupe du harnais : gardé au lancement, sinon retrouvé par le pid."""
+        if self.pgid:
+            return self.pgid
         try:
             pgid = os.getpgid(proc.pid)
         except OSError:
-            pgid = None
-        if pgid is not None and pgid != os.getpgid(0):
+            return None
+        return pgid if pgid != os.getpgid(0) else None
+
+    @staticmethod
+    def _signal_group(pgid: int | None, proc: subprocess.Popen, sig: int) -> None:
+        if pgid is not None:
             try:
                 os.killpg(pgid, sig)
                 return
@@ -149,34 +188,51 @@ class AgentWorker(threading.Thread):
         except OSError:
             pass
 
+    @staticmethod
+    def _group_alive(pgid: int | None) -> bool:
+        if pgid is None:
+            return False
+        try:
+            os.killpg(pgid, 0)  # signal 0 : le groupe existe-t-il encore ?
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
     def terminate(self, grace: float | None = None) -> None:
-        """Arrête le harnais et ses descendants : SIGTERM, puis SIGKILL.
+        """Arrête le harnais et tout son groupe : SIGTERM, puis SIGKILL.
 
         `grace=0` (perte du bail) tue tout de suite : pendant une grâce, le
         remplaçant peut réclamer l'agent alors que l'ancien enfant vit encore.
-        Le groupe de processus est signalé, pas seulement le parent : un
-        harnais qui lance un `sleep` ne doit pas le laisser derrière lui.
+
+        L'escalade ne dépend pas de la survie du **parent** : un harnais peut
+        mourir sur SIGTERM en laissant un descendant qui l'ignore, et le groupe
+        doit alors être tué (sonde codex3 B5b). Le groupe est mémorisé au
+        lancement, donc il reste tuable même après la disparition du parent.
         """
         with self.lock:
             proc = self.proc
-        if proc is None or proc.poll() is not None:
+        if proc is None:
             return
-        self._signal_tree(proc, signal.SIGTERM)
-        delai = self.TERMINATE_GRACE if grace is None else grace
-        deadline = time.monotonic() + max(0.0, delai)
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                return
-            time.sleep(0.05)
-        log("[%s] harnais toujours vivant : SIGKILL du groupe" % self.name)
-        self._signal_tree(proc, signal.SIGKILL)
+        pgid = self._group(proc)
+        vivant = proc.poll() is None
+        if vivant:
+            self._signal_group(pgid, proc, signal.SIGTERM)
+            deadline = time.monotonic() + max(0.0, self.TERMINATE_GRACE if grace is None else grace)
+            while time.monotonic() < deadline and proc.poll() is None:
+                time.sleep(0.05)
+        if not self._group_alive(pgid):
+            return
+        log("[%s] le groupe du harnais survit : SIGKILL" % self.name)
+        self._signal_group(pgid, proc, signal.SIGKILL)
         # SIGKILL est asynchrone : on attend que le noyau l'ait pris en compte,
-        # pour que « terminate est revenu » veuille dire « le harnais est mort ».
+        # pour que « terminate est revenu » veuille dire « le groupe est mort ».
         fin = time.monotonic() + 2.0
-        while time.monotonic() < fin and proc.poll() is None:
+        while time.monotonic() < fin and self._group_alive(pgid):
             time.sleep(0.02)
-        if proc.poll() is None:
-            log("[%s] harnais toujours vivant après SIGKILL (état noyau ?)" % self.name)
+        if self._group_alive(pgid):
+            log("[%s] groupe toujours vivant après SIGKILL (état noyau ?)" % self.name)
 
     def wait_timeout(self, cap: float) -> float:
         """Attente bornée par l'échéance du bail : on ne dort pas au-delà (B5a)."""
@@ -273,6 +329,9 @@ class AgentWorker(threading.Thread):
             "AGENT_MAIL_CONFIG": self.cfg.config_dir,
             "AGENT_MESH_HOST": self.cfg.host,
             "AGENT_MESH_RUNNER_ID": self.runner.runner_id,
+            # lie l'identité agent-mail au bail : sans ce triplet, le hook ne
+            # consomme rien (et le dossier ne donne jamais d'identité).
+            "AGENT_MESH_LEASE_EPOCH": str(self.epoch),
         })
         events_path = self._path("events.jsonl")
         stderr_path = self._path("stderr.log")
@@ -293,6 +352,7 @@ class AgentWorker(threading.Thread):
                 )
             with self.lock:
                 self.proc = proc
+                self.pgid = proc.pid  # start_new_session : le groupe porte son pid
             log("[%s] tour %s : %s" % (self.name, label, " ".join(argv[:6]) + " …"))
             with open(events_path, "a", encoding="utf-8") as events:
                 for line in proc.stdout or ():
@@ -322,6 +382,7 @@ class AgentWorker(threading.Thread):
             with self.lock:
                 running = self.proc
                 self.proc = None
+                self.pgid = None
             if running is not None and running.poll() is None:
                 running.terminate()
 

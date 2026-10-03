@@ -190,7 +190,13 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
               "[--sign --key FICHIER] [--expires 24h]", file=sys.stderr)
         return 2
     dest, text = args[0], " ".join(args[1:]).strip()
-    sender = sender or identity.resolve_name(os.getcwd(), cfg)
+    if not sender:
+        binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
+        if not binding.ok:
+            print("expéditeur non lié : posez AGENT_MAIL_NAME (le runner le fait) "
+                  "ou passez --from NOM", file=sys.stderr)
+            return 2
+        sender = binding.name
     if not NAME_RE.match(sender) or not text:
         print("expéditeur ou texte invalide", file=sys.stderr)
         return 2
@@ -241,7 +247,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
 
 
 def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
-    name = rest[0] if rest else identity.resolve_name(os.getcwd(), cfg)
+    if rest:
+        name = rest[0]  # lire la boîte d'un autre n'accorde rien et ne consomme rien
+    else:
+        binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
+        if not binding.ok:
+            print("identité non liée : %s" % (binding.reason or "AGENT_MAIL_NAME absente"),
+                  file=sys.stderr)
+            return 1
+        name = binding.name
     msgs = bk.unread(name)
     verdicts = verdicts_for(bk, msgs)
     for msg in msgs:
@@ -276,7 +290,12 @@ def cmd_list(bk) -> int:
 
 
 def cmd_status(bk, cfg: Config, rest: list[str]) -> int:
-    name = identity.resolve_name(os.getcwd(), cfg)
+    binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
+    if not binding.ok:
+        print("identité non liée : %s" % (binding.reason or "AGENT_MAIL_NAME absente"),
+              file=sys.stderr)
+        return 1
+    name = binding.name
     text = " ".join(rest).strip()[:80]
     bk.set_status(name, text)
     print("[%s/%s] %s" % (identity.chantier_of(name, cfg) or "-", name, text))
@@ -299,7 +318,14 @@ def cmd_statusline(cfg: Config) -> int:
     except ValueError:
         data = {}
     cwd = (data.get("workspace") or {}).get("current_dir") or data.get("cwd") or os.getcwd()
-    name = identity.resolve_name(cwd, cfg)
+    try:
+        _bk, _warn = backend_mod.open_backend(cfg)
+    except db_mod.DbError:
+        _bk = backend_mod.FileBackend(cfg)
+    # Affichage seulement : l'identité liée si elle existe, sinon le dossier
+    # (diagnostic). Rien n'est consommé, aucune autorité n'est accordée.
+    binding = identity.resolve_binding(cfg, _bk.db if _bk.kind == "pg" else None)
+    name = binding.name if binding.ok else identity.legacy_name(cwd, cfg)
     home = os.path.expanduser("~")
     short = "~" + cwd[len(home):] if cwd.startswith(home) else cwd
     try:
@@ -343,11 +369,21 @@ def cmd_hook(cfg: Config, tool: str) -> int:
     except ValueError:
         return 0
     event = data.get("hook_event_name") or ""
-    name = identity.resolve_name(data.get("cwd"), cfg)
     try:
         bk, _warning = backend_mod.open_backend(cfg)
     except Exception:
         bk = backend_mod.FileBackend(cfg)
+    # L'identité vient de l'environnement (le runner la pose), jamais du dossier :
+    # lire la doc d'un autre agent dans son worktree ne consomme plus son courrier.
+    binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
+    if not binding.ok:
+        if binding.name:
+            # Identité annoncée mais bail invalide : on le dit sur stderr, et
+            # on ne touche à rien.
+            print("agent-mail : identité %s non liée (%s) — courrier laissé en place"
+                  % (binding.name, binding.reason), file=sys.stderr)
+        return 0
+    name = binding.name
     try:
         bk.register(name, tool, data.get("cwd"), data.get("session_id"))
         set_title(cfg, bk, name)
@@ -485,8 +521,18 @@ def main(argv: list[str] | None = None) -> int:
         if command == "list":
             return cmd_list(bk)
         if command == "whoami":
-            cwd = rest[1] if len(rest) > 1 and rest[0] == "--cwd" else os.getcwd()
-            print(identity.resolve_name(cwd, cfg))
+            if len(rest) > 1 and rest[0] == "--cwd":
+                # Diagnostic : le dossier ne donne aucune identité.
+                print("legacy %s (diagnostic, non autoritaire)"
+                      % identity.legacy_name(rest[1], cfg))
+                return 0
+            binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
+            if not binding.ok:
+                print("identité non liée : %s" % (binding.reason or "AGENT_MAIL_NAME absente"),
+                      file=sys.stderr)
+                return 1
+            print(binding.name if binding.source == "explicit"
+                  else "%s [%s]" % (binding.name, binding.source))
             return 0
         if command == "status":
             return cmd_status(bk, cfg, rest)

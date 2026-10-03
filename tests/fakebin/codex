@@ -12,7 +12,12 @@ def main() -> int:
     log = os.environ.get("AGENT_MESH_TEST_LOG")
     if log:
         with open(log, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"harness": "codex", "argv": args}) + "\n")
+            fh.write(json.dumps({
+                "harness": "codex", "argv": args,
+                "env": {k: os.environ.get(k) for k in (
+                    "AGENT_MAIL_NAME", "AGENT_MESH_RUNNER_ID", "AGENT_MESH_LEASE_EPOCH",
+                    "AGENT_MESH_HOST", "AGENT_MESH_SCHEMA")},
+            }) + "\n")
     if os.environ.get("AGENT_MESH_TEST_SLEEP"):
         time.sleep(float(os.environ["AGENT_MESH_TEST_SLEEP"]))
     if os.environ.get("AGENT_MESH_TEST_KILL_SELF"):

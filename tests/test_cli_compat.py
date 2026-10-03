@@ -99,6 +99,85 @@ class CliCompatTest(PgTestCase):
                 self.assertEqual(proc.returncode, 0)
                 self.assertEqual(proc.stdout, "")
 
+    def test_hook_ne_consomme_rien_depuis_un_cwd_etranger(self):
+        """Incident mesh-design : lire dans le worktree d'un autre ne prend pas son courrier.
+
+        Le dossier est aliasé vers « india » et contient un message non lu :
+        sans identité explicite, le hook ne doit ni le livrer ni le marquer remis.
+        """
+        name = "india"
+        dossier = os.path.join(self.tmp, "worktree-doc")
+        os.makedirs(dossier, exist_ok=True)
+        self.cli("alias", name, dossier, "nexlink")
+        self._seed(name, "beta", "courrier de india")
+        payload = json.dumps({"hook_event_name": "SessionStart", "cwd": dossier})
+        env = self.env()
+        env.pop("AGENT_MAIL_NAME", None)  # aucune identité posée
+        proc = self.cli("hook", "claude", env=env, stdin=payload)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+        restant = self.db.query(
+            "SELECT count(*)::int AS n FROM agent_mailbox "
+            "WHERE recipient = %s AND delivered_at IS NULL", (name,))[0]["n"]
+        self.assertEqual(restant, 1, "le message ne doit pas être consommé")
+
+        # identité explicite : le même hook livre
+        proc = self.cli("hook", "claude", env=self.env(AGENT_MAIL_NAME=name), stdin=payload)
+        self.assertIn("courrier de india", proc.stdout)
+
+    def test_hook_identite_liee_au_bail(self):
+        """Identité liée : il faut le nom, le runner ET l'epoch du bail vivant."""
+        import dataclasses
+        from agent_mesh import registry
+        name = "juliette"
+        registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
+        lease = registry.claim(self.db, name, "runner-tests", 60)
+        epoch = int(lease["lease_epoch"])
+        self._seed(name, "beta", "courrier lié")
+        payload = json.dumps({"hook_event_name": "SessionStart", "cwd": self.tmp})
+
+        lie = self.env(AGENT_MAIL_NAME=name, AGENT_MESH_RUNNER_ID="runner-tests",
+                       AGENT_MESH_LEASE_EPOCH=str(epoch))
+        proc = self.cli("hook", "claude", env=lie, stdin=payload)
+        self.assertIn("courrier lié", proc.stdout)
+
+        # mauvais epoch : rien n'est consommé et rien n'est livré
+        self._seed(name, "beta", "courrier suivant")
+        perime = self.env(AGENT_MAIL_NAME=name, AGENT_MESH_RUNNER_ID="runner-tests",
+                          AGENT_MESH_LEASE_EPOCH=str(epoch + 1))
+        proc = self.cli("hook", "claude", env=perime, stdin=payload)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("non liée", proc.stderr)
+        restant = self.db.query(
+            "SELECT count(*)::int AS n FROM agent_mailbox "
+            "WHERE recipient = %s AND delivered_at IS NULL", (name,))[0]["n"]
+        self.assertEqual(restant, 1, "seul le premier message a été remis")
+
+        # autre runner : refusé aussi
+        autre = self.env(AGENT_MAIL_NAME=name, AGENT_MESH_RUNNER_ID="runner-voisin",
+                         AGENT_MESH_LEASE_EPOCH=str(epoch))
+        self.assertEqual(self.cli("hook", "claude", env=autre, stdin=payload).stdout, "")
+
+    def test_whoami_et_send_sans_identite(self):
+        env = self.env()
+        env.pop("AGENT_MAIL_NAME", None)
+        proc = self.cli("whoami", env=env)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("identité non liée", proc.stderr)
+
+        proc = self.cli("send", "beta", "sans expéditeur", env=env)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--from", proc.stderr)
+
+        proc = self.cli("send", "beta", "avec expéditeur", "--from", "gamma", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "déposé pour : beta")
+
+        # diagnostic de dossier : explicitement non autoritaire
+        proc = self.cli("whoami", "--cwd", self.tmp, env=env)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("non autoritaire", proc.stdout)
+
     def test_hook_ne_consomme_pas_si_l_ecriture_echoue(self):
         """Sonde codex3 (7) : un harnais qui ferme son entrée ne perd pas le message."""
         name = "kilo"
@@ -162,7 +241,10 @@ class CliCompatTest(PgTestCase):
         with open(os.path.join(self.conf, "aliases.tsv"), encoding="utf-8") as fh:
             self.assertIn("deepseek7\t%s\tnexlink" % os.path.realpath(dossier), fh.read())
 
+        # le dossier ne donne plus d'identité : diagnostic explicitement non autoritaire
         proc = self.cli("whoami", "--cwd", dossier)
+        self.assertEqual(proc.stdout.strip(), "legacy deepseek7 (diagnostic, non autoritaire)")
+        proc = self.cli("whoami", env=self.env(AGENT_MAIL_NAME="deepseek7"))
         self.assertEqual(proc.stdout.strip(), "deepseek7")
 
         proc = self.cli("status", "banc v1", env=self.env(AGENT_MAIL_NAME="deepseek7"))

@@ -1,18 +1,50 @@
-"""Identité d'une session : mêmes règles que agent-mail v0.
+"""Identité d'une session : explicite, et liée au bail (jamais déduite du cwd).
 
-`$AGENT_MAIL_NAME`, sinon le plus long préfixe d'alias qui contient le dossier,
-sinon le nom du dossier assaini. Les alias sont partagés avec la v0
-(`~/.config/agent-mail/aliases.tsv`), lus et écrits de façon atomique.
+Une session a une identité si, et seulement si :
+
+1. `AGENT_MAIL_NAME` est posée (le runner la pose pour le harnais qu'il lance) ;
+2. si `AGENT_MESH_RUNNER_ID` et `AGENT_MESH_LEASE_EPOCH` sont aussi posées,
+   le bail correspondant doit être **vivant et détenu par ce runner** : c'est
+   l'identité *liée au bail*, qui empêche une session périmée ou une autre
+   machine de consommer le courrier ;
+3. sinon, c'est une identité *explicite* (session hors runner, repli fichier).
+
+Le dossier courant ne donne **jamais** d'identité : lire la documentation d'un
+autre agent dans son worktree ne doit pas consommer son courrier (incident
+mesh-design du 2026-10-09). Les alias restent, pour ce qu'ils sont : une
+convention d'affichage (chantier, barre d'état, diagnostic).
 """
 from __future__ import annotations
 
 import os
 import re
 import tempfile
+from dataclasses import dataclass
 
 from .config import NAME_RE, Config
 
 CHANTIER_MAX = 64
+
+
+@dataclass(frozen=True)
+class Binding:
+    """L'identité d'une session, et d'où elle vient."""
+
+    name: str = ""
+    source: str = "none"      # runner | explicit | none
+    runner_id: str = ""
+    epoch: int = 0
+    ok: bool = False
+    reason: str = ""
+
+    @property
+    def bound_to_lease(self) -> bool:
+        return self.source == "runner" and self.ok
+
+    def describe(self) -> str:
+        if self.ok:
+            return "%s (%s)" % (self.name, self.source)
+        return "non lié" + (" : %s" % self.reason if self.reason else "")
 
 
 def aliases(cfg: Config) -> list[tuple[str, str, str]]:
@@ -33,16 +65,42 @@ def aliases(cfg: Config) -> list[tuple[str, str, str]]:
     return sorted(out, key=lambda t: -len(t[0]))
 
 
-def resolve_name(cwd: str | None, cfg: Config) -> str:
-    env = os.environ.get("AGENT_MAIL_NAME")
-    if env and NAME_RE.match(env):
-        return env
+def legacy_name(cwd: str | None, cfg: Config) -> str:
+    """Nom déduit du dossier — **diagnostic seulement**, jamais une identité.
+
+    Conservé pour `whoami --cwd` et la barre d'état (affichage), qui ne
+    consomment rien et ne donnent aucune autorité.
+    """
     real = os.path.realpath(cwd or os.getcwd())
     for path, name, _chantier in aliases(cfg):
         if real == path or real.startswith(path + os.sep):
             return name
     base = re.sub(r"[^A-Za-z0-9._-]", "-", os.path.basename(real) or "racine")
     return base[:64] or "racine"
+
+
+def resolve_binding(cfg: Config, db=None) -> Binding:
+    """L'identité de cette session : explicite, et liée au bail si le runner l'a posée.
+
+    `db` est optionnel : sans base (repli fichier), une identité explicite suffit
+    — il n'y a pas de bail à vérifier.
+    """
+    name = os.environ.get("AGENT_MAIL_NAME") or ""
+    if not name or not NAME_RE.match(name):
+        return Binding(reason="AGENT_MAIL_NAME absente (le runner la pose pour le harnais)")
+    runner_id = os.environ.get("AGENT_MESH_RUNNER_ID") or ""
+    epoch_text = os.environ.get("AGENT_MESH_LEASE_EPOCH") or ""
+    if runner_id and epoch_text and db is not None:
+        try:
+            epoch = int(epoch_text)
+        except ValueError:
+            return Binding(name=name, source="runner", runner_id=runner_id,
+                           reason="AGENT_MESH_LEASE_EPOCH illisible")
+        from . import registry  # import tardif : identity ne dépend pas de la base
+        ok, reason = registry.lease_matches(db, name, runner_id, epoch)
+        return Binding(name=name, source="runner", runner_id=runner_id, epoch=epoch,
+                       ok=ok, reason=reason)
+    return Binding(name=name, source="explicit", ok=True)
 
 
 def chantier_of(name: str, cfg: Config) -> str:
