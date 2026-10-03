@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# agent-mesh : la CLI (mêmes commandes que agent-mail) depuis le dépôt.
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+export PYTHONPATH="$here/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "${AGENT_MESH_PYTHON:-python3}" -m agent_mesh.cli "$@"
