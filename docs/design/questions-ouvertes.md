@@ -12,7 +12,6 @@ generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:30:00+02:00" 
 | # | Question | Recommandation de mesh-design |
 |---|---|---|
 | Q1 (ex-M3) | Quelle base pour l'état d'exécution ? Elle suit désormais le profil d'hébergement ([0011](decisions/0011-hebergement-configurable.md)) ; reste à savoir si le profil local peut se contenter de SQLite (pas de LISTEN/NOTIFY). | Postgres partout pour la v1 ; SQLite à étudier pour le profil local. |
-| Q8 | L'historique git du dépôt (privé) contient des mentions d'un client : avant le passage public, réécrire l'historique ou publier à partir d'un instantané sans historique ? | Publier un instantané propre (nouvel historique public) : pas de réécriture d'un historique partagé par les agents. |
 
 # Attend une étude ou un prototype
 

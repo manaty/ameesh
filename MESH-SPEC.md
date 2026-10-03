@@ -3,7 +3,7 @@
 **Status:** documentation of the working setup (2026-10-03) and a v1 proposal.
 The proposal (§5) waits for the owner's decisions (§6). Companion of
 `README.md` (distributed agent-mail AM1–AM9, Slack replacement AM10–AM15) and
-of `issue-manager-agent/docs/MULTI_AGENT_MESH_DESIGN.md`.
+of the mesh design of an existing ticket-pipeline orchestrator (see §3).
 
 ## 1. State of the art (October 2026)
 
@@ -63,34 +63,35 @@ tembo.io/blog/claude-code-multi-agent-orchestration.
 - the owner's authority is a convention, not a proof;
 - there is one machine: when it lost power on 2026-10-03, everything stopped.
 
-## 3. What issue-manager-agent (IMA) already has
+## 3. What an existing ticket-pipeline orchestrator already has
+
+Called *the ticket orchestrator* below; it is a separate, earlier system.
 
 - **Postgres state**: `work_items`, a cross-pipeline state machine
   (`intake → build → qa → merged → promoted`, plus `blocked` and
   `waiting_human`), and a `run_states` ledger.
-- **Kubernetes Jobs** for heavy work (`kubernetes-job-runner.js`), and drain on
-  shutdown (`runtime-lifecycle.js`).
-- **A harness adapter**, Codex only (`codex-process-runner.js`): one-shot
+- **Kubernetes Jobs** for heavy work, and drain on shutdown.
+- **A harness adapter**, Codex only: one-shot
   `codex exec`, no session resume.
-- **A governance gate** (`governance-gate.js`): a push that touches DDL, routes
+- **A governance gate**: a push that touches DDL, routes
   or contracts waits for an approval bound to the diff hash, by Slack thread,
   reaction or GitHub comment, and the approval survives a restart.
 - **A human loop with SLA**: `waiting_human` is asked by Slack or the issue,
   replies are polled, and the pipeline resumes.
-- **Model routing** (`llm-provider.js`: OpenAI or DeepSeek), secret
+- **Model routing** (OpenAI or DeepSeek), secret
   sanitising, and Ed25519-signed human receipts (Studio).
-- **A mesh design not yet built** (`MULTI_AGENT_MESH_DESIGN.md`): resident
+- **A mesh design not yet built**: resident
   agents on Codex app-server threads, `agent_registry` and `agent_mailbox`
   tables, a Supervisor and a Judgement thread.
 - **Limits**: one replica, runs local to the pod, coordination by a 5-minute
   polling sweep, no agent-to-agent messaging.
 
 The two setups complement each other almost exactly:
-- **IMA has the distributed infrastructure**: Postgres, Kubernetes, the
+- **the ticket orchestrator has the distributed infrastructure**: Postgres, Kubernetes, the
   governance gate and the human loop;
 - **this chantier has the multi-harness runtime**: three vendors, session
   resume and a real-time mailbox;
-- IMA's planned tables are exactly what agent-mail needs to leave the PC.
+- the ticket orchestrator's planned tables are exactly what agent-mail needs to leave the PC.
 
 ## 4. Requirements for the distributed version
 
@@ -114,24 +115,24 @@ The two setups complement each other almost exactly:
 1. **agent-mail on Postgres.**
    - Tables `agent_registry` (name, chantier, harness, host, lease, status,
      model, budget) and `agent_mailbox` (from, to, body, created, delivered,
-     signature), as in IMA's design.
+     signature), as in the ticket orchestrator's design.
    - `LISTEN/NOTIFY` wakes the recipient's runner at once.
    - The CLI and the hooks keep their interface, so the three harnesses change
      nothing.
-2. **One runner per machine**, generalising `nexlink-agent` and IMA's
-   `codex-process-runner`.
+2. **One runner per machine**, generalising `nexlink-agent` and the ticket
+   orchestrator's Codex runner.
    - Adapters for the three harnesses, with session resume.
    - The runner claims the agents assigned to its host, renews their leases
      and runs turns.
    - It runs as a user service on a PC or as a pod; heavy work can still use
-     IMA's Kubernetes Jobs.
+     Kubernetes Jobs.
    - In v1 an agent stays pinned to its host, because harness sessions are
      local files. Moving sessions comes later.
-3. **The owner's authority via IMA's governance gate.**
+3. **The owner's authority via a governance gate** (as in the ticket orchestrator).
    - Decisions are asked in a thread (Slack now, Nexlink later).
    - The owner's answer is recorded with an Ed25519 signature, bound to what
      it approves (a diff hash, a migration, a production release).
-4. **The board stays in git**; IMA's `work_items` state machine tracks the
+4. **The board stays in git**; a `work_items` state machine tracks the
    packages.
 5. **Observability**: a single `mesh list` shows every agent, its host, its
    lease, its unread mail and its budget, replacing `agent-mail list` and
@@ -141,7 +142,7 @@ The two setups complement each other almost exactly:
 
 | # | Question | Proposal |
 |---|---|---|
-| M1 | Where the mesh's code lives | a standalone package (`agent-mesh`), used by IMA and by this chantier |
+| M1 | Where the mesh's code lives | a standalone package (`agent-mesh`), usable by other systems and by this chantier |
 | M2 | Go to build v1 (§5 points 1–2) | — |
-| M3 | Which Postgres | a dedicated Supabase project for agents, rather than IMA's `issue_manager` schema or Nexlink's databases |
+| M3 | Which Postgres | a dedicated Supabase project for agents, rather than another system's schema or Nexlink's databases |
 | M4 | First second machine | a small server, so the agents survive the PC being off |

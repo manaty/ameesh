@@ -40,5 +40,12 @@ cette organisation.
 - Nexlink est une façade parmi d'autres, intégrée nativement ; une application
   tierce sur ces interfaces a les mêmes possibilités.
 - Les exemples et tests utilisent des organisations fictives.
-- L'historique git du dépôt privé contient des mentions antérieures d'un
-  client : à traiter avant le passage public (question ouverte).
+- **Passage public par un instantané** (décision du propriétaire, ex-Q8) :
+  l'historique git du dépôt privé, qui contient des mentions antérieures d'un
+  client, reste privé ; le dépôt public démarre d'un instantané propre à la
+  première release. Aucune réécriture de l'historique partagé par les agents.
+- **Migrations SQL** : leurs commentaires sont couverts par une empreinte
+  stockée en base et ne peuvent pas être modifiés sans casser les schémas
+  existants. Exception temporaire à cette règle : comme aucune base de
+  production n'existe, les migrations seront **consolidées en une base propre**
+  au moment de l'instantané public.
