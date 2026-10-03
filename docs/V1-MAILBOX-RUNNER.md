@@ -110,8 +110,11 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   re-`claim` (nouvel epoch) pour continuer ; `end_turn` reste fencé par
   `lease_owner` + `lease_epoch`, pour qu'un tour commencé sous bail valide
   puisse être enregistré.
-* **Renouvellement borné par l'échéance, pas par un délai fixe** — l'appel
-  `renew` tourne dans un fil et est abandonné au plus tard à `lease_deadline` :
+* **Renouvellement borné par l'échéance, pas par un délai fixe** — si
+  l'échéance est déjà atteinte au réveil, le harnais est arrêté **sans même
+  appeler la base** ; sinon l'appel `renew` tourne dans un fil et est abandonné
+  au plus tard à `lease_deadline` (budget = temps restant, sans marge ni
+  plancher) :
   même si la base ne répond plus du tout (réponse retenue par un proxy, par
   exemple), le battement conclut à la perte du bail et arrête le harnais à
   l'heure où un remplaçant peut réclamer l'agent. Le `statement_timeout` reste

@@ -113,7 +113,7 @@ scripts/test.sh                      # starts the container, runs the suite twic
 scripts/test.sh tests.test_runner    # one module
 ```
 
-147 tests against the local container, run twice (`psql`, then `psycopg` with
+156 tests against the local container, run twice (`psql`, then `psycopg` with
 `cryptography`): migrations and immutability, mailbox and LISTEN/NOTIFY round
 trips, lease races on 2 and 4 concurrent connections, **two runner processes
 competing for the same lease**, lease expiry takeover, fencing of a stale
@@ -133,7 +133,8 @@ statement timeout (server and client) and a renewal call abandoned at the lease
 deadline, process-group termination with SIGKILL on lease loss (even after the
 parent dies), the merge of two prompts when a turn is restored, and a
 lease-bound agent-mail identity that is never derived from the working
-directory.
+directory, and a renewal budget with no floor once the lease deadline has
+passed.
 
 ## Layout
 

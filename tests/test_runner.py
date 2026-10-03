@@ -209,7 +209,14 @@ class RunnerTest(PgTestCase):
                 "lease_epoch = lease_epoch + 1, lease_expires_at = now() + interval '60 seconds', "
                 "status = 'running' WHERE name = 'vole'"
             )
-            self.wait_for(lambda: any("bail perdu" in l for l in lignes), timeout=10)
+            # Deux issues également justes : le renouvellement voit l'epoch
+            # volé (« bail perdu ») ou l'échéance est atteinte avant l'appel
+            # (« échéance du bail atteinte »). Dans les deux cas le harnais est
+            # arrêté et le tour n'est pas compté.
+            self.wait_for(
+                lambda: any(("bail perdu" in l or "échéance du bail atteinte" in l)
+                            for l in lignes),
+                timeout=10)
             self.assertLess(
                 time.monotonic() - debut, 7.0,
                 "le harnais aurait dû être terminé par le battement de bail (12 s de sommeil)",
@@ -350,6 +357,43 @@ class RunnerTest(PgTestCase):
         # le tour tourne sous le premier bail ; le rendre en sortant incrémente
         # l'epoch en base, donc on compare au bail du moment, pas à l'après.
         self.assertEqual(int(env["AMEESH_LEASE_EPOCH"]), 1)
+
+    def test_echeance_atteinte_arrete_sans_appeler_la_base(self):
+        """Verdict codex3 B5a : plus de budget plancher après l'échéance.
+
+        Réveil tardif : l'échéance est déjà passée, on n'appelle même pas
+        `registry.renew` — on arrête le harnais immédiatement.
+        """
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "india", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() - 1},
+        )
+        debut = time.monotonic()
+        with mock.patch.object(registry, "renew") as appel:
+            self.assertFalse(worker.renew())
+        self.assertLess(time.monotonic() - debut, 0.3)
+        appel.assert_not_called()
+        self.assertTrue(worker.lease_lost.is_set())
+
+    def test_budget_borne_par_le_temps_restant_sans_marge(self):
+        """Le budget d'appel vaut le temps restant, pas un plancher de 0,5 s."""
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "juliette", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.3},
+        )
+        self.assertLessEqual(worker.call_budget(), 0.4)
+        self.assertGreater(worker.call_budget(), 0.0)
+        expire = AgentWorker(
+            runner,
+            {"name": "kilo", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() - 5},
+        )
+        self.assertTrue(expire.deadline_passed())
+        self.assertLessEqual(expire.call_budget(), 0.06)
 
     def test_battement_se_reveille_a_l_echeance_du_bail(self):
         """B5a : with a long interval, the heartbeat still wakes at the deadline."""

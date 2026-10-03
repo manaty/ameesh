@@ -94,15 +94,20 @@ class AgentWorker(threading.Thread):
             pass
 
     # -- bail --------------------------------------------------------------
+    def deadline_passed(self) -> bool:
+        """L'échéance du bail est-elle déjà atteinte (ou inconnue) ?"""
+        return self.lease_deadline > 0 and time.time() >= self.lease_deadline
+
     def call_budget(self) -> float:
         """Temps qu'on accepte d'attendre une réponse avant de conclure.
 
-        Borné par l'échéance du bail : un renouvellement qui pend ne doit pas
-        nous faire dépasser le moment où un remplaçant peut réclamer l'agent.
+        Borné par l'échéance du bail, **sans marge ni plancher** : si l'échéance
+        est passée, on ne donne pas 0,5 s de plus au harnais — un remplaçant peut
+        déjà avoir réclamé l'agent (verdict codex3 B5a).
         """
-        if self.lease_deadline > 0:
-            return max(0.5, self.lease_deadline - time.time() + 0.2)
-        return max(3.0, self.runner.lease_ttl / 3.0)
+        if self.lease_deadline <= 0:
+            return max(3.0, self.runner.lease_ttl / 3.0)
+        return max(0.05, self.lease_deadline - time.time())
 
     def _renew_call(self) -> tuple[bool, float | None, Exception | None]:
         """`registry.renew` avec une borne dure, même si l'appel se bloque."""
@@ -127,6 +132,13 @@ class AgentWorker(threading.Thread):
         """Prolonge le bail. Une panne de base ne laisse pas le harnais tourner
         sans bail : après quelques échecs ou à l'échéance connue, on l'arrête."""
         if self.lease_lost.is_set():
+            return False
+        if self.deadline_passed():
+            # Échéance déjà atteinte (réveil tardif, horloge, bail raccourci) :
+            # on ne tente même pas le renouvellement, on arrête tout de suite.
+            log("[%s] échéance du bail atteinte : arrêt du harnais" % self.name)
+            self.lease_lost.set()
+            self.terminate(grace=0)
             return False
         answered, expires, error = self._renew_call()
         if not answered:
@@ -237,7 +249,7 @@ class AgentWorker(threading.Thread):
     def wait_timeout(self, cap: float) -> float:
         """Attente bornée par l'échéance du bail : on ne dort pas au-delà (B5a)."""
         if self.lease_deadline > 0:
-            return max(0.2, min(cap, self.lease_deadline - time.time() + 0.2))
+            return max(0.05, min(cap, self.lease_deadline - time.time()))
         return cap
 
     def _heartbeat(self, stop_event: threading.Event) -> None:
