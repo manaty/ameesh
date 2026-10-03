@@ -288,11 +288,19 @@ def begin_turn(db: Db, name: str, owner: str, epoch: int, status_text: str) -> b
 
 
 def restore_prompt(db: Db, name: str, owner: str, epoch: int) -> bool:
-    """Remet en attente la consigne d'un tour qui n'a pas pu démarrer."""
+    """Remet en attente la consigne d'un tour qui n'a pas abouti.
+
+    Si une consigne était déjà en attente, les deux sont conservées (l'ancienne
+    d'abord) : un `coalesce` perderait la consigne du tour interrompu.
+    """
     rows = db.query(
         """
         UPDATE agent_registry
-           SET pending_prompt = coalesce(pending_prompt, current_prompt),
+           SET pending_prompt = CASE
+                   WHEN current_prompt IS NULL THEN pending_prompt
+                   WHEN pending_prompt IS NULL THEN current_prompt
+                   ELSE current_prompt || E'\n\n' || pending_prompt
+               END,
                current_prompt = NULL,
                updated_at = now()
          WHERE name = %s AND lease_owner = %s AND lease_epoch = %s

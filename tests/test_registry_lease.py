@@ -198,6 +198,19 @@ class RegistryTest(PgTestCase):
             registry.take_pending_prompt(self.db, "alpha", "runner-a", int(again["lease_epoch"])),
             "travail interrompu")
 
+    def test_restore_prompt_conserve_les_deux_consignes(self):
+        """Sonde codex3 (1) : un échec avec current A + pending B ne perd pas A."""
+        registry.upsert(self.db, "alpha", harness="claude", host="laptop")
+        registry.set_pending_prompt(self.db, "alpha", "A du tour")
+        lease = registry.claim(self.db, "alpha", "runner-a", 60)
+        epoch = int(lease["lease_epoch"])
+        registry.take_pending_prompt(self.db, "alpha", "runner-a", epoch)
+        registry.set_pending_prompt(self.db, "alpha", "B arrivée pendant le tour")
+        self.assertTrue(registry.restore_prompt(self.db, "alpha", "runner-a", epoch))
+        row = registry.get(self.db, "alpha")
+        self.assertEqual(row["pending_prompt"], "A du tour\n\nB arrivée pendant le tour")
+        self.assertIsNone(row["current_prompt"])
+
     def test_deux_consignes_conservees_a_la_reprise(self):
         """B6c : current A + pending B → les deux survivent, dans l'ordre."""
         registry.upsert(self.db, "alpha", harness="claude", host="laptop")

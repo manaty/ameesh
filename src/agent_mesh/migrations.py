@@ -97,6 +97,10 @@ def migrate(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR, log
     todo = pending(db, directory)
     for migration in todo:
         script = (
+            # Une migration peut être longue : on lève le délai le temps de la
+            # transaction (SET LOCAL retombe au commit), sinon le
+            # statement_timeout par défaut la couperait.
+            "SET LOCAL statement_timeout = 0;\n"
             "select pg_advisory_xact_lock(hashtext('%s'));\n%s\n"
             "insert into schema_migrations (version, name, checksum) values (%d, %s, %s);\n"
             % (

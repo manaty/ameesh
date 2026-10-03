@@ -110,23 +110,35 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   re-`claim` (nouvel epoch) pour continuer ; `end_turn` reste fencé par
   `lease_owner` + `lease_epoch`, pour qu'un tour commencé sous bail valide
   puisse être enregistré.
+* **Requêtes bornées** — chaque connexion pose un `statement_timeout`
+  (`AGENT_MESH_STATEMENT_TIMEOUT_MS`, défaut 30 s) : un renouvellement de bail
+  qui pend (verrou, requête lente) est annulé par le serveur ; le pilote `psql`
+  ajoute un délai client (le même + 5 s) qui abandonne le sous-processus si le
+  serveur ne répond plus du tout. Les migrations, elles, lèvent le délai le
+  temps de leur transaction (`SET LOCAL statement_timeout = 0`).
 * **Battement robuste** — une panne de base pendant un tour ne laisse pas le
   harnais tourner sans bail : le battement compte les échecs
   (`max(3, ttl/3)` secondes d'intervalle), et arrête le processus dès que la
   base reste injoignable ou que l'échéance connue du bail est atteinte. Il ne
   dort **jamais au-delà de l'échéance** (le réveil est borné par
   `lease_deadline`), même si l'intervalle nominal est plus long.
-* **Arrêt du harnais** — `terminate` envoie SIGTERM, laisse 3 secondes, puis
-  SIGKILL : un processus qui ignore SIGTERM ne survit pas à la perte du bail.
+* **Arrêt du harnais** — `terminate` signale le **groupe de processus** (le
+  harnais est lancé dans sa propre session) : ses descendants ne survivent pas.
+  SIGTERM, 3 secondes de grâce pour un arrêt propre, puis SIGKILL — sauf à la
+  perte du bail, où la grâce est nulle : le remplaçant peut réclamer l'agent
+  immédiatement, l'ancien enfant ne doit plus tourner. `terminate` attend que
+  le noyau ait pris le SIGKILL, pour que « arrêté » veuille dire arrêté.
 * **Consigne durable (R5)** — `pick` ne vide plus `pending_prompt` : la
   consigne est *déplacée* dans `current_prompt` quand le tour démarre, effacée
   par `end_turn` **uniquement si le tour a abouti**, et restaurée en attente
   dans tous les autres cas : tour en échec (y compris harnais tué), harnais
   absent, dossier disparu, changement de main — y compris quand le même
-  `--runner-id` reprend un bail expiré. Si une consigne était déjà en attente
-  pendant un tour interrompu, **les deux sont conservées** (l'ancienne puis la
-  nouvelle, séparées par une ligne vide). Au pire un tour est rejoué, jamais
-  une consigne perdue.
+  `--runner-id` reprend un bail expiré — et **bail perdu en cours de tour**
+  (la clôture ne passe plus par `end_turn`, qui aurait effacé la consigne ; et
+  elle ne touche pas au statut d'un agent qu'un remplaçant a pu reprendre). Si
+  une consigne était déjà en attente pendant un tour interrompu, **les deux
+  sont conservées** (l'ancienne puis la nouvelle, séparées par une ligne vide).
+  Au pire un tour est rejoué, jamais une consigne perdue.
 * **Expiration** — si l'exécuteur meurt (SIGKILL, coupure), le bail expire ;
   n'importe quel exécuteur du même hôte le reprend (`lease_expires_at < now()`).
   `reap()` marque `dead` les agents dont le bail a expiré en plein tour.

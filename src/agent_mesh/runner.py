@@ -108,13 +108,13 @@ class AgentWorker(threading.Thread):
             if self.renew_failures >= self.MAX_RENEW_FAILURES or time.time() >= self.lease_deadline:
                 log("[%s] bail considéré perdu (base injoignable) : arrêt du harnais" % self.name)
                 self.lease_lost.set()
-                self.terminate()
+                self.terminate(grace=0)
                 return False
             return True  # on laisse une chance au prochain battement
         if expires is None:
             log("[%s] bail perdu (epoch %d) : arrêt du tour" % (self.name, self.epoch))
             self.lease_lost.set()
-            self.terminate()
+            self.terminate(grace=0)  # pas de grâce : le remplaçant peut déjà tourner
             return False
         self.renew_failures = 0
         self.lease_deadline = float(expires)
@@ -131,31 +131,52 @@ class AgentWorker(threading.Thread):
     #: délai laissé au harnais entre SIGTERM et SIGKILL
     TERMINATE_GRACE = 3.0
 
-    def terminate(self) -> None:
-        """Arrête le harnais : SIGTERM, puis SIGKILL s'il l'ignore (B5b).
+    @staticmethod
+    def _signal_tree(proc: subprocess.Popen, sig: int) -> None:
+        """Signale le groupe du harnais (sinon ses descendants survivent)."""
+        try:
+            pgid = os.getpgid(proc.pid)
+        except OSError:
+            pgid = None
+        if pgid is not None and pgid != os.getpgid(0):
+            try:
+                os.killpg(pgid, sig)
+                return
+            except OSError:
+                pass
+        try:
+            proc.send_signal(sig)
+        except OSError:
+            pass
 
-        Un processus qui traite SIGTERM sort en quelques dizaines de
-        millisecondes ; un `sleep` qui l'ignore ne doit pas continuer à tourner
-        alors que le bail est perdu.
+    def terminate(self, grace: float | None = None) -> None:
+        """Arrête le harnais et ses descendants : SIGTERM, puis SIGKILL.
+
+        `grace=0` (perte du bail) tue tout de suite : pendant une grâce, le
+        remplaçant peut réclamer l'agent alors que l'ancien enfant vit encore.
+        Le groupe de processus est signalé, pas seulement le parent : un
+        harnais qui lance un `sleep` ne doit pas le laisser derrière lui.
         """
         with self.lock:
             proc = self.proc
         if proc is None or proc.poll() is not None:
             return
-        try:
-            proc.terminate()
-        except OSError:
-            return
-        deadline = time.monotonic() + self.TERMINATE_GRACE
+        self._signal_tree(proc, signal.SIGTERM)
+        delai = self.TERMINATE_GRACE if grace is None else grace
+        deadline = time.monotonic() + max(0.0, delai)
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 return
             time.sleep(0.05)
-        log("[%s] le harnais ignore SIGTERM : SIGKILL" % self.name)
-        try:
-            proc.kill()
-        except OSError:
-            pass
+        log("[%s] harnais toujours vivant : SIGKILL du groupe" % self.name)
+        self._signal_tree(proc, signal.SIGKILL)
+        # SIGKILL est asynchrone : on attend que le noyau l'ait pris en compte,
+        # pour que « terminate est revenu » veuille dire « le harnais est mort ».
+        fin = time.monotonic() + 2.0
+        while time.monotonic() < fin and proc.poll() is None:
+            time.sleep(0.02)
+        if proc.poll() is None:
+            log("[%s] harnais toujours vivant après SIGKILL (état noyau ?)" % self.name)
 
     def wait_timeout(self, cap: float) -> float:
         """Attente bornée par l'échéance du bail : on ne dort pas au-delà (B5a)."""
@@ -268,6 +289,7 @@ class AgentWorker(threading.Thread):
                 proc = subprocess.Popen(
                     argv, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
                     text=True, bufsize=1, env=env,
+                    start_new_session=True,  # son groupe : on peut le tuer en entier
                 )
             with self.lock:
                 self.proc = proc
@@ -310,9 +332,12 @@ class AgentWorker(threading.Thread):
             error = "le harnais a rendu le code %d" % result_code
         status = "idle" if ok else "blocked"
         if lost:
-            # Le bail ne nous appartient plus : end_turn est fencé, il ne fera rien.
-            registry.end_turn(self.db, self.name, self.runner.runner_id, self.epoch,
-                              status="dead", status_text="bail perdu", error=error)
+            # Le bail n'est plus vivant : on ne clôt PAS le tour. `end_turn`
+            # effacerait current_prompt alors que le tour n'a pas abouti (son
+            # fence par epoch ne suffit pas : un bail expiré mais pas encore
+            # repris porte toujours notre epoch), et `set_status` écraserait
+            # l'état d'un agent qu'un remplaçant a pu reprendre.
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
         if not ok:
             # B6a : le tour n'a pas abouti, la consigne repart en attente au lieu
@@ -496,6 +521,8 @@ class Runner:
         for worker in workers:
             worker.stopping.set()
             worker.wake.set()
+            # Un tour en cours ne doit pas continuer pendant qu'on rend le bail.
+            worker.terminate()
         deadline = time.monotonic() + 8.0
         for worker in workers:
             worker.join(timeout=max(0.1, deadline - time.monotonic()))

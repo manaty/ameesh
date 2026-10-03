@@ -197,6 +197,12 @@ class PsqlDriver:
             raise Unavailable("psql introuvable dans le PATH")
         self.binary = binary
         self.cfg = cfg
+        #: délai client : si le serveur ne répond plus (réseau coupé, requête
+        #: qui pend), on ne bloque pas le battement de bail indéfiniment.
+        self._client_timeout: float | None = (
+            cfg.statement_timeout_ms / 1000.0 + 5.0
+            if cfg.statement_timeout_ms and cfg.statement_timeout_ms > 0 else None
+        )
         self.password, base = split_password(cfg.dsn)
         self.env = os.environ.copy()
         self.env["PGCONNECT_TIMEOUT"] = str(max(1, int(cfg.connect_timeout)))
@@ -218,6 +224,12 @@ class PsqlDriver:
             schema = "SET search_path TO %s;" % quote_ident(cfg.schema)
             self._args += ["-c", schema[:-1]]
             self._bootstrap = schema + "\n"
+        if cfg.statement_timeout_ms and cfg.statement_timeout_ms > 0:
+            # Sans lui, une requête qui pend (réseau, verrou) bloquerait le
+            # battement de bail et laisserait un harnais tourner sans bail.
+            timeout = "SET statement_timeout = %d;" % int(cfg.statement_timeout_ms)
+            self._args += ["-c", timeout[:-1]]
+            self._bootstrap = timeout + "\n" + self._bootstrap
         self._check()
 
     # -- interne -----------------------------------------------------------
@@ -225,8 +237,12 @@ class PsqlDriver:
         try:
             return subprocess.run(
                 self._args + extra, input=stdin, capture_output=True, text=True,
-                env=self.env, timeout=None,
+                env=self.env, timeout=self._client_timeout,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise DbError(
+                "psql : délai client dépassé (%ss) — requête abandonnée"
+                % self._client_timeout) from exc
         except OSError as exc:
             raise Unavailable("psql n'a pas pu démarrer : %s" % exc) from exc
 
@@ -433,6 +449,8 @@ class PsycopgDriver:
     def _check(self) -> None:
         if self.cfg.schema != "public":
             self.conn.execute("SET search_path TO %s" % quote_ident(self.cfg.schema))
+        if self.cfg.statement_timeout_ms and self.cfg.statement_timeout_ms > 0:
+            self.conn.execute("SET statement_timeout = %d" % int(self.cfg.statement_timeout_ms))
         try:
             self.conn.execute("SELECT 1").fetchone()
         except Exception as exc:

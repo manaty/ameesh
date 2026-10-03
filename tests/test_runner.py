@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -334,6 +335,64 @@ class RunnerTest(PgTestCase):
             stop.set()
             thread.join(timeout=5)
         self.assertFalse(thread.is_alive())
+
+    def test_branche_bail_perdu_ne_perd_pas_la_consigne(self):
+        """Sonde codex3 (2) : la clôture d'un tour au bail perdu restaure la consigne."""
+        cwd = self._cwd("perdu")
+        self.register("perdu", "claude", cwd=cwd, prompt="consigne du tour perdu")
+        env = self.env(AGENT_MESH_TEST_SLEEP="12", AGENT_MESH_LEASE_TTL="3")
+        proc = self.runner_popen("--agents", "perdu", "--lease-ttl", "3", "--poll", "2", env=env)
+        try:
+            self.wait_for(lambda: len(self.turns()) == 1, timeout=20)
+            self.db.execute(
+                "UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
+                "WHERE name = 'perdu'")
+            self.wait_for(
+                lambda: registry.get(self.db, "perdu")["pending_prompt"] is not None, timeout=15)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=10)
+        row = registry.get(self.db, "perdu")
+        self.assertEqual(row["pending_prompt"], "consigne du tour perdu")
+        self.assertIsNone(row["current_prompt"])
+        self.assertEqual(int(row["turns"]), 0)
+
+    def test_terminate_tue_le_groupe_de_processus(self):
+        """Sonde codex3 (descendants) : un enfant du harnais ne survit pas."""
+        pidfile = os.path.join(self.tmp, "enfant.pid")
+        parent = subprocess.Popen(
+            [sys.executable, "-c",
+             "import os, signal, subprocess, sys, time;"
+             "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+             "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']);"
+             "open(sys.argv[1], 'w').write(str(child.pid));"
+             "time.sleep(60)", pidfile],
+            start_new_session=True,
+        )
+        for _ in range(50):
+            if os.path.exists(pidfile):
+                break
+            time.sleep(0.1)
+        enfant_pid = int(open(pidfile, encoding="utf-8").read())
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "foxtrot", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 3600},
+        )
+        worker.proc = parent
+        try:
+            worker.terminate(grace=0)
+            self.assertIsNotNone(parent.poll())
+            self.wait_for(
+                lambda: not os.path.exists("/proc/%d" % enfant_pid), timeout=5)
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+            try:
+                os.kill(enfant_pid, signal.SIGKILL)
+            except OSError:
+                pass
 
     def test_terminate_escalade_vers_sigkill(self):
         """B5b : un harnais qui ignore SIGTERM est tué, pas laissé vivant."""

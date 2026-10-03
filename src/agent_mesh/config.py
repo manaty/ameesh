@@ -60,6 +60,9 @@ class Config:
     host: str = hostname()
     runner_id: str = ""
     connect_timeout: float = 3.0
+    #: au-delà, une requête est annulée par le serveur (0 = pas de limite).
+    #: Empêche un renouvellement de bail de bloquer le battement indéfiniment.
+    statement_timeout_ms: float = 30000.0
     lease_ttl: float = 300.0
     idle_nudge: float = 1200.0
     poll: float = 5.0
@@ -108,6 +111,8 @@ def load(env: dict | None = None) -> Config:
         host=pick("AGENT_MESH_HOST", default=cfg.host),
         runner_id=pick("AGENT_MESH_RUNNER_ID", default=cfg.runner_id),
         connect_timeout=_as_float(env.get("AGENT_MESH_CONNECT_TIMEOUT"), cfg.connect_timeout),
+        statement_timeout_ms=_as_float(env.get("AGENT_MESH_STATEMENT_TIMEOUT_MS"),
+                                       cfg.statement_timeout_ms),
         lease_ttl=_as_float(env.get("AGENT_MESH_LEASE_TTL"), cfg.lease_ttl),
         idle_nudge=_as_float(env.get("AGENT_MESH_IDLE_NUDGE"), cfg.idle_nudge),
         poll=_as_float(env.get("AGENT_MESH_POLL"), cfg.poll),

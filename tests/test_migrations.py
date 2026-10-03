@@ -185,6 +185,44 @@ class MigrationsTest(PgTestCase):
             db.close()
             self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
 
+    def test_statement_timeout_borne_les_requetes(self):
+        """Une requête qui pend est annulée : le battement de bail ne bloque pas."""
+        import dataclasses
+        import time as temps
+        cfg = dataclasses.replace(self.cfg, statement_timeout_ms=300)
+        db = db_mod.connect(cfg)
+        try:
+            debut = temps.monotonic()
+            with self.assertRaises(db_mod.DbError) as ctx:
+                db.query("SELECT pg_sleep(3)")
+            self.assertLess(temps.monotonic() - debut, 2.5)
+            self.assertIn("timeout", str(ctx.exception).lower())
+        finally:
+            db.close()
+
+    def test_migration_longue_non_bornee_par_le_statement_timeout(self):
+        """Les migrations lèvent le délai (SET LOCAL) : une longue passe aboutit."""
+        import dataclasses
+        import tempfile
+        schema = "t_lente_%s" % uuid.uuid4().hex[:8]
+        db = self.connect(schema)
+        try:
+            db.execute('CREATE SCHEMA "%s"' % schema)
+            with tempfile.TemporaryDirectory() as dossier:
+                with open(os.path.join(dossier, "0001_lente.sql"), "w", encoding="utf-8") as fh:
+                    fh.write("create table lente (id int primary key);\n"
+                             "select pg_sleep(0.6);\n")
+                cfg = dataclasses.replace(self.cfg, schema=schema, statement_timeout_ms=200)
+                lent = db_mod.connect(cfg)
+                try:
+                    done = migrations.migrate(lent, directory=dossier)
+                    self.assertEqual([m.version for m in done], [1])
+                finally:
+                    lent.close()
+        finally:
+            db.close()
+            self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
+
     def test_schema_absent_message_actionnable(self):
         schema = "t_vide_%s" % uuid.uuid4().hex[:8]
         db = self.connect(schema)
