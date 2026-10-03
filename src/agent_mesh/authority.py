@@ -3,15 +3,17 @@
 Règle de base (R4, spec §5 point 3) : **l'autorité ne se déduit jamais du
 texte**. Un message ne porte l'autorité du propriétaire que si
 
-1. l'expéditeur a une clé **publique** enregistrée dans `agent_registry`, non
-   révoquée ;
+1. l'expéditeur a une clé **publique** enregistrée dans `agent_registry` avec
+   le rôle `owner`, non révoquée ;
 2. la signature Ed25519 vérifie sur un payload canonique qui **est exactement**
    le contenu stocké (expéditeur, destinataire, texte, horodatage, nonce) ;
 3. l'échéance n'est pas dépassée.
 
-Tout le reste — y compris un message signé « le propriétaire » — est un message
-d'agent ordinaire. Une signature invalide ou expirée est signalée comme telle,
-jamais ignorée.
+Une clé de rôle `agent` prouve la **provenance** (le message est bien de cet
+agent, contenu et échéance couverts) mais ne confère **aucune** autorité
+propriétaire et ne peut pas approuver. Tout le reste — y compris un message
+signé « le propriétaire » — est un message d'agent ordinaire. Une signature
+invalide ou expirée est signalée comme telle, jamais ignorée.
 
 Les approbations (`mesh_approvals`) suivent le même modèle, avec en plus une
 action, l'empreinte d'un artefact et une consommation unique.
@@ -30,6 +32,9 @@ from . import signing
 from .db import Db
 
 DOMAIN = "agent-mesh/v1"
+#: rôles de clé : seul 'owner' porte l'autorité du propriétaire
+KEY_ROLES = ("owner", "agent")
+DEFAULT_KEY_ROLE = "agent"
 DEFAULT_TTL = 24 * 3600.0
 MAX_TTL = 30 * 24 * 3600.0
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -43,17 +48,37 @@ class AuthorityError(RuntimeError):
 
 @dataclass(frozen=True)
 class Verdict:
+    """Résultat d'une vérification.
+
+    `ok` : la signature est valide, couvre ce contenu, la clé est connue, non
+    révoquée, et l'échéance n'est pas dépassée. `role` distingue ensuite
+    l'autorité du propriétaire (`owner`) de la simple authenticité d'un agent.
+    """
+
     ok: bool
     reason: str
     fingerprint: str = ""
     expires_ts: float = 0.0
+    role: str = ""
 
     def __bool__(self) -> bool:
         return self.ok
 
+    @property
+    def authority(self) -> bool:
+        """Autorité du propriétaire : signature valide d'une clé `owner`."""
+        return self.ok and self.role == "owner"
+
+    @property
+    def authentic(self) -> bool:
+        """Signature valide, propriétaire ou agent (provenance prouvée)."""
+        return self.ok
+
     def short(self) -> str:
+        if self.authority:
+            return "signé par le propriétaire"
         if self.ok:
-            return "signé %s" % self.fingerprint[:12]
+            return "signé par un agent"
         return self.reason
 
 
@@ -143,7 +168,7 @@ def unb64(text: str) -> bytes:
 def key_info(db: Db, agent: str) -> dict | None:
     rows = db.query(
         """
-        SELECT name, public_key, public_key_fingerprint,
+        SELECT name, public_key, public_key_fingerprint, key_role,
                extract(epoch from key_updated_at)::float8 as key_updated_ts,
                extract(epoch from key_revoked_at)::float8 as key_revoked_ts
           FROM agent_registry WHERE name = %s
@@ -153,16 +178,26 @@ def key_info(db: Db, agent: str) -> dict | None:
     return rows[0] if rows else None
 
 
-def register_key(db: Db, agent: str, public: bytes, *, note: str | None = None) -> dict:
-    """Enregistre la clé PUBLIQUE d'un agent (acte du propriétaire)."""
+def register_key(db: Db, agent: str, public: bytes, *, role: str = DEFAULT_KEY_ROLE,
+                 note: str | None = None) -> dict:
+    """Enregistre la clé PUBLIQUE d'un agent.
+
+    `role='owner'` est un acte du propriétaire (sa clé privée ne circule pas) ;
+    `role='agent'` (défaut) n'authentifie qu'un agent et ne donne aucune
+    autorité. Enregistrer une clé propriétaire pour un agent revient à lui
+    déléguer l'autorité du propriétaire : à ne faire qu'en connaissance de cause.
+    """
     if len(public) != 32:
         raise AuthorityError("clé publique Ed25519 : 32 octets attendus")
+    if role not in KEY_ROLES:
+        raise AuthorityError("rôle de clé inconnu : %r (%s)" % (role, ", ".join(KEY_ROLES)))
     fingerprint = signing.fingerprint(public)
     rows = db.query(
         """
         UPDATE agent_registry
            SET public_key = %s,
                public_key_fingerprint = %s,
+               key_role = %s,
                key_updated_at = now(),
                key_revoked_at = NULL,
                status_text = coalesce(%s, status_text),
@@ -170,12 +205,12 @@ def register_key(db: Db, agent: str, public: bytes, *, note: str | None = None) 
          WHERE name = %s
         RETURNING name
         """,
-        (b64(public), fingerprint, note, agent),
+        (b64(public), fingerprint, role, note, agent),
     )
     if not rows:
         raise AuthorityError(
             "agent %s inconnu du registre : déclarez-le avant d'enregistrer sa clé" % agent)
-    return {"agent": agent, "fingerprint": fingerprint}
+    return {"agent": agent, "fingerprint": fingerprint, "role": role}
 
 
 def revoke_key(db: Db, agent: str) -> bool:
@@ -198,11 +233,12 @@ def _valid_key(db: Db, agent: str, expected_fingerprint: str | None) -> tuple[di
     if info.get("key_revoked_ts"):
         return None, Verdict(False, "clé de %s révoquée" % agent)
     fingerprint = info.get("public_key_fingerprint")
+    role = info.get("key_role") or DEFAULT_KEY_ROLE
     if expected_fingerprint and fingerprint != expected_fingerprint:
         return None, Verdict(
             False, "clé inconnue (empreinte %s, registre %s)"
-            % (expected_fingerprint[:12], (fingerprint or "?")[:12]))
-    return info, Verdict(True, "clé connue", fingerprint or "")
+            % (expected_fingerprint[:12], (fingerprint or "?")[:12]), role=role)
+    return info, Verdict(True, "clé connue", fingerprint or "", role=role)
 
 
 # --------------------------------------------------------------------------
@@ -243,8 +279,14 @@ def verify_message(db: Db, row: dict) -> Verdict:
     if expires_ts and expires_ts < time.time():
         return Verdict(
             False, "signature expirée (%s)" % time.strftime("%Y-%m-%d %H:%M", time.localtime(expires_ts)))
-    return Verdict(True, "autorité du propriétaire prouvée",
-                   info.get("public_key_fingerprint") or "", expires_ts)
+    role = info.get("key_role") or DEFAULT_KEY_ROLE
+    fingerprint = info.get("public_key_fingerprint") or ""
+    if role == "owner":
+        return Verdict(True, "autorité du propriétaire prouvée", fingerprint, expires_ts
+                       if False else expires_ts, role)
+    return Verdict(
+        True, "signature d'agent authentique (sans autorité propriétaire)",
+        fingerprint, expires_ts, role)
 
 
 def sign_message(seed: bytes, *, sender: str, recipient: str, body: str,
@@ -307,6 +349,7 @@ def build_approval(seed: bytes, *, approver: str, action: str, artifact_kind: st
         "signed_payload": payload.decode("utf-8"),
         "signature": b64(backend.sign(seed, payload)),
         "signature_key": signing.fingerprint(public),
+        "created_us": ts_us,
         "expires_us": expires_us,
     }
 
@@ -324,18 +367,24 @@ def create_approval(db: Db, seed: bytes, *, approver: str, action: str, artifact
         raise AuthorityError(
             "%s — enregistrez la clé publique de %s avant de signer une approbation"
             % (verdict.reason, approver))
+    if info.get("key_role") != "owner":
+        raise AuthorityError(
+            "la clé de %s a le rôle %r : une approbation exige une clé propriétaire "
+            "(« agent-mesh key register %s --public-key … --role owner »)"
+            % (approver, info.get("key_role") or DEFAULT_KEY_ROLE, approver))
     rows = db.query(
         """
         INSERT INTO mesh_approvals
             (approver, action, artifact_kind, artifact_hash, decision, nonce,
-             signed_payload, signature, signature_key, expires_at, meta)
+             signed_payload, signature, signature_key, created_at, expires_at, meta)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                to_timestamp(%s::bigint / 1000000.0),
                 to_timestamp(%s::bigint / 1000000.0), %s::jsonb)
         RETURNING id
         """,
         (built["approver"], built["action"], built["artifact_kind"], built["artifact_hash"],
          built["decision"], built["nonce"], built["signed_payload"], built["signature"],
-         built["signature_key"], built["expires_us"],
+         built["signature_key"], built["created_us"], built["expires_us"],
          json.dumps(meta or {}, ensure_ascii=False)),
     )
     built["id"] = int(rows[0]["id"])
@@ -349,6 +398,12 @@ def verify_approval(db: Db, row: dict) -> Verdict:
     info, verdict = _valid_key(db, row.get("approver") or "", row.get("signature_key"))
     if not info:
         return verdict
+    if info.get("key_role") != "owner":
+        return Verdict(
+            False, "clé de rôle %r : seule une clé propriétaire peut approuver"
+            % (info.get("key_role") or DEFAULT_KEY_ROLE),
+            info.get("public_key_fingerprint") or "", 0.0,
+            info.get("key_role") or DEFAULT_KEY_ROLE)
 
     # Le payload est la référence : « agent-mesh/v1|approval|{json canonique} ».
     parts = payload_text.split("|", 2)
@@ -367,6 +422,21 @@ def verify_approval(db: Db, row: dict) -> Verdict:
         return Verdict(False, "signature Ed25519 invalide")
     if row.get("consumed_ts") or row.get("consumed_at"):
         return Verdict(False, "approbation déjà consommée")
+
+    # L'échéance et l'horodatage de la ligne doivent être EXACTEMENT ceux qui
+    # ont été signés : modifier expires_at en base ne ressuscite pas un reçu.
+    if "expires" in stored and row.get("expires_ts") is not None:
+        if _us(row["expires_ts"]) != int(stored["expires"]):
+            return Verdict(False, "l'échéance signée ne correspond pas à la ligne "
+                                  "(expires_at modifié)")
+    if "ts" in stored and row.get("created_ts") is not None:
+        if _us(row["created_ts"]) != int(stored["ts"]):
+            return Verdict(False, "l'horodatage signé ne correspond pas à la ligne "
+                                  "(created_at modifié)")
+    expiry_state = nonce_state(db, row.get("approver") or "", row.get("nonce") or "")
+    if expiry_state is not None:
+        return Verdict(False, "nonce déjà consommé (%s)" % expiry_state,
+                       info.get("public_key_fingerprint") or "")
 
     expires_ts = row.get("expires_ts")
     if expires_ts is None:
@@ -389,7 +459,8 @@ def list_approvals(db: Db, *, action: str | None = None, artifact_hash: str | No
                extract(epoch from created_at)::float8 as created_ts,
                extract(epoch from expires_at)::float8 as expires_ts,
                extract(epoch from consumed_at)::float8 as consumed_ts,
-               consumed_by, unconsumed, unexpired, key_known, key_live, key_matches
+               consumed_by, unconsumed, unexpired, key_known, key_live, key_matches,
+               key_is_owner
           FROM mesh_approvals_status
          WHERE true
     """
@@ -412,9 +483,11 @@ def find_approval(db: Db, action: str, artifact_hash: str, *, decision: str = "a
         """
         SELECT id, approver, action, artifact_kind, artifact_hash, decision, nonce,
                signed_payload, signature, signature_key,
+               extract(epoch from created_at)::float8 as created_ts,
                extract(epoch from expires_at)::float8 as expires_ts,
                extract(epoch from consumed_at)::float8 as consumed_ts,
-               consumed_by, unconsumed, unexpired, key_known, key_live, key_matches
+               consumed_by, unconsumed, unexpired, key_known, key_live, key_matches,
+               key_is_owner
           FROM mesh_approvals_status
          WHERE action = %s AND artifact_hash = %s AND decision = %s
          ORDER BY id DESC LIMIT 20
@@ -439,14 +512,50 @@ def find_approval(db: Db, action: str, artifact_hash: str, *, decision: str = "a
     return None, last
 
 
-def consume_approval(db: Db, approval_id: int, by: str) -> bool:
+def nonce_state(db: Db, approver: str, nonce: str) -> str | None:
+    """Raison si ce nonce a déjà été consommé, sinon None."""
+    if not approver or not nonce:
+        return None
     rows = db.query(
         """
-        UPDATE mesh_approvals
-           SET consumed_at = now(), consumed_by = %s
-         WHERE id = %s AND consumed_at IS NULL
-        RETURNING id
+        SELECT approver, consumed_by,
+               extract(epoch from consumed_at)::float8 as consumed_ts
+          FROM mesh_consumed_nonces
+         WHERE approver = %s AND nonce = %s
+        """,
+        (approver, nonce),
+    )
+    if not rows:
+        return None
+    return "par %s le %s" % (
+        rows[0].get("consumed_by") or "?",
+        time.strftime("%Y-%m-%d %H:%M", time.localtime(rows[0].get("consumed_ts") or 0)))
+
+
+def consume_approval(db: Db, approval_id: int, by: str) -> bool:
+    """Consomme une approbation une seule fois, par (approver, nonce).
+
+    Le reçu de consommation est une ligne de `mesh_consumed_nonces` : réinsérer
+    l'approbation sous un nouvel id ne permet pas de la rejouer, et supprimer la
+    ligne d'approbation ne supprime pas la preuve de consommation.
+    """
+    # L'INSERT ... ON CONFLICT est la décision atomique : s'il n'insère rien,
+    # le nonce était déjà consommé. La mise à jour de la ligne n'est qu'un
+    # affichage (la vérité est dans mesh_consumed_nonces, qui survit à la
+    # suppression de l'approbation).
+    rows = db.query(
+        """
+        INSERT INTO mesh_consumed_nonces (approver, nonce, approval_id, consumed_by)
+        SELECT approver, nonce, id, %s FROM mesh_approvals WHERE id = %s
+        ON CONFLICT (approver, nonce) DO NOTHING
+        RETURNING approver, nonce
         """,
         (by, int(approval_id)),
     )
-    return bool(rows)
+    if not rows:
+        return False
+    db.execute(
+        "UPDATE mesh_approvals SET consumed_at = now(), consumed_by = %s WHERE id = %s",
+        (by, int(approval_id)),
+    )
+    return True

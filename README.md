@@ -13,7 +13,7 @@ Spec: [`MESH-SPEC.md`](MESH-SPEC.md). v0 (local, files, still in production):
 |---|---|
 | 1. agent-mail on Postgres (`agent_registry`, `agent_mailbox`, migrations, LISTEN/NOTIFY, CLI compatible v0) | **done** — [`docs/V1-MAILBOX-RUNNER.md`](docs/V1-MAILBOX-RUNNER.md) |
 | 2. one runner per machine, 3 harness adapters with session resume, leases, wake on NOTIFY | **done** — same document |
-| 3. owner authority by Ed25519 signature, content- and expiry-bound; approvals with single use | **done** — [`docs/V1-AUTORITE-MESH.md`](docs/V1-AUTORITE-MESH.md) |
+| 3. owner authority by Ed25519 signature, content- and expiry-bound; two key roles (`owner` = authority, `agent` = provenance only); approvals with single use | **done** — [`docs/V1-AUTORITE-MESH.md`](docs/V1-AUTORITE-MESH.md) |
 | 4. `work_items` state machine (intake → build → qa → merged → promoted, + blocked/waiting_human), loop bound, event ledger | **done**; the board stays in git |
 | 5. `mesh list` observability | **done** — `agent-mesh list` / `show`, on `agent_mesh_overview` |
 
@@ -79,7 +79,7 @@ silently and never fail the agent.
 ```
 agent-mesh list [--json] | show <agent>
 agent-mesh key generate --out DIR --i-am-the-owner     # owner's act, never an agent
-agent-mesh key register <agent> --public-key FICHIER | key show|list|revoke <agent>
+agent-mesh key register <agent> --public-key FICHIER [--role owner|agent] | key show|list|revoke <agent>
 agent-mesh approve --key FICHIER --action A --hash H [--kind K] [--expires 48h]
 agent-mesh approvals [--action A] [--hash H] | verify --action A --hash H [--consume]
 agent-mesh work add|list|show|move|note …
@@ -113,7 +113,7 @@ scripts/test.sh                      # starts the container, runs the suite twic
 scripts/test.sh tests.test_runner    # one module
 ```
 
-110 tests against the local container, run twice (`psql`, then `psycopg` with
+129 tests against the local container, run twice (`psql`, then `psycopg` with
 `cryptography`): migrations and immutability, mailbox and LISTEN/NOTIFY round
 trips, lease races on 2 and 4 concurrent connections, **two runner processes
 competing for the same lease**, lease expiry takeover, fencing of a stale
@@ -122,7 +122,11 @@ session resume, via fake harness binaries that never call the real CLIs), v0
 hook-JSON equality, the file fallback, RFC 8032 vectors, **OpenSSL cross-check**
 of the Ed25519 implementation, signed/unsigned/tampered/expired messages,
 approval single use, `mesh list`, the work_items state machine and its loop
-bound, and v0 import/export.
+bound, v0 import/export, and the codex3 verdict probes: two key roles
+(owner/agent), signed expiry and creation time bound to the row, nonce-based
+single-use approvals, live-lease checks in renew/begin_turn/take_pending_prompt,
+heartbeat stopping the harness on DB failure, durable `current_prompt`, and the
+hook marking mail delivered only after a successful write.
 
 ## Layout
 

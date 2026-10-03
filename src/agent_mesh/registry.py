@@ -19,7 +19,7 @@ from .db import Db
 
 AGENT_COLUMNS = """
     name, chantier, harness, host, cwd, session_id, status, status_text, model,
-    budget_usd, spent_usd, turns, pending_prompt, last_error,
+    budget_usd, spent_usd, turns, pending_prompt, current_prompt, last_error,
     lease_owner, lease_epoch,
     extract(epoch from lease_expires_at)::float8 as lease_expires_ts,
     extract(epoch from last_seen)::float8         as last_seen_ts,
@@ -91,7 +91,7 @@ def overview(db: Db) -> list[dict]:
         SELECT name, chantier, harness, host, cwd, session_id, status, status_text,
                model, budget_usd, spent_usd, turns, pending_prompt, last_error,
                lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
-               public_key_fingerprint, key_ready, unread
+               public_key_fingerprint, key_role, key_ready, has_owner_key, unread
         FROM agent_mesh_overview
         ORDER BY last_seen_ts DESC NULLS LAST
         """
@@ -107,6 +107,15 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
            SET lease_owner      = %s,
                lease_expires_at = now() + make_interval(secs => %s),
                lease_epoch      = lease_epoch + 1,
+               -- R5 : si l'agent change de main avec un tour inachevé, la
+               -- consigne repart en attente au lieu d'être perdue.
+               pending_prompt   = CASE
+                   WHEN lease_owner IS DISTINCT FROM %s AND current_prompt IS NOT NULL
+                   THEN coalesce(pending_prompt, current_prompt)
+                   ELSE pending_prompt END,
+               current_prompt   = CASE
+                   WHEN lease_owner IS DISTINCT FROM %s THEN NULL
+                   ELSE current_prompt END,
                status           = CASE WHEN status = 'dead' THEN 'idle' ELSE status END,
                updated_at       = now()
          WHERE name = %s
@@ -114,7 +123,7 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
         RETURNING name, lease_owner, lease_epoch,
                   extract(epoch from lease_expires_at)::float8 as lease_expires_ts
         """,
-        (owner, ttl_seconds, name, owner),
+        (owner, ttl_seconds, owner, owner, name, owner),
     )
     return rows[0] if rows else None
 
@@ -128,6 +137,7 @@ def renew(db: Db, name: str, owner: str, epoch: int, ttl_seconds: float) -> floa
                last_seen        = now(),
                updated_at       = now()
          WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
+           AND lease_expires_at > now()
         RETURNING extract(epoch from lease_expires_at)::float8 as lease_expires_ts
         """,
         (ttl_seconds, name, owner, epoch),
@@ -234,10 +244,12 @@ def take_pending_prompt(db: Db, name: str, owner: str, epoch: int) -> str | None
               FROM agent_registry
              WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
                AND pending_prompt IS NOT NULL
+               AND lease_expires_at > now()
              FOR UPDATE
         )
         UPDATE agent_registry AS r
            SET pending_prompt = NULL,
+               current_prompt = taken.pending_prompt,
                status = 'running',
                status_text = 'tour en cours',
                updated_at = now()
@@ -256,9 +268,27 @@ def begin_turn(db: Db, name: str, owner: str, epoch: int, status_text: str) -> b
         UPDATE agent_registry
            SET status = 'running', status_text = %s, updated_at = now()
          WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
+           AND lease_expires_at > now()
         RETURNING name
         """,
         (status_text, name, owner, epoch),
+    )
+    return bool(rows)
+
+
+def restore_prompt(db: Db, name: str, owner: str, epoch: int) -> bool:
+    """Remet en attente la consigne d'un tour qui n'a pas pu démarrer."""
+    rows = db.query(
+        """
+        UPDATE agent_registry
+           SET pending_prompt = coalesce(pending_prompt, current_prompt),
+               current_prompt = NULL,
+               updated_at = now()
+         WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
+           AND current_prompt IS NOT NULL
+        RETURNING name
+        """,
+        (name, owner, epoch),
     )
     return bool(rows)
 
@@ -281,6 +311,7 @@ def end_turn(
            SET status      = %s,
                status_text = coalesce(%s, status_text),
                last_error  = %s,
+               current_prompt = NULL,
                turns       = turns + 1,
                spent_usd   = spent_usd + coalesce(%s, 0),
                last_turn_at = now(),

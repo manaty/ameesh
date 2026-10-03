@@ -104,9 +104,22 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   un `UPDATE … WHERE` réévalue la condition après le verrou de ligne : deux
   exécuteurs concurrents ne peuvent pas gagner le même agent. Testé avec 2 et 4
   connexions simultanées, puis avec **deux processus `agent-runner`**.
-* **Renouvellement** — battement pendant les tours (`renew`), `fencing` par
-  `lease_epoch` : un exécuteur dont le bail a expiré ne peut ni le prolonger, ni
-  écrire un résultat (`end_turn` est conditionné à `lease_owner` + `lease_epoch`).
+* **Fence temporel** — `renew`, `begin_turn` et `take_pending_prompt` exigent
+  tous `lease_expires_at > now()` : un bail expiré ne se prolonge pas, ne
+  démarre pas de tour et ne consomme pas de consigne. L'exécuteur doit
+  re-`claim` (nouvel epoch) pour continuer ; `end_turn` reste fencé par
+  `lease_owner` + `lease_epoch`, pour qu'un tour commencé sous bail valide
+  puisse être enregistré.
+* **Battement robuste** — une panne de base pendant un tour ne laisse pas le
+  harnais tourner sans bail : le battement compte les échecs
+  (`max(3, ttl/3)` secondes d'intervalle), et arrête le processus dès que la
+  base reste injoignable ou que l'échéance connue du bail est atteinte.
+* **Consigne durable (R5)** — `pick` ne vide plus `pending_prompt` : la
+  consigne est *déplacée* dans `current_prompt` quand le tour démarre, effacée
+  par `end_turn` en cas de succès, et **restaurée en attente** si l'agent
+  change de main (bail expiré, exécuteur mort) ou si le tour n'a pas pu
+  démarrer (harnais absent, dossier disparu). Au pire un tour est rejoué,
+  jamais une consigne perdue.
 * **Expiration** — si l'exécuteur meurt (SIGKILL, coupure), le bail expire ;
   n'importe quel exécuteur du même hôte le reprend (`lease_expires_at < now()`).
   `reap()` marque `dead` les agents dont le bail a expiré en plein tour.
@@ -184,6 +197,11 @@ Les hooks produisent le **même JSON** que la v0 (y compris la décision `Stop`
 et le plafond de 3 relances, compté localement dans
 `~/.local/state/agent-mesh/hooks/<nom>.stops`) : un test compare la sortie du
 script v0 et celle de la v1 pour les quatre événements.
+
+**Hooks : écrire d'abord, marquer ensuite.** Le JSON est écrit sur stdout et
+vidé (`flush`) *avant* de marquer les messages remis ; si le harnais a fermé son
+entrée (BrokenPipe), la remise n'a pas lieu et le courrier reste pour le tour
+suivant.
 
 **Repli** : si Postgres est injoignable et que `AGENT_MESH_BACKEND=auto`
 (défaut), la CLI écrit dans la boîte fichier v0

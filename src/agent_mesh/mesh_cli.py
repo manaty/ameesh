@@ -4,7 +4,7 @@
   agent-mesh list [--json]                     mesh list : agents, hôte, bail, non lus, budget
   agent-mesh show <agent> [--json]             détail d'un agent
   agent-mesh key generate --out DIR --i-am-the-owner   paire de clés (acte du propriétaire)
-  agent-mesh key register <agent> --public-key FICHIER  enregistre la clé PUBLIQUE
+  agent-mesh key register <agent> --public-key FICHIER [--role owner|agent]
   agent-mesh key show <agent> | key list | key revoke <agent>
   agent-mesh approve --key FICHIER --action A --hash H [--kind K] [--expires 48h]
                                                 signe une approbation liée à un artefact
@@ -101,7 +101,8 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             print("%-20s %-9s %-10s %-11s %-22s %-8d %-13s %-4s %s" % (
                 row["name"][:20], (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
                 status[:11], _lease(row), int(row.get("unread") or 0), _budget(row),
-                "oui" if row.get("key_ready") else "—",
+                ("owner" if row.get("has_owner_key")
+                 else "agent" if row.get("key_ready") else "—"),
                 _fmt_age(now - float(row.get("last_seen_ts") or 0)),
             ))
         return 0
@@ -134,8 +135,9 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         print("bail     : %s" % _lease(row))
         print("modèle   : %-9s budget : %s" % (row.get("model") or "—", _budget(row)))
         print("clé      : %s" % (
-            "%s%s" % (row.get("public_key_fingerprint") or "",
-                      " (révoquée)" if row.get("key_revoked_ts") else "")
+            "%s (rôle %s%s)" % (row.get("public_key_fingerprint") or "",
+                                row.get("key_role") or "agent",
+                                ", révoquée" if row.get("key_revoked_ts") else "")
             if row.get("key_ready") else "aucune clé publique enregistrée"))
         print("tours    : %s   dernier tour : %s" % (
             row.get("turns"), _fmt_moment(row.get("last_turn_ts"))))
@@ -171,8 +173,14 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.key_command == "register":
             public = signing.read_public(os.path.expanduser(args.public_key))
-            result = authority.register_key(db, args.agent, public, note=args.note)
-            print("clé de %s enregistrée : %s" % (result["agent"], result["fingerprint"]))
+            result = authority.register_key(
+                db, args.agent, public, role=args.role, note=args.note)
+            print("clé de %s enregistrée : %s (rôle %s)" % (
+                result["agent"], result["fingerprint"], result["role"]))
+            if result["role"] == "owner":
+                print("attention : cette clé porte l'autorité du propriétaire pour %s ; "
+                      "sa clé privée ne doit exister que chez le propriétaire."
+                      % result["agent"])
             return 0
         if args.key_command == "revoke":
             if not authority.revoke_key(db, args.agent):
@@ -190,6 +198,10 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
                 return 0
             print("agent      : %s" % info["name"])
             print("empreinte  : %s" % info.get("public_key_fingerprint"))
+            print("rôle       : %s%s" % (
+                info.get("key_role") or "agent",
+                " (autorité du propriétaire)" if info.get("key_role") == "owner"
+                else " (provenance seulement)"))
             print("clé        : %s" % info.get("public_key"))
             print("enregistrée: %s" % _fmt_moment(info.get("key_updated_ts")))
             print("révoquée   : %s" % (_fmt_moment(info.get("key_revoked_ts"))
@@ -198,7 +210,7 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
         if args.key_command == "list":
             rows = db.query(
                 """
-                SELECT name, public_key_fingerprint,
+                SELECT name, public_key_fingerprint, key_role,
                        extract(epoch from key_updated_at)::float8 as key_updated_ts,
                        extract(epoch from key_revoked_at)::float8 as key_revoked_ts
                   FROM agent_registry
@@ -213,8 +225,9 @@ def cmd_key(cfg: Config, args: argparse.Namespace) -> int:
                 print("aucune clé enregistrée")
                 return 0
             for row in rows:
-                print("%-20s %s  %s" % (
-                    row["name"], row["public_key_fingerprint"],
+                print("%-20s %-8s %s  %s" % (
+                    row["name"], row.get("key_role") or "agent",
+                    row["public_key_fingerprint"],
                     "révoquée %s" % _fmt_moment(row["key_revoked_ts"])
                     if row.get("key_revoked_ts") else "enregistrée %s"
                     % _fmt_moment(row.get("key_updated_ts"))))
@@ -523,6 +536,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_reg = key_sub.add_parser("register")
     p_reg.add_argument("agent")
     p_reg.add_argument("--public-key", required=True)
+    p_reg.add_argument("--role", choices=list(authority.KEY_ROLES), default=authority.DEFAULT_KEY_ROLE,
+                       help="owner = autorité du propriétaire ; agent = provenance seulement")
     p_reg.add_argument("--note", default=None)
     p_reg.set_defaults(func=cmd_key)
     p_kshow = key_sub.add_parser("show")

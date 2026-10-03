@@ -100,7 +100,10 @@ Aucun agent ne génère cette clé.
 agent-mesh key generate --out ~/cles-agent-mesh --name proprietaire --i-am-the-owner
 #   → ~/cles-agent-mesh/proprietaire.key (0600) : hors ligne, jamais commitée,
 #     jamais dans un message, jamais en base
-agent-mesh key register proprietaire --public-key ~/cles-agent-mesh/proprietaire.pub
+agent-mesh key register proprietaire --public-key ~/cles-agent-mesh/proprietaire.pub --role owner
+#   → --role owner est un acte explicite : il délègue l'autorité du propriétaire
+#     à cette clé. Sans --role, une clé est « agent » : elle prouve la provenance
+#     d'un agent, jamais l'autorité du propriétaire, et n'approuve rien.
 
 # preuve de bout en bout sur un artefact jetable
 H=$(printf 'essai' | sha256sum | cut -d' ' -f1)
@@ -266,5 +269,6 @@ relancer les boucles v0 des agents concernés.
 | un agent tourne à deux endroits | le bail est exclusif ; vérifier `agent-mesh list` après chaque étape |
 | la clé privée fuite | clé hors ligne, `0600`, `key revoke` immédiat, jamais en base |
 | une approbation rejouée | `verify --consume` la consomme une fois ; `consumed_at` est en base |
+| une clé d'agent se fait passer pour l'autorité | rôles `owner`/`agent` : seule une clé `owner` porte l'autorité et approuve ; `key list` montre le rôle |
 | une boucle qa→build s'emballe | bornée à 2 retours, puis `blocked`/`waiting_human` |
 | le disque du PC meurt | étape 1, exercice de restauration, puis M4 (deuxième machine) |

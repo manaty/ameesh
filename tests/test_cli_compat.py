@@ -1,12 +1,16 @@
 """Compatibilité v0 : commandes et surtout JSON des hooks, à l'octet près."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import unittest
+from unittest import mock
+
+from agent_mesh import cli
 
 from .support import REPO, PgTestCase
 
@@ -94,6 +98,40 @@ class CliCompatTest(PgTestCase):
                                 stdin=stdin)
                 self.assertEqual(proc.returncode, 0)
                 self.assertEqual(proc.stdout, "")
+
+    def test_hook_ne_consomme_pas_si_l_ecriture_echoue(self):
+        """Sonde codex3 (7) : un harnais qui ferme son entrée ne perd pas le message."""
+        name = "kilo"
+        self._seed(name, "beta", "message à ne pas perdre")
+
+        class _Broken(io.TextIOBase):
+            def write(self, _data):
+                raise BrokenPipeError("harnais parti")
+
+            def flush(self):
+                raise BrokenPipeError("harnais parti")
+
+            def close(self):
+                pass  # le finaliseur ne doit pas relancer l'exception
+
+        payload = json.dumps({"hook_event_name": "SessionStart", "cwd": self.tmp})
+        with mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": name}), \
+                mock.patch.object(sys, "stdin", io.StringIO(payload)), \
+                mock.patch.object(sys, "stdout", _Broken()):
+            self.assertEqual(cli.cmd_hook(self.cfg, "claude"), 0)
+        restant = self.db.query(
+            "SELECT count(*)::int AS n FROM agent_mailbox "
+            "WHERE recipient = %s AND delivered_at IS NULL", (name,))[0]["n"]
+        self.assertEqual(restant, 1, "le message ne doit pas être marqué remis")
+
+        # écriture normale : le message est bien remis
+        payload = json.dumps({"hook_event_name": "SessionStart", "cwd": self.tmp})
+        proc = self.cli("hook", "claude", env=self.env(AGENT_MAIL_NAME=name), stdin=payload)
+        self.assertEqual(proc.returncode, 0)
+        restant = self.db.query(
+            "SELECT count(*)::int AS n FROM agent_mailbox "
+            "WHERE recipient = %s AND delivered_at IS NULL", (name,))[0]["n"]
+        self.assertEqual(restant, 0)
 
     def test_hook_stop_plafonne_a_trois_relances(self):
         """Comme la v0 : au plus 3 relances forcées d'affilée, puis silence."""

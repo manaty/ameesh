@@ -129,6 +129,69 @@ class RegistryTest(PgTestCase):
         self.assertFalse(registry.end_turn(self.db, "alpha", "runner-a", epoch_a, status="idle"))
         self.assertEqual(int(registry.get(self.db, "alpha")["turns"]), 0)
 
+    def test_renew_refuse_un_bail_expire(self):
+        registry.upsert(self.db, "alpha", harness="claude", host="laptop")
+        lease = registry.claim(self.db, "alpha", "runner-a", 1.0)
+        epoch = int(lease["lease_epoch"])
+        time.sleep(1.3)
+        self.assertIsNone(registry.renew(self.db, "alpha", "runner-a", epoch, 60))
+        # le même exécuteur peut reprendre le bail, mais par un nouveau claim
+        again = registry.claim(self.db, "alpha", "runner-a", 60)
+        self.assertEqual(int(again["lease_epoch"]), epoch + 1)
+        self.assertIsNotNone(registry.renew(self.db, "alpha", "runner-a", epoch + 1, 60))
+
+    def test_begin_turn_refuse_un_bail_expire(self):
+        registry.upsert(self.db, "alpha", harness="claude", host="laptop")
+        registry.set_pending_prompt(self.db, "alpha", "consigne")
+        lease = registry.claim(self.db, "alpha", "runner-a", 1.0)
+        epoch = int(lease["lease_epoch"])
+        time.sleep(1.3)
+        self.assertFalse(registry.begin_turn(self.db, "alpha", "runner-a", epoch, "tour"))
+        self.assertIsNone(
+            registry.take_pending_prompt(self.db, "alpha", "runner-a", epoch))
+        self.assertTrue(registry.begin_turn(
+            self.db, "alpha", *(lambda l: ("runner-a", int(l["lease_epoch"])))(
+                registry.claim(self.db, "alpha", "runner-a", 60)), "tour"))
+
+    def test_consigne_survit_a_la_mort_de_l_executeur(self):
+        """R5 : la consigne d'un tour interrompu repart en attente pour le suivant."""
+        registry.upsert(self.db, "alpha", harness="claude", host="laptop")
+        registry.set_pending_prompt(self.db, "alpha", "travail à ne pas perdre")
+        lease = registry.claim(self.db, "alpha", "runner-a", 60)
+        epoch = int(lease["lease_epoch"])
+        self.assertEqual(
+            registry.take_pending_prompt(self.db, "alpha", "runner-a", epoch),
+            "travail à ne pas perdre")
+        row = registry.get(self.db, "alpha")
+        self.assertIsNone(row["pending_prompt"])
+        self.assertEqual(row["current_prompt"], "travail à ne pas perdre")
+
+        # l'exécuteur meurt : le bail expire, un autre reprend l'agent
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
+            "WHERE name = 'alpha'")
+        nouveau = registry.claim(self.db, "alpha", "runner-b", 60)
+        self.assertIsNotNone(nouveau)
+        row = registry.get(self.db, "alpha")
+        self.assertEqual(row["pending_prompt"], "travail à ne pas perdre",
+                         "la consigne doit être restaurée au changement de main")
+        self.assertIsNone(row["current_prompt"])
+        self.assertEqual(
+            registry.take_pending_prompt(self.db, "alpha", "runner-b", int(nouveau["lease_epoch"])),
+            "travail à ne pas perdre")
+
+    def test_restore_prompt(self):
+        registry.upsert(self.db, "alpha", harness="claude", host="laptop")
+        registry.set_pending_prompt(self.db, "alpha", "consigne")
+        lease = registry.claim(self.db, "alpha", "runner-a", 60)
+        epoch = int(lease["lease_epoch"])
+        registry.take_pending_prompt(self.db, "alpha", "runner-a", epoch)
+        self.assertTrue(registry.restore_prompt(self.db, "alpha", "runner-a", epoch))
+        row = registry.get(self.db, "alpha")
+        self.assertEqual(row["pending_prompt"], "consigne")
+        self.assertIsNone(row["current_prompt"])
+        self.assertFalse(registry.restore_prompt(self.db, "alpha", "runner-a", epoch))
+
     def test_renew_prolonge(self):
         registry.upsert(self.db, "alpha", harness="claude", host="laptop")
         lease = registry.claim(self.db, "alpha", "runner-a", 5)

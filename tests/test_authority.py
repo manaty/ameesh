@@ -11,7 +11,7 @@ import os
 import time
 import unittest
 
-from agent_mesh import authority, mail, registry, signing
+from agent_mesh import authority, db as db_mod, mail, registry, signing
 
 from .support import PgTestCase
 
@@ -27,7 +27,7 @@ class AuthorityTest(PgTestCase):
         # clé de TEST, éphémère, dans le bac à sable (jamais la clé réelle)
         self.seed = signing.backend("pure").generate_seed()
         self.public = signing.backend("pure").public_from_seed(self.seed)
-        authority.register_key(self.db, OWNER, self.public)
+        authority.register_key(self.db, OWNER, self.public, role="owner")
 
     def sign_and_send(self, text: str = "décision du propriétaire", ttl: float = 3600.0):
         signed = authority.sign_message(
@@ -51,7 +51,7 @@ class AuthorityTest(PgTestCase):
         self.assertIn("révoquée", verdict.reason)
 
         # ré-enregistrer la clé lève la révocation
-        authority.register_key(self.db, OWNER, self.public)
+        authority.register_key(self.db, OWNER, self.public, role="owner")
         self.assertTrue(authority.verify_message(self.db, message))
 
     def test_cle_non_enregistree(self):
@@ -63,6 +63,85 @@ class AuthorityTest(PgTestCase):
         verdict = authority.verify_message(self.db, row)
         self.assertFalse(verdict)
         self.assertIn("aucune clé publique", verdict.reason)
+
+    def test_cle_d_agent_authentifie_sans_autorite(self):
+        """Une clé d'agent prouve la provenance, jamais l'autorité du propriétaire."""
+        registry.upsert(self.db, "codex3", harness="codex", host=self.cfg.host)
+        seed = signing.backend("pure").generate_seed()
+        public = signing.backend("pure").public_from_seed(seed)
+        authority.register_key(self.db, "codex3", public)  # défaut : rôle agent
+        self.assertEqual(authority.key_info(self.db, "codex3")["key_role"], "agent")
+
+        signed = authority.sign_message(
+            seed, sender="codex3", recipient=AGENT, body="compte rendu", ttl=600)
+        mail.send(self.db, "codex3", AGENT, "compte rendu", **signed)
+        row = mail.normalize(mail.unread(self.db, AGENT)[0])
+        verdict = authority.verify_message(self.db, row)
+        self.assertTrue(verdict.ok, verdict.reason)   # la signature est valide
+        self.assertTrue(verdict.authentic)
+        self.assertEqual(verdict.role, "agent")
+        self.assertFalse(verdict.authority)           # mais ce n'est pas l'autorité
+        self.assertNotIn("propriétaire prouvée", verdict.reason)
+
+    def test_hook_cle_d_agent_ne_dit_pas_autorite(self):
+        registry.upsert(self.db, "codex3", harness="codex", host=self.cfg.host)
+        seed = signing.backend("pure").generate_seed()
+        public = signing.backend("pure").public_from_seed(seed)
+        authority.register_key(self.db, "codex3", public)
+        private_path = os.path.join(self.tmp, "agent.key")
+        with open(private_path, "w", encoding="utf-8") as fh:
+            fh.write(signing.encode_private(seed))
+        os.chmod(private_path, 0o600)
+        envoi = self.cli("send", AGENT, "rapport d'agent", "--sign", "--key", private_path,
+                         env=self.env(AGENT_MAIL_NAME="codex3"))
+        self.assertEqual(envoi.returncode, 0, envoi.stderr)
+        payload = json.dumps({"hook_event_name": "SessionStart", "cwd": self.tmp})
+        hook = self.cli("hook", "deepseek", env=self.env(AGENT_MAIL_NAME=AGENT),
+                        stdin=payload)
+        sortie = json.loads(hook.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("PROUVÉE", sortie)
+        self.assertIn("sans autorité propriétaire", sortie)
+        self.assertIn("rapport d'agent", sortie)
+
+    def test_approbation_refusee_pour_cle_d_agent(self):
+        registry.upsert(self.db, "codex3", harness="codex", host=self.cfg.host)
+        seed = signing.backend("pure").generate_seed()
+        public = signing.backend("pure").public_from_seed(seed)
+        authority.register_key(self.db, "codex3", public)
+        with self.assertRaises(authority.AuthorityError) as ctx:
+            authority.create_approval(
+                self.db, seed, approver="codex3", action="merge", artifact_kind="diff",
+                artifact_hash=authority.hash_artifact("diff"))
+        self.assertIn("rôle", str(ctx.exception))
+
+    def test_approbation_inseree_de_force_par_cle_d_agent_refusee(self):
+        """Même écrite en base à la main, une approbation d'agent ne vaut rien."""
+        registry.upsert(self.db, "codex3", harness="codex", host=self.cfg.host)
+        seed = signing.backend("pure").generate_seed()
+        public = signing.backend("pure").public_from_seed(seed)
+        authority.register_key(self.db, "codex3", public)
+        artifact = authority.hash_artifact("diff forcé")
+        built = authority.build_approval(
+            seed, approver="codex3", action="merge", artifact_kind="diff",
+            artifact_hash=artifact, ttl=3600)
+        self.db.query(
+            """
+            INSERT INTO mesh_approvals
+                (approver, action, artifact_kind, artifact_hash, decision, nonce,
+                 signed_payload, signature, signature_key, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    to_timestamp(%s::bigint / 1000000.0))
+            RETURNING id
+            """,
+            (built["approver"], built["action"], built["artifact_kind"],
+             built["artifact_hash"], built["decision"], built["nonce"],
+             built["signed_payload"], built["signature"], built["signature_key"],
+             built["expires_us"]),
+        )
+        row, verdict = authority.find_approval(self.db, "merge", artifact)
+        self.assertIsNone(row)
+        self.assertFalse(verdict)
+        self.assertIn("propriétaire", verdict.reason)
 
     def test_empreinte_inconnue_refusee(self):
         _id, message = self.sign_and_send()
@@ -165,12 +244,12 @@ class AuthorityTest(PgTestCase):
         self.assertIn("consommée", verdict2.reason)
 
     def test_approbation_expiree(self):
+        """Expiration réelle (échéance signée courte), sans toucher la base."""
         artifact = authority.hash_artifact("migration 0005")
-        built = authority.create_approval(
+        authority.create_approval(
             self.db, self.seed, approver=OWNER, action="migration", artifact_kind="migration",
-            artifact_hash=artifact, ttl=3600)
-        self.db.execute("UPDATE mesh_approvals SET expires_at = now() - interval '1 second' "
-                        "WHERE id = %s", (built["id"],))
+            artifact_hash=artifact, ttl=1.0)
+        time.sleep(1.2)
         row, verdict = authority.find_approval(self.db, "migration", artifact)
         self.assertIsNone(row)
         self.assertIn("expirée", verdict.reason)
@@ -186,6 +265,81 @@ class AuthorityTest(PgTestCase):
             self.db, "production", authority.hash_artifact("release 2.0"))
         self.assertIsNone(row)
         self.assertIn("ne correspond pas", verdict.reason)
+
+    def test_echeance_signee_non_modifiable_en_base(self):
+        """Sonde codex3 (1) : étendre expires_at ne ressuscite pas un reçu."""
+        artifact = authority.hash_artifact("diff à ne pas ressusciter")
+        built = authority.create_approval(
+            self.db, self.seed, approver=OWNER, action="merge", artifact_kind="diff",
+            artifact_hash=artifact, ttl=600)
+        self.db.execute("UPDATE mesh_approvals SET expires_at = now() + interval '30 days' "
+                        "WHERE id = %s", (built["id"],))
+        row, verdict = authority.find_approval(self.db, "merge", artifact)
+        self.assertIsNone(row)
+        self.assertFalse(verdict)
+        self.assertIn("échéance signée", verdict.reason)
+
+    def test_horodatage_signe_non_modifiable_en_base(self):
+        artifact = authority.hash_artifact("diff horodaté")
+        built = authority.create_approval(
+            self.db, self.seed, approver=OWNER, action="merge", artifact_kind="diff",
+            artifact_hash=artifact, ttl=3600)
+        self.db.execute("UPDATE mesh_approvals SET created_at = now() - interval '10 days' "
+                        "WHERE id = %s", (built["id"],))
+        row, verdict = authority.find_approval(self.db, "merge", artifact)
+        self.assertIsNone(row)
+        self.assertIn("horodatage signé", verdict.reason)
+
+    def test_approbation_reinseree_apres_consommation_refusee(self):
+        """Sonde codex3 (2) : le reçu de consommation survit à la ligne d'approbation."""
+        artifact = authority.hash_artifact("diff rejoué")
+        built = authority.create_approval(
+            self.db, self.seed, approver=OWNER, action="merge", artifact_kind="diff",
+            artifact_hash=artifact, ttl=3600)
+        self.assertTrue(authority.consume_approval(self.db, built["id"], AGENT))
+        # on supprime la ligne consommée et on réinsère le même reçu signé
+        self.db.execute("DELETE FROM mesh_approvals WHERE id = %s", (built["id"],))
+        copy_id = self.db.query(
+            """
+            INSERT INTO mesh_approvals
+                (approver, action, artifact_kind, artifact_hash, decision, nonce,
+                 signed_payload, signature, signature_key, created_at, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    to_timestamp(%s::bigint / 1000000.0), to_timestamp(%s::bigint / 1000000.0))
+            RETURNING id
+            """,
+            (built["approver"], built["action"], built["artifact_kind"],
+             built["artifact_hash"], built["decision"], built["nonce"],
+             built["signed_payload"], built["signature"], built["signature_key"],
+             built["created_us"], built["expires_us"]),
+        )[0]["id"]
+        row, verdict = authority.find_approval(self.db, "merge", artifact)
+        self.assertIsNone(row)
+        self.assertIn("nonce déjà consommé", verdict.reason)
+        self.assertFalse(authority.verify_approval(
+            self.db, authority.list_approvals(self.db)[0]))
+        # une seconde consommation est refusée
+        self.assertFalse(authority.consume_approval(self.db, int(copy_id), AGENT))
+
+    def test_approbation_en_double_refusee_par_la_base(self):
+        """L'index unique (approver, nonce) empêche la copie directe."""
+        artifact = authority.hash_artifact("diff copié")
+        built = authority.create_approval(
+            self.db, self.seed, approver=OWNER, action="merge", artifact_kind="diff",
+            artifact_hash=artifact, ttl=3600)
+        with self.assertRaises(db_mod.DbError):
+            self.db.query(
+                """
+                INSERT INTO mesh_approvals
+                    (approver, action, artifact_kind, artifact_hash, decision, nonce,
+                     signed_payload, signature, signature_key, expires_at)
+                SELECT approver, action, artifact_kind, artifact_hash, decision, nonce,
+                       signed_payload, signature, signature_key, expires_at
+                  FROM mesh_approvals WHERE id = %s
+                RETURNING id
+                """,
+                (built["id"],),
+            )
 
     def test_approbation_cle_non_enregistree_refusee(self):
         autre_seed = signing.backend("pure").generate_seed()

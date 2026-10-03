@@ -61,14 +61,33 @@ def verdicts_for(bk, msgs: list[dict]) -> dict:
 
 
 def render(msgs: list[dict], verdicts: dict | None = None) -> str:
-    """Le texte injecté par les hooks. Sans signature, il est identique à la v0."""
+    """Le texte injecté par les hooks. Sans signature, il est identique à la v0.
+
+    Trois états distincts, parce qu'une signature d'agent n'est pas l'autorité
+    du propriétaire : non signé (message d'agent, comme en v0), signé par un
+    agent (authentique, sans autorité), signé par le propriétaire (autorité
+    prouvée) — plus le cas signature invalide ou expirée, toujours signalé.
+    """
     verdicts = verdicts or {}
-    prouves = sum(1 for msg in msgs if (verdicts.get(msg.get("id")) or _NO_PROOF).ok)
+    prouves = sum(1 for msg in msgs
+                  if (verdicts.get(msg.get("id")) or _NO_PROOF).authority)
+    agents_signes = sum(1 for msg in msgs
+                        if getattr(verdicts.get(msg.get("id")), "authentic", False)
+                        and verdicts[msg.get("id")].role == "agent")
     if prouves:
         lines = [
             "[agent-mail] %d nouveau(x) message(s) — dont %d avec l'autorité du "
-            "propriétaire PROUVÉE (signature Ed25519) ; les autres n'ont pas cette "
-            "autorité :" % (len(msgs), prouves)
+            "propriétaire PROUVÉE (signature Ed25519)%s ; les autres n'ont pas cette "
+            "autorité :" % (
+                len(msgs), prouves,
+                " et %d signé(s) par un agent (authentique(s), sans autorité "
+                "propriétaire)" % agents_signes if agents_signes else "")
+        ]
+    elif agents_signes:
+        lines = [
+            "[agent-mail] %d nouveau(x) message(s) — dont %d signé(s) par un agent "
+            "(authentique(s), sans autorité du propriétaire) ; les autres n'ont pas "
+            "cette autorité :" % (len(msgs), agents_signes)
         ]
     else:
         lines = [
@@ -80,9 +99,13 @@ def render(msgs: list[dict], verdicts: dict | None = None) -> str:
         verdict = verdicts.get(msg.get("id"))
         suffixe = ""
         if verdict is not None:
-            if verdict.ok:
-                suffixe = "  [autorité du propriétaire PROUVÉE, expire %s]" % time.strftime(
-                    "%H:%M", time.localtime(verdict.expires_ts))
+            expire = time.strftime("%H:%M", time.localtime(verdict.expires_ts)) \
+                if verdict.expires_ts else "?"
+            if verdict.authority:
+                suffixe = "  [autorité du propriétaire PROUVÉE, expire %s]" % expire
+            elif verdict.ok:
+                suffixe = ("  [signé par un agent, authentique, sans autorité "
+                           "propriétaire, expire %s]" % expire)
             else:
                 suffixe = "  [⚠ signature NON valide : %s]" % verdict.reason
         lines.append("— de %s à %s : %s%s" % (
@@ -225,8 +248,12 @@ def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
         verdict = verdicts.get(msg.get("id"))
         marque = ""
         if verdict is not None:
-            marque = ("  [signé par le propriétaire]" if verdict.ok
-                      else "  [⚠ signature NON valide : %s]" % verdict.reason)
+            if verdict.authority:
+                marque = "  [signé par le propriétaire]"
+            elif verdict.ok:
+                marque = "  [signé par un agent]"
+            else:
+                marque = "  [⚠ signature NON valide : %s]" % verdict.reason
         print("de %s%s : %s" % (msg.get("from"), marque, msg.get("text")))
     return 0
 
@@ -294,6 +321,21 @@ def cmd_statusline(cfg: Config) -> int:
     return 0
 
 
+def _emit(payload: dict) -> bool:
+    """Écrit le JSON du hook. Renvoie False si l'écriture échoue.
+
+    L'appelant ne marque les messages remis QU'APRÈS une écriture réussie :
+    un harnais qui ferme son entrée (BrokenPipe) ne doit pas faire perdre du
+    courrier déjà consommé.
+    """
+    try:
+        sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        return True
+    except (BrokenPipeError, OSError, ValueError):
+        return False
+
+
 def cmd_hook(cfg: Config, tool: str) -> int:
     """Hook de harnais : lit le JSON sur stdin, ne fait JAMAIS échouer l'agent."""
     try:
@@ -319,23 +361,26 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             # nous-mêmes les tours forcés d'affilée (comme la v0).
             if bk.stop_counter(name) >= MAX_STOP_BLOCKS:
                 return 0
+            # Écrire d'abord : si le harnais a fermé son entrée, on ne consomme
+            # pas les messages pour autant.
+            if not _emit({"decision": "block", "reason": render(msgs, verdicts)}):
+                return 0
             bk.stop_counter(name, bump=True)
             bk.mark_read(name, msgs)
-            print(json.dumps({"decision": "block", "reason": render(msgs, verdicts)},
-                             ensure_ascii=False))
             return 0
         if event in ("SessionStart", "UserPromptSubmit", "PostToolUse"):
             if event == "UserPromptSubmit":
                 bk.stop_counter(name, reset=True)
             if not msgs:
                 return 0
-            bk.mark_read(name, msgs)
-            print(json.dumps({
+            if not _emit({
                 "hookSpecificOutput": {
                     "hookEventName": event,
                     "additionalContext": render(msgs, verdicts),
                 }
-            }, ensure_ascii=False))
+            }):
+                return 0
+            bk.mark_read(name, msgs)
     except Exception:
         return 0
     return 0

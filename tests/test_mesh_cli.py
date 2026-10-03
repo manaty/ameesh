@@ -6,7 +6,7 @@ import json
 import os
 import unittest
 
-from agent_mesh import authority, mail, registry, signing
+from agent_mesh import authority, mail, migrations, registry, signing
 
 from .support import PgTestCase
 
@@ -30,7 +30,7 @@ class MeshCliTest(PgTestCase):
 
     # -- list / show -------------------------------------------------------
     def test_list_et_json(self):
-        authority.register_key(self.db, OWNER, self.public)
+        authority.register_key(self.db, OWNER, self.public, role="owner")
         mail.send(self.db, OWNER, AGENT, "un message")
         proc = self.mesh("list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -44,7 +44,7 @@ class MeshCliTest(PgTestCase):
         self.assertEqual(colonnes[-1], "0s")  # vu récemment
         self.assertIn("1", colonnes)          # un non lu
         ligne_owner = [l for l in proc.stdout.splitlines() if l.startswith(OWNER)][0]
-        self.assertIn("oui", ligne_owner)  # clé enregistrée
+        self.assertIn("owner", ligne_owner)  # clé propriétaire enregistrée
 
         proc = self.mesh("list", "--json")
         rows = json.loads(proc.stdout)
@@ -80,13 +80,23 @@ class MeshCliTest(PgTestCase):
         proc = self.mesh("key", "register", OWNER, "--public-key", public_path)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(empreinte, proc.stdout)
+        self.assertIn("rôle agent", proc.stdout)  # moindre privilège par défaut
 
         proc = self.mesh("key", "show", OWNER, "--json")
         self.assertEqual(json.loads(proc.stdout)["public_key_fingerprint"], empreinte)
+        self.assertEqual(json.loads(proc.stdout)["key_role"], "agent")
 
         proc = self.mesh("key", "list")
         self.assertIn(OWNER, proc.stdout)
-        self.assertIn("enregistrée", proc.stdout)
+        self.assertIn("agent", proc.stdout)
+
+        # acte explicite : la même clé devient clé propriétaire
+        proc = self.mesh("key", "register", OWNER, "--public-key", public_path,
+                         "--role", "owner")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("autorité du propriétaire", proc.stdout)
+        self.assertEqual(
+            json.loads(self.mesh("key", "show", OWNER, "--json").stdout)["key_role"], "owner")
 
         proc = self.mesh("key", "revoke", OWNER)
         self.assertEqual(proc.returncode, 0)
@@ -102,7 +112,7 @@ class MeshCliTest(PgTestCase):
 
     # -- approbations ------------------------------------------------------
     def test_approve_verify_consume(self):
-        authority.register_key(self.db, OWNER, self.public)
+        authority.register_key(self.db, OWNER, self.public, role="owner")
         artifact = authority.hash_artifact("diff --git a/x b/x\n+1")
         proc = self.mesh("approve", "--key", self.key_path, "--action", "merge",
                          "--hash", artifact, "--kind", "diff", "--as", OWNER,
@@ -124,6 +134,24 @@ class MeshCliTest(PgTestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("consommée", proc.stderr)
 
+    def test_approve_refuse_avec_cle_d_agent(self):
+        """Une clé d'agent ne peut pas approuver, même enregistrée."""
+        proc = self.mesh("key", "register", OWNER, "--public-key",
+                         self._public_path(), "--role", "agent")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        artifact = authority.hash_artifact("diff d'agent")
+        proc = self.mesh("approve", "--key", self.key_path, "--action", "merge",
+                         "--hash", artifact, "--as", OWNER)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("rôle", proc.stderr)
+        self.assertEqual(authority.list_approvals(self.db), [])
+
+    def _public_path(self) -> str:
+        path = os.path.join(self.tmp, "owner.pub")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(signing.encode_public(self.public))
+        return path
+
     def test_approve_refuse_sans_cle_enregistree(self):
         artifact = authority.hash_artifact("peu importe")
         proc = self.mesh("approve", "--key", self.key_path, "--action", "merge",
@@ -133,7 +161,7 @@ class MeshCliTest(PgTestCase):
         self.assertEqual(authority.list_approvals(self.db), [])
 
     def test_approvals_liste(self):
-        authority.register_key(self.db, OWNER, self.public)
+        authority.register_key(self.db, OWNER, self.public, role="owner")
         artifact = authority.hash_artifact("release")
         authority.create_approval(
             self.db, self.seed, approver=OWNER, action="production",
@@ -237,7 +265,8 @@ class MeshCliTest(PgTestCase):
         proc = self.mesh("doctor")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("verdict    : OK", proc.stdout)
-        self.assertIn("4/4 appliquées", proc.stdout)
+        total = len(migrations.discover())
+        self.assertIn("%d/%d appliquées" % (total, total), proc.stdout)
 
 
 if __name__ == "__main__":

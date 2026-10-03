@@ -46,6 +46,8 @@ def log(message: str) -> None:
 
 
 class AgentWorker(threading.Thread):
+    #: nombre d'échecs de battement consécutifs avant d'arrêter le harnais
+    MAX_RENEW_FAILURES = 3
     """Un agent = un bail + une boucle de tours sur cette machine.
 
     C'est un thread : en mode service plusieurs agents tournent en parallèle,
@@ -68,6 +70,8 @@ class AgentWorker(threading.Thread):
         self.nudged = False
         self.last_activity = time.monotonic()
         self.state_dir = self.cfg.agent_dir(self.name)
+        self.renew_failures = 0
+        self.lease_deadline = float(lease.get("lease_expires_ts") or 0.0)
 
     # -- état local --------------------------------------------------------
     def _path(self, name: str) -> str:
@@ -90,14 +94,30 @@ class AgentWorker(threading.Thread):
 
     # -- bail --------------------------------------------------------------
     def renew(self) -> bool:
+        """Prolonge le bail. Une panne de base ne laisse pas le harnais tourner
+        sans bail : après quelques échecs ou à l'échéance connue, on l'arrête."""
         if self.lease_lost.is_set():
             return False
-        if registry.renew(self.db, self.name, self.runner.runner_id, self.epoch,
-                          self.runner.lease_ttl) is None:
+        try:
+            expires = registry.renew(self.db, self.name, self.runner.runner_id, self.epoch,
+                                     self.runner.lease_ttl)
+        except db_mod.DbError as exc:
+            self.renew_failures += 1
+            log("[%s] battement : base injoignable (%s) — échec %d/%d"
+                % (self.name, exc, self.renew_failures, self.MAX_RENEW_FAILURES))
+            if self.renew_failures >= self.MAX_RENEW_FAILURES or time.time() >= self.lease_deadline:
+                log("[%s] bail considéré perdu (base injoignable) : arrêt du harnais" % self.name)
+                self.lease_lost.set()
+                self.terminate()
+                return False
+            return True  # on laisse une chance au prochain battement
+        if expires is None:
             log("[%s] bail perdu (epoch %d) : arrêt du tour" % (self.name, self.epoch))
             self.lease_lost.set()
             self.terminate()
             return False
+        self.renew_failures = 0
+        self.lease_deadline = float(expires)
         return True
 
     def release_lease(self) -> None:
@@ -173,8 +193,7 @@ class AgentWorker(threading.Thread):
             adapter = self._adapter()
         except adapters.HarnessMissing as exc:
             log("[%s] %s" % (self.name, exc))
-            registry.set_status(self.db, self.name, "blocked",
-                                status_text="harnais absent", error=str(exc))
+            self.fail_turn("harnais absent", str(exc))
             return False
 
         session = self.agent.get("session_id") or self.read_session_file()
@@ -193,8 +212,7 @@ class AgentWorker(threading.Thread):
         if not cwd or not os.path.isdir(cwd):
             message = "dossier de travail absent : %r" % (cwd,)
             log("[%s] %s" % (self.name, message))
-            registry.end_turn(self.db, self.name, self.runner.runner_id, self.epoch,
-                              status="blocked", status_text="dossier absent", error=message)
+            self.fail_turn("dossier absent", message)
             return False
 
         env = os.environ.copy()
@@ -285,6 +303,12 @@ class AgentWorker(threading.Thread):
             # Si le hook du harnais les a déjà remis, c'est un no-op.
             mail.mark_delivered(self.db, spec["ids"])
         return ok
+
+    def fail_turn(self, status_text: str, error: str) -> None:
+        """Un tour qui n'a pas pu démarrer : la consigne repart en attente (R5)."""
+        registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+        registry.set_status(self.db, self.name, "blocked",
+                            status_text=status_text, error=error)
 
     def _parse(self, adapter: adapters.HarnessAdapter, line: str) -> dict:
         try:

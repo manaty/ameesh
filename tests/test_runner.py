@@ -5,8 +5,10 @@ import os
 import threading
 import time
 import unittest
+from unittest import mock
 
-from agent_mesh import adapters, mail, registry
+from agent_mesh import adapters, db as db_mod, mail, registry
+from agent_mesh.runner import AgentWorker, Runner
 
 from .support import PgTestCase
 
@@ -87,6 +89,51 @@ class RunnerTest(PgTestCase):
         self.assertIn("introuvable", row["last_error"])
         self.assertEqual(self.turns(), [])
         self.assertEqual(proc.stdout.count("introuvable"), 1)
+
+    def test_consigne_restauree_apres_echec_au_demarrage(self):
+        """Sonde codex3 (6) : un tour qui ne démarre pas ne perd pas sa consigne."""
+        cwd = self._cwd("restaure")
+        self.register("restaure", "claude", cwd=cwd, prompt="consigne à retrouver")
+        env = self.env(AGENT_MESH_CLAUDE_BIN=os.path.join(self.tmp, "claude-absent"))
+        proc = self.runner("--once", "--agents", "restaure", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        row = registry.get(self.db, "restaure")
+        self.assertEqual(row["status"], "blocked")
+        self.assertEqual(row["pending_prompt"], "consigne à retrouver")
+        self.assertIsNone(row["current_prompt"])
+
+        # le tour suivant repart avec la même consigne, sans intervention
+        proc = self.runner("--once", "--agents", "restaure")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(len(self.turns()), 1)
+        self.assertEqual(self.turns()[0]["argv"][-1], "consigne à retrouver")
+        self.assertIsNone(registry.get(self.db, "restaure")["pending_prompt"])
+
+    def test_battement_arrete_le_harnais_si_la_base_reste_injoignable(self):
+        """Sonde codex3 (5) : un DbError ne doit pas laisser le harnais sans bail."""
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "bravo", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 3600},
+        )
+        with mock.patch.object(registry, "renew", side_effect=db_mod.DbError("base absente")):
+            self.assertTrue(worker.renew())    # 1er échec : sursis
+            self.assertTrue(worker.renew())    # 2e échec : sursis
+            self.assertFalse(worker.renew())   # 3e : bail considéré perdu
+        self.assertTrue(worker.lease_lost.is_set())
+
+    def test_battement_arrete_le_harnais_a_l_echeance_connue(self):
+        """Même avec un seul échec, si l'échéance du bail est atteinte on arrête."""
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "charlie", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() - 1},
+        )
+        with mock.patch.object(registry, "renew", side_effect=db_mod.DbError("base absente")):
+            self.assertFalse(worker.renew())
+        self.assertTrue(worker.lease_lost.is_set())
 
     def test_dossier_absent_marque_bloque(self):
         self.register("sansdossier", "claude", cwd=os.path.join(self.tmp, "jamais-cree"),

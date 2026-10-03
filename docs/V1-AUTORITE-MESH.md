@@ -13,9 +13,10 @@ réel n'est branché, la bascule est décrite dans [`BASCULE.md`](BASCULE.md).
 **L'autorité ne se déduit jamais d'un texte.** Un message ou une approbation ne
 porte l'autorité du propriétaire que si trois conditions sont réunies :
 
-1. **clé connue** — l'expéditeur a une clé *publique* enregistrée dans
-   `agent_registry.public_key`, et cette clé n'est pas révoquée
-   (`key_revoked_at IS NULL`). La clé privée ne touche jamais la base ;
+1. **clé propriétaire connue** — l'expéditeur a une clé *publique* enregistrée
+   dans `agent_registry.public_key` avec `key_role = 'owner'`, et cette clé
+   n'est pas révoquée (`key_revoked_at IS NULL`). La clé privée ne touche
+   jamais la base ;
 2. **contenu couvert** — la signature Ed25519 vérifie sur un payload canonique
    qui *est exactement* le contenu stocké :
    `agent-mesh/v1|message|{"expires":…,"from":…,"kind":"message","nonce":…,"text":…,"to":…,"ts":…,"v":1}`
@@ -23,17 +24,42 @@ porte l'autorité du propriétaire que si trois conditions sont réunies :
    ligne et exige l'égalité avec `signed_payload`, puis vérifie la signature :
    modifier le corps, le destinataire, l'horodatage ou le nonce invalide la
    preuve ;
-3. **échéance** — `signature_expires_at` est dans le futur. Une signature
-   expirée est signalée comme telle, jamais ignorée.
+3. **échéance** — `signature_expires_at` est dans le futur, **et c'est
+   exactement l'échéance signée** : la colonne et le payload doivent coïncider
+   (au microsecondes près). Modifier `expires_at` en base ne ressuscite donc
+   pas une signature expirée ; il en va de même de `created_at` pour les
+   approbations. Une signature expirée est signalée comme telle, jamais
+   ignorée.
 
-Une signature invalide **ne retombe pas** dans « message d'agent ordinaire » :
-elle est rendue visible (`[⚠ signature NON valide : …]`). Un message non signé
-reste exactement ce qu'il était en v0 : un message d'agent, sans autorité.
+### Deux rôles de clés : autorité et provenance
+
+`agent_registry.key_role` distingue deux choses qu'il ne faut pas confondre :
+
+| rôle | ce que la clé prouve | ce qu'elle permet |
+|---|---|---|
+| `owner` | l'autorité du propriétaire (sa clé privée ne circule pas) | messages **et** approbations |
+| `agent` (défaut) | la provenance : ce message est bien de cet agent, contenu et échéance couverts | rien de plus : **aucune** autorité propriétaire, **aucune** approbation |
+
+Le défaut est `agent` (moindre privilège) : `key register --role owner` est un
+acte explicite. C'est ce qui évite qu'enregistrer la clé d'un agent pour
+signer son courrier lui donne, par effet de bord, l'autorité du propriétaire.
+
+Les hooks distinguent donc **quatre états** :
+
+* non signé → message d'agent, JSON identique à la v0 ;
+* signé par une clé `agent` → `[signé par un agent, authentique, sans autorité propriétaire, expire …]` ;
+* signé par une clé `owner` → `[autorité du propriétaire PROUVÉE, expire …]` ;
+* signature invalide ou expirée → `[⚠ signature NON valide : …]`, jamais ignorée.
 
 Les approbations (`mesh_approvals`) suivent le même modèle avec, en plus, une
-`action`, une empreinte d'artefact (`sha256` hex), une décision
-(`approved`/`rejected`) et une **consommation unique** (`consumed_at`,
-`consumed_by`) : une approbation ne peut pas servir deux fois.
+`action`, une empreinte d'artefact (`sha256` hex) et une décision
+(`approved`/`rejected`). La **consommation unique** n'est pas une colonne de la
+ligne mais une table à part, `mesh_consumed_nonces`, clé primaire
+`(approver, nonce)` : réinsérer le même reçu signé sous un nouvel id — ou
+supprimer la ligne consommée puis la recréer — ne permet pas de le rejouer, et
+un index unique sur `(approver, nonce)` bloque la copie directe. `verify_approval`
+refuse toute clé qui n'est pas `owner`, y compris si la ligne a été insérée en
+base à la main.
 
 ### Ed25519 : trois implémentations, une seule interface
 
@@ -66,9 +92,11 @@ base64 du germe ou de la clé de 32 octets). Règles :
   détient sa clé privée (voir `BASCULE.md`, étape 3) ;
 * la clé privée est écrite en `0600`, refusée à la lecture si ses permissions
   sont trop ouvertes, jamais journalisée, jamais en base, jamais dans un message ;
-* `agent-mesh key register <agent> --public-key FICHIER` n'accepte qu'une clé
-  publique (une clé privée est rejetée) ; `key revoke` invalide immédiatement
-  toutes les signatures de cet agent.
+* `agent-mesh key register <agent> --public-key FICHIER [--role owner|agent]`
+  n'accepte qu'une clé publique (une clé privée est rejetée) ; `key revoke`
+  invalide immédiatement toutes les signatures de cet agent. Le rôle par défaut
+  est `agent` ; passer `--role owner` délègue l'autorité du propriétaire et
+  affiche un avertissement.
 
 ### Ce que ça donne dans un hook
 
@@ -144,9 +172,15 @@ puis `psycopg` dans un venv avec `cryptography`). Couverture des points 3-5 :
   propriétaire), corps falsifié, destinataire modifié, signature bricolée,
   expirée, clé inconnue, empreinte inconnue, révocation puis ré-enregistrement ;
 * hooks : preuve affichée, falsification visible, JSON identique à la v0 sans
-  signature ;
-* approbations : cycle complet, consommation unique, expiration, hash non
-  couvert, décision `rejected`, clé non enregistrée refusée ;
+  signature ; clé d'agent → « authentique, sans autorité propriétaire », jamais
+  « PROUVÉE » ;
+* rôles : une clé d'agent authentifie sans autorité, ne peut pas approuver, et
+  une approbation insérée de force avec une clé d'agent est refusée ;
+* approbations : cycle complet, consommation unique, expiration réelle, hash
+  non couvert, décision `rejected`, clé non enregistrée refusée ;
+* sondes codex3 sur le gel 345aca6, désormais couvertes : `expires_at` ou
+  `created_at` modifiés en base → refusés ; reçu consommé supprimé puis
+  réinséré → « nonce déjà consommé » ; copie directe → index unique ;
 * `mesh list`/`show` (texte et JSON), cycle de vie des clés par la CLI ;
 * `work_items` : cycle, transitions refusées, boucle bornée, journal,
   déplacement concurrent (un seul gagnant), NOTIFY ;
@@ -157,9 +191,12 @@ puis `psycopg` dans un venv avec `cryptography`). Couverture des points 3-5 :
 ## 6. Limites assumées
 
 * **L'enregistrement d'une clé est un acte de confiance** : la CLI ne peut pas
-  prouver qui a lancé `key register`. La protection est organisationnelle
-  (cérémonie, machine, permissions) — R4 prouve la *signature*, pas l'identité
-  de l'opérateur.
+  prouver qui a lancé `key register` ni qui a choisi `--role owner`. La
+  protection est organisationnelle (cérémonie, machine, permissions) — R4
+  prouve la *signature* et son rôle, pas l'identité de l'opérateur.
+* **Un rôle par clé, pas encore de portées** : `owner`/`agent` est binaire ;
+  des capacités plus fines (« approuver un merge mais pas la production »)
+  viendront avec la porte de gouvernance.
 * **L'horloge est supposée à peu près juste** : les échéances sont comparées à
   l'heure locale/base. Une dérive d'horloge décale les expirations.
 * **Pas encore de porte** : `verify --consume` existe, mais aucun merge ou

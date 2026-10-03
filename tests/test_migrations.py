@@ -17,9 +17,10 @@ class MigrationsTest(PgTestCase):
         rows = self.db.query(
             "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
         )
-        self.assertEqual([row["version"] for row in rows], [1, 2, 3, 4])
+        self.assertEqual([row["version"] for row in rows], [1, 2, 3, 4, 5, 6])
         self.assertEqual([row["name"] for row in rows],
-                         ["init", "overview", "authority", "work_items"])
+                         ["init", "overview", "authority", "work_items", "key_roles",
+                          "authority_fixes"])
         for row in rows:
             self.assertEqual(len(row["checksum"]), 64)
         # la vue d'observabilité et les deux triggers de notification existent
@@ -32,7 +33,8 @@ class MigrationsTest(PgTestCase):
         colonnes = {row["column_name"] for row in self.db.query(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema = current_schema() AND table_name = 'agent_registry'")}
-        self.assertTrue({"public_key", "public_key_fingerprint", "key_revoked_at"} <= colonnes)
+        self.assertTrue({"public_key", "public_key_fingerprint", "key_revoked_at",
+                         "key_role", "current_prompt"} <= colonnes)
         colonnes = {row["column_name"] for row in self.db.query(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema = current_schema() AND table_name = 'agent_mailbox'")}
@@ -49,7 +51,7 @@ class MigrationsTest(PgTestCase):
     def test_remigration_idempotente(self):
         self.assertEqual(migrations.migrate(self.db), [])
         count = self.db.query("SELECT count(*)::int AS n FROM schema_migrations")[0]["n"]
-        self.assertEqual(count, 4)
+        self.assertEqual(count, 6)
 
     def test_migration_modifiee_refusee(self):
         connue = migrations.discover()[0].checksum
@@ -83,7 +85,7 @@ class MigrationsTest(PgTestCase):
                 "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %s) AS ok", (schema,)
             )[0]["ok"])
             done = migrations.migrate(db)
-            self.assertEqual([m.version for m in done], [1, 2, 3, 4])
+            self.assertEqual([m.version for m in done], [1, 2, 3, 4, 5, 6])
             tables = db.query(
                 "SELECT count(*)::int AS n FROM information_schema.tables "
                 "WHERE table_schema = %s AND table_name IN ('agent_registry','agent_mailbox',"
