@@ -30,7 +30,7 @@ if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import psycopg" 2>/dev/nu
   AGENT_MESH_DRIVER=psycopg "$VENV/bin/python" -m unittest discover -s tests -t . -v "${PATTERN[@]}"
 elif [ -x "$VENV/bin/pip" ]; then
   echo "=== installation de psycopg dans $VENV ==="
-  if "$VENV/bin/pip" install --quiet 'psycopg[binary]' 2>/dev/null; then
+  if "$VENV/bin/pip" install --quiet 'psycopg[binary]' cryptography 2>/dev/null; then
     echo
     echo "=== pilote psycopg ==="
     AGENT_MESH_DRIVER=psycopg "$VENV/bin/python" -m unittest discover -s tests -t . -v "${PATTERN[@]}"
