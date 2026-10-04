@@ -24,6 +24,14 @@ L'autorité d'un humain se **prouve** : un reçu est valide seulement si
    est atomique (`INSERT … ON CONFLICT DO NOTHING` sur la clé primaire
    (approver, nonce) de `mesh_consumed_nonces`).
 
+Toute ÉCRITURE qui accorde une autorité (consommation d'un nonce,
+enregistrement d'un grant, réservation sur un grant) recontrôle ses échéances
+(exp, iat futur, until) EN SQL, dans sa transaction, APRÈS le dernier verrou et
+immédiatement avant d'écrire, à l'heure réelle de la base (`clock_timestamp()`) :
+une échéance passée pendant l'attente d'un verrou annule toute la transaction
+(code EXPIRED ou iat_future). L'inventaire de ces chemins, de leurs verrous et
+de leurs contrôles est en tête de `migrations/0011_receipts.sql`.
+
     challenge = SHA-256("ameesh-approval/1\\0" ‖ JCS(request))
     empreinte = SHA-256("ameesh-action/1\\0" ‖ JCS({action_id, project, connector,
                 operation, target, args, amount, currency, policy_version}))
@@ -135,6 +143,34 @@ _PROOF_FIELDS = {
 
 class ReceiptError(ValueError):
     """Reçu, clé ou entrée de registre refusés — toujours avec une raison lisible."""
+
+
+class DeadlineError(ReceiptError):
+    """Échéance dépassée à l'heure RÉELLE de la base, au moment d'écrire.
+
+    Levée par la fonction SQL (`ameesh_receipt_deadlines`, après le dernier
+    verrou) : la transaction entière a été annulée. `code` vaut EXPIRED ou
+    NOT_YET.
+    """
+
+    def __init__(self, code: str, reason: str):
+        super().__init__(reason)
+        self.code = code
+
+
+#: `ameesh_echeance [code] : raison` (0011_receipts.sql), tel que le rendent
+#: les deux pilotes (psql : ligne ERROR ; psycopg : message + CONTEXT, ou
+#: CONTEXTE si le serveur parle français)
+_DEADLINE_RE = re.compile(
+    r"ameesh_echeance \[(expired|iat_future)\] : (.*?)(?:\s+CONTEXTE?\s*:.*)?$", re.S)
+
+
+def _deadline_error(exc: DbError) -> DeadlineError | None:
+    """Le refus d'échéance porté par une erreur SQL, ou None."""
+    match = _DEADLINE_RE.search(str(exc))
+    if not match:
+        return None
+    return DeadlineError(match.group(1), " ".join(match.group(2).split()))
 
 
 # --------------------------------------------------------------------------
@@ -688,11 +724,18 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
     elif not key.verify(parsed.challenge, parsed.proof_bytes["signature"]):
         return refuse(SIGNATURE, "signature %s invalide" % key.alg)
 
-    # 5. nonce
+    # 5. nonce — la consommation recontrôle exp et iat EN SQL, après le
+    #    dernier verrou, à l'heure réelle de la base (pas `moment`)
     approver, nonce = request["approver"], request["nonce"]
     if consume_by:
-        if not consume_nonce(db, approver, nonce, by=consume_by,
-                             challenge=parsed.challenge.hex(), authenticator_id=int(row["id"])):
+        try:
+            consumed = consume_nonce(
+                db, approver, nonce, by=consume_by, challenge=parsed.challenge.hex(),
+                authenticator_id=int(row["id"]), exp=exp, iat=iat,
+                clock_skew=policy.clock_skew)
+        except DeadlineError as exc:
+            return refuse(exc.code, str(exc))
+        if not consumed:
             state = authority.nonce_state(db, approver, nonce)
             if state:
                 return refuse(REPLAY, "nonce déjà consommé (%s)" % state)
@@ -720,6 +763,10 @@ def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
     depuis l'action, jamais lus dans le reçu).
     `kind=None` accepte les deux natures ; `expect_decision=None` les deux
     décisions.
+    `now` ne règle que les contrôles faits ici : une consommation recontrôle
+    exp et iat en SQL, après le dernier verrou, à l'heure réelle de la base
+    (`clock_timestamp()`) — un dépassement donne EXPIRED (ou iat_future) et
+    rien n'est consommé.
     """
     verdict, _parsed = _verify(
         db, receipt, policy, kind=kind, expected_digest=expected_digest,
@@ -728,31 +775,36 @@ def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
     return verdict
 
 
-def consume_nonce(db: Db, approver: str, nonce: str, *, by: str, challenge: str = "",
+def consume_nonce(db: Db, approver: str, nonce: str, *, by: str, exp: int, iat: int,
+                  clock_skew: int = DEFAULT_CLOCK_SKEW, challenge: str = "",
                   authenticator_id: int | None = None) -> bool:
     """Consomme (approver, nonce) une seule fois. Faux si déjà consommé.
 
-    La décision est l'`INSERT … ON CONFLICT DO NOTHING` sur la clé primaire :
-    deux consommations simultanées ne peuvent pas réussir toutes les deux. Si
-    `authenticator_id` est donné, l'authentificateur doit être encore actif au
-    moment de l'insertion : il est lu sous verrou partagé (`FOR SHARE`), qui
-    sérialise avec sa révocation (une révocation en cours est attendue puis
-    vue).
+    Une transaction (fonction `ameesh_receipt_consume`) : si
+    `authenticator_id` est donné, l'authentificateur doit être encore actif —
+    il est lu sous verrou partagé (`FOR SHARE`), qui sérialise avec sa
+    révocation (une révocation en cours est attendue puis vue). Puis, APRÈS
+    ce dernier verrou et immédiatement avant l'écriture, les échéances
+    SIGNÉES (`exp`, `iat` + `clock_skew`) sont recontrôlées à l'heure réelle
+    de la base ; la décision est ensuite l'`INSERT … ON CONFLICT DO NOTHING`
+    sur la clé primaire (deux consommations simultanées ne peuvent pas réussir
+    toutes les deux), et les échéances sont recontrôlées après lui (il a pu
+    attendre une insertion concurrente). Échéance dépassée : DeadlineError,
+    rien n'est consommé.
     """
-    rows = db.query(
-        """
-        INSERT INTO mesh_consumed_nonces (approver, nonce, consumed_by, challenge)
-        SELECT %s, %s, %s, %s
-         WHERE %s::bigint IS NULL
-            OR EXISTS (SELECT 1 FROM authenticators a
-                        WHERE a.id = %s::bigint AND a.revoked_at IS NULL
-                          FOR SHARE)
-        ON CONFLICT (approver, nonce) DO NOTHING
-        RETURNING nonce
-        """,
-        (approver, nonce, by, challenge or None, authenticator_id, authenticator_id),
-    )
-    return bool(rows)
+    try:
+        rows = db.query(
+            "SELECT ameesh_receipt_consume(%s::text, %s::text, %s::text, %s::text, "
+            "%s::bigint, %s::bigint, %s::bigint, %s::integer) AS consumed",
+            (approver, nonce, by, challenge or None, authenticator_id, _int(exp, "exp"),
+             _int(iat, "iat"), int(clock_skew)),
+        )
+    except DbError as exc:
+        deadline = _deadline_error(exc)
+        if deadline is not None:
+            raise deadline from exc
+        raise
+    return bool(rows and rows[0].get("consumed"))
 
 
 # --------------------------------------------------------------------------
@@ -764,23 +816,36 @@ def register_standing(db: Db, receipt, policy: Policy | None = None, *, register
     """Vérifie un reçu `standing` et enregistre le grant ; consomme son nonce.
 
     Consommation du nonce et insertion du grant sont une seule opération
-    (fonction `ameesh_standing_register`). Renvoie (verdict, id du grant).
+    (fonction `ameesh_standing_register`), qui recontrôle les échéances
+    signées (exp, iat, until) APRÈS le verrou de l'authentificateur, à
+    l'heure réelle de la base (`now` ne règle que les contrôles Python) : un
+    dépassement donne EXPIRED (ou iat_future), sans nonce consommé ni grant.
+    Renvoie (verdict, id du grant).
     """
+    policy = policy or Policy()
     verdict, parsed = _verify(
         db, receipt, policy, kind="standing", expected_digest=None, expected_action_id=None,
         expect_decision="approve", consume_by=None, now=now)
     if not verdict.ok or parsed is None:
         return verdict, None
     standing = parsed.request["standing"]
-    rows = db.query(
-        "SELECT ameesh_standing_register(%s::text, %s::text, %s::text, %s::bigint, %s::text, "
-        "%s::text, %s::jsonb, %s::text, %s::bigint, %s::text, %s::double precision, %s::text) "
-        "AS id",
-        (verdict.approver, verdict.nonce, verdict.challenge, verdict.authenticator_id,
-         jcs.dumps(parsed.document), standing["connector"], jcs.dumps(standing["operations"]),
-         standing["class"], standing["max_amount"], standing["currency"], standing["until"],
-         registered_by),
-    )
+    try:
+        rows = db.query(
+            "SELECT ameesh_standing_register(%s::text, %s::text, %s::text, %s::bigint, "
+            "%s::text, %s::text, %s::jsonb, %s::text, %s::bigint, %s::text, %s::bigint, "
+            "%s::bigint, %s::bigint, %s::integer, %s::text) AS id",
+            (verdict.approver, verdict.nonce, verdict.challenge, verdict.authenticator_id,
+             jcs.dumps(parsed.document), standing["connector"], jcs.dumps(standing["operations"]),
+             standing["class"], standing["max_amount"], standing["currency"],
+             parsed.request["exp"], parsed.request["iat"], standing["until"],
+             int(policy.clock_skew), registered_by),
+        )
+    except DbError as exc:
+        deadline = _deadline_error(exc)
+        if deadline is None:
+            raise
+        return dataclasses.replace(verdict, ok=False, code=deadline.code,
+                                   reason=str(deadline)), None
     grant_id = rows[0].get("id") if rows else None
     if grant_id is None:
         state = authority.nonce_state(db, verdict.approver, verdict.nonce)
@@ -808,9 +873,11 @@ def standing_reserve(db: Db, grant_id: int, action_id: str, amount, *, connector
 
     Atomique (fonction `ameesh_standing_reserve`, une transaction) : verrou
     du grant d'abord, puis TOUT est relu et réévalué après le verrou —
-    révocation, échéance comparée à l'heure réelle (`clock_timestamp()`, pas
-    `now()` figé avant l'attente du verrou), authentificateur, couverture,
-    cumul + montant <= max — et le lien est inséré.
+    révocation, authentificateur (sous verrou partagé), couverture, puis,
+    APRÈS ce dernier verrou et juste avant d'écrire, l'échéance comparée à
+    l'heure réelle (`clock_timestamp()`, pas `now()` figé avant l'attente des
+    verrous ; un grant échu pendant l'attente annule toute la transaction et
+    rend None), cumul + montant <= max — et le lien est inséré.
     La description de l'action (connecteur, opération, classe, devise) est
     OBLIGATOIRE : la couverture est contrôlée dans la même transaction, une
     réservation sur un grant qui ne couvre pas l'action est impossible.
@@ -830,6 +897,8 @@ def standing_reserve(db: Db, grant_id: int, action_id: str, amount, *, connector
              currency),
         )
     except DbError as exc:
+        if _deadline_error(exc) is not None:
+            return None             # grant échu à l'heure réelle : rien n'est réservé
         if "ameesh_standing_reserve" in str(exc):
             raise ReceiptError(str(exc)) from exc
         raise
@@ -872,6 +941,9 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> d
         "SELECT grant_id FROM standing_reservations WHERE action_id = %s "
         "AND released_at IS NULL ORDER BY id", (action_id,))
     candidates = [int(row["grant_id"]) for row in live]
+    # simple PRÉ-FILTRE, sans verrou : la décision (révocation, échéance à
+    # l'heure réelle après le dernier verrou, cumul) est refaite par
+    # ameesh_standing_reserve pour chaque candidat
     rows = db.query(
         """
         SELECT id FROM standing_approvals
