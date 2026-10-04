@@ -1,0 +1,164 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* ameesh-approve — feuille de style (aucun style en ligne : CSP style-src 'self'). */
+:root {
+  --bg: #ffffff;
+  --fg: #1b1d21;
+  --muted: #5b6270;
+  --line: #d9dce3;
+  --approve: #11683a;
+  --deny: #a32121;
+  --warn: #8a5a00;
+  --code-bg: #f3f4f7;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15171b;
+    --fg: #eceef2;
+    --muted: #a3a9b5;
+    --line: #333844;
+    --approve: #3fae6f;
+    --deny: #e06262;
+    --warn: #e0a83a;
+    --code-bg: #20232a;
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+main {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 1rem 16px 3rem;
+}
+
+h1 {
+  font-size: 1.4rem;
+}
+
+h2 {
+  font-size: 1rem;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+}
+
+.lead {
+  color: var(--muted);
+}
+
+dl.fields {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.35rem 0.75rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.75rem;
+}
+
+dt {
+  color: var(--muted);
+}
+
+dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+code,
+pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9rem;
+}
+
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.75rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.digest-short {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 1.3rem;
+  letter-spacing: 0.05em;
+  margin: 0;
+}
+
+.digest {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+  font-size: 0.85rem;
+}
+
+.warn {
+  display: block;
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* décision « assumer le doublon » : jamais confondue avec une approbation */
+.duplicate {
+  border: 2px solid var(--deny);
+  border-radius: 8px;
+  padding: 0.25rem 1rem;
+  margin: 1rem 0;
+}
+
+.duplicate h2 {
+  color: var(--deny);
+  text-transform: uppercase;
+}
+
+.notice {
+  border-left: 4px solid var(--warn);
+  padding-left: 0.75rem;
+}
+
+.buttons {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 1.5rem;
+}
+
+button {
+  flex: 1;
+  font-size: 1.05rem;
+  padding: 0.8rem 1rem;
+  border-radius: 8px;
+  border: 0;
+  color: #ffffff;
+  cursor: pointer;
+}
+
+button.approve {
+  background: var(--approve);
+}
+
+button.deny {
+  background: var(--deny);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+#status {
+  min-height: 1.5rem;
+  margin-top: 1rem;
+}
+
+#status.error {
+  color: var(--deny);
+}
+
+#status.done {
+  color: var(--approve);
+  font-weight: 600;
+}
