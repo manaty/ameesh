@@ -15,7 +15,9 @@
   ameesh fil list | show <projet> [<lot>] [--last N] | tail <projet> [<lot>]
         les fils lisibles : tout message passé par ameesh, en clair (R12) ;
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
-  ameesh migrate | doctor     schéma et diagnostic.
+  ameesh migrate | doctor     schéma et diagnostic ;
+  ameesh canon check|show|sync          canon OKF : validation, fiches, registre ;
+  ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Rien d'autre : ce fichier ne fait que router vers les modules, pour que
 `agent-mail` et `agent-runner` continuent de fonctionner à l'identique.
@@ -27,7 +29,7 @@ import sys
 #: sous-commandes servies par mesh_cli (parseur déjà en place)
 MESH_COMMANDS = (
     "list", "show", "key", "approve", "approvals", "verify", "work", "cost",
-    "migrate", "doctor", "import-v0", "export-v0",
+    "migrate", "doctor", "import-v0", "export-v0", "canon", "agent",
 )
 
 

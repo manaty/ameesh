@@ -13,10 +13,15 @@ locaux). Le bail est la seule autorisation de tourner :
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Sequence
 
 from .config import NAME_RE
 from .db import Db
+
+_ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+#: profondeur maximale d'une lignée d'éphémères suivie (au-delà : gouverné)
+_LINEAGE_MAX = 32
 
 AGENT_COLUMNS = """
     name, chantier, harness, host, cwd, session_id, status, status_text, model,
@@ -24,7 +29,10 @@ AGENT_COLUMNS = """
     lease_owner, lease_epoch,
     extract(epoch from lease_expires_at)::float8 as lease_expires_ts,
     extract(epoch from last_seen)::float8         as last_seen_ts,
-    extract(epoch from last_turn_at)::float8      as last_turn_ts
+    extract(epoch from last_turn_at)::float8      as last_turn_ts,
+    responsible, team, provider, credential_mode, capabilities, canon_ref,
+    ephemeral, created_by,
+    extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts
 """
 
 
@@ -36,6 +44,68 @@ def _check_name(name: str) -> str:
 
 def _name_list(names: Sequence[str]) -> str:
     return ", ".join("'%s'" % _check_name(n).replace("'", "''") for n in names)
+
+
+# --------------------------------------------------------------------------
+# canon (§4.1, C2/C3) : condition de réclamation, partagée par claimable(),
+# claim() et `ameesh attach`
+# --------------------------------------------------------------------------
+
+def _alias(alias: str) -> str:
+    if not _ALIAS_RE.match(alias or ""):
+        raise ValueError("alias SQL invalide : %r" % (alias,))
+    return alias
+
+
+def canon_governed_sql(alias: str = "agent_registry") -> str:
+    """Expression SQL : l'agent de la ligne `alias` est-il gouverné par le canon ?
+
+    Oui s'il vient du canon (`canon_ref` posé), ou si c'est un éphémère dont la
+    lignée de créateurs (`created_by`, suivie de proche en proche) atteint un
+    agent du canon. Fail closed : un éphémère dont la lignée est rompue
+    (créateur absent) ou trop longue est tenu pour gouverné. Seuls les agents
+    inscrits à la main (ni `canon_ref`, ni éphémère) et les éphémères issus
+    d'eux ne le sont pas.
+    """
+    a = _alias(alias)
+    return """(%(a)s.canon_ref IS NOT NULL
+       OR (%(a)s.ephemeral AND NOT EXISTS (
+           WITH RECURSIVE lignee (name, created_by, canon_ref, ephemeral, depth) AS (
+               SELECT c.name, c.created_by, c.canon_ref, c.ephemeral, 1
+                 FROM agent_registry c WHERE c.name = %(a)s.created_by
+               UNION ALL
+               SELECT c.name, c.created_by, c.canon_ref, c.ephemeral, l.depth + 1
+                 FROM lignee l JOIN agent_registry c ON c.name = l.created_by
+                WHERE l.ephemeral AND l.canon_ref IS NULL AND l.depth < %(max)d
+           )
+           SELECT 1 FROM lignee
+            WHERE NOT lignee.ephemeral AND lignee.canon_ref IS NULL)))""" % {
+        "a": a, "max": _LINEAGE_MAX}
+
+
+def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
+    """Condition SQL de réclamation liée au canon (§4.1), pour un `WHERE`.
+
+    Vraie si l'agent de la ligne `alias` (une ligne de `agent_registry`, ou de
+    la vue `agent_mesh_overview`) n'est pas gouverné par le canon
+    (`canon_governed_sql`), ou si le dernier état du canon de **son hôte**
+    (`canon_state`, écrit par `ameesh canon sync`) est `ok`. Un canon
+    `invalid` ou `unreadable`, ou l'absence d'état, refuse donc toute
+    NOUVELLE réclamation d'un agent du canon (et de ses éphémères), sans rien
+    toucher aux baux, sessions ni tours en cours : fail closed.
+
+    Indépendante de la configuration (AMEESH_CANON, AMEESH_REQUIRE_RESPONSIBLE) :
+    un agent venu du canon sur un hôte où aucune synchronisation n'a constaté
+    un canon valide n'est jamais réclamable. Sans paramètre lié (`%s`) : elle
+    s'insère telle quelle dans une requête paramétrée, avec les deux pilotes.
+    Utilisée par `claimable()` et `claim()` ; à réutiliser telle quelle pour
+    `ameesh attach` (C9).
+    """
+    a = _alias(alias)
+    return """(NOT %s
+       OR EXISTS (SELECT 1 FROM canon_state s
+                   WHERE s.host = %s.host AND s.status = 'ok'))""" % (
+        canon_governed_sql(a), a)
 
 
 def upsert(
@@ -87,20 +157,44 @@ def get(db: Db, name: str) -> dict | None:
 
 
 def overview(db: Db) -> list[dict]:
+    """Vue d'observabilité (`mesh list --json`).
+
+    Colonnes du canon : `canon_governed` (l'agent relève du canon),
+    `canon_status` / `canon_diagnostic` / `canon_checked_ts` (dernier état du
+    canon de son hôte, NULL si aucun), `canon_claim_ok` (la condition de
+    réclamation liée au canon est remplie).
+    """
     return db.query(
         """
         SELECT name, chantier, harness, host, cwd, session_id, status, status_text,
                model, budget_usd, spent_usd, turns, pending_prompt, last_error,
                lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
-               public_key_fingerprint, key_role, key_ready, has_owner_key, unread
-        FROM agent_mesh_overview
+               public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
+               responsible, team, provider, credential_mode, capabilities, canon_ref,
+               ephemeral, created_by, ephemeral_expires_ts, responsible_ok,
+               __GOVERNED__ AS canon_governed,
+               (SELECT s.status FROM canon_state s WHERE s.host = o.host) AS canon_status,
+               (SELECT s.diagnostic FROM canon_state s
+                 WHERE s.host = o.host) AS canon_diagnostic,
+               (SELECT extract(epoch from s.checked_at)::float8 FROM canon_state s
+                 WHERE s.host = o.host) AS canon_checked_ts,
+               __CLAIM_OK__ AS canon_claim_ok
+        FROM agent_mesh_overview o
         ORDER BY last_seen_ts DESC NULLS LAST
-        """
+        """.replace("__GOVERNED__", canon_governed_sql("o"))
+           .replace("__CLAIM_OK__", canon_claim_predicate_sql("o"))
     )
 
 
 def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
-    """Prend le bail s'il est libre ou expiré. Renvoie la ligne, sinon None."""
+    """Prend le bail s'il est libre ou expiré. Renvoie la ligne, sinon None.
+
+    La condition du canon (`canon_claim_predicate_sql`) est revérifiée ici,
+    atomiquement : un `canon sync` qui constate un canon invalide entre
+    `claimable()` et `claim()` empêche la réclamation. Un bail déjà détenu
+    n'est pas touché par ce refus : il se renouvelle (`renew`) et se rend
+    (`release`) comme avant.
+    """
     _check_name(name)
     rows = db.query(
         """
@@ -132,9 +226,10 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
                updated_at       = now()
          WHERE name = %s
            AND (lease_owner IS NULL OR lease_owner = %s OR lease_expires_at < now())
+           AND __CANON__
         RETURNING name, lease_owner, lease_epoch,
                   extract(epoch from lease_expires_at)::float8 as lease_expires_ts
-        """,
+        """.replace("__CANON__", canon_claim_predicate_sql("agent_registry")),
         (owner, ttl_seconds, owner, owner, name, owner),
     )
     return rows[0] if rows else None
@@ -204,15 +299,34 @@ def release(db: Db, name: str, owner: str, epoch: int) -> bool:
     return bool(rows)
 
 
-def claimable(db: Db, host: str, names: Sequence[str] | None = None) -> list[dict]:
-    """Agents de cet hôte sans bail vivant (libres, expirés, ou morts)."""
+def claimable(db: Db, host: str, names: Sequence[str] | None = None, *,
+              require_responsible: bool | None = None) -> list[dict]:
+    """Agents de cet hôte sans bail vivant (libres, expirés, ou morts).
+
+    R14 (C3) : un éphémère échu n'est jamais réclamable ; et quand le
+    responsable est requis (`AMEESH_REQUIRE_RESPONSIBLE`, vrai par défaut dès
+    qu'un canon est configuré), un agent sans humain responsable résolu non
+    plus. `canon sync` n'écrit `responsible` que résolu ; un éphémère
+    l'hérite de son créateur.
+
+    §4.1 (toujours, quel que soit le réglage) : un agent gouverné par le canon
+    n'est réclamable que si le dernier état du canon de son hôte est `ok`
+    (`canon_claim_predicate_sql`).
+    """
+    if require_responsible is None:
+        cfg = getattr(db, "cfg", None)
+        require_responsible = bool(cfg is not None and cfg.responsible_required)
     sql = """
         SELECT %s
         FROM agent_registry
         WHERE host = %%s
           AND status <> 'stopped'
           AND (lease_owner IS NULL OR lease_expires_at < now())
-    """ % AGENT_COLUMNS
+          AND (NOT ephemeral OR ephemeral_expires_at > now())
+          AND %s
+    """ % (AGENT_COLUMNS, canon_claim_predicate_sql("agent_registry"))
+    if require_responsible:
+        sql += " AND coalesce(responsible, '') <> ''"
     params: list[Any] = [host]
     if names:
         sql += " AND name IN (%s)" % _name_list(names)
