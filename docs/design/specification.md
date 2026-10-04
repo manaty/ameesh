@@ -397,6 +397,8 @@ propres au pilote. Le pilote Postgres actuel (psycopg | psql) est le seul en v1.
 
 # 13. Plan de lots
 
+**État au 2026-10-04 15:10** : L2, L3, L4, L5, L6, L7, L8, L9, L9b fusionnés sur `main` après revue d'un autre éditeur (et, hors v1, L11 et L12) ; l'essai de bout en bout passe sans contournement. Reste L1 (interface de stockage), dont le report en v1.1 est proposé au propriétaire.
+
 Règles : une branche par lot (`lot/L<n>-<nom>`), gel → revue d'un autre
 éditeur → fusion ; tests sur Postgres réel (`scripts/test.sh`) ; aucun nom de
 client ; migrations réservées ci-dessous ; aucune dépense, aucun service public.
@@ -412,6 +414,7 @@ client ; migrations réservées ci-dessous ; aucune dépense, aucun service publ
 | L7 | service `ameesh-approve` (C8) | L6 | — | codex3 |
 | L8 | événements, regroupement, `ameesh attach` (C9) | fin B5a | 0012 (`kind = event`) | codex3 |
 | L9 | bascule réécrite, documentation v1 (C11) | tous | — | codex |
+| L9b | finitions d'intégration trouvées par l'essai de bout en bout : canon sync → registre des authentificateurs (verrou, monotonie, branche de confiance), demande et reçu depuis ameesh, transitions d'actions dans le fil, projet du fil = équipe | L2–L7 | 0023, 0024 | codex2 + codex3 |
 | L10 | politique de revue par classe de risque au canon ; métriques de délai par lot (R19) | L2 | 0013 | codex |
 | L11 | interruption de tour, rotation de session avec résumé, sessions robustes au déplacement (R19) | L8 | — | codex3 |
 | L12 | lecteurs de jauges de forfait, comptabilité par tour, `ameesh cost` (R20) | — | 0014 | codex |
