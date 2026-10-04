@@ -5,7 +5,10 @@
   service relit l'action (ActionSource), recalcule son empreinte, rend SON
   résumé, construit la `request` (nonce 128 bits, iat, exp ≤ 15 min,
   summary_digest) et crée un lien à usage unique (jeton de 256 bits, stocké
-  haché). Tout résumé ou texte fourni par le demandeur est ignoré.
+  haché). Tout résumé ou texte fourni par le demandeur est ignoré. Avec
+  `assume_duplicate: true`, la demande n'est pas une approbation ordinaire :
+  c'est la décision qui ASSUME LE DOUBLON d'une action `unknown` (empreinte
+  de duplicate.py, résumé et page distincts) ;
 * `link_view` / `submit` : la page du lien, puis l'assertion WebAuthn ; le
   reçu `ameesh-receipt/1` est construit, VÉRIFIÉ par receipts.py (sans
   consommer le nonce : ameesh le consomme à l'exécution), puis enregistré —
@@ -28,7 +31,7 @@ import time
 
 from .. import jcs, receipts
 from ..db import DbError
-from . import enroll, render
+from . import duplicate, enroll, render
 from .config import ApproveConfig
 from .sources import ACTION_ID_RE, REQUESTABLE_STATES, ActionSource, ActionSourceError
 from .store import Store, new_request_id, new_token
@@ -39,6 +42,8 @@ _HUMAN_RE = re.compile(r"^human:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _MEMBER_RE = re.compile(r"^(human|agent):[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _B64U_RE = re.compile(r"^[A-Za-z0-9_-]{1,8192}$")
 REQUEST_FIELDS = ("action_id", "approver", "requested_by")
+#: facultatif : `assume_duplicate` (booléen) — décision qui assume le doublon
+REQUEST_OPTIONAL = ("assume_duplicate",)
 _ASSERTION_FIELDS = frozenset({"decision", "credential_id", "authenticatorData",
                                "clientDataJSON", "signature"})
 _ASSERTION_OPTIONAL = frozenset({"userHandle"})
@@ -103,6 +108,41 @@ class ApproveService:
                                "l'empreinte stockée de l'action ne correspond pas à son contenu")
         return action
 
+    @staticmethod
+    def _signed_digest(action: dict, assume_duplicate: bool) -> str:
+        """L'empreinte que signe la demande : celle de l'action, ou celle de la
+        décision qui assume son doublon (domaine distinct)."""
+        if assume_duplicate:
+            return duplicate.assume_duplicate_digest(action)
+        return action["computed_digest"]
+
+    @staticmethod
+    def _check_state(action: dict, assume_duplicate: bool, *, later: bool = False) -> None:
+        """L'état de l'action admet-il cette demande ? (mêmes règles que le lot L5 :
+        `actions.retry` pour une approbation, `actions.replace` pour un doublon)."""
+        state = action["state"]
+        if action.get("replaced_by"):
+            raise ApproveError(409, "action_replaced", "action remplacée par %s : plus rien "
+                               "à approuver" % action["replaced_by"])
+        if assume_duplicate:
+            if state not in duplicate.ASSUMABLE_STATES:
+                raise ApproveError(409, "action_state",
+                                   "action dans l'état %s : seule une action d'issue inconnue "
+                                   "(unknown) se remplace en assumant le doublon" % state)
+            return
+        if state not in REQUESTABLE_STATES:
+            if later:
+                raise ApproveError(409, "action_state", "l'action est passée à l'état %s : "
+                                   "plus rien à approuver" % state)
+            raise ApproveError(409, "action_state", "action dans l'état %s : rien à approuver"
+                               % state)
+        if state == "unknown" and action.get("dedupe") not in (None, "guaranteed"):
+            # nouvelle tentative impossible : l'effet a peut-être eu lieu
+            raise ApproveError(409, "dedupe",
+                               "issue inconnue et déduplication non garantie par %s : aucune "
+                               "nouvelle tentative ; reconcile, puis décision qui assume le "
+                               "doublon (assume_duplicate)" % action["connector"])
+
     def _credentials(self, approver: str) -> list[str]:
         """Credentials WebAuthn actifs de l'approbateur, au niveau exigé."""
         with self.db_lock:
@@ -126,7 +166,7 @@ class ApproveService:
         missing = [name for name in REQUEST_FIELDS if name not in body]
         if missing:
             raise ApproveError(400, "format", "champs manquants : %s" % ", ".join(missing))
-        ignored = sorted(set(body) - set(REQUEST_FIELDS))
+        ignored = sorted(set(body) - set(REQUEST_FIELDS) - set(REQUEST_OPTIONAL))
         if ignored:
             # résumé, texte, montant… fournis par le demandeur : ignorés (le
             # service rend son propre résumé depuis l'action)
@@ -140,16 +180,18 @@ class ApproveService:
             raise ApproveError(400, "format", "approver : « human:<id> » attendu")
         if not isinstance(requested_by, str) or not _MEMBER_RE.fullmatch(requested_by):
             raise ApproveError(400, "format", "requested_by : « agent:<id> » ou « human:<id> »")
+        assume_duplicate = body.get("assume_duplicate", False)
+        if not isinstance(assume_duplicate, bool):
+            raise ApproveError(400, "format", "assume_duplicate : booléen attendu")
 
         action = self._action(action_id)
-        if action["state"] not in REQUESTABLE_STATES:
-            raise ApproveError(409, "action_state", "action dans l'état %s : rien à approuver"
-                               % action["state"])
+        self._check_state(action, assume_duplicate)
         if not self._credentials(approver):
             raise ApproveError(409, "no_authenticator",
                                "%s n'a aucun authentificateur WebAuthn actif au niveau %s "
                                "(enrôlement puis PR du canon)" % (approver, self.cfg.level))
-        summary = render.render_summary(action, approver, requested_by)
+        summary = render.render_summary(action, approver, requested_by,
+                                        assume_duplicate=assume_duplicate)
         if len(summary.encode("utf-8")) > render.MAX_SUMMARY:
             raise ApproveError(413, "summary_too_long",
                                "action trop volumineuse pour être relue par un humain")
@@ -159,7 +201,7 @@ class ApproveService:
             "v": receipts.REQUEST_VERSION,
             "approver": approver,
             "action_id": action_id,
-            "digest": action["computed_digest"],
+            "digest": self._signed_digest(action, assume_duplicate),
             "summary_digest": render.summary_digest(summary),
             "requested_by": requested_by,
             "nonce": _b64u(os.urandom(16)),
@@ -179,11 +221,13 @@ class ApproveService:
             "link_exp": now + int(self.cfg.link_ttl),
             "exp": request["exp"],
             "created": now,
+            "assume_duplicate": assume_duplicate,
         }
         self.store.save_request(record, token)
         self.store.prune(now)
-        log.info("demande %s : action %s, approbateur %s, demandée par %s",
-                 request_id, action_id, approver, requested_by)
+        log.info("demande %s : %saction %s, approbateur %s, demandée par %s",
+                 request_id, "DOUBLON À ASSUMER de l'" if assume_duplicate else "",
+                 action_id, approver, requested_by)
         return {
             "request_id": request_id,
             "link": self._link("a", token),
@@ -191,7 +235,9 @@ class ApproveService:
             "exp": request["exp"],
             "action_id": action_id,
             "approver": approver,
+            "assume_duplicate": assume_duplicate,
             "digest": request["digest"],
+            "action_digest": action["computed_digest"],
             "summary_digest": request["summary_digest"],
         }
 
@@ -212,13 +258,13 @@ class ApproveService:
     def _check_unchanged(self, record: dict) -> dict:
         """L'action relue maintenant est-elle encore celle de la demande ?"""
         request = record["request"]
+        assume_duplicate = record.get("assume_duplicate") is True
         action = self._action(request["action_id"])
-        if not hmac.compare_digest(action["computed_digest"].encode(), request["digest"].encode()):
+        if not hmac.compare_digest(self._signed_digest(action, assume_duplicate).encode(),
+                                   request["digest"].encode()):
             raise ApproveError(409, "action_changed",
                                "l'action a changé depuis la demande : demande caduque")
-        if action["state"] not in REQUESTABLE_STATES:
-            raise ApproveError(409, "action_state", "l'action est passée à l'état %s : "
-                               "plus rien à approuver" % action["state"])
+        self._check_state(action, assume_duplicate, later=True)
         return action
 
     def link_view(self, token: str) -> dict:
@@ -232,6 +278,7 @@ class ApproveService:
             "request_id": record["request_id"],
             "request": request,
             "action": action,
+            "assume_duplicate": record.get("assume_duplicate") is True,
             "summary": record["summary"],
             "link_exp": record["link_exp"],
             "rp_id": self.cfg.rp_id,
@@ -282,8 +329,9 @@ class ApproveService:
             raise ApproveError(403, verdict.code, verdict.reason)
         if not self.store.save_receipt_once(record["request_id"], receipt):
             raise ApproveError(410, "used", "ce lien a déjà servi")
-        log.info("demande %s : reçu %s signé par %s", record["request_id"], decision,
-                 verdict.approver)
+        log.info("demande %s : reçu %s%s signé par %s", record["request_id"], decision,
+                 " (doublon assumé)" if record.get("assume_duplicate") is True
+                 and decision == "approve" else "", verdict.approver)
         return {"request_id": record["request_id"], "decision": decision}
 
     # ------------------------------------------------------------------

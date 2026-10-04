@@ -4,6 +4,8 @@
 Routes :
 
     POST /requests            jeton de service — crée une demande, rend le lien
+                              ({action_id, approver, requested_by,
+                              assume_duplicate?})
     GET  /receipts/<id>       jeton de service — le reçu (200), en attente (202),
                               échu sans reçu (410)
     GET  /a/<jeton>           page d'approbation

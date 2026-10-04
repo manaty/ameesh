@@ -8,7 +8,8 @@ recalcule son empreinte (spec §7.1) et en rend son propre résumé. Une
     action_id, project, connector, operation, target, args (objet),
     amount (entier en unités mineures ou None), currency (ou None),
     policy_version, class, state, et facultativement proposed_by,
-    work_item, digest (empreinte stockée, recoupée avec le recalcul).
+    work_item, digest (empreinte stockée, recoupée avec le recalcul), dedupe
+    (guaranteed | none), replaces, replaced_by.
 
 `DbActionSource` lit la table `actions` du lot L5 (spec §7.1). Si elle n'existe
 pas (L5 non migré), ou s'il lui manque une colonne de l'empreinte, l'erreur le
@@ -25,10 +26,13 @@ from .. import receipts
 from ..db import DbError, quote_ident
 
 ACTION_ID_RE = re.compile(r"^act_[0-9A-Za-z]{26}$")
-#: états où une approbation a un sens (proposed → approved ; unknown : nouvelle
-#: tentative d'un connecteur à dédoublonnage garanti, spec §7.2 ; approved :
-#: reçu précédent échu avant le lancement)
-REQUESTABLE_STATES = ("proposed", "approved", "unknown")
+#: états où une approbation ORDINAIRE a un sens (spec §7.2, `actions.py` du
+#: lot L5) : proposed → approved ; approved : reçu précédent échu avant le
+#: lancement ; failed : nouvelle tentative après un échec certain (`retry`,
+#: nouveau reçu, MÊME action_id) ; unknown : nouvelle tentative seulement si
+#: le connecteur garantit la déduplication (`dedupe` = guaranteed). La
+#: décision « assumer le doublon » a ses propres états (duplicate.py).
+REQUESTABLE_STATES = ("proposed", "approved", "failed", "unknown")
 
 
 class ActionSourceError(RuntimeError):
@@ -88,7 +92,7 @@ def normalize_action(raw: dict) -> dict:
         raise ActionSourceError("action : classe inconnue %r" % (action_class,))
     action["class"] = action_class
     action["state"] = _text(raw.get("state"), "state")
-    for name in ("proposed_by", "work_item", "digest"):
+    for name in ("proposed_by", "work_item", "digest", "dedupe", "replaces", "replaced_by"):
         value = raw.get(name)
         if value is not None:
             action[name] = str(value)

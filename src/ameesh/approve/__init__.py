@@ -14,6 +14,8 @@ décision 0017). Modules :
 * `config`  — configuration, jeton de service (0600), dossiers privés ;
 * `store`   — état en fichiers 0600 (demandes, liens hachés, reçus, enrôlements) ;
 * `sources` — lecture de l'action (table `actions` du lot L5, ou en mémoire) ;
+* `duplicate` — empreinte de la décision « assumer le doublon » (réplique de
+  `actions.assume_duplicate_digest`, lot L5) ;
 * `render`  — résumé signé et pages HTML (échappement, CSP stricte) ;
 * `enroll`  — attestation WebAuthn → proposition d'entrée de canon ;
 * `service` — logique (demande, page, reçu, enrôlement) ;

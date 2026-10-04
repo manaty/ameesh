@@ -110,8 +110,11 @@
         throw new Error("cancelled");
       }).then(function (result) {
         if (result.ok) {
+          var approved = data.kind === "assume-duplicate"
+            ? "Décision signée : vous assumez le risque d'un doublon. Vous pouvez fermer cette page."
+            : "Approbation signée et enregistrée. Vous pouvez fermer cette page.";
           say(decision === "approve"
-            ? "Approbation signée et enregistrée. Vous pouvez fermer cette page."
+            ? approved
             : "Refus signé et enregistré. Vous pouvez fermer cette page.", "done");
         } else {
           setBusy(false);

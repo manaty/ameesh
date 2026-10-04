@@ -28,13 +28,14 @@ import time
 import unittest
 from urllib.parse import urlsplit
 
-from ameesh import receipts
+from ameesh import jcs, receipts
 from ameesh.approve import config as approve_config
+from ameesh.approve import duplicate
 from ameesh.approve import render
 from ameesh.approve import server as approve_server
 from ameesh.approve.service import ApproveError, ApproveService
 from ameesh.approve.sources import (
-    ActionSourceError, DbActionSource, MemoryActionSource, normalize_action,
+    REQUESTABLE_STATES, ActionSourceError, DbActionSource, MemoryActionSource, normalize_action,
 )
 from ameesh.approve.store import Store
 
@@ -664,6 +665,274 @@ class ApproveFlowTest(ApproveBase):
         self.assertEqual(self.api("GET", "/requests")[0], 405)
 
 
+# --------------------------------------------------------------------------
+# alignement avec le lot L5 : nouvelle tentative, décision « assumer le doublon »
+# --------------------------------------------------------------------------
+
+class ApproveRetryTest(ApproveBase):
+    """Nouvelle tentative (`actions.retry`) : nouveau reçu, MÊME action_id."""
+
+    def request_status(self, action: dict, **extra):
+        self.source.put(action)
+        body = {"action_id": action["action_id"], "approver": ALICE, "requested_by": AGENT}
+        body.update(extra)
+        status, _h, payload = self.api("POST", "/requests", body)
+        return status, json.loads(payload)
+
+    def test_nouvelle_tentative_apres_echec_certain(self):
+        self.assertIn("failed", REQUESTABLE_STATES)
+        action = make_action(state="failed", dedupe="none")
+        _action, data, path = self.create(action)
+        # même action, même empreinte : le reçu vaut pour `retry` de L5
+        self.assertEqual((data["action_id"], data["digest"], data["assume_duplicate"]),
+                         (action["action_id"], digest_of(action), False))
+        status, _headers, text = self.page(path)
+        self.assertEqual(status, 200, text)
+        self.assertIn("Nouvelle tentative de la MÊME action", text)
+        self.assertIn("échoué de façon certaine", text)
+        self.assertNotIn("DOUBLON", text)
+        page = self.page_data(text)
+        self.assertEqual(page["kind"], "approve")
+        self.assertEqual(self.submit(path, self.sign(self.alice, page))[0], 200)
+        _status, receipt = self.fetch_receipt(data["request_id"])
+        verdict = receipts.verify_receipt(self.db, receipt, POLICY, kind="action",
+                                          expected_digest=digest_of(action),
+                                          expected_action_id=action["action_id"],
+                                          expect_decision="approve")
+        self.assertTrue(verdict.authority, verdict.reason)
+
+    def test_issue_inconnue_selon_la_deduplication(self):
+        guaranteed = make_action(state="unknown", dedupe="guaranteed")
+        _a, data, path = self.create(guaranteed)
+        self.assertEqual(data["digest"], digest_of(guaranteed))
+        self.assertIn("garantit la", self.page(path)[2])
+        # source sans l'information : L5 tranchera à la liaison (retry)
+        self.create(make_action(state="unknown"))
+        # sans déduplication garantie : aucune nouvelle tentative, seulement
+        # la décision qui assume le doublon
+        status, result = self.request_status(make_action(state="unknown", dedupe="none"))
+        self.assertEqual((status, result["error"]), (409, "dedupe"))
+        self.assertIn("assume_duplicate", result["message"])
+
+    def test_action_remplacee_ou_close(self):
+        for state in ("launched", "confirmed", "cancelled"):
+            with self.subTest(state):
+                status, result = self.request_status(make_action(state=state))
+                self.assertEqual((status, result["error"]), (409, "action_state"))
+        replaced = make_action(state="unknown", dedupe="none", replaced_by=new_action_id())
+        for extra in ({}, {"assume_duplicate": True}):
+            with self.subTest(extra=extra):
+                status, result = self.request_status(replaced, **extra)
+                self.assertEqual((status, result["error"]), (409, "action_replaced"))
+
+    def test_echec_entre_la_demande_et_la_signature(self):
+        action, _data, path = self.create(make_action(state="approved"))
+        page = self.page_data(self.page(path)[2])
+        self.source.put(dict(action, state="launched"))
+        status, result = self.submit(path, self.sign(self.alice, page))
+        self.assertEqual((status, result["error"]), (409, "action_state"))
+        # échec certain : la même demande (même empreinte) vaut nouvelle tentative
+        self.source.put(dict(action, state="failed"))
+        self.assertEqual(self.submit(path, self.sign(self.alice, page))[0], 200)
+
+
+class ApproveAssumeDuplicateTest(ApproveBase):
+    """Décision « assumer le doublon » (`actions.replace` du lot L5)."""
+
+    def unknown_action(self, **overrides) -> dict:
+        values = dict(state="unknown", dedupe="none", amount=12345, currency="EUR",
+                      target="exemple/depot#42")
+        values.update(overrides)
+        return make_action(**values)
+
+    def test_cycle_complet_assumer_le_doublon(self):
+        action = self.unknown_action()
+        expected = duplicate.assume_duplicate_digest(action)
+        self.assertNotEqual(expected, digest_of(action))
+        _a, data, path = self.create(action, extra={"assume_duplicate": True})
+        self.assertEqual((data["assume_duplicate"], data["digest"], data["action_digest"]),
+                         (True, expected, digest_of(action)))
+
+        status, _headers, text = self.page(path)
+        self.assertEqual(status, 200, text)
+        self.assertSecurityHeaders(_headers)
+        # EN CLAIR : une décision d'assomption de doublon, pas une approbation
+        self.assertIn("<title>Doublon à assumer — ameesh</title>", text)
+        self.assertEqual(html.unescape(re.search(r"<h1>(.*?)</h1>", text).group(1)),
+                         "Assumer le risque d'un DOUBLON")
+        self.assertNotIn("Approbation demandée", text)
+        alert = re.search(r'<section class="duplicate" role="alert">(.*?)</section>', text, re.S)
+        self.assertIsNotNone(alert)
+        alert = alert.group(1)
+        self.assertIn("PAS une approbation ordinaire", alert)
+        self.assertIn("assumez le risque d'un DOUBLON de cette action", alert)
+        self.assertIn("INCONNUE", alert)
+        for shown in (action["action_id"], "exemple/depot#42", "123.45 EUR", "git-merge / merge"):
+            self.assertIn(shown, alert)
+        self.assertIn('class="approve">Assumer le doublon</button>', text)
+        self.assertNotIn(">Approuver</button>", text)
+        self.assertIn("Action remplacée", text)
+        self.assertIn(render.short_digest(expected), text)
+        self.assertIn(digest_of(action), text)
+        page = self.page_data(text)
+        self.assertEqual(page["kind"], "assume-duplicate")
+
+        # le résumé signé le dit aussi, dès sa première ligne de contenu
+        summary = self.summary_of(text)
+        lines = summary.splitlines()
+        self.assertEqual(lines[0], "ameesh-summary/1")
+        self.assertTrue(lines[1].startswith("décision : ASSUMER LE RISQUE D'UN DOUBLON"), lines)
+        self.assertEqual(lines[2], "action remplacée : %s" % action["action_id"])
+        self.assertIn("empreinte de l'action : %s" % digest_of(action), lines)
+        self.assertIn("empreinte de la décision : %s" % expected, lines)
+        self.assertEqual(render.summary_digest(summary), data["summary_digest"])
+        self.assertEqual(summary, render.render_summary(normalize_action(action), ALICE, AGENT,
+                                                        assume_duplicate=True))
+        self.assertNotEqual(summary, render.render_summary(normalize_action(action), ALICE,
+                                                           AGENT))
+
+        status, result = self.submit(path, self.sign(self.alice, page))
+        self.assertEqual((status, result["decision"]), (200, "approve"), result)
+        status, receipt = self.fetch_receipt(data["request_id"])
+        self.assertEqual(status, 200)
+        self.assertEqual((receipt["request"]["action_id"], receipt["request"]["digest"]),
+                         (action["action_id"], expected))
+        verdict = receipts.verify_receipt(self.db, receipt, POLICY, kind="action",
+                                          expected_digest=expected,
+                                          expected_action_id=action["action_id"],
+                                          expect_decision="approve")
+        self.assertTrue(verdict.authority, verdict.reason)
+        # domaine distinct : ce reçu n'approuve pas une nouvelle tentative
+        mismatch = receipts.verify_receipt(self.db, receipt, POLICY, kind="action",
+                                           expected_digest=digest_of(action),
+                                           expected_action_id=action["action_id"])
+        self.assertEqual(mismatch.code, receipts.DIGEST_MISMATCH)
+        self.assertIn("doublon assumé", self.log.getvalue())
+
+    def test_approbation_ordinaire_ne_vaut_pas_assomption(self):
+        action = self.unknown_action(dedupe="guaranteed")
+        _a, ordinary, _p = self.create(action)
+        _a, assume, path = self.create(action, extra={"assume_duplicate": True})
+        self.assertNotEqual(ordinary["digest"], assume["digest"])
+        self.assertNotEqual(ordinary["summary_digest"], assume["summary_digest"])
+        page = self.page_data(self.page(path)[2])
+        self.assertNotEqual(page["challenge-approve"], self.page_data(
+            self.page(urlsplit(ordinary["link"]).path)[2])["challenge-approve"])
+
+    def test_assomption_refusee_hors_issue_inconnue(self):
+        for state in ("proposed", "approved", "failed", "launched", "confirmed", "cancelled"):
+            with self.subTest(state):
+                action = self.unknown_action(state=state)
+                self.source.put(action)
+                status, _h, payload = self.api("POST", "/requests", {
+                    "action_id": action["action_id"], "approver": ALICE,
+                    "requested_by": AGENT, "assume_duplicate": True})
+                self.assertEqual((status, json.loads(payload)["error"]), (409, "action_state"))
+        action = self.unknown_action()
+        self.source.put(action)
+        for value in ("true", 1, None, [True]):
+            with self.subTest(value=value):
+                status, _h, payload = self.api("POST", "/requests", {
+                    "action_id": action["action_id"], "approver": ALICE,
+                    "requested_by": AGENT, "assume_duplicate": value})
+                self.assertEqual((status, json.loads(payload)["error"]), (400, "format"))
+        # `assume_duplicate: false` : approbation ordinaire (refusée ici : dedupe none)
+        status, _h, payload = self.api("POST", "/requests", {
+            "action_id": action["action_id"], "approver": ALICE, "requested_by": AGENT,
+            "assume_duplicate": False})
+        self.assertEqual((status, json.loads(payload)["error"]), (409, "dedupe"))
+
+    def test_action_reconciliee_ou_remplacee_apres_la_demande(self):
+        action, _data, path = self.create(self.unknown_action(),
+                                          extra={"assume_duplicate": True})
+        page = self.page_data(self.page(path)[2])
+        self.source.put(dict(action, args={"pr": 43, "method": "merge"}))
+        status, result = self.submit(path, self.sign(self.alice, page))
+        self.assertEqual((status, result["error"]), (409, "action_changed"))
+        self.source.put(dict(action, state="confirmed"))      # réconciliée entre-temps
+        status, result = self.submit(path, self.sign(self.alice, page))
+        self.assertEqual((status, result["error"]), (409, "action_state"))
+        self.source.put(dict(action, replaced_by=new_action_id()))
+        status, result = self.submit(path, self.sign(self.alice, page))
+        self.assertEqual((status, result["error"]), (409, "action_replaced"))
+        self.assertEqual(self.page(path)[0], 409)
+        self.source.put(action)
+        status, result = self.submit(path, self.sign(self.alice, page, "deny"))
+        self.assertEqual((status, result["decision"]), (200, "deny"))
+
+    def test_echappement_dans_l_encadre(self):
+        hostile = self.unknown_action(target="<b>x</b>‮\nmontant : 0 EUR",
+                                      operation="merge<script>")
+        _a, _d, path = self.create(hostile, extra={"assume_duplicate": True})
+        status, _headers, text = self.page(path)
+        self.assertEqual(status, 200)
+        alert = re.search(r'<section class="duplicate" role="alert">(.*?)</section>',
+                          text, re.S).group(1)
+        self.assertIn("&lt;b&gt;x&lt;/b&gt;\\u{202e}\\u{000a}montant : 0 EUR", alert)
+        self.assertNotIn("<script>", alert)
+        self.assertNotIn("‮", text)
+
+
+class ApproveDuplicateDigestTest(unittest.TestCase):
+    """Non-régression : duplicate.py est une réplique EXACTE de
+    `actions.assume_duplicate_digest` (lot L5)."""
+
+    REFERENCE = {
+        "action_id": "act_01J9Z3Y4X5W6V7T8S9R0Q1P2N3", "project": "ameesh",
+        "connector": "git-merge", "operation": "merge", "target": "exemple/depot#42",
+        "args": {"pr": 42, "method": "merge", "note": "é"}, "amount": 12345,
+        "currency": "EUR", "policy_version": "3", "class": "irreversible", "state": "unknown",
+    }
+    #: calculés par `ameesh.actions` (origin/lot/L5-actions, 9cf68a3)
+    REFERENCE_ACTION_DIGEST = ("sha256:4a8958feb125d34d34ab17458d1f7066"
+                               "ab9a1f9ecb2cb67407dd8073b7e1b387")
+    REFERENCE_ASSUME_DIGEST = ("sha256:6fc4fef9ba10c58357106c40c7666356"
+                               "e1b6a0a9d60cf9283508944b34c663c5")
+
+    def samples(self) -> list[dict]:
+        return [
+            dict(self.REFERENCE),
+            make_action(state="unknown"),
+            make_action(state="unknown", amount=0, currency="JPY", policy_version=7,
+                        args={"z": [1, None, True], "a": {"é": " "}}),
+            make_action(state="unknown", args={}, target="t"),
+        ]
+
+    def test_vecteur_de_reference(self):
+        self.assertEqual(digest_of(self.REFERENCE), self.REFERENCE_ACTION_DIGEST)
+        self.assertEqual(duplicate.assume_duplicate_digest(self.REFERENCE),
+                         self.REFERENCE_ASSUME_DIGEST)
+        payload = {"action_digest": self.REFERENCE_ACTION_DIGEST,
+                   "decision": "assume-duplicate", "replaces": self.REFERENCE["action_id"]}
+        self.assertEqual(self.REFERENCE_ASSUME_DIGEST, "sha256:" + hashlib.sha256(
+            b"ameesh-assume-duplicate/1\x00" + jcs.canonicalize(payload)).hexdigest())
+        # l'action normalisée par la source donne la même empreinte
+        normalized = normalize_action(dict(self.REFERENCE))
+        self.assertEqual(duplicate.assume_duplicate_digest(normalized),
+                         self.REFERENCE_ASSUME_DIGEST)
+        other = dict(self.REFERENCE, action_id="act_" + "0" * 26)
+        self.assertNotEqual(duplicate.assume_duplicate_digest(other),
+                            self.REFERENCE_ASSUME_DIGEST)
+
+    def test_identique_a_actions_py(self):
+        try:
+            from ameesh import actions
+        except ImportError:
+            self.skipTest("ameesh.actions (lot L5) non fusionné : vecteur de référence seul")
+        self.assertEqual(actions.ASSUME_DUPLICATE_DOMAIN, duplicate.ASSUME_DUPLICATE_DOMAIN)
+        for action in self.samples():
+            with self.subTest(action=action["action_id"]):
+                self.assertEqual(actions.assume_duplicate_digest(action),
+                                 duplicate.assume_duplicate_digest(action))
+                self.assertEqual(actions.digest(action), digest_of(action))
+                normalized = normalize_action(dict(action))
+                self.assertEqual(actions.assume_duplicate_digest(normalized),
+                                 duplicate.assume_duplicate_digest(normalized))
+                request = actions.approval_request(normalized, ALICE, assume_duplicate=True,
+                                                   requested_by=AGENT)
+                self.assertEqual(request["digest"], duplicate.assume_duplicate_digest(action))
+
+
 class ApproveRateLimitTest(ApproveBase):
     CONFIG = {"rate_ip_per_minute": 8, "rate_token_per_minute": 3}
 
@@ -945,6 +1214,25 @@ class ApproveDbSourceTest(PgTestCase):
         self.assertEqual(read["args"], action["args"])
         self.assertIsNone(source.get_action(new_action_id()))
         self.assertIsNone(source.get_action("pas-une-action"))
+
+    def test_deduplication_et_remplacement_lus(self):
+        """Colonnes `dedupe` et `replaced_by` de la table de L5 : lues, pas exigées."""
+        self.db.execute("DROP TABLE IF EXISTS t_l7_dedupe")
+        self.db.execute("CREATE TABLE t_l7_dedupe (%s, dedupe text, replaced_by text)"
+                        % self.COLUMNS)
+        action = make_action(state="unknown")
+        successor = new_action_id()
+        self.db.query(
+            "INSERT INTO t_l7_dedupe (action_id, project, connector, operation, target, args, "
+            "class, state, policy_version, dedupe, replaced_by) "
+            "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, 'none', %s) RETURNING action_id",
+            (action["action_id"], action["project"], action["connector"], action["operation"],
+             action["target"], json.dumps(action["args"]), action["class"], action["state"],
+             action["policy_version"], successor))
+        read = DbActionSource(self.db, "t_l7_dedupe").get_action(action["action_id"])
+        self.assertEqual((read["dedupe"], read["replaced_by"]), ("none", successor))
+        self.assertEqual(duplicate.assume_duplicate_digest(read),
+                         duplicate.assume_duplicate_digest(action))
 
     def test_colonne_d_empreinte_manquante(self):
         self.db.execute("DROP TABLE IF EXISTS t_l7_incomplete")

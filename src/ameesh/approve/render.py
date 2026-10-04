@@ -13,6 +13,11 @@ de ligne et les espaces exotiques sont écrits `\\u{XXXX}`, et la barre
 oblique inverse est doublée. Une valeur ne peut donc ni s'étaler sur plusieurs
 lignes (imiter un autre champ), ni se réordonner à l'affichage.
 
+Une décision « assumer le doublon » (duplicate.py) a un résumé et une page
+distincts : première ligne `décision : ASSUMER LE RISQUE D'UN DOUBLON…`,
+empreinte de l'action ET empreinte de la décision, encadré d'alerte qui
+nomme l'action, sa cible et son montant.
+
 Les pages n'ont **aucun script en ligne** ni style en ligne (CSP stricte) :
 le JavaScript et la feuille de style sont des fichiers statiques servis par le
 service ; les données passent par des attributs `data-*` échappés. Toute
@@ -26,6 +31,7 @@ import time
 import unicodedata
 
 from .. import jcs
+from . import duplicate
 
 SUMMARY_VERSION = "ameesh-summary/1"
 #: un résumé plus long n'est plus relisable par un humain sur un téléphone
@@ -84,11 +90,16 @@ def short_digest(digest: str) -> str:
 
 
 _JSON_LABELS = ("version de politique", "arguments")
+#: première ligne du résumé d'une décision « assumer le doublon » : elle ne
+#: peut pas être confondue avec un résumé d'approbation ordinaire
+ASSUME_DUPLICATE_DECISION = ("ASSUMER LE RISQUE D'UN DOUBLON — l'issue de l'action est "
+                             "inconnue (elle a peut-être déjà eu lieu) ; une nouvelle action "
+                             "identique la remplace")
 
 
-def summary_lines(action: dict, approver: str, requested_by: str) -> list[tuple[str, str]]:
-    return [
-        ("action", action["action_id"]),
+def summary_lines(action: dict, approver: str, requested_by: str, *,
+                  assume_duplicate: bool = False) -> list[tuple[str, str]]:
+    content = [
         ("projet", action["project"]),
         ("connecteur", action["connector"]),
         ("opération", action["operation"]),
@@ -97,17 +108,26 @@ def summary_lines(action: dict, approver: str, requested_by: str) -> list[tuple[
         ("montant", format_amount(action.get("amount"), action.get("currency"))),
         ("version de politique", jcs.dumps(action.get("policy_version"))),
         ("arguments", jcs.dumps(action["args"])),
-        ("empreinte", action["computed_digest"]),
-        ("approbateur", approver),
-        ("demandé par", requested_by),
     ]
+    people = [("approbateur", approver), ("demandé par", requested_by)]
+    if assume_duplicate:
+        return ([("décision", ASSUME_DUPLICATE_DECISION),
+                 ("action remplacée", action["action_id"])]
+                + content
+                + [("empreinte de l'action", action["computed_digest"]),
+                   ("empreinte de la décision", duplicate.assume_duplicate_digest(action))]
+                + people)
+    return ([("action", action["action_id"])] + content
+            + [("empreinte", action["computed_digest"])] + people)
 
 
-def render_summary(action: dict, approver: str, requested_by: str) -> str:
+def render_summary(action: dict, approver: str, requested_by: str, *,
+                   assume_duplicate: bool = False) -> str:
     """Le résumé signé (par son empreinte) : texte stable, une ligne par champ."""
     lines = [SUMMARY_VERSION]
     lines += ["%s : %s" % (label, visible(value, json_text=label in _JSON_LABELS))
-              for label, value in summary_lines(action, approver, requested_by)]
+              for label, value in summary_lines(action, approver, requested_by,
+                                                assume_duplicate=assume_duplicate)]
     return "\n".join(lines) + "\n"
 
 
@@ -151,10 +171,47 @@ def _field(label: str, value, *, warn: str = "") -> str:
     return "<dt>%s</dt><dd><code>%s</code>%s</dd>" % (_e(label), _e(visible(value)), extra)
 
 
+#: approbation ordinaire d'une action déjà tentée : la page le dit
+_RETRY_NOTICES = {
+    "failed": "Nouvelle tentative de la MÊME action (même identifiant) : la tentative "
+              "précédente a échoué de façon certaine. Votre approbation autorise UNE "
+              "nouvelle tentative.",
+    "unknown": "Nouvelle tentative de la MÊME action (même identifiant) : l'issue de la "
+               "tentative précédente est inconnue, mais le connecteur garantit la "
+               "déduplication.",
+}
+
+
+def _duplicate_warning(action: dict) -> str:
+    """Encadré d'une décision « assumer le doublon » : en clair, QUELLE action
+    risque d'avoir lieu deux fois (opération, cible, montant)."""
+    return (
+        "<section class=\"duplicate\" role=\"alert\">\n"
+        "<h2>Ceci n'est PAS une approbation ordinaire</h2>\n"
+        "<p>L'action <code>%s</code> — <code>%s / %s</code> sur la cible <code>%s</code>, "
+        "montant <code>%s</code> — a été lancée, mais son issue est "
+        "<strong>INCONNUE</strong> : elle a peut-être déjà eu lieu.</p>\n"
+        "<p>En signant, vous <strong>assumez le risque d'un DOUBLON de cette action</strong> : "
+        "une nouvelle action identique la remplace et pourra produire le même effet une "
+        "seconde fois (elle exigera encore sa propre approbation). Ne signez que si un "
+        "second effet est acceptable, ou si vous avez vérifié que le premier n'a pas eu "
+        "lieu.</p>\n"
+        "</section>\n"
+    ) % (_e(visible(action["action_id"])), _e(visible(action["connector"])),
+         _e(visible(action["operation"])), _e(visible(action["target"])),
+         _e(format_amount(action.get("amount"), action.get("currency"))))
+
+
 def approval_page(view: dict) -> str:
-    """Page d'approbation. `view` : voir ApproveService.link_view."""
+    """Page d'approbation. `view` : voir ApproveService.link_view.
+
+    Une décision « assumer le doublon » (`view["assume_duplicate"]`) a sa
+    propre page : titre, encadré d'alerte, libellés et bouton distincts — elle
+    ne ressemble jamais à une approbation ordinaire.
+    """
     action = view["action"]
     request = view["request"]
+    assume = view.get("assume_duplicate") is True
     non_ascii = "Attention : contient des caractères non ASCII (risque de sosie)"
     fields = [
         _field("Opération", "%s / %s" % (action["connector"], action["operation"]),
@@ -166,12 +223,15 @@ def approval_page(view: dict) -> str:
         _field("Classe", action["class"]),
         _field("Projet", action["project"],
                warn=non_ascii if has_non_ascii(action["project"]) else ""),
-        _field("Action", action["action_id"]),
+        _field("Action remplacée" if assume else "Action", action["action_id"]),
         _field("Demandé par", request["requested_by"]),
         _field("Approbateur", request["approver"]),
         _field("Lien valable jusqu'à", _moment(view["link_exp"])),
     ]
+    if assume:
+        fields.insert(0, _field("Décision", "ASSUMER LE DOUBLON (remplacement)"))
     data = {
+        "kind": "assume-duplicate" if assume else "approve",
         "rp-id": view["rp_id"],
         "challenge-approve": view["challenge_approve"],
         "challenge-deny": view["challenge_deny"],
@@ -179,31 +239,53 @@ def approval_page(view: dict) -> str:
         "level": view["level"],
     }
     attributes = " ".join("data-%s=\"%s\"" % (name, _e(value)) for name, value in data.items())
+    if assume:
+        heading = "Assumer le risque d'un DOUBLON"
+        lead = ("Vérifiez l'action remplacée, sa cible et son montant. Signez "
+                "<strong>sur votre téléphone</strong> uniquement — ne scannez jamais un QR "
+                "code d'approbation affiché sur un ordinateur.")
+        notice = _duplicate_warning(action)
+        digest_title = "Empreinte de la décision"
+        digest_extra = ("<p class=\"digest\">empreinte de l'action remplacée : "
+                        "<code>%s</code></p>\n" % _e(action["computed_digest"]))
+        approve_label = "Assumer le doublon"
+        title = "Doublon à assumer — ameesh"
+    else:
+        heading = "Approbation demandée"
+        lead = ("Vérifiez l'opération, la cible et le montant. Approuvez "
+                "<strong>sur votre téléphone</strong> uniquement — ne scannez jamais un QR "
+                "code d'approbation affiché sur un ordinateur.")
+        retry = _RETRY_NOTICES.get(action.get("state"))
+        notice = "<p class=\"notice\">%s</p>\n" % _e(retry) if retry else ""
+        digest_title = "Empreinte"
+        digest_extra = ""
+        approve_label = "Approuver"
+        title = "Approbation — ameesh"
     body = (
         "<main id=\"ameesh-approval\" %s>\n"
-        "<h1>Approbation demandée</h1>\n"
-        "<p class=\"lead\">Vérifiez l'opération, la cible et le montant. Approuvez "
-        "<strong>sur votre téléphone</strong> uniquement — ne scannez jamais un QR code "
-        "d'approbation affiché sur un ordinateur.</p>\n"
+        "<h1>%s</h1>\n"
+        "<p class=\"lead\">%s</p>\n"
+        "%s"
         "<dl class=\"fields\">\n%s\n</dl>\n"
-        "<section>\n<h2>Empreinte</h2>\n<p class=\"digest-short\">%s</p>\n"
-        "<p class=\"digest\"><code>%s</code></p>\n</section>\n"
+        "<section>\n<h2>%s</h2>\n<p class=\"digest-short\">%s</p>\n"
+        "<p class=\"digest\"><code>%s</code></p>\n%s</section>\n"
         "<section>\n<h2>Arguments</h2>\n<pre class=\"args\">%s</pre>\n</section>\n"
         "<section>\n<h2>Résumé signé</h2>\n<pre class=\"summary\">%s</pre>\n"
         "<p class=\"digest\">empreinte du résumé : <code>%s</code></p>\n</section>\n"
         "<div class=\"buttons\">\n"
-        "<button id=\"approve\" type=\"button\" class=\"approve\">Approuver</button>\n"
+        "<button id=\"approve\" type=\"button\" class=\"approve\">%s</button>\n"
         "<button id=\"deny\" type=\"button\" class=\"deny\">Refuser</button>\n"
         "</div>\n"
         "<p id=\"status\" role=\"status\" aria-live=\"polite\"></p>\n"
         "<noscript><p>JavaScript est nécessaire pour signer avec votre passkey.</p></noscript>\n"
         "</main>"
     ) % (
-        attributes, "\n".join(fields), _e(short_digest(action["computed_digest"])),
-        _e(action["computed_digest"]), _e(visible(jcs.dumps(action["args"]), json_text=True)),
-        _e(view["summary"]), _e(request["summary_digest"]),
+        attributes, _e(heading), lead, notice, "\n".join(fields), _e(digest_title),
+        _e(short_digest(request["digest"])), _e(request["digest"]), digest_extra,
+        _e(visible(jcs.dumps(action["args"]), json_text=True)),
+        _e(view["summary"]), _e(request["summary_digest"]), _e(approve_label),
     )
-    return _page("Approbation — ameesh", body, base="../")
+    return _page(title, body, base="../")
 
 
 def enroll_page(view: dict) -> str:
