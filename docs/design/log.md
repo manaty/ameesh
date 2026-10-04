@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-04 (auto-réparation)
+* **Décision** : [auto-réparation](decisions/0022-auto-reparation.md) et [étude](etudes/boucle-auto-reparation.md) ; R23 ; lots L18–L23.
+
 ## 2026-10-04 (harnais)
 * **Décision** : [catalogue des harnais](decisions/0021-catalogue-des-harnais.md) ; R22 ; lots L16–L17.
 
