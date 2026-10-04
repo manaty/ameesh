@@ -440,6 +440,48 @@ class AnnouncedModelTest(PgTestCase):
         self.assertEqual(ligne["model"], "deepseek-pro")
         self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
 
+    def test_double_panne_puis_reprise_par_un_nouveau_worker_facture_le_modele_du_flux(self):
+        """La sonde B4 résiduelle (codex3) : ni l'annonce ni la ligne du grand livre
+        n'ont pu s'écrire ; le marqueur garde flash ; un NOUVEAU worker (pas la
+        mémoire du premier) doit facturer pro, relu dans les événements du tour."""
+        env = self._flux_pro()
+        with mock.patch("ameesh.registry.pending_spend_set_model",
+                        side_effect=db_mod.DbError("base indisponible")), \
+                mock.patch("ameesh.cost.CostBook.record",
+                           side_effect=RuntimeError("grand livre indisponible")):
+            self.assertTrue(self._tour(self.worker, env))
+        self.assertEqual(registry.pending_spend_get(self.db, self.name)["model"], "deepseek-flash")
+        self.worker.watchdog_stop.set()
+        nouveau = self._worker()
+        self.assertEqual(nouveau._annonce_ram, "", "pas de mémoire héritée")
+        autorise = nouveau.budget_ok()
+        ligne = self._ligne()
+        self.assertEqual(ligne["model"], "deepseek-pro")
+        self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
+        self.assertFalse(autorise, "0,55 $ dépasse le plafond de 0,40 $/h")
+
+    def test_flux_sans_annonce_la_reparation_garde_le_modele_du_marqueur(self):
+        sans = self._harnais({"type": "status", "phase": "step_end", "usage": {"inputTokens": 1_000_000}},
+                             {"type": "final", "text": "ok"})
+        with mock.patch("ameesh.cost.CostBook.record", side_effect=RuntimeError("panne")):
+            self.assertTrue(self._tour(self.worker, sans))
+        self.worker.watchdog_stop.set()
+        self._worker().budget_ok()
+        ligne = self._ligne()
+        self.assertEqual(ligne["model"], "deepseek-flash")
+        self.assertAlmostEqual(float(ligne["usd"]), 0.27, places=6)
+
+    def test_flux_illisible_ou_absent_ne_change_pas_le_modele_et_ne_plante_pas(self):
+        env = self._flux_pro()
+        with mock.patch("ameesh.cost.CostBook.record", side_effect=RuntimeError("panne")):
+            self.assertTrue(self._tour(self.worker, env))
+        self.worker.watchdog_stop.set()
+        nouveau = self._worker()
+        with mock.patch.object(AgentWorker, "_path", side_effect=OSError("flux perdu")):
+            self.assertEqual(nouveau._annonce_des_evenements(0), "")
+        # le tour d'avant ne se mélange pas à celui-ci : l'index de départ borne la relecture
+        self.assertEqual(nouveau._annonce_des_evenements(10_000), "")
+
     def test_marqueur_absent_pendant_le_tour_est_un_echec_pas_une_autorisation(self):
         env = self._flux_pro()
         with mock.patch("ameesh.registry.pending_spend_set_model", return_value=False):

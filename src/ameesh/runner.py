@@ -864,12 +864,21 @@ class AgentWorker(threading.Thread):
             book = cost_mod.CostBook(
                 state_dir=self.cfg.state_dir, db=self.db,
                 tools={self.name: self.agent.get("harness") or ""})
+            # Le modèle **du tour** se relit dans les événements du tour, qui sont
+            # sur disque : ni le marqueur (modèle du lancement, ou annonce non
+            # persistée), ni la mémoire d'un worker mort ne font foi quand le flux
+            # a dit autre chose (L13 B4 : double panne puis reprise par un NOUVEAU
+            # worker). Ordre : flux du tour > mémoire de ce worker > marqueur.
+            modele = travail.get("model")
+            annonce = self._annonce_des_evenements(debut)
+            if annonce:
+                modele = annonce
             book.record(self.name, start=debut,
                         turn=travail.get("turn") or None,
                         session=travail.get("session") or None,
                         # `""` = modèle inconnu : tarif le plus cher (fail-closed),
                         # jamais un repli sur un état local mutable.
-                        model=travail.get("model"))
+                        model=modele)
             registry.pending_spend_clear(self.db, self.name)
             self._annonce_ram = ""
             self._compta_en_echec = False
@@ -891,6 +900,31 @@ class AgentWorker(threading.Thread):
             self._compta_ecrit(travail)
         elif travail is not None:
             self._compta_en_echec = True  # marqueur incohérent : jamais autoriser
+
+    def _annonce_des_evenements(self, debut: int) -> str:
+        """Le dernier modèle annoncé par le flux **à partir de l'index du tour**.
+
+        Relu avec l'adaptateur du harnais, comme la boucle de lecture : les
+        événements sont écrits ligne à ligne avant d'être analysés, donc ils
+        survivent à un worker mort. Chaîne vide si le flux n'a rien annoncé ou
+        s'il est illisible : l'appelant garde alors le modèle qu'il a.
+        """
+        modele = ""
+        try:
+            adapter = self._adapter()
+            with open(self._path("events.jsonl"), encoding="utf-8") as flux:
+                for numero, ligne in enumerate(flux):
+                    if numero < debut:
+                        continue
+                    ligne = ligne.rstrip("\n")
+                    if not ligne:
+                        continue
+                    annonce = self._parse(adapter, ligne).get("model")
+                    if annonce:
+                        modele = annonce
+        except (OSError, ValueError):
+            return ""
+        return modele
 
     def _compta_annonce(self, modele: str) -> None:
         """Garde le modèle annoncé par le flux : mémoire d'abord, puis base (L13 B4).
