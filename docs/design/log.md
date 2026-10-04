@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-04 (harnais)
+* **Décision** : [catalogue des harnais](decisions/0021-catalogue-des-harnais.md) ; R22 ; lots L16–L17.
+
 ## 2026-10-04 (modèles)
 * **Décision** : [catalogue et évaluation des modèles](decisions/0020-catalogue-et-evaluation-des-modeles.md) ; R21 ; lots L14–L15.
 
