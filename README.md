@@ -25,9 +25,11 @@ scripts are untouched. The switch is described step by step, with rollback, in
 ## Quickstart (bench)
 
 ```bash
-scripts/pg-up.sh                    # container agent-mesh-pg, postgres:17, 127.0.0.1:55432
+scripts/pg-up.sh                    # container ameesh-pg, postgres:17, 127.0.0.1:55432
 export PYTHONPATH=src
-export AMEESH_DSN=postgresql://agent_mesh:agent_mesh@127.0.0.1:55432/agent_mesh
+# Aucun secret n'est codé dans le dépôt : le mot de passe du banc vient de
+# PGPASSWORD ou de ~/.pgpass (mode 600) ; sinon donnez le DSN complet.
+export AMEESH_DSN=postgresql://agent_mesh@127.0.0.1:55432/agent_mesh
 
 python3 -m ameesh migrate       # versioned migrations, idempotent
 python3 -m ameesh doctor --notify-test
@@ -177,3 +179,11 @@ src/ameesh/
 tests/            unittest suite + fakebin/ fake harnesses
 scripts/          pg-up.sh, test.sh
 ```
+
+## License
+
+ameesh is released under **AGPL-3.0-only**. The full, unmodified GNU Affero
+General Public License v3 text is in [`LICENSE`](LICENSE); it covers every file
+of this repository, including the SQL migrations (they carry no per-file header,
+because their sha256 is recorded in the database schema) and the test fixtures.
+External contributions require a contribution agreement (CLA).

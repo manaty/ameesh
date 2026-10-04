@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Suite de tests agent-mesh contre le conteneur Postgres local.
 #
 #   scripts/test.sh [motif unittest]
@@ -10,7 +11,8 @@ cd "$(dirname "$0")/.."
 
 ./scripts/pg-up.sh
 
-export AMEESH_TEST_DSN=${AMEESH_TEST_DSN:-${AGENT_MESH_TEST_DSN:-postgresql://agent_mesh:agent_mesh@127.0.0.1:55432/agent_mesh}}
+#: DSN sans mot de passe : le secret vient de PGPASSWORD ou de ~/.pgpass.
+export AMEESH_TEST_DSN=${AMEESH_TEST_DSN:-${AGENT_MESH_TEST_DSN:-postgresql://agent_mesh@127.0.0.1:55432/agent_mesh}}
 export AMEESH_REQUIRE_DB=1
 export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
 PATTERN=("$@")

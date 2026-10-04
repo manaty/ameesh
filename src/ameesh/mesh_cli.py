@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """agent-mesh — la CLI du mesh : observabilité, clés, approbations, lots.
 
   agent-mesh list [--json]                     mesh list : agents, hôte, bail, non lus, budget

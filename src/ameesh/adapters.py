@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Adaptateurs des trois harnais : construire la commande, lire le flux JSONL.
 
 Les lignes de commande reprennent exactement celles de `nexlink-agent.v0.sh` :

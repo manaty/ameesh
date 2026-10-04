@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Socle des tests agent-mesh : schéma Postgres jetable, CLI en sous-processus.
 
 Chaque classe de test reçoit son propre schéma (`t_<classe>_<hex>`) dans le
@@ -27,7 +28,8 @@ FAKEBIN = os.path.join(REPO, "tests", "fakebin")
 TEST_DSN = os.environ.get(
     "AMEESH_TEST_DSN", os.environ.get(
         "AGENT_MESH_TEST_DSN",
-        "postgresql://agent_mesh:agent_mesh@127.0.0.1:55432/agent_mesh",
+        #: aucun secret dans le dépôt : PGPASSWORD/~/.pgpass pour le banc local.
+        "postgresql://agent_mesh@127.0.0.1:55432/agent_mesh",
     ),
 )
 REQUIRE_DB = os.environ.get(

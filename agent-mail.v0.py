@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """agent-mail — boîte aux lettres locale entre les agents de ce PC
 (Claude Code, Codex, DeepSeek harness), générique, sans réseau.
 

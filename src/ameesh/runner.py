@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """agent-runner — un exécuteur par machine : baux, tours, réveil sur NOTIFY.
 
   agent-runner [--host H] [--runner-id ID] [--agents a,b] [--once [--wait S]]
@@ -30,6 +31,7 @@ import argparse
 import dataclasses
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -43,6 +45,47 @@ from .config import load as load_config
 
 def log(message: str) -> None:
     print("%s %s" % (time.strftime("%H:%M:%S"), message), flush=True)
+
+
+class _AsyncLog:
+    """Journal non bloquant pour le fil du battement (sondes codex3 B5a-N).
+
+    Un `print`+flush sur un tube plein bloque indéfiniment : le fil du
+    battement n'atteint plus l'échéance, le bail expire et un remplaçant peut
+    réclamer l'agent pendant que l'ancien harnais vit encore. Les messages
+    partent donc par une file **bornée**, écrite par un fil dédié ; si le puits
+    sature, le message est abandonné et la perte comptée, jamais attendue.
+    """
+
+    def __init__(self, maxsize: int = 1024) -> None:
+        self.queue: "queue.Queue[str]" = queue.Queue(maxsize)
+        self.perdus = 0
+        self.thread = threading.Thread(target=self._drain, name="journal", daemon=True)
+        self.thread.start()
+
+    def _drain(self) -> None:
+        while True:
+            message = self.queue.get()
+            if message is None:
+                return
+            if self.perdus:
+                perdus, self.perdus = self.perdus, 0
+                log("[journal] %d message(s) abandonné(s) : puits saturé" % perdus)
+            log(message)
+
+    def write(self, message: str) -> None:
+        try:
+            self.queue.put_nowait(message)
+        except queue.Full:
+            self.perdus += 1
+
+
+_journal = _AsyncLog()
+
+
+def log_async(message: str) -> None:
+    """Journal d'un chemin qui ne doit **jamais** attendre le puits (battement)."""
+    _journal.write(message)
 
 
 class AgentWorker(threading.Thread):
@@ -73,6 +116,9 @@ class AgentWorker(threading.Thread):
         self.renew_failures = 0
         self.lease_deadline = float(lease.get("lease_expires_ts") or 0.0)
         self.pgid: int | None = None  # groupe du harnais en cours
+        self.watchdog_lock = threading.Lock()
+        self.watchdog_on = False
+        self.watchdog_stop = threading.Event()
 
     # -- état local --------------------------------------------------------
     def _path(self, name: str) -> str:
@@ -132,43 +178,61 @@ class AgentWorker(threading.Thread):
 
     def renew(self) -> bool:
         """Prolonge le bail. Une panne de base ne laisse pas le harnais tourner
-        sans bail : après quelques échecs ou à l'échéance connue, on l'arrête."""
+        sans bail : après quelques échecs ou à l'échéance connue, on l'arrête.
+
+        Sur toute perte de bail, l'ordre est : drapeau `lease_lost` (bon
+        marché, sans E/S), **SIGKILL**, puis journal. Écrire le journal avant
+        le signal a laissé, sous charge, un remplaçant réclamer le bail pendant
+        que l'ancien harnais vivait encore (sonde codex3 b731f4f : +12 ms).
+        """
         if self.lease_lost.is_set():
             return False
         if self.deadline_passed():
             # Échéance déjà atteinte (réveil tardif, horloge, bail raccourci) :
             # on ne tente même pas le renouvellement, on arrête tout de suite.
-            log("[%s] échéance du bail atteinte : arrêt du harnais" % self.name)
             self.lease_lost.set()
             self.terminate(grace=0, hard=True)
+            log_async("[%s] échéance du bail atteinte : arrêt du harnais" % self.name)
             return False
         answered, expires, error = self._renew_call()
         if not answered:
-            log("[%s] renouvellement sans réponse au-delà du bail : arrêt du harnais"
-                % self.name)
             self.lease_lost.set()
             self.terminate(grace=0, hard=True)
+            log_async("[%s] renouvellement sans réponse au-delà du bail : arrêt du harnais"
+                      % self.name)
             return False
         if error is not None:
             self.renew_failures += 1
-            log("[%s] battement : base injoignable (%s) — échec %d/%d"
-                % (self.name, error, self.renew_failures, self.MAX_RENEW_FAILURES))
-            if self.renew_failures >= self.MAX_RENEW_FAILURES or time.time() >= self.lease_deadline:
-                log("[%s] bail considéré perdu (base injoignable) : arrêt du harnais" % self.name)
-                self.lease_lost.set()
-                self.terminate(grace=0, hard=True)
-                return False
-            return True  # on laisse une chance au prochain battement
+            echec = ("[%s] battement : base injoignable (%s) — échec %d/%d"
+                     % (self.name, error, self.renew_failures, self.MAX_RENEW_FAILURES))
+            definitive = (self.renew_failures >= self.MAX_RENEW_FAILURES
+                          or time.time() >= self.lease_deadline)
+            if not definitive:
+                # Diagnostic par la file non bloquante : le fil du battement
+                # doit continuer à surveiller l'échéance même si le puits est
+                # plein (sonde codex3 B5a-N).
+                log_async(echec)
+                return True  # on laisse une chance au prochain battement
+            # Perte définitive : arrêter avant d'écrire quoi que ce soit (un
+            # journal bloqué ne doit pas retarder le SIGKILL, comme sur les
+            # autres chemins de perte — revue codex3 de 852c8da).
+            self.lease_lost.set()
+            self.terminate(grace=0, hard=True)
+            log_async(echec)
+            log_async("[%s] bail considéré perdu (base injoignable) : arrêt du harnais"
+                      % self.name)
+            return False
         if expires is None:
-            log("[%s] bail perdu (epoch %d) : arrêt du tour" % (self.name, self.epoch))
             self.lease_lost.set()
             self.terminate(grace=0, hard=True)  # SIGKILL direct : plus de chevauchement
+            log_async("[%s] bail perdu (epoch %d) : arrêt du tour" % (self.name, self.epoch))
             return False
         self.renew_failures = 0
         self.lease_deadline = float(expires)
         return True
 
     def release_lease(self) -> None:
+        self.watchdog_stop.set()  # le veilleur n'a plus de bail à défendre
         if self.lease_lost.is_set():
             return
         try:
@@ -218,37 +282,67 @@ class AgentWorker(threading.Thread):
         """Arrête le harnais et tout son groupe.
 
         Par défaut : SIGTERM, 3 secondes de grâce, puis SIGKILL. `hard=True`
-        (perte du bail) envoie SIGKILL **directement** : le remplaçant peut
-        réclamer l'agent à l'échéance, chaque milliseconde de plus est un
-        chevauchement (verdict codex3 B5a).
+        (perte du bail) envoie SIGKILL **directement, avant tout journal** : le
+        remplaçant peut réclamer l'agent à l'échéance, chaque milliseconde de
+        plus est un chevauchement (verdicts codex3 B5a et b731f4f).
 
         L'escalade ne dépend pas de la survie du **parent** : un harnais peut
         mourir sur SIGTERM en laissant un descendant qui l'ignore, et le groupe
         doit alors être tué (sonde codex3 B5b). Le groupe est mémorisé au
         lancement, donc il reste tuable même après la disparition du parent.
+
+        L'enfant direct est moissonné après le SIGKILL : un zombie reste compté
+        vivant par `killpg(pid, 0)` et faisait croire à un groupe survivant
+        pendant les 2 s d'attente, en plus de fausser le constat « terminate est
+        revenu donc le groupe est mort » (constat codex3 b731f4f).
         """
         with self.lock:
             proc = self.proc
         if proc is None:
             return
         pgid = self._group(proc)
-        vivant = proc.poll() is None
-        if vivant and not hard:
+        if proc.poll() is None and not hard:
             self._signal_group(pgid, proc, signal.SIGTERM)
             deadline = time.monotonic() + max(0.0, self.TERMINATE_GRACE if grace is None else grace)
             while time.monotonic() < deadline and proc.poll() is None:
                 time.sleep(0.05)
         if not self._group_alive(pgid):
             return
-        log("[%s] le groupe du harnais survit : SIGKILL" % self.name)
+        # Le signal part avant le journal : un print+flush sur le chemin
+        # critique laissait le temps à un remplaçant de réclamer sous charge.
         self._signal_group(pgid, proc, signal.SIGKILL)
-        # SIGKILL est asynchrone : on attend que le noyau l'ait pris en compte,
-        # pour que « terminate est revenu » veuille dire « le groupe est mort ».
+        log_async("[%s] le groupe du harnais survit : SIGKILL" % self.name)
+        # SIGKILL est asynchrone. On moissonne d'abord l'enfant direct (sinon
+        # son zombie garde le groupe « vivant »), puis on attend la disparition
+        # du groupe entier, dans le même budget de 2 s.
         fin = time.monotonic() + 2.0
+        if proc.poll() is None:
+            try:
+                proc.wait(timeout=max(0.0, fin - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
         while time.monotonic() < fin and self._group_alive(pgid):
-            time.sleep(0.02)
+            time.sleep(0.005)
         if self._group_alive(pgid):
-            log("[%s] groupe toujours vivant après SIGKILL (état noyau ?)" % self.name)
+            log_async("[%s] groupe toujours vivant après SIGKILL (état noyau ?)" % self.name)
+
+    def kill_if_lease_lost(self) -> bool:
+        """Rattrape une publication tardive du harnais, après la perte du bail.
+
+        Le veilleur (ou l'arrêt du worker) peut conclure entre `Popen` et la
+        publication de `self.proc` : il voit alors `proc=None` et ne peut rien
+        tuer. Sans ce recontrôle, le harnais publié survivrait, sans stdout,
+        jusqu'à la fin du tour (sonde codex3 B5a-P) — y compris après un
+        `shutdown()` qui a rendu le bail et arrêté le veilleur, alors même que
+        l'ancienne échéance n'est pas encore atteinte (sonde codex3 B5a-Q).
+        Renvoie True si le harnais vient d'être arrêté.
+        """
+        if not (self.lease_lost.is_set() or self.deadline_passed()
+                or self.stopping.is_set() or self.watchdog_stop.is_set()):
+            return False
+        self.lease_lost.set()
+        self.terminate(grace=0, hard=True)
+        return True
 
     def wait_timeout(self, cap: float) -> float:
         """Attente bornée par l'échéance du bail, **sans plancher positif**.
@@ -263,7 +357,54 @@ class AgentWorker(threading.Thread):
             return max(0.0, min(cap, self.lease_deadline - time.time()))
         return cap
 
+    #: réveil maximal du veilleur : il relit l'échéance au moins à ce rythme.
+    WATCHDOG_TICK = 0.25
+
+    def ensure_watchdog(self) -> None:
+        """Démarre le veilleur d'échéance, une seule fois par agent."""
+        with self.watchdog_lock:
+            if self.watchdog_on:
+                return
+            self.watchdog_on = True
+        threading.Thread(target=self._deadline_watchdog, daemon=True,
+                         name="%s-watchdog" % self.name).start()
+
+    def _deadline_watchdog(self) -> None:
+        """Seul juge de l'échéance (sondes codex3 B5a-N et B5a-S) : **aucune E/S**.
+
+        Il ne dépend d'aucun autre fil : même si le battement est bloqué dans un
+        journal, une requête ou une écriture de fichier, il arrête le harnais
+        dès que l'échéance connue du bail est atteinte. Il ne lit que
+        `lease_deadline` et `time.time`, n'attend que sur un Event (borné par
+        `WATCHDOG_TICK`), puis pose `lease_lost` et envoie le SIGKILL.
+
+        Il reste actif pendant un arrêt gracieux (`stopping`) : la grâce
+        SIGTERM de 3 s ne doit pas laisser expirer le bail sans arrêt effectif
+        (sonde codex3 B5a-S). Seuls le relâchement du bail (`watchdog_stop`,
+        posé par `release_lease`) ou la perte déjà consommée l'arrêtent.
+        """
+        while not self.watchdog_stop.is_set() and not self.lease_lost.is_set():
+            deadline = self.lease_deadline
+            if deadline <= 0:
+                self.watchdog_stop.wait(self.WATCHDOG_TICK)
+                continue
+            reste = deadline - time.time()
+            if reste > 0:
+                # Réveil au plus tard à l'échéance ; relecture régulière pour
+                # voir une échéance repoussée (renouvellement) ou modifiée.
+                self.watchdog_stop.wait(min(reste, self.WATCHDOG_TICK))
+                continue
+            if self.watchdog_stop.is_set():
+                return
+            if self.lease_deadline > time.time():
+                continue  # bail renouvelé entre-temps : rien à faire
+            self.lease_lost.set()
+            log_async("[%s] échéance du bail atteinte : arrêt du harnais" % self.name)
+            self.terminate(grace=0, hard=True)
+            return
+
     def _heartbeat(self, stop_event: threading.Event) -> None:
+        self.ensure_watchdog()
         interval = max(3.0, self.runner.lease_ttl / 3.0)
         while not stop_event.wait(self.wait_timeout(interval)):
             if not self.renew():
@@ -385,6 +526,12 @@ class AgentWorker(threading.Thread):
             with self.lock:
                 self.proc = proc
                 self.pgid = proc.pid  # start_new_session : le groupe porte son pid
+            # Course de publication : le veilleur a pu conclure pendant que ce
+            # Popen n'était pas encore publié (proc=None). Sans ce recontrôle,
+            # le harnais survivrait au bail sans produire de stdout (B5a-P).
+            if self.kill_if_lease_lost():
+                log_async("[%s] bail perdu pendant le lancement : arrêt du harnais"
+                          % self.name)
             log("[%s] tour %s : %s" % (self.name, label, " ".join(argv[:6]) + " …"))
             with open(events_path, "a", encoding="utf-8") as events:
                 for line in proc.stdout or ():
@@ -406,17 +553,18 @@ class AgentWorker(threading.Thread):
                         error = str(parsed["error"])
                     if self.lease_lost.is_set():
                         error = "bail perdu en cours de tour"
-                        self.terminate()
+                        self.terminate(grace=0, hard=True)
                         break
             result_code = proc.wait()
         finally:
             heartbeat_done.set()
+            # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
+            # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
+            # du veilleur une fois `self.proc` effacé (sonde codex3 B5a-S).
+            self.terminate()
             with self.lock:
-                running = self.proc
                 self.proc = None
                 self.pgid = None
-            if running is not None and running.poll() is None:
-                running.terminate()
 
         duration = time.time() - started
         lost = self.lease_lost.is_set()
@@ -467,6 +615,7 @@ class AgentWorker(threading.Thread):
     # -- boucles -----------------------------------------------------------
     def process_once(self, wait_seconds: float) -> bool:
         """Mode banc : au plus un tour, en attendant `wait_seconds` du travail."""
+        self.ensure_watchdog()
         deadline = time.monotonic() + max(0.0, wait_seconds)
         while True:
             spec = self.pick()
@@ -480,6 +629,7 @@ class AgentWorker(threading.Thread):
 
     def run(self) -> None:
         """Mode service : boucle jusqu'à l'arrêt, réveillée par NOTIFY."""
+        self.ensure_watchdog()
         try:
             while not self.stopping.is_set() and not self.runner.stop.is_set():
                 if not self.renew():
@@ -619,6 +769,10 @@ class Runner:
         deadline = time.monotonic() + 8.0
         for worker in workers:
             worker.join(timeout=max(0.1, deadline - time.monotonic()))
+            # Le tour a pu publier son harnais après le terminate initial
+            # (course de publication) : rien ne doit survivre au relâchement
+            # du bail (sonde codex3 B5a-P).
+            worker.terminate(grace=0, hard=True)
             worker.release_lease()
         log("arrêt : %d bail(aux) rendu(s), %d tour(s)" % (len(workers), self.turns))
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Signatures Ed25519 — l'autorité du propriétaire (R4, spec §5 point 3).
 
 Trois implémentations, une seule interface :

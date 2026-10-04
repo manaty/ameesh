@@ -42,7 +42,7 @@ outillage OKF.
 
 # Recommandation
 
-1. **Canon et propositions : Forgejo** (ou GitHub, où sont Manaty et TPK). PR
+1. **Canon et propositions : Forgejo** (ou GitHub). PR
    protégée = `review_policy` de la fédération ; CI = `validate_bundle.py` ; un
    compte par agent, jeton limité à ses dépôts (read/propose, jamais approve).
 2. **État d'exécution dans ameesh**, projeté sur **une issue par lot** (labels

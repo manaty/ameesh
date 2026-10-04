@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Configuration d'agent-mesh.
 
 Une seule source de vérité, lue dans cet ordre :
@@ -18,7 +19,9 @@ import re
 import socket
 from dataclasses import dataclass, replace
 
-DEFAULT_DSN = "postgresql://agent_mesh:agent_mesh@127.0.0.1:55432/agent_mesh"
+#: DSN du banc local, **sans mot de passe** : le secret vient de PGPASSWORD ou
+#: de ~/.pgpass, ou d'un DSN complet dans AMEESH_DSN / le fichier de config.
+DEFAULT_DSN = "postgresql://agent_mesh@127.0.0.1:55432/agent_mesh"
 DEFAULT_CONFIG = "~/.config/ameesh/config.json"
 LEGACY_CONFIG = "~/.config/agent-mesh/config.json"
 DEFAULT_STATE = "~/.local/state/ameesh"

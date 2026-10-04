@@ -131,7 +131,7 @@ deux pour les scripts et les autres agents.
 
 ## 3. `work_items` (spec §5 point 4)
 
-Machine à états reprise de l'IMA :
+Machine à états reprise d'un orchestrateur de tickets existant :
 
 ```
 intake → build → qa → merged → promoted     (+ blocked, waiting_human)
@@ -206,8 +206,8 @@ puis `psycopg` dans un venv avec `cryptography`). Couverture des points 3-5 :
 * **L'horloge est supposée à peu près juste** : les échéances sont comparées à
   l'heure locale/base. Une dérive d'horloge décale les expirations.
 * **Pas encore de porte** : `verify --consume` existe, mais aucun merge ou
-  déploiement ne l'appelle automatiquement ; c'est le branchement IMA
-  (`governance-gate.js`) qui reste à faire.
+  déploiement ne l'appelle automatiquement ; c'est le branchement de la porte de
+  gouvernance externe qui reste à faire.
 * **Pas de clé matérielle** et pas de rotation automatique : `key revoke`
   puis `key register` sont manuels.
 * La vérification des messages signés se fait à chaque hook (~28 ms en pur

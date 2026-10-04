@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Boîte aux lettres : dépôt, lecture, remise, LISTEN/NOTIFY."""
 from __future__ import annotations
 

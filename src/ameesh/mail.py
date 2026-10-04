@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """`agent_mailbox` : messages durables entre agents.
 
 Le dépôt d'un message est la seule écriture nécessaire : un trigger Postgres
