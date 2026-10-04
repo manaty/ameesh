@@ -14,6 +14,10 @@
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
   ameesh migrate | doctor     schéma et diagnostic.
 
+Le service d'approbation humaine (spec §9) est une commande séparée,
+`ameesh-approve` (python -m ameesh.approve), lancée sous son propre
+utilisateur Unix.
+
 Rien d'autre : ce fichier ne fait que router vers les modules, pour que
 `agent-mail` et `agent-runner` continuent de fonctionner à l'identique.
 """
