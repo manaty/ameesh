@@ -64,7 +64,10 @@ exposition réseau.
      request|receipt`, jeton de service) fait l'affaire — **jamais** ses
      commandes `enroll`/`approve`, qui sont une passkey logicielle de test ;
    * les transitions d'actions ne sont pas encore écrites dans le fil (spec
-     §7.1) : on les lit dans `ameesh action show` et `ameesh decisions`.
+     §7.1) : on les lit dans `ameesh action show` et `ameesh decisions` ;
+   * le fil d'un message entre agents du canon suit `chantier` puis
+     `AMEESH_PROJECT`, jamais l'équipe (`team`) déclarée au canon : poser
+     `project` dans la configuration de chaque hôte (étape 1).
 
 **Retour arrière :** rien n'a changé.
 
