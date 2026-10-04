@@ -45,3 +45,22 @@ défauts natifs reproduits sur banc ; relectures avec contre-exemples connus
   référence par le worktree (diff identique). Exigence : rejouer dans un dépôt
   **isolé** (archive git + init, sans historique ni remote), sans accès au
   board ni aux autres worktrees.
+
+# Premier rejeu isolé (03:46)
+
+Lot de référence : correctif mobile JS d'environ 400 lignes avec tests, rejoué
+dans un dépôt isolé.
+
+| Configuration | Durée | Coût | Qualité (relecteur) |
+|---|---|---|---|
+| DeepSeek flash, effort bas | 9 min 40 | ≈ 0,32 $ (56k entrée, 3,9M cache, 32k sortie) | 8/10, OK avec détails |
+| DeepSeek flash, effort élevé (référence) | ≈ 9 min | comparable | ≈ 9/10, OK avec un détail |
+
+Conclusion provisoire : sur ce type de lot, **l'effort bas ne fait pas gagner de
+temps réel** (temps dominé par les outils — installation, tests, typage — et la
+lecture du code), coûte à peu près pareil (le cache domine) et perd environ un
+point de qualité. **Effort élevé par défaut pour l'implémentation** ; effort bas
+seulement quand le raisonnement domine (petites tâches sans suite de tests
+lourde). Le levier de vitesse est ailleurs : tests ciblés, sessions courtes,
+revue par risque. À confirmer sur d'autres paires (Rust, SQL). Outil de
+référence : `~/.local/bin/nexlink-rd`.
