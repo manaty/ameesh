@@ -402,8 +402,12 @@ def cmd_import_v0(cfg: Config, args: argparse.Namespace) -> int:
 
     Les fichiers importés sont déplacés dans `inbox/<nom>/imported/`, jamais
     supprimés : le retour arrière consiste à les remettre en place.
+
+    Chaque message importé est écrit dans son fil, sauf s'il y est déjà (déposé
+    par le repli fichier de la v1, qui note le fichier v0 dans l'entrée). Le
+    corps est repris tel quel : un import ne refuse pas un message déjà envoyé.
     """
-    from . import mail, registry
+    from . import fil, mail, registry
     state = os.path.expanduser(args.state or cfg.v0_state)
     inbox_root = os.path.join(state, "inbox")
     if not os.path.isdir(inbox_root):
@@ -412,6 +416,7 @@ def cmd_import_v0(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     total = 0
     try:
+        deja_au_fil = set() if args.dry_run else fil.v0_recorded(cfg)
         names = ([n.strip() for n in args.agents.split(",") if n.strip()]
                  if args.agents else sorted(os.listdir(inbox_root)))
         for name in names:
@@ -445,9 +450,12 @@ def cmd_import_v0(cfg: Config, args: argparse.Namespace) -> int:
                                             (message.get("text") or "")[:60]))
                     importes += 1
                     continue
+                cle_v0 = "%s/%s" % (name, filename)
                 mail.send(db, message.get("from") or "inconnu", name,
                           message.get("text") or "", host=message.get("host"),
-                          created_us=int(ts * 1_000_000))
+                          created_us=int(ts * 1_000_000), allow_structured=True,
+                          thread=cle_v0 not in deja_au_fil,
+                          thread_meta={"importe_v0": cle_v0})
                 destination = os.path.join(directory, "imported")
                 os.makedirs(destination, exist_ok=True)
                 os.replace(path, os.path.join(destination, filename))

@@ -604,6 +604,363 @@ class RunnerTest(PgTestCase):
                 proc.kill()
                 proc.wait(timeout=5)
 
+    def test_terminate_moissonne_le_zombie_sans_attendre_deux_secondes(self):
+        """Constat codex3 b731f4f : un zombie est compté vivant par killpg(0).
+
+        `terminate(hard=True)` doit moissonner l'enfant direct après le SIGKILL ;
+        sinon le zombie garde le groupe « vivant » et l'arrêt attend 2 s pour
+        rien, avec un faux « groupe toujours vivant après SIGKILL ».
+        """
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "romeo", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 3600},
+        )
+        worker.proc = proc
+        worker.pgid = proc.pid
+        try:
+            debut = time.monotonic()
+            worker.terminate(grace=0, hard=True)
+            ecoule = time.monotonic() - debut
+            self.assertIsNotNone(proc.poll(), "le harnais doit être mort et moissonné")
+            self.assertFalse(AgentWorker._group_alive(proc.pid))
+            self.assertLess(ecoule, 1.0, "un zombie ne doit pas faire durer l'arrêt 2 s")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_le_sigkill_part_avant_tout_journal(self):
+        """Sonde codex3 b731f4f : le journal avant le signal laissait, sous
+        charge, un remplaçant réclamer pendant que l'ancien harnais vivait.
+
+        Ici l'ordre est instrumenté : sur une échéance atteinte, le premier
+        événement doit être le signal, pas une écriture de journal.
+        """
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "tango", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() - 1},
+        )
+        worker.proc = proc
+        worker.pgid = proc.pid
+        ordre: list[tuple] = []
+        vrai_signal = AgentWorker._signal_group
+
+        def signal_trace(pgid, cible, sig):
+            ordre.append(("signal", sig))
+            vrai_signal(pgid, cible, sig)
+
+        def log_trace(message):
+            ordre.append(("log", message))
+
+        try:
+            with mock.patch.object(AgentWorker, "_signal_group",
+                                   staticmethod(signal_trace)), \
+                    mock.patch("ameesh.runner.log", side_effect=log_trace):
+                self.assertFalse(worker.renew())
+            self.assertTrue(worker.lease_lost.is_set())
+            self.assertTrue(ordre, "l'arrêt doit être tracé")
+            self.assertEqual(ordre[0][0], "signal", "un journal précède le SIGKILL")
+            self.assertEqual(ordre[0][1], signal.SIGKILL)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_panne_de_base_definitive_tue_avant_tout_journal(self):
+        """Revue codex3 de 852c8da : au 3e échec de base, le journal partait
+        avant le test définitif et le SIGKILL.
+
+        Un journal bloqué ne doit pas retarder l'arrêt : ici l'ordre est
+        instrumenté, le premier événement doit être le signal.
+        """
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "uniform", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 3600},
+        )
+        worker.proc = proc
+        worker.pgid = proc.pid
+        worker.renew_failures = AgentWorker.MAX_RENEW_FAILURES - 1
+        ordre: list[tuple] = []
+        vrai_signal = AgentWorker._signal_group
+
+        def signal_trace(pgid, cible, sig):
+            ordre.append(("signal", sig))
+            vrai_signal(pgid, cible, sig)
+
+        def log_trace(message):
+            ordre.append(("log", message))
+
+        try:
+            with mock.patch.object(AgentWorker, "_signal_group",
+                                   staticmethod(signal_trace)), \
+                    mock.patch("ameesh.runner.log", side_effect=log_trace), \
+                    mock.patch.object(registry, "renew",
+                                      side_effect=db_mod.DbError("base injoignable")):
+                self.assertFalse(worker.renew())
+            self.assertTrue(worker.lease_lost.is_set())
+            self.assertTrue(ordre, "l'arrêt doit être tracé")
+            self.assertEqual(ordre[0][0], "signal", "un journal précède le SIGKILL")
+            self.assertEqual(ordre[0][1], signal.SIGKILL)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_journal_bloque_ne_bloque_pas_le_battement(self):
+        """Sonde codex3 B5a-N : un puits de journal saturé ne doit pas
+        immobiliser le fil du battement.
+
+        Le diagnostic d'une erreur non définitive passe par une file bornée
+        (perte comptée) : `renew` rend la main tout de suite, puis l'échéance
+        tue quand même le harnais.
+        """
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "xray", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 30},
+        )
+        worker.proc = proc
+        worker.pgid = proc.pid
+        bloque = threading.Event()
+
+        def puits_bloque(message):
+            bloque.wait(2)  # le puits ne rend pas la main
+
+        try:
+            with mock.patch("ameesh.runner.log", side_effect=puits_bloque), \
+                    mock.patch.object(registry, "renew",
+                                      side_effect=db_mod.DbError("base injoignable")):
+                debut = time.monotonic()
+                self.assertTrue(worker.renew())  # 1er échec : non définitif
+                self.assertLess(time.monotonic() - debut, 0.3,
+                                "le journal bloqué immobilise le battement")
+                self.assertFalse(worker.lease_lost.is_set())
+                # l'échéance tombe : le battement doit encore pouvoir arrêter
+                worker.lease_deadline = time.time() - 1
+                bloque.set()  # libère le puits pour la fin du test
+                self.assertFalse(worker.renew())
+            self.assertTrue(worker.lease_lost.is_set())
+            self.assertIsNotNone(proc.poll())
+        finally:
+            bloque.set()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_veilleur_arrete_meme_battement_bloque(self):
+        """Sonde codex3 B5a-N traitée par classe : le veilleur d'échéance est
+        indépendant du battement.
+
+        Même si `renew` ne rend jamais la main (journal, requête, fichier),
+        le harnais est arrêté à l'échéance connue du bail.
+        """
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "whiskey", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.3},
+        )
+        worker.proc = proc
+        worker.pgid = proc.pid
+        bloque = threading.Event()
+        stop = threading.Event()
+        try:
+            with mock.patch.object(AgentWorker, "renew",
+                                   side_effect=lambda: bloque.wait(5)):
+                thread = threading.Thread(target=worker._heartbeat, args=(stop,), daemon=True)
+                thread.start()
+                self.wait_for(lambda: worker.lease_lost.is_set(), timeout=3, interval=0.01)
+            self.assertIsNotNone(proc.poll(), "le veilleur doit tuer à l'échéance")
+        finally:
+            bloque.set()
+            stop.set()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_veilleur_ne_tue_pas_un_bail_renouvele(self):
+        """Le veilleur n'est pas un minuteur : une échéance repoussée par un
+        renouvellement réussi ne doit pas tuer le harnais."""
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "yankee", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.25},
+        )
+        worker.proc = proc
+        worker.pgid = proc.pid
+        try:
+            worker.ensure_watchdog()
+            time.sleep(0.1)
+            worker.lease_deadline = time.time() + 1.5  # renouvellement réussi
+            time.sleep(0.4)  # bien au-delà de l'ancienne échéance
+            self.assertFalse(worker.lease_lost.is_set(), "un bail renouvelé a été tué")
+            self.assertIsNone(proc.poll(), "le harnais doit rester vivant")
+        finally:
+            worker.watchdog_stop.set()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_veilleur_reste_actif_pendant_l_arret_escalade(self):
+        """Sonde codex3 B5a-S : `stopping` (arrêt gracieux) ne doit pas
+        relâcher le veilleur.
+
+        Un harnais qui ignore SIGTERM vit pendant les 3 s de grâce ; si le bail
+        expire dans cette fenêtre, un remplaçant peut le réclamer. Le veilleur
+        doit rester actif jusqu'à la mort du harnais ou le relâchement du bail.
+        """
+        proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+             " time.sleep(60)"],
+            start_new_session=True)
+        runner = Runner(self.cfg, self.db, once=True)
+        worker = AgentWorker(
+            runner,
+            {"name": "zulu", "harness": "claude"},
+            {"lease_epoch": 1, "lease_expires_ts": time.time() + 0.3},
+        )
+        worker.proc = proc
+        worker.pgid = proc.pid
+        worker.ensure_watchdog()
+        try:
+            worker.stopping.set()
+            arret = threading.Thread(target=worker.terminate, daemon=True)
+            debut = time.monotonic()
+            arret.start()
+            self.wait_for(lambda: worker.lease_lost.is_set(), timeout=2, interval=0.01)
+            self.assertIsNotNone(proc.poll(), "le veilleur doit tuer pendant la grâce")
+            self.assertLess(time.monotonic() - debut, 2.0)
+            arret.join(timeout=5)
+        finally:
+            worker.watchdog_stop.set()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_harnais_publie_apres_la_perte_du_bail_est_tue(self):
+        """Sonde codex3 B5a-P : course de publication du Popen.
+
+        Le veilleur conclut pendant que `Popen` n'est pas encore revenu (il voit
+        `proc=None`) ; si la publication de `self.proc` ne recontrôle pas, un
+        harnais sans stdout survit au bail jusqu'à la fin du tour.
+        """
+        cwd = self._cwd("pubrace")
+        self.register("pubrace", "claude", cwd=cwd, prompt="tour")
+        runner = Runner(self.cfg, self.db, once=True)
+        lease = registry.claim(self.db, "pubrace", runner.runner_id, 3600)
+        self.assertIsNotNone(lease)
+        agent = registry.get(self.db, "pubrace")
+        worker = AgentWorker(runner, agent, lease)
+        vrai_popen = subprocess.Popen
+
+        def popen_retarde(*args, **kwargs):
+            proc = vrai_popen(*args, **kwargs)
+            worker.lease_lost.set()  # le veilleur a conclu avant la publication
+            time.sleep(0.05)
+            return proc
+
+        fakebin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakebin")
+        env = {"AMEESH_BIN_DIR": fakebin, "AMEESH_TEST_SLEEP": "5",
+               "AMEESH_TEST_LOG": self.turns_log}
+        debut = time.monotonic()
+        try:
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch("ameesh.runner.subprocess.Popen", side_effect=popen_retarde):
+                ok = worker.run_turn({"kind": "prompt", "prompt": "tour", "ids": []})
+            ecoule = time.monotonic() - debut
+            self.assertFalse(ok)
+            self.assertLess(ecoule, 2.0, "le harnais publié doit être tué, pas attendu")
+            self.assertEqual(registry.get(self.db, "pubrace").get("pending_prompt"), "tour")
+        finally:
+            if worker.proc is not None and worker.proc.poll() is None:
+                worker.proc.kill()
+                worker.proc.wait(timeout=5)
+            worker.watchdog_stop.set()
+
+    def test_arret_relache_le_bail_apres_avoir_tue_le_harnais(self):
+        """Le relâchement du bail ne doit jamais laisser un harnais vivant.
+
+        Le terminate initial peut tomber avant la publication du `Popen` ; un
+        arrêt dur après la jointure garantit que le bail n'est rendu qu'une fois
+        le harnais tué (course de publication, sonde codex3 B5a-P).
+        """
+        runner = Runner(self.cfg, self.db, once=True)
+        ordre: list[tuple] = []
+
+        class FauxWorker:
+            def __init__(self):
+                self.stopping = threading.Event()
+                self.wake = threading.Event()
+
+            def terminate(self, grace=None, hard=False):
+                ordre.append(("terminate", hard))
+
+            def join(self, timeout=None):
+                pass
+
+            def release_lease(self):
+                ordre.append(("release", None))
+
+        runner.workers = {"fantome": FauxWorker()}
+        runner.shutdown()
+        self.assertIn(("terminate", True), ordre)
+        self.assertLess(ordre.index(("terminate", True)), ordre.index(("release", None)))
+
+    def test_publication_tardive_apres_relachement_est_tuee(self):
+        """Sonde codex3 B5a-Q : une publication tardive après un shutdown qui a
+        rendu le bail et arrêté le veilleur doit être tuée, même si l'ancienne
+        échéance n'est pas encore atteinte.
+        """
+        cwd = self._cwd("pubshutdown")
+        self.register("pubshutdown", "claude", cwd=cwd, prompt="tour")
+        runner = Runner(self.cfg, self.db, once=True)
+        lease = registry.claim(self.db, "pubshutdown", runner.runner_id, 3600)
+        self.assertIsNotNone(lease)
+        agent = registry.get(self.db, "pubshutdown")
+        worker = AgentWorker(runner, agent, lease)
+        vrai_popen = subprocess.Popen
+
+        def popen_retarde(*args, **kwargs):
+            proc = vrai_popen(*args, **kwargs)
+            # shutdown a rendu le bail et arrêté le veilleur pendant la création
+            worker.stopping.set()
+            worker.watchdog_stop.set()
+            time.sleep(0.05)
+            return proc
+
+        fakebin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fakebin")
+        env = {"AMEESH_BIN_DIR": fakebin, "AMEESH_TEST_SLEEP": "5",
+               "AMEESH_TEST_LOG": self.turns_log}
+        debut = time.monotonic()
+        try:
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch("ameesh.runner.subprocess.Popen", side_effect=popen_retarde):
+                ok = worker.run_turn({"kind": "prompt", "prompt": "tour", "ids": []})
+            ecoule = time.monotonic() - debut
+            self.assertFalse(ok)
+            self.assertLess(ecoule, 2.0, "le harnais publié doit être tué, pas attendu")
+            self.assertTrue(worker.lease_lost.is_set())
+        finally:
+            if worker.proc is not None and worker.proc.poll() is None:
+                worker.proc.kill()
+                worker.proc.wait(timeout=5)
+            worker.watchdog_stop.set()
+
 
 if __name__ == "__main__":
     unittest.main()

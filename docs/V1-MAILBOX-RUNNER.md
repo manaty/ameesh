@@ -122,11 +122,48 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   harnais, au lieu de dormir 50 ms de plus pendant qu'un remplaçant réclame
   l'agent.
   À la perte du bail, le groupe reçoit SIGKILL **directement** (pas de SIGTERM
-  préalable) :
-  même si la base ne répond plus du tout (réponse retenue par un proxy, par
+  préalable) et **avant tout journal** : un print+flush sur ce chemin critique
+  laissait, sous charge, un remplaçant réclamer pendant que l'ancien harnais
+  vivait encore (sonde codex3 b731f4f). L'enfant direct est ensuite moissonné :
+  un zombie reste compté vivant par `killpg(pid, 0)`, ce qui faisait durer
+  l'attente 2 s et journalisait un faux « groupe toujours vivant ».
+  Même si la base ne répond plus du tout (réponse retenue par un proxy, par
   exemple), le battement conclut à la perte du bail et arrête le harnais à
   l'heure où un remplaçant peut réclamer l'agent. Le `statement_timeout` reste
   la borne serveur, le délai client `psql` la borne du sous-processus.
+* **Veilleur d'échéance indépendant, journal non bloquant** — un fil dédié
+  (`_deadline_watchdog`) ne fait que lire `lease_deadline` et `time.time`, puis
+  poser `lease_lost` et envoyer le SIGKILL dès que l'échéance connue est
+  atteinte. Il n'écrit rien, n'appelle ni la base ni un fichier et n'attend
+  aucun autre fil : même si le battement est bloqué dans un journal plein, une
+  requête ou une écriture, l'arrêt part à l'échéance (sonde codex3 B5a-N,
+  classe des E/S bloquantes sur ce chemin). Les journaux du chemin de perte de
+  bail (battement, `terminate`) passent par une file bornée écrite par un fil
+  dédié : si le puits sature, le message est abandonné et la perte comptée et
+  signalée, jamais attendue.
+  **Inventaire des E/S restantes sur le chemin du bail, avec leur borne :**
+  l'appel `renew` tourne dans un fil séparé, rejoint au plus tard au temps
+  restant du bail (`call_budget`, plancher 0), avec `statement_timeout` serveur
+  (30 s par défaut) et délai client `psql` (+5 s) ; les diagnostics du battement
+  passent par la file bornée (aucune attente) ; sur perte du bail, `terminate`
+  envoie le SIGKILL avant tout journal, moissonne l'enfant direct et borne
+  l'attente du groupe à 2 s ; le veilleur lui-même n'a aucune E/S. Le seul fil
+  qui peut rester bloqué est l'écrivain de journal, qui ne perd alors que des
+  messages.
+  Le veilleur **reste actif pendant un arrêt gracieux** (`stopping`, grâce
+  SIGTERM de 3 s) : il ne s'arrête qu'au relâchement du bail (`release_lease`)
+  ou une fois la perte consommée, sinon un harnais qui ignore SIGTERM
+  survivrait à l'échéance pendant la grâce (sonde codex3 B5a-S). La fin de tour
+  passe par l'arrêt escaladé (SIGTERM puis SIGKILL), plus par un
+  `Popen.terminate()` sec ; et le bail perdu en cours de lecture est un SIGKILL
+  direct. Enfin, **la publication du `Popen` est recontrôlée** : le veilleur
+  peut conclure entre la création du processus et l'affectation de `self.proc`
+  (il voit alors `proc=None`) ; sans ce recontrôle, un harnais sans stdout
+  survivrait au bail jusqu'à la fin du tour (sonde codex3 B5a-P). Le recontrôle
+  couvre aussi la fermeture du worker (`stopping`) et le relâchement du bail
+  (`watchdog_stop`) : une publication tardive après un `shutdown()` qui a rendu
+  le bail est tuée, même si l'ancienne échéance n'est pas atteinte (sonde
+  codex3 B5a-Q).
 * **Requêtes bornées** — chaque connexion pose un `statement_timeout`
   (`AMEESH_STATEMENT_TIMEOUT_MS`, défaut 30 s) : un renouvellement de bail
   qui pend (verrou, requête lente) est annulé par le serveur ; le pilote `psql`

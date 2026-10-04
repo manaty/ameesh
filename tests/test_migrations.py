@@ -17,10 +17,11 @@ class MigrationsTest(PgTestCase):
         rows = self.db.query(
             "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
         )
-        self.assertEqual([row["version"] for row in rows], [1, 2, 3, 4, 5, 6, 7, 14])
+        # 0008 est réservée au lot L2 (canon) : 0009 (L4, fils) peut la précéder
+        self.assertEqual([row["version"] for row in rows], [1, 2, 3, 4, 5, 6, 7, 9, 14])
         self.assertEqual([row["name"] for row in rows],
                          ["init", "overview", "authority", "work_items", "key_roles",
-                          "authority_fixes", "nonces_backfill", "cost"])
+                          "authority_fixes", "nonces_backfill", "threads", "cost"])
         for row in rows:
             self.assertEqual(len(row["checksum"]), 64)
         # la vue d'observabilité et les deux triggers de notification existent
@@ -85,14 +86,15 @@ class MigrationsTest(PgTestCase):
                 "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %s) AS ok", (schema,)
             )[0]["ok"])
             done = migrations.migrate(db)
-            self.assertEqual([m.version for m in done], [1, 2, 3, 4, 5, 6, 7, 14])
+            self.assertEqual([m.version for m in done], [1, 2, 3, 4, 5, 6, 7, 9, 14])
             tables = db.query(
                 "SELECT count(*)::int AS n FROM information_schema.tables "
                 "WHERE table_schema = %s AND table_name IN ('agent_registry','agent_mailbox',"
-                "'schema_migrations','mesh_approvals','work_items','work_item_events')",
+                "'schema_migrations','mesh_approvals','work_items','work_item_events',"
+                "'thread_index')",
                 (schema,),
             )[0]["n"]
-            self.assertEqual(tables, 6)
+            self.assertEqual(tables, 7)
         finally:
             db.close()
             self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
@@ -155,7 +157,7 @@ class MigrationsTest(PgTestCase):
             #    enregistrée avant 0005 devient « agent » (moindre privilège) :
             #    l'acte explicite --role owner est rejoué, comme à la bascule.
             done = migrations.migrate(db)
-            self.assertEqual([m.version for m in done], [5, 6, 7, 14])
+            self.assertEqual([m.version for m in done], [5, 6, 7, 9, 14])
             db.execute("UPDATE agent_registry SET key_role = 'owner' "
                        "WHERE name = 'proprietaire'")
             ledger = db.query(
