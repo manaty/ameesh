@@ -175,6 +175,37 @@ class AttachTest(PgTestCase):
         self.assertTrue(attach_owner("laptop").startswith("attach:"))
         self.assertTrue(attach_owner("laptop").endswith("@laptop"))
 
+    def test_attache_respecte_les_regles_du_canon_si_presentes(self):
+        """Pont L2 (R14) : dès que les colonnes du canon existent, attach et
+        claim refusent un éphémère échu ou un responsable non résolu."""
+        self._agent("att")
+        self.db.execute(
+            "ALTER TABLE agent_registry ADD COLUMN responsible text, "
+            "ADD COLUMN ephemeral boolean NOT NULL DEFAULT false, "
+            "ADD COLUMN ephemeral_expires_at timestamptz")
+        try:
+            self.db.execute(
+                "UPDATE agent_registry SET ephemeral = true, "
+                "ephemeral_expires_at = now() - interval '1 second' WHERE name = 'att'")
+            self.assertIsNone(registry.attach_claim(self.db, "att", "attach:test", 30))
+            self.assertIsNone(registry.claim(self.db, "att", "runner-x", 30))
+            self.db.execute(
+                "UPDATE agent_registry SET ephemeral_expires_at = now() + interval '1 hour' "
+                "WHERE name = 'att'")
+            self.assertIsNotNone(registry.claim(self.db, "att", "runner-x", 30))
+            self.db.execute(
+                "UPDATE agent_registry SET lease_owner = NULL, lease_expires_at = NULL "
+                "WHERE name = 'att'")
+            self.db.execute("UPDATE agent_registry SET responsible = NULL WHERE name = 'att'")
+            with mock.patch.object(type(self.cfg), "responsible_required", True, create=True):
+                self.assertIsNone(registry.attach_claim(self.db, "att", "attach:test", 30))
+                self.assertIsNone(registry.claim(self.db, "att", "runner-y", 30))
+        finally:
+            self.db.execute(
+                "ALTER TABLE agent_registry DROP COLUMN IF EXISTS responsible, "
+                "DROP COLUMN IF EXISTS ephemeral, "
+                "DROP COLUMN IF EXISTS ephemeral_expires_at")
+
 
 if __name__ == "__main__":
     unittest.main()

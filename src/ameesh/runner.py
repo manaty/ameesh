@@ -956,15 +956,20 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     ttl = max(5.0, ttl or cfg.lease_ttl)
     registry.reap(db, cfg.host)
     while True:
+        if registry.turn_in_progress(db, name):
+            if not wait:
+                print("un tour est en cours pour %s (relancez avec --wait pour attendre)"
+                      % name, file=sys.stderr)
+                return 3
+            print("tour en cours pour %s : attente…" % name, file=sys.stderr, flush=True)
+            time.sleep(2.0)
+            continue
         lease = registry.attach_claim(db, name, owner, ttl)
         if lease:
             break
-        if not wait:
-            print("un tour est en cours pour %s (relancez avec --wait pour attendre)"
-                  % name, file=sys.stderr)
-            return 3
-        print("tour en cours pour %s : attente…" % name, file=sys.stderr, flush=True)
-        time.sleep(2.0)
+        print("agent %s non réclamable (responsable non résolu, éphémère échu ou état)"
+              % name, file=sys.stderr)
+        return 1
     epoch = int(lease["lease_epoch"])
     log("[%s] bail attach pris (epoch %d)" % (name, epoch))
     stop = threading.Event()

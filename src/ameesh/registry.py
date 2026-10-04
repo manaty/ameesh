@@ -100,8 +100,36 @@ def overview(db: Db) -> list[dict]:
     )
 
 
+def _canon_rules_sql(db: Db) -> str:
+    """Règles du canon (L2) applicables au registre, si les colonnes existent.
+
+    L8 (`attach`) et L2 (canon) sont écrits en parallèle : ce pont applique le
+    même prédicat que `claimable` — éphémère échu jamais réclamable, responsable
+    résolu quand il est requis — dès que la migration 0008 est là, quel que soit
+    l'ordre de fusion. Tant que les colonnes n'existent pas, il ne change rien.
+    La politique d'hôte (L3) viendra s'ajouter ici.
+    """
+    rows = db.query(
+        "SELECT count(*)::int AS n FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = 'agent_registry' "
+        "AND column_name IN ('responsible', 'ephemeral', 'ephemeral_expires_at')"
+    )
+    if int(rows[0]["n"]) < 3:
+        return ""
+    sql = " AND (NOT ephemeral OR ephemeral_expires_at > now())"
+    cfg = getattr(db, "cfg", None)
+    if cfg is not None and getattr(cfg, "responsible_required", False):
+        sql += " AND coalesce(responsible, '') <> ''"
+    return sql
+
+
 def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
-    """Prend le bail s'il est libre ou expiré. Renvoie la ligne, sinon None."""
+    """Prend le bail s'il est libre ou expiré. Renvoie la ligne, sinon None.
+
+    Les règles du canon (`_canon_rules_sql`) sont appliquées **dans la même
+    requête** que la prise de bail : un agent non réclamable ne peut pas être
+    pris par une course entre `claimable` et `claim`.
+    """
     _check_name(name)
     rows = db.query(
         """
@@ -133,6 +161,7 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
                updated_at       = now()
          WHERE name = %s
            AND (lease_owner IS NULL OR lease_owner = %s OR lease_expires_at < now())
+        """ + _canon_rules_sql(db) + """
         RETURNING name, lease_owner, lease_epoch,
                   extract(epoch from lease_expires_at)::float8 as lease_expires_ts
         """,
@@ -176,6 +205,7 @@ def attach_claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | No
          WHERE name = %s
            AND status <> 'stopped'
            AND current_prompt IS NULL
+        """ + _canon_rules_sql(db) + """
          RETURNING name, lease_owner, lease_epoch,
                    extract(epoch from lease_expires_at)::float8 as lease_expires_ts
         """,
