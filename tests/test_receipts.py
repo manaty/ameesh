@@ -15,12 +15,12 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import jcs, p256, receipts
+from ameesh import cose, jcs, p256, receipts, signing
 
 from .support import PgTestCase
 from .webauthn_soft import (
-    ORIGIN, RP_ID, SoftDevice, SoftEd25519, SoftES256Key, SoftWebAuthn, b64u, make_receipt,
-    make_request, new_action_id, sha,
+    ORIGIN, RP_ID, SoftDevice, SoftEd25519, SoftES256Key, SoftWebAuthn, b64u, cbor,
+    make_receipt, make_request, new_action_id, sha,
 )
 
 ALICE = "human:alice"
@@ -552,6 +552,179 @@ class ReceiptsForgeryTest(ReceiptsBase):
         # et la synchronisation suivante la révoque (absente du canon)
         result = receipts.sync_authenticators(self.db, self.members)
         self.assertEqual(result["revoked"], ["%s/webauthn/%s" % (ALICE, intruder.credential_id)])
+
+
+# --------------------------------------------------------------------------
+# Ed25519 : clés et signatures de petit ordre (falsification universelle)
+# --------------------------------------------------------------------------
+
+#: les 8 points de petit ordre d'Ed25519 (sous-groupe de torsion), encodages
+#: canoniques — la liste standard (libsodium, « Taming the many EdDSAs »)
+SMALL_ORDER = [bytes.fromhex(h) for h in (
+    "0100000000000000000000000000000000000000000000000000000000000000",  # neutre
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",  # ordre 2
+    "0000000000000000000000000000000000000000000000000000000000000000",  # ordre 4
+    "0000000000000000000000000000000000000000000000000000000000000080",  # ordre 4
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",  # ordre 8
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",  # ordre 8
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",  # ordre 8
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",  # ordre 8
+)]
+IDENTITY = SMALL_ORDER[0]
+#: R = neutre, S = 0 : avec la clé neutre, [S]B - [k]A = neutre pour TOUT message
+FORGED = IDENTITY + bytes(32)
+#: encodages non canoniques : y non réduit mod p, ou signe posé sur x = 0
+NON_CANONICAL = [bytes.fromhex(h) for h in (
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",  # y = p
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",  # y = p + 1 (neutre)
+    "0100000000000000000000000000000000000000000000000000000000000080",  # neutre, signe 1
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",  # (0, -1), signe 1
+)]
+
+
+def okp_cose(raw: bytes) -> bytes:
+    return cbor({1: 1, 3: -8, -1: 6, -2: raw})
+
+
+class ForgedSigner:
+    """« Signe » n'importe quoi avec la signature constante (neutre, 0)."""
+
+    @staticmethod
+    def sign(_message: bytes) -> bytes:
+        return FORGED
+
+
+class SmallOrderTest(unittest.TestCase):
+    def test_les_8_points_de_petit_ordre_refuses_a_l_entree(self):
+        # la liste est exactement le sous-groupe de torsion : {k·T}, T d'ordre 8
+        order8 = signing._point_decompress(SMALL_ORDER[4])
+        self.assertEqual({signing._point_compress(signing._point_mul(k, order8))
+                          for k in range(8)}, set(SMALL_ORDER))
+        for point in SMALL_ORDER:
+            with self.subTest(point=point.hex()):
+                self.assertIsNotNone(signing._point_decompress(point))   # bien sur la courbe
+                self.assertIn("petit ordre", signing.public_key_error(point))
+                with self.assertRaises(ValueError):
+                    signing.check_public_key(point)
+                with self.assertRaises(ValueError):
+                    signing.decode_public(signing.encode_public(point))
+                with self.assertRaises(cose.CborError):
+                    cose.ed25519_key(point)
+                with self.assertRaises(cose.CborError):
+                    cose.parse_cose_key(okp_cose(point))
+                for facade, blob in (("ed25519", point), ("ed25519", okp_cose(point)),
+                                     ("webauthn", okp_cose(point))):
+                    with self.assertRaises(receipts.ReceiptError):
+                        receipts.parse_public_key(facade, blob)
+
+    def test_encodages_non_canoniques_refuses(self):
+        for blob in NON_CANONICAL:
+            with self.subTest(blob=blob.hex()):
+                self.assertIsNotNone(signing.public_key_error(blob))
+                with self.assertRaises(cose.CborError):
+                    cose.ed25519_key(blob)
+                with self.assertRaises(ValueError):
+                    signing.check_public_key(blob)
+
+    def test_signature_constante_refusee_par_tous_les_backends(self):
+        messages = (b"", b"n'importe quel message", receipts.challenge(make_request(ALICE)))
+        for name in signing.available_backends():
+            for public in SMALL_ORDER:
+                for message in messages:
+                    with self.subTest(backend=name, public=public.hex()[:8], message=message[:8]):
+                        self.assertFalse(signing.backend(name).verify(public, message, FORGED))
+            with self.subTest(backend=name, via="PublicKey"), \
+                    mock.patch.dict(os.environ, {"AMEESH_SIGNING_BACKEND": name}):
+                # même une PublicKey construite sans passer par ed25519_key
+                self.assertEqual(signing.backend().name, name)
+                key = cose.PublicKey("EdDSA", raw=IDENTITY)
+                self.assertEqual([key.verify(message, FORGED) for message in messages],
+                                 [False] * len(messages))
+        with self.subTest(via="signing.verify"):
+            self.assertEqual([signing.verify(IDENTITY, message, FORGED) for message in messages],
+                             [False] * len(messages))
+
+    def test_r_de_petit_ordre_et_s_non_reduit(self):
+        seed = os.urandom(32)
+        public = signing.public_from_seed(seed)
+        scalar, _prefix = signing.expand_seed(seed)
+        message = b"message"
+        good = signing.sign(seed, message)
+        # R = neutre, S = k·a : l'équation sans cofacteur [S]B - [k]A = R tient
+        k = int.from_bytes(hashlib.sha512(IDENTITY + public + message).digest(),
+                           "little") % signing._L
+        small_r = IDENTITY + (k * scalar % signing._L).to_bytes(32, "little")
+        # S + L : même point, scalaire non réduit
+        s = int.from_bytes(good[32:], "little")
+        unreduced = good[:32] + (s + signing._L).to_bytes(32, "little")
+        for name in signing.available_backends():
+            with self.subTest(backend=name):
+                backend = signing.backend(name)
+                self.assertTrue(backend.verify(public, message, good))       # inchangé
+                self.assertFalse(backend.verify(public, message, small_r))
+                self.assertFalse(backend.verify(public, message, unreduced))
+        self.assertEqual(signing.signature_error(public, small_r), "R de petit ordre")
+        self.assertIn("S non réduit", signing.signature_error(public, unreduced))
+        self.assertIsNone(signing.signature_error(public, good))
+
+    def test_cles_honnetes_inchangees(self):
+        for _ in range(16):
+            public = signing.public_from_seed(os.urandom(32))
+            self.assertIsNone(signing.public_key_error(public))
+            self.assertEqual(signing.decode_public(signing.encode_public(public)), public)
+            self.assertEqual(cose.ed25519_key(public).raw, public)
+
+
+class SmallOrderEndToEndTest(ReceiptsBase):
+    def inject(self, facade: str, credential_id: str, blob: bytes) -> None:
+        """Ligne écrite en base sans passer par le canon (qui la refuserait)."""
+        self.db.query(
+            "INSERT INTO authenticators (approver, facade, credential_id, public_key, "
+            "key_fingerprint, level, canon_ref) VALUES (%s, %s, %s, %s, %s, 'standard', %s) "
+            "RETURNING id",
+            (ALICE, facade, credential_id, b64u(blob), hashlib.sha256(blob).hexdigest(),
+             "members/alice.md@" + COMMIT))
+
+    def test_enrolement_canon_refuse(self):
+        forged = SoftWebAuthn("EdDSA")
+        members = self.members + [member(
+            "mallory",
+            {"facade": "ed25519", "credential_id": "ed25519:neutre",
+             "public_key": b64u(IDENTITY)},
+            {"facade": "ed25519", "credential_id": "ed25519:ordre8",
+             "public_key": b64u(SMALL_ORDER[4])},
+            dict(forged.entry(), public_key=b64u(okp_cose(IDENTITY))),
+            {"facade": "ed25519", "credential_id": "ed25519:noncanonique",
+             "public_key": b64u(NON_CANONICAL[1])},
+        )]
+        result = receipts.sync_authenticators(self.db, members)
+        self.assertEqual(len(result["errors"]), 4, result["errors"])
+        self.assertEqual(sum("petit ordre" in e for e in result["errors"]), 3, result["errors"])
+        self.assertEqual(result["added"], [])
+        self.assertEqual(receipts.list_authenticators(self.db, approver="human:mallory"), [])
+
+    def test_recu_forge_refuse(self):
+        tools = receipts.Policy(allow_facades={"ed25519"})
+        self.inject("ed25519", "ed25519:neutre", IDENTITY)
+        request = make_request(ALICE)
+        receipt = make_receipt(request, "ed25519", "ed25519:neutre",
+                               {"signature": b64u(FORGED)})
+        self.assertRefused(self.verify(receipt, tools), receipts.KEY)
+        self.assertRefused(receipts.verify_receipt(
+            self.db, receipt, tools, consume_by="porte", expected_digest=request["digest"],
+            expected_action_id=request["action_id"]), receipts.KEY)
+        # passkey EdDSA dont la clé COSE est le neutre : assertion forgée
+        forged = SoftWebAuthn("EdDSA")
+        self.inject("webauthn", forged.credential_id, okp_cose(IDENTITY))
+        receipt = forged.receipt(make_request(ALICE), signer=ForgedSigner())
+        self.assertRefused(self.verify(receipt), receipts.KEY)
+        # grant permanent forgé : rien n'est enregistré, aucun nonce consommé
+        receipt = forged.receipt(make_request(ALICE, standing=standing()), signer=ForgedSigner())
+        verdict, grant = receipts.register_standing(self.db, receipt, POLICY, registered_by="x")
+        self.assertIsNone(grant)
+        self.assertRefused(verdict, receipts.KEY)
+        self.assertEqual(self.db.query(
+            "SELECT count(*)::int AS n FROM mesh_consumed_nonces")[0]["n"], 0)
 
 
 # --------------------------------------------------------------------------
