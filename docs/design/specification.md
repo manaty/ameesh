@@ -416,6 +416,16 @@ client ; migrations réservées ci-dessous ; aucune dépense, aucun service publ
 | L11 | interruption de tour, rotation de session avec résumé, sessions robustes au déplacement (R19) | L8 | — | codex3 |
 | L12 | lecteurs de jauges de forfait, comptabilité par tour, `ameesh cost` (R20) | — | 0014 | codex |
 | L13 | garde de budget avant chaque tour, modèle et effort par harnais, `ameesh set` (R20) | L8, L12 | — | codex3 |
+| L14 | catalogue et découverte des modèles (API des fournisseurs, options des harnais, barèmes), événements de changement, `ameesh models list|discover|show` (R21) | L12 | 0015 | codex |
+| L15 | évaluation sur tâches de référence (action coûteuse sous la porte), rapports au canon, `ameesh models evaluate|recommend` (R21) | L5, L14 | 0016 | codex3 |
+| L16 | descripteurs de harnais au format du **manifeste du registre ACP** (`agent.json` : id, version, capacités, authentification, distribution), étendu par un espace de clés `ameesh` (pilotage sans interface, reprise de session, flux, hooks, jauges et coût, permissions) ; adaptateur ACP générique, adaptateur piloté par descripteur ; fin de la liste fermée de harnais (R22) | L8 | — | codex3 |
+| L17 | catalogue central des harnais, banc de conformité, évaluation harnais × modèle × effort, installation signée (R22) | L14, L15, L16 | 0017 | codex3 |
+| L18 | entrée des signaux (table `signals`, webhooks authentifiés, e-mail, fil), empreintes et déduplication à deux niveaux, liens signal ↔ lot (R23 : A1, A3) | L4 | 0018 | codex3 |
+| L19 | classifieur et politique d'auto-réparation au canon ; passage automatique ouvert → en cours pour les bugs admis (R23 : A2, A5) | L2, L18 | — | codex |
+| L20 | exécution de réparation : consigne « reproduire d'abord », rapport, gardes sur le diff (substituts, portée, contrats, tests), porte de changement sur l'empreinte du diff (R23 : A6, A7) | L5, L8 | 0019 | codex3 |
+| L21 | preuves de vérification et QA bornée (R23 : A8) | L20 | — | codex |
+| L22 | demandes aux humains : destinataire par le canon, échéances par gravité, remplaçants, escalade sans décision implicite (R23 : A9) | L2, L5 | 0020 | codex3 |
+| L23 | surveillance après livraison, réouverture sur récidive, corrélation avec les versions, notification du demandeur, auto-guérison des exécutions, balayage (R23 : A4, A10–A12) | L18, L21 | 0021 | codex |
 
 Ordre : L2, L4 et L6 en parallèle dès maintenant (fichiers nouveaux) ; L1 et L8
 après la fusion de B5a (ils touchent `runner.py` et `registry.py`) ; puis L3,
