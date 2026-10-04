@@ -169,6 +169,38 @@ prints the status for the host and the recorded state; `mesh list --json`
 exposes `canon_governed`, `canon_status`, `canon_diagnostic`,
 `canon_checked_ts` and `canon_claim_ok`.
 
+**Governed placement (C4, lot L3).** The project's responsible human decides
+where an agent runs (`Placement`), within the policy of the host's responsible
+(`Host`). For every canon agent of the host, `canon sync` writes whether its
+placement on *that* host is admitted (declarative columns `placement_ok`,
+`placement_diagnostic`, `placement_ref`, migration 0022): refused when the host
+policy rejects its harness, provider, model or credential mode, when it has no
+placement on this host, when the placement is ambiguous or the `Host` card is
+missing. The claim condition requires `placement_ok` for agents governed by
+the canon; a refused, missing or not-yet-evaluated verdict closes new claims,
+never a running lease. A verdict only holds for the profile it judged: every
+verdict is written with `placement_profile`, the SQL function
+`ameesh_placement_profile(host, harness, provider, model, credential_mode)` of
+the evaluated values, and the claim condition also requires it to equal the
+row's current profile. Any change made outside `canon sync` (`ameesh run
+register` with another harness or on another machine, `import-v0`, manual SQL)
+closes new claims until the next sync, without any trigger. Ephemeral agents
+inherit their canon creator's verdict only when their own profile is the one
+evaluated for that creator. Agents registered by hand are unaffected. ameesh
+never moves an agent by itself:
+
+```
+ameesh placement check [--agent A] [--json] …   # read-only: current placements (admitted or
+                                                # refused, and why), admissible hosts and modes;
+                                                # exit 1 if a placement is refused
+```
+
+`canon check` lists the host's placements (admitted or refused) and the
+registry verdicts whose profile diverged since evaluation, `canon sync`
+reports each agent's verdict, and `mesh list --json` exposes `placement_ok`,
+`placement_diagnostic`, `placement_ref`, `placement_profile` (evaluated),
+`placement_profile_current` and `placement_profile_ok`.
+
 `agent-runner`:
 
 ```
@@ -231,7 +263,7 @@ src/ameesh/
   mail.py         agent_mailbox: send, unread, deliver, history
   fil.py          readable threads: Transport, file transport, index, ameesh fil
   migrations.py   NNNN_name.sql, checksummed, advisory-locked
-  migrations/     0001_init.sql … 0009_threads.sql, 0011_receipts.sql, 0014_cost.sql (numéros réservés : 0010, 0012–0013, 0015–0021)
+  migrations/     0001_init.sql … 0009_threads.sql, 0011_receipts.sql, 0014_cost.sql, 0022_placement.sql (numéros réservés : 0010, 0012–0013, 0015–0021)
   mesh_cli.py     agent-mesh: mesh list, keys, approvals, work items, import/export v0
   authority.py    Ed25519 proofs bound to content and expiry; approvals
   signing.py      Ed25519 (pure RFC 8032 + optional cryptography/nacl), key files
@@ -244,6 +276,7 @@ src/ameesh/
   canon.py        OKF canon: git-object reading, minimal YAML, profile, validation,
                   placement_violations (host policy)
   canon_sync.py   canon → registry (declarative columns), ephemeral agents
+  placement.py    governed placement (C4): verdict per agent and host, admissible hosts
   canon_cli.py    ameesh canon check|show|sync, ameesh agent spawn
   backend.py      Postgres backend + v0 file fallback
   identity.py     v0 alias/name resolution (shared aliases.tsv)

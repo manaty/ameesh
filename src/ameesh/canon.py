@@ -823,7 +823,8 @@ class Canon:
 
 
 # ==========================================================================
-# Politique d'hôte (C4) — réutilisée par L3 dans `claimable`
+# Politique d'hôte (C4) — réutilisée par L3 (`placement.evaluate`, dont le
+# verdict, écrit par `canon sync`, entre dans la condition de réclamation)
 # ==========================================================================
 
 def _get(obj: Any, key: str) -> Any:
