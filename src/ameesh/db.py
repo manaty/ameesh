@@ -16,18 +16,28 @@ Règles communes :
   concaténation de chaîne non contrôlée) ;
 * `query()` renvoie une liste de dicts, `execute()` un nombre de lignes (0 avec
   psql : utiliser `query()` avec `RETURNING` quand le compte importe) ;
-* `script()` applique un script multi-instructions dans une transaction.
+* `script()` applique un script multi-instructions dans une transaction ;
+* `transaction()` ouvre une transaction explicite (BEGIN … COMMIT, ROLLBACK
+  sur exception) dont l'objet rendu a la même interface `query()` /
+  `execute()` : lectures, contrôles et écritures entre les deux voient le
+  même état, et les verrous pris (`pg_advisory_xact_lock`, `FOR UPDATE`)
+  tiennent jusqu'au COMMIT. psycopg : `Connection.transaction()` ; psql :
+  une session `psql` persistante sur des tubes (`_PsqlTransaction`).
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pty
 import queue
 import re
+import select
 import shutil
 import subprocess
+import tempfile
 import threading
+import time
 from collections import deque
 from decimal import Decimal
 from typing import Any, Iterable, Sequence, Union
@@ -296,6 +306,11 @@ class PsqlDriver:
         if proc.returncode != 0:
             raise self._fail(proc)
 
+    def transaction(self) -> "_PsqlTransaction":
+        """Transaction explicite sur une session psql persistante (voir
+        `_PsqlTransaction`) ; à utiliser en `with db.transaction() as tx:`."""
+        return _PsqlTransaction(self)
+
     def listen(self, channels: Iterable[str]) -> "Listener":
         return _PsqlListener(self, list(channels))
 
@@ -304,6 +319,160 @@ class PsqlDriver:
 
     def ping(self) -> None:
         self._check()
+
+
+class _PsqlTransaction:
+    """Transaction explicite avec le pilote psql (aucune dépendance Python).
+
+    Un `psql` persistant lit ses instructions sur un tube : `BEGIN` à l'entrée
+    du bloc `with`, `COMMIT` à sa sortie normale ; sur exception, la session
+    est abandonnée (ROLLBACK, puis fin du processus : la connexion fermée
+    annule de toute façon la transaction). Chaque instruction est suivie d'un
+    `SELECT` témoin propre à la session : psql vide sa sortie après chaque
+    résultat de requête (pas après `\\echo`, vérifié sur le conteneur), la
+    réponse d'une instruction est donc tout ce qui précède son témoin.
+    `ON_ERROR_STOP` : la première erreur termine psql (code 3) ; elle est lue
+    sur stderr (fichier temporaire : un NOTICE ne bloque jamais le tube) et
+    levée en DbError, la transaction étant annulée par la fermeture.
+
+    Même interface que le pilote (`query`, `execute`, `cfg`, `name`) :
+    le code qui reçoit `db` s'exécute tel quel dans la transaction. Un
+    `transaction()` imbriqué rend la même session (pas de sous-transaction).
+    """
+
+    name = "psql"
+
+    def __init__(self, driver: PsqlDriver):
+        self.driver = driver
+        self.cfg = driver.cfg
+        self.proc: subprocess.Popen | None = None
+        self._err = None
+        self._buf = b""
+        self._depth = 0
+        self._seq = 0
+        self._token = "__ameesh_tx_%s" % os.urandom(8).hex()
+
+    # -- cycle de vie ------------------------------------------------------
+    def __enter__(self) -> "_PsqlTransaction":
+        if self.proc is not None:
+            self._depth += 1
+            return self
+        self._err = tempfile.TemporaryFile()
+        try:
+            self.proc = subprocess.Popen(
+                self.driver._interactive_args, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=self._err, env=self.driver.env)
+        except OSError as exc:
+            self._err.close()
+            raise Unavailable("psql n'a pas pu démarrer : %s" % exc) from exc
+        try:
+            for line in self.driver._bootstrap.splitlines():
+                if line.strip():
+                    self._run(line)
+            self._run("BEGIN")
+        except BaseException:
+            self._close(abort=True)
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._depth:
+            self._depth -= 1
+            return False
+        try:
+            if exc_type is None:
+                self._run("COMMIT")
+        except BaseException:
+            self._close(abort=True)
+            raise
+        self._close(abort=exc_type is not None)
+        return False
+
+    def transaction(self) -> "_PsqlTransaction":
+        return self
+
+    def _close(self, abort: bool) -> None:
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                try:
+                    if abort:
+                        proc.stdin.write(b"ROLLBACK;\n")
+                    proc.stdin.close()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=2 if abort else 10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            if proc.stdout is not None:
+                proc.stdout.close()
+        finally:
+            if self._err is not None:
+                self._err.close()
+                self._err = None
+
+    # -- échanges ----------------------------------------------------------
+    def _failure(self) -> DbError:
+        proc = self.proc
+        code = proc.wait() if proc is not None else -1
+        text = ""
+        if self._err is not None:
+            self._err.seek(0)
+            text = self._err.read().decode("utf-8", "replace")
+        self._close(abort=True)
+        return self.driver._fail(subprocess.CompletedProcess([], code or 3, "", text))
+
+    def _run(self, sql: str) -> str:
+        """Envoie une instruction, rend sa sortie (tout ce qui précède le témoin)."""
+        if self.proc is None:
+            raise DbError("psql : transaction fermée")
+        self._seq += 1
+        marker = ("%s_%d__" % (self._token, self._seq)).encode()
+        payload = sql.rstrip().rstrip(";") + ";\nSELECT '%s';\n" % marker.decode()
+        try:
+            self.proc.stdin.write(payload.encode("utf-8"))
+            self.proc.stdin.flush()
+        except OSError:
+            raise self._failure() from None
+        timeout = self.driver._client_timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
+        fd = self.proc.stdout.fileno()
+        while True:
+            head, sep, rest = self._buf.partition(marker + b"\n")
+            if sep:
+                self._buf = rest
+                return head.decode("utf-8", "replace").rstrip("\n")
+            wait = None if deadline is None else max(0.0, deadline - time.monotonic())
+            ready, _, _ = select.select([fd], [], [], wait)
+            if not ready:
+                self._close(abort=True)
+                raise DbError("psql : délai client dépassé (%ss) — transaction annulée"
+                              % timeout)
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                raise self._failure()
+            self._buf += chunk
+
+    # -- interface ---------------------------------------------------------
+    def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
+        text = self._run(_json_query(bind(sql, params))).strip()
+        if not text:
+            return []
+        try:
+            rows = json.loads(text)
+        except ValueError as exc:
+            raise DbError("réponse JSON illisible de psql : %.120s" % text) from exc
+        if isinstance(rows, dict):
+            rows = [rows]
+        return [_normalize_row(row) for row in rows]
+
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
+        self._run(bind(sql, params))
+        return 0
 
 
 class _PsqlListener:
@@ -486,6 +655,17 @@ class PsycopgDriver:
         except Exception as exc:
             raise _map_error(exc) from exc
 
+    @contextlib.contextmanager
+    def transaction(self):
+        """Transaction explicite sur la connexion (BEGIN … COMMIT, ROLLBACK sur
+        exception) ; rend le pilote lui-même, dont les requêtes passent par
+        cette connexion. Imbriquée : un point de sauvegarde."""
+        try:
+            with self.conn.transaction():
+                yield self
+        except self._psycopg.Error as exc:
+            raise _map_error(exc) from exc
+
     def listen(self, channels: Iterable[str]) -> "Listener":
         try:
             conn = self._connect()
@@ -600,6 +780,6 @@ def listener(db: PsqlDriver | PsycopgDriver, channels: Iterable[str]) -> "Listen
         return None
 
 
-#: type commun aux deux pilotes
-Db = Union[PsqlDriver, PsycopgDriver]
+#: type commun aux deux pilotes (et à une transaction psql ouverte, même interface)
+Db = Union[PsqlDriver, PsycopgDriver, _PsqlTransaction]
 Listener = Union[_PsqlListener, _PsycopgListener]

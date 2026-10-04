@@ -6,9 +6,12 @@
                                          unreadable), état enregistré au registre,
                                          placements de l'hôte admis ou refusés (C4)
   ameesh canon show [--json]             fiches lues, et d'où (commit)
-  ameesh canon sync [--host H] [--json]  canon → registre de l'hôte (§4.4) ; enregistre
+  ameesh canon sync [--host H] [--json] [--bootstrap-ref BRANCHE]
+                                         canon → registre de l'hôte (§4.4) ; enregistre
                                          l'état du canon (canon_state), même illisible,
-                                         et le verdict de placement de chaque agent
+                                         et le verdict de placement de chaque agent ;
+                                         recopie Member.authenticators dans le registre
+                                         de confiance (§8.2) ; code 1 si erreur
   ameesh placement check [--agent A] [--json]
                                          placements actuels (admis ou refusés, et
                                          pourquoi) et placements admissibles (hôtes,
@@ -18,6 +21,12 @@
 
 Options communes du canon : `--canon DOSSIER` (sinon AMEESH_CANON), `--ref REV`
 (sinon AMEESH_CANON_REF, le `ref` du manifeste, origin/main), `--fetch`.
+
+Registre des authentificateurs (§8.2) : `--ref` choisit ce qui est LU, jamais
+ce qui est canonique. La branche canonique de confiance est celle de la
+configuration de l'hôte (AMEESH_CANON_REF / `canon_ref`), sinon celle du
+manifeste du dernier commit appliqué (journal en base), sinon — premier
+amorçage — `--bootstrap-ref BRANCHE` (journalisé) ; sans rien de cela, refus.
 """
 from __future__ import annotations
 
@@ -113,6 +122,11 @@ def _recorded_line(host: str, recorded: dict | None) -> str:
         line += (" — %s\n  → agents du canon non réclamables sur %s jusqu'à un "
                  "« ameesh canon sync » qui lit un canon valide" % (st.get("diagnostic") or "?",
                                                                     host))
+    if st.get("auth_status"):
+        line += "\nauthentificateurs : %s%s (contrôle du %s)%s" % (
+            "EN ERREUR — " if st["auth_status"] == canon_sync.AUTH_STATE_ERROR else "",
+            st["auth_status"], _moment(st.get("auth_checked_ts")),
+            " — %s" % st["auth_diagnostic"] if st.get("auth_diagnostic") else "")
     return line
 
 
@@ -216,14 +230,19 @@ def cmd_sync(cfg: Config, args: argparse.Namespace) -> int:
     try:
         db_mod.require_schema(db)
         try:
-            report = canon_sync.sync(db, canon, host)
+            # registre des authentificateurs : la branche canonique de confiance
+            # vient de la configuration de l'hôte (cfg.canon_ref, jamais --ref),
+            # du dernier commit appliqué, ou de --bootstrap-ref au premier amorçage
+            report = canon_sync.sync(db, canon, host, trusted_ref=cfg.canon_ref,
+                                     bootstrap_ref=args.bootstrap_ref or "")
         except canon_sync.CanonUnreadable as exc:
             return _print_unreadable(args, canon, exc)
     finally:
         db.close()
+    auth_errors = report.authenticators.errors if report.authenticators else []
     if args.json:
         print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
-        return 1 if report.errors else 0
+        return 1 if report.errors or auth_errors else 0
     tag = UNTRUSTED_TAG if report.untrusted else ""
     print("%scanon sync sur %s — %s" % (tag, host, report.source))
     if not report.actions:
@@ -239,11 +258,36 @@ def cmd_sync(cfg: Config, args: argparse.Namespace) -> int:
         print("%splacement refusé sur %s : %s — non réclamable(s) ; hôtes admissibles : "
               "ameesh placement check --agent A" % (tag, host, ", ".join(refused)))
     print(_status_line(host, report.status, report.diagnostic, recorded=True))
+    _print_authenticators(report.authenticators)
     if report.errors:
         print("canon INVALIDE — %s : les agents concernés ne sont pas réclamables "
               "(ameesh canon check)" % _summary(report.findings))
         return 1
-    return 0
+    return 1 if auth_errors else 0
+
+
+def _print_authenticators(done: canon_sync.AuthenticatorSync | None) -> None:
+    """Le registre des authentificateurs (§8.2) après la synchronisation."""
+    if done is None:
+        return
+    if done.branch:
+        print("authentificateurs : branche canonique de confiance %s (%s)" % (
+            done.branch, canon_sync.TRUST_LABELS.get(done.trust, done.trust)))
+    for note in done.notes:
+        print("authentificateurs : %s" % note)
+    if done.status != canon_sync.AUTH_SYNCED:
+        print("authentificateurs : %s%s" % (
+            "REFUSÉ — " if done.status == canon_sync.AUTH_REFUSED else "", done.reason))
+        return
+    data = done.to_dict()
+    print("authentificateurs : ajoutés %s ; mis à jour %s ; révoqués %s ; inchangés %d%s" % (
+        _join(data["added"]), _join(data["updated"]), _join(data["revoked"]),
+        data["unchanged"], " ; GELÉS %s" % _join(data["frozen"]) if data["frozen"] else ""))
+    if done.partial:
+        print("authentificateurs : canon lu en partie (%s) : aucune révocation pour absence"
+              % "; ".join(done.partial))
+    for error in done.errors:
+        print("authentificateurs : ERREUR %s" % error)
 
 
 def _modes(modes) -> str:
@@ -333,10 +377,12 @@ def _print_unreadable(args: argparse.Namespace, canon: canon_mod.Canon,
             "canon_status": canon_sync.CANON_UNREADABLE, "diagnostic": exc.diagnostic,
             "actions": [], "errors": len(canon_mod.errors(exc.findings)),
             "findings": [f.to_dict() for f in exc.findings],
+            "authenticators": canon_sync.AuthenticatorSync(
+                canon_sync.AUTH_SKIPPED, "canon illisible : registre inchangé").to_dict(),
         }, ensure_ascii=False, indent=2))
         return 1
-    print("canon sync sur %s — canon ILLISIBLE (%s) : registre inchangé"
-          % (exc.host, canon.root))
+    print("canon sync sur %s — canon ILLISIBLE (%s) : registre inchangé (agents et "
+          "authentificateurs)" % (exc.host, canon.root))
     _print_findings(exc.findings)
     print(_status_line(exc.host, canon_sync.CANON_UNREADABLE, exc.diagnostic, recorded=True))
     return 1
@@ -409,6 +455,11 @@ def add_parsers(sub) -> None:
     p_sync = canon_sub.add_parser("sync", help="canon → registre de l'hôte (§4.4)")
     _canon_options(p_sync)
     p_sync.add_argument("--host", default=None, help="hôte (sinon AMEESH_HOST / cette machine)")
+    p_sync.add_argument("--bootstrap-ref", default=None, metavar="BRANCHE",
+                        help="premier amorçage du registre des authentificateurs seulement "
+                             "(ni AMEESH_CANON_REF, ni commit déjà appliqué) : branche "
+                             "canonique de confiance (origin/<BRANCHE>), journalisée ; "
+                             "ignorée ensuite")
     p_sync.set_defaults(func=cmd_sync)
 
     p_place = sub.add_parser("placement", help="placement gouverné (C4) : check")

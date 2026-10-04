@@ -702,20 +702,37 @@ def transport_for(cfg: Config) -> FileTransport:
 # --------------------------------------------------------------------------
 
 def member(cfg: Config, name: str) -> str:
-    """`human:<nom>` pour un humain déclaré (AMEESH_HUMANS), `agent:<nom>` sinon."""
+    """`human:<nom>` pour un humain déclaré (AMEESH_HUMANS), `agent:<nom>` sinon.
+
+    Un nom déjà qualifié (`human:`, `agent:`, ou `ameesh:<acteur>` pour un
+    outil qui n'est ni l'un ni l'autre) reste tel quel : un nom d'agent ne
+    contient jamais `:`."""
     if name == "all":
         return "tous"
-    if name.startswith(("human:", "agent:")):
+    if ":" in name:
         return name
     return ("human:%s" if name in cfg.human_names else "agent:%s") % name
 
 
-def project_for(cfg: Config, *chantiers) -> str:
-    """Projet d'un message : chantier de l'expéditeur, du destinataire, AMEESH_PROJECT, default."""
-    for chantier in chantiers:
-        if chantier and str(chantier).strip():
-            return str(chantier).strip()
+def project_for(cfg: Config, *projects) -> str:
+    """Projet d'un message : celui de l'expéditeur, du destinataire (`agent_project`),
+    AMEESH_PROJECT, default."""
+    for project in projects:
+        if project and str(project).strip():
+            return str(project).strip()
     return cfg.project or DEFAULT_PROJECT
+
+
+def agent_project(row: dict | None) -> str:
+    """Projet du fil d'un agent (ligne du registre, avec `canon_governed`) :
+    son équipe (`team` du canon) s'il est gouverné par le canon, sinon son
+    chantier ; vide si aucun."""
+    if not row:
+        return ""
+    team = str(row.get("team") or "").strip()
+    if row.get("canon_governed") and team:
+        return team
+    return str(row.get("chantier") or "").strip()
 
 
 def _warn(text: str) -> None:
@@ -723,6 +740,11 @@ def _warn(text: str) -> None:
         print("ameesh fil : %s" % text, file=sys.stderr)
     except Exception:
         pass
+
+
+def warn(text: str) -> None:
+    """Dit un problème de fil sur stderr ; ne lève jamais."""
+    _warn(text)
 
 
 def record(cfg: Config, db, *, sender: str, recipients: Sequence[str], text: str,

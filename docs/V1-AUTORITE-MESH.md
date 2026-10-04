@@ -1,5 +1,17 @@
 # V1 — autorité du propriétaire, mesh list, work_items (points 3 à 5)
 
+> **Avertissement — document du banc, dépassé pour l'autorité humaine.** Ce
+> document décrit le modèle d'autorité du banc (clé Ed25519 « propriétaire »).
+> La conception v1 l'a remplacé : l'autorité d'un humain est un **reçu**
+> `ameesh-receipt/1` signé hors de portée des agents, sur son téléphone, par
+> **ameesh-approve** ; la **cérémonie de clé Ed25519 sur le PC est abandonnée**
+> ([décision 0012](design/decisions/0012-autorite-par-ameesh-approve.md)).
+> Les clés Ed25519 restent pour la provenance des agents (R13) et les tests,
+> jamais comme autorité humaine. Référence : [`docs/design/`](design/index.md) —
+> [spécification](design/specification.md) §7 (porte), §8 (reçus), §9
+> (ameesh-approve) — et la bascule réécrite, [`BASCULE.md`](BASCULE.md).
+> Le reste (mesh list, work_items, import/export v0) demeure valable.
+
 Suite de [`V1-MAILBOX-RUNNER.md`](V1-MAILBOX-RUNNER.md) (points 1 et 2 : boîte
 aux lettres Postgres et exécuteur par machine). Toujours en banc : aucun agent
 réel n'est branché, la bascule est décrite dans [`BASCULE.md`](BASCULE.md).
@@ -91,8 +103,9 @@ Format PEM-like, lisible et sans ambiguïté (`AGENT-MESH PUBLIC/PRIVATE KEY`,
 base64 du germe ou de la clé de 32 octets). Règles :
 
 * `agent-mesh key generate` **refuse** de s'exécuter sans `--i-am-the-owner` :
-  la cérémonie de clé est un acte du propriétaire, aucun agent ne génère ni ne
-  détient sa clé privée (voir `BASCULE.md`, étape 3) ;
+  aucun agent ne génère ni ne détient une clé de rôle `owner`. (La cérémonie de
+  clé du propriétaire prévue par l'ancienne bascule est abandonnée en v1 :
+  décision 0012, voir l'avertissement en tête) ;
 * la clé privée est écrite en `0600`, refusée à la lecture si ses permissions
   sont trop ouvertes, jamais journalisée, jamais en base, jamais dans un message ;
 * `agent-mesh key register <agent> --public-key FICHIER [--role owner|agent]`
@@ -198,8 +211,11 @@ puis `psycopg` dans un venv avec `cryptography`). Couverture des points 3-5 :
 
 * **L'enregistrement d'une clé est un acte de confiance** : la CLI ne peut pas
   prouver qui a lancé `key register` ni qui a choisi `--role owner`. La
-  protection est organisationnelle (cérémonie, machine, permissions) — R4
-  prouve la *signature* et son rôle, pas l'identité de l'opérateur.
+  protection est organisationnelle (machine, permissions) — R4 prouve la
+  *signature* et son rôle, pas l'identité de l'opérateur. C'est cette limite
+  (agents et clé sous le même utilisateur Unix) qui a conduit la v1 à placer
+  l'autorité humaine dans ameesh-approve et le registre des authentificateurs
+  dans le canon, modifiable seulement par PR revue (spec §8.2).
 * **Un rôle par clé, pas encore de portées** : `owner`/`agent` est binaire ;
   des capacités plus fines (« approuver un merge mais pas la production »)
   viendront avec la porte de gouvernance.

@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+import types
 import unittest
 from unittest import mock
 
-from ameesh import canon, canon_sync, config as config_mod, db as db_mod, registry
+from ameesh import canon, canon_sync, config as config_mod, db as db_mod, fil, receipts, registry
+from ameesh import runner as runner_mod
 
 from .support import REPO, PgTestCase
+from .webauthn_soft import SoftWebAuthn
 
 EXAMPLE = os.path.join(REPO, "examples", "canon")
 HAS_PYYAML = canon._yaml is not None
@@ -1270,6 +1275,732 @@ class CanonCliTest(_CanonDbCase):
         proc = self.mesh("agent", "spawn", "aide3", "--by", "relecteur", "--ttl", "1h",
                          env=self.env(AGENT_MAIL_NAME="relecteur"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+
+# ==========================================================================
+# canon sync → registre des authentificateurs (§8.2, L6)
+# ==========================================================================
+
+def member_fiche(title: str, entries=None, *, raw: str | None = None) -> str:
+    """Fiche Member ; `entries` : liste d'entrées (JSON en flux YAML), None : clé absente."""
+    lines = ["---", "type: Member", "title: %s" % title, "roles: [reviewer]"]
+    if raw is not None:
+        lines.append("authenticators: %s" % raw)
+    elif entries is not None:
+        lines.append("authenticators: %s" % json.dumps(entries))
+    lines += ["---", "", "# %s" % title, ""]
+    return "\n".join(lines)
+
+
+class _AuthenticatorCase(_TmpMixin, PgTestCase):
+    """Un canon dans un dépôt (le dépôt nu local tient lieu de branche
+    canonique distante), un registre des authentificateurs vide."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.execute("DELETE FROM canon_state")
+        self.db.execute("TRUNCATE authenticators, standing_approvals, standing_reservations, "
+                        "authenticator_syncs RESTART IDENTITY CASCADE")
+        self.workspace = self.make_tmp()
+        self.bare, self.clone = publish(self.workspace, "acme", EXAMPLE)
+        self.alice = SoftWebAuthn()
+        self.alice2 = SoftWebAuthn()
+        self.bruno = SoftWebAuthn()
+
+    def commit_members(self, clone: str | None = None, *, message: str = "membres",
+                       push: bool = True, **fiches) -> str:
+        clone = clone or self.clone
+        for title, text in fiches.items():
+            write(clone, "membres/%s.md" % title, text)
+        return commit_all(clone, message, push=push)
+
+    def sync(self, clone: str | None = None, *, bootstrap_ref: str = "main",
+             trusted_ref: str = "", **kwargs) -> canon_sync.SyncReport:
+        """`canon sync` ; le premier amorçage du registre se fait sur main
+        (--bootstrap-ref, ignoré une fois le registre amorcé)."""
+        return canon_sync.sync(self.db, canon.load(clone or self.clone, **kwargs), "atelier",
+                               bootstrap_ref=bootstrap_ref, trusted_ref=trusted_ref)
+
+    def rows(self, include_revoked: bool = False) -> list[dict]:
+        return receipts.list_authenticators(self.db, include_revoked=include_revoked)
+
+    def live(self) -> dict:
+        return {(r["approver"], r["credential_id"]): r["canon_ref"] for r in self.rows()}
+
+    def journal(self) -> list[dict]:
+        """Le journal des synchronisations appliquées (dernier commit appliqué en fin)."""
+        return self.db.query("SELECT id, root_member, root_commit, branch, trust, host "
+                             "FROM authenticator_syncs ORDER BY id")
+
+
+class AuthenticatorSyncTest(_AuthenticatorCase):
+    """`canon sync` remplit le registre de confiance depuis Member.authenticators,
+    à la révision canonique seulement, avec les règles de L6."""
+
+    def test_ajout_mise_a_jour_et_retrait_par_le_canon(self):
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]),
+                                    bruno=member_fiche("bruno", [self.bruno.entry()]))
+        report = self.sync()
+        done = report.authenticators
+        self.assertEqual((done.status, done.errors, done.partial), ("synced", [], []))
+        self.assertEqual(sorted(done.result["added"]), sorted([
+            "human:alice/webauthn/%s" % self.alice.credential_id,
+            "human:bruno/webauthn/%s" % self.bruno.credential_id]))
+        self.assertEqual(self.live(), {
+            ("human:alice", self.alice.credential_id): "canon:membres/alice.md@%s" % first,
+            ("human:bruno", self.bruno.credential_id): "canon:membres/bruno.md@%s" % first})
+        self.assertEqual(report.to_dict()["authenticators"]["status"], "synced")
+        # même commit : rien ne change
+        self.assertEqual(self.sync().authenticators.result["unchanged"], 2)
+        # niveau relevé et deuxième passkey, par PR fusionnée
+        self.commit_members(alice=member_fiche(
+            "alice", [self.alice.entry(level="eleve"), self.alice2.entry()]))
+        done = self.sync().authenticators
+        self.assertEqual(done.result["added"],
+                         ["human:alice/webauthn/%s" % self.alice2.credential_id])
+        self.assertIn("human:alice/webauthn/%s" % self.alice.credential_id,
+                      done.result["updated"])
+        levels = {r["credential_id"]: r["level"] for r in self.rows()}
+        self.assertEqual(levels[self.alice.credential_id], "eleve")
+        # retrait : la passkey quitte la liste (révoquée), bruno quitte le canon
+        third = self.commit_members(alice=member_fiche("alice", [self.alice2.entry()]),
+                                    bruno=None)
+        done = self.sync().authenticators
+        self.assertEqual(sorted(done.result["revoked"]), sorted([
+            "human:alice/webauthn/%s" % self.alice.credential_id,
+            "human:bruno/webauthn/%s" % self.bruno.credential_id]))
+        self.assertEqual(set(self.live()), {("human:alice", self.alice2.credential_id)})
+        # la révocation note le commit qui l'a constatée
+        revoked = {r["credential_id"]: r for r in self.rows(include_revoked=True)
+                   if r.get("revoked_ts")}
+        self.assertEqual(revoked[self.alice.credential_id]["canon_ref"],
+                         "canon:membres/alice.md@%s" % third)
+        self.assertEqual(revoked[self.bruno.credential_id]["canon_ref"],
+                         "canon:membres/bruno.md@%s" % third)
+        self.assertEqual(revoked[self.bruno.credential_id]["revoked_reason"], "absent du canon")
+
+    def test_entree_invalide_gele_le_membre(self):
+        self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        before = self.rows()
+        broken = dict(self.alice2.entry(), public_key="pas-une-cle")
+        self.commit_members(alice=member_fiche("alice", [broken]))   # retire alice, ajoute du faux
+        done = self.sync().authenticators
+        self.assertEqual(done.result["frozen"], ["human:alice"])
+        self.assertTrue(done.errors)
+        self.assertEqual(self.rows(), before)            # ni révocation, ni mise à jour
+        # clé absente, ou liste illisible : gelé aussi
+        for text in (member_fiche("alice"), member_fiche("alice", raw="{a: 1}")):
+            self.commit_members(alice=text)
+            done = self.sync().authenticators
+            self.assertEqual(done.result["frozen"], ["human:alice"])
+            self.assertEqual(self.rows(), before)
+        # la CLI le dit et rend 1
+        proc = self.mesh("canon", "sync", "--host", "atelier",
+                         env=self.env(AMEESH_CANON=self.clone))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("GELÉS human:alice", proc.stdout)
+
+    def test_une_entree_ne_choisit_pas_sa_provenance(self):
+        entry = dict(self.alice.entry(), canon_ref="ailleurs:x.md@" + "f" * 40)
+        commit = self.commit_members(alice=member_fiche("alice", [entry]))
+        self.sync()
+        self.assertEqual(list(self.live().values()), ["canon:membres/alice.md@%s" % commit])
+
+    def test_canon_non_approuve_ou_illisible_n_ecrit_rien(self):
+        root = os.path.join(self.make_tmp(), "acme")
+        shutil.copytree(EXAMPLE, root)
+        write(root, "membres/alice.md", member_fiche("alice", [self.alice.entry()]))
+        done = canon_sync.sync(self.db, canon.load(root, untrusted=True), "atelier").authenticators
+        self.assertEqual((done.status, done.errors), ("skipped", []))
+        self.assertIn("NON APPROUVÉ", done.reason)
+        self.assertEqual(self.rows(include_revoked=True), [])
+        # un registre rempli n'est pas vidé par un canon illisible
+        self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        before = self.rows()
+        with self.assertRaises(canon_sync.CanonUnreadable):
+            self.sync(ref="origin/inexistante")
+        self.assertEqual(self.rows(), before)
+        proc = self.mesh("canon", "sync", "--json", "--ref", "origin/inexistante",
+                         env=self.env(AMEESH_CANON=self.clone, AMEESH_HOST="atelier"))
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(json.loads(proc.stdout)["authenticators"]["status"], "skipped")
+        self.assertEqual(self.rows(), before)
+
+    def test_revision_hors_branche_canonique_refusee(self):
+        """Un commit local jamais fusionné, lu par --ref : aucune écriture (§4.1)."""
+        self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        before = self.rows()
+        local = self.commit_members(alice=member_fiche("alice", [self.alice2.entry()]),
+                                    bruno=member_fiche("bruno", [self.bruno.entry()]),
+                                    push=False, message="non revu")
+        done = self.sync(ref=local).authenticators
+        self.assertEqual(done.status, "refused")
+        self.assertIn("absent de la branche canonique", done.reason)
+        self.assertEqual(self.rows(), before)
+        proc = self.mesh("canon", "sync", "--host", "atelier", "--ref", local,
+                         env=self.env(AMEESH_CANON=self.clone))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("authentificateurs : REFUSÉ", proc.stdout)
+        self.assertEqual(self.rows(), before)
+        # une branche de PR poussée sur le dépôt, pas fusionnée : refusée aussi
+        git(self.clone, "push", "-q", "origin", "HEAD:refs/heads/pr-1")
+        git(self.clone, "fetch", "-q", "origin")
+        done = self.sync(ref="origin/pr-1").authenticators
+        self.assertEqual(done.status, "refused")
+        self.assertEqual(self.rows(), before)
+        # fusionnée sur la branche canonique : lue
+        git(self.clone, "push", "-q", "origin", "HEAD:main")
+        git(self.clone, "fetch", "-q", "origin")
+        self.assertEqual(self.sync(ref="origin/pr-1").authenticators.status, "synced")
+        self.assertEqual({r["credential_id"] for r in self.rows()},
+                         {self.alice2.credential_id, self.bruno.credential_id})
+
+    def test_hote_en_retard_ne_reactive_rien(self):
+        """Deux hôtes, une base : celui qui n'a pas vu le retrait ne le défait pas."""
+        other = os.path.join(self.workspace, "hote-b")
+        git(self.workspace, "clone", "-q", self.bare, other)
+        self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        git(other, "fetch", "-q", "origin")
+        self.assertEqual(self.sync(other).authenticators.result["added"],
+                         ["human:alice/webauthn/%s" % self.alice.credential_id])
+        # la seule passkey du registre est retirée par PR ; l'hôte A synchronise
+        self.commit_members(alice=member_fiche("alice", []))
+        self.assertEqual(len(self.sync().authenticators.result["revoked"]), 1)
+        # l'hôte B, pas encore rafraîchi, lit l'ancien commit : refus, rien réactivé
+        done = self.sync(other).authenticators
+        self.assertEqual(done.status, "refused")
+        self.assertIn("en retard", done.reason)
+        self.assertEqual(self.rows(), [])
+        # une fois rafraîchi, il suit
+        done = self.sync(other, fetch=True).authenticators
+        self.assertEqual((done.status, done.result["added"]), ("synced", []))
+        self.assertEqual(self.rows(), [])
+
+    def test_canon_lu_en_partie_ne_revoque_rien_pour_absence(self):
+        self.commit_members(alice=member_fiche("alice", [self.alice.entry()]),
+                            bruno=member_fiche("bruno", [self.bruno.entry()]))
+        self.sync()
+        # la fiche de bruno devient illisible : il pourrait encore y être déclaré
+        self.commit_members(alice=member_fiche("alice", []),
+                            bruno="---\ntype: Member\ntitle: [bruno\n---\n")
+        done = self.sync().authenticators
+        self.assertTrue(done.partial)
+        self.assertEqual(done.result["revoked"],
+                         ["human:alice/webauthn/%s" % self.alice.credential_id])
+        self.assertEqual(set(self.live()), {("human:bruno", self.bruno.credential_id)})
+
+    def test_ligne_ecrite_a_la_main_revoquee(self):
+        """Une ligne hors canon (insérée en base) ne bloque rien : elle est révoquée."""
+        self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        intruder = SoftWebAuthn()
+        raw = receipts.b64u_decode(intruder.public_key())
+        self.db.query(
+            "INSERT INTO authenticators (approver, facade, credential_id, public_key, "
+            "key_fingerprint, level, canon_ref) VALUES ('human:alice', 'webauthn', %s, %s, "
+            "%s, 'standard', %s) RETURNING id",
+            (intruder.credential_id, intruder.public_key(), hashlib.sha256(raw).hexdigest(),
+             "membres/alice.md@" + "f" * 40))
+        done = self.sync().authenticators
+        self.assertEqual(done.status, "synced")
+        self.assertEqual(done.result["revoked"],
+                         ["human:alice/webauthn/%s" % intruder.credential_id])
+        self.assertEqual(set(self.live()), {("human:alice", self.alice.credential_id)})
+
+
+# ==========================================================================
+# revue L9b (B1, B2) : synchronisations sérialisées, branche de confiance
+# ==========================================================================
+
+def federation(ref: str) -> str:
+    """Manifeste à un seul membre — la racine `canon`, ce clone — sur la branche `ref`."""
+    return ('federation: "0.1"\nid: acme\nroot: canon\nmembers:\n'
+            '  - id: canon\n    ref: %s\n    bundle: .\n    workspace_path: acme\n' % ref)
+
+
+class AuthenticatorRaceTest(_AuthenticatorCase):
+    """B1 : contrôle d'antériorité et écritures dans UNE transaction, sous un
+    verrou du registre pris AVANT le contrôle. Deux synchronisations réelles,
+    sur deux connexions, ne s'entrelacent jamais."""
+
+    def blocked_on_lock(self, thread: threading.Thread, timeout: float = 10.0) -> bool:
+        """Vrai dès qu'une session attend un verrou consultatif ; faux si
+        `thread` s'est terminé sans en attendre."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            waiting = self.db.query(
+                "SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' "
+                "AND NOT granted AND database = (SELECT oid FROM pg_database "
+                "WHERE datname = current_database())")[0]["n"]
+            if waiting:
+                return True
+            if not thread.is_alive():
+                return False
+            time.sleep(0.05)
+        return False
+
+    def race(self, first, second):
+        """`first(db)` s'arrête juste avant ses écritures (à l'entrée de
+        receipts._apply_authenticators, ses contrôles faits) ; `second(db)` est
+        lancé pendant cet arrêt, sur une autre connexion. Rend (résultat du
+        premier, résultat du second, le second a-t-il attendu le verrou)."""
+        original = receipts._apply_authenticators
+        paused, resume = threading.Event(), threading.Event()
+        results: dict = {}
+
+        def gate(lock, members, **kwargs):
+            if threading.current_thread().name == "premier":
+                paused.set()
+                resume.wait(60)
+            return original(lock, members, **kwargs)
+
+        def run(name, job):
+            conn = self.connect()
+            try:
+                results[name] = job(conn)
+            except BaseException as exc:        # rendu au fil principal
+                results[name] = exc
+            finally:
+                conn.close()
+
+        with mock.patch.object(receipts, "_apply_authenticators", side_effect=gate):
+            one = threading.Thread(target=run, args=("premier", first), name="premier")
+            one.start()
+            if not paused.wait(30):
+                resume.set()
+                one.join(60)
+                self.fail("la première synchronisation n'a pas atteint ses écritures : %r"
+                          % (results.get("premier"),))
+            two = threading.Thread(target=run, args=("second", second), name="second")
+            two.start()
+            blocked = self.blocked_on_lock(two)
+            resume.set()
+            one.join(60)
+            two.join(60)
+        for name in ("premier", "second"):
+            if isinstance(results.get(name), BaseException):
+                raise results[name]
+        return results["premier"], results["second"], blocked
+
+    def test_revocation_concurrente_jamais_defaite(self):
+        """Scénario de la revue : une synchronisation d'un ANCIEN canon a passé
+        ses contrôles ; une autre, d'un canon plus récent, révoque une clé ; les
+        écritures de l'ancienne ne la réactivent pas à l'ancien commit."""
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        old = canon.load(self.clone)
+        second = self.commit_members(alice=member_fiche("alice", []))
+        fresh = canon.load(self.clone)
+        stale, revoke, blocked = self.race(
+            lambda db: canon_sync.sync_authenticators(db, old),
+            lambda db: canon_sync.sync_authenticators(db, fresh))
+        self.assertEqual(self.live(), {})                  # jamais réactivée
+        self.assertEqual([r["canon_ref"] for r in self.rows(include_revoked=True)],
+                         ["canon:membres/alice.md@%s" % second])
+        self.assertTrue(blocked, "la révocation n'a pas attendu le verrou du registre")
+        self.assertEqual((stale.status, revoke.status), ("synced", "synced"))
+        self.assertEqual(revoke.result["revoked"],
+                         ["human:alice/webauthn/%s" % self.alice.credential_id])
+        self.assertEqual([j["root_commit"] for j in self.journal()], [first, second])
+        # l'ancien canon, rejoué ensuite : refusé (monotonie), rien réactivé
+        late = canon_sync.sync_authenticators(self.db, old)
+        self.assertEqual(late.status, "refused")
+        self.assertIn("ne descend pas du dernier commit appliqué %s" % second[:12], late.reason)
+        self.assertEqual(self.rows(), [])
+
+    def test_ancien_canon_apres_la_revocation_refuse(self):
+        """Ordre inverse : la révocation tient le verrou ; l'ancien canon attend,
+        puis relit le dernier commit appliqué sous le verrou et est refusé."""
+        self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        old = canon.load(self.clone)
+        second = self.commit_members(alice=member_fiche("alice", []))
+        fresh = canon.load(self.clone)
+        revoke, stale, blocked = self.race(
+            lambda db: canon_sync.sync_authenticators(db, fresh),
+            lambda db: canon_sync.sync_authenticators(db, old))
+        self.assertEqual(stale.status, "refused")
+        self.assertIn("ne descend pas du dernier commit appliqué %s" % second[:12], stale.reason)
+        self.assertEqual(revoke.status, "synced")
+        self.assertEqual(self.rows(), [])
+        self.assertTrue(blocked, "l'ancien canon n'a pas attendu le verrou du registre")
+
+    def test_deux_clones_du_meme_depot_se_serialisent(self):
+        """Le verrou ne dépend ni du chemin du clone, ni de l'hôte : deux clones
+        distincts du même dépôt nu qui synchronisent en même temps passent l'un
+        après l'autre, et le second voit ce que le premier a écrit."""
+        other = os.path.join(self.workspace, "hote-b")
+        git(self.workspace, "clone", "-q", self.bare, other)
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        second = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]),
+                                     bruno=member_fiche("bruno", [self.bruno.entry()]))
+        git(other, "fetch", "-q", "origin")
+        here, there = canon.load(self.clone), canon.load(other)
+        self.assertNotEqual(here.root, there.root)
+        self.assertEqual([s.commit for s in there.sources], [second])
+        one, two, blocked = self.race(
+            lambda db: canon_sync.sync_authenticators(db, here, host="atelier"),
+            lambda db: canon_sync.sync_authenticators(db, there, host="hote-b"))
+        self.assertTrue(blocked, "le second clone n'a pas attendu le verrou du registre")
+        self.assertEqual((one.status, one.result["added"]),
+                         ("synced", ["human:bruno/webauthn/%s" % self.bruno.credential_id]))
+        self.assertEqual((two.status, two.result["added"], two.result["unchanged"]),
+                         ("synced", [], 2))
+        self.assertEqual([(j["root_commit"], j["host"]) for j in self.journal()],
+                         [(first, "atelier"), (second, "atelier")])
+
+
+class AuthenticatorTrustTest(_AuthenticatorCase):
+    """B2 : la branche canonique de confiance ne vient jamais du commit lu —
+    configuration de l'hôte, sinon manifeste du dernier commit appliqué, sinon
+    amorçage explicite (--bootstrap-ref), sinon refus."""
+
+    def push_pr(self, branch: str = "pr-unmerged", **fiches) -> str:
+        """Commit NON fusionné, poussé sur une branche de PR du dépôt nu."""
+        commit = self.commit_members(push=False, message="PR non revue", **fiches)
+        git(self.clone, "push", "-q", "origin", "HEAD:refs/heads/%s" % branch)
+        git(self.clone, "fetch", "-q", "origin")
+        self.assertNotEqual(git(self.clone, "rev-parse", "origin/main"), commit)
+        return commit
+
+    def test_branche_de_pr_qui_s_autorise_elle_meme_refusee(self):
+        """Sonde de la revue : un commit de PR non fusionnée qui fait de sa propre
+        branche la branche canonique (federation.yaml) et ajoute une passkey."""
+        write(self.clone, "federation.yaml", federation("pr-unmerged"))
+        pr = self.push_pr(alice=member_fiche("alice", [self.alice.entry()]))
+        candidate = canon.load(self.clone, ref="origin/pr-unmerged")
+        self.assertEqual(candidate.sources[0].commit, pr)
+        # registre vierge, sans branche de confiance : refus d'amorçage
+        done = canon_sync.sync_authenticators(self.db, candidate)
+        self.assertEqual(done.status, "refused")
+        self.assertIn("--bootstrap-ref", done.reason)
+        # ni l'amorçage sur main, ni la configuration de l'hôte n'en font un canon
+        for kwargs in ({"bootstrap_ref": "main"}, {"trusted_ref": "origin/main"},
+                       {"trusted_ref": "main"}):
+            with self.subTest(**kwargs):
+                done = canon_sync.sync_authenticators(self.db, candidate, **kwargs)
+                self.assertEqual(done.status, "refused")
+                self.assertIn("absent de la branche canonique origin/main", done.reason)
+        self.assertEqual((self.rows(include_revoked=True), self.journal()), ([], []))
+        # registre amorcé sur main : la PR reste refusée, par la CLI aussi
+        self.assertEqual(self.sync(ref="origin/main").authenticators.status, "synced")
+        done = canon_sync.sync_authenticators(
+            self.db, canon.load(self.clone, ref="origin/pr-unmerged"))
+        self.assertEqual(done.status, "refused")
+        self.assertIn("absent de la branche canonique origin/main", done.reason)
+        proc = self.mesh("canon", "sync", "--host", "atelier", "--ref", "origin/pr-unmerged",
+                         env=self.env(AMEESH_CANON=self.clone))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("authentificateurs : REFUSÉ", proc.stdout)
+        self.assertEqual(self.rows(include_revoked=True), [])
+
+    def test_premier_amorcage_refuse_sans_bootstrap_ref(self):
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        done = canon_sync.sync(self.db, canon.load(self.clone), "atelier").authenticators
+        self.assertEqual(done.status, "refused")
+        self.assertIn("premier amorçage", done.reason)
+        self.assertIn("--bootstrap-ref", done.reason)
+        self.assertEqual((self.rows(include_revoked=True), self.journal()), ([], []))
+        env = self.env(AMEESH_CANON=self.clone)
+        proc = self.mesh("canon", "sync", "--host", "atelier", env=env)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("authentificateurs : REFUSÉ — premier amorçage", proc.stdout)
+        self.assertEqual(self.rows(), [])
+        # --bootstrap-ref explicite : appliqué, journalisé
+        proc = self.mesh("canon", "sync", "--host", "atelier", "--bootstrap-ref", "main",
+                         env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("AMORÇAGE", proc.stdout)
+        self.assertIn("branche canonique de confiance origin/main (amorçage --bootstrap-ref)",
+                      proc.stdout)
+        self.assertEqual(set(self.live()), {("human:alice", self.alice.credential_id)})
+        self.assertEqual([(j["root_commit"], j["branch"], j["trust"], j["host"])
+                          for j in self.journal()],
+                         [(first, "origin/main", "bootstrap", "atelier")])
+        # ensuite le dernier commit appliqué fait foi ; --bootstrap-ref est ignoré
+        second = self.commit_members(alice=member_fiche(
+            "alice", [self.alice.entry(), self.alice2.entry()]))
+        done = self.sync(bootstrap_ref="autre").authenticators
+        self.assertEqual((done.status, done.trust, done.branch),
+                         ("synced", "applied", "origin/main"))
+        self.assertIn("--bootstrap-ref autre ignoré : registre déjà amorcé", done.notes)
+        self.assertEqual(self.journal()[-1]["root_commit"], second)
+        # la configuration de l'hôte (AMEESH_CANON_REF) suffit à un premier amorçage
+        self.db.execute("TRUNCATE authenticators, authenticator_syncs RESTART IDENTITY CASCADE")
+        proc = self.mesh("canon", "sync", "--host", "atelier", "--json",
+                         env=self.env(AMEESH_CANON=self.clone, AMEESH_CANON_REF="origin/main"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        data = json.loads(proc.stdout)["authenticators"]
+        self.assertEqual((data["status"], data["trust"], data["branch"]),
+                         ("synced", "config", "origin/main"))
+        self.assertEqual([j["trust"] for j in self.journal()], ["config"])
+
+    def test_changement_de_branche_canonique_seulement_apres_fusion(self):
+        self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()                                         # amorçage sur main
+        # PR : le manifeste fait de « release » la branche canonique et ajoute
+        # la passkey de bruno ; poussée sur release, PAS fusionnée sur main
+        write(self.clone, "federation.yaml", federation("release"))
+        manifest = self.push_pr("release", bruno=member_fiche("bruno", [self.bruno.entry()]))
+        done = self.sync().authenticators                   # main : rien de neuf
+        self.assertEqual((done.status, done.result["added"]), ("synced", []))
+        done = self.sync(ref="origin/release").authenticators
+        self.assertEqual(done.status, "refused")
+        self.assertIn("absent de la branche canonique origin/main", done.reason)
+        self.assertEqual(set(self.live()), {("human:alice", self.alice.credential_id)})
+        # fusionnée sur main : lue, et encore vérifiée contre main
+        git(self.clone, "push", "-q", "origin", "%s:refs/heads/main" % manifest)
+        git(self.clone, "fetch", "-q", "origin")
+        done = self.sync().authenticators
+        self.assertEqual((done.status, done.trust, done.branch),
+                         ("synced", "applied", "origin/main"))
+        self.assertEqual(done.result["added"],
+                         ["human:bruno/webauthn/%s" % self.bruno.credential_id])
+        # désormais release fait foi : un commit de release seule est appliqué…
+        later = self.commit_members(push=False, alice=member_fiche(
+            "alice", [self.alice.entry(), self.alice2.entry()]))
+        git(self.clone, "push", "-q", "origin", "HEAD:refs/heads/release")
+        git(self.clone, "fetch", "-q", "origin")
+        done = self.sync().authenticators
+        self.assertEqual((done.status, done.branch), ("synced", "origin/release"))
+        self.assertEqual(done.result["added"],
+                         ["human:alice/webauthn/%s" % self.alice2.credential_id])
+        # … et un commit de main seule ne l'est plus
+        git(self.clone, "reset", "-q", "--hard", manifest)
+        write(self.clone, "note.md", "sur main seulement\n")
+        commit_all(self.clone, "main seule", push=False)
+        git(self.clone, "push", "-q", "origin", "HEAD:refs/heads/main")
+        git(self.clone, "fetch", "-q", "origin")
+        done = self.sync(ref="origin/main").authenticators
+        self.assertEqual(done.status, "refused")
+        self.assertIn("absent de la branche canonique origin/release", done.reason)
+        self.assertEqual(self.journal()[-1]["root_commit"], later)
+
+    def test_commit_non_descendant_refuse(self):
+        """Monotonie : un commit atteignable depuis la branche canonique mais qui
+        ne descend pas du dernier commit appliqué n'est jamais écrit, même quand
+        aucune ligne du registre ne trahit le retard."""
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        self.sync()
+        write(self.clone, "note.md", "sans effet sur le registre\n")
+        second = commit_all(self.clone, "note")
+        self.assertEqual(self.sync().authenticators.status, "synced")
+        before = self.rows(include_revoked=True)
+        # un ancien commit de main, lu par --ref
+        done = self.sync(ref=first).authenticators
+        self.assertEqual(done.status, "refused")
+        self.assertIn("ne descend pas du dernier commit appliqué %s" % second[:12],
+                      done.reason)
+        # historique réécrit (poussé en force sur main) qui ajoute bruno
+        git(self.clone, "reset", "-q", "--hard", first)
+        write(self.clone, "membres/bruno.md", member_fiche("bruno", [self.bruno.entry()]))
+        commit_all(self.clone, "historique réécrit", push=False)
+        git(self.clone, "push", "-q", "--force", "origin", "HEAD:main")
+        git(self.clone, "fetch", "-q", "origin")
+        done = self.sync().authenticators
+        self.assertEqual(done.status, "refused")
+        self.assertIn("ne descend pas du dernier commit appliqué %s" % second[:12],
+                      done.reason)
+        self.assertEqual(self.rows(include_revoked=True), before)
+        self.assertEqual(self.journal()[-1]["root_commit"], second)
+
+
+# ==========================================================================
+# revue L9b (codex2, codex3) : branche de confiance relayée par sync lui-même,
+# erreurs jamais silencieuses, écriture du registre gardée par son verrou
+# ==========================================================================
+
+class AuthenticatorRelayTest(_AuthenticatorCase):
+    """codex2 : l'exécuteur appelle `canon_sync.sync(db, canon, host)` sans
+    `trusted_ref` et ignore `report.authenticators` ; sync prend donc la
+    branche de confiance dans la configuration de la connexion, et inscrit
+    toute erreur d'authentificateurs dans canon_state et dans le fil."""
+
+    def configured(self, **changes):
+        """Connexion dont la configuration de l'hôte porte `changes`."""
+        conn = db_mod.connect(dataclasses.replace(self.cfg, **changes))
+        self.addCleanup(conn.close)
+        return conn
+
+    def fil_entries(self) -> list:
+        return fil.transport_for(self.cfg).read(fil.ThreadRef(fil.project_for(self.cfg)))
+
+    def runner_pass(self, **changes) -> bool:
+        """Une passe de `Runner.canon_sync_once` (code de l'exécuteur, non
+        modifié) avec une configuration d'hôte qui pose `changes`."""
+        fake = types.SimpleNamespace(
+            cfg=dataclasses.replace(self.cfg, canon=self.clone, **changes), host="atelier")
+        return runner_mod.Runner.canon_sync_once(fake)
+
+    def test_sync_sans_trusted_ref_prend_la_configuration(self):
+        first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        # registre vierge, ni --bootstrap-ref ni trusted_ref : la configuration suffit
+        conn = self.configured(canon_ref="origin/main")
+        report = canon_sync.sync(conn, canon.load(self.clone), "atelier")
+        done = report.authenticators
+        self.assertEqual((done.status, done.trust, done.branch),
+                         ("synced", "config", "origin/main"))
+        self.assertEqual([(j["root_commit"], j["trust"]) for j in self.journal()],
+                         [(first, "config")])
+        # la configuration PRIME sur le manifeste du dernier commit appliqué
+        git(self.clone, "push", "-q", "origin", "%s:refs/heads/release" % first)
+        self.commit_members(alice=member_fiche("alice", [self.alice.entry(),
+                                                         self.alice2.entry()]))
+        conn = self.configured(canon_ref="release")
+        done = canon_sync.sync(conn, canon.load(self.clone, fetch=True), "atelier").authenticators
+        self.assertEqual(done.status, "refused")
+        self.assertIn("absent de la branche canonique origin/release", done.reason)
+        self.assertEqual(set(self.live()), {("human:alice", self.alice.credential_id)})
+        # "" explicite : aucune configuration, le dernier commit appliqué fait foi
+        done = canon_sync.sync(conn, canon.load(self.clone), "atelier",
+                               trusted_ref="").authenticators
+        self.assertEqual((done.status, done.trust), ("synced", "applied"))
+        # l'exécuteur lui-même (aucun trusted_ref passé) suit la configuration
+        self.db.execute("TRUNCATE authenticators, authenticator_syncs RESTART IDENTITY CASCADE")
+        self.assertTrue(self.runner_pass(canon_ref="origin/main"))
+        self.assertEqual([j["trust"] for j in self.journal()], ["config"])
+        self.assertEqual(len(self.live()), 2)
+
+    def test_erreur_d_authentificateurs_dans_canon_state_et_le_fil(self):
+        self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        # premier amorçage sans branche de confiance : refusé — l'exécuteur ne le
+        # dit pas (il ne lit que le statut du canon), sync l'inscrit lui-même
+        self.assertTrue(self.runner_pass())
+        state = canon_sync.state(self.db, "atelier")
+        self.assertEqual((state["status"], state["auth_status"]), ("ok", "error"))
+        self.assertIn("premier amorçage", state["auth_diagnostic"])
+        self.assertIsNotNone(state["auth_checked_ts"])
+        entries = self.fil_entries()
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].author, canon_sync.FIL_SENDER)
+        self.assertIn("registre des authentificateurs EN ERREUR", entries[0].text)
+        self.assertIn("premier amorçage", entries[0].text)
+        self.assertEqual((entries[0].meta["event"], entries[0].meta["host"]),
+                         ("authenticators_error", "atelier"))
+        # la même erreur, passe suivante : état rafraîchi, pas de doublon au fil
+        report = canon_sync.sync(self.db, canon.load(self.clone), "atelier")
+        self.assertEqual((report.status, report.auth_status), ("ok", "error"))
+        self.assertEqual(report.to_dict()["auth_status"], "error")
+        self.assertEqual(len(self.fil_entries()), 1)
+        # une erreur d'une autre nature (membre gelé) : nouvelle entrée
+        self.sync()                                          # amorçage sur main
+        self.assertEqual(canon_sync.state(self.db, "atelier")["auth_status"], "ok")
+        self.assertIn("de nouveau sans erreur", self.fil_entries()[-1].text)
+        self.commit_members(alice=member_fiche("alice", raw="{a: 1}"))
+        report = self.sync()
+        self.assertEqual(report.auth_status, "error")
+        state = canon_sync.state(self.db, "atelier")
+        self.assertEqual(state["auth_status"], "error")
+        self.assertIn("GELÉS : human:alice", state["auth_diagnostic"])
+        self.assertIn("GELÉS : human:alice", self.fil_entries()[-1].text)
+        self.assertEqual(len(self.fil_entries()), 3)
+        # visible par `canon check`
+        proc = self.mesh("canon", "check", "--host", "atelier",
+                         env=self.env(AMEESH_CANON=self.clone))
+        self.assertIn("authentificateurs : EN ERREUR — error", proc.stdout)
+
+
+class AuthenticatorWriteGuardTest(_AuthenticatorCase):
+    """codex3 : le registre n'est écrit que par `canon_sync.sync_authenticators`
+    (lecture du canon, contrôles, verrou) ; l'écriture interne exige le jeton
+    du verrou et revérifie dans pg_locks que la session le détient."""
+
+    def members(self) -> list:
+        return [{"title": "alice", "canon_ref": "canon:membres/alice.md@" + "a" * 40,
+                 "authenticators": [self.alice.entry()]}]
+
+    def test_ecriture_hors_du_chemin_complet_refusee(self):
+        self.assertFalse(hasattr(receipts, "sync_authenticators"))   # plus de point d'entrée
+        with self.assertRaises(receipts.RegistryLockError):
+            receipts._apply_authenticators(self.db, self.members())   # pas un jeton
+        with self.assertRaises(receipts.RegistryLockError):
+            receipts.RegistryLock(self.db)                            # jeton forgé
+        # verrou pris hors transaction : relâché aussitôt, jeton refusé
+        lock = receipts.lock_registry(self.db)
+        self.assertFalse(receipts.registry_lock_held(self.db))
+        with self.assertRaises(receipts.RegistryLockError):
+            receipts._apply_authenticators(lock, self.members())
+        # jeton d'une transaction close
+        with self.db.transaction() as tx:
+            stale = receipts.lock_registry(tx)
+            self.assertTrue(receipts.registry_lock_held(tx))
+        with self.assertRaises(receipts.RegistryLockError):
+            receipts._apply_authenticators(stale, self.members())
+        self.assertEqual(self.rows(include_revoked=True), [])
+
+    def test_verrou_tenu_ailleurs_le_chemin_complet_attend(self):
+        """Une autre connexion tient le verrou : l'écriture directe est refusée
+        aussitôt ; le chemin complet attend (pg_blocking_pids) et n'écrit
+        qu'après la libération."""
+        self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        loaded = canon.load(self.clone)
+        holder = self.connect()
+        self.addCleanup(holder.close)
+        results: dict = {}
+
+        def run():
+            conn = self.connect()
+            try:
+                results["done"] = canon_sync.sync_authenticators(conn, loaded,
+                                                                 bootstrap_ref="main")
+            except BaseException as exc:        # rendu au fil principal
+                results["done"] = exc
+            finally:
+                conn.close()
+
+        with holder.transaction() as htx:
+            receipts.lock_registry(htx)
+            holder_pid = int(htx.query("SELECT pg_backend_pid() AS pid")[0]["pid"])
+            # écriture directe (sans le jeton du verrou) : refusée sans attendre
+            with self.assertRaises(receipts.RegistryLockError):
+                receipts._apply_authenticators(self.db, self.members())
+            worker = threading.Thread(target=run, name="chemin-complet")
+            worker.start()
+            blockers = None
+            deadline = time.monotonic() + 15
+            while blockers is None and time.monotonic() < deadline and worker.is_alive():
+                rows = self.db.query(
+                    "SELECT pg_blocking_pids(pid) AS blockers FROM pg_locks "
+                    "WHERE locktype = 'advisory' AND NOT granted AND database = "
+                    "(SELECT oid FROM pg_database WHERE datname = current_database())")
+                blockers = [int(p) for p in rows[0]["blockers"]] if rows else None
+                if blockers is None:
+                    time.sleep(0.05)
+            self.assertEqual(blockers, [holder_pid], results.get("done"))
+            self.assertEqual(self.rows(include_revoked=True), [])     # rien pendant l'attente
+            self.assertEqual(self.journal(), [])
+        worker.join(60)
+        done = results["done"]
+        if isinstance(done, BaseException):
+            raise done
+        self.assertEqual(done.status, "synced")
+        self.assertEqual(set(self.live()), {("human:alice", self.alice.credential_id)})
+
+    def test_verrou_reentrant_dans_la_meme_transaction(self):
+        """Via canon sync : pas d'auto-blocage. Le verrou repris dans la même
+        transaction est accordé aussitôt ; une transaction imbriquée (même
+        session psql, point de sauvegarde psycopg) le détient encore."""
+        with self.db.transaction() as tx:
+            lock = receipts.lock_registry(tx)
+            receipts.lock_registry(tx)
+            with tx.transaction() as inner:
+                self.assertTrue(receipts.registry_lock_held(inner))
+                result = receipts._apply_authenticators(receipts.lock_registry(inner),
+                                                        self.members())
+            self.assertEqual(len(result["added"]), 1)
+            self.assertTrue(receipts.registry_lock_held(lock.db))
+        self.assertFalse(receipts.registry_lock_held(self.db))
+        self.assertEqual(len(self.live()), 1)
+        # le chemin complet, de bout en bout, ne s'attend pas lui-même
+        self.db.execute("TRUNCATE authenticators, authenticator_syncs RESTART IDENTITY CASCADE")
+        self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
+        started = time.monotonic()
+        self.assertEqual(self.sync().authenticators.status, "synced")
+        self.assertLess(time.monotonic() - started, 30)
 
 
 if __name__ == "__main__":

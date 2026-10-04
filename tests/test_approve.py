@@ -26,9 +26,11 @@ import tempfile
 import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from ameesh import jcs, receipts
+from ameesh import actions, approve_client, fil, jcs, receipts
+from ameesh.connectors.shell_noop import ShellNoopConnector
 from ameesh.approve import config as approve_config
 from ameesh.approve import duplicate
 from ameesh.approve import render
@@ -39,7 +41,7 @@ from ameesh.approve.sources import (
 )
 from ameesh.approve.store import Store
 
-from .support import PgTestCase, child_env
+from .support import PgTestCase, apply_authenticators, child_env
 from .webauthn_soft import ORIGIN, RP_ID, SoftWebAuthn, b64u, cbor, new_action_id
 
 ALICE = "human:alice"
@@ -125,7 +127,7 @@ class ApproveBase(PgTestCase):
             "mesh_consumed_nonces RESTART IDENTITY CASCADE")
         self.alice = SoftWebAuthn("ES256")
         self.bob = SoftWebAuthn("ES256")
-        result = receipts.sync_authenticators(
+        result = apply_authenticators(
             self.db, [member("alice", self.alice.entry()), member("bob", self.bob.entry())])
         self.assertEqual(result["errors"], [])
         self.workdir = tempfile.mkdtemp(prefix="ameesh-approve-test-")
@@ -1009,7 +1011,7 @@ class ApproveEnrollTest(ApproveBase):
                                 proposal, re.M))
         entry = {key: json.loads(value) for key, value in entry.items()}
         self.assertEqual(entry["public_key"], dave.public_key())
-        synced = receipts.sync_authenticators(self.db, [
+        synced = apply_authenticators(self.db, [
             member("alice", self.alice.entry()), member("bob", self.bob.entry()),
             member("dave", entry)])
         self.assertEqual((synced["errors"], synced["added"]),
@@ -1240,6 +1242,200 @@ class ApproveDbSourceTest(PgTestCase):
                         % self.COLUMNS.replace(", policy_version integer", ""))
         with self.assertRaisesRegex(ActionSourceError, "policy_version"):
             DbActionSource(self.db, "t_l7_incomplete").get_action(new_action_id())
+
+
+# --------------------------------------------------------------------------
+# ameesh, client du service : action request / fetch-receipt (L9b)
+# --------------------------------------------------------------------------
+
+class _FakeApprove:
+    """Un faux ameesh-approve sur 127.0.0.1 : réponses imposées, requêtes notées."""
+
+    def __init__(self, test: unittest.TestCase, responder):
+        seen = self.seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def _reply(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b""
+                seen.append((self.command, self.path, dict(self.headers.items()), body))
+                status, headers, payload = responder(self.command, self.path)
+                self.send_response(status)
+                for name, value in headers:
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            do_GET = do_POST = _reply
+
+            def log_message(self, *_args) -> None:
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.url = "http://127.0.0.1:%d" % self.port
+        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+
+        def close() -> None:
+            self.server.shutdown()
+            self.server.server_close()
+            thread.join(5)
+        test.addCleanup(close)
+
+
+class ApproveClientTest(ApproveBase):
+    """`ameesh action request` dépose la demande (jeton de service, fichier 0600) et
+    affiche le lien ; `ameesh action fetch-receipt` récupère le reçu, le VÉRIFIE,
+    puis l'attache à l'action. Le jeton ne sort jamais de l'en-tête Authorization."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.execute("TRUNCATE actions, action_attempts, action_events "
+                        "RESTART IDENTITY CASCADE")
+        self.service.source = DbActionSource(self.server_db)
+        self.noop = ShellNoopConnector(os.path.join(self.tmp, "noop"), timeout=10.0)
+        self.action = actions.propose(
+            self.db, self.noop, project="demo", operation="send", target="client:42",
+            args={"n": 1}, proposed_by=AGENT, approvers=[ALICE])
+        self.action_id = self.action["action_id"]
+
+    def cli_env(self, **extra) -> dict:
+        base = dict(AMEESH_APPROVE_URL="http://127.0.0.1:%d" % self.port,
+                    AMEESH_APPROVE_TOKEN_FILE=self.token_file, AMEESH_APPROVE_RP_ID=RP_ID,
+                    AMEESH_APPROVE_ORIGINS=ORIGIN, AGENT_MAIL_NAME="deepseek7",
+                    # un mandataire configuré n'est jamais utilisé
+                    http_proxy="http://127.0.0.1:9", HTTP_PROXY="http://127.0.0.1:9",
+                    https_proxy="http://127.0.0.1:9", no_proxy="", NO_PROXY="")
+        base.update(extra)
+        return self.env(**base)
+
+    def cli(self, *args, rc: int = 0, **extra):
+        proc = self.mesh("action", *args, env=self.cli_env(**extra))
+        self.assertEqual(proc.returncode, rc, proc.stdout + proc.stderr)
+        self.assertNotIn(self.service_token, proc.stdout + proc.stderr)
+        return proc
+
+    def thread_text(self) -> str:
+        path = fil.transport_for(self.cfg).location(fil.ThreadRef("demo"))
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_url_controlee(self):
+        for url in ("", "http://approve.example.test", "ftp://127.0.0.1", "https://u:p@h.test",
+                    "https://h.test/?q=1", "https://h.test/#f", "http://10.0.0.1:8765",
+                    "https://h.test:99999"):
+            with self.subTest(url=url):
+                with self.assertRaises(approve_client.ApproveClientError) as caught:
+                    approve_client.endpoint(url)
+                self.assertEqual(caught.exception.code, "config")
+        for url, expected in (("http://127.0.0.1:8765/", "http://127.0.0.1:8765"),
+                              ("http://[::1]:8765", "http://[::1]:8765"),
+                              ("http://localhost:8765", "http://localhost:8765"),
+                              ("https://approve.example.test/api", "https://approve.example.test/api")):
+            self.assertEqual(approve_client.endpoint(url), expected)
+
+    def test_demande_puis_recu_par_la_cli(self):
+        proc = self.cli("request", self.action_id, "--approver", ALICE)
+        link = re.search(r"https://\S+/a/[A-Za-z0-9_-]{43}", proc.stdout).group(0)
+        self.assertTrue(link.startswith(ORIGIN + "/a/"))
+        request_id = re.search(r"req_[0-9a-z]{26}", proc.stdout).group(0)
+        self.assertIn("ameesh action fetch-receipt %s" % self.action_id, proc.stdout)
+        # le lien est dans le fil (pas le jeton de service) ; la demande au journal
+        thread = self.thread_text()
+        self.assertIn(link, thread)
+        self.assertIn("Demande d'approbation de l'action %s" % self.action_id, thread)
+        self.assertNotIn(self.service_token, thread)
+        self.assertEqual(actions.last_approval_request(self.db, self.action_id), request_id)
+        notes = [e["note"] for e in actions.events(self.db, self.action_id)
+                 if e["event"] == actions.APPROVAL_REQUESTED]
+        self.assertEqual(len(notes), 1)
+        self.assertNotIn(link.rsplit("/", 1)[1], notes[0])      # le lien, pas au journal
+
+        proc = self.cli("fetch-receipt", self.action_id, rc=5)
+        self.assertIn("pas encore signée", proc.stdout)
+        self.assertEqual(actions.get(self.db, self.action_id)["state"], "proposed")
+
+        path = urlsplit(link).path
+        _status, _headers, text = self.page(path)
+        status, result = self.submit(path, self.sign(self.alice, self.page_data(text)))
+        self.assertEqual(status, 200, result)
+        out = os.path.join(self.tmp, "recu.json")
+        proc = self.cli("fetch-receipt", self.action_id, "--out", out, "--by", ALICE)
+        self.assertIn("vérifié et attaché", proc.stdout)
+        self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o600)
+        row = actions.get(self.db, self.action_id)
+        self.assertEqual((row["state"], row["auth_approver"]), ("approved", ALICE))
+        with open(out, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["request"]["action_id"], self.action_id)
+        result = actions.execute(self.db, self.action_id, self.noop, policy=POLICY, by="porte")
+        self.assertEqual(result["state"], "confirmed")
+        # une fois liée, la même demande ne se rattache plus (reçu consommé)
+        self.cli("fetch-receipt", self.action_id, rc=1)
+
+    def test_session_d_agent_et_refus_du_service(self):
+        proc = self.cli("request", self.action_id, "--approver", ALICE, "--requested-by",
+                        "human:alice", rc=1)
+        self.assertIn("n'est pas son identité", proc.stderr)
+        proc = self.cli("request", self.action_id, "--approver", DAVE, rc=1)
+        self.assertIn("[no_authenticator]", proc.stderr)
+        other, _token = write_token_file(tempfile.mkdtemp(dir=self.workdir))
+        proc = self.cli("request", self.action_id, "--approver", ALICE, rc=1,
+                        AMEESH_APPROVE_TOKEN_FILE=other)
+        self.assertIn("[unauthorized]", proc.stderr)
+        self.assertEqual(actions.last_approval_request(self.db, self.action_id), None)
+
+    def test_jeton_trop_ouvert_ou_absent_rien_n_est_envoye(self):
+        os.chmod(self.token_file, 0o644)
+        proc = self.cli("request", self.action_id, "--approver", ALICE, rc=1)
+        self.assertIn("[config]", proc.stderr)
+        self.assertIn("permissions trop ouvertes", proc.stderr)
+        proc = self.cli("request", self.action_id, "--approver", ALICE, rc=1,
+                        AMEESH_APPROVE_TOKEN_FILE="")
+        self.assertIn("AMEESH_APPROVE_TOKEN_FILE", proc.stderr)
+        proc = self.cli("request", self.action_id, "--approver", ALICE, rc=1,
+                        AMEESH_APPROVE_URL="http://approve.example.test")
+        self.assertIn("boucle locale", proc.stderr)
+        self.assertNotIn("demande req_", self.log.getvalue())
+        # sans service : la demande brute reste disponible (--local)
+        proc = self.cli("request", self.action_id, "--approver", ALICE, "--local")
+        self.assertEqual(json.loads(proc.stdout)["digest"], self.action["digest"])
+
+    def test_aucune_redirection_suivie(self):
+        target = _FakeApprove(self, lambda method, path: (201, (), b"{}"))
+        redirect = _FakeApprove(self, lambda method, path: (
+            307, (("Location", target.url + path),), b""))
+        proc = self.cli("request", self.action_id, "--approver", ALICE, rc=1,
+                        AMEESH_APPROVE_URL=redirect.url)
+        self.assertIn("[redirect]", proc.stderr)
+        self.assertEqual(len(redirect.seen), 1)
+        self.assertEqual(target.seen, [])           # le jeton n'est allé nulle part ailleurs
+
+    def test_recu_verifie_avant_d_etre_attache(self):
+        request = actions.approval_request(self.action, ALICE)
+        forged = {
+            "credential d'un autre": self.bob.receipt(request),
+            "autre action": self.alice.receipt(actions.approval_request(
+                actions.propose(self.db, self.noop, project="demo", operation="send",
+                                target="client:43", proposed_by=AGENT), ALICE)),
+            "signature fausse": dict(self.alice.receipt(request), credential_id=(
+                self.alice.credential_id)),
+        }
+        forged["signature fausse"]["proof"] = dict(
+            forged["signature fausse"]["proof"],
+            signature=self.alice.receipt(dict(request, nonce=request["nonce"][::-1]))[
+                "proof"]["signature"])
+        request_id = "req_" + "0" * 26
+        for label, receipt in forged.items():
+            with self.subTest(label):
+                fake = _FakeApprove(self, lambda method, path, r=receipt: (
+                    200, (("Content-Type", "application/json"),), json.dumps(r).encode()))
+                proc = self.cli("fetch-receipt", self.action_id, "--request-id", request_id,
+                                rc=1, AMEESH_APPROVE_URL=fake.url)
+                self.assertIn("reçu refusé", proc.stderr)
+                self.assertEqual(fake.seen[0][1], "/receipts/" + request_id)
+                self.assertEqual(actions.get(self.db, self.action_id)["state"], "proposed")
 
 
 if __name__ == "__main__":

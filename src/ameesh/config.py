@@ -129,6 +129,12 @@ class Config:
     #: R14 : un agent sans humain responsable n'est pas réclamable. None = vrai
     #: si un canon est configuré, faux sinon (compatibilité du banc)
     require_responsible: bool | None = None
+    #: ameesh-approve (spec §9), côté client : URL de son API de service
+    #: (AMEESH_APPROVE_URL ; https, ou http sur la boucle locale seulement) et
+    #: fichier 0600 du jeton de service (AMEESH_APPROVE_TOKEN_FILE). Vides : pas
+    #: de demande d'approbation par ameesh (`ameesh action request`)
+    approve_url: str = ""
+    approve_token_file: str = ""
 
     @property
     def responsible_required(self) -> bool:
@@ -257,6 +263,12 @@ def load(env: dict | None = None) -> Config:
         require_responsible=_as_bool(
             pick("AMEESH_REQUIRE_RESPONSIBLE", "AGENT_MESH_REQUIRE_RESPONSIBLE",
                  default=cfg.require_responsible), None, "AMEESH_REQUIRE_RESPONSIBLE"),
+    )
+    token_file = pick("AMEESH_APPROVE_TOKEN_FILE", default=cfg.approve_token_file) or ""
+    cfg = replace(
+        cfg,
+        approve_url=str(pick("AMEESH_APPROVE_URL", default=cfg.approve_url) or "").strip(),
+        approve_token_file=_expand(str(token_file)) if token_file else "",
     )
     if cfg.canon_ref.startswith("-"):
         raise SystemExit("AMEESH_CANON_REF invalide : %r" % cfg.canon_ref)

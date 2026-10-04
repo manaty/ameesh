@@ -16,8 +16,15 @@ from __future__ import annotations
 import json
 from typing import Any, Sequence
 
-from . import fil
+from . import fil, registry
 from .db import Db
+
+#: projet du fil d'un agent (`fil.agent_project`), en SQL : son équipe s'il est
+#: gouverné par le canon, sinon son chantier (un paramètre : le nom de l'agent)
+PROJECT_SQL = (
+    "SELECT CASE WHEN " + registry.canon_governed_sql("r")
+    + " AND coalesce(btrim(r.team), '') <> '' THEN btrim(r.team) ELSE r.chantier END"
+    " FROM agent_registry r WHERE r.name = %s")
 
 MAIL_COLUMNS = """
     id, sender, recipient, body, kind, payload, status, host,
@@ -56,8 +63,9 @@ def send(
 
     `allow_structured` lève le refus des corps illisibles (tests et outils
     seulement). `thread=False` laisse l'écriture du fil à l'appelant (envoi à
-    « all » regroupé en une entrée, import déjà écrit). Projet du fil : chantier
-    de l'expéditeur, sinon du destinataire, sinon AMEESH_PROJECT, sinon
+    « all » regroupé en une entrée, import déjà écrit). Projet du fil : celui
+    de l'expéditeur, sinon du destinataire — son équipe (`team`) s'il est
+    gouverné par le canon, sinon son chantier —, sinon AMEESH_PROJECT, sinon
     `default` ; lot : `work_item_id`.
     """
     fil.ensure_readable(body, allow_structured)
@@ -71,9 +79,9 @@ def send(
                 coalesce(to_timestamp(%s::bigint / 1000000.0), now()),
                 to_timestamp(%s::bigint / 1000000.0))
         RETURNING id, extract(epoch from created_at)::float8 AS created_ts,
-                  (SELECT chantier FROM agent_registry WHERE name = %s) AS sender_chantier,
-                  (SELECT chantier FROM agent_registry WHERE name = %s) AS recipient_chantier
-        """,
+                  (__PROJECT__) AS sender_project,
+                  (__PROJECT__) AS recipient_project
+        """.replace("__PROJECT__", PROJECT_SQL),
         (sender, recipient, body, host, kind,
          json.dumps(payload or {}, ensure_ascii=False), work_item_id,
          signature, signature_key, signed_payload, nonce,
@@ -91,8 +99,8 @@ def send(
         fil.record(
             db.cfg, db, sender=sender, recipients=[recipient], text=body,
             ts=row.get("created_ts"),
-            project=fil.project_for(db.cfg, row.get("sender_chantier"),
-                                    row.get("recipient_chantier")),
+            project=fil.project_for(db.cfg, row.get("sender_project"),
+                                    row.get("recipient_project")),
             lot=work_item_id, mailbox_ids=[message_id], meta=meta)
     return message_id
 

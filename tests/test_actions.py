@@ -2,12 +2,15 @@
 """Actions sous porte (spec §7, R5, C6) et file des décisions (C10).
 
 Reçus produits par des authentificateurs LOGICIELS (tests/webauthn_soft.py),
-registre de confiance rempli par `sync_authenticators`. Connecteurs :
+registre de confiance rempli par `support.apply_authenticators`. Connecteurs :
 `shell-noop` (fichiers sous le bac à sable du test) et `git-merge` avec un
 FAUX `gh` (tests/fakebin/gh) — jamais le vrai, aucun réseau.
 """
 from __future__ import annotations
 
+import contextlib
+import dataclasses
+import io
 import json
 import os
 import subprocess
@@ -16,7 +19,7 @@ import threading
 import time
 import unittest
 
-from ameesh import actions, jcs, receipts, work
+from ameesh import actions, fil, jcs, receipts, work
 from ameesh import db as db_mod
 from ameesh.actions import ActionError
 from ameesh.connectors import Outcome
@@ -25,7 +28,7 @@ from ameesh.connectors.git_merge import GitMergeConnector, parse_target, resolve
 from ameesh.connectors.shell_noop import ShellNoopConnector
 from ameesh.db import DbError
 
-from .support import FAKEBIN, PgTestCase
+from .support import FAKEBIN, PgTestCase, apply_authenticators
 from .test_receipts import HeldTransaction, Worker
 from .webauthn_soft import ORIGIN, RP_ID, SoftEd25519, SoftWebAuthn, make_request
 
@@ -129,7 +132,7 @@ class ActionsBase(PgTestCase):
         self.bob = SoftWebAuthn("ES256")
         self.members = [member("alice", self.alice.entry(), self.alice_tool.entry()),
                         member("bob", self.bob.entry())]
-        result = receipts.sync_authenticators(self.db, self.members)
+        result = apply_authenticators(self.db, self.members)
         self.assertEqual(result["errors"], [])
         self.noop_dir = os.path.join(self.tmp, "noop")
         self.noop = Counting(ShellNoopConnector(self.noop_dir, timeout=10.0))
@@ -377,7 +380,7 @@ class ActionsCycleTest(ActionsBase):
                  None, "test", 5.0))[0]
 
         self.assertEqual(launch(digest="sha256:" + "0" * 64)["result"], "state")
-        receipts.sync_authenticators(self.db, [member("alice", self.alice_tool.entry()),
+        apply_authenticators(self.db, [member("alice", self.alice_tool.entry()),
                                                member("bob", self.bob.entry())])
         self.assertEqual(launch()["result"], "revoked_authenticator")
         self.assertEqual(self.get(action)["state"], "approved")
@@ -387,7 +390,7 @@ class ActionsCycleTest(ActionsBase):
     def test_revocation_entre_approbation_et_execution(self):
         action = self.propose("send")
         self.approve(action)
-        receipts.sync_authenticators(self.db, [member("alice", self.alice_tool.entry()),
+        apply_authenticators(self.db, [member("alice", self.alice_tool.entry()),
                                                member("bob", self.bob.entry())])
         self.refused(receipts.REVOKED, self.execute, action)
         self.assertEqual((self.get(action)["state"], self.noop.calls), ("approved", []))
@@ -592,7 +595,7 @@ class ActionsCycleTest(ActionsBase):
                 row = self.get(action)
                 self.assertEqual(row["state"], "unknown")
                 self.assertTrue(row["last_error"])
-                self.refused(actions.UNKNOWN_OUTCOME, self.execute, action, connector)
+                self.refused(actions.STATE, self.execute, action, connector)
                 self.assertEqual(connector.calls, 1)
         # un échec n'est « certain » que si le connecteur le dit
         connector = Scripted(lambda: Outcome.failed("refus du système externe"))
@@ -727,7 +730,7 @@ class ActionsConcurrencyTest(ActionsBase):
         self.assertEqual(row["state"], "unknown")
         attempt, = actions.attempts(self.db, action["action_id"])
         self.assertEqual((attempt["state"], attempt["settled_by"]), ("unknown", "recover"))
-        self.refused(actions.UNKNOWN_OUTCOME, self.execute, action)
+        self.refused(actions.STATE, self.execute, action)
         self.assertEqual(self.noop.calls, [])                   # aucun appel automatique
         # shell-noop garantit la déduplication : nouvelle tentative, MÊME action_id
         actions.retry(self.db, action["action_id"], self.receipt(action), policy=POLICY, by=ALICE)
@@ -982,7 +985,7 @@ class ActionsUnknownTest(ActionsBase):
         self.approve(action, first)
         self.assertEqual(self.execute(action)["state"], "unknown")
         self.assertEqual(self.files(), [action["action_id"] + ".json"])  # l'effet a eu lieu
-        self.refused(actions.UNKNOWN_OUTCOME, self.execute, action)
+        self.refused(actions.STATE, self.execute, action)
         self.refused(receipts.REPLAY, actions.retry, self.db, action["action_id"], first,
                      policy=POLICY)
         self.refused(actions.RECEIPT_REQUIRED, actions.retry, self.db, action["action_id"], None,
@@ -1021,7 +1024,7 @@ class ActionsUnknownTest(ActionsBase):
         result = self.execute(action, lossy)
         self.assertEqual(result["state"], "unknown", result)
         self.assertEqual(len(lossy.calls), 1)
-        self.refused(actions.UNKNOWN_OUTCOME, self.execute, action, lossy)
+        self.refused(actions.STATE, self.execute, action, lossy)
         self.refused(actions.DEDUPE, actions.retry, self.db, action["action_id"],
                      self.receipt(action), connector=lossy, policy=POLICY)
         blind = self.gh(view="absent")
@@ -1277,7 +1280,7 @@ class ActionsUnknownTest(ActionsBase):
         self.assertIn("reconcile_none", self.event_names(action))
         self.refused(actions.DEDUPE, actions.retry, self.db, action["action_id"],
                      self.receipt(action), connector=self.gh(), policy=POLICY)
-        self.refused(actions.UNKNOWN_OUTCOME, self.execute, action, self.gh())
+        self.refused(actions.STATE, self.execute, action, self.gh())
         result = actions.reconcile(self.db, action["action_id"], self.gh(view="land"), by=ALICE)
         self.assertEqual((result["found"], result["state"]), (True, "confirmed"))
         self.assertEqual(result["external_ref"], self.pr()["mergeCommit"]["oid"])
@@ -1339,6 +1342,114 @@ class ActionsUnknownTest(ActionsBase):
 
 
 # --------------------------------------------------------------------------
+# fil lisible (§7.1) : chaque transition y est écrite
+# --------------------------------------------------------------------------
+
+class ActionsThreadTest(ActionsBase):
+    def entries(self, project: str = "demo", lot=None) -> list:
+        return fil.transport_for(self.cfg).read(fil.ThreadRef(project, lot))
+
+    def events(self, project: str = "demo", lot=None) -> list:
+        return [(e.meta.get("action_id"), e.meta.get("event"))
+                for e in self.entries(project, lot)]
+
+    def test_cycle_dans_le_fil_sans_secret(self):
+        secret = "s3cr3t-" + "x" * 8
+        opaque = "A" * 64
+        action = self.propose(args={"subject": "facture de mars", "n": 1, "api_token": secret,
+                                    "blob": opaque, "lignes": [1, 2, 3]},
+                              approvers=[ALICE])
+        receipt = self.receipt(action)
+        self.approve(action, receipt)
+        self.assertEqual(self.execute(action)["state"], "confirmed")
+        entries = self.entries()
+        action_id = action["action_id"]
+        self.assertEqual(self.events(), [(action_id, event) for event in
+                                         ("proposed", "approved", "launched", "confirmed")])
+        proposed, approved, launched, confirmed = entries
+        self.assertEqual((proposed.author, proposed.recipient), (AGENT, ALICE))
+        self.assertEqual((approved.author, launched.author), (ALICE, "ameesh:porte"))
+        self.assertIn("Action %s proposée par %s : shell-noop send sur client:42 (projet demo, "
+                      "classe irreversible)" % (action_id, AGENT), proposed.text)
+        self.assertIn("approbation humaine (reçu) requise ; approbateurs : human:alice",
+                      proposed.text)
+        self.assertIn("api_token=<masqué>", proposed.text)
+        self.assertIn("blob=<masqué, 64 caractères>", proposed.text)
+        self.assertIn("lignes=[3 élément(s)]", proposed.text)
+        self.assertIn("subject=facture de mars", proposed.text)
+        self.assertIn("approuvée par human:alice (webauthn", approved.text)
+        self.assertIn("lancée", launched.text)
+        self.assertIn("confirmée", confirmed.text)
+        everything = "\n".join(e.text + json.dumps(e.meta) for e in entries)
+        request = receipt["request"]
+        for leak in (secret, opaque, request["nonce"], receipt["proof"]["signature"]):
+            self.assertNotIn(leak, everything)
+        self.assertEqual(confirmed.meta["state"], "confirmed")
+        self.assertEqual(confirmed.meta["attempt"], 1)
+        # le fil est indexé comme les messages
+        [row] = self.db.query("SELECT project, entries FROM thread_index")
+        self.assertEqual((row["project"], row["entries"]), ("demo", 4))
+
+    def test_lot_inconnue_reconciliation_annulation_remplacement(self):
+        item = work.add(self.db, title="Fusion du lot 7")
+        lossy = self.gh(mode="lose", view="absent")
+        action = self.propose("merge", connector=lossy, target=PR, args={"method": "squash"},
+                              work_item=int(item["id"]))
+        self.approve(action)
+        self.assertEqual(self.execute(action, lossy)["state"], "unknown")
+        actions.reconcile(self.db, action["action_id"], self.gh(), by=ALICE)
+        thread = self.entries("demo", str(item["id"]))
+        self.assertEqual([e.meta["event"] for e in thread],
+                         ["proposed", "approved", "launched", "unknown", "confirmed"])
+        self.assertIn("Aucune nouvelle tentative automatique : ameesh action reconcile %s"
+                      % action["action_id"], thread[3].text)
+        self.assertIn("réconciliation", thread[4].text)
+        self.assertEqual(self.entries(), [])                # le fil du lot, pas celui du projet
+
+        cancelled = self.propose()
+        actions.cancel(self.db, cancelled["action_id"], by=ALICE, note="plus utile")
+        self.assertEqual(self.events()[-1], (cancelled["action_id"], "cancelled"))
+        self.assertIn("plus utile", self.entries()[-1].text)
+
+        self.set_pr("o/r#13")
+        dropped = self.propose("merge", connector=self.gh(mode="drop"), target="o/r#13")
+        self.approve(dropped)
+        self.assertEqual(self.execute(dropped, self.gh(mode="drop"))["state"], "unknown")
+        new = actions.replace(self.db, dropped["action_id"],
+                              self.receipt(dropped, assume_duplicate=True), policy=POLICY,
+                              by=ALICE)
+        self.assertEqual(self.events()[-2:], [(dropped["action_id"], "replaced"),
+                                              (new["action_id"], "proposed")])
+        replaced, proposed = self.entries()[-2:]
+        self.assertIn("remplacée par %s (doublon assumé par human:alice)" % new["action_id"],
+                      replaced.text)
+        self.assertIn("Elle remplace %s" % dropped["action_id"], proposed.text)
+
+    def test_fil_inaccessible_ne_bloque_rien(self):
+        broken = os.path.join(self.tmp, "pas-un-dossier")
+        with open(broken, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        db = db_mod.connect(dataclasses.replace(self.cfg, threads_dir=broken))
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                action = actions.propose(db, self.noop, project="demo", operation="send",
+                                         target="client:1", proposed_by=AGENT)
+                actions.cancel(db, action["action_id"], by=ALICE)
+        finally:
+            db.close()
+        self.assertEqual(self.get(action)["state"], "cancelled")
+        self.assertIn("écriture du fil impossible", err.getvalue())
+
+    def test_resume_des_arguments(self):
+        self.assertEqual(actions.args_summary({}), "aucun")
+        self.assertEqual(actions.args_summary({"password": "x", "n": None, "ok": True,
+                                               "o": {"a": 1}}),
+                         "n=null, o={1 clé(s)}, ok=true, password=<masqué>")
+        self.assertTrue(actions.args_summary({"t": "mot " * 30}).endswith("…"))
+        self.assertLessEqual(len(actions.args_summary({"k%d" % i: i for i in range(100)})), 200)
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -1359,7 +1470,7 @@ class ActionsCliTest(ActionsBase):
         return path
 
     def signed(self, action_id: str, *extra, soft=None) -> str:
-        proc = self.run_cli("action", "request", action_id, "--approver", ALICE, *extra)
+        proc = self.run_cli("action", "request", action_id, "--approver", ALICE, "--local", *extra)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return self.write((soft or self.alice).receipt(json.loads(proc.stdout)))
 
@@ -1415,6 +1526,10 @@ class ActionsCliTest(ActionsBase):
                             env=self.cli_env(AMEESH_FAKE_GH_MODE="drop"))
         self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
         self.assertIn("unknown", proc.stdout)
+        # exécuter une action d'issue inconnue : refus d'état, code 1 (pas 4)
+        proc = self.run_cli("action", "execute", action_id)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("refus [state] : action %s : issue inconnue" % action_id, proc.stderr)
         proc = self.run_cli("action", "reconcile", action_id,
                             env=self.cli_env(AMEESH_FAKE_GH_VIEW="absent"))
         self.assertEqual(proc.returncode, 4, proc.stderr)

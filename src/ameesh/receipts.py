@@ -45,6 +45,14 @@ Approbations permanentes bornées (§8.3) : un reçu `standing` crée un grant
 Chaque tentative couverte réserve ensuite son montant (`standing_reserve`,
 `standing_cover`) ; une réservation n'est libérée que sur un échec certain
 (`standing_release`).
+
+Registre des authentificateurs (§8.2) : il n'est écrit QUE par
+`canon_sync.sync_authenticators` — canon lu à sa révision canonique, contrôles
+(branche de confiance, monotonie, retard) et écritures dans une transaction,
+sous le verrou consultatif du registre (`lock_registry`). L'écriture elle-même
+(`_apply_authenticators`) exige le jeton de ce verrou (`RegistryLock`) et
+revérifie en SQL (`pg_locks`) que la session le détient : hors de ce chemin,
+refus (`RegistryLockError`), rien n'est écrit.
 """
 from __future__ import annotations
 
@@ -1018,8 +1026,110 @@ def _label(approver: str, facade: str, credential_id: str) -> str:
     return "%s/%s/%s" % (approver, facade, credential_id)
 
 
-def sync_authenticators(db: Db, members: list) -> dict:
+#: motifs de révocation écrits par `_apply_authenticators` (et lui seul)
+SYNC_REVOCATIONS = ("absent du canon", "clé changée dans le canon")
+#: `canon_ref` d'une fiche lue par le canon (L2) : `<membre>:<chemin>@<commit>`
+FICHE_REF_RE = re.compile(r"^([^:\s]+):(\S*)@([0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+# --------------------------------------------------------------------------
+# verrou du registre des authentificateurs (revue L9b : B1, codex3)
+# --------------------------------------------------------------------------
+
+#: verrou consultatif TRANSACTIONNEL de toute écriture du registre des
+#: authentificateurs. Le registre est unique par schéma : la clé ne dépend que
+#: de lui — ni du chemin du clone, ni de l'hôte, ni de `canon.root` —, deux
+#: clones ou deux hôtes du même canon se sérialisent donc sur le même verrou.
+#: Une seule définition de la clé (`_AUTH_LOCK_KEY`), pour la prise
+#: (`lock_registry`) comme pour le contrôle (`registry_lock_held`).
+AUTH_LOCK_NAMESPACE = "ameesh_authenticators:"
+_AUTH_LOCK_KEY = "hashtext(%s || current_schema())::bigint"
+AUTH_LOCK_SQL = "SELECT pg_advisory_xact_lock(%s)" % _AUTH_LOCK_KEY
+#: pg_locks présente une clé bigint en (classid = 32 bits hauts, objid = 32
+#: bits bas, objsubid = 1) ; seule la session courante compte (pid)
+_AUTH_LOCK_HELD_SQL = """
+SELECT EXISTS (
+    SELECT 1
+      FROM pg_locks l, (SELECT %s AS k) AS key
+     WHERE l.locktype = 'advisory' AND l.granted AND l.pid = pg_backend_pid()
+       AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+       AND l.objsubid = 1
+       AND l.classid::bigint = ((key.k >> 32) & 4294967295)
+       AND l.objid::bigint = (key.k & 4294967295)
+) AS held
+""" % _AUTH_LOCK_KEY
+
+_LOCK_PROOF = object()
+
+
+class RegistryLockError(RuntimeError):
+    """Écriture du registre des authentificateurs hors du chemin autorisé."""
+
+
+class RegistryLock:
+    """Jeton : le verrou du registre est pris dans la transaction de `db`.
+
+    Rendu par `lock_registry` seulement (le constructeur refuse tout autre
+    appelant) ; `_apply_authenticators` revérifie de toute façon, en SQL, que
+    la session de `db` détient le verrou avant d'écrire."""
+
+    __slots__ = ("db",)
+
+    def __init__(self, db: Db, proof: object = None):
+        if proof is not _LOCK_PROOF:
+            raise RegistryLockError("RegistryLock : rendu par receipts.lock_registry seulement")
+        self.db = db
+
+
+def lock_registry(db: Db) -> RegistryLock:
+    """Prend le verrou du registre des authentificateurs et rend son jeton.
+
+    À appeler dans une transaction ouverte (`with db.transaction() as tx:`) :
+    le verrou tient jusqu'au COMMIT. Hors transaction (autocommit), il serait
+    relâché aussitôt et `_apply_authenticators` refuserait le jeton. Réentrant
+    dans la même session (`pg_advisory_xact_lock` déjà détenu : accordé)."""
+    db.execute(AUTH_LOCK_SQL, (AUTH_LOCK_NAMESPACE,))
+    return RegistryLock(db, _LOCK_PROOF)
+
+
+def registry_lock_held(db: Db) -> bool:
+    """La session de `db` détient-elle le verrou du registre (pg_locks) ?"""
+    rows = db.query(_AUTH_LOCK_HELD_SQL, (AUTH_LOCK_NAMESPACE,))
+    return bool(rows and rows[0].get("held"))
+
+
+def _revocation_ref(row: dict, wanted: dict | None, member_refs: dict,
+                    source_commits: dict | None) -> str | None:
+    """Le commit du canon qui constate une révocation (provenance de la ligne
+    révoquée) : la fiche du membre lue maintenant, ou, pour un membre absent,
+    l'ancien chemin de la fiche au commit lu de sa source. None : inchangé."""
+    if wanted is not None:
+        return wanted["canon_ref"]
+    ref = member_refs.get(row["approver"])
+    if ref:
+        return ref
+    match = FICHE_REF_RE.fullmatch(row.get("canon_ref") or "")
+    if match and source_commits and _COMMIT_RE.fullmatch(
+            str(source_commits.get(match.group(1)) or "")):
+        return "%s:%s@%s" % (match.group(1), match.group(2), source_commits[match.group(1)])
+    return None
+
+
+def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: bool = True,
+                          source_commits: dict | None = None) -> dict:
     """Met la table `authenticators` en conformité avec le canon lu par ailleurs.
+
+    RÈGLE (revue L9b, codex2/codex3) : écriture INTERNE, jamais un point
+    d'entrée. Son seul appelant est `canon_sync._sync_locked` — dans la
+    transaction et sous le verrou du registre (`lock_registry`), APRÈS la
+    lecture du canon à sa révision canonique et les contrôles de
+    `canon_sync` (branche de confiance, monotonie, retard) ; le point
+    d'entrée public est `canon_sync.sync_authenticators`. Les tests de L6
+    l'appellent par `tests.support.apply_authenticators`, contexte de test
+    explicite (verrou pris, sans canon git). Avant toute lecture ou écriture,
+    `lock` doit être le jeton de `lock_registry` ET la session de `lock.db`
+    doit détenir le verrou (vérifié en SQL dans `pg_locks`) ; sinon
+    RegistryLockError, rien n'est écrit. Les écritures passent par `lock.db`.
 
     `members` : [{"title": "smichea", "canon_ref": "members/smichea.md@<sha>",
     "authenticators": [{facade, credential_id, public_key, aaguid, level,
@@ -1047,10 +1157,37 @@ def sync_authenticators(db: Db, members: list) -> dict:
       de membre est illisible (titre invalide) : elle pourrait être ce membre,
       aucune révocation pour absence n'est alors faite ;
     * un credential déclaré par plusieurs membres, ou porté par une entrée
-      invalide, n'est ni ajouté ni modifié ni révoqué, chez personne.
+      invalide, n'est ni ajouté ni modifié ni révoqué, chez personne ;
+    * `revoke_absent=False` (canon lu en partie : une fiche Member a pu
+      échapper à la lecture) : aucune révocation pour absence du canon, comme
+      pour une entrée de membre illisible ; une liste valide qui omet un
+      credential le révoque toujours.
+
+    Provenance des révocations : une ligne révoquée par la synchronisation
+    note le commit du canon qui l'a constatée (`canon_ref` = la fiche du
+    membre lue maintenant ; pour un membre absent, son ancien chemin au
+    commit lu de sa source, `source_commits` = {membre du canon: commit}). Un
+    hôte dont le canon est en retard peut ainsi être reconnu
+    (`canon_sync.sync_authenticators`) avant de réactiver ce qui a été retiré.
 
     Renvoie {"added", "updated", "revoked", "unchanged", "frozen", "errors"}.
     """
+    if not isinstance(lock, RegistryLock):
+        raise RegistryLockError(
+            "écriture du registre des authentificateurs refusée : jeton du verrou attendu "
+            "(canon_sync.sync_authenticators) — rien n'est modifié")
+    db = lock.db
+    try:
+        held = registry_lock_held(db)
+    except DbError as exc:              # psql : session de la transaction déjà close
+        raise RegistryLockError(
+            "écriture du registre des authentificateurs refusée : verrou du registre "
+            "invérifiable (%s) — rien n'est modifié" % exc) from exc
+    if not held:
+        raise RegistryLockError(
+            "écriture du registre des authentificateurs refusée : la session ne détient "
+            "pas le verrou du registre (transaction close, ou verrou pris hors "
+            "transaction) — rien n'est modifié")
     if not isinstance(members, list):
         raise ReceiptError("members : liste de membres attendue (rien n'est modifié)")
     errors: list[str] = []
@@ -1060,6 +1197,7 @@ def sync_authenticators(db: Db, members: list) -> dict:
     listed: set[str] = set()       # approbateurs lisibles dans le canon
     frozen: set[str] = set()       # approbateurs gelés : aucune écriture
     unreadable = False             # une entrée de membre sans titre lisible
+    member_refs: dict[str, str] = {}   # approbateur → fiche Member lue (chemin@SHA)
 
     for index, member in enumerate(members):
         title = member.get("title") if isinstance(member, dict) else None
@@ -1069,6 +1207,9 @@ def sync_authenticators(db: Db, members: list) -> dict:
             continue
         approver = "human:" + title
         listed.add(approver)
+        member_ref = member.get("canon_ref")
+        if isinstance(member_ref, str) and _CANON_REF_RE.fullmatch(member_ref):
+            member_refs.setdefault(approver, member_ref)
         entries = member.get("authenticators")
         if not isinstance(entries, list):
             errors.append("%s : authenticators doit être une liste (%s)" % (
@@ -1156,14 +1297,15 @@ def sync_authenticators(db: Db, members: list) -> dict:
             else:
                 result["unchanged"] += 1
             continue
-        if unreadable and row["approver"] not in listed:
+        if (unreadable or not revoke_absent) and row["approver"] not in listed:
             continue        # son entrée est peut-être celle qu'on n'a pas pu lire
-        reason = ("clé changée dans le canon" if wanted and wanted["approver"] == row["approver"]
-                  else "absent du canon")
+        same = wanted if wanted and wanted["approver"] == row["approver"] else None
+        reason = SYNC_REVOCATIONS[1] if same else SYNC_REVOCATIONS[0]
         rows = db.query(
             "UPDATE authenticators SET revoked_at = now(), revoked_reason = %s, "
-            "updated_at = now() WHERE id = %s AND revoked_at IS NULL RETURNING id",
-            (reason, int(row["id"])))
+            "canon_ref = coalesce(%s::text, canon_ref), updated_at = now() "
+            "WHERE id = %s AND revoked_at IS NULL RETURNING id",
+            (reason, _revocation_ref(row, same, member_refs, source_commits), int(row["id"])))
         if rows:
             result["revoked"].append(label)
 

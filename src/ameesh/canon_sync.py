@@ -1,6 +1,43 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Du canon vers le registre (spec §4.4) : `canon sync` et agents éphémères.
 
+`sync` recopie aussi les authentificateurs des fiches Member dans le
+registre de confiance (`authenticators`, §8.2), par
+`receipts._apply_authenticators` (L6), depuis le canon lu à sa révision
+canonique seulement (voir `sync_authenticators`) :
+
+* **sérialisé** (revue L9b, B1) : contrôles et écritures dans UNE
+  transaction, sous un verrou consultatif transactionnel du registre pris
+  avant tout contrôle (clé indépendante du clone, de l'hôte et du chemin) ;
+  sous ce verrou, le dernier commit appliqué (journal `authenticator_syncs`)
+  est relu et un commit qui n'en descend pas n'est jamais écrit ;
+* **la branche canonique ne vient jamais du commit lu** (B2) : configuration
+  de l'hôte (`AMEESH_CANON_REF` / `canon_ref`), sinon manifeste du dernier
+  commit appliqué, sinon amorçage explicite (`canon sync --bootstrap-ref`,
+  journalisé), sinon refus. `--ref` choisit ce qu'on lit, jamais ce qui est
+  canonique : le commit lu doit être atteignable depuis la branche de
+  confiance (suivi distant `refs/remotes/…`) ; un changement de `ref` dans
+  le manifeste ne prend effet qu'une fois fusionné sur la branche actuelle.
+  Sans `trusted_ref` explicite, `sync` le prend LUI-MÊME dans la
+  configuration de la connexion (`db.cfg.canon_ref`) : aucun appelant
+  (exécuteur compris) ne peut l'oublier ;
+* **jamais silencieux** (revue codex2) : l'issue est inscrite dans
+  `canon_state` (`auth_status` : ok | skipped | error, `auth_diagnostic` ;
+  0024) ; une erreur (refus, membre gelé…) y rend la partie
+  authentificateurs non-ok et est écrite dans le fil du projet (`fil.record`,
+  qui ne lève jamais) — à chaque erreur nouvelle, et au retour à la normale ;
+* **écriture gardée** : seul `_sync_locked` écrit le registre, par
+  `receipts._apply_authenticators`, qui exige le jeton du verrou et revérifie
+  dans `pg_locks` que la session le détient.
+
+Limite connue (§11) : la branche de suivi distant est lue dans le clone de
+l'hôte. Un agent qui partage l'utilisateur Unix d'ameesh peut réécrire
+`refs/remotes/…` (ou la configuration de l'hôte, ou l'environnement de la
+commande) et faire passer un commit non fusionné pour canonique ; seule la
+monotonie (journal en base) l'empêche de revenir en arrière. Seule une
+vérification par un composant isolé (`ameesh-approve`, autre utilisateur)
+est opposable à un agent malveillant.
+
 `sync` met à jour, pour les agents placés sur un hôte, les colonnes
 **déclaratives** du registre (harnais, hôte, dossier, modèle, budget,
 responsable, équipe, fournisseur, mode d'identifiants, capacités, canon_ref,
@@ -55,11 +92,12 @@ import re
 from dataclasses import dataclass, field
 
 from . import canon as canon_mod
+from . import fil
 from . import placement as placement_mod
-from . import registry
+from . import receipts, registry
 from .canon import Canon, Finding
 from .config import NAME_RE
-from .db import Db
+from .db import Db, DbError
 
 #: préfixes de `status_text` posés par sync (et reconnus par lui seul)
 STOP_MARK = "retiré du canon"
@@ -114,6 +152,78 @@ class SyncAction:
         return out
 
 
+#: statuts de la synchronisation du registre des authentificateurs
+AUTH_SYNCED = "synced"       # receipts._apply_authenticators appelé
+AUTH_SKIPPED = "skipped"     # rien écrit, sans erreur (canon non approuvé : tests)
+AUTH_REFUSED = "refused"     # rien écrit, ERREUR (révision hors branche, canon en retard,
+                             # non descendant, premier amorçage sans --bootstrap-ref)
+
+#: partie authentificateurs de l'état du canon (`canon_state.auth_status`, 0024)
+AUTH_STATE_OK = "ok"         # synchronisé sans erreur
+AUTH_STATE_SKIPPED = AUTH_SKIPPED   # rien écrit, sans erreur
+AUTH_STATE_ERROR = "error"   # refus, ou erreurs (membre gelé, entrée illisible…) : non-ok
+#: auteur des entrées du fil écrites par sync
+FIL_SENDER = "ameesh:canon-sync"
+
+
+@dataclass
+class AuthenticatorSync:
+    """Canon → registre des authentificateurs (§8.2) : ce qui a été fait."""
+
+    status: str
+    reason: str = ""
+    #: résultat de `receipts._apply_authenticators` (statut `synced`)
+    result: dict | None = None
+    #: canon lu en partie : aucune révocation pour absence (raisons)
+    partial: list[str] = field(default_factory=list)
+    #: origine de la branche canonique de confiance (config | applied | bootstrap)
+    trust: str = ""
+    #: branche canonique de confiance (suivi distant, ex. origin/main)
+    branch: str = ""
+    #: remarques (amorçage journalisé, --bootstrap-ref ignoré…)
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def errors(self) -> list[str]:
+        if self.status == AUTH_REFUSED:
+            return [self.reason]
+        return list((self.result or {}).get("errors") or [])
+
+    @property
+    def state(self) -> str:
+        """Partie authentificateurs de l'état du canon : ok | skipped | error."""
+        if self.errors:
+            return AUTH_STATE_ERROR
+        return AUTH_STATE_SKIPPED if self.status == AUTH_SKIPPED else AUTH_STATE_OK
+
+    def diagnostic(self) -> str:
+        """Diagnostic durable (`canon_state.auth_diagnostic`), borné."""
+        if self.status == AUTH_REFUSED:
+            text = "REFUSÉ, registre inchangé — %s" % self.reason
+        elif self.errors:
+            frozen = list((self.result or {}).get("frozen") or [])
+            text = "%d erreur(s)%s : %s" % (
+                len(self.errors), " (GELÉS : %s)" % ", ".join(frozen) if frozen else "",
+                " ; ".join(self.errors))
+        elif self.status == AUTH_SKIPPED:
+            text = self.reason
+        else:
+            text = " ; ".join(list(self.notes) + (
+                ["canon lu en partie, aucune révocation pour absence : %s"
+                 % ", ".join(self.partial)] if self.partial else []))
+        return _clip(text)
+
+    def to_dict(self) -> dict:
+        out: dict = {"status": self.status, "reason": self.reason,
+                     "errors": self.errors, "partial": self.partial,
+                     "trust": self.trust, "branch": self.branch, "notes": self.notes,
+                     "state": self.state}
+        for key in ("added", "updated", "revoked", "frozen"):
+            out[key] = list((self.result or {}).get(key) or [])
+        out["unchanged"] = int((self.result or {}).get("unchanged") or 0)
+        return out
+
+
 @dataclass
 class SyncReport:
     host: str
@@ -123,26 +233,42 @@ class SyncReport:
     findings: list[Finding]
     status: str = CANON_OK          # état enregistré dans canon_state
     diagnostic: str = ""
+    #: registre des authentificateurs (§8.2), synchronisé par le même passage
+    authenticators: AuthenticatorSync | None = None
 
     @property
     def errors(self) -> list[Finding]:
         return canon_mod.errors(self.findings)
 
+    @property
+    def auth_status(self) -> str:
+        """Partie authentificateurs de l'état (`canon_state.auth_status`) ; non-ok
+        (`error`) dès qu'une erreur d'authentificateurs est constatée."""
+        return self.authenticators.state if self.authenticators is not None else ""
+
     def to_dict(self) -> dict:
         return {"host": self.host, "source": self.source, "untrusted": self.untrusted,
                 "canon_status": self.status, "diagnostic": self.diagnostic,
+                "auth_status": self.auth_status,
+                "auth_diagnostic": (self.authenticators.diagnostic()
+                                    if self.authenticators is not None else ""),
                 "actions": [a.to_dict() for a in self.actions],
                 "errors": len(self.errors),
-                "findings": [f.to_dict() for f in self.findings]}
+                "findings": [f.to_dict() for f in self.findings],
+                "authenticators": (self.authenticators.to_dict()
+                                   if self.authenticators is not None else None)}
 
 
 # --------------------------------------------------------------------------
 # état du canon par hôte (canon_state, §4.1)
 # --------------------------------------------------------------------------
 
-def _describe(findings: list[Finding]) -> str:
-    text = " ; ".join("%s (%s) : %s" % (f.code, f.where(), f.message) for f in findings)
+def _clip(text: str) -> str:
     return text if len(text) <= _DIAGNOSTIC_MAX else text[:_DIAGNOSTIC_MAX - 1] + "…"
+
+
+def _describe(findings: list[Finding]) -> str:
+    return _clip(" ; ".join("%s (%s) : %s" % (f.code, f.where(), f.message) for f in findings))
 
 
 def assess(canon: Canon, host: str,
@@ -208,12 +334,421 @@ def state(db: Db, host: str) -> dict | None:
         """
         SELECT host, status, root, source, last_good_commit, diagnostic,
                extract(epoch from last_good_at)::float8 AS last_good_ts,
-               extract(epoch from checked_at)::float8   AS checked_ts
+               extract(epoch from checked_at)::float8   AS checked_ts,
+               auth_status, auth_diagnostic,
+               extract(epoch from auth_checked_at)::float8 AS auth_checked_ts
           FROM canon_state WHERE host = %s
         """,
         (host,),
     )
     return rows[0] if rows else None
+
+
+def record_authenticators(db: Db, host: str, done: AuthenticatorSync) -> None:
+    """Inscrit l'issue de la synchronisation du registre des authentificateurs.
+
+    Diagnostic durable : `canon_state.auth_status` / `auth_diagnostic` de
+    `host` (la ligne de l'hôte, écrite juste avant par `record_state`). Une
+    erreur rend cette partie non-ok (`error`) sans toucher au statut du canon
+    pour les agents (`status`, réclamation). Fil : une erreur NOUVELLE (statut
+    ou diagnostic différent du précédent) est écrite dans le fil du projet,
+    et le retour à la normale aussi — un exécuteur qui resynchronise
+    périodiquement ne répète pas la même entrée, mais rien n'est silencieux.
+    """
+    status, diagnostic = done.state, done.diagnostic()
+    rows = db.query("SELECT auth_status, auth_diagnostic FROM canon_state WHERE host = %s",
+                    (host,))
+    before = (rows[0].get("auth_status"), rows[0].get("auth_diagnostic") or "") \
+        if rows else (None, "")
+    db.query(
+        "UPDATE canon_state SET auth_status = %s, auth_diagnostic = %s, "
+        "auth_checked_at = now() WHERE host = %s RETURNING host",
+        (status, diagnostic, host))
+    if status == AUTH_STATE_ERROR and before != (status, diagnostic):
+        _post_authenticators(db, host, status, (
+            "canon sync sur %s : registre des authentificateurs EN ERREUR — %s. "
+            "Détail : ameesh canon sync --host %s ; état durable : ameesh canon check --host %s."
+            % (host, diagnostic or "?", host, host)), done)
+    elif status != AUTH_STATE_ERROR and before[0] == AUTH_STATE_ERROR:
+        _post_authenticators(db, host, status, (
+            "canon sync sur %s : registre des authentificateurs de nouveau sans erreur (%s)%s."
+            % (host, status, " — %s" % diagnostic if diagnostic else "")), done)
+
+
+def _post_authenticators(db: Db, host: str, status: str, text: str,
+                         done: AuthenticatorSync) -> None:
+    """Entrée du fil du projet (`fil.record`, qui ne lève jamais) ; une
+    connexion sans configuration se dit sur stderr."""
+    cfg = getattr(db, "cfg", None)
+    if cfg is None:
+        fil.warn(text)
+        return
+    try:
+        fil.record(cfg, db, sender=FIL_SENDER, recipients=["all"], text=text,
+                   project=fil.project_for(cfg),
+                   meta={"event": "authenticators_%s" % status, "host": host,
+                         "auth_status": status, "auth": done.status,
+                         "branch": done.branch, "trust": done.trust})
+    except Exception as exc:  # noqa: BLE001 - fil.record ne lève pas ; prudence
+        fil.warn("%s (entrée du fil non écrite : %s)" % (text, " ".join(str(exc).split())[:200]))
+
+
+# --------------------------------------------------------------------------
+# registre des authentificateurs (§8.2, L6)
+# --------------------------------------------------------------------------
+
+#: Le verrou consultatif TRANSACTIONNEL du registre (B1) est défini une seule
+#: fois, avec l'écriture qu'il garde : `receipts.lock_registry` (clé du seul
+#: registre, ni du clone ni de l'hôte), `receipts._apply_authenticators`.
+
+#: d'où vient la branche canonique de CONFIANCE (journal `authenticator_syncs`)
+TRUST_CONFIG = "config"          # configuration de l'hôte (AMEESH_CANON_REF / canon_ref)
+TRUST_APPLIED = "applied"        # manifeste du dernier commit déjà appliqué
+TRUST_BOOTSTRAP = "bootstrap"    # premier amorçage : --bootstrap-ref explicite
+TRUST_LABELS = {
+    TRUST_CONFIG: "configuration de l'hôte",
+    TRUST_APPLIED: "manifeste du dernier commit appliqué",
+    TRUST_BOOTSTRAP: "amorçage --bootstrap-ref",
+}
+BOOTSTRAP_REFUSED = (
+    "premier amorçage du registre des authentificateurs refusé : aucune branche "
+    "canonique de confiance (ni AMEESH_CANON_REF / canon_ref dans la configuration de "
+    "l'hôte, ni commit déjà appliqué) ; le commit lu ne décide jamais lui-même de ce "
+    "qui est canonique — registre inchangé, « ameesh canon sync --bootstrap-ref "
+    "<branche> » (journalisé)")
+
+
+class _Refused(Exception):
+    """Contrôle refusé sous le verrou : rien n'est écrit."""
+
+
+class _Concurrent(Exception):
+    """Le journal a bougé pendant la transaction : tout est annulé."""
+
+
+def configured_ref(db: Db) -> str:
+    """Branche canonique de confiance de la configuration de l'hôte
+    (AMEESH_CANON_REF / `canon_ref`), lue sur la connexion (`db.cfg`)."""
+    return str(getattr(getattr(db, "cfg", None), "canon_ref", "") or "")
+
+
+def last_applied(db: Db) -> dict | None:
+    """Dernière synchronisation appliquée (journal `authenticator_syncs`), ou None."""
+    rows = db.query(
+        "SELECT id, root_member, root_commit, commits, branch, trust, host, applied_by, "
+        "extract(epoch from applied_at)::float8 AS applied_ts "
+        "FROM authenticator_syncs ORDER BY id DESC LIMIT 1")
+    if not rows:
+        return None
+    row = rows[0]
+    commits = row.get("commits")
+    if isinstance(commits, str):
+        commits = json.loads(commits)
+    row["commits"] = {str(k): str(v) for k, v in (commits or {}).items()} \
+        if isinstance(commits, dict) else {}
+    row["id"] = int(row["id"])
+    return row
+
+
+def _applied_branch(root: canon_mod.Source, last: dict) -> str:
+    """La branche canonique selon le manifeste du DERNIER commit appliqué
+    (`ref` de son membre racine), sinon celle contre laquelle ce commit a été
+    vérifié. Un changement de branche n'y entre qu'une fois fusionné."""
+    commit = last["root_commit"]
+    if not canon_mod.git_commit(root.repo, commit):
+        raise _Refused(
+            "canon en retard sur le registre des authentificateurs : le dernier commit "
+            "appliqué %s est inconnu de ce clone — registre inchangé, ameesh canon sync "
+            "--fetch" % commit[:12])
+    path = (root.prefix + "/" if root.prefix else "") + "federation.yaml"
+    raw = canon_mod.git_read(root.repo, commit, path)
+    if raw is None:
+        return last["branch"]
+    try:
+        manifest = canon_mod.load_yaml(raw.decode("utf-8"))
+    except (UnicodeDecodeError, canon_mod.YamlError) as exc:
+        raise _Refused("federation.yaml illisible au dernier commit appliqué %s (%s) : "
+                       "branche canonique inconnue, registre inchangé" % (commit[:12], exc))
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("members") or [], list):
+        raise _Refused("federation.yaml invalide au dernier commit appliqué %s : branche "
+                       "canonique inconnue, registre inchangé" % commit[:12])
+    root_id = str(manifest.get("root") or "canon")
+    entry = next((m for m in manifest.get("members") or []
+                  if isinstance(m, dict) and str(m.get("id")) == root_id), None)
+    ref = str((entry or {}).get("ref") or "")
+    if not ref:
+        return last["branch"]
+    branch = canon_mod.remote_branch(root.repo, ref)
+    if branch is None:
+        raise _Refused("ref %r du membre racine %s (manifeste du dernier commit appliqué "
+                       "%s) : pas une branche, registre inchangé" % (ref, root_id, commit[:12]))
+    return branch
+
+
+def _trusted_branch(root: canon_mod.Source, last: dict | None, trusted_ref: str,
+                    bootstrap_ref: str) -> tuple[str, str, list[str]]:
+    """(branche canonique de confiance, origine, remarques) — jamais tirée du
+    commit lu : configuration de l'hôte, sinon manifeste du dernier commit
+    appliqué, sinon amorçage explicite ; sinon refus."""
+    notes: list[str] = []
+    if trusted_ref:
+        branch = canon_mod.remote_branch(root.repo, trusted_ref)
+        if branch is None:
+            raise _Refused("AMEESH_CANON_REF %r (configuration de l'hôte) ne désigne pas une "
+                           "branche : branche canonique de confiance inconnue, registre "
+                           "inchangé" % trusted_ref)
+        trust = TRUST_CONFIG
+    elif last is not None:
+        branch, trust = _applied_branch(root, last), TRUST_APPLIED
+    elif bootstrap_ref:
+        branch = canon_mod.remote_branch(root.repo, bootstrap_ref)
+        if branch is None:
+            raise _Refused("--bootstrap-ref %r ne désigne pas une branche : registre "
+                           "inchangé" % bootstrap_ref)
+        trust = TRUST_BOOTSTRAP
+        notes.append("AMORÇAGE du registre des authentificateurs : branche canonique de "
+                     "confiance %s fixée par --bootstrap-ref (journalisé)" % branch)
+    else:
+        raise _Refused(BOOTSTRAP_REFUSED)
+    if bootstrap_ref and trust != TRUST_BOOTSTRAP:
+        notes.append("--bootstrap-ref %s ignoré : %s" % (
+            bootstrap_ref, "registre déjà amorcé" if trust == TRUST_APPLIED
+            else "la configuration de l'hôte fixe la branche canonique"))
+    return branch, trust, notes
+
+
+def _check_on_branch(source: canon_mod.Source, branch: str, why: str) -> None:
+    """Le commit lu est-il atteignable depuis la branche canonique de confiance ?"""
+    head = canon_mod.git_commit(source.repo, "refs/remotes/" + branch)
+    if not head:
+        raise _Refused("%s : branche canonique %s (%s) introuvable dans %s (git fetch ?) — "
+                       "registre des authentificateurs inchangé"
+                       % (source.member, branch, why, source.repo))
+    if not canon_mod.git_contains(source.repo, source.commit, head):
+        raise _Refused("%s @ %s : commit absent de la branche canonique %s (%s, %s) — "
+                       "révision non canonique, registre des authentificateurs inchangé"
+                       % (source.member, source.commit[:12], branch, head[:12], why))
+
+
+def _check_descends(source: canon_mod.Source, floor: str | None) -> None:
+    """Monotonie : jamais d'écriture d'un commit qui ne descend pas du dernier appliqué."""
+    if floor and not canon_mod.git_contains(source.repo, floor, source.commit):
+        raise _Refused(
+            "%s @ %s ne descend pas du dernier commit appliqué %s : canon en retard "
+            "(ameesh canon sync --fetch) ou historique réécrit — jamais de retour en "
+            "arrière, registre des authentificateurs inchangé"
+            % (source.member, source.commit[:12], floor[:12]))
+
+
+def _verify(canon: Canon, last: dict | None, trusted_ref: str,
+            bootstrap_ref: str) -> tuple[str, str, list[str]]:
+    """Contrôles de confiance (B2) et de monotonie (B1), sous le verrou.
+
+    1. branche canonique de confiance (`_trusted_branch`) ; le commit racine lu
+       doit en être atteignable (suivi distant `refs/remotes/<branche>`) ;
+    2. il doit descendre du dernier commit racine appliqué ;
+    3. chaque autre source (dépôt distinct) : atteignable depuis la branche de
+       son entrée au manifeste — celui du commit racine, désormais vérifié
+       (fusionné) — et descendante de son dernier commit appliqué.
+    """
+    root = canon.sources[0]
+    branch, trust, notes = _trusted_branch(root, last, trusted_ref, bootstrap_ref)
+    _check_on_branch(root, branch, TRUST_LABELS[trust])
+    if last is not None:
+        _check_descends(root, last["root_commit"])
+    manifest = canon.federation if isinstance(canon.federation, dict) else {}
+    for source in canon.sources[1:]:
+        if source.repo == root.repo and source.commit == root.commit:
+            continue                    # même instantané que la racine : déjà vérifié
+        entry = next((m for m in manifest.get("members") or []
+                      if isinstance(m, dict) and str(m.get("id")) == source.member), None)
+        ref = str((entry or {}).get("ref") or canon_mod.DEFAULT_BRANCH)
+        member_branch = canon_mod.remote_branch(source.repo, ref)
+        if member_branch is None:
+            raise _Refused("%s : ref %r du manifeste, pas une branche — registre inchangé"
+                           % (source.member, ref))
+        _check_on_branch(source, member_branch, "manifeste du commit racine %s"
+                         % root.commit[:12])
+        if last is not None:
+            _check_descends(source, last["commits"].get(source.member))
+    return branch, trust, notes
+
+
+def _record(db: Db, last: dict | None, canon: Canon, branch: str, trust: str, host: str,
+            result: dict) -> None:
+    """Journalise la synchronisation appliquée (dernier commit appliqué), en
+    vérifiant que le journal n'a pas bougé depuis sa lecture sous le verrou."""
+    root = canon.sources[0]
+    commits = dict(last["commits"]) if last is not None else {}
+    commits.update({s.member: s.commit for s in canon.sources if s.mode == "git"})
+    changed = any(result.get(key) for key in ("added", "updated", "revoked"))
+    expected = last["id"] if last is not None else None
+    if last is not None and not changed and (
+            last["root_commit"], last["commits"], last["branch"]) == (root.commit, commits,
+                                                                      branch):
+        rows = db.query("SELECT max(id) AS id FROM authenticator_syncs")
+        if not rows or rows[0].get("id") is None or int(rows[0]["id"]) != expected:
+            raise _Concurrent("journal des synchronisations modifié pendant la transaction")
+        return
+    summary = {key: len(result.get(key) or []) for key in ("added", "updated", "revoked",
+                                                           "frozen", "errors")}
+    rows = db.query(
+        """
+        INSERT INTO authenticator_syncs
+            (root_member, root_commit, commits, branch, trust, host, summary)
+        SELECT %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb
+         WHERE (SELECT max(id) FROM authenticator_syncs) IS NOT DISTINCT FROM %s::bigint
+        RETURNING id
+        """,
+        (root.member, root.commit, json.dumps(commits, sort_keys=True), branch, trust,
+         host or "", json.dumps(summary, sort_keys=True), expected))
+    if not rows:
+        raise _Concurrent("journal des synchronisations modifié pendant la transaction")
+
+
+def _lag(db: Db, canon: Canon) -> tuple[list[str], set[str]]:
+    """Le canon lu est-il en retard sur ce que le registre a déjà appliqué ?
+
+    Chaque ligne écrite par une synchronisation porte le commit qui l'a
+    écrite (ajout, mise à jour, révocation). Un hôte dont le clone n'a pas
+    encore vu ce commit (pas de `--fetch`) ne doit pas réappliquer un canon
+    plus ancien : il réactiverait un authentificateur retiré depuis. Rend
+    (lignes en avance sur le canon lu, sources du registre absentes du canon
+    lu). Une ligne hors du format des fiches (écrite à la main) n'est pas un
+    repère : la synchronisation la traite comme L6 le prévoit (révoquée si le
+    canon ne la déclare pas).
+    """
+    sources = {s.member: s for s in canon.sources if s.mode == "git"}
+    rows = db.query(
+        "SELECT DISTINCT canon_ref FROM authenticators "
+        "WHERE revoked_at IS NULL OR revoked_reason IN (%s, %s)",
+        receipts.SYNC_REVOCATIONS)
+    ahead: list[str] = []
+    unread: set[str] = set()
+    seen: dict[tuple[str, str], bool] = {}
+    for row in sorted(rows, key=lambda r: r["canon_ref"] or ""):
+        match = receipts.FICHE_REF_RE.fullmatch(row["canon_ref"] or "")
+        if not match:
+            continue
+        member, _path, commit = match.groups()
+        source = sources.get(member)
+        if source is None:
+            unread.add(member)
+            continue
+        key = (member, commit)
+        if key not in seen:
+            seen[key] = canon_mod.git_contains(source.repo, commit, source.commit)
+        if not seen[key]:
+            ahead.append(row["canon_ref"])
+    return ahead, unread
+
+
+def _partial(canon: Canon, unread: set[str]) -> list[str]:
+    """Raisons de croire qu'une fiche Member a pu échapper à la lecture."""
+    reasons = ["%s (%s)" % (f.code, f.where()) for f in canon.load_findings
+               if f.severity == canon_mod.ERROR or f.code == "member-absent"]
+    reasons += ["source %s du registre non lue" % member for member in sorted(unread)]
+    return reasons
+
+
+def registry_members(canon: Canon) -> list[dict]:
+    """Les fiches Member au format de `receipts._apply_authenticators`.
+
+    `canon_ref` = la fiche lue (`<membre>:<chemin>@<commit>`). La liste
+    `authenticators` est passée telle qu'écrite dans la fiche (absente,
+    invalide : L6 gèle le membre) ; une entrée ne choisit jamais sa propre
+    provenance (`canon_ref` d'entrée retiré : c'est la fiche qui fait foi).
+    """
+    members = []
+    for member in canon.members:
+        entry: dict = {"title": member.title, "canon_ref": member.fiche.ref}
+        if "authenticators" in member.fiche.data:
+            raw = member.fiche.data["authenticators"]
+            if isinstance(raw, list):
+                raw = [{k: v for k, v in item.items() if k != "canon_ref"}
+                       if isinstance(item, dict) else item for item in raw]
+            entry["authenticators"] = raw
+        members.append(entry)
+    return members
+
+
+def sync_authenticators(db: Db, canon: Canon, *, trusted_ref: str | None = None,
+                        bootstrap_ref: str = "", host: str = "") -> AuthenticatorSync:
+    """Canon → registre des authentificateurs (§8.2) : le SEUL point d'entrée.
+
+    Écriture de confiance. Rien n'est écrit si le canon est illisible ou lu
+    hors git (non approuvé). Sinon, UNE transaction (`db.transaction()`, les
+    deux pilotes) :
+
+    1. verrou consultatif transactionnel du registre
+       (`receipts.lock_registry`, qui rend son jeton), pris AVANT tout
+       contrôle : deux synchronisations, de deux clones ou de deux hôtes du
+       même canon, se sérialisent ;
+    2. sous ce verrou, relecture du dernier commit appliqué (`last_applied`)
+       et contrôles (`_verify`) : branche canonique de CONFIANCE — jamais
+       tirée du commit lu (`trusted_ref` = configuration de l'hôte, sinon
+       manifeste du dernier commit appliqué, sinon `bootstrap_ref` explicite,
+       sinon refus) —, commit lu atteignable depuis elle, et descendant du
+       dernier commit appliqué (monotonie : jamais de retour en arrière) ;
+       puis le canon ne doit pas être en retard sur une ligne du registre
+       (`_lag`) ;
+    3. écritures de L6 par `receipts._apply_authenticators` (jeton du verrou
+       exigé, verrou revérifié dans `pg_locks` ; entrée invalide : membre
+       gelé ; absent du canon : révoqué ; canon lu en partie : aucune
+       révocation pour absence) et journal (`authenticator_syncs`), puis
+       COMMIT.
+
+    `trusted_ref` None (défaut) : la configuration de la connexion
+    (`configured_ref(db)`) ; "" : aucune. Un refus rend AUTH_REFUSED et
+    n'écrit rien ; une erreur de base annule la transaction entière.
+    """
+    if trusted_ref is None:
+        trusted_ref = configured_ref(db)
+    if not canon.readable:
+        return AuthenticatorSync(AUTH_SKIPPED, "canon illisible : registre inchangé")
+    if canon.untrusted:
+        return AuthenticatorSync(AUTH_SKIPPED, "canon NON APPROUVÉ (fichiers de travail) : "
+                                               "registre des authentificateurs inchangé")
+    if not canon.sources:
+        return AuthenticatorSync(AUTH_SKIPPED, "aucune source lue : registre inchangé")
+    try:
+        with db.transaction() as tx:
+            lock = receipts.lock_registry(tx)
+            return _sync_locked(lock, canon, trusted_ref, bootstrap_ref, host)
+    except receipts.RegistryLockError as exc:
+        return AuthenticatorSync(AUTH_REFUSED, "%s : transaction annulée" % exc)
+    except _Concurrent as exc:
+        return AuthenticatorSync(AUTH_REFUSED, "%s : transaction annulée, registre des "
+                                               "authentificateurs inchangé" % exc)
+    except DbError as exc:
+        return AuthenticatorSync(AUTH_REFUSED, "base : %s — transaction annulée, registre "
+                                               "des authentificateurs inchangé" % exc)
+
+
+def _sync_locked(lock: receipts.RegistryLock, canon: Canon, trusted_ref: str,
+                 bootstrap_ref: str, host: str) -> AuthenticatorSync:
+    """Contrôles et écritures, dans la transaction et sous le verrou du
+    registre (`lock` : son jeton ; `lock.db` : la transaction)."""
+    tx = lock.db
+    last = last_applied(tx)
+    try:
+        branch, trust, notes = _verify(canon, last, trusted_ref, bootstrap_ref)
+    except _Refused as exc:
+        return AuthenticatorSync(AUTH_REFUSED, str(exc))
+    ahead, unread = _lag(tx, canon)
+    if ahead:
+        return AuthenticatorSync(AUTH_REFUSED, (
+            "canon en retard sur le registre des authentificateurs (déjà appliqué : %s) : "
+            "registre inchangé — ameesh canon sync --fetch" % ", ".join(ahead[:5])),
+            trust=trust, branch=branch, notes=notes)
+    partial = _partial(canon, unread)
+    # contrôles faits, verrou détenu : la seule écriture du registre
+    result = receipts._apply_authenticators(
+        lock, registry_members(canon), revoke_absent=not partial,
+        source_commits={s.member: s.commit for s in canon.sources})
+    _record(tx, last, canon, branch, trust, host, result)
+    return AuthenticatorSync(AUTH_SYNCED, "", result, partial, trust=trust, branch=branch,
+                             notes=notes)
 
 
 def _member_of(canon_ref: str | None) -> str:
@@ -414,14 +949,28 @@ def _same(row: dict, values: dict) -> bool:
     return True
 
 
-def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None) -> SyncReport:
+def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None, *,
+         trusted_ref: str | None = None, bootstrap_ref: str = "") -> SyncReport:
     """Aligne le registre de `host` sur le canon et enregistre l'état du canon.
 
     Canon illisible : seul l'état `unreadable` est écrit, puis CanonUnreadable.
     Ordre fail closed : un état non `ok` est écrit AVANT toute autre écriture
     (la réclamation est fermée d'abord) ; un état `ok` APRÈS (elle ne rouvre
     qu'une fois le registre aligné).
+
+    `trusted_ref` (configuration de l'hôte) et `bootstrap_ref` (premier
+    amorçage explicite) ne servent qu'au registre des authentificateurs :
+    voir `sync_authenticators`. `trusted_ref` non fourni (None) : sync le
+    prend lui-même dans la configuration de la connexion
+    (`db.cfg.canon_ref`, AMEESH_CANON_REF) — l'exécuteur, qui ne le passe
+    pas, suit donc la même priorité que `ameesh canon sync` ; "" : aucune.
+
+    L'issue des authentificateurs est inscrite dans `canon_state`
+    (`auth_status`, `auth_diagnostic`) et, en cas d'erreur, dans le fil
+    (`record_authenticators`) : jamais silencieuse, quel que soit l'appelant.
     """
+    if trusted_ref is None:
+        trusted_ref = configured_ref(db)
     if not canon.readable:
         status, diagnostic = assess(canon, host)
         record_state(db, host, status, diagnostic, canon)
@@ -597,9 +1146,15 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None)
     _inherit_placements(db, host)
     if status == CANON_OK:
         record_state(db, host, status, diagnostic, canon)
+    # registre des authentificateurs (§8.2) : copie de travail des fiches
+    # Member, quel que soit l'état du canon pour cet hôte (ses propres règles)
+    authenticators = sync_authenticators(db, canon, trusted_ref=trusted_ref,
+                                         bootstrap_ref=bootstrap_ref, host=host)
+    # jamais silencieux : diagnostic durable (canon_state) et fil
+    record_authenticators(db, host, authenticators)
     return SyncReport(host=host, source=canon.source_label(), untrusted=canon.untrusted,
                       actions=actions, findings=findings, status=status,
-                      diagnostic=diagnostic)
+                      diagnostic=diagnostic, authenticators=authenticators)
 
 
 # --------------------------------------------------------------------------
