@@ -173,8 +173,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     sender = None
     key_path = None
     expires = None
+    kind = "notify"
+    urgent = False
     args = list(args)
-    for flag in ("--from", "--key", "--expires"):
+    for flag in ("--from", "--key", "--expires", "--kind"):
         if flag in args:
             index = args.index(flag)
             value = args[index + 1] if index + 1 < len(args) else None
@@ -183,8 +185,19 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 sender = value
             elif flag == "--key":
                 key_path = value
-            else:
+            elif flag == "--expires":
                 expires = value
+            else:
+                kind = value
+    if "--urgent" in args:
+        urgent = True
+        args = [arg for arg in args if arg != "--urgent"]
+    if kind not in ("request", "reply", "notify", "event"):
+        print("kind invalide : %r (request|reply|notify|event)" % (kind,), file=sys.stderr)
+        return 2
+    if urgent and kind != "event":
+        print("--urgent n'a de sens qu'avec --kind event", file=sys.stderr)
+        return 2
     sign = key_path is not None or "--sign" in args
     args = [arg for arg in args if arg != "--sign"]
     if expires and not sign:
@@ -192,6 +205,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if len(args) < 2:
         print("usage: agent-mail send <dest|all> <texte…> [--from NOM] "
+              "[--kind request|reply|notify|event] [--urgent] "
               "[--sign --key FICHIER] [--expires 24h]", file=sys.stderr)
         return 2
     dest, text = args[0], " ".join(args[1:]).strip()
@@ -239,7 +253,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             print("attention : en repli fichier, la signature n'est pas conservée",
                   file=sys.stderr)
 
-    targets = bk.send(sender, dest, text, host=cfg.host, signed=signed)
+    targets = bk.send(sender, dest, text, host=cfg.host, signed=signed,
+                      kind=kind, urgent=urgent)
     if not targets:
         print("aucun destinataire")
     elif signed:

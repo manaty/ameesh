@@ -20,12 +20,17 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from dataclasses import dataclass
 
 from .config import HARNESSES
 
 MAIL_PROMPT = (
     "Tu as des messages agent-mail : lance agent-mail inbox, lis-les, "
     "puis continue ton travail sans attendre de confirmation."
+)
+EVENT_PROMPT = (
+    "Des événements sont arrivés dans ta boîte agent-mail : lance agent-mail "
+    "inbox, traite-les, puis continue ton travail sans attendre de confirmation."
 )
 IDLE_PROMPT = (
     "Reprise : si ton lot n'est ni gelé ni fusionné, continue-le ; sinon prends "
@@ -40,7 +45,49 @@ BIN_ENV = {
 }
 #: anciens noms acceptés en repli (renommage agent-mesh → ameesh)
 BIN_DIR_ENV = ("AMEESH_BIN_DIR", "AGENT_MESH_BIN_DIR")
-DEFAULT_BIN = {"claude": "claude", "codex": "codex", "deepseek": "dsh"}
+
+
+@dataclass(frozen=True)
+class HarnessSpec:
+    """Descripteur **déclaratif** d'un harnais (base du lot L16).
+
+    `headless` et `interactive` sont des argv sans session ni texte : la session
+    est insérée juste avant le texte avec `session_flag`, et disparaît quand
+    elle est vide. Les capacités qui ne sont pas une simple ligne de commande
+    (lecture du flux, variables d'environnement) restent dans la classe
+    d'adaptateur.
+    """
+    key: str
+    binary: str
+    headless: tuple[str, ...]
+    interactive: tuple[str, ...]
+    session_flag: tuple[str, ...]
+
+
+SPECS: dict[str, HarnessSpec] = {
+    "claude": HarnessSpec(
+        key="claude", binary="claude",
+        headless=("-p", "--output-format", "stream-json", "--verbose",
+                  "--dangerously-skip-permissions"),
+        interactive=(),
+        session_flag=("--resume",),
+    ),
+    "codex": HarnessSpec(
+        key="codex", binary="codex",
+        headless=("--dangerously-bypass-hook-trust", "exec",
+                  "--dangerously-bypass-approvals-and-sandbox", "--json"),
+        interactive=(),
+        session_flag=("resume",),
+    ),
+    "deepseek": HarnessSpec(
+        key="deepseek", binary="dsh",
+        headless=("--profile", "agent", "--json"),
+        interactive=("--profile", "agent"),
+        session_flag=("--session-id",),
+    ),
+}
+#: nom de binaire par défaut, dérivé de la table (une seule source).
+DEFAULT_BIN = {key: spec.binary for key, spec in SPECS.items()}
 
 
 class HarnessMissing(RuntimeError):
@@ -77,17 +124,40 @@ def resolve_binary(harness: str, override: str | None = None) -> str:
 
 
 class HarnessAdapter:
-    """Un harnais = une commande + un lecteur de flux JSONL."""
+    """Un harnais = un descripteur de commande + un lecteur de flux JSONL."""
 
     key = ""
     resume = ""
 
     def __init__(self, binary: str | None = None):
+        spec = SPECS.get(self.key)
+        if spec is None:
+            raise HarnessMissing("harnais inconnu : %r (connus : %s)"
+                                 % (self.key, ", ".join(sorted(SPECS))))
+        self.spec = spec
         self.binary = resolve_binary(self.key, binary)
 
     # -- commande ----------------------------------------------------------
+    def _argv(self, base: tuple[str, ...], session_id: str | None,
+              text: str | None = None) -> list[str]:
+        argv = [self.binary, *base]
+        if session_id:
+            argv += [*self.spec.session_flag, session_id]
+        if text is not None:
+            argv.append(text)
+        return argv
+
     def command(self, text: str, session_id: str | None = None) -> list[str]:
-        raise NotImplementedError
+        """Ligne de commande d'un tour sans tête (le texte est la consigne)."""
+        return self._argv(self.spec.headless, session_id, text)
+
+    def interactive_command(self, session_id: str | None = None) -> list[str]:
+        """Commande d'une session **interactive** sur la même session (attach, C9).
+
+        Elle ne passe ni par `-p`/`exec` ni par `--json` : le harnais garde son
+        terminal et sa session, l'humain est devant.
+        """
+        return self._argv(self.spec.interactive, session_id)
 
     def env(self) -> dict[str, str]:
         return {}
@@ -110,16 +180,6 @@ class HarnessAdapter:
 class ClaudeAdapter(HarnessAdapter):
     key = "claude"
     resume = "claude -p --resume"
-
-    def command(self, text: str, session_id: str | None = None) -> list[str]:
-        argv = [
-            self.binary, "-p", "--output-format", "stream-json", "--verbose",
-            "--dangerously-skip-permissions",
-        ]
-        if session_id:
-            argv += ["--resume", session_id]
-        argv.append(text)
-        return argv
 
     def env(self) -> dict[str, str]:
         return {"CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"}
@@ -153,16 +213,6 @@ class CodexAdapter(HarnessAdapter):
     key = "codex"
     resume = "codex exec resume"
 
-    def command(self, text: str, session_id: str | None = None) -> list[str]:
-        argv = [
-            self.binary, "--dangerously-bypass-hook-trust", "exec",
-            "--dangerously-bypass-approvals-and-sandbox", "--json",
-        ]
-        if session_id:
-            argv += ["resume", session_id]
-        argv.append(text)
-        return argv
-
     def _parse_event(self, event: dict) -> dict:
         kind = event.get("type")
         out: dict = {}
@@ -186,13 +236,6 @@ class CodexAdapter(HarnessAdapter):
 class DeepseekAdapter(HarnessAdapter):
     key = "deepseek"
     resume = "dsh --session-id"
-
-    def command(self, text: str, session_id: str | None = None) -> list[str]:
-        argv = [self.binary, "--profile", "agent", "--json"]
-        if session_id:
-            argv += ["--session-id", session_id]
-        argv.append(text)
-        return argv
 
     def env(self) -> dict[str, str]:
         return {"DSH_PERMISSION_MODE": "danger-full-access"}

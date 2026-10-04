@@ -153,3 +153,12 @@ def message_payload(row: Any) -> dict:
         except ValueError:
             return {}
     return payload or {}
+
+
+def is_event(row: Any) -> bool:
+    return (row.get("kind") or "") == "event"
+
+
+def is_urgent(row: Any) -> bool:
+    """Un événement `urgent` perce le regroupement (C9)."""
+    return bool(message_payload(row).get("urgent"))

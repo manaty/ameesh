@@ -17,10 +17,9 @@ class MigrationsTest(PgTestCase):
         rows = self.db.query(
             "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
         )
-        self.assertEqual([row["version"] for row in rows], [1, 2, 3, 4, 5, 6, 7])
-        self.assertEqual([row["name"] for row in rows],
-                         ["init", "overview", "authority", "work_items", "key_roles",
-                          "authority_fixes", "nonces_backfill"])
+        attendues = migrations.discover()
+        self.assertEqual([row["version"] for row in rows], [m.version for m in attendues])
+        self.assertEqual([row["name"] for row in rows], [m.name for m in attendues])
         for row in rows:
             self.assertEqual(len(row["checksum"]), 64)
         # la vue d'observabilité et les deux triggers de notification existent
@@ -34,7 +33,7 @@ class MigrationsTest(PgTestCase):
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema = current_schema() AND table_name = 'agent_registry'")}
         self.assertTrue({"public_key", "public_key_fingerprint", "key_revoked_at",
-                         "key_role", "current_prompt"} <= colonnes)
+                         "key_role", "current_prompt", "last_event_at"} <= colonnes)
         colonnes = {row["column_name"] for row in self.db.query(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema = current_schema() AND table_name = 'agent_mailbox'")}
@@ -51,7 +50,7 @@ class MigrationsTest(PgTestCase):
     def test_remigration_idempotente(self):
         self.assertEqual(migrations.migrate(self.db), [])
         count = self.db.query("SELECT count(*)::int AS n FROM schema_migrations")[0]["n"]
-        self.assertEqual(count, 7)
+        self.assertEqual(count, len(migrations.discover()))
 
     def test_migration_modifiee_refusee(self):
         connue = migrations.discover()[0].checksum
@@ -85,7 +84,8 @@ class MigrationsTest(PgTestCase):
                 "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %s) AS ok", (schema,)
             )[0]["ok"])
             done = migrations.migrate(db)
-            self.assertEqual([m.version for m in done], [1, 2, 3, 4, 5, 6, 7])
+            self.assertEqual([m.version for m in done],
+                             [m.version for m in migrations.discover()])
             tables = db.query(
                 "SELECT count(*)::int AS n FROM information_schema.tables "
                 "WHERE table_schema = %s AND table_name IN ('agent_registry','agent_mailbox',"
@@ -155,7 +155,8 @@ class MigrationsTest(PgTestCase):
             #    enregistrée avant 0005 devient « agent » (moindre privilège) :
             #    l'acte explicite --role owner est rejoué, comme à la bascule.
             done = migrations.migrate(db)
-            self.assertEqual([m.version for m in done], [5, 6, 7])
+            self.assertEqual([m.version for m in done],
+                             [m.version for m in migrations.discover() if m.version >= 5])
             db.execute("UPDATE agent_registry SET key_role = 'owner' "
                        "WHERE name = 'proprietaire'")
             ledger = db.query(

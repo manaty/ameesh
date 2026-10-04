@@ -45,7 +45,8 @@ class FileBackend:
 
     # -- messages ----------------------------------------------------------
     def send(self, sender: str, dest: str, text: str, host: str | None = None,
-             signed: dict | None = None) -> list[str]:
+             signed: dict | None = None, kind: str = "notify",
+             urgent: bool = False) -> list[str]:
         # Le repli fichier ne stocke pas de signature (format v0 strict) : la
         # CLI prévient l'appelant, le message part quand même.
         if dest == "all":
@@ -63,6 +64,7 @@ class FileBackend:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(
                     {"from": sender, "to": target, "ts": now, "text": text,
+                     "kind": kind, "payload": {"urgent": True} if urgent else {},
                      "host": host or socket.gethostname()},
                     fh, ensure_ascii=False,
                 )
@@ -86,8 +88,8 @@ class FileBackend:
                 "to": msg.get("to", name),
                 "ts": msg.get("ts", 0),
                 "text": msg.get("text", ""),
-                "kind": "notify",
-                "payload": {},
+                "kind": msg.get("kind", "notify"),
+                "payload": msg.get("payload") or {},
                 "host": msg.get("host"),
                 "_file": filename,
             })
@@ -191,7 +193,8 @@ class PgBackend:
 
     # -- messages ----------------------------------------------------------
     def send(self, sender: str, dest: str, text: str, host: str | None = None,
-             signed: dict | None = None) -> list[str]:
+             signed: dict | None = None, kind: str = "notify",
+             urgent: bool = False) -> list[str]:
         if dest == "all":
             targets = [
                 row["name"]
@@ -203,7 +206,9 @@ class PgBackend:
         for target in targets:
             # `signed` vient de authority.sign_message : signature, payload,
             # nonce, horodatage et échéance signés.
-            mail.send(self.db, sender, target, text, host=host, **dict(signed or {}))
+            mail.send(self.db, sender, target, text, host=host, kind=kind,
+                      payload={"urgent": True} if urgent else None,
+                      **dict(signed or {}))
             registry.upsert(self.db, target, host=host)
         return targets
 

@@ -24,7 +24,8 @@ AGENT_COLUMNS = """
     lease_owner, lease_epoch,
     extract(epoch from lease_expires_at)::float8 as lease_expires_ts,
     extract(epoch from last_seen)::float8         as last_seen_ts,
-    extract(epoch from last_turn_at)::float8      as last_turn_ts
+    extract(epoch from last_turn_at)::float8      as last_turn_ts,
+    extract(epoch from last_event_at)::float8     as last_event_ts
 """
 
 
@@ -138,6 +139,61 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
         (owner, ttl_seconds, owner, owner, name, owner),
     )
     return rows[0] if rows else None
+
+
+def turn_in_progress(db: Db, name: str) -> bool:
+    """Un tour est-il en cours (consigne consommée, pas encore close) ?
+
+    `current_prompt` n'est effacé qu'à la clôture du tour : c'est le marqueur
+    fiable pour `ameesh attach`, qui refuse d'interrompre un tour.
+    """
+    rows = db.query(
+        "SELECT current_prompt IS NOT NULL AS en_cours FROM agent_registry WHERE name = %s",
+        (name,),
+    )
+    return bool(rows and rows[0]["en_cours"])
+
+
+def attach_claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
+    """Prend le bail pour une session interactive (`ameesh attach`).
+
+    Contrairement à `claim`, un bail vivant mais **sans tour en cours** peut
+    être repris : c'est ce qui suspend la réclamation automatique de l'agent
+    (l'ancien exécuteur est fencé par l'epoch à son prochain renouvellement).
+    Un tour en cours n'est jamais interrompu : renvoie None (l'appelant peut
+    attendre, `--wait`).
+    """
+    _check_name(name)
+    rows = db.query(
+        """
+        UPDATE agent_registry
+           SET lease_owner      = %s,
+               lease_expires_at = now() + make_interval(secs => %s),
+               lease_epoch      = lease_epoch + 1,
+               status           = 'running',
+               status_text      = 'session interactive (attach)',
+               updated_at       = now()
+         WHERE name = %s
+           AND status <> 'stopped'
+           AND current_prompt IS NULL
+         RETURNING name, lease_owner, lease_epoch,
+                   extract(epoch from lease_expires_at)::float8 as lease_expires_ts
+        """,
+        (owner, ttl_seconds, name),
+    )
+    return rows[0] if rows else None
+
+
+def mark_event_wake(db: Db, name: str) -> None:
+    """Note l'instant du dernier réveil d'événements (regroupement C9).
+
+    Cet état vit en base (et non dans l'exécuteur) : un redémarrage ne remet
+    pas à zéro la fenêtre de regroupement.
+    """
+    db.execute(
+        "UPDATE agent_registry SET last_event_at = now(), updated_at = now() WHERE name = %s",
+        (name,),
+    )
 
 
 def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]:

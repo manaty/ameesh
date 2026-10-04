@@ -72,6 +72,9 @@ class Config:
     lease_ttl: float = 300.0
     idle_nudge: float = 1200.0
     poll: float = 5.0
+    #: regroupement des événements (C9) : au plus un réveil par ce délai,
+    #: sauf événement `urgent`. 0 = aucun regroupement.
+    event_coalesce: float = 120.0
 
     @property
     def runner(self) -> str:
@@ -144,6 +147,8 @@ def load(env: dict | None = None) -> Config:
         lease_ttl=_as_float(pick("AMEESH_LEASE_TTL", "AGENT_MESH_LEASE_TTL"), cfg.lease_ttl),
         idle_nudge=_as_float(pick("AMEESH_IDLE_NUDGE", "AGENT_MESH_IDLE_NUDGE"), cfg.idle_nudge),
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
+        event_coalesce=_as_float(
+            pick("AMEESH_EVENT_COALESCE", "AGENT_MESH_EVENT_COALESCE"), cfg.event_coalesce),
     )
     if not SCHEMA_RE.match(cfg.schema):
         raise SystemExit("AGENT_MESH_SCHEMA invalide : %r" % cfg.schema)

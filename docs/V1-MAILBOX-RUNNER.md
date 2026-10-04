@@ -248,10 +248,24 @@ test (trois messages → trois notifications) a attrapé le bug.
   resume`, `dsh --profile agent --json --session-id`), lecture JSONL,
   capture de la session et du coût quand le harnais le donne
   (`total_cost_usd` pour Claude, `cost_usd` pour DeepSeek).
-* **Tours** : consigne en attente → messages non lus → relance d'inactivité
-  (mêmes textes que la v0). Le flux brut est journalisé dans
+* **Tours** : consigne en attente → messages non lus → événements → relance
+  d'inactivité (mêmes textes que la v0). Le flux brut est journalisé dans
   `~/.local/state/agent-mesh/<nom>/events.jsonl`, la session en base **et** sur
   disque (reprise après crash), stderr dans `stderr.log`.
+* **Événements (C9, `0012_events.sql`)** : un message `kind = 'event'` réveille
+  l'agent comme un message ; un lot d'événements n'en réveille qu'un par
+  `AMEESH_EVENT_COALESCE` secondes (défaut 120), sauf `payload.urgent`. L'instant
+  du dernier réveil vit en base (`agent_registry.last_event_at`) : un
+  redémarrage ne remet pas la fenêtre à zéro. Le courrier ordinaire n'est jamais
+  regroupé.
+* **`ameesh attach <agent>` (C9)** : prend le bail pour une session interactive
+  (`attach:<utilisateur>@<hôte>`), même sur un bail vivant **sans tour en
+  cours** — l'ancien exécuteur est fencé par l'epoch à son prochain
+  renouvellement, ce qui suspend la réclamation automatique. Un tour en cours
+  n'est jamais interrompu (`--wait` pour attendre). Le harnais est lancé en
+  interactif sur la **même session** (sans `-p`/`exec`/`--json`), le bail est
+  renouvelé tant que la session vit, le harnais est tué si le bail est perdu, et
+  le bail est rendu à la sortie.
 * **Chemin de reprise** : la session est relue depuis le registre, sinon depuis
   le fichier `session`.
 * **Binaire des harnais** : `AMEESH_<HARNAIS>_BIN`, puis

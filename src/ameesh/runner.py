@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import getpass
 import json
 import os
 import queue
@@ -440,14 +441,36 @@ class AgentWorker(threading.Thread):
         messages = mail.unread(self.db, self.name)
         if messages:
             self.nudged = False
-            return {
-                "kind": "mail",
-                "prompt": adapters.MAIL_PROMPT,
-                "ids": [int(m["id"]) for m in messages if m.get("id") is not None],
-            }
+            return self._mail_spec(messages)
         if self.idle_due():
             return {"kind": "idle", "prompt": adapters.IDLE_PROMPT, "ids": []}
         return None
+
+    def _mail_spec(self, messages: list[dict]) -> dict | None:
+        """Messages non remis -> un tour. Les événements seuls sont regroupés (C9).
+
+        Le courrier ordinaire réveille immédiatement ; un lot d'événements n'en
+        réveille qu'un par fenêtre `AMEESH_EVENT_COALESCE` (défaut 120 s), sauf
+        si l'un d'eux est `urgent`. L'instant du dernier réveil vit en base
+        (`agent_registry.last_event_at`) : un redémarrage ne remet pas la
+        fenêtre à zéro.
+        """
+        ids = [int(m["id"]) for m in messages if m.get("id") is not None]
+        events = [m for m in messages if mail.is_event(m)]
+        autres = [m for m in messages if not mail.is_event(m)]
+        if autres:
+            if events:
+                registry.mark_event_wake(self.db, self.name)
+            return {"kind": "mail", "prompt": adapters.MAIL_PROMPT, "ids": ids}
+        if not events:
+            return None
+        fenetre = self.runner.event_coalesce
+        dernier = float(self.agent.get("last_event_ts") or 0.0)
+        if any(mail.is_urgent(m) for m in events) or fenetre <= 0 \
+                or (time.time() - dernier) >= fenetre:
+            registry.mark_event_wake(self.db, self.name)
+            return {"kind": "event", "prompt": adapters.EVENT_PROMPT, "ids": ids}
+        return None  # fenêtre de regroupement en cours : on attend la suivante
 
     # -- un tour -----------------------------------------------------------
     def _adapter(self) -> adapters.HarnessAdapter:
@@ -465,7 +488,8 @@ class AgentWorker(threading.Thread):
 
         session = self.agent.get("session_id") or self.read_session_file()
         argv = adapter.command(spec["prompt"], session)
-        label = {"prompt": "consigne", "mail": "messages", "idle": "reprise"}[spec["kind"]]
+        label = {"prompt": "consigne", "mail": "messages", "event": "événements",
+                 "idle": "reprise"}[spec["kind"]]
         if self.runner.dry_run:
             log("[%s] tour %s (dry-run, session %s) : %s"
                 % (self.name, label, session or "neuve", " ".join(argv)))
@@ -595,7 +619,7 @@ class AgentWorker(threading.Thread):
             self.nudged = True
         with self.runner.lock:
             self.runner.turns += 1
-        if spec["kind"] == "mail" and ok and spec["ids"]:
+        if spec["kind"] in ("mail", "event") and ok and spec["ids"]:
             # Si le hook du harnais les a déjà remis, c'est un no-op.
             mail.mark_delivered(self.db, spec["ids"])
         return ok
@@ -673,6 +697,7 @@ class Runner:
         self.lease_ttl = cfg.lease_ttl
         self.idle_nudge = cfg.idle_nudge
         self.poll = max(1.0, cfg.poll)
+        self.event_coalesce = max(0.0, cfg.event_coalesce)
         self.failure_backoff = 5.0
         self.stop = threading.Event()
         self.wake_all = threading.Event()
@@ -861,6 +886,163 @@ def cmd_stop(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
     registry.set_status(db, args[0], "stopped", status_text="arrêté à la main")
     log("agent %s marqué arrêté" % args[0])
     return 0
+
+
+# --------------------------------------------------------------------------
+# attach : une session interactive qui prend le bail (C9)
+# --------------------------------------------------------------------------
+
+def attach_owner(host: str) -> str:
+    """Identité d'exécuteur d'une session attachée : distincte d'un runner."""
+    return "attach:%s@%s" % (getpass.getuser(), host)
+
+
+def _attach_env(cfg: Config, name: str, owner: str, epoch: int) -> dict:
+    """L'identité que le harnais interactif transmet à ses hooks."""
+    env = os.environ.copy()
+    env.update({
+        "AGENT_MAIL_NAME": name,
+        "AGENT_MAIL_STATE": cfg.v0_state,
+        "AGENT_MAIL_CONFIG": cfg.config_dir,
+        "AMEESH_DSN": cfg.dsn, "AGENT_MESH_DSN": cfg.dsn,
+        "AMEESH_SCHEMA": cfg.schema, "AGENT_MESH_SCHEMA": cfg.schema,
+        "AMEESH_STATE": cfg.state_dir, "AGENT_MESH_STATE": cfg.state_dir,
+        "AMEESH_HOST": cfg.host, "AGENT_MESH_HOST": cfg.host,
+        "AMEESH_RUNNER_ID": owner, "AGENT_MESH_RUNNER_ID": owner,
+        "AMEESH_LEASE_EPOCH": str(epoch), "AGENT_MESH_LEASE_EPOCH": str(epoch),
+    })
+    return env
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """SIGKILL du groupe du harnais (il est lancé dans sa propre session)."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
+def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
+               ttl: float | None = None) -> int:
+    """`ameesh attach <agent>` : bail interactif sur la même session (C9).
+
+    Le bail est pris même s'il est déjà détenu par un exécuteur **sans tour en
+    cours** : c'est ce qui suspend la réclamation automatique (l'ancien
+    exécuteur est fencé par l'epoch à son prochain renouvellement). Un tour en
+    cours n'est jamais interrompu : refus, ou attente avec `--wait`. Le bail est
+    renouvelé tant que la session vit, le harnais est arrêté si le bail est
+    perdu, et le bail est rendu à la sortie.
+    """
+    agent = registry.get(db, name)
+    if agent is None:
+        print("agent inconnu : %s" % name, file=sys.stderr)
+        return 1
+    if agent.get("status") == "stopped":
+        print("agent %s arrêté : rien à attacher" % name, file=sys.stderr)
+        return 1
+    if (agent.get("host") or "") != cfg.host:
+        print("agent %s épinglé à %s, pas à %s" % (name, agent.get("host") or "?", cfg.host),
+              file=sys.stderr)
+        return 1
+    try:
+        adapter = adapters.adapter_for(agent.get("harness") or "other")
+    except adapters.HarnessMissing as exc:
+        print("attach : %s" % exc, file=sys.stderr)
+        return 1
+    owner = attach_owner(cfg.host)
+    ttl = max(5.0, ttl or cfg.lease_ttl)
+    registry.reap(db, cfg.host)
+    while True:
+        lease = registry.attach_claim(db, name, owner, ttl)
+        if lease:
+            break
+        if not wait:
+            print("un tour est en cours pour %s (relancez avec --wait pour attendre)"
+                  % name, file=sys.stderr)
+            return 3
+        print("tour en cours pour %s : attente…" % name, file=sys.stderr, flush=True)
+        time.sleep(2.0)
+    epoch = int(lease["lease_epoch"])
+    log("[%s] bail attach pris (epoch %d)" % (name, epoch))
+    stop = threading.Event()
+    perdu = threading.Event()
+
+    def battement() -> None:
+        interval = max(3.0, ttl / 3.0)
+        while not stop.wait(interval):
+            try:
+                expires = registry.renew(db, name, owner, epoch, ttl)
+            except db_mod.DbError as exc:
+                log("[%s] attach : renouvellement en échec (%s)" % (name, exc))
+                continue
+            if expires is None:
+                log("[%s] attach : bail perdu" % name)
+                perdu.set()
+                return
+
+    thread = threading.Thread(target=battement, daemon=True, name="%s-attach" % name)
+    thread.start()
+    argv = adapter.interactive_command(agent.get("session_id"))
+    env = _attach_env(cfg, name, owner, epoch)
+    env.update(adapter.env())
+    cwd = agent.get("cwd") or None
+    if cwd and not os.path.isdir(cwd):
+        cwd = None
+    proc: subprocess.Popen | None = None
+    code = 0
+    try:
+        log("[%s] session interactive : %s" % (name, " ".join(argv)))
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True)
+        while proc.poll() is None:
+            if perdu.is_set():
+                log("[%s] attach : bail perdu, arrêt du harnais" % name)
+                _kill_group(proc)
+                break
+            time.sleep(0.2)
+        code = proc.wait()
+    except KeyboardInterrupt:
+        if proc is not None:
+            _kill_group(proc)
+            code = proc.wait()
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        try:
+            registry.release(db, name, owner, epoch)
+        except db_mod.DbError:
+            pass
+        log("[%s] bail attach rendu" % name)
+    return code
+
+
+def attach_main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    parser = argparse.ArgumentParser(
+        prog="ameesh attach",
+        description="Ouvrir une session interactive sur le bail d'un agent (C9).")
+    parser.add_argument("agent")
+    parser.add_argument("--wait", action="store_true",
+                        help="attendre la fin d'un tour en cours avant de prendre le bail")
+    parser.add_argument("--ttl", type=float, default=None, help="durée du bail en secondes")
+    parsed = parser.parse_args(argv)
+    cfg = load_config()
+    try:
+        db = db_mod.connect(cfg)
+    except db_mod.Unavailable as exc:
+        print("ameesh attach : base injoignable : %s" % exc, file=sys.stderr)
+        return 1
+    try:
+        try:
+            db_mod.require_schema(db)
+        except db_mod.SchemaMissing as exc:
+            print("ameesh attach : %s" % exc, file=sys.stderr)
+            return 1
+        return run_attach(cfg, db, parsed.agent, wait=parsed.wait, ttl=parsed.ttl)
+    finally:
+        db.close()
 
 
 def main(argv: list[str] | None = None) -> int:
