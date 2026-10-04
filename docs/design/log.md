@@ -1,6 +1,7 @@
 # Journal de la conception
 
 ## 2026-10-04 (v1)
+* **Vérification** : `scripts/test.sh` complet sur `main` 9ffb2e2 — 618 tests verts sur chacun des deux pilotes (psql : 5 sautés, psycopg : 2 sautés), base temporaire.
 * **Jalon** : v1 fonctionnellement complète sur `main` (d2611b0) — lots L2–L9 et L9b fusionnés après revue ; essai de bout en bout vert ; L1 proposé en v1.1.
 
 ## 2026-10-04 (critère d'adoption)

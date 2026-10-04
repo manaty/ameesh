@@ -72,3 +72,16 @@ verts, diff de 850 lignes contre 543 pour la référence (plus verbeux) ; la
 référence en effort élevé avait pris environ 14 min. Aucun gain de délai :
 **l'effort bas est écarté pour l'implémentation** (critère
 [0023](../decisions/0023-critere-d-adoption-des-reglages.md)).
+
+# Revue de code par un modèle bon marché (17:40)
+
+Rejeu isolé d'une revue réelle (lot bloqué par le relecteur Codex sur 2 défauts),
+avec DeepSeek flash en effort élevé : 6 min 17 s, ≈ 55k tokens en entrée (1,9M en
+cache) et 34k en sortie, une fraction de dollar. **Il retrouve les 2 défauts de
+référence**, avec la même analyse et des sondes exécutables ; il ajoute 1 faux
+positif (dû à une politique du projet qu'il ignorait) et 1 remarque juste non
+bloquante. Conclusion provisoire : **rappel égal, précision un peu moindre** sur
+cet échantillon. Suite : pilote en **double revue** sur des lots de classe
+normale avant tout transfert de responsabilité ; les revues sensibles restent
+aux relecteurs Codex et Claude. Implication pour ameesh : la politique du projet
+doit être fournie au relecteur (canon), pour éviter les faux positifs de ce type.
