@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-04 (vitesse et budgets)
+* **Décision** : [vitesse](decisions/0018-vitesse-des-agents.md) et [budgets](decisions/0019-budgets-et-routage.md) (transmises par l'orchestrateur Nexlink) ; exigences R19–R20 ; lots L10–L13.
+
 ## 2026-10-04 (revue codex3 de la spec, exposition)
 * **Correction** : [spécification](specification.md) — canon lu à la révision fusionnée de la branche canonique ; grant permanent à nonce unique puis réservations atomiques ; invariant de bail à marge d'ordonnancement près ; garantie de la porte limitée en v1.
 * **Décision** : [ameesh-approve via une page Nexlink](decisions/0017-approbation-via-page-nexlink.md).

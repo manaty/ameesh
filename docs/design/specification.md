@@ -412,6 +412,10 @@ client ; migrations réservées ci-dessous ; aucune dépense, aucun service publ
 | L7 | service `ameesh-approve` (C8) | L6 | — | codex3 |
 | L8 | événements, regroupement, `ameesh attach` (C9) | fin B5a | 0012 (`kind = event`) | codex3 |
 | L9 | bascule réécrite, documentation v1 (C11) | tous | — | codex |
+| L10 | politique de revue par classe de risque au canon ; métriques de délai par lot (R19) | L2 | 0013 | codex |
+| L11 | interruption de tour, rotation de session avec résumé, sessions robustes au déplacement (R19) | L8 | — | codex3 |
+| L12 | lecteurs de jauges de forfait, comptabilité par tour, `ameesh cost` (R20) | — | 0014 | codex |
+| L13 | garde de budget avant chaque tour, modèle et effort par harnais, `ameesh set` (R20) | L8, L12 | — | codex3 |
 
 Ordre : L2, L4 et L6 en parallèle dès maintenant (fichiers nouveaux) ; L1 et L8
 après la fusion de B5a (ils touchent `runner.py` et `registry.py`) ; puis L3,

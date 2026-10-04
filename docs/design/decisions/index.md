@@ -17,3 +17,5 @@
 * [Aucun client nommé ; interfaces publiques pour bâtir les façades](0015-interfaces-des-facades.md) - Applications tierces, dont mobiles natives, sans imposer Nexlink.
 * [Stockage : Postgres en v1, SQL derrière une interface, SQLite plus tard](0016-stockage.md) - Postgres installé par l'installateur en local ; pilote SQLite pour le mode perso ensuite.
 * [ameesh-approve joignable via une page Nexlink](0017-approbation-via-page-nexlink.md) - Exposition HTTPS du service d'approbation pour la bascule.
+* [Vitesse des agents](0018-vitesse-des-agents.md) - Revue par classe de risque, interruption, rotation de session, délais mesurés.
+* [Budgets et routage](0019-budgets-et-routage.md) - Modèle et effort par tâche, plafonds, jauges de forfait lues à la source.
