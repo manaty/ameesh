@@ -52,7 +52,7 @@ class MigrationsTest(PgTestCase):
     def test_remigration_idempotente(self):
         self.assertEqual(migrations.migrate(self.db), [])
         count = self.db.query("SELECT count(*)::int AS n FROM schema_migrations")[0]["n"]
-        self.assertEqual(count, 8)
+        self.assertEqual(count, len(migrations.discover()))
 
     def test_migration_modifiee_refusee(self):
         connue = migrations.discover()[0].checksum
