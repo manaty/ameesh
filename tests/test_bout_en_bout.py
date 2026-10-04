@@ -394,7 +394,8 @@ class BoutEnBoutTest(PgTestCase):
         self.assertIn("issues inconnues à trancher", proc.stdout)
         self.assertIn(action_id, proc.stdout)
         # aucune nouvelle tentative : ni exécution, ni nouvelle liaison du reçu
-        self.assertIn("[unknown]", self.run_mesh("action", "execute", action_id, rc=1).stderr)
+        self.assertIn("refus [state] : action %s : issue inconnue" % action_id,
+                      self.run_mesh("action", "execute", action_id, rc=1).stderr)
         self.run_mesh("action", "approve", action_id, "--receipt", receipt_path, rc=1)
         self.assertEqual(self.gh_calls("merge"), 1)
 

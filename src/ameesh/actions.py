@@ -88,11 +88,14 @@ _HUMAN_RE = re.compile(r"^human:%s$" % _NAME)
 _IDENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _CURRENCY_RE = re.compile(r"^[A-Z]{3}$")
 
-# codes de refus (stables) — en plus de ceux des reçus (receipts.*)
+# codes de refus (stables) — en plus de ceux des reçus (receipts.*). Un refus
+# dû à l'état de l'action est `state` (approuver, exécuter, annuler, réconcilier
+# hors de l'état voulu ; exécuter une action d'issue inconnue compris) ; seuls
+# `launched` (tentative en cours : course entre deux exécutions) et
+# `receipt_required` (action pas encore approuvée) le précisent.
 UNKNOWN_ACTION = "unknown_action"
 STATE = "state"
 LAUNCHED = "launched"
-UNKNOWN_OUTCOME = "unknown"
 DEDUPE = "dedupe"
 REPLACED = "replaced"
 RECEIPT_REQUIRED = "receipt_required"
@@ -920,7 +923,7 @@ def _refuse_state(action: dict) -> ActionError:
                            "appel ; attendre l'issue, ou l'échéance puis reconcile"
                            % (action_id, action["attempts"]))
     if state == "unknown":
-        return ActionError(UNKNOWN_OUTCOME, "action %s : issue inconnue, aucune nouvelle "
+        return ActionError(STATE, "action %s : issue inconnue, aucune nouvelle "
                            "tentative automatique (reconcile, retry si déduplication garantie, "
                            "ou décision humaine)" % action_id)
     if state == "proposed":

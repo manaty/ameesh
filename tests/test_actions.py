@@ -595,7 +595,7 @@ class ActionsCycleTest(ActionsBase):
                 row = self.get(action)
                 self.assertEqual(row["state"], "unknown")
                 self.assertTrue(row["last_error"])
-                self.refused(actions.UNKNOWN_OUTCOME, self.execute, action, connector)
+                self.refused(actions.STATE, self.execute, action, connector)
                 self.assertEqual(connector.calls, 1)
         # un échec n'est « certain » que si le connecteur le dit
         connector = Scripted(lambda: Outcome.failed("refus du système externe"))
@@ -730,7 +730,7 @@ class ActionsConcurrencyTest(ActionsBase):
         self.assertEqual(row["state"], "unknown")
         attempt, = actions.attempts(self.db, action["action_id"])
         self.assertEqual((attempt["state"], attempt["settled_by"]), ("unknown", "recover"))
-        self.refused(actions.UNKNOWN_OUTCOME, self.execute, action)
+        self.refused(actions.STATE, self.execute, action)
         self.assertEqual(self.noop.calls, [])                   # aucun appel automatique
         # shell-noop garantit la déduplication : nouvelle tentative, MÊME action_id
         actions.retry(self.db, action["action_id"], self.receipt(action), policy=POLICY, by=ALICE)
@@ -985,7 +985,7 @@ class ActionsUnknownTest(ActionsBase):
         self.approve(action, first)
         self.assertEqual(self.execute(action)["state"], "unknown")
         self.assertEqual(self.files(), [action["action_id"] + ".json"])  # l'effet a eu lieu
-        self.refused(actions.UNKNOWN_OUTCOME, self.execute, action)
+        self.refused(actions.STATE, self.execute, action)
         self.refused(receipts.REPLAY, actions.retry, self.db, action["action_id"], first,
                      policy=POLICY)
         self.refused(actions.RECEIPT_REQUIRED, actions.retry, self.db, action["action_id"], None,
@@ -1024,7 +1024,7 @@ class ActionsUnknownTest(ActionsBase):
         result = self.execute(action, lossy)
         self.assertEqual(result["state"], "unknown", result)
         self.assertEqual(len(lossy.calls), 1)
-        self.refused(actions.UNKNOWN_OUTCOME, self.execute, action, lossy)
+        self.refused(actions.STATE, self.execute, action, lossy)
         self.refused(actions.DEDUPE, actions.retry, self.db, action["action_id"],
                      self.receipt(action), connector=lossy, policy=POLICY)
         blind = self.gh(view="absent")
@@ -1280,7 +1280,7 @@ class ActionsUnknownTest(ActionsBase):
         self.assertIn("reconcile_none", self.event_names(action))
         self.refused(actions.DEDUPE, actions.retry, self.db, action["action_id"],
                      self.receipt(action), connector=self.gh(), policy=POLICY)
-        self.refused(actions.UNKNOWN_OUTCOME, self.execute, action, self.gh())
+        self.refused(actions.STATE, self.execute, action, self.gh())
         result = actions.reconcile(self.db, action["action_id"], self.gh(view="land"), by=ALICE)
         self.assertEqual((result["found"], result["state"]), (True, "confirmed"))
         self.assertEqual(result["external_ref"], self.pr()["mergeCommit"]["oid"])
@@ -1526,6 +1526,10 @@ class ActionsCliTest(ActionsBase):
                             env=self.cli_env(AMEESH_FAKE_GH_MODE="drop"))
         self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
         self.assertIn("unknown", proc.stdout)
+        # exécuter une action d'issue inconnue : refus d'état, code 1 (pas 4)
+        proc = self.run_cli("action", "execute", action_id)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("refus [state] : action %s : issue inconnue" % action_id, proc.stderr)
         proc = self.run_cli("action", "reconcile", action_id,
                             env=self.cli_env(AMEESH_FAKE_GH_VIEW="absent"))
         self.assertEqual(proc.returncode, 4, proc.stderr)
