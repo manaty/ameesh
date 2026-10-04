@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-04 (critère d'adoption)
+* **Décision** : [critère d'adoption des réglages](decisions/0023-critere-d-adoption-des-reglages.md).
+
 ## 2026-10-04 (auto-réparation)
 * **Décision** : [auto-réparation](decisions/0022-auto-reparation.md) et [étude](etudes/boucle-auto-reparation.md) ; R23 ; lots L18–L23.
 
