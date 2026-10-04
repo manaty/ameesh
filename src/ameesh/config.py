@@ -91,6 +91,9 @@ class Config:
     lease_ttl: float = 300.0
     idle_nudge: float = 1200.0
     poll: float = 5.0
+    #: regroupement des événements (C9) : au plus un réveil par ce délai,
+    #: sauf événement `urgent`. 0 = aucun regroupement.
+    event_coalesce: float = 120.0
     #: racine des fils lisibles (transport `file`) ; vide = `<state_dir>/fils`
     threads_dir: str = ""
     #: projet par défaut d'un message dont ni l'expéditeur ni le destinataire
@@ -200,6 +203,8 @@ def load(env: dict | None = None) -> Config:
         lease_ttl=_as_float(pick("AMEESH_LEASE_TTL", "AGENT_MESH_LEASE_TTL"), cfg.lease_ttl),
         idle_nudge=_as_float(pick("AMEESH_IDLE_NUDGE", "AGENT_MESH_IDLE_NUDGE"), cfg.idle_nudge),
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
+        event_coalesce=_as_float(
+            pick("AMEESH_EVENT_COALESCE", "AGENT_MESH_EVENT_COALESCE"), cfg.event_coalesce),
         threads_dir=_expand(threads_brut) if threads_brut else "",
         project=pick("AMEESH_PROJECT", default=cfg.project) or "",
         humans=pick("AMEESH_HUMANS", default=cfg.humans) or "",

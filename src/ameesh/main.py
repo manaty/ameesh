@@ -7,6 +7,8 @@
         trois harnais l'appellent) ;
   ameesh run [options]        l'exécuteur de la machine ; `agent-runner` reste
         un alias ;
+  ameesh attach <agent> [--wait] [--ttl S]
+        une session interactive sur le bail de l'agent, même session (C9) ;
   ameesh list | show          observabilité (hôte, bail, non-lus, budget, clé) ;
   ameesh key …                clés publiques (propriétaire / agent) ;
   ameesh approve | approvals | verify   approbations signées ;
@@ -52,6 +54,9 @@ def main(argv: list[str] | None = None) -> int:
     if command == "run":
         from . import runner
         return runner.main(rest)
+    if command == "attach":
+        from . import runner
+        return runner.attach_main(rest)
     if command == "fil":
         from . import fil
         return fil.main(rest)

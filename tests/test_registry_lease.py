@@ -311,6 +311,91 @@ class RegistryTest(PgTestCase):
         registry.set_session(self.db, "alpha", "sess-42")
         self.assertEqual(registry.get(self.db, "alpha")["session_id"], "sess-42")
 
+    def test_echeance_recontrolee_apres_le_verrou(self):
+        """Grille codex3 (L6) : une échéance se recontrôle avec
+        `clock_timestamp()` **après** le dernier verrou. Un renouvellement qui
+        attend un verrou pendant que le bail expire doit être refusé.
+        """
+        if self.db.name != "psycopg":
+            self.skipTest("verrou tenu entre deux ordres : connexion persistante requise")
+        registry.upsert(self.db, "bail", harness="claude", host=self.cfg.host)
+        lease = registry.claim(self.db, "bail", "runner-1", 0.4)
+        self.assertIsNotNone(lease)
+        bloqueur = self.connect()
+        resultat: list = []
+        try:
+            bloqueur.execute("BEGIN")
+            bloqueur.execute(
+                "UPDATE agent_registry SET updated_at = now() WHERE name = 'bail'")
+            thread = threading.Thread(
+                target=lambda: resultat.append(registry.renew(
+                    self.db, "bail", "runner-1", int(lease["lease_epoch"]), 30)),
+                daemon=True)
+            thread.start()
+            time.sleep(0.8)  # le bail expire pendant que le renouvellement attend
+            bloqueur.execute("COMMIT")
+            thread.join(timeout=5)
+            self.assertEqual(resultat, [None],
+                             "un bail expiré pendant l'attente du verrou a été renouvelé")
+        finally:
+            try:
+                bloqueur.execute("ROLLBACK")
+            except Exception:
+                pass
+            bloqueur.close()
+
+    def test_echeance_recontrolee_apres_select_for_update_sans_modification(self):
+        """Sonde codex3 L8 B3 : le détenteur ne fait qu'un `SELECT ... FOR UPDATE`
+        (aucune modification), donc le `WHERE` d'un UPDATE n'est pas réévalué
+        après l'attente. Le verrou explicite puis le recontrôle
+        `clock_timestamp()` doivent refuser le renouvellement et la consommation
+        de consigne sous un bail expiré.
+        """
+        if self.db.name != "psycopg":
+            self.skipTest("verrou tenu entre deux ordres : connexion persistante requise")
+        registry.upsert(self.db, "bail", harness="claude", host=self.cfg.host)
+        lease = registry.claim(self.db, "bail", "runner-1", 0.4)
+        self.assertIsNotNone(lease)
+        registry.set_pending_prompt(self.db, "bail", "consigne en attente")
+        bloqueur = self.connect()
+        epoch = int(lease["lease_epoch"])
+        try:
+            resultat: list = []
+            bloqueur.execute("BEGIN")
+            bloqueur.execute(
+                "SELECT name FROM agent_registry WHERE name = 'bail' FOR UPDATE")
+            thread = threading.Thread(
+                target=lambda: resultat.append(
+                    registry.renew(self.db, "bail", "runner-1", epoch, 30)),
+                daemon=True)
+            thread.start()
+            time.sleep(0.8)  # le bail expire pendant que le renouvellement attend
+            bloqueur.execute("COMMIT")
+            thread.join(timeout=5)
+            self.assertEqual(resultat, [None],
+                             "un bail expiré sous SELECT FOR UPDATE a été renouvelé")
+
+            resultat2: list = []
+            bloqueur.execute("BEGIN")
+            bloqueur.execute(
+                "SELECT name FROM agent_registry WHERE name = 'bail' FOR UPDATE")
+            thread2 = threading.Thread(
+                target=lambda: resultat2.append(
+                    registry.take_pending_prompt(self.db, "bail", "runner-1", epoch)),
+                daemon=True)
+            thread2.start()
+            time.sleep(0.8)
+            bloqueur.execute("COMMIT")
+            thread2.join(timeout=5)
+            self.assertEqual(resultat2, [None],
+                             "une consigne a été consommée sous un bail expiré")
+        finally:
+            try:
+                bloqueur.execute("ROLLBACK")
+            except Exception:
+                pass
+            bloqueur.close()
+
 
 if __name__ == "__main__":
     unittest.main()
