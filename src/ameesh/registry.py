@@ -473,6 +473,43 @@ def set_session(db: Db, name: str, session_id: str) -> None:
     )
 
 
+def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
+    """Oublie la session (rotation, 0018), **fencé par un bail valide**.
+
+    Renvoie False si le bail n'est plus le nôtre ou s'il a expiré : un
+    remplaçant a pu réclamer l'agent et ouvrir sa propre session, qu'il ne faut
+    pas effacer (verdicts codex3 L11 B3). Le verrou est pris d'abord et
+    l'échéance est recontrôlée avec `clock_timestamp()` dans l'écriture, comme
+    les autres opérations de bail.
+    """
+    rows = db.query(
+        """
+        WITH verrou AS (
+            SELECT name, lease_owner, lease_epoch, lease_expires_at
+              FROM agent_registry WHERE name = %s FOR UPDATE
+        )
+        UPDATE agent_registry AS r
+           SET session_id = NULL, updated_at = now()
+          FROM verrou
+         WHERE r.name = verrou.name
+           AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+           AND verrou.lease_expires_at > clock_timestamp()
+        RETURNING r.name
+        """,
+        (name, owner, epoch),
+    )
+    return bool(rows)
+
+
+def cwd_used(db: Db, cwd: str, exclude: str) -> bool:
+    """Ce dossier de travail est-il déjà celui d'un autre agent ? (0018)"""
+    rows = db.query(
+        "SELECT 1 AS ok FROM agent_registry WHERE cwd = %s AND name <> %s LIMIT 1",
+        (cwd, exclude),
+    )
+    return bool(rows)
+
+
 def set_status(
     db: Db, name: str, status: str, status_text: str | None = None, error: str | None = None
 ) -> None:

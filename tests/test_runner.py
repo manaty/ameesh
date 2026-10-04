@@ -914,6 +914,11 @@ class RunnerTest(PgTestCase):
             def terminate(self, grace=None, hard=False):
                 ordre.append(("terminate", hard))
 
+            def stop_group_now(self, reason, grace=None, hard=False):
+                # point de passage unique : le double enregistre l'ordre réel
+                ordre.append(("stop", reason, hard))
+                self.terminate(grace=grace, hard=hard)
+
             def join(self, timeout=None):
                 pass
 

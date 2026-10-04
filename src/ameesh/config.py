@@ -54,6 +54,11 @@ def _as_float(value, default: float) -> float:
         return default
 
 
+def _as_names(value) -> tuple[str, ...]:
+    """Liste de noms séparés par des virgules -> tuple propre (ordre gardé)."""
+    return tuple(n.strip() for n in str(value or "").split(",") if n.strip())
+
+
 def _as_bool(value, default: bool | None, name: str) -> bool | None:
     """Booléen d'environnement ou de configuration ; une valeur illisible est une erreur."""
     if value is None or value == "":
@@ -94,6 +99,18 @@ class Config:
     #: regroupement des événements (C9) : au plus un réveil par ce délai,
     #: sauf événement `urgent`. 0 = aucun regroupement.
     event_coalesce: float = 120.0
+    #: périodicité de `canon sync` par l'exécuteur (spec §4.4) ; 0 = seulement
+    #: au démarrage. Sans canon configuré, rien n'est lancé.
+    canon_sync_interval: float = 300.0
+    #: expéditeurs autorisés à interrompre un tour (0018, R19) ; sans canon,
+    #: c'est la seule autorisation. Vide = personne.
+    interrupt_senders: tuple[str, ...] = ()
+    #: rotation de session (0018) : taille de contexte et latence des tours
+    session_max_tokens: float = 150000.0
+    session_max_turn_seconds: float = 900.0
+    session_min_turns: int = 3
+    #: racines fouillées pour retrouver un dossier de travail déplacé (0018)
+    worktree_roots: tuple[str, ...] = (_expand("~/development"),)
     #: racine des fils lisibles (transport `file`) ; vide = `<state_dir>/fils`
     threads_dir: str = ""
     #: projet par défaut d'un message dont ni l'expéditeur ni le destinataire
@@ -211,6 +228,25 @@ def load(env: dict | None = None) -> Config:
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
         event_coalesce=_as_float(
             pick("AMEESH_EVENT_COALESCE", "AGENT_MESH_EVENT_COALESCE"), cfg.event_coalesce),
+        canon_sync_interval=_as_float(
+            pick("AMEESH_CANON_SYNC_INTERVAL", "AGENT_MESH_CANON_SYNC_INTERVAL"),
+            cfg.canon_sync_interval),
+        interrupt_senders=_as_names(
+            pick("AMEESH_INTERRUPT_SENDERS", "AGENT_MESH_INTERRUPT_SENDERS")
+        ) or cfg.interrupt_senders,
+        session_max_tokens=_as_float(
+            pick("AMEESH_SESSION_MAX_TOKENS", "AGENT_MESH_SESSION_MAX_TOKENS"),
+            cfg.session_max_tokens),
+        session_max_turn_seconds=_as_float(
+            pick("AMEESH_SESSION_MAX_TURN_SECONDS", "AGENT_MESH_SESSION_MAX_TURN_SECONDS"),
+            cfg.session_max_turn_seconds),
+        session_min_turns=int(_as_float(
+            pick("AMEESH_SESSION_MIN_TURNS", "AGENT_MESH_SESSION_MIN_TURNS"),
+            cfg.session_min_turns)),
+        worktree_roots=tuple(
+            _expand(n) for n in _as_names(
+                pick("AMEESH_WORKTREE_ROOTS", "AGENT_MESH_WORKTREE_ROOTS"))
+        ) or cfg.worktree_roots,
         threads_dir=_expand(threads_brut) if threads_brut else "",
         project=pick("AMEESH_PROJECT", default=cfg.project) or "",
         humans=pick("AMEESH_HUMANS", default=cfg.humans) or "",

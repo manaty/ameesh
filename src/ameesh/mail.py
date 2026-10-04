@@ -119,6 +119,28 @@ def unread(db: Db, recipient: str, limit: int = 200) -> list[dict]:
     )
 
 
+def unread_urgent(db: Db, recipient: str, limit: int = 50) -> list[dict]:
+    """Messages non remis marqués `payload.urgent` (interruption de tour, 0018)."""
+    return db.query(
+        """
+        SELECT %s
+        FROM agent_mailbox
+        WHERE recipient = %%s AND delivered_at IS NULL
+          AND payload @> '{"urgent": true}'::jsonb
+        ORDER BY id
+        LIMIT %%s
+        """ % MAIL_COLUMNS,
+        (recipient, int(limit)),
+    )
+
+
+def get(db: Db, message_id: int) -> dict | None:
+    """Un message par son id (l'écouteur NOTIFY ne porte que l'id)."""
+    rows = db.query("SELECT %s FROM agent_mailbox WHERE id = %%s" % MAIL_COLUMNS,
+                    (int(message_id),))
+    return rows[0] if rows else None
+
+
 def mark_delivered(db: Db, ids: Sequence[int]) -> int:
     """Marque remis (le hook les a injectés, ou l'exécuteur a fini son tour)."""
     clean = sorted({int(i) for i in ids})
