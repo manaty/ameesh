@@ -7,15 +7,27 @@
   recommandé : la fusion échoue si la PR a bougé depuis l'approbation),
   `delete_branch` (booléen) ;
 * `dedupe = none` : `gh pr merge` n'a pas de clé d'idempotence ;
-* réconciliation : `gh pr view --json state,mergeCommit` — `MERGED` →
-  `confirmed` (réf. = SHA du commit de fusion), `OPEN` ou `CLOSED` →
-  `failed` (la fusion n'a pas eu lieu), lecture impossible → `None`.
+* réconciliation : `gh pr view --json state,mergeCommit`.
 
-Issue d'un appel : code 0 → `confirmed` ; code non nul → on relit l'état de
-la PR, `MERGED` → `confirmed`, sinon `unknown` (une erreur réseau après
-l'envoi ne prouve pas l'absence d'effet : c'est la réconciliation, plus tard,
-qui tranche) ; délai dépassé → `unknown` ; binaire introuvable → `failed`
-(rien n'a été lancé).
+Règle (R5 : jamais d'issue présumée) — `confirmed` seulement sur PREUVE
+certaine : la PR est `MERGED` avec un commit de fusion (réf. = son SHA).
+`failed` seulement sur échec CERTAIN : refus explicite et documenté de gh
+ou de GitHub (`is not mergeable` — contrôle préalable de gh, la mutation
+n'est pas envoyée —, `Head branch was modified`, `Could not resolve to a
+PullRequest`), ou PR `CLOSED` sans fusion après une erreur (une PR fermée
+sort de la file de fusion et ne peut plus être fusionnée). Tout le reste
+reste `unknown`, et la réconciliation ultérieure tranche :
+
+* code 0 mais PR `OPEN` : file de fusion (merge queue) ou fusion automatique,
+  la fusion n'a pas (encore) eu lieu — elle peut encore avoir lieu ;
+* code non nul sans refus explicite (coupure, réponse perdue) et PR `OPEN`
+  ou illisible : la demande a peut-être été reçue (mise en file) ;
+* délai dépassé ; PR `MERGED` sans commit de fusion lisible.
+
+À la réconciliation : `MERGED` avec commit → `confirmed` ; `CLOSED` sans
+fusion → `failed` ; `OPEN` → l'issue reste inconnue (une PR ouverte ne
+prouve pas l'absence d'effet : elle peut être en file de fusion) ; lecture
+impossible → `None`. Binaire introuvable → `failed` (rien n'a été lancé).
 
 Le binaire est résolu par `AMEESH_GH_BIN`, puis `AMEESH_BIN_DIR/gh`, puis le
 PATH : les tests utilisent un faux `gh`, jamais le vrai.
@@ -33,6 +45,13 @@ from . import Action, ConnectorError, Outcome
 _TARGET_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.-]{0,99})/([A-Za-z0-9_.-]{1,100})#([1-9][0-9]{0,9})$")
 _SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 METHODS = ("merge", "squash", "rebase")
+#: refus explicites et documentés de `gh pr merge` : la demande de fusion n'a
+#: pas été envoyée (contrôle préalable de gh) ou GitHub l'a rejetée — aucun effet
+REFUSALS = (
+    re.compile(r"pull request (?:\S+ )?is not mergeable", re.I),  # gh / GitHub : non fusionnable
+    re.compile(r"head branch was modified", re.I),                # --match-head-commit dépassé
+    re.compile(r"could not resolve to a pullrequest", re.I),      # PR inexistante
+)
 BIN_ENV = ("AMEESH_GH_BIN", "AGENT_MESH_GH_BIN")
 BIN_DIR_ENV = ("AMEESH_BIN_DIR", "AGENT_MESH_BIN_DIR")
 
@@ -105,11 +124,22 @@ class GitMergeConnector:
         return data
 
     @staticmethod
-    def _merge_ref(view: dict) -> str | None:
+    def _merge_ref(view: dict | None) -> str | None:
+        """SHA du commit de fusion si la PR est `MERGED` : la seule preuve certaine."""
+        if not view or view.get("state") != "MERGED":
+            return None
         commit = view.get("mergeCommit")
-        if isinstance(commit, dict) and isinstance(commit.get("oid"), str):
+        if isinstance(commit, dict) and isinstance(commit.get("oid"), str) \
+                and _SHA_RE.fullmatch(commit["oid"]):
             return commit["oid"]
         return None
+
+    @staticmethod
+    def _seen(view: dict | None) -> str:
+        if view is None:
+            return "illisible"
+        return {"OPEN": "ouverte", "CLOSED": "fermée sans fusion",
+                "MERGED": "MERGED sans commit de fusion lisible"}[view["state"]]
 
     # -- protocole ---------------------------------------------------------
     def execute(self, action: Action, idempotency_key: str) -> Outcome:
@@ -146,15 +176,28 @@ class GitMergeConnector:
         except OSError as exc:
             return Outcome.unknown("gh pr merge : %s" % exc)
         view = self.view(repo, number)
+        pr = "PR %s#%d" % (repo, number)
+        merged = self._merge_ref(view)
+        if merged:
+            return Outcome.confirmed(merged, "%s fusionnée (commit %s)%s" % (
+                pr, merged[:12],
+                " malgré le code %d" % proc.returncode if proc.returncode else ""))
+        output = " ".join((proc.stderr or proc.stdout or "").split())[:500] or "—"
         if proc.returncode == 0:
-            return Outcome.confirmed(self._merge_ref(view) if view else None,
-                                     "PR %s#%d fusionnée" % (repo, number))
-        if view and view.get("state") == "MERGED":
-            return Outcome.confirmed(self._merge_ref(view),
-                                     "PR %s#%d fusionnée (malgré le code %d)"
-                                     % (repo, number, proc.returncode))
-        error = " ".join((proc.stderr or proc.stdout or "").split())[:500]
-        return Outcome.unknown("gh pr merge : code %d : %s" % (proc.returncode, error or "—"))
+            # file de fusion, fusion automatique : gh a répondu, la fusion n'a pas
+            # (encore) eu lieu et peut encore avoir lieu
+            return Outcome.unknown("gh pr merge : code 0 mais %s %s, fusion non constatée "
+                                   "(file de fusion ?) : issue inconnue, la réconciliation "
+                                   "tranchera — %s" % (pr, self._seen(view), output))
+        if any(pattern.search(proc.stderr or "") for pattern in REFUSALS):
+            return Outcome.failed("gh pr merge : refus explicite (code %d) : %s"
+                                  % (proc.returncode, output))
+        if view is not None and view["state"] == "CLOSED":
+            return Outcome.failed("%s fermée sans fusion (gh pr merge : code %d : %s)"
+                                  % (pr, proc.returncode, output))
+        return Outcome.unknown("gh pr merge : code %d, %s %s : issue inconnue, la "
+                               "réconciliation tranchera — %s"
+                               % (proc.returncode, pr, self._seen(view), output))
 
     def reconcile(self, action: Action) -> Outcome | None:
         try:
@@ -164,8 +207,12 @@ class GitMergeConnector:
         view = self.view(repo, number)
         if view is None:
             return None
-        state = view["state"]
-        if state == "MERGED":
-            return Outcome.confirmed(self._merge_ref(view), "PR %s#%d fusionnée" % (repo, number))
-        return Outcome.failed("PR %s#%d %s : la fusion n'a pas eu lieu"
-                              % (repo, number, "ouverte" if state == "OPEN" else "fermée"))
+        pr = "PR %s#%d" % (repo, number)
+        merged = self._merge_ref(view)
+        if merged:
+            return Outcome.confirmed(merged, "%s fusionnée (commit %s)" % (pr, merged[:12]))
+        if view["state"] == "CLOSED":
+            return Outcome.failed("%s fermée sans fusion : la fusion n'a pas eu lieu" % pr)
+        # OPEN : peut-être en file de fusion, la fusion peut encore avoir lieu
+        return Outcome.unknown("%s %s : fusion non constatée (file de fusion ?), issue "
+                               "toujours inconnue" % (pr, self._seen(view)))

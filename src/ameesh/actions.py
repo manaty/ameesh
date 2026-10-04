@@ -787,6 +787,7 @@ def reconcile(db: Db, action_id: str, connector, *, by: str = "", force: bool = 
     if found is None:
         why = ("délai dépassé" if not done else
                "%s : %s" % (type(error).__name__, _one_line(error)) if error is not None else
+               value.detail if isinstance(value, Outcome) and value.detail else
                "introuvable")
         _event(db, action, "reconcile_none", by,
                "réconciliation sans résultat (%s) : décision humaine requise" % why)

@@ -164,9 +164,23 @@ class ActionsBase(PgTestCase):
             env["AMEESH_FAKE_GH_VIEW"] = view
         return Counting(GitMergeConnector(gh=FAKE_GH, env=env, timeout=timeout))
 
-    def pr(self) -> dict:
+    def pr(self, key: str = PR) -> dict:
         with open(self.gh_state, encoding="utf-8") as fh:
-            return json.load(fh)["prs"][PR]
+            return json.load(fh)["prs"][key]
+
+    def set_pr(self, key: str = PR, **fields) -> None:
+        with open(self.gh_state, encoding="utf-8") as fh:
+            state = json.load(fh)
+        state["prs"].setdefault(key, {"state": "OPEN", "mergeCommit": None}).update(fields)
+        with open(self.gh_state, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+
+    def merge_calls(self) -> int:
+        """Demandes de fusion soumises au faux gh (toutes actions confondues)."""
+        if not os.path.exists(self.gh_log):
+            return 0
+        with open(self.gh_log, encoding="utf-8") as fh:
+            return sum(1 for line in fh if json.loads(line)["argv"][1] == "merge")
 
     def register_grant(self, max_amount: int = 100) -> int:
         standing = {"connector": "shell-noop", "operations": ["refund"], "class": "costly",
@@ -881,21 +895,99 @@ class ActionsUnknownTest(ActionsBase):
         consumed = sum(1 for r in decisions if self.nonce_consumed(r))
         self.assertEqual(consumed, 1)
 
-    def test_git_merge_reconcile_ouverte_puis_nouvelle_tentative(self):
+    def test_git_merge_reconcile_ouverte_reste_inconnue_fermee_echoue(self):
         lossy = self.gh(mode="drop")
         action = self.propose("merge", connector=lossy, target=PR, args={"method": "squash"})
         self.approve(action)
         self.assertEqual(self.execute(action, lossy)["state"], "unknown")
+        # PR ouverte : la demande perdue est peut-être en file de fusion, rien de certain
+        result = actions.reconcile(self.db, action["action_id"], self.gh(), by=ALICE)
+        self.assertEqual((result["found"], result["state"]), (False, "unknown"))
+        self.assertIn("ouverte", result["detail"])
+        self.assertEqual(self.get(action)["state"], "unknown")
+        self.refused(actions.DEDUPE, actions.retry, self.db, action["action_id"],
+                     self.receipt(action), connector=self.gh(), policy=POLICY)
+        # PR fermée sans fusion : la fusion n'a pas eu lieu et ne peut plus avoir lieu
+        self.set_pr(state="CLOSED")
         result = actions.reconcile(self.db, action["action_id"], self.gh(), by=ALICE)
         self.assertEqual((result["found"], result["state"]), (True, "failed"))
-        self.assertIn("ouverte", result["detail"])
+        self.assertIn("fermée sans fusion", result["detail"])
+        self.assertEqual(self.merge_calls(), 1)
+
+    def test_git_merge_file_de_fusion_reste_inconnue_jusqu_a_la_fusion(self):
+        """`gh pr merge` code 0 mais PR OPEN (file de fusion) : pas une preuve."""
+        queued = self.gh(mode="queue")
+        action = self.propose("merge", connector=queued, target=PR)
+        self.approve(action)
+        result = self.execute(action, queued)
+        self.assertEqual((result["state"], result["external_ref"]), ("unknown", None), result)
+        self.assertIn("file de fusion", result["detail"])
+        self.assertEqual(self.pr()["state"], "OPEN")
+        # toujours en file : la réconciliation ne tranche pas, aucune nouvelle soumission
+        result = actions.reconcile(self.db, action["action_id"], self.gh(), by=ALICE)
+        self.assertEqual((result["found"], result["state"]), (False, "unknown"))
+        self.refused(actions.DEDUPE, actions.retry, self.db, action["action_id"],
+                     self.receipt(action), connector=self.gh(), policy=POLICY)
+        # la file aboutit : MERGED avec son commit de fusion → confirmed
+        result = actions.reconcile(self.db, action["action_id"], self.gh(view="land"), by=ALICE)
+        self.assertEqual((result["found"], result["state"]), (True, "confirmed"))
+        oid = self.pr()["mergeCommit"]["oid"]
+        self.assertEqual(result["external_ref"], oid)
+        row = self.get(action)
+        self.assertEqual((row["state"], row["external_ref"]), ("confirmed", oid))
+        self.assertEqual((self.pr()["merges"], self.merge_calls()), (1, 1))
+
+    def test_git_merge_reponse_perdue_puis_ouverte_puis_fusionnee(self):
+        """Réponse perdue, PR encore OPEN (mise en file) : jamais `failed`, donc
+        jamais de seconde soumission ; la fusion arrive plus tard."""
+        lost = self.gh(mode="queue-lose")
+        action = self.propose("merge", connector=lost, target=PR)
+        self.approve(action)
+        self.assertEqual(self.execute(action, lost)["state"], "unknown")
+        result = actions.reconcile(self.db, action["action_id"], self.gh(), by=ALICE)
+        self.assertEqual((result["found"], result["state"]), (False, "unknown"))
+        self.assertEqual(self.get(action)["state"], "unknown")
+        self.assertIn("reconcile_none", self.event_names(action))
+        self.refused(actions.DEDUPE, actions.retry, self.db, action["action_id"],
+                     self.receipt(action), connector=self.gh(), policy=POLICY)
+        self.refused(actions.UNKNOWN_OUTCOME, self.execute, action, self.gh())
+        result = actions.reconcile(self.db, action["action_id"], self.gh(view="land"), by=ALICE)
+        self.assertEqual((result["found"], result["state"]), (True, "confirmed"))
+        self.assertEqual(result["external_ref"], self.pr()["mergeCommit"]["oid"])
+        self.assertEqual((self.pr()["merges"], self.merge_calls()), (1, 1))
+
+    def test_git_merge_confirmed_sur_preuve_failed_sur_echec_certain(self):
+        # refus explicite et documenté de gh (contrôle préalable) : échec certain
+        refused = self.gh(mode="refuse")
+        action = self.propose("merge", connector=refused, target=PR)
+        self.approve(action)
+        result = self.execute(action, refused)
+        self.assertEqual(result["state"], "failed", result)
+        self.assertIn("refus explicite", result["detail"])
         ok = self.gh()
         actions.retry(self.db, action["action_id"], self.receipt(action), connector=ok,
                       policy=POLICY, by=ALICE)
         result = self.execute(action, ok)
         self.assertEqual((result["state"], result["attempt"]), ("confirmed", 2))
         self.assertEqual(result["external_ref"], self.pr()["mergeCommit"]["oid"])
-        self.assertEqual(self.pr()["merges"], 1)
+        # erreur, puis PR fermée sans fusion : échec certain
+        self.set_pr("o/r#13", state="CLOSED")
+        closed = self.propose("merge", connector=ok, target="o/r#13")
+        self.approve(closed)
+        result = self.execute(closed, ok)
+        self.assertEqual(result["state"], "failed", result)
+        self.assertIn("fermée sans fusion", result["detail"])
+        # code 0 mais PR illisible : pas de preuve, l'issue reste inconnue
+        self.set_pr("o/r#14")
+        blind = self.gh(view="absent")
+        unread = self.propose("merge", connector=blind, target="o/r#14")
+        self.approve(unread)
+        result = self.execute(unread, blind)
+        self.assertEqual((result["state"], result["external_ref"]), ("unknown", None), result)
+        self.assertEqual(self.pr("o/r#14")["state"], "MERGED")
+        result = actions.reconcile(self.db, unread["action_id"], ok, by=ALICE)
+        self.assertEqual((result["state"], result["external_ref"]),
+                         ("confirmed", self.pr("o/r#14")["mergeCommit"]["oid"]))
 
     def test_git_merge_reponse_perdue_apres_effet(self):
         lose = self.gh(mode="lose")
@@ -906,14 +998,15 @@ class ActionsUnknownTest(ActionsBase):
         self.assertEqual(result["external_ref"], self.pr()["mergeCommit"]["oid"])
 
     def test_git_merge_delai_depasse(self):
-        env_hang = self.gh(mode="hang", timeout=1.0)
-        env_hang.inner.env["AMEESH_FAKE_GH_SLEEP"] = "5"
+        env_hang = self.gh(mode="hang", timeout=3.0)
+        env_hang.inner.env["AMEESH_FAKE_GH_SLEEP"] = "10"
         action = self.propose("merge", connector=env_hang, target=PR)
         self.approve(action)
         started = time.monotonic()
         result = self.execute(action, env_hang)
         self.assertEqual(result["state"], "unknown")
-        self.assertLess(time.monotonic() - started, 4.5)
+        self.assertLess(time.monotonic() - started, 8.0)
+        self.wait_for(lambda: self.pr()["state"] == "MERGED")  # l'effet a eu lieu
         result = actions.reconcile(self.db, action["action_id"], self.gh(), by=ALICE)
         self.assertEqual(result["state"], "confirmed")
 

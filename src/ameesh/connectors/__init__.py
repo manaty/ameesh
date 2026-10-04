@@ -15,7 +15,9 @@ Un connecteur déclare :
   CERTAIN, aucun effet) ou `unknown`. Dans le doute : `unknown`, jamais
   `failed` ;
 * `reconcile(action)` : retrouve l'issue par une lecture ; `None` =
-  introuvable (la décision revient à un humain).
+  introuvable, une `Outcome` `unknown` = lue mais rien de certain (son
+  détail dit pourquoi) : la décision revient à un humain. Même règle
+  qu'`execute` : `confirmed` sur preuve, `failed` sur échec certain.
 
 La porte (`ameesh.actions`) appelle `execute` seulement après avoir écrit
 `launched` en base ; une exception, un délai dépassé ou une perte de
