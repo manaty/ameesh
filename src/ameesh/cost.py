@@ -377,7 +377,17 @@ class CostBook:
         }
 
 
-    def turn_usage(self, agent: str, start: int = 0) -> TurnUsage:
+    def session_of(self, agent: str) -> str | None:
+        """La session (ou le fil) courante d'un agent, lue sur **tout** son flux.
+
+        Pas sur la tranche du dernier tour : un `turn.completed` peut arriver sans
+        nouveau `thread.started`, et la session se perdrait alors sur la ligne —
+        le relevé suivant, comparé au mauvais repère, compterait un tour de trop
+        (sonde codex2, B5). La session se résout donc en amont et se transmet.
+        """
+        return _last_session(self.events(agent)) or None
+
+    def turn_usage(self, agent: str, start: int = 0, session: str | None = None) -> TurnUsage:
         """Ce que le tour qui vient de finir a coûté, sans rien écrire.
 
         Le repère de cumul (dernier `total_cost_usd` Claude, dernier usage Codex)
@@ -389,14 +399,14 @@ class CostBook:
         model = self.model_of(agent)
         prices = load_prices(self.prices_path)
         events = self.events(agent, start)
-        # La session se lit AVANT le repère : c'est elle qui dit lequel comparer.
-        cum = self.baseline(agent, harness, _last_session(events) or None)
+        # La session se résout AVANT le repère : c'est elle qui dit lequel comparer.
+        session = session or self.session_of(agent)
+        cum = self.baseline(agent, harness, session)
 
         if harness == "claude":
             totals = [float(e["total_cost_usd"]) for e in events
                       if e.get("type") == "result" and isinstance(e.get("total_cost_usd"), (int, float))]
             usage = [e.get("usage") or {} for e in events if e.get("type") == "result"]
-            session = _last_session(events) or cum.get("session")
             last = cum.get("cum_usd")
             if not totals:
                 usd = 0.0
@@ -424,7 +434,6 @@ class CostBook:
             current = [int(last.get("input_tokens", 0)), int(last.get("cached_input_tokens", 0)),
                        int(last.get("output_tokens", 0))]
             previous = cum.get("cum_usage")
-            session = _last_session(events) or cum.get("session")
             if session == cum.get("session") and isinstance(previous, list) and len(previous) == 3 \
                     and all(c >= p for c, p in zip(current, previous)):
                 # Même fil : `turn.completed` porte l'usage **cumulé** du fil.
@@ -466,8 +475,10 @@ class CostBook:
         if self.db is None:
             raise CostError("record sans base : le repère de cumul vit dans turn_costs")
         events = self.events(agent, start)
-        usage = self.turn_usage(agent, start)
-        session_id = session or _last_session(events) or None
+        # **Résolue une fois**, sur tout le flux, puis transmise au calcul comme à
+        # l'insertion : la ligne et le repère doivent porter la même session.
+        session_id = session or self.session_of(agent)
+        usage = self.turn_usage(agent, start, session=session_id)
         cum_usd = cum_input = cum_cached = cum_out = None
         if usage.harness == "claude":
             totals = [float(e["total_cost_usd"]) for e in events

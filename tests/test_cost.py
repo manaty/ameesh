@@ -372,6 +372,41 @@ class CostDbTest(Sandbox, PgTestCase):
         self.assertAlmostEqual(second.usd, 500_000 * 1.25 / 1e6)
         self.assertEqual(second.input_tokens, 500_000)
 
+    def test_la_session_survit_a_un_tour_sans_thread_started(self):
+        """Sonde codex2 B5 : `turn.completed` peut arriver sans `thread.started`.
+
+        La session se résout sur tout le flux et se transmet : sans cela la ligne
+        du tour intermédiaire portait une session nulle, la reprise préférait le
+        vieux relevé et comptait 1 M au lieu de 0,5 M.
+        """
+        book = self.book()
+        os.makedirs(book.agent_dir("a1"), exist_ok=True)
+        with open(os.path.join(book.agent_dir("a1"), "tool"), "w", encoding="utf-8") as fh:
+            fh.write("codex")
+        with open(os.path.join(book.agent_dir("a1"), "model"), "w", encoding="utf-8") as fh:
+            fh.write("gpt-6.1-sol")
+        usage = {"input_tokens": 1_000_000, "cached_input_tokens": 0, "output_tokens": 0}
+        self.write_events("a1", {"type": "thread.started", "thread_id": "s1"},
+                          {"type": "turn.completed", "usage": usage})
+        book.record("a1")                       # t1 : 1 M, session s1
+        # t2 : le cumul continue, mais aucun `thread.started` dans la tranche.
+        self.write_events("a1", {"type": "turn.completed",
+                                 "usage": {"input_tokens": 1_500_000,
+                                           "cached_input_tokens": 0, "output_tokens": 0}})
+        book.record("a1", start=2)
+        last = self.db.query("select session, cum_input_tokens from turn_costs"
+                             " order by id desc limit 1")[0]
+        self.assertEqual(last["session"], "s1")     # la session est conservée
+        self.assertEqual(last["cum_input_tokens"], 1_500_000)
+        # t3 : la reprise après un `thread.started` ne compte que sa différence.
+        self.write_events("a1", {"type": "thread.started", "thread_id": "s1"},
+                          {"type": "turn.completed",
+                           "usage": {"input_tokens": 2_000_000,
+                                     "cached_input_tokens": 0, "output_tokens": 0}})
+        third = book.record("a1", start=3)
+        self.assertEqual(third.input_tokens, 500_000)
+        self.assertAlmostEqual(third.usd, 500_000 * 1.25 / 1e6)
+
     def test_record_sans_base_refuse_de_compter(self):
         book = cost.CostBook(state_dir=self.state)
         with self.assertRaises(cost.CostError):
