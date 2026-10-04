@@ -140,7 +140,7 @@ Puis, sur l'hôte :
 ```bash
 git clone <dépôt du canon> ~/canon && echo "AMEESH_CANON=~/canon"   # ou "canon" dans config.json
 ameesh canon check --fetch        # 0 erreur ; lu au commit fusionné d'origin/main
-ameesh canon sync --fetch         # par hôte, AVANT toute réclamation
+ameesh canon sync --fetch --bootstrap-ref main   # 1re fois seulement (voir ci-dessous)
 ameesh list                       # agents du canon : hôte, responsable, aucun bail
 
 # tous les agents tournent encore en v0 : les tenir hors de portée de tout
@@ -154,6 +154,26 @@ done
 Aucun exécuteur ne tourne encore : rien ne démarre. `canon sync` n'écrit que
 les colonnes déclaratives (harnais, hôte, dossier, responsable…), jamais bail,
 session ni statut, et **ne lève jamais** un arrêt posé par `agent-runner stop`.
+
+Registre des authentificateurs (spec §8.2) : la branche canonique qui fait foi
+ne vient **jamais** du commit lu (son propre `federation.yaml` pourrait
+s'autoriser). Elle vient de la configuration de l'hôte (`AMEESH_CANON_REF` /
+`canon_ref`, posée par son responsable), sinon du manifeste du dernier commit
+déjà appliqué (journal `authenticator_syncs` en base), sinon — premier
+amorçage du registre — de `--bootstrap-ref <branche>` (journalisé, ignoré
+ensuite) ; sans rien de cela, la synchronisation des authentificateurs est
+refusée. `--ref` choisit ce qui est lu, jamais ce qui est canonique : le
+commit lu doit être atteignable depuis la branche de suivi distant de
+confiance, et descendre du dernier commit appliqué (jamais de retour en
+arrière ; contrôle et écritures sont sérialisés par un verrou du registre).
+Un changement de `ref` dans le manifeste ne prend effet qu'une fois fusionné
+sur la branche canonique actuelle. Limite connue (spec §11) : un agent qui
+partage l'utilisateur Unix d'ameesh peut réécrire `refs/remotes/…` du clone
+(ou la configuration de l'hôte) ; seule la monotonie en base l'empêche alors
+de revenir en arrière. Après une réécriture **légitime** de l'historique de la
+branche canonique, tout est refusé (« ne descend pas du dernier commit
+appliqué ») jusqu'à ce que le propriétaire vide le journal
+(`DELETE FROM authenticator_syncs`) et réamorce avec `--bootstrap-ref`.
 
 **Retour arrière :** retirer `AMEESH_CANON` (ou `canon` de la configuration).
 Le registre garde ses colonnes et ses arrêts, sans effet tant qu'aucun
@@ -429,5 +449,7 @@ les boucles v0 (étape 4, retour arrière).
 | une action irréversible sans humain | la porte exige un reçu lié à l'empreinte, à usage unique, avec échéance ; issue inconnue → `reconcile`, jamais de nouvelle tentative automatique |
 | ameesh-approve exposé trop tôt | rien n'est mis en ligne avant la revue de L7 ; exposition = acte du propriétaire ; service sur la boucle locale seulement |
 | faux enrôlement de passkey | l'enrôlement n'est qu'une proposition ; confirmation hors bande et PR revue du canon avant toute activation |
+| PR non fusionnée qui se déclare canonique (`federation.yaml`) | la branche de confiance vient de l'hôte, du dernier commit appliqué ou de l'amorçage, jamais du commit lu : refus |
+| deux `canon sync` concurrents (deux hôtes, un ancien canon) | verrou du registre pris avant le contrôle, monotonie : un ancien commit ne réactive jamais une passkey retirée |
 | reçu rejoué | nonce consommé au lancement, en base (`mesh_consumed_nonces`) |
 | le disque du PC meurt | `pg_dump` quotidien hors du PC, exercice de restauration de l'étape 1 |
