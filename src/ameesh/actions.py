@@ -721,7 +721,8 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
     1. revérifie l'autorisation liée (reçu : forme, échéance, registre,
        signature, nonce encore libre, empreinte RECALCULÉE depuis la ligne) ;
     2. `ameesh_action_launch` : approved → launched + consommation du nonce
-       (ou réservation sur le grant) + tentative, en une transaction ;
+       (ou réservation sur le grant) + tentative, en une transaction qui
+       revérifie l'échéance du reçu à l'heure réelle, après les verrous ;
        deux exécutions concurrentes : une seule passe ;
     3. appel du connecteur, clé d'idempotence = action_id, borné par son délai ;
     4. issue enregistrée (`ameesh_action_settle`). Si l'enregistrement échoue,
@@ -730,6 +731,7 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
        avec une issue certaine, son fil l'inscrit (`_record_late`).
     """
     connectors_mod.check(connector)
+    policy = policy if policy is not None else policy_from_env()
     recover(db, action_id=action_id)
     action = _require(db, action_id, with_receipts=True)
     if action["connector"] != connector.name:
@@ -763,9 +765,9 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
     timeout = connectors_mod.timeout_of(connector)
     rows = db.query(
         "SELECT * FROM ameesh_action_launch(%s::text, %s::text, %s::text, %s::text, "
-        "%s::bigint, %s::text, %s::double precision)",
+        "%s::bigint, %s::text, %s::double precision, %s::double precision)",
         (action_id, expected, action["auth_kind"], action["auth_nonce"],
-         action["auth_grant_id"], by or "", timeout),
+         action["auth_grant_id"], by or "", timeout, float(policy.clock_skew)),
     )
     launch = rows[0] if rows else {"result": STATE, "detail": "aucune réponse"}
     if launch.get("result") != "ok":
@@ -933,12 +935,15 @@ def replace(db: Db, action_id: str, receipt, *, policy=None, by: str = "",
 
     Seulement avec un reçu humain signé qui assume le doublon (empreinte
     `assume_duplicate_digest`, voir le module). Consommation du nonce,
-    liaison et création en une transaction. La nouvelle action naît
-    `proposed` : elle exige sa propre approbation.
+    liaison et création en une transaction, qui revérifie l'échéance de la
+    décision à l'heure réelle (échue entre-temps → refus `expired`, rien
+    n'est créé, nonce intact). La nouvelle action naît `proposed` : elle
+    exige sa propre approbation.
     """
     if receipt is None:
         raise ActionError(DECISION_REQUIRED, "remplacer %s exige une décision humaine signée "
                           "qui assume le doublon" % action_id)
+    policy = policy if policy is not None else policy_from_env()
     recover(db, action_id=action_id)
     action = _require(db, action_id)
     if action.get("replaced_by"):
@@ -955,9 +960,10 @@ def replace(db: Db, action_id: str, receipt, *, policy=None, by: str = "",
     new_digest = receipts.action_digest(dict(digest_fields(action), action_id=new_id))
     rows = db.query(
         "SELECT * FROM ameesh_action_replace(%s::text, %s::text, %s::text, %s::text, %s::text, "
-        "%s::text, %s::text, %s::text, %s::bigint, %s::text)",
+        "%s::text, %s::text, %s::text, %s::bigint, %s::text, %s::double precision)",
         (action_id, digest(action), new_id, new_digest, jcs.dumps(document), verdict.approver,
-         verdict.nonce, verdict.challenge, verdict.authenticator_id, by or ""),
+         verdict.nonce, verdict.challenge, verdict.authenticator_id, by or "",
+         float(policy.clock_skew)),
     )
     result = rows[0] if rows else {"result": STATE, "detail": "aucune réponse"}
     if result.get("result") != "ok":

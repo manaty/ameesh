@@ -94,6 +94,27 @@ class Scripted:
         return self.reconciled
 
 
+class Paused:
+    """Base dont la requête qui contient `marker` attend l'heure `until` avant
+    de partir : pause injectée entre la vérification Python et la transaction."""
+
+    def __init__(self, db, marker: str, until: float):
+        self.db = db
+        self.marker = marker
+        self.until = until
+        self.paused = 0
+
+    def query(self, sql, params=()):
+        if self.marker in sql:
+            self.paused += 1
+            while time.time() < self.until:
+                time.sleep(0.05)
+        return self.db.query(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+
 class ActionsBase(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -379,6 +400,43 @@ class ActionsCycleTest(ActionsBase):
         self.assertFalse(self.nonce_consumed(receipt))
         self.assertEqual((self.get(action)["state"], self.noop.calls), ("approved", []))
         # nouvelle liaison avec un reçu frais : l'action repart
+        self.approve(action)
+        self.assertEqual(self.execute(action)["state"], "confirmed")
+
+    def test_lancement_echeance_controlee_a_l_heure_reelle(self):
+        """L'échéance du reçu est revérifiée DANS la transaction de lancement, à
+        l'heure réelle (clock_timestamp, pas now()), après les verrous."""
+        action = self.propose("send")
+        receipt = self.receipt(action, now=int(time.time()) - 598, ttl=600)
+        row = self.approve(action, receipt)
+        # transaction ouverte AVANT l'échéance, lancement APRÈS : now() est périmé
+        self.db.execute(
+            "CREATE OR REPLACE FUNCTION launch_after(p_action_id text, p_digest text, p_nonce text, "
+            "p_until double precision) "
+            "RETURNS TABLE (result text, attempt integer, reservation bigint, detail text) "
+            "LANGUAGE plpgsql AS $f$ BEGIN "
+            "PERFORM pg_sleep(greatest(p_until - extract(epoch from clock_timestamp())::float8, 0)); "
+            "RETURN QUERY SELECT * FROM ameesh_action_launch(p_action_id, p_digest, 'receipt', "
+            "p_nonce, NULL, 'test', 5.0); END $f$")
+        out = self.db.query(
+            "SELECT * FROM launch_after(%s::text, %s::text, %s::text, %s::double precision)",
+            (action["action_id"], action["digest"], row["auth_nonce"],
+             receipt["request"]["exp"] + 0.3))[0]
+        self.assertEqual(out["result"], receipts.EXPIRED, out)
+        self.assertEqual(self.get(action)["state"], "approved")
+        self.assertFalse(self.nonce_consumed(receipt))
+        self.assertEqual(actions.attempts(self.db, action["action_id"]), [])
+        # par la porte : reçu valide à la vérification Python, échu à l'appel SQL
+        receipt = self.receipt(action, now=int(time.time()) - 598, ttl=600)
+        self.approve(action, receipt)
+        paused = Paused(self.db, "ameesh_action_launch(", until=receipt["request"]["exp"] + 0.3)
+        self.refused(receipts.EXPIRED, self.execute, action, db=paused)
+        self.assertEqual(paused.paused, 1)
+        self.assertEqual((self.get(action)["state"], self.noop.calls), ("approved", []))
+        self.assertFalse(self.nonce_consumed(receipt))
+        self.assertEqual(actions.attempts(self.db, action["action_id"]), [])
+        self.assertIn("refused", self.event_names(action))
+        # un reçu frais : l'action part
         self.approve(action)
         self.assertEqual(self.execute(action)["state"], "confirmed")
 
@@ -860,6 +918,29 @@ class ActionsUnknownTest(ActionsBase):
         self.approve(new)
         self.assertEqual(self.execute(new, self.gh())["state"], "confirmed")
         self.assertEqual(self.pr()["state"], "MERGED")
+
+    def test_replace_decision_echue_entre_verification_et_transaction(self):
+        """Décision valide à la vérification Python, échue avant la transaction
+        SQL : refus, aucune action créée, nonce intact."""
+        lossy = self.gh(mode="drop")
+        action = self.propose("merge", connector=lossy, target=PR)
+        self.approve(action)
+        self.assertEqual(self.execute(action, lossy)["state"], "unknown")
+        decision = self.receipt(action, assume_duplicate=True, now=int(time.time()) - 598,
+                                ttl=600)
+        paused = Paused(self.db, "ameesh_action_replace(", until=decision["request"]["exp"] + 0.3)
+        self.refused(receipts.EXPIRED, actions.replace, paused, action["action_id"], decision,
+                     policy=POLICY, by=ALICE)
+        self.assertEqual(paused.paused, 1)                     # vérifiée en Python avant l'échéance
+        self.assertFalse(self.nonce_consumed(decision))
+        self.assertEqual(self.db.query("SELECT count(*)::int AS n FROM actions")[0]["n"], 1)
+        old = self.get(action)
+        self.assertEqual((old["state"], old["replaced_by"]), ("unknown", None))
+        self.assertNotIn("replaced", self.event_names(action))
+        # une décision fraîche remplace
+        new = actions.replace(self.db, action["action_id"],
+                              self.receipt(action, assume_duplicate=True), policy=POLICY, by=ALICE)
+        self.assertEqual((new["replaces"], new["state"]), (action["action_id"], "proposed"))
 
     def test_replace_concurrent_une_seule_nouvelle_action(self):
         lossy = self.gh(mode="drop")

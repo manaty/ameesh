@@ -259,15 +259,22 @@ create trigger action_events_append_only
 -- `p_digest` est l'empreinte recalculée par la porte depuis l'action ; elle
 -- doit être celle que le reçu a signée (vérifié en Python juste avant) et
 -- celle de la ligne. Résultat : 'ok' ou un code de refus (rien n'a changé).
+-- L'échéance du reçu (`exp`, et `iat` à `p_skew` secondes près, la tolérance
+-- d'horloge de la politique — receipts.DEFAULT_CLOCK_SKEW par défaut) est
+-- revérifiée DANS la transaction, à l'heure réelle (`clock_timestamp()`, pas
+-- `now()` qui date du début de la transaction), APRÈS l'acquisition des
+-- verrous : un reçu échu entre la vérification Python et ce point ne lance
+-- rien, tout est annulé (code 'expired' ou 'iat_future').
 create or replace function ameesh_action_launch(
     p_action_id text, p_digest text, p_auth_kind text, p_nonce text, p_grant_id bigint,
-    p_by text, p_timeout double precision)
+    p_by text, p_timeout double precision, p_skew double precision default 120)
 returns table (result text, attempt integer, reservation bigint, detail text)
 language plpgsql as $$
 declare
     a actions%rowtype;
     v_code text := 'state';
     v_reservation bigint;
+    v_iat bigint;
 begin
     begin
         update actions
@@ -285,7 +292,6 @@ begin
            and actions.auth_kind = p_auth_kind
            and actions.auth_nonce is not distinct from p_nonce
            and actions.auth_grant_id is not distinct from p_grant_id
-           and (actions.auth_kind <> 'receipt' or actions.auth_expires_at > now())
         returning * into a;
         if not found then
             return query select 'state'::text, null::integer, null::bigint,
@@ -334,6 +340,21 @@ begin
             (a.action_id, a.attempts, a.auth_kind, a.auth_challenge, a.auth_receipt,
              a.auth_approver, a.auth_nonce, a.auth_grant_id, v_reservation, 'launched',
              p_by, a.launch_deadline);
+
+        -- verrous acquis (ligne de l'action, nonce, tentative) : échéance du reçu
+        -- à l'heure réelle ; échu → exception, tout le bloc est annulé
+        if a.auth_kind = 'receipt' then
+            v_code := 'expired';
+            if a.auth_expires_at is null or a.auth_expires_at <= clock_timestamp() then
+                raise exception 'reçu expiré (échéance %) : rien n''est lancé', a.auth_expires_at;
+            end if;
+            v_code := 'iat_future';
+            v_iat := (a.auth_receipt::jsonb #>> '{request,iat}')::bigint;
+            if v_iat is null or to_timestamp(v_iat) > clock_timestamp()
+                    + make_interval(secs => greatest(coalesce(p_skew, 0), 0)) then
+                raise exception 'iat du reçu dans le futur : rien n''est lancé';
+            end if;
+        end if;
     exception
         when raise_exception or unique_violation then
             return query select v_code, null::integer, null::bigint, sqlerrm::text;
@@ -412,15 +433,21 @@ $$;
 -- --------------------------------------------------------------------------
 -- remplacement : une décision humaine signée qui ASSUME le doublon crée une
 -- nouvelle action (nouvel action_id, replaces = l'ancienne) ; consommation du
--- nonce, liaison et création en une transaction.
+-- nonce, liaison et création en une transaction. L'échéance de la décision
+-- (`exp` et `iat` du reçu `p_receipt`, tolérance `p_skew`) est contrôlée
+-- DANS cette transaction, à l'heure réelle, après l'acquisition des verrous :
+-- échue → rien n'est créé, le nonce reste intact (code 'expired').
 -- --------------------------------------------------------------------------
 create or replace function ameesh_action_replace(
     p_old text, p_old_digest text, p_new text, p_new_digest text, p_receipt text,
-    p_approver text, p_nonce text, p_challenge text, p_authenticator_id bigint, p_by text)
+    p_approver text, p_nonce text, p_challenge text, p_authenticator_id bigint, p_by text,
+    p_skew double precision default 120)
 returns table (result text, detail text)
 language plpgsql as $$
 declare
     v_code text := 'state';
+    v_iat bigint;
+    v_exp bigint;
 begin
     begin
         insert into actions
@@ -461,6 +488,21 @@ begin
                 raise exception 'authentificateur révoqué avant le remplacement';
             end if;
             raise exception 'nonce déjà consommé';
+        end if;
+
+        -- verrous acquis (ligne remplacée, index d'unicité, nonce) : échéance de
+        -- la décision à l'heure réelle ; échue → exception, tout est annulé
+        v_code := 'expired';
+        v_iat := (p_receipt::jsonb #>> '{request,iat}')::bigint;
+        v_exp := (p_receipt::jsonb #>> '{request,exp}')::bigint;
+        if v_exp is null or to_timestamp(v_exp) <= clock_timestamp() then
+            raise exception 'décision échue (échéance %) : aucun remplacement',
+                to_timestamp(v_exp);
+        end if;
+        v_code := 'iat_future';
+        if v_iat is null or to_timestamp(v_iat) > clock_timestamp()
+                + make_interval(secs => greatest(coalesce(p_skew, 0), 0)) then
+            raise exception 'iat de la décision dans le futur : aucun remplacement';
         end if;
     exception
         when raise_exception or unique_violation then
