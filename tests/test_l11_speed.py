@@ -139,6 +139,61 @@ class InterruptionTest(PgTestCase):
                          "payload": json.dumps({"to": "l11", "id": vrai})})
         self.assertTrue(worker.preempting.is_set())
 
+    def test_dispatch_prioritaire_ne_bloque_pas_sur_un_journal(self):
+        """Verdict L11 B1 (dispatch) : le signal de préemption part avant le
+        journal ; un pipe saturé ne doit pas l'empêcher."""
+        runner, worker = self._worker()
+        with runner.lock:
+            runner.workers["l11"] = worker
+        mail.send(self.db, "orch", "l11", "vrai", kind="event",
+                  payload={"urgent": True})
+        mid = mail.unread(self.db, "l11")[-1]["id"]
+
+        def bloque(message, *args, **kwargs):
+            time.sleep(30)
+
+        thread = threading.Thread(
+            target=lambda: runner.dispatch({"channel": "agent_mail",
+                                            "payload": json.dumps({"to": "l11", "id": mid})}),
+            daemon=True)
+        with mock.patch("ameesh.runner.log", side_effect=bloque):
+            thread.start()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "le dispatch a été bloqué par un journal")
+        self.assertTrue(worker.preempting.is_set())
+
+    def test_reprise_apres_interruption_traite_l_urgent(self):
+        """Verdict L11 B5 : le latch d'arrêt ne doit pas tuer la reprise — le
+        tour prioritaire suivant traite bien le message."""
+        runner, worker = self._worker()
+        self.register("l11", "claude", cwd=self._cwd("l11"), prompt="tour long")
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+               "AMEESH_TEST_SLEEP": "5"}
+        spec = worker.pick()
+        resultat: list = []
+        try:
+            with mock.patch.dict(os.environ, env, clear=False):
+                thread = threading.Thread(
+                    target=lambda: resultat.append(worker.run_turn(spec)), daemon=True)
+                thread.start()
+                time.sleep(0.4)
+                worker.request_preempt()
+                thread.join(timeout=6)
+            self.assertEqual(resultat, [False])
+            mail.send(self.db, "orch", "l11", "incident prioritaire", kind="event",
+                      payload={"urgent": True})
+            urgent = worker.pick()
+            self.assertEqual(urgent["kind"], "urgent")
+            env2 = dict(env)
+            env2["AMEESH_TEST_SLEEP"] = "0"
+            with mock.patch.dict(os.environ, env2, clear=False):
+                self.assertTrue(worker.run_turn(urgent),
+                                "le tour prioritaire a été tué par le latch d'arrêt")
+            self.assertEqual(mail.unread(self.db, "l11"), [])
+            self.assertFalse(worker.stop_requested.is_set())
+        finally:
+            worker.watchdog_stop.set()
+
 
 class RotationTest(PgTestCase):
     def _worker(self, name: str = "rot"):
@@ -215,6 +270,18 @@ class RotationTest(PgTestCase):
         self.assertTrue(registry.clear_session(self.db, "rot", runner.runner_id,
                                                int(worker.epoch)))
         self.assertIsNone(registry.get(self.db, "rot")["session_id"])
+
+    def test_clear_session_refuse_un_bail_expire(self):
+        """Verdict L11 B3 : même owner et même epoch, un bail expiré ne peut
+        rien effacer (la session d'un remplaçant reste intacte)."""
+        runner, worker = self._worker()
+        registry.set_session(self.db, "rot", "session-protegee")
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at = now() - interval '1 second' "
+            "WHERE name = 'rot'")
+        self.assertFalse(registry.clear_session(self.db, "rot", runner.runner_id,
+                                                int(worker.epoch)))
+        self.assertEqual(registry.get(self.db, "rot")["session_id"], "session-protegee")
 
 
 class StopTriggersTest(PgTestCase):

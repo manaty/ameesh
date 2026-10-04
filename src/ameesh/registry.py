@@ -474,18 +474,27 @@ def set_session(db: Db, name: str, session_id: str) -> None:
 
 
 def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
-    """Oublie la session (rotation, 0018), **fencé par le bail**.
+    """Oublie la session (rotation, 0018), **fencé par un bail valide**.
 
-    Renvoie False si le bail n'est plus le nôtre : un remplaçant a pu réclamer
-    l'agent et ouvrir sa propre session, qu'il ne faut pas effacer (verdict
-    codex3 L11 B3).
+    Renvoie False si le bail n'est plus le nôtre ou s'il a expiré : un
+    remplaçant a pu réclamer l'agent et ouvrir sa propre session, qu'il ne faut
+    pas effacer (verdicts codex3 L11 B3). Le verrou est pris d'abord et
+    l'échéance est recontrôlée avec `clock_timestamp()` dans l'écriture, comme
+    les autres opérations de bail.
     """
     rows = db.query(
         """
-        UPDATE agent_registry
+        WITH verrou AS (
+            SELECT name, lease_owner, lease_epoch, lease_expires_at
+              FROM agent_registry WHERE name = %s FOR UPDATE
+        )
+        UPDATE agent_registry AS r
            SET session_id = NULL, updated_at = now()
-         WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
-        RETURNING name
+          FROM verrou
+         WHERE r.name = verrou.name
+           AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+           AND verrou.lease_expires_at > clock_timestamp()
+        RETURNING r.name
         """,
         (name, owner, epoch),
     )

@@ -404,8 +404,11 @@ class AgentWorker(threading.Thread):
         with self.lock:
             proc = self.proc
         self._stop_reason = reason
-        self.stop_requested.set()
         if proc is None:
+            # Le latch ne sert qu'à la course de publication en cours : il est
+            # consommé par le recontrôle, puis remis à zéro au tour suivant
+            # (verdict codex3 L11 B5 : un latch permanent tuerait la reprise).
+            self.stop_requested.set()
             log_async("[%s] arrêt demandé (%s) : harnais non encore publié"
                       % (self.name, reason))
             return False
@@ -436,6 +439,9 @@ class AgentWorker(threading.Thread):
             self.stop_requested.set()
             return False
         self.stop_group_now(self._stop_reason or "arrêt", grace=0, hard=True)
+        # Le latch de publication est consommé : le prochain tour doit pouvoir
+        # tourner (verdict codex3 L11 B5).
+        self.stop_requested.clear()
         return True
 
     def kill_if_lease_lost(self) -> bool:
@@ -880,6 +886,10 @@ class AgentWorker(threading.Thread):
         heartbeat_done = threading.Event()
         threading.Thread(target=self._heartbeat, args=(heartbeat_done,), daemon=True).start()
         preempt_done = threading.Event()
+        # Un nouveau tour remet à zéro le latch de publication : il ne concerne
+        # que la course du tour précédent, et les autres déclencheurs (bail,
+        # arrêt, préemption) sont revérifiés à la publication (verdict B5).
+        self.stop_requested.clear()
         if spec["kind"] == "urgent":
             # Ce tour sert justement le message prioritaire : le signal est consommé.
             self.preempting.clear()
@@ -1115,6 +1125,12 @@ class Runner:
 
     # -- écoute ------------------------------------------------------------
     def dispatch(self, item: dict) -> None:
+        """Réveille (ou préempte) le worker visé, **signal avant journal**.
+
+        Un `log` synchrone avant `request_preempt`/`wake.set` laissait un pipe
+        saturé retarder la préemption (verdict codex3 L11 B1) : tous les signaux
+        partent d'abord, la journalisation passe par la file bornée.
+        """
         if item.get("channel") == CHANNEL_MAIL:
             try:
                 payload = json.loads(item.get("payload") or "{}")
@@ -1129,17 +1145,17 @@ class Runner:
                 if row and mail.is_urgent(row):
                     prioritaire = worker.interrupt_allowed(row)
                     if not prioritaire:
-                        log("urgent de %s ignoré : expéditeur non habilité à interrompre"
-                            % (row.get("sender") or "?"))
+                        log_async("urgent de %s ignoré : expéditeur non habilité à interrompre"
+                                  % (row.get("sender") or "?"))
             if worker and prioritaire:
-                log("message prioritaire pour %s : interruption du tour" % target)
-                worker.request_preempt()
+                worker.request_preempt()  # le signal d'abord
+                log_async("message prioritaire pour %s : interruption du tour" % target)
             elif worker:
-                log("message pour %s : réveil du tour" % target)
                 worker.wake.set()
+                log_async("message pour %s : réveil du tour" % target)
             else:
-                for worker in self.workers.values():
-                    worker.wake.set()
+                for autre in self.workers.values():
+                    autre.wake.set()
         self.wake_all.set()
 
     def _listen_loop(self) -> None:
