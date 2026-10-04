@@ -10,14 +10,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
+import subprocess
 import threading
 import time
 import unittest
 from unittest import mock
 
 from ameesh import cose, jcs, p256, receipts, signing
+from ameesh import db as db_mod
 
-from .support import PgTestCase
+from .support import TEST_DSN, PgTestCase
 from .webauthn_soft import (
     ORIGIN, RP_ID, SoftDevice, SoftEd25519, SoftES256Key, SoftWebAuthn, b64u, cbor,
     make_receipt, make_request, new_action_id, sha,
@@ -745,6 +748,110 @@ def action(**overrides) -> dict:
     return value
 
 
+class HeldTransaction:
+    """Transaction tenue OUVERTE sur une connexion à part, pour les courses réelles.
+
+    Un `psql` lit ses instructions sur stdin (indépendant du pilote testé : la
+    connexion qui attend, elle, passe par `db.py`). La dernière instruction
+    renomme la session `<app>-pret` : quand pg_stat_activity la montre « idle
+    in transaction » sous ce nom, tout ce qui précède est exécuté et les
+    verrous sont pris.
+    """
+
+    def __init__(self, test: PgTestCase, statements: str):
+        self.test = test
+        self.app = "ameesh-test-%s" % os.urandom(4).hex()
+        password, dsn = db_mod.split_password(TEST_DSN)
+        env = dict(os.environ, PGAPPNAME=self.app)
+        if password:
+            env["PGPASSWORD"] = password
+        self.proc = subprocess.Popen(
+            [shutil.which("psql") or "psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", dsn],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, env=env)
+        self.proc.stdin.write("SET search_path TO %s;\nBEGIN;\n%s\nSET application_name = '%s-pret';\n"
+                              % (db_mod.quote_ident(test.schema), statements, self.app))
+        self.proc.stdin.flush()
+        self.pid = test.wait_for(self._ready, timeout=30)
+
+    def _ready(self):
+        if self.proc.poll() is not None:
+            self.test.fail("psql de la transaction tenue terminé : %s" % self.proc.stderr.read())
+        rows = self.test.db.query(
+            "SELECT pid FROM pg_stat_activity WHERE application_name = %s "
+            "AND state = 'idle in transaction'", (self.app + "-pret",))
+        return int(rows[0]["pid"]) if rows else None
+
+    def blocked(self, worker: "Worker") -> bool:
+        """Attend qu'une session soit bloquée derrière cette transaction.
+
+        Faux si `worker` a terminé sans jamais l'attendre.
+        """
+        def check():
+            if not worker.is_alive():
+                return "terminé"
+            rows = self.test.db.query(
+                "SELECT count(*)::int AS n FROM pg_stat_activity "
+                "WHERE %s::int = ANY(pg_blocking_pids(pid))", (self.pid,))
+            return "bloqué" if rows[0]["n"] else None
+        return self.test.wait_for(check, timeout=30) == "bloqué"
+
+    def commit(self) -> None:
+        self._end("COMMIT")
+
+    def _end(self, verb: str) -> None:
+        if self.proc.poll() is None:
+            self.proc.stdin.write("%s;\n" % verb)
+            self.proc.stdin.close()
+        try:
+            self.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+        self.test.assertEqual(self.proc.returncode, 0, self.proc.stderr.read())
+
+    def __enter__(self) -> "HeldTransaction":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self.proc.poll() is None:
+            self.proc.stdin.write("ROLLBACK;\n")
+            self.proc.stdin.close()
+            try:
+                self.proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        self.proc.stderr.close()
+
+
+class Worker(threading.Thread):
+    """Un appel dans un fil, sur SA connexion (le pilote testé)."""
+
+    def __init__(self, test: PgTestCase, call):
+        super().__init__(daemon=True)
+        self.test, self.call = test, call
+        self.value = self.error = None
+        self.start()
+
+    def run(self) -> None:
+        db = self.test.connect()
+        try:
+            self.value = self.call(db)
+        except BaseException as exc:  # rendu au fil principal par result()
+            self.error = exc
+        finally:
+            db.close()
+
+    def result(self, timeout: float = 60.0):
+        self.join(timeout)
+        if self.is_alive():
+            raise AssertionError("appel toujours bloqué après %ss" % timeout)
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+
 class StandingTest(ReceiptsBase):
     def register(self, soft=None, approver=ALICE, **overrides):
         soft = soft or self.alice
@@ -760,6 +867,21 @@ class StandingTest(ReceiptsBase):
 
     def consumed(self, grant) -> int:
         return int(receipts.get_standing(self.db, grant)["consumed_amount"])
+
+    def reserving(self, grant, act) -> "Worker":
+        """La réservation, lancée dans un fil sur sa propre connexion."""
+        return Worker(self, lambda db: receipts.standing_reserve(
+            db, grant, act["action_id"], act["amount"], connector=act["connector"],
+            operation=act["operation"], action_class=act["class"], currency=act["currency"]))
+
+    def lock_grant(self, grant) -> HeldTransaction:
+        """Une autre transaction tient le verrou du grant (transaction ouverte)."""
+        return HeldTransaction(
+            self, "SELECT id FROM standing_approvals WHERE id = %d FOR UPDATE;" % int(grant))
+
+    def live_reservations(self) -> int:
+        return self.db.query("SELECT count(*)::int AS n FROM standing_reservations "
+                             "WHERE released_at IS NULL")[0]["n"]
 
     def test_cycle_reserver_reutiliser_liberer(self):
         grant, _receipt = self.register()
@@ -940,6 +1062,42 @@ class StandingTest(ReceiptsBase):
                                                    now=until + 1)
         self.assertIsNone(none)
         self.assertFalse(verdict.ok)
+
+    def test_attente_du_verrou_puis_reservation(self):
+        """Témoin des courses réelles : la réservation attend le verrou, puis passe."""
+        grant, _ = self.register()
+        with self.lock_grant(grant) as holder:
+            worker = self.reserving(grant, action(amount=30))
+            self.assertTrue(holder.blocked(worker), "la réservation n'a pas attendu le verrou")
+            holder.commit()
+        reserved = worker.result()
+        self.assertIsNotNone(reserved)
+        self.assertEqual(self.consumed(grant), 30)
+
+    def test_echeance_pendant_l_attente_du_verrou(self):
+        """B2 : un grant échu PENDANT l'attente du verrou ne couvre plus rien.
+
+        now() est figé au début de la transaction, avant l'attente : seule
+        l'heure réelle (clock_timestamp()) voit l'échéance passée.
+        """
+        grant, _ = self.register()
+        self.db.query("UPDATE standing_approvals SET valid_until = clock_timestamp() "
+                      "+ interval '3 seconds' WHERE id = %s RETURNING id", (grant,))
+        with self.lock_grant(grant) as holder:
+            worker = self.reserving(grant, action(amount=30))
+            self.assertTrue(holder.blocked(worker), "la réservation n'a pas attendu le verrou")
+            self.assertTrue(self.db.query(
+                "SELECT clock_timestamp() < valid_until AS avant FROM standing_approvals "
+                "WHERE id = %s", (grant,))[0]["avant"],
+                "banc trop lent : l'échéance est passée avant le début de la réservation")
+            # l'échéance passe pendant que la réservation attend
+            self.wait_for(lambda: self.db.query(
+                "SELECT clock_timestamp() > valid_until AS passee FROM standing_approvals "
+                "WHERE id = %s", (grant,))[0]["passee"], timeout=10)
+            holder.commit()
+        self.assertIsNone(worker.result())
+        self.assertEqual(self.consumed(grant), 0)
+        self.assertEqual(self.live_reservations(), 0)
 
     def test_grant_trop_long(self):
         receipt = self.alice.receipt(make_request(

@@ -803,10 +803,13 @@ def standing_reserve(db: Db, grant_id: int, action_id: str, amount, *, connector
                      reserved_by: str | None = None) -> dict | None:
     """Réserve `amount` sur le grant pour la tentative de `action_id`.
 
-    Atomique (un seul UPDATE … WHERE cumul + montant <= max AND until > now()
-    AND revoked_at IS NULL … puis l'insertion du lien, dans une même fonction).
+    Atomique (fonction `ameesh_standing_reserve`, une transaction) : verrou
+    du grant d'abord, puis TOUT est relu et réévalué après le verrou —
+    révocation, échéance comparée à l'heure réelle (`clock_timestamp()`, pas
+    `now()` figé avant l'attente du verrou), authentificateur, couverture,
+    cumul + montant <= max — et le lien est inséré.
     La description de l'action (connecteur, opération, classe, devise) est
-    OBLIGATOIRE : la couverture est contrôlée dans la même requête, une
+    OBLIGATOIRE : la couverture est contrôlée dans la même transaction, une
     réservation sur un grant qui ne couvre pas l'action est impossible.
     Idempotente par (grant, action) : une réservation vivante est rendue
     (`reused`) seulement si la description est IDENTIQUE (montant, devise,
@@ -870,7 +873,7 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> d
         """
         SELECT id FROM standing_approvals
          WHERE connector = %s AND operations @> jsonb_build_array(%s::text)
-           AND action_class = %s AND revoked_at IS NULL AND valid_until > now()
+           AND action_class = %s AND revoked_at IS NULL AND valid_until > clock_timestamp()
            AND consumed_amount + %s::bigint <= max_amount
            AND (%s::bigint = 0 OR currency = %s)
          ORDER BY valid_until, id

@@ -169,94 +169,85 @@ end
 $$;
 
 -- Réservation d'un montant sur un grant pour une tentative d'action.
--- La décision est UN SEUL UPDATE … WHERE cumul + montant <= max … : sous
--- READ COMMITTED, deux réservations concurrentes se sérialisent sur la ligne
--- du grant et la seconde réévalue la condition sur la version à jour.
--- Idempotente par (grant, action) : une réservation vivante est rendue telle
--- quelle (reused = true), à condition que la description de l'action soit
--- IDENTIQUE (montant, devise, connecteur, opération, classe) — toute
--- différence est une erreur, jamais un succès — et que le grant soit encore
--- valable et couvre l'action.
+--
+-- 1. Verrou du grant (`SELECT … FOR UPDATE`) : les réservations d'un même
+--    grant se sérialisent ici, y compris celles de la MÊME action.
+-- 2. Tout est RELU et réévalué APRÈS le verrou : la fonction est VOLATILE et
+--    tourne sous READ COMMITTED, chaque instruction prend donc un nouvel
+--    instantané, et la ligne verrouillée est la dernière version validée.
+--    L'échéance est comparée à `clock_timestamp()`, jamais à `now()` : `now()`
+--    est figé au début de la transaction, AVANT l'éventuelle attente du
+--    verrou — un grant échu pendant l'attente serait encore « valable ».
+-- 3. Idempotente par (grant, action) : une réservation vivante est rendue
+--    telle quelle (reused = true), à condition que la description de l'action
+--    soit IDENTIQUE (montant, devise, connecteur, opération, classe) — toute
+--    différence est une erreur, jamais un succès — et que le grant soit encore
+--    valable et couvre l'action.
 -- Aucune ligne rendue = pas de couverture.
 create or replace function ameesh_standing_reserve(
     p_grant_id bigint, p_action_id text, p_amount bigint, p_reserved_by text,
     p_connector text, p_operation text, p_class text, p_currency text)
 returns table (reservation_id bigint, standing_id bigint, reserved_amount bigint,
                grant_consumed bigint, grant_max bigint, reused boolean)
-language plpgsql as $$
+language plpgsql volatile as $$
 declare
-    v_existing standing_reservations%rowtype;
-    v_grant record;
+    v_grant standing_approvals%rowtype;
+    v_live standing_reservations%rowtype;
+    v_consumed bigint;
     v_id bigint;
 begin
     if p_amount is null or p_amount < 0 then
         raise exception 'ameesh_standing_reserve : montant invalide';
     end if;
-    select r.* into v_existing
+    select s.* into v_grant from standing_approvals s where s.id = p_grant_id for update;
+    if not found then
+        return;
+    end if;
+    -- (après le verrou : instantané neuf, heure réelle)
+    select r.* into v_live
       from standing_reservations r
      where r.grant_id = p_grant_id and r.action_id = p_action_id
        and r.released_at is null;
     if found then
-        perform ameesh_standing_same_action(v_existing, p_amount, p_connector, p_operation,
+        perform ameesh_standing_same_action(v_live, p_amount, p_connector, p_operation,
                                             p_class, p_currency);
-        return query
-            select v_existing.id, s.id, v_existing.amount, s.consumed_amount, s.max_amount, true
-              from standing_approvals s
-             where s.id = p_grant_id
-               and s.revoked_at is null
-               and s.valid_until > now()
-               and s.connector = p_connector
-               and s.operations @> jsonb_build_array(p_operation)
-               and s.action_class = p_class
-               and (p_amount = 0 or s.currency = p_currency)
-               and exists (select 1 from authenticators a
-                            where a.id = s.authenticator_id and a.revoked_at is null);
+    end if;
+    if v_grant.revoked_at is not null or v_grant.valid_until <= clock_timestamp() then
         return;
     end if;
-    begin
-        update standing_approvals s
-           set consumed_amount = s.consumed_amount + p_amount,
-               uses = s.uses + 1,
-               last_used_at = now()
-         where s.id = p_grant_id
-           and s.revoked_at is null
-           and s.valid_until > now()
-           and s.consumed_amount + p_amount <= s.max_amount
-           and s.connector = p_connector
-           and s.operations @> jsonb_build_array(p_operation)
-           and s.action_class = p_class
-           and (p_amount = 0 or s.currency = p_currency)
-           and exists (select 1 from authenticators a
-                        where a.id = s.authenticator_id and a.revoked_at is null)
-        returning s.consumed_amount, s.max_amount into v_grant;
-        if not found then
-            return;
-        end if;
-        insert into standing_reservations
-            (grant_id, action_id, amount, connector, operation, action_class, currency,
-             reserved_by)
-        values
-            (p_grant_id, p_action_id, p_amount, p_connector, p_operation, p_class, p_currency,
-             p_reserved_by)
-        returning id into v_id;
-    exception when unique_violation then
-        -- Course avec une réservation concurrente de la MÊME action : ce bloc
-        -- est annulé (l'UPDATE du plafond aussi) et on rend la réservation
-        -- gagnante — si elle décrit la même action (sinon : erreur).
-        select r.* into v_existing
-          from standing_reservations r
-         where r.grant_id = p_grant_id and r.action_id = p_action_id
-           and r.released_at is null;
-        perform ameesh_standing_same_action(v_existing, p_amount, p_connector, p_operation,
-                                            p_class, p_currency);
-        return query
-            select v_existing.id, s.id, v_existing.amount, s.consumed_amount, s.max_amount, true
-              from standing_approvals s
-             where s.id = p_grant_id;
+    perform 1 from authenticators a
+     where a.id = v_grant.authenticator_id and a.revoked_at is null;
+    if not found then
         return;
-    end;
-    return query
-        select v_id, p_grant_id, p_amount, v_grant.consumed_amount, v_grant.max_amount, false;
+    end if;
+    if v_grant.connector is distinct from p_connector
+       or not coalesce(v_grant.operations @> jsonb_build_array(p_operation), false)
+       or v_grant.action_class is distinct from p_class
+       or (p_amount > 0 and (p_currency is null or v_grant.currency is distinct from p_currency))
+    then
+        return;
+    end if;
+    if v_live.id is not null then
+        return query select v_live.id, v_grant.id, v_live.amount, v_grant.consumed_amount,
+                            v_grant.max_amount, true;
+        return;
+    end if;
+    if v_grant.consumed_amount + p_amount > v_grant.max_amount then
+        return;
+    end if;
+    update standing_approvals s
+       set consumed_amount = s.consumed_amount + p_amount,
+           uses = s.uses + 1,
+           last_used_at = clock_timestamp()
+     where s.id = p_grant_id
+    returning s.consumed_amount into v_consumed;
+    insert into standing_reservations
+        (grant_id, action_id, amount, connector, operation, action_class, currency, reserved_by)
+    values
+        (p_grant_id, p_action_id, p_amount, p_connector, p_operation, p_class, p_currency,
+         p_reserved_by)
+    returning id into v_id;
+    return query select v_id, p_grant_id, p_amount, v_consumed, v_grant.max_amount, false;
 end
 $$;
 
