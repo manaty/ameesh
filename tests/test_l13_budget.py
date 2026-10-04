@@ -331,5 +331,146 @@ class BudgetGateTest(PgTestCase):
             worker.watchdog_stop.set()
 
 
+class AnnouncedModelTest(PgTestCase):
+    """Verdict codex3 L13 B4 : le modèle **annoncé par le flux** est celui qu'on
+    facture, y compris quand l'écriture du grand livre échoue et qu'un autre
+    worker répare. L'annonce vit donc en base dès qu'elle arrive."""
+
+    def setUp(self):
+        super().setUp()
+        self.name = "annonce"
+        self.db.execute("DELETE FROM turn_costs")
+        self.db.execute("DELETE FROM spend_pending WHERE agent = %s", (self.name,))
+        cwd = os.path.join(self.tmp, "work", self.name)
+        os.makedirs(cwd, exist_ok=True)
+        self.register(self.name, "deepseek", cwd=cwd)
+        registry.upsert(self.db, self.name, model="deepseek-flash")  # lancement : flash
+        cfg = dataclasses.replace(self.cfg, budget_usd_per_hour=0.4, budget_check_interval=0.0)
+        self.runner = Runner(cfg, self.db, once=True)
+        self.lease = registry.claim(self.db, self.name, self.runner.runner_id, 3600)
+        self.workers = []
+        self.worker = self._worker()
+        self.bins = os.path.join(self.tmp, "bin-annonce")
+        os.makedirs(self.bins, exist_ok=True)
+
+    def tearDown(self):
+        for worker in self.workers:
+            worker.watchdog_stop.set()
+        super().tearDown()
+
+    def _worker(self) -> AgentWorker:
+        worker = AgentWorker(self.runner, registry.get(self.db, self.name), self.lease)
+        self.workers.append(worker)
+        return worker
+
+    def _harnais(self, *events: dict) -> dict:
+        """Un faux `dsh` qui joue ces événements, comme le vrai flux."""
+        chemin = os.path.join(self.bins, "dsh")
+        with open(chemin, "w", encoding="utf-8") as fh:
+            fh.write("#!/usr/bin/env python3\n")
+            for event in events:
+                fh.write("print(%r, flush=True)\n" % json.dumps(event))
+        os.chmod(chemin, 0o700)
+        return {"AMEESH_BIN_DIR": self.bins}
+
+    def _flux_pro(self, *, annonces: int = 1) -> dict:
+        evenements = [{"type": "session", "sessionId": "s", "model": "deepseek-pro"}
+                      for _ in range(annonces)]
+        evenements += [{"type": "status", "phase": "step_end",
+                        "usage": {"inputTokens": 1_000_000}},
+                       {"type": "final", "text": "ok"}]
+        return self._harnais(*evenements)
+
+    def _tour(self, worker: AgentWorker, env: dict) -> bool:
+        with mock.patch.dict(os.environ, env, clear=False):
+            return worker.run_turn({"kind": "prompt", "prompt": "payé", "ids": []})
+
+    def _ligne(self) -> dict:
+        return self.db.query("select model, usd from turn_costs where agent = %s",
+                             (self.name,))[0]
+
+    def test_annonce_persistee_et_facturee_par_un_autre_worker_apres_panne(self):
+        """La sonde B4 : lancement flash, flux pro, grand livre en panne, nouveau
+        worker : la réparation facture pro (0,55 $/M), pas flash (0,27)."""
+        env = self._flux_pro()
+        with mock.patch("ameesh.cost.CostBook.record",
+                        side_effect=RuntimeError("grand livre indisponible")):
+            self.assertTrue(self._tour(self.worker, env))
+        marqueur = registry.pending_spend_get(self.db, self.name)
+        self.assertEqual(marqueur["model"], "deepseek-pro", "annonce non persistée")
+        autre = self._worker()
+        self.assertTrue(autre._compta_en_echec)
+        autorise = autre.budget_ok()  # réparation, puis décision du plafond
+        ligne = self._ligne()
+        self.assertEqual(ligne["model"], "deepseek-pro")
+        self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
+        self.assertFalse(autorise, "0,55 $ dépasse le plafond de 0,40 $/h")
+        self.assertIsNone(registry.pending_spend_get(self.db, self.name))
+
+    def test_annonce_ecrite_une_fois_par_changement_pas_a_chaque_ligne(self):
+        env = self._flux_pro(annonces=5)
+        reel = registry.pending_spend_set_model
+        with mock.patch("ameesh.registry.pending_spend_set_model", side_effect=reel) as appels:
+            self.assertTrue(self._tour(self.worker, env))
+        self.assertEqual(appels.call_count, 1)
+        self.assertEqual(self._ligne()["model"], "deepseek-pro")
+
+    def test_annonce_identique_au_lancement_n_ecrit_rien_de_plus(self):
+        env = self._harnais({"type": "session", "sessionId": "s", "model": "deepseek-flash"},
+                            {"type": "status", "phase": "step_end", "usage": {"inputTokens": 1_000_000}},
+                            {"type": "final", "text": "ok"})
+        self.assertTrue(self._tour(self.worker, env))
+        ligne = self._ligne()
+        self.assertEqual(ligne["model"], "deepseek-flash")
+        self.assertAlmostEqual(float(ligne["usd"]), 0.27, places=6)
+
+    def test_annonce_non_persistee_suspend_et_ce_worker_repare_au_bon_tarif(self):
+        """Si la base refuse l'annonce, les tours se suspendent (fail-closed) et la
+        mémoire de CE worker garde le modèle : sa réparation facture pro."""
+        env = self._flux_pro()
+        with mock.patch("ameesh.registry.pending_spend_set_model",
+                        side_effect=db_mod.DbError("base indisponible")), \
+                mock.patch("ameesh.cost.CostBook.record",
+                           side_effect=RuntimeError("grand livre indisponible")):
+            self.assertTrue(self._tour(self.worker, env))
+        self.assertTrue(self.worker._compta_en_echec)
+        self.assertEqual(registry.pending_spend_get(self.db, self.name)["model"], "deepseek-flash")
+        self.worker.budget_ok()  # la réparation de ce worker passe par sa mémoire
+        ligne = self._ligne()
+        self.assertEqual(ligne["model"], "deepseek-pro")
+        self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
+
+    def test_marqueur_absent_pendant_le_tour_est_un_echec_pas_une_autorisation(self):
+        env = self._flux_pro()
+        with mock.patch("ameesh.registry.pending_spend_set_model", return_value=False):
+            self.assertTrue(self._tour(self.worker, env))
+        # le tour a pourtant été compté (le marqueur existait pour `_compta_termine`)
+        self.assertEqual(self._ligne()["model"], "deepseek-pro")
+        self.assertFalse(self.worker._compta_en_echec, "la ligne écrite lève la suspension")
+
+    def test_la_memoire_de_l_annonce_est_remise_a_zero_par_le_marqueur_d_un_tour_neuf(self):
+        """Une annonce gardée parce que le grand livre était en panne ne doit pas
+        coller à un tour suivant : le marqueur d'un tour neuf l'efface."""
+        env = self._flux_pro()
+        with mock.patch("ameesh.cost.CostBook.record", side_effect=RuntimeError("panne")):
+            self.assertTrue(self._tour(self.worker, env))
+        self.assertEqual(self.worker._annonce_ram, "deepseek-pro")
+        self.assertTrue(self.worker._compta_marque(0, "suivant", "deepseek-flash"))
+        self.assertEqual(self.worker._annonce_ram, "")
+
+    def test_un_tour_neuf_n_herite_pas_de_l_annonce_du_precedent(self):
+        env = self._flux_pro()
+        self.assertTrue(self._tour(self.worker, env))
+        self.assertEqual(self.worker._annonce_ram, "")
+        sans_annonce = self._harnais({"type": "status", "phase": "step_end",
+                                      "usage": {"inputTokens": 1_000_000}},
+                                     {"type": "final", "text": "ok"})
+        self.db.execute("DELETE FROM turn_costs")
+        self.assertTrue(self._tour(self.worker, sans_annonce))
+        ligne = self._ligne()
+        self.assertEqual(ligne["model"], "deepseek-flash")  # le lancement, pas le tour d'avant
+        self.assertAlmostEqual(float(ligne["usd"]), 0.27, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()

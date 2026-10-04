@@ -42,6 +42,7 @@ import glob
 import json
 import os
 import re
+import math
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, Sequence
@@ -147,11 +148,30 @@ def load_prices(path: str | None = None) -> dict:
                 loaded = json.load(fh)
             if isinstance(loaded, dict):
                 for key, value in loaded.items():
-                    if isinstance(value, (list, tuple)) and len(value) == 3:
-                        prices[str(key)] = [float(v) for v in value]
+                    triplet = _valid_triplet(value)
+                    if triplet is not None:
+                        prices[str(key)] = triplet
         except (OSError, ValueError):
             pass
     return prices
+
+
+def _valid_triplet(value) -> list | None:
+    """Un triplet de prix exploitable, ou None.
+
+    Trois nombres **finis et positifs ou nuls**. Un prix négatif, `NaN` ou
+    infini ne doit jamais entrer dans le barème : il baisserait une dépense, ou
+    rendrait le majorant incalculable (L13 B6, fail-closed).
+    """
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        return None
+    try:
+        triplet = [float(v) for v in value]
+    except (TypeError, ValueError):
+        return None
+    if any(not math.isfinite(v) or v < 0 for v in triplet):
+        return None
+    return triplet
 
 
 #: familles de modèles par harnais (préfixes de clés du barème) : sert au
@@ -171,19 +191,34 @@ def price_of(prices: dict, harness: str, model: str | None) -> list:
 
 
 def max_price_of(prices: dict, harness: str) -> list:
-    """Le tarif le plus cher **connu** de la famille du harnais.
+    """Un **majorant sûr** du tarif d'un modèle inconnu de la famille du harnais.
+
+    Le maximum se prend **composante par composante** — entrée, entrée en cache,
+    sortie — sur tous les tarifs connus de la famille. Le triplet obtenu coûte,
+    pour n'importe quel mélange de jetons, **au moins autant que n'importe quel
+    modèle connu** : un barème où le modèle le plus cher en entrée est le moins
+    cher en sortie (`flash [10,1,1]`, `pro [5,1,100]`) donne `[10,1,100]`, jamais
+    `flash` seul (B6 : on ne comparait que l'entrée, et un modèle inconnu qui
+    produit 1 M de jetons de sortie était facturé 1 $ au lieu de 100 $).
 
     Un modèle inconnu (ou vide) ne doit jamais être facturé au tarif par défaut,
-    qui est le moins cher : on prend le plus cher de la famille, pour ne jamais
-    sous-estimer une dépense (0019 §3, repli fail-closed).
+    qui est le moins cher (0019 §3, repli fail-closed). Si la famille n'a aucun
+    tarif connu, on prend le maximum composante par composante de **tout** le
+    barème utilisable plutôt que le défaut d'un harnais.
     """
     prefixes = PRICE_FAMILY.get(harness, ())
-    candidats = [value for key, value in prices.items()
-                 if value and not key.startswith("default-")
-                 and any(key.startswith(prefixe) for prefixe in prefixes)]
+
+    def connus(retenir) -> list:
+        return [triplet for key, value in prices.items()
+                if not key.startswith("default-") and retenir(key)
+                for triplet in [_valid_triplet(value)] if triplet is not None]
+
+    candidats = connus(lambda key: any(key.startswith(prefixe) for prefixe in prefixes))
     if not candidats:
-        return prices.get("default-%s" % harness) or prices["default-deepseek"]
-    return max(candidats, key=lambda triplet: triplet[0])
+        candidats = connus(lambda key: True)
+    if not candidats:
+        return list(prices.get("default-%s" % harness) or prices["default-deepseek"])
+    return [max(triplet[i] for triplet in candidats) for i in range(3)]
 
 
 class CostBook:

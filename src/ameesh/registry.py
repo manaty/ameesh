@@ -520,6 +520,21 @@ def pending_spend_put(db: Db, name: str, start_index: int, turn: str | None = No
     return bool(rows)
 
 
+def pending_spend_set_model(db: Db, name: str, model: str | None) -> bool:
+    """Remplace le modèle du marqueur par celui **annoncé par le flux** (L13 B4).
+
+    L'annonce doit vivre en base dès qu'elle arrive : si l'écriture comptable
+    échoue et qu'un **autre** worker répare, il doit facturer le modèle
+    réellement utilisé, pas celui du lancement. Faux si aucun marqueur n'existe
+    (rien n'a été mis à jour) : l'appelant le traite comme un échec.
+    """
+    rows = db.query(
+        "UPDATE spend_pending SET model = %s WHERE agent = %s RETURNING agent",
+        (model if model is not None else "", name),
+    )
+    return bool(rows)
+
+
 def pending_spend_get(db: Db, name: str) -> dict | None:
     """Le marqueur comptable en attente, ou None (aucun travail suspendu)."""
     rows = db.query(

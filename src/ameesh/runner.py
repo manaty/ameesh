@@ -176,6 +176,10 @@ class AgentWorker(threading.Thread):
         #: la comptabilité du dernier tour a échoué : plus de tour à l'aveugle.
         #: Un marqueur persistant rend la suspension durable au redémarrage (B5).
         self._compta_en_echec = self._compta_en_attente() is not None
+        #: modèle annoncé par le flux du tour en cours, gardé en mémoire **en plus** de
+        #: la base : si l'écriture du marqueur échoue, ce worker-ci répare quand même
+        #: au bon tarif (L13 B4). Effacé quand la ligne du grand livre est écrite.
+        self._annonce_ram = ""
         #: rotation de session (0018) : compteurs de la session courante
         self.resume_summary = ""
         self.session_turns = 0
@@ -830,6 +834,7 @@ class AgentWorker(threading.Thread):
         Si la pose échoue, le tour ne démarre pas : aucune dépense sans trace
         possible (fail-closed).
         """
+        self._annonce_ram = ""  # un tour neuf n'a encore rien annoncé
         try:
             registry.pending_spend_put(self.db, self.name, int(start), tour,
                                        model if model is not None else "")
@@ -866,6 +871,7 @@ class AgentWorker(threading.Thread):
                         # jamais un repli sur un état local mutable.
                         model=travail.get("model"))
             registry.pending_spend_clear(self.db, self.name)
+            self._annonce_ram = ""
             self._compta_en_echec = False
             return True
         except Exception as exc:  # panne non fatale au tour, mais fail-closed
@@ -878,9 +884,31 @@ class AgentWorker(threading.Thread):
         """Avant un tour : rejoue le travail en attente ; `{}` suspend."""
         travail = self._compta_en_attente()
         if travail:
+            if self._annonce_ram:
+                # Ce worker a vu l'annonce du flux ; si la base ne l'a pas gardée,
+                # la mémoire fait foi (jamais le modèle du lancement).
+                travail = dict(travail, model=self._annonce_ram)
             self._compta_ecrit(travail)
         elif travail is not None:
             self._compta_en_echec = True  # marqueur incohérent : jamais autoriser
+
+    def _compta_annonce(self, modele: str) -> None:
+        """Garde le modèle annoncé par le flux : mémoire d'abord, puis base (L13 B4).
+
+        Persisté **dès sa réception** dans `spend_pending.model` : si la ligne du
+        grand livre ne peut pas s'écrire, la réparation (ce worker, ou un autre
+        après un redémarrage) facture le modèle réellement utilisé. Un échec de
+        persistance — erreur de base, ou marqueur absent — suspend les tours
+        (fail-closed) ; la mémoire garde l'annonce pour la réparation de ce worker.
+        """
+        self._annonce_ram = modele
+        try:
+            if not registry.pending_spend_set_model(self.db, self.name, modele):
+                raise db_mod.DbError("aucun marqueur comptable à mettre à jour")
+        except db_mod.DbError as exc:
+            self._compta_en_echec = True
+            log_async("[%s] modèle annoncé non persisté (%s) : tours suspendus"
+                      % (self.name, " ".join(str(exc).split())[:120]))
 
     def _compta_termine(self, model_annonce: str | None = None) -> None:
         """Après un tour : écrit la ligne du grand livre.
@@ -1108,8 +1136,9 @@ class AgentWorker(threading.Thread):
                         session_new = parsed["session"]
                         self.write_session_file(session_new)
                         registry.set_session(self.db, self.name, session_new)
-                    if parsed.get("model"):
+                    if parsed.get("model") and parsed["model"] != modele_annonce:
                         modele_annonce = parsed["model"]  # source du tour (L13 B4)
+                        self._compta_annonce(modele_annonce)  # persisté tout de suite
                     for text in parsed.get("display") or []:
                         log("[%s] %s" % (self.name, text))
                         self.last_output = (self.last_output + "\n" + text)[-4000:]

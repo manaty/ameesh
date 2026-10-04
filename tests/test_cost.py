@@ -237,6 +237,68 @@ class TurnAccountingTest(Sandbox, PgTestCase):
                                      "outputTokens": 0}})
         self.assertAlmostEqual(self.book().turn_usage("a1").usd, 1.0)
 
+    # -- majorant d'un modèle inconnu (L13 B6) --------------------------------
+    def _bareme_croise(self) -> str:
+        """flash est le plus cher en entrée et le moins cher en sortie : le piège."""
+        chemin = os.path.join(self.tmp_cost, "prices.json")
+        with open(chemin, "w", encoding="utf-8") as fh:
+            json.dump({"deepseek-flash": [10, 1, 1], "deepseek-pro": [5, 1, 100]}, fh)
+        return chemin
+
+    def test_majorant_composante_par_composante_et_non_sur_l_entree_seule(self):
+        prix = cost.load_prices(self._bareme_croise())
+        self.assertEqual(cost.max_price_of(prix, "deepseek"), [10.0, 1.0, 100.0])
+
+    def test_modele_inconnu_ne_sous_estime_ni_l_entree_ni_la_sortie(self):
+        """La sonde B6 : 1 M de sortie d'un modèle inconnu coûte 100, pas 1."""
+        chemin = self._bareme_croise()
+        self.agent("a1", "deepseek")
+        self.events("a1", {"type": "status", "phase": "step_end",
+                           "usage": {"outputTokens": 1_000_000}})
+        book = cost.CostBook(state_dir=self.state, codex_sessions=self.codex,
+                             prices_path=chemin, tools={"a1": "deepseek"})
+        self.assertAlmostEqual(book.turn_usage("a1", model="").usd, 100.0)
+        self.assertAlmostEqual(book.turn_usage("a1", model="modele-inconnu").usd, 100.0)
+        self.events("a1", {"type": "status", "phase": "step_end",
+                           "usage": {"inputTokens": 1_000_000}})
+        # (l'entrée s'ajoute au flux : 1 M entrée à 10 + 1 M sortie à 100)
+        self.assertAlmostEqual(book.turn_usage("a1", model="").usd, 110.0)
+
+    def test_le_majorant_coute_au_moins_chaque_modele_connu_pour_tout_melange(self):
+        prix = cost.load_prices(self._bareme_croise())
+        majorant = cost.max_price_of(prix, "deepseek")
+        connus = [prix[cle] for cle in prix
+                  if cle.startswith("deepseek-") and not cle.startswith("default-")]
+        for entree in (0, 1, 1_000_000):
+            for cache in (0, 1, 500_000):
+                for sortie in (0, 1, 1_000_000):
+                    def cout(triplet):
+                        return entree * triplet[0] + cache * triplet[1] + sortie * triplet[2]
+                    for triplet in connus:
+                        self.assertGreaterEqual(cout(majorant), cout(triplet))
+
+    def test_defauts_inchanges_quand_le_plus_cher_l_est_partout(self):
+        self.assertEqual(cost.max_price_of(cost.DEFAULT_PRICES, "deepseek"),
+                         cost.DEFAULT_PRICES["deepseek-pro"])
+
+    def test_prix_invalides_ne_rentrent_pas_dans_le_bareme(self):
+        chemin = os.path.join(self.tmp_cost, "prices.json")
+        with open(chemin, "w", encoding="utf-8") as fh:
+            fh.write('{"deepseek-neg": [-1, 0, 0], "deepseek-court": [1, 2],'
+                     ' "deepseek-texte": ["a", 1, 1], "deepseek-nan": [NaN, 1, 1],'
+                     ' "deepseek-inf": [1, 1, Infinity], "deepseek-ok": [2, 1, 3]}')
+        prix = cost.load_prices(chemin)
+        for cle in ("deepseek-neg", "deepseek-court", "deepseek-texte", "deepseek-nan", "deepseek-inf"):
+            self.assertNotIn(cle, prix)
+        self.assertEqual(prix["deepseek-ok"], [2.0, 1.0, 3.0])
+        # seuls les tarifs valides comptent : le majorant est celui des défauts et de `deepseek-ok`
+        self.assertEqual(cost.max_price_of(prix, "deepseek"), [2.0, 1.0, 3.0])
+
+    def test_famille_sans_tarif_connu_prend_le_pire_de_tout_le_bareme(self):
+        prix = {"gpt-x": [3, 1, 30], "default-claude": [0.1, 0.1, 0.1], "default-deepseek": [0.2, 0.2, 0.2]}
+        self.assertEqual(cost.max_price_of(prix, "claude"), [3.0, 1.0, 30.0])
+        self.assertEqual(cost.max_price_of({"default-claude": [1, 2, 3]}, "claude"), [1, 2, 3])
+
     def test_bareme_surchargeable_par_l_environnement(self):
         # La variable d'environnement évite d'avoir à connaître le chemin par
         # défaut du poste (et les tests ne le lisent jamais).
