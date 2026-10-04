@@ -11,6 +11,7 @@
   ameesh key …                clés publiques (propriétaire / agent) ;
   ameesh approve | approvals | verify   approbations signées ;
   ameesh work …               lots (work_items) ;
+  ameesh cost …               coût des tours et jauges de forfait ;
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
   ameesh migrate | doctor     schéma et diagnostic.
 
@@ -23,7 +24,7 @@ import sys
 
 #: sous-commandes servies par mesh_cli (parseur déjà en place)
 MESH_COMMANDS = (
-    "list", "show", "key", "approve", "approvals", "verify", "work",
+    "list", "show", "key", "approve", "approvals", "verify", "work", "cost",
     "migrate", "doctor", "import-v0", "export-v0",
 )
 
