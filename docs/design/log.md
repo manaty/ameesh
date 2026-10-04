@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-04 (modèles)
+* **Décision** : [catalogue et évaluation des modèles](decisions/0020-catalogue-et-evaluation-des-modeles.md) ; R21 ; lots L14–L15.
+
 ## 2026-10-04 (vitesse et budgets)
 * **Décision** : [vitesse](decisions/0018-vitesse-des-agents.md) et [budgets](decisions/0019-budgets-et-routage.md) (transmises par l'orchestrateur Nexlink) ; exigences R19–R20 ; lots L10–L13.
 
