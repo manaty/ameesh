@@ -6,7 +6,8 @@
                                          unreadable), état enregistré au registre,
                                          placements de l'hôte admis ou refusés (C4)
   ameesh canon show [--json]             fiches lues, et d'où (commit)
-  ameesh canon sync [--host H] [--json]  canon → registre de l'hôte (§4.4) ; enregistre
+  ameesh canon sync [--host H] [--json] [--bootstrap-ref BRANCHE]
+                                         canon → registre de l'hôte (§4.4) ; enregistre
                                          l'état du canon (canon_state), même illisible,
                                          et le verdict de placement de chaque agent ;
                                          recopie Member.authenticators dans le registre
@@ -20,6 +21,12 @@
 
 Options communes du canon : `--canon DOSSIER` (sinon AMEESH_CANON), `--ref REV`
 (sinon AMEESH_CANON_REF, le `ref` du manifeste, origin/main), `--fetch`.
+
+Registre des authentificateurs (§8.2) : `--ref` choisit ce qui est LU, jamais
+ce qui est canonique. La branche canonique de confiance est celle de la
+configuration de l'hôte (AMEESH_CANON_REF / `canon_ref`), sinon celle du
+manifeste du dernier commit appliqué (journal en base), sinon — premier
+amorçage — `--bootstrap-ref BRANCHE` (journalisé) ; sans rien de cela, refus.
 """
 from __future__ import annotations
 
@@ -218,7 +225,11 @@ def cmd_sync(cfg: Config, args: argparse.Namespace) -> int:
     try:
         db_mod.require_schema(db)
         try:
-            report = canon_sync.sync(db, canon, host)
+            # registre des authentificateurs : la branche canonique de confiance
+            # vient de la configuration de l'hôte (cfg.canon_ref, jamais --ref),
+            # du dernier commit appliqué, ou de --bootstrap-ref au premier amorçage
+            report = canon_sync.sync(db, canon, host, trusted_ref=cfg.canon_ref,
+                                     bootstrap_ref=args.bootstrap_ref or "")
         except canon_sync.CanonUnreadable as exc:
             return _print_unreadable(args, canon, exc)
     finally:
@@ -254,6 +265,11 @@ def _print_authenticators(done: canon_sync.AuthenticatorSync | None) -> None:
     """Le registre des authentificateurs (§8.2) après la synchronisation."""
     if done is None:
         return
+    if done.branch:
+        print("authentificateurs : branche canonique de confiance %s (%s)" % (
+            done.branch, canon_sync.TRUST_LABELS.get(done.trust, done.trust)))
+    for note in done.notes:
+        print("authentificateurs : %s" % note)
     if done.status != canon_sync.AUTH_SYNCED:
         print("authentificateurs : %s%s" % (
             "REFUSÉ — " if done.status == canon_sync.AUTH_REFUSED else "", done.reason))
@@ -434,6 +450,11 @@ def add_parsers(sub) -> None:
     p_sync = canon_sub.add_parser("sync", help="canon → registre de l'hôte (§4.4)")
     _canon_options(p_sync)
     p_sync.add_argument("--host", default=None, help="hôte (sinon AMEESH_HOST / cette machine)")
+    p_sync.add_argument("--bootstrap-ref", default=None, metavar="BRANCHE",
+                        help="premier amorçage du registre des authentificateurs seulement "
+                             "(ni AMEESH_CANON_REF, ni commit déjà appliqué) : branche "
+                             "canonique de confiance (origin/<BRANCHE>), journalisée ; "
+                             "ignorée ensuite")
     p_sync.set_defaults(func=cmd_sync)
 
     p_place = sub.add_parser("placement", help="placement gouverné (C4) : check")

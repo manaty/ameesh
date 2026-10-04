@@ -1297,8 +1297,8 @@ class AuthenticatorSyncTest(_TmpMixin, PgTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.db.execute("DELETE FROM canon_state")
-        self.db.execute("TRUNCATE authenticators, standing_approvals, standing_reservations "
-                        "RESTART IDENTITY CASCADE")
+        self.db.execute("TRUNCATE authenticators, standing_approvals, standing_reservations, "
+                        "authenticator_syncs RESTART IDENTITY CASCADE")
         self.workspace = self.make_tmp()
         self.bare, self.clone = publish(self.workspace, "acme", EXAMPLE)
         self.alice = SoftWebAuthn()
@@ -1312,8 +1312,12 @@ class AuthenticatorSyncTest(_TmpMixin, PgTestCase):
             write(clone, "membres/%s.md" % title, text)
         return commit_all(clone, message, push=push)
 
-    def sync(self, clone: str | None = None, **kwargs) -> canon_sync.SyncReport:
-        return canon_sync.sync(self.db, canon.load(clone or self.clone, **kwargs), "atelier")
+    def sync(self, clone: str | None = None, *, bootstrap_ref: str = "main",
+             trusted_ref: str = "", **kwargs) -> canon_sync.SyncReport:
+        """`canon sync` ; le premier amorçage du registre se fait sur main
+        (--bootstrap-ref, ignoré une fois le registre amorcé)."""
+        return canon_sync.sync(self.db, canon.load(clone or self.clone, **kwargs), "atelier",
+                               bootstrap_ref=bootstrap_ref, trusted_ref=trusted_ref)
 
     def rows(self, include_revoked: bool = False) -> list[dict]:
         return receipts.list_authenticators(self.db, include_revoked=include_revoked)

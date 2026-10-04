@@ -222,9 +222,16 @@ class BoutEnBoutTest(PgTestCase):
 
     # 2 ----------------------------------------------------------------------
     def etape_2_canon_sync(self) -> None:
-        report = json.loads(self.run_mesh("canon", "sync", "--json").stdout)
+        # premier amorçage du registre des authentificateurs : la branche
+        # canonique de confiance est donnée explicitement (journalisé), jamais
+        # tirée du commit lu
+        report = json.loads(self.run_mesh("canon", "sync", "--json",
+                                          "--bootstrap-ref", "main").stdout)
         self.assertEqual((report["host"], report["canon_status"], report["errors"],
                           report["untrusted"]), (HOST, "ok", 0, False))
+        self.assertEqual((report["authenticators"]["status"], report["authenticators"]["trust"],
+                          report["authenticators"]["branch"]),
+                         ("synced", "bootstrap", "origin/main"))
         self.assertEqual({a["agent"]: a["action"] for a in report["actions"]},
                          {"orchestre": "créé", "relecteur": "créé"})
         for name, harness in (("orchestre", "claude"), ("relecteur", "codex")):
@@ -340,6 +347,8 @@ class BoutEnBoutTest(PgTestCase):
         done = report["authenticators"]
         self.assertEqual((done["status"], done["errors"], done["added"]),
                          ("synced", [], ["%s/webauthn/%s" % (ALICE, soft.credential_id)]))
+        # la branche de confiance vient du dernier commit appliqué (étape 2)
+        self.assertEqual((done["trust"], done["branch"]), ("applied", "origin/main"))
         rows = receipts.list_authenticators(self.db, approver=ALICE)
         self.assertEqual([(r["facade"], r["credential_id"]) for r in rows],
                          [("webauthn", soft.credential_id)])

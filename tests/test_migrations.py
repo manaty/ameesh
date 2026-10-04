@@ -24,7 +24,8 @@ class MigrationsTest(PgTestCase):
         names = {int(row["version"]): row["name"] for row in rows}
         expected = {1: "init", 2: "overview", 3: "authority", 4: "work_items", 5: "key_roles",
                     6: "authority_fixes", 7: "nonces_backfill", 8: "canon", 9: "threads",
-                    11: "receipts", 12: "events", 14: "cost", 22: "placement"}
+                    11: "receipts", 12: "events", 14: "cost", 22: "placement",
+                    23: "authenticator_syncs"}
         self.assertEqual({v: names.get(v) for v in expected}, expected)
         for row in rows:
             self.assertEqual(len(row["checksum"]), 64)

@@ -12,6 +12,10 @@ jamais pris en compte (seulement signalé). Un dossier qui n'est pas un dépôt
 git n'est lu qu'avec `AMEESH_CANON_UNTRUSTED=1` (tests, prototypes), et chaque
 constat le signale.
 
+Ce module dit ce qui est LU. Ce qui FAIT FOI pour le registre des
+authentificateurs (§8.2) n'est jamais tiré du commit lu (son propre
+manifeste pourrait s'autoriser) : voir `canon_sync.sync_authenticators`.
+
 Fédération : si `federation.yaml` est présent à la racine, ses membres
 présents localement (`workspace_path`, relatif au dossier de travail commun,
 comme le validateur OKF Federation) sont lus aussi, chacun à `origin/<ref>`
@@ -1011,6 +1015,53 @@ def _git_blobs(repo: str, shas: Iterable[str]) -> dict[str, bytes]:
 def _git_read(repo: str, commit: str, path: str) -> bytes | None:
     proc = _git(repo, "cat-file", "blob", "%s:%s" % (commit, path))
     return proc.stdout if proc.returncode == 0 else None
+
+
+def git_read(repo: str, commit: str, path: str) -> bytes | None:
+    """Contenu de `path` au commit `commit` (objets git), ou None."""
+    if not _SHA_RE.fullmatch(commit or ""):
+        return None
+    try:
+        return _git_read(repo, commit, path)
+    except GitError:
+        return None
+
+
+def git_remotes(repo: str) -> list[str]:
+    try:
+        return (_git_out(repo, "remote") or "").split()
+    except GitError:
+        return []
+
+
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]*$")
+
+
+def remote_branch(repo: str, name: str) -> str | None:
+    """La branche de suivi distant que `name` désigne (`origin/main`), ou None.
+
+    `main` → `origin/main` ; `origin/main` (un dépôt distant connu) et
+    `refs/remotes/origin/main` → `origin/main` ; `refs/heads/main` →
+    `origin/main`. Un SHA, une expression de révision (`~`, `^`, `@{`, `..`)
+    ou un nom vide ne sont pas une branche : None. La résolution se fait
+    ensuite par `refs/remotes/<branche>`, jamais par un nom court qu'une
+    branche locale ou une étiquette homonyme pourrait masquer.
+    """
+    text = (name or "").strip()
+    if not text or _SHA_RE.fullmatch(text):
+        return None
+    if text.startswith("refs/remotes/"):
+        short = text[len("refs/remotes/"):]
+    elif text.startswith("refs/heads/"):
+        short = "%s/%s" % (DEFAULT_REMOTE, text[len("refs/heads/"):])
+    elif "/" in text and text.split("/", 1)[0] in git_remotes(repo):
+        short = text
+    else:
+        short = "%s/%s" % (DEFAULT_REMOTE, text)
+    if (not _BRANCH_RE.fullmatch(short) or ".." in short or "//" in short
+            or short.endswith(("/", ".lock", ".")) or "/" not in short):
+        return None
+    return short
 
 
 def _remote_of(repo: str, rev: str) -> str:
