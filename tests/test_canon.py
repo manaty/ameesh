@@ -1148,8 +1148,13 @@ class ClaimRuleTest(_TmpMixin, PgTestCase):
         proc = self.runner("register", "canonique", "claude", "--cwd", cwd,
                            "--prompt", "tour", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        # placement admis pour son profil, comme l'écrirait `canon sync` (C4, L3) :
+        # seul l'état du canon est en jeu ici (test_placement couvre le placement)
         self.db.execute("UPDATE agent_registry SET canon_ref = 'canon:agents/c.md@abc', "
-                        "responsible = 'human:alice' WHERE name = 'canonique'")
+                        "responsible = 'human:alice', placement_ok = true, "
+                        "placement_profile = ameesh_placement_profile("
+                        "host, harness, provider, model, credential_mode) "
+                        "WHERE name = 'canonique'")
         self.runner("--once", "--agents", "canonique", env=env)
         self.assertEqual(self.turns(), [])                    # aucun état : jamais vérifié
         canon_sync.record_state(self.db, "h-canon", canon_sync.CANON_UNREADABLE,

@@ -296,6 +296,46 @@ test (trois messages → trois notifications) a attrapé le bug.
   interactif sur la **même session** (sans `-p`/`exec`/`--json`), le bail est
   renouvelé tant que la session vit, le harnais est tué si le bail est perdu, et
   le bail est rendu à la sortie.
+* **Interruption prioritaire (0018, R19)** : un message non remis marqué
+  `payload.urgent` venu d'un **expéditeur habilité** (`AMEESH_INTERRUPT_SENDERS`
+  sans canon ; la capacité « interrupt » d'une fiche canon s'ajoutera) arrête le
+  tour en cours (SIGTERM bref puis SIGKILL), remet la consigne du tour en
+  attente, et `pick()` sert le message prioritaire **en tête** au tour suivant,
+  sur la même session. Un urgent d'un expéditeur non habilité est remis comme un
+  message normal, et l'abus est journalisé ; le fil garde la trace de
+  l'interruption et de sa raison.
+* **Rotation de session (0018)** : quand la session dépasse
+  `AMEESH_SESSION_MAX_TOKENS` (défaut 150 000) ou qu'un tour a duré plus de
+  `AMEESH_SESSION_MAX_TURN_SECONDS` (défaut 900 s), après au moins
+  `AMEESH_SESSION_MIN_TURNS` tours (défaut 3) et **jamais pendant un tour**, un
+  tour de résumé est joué dans la session, le résumé est écrit dans le fil
+  (R12), l'ancien id de session est conservé dans
+  `<état>/<agent>/session-history.jsonl`, puis la session est oubliée : le tour
+  suivant ouvre une session neuve préfixée par le résumé.
+* **Dossier de travail déplacé (0018)** : à l'inscription, l'identité git du
+  dossier (dépôt commun + branche) est écrite dans
+  `<état>/<agent>/worktree.json`. Si le cwd a disparu, un candidat **unique**
+  est cherché sous `AMEESH_WORKTREE_ROOTS` (défaut `~/development`), en
+  profondeur bornée — les worktrees imbriqués (`.claude/worktrees/<nom>`) sont
+  traversés, les dépendances et `.git` non — ; il est adopté (registre mis à
+  jour, fil prévenu) s'il n'est pas déjà le cwd d'un autre agent.
+* **Point de passage unique d'arrêt** — tout arrêt de harnais (échéance du
+  bail, bail perdu, arrêt de l'exécuteur, préemption prioritaire, et demain
+  garde de budget L13) passe par `stop_group_now(raison)` : le signal part
+  **avant** tout journal, la journalisation passe par la file bornée, et une
+  publication tardive du `Popen` est rattrapée par un recontrôle unique
+  (`kill_if_stop_requested`). Un nouveau chemin d'arrêt hérite donc des mêmes
+  sondes ; la suite de tests **paramétrée** (`StopTriggersTest`) rejoue pour
+  chaque déclencheur les trois scénarios — harnais publié, journal saturé,
+  `Popen` publié en retard.
+* **`canon sync` par l'exécuteur (spec §4.4)** : quand un canon est configuré,
+  l'exécuteur lance `canon sync` pour son hôte **au démarrage**, puis
+  périodiquement (`AMEESH_CANON_SYNC_INTERVAL`, défaut 300 s ; 0 = seulement au
+  démarrage). Le sync tourne dans son propre fil avec sa propre connexion ; un
+  échec (canon illisible, git, base) est journalisé par la file bornée et
+  **n'arrête jamais l'exécuteur ni un tour** : un canon illisible ferme la
+  réclamation via `canon_state`, ce que L2 fait déjà. Sans canon configuré,
+  rien n'est lancé.
 * **Chemin de reprise** : la session est relue depuis le registre, sinon depuis
   le fichier `session`.
 * **Binaire des harnais** : `AMEESH_<HARNAIS>_BIN`, puis

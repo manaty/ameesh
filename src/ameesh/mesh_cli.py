@@ -20,6 +20,7 @@
   agent-mesh export-v0 [--agents a,b] [--keep]        retour arrière : Postgres → boîte v0
   agent-mesh migrate | doctor [--notify-test]
   agent-mesh canon check|show|sync [--json] [--host H]   canon OKF (spec §4)
+  agent-mesh placement check [--agent A] [--json]        placement gouverné (C4)
   agent-mesh agent spawn <nom> --by <créateur> --ttl 2h   agent éphémère (R14)
 
 L'autorité du propriétaire ne se déduit jamais d'un texte : elle se prouve par
@@ -36,7 +37,7 @@ import sys
 import time
 
 from . import authority, config as config_mod, cost as cost_mod, db as db_mod, identity
-from . import migrations, registry
+from . import migrations, placement, registry
 from . import signing, work
 from .config import Config
 from .db import Db
@@ -92,6 +93,8 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
     try:
         rows = registry.overview(db)
         if args.json:
+            # C4 : verdict de placement de chaque agent (0022)
+            placement.annotate(db, rows)
             print(json.dumps(rows, ensure_ascii=False, indent=2))
             return 0
         if not rows:

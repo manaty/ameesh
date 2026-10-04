@@ -2,6 +2,7 @@
 """L8 — événements `kind='event'` (regroupement, urgent) et `ameesh attach` (C9)."""
 from __future__ import annotations
 
+import dataclasses
 import os
 import subprocess
 import sys
@@ -17,8 +18,9 @@ from .support import FAKEBIN, PgTestCase
 
 
 class EventsTest(PgTestCase):
-    def _worker(self, name: str = "evt"):
-        runner = Runner(self.cfg, self.db, once=True)
+    def _worker(self, name: str = "evt", *, senders=()):
+        cfg = dataclasses.replace(self.cfg, interrupt_senders=tuple(senders))
+        runner = Runner(cfg, self.db, once=True)
         runner.event_coalesce = 120.0
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
@@ -55,12 +57,23 @@ class EventsTest(PgTestCase):
         runner.event_coalesce = 0.0
         self.assertEqual(worker.pick()["kind"], "event")
 
-    def test_urgent_perce_la_fenetre(self):
-        runner, worker = self._worker()
+    def test_urgent_habilite_passe_en_prioritaire(self):
+        # un urgent d'un expéditeur habilité n'est jamais regroupé : `pick()` le
+        # sert en tête comme tour prioritaire (0018)
+        runner, worker = self._worker(senders=("src",))
         registry.mark_event_wake(self.db, "evt")  # fenêtre fraîchement ouverte
         mail.send(self.db, "src", "evt", "incident", kind="event",
                   payload={"urgent": True})
-        self.assertEqual(worker.pick()["kind"], "event")
+        spec = worker.pick()
+        self.assertEqual(spec["kind"], "urgent")
+        self.assertIn("incident", spec["prompt"])
+
+    def test_urgent_non_habilite_ne_perce_pas_la_fenetre(self):
+        runner, worker = self._worker()
+        registry.mark_event_wake(self.db, "evt")
+        mail.send(self.db, "inconnu", "evt", "faux urgent", kind="event",
+                  payload={"urgent": True})
+        self.assertIsNone(worker.pick())  # remis comme un événement normal
 
     def test_courrier_ordinaire_non_regroupe(self):
         runner, worker = self._worker()

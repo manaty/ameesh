@@ -90,23 +90,36 @@ def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
     Vraie si l'agent de la ligne `alias` (une ligne de `agent_registry`, ou de
     la vue `agent_mesh_overview`) n'est pas gouverné par le canon
     (`canon_governed_sql`), ou si le dernier état du canon de **son hôte**
-    (`canon_state`, écrit par `ameesh canon sync`) est `ok`. Un canon
-    `invalid` ou `unreadable`, ou l'absence d'état, refuse donc toute
-    NOUVELLE réclamation d'un agent du canon (et de ses éphémères), sans rien
-    toucher aux baux, sessions ni tours en cours : fail closed.
+    (`canon_state`, écrit par `ameesh canon sync`) est `ok` **et** que son
+    placement sur cet hôte est admis par la politique de l'hôte
+    (`placement_ok`, colonne déclarative écrite par `canon sync`, recopiée du
+    créateur pour un éphémère ; C4, 0022) **pour le profil qu'il a
+    maintenant** : `placement_profile` (le profil évalué, écrit avec le
+    verdict) égal à `ameesh_placement_profile` de ses colonnes hôte,
+    harnais, fournisseur, modèle et mode d'identifiants. Un canon `invalid`
+    ou `unreadable`, l'absence d'état, un placement refusé, absent de cet
+    hôte ou pas encore évalué (`placement_ok` faux ou NULL), un profil
+    divergé depuis l'évaluation (inscription, import ou SQL à la main)
+    refusent donc toute NOUVELLE réclamation d'un agent du canon (et de ses
+    éphémères) jusqu'au prochain `canon sync`, sans rien toucher aux baux,
+    sessions ni tours en cours : fail closed.
 
     Indépendante de la configuration (AMEESH_CANON, AMEESH_REQUIRE_RESPONSIBLE) :
     un agent venu du canon sur un hôte où aucune synchronisation n'a constaté
-    un canon valide n'est jamais réclamable. Sans paramètre lié (`%s`) : elle
-    s'insère telle quelle dans une requête paramétrée, avec les deux pilotes.
-    Utilisée par `claimable()` et `claim()` ; à réutiliser telle quelle pour
-    `ameesh attach` (C9).
+    un canon valide et un placement admis n'est jamais réclamable. Sans
+    paramètre lié (`%s`) : elle s'insère telle quelle dans une requête
+    paramétrée, avec les deux pilotes. Utilisée par `claimable()` et
+    `claim()` ; à réutiliser telle quelle pour `ameesh attach` (C9).
     """
     a = _alias(alias)
-    return """(NOT %s
-       OR EXISTS (SELECT 1 FROM canon_state s
-                   WHERE s.host = %s.host AND s.status = 'ok'))""" % (
-        canon_governed_sql(a), a)
+    return """(NOT %(governed)s
+       OR (EXISTS (SELECT 1 FROM canon_state s
+                    WHERE s.host = %(a)s.host AND s.status = 'ok')
+           AND coalesce(%(a)s.placement_ok, false)
+           AND %(a)s.placement_profile IS NOT DISTINCT FROM ameesh_placement_profile(
+                   %(a)s.host, %(a)s.harness, %(a)s.provider, %(a)s.model,
+                   %(a)s.credential_mode)))""" % {
+        "governed": canon_governed_sql(a), "a": a}
 
 
 def upsert(
@@ -458,6 +471,43 @@ def set_session(db: Db, name: str, session_id: str) -> None:
         "UPDATE agent_registry SET session_id = %s, updated_at = now() WHERE name = %s",
         (session_id, name),
     )
+
+
+def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
+    """Oublie la session (rotation, 0018), **fencé par un bail valide**.
+
+    Renvoie False si le bail n'est plus le nôtre ou s'il a expiré : un
+    remplaçant a pu réclamer l'agent et ouvrir sa propre session, qu'il ne faut
+    pas effacer (verdicts codex3 L11 B3). Le verrou est pris d'abord et
+    l'échéance est recontrôlée avec `clock_timestamp()` dans l'écriture, comme
+    les autres opérations de bail.
+    """
+    rows = db.query(
+        """
+        WITH verrou AS (
+            SELECT name, lease_owner, lease_epoch, lease_expires_at
+              FROM agent_registry WHERE name = %s FOR UPDATE
+        )
+        UPDATE agent_registry AS r
+           SET session_id = NULL, updated_at = now()
+          FROM verrou
+         WHERE r.name = verrou.name
+           AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+           AND verrou.lease_expires_at > clock_timestamp()
+        RETURNING r.name
+        """,
+        (name, owner, epoch),
+    )
+    return bool(rows)
+
+
+def cwd_used(db: Db, cwd: str, exclude: str) -> bool:
+    """Ce dossier de travail est-il déjà celui d'un autre agent ? (0018)"""
+    rows = db.query(
+        "SELECT 1 AS ok FROM agent_registry WHERE cwd = %s AND name <> %s LIMIT 1",
+        (cwd, exclude),
+    )
+    return bool(rows)
 
 
 def set_status(

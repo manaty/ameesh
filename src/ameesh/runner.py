@@ -39,7 +39,7 @@ import sys
 import threading
 import time
 
-from . import adapters, db as db_mod, mail, registry
+from . import adapters, canon as canon_mod, canon_sync, db as db_mod, fil, mail, registry
 from .config import CHANNEL_LEASE, CHANNEL_MAIL, Config
 from .config import load as load_config
 
@@ -89,6 +89,48 @@ def log_async(message: str) -> None:
     _journal.write(message)
 
 
+def worktree_marker(cwd: str | None) -> dict:
+    """Identité git d'un dossier de travail (0018 : suivre un renommage).
+
+    `git_common_dir` est le dépôt commun (le même pour tous les worktrees) ;
+    la branche distingue les worktrees d'un même dépôt. Best-effort : renvoie
+    `{}` si le dossier n'est pas un dépôt ou si git manque.
+    """
+    if not cwd or not os.path.isdir(cwd):
+        return {}
+    try:
+        common = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, timeout=5)
+        branche = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if common.returncode != 0 or not common.stdout.strip():
+        return {}
+    return {
+        "cwd": os.path.abspath(cwd),
+        "git_common_dir": os.path.abspath(os.path.join(cwd, common.stdout.strip())),
+        "branch": branche.stdout.strip() if branche.returncode == 0 else "",
+    }
+
+
+def write_worktree_marker(cfg: Config, name: str, cwd: str) -> dict:
+    """Écrit le marqueur du dossier de travail dans l'état de l'agent."""
+    marker = worktree_marker(cwd)
+    if not marker:
+        return {}
+    directory = cfg.agent_dir(name)
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        with open(os.path.join(directory, "worktree.json"), "w", encoding="utf-8") as fh:
+            json.dump(marker, fh, ensure_ascii=False)
+    except OSError:
+        return {}
+    return marker
+
+
 class AgentWorker(threading.Thread):
     #: nombre d'échecs de battement consécutifs avant d'arrêter le harnais
     MAX_RENEW_FAILURES = 3
@@ -120,6 +162,18 @@ class AgentWorker(threading.Thread):
         self.watchdog_lock = threading.Lock()
         self.watchdog_on = False
         self.watchdog_stop = threading.Event()
+        #: message prioritaire : préempte le tour en cours (0018, R19)
+        self.preempting = threading.Event()
+        self._refus_vus: set[int] = set()
+        #: arrêt demandé avant la publication du Popen (point de passage unique)
+        self.stop_requested = threading.Event()
+        self._stop_reason = ""
+        #: rotation de session (0018) : compteurs de la session courante
+        self.resume_summary = ""
+        self.session_turns = 0
+        self.session_tokens = 0.0
+        self.last_turn_seconds = 0.0
+        self.last_output = ""
 
     # -- état local --------------------------------------------------------
     def _path(self, name: str) -> str:
@@ -139,6 +193,17 @@ class AgentWorker(threading.Thread):
                 fh.write(session_id + "\n")
         except OSError:
             pass
+
+    def _fil_note(self, text: str, *, meta: dict | None = None) -> None:
+        """Trace d'audit dans le fil du projet de l'agent (R12) ; ne lève jamais."""
+        try:
+            chantier = (self.agent or {}).get("chantier") or ""
+            project = fil.project_for(self.cfg, chantier)
+            fil.record(self.cfg, self.db, sender=self.name, recipients=[], text=text,
+                       ts=time.time(), project=project,
+                       meta=dict(meta or {}, audit="runner"))
+        except Exception as exc:  # une trace ne casse jamais un tour
+            log("[%s] fil indisponible : %s" % (self.name, exc))
 
     # -- bail --------------------------------------------------------------
     def deadline_passed(self) -> bool:
@@ -192,15 +257,13 @@ class AgentWorker(threading.Thread):
             # Échéance déjà atteinte (réveil tardif, horloge, bail raccourci) :
             # on ne tente même pas le renouvellement, on arrête tout de suite.
             self.lease_lost.set()
-            self.terminate(grace=0, hard=True)
-            log_async("[%s] échéance du bail atteinte : arrêt du harnais" % self.name)
+            self.stop_group_now("échéance du bail atteinte", grace=0, hard=True)
             return False
         answered, expires, error = self._renew_call()
         if not answered:
             self.lease_lost.set()
-            self.terminate(grace=0, hard=True)
-            log_async("[%s] renouvellement sans réponse au-delà du bail : arrêt du harnais"
-                      % self.name)
+            self.stop_group_now("renouvellement sans réponse au-delà du bail",
+                                grace=0, hard=True)
             return False
         if error is not None:
             self.renew_failures += 1
@@ -218,15 +281,12 @@ class AgentWorker(threading.Thread):
             # journal bloqué ne doit pas retarder le SIGKILL, comme sur les
             # autres chemins de perte — revue codex3 de 852c8da).
             self.lease_lost.set()
-            self.terminate(grace=0, hard=True)
             log_async(echec)
-            log_async("[%s] bail considéré perdu (base injoignable) : arrêt du harnais"
-                      % self.name)
+            self.stop_group_now("base injoignable", grace=0, hard=True)
             return False
         if expires is None:
             self.lease_lost.set()
-            self.terminate(grace=0, hard=True)  # SIGKILL direct : plus de chevauchement
-            log_async("[%s] bail perdu (epoch %d) : arrêt du tour" % (self.name, self.epoch))
+            self.stop_group_now("bail perdu (epoch %d)" % self.epoch, grace=0, hard=True)
             return False
         self.renew_failures = 0
         self.lease_deadline = float(expires)
@@ -327,6 +387,63 @@ class AgentWorker(threading.Thread):
         if self._group_alive(pgid):
             log_async("[%s] groupe toujours vivant après SIGKILL (état noyau ?)" % self.name)
 
+    def stop_group_now(self, reason: str, *, grace: float | None = None,
+                       hard: bool = False) -> bool:
+        """Point de passage **unique** de tout arrêt de harnais (0018, verdicts codex3).
+
+        1. Le signal part d'abord (`terminate`, qui n'écrit rien avant) ;
+        2. le journal vient ensuite, par la file bornée `log_async` ;
+        3. si le `Popen` n'est pas encore publié, on pose `stop_requested` et
+           `_stop_reason` : `kill_if_stop_requested()` recontrôlera juste après
+           la publication (courses B5a-P et L11 B2).
+
+        Tous les déclencheurs — échéance, bail perdu, arrêt de l'exécuteur,
+        préemption, et demain la garde de budget (L13) — passent par ici : un
+        nouveau chemin hérite des sondes paramétrées.
+        """
+        with self.lock:
+            proc = self.proc
+        self._stop_reason = reason
+        if proc is None:
+            # Le latch ne sert qu'à la course de publication en cours : il est
+            # consommé par le recontrôle, puis remis à zéro au tour suivant
+            # (verdict codex3 L11 B5 : un latch permanent tuerait la reprise).
+            self.stop_requested.set()
+            log_async("[%s] arrêt demandé (%s) : harnais non encore publié"
+                      % (self.name, reason))
+            return False
+        self.terminate(grace=grace, hard=hard)
+        log_async("[%s] harnais arrêté (%s)" % (self.name, reason))
+        return True
+
+    def kill_if_stop_requested(self) -> bool:
+        """Recontrôle après publication du `Popen` : tout déclencheur d'arrêt.
+
+        Remplace les recontrôles par cause (`kill_if_lease_lost`,
+        `kill_if_preempted`) : un déclencheur nouveau, comme la préemption
+        arrivée pendant le lancement, est rattrapé sans code dédié (verdict
+        codex3 L11 B2).
+        """
+        en_cause = (self.lease_lost.is_set() or self.deadline_passed()
+                    or self.stopping.is_set() or self.watchdog_stop.is_set()
+                    or self.preempting.is_set() or self.stop_requested.is_set())
+        if not en_cause:
+            return False
+        if (self.deadline_passed() or self.stopping.is_set()
+                or self.watchdog_stop.is_set()):
+            # Arrêt de classe « bail » : le tour ne doit pas être clos ni compté.
+            self.lease_lost.set()
+        with self.lock:
+            proc = self.proc
+        if proc is None:
+            self.stop_requested.set()
+            return False
+        self.stop_group_now(self._stop_reason or "arrêt", grace=0, hard=True)
+        # Le latch de publication est consommé : le prochain tour doit pouvoir
+        # tourner (verdict codex3 L11 B5).
+        self.stop_requested.clear()
+        return True
+
     def kill_if_lease_lost(self) -> bool:
         """Rattrape une publication tardive du harnais, après la perte du bail.
 
@@ -342,8 +459,20 @@ class AgentWorker(threading.Thread):
                 or self.stopping.is_set() or self.watchdog_stop.is_set()):
             return False
         self.lease_lost.set()
-        self.terminate(grace=0, hard=True)
-        return True
+        return self.stop_group_now("bail perdu", grace=0, hard=True)
+
+    def kill_if_preempted(self) -> bool:
+        """Rattrape une préemption arrivée avant la publication du `Popen` (0018).
+
+        Le moniteur de tour peut déclencher entre `Popen` et l'affectation de
+        `self.proc` : il voit `proc=None`, ne tue rien, et son fil se termine —
+        le harnais survivrait alors jusqu'à la fin du tour (même classe que
+        B5a-P, verdict codex3 L11 B2). Renvoie True si le harnais vient d'être
+        arrêté.
+        """
+        if not self.preempting.is_set():
+            return False
+        return self.stop_group_now("préemption", grace=0, hard=True)
 
     def wait_timeout(self, cap: float) -> float:
         """Attente bornée par l'échéance du bail, **sans plancher positif**.
@@ -400,8 +529,7 @@ class AgentWorker(threading.Thread):
             if self.lease_deadline > time.time():
                 continue  # bail renouvelé entre-temps : rien à faire
             self.lease_lost.set()
-            log_async("[%s] échéance du bail atteinte : arrêt du harnais" % self.name)
-            self.terminate(grace=0, hard=True)
+            self.stop_group_now("échéance du bail atteinte", grace=0, hard=True)
             return
 
     def _heartbeat(self, stop_event: threading.Event) -> None:
@@ -425,6 +553,192 @@ class AgentWorker(threading.Thread):
             return True
         return self.idle_due()
 
+    def request_preempt(self) -> None:
+        """Un message prioritaire préempte le tour en cours (0018, R19).
+
+        Le tour est arrêté (SIGTERM bref puis SIGKILL), sa consigne repart en
+        attente, et `pick()` sert le message prioritaire en tête au tour suivant,
+        sur la même session.
+        """
+        self.preempting.set()
+        self.wake.set()
+
+    def _preempt_monitor(self, done: threading.Event) -> None:
+        """Arrête le harnais dès qu'un message prioritaire arrive (0018).
+
+        Passe par le point de passage unique : signal d'abord, journal borné
+        ensuite ; une préemption arrivée avant la publication du `Popen` est
+        rattrapée par `kill_if_stop_requested()`.
+        """
+        while not done.wait(0.1):
+            if self.preempting.is_set():
+                self.stop_group_now("préemption", grace=1.0)
+                return
+
+    # -- rotation de session (0018) ----------------------------------------
+    def rotation_due(self) -> bool:
+        """Rotation due ? Jamais pendant un tour, jamais avant le minimum."""
+        if self.proc is not None:
+            return False
+        if self.session_turns < self.runner.session_min_turns:
+            return False
+        return (self.session_tokens >= self.runner.session_max_tokens
+                or self.last_turn_seconds >= self.runner.session_max_turn_seconds)
+
+    def _session_history(self, session_id: str | None, resume: str) -> None:
+        """Garde l'ancien id de session et son résumé (audit, 0018)."""
+        entry = {
+            "ts": time.time(), "session": session_id, "turns": self.session_turns,
+            "tokens": self.session_tokens,
+            "last_turn_s": round(self.last_turn_seconds, 1), "resume": resume[:2000],
+        }
+        try:
+            with open(self._path("session-history.jsonl"), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def maybe_rotate(self) -> bool:
+        """Résume la session courante puis en ouvre une neuve (0018, R19).
+
+        Le résumé est produit **dans** la session (un tour), écrit dans le fil
+        (R12), l'ancien id est conservé dans l'historique de l'état, puis la
+        session est oubliée : le prochain tour repart d'une session neuve,
+        préfixé par le résumé. Ne se déclenche jamais pendant un tour.
+        """
+        if not self.rotation_due():
+            return False
+        ancienne = (self.agent or {}).get("session_id") or self.read_session_file()
+        log_async("[%s] rotation de session (tours=%d, tokens=%.0f, dernier tour=%.0fs)"
+                  % (self.name, self.session_turns, self.session_tokens,
+                     self.last_turn_seconds))
+        ok = self.run_turn({"kind": "prompt", "prompt": adapters.SUMMARY_PROMPT, "ids": []})
+        if not ok:
+            # Résumé partiel, bail perdu pendant le tour, claim remplaçant : on ne
+            # touche à rien. Effacer la session ici effacerait celle du remplaçant
+            # (verdict codex3 L11 B3).
+            log_async("[%s] rotation annulée : le tour de résumé n'a pas abouti" % self.name)
+            self._fil_note("Rotation de session annulée : le tour de résumé n'a pas "
+                           "abouti. L'ancienne session est conservée ; nouvelle "
+                           "tentative plus tard.",
+                           meta={"action": "rotation", "etat": "annulee"})
+            return False
+        resume = (self.last_output or "").strip()
+        if not resume:
+            log_async("[%s] rotation annulée : résumé vide" % self.name)
+            self._fil_note("Rotation de session annulée : résumé vide. L'ancienne "
+                           "session est conservée.",
+                           meta={"action": "rotation", "etat": "annulee"})
+            return False
+        self._session_history(ancienne, resume)
+        # L'effacement est fencé par le bail : si un remplaçant a réclamé l'agent
+        # entre-temps, sa session n'est pas touchée.
+        if not registry.clear_session(self.db, self.name, self.runner.runner_id, self.epoch):
+            log_async("[%s] rotation annulée : bail perdu avant l'effacement de la session"
+                      % self.name)
+            self._fil_note("Rotation de session annulée : le bail a changé de main "
+                           "avant l'effacement ; rien n'a été touché.",
+                           meta={"action": "rotation", "etat": "annulee"})
+            return False
+        self.resume_summary = resume
+        try:
+            os.unlink(self._path("session"))
+        except OSError:
+            pass
+        self.agent = registry.get(self.db, self.name) or self.agent
+        self.session_turns = 0
+        self.session_tokens = 0.0
+        self._fil_note(
+            "Rotation de session : l'ancien id (%s) est conservé dans "
+            "`session-history.jsonl` ; la session neuve repart du résumé ci-dessous.\n\n%s"
+            % (ancienne or "neuve", resume),
+            meta={"action": "rotation", "session": ancienne or ""})
+        return True
+
+    # -- dossier de travail déplacé (0018) ---------------------------------
+    #: profondeur maximale de recherche d'un dossier de travail déplacé :
+    #: `~/development/manaty/ameesh/.claude/worktrees/<nom>` est à cinq niveaux.
+    WORKTREE_DEPTH = 6
+    #: dossiers cachés qu'on traverse quand même (worktrees imbriqués)
+    WORKTREE_HIDDEN = (".claude", ".worktrees")
+    #: répertoires jamais traversés (dépendances, caches, sorties de build)
+    WORKTREE_SKIP = ("node_modules", ".git", "venv", ".venv", "target", "build",
+                     "dist", "__pycache__", ".cache", ".local")
+
+    def _worktree_dirs(self, racine: str, ancien: str | None):
+        """Dossiers candidats sous une racine, profondeur bornée (0018 B4).
+
+        On ne descend pas dans les grands répertoires de dépendances ni dans
+        `.git`, mais on traverse `.claude` / `.worktrees` : les worktrees
+        imbriqués (ex. `~/development/manaty/ameesh/.claude/worktrees/<nom>`)
+        doivent être trouvés, ou l'adoption refuse proprement.
+        """
+        base = racine.rstrip(os.sep).count(os.sep)
+        for dossier, sous_dirs, _ in os.walk(racine):
+            sous_dirs[:] = [d for d in sous_dirs
+                            if d not in self.WORKTREE_SKIP
+                            and (not d.startswith(".") or d in self.WORKTREE_HIDDEN)]
+            if dossier.count(os.sep) - base >= self.WORKTREE_DEPTH:
+                sous_dirs[:] = []
+            if dossier != ancien and os.path.exists(os.path.join(dossier, ".git")):
+                yield dossier
+
+    def adopt_moved_worktree(self) -> str | None:
+        """Retrouve un dossier de travail déplacé, borné aux racines (0018).
+
+        Le marqueur git (common dir + branche) est écrit à l'inscription ; si le
+        cwd a disparu, on cherche un candidat **unique** sous les racines
+        configurées, en profondeur bornée, et on refuse un dossier déjà utilisé
+        par un autre agent.
+        """
+        marqueur: dict = {}
+        try:
+            with open(self._path("worktree.json"), encoding="utf-8") as fh:
+                marqueur = json.load(fh) or {}
+        except (OSError, ValueError):
+            return None
+        common = marqueur.get("git_common_dir")
+        if not common:
+            return None
+        branche = marqueur.get("branch") or ""
+        ancien = self.agent.get("cwd")
+        candidats = []
+        for racine in self.runner.worktree_roots:
+            if not os.path.isdir(racine):
+                continue
+            for chemin in self._worktree_dirs(racine, ancien):
+                ident = worktree_marker(chemin)
+                if not ident or ident.get("git_common_dir") != common:
+                    continue
+                if branche and ident.get("branch") != branche:
+                    continue
+                candidats.append(chemin)
+        if len(candidats) != 1:
+            if len(candidats) > 1:
+                log("[%s] dossier déplacé ambigu : %s" % (self.name, ", ".join(candidats)))
+            return None
+        candidat = candidats[0]
+        if registry.cwd_used(self.db, candidat, self.name):
+            log("[%s] dossier déplacé %s déjà utilisé par un autre agent"
+                % (self.name, candidat))
+            return None
+        registry.upsert(self.db, self.name, cwd=candidat)
+        self.agent["cwd"] = candidat
+        log("[%s] dossier de travail déplacé adopté : %s" % (self.name, candidat))
+        self._fil_note("Dossier de travail déplacé adopté : %s" % candidat,
+                       meta={"action": "deplacement", "cwd": candidat})
+        return candidat
+
+    def interrupt_allowed(self, row: dict) -> bool:
+        """Un message ne préempte que s'il vient d'un expéditeur habilité (0018).
+
+        Sans canon (L2), `AMEESH_INTERRUPT_SENDERS` est la seule autorisation ;
+        la capacité « interrupt » d'une fiche canon s'ajoutera ici. Un urgent
+        non habilité est remis comme un message normal (et l'abus est journalisé).
+        """
+        sender = (row.get("sender") or row.get("from") or "").strip()
+        return bool(sender) and sender in self.cfg.interrupt_senders
+
     def pick(self) -> dict | None:
         """Le prochain tour à faire, ou None. Consomme la consigne en attente."""
         agent = registry.get(self.db, self.name)
@@ -434,6 +748,26 @@ class AgentWorker(threading.Thread):
             self.stopping.set()
             return None
         self.agent = agent
+        urgents = mail.unread_urgent(self.db, self.name)
+        autorises = [m for m in urgents if self.interrupt_allowed(m)]
+        for refuse in (m for m in urgents if m not in autorises):
+            mid = int(refuse.get("id") or 0)
+            if mid and mid not in self._refus_vus:
+                self._refus_vus.add(mid)
+                log("[%s] urgent ignoré : expéditeur %s non habilité à interrompre"
+                    % (self.name, refuse.get("sender") or "?"))
+        if autorises:
+            # Le prioritaire passe devant la consigne en attente : c'est lui qui
+            # ouvre le tour, la consigne interrompue suivra (0018).
+            self.nudged = False
+            return {
+                "kind": "urgent",
+                "prompt": "\n\n".join(
+                    adapters.PRIORITY_PROMPT % (
+                        m.get("sender") or "?", (m.get("body") or "")[:2000])
+                    for m in autorises),
+                "ids": [int(m["id"]) for m in autorises if m.get("id") is not None],
+            }
         prompt = registry.take_pending_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
         if prompt:
             self.nudged = False
@@ -466,8 +800,11 @@ class AgentWorker(threading.Thread):
             return None
         fenetre = self.runner.event_coalesce
         dernier = float(self.agent.get("last_event_ts") or 0.0)
-        if any(mail.is_urgent(m) for m in events) or fenetre <= 0 \
-                or (time.time() - dernier) >= fenetre:
+        # Seul un urgent d'un expéditeur habilité perce la fenêtre : un urgent
+        # non habilité reste soumis au regroupement (même règle que la
+        # préemption, 0018).
+        if any(mail.is_urgent(m) and self.interrupt_allowed(m) for m in events) \
+                or fenetre <= 0 or (time.time() - dernier) >= fenetre:
             registry.mark_event_wake(self.db, self.name)
             return {"kind": "event", "prompt": adapters.EVENT_PROMPT, "ids": ids}
         return None  # fenêtre de regroupement en cours : on attend la suivante
@@ -487,9 +824,13 @@ class AgentWorker(threading.Thread):
             return False
 
         session = self.agent.get("session_id") or self.read_session_file()
-        argv = adapter.command(spec["prompt"], session)
+        resume = ""
+        if self.resume_summary and not session:
+            # Session neuve après rotation (0018) : le résumé de reprise ouvre le tour.
+            resume = "Reprise de session après rotation — résumé :\n%s\n\n" % self.resume_summary
+        argv = adapter.command(resume + spec["prompt"], session)
         label = {"prompt": "consigne", "mail": "messages", "event": "événements",
-                 "idle": "reprise"}[spec["kind"]]
+                 "urgent": "prioritaire", "idle": "reprise"}[spec["kind"]]
         if self.runner.dry_run:
             log("[%s] tour %s (dry-run, session %s) : %s"
                 % (self.name, label, session or "neuve", " ".join(argv)))
@@ -500,6 +841,9 @@ class AgentWorker(threading.Thread):
             return False
 
         cwd = self.agent.get("cwd")
+        if not cwd or not os.path.isdir(cwd):
+            # Worktree renommé/déplacé (0018) : on tente une adoption bornée.
+            cwd = self.adopt_moved_worktree() or cwd
         if not cwd or not os.path.isdir(cwd):
             message = "dossier de travail absent : %r" % (cwd,)
             log("[%s] %s" % (self.name, message))
@@ -537,9 +881,20 @@ class AgentWorker(threading.Thread):
         cost: float | None = None
         error: str | None = None
         result_code = 0
+        self.last_output = ""
 
         heartbeat_done = threading.Event()
         threading.Thread(target=self._heartbeat, args=(heartbeat_done,), daemon=True).start()
+        preempt_done = threading.Event()
+        # Un nouveau tour remet à zéro le latch de publication : il ne concerne
+        # que la course du tour précédent, et les autres déclencheurs (bail,
+        # arrêt, préemption) sont revérifiés à la publication (verdict B5).
+        self.stop_requested.clear()
+        if spec["kind"] == "urgent":
+            # Ce tour sert justement le message prioritaire : le signal est consommé.
+            self.preempting.clear()
+        threading.Thread(target=self._preempt_monitor, args=(preempt_done,),
+                         daemon=True).start()
         try:
             with open(stderr_path, "ab") as stderr:
                 proc = subprocess.Popen(
@@ -550,12 +905,13 @@ class AgentWorker(threading.Thread):
             with self.lock:
                 self.proc = proc
                 self.pgid = proc.pid  # start_new_session : le groupe porte son pid
-            # Course de publication : le veilleur a pu conclure pendant que ce
-            # Popen n'était pas encore publié (proc=None). Sans ce recontrôle,
-            # le harnais survivrait au bail sans produire de stdout (B5a-P).
-            if self.kill_if_lease_lost():
-                log_async("[%s] bail perdu pendant le lancement : arrêt du harnais"
-                          % self.name)
+            # Course de publication : un déclencheur d'arrêt (bail perdu,
+            # préemption, arrêt de l'exécuteur, échéance) a pu conclure pendant
+            # que ce Popen n'était pas encore publié (proc=None). Le recontrôle
+            # unique couvre toutes les causes (B5a-P, L11 B2).
+            tue = self.kill_if_stop_requested()
+            if resume and not tue:
+                self.resume_summary = ""  # le résumé a ouvert la session neuve
             log("[%s] tour %s : %s" % (self.name, label, " ".join(argv[:6]) + " …"))
             with open(events_path, "a", encoding="utf-8") as events:
                 for line in proc.stdout or ():
@@ -571,17 +927,23 @@ class AgentWorker(threading.Thread):
                         registry.set_session(self.db, self.name, session_new)
                     for text in parsed.get("display") or []:
                         log("[%s] %s" % (self.name, text))
+                        self.last_output = (self.last_output + "\n" + text)[-4000:]
+                    usage = parsed.get("usage")
+                    if isinstance(usage, dict):
+                        self.session_tokens += float(usage.get("input_tokens") or 0) \
+                            + float(usage.get("output_tokens") or 0)
                     if parsed.get("cost") is not None:
                         cost = parsed["cost"]
                     if parsed.get("error"):
                         error = str(parsed["error"])
                     if self.lease_lost.is_set():
                         error = "bail perdu en cours de tour"
-                        self.terminate(grace=0, hard=True)
+                        self.stop_group_now("bail perdu en cours de tour", grace=0, hard=True)
                         break
             result_code = proc.wait()
         finally:
             heartbeat_done.set()
+            preempt_done.set()
             # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
             # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
             # du veilleur une fois `self.proc` effacé (sonde codex3 B5a-S).
@@ -591,7 +953,9 @@ class AgentWorker(threading.Thread):
                 self.pgid = None
 
         duration = time.time() - started
+        self.last_turn_seconds = duration
         lost = self.lease_lost.is_set()
+        preempte = self.preempting.is_set()
         ok = result_code == 0 and not lost and not error
         if error is None and result_code != 0:
             error = "le harnais a rendu le code %d" % result_code
@@ -604,6 +968,18 @@ class AgentWorker(threading.Thread):
             # l'état d'un agent qu'un remplaçant a pu reprendre.
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
+        if preempte:
+            # Message prioritaire reçu pendant le tour (0018) : la consigne
+            # repart en attente, `pick()` servira le message en tête au tour
+            # suivant, sur la même session. Le fil garde la trace.
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            registry.set_status(self.db, self.name, "queued",
+                                status_text="tour interrompu : message prioritaire")
+            self._fil_note(
+                "Tour interrompu par un message prioritaire ; la consigne du tour "
+                "repart en attente et le message prioritaire passe en tête.",
+                meta={"action": "interruption", "tour_s": round(duration, 1)})
+            return False
         if not ok:
             # B6a : le tour n'a pas abouti, la consigne repart en attente au lieu
             # d'être effacée par end_turn. Au pire elle est rejouée.
@@ -615,11 +991,13 @@ class AgentWorker(threading.Thread):
             error=error, cost_usd=cost,
         )
         self.last_activity = time.monotonic()
+        if ok:
+            self.session_turns += 1
         if spec["kind"] == "idle":
             self.nudged = True
         with self.runner.lock:
             self.runner.turns += 1
-        if spec["kind"] in ("mail", "event") and ok and spec["ids"]:
+        if spec["kind"] in ("mail", "event", "urgent") and ok and spec["ids"]:
             # Si le hook du harnais les a déjà remis, c'est un no-op.
             mail.mark_delivered(self.db, spec["ids"])
         return ok
@@ -642,6 +1020,7 @@ class AgentWorker(threading.Thread):
         self.ensure_watchdog()
         deadline = time.monotonic() + max(0.0, wait_seconds)
         while True:
+            self.maybe_rotate()
             spec = self.pick()
             if spec:
                 self.run_turn(spec)
@@ -658,6 +1037,7 @@ class AgentWorker(threading.Thread):
             while not self.stopping.is_set() and not self.runner.stop.is_set():
                 if not self.renew():
                     break
+                self.maybe_rotate()
                 spec = self.pick()
                 if spec is None:
                     self.wake.wait(timeout=self.wait_timeout(
@@ -698,6 +1078,10 @@ class Runner:
         self.idle_nudge = cfg.idle_nudge
         self.poll = max(1.0, cfg.poll)
         self.event_coalesce = max(0.0, cfg.event_coalesce)
+        self.session_max_tokens = max(0.0, cfg.session_max_tokens)
+        self.session_max_turn_seconds = max(0.0, cfg.session_max_turn_seconds)
+        self.session_min_turns = max(0, int(cfg.session_min_turns))
+        self.worktree_roots = tuple(cfg.worktree_roots)
         self.failure_backoff = 5.0
         self.stop = threading.Event()
         self.wake_all = threading.Event()
@@ -705,6 +1089,9 @@ class Runner:
         self.lock = threading.Lock()
         self.listener = None          # écouteur LISTEN/NOTIFY courant
         self.listener_thread = None
+        #: `canon sync` de l'hôte : au démarrage puis périodiquement (spec §4.4)
+        self.canon_sync_interval = max(0.0, cfg.canon_sync_interval)
+        self.canon_thread: threading.Thread | None = None
         self.turns = 0
         self.did_turn = False
 
@@ -738,6 +1125,12 @@ class Runner:
 
     # -- écoute ------------------------------------------------------------
     def dispatch(self, item: dict) -> None:
+        """Réveille (ou préempte) le worker visé, **signal avant journal**.
+
+        Un `log` synchrone avant `request_preempt`/`wake.set` laissait un pipe
+        saturé retarder la préemption (verdict codex3 L11 B1) : tous les signaux
+        partent d'abord, la journalisation passe par la file bornée.
+        """
         if item.get("channel") == CHANNEL_MAIL:
             try:
                 payload = json.loads(item.get("payload") or "{}")
@@ -746,12 +1139,23 @@ class Runner:
             target = payload.get("to")
             with self.lock:
                 worker = self.workers.get(target) if target else None
-            if worker:
-                log("message pour %s : réveil du tour" % target)
+            prioritaire = False
+            if worker is not None and payload.get("id"):
+                row = mail.get(self.db, int(payload["id"]))
+                if row and mail.is_urgent(row):
+                    prioritaire = worker.interrupt_allowed(row)
+                    if not prioritaire:
+                        log_async("urgent de %s ignoré : expéditeur non habilité à interrompre"
+                                  % (row.get("sender") or "?"))
+            if worker and prioritaire:
+                worker.request_preempt()  # le signal d'abord
+                log_async("message prioritaire pour %s : interruption du tour" % target)
+            elif worker:
                 worker.wake.set()
+                log_async("message pour %s : réveil du tour" % target)
             else:
-                for worker in self.workers.values():
-                    worker.wake.set()
+                for autre in self.workers.values():
+                    autre.wake.set()
         self.wake_all.set()
 
     def _listen_loop(self) -> None:
@@ -790,20 +1194,79 @@ class Runner:
             worker.stopping.set()
             worker.wake.set()
             # Un tour en cours ne doit pas continuer pendant qu'on rend le bail.
-            worker.terminate()
+            worker.stop_group_now("arrêt de l'exécuteur", grace=3.0)
         deadline = time.monotonic() + 8.0
         for worker in workers:
             worker.join(timeout=max(0.1, deadline - time.monotonic()))
             # Le tour a pu publier son harnais après le terminate initial
             # (course de publication) : rien ne doit survivre au relâchement
             # du bail (sonde codex3 B5a-P).
-            worker.terminate(grace=0, hard=True)
+            worker.stop_group_now("arrêt de l'exécuteur (dur)", grace=0, hard=True)
             worker.release_lease()
         log("arrêt : %d bail(aux) rendu(s), %d tour(s)" % (len(workers), self.turns))
+
+    # -- canon sync (spec §4.4) --------------------------------------------
+    def canon_sync_once(self) -> bool:
+        """Un `canon sync` de l'hôte ; ne lève jamais, ne tue jamais un tour.
+
+        Le canon est relu à chaque passe (`from_config`) et l'état est écrit par
+        `canon_sync.sync` ; un canon illisible enregistre l'état `unreadable`,
+        ce qui ferme la réclamation (L2) sans toucher aux baux ni aux tours en
+        cours. Un échec — canon, git, base — est journalisé et rend `False`.
+        """
+        if not self.cfg.canon:
+            return True
+        db = None
+        try:
+            db = db_mod.connect(self.cfg)
+            db_mod.require_schema(db)
+            canon = canon_mod.from_config(self.cfg)
+            report = canon_sync.sync(db, canon, self.host)
+            status = getattr(report, "status", None)
+            if status and status != canon_sync.CANON_OK:
+                log_async("canon sync : %s (%s)"
+                          % (status, getattr(report, "diagnostic", None) or "sans détail"))
+            return True
+        except Exception as exc:  # jamais fatal : le canon ferme, il ne tue pas
+            log_async("canon sync en échec : %s" % " ".join(str(exc).split())[:200])
+            return False
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    def _canon_sync_loop(self) -> None:
+        while not self.stop.is_set():
+            self.canon_sync_once()
+            if self.stop.wait(self.canon_sync_interval):
+                return
+
+    def start_canon_sync(self) -> None:
+        """Lance le sync du canon : immédiat, puis périodique (spec §4.4).
+
+        Sans canon configuré ou avec un intervalle nul, il n'y a rien à faire.
+        En mode `--once`, le sync est fait en ligne (le fil n'aurait pas le
+        temps de tourner) ; sinon un fil dédié s'en charge.
+        """
+        if not self.cfg.canon or self.canon_sync_interval <= 0:
+            if self.cfg.canon:
+                self.canon_sync_once()  # seulement au démarrage
+            return
+        if self.once:
+            self.canon_sync_once()
+            return
+        if self.canon_thread is not None:
+            return
+        self.canon_thread = threading.Thread(
+            target=self._canon_sync_loop, daemon=True, name="canon-sync")
+        self.canon_thread.start()
 
     def run(self) -> int:
         log("démarrage : hôte %s, exécuteur %s, pilote %s, schéma %s"
             % (self.host, self.runner_id, self.db.name, self.cfg.schema))
+        self.start_canon_sync()
         if self.once:
             self.sweep()
             if not self.did_turn:
@@ -871,6 +1334,13 @@ def cmd_register(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
     )
     if parsed.prompt:
         registry.set_pending_prompt(db, parsed.name, parsed.prompt)
+    if cwd:
+        # Identité git du dossier : elle permettra de le retrouver s'il est
+        # déplacé (0018), sans confondre deux worktrees du même dépôt.
+        marker = write_worktree_marker(cfg, parsed.name, cwd)
+        if marker:
+            log("dossier de travail %s : dépôt %s, branche %s"
+                % (cwd, marker["git_common_dir"], marker.get("branch") or "?"))
     log("agent %s inscrit : %s sur %s%s%s" % (
         parsed.name, parsed.harness, cfg.host,
         ", session %s" % parsed.session if parsed.session else "",
@@ -923,6 +1393,29 @@ def _kill_group(proc: subprocess.Popen) -> None:
             proc.kill()
         except OSError:
             pass
+
+
+def stop_group_now(proc: subprocess.Popen, reason: str, *, name: str = "",
+                   grace: float | None = None, hard: bool = True) -> None:
+    """Point de passage d'arrêt d'un groupe de harnais isolé (`attach`).
+
+    Même règle que `AgentWorker.stop_group_now` : le signal part **d'abord**
+    (SIGTERM bref puis SIGKILL si `hard` est faux), le journal borné vient
+    ensuite. Aucun `print` ne précède la coupe.
+    """
+    if hard or grace is None:
+        _kill_group(proc)
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except OSError:
+            pass
+        deadline = time.monotonic() + max(0.0, grace)
+        while time.monotonic() < deadline and proc.poll() is None:
+            time.sleep(0.05)
+        if proc.poll() is None:
+            _kill_group(proc)
+    log_async("[%s] harnais arrêté (%s)" % (name or "?", reason))
 
 
 def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
@@ -1033,14 +1526,13 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
             perdu.set()
         while proc.poll() is None:
             if perdu.is_set():
-                _kill_group(proc)  # couper d'abord, journaliser ensuite
-                log_async("[%s] attach : bail perdu, arrêt du harnais" % name)
+                stop_group_now(proc, "bail perdu (attach)", name=name)
                 break
             time.sleep(0.2)
         code = proc.wait()
     except KeyboardInterrupt:
         if proc is not None:
-            _kill_group(proc)
+            stop_group_now(proc, "interruption (attach)", name=name)
             code = proc.wait()
     finally:
         stop.set()

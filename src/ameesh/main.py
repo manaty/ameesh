@@ -17,9 +17,13 @@
   ameesh fil list | show <projet> [<lot>] [--last N] | tail <projet> [<lot>]
         les fils lisibles : tout message passé par ameesh, en clair (R12) ;
   ameesh receipt verify | authenticator list   reçus d'approbation (spec §8) ;
+  ameesh action propose|show|list|request|approve|execute|reconcile|retry|replace|cancel
+        actions sous porte (spec §7) ;
+  ameesh decisions [--for human:ID]     décisions qui attendent un humain (C10) ;
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
   ameesh migrate | doctor     schéma et diagnostic ;
   ameesh canon check|show|sync          canon OKF : validation, fiches, registre ;
+  ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -36,10 +40,12 @@ import sys
 #: sous-commandes servies par mesh_cli (parseur déjà en place)
 MESH_COMMANDS = (
     "list", "show", "key", "approve", "approvals", "verify", "work", "cost",
-    "migrate", "doctor", "import-v0", "export-v0", "canon", "agent",
+    "migrate", "doctor", "import-v0", "export-v0", "canon", "placement", "agent",
 )
 #: sous-commandes des reçus d'approbation (receipts_cli)
 RECEIPT_COMMANDS = ("receipt", "authenticator")
+#: actions sous porte et file des décisions (actions_cli)
+ACTION_COMMANDS = ("action", "decisions")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -66,6 +72,9 @@ def main(argv: list[str] | None = None) -> int:
     if command in RECEIPT_COMMANDS:
         from . import receipts_cli
         return receipts_cli.main(argv)
+    if command in ACTION_COMMANDS:
+        from . import actions_cli
+        return actions_cli.main(argv)
     print("ameesh : sous-commande inconnue %r" % command, file=sys.stderr)
     print(__doc__)
     return 2
