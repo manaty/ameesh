@@ -32,3 +32,16 @@ stale_after: 2026-11-04
 Petites retouches d'UI avec capture ; correctifs SQL avec sondes de privilèges ;
 défauts natifs reproduits sur banc ; relectures avec contre-exemples connus
 (les blocages de revue de la nuit, avec leur sonde, en sont une source prête).
+
+# Mesures et leçons (03:28)
+
+- Après les règles de vitesse : délai travail → fusion maximal passé de 100 min
+  (fenêtre 01:25–02:25, 8 fusions) à 21 min (02:25–03:25, 6 fusions) ; petit
+  échantillon. Ce qui a porté : revue proportionnée, rotation des sessions
+  saturées avec résumé, pouls automatique (un tour de 67 min passé à attendre
+  une suite complète), mode rapide des relecteurs.
+- **Rejeu d'évaluation contaminé** : un rejeu en DeepSeek flash effort bas
+  (6,5 min, ≈ 0,15 $, tests verts, note 9/10) avait accès à la solution de
+  référence par le worktree (diff identique). Exigence : rejouer dans un dépôt
+  **isolé** (archive git + init, sans historique ni remote), sans accès au
+  board ni aux autres worktrees.
