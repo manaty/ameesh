@@ -116,7 +116,7 @@ def _canon_rules_sql(db: Db) -> str:
     )
     if int(rows[0]["n"]) < 3:
         return ""
-    sql = " AND (NOT ephemeral OR ephemeral_expires_at > now())"
+    sql = " AND (NOT ephemeral OR ephemeral_expires_at > clock_timestamp())"
     cfg = getattr(db, "cfg", None)
     if cfg is not None and getattr(cfg, "responsible_required", False):
         sql += " AND coalesce(responsible, '') <> ''"
@@ -135,7 +135,7 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
         """
         UPDATE agent_registry
            SET lease_owner      = %s,
-               lease_expires_at = now() + make_interval(secs => %s),
+               lease_expires_at = clock_timestamp() + make_interval(secs => %s),
                lease_epoch      = lease_epoch + 1,
                -- R5 : si le bail n'était plus vivant (autre main, ou même
                -- exécuteur relancé avec le même identifiant), la consigne
@@ -197,7 +197,7 @@ def attach_claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | No
         """
         UPDATE agent_registry
            SET lease_owner      = %s,
-               lease_expires_at = now() + make_interval(secs => %s),
+               lease_expires_at = clock_timestamp() + make_interval(secs => %s),
                lease_epoch      = lease_epoch + 1,
                status           = 'running',
                status_text      = 'session interactive (attach)',
@@ -236,7 +236,7 @@ def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]
     rows = db.query(
         """
         SELECT lease_owner, lease_epoch, status,
-               (lease_expires_at IS NOT NULL AND lease_expires_at > now()) AS live
+               (lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()) AS live
           FROM agent_registry WHERE name = %s
         """,
         (name,),
@@ -260,11 +260,11 @@ def renew(db: Db, name: str, owner: str, epoch: int, ttl_seconds: float) -> floa
     rows = db.query(
         """
         UPDATE agent_registry
-           SET lease_expires_at = now() + make_interval(secs => %s),
+           SET lease_expires_at = clock_timestamp() + make_interval(secs => %s),
                last_seen        = now(),
                updated_at       = now()
          WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
-           AND lease_expires_at > now()
+           AND lease_expires_at > clock_timestamp()
         RETURNING extract(epoch from lease_expires_at)::float8 as lease_expires_ts
         """,
         (ttl_seconds, name, owner, epoch),
@@ -297,7 +297,7 @@ def claimable(db: Db, host: str, names: Sequence[str] | None = None) -> list[dic
         FROM agent_registry
         WHERE host = %%s
           AND status <> 'stopped'
-          AND (lease_owner IS NULL OR lease_expires_at < now())
+          AND (lease_owner IS NULL OR lease_expires_at < clock_timestamp())
     """ % AGENT_COLUMNS
     params: list[Any] = [host]
     if names:
@@ -371,7 +371,7 @@ def take_pending_prompt(db: Db, name: str, owner: str, epoch: int) -> str | None
               FROM agent_registry
              WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
                AND pending_prompt IS NOT NULL
-               AND lease_expires_at > now()
+               AND lease_expires_at > clock_timestamp()
              FOR UPDATE
         )
         UPDATE agent_registry AS r
@@ -395,7 +395,7 @@ def begin_turn(db: Db, name: str, owner: str, epoch: int, status_text: str) -> b
         UPDATE agent_registry
            SET status = 'running', status_text = %s, updated_at = now()
          WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
-           AND lease_expires_at > now()
+           AND lease_expires_at > clock_timestamp()
         RETURNING name
         """,
         (status_text, name, owner, epoch),

@@ -311,6 +311,39 @@ class RegistryTest(PgTestCase):
         registry.set_session(self.db, "alpha", "sess-42")
         self.assertEqual(registry.get(self.db, "alpha")["session_id"], "sess-42")
 
+    def test_echeance_recontrolee_apres_le_verrou(self):
+        """Grille codex3 (L6) : une échéance se recontrôle avec
+        `clock_timestamp()` **après** le dernier verrou. Un renouvellement qui
+        attend un verrou pendant que le bail expire doit être refusé.
+        """
+        if self.db.name != "psycopg":
+            self.skipTest("verrou tenu entre deux ordres : connexion persistante requise")
+        registry.upsert(self.db, "bail", harness="claude", host=self.cfg.host)
+        lease = registry.claim(self.db, "bail", "runner-1", 0.4)
+        self.assertIsNotNone(lease)
+        bloqueur = self.connect()
+        resultat: list = []
+        try:
+            bloqueur.execute("BEGIN")
+            bloqueur.execute(
+                "UPDATE agent_registry SET updated_at = now() WHERE name = 'bail'")
+            thread = threading.Thread(
+                target=lambda: resultat.append(registry.renew(
+                    self.db, "bail", "runner-1", int(lease["lease_epoch"]), 30)),
+                daemon=True)
+            thread.start()
+            time.sleep(0.8)  # le bail expire pendant que le renouvellement attend
+            bloqueur.execute("COMMIT")
+            thread.join(timeout=5)
+            self.assertEqual(resultat, [None],
+                             "un bail expiré pendant l'attente du verrou a été renouvelé")
+        finally:
+            try:
+                bloqueur.execute("ROLLBACK")
+            except Exception:
+                pass
+            bloqueur.close()
+
 
 if __name__ == "__main__":
     unittest.main()
