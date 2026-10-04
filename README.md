@@ -225,10 +225,15 @@ src/ameesh/
   mail.py         agent_mailbox: send, unread, deliver, history
   fil.py          readable threads: Transport, file transport, index, ameesh fil
   migrations.py   NNNN_name.sql, checksummed, advisory-locked
-  migrations/     0001_init.sql … 0009_threads.sql, 0014_cost.sql (numéros réservés : 0010–0013, 0015–0021)
+  migrations/     0001_init.sql … 0009_threads.sql, 0011_receipts.sql, 0014_cost.sql (numéros réservés : 0010, 0012–0013, 0015–0021)
   mesh_cli.py     agent-mesh: mesh list, keys, approvals, work items, import/export v0
   authority.py    Ed25519 proofs bound to content and expiry; approvals
   signing.py      Ed25519 (pure RFC 8032 + optional cryptography/nacl), key files
+  jcs.py          RFC 8785 canonical JSON (receipt challenges, action digests)
+  p256.py         ECDSA P-256 / ES256, verification only (pure Python)
+  cose.py         minimal CBOR, COSE_Key public keys (EC2 P-256, OKP Ed25519)
+  receipts.py     ameesh-receipt/1 approval receipts, authenticators, standing grants
+  receipts_cli.py ameesh receipt verify, ameesh authenticator list
   work.py         work_items state machine, loop bound, event ledger
   canon.py        OKF canon: git-object reading, minimal YAML, profile, validation,
                   placement_violations (host policy)

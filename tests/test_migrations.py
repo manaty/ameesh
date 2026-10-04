@@ -17,10 +17,15 @@ class MigrationsTest(PgTestCase):
         rows = self.db.query(
             "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
         )
-        self.assertEqual([row["version"] for row in rows], [1, 2, 3, 4, 5, 6, 7, 8, 9, 14])
-        self.assertEqual([row["name"] for row in rows],
-                         ["init", "overview", "authority", "work_items", "key_roles",
-                          "authority_fixes", "nonces_backfill", "canon", "threads", "cost"])
+        # toutes les migrations livrées sont appliquées, dans l'ordre (les
+        # numéros réservés aux lots non encore fusionnés peuvent manquer)
+        self.assertEqual([row["version"] for row in rows],
+                         [m.version for m in migrations.discover()])
+        names = {int(row["version"]): row["name"] for row in rows}
+        expected = {1: "init", 2: "overview", 3: "authority", 4: "work_items", 5: "key_roles",
+                    6: "authority_fixes", 7: "nonces_backfill", 8: "canon", 9: "threads",
+                    11: "receipts", 14: "cost"}
+        self.assertEqual({v: names.get(v) for v in expected}, expected)
         for row in rows:
             self.assertEqual(len(row["checksum"]), 64)
         # la vue d'observabilité et les deux triggers de notification existent
@@ -85,7 +90,8 @@ class MigrationsTest(PgTestCase):
                 "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %s) AS ok", (schema,)
             )[0]["ok"])
             done = migrations.migrate(db)
-            self.assertEqual([m.version for m in done], [1, 2, 3, 4, 5, 6, 7, 8, 9, 14])
+            self.assertEqual([m.version for m in done],
+                             [m.version for m in migrations.discover()])
             tables = db.query(
                 "SELECT count(*)::int AS n FROM information_schema.tables "
                 "WHERE table_schema = %s AND table_name IN ('agent_registry','agent_mailbox',"
@@ -156,7 +162,8 @@ class MigrationsTest(PgTestCase):
             #    enregistrée avant 0005 devient « agent » (moindre privilège) :
             #    l'acte explicite --role owner est rejoué, comme à la bascule.
             done = migrations.migrate(db)
-            self.assertEqual([m.version for m in done], [5, 6, 7, 8, 9, 14])
+            self.assertEqual([m.version for m in done],
+                             [m.version for m in migrations.discover() if m.version >= 5])
             db.execute("UPDATE agent_registry SET key_role = 'owner' "
                        "WHERE name = 'proprietaire'")
             ledger = db.query(
