@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Migrations versionnées : `NNNN_nom.sql`, appliquées une fois, vérifiées.
 
 Chaque fichier est immuable : son empreinte SHA-256 est enregistrée dans

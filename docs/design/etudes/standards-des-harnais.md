@@ -45,6 +45,22 @@ existants, sans nouveau format de connecteur.
 | Gemini CLI | oui | oui | BeforeTool | `-p` ; ACP natif |
 | goose, OpenHands | oui | partiel | non vérifié | ACP natif |
 
+# Décrire un harnais : standards existants
+
+- **Registre ACP** (RFD terminée, registre stabilisé en mars 2026) : chaque agent
+  publie un manifeste `agent.json` (id, nom, version, version du schéma,
+  description, dépôt, licence, capacités = méthodes ACP, options
+  d'authentification, distribution) dans un dépôt de registre agrégé en
+  catalogue. C'est la base retenue pour les descripteurs de harnais d'ameesh
+  (lot L16), étendue par des clés propres à ameesh pour ce que l'ACP ne décrit
+  pas (pilotage sans interface et reprise de session hors ACP, jauges et coût,
+  hooks, permissions).
+- **Agent Card A2A** (`/.well-known/agent.json`, A2A v1.0) : décrit un agent
+  **distant** (identité, compétences, points d'accès) — utile si un membre
+  agent d'ameesh est exposé à d'autres systèmes, pas pour un harnais local.
+- **Registre MCP** (`server.json`) : décrit des serveurs d'outils, pas des
+  harnais ; utile pour le catalogue des connecteurs.
+
 # Entrant
 
 Les « channels » de Claude Code existent (preview, propres à Claude, liste

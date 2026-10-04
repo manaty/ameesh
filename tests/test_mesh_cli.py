@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """CLI `agent-mesh` : mesh list, show, clés, approbations, work_items."""
 from __future__ import annotations
 

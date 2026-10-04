@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """agent-mesh — boîte aux lettres durable et exécuteur multi-harnais.
 
 v1 (points 1–2) : `agent_mailbox` + `agent_registry` sur Postgres, migrations

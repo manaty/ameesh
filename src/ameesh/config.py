@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Configuration d'agent-mesh.
 
 Une seule source de vérité, lue dans cet ordre :
@@ -23,7 +24,9 @@ import re
 import socket
 from dataclasses import dataclass, replace
 
-DEFAULT_DSN = "postgresql://agent_mesh:agent_mesh@127.0.0.1:55432/agent_mesh"
+#: DSN du banc local, **sans mot de passe** : le secret vient de PGPASSWORD ou
+#: de ~/.pgpass, ou d'un DSN complet dans AMEESH_DSN / le fichier de config.
+DEFAULT_DSN = "postgresql://agent_mesh@127.0.0.1:55432/agent_mesh"
 DEFAULT_CONFIG = "~/.config/ameesh/config.json"
 LEGACY_CONFIG = "~/.config/agent-mesh/config.json"
 DEFAULT_STATE = "~/.local/state/ameesh"
@@ -88,6 +91,14 @@ class Config:
     lease_ttl: float = 300.0
     idle_nudge: float = 1200.0
     poll: float = 5.0
+    #: racine des fils lisibles (transport `file`) ; vide = `<state_dir>/fils`
+    threads_dir: str = ""
+    #: projet par défaut d'un message dont ni l'expéditeur ni le destinataire
+    #: n'ont de chantier (AMEESH_PROJECT) ; vide = « default »
+    project: str = ""
+    #: noms des membres humains (séparés par des virgules), pour l'auteur
+    #: `human:` des entrées de fil ; les autres sont `agent:`
+    humans: str = ""
     #: racine du canon OKF (spec §4.1) ; vide = pas de canon (banc historique)
     canon: str = ""
     #: révision canonique à lire (vide = `ref` du manifeste, sinon origin/main)
@@ -117,6 +128,15 @@ class Config:
         """État local d'un agent (événements, session, journaux) sur cette machine."""
         return os.path.join(self.state_dir, name)
 
+    @property
+    def threads_root(self) -> str:
+        """Racine des fils lisibles : AMEESH_THREADS, sinon `<état>/fils`."""
+        return self.threads_dir or os.path.join(self.state_dir, "fils")
+
+    @property
+    def human_names(self) -> frozenset:
+        return frozenset(n.strip() for n in (self.humans or "").split(",") if n.strip())
+
 
 def load(env: dict | None = None) -> Config:
     env = dict(os.environ if env is None else env)
@@ -135,6 +155,8 @@ def load(env: dict | None = None) -> Config:
         if not isinstance(raw, dict):
             raise SystemExit("config illisible %s : objet JSON attendu" % cfg_path)
         known = {f for f in Config.__dataclass_fields__}  # type: ignore[attr-defined]
+        if isinstance(raw.get("humans"), list):
+            raw = dict(raw, humans=",".join(str(n) for n in raw["humans"]))
         cfg = replace(cfg, **{k: v for k, v in raw.items() if k in known})
 
     def pick(*names, default=None):
@@ -156,6 +178,8 @@ def load(env: dict | None = None) -> Config:
     else:
         neuf, ancien = _expand(DEFAULT_STATE), _expand(LEGACY_STATE)
         state_dir = ancien if (os.path.isdir(ancien) and not os.path.isdir(neuf)) else neuf
+    # Fils lisibles : AMEESH_THREADS > `threads_dir` du JSON > `<état>/fils`.
+    threads_brut = pick("AMEESH_THREADS", default=cfg.threads_dir)
     cfg = replace(
         cfg,
         dsn=pick("AMEESH_DSN", "AGENT_MESH_DSN", "AMEESH_DATABASE_URL",
@@ -176,6 +200,9 @@ def load(env: dict | None = None) -> Config:
         lease_ttl=_as_float(pick("AMEESH_LEASE_TTL", "AGENT_MESH_LEASE_TTL"), cfg.lease_ttl),
         idle_nudge=_as_float(pick("AMEESH_IDLE_NUDGE", "AGENT_MESH_IDLE_NUDGE"), cfg.idle_nudge),
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
+        threads_dir=_expand(threads_brut) if threads_brut else "",
+        project=pick("AMEESH_PROJECT", default=cfg.project) or "",
+        humans=pick("AMEESH_HUMANS", default=cfg.humans) or "",
     )
     canon = pick("AMEESH_CANON", "AGENT_MESH_CANON", default=cfg.canon) or ""
     cfg = replace(

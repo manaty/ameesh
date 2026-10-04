@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # nexlink-agent — agents du chantier Nexlink en mode headless, qui se relancent seuls.
 #
 #   nexlink-agent start <nom> <deepseek|claude|codex> "<consigne>" [session]

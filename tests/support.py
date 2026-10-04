@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Socle des tests agent-mesh : schéma Postgres jetable, CLI en sous-processus.
 
 Chaque classe de test reçoit son propre schéma (`t_<classe>_<hex>`) dans le
@@ -27,7 +28,8 @@ FAKEBIN = os.path.join(REPO, "tests", "fakebin")
 TEST_DSN = os.environ.get(
     "AMEESH_TEST_DSN", os.environ.get(
         "AGENT_MESH_TEST_DSN",
-        "postgresql://agent_mesh:agent_mesh@127.0.0.1:55432/agent_mesh",
+        #: aucun secret dans le dépôt : PGPASSWORD/~/.pgpass pour le banc local.
+        "postgresql://agent_mesh@127.0.0.1:55432/agent_mesh",
     ),
 )
 REQUIRE_DB = os.environ.get(
@@ -42,6 +44,10 @@ def child_env(**extra: str) -> dict:
     for name in ("AMEESH_CANON", "AMEESH_CANON_REF", "AMEESH_CANON_UNTRUSTED",
                  "AMEESH_REQUIRE_RESPONSIBLE", "AGENT_MESH_CANON", "AGENT_MESH_CANON_REF",
                  "AGENT_MESH_CANON_UNTRUSTED", "AGENT_MESH_REQUIRE_RESPONSIBLE"):
+        env.pop(name, None)
+    # Les fils vont sous l'état du test (AMEESH_STATE/fils), jamais dans un
+    # dossier réel hérité de l'environnement du développeur.
+    for name in ("AMEESH_THREADS", "AMEESH_PROJECT", "AMEESH_HUMANS"):
         env.pop(name, None)
     env["AMEESH_DSN"] = TEST_DSN
     env["PYTHONPATH"] = SRC + os.pathsep + env.get("PYTHONPATH", "")
@@ -99,7 +105,7 @@ class PgTestCase(unittest.TestCase):
         """Chaque test part d'une base et d'un disque propres."""
         self.db.execute(
             "TRUNCATE agent_registry, agent_mailbox, mesh_approvals, "
-            "work_items, work_item_events RESTART IDENTITY CASCADE")
+            "work_items, work_item_events, thread_index RESTART IDENTITY CASCADE")
         shutil.rmtree(self.tmp, ignore_errors=True)
         os.makedirs(self.tmp, exist_ok=True)
         for path in (self.state, self.v0state, self.conf):

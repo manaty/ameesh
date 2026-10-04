@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Renommage agent-mesh → ameesh : commande `ameesh`, alias, variables.
 
 Le renommage ne doit rien casser de l'existant : `agent-mail` (les hooks des

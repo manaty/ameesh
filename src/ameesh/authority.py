@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Autorité du propriétaire : signatures Ed25519 liées au contenu et à l'échéance.
 
 Règle de base (R4, spec §5 point 3) : **l'autorité ne se déduit jamais du

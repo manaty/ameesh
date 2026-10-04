@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Repli lisible quand la base est absente : les agents continuent de se parler."""
 from __future__ import annotations
 

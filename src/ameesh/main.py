@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """ameesh — la commande du mesh, et ses sous-commandes.
 
   ameesh mail <send|inbox|list|status|alias|hook|statusline|whoami>
@@ -10,6 +11,9 @@
   ameesh key …                clés publiques (propriétaire / agent) ;
   ameesh approve | approvals | verify   approbations signées ;
   ameesh work …               lots (work_items) ;
+  ameesh cost …               coût des tours et jauges de forfait ;
+  ameesh fil list | show <projet> [<lot>] [--last N] | tail <projet> [<lot>]
+        les fils lisibles : tout message passé par ameesh, en clair (R12) ;
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
   ameesh migrate | doctor     schéma et diagnostic ;
   ameesh canon check|show|sync          canon OKF : validation, fiches, registre ;
@@ -24,7 +28,7 @@ import sys
 
 #: sous-commandes servies par mesh_cli (parseur déjà en place)
 MESH_COMMANDS = (
-    "list", "show", "key", "approve", "approvals", "verify", "work",
+    "list", "show", "key", "approve", "approvals", "verify", "work", "cost",
     "migrate", "doctor", "import-v0", "export-v0", "canon", "agent",
 )
 
@@ -41,6 +45,9 @@ def main(argv: list[str] | None = None) -> int:
     if command == "run":
         from . import runner
         return runner.main(rest)
+    if command == "fil":
+        from . import fil
+        return fil.main(rest)
     if command in MESH_COMMANDS:
         from . import mesh_cli
         return mesh_cli.main(argv)
