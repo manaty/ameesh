@@ -7,6 +7,11 @@ Une seule source de vérité, lue dans cet ordre :
    en alias, comme `agent-mail` pour la commande) ;
 3. les valeurs par défaut.
 
+Canon (spec §4) : `AMEESH_CANON` (racine du bundle OKF), `AMEESH_CANON_REF`
+(révision canonique), `AMEESH_CANON_UNTRUSTED=1` (canon hors git, tests
+seulement) et `AMEESH_REQUIRE_RESPONSIBLE` (R14 dans `claimable` ; par défaut
+vrai dès qu'un canon est configuré, faux sinon pour la compatibilité du banc).
+
 Les chemins v0 (`~/.local/state/agent-mail`, `~/.config/agent-mail`) restent les
 chemins du repli fichier et des alias : la CLI v1 reste compatible avec les
 outils v0 qui tournent en production sur ce PC.
@@ -49,6 +54,20 @@ def _as_float(value, default: float) -> float:
         return default
 
 
+def _as_bool(value, default: bool | None, name: str) -> bool | None:
+    """Booléen d'environnement ou de configuration ; une valeur illisible est une erreur."""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "oui", "on"):
+        return True
+    if text in ("0", "false", "no", "non", "off"):
+        return False
+    raise SystemExit("%s invalide : %r (attendu 1/0, true/false)" % (name, value))
+
+
 def hostname() -> str:
     """Nom court de la machine : l'hôte auquel un agent est épinglé."""
     return socket.gethostname().split(".")[0]
@@ -75,6 +94,30 @@ class Config:
     #: regroupement des événements (C9) : au plus un réveil par ce délai,
     #: sauf événement `urgent`. 0 = aucun regroupement.
     event_coalesce: float = 120.0
+    #: racine des fils lisibles (transport `file`) ; vide = `<state_dir>/fils`
+    threads_dir: str = ""
+    #: projet par défaut d'un message dont ni l'expéditeur ni le destinataire
+    #: n'ont de chantier (AMEESH_PROJECT) ; vide = « default »
+    project: str = ""
+    #: noms des membres humains (séparés par des virgules), pour l'auteur
+    #: `human:` des entrées de fil ; les autres sont `agent:`
+    humans: str = ""
+    #: racine du canon OKF (spec §4.1) ; vide = pas de canon (banc historique)
+    canon: str = ""
+    #: révision canonique à lire (vide = `ref` du manifeste, sinon origin/main)
+    canon_ref: str = ""
+    #: lire les fichiers de travail d'un canon hors dépôt (tests, prototypes) :
+    #: jamais par défaut, et chaque constat le signale
+    canon_untrusted: bool = False
+    #: R14 : un agent sans humain responsable n'est pas réclamable. None = vrai
+    #: si un canon est configuré, faux sinon (compatibilité du banc)
+    require_responsible: bool | None = None
+
+    @property
+    def responsible_required(self) -> bool:
+        if self.require_responsible is None:
+            return bool(self.canon)
+        return bool(self.require_responsible)
 
     @property
     def runner(self) -> str:
@@ -87,6 +130,15 @@ class Config:
     def agent_dir(self, name: str) -> str:
         """État local d'un agent (événements, session, journaux) sur cette machine."""
         return os.path.join(self.state_dir, name)
+
+    @property
+    def threads_root(self) -> str:
+        """Racine des fils lisibles : AMEESH_THREADS, sinon `<état>/fils`."""
+        return self.threads_dir or os.path.join(self.state_dir, "fils")
+
+    @property
+    def human_names(self) -> frozenset:
+        return frozenset(n.strip() for n in (self.humans or "").split(",") if n.strip())
 
 
 def load(env: dict | None = None) -> Config:
@@ -106,6 +158,8 @@ def load(env: dict | None = None) -> Config:
         if not isinstance(raw, dict):
             raise SystemExit("config illisible %s : objet JSON attendu" % cfg_path)
         known = {f for f in Config.__dataclass_fields__}  # type: ignore[attr-defined]
+        if isinstance(raw.get("humans"), list):
+            raw = dict(raw, humans=",".join(str(n) for n in raw["humans"]))
         cfg = replace(cfg, **{k: v for k, v in raw.items() if k in known})
 
     def pick(*names, default=None):
@@ -127,6 +181,8 @@ def load(env: dict | None = None) -> Config:
     else:
         neuf, ancien = _expand(DEFAULT_STATE), _expand(LEGACY_STATE)
         state_dir = ancien if (os.path.isdir(ancien) and not os.path.isdir(neuf)) else neuf
+    # Fils lisibles : AMEESH_THREADS > `threads_dir` du JSON > `<état>/fils`.
+    threads_brut = pick("AMEESH_THREADS", default=cfg.threads_dir)
     cfg = replace(
         cfg,
         dsn=pick("AMEESH_DSN", "AGENT_MESH_DSN", "AMEESH_DATABASE_URL",
@@ -149,7 +205,25 @@ def load(env: dict | None = None) -> Config:
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
         event_coalesce=_as_float(
             pick("AMEESH_EVENT_COALESCE", "AGENT_MESH_EVENT_COALESCE"), cfg.event_coalesce),
+        threads_dir=_expand(threads_brut) if threads_brut else "",
+        project=pick("AMEESH_PROJECT", default=cfg.project) or "",
+        humans=pick("AMEESH_HUMANS", default=cfg.humans) or "",
     )
+    canon = pick("AMEESH_CANON", "AGENT_MESH_CANON", default=cfg.canon) or ""
+    cfg = replace(
+        cfg,
+        canon=_expand(str(canon)) if canon else "",
+        canon_ref=str(pick("AMEESH_CANON_REF", "AGENT_MESH_CANON_REF",
+                           default=cfg.canon_ref) or ""),
+        canon_untrusted=bool(_as_bool(
+            pick("AMEESH_CANON_UNTRUSTED", "AGENT_MESH_CANON_UNTRUSTED",
+                 default=cfg.canon_untrusted), False, "AMEESH_CANON_UNTRUSTED")),
+        require_responsible=_as_bool(
+            pick("AMEESH_REQUIRE_RESPONSIBLE", "AGENT_MESH_REQUIRE_RESPONSIBLE",
+                 default=cfg.require_responsible), None, "AMEESH_REQUIRE_RESPONSIBLE"),
+    )
+    if cfg.canon_ref.startswith("-"):
+        raise SystemExit("AMEESH_CANON_REF invalide : %r" % cfg.canon_ref)
     if not SCHEMA_RE.match(cfg.schema):
         raise SystemExit("AGENT_MESH_SCHEMA invalide : %r" % cfg.schema)
     if cfg.driver not in ("auto", "psycopg", "psql"):

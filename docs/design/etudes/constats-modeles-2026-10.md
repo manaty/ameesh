@@ -32,3 +32,35 @@ stale_after: 2026-11-04
 Petites retouches d'UI avec capture ; correctifs SQL avec sondes de privilèges ;
 défauts natifs reproduits sur banc ; relectures avec contre-exemples connus
 (les blocages de revue de la nuit, avec leur sonde, en sont une source prête).
+
+# Mesures et leçons (03:28)
+
+- Après les règles de vitesse : délai travail → fusion maximal passé de 100 min
+  (fenêtre 01:25–02:25, 8 fusions) à 21 min (02:25–03:25, 6 fusions) ; petit
+  échantillon. Ce qui a porté : revue proportionnée, rotation des sessions
+  saturées avec résumé, pouls automatique (un tour de 67 min passé à attendre
+  une suite complète), mode rapide des relecteurs.
+- **Rejeu d'évaluation contaminé** : un rejeu en DeepSeek flash effort bas
+  (6,5 min, ≈ 0,15 $, tests verts, note 9/10) avait accès à la solution de
+  référence par le worktree (diff identique). Exigence : rejouer dans un dépôt
+  **isolé** (archive git + init, sans historique ni remote), sans accès au
+  board ni aux autres worktrees.
+
+# Premier rejeu isolé (03:46)
+
+Lot de référence : correctif mobile JS d'environ 400 lignes avec tests, rejoué
+dans un dépôt isolé.
+
+| Configuration | Durée | Coût | Qualité (relecteur) |
+|---|---|---|---|
+| DeepSeek flash, effort bas | 9 min 40 | ≈ 0,32 $ (56k entrée, 3,9M cache, 32k sortie) | 8/10, OK avec détails |
+| DeepSeek flash, effort élevé (référence) | ≈ 9 min | comparable | ≈ 9/10, OK avec un détail |
+
+Conclusion provisoire : sur ce type de lot, **l'effort bas ne fait pas gagner de
+temps réel** (temps dominé par les outils — installation, tests, typage — et la
+lecture du code), coûte à peu près pareil (le cache domine) et perd environ un
+point de qualité. **Effort élevé par défaut pour l'implémentation** ; effort bas
+seulement quand le raisonnement domine (petites tâches sans suite de tests
+lourde). Le levier de vitesse est ailleurs : tests ciblés, sessions courtes,
+revue par risque. À confirmer sur d'autres paires (Rust, SQL). Outil de
+référence : `~/.local/bin/nexlink-rd`.

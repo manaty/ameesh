@@ -13,10 +13,15 @@ locaux). Le bail est la seule autorisation de tourner :
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Sequence
 
 from .config import NAME_RE
 from .db import Db
+
+_ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+#: profondeur maximale d'une lignée d'éphémères suivie (au-delà : gouverné)
+_LINEAGE_MAX = 32
 
 AGENT_COLUMNS = """
     name, chantier, harness, host, cwd, session_id, status, status_text, model,
@@ -25,7 +30,10 @@ AGENT_COLUMNS = """
     extract(epoch from lease_expires_at)::float8 as lease_expires_ts,
     extract(epoch from last_seen)::float8         as last_seen_ts,
     extract(epoch from last_turn_at)::float8      as last_turn_ts,
-    extract(epoch from last_event_at)::float8     as last_event_ts
+    extract(epoch from last_event_at)::float8     as last_event_ts,
+    responsible, team, provider, credential_mode, capabilities, canon_ref,
+    ephemeral, created_by,
+    extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts
 """
 
 
@@ -37,6 +45,68 @@ def _check_name(name: str) -> str:
 
 def _name_list(names: Sequence[str]) -> str:
     return ", ".join("'%s'" % _check_name(n).replace("'", "''") for n in names)
+
+
+# --------------------------------------------------------------------------
+# canon (§4.1, C2/C3) : condition de réclamation, partagée par claimable(),
+# claim() et `ameesh attach`
+# --------------------------------------------------------------------------
+
+def _alias(alias: str) -> str:
+    if not _ALIAS_RE.match(alias or ""):
+        raise ValueError("alias SQL invalide : %r" % (alias,))
+    return alias
+
+
+def canon_governed_sql(alias: str = "agent_registry") -> str:
+    """Expression SQL : l'agent de la ligne `alias` est-il gouverné par le canon ?
+
+    Oui s'il vient du canon (`canon_ref` posé), ou si c'est un éphémère dont la
+    lignée de créateurs (`created_by`, suivie de proche en proche) atteint un
+    agent du canon. Fail closed : un éphémère dont la lignée est rompue
+    (créateur absent) ou trop longue est tenu pour gouverné. Seuls les agents
+    inscrits à la main (ni `canon_ref`, ni éphémère) et les éphémères issus
+    d'eux ne le sont pas.
+    """
+    a = _alias(alias)
+    return """(%(a)s.canon_ref IS NOT NULL
+       OR (%(a)s.ephemeral AND NOT EXISTS (
+           WITH RECURSIVE lignee (name, created_by, canon_ref, ephemeral, depth) AS (
+               SELECT c.name, c.created_by, c.canon_ref, c.ephemeral, 1
+                 FROM agent_registry c WHERE c.name = %(a)s.created_by
+               UNION ALL
+               SELECT c.name, c.created_by, c.canon_ref, c.ephemeral, l.depth + 1
+                 FROM lignee l JOIN agent_registry c ON c.name = l.created_by
+                WHERE l.ephemeral AND l.canon_ref IS NULL AND l.depth < %(max)d
+           )
+           SELECT 1 FROM lignee
+            WHERE NOT lignee.ephemeral AND lignee.canon_ref IS NULL)))""" % {
+        "a": a, "max": _LINEAGE_MAX}
+
+
+def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
+    """Condition SQL de réclamation liée au canon (§4.1), pour un `WHERE`.
+
+    Vraie si l'agent de la ligne `alias` (une ligne de `agent_registry`, ou de
+    la vue `agent_mesh_overview`) n'est pas gouverné par le canon
+    (`canon_governed_sql`), ou si le dernier état du canon de **son hôte**
+    (`canon_state`, écrit par `ameesh canon sync`) est `ok`. Un canon
+    `invalid` ou `unreadable`, ou l'absence d'état, refuse donc toute
+    NOUVELLE réclamation d'un agent du canon (et de ses éphémères), sans rien
+    toucher aux baux, sessions ni tours en cours : fail closed.
+
+    Indépendante de la configuration (AMEESH_CANON, AMEESH_REQUIRE_RESPONSIBLE) :
+    un agent venu du canon sur un hôte où aucune synchronisation n'a constaté
+    un canon valide n'est jamais réclamable. Sans paramètre lié (`%s`) : elle
+    s'insère telle quelle dans une requête paramétrée, avec les deux pilotes.
+    Utilisée par `claimable()` et `claim()` ; à réutiliser telle quelle pour
+    `ameesh attach` (C9).
+    """
+    a = _alias(alias)
+    return """(NOT %s
+       OR EXISTS (SELECT 1 FROM canon_state s
+                   WHERE s.host = %s.host AND s.status = 'ok'))""" % (
+        canon_governed_sql(a), a)
 
 
 def upsert(
@@ -88,52 +158,57 @@ def get(db: Db, name: str) -> dict | None:
 
 
 def overview(db: Db) -> list[dict]:
+    """Vue d'observabilité (`mesh list --json`).
+
+    Colonnes du canon : `canon_governed` (l'agent relève du canon),
+    `canon_status` / `canon_diagnostic` / `canon_checked_ts` (dernier état du
+    canon de son hôte, NULL si aucun), `canon_claim_ok` (la condition de
+    réclamation liée au canon est remplie).
+    """
     return db.query(
         """
         SELECT name, chantier, harness, host, cwd, session_id, status, status_text,
                model, budget_usd, spent_usd, turns, pending_prompt, last_error,
                lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
-               public_key_fingerprint, key_role, key_ready, has_owner_key, unread
-        FROM agent_mesh_overview
+               public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
+               responsible, team, provider, credential_mode, capabilities, canon_ref,
+               ephemeral, created_by, ephemeral_expires_ts, responsible_ok,
+               __GOVERNED__ AS canon_governed,
+               (SELECT s.status FROM canon_state s WHERE s.host = o.host) AS canon_status,
+               (SELECT s.diagnostic FROM canon_state s
+                 WHERE s.host = o.host) AS canon_diagnostic,
+               (SELECT extract(epoch from s.checked_at)::float8 FROM canon_state s
+                 WHERE s.host = o.host) AS canon_checked_ts,
+               __CLAIM_OK__ AS canon_claim_ok
+        FROM agent_mesh_overview o
         ORDER BY last_seen_ts DESC NULLS LAST
-        """
+        """.replace("__GOVERNED__", canon_governed_sql("o"))
+           .replace("__CLAIM_OK__", canon_claim_predicate_sql("o"))
     )
-
-
-def _canon_rules_sql(db: Db) -> str:
-    """Règles du canon (L2) applicables au registre, si les colonnes existent.
-
-    L8 (`attach`) et L2 (canon) sont écrits en parallèle : ce pont applique le
-    même prédicat que `claimable` — éphémère échu jamais réclamable, responsable
-    résolu quand il est requis — dès que la migration 0008 est là, quel que soit
-    l'ordre de fusion. Tant que les colonnes n'existent pas, il ne change rien.
-    La politique d'hôte (L3) viendra s'ajouter ici.
-    """
-    rows = db.query(
-        "SELECT count(*)::int AS n FROM information_schema.columns "
-        "WHERE table_schema = current_schema() AND table_name = 'agent_registry' "
-        "AND column_name IN ('responsible', 'ephemeral', 'ephemeral_expires_at')"
-    )
-    if int(rows[0]["n"]) < 3:
-        return ""
-    sql = " AND (NOT ephemeral OR ephemeral_expires_at > clock_timestamp())"
-    cfg = getattr(db, "cfg", None)
-    if cfg is not None and getattr(cfg, "responsible_required", False):
-        sql += " AND coalesce(responsible, '') <> ''"
-    return sql
 
 
 def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
     """Prend le bail s'il est libre ou expiré. Renvoie la ligne, sinon None.
 
-    Les règles du canon (`_canon_rules_sql`) sont appliquées **dans la même
-    requête** que la prise de bail : un agent non réclamable ne peut pas être
-    pris par une course entre `claimable` et `claim`.
+    Le verrou de ligne est pris **d'abord** (`SELECT ... FOR UPDATE`), puis les
+    conditions sont recontrôlées avec `clock_timestamp()` dans l'instruction qui
+    écrit : un verrou attendu au-delà de l'échéance refuse la réclamation, même
+    si le détenteur n'a fait qu'un `SELECT ... FOR UPDATE` sans modifier la ligne
+    (EvalPlanQual ne réévalue pas un `WHERE` sans nouvelle version — grille
+    codex3).
+
+    `claim` applique **les mêmes règles que `claimable`** — éphémère échu,
+    responsable résolu quand il est requis, prédicat du canon — dans la même
+    instruction : la course `claimable` → `claim` est fermée.
     """
     _check_name(name)
-    rows = db.query(
-        """
-        UPDATE agent_registry
+    cfg = getattr(db, "cfg", None)
+    responsable = bool(cfg is not None and getattr(cfg, "responsible_required", False))
+    sql = """
+        WITH verrou AS (
+            SELECT name FROM agent_registry WHERE name = %s FOR UPDATE
+        )
+        UPDATE agent_registry AS r
            SET lease_owner      = %s,
                lease_expires_at = clock_timestamp() + make_interval(secs => %s),
                lease_epoch      = lease_epoch + 1,
@@ -142,88 +217,39 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
                -- inachevée repart en attente. Si une consigne était déjà en
                -- attente, les deux sont conservées (B6b, B6c).
                pending_prompt   = CASE
-                   WHEN current_prompt IS NOT NULL
-                        AND (lease_owner IS DISTINCT FROM %s
-                             OR lease_expires_at IS NULL
-                             OR lease_expires_at < now())
+                   WHEN r.current_prompt IS NOT NULL
+                        AND (r.lease_owner IS DISTINCT FROM %s
+                             OR r.lease_expires_at IS NULL
+                             OR r.lease_expires_at < clock_timestamp())
                    THEN CASE
-                       WHEN pending_prompt IS NULL THEN current_prompt
-                       ELSE current_prompt || E'\n\n' || pending_prompt
+                       WHEN r.pending_prompt IS NULL THEN r.current_prompt
+                       ELSE r.current_prompt || E'\n\n' || r.pending_prompt
                    END
-                   ELSE pending_prompt END,
+                   ELSE r.pending_prompt END,
                current_prompt   = CASE
-                   WHEN lease_owner IS DISTINCT FROM %s
-                        OR lease_expires_at IS NULL
-                        OR lease_expires_at < now()
+                   WHEN r.lease_owner IS DISTINCT FROM %s
+                        OR r.lease_expires_at IS NULL
+                        OR r.lease_expires_at < clock_timestamp()
                    THEN NULL
-                   ELSE current_prompt END,
-               status           = CASE WHEN status = 'dead' THEN 'idle' ELSE status END,
+                   ELSE r.current_prompt END,
+               status           = CASE WHEN r.status = 'dead' THEN 'idle' ELSE r.status END,
                updated_at       = now()
-         WHERE name = %s
-           AND (lease_owner IS NULL OR lease_owner = %s OR lease_expires_at < now())
-        """ + _canon_rules_sql(db) + """
-        RETURNING name, lease_owner, lease_epoch,
-                  extract(epoch from lease_expires_at)::float8 as lease_expires_ts
-        """,
-        (owner, ttl_seconds, owner, owner, name, owner),
-    )
+          FROM verrou
+         WHERE r.name = verrou.name
+           AND (r.lease_owner IS NULL OR r.lease_owner = %s
+                OR r.lease_expires_at < clock_timestamp())
+           AND (NOT r.ephemeral OR r.ephemeral_expires_at > clock_timestamp())
+           __RESPONSABLE__
+           AND __CANON__
+        RETURNING r.name, r.lease_owner, r.lease_epoch,
+                  extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
+    """
+    sql = sql.replace("__RESPONSABLE__",
+                      "AND coalesce(r.responsible, '') <> ''" if responsable else "")
+    sql = sql.replace("__CANON__", canon_claim_predicate_sql("r"))
+    rows = db.query(sql, (name, owner, ttl_seconds, owner, owner, owner))
     return rows[0] if rows else None
 
-
-def turn_in_progress(db: Db, name: str) -> bool:
-    """Un tour est-il en cours (consigne consommée, pas encore close) ?
-
-    `current_prompt` n'est effacé qu'à la clôture du tour : c'est le marqueur
-    fiable pour `ameesh attach`, qui refuse d'interrompre un tour.
-    """
-    rows = db.query(
-        "SELECT current_prompt IS NOT NULL AS en_cours FROM agent_registry WHERE name = %s",
-        (name,),
-    )
-    return bool(rows and rows[0]["en_cours"])
-
-
-def attach_claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
-    """Prend le bail pour une session interactive (`ameesh attach`).
-
-    Contrairement à `claim`, un bail vivant mais **sans tour en cours** peut
-    être repris : c'est ce qui suspend la réclamation automatique de l'agent
-    (l'ancien exécuteur est fencé par l'epoch à son prochain renouvellement).
-    Un tour en cours n'est jamais interrompu : renvoie None (l'appelant peut
-    attendre, `--wait`).
-    """
-    _check_name(name)
-    rows = db.query(
-        """
-        UPDATE agent_registry
-           SET lease_owner      = %s,
-               lease_expires_at = clock_timestamp() + make_interval(secs => %s),
-               lease_epoch      = lease_epoch + 1,
-               status           = 'running',
-               status_text      = 'session interactive (attach)',
-               updated_at       = now()
-         WHERE name = %s
-           AND status <> 'stopped'
-           AND current_prompt IS NULL
-        """ + _canon_rules_sql(db) + """
-         RETURNING name, lease_owner, lease_epoch,
-                   extract(epoch from lease_expires_at)::float8 as lease_expires_ts
-        """,
-        (owner, ttl_seconds, name),
-    )
-    return rows[0] if rows else None
-
-
-def mark_event_wake(db: Db, name: str) -> None:
-    """Note l'instant du dernier réveil d'événements (regroupement C9).
-
-    Cet état vit en base (et non dans l'exécuteur) : un redémarrage ne remet
-    pas à zéro la fenêtre de regroupement.
-    """
-    db.execute(
-        "UPDATE agent_registry SET last_event_at = now(), updated_at = now() WHERE name = %s",
-        (name,),
-    )
 
 
 def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]:
@@ -256,20 +282,32 @@ def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]
 
 
 def renew(db: Db, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
-    """Prolonge le bail. None si on ne le détient plus (fencing par epoch)."""
+    """Prolonge le bail. None si on ne le détient plus (fencing par epoch).
+
+    Verrou pris d'abord, échéance recontrôlée avec `clock_timestamp()` dans
+    l'écriture : un renouvellement qui a attendu le verrou au-delà de
+    l'expiration est refusé (grille codex3).
+    """
     rows = db.query(
         """
-        UPDATE agent_registry
+        WITH verrou AS (
+            SELECT name, lease_owner, lease_epoch, lease_expires_at
+              FROM agent_registry WHERE name = %s FOR UPDATE
+        )
+        UPDATE agent_registry AS r
            SET lease_expires_at = clock_timestamp() + make_interval(secs => %s),
                last_seen        = now(),
                updated_at       = now()
-         WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
-           AND lease_expires_at > clock_timestamp()
-        RETURNING extract(epoch from lease_expires_at)::float8 as lease_expires_ts
+          FROM verrou
+         WHERE r.name = verrou.name
+           AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+           AND verrou.lease_expires_at > clock_timestamp()
+        RETURNING extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
         """,
-        (ttl_seconds, name, owner, epoch),
+        (name, ttl_seconds, owner, epoch),
     )
     return rows[0]["lease_expires_ts"] if rows else None
+
 
 
 def release(db: Db, name: str, owner: str, epoch: int) -> bool:
@@ -290,15 +328,109 @@ def release(db: Db, name: str, owner: str, epoch: int) -> bool:
     return bool(rows)
 
 
-def claimable(db: Db, host: str, names: Sequence[str] | None = None) -> list[dict]:
-    """Agents de cet hôte sans bail vivant (libres, expirés, ou morts)."""
+def turn_in_progress(db: Db, name: str) -> bool:
+    """Un tour (ou une session attach) est-il vivant ? (verdict L8 B1)
+
+    `current_prompt` ne suffit pas : un tour de courrier, d'événement ou de
+    reprise ne le remplit pas. Le marqueur fiable est `status = 'running'` avec
+    un bail vivant — `begin_turn` le pose pour tout tour, `attach` pour sa
+    session, `end_turn` / `release` le retirent.
+    """
+    rows = db.query(
+        """
+        SELECT (status = 'running' AND lease_owner IS NOT NULL
+                AND lease_expires_at > clock_timestamp()) AS en_cours
+          FROM agent_registry WHERE name = %s
+        """,
+        (name,),
+    )
+    return bool(rows and rows[0]["en_cours"])
+
+
+def attach_claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
+    """Prend le bail pour une session interactive (`ameesh attach`, C9).
+
+    Contrairement à `claim`, un bail vivant mais **sans tour ni session en
+    cours** peut être repris : c'est ce qui suspend la réclamation automatique
+    (l'ancien exécuteur est fencé par l'epoch à son prochain renouvellement).
+    Un tour vivant — courrier, événement, reprise ou attach déjà ouvert — n'est
+    jamais interrompu (verdict L8 B1 : `status = 'running'` + bail vivant, et
+    non `current_prompt`). Mêmes règles que `claimable` : éphémère échu,
+    responsable résolu quand il est requis, prédicat du canon ; verrou pris
+    d'abord et échéances recontrôlées avec `clock_timestamp()`.
+    """
+    _check_name(name)
+    cfg = getattr(db, "cfg", None)
+    responsable = bool(cfg is not None and getattr(cfg, "responsible_required", False))
+    sql = """
+        WITH verrou AS (
+            SELECT name FROM agent_registry WHERE name = %s FOR UPDATE
+        )
+        UPDATE agent_registry AS r
+           SET lease_owner      = %s,
+               lease_expires_at = clock_timestamp() + make_interval(secs => %s),
+               lease_epoch      = lease_epoch + 1,
+               status           = 'running',
+               status_text      = 'session interactive (attach)',
+               updated_at       = now()
+          FROM verrou
+         WHERE r.name = verrou.name
+           AND r.status <> 'stopped'
+           AND NOT (r.status = 'running' AND r.lease_owner IS NOT NULL
+                    AND r.lease_expires_at > clock_timestamp())
+           AND (NOT r.ephemeral OR r.ephemeral_expires_at > clock_timestamp())
+           __RESPONSABLE__
+           AND __CANON__
+        RETURNING r.name, r.lease_owner, r.lease_epoch,
+                  extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
+    """
+    sql = sql.replace("__RESPONSABLE__",
+                      "AND coalesce(r.responsible, '') <> ''" if responsable else "")
+    sql = sql.replace("__CANON__", canon_claim_predicate_sql("r"))
+    rows = db.query(sql, (name, owner, ttl_seconds))
+    return rows[0] if rows else None
+
+
+def mark_event_wake(db: Db, name: str) -> None:
+    """Note l'instant du dernier réveil d'événements (regroupement C9).
+
+    Cet état vit en base (et non dans l'exécuteur) : un redémarrage ne remet
+    pas à zéro la fenêtre de regroupement.
+    """
+    db.execute(
+        "UPDATE agent_registry SET last_event_at = now(), updated_at = now() WHERE name = %s",
+        (name,),
+    )
+
+
+def claimable(db: Db, host: str, names: Sequence[str] | None = None, *,
+              require_responsible: bool | None = None) -> list[dict]:
+    """Agents de cet hôte sans bail vivant (libres, expirés, ou morts).
+
+    R14 (C3) : un éphémère échu n'est jamais réclamable ; et quand le
+    responsable est requis (`AMEESH_REQUIRE_RESPONSIBLE`, vrai par défaut dès
+    qu'un canon est configuré), un agent sans humain responsable résolu non
+    plus. `canon sync` n'écrit `responsible` que résolu ; un éphémère
+    l'hérite de son créateur.
+
+    §4.1 (toujours, quel que soit le réglage) : un agent gouverné par le canon
+    n'est réclamable que si le dernier état du canon de son hôte est `ok`
+    (`canon_claim_predicate_sql`).
+    """
+    if require_responsible is None:
+        cfg = getattr(db, "cfg", None)
+        require_responsible = bool(cfg is not None and cfg.responsible_required)
     sql = """
         SELECT %s
         FROM agent_registry
         WHERE host = %%s
           AND status <> 'stopped'
           AND (lease_owner IS NULL OR lease_expires_at < clock_timestamp())
-    """ % AGENT_COLUMNS
+          AND (NOT ephemeral OR ephemeral_expires_at > clock_timestamp())
+          AND %s
+    """ % (AGENT_COLUMNS, canon_claim_predicate_sql("agent_registry"))
+    if require_responsible:
+        sql += " AND coalesce(responsible, '') <> ''"
     params: list[Any] = [host]
     if names:
         sql += " AND name IN (%s)" % _name_list(names)
@@ -311,7 +443,7 @@ def reap(db: Db, host: str | None = None) -> list[dict]:
     sql = """
         UPDATE agent_registry
            SET status = 'dead', status_text = 'bail expiré', updated_at = now()
-         WHERE status = 'running' AND lease_expires_at < now()
+         WHERE status = 'running' AND lease_expires_at < clock_timestamp()
     """
     params: tuple = ()
     if host is not None:
@@ -361,46 +493,54 @@ def set_pending_prompt(db: Db, name: str, prompt: str | None) -> None:
 def take_pending_prompt(db: Db, name: str, owner: str, epoch: int) -> str | None:
     """Consomme la consigne en attente, atomiquement, et passe l'agent en `running`.
 
-    Le `RETURNING` d'un UPDATE renvoie la *nouvelle* valeur (NULL) : d'où le
-    CTE, qui capture l'ancienne valeur avant de l'effacer.
+    Verrou pris d'abord, échéance recontrôlée avec `clock_timestamp()` dans
+    l'écriture (grille codex3) : une consigne n'est pas consommée sous un bail
+    expiré pendant l'attente du verrou.
     """
     rows = db.query(
         """
-        WITH taken AS (
-            SELECT name, pending_prompt
-              FROM agent_registry
-             WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
-               AND pending_prompt IS NOT NULL
-               AND lease_expires_at > clock_timestamp()
-             FOR UPDATE
+        WITH verrou AS (
+            SELECT name, pending_prompt, lease_owner, lease_epoch, lease_expires_at
+              FROM agent_registry WHERE name = %s FOR UPDATE
         )
         UPDATE agent_registry AS r
            SET pending_prompt = NULL,
-               current_prompt = taken.pending_prompt,
+               current_prompt = verrou.pending_prompt,
                status = 'running',
                status_text = 'tour en cours',
                updated_at = now()
-          FROM taken
-         WHERE r.name = taken.name
-        RETURNING taken.pending_prompt
+          FROM verrou
+         WHERE r.name = verrou.name
+           AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+           AND verrou.pending_prompt IS NOT NULL
+           AND verrou.lease_expires_at > clock_timestamp()
+        RETURNING verrou.pending_prompt
         """,
         (name, owner, epoch),
     )
     return rows[0]["pending_prompt"] if rows else None
 
 
+
 def begin_turn(db: Db, name: str, owner: str, epoch: int, status_text: str) -> bool:
     rows = db.query(
         """
-        UPDATE agent_registry
+        WITH verrou AS (
+            SELECT name, lease_owner, lease_epoch, lease_expires_at
+              FROM agent_registry WHERE name = %s FOR UPDATE
+        )
+        UPDATE agent_registry AS r
            SET status = 'running', status_text = %s, updated_at = now()
-         WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
-           AND lease_expires_at > clock_timestamp()
-        RETURNING name
+          FROM verrou
+         WHERE r.name = verrou.name
+           AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+           AND verrou.lease_expires_at > clock_timestamp()
+        RETURNING r.name
         """,
-        (status_text, name, owner, epoch),
+        (name, status_text, owner, epoch),
     )
     return bool(rows)
+
 
 
 def restore_prompt(db: Db, name: str, owner: str, epoch: int) -> bool:

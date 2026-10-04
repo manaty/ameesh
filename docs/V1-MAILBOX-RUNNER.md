@@ -111,6 +111,21 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   re-`claim` (nouvel epoch) pour continuer ; `end_turn` reste fencé par
   `lease_owner` + `lease_epoch`, pour qu'un tour commencé sous bail valide
   puisse être enregistré.
+* **Verrou d'abord, recontrôle ensuite** — les opérations de bail (`claim`,
+  `attach_claim`, `renew`, `take_pending_prompt`, `begin_turn`) prennent le
+  verrou de la ligne (`SELECT … FOR UPDATE`) puis recontrôlent l'échéance avec
+  `clock_timestamp()` **dans l'instruction qui écrit** : un verrou attendu
+  au-delà de l'expiration refuse l'opération, même si le détenteur n'a fait
+  qu'un `SELECT … FOR UPDATE` sans modifier la ligne (EvalPlanQual ne réévalue
+  pas un `WHERE` sans nouvelle version). `claim` applique les mêmes règles que
+  `claimable` — éphémère échu, responsable résolu quand il est requis, prédicat
+  du canon — dans la même instruction, ce qui ferme la course `claimable` →
+  `claim`. Le marqueur d'un tour vivant est `status = 'running'` avec un bail
+  vivant, pas `current_prompt` (qu'un tour de courrier ou d'événement ne
+  remplit pas) : `ameesh attach` ne reprend jamais un tour en cours, ni une
+  session attach déjà ouverte, et son propre **veilleur d'échéance** tue le
+  harnais interactif si le renouvellement échoue (erreur SQL réelle) et que le
+  bail expire.
 * **Renouvellement borné par l'échéance, pas par un délai fixe** — si
   l'échéance est déjà atteinte au réveil, le harnais est arrêté **sans même
   appeler la base** ; sinon l'appel `renew` tourne dans un fil et est abandonné

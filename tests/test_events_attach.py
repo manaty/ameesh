@@ -10,7 +10,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import adapters, mail, registry
+from ameesh import adapters, db as db_mod, mail, registry
 from ameesh.runner import AgentWorker, Runner, attach_owner, run_attach
 
 from .support import FAKEBIN, PgTestCase
@@ -134,11 +134,28 @@ class AttachTest(PgTestCase):
     def test_attach_refuse_pendant_un_tour(self):
         self._agent("att")
         lease = registry.claim(self.db, "att", "runner-actif", 3600)
+        # le marqueur d'un tour vivant est `status='running'` + bail vivant
+        # (un tour de courrier ne remplit pas current_prompt)
         self.db.execute(
-            "UPDATE agent_registry SET current_prompt = 'tour en cours' WHERE name = 'att'")
+            "UPDATE agent_registry SET status = 'running', "
+            "status_text = 'tour en cours' WHERE name = 'att'")
         with mock.patch.dict(os.environ, self._env(), clear=False):
             code = run_attach(self.cfg, self.db, "att", ttl=30)
         self.assertEqual(code, 3)
+        row = registry.get(self.db, "att")
+        self.assertEqual(row["lease_owner"], "runner-actif")
+        self.assertEqual(int(row["lease_epoch"]), int(lease["lease_epoch"]))
+
+    def test_attach_refuse_pendant_un_tour_de_courrier(self):
+        """Verdict L8 B1 : un vrai tour de courrier (current_prompt NULL) bloque
+        l'attach : le marqueur est `status='running'`, pas `current_prompt`."""
+        self._agent("att")
+        lease = registry.claim(self.db, "att", "runner-actif", 3600)
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'running', current_prompt = NULL "
+            "WHERE name = 'att'")
+        self.assertTrue(registry.turn_in_progress(self.db, "att"))
+        self.assertIsNone(registry.attach_claim(self.db, "att", "attach:test", 30))
         row = registry.get(self.db, "att")
         self.assertEqual(row["lease_owner"], "runner-actif")
         self.assertEqual(int(row["lease_epoch"]), int(lease["lease_epoch"]))
@@ -147,12 +164,14 @@ class AttachTest(PgTestCase):
         self._agent("att")
         registry.claim(self.db, "att", "runner-actif", 3600)
         self.db.execute(
-            "UPDATE agent_registry SET current_prompt = 'tour en cours' WHERE name = 'att'")
+            "UPDATE agent_registry SET status = 'running', current_prompt = 'tour en cours' "
+            "WHERE name = 'att'")
 
         def finir() -> None:
             time.sleep(0.5)
             self.db.execute(
-                "UPDATE agent_registry SET current_prompt = NULL WHERE name = 'att'")
+                "UPDATE agent_registry SET status = 'idle', current_prompt = NULL "
+                "WHERE name = 'att'")
 
         threading.Thread(target=finir, daemon=True).start()
         with mock.patch.dict(os.environ, self._env(), clear=False):
@@ -171,40 +190,48 @@ class AttachTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIsNone(registry.get(self.db, "att")["lease_owner"])
 
+    def test_attach_meurt_a_l_echeance_meme_si_renew_echoue(self):
+        """Verdict L8 B2 : une vraie erreur SQL de renouvellement ne doit pas
+        laisser la session interactive vivante après l'expiration du bail
+        (un remplaçant peut réclamer)."""
+        self._agent("att")
+        env = dict(self._env(), AMEESH_TEST_SLEEP="8")
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(registry, "renew",
+                                  side_effect=db_mod.DbError("panne SQL")):
+            debut = time.monotonic()
+            code = run_attach(self.cfg, self.db, "att", ttl=5)
+            ecoule = time.monotonic() - debut
+        self.assertLess(ecoule, 7.5, "la session interactive a survécu à l'échéance")
+        self.assertLess(code, 0, "le harnais devait être tué à l'échéance")
+
     def test_attach_owner_est_attache_a_l_hote(self):
         self.assertTrue(attach_owner("laptop").startswith("attach:"))
         self.assertTrue(attach_owner("laptop").endswith("@laptop"))
 
-    def test_attache_respecte_les_regles_du_canon_si_presentes(self):
-        """Pont L2 (R14) : dès que les colonnes du canon existent, attach et
-        claim refusent un éphémère échu ou un responsable non résolu."""
+    def test_attache_respecte_les_regles_du_canon(self):
+        """L2 est fusionné : attach et claim refusent un éphémère échu ou un
+        responsable non résolu (mêmes règles que `claimable`)."""
         self._agent("att")
+        # éphémère issu d'un agent manuel : non gouverné par le canon, donc
+        # seule la règle de l'éphémère échu s'applique ici (fail closed L2).
+        self.register("parent", "claude", cwd=self.tmp)
         self.db.execute(
-            "ALTER TABLE agent_registry ADD COLUMN responsible text, "
-            "ADD COLUMN ephemeral boolean NOT NULL DEFAULT false, "
-            "ADD COLUMN ephemeral_expires_at timestamptz")
-        try:
-            self.db.execute(
-                "UPDATE agent_registry SET ephemeral = true, "
-                "ephemeral_expires_at = now() - interval '1 second' WHERE name = 'att'")
+            "UPDATE agent_registry SET created_by = 'parent', ephemeral = true, "
+            "ephemeral_expires_at = now() - interval '1 second' WHERE name = 'att'")
+        self.assertIsNone(registry.attach_claim(self.db, "att", "attach:test", 30))
+        self.assertIsNone(registry.claim(self.db, "att", "runner-x", 30))
+        self.db.execute(
+            "UPDATE agent_registry SET ephemeral_expires_at = now() + interval '1 hour' "
+            "WHERE name = 'att'")
+        self.assertIsNotNone(registry.claim(self.db, "att", "runner-x", 30))
+        self.db.execute(
+            "UPDATE agent_registry SET lease_owner = NULL, lease_expires_at = NULL, "
+            "status = 'idle' WHERE name = 'att'")
+        self.db.execute("UPDATE agent_registry SET responsible = NULL WHERE name = 'att'")
+        with mock.patch.object(type(self.cfg), "responsible_required", True):
             self.assertIsNone(registry.attach_claim(self.db, "att", "attach:test", 30))
-            self.assertIsNone(registry.claim(self.db, "att", "runner-x", 30))
-            self.db.execute(
-                "UPDATE agent_registry SET ephemeral_expires_at = now() + interval '1 hour' "
-                "WHERE name = 'att'")
-            self.assertIsNotNone(registry.claim(self.db, "att", "runner-x", 30))
-            self.db.execute(
-                "UPDATE agent_registry SET lease_owner = NULL, lease_expires_at = NULL "
-                "WHERE name = 'att'")
-            self.db.execute("UPDATE agent_registry SET responsible = NULL WHERE name = 'att'")
-            with mock.patch.object(type(self.cfg), "responsible_required", True, create=True):
-                self.assertIsNone(registry.attach_claim(self.db, "att", "attach:test", 30))
-                self.assertIsNone(registry.claim(self.db, "att", "runner-y", 30))
-        finally:
-            self.db.execute(
-                "ALTER TABLE agent_registry DROP COLUMN IF EXISTS responsible, "
-                "DROP COLUMN IF EXISTS ephemeral, "
-                "DROP COLUMN IF EXISTS ephemeral_expires_at")
+            self.assertIsNone(registry.claim(self.db, "att", "runner-y", 30))
 
 
 if __name__ == "__main__":

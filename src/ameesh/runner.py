@@ -974,6 +974,7 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     log("[%s] bail attach pris (epoch %d)" % (name, epoch))
     stop = threading.Event()
     perdu = threading.Event()
+    etat = {"deadline": float(lease.get("lease_expires_ts") or 0.0)}
 
     def battement() -> None:
         interval = max(3.0, ttl / 3.0)
@@ -987,9 +988,26 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
                 log("[%s] attach : bail perdu" % name)
                 perdu.set()
                 return
+            etat["deadline"] = float(expires)
+
+    def veilleur() -> None:
+        """Borne dure : le harnais interactif meurt à l'échéance connue du bail.
+
+        Verdict L8 B2 : sans veilleur, une erreur SQL de renouvellement laissait
+        la session vivante après l'expiration, pendant qu'un remplaçant
+        réclamait l'agent. Le veilleur ne fait aucune E/S : il lit l'échéance et
+        l'heure, et coupe.
+        """
+        while not stop.wait(0.2):
+            if etat["deadline"] > 0 and time.time() >= etat["deadline"]:
+                log("[%s] attach : échéance du bail atteinte, arrêt du harnais" % name)
+                perdu.set()
+                return
 
     thread = threading.Thread(target=battement, daemon=True, name="%s-attach" % name)
     thread.start()
+    veille = threading.Thread(target=veilleur, daemon=True, name="%s-attach-veilleur" % name)
+    veille.start()
     argv = adapter.interactive_command(agent.get("session_id"))
     env = _attach_env(cfg, name, owner, epoch)
     env.update(adapter.env())
@@ -1015,6 +1033,7 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     finally:
         stop.set()
         thread.join(timeout=5)
+        veille.join(timeout=5)
         try:
             registry.release(db, name, owner, epoch)
         except db_mod.DbError:

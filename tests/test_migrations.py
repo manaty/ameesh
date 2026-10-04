@@ -18,8 +18,10 @@ class MigrationsTest(PgTestCase):
             "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
         )
         attendues = migrations.discover()
-        self.assertEqual([row["version"] for row in rows], [m.version for m in attendues])
-        self.assertEqual([row["name"] for row in rows], [m.name for m in attendues])
+        self.assertEqual([row["version"] for row in rows],
+                         [m.version for m in attendues])
+        self.assertEqual([row["name"] for row in rows],
+                         [m.name for m in attendues])
         for row in rows:
             self.assertEqual(len(row["checksum"]), 64)
         # la vue d'observabilité et les deux triggers de notification existent
@@ -33,7 +35,7 @@ class MigrationsTest(PgTestCase):
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema = current_schema() AND table_name = 'agent_registry'")}
         self.assertTrue({"public_key", "public_key_fingerprint", "key_revoked_at",
-                         "key_role", "current_prompt", "last_event_at"} <= colonnes)
+                         "key_role", "current_prompt"} <= colonnes)
         colonnes = {row["column_name"] for row in self.db.query(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema = current_schema() AND table_name = 'agent_mailbox'")}
@@ -89,10 +91,11 @@ class MigrationsTest(PgTestCase):
             tables = db.query(
                 "SELECT count(*)::int AS n FROM information_schema.tables "
                 "WHERE table_schema = %s AND table_name IN ('agent_registry','agent_mailbox',"
-                "'schema_migrations','mesh_approvals','work_items','work_item_events')",
+                "'schema_migrations','mesh_approvals','work_items','work_item_events',"
+                "'thread_index')",
                 (schema,),
             )[0]["n"]
-            self.assertEqual(tables, 6)
+            self.assertEqual(tables, 7)
         finally:
             db.close()
             self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)

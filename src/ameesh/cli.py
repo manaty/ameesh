@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """agent-mail (mesh v1) — boîte aux lettres des agents, sur Postgres.
 
-  agent-mail send <dest> <texte…> [--from NOM]   dépose un message (dest = nom, ou "all")
+  agent-mail send <dest> <texte…> [--from NOM] [--lot ID]
+                                                 dépose un message (dest = nom, ou "all")
+                                                 et l'écrit dans le fil lisible du projet
+                                                 ou du lot (ameesh fil show <projet> [<lot>])
   agent-mail list                                agents, hôte, bail, non lus
   agent-mail inbox [NOM]                         messages non lus de NOM (sans les marquer lus)
   agent-mail whoami                              identité liée ; --cwd = diagnostic
@@ -37,7 +40,7 @@ from . import authority
 from . import backend as backend_mod
 from . import config as config_mod
 from . import db as db_mod
-from . import identity, migrations, signing
+from . import fil, identity, migrations, signing
 from .config import NAME_RE, Config
 
 MAX_STOP_BLOCKS = 3
@@ -173,10 +176,11 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     sender = None
     key_path = None
     expires = None
+    lot = None
     kind = "notify"
     urgent = False
     args = list(args)
-    for flag in ("--from", "--key", "--expires", "--kind"):
+    for flag in ("--from", "--key", "--expires", "--lot", "--kind"):
         if flag in args:
             index = args.index(flag)
             value = args[index + 1] if index + 1 < len(args) else None
@@ -187,6 +191,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 key_path = value
             elif flag == "--expires":
                 expires = value
+            elif flag == "--lot":
+                lot = value
             else:
                 kind = value
     if "--urgent" in args:
@@ -199,14 +205,18 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--urgent n'a de sens qu'avec --kind event", file=sys.stderr)
         return 2
     sign = key_path is not None or "--sign" in args
-    args = [arg for arg in args if arg != "--sign"]
+    allow_structured = "--allow-structured" in args
+    args = [arg for arg in args if arg not in ("--sign", "--allow-structured")]
     if expires and not sign:
         print("--expires n'a de sens qu'avec --sign/--key", file=sys.stderr)
         return 2
     if len(args) < 2:
-        print("usage: agent-mail send <dest|all> <texte…> [--from NOM] "
+        print("usage: agent-mail send <dest|all> <texte…> [--from NOM] [--lot ID] "
               "[--kind request|reply|notify|event] [--urgent] "
               "[--sign --key FICHIER] [--expires 24h]", file=sys.stderr)
+        return 2
+    if lot is not None and not NAME_RE.match(lot):
+        print("lot invalide : %r (lettres, chiffres, . _ -)" % lot, file=sys.stderr)
         return 2
     dest, text = args[0], " ".join(args[1:]).strip()
     if not sender:
@@ -222,6 +232,13 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     if dest != "all" and not NAME_RE.match(dest):
         print("destinataire invalide", file=sys.stderr)
         return 2
+    # R12 : le fil est lu par des humains ; un corps illisible n'est pas déposé.
+    if not allow_structured:
+        reason = fil.unreadable_reason(text)
+        if reason:
+            print("message refusé — %s\n(--allow-structured est réservé aux tests et "
+                  "aux outils)" % reason, file=sys.stderr)
+            return 2
 
     signed = None
     if sign:
@@ -254,6 +271,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                   file=sys.stderr)
 
     targets = bk.send(sender, dest, text, host=cfg.host, signed=signed,
+                      work_item_id=lot, allow_structured=allow_structured,
                       kind=kind, urgent=urgent)
     if not targets:
         print("aucun destinataire")
