@@ -3,7 +3,8 @@
 
 `sync` met à jour, pour les agents placés sur un hôte, les colonnes
 **déclaratives** du registre (harnais, hôte, dossier, modèle, budget,
-responsable, équipe, fournisseur, mode d'identifiants, capacités, canon_ref).
+responsable, équipe, fournisseur, mode d'identifiants, capacités, canon_ref,
+placement).
 Il ne touche jamais aux colonnes d'**état** (bail, session, statut, dépense,
 consigne), avec deux exceptions qui sont les siennes :
 
@@ -28,6 +29,17 @@ que cette ligne (aucune autre écriture). La condition de réclamation
 (`registry.canon_claim_predicate_sql`) refuse les agents du canon, et leurs
 éphémères, tant que cet état n'est pas `ok` ; baux, sessions et tours en
 cours ne sont pas touchés.
+
+Placement gouverné (C4, R18 ; 0022) : pour chaque agent du canon de l'hôte,
+sync écrit l'admissibilité de son placement sur CET hôte (`placement_ok`,
+`placement_diagnostic`, `placement_ref` ; voir `placement.evaluate`) : admis
+par la politique de la fiche Host, ou refusé — politique violée, aucun
+placement sur cet hôte, placement ambigu, fiche invérifiable. La condition
+de réclamation exige `placement_ok` pour un agent gouverné par le canon. Un
+éphémère hérite du verdict de son créateur racine du canon (recopié par
+`spawn`, rafraîchi par sync ; refusé si ce créateur n'est plus sur cet hôte
+ou si la lignée est rompue). sync ne place ni ne déplace un agent de
+lui-même : il suit les fiches Placement du canon.
 """
 from __future__ import annotations
 
@@ -37,6 +49,8 @@ import re
 from dataclasses import dataclass, field
 
 from . import canon as canon_mod
+from . import placement as placement_mod
+from . import registry
 from .canon import Canon, Finding
 from .config import NAME_RE
 from .db import Db
@@ -50,7 +64,8 @@ MAX_EPHEMERAL_TTL = 7 * 24 * 3600.0
 _TTL_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$", re.I)
 
 DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "team",
-               "provider", "credential_mode", "capabilities", "canon_ref", "ephemeral")
+               "provider", "credential_mode", "capabilities", "canon_ref", "ephemeral",
+               "placement_ok", "placement_diagnostic", "placement_ref")
 
 #: statuts de `canon_state` (0008)
 CANON_OK = "ok"
@@ -79,11 +94,17 @@ class SyncAction:
     action: str     # créé | mis à jour | inchangé | arrêté | arrêt demandé | réintégré | déplacé | laissé
     detail: str = ""
     blocked: list[str] = field(default_factory=list)
+    #: verdict de placement écrit pour cet agent (C4), s'il en a un
+    placement: placement_mod.Verdict | None = None
 
     def to_dict(self) -> dict:
         out = {"agent": self.agent, "action": self.action, "detail": self.detail}
         if self.blocked:
             out["blocked"] = self.blocked
+        if self.placement is not None:
+            out["placement_ok"] = self.placement.ok
+            out["placement_diagnostic"] = self.placement.diagnostic
+            out["placement_ref"] = self.placement.ref
         return out
 
 
@@ -207,8 +228,10 @@ def _write_declared(db: Db, name: str, values: dict) -> None:
         """
         INSERT INTO agent_registry
             (name, harness, host, cwd, model, budget_usd, responsible, team, provider,
-             credential_mode, capabilities, canon_ref, ephemeral, ephemeral_expires_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, __CAPS__, %s, false, NULL)
+             credential_mode, capabilities, canon_ref, ephemeral, ephemeral_expires_at,
+             placement_ok, placement_diagnostic, placement_ref)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, __CAPS__, %s, false, NULL,
+                %s, %s, %s)
         ON CONFLICT (name) DO UPDATE SET
             harness         = excluded.harness,
             host            = excluded.host,
@@ -223,12 +246,16 @@ def _write_declared(db: Db, name: str, values: dict) -> None:
             canon_ref       = excluded.canon_ref,
             ephemeral       = false,
             ephemeral_expires_at = NULL,
+            placement_ok    = excluded.placement_ok,
+            placement_diagnostic = excluded.placement_diagnostic,
+            placement_ref   = excluded.placement_ref,
             updated_at      = now()
         RETURNING name
         """.replace("__CAPS__", _CAPS_SQL),
         (name, values["harness"], values["host"], values["cwd"], values["model"],
          values["budget_usd"], values["responsible"], values["team"], values["provider"],
-         values["credential_mode"], caps, caps, values["canon_ref"]),
+         values["credential_mode"], caps, caps, values["canon_ref"],
+         values["placement_ok"], values["placement_diagnostic"], values["placement_ref"]),
     )
 
 
@@ -239,10 +266,84 @@ def _clear_responsible(db: Db, name: str, host: str) -> None:
         (name, host))
 
 
+def _set_placement(db: Db, name: str, host: str, verdict: placement_mod.Verdict) -> None:
+    """Écrit un verdict de placement (colonnes déclaratives seulement), s'il change."""
+    db.execute(
+        """
+        UPDATE agent_registry
+           SET placement_ok = %s, placement_diagnostic = %s, placement_ref = %s,
+               updated_at = now()
+         WHERE name = %s AND host = %s
+           AND (placement_ok, placement_diagnostic, placement_ref)
+               IS DISTINCT FROM (%s::boolean, %s::text, %s::text)
+        """,
+        (verdict.ok, verdict.diagnostic, verdict.ref, name, host,
+         verdict.ok, verdict.diagnostic, verdict.ref))
+
+
+def _lineage_root(by_name: dict[str, dict], creator: str | None) -> tuple[dict | None, str]:
+    """Créateur racine d'un éphémère, suivi comme `registry.canon_governed_sql`.
+
+    (ligne, '') : premier ancêtre non éphémère ou venu du canon ;
+    (None, raison) : lignée rompue ou trop longue (tenue pour gouvernée).
+    """
+    name = creator
+    for _depth in range(registry._LINEAGE_MAX):
+        row = by_name.get(name) if name else None
+        if row is None:
+            return None, "créateur %s introuvable" % (name or "non déclaré")
+        if not row.get("ephemeral") or row.get("canon_ref"):
+            return row, ""
+        name = row.get("created_by")
+    return None, "lignée de plus de %d créateurs" % registry._LINEAGE_MAX
+
+
+def _inherit_placements(db: Db, host: str) -> None:
+    """Les éphémères de cet hôte héritent du verdict de placement de leur
+    créateur racine du canon (C4) : le même harnais, le même fournisseur, le
+    même mode, sur le même hôte. Un éphémère issu d'un agent inscrit à la main
+    n'est pas gouverné : il n'est pas touché. Ni action, ni colonne d'état."""
+    rows = db.query(
+        """
+        SELECT name, created_by, ephemeral, canon_ref, host,
+               placement_ok, placement_diagnostic, placement_ref
+          FROM agent_registry
+         WHERE ephemeral
+            OR name IN (SELECT created_by FROM agent_registry
+                         WHERE ephemeral AND created_by IS NOT NULL)
+        """
+    )
+    by_name = {row["name"]: row for row in rows}
+    for row in sorted(rows, key=lambda r: r["name"]):
+        if not row.get("ephemeral") or row.get("host") != host:
+            continue
+        root, broken = _lineage_root(by_name, row.get("created_by"))
+        if root is not None and not root.get("canon_ref"):
+            continue                    # lignée d'un agent inscrit à la main
+        if root is None:
+            verdict = placement_mod.Verdict(
+                row["name"], host, False,
+                "lignée invérifiable (%s) : placement non hérité" % broken)
+        elif root.get("host") != host:
+            verdict = placement_mod.Verdict(
+                row["name"], host, False,
+                "créateur %s placé sur %s, pas sur %s" % (
+                    root["name"], root.get("host") or "?", host),
+                root.get("placement_ref"))
+        else:
+            verdict = placement_mod.Verdict(
+                row["name"], host, root.get("placement_ok"),
+                root.get("placement_diagnostic") or "", root.get("placement_ref"))
+        if (row.get("placement_ok"), row.get("placement_diagnostic") or "",
+                row.get("placement_ref")) != (verdict.ok, verdict.diagnostic, verdict.ref):
+            _set_placement(db, row["name"], host, verdict)
+
+
 def _rows(db: Db, host: str, names: list[str]) -> dict[str, dict]:
     sql = """
         SELECT name, harness, host, cwd, model, budget_usd, responsible, team, provider,
                credential_mode, capabilities, canon_ref, ephemeral, status, status_text,
+               placement_ok, placement_diagnostic, placement_ref,
                (status = 'running' AND lease_expires_at > now()) AS in_turn
           FROM agent_registry
          WHERE host = %s
@@ -306,6 +407,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None)
             continue
         reasons = block.reasons(name, [host])
         responsible = canon.resolve_human(agent.responsible) if not reasons else None
+        verdict = placement_mod.evaluate(canon, name, host)
         values = {
             "harness": agent.harness or "other",
             "host": host,
@@ -323,6 +425,10 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None)
                 if c.strip().lower() not in canon_mod.FORBIDDEN_CAPABILITIES],
             "canon_ref": agent.fiche.ref,
             "ephemeral": False,
+            # C4 : admissibilité du placement sur CET hôte (politique de la fiche Host)
+            "placement_ok": verdict.ok,
+            "placement_diagnostic": verdict.diagnostic,
+            "placement_ref": verdict.ref,
         }
         row = rows.get(name)
         if row is None:
@@ -333,9 +439,12 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None)
         else:
             _write_declared(db, name, values)
             action = SyncAction(name, "mis à jour")
+        action.placement = verdict
         if reasons:
             action.blocked = reasons
             action.detail = "non réclamable : erreur bloquante du canon"
+        if not verdict.ok:
+            action.detail = "non réclamable : placement refusé — %s" % verdict.diagnostic
         actions.append(action)
         if row is not None and row.get("status") == "stopped" \
                 and (row.get("status_text") or "").startswith(STOP_MARK):
@@ -367,27 +476,47 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None)
                         else "canon invalide" if block.global_errors else "")
         if unverifiable:
             # Fiche invérifiable : ni arrêté (le retrait n'est pas constaté), ni
-            # réclamable (son responsable n'est plus confirmé par le canon).
+            # réclamable (son responsable n'est plus confirmé par le canon, son
+            # placement non plus).
             _clear_responsible(db, name, host)
+            verdict = placement_mod.Verdict(
+                name, host, False, "placement invérifiable : %s" % unverifiable,
+                row.get("placement_ref"))
+            _set_placement(db, name, host, verdict)
             actions.append(SyncAction(
                 name, "laissé", "%s : retrait différé, non réclamable" % unverifiable,
-                block.reasons(name) if block.global_errors else []))
+                block.reasons(name) if block.global_errors else [], verdict))
             continue
         moved = elsewhere.get(name)
         if moved and len(moved) == 1 and canon.agent(name) is not None:
             target = moved[0].host or ""
+            # Le canon l'a placé ailleurs (décision humaine) : sync suit, et
+            # le placement n'est évalué que par la synchronisation de l'hôte cible.
+            verdict = placement_mod.Verdict(
+                name, target, None,
+                "déplacé de %s : placement à évaluer par « ameesh canon sync » sur %s"
+                % (host, target), moved[0].fiche.ref)
             db.execute(
                 """
                 UPDATE agent_registry
-                   SET host = %s, responsible = NULL, canon_ref = %s, updated_at = now()
+                   SET host = %s, responsible = NULL, canon_ref = %s,
+                       placement_ok = NULL, placement_diagnostic = %s, placement_ref = %s,
+                       updated_at = now()
                  WHERE name = %s AND host = %s
                 """,
-                (target, canon.agent(name).fiche.ref, name, host))
+                (target, canon.agent(name).fiche.ref, verdict.diagnostic, verdict.ref,
+                 name, host))
             actions.append(SyncAction(
                 name, "déplacé",
-                "placé sur %s : non réclamable avant la synchronisation de cet hôte" % target))
+                "placé sur %s : non réclamable avant la synchronisation de cet hôte" % target,
+                placement=verdict))
             continue
         why = "plus de placement" if canon.agent(name) is not None else "fiche absente"
+        # Sans placement sur cet hôte, plus réclamable ici, quel que soit son
+        # statut (fin de tour comprise) : écrit avant l'arrêt, colonnes
+        # déclaratives seulement.
+        verdict = placement_mod.evaluate(canon, name, host)
+        _set_placement(db, name, host, verdict)
         stopped = db.query(
             """
             UPDATE agent_registry
@@ -405,15 +534,17 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None)
         if not stopped:
             continue
         if stopped[0]["status"] == "stopped":
-            actions.append(SyncAction(name, "arrêté", why))
+            actions.append(SyncAction(name, "arrêté", why, placement=verdict))
         else:
             actions.append(SyncAction(name, "arrêt demandé",
-                                      "%s : tour en cours, rien n'est tué" % why))
+                                      "%s : tour en cours, rien n'est tué" % why,
+                                      placement=verdict))
     for name, row in sorted(rows.items()):
         if row.get("host") == host and not row.get("canon_ref") and not row.get("ephemeral") \
                 and name not in placed_here:
             actions.append(SyncAction(name, "hors canon",
                                       "inscrit à la main : non gouverné par sync"))
+    _inherit_placements(db, host)
     if status == CANON_OK:
         record_state(db, host, status, diagnostic, canon)
     return SyncReport(host=host, source=canon.source_label(), untrusted=canon.untrusted,
@@ -449,6 +580,9 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
     L'insertion est atomique (INSERT … SELECT sur la ligne du créateur) : le
     responsable copié est celui du créateur au moment de la création. Un
     créateur éphémère transmet aussi son échéance (l'enfant ne lui survit pas).
+    Le verdict de placement (C4) est recopié lui aussi : l'éphémère tourne sur
+    le même hôte, avec le même harnais et le même mode ; `canon sync` le
+    rafraîchit ensuite depuis le créateur racine.
     """
     if not NAME_RE.match(name or ""):
         raise SpawnError("nom d'agent invalide : %r" % (name,))
@@ -480,7 +614,8 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
         """
         INSERT INTO agent_registry
             (name, chantier, harness, host, cwd, model, responsible, team, provider,
-             credential_mode, capabilities, ephemeral, ephemeral_expires_at, created_by)
+             credential_mode, capabilities, ephemeral, ephemeral_expires_at, created_by,
+             placement_ok, placement_diagnostic, placement_ref)
         SELECT %s, c.chantier, c.harness, c.host, coalesce(%s, c.cwd), c.model,
                c.responsible, c.team, c.provider, c.credential_mode,
                ARRAY(SELECT x FROM unnest(ARRAY['read', 'propose']::text[]) AS x
@@ -489,7 +624,8 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
                CASE WHEN c.ephemeral
                     THEN least(now() + make_interval(secs => %s), c.ephemeral_expires_at)
                     ELSE now() + make_interval(secs => %s) END,
-               c.name
+               c.name,
+               c.placement_ok, c.placement_diagnostic, c.placement_ref
           FROM agent_registry c
          WHERE c.name = %s
            AND coalesce(c.responsible, '') <> ''

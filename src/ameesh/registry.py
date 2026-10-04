@@ -89,23 +89,28 @@ def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
     Vraie si l'agent de la ligne `alias` (une ligne de `agent_registry`, ou de
     la vue `agent_mesh_overview`) n'est pas gouverné par le canon
     (`canon_governed_sql`), ou si le dernier état du canon de **son hôte**
-    (`canon_state`, écrit par `ameesh canon sync`) est `ok`. Un canon
-    `invalid` ou `unreadable`, ou l'absence d'état, refuse donc toute
+    (`canon_state`, écrit par `ameesh canon sync`) est `ok` **et** que son
+    placement sur cet hôte est admis par la politique de l'hôte
+    (`placement_ok`, colonne déclarative écrite par `canon sync`, recopiée du
+    créateur pour un éphémère ; C4, 0022). Un canon `invalid` ou
+    `unreadable`, l'absence d'état, un placement refusé, absent de cet hôte ou
+    pas encore évalué (`placement_ok` faux ou NULL) refusent donc toute
     NOUVELLE réclamation d'un agent du canon (et de ses éphémères), sans rien
     toucher aux baux, sessions ni tours en cours : fail closed.
 
     Indépendante de la configuration (AMEESH_CANON, AMEESH_REQUIRE_RESPONSIBLE) :
     un agent venu du canon sur un hôte où aucune synchronisation n'a constaté
-    un canon valide n'est jamais réclamable. Sans paramètre lié (`%s`) : elle
-    s'insère telle quelle dans une requête paramétrée, avec les deux pilotes.
-    Utilisée par `claimable()` et `claim()` ; à réutiliser telle quelle pour
-    `ameesh attach` (C9).
+    un canon valide et un placement admis n'est jamais réclamable. Sans
+    paramètre lié (`%s`) : elle s'insère telle quelle dans une requête
+    paramétrée, avec les deux pilotes. Utilisée par `claimable()` et
+    `claim()` ; à réutiliser telle quelle pour `ameesh attach` (C9).
     """
     a = _alias(alias)
     return """(NOT %s
-       OR EXISTS (SELECT 1 FROM canon_state s
-                   WHERE s.host = %s.host AND s.status = 'ok'))""" % (
-        canon_governed_sql(a), a)
+       OR (EXISTS (SELECT 1 FROM canon_state s
+                    WHERE s.host = %s.host AND s.status = 'ok')
+           AND coalesce(%s.placement_ok, false)))""" % (
+        canon_governed_sql(a), a, a)
 
 
 def upsert(
