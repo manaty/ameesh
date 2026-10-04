@@ -12,6 +12,8 @@
   agent-mesh approvals [--action A] [--hash H] [--json]
   agent-mesh verify --action A --hash H [--consume] [--by NOM]
                                                 une approbation valide existe-t-elle ?
+  agent-mesh cost report | cost spent <agent|all> [s] | cost over <agent>
+                                                coût des tours et jauges de forfait
   agent-mesh work add --title T [--type bug|evolution] [--app A] [--assignee N] …
   agent-mesh work list [--state S] | work show <id> | work move <id> <état> | work note <id> "…"
   agent-mesh import-v0 [--agents a,b] [--dry-run]     bascule : boîte fichier v0 → Postgres
@@ -31,7 +33,8 @@ import os
 import sys
 import time
 
-from . import authority, config as config_mod, db as db_mod, identity, migrations, registry
+from . import authority, config as config_mod, cost as cost_mod, db as db_mod, identity
+from . import migrations, registry
 from . import signing, work
 from .config import Config
 from .db import Db
@@ -629,6 +632,21 @@ def build_parser() -> argparse.ArgumentParser:
     pw_note.add_argument("--actor", default="")
     pw_note.set_defaults(func=cmd_work)
 
+    p_cost = sub.add_parser("cost", help="coût des tours et jauges de forfait (L12)")
+    cost_sub = p_cost.add_subparsers(dest="cost_command")
+    pc_rep = cost_sub.add_parser("report", help="tableau : agent, harnais, modèle, dépense, jauges")
+    pc_rep.add_argument("--json", action="store_true")
+    pc_rep.add_argument("--hours", type=float, default=None,
+                        help="fenêtre du rapport, en heures (défaut : 1 h et 24 h)")
+    pc_rep.set_defaults(func=cmd_cost)
+    pc_spent = cost_sub.add_parser("spent", help="dépense (USD) sur une fenêtre glissante")
+    pc_spent.add_argument("agent", nargs="?", default="all")
+    pc_spent.add_argument("seconds", nargs="?", type=float, default=3600.0)
+    pc_spent.set_defaults(func=cmd_cost)
+    pc_over = cost_sub.add_parser("over", help="code 0 si le rythme du forfait est dépassé")
+    pc_over.add_argument("agent", nargs="?", default="all")
+    pc_over.set_defaults(func=cmd_cost)
+
     p_imp = sub.add_parser("import-v0", help="importer la boîte fichier v0 dans Postgres")
     p_imp.add_argument("--state", default=None, help="état v0 (défaut AGENT_MAIL_STATE)")
     p_imp.add_argument("--agents", default=None, help="liste de noms séparés par des virgules")
@@ -647,6 +665,36 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--notify-test", action="store_true")
     p_doc.set_defaults(func=cmd_doctor)
     return parser
+
+
+def cmd_cost(cfg: Config, args) -> int:
+    """`agent-mesh cost` — la comptabilité par tour et les jauges de forfait.
+
+    Le module `ameesh.cost` ne lit les journaux des harnais qu'en lecture seule :
+    ce qui est écrit ici, c'est la base (`turn_costs`, migration 0014).
+    """
+    what = getattr(args, "cost_command", None) or "report"
+    db = _open(cfg)
+    try:
+        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+        if what == "spent":
+            seconds = float(getattr(args, "seconds", 3600.0) or 3600.0)
+            print("%.4f" % book.spent(getattr(args, "agent", "all") or "all", seconds))
+            return 0
+        if what == "over":
+            reason = book.over(getattr(args, "agent", "all") or "all")
+            if reason:
+                print(reason)
+                return 0          # dépassé : c'est le code 0 de la référence
+            return 1
+        rows = book.report()
+        if getattr(args, "json", False):
+            print(json.dumps(rows, indent=2, sort_keys=True, default=str))
+        else:
+            print(cost_mod.format_report(rows))
+        return 0
+    finally:
+        db.close()
 
 
 def main(argv: list[str] | None = None) -> int:
