@@ -1,6 +1,6 @@
 ---
 type: Specification
-title: "Exigences d'ameesh (R1–R21)"
+title: "Exigences d'ameesh (R1–R22)"
 description: "Les exigences de la spec mesh d'origine (R1–R7), généralisées, et celles ajoutées par les décisions du 2026-10-03 (R8–R17)."
 status: draft
 tags: [exigences, specification]
@@ -40,6 +40,7 @@ sources:
 | R19 | **Vitesse** : revue proportionnée à la classe de risque (déclarée au canon par portée de fichiers) ; interruption de tour par message prioritaire ; rotation de session avec résumé de reprise ; sessions robustes au déplacement ; délais par lot mesurés. | [0018](decisions/0018-vitesse-des-agents.md) |
 | R20 | **Budgets** : modèle et effort par tâche ; plafonds par harnais, agent et projet ; jamais de dépassement d'un forfait, lu à sa source ; comptabilité par tour. | [0019](decisions/0019-budgets-et-routage.md) |
 | R21 | **Catalogue des modèles** : ameesh liste, découvre et évalue les modèles et niveaux d'effort sur des tâches de référence, et recommande modèle et effort par classe de tâche ; la politique de routage reste au canon. | [0020](decisions/0020-catalogue-et-evaluation-des-modeles.md) |
+| R22 | **Catalogue des harnais** : les harnais ne sont plus codés en dur ; un service centralisé les décrit, les certifie par un banc de conformité, les évalue avec les modèles et les met à disposition (installation signée, version épinglée). | [0021](decisions/0021-catalogue-des-harnais.md) |
 
 # Protocole d'exécution d'une action irréversible (R5)
 
