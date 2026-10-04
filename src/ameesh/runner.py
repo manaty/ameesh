@@ -376,7 +376,10 @@ class AgentWorker(threading.Thread):
             deadline = time.monotonic() + max(0.0, self.TERMINATE_GRACE if grace is None else grace)
             while time.monotonic() < deadline and proc.poll() is None:
                 time.sleep(0.05)
-        if not self._group_alive(pgid):
+        if not self._group_alive(pgid) and proc.poll() is not None:
+            # Groupe mort **et** enfant direct moissonné : rien à faire. Si le
+            # pid n'est pas un chef de groupe (groupe inconnu) mais que l'enfant
+            # vit encore, on ne doit pas sortir sans lui envoyer le SIGKILL.
             return
         # Le signal part avant le journal : un print+flush sur le chemin
         # critique laissait le temps à un remplaçant de réclamer sous charge.

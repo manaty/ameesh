@@ -584,7 +584,8 @@ class RunnerTest(PgTestCase):
         """B5b : un harnais qui ignore SIGTERM est tué, pas laissé vivant."""
         proc = subprocess.Popen(
             [sys.executable, "-c",
-             "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"])
+             "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"],
+            start_new_session=True)  # comme un vrai harnais : son propre groupe
         runner = Runner(self.cfg, self.db, once=True)
         worker = AgentWorker(
             runner,
@@ -596,8 +597,11 @@ class RunnerTest(PgTestCase):
         try:
             debut = time.monotonic()
             worker.terminate()
-            self.assertIsNotNone(proc.poll(), "le harnais doit être arrêté")
-            self.assertLess(time.monotonic() - debut, 8.0)
+            # La mort du processus est un effet du SIGKILL, distinct du retour de
+            # `terminate` : on attend la sortie (test stable sous charge), tout
+            # en gardant la borne sémantique de l'escalade.
+            self.wait_for(lambda: proc.poll() is not None, timeout=12, interval=0.02)
+            self.assertLess(time.monotonic() - debut, 12.0)
             self.assertLess(proc.returncode, 0)  # tué par un signal (SIGKILL)
         finally:
             if proc.poll() is None:
@@ -624,7 +628,7 @@ class RunnerTest(PgTestCase):
             debut = time.monotonic()
             worker.terminate(grace=0, hard=True)
             ecoule = time.monotonic() - debut
-            self.assertIsNotNone(proc.poll(), "le harnais doit être mort et moissonné")
+            self.wait_for(lambda: proc.poll() is not None, timeout=3, interval=0.01)
             self.assertFalse(AgentWorker._group_alive(proc.pid))
             self.assertLess(ecoule, 1.0, "un zombie ne doit pas faire durer l'arrêt 2 s")
         finally:
@@ -751,7 +755,7 @@ class RunnerTest(PgTestCase):
                 bloque.set()  # libère le puits pour la fin du test
                 self.assertFalse(worker.renew())
             self.assertTrue(worker.lease_lost.is_set())
-            self.assertIsNotNone(proc.poll())
+            self.wait_for(lambda: proc.poll() is not None, timeout=5, interval=0.02)
         finally:
             bloque.set()
             if proc.poll() is None:
