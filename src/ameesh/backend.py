@@ -49,7 +49,8 @@ class FileBackend:
     # -- messages ----------------------------------------------------------
     def send(self, sender: str, dest: str, text: str, host: str | None = None,
              signed: dict | None = None, work_item_id: str | None = None,
-             allow_structured: bool = False) -> list[str]:
+             allow_structured: bool = False, kind: str = "notify",
+             urgent: bool = False) -> list[str]:
         # Le repli fichier ne stocke pas de signature (format v0 strict) : la
         # CLI prévient l'appelant, le message part quand même.
         fil.ensure_readable(text, allow_structured)
@@ -66,12 +67,15 @@ class FileBackend:
         for target in targets:
             filename = "%d-%s-%d.json" % (int(now * 1000), sender, os.getpid())
             tmp = os.path.join(self.inbox_dir(target), "." + filename)
+            message = {"from": sender, "to": target, "ts": now, "text": text,
+                       "host": host or socket.gethostname()}
+            if kind != "notify" or urgent:
+                # format v0 inchangé pour un message ordinaire ; kind/payload
+                # n'apparaissent que pour un événement ou un urgent (C9).
+                message["kind"] = kind
+                message["payload"] = {"urgent": True} if urgent else {}
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(
-                    {"from": sender, "to": target, "ts": now, "text": text,
-                     "host": host or socket.gethostname()},
-                    fh, ensure_ascii=False,
-                )
+                json.dump(message, fh, ensure_ascii=False)
             os.replace(tmp, os.path.join(self.inbox_dir(target), filename))
             written.append((target, filename))
         # Le fil, après le dépôt : une erreur ici ne perd rien (fil.record ne
@@ -113,8 +117,8 @@ class FileBackend:
                 "to": msg.get("to", name),
                 "ts": msg.get("ts", 0),
                 "text": msg.get("text", ""),
-                "kind": "notify",
-                "payload": {},
+                "kind": msg.get("kind", "notify"),
+                "payload": msg.get("payload") or {},
                 "host": msg.get("host"),
                 "_file": filename,
             })
@@ -219,7 +223,8 @@ class PgBackend:
     # -- messages ----------------------------------------------------------
     def send(self, sender: str, dest: str, text: str, host: str | None = None,
              signed: dict | None = None, work_item_id: str | None = None,
-             allow_structured: bool = False) -> list[str]:
+             allow_structured: bool = False, kind: str = "notify",
+             urgent: bool = False) -> list[str]:
         fil.ensure_readable(text, allow_structured)
         chantiers: dict[str, str] = {}
         if dest == "all":
@@ -236,6 +241,7 @@ class PgBackend:
             message_id = mail.send(
                 self.db, sender, target, text, host=host, work_item_id=work_item_id,
                 allow_structured=allow_structured, thread=(dest != "all"),
+                kind=kind, payload={"urgent": True} if urgent else None,
                 **dict(signed or {}))
             registry.upsert(self.db, target, host=host)
             if dest == "all":

@@ -111,6 +111,21 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   re-`claim` (nouvel epoch) pour continuer ; `end_turn` reste fencé par
   `lease_owner` + `lease_epoch`, pour qu'un tour commencé sous bail valide
   puisse être enregistré.
+* **Verrou d'abord, recontrôle ensuite** — les opérations de bail (`claim`,
+  `attach_claim`, `renew`, `take_pending_prompt`, `begin_turn`) prennent le
+  verrou de la ligne (`SELECT … FOR UPDATE`) puis recontrôlent l'échéance avec
+  `clock_timestamp()` **dans l'instruction qui écrit** : un verrou attendu
+  au-delà de l'expiration refuse l'opération, même si le détenteur n'a fait
+  qu'un `SELECT … FOR UPDATE` sans modifier la ligne (EvalPlanQual ne réévalue
+  pas un `WHERE` sans nouvelle version). `claim` applique les mêmes règles que
+  `claimable` — éphémère échu, responsable résolu quand il est requis, prédicat
+  du canon — dans la même instruction, ce qui ferme la course `claimable` →
+  `claim`. Le marqueur d'un tour vivant est `status = 'running'` avec un bail
+  vivant, pas `current_prompt` (qu'un tour de courrier ou d'événement ne
+  remplit pas) : `ameesh attach` ne reprend jamais un tour en cours, ni une
+  session attach déjà ouverte, et son propre **veilleur d'échéance** tue le
+  harnais interactif si le renouvellement échoue (erreur SQL réelle) et que le
+  bail expire.
 * **Renouvellement borné par l'échéance, pas par un délai fixe** — si
   l'échéance est déjà atteinte au réveil, le harnais est arrêté **sans même
   appeler la base** ; sinon l'appel `renew` tourne dans un fil et est abandonné
@@ -150,6 +165,21 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   l'attente du groupe à 2 s ; le veilleur lui-même n'a aucune E/S. Le seul fil
   qui peut rester bloqué est l'écrivain de journal, qui ne perd alors que des
   messages.
+  **Inventaire des E/S du chemin `attach` (mêmes règles, sonde codex3 du
+  2026-10-04-0442) :** la revendication du bail (`attach_claim`) et le
+  renouvellement (`renew`) sont des appels base bornés par `statement_timeout`
+  et par le budget client ; le renouvellement tourne dans le fil de battement,
+  jamais dans la décision d'arrêt ; le fil principal tue le groupe
+  (`os.killpg`) **avant** tout journal ; le veilleur d'échéance ne fait que lire
+  `etat["deadline"]` et `time.time`, pose `perdu` (le signal d'arrêt) puis
+  journalise ; tous les journaux d'attach — bail pris, session interactive,
+  renouvellement en échec, bail perdu, échéance atteinte, harnais coupé, bail
+  rendu — passent par la file bornée `log_async` (aucune attente) ; la
+  publication du `Popen` est recontrôlée après coup (le veilleur a pu conclure
+  entre-temps) ; `release` n'intervient qu'après la coupe. Les seules sorties
+  synchrones d'`attach` sont les messages CLI (`print` sur stderr) émis avant
+  toute prise de bail (agent inconnu, tour en cours, non réclamable) ou par la
+  boucle `--wait` sans bail détenu.
   Le veilleur **reste actif pendant un arrêt gracieux** (`stopping`, grâce
   SIGTERM de 3 s) : il ne s'arrête qu'au relâchement du bail (`release_lease`)
   ou une fois la perte consommée, sinon un harnais qui ignore SIGTERM
@@ -248,10 +278,24 @@ test (trois messages → trois notifications) a attrapé le bug.
   resume`, `dsh --profile agent --json --session-id`), lecture JSONL,
   capture de la session et du coût quand le harnais le donne
   (`total_cost_usd` pour Claude, `cost_usd` pour DeepSeek).
-* **Tours** : consigne en attente → messages non lus → relance d'inactivité
-  (mêmes textes que la v0). Le flux brut est journalisé dans
+* **Tours** : consigne en attente → messages non lus → événements → relance
+  d'inactivité (mêmes textes que la v0). Le flux brut est journalisé dans
   `~/.local/state/agent-mesh/<nom>/events.jsonl`, la session en base **et** sur
   disque (reprise après crash), stderr dans `stderr.log`.
+* **Événements (C9, `0012_events.sql`)** : un message `kind = 'event'` réveille
+  l'agent comme un message ; un lot d'événements n'en réveille qu'un par
+  `AMEESH_EVENT_COALESCE` secondes (défaut 120), sauf `payload.urgent`. L'instant
+  du dernier réveil vit en base (`agent_registry.last_event_at`) : un
+  redémarrage ne remet pas la fenêtre à zéro. Le courrier ordinaire n'est jamais
+  regroupé.
+* **`ameesh attach <agent>` (C9)** : prend le bail pour une session interactive
+  (`attach:<utilisateur>@<hôte>`), même sur un bail vivant **sans tour en
+  cours** — l'ancien exécuteur est fencé par l'epoch à son prochain
+  renouvellement, ce qui suspend la réclamation automatique. Un tour en cours
+  n'est jamais interrompu (`--wait` pour attendre). Le harnais est lancé en
+  interactif sur la **même session** (sans `-p`/`exec`/`--json`), le bail est
+  renouvelé tant que la session vit, le harnais est tué si le bail est perdu, et
+  le bail est rendu à la sortie.
 * **Chemin de reprise** : la session est relue depuis le registre, sinon depuis
   le fichier `session`.
 * **Binaire des harnais** : `AMEESH_<HARNAIS>_BIN`, puis

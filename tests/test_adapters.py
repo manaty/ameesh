@@ -119,6 +119,32 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(final["cost"], 0.01)
         self.assertIn("fin du tour", final["display"][0])
 
+    def test_descripteurs_de_harnais(self):
+        """Les lignes de commande viennent d'une table déclarative (base L16)."""
+        self.assertEqual(set(adapters.SPECS), set(adapters.DEFAULT_BIN))
+        with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN}):
+            for harness in ("claude", "codex", "deepseek"):
+                with self.subTest(harness=harness):
+                    adapter = adapters.adapter_for(harness)
+                    self.assertEqual(adapter.spec.key, harness)
+                    self.assertEqual(adapter.spec.binary, adapters.DEFAULT_BIN[harness])
+                    # sans session, aucun drapeau de session ne traîne
+                    self.assertNotIn(adapter.spec.session_flag[0],
+                                     adapter.interactive_command())
+                    # la session se place avant le texte
+                    argv = adapter.command("fais X", "s-1")
+                    self.assertEqual(argv[-1], "fais X")
+                    self.assertEqual(argv[-2], "s-1")
+
+            claude = adapters.adapter_for("claude")
+            self.assertEqual(claude.interactive_command("s1"),
+                             [claude.binary, "--resume", "s1"])
+            codex = adapters.adapter_for("codex")
+            self.assertEqual(codex.interactive_command("t1"), [codex.binary, "resume", "t1"])
+            dsh = adapters.adapter_for("deepseek")
+            self.assertEqual(dsh.interactive_command("d1"),
+                             [dsh.binary, "--profile", "agent", "--session-id", "d1"])
+
 
 if __name__ == "__main__":
     unittest.main()

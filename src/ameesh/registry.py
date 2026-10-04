@@ -30,6 +30,7 @@ AGENT_COLUMNS = """
     extract(epoch from lease_expires_at)::float8 as lease_expires_ts,
     extract(epoch from last_seen)::float8         as last_seen_ts,
     extract(epoch from last_turn_at)::float8      as last_turn_ts,
+    extract(epoch from last_event_at)::float8     as last_event_ts,
     responsible, team, provider, credential_mode, capabilities, canon_ref,
     ephemeral, created_by,
     extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts
@@ -189,50 +190,66 @@ def overview(db: Db) -> list[dict]:
 def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
     """Prend le bail s'il est libre ou expiré. Renvoie la ligne, sinon None.
 
-    La condition du canon (`canon_claim_predicate_sql`) est revérifiée ici,
-    atomiquement : un `canon sync` qui constate un canon invalide entre
-    `claimable()` et `claim()` empêche la réclamation. Un bail déjà détenu
-    n'est pas touché par ce refus : il se renouvelle (`renew`) et se rend
-    (`release`) comme avant.
+    Le verrou de ligne est pris **d'abord** (`SELECT ... FOR UPDATE`), puis les
+    conditions sont recontrôlées avec `clock_timestamp()` dans l'instruction qui
+    écrit : un verrou attendu au-delà de l'échéance refuse la réclamation, même
+    si le détenteur n'a fait qu'un `SELECT ... FOR UPDATE` sans modifier la ligne
+    (EvalPlanQual ne réévalue pas un `WHERE` sans nouvelle version — grille
+    codex3).
+
+    `claim` applique **les mêmes règles que `claimable`** — éphémère échu,
+    responsable résolu quand il est requis, prédicat du canon — dans la même
+    instruction : la course `claimable` → `claim` est fermée.
     """
     _check_name(name)
-    rows = db.query(
-        """
-        UPDATE agent_registry
+    cfg = getattr(db, "cfg", None)
+    responsable = bool(cfg is not None and getattr(cfg, "responsible_required", False))
+    sql = """
+        WITH verrou AS (
+            SELECT name FROM agent_registry WHERE name = %s FOR UPDATE
+        )
+        UPDATE agent_registry AS r
            SET lease_owner      = %s,
-               lease_expires_at = now() + make_interval(secs => %s),
+               lease_expires_at = clock_timestamp() + make_interval(secs => %s),
                lease_epoch      = lease_epoch + 1,
                -- R5 : si le bail n'était plus vivant (autre main, ou même
                -- exécuteur relancé avec le même identifiant), la consigne
                -- inachevée repart en attente. Si une consigne était déjà en
                -- attente, les deux sont conservées (B6b, B6c).
                pending_prompt   = CASE
-                   WHEN current_prompt IS NOT NULL
-                        AND (lease_owner IS DISTINCT FROM %s
-                             OR lease_expires_at IS NULL
-                             OR lease_expires_at < now())
+                   WHEN r.current_prompt IS NOT NULL
+                        AND (r.lease_owner IS DISTINCT FROM %s
+                             OR r.lease_expires_at IS NULL
+                             OR r.lease_expires_at < clock_timestamp())
                    THEN CASE
-                       WHEN pending_prompt IS NULL THEN current_prompt
-                       ELSE current_prompt || E'\n\n' || pending_prompt
+                       WHEN r.pending_prompt IS NULL THEN r.current_prompt
+                       ELSE r.current_prompt || E'\n\n' || r.pending_prompt
                    END
-                   ELSE pending_prompt END,
+                   ELSE r.pending_prompt END,
                current_prompt   = CASE
-                   WHEN lease_owner IS DISTINCT FROM %s
-                        OR lease_expires_at IS NULL
-                        OR lease_expires_at < now()
+                   WHEN r.lease_owner IS DISTINCT FROM %s
+                        OR r.lease_expires_at IS NULL
+                        OR r.lease_expires_at < clock_timestamp()
                    THEN NULL
-                   ELSE current_prompt END,
-               status           = CASE WHEN status = 'dead' THEN 'idle' ELSE status END,
+                   ELSE r.current_prompt END,
+               status           = CASE WHEN r.status = 'dead' THEN 'idle' ELSE r.status END,
                updated_at       = now()
-         WHERE name = %s
-           AND (lease_owner IS NULL OR lease_owner = %s OR lease_expires_at < now())
+          FROM verrou
+         WHERE r.name = verrou.name
+           AND (r.lease_owner IS NULL OR r.lease_owner = %s
+                OR r.lease_expires_at < clock_timestamp())
+           AND (NOT r.ephemeral OR r.ephemeral_expires_at > clock_timestamp())
+           __RESPONSABLE__
            AND __CANON__
-        RETURNING name, lease_owner, lease_epoch,
-                  extract(epoch from lease_expires_at)::float8 as lease_expires_ts
-        """.replace("__CANON__", canon_claim_predicate_sql("agent_registry")),
-        (owner, ttl_seconds, owner, owner, name, owner),
-    )
+        RETURNING r.name, r.lease_owner, r.lease_epoch,
+                  extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
+    """
+    sql = sql.replace("__RESPONSABLE__",
+                      "AND coalesce(r.responsible, '') <> ''" if responsable else "")
+    sql = sql.replace("__CANON__", canon_claim_predicate_sql("r"))
+    rows = db.query(sql, (name, owner, ttl_seconds, owner, owner, owner))
     return rows[0] if rows else None
+
 
 
 def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]:
@@ -245,7 +262,7 @@ def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]
     rows = db.query(
         """
         SELECT lease_owner, lease_epoch, status,
-               (lease_expires_at IS NOT NULL AND lease_expires_at > now()) AS live
+               (lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()) AS live
           FROM agent_registry WHERE name = %s
         """,
         (name,),
@@ -265,20 +282,32 @@ def lease_matches(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str]
 
 
 def renew(db: Db, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
-    """Prolonge le bail. None si on ne le détient plus (fencing par epoch)."""
+    """Prolonge le bail. None si on ne le détient plus (fencing par epoch).
+
+    Verrou pris d'abord, échéance recontrôlée avec `clock_timestamp()` dans
+    l'écriture : un renouvellement qui a attendu le verrou au-delà de
+    l'expiration est refusé (grille codex3).
+    """
     rows = db.query(
         """
-        UPDATE agent_registry
-           SET lease_expires_at = now() + make_interval(secs => %s),
+        WITH verrou AS (
+            SELECT name, lease_owner, lease_epoch, lease_expires_at
+              FROM agent_registry WHERE name = %s FOR UPDATE
+        )
+        UPDATE agent_registry AS r
+           SET lease_expires_at = clock_timestamp() + make_interval(secs => %s),
                last_seen        = now(),
                updated_at       = now()
-         WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
-           AND lease_expires_at > now()
-        RETURNING extract(epoch from lease_expires_at)::float8 as lease_expires_ts
+          FROM verrou
+         WHERE r.name = verrou.name
+           AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+           AND verrou.lease_expires_at > clock_timestamp()
+        RETURNING extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
         """,
-        (ttl_seconds, name, owner, epoch),
+        (name, ttl_seconds, owner, epoch),
     )
     return rows[0]["lease_expires_ts"] if rows else None
+
 
 
 def release(db: Db, name: str, owner: str, epoch: int) -> bool:
@@ -297,6 +326,81 @@ def release(db: Db, name: str, owner: str, epoch: int) -> bool:
         (name, owner, epoch),
     )
     return bool(rows)
+
+
+def turn_in_progress(db: Db, name: str) -> bool:
+    """Un tour (ou une session attach) est-il vivant ? (verdict L8 B1)
+
+    `current_prompt` ne suffit pas : un tour de courrier, d'événement ou de
+    reprise ne le remplit pas. Le marqueur fiable est `status = 'running'` avec
+    un bail vivant — `begin_turn` le pose pour tout tour, `attach` pour sa
+    session, `end_turn` / `release` le retirent.
+    """
+    rows = db.query(
+        """
+        SELECT (status = 'running' AND lease_owner IS NOT NULL
+                AND lease_expires_at > clock_timestamp()) AS en_cours
+          FROM agent_registry WHERE name = %s
+        """,
+        (name,),
+    )
+    return bool(rows and rows[0]["en_cours"])
+
+
+def attach_claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
+    """Prend le bail pour une session interactive (`ameesh attach`, C9).
+
+    Contrairement à `claim`, un bail vivant mais **sans tour ni session en
+    cours** peut être repris : c'est ce qui suspend la réclamation automatique
+    (l'ancien exécuteur est fencé par l'epoch à son prochain renouvellement).
+    Un tour vivant — courrier, événement, reprise ou attach déjà ouvert — n'est
+    jamais interrompu (verdict L8 B1 : `status = 'running'` + bail vivant, et
+    non `current_prompt`). Mêmes règles que `claimable` : éphémère échu,
+    responsable résolu quand il est requis, prédicat du canon ; verrou pris
+    d'abord et échéances recontrôlées avec `clock_timestamp()`.
+    """
+    _check_name(name)
+    cfg = getattr(db, "cfg", None)
+    responsable = bool(cfg is not None and getattr(cfg, "responsible_required", False))
+    sql = """
+        WITH verrou AS (
+            SELECT name FROM agent_registry WHERE name = %s FOR UPDATE
+        )
+        UPDATE agent_registry AS r
+           SET lease_owner      = %s,
+               lease_expires_at = clock_timestamp() + make_interval(secs => %s),
+               lease_epoch      = lease_epoch + 1,
+               status           = 'running',
+               status_text      = 'session interactive (attach)',
+               updated_at       = now()
+          FROM verrou
+         WHERE r.name = verrou.name
+           AND r.status <> 'stopped'
+           AND NOT (r.status = 'running' AND r.lease_owner IS NOT NULL
+                    AND r.lease_expires_at > clock_timestamp())
+           AND (NOT r.ephemeral OR r.ephemeral_expires_at > clock_timestamp())
+           __RESPONSABLE__
+           AND __CANON__
+        RETURNING r.name, r.lease_owner, r.lease_epoch,
+                  extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
+    """
+    sql = sql.replace("__RESPONSABLE__",
+                      "AND coalesce(r.responsible, '') <> ''" if responsable else "")
+    sql = sql.replace("__CANON__", canon_claim_predicate_sql("r"))
+    rows = db.query(sql, (name, owner, ttl_seconds))
+    return rows[0] if rows else None
+
+
+def mark_event_wake(db: Db, name: str) -> None:
+    """Note l'instant du dernier réveil d'événements (regroupement C9).
+
+    Cet état vit en base (et non dans l'exécuteur) : un redémarrage ne remet
+    pas à zéro la fenêtre de regroupement.
+    """
+    db.execute(
+        "UPDATE agent_registry SET last_event_at = now(), updated_at = now() WHERE name = %s",
+        (name,),
+    )
 
 
 def claimable(db: Db, host: str, names: Sequence[str] | None = None, *,
@@ -321,8 +425,8 @@ def claimable(db: Db, host: str, names: Sequence[str] | None = None, *,
         FROM agent_registry
         WHERE host = %%s
           AND status <> 'stopped'
-          AND (lease_owner IS NULL OR lease_expires_at < now())
-          AND (NOT ephemeral OR ephemeral_expires_at > now())
+          AND (lease_owner IS NULL OR lease_expires_at < clock_timestamp())
+          AND (NOT ephemeral OR ephemeral_expires_at > clock_timestamp())
           AND %s
     """ % (AGENT_COLUMNS, canon_claim_predicate_sql("agent_registry"))
     if require_responsible:
@@ -339,7 +443,7 @@ def reap(db: Db, host: str | None = None) -> list[dict]:
     sql = """
         UPDATE agent_registry
            SET status = 'dead', status_text = 'bail expiré', updated_at = now()
-         WHERE status = 'running' AND lease_expires_at < now()
+         WHERE status = 'running' AND lease_expires_at < clock_timestamp()
     """
     params: tuple = ()
     if host is not None:
@@ -389,46 +493,54 @@ def set_pending_prompt(db: Db, name: str, prompt: str | None) -> None:
 def take_pending_prompt(db: Db, name: str, owner: str, epoch: int) -> str | None:
     """Consomme la consigne en attente, atomiquement, et passe l'agent en `running`.
 
-    Le `RETURNING` d'un UPDATE renvoie la *nouvelle* valeur (NULL) : d'où le
-    CTE, qui capture l'ancienne valeur avant de l'effacer.
+    Verrou pris d'abord, échéance recontrôlée avec `clock_timestamp()` dans
+    l'écriture (grille codex3) : une consigne n'est pas consommée sous un bail
+    expiré pendant l'attente du verrou.
     """
     rows = db.query(
         """
-        WITH taken AS (
-            SELECT name, pending_prompt
-              FROM agent_registry
-             WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
-               AND pending_prompt IS NOT NULL
-               AND lease_expires_at > now()
-             FOR UPDATE
+        WITH verrou AS (
+            SELECT name, pending_prompt, lease_owner, lease_epoch, lease_expires_at
+              FROM agent_registry WHERE name = %s FOR UPDATE
         )
         UPDATE agent_registry AS r
            SET pending_prompt = NULL,
-               current_prompt = taken.pending_prompt,
+               current_prompt = verrou.pending_prompt,
                status = 'running',
                status_text = 'tour en cours',
                updated_at = now()
-          FROM taken
-         WHERE r.name = taken.name
-        RETURNING taken.pending_prompt
+          FROM verrou
+         WHERE r.name = verrou.name
+           AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+           AND verrou.pending_prompt IS NOT NULL
+           AND verrou.lease_expires_at > clock_timestamp()
+        RETURNING verrou.pending_prompt
         """,
         (name, owner, epoch),
     )
     return rows[0]["pending_prompt"] if rows else None
 
 
+
 def begin_turn(db: Db, name: str, owner: str, epoch: int, status_text: str) -> bool:
     rows = db.query(
         """
-        UPDATE agent_registry
+        WITH verrou AS (
+            SELECT name, lease_owner, lease_epoch, lease_expires_at
+              FROM agent_registry WHERE name = %s FOR UPDATE
+        )
+        UPDATE agent_registry AS r
            SET status = 'running', status_text = %s, updated_at = now()
-         WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
-           AND lease_expires_at > now()
-        RETURNING name
+          FROM verrou
+         WHERE r.name = verrou.name
+           AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+           AND verrou.lease_expires_at > clock_timestamp()
+        RETURNING r.name
         """,
-        (status_text, name, owner, epoch),
+        (name, status_text, owner, epoch),
     )
     return bool(rows)
+
 
 
 def restore_prompt(db: Db, name: str, owner: str, epoch: int) -> bool:

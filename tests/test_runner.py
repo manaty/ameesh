@@ -781,7 +781,11 @@ class RunnerTest(PgTestCase):
                                    side_effect=lambda: bloque.wait(5)):
                 thread = threading.Thread(target=worker._heartbeat, args=(stop,), daemon=True)
                 thread.start()
-                self.wait_for(lambda: worker.lease_lost.is_set(), timeout=3, interval=0.01)
+                self.wait_for(lambda: worker.lease_lost.is_set(), timeout=5, interval=0.01)
+                # La coupe est un effet du veilleur, distinct de `lease_lost` :
+                # on attend la sortie du processus plutôt qu'une durée fixe
+                # (test instable sous charge CPU, constat mesh-design).
+                self.wait_for(lambda: proc.poll() is not None, timeout=10, interval=0.02)
             self.assertIsNotNone(proc.poll(), "le veilleur doit tuer à l'échéance")
         finally:
             bloque.set()

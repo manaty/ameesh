@@ -60,7 +60,8 @@ Repo-local wrappers: `bin/agent-mail`, `bin/agent-runner`, `bin/agent-mesh`
 `agent-mail` keeps the v0 interface — and the v0 hook JSON, byte for byte:
 
 ```
-agent-mail send <dest> <texte…> [--from NOM] [--lot ID]   # dest = nom ou "all"
+agent-mail send <dest> <texte…> [--from NOM] [--lot ID] [--kind request|reply|notify|event] [--urgent]
+                                               # dest = nom ou "all" ; --urgent : événement (C9)
 agent-mail list                                # nom, outil, âge, non lus, dossier, hôte, bail
 agent-mail inbox [NOM]                         # non lus, sans les marquer lus
 agent-mail whoami                              # identité liée (nom + bail), jamais le dossier
@@ -71,6 +72,10 @@ agent-mail statusline                          # barre d'état Claude Code
 agent-mail migrate                             # migrations versionnées
 agent-mail doctor [--notify-test]              # pilote, schéma, migrations, LISTEN/NOTIFY
 ```
+
+Les **événements** (`--kind event`) réveillent l'agent comme un message, mais un
+lot d'événements n'en réveille qu'un par `AMEESH_EVENT_COALESCE` secondes
+(défaut 120) ; `--urgent` perce le regroupement.
 
 If Postgres is unreachable, the CLI falls back to the v0 file mailbox
 (`~/.local/state/agent-mail`) with a readable warning on stderr; hooks fall back
@@ -172,6 +177,7 @@ agent-runner [--host H] [--runner-id ID] [--agents a,b] [--once [--wait S]]
 agent-runner register <nom> <claude|codex|deepseek> [--cwd DIR] [--prompt TEXTE]
              [--session ID] [--chantier C] [--model M] [--budget USD]
 agent-runner stop <nom>
+ameesh attach <agent> [--wait] [--ttl S]      # session interactive sur le bail (C9)
 ```
 
 ## Language choice

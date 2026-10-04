@@ -177,8 +177,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     key_path = None
     expires = None
     lot = None
+    kind = "notify"
+    urgent = False
     args = list(args)
-    for flag in ("--from", "--key", "--expires", "--lot"):
+    for flag in ("--from", "--key", "--expires", "--lot", "--kind"):
         if flag in args:
             index = args.index(flag)
             value = args[index + 1] if index + 1 < len(args) else None
@@ -187,10 +189,21 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 sender = value
             elif flag == "--key":
                 key_path = value
+            elif flag == "--expires":
+                expires = value
             elif flag == "--lot":
                 lot = value
             else:
-                expires = value
+                kind = value
+    if "--urgent" in args:
+        urgent = True
+        args = [arg for arg in args if arg != "--urgent"]
+    if kind not in ("request", "reply", "notify", "event"):
+        print("kind invalide : %r (request|reply|notify|event)" % (kind,), file=sys.stderr)
+        return 2
+    if urgent and kind != "event":
+        print("--urgent n'a de sens qu'avec --kind event", file=sys.stderr)
+        return 2
     sign = key_path is not None or "--sign" in args
     allow_structured = "--allow-structured" in args
     args = [arg for arg in args if arg not in ("--sign", "--allow-structured")]
@@ -199,6 +212,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if len(args) < 2:
         print("usage: agent-mail send <dest|all> <texte…> [--from NOM] [--lot ID] "
+              "[--kind request|reply|notify|event] [--urgent] "
               "[--sign --key FICHIER] [--expires 24h]", file=sys.stderr)
         return 2
     if lot is not None and not NAME_RE.match(lot):
@@ -257,7 +271,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                   file=sys.stderr)
 
     targets = bk.send(sender, dest, text, host=cfg.host, signed=signed,
-                      work_item_id=lot, allow_structured=allow_structured)
+                      work_item_id=lot, allow_structured=allow_structured,
+                      kind=kind, urgent=urgent)
     if not targets:
         print("aucun destinataire")
     elif signed:
