@@ -349,6 +349,10 @@ $$;
 -- Une réservation de grant n'est libérée que sur un échec CERTAIN (failed).
 -- `p_stale_after` (reprise) : n'agit que si l'échéance du lancement est
 -- dépassée d'au moins ce délai ; NULL = sans condition d'échéance.
+-- Transition conditionnelle sur l'action ET sur la tentative : action en
+-- `p_from` à la tentative `p_attempt`, tentative `p_attempt` en `p_from`.
+-- Un état déjà tranché (réconciliation, nouvelle tentative, humain) n'est
+-- jamais écrasé : 'state', rien n'a changé.
 -- --------------------------------------------------------------------------
 create or replace function ameesh_action_settle(
     p_action_id text, p_attempt integer, p_from text, p_to text, p_external_ref text,
@@ -389,8 +393,13 @@ begin
            error = p_error,
            finished_at = now(),
            settled_by = p_settled_by
-     where t.action_id = p_action_id and t.attempt_no = p_attempt
+     where t.action_id = p_action_id and t.attempt_no = p_attempt and t.state = p_from
     returning t.reservation_id into v_reservation;
+    if not found then
+        -- l'action et sa tentative divergent : incohérence, tout est annulé
+        raise exception 'ameesh_action_settle : tentative %#% absente ou pas en %',
+            p_action_id, p_attempt, p_from;
+    end if;
     if p_to = 'failed' and v_reservation is not null then
         select r.released_amount into v_released
           from ameesh_standing_release(v_reservation, 'failed : ' || p_action_id

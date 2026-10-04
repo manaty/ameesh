@@ -21,7 +21,10 @@ n'autorise qu'UNE tentative.
   appelle le connecteur, clé d'idempotence = `action_id` ; enregistre
   `confirmed | failed | unknown`. Exception, délai dépassé, perte de
   connexion → `unknown`. Si l'issue ne peut pas être enregistrée, l'action
-  reste `launched` et sera traitée comme inconnue (`recover`) ;
+  reste `launched` et sera traitée comme inconnue (`recover`). Un appel
+  abandonné après son délai qui rend plus tard une issue CERTAINE l'inscrit
+  par une transition conditionnelle (`unknown` → issue, même tentative),
+  jamais par-dessus un état déjà tranché ;
 * `unknown` : aucune nouvelle tentative automatique. `retry` (nouveau reçu,
   MÊME `action_id`) n'est permis qu'après `failed`, ou après `unknown` si le
   connecteur déclare `dedupe = guaranteed` ; sinon `reconcile`, et si
@@ -52,6 +55,7 @@ import threading
 import time
 
 from . import connectors as connectors_mod
+from . import db as db_mod
 from . import jcs, receipts, work
 from .connectors import ACTION_CLASSES, SEVERITY, Action, ConnectorError, Outcome
 from .db import Db, DbError
@@ -64,6 +68,9 @@ DEFAULT_RECEIPT_CLASSES = GATED_CLASSES
 #: une action `launched` dont l'échéance est dépassée depuis plus que ce délai
 #: est réputée interrompue (processus mort) : `recover` la passe en `unknown`
 RECOVER_GRACE = 60.0
+#: un appel abandonné après son délai qui rend la main plus tard attend au plus
+#: ce délai que `unknown` soit enregistré avant d'y inscrire son issue tardive
+LATE_WAIT = 60.0
 DEFAULT_REQUEST_TTL = 600
 ASSUME_DUPLICATE_DOMAIN = b"ameesh-assume-duplicate/1\x00"
 SUMMARY_DOMAIN = b"ameesh-summary/1\x00"
@@ -566,31 +573,44 @@ def _one_line(exc: BaseException) -> str:
     return " ".join(str(exc).split())[:300] or type(exc).__name__
 
 
-def _guarded(func, timeout: float, label: str):
+def _guarded(func, timeout: float, label: str, late=None):
     """Appelle `func` dans un fil, borné par `timeout`.
 
     Renvoie (terminé, valeur, exception). Un appel qui ne rend pas la main
-    est abandonné (fil démon) : son issue est inconnue.
+    est abandonné (fil démon) : son issue est inconnue. S'il la rend plus
+    tard, `late(valeur, exception)` est appelé dans ce fil. Sous verrou :
+    le résultat va à l'appelant OU à `late`, jamais aux deux, jamais perdu.
     """
     box: dict = {}
+    lock = threading.Lock()
 
     def run() -> None:
         try:
             box["value"] = func()
         except BaseException as exc:  # noqa: BLE001 - toute exception = issue inconnue
             box["error"] = exc
+        with lock:
+            box["done"] = True
+            abandoned = box.get("abandoned", False)
+        if abandoned and late is not None:
+            try:
+                late(box.get("value"), box.get("error"))
+            except Exception:  # noqa: BLE001 - fil démon : rien à qui remonter
+                pass
 
     thread = threading.Thread(target=run, name=label, daemon=True)
     thread.start()
     thread.join(timeout)
-    if thread.is_alive():
-        return False, None, None
+    with lock:
+        if not box.get("done"):
+            box["abandoned"] = True
+            return False, None, None
     return True, box.get("value"), box.get("error")
 
 
-def _call(connector, action: Action, timeout: float) -> Outcome:
+def _call(connector, action: Action, timeout: float, late=None) -> Outcome:
     done, value, error = _guarded(lambda: connector.execute(action, action.action_id),
-                                  timeout, "ameesh-action-%s" % action.action_id)
+                                  timeout, "ameesh-action-%s" % action.action_id, late=late)
     if not done:
         return Outcome.unknown("délai dépassé (%gs) : issue inconnue" % timeout)
     if error is not None:
@@ -619,6 +639,60 @@ def _note(outcome: Outcome, prefix: str) -> str:
     if outcome.detail:
         text += " — " + outcome.detail[:300]
     return text
+
+
+def _late_db(db: Db):
+    """Connexion propre au fil tardif : celle de l'appelant peut être fermée
+    entre-temps, ou prise dans une autre transaction. À défaut, la sienne."""
+    cfg = getattr(db, "cfg", None)
+    if cfg is None:
+        return db
+    try:
+        return db_mod.connect(cfg, driver=getattr(db, "name", None))
+    except DbError:
+        return db
+
+
+def _record_late(db: Db, action_id: str, attempt: int, value, error, *, by: str) -> None:
+    """Issue rendue APRÈS le délai par l'appel abandonné (dans son fil).
+
+    Certaine (`confirmed` | `failed`) : elle règle l'inconnue par une
+    transition conditionnelle (`ameesh_action_settle`, `unknown` → issue :
+    action ET tentative `attempt` encore `unknown`), avec la référence
+    externe. Jamais d'écrasement : si une réconciliation, une nouvelle
+    tentative ou un humain a tranché entre-temps, l'issue tardive est
+    seulement journalisée (`late_ignored`). Incertaine : journalisée
+    (`late_unknown`), rien ne change.
+    """
+    if error is not None:
+        outcome = Outcome.unknown("%s après le délai : %s" % (type(error).__name__,
+                                                               _one_line(error)))
+    elif not isinstance(value, Outcome):
+        outcome = Outcome.unknown("réponse tardive du connecteur illisible : %r" % (value,))
+    else:
+        outcome = value
+    note = _note(outcome, "tentative %d, issue tardive (après le délai)" % attempt)
+    target = _late_db(db)
+    try:
+        event = "late_unknown"
+        if outcome.state in ("confirmed", "failed"):
+            settled = _settle(target, action_id, attempt, "unknown", outcome, by=by,
+                              settled_by="connector-late", note=note)
+            if settled.get("result") == "ok":
+                return
+            event = "late_ignored"
+        current = get(target, action_id)
+        if current is None:
+            return
+        if event == "late_ignored":
+            note += " — ignorée : action déjà %s (tentative %s), rien n'est écrasé" % (
+                current["state"], current["attempts"])
+        _event(target, dict(current, attempts=attempt), event, by, note)
+    except DbError:
+        pass  # l'action reste `unknown` : la réconciliation tranchera
+    finally:
+        if target is not db:
+            target.close()
 
 
 def _refuse_state(action: dict) -> ActionError:
@@ -652,6 +726,8 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
     3. appel du connecteur, clé d'idempotence = action_id, borné par son délai ;
     4. issue enregistrée (`ameesh_action_settle`). Si l'enregistrement échoue,
        l'action reste `launched` : `recover` la traitera comme inconnue.
+       Délai dépassé : `unknown` ; si l'appel abandonné rend la main plus tard
+       avec une issue certaine, son fil l'inscrit (`_record_late`).
     """
     connectors_mod.check(connector)
     recover(db, action_id=action_id)
@@ -702,9 +778,16 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
         _event(db, action, "refused", by, "lancement refusé [%s] : %s" % (code, reason))
         raise ActionError(code, "action %s : %s" % (action_id, reason))
     attempt = int(launch["attempt"])
+    recorded = threading.Event()
+
+    def late(value, error) -> None:
+        # l'appel abandonné a fini par rendre la main : attendre que `unknown`
+        # soit enregistré ci-dessous, puis y inscrire l'issue si elle est certaine
+        recorded.wait(LATE_WAIT)
+        _record_late(db, action_id, attempt, value, error, by=by)
 
     # --- l'état `launched` est validé en base : l'appel externe peut partir ---
-    outcome = _call(connector, to_action(action, attempt), timeout)
+    outcome = _call(connector, to_action(action, attempt), timeout, late=late)
     note = _note(outcome, "tentative %d" % attempt)
     try:
         settled = _settle(db, action_id, attempt, "launched", outcome, by=by,
@@ -718,6 +801,8 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
         raise ActionError(UNRECORDED, "action %s : issue %s NON enregistrée (%s) ; l'action "
                           "reste launched et sera traitée comme inconnue"
                           % (action_id, outcome.state, _one_line(exc))) from exc
+    finally:
+        recorded.set()
     if settled.get("result") != "ok":
         raise ActionError(UNRECORDED, "action %s : issue %s non enregistrée (%s)"
                           % (action_id, outcome.state, settled.get("detail")))

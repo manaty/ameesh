@@ -75,10 +75,12 @@ class Scripted:
 
     name = "scripted"
 
-    def __init__(self, behaviour, dedupe: str = "none", timeout: float = 0.5):
+    def __init__(self, behaviour, dedupe: str = "none", timeout: float = 0.5,
+                 reconciled: Outcome | None = None):
         self.behaviour = behaviour
         self.dedupe = dedupe
         self.timeout = timeout
+        self.reconciled = reconciled
         self.calls = 0
 
     def classify(self, operation, args):
@@ -89,7 +91,7 @@ class Scripted:
         return self.behaviour()
 
     def reconcile(self, action):
-        return None
+        return self.reconciled
 
 
 class ActionsBase(PgTestCase):
@@ -894,6 +896,82 @@ class ActionsUnknownTest(ActionsBase):
         self.assertEqual(count, 1)
         consumed = sum(1 for r in decisions if self.nonce_consumed(r))
         self.assertEqual(consumed, 1)
+
+    def test_issue_tardive_certaine_enregistree(self):
+        """Délai dépassé, puis le connecteur réussit : l'issue certaine n'est pas
+        perdue, elle règle l'inconnue (même tentative) avec sa référence."""
+        def slow():
+            time.sleep(1.5)
+            return Outcome.confirmed("ref-tardive", "fait, mais après le délai")
+
+        connector = Scripted(slow)
+        action = self.propose("send", connector=connector)
+        self.approve(action)
+        result = self.execute(action, connector)
+        self.assertEqual((result["state"], result["external_ref"]), ("unknown", None))
+
+        def settled():
+            row = self.get(action)
+            return row if row["state"] != "unknown" else None
+
+        row = self.wait_for(settled, timeout=15)
+        self.assertEqual((row["state"], row["external_ref"], row["attempts"]),
+                         ("confirmed", "ref-tardive", 1))
+        attempt, = actions.attempts(self.db, action["action_id"])
+        self.assertEqual((attempt["state"], attempt["external_ref"], attempt["settled_by"]),
+                         ("confirmed", "ref-tardive", "connector-late"))
+        self.assertEqual(self.event_names(action),
+                         ["proposed", "approved", "launched", "unknown", "confirmed"])
+        self.assertEqual(connector.calls, 1)
+
+    def test_issue_tardive_ignoree_si_deja_reconciliee(self):
+        """Une réconciliation a tranché avant l'issue tardive : rien n'est
+        écrasé, l'issue tardive est seulement journalisée."""
+        gate = threading.Event()
+
+        def held():
+            gate.wait(30)
+            return Outcome.confirmed("ref-tardive")
+
+        connector = Scripted(held, reconciled=Outcome.confirmed("ref-reconcile", "relu"))
+        action = self.propose("send", connector=connector)
+        self.approve(action)
+        self.assertEqual(self.execute(action, connector)["state"], "unknown")
+        result = actions.reconcile(self.db, action["action_id"], connector, by=ALICE)
+        self.assertEqual((result["found"], result["state"]), (True, "confirmed"))
+        gate.set()
+        self.wait_for(lambda: "late_ignored" in self.event_names(action), timeout=15)
+        row = self.get(action)
+        self.assertEqual((row["state"], row["external_ref"]), ("confirmed", "ref-reconcile"))
+        attempt, = actions.attempts(self.db, action["action_id"])
+        self.assertEqual((attempt["state"], attempt["external_ref"], attempt["settled_by"]),
+                         ("confirmed", "ref-reconcile", "reconcile"))
+        late, = [e for e in actions.events(self.db, action["action_id"])
+                 if e["event"] == "late_ignored"]
+        self.assertEqual(late["attempt_no"], 1)
+        self.assertIn("ref-tardive", late["note"])
+
+    def test_issue_tardive_ignoree_apres_nouvelle_tentative(self):
+        """Un humain a autorisé une nouvelle tentative (déduplication garantie)
+        avant l'issue tardive de la première : elle ne règle rien."""
+        gate = threading.Event()
+
+        def held():
+            gate.wait(30)
+            return Outcome.failed("refus tardif")
+
+        connector = Scripted(held, dedupe="guaranteed")
+        action = self.propose("send", connector=connector)
+        self.approve(action)
+        self.assertEqual(self.execute(action, connector)["state"], "unknown")
+        actions.retry(self.db, action["action_id"], self.receipt(action), connector=connector,
+                      policy=POLICY, by=ALICE)
+        gate.set()
+        self.wait_for(lambda: "late_ignored" in self.event_names(action), timeout=15)
+        row = self.get(action)
+        self.assertEqual((row["state"], row["attempts"]), ("approved", 1))
+        attempt, = actions.attempts(self.db, action["action_id"])
+        self.assertEqual(attempt["state"], "unknown")
 
     def test_git_merge_reconcile_ouverte_reste_inconnue_fermee_echoue(self):
         lossy = self.gh(mode="drop")
