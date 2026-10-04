@@ -78,7 +78,10 @@ Every message (Postgres or file fallback) is also appended to a **readable
 thread** (R12): one Markdown file per thread under `AMEESH_THREADS` (default
 `~/.local/state/ameesh/fils/<project>/<lot or _projet>.md`). The project is the
 sender's `chantier`, else the recipient's, else `AMEESH_PROJECT`, else
-`default`; the lot is `--lot`. A thread write failure is reported on stderr and
+`default`; the lot is `--lot`. Each body is copied verbatim into a fenced code
+block whose fence is longer than any backtick run it contains, so no line of a
+message can become a heading, HTML or anything else in the rendered thread.
+A thread write failure is reported on stderr and
 never loses the message. Unreadable bodies (empty, JSON only, control/binary
 characters, base64/hex blobs over 200 characters) are refused;
 `--allow-structured` is for tests and tools only.

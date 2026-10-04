@@ -18,14 +18,19 @@ les humains, y compris pour les échanges d'agent à agent (décision 0006).
 Une écriture de fil qui échoue ne fait JAMAIS perdre le message : `record()`
 ne lève pas, il le dit sur stderr, et le message reste dans la boîte.
 
-Format d'une entrée :
+Format d'une entrée : le texte du message, tel quel, dans un bloc de code
+clôturé dont la barrière (```) est plus longue que toute suite de ` du texte.
+Aucune ligne du corps ne peut donc fermer le bloc : rien n'y est interprété
+comme du Markdown (titre à toute indentation, setext, HTML, commentaire, autre
+barrière), et la relecture rend le texte exact.
 
     ### 2026-10-04T10:15:30+02:00 — agent:alpha → agent:beta
 
-    Le texte du message, tel quel (les lignes qui ressembleraient à un
-    en-tête d'entrée sont échappées par une barre oblique inverse).
+    ```
+    Le texte du message, tel quel.
+    ```
 
-    <!-- ameesh {"ids": [12], "host": "laptop"} -->
+    <!-- ameesh {"host": "laptop", "ids": [12]} -->
 
   ameesh fil list                               les fils connus (index + disque)
   ameesh fil show <projet> [<lot>] [--last N]   lire un fil
@@ -58,8 +63,12 @@ SEGMENT_MAX = 64
 
 _HEADING_RE = re.compile(r"^### (\S+) — (.+?) → (.*)$")
 _META_RE = re.compile(r"^<!-- ameesh (\{.*\}) -->$")
-_ESCAPED_RE = re.compile(r"^\\+(###|<!-- ameesh)")
-_TO_ESCAPE_RE = re.compile(r"^\\*(###|<!-- ameesh)")
+_BACKTICKS_RE = re.compile(r"`+")
+# lecture d'un fil : sur les octets, pour sauter les corps sans les décoder
+_HEADING_B = re.compile(_HEADING_RE.pattern.encode("utf-8"), re.M)
+_FENCE_B = re.compile(rb"`{3,}")
+_CLOSING_B = re.compile(rb" {0,3}`{3,}[ \t]*")
+_BLANK_LINES_B = re.compile(rb"(?:[ \t\r\f\v]*\n)*")
 _UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _BLOB_RE = re.compile(r"[A-Za-z0-9+/=_-]{%d,}" % (MAX_BLOB + 1))
 _ALLOW_HINT = "(--allow-structured est réservé aux tests et aux outils)"
@@ -199,7 +208,11 @@ def ensure_readable(body, allow_structured: bool = False) -> None:
 
 
 def clean_text(text) -> str:
-    """Texte prêt pour le fil : fins de ligne normalisées, contrôles neutralisés."""
+    """Texte prêt pour le fil : fins de ligne normalisées, contrôles neutralisés.
+
+    Rien d'autre n'est touché (ni espaces ni lignes vides de bord) : un texte
+    sans `\\r` ni caractère de contrôle (hors `\\n` et `\\t`) est relu exact.
+    """
     text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     out = []
     for ch in text:
@@ -207,7 +220,7 @@ def clean_text(text) -> str:
             out.append("�")
         else:
             out.append(ch)
-    return "".join(out).strip()
+    return "".join(out)
 
 
 def _one_line(text) -> str:
@@ -238,17 +251,30 @@ def _meta_line(meta: dict) -> str:
     return "<!-- ameesh %s -->" % data.replace("<", "\\u003c").replace(">", "\\u003e")
 
 
+def fence_for(text: str) -> str:
+    """Barrière du bloc de code d'un corps : plus longue que toute suite de ` du corps.
+
+    En CommonMark, un bloc ouvert par N ` ne se ferme que sur une ligne de N `
+    ou plus (indentée de 0 à 3 espaces) ; une barrière de ~ ne le ferme pas.
+    """
+    longest = max(map(len, _BACKTICKS_RE.findall(text)), default=0)
+    return "`" * max(3, longest + 1)
+
+
 def format_entry(entry: Entry, *, meta: bool = True) -> str:
-    """Le Markdown d'une entrée, terminé par une ligne vide."""
-    lines = ["### %s — %s → %s" % (iso_local(entry.ts), _one_line(entry.author) or "?",
-                                   _one_line(entry.recipient) or "?"), ""]
+    """Le Markdown d'une entrée, terminé par une ligne vide.
+
+    Le corps est copié tel quel, ligne à ligne, entre deux barrières
+    `fence_for(corps)` : il est inerte (aucune ligne ne ferme le bloc) et
+    `parse` le relit à l'identique. Corps vide : bloc sans ligne.
+    """
     body = clean_text(entry.text)
+    fence = fence_for(body)
+    lines = ["### %s — %s → %s" % (iso_local(entry.ts), _one_line(entry.author) or "?",
+                                   _one_line(entry.recipient) or "?"), "", fence]
     if body:
-        lines += [("\\" + line) if _TO_ESCAPE_RE.match(line) else line
-                  for line in body.split("\n")]
-    else:
-        lines.append("_(corps vide)_")
-    lines.append("")
+        lines += body.split("\n")
+    lines += [fence, ""]
     if meta and entry.meta:
         lines += [_meta_line(entry.meta), ""]
     return "\n".join(lines) + "\n"
@@ -258,56 +284,138 @@ def header(thread: ThreadRef) -> str:
     return (
         "# Fil — %s\n\n"
         "Fil lisible tenu par ameesh : une entrée par message, en ajout seulement.\n"
-        "Les métadonnées de chaque entrée sont dans un commentaire `ameesh` discret.\n\n"
+        "Le texte de chaque message est reproduit tel quel dans un bloc de code ;\n"
+        "ses métadonnées sont dans un commentaire `ameesh` discret.\n\n"
         % thread.describe()
     )
 
 
+def _meta_of(line: str) -> dict | None:
+    found = _META_RE.match(line)
+    if not found:
+        return None
+    try:
+        meta = json.loads(found.group(1))
+    except ValueError:
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def _line_end(data: bytes, pos: int) -> int:
+    end = data.find(b"\n", pos)
+    return len(data) if end < 0 else end
+
+
+def _closing_line(data: bytes, fence: bytes, pos: int) -> int:
+    """Début de la ligne qui ferme le bloc ouvert par `fence`, à partir de la
+    ligne `pos` ; -1 si le bloc n'est jamais fermé (entrée coupée).
+
+    Règle CommonMark : une ligne de len(fence) ` ou plus, 0 à 3 espaces avant,
+    des blancs après. Aucun corps n'a de suite de ` aussi longue : seule la
+    vraie fermeture convient, et la lecture s'accorde avec tout rendu Markdown.
+    """
+    i = data.find(fence, pos)
+    while i >= 0:
+        start = data.rfind(b"\n", pos, i) + 1 or pos
+        end = _line_end(data, i)
+        if _CLOSING_B.fullmatch(data, start, end):
+            return start
+        i = data.find(fence, end)
+    return -1
+
+
+def _walk(data: bytes) -> tuple[list[tuple], bytes | None]:
+    """Découpe un fil en entrées brutes, sans rien décoder.
+
+    Seules les lignes HORS des blocs de code sont structurelles : titre
+    d'entrée, barrière d'ouverture, commentaire `ameesh` qui suit le bloc. Un
+    corps est sauté d'un coup jusqu'à sa barrière de fermeture.
+
+    Renvoie [(début, titre, corps, hors_bloc, après, coupé)] — `corps` et
+    `hors_bloc` sont des tranches (début, fin) ou None — et la barrière restée
+    ouverte en fin de données (entrée coupée en plein corps), sinon None.
+    """
+    found: list[tuple] = []
+    size = len(data)
+    heading = _HEADING_B.search(data)
+    while heading:
+        start = heading.start()
+        pos = _BLANK_LINES_B.match(data, min(heading.end() + 1, size)).end()
+        end = _line_end(data, pos)
+        if not _FENCE_B.fullmatch(data, pos, end):
+            # Pas de bloc de code : entrée écrite à la main, ou coupée avant son
+            # corps. Ses lignes vont jusqu'au titre suivant.
+            heading_next = _HEADING_B.search(data, pos)
+            found.append((start, heading, None,
+                          (pos, heading_next.start() if heading_next else size), None, False))
+            heading = heading_next
+            continue
+        fence, body = data[pos:end], min(end + 1, size)
+        close = _closing_line(data, fence, body)
+        if close < 0:
+            found.append((start, heading, (body, size), None, None, True))
+            return found, fence
+        pos = _BLANK_LINES_B.match(data, min(_line_end(data, close) + 1, size)).end()
+        found.append((start, heading, (body, max(body, close - 1)), None,
+                      (pos, _line_end(data, pos)), False))
+        heading = _HEADING_B.search(data, pos)
+    return found, None
+
+
+def _loose_text(lines: list[str]) -> tuple[str, dict | None]:
+    """Texte et métadonnées d'une entrée sans bloc de code (lignes vides de bord ôtées)."""
+    while lines and not lines[-1].strip():
+        lines.pop()
+    meta = _meta_of(lines[-1]) if lines else None
+    if meta is not None:
+        lines.pop()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    return "\n".join(lines), meta
+
+
 def parse(data: bytes, *, base: int = 0, key: str = "") -> list[Entry]:
-    """Les entrées d'un fil (ou d'un morceau de fil commençant à l'octet `base`)."""
+    """Les entrées d'un fil (ou d'un morceau de fil commençant à l'octet `base`).
+
+    Le corps est relu à l'identique ; une entrée coupée en plein corps rend ce
+    qui en a été écrit (sans sa dernière fin de ligne).
+    """
     entries: list[Entry] = []
-    current: tuple[int, re.Match, list[str]] | None = None
-
-    def close() -> None:
-        if current is None:
-            return
-        offset, match, lines = current
-        while lines and not lines[-1].strip():
-            lines.pop()
-        meta: dict = {}
-        if lines:
-            found = _META_RE.match(lines[-1])
-            if found:
-                try:
-                    meta = json.loads(found.group(1))
-                except ValueError:
-                    meta = {}
-                if isinstance(meta, dict):
-                    lines.pop()
-                else:
-                    meta = {}
-        while lines and not lines[-1].strip():
-            lines.pop()
-        while lines and not lines[0].strip():
-            lines.pop(0)
-        text = "\n".join(line[1:] if _ESCAPED_RE.match(line) else line for line in lines)
-        entries.append(Entry(
-            author=match.group(2), recipient=match.group(3), text=text,
-            ts=_parse_iso(match.group(1)), meta=meta,
-            id="%s#%d" % (key, offset) if key else str(offset)))
-
-    position = base
-    for raw in data.split(b"\n"):
-        line = raw.decode("utf-8", "replace")
-        match = _HEADING_RE.match(line)
-        if match:
-            close()
-            current = (position, match, [])
-        elif current is not None:
-            current[2].append(line)
-        position += len(raw) + 1
-    close()
+    for start, heading, body, loose, after, torn in _walk(data)[0]:
+        meta = None
+        if body is not None:
+            raw = data[body[0]:body[1]]
+            if torn and raw.endswith(b"\n"):
+                raw = raw[:-1]
+            text = raw.decode("utf-8", "replace")
+            if after is not None:
+                meta = _meta_of(data[after[0]:after[1]].decode("utf-8", "replace"))
+        else:
+            text, meta = _loose_text(
+                data[loose[0]:loose[1]].decode("utf-8", "replace").split("\n"))
+        when, author, recipient = (g.decode("utf-8", "replace") for g in heading.groups())
+        offset = base + start
+        entries.append(Entry(author=author, recipient=recipient, text=text,
+                             ts=_parse_iso(when), meta=meta or {},
+                             id="%s#%d" % (key, offset) if key else str(offset)))
     return entries
+
+
+def _repair(data: bytes) -> bytes:
+    """Ce qu'il faut écrire avant une nouvelle entrée si la précédente a été
+    interrompue (arrêt brutal en pleine écriture) : finir la ligne, fermer le
+    bloc de code ou le commentaire resté ouvert. Sans cela, un lecteur
+    Markdown avalerait la suite du fil dans le bloc ouvert."""
+    fence = _walk(data)[1]
+    tail = data[data.rfind(b"\n") + 1:]
+    newline = b"\n" if tail else b""
+    if fence is not None:
+        return newline + fence + b"\n\n"
+    if tail.startswith(b"<!--") and b"-->" not in tail:
+        return b" -->\n\n"
+    return newline
 
 
 # --------------------------------------------------------------------------
@@ -319,6 +427,17 @@ def _write_all(fd: int, data: bytes) -> None:
     while view:
         written = os.write(fd, view)
         view = view[written:]
+
+
+def _pread_all(fd: int, size: int) -> bytes:
+    chunks, offset = [], 0
+    while offset < size:
+        chunk = os.pread(fd, size - offset, offset)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        offset += len(chunk)
+    return b"".join(chunks)
 
 
 #: un lien symbolique ouvert avec O_NOFOLLOW (ELOOP), ou un lien / un fichier là
@@ -429,11 +548,9 @@ class FileTransport:
             size = os.fstat(fd).st_size
             if size == 0:
                 prefix = header(thread).encode("utf-8")
-            elif os.pread(fd, 1, size - 1) != b"\n":
-                # une écriture précédente interrompue : repartir sur une ligne neuve
-                prefix = b"\n"
             else:
-                prefix = b""
+                # une écriture précédente interrompue (arrêt brutal) : la clore
+                prefix = _repair(_pread_all(fd, size))
             try:
                 _write_all(fd, prefix + data)
                 os.fsync(fd)
