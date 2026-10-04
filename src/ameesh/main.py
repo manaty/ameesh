@@ -23,6 +23,7 @@
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
   ameesh migrate | doctor     schéma et diagnostic ;
   ameesh canon check|show|sync          canon OKF : validation, fiches, registre ;
+  ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -39,7 +40,7 @@ import sys
 #: sous-commandes servies par mesh_cli (parseur déjà en place)
 MESH_COMMANDS = (
     "list", "show", "key", "approve", "approvals", "verify", "work", "cost",
-    "migrate", "doctor", "import-v0", "export-v0", "canon", "agent",
+    "migrate", "doctor", "import-v0", "export-v0", "canon", "placement", "agent",
 )
 #: sous-commandes des reçus d'approbation (receipts_cli)
 RECEIPT_COMMANDS = ("receipt", "authenticator")

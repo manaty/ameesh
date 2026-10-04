@@ -90,23 +90,36 @@ def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
     Vraie si l'agent de la ligne `alias` (une ligne de `agent_registry`, ou de
     la vue `agent_mesh_overview`) n'est pas gouverné par le canon
     (`canon_governed_sql`), ou si le dernier état du canon de **son hôte**
-    (`canon_state`, écrit par `ameesh canon sync`) est `ok`. Un canon
-    `invalid` ou `unreadable`, ou l'absence d'état, refuse donc toute
-    NOUVELLE réclamation d'un agent du canon (et de ses éphémères), sans rien
-    toucher aux baux, sessions ni tours en cours : fail closed.
+    (`canon_state`, écrit par `ameesh canon sync`) est `ok` **et** que son
+    placement sur cet hôte est admis par la politique de l'hôte
+    (`placement_ok`, colonne déclarative écrite par `canon sync`, recopiée du
+    créateur pour un éphémère ; C4, 0022) **pour le profil qu'il a
+    maintenant** : `placement_profile` (le profil évalué, écrit avec le
+    verdict) égal à `ameesh_placement_profile` de ses colonnes hôte,
+    harnais, fournisseur, modèle et mode d'identifiants. Un canon `invalid`
+    ou `unreadable`, l'absence d'état, un placement refusé, absent de cet
+    hôte ou pas encore évalué (`placement_ok` faux ou NULL), un profil
+    divergé depuis l'évaluation (inscription, import ou SQL à la main)
+    refusent donc toute NOUVELLE réclamation d'un agent du canon (et de ses
+    éphémères) jusqu'au prochain `canon sync`, sans rien toucher aux baux,
+    sessions ni tours en cours : fail closed.
 
     Indépendante de la configuration (AMEESH_CANON, AMEESH_REQUIRE_RESPONSIBLE) :
     un agent venu du canon sur un hôte où aucune synchronisation n'a constaté
-    un canon valide n'est jamais réclamable. Sans paramètre lié (`%s`) : elle
-    s'insère telle quelle dans une requête paramétrée, avec les deux pilotes.
-    Utilisée par `claimable()` et `claim()` ; à réutiliser telle quelle pour
-    `ameesh attach` (C9).
+    un canon valide et un placement admis n'est jamais réclamable. Sans
+    paramètre lié (`%s`) : elle s'insère telle quelle dans une requête
+    paramétrée, avec les deux pilotes. Utilisée par `claimable()` et
+    `claim()` ; à réutiliser telle quelle pour `ameesh attach` (C9).
     """
     a = _alias(alias)
-    return """(NOT %s
-       OR EXISTS (SELECT 1 FROM canon_state s
-                   WHERE s.host = %s.host AND s.status = 'ok'))""" % (
-        canon_governed_sql(a), a)
+    return """(NOT %(governed)s
+       OR (EXISTS (SELECT 1 FROM canon_state s
+                    WHERE s.host = %(a)s.host AND s.status = 'ok')
+           AND coalesce(%(a)s.placement_ok, false)
+           AND %(a)s.placement_profile IS NOT DISTINCT FROM ameesh_placement_profile(
+                   %(a)s.host, %(a)s.harness, %(a)s.provider, %(a)s.model,
+                   %(a)s.credential_mode)))""" % {
+        "governed": canon_governed_sql(a), "a": a}
 
 
 def upsert(
