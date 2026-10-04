@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Faux `gh` du banc de test — n'appelle jamais GitHub ni le vrai gh.
+
+État des PR dans le fichier JSON `AMEESH_FAKE_GH_STATE` :
+    {"prs": {"owner/repo#12": {"state": "OPEN", "mergeCommit": null}}}
+
+Commandes comprises :
+    gh pr merge <n> --repo <owner/repo> --merge|--squash|--rebase [...]
+    gh pr view <n> --repo <owner/repo> --json state,mergeCommit
+
+`AMEESH_FAKE_GH_MODE` règle la fusion :
+    ok (défaut)  fusionne, code 0 ;
+    refuse       ne fusionne pas, code 1 (« not mergeable ») ;
+    drop         ne fusionne pas, code 1 (coupure réseau simulée, sans effet) ;
+    lose         fusionne, puis code 1 (coupure après l'effet) ;
+    hang         fusionne, puis dort `AMEESH_FAKE_GH_SLEEP` secondes (défaut 30).
+`AMEESH_FAKE_GH_VIEW=absent` : `pr view` échoue (PR introuvable).
+Chaque appel est journalisé (une ligne JSON) dans `AMEESH_FAKE_GH_LOG`.
+"""
+import fcntl
+import hashlib
+import json
+import os
+import sys
+import time
+
+
+def log(argv):
+    path = os.environ.get("AMEESH_FAKE_GH_LOG")
+    if path:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"argv": argv, "mode": os.environ.get("AMEESH_FAKE_GH_MODE", "ok")})
+                     + "\n")
+
+
+def load(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {"prs": {}}
+
+
+def save(path, state):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+    os.replace(tmp, path)
+
+
+def option(argv, name):
+    if name in argv:
+        index = argv.index(name)
+        if index + 1 < len(argv):
+            return argv[index + 1]
+    return None
+
+
+def main():
+    argv = sys.argv[1:]
+    log(argv)
+    path = os.environ.get("AMEESH_FAKE_GH_STATE")
+    if not path:
+        print("faux gh : AMEESH_FAKE_GH_STATE absent", file=sys.stderr)
+        return 2
+    if len(argv) < 3 or argv[0] != "pr" or argv[1] not in ("merge", "view"):
+        print("faux gh : commande non prise en charge : %s" % " ".join(argv), file=sys.stderr)
+        return 2
+    number, repo = argv[2], option(argv, "--repo")
+    key = "%s#%s" % (repo, number)
+    with open(path + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = load(path)
+        pr = state.get("prs", {}).get(key)
+        if argv[1] == "view":
+            if pr is None or os.environ.get("AMEESH_FAKE_GH_VIEW") == "absent":
+                print("GraphQL: Could not resolve to a PullRequest with the number of %s."
+                      % number, file=sys.stderr)
+                return 1
+            print(json.dumps({"state": pr["state"], "mergeCommit": pr.get("mergeCommit")}))
+            return 0
+        mode = os.environ.get("AMEESH_FAKE_GH_MODE", "ok")
+        if pr is None:
+            print("GraphQL: Could not resolve to a PullRequest with the number of %s."
+                  % number, file=sys.stderr)
+            return 1
+        if pr["state"] != "OPEN":
+            print("Pull request %s is not open (%s)" % (key, pr["state"]), file=sys.stderr)
+            return 1
+        if mode == "refuse":
+            print("Pull request %s is not mergeable" % key, file=sys.stderr)
+            return 1
+        if mode == "drop":
+            print("Post \"https://api.github.com/graphql\": connection reset by peer", file=sys.stderr)
+            return 1
+        oid = hashlib.sha1(("%s-%s" % (key, time.time())).encode()).hexdigest()
+        pr["state"] = "MERGED"
+        pr["mergeCommit"] = {"oid": oid}
+        pr["merges"] = int(pr.get("merges", 0)) + 1
+        save(path, state)
+    if mode == "lose":
+        print("Post \"https://api.github.com/graphql\": unexpected EOF", file=sys.stderr)
+        return 1
+    if mode == "hang":
+        time.sleep(float(os.environ.get("AMEESH_FAKE_GH_SLEEP", "30")))
+    print("✓ Merged pull request %s" % key)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -11,6 +11,9 @@
   ameesh approve | approvals | verify   approbations signées ;
   ameesh work …               lots (work_items) ;
   ameesh receipt verify | authenticator list   reçus d'approbation (spec §8) ;
+  ameesh action propose|show|list|request|approve|execute|reconcile|retry|replace|cancel
+        actions sous porte (spec §7) ;
+  ameesh decisions [--for human:ID]     décisions qui attendent un humain (C10) ;
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
   ameesh migrate | doctor     schéma et diagnostic.
 
@@ -28,6 +31,8 @@ MESH_COMMANDS = (
 )
 #: sous-commandes des reçus d'approbation (receipts_cli)
 RECEIPT_COMMANDS = ("receipt", "authenticator")
+#: actions sous porte et file des décisions (actions_cli)
+ACTION_COMMANDS = ("action", "decisions")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,6 +53,9 @@ def main(argv: list[str] | None = None) -> int:
     if command in RECEIPT_COMMANDS:
         from . import receipts_cli
         return receipts_cli.main(argv)
+    if command in ACTION_COMMANDS:
+        from . import actions_cli
+        return actions_cli.main(argv)
     print("ameesh : sous-commande inconnue %r" % command, file=sys.stderr)
     print(__doc__)
     return 2
