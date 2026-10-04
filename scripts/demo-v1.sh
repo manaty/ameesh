@@ -15,7 +15,8 @@
 # Rien de réel : organisation FICTIVE (acme), faux harnais (tests/fakebin —
 # jamais claude, codex ni dsh), faux gh (jamais GitHub), passkey LOGICIELLE
 # (tests/webauthn_soft.py — jamais une vraie clé). ameesh-approve n'écoute que
-# sur 127.0.0.1 ; le mandataire HTTPS (page Nexlink) est simulé par tests/banc_v1.py.
+# sur 127.0.0.1 ; le mandataire HTTPS (page Nexlink) et le téléphone sont simulés
+# par tests/banc_v1.py ; tout le reste passe par les commandes ameesh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD
@@ -206,6 +207,9 @@ for _ in $(seq 1 150); do
 done
 [ -n "$PORT" ] || { echo "ameesh-approve ne répond pas" >&2; exit 1; }
 note "ameesh-approve écoute sur 127.0.0.1:$PORT"
+# ameesh, client du service : l'URL de l'API et le jeton de service (fichier 0600)
+export AMEESH_APPROVE_URL="http://127.0.0.1:$PORT"
+export AMEESH_APPROVE_TOKEN_FILE="$WORK/approve/service-token"
 montre "ameesh-approve enroll-link --approver human:alice --state-dir …"
 LIEN=$(ameesh-approve enroll-link --approver human:alice --state-dir "$WORK/approve/etat")
 note "lien à usage unique, à ouvrir SUR LE TÉLÉPHONE : ${LIEN%/*}/<jeton>"
@@ -229,18 +233,18 @@ lance ameesh authenticator list --approver human:alice
 
 # ===========================================================================
 etape "7. Demande d'approbation, signature au téléphone, reçu"
-note "aucune commande ameesh ne dépose encore la demande : le banc joue le client de service"
-montre "banc request --action $ACTION --approver human:alice --by agent:orchestre"
-banc request --port "$PORT" --token-file "$WORK/approve/service-token" --action "$ACTION" \
-  --approver human:alice --by agent:orchestre | tee "$WORK/demande.json"
-DEMANDE=$(json "$WORK/demande.json" request_id)
+note "ameesh dépose la demande (AMEESH_APPROVE_URL, jeton de service en 0600, jamais affiché)"
+montre "AGENT_MAIL_NAME=orchestre ameesh action request $ACTION --approver human:alice"
+AGENT_MAIL_NAME=orchestre ameesh action request "$ACTION" --approver human:alice --json \
+  >"$WORK/demande.json"
 LIEN=$(json "$WORK/demande.json" link)
+note "lien à usage unique pour le téléphone d'alice : ${LIEN%/*}/<jeton> (écrit aussi dans le fil)"
+attendu 5 ameesh action fetch-receipt "$ACTION"
 montre "banc approve …       # le téléphone affiche le résumé RECALCULÉ par le service et signe"
 banc approve --port "$PORT" --link "$LIEN" --key "$WORK/passkey-alice.json"
-lance banc receipt --port "$PORT" --token-file "$WORK/approve/service-token" \
-  --request "$DEMANDE" --out "$WORK/recu.json"
+note "ameesh récupère le reçu, le VÉRIFIE lui-même, puis l'attache à l'action"
+lance ameesh action fetch-receipt "$ACTION" --out "$WORK/recu.json" --by human:alice
 lance ameesh receipt verify "$WORK/recu.json" --digest "$DIGEST" --action-id "$ACTION"
-lance ameesh action approve "$ACTION" --receipt "$WORK/recu.json"
 
 # ===========================================================================
 etape "8. Exécution : gh fusionne, puis la réponse se perd"

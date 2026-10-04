@@ -35,6 +35,7 @@ agent-runner [--once]  |  ameesh attach <agent>   # the host's runner; interacti
 ameesh mail send <agent> "<text>"                 # agent-mail, unchanged for the hooks
 ameesh fil list | show <project> [<lot>]          # readable threads
 ameesh action propose | execute | reconcile …     # the gate
+ameesh action request | fetch-receipt <id>        # ask ameesh-approve, attach the receipt
 ameesh decisions [--for human:ID]                 # what waits for a human
 ameesh receipt verify | authenticator list        # receipts, trust registry
 ameesh-approve serve | enroll-link | gen-token    # the approval service (own user)
@@ -320,6 +321,7 @@ src/ameesh/
   cose.py         minimal CBOR, COSE_Key public keys (EC2 P-256, OKP Ed25519)
   receipts.py     ameesh-receipt/1 approval receipts, authenticators, standing grants
   receipts_cli.py ameesh receipt verify, ameesh authenticator list
+  approve_client.py ameesh-approve service client (POST /requests, GET /receipts/<id>)
   work.py         work_items state machine, loop bound, event ledger
   canon.py        OKF canon: git-object reading, minimal YAML, profile, validation,
                   placement_violations (host policy)
@@ -329,7 +331,7 @@ src/ameesh/
   backend.py      Postgres backend + v0 file fallback
   identity.py     v0 alias/name resolution (shared aliases.tsv)
 tests/            unittest suite, fakebin/ fake harnesses and gh, webauthn_soft.py and
-                  banc_v1.py (software passkey, ameesh-approve client: tests and demo only)
+                  banc_v1.py (software passkey and canon PR: tests and demo only)
 scripts/          pg-up.sh, test.sh, demo-v1.sh
 ```
 

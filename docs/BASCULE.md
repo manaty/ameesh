@@ -52,13 +52,13 @@ exposition réseau.
    scripts/demo-v1.sh                        # le même scénario, commenté, base temporaire effacée
    ```
 
-3. Écarts d'intégration relevés par l'essai (lot L9), à fermer **avant
-   l'étape 3** :
-   * aucune commande ameesh ne dépose une demande auprès d'ameesh-approve
-     (`POST /requests`) ni ne récupère le reçu (`GET /receipts/<id>`) ; en
-     attendant, le client de service du banc (`python3 -m tests.banc_v1
-     request|receipt`, jeton de service) fait l'affaire — **jamais** ses
-     commandes `enroll`/`approve`, qui sont une passkey logicielle de test ;
+3. Les écarts d'intégration relevés par l'essai (lot L9) sont fermés (lot
+   L9b) et l'essai passe **sans contournement** : `canon sync` remplit le
+   registre des authentificateurs, `ameesh action request` / `fetch-receipt`
+   parlent à ameesh-approve, les transitions d'actions sont dans le fil, le
+   fil d'un agent du canon suit son équipe. `tests/banc_v1.py` ne joue plus
+   que le téléphone (passkey LOGICIELLE de test — **jamais** en production)
+   et la PR du canon.
 
 **Retour arrière :** rien n'a changé.
 
@@ -172,7 +172,12 @@ exécuteur ne tourne.
    ```
 
    ameesh, côté agents, lit une copie de ce jeton : il permet de **demander**
-   une approbation, jamais d'en signer une.
+   une approbation, jamais d'en signer une. Copie en `0600` à l'utilisateur
+   des agents (refusée sinon), puis dans `~/.config/ameesh/env` :
+   `AMEESH_APPROVE_URL=http://127.0.0.1:8765` (https, ou http sur la boucle
+   locale seulement) et `AMEESH_APPROVE_TOKEN_FILE=<copie>`. ameesh ne
+   l'affiche ni ne l'écrit jamais (ni fil, ni journal), ne passe par aucun
+   mandataire et ne suit aucune redirection.
 2. **Exposition au téléphone — une page Nexlink**
    ([0017](design/decisions/0017-approbation-via-page-nexlink.md)). Le service
    n'écoute que sur la boucle locale (`--bind 127.0.0.1 --port 8765`) ; la page
@@ -199,9 +204,12 @@ exécuteur ne tourne.
    hôte) refuse d'y écrire (`authentificateurs : REFUSÉ … --fetch`) : il ne
    réactive jamais une passkey retirée.
 4. **Essai réel** : une action `shell-noop` de classe `irreversible` reste
-   bloquée sans reçu (`ameesh action execute` → `[receipt_required]`), passe
-   avec un reçu signé sur le téléphone (`ameesh action approve --receipt`),
-   et le rejeu du reçu échoue (`ameesh receipt verify` → `[replay]`).
+   bloquée sans reçu (`ameesh action execute` → `[receipt_required]`) ;
+   `ameesh action request <id> --approver human:smichea` dépose la demande et
+   écrit le lien dans le fil ; une fois signé sur le téléphone,
+   `ameesh action fetch-receipt <id>` récupère le reçu, le vérifie et
+   l'attache ; l'exécution passe, et le rejeu du reçu échoue
+   (`ameesh receipt verify` → `[replay]`).
 
 **Retour arrière :** arrêter le service (`systemctl stop ameesh-approve`) et
 retirer la page Nexlink. Les actions irréversibles restent bloquées — le

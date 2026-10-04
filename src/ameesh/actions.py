@@ -441,6 +441,61 @@ def _publish(db: Db, action_id: str, event: str, actor: str, *, detail: str = ""
                  % (event, action_id, _one(exc, 200)))
 
 
+# --------------------------------------------------------------------------
+# demandes d'approbation déposées auprès d'ameesh-approve (§9)
+# --------------------------------------------------------------------------
+
+#: événement du journal d'une demande déposée (sans transition)
+APPROVAL_REQUESTED = "approval_requested"
+_REQUEST_ID_RE = re.compile(r"\breq_[0-9a-z]{26}\b")
+
+
+def record_approval_request(db: Db, action: dict, reply: dict, *, by: str) -> None:
+    """Trace une demande déposée auprès d'ameesh-approve : un événement du
+    journal (son identifiant, pour `fetch-receipt`) et une entrée du fil avec
+    le LIEN à ouvrir sur le téléphone. Jamais le jeton de service (ameesh ne
+    le connaît que pour l'en-tête de la requête). Ne lève pas."""
+    request_id = str(reply.get("request_id") or "")
+    approver = str(reply.get("approver") or "?")
+    duplicate = reply.get("assume_duplicate") is True
+    until = reply.get("link_exp") or reply.get("exp")
+    moment = time.strftime("%H:%M", time.localtime(float(until))) if until else "?"
+    note = "%s envoyée à %s (ameesh-approve)%s, lien valable jusqu'à %s" % (
+        request_id, approver, " — DOUBLON À ASSUMER" if duplicate else "", moment)
+    _event(db, action, APPROVAL_REQUESTED, by, note)
+    cfg = getattr(db, "cfg", None)
+    if cfg is None:
+        return
+    what = "%s %s sur %s" % (action["connector"], action["operation"],
+                             action.get("target") or "—")
+    if duplicate:
+        ask = ("Décision demandée à %s : ASSUMER LE DOUBLON de l'action %s (%s, issue "
+               "inconnue) et la remplacer" % (approver, action["action_id"], what))
+    else:
+        ask = "Demande d'approbation de l'action %s (%s) envoyée à %s" % (
+            action["action_id"], what, approver)
+    text = ("%s : ouvrir %s sur son téléphone (lien à usage unique, valable jusqu'à %s ; "
+            "empreinte signée %s). Reçu : ameesh action fetch-receipt %s." % (
+                ask, reply.get("link") or "?", moment, reply.get("digest") or "?",
+                action["action_id"]))
+    try:
+        fil.record(cfg, db, sender=_author(by), recipients=[approver], text=text,
+                   project=action["project"], lot=action.get("work_item"),
+                   meta={"action_id": action["action_id"], "event": APPROVAL_REQUESTED,
+                         "request_id": request_id})
+    except Exception as exc:  # noqa: BLE001 - fil.record ne lève pas ; prudence
+        fil.warn("demande %s non écrite dans le fil (%s)" % (request_id, _one(exc, 200)))
+
+
+def last_approval_request(db: Db, action_id: str) -> str | None:
+    """Identifiant de la dernière demande déposée pour l'action (journal)."""
+    rows = db.query(
+        "SELECT note FROM action_events WHERE action_id = %s AND event = %s "
+        "ORDER BY id DESC LIMIT 1", (action_id, APPROVAL_REQUESTED))
+    match = _REQUEST_ID_RE.search(rows[0]["note"] or "") if rows else None
+    return match.group(0) if match else None
+
+
 def to_action(row: dict, attempt: int | None = None) -> Action:
     return Action(
         action_id=row["action_id"], project=row["project"], connector=row["connector"],

@@ -3,14 +3,13 @@
 démonstration (scripts/demo-v1.sh). Code de TEST : jamais importé par ameesh.
 
 Il joue ce qu'ameesh v1 laisse hors de portée des agents, sans téléphone ni
-navigateur :
+navigateur (la demande d'approbation et la récupération du reçu passent par
+`ameesh action request` et `ameesh action fetch-receipt`, jeton de service
+compris : le banc n'en a pas) :
 
 * le **téléphone de l'approbateur** : une passkey LOGICIELLE
   (tests/webauthn_soft.py, jamais une vraie clé) qui s'enrôle sur
   ameesh-approve (`/enroll/<jeton>`) puis signe une approbation (`/a/<jeton>`) ;
-* le **client de service** d'ameesh-approve : `POST /requests` et
-  `GET /receipts/<id>` avec le jeton de service — aucune commande ameesh ne le
-  fait encore (écart relevé par L9) ;
 * le **report de la proposition d'enrôlement au canon** (la « PR » que le
   propriétaire fusionne) : l'entrée `authenticator` de la proposition est
   ajoutée à `authenticators` de la fiche Member. `ameesh canon sync` la
@@ -24,9 +23,7 @@ Ligne de commande (depuis la racine du dépôt, PYTHONPATH=src) :
 
   python3 -m tests.banc_v1 enroll  --port P --link URL --key FICHIER
   python3 -m tests.banc_v1 canon-entry --proposal FICHIER --member FICHE.md
-  python3 -m tests.banc_v1 request --port P --token-file F --action A --approver human:X --by agent:Y
   python3 -m tests.banc_v1 approve --port P --link URL --key FICHIER
-  python3 -m tests.banc_v1 receipt --port P --token-file F --request R --out FICHIER
 """
 from __future__ import annotations
 
@@ -58,8 +55,7 @@ class BancError(RuntimeError):
 # --------------------------------------------------------------------------
 
 def http_call(port: int, method: str, path: str, body=None, *, host: str,
-              origin: str | None = None, token: str | None = None,
-              timeout: float = 15.0) -> tuple[int, bytes]:
+              origin: str | None = None, timeout: float = 15.0) -> tuple[int, bytes]:
     conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=timeout)
     try:
         headers = {"Host": host}
@@ -69,8 +65,6 @@ def http_call(port: int, method: str, path: str, body=None, *, host: str,
             headers["Content-Type"] = "application/json"
         if origin is not None:
             headers["Origin"] = origin
-        if token is not None:
-            headers["Authorization"] = "Bearer " + token
         conn.request(method, path, body=data, headers=headers)
         response = conn.getresponse()
         return response.status, response.read()
@@ -97,11 +91,6 @@ def page_data(text: str, element: str) -> dict:
         raise BancError("page sans élément %s" % element)
     return {name: html.unescape(value)
             for name, value in re.findall(r'data-([a-z-]+)="([^"]*)"', match.group(1))}
-
-
-def read_token(path: str) -> str:
-    with open(path, encoding="utf-8") as fh:
-        return fh.read().strip()
 
 
 # --------------------------------------------------------------------------
@@ -189,24 +178,6 @@ def approve(port: int, link: str, soft: SoftWebAuthn, *, decision: str = "approv
 
 
 # --------------------------------------------------------------------------
-# le client de service (ce que ferait ameesh)
-# --------------------------------------------------------------------------
-
-def request(port: int, token: str, action_id: str, approver: str,
-            requested_by: str) -> tuple[int, dict]:
-    status, payload = http_call(
-        port, "POST", "/requests",
-        {"action_id": action_id, "approver": approver, "requested_by": requested_by},
-        host="127.0.0.1:%d" % int(port), token=token)
-    return status, json.loads(payload or b"{}")
-
-
-def fetch_receipt(port: int, token: str, request_id: str) -> tuple[int, bytes]:
-    return http_call(port, "GET", "/receipts/" + request_id,
-                     host="127.0.0.1:%d" % int(port), token=token)
-
-
-# --------------------------------------------------------------------------
 # la « PR » du canon
 # --------------------------------------------------------------------------
 
@@ -276,28 +247,10 @@ def _cmd_canon_entry(args) -> int:
     return 0
 
 
-def _cmd_request(args) -> int:
-    status, data = request(args.port, read_token(args.token_file), args.action,
-                           args.approver, args.by)
-    print(json.dumps(data, ensure_ascii=False))
-    return 0 if status == 201 else 1
-
-
 def _cmd_approve(args) -> int:
     done = approve(args.port, args.link, load_passkey(args.key))
     print("page affichée au téléphone :\n  %s" % done["summary"].replace("\n", "\n  "))
     print(json.dumps(done["result"], ensure_ascii=False))
-    return 0
-
-
-def _cmd_receipt(args) -> int:
-    status, payload = fetch_receipt(args.port, read_token(args.token_file), args.request)
-    if status != 200:
-        print("reçu non disponible : HTTP %d %s" % (status, payload[:200]), file=sys.stderr)
-        return 1
-    with open(args.out, "wb") as fh:
-        fh.write(payload)
-    print("reçu enregistré : %s" % args.out)
     return 0
 
 
@@ -314,24 +267,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--proposal", required=True)
     p.add_argument("--member", required=True)
     p.set_defaults(func=_cmd_canon_entry)
-    p = sub.add_parser("request")
-    p.add_argument("--port", type=int, required=True)
-    p.add_argument("--token-file", required=True)
-    p.add_argument("--action", required=True)
-    p.add_argument("--approver", required=True)
-    p.add_argument("--by", required=True)
-    p.set_defaults(func=_cmd_request)
     p = sub.add_parser("approve")
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--link", required=True)
     p.add_argument("--key", required=True)
     p.set_defaults(func=_cmd_approve)
-    p = sub.add_parser("receipt")
-    p.add_argument("--port", type=int, required=True)
-    p.add_argument("--token-file", required=True)
-    p.add_argument("--request", required=True)
-    p.add_argument("--out", required=True)
-    p.set_defaults(func=_cmd_receipt)
     args = parser.parse_args(argv)
     try:
         return args.func(args)

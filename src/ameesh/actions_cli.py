@@ -7,8 +7,15 @@
                         [--receipt-class C]… [--by agent:ID] [--json]
   ameesh action show <id> [--json]          action, tentatives, journal
   ameesh action list [--state S] [--project P] [--limit N] [--json]
-  ameesh action request <id> --approver human:ID [--assume-duplicate] [--ttl S]
-        la demande à signer (ameesh-approve, ou authentificateur de test)
+  ameesh action request <id> --approver human:ID [--assume-duplicate] [--requested-by M]
+                        [--json]
+        dépose la demande auprès d'ameesh-approve (POST /requests, jeton de service)
+        et affiche le lien à ouvrir sur le téléphone (écrit aussi dans le fil)
+  ameesh action request <id> --approver human:ID --local [--assume-duplicate] [--ttl S]
+        la demande brute à signer par un authentificateur de test ou un outil
+  ameesh action fetch-receipt <id> [--request-id R] [--wait S] [--out F] [--by NOM]
+        récupère le reçu (GET /receipts/<id>), le VÉRIFIE, puis l'attache à l'action
+        (approve ; retry après failed ; replace pour un doublon assumé)
   ameesh action approve <id> (--receipt F | --standing) [--by NOM]
   ameesh action execute <id> [--by NOM] [--timeout S]
   ameesh action reconcile <id> [--force] [--by NOM]
@@ -23,8 +30,15 @@ AMEESH_APPROVE_ORIGINS), `--allow-facade`, `--level`. Connecteurs :
 `shell-noop` écrit sous `--noop-dir` (défaut AMEESH_NOOP_DIR, sinon
 <état>/noop) ; `git-merge` appelle `gh` (AMEESH_GH_BIN, AMEESH_BIN_DIR, PATH).
 
+ameesh-approve (client) : AMEESH_APPROVE_URL (https, ou http sur la boucle
+locale) et AMEESH_APPROVE_TOKEN_FILE (jeton de service, fichier 0600) ; le
+jeton n'est jamais affiché ni écrit dans le fil.
+
 Codes de sortie : 0 succès (exécution confirmée) ; 1 refus ou erreur ;
-2 usage ; 3 exécution en échec certain ; 4 issue inconnue.
+2 usage ; 3 exécution en échec certain ; 4 issue inconnue (résultat d'une
+exécution ou d'une réconciliation) ; 5 reçu pas encore signé (fetch-receipt).
+Un refus s'écrit `refus [code] : raison` sur stderr ; `execute` sur une
+action dont l'issue est inconnue est un refus d'état : `[state]`.
 """
 from __future__ import annotations
 
@@ -35,7 +49,8 @@ import os
 import sys
 import time
 
-from . import actions, config as config_mod, connectors, db as db_mod, jcs, receipts
+from . import actions, approve_client, config as config_mod, connectors, db as db_mod
+from . import jcs, receipts
 from .config import Config
 from .db import Db
 
@@ -213,19 +228,135 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _requester(args: argparse.Namespace, action: dict) -> str:
+    """Qui demande : --requested-by, sinon l'agent de la session, sinon le proposant.
+    Une session d'agent ne demande qu'en son propre nom."""
+    session = os.environ.get("AGENT_MAIL_NAME")
+    if session and args.requested_by and args.requested_by != "agent:%s" % session:
+        raise actions.ActionError(actions.INVALID, "cette session est agent:%s : --requested-by "
+                                  "%s n'est pas son identité" % (session, args.requested_by))
+    return args.requested_by or ("agent:%s" % session if session else action["proposed_by"])
+
+
 def cmd_request(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
         action = actions.get(db, args.id)
+        if action is None:
+            print("erreur : action %s introuvable" % args.id, file=sys.stderr)
+            return 1
+        requested_by = _requester(args, action)
+        if args.local:
+            _dump(actions.approval_request(
+                action, args.approver, assume_duplicate=args.assume_duplicate, ttl=args.ttl,
+                requested_by=requested_by))
+            return 0
+        # l'empreinte que le service fera signer, recalculée ici depuis l'action
+        expected = (actions.assume_duplicate_digest(action) if args.assume_duplicate
+                    else actions.digest(action))
+        if actions.digest(action) != action["digest"]:
+            raise actions.ActionError(actions.INVALID, "empreinte stockée de %s incohérente : "
+                                      "aucune demande" % args.id)
+        reply = approve_client.create_request(
+            cfg, action_id=action["action_id"], approver=args.approver,
+            requested_by=requested_by, assume_duplicate=args.assume_duplicate)
+        mismatch = [key for key, value in (
+            ("action_id", action["action_id"]), ("approver", args.approver),
+            ("assume_duplicate", bool(args.assume_duplicate)), ("digest", expected),
+            ("action_digest", action["digest"])) if reply.get(key) != value]
+        if mismatch:
+            raise approve_client.ApproveClientError(
+                "mismatch", "ameesh-approve a répondu pour une autre demande (%s) : ignorée"
+                % ", ".join(mismatch))
+        actions.record_approval_request(db, action, reply, by=requested_by)
     finally:
         db.close()
-    if action is None:
-        print("erreur : action %s introuvable" % args.id, file=sys.stderr)
-        return 1
-    request = actions.approval_request(
-        action, args.approver, assume_duplicate=args.assume_duplicate, ttl=args.ttl,
-        requested_by=args.requested_by)
-    _dump(request)
+    if args.json:
+        _dump(reply)
+        return 0
+    print("demande %s déposée auprès d'ameesh-approve pour %s%s" % (
+        reply["request_id"], args.approver,
+        " (DÉCISION QUI ASSUME LE DOUBLON)" if args.assume_duplicate else ""))
+    print("lien à ouvrir sur son téléphone (usage unique, jusqu'à %s) :" % _moment(
+        reply.get("link_exp")))
+    print("  %s" % reply["link"])
+    print("empreinte signée : %s" % reply["digest"])
+    print("ensuite : ameesh action fetch-receipt %s" % action["action_id"])
+    return 0
+
+
+def _attach(db: Db, action: dict, raw: bytes, args: argparse.Namespace) -> dict:
+    """Vérifie le reçu récupéré (C7) puis l'attache à l'action."""
+    policy = _policy(args)
+    try:
+        parsed = receipts.parse_receipt(raw)
+    except receipts.ReceiptError as exc:
+        raise actions.ActionError(receipts.FORMAT, "reçu illisible : %s" % exc) from exc
+    # l'empreinte attendue est RECALCULÉE depuis l'action : celle de l'action,
+    # ou celle de la décision qui assume son doublon (domaine distinct)
+    duplicate = parsed.request.get("digest") == actions.assume_duplicate_digest(action)
+    expected = actions.assume_duplicate_digest(action) if duplicate else actions.digest(action)
+    retry = not duplicate and action["state"] in ("failed", "unknown")
+    # un refus signé (deny) n'annule qu'une action à approuver (approve le traite)
+    decision = "approve" if duplicate or retry else None
+    verdict = receipts.verify_receipt(
+        db, raw, policy, kind="action", expected_digest=expected,
+        expected_action_id=action["action_id"], expect_decision=decision, consume_by=None)
+    if not verdict.ok:
+        raise actions.ActionError(verdict.code, "reçu refusé : %s" % verdict.reason)
+    by = _actor(args)
+    if duplicate:
+        return actions.replace(db, action["action_id"], raw, policy=policy, by=by)
+    if retry:
+        return actions.retry(db, action["action_id"], raw, policy=policy, by=by)
+    return actions.approve(db, action["action_id"], raw, policy=policy, by=by)
+
+
+def _write_private(path: str, data: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+
+
+def cmd_fetch_receipt(cfg: Config, args: argparse.Namespace) -> int:
+    db = _open(cfg)
+    try:
+        action = actions.get(db, args.id)
+        if action is None:
+            print("erreur : action %s introuvable" % args.id, file=sys.stderr)
+            return 1
+        request_id = args.request_id or actions.last_approval_request(db, args.id)
+        if not request_id:
+            print("erreur : aucune demande déposée pour %s (ameesh action request), ou "
+                  "--request-id req_…" % args.id, file=sys.stderr)
+            return 1
+        deadline = time.monotonic() + max(0.0, float(args.wait or 0))
+        while True:
+            status, payload = approve_client.fetch_receipt(cfg, request_id)
+            if status != "pending" or time.monotonic() >= deadline:
+                break
+            time.sleep(min(2.0, max(0.1, deadline - time.monotonic())))
+        if status == "pending":
+            print("demande %s : pas encore signée (lien valable jusqu'à %s)" % (
+                request_id, _moment(payload.get("link_exp"))))
+            return 5
+        if status == "expired":
+            print("refus [expired] : demande %s échue sans reçu — nouvelle demande "
+                  "(ameesh action request)" % request_id, file=sys.stderr)
+            return 1
+        result = _attach(db, action, payload, args)
+        if args.out:
+            _write_private(args.out, payload)
+    finally:
+        db.close()
+    if args.json:
+        _dump(result)
+        return 0
+    print("reçu de la demande %s vérifié et attaché : action %s %s (%s)" % (
+        request_id, result["action_id"], result["state"], result.get("last_note") or ""))
+    if args.out:
+        print("reçu enregistré : %s" % args.out)
     return 0
 
 
@@ -432,13 +563,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_list)
 
-    p = act.add_parser("request")
+    p = act.add_parser("request", help="demande d'approbation (ameesh-approve)")
     p.add_argument("id")
     p.add_argument("--approver", required=True)
-    p.add_argument("--assume-duplicate", action="store_true")
-    p.add_argument("--ttl", type=int, default=actions.DEFAULT_REQUEST_TTL)
-    p.add_argument("--requested-by", default=None)
+    p.add_argument("--assume-duplicate", action="store_true",
+                   help="décision qui assume le doublon d'une action d'issue inconnue")
+    p.add_argument("--requested-by", default=None,
+                   help="agent:<id> ou human:<id> (défaut : la session, sinon le proposant)")
+    p.add_argument("--local", action="store_true",
+                   help="sans ameesh-approve : la demande brute à signer (tests, outils)")
+    p.add_argument("--ttl", type=int, default=actions.DEFAULT_REQUEST_TTL,
+                   help="durée de la demande brute (--local)")
+    p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_request)
+
+    p = act.add_parser("fetch-receipt", help="récupérer, vérifier et attacher le reçu")
+    p.add_argument("id")
+    p.add_argument("--request-id", default=None,
+                   help="req_… (défaut : la dernière demande déposée pour l'action)")
+    p.add_argument("--wait", type=float, default=0.0,
+                   help="attendre la signature jusqu'à S secondes")
+    p.add_argument("--out", default=None, help="enregistrer aussi le reçu (0600)")
+    p.add_argument("--by", default=None)
+    p.add_argument("--json", action="store_true")
+    _verify_options(p)
+    p.set_defaults(func=cmd_fetch_receipt)
 
     for name in ("approve", "retry"):
         p = act.add_parser(name)
@@ -510,6 +659,9 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(cfg, args)
     except actions.ActionError as exc:
         print("refus [%s] : %s" % (exc.code, exc.reason), file=sys.stderr)
+        return 1
+    except approve_client.ApproveClientError as exc:
+        print("refus [%s] : ameesh-approve : %s" % (exc.code, exc.message), file=sys.stderr)
         return 1
     except db_mod.SchemaMissing as exc:
         print("erreur : %s" % exc, file=sys.stderr)

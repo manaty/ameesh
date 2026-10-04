@@ -1470,7 +1470,7 @@ class ActionsCliTest(ActionsBase):
         return path
 
     def signed(self, action_id: str, *extra, soft=None) -> str:
-        proc = self.run_cli("action", "request", action_id, "--approver", ALICE, *extra)
+        proc = self.run_cli("action", "request", action_id, "--approver", ALICE, "--local", *extra)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         return self.write((soft or self.alice).receipt(json.loads(proc.stdout)))
 

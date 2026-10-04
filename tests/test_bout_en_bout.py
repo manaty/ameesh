@@ -17,8 +17,9 @@ Un seul scénario, dans l'ordre de la spec, presque entièrement par la CLI :
    LOGICIELLE d'alice (tests/webauthn_soft.py) est enrôlée par la voie canon :
    proposition du service → fiche Member → commit poussé (PR fusionnée) →
    `ameesh canon check` / `canon sync` ;
-7. demande d'approbation au service, signature au « téléphone », reçu,
-   `ameesh receipt verify`, `ameesh action approve --receipt` ;
+7. `ameesh action request` dépose la demande (jeton de service) et donne le
+   lien ; signature au « téléphone » ; `ameesh action fetch-receipt`
+   récupère le reçu, le vérifie et l'attache ; `ameesh receipt verify` ;
 8. exécution : le faux gh fusionne puis perd la réponse (la relecture échoue
    aussi) → issue inconnue ; aucune nouvelle tentative automatique ;
 9. `ameesh action reconcile` → confirmée ; une seule fusion ; le reçu ne se
@@ -91,6 +92,9 @@ class BoutEnBoutTest(PgTestCase):
             AMEESH_CONFIG=self.absent, AGENT_MESH_CONFIG=self.absent,
             AMEESH_APPROVE_CONFIG=self.absent,
             AMEESH_APPROVE_RP_ID=RP_ID, AMEESH_APPROVE_ORIGINS=ORIGIN,
+            # ameesh, client d'ameesh-approve (posés une fois le service lancé)
+            AMEESH_APPROVE_URL=getattr(self, "approve_url", None),
+            AMEESH_APPROVE_TOKEN_FILE=getattr(self, "token_file", None),
             AMEESH_CLAUDE_BIN=os.path.join(FAKEBIN, "claude"),
             AMEESH_CODEX_BIN=os.path.join(FAKEBIN, "codex"),
             AMEESH_DSH_BIN=os.path.join(FAKEBIN, "dsh"),
@@ -148,7 +152,8 @@ class BoutEnBoutTest(PgTestCase):
         self.token_file = os.path.join(directory, "service-token")
         self.approve_state = os.path.join(directory, "etat")
         self.run_approve("gen-token", "--token-file", self.token_file)
-        self.service_token = banc_v1.read_token(self.token_file)
+        with open(self.token_file, encoding="utf-8") as fh:
+            self.service_token = fh.read().strip()
         log_path = os.path.join(directory, "serve.log")
         log = open(log_path, "wb")
         proc = subprocess.Popen(
@@ -175,7 +180,9 @@ class BoutEnBoutTest(PgTestCase):
             if proc.poll() is not None:
                 self.fail("ameesh-approve s'est arrêté (code %s) :\n%s" % (proc.returncode, text))
             return None
-        return self.wait_for(port, timeout=30)
+        found = self.wait_for(port, timeout=30)
+        self.approve_url = "http://127.0.0.1:%d" % found
+        return found
 
     # -- l'essai ---------------------------------------------------------------
     def test_essai_de_bout_en_bout(self):
@@ -314,9 +321,9 @@ class BoutEnBoutTest(PgTestCase):
         proposal = os.path.join(self.approve_state, "proposals", result["proposal"])
         # rien d'actif avant la PR du canon : ni registre, ni demande possible
         self.assertEqual(receipts.list_authenticators(self.db, approver=ALICE), [])
-        status, data = banc_v1.request(port, self.service_token, self.action["action_id"],
-                                       ALICE, ORCHESTRE)
-        self.assertEqual((status, data.get("error")), (409, "no_authenticator"), data)
+        proc = self.run_mesh("action", "request", self.action["action_id"], "--approver", ALICE,
+                             rc=1, AGENT_MAIL_NAME="orchestre")
+        self.assertIn("[no_authenticator]", proc.stderr)
 
         # la « PR » : l'entrée proposée rejoint la fiche Member, commit poussé
         banc_v1.add_to_member(os.path.join(self.clone, "membres", "alice.md"),
@@ -342,32 +349,37 @@ class BoutEnBoutTest(PgTestCase):
 
     # 7 ----------------------------------------------------------------------
     def etape_7_recu(self, port: int, soft, action_id: str) -> str:
-        status, data = banc_v1.request(port, self.service_token, action_id, ALICE, ORCHESTRE)
-        self.assertEqual(status, 201, data)
-        self.assertEqual((data["digest"], data["action_digest"]),
-                         (self.action["digest"], self.action["digest"]))
-        status, _payload = banc_v1.fetch_receipt(port, self.service_token, data["request_id"])
-        self.assertEqual(status, 202)                            # en attente du téléphone
+        # l'orchestre dépose la demande : ameesh-approve rend le lien du téléphone
+        proc = self.run_mesh("action", "request", action_id, "--approver", ALICE, "--json",
+                             AGENT_MAIL_NAME="orchestre")
+        data = json.loads(proc.stdout)
+        self.assertEqual((data["digest"], data["action_digest"], data["approver"]),
+                         (self.action["digest"], self.action["digest"], ALICE))
+        proc = self.run_mesh("action", "fetch-receipt", action_id, rc=5)
+        self.assertIn("pas encore signée", proc.stdout)           # en attente du téléphone
 
         done = banc_v1.approve(port, data["link"], soft)
         self.assertEqual(done["result"], {"request_id": data["request_id"],
                                           "decision": "approve"})
         self.assertIn(PR, done["summary"])                       # résumé recalculé par le service
-        status, payload = banc_v1.fetch_receipt(port, self.service_token, data["request_id"])
-        self.assertEqual(status, 200, payload)
-        receipt = json.loads(payload)
-        self.assertEqual((receipt["v"], receipt["facade"], receipt["request"]["approver"],
-                          receipt["request"]["action_id"]),
-                         ("ameesh-receipt/1", "webauthn", ALICE, action_id))
         receipt_path = os.path.join(self.ws, "recu.json")
-        with open(receipt_path, "wb") as fh:
-            fh.write(payload)
-
+        proc = self.run_mesh("action", "fetch-receipt", action_id, "--out", receipt_path,
+                             "--by", ALICE)
+        self.assertIn("reçu de la demande %s vérifié et attaché : action %s approved"
+                      % (data["request_id"], action_id), proc.stdout)
+        with open(receipt_path, encoding="utf-8") as fh:
+            receipt = json.load(fh)
+        self.assertEqual((receipt["v"], receipt["facade"], receipt["request"]["approver"],
+                          receipt["request"]["action_id"], receipt["request"]["requested_by"]),
+                         ("ameesh-receipt/1", "webauthn", ALICE, action_id, ORCHESTRE))
         proc = self.run_mesh("receipt", "verify", receipt_path, "--digest",
                              self.action["digest"], "--action-id", action_id)
         self.assertIn("reçu VALIDE : approve par %s (webauthn" % ALICE, proc.stdout)
-        proc = self.run_mesh("action", "approve", action_id, "--receipt", receipt_path)
-        self.assertIn("approved", proc.stdout)
+        # le lien est dans le fil du projet ; le jeton de service nulle part
+        thread = self.run_mesh("fil", "show", PROJECT).stdout
+        self.assertIn("Demande d'approbation de l'action %s" % action_id, thread)
+        self.assertIn(data["link"], thread)
+        self.assertNotIn(self.service_token, thread)
         return receipt_path
 
     # 8 ----------------------------------------------------------------------
@@ -394,6 +406,8 @@ class BoutEnBoutTest(PgTestCase):
         shown = json.loads(self.run_mesh("action", "show", action_id, "--json").stdout)
         self.assertEqual((shown["state"], shown["attempts"]), ("confirmed", 1))
         events = [event["event"] for event in shown["events"]]
+        self.assertIn("approval_requested", events)               # la demande, au journal
+        events = [event for event in events if event != "approval_requested"]
         self.assertEqual(events[:3], ["proposed", "approved", "launched"], events)
         self.assertIn("unknown", events)
         self.assertEqual(events[-1], "confirmed", events)
