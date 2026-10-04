@@ -165,6 +165,21 @@ fichiers locaux). Le bail est la seule autorisation de tourner.
   l'attente du groupe à 2 s ; le veilleur lui-même n'a aucune E/S. Le seul fil
   qui peut rester bloqué est l'écrivain de journal, qui ne perd alors que des
   messages.
+  **Inventaire des E/S du chemin `attach` (mêmes règles, sonde codex3 du
+  2026-10-04-0442) :** la revendication du bail (`attach_claim`) et le
+  renouvellement (`renew`) sont des appels base bornés par `statement_timeout`
+  et par le budget client ; le renouvellement tourne dans le fil de battement,
+  jamais dans la décision d'arrêt ; le fil principal tue le groupe
+  (`os.killpg`) **avant** tout journal ; le veilleur d'échéance ne fait que lire
+  `etat["deadline"]` et `time.time`, pose `perdu` (le signal d'arrêt) puis
+  journalise ; tous les journaux d'attach — bail pris, session interactive,
+  renouvellement en échec, bail perdu, échéance atteinte, harnais coupé, bail
+  rendu — passent par la file bornée `log_async` (aucune attente) ; la
+  publication du `Popen` est recontrôlée après coup (le veilleur a pu conclure
+  entre-temps) ; `release` n'intervient qu'après la coupe. Les seules sorties
+  synchrones d'`attach` sont les messages CLI (`print` sur stderr) émis avant
+  toute prise de bail (agent inconnu, tour en cours, non réclamable) ou par la
+  boucle `--wait` sans bail détenu.
   Le veilleur **reste actif pendant un arrêt gracieux** (`stopping`, grâce
   SIGTERM de 3 s) : il ne s'arrête qu'au relâchement du bail (`release_lease`)
   ou une fois la perte consommée, sinon un harnais qui ignore SIGTERM

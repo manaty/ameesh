@@ -971,7 +971,7 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
               % name, file=sys.stderr)
         return 1
     epoch = int(lease["lease_epoch"])
-    log("[%s] bail attach pris (epoch %d)" % (name, epoch))
+    log_async("[%s] bail attach pris (epoch %d)" % (name, epoch))
     stop = threading.Event()
     perdu = threading.Event()
     etat = {"deadline": float(lease.get("lease_expires_ts") or 0.0)}
@@ -1025,7 +1025,7 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     proc: subprocess.Popen | None = None
     code = 0
     try:
-        log("[%s] session interactive : %s" % (name, " ".join(argv)))
+        log_async("[%s] session interactive : %s" % (name, " ".join(argv)))
         proc = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True)
         # Course de publication (même correctif que B5a-P) : le veilleur a pu
         # conclure pendant que ce Popen n'était pas encore publié.
@@ -1050,7 +1050,7 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
             registry.release(db, name, owner, epoch)
         except db_mod.DbError:
             pass
-        log("[%s] bail attach rendu" % name)
+        log_async("[%s] bail attach rendu" % name)
     return code
 
 
