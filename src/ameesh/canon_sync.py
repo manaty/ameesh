@@ -19,6 +19,15 @@ Sinon elle est vidée : l'agent n'est plus réclamable quand le responsable est
 requis (`registry.claimable`). Une erreur sans sujet (fédération, fiche du
 profil illisible…) bloque tous les agents de l'hôte : un canon invalide
 empêche les nouvelles réclamations sans arrêter les agents déjà réclamés.
+
+État du canon (§4.1, fail closed) : chaque `sync` enregistre dans
+`canon_state` le statut du canon pour l'hôte — `ok`, `invalid` (erreur qui
+bloque tout l'hôte) ou `unreadable` (racine absente, dépôt cassé, révision
+introuvable) — avec un diagnostic. Un canon illisible ne laisse au registre
+que cette ligne (aucune autre écriture). La condition de réclamation
+(`registry.canon_claim_predicate_sql`) refuse les agents du canon, et leurs
+éphémères, tant que cet état n'est pas `ok` ; baux, sessions et tours en
+cours ne sont pas touchés.
 """
 from __future__ import annotations
 
@@ -43,9 +52,25 @@ _TTL_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$", re.I)
 DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "team",
                "provider", "credential_mode", "capabilities", "canon_ref", "ephemeral")
 
+#: statuts de `canon_state` (0008)
+CANON_OK = "ok"
+CANON_INVALID = "invalid"
+CANON_UNREADABLE = "unreadable"
+_DIAGNOSTIC_MAX = 4000
+
 
 class SpawnError(ValueError):
     pass
+
+
+class CanonUnreadable(canon_mod.CanonError):
+    """Canon illisible : l'état `unreadable` est enregistré, rien d'autre."""
+
+    def __init__(self, host: str, diagnostic: str, findings: list[Finding]):
+        super().__init__("canon illisible, registre inchangé : %s" % diagnostic)
+        self.host = host
+        self.diagnostic = diagnostic
+        self.findings = findings
 
 
 @dataclass
@@ -69,6 +94,8 @@ class SyncReport:
     untrusted: bool
     actions: list[SyncAction]
     findings: list[Finding]
+    status: str = CANON_OK          # état enregistré dans canon_state
+    diagnostic: str = ""
 
     @property
     def errors(self) -> list[Finding]:
@@ -76,9 +103,90 @@ class SyncReport:
 
     def to_dict(self) -> dict:
         return {"host": self.host, "source": self.source, "untrusted": self.untrusted,
+                "canon_status": self.status, "diagnostic": self.diagnostic,
                 "actions": [a.to_dict() for a in self.actions],
                 "errors": len(self.errors),
                 "findings": [f.to_dict() for f in self.findings]}
+
+
+# --------------------------------------------------------------------------
+# état du canon par hôte (canon_state, §4.1)
+# --------------------------------------------------------------------------
+
+def _describe(findings: list[Finding]) -> str:
+    text = " ; ".join("%s (%s) : %s" % (f.code, f.where(), f.message) for f in findings)
+    return text if len(text) <= _DIAGNOSTIC_MAX else text[:_DIAGNOSTIC_MAX - 1] + "…"
+
+
+def assess(canon: Canon, host: str,
+           findings: list[Finding] | None = None) -> tuple[str, str]:
+    """(statut, diagnostic) du canon pour `host`, tel que `sync` l'enregistre.
+
+    `unreadable` : le canon n'a pas pu être lu (aucune donnée utilisable).
+    `invalid` : lu, mais une erreur bloque tous les agents de l'hôte (erreur
+    sans sujet, ou liée à la fiche Host). `ok` sinon ; une erreur propre à un
+    agent ne bloque que lui (son `responsible` est vidé) et figure au
+    diagnostic.
+    """
+    if not canon.readable:
+        reasons = canon_mod.errors(canon.load_findings)
+        return CANON_UNREADABLE, _describe(reasons) if reasons else "aucune source lue"
+    if findings is None:
+        findings = canon_mod.validate(canon)
+    block = canon_mod.blocking(findings)
+    host_wide = block.global_errors + list(block.by_host.get(host, []))
+    if host_wide:
+        return CANON_INVALID, _describe(host_wide)
+    others = canon_mod.errors(findings)
+    if others:
+        return CANON_OK, "erreurs propres à des agents (non réclamables) : " + _describe(others)
+    return CANON_OK, ""
+
+
+def record_state(db: Db, host: str, status: str, diagnostic: str,
+                 canon: Canon | None = None) -> None:
+    """Écrit l'état du canon de `host` ; le dernier commit valide ne suit que `ok`."""
+    commit = None
+    if status == CANON_OK and canon is not None and canon.sources:
+        commit = canon.sources[0].commit or None
+    db.query(
+        """
+        INSERT INTO canon_state AS s
+            (host, status, root, source, last_good_commit, last_good_at, diagnostic,
+             checked_at)
+        VALUES (%s, %s, %s, %s, %s, CASE WHEN %s THEN now() END, %s, now())
+        ON CONFLICT (host) DO UPDATE SET
+            status           = excluded.status,
+            root             = excluded.root,
+            source           = excluded.source,
+            last_good_commit = CASE WHEN excluded.status = 'ok'
+                                    THEN excluded.last_good_commit
+                                    ELSE s.last_good_commit END,
+            last_good_at     = CASE WHEN excluded.status = 'ok'
+                                    THEN excluded.last_good_at
+                                    ELSE s.last_good_at END,
+            diagnostic       = excluded.diagnostic,
+            checked_at       = excluded.checked_at
+        RETURNING host
+        """,
+        (host, status, canon.root if canon is not None else "",
+         canon.source_label() if canon is not None and canon.sources else "",
+         commit, status == CANON_OK, diagnostic),
+    )
+
+
+def state(db: Db, host: str) -> dict | None:
+    """Dernier état enregistré du canon de `host`, ou None."""
+    rows = db.query(
+        """
+        SELECT host, status, root, source, last_good_commit, diagnostic,
+               extract(epoch from last_good_at)::float8 AS last_good_ts,
+               extract(epoch from checked_at)::float8   AS checked_ts
+          FROM canon_state WHERE host = %s
+        """,
+        (host,),
+    )
+    return rows[0] if rows else None
 
 
 def _member_of(canon_ref: str | None) -> str:
@@ -160,14 +268,22 @@ def _same(row: dict, values: dict) -> bool:
 
 
 def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None) -> SyncReport:
-    """Aligne le registre de `host` sur le canon. Refuse un canon illisible."""
+    """Aligne le registre de `host` sur le canon et enregistre l'état du canon.
+
+    Canon illisible : seul l'état `unreadable` est écrit, puis CanonUnreadable.
+    Ordre fail closed : un état non `ok` est écrit AVANT toute autre écriture
+    (la réclamation est fermée d'abord) ; un état `ok` APRÈS (elle ne rouvre
+    qu'une fois le registre aligné).
+    """
     if not canon.readable:
-        reasons = "; ".join("%s : %s" % (f.code, f.message)
-                            for f in canon_mod.errors(canon.load_findings))
-        raise canon_mod.CanonError("canon illisible, registre inchangé : %s" % (
-            reasons or "aucune source"))
+        status, diagnostic = assess(canon, host)
+        record_state(db, host, status, diagnostic, canon)
+        raise CanonUnreadable(host, diagnostic, list(canon.load_findings))
     if findings is None:
         findings = canon_mod.validate(canon)
+    status, diagnostic = assess(canon, host, findings)
+    if status != CANON_OK:
+        record_state(db, host, status, diagnostic, canon)
     block = canon_mod.blocking(findings)
     actions: list[SyncAction] = []
 
@@ -298,8 +414,11 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None)
                 and name not in placed_here:
             actions.append(SyncAction(name, "hors canon",
                                       "inscrit à la main : non gouverné par sync"))
+    if status == CANON_OK:
+        record_state(db, host, status, diagnostic, canon)
     return SyncReport(host=host, source=canon.source_label(), untrusted=canon.untrusted,
-                      actions=actions, findings=findings)
+                      actions=actions, findings=findings, status=status,
+                      diagnostic=diagnostic)
 
 
 # --------------------------------------------------------------------------

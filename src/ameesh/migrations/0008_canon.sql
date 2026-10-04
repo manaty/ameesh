@@ -40,6 +40,36 @@ alter table agent_registry
     check (capabilities is null
            or lower(array_to_string(capabilities, ',')) !~ '(^|,)\s*approve\s*(,|$)');
 
+-- État du canon par hôte (§4.1 : « un canon invalide n'arrête pas les agents
+-- déjà réclamés : il empêche les nouvelles réclamations et produit un
+-- diagnostic »). Écrit par `ameesh canon sync`, y compris quand le canon est
+-- illisible (c'est alors sa seule écriture). Lu par la condition de
+-- réclamation (`registry.canon_claim_predicate_sql`) : un agent gouverné par
+-- le canon n'est réclamable que si l'état de SON hôte est `ok` ; pas d'état,
+-- pas de réclamation. Ni bail, ni session, ni tour n'en dépendent.
+--
+--   status            ok | invalid (canon lu, mais une erreur bloque tout
+--                     l'hôte : fédération, fiche du profil illisible, fiche
+--                     Host…) | unreadable (racine absente, dépôt cassé,
+--                     révision introuvable, dossier non approuvé refusé)
+--   root              racine du canon lue
+--   source            sources lues au dernier contrôle (membre @ commit)
+--   last_good_commit  commit de la racine au dernier contrôle `ok` (NULL pour
+--                     un canon non approuvé, sans commit)
+--   last_good_at      horodatage du dernier contrôle `ok`
+--   diagnostic        constats bloquants, lisibles
+--   checked_at        horodatage du dernier contrôle
+create table if not exists canon_state (
+    host             text primary key,
+    status           text not null check (status in ('ok', 'invalid', 'unreadable')),
+    root             text not null default '',
+    source           text not null default '',
+    last_good_commit text,
+    last_good_at     timestamptz,
+    diagnostic       text not null default '',
+    checked_at       timestamptz not null default now()
+);
+
 -- La vue d'observabilité figeait ses colonnes (0005) : on la recrée pour que
 -- les colonnes du canon apparaissent dans `mesh list --json`, avec
 -- `responsible_ok` (R14 : l'agent a un responsable et, s'il est éphémère,

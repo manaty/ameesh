@@ -99,7 +99,7 @@ repository is read only with `AMEESH_CANON_UNTRUSTED=1` (tests, prototypes), and
 every finding and sync line is then tagged `[NON APPROUVÉ]`.
 
 ```
-ameesh canon check [--json] [--canon DIR] [--ref REV] [--fetch]   # exit 1 on any error
+ameesh canon check [--host H] [--json] [--canon DIR] [--ref REV] [--fetch]   # exit 1 on any error
 ameesh canon show  [--json] …                                     # cards read, and from which commit
 ameesh canon sync  [--host H] [--json] …                          # canon → registry of host H
 ameesh agent spawn <name> --by <creator> --ttl 2h [--cwd DIR] [--prompt TEXT]
@@ -127,6 +127,21 @@ alone. `agent spawn` creates an ephemeral agent whose `responsible` is copied
 from its creator at creation (R14), with capabilities ⊆ `{read, propose}` (and
 ⊆ the creator's), a mandatory expiry (max 7 days, never beyond an ephemeral
 creator's). A fictitious example canon lives in [`examples/canon/`](examples/canon/).
+
+**Canon state, fail closed (§4.1).** Every `canon sync` records the canon's
+status for the host in `canon_state`: `ok`, `invalid` (read, but an error
+blocks the whole host: federation, unreadable profile card, `Host` card) or
+`unreadable` (root missing, broken repository, revision not found, non-git
+directory refused), with a diagnostic and the last valid commit. An unreadable
+canon writes **only** that row. Agents governed by the canon (`canon_ref` set,
+and ephemeral agents whose creator lineage leads to one) are claimable only
+while their host's state is `ok`; no state means not claimable. Leases,
+sessions and turns already running are never touched; agents registered by
+hand are unaffected. The SQL condition is `registry.canon_claim_predicate_sql()`
+(used by `claimable()` and `claim()`, to be reused by `attach`). `canon check`
+prints the status for the host and the recorded state; `mesh list --json`
+exposes `canon_governed`, `canon_status`, `canon_diagnostic`,
+`canon_checked_ts` and `canon_claim_ok`.
 
 `agent-runner`:
 

@@ -1490,9 +1490,19 @@ def _text(value: Any) -> str | None:
 
 def load(root: str, *, ref: str = "", untrusted: bool = False, fetch: bool = False,
          use_pyyaml: bool | None = None) -> Canon:
-    """Lit le canon (§4.1). Les problèmes de lecture sont dans `canon.load_findings`."""
-    return _Loader(root, ref=ref, untrusted=untrusted, fetch=fetch,
-                   use_pyyaml=use_pyyaml).load()
+    """Lit le canon (§4.1). Les problèmes de lecture sont dans `canon.load_findings`.
+
+    Une erreur git imprévue (dépôt cassé, délai dépassé) rend le canon
+    illisible (`readable` faux) au lieu de remonter : `canon sync` peut alors
+    enregistrer l'état `unreadable`.
+    """
+    loader = _Loader(root, ref=ref, untrusted=untrusted, fetch=fetch, use_pyyaml=use_pyyaml)
+    try:
+        return loader.load()
+    except GitError as exc:
+        loader.add("canon-git-error", ERROR, "lecture du canon : %s" % exc)
+        loader.canon.readable = False
+        return loader.canon
 
 
 def from_config(cfg, *, root: str | None = None, fetch: bool = False) -> Canon:

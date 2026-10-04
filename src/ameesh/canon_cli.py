@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Commandes du canon (spec §4) et des agents éphémères.
 
-  ameesh canon check [--json]            validation (§4.3) ; code 1 si erreur
+  ameesh canon check [--host H] [--json] validation (§4.3) ; code 1 si erreur ;
+                                         état du canon pour l'hôte (ok | invalid |
+                                         unreadable) et état enregistré au registre
   ameesh canon show [--json]             fiches lues, et d'où (commit)
-  ameesh canon sync [--host H] [--json]  canon → registre de l'hôte (§4.4)
+  ameesh canon sync [--host H] [--json]  canon → registre de l'hôte (§4.4) ; enregistre
+                                         l'état du canon (canon_state), même illisible
   ameesh agent spawn <nom> --by <créateur> --ttl <durée> [--cwd DIR] [--prompt T]
 
 Options communes du canon : `--canon DOSSIER` (sinon AMEESH_CANON), `--ref REV`
@@ -45,13 +48,64 @@ def _summary(findings: list[canon_mod.Finding]) -> str:
     return "%d erreur(s), %d avertissement(s)" % (errors, len(findings) - errors)
 
 
+def _moment(ts) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts))) if ts else "—"
+
+
+def _status_line(host: str, status: str, diagnostic: str, *, recorded: bool) -> str:
+    """Le statut du canon pour un hôte, et ce qu'il implique pour la réclamation."""
+    if status == canon_sync.CANON_OK:
+        return "état du canon pour %s : ok%s" % (host, " — %s" % diagnostic if diagnostic else "")
+    return ("état du canon pour %s : %s — %s\n  → %sagents du canon (et leurs éphémères) "
+            "NON réclamables sur %s ; baux, sessions et tours en cours intacts"
+            % (host, status, diagnostic or "?",
+               "" if recorded else "après ameesh canon sync : ", host))
+
+
+def _recorded(cfg: Config, host: str) -> dict | None:
+    """{"state": état enregistré ou None}, ou None sans base (check marche sans base)."""
+    try:
+        db = db_mod.connect(cfg)
+    except db_mod.DbError:
+        return None
+    try:
+        return {"state": canon_sync.state(db, host)}
+    except db_mod.DbError:
+        return None
+    finally:
+        db.close()
+
+
+def _recorded_line(host: str, recorded: dict | None) -> str:
+    if recorded is None:
+        return "registre  : état enregistré inconnu (base injoignable ou non migrée)"
+    st = recorded["state"]
+    if st is None:
+        return ("registre  : aucun état du canon pour %s (ameesh canon sync) : agents du "
+                "canon non réclamables" % host)
+    line = "registre  : %s pour %s (contrôle du %s), dernier commit valide %s (%s)" % (
+        st["status"], host, _moment(st.get("checked_ts")),
+        (st.get("last_good_commit") or "—")[:12], _moment(st.get("last_good_ts")))
+    if st["status"] != canon_sync.CANON_OK:
+        line += (" — %s\n  → agents du canon non réclamables sur %s jusqu'à un "
+                 "« ameesh canon sync » qui lit un canon valide" % (st.get("diagnostic") or "?",
+                                                                    host))
+    return line
+
+
 def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
     canon = _load(cfg, args)
+    host = getattr(args, "host", None) or cfg.host
     findings = canon_mod.validate(canon)
     errors = canon_mod.errors(findings)
+    status, diagnostic = canon_sync.assess(canon, host, findings)
+    recorded = _recorded(cfg, host)
     if args.json:
         print(json.dumps({
             "ok": not errors, "root": canon.root, "untrusted": canon.untrusted,
+            "readable": canon.readable, "host": host,
+            "canon_status": status, "diagnostic": diagnostic,
+            "registry_state": recorded["state"] if recorded else None,
             "sources": [s.to_dict() for s in canon.sources],
             "errors": len(errors), "warnings": len(findings) - len(errors),
             "findings": [f.to_dict() for f in findings],
@@ -60,7 +114,11 @@ def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
     print("canon : %s" % canon.root)
     print("source : %s%s" % (UNTRUSTED_TAG if canon.untrusted else "", canon.source_label()))
     _print_findings(findings)
-    print(("canon valide — " if not errors else "canon INVALIDE — ") + _summary(findings))
+    print(("canon valide — " if not errors
+           else "canon ILLISIBLE — " if not canon.readable
+           else "canon INVALIDE — ") + _summary(findings))
+    print(_status_line(host, status, diagnostic, recorded=False))
+    print(_recorded_line(host, recorded))
     return 1 if errors else 0
 
 
@@ -110,7 +168,10 @@ def cmd_sync(cfg: Config, args: argparse.Namespace) -> int:
     db = db_mod.connect(cfg)
     try:
         db_mod.require_schema(db)
-        report = canon_sync.sync(db, canon, host)
+        try:
+            report = canon_sync.sync(db, canon, host)
+        except canon_sync.CanonUnreadable as exc:
+            return _print_unreadable(args, canon, exc)
     finally:
         db.close()
     if args.json:
@@ -124,11 +185,30 @@ def cmd_sync(cfg: Config, args: argparse.Namespace) -> int:
         print("%s  %-16s %-14s %s" % (tag, action.agent, action.action, action.detail))
         for reason in action.blocked:
             print("%s  %-16s   bloqué par %s" % (tag, "", reason))
+    print(_status_line(host, report.status, report.diagnostic, recorded=True))
     if report.errors:
         print("canon INVALIDE — %s : les agents concernés ne sont pas réclamables "
               "(ameesh canon check)" % _summary(report.findings))
         return 1
     return 0
+
+
+def _print_unreadable(args: argparse.Namespace, canon: canon_mod.Canon,
+                      exc: canon_sync.CanonUnreadable) -> int:
+    """Canon illisible : seul l'état `unreadable` a été enregistré."""
+    if args.json:
+        print(json.dumps({
+            "host": exc.host, "source": "", "untrusted": canon.untrusted,
+            "canon_status": canon_sync.CANON_UNREADABLE, "diagnostic": exc.diagnostic,
+            "actions": [], "errors": len(canon_mod.errors(exc.findings)),
+            "findings": [f.to_dict() for f in exc.findings],
+        }, ensure_ascii=False, indent=2))
+        return 1
+    print("canon sync sur %s — canon ILLISIBLE (%s) : registre inchangé"
+          % (exc.host, canon.root))
+    _print_findings(exc.findings)
+    print(_status_line(exc.host, canon_sync.CANON_UNREADABLE, exc.diagnostic, recorded=True))
+    return 1
 
 
 def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
@@ -185,6 +265,9 @@ def add_parsers(sub) -> None:
     canon_sub = p_canon.add_subparsers(dest="canon_command")
     p_check = canon_sub.add_parser("check", help="valider le canon (§4.3)")
     _canon_options(p_check)
+    p_check.add_argument("--host", default=None,
+                         help="hôte dont l'état est diagnostiqué (sinon AMEESH_HOST / cette "
+                              "machine)")
     p_check.set_defaults(func=cmd_check)
     p_cshow = canon_sub.add_parser("show", help="fiches lues et leur source")
     _canon_options(p_cshow)

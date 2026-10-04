@@ -604,6 +604,7 @@ class FederationTest(_TmpMixin, unittest.TestCase):
 class _CanonDbCase(_TmpMixin, PgTestCase):
     def setUp(self) -> None:
         super().setUp()
+        self.db.execute("DELETE FROM canon_state")
         self.root = self.example_copy()
 
     def load(self) -> canon.Canon:
@@ -738,6 +739,10 @@ class SyncTest(_CanonDbCase):
         blocked = {a.agent: a.blocked for a in report.actions}
         self.assertTrue(blocked["relecteur"])
         self.assertFalse(blocked["orchestre"])
+        # une erreur propre à un agent ne ferme pas tout l'hôte : état ok, diagnostic
+        self.assertEqual(report.status, "ok")
+        self.assertIn("agent-responsible-unresolved", report.diagnostic)
+        self.assertEqual(canon_sync.state(self.db, "atelier")["status"], "ok")
         self.assertIsNone(self.row("relecteur")["responsible"])
         self.assertEqual(self.row("orchestre")["responsible"], "human:alice")
         noms = [r["name"] for r in registry.claimable(self.db, "atelier",
@@ -787,6 +792,9 @@ class SyncTest(_CanonDbCase):
         with self.assertRaises(canon.CanonError):
             canon_sync.sync(self.db, canon.load(self.root), "atelier")   # hors git, refusé
         self.assertEqual([r["name"] for r in registry.overview(self.db)], ["manuel"])
+        state = canon_sync.state(self.db, "atelier")
+        self.assertEqual(state["status"], "unreadable")
+        self.assertIn("canon-untrusted-refused", state["diagnostic"])
 
     def test_sync_depuis_git_enregistre_le_commit(self):
         workspace = self.make_tmp()
@@ -803,6 +811,175 @@ class SyncTest(_CanonDbCase):
                             "WHERE name = 'x'")
         with self.assertRaises(db_mod.DbError):
             self.db.execute("UPDATE agent_registry SET ephemeral = true WHERE name = 'x'")
+
+
+class CanonStateTest(_CanonDbCase):
+    """§4.1, fail closed : un canon illisible ou invalide ferme toute NOUVELLE
+    réclamation des agents qu'il gouverne (et de leurs éphémères), sans toucher
+    aux baux, sessions ni tours en cours ; les agents inscrits à la main ne
+    sont pas concernés."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.workspace = self.make_tmp()
+        self.bare, self.clone = publish(self.workspace, "acme", EXAMPLE)
+        self.main = git(self.clone, "rev-parse", "origin/main")
+
+    def git_sync(self, **kwargs) -> canon_sync.SyncReport:
+        return canon_sync.sync(self.db, canon.load(self.clone, **kwargs), "atelier")
+
+    def break_canon(self) -> canon_sync.CanonUnreadable:
+        with self.assertRaises(canon_sync.CanonUnreadable) as ctx:
+            self.git_sync()
+        return ctx.exception
+
+    def claimable(self, **kwargs) -> list[str]:
+        return sorted(r["name"] for r in registry.claimable(self.db, "atelier", **kwargs))
+
+    def snapshot(self) -> list[dict]:
+        return self.db.query("SELECT * FROM agent_registry ORDER BY name")
+
+    def manual(self, name: str = "manuel") -> None:
+        registry.upsert(self.db, name, harness="codex", host="atelier")
+        self.db.execute("UPDATE agent_registry SET responsible = 'human:alice' "
+                        "WHERE name = %s", (name,))
+
+    def test_etat_ok_enregistre(self):
+        report = self.git_sync()
+        self.assertEqual((report.status, report.diagnostic), ("ok", ""))
+        state = canon_sync.state(self.db, "atelier")
+        self.assertEqual((state["status"], state["last_good_commit"], state["diagnostic"]),
+                         ("ok", self.main, ""))
+        self.assertIn(self.main[:12], state["source"])
+        self.assertEqual(self.claimable(require_responsible=True), ["orchestre", "relecteur"])
+        with self.assertRaises(db_mod.DbError):
+            self.db.execute("UPDATE canon_state SET status = 'peut-être'")
+
+    def test_racine_supprimee_bail_et_session_intacts(self):
+        self.git_sync()
+        registry.set_session(self.db, "orchestre", "sess-orchestre")
+        lease = registry.claim(self.db, "relecteur", "runner-x", 600)
+        epoch = int(lease["lease_epoch"])
+        registry.set_session(self.db, "relecteur", "sess-relecteur")
+        self.assertTrue(registry.begin_turn(self.db, "relecteur", "runner-x", epoch, "tour"))
+        avant = self.snapshot()
+        shutil.rmtree(self.clone)
+        exc = self.break_canon()
+        self.assertIsInstance(exc, canon.CanonError)
+        self.assertIn("canon-missing", exc.diagnostic)
+        # seule écriture : l'état du canon (dernier commit valide conservé)
+        self.assertEqual(self.snapshot(), avant)
+        state = canon_sync.state(self.db, "atelier")
+        self.assertEqual((state["status"], state["last_good_commit"]), ("unreadable", self.main))
+        self.assertIn("canon-missing", state["diagnostic"])
+        # plus aucune nouvelle réclamation, quel que soit le réglage R14…
+        self.assertEqual(self.claimable(require_responsible=True), [])
+        self.assertEqual(self.claimable(require_responsible=False), [])
+        self.assertIsNone(registry.claim(self.db, "orchestre", "runner-y", 600))
+        # … mais rien n'est arrêté : le bail, la session et le tour continuent
+        row = self.row("relecteur")
+        self.assertEqual((row["lease_owner"], int(row["lease_epoch"]), row["status"],
+                          row["session_id"]), ("runner-x", epoch, "running", "sess-relecteur"))
+        self.assertEqual(registry.lease_matches(self.db, "relecteur", "runner-x", epoch),
+                         (True, ""))
+        self.assertIsNotNone(registry.renew(self.db, "relecteur", "runner-x", epoch, 600))
+        self.assertTrue(registry.end_turn(self.db, "relecteur", "runner-x", epoch,
+                                          status="idle", status_text="tour fini"))
+        self.assertTrue(registry.release(self.db, "relecteur", "runner-x", epoch))
+        row = self.row("orchestre")
+        self.assertEqual((row["session_id"], row["responsible"], row["status"]),
+                         ("sess-orchestre", "human:alice", "idle"))
+        self.assertEqual(self.claimable(require_responsible=True), [])
+        # canon réparé, puis sync : de nouveau réclamables
+        git(self.workspace, "clone", "-q", self.bare, self.clone)
+        self.assertEqual(self.git_sync().status, "ok")
+        self.assertEqual(self.claimable(require_responsible=True), ["orchestre", "relecteur"])
+        self.assertIsNotNone(registry.claim(self.db, "orchestre", "runner-y", 600))
+        self.assertEqual(self.row("orchestre")["session_id"], "sess-orchestre")
+
+    def test_revision_introuvable(self):
+        self.git_sync()
+        with self.assertRaises(canon_sync.CanonUnreadable):
+            self.git_sync(ref="origin/inexistante")
+        state = canon_sync.state(self.db, "atelier")
+        self.assertEqual(state["status"], "unreadable")
+        self.assertIn("canon-ref-missing", state["diagnostic"])
+        self.assertEqual(self.claimable(require_responsible=False), [])
+        self.git_sync()
+        self.assertEqual(self.claimable(require_responsible=True), ["orchestre", "relecteur"])
+
+    def test_depot_casse(self):
+        self.git_sync()
+        shutil.rmtree(os.path.join(self.clone, ".git"))
+        exc = self.break_canon()
+        self.assertIn("canon-untrusted-refused", exc.diagnostic)
+        self.assertEqual(self.claimable(require_responsible=False), [])
+
+    def test_agent_manuel_non_affecte(self):
+        self.manual()
+        self.assertEqual(self.claimable(require_responsible=True), ["manuel"])   # aucun état
+        self.git_sync()
+        shutil.rmtree(self.clone)
+        self.break_canon()
+        self.assertEqual(self.claimable(require_responsible=True), ["manuel"])
+        self.assertEqual(self.claimable(require_responsible=False), ["manuel"])
+        self.assertIsNotNone(registry.claim(self.db, "manuel", "runner-y", 600))
+
+    def test_ephemeres_d_un_createur_canonique_bloques(self):
+        self.git_sync()
+        self.manual()
+        canon_sync.spawn(self.db, "aide", "orchestre", 3600)
+        canon_sync.spawn(self.db, "petit", "aide", 3600)        # petit → aide → orchestre
+        canon_sync.spawn(self.db, "aidem", "manuel", 3600)
+        self.assertEqual(self.claimable(require_responsible=True),
+                         ["aide", "aidem", "manuel", "orchestre", "petit", "relecteur"])
+        shutil.rmtree(self.clone)
+        self.break_canon()
+        self.assertEqual(self.claimable(require_responsible=True), ["aidem", "manuel"])
+        self.assertIsNone(registry.claim(self.db, "petit", "runner-y", 600))
+        overview = {r["name"]: r for r in registry.overview(self.db)}
+        self.assertEqual({n for n, r in overview.items() if r["canon_governed"]},
+                         {"aide", "petit", "orchestre", "relecteur"})
+        self.assertEqual({n for n, r in overview.items() if r["canon_claim_ok"]},
+                         {"aidem", "manuel"})
+        self.assertEqual({r["canon_status"] for r in overview.values()}, {"unreadable"})
+        # lignée rompue (créateur disparu) : tenu pour gouverné
+        self.db.execute("UPDATE agent_registry SET created_by = 'disparu' WHERE name = 'aidem'")
+        self.assertEqual(self.claimable(require_responsible=True), ["manuel"])
+
+    def test_canon_invalide_bloque_aussi_les_ephemeres(self):
+        self.git_sync()
+        canon_sync.spawn(self.db, "aide", "orchestre", 3600)
+        write(self.clone, "agents/casse.md", "---\ntype: Agent\ntitle: [x\n---\n")
+        head = commit_all(self.clone, "fiche cassée")
+        report = self.git_sync()
+        self.assertEqual(report.status, "invalid")
+        self.assertIn("frontmatter-invalid", report.diagnostic)
+        state = canon_sync.state(self.db, "atelier")
+        self.assertEqual((state["status"], state["last_good_commit"]), ("invalid", self.main))
+        # l'éphémère garde son responsable copié, mais n'est plus réclamable
+        self.assertEqual(self.row("aide")["responsible"], "human:alice")
+        self.assertEqual(self.claimable(require_responsible=False), [])
+        write(self.clone, "agents/casse.md", None)
+        repaired = commit_all(self.clone, "réparation")
+        self.assertNotEqual(repaired, head)
+        self.assertEqual(self.git_sync().status, "ok")
+        self.assertEqual(canon_sync.state(self.db, "atelier")["last_good_commit"], repaired)
+        self.assertEqual(self.claimable(require_responsible=True),
+                         ["aide", "orchestre", "relecteur"])
+
+    def test_sans_etat_pas_de_reclamation(self):
+        self.git_sync()
+        self.db.execute("DELETE FROM canon_state")
+        self.assertEqual(self.claimable(require_responsible=False), [])
+        self.assertIsNone(registry.claim(self.db, "orchestre", "runner-y", 600))
+
+    def test_etat_par_hote(self):
+        self.git_sync()
+        canon_sync.sync(self.db, canon.load(self.clone), "banc")
+        canon_sync.record_state(self.db, "banc", canon_sync.CANON_UNREADABLE, "panne")
+        self.assertEqual(self.claimable(require_responsible=True), ["orchestre", "relecteur"])
+        self.assertEqual(registry.claimable(self.db, "banc", require_responsible=False), [])
 
 
 class SpawnTest(_CanonDbCase):
@@ -885,6 +1062,10 @@ class SpawnTest(_CanonDbCase):
 
 
 class ClaimRuleTest(_TmpMixin, PgTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.execute("DELETE FROM canon_state")
+
     def test_regle_explicite(self):
         registry.upsert(self.db, "avec", harness="claude", host="h1")
         registry.upsert(self.db, "sans", harness="claude", host="h1")
@@ -934,6 +1115,27 @@ class ClaimRuleTest(_TmpMixin, PgTestCase):
         self.db.execute("UPDATE agent_registry SET responsible = 'human:alice' "
                         "WHERE name = 'sansresp'")
         proc = self.runner("--once", "--agents", "sansresp", env=env)
+        self.assertEqual([t["harness"] for t in self.turns()], ["claude"], proc.stdout)
+
+    def test_l_executeur_respecte_l_etat_du_canon(self):
+        """§4.1 de bout en bout, sans toucher à runner.py : sans état `ok` du canon
+        de son hôte, un agent du canon n'est pas réclamé."""
+        cwd = os.path.join(self.tmp, "work")
+        os.makedirs(cwd, exist_ok=True)
+        env = self.env(AMEESH_HOST="h-canon")
+        proc = self.runner("register", "canonique", "claude", "--cwd", cwd,
+                           "--prompt", "tour", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.db.execute("UPDATE agent_registry SET canon_ref = 'canon:agents/c.md@abc', "
+                        "responsible = 'human:alice' WHERE name = 'canonique'")
+        self.runner("--once", "--agents", "canonique", env=env)
+        self.assertEqual(self.turns(), [])                    # aucun état : jamais vérifié
+        canon_sync.record_state(self.db, "h-canon", canon_sync.CANON_UNREADABLE,
+                                "canon-missing (canon) : racine du canon introuvable")
+        self.runner("--once", "--agents", "canonique", env=env)
+        self.assertEqual(self.turns(), [])
+        canon_sync.record_state(self.db, "h-canon", canon_sync.CANON_OK, "")
+        proc = self.runner("--once", "--agents", "canonique", env=env)
         self.assertEqual([t["harness"] for t in self.turns()], ["claude"], proc.stdout)
 
 
@@ -989,6 +1191,39 @@ class CanonCliTest(_CanonDbCase):
         data = json.loads(self.mesh("canon", "sync", "--host", "banc", "--json",
                                     env=self.cli_env()).stdout)
         self.assertEqual(data["actions"][0]["action"], "inchangé")
+        self.assertEqual(data["canon_status"], "ok")
+
+    def test_canon_illisible_diagnostic(self):
+        proc = self.mesh("canon", "sync", "--host", "atelier", env=self.cli_env())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("état du canon pour atelier : ok", proc.stdout)
+        registry.upsert(self.db, "manuel", harness="codex", host="atelier")
+        shutil.rmtree(self.root)
+        proc = self.mesh("canon", "sync", "--host", "atelier", env=self.cli_env())
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        for attendu in ("ILLISIBLE", "registre inchangé", "canon-missing",
+                        "état du canon pour atelier : unreadable", "NON réclamables"):
+            self.assertIn(attendu, proc.stdout)
+        data = json.loads(self.mesh("canon", "sync", "--host", "atelier", "--json",
+                                    env=self.cli_env()).stdout)
+        self.assertEqual((data["canon_status"], data["actions"]), ("unreadable", []))
+        self.assertIn("canon-missing", data["diagnostic"])
+        proc = self.mesh("canon", "check", "--host", "atelier", env=self.cli_env())
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("état du canon pour atelier : unreadable", proc.stdout)
+        self.assertIn("registre  : unreadable pour atelier", proc.stdout)
+        data = json.loads(self.mesh("canon", "check", "--host", "atelier", "--json",
+                                    env=self.cli_env()).stdout)
+        self.assertEqual((data["canon_status"], data["registry_state"]["status"]),
+                         ("unreadable", "unreadable"))
+        rows = {r["name"]: r for r in json.loads(self.mesh("list", "--json").stdout)}
+        orchestre = rows["orchestre"]
+        self.assertEqual((orchestre["canon_governed"], orchestre["canon_status"],
+                          orchestre["canon_claim_ok"]), (True, "unreadable", False))
+        self.assertIn("canon-missing", orchestre["canon_diagnostic"])
+        self.assertTrue(orchestre["responsible_ok"])          # rien d'autre n'a changé
+        self.assertEqual((rows["manuel"]["canon_governed"], rows["manuel"]["canon_claim_ok"]),
+                         (False, True))
 
     def test_spawn(self):
         self.sync()
