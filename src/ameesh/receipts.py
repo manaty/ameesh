@@ -735,7 +735,9 @@ def consume_nonce(db: Db, approver: str, nonce: str, *, by: str, challenge: str 
     La décision est l'`INSERT … ON CONFLICT DO NOTHING` sur la clé primaire :
     deux consommations simultanées ne peuvent pas réussir toutes les deux. Si
     `authenticator_id` est donné, l'authentificateur doit être encore actif au
-    moment de l'insertion.
+    moment de l'insertion : il est lu sous verrou partagé (`FOR SHARE`), qui
+    sérialise avec sa révocation (une révocation en cours est attendue puis
+    vue).
     """
     rows = db.query(
         """
@@ -743,7 +745,8 @@ def consume_nonce(db: Db, approver: str, nonce: str, *, by: str, challenge: str 
         SELECT %s, %s, %s, %s
          WHERE %s::bigint IS NULL
             OR EXISTS (SELECT 1 FROM authenticators a
-                        WHERE a.id = %s::bigint AND a.revoked_at IS NULL)
+                        WHERE a.id = %s::bigint AND a.revoked_at IS NULL
+                          FOR SHARE)
         ON CONFLICT (approver, nonce) DO NOTHING
         RETURNING nonce
         """,
@@ -803,13 +806,18 @@ def standing_reserve(db: Db, grant_id: int, action_id: str, amount, *, connector
                      reserved_by: str | None = None) -> dict | None:
     """Réserve `amount` sur le grant pour la tentative de `action_id`.
 
-    Atomique (un seul UPDATE … WHERE cumul + montant <= max AND until > now()
-    AND revoked_at IS NULL … puis l'insertion du lien, dans une même fonction).
+    Atomique (fonction `ameesh_standing_reserve`, une transaction) : verrou
+    du grant d'abord, puis TOUT est relu et réévalué après le verrou —
+    révocation, échéance comparée à l'heure réelle (`clock_timestamp()`, pas
+    `now()` figé avant l'attente du verrou), authentificateur, couverture,
+    cumul + montant <= max — et le lien est inséré.
     La description de l'action (connecteur, opération, classe, devise) est
-    OBLIGATOIRE : la couverture est contrôlée dans la même requête, une
+    OBLIGATOIRE : la couverture est contrôlée dans la même transaction, une
     réservation sur un grant qui ne couvre pas l'action est impossible.
     Idempotente par (grant, action) : une réservation vivante est rendue
-    (`reused`). None = pas de couverture.
+    (`reused`) seulement si la description est IDENTIQUE (montant, devise,
+    connecteur, opération, classe) ; toute différence lève ReceiptError — un
+    refus explicite, jamais un succès silencieux. None = pas de couverture.
     """
     if not isinstance(action_id, str) or not action_id:
         raise ReceiptError("action_id requis")
@@ -853,7 +861,8 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> d
 
     `action` : action_id, connector, operation, class, amount (facultatif),
     currency (facultatif). Une réservation vivante existante pour l'action est
-    réutilisée en priorité. None = aucune couverture.
+    réutilisée en priorité — si elle décrit la même action, sinon ReceiptError
+    (`standing_reserve`). None = aucune couverture.
     """
     action_id = action["action_id"]
     action_class = action.get("class", action.get("action_class"))
@@ -867,7 +876,7 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> d
         """
         SELECT id FROM standing_approvals
          WHERE connector = %s AND operations @> jsonb_build_array(%s::text)
-           AND action_class = %s AND revoked_at IS NULL AND valid_until > now()
+           AND action_class = %s AND revoked_at IS NULL AND valid_until > clock_timestamp()
            AND consumed_amount + %s::bigint <= max_amount
            AND (%s::bigint = 0 OR currency = %s)
          ORDER BY valid_until, id
@@ -944,44 +953,77 @@ def sync_authenticators(db: Db, members: list) -> dict:
     "authenticators": [{facade, credential_id, public_key, aaguid, level,
     canon_ref?}]}]. Le canon est la référence complète : un authentificateur
     actif absent de la liste est révoqué ; un changement de clé révoque
-    l'ancienne ligne et en crée une nouvelle.
+    l'ancienne ligne et en crée une nouvelle. Une révocation est un UPDATE de
+    la ligne : elle se sérialise avec les lectures sous verrou partagé (`FOR
+    SHARE`) des réservations, des enregistrements de grants et des
+    consommations de nonces.
 
-    Une entrée invalide — en particulier **sans référence de commit**
-    (`canon_ref` = chemin@SHA) — est refusée : constat d'erreur, aucune
-    écriture pour elle (ni ajout, ni mise à jour, ni révocation de la ligne
-    existante de même identité). Les autres entrées sont appliquées.
+    Une entrée invalide ne retire JAMAIS d'autorité par accident :
 
-    Renvoie {"added", "updated", "revoked", "unchanged", "errors"}.
+    * `members` doit être une liste (sinon ReceiptError, rien n'est écrit) ;
+      une liste vide est un canon sans membre : tout est révoqué ;
+    * un membre dont `authenticators` n'est pas une liste (absent, null,
+      texte, objet…) **ou dont la liste contient UN élément invalide** (pas
+      un objet ; façade, credential_id, clé, niveau ou aaguid invalides ;
+      entrée **sans référence de commit** `canon_ref` = chemin@SHA ; même
+      credential deux fois dans la liste) est GELÉ : constat d'erreur et
+      aucune écriture pour ce membre — ni ajout, ni mise à jour, ni
+      révocation de ses lignes actives. Une liste partiellement valide n'est
+      donc pas appliquée en partie ;
+    * seule une liste VALIDE qui omet un credential le révoque ; un membre
+      absent de `members` voit ses credentials révoqués — sauf si une entrée
+      de membre est illisible (titre invalide) : elle pourrait être ce membre,
+      aucune révocation pour absence n'est alors faite ;
+    * un credential déclaré par plusieurs membres, ou porté par une entrée
+      invalide, n'est ni ajouté ni modifié ni révoqué, chez personne.
+
+    Renvoie {"added", "updated", "revoked", "unchanged", "frozen", "errors"}.
     """
+    if not isinstance(members, list):
+        raise ReceiptError("members : liste de membres attendue (rien n'est modifié)")
     errors: list[str] = []
     desired: dict[tuple[str, str], dict] = {}
     protected: set[tuple[str, str]] = set()
     claimed: dict[tuple[str, str], int] = {}
+    listed: set[str] = set()       # approbateurs lisibles dans le canon
+    frozen: set[str] = set()       # approbateurs gelés : aucune écriture
+    unreadable = False             # une entrée de membre sans titre lisible
 
-    for index, member in enumerate(members or []):
+    for index, member in enumerate(members):
         title = member.get("title") if isinstance(member, dict) else None
         if not isinstance(title, str) or not re.fullmatch(_NAME, title):
             errors.append("membre #%d : titre invalide %r" % (index, title))
+            unreadable = True
             continue
         approver = "human:" + title
-        entries = member.get("authenticators") or []
+        listed.add(approver)
+        entries = member.get("authenticators")
         if not isinstance(entries, list):
-            errors.append("%s : authenticators doit être une liste" % approver)
+            errors.append("%s : authenticators doit être une liste (%s)" % (
+                approver, "absent" if "authenticators" not in member
+                else type(entries).__name__))
+            frozen.add(approver)
             continue
+        records: dict[tuple[str, str], dict] = {}
+        invalid = False
         for position, entry in enumerate(entries):
             where = "%s, authentificateur #%d" % (approver, position)
             if not isinstance(entry, dict):
                 errors.append("%s : objet attendu" % where)
+                invalid = True
                 continue
             facade = entry.get("facade")
             credential_id = entry.get("credential_id")
             if facade not in FACADES or not isinstance(credential_id, str) \
                     or not _CREDENTIAL_RE.fullmatch(credential_id):
                 errors.append("%s : façade ou credential_id invalide" % where)
+                invalid = True
                 continue
             identity = (facade, credential_id)
             claimed[identity] = claimed.get(identity, 0) + 1
             try:
+                if identity in records:
+                    raise ReceiptError("déclaré deux fois dans la liste")
                 canon_ref = entry.get("canon_ref") or member.get("canon_ref")
                 if not isinstance(canon_ref, str) or not _CANON_REF_RE.fullmatch(canon_ref):
                     raise ReceiptError("sans référence de commit du canon (chemin@SHA)")
@@ -998,8 +1040,13 @@ def sync_authenticators(db: Db, members: list) -> dict:
             except ReceiptError as exc:
                 errors.append("%s (%s) : %s" % (where, _label(approver, *identity), exc))
                 protected.add(identity)
+                invalid = True
                 continue
-            desired[identity] = record
+            records[identity] = record
+        if invalid:
+            frozen.add(approver)
+            continue
+        desired.update(records)
 
     for identity, count in claimed.items():
         if count > 1:
@@ -1007,14 +1054,21 @@ def sync_authenticators(db: Db, members: list) -> dict:
                           % (identity[0], identity[1], count))
             desired.pop(identity, None)
             protected.add(identity)
+    # un membre déclaré deux fois, dont une fois invalide : rien de lui non plus
+    for identity in [i for i, r in desired.items() if r["approver"] in frozen]:
+        desired.pop(identity)
+    if unreadable:
+        errors.append("entrée de membre illisible : aucune révocation pour absence du canon "
+                      "pendant cette synchronisation")
 
-    result = {"added": [], "updated": [], "revoked": [], "unchanged": 0, "errors": errors}
+    result = {"added": [], "updated": [], "revoked": [], "unchanged": 0,
+              "frozen": sorted(frozen), "errors": errors}
     active = list_authenticators(db)
     keep: set[tuple[str, str]] = set()
     for row in active:
         identity = (row["facade"], row["credential_id"])
         label = _label(row["approver"], *identity)
-        if identity in protected:
+        if identity in protected or row["approver"] in frozen:
             continue
         wanted = desired.get(identity)
         if wanted and wanted["approver"] == row["approver"] \
@@ -1030,6 +1084,8 @@ def sync_authenticators(db: Db, members: list) -> dict:
             else:
                 result["unchanged"] += 1
             continue
+        if unreadable and row["approver"] not in listed:
+            continue        # son entrée est peut-être celle qu'on n'a pas pu lire
         reason = ("clé changée dans le canon" if wanted and wanted["approver"] == row["approver"]
                   else "absent du canon")
         rows = db.query(
