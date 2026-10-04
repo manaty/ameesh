@@ -1,11 +1,54 @@
 # agent-mesh
 
 A multi-harness agent mesh (Claude Code, Codex, DeepSeek Harness): a durable
-mailbox on Postgres, one runner per machine, agent leases, owner authority by
-signature.
+mailbox on Postgres, one runner per machine, agent leases, readable threads,
+actions behind a gate, and human approvals proved by passkey receipts.
 
 Spec: [`MESH-SPEC.md`](MESH-SPEC.md). v0 (local, files, still in production):
 `agent-mail.v0.py`, `nexlink-agent.v0.sh` — **not touched by v1**.
+
+## ameesh v1
+
+What v1 does (design: [`docs/design/specification.md`](docs/design/specification.md)):
+
+* **canon** — an OKF git repository declares humans, hosts, agents and
+  placements; ameesh reads it only at the merged canonical commit and syncs it
+  into the registry of each host. An agent without a resolved human
+  `responsible`, or placed against its host's policy, is never claimed;
+* **runner** — one per host, leases, three harnesses (Claude Code, Codex,
+  DeepSeek Harness) resumed on the same session, events and `ameesh attach`;
+* **readable threads** — every message that goes through ameesh is appended in
+  clear to a Markdown thread per project or lot;
+* **actions behind a gate** — an `irreversible` or `costly` action (e.g. merging
+  a PR with `git-merge`) runs only with a valid receipt bound to its digest,
+  single use, with expiry; an unknown outcome is reconciled, never retried
+  blindly;
+* **human approval** — `ameesh-approve`, a separate service under its own Unix
+  user, shows the action recomputed from the database and has the human sign
+  it with a passkey on their phone; passkeys are enrolled by a canon PR. The
+  former Ed25519 owner-key ceremony is abandoned
+  ([0012](docs/design/decisions/0012-autorite-par-ameesh-approve.md)).
+
+```
+ameesh canon check | show | sync                  # canon → registry of this host
+agent-runner [--once]  |  ameesh attach <agent>   # the host's runner; interactive takeover
+ameesh mail send <agent> "<text>"                 # agent-mail, unchanged for the hooks
+ameesh fil list | show <project> [<lot>]          # readable threads
+ameesh action propose | execute | reconcile …     # the gate
+ameesh decisions [--for human:ID]                 # what waits for a human
+ameesh receipt verify | authenticator list        # receipts, trust registry
+ameesh-approve serve | enroll-link | gen-token    # the approval service (own user)
+```
+
+Demo — the whole scenario of the end-to-end test (`tests/test_bout_en_bout.py`),
+commented, on a temporary database that is dropped afterwards (fictitious
+organisation, fake harnesses, fake `gh`, software passkey):
+
+```bash
+scripts/demo-v1.sh
+```
+
+Switching the real site from v0: [`docs/BASCULE.md`](docs/BASCULE.md).
 
 ## State — v1 points 1 to 5 are built (bench)
 
@@ -13,7 +56,7 @@ Spec: [`MESH-SPEC.md`](MESH-SPEC.md). v0 (local, files, still in production):
 |---|---|
 | 1. agent-mail on Postgres (`agent_registry`, `agent_mailbox`, migrations, LISTEN/NOTIFY, CLI compatible v0) | **done** — [`docs/V1-MAILBOX-RUNNER.md`](docs/V1-MAILBOX-RUNNER.md) |
 | 2. one runner per machine, 3 harness adapters with session resume, leases, wake on NOTIFY | **done** — same document |
-| 3. owner authority by Ed25519 signature, content- and expiry-bound; two key roles (`owner` = authority, `agent` = provenance only); approvals with single use | **done** — [`docs/V1-AUTORITE-MESH.md`](docs/V1-AUTORITE-MESH.md) |
+| 3. owner authority by Ed25519 signature, content- and expiry-bound; two key roles (`owner` = authority, `agent` = provenance only); approvals with single use | **done** on the bench — [`docs/V1-AUTORITE-MESH.md`](docs/V1-AUTORITE-MESH.md); **superseded** for human authority by ameesh-approve receipts (decision 0012), Ed25519 keys remain for agent provenance and tests |
 | 4. `work_items` state machine (intake → build → qa → merged → promoted, + blocked/waiting_human), loop bound, event ledger | **done**; the board stays in git |
 | 5. `mesh list` observability | **done** — `agent-mesh list` / `show`, on `agent_mesh_overview` |
 
@@ -39,13 +82,11 @@ python3 -m ameesh.runner register deepseek7 deepseek --cwd ~/development/manaty/
 python3 -m ameesh.runner --max-turns 1
 
 # talk to it
-python3 -m ameesh send deepseek7 "ton lot a bougé"
+python3 -m ameesh mail send deepseek7 "ton lot a bougé"
 python3 -m ameesh list            # mesh list: host, lease, unread, budget, key
 
-# owner authority (test key only on the bench — the real key is the owner's act)
-python3 -m ameesh.mesh_cli key generate --out /tmp/cles --name test --i-am-the-owner
-python3 -m ameesh.mesh_cli key register proprietaire --public-key /tmp/cles/test.pub
-python3 -m ameesh.cli send deepseek7 "décision" --sign --key /tmp/cles/test.key --expires 12h
+# human approval: canon, gate, ameesh-approve and a software passkey, end to end
+scripts/demo-v1.sh
 
 # work items
 python3 -m ameesh.mesh_cli work add --title "un lot" --app nexlink --assignee deepseek7
@@ -104,7 +145,7 @@ ameesh fil tail <projet> [<lot>] [--last N]     # follow; Ctrl-C to exit
 
 ```
 agent-mesh list [--json] | show <agent>
-agent-mesh key generate --out DIR --i-am-the-owner     # owner's act, never an agent
+agent-mesh key generate --out DIR --i-am-the-owner     # bench / agent provenance keys
 agent-mesh key register <agent> --public-key FICHIER [--role owner|agent] | key show|list|revoke <agent>
 agent-mesh approve --key FICHIER --action A --hash H [--kind K] [--expires 48h]
 agent-mesh approvals [--action A] [--hash H] | verify --action A --hash H [--consume]
@@ -112,6 +153,12 @@ agent-mesh work add|list|show|move|note …
 agent-mesh import-v0 | export-v0                       # v0 → Postgres and back
 agent-mesh migrate | doctor [--notify-test]
 ```
+
+The Ed25519 keys and `approve`/`verify` are the bench's authority model. In
+v1 a human's authority is a receipt signed on their phone through
+ameesh-approve and checked by the gate (`ameesh action`, `ameesh receipt`);
+there is no owner-key ceremony any more, and an Ed25519 key kept on an agents'
+host never counts as human authority — it only proves an agent's provenance.
 
 ### Canon (v1, lot L2)
 
@@ -194,6 +241,7 @@ Python path runs with **zero** dependencies via `psql`.
 ```bash
 scripts/test.sh                      # starts the container, runs the suite twice
 scripts/test.sh tests.test_runner    # one module
+scripts/test.sh tests.test_bout_en_bout   # the v1 end-to-end test (spec §13)
 ```
 
 158 tests against the local container, run twice (`psql`, then `psycopg` with
@@ -247,8 +295,9 @@ src/ameesh/
   canon_cli.py    ameesh canon check|show|sync, ameesh agent spawn
   backend.py      Postgres backend + v0 file fallback
   identity.py     v0 alias/name resolution (shared aliases.tsv)
-tests/            unittest suite + fakebin/ fake harnesses
-scripts/          pg-up.sh, test.sh
+tests/            unittest suite, fakebin/ fake harnesses and gh, webauthn_soft.py and
+                  banc_v1.py (software passkey, ameesh-approve client: tests and demo only)
+scripts/          pg-up.sh, test.sh, demo-v1.sh
 ```
 
 ## License

@@ -302,8 +302,8 @@ def _cmd_sync(_args) -> int:
         result = sync_authenticators_from_canon(db, canon)
     finally:
         db.close()
-    print("registre des authentificateurs : ajoutés %s, révoqués %s, erreurs %s" % (
-        result["added"] or "—", result["revoked"] or "—", result["errors"] or "—"))
+    print("registre des authentificateurs : ajoutés %s ; révoqués %s ; erreurs %s" % tuple(
+        ", ".join(result[key]) or "—" for key in ("added", "revoked", "errors")))
     return 1 if result["errors"] else 0
 
 
