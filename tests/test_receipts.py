@@ -1318,7 +1318,7 @@ class SyncTest(ReceiptsBase):
         self.assertTrue(self.verify(self.bob.receipt(make_request(CAROL))).ok)
 
     def test_entree_sans_reference_de_commit(self):
-        """Constat d'erreur, aucune écriture pour l'entrée — même pas une révocation."""
+        """Constat d'erreur, aucune écriture pour le membre — même pas une révocation."""
         newcomer = SoftWebAuthn()
         members = [dict(m) for m in self.members]
         members[0] = dict(members[0], canon_ref=None, authenticators=[
@@ -1332,16 +1332,90 @@ class SyncTest(ReceiptsBase):
         self.assertEqual(len(result["errors"]), 3, result["errors"])
         self.assertTrue(all("référence de commit" in e for e in result["errors"]))
         self.assertEqual(result["added"], [])
-        # la ligne existante d'alice/webauthn est restée telle quelle ; l'outil
-        # ed25519, absent de la liste, est révoqué normalement
-        self.assertEqual(result["revoked"],
-                         ["%s/ed25519/%s" % (ALICE, self.alice_tool.credential_id)])
+        # liste invalide : alice est gelée — ses lignes restent telles quelles,
+        # l'outil ed25519 absent de CETTE liste n'est pas révoqué pour autant
+        self.assertEqual((result["revoked"], result["updated"]), ([], []))
+        self.assertEqual(result.get("frozen"), [ALICE])
         after = {row["credential_id"]: row for row in
                  receipts.list_authenticators(self.db, approver=ALICE)}
+        self.assertEqual(sorted(after), sorted(row["credential_id"] for row in before))
         for row in before:
-            if row["facade"] in ("webauthn", "device-es256"):
-                self.assertEqual(after[row["credential_id"]]["canon_ref"], row["canon_ref"])
+            self.assertEqual(after[row["credential_id"]]["canon_ref"], row["canon_ref"])
         self.assertNotIn(newcomer.credential_id, after)
+
+    def test_membre_invalide_ne_change_rien(self):
+        """B4 : une entrée de membre invalide ne change RIEN pour ce membre.
+
+        Règle : `authenticators` qui n'est pas une liste (texte, objet, null,
+        absent), ou une liste dont UN élément est invalide, gèle le membre — ni
+        ajout, ni mise à jour, ni révocation. Seule une liste valide qui omet
+        un credential le révoque.
+        """
+        newcomer = SoftWebAuthn()
+        cases = {
+            "texte": "webauthn:" + self.alice.credential_id,
+            "objet": self.alice.entry(),
+            "null": None,
+            "absent": KeyError,
+            "liste avec un élément non objet": [self.alice.entry(), newcomer.entry(), "x"],
+            "liste avec une façade invalide": [self.alice.entry(), newcomer.entry(),
+                                               dict(SoftWebAuthn().entry(), facade="sms")],
+            "liste avec un objet incomplet": [self.alice.entry(), {"facade": "webauthn"}],
+            "liste avec une clé illisible": [
+                self.alice.entry(), dict(newcomer.entry(), public_key=b64u(b"pas une cle"))],
+            "liste avec une clé de petit ordre": [
+                self.alice.entry(), dict(newcomer.entry(), public_key=b64u(okp_cose(IDENTITY)))],
+            "liste avec un niveau inconnu": [self.alice.entry(level="maximal")],
+            "liste avec un credential en double": [self.alice.entry(), self.alice.entry()],
+        }
+        before = receipts.list_authenticators(self.db, include_revoked=True)
+        for label, value in cases.items():
+            with self.subTest(label):
+                members = [dict(m) for m in self.members]
+                if value is KeyError:
+                    members[0] = {k: v for k, v in members[0].items() if k != "authenticators"}
+                else:
+                    members[0] = dict(members[0], authenticators=value)
+                # un autre membre change en même temps : lui est appliqué
+                members[1] = dict(members[1], authenticators=[self.bob.entry(level="eleve")])
+                result = receipts.sync_authenticators(self.db, members)
+                self.assertEqual((result["added"], result["revoked"]), ([], []))
+                after = receipts.list_authenticators(self.db, include_revoked=True)
+                alice_before = [r for r in before if r["approver"] == ALICE]
+                self.assertEqual([r for r in after if r["approver"] == ALICE], alice_before)
+                self.assertNotIn(newcomer.credential_id, [r["credential_id"] for r in after])
+                self.assertNotEqual(result["errors"], [])
+                self.assertEqual(result.get("frozen"), [ALICE])
+                # la passkey d'alice fait toujours autorité
+                self.assertTrue(self.verify(self.alice.receipt(make_request(ALICE))).ok)
+        bob = receipts.list_authenticators(self.db, approver=BOB)
+        self.assertEqual([r["level"] for r in bob], ["eleve"])
+        # témoin : une liste VALIDE qui omet un credential le révoque
+        members = [dict(m) for m in self.members]
+        members[0] = dict(members[0], authenticators=[self.alice.entry()])
+        result = receipts.sync_authenticators(self.db, members)
+        self.assertEqual(result.get("frozen"), [])
+        self.assertEqual(sorted(result["revoked"]), sorted([
+            "%s/webauthn/%s" % (ALICE, self.alice_ed.credential_id),
+            "%s/device-es256/%s" % (ALICE, self.alice_device.credential_id),
+            "%s/ed25519/%s" % (ALICE, self.alice_tool.credential_id)]))
+
+    def test_membres_illisibles_ne_revoquent_rien(self):
+        """Une liste de membres invalide, ou un membre sans titre lisible : pas de révocation."""
+        before = receipts.list_authenticators(self.db)
+        for members in (None, "membres", {"alice": []}):
+            with self.subTest(members=members):
+                with self.assertRaises(receipts.ReceiptError):
+                    receipts.sync_authenticators(self.db, members)
+        # alice absente, mais une entrée illisible pourrait être la sienne
+        members = self.members[1:] + [{"title": "Alice Martin", "authenticators": []}]
+        result = receipts.sync_authenticators(self.db, members)
+        self.assertEqual(result["revoked"], [])
+        self.assertTrue(any("illisible" in e for e in result["errors"]), result["errors"])
+        self.assertEqual(receipts.list_authenticators(self.db), before)
+        # sans entrée illisible, le membre retiré du canon est révoqué
+        result = receipts.sync_authenticators(self.db, self.members[1:])
+        self.assertEqual(len(result["revoked"]), 4)
 
     def test_entrees_invalides(self):
         broken_key = dict(SoftWebAuthn().entry(), public_key=b64u(b"pas une cle COSE"))
