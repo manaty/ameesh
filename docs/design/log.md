@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-04 (v1)
+* **Jalon** : v1 fonctionnellement complète sur `main` (d2611b0) — lots L2–L9 et L9b fusionnés après revue ; essai de bout en bout vert ; L1 proposé en v1.1.
+
 ## 2026-10-04 (critère d'adoption)
 * **Décision** : [critère d'adoption des réglages](decisions/0023-critere-d-adoption-des-reglages.md).
 
