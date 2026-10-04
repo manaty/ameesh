@@ -10,8 +10,9 @@
 -- * `action_events` : le journal, en ajout seul. Chaque transition d'état
 --   y écrit une ligne par déclencheur, dans la même transaction.
 --
--- Les transitions sont décidées par des UPDATE conditionnels (`WHERE state =
--- <attendu>`) et vérifiées une seconde fois par un déclencheur : une
+-- Les transitions sont décidées sous le verrou de la ligne de l'action
+-- (UPDATE conditionnel `WHERE state = <attendu>`, ou `SELECT … FOR UPDATE`
+-- puis relecture) et vérifiées une seconde fois par un déclencheur : une
 -- transition interdite échoue en base, quel que soit l'appelant.
 --
 --     proposed → approved → launched → confirmed | failed | unknown
@@ -22,9 +23,19 @@
 --
 -- Les opérations qui écrivent dans plusieurs tables sont des fonctions
 -- PL/pgSQL (un appel, une transaction, avec les deux pilotes). Elles appellent
--- `ameesh_standing_reserve` / `ameesh_standing_release` (0011) : les corps
--- PL/pgSQL ne sont résolus qu'à l'exécution, l'ordre 0010 < 0011 est sans
--- effet.
+-- les fonctions de 0011 — `ameesh_receipt_consume`, `ameesh_receipt_deadlines`,
+-- `ameesh_standing_reserve`, `ameesh_standing_release` — au lieu d'en dupliquer
+-- la logique : les corps PL/pgSQL ne sont résolus qu'à l'exécution, l'ordre
+-- 0010 < 0011 est sans effet.
+--
+-- ÉCHÉANCES : la règle de 0011 s'applique (voir son en-tête). Toute fonction
+-- d'ici qui accorde une autorité (lancement, remplacement) suit le motif
+-- verrou → relecture et échéances → écriture, en instructions distinctes ;
+-- aucune échéance dans le WHERE d'une instruction qui prend un verrou (une
+-- condition d'heure n'y serait pas réévaluée après l'attente d'un verrou tenu
+-- sans modification de la ligne). Ordre des verrous : la ligne de l'action
+-- d'abord, puis celui de 0011 (grant → authentificateur → nonce → lignes
+-- écrites).
 
 create table if not exists actions (
     action_id        text primary key
@@ -92,7 +103,7 @@ create table if not exists actions (
     check (auth_kind is distinct from 'receipt'
            or (auth_receipt is not null and auth_approver is not null
                and auth_nonce is not null and auth_challenge is not null
-               and auth_expires_at is not null)),
+               and auth_authenticator_id is not null and auth_expires_at is not null)),
     check (auth_kind is distinct from 'standing' or auth_grant_id is not null),
     check (state <> 'proposed' or attempts = 0),
     check (replaces is null or (replace_receipt is not null and replace_approver is not null
@@ -259,61 +270,75 @@ create trigger action_events_append_only
 -- `p_digest` est l'empreinte recalculée par la porte depuis l'action ; elle
 -- doit être celle que le reçu a signée (vérifié en Python juste avant) et
 -- celle de la ligne. Résultat : 'ok' ou un code de refus (rien n'a changé).
--- L'échéance du reçu (`exp`, et `iat` à `p_skew` secondes près, la tolérance
--- d'horloge de la politique — receipts.DEFAULT_CLOCK_SKEW par défaut) est
--- revérifiée DANS la transaction, à l'heure réelle (`clock_timestamp()`, pas
--- `now()` qui date du début de la transaction), APRÈS l'acquisition des
--- verrous : un reçu échu entre la vérification Python et ce point ne lance
--- rien, tout est annulé (code 'expired' ou 'iat_future').
+--
+-- Motif de 0011 (en-tête « ÉCHÉANCES ») : verrou → relecture et échéances →
+-- écriture, en instructions DISTINCTES ; jamais d'échéance dans le WHERE
+-- d'une instruction qui prend un verrou.
+--   a. verrou de la ligne de l'action (`SELECT … FOR UPDATE`), puis
+--      relecture sous ce verrou : état, empreinte, autorisation liée ;
+--   b. reçu : `ameesh_receipt_consume` (authentificateur FOR SHARE → ⏱ exp
+--      et iat SIGNÉS, relus dans le reçu lié à la ligne → INSERT du nonce →
+--      ⏱) ; grant : `ameesh_standing_reserve` (grant FOR UPDATE →
+--      authentificateur FOR SHARE → ⏱ until → écriture → ⏱) ;
+--   c. écritures : transition `launched` (verrou a, déjà tenu), tentative ;
+--   ⏱ refait après la dernière écriture.
+-- ⏱ = `ameesh_receipt_deadlines`, à l'heure réelle (`clock_timestamp()`) ;
+-- `p_skew` : tolérance d'horloge sur iat (politique,
+-- receipts.DEFAULT_CLOCK_SKEW par défaut). Une échéance dépassée rend son code
+-- (`expired`, `iat_future`) et rien n'est écrit : nonce intact, aucune
+-- réservation, aucune tentative.
+-- Ordre des verrous : action, puis celui de 0011 (grant → authentificateur
+-- → nonce → lignes écrites) ; aucune fonction ne prend une action après l'un
+-- d'eux : pas de cycle d'attente.
 create or replace function ameesh_action_launch(
     p_action_id text, p_digest text, p_auth_kind text, p_nonce text, p_grant_id bigint,
-    p_by text, p_timeout double precision, p_skew double precision default 120)
+    p_by text, p_timeout double precision, p_skew integer default 120)
 returns table (result text, attempt integer, reservation bigint, detail text)
 language plpgsql as $$
 declare
     a actions%rowtype;
     v_code text := 'state';
+    v_attempt integer;
     v_reservation bigint;
+    v_exp bigint;
     v_iat bigint;
+    v_until timestamptz;
 begin
     begin
-        update actions
-           set state = 'launched',
-               attempts = actions.attempts + 1,
-               launched_at = now(),
-               launch_deadline = now() + make_interval(secs => greatest(p_timeout, 0)),
-               external_ref = null,
-               last_error = null,
-               last_actor = coalesce(p_by, ''),
-               last_note = 'lancée (tentative ' || (actions.attempts + 1) || ')'
-         where actions.action_id = p_action_id
-           and actions.state = 'approved'
-           and actions.digest = p_digest
-           and actions.auth_kind = p_auth_kind
-           and actions.auth_nonce is not distinct from p_nonce
-           and actions.auth_grant_id is not distinct from p_grant_id
-        returning * into a;
-        if not found then
+        -- a. verrou de l'action, puis relecture sous ce verrou
+        select * into a from actions where actions.action_id = p_action_id for update;
+        if not found or a.state <> 'approved' or a.digest <> p_digest
+           or a.auth_kind is distinct from p_auth_kind
+           or a.auth_nonce is distinct from p_nonce
+           or a.auth_grant_id is distinct from p_grant_id then
             return query select 'state'::text, null::integer, null::bigint,
                 'action absente, plus en approved, ou autorisation changée'::text;
             return;
         end if;
+        v_attempt := a.attempts + 1;
 
         if a.requires_receipt and a.auth_kind not in ('receipt', 'standing') then
             v_code := 'receipt_required';
             raise exception 'reçu ou grant requis';
         end if;
 
+        -- b. l'autorisation (0011) : verrous, échéances à l'heure réelle, écriture
         if a.auth_kind = 'receipt' then
+            v_code := 'revoked_authenticator';
+            if a.auth_authenticator_id is null then
+                raise exception 'reçu lié sans authentificateur : rien n''est lancé';
+            end if;
+            v_exp := (a.auth_receipt::jsonb #>> '{request,exp}')::bigint;
+            v_iat := (a.auth_receipt::jsonb #>> '{request,iat}')::bigint;
+            v_code := 'expired';
+            if v_exp is null or v_iat is null then
+                raise exception 'reçu lié sans échéances signées (exp, iat) : rien n''est lancé';
+            end if;
             v_code := 'replay';
-            insert into mesh_consumed_nonces (approver, nonce, consumed_by, challenge)
-            select a.auth_approver, a.auth_nonce,
-                   coalesce(p_by, 'porte') || ' (' || a.action_id || '#' || a.attempts || ')',
-                   a.auth_challenge
-             where exists (select 1 from authenticators x
-                            where x.id = a.auth_authenticator_id and x.revoked_at is null)
-            on conflict (approver, nonce) do nothing;
-            if not found then
+            if not ameesh_receipt_consume(
+                    a.auth_approver, a.auth_nonce,
+                    coalesce(p_by, 'porte') || ' (' || a.action_id || '#' || v_attempt || ')',
+                    a.auth_challenge, a.auth_authenticator_id, v_exp, v_iat, p_skew) then
                 if not exists (select 1 from mesh_consumed_nonces n
                                 where n.approver = a.auth_approver and n.nonce = a.auth_nonce) then
                     v_code := 'revoked_authenticator';
@@ -331,36 +356,45 @@ begin
                 raise exception 'le grant % ne couvre plus l''action (plafond, échéance, révocation)',
                     a.auth_grant_id;
             end if;
+            -- le grant reste verrouillé (FOR UPDATE de la réservation) : son
+            -- échéance, relue ici, est recontrôlée après les écritures
+            select s.valid_until into v_until from standing_approvals s
+             where s.id = a.auth_grant_id;
         end if;
+
+        -- c. écritures (la ligne de l'action est verrouillée depuis a)
+        v_code := 'state';
+        update actions
+           set state = 'launched',
+               attempts = v_attempt,
+               launched_at = clock_timestamp(),
+               launch_deadline = clock_timestamp() + make_interval(secs => greatest(p_timeout, 0)),
+               external_ref = null,
+               last_error = null,
+               last_actor = coalesce(p_by, ''),
+               last_note = 'lancée (tentative ' || v_attempt || ')'
+         where actions.action_id = p_action_id
+        returning * into a;
 
         insert into action_attempts
             (action_id, attempt_no, auth_kind, receipt_id, receipt, approver, nonce, grant_id,
-             reservation_id, state, launched_by, deadline_at)
+             reservation_id, state, launched_by, launched_at, deadline_at)
         values
-            (a.action_id, a.attempts, a.auth_kind, a.auth_challenge, a.auth_receipt,
+            (a.action_id, v_attempt, a.auth_kind, a.auth_challenge, a.auth_receipt,
              a.auth_approver, a.auth_nonce, a.auth_grant_id, v_reservation, 'launched',
-             p_by, a.launch_deadline);
+             p_by, a.launched_at, a.launch_deadline);
 
-        -- verrous acquis (ligne de l'action, nonce, tentative) : échéance du reçu
-        -- à l'heure réelle ; échu → exception, tout le bloc est annulé
-        if a.auth_kind = 'receipt' then
-            v_code := 'expired';
-            if a.auth_expires_at is null or a.auth_expires_at <= clock_timestamp() then
-                raise exception 'reçu expiré (échéance %) : rien n''est lancé', a.auth_expires_at;
-            end if;
-            v_code := 'iat_future';
-            v_iat := (a.auth_receipt::jsonb #>> '{request,iat}')::bigint;
-            if v_iat is null or to_timestamp(v_iat) > clock_timestamp()
-                    + make_interval(secs => greatest(coalesce(p_skew, 0), 0)) then
-                raise exception 'iat du reçu dans le futur : rien n''est lancé';
-            end if;
-        end if;
+        -- ⏱ les écritures ont pu attendre : un dépassement annule tout
+        perform ameesh_receipt_deadlines(format('lancement de %s#%s', a.action_id, v_attempt),
+                                         v_exp, v_iat, p_skew, v_until);
     exception
         when raise_exception or unique_violation then
+            -- un refus d'échéance (0011) porte son propre code : expired, iat_future
+            v_code := coalesce(substring(sqlerrm from '^ameesh_echeance \[([a-z_]+)\]'), v_code);
             return query select v_code, null::integer, null::bigint, sqlerrm::text;
             return;
     end;
-    return query select 'ok'::text, a.attempts, v_reservation, null::text;
+    return query select 'ok'::text, v_attempt, v_reservation, null::text;
 end
 $$;
 
@@ -369,11 +403,16 @@ $$;
 -- après redémarrage), unknown → confirmed | failed (réconciliation).
 -- Une réservation de grant n'est libérée que sur un échec CERTAIN (failed).
 -- `p_stale_after` (reprise) : n'agit que si l'échéance du lancement est
--- dépassée d'au moins ce délai ; NULL = sans condition d'échéance.
+-- dépassée d'au moins ce délai, à l'heure réelle ; NULL = sans condition
+-- d'échéance.
 -- Transition conditionnelle sur l'action ET sur la tentative : action en
 -- `p_from` à la tentative `p_attempt`, tentative `p_attempt` en `p_from`.
 -- Un état déjà tranché (réconciliation, nouvelle tentative, humain) n'est
 -- jamais écrasé : 'state', rien n'a changé.
+-- Motif de 0011 : verrou de l'action (`SELECT … FOR UPDATE`), puis relecture
+-- et condition d'échéance sous ce verrou, puis écritures — aucune condition
+-- d'heure dans le WHERE qui verrouille. Verrous : action → tentative → grant
+-- (libération) : même ordre que le lancement.
 -- --------------------------------------------------------------------------
 create or replace function ameesh_action_settle(
     p_action_id text, p_attempt integer, p_from text, p_to text, p_external_ref text,
@@ -390,6 +429,22 @@ begin
         return query select 'invalid'::text, null::bigint, 'issue invalide'::text;
         return;
     end if;
+    -- a. verrou de l'action, puis relecture sous ce verrou
+    select * into a from actions where actions.action_id = p_action_id for update;
+    if not found or a.state <> p_from or a.attempts <> p_attempt then
+        return query select 'state'::text, null::bigint,
+            'action absente, déjà réglée, ou tentative différente'::text;
+        return;
+    end if;
+    -- échéance du lancement (reprise), à l'heure réelle, après le verrou
+    if p_stale_after is not null
+       and not coalesce(a.launch_deadline + make_interval(secs => p_stale_after)
+                        < clock_timestamp(), false) then
+        return query select 'state'::text, null::bigint,
+            'échéance du lancement non atteinte'::text;
+        return;
+    end if;
+    -- b. écritures
     update actions
        set state = p_to,
            finished_at = case when p_to in ('confirmed', 'failed') then now() else null end,
@@ -397,17 +452,7 @@ begin
            last_error = p_error,
            last_actor = coalesce(p_by, ''),
            last_note = coalesce(p_note, '')
-     where actions.action_id = p_action_id
-       and actions.state = p_from
-       and actions.attempts = p_attempt
-       and (p_stale_after is null
-            or actions.launch_deadline + make_interval(secs => p_stale_after) < now())
-    returning * into a;
-    if not found then
-        return query select 'state'::text, null::bigint,
-            'action absente, déjà réglée, ou tentative différente'::text;
-        return;
-    end if;
+     where actions.action_id = p_action_id;
     update action_attempts t
        set state = p_to,
            external_ref = coalesce(p_external_ref, t.external_ref),
@@ -433,55 +478,51 @@ $$;
 -- --------------------------------------------------------------------------
 -- remplacement : une décision humaine signée qui ASSUME le doublon crée une
 -- nouvelle action (nouvel action_id, replaces = l'ancienne) ; consommation du
--- nonce, liaison et création en une transaction. L'échéance de la décision
--- (`exp` et `iat` du reçu `p_receipt`, tolérance `p_skew`) est contrôlée
--- DANS cette transaction, à l'heure réelle, après l'acquisition des verrous :
--- échue → rien n'est créé, le nonce reste intact (code 'expired').
+-- nonce, liaison et création en une transaction.
+-- Motif de 0011 : a. verrou de l'action remplacée (`SELECT … FOR UPDATE`),
+-- relecture sous ce verrou (unknown, pas encore remplacée, même empreinte) ;
+-- b. consommation par `ameesh_receipt_consume` (authentificateur FOR SHARE →
+-- ⏱ exp et iat SIGNÉS de la décision `p_receipt`, tolérance `p_skew` →
+-- INSERT du nonce → ⏱) ; c. création de la nouvelle action, liaison de
+-- l'ancienne ; ⏱ refait après ces écritures. Décision échue → code
+-- 'expired' (ou 'iat_future'), rien n'est créé, le nonce reste intact.
 -- --------------------------------------------------------------------------
 create or replace function ameesh_action_replace(
     p_old text, p_old_digest text, p_new text, p_new_digest text, p_receipt text,
     p_approver text, p_nonce text, p_challenge text, p_authenticator_id bigint, p_by text,
-    p_skew double precision default 120)
+    p_skew integer default 120)
 returns table (result text, detail text)
 language plpgsql as $$
 declare
+    o actions%rowtype;
     v_code text := 'state';
-    v_iat bigint;
     v_exp bigint;
+    v_iat bigint;
 begin
     begin
-        insert into actions
-            (action_id, project, work_item, proposed_by, connector, operation, target, args,
-             class, amount, currency, policy_version, digest, dedupe, requires_receipt,
-             approvers, replaces, replace_receipt, replace_approver, replace_nonce,
-             last_actor, last_note)
-        select p_new, o.project, o.work_item, p_approver, o.connector, o.operation, o.target,
-               o.args, o.class, o.amount, o.currency, o.policy_version, p_new_digest, o.dedupe,
-               o.requires_receipt, o.approvers, o.action_id, p_receipt, p_approver, p_nonce,
-               coalesce(p_by, ''), 'remplace ' || o.action_id || ' (doublon assumé par '
-                                   || p_approver || ')'
-          from actions o
-         where o.action_id = p_old and o.state = 'unknown' and o.replaced_by is null
-           and o.digest = p_old_digest;
-        if not found then
+        -- a. verrou de l'action remplacée, puis relecture sous ce verrou
+        select * into o from actions where actions.action_id = p_old for update;
+        if not found or o.state <> 'unknown' or o.replaced_by is not null
+           or o.digest <> p_old_digest then
             raise exception 'action % absente, plus en unknown, ou déjà remplacée', p_old;
         end if;
-        update actions
-           set replaced_by = p_new,
-               last_actor = coalesce(p_by, ''),
-               last_note = 'remplacée par ' || p_new || ' (doublon assumé par ' || p_approver || ')'
-         where action_id = p_old and state = 'unknown' and replaced_by is null;
-        if not found then
-            raise exception 'action % remplacée entre-temps', p_old;
+
+        -- b. la décision : authentificateur, échéances signées, nonce (0011)
+        v_code := 'revoked_authenticator';
+        if p_authenticator_id is null then
+            raise exception 'décision sans authentificateur : aucun remplacement';
+        end if;
+        v_exp := (p_receipt::jsonb #>> '{request,exp}')::bigint;
+        v_iat := (p_receipt::jsonb #>> '{request,iat}')::bigint;
+        v_code := 'expired';
+        if v_exp is null or v_iat is null then
+            raise exception 'décision sans échéances signées (exp, iat) : aucun remplacement';
         end if;
         v_code := 'replay';
-        insert into mesh_consumed_nonces (approver, nonce, consumed_by, challenge)
-        select p_approver, p_nonce,
-               coalesce(p_by, 'porte') || ' (remplacement de ' || p_old || ')', p_challenge
-         where exists (select 1 from authenticators x
-                        where x.id = p_authenticator_id and x.revoked_at is null)
-        on conflict (approver, nonce) do nothing;
-        if not found then
+        if not ameesh_receipt_consume(
+                p_approver, p_nonce,
+                coalesce(p_by, 'porte') || ' (remplacement de ' || p_old || ')',
+                p_challenge, p_authenticator_id, v_exp, v_iat, p_skew) then
             if not exists (select 1 from mesh_consumed_nonces n
                             where n.approver = p_approver and n.nonce = p_nonce) then
                 v_code := 'revoked_authenticator';
@@ -490,22 +531,32 @@ begin
             raise exception 'nonce déjà consommé';
         end if;
 
-        -- verrous acquis (ligne remplacée, index d'unicité, nonce) : échéance de
-        -- la décision à l'heure réelle ; échue → exception, tout est annulé
-        v_code := 'expired';
-        v_iat := (p_receipt::jsonb #>> '{request,iat}')::bigint;
-        v_exp := (p_receipt::jsonb #>> '{request,exp}')::bigint;
-        if v_exp is null or to_timestamp(v_exp) <= clock_timestamp() then
-            raise exception 'décision échue (échéance %) : aucun remplacement',
-                to_timestamp(v_exp);
-        end if;
-        v_code := 'iat_future';
-        if v_iat is null or to_timestamp(v_iat) > clock_timestamp()
-                + make_interval(secs => greatest(coalesce(p_skew, 0), 0)) then
-            raise exception 'iat de la décision dans le futur : aucun remplacement';
-        end if;
+        -- c. écritures : la nouvelle action, puis la liaison de l'ancienne
+        v_code := 'state';
+        insert into actions
+            (action_id, project, work_item, proposed_by, connector, operation, target, args,
+             class, amount, currency, policy_version, digest, dedupe, requires_receipt,
+             approvers, replaces, replace_receipt, replace_approver, replace_nonce,
+             last_actor, last_note)
+        values
+            (p_new, o.project, o.work_item, p_approver, o.connector, o.operation, o.target,
+             o.args, o.class, o.amount, o.currency, o.policy_version, p_new_digest, o.dedupe,
+             o.requires_receipt, o.approvers, o.action_id, p_receipt, p_approver, p_nonce,
+             coalesce(p_by, ''), 'remplace ' || o.action_id || ' (doublon assumé par '
+                                 || p_approver || ')');
+        update actions
+           set replaced_by = p_new,
+               last_actor = coalesce(p_by, ''),
+               last_note = 'remplacée par ' || p_new || ' (doublon assumé par ' || p_approver || ')'
+         where actions.action_id = p_old;
+
+        -- ⏱ les écritures ont pu attendre : un dépassement annule tout
+        perform ameesh_receipt_deadlines(format('remplacement de %s', p_old),
+                                         v_exp, v_iat, p_skew, null);
     exception
         when raise_exception or unique_violation then
+            -- un refus d'échéance (0011) porte son propre code : expired, iat_future
+            v_code := coalesce(substring(sqlerrm from '^ameesh_echeance \[([a-z_]+)\]'), v_code);
             return query select v_code, sqlerrm::text;
             return;
     end;

@@ -17,6 +17,7 @@ import time
 import unittest
 
 from ameesh import actions, jcs, receipts, work
+from ameesh import db as db_mod
 from ameesh.actions import ActionError
 from ameesh.connectors import Outcome
 from ameesh.connectors import ConnectorError
@@ -25,6 +26,7 @@ from ameesh.connectors.shell_noop import ShellNoopConnector
 from ameesh.db import DbError
 
 from .support import FAKEBIN, PgTestCase
+from .test_receipts import HeldTransaction, Worker
 from .webauthn_soft import ORIGIN, RP_ID, SoftEd25519, SoftWebAuthn, make_request
 
 ALICE = "human:alice"
@@ -355,7 +357,8 @@ class ActionsCycleTest(ActionsBase):
         second = self.propose("send", args={"n": 2})
         receipt2 = self.receipt(second)
         self.approve(second, receipt2)
-        receipts.consume_nonce(self.db, ALICE, receipt2["request"]["nonce"], by="ailleurs")
+        receipts.consume_nonce(self.db, ALICE, receipt2["request"]["nonce"], by="ailleurs",
+                               exp=receipt2["request"]["exp"], iat=receipt2["request"]["iat"])
         self.refused(receipts.REPLAY, self.execute, second)
         self.assertEqual(self.get(second)["state"], "approved")
         self.assertEqual(len(self.noop.calls), 1)
@@ -801,6 +804,171 @@ class ActionsConcurrencyTest(ActionsBase):
         self.assertEqual(actions.execute(self.db, failed["action_id"], self.noop,
                                          by="porte")["state"], "failed")
         self.assertEqual(self.grant_consumed(grant), 30)
+
+
+# --------------------------------------------------------------------------
+# échéances recontrôlées APRÈS le dernier verrou (règle de 0011_receipts.sql)
+# --------------------------------------------------------------------------
+
+class ActionsDeadlineRaceTest(ActionsBase):
+    """Courses réelles : une autre connexion tient un verrou que le lancement
+    (ou le remplacement) doit prendre, par un simple `SELECT … FOR UPDATE` qui
+    laisse la ligne INTACTE — PostgreSQL ne réévalue alors pas le WHERE de
+    l'instruction qui attendait (EvalPlanQual) — et ne le relâche qu'APRÈS
+    l'échéance du reçu (ou du grant), heure de la base. L'appel a passé la
+    vérification Python avant l'échéance ; il doit pourtant être refusé :
+    rien n'est écrit (nonce intact, aucune tentative, aucune réservation) et
+    le connecteur n'est pas appelé. Témoin : relâché avant l'échéance, il part.
+    """
+
+    #: secondes entre la préparation de la course et l'échéance
+    MARGIN = 4
+    #: échéance des témoins : bien après la fin de l'attente
+    LATER = 60
+
+    def clock(self) -> float:
+        """L'heure réelle de la BASE (celle des contrôles SQL)."""
+        return float(self.db.query(
+            "SELECT extract(epoch from clock_timestamp())::float8 AS epoch")[0]["epoch"])
+
+    def lock_action(self, action: dict) -> str:
+        return ("SELECT action_id FROM actions WHERE action_id = %s FOR UPDATE;"
+                % db_mod.sql_literal(action["action_id"]))
+
+    def lock_authenticator(self, _action: dict) -> str:
+        ident = int(self.db.query(
+            "SELECT id FROM authenticators WHERE credential_id = %s AND revoked_at IS NULL",
+            (self.alice.credential_id,))[0]["id"])
+        return "SELECT id FROM authenticators WHERE id = %d FOR UPDATE;" % ident
+
+    def lock_grant(self, action: dict) -> str:
+        return ("SELECT id FROM standing_approvals WHERE id = %d FOR UPDATE;"
+                % int(self.get(action)["auth_grant_id"]))
+
+    def race(self, statements: str, call, deadline: float, *, expires: bool):
+        """`call` (sur sa connexion) attend le verrou tenu par `statements`,
+        ligne intacte ; relâché après l'échéance (`expires`) ou aussitôt."""
+        with HeldTransaction(self, statements) as holder:
+            worker = Worker(self, call)
+            self.assertTrue(holder.blocked(worker), "l'appel n'a pas attendu le verrou")
+            self.assertLess(self.clock(), deadline,
+                            "banc trop lent : l'échéance est passée avant l'attente")
+            if expires:
+                self.wait_for(lambda: self.clock() > deadline + 0.2, timeout=self.MARGIN + 10)
+                self.assertTrue(worker.is_alive(), "l'appel n'attendait plus le verrou")
+            holder.commit()
+            result = worker.result()
+        if not expires:
+            self.assertLess(self.clock(), deadline, "témoin : l'échéance est passée")
+        return result
+
+    def executing(self, action: dict):
+        def call(db):
+            try:
+                return actions.execute(db, action["action_id"], self.noop, policy=POLICY,
+                                       by="porte")
+            except ActionError as exc:
+                return exc
+        return call
+
+    def approved_with_receipt(self, deadline: float, **args) -> tuple[dict, dict]:
+        """Action approuvée par un reçu dont `exp` vaut `deadline`."""
+        action = self.propose("send", args=args)
+        iat = int(self.clock()) - 10
+        receipt = self.receipt(action, now=iat, ttl=int(deadline) - iat)
+        self.approve(action, receipt)
+        return action, receipt
+
+    def approved_with_grant(self, deadline: float, **args) -> tuple[dict, int]:
+        """Action couverte par un grant dont l'échéance (until) vaut `deadline`."""
+        grant = self.register_grant(max_amount=100)
+        self.db.query("UPDATE standing_approvals SET valid_until = to_timestamp(%s) "
+                      "WHERE id = %s RETURNING id", (deadline, grant))
+        action = self.propose("refund", amount=30, currency="EUR", args=args)
+        actions.approve(self.db, action["action_id"], None, standing=True, by="porte")
+        return action, grant
+
+    def assertNotLaunched(self, action: dict) -> None:
+        row = self.get(action)
+        self.assertEqual((row["state"], row["attempts"]), ("approved", 0))
+        self.assertEqual(actions.attempts(self.db, action["action_id"]), [])
+        self.assertIn("refused", self.event_names(action))
+
+    def test_lancement_refuse_si_le_recu_echoit_pendant_l_attente(self):
+        """Verrou de la ligne de l'action (pris en premier par le lancement) ou
+        de l'authentificateur signataire (FOR SHARE de la consommation), tenu
+        sans modification de la ligne, relâché après `exp` : refus `expired`."""
+        for label, lock in (("action : SELECT … FOR UPDATE", self.lock_action),
+                            ("authentificateur : SELECT … FOR UPDATE", self.lock_authenticator)):
+            with self.subTest(label):
+                deadline = int(self.clock()) + self.MARGIN
+                action, receipt = self.approved_with_receipt(deadline, lock=label)
+                out = self.race(lock(action), self.executing(action), deadline, expires=True)
+                self.assertIsInstance(out, ActionError, out)
+                self.assertEqual(out.code, receipts.EXPIRED, out.reason)
+                self.assertNotLaunched(action)
+                self.assertFalse(self.nonce_consumed(receipt))
+        self.assertEqual((self.noop.calls, self.files()), ([], []))
+
+    def test_lancement_refuse_si_le_grant_echoit_pendant_l_attente(self):
+        """Même course pour un grant : verrou de l'action ou du grant, tenu sans
+        modification, relâché après `until` : refus, aucune réservation."""
+        for label, lock in (("action : SELECT … FOR UPDATE", self.lock_action),
+                            ("grant : SELECT … FOR UPDATE", self.lock_grant)):
+            with self.subTest(label):
+                deadline = self.clock() + self.MARGIN
+                action, grant = self.approved_with_grant(deadline, lock=label)
+                out = self.race(lock(action), self.executing(action), deadline, expires=True)
+                self.assertIsInstance(out, ActionError, out)
+                self.assertEqual(out.code, receipts.EXPIRED, out.reason)
+                self.assertNotLaunched(action)
+                self.assertEqual(self.grant_consumed(grant), 0)
+                self.assertEqual(self.db.query(
+                    "SELECT count(*)::int AS n FROM standing_reservations WHERE grant_id = %s",
+                    (grant,))[0]["n"], 0)
+        self.assertEqual((self.noop.calls, self.files()), ([], []))
+
+    def test_remplacement_refuse_si_la_decision_echoit_pendant_l_attente(self):
+        """Décision « assumer le doublon » : verrou de l'action remplacée, tenu
+        sans modification, relâché après `exp` : aucune action créée, nonce
+        intact."""
+        lossy = self.gh(mode="drop")
+        action = self.propose("merge", connector=lossy, target=PR)
+        self.approve(action)
+        self.assertEqual(self.execute(action, lossy)["state"], "unknown")
+        deadline = int(self.clock()) + self.MARGIN
+        iat = int(self.clock()) - 10
+        decision = self.receipt(action, assume_duplicate=True, now=iat, ttl=deadline - iat)
+
+        def replacing(db):
+            try:
+                return actions.replace(db, action["action_id"], decision, policy=POLICY, by=ALICE)
+            except ActionError as exc:
+                return exc
+
+        out = self.race(self.lock_action(action), replacing, deadline, expires=True)
+        self.assertIsInstance(out, ActionError, out)
+        self.assertEqual(out.code, receipts.EXPIRED, out.reason)
+        self.assertFalse(self.nonce_consumed(decision))
+        self.assertEqual(self.db.query("SELECT count(*)::int AS n FROM actions")[0]["n"], 1)
+        old = self.get(action)
+        self.assertEqual((old["state"], old["replaced_by"]), ("unknown", None))
+
+    def test_temoins_verrou_relache_avant_l_echeance(self):
+        """Les mêmes attentes, terminées avant l'échéance : le lancement part."""
+        deadline = int(self.clock()) + self.LATER
+        cases = [("reçu, " + label, lock, self.approved_with_receipt)
+                 for label, lock in (("action", self.lock_action),
+                                     ("authentificateur", self.lock_authenticator))]
+        cases += [("grant, " + label, lock, self.approved_with_grant)
+                  for label, lock in (("action", self.lock_action), ("grant", self.lock_grant))]
+        for label, lock, prepare in cases:
+            with self.subTest(label):
+                action, _auth = prepare(deadline, lock=label)
+                out = self.race(lock(action), self.executing(action), deadline, expires=False)
+                self.assertNotIsInstance(out, ActionError, out)
+                self.assertEqual((out["state"], out["attempt"]), ("confirmed", 1))
+        self.assertEqual(len(self.noop.calls), len(cases))
 
 
 # --------------------------------------------------------------------------
