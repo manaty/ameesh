@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# ameesh : la commande du mesh depuis le dépôt (agent-mail/agent-runner restent des alias).
+set -euo pipefail
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+export PYTHONPATH="$here/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "${AGENT_MESH_PYTHON:-python3}" -m agent_mesh.mesh_cli "$@"

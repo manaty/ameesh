@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Intégration continue d'ameesh : la suite complète sur un vrai Postgres 17,
+# avec les deux pilotes de base (psql et psycopg). Aucun secret n'est utilisé :
+# la base de service n'existe que le temps du job.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        driver: [psql, psycopg]
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ameesh
+          POSTGRES_PASSWORD: ameesh-ci
+          POSTGRES_DB: ameesh
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ameesh"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      AMEESH_TEST_DSN: postgresql://ameesh@127.0.0.1:5432/ameesh
+      PGPASSWORD: ameesh-ci
+      AMEESH_REQUIRE_DB: "1"
+      AMEESH_DRIVER: ${{ matrix.driver }}
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: client psql
+        run: sudo apt-get update -q && sudo apt-get install -y -q postgresql-client
+      - name: dépendances facultatives (pilote psycopg)
+        if: matrix.driver == 'psycopg'
+        run: python -m pip install 'psycopg[binary]>=3.1' 'cryptography>=41'
+      - name: identité git des tests (dépôts temporaires)
+        run: |
+          git config --global user.name "ameesh ci"
+          git config --global user.email "ci@ameesh.invalid"
+          git config --global init.defaultBranch main
+      - name: suite complète
+        run: python -m unittest discover -s tests -t . -v

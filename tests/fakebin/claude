@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Faux harnais "claude" du banc de test — n'appelle jamais Claude Code.
+
+Émet le même flux JSONL que `claude -p --output-format stream-json`, journalise
+son argv dans $AMEESH_TEST_LOG, et obéit à deux variables de banc :
+AMEESH_TEST_SLEEP (secondes de sommeil) et AMEESH_TEST_EXIT (code).
+"""
+import json
+import os
+import signal
+import sys
+import time
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    log = os.environ.get("AMEESH_TEST_LOG")
+    if log:
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "harness": "claude", "argv": args,
+                "env": {k: os.environ.get(k) for k in (
+                    "AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
+                    "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
+                    "AMEESH_HOST", "AMEESH_SCHEMA")},
+            }) + "\n")
+    if os.environ.get("AMEESH_TEST_SLEEP"):
+        time.sleep(float(os.environ["AMEESH_TEST_SLEEP"]))
+    if os.environ.get("AMEESH_TEST_KILL_SELF"):
+        os.kill(os.getpid(), signal.SIGKILL)
+    session = "claude-sess-1"
+    if "--resume" in args:
+        session = args[args.index("--resume") + 1]
+    print(json.dumps({"type": "system", "subtype": "init", "session_id": session,
+                      "cwd": os.getcwd()}), flush=True)
+    print(json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "bonjour du faux claude (session %s)" % session}]}}), flush=True)
+    print(json.dumps({"type": "result", "subtype": "success", "result": "fini",
+                      "total_cost_usd": 0.0125, "session_id": session}), flush=True)
+    return int(os.environ.get("AMEESH_TEST_EXIT", "0"))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

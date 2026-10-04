@@ -1,0 +1,1771 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Le canon OKF : fiches Agent, Host, Placement, Member ; validation (C2, C3).
+
+Spec §4. ameesh ne lit que le **frontmatter** des fichiers `.md` d'un bundle
+OKF (hors `index.md` et `log.md`) et n'écrit jamais dans le canon.
+
+Source approuvée (§4.1) : le canon est lu **par les objets git, à la révision
+fusionnée de la branche canonique** — `AMEESH_CANON_REF` si posé, sinon le
+`ref` du membre racine dans `federation.yaml` (`origin/<ref>`), sinon
+`origin/main`. Un arbre de travail modifié ou un commit local non poussé n'est
+jamais pris en compte (seulement signalé). Un dossier qui n'est pas un dépôt
+git n'est lu qu'avec `AMEESH_CANON_UNTRUSTED=1` (tests, prototypes), et chaque
+constat le signale.
+
+Ce module dit ce qui est LU. Ce qui FAIT FOI pour le registre des
+authentificateurs (§8.2) n'est jamais tiré du commit lu (son propre
+manifeste pourrait s'autoriser) : voir `canon_sync.sync_authenticators`.
+
+Fédération : si `federation.yaml` est présent à la racine, ses membres
+présents localement (`workspace_path`, relatif au dossier de travail commun,
+comme le validateur OKF Federation) sont lus aussi, chacun à `origin/<ref>`
+de son propre dépôt. Un membre absent est signalé, jamais deviné.
+
+YAML : PyYAML n'est pas une dépendance. Si `yaml` est importable, il est
+utilisé (`safe_load`, clés en double refusées) ; sinon un lecteur minimal
+couvre le sous-ensemble du profil (scalaires, chaînes entre guillemets,
+listes en ligne et à tirets, mappings imbriqués, mappings en ligne, ancres
+simples, blocs `|`/`>`).
+"""
+from __future__ import annotations
+
+import dataclasses
+import datetime as _dt
+import fnmatch
+import hashlib
+import os
+import re
+import subprocess
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Any, Iterable, Mapping
+
+from .config import HARNESSES, NAME_RE
+
+try:  # facultatif : jamais requis
+    import yaml as _yaml  # type: ignore
+except Exception:  # pragma: no cover - dépend de l'environnement
+    _yaml = None
+
+PROFILE_TYPES = ("Agent", "Host", "Placement", "Member")
+KNOWN_CAPABILITIES = ("read", "report-drift", "propose")
+#: R8 : l'autorité de décision est réservée aux humains
+FORBIDDEN_CAPABILITIES = ("approve",)
+EPHEMERAL_CAPABILITIES = ("read", "propose")
+SKIPPED_FILES = ("index.md", "log.md")
+DEFAULT_REMOTE = "origin"
+DEFAULT_BRANCH = "main"
+FRONTMATTER_MAX = 256 * 1024
+GIT_TIMEOUT = 60.0
+FETCH_TIMEOUT = 180.0
+
+ERROR = "error"
+WARNING = "warning"
+
+
+class CanonError(ValueError):
+    """Canon introuvable ou illisible (la CLI l'affiche, sans trace)."""
+
+
+class YamlError(ValueError):
+    pass
+
+
+class _Incomplete(YamlError):
+    """Flux ou chaîne non terminés sur la ligne : la suite est peut-être dessous."""
+
+
+# ==========================================================================
+# YAML : PyYAML si présent, sinon lecteur minimal
+# ==========================================================================
+
+def _normalize(value: Any, memo: dict | None = None) -> Any:
+    """Dates → texte ISO, récursivement : les deux lecteurs rendent la même chose.
+
+    Les objets partagés par des alias restent partagés (mémo par identité) :
+    une chaîne d'alias ne se déplie pas en une structure exponentielle.
+    """
+    if isinstance(value, (_dt.datetime, _dt.date)):
+        return value.isoformat()
+    if not isinstance(value, (dict, list)):
+        return value
+    memo = {} if memo is None else memo
+    if id(value) in memo:
+        return memo[id(value)]
+    if isinstance(value, dict):
+        out: Any = {}
+        memo[id(value)] = out
+        for k, v in value.items():
+            out[_normalize(k, memo) if not isinstance(k, str) else k] = _normalize(v, memo)
+        return out
+    out = []
+    memo[id(value)] = out
+    out.extend(_normalize(v, memo) for v in value)
+    return out
+
+
+if _yaml is not None:
+    class _StrictLoader(_yaml.SafeLoader):  # type: ignore[misc,name-defined]
+        """SafeLoader qui refuse les clés en double (deux `responsible:` = ambigu)."""
+
+    def _strict_mapping(loader, node, deep=False):
+        seen = set()
+        for key_node, _value in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            try:
+                if key in seen:
+                    raise YamlError("ligne %d : clé en double %r"
+                                    % (key_node.start_mark.line + 1, key))
+                seen.add(key)
+            except TypeError:
+                raise YamlError("ligne %d : clé non scalaire" % (key_node.start_mark.line + 1))
+        return loader.construct_mapping(node, deep=deep)
+
+    _StrictLoader.add_constructor(
+        _yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _strict_mapping)
+
+
+def load_yaml(text: str, *, use_pyyaml: bool | None = None) -> Any:
+    """Document YAML → valeurs Python. `use_pyyaml=False` force le lecteur minimal."""
+    if use_pyyaml is None:
+        use_pyyaml = _yaml is not None
+    try:
+        if use_pyyaml:
+            if _yaml is None:
+                raise YamlError("PyYAML indisponible")
+            try:
+                return _normalize(_yaml.load(text, Loader=_StrictLoader))  # noqa: S506 (SafeLoader)
+            except _yaml.YAMLError as exc:
+                raise YamlError(" ".join(str(exc).split())) from exc
+        return _MiniYaml(text).parse()
+    except RecursionError as exc:
+        raise YamlError("imbrication trop profonde") from exc
+
+
+_INT_RE = re.compile(r"^[-+]?(0|[1-9][0-9]*)$")
+#: YAML 1.1, comme PyYAML : un point est requis (`1e12` reste un texte)
+_FLOAT_RE = re.compile(r"^[-+]?(\d+\.\d*|\.\d+)([eE][-+]\d+)?$")
+_BLOCK_RE = re.compile(r"^[|>][-+]?[1-9]?$")
+_ANCHOR_RE = re.compile(r"^&([^\s\[\]{},]+)(?:\s+(.*))?$")
+_TRUE = ("true", "True", "TRUE", "yes", "Yes", "YES", "on", "On", "ON")
+_FALSE = ("false", "False", "FALSE", "no", "No", "NO", "off", "Off", "OFF")
+_NULL = ("", "~", "null", "Null", "NULL")
+_ESCAPES = {"n": "\n", "t": "\t", '"': '"', "\\": "\\", "/": "/", "0": "\0",
+            "r": "\r", " ": " ", "a": "\a", "b": "\b", "e": "\x1b", "f": "\f",
+            "v": "\v", "N": "\x85", "_": "\xa0"}
+
+
+def _plain(text: str) -> Any:
+    text = text.strip()
+    if text in _NULL:
+        return None
+    if text in _TRUE:
+        return True
+    if text in _FALSE:
+        return False
+    if _INT_RE.match(text):
+        return int(text)
+    if _FLOAT_RE.match(text):
+        return float(text)
+    if text.startswith(("!", "%", "@", "`")):
+        raise YamlError("valeur non prise en charge : %r" % text[:40])
+    return text
+
+
+def _quote_starts(text: str, i: int) -> bool:
+    return text[i] in "'\"" and (i == 0 or text[i - 1] in " \t[{,")
+
+
+def _strip_comment(text: str) -> str:
+    """Retire un commentaire `# …` hors guillemets."""
+    quote = None
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if quote == "'":
+            if c == "'":
+                if text[i + 1:i + 2] == "'":
+                    i += 2
+                    continue
+                quote = None
+        elif quote == '"':
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                quote = None
+        elif c == "#" and (i == 0 or text[i - 1] in " \t"):
+            return text[:i]
+        elif _quote_starts(text, i):
+            quote = c
+        i += 1
+    return text
+
+
+def _split_key(text: str) -> tuple[str, str] | None:
+    """`clé: valeur` → (clé brute, valeur brute), hors guillemets et crochets."""
+    if not text or text[0] in "[{":
+        return None
+    quote = None
+    depth = 0
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if quote == "'":
+            if c == "'":
+                if text[i + 1:i + 2] == "'":
+                    i += 2
+                    continue
+                quote = None
+        elif quote == '"':
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                quote = None
+        elif _quote_starts(text, i):
+            quote = c
+        elif c in "[{":
+            depth += 1
+        elif c in "]}":
+            depth -= 1
+        elif c == ":" and depth == 0 and (i + 1 == len(text) or text[i + 1] in " \t"):
+            return text[:i].strip(), text[i + 1:].strip()
+        i += 1
+    return None
+
+
+def _is_item(text: str) -> bool:
+    return text == "-" or text.startswith("- ")
+
+
+def _quoted(text: str, i: int) -> tuple[str, int]:
+    """Chaîne entre guillemets à la position i → (valeur, position après)."""
+    quote = text[i]
+    i += 1
+    out: list[str] = []
+    while i < len(text):
+        c = text[i]
+        if quote == "'":
+            if c == "'":
+                if text[i + 1:i + 2] == "'":
+                    out.append("'")
+                    i += 2
+                    continue
+                return "".join(out), i + 1
+            out.append(c)
+            i += 1
+            continue
+        if c == "\\":
+            nxt = text[i + 1:i + 2]
+            if nxt in _ESCAPES:
+                out.append(_ESCAPES[nxt])
+                i += 2
+                continue
+            width = {"x": 2, "u": 4, "U": 8}.get(nxt)
+            if width:
+                digits = text[i + 2:i + 2 + width]
+                if len(digits) == width and all(d in "0123456789abcdefABCDEF" for d in digits):
+                    out.append(chr(int(digits, 16)))
+                    i += 2 + width
+                    continue
+            raise YamlError("échappement inconnu : \\%s" % nxt)
+        if c == '"':
+            return "".join(out), i + 1
+        out.append(c)
+        i += 1
+    raise _Incomplete("chaîne non terminée")
+
+
+class _Flow:
+    """Collections en ligne : `[a, "b, c"]`, `{ by: x, at: y }`."""
+
+    def __init__(self, text: str, anchors: dict):
+        self.s = text
+        self.i = 0
+        self.anchors = anchors
+
+    def parse(self) -> Any:
+        value = self.value()
+        self.ws()
+        if self.i != len(self.s):
+            raise YamlError("contenu après une collection en ligne : %r" % self.s[self.i:][:40])
+        return value
+
+    def ws(self) -> None:
+        while self.i < len(self.s) and self.s[self.i] in " \t":
+            self.i += 1
+
+    def peek(self) -> str:
+        if self.i >= len(self.s):
+            raise _Incomplete("collection en ligne non terminée")
+        return self.s[self.i]
+
+    def value(self, key: bool = False) -> Any:
+        self.ws()
+        c = self.peek()
+        if c == "[":
+            return self.seq()
+        if c == "{":
+            return self.map()
+        if c in "'\"":
+            text, self.i = _quoted(self.s, self.i)
+            return text
+        if c == "*":
+            match = re.match(r"\*([^\s\[\]{},]+)", self.s[self.i:])
+            if not match or match.group(1) not in self.anchors:
+                raise YamlError("alias inconnu")
+            self.i += match.end()
+            return self.anchors[match.group(1)]
+        start = self.i
+        while self.i < len(self.s):
+            c = self.s[self.i]
+            if c in ",]}":
+                break
+            if key and c == ":" and (self.i + 1 == len(self.s) or self.s[self.i + 1] in " \t,}"):
+                break
+            if c == "#" and self.s[self.i - 1:self.i] in (" ", "\t"):
+                raise YamlError("commentaire dans une collection en ligne")
+            self.i += 1
+        text = self.s[start:self.i].strip()
+        return text if key else _plain(text)
+
+    def seq(self) -> list:
+        self.i += 1
+        items: list = []
+        while True:
+            self.ws()
+            if self.peek() == "]":
+                self.i += 1
+                return items
+            items.append(self.value())
+            self.ws()
+            c = self.peek()
+            if c == ",":
+                self.i += 1
+            elif c != "]":
+                raise YamlError("« , » ou « ] » attendu dans une liste en ligne")
+
+    def map(self) -> dict:
+        self.i += 1
+        out: dict = {}
+        while True:
+            self.ws()
+            if self.peek() == "}":
+                self.i += 1
+                return out
+            key = self.value(key=True)
+            if not isinstance(key, str):
+                raise YamlError("clé non scalaire dans un mapping en ligne")
+            self.ws()
+            value = None
+            if self.peek() == ":":
+                self.i += 1
+                self.ws()
+                if self.peek() not in ",}":
+                    value = self.value()
+            if key in out:
+                raise YamlError("clé en double %r" % key)
+            out[key] = value
+            self.ws()
+            c = self.peek()
+            if c == ",":
+                self.i += 1
+            elif c != "}":
+                raise YamlError("« , » ou « } » attendu dans un mapping en ligne")
+
+
+@dataclass
+class _Line:
+    no: int
+    indent: int
+    text: str
+    raw: str
+
+
+class _MiniYaml:
+    """Lecteur YAML minimal, par indentation. Tout ce qu'il ne comprend pas est
+    une erreur explicite : il ne devine jamais."""
+
+    def __init__(self, text: str):
+        self.lines: list[_Line] = []
+        self.anchors: dict[str, Any] = {}
+        for no, raw in enumerate(text.splitlines(), 1):
+            stripped = raw.lstrip(" ")
+            indent = len(raw) - len(stripped)
+            if stripped.startswith("\t") and stripped.strip():
+                raise YamlError("ligne %d : tabulation dans l'indentation" % no)
+            content = _strip_comment(stripped).rstrip()
+            if indent == 0 and content in ("---", "..."):
+                if self.lines and any(line.text for line in self.lines):
+                    if content == "...":
+                        break
+                    raise YamlError("ligne %d : plusieurs documents" % no)
+                continue
+            self.lines.append(_Line(no, indent, content, raw))
+
+    def parse(self) -> Any:
+        i = self._skip(0)
+        if i >= len(self.lines):
+            return None
+        value, i = self._node(i)
+        i = self._skip(i)
+        if i < len(self.lines):
+            raise YamlError("ligne %d : contenu inattendu" % self.lines[i].no)
+        return value
+
+    def _skip(self, i: int) -> int:
+        while i < len(self.lines) and not self.lines[i].text:
+            i += 1
+        return i
+
+    def _node(self, i: int) -> tuple[Any, int]:
+        line = self.lines[i]
+        if _is_item(line.text):
+            return self._seq(i, line.indent)
+        if _split_key(line.text) is not None:
+            return self._map(i, line.indent)
+        return self._inline(i, line.text, line.indent - 1)
+
+    def _seq(self, i: int, indent: int) -> tuple[list, int]:
+        items: list = []
+        while True:
+            i = self._skip(i)
+            if i >= len(self.lines):
+                break
+            line = self.lines[i]
+            if line.indent < indent or (line.indent == indent and not _is_item(line.text)):
+                break
+            if line.indent > indent:
+                raise YamlError("ligne %d : indentation inattendue" % line.no)
+            rest = line.text[1:].lstrip(" ")
+            anchor = None
+            match = _ANCHOR_RE.match(rest)
+            if match:
+                anchor, rest = match.group(1), (match.group(2) or "")
+            if not rest:
+                j = self._skip(i + 1)
+                if j < len(self.lines) and self.lines[j].indent > indent:
+                    value, i = self._node(j)
+                else:
+                    value, i = None, i + 1
+            elif _is_item(rest) or _split_key(rest) is not None:
+                column = indent + (len(line.text) - len(rest))
+                self.lines[i] = _Line(line.no, column, rest, line.raw)
+                value, i = self._node(i)
+            else:
+                value, i = self._inline(i, rest, indent)
+            if anchor:
+                self.anchors[anchor] = value
+            items.append(value)
+        return items, i
+
+    def _map(self, i: int, indent: int) -> tuple[dict, int]:
+        out: dict = {}
+        while True:
+            i = self._skip(i)
+            if i >= len(self.lines):
+                break
+            line = self.lines[i]
+            if line.indent < indent:
+                break
+            if line.indent > indent:
+                raise YamlError("ligne %d : indentation inattendue" % line.no)
+            if _is_item(line.text):
+                raise YamlError("ligne %d : élément de liste inattendu" % line.no)
+            pair = _split_key(line.text)
+            if pair is None:
+                raise YamlError("ligne %d : « clé: valeur » attendu" % line.no)
+            raw_key, rest = pair
+            if raw_key and raw_key[0] in "'\"":
+                key, end = _quoted(raw_key, 0)
+                if raw_key[end:].strip():
+                    raise YamlError("ligne %d : clé illisible" % line.no)
+            else:
+                key = raw_key
+            if not key:
+                raise YamlError("ligne %d : clé vide" % line.no)
+            if key in out:
+                raise YamlError("ligne %d : clé en double %r" % (line.no, key))
+            anchor = None
+            match = _ANCHOR_RE.match(rest)
+            if match:
+                anchor, rest = match.group(1), (match.group(2) or "")
+            if not rest:
+                j = self._skip(i + 1)
+                nested = j < len(self.lines) and (
+                    self.lines[j].indent > indent
+                    or (self.lines[j].indent == indent and _is_item(self.lines[j].text)))
+                if nested:
+                    value, i = self._node(j)
+                else:
+                    value, i = None, i + 1
+            else:
+                value, i = self._inline(i, rest, indent)
+            if anchor:
+                self.anchors[anchor] = value
+            out[key] = value
+        return out, i
+
+    def _inline(self, i: int, text: str, parent: int) -> tuple[Any, int]:
+        """Valeur écrite sur la ligne i (et ses suites plus indentées)."""
+        line = self.lines[i]
+        if _BLOCK_RE.match(text):
+            return self._block(i, text, parent)
+        if text[0] in "[{":
+            j = i
+            while True:
+                try:
+                    return _Flow(text, self.anchors).parse(), j + 1
+                except _Incomplete:
+                    j += 1
+                    while j < len(self.lines) and not self.lines[j].text:
+                        j += 1
+                    if j >= len(self.lines) or self.lines[j].indent <= parent:
+                        raise YamlError("ligne %d : collection en ligne non terminée" % line.no)
+                    text = text + " " + self.lines[j].text
+        if text[0] in "'\"":
+            try:
+                value, end = _quoted(text, 0)
+            except _Incomplete:
+                raise YamlError("ligne %d : chaîne sur plusieurs lignes non prise en charge"
+                                % line.no)
+            if text[end:].strip():
+                raise YamlError("ligne %d : contenu après une chaîne" % line.no)
+            return value, i + 1
+        if text[0] == "*":
+            name = text[1:].strip()
+            if name not in self.anchors:
+                raise YamlError("ligne %d : alias inconnu %r" % (line.no, name))
+            return self.anchors[name], i + 1
+        # scalaire simple, éventuellement replié sur les lignes suivantes
+        parts = [text]
+        j = i + 1
+        while j < len(self.lines):
+            nxt = self.lines[j]
+            if not nxt.text:
+                j += 1
+                continue
+            if nxt.indent <= parent:
+                break
+            if _split_key(nxt.text) is not None or _is_item(nxt.text):
+                raise YamlError("ligne %d : structure inattendue après un scalaire" % nxt.no)
+            parts.append(nxt.text)
+            j += 1
+        if len(parts) > 1:
+            return " ".join(p.strip() for p in parts), j
+        return _plain(text), i + 1
+
+    def _block(self, i: int, header: str, parent: int) -> tuple[str, int]:
+        """Bloc littéral `|` ou replié `>` (indicateurs -/+ ; indentation automatique)."""
+        style, chomp = header[0], (header[1] if len(header) > 1 and header[1] in "-+" else "")
+        body: list[str] = []
+        j = i + 1
+        block_indent = None
+        while j < len(self.lines):
+            raw = self.lines[j].raw
+            if raw.strip():
+                indent = len(raw) - len(raw.lstrip(" "))
+                if indent <= parent:
+                    break
+                if block_indent is None:
+                    block_indent = indent
+                if indent < block_indent:
+                    break
+                body.append(raw[block_indent:])
+            else:
+                body.append("")
+            j += 1
+        while body and body[-1] == "" and chomp != "+":
+            body.pop()
+        if style == "|":
+            text = "\n".join(body)
+        else:
+            folded: list[str] = []
+            for item in body:
+                if item == "":
+                    folded.append("\n")
+                elif folded and not folded[-1].endswith("\n"):
+                    folded.append(" " + item)
+                else:
+                    folded.append(item)
+            text = "".join(folded)
+        if body and chomp != "-":
+            text += "\n"
+        return text, j
+
+
+def split_frontmatter(text: str) -> str | None:
+    """Le frontmatter YAML d'un fichier Markdown, ou None s'il n'y en a pas."""
+    if text.startswith("﻿"):
+        text = text[1:]
+    lines = text.split("\n")
+    if not lines or lines[0].rstrip("\r \t") != "---":
+        return None
+    for idx in range(1, len(lines)):
+        if lines[idx].rstrip("\r \t") in ("---", "..."):
+            return "\n".join(line.rstrip("\r") for line in lines[1:idx])
+    raise YamlError("frontmatter non fermé (ou plus grand que %d Kio)" % (FRONTMATTER_MAX // 1024))
+
+
+_TYPED_RE = re.compile(r"^type:\s*[\"']?(%s)[\"']?\s*(#.*)?$" % "|".join(PROFILE_TYPES), re.M)
+
+
+# ==========================================================================
+# Modèle
+# ==========================================================================
+
+@dataclass(frozen=True)
+class Finding:
+    """Un constat de validation, sur le modèle du validateur OKF Federation."""
+
+    code: str
+    severity: str           # error | warning
+    message: str
+    path: str = ""          # fichier (chemin dans le dépôt, ou dans le dossier)
+    member: str = ""        # membre de la fédération
+    agent: str = ""         # agent concerné (une erreur bloque cet agent)
+    host: str = ""          # hôte concerné (une erreur bloque ses agents)
+    untrusted: bool = False  # lu hors source approuvée
+
+    def to_dict(self) -> dict:
+        out = {"code": self.code, "severity": self.severity, "member": self.member,
+               "path": self.path, "message": self.message}
+        if self.agent:
+            out["agent"] = self.agent
+        if self.host:
+            out["host"] = self.host
+        if self.untrusted:
+            out["untrusted"] = True
+        return out
+
+    def where(self) -> str:
+        if self.member and self.path:
+            return "%s:%s" % (self.member, self.path)
+        return self.path or self.member or "canon"
+
+
+@dataclass
+class Source:
+    """D'où viennent les fiches d'un membre : un commit, ou des fichiers de travail."""
+
+    member: str
+    directory: str
+    mode: str = "git"       # git | untrusted
+    repo: str = ""
+    prefix: str = ""
+    rev: str = ""
+    commit: str = ""
+
+    def describe(self) -> str:
+        if self.mode == "git":
+            return "%s @ %s (%s)" % (self.member, self.commit[:12], self.rev)
+        return "%s : fichiers de travail NON APPROUVÉS (%s)" % (self.member, self.directory)
+
+    def to_dict(self) -> dict:
+        return {"member": self.member, "directory": self.directory, "mode": self.mode,
+                "repo": self.repo, "prefix": self.prefix, "rev": self.rev,
+                "commit": self.commit}
+
+
+@dataclass
+class Fiche:
+    type: str
+    title: str
+    member: str
+    path: str
+    ref: str                # canon_ref : `<membre>:<chemin>@<commit>`
+    data: dict              # frontmatter complet (clés inconnues conservées)
+    untrusted: bool = False
+
+
+@dataclass
+class Member:
+    title: str
+    roles: list[str] | None
+    authenticators: list | None
+    fiche: Fiche
+
+
+@dataclass
+class Agent:
+    title: str
+    responsible: str | None
+    team: str | None
+    capabilities: list[str] | None
+    harness: str | None
+    model: str | None
+    provider: str | None
+    credential_mode: str | None
+    budget_usd_per_day: float | None
+    tools: list[str] | None
+    reviewers: list[str] | None
+    fiche: Fiche
+
+
+@dataclass
+class HostPolicy:
+    harnesses: list[str] | None = None
+    providers: list[str] | None = None
+    models: list[str] | None = None
+    credential_modes: list[str] | None = None
+    max_agents: int | None = None
+
+
+@dataclass
+class Host:
+    title: str
+    responsible: str | None
+    policy: HostPolicy
+    fiche: Fiche
+
+
+@dataclass
+class Placement:
+    title: str
+    agent: str | None
+    host: str | None
+    credential_mode: str | None
+    cwd: str | None
+    fiche: Fiche
+
+
+@dataclass
+class Canon:
+    root: str
+    sources: list[Source] = field(default_factory=list)
+    members: list[Member] = field(default_factory=list)
+    agents: list[Agent] = field(default_factory=list)
+    hosts: list[Host] = field(default_factory=list)
+    placements: list[Placement] = field(default_factory=list)
+    federation: dict | None = None
+    #: constats de lecture (source, fédération, frontmatter, champs)
+    load_findings: list[Finding] = field(default_factory=list)
+    #: faux si la racine n'a pas pu être lue : aucune donnée n'est utilisable
+    readable: bool = False
+
+    # -- accès ---------------------------------------------------------------
+    @property
+    def untrusted(self) -> bool:
+        return any(source.mode != "git" for source in self.sources)
+
+    @property
+    def roles(self) -> dict:
+        roles = (self.federation or {}).get("roles")
+        return roles if isinstance(roles, dict) else {}
+
+    @property
+    def review_policies(self) -> dict:
+        policies = (self.federation or {}).get("review_policies")
+        return policies if isinstance(policies, dict) else {}
+
+    def loaded_members(self) -> set[str]:
+        return {source.member for source in self.sources}
+
+    def agent(self, name: str) -> Agent | None:
+        for agent in self.agents:
+            if agent.title == name:
+                return agent
+        return None
+
+    def host(self, name: str) -> Host | None:
+        for host in self.hosts:
+            if host.title == name:
+                return host
+        return None
+
+    def placements_of(self, agent: str) -> list[Placement]:
+        return [p for p in self.placements if p.agent == agent]
+
+    def resolve_human(self, responsible: str | None) -> str | None:
+        """`human:<id>` qui désigne un Member du canon → `human:<id>`, sinon None.
+
+        Strict : un identifiant sans préfixe, un `agent:`, ou un Member en
+        double ne résout pas (fail closed).
+        """
+        if not responsible or not responsible.startswith("human:"):
+            return None
+        ident = responsible[len("human:"):].strip()
+        matches = [m for m in self.members if m.title == ident]
+        if len(matches) != 1:
+            return None
+        if any(a.title == ident for a in self.agents):
+            return None  # un agent ne se déclare pas humain en prenant un nom de membre
+        return "human:%s" % ident
+
+    def source_label(self) -> str:
+        return "; ".join(source.describe() for source in self.sources) or "aucune source lue"
+
+    def to_dict(self) -> dict:
+        def fiche(f: Fiche) -> dict:
+            return {"member": f.member, "path": f.path, "canon_ref": f.ref}
+
+        return {
+            "root": self.root,
+            "readable": self.readable,
+            "untrusted": self.untrusted,
+            "sources": [s.to_dict() for s in self.sources],
+            "members": [dict(title=m.title, roles=m.roles, **fiche(m.fiche))
+                        for m in self.members],
+            "hosts": [dict(title=h.title, responsible=h.responsible,
+                           policy=h.policy.__dict__.copy(), **fiche(h.fiche))
+                      for h in self.hosts],
+            "agents": [dict(title=a.title, responsible=a.responsible, team=a.team,
+                            capabilities=a.capabilities, harness=a.harness, model=a.model,
+                            provider=a.provider, credential_mode=a.credential_mode,
+                            budget_usd_per_day=a.budget_usd_per_day, tools=a.tools,
+                            reviewers=a.reviewers,
+                            hosts=[p.host for p in self.placements_of(a.title)],
+                            **fiche(a.fiche))
+                       for a in self.agents],
+            "placements": [dict(title=p.title, agent=p.agent, host=p.host,
+                                credential_mode=p.credential_mode, cwd=p.cwd, **fiche(p.fiche))
+                           for p in self.placements],
+            "federation": {"id": (self.federation or {}).get("id"),
+                           "roles": self.roles, "review_policies": self.review_policies},
+        }
+
+
+# ==========================================================================
+# Politique d'hôte (C4) — réutilisée par L3 (`placement.evaluate`, dont le
+# verdict, écrit par `canon sync`, entre dans la condition de réclamation)
+# ==========================================================================
+
+def _get(obj: Any, key: str) -> Any:
+    if obj is None:
+        return None
+    if isinstance(obj, Mapping):
+        return obj.get(key)
+    return getattr(obj, key, None)
+
+
+def placement_violations(agent: Any, host: Any, placement: Any = None) -> list[str]:
+    """Raisons pour lesquelles ce placement viole la politique de l'hôte ([] = admis).
+
+    Accepte les objets du canon (`Agent`, `Host`, `Placement`) ou des mappings
+    (ligne du registre, dict de politique). Règles :
+
+    * une clé de politique **absente** admet tout ; une liste **vide** n'admet rien ;
+    * une valeur **non déclarée** par l'agent n'est pas admise quand l'hôte
+      restreint cette clé (fail closed) ;
+    * le mode d'identifiants est celui du placement, sinon celui de l'agent ;
+    * `models` accepte des motifs (`deepseek-*`).
+    """
+    policy = _get(host, "policy")
+    if policy is None:
+        return []
+    host_name = _get(host, "title") or _get(host, "name") or "?"
+    mode = _get(placement, "credential_mode") or _get(agent, "credential_mode")
+    checks = (
+        ("harnesses", "harnais", _get(agent, "harness"), False),
+        ("providers", "fournisseur", _get(agent, "provider"), False),
+        ("models", "modèle", _get(agent, "model"), True),
+        ("credential_modes", "mode d'identifiants", mode, False),
+    )
+    out: list[str] = []
+    for key, label, value, pattern in checks:
+        allowed = _get(policy, key)
+        if allowed is None:
+            continue
+        if isinstance(allowed, str):
+            allowed = [allowed]
+        allowed = [str(a) for a in allowed]
+        text = None if value is None or value == "" else str(value)
+        if text is not None and (
+                any(fnmatch.fnmatchcase(text, a) for a in allowed) if pattern
+                else text in allowed):
+            continue
+        out.append("%s %s non admis par l'hôte %s (admis : %s)" % (
+            label, text if text is not None else "non déclaré", host_name,
+            ", ".join(allowed) or "aucun"))
+    return out
+
+
+# ==========================================================================
+# git : lecture par les objets, jamais par l'arbre de travail
+# ==========================================================================
+
+#: variables qui redirigeraient git vers un autre dépôt, index ou objet
+_GIT_ENV_DROP = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE",
+    "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_REPLACE_REF_BASE",
+    "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+)
+
+
+class GitError(RuntimeError):
+    pass
+
+
+def _git_env() -> dict:
+    env = {k: v for k, v in os.environ.items()
+           if k not in _GIT_ENV_DROP and not k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_NO_REPLACE_OBJECTS="1",
+               LC_ALL="C")
+    return env
+
+
+def _git(repo: str, *args: str, stdin: bytes | None = None,
+         timeout: float = GIT_TIMEOUT) -> subprocess.CompletedProcess:
+    """git sans crochets, sans fsmonitor, sans objets de remplacement, sans pager."""
+    cmd = ["git", "--no-pager", "--no-replace-objects", "--literal-pathspecs",
+           "-c", "core.fsmonitor=false", "-c", "core.hooksPath=%s" % os.devnull,
+           *args]
+    try:
+        return subprocess.run(cmd, cwd=repo, input=stdin, capture_output=True,
+                              env=_git_env(), timeout=timeout, check=False)
+    except FileNotFoundError as exc:
+        raise GitError("git introuvable") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise GitError("git %s : délai dépassé" % args[0]) from exc
+    except OSError as exc:
+        # Dossier du dépôt inaccessible (permission refusée, n'est plus un
+        # dossier…) : le canon est illisible, jamais une exception qui
+        # empêcherait « canon sync » d’enregistrer l’état fermé.
+        raise GitError("git %s : %s" % (args[0], exc.strerror or exc)) from exc
+
+
+def _git_out(repo: str, *args: str) -> str | None:
+    proc = _git(repo, *args)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8", "replace").strip()
+
+
+def git_toplevel(directory: str) -> str | None:
+    """Racine du dépôt git qui contient `directory`, ou None."""
+    try:
+        out = _git_out(directory, "rev-parse", "--show-toplevel")
+    except GitError:
+        return None
+    return os.path.realpath(out) if out else None
+
+
+def git_commit(repo: str, rev: str) -> str | None:
+    if not rev or rev.startswith("-"):
+        return None
+    return _git_out(repo, "rev-parse", "--verify", "--quiet", "--end-of-options",
+                    rev + "^{commit}")
+
+
+_SHA_RE = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def git_contains(repo: str, ancestor: str, descendant: str) -> bool:
+    """`ancestor` (un SHA) est-il contenu dans l'historique de `descendant` (un
+    SHA) ? Faux si l'un des deux est inconnu de ce dépôt, ou en cas d'erreur
+    git : le doute ne prouve jamais l'appartenance."""
+    if not (_SHA_RE.fullmatch(ancestor or "") and _SHA_RE.fullmatch(descendant or "")):
+        return False
+    if ancestor == descendant:
+        return True
+    try:
+        proc = _git(repo, "merge-base", "--is-ancestor", ancestor, descendant)
+    except GitError:
+        return False
+    return proc.returncode == 0
+
+
+def _git_list(repo: str, commit: str, prefix: str) -> list[tuple[str, str]]:
+    """[(chemin dans le dépôt, sha du blob)] des fichiers ordinaires sous `prefix`."""
+    args = ["ls-tree", "-r", "-z", "--full-tree", commit]
+    if prefix:
+        args += ["--", prefix]
+    proc = _git(repo, *args)
+    if proc.returncode != 0:
+        raise GitError("git ls-tree : %s" % proc.stderr.decode("utf-8", "replace").strip())
+    out = []
+    for entry in proc.stdout.split(b"\0"):
+        if not entry:
+            continue
+        meta, _tab, path = entry.partition(b"\t")
+        mode, kind, sha = meta.decode().split(" ")
+        # ni lien symbolique (120000), ni sous-module (160000)
+        if kind == "blob" and mode in ("100644", "100755"):
+            out.append((path.decode("utf-8", "replace"), sha))
+    return out
+
+
+def _git_blobs(repo: str, shas: Iterable[str]) -> dict[str, bytes]:
+    shas = list(dict.fromkeys(shas))
+    if not shas:
+        return {}
+    proc = _git(repo, "cat-file", "--batch", stdin=("\n".join(shas) + "\n").encode())
+    if proc.returncode != 0:
+        raise GitError("git cat-file : %s" % proc.stderr.decode("utf-8", "replace").strip())
+    data = proc.stdout
+    out: dict[str, bytes] = {}
+    pos = 0
+    try:
+        for sha in shas:
+            end = data.index(b"\n", pos)
+            header = data[pos:end].decode().split(" ")
+            pos = end + 1
+            if len(header) < 3 or header[1] == "missing":
+                continue
+            size = int(header[2])
+            out[sha] = data[pos:pos + size]
+            pos += size + 1
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise GitError("git cat-file : sortie illisible (%s)" % exc) from exc
+    return out
+
+
+def _git_read(repo: str, commit: str, path: str) -> bytes | None:
+    proc = _git(repo, "cat-file", "blob", "%s:%s" % (commit, path))
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def git_read(repo: str, commit: str, path: str) -> bytes | None:
+    """Contenu de `path` au commit `commit` (objets git), ou None."""
+    if not _SHA_RE.fullmatch(commit or ""):
+        return None
+    try:
+        return _git_read(repo, commit, path)
+    except GitError:
+        return None
+
+
+def git_remotes(repo: str) -> list[str]:
+    try:
+        return (_git_out(repo, "remote") or "").split()
+    except GitError:
+        return []
+
+
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]*$")
+
+
+def remote_branch(repo: str, name: str) -> str | None:
+    """La branche de suivi distant que `name` désigne (`origin/main`), ou None.
+
+    `main` → `origin/main` ; `origin/main` (un dépôt distant connu) et
+    `refs/remotes/origin/main` → `origin/main` ; `refs/heads/main` →
+    `origin/main`. Un SHA, une expression de révision (`~`, `^`, `@{`, `..`)
+    ou un nom vide ne sont pas une branche : None. La résolution se fait
+    ensuite par `refs/remotes/<branche>`, jamais par un nom court qu'une
+    branche locale ou une étiquette homonyme pourrait masquer.
+    """
+    text = (name or "").strip()
+    if not text or _SHA_RE.fullmatch(text):
+        return None
+    if text.startswith("refs/remotes/"):
+        short = text[len("refs/remotes/"):]
+    elif text.startswith("refs/heads/"):
+        short = "%s/%s" % (DEFAULT_REMOTE, text[len("refs/heads/"):])
+    elif "/" in text and text.split("/", 1)[0] in git_remotes(repo):
+        short = text
+    else:
+        short = "%s/%s" % (DEFAULT_REMOTE, text)
+    if (not _BRANCH_RE.fullmatch(short) or ".." in short or "//" in short
+            or short.endswith(("/", ".lock", ".")) or "/" not in short):
+        return None
+    return short
+
+
+def _remote_of(repo: str, rev: str) -> str:
+    remotes = (_git_out(repo, "remote") or "").split()
+    head = rev.split("/", 1)[0]
+    return head if head in remotes else DEFAULT_REMOTE
+
+
+def _norm_url(url: str) -> str:
+    """URL de dépôt comparable : sans schéma, utilisateur, `.git` ni `/` final."""
+    text = url.strip()
+    scp = re.match(r"^[\w.-]+@([^:/]+):(.*)$", text)
+    if scp:
+        text = "%s/%s" % (scp.group(1), scp.group(2))
+    else:
+        text = re.sub(r"^[a-z][a-z0-9+.-]*://", "", text, flags=re.I)
+        text = re.sub(r"^[^@/]+@", "", text)
+    text = text.rstrip("/")
+    if text.endswith(".git"):
+        text = text[:-4]
+    return text.lower()
+
+
+def git_fetch(repo: str, remote: str) -> str:
+    """`git fetch` sans crochets ; renvoie '' ou le message d'erreur."""
+    try:
+        proc = _git(repo, "fetch", "--quiet", "--no-tags", "--", remote, timeout=FETCH_TIMEOUT)
+    except GitError as exc:
+        return str(exc)
+    if proc.returncode != 0:
+        return proc.stderr.decode("utf-8", "replace").strip() or "code %d" % proc.returncode
+    return ""
+
+
+# ==========================================================================
+# Lecture
+# ==========================================================================
+
+def _within(base: str, target: str) -> bool:
+    base = os.path.realpath(base)
+    target = os.path.realpath(target)
+    return target == base or target.startswith(base.rstrip(os.sep) + os.sep)
+
+
+def _relative_ok(path: str) -> bool:
+    if not isinstance(path, str) or not path or os.path.isabs(path):
+        return False
+    norm = os.path.normpath(path)
+    return norm != ".." and not norm.startswith(".." + os.sep)
+
+
+def _interesting(relpath: str) -> bool:
+    parts = relpath.replace(os.sep, "/").split("/")
+    if any(part.startswith(".") for part in parts):
+        return False
+    name = parts[-1]
+    return name.endswith(".md") and name not in SKIPPED_FILES
+
+
+class _Loader:
+    def __init__(self, root: str, *, ref: str, untrusted: bool, fetch: bool,
+                 use_pyyaml: bool | None):
+        self.root = os.path.abspath(os.path.expanduser(root))
+        self.ref = ref
+        self.allow_untrusted = untrusted
+        self.fetch = fetch
+        self.use_pyyaml = use_pyyaml
+        self.canon = Canon(root=self.root)
+        self.fetched: set[str] = set()
+        self.findings = self.canon.load_findings
+
+    def add(self, code: str, severity: str, message: str, **where: str) -> None:
+        self.findings.append(Finding(code, severity, message, **where))
+
+    # -- sources ---------------------------------------------------------------
+    def _git_source(self, member: str, directory: str, repo: str, rev: str,
+                    explicit: bool) -> Source | None:
+        if self.fetch and repo not in self.fetched:
+            self.fetched.add(repo)
+            error = git_fetch(repo, _remote_of(repo, rev))
+            if error:
+                self.add("canon-fetch-failed", WARNING,
+                         "git fetch a échoué (%s) : lecture de la dernière révision connue"
+                         % error.splitlines()[0][:200], member=member)
+        commit = git_commit(repo, rev)
+        if not commit:
+            self.add("canon-ref-missing", ERROR,
+                     "révision canonique %s introuvable dans %s (git fetch ? %s)"
+                     % (rev, repo, "AMEESH_CANON_REF" if explicit
+                        else "ou AMEESH_CANON_REF pour une autre branche"),
+                     member=member)
+            return None
+        prefix = os.path.relpath(os.path.realpath(directory), repo)
+        prefix = "" if prefix == "." else prefix.replace(os.sep, "/")
+        source = Source(member=member, directory=directory, mode="git", repo=repo,
+                        prefix=prefix, rev=rev, commit=commit)
+        self._local_state(source)
+        return source
+
+    def _local_state(self, source: Source) -> None:
+        """Signale (sans jamais en tenir compte) l'écart entre le clone et le canon."""
+        head = git_commit(source.repo, "HEAD")
+        if head and head != source.commit:
+            self.add("canon-local-divergence", WARNING,
+                     "le clone local (HEAD %s) diffère de %s (%s) : seul %s est lu"
+                     % (head[:12], source.rev, source.commit[:12], source.commit[:12]),
+                     member=source.member, path=source.prefix)
+        args = ["status", "--porcelain", "--untracked-files=normal", "--", source.prefix or "."]
+        proc = _git(source.repo, *args)
+        if proc.returncode == 0 and proc.stdout.strip():
+            self.add("canon-worktree-dirty", WARNING,
+                     "modifications locales non commitées sous %s : ignorées (seul %s est lu)"
+                     % (source.prefix or ".", source.commit[:12]),
+                     member=source.member, path=source.prefix)
+
+    def _fs_source(self, member: str, directory: str) -> Source | None:
+        if not self.allow_untrusted:
+            self.add("canon-untrusted-refused", ERROR,
+                     "%s n'est pas un dépôt git : canon non approuvé, refusé "
+                     "(AMEESH_CANON_UNTRUSTED=1 pour les tests et prototypes)" % directory,
+                     member=member)
+            return None
+        self.add("canon-untrusted", WARNING,
+                 "%s lu depuis les fichiers de travail : canon NON APPROUVÉ "
+                 "(AMEESH_CANON_UNTRUSTED=1)" % directory, member=member)
+        return Source(member=member, directory=directory, mode="untrusted")
+
+    def _source(self, member: str, directory: str, rev: str, explicit: bool,
+                same_repo_commit: tuple[str, str, str] | None = None) -> Source | None:
+        try:
+            repo = git_toplevel(directory)
+        except GitError:
+            repo = None
+        if repo is None:
+            return self._fs_source(member, directory)
+        if same_repo_commit and same_repo_commit[0] == repo:
+            # même dépôt que la racine : même instantané
+            prefix = os.path.relpath(os.path.realpath(directory), repo)
+            return Source(member=member, directory=directory, mode="git", repo=repo,
+                          prefix="" if prefix == "." else prefix.replace(os.sep, "/"),
+                          rev=same_repo_commit[1], commit=same_repo_commit[2])
+        try:
+            return self._git_source(member, directory, repo, rev, explicit)
+        except GitError as exc:
+            self.add("canon-git-error", ERROR, str(exc), member=member)
+            return None
+
+    def _check_repository(self, source: Source, entry: dict | None) -> None:
+        """Le dépôt lu est-il celui que le manifeste déclare ? (diagnostic)"""
+        declared = str((entry or {}).get("repository") or "")
+        if source.mode != "git" or not declared:
+            return
+        remote = source.rev.split("/", 1)[0] if "/" in source.rev else DEFAULT_REMOTE
+        actual = _git_out(source.repo, "remote", "get-url", "--", remote) or ""
+        if _norm_url(actual) != _norm_url(declared):
+            self.add("member-repository-mismatch", WARNING,
+                     "le dépôt %s de %s (%s) n'est pas celui du manifeste (%s)"
+                     % (remote, source.member, actual or "absent", declared),
+                     member=source.member)
+
+    def _read_manifest(self, source: Source) -> bytes | None:
+        if source.mode == "git":
+            path = (source.prefix + "/" if source.prefix else "") + "federation.yaml"
+            return _git_read(source.repo, source.commit, path)
+        path = os.path.join(source.directory, "federation.yaml")
+        if os.path.isfile(path) and not os.path.islink(path):
+            with open(path, "rb") as fh:
+                return fh.read(FRONTMATTER_MAX * 4)
+        return None
+
+    def _parse_manifest(self, raw: bytes, member: str) -> dict | None:
+        try:
+            manifest = load_yaml(raw.decode("utf-8"), use_pyyaml=self.use_pyyaml)
+        except (UnicodeDecodeError, YamlError) as exc:
+            self.add("federation-invalid", ERROR, "federation.yaml illisible : %s" % exc,
+                     member=member, path="federation.yaml")
+            return None
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("members", []), list):
+            self.add("federation-invalid", ERROR,
+                     "federation.yaml : mapping avec une liste `members` attendu",
+                     member=member, path="federation.yaml")
+            return None
+        return manifest
+
+    # -- chargement --------------------------------------------------------------
+    def _bootstrap_rev(self) -> str:
+        """Révision où lire le manifeste quand AMEESH_CANON_REF n'est pas posé."""
+        repo = git_toplevel(self.root)
+        default = "%s/%s" % (DEFAULT_REMOTE, DEFAULT_BRANCH)
+        if repo is None:
+            return default
+        if self.fetch and repo not in self.fetched:
+            self.fetched.add(repo)
+            error = git_fetch(repo, DEFAULT_REMOTE)
+            if error:
+                self.add("canon-fetch-failed", WARNING,
+                         "git fetch a échoué (%s) : lecture de la dernière révision connue"
+                         % error.splitlines()[0][:200], member="canon")
+        for rev in (default, "%s/HEAD" % DEFAULT_REMOTE):
+            if git_commit(repo, rev):
+                return rev
+        return default
+
+    def load(self) -> Canon:
+        if not os.path.isdir(self.root):
+            self.add("canon-missing", ERROR, "racine du canon introuvable : %s" % self.root)
+            return self.canon
+        explicit = bool(self.ref)
+        rev = self.ref or self._bootstrap_rev()
+        root = self._source("canon", self.root, rev, explicit)
+        if root is None:
+            return self.canon
+        manifest = None
+        raw = self._read_manifest(root)
+        if raw is not None:
+            manifest = self._parse_manifest(raw, root.member)
+        if manifest is not None:
+            root_id = str(manifest.get("root") or "canon")
+            root.member = root_id
+            root_entry = next((m for m in manifest["members"]
+                               if isinstance(m, dict) and str(m.get("id")) == root_id), None)
+            branch = str((root_entry or {}).get("ref") or "")
+            if (root.mode == "git" and not explicit and branch
+                    and "%s/%s" % (DEFAULT_REMOTE, branch) != root.rev):
+                # la branche canonique est celle du manifeste
+                rev = "%s/%s" % (DEFAULT_REMOTE, branch)
+                self.findings[:] = [f for f in self.findings
+                                    if f.code not in ("canon-local-divergence",
+                                                      "canon-worktree-dirty")]
+                root = self._source(root_id, self.root, rev, False)
+                if root is None:
+                    return self.canon
+                raw = self._read_manifest(root)
+                manifest = self._parse_manifest(raw, root_id) if raw is not None else None
+            self._check_repository(root, root_entry)
+        self.canon.federation = manifest
+        self.canon.sources.append(root)
+        if manifest is not None:
+            self._members(manifest, root)
+        self.canon.readable = True
+        self._read_fiches()
+        if self.canon.untrusted:
+            self.findings[:] = [dataclasses.replace(f, untrusted=True) for f in self.findings]
+        return self.canon
+
+    def _workspace(self, manifest: dict, root: Source) -> str:
+        """Dossier de travail commun : tel que workspace/<workspace_path>/<bundle> = racine."""
+        root_id = root.member
+        entry = next((m for m in manifest["members"]
+                      if isinstance(m, dict) and str(m.get("id")) == root_id), {}) or {}
+        rel = os.path.normpath(os.path.join(str(entry.get("workspace_path") or "."),
+                                            str(entry.get("bundle") or ".")))
+        base = os.path.realpath(self.root)
+        if rel == ".":
+            return base
+        parts = rel.split(os.sep)
+        if _relative_ok(rel) and base.split(os.sep)[-len(parts):] == parts:
+            return os.sep.join(base.split(os.sep)[:-len(parts)]) or os.sep
+        return os.path.dirname(base)
+
+    def _members(self, manifest: dict, root: Source) -> None:
+        workspace = self._workspace(manifest, root)
+        seen = {root.member}
+        anchor = (root.repo, root.rev, root.commit) if root.mode == "git" else None
+        for entry in manifest["members"]:
+            if not isinstance(entry, dict) or not entry.get("id"):
+                self.add("federation-invalid", ERROR, "membre sans `id` dans federation.yaml",
+                         member=root.member, path="federation.yaml")
+                continue
+            member = str(entry["id"])
+            if member in seen:
+                if member != root.member:
+                    self.add("federation-invalid", ERROR, "membre %s en double" % member,
+                             member=root.member, path="federation.yaml")
+                continue
+            seen.add(member)
+            hint = entry.get("workspace_path")
+            if not hint:
+                self.add("member-absent", WARNING,
+                         "membre %s sans workspace_path : non lu" % member, member=member)
+                continue
+            bundle = str(entry.get("bundle") or ".")
+            checkout = os.path.join(workspace, str(hint))
+            directory = os.path.normpath(os.path.join(checkout, bundle))
+            if (not _relative_ok(str(hint)) or not _relative_ok(bundle)
+                    or not _within(workspace, checkout) or not _within(checkout, directory)):
+                self.add("member-path-escape", ERROR,
+                         "membre %s : chemin hors du dossier de travail (%s/%s)"
+                         % (member, hint, bundle), member=member)
+                continue
+            if not os.path.isdir(directory):
+                self.add("member-absent", WARNING,
+                         "membre %s absent localement (%s) : non lu" % (member, directory),
+                         member=member)
+                continue
+            if os.path.realpath(directory) == os.path.realpath(self.root):
+                continue
+            branch = str(entry.get("ref") or DEFAULT_BRANCH)
+            source = self._source(member, directory, "%s/%s" % (DEFAULT_REMOTE, branch),
+                                  False, same_repo_commit=anchor)
+            if source is not None:
+                if source.repo != root.repo:
+                    self._check_repository(source, entry)
+                self.canon.sources.append(source)
+
+    # -- fiches ------------------------------------------------------------------
+    def _files(self, source: Source) -> list[tuple[str, bytes | None, str]]:
+        """[(chemin affiché, contenu, empreinte)] des .md de la source."""
+        others = [s for s in self.canon.sources if s is not source]
+        if source.mode == "git":
+            nested = [s.prefix for s in others if s.mode == "git" and s.repo == source.repo
+                      and s.prefix != source.prefix
+                      and (not source.prefix or s.prefix.startswith(source.prefix + "/"))]
+            entries = []
+            listed = _git_list(source.repo, source.commit, source.prefix)
+            if not listed:
+                self.add("canon-bundle-missing", ERROR,
+                         "%s absent de %s (%s) : rien à lire" % (
+                             source.prefix or "le bundle", source.rev, source.commit[:12]),
+                         member=source.member, path=source.prefix)
+            for path, sha in listed:
+                rel = path[len(source.prefix) + 1:] if source.prefix else path
+                if not _interesting(rel):
+                    continue
+                if any(path == n or path.startswith(n + "/") for n in nested):
+                    continue
+                entries.append((path, sha))
+            blobs = _git_blobs(source.repo, [sha for _p, sha in entries])
+            return [(path, blobs.get(sha), source.commit) for path, sha in entries]
+        nested_dirs = [os.path.realpath(s.directory) for s in others
+                       if _within(source.directory, s.directory)
+                       and os.path.realpath(s.directory) != os.path.realpath(source.directory)]
+        out = []
+        for current, dirs, files in os.walk(source.directory, followlinks=False):
+            dirs[:] = sorted(d for d in dirs if not d.startswith(".")
+                             and os.path.realpath(os.path.join(current, d)) not in nested_dirs)
+            for name in sorted(files):
+                full = os.path.join(current, name)
+                rel = os.path.relpath(full, source.directory)
+                if not _interesting(rel) or os.path.islink(full):
+                    continue
+                with open(full, "rb") as fh:
+                    content = fh.read(FRONTMATTER_MAX)
+                digest = "untrusted:sha256:" + hashlib.sha256(content).hexdigest()
+                out.append((rel.replace(os.sep, "/"), content, digest))
+        return out
+
+    def _read_fiches(self) -> None:
+        for source in self.canon.sources:
+            try:
+                files = self._files(source)
+            except (GitError, OSError) as exc:
+                self.add("canon-git-error", ERROR, "lecture de %s : %s" % (source.member, exc),
+                         member=source.member)
+                continue
+            for path, content, version in files:
+                self._fiche(source, path, content, version)
+
+    def _fiche(self, source: Source, path: str, content: bytes | None, version: str) -> None:
+        where = {"member": source.member, "path": path}
+        if content is None:
+            self.add("canon-git-error", ERROR, "objet git illisible", **where)
+            return
+        head = content[:FRONTMATTER_MAX]
+        try:
+            text = head.decode("utf-8")
+        except UnicodeDecodeError:
+            text = head.decode("utf-8", "replace")
+            typed = bool(_TYPED_RE.search(text))
+            self.add("frontmatter-invalid", ERROR if typed else WARNING,
+                     "fichier non UTF-8", **where)
+            return
+        try:
+            block = split_frontmatter(text)
+            if block is None:
+                return
+            data = load_yaml(block, use_pyyaml=self.use_pyyaml)
+        except YamlError as exc:
+            typed = bool(_TYPED_RE.search(text[:FRONTMATTER_MAX]))
+            self.add("frontmatter-invalid", ERROR if typed else WARNING,
+                     "frontmatter illisible : %s%s" % (
+                         exc, "" if typed else " (type inconnu : fiche ignorée)"), **where)
+            return
+        if not isinstance(data, dict):
+            return
+        kind = data.get("type")
+        if kind not in PROFILE_TYPES:
+            return
+        title = _text(data.get("title"))
+        fiche = Fiche(type=kind, title=title or "", member=source.member, path=path,
+                      ref="%s:%s@%s" % (source.member, path, version), data=data,
+                      untrusted=source.mode != "git")
+        if not title and kind != "Placement":
+            self.add("fiche-title-missing", ERROR, "fiche %s sans `title`" % kind, **where)
+            return
+        build = getattr(self, "_build_" + kind.lower())
+        build(fiche, where)
+
+    # -- types ---------------------------------------------------------------------
+    def _list(self, fiche: Fiche, key: str, where: dict, code: str, **subject) -> list[str] | None:
+        value = fiche.data.get(key)
+        if value is None:
+            return None
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+            return [str(value).strip()]
+        if isinstance(value, list) and all(isinstance(v, (str, int, float))
+                                           and not isinstance(v, bool) for v in value):
+            return [str(v).strip() for v in value]
+        self.add(code, ERROR, "`%s` : liste de textes attendue" % key, **where, **subject)
+        return None
+
+    def _build_member(self, fiche: Fiche, where: dict) -> None:
+        roles = self._list(fiche, "roles", where, "member-invalid")
+        authenticators = fiche.data.get("authenticators")
+        self.canon.members.append(Member(
+            title=fiche.title, roles=roles,
+            authenticators=authenticators if isinstance(authenticators, list) else None,
+            fiche=fiche))
+
+    def _build_agent(self, fiche: Fiche, where: dict) -> None:
+        subject = {"agent": fiche.title}
+        budget = fiche.data.get("budget_usd_per_day")
+        if budget is not None:
+            try:
+                budget = float(budget)
+                if not 0 <= budget < 1e8:  # numeric(12,4) au registre
+                    raise ValueError
+            except (TypeError, ValueError):
+                self.add("agent-budget-invalid", WARNING,
+                         "budget_usd_per_day illisible : %r (ignoré)" % (budget,), **where,
+                         **subject)
+                budget = None
+        self.canon.agents.append(Agent(
+            title=fiche.title,
+            responsible=_text(fiche.data.get("responsible")),
+            team=_text(fiche.data.get("team")),
+            capabilities=self._list(fiche, "capabilities", where, "agent-capabilities-invalid",
+                                    **subject),
+            harness=_text(fiche.data.get("harness")),
+            model=_text(fiche.data.get("model")),
+            provider=_text(fiche.data.get("provider")),
+            credential_mode=_text(fiche.data.get("credential_mode")),
+            budget_usd_per_day=budget,
+            tools=self._list(fiche, "tools", where, "agent-tools-invalid", **subject),
+            reviewers=self._list(fiche, "reviewers", where, "agent-reviewers-invalid", **subject),
+            fiche=fiche,
+        ))
+
+    def _build_host(self, fiche: Fiche, where: dict) -> None:
+        subject = {"host": fiche.title}
+        raw = fiche.data.get("policy")
+        policy = HostPolicy()
+        if raw is not None and not isinstance(raw, dict):
+            self.add("host-policy-invalid", ERROR, "`policy` : mapping attendu", **where,
+                     **subject)
+            # politique illisible : rien n'est admis (fail closed)
+            policy = HostPolicy(harnesses=[], providers=[], credential_modes=[])
+        elif isinstance(raw, dict):
+            for key in ("harnesses", "providers", "models", "credential_modes"):
+                value = raw.get(key)
+                if value is None:
+                    continue
+                if isinstance(value, str):
+                    value = [value]
+                if not isinstance(value, list) or not all(isinstance(v, (str, int, float))
+                                                          for v in value):
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.%s` : liste de textes attendue" % key, **where, **subject)
+                    value = []
+                setattr(policy, key, [str(v).strip() for v in value])
+            if raw.get("max_agents") is not None:
+                try:
+                    policy.max_agents = int(raw["max_agents"])
+                    if policy.max_agents < 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.max_agents` : entier positif attendu", **where, **subject)
+                    policy.max_agents = 0
+        self.canon.hosts.append(Host(title=fiche.title,
+                                     responsible=_text(fiche.data.get("responsible")),
+                                     policy=policy, fiche=fiche))
+
+    def _build_placement(self, fiche: Fiche, where: dict) -> None:
+        self.canon.placements.append(Placement(
+            title=fiche.title,
+            agent=_text(fiche.data.get("agent")),
+            host=_text(fiche.data.get("host")),
+            credential_mode=_text(fiche.data.get("credential_mode")),
+            cwd=_text(fiche.data.get("cwd")),
+            fiche=fiche,
+        ))
+
+
+def _text(value: Any) -> str | None:
+    if value is None or isinstance(value, (dict, list)):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def load(root: str, *, ref: str = "", untrusted: bool = False, fetch: bool = False,
+         use_pyyaml: bool | None = None) -> Canon:
+    """Lit le canon (§4.1). Les problèmes de lecture sont dans `canon.load_findings`.
+
+    Une erreur git imprévue (dépôt cassé, délai dépassé) rend le canon
+    illisible (`readable` faux) au lieu de remonter : `canon sync` peut alors
+    enregistrer l'état `unreadable`.
+    """
+    loader = _Loader(root, ref=ref, untrusted=untrusted, fetch=fetch, use_pyyaml=use_pyyaml)
+    try:
+        return loader.load()
+    except GitError as exc:
+        loader.add("canon-git-error", ERROR, "lecture du canon : %s" % exc)
+        loader.canon.readable = False
+        return loader.canon
+    except OSError as exc:
+        # Lecture refusée ou impossible (permissions, fichier disparu) : même
+        # traitement fail-closed qu'une erreur git.
+        loader.add("canon-io-error", ERROR, "lecture du canon : %s" % (exc.strerror or exc))
+        loader.canon.readable = False
+        return loader.canon
+
+
+def from_config(cfg, *, root: str | None = None, fetch: bool = False) -> Canon:
+    """Le canon de la configuration (`AMEESH_CANON`, `AMEESH_CANON_REF`, …)."""
+    path = root or cfg.canon
+    if not path:
+        raise CanonError("aucun canon configuré : posez AMEESH_CANON (ou `canon` dans la "
+                         "configuration), ou passez --canon DOSSIER")
+    return load(path, ref=cfg.canon_ref, untrusted=cfg.canon_untrusted, fetch=fetch)
+
+
+# ==========================================================================
+# Validation (§4.3)
+# ==========================================================================
+
+def validate(canon: Canon) -> list[Finding]:
+    """Constats de lecture + constats du profil. Une erreur est bloquante."""
+    findings: list[Finding] = list(canon.load_findings)
+    untrusted = canon.untrusted
+
+    def add(code: str, severity: str, message: str, fiche: Fiche | None = None,
+            **subject: str) -> None:
+        where = {"member": fiche.member, "path": fiche.path} if fiche else {}
+        findings.append(Finding(code, severity, message, untrusted=untrusted,
+                                **where, **subject))
+
+    if not canon.readable:
+        return findings
+
+    # -- doublons --------------------------------------------------------------
+    for kind, items, subject in (("member", canon.members, None),
+                                 ("agent", canon.agents, "agent"),
+                                 ("host", canon.hosts, "host")):
+        by_title: dict[str, list] = defaultdict(list)
+        for item in items:
+            by_title[item.title].append(item)
+        for title, group in by_title.items():
+            if len(group) > 1:
+                for item in group:
+                    add("%s-duplicate" % kind, ERROR,
+                        "%s %s déclaré %d fois (%s)" % (
+                            kind, title, len(group),
+                            ", ".join("%s:%s" % (g.fiche.member, g.fiche.path) for g in group)),
+                        item.fiche, **({subject: title} if subject else {}))
+
+    agent_names = {a.title for a in canon.agents}
+    for member in canon.members:
+        if member.title in agent_names:
+            add("member-agent-clash", ERROR,
+                "le membre humain %s porte le nom d'un agent : responsable ambigu"
+                % member.title, member.fiche, agent=member.title)
+
+    # -- agents ------------------------------------------------------------------
+    for agent in canon.agents:
+        f = agent.fiche
+        if not NAME_RE.match(agent.title):
+            add("agent-title-invalid", ERROR,
+                "nom d'agent %r hors de la grammaire du registre" % agent.title, f)
+            continue
+        if not agent.responsible:
+            add("agent-responsible-missing", ERROR,
+                "agent %s sans `responsible` (R14 : tout agent a un humain responsable)"
+                % agent.title, f, agent=agent.title)
+        elif canon.resolve_human(agent.responsible) is None:
+            add("agent-responsible-unresolved", ERROR,
+                "responsable %r de %s ne résout pas vers un Member humain (attendu "
+                "human:<id> d'une fiche Member unique)" % (agent.responsible, agent.title),
+                f, agent=agent.title)
+        caps = agent.capabilities or []
+        forbidden = [c for c in caps if c.strip().lower() in FORBIDDEN_CAPABILITIES]
+        if forbidden:
+            add("agent-approve-capability", ERROR,
+                "agent %s avec la capacité `approve` : réservée aux humains (R8)"
+                % agent.title, f, agent=agent.title)
+        unknown = [c for c in caps if c not in KNOWN_CAPABILITIES and c not in forbidden]
+        if unknown:
+            add("agent-capability-unknown", WARNING,
+                "capacités inconnues pour %s : %s" % (agent.title, ", ".join(unknown)),
+                f, agent=agent.title)
+        if not agent.harness or agent.harness not in HARNESSES:
+            add("agent-harness-unknown", WARNING,
+                "harnais %r de %s sans adaptateur (connus : %s)"
+                % (agent.harness, agent.title, ", ".join(HARNESSES)), f, agent=agent.title)
+
+    # -- hôtes -----------------------------------------------------------------------
+    for host in canon.hosts:
+        if not host.responsible:
+            add("host-responsible-missing", ERROR,
+                "hôte %s sans `responsible`" % host.title, host.fiche, host=host.title)
+        elif canon.resolve_human(host.responsible) is None:
+            add("host-responsible-unresolved", ERROR,
+                "responsable %r de l'hôte %s ne résout pas vers un Member humain"
+                % (host.responsible, host.title), host.fiche, host=host.title)
+
+    # -- placements ----------------------------------------------------------------------
+    host_names = {h.title for h in canon.hosts}
+    by_agent: dict[str, list[Placement]] = defaultdict(list)
+    by_host: dict[str, list[Placement]] = defaultdict(list)
+    for placement in canon.placements:
+        f = placement.fiche
+        if not placement.agent or not placement.host:
+            add("placement-incomplete", ERROR,
+                "placement sans %s" % ("`agent`" if not placement.agent else "`host`"), f,
+                **({"agent": placement.agent} if placement.agent else
+                   {"host": placement.host} if placement.host else {}))
+            continue
+        by_agent[placement.agent].append(placement)
+        by_host[placement.host].append(placement)
+        if placement.agent not in agent_names:
+            add("placement-agent-unknown", ERROR,
+                "placement vers un agent inconnu : %s" % placement.agent, f,
+                agent=placement.agent)
+        if placement.host not in host_names:
+            add("placement-host-unknown", ERROR,
+                "placement de %s vers un hôte inconnu : %s" % (placement.agent, placement.host),
+                f, agent=placement.agent)
+        agent = canon.agent(placement.agent)
+        host = canon.host(placement.host)
+        if agent is not None and host is not None:
+            for reason in placement_violations(agent, host, placement):
+                add("placement-policy-violation", ERROR,
+                    "%s sur %s : %s" % (agent.title, host.title, reason), f,
+                    agent=agent.title)
+        if placement.cwd and not (placement.cwd.startswith("~") or os.path.isabs(placement.cwd)):
+            add("placement-cwd-invalid", WARNING,
+                "cwd %r de %s : chemin absolu ou ~/… attendu" % (placement.cwd, placement.agent),
+                f, agent=placement.agent)
+    for name, group in by_agent.items():
+        if len(group) > 1:
+            for placement in group:
+                add("placement-duplicate", ERROR,
+                    "agent %s placé %d fois (%s)" % (
+                        name, len(group), ", ".join(p.host or "?" for p in group)),
+                    placement.fiche, agent=name)
+    for host in canon.hosts:
+        limit = host.policy.max_agents
+        if limit is not None and len(by_host.get(host.title, [])) > limit:
+            add("host-max-agents", ERROR,
+                "hôte %s : %d placements pour max_agents = %d"
+                % (host.title, len(by_host[host.title]), limit), host.fiche, host=host.title)
+
+    # -- avertissements -----------------------------------------------------------------
+    for agent in canon.agents:
+        if agent.title not in by_agent:
+            add("agent-unplaced", WARNING, "agent %s sans placement" % agent.title,
+                agent.fiche, agent=agent.title)
+    for host in canon.hosts:
+        if host.title not in by_host:
+            add("host-unplaced", WARNING, "hôte %s sans placement" % host.title,
+                host.fiche, host=host.title)
+    return findings
+
+
+def errors(findings: Iterable[Finding]) -> list[Finding]:
+    return [f for f in findings if f.severity == ERROR]
+
+
+@dataclass
+class Blocking:
+    """Qui une erreur empêche de réclamer (un canon invalide bloque, §4.1)."""
+
+    global_errors: list[Finding]
+    by_agent: dict[str, list[Finding]]
+    by_host: dict[str, list[Finding]]
+
+    def reasons(self, agent: str, hosts: Iterable[str] = ()) -> list[str]:
+        out = ["%s (%s)" % (f.code, f.where()) for f in self.global_errors]
+        out += ["%s (%s)" % (f.code, f.where()) for f in self.by_agent.get(agent, [])]
+        for host in hosts:
+            out += ["%s (%s)" % (f.code, f.where()) for f in self.by_host.get(host, [])]
+        return list(dict.fromkeys(out))
+
+
+def blocking(findings: Iterable[Finding]) -> Blocking:
+    """Une erreur liée à un agent bloque cet agent ; à un hôte, les agents qui y
+    sont placés ; sinon (fédération, frontmatter d'une fiche du profil, …) tous."""
+    result = Blocking([], defaultdict(list), defaultdict(list))
+    for finding in errors(findings):
+        if finding.agent:
+            result.by_agent[finding.agent].append(finding)
+        elif finding.host:
+            result.by_host[finding.host].append(finding)
+        else:
+            result.global_errors.append(finding)
+    return result

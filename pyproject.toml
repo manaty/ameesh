@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77"]  # licence SPDX (PEP 639)
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ameesh"
+version = "1.0.0"
+description = "Coordination d'équipes mixtes humains et agents IA : exécuteur multi-harnais, canon OKF, fil lisible, actions sous porte et approbations signées."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+# Pas de classifier `License ::` : depuis PEP 639, il est incompatible avec
+# l'expression SPDX ci-dessus (setuptools refuse le build — verdict codex3 B1).
+# psycopg est optionnel : sans lui, la couche db utilise le binaire psql.
+dependencies = []
+
+[project.optional-dependencies]
+psycopg = ["psycopg[binary]>=3.1"]
+crypto = ["cryptography>=41"]
+
+[project.scripts]
+ameesh = "ameesh.main:main"
+#: alias conservés : les hooks des trois harnais appellent agent-mail
+agent-mail = "ameesh.cli:main"
+agent-runner = "ameesh.runner:main"
+#: service d'approbation humaine (spec §9), lancé sous son propre utilisateur
+ameesh-approve = "ameesh.approve.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ameesh = ["migrations/*.sql"]
+"ameesh.approve" = ["static/*.js", "static/*.css"]

@@ -1,0 +1,905 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Classes abstraites du stockage : ce qu'un pilote doit fournir.
+
+Un pilote (`storage.postgres` en v1) implémente chaque domaine ; `Storage`
+les regroupe pour une connexion (ou une transaction ouverte). Les garanties
+de chaque opération (atomicité, verrous, recontrôle des échéances, fencing
+par `lease_epoch`) sont documentées ici et dans le pilote : un autre pilote
+doit les tenir à l'identique.
+
+Hors de l'interface : le schéma et la connexion, propres au pilote
+------------------------------------------------------------------
+
+Ni les migrations ni le contrôle du schéma ne sont des opérations de
+l'interface (spec §10 : « les migrations restent des fichiers SQL versionnés
+propres au pilote »). Les points d'entrée (CLI, exécuteur, ameesh-approve,
+tests) les appellent sur la connexion, avant `storage.of(db)` :
+
+* `ameesh.migrations` — pilote Postgres : fichiers `migrations/NNNN_nom.sql`
+  immuables (empreinte SHA-256 dans `schema_migrations`), chacun appliqué en
+  UNE transaction sous verrou consultatif (`pg_advisory_xact_lock`), délai
+  de requête levé le temps de la transaction, schéma nommé créé au besoin.
+  Ces fichiers définissent tout le schéma dans le dialecte du pilote :
+  tables et index, vues (`agent_mesh_overview`, `mesh_approvals_status`),
+  triggers (réveil `agent_mail` / `agent_lease` / `work_item`, journal et
+  gardes de `actions`) et fonctions PL/pgSQL (`ameesh_action_*`,
+  `ameesh_receipt_*`, `ameesh_standing_*`, `ameesh_placement_profile`). Un
+  autre pilote a SA suite de migrations, sur le même principe (versions
+  immuables, application atomique et exclusive).
+* `ameesh.db.require_schema` (schéma migré, sinon `SchemaMissing` qui dit
+  de lancer `agent-mesh migrate`), avec `ameesh.db.connect` (psycopg | psql,
+  `search_path`, `statement_timeout`), `transaction()` et les erreurs
+  `DbError` / `Unavailable` / `SchemaMissing` que les modules métier
+  attrapent : c'est la connexion du pilote.
+
+Ce qu'un pilote SQLite devra fournir (profil local, décision 0016)
+------------------------------------------------------------------
+
+Non implémenté ; liste de contrôle pour qui l'écrira.
+
+1. `SqliteStorage(Storage)`, `driver = "sqlite"`, choisi par `storage.of(db)`
+   selon la connexion. La connexion offre `query` / `execute` / `script` /
+   `transaction()` (rappelable dans une transaction déjà ouverte, comme les
+   deux pilotes Postgres) et lève les erreurs de `ameesh.db` (`DbError`,
+   `Unavailable`, `SchemaMissing`).
+
+2. Tous les domaines de `Storage`, chaque opération avec la MÊME signature,
+   les mêmes clés dans les lignes rendues (instants en secondes epoch
+   flottantes `*_ts`, JSON rendu en dict / list, comptes en int) et les
+   mêmes refus (None, faux, liste vide : jamais une exception pour un refus
+   métier) :
+
+   agents          upsert get overview claimable mark_event_wake set_session
+                   cwd_used set_status set_pending_prompt clear_model count
+   leases          claim attach_claim state renew release turn_in_progress
+                   reap clear_session take_pending_prompt begin_turn
+                   restore_prompt end_turn
+   pending_spend   put set_model get clear
+   turn_costs      last_reading insert spent
+   mailbox         send unread unread_urgent get mark_delivered
+                   unread_counts history pending_recipients
+                   pending_recipients_sorted unread_total
+   wakeups         subscribe notify
+   keys            info register revoke registered
+   approvals       create recent candidates consume
+   nonces          state consume
+   work            add get items move note events
+   actions         get recent attempts events log_event last_event_note
+                   decision_queues covering_grants launched propose bind
+                   launch settle replace cancel
+   action_source   columns rows
+   canon           record_state state record_auth_state host_rows
+                   write_declared clear_responsible set_placement
+                   lineage_rows revive clear_pending_stop move_host
+                   stop_removed
+   ephemerals      creator create exists
+   authenticators  lock_registry registry_lock_held under_registry_lock
+                   canon_refs last_sync journal_head append_sync registered
+                   for_approver active_holders update_meta revoke insert
+   threads         index indexed
+   grants          register reserve release live_reservations candidates
+                   revoke get
+   placements      recorded
+
+3. Atomicité et verrous. Postgres tient les garanties par des écritures
+   conditionnelles en une instruction (`UPDATE … WHERE`, `INSERT … ON
+   CONFLICT`, `INSERT … SELECT`), des verrous de ligne (`FOR UPDATE`,
+   `FOR SHARE`), un verrou consultatif transactionnel (registre des
+   authentificateurs) et des fonctions PL/pgSQL qui sont chacune UNE
+   transaction (`actions.launch` / `settle` / `replace`, `nonces.consume`,
+   `grants.register` / `reserve` / `release`). SQLite n'a qu'un écrivain :
+   une opération documentée « UNE transaction », ou qui lit puis écrit sous
+   condition, s'exécute en `BEGIN IMMEDIATE` (verrou d'écriture pris AVANT
+   la première lecture) et garde le motif verrou → recontrôle des échéances
+   à l'heure réelle → écriture ; le fencing par `lease_epoch` et le
+   « un seul gagnant » des réclamations, consommations et réservations
+   restent dans la condition de l'écriture. `lock_registry` /
+   `registry_lock_held` : vrais seulement dans la transaction qui a pris le
+   verrou ; le jeton `RegistryLock` ne se forge toujours pas hors d'un
+   pilote. Le code PL/pgSQL devient du code du pilote, dans la transaction,
+   même ordre de contrôles, mêmes issues ; une échéance dépassée lève une
+   `DbError` dont le texte commence par
+   `ameesh_echeance [expired|iat_future] : ` (lu par `ameesh.receipts`).
+   `busy_timeout` tient le rôle de `statement_timeout`.
+
+4. Heure. Postgres distingue `now()` (début de la transaction) et
+   `clock_timestamp()` (heure réelle, celle des recontrôles après verrou) ;
+   SQLite lit son horloge au moment de chaque contrôle, après le verrou.
+
+5. Réveil. Sans LISTEN/NOTIFY, `wakeups.subscribe` rend un abonnement LOCAL
+   au même contrat (`wait(timeout)` : signal, None au délai, `down` ;
+   `close()` depuis un autre fil), signalé par le pilote APRÈS le commit des
+   écritures qui, en Postgres, déclenchent `agent_mail` (dépôt d'un
+   message), `agent_lease` (bail, epoch ou statut d'un agent) et
+   `work_item` (lots) ; `notify` émet sur ce même abonnement. Il peut aussi
+   rendre None : l'exécuteur se replie alors sur le sondage (`poll`),
+   chemin déjà en place.
+
+6. Schéma. Sa propre suite de migrations (voir ci-dessus) : tables, index,
+   vues, journal et gardes de `actions` (triggers SQLite), profil de
+   placement (`ameesh_placement_profile` en fonction enregistrée sur la
+   connexion ou calculé par le pilote) ; son `require_schema` ;
+   `PRAGMA table_info` à la place de `pg_attribute` (`action_source`).
+
+7. Tests. La suite doit passer sur les deux pilotes (0016). Ses montages
+   appellent encore `db.query` / `db.execute` en SQL Postgres (schéma
+   jetable par classe, TRUNCATE) : à rendre propres au pilote.
+"""
+from __future__ import annotations
+
+import abc
+from typing import Any, Callable, Protocol, Sequence
+
+
+class Domain(abc.ABC):
+    """Opérations d'un domaine, liées à une connexion ou une transaction."""
+
+    __slots__ = ("db",)
+
+    def __init__(self, db: Any):
+        self.db = db
+
+
+# --------------------------------------------------------------------------
+# registre des agents (`agent_registry`) : lignes et baux
+# --------------------------------------------------------------------------
+
+class Agents(Domain):
+    """Lignes du registre hors bail : inscription, lecture, statut."""
+
+    @abc.abstractmethod
+    def upsert(self, name: str, *, chantier: str | None, harness: str | None,
+               host: str | None, cwd: str | None, session_id: str | None,
+               status: str | None, status_text: str | None, model: str | None,
+               budget_usd: float | None) -> dict:
+        """Crée l'agent ou met à jour les champs fournis ; rend la ligne."""
+
+    @abc.abstractmethod
+    def get(self, name: str) -> dict | None:
+        """La ligne de l'agent, ou None."""
+
+    @abc.abstractmethod
+    def overview(self) -> list[dict]:
+        """Vue d'observabilité (`mesh list --json`), colonnes du canon comprises."""
+
+    @abc.abstractmethod
+    def claimable(self, host: str, names: Sequence[str] | None, *,
+                  require_responsible: bool) -> list[dict]:
+        """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`)."""
+
+    @abc.abstractmethod
+    def mark_event_wake(self, name: str) -> None:
+        """Note l'instant du dernier réveil d'événements."""
+
+    @abc.abstractmethod
+    def set_session(self, name: str, session_id: str) -> None:
+        """Enregistre la session du harnais."""
+
+    @abc.abstractmethod
+    def cwd_used(self, cwd: str, exclude: str) -> bool:
+        """Ce dossier est-il celui d'un autre agent que `exclude` ?"""
+
+    @abc.abstractmethod
+    def set_status(self, name: str, status: str, status_text: str | None,
+                   error: str | None) -> None:
+        """Pose le statut (et l'erreur) de l'agent."""
+
+    @abc.abstractmethod
+    def set_pending_prompt(self, name: str, prompt: str | None) -> None:
+        """Pose la consigne en attente (statut `queued` si elle n'est pas nulle)."""
+
+    @abc.abstractmethod
+    def clear_model(self, name: str) -> None:
+        """Efface le modèle de l'agent (retour au défaut du harnais, `ameesh set`)."""
+
+    @abc.abstractmethod
+    def count(self) -> int:
+        """Nombre d'agents inscrits (`doctor`)."""
+
+
+class Leases(Domain):
+    """Baux : réclamation atomique, fencing par `lease_epoch`.
+
+    Toute opération qui écrit sous un bail prend le verrou de la ligne
+    D'ABORD, puis recontrôle l'échéance avec l'heure réelle de la base
+    (`clock_timestamp()`) dans l'instruction qui écrit, hors du WHERE
+    verrouillant : un verrou attendu au-delà de l'échéance refuse l'écriture.
+    """
+
+    @abc.abstractmethod
+    def claim(self, name: str, owner: str, ttl_seconds: float, *,
+              require_responsible: bool) -> dict | None:
+        """Prend le bail s'il est libre ou expiré ; rend la ligne, sinon None."""
+
+    @abc.abstractmethod
+    def attach_claim(self, name: str, owner: str, ttl_seconds: float, *,
+                     require_responsible: bool) -> dict | None:
+        """Prend le bail pour une session interactive (`ameesh attach`)."""
+
+    @abc.abstractmethod
+    def state(self, name: str) -> dict | None:
+        """Détenteur, epoch, statut et vie du bail (`live`), ou None."""
+
+    @abc.abstractmethod
+    def renew(self, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
+        """Prolonge le bail ; rend la nouvelle échéance, None si on ne le détient plus."""
+
+    @abc.abstractmethod
+    def release(self, name: str, owner: str, epoch: int) -> bool:
+        """Rend le bail ; l'epoch avance."""
+
+    @abc.abstractmethod
+    def turn_in_progress(self, name: str) -> bool:
+        """`status = 'running'` avec un bail vivant ?"""
+
+    @abc.abstractmethod
+    def reap(self, host: str | None) -> list[dict]:
+        """Marque morts les agents dont le bail a expiré en plein tour."""
+
+    @abc.abstractmethod
+    def clear_session(self, name: str, owner: str, epoch: int) -> bool:
+        """Oublie la session, fencé par un bail valide."""
+
+    @abc.abstractmethod
+    def take_pending_prompt(self, name: str, owner: str, epoch: int) -> str | None:
+        """Consomme la consigne en attente et passe l'agent en `running`."""
+
+    @abc.abstractmethod
+    def begin_turn(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
+        """Passe l'agent en `running` sous un bail vivant."""
+
+    @abc.abstractmethod
+    def restore_prompt(self, name: str, owner: str, epoch: int) -> bool:
+        """Remet en attente la consigne d'un tour qui n'a pas abouti."""
+
+    @abc.abstractmethod
+    def end_turn(self, name: str, owner: str, epoch: int, *, status: str,
+                 status_text: str | None, error: str | None,
+                 cost_usd: float | None) -> bool:
+        """Clôt un tour seulement si le bail est encore détenu."""
+
+
+class PendingSpend(Domain):
+    """Marqueur comptable d'un tour (`spend_pending`) : une ligne par agent."""
+
+    @abc.abstractmethod
+    def put(self, name: str, start_index: int, turn: str | None, model: str | None) -> bool:
+        """Pose (atomiquement) le marqueur du tour, en remplaçant le précédent."""
+
+    @abc.abstractmethod
+    def set_model(self, name: str, model: str | None) -> bool:
+        """Remplace le modèle du marqueur ; faux s'il n'y a pas de marqueur."""
+
+    @abc.abstractmethod
+    def get(self, name: str) -> dict | None:
+        """Le marqueur (agent, start_index, turn, model, created_ts), ou None."""
+
+    @abc.abstractmethod
+    def clear(self, name: str) -> bool:
+        """Retire le marqueur ; faux s'il n'y en avait pas."""
+
+
+# --------------------------------------------------------------------------
+# grand livre des coûts (`turn_costs`, L12/L13)
+# --------------------------------------------------------------------------
+
+class TurnCosts(Domain):
+    """Une ligne par tour compté : son coût ET le cumul brut du harnais, qui
+    sert de repère au tour suivant. Insertion et repère sont la même écriture
+    (une seule instruction) : un tour rejoué après une insertion en échec
+    retrouve le même repère. L'état de pause comptable vit ailleurs
+    (`PendingSpend`) ; ce domaine n'ouvre aucune transaction."""
+
+    @abc.abstractmethod
+    def last_reading(self, agent: str, harness: str,
+                     session: str | None = None) -> dict | None:
+        """Dernier relevé CONNU (cumul en dollars ou en jetons non nul) de
+        l'agent pour ce harnais — de cette session seulement si `session` est
+        donnée : session, cum_usd, cum_input_tokens, cum_cached_input_tokens,
+        cum_output_tokens ; ou None."""
+
+    @abc.abstractmethod
+    def insert(self, *, agent: str, harness: str, turn: str | None, model: str | None,
+               session: str | None, usd: float, input_tokens: int,
+               cached_input_tokens: int, output_tokens: int, cum_usd: float | None,
+               cum_input_tokens: int | None, cum_cached_input_tokens: int | None,
+               cum_output_tokens: int | None) -> None:
+        """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
+        telle quelle et n'a rien écrit."""
+
+    @abc.abstractmethod
+    def spent(self, seconds: float, *, agent: str,
+              harnesses: Sequence[str] | None) -> float:
+        """Somme des coûts des `seconds` dernières secondes (horloge de la
+        base), de l'agent (`"all"` : tout le compte, comme `cost spent`), de
+        ces harnais seulement si donnés."""
+
+
+# --------------------------------------------------------------------------
+# boîte aux lettres (`agent_mailbox`)
+# --------------------------------------------------------------------------
+
+class Mailbox(Domain):
+    """Messages durables ; le dépôt réveille le destinataire (NOTIFY en Postgres)."""
+
+    @abc.abstractmethod
+    def send(self, sender: str, recipient: str, body: str, *, host: str | None,
+             kind: str, payload: dict | None, work_item_id: str | None,
+             signature: str | None, signature_key: str | None,
+             signed_payload: str | None, nonce: str | None, created_us: int | None,
+             expires_us: int | None) -> dict:
+        """Dépose un message ; rend id, created_ts et les projets du fil
+        (`sender_project`, `recipient_project`) des deux agents."""
+
+    @abc.abstractmethod
+    def unread(self, recipient: str, limit: int) -> list[dict]:
+        """Messages non remis, du plus ancien au plus récent."""
+
+    @abc.abstractmethod
+    def unread_urgent(self, recipient: str, limit: int) -> list[dict]:
+        """Messages non remis marqués `payload.urgent`."""
+
+    @abc.abstractmethod
+    def get(self, message_id: int) -> dict | None:
+        """Un message par son id."""
+
+    @abc.abstractmethod
+    def mark_delivered(self, ids: Sequence[int]) -> int:
+        """Marque remis ; rend le nombre de messages passés remis."""
+
+    @abc.abstractmethod
+    def unread_counts(self) -> dict[str, int]:
+        """Nombre de messages non remis par destinataire."""
+
+    @abc.abstractmethod
+    def history(self, recipient: str, limit: int) -> list[dict]:
+        """Derniers messages du destinataire, du plus récent au plus ancien."""
+
+    @abc.abstractmethod
+    def pending_recipients(self) -> list[str]:
+        """Destinataires qui ont du courrier non remis."""
+
+    @abc.abstractmethod
+    def pending_recipients_sorted(self) -> list[str]:
+        """Destinataires qui ont du courrier non remis, par ordre de nom
+        (`export-v0`)."""
+
+    @abc.abstractmethod
+    def unread_total(self) -> int:
+        """Nombre de messages non remis, tous destinataires confondus (`doctor`)."""
+
+
+# --------------------------------------------------------------------------
+# réveil des exécuteurs (LISTEN/NOTIFY en Postgres)
+# --------------------------------------------------------------------------
+
+class Subscription(Protocol):
+    """Abonnement ouvert par `Wakeups.subscribe` (une connexion dédiée en
+    Postgres). `wait` et `close` peuvent être appelés depuis deux fils
+    différents : `close` interrompt l'abonnement d'un exécuteur qui s'arrête."""
+
+    def wait(self, timeout: float) -> dict | None:
+        """Attend un signal au plus `timeout` secondes. Rend
+        `{"channel", "payload"}` pour un signal, None si le délai s'écoule
+        (l'appelant sonde alors l'état), ou `{"event": "down", "error"}` si
+        l'abonnement est rompu (l'appelant le ferme et se réabonne)."""
+
+    def close(self) -> None:
+        """Ferme l'abonnement (idempotent, ne lève pas)."""
+
+
+class Wakeups(Domain):
+    """Signaux de réveil, par canal : le dépôt d'un message (`agent_mail`) et
+    les changements de bail ou de statut (`agent_lease`) en émettent (en
+    Postgres : des triggers, migration 0001). Un signal n'est qu'un réveil :
+    l'état fait foi dans les tables, relu après chaque réveil ou délai. Sans
+    réveil (`subscribe` rend None), l'exécuteur se replie sur le sondage."""
+
+    @abc.abstractmethod
+    def subscribe(self, channels: Sequence[str]) -> Subscription | None:
+        """Ouvre un abonnement à ces canaux ; None si le pilote ne sait pas
+        réveiller (ou si l'abonnement n'a pas pu s'ouvrir)."""
+
+    @abc.abstractmethod
+    def notify(self, channel: str, payload: str) -> None:
+        """Émet un signal sur `channel` (diagnostic de bout en bout, `doctor`)."""
+
+
+# --------------------------------------------------------------------------
+# autorité : clés des agents, approbations signées, nonces consommés
+# --------------------------------------------------------------------------
+
+class Keys(Domain):
+    """Clés publiques Ed25519 des agents (colonnes de `agent_registry`)."""
+
+    @abc.abstractmethod
+    def info(self, agent: str) -> dict | None:
+        """Clé, empreinte, rôle et dates de l'agent, ou None."""
+
+    @abc.abstractmethod
+    def register(self, agent: str, public_key: str, fingerprint: str, role: str,
+                 note: str | None) -> bool:
+        """Enregistre la clé publique (base64) ; faux si l'agent est inconnu."""
+
+    @abc.abstractmethod
+    def revoke(self, agent: str) -> bool:
+        """Révoque la clé active ; faux s'il n'y en avait pas."""
+
+    @abc.abstractmethod
+    def registered(self) -> list[dict]:
+        """Agents qui ont une clé publique (révoquée comprise), par nom :
+        name, public_key_fingerprint, key_role, key_updated_ts, key_revoked_ts."""
+
+
+class Approvals(Domain):
+    """Approbations Ed25519 (`mesh_approvals`) et leur consommation unique."""
+
+    @abc.abstractmethod
+    def create(self, *, approver: str, action: str, artifact_kind: str,
+               artifact_hash: str, decision: str, nonce: str, signed_payload: str,
+               signature: str, signature_key: str, created_us: int, expires_us: int,
+               meta: dict | None) -> int:
+        """Enregistre une approbation signée ; rend son id."""
+
+    @abc.abstractmethod
+    def recent(self, *, action: str | None, artifact_hash: str | None,
+               limit: int) -> list[dict]:
+        """Approbations avec leur état, de la plus récente à la plus ancienne."""
+
+    @abc.abstractmethod
+    def candidates(self, action: str, artifact_hash: str, decision: str) -> list[dict]:
+        """Les 20 dernières approbations pour (action, empreinte, décision)."""
+
+    @abc.abstractmethod
+    def consume(self, approval_id: int, by: str) -> bool:
+        """Consomme l'approbation une seule fois, par (approver, nonce) :
+        faux si ce nonce était déjà consommé."""
+
+
+class Nonces(Domain):
+    """Registre des nonces consommés (`mesh_consumed_nonces`)."""
+
+    @abc.abstractmethod
+    def state(self, approver: str, nonce: str) -> dict | None:
+        """La consommation de (approver, nonce) — consumed_by, consumed_ts — ou None."""
+
+    @abc.abstractmethod
+    def consume(self, approver: str, nonce: str, *, by: str, challenge: str,
+                authenticator_id: int | None, exp: int, iat: int, clock_skew: int) -> bool:
+        """Consomme (approver, nonce) une seule fois, en UNE transaction :
+        authentificateur (s'il est donné) lu sous verrou partagé, puis
+        échéances signées recontrôlées à l'heure réelle de la base APRÈS ce
+        dernier verrou, décision par insertion sur la clé (approver, nonce),
+        échéances recontrôlées après elle. Faux si déjà consommé ou
+        authentificateur révoqué ; échéance dépassée : erreur de base
+        (`ameesh_echeance [expired|iat_future]`), rien n'est consommé."""
+
+
+# --------------------------------------------------------------------------
+# lots (`work_items`, `work_item_events`)
+# --------------------------------------------------------------------------
+
+class WorkItems(Domain):
+    """Lots et journal de leurs transitions (ledger de reprise)."""
+
+    @abc.abstractmethod
+    def add(self, *, type: str, source: str, app: str, title: str, body: str,  # noqa: A002
+            issue_ref: str | None, workstream: str | None, assignee: str | None,
+            budget_usd: float | None, note: str, actor: str) -> dict:
+        """Crée le lot en `intake` et sa première ligne de journal ; rend le lot."""
+
+    @abc.abstractmethod
+    def get(self, item_id: int) -> dict | None:
+        """Un lot, ou None."""
+
+    @abc.abstractmethod
+    def items(self, *, state: str | None, assignee: str | None, limit: int) -> list[dict]:
+        """Lots, du plus récemment modifié au plus ancien."""
+
+    @abc.abstractmethod
+    def move(self, item_id: int, state: str, *, current: str, loops: int, note: str,
+             actor: str) -> dict | None:
+        """Passe le lot de `current` à `state` (boucle QA : `loops` ajouté) et
+        journalise ; None (rien d'écrit) s'il n'est plus en `current`."""
+
+    @abc.abstractmethod
+    def note(self, item_id: int, state: str, text: str, actor: str) -> None:
+        """Journalise une note et rafraîchit `updated_at`."""
+
+    @abc.abstractmethod
+    def events(self, item_id: int, limit: int) -> list[dict]:
+        """Journal du lot, du plus récent au plus ancien."""
+
+
+# --------------------------------------------------------------------------
+# actions et porte (`actions`, `action_attempts`, `action_events`)
+# --------------------------------------------------------------------------
+
+class Actions(Domain):
+    """Actions, tentatives et journal.
+
+    `launch`, `settle` et `replace` sont chacune UNE transaction qui prend ses
+    verrous puis recontrôle les échéances (reçu : exp, iat ; grant : until) à
+    l'heure réelle de la base, après le dernier verrou et avant d'écrire ;
+    elles rendent une ligne `result` / `detail` (et les champs propres à la
+    transition), jamais une exception pour un refus.
+    """
+
+    @abc.abstractmethod
+    def get(self, action_id: str, *, with_receipts: bool) -> dict | None:
+        """Une action (avec ses reçus si demandé), ou None."""
+
+    @abc.abstractmethod
+    def recent(self, *, state: str | None, project: str | None, limit: int) -> list[dict]:
+        """Actions, de la plus récente à la plus ancienne."""
+
+    @abc.abstractmethod
+    def attempts(self, action_id: str) -> list[dict]:
+        """Tentatives de l'action, dans l'ordre."""
+
+    @abc.abstractmethod
+    def events(self, action_id: str) -> list[dict]:
+        """Journal de l'action, dans l'ordre."""
+
+    @abc.abstractmethod
+    def log_event(self, action_id: str, attempt_no: int, event: str, from_state: str | None,
+                  to_state: str | None, actor: str, note: str) -> None:
+        """Événement informatif du journal (sans transition)."""
+
+    @abc.abstractmethod
+    def last_event_note(self, action_id: str, event: str) -> str | None:
+        """Note du dernier événement `event` de l'action, ou None."""
+
+    @abc.abstractmethod
+    def decision_queues(self) -> tuple[list[dict], list[dict], list[dict]]:
+        """(à approuver avec reçu, issue inconnue non remplacée, lancées échues)."""
+
+    @abc.abstractmethod
+    def covering_grants(self, action_id: str, amount: int, connector: str, operation: str,
+                        action_class: str, currency: str | None) -> list[dict]:
+        """Grants vivants qui couvrent l'action (pré-filtre sans verrou), avec
+        `live` : une réservation vivante de l'action existe déjà."""
+
+    @abc.abstractmethod
+    def launched(self, *, action_id: str | None, grace: float, force: bool) -> list[dict]:
+        """Actions `launched` dont l'échéance + `grace` est passée (toutes si `force`)."""
+
+    @abc.abstractmethod
+    def propose(self, *, action_id: str, project: str, work_item: int | None,
+                proposed_by: str, connector: str, operation: str, target: str,
+                args_json: str, action_class: str, amount: int | None,
+                currency: str | None, policy_version: str, digest: str, dedupe: str,
+                requires_receipt: bool, approvers_json: str, note: str) -> None:
+        """Enregistre une action `proposed`."""
+
+    @abc.abstractmethod
+    def bind(self, action_id: str, *, from_states: tuple, digest: str, auth: dict,
+             by: str) -> bool:
+        """Lie une autorisation (`→ approved`) si l'action est encore dans
+        `from_states`, non remplacée, d'empreinte `digest`."""
+
+    @abc.abstractmethod
+    def launch(self, action_id: str, *, digest: str, auth_kind: str, auth_nonce: str | None,
+               auth_grant_id: int | None, by: str, timeout: float,
+               clock_skew: int) -> dict | None:
+        """approved → launched + consommation du nonce ou réservation + tentative."""
+
+    @abc.abstractmethod
+    def settle(self, action_id: str, attempt: int, *, from_state: str, state: str,
+               external_ref: str | None, error: str | None, by: str, note: str,
+               settled_by: str, stale_after: float | None) -> dict | None:
+        """Issue d'une tentative, par transition conditionnelle depuis `from_state`."""
+
+    @abc.abstractmethod
+    def replace(self, action_id: str, *, digest: str, new_id: str, new_digest: str,
+                receipt_json: str, approver: str, nonce: str, challenge: str,
+                authenticator_id: int, by: str, clock_skew: int) -> dict | None:
+        """Consomme la décision « assumer le doublon » et crée l'action qui remplace."""
+
+    @abc.abstractmethod
+    def cancel(self, action_id: str, *, by: str, note: str) -> bool:
+        """`proposed | approved | failed → cancelled` ; faux sinon."""
+
+
+class ActionSource(Domain):
+    """Lecture SEULE, par ameesh-approve, de la table d'actions configurée
+    (`action_table`, `actions` par défaut ; nom d'identifiant SQL simple,
+    refusé sinon) : le service relit l'action lui-même, jamais un texte
+    d'agent, et vérifie d'abord que la table a les colonnes de l'empreinte."""
+
+    @abc.abstractmethod
+    def columns(self, table: str) -> set:
+        """Noms des colonnes vivantes de `table` ; vide si elle n'existe pas."""
+
+    @abc.abstractmethod
+    def rows(self, table: str, action_id: str) -> list[dict]:
+        """Lignes brutes (toutes colonnes) de `table` pour cet `action_id`."""
+
+
+# --------------------------------------------------------------------------
+# canon : état par hôte, colonnes déclaratives, retrait, éphémères
+# --------------------------------------------------------------------------
+
+class Canon(Domain):
+    """Ce que `canon sync` écrit au registre (§4.4) : état du canon de l'hôte
+    (`canon_state`), colonnes DÉCLARATIVES des agents, arrêt d'un agent
+    retiré du canon. Jamais les colonnes d'état (bail, session, dépense,
+    consigne), sauf `status` / `status_text` d'un agent retiré ou réintégré."""
+
+    @abc.abstractmethod
+    def record_state(self, host: str, status: str, *, root: str, source: str,
+                     commit: str | None, good: bool, diagnostic: str) -> None:
+        """Écrit l'état du canon de l'hôte ; le dernier commit valide ne suit que `good`."""
+
+    @abc.abstractmethod
+    def state(self, host: str) -> dict | None:
+        """Dernier état enregistré du canon de l'hôte, ou None."""
+
+    @abc.abstractmethod
+    def record_auth_state(self, host: str, status: str, diagnostic: str) -> dict | None:
+        """Inscrit l'issue de la synchronisation des authentificateurs ; rend
+        l'issue précédente (`auth_status`, `auth_diagnostic`), ou None."""
+
+    @abc.abstractmethod
+    def host_rows(self, host: str, names: Sequence[str]) -> list[dict]:
+        """Agents de l'hôte (et ceux nommés) avec colonnes déclaratives, statut,
+        `profile_fresh` et `in_turn`."""
+
+    @abc.abstractmethod
+    def write_declared(self, name: str, values: dict) -> None:
+        """Écrit les colonnes déclaratives (crée l'agent au besoin) et le profil
+        évalué des valeurs écrites, dans la même instruction."""
+
+    @abc.abstractmethod
+    def clear_responsible(self, name: str, host: str) -> None:
+        """Vide le responsable d'un agent non éphémère de l'hôte."""
+
+    @abc.abstractmethod
+    def set_placement(self, name: str, host: str, *, ok: bool | None, diagnostic: str,
+                      ref: str | None, profile: str | None) -> None:
+        """Écrit un verdict de placement s'il change ; profil None : le profil
+        courant de la ligne, calculé dans la même instruction."""
+
+    @abc.abstractmethod
+    def lineage_rows(self) -> list[dict]:
+        """Éphémères et leurs créateurs, avec verdicts et profil courant."""
+
+    @abc.abstractmethod
+    def revive(self, name: str, text: str, stop_mark: str) -> bool:
+        """Un agent arrêté par sync (`status_text` commençant par `stop_mark`)
+        repart `idle` ; faux s'il n'est pas dans ce cas."""
+
+    @abc.abstractmethod
+    def clear_pending_stop(self, name: str, pending_mark: str) -> None:
+        """Efface la marque d'arrêt demandé en fin de tour."""
+
+    @abc.abstractmethod
+    def move_host(self, name: str, host: str, *, target: str, canon_ref: str,
+                  diagnostic: str, ref: str | None) -> None:
+        """Suit un déplacement décidé au canon : placement à réévaluer sur `target`."""
+
+    @abc.abstractmethod
+    def stop_removed(self, name: str, host: str, *, pending_text: str,
+                     stop_text: str) -> dict | None:
+        """Arrête un agent retiré du canon (sauf en plein tour : arrêt demandé) ;
+        rend name et status, ou None s'il n'y avait rien à faire."""
+
+
+class Ephemerals(Domain):
+    """Agents éphémères (R14) : créés depuis la ligne de leur créateur."""
+
+    @abc.abstractmethod
+    def creator(self, name: str) -> dict | None:
+        """Le créateur : responsable, éphémère, statut, capacités, `alive`."""
+
+    @abc.abstractmethod
+    def create(self, name: str, creator: str, *, cwd: str | None,
+               ttl_seconds: float) -> dict | None:
+        """Crée l'éphémère atomiquement (INSERT … SELECT sur la ligne du
+        créateur) ; None si le nom est pris ou si le créateur a changé."""
+
+    @abc.abstractmethod
+    def exists(self, name: str) -> bool:
+        """Un agent de ce nom existe-t-il ?"""
+
+
+# --------------------------------------------------------------------------
+# registre des authentificateurs (§8.2) : verrou, journal des synchronisations
+# --------------------------------------------------------------------------
+
+class RegistryLockError(RuntimeError):
+    """Écriture du registre des authentificateurs hors du chemin autorisé."""
+
+
+#: preuve réservée aux pilotes : seul `Authenticators.lock_registry` d'un
+#: pilote rend un jeton (jamais un module métier)
+_LOCK_PROOF = object()
+
+
+class RegistryLock:
+    """Jeton : le verrou du registre est pris dans la transaction de `db`.
+
+    Rendu par `lock_registry` seulement (le constructeur refuse tout autre
+    appelant) ; l'écriture du registre revérifie de toute façon, auprès de la
+    base, que la session de `db` détient le verrou avant d'écrire."""
+
+    __slots__ = ("db",)
+
+    def __init__(self, db: Any, proof: object = None):
+        if proof is not _LOCK_PROOF:
+            raise RegistryLockError("RegistryLock : rendu par receipts.lock_registry seulement")
+        self.db = db
+
+
+class Authenticators(Domain):
+    """Registre de confiance des authentificateurs (`authenticators`), son
+    verrou et le journal des synchronisations (`authenticator_syncs`)."""
+
+    @abc.abstractmethod
+    def lock_registry(self) -> RegistryLock:
+        """Prend le verrou TRANSACTIONNEL du registre (clé du seul registre du
+        schéma) dans la transaction courante ; rend son jeton. Réentrant."""
+
+    @abc.abstractmethod
+    def registry_lock_held(self) -> bool:
+        """La session courante détient-elle le verrou du registre ?"""
+
+    @abc.abstractmethod
+    def under_registry_lock(self, work: Callable[[RegistryLock], Any]) -> Any:
+        """UNE transaction : verrou du registre pris AVANT tout contrôle, puis
+        `work(jeton)` (contrôles, lectures et écritures par `jeton.db`), puis
+        COMMIT ; toute exception annule la transaction entière."""
+
+    @abc.abstractmethod
+    def canon_refs(self, revocations: Sequence[str]) -> list[dict]:
+        """`canon_ref` distincts des lignes actives ou révoquées par sync."""
+
+    @abc.abstractmethod
+    def last_sync(self) -> dict | None:
+        """Dernière synchronisation appliquée (journal), ou None."""
+
+    @abc.abstractmethod
+    def journal_head(self) -> int | None:
+        """Id de la dernière ligne du journal, ou None s'il est vide."""
+
+    @abc.abstractmethod
+    def append_sync(self, *, root_member: str, root_commit: str, commits_json: str,
+                    branch: str, trust: str, host: str, summary_json: str,
+                    expected: int | None) -> bool:
+        """Journalise une synchronisation SI la dernière ligne est encore
+        `expected` (sinon rien, faux)."""
+
+    @abc.abstractmethod
+    def registered(self, *, approver: str | None, include_revoked: bool) -> list[dict]:
+        """Authentificateurs (actifs seulement, sauf `include_revoked`)."""
+
+    @abc.abstractmethod
+    def for_approver(self, approver: str) -> list[dict]:
+        """Tous les authentificateurs de l'approbateur, révoqués compris."""
+
+    @abc.abstractmethod
+    def active_holders(self, facade: str, credential_id: str) -> list[dict]:
+        """Approbateurs qui détiennent ce credential actif."""
+
+    @abc.abstractmethod
+    def update_meta(self, authenticator_id: int, *, level: str, aaguid: str | None,
+                    canon_ref: str) -> bool:
+        """Niveau, aaguid et provenance d'une ligne active (même clé)."""
+
+    @abc.abstractmethod
+    def revoke(self, authenticator_id: int, *, reason: str, canon_ref: str | None) -> bool:
+        """Révoque une ligne active, en notant le commit qui le constate."""
+
+    @abc.abstractmethod
+    def insert(self, record: dict) -> bool:
+        """Ajoute une ligne active ; faux si une ligne active a déjà ce credential."""
+
+
+# --------------------------------------------------------------------------
+# approbations permanentes bornées (`standing_approvals`, §8.3)
+# --------------------------------------------------------------------------
+
+class Grants(Domain):
+    """Grants et réservations. `register`, `reserve` et `release` sont chacune
+    UNE transaction (verrous, puis échéances recontrôlées à l'heure réelle de
+    la base après le dernier verrou) ; une échéance dépassée lève une erreur
+    de base `ameesh_echeance [expired|iat_future]`."""
+
+    @abc.abstractmethod
+    def register(self, *, approver: str, nonce: str, challenge: str, authenticator_id: int,
+                 receipt_json: str, connector: str, operations_json: str, action_class: str,
+                 max_amount: int, currency: str | None, exp: int, iat: int, until: int,
+                 clock_skew: int, registered_by: str) -> int | None:
+        """Consomme le nonce du reçu `standing` et crée le grant ; rend son id,
+        ou None (nonce déjà consommé, authentificateur révoqué)."""
+
+    @abc.abstractmethod
+    def reserve(self, grant_id: int, action_id: str, amount: int, *, reserved_by: str | None,
+                connector: str, operation: str, action_class: str,
+                currency: str | None) -> dict | None:
+        """Réserve `amount` pour la tentative ; None = pas de couverture."""
+
+    @abc.abstractmethod
+    def release(self, reservation_id: int, reason: str | None) -> dict | None:
+        """Libère une réservation (une seule fois) ; None si déjà libérée ou inconnue."""
+
+    @abc.abstractmethod
+    def live_reservations(self, action_id: str) -> list[dict]:
+        """`grant_id` des réservations vivantes de l'action, dans l'ordre."""
+
+    @abc.abstractmethod
+    def candidates(self, connector: str, operation: str, action_class: str, amount: int,
+                   currency: str | None) -> list[dict]:
+        """Grants qui pourraient couvrir l'action (pré-filtre sans verrou)."""
+
+    @abc.abstractmethod
+    def revoke(self, grant_id: int, by: str) -> bool:
+        """Révoque un grant actif."""
+
+    @abc.abstractmethod
+    def get(self, grant_id: int) -> dict | None:
+        """Un grant, ou None."""
+
+
+# --------------------------------------------------------------------------
+# index des fils lisibles (`thread_index`)
+# --------------------------------------------------------------------------
+
+class Threads(Domain):
+    """Index des fils (le fil lui-même vit chez son transport, hors base)."""
+
+    @abc.abstractmethod
+    def index(self, *, project: str, lot: str, transport: str, host: str, location: str,
+              entry_id: str, mailbox_ids: Sequence[int], author: str, excerpt: str,
+              ts: float, trace: dict) -> None:
+        """Compte l'entrée dans l'index du fil et, si elle porte des messages
+        de la boîte, y note `trace` (id externe) — en une seule écriture."""
+
+    @abc.abstractmethod
+    def indexed(self) -> list[dict]:
+        """Fils indexés, du plus récemment écrit au plus ancien."""
+
+
+# --------------------------------------------------------------------------
+# placement gouverné (colonnes de `agent_registry`, 0022)
+# --------------------------------------------------------------------------
+
+class Placements(Domain):
+    """Verdicts de placement écrits au registre (lecture seule)."""
+
+    @abc.abstractmethod
+    def recorded(self, host: str | None) -> list[dict]:
+        """Verdict, profil évalué et profil COURANT de chaque agent (de `host`
+        seulement si donné)."""
+
+
+# --------------------------------------------------------------------------
+# le stockage d'une connexion
+# --------------------------------------------------------------------------
+
+class Storage(abc.ABC):
+    """Les domaines du stockage, liés à une connexion ou une transaction."""
+
+    #: nom du pilote de stockage (`postgres`)
+    driver: str
+    #: la connexion (ou la transaction) sous-jacente
+    db: Any
+
+    agents: Agents
+    leases: Leases
+    pending_spend: PendingSpend
+    turn_costs: TurnCosts
+    mailbox: Mailbox
+    wakeups: Wakeups
+    keys: Keys
+    approvals: Approvals
+    nonces: Nonces
+    work: WorkItems
+    actions: Actions
+    action_source: ActionSource
+    canon: Canon
+    ephemerals: Ephemerals
+    authenticators: Authenticators
+    threads: Threads
+    grants: Grants
+    placements: Placements
