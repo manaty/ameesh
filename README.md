@@ -75,7 +75,14 @@ agent-mail doctor [--notify-test]              # pilote, schéma, migrations, LI
 
 Les **événements** (`--kind event`) réveillent l'agent comme un message, mais un
 lot d'événements n'en réveille qu'un par `AMEESH_EVENT_COALESCE` secondes
-(défaut 120) ; `--urgent` perce le regroupement.
+(défaut 120) ; `--urgent` perce le regroupement. Un `--urgent` venu d'un
+expéditeur habilité (`AMEESH_INTERRUPT_SENDERS`, demain une capacité du canon)
+**interrompt le tour en cours** : le harnais est arrêté, la consigne repart en
+attente et le message passe en tête. La **rotation de session** (résumé de
+reprise puis session neuve, seuils `AMEESH_SESSION_MAX_TOKENS` /
+`AMEESH_SESSION_MAX_TURN_SECONDS`) et l'**adoption d'un dossier de travail
+déplacé** (`AMEESH_WORKTREE_ROOTS`) sont décrites dans
+[`docs/V1-MAILBOX-RUNNER.md`](docs/V1-MAILBOX-RUNNER.md).
 
 If Postgres is unreachable, the CLI falls back to the v0 file mailbox
 (`~/.local/state/agent-mail`) with a readable warning on stderr; hooks fall back

@@ -39,7 +39,7 @@ import sys
 import threading
 import time
 
-from . import adapters, db as db_mod, mail, registry
+from . import adapters, db as db_mod, fil, mail, registry
 from .config import CHANNEL_LEASE, CHANNEL_MAIL, Config
 from .config import load as load_config
 
@@ -89,6 +89,48 @@ def log_async(message: str) -> None:
     _journal.write(message)
 
 
+def worktree_marker(cwd: str | None) -> dict:
+    """Identité git d'un dossier de travail (0018 : suivre un renommage).
+
+    `git_common_dir` est le dépôt commun (le même pour tous les worktrees) ;
+    la branche distingue les worktrees d'un même dépôt. Best-effort : renvoie
+    `{}` si le dossier n'est pas un dépôt ou si git manque.
+    """
+    if not cwd or not os.path.isdir(cwd):
+        return {}
+    try:
+        common = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, timeout=5)
+        branche = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if common.returncode != 0 or not common.stdout.strip():
+        return {}
+    return {
+        "cwd": os.path.abspath(cwd),
+        "git_common_dir": os.path.abspath(os.path.join(cwd, common.stdout.strip())),
+        "branch": branche.stdout.strip() if branche.returncode == 0 else "",
+    }
+
+
+def write_worktree_marker(cfg: Config, name: str, cwd: str) -> dict:
+    """Écrit le marqueur du dossier de travail dans l'état de l'agent."""
+    marker = worktree_marker(cwd)
+    if not marker:
+        return {}
+    directory = cfg.agent_dir(name)
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        with open(os.path.join(directory, "worktree.json"), "w", encoding="utf-8") as fh:
+            json.dump(marker, fh, ensure_ascii=False)
+    except OSError:
+        return {}
+    return marker
+
+
 class AgentWorker(threading.Thread):
     #: nombre d'échecs de battement consécutifs avant d'arrêter le harnais
     MAX_RENEW_FAILURES = 3
@@ -120,6 +162,15 @@ class AgentWorker(threading.Thread):
         self.watchdog_lock = threading.Lock()
         self.watchdog_on = False
         self.watchdog_stop = threading.Event()
+        #: message prioritaire : préempte le tour en cours (0018, R19)
+        self.preempting = threading.Event()
+        self._refus_vus: set[int] = set()
+        #: rotation de session (0018) : compteurs de la session courante
+        self.resume_summary = ""
+        self.session_turns = 0
+        self.session_tokens = 0.0
+        self.last_turn_seconds = 0.0
+        self.last_output = ""
 
     # -- état local --------------------------------------------------------
     def _path(self, name: str) -> str:
@@ -139,6 +190,17 @@ class AgentWorker(threading.Thread):
                 fh.write(session_id + "\n")
         except OSError:
             pass
+
+    def _fil_note(self, text: str, *, meta: dict | None = None) -> None:
+        """Trace d'audit dans le fil du projet de l'agent (R12) ; ne lève jamais."""
+        try:
+            chantier = (self.agent or {}).get("chantier") or ""
+            project = fil.project_for(self.cfg, chantier)
+            fil.record(self.cfg, self.db, sender=self.name, recipients=[], text=text,
+                       ts=time.time(), project=project,
+                       meta=dict(meta or {}, audit="runner"))
+        except Exception as exc:  # une trace ne casse jamais un tour
+            log("[%s] fil indisponible : %s" % (self.name, exc))
 
     # -- bail --------------------------------------------------------------
     def deadline_passed(self) -> bool:
@@ -425,6 +487,143 @@ class AgentWorker(threading.Thread):
             return True
         return self.idle_due()
 
+    def request_preempt(self) -> None:
+        """Un message prioritaire préempte le tour en cours (0018, R19).
+
+        Le tour est arrêté (SIGTERM bref puis SIGKILL), sa consigne repart en
+        attente, et `pick()` sert le message prioritaire en tête au tour suivant,
+        sur la même session.
+        """
+        self.preempting.set()
+        self.wake.set()
+
+    def _preempt_monitor(self, done: threading.Event) -> None:
+        """Arrête le harnais dès qu'un message prioritaire arrive (0018)."""
+        while not done.wait(0.1):
+            if self.preempting.is_set():
+                log("[%s] message prioritaire : arrêt du tour en cours" % self.name)
+                self.terminate(grace=1.0)
+                return
+
+    # -- rotation de session (0018) ----------------------------------------
+    def rotation_due(self) -> bool:
+        """Rotation due ? Jamais pendant un tour, jamais avant le minimum."""
+        if self.proc is not None:
+            return False
+        if self.session_turns < self.runner.session_min_turns:
+            return False
+        return (self.session_tokens >= self.runner.session_max_tokens
+                or self.last_turn_seconds >= self.runner.session_max_turn_seconds)
+
+    def _session_history(self, session_id: str | None, resume: str) -> None:
+        """Garde l'ancien id de session et son résumé (audit, 0018)."""
+        entry = {
+            "ts": time.time(), "session": session_id, "turns": self.session_turns,
+            "tokens": self.session_tokens,
+            "last_turn_s": round(self.last_turn_seconds, 1), "resume": resume[:2000],
+        }
+        try:
+            with open(self._path("session-history.jsonl"), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+    def maybe_rotate(self) -> bool:
+        """Résume la session courante puis en ouvre une neuve (0018, R19).
+
+        Le résumé est produit **dans** la session (un tour), écrit dans le fil
+        (R12), l'ancien id est conservé dans l'historique de l'état, puis la
+        session est oubliée : le prochain tour repart d'une session neuve,
+        préfixé par le résumé. Ne se déclenche jamais pendant un tour.
+        """
+        if not self.rotation_due():
+            return False
+        ancienne = (self.agent or {}).get("session_id") or self.read_session_file()
+        log("[%s] rotation de session (tours=%d, tokens=%.0f, dernier tour=%.0fs)"
+            % (self.name, self.session_turns, self.session_tokens, self.last_turn_seconds))
+        self.run_turn({"kind": "prompt", "prompt": adapters.SUMMARY_PROMPT, "ids": []})
+        resume = (self.last_output or "").strip()
+        if not resume:
+            log("[%s] rotation annulée : résumé vide" % self.name)
+            return False
+        self._session_history(ancienne, resume)
+        self.resume_summary = resume
+        registry.clear_session(self.db, self.name)
+        try:
+            os.unlink(self._path("session"))
+        except OSError:
+            pass
+        self.agent = registry.get(self.db, self.name) or self.agent
+        self.session_turns = 0
+        self.session_tokens = 0.0
+        self._fil_note(
+            "Rotation de session : l'ancien id (%s) est conservé dans "
+            "`session-history.jsonl` ; la session neuve repart du résumé ci-dessous.\n\n%s"
+            % (ancienne or "neuve", resume),
+            meta={"action": "rotation", "session": ancienne or ""})
+        return True
+
+    # -- dossier de travail déplacé (0018) ---------------------------------
+    def adopt_moved_worktree(self) -> str | None:
+        """Retrouve un dossier de travail déplacé, borné aux racines (0018).
+
+        Le marqueur git (common dir + branche) est écrit à l'inscription ; si le
+        cwd a disparu, on cherche un candidat **unique** sous les racines
+        configurées, en refusant un dossier déjà utilisé par un autre agent.
+        """
+        marqueur: dict = {}
+        try:
+            with open(self._path("worktree.json"), encoding="utf-8") as fh:
+                marqueur = json.load(fh) or {}
+        except (OSError, ValueError):
+            return None
+        common = marqueur.get("git_common_dir")
+        if not common:
+            return None
+        branche = marqueur.get("branch") or ""
+        ancien = self.agent.get("cwd")
+        candidats = []
+        for racine in self.runner.worktree_roots:
+            if not os.path.isdir(racine):
+                continue
+            for nom in sorted(os.listdir(racine)):
+                chemin = os.path.join(racine, nom)
+                if chemin == ancien or not os.path.isdir(chemin):
+                    continue
+                if not os.path.exists(os.path.join(chemin, ".git")):
+                    continue  # pas un dépôt/worktree : inutile d'appeler git
+                ident = worktree_marker(chemin)
+                if not ident or ident.get("git_common_dir") != common:
+                    continue
+                if branche and ident.get("branch") != branche:
+                    continue
+                candidats.append(chemin)
+        if len(candidats) != 1:
+            if len(candidats) > 1:
+                log("[%s] dossier déplacé ambigu : %s" % (self.name, ", ".join(candidats)))
+            return None
+        candidat = candidats[0]
+        if registry.cwd_used(self.db, candidat, self.name):
+            log("[%s] dossier déplacé %s déjà utilisé par un autre agent"
+                % (self.name, candidat))
+            return None
+        registry.upsert(self.db, self.name, cwd=candidat)
+        self.agent["cwd"] = candidat
+        log("[%s] dossier de travail déplacé adopté : %s" % (self.name, candidat))
+        self._fil_note("Dossier de travail déplacé adopté : %s" % candidat,
+                       meta={"action": "deplacement", "cwd": candidat})
+        return candidat
+
+    def interrupt_allowed(self, row: dict) -> bool:
+        """Un message ne préempte que s'il vient d'un expéditeur habilité (0018).
+
+        Sans canon (L2), `AMEESH_INTERRUPT_SENDERS` est la seule autorisation ;
+        la capacité « interrupt » d'une fiche canon s'ajoutera ici. Un urgent
+        non habilité est remis comme un message normal (et l'abus est journalisé).
+        """
+        sender = (row.get("sender") or row.get("from") or "").strip()
+        return bool(sender) and sender in self.cfg.interrupt_senders
+
     def pick(self) -> dict | None:
         """Le prochain tour à faire, ou None. Consomme la consigne en attente."""
         agent = registry.get(self.db, self.name)
@@ -434,6 +633,26 @@ class AgentWorker(threading.Thread):
             self.stopping.set()
             return None
         self.agent = agent
+        urgents = mail.unread_urgent(self.db, self.name)
+        autorises = [m for m in urgents if self.interrupt_allowed(m)]
+        for refuse in (m for m in urgents if m not in autorises):
+            mid = int(refuse.get("id") or 0)
+            if mid and mid not in self._refus_vus:
+                self._refus_vus.add(mid)
+                log("[%s] urgent ignoré : expéditeur %s non habilité à interrompre"
+                    % (self.name, refuse.get("sender") or "?"))
+        if autorises:
+            # Le prioritaire passe devant la consigne en attente : c'est lui qui
+            # ouvre le tour, la consigne interrompue suivra (0018).
+            self.nudged = False
+            return {
+                "kind": "urgent",
+                "prompt": "\n\n".join(
+                    adapters.PRIORITY_PROMPT % (
+                        m.get("sender") or "?", (m.get("body") or "")[:2000])
+                    for m in autorises),
+                "ids": [int(m["id"]) for m in autorises if m.get("id") is not None],
+            }
         prompt = registry.take_pending_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
         if prompt:
             self.nudged = False
@@ -466,8 +685,11 @@ class AgentWorker(threading.Thread):
             return None
         fenetre = self.runner.event_coalesce
         dernier = float(self.agent.get("last_event_ts") or 0.0)
-        if any(mail.is_urgent(m) for m in events) or fenetre <= 0 \
-                or (time.time() - dernier) >= fenetre:
+        # Seul un urgent d'un expéditeur habilité perce la fenêtre : un urgent
+        # non habilité reste soumis au regroupement (même règle que la
+        # préemption, 0018).
+        if any(mail.is_urgent(m) and self.interrupt_allowed(m) for m in events) \
+                or fenetre <= 0 or (time.time() - dernier) >= fenetre:
             registry.mark_event_wake(self.db, self.name)
             return {"kind": "event", "prompt": adapters.EVENT_PROMPT, "ids": ids}
         return None  # fenêtre de regroupement en cours : on attend la suivante
@@ -487,9 +709,13 @@ class AgentWorker(threading.Thread):
             return False
 
         session = self.agent.get("session_id") or self.read_session_file()
-        argv = adapter.command(spec["prompt"], session)
+        resume = ""
+        if self.resume_summary and not session:
+            # Session neuve après rotation (0018) : le résumé de reprise ouvre le tour.
+            resume = "Reprise de session après rotation — résumé :\n%s\n\n" % self.resume_summary
+        argv = adapter.command(resume + spec["prompt"], session)
         label = {"prompt": "consigne", "mail": "messages", "event": "événements",
-                 "idle": "reprise"}[spec["kind"]]
+                 "urgent": "prioritaire", "idle": "reprise"}[spec["kind"]]
         if self.runner.dry_run:
             log("[%s] tour %s (dry-run, session %s) : %s"
                 % (self.name, label, session or "neuve", " ".join(argv)))
@@ -500,6 +726,9 @@ class AgentWorker(threading.Thread):
             return False
 
         cwd = self.agent.get("cwd")
+        if not cwd or not os.path.isdir(cwd):
+            # Worktree renommé/déplacé (0018) : on tente une adoption bornée.
+            cwd = self.adopt_moved_worktree() or cwd
         if not cwd or not os.path.isdir(cwd):
             message = "dossier de travail absent : %r" % (cwd,)
             log("[%s] %s" % (self.name, message))
@@ -537,9 +766,16 @@ class AgentWorker(threading.Thread):
         cost: float | None = None
         error: str | None = None
         result_code = 0
+        self.last_output = ""
 
         heartbeat_done = threading.Event()
         threading.Thread(target=self._heartbeat, args=(heartbeat_done,), daemon=True).start()
+        preempt_done = threading.Event()
+        if spec["kind"] == "urgent":
+            # Ce tour sert justement le message prioritaire : le signal est consommé.
+            self.preempting.clear()
+        threading.Thread(target=self._preempt_monitor, args=(preempt_done,),
+                         daemon=True).start()
         try:
             with open(stderr_path, "ab") as stderr:
                 proc = subprocess.Popen(
@@ -556,6 +792,8 @@ class AgentWorker(threading.Thread):
             if self.kill_if_lease_lost():
                 log_async("[%s] bail perdu pendant le lancement : arrêt du harnais"
                           % self.name)
+            if resume:
+                self.resume_summary = ""  # le résumé a ouvert la session neuve
             log("[%s] tour %s : %s" % (self.name, label, " ".join(argv[:6]) + " …"))
             with open(events_path, "a", encoding="utf-8") as events:
                 for line in proc.stdout or ():
@@ -571,6 +809,11 @@ class AgentWorker(threading.Thread):
                         registry.set_session(self.db, self.name, session_new)
                     for text in parsed.get("display") or []:
                         log("[%s] %s" % (self.name, text))
+                        self.last_output = (self.last_output + "\n" + text)[-4000:]
+                    usage = parsed.get("usage")
+                    if isinstance(usage, dict):
+                        self.session_tokens += float(usage.get("input_tokens") or 0) \
+                            + float(usage.get("output_tokens") or 0)
                     if parsed.get("cost") is not None:
                         cost = parsed["cost"]
                     if parsed.get("error"):
@@ -582,6 +825,7 @@ class AgentWorker(threading.Thread):
             result_code = proc.wait()
         finally:
             heartbeat_done.set()
+            preempt_done.set()
             # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
             # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
             # du veilleur une fois `self.proc` effacé (sonde codex3 B5a-S).
@@ -591,7 +835,9 @@ class AgentWorker(threading.Thread):
                 self.pgid = None
 
         duration = time.time() - started
+        self.last_turn_seconds = duration
         lost = self.lease_lost.is_set()
+        preempte = self.preempting.is_set()
         ok = result_code == 0 and not lost and not error
         if error is None and result_code != 0:
             error = "le harnais a rendu le code %d" % result_code
@@ -604,6 +850,18 @@ class AgentWorker(threading.Thread):
             # l'état d'un agent qu'un remplaçant a pu reprendre.
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
+        if preempte:
+            # Message prioritaire reçu pendant le tour (0018) : la consigne
+            # repart en attente, `pick()` servira le message en tête au tour
+            # suivant, sur la même session. Le fil garde la trace.
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            registry.set_status(self.db, self.name, "queued",
+                                status_text="tour interrompu : message prioritaire")
+            self._fil_note(
+                "Tour interrompu par un message prioritaire ; la consigne du tour "
+                "repart en attente et le message prioritaire passe en tête.",
+                meta={"action": "interruption", "tour_s": round(duration, 1)})
+            return False
         if not ok:
             # B6a : le tour n'a pas abouti, la consigne repart en attente au lieu
             # d'être effacée par end_turn. Au pire elle est rejouée.
@@ -615,11 +873,13 @@ class AgentWorker(threading.Thread):
             error=error, cost_usd=cost,
         )
         self.last_activity = time.monotonic()
+        if ok:
+            self.session_turns += 1
         if spec["kind"] == "idle":
             self.nudged = True
         with self.runner.lock:
             self.runner.turns += 1
-        if spec["kind"] in ("mail", "event") and ok and spec["ids"]:
+        if spec["kind"] in ("mail", "event", "urgent") and ok and spec["ids"]:
             # Si le hook du harnais les a déjà remis, c'est un no-op.
             mail.mark_delivered(self.db, spec["ids"])
         return ok
@@ -642,6 +902,7 @@ class AgentWorker(threading.Thread):
         self.ensure_watchdog()
         deadline = time.monotonic() + max(0.0, wait_seconds)
         while True:
+            self.maybe_rotate()
             spec = self.pick()
             if spec:
                 self.run_turn(spec)
@@ -658,6 +919,7 @@ class AgentWorker(threading.Thread):
             while not self.stopping.is_set() and not self.runner.stop.is_set():
                 if not self.renew():
                     break
+                self.maybe_rotate()
                 spec = self.pick()
                 if spec is None:
                     self.wake.wait(timeout=self.wait_timeout(
@@ -698,6 +960,10 @@ class Runner:
         self.idle_nudge = cfg.idle_nudge
         self.poll = max(1.0, cfg.poll)
         self.event_coalesce = max(0.0, cfg.event_coalesce)
+        self.session_max_tokens = max(0.0, cfg.session_max_tokens)
+        self.session_max_turn_seconds = max(0.0, cfg.session_max_turn_seconds)
+        self.session_min_turns = max(0, int(cfg.session_min_turns))
+        self.worktree_roots = tuple(cfg.worktree_roots)
         self.failure_backoff = 5.0
         self.stop = threading.Event()
         self.wake_all = threading.Event()
@@ -746,7 +1012,18 @@ class Runner:
             target = payload.get("to")
             with self.lock:
                 worker = self.workers.get(target) if target else None
-            if worker:
+            prioritaire = False
+            if worker is not None and payload.get("id"):
+                row = mail.get(self.db, int(payload["id"]))
+                if row and mail.is_urgent(row):
+                    prioritaire = worker.interrupt_allowed(row)
+                    if not prioritaire:
+                        log("urgent de %s ignoré : expéditeur non habilité à interrompre"
+                            % (row.get("sender") or "?"))
+            if worker and prioritaire:
+                log("message prioritaire pour %s : interruption du tour" % target)
+                worker.request_preempt()
+            elif worker:
                 log("message pour %s : réveil du tour" % target)
                 worker.wake.set()
             else:
@@ -871,6 +1148,13 @@ def cmd_register(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
     )
     if parsed.prompt:
         registry.set_pending_prompt(db, parsed.name, parsed.prompt)
+    if cwd:
+        # Identité git du dossier : elle permettra de le retrouver s'il est
+        # déplacé (0018), sans confondre deux worktrees du même dépôt.
+        marker = write_worktree_marker(cfg, parsed.name, cwd)
+        if marker:
+            log("dossier de travail %s : dépôt %s, branche %s"
+                % (cwd, marker["git_common_dir"], marker.get("branch") or "?"))
     log("agent %s inscrit : %s sur %s%s%s" % (
         parsed.name, parsed.harness, cfg.host,
         ", session %s" % parsed.session if parsed.session else "",

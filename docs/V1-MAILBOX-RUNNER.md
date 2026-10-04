@@ -296,6 +296,28 @@ test (trois messages → trois notifications) a attrapé le bug.
   interactif sur la **même session** (sans `-p`/`exec`/`--json`), le bail est
   renouvelé tant que la session vit, le harnais est tué si le bail est perdu, et
   le bail est rendu à la sortie.
+* **Interruption prioritaire (0018, R19)** : un message non remis marqué
+  `payload.urgent` venu d'un **expéditeur habilité** (`AMEESH_INTERRUPT_SENDERS`
+  sans canon ; la capacité « interrupt » d'une fiche canon s'ajoutera) arrête le
+  tour en cours (SIGTERM bref puis SIGKILL), remet la consigne du tour en
+  attente, et `pick()` sert le message prioritaire **en tête** au tour suivant,
+  sur la même session. Un urgent d'un expéditeur non habilité est remis comme un
+  message normal, et l'abus est journalisé ; le fil garde la trace de
+  l'interruption et de sa raison.
+* **Rotation de session (0018)** : quand la session dépasse
+  `AMEESH_SESSION_MAX_TOKENS` (défaut 150 000) ou qu'un tour a duré plus de
+  `AMEESH_SESSION_MAX_TURN_SECONDS` (défaut 900 s), après au moins
+  `AMEESH_SESSION_MIN_TURNS` tours (défaut 3) et **jamais pendant un tour**, un
+  tour de résumé est joué dans la session, le résumé est écrit dans le fil
+  (R12), l'ancien id de session est conservé dans
+  `<état>/<agent>/session-history.jsonl`, puis la session est oubliée : le tour
+  suivant ouvre une session neuve préfixée par le résumé.
+* **Dossier de travail déplacé (0018)** : à l'inscription, l'identité git du
+  dossier (dépôt commun + branche) est écrite dans
+  `<état>/<agent>/worktree.json`. Si le cwd a disparu, un candidat **unique**
+  est cherché sous `AMEESH_WORKTREE_ROOTS` (défaut `~/development`) ; il est
+  adopté (registre mis à jour, fil prévenu) s'il n'est pas déjà le cwd d'un
+  autre agent.
 * **Chemin de reprise** : la session est relue depuis le registre, sinon depuis
   le fichier `session`.
 * **Binaire des harnais** : `AMEESH_<HARNAIS>_BIN`, puis

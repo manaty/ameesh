@@ -473,6 +473,23 @@ def set_session(db: Db, name: str, session_id: str) -> None:
     )
 
 
+def clear_session(db: Db, name: str) -> None:
+    """Oublie la session (rotation, 0018) : le prochain tour repart d'une neuve."""
+    db.execute(
+        "UPDATE agent_registry SET session_id = NULL, updated_at = now() WHERE name = %s",
+        (name,),
+    )
+
+
+def cwd_used(db: Db, cwd: str, exclude: str) -> bool:
+    """Ce dossier de travail est-il déjà celui d'un autre agent ? (0018)"""
+    rows = db.query(
+        "SELECT 1 AS ok FROM agent_registry WHERE cwd = %s AND name <> %s LIMIT 1",
+        (cwd, exclude),
+    )
+    return bool(rows)
+
+
 def set_status(
     db: Db, name: str, status: str, status_text: str | None = None, error: str | None = None
 ) -> None:

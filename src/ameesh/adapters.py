@@ -32,6 +32,17 @@ EVENT_PROMPT = (
     "Des événements sont arrivés dans ta boîte agent-mail : lance agent-mail "
     "inbox, traite-les, puis continue ton travail sans attendre de confirmation."
 )
+#: message prioritaire : il préempte le tour en cours (0018, R19)
+PRIORITY_PROMPT = (
+    "Message prioritaire de %s :\n%s\n\n"
+    "Traite-le en priorité, puis reprends ton travail sans attendre de confirmation."
+)
+#: rotation de session : résumé de reprise produit avant d'ouvrir une session neuve
+SUMMARY_PROMPT = (
+    "Résume cette session pour la reprendre dans une session neuve : état du lot, "
+    "décisions prises, fichiers touchés, prochaine action. Sois concis et factuel, "
+    "sans outils : ce résumé sera le seul contexte de la session suivante."
+)
 IDLE_PROMPT = (
     "Reprise : si ton lot n'est ni gelé ni fusionné, continue-le ; sinon prends "
     "la suite de ton affectation (board, workstream). Si tu n'as rien à faire, "
@@ -202,6 +213,8 @@ class ClaudeAdapter(HarnessAdapter):
             out["display"] = ["== fin du tour : %s" % (event.get("result") or "")[:300]]
             if isinstance(event.get("total_cost_usd"), (int, float)):
                 out["cost"] = float(event["total_cost_usd"])
+            if isinstance(event.get("usage"), dict):
+                out["usage"] = event["usage"]  # rotation de session (0018)
             if event.get("session_id"):
                 out["session"] = event["session_id"]
             if event.get("is_error"):
