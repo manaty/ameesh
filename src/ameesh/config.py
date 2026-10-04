@@ -99,6 +99,9 @@ class Config:
     #: regroupement des événements (C9) : au plus un réveil par ce délai,
     #: sauf événement `urgent`. 0 = aucun regroupement.
     event_coalesce: float = 120.0
+    #: périodicité de `canon sync` par l'exécuteur (spec §4.4) ; 0 = seulement
+    #: au démarrage. Sans canon configuré, rien n'est lancé.
+    canon_sync_interval: float = 300.0
     #: expéditeurs autorisés à interrompre un tour (0018, R19) ; sans canon,
     #: c'est la seule autorisation. Vide = personne.
     interrupt_senders: tuple[str, ...] = ()
@@ -219,6 +222,9 @@ def load(env: dict | None = None) -> Config:
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
         event_coalesce=_as_float(
             pick("AMEESH_EVENT_COALESCE", "AGENT_MESH_EVENT_COALESCE"), cfg.event_coalesce),
+        canon_sync_interval=_as_float(
+            pick("AMEESH_CANON_SYNC_INTERVAL", "AGENT_MESH_CANON_SYNC_INTERVAL"),
+            cfg.canon_sync_interval),
         interrupt_senders=_as_names(
             pick("AMEESH_INTERRUPT_SENDERS", "AGENT_MESH_INTERRUPT_SENDERS")
         ) or cfg.interrupt_senders,

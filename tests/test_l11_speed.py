@@ -192,5 +192,69 @@ class DeplacementTest(PgTestCase):
         self.assertIsNone(worker.adopt_moved_worktree())
 
 
+class CanonSyncTest(PgTestCase):
+    """Spec §4.4 : l'exécuteur lance `canon sync` au démarrage puis périodiquement."""
+
+    def _runner(self, *, canon: str = "", interval: float = 300.0) -> Runner:
+        cfg = dataclasses.replace(self.cfg, canon=canon, canon_sync_interval=interval)
+        return Runner(cfg, self.db, once=True)
+
+    def test_sans_canon_aucun_sync(self):
+        runner = self._runner()
+        with mock.patch("ameesh.canon_sync.sync") as sync:
+            self.assertTrue(runner.canon_sync_once())
+        sync.assert_not_called()
+
+    def test_sync_appelle_le_canon_de_l_hote(self):
+        runner = self._runner(canon="/tmp/canon-fictif")
+        appels: list = []
+
+        def faux_sync(db, canon, host):
+            appels.append((canon, host))
+            return type("R", (), {"status": "ok"})()
+
+        with mock.patch("ameesh.canon.from_config", return_value="canon-fictif"), \
+                mock.patch("ameesh.canon_sync.sync", side_effect=faux_sync):
+            self.assertTrue(runner.canon_sync_once())
+        self.assertEqual(appels, [("canon-fictif", self.cfg.host)])
+
+    def test_sync_en_echec_ne_leve_pas(self):
+        runner = self._runner(canon="/tmp/canon-fictif")
+        with mock.patch("ameesh.canon.from_config", side_effect=OSError("canon absent")):
+            self.assertFalse(runner.canon_sync_once())
+
+    def test_one_shot_synchronise_au_demarrage(self):
+        runner = self._runner(canon="/tmp/canon-fictif")
+        appels: list = []
+        with mock.patch.object(Runner, "canon_sync_once",
+                               side_effect=lambda: appels.append(1) or True):
+            runner.start_canon_sync()
+        self.assertEqual(appels, [1])  # en ligne, pas de fil pour un one-shot
+        self.assertIsNone(runner.canon_thread)
+
+    def test_intervalle_nul_synchronise_seulement_au_demarrage(self):
+        runner = self._runner(canon="/tmp/canon-fictif", interval=0.0)
+        appels: list = []
+        with mock.patch.object(Runner, "canon_sync_once",
+                               side_effect=lambda: appels.append(1) or True):
+            runner.start_canon_sync()
+        self.assertEqual(appels, [1])
+        self.assertIsNone(runner.canon_thread)
+
+    def test_boucle_periodique_demarree_puis_arretee(self):
+        runner = self._runner(canon="/tmp/canon-fictif", interval=3600.0)
+        runner.once = False
+        appels: list = []
+        with mock.patch.object(Runner, "canon_sync_once",
+                               side_effect=lambda: appels.append(1) or True):
+            runner.start_canon_sync()
+            self.wait_for(lambda: appels, timeout=3)
+            self.assertIsNotNone(runner.canon_thread)
+            self.assertTrue(runner.canon_thread.is_alive())
+            runner.stop.set()
+            runner.canon_thread.join(timeout=5)
+            self.assertFalse(runner.canon_thread.is_alive())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -39,7 +39,7 @@ import sys
 import threading
 import time
 
-from . import adapters, db as db_mod, fil, mail, registry
+from . import adapters, canon as canon_mod, canon_sync, db as db_mod, fil, mail, registry
 from .config import CHANNEL_LEASE, CHANNEL_MAIL, Config
 from .config import load as load_config
 
@@ -971,6 +971,9 @@ class Runner:
         self.lock = threading.Lock()
         self.listener = None          # écouteur LISTEN/NOTIFY courant
         self.listener_thread = None
+        #: `canon sync` de l'hôte : au démarrage puis périodiquement (spec §4.4)
+        self.canon_sync_interval = max(0.0, cfg.canon_sync_interval)
+        self.canon_thread: threading.Thread | None = None
         self.turns = 0
         self.did_turn = False
 
@@ -1078,9 +1081,68 @@ class Runner:
             worker.release_lease()
         log("arrêt : %d bail(aux) rendu(s), %d tour(s)" % (len(workers), self.turns))
 
+    # -- canon sync (spec §4.4) --------------------------------------------
+    def canon_sync_once(self) -> bool:
+        """Un `canon sync` de l'hôte ; ne lève jamais, ne tue jamais un tour.
+
+        Le canon est relu à chaque passe (`from_config`) et l'état est écrit par
+        `canon_sync.sync` ; un canon illisible enregistre l'état `unreadable`,
+        ce qui ferme la réclamation (L2) sans toucher aux baux ni aux tours en
+        cours. Un échec — canon, git, base — est journalisé et rend `False`.
+        """
+        if not self.cfg.canon:
+            return True
+        db = None
+        try:
+            db = db_mod.connect(self.cfg)
+            db_mod.require_schema(db)
+            canon = canon_mod.from_config(self.cfg)
+            report = canon_sync.sync(db, canon, self.host)
+            status = getattr(report, "status", None)
+            if status and status != canon_sync.CANON_OK:
+                log_async("canon sync : %s (%s)"
+                          % (status, getattr(report, "diagnostic", None) or "sans détail"))
+            return True
+        except Exception as exc:  # jamais fatal : le canon ferme, il ne tue pas
+            log_async("canon sync en échec : %s" % " ".join(str(exc).split())[:200])
+            return False
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    def _canon_sync_loop(self) -> None:
+        while not self.stop.is_set():
+            self.canon_sync_once()
+            if self.stop.wait(self.canon_sync_interval):
+                return
+
+    def start_canon_sync(self) -> None:
+        """Lance le sync du canon : immédiat, puis périodique (spec §4.4).
+
+        Sans canon configuré ou avec un intervalle nul, il n'y a rien à faire.
+        En mode `--once`, le sync est fait en ligne (le fil n'aurait pas le
+        temps de tourner) ; sinon un fil dédié s'en charge.
+        """
+        if not self.cfg.canon or self.canon_sync_interval <= 0:
+            if self.cfg.canon:
+                self.canon_sync_once()  # seulement au démarrage
+            return
+        if self.once:
+            self.canon_sync_once()
+            return
+        if self.canon_thread is not None:
+            return
+        self.canon_thread = threading.Thread(
+            target=self._canon_sync_loop, daemon=True, name="canon-sync")
+        self.canon_thread.start()
+
     def run(self) -> int:
         log("démarrage : hôte %s, exécuteur %s, pilote %s, schéma %s"
             % (self.host, self.runner_id, self.db.name, self.cfg.schema))
+        self.start_canon_sync()
         if self.once:
             self.sweep()
             if not self.did_turn:

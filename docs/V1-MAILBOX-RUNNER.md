@@ -318,6 +318,14 @@ test (trois messages → trois notifications) a attrapé le bug.
   est cherché sous `AMEESH_WORKTREE_ROOTS` (défaut `~/development`) ; il est
   adopté (registre mis à jour, fil prévenu) s'il n'est pas déjà le cwd d'un
   autre agent.
+* **`canon sync` par l'exécuteur (spec §4.4)** : quand un canon est configuré,
+  l'exécuteur lance `canon sync` pour son hôte **au démarrage**, puis
+  périodiquement (`AMEESH_CANON_SYNC_INTERVAL`, défaut 300 s ; 0 = seulement au
+  démarrage). Le sync tourne dans son propre fil avec sa propre connexion ; un
+  échec (canon illisible, git, base) est journalisé par la file bornée et
+  **n'arrête jamais l'exécuteur ni un tour** : un canon illisible ferme la
+  réclamation via `canon_state`, ce que L2 fait déjà. Sans canon configuré,
+  rien n'est lancé.
 * **Chemin de reprise** : la session est relue depuis le registre, sinon depuis
   le fichier `session`.
 * **Binaire des harnais** : `AMEESH_<HARNAIS>_BIN`, puis

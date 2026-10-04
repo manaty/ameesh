@@ -82,7 +82,10 @@ attente et le message passe en tête. La **rotation de session** (résumé de
 reprise puis session neuve, seuils `AMEESH_SESSION_MAX_TOKENS` /
 `AMEESH_SESSION_MAX_TURN_SECONDS`) et l'**adoption d'un dossier de travail
 déplacé** (`AMEESH_WORKTREE_ROOTS`) sont décrites dans
-[`docs/V1-MAILBOX-RUNNER.md`](docs/V1-MAILBOX-RUNNER.md).
+[`docs/V1-MAILBOX-RUNNER.md`](docs/V1-MAILBOX-RUNNER.md). Quand un canon est
+configuré, l'exécuteur lance `canon sync` au démarrage puis toutes les
+`AMEESH_CANON_SYNC_INTERVAL` secondes (défaut 300) ; un échec ne l'arrête
+jamais.
 
 If Postgres is unreachable, the CLI falls back to the v0 file mailbox
 (`~/.local/state/agent-mail`) with a readable warning on stderr; hooks fall back
