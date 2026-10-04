@@ -225,8 +225,7 @@ src/ameesh/
   mail.py         agent_mailbox: send, unread, deliver, history
   fil.py          readable threads: Transport, file transport, index, ameesh fil
   migrations.py   NNNN_name.sql, checksummed, advisory-locked
-  migrations/     0001_init.sql … 0008_canon.sql
-  migrations/     0001_init.sql … 0007, 0009_threads.sql (0008 reserved)
+  migrations/     0001_init.sql … 0009_threads.sql, 0014_cost.sql (numéros réservés : 0010–0013, 0015–0021)
   mesh_cli.py     agent-mesh: mesh list, keys, approvals, work items, import/export v0
   authority.py    Ed25519 proofs bound to content and expiry; approvals
   signing.py      Ed25519 (pure RFC 8032 + optional cryptography/nacl), key files
