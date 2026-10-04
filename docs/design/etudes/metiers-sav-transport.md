@@ -33,9 +33,9 @@ sources:
 - **Karrio** (LGPL-3.0, sauf `ee/`) comme passerelle transporteurs : DHL, UPS,
   FedEx, Chronopost en production ; GLS et DPD absents.
 - **Fleetbase** (AGPL-3.0) seulement pour des tournées d'enlèvement en propre.
-- **Pour ThePackengers** : l'organisation a déjà ses propres systèmes
-  (`transport-manager`, `quote-manager`…) ; ses « outils métier » sont d'abord
-  ses API. Odoo et Karrio sont la référence open source pour les autres.
+- **Une organisation qui a déjà ses propres systèmes métier** (gestion du
+  transport, devis…) branche d'abord ses API comme outils métier ; Odoo et
+  Karrio sont la référence open source pour les autres.
 
 # Agents hors code
 

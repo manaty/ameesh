@@ -1,6 +1,6 @@
 ---
 type: Specification
-title: "Exigences d'ameesh (R1–R17)"
+title: "Exigences d'ameesh (R1–R20)"
 description: "Les exigences de la spec mesh d'origine (R1–R7), généralisées, et celles ajoutées par les décisions du 2026-10-03 (R8–R17)."
 status: draft
 tags: [exigences, specification]
@@ -36,6 +36,9 @@ sources:
 | R15 | **Projets vivants** : un projet a des humains responsables, un ou plusieurs orchestrateurs, des membres (parfois partagés), un canon et des dépendances ; il se crée, se scinde, fusionne ou s'archive avec une filiation tracée. | [0010](decisions/0010-responsabilite-et-orchestrateurs.md) |
 | R16 | **Décisions sans relais** : une décision prise dans n'importe quelle conversation humain–agent est enregistrée dans le canon du projet (une décision par fichier) ; les orchestrateurs la lisent là. | [0010](decisions/0010-responsabilite-et-orchestrateurs.md) |
 | R17 | **Attention humaine** : chaque humain a une file unique des décisions qui l'attendent, tous projets confondus. | [0010](decisions/0010-responsabilite-et-orchestrateurs.md) |
+| R18 | **Placement gouverné** : quel agent tourne sur quel hôte, et avec une clé d'API ou un forfait, est décidé par le responsable ameesh du projet (ou l'infra à qui il délègue), dans les limites de la politique posée par le responsable de chaque hôte ; ameesh facilite cette gestion et la supervise. | [0014](decisions/0014-orchestrateurs-a-tours-et-placement.md) |
+| R19 | **Vitesse** : revue proportionnée à la classe de risque (déclarée au canon par portée de fichiers) ; interruption de tour par message prioritaire ; rotation de session avec résumé de reprise ; sessions robustes au déplacement ; délais par lot mesurés. | [0018](decisions/0018-vitesse-des-agents.md) |
+| R20 | **Budgets** : modèle et effort par tâche ; plafonds par harnais, agent et projet ; jamais de dépassement d'un forfait, lu à sa source ; comptabilité par tour. | [0019](decisions/0019-budgets-et-routage.md) |
 
 # Protocole d'exécution d'une action irréversible (R5)
 

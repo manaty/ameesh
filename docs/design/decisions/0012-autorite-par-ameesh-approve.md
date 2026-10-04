@@ -27,15 +27,16 @@ ils peuvent lire ce fichier, et tous peuvent enregistrer une clé `owner` en bas
 - **Population mixte** : parmi les humains, **certains utiliseront Nexlink,
   d'autres non**. Les premiers approuvent depuis l'application Nexlink (clés
   d'appareil non exportables) ; les autres par une passkey (page WebAuthn).
-- **Pour TPK, une application mobile native sera peut-être nécessaire.**
+- Une **application mobile native** pourra être nécessaire pour certaines organisations : ameesh en prévoit les interfaces ([0015](0015-interfaces-des-facades.md)).
 
 # Conséquences
 
 - ameesh-approve a **plusieurs façades d'approbation** derrière **un seul format
   de reçu** et une seule vérification : page WebAuthn (open source, par défaut),
-  application Nexlink (native), application mobile native ameesh (Keystore /
-  Secure Enclave ; affiche elle-même l'objet et signe — le meilleur « ce que
-  vous voyez est ce que vous signez »).
+  application Nexlink (native), application mobile native développée par une
+  organisation sur les interfaces publiques d'ameesh (Keystore / Secure
+  Enclave ; affiche elle-même l'objet et signe — le meilleur « ce que vous
+  voyez est ce que vous signez »).
 - Le registre des clés publiques vit dans le canon OKF (PR revue) et associe
   chaque humain à un ou plusieurs authentificateurs ; la politique peut exiger
   un niveau (application native ou clé matérielle pour les actions sensibles).

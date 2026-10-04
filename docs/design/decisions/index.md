@@ -13,3 +13,9 @@
 * [L'hébergement est une configuration, préparée par le harnais de l'utilisateur](0011-hebergement-configurable.md) - Local, page Nexlink ou VPS provisionné ; installation conduite par le harnais que l'utilisateur a déjà.
 * [Abandon de la cérémonie Ed25519 ; autorité par ameesh-approve](0012-autorite-par-ameesh-approve.md) - Passkey, application Nexlink ou application native ; un seul format de reçu.
 * [Licence d'ameesh : AGPL-3.0-only, avec accord de contribution](0013-licence-agpl.md) - Termes figés à la v3 ; CLA pour les contributions externes.
+* [Orchestrateurs à tours ; placement décidé par les humains responsables](0014-orchestrateurs-a-tours-et-placement.md) - Attachement interactif ; politique par hôte ; clé d'API ou forfait choisi par le responsable.
+* [Aucun client nommé ; interfaces publiques pour bâtir les façades](0015-interfaces-des-facades.md) - Applications tierces, dont mobiles natives, sans imposer Nexlink.
+* [Stockage : Postgres en v1, SQL derrière une interface, SQLite plus tard](0016-stockage.md) - Postgres installé par l'installateur en local ; pilote SQLite pour le mode perso ensuite.
+* [ameesh-approve joignable via une page Nexlink](0017-approbation-via-page-nexlink.md) - Exposition HTTPS du service d'approbation pour la bascule.
+* [Vitesse des agents](0018-vitesse-des-agents.md) - Revue par classe de risque, interruption, rotation de session, délais mesurés.
+* [Budgets et routage](0019-budgets-et-routage.md) - Modèle et effort par tâche, plafonds, jauges de forfait lues à la source.
