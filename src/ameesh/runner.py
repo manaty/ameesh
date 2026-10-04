@@ -279,10 +279,11 @@ class AgentWorker(threading.Thread):
                 return True  # on laisse une chance au prochain battement
             # Perte définitive : arrêter avant d'écrire quoi que ce soit (un
             # journal bloqué ne doit pas retarder le SIGKILL, comme sur les
-            # autres chemins de perte — revue codex3 de 852c8da).
+            # autres chemins de perte — revue codex3 de 852c8da). Le diagnostic
+            # part après le signal, par la file bornée.
             self.lease_lost.set()
-            log_async(echec)
             self.stop_group_now("base injoignable", grace=0, hard=True)
+            log_async(echec)
             return False
         if expires is None:
             self.lease_lost.set()
