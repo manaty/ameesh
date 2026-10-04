@@ -702,10 +702,14 @@ def transport_for(cfg: Config) -> FileTransport:
 # --------------------------------------------------------------------------
 
 def member(cfg: Config, name: str) -> str:
-    """`human:<nom>` pour un humain déclaré (AMEESH_HUMANS), `agent:<nom>` sinon."""
+    """`human:<nom>` pour un humain déclaré (AMEESH_HUMANS), `agent:<nom>` sinon.
+
+    Un nom déjà qualifié (`human:`, `agent:`, ou `ameesh:<acteur>` pour un
+    outil qui n'est ni l'un ni l'autre) reste tel quel : un nom d'agent ne
+    contient jamais `:`."""
     if name == "all":
         return "tous"
-    if name.startswith(("human:", "agent:")):
+    if ":" in name:
         return name
     return ("human:%s" if name in cfg.human_names else "agent:%s") % name
 
@@ -736,6 +740,11 @@ def _warn(text: str) -> None:
         print("ameesh fil : %s" % text, file=sys.stderr)
     except Exception:
         pass
+
+
+def warn(text: str) -> None:
+    """Dit un problème de fil sur stderr ; ne lève jamais."""
+    _warn(text)
 
 
 def record(cfg: Config, db, *, sender: str, recipients: Sequence[str], text: str,

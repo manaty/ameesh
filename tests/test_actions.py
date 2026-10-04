@@ -8,6 +8,9 @@ FAUX `gh` (tests/fakebin/gh) — jamais le vrai, aucun réseau.
 """
 from __future__ import annotations
 
+import contextlib
+import dataclasses
+import io
 import json
 import os
 import subprocess
@@ -16,7 +19,7 @@ import threading
 import time
 import unittest
 
-from ameesh import actions, jcs, receipts, work
+from ameesh import actions, fil, jcs, receipts, work
 from ameesh import db as db_mod
 from ameesh.actions import ActionError
 from ameesh.connectors import Outcome
@@ -1336,6 +1339,114 @@ class ActionsUnknownTest(ActionsBase):
         self.wait_for(lambda: self.pr()["state"] == "MERGED")  # l'effet a eu lieu
         result = actions.reconcile(self.db, action["action_id"], self.gh(), by=ALICE)
         self.assertEqual(result["state"], "confirmed")
+
+
+# --------------------------------------------------------------------------
+# fil lisible (§7.1) : chaque transition y est écrite
+# --------------------------------------------------------------------------
+
+class ActionsThreadTest(ActionsBase):
+    def entries(self, project: str = "demo", lot=None) -> list:
+        return fil.transport_for(self.cfg).read(fil.ThreadRef(project, lot))
+
+    def events(self, project: str = "demo", lot=None) -> list:
+        return [(e.meta.get("action_id"), e.meta.get("event"))
+                for e in self.entries(project, lot)]
+
+    def test_cycle_dans_le_fil_sans_secret(self):
+        secret = "s3cr3t-" + "x" * 8
+        opaque = "A" * 64
+        action = self.propose(args={"subject": "facture de mars", "n": 1, "api_token": secret,
+                                    "blob": opaque, "lignes": [1, 2, 3]},
+                              approvers=[ALICE])
+        receipt = self.receipt(action)
+        self.approve(action, receipt)
+        self.assertEqual(self.execute(action)["state"], "confirmed")
+        entries = self.entries()
+        action_id = action["action_id"]
+        self.assertEqual(self.events(), [(action_id, event) for event in
+                                         ("proposed", "approved", "launched", "confirmed")])
+        proposed, approved, launched, confirmed = entries
+        self.assertEqual((proposed.author, proposed.recipient), (AGENT, ALICE))
+        self.assertEqual((approved.author, launched.author), (ALICE, "ameesh:porte"))
+        self.assertIn("Action %s proposée par %s : shell-noop send sur client:42 (projet demo, "
+                      "classe irreversible)" % (action_id, AGENT), proposed.text)
+        self.assertIn("approbation humaine (reçu) requise ; approbateurs : human:alice",
+                      proposed.text)
+        self.assertIn("api_token=<masqué>", proposed.text)
+        self.assertIn("blob=<masqué, 64 caractères>", proposed.text)
+        self.assertIn("lignes=[3 élément(s)]", proposed.text)
+        self.assertIn("subject=facture de mars", proposed.text)
+        self.assertIn("approuvée par human:alice (webauthn", approved.text)
+        self.assertIn("lancée", launched.text)
+        self.assertIn("confirmée", confirmed.text)
+        everything = "\n".join(e.text + json.dumps(e.meta) for e in entries)
+        request = receipt["request"]
+        for leak in (secret, opaque, request["nonce"], receipt["proof"]["signature"]):
+            self.assertNotIn(leak, everything)
+        self.assertEqual(confirmed.meta["state"], "confirmed")
+        self.assertEqual(confirmed.meta["attempt"], 1)
+        # le fil est indexé comme les messages
+        [row] = self.db.query("SELECT project, entries FROM thread_index")
+        self.assertEqual((row["project"], row["entries"]), ("demo", 4))
+
+    def test_lot_inconnue_reconciliation_annulation_remplacement(self):
+        item = work.add(self.db, title="Fusion du lot 7")
+        lossy = self.gh(mode="lose", view="absent")
+        action = self.propose("merge", connector=lossy, target=PR, args={"method": "squash"},
+                              work_item=int(item["id"]))
+        self.approve(action)
+        self.assertEqual(self.execute(action, lossy)["state"], "unknown")
+        actions.reconcile(self.db, action["action_id"], self.gh(), by=ALICE)
+        thread = self.entries("demo", str(item["id"]))
+        self.assertEqual([e.meta["event"] for e in thread],
+                         ["proposed", "approved", "launched", "unknown", "confirmed"])
+        self.assertIn("Aucune nouvelle tentative automatique : ameesh action reconcile %s"
+                      % action["action_id"], thread[3].text)
+        self.assertIn("réconciliation", thread[4].text)
+        self.assertEqual(self.entries(), [])                # le fil du lot, pas celui du projet
+
+        cancelled = self.propose()
+        actions.cancel(self.db, cancelled["action_id"], by=ALICE, note="plus utile")
+        self.assertEqual(self.events()[-1], (cancelled["action_id"], "cancelled"))
+        self.assertIn("plus utile", self.entries()[-1].text)
+
+        self.set_pr("o/r#13")
+        dropped = self.propose("merge", connector=self.gh(mode="drop"), target="o/r#13")
+        self.approve(dropped)
+        self.assertEqual(self.execute(dropped, self.gh(mode="drop"))["state"], "unknown")
+        new = actions.replace(self.db, dropped["action_id"],
+                              self.receipt(dropped, assume_duplicate=True), policy=POLICY,
+                              by=ALICE)
+        self.assertEqual(self.events()[-2:], [(dropped["action_id"], "replaced"),
+                                              (new["action_id"], "proposed")])
+        replaced, proposed = self.entries()[-2:]
+        self.assertIn("remplacée par %s (doublon assumé par human:alice)" % new["action_id"],
+                      replaced.text)
+        self.assertIn("Elle remplace %s" % dropped["action_id"], proposed.text)
+
+    def test_fil_inaccessible_ne_bloque_rien(self):
+        broken = os.path.join(self.tmp, "pas-un-dossier")
+        with open(broken, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        db = db_mod.connect(dataclasses.replace(self.cfg, threads_dir=broken))
+        try:
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                action = actions.propose(db, self.noop, project="demo", operation="send",
+                                         target="client:1", proposed_by=AGENT)
+                actions.cancel(db, action["action_id"], by=ALICE)
+        finally:
+            db.close()
+        self.assertEqual(self.get(action)["state"], "cancelled")
+        self.assertIn("écriture du fil impossible", err.getvalue())
+
+    def test_resume_des_arguments(self):
+        self.assertEqual(actions.args_summary({}), "aucun")
+        self.assertEqual(actions.args_summary({"password": "x", "n": None, "ok": True,
+                                               "o": {"a": 1}}),
+                         "n=null, o={1 clé(s)}, ok=true, password=<masqué>")
+        self.assertTrue(actions.args_summary({"t": "mot " * 30}).endswith("…"))
+        self.assertLessEqual(len(actions.args_summary({"k%d" % i: i for i in range(100)})), 200)
 
 
 # --------------------------------------------------------------------------

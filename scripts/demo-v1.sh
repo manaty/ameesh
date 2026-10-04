@@ -257,6 +257,8 @@ attendu 1 ameesh action execute "$ACTION"
 etape "9. Réconciliation"
 lance ameesh action reconcile "$ACTION"
 lance ameesh action show "$ACTION"
+note "chaque transition de l'action est aussi dans le fil du projet (spec §7.1) :"
+lance ameesh fil show acme-web --last 6
 FUSIONS=$("$PY" -c 'import json, sys; print(json.load(open(sys.argv[1]))["prs"]["acme/acme-web#7"]["merges"])' "$AMEESH_FAKE_GH_STATE")
 note "fusions réellement faites sur la PR (faux gh) : $FUSIONS — aucun doublon"
 note "le nonce du reçu a été consommé au lancement : le rejouer échoue"

@@ -45,8 +45,11 @@ vaut jamais décision d'assomption, et inversement. La nouvelle action
 et suit le protocole complet : elle exige sa propre approbation.
 
 Le journal (`action_events`) est écrit par déclencheur, dans la transaction
-de chaque transition. L'entrée de fil (C5, lot L4) n'est pas encore écrite :
-le journal est la source qu'indexera le fil.
+de chaque transition. Chaque transition (proposée, approuvée, lancée,
+confirmée, échouée, inconnue, annulée, remplacée) écrit aussi, APRÈS coup,
+une entrée lisible dans le fil du projet / du lot de l'action (§7.1, C5 :
+`_publish`, par `fil.record` qui ne lève jamais) : sans secret, arguments
+résumés.
 """
 from __future__ import annotations
 
@@ -58,7 +61,7 @@ import time
 
 from . import connectors as connectors_mod
 from . import db as db_mod
-from . import authority, jcs, receipts, work
+from . import authority, fil, jcs, receipts, work
 from .connectors import ACTION_CLASSES, SEVERITY, Action, ConnectorError, Outcome
 from .db import Db, DbError
 
@@ -303,6 +306,141 @@ def _event(db: Db, action: dict, event: str, actor: str, note: str) -> None:
         pass  # le refus lui-même est rendu à l'appelant ; le journal est un plus
 
 
+# --------------------------------------------------------------------------
+# fil lisible (§7.1, C5) : une entrée par transition
+# --------------------------------------------------------------------------
+
+#: transitions écrites dans le fil, et leur libellé
+THREAD_EVENTS = {
+    "proposed": "proposée", "approved": "approuvée", "launched": "lancée",
+    "confirmed": "confirmée", "failed": "échouée", "unknown": "— issue INCONNUE",
+    "cancelled": "annulée", "replaced": "remplacée",
+}
+#: une clé d'argument qui ressemble à un secret : valeur jamais recopiée
+_SECRET_KEY_RE = re.compile(r"secret|token|passw|key|auth|credential|cookie|signature|bearer",
+                            re.I)
+#: une valeur qui contient une longue suite base64/hex (jeton, clé…) : masquée
+_OPAQUE_RE = re.compile(r"[A-Za-z0-9+/=_-]{20,}")
+_THREAD_DETAIL_MAX = 300
+
+
+def args_summary(args, limit: int = 200) -> str:
+    """Arguments résumés pour le fil : clés, valeurs courtes ; jamais un secret.
+
+    Valeur d'une clé qui évoque un secret, ou qui contient une longue suite
+    opaque (jeton, clé, signature) : masquée ; objet ou liste : sa taille
+    seulement ; texte : 40 caractères au plus."""
+    if not isinstance(args, dict) or not args:
+        return "aucun"
+    parts = []
+    for key in sorted(args):
+        value = args[key]
+        if _SECRET_KEY_RE.search(str(key)):
+            shown = "<masqué>"
+        elif isinstance(value, dict):
+            shown = "{%d clé(s)}" % len(value)
+        elif isinstance(value, list):
+            shown = "[%d élément(s)]" % len(value)
+        elif isinstance(value, str):
+            text = " ".join(value.split())
+            if _OPAQUE_RE.search(text):
+                shown = "<masqué, %d caractères>" % len(text)
+            else:
+                shown = text if len(text) <= 40 else text[:39] + "…"
+        else:
+            shown = jcs.dumps(value)
+        parts.append("%s=%s" % (str(key)[:40], shown))
+    text = ", ".join(parts)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _one(text, limit: int = _THREAD_DETAIL_MAX) -> str:
+    line = " ".join(str(text or "").split())
+    return line if len(line) <= limit else line[: limit - 1] + "…"
+
+
+def transition_text(action: dict, event: str, *, detail: str = "") -> str:
+    """Texte lisible (autosuffisant) d'une transition, pour le fil."""
+    action_id = action["action_id"]
+    what = "%s %s sur %s" % (action["connector"], action["operation"],
+                             action.get("target") or "—")
+    attempt = int(action.get("attempts") or 0)
+    label = THREAD_EVENTS.get(event, event)
+    if event == "proposed":
+        money = ("" if action.get("amount") is None
+                 else ", montant %s %s" % (action["amount"], action.get("currency")))
+        approvers = action.get("approvers") or []
+        text = "Action %s proposée par %s : %s (projet %s, classe %s%s) — %s%s." % (
+            action_id, action["proposed_by"], what, action["project"], action["class"], money,
+            "approbation humaine (reçu) requise" if action["requires_receipt"] else "sans reçu",
+            " ; approbateurs : %s" % ", ".join(approvers) if approvers else "")
+        if action.get("replaces"):
+            text += " Elle remplace %s (doublon assumé par %s)." % (
+                action["replaces"], action.get("replace_approver") or "?")
+        text += " Arguments : %s. Empreinte %s." % (args_summary(action.get("args")),
+                                                   action["digest"])
+        return text
+    head = "Action %s %s (%s" % (action_id, label, what)
+    head += ", tentative %d)" % attempt if attempt and event != "approved" else ")"
+    if event == "approved":
+        tail = _one(detail or action.get("last_note")) or "approuvée"
+        return "%s : %s. Exécution : ameesh action execute %s." % (head, tail, action_id)
+    if event == "launched":
+        return "%s : appel du connecteur, clé d'idempotence %s." % (head, action_id)
+    if event == "confirmed":
+        ref = action.get("external_ref")
+        return "%s%s%s." % (head, " : réf. %s" % ref if ref else "",
+                            " — %s" % _one(detail) if detail else "")
+    if event == "failed":
+        return "%s : %s. Nouvelle tentative : ameesh action retry %s (nouveau reçu)." % (
+            head, _one(detail or action.get("last_error")) or "échec certain", action_id)
+    if event == "unknown":
+        return ("%s : %s. Aucune nouvelle tentative automatique : ameesh action reconcile %s, "
+                "puis décision humaine (ameesh decisions)." % (
+                    head, _one(detail or action.get("last_error")) or "issue inconnue",
+                    action_id))
+    if event == "cancelled":
+        return "%s : %s." % (head, _one(detail or action.get("last_note")) or "annulée")
+    if event == "replaced":
+        return "%s : remplacée par %s (doublon assumé par %s), à approuver." % (
+            head, action.get("replaced_by") or "?", action.get("replace_approver")
+            or _one(detail) or "?")
+    return "%s : %s." % (head, _one(detail or action.get("last_note")))
+
+
+def _author(actor: str) -> str:
+    """Auteur d'une entrée : `human:`/`agent:` tel quel, sinon ameesh (l'outil)."""
+    actor = (actor or "").strip()
+    if _MEMBER_RE.fullmatch(actor):
+        return actor
+    return "ameesh:%s" % (_one(actor, 64) or "action")
+
+
+def _publish(db: Db, action_id: str, event: str, actor: str, *, detail: str = "") -> None:
+    """Écrit la transition dans le fil du projet / du lot de l'action (§7.1).
+
+    Ne lève JAMAIS (`fil.record` non plus) : la transition est déjà faite en
+    base ; un fil inaccessible se dit sur stderr. Aucun secret : ni reçu, ni
+    nonce, ni jeton ; les arguments sont résumés (`args_summary`)."""
+    cfg = getattr(db, "cfg", None)
+    if cfg is None:
+        return
+    try:
+        action = get(db, action_id)
+        if action is None:
+            return
+        fil.record(
+            cfg, db, sender=_author(actor),
+            recipients=list(action.get("approvers") or []) or ["all"],
+            text=transition_text(action, event, detail=detail),
+            project=action["project"], lot=action.get("work_item"),
+            meta={"action_id": action_id, "event": event, "state": action["state"],
+                  "attempt": int(action.get("attempts") or 0) or None})
+    except Exception as exc:  # noqa: BLE001 - le fil est un plus, jamais un obstacle
+        fil.warn("transition %s de %s non écrite dans le fil (%s)"
+                 % (event, action_id, _one(exc, 200)))
+
+
 def to_action(row: dict, attempt: int | None = None) -> Action:
     return Action(
         action_id=row["action_id"], project=row["project"], connector=row["connector"],
@@ -415,6 +553,7 @@ def propose(db: Db, connector, *, project: str, operation: str, target: str,
     action = _require(db, action_id)
     if digest(action) != action_digest:  # l'aller-retour jsonb ne doit rien changer
         raise ActionError(INVALID, "empreinte instable après enregistrement (%s)" % action_id)
+    _publish(db, action_id, "proposed", proposed_by)
     return action
 
 
@@ -540,6 +679,7 @@ def _bind(db: Db, action: dict, auth: dict, *, from_states: tuple, by: str) -> d
         current = _require(db, action["action_id"])
         raise ActionError(STATE, "action %s modifiée entre-temps (état %s)"
                           % (action["action_id"], current["state"]))
+    _publish(db, action["action_id"], "approved", by)
     return _require(db, action["action_id"])
 
 
@@ -698,6 +838,9 @@ def _record_late(db: Db, action_id: str, attempt: int, value, error, *, by: str)
             settled = _settle(target, action_id, attempt, "unknown", outcome, by=by,
                               settled_by="connector-late", note=note)
             if settled.get("result") == "ok":
+                _publish(target, action_id, outcome.state, by or "connector-late",
+                         detail="issue tardive, après le délai%s" % (
+                             " — %s" % outcome.detail if outcome.detail else ""))
                 return
             event = "late_ignored"
         current = get(target, action_id)
@@ -802,6 +945,7 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
         _event(db, action, "refused", by, "lancement refusé [%s] : %s" % (code, reason))
         raise ActionError(code, "action %s : %s" % (action_id, reason))
     attempt = int(launch["attempt"])
+    _publish(db, action_id, "launched", by)
     recorded = threading.Event()
 
     def late(value, error) -> None:
@@ -830,6 +974,7 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
     if settled.get("result") != "ok":
         raise ActionError(UNRECORDED, "action %s : issue %s non enregistrée (%s)"
                           % (action_id, outcome.state, settled.get("detail")))
+    _publish(db, action_id, outcome.state, by, detail=outcome.detail or "")
     return {"action_id": action_id, "attempt": attempt, "state": outcome.state,
             "external_ref": outcome.external_ref, "detail": outcome.detail,
             "released": settled.get("released")}
@@ -865,6 +1010,7 @@ def recover(db: Db, *, action_id: str | None = None, grace: float = RECOVER_GRAC
                           stale_after=None if force else float(grace))
         if settled.get("result") == "ok":
             moved.append(row["action_id"])
+            _publish(db, row["action_id"], "unknown", by, detail=outcome.detail)
     return moved
 
 
@@ -908,6 +1054,8 @@ def reconcile(db: Db, action_id: str, connector, *, by: str = "", force: bool = 
         current = _require(db, action_id)
         raise ActionError(STATE, "action %s réglée entre-temps (état %s)"
                           % (action_id, current["state"]))
+    _publish(db, action_id, found.state, by or "reconcile",
+             detail="réconciliation%s" % (" — %s" % found.detail if found.detail else ""))
     return {"action_id": action_id, "state": found.state, "found": True,
             "detail": found.detail, "external_ref": found.external_ref,
             "released": settled.get("released")}
@@ -992,6 +1140,8 @@ def replace(db: Db, action_id: str, receipt, *, policy=None, by: str = "",
     if result.get("result") != "ok":
         raise ActionError(result.get("result") or STATE, "remplacement de %s refusé : %s"
                           % (action_id, result.get("detail")))
+    _publish(db, action_id, "replaced", by, detail=verdict.approver)
+    _publish(db, new_id, "proposed", by)
     return _require(db, new_id)
 
 
@@ -1012,6 +1162,7 @@ def cancel(db: Db, action_id: str, *, by: str = "", note: str = "") -> dict:
                               "annulation impossible (reconcile)" % (action_id, action["state"]))
         raise ActionError(STATE, "action %s en %s : annulation impossible"
                           % (action_id, action["state"]))
+    _publish(db, action_id, "cancelled", by, detail=note or "annulée")
     return _require(db, action_id)
 
 

@@ -407,6 +407,15 @@ class BoutEnBoutTest(PgTestCase):
         self.assertIn("[replay]", proc.stderr)
         self.assertIn("aucune décision en attente",
                       self.run_mesh("decisions", "--for", ALICE).stdout)
+        # chaque transition est lisible dans le fil du projet (§7.1)
+        thread = self.run_mesh("fil", "show", PROJECT).stdout
+        for text in ("Action %s proposée par %s : git-merge merge sur %s" % (
+                         action_id, ORCHESTRE, PR),
+                     "Action %s approuvée" % action_id, "Action %s lancée" % action_id,
+                     "Action %s — issue INCONNUE" % action_id,
+                     "Action %s confirmée" % action_id):
+            self.assertIn(text, thread)
+        self.assertRegex(thread, r"(?m)^### \S+ — agent:orchestre → human:alice$")
 
 
 if __name__ == "__main__":

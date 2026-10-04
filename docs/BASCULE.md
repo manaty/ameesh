@@ -59,8 +59,6 @@ exposition réseau.
      attendant, le client de service du banc (`python3 -m tests.banc_v1
      request|receipt`, jeton de service) fait l'affaire — **jamais** ses
      commandes `enroll`/`approve`, qui sont une passkey logicielle de test ;
-   * les transitions d'actions ne sont pas encore écrites dans le fil (spec
-     §7.1) : on les lit dans `ameesh action show` et `ameesh decisions` ;
 
 **Retour arrière :** rien n'a changé.
 

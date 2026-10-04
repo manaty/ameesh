@@ -652,6 +652,9 @@ class FilFormatTest(unittest.TestCase):
         self.assertEqual(fil.member(cfg, "proprio"), "human:proprio")
         self.assertEqual(fil.member(cfg, "alpha"), "agent:alpha")
         self.assertEqual(fil.member(cfg, "all"), "tous")
+        # déjà qualifié (humain, agent, ou outil ameesh) : tel quel
+        for name in ("human:alice", "agent:beta", "ameesh:porte"):
+            self.assertEqual(fil.member(cfg, name), name)
         self.assertEqual(fil.project_for(cfg, "", "nexlink"), "nexlink")
         self.assertEqual(fil.project_for(cfg, "atelier", "nexlink"), "atelier")
         self.assertEqual(fil.project_for(cfg, None, ""), "default")
