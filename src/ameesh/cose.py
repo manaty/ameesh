@@ -12,7 +12,8 @@ besoin :
   foi d'un en-tête) ;
 * COSE_Key : EC2 / P-256 / ES256 (kty 2, crv 1, alg -7) et OKP / Ed25519 /
   EdDSA (kty 1, crv 6, alg -8). Une clé qui porte une partie privée (`d`) est
-  refusée bruyamment : elle n'a rien à faire dans le canon.
+  refusée bruyamment : elle n'a rien à faire dans le canon. Une clé Ed25519 de
+  petit ordre ou non canonique est refusée aussi (falsification universelle).
 """
 from __future__ import annotations
 
@@ -127,7 +128,9 @@ class PublicKey:
         if self.alg == "ES256":
             return p256.verify(self.point, message, signature)
         if self.alg == "EdDSA":
-            if len(signature) != 64:
+            # contrôles communs (clé et R hors petit ordre, S réduit) avant
+            # tout backend — redondant avec `ed25519_key`, voulu
+            if signing.signature_error(self.raw, signature) is not None:
                 return False
             return bool(signing.backend().verify(self.raw, message, signature))
         return False
@@ -140,9 +143,16 @@ def es256_key(point: tuple[int, int]) -> PublicKey:
 
 
 def ed25519_key(raw: bytes) -> PublicKey:
+    """Clé Ed25519 brute (32 octets) → PublicKey.
+
+    Refus d'un encodage non canonique et des 8 points de petit ordre (dont le
+    neutre) : une telle clé accepterait une signature constante pour tout
+    message (`signing.public_key_error`).
+    """
     raw = bytes(raw)
-    if len(raw) != 32 or signing._point_decompress(raw) is None:
-        raise CborError("clé Ed25519 : 32 octets d'un point valide attendus")
+    error = signing.public_key_error(raw)
+    if error:
+        raise CborError("clé Ed25519 refusée : %s" % error)
     return PublicKey("EdDSA", raw=raw)
 
 

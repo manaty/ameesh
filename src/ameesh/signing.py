@@ -8,6 +8,12 @@ Trois implémentations, une seule interface :
 * **cryptography** et **nacl** quand ils sont importables : plus rapides, et
   utilisés comme contre-vérification croisée dans les tests.
 
+Quel que soit le backend, une clé publique de petit ordre ou non canonique est
+refusée (`public_key_error`), comme une signature dont R est de petit ordre ou
+non canonique, ou dont S n'est pas réduit (`signature_error`) : sans ces
+contrôles, la clé neutre 01 00…00 et la signature (neutre, 0) vérifieraient
+pour tout message, avec le backend pur comme avec OpenSSL.
+
 Rien ici ne connaît la base : ce module signe et vérifie des octets. Le lien
 avec le registre (`agent_registry.public_key`), le contenu (payload canonique)
 et l'échéance est dans `authority.py`.
@@ -143,16 +149,70 @@ def sign(seed: bytes, message: bytes) -> bytes:
     return encoded_r + s.to_bytes(32, "little")
 
 
-def verify(public: bytes, message: bytes, signature: bytes) -> bool:
-    if len(public) != 32 or len(signature) != 64:
-        return False
-    point = _point_decompress(public)
+def _is_small_order(point: tuple) -> bool:
+    """[8]P = neutre : P est l'un des 8 points du sous-groupe de torsion."""
+    x, y, z, _t = _point_mul(8, point)
+    return x % _P == 0 and (y - z) % _P == 0
+
+
+def public_key_error(public: bytes) -> str | None:
+    """Raison de refuser une clé publique Ed25519, ou None si elle est admissible.
+
+    Refusées : longueur autre que 32 octets, encodage non canonique (y non
+    réduit mod p, ou bit de signe posé sur x = 0), point hors de la courbe, et
+    les 8 points de PETIT ORDRE (dont le neutre 01 00…00) : avec une telle clé,
+    la signature constante (R = neutre, S = 0) vérifie pour TOUT message.
+    Une clé honnête (a·B) n'est jamais concernée.
+    """
+    if not isinstance(public, (bytes, bytearray)) or len(public) != 32:
+        return "32 octets attendus"
+    point = _point_decompress(bytes(public))
     if point is None:
+        return "encodage non canonique ou point hors de la courbe"
+    if _is_small_order(point):
+        return "point de petit ordre (sous-groupe de torsion)"
+    return None
+
+
+def check_public_key(public: bytes) -> bytes:
+    """Clé publique Ed25519 admissible, ou ValueError (voir `public_key_error`)."""
+    error = public_key_error(public)
+    if error:
+        raise ValueError("clé publique Ed25519 refusée : %s" % error)
+    return bytes(public)
+
+
+def signature_error(public: bytes, signature: bytes) -> str | None:
+    """Contrôles communs à TOUS les backends, avant la vérification elle-même.
+
+    La clé doit être admissible (`public_key_error`) ; R doit être l'encodage
+    canonique d'un point de la courbe qui n'est pas de petit ordre ; S doit
+    être réduit (S < L). Les backends n'appliquent pas tous ces règles (OpenSSL
+    accepte une clé de petit ordre) : elles sont donc imposées ici.
+    """
+    error = public_key_error(public)
+    if error:
+        return "clé publique : %s" % error
+    if not isinstance(signature, (bytes, bytearray)) or len(signature) != 64:
+        return "signature : 64 octets attendus"
+    signature = bytes(signature)
+    r_point = _point_decompress(signature[:32])
+    if r_point is None:
+        return "R : encodage non canonique ou point hors de la courbe"
+    if _is_small_order(r_point):
+        return "R de petit ordre"
+    if int.from_bytes(signature[32:], "little") >= _L:
+        return "S non réduit (S >= L)"
+    return None
+
+
+def verify(public: bytes, message: bytes, signature: bytes) -> bool:
+    if signature_error(public, signature) is not None:
         return False
+    public, signature = bytes(public), bytes(signature)
+    point = _point_decompress(public)
     encoded_r = signature[:32]
     s = int.from_bytes(signature[32:], "little")
-    if s >= _L:
-        return False
     k = int.from_bytes(_sha512(encoded_r + public + message), "little") % _L
     # [S]B - [k]A doit valoir R (vérification sans cofacteur)
     computed = _point_add(_point_mul(s, _BASE), _point_neg(_point_mul(k, point)))
@@ -211,6 +271,8 @@ class CryptographyEd25519:
         return self._private.from_private_bytes(seed).sign(message)
 
     def verify(self, public: bytes, message: bytes, signature: bytes) -> bool:
+        if signature_error(public, signature) is not None:
+            return False
         try:
             self._public.from_public_bytes(public).verify(signature, message)
             return True
@@ -237,6 +299,8 @@ class NaclEd25519:
         return self._signing.SigningKey(seed).sign(message).signature
 
     def verify(self, public: bytes, message: bytes, signature: bytes) -> bool:
+        if signature_error(public, signature) is not None:
+            return False
         try:
             self._signing.VerifyKey(public).verify(message, signature)
             return True
@@ -322,7 +386,7 @@ def _decode(text: str, header: str, footer: str, what: str) -> bytes:
 
 
 def decode_public(text: str) -> bytes:
-    return _decode(text, PUBLIC_HEADER, PUBLIC_FOOTER, "clé publique")
+    return check_public_key(_decode(text, PUBLIC_HEADER, PUBLIC_FOOTER, "clé publique"))
 
 
 def decode_private(text: str) -> bytes:

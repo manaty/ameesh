@@ -24,6 +24,14 @@ L'autorité d'un humain se **prouve** : un reçu est valide seulement si
    est atomique (`INSERT … ON CONFLICT DO NOTHING` sur la clé primaire
    (approver, nonce) de `mesh_consumed_nonces`).
 
+Toute ÉCRITURE qui accorde une autorité (consommation d'un nonce,
+enregistrement d'un grant, réservation sur un grant) recontrôle ses échéances
+(exp, iat futur, until) EN SQL, dans sa transaction, APRÈS le dernier verrou et
+immédiatement avant d'écrire, à l'heure réelle de la base (`clock_timestamp()`) :
+une échéance passée pendant l'attente d'un verrou annule toute la transaction
+(code EXPIRED ou iat_future). L'inventaire de ces chemins, de leurs verrous et
+de leurs contrôles est en tête de `migrations/0011_receipts.sql`.
+
     challenge = SHA-256("ameesh-approval/1\\0" ‖ JCS(request))
     empreinte = SHA-256("ameesh-action/1\\0" ‖ JCS({action_id, project, connector,
                 operation, target, args, amount, currency, policy_version}))
@@ -135,6 +143,34 @@ _PROOF_FIELDS = {
 
 class ReceiptError(ValueError):
     """Reçu, clé ou entrée de registre refusés — toujours avec une raison lisible."""
+
+
+class DeadlineError(ReceiptError):
+    """Échéance dépassée à l'heure RÉELLE de la base, au moment d'écrire.
+
+    Levée par la fonction SQL (`ameesh_receipt_deadlines`, après le dernier
+    verrou) : la transaction entière a été annulée. `code` vaut EXPIRED ou
+    NOT_YET.
+    """
+
+    def __init__(self, code: str, reason: str):
+        super().__init__(reason)
+        self.code = code
+
+
+#: `ameesh_echeance [code] : raison` (0011_receipts.sql), tel que le rendent
+#: les deux pilotes (psql : ligne ERROR ; psycopg : message + CONTEXT, ou
+#: CONTEXTE si le serveur parle français)
+_DEADLINE_RE = re.compile(
+    r"ameesh_echeance \[(expired|iat_future)\] : (.*?)(?:\s+CONTEXTE?\s*:.*)?$", re.S)
+
+
+def _deadline_error(exc: DbError) -> DeadlineError | None:
+    """Le refus d'échéance porté par une erreur SQL, ou None."""
+    match = _DEADLINE_RE.search(str(exc))
+    if not match:
+        return None
+    return DeadlineError(match.group(1), " ".join(match.group(2).split()))
 
 
 # --------------------------------------------------------------------------
@@ -688,11 +724,18 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
     elif not key.verify(parsed.challenge, parsed.proof_bytes["signature"]):
         return refuse(SIGNATURE, "signature %s invalide" % key.alg)
 
-    # 5. nonce
+    # 5. nonce — la consommation recontrôle exp et iat EN SQL, après le
+    #    dernier verrou, à l'heure réelle de la base (pas `moment`)
     approver, nonce = request["approver"], request["nonce"]
     if consume_by:
-        if not consume_nonce(db, approver, nonce, by=consume_by,
-                             challenge=parsed.challenge.hex(), authenticator_id=int(row["id"])):
+        try:
+            consumed = consume_nonce(
+                db, approver, nonce, by=consume_by, challenge=parsed.challenge.hex(),
+                authenticator_id=int(row["id"]), exp=exp, iat=iat,
+                clock_skew=policy.clock_skew)
+        except DeadlineError as exc:
+            return refuse(exc.code, str(exc))
+        if not consumed:
             state = authority.nonce_state(db, approver, nonce)
             if state:
                 return refuse(REPLAY, "nonce déjà consommé (%s)" % state)
@@ -720,6 +763,10 @@ def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
     depuis l'action, jamais lus dans le reçu).
     `kind=None` accepte les deux natures ; `expect_decision=None` les deux
     décisions.
+    `now` ne règle que les contrôles faits ici : une consommation recontrôle
+    exp et iat en SQL, après le dernier verrou, à l'heure réelle de la base
+    (`clock_timestamp()`) — un dépassement donne EXPIRED (ou iat_future) et
+    rien n'est consommé.
     """
     verdict, _parsed = _verify(
         db, receipt, policy, kind=kind, expected_digest=expected_digest,
@@ -728,28 +775,36 @@ def verify_receipt(db: Db, receipt, policy: Policy | None = None, *,
     return verdict
 
 
-def consume_nonce(db: Db, approver: str, nonce: str, *, by: str, challenge: str = "",
+def consume_nonce(db: Db, approver: str, nonce: str, *, by: str, exp: int, iat: int,
+                  clock_skew: int = DEFAULT_CLOCK_SKEW, challenge: str = "",
                   authenticator_id: int | None = None) -> bool:
     """Consomme (approver, nonce) une seule fois. Faux si déjà consommé.
 
-    La décision est l'`INSERT … ON CONFLICT DO NOTHING` sur la clé primaire :
-    deux consommations simultanées ne peuvent pas réussir toutes les deux. Si
-    `authenticator_id` est donné, l'authentificateur doit être encore actif au
-    moment de l'insertion.
+    Une transaction (fonction `ameesh_receipt_consume`) : si
+    `authenticator_id` est donné, l'authentificateur doit être encore actif —
+    il est lu sous verrou partagé (`FOR SHARE`), qui sérialise avec sa
+    révocation (une révocation en cours est attendue puis vue). Puis, APRÈS
+    ce dernier verrou et immédiatement avant l'écriture, les échéances
+    SIGNÉES (`exp`, `iat` + `clock_skew`) sont recontrôlées à l'heure réelle
+    de la base ; la décision est ensuite l'`INSERT … ON CONFLICT DO NOTHING`
+    sur la clé primaire (deux consommations simultanées ne peuvent pas réussir
+    toutes les deux), et les échéances sont recontrôlées après lui (il a pu
+    attendre une insertion concurrente). Échéance dépassée : DeadlineError,
+    rien n'est consommé.
     """
-    rows = db.query(
-        """
-        INSERT INTO mesh_consumed_nonces (approver, nonce, consumed_by, challenge)
-        SELECT %s, %s, %s, %s
-         WHERE %s::bigint IS NULL
-            OR EXISTS (SELECT 1 FROM authenticators a
-                        WHERE a.id = %s::bigint AND a.revoked_at IS NULL)
-        ON CONFLICT (approver, nonce) DO NOTHING
-        RETURNING nonce
-        """,
-        (approver, nonce, by, challenge or None, authenticator_id, authenticator_id),
-    )
-    return bool(rows)
+    try:
+        rows = db.query(
+            "SELECT ameesh_receipt_consume(%s::text, %s::text, %s::text, %s::text, "
+            "%s::bigint, %s::bigint, %s::bigint, %s::integer) AS consumed",
+            (approver, nonce, by, challenge or None, authenticator_id, _int(exp, "exp"),
+             _int(iat, "iat"), int(clock_skew)),
+        )
+    except DbError as exc:
+        deadline = _deadline_error(exc)
+        if deadline is not None:
+            raise deadline from exc
+        raise
+    return bool(rows and rows[0].get("consumed"))
 
 
 # --------------------------------------------------------------------------
@@ -761,23 +816,36 @@ def register_standing(db: Db, receipt, policy: Policy | None = None, *, register
     """Vérifie un reçu `standing` et enregistre le grant ; consomme son nonce.
 
     Consommation du nonce et insertion du grant sont une seule opération
-    (fonction `ameesh_standing_register`). Renvoie (verdict, id du grant).
+    (fonction `ameesh_standing_register`), qui recontrôle les échéances
+    signées (exp, iat, until) APRÈS le verrou de l'authentificateur, à
+    l'heure réelle de la base (`now` ne règle que les contrôles Python) : un
+    dépassement donne EXPIRED (ou iat_future), sans nonce consommé ni grant.
+    Renvoie (verdict, id du grant).
     """
+    policy = policy or Policy()
     verdict, parsed = _verify(
         db, receipt, policy, kind="standing", expected_digest=None, expected_action_id=None,
         expect_decision="approve", consume_by=None, now=now)
     if not verdict.ok or parsed is None:
         return verdict, None
     standing = parsed.request["standing"]
-    rows = db.query(
-        "SELECT ameesh_standing_register(%s::text, %s::text, %s::text, %s::bigint, %s::text, "
-        "%s::text, %s::jsonb, %s::text, %s::bigint, %s::text, %s::double precision, %s::text) "
-        "AS id",
-        (verdict.approver, verdict.nonce, verdict.challenge, verdict.authenticator_id,
-         jcs.dumps(parsed.document), standing["connector"], jcs.dumps(standing["operations"]),
-         standing["class"], standing["max_amount"], standing["currency"], standing["until"],
-         registered_by),
-    )
+    try:
+        rows = db.query(
+            "SELECT ameesh_standing_register(%s::text, %s::text, %s::text, %s::bigint, "
+            "%s::text, %s::text, %s::jsonb, %s::text, %s::bigint, %s::text, %s::bigint, "
+            "%s::bigint, %s::bigint, %s::integer, %s::text) AS id",
+            (verdict.approver, verdict.nonce, verdict.challenge, verdict.authenticator_id,
+             jcs.dumps(parsed.document), standing["connector"], jcs.dumps(standing["operations"]),
+             standing["class"], standing["max_amount"], standing["currency"],
+             parsed.request["exp"], parsed.request["iat"], standing["until"],
+             int(policy.clock_skew), registered_by),
+        )
+    except DbError as exc:
+        deadline = _deadline_error(exc)
+        if deadline is None:
+            raise
+        return dataclasses.replace(verdict, ok=False, code=deadline.code,
+                                   reason=str(deadline)), None
     grant_id = rows[0].get("id") if rows else None
     if grant_id is None:
         state = authority.nonce_state(db, verdict.approver, verdict.nonce)
@@ -803,13 +871,20 @@ def standing_reserve(db: Db, grant_id: int, action_id: str, amount, *, connector
                      reserved_by: str | None = None) -> dict | None:
     """Réserve `amount` sur le grant pour la tentative de `action_id`.
 
-    Atomique (un seul UPDATE … WHERE cumul + montant <= max AND until > now()
-    AND revoked_at IS NULL … puis l'insertion du lien, dans une même fonction).
+    Atomique (fonction `ameesh_standing_reserve`, une transaction) : verrou
+    du grant d'abord, puis TOUT est relu et réévalué après le verrou —
+    révocation, authentificateur (sous verrou partagé), couverture, puis,
+    APRÈS ce dernier verrou et juste avant d'écrire, l'échéance comparée à
+    l'heure réelle (`clock_timestamp()`, pas `now()` figé avant l'attente des
+    verrous ; un grant échu pendant l'attente annule toute la transaction et
+    rend None), cumul + montant <= max — et le lien est inséré.
     La description de l'action (connecteur, opération, classe, devise) est
-    OBLIGATOIRE : la couverture est contrôlée dans la même requête, une
+    OBLIGATOIRE : la couverture est contrôlée dans la même transaction, une
     réservation sur un grant qui ne couvre pas l'action est impossible.
     Idempotente par (grant, action) : une réservation vivante est rendue
-    (`reused`). None = pas de couverture.
+    (`reused`) seulement si la description est IDENTIQUE (montant, devise,
+    connecteur, opération, classe) ; toute différence lève ReceiptError — un
+    refus explicite, jamais un succès silencieux. None = pas de couverture.
     """
     if not isinstance(action_id, str) or not action_id:
         raise ReceiptError("action_id requis")
@@ -822,6 +897,8 @@ def standing_reserve(db: Db, grant_id: int, action_id: str, amount, *, connector
              currency),
         )
     except DbError as exc:
+        if _deadline_error(exc) is not None:
+            return None             # grant échu à l'heure réelle : rien n'est réservé
         if "ameesh_standing_reserve" in str(exc):
             raise ReceiptError(str(exc)) from exc
         raise
@@ -853,7 +930,8 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> d
 
     `action` : action_id, connector, operation, class, amount (facultatif),
     currency (facultatif). Une réservation vivante existante pour l'action est
-    réutilisée en priorité. None = aucune couverture.
+    réutilisée en priorité — si elle décrit la même action, sinon ReceiptError
+    (`standing_reserve`). None = aucune couverture.
     """
     action_id = action["action_id"]
     action_class = action.get("class", action.get("action_class"))
@@ -863,11 +941,14 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> d
         "SELECT grant_id FROM standing_reservations WHERE action_id = %s "
         "AND released_at IS NULL ORDER BY id", (action_id,))
     candidates = [int(row["grant_id"]) for row in live]
+    # simple PRÉ-FILTRE, sans verrou : la décision (révocation, échéance à
+    # l'heure réelle après le dernier verrou, cumul) est refaite par
+    # ameesh_standing_reserve pour chaque candidat
     rows = db.query(
         """
         SELECT id FROM standing_approvals
          WHERE connector = %s AND operations @> jsonb_build_array(%s::text)
-           AND action_class = %s AND revoked_at IS NULL AND valid_until > now()
+           AND action_class = %s AND revoked_at IS NULL AND valid_until > clock_timestamp()
            AND consumed_amount + %s::bigint <= max_amount
            AND (%s::bigint = 0 OR currency = %s)
          ORDER BY valid_until, id
@@ -944,44 +1025,77 @@ def sync_authenticators(db: Db, members: list) -> dict:
     "authenticators": [{facade, credential_id, public_key, aaguid, level,
     canon_ref?}]}]. Le canon est la référence complète : un authentificateur
     actif absent de la liste est révoqué ; un changement de clé révoque
-    l'ancienne ligne et en crée une nouvelle.
+    l'ancienne ligne et en crée une nouvelle. Une révocation est un UPDATE de
+    la ligne : elle se sérialise avec les lectures sous verrou partagé (`FOR
+    SHARE`) des réservations, des enregistrements de grants et des
+    consommations de nonces.
 
-    Une entrée invalide — en particulier **sans référence de commit**
-    (`canon_ref` = chemin@SHA) — est refusée : constat d'erreur, aucune
-    écriture pour elle (ni ajout, ni mise à jour, ni révocation de la ligne
-    existante de même identité). Les autres entrées sont appliquées.
+    Une entrée invalide ne retire JAMAIS d'autorité par accident :
 
-    Renvoie {"added", "updated", "revoked", "unchanged", "errors"}.
+    * `members` doit être une liste (sinon ReceiptError, rien n'est écrit) ;
+      une liste vide est un canon sans membre : tout est révoqué ;
+    * un membre dont `authenticators` n'est pas une liste (absent, null,
+      texte, objet…) **ou dont la liste contient UN élément invalide** (pas
+      un objet ; façade, credential_id, clé, niveau ou aaguid invalides ;
+      entrée **sans référence de commit** `canon_ref` = chemin@SHA ; même
+      credential deux fois dans la liste) est GELÉ : constat d'erreur et
+      aucune écriture pour ce membre — ni ajout, ni mise à jour, ni
+      révocation de ses lignes actives. Une liste partiellement valide n'est
+      donc pas appliquée en partie ;
+    * seule une liste VALIDE qui omet un credential le révoque ; un membre
+      absent de `members` voit ses credentials révoqués — sauf si une entrée
+      de membre est illisible (titre invalide) : elle pourrait être ce membre,
+      aucune révocation pour absence n'est alors faite ;
+    * un credential déclaré par plusieurs membres, ou porté par une entrée
+      invalide, n'est ni ajouté ni modifié ni révoqué, chez personne.
+
+    Renvoie {"added", "updated", "revoked", "unchanged", "frozen", "errors"}.
     """
+    if not isinstance(members, list):
+        raise ReceiptError("members : liste de membres attendue (rien n'est modifié)")
     errors: list[str] = []
     desired: dict[tuple[str, str], dict] = {}
     protected: set[tuple[str, str]] = set()
     claimed: dict[tuple[str, str], int] = {}
+    listed: set[str] = set()       # approbateurs lisibles dans le canon
+    frozen: set[str] = set()       # approbateurs gelés : aucune écriture
+    unreadable = False             # une entrée de membre sans titre lisible
 
-    for index, member in enumerate(members or []):
+    for index, member in enumerate(members):
         title = member.get("title") if isinstance(member, dict) else None
         if not isinstance(title, str) or not re.fullmatch(_NAME, title):
             errors.append("membre #%d : titre invalide %r" % (index, title))
+            unreadable = True
             continue
         approver = "human:" + title
-        entries = member.get("authenticators") or []
+        listed.add(approver)
+        entries = member.get("authenticators")
         if not isinstance(entries, list):
-            errors.append("%s : authenticators doit être une liste" % approver)
+            errors.append("%s : authenticators doit être une liste (%s)" % (
+                approver, "absent" if "authenticators" not in member
+                else type(entries).__name__))
+            frozen.add(approver)
             continue
+        records: dict[tuple[str, str], dict] = {}
+        invalid = False
         for position, entry in enumerate(entries):
             where = "%s, authentificateur #%d" % (approver, position)
             if not isinstance(entry, dict):
                 errors.append("%s : objet attendu" % where)
+                invalid = True
                 continue
             facade = entry.get("facade")
             credential_id = entry.get("credential_id")
             if facade not in FACADES or not isinstance(credential_id, str) \
                     or not _CREDENTIAL_RE.fullmatch(credential_id):
                 errors.append("%s : façade ou credential_id invalide" % where)
+                invalid = True
                 continue
             identity = (facade, credential_id)
             claimed[identity] = claimed.get(identity, 0) + 1
             try:
+                if identity in records:
+                    raise ReceiptError("déclaré deux fois dans la liste")
                 canon_ref = entry.get("canon_ref") or member.get("canon_ref")
                 if not isinstance(canon_ref, str) or not _CANON_REF_RE.fullmatch(canon_ref):
                     raise ReceiptError("sans référence de commit du canon (chemin@SHA)")
@@ -998,8 +1112,13 @@ def sync_authenticators(db: Db, members: list) -> dict:
             except ReceiptError as exc:
                 errors.append("%s (%s) : %s" % (where, _label(approver, *identity), exc))
                 protected.add(identity)
+                invalid = True
                 continue
-            desired[identity] = record
+            records[identity] = record
+        if invalid:
+            frozen.add(approver)
+            continue
+        desired.update(records)
 
     for identity, count in claimed.items():
         if count > 1:
@@ -1007,14 +1126,21 @@ def sync_authenticators(db: Db, members: list) -> dict:
                           % (identity[0], identity[1], count))
             desired.pop(identity, None)
             protected.add(identity)
+    # un membre déclaré deux fois, dont une fois invalide : rien de lui non plus
+    for identity in [i for i, r in desired.items() if r["approver"] in frozen]:
+        desired.pop(identity)
+    if unreadable:
+        errors.append("entrée de membre illisible : aucune révocation pour absence du canon "
+                      "pendant cette synchronisation")
 
-    result = {"added": [], "updated": [], "revoked": [], "unchanged": 0, "errors": errors}
+    result = {"added": [], "updated": [], "revoked": [], "unchanged": 0,
+              "frozen": sorted(frozen), "errors": errors}
     active = list_authenticators(db)
     keep: set[tuple[str, str]] = set()
     for row in active:
         identity = (row["facade"], row["credential_id"])
         label = _label(row["approver"], *identity)
-        if identity in protected:
+        if identity in protected or row["approver"] in frozen:
             continue
         wanted = desired.get(identity)
         if wanted and wanted["approver"] == row["approver"] \
@@ -1030,6 +1156,8 @@ def sync_authenticators(db: Db, members: list) -> dict:
             else:
                 result["unchanged"] += 1
             continue
+        if unreadable and row["approver"] not in listed:
+            continue        # son entrée est peut-être celle qu'on n'a pas pu lire
         reason = ("clé changée dans le canon" if wanted and wanted["approver"] == row["approver"]
                   else "absent du canon")
         rows = db.query(
