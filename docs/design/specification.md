@@ -405,7 +405,7 @@ client ; migrations réservées ci-dessous ; aucune dépense, aucun service publ
 |---|---|---|---|---|
 | L1 | interface de stockage (C1), sans changement de comportement | fin B5a | — | codex3 |
 | L2 | canon : lecture, profil, validation, sync, responsables, éphémères (C2, C3) | — | 0008 (`responsible`, `team`, `credential_mode`, `ephemeral`, `canon_ref`) | codex |
-| L3 | placement et politique d'hôte dans `claimable` (C4) | L2 | — | codex |
+| L3 | placement et politique d'hôte dans le prédicat de réclamation (C4), `ameesh placement check` | L2 | 0022 | codex |
 | L4 | fil lisible, transport `file`, refus des corps illisibles (C5) | — | 0009 (index des fils) | codex |
 | L5 | actions, porte, connecteurs `shell-noop` et `git-merge`, `ameesh decisions` (C6, C10) | L6 (vérif.) | 0010 (`actions`, `action_attempts`) | codex3 |
 | L6 | reçus `ameesh-receipt/1`, façades webauthn/ed25519/device-es256, registre au canon, permanentes bornées (C7) | L2 | 0011 (`authenticators`, `standing_approvals`) | codex3 |
