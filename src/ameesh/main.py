@@ -20,6 +20,10 @@
   ameesh canon check|show|sync          canon OKF : validation, fiches, registre ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
+Le service d'approbation humaine (spec §9) est une commande séparée,
+`ameesh-approve` (python -m ameesh.approve), lancée sous son propre
+utilisateur Unix.
+
 Rien d'autre : ce fichier ne fait que router vers les modules, pour que
 `agent-mail` et `agent-runner` continuent de fonctionner à l'identique.
 """
