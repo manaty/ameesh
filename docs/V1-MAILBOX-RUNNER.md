@@ -315,9 +315,19 @@ test (trois messages → trois notifications) a attrapé le bug.
 * **Dossier de travail déplacé (0018)** : à l'inscription, l'identité git du
   dossier (dépôt commun + branche) est écrite dans
   `<état>/<agent>/worktree.json`. Si le cwd a disparu, un candidat **unique**
-  est cherché sous `AMEESH_WORKTREE_ROOTS` (défaut `~/development`) ; il est
-  adopté (registre mis à jour, fil prévenu) s'il n'est pas déjà le cwd d'un
-  autre agent.
+  est cherché sous `AMEESH_WORKTREE_ROOTS` (défaut `~/development`), en
+  profondeur bornée — les worktrees imbriqués (`.claude/worktrees/<nom>`) sont
+  traversés, les dépendances et `.git` non — ; il est adopté (registre mis à
+  jour, fil prévenu) s'il n'est pas déjà le cwd d'un autre agent.
+* **Point de passage unique d'arrêt** — tout arrêt de harnais (échéance du
+  bail, bail perdu, arrêt de l'exécuteur, préemption prioritaire, et demain
+  garde de budget L13) passe par `stop_group_now(raison)` : le signal part
+  **avant** tout journal, la journalisation passe par la file bornée, et une
+  publication tardive du `Popen` est rattrapée par un recontrôle unique
+  (`kill_if_stop_requested`). Un nouveau chemin d'arrêt hérite donc des mêmes
+  sondes ; la suite de tests **paramétrée** (`StopTriggersTest`) rejoue pour
+  chaque déclencheur les trois scénarios — harnais publié, journal saturé,
+  `Popen` publié en retard.
 * **`canon sync` par l'exécuteur (spec §4.4)** : quand un canon est configuré,
   l'exécuteur lance `canon sync` pour son hôte **au démarrage**, puis
   périodiquement (`AMEESH_CANON_SYNC_INTERVAL`, défaut 300 s ; 0 = seulement au

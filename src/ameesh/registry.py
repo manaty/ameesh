@@ -473,12 +473,23 @@ def set_session(db: Db, name: str, session_id: str) -> None:
     )
 
 
-def clear_session(db: Db, name: str) -> None:
-    """Oublie la session (rotation, 0018) : le prochain tour repart d'une neuve."""
-    db.execute(
-        "UPDATE agent_registry SET session_id = NULL, updated_at = now() WHERE name = %s",
-        (name,),
+def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
+    """Oublie la session (rotation, 0018), **fencé par le bail**.
+
+    Renvoie False si le bail n'est plus le nôtre : un remplaçant a pu réclamer
+    l'agent et ouvrir sa propre session, qu'il ne faut pas effacer (verdict
+    codex3 L11 B3).
+    """
+    rows = db.query(
+        """
+        UPDATE agent_registry
+           SET session_id = NULL, updated_at = now()
+         WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
+        RETURNING name
+        """,
+        (name, owner, epoch),
     )
+    return bool(rows)
 
 
 def cwd_used(db: Db, cwd: str, exclude: str) -> bool:

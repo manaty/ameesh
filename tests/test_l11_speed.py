@@ -75,6 +75,53 @@ class InterruptionTest(PgTestCase):
         finally:
             worker.watchdog_stop.set()
 
+    def test_interruption_ne_bloque_pas_sur_un_journal(self):
+        """Verdict L11 B1 : le moniteur de préemption coupe **avant** de
+        journaliser (un tube saturé ne doit pas retarder l'arrêt)."""
+        runner, worker = self._worker()
+        self.register("l11", "claude", cwd=self._cwd("l11"), prompt="tour long")
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+               "AMEESH_TEST_SLEEP": "8"}
+        spec = worker.pick()
+        resultat: list = []
+
+        def faux_log(message, *args, **kwargs):
+            if "prioritaire" in str(message):
+                time.sleep(30)  # simule un tube plein
+
+        try:
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch("ameesh.runner.log", side_effect=faux_log):
+                thread = threading.Thread(
+                    target=lambda: resultat.append(worker.run_turn(spec)), daemon=True)
+                thread.start()
+                time.sleep(0.4)
+                worker.request_preempt()
+                thread.join(timeout=6)
+            self.assertFalse(thread.is_alive(), "l'arrêt a été bloqué par un journal")
+            self.assertEqual(resultat, [False])
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_preemption_pendant_la_publication_est_rattrapee(self):
+        """Verdict L11 B2 : la préemption arrivée avant la publication du `Popen`
+        est rattrapée par `kill_if_preempted` (même classe que B5a-P)."""
+        runner, worker = self._worker()
+        proc = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        worker.proc = proc
+        worker.pgid = proc.pid
+        worker.preempting.set()
+        try:
+            self.assertTrue(worker.kill_if_preempted())
+            proc.wait(timeout=5)
+            self.assertIsNotNone(proc.poll())
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            worker.proc = None
+            worker.preempting.clear()
+
     def test_dispatch_prioritaire_selon_l_habilititation(self):
         runner, worker = self._worker()
         with runner.lock:
@@ -143,6 +190,126 @@ class RotationTest(PgTestCase):
         worker.proc = None
         self.assertTrue(worker.rotation_due())
 
+    def test_rotation_annulee_si_le_resume_echoue(self):
+        """Verdict L11 B3 : un tour de résumé en échec (bail perdu, remplaçant)
+        ne doit ni tourner ni effacer la session du remplaçant."""
+        runner, worker = self._worker()
+        registry.set_session(self.db, "rot", "session-du-remplacant")
+        worker.agent = registry.get(self.db, "rot")
+        worker.session_turns = 5
+        try:
+            with mock.patch.object(worker, "run_turn", return_value=False):
+                self.assertFalse(worker.maybe_rotate())
+        finally:
+            worker.watchdog_stop.set()
+        self.assertEqual(registry.get(self.db, "rot")["session_id"],
+                         "session-du-remplacant")
+
+    def test_clear_session_refuse_un_autre_bail(self):
+        """Verdict L11 B3 : l'effacement de session est fencé par le bail."""
+        runner, worker = self._worker()
+        registry.set_session(self.db, "rot", "session-protegee")
+        self.assertFalse(registry.clear_session(self.db, "rot", "autre-runner",
+                                                int(worker.epoch)))
+        self.assertEqual(registry.get(self.db, "rot")["session_id"], "session-protegee")
+        self.assertTrue(registry.clear_session(self.db, "rot", runner.runner_id,
+                                               int(worker.epoch)))
+        self.assertIsNone(registry.get(self.db, "rot")["session_id"])
+
+
+class StopTriggersTest(PgTestCase):
+    """Suite **paramétrée** de tous les déclencheurs d'arrêt (verdicts codex3 L11).
+
+    Chaque déclencheur rejoue les mêmes scénarios : harnais publié, journal
+    saturé, `Popen` publié en retard. Un nouveau chemin d'arrêt (garde de budget
+    L13, demain) hérite de ces sondes en s'ajoutant à `TRIGGERS`.
+    """
+
+    TRIGGERS = (
+        ("bail-perdu", lambda w: w.lease_lost.set()),
+        ("preemption", lambda w: w.preempting.set()),
+        ("arret", lambda w: w.stopping.set()),
+        ("echeance", lambda w: setattr(w, "lease_deadline", time.time() - 1.0)),
+        ("stop-demande", lambda w: w.stop_requested.set()),
+    )
+
+    def _worker(self, name: str):
+        runner = Runner(self.cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", name)
+        os.makedirs(cwd, exist_ok=True)
+        self.register(name, "claude", cwd=cwd)
+        lease = registry.claim(self.db, name, runner.runner_id, 3600)
+        return AgentWorker(runner, registry.get(self.db, name), lease)
+
+    @staticmethod
+    def _proc() -> subprocess.Popen:
+        return subprocess.Popen(["sleep", "60"], start_new_session=True)
+
+    def _publie(self, worker, proc):
+        worker.proc = proc
+        worker.pgid = proc.pid
+
+    def test_chaque_declencheur_coupe_le_harnais(self):
+        for label, declenche in self.TRIGGERS:
+            with self.subTest(declencheur=label):
+                worker = self._worker("st-%s" % label)
+                proc = self._proc()
+                self._publie(worker, proc)
+                try:
+                    declenche(worker)
+                    self.assertTrue(worker.kill_if_stop_requested())
+                    proc.wait(timeout=5)
+                    self.assertIsNotNone(proc.poll())
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+                    worker.proc = None
+
+    def test_chaque_declencheur_coupe_meme_journal_bloque(self):
+        def bloque(message, *args, **kwargs):
+            time.sleep(30)
+
+        for label, declenche in self.TRIGGERS:
+            with self.subTest(declencheur=label):
+                worker = self._worker("sb-%s" % label)
+                proc = self._proc()
+                self._publie(worker, proc)
+                try:
+                    with mock.patch("ameesh.runner.log", side_effect=bloque):
+                        declenche(worker)
+                        debut = time.monotonic()
+                        self.assertTrue(worker.kill_if_stop_requested())
+                        proc.wait(timeout=5)
+                        ecoule = time.monotonic() - debut
+                    self.assertIsNotNone(proc.poll())
+                    self.assertLess(ecoule, 2.0,
+                                    "l'arrêt dépend d'une E/S sur le chemin (%s)" % label)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+                    worker.proc = None
+
+    def test_chaque_declencheur_est_rattrape_apres_publication(self):
+        for label, declenche in self.TRIGGERS:
+            with self.subTest(declencheur=label):
+                worker = self._worker("sp-%s" % label)
+                # le déclencheur part avant la publication du Popen
+                worker.proc = None
+                declenche(worker)
+                proc = self._proc()
+                self._publie(worker, proc)
+                try:
+                    self.assertTrue(worker.kill_if_stop_requested())
+                    proc.wait(timeout=5)
+                    self.assertIsNotNone(proc.poll())
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+                    worker.proc = None
+
 
 class DeplacementTest(PgTestCase):
     def _git(self, *args: str, cwd: str):
@@ -159,7 +326,8 @@ class DeplacementTest(PgTestCase):
             fh.write("x\n")
         self._git("add", ".", cwd=depot)
         self._git("commit", "-q", "-m", "init", cwd=depot)
-        wt = os.path.join(racine, "wt")
+        wt = os.path.join(racine, "manaty", "wt")
+        os.makedirs(os.path.dirname(wt), exist_ok=True)
         self._git("worktree", "add", "-q", "-b", "lot/x", wt, cwd=depot)
         return racine, wt
 
@@ -171,7 +339,7 @@ class DeplacementTest(PgTestCase):
         runner = Runner(cfg, self.db, once=True)
         lease = registry.claim(self.db, "dep", runner.runner_id, 3600)
         worker = AgentWorker(runner, registry.get(self.db, "dep"), lease)
-        deplace = os.path.join(racine, "wt-renomme")
+        deplace = os.path.join(racine, "manaty", "wt-renomme")
         os.rename(wt, deplace)
         # un autre agent occupe déjà le candidat : adoption refusée
         self.register("autre", "claude", cwd=deplace)
