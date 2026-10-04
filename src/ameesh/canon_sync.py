@@ -34,12 +34,18 @@ Placement gouverné (C4, R18 ; 0022) : pour chaque agent du canon de l'hôte,
 sync écrit l'admissibilité de son placement sur CET hôte (`placement_ok`,
 `placement_diagnostic`, `placement_ref` ; voir `placement.evaluate`) : admis
 par la politique de la fiche Host, ou refusé — politique violée, aucun
-placement sur cet hôte, placement ambigu, fiche invérifiable. La condition
-de réclamation exige `placement_ok` pour un agent gouverné par le canon. Un
-éphémère hérite du verdict de son créateur racine du canon (recopié par
-`spawn`, rafraîchi par sync ; refusé si ce créateur n'est plus sur cet hôte
-ou si la lignée est rompue). sync ne place ni ne déplace un agent de
-lui-même : il suit les fiches Placement du canon.
+placement sur cet hôte, placement ambigu, fiche invérifiable. Chaque verdict
+est écrit avec le PROFIL ÉVALUÉ (`placement_profile`, calculé par la
+fonction SQL `ameesh_placement_profile` sur les valeurs jugées : hôte,
+harnais, fournisseur, modèle, mode d'identifiants). La condition de
+réclamation exige `placement_ok` pour un agent gouverné par le canon, et
+que son profil courant soit le profil évalué : toute divergence posée
+ensuite (inscription, import, SQL à la main) le ferme jusqu'au sync suivant.
+Un éphémère hérite du verdict de son créateur racine du canon (recopié par
+`spawn`, rafraîchi par sync) seulement si SON profil est le profil évalué de
+ce créateur ; sinon il est refusé, comme quand ce créateur n'est plus sur
+cet hôte ou que la lignée est rompue. sync ne place ni ne déplace un agent
+de lui-même : il suit les fiches Placement du canon.
 """
 from __future__ import annotations
 
@@ -223,15 +229,18 @@ _CAPS_SQL = ("CASE WHEN %s::text IS NULL THEN NULL "
 
 
 def _write_declared(db: Db, name: str, values: dict) -> None:
+    """Écrit les colonnes déclaratives ; `placement_profile` est le profil des
+    valeurs écrites (celles que `placement.evaluate` a jugées), calculé par
+    `ameesh_placement_profile` dans la même instruction."""
     caps = _caps_param(values["capabilities"])
     db.query(
         """
         INSERT INTO agent_registry
             (name, harness, host, cwd, model, budget_usd, responsible, team, provider,
              credential_mode, capabilities, canon_ref, ephemeral, ephemeral_expires_at,
-             placement_ok, placement_diagnostic, placement_ref)
+             placement_ok, placement_diagnostic, placement_ref, placement_profile)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, __CAPS__, %s, false, NULL,
-                %s, %s, %s)
+                %s, %s, %s, __PROFILE__)
         ON CONFLICT (name) DO UPDATE SET
             harness         = excluded.harness,
             host            = excluded.host,
@@ -249,13 +258,16 @@ def _write_declared(db: Db, name: str, values: dict) -> None:
             placement_ok    = excluded.placement_ok,
             placement_diagnostic = excluded.placement_diagnostic,
             placement_ref   = excluded.placement_ref,
+            placement_profile = excluded.placement_profile,
             updated_at      = now()
         RETURNING name
-        """.replace("__CAPS__", _CAPS_SQL),
+        """.replace("__CAPS__", _CAPS_SQL)
+           .replace("__PROFILE__", placement_mod.PROFILE_PARAMS_SQL),
         (name, values["harness"], values["host"], values["cwd"], values["model"],
          values["budget_usd"], values["responsible"], values["team"], values["provider"],
          values["credential_mode"], caps, caps, values["canon_ref"],
-         values["placement_ok"], values["placement_diagnostic"], values["placement_ref"]),
+         values["placement_ok"], values["placement_diagnostic"], values["placement_ref"])
+        + placement_mod.profile_params(values),
     )
 
 
@@ -267,18 +279,29 @@ def _clear_responsible(db: Db, name: str, host: str) -> None:
 
 
 def _set_placement(db: Db, name: str, host: str, verdict: placement_mod.Verdict) -> None:
-    """Écrit un verdict de placement (colonnes déclaratives seulement), s'il change."""
+    """Écrit un verdict de placement et son profil évalué (colonnes
+    déclaratives seulement), s'il change.
+
+    `verdict.profile` : le profil évalué (texte de `ameesh_placement_profile`).
+    None pour un refus jugé sur la ligne telle qu'elle est : son profil
+    courant, calculé dans la même instruction. Un verdict admis n'est jamais
+    écrit sans profil évalué (il vaudrait pour n'importe quel profil).
+    """
+    if verdict.ok and verdict.profile is None:
+        raise ValueError("verdict de placement admis sans profil évalué : %s" % name)
     db.execute(
         """
         UPDATE agent_registry
            SET placement_ok = %s, placement_diagnostic = %s, placement_ref = %s,
+               placement_profile = coalesce(%s::text, __PROFILE__),
                updated_at = now()
          WHERE name = %s AND host = %s
-           AND (placement_ok, placement_diagnostic, placement_ref)
-               IS DISTINCT FROM (%s::boolean, %s::text, %s::text)
-        """,
-        (verdict.ok, verdict.diagnostic, verdict.ref, name, host,
-         verdict.ok, verdict.diagnostic, verdict.ref))
+           AND (placement_ok, placement_diagnostic, placement_ref, placement_profile)
+               IS DISTINCT FROM (%s::boolean, %s::text, %s::text,
+                                 coalesce(%s::text, __PROFILE__))
+        """.replace("__PROFILE__", placement_mod.profile_sql()),
+        (verdict.ok, verdict.diagnostic, verdict.ref, verdict.profile, name, host,
+         verdict.ok, verdict.diagnostic, verdict.ref, verdict.profile))
 
 
 def _lineage_root(by_name: dict[str, dict], creator: str | None) -> tuple[dict | None, str]:
@@ -300,18 +323,22 @@ def _lineage_root(by_name: dict[str, dict], creator: str | None) -> tuple[dict |
 
 def _inherit_placements(db: Db, host: str) -> None:
     """Les éphémères de cet hôte héritent du verdict de placement de leur
-    créateur racine du canon (C4) : le même harnais, le même fournisseur, le
-    même mode, sur le même hôte. Un éphémère issu d'un agent inscrit à la main
-    n'est pas gouverné : il n'est pas touché. Ni action, ni colonne d'état."""
+    créateur racine du canon (C4), à condition d'avoir le profil que ce
+    verdict a jugé : même hôte, même harnais, même fournisseur, même modèle,
+    même mode (profil courant de l'éphémère = profil évalué du créateur).
+    Sinon, refusé : « profil divergé ». Un éphémère issu d'un agent inscrit à
+    la main n'est pas gouverné : il n'est pas touché. Ni action, ni colonne
+    d'état."""
     rows = db.query(
         """
         SELECT name, created_by, ephemeral, canon_ref, host,
-               placement_ok, placement_diagnostic, placement_ref
+               placement_ok, placement_diagnostic, placement_ref, placement_profile,
+               __PROFILE__ AS profile_now
           FROM agent_registry
          WHERE ephemeral
             OR name IN (SELECT created_by FROM agent_registry
                          WHERE ephemeral AND created_by IS NOT NULL)
-        """
+        """.replace("__PROFILE__", placement_mod.profile_sql())
     )
     by_name = {row["name"]: row for row in rows}
     for row in sorted(rows, key=lambda r: r["name"]):
@@ -330,12 +357,26 @@ def _inherit_placements(db: Db, host: str) -> None:
                 "créateur %s placé sur %s, pas sur %s" % (
                     root["name"], root.get("host") or "?", host),
                 root.get("placement_ref"))
+        elif root.get("placement_ok") \
+                and row.get("profile_now") != root.get("placement_profile"):
+            # le verdict admis du créateur a jugé un autre profil que celui de
+            # l'éphémère : rien n'en est hérité
+            verdict = placement_mod.Verdict(
+                row["name"], host, False,
+                "profil divergé de celui évalué pour le créateur %s (évalué : %s ; "
+                "éphémère : %s) : placement non hérité" % (
+                    root["name"], root.get("placement_profile") or "aucun",
+                    row.get("profile_now")),
+                root.get("placement_ref"), profile=row.get("profile_now"))
         else:
             verdict = placement_mod.Verdict(
                 row["name"], host, root.get("placement_ok"),
-                root.get("placement_diagnostic") or "", root.get("placement_ref"))
+                root.get("placement_diagnostic") or "", root.get("placement_ref"),
+                profile=root.get("placement_profile"))
+        written = verdict.profile if verdict.profile is not None else row.get("profile_now")
         if (row.get("placement_ok"), row.get("placement_diagnostic") or "",
-                row.get("placement_ref")) != (verdict.ok, verdict.diagnostic, verdict.ref):
+                row.get("placement_ref"), row.get("placement_profile")) != (
+                verdict.ok, verdict.diagnostic, verdict.ref, written):
             _set_placement(db, row["name"], host, verdict)
 
 
@@ -344,10 +385,11 @@ def _rows(db: Db, host: str, names: list[str]) -> dict[str, dict]:
         SELECT name, harness, host, cwd, model, budget_usd, responsible, team, provider,
                credential_mode, capabilities, canon_ref, ephemeral, status, status_text,
                placement_ok, placement_diagnostic, placement_ref,
+               placement_profile IS NOT DISTINCT FROM __PROFILE__ AS profile_fresh,
                (status = 'running' AND lease_expires_at > now()) AS in_turn
           FROM agent_registry
          WHERE host = %s
-    """
+    """.replace("__PROFILE__", placement_mod.profile_sql())
     params: list = [host]
     if names:
         sql += " OR name = ANY(ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)))"
@@ -356,6 +398,10 @@ def _rows(db: Db, host: str, names: list[str]) -> dict[str, dict]:
 
 
 def _same(row: dict, values: dict) -> bool:
+    # profil évalué absent, ou différent du profil courant (posé à la main) :
+    # à réécrire, même si toutes les autres colonnes sont égales
+    if not row.get("profile_fresh"):
+        return False
     for key in DECLARATIVE:
         old, new = row.get(key), values.get(key)
         if key == "budget_usd":
@@ -425,7 +471,10 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None)
                 if c.strip().lower() not in canon_mod.FORBIDDEN_CAPABILITIES],
             "canon_ref": agent.fiche.ref,
             "ephemeral": False,
-            # C4 : admissibilité du placement sur CET hôte (politique de la fiche Host)
+            # C4 : admissibilité du placement sur CET hôte (politique de la fiche Host),
+            # pour le profil de ces valeurs (`_write_declared` écrit le profil évalué ;
+            # un harnais non déclaré, refusé par toute politique qui restreint les
+            # harnais, est inscrit « other »)
             "placement_ok": verdict.ok,
             "placement_diagnostic": verdict.diagnostic,
             "placement_ref": verdict.ref,
@@ -501,6 +550,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None)
                 UPDATE agent_registry
                    SET host = %s, responsible = NULL, canon_ref = %s,
                        placement_ok = NULL, placement_diagnostic = %s, placement_ref = %s,
+                       placement_profile = NULL,
                        updated_at = now()
                  WHERE name = %s AND host = %s
                 """,
@@ -580,9 +630,13 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
     L'insertion est atomique (INSERT … SELECT sur la ligne du créateur) : le
     responsable copié est celui du créateur au moment de la création. Un
     créateur éphémère transmet aussi son échéance (l'enfant ne lui survit pas).
-    Le verdict de placement (C4) est recopié lui aussi : l'éphémère tourne sur
-    le même hôte, avec le même harnais et le même mode ; `canon sync` le
-    rafraîchit ensuite depuis le créateur racine.
+    Le verdict de placement (C4) est recopié lui aussi, avec le profil évalué
+    du créateur : l'éphémère tourne sur le même hôte, avec le même harnais, le
+    même fournisseur, le même modèle et le même mode — mais un verdict admis
+    n'est hérité que si ce profil (celui du créateur au moment de la
+    création) est encore le profil évalué ; sinon l'éphémère naît refusé
+    (« profil divergé »). `canon sync` le rafraîchit ensuite depuis le
+    créateur racine.
     """
     if not NAME_RE.match(name or ""):
         raise SpawnError("nom d'agent invalide : %r" % (name,))
@@ -615,7 +669,7 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
         INSERT INTO agent_registry
             (name, chantier, harness, host, cwd, model, responsible, team, provider,
              credential_mode, capabilities, ephemeral, ephemeral_expires_at, created_by,
-             placement_ok, placement_diagnostic, placement_ref)
+             placement_ok, placement_diagnostic, placement_ref, placement_profile)
         SELECT %s, c.chantier, c.harness, c.host, coalesce(%s, c.cwd), c.model,
                c.responsible, c.team, c.provider, c.credential_mode,
                ARRAY(SELECT x FROM unnest(ARRAY['read', 'propose']::text[]) AS x
@@ -625,7 +679,18 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
                     THEN least(now() + make_interval(secs => %s), c.ephemeral_expires_at)
                     ELSE now() + make_interval(secs => %s) END,
                c.name,
-               c.placement_ok, c.placement_diagnostic, c.placement_ref
+               -- C4 : le profil de l'éphémère est celui du créateur (colonnes
+               -- recopiées ci-dessus) ; un verdict admis n'est hérité que s'il
+               -- a jugé ce profil
+               CASE WHEN c.placement_ok AND c.placement_profile IS DISTINCT FROM __NOW__
+                    THEN false ELSE c.placement_ok END,
+               CASE WHEN c.placement_ok AND c.placement_profile IS DISTINCT FROM __NOW__
+                    THEN 'profil de ' || c.name || ' divergé depuis l''évaluation de son '
+                         || 'placement (évalué : ' || coalesce(c.placement_profile, 'aucun')
+                         || ' ; actuel : ' || __NOW__ || ') : placement non hérité, à '
+                         || 'réévaluer par « ameesh canon sync »'
+                    ELSE c.placement_diagnostic END,
+               c.placement_ref, c.placement_profile
           FROM agent_registry c
          WHERE c.name = %s
            AND coalesce(c.responsible, '') <> ''
@@ -633,8 +698,9 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
            AND (NOT c.ephemeral OR c.ephemeral_expires_at > now())
         ON CONFLICT (name) DO NOTHING
         RETURNING name, responsible, host, harness, capabilities, created_by,
+                  placement_ok, placement_diagnostic,
                   extract(epoch from ephemeral_expires_at)::float8 AS ephemeral_expires_ts
-        """,
+        """.replace("__NOW__", placement_mod.profile_sql("c")),
         (name, os.path.abspath(os.path.expanduser(cwd)) if cwd else None,
          ttl_seconds, ttl_seconds, creator),
     )

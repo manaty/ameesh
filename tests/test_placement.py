@@ -103,7 +103,7 @@ class EvaluateTest(test_canon._TmpMixin, unittest.TestCase):
 # sync et réclamation (base réelle)
 # ==========================================================================
 
-class PlacementTest(test_canon._CanonDbCase):
+class _PlacementDbCase(test_canon._CanonDbCase):
     def claimable(self, host: str = "atelier", **kwargs) -> list[str]:
         kwargs.setdefault("require_responsible", False)
         return sorted(r["name"] for r in registry.claimable(self.db, host, **kwargs))
@@ -111,6 +111,12 @@ class PlacementTest(test_canon._CanonDbCase):
     def set_atelier(self, **changes) -> None:
         write(self.root, "hotes/atelier.md", host_card("atelier", **dict(ATELIER, **changes)))
 
+    def verdict(self, name: str) -> dict:
+        return self.db.query("SELECT placement_ok, placement_diagnostic, placement_profile "
+                             "FROM agent_registry WHERE name = %s", (name,))[0]
+
+
+class PlacementTest(_PlacementDbCase):
     def test_placement_admis_reclamable(self):
         report = self.sync()
         placements = {a.agent: a.to_dict() for a in report.actions}
@@ -194,11 +200,16 @@ class PlacementTest(test_canon._CanonDbCase):
         self.sync()
         self.assertEqual(self.claimable("banc"), ["ouvrier"])
         registry.upsert(self.db, "ouvrier", host="atelier")
-        row = self.db.query("SELECT placement_ok, placement_diagnostic FROM agent_registry "
-                            "WHERE name = 'ouvrier'")[0]
-        self.assertIsNone(row["placement_ok"])
-        self.assertIn("hôte changé hors de « ameesh canon sync »", row["placement_diagnostic"])
+        # le verdict reste écrit, mais il a jugé le profil du banc : il ne vaut plus
+        self.assertIs(self.db.query("SELECT placement_ok FROM agent_registry "
+                                    "WHERE name = 'ouvrier'")[0]["placement_ok"], True)
+        ouvrier = placement.recorded(self.db)["ouvrier"]
+        self.assertIs(ouvrier["placement_profile_ok"], False)
+        self.assertIn("profil divergé depuis l'évaluation", ouvrier["placement_diagnostic"])
+        self.assertIn("host='banc'", ouvrier["placement_profile"])
+        self.assertIn("host='atelier'", ouvrier["placement_profile_current"])
         self.assertEqual(self.claimable(), ["orchestre", "relecteur"])     # canon ok sur atelier
+        self.assertIsNone(registry.claim(self.db, "ouvrier", "runner-x", 600))
         # sync suit le canon : ouvrier retourne sur le banc, évalué là-bas
         self.assertEqual({a.agent: a.action for a in self.sync().actions}["ouvrier"], "déplacé")
         self.assertEqual(self.claimable("banc"), [])
@@ -339,10 +350,184 @@ class PlacementTest(test_canon._CanonDbCase):
         canon_sync.record_state(self.db, "h-place", canon_sync.CANON_OK, "")
         self.runner("--once", "--agents", "place", env=env)
         self.assertEqual(self.turns(), [])
+        # admis, mais pour un autre profil (harnais codex) : toujours rien
         self.db.execute("UPDATE agent_registry SET placement_ok = true, "
-                        "placement_diagnostic = '' WHERE name = 'place'")
+                        "placement_diagnostic = '', placement_profile = "
+                        "ameesh_placement_profile(host, 'codex', provider, model, "
+                        "credential_mode) WHERE name = 'place'")
+        self.runner("--once", "--agents", "place", env=env)
+        self.assertEqual(self.turns(), [])
+        self.db.execute("UPDATE agent_registry SET placement_profile = "
+                        "ameesh_placement_profile(host, harness, provider, model, "
+                        "credential_mode) WHERE name = 'place'")
         proc = self.runner("--once", "--agents", "place", env=env)
         self.assertEqual([t["harness"] for t in self.turns()], ["claude"], proc.stdout)
+
+
+# ==========================================================================
+# le verdict ne vaut que pour le profil évalué (revue B1)
+# ==========================================================================
+
+class ProfilEvalueTest(_PlacementDbCase):
+    def strict(self, host: str = "atelier") -> list[str]:
+        return self.claimable(host, require_responsible=True)
+
+    def assert_closed(self, name: str, host: str = "atelier") -> None:
+        """Ni claimable (strict ou non), ni claim, ni canon_claim_ok ; diagnostic lisible."""
+        self.assertNotIn(name, self.strict(host))
+        self.assertNotIn(name, self.claimable(host))
+        self.assertIsNone(registry.claim(self.db, name, "runner-x", 600))
+        overview = {r["name"]: r for r in registry.overview(self.db)}
+        self.assertFalse(overview[name]["canon_claim_ok"])
+
+    def test_profil_canonique(self):
+        """Forme canonique : NULL explicite (jamais un profil NULL), distinct de ''."""
+        row = self.db.query(
+            "SELECT ameesh_placement_profile('atelier', 'claude', NULL, '', 'l''api') AS p, "
+            "ameesh_placement_profile(NULL, NULL, NULL, NULL, NULL) AS vide, "
+            "ameesh_placement_profile('a', 'b', NULL, 'm', 'k') "
+            "= ameesh_placement_profile('a', 'b', '', 'm', 'k') AS confondus")[0]
+        self.assertEqual(row["p"], "host='atelier' harness='claude' provider=NULL model='' "
+                                   "credential_mode='l''api'")
+        self.assertEqual(row["vide"], "host=NULL harness=NULL provider=NULL model=NULL "
+                                      "credential_mode=NULL")
+        self.assertIs(row["confondus"], False)
+
+    def test_sonde_harnais_change_parent_et_enfant(self):
+        """La sonde : hôte qui n'admet que claude, sync, spawn, puis inscription
+        en codex sur le même hôte — ni le parent ni l'enfant ne restent réclamables."""
+        self.set_atelier(harnesses=["claude"])
+        self.sync()
+        canon_sync.spawn(self.db, "aide", "orchestre", 3600)
+        self.assertEqual(self.strict(), ["aide", "orchestre"])
+        registry.upsert(self.db, "orchestre", harness="codex", host="atelier")
+        registry.upsert(self.db, "aide", harness="codex", host="atelier")
+        self.assertEqual(self.strict(), [])
+        for name in ("orchestre", "aide"):
+            with self.subTest(agent=name):
+                self.assert_closed(name)
+                verdict = self.verdict(name)            # écrit, mais il a jugé claude
+                self.assertIs(verdict["placement_ok"], True)
+                self.assertIn("harness='claude'", verdict["placement_profile"])
+                recorded = placement.recorded(self.db, "atelier")[name]
+                self.assertIs(recorded["placement_profile_ok"], False)
+                self.assertIn("profil divergé depuis l'évaluation",
+                              recorded["placement_diagnostic"])
+                self.assertIn("harness='codex'", recorded["placement_diagnostic"])
+        # un éphémère créé par le créateur divergé naît refusé, et le dit
+        row = canon_sync.spawn(self.db, "tardif", "orchestre", 3600)
+        self.assertIs(row["placement_ok"], False)
+        self.assertIn("profil de orchestre divergé depuis l'évaluation",
+                      row["placement_diagnostic"])
+        self.assert_closed("tardif")
+        # le sync suivant réévalue : le canon remet orchestre sur claude (admis) ;
+        # les éphémères en codex n'héritent pas du verdict qui a jugé claude
+        report = self.sync()
+        self.assertEqual(self.actions(report)["orchestre"], "mis à jour")
+        self.assertEqual(self.row("orchestre")["harness"], "claude")
+        self.assertEqual(self.strict(), ["orchestre"])
+        for name in ("aide", "tardif"):
+            with self.subTest(agent=name):
+                verdict = self.verdict(name)
+                self.assertIs(verdict["placement_ok"], False)
+                self.assertIn("profil divergé de celui évalué pour le créateur orchestre",
+                              verdict["placement_diagnostic"])
+                self.assertIn("harness='codex'", verdict["placement_diagnostic"])
+        # revenus au profil évalué du créateur : fermés jusqu'au sync, qui les rouvre
+        self.db.execute("UPDATE agent_registry SET harness = 'claude' "
+                        "WHERE name IN ('aide', 'tardif')")
+        self.assertEqual(self.strict(), ["orchestre"])
+        self.sync()
+        self.assertEqual(self.strict(), ["aide", "orchestre", "tardif"])
+        self.assertIsNotNone(registry.claim(self.db, "aide", "runner-x", 600))
+
+    def test_divergence_du_profil_ferme_la_reclamation(self):
+        """Fournisseur, modèle, mode d'identifiants, hôte : toute divergence posée
+        hors sync ferme la réclamation ; le sync suivant réévalue."""
+        self.sync("banc")
+        self.sync()
+        self.assertEqual(self.strict(), ["orchestre", "relecteur"])
+        cas = (
+            ("fournisseur", "orchestre", "atelier",
+             "UPDATE agent_registry SET provider = 'openai' WHERE name = 'orchestre'"),
+            ("modèle", "orchestre", "atelier",
+             "UPDATE agent_registry SET model = 'claude-haiku' WHERE name = 'orchestre'"),
+            # modèle non déclaré (NULL) : la chaîne vide n'est pas le même profil
+            ("modèle NULL", "relecteur", "atelier",
+             "UPDATE agent_registry SET model = '' WHERE name = 'relecteur'"),
+            ("mode d'identifiants", "orchestre", "atelier",
+             "UPDATE agent_registry SET credential_mode = 'api-key' WHERE name = 'orchestre'"),
+            ("fournisseur NULL", "relecteur", "atelier",
+             "UPDATE agent_registry SET provider = NULL WHERE name = 'relecteur'"),
+            # hôte changé avec la référence de placement (import, SQL à la main)
+            ("hôte", "orchestre", "banc",
+             "UPDATE agent_registry SET host = 'banc', "
+             "placement_ref = 'canon:placements/orchestre-banc.md@x' WHERE name = 'orchestre'"),
+        )
+        for label, name, host, sql in cas:
+            with self.subTest(divergence=label):
+                self.db.execute(sql)
+                self.assert_closed(name, host)
+                self.assertIs(self.verdict(name)["placement_ok"], True)   # écrit, mais caduc
+                self.assertIn("profil divergé depuis l'évaluation",
+                              placement.recorded(self.db)[name]["placement_diagnostic"])
+                report = self.sync()
+                self.assertEqual(self.actions(report)[name], "mis à jour")
+                self.assertEqual(self.strict(), ["orchestre", "relecteur"])
+                self.assertIs(placement.recorded(self.db)[name]["placement_profile_ok"], True)
+        # hôte changé par `ameesh run register` sur une autre machine
+        registry.upsert(self.db, "orchestre", host="banc")
+        self.assert_closed("orchestre", "banc")
+        self.assertEqual(self.strict("banc"), ["ouvrier"])
+        self.sync()
+        self.assertEqual(self.strict(), ["orchestre", "relecteur"])
+
+    def test_profil_evalue_touche_a_la_main(self):
+        """Profil évalué posé à la main (ou verdict sans profil) : fermé, et le
+        sync suivant le réécrit même si toutes les autres colonnes sont égales."""
+        self.sync()
+        for label, value in (("faux profil", "'host=''atelier'''"), ("sans profil", "NULL")):
+            with self.subTest(cas=label):
+                self.db.execute("UPDATE agent_registry SET placement_profile = %s "
+                                "WHERE name = 'orchestre'" % value)
+                self.assert_closed("orchestre")
+                self.assertEqual(self.actions(self.sync())["orchestre"], "mis à jour")
+                self.assertEqual(self.strict(), ["orchestre", "relecteur"])
+                self.assertEqual(self.actions(self.sync())["orchestre"], "inchangé")
+
+    def test_enfant_dont_le_profil_differe_du_createur(self):
+        self.sync()
+        canon_sync.spawn(self.db, "aide", "orchestre", 3600)
+        canon_sync.spawn(self.db, "petit", "aide", 3600)          # petit → aide → orchestre
+        self.assertEqual(self.strict(), ["aide", "orchestre", "petit", "relecteur"])
+        for label, sql in (
+                ("modèle", "UPDATE agent_registry SET model = 'autre' WHERE name = 'petit'"),
+                ("mode", "UPDATE agent_registry SET credential_mode = 'api-key' "
+                         "WHERE name = 'petit'")):
+            with self.subTest(divergence=label):
+                self.db.execute(sql)
+                self.assert_closed("petit")                     # avant tout sync
+                self.sync()
+                verdict = self.verdict("petit")
+                self.assertIs(verdict["placement_ok"], False)
+                self.assertIn("profil divergé de celui évalué pour le créateur orchestre",
+                              verdict["placement_diagnostic"])
+                self.assert_closed("petit")
+                self.assertEqual(self.strict(), ["aide", "orchestre", "relecteur"])
+                # retour au profil du créateur : le sync suivant le rouvre
+                self.db.execute("UPDATE agent_registry SET model = 'claude-opus', "
+                                "credential_mode = 'subscription' WHERE name = 'petit'")
+                self.assertNotIn("petit", self.strict())
+                self.sync()
+                self.assertEqual(self.strict(), ["aide", "orchestre", "petit", "relecteur"])
+        # créateur intermédiaire divergé : l'enfant suit le créateur racine, pas lui
+        self.db.execute("UPDATE agent_registry SET model = 'autre' WHERE name = 'aide'")
+        self.sync()
+        self.assertEqual(self.strict(), ["orchestre", "petit", "relecteur"])
+        # et un éphémère créé par cet intermédiaire divergé naît refusé
+        row = canon_sync.spawn(self.db, "cadet", "aide", 3600)
+        self.assertIs(row["placement_ok"], False)
+        self.assertNotIn("cadet", self.strict())
 
 
 # ==========================================================================
@@ -436,6 +621,38 @@ class PlacementCliTest(test_canon._CanonDbCase):
                           rows["orchestre"]["placement_diagnostic"]), (True, True, ""))
         self.assertEqual((rows["manuel"]["placement_ok"], rows["manuel"]["canon_claim_ok"]),
                          (None, True))
+
+    def test_diagnostic_profil_divergé(self):
+        """canon check et list --json disent « profil divergé depuis l'évaluation »."""
+        self.sync()
+        registry.upsert(self.db, "orchestre", harness="codex", host="atelier")
+        rows = {r["name"]: r for r in json.loads(self.mesh("list", "--json").stdout)}
+        orchestre = rows["orchestre"]
+        self.assertEqual((orchestre["placement_ok"], orchestre["placement_profile_ok"],
+                          orchestre["canon_claim_ok"]), (True, False, False))
+        self.assertIn("profil divergé depuis l'évaluation", orchestre["placement_diagnostic"])
+        self.assertIn("harness='claude'", orchestre["placement_profile"])
+        self.assertIn("harness='codex'", orchestre["placement_profile_current"])
+        self.assertEqual((rows["relecteur"]["placement_profile_ok"],
+                          rows["relecteur"]["placement_diagnostic"],
+                          rows["relecteur"]["canon_claim_ok"]), (True, "", True))
+        proc = self.mesh("canon", "check", "--host", "atelier", env=self.cli_env())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        line = [ligne for ligne in proc.stdout.splitlines()
+                if ligne.startswith("registre  : orchestre")]
+        self.assertEqual(len(line), 1, proc.stdout)
+        self.assertIn("profil divergé depuis l'évaluation", line[0])
+        self.assertIn("« ameesh canon sync »", line[0])
+        self.assertNotIn("registre  : relecteur", proc.stdout)
+        data = json.loads(self.mesh("canon", "check", "--host", "atelier", "--json",
+                                    env=self.cli_env()).stdout)
+        recorded = {p["agent"]: p for p in data["registry_placements"]}
+        self.assertIs(recorded["orchestre"]["placement_profile_ok"], False)
+        self.assertIs(recorded["relecteur"]["placement_profile_ok"], True)
+        # le sync suivant réévalue : plus de divergence
+        self.sync()
+        proc = self.mesh("canon", "check", "--host", "atelier", env=self.cli_env())
+        self.assertNotIn("profil divergé", proc.stdout)
 
 
 if __name__ == "__main__":

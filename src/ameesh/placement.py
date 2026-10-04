@@ -6,9 +6,13 @@ la politique posée par le responsable de l'hôte (fiche `Host`). ameesh :
 
 * évalue l'admissibilité du placement d'un agent sur un hôte (`evaluate`,
   fail closed) ; `ameesh canon sync` l'écrit dans les colonnes déclaratives
-  `placement_ok`, `placement_diagnostic` et `placement_ref` (0022), et la
-  condition de réclamation (`registry.canon_claim_predicate_sql`) exige
-  `placement_ok` pour un agent gouverné par le canon ;
+  `placement_ok`, `placement_diagnostic` et `placement_ref` (0022), avec le
+  PROFIL ÉVALUÉ (`placement_profile` : `ameesh_placement_profile` de l'hôte,
+  du harnais, du fournisseur, du modèle et du mode d'identifiants jugés) ;
+  la condition de réclamation (`registry.canon_claim_predicate_sql`) exige
+  `placement_ok` pour un agent gouverné par le canon, et que son profil
+  courant soit encore le profil évalué (sinon : « profil divergé depuis
+  l'évaluation », jusqu'au prochain `canon sync`) ;
 * propose les placements admissibles d'un agent (`proposals`) : les hôtes du
   canon dont la politique l'admet, avec les modes d'identifiants admis ;
 * ne déplace jamais un agent de lui-même : rien ici n'écrit, ni dans le canon
@@ -26,6 +30,34 @@ from .db import Db
 #: modes d'identifiants du profil (spec §4.2)
 CREDENTIAL_MODES = ("api-key", "subscription")
 
+#: colonnes du registre qui forment le profil d'un placement (0022), dans
+#: l'ordre des arguments de la fonction SQL `ameesh_placement_profile`
+PROFILE_COLUMNS = ("host", "harness", "provider", "model", "credential_mode")
+
+
+def profile_sql(alias: str | None = None) -> str:
+    """Expression SQL : profil COURANT de la ligne (`ameesh_placement_profile`
+    de ses colonnes), à comparer à `placement_profile`, le profil évalué."""
+    prefix = "%s." % alias if alias else ""
+    return "ameesh_placement_profile(%s)" % ", ".join(prefix + c for c in PROFILE_COLUMNS)
+
+
+#: profil passé en paramètres (`%s` liés, dans l'ordre de PROFILE_COLUMNS)
+PROFILE_PARAMS_SQL = "ameesh_placement_profile(%s)" % ", ".join(
+    ["%s::text"] * len(PROFILE_COLUMNS))
+
+
+def profile_params(values: dict) -> tuple:
+    """Les paramètres de PROFILE_PARAMS_SQL pour un mapping de colonnes."""
+    return tuple(values.get(c) for c in PROFILE_COLUMNS)
+
+
+def diverged_diagnostic(evaluated: str | None, current: str | None) -> str:
+    """Raison lisible : le profil de l'agent n'est plus celui que le verdict a jugé."""
+    return ("profil divergé depuis l'évaluation du placement (évalué : %s ; actuel : %s) : "
+            "non réclamable jusqu'au prochain « ameesh canon sync »" % (
+                evaluated or "aucun", current or "?"))
+
 
 @dataclass
 class Verdict:
@@ -42,6 +74,9 @@ class Verdict:
     diagnostic: str = ""
     ref: str | None = None              # canon_ref de la fiche Placement
     credential_mode: str | None = None  # celui du placement, sinon de la fiche
+    #: profil évalué (texte de `ameesh_placement_profile`) quand il est connu
+    #: au moment de l'écrire : écrit dans `placement_profile` avec le verdict
+    profile: str | None = None
 
     def to_dict(self) -> dict:
         return {"agent": self.agent, "host": self.host, "placement_ok": self.ok,
@@ -199,13 +234,53 @@ def report(canon: Canon, agent: str | None = None,
     return out
 
 
+#: clés ajoutées par `annotate` / rendues par `recorded`
+RECORDED_KEYS = ("placement_ok", "placement_diagnostic", "placement_ref", "placement_profile",
+                 "placement_profile_current", "placement_profile_ok")
+
+
+def recorded(db: Db, host: str | None = None) -> dict[str, dict]:
+    """Verdicts écrits au registre (0022), confrontés au profil COURANT de
+    chaque agent, par nom (ceux de `host` seulement si donné).
+
+    `placement_profile_ok` : None sans verdict (agent inscrit à la main, pas
+    encore évalué) ; faux si le profil a divergé depuis l'évaluation — la
+    condition de réclamation le refuse alors, et `placement_diagnostic` le
+    dit (« profil divergé depuis l'évaluation », profils évalué et actuel).
+    """
+    sql = ("SELECT name, host, placement_ok, placement_diagnostic, placement_ref, "
+           "placement_profile, %s AS placement_profile_current FROM agent_registry"
+           % profile_sql())
+    params: tuple = ()
+    if host is not None:
+        sql += " WHERE host = %s"
+        params = (host,)
+    out: dict[str, dict] = {}
+    for row in db.query(sql, params):
+        entry = dict(row)
+        if row.get("placement_ok") is None and row.get("placement_profile") is None:
+            entry["placement_profile_ok"] = None
+        else:
+            entry["placement_profile_ok"] = (
+                row.get("placement_profile") == row.get("placement_profile_current"))
+        if entry["placement_profile_ok"] is False:
+            why = diverged_diagnostic(row.get("placement_profile"),
+                                      row.get("placement_profile_current"))
+            if row.get("placement_ok") is not True and row.get("placement_diagnostic"):
+                why += " ; verdict à l'évaluation : %s" % row["placement_diagnostic"]
+            entry["placement_diagnostic"] = why
+        out[row["name"]] = entry
+    return out
+
+
 def annotate(db: Db, rows: list[dict]) -> list[dict]:
-    """Ajoute `placement_ok`, `placement_diagnostic` et `placement_ref` (0022)
-    aux lignes de `registry.overview` (`mesh list --json`)."""
-    columns = {r["name"]: r for r in db.query(
-        "SELECT name, placement_ok, placement_diagnostic, placement_ref FROM agent_registry")}
+    """Ajoute le verdict de placement (0022) aux lignes de `registry.overview`
+    (`mesh list --json`) : `placement_ok`, `placement_diagnostic`,
+    `placement_ref`, `placement_profile` (évalué), `placement_profile_current`
+    et `placement_profile_ok` (voir `recorded`)."""
+    columns = recorded(db)
     for row in rows:
         found = columns.get(row.get("name"), {})
-        for key in ("placement_ok", "placement_diagnostic", "placement_ref"):
+        for key in RECORDED_KEYS:
             row[key] = found.get(key)
     return rows

@@ -71,17 +71,32 @@ def _status_line(host: str, status: str, diagnostic: str, *, recorded: bool) -> 
 
 
 def _recorded(cfg: Config, host: str) -> dict | None:
-    """{"state": état enregistré ou None}, ou None sans base (check marche sans base)."""
+    """{"state": état enregistré ou None, "placements": verdicts écrits au
+    registre pour l'hôte (`placement.recorded`), ou None si illisibles}, ou
+    None sans base (check marche sans base)."""
     try:
         db = db_mod.connect(cfg)
     except db_mod.DbError:
         return None
     try:
-        return {"state": canon_sync.state(db, host)}
+        out = {"state": canon_sync.state(db, host), "placements": None}
+        try:
+            out["placements"] = placement_mod.recorded(db, host)
+        except db_mod.DbError:
+            pass                        # base pas encore migrée (0022)
+        return out
     except db_mod.DbError:
         return None
     finally:
         db.close()
+
+
+def _print_recorded_placements(recorded: dict | None) -> None:
+    """Verdicts du registre qui ne valent plus : profil divergé depuis l'évaluation."""
+    rows = (recorded or {}).get("placements") or {}
+    for name in sorted(rows):
+        if rows[name].get("placement_profile_ok") is False:
+            print("registre  : %-16s %s" % (name, rows[name]["placement_diagnostic"]))
 
 
 def _recorded_line(host: str, recorded: dict | None) -> str:
@@ -115,6 +130,11 @@ def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
             "readable": canon.readable, "host": host,
             "canon_status": status, "diagnostic": diagnostic,
             "registry_state": recorded["state"] if recorded else None,
+            # C4 : verdicts écrits au registre pour l'hôte, confrontés au
+            # profil courant (placement_profile_ok faux : profil divergé)
+            "registry_placements": [
+                dict(row, agent=name)
+                for name, row in sorted(((recorded or {}).get("placements") or {}).items())],
             "sources": [s.to_dict() for s in canon.sources],
             "errors": len(errors), "warnings": len(findings) - len(errors),
             "findings": [f.to_dict() for f in findings],
@@ -131,6 +151,7 @@ def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
     print(_recorded_line(host, recorded))
     if canon.readable:
         _print_placements(host, [v for v in placements if v.host == host])
+    _print_recorded_placements(recorded)
     return 1 if errors else 0
 
 
@@ -357,6 +378,9 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
               row["name"], row["created_by"], row["responsible"],
               _join(row.get("capabilities")), row.get("host") or "—",
               time.strftime("%Y-%m-%d %H:%M", time.localtime(row["ephemeral_expires_ts"]))))
+    if row.get("placement_ok") is False:
+        print("placement refusé (non réclamable) : %s"
+              % (row.get("placement_diagnostic") or "?"))
     return 0
 
 

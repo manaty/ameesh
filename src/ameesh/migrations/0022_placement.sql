@@ -18,46 +18,47 @@
 --   placement_diagnostic  la raison du refus, lisible ('' si admis)
 --   placement_ref         `<membre>:<chemin>@<commit>` de la fiche Placement lue
 --                         (celle du créateur racine pour un éphémère)
+--   placement_profile     le PROFIL ÉVALUÉ : `ameesh_placement_profile(hôte,
+--                         harnais, fournisseur, modèle, mode d'identifiants)`
+--                         des valeurs que le verdict a jugées (celles que sync
+--                         écrit, ou celles du créateur pour un éphémère) ;
+--                         écrit avec chaque verdict, jamais seul
 --
--- La condition de réclamation (`registry.canon_claim_predicate_sql`) exige
--- `placement_ok` pour un agent gouverné par le canon : NULL ou faux, pas de
--- NOUVELLE réclamation (fail closed). Baux, sessions et tours en cours ne sont
--- pas touchés. Les agents inscrits à la main ne sont pas concernés. Après
--- cette migration, un `ameesh canon sync` par hôte rouvre la réclamation des
--- agents du canon dont le placement est admis.
+-- Le verdict ne vaut que pour le profil évalué. La condition de réclamation
+-- (`registry.canon_claim_predicate_sql`) exige, pour un agent gouverné par le
+-- canon, `placement_ok` ET `placement_profile` égal au profil COURANT de la
+-- ligne (`ameesh_placement_profile` de ses colonnes). Verdict NULL ou faux, ou
+-- profil divergé depuis l'évaluation — `ameesh run register` sur une autre
+-- machine ou avec un autre harnais, `import-v0`, SQL à la main —, pas de
+-- NOUVELLE réclamation (fail closed) jusqu'au prochain `ameesh canon sync`,
+-- sans déclencheur à deviner qui écrit. Baux, sessions et tours en cours ne
+-- sont pas touchés. Les agents inscrits à la main ne sont pas concernés.
+-- Après cette migration, un `ameesh canon sync` par hôte rouvre la
+-- réclamation des agents du canon dont le placement est admis.
 
 alter table agent_registry
     add column if not exists placement_ok         boolean,
     add column if not exists placement_diagnostic text,
-    add column if not exists placement_ref        text;
+    add column if not exists placement_ref        text,
+    add column if not exists placement_profile    text;
 
--- Le verdict vaut pour un hôte. Un changement d'hôte qui ne vient pas d'une
--- réévaluation (`ameesh run register` ou `import-v0` sur une autre machine,
--- SQL à la main) n'emporte pas le verdict : il est remis à NULL, donc plus de
--- réclamation avant le `canon sync` de ce nouvel hôte. `canon sync` change
--- l'hôte en écrivant la fiche Placement de l'hôte cible (`placement_ref`
--- différent) : il n'est pas concerné. Un agent jamais évalué (inscrit à la
--- main) non plus.
-create or replace function agent_registry_placement_host() returns trigger
-language plpgsql as $$
-begin
-    if new.host is distinct from old.host
-       and new.placement_ref is not distinct from old.placement_ref
-       and old.placement_ok is not null then
-        new.placement_ok := null;
-        new.placement_diagnostic := 'hôte changé hors de « ameesh canon sync » ('
-            || coalesce(old.host, '') || ' → ' || coalesce(new.host, '')
-            || ') : placement à réévaluer par « ameesh canon sync » sur '
-            || coalesce(new.host, '');
-    end if;
-    return new;
-end
+-- Profil d'un placement, forme canonique : chaque valeur citée par
+-- quote_nullable (apostrophes doublées), NULL écrit `NULL` — distinct de la
+-- chaîne vide `''` —, dans un ordre fixe. Jamais NULL (pas STRICT, pas de
+-- concaténation avec NULL) : deux profils inconnus ne sont jamais « égaux »
+-- par accident. Immuable : même entrée, même texte, sur toutes les bases.
+create or replace function ameesh_placement_profile(
+    p_host text, p_harness text, p_provider text, p_model text,
+    p_credential_mode text)
+returns text
+language sql immutable parallel safe
+as $$
+    select 'host=' || quote_nullable(p_host)
+        || ' harness=' || quote_nullable(p_harness)
+        || ' provider=' || quote_nullable(p_provider)
+        || ' model=' || quote_nullable(p_model)
+        || ' credential_mode=' || quote_nullable(p_credential_mode)
 $$;
-
-drop trigger if exists agent_registry_placement_host on agent_registry;
-create trigger agent_registry_placement_host
-    before update of host on agent_registry
-    for each row execute function agent_registry_placement_host();
 
 -- La vue d'observabilité fige ses colonnes (`r.*` est développé à la
 -- création) : on la recrée, à l'identique de 0008, pour qu'elle expose les

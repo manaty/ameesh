@@ -172,11 +172,17 @@ placement on *that* host is admitted (declarative columns `placement_ok`,
 policy rejects its harness, provider, model or credential mode, when it has no
 placement on this host, when the placement is ambiguous or the `Host` card is
 missing. The claim condition requires `placement_ok` for agents governed by
-the canon (ephemeral agents inherit their canon creator's verdict); a refused,
-missing or not-yet-evaluated verdict closes new claims, never a running lease.
-A host change made outside `canon sync` (e.g. `ameesh run register` on another
-machine) resets the verdict until that host is synced. Agents registered by
-hand are unaffected. ameesh never moves an agent by itself:
+the canon; a refused, missing or not-yet-evaluated verdict closes new claims,
+never a running lease. A verdict only holds for the profile it judged: every
+verdict is written with `placement_profile`, the SQL function
+`ameesh_placement_profile(host, harness, provider, model, credential_mode)` of
+the evaluated values, and the claim condition also requires it to equal the
+row's current profile. Any change made outside `canon sync` (`ameesh run
+register` with another harness or on another machine, `import-v0`, manual SQL)
+closes new claims until the next sync, without any trigger. Ephemeral agents
+inherit their canon creator's verdict only when their own profile is the one
+evaluated for that creator. Agents registered by hand are unaffected. ameesh
+never moves an agent by itself:
 
 ```
 ameesh placement check [--agent A] [--json] …   # read-only: current placements (admitted or
@@ -184,9 +190,11 @@ ameesh placement check [--agent A] [--json] …   # read-only: current placement
                                                 # exit 1 if a placement is refused
 ```
 
-`canon check` lists the host's placements (admitted or refused), `canon sync`
+`canon check` lists the host's placements (admitted or refused) and the
+registry verdicts whose profile diverged since evaluation, `canon sync`
 reports each agent's verdict, and `mesh list --json` exposes `placement_ok`,
-`placement_diagnostic` and `placement_ref`.
+`placement_diagnostic`, `placement_ref`, `placement_profile` (evaluated),
+`placement_profile_current` and `placement_profile_ok`.
 
 `agent-runner`:
 
