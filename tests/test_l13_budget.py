@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import cost, db as db_mod, registry
+from ameesh import adapters, cost, db as db_mod, registry
 from ameesh.adapters import adapter_for
 from ameesh.runner import AgentWorker, Runner
 
@@ -329,6 +329,33 @@ class BudgetGateTest(PgTestCase):
                 "select count(*)::int as n from turn_costs")[0]["n"], 0)
         finally:
             worker.watchdog_stop.set()
+
+    def test_la_comptabilite_ne_requiert_pas_le_binaire_du_harnais(self):
+        """Relire le flux d'un tour passé n'exige pas le binaire : il a pu être
+        désinstallé depuis (ou n'existe pas, comme en CI). La ligne s'écrit."""
+        runner, worker = self._worker(plafond=10.0, harness="deepseek")
+        with open(worker._path("events.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "session", "sessionId": "s1",
+                                 "model": "deepseek-pro"}) + "\n")
+            fh.write(json.dumps({
+                "type": "status", "phase": "step_end",
+                "usage": {"inputTokens": 1_000_000, "cacheReadTokens": 0,
+                          "outputTokens": 0},
+            }) + "\n")
+        self.assertTrue(worker._compta_marque(0, "tour", ""))
+        sans = {k: v for k, v in os.environ.items()
+                if not k.endswith("_BIN") and not k.endswith("_BIN_DIR")}
+        with mock.patch.dict(os.environ, sans, clear=True), \
+                mock.patch("ameesh.adapters.shutil.which", return_value=None):
+            with self.assertRaises(adapters.HarnessMissing):
+                adapter_for("deepseek")  # le binaire est bien introuvable
+            worker._compta_termine()
+        self.assertFalse(worker._compta_en_echec)
+        ligne = self.db.query(
+            "select model, usd from turn_costs where agent = 'budget' "
+            "order by id desc limit 1")[0]
+        self.assertEqual(ligne["model"], "deepseek-pro")
+        self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
 
 
 class AnnouncedModelTest(PgTestCase):
