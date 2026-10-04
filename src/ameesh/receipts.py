@@ -735,7 +735,9 @@ def consume_nonce(db: Db, approver: str, nonce: str, *, by: str, challenge: str 
     La décision est l'`INSERT … ON CONFLICT DO NOTHING` sur la clé primaire :
     deux consommations simultanées ne peuvent pas réussir toutes les deux. Si
     `authenticator_id` est donné, l'authentificateur doit être encore actif au
-    moment de l'insertion.
+    moment de l'insertion : il est lu sous verrou partagé (`FOR SHARE`), qui
+    sérialise avec sa révocation (une révocation en cours est attendue puis
+    vue).
     """
     rows = db.query(
         """
@@ -743,7 +745,8 @@ def consume_nonce(db: Db, approver: str, nonce: str, *, by: str, challenge: str 
         SELECT %s, %s, %s, %s
          WHERE %s::bigint IS NULL
             OR EXISTS (SELECT 1 FROM authenticators a
-                        WHERE a.id = %s::bigint AND a.revoked_at IS NULL)
+                        WHERE a.id = %s::bigint AND a.revoked_at IS NULL
+                          FOR SHARE)
         ON CONFLICT (approver, nonce) DO NOTHING
         RETURNING nonce
         """,
@@ -950,7 +953,10 @@ def sync_authenticators(db: Db, members: list) -> dict:
     "authenticators": [{facade, credential_id, public_key, aaguid, level,
     canon_ref?}]}]. Le canon est la référence complète : un authentificateur
     actif absent de la liste est révoqué ; un changement de clé révoque
-    l'ancienne ligne et en crée une nouvelle.
+    l'ancienne ligne et en crée une nouvelle. Une révocation est un UPDATE de
+    la ligne : elle se sérialise avec les lectures sous verrou partagé (`FOR
+    SHARE`) des réservations, des enregistrements de grants et des
+    consommations de nonces.
 
     Une entrée invalide — en particulier **sans référence de commit**
     (`canon_ref` = chemin@SHA) — est refusée : constat d'erreur, aucune

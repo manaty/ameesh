@@ -104,6 +104,9 @@ alter table mesh_consumed_nonces
 -- Enregistrement d'un grant : consommation du nonce ET insertion du grant,
 -- ou rien. NULL si le nonce était déjà consommé ou si l'authentificateur
 -- n'est plus actif (révoqué entre la vérification et l'enregistrement).
+-- L'authentificateur est relu sous verrou partagé (`FOR SHARE`) : une
+-- révocation en cours est attendue puis vue, une révocation postérieure
+-- attend la fin de l'enregistrement.
 create or replace function ameesh_standing_register(
     p_approver text, p_nonce text, p_challenge text, p_authenticator_id bigint,
     p_receipt text, p_connector text, p_operations jsonb, p_class text,
@@ -114,10 +117,14 @@ language plpgsql as $$
 declare
     v_id bigint;
 begin
+    perform 1 from authenticators a
+     where a.id = p_authenticator_id and a.revoked_at is null
+       for share;
+    if not found then
+        return null;
+    end if;
     insert into mesh_consumed_nonces (approver, nonce, consumed_by, challenge)
-    select p_approver, p_nonce, coalesce(p_registered_by, 'standing'), p_challenge
-     where exists (select 1 from authenticators a
-                    where a.id = p_authenticator_id and a.revoked_at is null)
+    values (p_approver, p_nonce, coalesce(p_registered_by, 'standing'), p_challenge)
     on conflict (approver, nonce) do nothing;
     if not found then
         return null;
@@ -178,6 +185,8 @@ $$;
 --    L'échéance est comparée à `clock_timestamp()`, jamais à `now()` : `now()`
 --    est figé au début de la transaction, AVANT l'éventuelle attente du
 --    verrou — un grant échu pendant l'attente serait encore « valable ».
+--    L'authentificateur signataire est relu sous verrou partagé (`FOR
+--    SHARE`), qui sérialise avec sa révocation (un UPDATE de la ligne).
 -- 3. Idempotente par (grant, action) : une réservation vivante est rendue
 --    telle quelle (reused = true), à condition que la description de l'action
 --    soit IDENTIQUE (montant, devise, connecteur, opération, classe) — toute
@@ -215,8 +224,12 @@ begin
     if v_grant.revoked_at is not null or v_grant.valid_until <= clock_timestamp() then
         return;
     end if;
+    -- L'authentificateur qui a signé le grant, sous verrou PARTAGÉ : une
+    -- révocation (UPDATE de la ligne) en cours est attendue puis vue ; une
+    -- révocation postérieure attend la fin de cette réservation.
     perform 1 from authenticators a
-     where a.id = v_grant.authenticator_id and a.revoked_at is null;
+     where a.id = v_grant.authenticator_id and a.revoked_at is null
+       for share;
     if not found then
         return;
     end if;

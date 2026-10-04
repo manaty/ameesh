@@ -461,6 +461,18 @@ class ReceiptsForgeryTest(ReceiptsBase):
         self.assertRefused(self.verify(receipt), receipts.REVOKED)
         self.assertRefused(self.verify(self.alice.receipt(make_request(ALICE))), receipts.REVOKED)
 
+    def test_consommation_pendant_une_revocation(self):
+        """B3 : la consommation d'un reçu attend une révocation en cours, puis refuse."""
+        receipt = self.alice.receipt(make_request(ALICE))
+        with revoking(self, self.alice.credential_id) as revocation:
+            worker = Worker(self, lambda db: self.consume(receipt, db=db))
+            waited = revocation.blocked(worker)
+            revocation.commit()
+        self.assertRefused(worker.result(), receipts.REVOKED)
+        self.assertTrue(waited, "la consommation n'a pas attendu la révocation en cours")
+        self.assertEqual(self.db.query(
+            "SELECT count(*)::int AS n FROM mesh_consumed_nonces")[0]["n"], 0)
+
     def test_expire(self):
         request = make_request(ALICE, iat=int(time.time()) - 700, ttl=600)
         self.assertRefused(self.verify(self.alice.receipt(request)), receipts.EXPIRED)
@@ -825,6 +837,15 @@ class HeldTransaction:
         self.proc.stderr.close()
 
 
+def revoking(test: PgTestCase, credential_id: str) -> HeldTransaction:
+    """Une révocation d'authentificateur EN COURS : l'UPDATE, non encore validé."""
+    row = test.db.query("SELECT id FROM authenticators WHERE credential_id = %s "
+                        "AND revoked_at IS NULL", (credential_id,))[0]
+    return HeldTransaction(
+        test, "UPDATE authenticators SET revoked_at = now(), "
+              "revoked_reason = 'revocation en cours (test)' WHERE id = %d;" % int(row["id"]))
+
+
 class Worker(threading.Thread):
     """Un appel dans un fil, sur SA connexion (le pilote testé)."""
 
@@ -878,6 +899,10 @@ class StandingTest(ReceiptsBase):
         """Une autre transaction tient le verrou du grant (transaction ouverte)."""
         return HeldTransaction(
             self, "SELECT id FROM standing_approvals WHERE id = %d FOR UPDATE;" % int(grant))
+
+    def revoking(self, credential_id: str) -> HeldTransaction:
+        """Une révocation de l'authentificateur EN COURS (UPDATE non validé)."""
+        return revoking(self, credential_id)
 
     def live_reservations(self) -> int:
         return self.db.query("SELECT count(*)::int AS n FROM standing_reservations "
@@ -1098,6 +1123,61 @@ class StandingTest(ReceiptsBase):
         self.assertIsNone(worker.result())
         self.assertEqual(self.consumed(grant), 0)
         self.assertEqual(self.live_reservations(), 0)
+
+    def test_authentificateur_revoque_pendant_l_attente(self):
+        """B3 : authentificateur révoqué (et validé) pendant l'attente du verrou."""
+        grant, _ = self.register()
+        with self.lock_grant(grant) as holder:
+            worker = self.reserving(grant, action(amount=30))
+            self.assertTrue(holder.blocked(worker), "la réservation n'a pas attendu le verrou")
+            # le canon retire la passkey qui a signé le grant ; révocation validée
+            self.members[0]["authenticators"] = [
+                e for e in self.members[0]["authenticators"]
+                if e["credential_id"] != self.alice.credential_id]
+            result = receipts.sync_authenticators(self.db, self.members)
+            self.assertEqual(result["revoked"],
+                             ["%s/webauthn/%s" % (ALICE, self.alice.credential_id)])
+            holder.commit()
+        self.assertIsNone(worker.result())
+        self.assertEqual(self.consumed(grant), 0)
+        self.assertEqual(self.live_reservations(), 0)
+
+    def test_grant_revoque_pendant_l_attente(self):
+        grant, _ = self.register()
+        with HeldTransaction(self, "UPDATE standing_approvals SET revoked_at = now(), "
+                                   "revoked_by = 'human:alice' WHERE id = %d;" % grant) as holder:
+            worker = self.reserving(grant, action(amount=30))
+            self.assertTrue(holder.blocked(worker), "la réservation n'a pas attendu le verrou")
+            holder.commit()
+        self.assertIsNone(worker.result())
+        self.assertEqual(self.consumed(grant), 0)
+
+    def test_revocation_en_cours_serialisee_avec_la_reservation(self):
+        """B3 : FOR SHARE sur l'authentificateur — la révocation en cours est attendue."""
+        grant, _ = self.register()
+        with self.revoking(self.alice.credential_id) as revocation:
+            worker = self.reserving(grant, action(amount=30))
+            waited = revocation.blocked(worker)
+            revocation.commit()
+        self.assertIsNone(worker.result())
+        self.assertTrue(waited, "la réservation n'a pas attendu la révocation en cours")
+        self.assertEqual(self.consumed(grant), 0)
+        self.assertEqual(self.live_reservations(), 0)
+
+    def test_enregistrement_pendant_une_revocation(self):
+        """B3 : l'enregistrement d'un grant attend une révocation en cours, puis refuse."""
+        receipt = self.alice.receipt(make_request(ALICE, standing=standing()))
+        with self.revoking(self.alice.credential_id) as revocation:
+            worker = Worker(self, lambda db: receipts.register_standing(
+                db, receipt, POLICY, registered_by="porte"))
+            waited = revocation.blocked(worker)
+            revocation.commit()
+        verdict, grant = worker.result()
+        self.assertIsNone(grant)
+        self.assertRefused(verdict, receipts.REVOKED)
+        self.assertTrue(waited, "l'enregistrement n'a pas attendu la révocation en cours")
+        self.assertEqual(self.db.query(
+            "SELECT count(*)::int AS n FROM mesh_consumed_nonces")[0]["n"], 0)
 
     def test_grant_trop_long(self):
         receipt = self.alice.receipt(make_request(
