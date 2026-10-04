@@ -222,9 +222,8 @@ git -C "$AMEESH_CANON" fetch -q origin
 note "PR fusionnée (commit $(git -C "$AMEESH_CANON" rev-parse --short HEAD) poussé sur la branche canonique)"
 lance ameesh canon check
 lance ameesh canon sync
-note "écart d'intégration : canon sync ne recopie pas encore Member.authenticators dans"
-note "le registre (spec §8.2) ; le pont du banc le fait, depuis le canon approuvé"
-lance banc sync-authenticators
+note "canon sync recopie Member.authenticators dans le registre de confiance (spec §8.2),"
+note "depuis le commit fusionné de la branche canonique seulement"
 lance ameesh authenticator list --approver human:alice
 
 # ===========================================================================

@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Du canon vers le registre (spec §4.4) : `canon sync` et agents éphémères.
 
+`sync` recopie aussi les authentificateurs des fiches Member dans le
+registre de confiance (`authenticators`, §8.2), par
+`receipts.sync_authenticators` (L6), depuis le canon lu à sa révision
+canonique seulement (voir `sync_authenticators`).
+
 `sync` met à jour, pour les agents placés sur un hôte, les colonnes
 **déclaratives** du registre (harnais, hôte, dossier, modèle, budget,
 responsable, équipe, fournisseur, mode d'identifiants, capacités, canon_ref,
@@ -56,7 +61,7 @@ from dataclasses import dataclass, field
 
 from . import canon as canon_mod
 from . import placement as placement_mod
-from . import registry
+from . import receipts, registry
 from .canon import Canon, Finding
 from .config import NAME_RE
 from .db import Db
@@ -114,6 +119,38 @@ class SyncAction:
         return out
 
 
+#: statuts de la synchronisation du registre des authentificateurs
+AUTH_SYNCED = "synced"       # receipts.sync_authenticators appelé
+AUTH_SKIPPED = "skipped"     # rien écrit, sans erreur (canon non approuvé : tests)
+AUTH_REFUSED = "refused"     # rien écrit, ERREUR (révision hors branche, canon en retard)
+
+
+@dataclass
+class AuthenticatorSync:
+    """Canon → registre des authentificateurs (§8.2) : ce qui a été fait."""
+
+    status: str
+    reason: str = ""
+    #: résultat de `receipts.sync_authenticators` (statut `synced`)
+    result: dict | None = None
+    #: canon lu en partie : aucune révocation pour absence (raisons)
+    partial: list[str] = field(default_factory=list)
+
+    @property
+    def errors(self) -> list[str]:
+        if self.status == AUTH_REFUSED:
+            return [self.reason]
+        return list((self.result or {}).get("errors") or [])
+
+    def to_dict(self) -> dict:
+        out: dict = {"status": self.status, "reason": self.reason,
+                     "errors": self.errors, "partial": self.partial}
+        for key in ("added", "updated", "revoked", "frozen"):
+            out[key] = list((self.result or {}).get(key) or [])
+        out["unchanged"] = int((self.result or {}).get("unchanged") or 0)
+        return out
+
+
 @dataclass
 class SyncReport:
     host: str
@@ -123,6 +160,8 @@ class SyncReport:
     findings: list[Finding]
     status: str = CANON_OK          # état enregistré dans canon_state
     diagnostic: str = ""
+    #: registre des authentificateurs (§8.2), synchronisé par le même passage
+    authenticators: AuthenticatorSync | None = None
 
     @property
     def errors(self) -> list[Finding]:
@@ -133,7 +172,9 @@ class SyncReport:
                 "canon_status": self.status, "diagnostic": self.diagnostic,
                 "actions": [a.to_dict() for a in self.actions],
                 "errors": len(self.errors),
-                "findings": [f.to_dict() for f in self.findings]}
+                "findings": [f.to_dict() for f in self.findings],
+                "authenticators": (self.authenticators.to_dict()
+                                   if self.authenticators is not None else None)}
 
 
 # --------------------------------------------------------------------------
@@ -214,6 +255,148 @@ def state(db: Db, host: str) -> dict | None:
         (host,),
     )
     return rows[0] if rows else None
+
+
+# --------------------------------------------------------------------------
+# registre des authentificateurs (§8.2, L6)
+# --------------------------------------------------------------------------
+
+def _canonical_rev(canon: Canon, source: canon_mod.Source) -> str:
+    """La branche canonique distante d'une source : `ref` de son entrée au
+    manifeste (`origin/<ref>`), sinon la branche par défaut de l'amorçage."""
+    manifest = canon.federation if isinstance(canon.federation, dict) else {}
+    root = canon.sources[0]
+    member = source.member
+    if source.repo == root.repo and source.commit == root.commit:
+        member = root.member            # même instantané que la racine
+    entry = next((m for m in manifest.get("members") or []
+                  if isinstance(m, dict) and str(m.get("id")) == member), None)
+    branch = str((entry or {}).get("ref") or "")
+    if branch:
+        return "%s/%s" % (canon_mod.DEFAULT_REMOTE, branch)
+    if member == root.member:
+        for rev in ("%s/%s" % (canon_mod.DEFAULT_REMOTE, canon_mod.DEFAULT_BRANCH),
+                    "%s/HEAD" % canon_mod.DEFAULT_REMOTE):
+            if canon_mod.git_commit(source.repo, rev):
+                return rev
+    return "%s/%s" % (canon_mod.DEFAULT_REMOTE, canon_mod.DEFAULT_BRANCH)
+
+
+def _off_branch(canon: Canon) -> list[str]:
+    """Sources lues à un commit absent de leur branche canonique distante
+    (§4.1 : un tel commit est ignoré ; ex. `--ref` sur un commit local)."""
+    problems = []
+    for source in canon.sources:
+        if source.mode != "git":
+            problems.append("%s : source non approuvée" % source.member)
+            continue
+        rev = _canonical_rev(canon, source)
+        head = canon_mod.git_commit(source.repo, rev)
+        if not head or not canon_mod.git_contains(source.repo, source.commit, head):
+            problems.append("%s @ %s : commit absent de la branche canonique %s"
+                            % (source.member, source.commit[:12], rev))
+    return problems
+
+
+def _lag(db: Db, canon: Canon) -> tuple[list[str], set[str]]:
+    """Le canon lu est-il en retard sur ce que le registre a déjà appliqué ?
+
+    Chaque ligne écrite par une synchronisation porte le commit qui l'a
+    écrite (ajout, mise à jour, révocation). Un hôte dont le clone n'a pas
+    encore vu ce commit (pas de `--fetch`) ne doit pas réappliquer un canon
+    plus ancien : il réactiverait un authentificateur retiré depuis. Rend
+    (lignes en avance sur le canon lu, sources du registre absentes du canon
+    lu). Une ligne hors du format des fiches (écrite à la main) n'est pas un
+    repère : la synchronisation la traite comme L6 le prévoit (révoquée si le
+    canon ne la déclare pas).
+    """
+    sources = {s.member: s for s in canon.sources if s.mode == "git"}
+    rows = db.query(
+        "SELECT DISTINCT canon_ref FROM authenticators "
+        "WHERE revoked_at IS NULL OR revoked_reason IN (%s, %s)",
+        receipts.SYNC_REVOCATIONS)
+    ahead: list[str] = []
+    unread: set[str] = set()
+    seen: dict[tuple[str, str], bool] = {}
+    for row in sorted(rows, key=lambda r: r["canon_ref"] or ""):
+        match = receipts.FICHE_REF_RE.fullmatch(row["canon_ref"] or "")
+        if not match:
+            continue
+        member, _path, commit = match.groups()
+        source = sources.get(member)
+        if source is None:
+            unread.add(member)
+            continue
+        key = (member, commit)
+        if key not in seen:
+            seen[key] = canon_mod.git_contains(source.repo, commit, source.commit)
+        if not seen[key]:
+            ahead.append(row["canon_ref"])
+    return ahead, unread
+
+
+def _partial(canon: Canon, unread: set[str]) -> list[str]:
+    """Raisons de croire qu'une fiche Member a pu échapper à la lecture."""
+    reasons = ["%s (%s)" % (f.code, f.where()) for f in canon.load_findings
+               if f.severity == canon_mod.ERROR or f.code == "member-absent"]
+    reasons += ["source %s du registre non lue" % member for member in sorted(unread)]
+    return reasons
+
+
+def registry_members(canon: Canon) -> list[dict]:
+    """Les fiches Member au format de `receipts.sync_authenticators`.
+
+    `canon_ref` = la fiche lue (`<membre>:<chemin>@<commit>`). La liste
+    `authenticators` est passée telle qu'écrite dans la fiche (absente,
+    invalide : L6 gèle le membre) ; une entrée ne choisit jamais sa propre
+    provenance (`canon_ref` d'entrée retiré : c'est la fiche qui fait foi).
+    """
+    members = []
+    for member in canon.members:
+        entry: dict = {"title": member.title, "canon_ref": member.fiche.ref}
+        if "authenticators" in member.fiche.data:
+            raw = member.fiche.data["authenticators"]
+            if isinstance(raw, list):
+                raw = [{k: v for k, v in item.items() if k != "canon_ref"}
+                       if isinstance(item, dict) else item for item in raw]
+            entry["authenticators"] = raw
+        members.append(entry)
+    return members
+
+
+def sync_authenticators(db: Db, canon: Canon) -> AuthenticatorSync:
+    """Canon → registre des authentificateurs (§8.2), par `receipts.sync_authenticators`.
+
+    Écriture de confiance : rien n'est écrit si le canon est illisible, lu
+    hors git (non approuvé), lu à un commit absent de sa branche canonique
+    distante, ou en retard sur le registre (une ligne vient d'un commit que
+    le canon lu ne contient pas : `ameesh canon sync --fetch`). Sinon, les
+    règles de L6 s'appliquent telles quelles (entrée invalide : membre gelé,
+    aucune écriture pour lui ; absent du canon : révoqué) ; un canon lu en
+    partie (erreur de lecture, membre de la fédération absent) ne révoque
+    rien pour absence.
+    """
+    if not canon.readable:
+        return AuthenticatorSync(AUTH_SKIPPED, "canon illisible : registre inchangé")
+    if canon.untrusted:
+        return AuthenticatorSync(AUTH_SKIPPED, "canon NON APPROUVÉ (fichiers de travail) : "
+                                               "registre des authentificateurs inchangé")
+    if not canon.sources:
+        return AuthenticatorSync(AUTH_SKIPPED, "aucune source lue : registre inchangé")
+    off = _off_branch(canon)
+    if off:
+        return AuthenticatorSync(AUTH_REFUSED, "révision non canonique, registre des "
+                                               "authentificateurs inchangé : " + " ; ".join(off))
+    ahead, unread = _lag(db, canon)
+    if ahead:
+        return AuthenticatorSync(AUTH_REFUSED, (
+            "canon en retard sur le registre des authentificateurs (déjà appliqué : %s) : "
+            "registre inchangé — ameesh canon sync --fetch" % ", ".join(ahead[:5])))
+    partial = _partial(canon, unread)
+    result = receipts.sync_authenticators(
+        db, registry_members(canon), revoke_absent=not partial,
+        source_commits={s.member: s.commit for s in canon.sources})
+    return AuthenticatorSync(AUTH_SYNCED, "", result, partial)
 
 
 def _member_of(canon_ref: str | None) -> str:
@@ -597,9 +780,12 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None)
     _inherit_placements(db, host)
     if status == CANON_OK:
         record_state(db, host, status, diagnostic, canon)
+    # registre des authentificateurs (§8.2) : copie de travail des fiches
+    # Member, quel que soit l'état du canon pour cet hôte (ses propres règles)
+    authenticators = sync_authenticators(db, canon)
     return SyncReport(host=host, source=canon.source_label(), untrusted=canon.untrusted,
                       actions=actions, findings=findings, status=status,
-                      diagnostic=diagnostic)
+                      diagnostic=diagnostic, authenticators=authenticators)
 
 
 # --------------------------------------------------------------------------

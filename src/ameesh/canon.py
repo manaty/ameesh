@@ -945,6 +945,24 @@ def git_commit(repo: str, rev: str) -> str | None:
                     rev + "^{commit}")
 
 
+_SHA_RE = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def git_contains(repo: str, ancestor: str, descendant: str) -> bool:
+    """`ancestor` (un SHA) est-il contenu dans l'historique de `descendant` (un
+    SHA) ? Faux si l'un des deux est inconnu de ce dépôt, ou en cas d'erreur
+    git : le doute ne prouve jamais l'appartenance."""
+    if not (_SHA_RE.fullmatch(ancestor or "") and _SHA_RE.fullmatch(descendant or "")):
+        return False
+    if ancestor == descendant:
+        return True
+    try:
+        proc = _git(repo, "merge-base", "--is-ancestor", ancestor, descendant)
+    except GitError:
+        return False
+    return proc.returncode == 0
+
+
 def _git_list(repo: str, commit: str, prefix: str) -> list[tuple[str, str]]:
     """[(chemin dans le dépôt, sha du blob)] des fichiers ordinaires sous `prefix`."""
     args = ["ls-tree", "-r", "-z", "--full-tree", commit]

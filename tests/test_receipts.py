@@ -1711,6 +1711,33 @@ class SyncTest(ReceiptsBase):
         result = receipts.sync_authenticators(self.db, self.members[1:])
         self.assertEqual(len(result["revoked"]), 4)
 
+    def test_canon_lu_en_partie_ne_revoque_rien_pour_absence(self):
+        """`revoke_absent=False` : un membre absent garde ses lignes ; une liste
+        valide qui omet un credential le révoque toujours."""
+        before = receipts.list_authenticators(self.db, approver=ALICE)
+        members = [dict(self.members[1], authenticators=[]), self.members[2]]
+        result = receipts.sync_authenticators(self.db, members, revoke_absent=False)
+        self.assertEqual(result["revoked"], ["%s/webauthn/%s" % (BOB, self.bob.credential_id)])
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(receipts.list_authenticators(self.db, approver=ALICE), before)
+
+    def test_revocation_note_le_commit_qui_la_constate(self):
+        """La ligne révoquée par la synchronisation porte le commit du canon qui
+        l'a retirée : fiche du membre lue, ou ancien chemin au commit de sa source."""
+        self.db.query("UPDATE authenticators SET canon_ref = %s WHERE approver = %s "
+                      "RETURNING id", ("home:members/carol.md@" + COMMIT, CAROL))
+        members = [dict(self.members[0]),
+                   member("bob", commit=NEXT_COMMIT)]                    # bob : liste vide
+        result = receipts.sync_authenticators(
+            self.db, members, source_commits={"home": NEXT_COMMIT})
+        self.assertEqual(len(result["revoked"]), 3)                     # bob, et carol ×2
+        refs = {(row["approver"], row["credential_id"]): row["canon_ref"]
+                for row in receipts.list_authenticators(self.db, include_revoked=True)
+                if row.get("revoked_ts")}
+        self.assertEqual(refs[(BOB, self.bob.credential_id)], "members/bob.md@" + NEXT_COMMIT)
+        self.assertEqual({ref for (who, _c), ref in refs.items() if who == CAROL},
+                         {"home:members/carol.md@" + NEXT_COMMIT})
+
     def test_entrees_invalides(self):
         broken_key = dict(SoftWebAuthn().entry(), public_key=b64u(b"pas une cle COSE"))
         private = SoftWebAuthn()

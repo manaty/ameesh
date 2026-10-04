@@ -54,10 +54,6 @@ exposition réseau.
 
 3. Écarts d'intégration relevés par l'essai (lot L9), à fermer **avant
    l'étape 3** :
-   * `ameesh canon sync` ne recopie pas `Member.authenticators` dans le
-     registre `authenticators` (spec §8.2) : sans ce pont, une passkey
-     fusionnée au canon n'est jamais active (l'essai le contourne par
-     `tests/banc_v1.py sync-authenticators`) ;
    * aucune commande ameesh ne dépose une demande auprès d'ameesh-approve
      (`POST /requests`) ni ne récupère le reçu (`GET /receipts/<id>`) ; en
      attendant, le client de service du banc (`python3 -m tests.banc_v1
@@ -200,9 +196,13 @@ exécuteur ne tourne.
 
    Le propriétaire vérifie l'empreinte hors bande, reporte l'entrée proposée
    dans `authenticators` de `membres/smichea.md` **par PR**, la fusionne, puis
-   `ameesh canon sync --fetch` sur chaque hôte (et le pont du registre, tant que
-   l'écart des prérequis n'est pas fermé) ; `ameesh authenticator list` montre
-   la passkey active, avec le commit du canon.
+   `ameesh canon sync --fetch` sur chaque hôte : il recopie
+   `Member.authenticators` dans le registre de confiance (spec §8.2), depuis le
+   commit fusionné de la branche canonique seulement ; `ameesh authenticator
+   list` montre la passkey active, avec le commit du canon. Un hôte dont le
+   clone est en retard sur le registre (retrait déjà appliqué par un autre
+   hôte) refuse d'y écrire (`authentificateurs : REFUSÉ … --fetch`) : il ne
+   réactive jamais une passkey retirée.
 4. **Essai réel** : une action `shell-noop` de classe `irreversible` reste
    bloquée sans reçu (`ameesh action execute` → `[receipt_required]`), passe
    avec un reçu signé sur le téléphone (`ameesh action approve --receipt`),

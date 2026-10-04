@@ -13,11 +13,8 @@ navigateur :
   fait encore (écart relevé par L9) ;
 * le **report de la proposition d'enrôlement au canon** (la « PR » que le
   propriétaire fusionne) : l'entrée `authenticator` de la proposition est
-  ajoutée à `authenticators` de la fiche Member ;
-* le **pont canon → registre des authentificateurs** : `ameesh canon sync`
-  n'appelle pas encore `receipts.sync_authenticators` (défaut d'intégration
-  L2/L6 relevé par L9) ; `sync_authenticators_from_canon` le fait, depuis le
-  canon lu à sa révision approuvée.
+  ajoutée à `authenticators` de la fiche Member. `ameesh canon sync` la
+  recopie ensuite dans le registre de confiance (§8.2), sans aide du banc.
 
 Le mandataire HTTPS (page Nexlink) est simulé : les requêtes partent en HTTP
 vers 127.0.0.1 avec l'en-tête `Host` (et `Origin` pour les POST humains) de
@@ -27,7 +24,6 @@ Ligne de commande (depuis la racine du dépôt, PYTHONPATH=src) :
 
   python3 -m tests.banc_v1 enroll  --port P --link URL --key FICHIER
   python3 -m tests.banc_v1 canon-entry --proposal FICHIER --member FICHE.md
-  python3 -m tests.banc_v1 sync-authenticators
   python3 -m tests.banc_v1 request --port P --token-file F --action A --approver human:X --by agent:Y
   python3 -m tests.banc_v1 approve --port P --link URL --key FICHIER
   python3 -m tests.banc_v1 receipt --port P --token-file F --request R --out FICHIER
@@ -45,8 +41,6 @@ import sys
 from urllib.parse import urlsplit
 
 from ameesh import canon as canon_mod
-from ameesh import config as config_mod
-from ameesh import db as db_mod
 from ameesh import p256, receipts
 
 from .webauthn_soft import ORIGIN, RP_ID, SoftWebAuthn, b64u, cbor
@@ -213,7 +207,7 @@ def fetch_receipt(port: int, token: str, request_id: str) -> tuple[int, bytes]:
 
 
 # --------------------------------------------------------------------------
-# la « PR » du canon et le pont vers le registre
+# la « PR » du canon
 # --------------------------------------------------------------------------
 
 def proposal_entry(path: str) -> dict:
@@ -261,18 +255,6 @@ def add_to_member(member_path: str, entry: dict) -> None:
         fh.write("\n".join(lines))
 
 
-def members_from_canon(canon: canon_mod.Canon) -> list[dict]:
-    """Les membres au format de `receipts.sync_authenticators` (canon_ref = commit)."""
-    return [{"title": m.title, "canon_ref": m.fiche.ref, "authenticators": m.authenticators}
-            for m in canon.members]
-
-
-def sync_authenticators_from_canon(db, canon: canon_mod.Canon) -> dict:
-    """Pont manquant de `ameesh canon sync` (spec §8.2) : canon → `authenticators`."""
-    if canon.untrusted or not canon.readable:
-        raise BancError("canon non approuvé ou illisible : registre inchangé")
-    return receipts.sync_authenticators(db, members_from_canon(canon))
-
 
 # --------------------------------------------------------------------------
 # ligne de commande (scripts/demo-v1.sh)
@@ -292,19 +274,6 @@ def _cmd_canon_entry(args) -> int:
     print("entrée ajoutée à %s : %s %s (niveau %s)" % (
         os.path.basename(args.member), entry["facade"], entry["credential_id"], entry["level"]))
     return 0
-
-
-def _cmd_sync(_args) -> int:
-    cfg = config_mod.load()
-    canon = canon_mod.from_config(cfg)
-    db = db_mod.connect(cfg)
-    try:
-        result = sync_authenticators_from_canon(db, canon)
-    finally:
-        db.close()
-    print("registre des authentificateurs : ajoutés %s ; révoqués %s ; erreurs %s" % tuple(
-        ", ".join(result[key]) or "—" for key in ("added", "revoked", "errors")))
-    return 1 if result["errors"] else 0
 
 
 def _cmd_request(args) -> int:
@@ -345,8 +314,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--proposal", required=True)
     p.add_argument("--member", required=True)
     p.set_defaults(func=_cmd_canon_entry)
-    p = sub.add_parser("sync-authenticators")
-    p.set_defaults(func=_cmd_sync)
     p = sub.add_parser("request")
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--token-file", required=True)

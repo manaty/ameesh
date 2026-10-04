@@ -28,11 +28,8 @@ Compatibilité L3 : si la colonne `placement_ok` existe (lot L3 fusionné), le
 verdict de placement écrit par `canon sync` est vérifié ; sinon ce contrôle est
 sauté (rien d'autre ne dépend de L3 : la réclamation passe dans les deux cas).
 
-Défaut contourné (L2/L6) : `ameesh canon sync` ne recopie pas
-`Member.authenticators` dans le registre `authenticators` (spec §8.2). Si, après
-la synchronisation, la passkey du canon n'y est pas, l'essai appelle le pont
-`banc_v1.sync_authenticators_from_canon` (canon lu à sa révision approuvée,
-puis `receipts.sync_authenticators`) et le note.
+Aucun contournement : la passkey fusionnée au canon devient active par
+`ameesh canon sync` seul (§8.2).
 """
 from __future__ import annotations
 
@@ -331,13 +328,10 @@ class BoutEnBoutTest(PgTestCase):
         self.assertIn("canon valide — 0 erreur(s)", self.run_mesh("canon", "check").stdout)
         report = json.loads(self.run_mesh("canon", "sync", "--json").stdout)
         self.assertEqual((report["canon_status"], report["errors"]), ("ok", 0))
-
-        if not receipts.list_authenticators(self.db, approver=ALICE):
-            # DÉFAUT D'INTÉGRATION L2/L6 : canon sync ne remplit pas le registre
-            # des authentificateurs (spec §8.2). Pont : à retirer dès que
-            # canon_sync.sync appellera receipts.sync_authenticators.
-            synced = banc_v1.sync_authenticators_from_canon(self.db, canon.load(self.clone))
-            self.assertEqual(synced["errors"], [])
+        # canon sync recopie Member.authenticators dans le registre de confiance (§8.2)
+        done = report["authenticators"]
+        self.assertEqual((done["status"], done["errors"], done["added"]),
+                         ("synced", [], ["%s/webauthn/%s" % (ALICE, soft.credential_id)]))
         rows = receipts.list_authenticators(self.db, approver=ALICE)
         self.assertEqual([(r["facade"], r["credential_id"]) for r in rows],
                          [("webauthn", soft.credential_id)])

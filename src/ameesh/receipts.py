@@ -1018,7 +1018,31 @@ def _label(approver: str, facade: str, credential_id: str) -> str:
     return "%s/%s/%s" % (approver, facade, credential_id)
 
 
-def sync_authenticators(db: Db, members: list) -> dict:
+#: motifs de révocation écrits par `sync_authenticators` (et lui seul)
+SYNC_REVOCATIONS = ("absent du canon", "clé changée dans le canon")
+#: `canon_ref` d'une fiche lue par le canon (L2) : `<membre>:<chemin>@<commit>`
+FICHE_REF_RE = re.compile(r"^([^:\s]+):(\S*)@([0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def _revocation_ref(row: dict, wanted: dict | None, member_refs: dict,
+                    source_commits: dict | None) -> str | None:
+    """Le commit du canon qui constate une révocation (provenance de la ligne
+    révoquée) : la fiche du membre lue maintenant, ou, pour un membre absent,
+    l'ancien chemin de la fiche au commit lu de sa source. None : inchangé."""
+    if wanted is not None:
+        return wanted["canon_ref"]
+    ref = member_refs.get(row["approver"])
+    if ref:
+        return ref
+    match = FICHE_REF_RE.fullmatch(row.get("canon_ref") or "")
+    if match and source_commits and _COMMIT_RE.fullmatch(
+            str(source_commits.get(match.group(1)) or "")):
+        return "%s:%s@%s" % (match.group(1), match.group(2), source_commits[match.group(1)])
+    return None
+
+
+def sync_authenticators(db: Db, members: list, *, revoke_absent: bool = True,
+                        source_commits: dict | None = None) -> dict:
     """Met la table `authenticators` en conformité avec le canon lu par ailleurs.
 
     `members` : [{"title": "smichea", "canon_ref": "members/smichea.md@<sha>",
@@ -1047,7 +1071,18 @@ def sync_authenticators(db: Db, members: list) -> dict:
       de membre est illisible (titre invalide) : elle pourrait être ce membre,
       aucune révocation pour absence n'est alors faite ;
     * un credential déclaré par plusieurs membres, ou porté par une entrée
-      invalide, n'est ni ajouté ni modifié ni révoqué, chez personne.
+      invalide, n'est ni ajouté ni modifié ni révoqué, chez personne ;
+    * `revoke_absent=False` (canon lu en partie : une fiche Member a pu
+      échapper à la lecture) : aucune révocation pour absence du canon, comme
+      pour une entrée de membre illisible ; une liste valide qui omet un
+      credential le révoque toujours.
+
+    Provenance des révocations : une ligne révoquée par la synchronisation
+    note le commit du canon qui l'a constatée (`canon_ref` = la fiche du
+    membre lue maintenant ; pour un membre absent, son ancien chemin au
+    commit lu de sa source, `source_commits` = {membre du canon: commit}). Un
+    hôte dont le canon est en retard peut ainsi être reconnu
+    (`canon_sync.sync_authenticators`) avant de réactiver ce qui a été retiré.
 
     Renvoie {"added", "updated", "revoked", "unchanged", "frozen", "errors"}.
     """
@@ -1060,6 +1095,7 @@ def sync_authenticators(db: Db, members: list) -> dict:
     listed: set[str] = set()       # approbateurs lisibles dans le canon
     frozen: set[str] = set()       # approbateurs gelés : aucune écriture
     unreadable = False             # une entrée de membre sans titre lisible
+    member_refs: dict[str, str] = {}   # approbateur → fiche Member lue (chemin@SHA)
 
     for index, member in enumerate(members):
         title = member.get("title") if isinstance(member, dict) else None
@@ -1069,6 +1105,9 @@ def sync_authenticators(db: Db, members: list) -> dict:
             continue
         approver = "human:" + title
         listed.add(approver)
+        member_ref = member.get("canon_ref")
+        if isinstance(member_ref, str) and _CANON_REF_RE.fullmatch(member_ref):
+            member_refs.setdefault(approver, member_ref)
         entries = member.get("authenticators")
         if not isinstance(entries, list):
             errors.append("%s : authenticators doit être une liste (%s)" % (
@@ -1156,14 +1195,15 @@ def sync_authenticators(db: Db, members: list) -> dict:
             else:
                 result["unchanged"] += 1
             continue
-        if unreadable and row["approver"] not in listed:
+        if (unreadable or not revoke_absent) and row["approver"] not in listed:
             continue        # son entrée est peut-être celle qu'on n'a pas pu lire
-        reason = ("clé changée dans le canon" if wanted and wanted["approver"] == row["approver"]
-                  else "absent du canon")
+        same = wanted if wanted and wanted["approver"] == row["approver"] else None
+        reason = SYNC_REVOCATIONS[1] if same else SYNC_REVOCATIONS[0]
         rows = db.query(
             "UPDATE authenticators SET revoked_at = now(), revoked_reason = %s, "
-            "updated_at = now() WHERE id = %s AND revoked_at IS NULL RETURNING id",
-            (reason, int(row["id"])))
+            "canon_ref = coalesce(%s::text, canon_ref), updated_at = now() "
+            "WHERE id = %s AND revoked_at IS NULL RETURNING id",
+            (reason, _revocation_ref(row, same, member_refs, source_commits), int(row["id"])))
         if rows:
             result["revoked"].append(label)
 
