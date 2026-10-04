@@ -36,6 +36,22 @@ REQUIRE_DB = os.environ.get(
     "AMEESH_REQUIRE_DB", os.environ.get("AGENT_MESH_REQUIRE_DB", "1")) != "0"
 
 
+def apply_authenticators(db, members, **kwargs) -> dict:
+    """CONTEXTE DE TEST EXPLICITE (tests de L6, sans canon git) : écrit le
+    registre des authentificateurs depuis une liste de membres.
+
+    Comme `canon_sync._sync_locked` : une transaction, le verrou du registre
+    (`receipts.lock_registry`, qui rend son jeton), puis l'écriture interne
+    `receipts._apply_authenticators` — mais SANS les contrôles du canon
+    (branche de confiance, monotonie, retard). Réservé aux tests : en
+    production, le seul point d'entrée est `canon_sync.sync_authenticators`.
+    """
+    from ameesh import receipts
+    with db.transaction() as tx:
+        lock = receipts.lock_registry(tx)
+        return receipts._apply_authenticators(lock, members, **kwargs)
+
+
 def child_env(**extra: str) -> dict:
     """Environnement d'un sous-processus de test (CLI ou exécuteur)."""
     env = dict(os.environ)

@@ -2,7 +2,8 @@
 """Reçus ameesh-receipt/1 : cas valides et chaque falsification (spec §8, C7).
 
 Tout passe par des authentificateurs LOGICIELS (tests/webauthn_soft.py) et le
-registre de confiance est rempli par `sync_authenticators`, comme le ferait
+registre de confiance est rempli par `support.apply_authenticators` (verrou du
+registre, écriture interne de L6), comme le ferait
 `ameesh canon sync`. Aucune vraie clé, aucun service réseau.
 """
 from __future__ import annotations
@@ -20,7 +21,7 @@ from unittest import mock
 from ameesh import cose, jcs, p256, receipts, signing
 from ameesh import db as db_mod
 
-from .support import TEST_DSN, PgTestCase
+from .support import TEST_DSN, PgTestCase, apply_authenticators
 from .webauthn_soft import (
     ORIGIN, RP_ID, SoftDevice, SoftEd25519, SoftES256Key, SoftWebAuthn, b64u, cbor,
     make_receipt, make_request, new_action_id, sha,
@@ -58,7 +59,7 @@ class ReceiptsBase(PgTestCase):
             member("bob", self.bob.entry()),
             member("carol", self.carol_key.entry(level="eleve"), self.carol_synced.entry()),
         ]
-        result = receipts.sync_authenticators(self.db, self.members)
+        result = apply_authenticators(self.db, self.members)
         self.assertEqual(result["errors"], [])
         self.assertEqual(len(result["added"]), 7)
 
@@ -203,7 +204,7 @@ class ReceiptsValidTest(ReceiptsBase):
     def test_device_es256_cle_cose(self):
         device = SoftDevice(cose=True)
         self.members[0]["authenticators"].append(device.entry())
-        self.assertEqual(receipts.sync_authenticators(self.db, self.members)["errors"], [])
+        self.assertEqual(apply_authenticators(self.db, self.members)["errors"], [])
         self.assertTrue(self.verify(device.receipt(make_request(ALICE))).ok)
 
     def test_decision_deny(self):
@@ -456,7 +457,7 @@ class ReceiptsForgeryTest(ReceiptsBase):
         self.members[0]["authenticators"] = [
             e for e in self.members[0]["authenticators"]
             if e["credential_id"] != self.alice.credential_id]
-        result = receipts.sync_authenticators(self.db, self.members)
+        result = apply_authenticators(self.db, self.members)
         self.assertEqual(result["revoked"], ["%s/webauthn/%s" % (ALICE, self.alice.credential_id)])
         self.assertRefused(self.verify(receipt), receipts.REVOKED)
         self.assertRefused(self.verify(self.alice.receipt(make_request(ALICE))), receipts.REVOKED)
@@ -565,7 +566,7 @@ class ReceiptsForgeryTest(ReceiptsBase):
         self.assertRefused(self.verify(intruder.receipt(make_request(ALICE)), policy),
                            receipts.CANON)
         # et la synchronisation suivante la révoque (absente du canon)
-        result = receipts.sync_authenticators(self.db, self.members)
+        result = apply_authenticators(self.db, self.members)
         self.assertEqual(result["revoked"], ["%s/webauthn/%s" % (ALICE, intruder.credential_id)])
 
 
@@ -712,7 +713,7 @@ class SmallOrderEndToEndTest(ReceiptsBase):
             {"facade": "ed25519", "credential_id": "ed25519:noncanonique",
              "public_key": b64u(NON_CANONICAL[1])},
         )]
-        result = receipts.sync_authenticators(self.db, members)
+        result = apply_authenticators(self.db, members)
         self.assertEqual(len(result["errors"]), 4, result["errors"])
         self.assertEqual(sum("petit ordre" in e for e in result["errors"]), 3, result["errors"])
         self.assertEqual(result["added"], [])
@@ -1141,7 +1142,7 @@ class StandingTest(StandingBase):
             self.members[0]["authenticators"] = [
                 e for e in self.members[0]["authenticators"]
                 if e["credential_id"] != self.alice.credential_id]
-            result = receipts.sync_authenticators(self.db, self.members)
+            result = apply_authenticators(self.db, self.members)
             self.assertEqual(result["revoked"],
                              ["%s/webauthn/%s" % (ALICE, self.alice.credential_id)])
             holder.commit()
@@ -1210,7 +1211,7 @@ class StandingTest(StandingBase):
         self.members[0]["authenticators"] = [
             e for e in self.members[0]["authenticators"]
             if e["credential_id"] != self.alice.credential_id]
-        receipts.sync_authenticators(self.db, self.members)
+        apply_authenticators(self.db, self.members)
         self.assertIsNone(self.reserve(grant, action()))
 
     def test_couverture_exacte(self):
@@ -1321,7 +1322,7 @@ class DeadlineRaceTest(StandingBase):
 
     def authenticator_holders(self) -> list:
         """Verrous sur l'authentificateur signataire d'alice (jamais révoqué :
-        la mise à jour est un nouveau commit du canon, comme sync_authenticators).
+        la mise à jour est un nouveau commit du canon, comme canon sync).
         Un `FOR SHARE` concurrent n'est pas listé : compatible avec le nôtre, il
         ne fait rien attendre."""
         ident = self.authenticator_id(self.alice.credential_id)
@@ -1569,7 +1570,7 @@ class DeadlineRaceTest(StandingBase):
 
 class SyncTest(ReceiptsBase):
     def test_sync_idempotente_et_mise_a_jour(self):
-        result = receipts.sync_authenticators(self.db, self.members)
+        result = apply_authenticators(self.db, self.members)
         self.assertEqual((result["added"], result["revoked"], result["updated"]), ([], [], []))
         self.assertEqual(result["unchanged"], 7)
         # nouveau commit du canon : la provenance de chaque ligne suit
@@ -1578,7 +1579,7 @@ class SyncTest(ReceiptsBase):
                  member("bob", self.bob.entry(), commit=NEXT_COMMIT),
                  member("carol", self.carol_key.entry(level="eleve"),
                         self.carol_synced.entry(), commit=NEXT_COMMIT)]
-        result = receipts.sync_authenticators(self.db, moved)
+        result = apply_authenticators(self.db, moved)
         self.assertEqual(len(result["updated"]), 7)
         self.assertEqual(receipts.mismatched_authenticators(self.db, NEXT_COMMIT), [])
         self.assertEqual(len(receipts.mismatched_authenticators(self.db, COMMIT)), 7)
@@ -1590,7 +1591,7 @@ class SyncTest(ReceiptsBase):
         replaced = SoftWebAuthn()
         replaced.credential_id = self.alice.credential_id
         self.members[0]["authenticators"][0] = replaced.entry()
-        result = receipts.sync_authenticators(self.db, self.members)
+        result = apply_authenticators(self.db, self.members)
         label = "%s/webauthn/%s" % (ALICE, self.alice.credential_id)
         self.assertEqual((result["revoked"], result["added"]), ([label], [label]))
         self.assertRefused(self.verify(self.alice.receipt(make_request(ALICE))),
@@ -1604,7 +1605,7 @@ class SyncTest(ReceiptsBase):
         # bob disparaît du canon ; son credential est déclaré pour carol
         self.members[1]["authenticators"] = []
         self.members[2]["authenticators"].append(self.bob.entry())
-        result = receipts.sync_authenticators(self.db, self.members)
+        result = apply_authenticators(self.db, self.members)
         self.assertIn("%s/webauthn/%s" % (BOB, self.bob.credential_id), result["revoked"])
         self.assertIn("%s/webauthn/%s" % (CAROL, self.bob.credential_id), result["added"])
         self.assertRefused(self.verify(self.bob.receipt(make_request(BOB))),
@@ -1622,7 +1623,7 @@ class SyncTest(ReceiptsBase):
             dict(self.alice_device.entry(), canon_ref="members/alice.md@" + COMMIT),
         ])
         before = receipts.list_authenticators(self.db, approver=ALICE)
-        result = receipts.sync_authenticators(self.db, members)
+        result = apply_authenticators(self.db, members)
         self.assertEqual(len(result["errors"]), 3, result["errors"])
         self.assertTrue(all("référence de commit" in e for e in result["errors"]))
         self.assertEqual(result["added"], [])
@@ -1672,7 +1673,7 @@ class SyncTest(ReceiptsBase):
                     members[0] = dict(members[0], authenticators=value)
                 # un autre membre change en même temps : lui est appliqué
                 members[1] = dict(members[1], authenticators=[self.bob.entry(level="eleve")])
-                result = receipts.sync_authenticators(self.db, members)
+                result = apply_authenticators(self.db, members)
                 self.assertEqual((result["added"], result["revoked"]), ([], []))
                 after = receipts.list_authenticators(self.db, include_revoked=True)
                 alice_before = [r for r in before if r["approver"] == ALICE]
@@ -1687,7 +1688,7 @@ class SyncTest(ReceiptsBase):
         # témoin : une liste VALIDE qui omet un credential le révoque
         members = [dict(m) for m in self.members]
         members[0] = dict(members[0], authenticators=[self.alice.entry()])
-        result = receipts.sync_authenticators(self.db, members)
+        result = apply_authenticators(self.db, members)
         self.assertEqual(result.get("frozen"), [])
         self.assertEqual(sorted(result["revoked"]), sorted([
             "%s/webauthn/%s" % (ALICE, self.alice_ed.credential_id),
@@ -1700,15 +1701,15 @@ class SyncTest(ReceiptsBase):
         for members in (None, "membres", {"alice": []}):
             with self.subTest(members=members):
                 with self.assertRaises(receipts.ReceiptError):
-                    receipts.sync_authenticators(self.db, members)
+                    apply_authenticators(self.db, members)
         # alice absente, mais une entrée illisible pourrait être la sienne
         members = self.members[1:] + [{"title": "Alice Martin", "authenticators": []}]
-        result = receipts.sync_authenticators(self.db, members)
+        result = apply_authenticators(self.db, members)
         self.assertEqual(result["revoked"], [])
         self.assertTrue(any("illisible" in e for e in result["errors"]), result["errors"])
         self.assertEqual(receipts.list_authenticators(self.db), before)
         # sans entrée illisible, le membre retiré du canon est révoqué
-        result = receipts.sync_authenticators(self.db, self.members[1:])
+        result = apply_authenticators(self.db, self.members[1:])
         self.assertEqual(len(result["revoked"]), 4)
 
     def test_canon_lu_en_partie_ne_revoque_rien_pour_absence(self):
@@ -1716,7 +1717,7 @@ class SyncTest(ReceiptsBase):
         valide qui omet un credential le révoque toujours."""
         before = receipts.list_authenticators(self.db, approver=ALICE)
         members = [dict(self.members[1], authenticators=[]), self.members[2]]
-        result = receipts.sync_authenticators(self.db, members, revoke_absent=False)
+        result = apply_authenticators(self.db, members, revoke_absent=False)
         self.assertEqual(result["revoked"], ["%s/webauthn/%s" % (BOB, self.bob.credential_id)])
         self.assertEqual(result["errors"], [])
         self.assertEqual(receipts.list_authenticators(self.db, approver=ALICE), before)
@@ -1728,7 +1729,7 @@ class SyncTest(ReceiptsBase):
                       "RETURNING id", ("home:members/carol.md@" + COMMIT, CAROL))
         members = [dict(self.members[0]),
                    member("bob", commit=NEXT_COMMIT)]                    # bob : liste vide
-        result = receipts.sync_authenticators(
+        result = apply_authenticators(
             self.db, members, source_commits={"home": NEXT_COMMIT})
         self.assertEqual(len(result["revoked"]), 3)                     # bob, et carol ×2
         refs = {(row["approver"], row["credential_id"]): row["canon_ref"]
@@ -1753,7 +1754,7 @@ class SyncTest(ReceiptsBase):
             member("erin", dup.entry()),
             {"title": "pas un nom valide !", "authenticators": []},
         ]
-        result = receipts.sync_authenticators(self.db, members)
+        result = apply_authenticators(self.db, members)
         joined = "\n".join(result["errors"])
         self.assertIn("COSE", joined)
         self.assertIn("PRIVÉE", joined)
@@ -1770,14 +1771,14 @@ class SyncTest(ReceiptsBase):
         import base64
         entry = dict(device.entry(), public_key=base64.b64encode(raw).decode())
         self.members[0]["authenticators"].append(entry)
-        result = receipts.sync_authenticators(self.db, self.members)
+        result = apply_authenticators(self.db, self.members)
         self.assertEqual(result["errors"], [])
         self.assertTrue(self.verify(device.receipt(make_request(ALICE))).ok)
 
     def test_aaguid_normalise(self):
         entry = self.alice.entry(aaguid="ADCE0002-35BC-C60A-648B-0B25F1F05503")
         self.members[0]["authenticators"][0] = entry
-        receipts.sync_authenticators(self.db, self.members)
+        apply_authenticators(self.db, self.members)
         row = [r for r in receipts.list_authenticators(self.db, approver=ALICE)
                if r["credential_id"] == self.alice.credential_id][0]
         self.assertEqual(row["aaguid"], "adce0002-35bc-c60a-648b-0b25f1f05503")

@@ -2,7 +2,7 @@
 """Actions sous porte (spec §7, R5, C6) et file des décisions (C10).
 
 Reçus produits par des authentificateurs LOGICIELS (tests/webauthn_soft.py),
-registre de confiance rempli par `sync_authenticators`. Connecteurs :
+registre de confiance rempli par `support.apply_authenticators`. Connecteurs :
 `shell-noop` (fichiers sous le bac à sable du test) et `git-merge` avec un
 FAUX `gh` (tests/fakebin/gh) — jamais le vrai, aucun réseau.
 """
@@ -28,7 +28,7 @@ from ameesh.connectors.git_merge import GitMergeConnector, parse_target, resolve
 from ameesh.connectors.shell_noop import ShellNoopConnector
 from ameesh.db import DbError
 
-from .support import FAKEBIN, PgTestCase
+from .support import FAKEBIN, PgTestCase, apply_authenticators
 from .test_receipts import HeldTransaction, Worker
 from .webauthn_soft import ORIGIN, RP_ID, SoftEd25519, SoftWebAuthn, make_request
 
@@ -132,7 +132,7 @@ class ActionsBase(PgTestCase):
         self.bob = SoftWebAuthn("ES256")
         self.members = [member("alice", self.alice.entry(), self.alice_tool.entry()),
                         member("bob", self.bob.entry())]
-        result = receipts.sync_authenticators(self.db, self.members)
+        result = apply_authenticators(self.db, self.members)
         self.assertEqual(result["errors"], [])
         self.noop_dir = os.path.join(self.tmp, "noop")
         self.noop = Counting(ShellNoopConnector(self.noop_dir, timeout=10.0))
@@ -380,7 +380,7 @@ class ActionsCycleTest(ActionsBase):
                  None, "test", 5.0))[0]
 
         self.assertEqual(launch(digest="sha256:" + "0" * 64)["result"], "state")
-        receipts.sync_authenticators(self.db, [member("alice", self.alice_tool.entry()),
+        apply_authenticators(self.db, [member("alice", self.alice_tool.entry()),
                                                member("bob", self.bob.entry())])
         self.assertEqual(launch()["result"], "revoked_authenticator")
         self.assertEqual(self.get(action)["state"], "approved")
@@ -390,7 +390,7 @@ class ActionsCycleTest(ActionsBase):
     def test_revocation_entre_approbation_et_execution(self):
         action = self.propose("send")
         self.approve(action)
-        receipts.sync_authenticators(self.db, [member("alice", self.alice_tool.entry()),
+        apply_authenticators(self.db, [member("alice", self.alice_tool.entry()),
                                                member("bob", self.bob.entry())])
         self.refused(receipts.REVOKED, self.execute, action)
         self.assertEqual((self.get(action)["state"], self.noop.calls), ("approved", []))

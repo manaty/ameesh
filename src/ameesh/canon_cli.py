@@ -122,6 +122,11 @@ def _recorded_line(host: str, recorded: dict | None) -> str:
         line += (" — %s\n  → agents du canon non réclamables sur %s jusqu'à un "
                  "« ameesh canon sync » qui lit un canon valide" % (st.get("diagnostic") or "?",
                                                                     host))
+    if st.get("auth_status"):
+        line += "\nauthentificateurs : %s%s (contrôle du %s)%s" % (
+            "EN ERREUR — " if st["auth_status"] == canon_sync.AUTH_STATE_ERROR else "",
+            st["auth_status"], _moment(st.get("auth_checked_ts")),
+            " — %s" % st["auth_diagnostic"] if st.get("auth_diagnostic") else "")
     return line
 
 

@@ -41,7 +41,7 @@ from ameesh.approve.sources import (
 )
 from ameesh.approve.store import Store
 
-from .support import PgTestCase, child_env
+from .support import PgTestCase, apply_authenticators, child_env
 from .webauthn_soft import ORIGIN, RP_ID, SoftWebAuthn, b64u, cbor, new_action_id
 
 ALICE = "human:alice"
@@ -127,7 +127,7 @@ class ApproveBase(PgTestCase):
             "mesh_consumed_nonces RESTART IDENTITY CASCADE")
         self.alice = SoftWebAuthn("ES256")
         self.bob = SoftWebAuthn("ES256")
-        result = receipts.sync_authenticators(
+        result = apply_authenticators(
             self.db, [member("alice", self.alice.entry()), member("bob", self.bob.entry())])
         self.assertEqual(result["errors"], [])
         self.workdir = tempfile.mkdtemp(prefix="ameesh-approve-test-")
@@ -1011,7 +1011,7 @@ class ApproveEnrollTest(ApproveBase):
                                 proposal, re.M))
         entry = {key: json.loads(value) for key, value in entry.items()}
         self.assertEqual(entry["public_key"], dave.public_key())
-        synced = receipts.sync_authenticators(self.db, [
+        synced = apply_authenticators(self.db, [
             member("alice", self.alice.entry()), member("bob", self.bob.entry()),
             member("dave", entry)])
         self.assertEqual((synced["errors"], synced["added"]),

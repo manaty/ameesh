@@ -25,8 +25,13 @@ class MigrationsTest(PgTestCase):
         expected = {1: "init", 2: "overview", 3: "authority", 4: "work_items", 5: "key_roles",
                     6: "authority_fixes", 7: "nonces_backfill", 8: "canon", 9: "threads",
                     11: "receipts", 12: "events", 14: "cost", 22: "placement",
-                    23: "authenticator_syncs"}
+                    23: "authenticator_syncs", 24: "canon_state_authenticators"}
         self.assertEqual({v: names.get(v) for v in expected}, expected)
+        # 0024 : la partie authentificateurs de l'état du canon (revue L9b, codex2)
+        colonnes = {row["column_name"] for row in self.db.query(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'canon_state'")}
+        self.assertTrue({"auth_status", "auth_diagnostic", "auth_checked_at"} <= colonnes)
         for row in rows:
             self.assertEqual(len(row["checksum"]), 64)
         # la vue d'observabilité et les deux triggers de notification existent
