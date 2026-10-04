@@ -5,12 +5,18 @@ Le dépôt d'un message est la seule écriture nécessaire : un trigger Postgres
 émet `pg_notify('agent_mail', …)`, ce qui réveille l'exécuteur du destinataire.
 La remise (`mark_delivered`) est faite par le hook du harnais ou par l'exécuteur
 après un tour : un message non remis est représenté par `delivered_at IS NULL`.
+
+La boîte n'est que la file de distribution : chaque message déposé est aussi
+écrit dans son **fil lisible** (`fil.record`, R12). Un corps illisible (vide,
+JSON seul, binaire, bloc encodé) est refusé avant tout dépôt ; un fil
+inaccessible ne fait jamais perdre le message.
 """
 from __future__ import annotations
 
 import json
 from typing import Any, Sequence
 
+from . import fil
 from .db import Db
 
 MAIL_COLUMNS = """
@@ -38,13 +44,23 @@ def send(
     nonce: str | None = None,
     created_us: int | None = None,
     expires_us: int | None = None,
+    allow_structured: bool = False,
+    thread: bool = True,
+    thread_meta: dict | None = None,
 ) -> int:
-    """Dépose un message pour UN destinataire. Renvoie son id.
+    """Dépose un message pour UN destinataire, l'écrit dans son fil. Renvoie son id.
 
     Les champs `signed_*` viennent de `authority.sign_message` : un message
     signé fixe son propre horodatage (c'est lui qui est couvert par la
     signature) et son échéance.
+
+    `allow_structured` lève le refus des corps illisibles (tests et outils
+    seulement). `thread=False` laisse l'écriture du fil à l'appelant (envoi à
+    « all » regroupé en une entrée, import déjà écrit). Projet du fil : chantier
+    de l'expéditeur, sinon du destinataire, sinon AMEESH_PROJECT, sinon
+    `default` ; lot : `work_item_id`.
     """
+    fil.ensure_readable(body, allow_structured)
     rows = db.query(
         """
         INSERT INTO agent_mailbox
@@ -54,14 +70,31 @@ def send(
         VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s,
                 coalesce(to_timestamp(%s::bigint / 1000000.0), now()),
                 to_timestamp(%s::bigint / 1000000.0))
-        RETURNING id
+        RETURNING id, extract(epoch from created_at)::float8 AS created_ts,
+                  (SELECT chantier FROM agent_registry WHERE name = %s) AS sender_chantier,
+                  (SELECT chantier FROM agent_registry WHERE name = %s) AS recipient_chantier
         """,
         (sender, recipient, body, host, kind,
          json.dumps(payload or {}, ensure_ascii=False), work_item_id,
          signature, signature_key, signed_payload, nonce,
-         created_us, expires_us),
+         created_us, expires_us, sender, recipient),
     )
-    return int(rows[0]["id"])
+    row = rows[0]
+    message_id = int(row["id"])
+    if thread:
+        # Le message est déposé : à partir d'ici, rien ne doit le faire perdre
+        # (fil.record ne lève jamais).
+        meta = {"host": host, "signature_key": signature_key}
+        if kind != "notify":
+            meta["kind"] = kind
+        meta.update(thread_meta or {})
+        fil.record(
+            db.cfg, db, sender=sender, recipients=[recipient], text=body,
+            ts=row.get("created_ts"),
+            project=fil.project_for(db.cfg, row.get("sender_chantier"),
+                                    row.get("recipient_chantier")),
+            lot=work_item_id, mailbox_ids=[message_id], meta=meta)
+    return message_id
 
 
 def unread(db: Db, recipient: str, limit: int = 200) -> list[dict]:

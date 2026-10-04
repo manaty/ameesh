@@ -11,6 +11,8 @@
   ameesh key …                clés publiques (propriétaire / agent) ;
   ameesh approve | approvals | verify   approbations signées ;
   ameesh work …               lots (work_items) ;
+  ameesh fil list | show <projet> [<lot>] [--last N] | tail <projet> [<lot>]
+        les fils lisibles : tout message passé par ameesh, en clair (R12) ;
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
   ameesh migrate | doctor     schéma et diagnostic.
 
@@ -40,6 +42,9 @@ def main(argv: list[str] | None = None) -> int:
     if command == "run":
         from . import runner
         return runner.main(rest)
+    if command == "fil":
+        from . import fil
+        return fil.main(rest)
     if command in MESH_COMMANDS:
         from . import mesh_cli
         return mesh_cli.main(argv)
