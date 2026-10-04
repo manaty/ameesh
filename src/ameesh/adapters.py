@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 from dataclasses import dataclass
+from typing import Sequence
 
 from .config import HARNESSES
 
@@ -64,15 +65,17 @@ class HarnessSpec:
 
     `headless` et `interactive` sont des argv sans session ni texte : la session
     est insérée juste avant le texte avec `session_flag`, et disparaît quand
-    elle est vide. Les capacités qui ne sont pas une simple ligne de commande
-    (lecture du flux, variables d'environnement) restent dans la classe
-    d'adaptateur.
+    elle est vide. `model_flags` / `effort_flags` reçoivent le modèle et
+    l'effort choisis (0019) via `{model}` / `{effort}` ; un harnais qui n'est pas
+    une simple ligne de commande (DeepSeek, patch YAML) surcharge `command()`.
     """
     key: str
     binary: str
     headless: tuple[str, ...]
     interactive: tuple[str, ...]
     session_flag: tuple[str, ...]
+    model_flags: tuple[str, ...] = ()
+    effort_flags: tuple[str, ...] = ()
 
 
 SPECS: dict[str, HarnessSpec] = {
@@ -82,6 +85,8 @@ SPECS: dict[str, HarnessSpec] = {
                   "--dangerously-skip-permissions"),
         interactive=(),
         session_flag=("--resume",),
+        model_flags=("--model", "{model}"),
+        effort_flags=("--effort", "{effort}"),
     ),
     "codex": HarnessSpec(
         key="codex", binary="codex",
@@ -89,6 +94,8 @@ SPECS: dict[str, HarnessSpec] = {
                   "--dangerously-bypass-approvals-and-sandbox", "--json"),
         interactive=(),
         session_flag=("resume",),
+        model_flags=("-m", "{model}"),
+        effort_flags=("-c", 'model_reasoning_effort="{effort}"'),
     ),
     "deepseek": HarnessSpec(
         key="deepseek", binary="dsh",
@@ -150,17 +157,37 @@ class HarnessAdapter:
 
     # -- commande ----------------------------------------------------------
     def _argv(self, base: tuple[str, ...], session_id: str | None,
-              text: str | None = None) -> list[str]:
+              text: str | None = None, extra: Sequence[str] | None = None) -> list[str]:
         argv = [self.binary, *base]
+        if extra:
+            argv += list(extra)
         if session_id:
             argv += [*self.spec.session_flag, session_id]
         if text is not None:
             argv.append(text)
         return argv
 
-    def command(self, text: str, session_id: str | None = None) -> list[str]:
-        """Ligne de commande d'un tour sans tête (le texte est la consigne)."""
-        return self._argv(self.spec.headless, session_id, text)
+    def _options(self, model: str | None, effort: str | None) -> list[str]:
+        """Options modèle/effort, déclarées par le descripteur (0019)."""
+        out: list[str] = []
+        if model:
+            out += [flag.format(model=model, effort=effort or "")
+                    for flag in self.spec.model_flags]
+        if effort:
+            out += [flag.format(model=model or "", effort=effort)
+                    for flag in self.spec.effort_flags]
+        return out
+
+    def command(self, text: str, session_id: str | None = None,
+                model: str | None = None, effort: str | None = None,
+                patch: str | None = None) -> list[str]:
+        """Ligne de commande d'un tour sans tête (le texte est la consigne).
+
+        `model` et `effort` sont appliqués s'ils sont fournis ; `patch` et
+        l'écriture du patch YAML sont propres à DeepSeek (voir la sous-classe).
+        """
+        return self._argv(self.spec.headless, session_id, text,
+                          extra=self._options(model, effort))
 
     def interactive_command(self, session_id: str | None = None) -> list[str]:
         """Commande d'une session **interactive** sur la même session (attach, C9).
@@ -252,6 +279,36 @@ class DeepseekAdapter(HarnessAdapter):
 
     def env(self) -> dict[str, str]:
         return {"DSH_PERMISSION_MODE": "danger-full-access"}
+
+    def command(self, text: str, session_id: str | None = None,
+                model: str | None = None, effort: str | None = None,
+                patch: str | None = None) -> list[str]:
+        """DeepSeek n'a pas d'options modèle/effort : il reçoit un patch YAML.
+
+        Le fichier est écrit par l'exécuteur (il connaît l'état de l'agent) ; le
+        patch n'est ajouté que si un modèle ou un effort est choisi.
+        """
+        extra: Sequence[str] = ()
+        if patch and (model or effort):
+            self._write_patch(patch, model, effort)
+            extra = ("--patch", patch)
+        return self._argv(self.spec.headless, session_id, text, extra=extra)
+
+    @staticmethod
+    def _write_patch(path: str, model: str | None, effort: str | None) -> None:
+        body = (
+            "- id: agent-default-model\n"
+            '  name: "@deepseek-ai/dsh-agent-default-model"\n'
+            "  config:\n"
+            "    provider: deepseek-official\n"
+            "    model: %s\n"
+            "    reasoningEffort: %s\n" % (model or "deepseek-flash", effort or "max")
+        )
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(body)
+        except OSError:
+            pass  # pas de patch : le harnais garde ses défauts, le tour part quand même
 
     def _parse_event(self, event: dict) -> dict:
         kind = event.get("type")

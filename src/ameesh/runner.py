@@ -39,7 +39,8 @@ import sys
 import threading
 import time
 
-from . import adapters, canon as canon_mod, canon_sync, db as db_mod, fil, mail, registry
+from . import adapters, canon as canon_mod, canon_sync, cost as cost_mod
+from . import db as db_mod, fil, mail, registry
 from .config import CHANNEL_LEASE, CHANNEL_MAIL, Config
 from .config import load as load_config
 
@@ -168,6 +169,10 @@ class AgentWorker(threading.Thread):
         #: arrêt demandé avant la publication du Popen (point de passage unique)
         self.stop_requested = threading.Event()
         self._stop_reason = ""
+        #: garde de budget (L13, 0019) : état de pause et cadence de contrôle
+        self._budget_next_check = 0.0
+        self._budget_paused = False
+        self._budget_reason = ""
         #: rotation de session (0018) : compteurs de la session courante
         self.resume_summary = ""
         self.session_turns = 0
@@ -740,6 +745,59 @@ class AgentWorker(threading.Thread):
         sender = (row.get("sender") or row.get("from") or "").strip()
         return bool(sender) and sender in self.cfg.interrupt_senders
 
+    # -- garde de budget (L13, 0019, R20) ----------------------------------
+    def budget_reason(self) -> str:
+        """Raison de pause budget pour cet agent, ou '' (jauges + dépense).
+
+        Le harnais est passé au `CostBook` (l'état local ne porte pas toujours
+        `tool`) ; le plafond horaire est celui de l'exécuteur (0019 §2).
+        """
+        if self.runner.budget_usd_per_hour <= 0:
+            return ""
+        book = cost_mod.CostBook(
+            state_dir=self.cfg.state_dir, db=self.db,
+            tools={self.name: self.agent.get("harness") or ""},
+            hourly_usd=self.runner.budget_usd_per_hour)
+        return book.over(self.name)
+
+    def budget_ok(self) -> bool:
+        """La garde de budget autorise-t-elle un tour ? Pose l'état de pause.
+
+        Le contrôle est cadencé (`budget_check_interval`) pour ne pas interroger
+        la base à chaque sondage. Un agent en pause est visible dans
+        `ameesh list` (`status=paused`, raison dans `status_text`) et laisse une
+        trace dans le fil.
+        """
+        if self.runner.budget_usd_per_hour <= 0:
+            return True
+        maintenant = time.monotonic()
+        if maintenant < self._budget_next_check:
+            return not self._budget_paused
+        self._budget_next_check = maintenant + self.runner.budget_check_interval
+        raison = self.budget_reason()
+        self._budget_paused = bool(raison)
+        if not raison:
+            self._budget_reason = ""
+            return True
+        # `paused` n'est pas dans la contrainte de statut (L13 n'a pas de
+        # migration) : la pause se lit `blocked` + raison dans `status_text`.
+        registry.set_status(self.db, self.name, "blocked",
+                            status_text="budget : %s" % raison)
+        if raison != self._budget_reason:
+            self._budget_reason = raison
+            self._fil_note("Pause budget : %s. Aucun tour tant que la jauge ne "
+                           "redescend pas." % raison,
+                           meta={"action": "budget", "raison": raison})
+        return False
+
+    def _state_read(self, key: str) -> str:
+        """Lit une valeur d'état locale (`model`, `effort`) ; '' si absente."""
+        try:
+            with open(os.path.join(self.state_dir, key), encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+
     def pick(self) -> dict | None:
         """Le prochain tour à faire, ou None. Consomme la consigne en attente."""
         agent = registry.get(self.db, self.name)
@@ -749,6 +807,8 @@ class AgentWorker(threading.Thread):
             self.stopping.set()
             return None
         self.agent = agent
+        if not self.budget_ok():
+            return None  # garde de budget (L13) : aucun tour, état `paused` posé
         urgents = mail.unread_urgent(self.db, self.name)
         autorises = [m for m in urgents if self.interrupt_allowed(m)]
         for refuse in (m for m in urgents if m not in autorises):
@@ -829,7 +889,13 @@ class AgentWorker(threading.Thread):
         if self.resume_summary and not session:
             # Session neuve après rotation (0018) : le résumé de reprise ouvre le tour.
             resume = "Reprise de session après rotation — résumé :\n%s\n\n" % self.resume_summary
-        argv = adapter.command(resume + spec["prompt"], session)
+        # Modèle et effort par agent (0019) : lus à chaque tour, donc un
+        # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
+        model = self.agent.get("model") or self._state_read("model")
+        effort = self._state_read("effort")
+        patch = self._path("model.patch.yml") if (model or effort) else None
+        argv = adapter.command(resume + spec["prompt"], session,
+                               model=model or None, effort=effort or None, patch=patch)
         label = {"prompt": "consigne", "mail": "messages", "event": "événements",
                  "urgent": "prioritaire", "idle": "reprise"}[spec["kind"]]
         if self.runner.dry_run:
@@ -1093,6 +1159,9 @@ class Runner:
         #: `canon sync` de l'hôte : au démarrage puis périodiquement (spec §4.4)
         self.canon_sync_interval = max(0.0, cfg.canon_sync_interval)
         self.canon_thread: threading.Thread | None = None
+        #: garde de budget (L13, 0019) : plafond horaire et cadence de contrôle
+        self.budget_usd_per_hour = max(0.0, cfg.budget_usd_per_hour)
+        self.budget_check_interval = max(1.0, cfg.budget_check_interval)
         self.turns = 0
         self.did_turn = False
 

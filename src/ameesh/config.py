@@ -102,6 +102,11 @@ class Config:
     #: périodicité de `canon sync` par l'exécuteur (spec §4.4) ; 0 = seulement
     #: au démarrage. Sans canon configuré, rien n'est lancé.
     canon_sync_interval: float = 300.0
+    #: garde de budget (0019, R20) : plafond horaire de l'usage payé au token
+    #: (somme des tours des 60 dernières minutes) ; 0 = garde désactivée.
+    budget_usd_per_hour: float = 10.0
+    #: intervalle minimal entre deux vérifications de budget d'un agent en pause
+    budget_check_interval: float = 30.0
     #: expéditeurs autorisés à interrompre un tour (0018, R19) ; sans canon,
     #: c'est la seule autorisation. Vide = personne.
     interrupt_senders: tuple[str, ...] = ()
@@ -231,6 +236,12 @@ def load(env: dict | None = None) -> Config:
         canon_sync_interval=_as_float(
             pick("AMEESH_CANON_SYNC_INTERVAL", "AGENT_MESH_CANON_SYNC_INTERVAL"),
             cfg.canon_sync_interval),
+        budget_usd_per_hour=_as_float(
+            pick("AMEESH_BUDGET_USD_PER_HOUR", "AGENT_MESH_BUDGET_USD_PER_HOUR"),
+            cfg.budget_usd_per_hour),
+        budget_check_interval=_as_float(
+            pick("AMEESH_BUDGET_CHECK_INTERVAL", "AGENT_MESH_BUDGET_CHECK_INTERVAL"),
+            cfg.budget_check_interval),
         interrupt_senders=_as_names(
             pick("AMEESH_INTERRUPT_SENDERS", "AGENT_MESH_INTERRUPT_SENDERS")
         ) or cfg.interrupt_senders,

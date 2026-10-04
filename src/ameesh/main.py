@@ -39,7 +39,7 @@ import sys
 
 #: sous-commandes servies par mesh_cli (parseur déjà en place)
 MESH_COMMANDS = (
-    "list", "show", "key", "approve", "approvals", "verify", "work", "cost",
+    "list", "show", "set", "key", "approve", "approvals", "verify", "work", "cost",
     "migrate", "doctor", "import-v0", "export-v0", "canon", "placement", "agent",
 )
 #: sous-commandes des reçus d'approbation (receipts_cli)

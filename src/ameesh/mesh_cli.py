@@ -542,6 +542,69 @@ def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
 # entrée
 # --------------------------------------------------------------------------
 
+def _etat_chemin(cfg: Config, agent: str, cle: str) -> str:
+    return os.path.join(cfg.agent_dir(agent), cle)
+
+
+def _lit_etat(cfg: Config, agent: str, cle: str) -> str:
+    try:
+        with open(_etat_chemin(cfg, agent, cle), encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
+    """Écrit (ou efface) un réglage local ; jamais fatal, `set` le dit."""
+    chemin = _etat_chemin(cfg, agent, cle)
+    if not valeur:
+        try:
+            os.unlink(chemin)
+        except OSError:
+            pass
+        return
+    os.makedirs(cfg.agent_dir(agent), mode=0o700, exist_ok=True)
+    with open(chemin, "w", encoding="utf-8") as fh:
+        fh.write(valeur + "\n")
+
+
+def cmd_set(cfg: Config, args) -> int:
+    """`ameesh set <agent> model=… effort=…` (L13, décision 0019 §1).
+
+    Écrit l'état d'exécution : le modèle dans le registre (visible par `list`)
+    et dans l'état local, l'effort dans l'état local. Le tour suivant les lit et
+    les applique ; une valeur vide revient au défaut.
+    """
+    db = db_mod.connect(cfg)
+    try:
+        db_mod.require_schema(db)
+        if registry.get(db, args.agent) is None:
+            print("agent inconnu : %s" % args.agent, file=sys.stderr)
+            return 1
+        valeurs: dict = {}
+        for couple in args.values:
+            cle, sep, valeur = couple.partition("=")
+            if not sep or cle not in ("model", "effort"):
+                print("usage : ameesh set <agent> model=… effort=…", file=sys.stderr)
+                return 2
+            valeurs[cle] = valeur
+        for cle, valeur in valeurs.items():
+            _ecrit_etat(cfg, args.agent, cle, valeur)
+            if cle == "model":
+                if valeur:
+                    registry.upsert(db, args.agent, model=valeur)
+                else:
+                    db.execute("UPDATE agent_registry SET model = NULL WHERE name = %s",
+                               (args.agent,))
+        modele = registry.get(db, args.agent).get("model") or "défaut"
+        effort = _lit_etat(cfg, args.agent, "effort") or "défaut"
+        print("%s : modèle=%s effort=%s (prend effet au prochain tour)"
+              % (args.agent, modele, effort))
+        return 0
+    finally:
+        db.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="agent-mesh", description=__doc__,
@@ -659,6 +722,12 @@ def build_parser() -> argparse.ArgumentParser:
     pc_over = cost_sub.add_parser("over", help="code 0 si le rythme du forfait est dépassé")
     pc_over.add_argument("agent", nargs="?", default="all")
     pc_over.set_defaults(func=cmd_cost)
+
+    p_set = sub.add_parser("set", help="modèle/effort d'un agent, effet au prochain tour (L13)")
+    p_set.add_argument("agent")
+    p_set.add_argument("values", nargs="+", metavar="clé=valeur",
+                       help="model=… effort=… (valeur vide = défaut)")
+    p_set.set_defaults(func=cmd_set)
 
     p_imp = sub.add_parser("import-v0", help="importer la boîte fichier v0 dans Postgres")
     p_imp.add_argument("--state", default=None, help="état v0 (défaut AGENT_MAIL_STATE)")
