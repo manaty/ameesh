@@ -426,7 +426,7 @@ client ; migrations réservées ci-dessous ; aucune dépense, aucun service publ
 | L21 | preuves de vérification et QA bornée (R23 : A8) | L20 | — | codex |
 | L22 | demandes aux humains : destinataire par le canon, échéances par gravité, remplaçants, escalade sans décision implicite (R23 : A9) | L2, L5 | 0020 | codex3 |
 | L23 | surveillance après livraison, réouverture sur récidive, corrélation avec les versions, notification du demandeur, auto-guérison des exécutions, balayage (R23 : A4, A10–A12) | L18, L21 | 0021 | codex |
-| L24 | vue temps réel de l'avancement : `ameesh progress --json` (lots, agents, jalons, budget) alimenté par les événements, vue de référence lisible sur téléphone ([0024](decisions/0024-vue-temps-reel.md)) | L5, L8, L12 | — | codex |
+| L24 | vue temps réel de l'avancement : `ameesh progress --json` (lots, agents, jalons, budget) alimenté par les événements, vue de référence lisible sur téléphone (maquette : page « Chantier Nexlink » de l'orchestrateur, https://claude.ai/artifact/2pYwH2qpFYTmcxGXMzaLc9, privée au propriétaire ; données : document `state/current` produit par `nexlink-gantt-data`) ([0024](decisions/0024-vue-temps-reel.md)) | L5, L8, L12 | — | codex |
 
 Ordre : L2, L4 et L6 en parallèle dès maintenant (fichiers nouveaux) ; L1 et L8
 après la fusion de B5a (ils touchent `runner.py` et `registry.py`) ; puis L3,
