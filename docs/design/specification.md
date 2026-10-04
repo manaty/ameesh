@@ -416,6 +416,8 @@ client ; migrations réservées ci-dessous ; aucune dépense, aucun service publ
 | L11 | interruption de tour, rotation de session avec résumé, sessions robustes au déplacement (R19) | L8 | — | codex3 |
 | L12 | lecteurs de jauges de forfait, comptabilité par tour, `ameesh cost` (R20) | — | 0014 | codex |
 | L13 | garde de budget avant chaque tour, modèle et effort par harnais, `ameesh set` (R20) | L8, L12 | — | codex3 |
+| L14 | catalogue et découverte des modèles (API des fournisseurs, options des harnais, barèmes), événements de changement, `ameesh models list|discover|show` (R21) | L12 | 0015 | codex |
+| L15 | évaluation sur tâches de référence (action coûteuse sous la porte), rapports au canon, `ameesh models evaluate|recommend` (R21) | L5, L14 | 0016 | codex3 |
 
 Ordre : L2, L4 et L6 en parallèle dès maintenant (fichiers nouveaux) ; L1 et L8
 après la fusion de B5a (ils touchent `runner.py` et `registry.py`) ; puis L3,
