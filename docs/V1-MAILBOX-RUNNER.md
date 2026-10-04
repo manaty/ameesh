@@ -418,9 +418,20 @@ les sessions réelles.
 * **L'autorité du propriétaire (R4)** et **`mesh list`** sont traités dans
   [`V1-AUTORITE-MESH.md`](V1-AUTORITE-MESH.md) (points 3 à 5), avec
   `signing.py`, `authority.py` et `mesh_cli.py`.
-* **Budget** : `budget_usd` / `spent_usd` sont stockés et alimentés quand le
-  harnais annonce un coût ; le contrôle (refuser un tour au-delà du budget)
-  n'est pas implémenté.
+* **Budget (L13, 0019)** : chaque tour terminé écrit une ligne `turn_costs`
+  (comptabilité par tour, L12) ; un échec d'écriture n'est pas fatal au tour
+  mais **suspend les suivants** (fail-closed : pas de dépense en aveugle).
+  Avant chaque tour, la garde interroge `CostBook.over` : plafond horaire
+  glissant de l'usage **payé au token** (`AMEESH_BUDGET_USD_PER_HOUR`, défaut
+  10 $/h ; le forfait Claude/Codex n'entre pas dans cette somme) et garde de
+  rythme des forfaits (`min(90 %, part écoulée + 10 points)`, jauges lues à la
+  source). La décision est fraîche à chaque tour ; seuls le statut et la trace
+  sont cadencés (`AMEESH_BUDGET_CHECK_INTERVAL`, défaut 30 s). Un agent en pause
+  est `blocked` avec la raison dans `status_text` (visible dans `ameesh list`)
+  et le fil en garde la trace. `budget_usd` / `spent_usd` restent les compteurs
+  historiques par agent ; `ameesh set <agent> model=… effort=…` règle le modèle
+  et l'effort, appliqués au tour suivant (options déclarées par harnais, patch
+  YAML pour DeepSeek).
 * **Portage (M1)** : le paquet est autonome (`pyproject.toml`, aucun import
   d'un orchestrateur existant). Les tables et les colonnes
   `kind`/`payload`/`work_item_id` sont prêtes pour une reprise côté

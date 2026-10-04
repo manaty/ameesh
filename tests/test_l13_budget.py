@@ -74,7 +74,8 @@ class SetModelEffortTest(PgTestCase):
 
 
 class BudgetGateTest(PgTestCase):
-    def _worker(self, name: str = "budget", *, plafond: float = 10.0):
+    def _worker(self, name: str = "budget", *, plafond: float = 10.0,
+                harness: str = "deepseek"):
         cfg = dataclasses.replace(self.cfg, budget_usd_per_hour=plafond,
                                   budget_check_interval=0.0)
         runner = Runner(cfg, self.db, once=True)
@@ -83,7 +84,7 @@ class BudgetGateTest(PgTestCase):
         self.db.execute("DELETE FROM turn_costs")
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
-        self.register(name, "deepseek", cwd=cwd)
+        self.register(name, harness, cwd=cwd)
         lease = registry.claim(self.db, name, runner.runner_id, 3600)
         return runner, AgentWorker(runner, registry.get(self.db, name), lease)
 
@@ -140,6 +141,54 @@ class BudgetGateTest(PgTestCase):
         with open(os.path.join(self.cfg.state_dir, "budget", "model.patch.yml"),
                   encoding="utf-8") as fh:
             self.assertIn("model: deepseek-pro", fh.read())
+
+    def test_un_tour_reel_ecrit_le_grand_livre(self):
+        """Verdict L13 B1 : après un tour réel, `turn_costs` porte la dépense."""
+        runner, worker = self._worker(plafond=10.0, harness="claude")
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log}
+        try:
+            with mock.patch.dict(os.environ, env, clear=False):
+                self.assertTrue(worker.run_turn(
+                    {"kind": "prompt", "prompt": "tour", "ids": []}))
+        finally:
+            worker.watchdog_stop.set()
+        lignes = self.db.query(
+            "select count(*)::int as n from turn_costs where agent = 'budget'")[0]["n"]
+        self.assertEqual(lignes, 1)
+        book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db,
+                             tools={"budget": "claude"})
+        self.assertGreater(book.spent("budget", 3600), 0.0)
+
+    def test_echec_de_comptabilite_suspend_les_tours(self):
+        """Verdict L13 B1 : sans grand livre, plus de tour (fail-closed)."""
+        runner, worker = self._worker(plafond=10.0, harness="claude")
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log}
+        try:
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch("ameesh.cost.CostBook.record",
+                               side_effect=RuntimeError("disque plein")):
+                worker.run_turn({"kind": "prompt", "prompt": "tour", "ids": []})
+            self.assertTrue(worker._compta_en_echec)
+            self.assertFalse(worker.budget_ok())
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_le_forfait_ne_compte_pas_dans_le_plafond_token(self):
+        """Verdict L13 B2 : une estimation de forfait (Claude) n'entre pas dans
+        le plafond horaire payé au token."""
+        runner, worker = self._worker(plafond=0.1)
+        self.db.execute(
+            "INSERT INTO turn_costs (agent, harness, model, usd, recorded_at) "
+            "VALUES ('forfait', 'claude', 'claude-opus-4', 100.0, now())")
+        self.assertEqual(worker.budget_reason(), "")
+
+    def test_pas_de_cache_positif_de_la_garde(self):
+        """Verdict L13 B3 : un tour autorisé ne met pas la décision en cache ;
+        un dépassement survenu juste après est vu au tour suivant."""
+        runner, worker = self._worker(plafond=0.1)
+        self.assertTrue(worker.budget_ok())
+        self._depense("budget", 1.0)
+        self.assertFalse(worker.budget_ok())
 
 
 if __name__ == "__main__":

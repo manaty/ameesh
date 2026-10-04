@@ -173,6 +173,8 @@ class AgentWorker(threading.Thread):
         self._budget_next_check = 0.0
         self._budget_paused = False
         self._budget_reason = ""
+        #: la comptabilité du dernier tour a échoué : plus de tour à l'aveugle
+        self._compta_en_echec = False
         #: rotation de session (0018) : compteurs de la session courante
         self.resume_summary = ""
         self.session_turns = 0
@@ -763,31 +765,35 @@ class AgentWorker(threading.Thread):
     def budget_ok(self) -> bool:
         """La garde de budget autorise-t-elle un tour ? Pose l'état de pause.
 
-        Le contrôle est cadencé (`budget_check_interval`) pour ne pas interroger
-        la base à chaque sondage. Un agent en pause est visible dans
-        `ameesh list` (`status=paused`, raison dans `status_text`) et laisse une
-        trace dans le fil.
+        La **décision** est fraîche à chaque appel : un tour qui vient de
+        franchir le plafond ne doit pas passer grâce à un cache (verdict codex3
+        L13 B3). Seuls les effets de bord (statut, trace au fil) sont cadencés
+        par `budget_check_interval`, pour ne pas écrire à chaque sondage.
+
+        Si la comptabilité d'un tour a échoué (`_compta_en_echec`), les tours
+        suivants sont refusés : sans grand livre, l'exécuteur dépenserait en
+        aveugle (verdict L13 B1).
         """
         if self.runner.budget_usd_per_hour <= 0:
             return True
-        maintenant = time.monotonic()
-        if maintenant < self._budget_next_check:
-            return not self._budget_paused
-        self._budget_next_check = maintenant + self.runner.budget_check_interval
-        raison = self.budget_reason()
+        raison = ("comptabilité des tours indisponible" if self._compta_en_echec
+                  else self.budget_reason())
         self._budget_paused = bool(raison)
         if not raison:
             self._budget_reason = ""
             return True
-        # `paused` n'est pas dans la contrainte de statut (L13 n'a pas de
-        # migration) : la pause se lit `blocked` + raison dans `status_text`.
-        registry.set_status(self.db, self.name, "blocked",
-                            status_text="budget : %s" % raison)
-        if raison != self._budget_reason:
-            self._budget_reason = raison
-            self._fil_note("Pause budget : %s. Aucun tour tant que la jauge ne "
-                           "redescend pas." % raison,
-                           meta={"action": "budget", "raison": raison})
+        maintenant = time.monotonic()
+        if maintenant >= self._budget_next_check:
+            self._budget_next_check = maintenant + self.runner.budget_check_interval
+            # `paused` n'est pas dans la contrainte de statut (L13 n'a pas de
+            # migration) : la pause se lit `blocked` + raison dans `status_text`.
+            registry.set_status(self.db, self.name, "blocked",
+                                status_text="budget : %s" % raison)
+            if raison != self._budget_reason:
+                self._budget_reason = raison
+                self._fil_note("Pause budget : %s. Aucun tour tant que la jauge ne "
+                               "redescend pas." % raison,
+                               meta={"action": "budget", "raison": raison})
         return False
 
     def _state_read(self, key: str) -> str:
@@ -797,6 +803,25 @@ class AgentWorker(threading.Thread):
                 return fh.read().strip()
         except OSError:
             return ""
+
+    def _enregistre_cout(self, start: int, tour: str, session_new: str | None) -> None:
+        """Comptabilité du tour dans `turn_costs` (L13, 0019 §3).
+
+        C'est le grand livre que lit la garde de budget : sans écriture,
+        l'exécuteur dépenserait en aveugle. Un échec n'est pas fatal au tour,
+        mais il suspend les suivants (`_compta_en_echec`), fail-closed.
+        """
+        try:
+            book = cost_mod.CostBook(
+                state_dir=self.cfg.state_dir, db=self.db,
+                tools={self.name: self.agent.get("harness") or ""})
+            session = session_new or self.agent.get("session_id") or None
+            book.record(self.name, start=start, turn=tour, session=session)
+            self._compta_en_echec = False
+        except Exception as exc:  # une panne de comptabilité ne tue pas le tour
+            self._compta_en_echec = True
+            log_async("[%s] comptabilité du tour en échec (%s) : tours suspendus"
+                      % (self.name, " ".join(str(exc).split())[:160]))
 
     def pick(self) -> dict | None:
         """Le prochain tour à faire, ou None. Consomme la consigne en attente."""
@@ -944,6 +969,14 @@ class AgentWorker(threading.Thread):
         events_path = self._path("events.jsonl")
         stderr_path = self._path("stderr.log")
         started = time.time()
+        # Index du flux avant le tour : `CostBook.record` ne compte que les
+        # événements nouveaux (L13, 0019 §3).
+        events_start = 0
+        try:
+            with open(events_path, "rb") as flux:
+                events_start = sum(1 for _ in flux)
+        except OSError:
+            events_start = 0
         session_new: str | None = None
         cost: float | None = None
         error: str | None = None
@@ -1023,6 +1056,9 @@ class AgentWorker(threading.Thread):
         self.last_turn_seconds = duration
         lost = self.lease_lost.is_set()
         preempte = self.preempting.is_set()
+        # Comptabilité **avant** toute sortie anticipée : la dépense a eu lieu,
+        # même si le bail a été perdu ou le tour préempté (L13 B1).
+        self._enregistre_cout(events_start, label, session_new)
         ok = result_code == 0 and not lost and not error
         if error is None and result_code != 0:
             error = "le harnais a rendu le code %d" % result_code

@@ -44,7 +44,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Sequence
 
 from . import config as config_mod
 
@@ -64,6 +64,9 @@ KNOWN_WINDOWS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
 #: Plafond horaire de l'usage payé au jeton, pour l'ensemble des agents
 #: (décision 0019 §2 : référence 10 USD/h).
 DEFAULT_HOURLY_USD = 10.0
+#: harnais dont l'usage est **payé au token** : seuls eux comptent dans le
+#: plafond horaire ; Claude/Codex sont des forfaits, gardés par le rythme.
+DEFAULT_PAID_HARNESSES = ("deepseek",)
 
 #: Marge de rythme : on ne vise pas 100 % d'un forfait, mais la part écoulée + 10.
 PACE_MARGIN = 0.10
@@ -506,31 +509,46 @@ class CostBook:
         return usage
 
     # -- dépense ------------------------------------------------------------
-    def spent(self, agent: str = "all", seconds: float = 3600.0) -> float:
-        """La dépense des `seconds` dernières secondes, lue sur `turn_costs`."""
+    def spent(self, agent: str = "all", seconds: float = 3600.0,
+              harnesses: Sequence[str] | None = None) -> float:
+        """La dépense des `seconds` dernières secondes, lue sur `turn_costs`.
+
+        `harnesses` restreint la somme à ces harnais : le plafond horaire de
+        0019 §2 ne vise que l'**usage payé au token** (`DEFAULT_PAID_HARNESSES`),
+        pas les estimations des forfaits (Claude, Codex), dont la vraie limite
+        est la garde de rythme.
+        """
         if self.db is None:
             return 0.0
-        window = "recorded_at >= now() - make_interval(secs => %s)"
-        if agent == "all":
-            rows = self.db.query(
-                "select coalesce(sum(usd), 0) as usd from turn_costs where " + window,
-                (float(seconds),))
-        else:
-            rows = self.db.query(
-                "select coalesce(sum(usd), 0) as usd from turn_costs"
-                " where agent = %s and " + window,
-                (agent, float(seconds)))
+        clauses = ["recorded_at >= now() - make_interval(secs => %s)"]
+        params: list = [float(seconds)]
+        if agent != "all":
+            clauses.append("agent = %s")
+            params.append(agent)
+        if harnesses:
+            clauses.append("harness in (%s)" % ", ".join(["%s"] * len(harnesses)))
+            params.extend(harnesses)
+        rows = self.db.query(
+            "select coalesce(sum(usd), 0) as usd from turn_costs where "
+            + " and ".join(clauses), tuple(params))
         return float(rows[0]["usd"]) if rows else 0.0
 
-    def over(self, agent: str = "all") -> str:
-        """Le garde-fou : raison si l'agent (ou le compte) doit s'arrêter, sinon ''."""
+    def over(self, agent: str = "all", *,
+             paid_harnesses: Sequence[str] | None = None) -> str:
+        """Le garde-fou : raison si l'agent (ou le compte) doit s'arrêter, sinon ''.
+
+        Le plafond horaire ne somme que l'usage payé au token
+        (`paid_harnesses`, défaut `DEFAULT_PAID_HARNESSES`) ; les forfaits sont
+        couverts par `pace_exceeded`, pas par cette somme (0019 §2).
+        """
         harness = self.tool_of(agent) if agent != "all" else ""
         reason = self.pace_exceeded(harness) if harness else ""
         if reason:
             return reason
-        hourly = self.spent("all", 3600)
+        paid = DEFAULT_PAID_HARNESSES if paid_harnesses is None else tuple(paid_harnesses)
+        hourly = self.spent("all", 3600, harnesses=paid)
         if hourly >= self.hourly_usd:
-            return ("budget horaire : %.2f $ dépensés sur les 60 dernières minutes "
+            return ("budget horaire (payé au token) : %.2f $ sur les 60 dernières minutes "
                     "(plafond %.2f $)" % (hourly, self.hourly_usd))
         return ""
 
