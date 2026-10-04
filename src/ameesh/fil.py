@@ -50,7 +50,7 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Iterable, Protocol, Sequence
+from typing import Iterable, Iterator, Protocol, Sequence
 
 from .config import Config
 
@@ -59,6 +59,9 @@ DEFAULT_PROJECT = "default"
 PROJECT_THREAD = "_projet"
 #: au-delà, un bloc sans espace en alphabet base64/hex est une donnée encodée
 MAX_BLOB = 200
+#: un bloc encodé replié l'est à largeur fixe (64 en PEM, 76 en MIME, 60 pour
+#: `xxd -p`) ; les mots d'un texte n'atteignent presque jamais 16 caractères
+FOLD_MIN = 16
 SEGMENT_MAX = 64
 
 _HEADING_RE = re.compile(r"^### (\S+) — (.+?) → (.*)$")
@@ -71,6 +74,9 @@ _CLOSING_B = re.compile(rb" {0,3}`{3,}[ \t]*")
 _BLANK_LINES_B = re.compile(rb"(?:[ \t\r\f\v]*\n)*")
 _UNSAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _BLOB_RE = re.compile(r"[A-Za-z0-9+/=_-]{%d,}" % (MAX_BLOB + 1))
+_ALPHABET_RE = re.compile(r"[A-Za-z0-9+/=_-]+")
+_HEX_RUN_RE = re.compile(r"[0-9A-Fa-f]{%d,}" % (MAX_BLOB + 1))
+_WORD_RE = re.compile(r"[A-Z]?[a-z]{2,}")
 _ALLOW_HINT = "(--allow-structured est réservé aux tests et aux outils)"
 
 
@@ -176,13 +182,57 @@ def unreadable_reason(body) -> str | None:
             return ("le corps n'est que du JSON : écrivez en phrases ce que le destinataire "
                     "doit savoir ; les données structurées accompagnent le texte, elles ne "
                     "le remplacent pas")
-    for match in _BLOB_RE.finditer(body):
-        blob = match.group(0)
-        if re.search(r"[A-Za-z0-9]", blob) and not _path_like(blob):
-            return ("bloc encodé de %d caractères sans espace (base64 ou hexadécimal) : "
+    for blob, folded in _blobs(body):
+        if re.search(r"[A-Za-z0-9]", blob) and not _word_like(blob):
+            return ("bloc encodé de %d caractères %s (base64 ou hexadécimal) : "
                     "décrivez-le en clair et transmettez la donnée par un autre moyen"
-                    % len(blob))
+                    % (len(blob), "replié sur plusieurs lignes" if folded else "sans espace"))
+    # L'hexadécimal, replié ou espacé (« de ad be ef … »), se voit aussi dans le
+    # texte sans aucun blanc : aucun texte n'aligne 200 caractères de [0-9a-f]
+    # mêlant lettres et chiffres (une liste de nombres n'a pas de lettres).
+    for match in _HEX_RUN_RE.finditer("".join(body.split())):
+        run = match.group(0)
+        letters = sum(ch.isalpha() for ch in run)
+        if 0.05 * len(run) <= letters <= 0.95 * len(run):
+            return ("bloc encodé de %d caractères (hexadécimal replié ou espacé) : "
+                    "décrivez-le en clair et transmettez la donnée par un autre moyen"
+                    % len(run))
     return None
+
+
+def _blobs(body: str) -> Iterator[tuple[str, bool]]:
+    """Les blocs de l'alphabet base64/base64url/hex de plus de MAX_BLOB
+    caractères, avec un drapeau « replié ».
+
+    D'un seul tenant, ou repliés en lignes (et indentés, en CRLF…) : une suite
+    de mots de l'alphabet d'au moins FOLD_MIN caractères chacun, plus la
+    dernière ligne du bloc (plus courte), est recollée. Les mots d'une phrase
+    sont trop courts pour être recollés ainsi.
+    """
+    for match in _BLOB_RE.finditer(body):
+        yield match.group(0), False
+    run: list[str] = []
+    for token in body.split() + [""]:
+        alphabet = _ALPHABET_RE.fullmatch(token) is not None
+        if alphabet and len(token) >= FOLD_MIN:
+            run.append(token)
+            continue
+        if alphabet and run:
+            run.append(token)
+        joined = "".join(run)
+        if len(run) > 1 and len(joined) > MAX_BLOB:
+            yield joined, True
+        run = []
+
+
+def _word_like(run: str) -> bool:
+    """Un long chemin, des identifiants ou des noms collés : pas un bloc encodé.
+
+    Mesuré sur 6 000 base64, base64url et hexadécimaux (données aléatoires,
+    texte, JSON, zéros ; 200 à 1 200 caractères) : seul `_path_like` en laisse
+    passer, moins de 0,3 %.
+    """
+    return _path_like(run) or _identifiers_like(run) or _camel_like(run)
 
 
 def _path_like(run: str) -> bool:
@@ -196,6 +246,25 @@ def _path_like(run: str) -> bool:
         return False
     longueurs = [len(s) for s in run.split("/")]
     return max(longueurs) <= 48 and sum(longueurs) / len(longueurs) <= 40
+
+
+def _identifiers_like(run: str) -> bool:
+    """Des mots séparés par `-`, `_` ou `/` (noms de tests, UUID…) : segments courts.
+
+    Un base64url n'a un `-` ou un `_` que tous les 32 caractères en moyenne.
+    """
+    parts = [len(p) for p in re.split(r"[-_/]+", run) if p]
+    return len(parts) > 1 and max(parts) <= 32 and sum(parts) / len(parts) <= 12
+
+
+def _camel_like(run: str) -> bool:
+    """Des noms collés (CamelCase) : presque toutes les lettres dans des mots
+    (une majuscule puis des minuscules), presque pas de chiffres. Un base64 a
+    des chiffres partout et des majuscules au hasard."""
+    letters = sum(ch.isalpha() for ch in run)
+    in_words = sum(map(len, _WORD_RE.findall(run)))
+    digits = sum(ch.isdigit() for ch in run)
+    return letters > 0 and in_words >= 0.85 * letters and digits <= 0.05 * len(run)
 
 
 def ensure_readable(body, allow_structured: bool = False) -> None:

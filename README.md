@@ -83,7 +83,8 @@ block whose fence is longer than any backtick run it contains, so no line of a
 message can become a heading, HTML or anything else in the rendered thread.
 A thread write failure is reported on stderr and
 never loses the message. Unreadable bodies (empty, JSON only, control/binary
-characters, base64/hex blobs over 200 characters) are refused;
+characters, base64/hex blobs over 200 characters, even folded into lines or
+spaced out) are refused;
 `--allow-structured` is for tests and tools only.
 
 ```

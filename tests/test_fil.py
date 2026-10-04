@@ -553,6 +553,100 @@ class FilFormatTest(unittest.TestCase):
             for _ in range(300))
         self.assertLessEqual(manques, 1)
 
+    def test_corps_encodes_replies_refuses(self):
+        """B3 : un bloc base64/base64url/hex replié en lignes (64, 76…) ou espacé
+        est refusé comme le même bloc d'un seul tenant."""
+        import base64
+        import random
+        hasard = random.Random(7)
+        aleatoire = bytes(hasard.getrandbits(8) for _ in range(513))
+
+        def replier(texte: str, largeur: int, fin: str = "\n") -> str:
+            return fin.join(texte[i:i + largeur] for i in range(0, len(texte), largeur))
+
+        b64 = base64.b64encode(aleatoire).decode()            # 684 caractères
+        b64url = base64.urlsafe_b64encode(aleatoire).decode()
+        hexa = aleatoire[:150].hex()                           # 300 caractères
+        empreinte = "a3f5c9e1d2b4f6a8c0e1d3b5f7a9c1e3d5b7f9a1c3e5d7f9b1a3c5e7d9f1b3a5"
+        self.assertEqual(len(b64), 684)
+        refus = {
+            "base64 684 replié à 76 (signalé par la revue)": replier("QUJD" * 171, 76),
+            "base64 aléatoire replié à 76": replier(b64, 76),
+            "base64 aléatoire replié à 64": replier(b64, 64),
+            "base64 replié à 76, fins de ligne MIME": replier(b64, 76, "\r\n"),
+            "base64 replié et indenté": replier(b64, 64, "\n    "),
+            "base64url replié à 64": replier(b64url, 64),
+            "bloc PEM": "-----BEGIN CERTIFICATE-----\n%s\n-----END CERTIFICATE-----"
+                        % replier(b64, 64),
+            "base64 replié au milieu d'un texte": "Voici la pièce jointe :\n%s\nMerci."
+                                                  % replier(b64, 76),
+            "hexadécimal replié à 64": replier(hexa, 64),
+            "hexadécimal replié à 60 (xxd -p)": replier(hexa, 60),
+            "hexadécimal espacé par octet": " ".join(aleatoire[i:i + 1].hex()
+                                                     for i in range(120)),
+            "quatre empreintes nues à la suite": replier(empreinte * 4, 64),
+        }
+        for nom, corps in refus.items():
+            with self.subTest(nom):
+                raison = fil.unreadable_reason(corps)
+                self.assertIsNotNone(raison)
+                self.assertIn("encodé", raison)
+                with self.assertRaises(fil.UnreadableBody):
+                    fil.ensure_readable(corps)
+                fil.ensure_readable(corps, allow_structured=True)
+
+        chemins = "\n".join("/home/smichea/development/manaty/ameesh/src/module-%02d" % n
+                            for n in range(10))
+        acceptes = {
+            "empreinte sha256 isolée": "sha256 de l'archive : %s, vérifiée." % empreinte,
+            "trois empreintes nues (192 car.)": "\n".join([empreinte] * 3),
+            "sortie de sha256sum": "\n".join("%s  paquet-%d.tar.gz" % (empreinte, n)
+                                             for n in range(6)),
+            "longs chemins, un par ligne": chemins,
+            "URL, une par ligne": "\n".join(
+                "https://github.com/manaty/ameesh/pull/%d/files#diff-%s" % (n, empreinte)
+                for n in range(6)),
+            "phrase anglaise sans ponctuation": (
+                "I have finished the refactoring of the authentication module and all "
+                "the tests are passing on both drivers so you can start the review "
+                "whenever you are ready and let me know if you need anything else from "
+                "me before the end of the week because the release is planned for "
+                "Monday morning and we still have to update the documentation"),
+            "texte multilingue": (
+                "Bonjour, le lot est prêt à être relu : les tests passent sur les deux "
+                "pilotes. Die Donaudampfschifffahrtsgesellschaftskapitänsmütze liegt "
+                "dort. Привет, всё готово к проверке. 测试已经全部通过，请审阅。"
+                "テストはすべて合格しました。مرحبا، الاختبارات ناجحة. 🚀"),
+            "noms de tests, un par ligne": "\n".join([
+                "test_course_dossier_remplace_par_un_lien_pendant_les_ecritures",
+                "test_liens_symboliques_preexistants_ni_suivis_ni_listes",
+                "test_corps_inerte_aucun_titre_ni_html_parasite",
+                "test_entree_coupee_en_plein_bloc_ou_commentaire",
+                "test_corps_encodes_replies_refuses"]),
+            "noms de classes, un par ligne": "\n".join([
+                "AuthenticationServiceFactory", "UserRepositoryImplementation",
+                "PaymentGatewayAdapterFactory", "NotificationDispatcherService",
+                "ConfigurationLoaderStrategy", "DatabaseMigrationOrchestrator",
+                "CacheInvalidationPolicy", "RequestThrottlingMiddleware"]),
+            "UUID, un par ligne": "\n".join("64a93ff1-e27f-4fc9-9db8-3bbefaf9710%d" % n
+                                            for n in range(8)),
+            "nombres espacés": "identifiants : " + " ".join(str(1000 + n) for n in range(80)),
+            "journal git": "\n".join("%s correctif numéro %d du fil" % (empreinte[n:n + 7], n)
+                                     for n in range(30)),
+        }
+        for nom, corps in acceptes.items():
+            with self.subTest(nom):
+                self.assertIsNone(fil.unreadable_reason(corps))
+
+        # base64 et hex aléatoires repliés à 64 ou 76 : détectés, à de rares exceptions près
+        manques = 0
+        for _ in range(300):
+            donnee = bytes(hasard.getrandbits(8) for _ in range(hasard.randint(151, 600)))
+            encode = hasard.choice([base64.b64encode, base64.urlsafe_b64encode,
+                                    lambda d: d.hex().encode()])(donnee).decode()
+            manques += fil.unreadable_reason(replier(encode, hasard.choice([64, 76]))) is None
+        self.assertLessEqual(manques, 1)
+
     def test_auteur_et_projet(self):
         cfg = dataclasses.replace(config_mod.Config(), humans="proprio, smichea")
         self.assertEqual(fil.member(cfg, "proprio"), "human:proprio")
