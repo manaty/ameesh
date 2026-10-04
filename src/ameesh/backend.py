@@ -226,10 +226,11 @@ class PgBackend:
              allow_structured: bool = False, kind: str = "notify",
              urgent: bool = False) -> list[str]:
         fil.ensure_readable(text, allow_structured)
-        chantiers: dict[str, str] = {}
+        projects: dict[str, str] = {}
         if dest == "all":
             rows = registry.overview(self.db)
-            chantiers = {row["name"]: row.get("chantier") or "" for row in rows}
+            # projet du fil : équipe du canon, sinon chantier (fil.agent_project)
+            projects = {row["name"]: fil.agent_project(row) for row in rows}
             targets = [row["name"] for row in rows if row["name"] != sender]
         else:
             targets = [dest]
@@ -245,7 +246,7 @@ class PgBackend:
                 **dict(signed or {}))
             registry.upsert(self.db, target, host=host)
             if dest == "all":
-                project = fil.project_for(self.cfg, chantiers.get(sender), chantiers.get(target))
+                project = fil.project_for(self.cfg, projects.get(sender), projects.get(target))
                 groups.setdefault(project, []).append((target, message_id))
         for project, sent in groups.items():
             fil.record(

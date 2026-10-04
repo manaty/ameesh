@@ -40,7 +40,7 @@ export AMEESH_CLAUDE_BIN="$REPO/tests/fakebin/claude" AMEESH_CODEX_BIN="$REPO/te
 export AMEESH_DSH_BIN="$REPO/tests/fakebin/dsh"
 export AMEESH_GH_BIN="$REPO/tests/fakebin/gh"
 export AMEESH_FAKE_GH_STATE="$WORK/gh-etat.json" AMEESH_FAKE_GH_LOG="$WORK/gh-journal.jsonl"
-export AMEESH_CANON="$WORK/canon/acme" AMEESH_HOST=atelier AMEESH_PROJECT=acme-web
+export AMEESH_CANON="$WORK/canon/acme" AMEESH_HOST=atelier
 export AMEESH_HUMANS=alice,bruno
 export AMEESH_APPROVE_RP_ID=approve.example.test
 export AMEESH_APPROVE_ORIGINS=https://approve.example.test
@@ -167,7 +167,8 @@ MESSAGE="Relecteur, le lot 7 est prêt : relis la PR acme/acme-web#7 avant la fu
 montre "AGENT_MAIL_NAME=orchestre ameesh mail send relecteur \"$MESSAGE\""
 AGENT_MAIL_NAME=orchestre ameesh mail send relecteur "$MESSAGE"
 lance ameesh fil show acme-web
-note "la boîte Postgres distribue ; le fil est la référence lisible par les humains (R12)"
+note "la boîte Postgres distribue ; le fil est la référence lisible par les humains (R12) ;"
+note "son projet est l'équipe (team) des agents au canon : acme-web"
 lance agent-runner --once
 note "relecteur a été réveillé par le message (un tour du faux codex)"
 

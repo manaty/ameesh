@@ -85,7 +85,8 @@ class BoutEnBoutTest(PgTestCase):
         """Environnement des commandes : le canon de l'essai, l'hôte atelier, les
         faux harnais et le faux gh ; aucune configuration du développeur."""
         base = dict(
-            AMEESH_CANON=self.clone, AMEESH_HOST=HOST, AMEESH_PROJECT=PROJECT,
+            # pas d'AMEESH_PROJECT : le fil d'un agent du canon suit son équipe (team)
+            AMEESH_CANON=self.clone, AMEESH_HOST=HOST,
             AMEESH_HUMANS="alice,bruno",
             AMEESH_CONFIG=self.absent, AGENT_MESH_CONFIG=self.absent,
             AMEESH_APPROVE_CONFIG=self.absent,

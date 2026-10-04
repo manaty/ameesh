@@ -748,6 +748,38 @@ class FilPgTest(PgTestCase):
         self.assertEqual([e.text for e in self.entries("default")], ["sinon le défaut"])
         self.assertEqual([e.text for e in self.entries("banc")], ["sinon AMEESH_PROJECT"])
 
+    def test_projet_d_un_agent_du_canon(self):
+        """Agent gouverné par le canon : le projet du fil est son équipe (`team`)."""
+        sha = "c" * 40
+        for name, chantier in (("orchestre", "ancien"), ("relecteur", ""), ("manuel", "atelier"),
+                               ("sans-equipe", "banc")):
+            registry.upsert(self.db, name, chantier=chantier or None)
+        self.db.execute("UPDATE agent_registry SET team = 'acme-web', canon_ref = %s "
+                        "WHERE name IN ('orchestre', 'relecteur')", ("canon:agents/x.md@" + sha,))
+        self.db.execute("UPDATE agent_registry SET canon_ref = %s WHERE name = 'sans-equipe'",
+                        ("canon:agents/y.md@" + sha,))
+        # écrit à la main sans venir du canon : l'équipe ne compte pas
+        self.db.execute("UPDATE agent_registry SET team = 'ailleurs' WHERE name = 'manuel'")
+        mail.send(self.db, "alice", "relecteur", "un humain écrit à un agent du canon")
+        mail.send(self.db, "orchestre", "manuel", "l'équipe prime sur le chantier")
+        mail.send(self.db, "manuel", "orchestre", "agent inscrit à la main : son chantier")
+        mail.send(self.db, "sans-equipe", "beta", "gouverné sans équipe : son chantier")
+        self.assertEqual([e.text for e in self.entries("acme-web")],
+                         ["un humain écrit à un agent du canon",
+                          "l'équipe prime sur le chantier"])
+        self.assertEqual([e.text for e in self.entries("atelier")],
+                         ["agent inscrit à la main : son chantier"])
+        self.assertEqual([e.text for e in self.entries("banc")],
+                         ["gouverné sans équipe : son chantier"])
+        self.assertEqual(self.entries("ailleurs"), [])
+        # envoi à tous : même règle
+        PgBackend(self.cfg, self.db).send("orchestre", "all", "Point d'équipe.")
+        self.assertEqual(self.entries("acme-web")[-1].text, "Point d'équipe.")
+        self.assertEqual(fil.agent_project({"team": "t", "chantier": "c"}), "c")
+        self.assertEqual(fil.agent_project({"team": "t", "chantier": "c",
+                                            "canon_governed": True}), "t")
+        self.assertEqual(fil.agent_project(None), "")
+
     def test_humain_declare(self):
         humain = db_mod.connect(dataclasses.replace(self.cfg, humans="proprio"))
         try:

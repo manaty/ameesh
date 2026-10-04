@@ -710,12 +710,25 @@ def member(cfg: Config, name: str) -> str:
     return ("human:%s" if name in cfg.human_names else "agent:%s") % name
 
 
-def project_for(cfg: Config, *chantiers) -> str:
-    """Projet d'un message : chantier de l'expéditeur, du destinataire, AMEESH_PROJECT, default."""
-    for chantier in chantiers:
-        if chantier and str(chantier).strip():
-            return str(chantier).strip()
+def project_for(cfg: Config, *projects) -> str:
+    """Projet d'un message : celui de l'expéditeur, du destinataire (`agent_project`),
+    AMEESH_PROJECT, default."""
+    for project in projects:
+        if project and str(project).strip():
+            return str(project).strip()
     return cfg.project or DEFAULT_PROJECT
+
+
+def agent_project(row: dict | None) -> str:
+    """Projet du fil d'un agent (ligne du registre, avec `canon_governed`) :
+    son équipe (`team` du canon) s'il est gouverné par le canon, sinon son
+    chantier ; vide si aucun."""
+    if not row:
+        return ""
+    team = str(row.get("team") or "").strip()
+    if row.get("canon_governed") and team:
+        return team
+    return str(row.get("chantier") or "").strip()
 
 
 def _warn(text: str) -> None:
