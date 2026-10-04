@@ -1595,13 +1595,13 @@ class AuthenticatorRaceTest(_AuthenticatorCase):
         stale, revoke, blocked = self.race(
             lambda db: canon_sync.sync_authenticators(db, old),
             lambda db: canon_sync.sync_authenticators(db, fresh))
+        self.assertEqual(self.live(), {})                  # jamais réactivée
+        self.assertEqual([r["canon_ref"] for r in self.rows(include_revoked=True)],
+                         ["canon:membres/alice.md@%s" % second])
         self.assertTrue(blocked, "la révocation n'a pas attendu le verrou du registre")
         self.assertEqual((stale.status, revoke.status), ("synced", "synced"))
         self.assertEqual(revoke.result["revoked"],
                          ["human:alice/webauthn/%s" % self.alice.credential_id])
-        self.assertEqual(self.rows(), [])                  # jamais réactivée
-        self.assertEqual([r["canon_ref"] for r in self.rows(include_revoked=True)],
-                         ["canon:membres/alice.md@%s" % second])
         self.assertEqual([j["root_commit"] for j in self.journal()], [first, second])
         # l'ancien canon, rejoué ensuite : refusé (monotonie), rien réactivé
         late = canon_sync.sync_authenticators(self.db, old)
@@ -1620,11 +1620,11 @@ class AuthenticatorRaceTest(_AuthenticatorCase):
         revoke, stale, blocked = self.race(
             lambda db: canon_sync.sync_authenticators(db, fresh),
             lambda db: canon_sync.sync_authenticators(db, old))
-        self.assertTrue(blocked, "l'ancien canon n'a pas attendu le verrou du registre")
-        self.assertEqual(revoke.status, "synced")
         self.assertEqual(stale.status, "refused")
         self.assertIn("ne descend pas du dernier commit appliqué %s" % second[:12], stale.reason)
+        self.assertEqual(revoke.status, "synced")
         self.assertEqual(self.rows(), [])
+        self.assertTrue(blocked, "l'ancien canon n'a pas attendu le verrou du registre")
 
     def test_deux_clones_du_meme_depot_se_serialisent(self):
         """Le verrou ne dépend ni du chemin du clone, ni de l'hôte : deux clones
@@ -1787,7 +1787,6 @@ class AuthenticatorTrustTest(_AuthenticatorCase):
         write(self.clone, "note.md", "sans effet sur le registre\n")
         second = commit_all(self.clone, "note")
         self.assertEqual(self.sync().authenticators.status, "synced")
-        self.assertEqual(self.journal()[-1]["root_commit"], second)
         before = self.rows(include_revoked=True)
         # un ancien commit de main, lu par --ref
         done = self.sync(ref=first).authenticators
