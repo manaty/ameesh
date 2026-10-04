@@ -22,3 +22,4 @@
 * [Catalogue et évaluation des modèles](0020-catalogue-et-evaluation-des-modeles.md) - Lister, découvrir, évaluer les modèles pour guider le routage modèle/effort.
 * [Catalogue des harnais](0021-catalogue-des-harnais.md) - Harnais décrits, certifiés et évalués par un service central au lieu d'être codés en dur.
 * [Auto-réparation des bugs](0022-auto-reparation.md) - Signaux, triage au canon, réparation, vérification, livraison, surveillance.
+* [Critère d'adoption des réglages](0023-critere-d-adoption-des-reglages.md) - Gain significatif de délai ou de coût, sans perte de qualité globale après revue et recette.
