@@ -284,7 +284,11 @@ def _canonical_rev(canon: Canon, source: canon_mod.Source) -> str:
 
 def _off_branch(canon: Canon) -> list[str]:
     """Sources lues à un commit absent de leur branche canonique distante
-    (§4.1 : un tel commit est ignoré ; ex. `--ref` sur un commit local)."""
+    (§4.1 : un tel commit est ignoré ; ex. `--ref` sur un commit local, ou
+    sur une branche de PR poussée mais pas fusionnée). La branche canonique
+    est celle du manifeste (sinon origin/main) : `--ref` / AMEESH_CANON_REF
+    choisit ce qu'on lit, jamais ce qui fait foi pour le registre de
+    confiance."""
     problems = []
     for source in canon.sources:
         if source.mode != "git":

@@ -1429,6 +1429,18 @@ class AuthenticatorSyncTest(_TmpMixin, PgTestCase):
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("authentificateurs : REFUSÉ", proc.stdout)
         self.assertEqual(self.rows(), before)
+        # une branche de PR poussée sur le dépôt, pas fusionnée : refusée aussi
+        git(self.clone, "push", "-q", "origin", "HEAD:refs/heads/pr-1")
+        git(self.clone, "fetch", "-q", "origin")
+        done = self.sync(ref="origin/pr-1").authenticators
+        self.assertEqual(done.status, "refused")
+        self.assertEqual(self.rows(), before)
+        # fusionnée sur la branche canonique : lue
+        git(self.clone, "push", "-q", "origin", "HEAD:main")
+        git(self.clone, "fetch", "-q", "origin")
+        self.assertEqual(self.sync(ref="origin/pr-1").authenticators.status, "synced")
+        self.assertEqual({r["credential_id"] for r in self.rows()},
+                         {self.alice2.credential_id, self.bruno.credential_id})
 
     def test_hote_en_retard_ne_reactive_rien(self):
         """Deux hôtes, une base : celui qui n'a pas vu le retrait ne le défait pas."""

@@ -315,6 +315,7 @@ def _attach(db: Db, action: dict, raw: bytes, args: argparse.Namespace) -> dict:
 def _write_private(path: str, data: bytes) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags, 0o600)
+    os.fchmod(fd, 0o600)             # un fichier déjà là garde sinon ses permissions
     with os.fdopen(fd, "wb") as fh:
         fh.write(data)
 
