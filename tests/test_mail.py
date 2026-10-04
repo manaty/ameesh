@@ -2,6 +2,7 @@
 """Boîte aux lettres : dépôt, lecture, remise, LISTEN/NOTIFY."""
 from __future__ import annotations
 
+import json
 import time
 import unittest
 
@@ -13,6 +14,28 @@ from .support import PgTestCase
 
 
 class MailTest(PgTestCase):
+    def _notifications(self, listener, to: str, count: int = 1, mid: int | None = None,
+                       timeout: float = 5.0) -> list[dict]:
+        """Notifications de CE schéma : le canal LISTEN/NOTIFY est global à la
+        base, des suites concurrentes y déposent leurs propres messages — on
+        filtre sur le destinataire (et l'id quand il est connu)."""
+        trouves: list[dict] = []
+        deadline = time.monotonic() + timeout
+        while len(trouves) < count and time.monotonic() < deadline:
+            item = listener.wait(timeout=1.0)
+            if not item or not item.get("channel"):
+                continue
+            try:
+                charge = json.loads(item["payload"])
+            except ValueError:
+                continue
+            if charge.get("to") != to:
+                continue
+            if mid is not None and int(charge.get("id", 0)) != mid:
+                continue
+            trouves.append(charge)
+        return trouves
+
     def test_envoi_lecture_remise(self):
         registry.upsert(self.db, "beta", harness="codex", host="autre")
         message_id = mail.send(self.db, "alpha", "beta", "bonjour beta", host="laptop")
@@ -66,16 +89,9 @@ class MailTest(PgTestCase):
         try:
             time.sleep(0.6)  # laisser LISTEN s'établir (pilote psql : ~0,5 s)
             mail.send(self.db, "alpha", "beta", "réveille-toi", host="laptop")
-            deadline = time.monotonic() + 5.0
-            recu = None
-            while time.monotonic() < deadline and recu is None:
-                recu = listener.wait(timeout=1.0)
-            self.assertIsNotNone(recu, "aucune notification reçue")
-            self.assertEqual(recu["channel"], "agent_mail")
-            import json as _json
-            charge = _json.loads(recu["payload"])
-            self.assertEqual(charge["to"], "beta")
-            self.assertEqual(int(charge["id"]), 1)
+            charges = self._notifications(listener, "beta", mid=1)
+            self.assertEqual(len(charges), 1, "aucune notification reçue pour beta")
+            self.assertEqual(int(charges[0]["id"]), 1)
         finally:
             listener.close()
 
@@ -86,13 +102,8 @@ class MailTest(PgTestCase):
             time.sleep(0.6)
             for index in range(3):
                 mail.send(self.db, "alpha", "beta", "message %d" % index)
-            payloads = []
-            deadline = time.monotonic() + 5.0
-            while len(payloads) < 3 and time.monotonic() < deadline:
-                item = listener.wait(timeout=1.0)
-                if item and item.get("channel"):
-                    payloads.append(item["payload"])
-            self.assertEqual(len(payloads), 3)
+            charges = self._notifications(listener, "beta", count=3)
+            self.assertEqual(len(charges), 3)
         finally:
             listener.close()
 
