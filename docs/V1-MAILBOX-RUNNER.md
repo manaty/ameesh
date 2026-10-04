@@ -418,9 +418,15 @@ les sessions réelles.
 * **L'autorité du propriétaire (R4)** et **`mesh list`** sont traités dans
   [`V1-AUTORITE-MESH.md`](V1-AUTORITE-MESH.md) (points 3 à 5), avec
   `signing.py`, `authority.py` et `mesh_cli.py`.
-* **Budget (L13, 0019)** : chaque tour terminé écrit une ligne `turn_costs`
-  (comptabilité par tour, L12) ; un échec d'écriture n'est pas fatal au tour
-  mais **suspend les suivants** (fail-closed : pas de dépense en aveugle).
+* **Budget (L13, 0019)** : chaque tour écrit une ligne `turn_costs`
+  (comptabilité par tour, L12). Le travail comptable d'un tour est marqué
+  **en base** (`spend_pending`, migration 0025) avant le lancement : une ligne
+  présente, illisible ou incohérente au redémarrage = **pause comptable**
+  (fail-closed), la ligne n'étant effacée qu'après une écriture réussie ; si le
+  marqueur ne peut pas être posé, le tour ne démarre pas. Le modèle facturé est
+  la **source du tour** : le modèle annoncé par le flux du harnais, sinon celui
+  figé au lancement dans le marqueur ; s'il est inconnu, on facture le tarif le
+  plus cher connu de la famille (`deepseek-pro` pour DeepSeek), jamais le défaut.
   Avant chaque tour, la garde interroge `CostBook.over` : plafond horaire
   glissant de l'usage **payé au token** (`AMEESH_BUDGET_USD_PER_HOUR`, défaut
   10 $/h ; le forfait Claude/Codex n'entre pas dans cette somme) et garde de

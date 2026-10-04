@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import cost, registry
+from ameesh import cost, db as db_mod, registry
 from ameesh.adapters import adapter_for
 from ameesh.runner import AgentWorker, Runner
 
@@ -84,12 +84,9 @@ class BudgetGateTest(PgTestCase):
         # d'un grand livre propre pour que chaque cas soit isolé, et on efface
         # un éventuel marqueur de comptabilité laissé par un test précédent.
         self.db.execute("DELETE FROM turn_costs")
+        self.db.execute("DELETE FROM spend_pending WHERE agent = %s", (name,))
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
-        try:
-            os.unlink(os.path.join(cfg.agent_dir(name), "compta-pending.json"))
-        except OSError:
-            pass
         self.register(name, harness, cwd=cwd)
         lease = registry.claim(self.db, name, runner.runner_id, 3600)
         return runner, AgentWorker(runner, registry.get(self.db, name), lease)
@@ -209,12 +206,56 @@ class BudgetGateTest(PgTestCase):
                 "usage": {"inputTokens": 1_000_000, "cacheReadTokens": 0,
                           "outputTokens": 0},
             }) + "\n")
-        worker._enregistre_cout(0, "tour", None, model="deepseek-pro")
+        self.assertTrue(worker._compta_marque(0, "tour", "deepseek-pro"))
+        worker._compta_termine()
         ligne = self.db.query(
             "select model, usd from turn_costs where agent = 'budget' "
             "order by id desc limit 1")[0]
         self.assertEqual(ligne["model"], "deepseek-pro")
         # barème pro : 1 M de jetons d'entrée = 0,55 $ (le défaut serait 0,27 $)
+        self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
+
+    def test_modele_inconnu_facture_le_plus_cher(self):
+        """B4 (arbitrage mesh-design) : un modèle inconnu (vide) facture le
+        tarif le plus cher connu de la famille, jamais le défaut, et ne suit
+        pas un état local modifié pendant le tour."""
+        runner, worker = self._worker(plafond=10.0, harness="deepseek")
+        with open(worker._path("events.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "type": "status", "phase": "step_end",
+                "usage": {"inputTokens": 1_000_000, "cacheReadTokens": 0,
+                          "outputTokens": 0},
+            }) + "\n")
+        self.assertTrue(worker._compta_marque(0, "tour", ""))  # modèle inconnu
+        os.makedirs(worker.state_dir, exist_ok=True)
+        with open(os.path.join(worker.state_dir, "model"), "w", encoding="utf-8") as fh:
+            fh.write("deepseek-pro\n")  # état modifié pendant le tour
+        worker._compta_termine()
+        ligne = self.db.query(
+            "select model, usd from turn_costs where agent = 'budget' "
+            "order by id desc limit 1")[0]
+        self.assertEqual(ligne["model"], "inconnu")
+        # plus cher connu DeepSeek = pro : 0,55 $/M d'entrée (défaut 0,27)
+        self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
+
+    def test_modele_annonce_par_le_flux_gagne(self):
+        """B4 : le modèle annoncé par le flux du harnais est la source du tour
+        (il prime sur le marqueur figé au lancement)."""
+        runner, worker = self._worker(plafond=10.0, harness="deepseek")
+        with open(worker._path("events.jsonl"), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "session", "sessionId": "s1",
+                                 "model": "deepseek-pro"}) + "\n")
+            fh.write(json.dumps({
+                "type": "status", "phase": "step_end",
+                "usage": {"inputTokens": 1_000_000, "cacheReadTokens": 0,
+                          "outputTokens": 0},
+            }) + "\n")
+        self.assertTrue(worker._compta_marque(0, "tour", ""))
+        worker._compta_termine("deepseek-pro")
+        ligne = self.db.query(
+            "select model, usd from turn_costs where agent = 'budget' "
+            "order by id desc limit 1")[0]
+        self.assertEqual(ligne["model"], "deepseek-pro")
         self.assertAlmostEqual(float(ligne["usd"]), 0.55, places=6)
 
     def test_suspension_durable_et_reparation_avant_reprise(self):
@@ -228,7 +269,7 @@ class BudgetGateTest(PgTestCase):
                                side_effect=RuntimeError("disque plein")):
                 worker.run_turn({"kind": "prompt", "prompt": "tour", "ids": []})
             self.assertTrue(worker._compta_en_echec)
-            self.assertTrue(os.path.exists(worker._compta_chemin()))
+            self.assertIsNotNone(registry.pending_spend_get(self.db, "budget"))
             # redémarrage : même agent, même bail, nouveau worker
             worker2 = AgentWorker(runner, registry.get(self.db, "budget"), {
                 "lease_epoch": worker.epoch,
@@ -240,10 +281,52 @@ class BudgetGateTest(PgTestCase):
                 self.assertFalse(worker2.budget_ok())  # réparation impossible
             # réparation : l'écriture en attente est rejouée, puis la reprise
             self.assertTrue(worker2.budget_ok())
-            self.assertFalse(os.path.exists(worker2._compta_chemin()))
+            self.assertIsNone(registry.pending_spend_get(self.db, "budget"))
             lignes = self.db.query(
                 "select count(*)::int as n from turn_costs where agent = 'budget'")[0]["n"]
             self.assertEqual(lignes, 1)
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_ligne_comptable_presente_ou_incoherente_suspend(self):
+        """Verdict L13 B5 (état en base) : une ligne présente suspend un nouveau
+        worker ; une ligne incohérente (index négatif) ne peut pas être réparée
+        et reste bloquante — jamais d'autorisation."""
+        runner, worker = self._worker(plafond=10.0, harness="claude")
+        self.assertTrue(registry.pending_spend_put(self.db, "budget", 0, "tour", ""))
+        worker2 = AgentWorker(runner, registry.get(self.db, "budget"), {
+            "lease_epoch": worker.epoch,
+            "lease_expires_ts": time.time() + 3600,
+        })
+        self.assertTrue(worker2._compta_en_echec, "ligne en attente non vue")
+        self.assertTrue(worker2.budget_ok())  # la réparation réussit
+        # la réparation a écrit la ligne et effacé le marqueur
+        self.assertIsNone(registry.pending_spend_get(self.db, "budget"))
+        # ligne incohérente : index négatif, réparation impossible
+        self.assertTrue(registry.pending_spend_put(self.db, "budget", -1, "tour", ""))
+        worker3 = AgentWorker(runner, registry.get(self.db, "budget"), {
+            "lease_epoch": worker.epoch,
+            "lease_expires_ts": time.time() + 3600,
+        })
+        self.assertTrue(worker3._compta_en_echec)
+        self.assertFalse(worker3.budget_ok())
+        self.assertIsNotNone(registry.pending_spend_get(self.db, "budget"))
+
+    def test_marqueur_non_pose_refuse_le_tour(self):
+        """Verdict L13 B5 : si la trace comptable ne peut pas être posée en
+        base, le tour ne démarre pas (aucune dépense à l'aveugle)."""
+        runner, worker = self._worker(plafond=10.0, harness="claude")
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log}
+        try:
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch("ameesh.registry.pending_spend_put",
+                               side_effect=db_mod.DbError("base indisponible")):
+                self.assertFalse(worker.run_turn(
+                    {"kind": "prompt", "prompt": "tour", "ids": []}))
+            self.assertTrue(worker._compta_en_echec)
+            self.assertIsNone(registry.pending_spend_get(self.db, "budget"))
+            self.assertEqual(self.db.query(
+                "select count(*)::int as n from turn_costs")[0]["n"], 0)
         finally:
             worker.watchdog_stop.set()
 

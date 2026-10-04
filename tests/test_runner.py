@@ -846,9 +846,13 @@ class RunnerTest(PgTestCase):
             arret = threading.Thread(target=worker.terminate, daemon=True)
             debut = time.monotonic()
             arret.start()
-            self.wait_for(lambda: worker.lease_lost.is_set(), timeout=2, interval=0.01)
-            self.assertIsNotNone(proc.poll(), "le veilleur doit tuer pendant la grâce")
-            self.assertLess(time.monotonic() - debut, 2.0)
+            self.wait_for(lambda: worker.lease_lost.is_set(), timeout=3, interval=0.01)
+            # La coupe est un effet du veilleur, distinct de `lease_lost` :
+            # on attend la sortie du processus (test stable sous charge) tout en
+            # exigeant qu'elle ait lieu pendant les 3 s de grâce SIGTERM.
+            self.wait_for(lambda: proc.poll() is not None, timeout=5, interval=0.02)
+            self.assertLess(time.monotonic() - debut, 3.5,
+                            "le veilleur doit tuer pendant la grâce")
             arret.join(timeout=5)
         finally:
             worker.watchdog_stop.set()

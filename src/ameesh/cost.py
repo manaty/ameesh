@@ -154,11 +154,36 @@ def load_prices(path: str | None = None) -> dict:
     return prices
 
 
+#: familles de modèles par harnais (préfixes de clés du barème) : sert au
+#: repli fail-closed « tarif le plus cher connu du fournisseur » (0019 §3).
+PRICE_FAMILY = {
+    "deepseek": ("deepseek-",),
+    "codex": ("gpt-", "codex-"),
+    "claude": ("claude-",),
+}
+
+
 def price_of(prices: dict, harness: str, model: str | None) -> list:
     """Le triplet de prix d'un modèle, avec le repli par harnais."""
     if model and model in prices:
         return prices[model]
     return prices.get("default-%s" % harness) or prices["default-deepseek"]
+
+
+def max_price_of(prices: dict, harness: str) -> list:
+    """Le tarif le plus cher **connu** de la famille du harnais.
+
+    Un modèle inconnu (ou vide) ne doit jamais être facturé au tarif par défaut,
+    qui est le moins cher : on prend le plus cher de la famille, pour ne jamais
+    sous-estimer une dépense (0019 §3, repli fail-closed).
+    """
+    prefixes = PRICE_FAMILY.get(harness, ())
+    candidats = [value for key, value in prices.items()
+                 if value and not key.startswith("default-")
+                 and any(key.startswith(prefixe) for prefixe in prefixes)]
+    if not candidats:
+        return prices.get("default-%s" % harness) or prices["default-deepseek"]
+    return max(candidats, key=lambda triplet: triplet[0])
 
 
 class CostBook:
@@ -401,9 +426,19 @@ class CostBook:
         """
         harness = self.tool_of(agent)
         # Le modèle **effectif du lancement** est passé par l'exécuteur ; le
-        # relire ici prendrait un fichier d'état mutable (verdict codex3 L13 B4).
-        model = model or self.model_of(agent)
+        # relire ici prendrait un fichier d'état mutable (verdicts codex3 L13 B4).
+        # `None` = paramètre absent (repli historique sur l'état local) ;
+        # `""` = aucun modèle annoncé/figé : on facture le **plus cher connu** de
+        # la famille, jamais le défaut (mesh-design, 0019 §3, fail-closed).
+        if model is None:
+            model = self.model_of(agent)
         prices = load_prices(self.prices_path)
+        if model and model in prices:
+            pin, pcache, pout = prices[model]
+            modele = model
+        else:
+            pin, pcache, pout = max_price_of(prices, harness or "deepseek")
+            modele = model or "inconnu"
         events = self.events(agent, start)
         # La session se résout AVANT le repère : c'est elle qui dit lequel comparer.
         session = session or self.session_of(agent)
@@ -426,7 +461,7 @@ class CostBook:
                 if usd < 0:  # session reprise : le cumul repart de plus bas
                     usd = float(totals[-1])
             return TurnUsage(
-                agent, harness, model or "défaut", max(usd, 0.0),
+                agent, harness, modele, max(usd, 0.0),
                 input_tokens=_sum(usage, "input_tokens"),
                 cached_input_tokens=_sum(usage, "cache_read_input_tokens"),
                 output_tokens=_sum(usage, "output_tokens"),
@@ -435,7 +470,7 @@ class CostBook:
         if harness == "codex":
             completed = [e.get("usage") or {} for e in events if e.get("type") == "turn.completed"]
             if not completed:
-                return TurnUsage(agent, harness, model or "défaut", 0.0)
+                return TurnUsage(agent, harness, modele, 0.0)
             last = completed[-1]
             current = [int(last.get("input_tokens", 0)), int(last.get("cached_input_tokens", 0)),
                        int(last.get("output_tokens", 0))]
@@ -449,10 +484,9 @@ class CostBook:
                 delta = current
             else:
                 delta = [0, 0, 0]
-            pin, pcache, pout = price_of(prices, harness, model)
             uncached = max(delta[0] - delta[1], 0)
             usd = (uncached * pin + delta[1] * pcache + delta[2] * pout) / 1e6
-            return TurnUsage(agent, harness, model or "défaut", usd,
+            return TurnUsage(agent, harness, modele, usd,
                              input_tokens=delta[0], cached_input_tokens=delta[1],
                              output_tokens=delta[2])
 
@@ -462,9 +496,8 @@ class CostBook:
         tin = _sum(steps, "inputTokens")
         tcache = _sum(steps, "cacheReadTokens")
         tout = _sum(steps, "outputTokens")
-        pin, pcache, pout = price_of(prices, harness or "deepseek", model)
         usd = (tin * pin + tcache * pcache + tout * pout) / 1e6
-        return TurnUsage(agent, harness or "deepseek", model or "défaut", usd,
+        return TurnUsage(agent, harness or "deepseek", modele, usd,
                          input_tokens=tin, cached_input_tokens=tcache, output_tokens=tout)
 
     def record(self, agent: str, start: int = 0, turn: str | None = None,

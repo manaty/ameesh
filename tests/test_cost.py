@@ -421,13 +421,16 @@ class CostDbTest(Sandbox, PgTestCase):
                                  "usage": {"inputTokens": 1_000_000, "cacheReadTokens": 0,
                                            "outputTokens": 0}})
         usage = book.record("a1", turn="t-1")
-        self.assertAlmostEqual(usage.usd, 0.27)
-        self.assertAlmostEqual(book.spent("a1", 3600), 0.27)
-        self.assertAlmostEqual(book.spent("all", 3600), 0.27)
+        # modèle inconnu (aucun état) : tarif le plus cher connu de la famille
+        # DeepSeek (0019 §3, repli fail-closed appliqué par L13)
+        self.assertEqual(usage.model, "inconnu")
+        self.assertAlmostEqual(usage.usd, 0.55)
+        self.assertAlmostEqual(book.spent("a1", 3600), 0.55)
+        self.assertAlmostEqual(book.spent("all", 3600), 0.55)
         # hors fenêtre : la dépense d'il y a plus d'une heure ne compte plus
         self.db.execute("update turn_costs set recorded_at = now() - interval '2 hours'")
         self.assertEqual(book.spent("all", 3600), 0.0)
-        self.assertAlmostEqual(book.spent("all", 86400), 0.27)
+        self.assertAlmostEqual(book.spent("all", 86400), 0.55)
 
     def test_over_dit_le_rythme_du_forfait_puis_le_budget_horaire(self):
         book = self.book(hourly_usd=0.10)

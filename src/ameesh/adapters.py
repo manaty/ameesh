@@ -227,6 +227,8 @@ class ClaudeAdapter(HarnessAdapter):
         out: dict = {}
         if kind == "system" and event.get("subtype") == "init":
             out["session"] = event.get("session_id")
+            if event.get("model"):
+                out["model"] = event["model"]  # modèle effectif annoncé (L13 B4)
         elif kind == "assistant":
             texts = [
                 chunk.get("text", "")
@@ -258,6 +260,8 @@ class CodexAdapter(HarnessAdapter):
         out: dict = {}
         if kind == "thread.started":
             out["session"] = event.get("thread_id")
+            if event.get("model"):
+                out["model"] = event["model"]  # modèle effectif annoncé (L13 B4)
         elif kind == "item.completed":
             item = event.get("item") or {}
             if item.get("type") == "agent_message" and item.get("text"):
@@ -315,6 +319,8 @@ class DeepseekAdapter(HarnessAdapter):
         out: dict = {}
         if kind == "session":
             out["session"] = event.get("sessionId") or event.get("session_id")
+            if event.get("model"):
+                out["model"] = event["model"]  # modèle effectif annoncé (L13 B4)
         elif kind == "text":
             if event.get("text"):
                 out["display"] = [event["text"]]

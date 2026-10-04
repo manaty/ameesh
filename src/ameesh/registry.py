@@ -501,6 +501,52 @@ def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
     return bool(rows)
 
 
+def pending_spend_put(db: Db, name: str, start_index: int, turn: str | None = None,
+                      model: str | None = None) -> bool:
+    """Pose (atomiquement) le marqueur comptable d'un tour : une seule ligne."""
+    rows = db.query(
+        """
+        INSERT INTO spend_pending (agent, start_index, turn, model, created_at)
+        VALUES (%s, %s, %s, %s, now())
+        ON CONFLICT (agent) DO UPDATE SET
+            start_index = excluded.start_index,
+            turn        = excluded.turn,
+            model       = excluded.model,
+            created_at  = now()
+        RETURNING agent
+        """,
+        (name, int(start_index), turn, model),
+    )
+    return bool(rows)
+
+
+def pending_spend_get(db: Db, name: str) -> dict | None:
+    """Le marqueur comptable en attente, ou None (aucun travail suspendu)."""
+    rows = db.query(
+        """
+        SELECT agent, start_index, turn, model,
+               extract(epoch from created_at)::float8 as created_ts
+          FROM spend_pending WHERE agent = %s
+        """,
+        (name,),
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "agent": row["agent"],
+        "start": int(row["start_index"]),
+        "turn": row.get("turn") or "",
+        "model": row.get("model"),
+        "created_ts": row.get("created_ts"),
+    }
+
+
+def pending_spend_clear(db: Db, name: str) -> bool:
+    rows = db.query("DELETE FROM spend_pending WHERE agent = %s RETURNING agent", (name,))
+    return bool(rows)
+
+
 def cwd_used(db: Db, cwd: str, exclude: str) -> bool:
     """Ce dossier de travail est-il déjà celui d'un autre agent ? (0018)"""
     rows = db.query(

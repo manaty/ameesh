@@ -778,10 +778,9 @@ class AgentWorker(threading.Thread):
         if self.runner.budget_usd_per_hour <= 0:
             return True
         # Réparation d'abord : un travail comptable en attente (marqueur
-        # persistant) doit être écrit avant d'autoriser le moindre tour.
-        attente = self._compta_en_attente()
-        if attente is not None:
-            self._compta_ecrit(attente)
+        # persistant) doit être écrit avant d'autoriser le moindre tour ; un
+        # marqueur corrompu suspend au lieu d'autoriser.
+        self._compta_repare()
         raison = ("comptabilité des tours indisponible" if self._compta_en_echec
                   else self.budget_reason())
         self._budget_paused = bool(raison)
@@ -810,38 +809,60 @@ class AgentWorker(threading.Thread):
         except OSError:
             return ""
 
-    def _compta_chemin(self) -> str:
-        return self._path("compta-pending.json")
-
     def _compta_en_attente(self) -> dict | None:
-        """Le travail comptable non écrit (survit au redémarrage, L13 B5)."""
+        """Le marqueur comptable **en base** (L13 B5, arbitrage mesh-design).
+
+        L'état de pause vit dans `spend_pending`, jamais dans un fichier ni en
+        mémoire : une ligne présente, illisible ou incohérente suspend, elle
+        n'autorise jamais. Une erreur de base renvoie `{}` (doute = suspension).
+        """
         try:
-            with open(self._compta_chemin(), encoding="utf-8") as fh:
-                travail = json.load(fh)
-            return travail if isinstance(travail, dict) else None
-        except (OSError, ValueError):
-            return None
+            return registry.pending_spend_get(self.db, self.name)
+        except db_mod.DbError:
+            return {}
+
+    def _compta_marque(self, start: int, tour: str, model: str | None) -> bool:
+        """Pose le marqueur **avant** le tour, atomiquement en base (L13 B5).
+
+        Si la pose échoue, le tour ne démarre pas : aucune dépense sans trace
+        possible (fail-closed).
+        """
+        try:
+            registry.pending_spend_put(self.db, self.name, int(start), tour,
+                                       model if model is not None else "")
+            return True
+        except db_mod.DbError as exc:
+            self._compta_en_echec = True
+            log_async("[%s] marqueur de comptabilité non posé (%s) : tour refusé"
+                      % (self.name, " ".join(str(exc).split())[:160]))
+            return False
 
     def _compta_ecrit(self, travail: dict) -> bool:
-        """Écrit une ligne du grand livre, puis efface le marqueur persistant.
+        """Écrit une ligne du grand livre, puis efface le marqueur en base.
 
         Rejouable après panne : le marqueur n'est effacé qu'après une écriture
         réussie. Si l'effacement lui-même échoue, la réparation suivante peut
         écrire une ligne en double — jamais une dépense perdue en silence ; le
-        contraire (autoriser un tour sans trace) est ce que codex3 refuse.
+        contraire (autoriser un tour sans trace) est ce qu'on refuse.
         """
+        try:
+            debut = int(travail.get("start"))
+            if debut < 0:
+                raise ValueError("index négatif")
+        except (TypeError, ValueError):
+            self._compta_en_echec = True
+            return False
         try:
             book = cost_mod.CostBook(
                 state_dir=self.cfg.state_dir, db=self.db,
                 tools={self.name: self.agent.get("harness") or ""})
-            book.record(self.name, start=int(travail.get("start") or 0),
+            book.record(self.name, start=debut,
                         turn=travail.get("turn") or None,
                         session=travail.get("session") or None,
-                        model=travail.get("model") or None)
-            try:
-                os.unlink(self._compta_chemin())
-            except OSError:
-                pass
+                        # `""` = modèle inconnu : tarif le plus cher (fail-closed),
+                        # jamais un repli sur un état local mutable.
+                        model=travail.get("model"))
+            registry.pending_spend_clear(self.db, self.name)
             self._compta_en_echec = False
             return True
         except Exception as exc:  # panne non fatale au tour, mais fail-closed
@@ -850,30 +871,27 @@ class AgentWorker(threading.Thread):
                       % (self.name, " ".join(str(exc).split())[:160]))
             return False
 
-    def _enregistre_cout(self, start: int, tour: str, session_new: str | None,
-                         model: str | None = None) -> None:
-        """Comptabilité du tour dans `turn_costs` (L13, 0019 §3).
+    def _compta_repare(self) -> None:
+        """Avant un tour : rejoue le travail en attente ; `{}` suspend."""
+        travail = self._compta_en_attente()
+        if travail:
+            self._compta_ecrit(travail)
+        elif travail is not None:
+            self._compta_en_echec = True  # marqueur incohérent : jamais autoriser
 
-        Le travail est **persisté avant** l'écriture (le tour est déjà dépensé),
-        puis écrit ; un échec laisse le marqueur, donc un redémarrage sait qu'il
-        doit réparer avant d'autoriser la suite (verdict codex3 L13 B5). Le
-        modèle est celui du lancement, figé : un état local modifié depuis ne
-        fausse pas le barème (B4).
+    def _compta_termine(self, model_annonce: str | None = None) -> None:
+        """Après un tour : écrit la ligne du grand livre.
+
+        Le modèle **annoncé par le flux** du harnais prime sur celui figé au
+        lancement : c'est la source du tour (mesh-design, 0019 §3).
         """
-        travail = {
-            "start": int(start), "turn": tour,
-            "session": session_new or self.agent.get("session_id") or "",
-            "model": model or "",
-        }
-        try:
-            with open(self._compta_chemin(), "w", encoding="utf-8") as fh:
-                json.dump(travail, fh, ensure_ascii=False)
-        except OSError as exc:
+        travail = self._compta_en_attente()
+        if travail:
+            if model_annonce:
+                travail = dict(travail, model=model_annonce)
+            self._compta_ecrit(travail)
+        elif travail is not None:
             self._compta_en_echec = True
-            log_async("[%s] marqueur de comptabilité non écrit (%s) : tours suspendus"
-                      % (self.name, " ".join(str(exc).split())[:160]))
-            return
-        self._compta_ecrit(travail)
 
     def pick(self) -> dict | None:
         """Le prochain tour à faire, ou None. Consomme la consigne en attente."""
@@ -1030,10 +1048,20 @@ class AgentWorker(threading.Thread):
         except OSError:
             events_start = 0
         session_new: str | None = None
+        modele_annonce = ""  # modèle annoncé par le flux du harnais (L13 B4)
         cost: float | None = None
         error: str | None = None
         result_code = 0
         self.last_output = ""
+
+        # Marqueur comptable **avant** le lancement : si on ne peut pas garantir
+        # une trace, on ne dépense pas (fail-closed, L13 B5). Le marqueur est
+        # écrit atomiquement et lu au redémarrage ; la session sera résolue par
+        # `record` au moment de l'écriture.
+        if not self._compta_marque(events_start, label, model):
+            self.fail_turn("comptabilité indisponible",
+                           "marqueur de comptabilité non écrit")
+            return False
 
         heartbeat_done = threading.Event()
         threading.Thread(target=self._heartbeat, args=(heartbeat_done,), daemon=True).start()
@@ -1077,6 +1105,8 @@ class AgentWorker(threading.Thread):
                         session_new = parsed["session"]
                         self.write_session_file(session_new)
                         registry.set_session(self.db, self.name, session_new)
+                    if parsed.get("model"):
+                        modele_annonce = parsed["model"]  # source du tour (L13 B4)
                     for text in parsed.get("display") or []:
                         log("[%s] %s" % (self.name, text))
                         self.last_output = (self.last_output + "\n" + text)[-4000:]
@@ -1110,8 +1140,8 @@ class AgentWorker(threading.Thread):
         preempte = self.preempting.is_set()
         # Comptabilité **avant** toute sortie anticipée : la dépense a eu lieu,
         # même si le bail a été perdu ou le tour préempté (L13 B1). Le modèle
-        # est celui du lancement, déjà figé dans `model` (L13 B4).
-        self._enregistre_cout(events_start, label, session_new, model=model)
+        # est celui du lancement, déjà figé dans le marqueur (L13 B4).
+        self._compta_termine(modele_annonce)
         ok = result_code == 0 and not lost and not error
         if error is None and result_code != 0:
             error = "le harnais a rendu le code %d" % result_code
