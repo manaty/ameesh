@@ -635,9 +635,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_cost = sub.add_parser("cost", help="coût des tours et jauges de forfait (L12)")
     cost_sub = p_cost.add_subparsers(dest="cost_command")
     pc_rep = cost_sub.add_parser("report", help="tableau : agent, harnais, modèle, dépense, jauges")
+    # Pas d'option de fenêtre : le rapport rend 1 h et 24 h, et `cost spent <agent> [s]`
+    # couvre déjà les fenêtres libres. Une option qui ne change rien se retire.
     pc_rep.add_argument("--json", action="store_true")
-    pc_rep.add_argument("--hours", type=float, default=None,
-                        help="fenêtre du rapport, en heures (défaut : 1 h et 24 h)")
     pc_rep.set_defaults(func=cmd_cost)
     pc_spent = cost_sub.add_parser("spent", help="dépense (USD) sur une fenêtre glissante")
     pc_spent.add_argument("agent", nargs="?", default="all")
