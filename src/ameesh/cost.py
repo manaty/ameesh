@@ -390,7 +390,8 @@ class CostBook:
         """
         return _last_session(self.events(agent)) or None
 
-    def turn_usage(self, agent: str, start: int = 0, session: str | None = None) -> TurnUsage:
+    def turn_usage(self, agent: str, start: int = 0, session: str | None = None,
+                   model: str | None = None) -> TurnUsage:
         """Ce que le tour qui vient de finir a coûté, sans rien écrire.
 
         Le repère de cumul (dernier `total_cost_usd` Claude, dernier usage Codex)
@@ -399,7 +400,9 @@ class CostBook:
         l'efface pas.
         """
         harness = self.tool_of(agent)
-        model = self.model_of(agent)
+        # Le modèle **effectif du lancement** est passé par l'exécuteur ; le
+        # relire ici prendrait un fichier d'état mutable (verdict codex3 L13 B4).
+        model = model or self.model_of(agent)
         prices = load_prices(self.prices_path)
         events = self.events(agent, start)
         # La session se résout AVANT le repère : c'est elle qui dit lequel comparer.
@@ -465,7 +468,7 @@ class CostBook:
                          input_tokens=tin, cached_input_tokens=tcache, output_tokens=tout)
 
     def record(self, agent: str, start: int = 0, turn: str | None = None,
-               session: str | None = None) -> TurnUsage:
+               session: str | None = None, model: str | None = None) -> TurnUsage:
         """Compte le tour qui vient de finir : **une** ligne `turn_costs`.
 
         La ligne porte le cumul brut du harnais, qui sert de repère au tour
@@ -481,7 +484,7 @@ class CostBook:
         # **Résolue une fois**, sur tout le flux, puis transmise au calcul comme à
         # l'insertion : la ligne et le repère doivent porter la même session.
         session_id = session or self.session_of(agent)
-        usage = self.turn_usage(agent, start, session=session_id)
+        usage = self.turn_usage(agent, start, session=session_id, model=model)
         cum_usd = cum_input = cum_cached = cum_out = None
         if usage.harness == "claude":
             totals = [float(e["total_cost_usd"]) for e in events

@@ -173,8 +173,9 @@ class AgentWorker(threading.Thread):
         self._budget_next_check = 0.0
         self._budget_paused = False
         self._budget_reason = ""
-        #: la comptabilité du dernier tour a échoué : plus de tour à l'aveugle
-        self._compta_en_echec = False
+        #: la comptabilité du dernier tour a échoué : plus de tour à l'aveugle.
+        #: Un marqueur persistant rend la suspension durable au redémarrage (B5).
+        self._compta_en_echec = self._compta_en_attente() is not None
         #: rotation de session (0018) : compteurs de la session courante
         self.resume_summary = ""
         self.session_turns = 0
@@ -776,6 +777,11 @@ class AgentWorker(threading.Thread):
         """
         if self.runner.budget_usd_per_hour <= 0:
             return True
+        # Réparation d'abord : un travail comptable en attente (marqueur
+        # persistant) doit être écrit avant d'autoriser le moindre tour.
+        attente = self._compta_en_attente()
+        if attente is not None:
+            self._compta_ecrit(attente)
         raison = ("comptabilité des tours indisponible" if self._compta_en_echec
                   else self.budget_reason())
         self._budget_paused = bool(raison)
@@ -804,24 +810,70 @@ class AgentWorker(threading.Thread):
         except OSError:
             return ""
 
-    def _enregistre_cout(self, start: int, tour: str, session_new: str | None) -> None:
-        """Comptabilité du tour dans `turn_costs` (L13, 0019 §3).
+    def _compta_chemin(self) -> str:
+        return self._path("compta-pending.json")
 
-        C'est le grand livre que lit la garde de budget : sans écriture,
-        l'exécuteur dépenserait en aveugle. Un échec n'est pas fatal au tour,
-        mais il suspend les suivants (`_compta_en_echec`), fail-closed.
+    def _compta_en_attente(self) -> dict | None:
+        """Le travail comptable non écrit (survit au redémarrage, L13 B5)."""
+        try:
+            with open(self._compta_chemin(), encoding="utf-8") as fh:
+                travail = json.load(fh)
+            return travail if isinstance(travail, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def _compta_ecrit(self, travail: dict) -> bool:
+        """Écrit une ligne du grand livre, puis efface le marqueur persistant.
+
+        Rejouable après panne : le marqueur n'est effacé qu'après une écriture
+        réussie. Si l'effacement lui-même échoue, la réparation suivante peut
+        écrire une ligne en double — jamais une dépense perdue en silence ; le
+        contraire (autoriser un tour sans trace) est ce que codex3 refuse.
         """
         try:
             book = cost_mod.CostBook(
                 state_dir=self.cfg.state_dir, db=self.db,
                 tools={self.name: self.agent.get("harness") or ""})
-            session = session_new or self.agent.get("session_id") or None
-            book.record(self.name, start=start, turn=tour, session=session)
+            book.record(self.name, start=int(travail.get("start") or 0),
+                        turn=travail.get("turn") or None,
+                        session=travail.get("session") or None,
+                        model=travail.get("model") or None)
+            try:
+                os.unlink(self._compta_chemin())
+            except OSError:
+                pass
             self._compta_en_echec = False
-        except Exception as exc:  # une panne de comptabilité ne tue pas le tour
+            return True
+        except Exception as exc:  # panne non fatale au tour, mais fail-closed
             self._compta_en_echec = True
             log_async("[%s] comptabilité du tour en échec (%s) : tours suspendus"
                       % (self.name, " ".join(str(exc).split())[:160]))
+            return False
+
+    def _enregistre_cout(self, start: int, tour: str, session_new: str | None,
+                         model: str | None = None) -> None:
+        """Comptabilité du tour dans `turn_costs` (L13, 0019 §3).
+
+        Le travail est **persisté avant** l'écriture (le tour est déjà dépensé),
+        puis écrit ; un échec laisse le marqueur, donc un redémarrage sait qu'il
+        doit réparer avant d'autoriser la suite (verdict codex3 L13 B5). Le
+        modèle est celui du lancement, figé : un état local modifié depuis ne
+        fausse pas le barème (B4).
+        """
+        travail = {
+            "start": int(start), "turn": tour,
+            "session": session_new or self.agent.get("session_id") or "",
+            "model": model or "",
+        }
+        try:
+            with open(self._compta_chemin(), "w", encoding="utf-8") as fh:
+                json.dump(travail, fh, ensure_ascii=False)
+        except OSError as exc:
+            self._compta_en_echec = True
+            log_async("[%s] marqueur de comptabilité non écrit (%s) : tours suspendus"
+                      % (self.name, " ".join(str(exc).split())[:160]))
+            return
+        self._compta_ecrit(travail)
 
     def pick(self) -> dict | None:
         """Le prochain tour à faire, ou None. Consomme la consigne en attente."""
@@ -1057,8 +1109,9 @@ class AgentWorker(threading.Thread):
         lost = self.lease_lost.is_set()
         preempte = self.preempting.is_set()
         # Comptabilité **avant** toute sortie anticipée : la dépense a eu lieu,
-        # même si le bail a été perdu ou le tour préempté (L13 B1).
-        self._enregistre_cout(events_start, label, session_new)
+        # même si le bail a été perdu ou le tour préempté (L13 B1). Le modèle
+        # est celui du lancement, déjà figé dans `model` (L13 B4).
+        self._enregistre_cout(events_start, label, session_new, model=model)
         ok = result_code == 0 and not lost and not error
         if error is None and result_code != 0:
             error = "le harnais a rendu le code %d" % result_code
