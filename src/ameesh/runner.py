@@ -982,11 +982,11 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
             try:
                 expires = registry.renew(db, name, owner, epoch, ttl)
             except db_mod.DbError as exc:
-                log("[%s] attach : renouvellement en échec (%s)" % (name, exc))
+                log_async("[%s] attach : renouvellement en échec (%s)" % (name, exc))
                 continue
             if expires is None:
-                log("[%s] attach : bail perdu" % name)
-                perdu.set()
+                perdu.set()  # couper d'abord : le journal ne doit jamais retarder l'arrêt
+                log_async("[%s] attach : bail perdu" % name)
                 return
             etat["deadline"] = float(expires)
 
@@ -995,14 +995,22 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
 
         Verdict L8 B2 : sans veilleur, une erreur SQL de renouvellement laissait
         la session vivante après l'expiration, pendant qu'un remplaçant
-        réclamait l'agent. Le veilleur ne fait aucune E/S : il lit l'échéance et
-        l'heure, et coupe.
+        réclamait l'agent. Le veilleur ne fait **aucune E/S** : il lit l'échéance
+        et l'heure, pose `perdu` (donc la coupe), et ne journalise qu'ensuite,
+        par le journal asynchrone borné — un `print` synchrone sur un tube plein
+        bloquerait le chemin d'arrêt (sonde codex3 du 04:42). L'attente est
+        bornée par l'échéance, comme le veilleur d'`AgentWorker`.
         """
-        while not stop.wait(0.2):
-            if etat["deadline"] > 0 and time.time() >= etat["deadline"]:
-                log("[%s] attach : échéance du bail atteinte, arrêt du harnais" % name)
+        while not stop.is_set():
+            if etat["deadline"] <= 0:
+                stop.wait(0.5)
+                continue
+            reste = etat["deadline"] - time.time()
+            if reste <= 0:
                 perdu.set()
+                log_async("[%s] attach : échéance du bail atteinte, arrêt du harnais" % name)
                 return
+            stop.wait(max(0.05, min(0.5, reste)))
 
     thread = threading.Thread(target=battement, daemon=True, name="%s-attach" % name)
     thread.start()
@@ -1019,10 +1027,14 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     try:
         log("[%s] session interactive : %s" % (name, " ".join(argv)))
         proc = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True)
+        # Course de publication (même correctif que B5a-P) : le veilleur a pu
+        # conclure pendant que ce Popen n'était pas encore publié.
+        if etat["deadline"] > 0 and time.time() >= etat["deadline"]:
+            perdu.set()
         while proc.poll() is None:
             if perdu.is_set():
-                log("[%s] attach : bail perdu, arrêt du harnais" % name)
-                _kill_group(proc)
+                _kill_group(proc)  # couper d'abord, journaliser ensuite
+                log_async("[%s] attach : bail perdu, arrêt du harnais" % name)
                 break
             time.sleep(0.2)
         code = proc.wait()

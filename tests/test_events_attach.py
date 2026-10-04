@@ -205,6 +205,36 @@ class AttachTest(PgTestCase):
         self.assertLess(ecoule, 7.5, "la session interactive a survécu à l'échéance")
         self.assertLess(code, 0, "le harnais devait être tué à l'échéance")
 
+    def test_attach_coupe_sans_journal_sur_le_chemin_d_arret(self):
+        """Sonde codex3 du 04:42 : un journal synchrone bloqué (tube plein) ne
+        doit pas retarder l'arrêt du harnais — le veilleur pose `perdu` avant de
+        journaliser, et le fil principal coupe avant de journaliser."""
+        self._agent("att")
+        env = dict(self._env(), AMEESH_TEST_SLEEP="8")
+
+        def faux_log(message, *args, **kwargs):
+            if "échéance" in str(message) or "bail perdu" in str(message):
+                time.sleep(30)  # simule un tube saturé
+
+        resultat: list = []
+
+        def lance() -> None:
+            with mock.patch.dict(os.environ, env, clear=False), \
+                    mock.patch.object(registry, "renew",
+                                      side_effect=db_mod.DbError("panne SQL")), \
+                    mock.patch("ameesh.runner.log", side_effect=faux_log):
+                resultat.append(run_attach(self.cfg, self.db, "att", ttl=5))
+
+        debut = time.monotonic()
+        thread = threading.Thread(target=lance, daemon=True)
+        thread.start()
+        thread.join(timeout=12)
+        ecoule = time.monotonic() - debut
+        self.assertFalse(thread.is_alive(),
+                         "le chemin d'arrêt a été bloqué par un journal synchrone")
+        self.assertLess(ecoule, 8.0)
+        self.assertTrue(resultat and resultat[0] < 0)
+
     def test_attach_owner_est_attache_a_l_hote(self):
         self.assertTrue(attach_owner("laptop").startswith("attach:"))
         self.assertTrue(attach_owner("laptop").endswith("@laptop"))
