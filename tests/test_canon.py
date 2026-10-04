@@ -897,6 +897,28 @@ class CanonStateTest(_CanonDbCase):
         self.assertIsNotNone(registry.claim(self.db, "orchestre", "runner-y", 600))
         self.assertEqual(self.row("orchestre")["session_id"], "sess-orchestre")
 
+    @unittest.skipIf(os.geteuid() == 0, "root ignore les permissions")
+    def test_permission_refusee_ferme_la_reclamation(self):
+        # revue codex2 (B1 bis) : une PermissionError réelle sur la racine du
+        # canon doit fermer la réclamation comme une racine absente.
+        self.git_sync()
+        self.assertEqual(self.claimable(require_responsible=True), ["orchestre", "relecteur"])
+        mode = os.stat(self.clone).st_mode
+        os.chmod(self.clone, 0)
+        try:
+            exc = self.break_canon()
+        finally:
+            os.chmod(self.clone, mode)
+        self.assertIsInstance(exc, canon.CanonError)
+        state = canon_sync.state(self.db, "atelier")
+        self.assertEqual(state["status"], "unreadable")
+        self.assertEqual(self.claimable(require_responsible=True), [])
+        self.assertEqual(self.claimable(require_responsible=False), [])
+        self.assertIsNone(registry.claim(self.db, "orchestre", "runner-y", 600))
+        # permissions rétablies + sync : de nouveau réclamables
+        self.assertEqual(self.git_sync().status, "ok")
+        self.assertEqual(self.claimable(require_responsible=True), ["orchestre", "relecteur"])
+
     def test_revision_introuvable(self):
         self.git_sync()
         with self.assertRaises(canon_sync.CanonUnreadable):

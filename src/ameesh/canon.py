@@ -914,6 +914,11 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
         raise GitError("git introuvable") from exc
     except subprocess.TimeoutExpired as exc:
         raise GitError("git %s : délai dépassé" % args[0]) from exc
+    except OSError as exc:
+        # Dossier du dépôt inaccessible (permission refusée, n'est plus un
+        # dossier…) : le canon est illisible, jamais une exception qui
+        # empêcherait « canon sync » d’enregistrer l’état fermé.
+        raise GitError("git %s : %s" % (args[0], exc.strerror or exc)) from exc
 
 
 def _git_out(repo: str, *args: str) -> str | None:
@@ -1501,6 +1506,12 @@ def load(root: str, *, ref: str = "", untrusted: bool = False, fetch: bool = Fal
         return loader.load()
     except GitError as exc:
         loader.add("canon-git-error", ERROR, "lecture du canon : %s" % exc)
+        loader.canon.readable = False
+        return loader.canon
+    except OSError as exc:
+        # Lecture refusée ou impossible (permissions, fichier disparu) : même
+        # traitement fail-closed qu'une erreur git.
+        loader.add("canon-io-error", ERROR, "lecture du canon : %s" % (exc.strerror or exc))
         loader.canon.readable = False
         return loader.canon
 
