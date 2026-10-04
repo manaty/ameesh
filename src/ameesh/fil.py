@@ -11,7 +11,9 @@ les humains, y compris pour les échanges d'agent à agent (décision 0006).
 * `Transport` : `post(thread, entry) -> id externe`, `read(thread, since)`.
   Transport v1 : `file`, un fichier Markdown par fil sous `AMEESH_THREADS`
   (défaut `<état>/fils/<projet>/<lot ou _projet>.md`), en ajout seulement,
-  une entrée complète écrite d'un bloc sous verrou `flock`.
+  une entrée complète écrite d'un bloc sous verrou `flock`. La racine est de
+  confiance ; sous elle, chaque dossier et chaque fichier est ouvert par un
+  descripteur ancré sur son parent, sans jamais suivre de lien symbolique.
 
 Une écriture de fil qui échoue ne fait JAMAIS perdre le message : `record()`
 ne lève pas, il le dit sur stderr, et le message reste dans la boîte.
@@ -33,15 +35,17 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import errno
 import fcntl
 import json
 import os
 import re
+import stat
 import sys
 import time
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Iterable, Iterator, Protocol, Sequence
+from typing import Iterable, Protocol, Sequence
 
 from .config import Config
 
@@ -317,8 +321,39 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+#: un lien symbolique ouvert avec O_NOFOLLOW (ELOOP), ou un lien / un fichier là
+#: où un dossier est attendu avec O_DIRECTORY (ENOTDIR)
+_REFUSED = (errno.ELOOP, errno.ENOTDIR)
+
+
+def _open_at(parent_fd: int, name: str, flags: int, shown: str) -> int:
+    """`os.open(name)` relatif au dossier `parent_fd`, sans suivre de lien.
+
+    `name` est un seul composant (assaini : ni `/`, ni `..`) : O_NOFOLLOW porte
+    donc sur tout ce qui est résolu. Un lien symbolique, même posé entre deux
+    appels, fait échouer l'ouverture au lieu de sortir de la racine.
+    """
+    try:
+        return os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent_fd)
+    except OSError as exc:
+        if exc.errno in _REFUSED:
+            raise ThreadError("%s : lien symbolique ou type de fichier inattendu, refusé"
+                              % shown) from exc
+        raise
+
+
 class FileTransport:
-    """Un fichier Markdown par fil, ajout seulement, verrou `flock` par fichier."""
+    """Un fichier Markdown par fil, ajout seulement, verrou `flock` par fichier.
+
+    La racine (`AMEESH_THREADS`, défaut `<état>/fils`) est **de confiance** :
+    choisie par l'utilisateur, elle est ouverte telle quelle, une fois par
+    opération (elle peut elle-même être un lien). Tout ce qui est SOUS elle est
+    ouvert par descripteurs ancrés : le dossier du projet relativement au
+    descripteur de la racine, le fichier du fil relativement à celui du dossier,
+    chacun avec O_NOFOLLOW. Aucun chemin n'est vérifié puis rouvert : remplacer
+    un dossier par un lien entre deux appels fait échouer l'opération
+    (ThreadError), jamais écrire ni lire hors de la racine.
+    """
 
     name = "file"
 
@@ -326,21 +361,69 @@ class FileTransport:
         self.root = os.path.abspath(os.path.expanduser(root))
 
     def location(self, thread: ThreadRef) -> str:
-        """Chemin du fil ; refuse tout ce qui sortirait de la racine."""
-        path = os.path.join(self.root, thread.project, thread.stem + ".md")
-        root_real = os.path.realpath(self.root)
-        real = os.path.realpath(path)
-        if os.path.commonpath([root_real, real]) != root_real or real == root_real:
-            raise ThreadError("emplacement de fil hors de %s : %s" % (self.root, real))
-        return path
+        """Chemin du fil, pour l'affichage et l'index.
+
+        Purement lexical (segments assainis : toujours sous la racine) ; ce
+        chemin n'est jamais rouvert tel quel, la sécurité est dans `_open`.
+        """
+        return os.path.join(self.root, thread.project, thread.stem + ".md")
+
+    def _root_fd(self, create: bool = False) -> int:
+        if create:
+            os.makedirs(self.root, mode=0o700, exist_ok=True)
+        return os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+    def _dir_fd(self, root_fd: int, project: str, create: bool = False) -> int:
+        """Le dossier d'un projet, ouvert sous la racine sans suivre de lien."""
+        flags = os.O_RDONLY | os.O_DIRECTORY
+        shown = os.path.join(self.root, project)
+        try:
+            return _open_at(root_fd, project, flags, shown)
+        except FileNotFoundError:
+            if not create:
+                raise
+        try:
+            os.mkdir(project, 0o700, dir_fd=root_fd)
+        except FileExistsError:
+            pass  # créé entre-temps : rouvert ci-dessous, toujours sans suivre de lien
+        return _open_at(root_fd, project, flags, shown)
+
+    def _open(self, thread: ThreadRef, write: bool) -> int:
+        """Descripteur du fichier du fil : un fichier ordinaire sous la racine.
+
+        Écriture : dossier et fichier créés au besoin (0700 / 0600), ouvert en
+        ajout. Lecture : FileNotFoundError si le fil n'existe pas ; O_NONBLOCK
+        pour qu'un tube nommé posé à sa place ne bloque pas (il est refusé).
+        """
+        root_fd = self._root_fd(create=write)
+        try:
+            dir_fd = self._dir_fd(root_fd, thread.project, create=write)
+        finally:
+            os.close(root_fd)
+        flags = (os.O_RDWR | os.O_APPEND | os.O_CREAT) if write \
+            else (os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            fd = _open_at(dir_fd, thread.stem + ".md", flags, self.location(thread))
+        finally:
+            os.close(dir_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ThreadError("%s : pas un fichier ordinaire, refusé" % self.location(thread))
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    def exists(self, thread: ThreadRef) -> bool:
+        try:
+            os.close(self._open(thread, write=False))
+        except FileNotFoundError:
+            return False
+        return True
 
     def post(self, thread: ThreadRef, entry: Entry) -> str:
-        path = self.location(thread)
-        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         data = format_entry(entry).encode("utf-8")
-        flags = (os.O_RDWR | os.O_APPEND | os.O_CREAT
-                 | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0))
-        fd = os.open(path, flags, 0o600)
+        fd = self._open(thread, write=True)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             size = os.fstat(fd).st_size
@@ -376,7 +459,7 @@ class FileTransport:
         """Les entrées du fil, ou celles postérieures à l'id `since`."""
         start = self._offset(thread, since) if since else 0
         try:
-            fd = os.open(self.location(thread), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+            fd = self._open(thread, write=False)
         except FileNotFoundError:
             return []
         with open(fd, "rb") as fh:
@@ -388,23 +471,39 @@ class FileTransport:
             entries = [e for e in entries if int(e.id.rpartition("#")[2]) > start]
         return entries
 
-    def threads(self) -> Iterator[ThreadRef]:
-        """Les fils présents sur disque."""
+    def threads(self) -> list[ThreadRef]:
+        """Les fils présents sur disque (liens symboliques ignorés, jamais suivis)."""
+        found: list[ThreadRef] = []
         try:
-            projects = sorted(os.listdir(self.root))
+            root_fd = self._root_fd()
         except OSError:
-            return
-        for project in projects:
-            directory = os.path.join(self.root, project)
-            if not os.path.isdir(directory) or safe_segment(project) != project:
-                continue
-            for filename in sorted(os.listdir(directory)):
-                if not filename.endswith(".md"):
+            return found
+        try:
+            with os.scandir(root_fd) as it:
+                projects = sorted(e.name for e in it if e.is_dir(follow_symlinks=False)
+                                  and safe_segment(e.name) == e.name)
+            for project in projects:
+                try:
+                    dir_fd = self._dir_fd(root_fd, project)
+                except (OSError, ThreadError):
+                    continue  # disparu, ou remplacé par un lien entre-temps
+                try:
+                    with os.scandir(dir_fd) as it:
+                        stems = sorted(e.name[:-3] for e in it if e.name.endswith(".md")
+                                       and e.is_file(follow_symlinks=False))
+                except OSError:
                     continue
-                stem = filename[:-3]
-                thread = ThreadRef(project, None if stem == PROJECT_THREAD else stem)
-                if thread.stem == stem:
-                    yield thread
+                finally:
+                    os.close(dir_fd)
+                for stem in stems:
+                    thread = ThreadRef(project, None if stem == PROJECT_THREAD else stem)
+                    if thread.stem == stem:
+                        found.append(thread)
+        except OSError:
+            pass
+        finally:
+            os.close(root_fd)
+        return found
 
 
 def transport_for(cfg: Config) -> FileTransport:
@@ -583,7 +682,10 @@ def cmd_list(cfg: Config, _args: argparse.Namespace) -> int:
     for thread in transport.threads():
         if (thread.project, thread.lot or "") in indexed:
             continue
-        entries = transport.read(thread)
+        try:
+            entries = transport.read(thread)
+        except (OSError, ThreadError):
+            continue  # remplacé par un lien, ou disparu, depuis le listage
         last = entries[-1] if entries else None
         rows.append({
             "project": thread.project, "lot": thread.lot or "", "transport": transport.name,
@@ -615,9 +717,9 @@ def _thread_from(args: argparse.Namespace) -> ThreadRef:
 def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     thread = _thread_from(args)
     transport = transport_for(cfg)
-    path = transport.location(thread)
-    if not os.path.exists(path):
-        print("aucun fil %s (%s)" % (thread.describe(), path), file=sys.stderr)
+    if not transport.exists(thread):
+        print("aucun fil %s (%s)" % (thread.describe(), transport.location(thread)),
+              file=sys.stderr)
         return 1
     entries = transport.read(thread)
     if args.last is not None:

@@ -203,13 +203,123 @@ class FilFormatTest(unittest.TestCase):
         os.makedirs(self.root)
         os.symlink(dehors, os.path.join(self.root, "piege"))
         with self.assertRaises(fil.ThreadError):
-            self.transport.location(fil.ThreadRef("piege"))
+            self.transport.post(fil.ThreadRef("piege"), fil.Entry("agent:a", "agent:b", "x"))
         cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
         with contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertIsNone(fil.record(cfg, None, sender="a", recipients=["b"], text="x",
                                          project="piege"))
         self.assertIn("écriture du fil impossible", err.getvalue())
         self.assertEqual(os.listdir(dehors), [])
+
+    def secret_dehors(self, *names: str) -> tuple[str, bytes]:
+        """Un dossier hors de la racine, avec des fils « secrets » à ne jamais lire."""
+        dehors = os.path.join(self.tmp, "dehors")
+        os.makedirs(dehors)
+        secret = (fil.header(fil.ThreadRef("dehors")) + fil.format_entry(
+            fil.Entry("agent:secret", "agent:x", "SECRET EXTÉRIEUR", ts=TS))).encode()
+        for name in names:
+            with open(os.path.join(dehors, name), "wb") as fh:
+                fh.write(secret)
+        return dehors, secret
+
+    def test_liens_symboliques_preexistants_ni_suivis_ni_listes(self):
+        """B1, cas statique : ni écriture, ni lecture, ni listage à travers un lien."""
+        dehors, secret = self.secret_dehors("_projet.md", "cible.md")
+        os.makedirs(os.path.join(self.root, "vrai"))
+        os.symlink(dehors, os.path.join(self.root, "piege"))  # dossier de projet → dehors
+        os.symlink(os.path.join(dehors, "cible.md"),          # fichier de fil → dehors
+                   os.path.join(self.root, "vrai", "_projet.md"))
+        os.symlink(os.path.join(self.root, "vrai"),           # même un lien interne
+                   os.path.join(self.root, "alias"))
+        os.makedirs(os.path.join(self.root, "tube"))           # un tube nommé ne bloque pas
+        os.mkfifo(os.path.join(self.root, "tube", "_projet.md"))
+        for thread in (fil.ThreadRef("piege"), fil.ThreadRef("vrai"), fil.ThreadRef("alias"),
+                       fil.ThreadRef("tube")):
+            with self.subTest(thread=thread.key):
+                with self.assertRaises(fil.ThreadError):
+                    self.transport.post(thread, fil.Entry("agent:a", "agent:b", "x", ts=TS))
+                with self.assertRaises(fil.ThreadError):
+                    self.transport.read(thread)
+                with self.assertRaises(fil.ThreadError):
+                    self.transport.exists(thread)
+        self.assertEqual(list(self.transport.threads()), [])
+        # ni la CLI (show), ni import-v0 (v0_recorded) ne lisent à travers un lien
+        env = {"AMEESH_THREADS": self.root, "AMEESH_STATE": self.tmp}
+        for argv in (["show", "piege"], ["show", "vrai"], ["show", "alias", "--meta"]):
+            with self.subTest(argv=argv), mock.patch.dict(os.environ, env), \
+                    contextlib.redirect_stdout(io.StringIO()) as out, \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(fil.main(argv), 1)
+            self.assertNotIn("SECRET", out.getvalue() + err.getvalue())
+            self.assertIn("refusé", err.getvalue())
+        cfg = dataclasses.replace(config_mod.Config(), threads_dir=self.root)
+        self.assertEqual(fil.v0_recorded(cfg), set())
+        self.assertEqual(sorted(os.listdir(dehors)), ["_projet.md", "cible.md"])
+        for name in ("_projet.md", "cible.md"):
+            with open(os.path.join(dehors, name), "rb") as fh:
+                self.assertEqual(fh.read(), secret)
+
+    def test_course_dossier_remplace_par_un_lien_pendant_les_ecritures(self):
+        """B1, course réelle : un fil d'exécution remplace en boucle le dossier du
+        projet par un lien vers l'extérieur pendant que l'on écrit et relit le fil.
+        Aucun octet n'atterrit dehors, aucune lecture ne renvoie de contenu extérieur."""
+        dehors, secret = self.secret_dehors("_projet.md")
+        projet = os.path.join(self.root, "course")
+        os.makedirs(projet)
+        thread = fil.ThreadRef("course")
+        stop = threading.Event()
+        liens = [0]
+
+        def remplacer() -> None:
+            n = 0
+            while not stop.is_set():
+                n += 1
+                # le vrai dossier est mis de côté (sous la racine), un lien prend sa place
+                with contextlib.suppress(OSError):
+                    os.rename(projet, os.path.join(self.root, "cote-%d" % n))
+                with contextlib.suppress(OSError):
+                    os.symlink(dehors, projet)
+                    liens[0] += 1
+                with contextlib.suppress(OSError):
+                    os.unlink(projet)  # le lien seulement : un dossier recréé reste en place
+
+        remplacant = threading.Thread(target=remplacer, daemon=True)
+        intervalle = sys.getswitchinterval()
+        sys.setswitchinterval(1e-5)  # entrelacer finement les deux fils d'exécution
+        postes, refus, fuites = 0, 0, []
+        remplacant.start()
+        try:
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline and postes < 300:
+                try:
+                    self.transport.post(thread, fil.Entry(
+                        "agent:a", "agent:b", "entrée %d" % postes, ts=TS))
+                    postes += 1
+                except (fil.ThreadError, OSError):  # un refus est permis, une fuite non
+                    refus += 1
+                try:
+                    lues = self.transport.read(thread)
+                except (fil.ThreadError, OSError):
+                    continue
+                fuites += [e.text for e in lues if "SECRET" in e.text]
+        finally:
+            stop.set()
+            remplacant.join(10)
+            sys.setswitchinterval(intervalle)
+        self.assertGreater(liens[0], 10, "la course n'a pas eu lieu")
+        self.assertGreater(postes, 0)
+        self.assertEqual(fuites, [], "lecture de données hors de la racine")
+        self.assertEqual(os.listdir(dehors), ["_projet.md"])
+        with open(os.path.join(dehors, "_projet.md"), "rb") as fh:
+            self.assertEqual(fh.read(), secret, "écriture hors de la racine")
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["dehors", "fils"])
+        # chaque entrée acceptée est sous la racine (dossier courant ou mis de côté)
+        trouvees = 0
+        for dirpath, _dirs, files in os.walk(self.root):  # sans suivre les liens
+            for name in files:
+                with open(os.path.join(dirpath, name), "rb") as fh:
+                    trouvees += len(fil.parse(fh.read()))
+        self.assertEqual(trouvees, postes)
 
     def test_corps_illisibles_refuses(self):
         b64 = "QUJD" * 60 + "ZA=="            # 244 caractères base64
