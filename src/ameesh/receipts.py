@@ -809,7 +809,9 @@ def standing_reserve(db: Db, grant_id: int, action_id: str, amount, *, connector
     OBLIGATOIRE : la couverture est contrôlée dans la même requête, une
     réservation sur un grant qui ne couvre pas l'action est impossible.
     Idempotente par (grant, action) : une réservation vivante est rendue
-    (`reused`). None = pas de couverture.
+    (`reused`) seulement si la description est IDENTIQUE (montant, devise,
+    connecteur, opération, classe) ; toute différence lève ReceiptError — un
+    refus explicite, jamais un succès silencieux. None = pas de couverture.
     """
     if not isinstance(action_id, str) or not action_id:
         raise ReceiptError("action_id requis")
@@ -853,7 +855,8 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> d
 
     `action` : action_id, connector, operation, class, amount (facultatif),
     currency (facultatif). Une réservation vivante existante pour l'action est
-    réutilisée en priorité. None = aucune couverture.
+    réutilisée en priorité — si elle décrit la même action, sinon ReceiptError
+    (`standing_reserve`). None = aucune couverture.
     """
     action_id = action["action_id"]
     action_class = action.get("class", action.get("action_class"))

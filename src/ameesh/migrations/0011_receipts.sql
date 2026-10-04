@@ -8,7 +8,8 @@
 -- * `standing_approvals` : les grants (approbations permanentes bornées, §8.3).
 --   Le nonce du reçu est consommé UNE fois, à l'enregistrement ; ensuite chaque
 --   tentative couverte RÉSERVE son montant sur le plafond cumulé.
--- * `standing_reservations` : le lien tentative ↔ grant (action_id, montant).
+-- * `standing_reservations` : le lien tentative ↔ grant (action_id, montant,
+--   et la description de l'action : connecteur, opération, classe, devise).
 --   Une réservation n'est libérée que sur un échec certain (failed), jamais
 --   sur une issue inconnue.
 -- * `mesh_consumed_nonces` (0006) reste le registre des nonces consommés ; on
@@ -79,6 +80,12 @@ create table if not exists standing_reservations (
     grant_id        bigint not null references standing_approvals (id),
     action_id       text not null,
     amount          bigint not null check (amount >= 0),
+    -- description de l'action réservée : une nouvelle tentative de la même
+    -- action ne réutilise la réservation que si elle est IDENTIQUE
+    connector       text not null,
+    operation       text not null,
+    action_class    text not null,
+    currency        text,
     reserved_by     text,
     reserved_at     timestamptz not null default now(),
     released_at     timestamptz,
@@ -127,12 +134,49 @@ begin
 end
 $$;
 
+-- Une réservation vivante ne sert une nouvelle tentative que pour la MÊME
+-- action : montant, devise, connecteur, opération et classe identiques. Toute
+-- différence lève une erreur (refus explicite, jamais un succès silencieux) ;
+-- le message dit ce qui diffère.
+create or replace function ameesh_standing_same_action(
+    p_live standing_reservations, p_amount bigint, p_connector text, p_operation text,
+    p_class text, p_currency text)
+returns void
+language plpgsql as $$
+declare
+    v_diff text;
+begin
+    v_diff := concat_ws(', ',
+        case when p_live.amount is distinct from p_amount
+             then format('montant %s au lieu de %s', p_amount, p_live.amount) end,
+        case when p_live.currency is distinct from p_currency
+             then format('devise %s au lieu de %s', coalesce(p_currency, 'null'),
+                         coalesce(p_live.currency, 'null')) end,
+        case when p_live.connector is distinct from p_connector
+             then format('connecteur %s au lieu de %s', coalesce(p_connector, 'null'),
+                         p_live.connector) end,
+        case when p_live.operation is distinct from p_operation
+             then format('opération %s au lieu de %s', coalesce(p_operation, 'null'),
+                         p_live.operation) end,
+        case when p_live.action_class is distinct from p_class
+             then format('classe %s au lieu de %s', coalesce(p_class, 'null'),
+                         p_live.action_class) end);
+    if v_diff <> '' then
+        raise exception 'ameesh_standing_reserve : action % déjà réservée sur le grant % avec une autre description (%)',
+            p_live.action_id, p_live.grant_id, v_diff;
+    end if;
+end
+$$;
+
 -- Réservation d'un montant sur un grant pour une tentative d'action.
 -- La décision est UN SEUL UPDATE … WHERE cumul + montant <= max … : sous
 -- READ COMMITTED, deux réservations concurrentes se sérialisent sur la ligne
 -- du grant et la seconde réévalue la condition sur la version à jour.
 -- Idempotente par (grant, action) : une réservation vivante est rendue telle
--- quelle (reused = true), à condition que le grant soit encore valable.
+-- quelle (reused = true), à condition que la description de l'action soit
+-- IDENTIQUE (montant, devise, connecteur, opération, classe) — toute
+-- différence est une erreur, jamais un succès — et que le grant soit encore
+-- valable et couvre l'action.
 -- Aucune ligne rendue = pas de couverture.
 create or replace function ameesh_standing_reserve(
     p_grant_id bigint, p_action_id text, p_amount bigint, p_reserved_by text,
@@ -141,21 +185,20 @@ returns table (reservation_id bigint, standing_id bigint, reserved_amount bigint
                grant_consumed bigint, grant_max bigint, reused boolean)
 language plpgsql as $$
 declare
-    v_existing record;
+    v_existing standing_reservations%rowtype;
     v_grant record;
     v_id bigint;
 begin
     if p_amount is null or p_amount < 0 then
         raise exception 'ameesh_standing_reserve : montant invalide';
     end if;
-    select r.id, r.amount into v_existing
+    select r.* into v_existing
       from standing_reservations r
      where r.grant_id = p_grant_id and r.action_id = p_action_id
        and r.released_at is null;
     if found then
-        if v_existing.amount <> p_amount then
-            raise exception 'ameesh_standing_reserve : action déjà réservée pour un autre montant';
-        end if;
+        perform ameesh_standing_same_action(v_existing, p_amount, p_connector, p_operation,
+                                            p_class, p_currency);
         return query
             select v_existing.id, s.id, v_existing.amount, s.consumed_amount, s.max_amount, true
               from standing_approvals s
@@ -165,6 +208,7 @@ begin
                and s.connector = p_connector
                and s.operations @> jsonb_build_array(p_operation)
                and s.action_class = p_class
+               and (p_amount = 0 or s.currency = p_currency)
                and exists (select 1 from authenticators a
                             where a.id = s.authenticator_id and a.revoked_at is null);
         return;
@@ -188,19 +232,27 @@ begin
         if not found then
             return;
         end if;
-        insert into standing_reservations (grant_id, action_id, amount, reserved_by)
-        values (p_grant_id, p_action_id, p_amount, p_reserved_by)
+        insert into standing_reservations
+            (grant_id, action_id, amount, connector, operation, action_class, currency,
+             reserved_by)
+        values
+            (p_grant_id, p_action_id, p_amount, p_connector, p_operation, p_class, p_currency,
+             p_reserved_by)
         returning id into v_id;
     exception when unique_violation then
         -- Course avec une réservation concurrente de la MÊME action : ce bloc
         -- est annulé (l'UPDATE du plafond aussi) et on rend la réservation
-        -- gagnante.
+        -- gagnante — si elle décrit la même action (sinon : erreur).
+        select r.* into v_existing
+          from standing_reservations r
+         where r.grant_id = p_grant_id and r.action_id = p_action_id
+           and r.released_at is null;
+        perform ameesh_standing_same_action(v_existing, p_amount, p_connector, p_operation,
+                                            p_class, p_currency);
         return query
-            select r.id, r.grant_id, r.amount, s.consumed_amount, s.max_amount, true
-              from standing_reservations r
-              join standing_approvals s on s.id = r.grant_id
-             where r.grant_id = p_grant_id and r.action_id = p_action_id
-               and r.released_at is null and r.amount = p_amount;
+            select v_existing.id, s.id, v_existing.amount, s.consumed_amount, s.max_amount, true
+              from standing_approvals s
+             where s.id = p_grant_id;
         return;
     end;
     return query

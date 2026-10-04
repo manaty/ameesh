@@ -790,6 +790,42 @@ class StandingTest(ReceiptsBase):
         self.assertEqual(self.reserve(grant, first)["reused"], False)
         self.assertEqual(self.consumed(grant), 30)
 
+    def test_idempotence_exige_la_meme_description(self):
+        """B1 : réutiliser une réservation exige la MÊME action, sinon refus explicite."""
+        grant, _ = self.register()          # EUR, opérations refund et label
+        first = action(amount=30)
+        reserved = self.reserve(grant, first)
+        for label, changed, needle in (
+            ("devise", dict(first, currency="USD"), "devise USD au lieu de EUR"),
+            ("sans devise", dict(first, currency=None), "devise null au lieu de EUR"),
+            ("montant", dict(first, amount=31), "montant 31 au lieu de 30"),
+            ("connecteur", dict(first, connector="git-merge"), "connecteur git-merge"),
+            # opération que le grant couvre AUSSI : seule la réservation la voit
+            ("opération", dict(first, operation="label"), "opération label au lieu de refund"),
+            ("classe", dict(first, **{"class": "irreversible"}), "classe irreversible"),
+        ):
+            with self.subTest(label):
+                with self.assertRaises(receipts.ReceiptError) as caught:
+                    self.reserve(grant, changed)
+                self.assertIn("autre description", str(caught.exception))
+                self.assertIn(needle, str(caught.exception))
+                # standing_cover passe par la réservation vivante : refus aussi
+                with self.assertRaises(receipts.ReceiptError):
+                    receipts.standing_cover(self.db, changed)
+        # rien n'a bougé ; la même description réutilise toujours la réservation
+        self.assertEqual(self.consumed(grant), 30)
+        again = self.reserve(grant, first)
+        self.assertEqual((again["reservation_id"], again["reused"]),
+                         (reserved["reservation_id"], True))
+        self.assertEqual(self.db.query(
+            "SELECT count(*)::int AS n FROM standing_reservations")[0]["n"], 1)
+        # sans montant non plus, la devise annoncée doit être la même
+        free = action(amount=0, currency=None)
+        self.assertFalse(self.reserve(grant, free)["reused"])
+        with self.assertRaises(receipts.ReceiptError):
+            self.reserve(grant, dict(free, currency="EUR"))
+        self.assertTrue(self.reserve(grant, free)["reused"])
+
     def test_plafond_cumule(self):
         grant, _ = self.register()
         self.assertIsNotNone(self.reserve(grant, action(amount=60)))
