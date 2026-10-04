@@ -64,3 +64,11 @@ seulement quand le raisonnement domine (petites tâches sans suite de tests
 lourde). Le levier de vitesse est ailleurs : tests ciblés, sessions courtes,
 revue par risque. À confirmer sur d'autres paires (Rust, SQL). Outil de
 référence : `~/.local/bin/nexlink-rd`.
+
+# Second rejeu isolé (05:13)
+
+Lot léger (traductions et tests) : DeepSeek flash en effort bas, 14 min, tests
+verts, diff de 850 lignes contre 543 pour la référence (plus verbeux) ; la
+référence en effort élevé avait pris environ 14 min. Aucun gain de délai :
+**l'effort bas est écarté pour l'implémentation** (critère
+[0023](../decisions/0023-critere-d-adoption-des-reglages.md)).
