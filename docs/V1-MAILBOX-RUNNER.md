@@ -3,7 +3,8 @@
 Ce document couvre les points 1 et 2 de la spec (§5) : ce qui a été construit,
 les décisions prises, et ce qui reste volontairement dehors. Il est écrit pour
 être relu par un autre agent (relecture croisée) et pour servir de base au
-portage IMA (M1 : paquet autonome `agent-mesh`).
+portage vers un orchestrateur de tickets existant (M1 : paquet autonome
+`agent-mesh`).
 
 ---
 
@@ -29,9 +30,9 @@ Pourquoi Python plutôt que Node :
 3. **Un seul runtime pour les trois harnais.** Le runner est un service local :
    Python est déjà présent partout où `agent-mail` v0 tourne (c'est le même
    interpréteur), et `psql` est présent partout où Postgres est utilisé.
-4. **`psycopg` reste le chemin nominal** quand il est là (installé par IMA ou
-   par un venv) : connexions directes, LISTEN/NOTIFY natif, pas de processus
-   par requête. C'est un accélérateur, pas un prérequis.
+4. **`psycopg` reste le chemin nominal** quand il est là (installé par
+   l'orchestrateur ou par un venv) : connexions directes, LISTEN/NOTIFY natif,
+   pas de processus par requête. C'est un accélérateur, pas un prérequis.
 
 L'alternative Node avait un avantage réel (le harnais Codex et `jq` sont déjà
 dans l'écosystème npm), mais elle perd sur la compatibilité v0 et sur
@@ -75,10 +76,10 @@ Deux points de conception :
 `delivered_at`, `signature`, `signature_key`, `slack_ts`, `host`, `meta`.
 
 C'est la liste de la spec §5.1 (`from, to, body, created, delivered,
-signature`) enrichie des colonnes du design IMA (`kind`, `payload`,
-`work_item_id`, `slack_ts`) pour que la même table serve aux transports
-suivants (R6 : Nexlink, Slack). `sender`/`recipient` portent `from`/`to`, mots
-réservés SQL.
+signature`) enrichie des colonnes d'un orchestrateur de tickets existant
+(`kind`, `payload`, `work_item_id`, `slack_ts`) pour que la même table serve aux
+transports suivants (R6 : Nexlink, Slack). `sender`/`recipient` portent
+`from`/`to`, mots réservés SQL.
 
 Un message **non remis** est `delivered_at IS NULL` ; l'index partiel
 `agent_mailbox_unread_idx (recipient, id) WHERE delivered_at IS NULL` sert la
@@ -336,6 +337,7 @@ les sessions réelles.
 * **Budget** : `budget_usd` / `spent_usd` sont stockés et alimentés quand le
   harnais annonce un coût ; le contrôle (refuser un tour au-delà du budget)
   n'est pas implémenté.
-* **IMA (M1)** : le paquet est autonome (`pyproject.toml`, aucun import d'IMA).
-  Les tables et les colonnes `kind`/`payload`/`work_item_id` sont prêtes pour
-  la reprise côté IMA ; il restera à décider qui possède `work_items`.
+* **Portage (M1)** : le paquet est autonome (`pyproject.toml`, aucun import
+  d'un orchestrateur existant). Les tables et les colonnes
+  `kind`/`payload`/`work_item_id` sont prêtes pour une reprise côté
+  orchestrateur ; il restera à décider qui possède `work_items`.

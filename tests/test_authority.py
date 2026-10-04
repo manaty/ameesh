@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Autorité du propriétaire : preuve, contenu, échéance, révocation, approbations.
 
 Le cœur du test : un texte qui se prétend du propriétaire n'a aucune autorité

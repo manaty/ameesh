@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Accès Postgres pour agent-mesh.
 
 Deux pilotes, une seule interface :

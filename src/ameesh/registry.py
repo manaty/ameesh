@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """`agent_registry` : présence des agents et baux (R3, R5).
 
 Un agent est épinglé à un hôte (v1 : les sessions des harnais sont des fichiers

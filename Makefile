@@ -1,7 +1,9 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 # agent-mesh — raccourcis du dépôt (rien n'est installé dans ~/.local/bin).
 PYTHON ?= python3
 export PYTHONPATH := src$(if $(PYTHONPATH),:$(PYTHONPATH))
-export AMEESH_DSN ?= postgresql://agent_mesh:agent_mesh@127.0.0.1:55432/agent_mesh
+#: DSN du banc local, sans mot de passe : PGPASSWORD ou ~/.pgpass fournit le secret.
+export AMEESH_DSN ?= postgresql://agent_mesh@127.0.0.1:55432/agent_mesh
 
 .PHONY: help pg-up migrate doctor test list mesh-list keys work clean-schemas
 

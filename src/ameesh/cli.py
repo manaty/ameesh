@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
 """agent-mail (mesh v1) — boîte aux lettres des agents, sur Postgres.
 
   agent-mail send <dest> <texte…> [--from NOM]   dépose un message (dest = nom, ou "all")

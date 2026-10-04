@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Identité d'une session : explicite, et liée au bail (jamais déduite du cwd).
 
 Une session a une identité si, et seulement si :

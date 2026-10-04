@@ -1,10 +1,12 @@
-"""work_items — la machine à états des lots, reprise de l'IMA (spec §5 point 4).
+# SPDX-License-Identifier: AGPL-3.0-only
+"""work_items — la machine à états des lots, reprise d'un orchestrateur de
+tickets existant (spec §5 point 4).
 
     intake → build → qa → merged → promoted
 
 plus `blocked` et `waiting_human`. La boucle `qa → build` est bornée à deux
-allers-retours (comme dans le design IMA) : au-delà, il faut bloquer le lot ou
-attendre une décision humaine, sinon la boucle coûte des tokens sans fin.
+allers-retours (comme dans le design d'origine) : au-delà, il faut bloquer le
+lot ou attendre une décision humaine, sinon la boucle coûte des tokens sans fin.
 
 Chaque transition laisse une ligne dans `work_item_events` (qui, quand,
 pourquoi) : c'est le ledger de reprise après un redémarrage.
@@ -53,7 +55,7 @@ def add(
     db: Db,
     *,
     title: str,
-    type: str = "evolution",  # noqa: A002 - nom de colonne imposé par l'IMA
+    type: str = "evolution",  # noqa: A002 - nom de colonne de l'orchestrateur d'origine
     source: str = "",
     app: str = "",
     body: str = "",

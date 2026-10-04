@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Adaptateurs : lignes de commande identiques à la v0, lecture des flux JSONL."""
 from __future__ import annotations
 

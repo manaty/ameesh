@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """Exécuteur : tours, reprise de session, baux, expiration, réveil sur NOTIFY."""
 from __future__ import annotations
 

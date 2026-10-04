@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: AGPL-3.0-only
 """work_items : machine à états, boucle QA bornée, journal des transitions."""
 from __future__ import annotations
 
