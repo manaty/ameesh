@@ -18,6 +18,80 @@
 -- Les opérations qui écrivent dans deux tables sont des fonctions PL/pgSQL :
 -- un seul appel, une seule transaction, avec les deux pilotes (psql n'accepte
 -- pas un CTE de modification imbriqué dans la requête d'enrobage JSON).
+--
+-- ÉCHÉANCES — règle commune à toute écriture qui accorde une autorité.
+-- Toute échéance (exp du reçu, until du grant, iat futur au-delà de la
+-- tolérance) est recontrôlée EN SQL, dans la transaction de l'écriture, APRÈS
+-- l'acquisition du DERNIER verrou et immédiatement avant l'écriture, contre
+-- `clock_timestamp()` (l'heure réelle) — jamais contre `now()`, figé au début
+-- de la transaction, donc AVANT toute attente de verrou. Les échéances signées
+-- sont passées en paramètres (l'hôte qui a vérifié la signature peut avoir
+-- une autre heure : celle de la base fait foi pour écrire). Le contrôle est
+-- `ameesh_receipt_deadlines()`, qui LÈVE une exception
+-- `ameesh_echeance [expired|iat_future]` : la transaction entière est
+-- annulée — aucune réservation, aucun nonce consommé, aucun grant enregistré.
+-- Une écriture peut elle-même attendre un verrou (index unique : l'INSERT …
+-- ON CONFLICT d'un nonce attend l'issue d'une insertion concurrente du même
+-- nonce) : le contrôle est donc REFAIT après l'écriture, avant de rendre la
+-- main ; un dépassement annule là aussi toute la transaction.
+--
+-- Motif imposé, en trois instructions DISTINCTES de la même fonction :
+--   1. PRENDRE les verrous (`SELECT … FOR UPDATE` / `FOR SHARE`, dans des
+--      variables ou par `perform`) ;
+--   2. relire l'état verrouillé et comparer les échéances à
+--      `clock_timestamp()` (`perform ameesh_receipt_deadlines(…)`, qui lève) ;
+--   3. écrire.
+-- JAMAIS d'échéance dans la clause WHERE de l'instruction qui prend le
+-- verrou (ni d'un UPDATE) : PostgreSQL ne réévalue ce WHERE après l'attente
+-- (EvalPlanQual) que si la ligne a été MODIFIÉE par la transaction qui tenait
+-- le verrou ; si elle n'a fait qu'un `SELECT … FOR UPDATE / FOR SHARE`, la
+-- condition reste celle évaluée AVANT l'attente. Les tests de course le
+-- vérifient avec des verrous tenus sans modification de la ligne.
+--
+-- INVENTAIRE des fonctions qui décident d'une autorisation (verrous dans
+-- l'ordre où ils sont pris ; « ⏱ » = contrôle des échéances) :
+--
+-- 1. ameesh_receipt_consume — consommation du nonce d'un reçu d'action
+--    (receipts.verify_receipt(consume_by=…) → receipts.consume_nonce).
+--    Échéances : exp, iat (+ tolérance).
+--      a. authenticators[id] FOR SHARE (sérialisé avec une révocation) ;
+--      ⏱ immédiatement avant l'INSERT ;
+--      b. INSERT mesh_consumed_nonces ON CONFLICT DO NOTHING (verrou de la
+--         clé (approver, nonce) : attend une insertion concurrente) ;
+--      ⏱ après l'INSERT.
+-- 2. ameesh_standing_register — enregistrement d'un grant
+--    (receipts.register_standing). Échéances : exp, iat (+ tolérance), until.
+--      a. authenticators[id] FOR SHARE ;
+--      ⏱ immédiatement avant les INSERT ;
+--      b. INSERT mesh_consumed_nonces ON CONFLICT DO NOTHING (clé du nonce) ;
+--      c. INSERT standing_approvals (clé unique (approver, nonce) ; la clé
+--         étrangère vers authenticators est couverte par a) ;
+--      ⏱ après les INSERT.
+-- 3. ameesh_standing_reserve — réservation sur un grant
+--    (receipts.standing_reserve, receipts.standing_cover). Échéance :
+--    standing_approvals.valid_until (le until signé, relu sous le verrou a).
+--      a. standing_approvals[grant] FOR UPDATE ;
+--      b. authenticators[grant.authenticator_id] FOR SHARE ;
+--      ⏱ immédiatement avant la décision (réutilisation d'une réservation
+--         vivante, ou UPDATE du cumul + INSERT de la réservation) ;
+--      c. UPDATE standing_approvals (verrou a, déjà tenu), INSERT
+--         standing_reservations (index unique (grant, action) vivant) ;
+--      ⏱ après l'INSERT.
+-- 4. ameesh_standing_release — libération après un échec certain
+--    (receipts.standing_release). Verrous : a. standing_approvals[grant] FOR
+--    UPDATE (même ordre que la réservation), b. UPDATE de la réservation.
+--    Aucune échéance : la libération n'accorde aucune autorité, elle rend du
+--    plafond ; toute réservation ultérieure recontrôle until sous verrou (3).
+--
+-- Hors inventaire (n'accordent rien, aucune échéance) : verify_receipt sans
+-- consommation (lecture seule : le verdict n'autorise rien à lui seul) ;
+-- revoke_standing et la révocation d'authentificateurs par
+-- sync_authenticators (elles RETIRENT de l'autorité ; un UPDATE de la ligne,
+-- sérialisé avec les FOR SHARE ci-dessus).
+--
+-- Ordre global des verrous : grant → authentificateur → nonce → lignes
+-- écrites. Aucune fonction ne prend un grant après un authentificateur :
+-- pas de cycle d'attente.
 
 create table if not exists authenticators (
     id              bigserial primary key,
@@ -101,42 +175,122 @@ create index if not exists standing_reservations_action_idx
 alter table mesh_consumed_nonces
     add column if not exists challenge text;
 
--- Enregistrement d'un grant : consommation du nonce ET insertion du grant,
--- ou rien. NULL si le nonce était déjà consommé ou si l'authentificateur
--- n'est plus actif (révoqué entre la vérification et l'enregistrement).
--- L'authentificateur est relu sous verrou partagé (`FOR SHARE`) : une
--- révocation en cours est attendue puis vue, une révocation postérieure
--- attend la fin de l'enregistrement.
+-- Contrôle des échéances à l'heure RÉELLE de la base (`clock_timestamp()`).
+-- Appelé APRÈS le dernier verrou, immédiatement avant l'écriture, puis après
+-- elle (voir l'en-tête). Lève `ameesh_echeance [code] : …` (codes de
+-- receipts.py : expired, iat_future) : la transaction entière est annulée.
+-- Ordre des contrôles : exp, iat, until (celui de la vérification Python).
+create or replace function ameesh_receipt_deadlines(
+    p_what text, p_exp bigint, p_iat bigint, p_skew integer, p_until timestamptz)
+returns void
+language plpgsql volatile as $$
+declare
+    v_now timestamptz := clock_timestamp();
+begin
+    if p_exp is not null and to_timestamp(p_exp) <= v_now then
+        raise exception 'ameesh_echeance [expired] : % : reçu expiré (exp %, heure de la base %), rien n''est écrit',
+            p_what, to_timestamp(p_exp), v_now;
+    end if;
+    if p_iat is not null
+       and to_timestamp(p_iat) > v_now + make_interval(secs => coalesce(p_skew, 0)) then
+        raise exception 'ameesh_echeance [iat_future] : % : iat dans le futur au-delà de % s de tolérance (iat %, heure de la base %), rien n''est écrit',
+            p_what, coalesce(p_skew, 0), to_timestamp(p_iat), v_now;
+    end if;
+    if p_until is not null and p_until <= v_now then
+        raise exception 'ameesh_echeance [expired] : % : grant échu (until %, heure de la base %), rien n''est écrit',
+            p_what, p_until, v_now;
+    end if;
+end
+$$;
+
+-- Consommation du nonce d'un reçu d'action (inventaire, 1). Vrai si consommé
+-- ici ; faux si le nonce l'était déjà, ou si l'authentificateur n'est plus
+-- actif (révoqué entre la vérification et la consommation). Une échéance
+-- dépassée lève une exception : rien n'est consommé.
+create or replace function ameesh_receipt_consume(
+    p_approver text, p_nonce text, p_by text, p_challenge text, p_authenticator_id bigint,
+    p_exp bigint, p_iat bigint, p_skew integer)
+returns boolean
+language plpgsql volatile as $$
+begin
+    if p_exp is null or p_iat is null then
+        raise exception 'ameesh_receipt_consume : échéances signées (exp, iat) requises';
+    end if;
+    -- a. l'authentificateur signataire, sous verrou PARTAGÉ : une révocation
+    --    en cours est attendue puis vue ; une révocation postérieure attend.
+    if p_authenticator_id is not null then
+        perform 1 from authenticators a
+         where a.id = p_authenticator_id and a.revoked_at is null
+           for share;
+        if not found then
+            return false;
+        end if;
+    end if;
+    -- ⏱ après le dernier verrou, immédiatement avant l'écriture
+    perform ameesh_receipt_deadlines('consommation du nonce', p_exp, p_iat, p_skew, null);
+    -- b. la décision atomique (clé primaire (approver, nonce)) ; peut attendre
+    --    l'issue d'une insertion concurrente du même nonce
+    insert into mesh_consumed_nonces (approver, nonce, consumed_by, challenge)
+    values (p_approver, p_nonce, p_by, p_challenge)
+    on conflict (approver, nonce) do nothing;
+    if not found then
+        return false;
+    end if;
+    -- ⏱ l'INSERT a pu attendre : un dépassement annule la consommation
+    perform ameesh_receipt_deadlines('consommation du nonce', p_exp, p_iat, p_skew, null);
+    return true;
+end
+$$;
+
+-- Enregistrement d'un grant (inventaire, 2) : consommation du nonce ET
+-- insertion du grant, ou rien. NULL si le nonce était déjà consommé ou si
+-- l'authentificateur n'est plus actif (révoqué entre la vérification et
+-- l'enregistrement). L'authentificateur est relu sous verrou partagé (`FOR
+-- SHARE`) : une révocation en cours est attendue puis vue, une révocation
+-- postérieure attend la fin de l'enregistrement. Une échéance dépassée (exp,
+-- iat, until) lève une exception : ni nonce consommé, ni grant.
 create or replace function ameesh_standing_register(
     p_approver text, p_nonce text, p_challenge text, p_authenticator_id bigint,
     p_receipt text, p_connector text, p_operations jsonb, p_class text,
-    p_max_amount bigint, p_currency text, p_valid_until double precision,
-    p_registered_by text)
+    p_max_amount bigint, p_currency text, p_exp bigint, p_iat bigint, p_until bigint,
+    p_skew integer, p_registered_by text)
 returns bigint
-language plpgsql as $$
+language plpgsql volatile as $$
 declare
     v_id bigint;
 begin
+    if p_exp is null or p_iat is null or p_until is null then
+        raise exception 'ameesh_standing_register : échéances signées (exp, iat, until) requises';
+    end if;
+    -- a. verrou partagé de l'authentificateur signataire
     perform 1 from authenticators a
      where a.id = p_authenticator_id and a.revoked_at is null
        for share;
     if not found then
         return null;
     end if;
+    -- ⏱ après le dernier verrou, immédiatement avant l'écriture
+    perform ameesh_receipt_deadlines('enregistrement du grant', p_exp, p_iat, p_skew,
+                                     to_timestamp(p_until));
+    -- b. le nonce (peut attendre une insertion concurrente du même nonce)
     insert into mesh_consumed_nonces (approver, nonce, consumed_by, challenge)
     values (p_approver, p_nonce, coalesce(p_registered_by, 'standing'), p_challenge)
     on conflict (approver, nonce) do nothing;
     if not found then
         return null;
     end if;
+    -- c. le grant
     insert into standing_approvals
         (approver, nonce, authenticator_id, challenge, receipt, connector, operations,
          action_class, max_amount, currency, valid_until, registered_by)
     values
         (p_approver, p_nonce, p_authenticator_id, p_challenge, p_receipt, p_connector,
-         p_operations, p_class, p_max_amount, p_currency, to_timestamp(p_valid_until),
+         p_operations, p_class, p_max_amount, p_currency, to_timestamp(p_until),
          p_registered_by)
     returning id into v_id;
+    -- ⏱ les INSERT ont pu attendre : un dépassement annule tout
+    perform ameesh_receipt_deadlines('enregistrement du grant', p_exp, p_iat, p_skew,
+                                     to_timestamp(p_until));
     return v_id;
 end
 $$;
@@ -175,24 +329,29 @@ begin
 end
 $$;
 
--- Réservation d'un montant sur un grant pour une tentative d'action.
+-- Réservation d'un montant sur un grant pour une tentative d'action
+-- (inventaire, 3).
 --
 -- 1. Verrou du grant (`SELECT … FOR UPDATE`) : les réservations d'un même
 --    grant se sérialisent ici, y compris celles de la MÊME action.
 -- 2. Tout est RELU et réévalué APRÈS le verrou : la fonction est VOLATILE et
 --    tourne sous READ COMMITTED, chaque instruction prend donc un nouvel
 --    instantané, et la ligne verrouillée est la dernière version validée.
---    L'échéance est comparée à `clock_timestamp()`, jamais à `now()` : `now()`
---    est figé au début de la transaction, AVANT l'éventuelle attente du
---    verrou — un grant échu pendant l'attente serait encore « valable ».
 --    L'authentificateur signataire est relu sous verrou partagé (`FOR
 --    SHARE`), qui sérialise avec sa révocation (un UPDATE de la ligne).
--- 3. Idempotente par (grant, action) : une réservation vivante est rendue
+-- 3. L'échéance (`valid_until`) est contrôlée APRÈS ce DERNIER verrou,
+--    immédiatement avant la décision et l'écriture, contre
+--    `clock_timestamp()` (jamais `now()`, figé avant les attentes) : un
+--    grant échu pendant l'attente du verrou du grant OU de celui de
+--    l'authentificateur ne couvre plus rien. Le contrôle est refait après
+--    l'INSERT ; un dépassement lève `ameesh_echeance` et annule tout.
+-- 4. Idempotente par (grant, action) : une réservation vivante est rendue
 --    telle quelle (reused = true), à condition que la description de l'action
 --    soit IDENTIQUE (montant, devise, connecteur, opération, classe) — toute
 --    différence est une erreur, jamais un succès — et que le grant soit encore
 --    valable et couvre l'action.
--- Aucune ligne rendue = pas de couverture.
+-- Aucune ligne rendue = pas de couverture ; `ameesh_echeance` = grant échu
+-- (receipts.standing_reserve rend alors None).
 create or replace function ameesh_standing_reserve(
     p_grant_id bigint, p_action_id text, p_amount bigint, p_reserved_by text,
     p_connector text, p_operation text, p_class text, p_currency text)
@@ -208,11 +367,12 @@ begin
     if p_amount is null or p_amount < 0 then
         raise exception 'ameesh_standing_reserve : montant invalide';
     end if;
+    -- a. verrou du grant
     select s.* into v_grant from standing_approvals s where s.id = p_grant_id for update;
     if not found then
         return;
     end if;
-    -- (après le verrou : instantané neuf, heure réelle)
+    -- (après le verrou : instantané neuf)
     select r.* into v_live
       from standing_reservations r
      where r.grant_id = p_grant_id and r.action_id = p_action_id
@@ -221,12 +381,12 @@ begin
         perform ameesh_standing_same_action(v_live, p_amount, p_connector, p_operation,
                                             p_class, p_currency);
     end if;
-    if v_grant.revoked_at is not null or v_grant.valid_until <= clock_timestamp() then
+    if v_grant.revoked_at is not null then
         return;
     end if;
-    -- L'authentificateur qui a signé le grant, sous verrou PARTAGÉ : une
-    -- révocation (UPDATE de la ligne) en cours est attendue puis vue ; une
-    -- révocation postérieure attend la fin de cette réservation.
+    -- b. l'authentificateur qui a signé le grant, sous verrou PARTAGÉ : une
+    --    révocation (UPDATE de la ligne) en cours est attendue puis vue ; une
+    --    révocation postérieure attend la fin de cette réservation.
     perform 1 from authenticators a
      where a.id = v_grant.authenticator_id and a.revoked_at is null
        for share;
@@ -240,6 +400,10 @@ begin
     then
         return;
     end if;
+    -- ⏱ après le dernier verrou (b), immédiatement avant la décision : l'heure
+    --   réelle, pas now() (figé avant l'attente des verrous a et b)
+    perform ameesh_receipt_deadlines(format('réservation sur le grant %s', p_grant_id),
+                                     null, null, null, v_grant.valid_until);
     if v_live.id is not null then
         return query select v_live.id, v_grant.id, v_live.amount, v_grant.consumed_amount,
                             v_grant.max_amount, true;
@@ -248,6 +412,8 @@ begin
     if v_grant.consumed_amount + p_amount > v_grant.max_amount then
         return;
     end if;
+    -- c. l'écriture (le verrou a est tenu ; l'index unique (grant, action)
+    --    vivant peut attendre une transaction concurrente)
     update standing_approvals s
        set consumed_amount = s.consumed_amount + p_amount,
            uses = s.uses + 1,
@@ -260,29 +426,44 @@ begin
         (p_grant_id, p_action_id, p_amount, p_connector, p_operation, p_class, p_currency,
          p_reserved_by)
     returning id into v_id;
+    -- ⏱ l'INSERT a pu attendre : un dépassement annule la réservation
+    perform ameesh_receipt_deadlines(format('réservation sur le grant %s', p_grant_id),
+                                     null, null, null, v_grant.valid_until);
     return query select v_id, p_grant_id, p_amount, v_consumed, v_grant.max_amount, false;
 end
 $$;
 
 -- Libération d'une réservation (échec CERTAIN de la tentative) : le montant
--- revient au plafond, une seule fois.
+-- revient au plafond, une seule fois (inventaire, 4). Verrou du grant
+-- d'abord, comme la réservation (même ordre : pas de cycle d'attente), puis
+-- la réservation. Aucune échéance : libérer n'accorde aucune autorité (une
+-- réservation ultérieure recontrôle until sous verrou).
 create or replace function ameesh_standing_release(p_reservation_id bigint, p_reason text)
 returns table (standing_id bigint, released_amount bigint, grant_consumed bigint)
-language plpgsql as $$
+language plpgsql volatile as $$
 declare
-    v record;
+    v_grant_id bigint;
+    v_amount bigint;
 begin
+    select r.grant_id into v_grant_id from standing_reservations r
+     where r.id = p_reservation_id;
+    if not found then
+        return;
+    end if;
+    -- a. verrou du grant
+    perform 1 from standing_approvals s where s.id = v_grant_id for update;
+    -- b. la réservation, relue sous ce verrou : libérée une seule fois
     update standing_reservations r
-       set released_at = now(), released_reason = p_reason
+       set released_at = clock_timestamp(), released_reason = p_reason
      where r.id = p_reservation_id and r.released_at is null
-    returning r.grant_id as gid, r.amount as amt into v;
+    returning r.amount into v_amount;
     if not found then
         return;
     end if;
     return query
         update standing_approvals s
-           set consumed_amount = s.consumed_amount - v.amt
-         where s.id = v.gid
-        returning s.id, v.amt, s.consumed_amount;
+           set consumed_amount = s.consumed_amount - v_amount
+         where s.id = v_grant_id
+        returning s.id, v_amount, s.consumed_amount;
 end
 $$;

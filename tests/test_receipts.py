@@ -811,6 +811,9 @@ class HeldTransaction:
     def commit(self) -> None:
         self._end("COMMIT")
 
+    def rollback(self) -> None:
+        self._end("ROLLBACK")
+
     def _end(self, verb: str) -> None:
         if self.proc.poll() is None:
             self.proc.stdin.write("%s;\n" % verb)
@@ -873,7 +876,9 @@ class Worker(threading.Thread):
         return self.value
 
 
-class StandingTest(ReceiptsBase):
+class StandingBase(ReceiptsBase):
+    """Utilitaires des grants (aucun test ici)."""
+
     def register(self, soft=None, approver=ALICE, **overrides):
         soft = soft or self.alice
         receipt = soft.receipt(make_request(approver, standing=standing(**overrides)))
@@ -908,6 +913,8 @@ class StandingTest(ReceiptsBase):
         return self.db.query("SELECT count(*)::int AS n FROM standing_reservations "
                              "WHERE released_at IS NULL")[0]["n"]
 
+
+class StandingTest(StandingBase):
     def test_cycle_reserver_reutiliser_liberer(self):
         grant, _receipt = self.register()
         first = action()
@@ -1267,6 +1274,293 @@ class StandingTest(ReceiptsBase):
                                                             registered_by="x")
                 self.assertIsNone(grant)
                 self.assertRefused(verdict, receipts.FORMAT)
+
+
+# --------------------------------------------------------------------------
+# échéances recontrôlées après le dernier verrou (heure réelle de la base)
+# --------------------------------------------------------------------------
+
+class DeadlineRaceTest(StandingBase):
+    """Toute échéance (exp, until, iat) est recontrôlée en SQL APRÈS le dernier
+    verrou, à `clock_timestamp()`, immédiatement avant l'écriture.
+
+    Courses réelles : une première connexion tient un verrou (authentificateur,
+    grant ou nonce) — en MODIFIANT la ligne, ou par un simple `SELECT … FOR
+    UPDATE / FOR SHARE` qui la laisse intacte —, la seconde l'attend (vu par
+    pg_blocking_pids), et l'échéance passe pendant l'attente : la transaction
+    entière est annulée. Témoins : la même attente, terminée avant l'échéance,
+    réussit.
+    """
+
+    #: secondes entre la préparation de la course et l'échéance
+    MARGIN = 4
+    #: échéance des témoins : bien après la fin de l'attente
+    LATER = 60
+
+    def clock(self) -> float:
+        """L'heure réelle de la BASE (celle des contrôles SQL)."""
+        return float(self.db.query(
+            "SELECT extract(epoch from clock_timestamp())::float8 AS epoch")[0]["epoch"])
+
+    def count(self, table: str) -> int:
+        return self.db.query("SELECT count(*)::int AS n FROM %s" % table)[0]["n"]
+
+    # -- verrous tenus par la première connexion -------------------------------
+    #
+    # Chaque course est jouée derrière un verrou qui MODIFIE la ligne et derrière
+    # un verrou qui la laisse intacte (`SELECT … FOR UPDATE / FOR SHARE`) :
+    # PostgreSQL ne réévalue le WHERE d'une instruction après l'attente
+    # (EvalPlanQual) que si la ligne a été modifiée — une échéance placée dans
+    # ce WHERE passerait derrière un verrou sans modification. Chaque fabrique
+    # reçoit la cible (requête du reçu, ou id du grant) et rend la transaction
+    # tenue ; `finish` dit comment elle se termine.
+
+    def authenticator_id(self, credential_id: str) -> int:
+        return int(self.db.query("SELECT id FROM authenticators WHERE credential_id = %s "
+                                 "AND revoked_at IS NULL", (credential_id,))[0]["id"])
+
+    def authenticator_holders(self) -> list:
+        """Verrous sur l'authentificateur signataire d'alice (jamais révoqué :
+        la mise à jour est un nouveau commit du canon, comme sync_authenticators).
+        Un `FOR SHARE` concurrent n'est pas listé : compatible avec le nôtre, il
+        ne fait rien attendre."""
+        ident = self.authenticator_id(self.alice.credential_id)
+        canon = db_mod.sql_literal("members/alice.md@" + NEXT_COMMIT)
+        return [
+            ("authentificateur : UPDATE (ligne modifiée)", lambda _target: HeldTransaction(
+                self, "UPDATE authenticators SET canon_ref = %s, updated_at = now() "
+                      "WHERE id = %d;" % (canon, ident)), "commit"),
+            ("authentificateur : SELECT … FOR UPDATE (ligne intacte)",
+             lambda _target: HeldTransaction(
+                 self, "SELECT id FROM authenticators WHERE id = %d FOR UPDATE;" % ident),
+             "commit"),
+        ]
+
+    def grant_holders(self) -> list:
+        """Verrous sur le grant (la réservation le prend FOR UPDATE)."""
+        return [
+            ("grant : SELECT … FOR UPDATE (ligne intacte)", lambda grant: HeldTransaction(
+                self, "SELECT id FROM standing_approvals WHERE id = %d FOR UPDATE;"
+                      % int(grant)), "commit"),
+            ("grant : SELECT … FOR SHARE (ligne intacte)", lambda grant: HeldTransaction(
+                self, "SELECT id FROM standing_approvals WHERE id = %d FOR SHARE;"
+                      % int(grant)), "commit"),
+            ("grant : UPDATE (ligne modifiée)", lambda grant: HeldTransaction(
+                self, "UPDATE standing_approvals SET registered_by = 'concurrent' "
+                      "WHERE id = %d;" % int(grant)), "commit"),
+        ]
+
+    def nonce_holders(self) -> list:
+        """Une autre transaction a inséré le MÊME nonce, puis s'annule : l'INSERT
+        … ON CONFLICT de la seconde attend son issue (verrou de la clé unique)."""
+        return [
+            ("nonce : INSERT concurrent annulé", lambda request: HeldTransaction(
+                self, "INSERT INTO mesh_consumed_nonces (approver, nonce, consumed_by) "
+                      "VALUES (%s, %s, 'concurrent');" % (
+                          db_mod.sql_literal(request["approver"]),
+                          db_mod.sql_literal(request["nonce"]))), "rollback"),
+        ]
+
+    def race(self, holder: HeldTransaction, call, deadline: float, *, expires: bool,
+             finish: str = "commit"):
+        """`call` (sur sa connexion) attend le verrou de `holder`.
+
+        `expires` : l'échéance passe PENDANT l'attente (heure de la base), puis
+        `holder` se termine ; sinon (témoin) `holder` se termine aussitôt.
+        """
+        worker = Worker(self, call)
+        self.assertTrue(holder.blocked(worker), "l'appel n'a pas attendu le verrou")
+        self.assertLess(self.clock(), deadline,
+                        "banc trop lent : l'échéance est passée avant l'attente")
+        if expires:
+            self.wait_for(lambda: self.clock() > deadline + 0.2, timeout=self.MARGIN + 10)
+            self.assertTrue(worker.is_alive(), "l'appel n'attendait plus le verrou")
+        getattr(holder, finish)()
+        result = worker.result()
+        if not expires:
+            self.assertLess(self.clock(), deadline, "témoin : l'échéance est passée")
+        return result
+
+    def action_receipt(self, exp: int) -> dict:
+        iat = int(self.clock()) - 10
+        return self.alice.receipt(make_request(ALICE, iat=iat, ttl=exp - iat))
+
+    def standing_receipt(self, *, exp: int | None = None, until: int | None = None) -> dict:
+        iat = int(self.clock()) - 10
+        ttl = (exp - iat) if exp is not None else 600
+        return self.alice.receipt(make_request(
+            ALICE, iat=iat, ttl=ttl, standing=standing(until=until or iat + 3600)))
+
+    def registering(self, receipt):
+        return lambda db: receipts.register_standing(db, receipt, POLICY, registered_by="porte")
+
+    def consuming(self, receipt):
+        return lambda db: self.consume(receipt, db=db)
+
+    def assertNothingWritten(self) -> None:
+        self.assertEqual(self.count("mesh_consumed_nonces"), 0)
+        self.assertEqual(self.count("standing_approvals"), 0)
+
+    def alice_live(self) -> bool:
+        return bool(self.db.query(
+            "SELECT 1 AS x FROM authenticators WHERE credential_id = %s "
+            "AND revoked_at IS NULL", (self.alice.credential_id,)))
+
+    # -- réservation -------------------------------------------------------
+    def expiring_grant(self, margin: float) -> tuple[int, float]:
+        """Un grant dont l'échéance tombe dans `margin` secondes (heure de la base)."""
+        grant, _ = self.register()
+        deadline = self.clock() + margin
+        self.db.query("UPDATE standing_approvals SET valid_until = to_timestamp(%s) "
+                      "WHERE id = %s RETURNING id", (deadline, grant))
+        return grant, deadline
+
+    def reserve_on(self, db, grant, act):
+        return receipts.standing_reserve(
+            db, grant, act["action_id"], act["amount"], connector=act["connector"],
+            operation=act["operation"], action_class=act["class"], currency=act["currency"])
+
+    def test_reservation_grant_echu_pendant_l_attente(self):
+        """Course (1) : le grant échoit pendant l'attente d'un verrou — celui
+        de l'authentificateur (non révoqué) ou celui du grant, ligne modifiée
+        ou intacte — : aucune réservation, cumul inchangé."""
+        for label, make, finish in self.authenticator_holders() + self.grant_holders():
+            with self.subTest(label):
+                grant, deadline = self.expiring_grant(self.MARGIN)
+                with make(grant) as holder:
+                    result = self.race(
+                        holder, lambda db: self.reserve_on(db, grant, action(amount=30)),
+                        deadline, expires=True, finish=finish)
+                self.assertIsNone(result)
+                self.assertEqual(self.consumed(grant), 0)
+                self.assertEqual(int(receipts.get_standing(self.db, grant)["uses"]), 0)
+                self.assertEqual(self.db.query(
+                    "SELECT count(*)::int AS n FROM standing_reservations WHERE grant_id = %s",
+                    (grant,))[0]["n"], 0)
+                self.assertTrue(self.alice_live(), "l'authentificateur ne devait pas être révoqué")
+
+    def test_reservation_temoin_attente_avant_l_echeance(self):
+        grant, deadline = self.expiring_grant(self.LATER)
+        holders = self.authenticator_holders() + self.grant_holders()
+        for index, (label, make, finish) in enumerate(holders, start=1):
+            with self.subTest(label):
+                with make(grant) as holder:
+                    result = self.race(
+                        holder, lambda db: self.reserve_on(db, grant, action(amount=10)),
+                        deadline, expires=False, finish=finish)
+                self.assertIsNotNone(result)
+                self.assertEqual(self.consumed(grant), 10 * index)
+
+    # -- enregistrement d'un grant -------------------------------------------
+    def test_enregistrement_echeance_pendant_l_attente(self):
+        """exp du reçu, ou until du grant, passé pendant l'attente du verrou de
+        l'authentificateur (ligne modifiée ou intacte), ou de l'INSERT du nonce
+        (insertion concurrente annulée ; l'échéance est alors recontrôlée APRÈS
+        l'écriture) : aucun grant enregistré, aucun nonce consommé."""
+        cases = [(label + ", " + field, make, finish, field)
+                 for label, make, finish in self.authenticator_holders()
+                 for field in ("exp", "until")]
+        cases += [(label + ", exp", make, finish, "exp")
+                  for label, make, finish in self.nonce_holders()]
+        for label, make, finish, field in cases:
+            with self.subTest(label):
+                deadline = int(self.clock()) + self.MARGIN
+                receipt = self.standing_receipt(**{field: deadline})
+                with make(receipt["request"]) as holder:
+                    verdict, grant = self.race(holder, self.registering(receipt), deadline,
+                                               expires=True, finish=finish)
+                self.assertIsNone(grant)
+                self.assertRefused(verdict, receipts.EXPIRED)
+                self.assertFalse(verdict.consumed)
+                self.assertNothingWritten()
+                self.assertTrue(self.alice_live())
+
+    def test_enregistrement_temoin_attente_avant_l_echeance(self):
+        holders = self.authenticator_holders() + self.nonce_holders()
+        for index, (label, make, finish) in enumerate(holders, start=1):
+            with self.subTest(label):
+                deadline = int(self.clock()) + self.LATER
+                receipt = self.standing_receipt(exp=deadline, until=deadline)
+                with make(receipt["request"]) as holder:
+                    verdict, grant = self.race(holder, self.registering(receipt), deadline,
+                                               expires=False, finish=finish)
+                self.assertTrue(verdict.ok, verdict.reason)
+                self.assertIsNotNone(grant)
+                self.assertEqual((self.count("mesh_consumed_nonces"),
+                                  self.count("standing_approvals")), (index, index))
+
+    # -- consommation d'un nonce (reçu d'action) -------------------------------
+    def test_consommation_recu_echu_pendant_l_attente(self):
+        """Course (2) : le reçu d'action expire pendant l'attente — verdict
+        EXPIRED, nonce NON consommé (derrière l'authentificateur, ligne modifiée
+        ou intacte, ou derrière une insertion concurrente du même nonce)."""
+        for label, make, finish in self.authenticator_holders() + self.nonce_holders():
+            with self.subTest(label):
+                deadline = int(self.clock()) + self.MARGIN
+                receipt = self.action_receipt(deadline)
+                with make(receipt["request"]) as holder:
+                    verdict = self.race(holder, self.consuming(receipt), deadline,
+                                        expires=True, finish=finish)
+                self.assertRefused(verdict, receipts.EXPIRED)
+                self.assertFalse(verdict.consumed)
+                self.assertEqual(self.count("mesh_consumed_nonces"), 0)
+
+    def test_consommation_temoin_attente_avant_l_echeance(self):
+        holders = self.authenticator_holders() + self.nonce_holders()
+        for index, (label, make, finish) in enumerate(holders, start=1):
+            with self.subTest(label):
+                receipt = self.action_receipt(int(self.clock()) + self.LATER)
+                with make(receipt["request"]) as holder:
+                    verdict = self.race(holder, self.consuming(receipt),
+                                        receipt["request"]["exp"], expires=False,
+                                        finish=finish)
+                self.assertTrue(verdict.ok, verdict.reason)
+                self.assertTrue(verdict.consumed)
+                self.assertEqual(self.count("mesh_consumed_nonces"), index)
+
+    # -- l'heure de la base fait foi pour toute écriture ----------------------
+    def test_horloge_de_l_hote_en_retard(self):
+        """L'hôte croit le reçu encore valable (`now` dans le passé) : la base,
+        à l'heure réelle, refuse toute écriture."""
+        request = make_request(ALICE, iat=int(time.time()) - 700, ttl=600)   # exp passé
+        receipt = self.alice.receipt(request)
+        late = request["exp"] - 1
+        self.assertTrue(self.verify(receipt, now=late).ok)          # lecture seule
+        verdict = receipts.verify_receipt(
+            self.db, receipt, POLICY, consume_by="porte", expected_digest=request["digest"],
+            expected_action_id=request["action_id"], now=late)
+        self.assertRefused(verdict, receipts.EXPIRED)
+        self.assertFalse(verdict.consumed)
+        now = int(time.time())
+        for label, request in (
+                ("exp", make_request(ALICE, iat=now - 700, ttl=600, standing=standing())),
+                ("until", make_request(ALICE, iat=now - 700, ttl=1200,
+                                       standing=standing(until=now - 50)))):
+            with self.subTest(label):
+                late = min(request["exp"], request["standing"]["until"]) - 1
+                verdict, grant = receipts.register_standing(
+                    self.db, self.alice.receipt(request), POLICY, registered_by="porte",
+                    now=late)
+                self.assertIsNone(grant)
+                self.assertRefused(verdict, receipts.EXPIRED)
+        self.assertNothingWritten()
+
+    def test_horloge_de_l_hote_en_avance(self):
+        """iat dans le futur pour la base (hôte en avance) : aucune écriture."""
+        ahead = time.time() + 600
+        request = make_request(ALICE, iat=int(ahead))
+        receipt = self.alice.receipt(request)
+        self.assertTrue(self.verify(receipt, now=ahead).ok)          # lecture seule
+        verdict = receipts.verify_receipt(
+            self.db, receipt, POLICY, consume_by="porte", expected_digest=request["digest"],
+            expected_action_id=request["action_id"], now=ahead)
+        self.assertRefused(verdict, receipts.NOT_YET)
+        request = make_request(ALICE, iat=int(ahead), standing=standing(until=int(ahead) + 3600))
+        verdict, grant = receipts.register_standing(
+            self.db, self.alice.receipt(request), POLICY, registered_by="porte", now=ahead)
+        self.assertIsNone(grant)
+        self.assertRefused(verdict, receipts.NOT_YET)
+        self.assertNothingWritten()
 
 
 # --------------------------------------------------------------------------
