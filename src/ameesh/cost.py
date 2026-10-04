@@ -336,22 +336,35 @@ class CostBook:
         return ""
 
     # -- comptabilité par tour ---------------------------------------------
-    def baseline(self, agent: str, harness: str) -> dict:
-        """Le repère du tour précédent, **lu sur la dernière ligne du grand livre**.
+    def baseline(self, agent: str, harness: str, session: str | None = None) -> dict:
+        """Le dernier relevé **connu** du tour précédent, lu sur le grand livre.
 
         Il n'est pas tenu dans un fichier : un repère écrit avant l'insertion
         avancerait alors qu'aucune ligne n'existe, et le tour rejoué après panne
-        compterait zéro — le coût serait perdu en silence (sonde codex2). Ici, la
-        ligne et le repère sont la même écriture, donc une insertion qui échoue
-        laisse le repère où il était.
+        compterait zéro — le coût serait perdu en silence (sonde codex2, B1).
+
+        Et c'est le dernier relevé **connu**, pas la dernière ligne : un tour sans
+        résultat (erreur du harnais, tour interrompu) écrit une ligne légitime mais
+        sans cumul, et la prendre pour repère ferait compter le tour suivant en
+        entier au lieu de sa différence (sonde codex2, B4). Un relevé de la
+        **session courante** est préféré quand il existe : deux sessions qui
+        s'entrelacent ne doivent pas se prendre l'une l'autre pour repère.
         """
         if self.db is None:
             return {}
+        columns = ("session, cum_usd, cum_input_tokens, cum_cached_input_tokens,"
+                   " cum_output_tokens")
+        where = ("where agent = %s and harness = %s"
+                 " and (cum_usd is not null or cum_input_tokens is not null)")
         rows = self.db.query(
-            "select session, cum_usd, cum_input_tokens, cum_cached_input_tokens,"
-            " cum_output_tokens from turn_costs"
-            " where agent = %s and harness = %s order by recorded_at desc, id desc limit 1",
-            (agent, harness))
+            "select " + columns + " from turn_costs " + where +
+            " order by recorded_at desc, id desc limit 1", (agent, harness))
+        if session and rows and rows[0]["session"] != session:
+            own = self.db.query(
+                "select " + columns + " from turn_costs " + where + " and session = %s"
+                " order by recorded_at desc, id desc limit 1", (agent, harness, session))
+            if own:
+                rows = own
         if not rows:
             return {}
         row = rows[0]
@@ -363,18 +376,21 @@ class CostBook:
                           int(row["cum_output_tokens"] or 0)] if row["cum_input_tokens"] is not None else None,
         }
 
+
     def turn_usage(self, agent: str, start: int = 0) -> TurnUsage:
         """Ce que le tour qui vient de finir a coûté, sans rien écrire.
 
         Le repère de cumul (dernier `total_cost_usd` Claude, dernier usage Codex)
-        est lu dans l'état local : la différence se calcule donc entre deux
-        tours, pas entre deux lectures d'un même tour.
+        est lu dans le grand livre : la différence se calcule donc entre deux
+        tours, pas entre deux lectures d'un même tour — et un tour sans relevé ne
+        l'efface pas.
         """
         harness = self.tool_of(agent)
         model = self.model_of(agent)
         prices = load_prices(self.prices_path)
-        cum = self.baseline(agent, harness)
         events = self.events(agent, start)
+        # La session se lit AVANT le repère : c'est elle qui dit lequel comparer.
+        cum = self.baseline(agent, harness, _last_session(events) or None)
 
         if harness == "claude":
             totals = [float(e["total_cost_usd"]) for e in events

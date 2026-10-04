@@ -326,6 +326,52 @@ class CostDbTest(Sandbox, PgTestCase):
                                  "total_cost_usd": 1.25})
         self.assertAlmostEqual(book.record("a1", start=1).usd, 0.25)
 
+    def test_un_tour_sans_releve_ne_perd_pas_le_repere_claude(self):
+        """Sonde codex2 B4 (Claude) : un tour en erreur n'a pas de `result`.
+
+        Sa ligne est légitime mais sans cumul ; la prendre pour repère ferait
+        compter le tour suivant **en entier** (0,75 au lieu de 0,25) et `spent`
+        annoncerait 1,25 au lieu de 0,75.
+        """
+        book = self.book()
+        os.makedirs(book.agent_dir("a1"), exist_ok=True)
+        with open(os.path.join(book.agent_dir("a1"), "tool"), "w", encoding="utf-8") as fh:
+            fh.write("claude")
+        self.write_events("a1", {"type": "result", "session_id": "s1", "total_cost_usd": 0.50})
+        self.assertAlmostEqual(book.record("a1").usd, 0.50)
+        # Tour interrompu : du flux, mais aucun résultat — donc aucun relevé.
+        self.write_events("a1", {"type": "system", "subtype": "init", "session_id": "s1"})
+        self.assertAlmostEqual(book.record("a1", start=1).usd, 0.0)
+        self.write_events("a1", {"type": "result", "session_id": "s1", "total_cost_usd": 0.75})
+        self.assertAlmostEqual(book.record("a1", start=2).usd, 0.25)
+        self.assertAlmostEqual(book.spent("a1", 3600), 0.75)
+
+    def test_un_tour_sans_releve_ne_perd_pas_le_repere_codex(self):
+        """Même sonde côté Codex : 1 M de jetons, tour interrompu, puis 1,5 M.
+
+        Le deuxième tour doit compter 0,5 M, pas 1,5 M.
+        """
+        book = self.book()
+        os.makedirs(book.agent_dir("a1"), exist_ok=True)
+        with open(os.path.join(book.agent_dir("a1"), "tool"), "w", encoding="utf-8") as fh:
+            fh.write("codex")
+        with open(os.path.join(book.agent_dir("a1"), "model"), "w", encoding="utf-8") as fh:
+            fh.write("gpt-6.1-sol")
+        self.write_events("a1", {"type": "thread.started", "thread_id": "t1"},
+                          {"type": "turn.completed", "usage": {"input_tokens": 1_000_000,
+                                                               "cached_input_tokens": 0,
+                                                               "output_tokens": 0}})
+        first = book.record("a1")
+        self.assertAlmostEqual(first.usd, 1_000_000 * 1.25 / 1e6)
+        self.write_events("a1", {"type": "thread.started", "thread_id": "t1"})
+        self.assertAlmostEqual(book.record("a1", start=2).usd, 0.0)
+        self.write_events("a1", {"type": "turn.completed",
+                                 "usage": {"input_tokens": 1_500_000,
+                                           "cached_input_tokens": 0, "output_tokens": 0}})
+        second = book.record("a1", start=3)
+        self.assertAlmostEqual(second.usd, 500_000 * 1.25 / 1e6)
+        self.assertEqual(second.input_tokens, 500_000)
+
     def test_record_sans_base_refuse_de_compter(self):
         book = cost.CostBook(state_dir=self.state)
         with self.assertRaises(cost.CostError):
