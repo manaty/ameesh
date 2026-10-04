@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import tempfile
 import time
 import unittest
 
@@ -25,26 +27,30 @@ def write(path: str, *events) -> None:
             fh.write(json.dumps(event) + "\n")
 
 
-class CostTestBase(unittest.TestCase):
-    """Un bac à sable disque, des harnais simulés par des fichiers `tool`."""
+class Sandbox:
+    """Un bac à sable disque (et, si la classe a une base, un grand livre propre).
+
+    Les journaux de harnais sont **factices** : aucun test n'approche `~/.codex`
+    ni `~/.claude`, et les chemins par défaut ne sont jamais lus.
+    """
 
     def setUp(self) -> None:
-        import tempfile
-        self.tmp = tempfile.mkdtemp(prefix="ameesh-cost-")
-        self.addCleanup(self._clean)
-        self.state = os.path.join(self.tmp, "state")
-        self.codex = os.path.join(self.tmp, "codex-sessions")
+        super().setUp()                     # PgTestCase : schéma, TRUNCATE, dossiers
+        self.tmp_cost = tempfile.mkdtemp(prefix="ameesh-cost-")
+        self.addCleanup(shutil.rmtree, self.tmp_cost, ignore_errors=True)
+        self.state = os.path.join(self.tmp_cost, "state")
+        self.codex = os.path.join(self.tmp_cost, "codex-sessions")
         os.makedirs(self.state, exist_ok=True)
         self.now = 1_800_000_000.0
-
-    def _clean(self) -> None:
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        if getattr(self, "db", None) is not None:
+            self.db.execute("DELETE FROM turn_costs")
 
     def book(self, **kw) -> cost.CostBook:
+        if getattr(self, "db", None) is not None:
+            kw.setdefault("db", self.db)
         kw.setdefault("state_dir", self.state)
         kw.setdefault("codex_sessions", self.codex)
-        kw.setdefault("prices_path", os.path.join(self.tmp, "prices.json"))
+        kw.setdefault("prices_path", os.path.join(self.tmp_cost, "prices.json"))
         kw.setdefault("clock", lambda: self.now)
         return cost.CostBook(**kw)
 
@@ -57,10 +63,13 @@ class CostTestBase(unittest.TestCase):
         return name
 
     def events(self, name: str, *events) -> None:
+        self.write_events(name, *events)
+
+    def write_events(self, name: str, *events) -> None:
         write(os.path.join(self.state, name, "events.jsonl"), *events)
 
 
-class ClaudeGaugeTest(CostTestBase):
+class ClaudeGaugeTest(Sandbox, unittest.TestCase):
     def test_jauges_lues_dans_le_dernier_rate_limit_event(self):
         self.agent("a1", "claude")
         self.agent("a2", "claude")
@@ -114,7 +123,7 @@ class ClaudeGaugeTest(CostTestBase):
         self.assertAlmostEqual(fresh.pace_cap(self.now), 0.10)
 
 
-class CodexGaugeTest(CostTestBase):
+class CodexGaugeTest(Sandbox, unittest.TestCase):
     def test_jauges_primaires_et_secondaires_du_journal_le_plus_recent(self):
         write(os.path.join(self.codex, "2026", "10", "04", "roll.jsonl"),
               {"type": "session_meta"},
@@ -131,12 +140,31 @@ class CodexGaugeTest(CostTestBase):
         # 300 min écoulées à ~94 % : plafond de rythme atteint (min(90, 94+10)).
         self.assertIn("codex", self.book().pace_exceeded("codex") or "codex")
 
+    def test_l_ordre_des_cles_et_un_secondaire_nul_ne_perdent_pas_la_jauge(self):
+        """Sonde codex2 B2 : une regex exigeait `plan_type` en dernier.
+
+        Même `rate_limits`, `plan_type` en tête et `secondary` nul : la jauge
+        primaire doit être trouvée, sinon la pause est manquée.
+        """
+        write(os.path.join(self.codex, "2026", "10", "04", "ordre.jsonl"),
+              {"payload": {"rate_limits": {
+                  "plan_type": "plus",
+                  "secondary": None,
+                  "primary": {"used_percent": 95, "window_minutes": 300,
+                              "resets_at": self.now + 100}}}})
+        gauges = self.book().codex_gauges()
+        self.assertEqual([g.key for g in gauges], ["codex-300min"])
+        self.assertAlmostEqual(gauges[0].used, 0.95)
+        self.assertIn("codex", self.book().pace_exceeded("codex"))
+
     def test_aucune_jauge_sans_journal(self):
         self.assertEqual(self.book().codex_gauges(), [])
         self.assertEqual(self.book().pace_exceeded("codex"), "")
 
 
-class TurnAccountingTest(CostTestBase):
+class TurnAccountingTest(Sandbox, PgTestCase):
+    """La comptabilité par tour, avec le grand livre : le repère est la dernière
+    ligne de `turn_costs`, donc ces cas tournent sur les deux pilotes."""
     def test_claude_difference_du_cout_cumule_par_session(self):
         self.agent("a1", "claude", "gpt-6.1-sol")
         book = self.book()
@@ -202,7 +230,7 @@ class TurnAccountingTest(CostTestBase):
 
     def test_bareme_modifiable_et_repli(self):
         self.agent("a1", "deepseek", "deepseek-pro")
-        with open(os.path.join(self.tmp, "prices.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(self.tmp_cost, "prices.json"), "w", encoding="utf-8") as fh:
             json.dump({"deepseek-pro": [1.0, 0.1, 2.0]}, fh)
         self.events("a1", {"type": "status", "phase": "step_end",
                            "usage": {"inputTokens": 1_000_000, "cacheReadTokens": 0,
@@ -212,7 +240,7 @@ class TurnAccountingTest(CostTestBase):
     def test_bareme_surchargeable_par_l_environnement(self):
         # La variable d'environnement évite d'avoir à connaître le chemin par
         # défaut du poste (et les tests ne le lisent jamais).
-        custom = os.path.join(self.tmp, "custom-prices.json")
+        custom = os.path.join(self.tmp_cost, "custom-prices.json")
         with open(custom, "w", encoding="utf-8") as fh:
             json.dump({"deepseek-flash": [9.0, 9.0, 9.0]}, fh)
         os.environ["AMEESH_PRICES"] = custom
@@ -221,9 +249,9 @@ class TurnAccountingTest(CostTestBase):
         self.assertEqual(book.prices_path, custom)
 
     def test_bareme_illisible_garde_les_defauts(self):
-        with open(os.path.join(self.tmp, "prices.json"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(self.tmp_cost, "prices.json"), "w", encoding="utf-8") as fh:
             fh.write("{ceci n'est pas du JSON")
-        prices = cost.load_prices(os.path.join(self.tmp, "prices.json"))
+        prices = cost.load_prices(os.path.join(self.tmp_cost, "prices.json"))
         self.assertEqual(prices["deepseek-flash"], cost.DEFAULT_PRICES["deepseek-flash"])
 
     def test_un_flux_illisible_ne_casse_pas_la_comptabilite(self):
@@ -231,42 +259,86 @@ class TurnAccountingTest(CostTestBase):
         path = os.path.join(self.state, "a1", "events.jsonl")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("pas du json\n")
+            # `[]` et `null` sont du JSON valide mais pas des événements (B3) :
+            # les garder ferait planter le premier `.get` venu.
+            fh.write("[]\n")
+            fh.write("null\n")
             fh.write(json.dumps({"type": "result", "session_id": "s1",
                                  "total_cost_usd": 0.5}) + "\n")
         self.assertAlmostEqual(self.book().turn_usage("a1").usd, 0.5)
 
 
-class CostDbTest(PgTestCase):
+class CostDbTest(Sandbox, PgTestCase):
     """`turn_costs` : écriture par `record`, lecture par `spent` et `report`."""
-
-    def setUp(self) -> None:
-        super().setUp()
-        # `turn_costs` n'est pas dans le TRUNCATE partagé de `PgTestCase` : ce lot
-        # nettoie ce qu'il remplit, sans toucher au socle des autres.
-        self.db.execute("DELETE FROM turn_costs")
-        self.state_dir = os.path.join(self.tmp, "cost-state")
-        os.makedirs(self.state_dir, exist_ok=True)
-
-    def book(self, **kw) -> cost.CostBook:
-        kw.setdefault("db", self.db)
-        kw.setdefault("state_dir", self.state_dir)
-        kw.setdefault("codex_sessions", os.path.join(self.tmp, "cost-codex"))
-        return cost.CostBook(**kw)
 
     def test_migration_0014_presente(self):
         rows = self.db.query(
             "select version, name from schema_migrations where version = 14")
         self.assertEqual([(r["version"], r["name"]) for r in rows], [(14, "cost")])
 
+    def test_repere_dans_le_grand_livre_et_reprise_apres_panne(self):
+        """Sonde codex2 B1 : insertion et repère sont la même écriture.
+
+        Un `execute` qui échoue ne doit pas faire avancer le repère : le tour
+        rejoué compte le même delta, au lieu d'insérer zéro.
+        """
+        real = self.db
+
+        class Flaky:
+            """La base, avec une insertion qui échoue une fois."""
+
+            def __init__(self, inner):
+                self.inner = inner
+                self.failures = 1
+
+            def query(self, sql, params=None):
+                return self.inner.query(sql, params)
+
+            def execute(self, sql, params=None):
+                if self.failures:
+                    self.failures -= 1
+                    raise RuntimeError("base indisponible")
+                return self.inner.execute(sql, params)
+
+        book = self.book(db=Flaky(real))
+        os.makedirs(book.agent_dir("a1"), exist_ok=True)
+        with open(os.path.join(book.agent_dir("a1"), "tool"), "w", encoding="utf-8") as fh:
+            fh.write("claude")
+        self.write_events("a1", {"type": "result", "session_id": "s1",
+                                 "total_cost_usd": 0.50})
+        with self.assertRaises(RuntimeError):
+            book.record("a1")
+        # La panne n'a rien laissé : aucune ligne, donc aucun repère avancé.
+        self.assertEqual(real.query("select count(*) as n from turn_costs")[0]["n"], 0)
+        usage = book.record("a1")                      # la reprise
+        self.assertAlmostEqual(usage.usd, 0.50)        # le coût n'est pas perdu
+        self.assertAlmostEqual(book.spent("a1", 3600), 0.50)
+
+    def test_difference_lue_sur_la_derniere_ligne(self):
+        book = self.book()
+        os.makedirs(book.agent_dir("a1"), exist_ok=True)
+        with open(os.path.join(book.agent_dir("a1"), "tool"), "w", encoding="utf-8") as fh:
+            fh.write("claude")
+        self.write_events("a1", {"type": "result", "session_id": "s1",
+                                 "total_cost_usd": 1.00})
+        self.assertAlmostEqual(book.record("a1").usd, 1.00)
+        self.write_events("a1", {"type": "result", "session_id": "s1",
+                                 "total_cost_usd": 1.25})
+        self.assertAlmostEqual(book.record("a1", start=1).usd, 0.25)
+
+    def test_record_sans_base_refuse_de_compter(self):
+        book = cost.CostBook(state_dir=self.state)
+        with self.assertRaises(cost.CostError):
+            book.record("a1")
+
     def test_record_ecrit_une_ligne_et_spent_la_somme(self):
         book = self.book()
         os.makedirs(book.agent_dir("a1"), exist_ok=True)
         with open(os.path.join(book.agent_dir("a1"), "tool"), "w", encoding="utf-8") as fh:
             fh.write("deepseek")
-        with open(os.path.join(book.agent_dir("a1"), "events.jsonl"), "w", encoding="utf-8") as fh:
-            fh.write(json.dumps({"type": "status", "phase": "step_end",
+        self.write_events("a1", {"type": "status", "phase": "step_end",
                                  "usage": {"inputTokens": 1_000_000, "cacheReadTokens": 0,
-                                           "outputTokens": 0}}) + "\n")
+                                           "outputTokens": 0}})
         usage = book.record("a1", turn="t-1")
         self.assertAlmostEqual(usage.usd, 0.27)
         self.assertAlmostEqual(book.spent("a1", 3600), 0.27)
@@ -281,10 +353,9 @@ class CostDbTest(PgTestCase):
         os.makedirs(book.agent_dir("a1"), exist_ok=True)
         with open(os.path.join(book.agent_dir("a1"), "tool"), "w", encoding="utf-8") as fh:
             fh.write("deepseek")
-        with open(os.path.join(book.agent_dir("a1"), "events.jsonl"), "w", encoding="utf-8") as fh:
-            fh.write(json.dumps({"type": "status", "phase": "step_end",
+        self.write_events("a1", {"type": "status", "phase": "step_end",
                                  "usage": {"inputTokens": 1_000_000, "cacheReadTokens": 0,
-                                           "outputTokens": 0}}) + "\n")
+                                           "outputTokens": 0}})
         self.assertEqual(book.over("a1"), "")
         book.record("a1")
         self.assertIn("budget horaire", book.over("a1"))

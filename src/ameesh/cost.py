@@ -31,10 +31,10 @@ atteint `min(90 %, part écoulée de la fenêtre + 10 points)`. La marge de dix
 points couvre l'orchestrateur et les humains, qui partagent le même forfait
 (décision 0019 §4).
 
-Rien ici n'écrit dans les journaux d'un harnais ; `record` écrit une ligne
-`turn_costs` (migration 0014) et un repère de cumul dans l'état local de
-l'agent (`cost-cum.json`), pour que la différence d'un tour à l'autre survive au
-redémarrage de l'exécuteur.
+Rien ici n'écrit dans les journaux d'un harnais, ni même sur le disque : `record`
+écrit **une** ligne `turn_costs` (migration 0014), qui porte à la fois le coût du
+tour et le cumul brut dont le tour suivant fera la différence. Insertion et repère
+sont donc la même écriture — un tour rejoué après panne ne perd pas son coût.
 """
 from __future__ import annotations
 
@@ -73,6 +73,10 @@ PACE_CEILING = 0.90
 #: sessions des harnais grossissent sans fin.
 TAIL_BYTES = 4_000_000
 CODEX_FILES = 5
+
+
+class CostError(Exception):
+    """Erreur de comptabilité (repère illisible, base absente)."""
 
 
 @dataclass(frozen=True)
@@ -222,9 +226,13 @@ class CostBook:
             if not line:
                 continue
             try:
-                out.append(json.loads(line))
+                event = json.loads(line)
             except ValueError:
                 continue
+            # Un `[]` ou un `null` est une ligne JSON valide mais pas un événement :
+            # la garder ferait planter le premier `.get` venu (sonde codex2).
+            if isinstance(event, dict):
+                out.append(event)
         return out
 
     # -- jauges de forfait --------------------------------------------------
@@ -262,27 +270,36 @@ class CostBook:
         return newest[1] if newest else []
 
     def codex_gauges(self) -> list:
-        """Les `rate_limits` primaire et secondaire du journal de session le plus récent."""
+        """Les `rate_limits` primaire et secondaire du journal de session le plus récent.
+
+        Lecture **JSON structurée**, pas une expression régulière : l'ordre des clés
+        n'est pas garanti (`plan_type` peut précéder `primary`), `secondary` peut
+        être `null`, et une regex y perdait la jauge — donc la pause (sonde codex2).
+        """
         files = sorted(
             glob.glob(os.path.join(self.codex_sessions, "**", "*.jsonl"), recursive=True),
             key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
         )[-CODEX_FILES:]
         for path in reversed(files):
-            raw = _read_tail(path, 2_000_000)
-            found = None
-            for match in re.finditer(r'"rate_limits":\s*(\{.*?"plan_type":[^}]*\})', raw):
-                found = match.group(1)
-            if not found:
-                continue
-            try:
-                limits = json.loads(found)
-            except ValueError:
+            limits = None
+            for line in _read_tail(path, 2_000_000).splitlines():
+                line = line.strip()
+                if not line or "rate_limits" not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                found = _find_rate_limits(event)
+                if found:
+                    limits = found          # le dernier de la session gagne
+            if not limits:
                 continue
             gauges = []
             for key in ("primary", "secondary"):
                 value = limits.get(key)
                 if not isinstance(value, dict):
-                    continue
+                    continue                    # `secondary: null` n'est pas une jauge
                 minutes = float(value.get("window_minutes") or 0)
                 gauges.append(Gauge(
                     "codex",
@@ -319,16 +336,32 @@ class CostBook:
         return ""
 
     # -- comptabilité par tour ---------------------------------------------
-    def _cum_path(self, agent: str) -> str:
-        return os.path.join(self.agent_dir(agent), "cost-cum.json")
+    def baseline(self, agent: str, harness: str) -> dict:
+        """Le repère du tour précédent, **lu sur la dernière ligne du grand livre**.
 
-    def _read_cum(self, agent: str) -> dict:
-        try:
-            with open(self._cum_path(agent), encoding="utf-8") as fh:
-                data = json.load(fh)
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
+        Il n'est pas tenu dans un fichier : un repère écrit avant l'insertion
+        avancerait alors qu'aucune ligne n'existe, et le tour rejoué après panne
+        compterait zéro — le coût serait perdu en silence (sonde codex2). Ici, la
+        ligne et le repère sont la même écriture, donc une insertion qui échoue
+        laisse le repère où il était.
+        """
+        if self.db is None:
             return {}
+        rows = self.db.query(
+            "select session, cum_usd, cum_input_tokens, cum_cached_input_tokens,"
+            " cum_output_tokens from turn_costs"
+            " where agent = %s and harness = %s order by recorded_at desc, id desc limit 1",
+            (agent, harness))
+        if not rows:
+            return {}
+        row = rows[0]
+        return {
+            "session": row["session"],
+            "cum_usd": float(row["cum_usd"]) if row["cum_usd"] is not None else None,
+            "cum_usage": [int(row["cum_input_tokens"] or 0),
+                          int(row["cum_cached_input_tokens"] or 0),
+                          int(row["cum_output_tokens"] or 0)] if row["cum_input_tokens"] is not None else None,
+        }
 
     def turn_usage(self, agent: str, start: int = 0) -> TurnUsage:
         """Ce que le tour qui vient de finir a coûté, sans rien écrire.
@@ -340,18 +373,18 @@ class CostBook:
         harness = self.tool_of(agent)
         model = self.model_of(agent)
         prices = load_prices(self.prices_path)
-        cum = self._read_cum(agent)
+        cum = self.baseline(agent, harness)
         events = self.events(agent, start)
 
         if harness == "claude":
             totals = [float(e["total_cost_usd"]) for e in events
                       if e.get("type") == "result" and isinstance(e.get("total_cost_usd"), (int, float))]
             usage = [e.get("usage") or {} for e in events if e.get("type") == "result"]
-            session = _last_session(events) or cum.get("claude_session")
-            last = cum.get("claude_usd")
+            session = _last_session(events) or cum.get("session")
+            last = cum.get("cum_usd")
             if not totals:
                 usd = 0.0
-            elif last is None or session != cum.get("claude_session"):
+            elif last is None or session != cum.get("session"):
                 # Session neuve (ou inconnue) : son `total_cost_usd` cumulé part de
                 # zéro, donc le dernier relevé EST le coût du tour. Le soustraire
                 # d'un repère d'une autre session compterait faux.
@@ -374,13 +407,13 @@ class CostBook:
             last = completed[-1]
             current = [int(last.get("input_tokens", 0)), int(last.get("cached_input_tokens", 0)),
                        int(last.get("output_tokens", 0))]
-            previous = cum.get("codex_usage")
-            session = _last_session(events) or cum.get("codex_session")
-            if session == cum.get("codex_session") and isinstance(previous, list) and len(previous) == 3 \
+            previous = cum.get("cum_usage")
+            session = _last_session(events) or cum.get("session")
+            if session == cum.get("session") and isinstance(previous, list) and len(previous) == 3 \
                     and all(c >= p for c, p in zip(current, previous)):
                 # Même fil : `turn.completed` porte l'usage **cumulé** du fil.
                 delta = [c - p for c, p in zip(current, previous)]
-            elif previous is None or session != cum.get("codex_session"):
+            elif previous is None or session != cum.get("session"):
                 # Fil neuf : le cumul du fil EST le tour.
                 delta = current
             else:
@@ -405,44 +438,44 @@ class CostBook:
 
     def record(self, agent: str, start: int = 0, turn: str | None = None,
                session: str | None = None) -> TurnUsage:
-        """Compte le tour qui vient de finir : repère de cumul + ligne `turn_costs`."""
-        usage = self.turn_usage(agent, start)
+        """Compte le tour qui vient de finir : **une** ligne `turn_costs`.
+
+        La ligne porte le cumul brut du harnais, qui sert de repère au tour
+        suivant : insertion et repère sont la même écriture. Si l'insertion
+        échoue, rien n'a bougé et un tour rejoué retrouve le même delta.
+
+        La base est donc obligatoire ici : sans elle, il n'y a pas de grand livre,
+        et un repère en fichier serait exactement le défaut que ce lot corrige.
+        """
+        if self.db is None:
+            raise CostError("record sans base : le repère de cumul vit dans turn_costs")
         events = self.events(agent, start)
-        cum = self._read_cum(agent)
-        session_id = _last_session(events)
+        usage = self.turn_usage(agent, start)
+        session_id = session or _last_session(events) or None
+        cum_usd = cum_input = cum_cached = cum_out = None
         if usage.harness == "claude":
             totals = [float(e["total_cost_usd"]) for e in events
                       if e.get("type") == "result" and isinstance(e.get("total_cost_usd"), (int, float))]
             if totals:
-                cum["claude_usd"] = totals[-1]
-            if session_id:
-                cum["claude_session"] = session_id
+                cum_usd = totals[-1]
         elif usage.harness == "codex":
             completed = [e.get("usage") or {} for e in events if e.get("type") == "turn.completed"]
             if completed:
                 last = completed[-1]
-                cum["codex_usage"] = [int(last.get("input_tokens", 0)),
-                                      int(last.get("cached_input_tokens", 0)),
-                                      int(last.get("output_tokens", 0))]
-                if session_id:
-                    cum["codex_session"] = session_id
-        else:
-            cum["deepseek_steps"] = int(cum.get("deepseek_steps", 0)) + len(
-                [e for e in events if e.get("type") == "status" and e.get("phase") == "step_end"])
-        os.makedirs(self.agent_dir(agent), exist_ok=True)
-        with open(self._cum_path(agent), "w", encoding="utf-8") as fh:
-            json.dump(cum, fh)
+                cum_input = int(last.get("input_tokens", 0))
+                cum_cached = int(last.get("cached_input_tokens", 0))
+                cum_out = int(last.get("output_tokens", 0))
         row = usage.row()
         row["turn"] = turn or usage.turn
-        row["session"] = session or usage.session
-        if self.db is not None:
-            self.db.execute(
-                "insert into turn_costs (agent, harness, turn, model, session, usd,"
-                " input_tokens, cached_input_tokens, output_tokens)"
-                " values (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (row["agent"], row["harness"], row["turn"], row["model"], row["session"],
-                 row["usd"], row["input_tokens"], row["cached_input_tokens"],
-                 row["output_tokens"]))
+        row["session"] = session_id
+        self.db.execute(
+            "insert into turn_costs (agent, harness, turn, model, session, usd,"
+            " input_tokens, cached_input_tokens, output_tokens,"
+            " cum_usd, cum_input_tokens, cum_cached_input_tokens, cum_output_tokens)"
+            " values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (row["agent"], row["harness"], row["turn"], row["model"], row["session"],
+             row["usd"], row["input_tokens"], row["cached_input_tokens"],
+             row["output_tokens"], cum_usd, cum_input, cum_cached, cum_out))
         return usage
 
     # -- dépense ------------------------------------------------------------
@@ -522,6 +555,32 @@ def format_report(rows: Iterable[dict]) -> str:
             row["agent"], row["harness"], row["model"],
             row["spent_1h"], row["spent_24h"], gauges))
     return "\n".join(lines)
+
+
+def _find_rate_limits(node, depth: int = 0):
+    """Le premier objet « rate_limits » d'un événement, quel que soit son ordre.
+
+    On reconnaît la forme au fond, pas au chemin : un objet qui porte `primary` ou
+    `secondary` avec un `used_percent`. Les journaux des harnais changent de
+    nesting sans prévenir, et une jauge manquée est une pause manquée.
+    """
+    if depth > 6:
+        return None
+    if isinstance(node, dict):
+        for key in ("primary", "secondary"):
+            value = node.get(key)
+            if isinstance(value, dict) and "used_percent" in value:
+                return node
+        for value in node.values():
+            found = _find_rate_limits(value, depth + 1)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = _find_rate_limits(value, depth + 1)
+            if found:
+                return found
+    return None
 
 
 def _last_session(events: Iterable[dict]) -> str:
