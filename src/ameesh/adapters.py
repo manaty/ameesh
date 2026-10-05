@@ -76,6 +76,9 @@ class HarnessSpec:
     session_flag: tuple[str, ...]
     model_flags: tuple[str, ...] = ()
     effort_flags: tuple[str, ...] = ()
+    #: niveau de service du fournisseur (`ameesh set tier=…`, L26) via `{tier}` ;
+    #: vide = le harnais n'en a pas, le réglage est sans effet
+    tier_flags: tuple[str, ...] = ()
 
 
 SPECS: dict[str, HarnessSpec] = {
@@ -96,6 +99,7 @@ SPECS: dict[str, HarnessSpec] = {
         session_flag=("resume",),
         model_flags=("-m", "{model}"),
         effort_flags=("-c", 'model_reasoning_effort="{effort}"'),
+        tier_flags=("-c", 'service_tier="{tier}"'),
     ),
     "deepseek": HarnessSpec(
         key="deepseek", binary="dsh",
@@ -169,27 +173,34 @@ class HarnessAdapter:
             argv.append(text)
         return argv
 
-    def _options(self, model: str | None, effort: str | None) -> list[str]:
-        """Options modèle/effort, déclarées par le descripteur (0019)."""
+    def _options(self, model: str | None, effort: str | None,
+                 tier: str | None = None) -> list[str]:
+        """Options modèle/effort/tier, déclarées par le descripteur (0019, L26)."""
+        values = {"model": model or "", "effort": effort or "", "tier": tier or ""}
         out: list[str] = []
         if model:
-            out += [flag.format(model=model, effort=effort or "")
-                    for flag in self.spec.model_flags]
+            out += [flag.format(**values) for flag in self.spec.model_flags]
         if effort:
-            out += [flag.format(model=model or "", effort=effort)
-                    for flag in self.spec.effort_flags]
+            out += [flag.format(**values) for flag in self.spec.effort_flags]
+        if tier:
+            out += [flag.format(**values) for flag in self.spec.tier_flags]
         return out
+
+    def supports_tier(self) -> bool:
+        """Le descripteur sait-il passer un tier au harnais ?"""
+        return bool(self.spec.tier_flags)
 
     def command(self, text: str, session_id: str | None = None,
                 model: str | None = None, effort: str | None = None,
-                patch: str | None = None) -> list[str]:
+                patch: str | None = None, tier: str | None = None) -> list[str]:
         """Ligne de commande d'un tour sans tête (le texte est la consigne).
 
-        `model` et `effort` sont appliqués s'ils sont fournis ; `patch` et
-        l'écriture du patch YAML sont propres à DeepSeek (voir la sous-classe).
+        `model`, `effort` et `tier` sont appliqués s'ils sont fournis (un
+        harnais sans `tier_flags` ignore le tier) ; `patch` et l'écriture du
+        patch YAML sont propres à DeepSeek (voir la sous-classe).
         """
         return self._argv(self.spec.headless, session_id, text,
-                          extra=self._options(model, effort))
+                          extra=self._options(model, effort, tier))
 
     def interactive_command(self, session_id: str | None = None) -> list[str]:
         """Commande d'une session **interactive** sur la même session (attach, C9).
@@ -288,7 +299,7 @@ class DeepseekAdapter(HarnessAdapter):
 
     def command(self, text: str, session_id: str | None = None,
                 model: str | None = None, effort: str | None = None,
-                patch: str | None = None) -> list[str]:
+                patch: str | None = None, tier: str | None = None) -> list[str]:
         """DeepSeek n'a pas d'options modèle/effort : il reçoit un patch YAML.
 
         Le fichier est écrit par l'exécuteur (il connaît l'état de l'agent) ; le

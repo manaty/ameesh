@@ -13,6 +13,9 @@ Routes :
     GET  /enroll/<jeton>      page d'enrôlement
     POST /enroll/<jeton>      attestation → proposition de canon
     GET  /static/<fichier>    approve.js, approve.css
+    GET  /health              sans jeton ni secret : la politique publiée
+                              (RP ID, origines, profil) pour `ameesh
+                              approve-check` ; mêmes règles de Host que l'API
 
 Défenses (toutes les réponses, y compris les erreurs) : CSP stricte sans
 script en ligne, `X-Content-Type-Options: nosniff`, `Referrer-Policy:
@@ -21,13 +24,15 @@ En plus :
 
 * en-tête Host contrôlé : pages humaines sous un hôte des origines
   autorisées ; API de service sous l'hôte local (127.0.0.1:port) seulement,
-  sauf `api_via_public` (anti-rebinding DNS) ;
+  sauf `api_via_public` (anti-rebinding DNS), écrit dans le JSON ;
 * POST humains : `Origin` doit être une origine autorisée (et
   `Sec-Fetch-Site`, s'il est présent, same-origin) ; API : aucun `Origin`
   (un navigateur n'a rien à y faire) ;
 * corps : `Content-Length` obligatoire, borné (413 sans lecture), JSON seul ;
 * limitation de débit par IP et par jeton (seaux à jetons en mémoire) ;
 * nombre de connexions simultanées borné, délai de socket ;
+* TLS local facultatif (`tls.TlsReloader`, passthrough) : la poignée de main
+  se fait dans le fil de la connexion, sous le même délai ;
 * journal sans secrets : chemins à jeton masqués, toute suite base64url
   longue masquée, jamais d'en-tête ni de corps.
 """
@@ -74,6 +79,7 @@ _TOKEN_PATH = r"([A-Za-z0-9_-]{43})"
 _ROUTES = (
     ("api", "POST", re.compile(r"^/requests$")),
     ("api", "GET", re.compile(r"^/receipts/(req_[0-9a-z]{26})$")),
+    ("health", "GET", re.compile(r"^/health$")),
     ("approve", "GET POST", re.compile(r"^/a/%s$" % _TOKEN_PATH)),
     ("enroll", "GET POST", re.compile(r"^/enroll/%s$" % _TOKEN_PATH)),
     ("static", "GET", re.compile(r"^/static/([a-z]+\.(?:js|css))$")),
@@ -126,10 +132,12 @@ class ApproveHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     request_queue_size = 64
 
-    def __init__(self, service: ApproveService, address: tuple[str, int]):
+    def __init__(self, service: ApproveService, address: tuple[str, int], tls=None):
         if ":" in address[0]:
             self.address_family = socket.AF_INET6
         self.service = service
+        #: TLS local facultatif (tls.TlsReloader) ; None : HTTP sur la boucle
+        self.tls = tls
         cfg = service.cfg
         self.ip_limiter = RateLimiter(cfg.rate_ip_per_minute)
         self.token_limiter = RateLimiter(cfg.rate_token_per_minute)
@@ -143,6 +151,16 @@ class ApproveHTTPServer(ThreadingHTTPServer):
         for name, content_type in STATIC_FILES.items():
             with open(os.path.join(STATIC_DIR, name), "rb") as fh:
                 self.static[name] = (fh.read(), content_type)
+
+    def get_request(self):
+        sock, address = super().get_request()
+        if self.tls is not None:
+            try:
+                sock = self.tls.wrap(sock)
+            except Exception:
+                sock.close()
+                raise
+        return sock, address
 
     def process_request(self, request, client_address):
         if not self._slots.acquire(blocking=False):
@@ -176,6 +194,11 @@ class ApproveHandler(BaseHTTPRequestHandler):
 
     def setup(self) -> None:
         self.timeout = self.server.service.cfg.socket_timeout
+        if self.server.tls is not None:
+            # poignée de main TLS ici, sous le délai de socket : un client
+            # lent ou muet ne tient que son propre fil
+            self.request.settimeout(self.timeout)
+            self.request.do_handshake()
         super().setup()
 
     def version_string(self) -> str:
@@ -267,7 +290,7 @@ class ApproveHandler(BaseHTTPRequestHandler):
         if len(hosts) != 1:
             return False
         host = hosts[0].strip().lower()
-        if kind == "api":
+        if kind in ("api", "health"):
             allowed = self.server.local_hosts
             if self.server.service.cfg.api_via_public:
                 allowed = allowed | self.server.public_hosts
@@ -346,6 +369,11 @@ class ApproveHandler(BaseHTTPRequestHandler):
                 raise ApproveError(421, "host", "en-tête Host non admis")
             if kind == "static":
                 return self._static(value)
+            if kind == "health":
+                if self.headers.get("Origin") is not None:
+                    raise ApproveError(403, "origin", "aucun navigateur admis")
+                return self._json(200, self.server.service.health(tls=self.server.tls
+                                                                  is not None))
             # corps lu (borné) AVANT les contrôles d'autorisation : la réponse
             # d'erreur part sur une connexion propre
             body = self._read_body() if self.command == "POST" else b""
@@ -409,9 +437,11 @@ class ApproveHandler(BaseHTTPRequestHandler):
 
 
 def make_server(service: ApproveService, *, bind: str | None = None,
-                port: int | None = None) -> ApproveHTTPServer:
+                port: int | None = None, tls=None) -> ApproveHTTPServer:
+    """Le serveur ; `tls` (tls.TlsReloader) active le TLS local (passthrough)."""
     cfg = service.cfg
-    return ApproveHTTPServer(service, (bind or cfg.bind, cfg.port if port is None else port))
+    return ApproveHTTPServer(service, (bind or cfg.bind, cfg.port if port is None else port),
+                             tls=tls)
 
 
 def serve_in_thread(server: ApproveHTTPServer) -> threading.Thread:

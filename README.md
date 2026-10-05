@@ -38,8 +38,19 @@ ameesh action propose | execute | reconcile …     # the gate
 ameesh action request | fetch-receipt <id>        # ask ameesh-approve, attach the receipt
 ameesh decisions [--for human:ID]                 # what waits for a human
 ameesh receipt verify | authenticator list        # receipts, trust registry
+ameesh review-class <files…|--diff REF>           # review class of a change (canon policy)
 ameesh-approve serve | enroll-link | gen-token    # the approval service (own user)
+ameesh approve-check [--json]                     # service and verifiers share RP ID/origins
+ameesh progress [--json|--html F] [--since 24h]  # lots, agents, milestones, budget (docs/PROGRESS.md)
+ameesh alerts [--follow] --json                   # long turn, idle with mail, dead runner, big session, stale lot
+ameesh restart <agent> --brief FILE|-             # stop the turn, forget the session, brief first
+ameesh interrupt <agent> <message…>               # direct interruption (authorised senders only)
+ameesh set <agent> tier=fast session_policy=par-lot|taille|jamais
+ameesh cost turns | gauges | balance --json       # usage per turn, plan gauges history, paid-per-token balance
 ```
+
+Operating agents (L26: session per lot, enriched `list --json`, alerts,
+restart, balances — schemas): [`docs/EXPLOITATION.md`](docs/EXPLOITATION.md).
 
 Demo — the whole scenario of the end-to-end test (`tests/test_bout_en_bout.py`),
 commented, on a temporary database that is dropped afterwards (fictitious
@@ -50,6 +61,12 @@ scripts/demo-v1.sh
 ```
 
 Switching the real site from v0: [`docs/BASCULE.md`](docs/BASCULE.md).
+Hosting profile « cluster » (one persistent agent per Kubernetes pod, image,
+example manifests, read-only supervisor role):
+[`docs/profils/cluster.md`](docs/profils/cluster.md).
+Hosting one team's ameesh-approve (own host, RP ID = that host, strict
+profile, optional local TLS behind a TLS-passthrough gateway, database role):
+[`docs/profils/heberger-ameesh-approve.md`](docs/profils/heberger-ameesh-approve.md).
 
 ## State — v1 points 1 to 5 are built (bench)
 
@@ -91,10 +108,11 @@ scripts/demo-v1.sh
 
 # work items
 python3 -m ameesh.mesh_cli work add --title "un lot" --app nexlink --assignee deepseek7
-python3 -m ameesh.mesh_cli work list
+python3 -m ameesh.mesh_cli work list      # + column DÉLAI (phase and age, R19)
+python3 -m ameesh.mesh_cli work show 1    # milestones and durations: demande → gel → revue → fusion
 ```
 
-Repo-local wrappers: `bin/agent-mail`, `bin/agent-runner`, `bin/agent-mesh`
+Repo-local wrappers: `bin/ameesh`, `bin/agent-mail`, `bin/agent-runner`, `bin/ameesh-approve`
 (they only set `PYTHONPATH=src`; nothing is installed into `~/.local/bin`).
 
 ## Commands
@@ -124,7 +142,10 @@ attente et le message passe en tête. La **rotation de session** (résumé de
 reprise puis session neuve, seuils `AMEESH_SESSION_MAX_TOKENS` /
 `AMEESH_SESSION_MAX_TURN_SECONDS`) et l'**adoption d'un dossier de travail
 déplacé** (`AMEESH_WORKTREE_ROOTS`) sont décrites dans
-[`docs/V1-MAILBOX-RUNNER.md`](docs/V1-MAILBOX-RUNNER.md). Quand un canon est
+[`docs/V1-MAILBOX-RUNNER.md`](docs/V1-MAILBOX-RUNNER.md). Depuis L26, la
+session tourne aussi **au changement de lot** (politique `par-lot`, défaut
+`AMEESH_SESSION_POLICY` ; `taille` pour un orchestrateur, `jamais`), voir
+[`docs/EXPLOITATION.md`](docs/EXPLOITATION.md). Quand un canon est
 configuré, l'exécuteur lance `canon sync` au démarrage puis toutes les
 `AMEESH_CANON_SYNC_INTERVAL` secondes (défaut 300) ; un échec ne l'arrête
 jamais.
@@ -322,8 +343,10 @@ src/ameesh/
   mail.py         agent_mailbox: send, unread, deliver, history
   fil.py          readable threads: Transport, file transport, index, ameesh fil
   migrations.py   NNNN_name.sql, checksummed, advisory-locked
-  migrations/     0001_init.sql … 0009_threads.sql, 0011_receipts.sql, 0014_cost.sql, 0022_placement.sql (numéros réservés : 0010, 0012–0013, 0015–0021)
-  mesh_cli.py     agent-mesh: mesh list, keys, approvals, work items, import/export v0
+  migrations/     0001_init.sql … 0009_threads.sql, 0011_receipts.sql, 0013_work_item_milestones.sql,
+                  0014_cost.sql, 0022_placement.sql (numéros réservés : 0010, 0012, 0015–0021)
+  review.py       politique de revue par classe de risque (canon) ; ameesh review-class
+  mesh_cli.py     agent-mesh: mesh list, keys, approvals, work items, review-class, import/export v0
   authority.py    Ed25519 proofs bound to content and expiry; approvals
   signing.py      Ed25519 (pure RFC 8032 + optional cryptography/nacl), key files
   jcs.py          RFC 8785 canonical JSON (receipt challenges, action digests)

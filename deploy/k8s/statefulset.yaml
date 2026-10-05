@@ -1,0 +1,277 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# UN agent persistant = UN StatefulSet à UNE réplique.
+#
+# Identité : le nom du pod (`ameesh-agent-0`) est l'hôte ameesh
+# (AMEESH_HOST, par l'API descendante). Le canon doit déclarer un `Host` de ce
+# nom, avec son responsable et sa politique, et le `Placement` de l'agent sur
+# cet hôte — sinon l'agent n'est pas réclamable (R14, C4 : fail closed).
+#
+# Conteneurs :
+#   migrate      (init) `ameesh migrate` — idempotent, sous verrou consultatif ;
+#                provisoire : exige des droits DDL pour le rôle de l'exécuteur
+#                (risque et suite prévue : docs/profils/cluster.md, section 9) ;
+#   canon        (init) clone le canon avec la clé de déploiement (lecture
+#                seule), puis `ameesh canon sync --fetch` ;
+#   runner       l'exécuteur (`agent-runner`) et le harnais qu'il lance ; voit
+#                le canon en LECTURE SEULE et jamais la clé de déploiement ;
+#   canon-fetch  `git fetch` périodique du canon ; l'exécuteur relit le canon
+#                toutes les AMEESH_CANON_SYNC_INTERVAL secondes (sans fetch).
+#
+# Secrets (créés à part, jamais dans ce dépôt — secrets.exemple.yaml) :
+#   ameesh-db                 password                       → PGPASSWORD
+#   ameesh-harness            clés d'API des fournisseurs    → environnement du harnais
+#   ameesh-canon-deploy-key   ssh-privatekey, known_hosts    → init canon et canon-fetch
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ameesh-agent
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/component: runner
+spec:
+  # JAMAIS plus d'une réplique : chaque pod est un hôte distinct pour ameesh ;
+  # deux répliques feraient deux hôtes, pas un agent redondant. Le bail en
+  # base empêche de toute façon deux exécuteurs de servir le même agent.
+  replicas: 1
+  serviceName: ameesh-agent
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ameesh
+      app.kubernetes.io/component: runner
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ameesh
+        app.kubernetes.io/component: runner
+    spec:
+      serviceAccountName: ameesh-agent
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # Arrêt propre de l'exécuteur sur SIGTERM (relayé par tini) : fin de
+      # l'attente en cours, SIGTERM au groupe du harnais, 3 s de grâce puis
+      # SIGKILL, 8 s au plus pour joindre les tours, bail rendu. Une requête
+      # en vol peut durer jusqu'au statement_timeout (30 s par défaut). 60 s
+      # couvrent le tout ; au-delà, Kubernetes tue le pod et le bail expire
+      # seul (lease_ttl) avant qu'un autre exécuteur ne reprenne l'agent.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+
+      initContainers:
+        - name: migrate
+          image: ameesh-runner
+          # `args` seulement : l'ENTRYPOINT de l'image (tini) est conservé
+          args: ["ameesh", "migrate"]
+          env:
+            - name: AMEESH_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ameesh-db
+                  key: password
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ameesh/config
+              readOnly: true
+
+        - name: canon
+          image: ameesh-runner
+          args:
+            - sh
+            - -ec
+            - |
+              # La clé est copiée en 0600 dans un /tmp propre à ce conteneur
+              # (ssh refuse une clé lisible par le groupe).
+              install -m 600 /etc/ameesh/canon-key/ssh-privatekey /tmp/canon-key
+              export GIT_SSH_COMMAND="ssh -i /tmp/canon-key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/ameesh/canon-key/known_hosts"
+              repo=/var/lib/ameesh/canon/repo
+              if [ ! -d "$repo/.git" ]; then
+                git clone --quiet --branch "$CANON_BRANCH" -- "$CANON_URL" "$repo"
+              fi
+              # Un canon invalide ou illisible ne bloque pas le démarrage : il
+              # ferme la réclamation des agents du canon (fail closed), comme
+              # `ExecStartPre=-` dans le profil local (docs/BASCULE.md, étape 7).
+              ameesh canon sync --fetch \
+                || echo "canon sync en échec : réclamation fermée jusqu'au prochain sync" >&2
+              rm -f /tmp/canon-key
+          env:
+            - name: AMEESH_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ameesh-db
+                  key: password
+            - name: CANON_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: ameesh-canon
+                  key: url
+            - name: CANON_BRANCH
+              valueFrom:
+                configMapKeyRef:
+                  name: ameesh-canon
+                  key: branch
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/ameesh/config
+              readOnly: true
+            - name: canon
+              mountPath: /var/lib/ameesh/canon
+            - name: canon-key
+              mountPath: /etc/ameesh/canon-key
+              readOnly: true
+            - name: canon-tmp
+              mountPath: /tmp
+
+      containers:
+        - name: runner
+          image: ameesh-runner
+          args: ["agent-runner", "--poll", "5"]
+          env:
+            - name: AMEESH_HOST
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ameesh-db
+                  key: password
+          # Clés d'API des fournisseurs (ANTHROPIC_API_KEY, OPENAI_API_KEY,
+          # DEEPSEEK_API_KEY… selon le harnais) : toutes les clés du Secret
+          # deviennent des variables d'environnement, héritées par le harnais.
+          envFrom:
+            - secretRef:
+                name: ameesh-harness
+                optional: true
+          # Prêt = base joignable, schéma présent, migrations à jour (lecture
+          # seule, ni NOTIFY ni comptage). Pas de livenessProbe : redémarrer le
+          # pod ne répare pas une base injoignable, et l'exécuteur gère déjà
+          # cette panne (harnais arrêté à l'échéance du bail) ; s'il meurt, le
+          # conteneur sort et Kubernetes le relance.
+          readinessProbe:
+            exec:
+              command: ["ameesh", "doctor", "--probe"]
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: home
+              mountPath: /home/ameesh
+            - name: config
+              mountPath: /etc/ameesh/config
+              readOnly: true
+            - name: canon
+              mountPath: /var/lib/ameesh/canon
+              readOnly: true
+            - name: runner-tmp
+              mountPath: /tmp
+
+        - name: canon-fetch
+          image: ameesh-runner
+          args:
+            - sh
+            - -ec
+            - |
+              install -m 600 /etc/ameesh/canon-key/ssh-privatekey /tmp/canon-key
+              export GIT_SSH_COMMAND="ssh -i /tmp/canon-key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/ameesh/canon-key/known_hosts"
+              while :; do
+                git -C /var/lib/ameesh/canon/repo fetch --quiet --no-tags origin \
+                  || echo "git fetch du canon en échec : dernière révision connue conservée" >&2
+                sleep "$CANON_FETCH_INTERVAL" & wait $!
+              done
+          env:
+            - name: CANON_FETCH_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: ameesh-canon
+                  key: fetch-interval
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: canon
+              mountPath: /var/lib/ameesh/canon
+            - name: canon-key
+              mountPath: /etc/ameesh/canon-key
+              readOnly: true
+            - name: canon-tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: config
+          configMap:
+            name: ameesh-config
+        - name: canon
+          emptyDir: {}
+        - name: canon-key
+          secret:
+            secretName: ameesh-canon-deploy-key
+            defaultMode: 0440
+        - name: canon-tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: runner-tmp
+          emptyDir:
+            sizeLimit: 1Gi
+
+  # HOME de l'agent : sessions du harnais (~/.claude, ~/.codex…), état
+  # d'ameesh (~/.local/state/ameesh, dont les fils lisibles) et dossiers de
+  # travail (cwd du Placement, par exemple /home/ameesh/travail/<projet>).
+  # Conservé quand le pod est recréé, et quand le StatefulSet est supprimé
+  # (politique par défaut de Kubernetes : la PVC reste).
+  volumeClaimTemplates:
+    - metadata:
+        name: home
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # storageClassName: <classe>   # à adapter
+        resources:
+          requests:
+            storage: 20Gi

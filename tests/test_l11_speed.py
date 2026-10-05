@@ -298,6 +298,8 @@ class StopTriggersTest(PgTestCase):
         ("arret", lambda w: w.stopping.set()),
         ("echeance", lambda w: setattr(w, "lease_deadline", time.time() - 1.0)),
         ("stop-demande", lambda w: w.stop_requested.set()),
+        # L26 : `ameesh restart` passe par le même point de passage
+        ("redemarrage", lambda w: w.restarting.set()),
     )
 
     def _worker(self, name: str):

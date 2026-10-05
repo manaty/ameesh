@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Le canon OKF : fiches Agent, Host, Placement, Member ; validation (C2, C3).
+"""Le canon OKF : fiches Agent, Host, Placement, Member, WorkPackage ; validation (C2, C3).
 
 Spec §4. ameesh ne lit que le **frontmatter** des fichiers `.md` d'un bundle
 OKF (hors `index.md` et `log.md`) et n'écrit jamais dans le canon.
@@ -40,6 +40,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
+from . import review as review_mod
 from .config import HARNESSES, NAME_RE
 
 try:  # facultatif : jamais requis
@@ -47,7 +48,12 @@ try:  # facultatif : jamais requis
 except Exception:  # pragma: no cover - dépend de l'environnement
     _yaml = None
 
-PROFILE_TYPES = ("Agent", "Host", "Placement", "Member")
+PROFILE_TYPES = ("Agent", "Host", "Placement", "Member", "WorkPackage")
+#: les sortes de fiches WorkPackage (plan de travail, L29) et les parents admis
+PACKAGE_KINDS = ("milestone", "epic", "lot")
+PACKAGE_PARENTS = {"milestone": (), "epic": ("milestone",), "lot": ("epic", "milestone")}
+#: identifiant d'une fiche WorkPackage (clé `id`, sinon nom du fichier sans `.md`)
+PACKAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 KNOWN_CAPABILITIES = ("read", "report-drift", "propose")
 #: R8 : l'autorité de décision est réservée aux humains
 FORBIDDEN_CAPABILITIES = ("approve",)
@@ -627,6 +633,7 @@ class Finding:
     agent: str = ""         # agent concerné (une erreur bloque cet agent)
     host: str = ""          # hôte concerné (une erreur bloque ses agents)
     untrusted: bool = False  # lu hors source approuvée
+    package: str = ""       # fiche WorkPackage concernée (ne bloque aucun agent)
 
     def to_dict(self) -> dict:
         out = {"code": self.code, "severity": self.severity, "member": self.member,
@@ -635,6 +642,8 @@ class Finding:
             out["agent"] = self.agent
         if self.host:
             out["host"] = self.host
+        if self.package:
+            out["package"] = self.package
         if self.untrusted:
             out["untrusted"] = True
         return out
@@ -731,6 +740,21 @@ class Placement:
 
 
 @dataclass
+class WorkPackage:
+    """Une fiche du plan de travail (L29) : jalon, epic ou lot."""
+
+    id: str
+    title: str
+    kind: str | None
+    parent: str | None
+    responsible: str | None
+    team: str | None
+    scope: list[str] | None
+    status: str | None
+    fiche: Fiche
+
+
+@dataclass
 class Canon:
     root: str
     sources: list[Source] = field(default_factory=list)
@@ -738,6 +762,7 @@ class Canon:
     agents: list[Agent] = field(default_factory=list)
     hosts: list[Host] = field(default_factory=list)
     placements: list[Placement] = field(default_factory=list)
+    packages: list[WorkPackage] = field(default_factory=list)
     federation: dict | None = None
     #: constats de lecture (source, fédération, frontmatter, champs)
     load_findings: list[Finding] = field(default_factory=list)
@@ -772,6 +797,12 @@ class Canon:
         for host in self.hosts:
             if host.title == name:
                 return host
+        return None
+
+    def package(self, ident: str) -> WorkPackage | None:
+        for package in self.packages:
+            if package.id == ident:
+                return package
         return None
 
     def placements_of(self, agent: str) -> list[Placement]:
@@ -821,6 +852,10 @@ class Canon:
             "placements": [dict(title=p.title, agent=p.agent, host=p.host,
                                 credential_mode=p.credential_mode, cwd=p.cwd, **fiche(p.fiche))
                            for p in self.placements],
+            "packages": [dict(id=w.id, title=w.title, kind=w.kind, parent=w.parent,
+                              responsible=w.responsible, team=w.team, scope=w.scope,
+                              status=w.status, **fiche(w.fiche))
+                         for w in self.packages],
             "federation": {"id": (self.federation or {}).get("id"),
                            "roles": self.roles, "review_policies": self.review_policies},
         }
@@ -931,6 +966,66 @@ def _git_out(repo: str, *args: str) -> str | None:
     if proc.returncode != 0:
         return None
     return proc.stdout.decode("utf-8", "replace").strip()
+
+
+def _git_message(proc: subprocess.CompletedProcess) -> str:
+    """Le message d'erreur de git, ou son code de sortie s'il est muet."""
+    text = proc.stderr.decode("utf-8", "replace").strip()
+    return text or ("code %d" % proc.returncode)
+
+
+def git_changed_paths(repo: str, ref: str = "") -> list[str]:
+    """Les chemins d'un changement, relatifs à la racine du dépôt (L10).
+
+    Le changement est lu entre **`merge-base(ref, HEAD)`** et **l'arbre de
+    travail** (suivi, index et non indexé), plus les fichiers non suivis : c'est
+    ce qu'un gel emporterait (mesh-design). Un renommage compte pour ses **deux**
+    chemins, l'ancien et le nouveau, parce que la politique de revue les couvre
+    tous les deux. `ref` vide vaut `HEAD` (« tout ce qui n'est pas committé »).
+
+    Toute erreur git — référence inconnue, dépôt illisible — lève [`GitError`] :
+    une liste vide ou partielle se lirait comme « rien à relire », donc une
+    classe rassurante sur un changement qu'on n'a pas su lire (revue codex2, B2).
+    """
+    paths: set[str] = set()
+    base = "HEAD"
+    if ref:
+        # `merge-base` échoue aussi quand les historiques n'ont pas d'ancêtre
+        # commun : là, le repli légitime est la référence elle-même. Mais une
+        # référence *inconnue* n'a pas de diff : c'est une erreur, jamais [].
+        verified = git_commit(repo, ref)
+        if verified is None:
+            raise GitError("référence git inconnue : %s" % ref)
+        proc = _git(repo, "merge-base", verified, "HEAD")
+        if proc.returncode == 0 and proc.stdout.strip():
+            base = proc.stdout.decode("utf-8", "replace").strip()
+        else:
+            base = verified
+    proc = _git(repo, "diff", "--name-status", "-z", "--find-renames", base)
+    if proc.returncode != 0:
+        raise GitError("git diff %s : %s" % (base, _git_message(proc)))
+    fields = proc.stdout.decode("utf-8", "replace").split("\0")
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        if not status:
+            break
+        if status[0] in ("R", "C"):
+            if index + 2 >= len(fields):
+                break
+            paths.add(fields[index + 1])
+            paths.add(fields[index + 2])
+            index += 3
+        else:
+            if index + 1 >= len(fields):
+                break
+            paths.add(fields[index + 1])
+            index += 2
+    proc = _git(repo, "ls-files", "--others", "--exclude-standard", "-z")
+    if proc.returncode != 0:
+        raise GitError("git ls-files : %s" % _git_message(proc))
+    paths.update(name for name in proc.stdout.decode("utf-8", "replace").split("\0") if name)
+    return sorted(paths)
 
 
 def git_toplevel(directory: str) -> str | None:
@@ -1440,10 +1535,14 @@ class _Loader:
                 return
             data = load_yaml(block, use_pyyaml=self.use_pyyaml)
         except YamlError as exc:
-            typed = bool(_TYPED_RE.search(text[:FRONTMATTER_MAX]))
+            typed = _TYPED_RE.search(text[:FRONTMATTER_MAX])
+            # une fiche du plan illisible ne bloque aucun agent (L29)
+            subject = ({"package": _package_stem(path)}
+                       if typed and typed.group(1) == "WorkPackage" else {})
             self.add("frontmatter-invalid", ERROR if typed else WARNING,
                      "frontmatter illisible : %s%s" % (
-                         exc, "" if typed else " (type inconnu : fiche ignorée)"), **where)
+                         exc, "" if typed else " (type inconnu : fiche ignorée)"),
+                     **where, **subject)
             return
         if not isinstance(data, dict):
             return
@@ -1455,7 +1554,9 @@ class _Loader:
                       ref="%s:%s@%s" % (source.member, path, version), data=data,
                       untrusted=source.mode != "git")
         if not title and kind != "Placement":
-            self.add("fiche-title-missing", ERROR, "fiche %s sans `title`" % kind, **where)
+            subject = {"package": _package_stem(path)} if kind == "WorkPackage" else {}
+            self.add("fiche-title-missing", ERROR, "fiche %s sans `title`" % kind, **where,
+                     **subject)
             return
         build = getattr(self, "_build_" + kind.lower())
         build(fiche, where)
@@ -1554,6 +1655,27 @@ class _Loader:
             cwd=_text(fiche.data.get("cwd")),
             fiche=fiche,
         ))
+
+
+    def _build_workpackage(self, fiche: Fiche, where: dict) -> None:
+        ident = _text(fiche.data.get("id")) or _package_stem(fiche.path)
+        subject = {"package": ident}
+        scope = self._list(fiche, "scope", where, "package-scope-invalid", **subject)
+        self.canon.packages.append(WorkPackage(
+            id=ident, title=fiche.title,
+            kind=_text(fiche.data.get("kind")),
+            parent=_text(fiche.data.get("parent")),
+            responsible=_text(fiche.data.get("responsible")),
+            team=_text(fiche.data.get("team")),
+            scope=scope,
+            status=_text(fiche.data.get("status")),
+            fiche=fiche))
+
+
+def _package_stem(path: str) -> str:
+    """Identifiant par défaut d'une fiche WorkPackage : son nom de fichier."""
+    name = path.rsplit("/", 1)[-1]
+    return name[:-3] if name.endswith(".md") else name
 
 
 def _text(value: Any) -> str | None:
@@ -1725,6 +1847,18 @@ def validate(canon: Canon) -> list[Finding]:
                 "hôte %s : %d placements pour max_agents = %d"
                 % (host.title, len(by_host[host.title]), limit), host.fiche, host=host.title)
 
+    # -- politique de revue par classe (décision 0018 point 1, R19) ------------
+    # La déclaration vit dans `federation.yaml`, sous `review_policies.classes` :
+    # `canon check` la valide, `ameesh review-class` la relit avec le même code.
+    root_member = canon.sources[0].member if canon.sources else ""
+    _policy, policy_problems = review_mod.policy_from_federation(canon.federation)
+    for code, severity, message in policy_problems:
+        add(code, severity, message,
+            **({"member": root_member, "path": "federation.yaml"} if root_member else {}))
+
+    # -- plan de travail (L29) ----------------------------------------------------------
+    _validate_packages(canon, add)
+
     # -- avertissements -----------------------------------------------------------------
     for agent in canon.agents:
         if agent.title not in by_agent:
@@ -1735,6 +1869,74 @@ def validate(canon: Canon) -> list[Finding]:
             add("host-unplaced", WARNING, "hôte %s sans placement" % host.title,
                 host.fiche, host=host.title)
     return findings
+
+
+def _validate_packages(canon: Canon, add) -> None:
+    """Fiches WorkPackage : identifiant, sorte, parent existant et cohérent,
+    pas de cycle, responsable résolu. Leurs constats portent `package` : ils
+    ne bloquent la réclamation d'aucun agent (voir `blocking`)."""
+    by_id: dict[str, list[WorkPackage]] = defaultdict(list)
+    for package in canon.packages:
+        by_id[package.id].append(package)
+    for ident, group in by_id.items():
+        if len(group) > 1:
+            for package in group:
+                add("package-duplicate", ERROR,
+                    "WorkPackage %s déclaré %d fois (%s)" % (
+                        ident, len(group),
+                        ", ".join("%s:%s" % (g.fiche.member, g.fiche.path) for g in group)),
+                    package.fiche, package=ident)
+    for package in canon.packages:
+        f, ident = package.fiche, package.id
+        if not PACKAGE_ID_RE.match(ident):
+            add("package-id-invalid", ERROR,
+                "identifiant de WorkPackage %r invalide (lettres, chiffres, . _ -, 64 "
+                "caractères au plus)" % ident, f, package=ident)
+        if package.kind not in PACKAGE_KINDS:
+            add("package-kind-invalid", ERROR,
+                "WorkPackage %s : `kind` %r (attendu : %s)"
+                % (ident, package.kind, " | ".join(PACKAGE_KINDS)), f, package=ident)
+        if not package.responsible:
+            add("package-responsible-missing", ERROR,
+                "WorkPackage %s sans `responsible` (un humain répond de chaque élément "
+                "du plan)" % ident, f, package=ident)
+        elif canon.resolve_human(package.responsible) is None:
+            add("package-responsible-unresolved", ERROR,
+                "responsable %r de %s ne résout pas vers un Member humain"
+                % (package.responsible, ident), f, package=ident)
+        if package.parent:
+            parents = by_id.get(package.parent) or []
+            if not parents:
+                add("package-parent-unknown", ERROR,
+                    "WorkPackage %s : parent inconnu %r" % (ident, package.parent), f,
+                    package=ident)
+            elif package.kind in PACKAGE_KINDS and len(parents) == 1:
+                allowed = PACKAGE_PARENTS[package.kind]
+                if parents[0].kind not in allowed:
+                    add("package-kind-incoherent", ERROR,
+                        "WorkPackage %s (%s) sous %s (%s) : %s" % (
+                            ident, package.kind, package.parent, parents[0].kind,
+                            "un %s se place sous %s" % (package.kind, " ou ".join(allowed))
+                            if allowed else "un jalon n'a pas de parent"),
+                        f, package=ident)
+        elif package.kind == "lot":
+            add("package-lot-orphan", WARNING,
+                "lot %s sans parent (un lot se place sous un epic ou un jalon)" % ident,
+                f, package=ident)
+    # cycles : suivre les parents depuis chaque fiche
+    reported: set[str] = set()
+    for package in canon.packages:
+        seen: list[str] = []
+        current: str | None = package.id
+        while current and current not in seen:
+            seen.append(current)
+            nxt = by_id.get(current) or []
+            current = nxt[0].parent if len(nxt) == 1 else None
+        if current and current == package.id and package.id not in reported:
+            reported.update(seen)
+            add("package-cycle", ERROR,
+                "cycle dans le plan : %s" % " → ".join(seen + [current]), package.fiche,
+                package=package.id)
 
 
 def errors(findings: Iterable[Finding]) -> list[Finding]:
@@ -1759,9 +1961,12 @@ class Blocking:
 
 def blocking(findings: Iterable[Finding]) -> Blocking:
     """Une erreur liée à un agent bloque cet agent ; à un hôte, les agents qui y
-    sont placés ; sinon (fédération, frontmatter d'une fiche du profil, …) tous."""
+    sont placés ; à une fiche du plan (WorkPackage, L29), aucun agent ; sinon
+    (fédération, frontmatter d'une fiche du profil, …) tous."""
     result = Blocking([], defaultdict(list), defaultdict(list))
     for finding in errors(findings):
+        if finding.package:
+            continue
         if finding.agent:
             result.by_agent[finding.agent].append(finding)
         elif finding.host:

@@ -1171,6 +1171,75 @@ class ClaimRuleTest(_TmpMixin, PgTestCase):
         self.assertEqual([t["harness"] for t in self.turns()], ["claude"], proc.stdout)
 
 
+class ReviewPolicyTest(_TmpMixin, unittest.TestCase):
+    """`canon check` valide `review_policies.classes` (L10, R19)."""
+
+    def canon_dir(self, manifest: str) -> str:
+        root = self.make_tmp()
+        write(root, "federation.yaml", manifest)
+        return root
+
+    def test_politique_valide_sans_constat(self):
+        root = self.canon_dir(
+            "id: test\nroot: test\nmembers: []\nreview_policies:\n"
+            "  self_approval: forbidden\n  risk_classes:\n    default: normal\n"
+            "    rules:\n      - paths: ['**/*.sql']\n        class: sensitive\n")
+        canon_obj = canon.load(root, untrusted=True)
+        self.assertTrue(canon_obj.readable)
+        self.assertEqual([f.code for f in canon.validate(canon_obj)
+                          if f.code.startswith("review-policies")], [])
+        self.assertEqual(canon_obj.review_policies["self_approval"], "forbidden")
+
+    def test_defaut_manquant_avertit_sans_invalider(self):
+        root = self.canon_dir(
+            "id: test\nroot: test\nmembers: []\nreview_policies:\n"
+            "  risk_classes:\n    rules:\n"
+            "      - paths: ['src/**']\n        class: normal\n")
+        findings = [f for f in canon.validate(canon.load(root, untrusted=True))
+                    if f.code.startswith("review-policies")]
+        self.assertEqual([f.code for f in findings], ["review-policies-default-missing"])
+        self.assertEqual(findings[0].severity, canon.WARNING)
+        self.assertEqual(findings[0].path, "federation.yaml")
+
+    def test_politique_invalide_rapportee(self):
+        root = self.canon_dir(
+            "id: test\nroot: test\nmembers: []\nreview_policies:\n"
+            "  risk_classes:\n    default: urgent\n    rules:\n"
+            "      - paths: []\n        class: normal\n")
+        canon_obj = canon.load(root, untrusted=True)
+        found = codes(canon.validate(canon_obj))
+        self.assertIn("review-policies-class-unknown", found)
+        self.assertIn("review-policies-rule-invalid", found)
+
+    def test_chemins_changes_depuis_une_reference(self):
+        workspace = self.make_tmp()
+        _bare, clone = publish(workspace, "home")
+        write(clone, "a.txt", "un\n")
+        commit_all(clone)
+        ref = git(clone, "rev-parse", "HEAD")
+        write(clone, "b.sql", "deux\n")          # non suivi
+        write(clone, "a.txt", "un bis\n")        # modifié
+        self.assertEqual(canon.git_changed_paths(clone, ref), ["a.txt", "b.sql"])
+        self.assertEqual(canon.git_changed_paths(clone), ["a.txt", "b.sql"])
+
+    def test_reference_inconnue_refusee_au_lieu_d_un_diff_vide(self):
+        """Une erreur git ne vaut jamais une liste vide (revue codex2).
+
+        Sans cela, `review-class --diff <ref inconnue>` rendait un succès sur
+        les seuls fichiers non suivis : une classe partielle, donc rassurante.
+        """
+        workspace = self.make_tmp()
+        _bare, clone = publish(workspace, "home")
+        with self.assertRaises(canon.GitError):
+            canon.git_changed_paths(clone, "ref-qui-n-existe-pas")
+        # une référence valide sans ancêtre commun reste un diff légitime :
+        # le repli sur la référence elle-même, pas une erreur.
+        git(clone, "checkout", "-q", "--orphan", "autre")
+        write(clone, "c.txt", "trois\n")
+        commit_all(clone, "orphelin", push=False)
+        self.assertIn("c.txt", canon.git_changed_paths(clone, "main"))
+
+
 class CanonCliTest(_CanonDbCase):
     def cli_env(self, **extra) -> dict:
         return self.env(AMEESH_CANON=self.root, AMEESH_CANON_UNTRUSTED="1", **extra)
@@ -1194,6 +1263,85 @@ class CanonCliTest(_CanonDbCase):
         proc = self.mesh("canon", "check", env=self.env(AMEESH_CANON=self.root))
         self.assertEqual(proc.returncode, 1)
         self.assertIn("canon-untrusted-refused", proc.stdout)
+
+    def test_review_class(self):
+        write(self.root, "federation.yaml",
+              "id: test\nroot: test\nmembers: []\nreview_policies:\n"
+              "  risk_classes:\n    default: normal\n    rules:\n"
+              "      - paths: ['**/*.sql']\n        class: sensitive\n"
+              "      - paths: ['docs/**']\n        class: light\n")
+        env = self.cli_env()
+        proc = self.mesh("review-class", "db/x.sql", "docs/a.md", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("sensible", proc.stdout)
+        self.assertIn("léger", proc.stdout)
+        proc = self.mesh("review-class", "--json", "docs/a.md", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        data = json.loads(proc.stdout)
+        self.assertEqual(data["class"], "light")
+        self.assertIn("policy_ref", data)      # le commit du canon lu (vide ici : non approuvé)
+        # ni fichier ni --diff : usage
+        proc = self.mesh("review-class", env=env)
+        self.assertEqual(proc.returncode, 2)
+        # chemin hors dépôt : refusé
+        proc = self.mesh("review-class", "../secret.txt", env=env)
+        self.assertEqual(proc.returncode, 1)
+        # --diff REF : dépôt git requis…
+        proc = self.mesh("review-class", "--diff", "HEAD", env=env)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("dépôt git", proc.stderr)
+        # …puis les fichiers changés sont classés
+        git(self.tmp, "init", "-q")
+        write(self.tmp, "db/x.sql", "select 0;\n")
+        git(self.tmp, "add", "-A")
+        git(self.tmp, "commit", "-q", "-m", "base")
+        write(self.tmp, "db/x.sql", "select 1;\n")     # modifié
+        write(self.tmp, "docs/a.md", "note\n")         # non suivi
+        proc = self.mesh("review-class", "--diff", "HEAD", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("sensible", proc.stdout)
+        self.assertIn("docs/a.md", proc.stdout)
+        # une déclaration invalide refuse de classer
+        write(self.root, "federation.yaml",
+              "id: test\nroot: test\nmembers: []\nreview_policies:\n"
+              "  risk_classes:\n    default: urgent\n")
+        proc = self.mesh("review-class", "docs/a.md", env=env)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("review-policies-class-unknown", proc.stderr)
+
+    def test_review_class_chemin_avec_saut_de_ligne(self):
+        """De bout en bout : un dossier au nom contenant un LF reste sensible."""
+        write(self.root, "federation.yaml",
+              "id: test\nroot: test\nmembers: []\nreview_policies:\n"
+              "  risk_classes:\n    default: light\n    rules:\n"
+              "      - paths: ['**/*.sql']\n        class: sensitive\n")
+        env = self.cli_env()
+        git(self.tmp, "init", "-q")
+        write(self.tmp, "db/x.sql", "select 0;\n")
+        git(self.tmp, "add", "-A")
+        git(self.tmp, "commit", "-q", "-m", "base")
+        write(self.tmp, "db/line\nbreak/new.sql", "select 1;\n")   # non suivi
+        proc = self.mesh("review-class", "--diff", "HEAD", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("sensible", proc.stdout)
+        self.assertIn("new.sql", proc.stdout)
+
+    def test_review_class_diff_reference_inconnue(self):
+        """`--diff` sur une référence inconnue : erreur, jamais un succès partiel."""
+        write(self.root, "federation.yaml",
+              "id: test\nroot: test\nmembers: []\nreview_policies:\n"
+              "  risk_classes:\n    default: light\n    rules:\n"
+              "      - paths: ['**/*.sql']\n        class: sensitive\n")
+        env = self.cli_env()
+        git(self.tmp, "init", "-q")
+        write(self.tmp, "db/x.sql", "select 0;\n")
+        git(self.tmp, "add", "-A")
+        git(self.tmp, "commit", "-q", "-m", "base")
+        write(self.tmp, "note.md", "non suivi\n")
+        proc = self.mesh("review-class", "--diff", "ref-qui-n-existe-pas", env=env)
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("référence", proc.stderr)
+        self.assertNotIn("classe :", proc.stdout)   # aucune classe partielle
 
     def test_sans_canon_configure(self):
         proc = self.mesh("canon", "check")

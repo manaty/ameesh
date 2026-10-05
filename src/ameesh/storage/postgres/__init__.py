@@ -10,14 +10,19 @@ from typing import Any
 
 from .. import interface
 from .action_source import ActionSource
+from .accounts import Accounts
 from .actions import Actions
 from .authenticators import Authenticators
 from .authority import Approvals, Keys, Nonces
 from .canon import Canon, Ephemerals
+from .catalog import Catalog
 from .costs import TurnCosts
 from .grants import Grants
 from .mailbox import Mailbox
+from .operations import Operations
+from .packages import WorkPackages
 from .placement import Placements
+from .progress import Progress
 from .registry import Agents, Leases, PendingSpend
 from .threads import Threads
 from .wakeups import Wakeups
@@ -35,12 +40,15 @@ class PostgresStorage(interface.Storage):
         self.leases = Leases(db)
         self.pending_spend = PendingSpend(db)
         self.turn_costs = TurnCosts(db)
+        self.accounts = Accounts(db)
+        self.catalog = Catalog(db)
         self.mailbox = Mailbox(db)
         self.wakeups = Wakeups(db)
         self.keys = Keys(db)
         self.approvals = Approvals(db)
         self.nonces = Nonces(db)
         self.work = WorkItems(db)
+        self.packages = WorkPackages(db)
         self.actions = Actions(db)
         self.action_source = ActionSource(db)
         self.canon = Canon(db)
@@ -49,3 +57,5 @@ class PostgresStorage(interface.Storage):
         self.threads = Threads(db)
         self.grants = Grants(db)
         self.placements = Placements(db)
+        self.progress = Progress(db)
+        self.operations = Operations(db)

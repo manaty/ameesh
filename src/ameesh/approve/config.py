@@ -7,17 +7,33 @@ Lue dans cet ordre, la dernière source l'emporte :
    ou `AMEESH_APPROVE_CONFIG`) ;
 2. les variables d'environnement `AMEESH_APPROVE_*` (`RP_ID`, `ORIGINS` —
    séparées par des virgules, comme pour `ameesh receipt verify` —,
-   `PUBLIC_URL`, `BIND`, `PORT`, `TOKEN_FILE`, `STATE`, `PROPOSALS`, `LEVEL`) ;
+   `PUBLIC_URL`, `BIND`, `PORT`, `TOKEN_FILE`, `STATE`, `PROPOSALS`, `LEVEL`,
+   `PROFILE`, `RESERVED_ZONES`, `RESERVED_HOSTS` — séparées par des virgules —,
+   `TLS_CERT`, `TLS_KEY`) ;
 3. les options de la ligne de commande.
+
+`api_via_public` n'existe que dans le fichier JSON : ouvrir l'API de service
+sous l'hôte public est un choix écrit, jamais une option d'environnement.
 
 Règles de sûreté vérifiées ici, au démarrage :
 
-* le service n'écoute **que sur la boucle locale** (127.0.0.1, ::1) : il ne
-  parle pas TLS, c'est le mandataire inverse (page Nexlink, 0017) qui expose
-  HTTPS ; une autre interface est refusée ;
-* chaque origine est exactement `https://hôte[:port]` (ou `http://localhost`
-  pour un essai local, contexte sûr pour WebAuthn), et son hôte est le RP ID
-  ou un de ses sous-domaines ;
+* le service n'écoute **que sur la boucle locale** (127.0.0.1, ::1). Par
+  défaut il parle HTTP et un mandataire inverse expose HTTPS ; avec
+  `tls_cert`/`tls_key` (lot L27), il parle TLS lui-même sur la boucle locale
+  (passerelle en passthrough TLS : le tunnel de l'appareil lui livre le flux
+  chiffré). Une autre interface est refusée ;
+* **profil strict** (défaut, décision 0026) : le RP ID est EXACTEMENT l'hôte
+  `H` de l'équipe — une seule origine, `https://H` (sans port), et
+  `public_url` vide ou `https://H` (sans préfixe de chemin : pas d'hôte
+  partagé par chemin) ; ni `localhost` ni adresse IP ;
+* **profil compatible** (`profile: "compatible"`, explicite, pour les essais
+  locaux) : chaque origine est exactement `https://hôte[:port]` (ou
+  `http://localhost`, contexte sûr pour WebAuthn), et son hôte est le RP ID
+  ou un de ses sous-domaines ; plusieurs origines admises ;
+* dans les deux profils, le RP ID n'est jamais une zone ou un hôte réservés
+  (`reserved_zones`, `reserved_hosts`, plus ceux de la décision 0026, toujours
+  réservés), ni un de leurs parents : un RP ID parent couvrirait les hôtes de
+  toutes les équipes de la zone ;
 * le jeton de service est lu dans un fichier régulier, appartenant à
   l'utilisateur du service, en `0600` (refusé s'il est lisible par d'autres) ;
 * le dossier d'état est privé (`0700`, même propriétaire).
@@ -29,6 +45,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import stat
 from dataclasses import dataclass, fields, replace
 from urllib.parse import urlsplit
@@ -47,6 +64,15 @@ MIN_LINK_TTL = 30
 MAX_ENROLL_TTL = 86400
 MIN_TOKEN_LENGTH = 32
 MAX_TOKEN_FILE = 4096
+
+#: profils de validation (lot L27)
+PROFILE_STRICT = "strict"
+PROFILE_COMPATIBLE = "compatible"
+PROFILES = (PROFILE_STRICT, PROFILE_COMPATIBLE)
+#: toujours réservés, quelle que soit la configuration (décision 0026) : la
+#: zone des hôtes d'équipe et son apex d'approbation ne sont jamais un RP ID
+BUILTIN_RESERVED_ZONES = ("nexlink.ph",)
+BUILTIN_RESERVED_HOSTS = ("ameesh.nexlink.ph",)
 
 _RP_ID_RE = re.compile(
     r"^(localhost|[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+)$")
@@ -139,6 +165,17 @@ class ApproveConfig:
     trust_forwarded: bool = False
     #: table des actions (lot L5) lue par la source par défaut
     action_table: str = "actions"
+    #: profil de validation : strict (exploitation, défaut) | compatible
+    #: (essais locaux : localhost, plusieurs origines, sous-domaines)
+    profile: str = PROFILE_STRICT
+    #: zones d'hôtes d'équipe (ex. une zone de pages) et hôtes réservés (ex.
+    #: l'apex d'approbation) : jamais RP ID, ni eux ni leurs parents
+    reserved_zones: tuple = ()
+    reserved_hosts: tuple = ()
+    #: TLS local facultatif (passthrough) : certificat et clé de l'hôte H,
+    #: fichiers privés de l'utilisateur du service, relus à chaque changement
+    tls_cert: str = ""
+    tls_key: str = ""
 
     # ------------------------------------------------------------------
     @property
@@ -162,13 +199,69 @@ class ApproveConfig:
                 hosts.add("%s:%s" % (host, _default_ports(scheme)))
         return frozenset(hosts)
 
+    @property
+    def reserved(self) -> tuple:
+        """Noms jamais admis comme RP ID (ni leurs parents) : configurés + 0026."""
+        names: list = []
+        for name in (BUILTIN_RESERVED_ZONES + BUILTIN_RESERVED_HOSTS
+                     + _names(self.reserved_zones) + _names(self.reserved_hosts)):
+            if name not in names:
+                names.append(name)
+        return tuple(names)
+
+    @property
+    def tls(self) -> bool:
+        return bool(self.tls_cert and self.tls_key)
+
+    def _check_reserved(self) -> None:
+        zones = set(BUILTIN_RESERVED_ZONES + _names(self.reserved_zones))
+        for name in self.reserved:
+            if not _RP_ID_RE.fullmatch(name):
+                raise ApproveConfigError("nom réservé illisible : %r (domaine en minuscules)"
+                                         % (name,))
+            if self.rp_id == name:
+                raise ApproveConfigError(
+                    "RP ID %r refusé : c'est %s ; chaque équipe a son hôte H, et son RP ID "
+                    "est exactement H (décision 0026)"
+                    % (self.rp_id, "une zone réservée (reserved_zones)" if name in zones
+                       else "un hôte réservé (reserved_hosts)"))
+            if name.endswith("." + self.rp_id):
+                raise ApproveConfigError(
+                    "RP ID %r refusé : parent du nom réservé %r ; un RP ID parent couvrirait "
+                    "les hôtes de toutes les équipes de cette zone (décision 0026)"
+                    % (self.rp_id, name))
+
+    def _check_strict(self, origins: tuple) -> None:
+        if self.rp_id == "localhost" or _is_ip(self.rp_id):
+            raise ApproveConfigError(
+                "profil strict : RP ID %r refusé (ni localhost ni adresse IP) ; pour un essai "
+                "local, profil « compatible » explicite" % (self.rp_id,))
+        if len(origins) != 1:
+            raise ApproveConfigError(
+                "profil strict : exactement UNE origine, https://%s (reçu %d : %s)"
+                % (self.rp_id, len(origins), ", ".join(origins)))
+        expected = "https://" + self.rp_id
+        if origins[0] != expected:
+            raise ApproveConfigError(
+                "profil strict : l'origine doit être exactement %r (RP ID = hôte de l'origine, "
+                "sans port), reçu %r" % (expected, origins[0]))
+        if self.public_url and self.public_url.rstrip("/") != expected:
+            raise ApproveConfigError(
+                "profil strict : public_url doit être %r (même hôte que le RP ID, sans préfixe "
+                "de chemin : pas d'hôte partagé par chemin), reçu %r"
+                % (expected, self.public_url))
+
     def validate(self) -> "ApproveConfig":
         if not isinstance(self.rp_id, str) or not _RP_ID_RE.fullmatch(self.rp_id):
             raise ApproveConfigError("RP ID invalide ou absent : %r (domaine en minuscules)"
                                      % (self.rp_id,))
+        if self.profile not in PROFILES:
+            raise ApproveConfigError("profil inconnu : %r (%s)" % (self.profile,
+                                                                  ", ".join(PROFILES)))
         origins = (self.origins,) if isinstance(self.origins, str) else tuple(self.origins or ())
         if not origins:
             raise ApproveConfigError("au moins une origine autorisée est requise")
+        self._check_reserved()
         for origin in origins:
             _scheme, host, _port = parse_origin(origin)
             if host != self.rp_id and not host.endswith("." + self.rp_id):
@@ -180,10 +273,16 @@ class ApproveConfig:
                                          % self.public_url)
             if any(c in self.public_url for c in "?#\"'<> "):
                 raise ApproveConfigError("public_url : caractères interdits")
+        if self.profile == PROFILE_STRICT:
+            self._check_strict(origins)
+        if bool(self.tls_cert) != bool(self.tls_key):
+            raise ApproveConfigError("TLS local : tls_cert et tls_key (--tls-cert, --tls-key) "
+                                     "vont ensemble")
         if not is_loopback(self.bind):
             raise ApproveConfigError(
                 "adresse d'écoute %r refusée : le service n'écoute que sur la boucle locale "
-                "(127.0.0.1 ou ::1) ; HTTPS est assuré par le mandataire (page Nexlink)"
+                "(127.0.0.1 ou ::1) ; HTTPS est assuré par le mandataire, ou par le TLS local "
+                "(--tls-cert/--tls-key) derrière une passerelle en passthrough"
                 % (self.bind,))
         if type(self.port) is not int or not 0 <= self.port <= 65535:
             raise ApproveConfigError("port invalide : %r" % (self.port,))
@@ -205,7 +304,40 @@ class ApproveConfig:
                 raise ApproveConfigError("%s doit être positif" % name)
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", self.action_table or ""):
             raise ApproveConfigError("action_table : identifiant SQL simple attendu")
-        return replace(self, origins=origins)
+        if not isinstance(self.api_via_public, bool):
+            raise ApproveConfigError("api_via_public : booléen JSON attendu (true | false)")
+        return replace(self, origins=origins, reserved_zones=_names(self.reserved_zones),
+                       reserved_hosts=_names(self.reserved_hosts))
+
+
+_NUMERIC_LABEL_RE = re.compile(r"^(0x[0-9a-f]*|[0-9]+)$")
+
+
+def _is_ip(host: str) -> bool:
+    """Adresse IP sous TOUTE forme qu'un résolveur ou un navigateur lirait
+    comme telle (verdict codex2) : `ipaddress`, `inet_aton` (127.1, 0x7f.1,
+    0177.0.0.1…), et la règle WHATWG — un dernier segment numérique
+    (décimal, hexadécimal ou octal) fait de l'hôte une adresse IPv4."""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    try:
+        socket.inet_aton(host)
+        return True
+    except (OSError, ValueError):
+        pass
+    labels = host.rstrip(".").split(".")
+    return bool(_NUMERIC_LABEL_RE.fullmatch(labels[-1])) or all(
+        _NUMERIC_LABEL_RE.fullmatch(label) for label in labels)
+
+
+def _names(value) -> tuple:
+    """Liste de noms d'hôte (texte séparé par des virgules ou liste), normalisée."""
+    if isinstance(value, str):
+        value = value.split(",")
+    return tuple(str(v).strip().lower().rstrip(".") for v in (value or ()) if str(v).strip())
 
 
 _ENV = {
@@ -218,8 +350,13 @@ _ENV = {
     "AMEESH_APPROVE_STATE": "state_dir",
     "AMEESH_APPROVE_PROPOSALS": "proposals_dir",
     "AMEESH_APPROVE_LEVEL": "level",
+    "AMEESH_APPROVE_PROFILE": "profile",
+    "AMEESH_APPROVE_RESERVED_ZONES": "reserved_zones",
+    "AMEESH_APPROVE_RESERVED_HOSTS": "reserved_hosts",
+    "AMEESH_APPROVE_TLS_CERT": "tls_cert",
+    "AMEESH_APPROVE_TLS_KEY": "tls_key",
 }
-_PATHS = ("token_file", "state_dir", "proposals_dir")
+_PATHS = ("token_file", "state_dir", "proposals_dir", "tls_cert", "tls_key")
 
 
 def _coerce(name: str, value):
@@ -228,6 +365,13 @@ def _coerce(name: str, value):
         if isinstance(value, str):
             return tuple(o.strip() for o in value.split(",") if o.strip())
         return tuple(value or ())
+    if name in ("reserved_zones", "reserved_hosts"):
+        if not isinstance(value, (str, list, tuple)):
+            raise ApproveConfigError("%s : liste de noms d'hôte attendue" % name)
+        return _names(value)
+    if name == "api_via_public" and not isinstance(value, bool):
+        # jamais « "false" » interprété : un booléen JSON, sans ambiguïté
+        raise ApproveConfigError("api_via_public : booléen JSON attendu (true | false)")
     if name in _PATHS:
         return _expand(str(value)) if value else ""
     kind = kinds.get(name)

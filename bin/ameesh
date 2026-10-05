@@ -4,4 +4,4 @@
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 export PYTHONPATH="$here/src${PYTHONPATH:+:$PYTHONPATH}"
-exec "${AGENT_MESH_PYTHON:-python3}" -m agent_mesh.mesh_cli "$@"
+exec "${AMEESH_PYTHON:-${AGENT_MESH_PYTHON:-python3}}" -m ameesh.main "$@"

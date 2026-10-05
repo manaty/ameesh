@@ -1,7 +1,7 @@
 ---
 type: Index
 title: "Canon d'exemple — acme"
-description: "Organisation fictive acme : deux humains, deux hôtes, trois agents placés. Sert aux tests et à la démonstration d'ameesh (profil ameesh d'OKF, spec §4)."
+description: "Organisation fictive acme : deux humains, deux hôtes, trois agents placés, un plan de travail (jalon, epics, lots). Sert aux tests et à la démonstration d'ameesh (profil ameesh d'OKF, spec §4)."
 ---
 
 # Canon d'exemple — acme
@@ -17,6 +17,9 @@ client réels.
   `ouvrier` (deepseek).
 - [Placements](placements/) — quel agent tourne sur quel hôte, avec quel mode
   d'identifiants.
+- [Plan](plan/) — le plan de travail (fiches `WorkPackage`, L29) : le jalon
+  `v1`, les epics `catalogue` et `paiement`, les lots `cat-recherche`,
+  `cat-export` et `pay-webhook`.
 - [Décisions](decisions/) — un exemple de fiche d'un autre type, ignorée par
   ameesh.
 

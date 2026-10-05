@@ -7,3 +7,4 @@
 * [Standards des harnais](standards-des-harnais.md) - MCP, skills, plugins, ACP ; entrant ; ameesh-gate.
 * [Boucle d'auto-réparation](boucle-auto-reparation.md) - Détection et réparation automatiques des bugs : circuit observé, limites, transposition.
 * [Constats modèles et effort (octobre 2026)](constats-modeles-2026-10.md) - Premières observations de l'orchestrateur Nexlink, base des tâches de référence.
+* [Comptes multiples](comptes-multiples.md) - Isoler un compte et ses sessions par harnais (Claude Code, Codex, DeepSeek Harness) ; reprise sous un autre compte ; base de L30.

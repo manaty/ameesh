@@ -42,6 +42,8 @@ _HUMAN_RE = re.compile(r"^human:[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _MEMBER_RE = re.compile(r"^(human|agent):[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _B64U_RE = re.compile(r"^[A-Za-z0-9_-]{1,8192}$")
 REQUEST_FIELDS = ("action_id", "approver", "requested_by")
+#: version du document de `GET /health`
+HEALTH_VERSION = 1
 #: facultatif : `assume_duplicate` (booléen) — décision qui assume le doublon
 REQUEST_OPTIONAL = ("assume_duplicate",)
 _ASSERTION_FIELDS = frozenset({"decision", "credential_id", "authenticatorData",
@@ -85,6 +87,24 @@ class ApproveService:
         """Comparaison à temps constant (sur les SHA-256 : longueur fixe)."""
         presented_digest = hashlib.sha256((presented or "").encode("utf-8")).digest()
         return hmac.compare_digest(presented_digest, self._token_digest) and bool(presented)
+
+    # ------------------------------------------------------------------
+    # GET /health : la politique publiée (lot L27), sans aucun secret
+    # ------------------------------------------------------------------
+    def health(self, *, tls: bool = False) -> dict:
+        """Ce que les vérificateurs doivent partager avec le service (RP ID,
+        origines) et le profil ; ni jeton, ni chemin, ni état, ni base."""
+        return {
+            "service": "ameesh-approve",
+            "health": HEALTH_VERSION,
+            "rp_id": self.cfg.rp_id,
+            "origins": list(self.cfg.origins),
+            "public_url": self.cfg.base_url,
+            "profile": self.cfg.profile,
+            "level": self.cfg.level,
+            "api_via_public": bool(self.cfg.api_via_public),
+            "tls": bool(tls),
+        }
 
     # ------------------------------------------------------------------
     # outils

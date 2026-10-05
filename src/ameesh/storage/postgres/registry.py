@@ -40,7 +40,11 @@ AGENT_COLUMNS = """
     extract(epoch from last_event_at)::float8     as last_event_ts,
     responsible, team, provider, credential_mode, capabilities, canon_ref,
     ephemeral, created_by,
-    extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts
+    extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts,
+    session_policy, effort, tier, session_work_item,
+    extract(epoch from status_since)::float8         as status_since_ts,
+    extract(epoch from restart_requested_at)::float8 as restart_requested_ts,
+    extract(epoch from session_reset_at)::float8     as session_reset_ts
 """
 
 
@@ -446,7 +450,7 @@ class Leases(interface.Leases):
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
-               SET session_id = NULL, updated_at = now()
+               SET session_id = NULL, session_work_item = NULL, updated_at = now()
               FROM verrou
              WHERE r.name = verrou.name
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s

@@ -1,0 +1,26 @@
+# Contexte de construction de l'image : seuls pyproject.toml, README.md,
+# LICENSE et src/ sont copiés ; le reste est exclu, et surtout tout ce qui
+# pourrait porter un secret ou un état local.
+.git
+.github
+.venv
+.claude
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+build
+dist
+tests
+docs
+examples
+scripts
+deploy
+bin
+*.v0.*
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/id_*
+**/.pgpass
+**/config.json

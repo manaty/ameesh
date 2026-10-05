@@ -52,6 +52,11 @@ def _load(cfg: Config, args: argparse.Namespace) -> canon_mod.Canon:
                                  fetch=bool(getattr(args, "fetch", False)))
 
 
+def load_canon(cfg: Config, args: argparse.Namespace) -> canon_mod.Canon:
+    """Charge le canon selon les options communes (`--canon`, `--ref`, `--fetch`)."""
+    return _load(cfg, args)
+
+
 def _print_findings(findings: list[canon_mod.Finding]) -> None:
     for f in findings:
         print("%s%-8s %-30s %s — %s" % (
@@ -258,12 +263,31 @@ def cmd_sync(cfg: Config, args: argparse.Namespace) -> int:
         print("%splacement refusé sur %s : %s — non réclamable(s) ; hôtes admissibles : "
               "ameesh placement check --agent A" % (tag, host, ", ".join(refused)))
     print(_status_line(host, report.status, report.diagnostic, recorded=True))
+    _print_packages(report.packages)
     _print_authenticators(report.authenticators)
     if report.errors:
         print("canon INVALIDE — %s : les agents concernés ne sont pas réclamables "
               "(ameesh canon check)" % _summary(report.findings))
         return 1
     return 1 if auth_errors else 0
+
+
+def _print_packages(done) -> None:
+    """Le plan de travail (L29) recopié par la synchronisation."""
+    if done is None:
+        return
+    parts = ["%d %s" % (len(ids), label) for ids, label in (
+        (done.created, "créée(s)"), (done.updated, "mise(s) à jour"),
+        (done.unchanged, "inchangée(s)"), (done.retired, "retirée(s)"),
+        (done.skipped, "en erreur, non écrite(s)")) if ids]
+    if not parts:
+        return
+    print("plan (WorkPackage) : %s%s" % (
+        ", ".join(parts),
+        " ; %d lot(s) suivent le nouveau parent de leur fiche" % done.relinked
+        if done.relinked else ""))
+    if done.skipped:
+        print("  en erreur : %s (ameesh canon check)" % ", ".join(done.skipped))
 
 
 def _print_authenticators(done: canon_sync.AuthenticatorSync | None) -> None:

@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import sys
 import unittest
 
 from ameesh import authority, mail, migrations, registry, signing
@@ -295,3 +297,121 @@ class MeshCliTest(PgTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DelaysCliTest(MeshCliTest):
+    """R19 : `ameesh work` et `ameesh list` exposent les jalons et les délais."""
+
+    def test_jalons_et_delais_dans_work_et_list(self):
+        proc = self.mesh("work", "add", "--title", "Délais", "--assignee", AGENT)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.mesh("work", "move", "1", "build")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        proc = self.mesh("work", "milestone", "1", "frozen", "--sha", "a" * 40,
+                         "--actor", AGENT)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("jalon frozen", proc.stdout)
+
+        # un lot gelé : le pied de `list` dit ce qui attend une revue
+        proc = self.mesh("list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("lots     : 1 (gel 1)", proc.stdout)
+        self.assertIn("plus ancien gel", proc.stdout)
+
+        proc = self.mesh("work", "milestone", "1", "verdict", "ok", "--sha", "b" * 40)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+        proc = self.mesh("work", "list")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DÉLAI", proc.stdout)
+        self.assertIn("revue", proc.stdout)
+
+        proc = self.mesh("work", "list", "--json")
+        lot = json.loads(proc.stdout)[0]
+        self.assertIsNotNone(lot["delays"]["frozen_ts"])
+        self.assertIsNotNone(lot["delays"]["reviewed_ts"])
+        self.assertEqual(lot["delays"]["reviewed_verdict"], "ok")
+        self.assertEqual(lot["delays"]["verdicts"], 1)
+        self.assertIsNone(lot["delays"]["merged_ts"])
+
+        proc = self.mesh("work", "show", "1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("jalons", proc.stdout)
+        self.assertIn("délais", proc.stdout)
+        self.assertIn("demande → gel", proc.stdout)
+
+        proc = self.mesh("work", "show", "1", "--json")
+        item = json.loads(proc.stdout)
+        self.assertEqual(item["delays"]["reviewed_verdict"], "ok")
+        self.assertEqual([m["kind"] for m in item["milestones"]].count("verdict"), 1)
+
+        proc = self.mesh("list")
+        self.assertIn("lots     : 1 (revue 1)", proc.stdout)
+        self.assertNotIn("plus ancien gel", proc.stdout)
+
+        # un jalon automatique ne se déclare pas à la main (choix argparse)
+        proc = self.mesh("work", "milestone", "1", "requested")
+        self.assertEqual(proc.returncode, 2)
+
+        # la forme de `list --json` ne change pas : un tableau d'agents
+        proc = self.mesh("list", "--json")
+        self.assertIsInstance(json.loads(proc.stdout), list)
+
+    def test_lot_filtre_hors_fenetre_garde_ses_delais(self):
+        """Un lot ancien filtré garde sa frise, derrière 200 lots récents (B3).
+
+        Les délais ne doivent pas dépendre de la fenêtre globale des lots les
+        plus récemment modifiés : `work list --assignee` rend la ligne demandée
+        avec ses jalons, même si elle est hors de cette fenêtre.
+        """
+        proc = self.mesh("work", "add", "--title", "ancien", "--assignee", AGENT)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.mesh("work", "move", "1", "build")
+        proc = self.mesh("work", "milestone", "1", "frozen", "--sha", "a" * 40)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.db.execute(
+            "INSERT INTO work_items(title, state, assignee) "
+            "SELECT 'récent-'||i, 'intake', 'autre' FROM generate_series(1, 201) i")
+
+        proc = self.mesh("work", "list", "--assignee", AGENT, "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = json.loads(proc.stdout)
+        self.assertEqual([row["id"] for row in rows], [1])
+        self.assertIsNotNone(rows[0]["delays"], "le lot filtré a perdu sa frise")
+        self.assertEqual(rows[0]["delays"]["work_item_id"], 1)
+        self.assertIsNotNone(rows[0]["delays"]["frozen_ts"])
+
+        # la sortie lisible porte aussi la phase courante
+        proc = self.mesh("work", "list", "--assignee", AGENT)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("gel", proc.stdout)
+
+
+class AideSansEffetTest(unittest.TestCase):
+    """`--help` n'exécute jamais une sous-commande (relecture L28 : `mail migrate
+    --help` avait appliqué des migrations à une base vivante)."""
+
+    def run_cli(self, *args):
+        env = dict(os.environ, AMEESH_CONFIG="/nonexistent",
+                   AMEESH_DSN="postgresql://personne@127.0.0.1:1/aucune",
+                   PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "src"))
+        return subprocess.run([sys.executable, "-m", "ameesh", *args], env=env,
+                              capture_output=True, text=True, timeout=60)
+
+    def test_aide_des_sous_commandes_mail(self):
+        for sub in ("migrate", "list", "doctor", "inbox", "send"):
+            proc = self.run_cli("mail", sub, "--help")
+            self.assertEqual(proc.returncode, 0, (sub, proc.stderr))
+            self.assertIn("agent-mail", proc.stdout)
+
+    def test_aide_de_register_et_stop(self):
+        for sub in ("register", "stop"):
+            proc = subprocess.run(
+                [sys.executable, "-c", "import sys; from ameesh import runner; sys.exit(runner.main(sys.argv[1:]))",
+                 sub, "--help"],
+                env=dict(os.environ, AMEESH_CONFIG="/nonexistent",
+                         AMEESH_DSN="postgresql://personne@127.0.0.1:1/aucune",
+                         PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "src")),
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, (sub, proc.stderr))
+            self.assertIn("usage", proc.stdout)

@@ -24,3 +24,6 @@
 * [Auto-réparation des bugs](0022-auto-reparation.md) - Signaux, triage au canon, réparation, vérification, livraison, surveillance.
 * [Critère d'adoption des réglages](0023-critere-d-adoption-des-reglages.md) - Gain significatif de délai ou de coût, sans perte de qualité globale après revue et recette.
 * [Vue temps réel de l'avancement](0024-vue-temps-reel.md) - Frise des lots, agents, jalons et budget, alimentée par les événements d'ameesh.
+* [Une session neuve par lot](0025-une-session-par-lot.md) - Construction et relecture : session neuve par lot, gardée jusqu'à la fusion ; orchestrateurs tournés avec résumé.
+* [Hébergement d'ameesh-approve par équipe](0026-hebergement-d-ameesh-approve-par-equipe.md) - PC + relais, page Nexlink ou serveur propre ; RP ID exactement égal à l'hôte de l'équipe.
+* [Bascule automatique entre comptes](0027-bascule-automatique-entre-comptes.md) - Compte secondaire quand le primaire approche sa limite, retour après la remise à zéro.

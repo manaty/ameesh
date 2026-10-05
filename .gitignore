@@ -7,3 +7,6 @@ dist/
 .pytest_cache/
 # worktrees d'outillage d'agents : locaux, jamais versionnés
 .claude/
+# site public : sortie de construction et venv de MkDocs (scripts/build-site.sh)
+_site/
+.venv-site/

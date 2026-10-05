@@ -1,5 +1,14 @@
 # Journal de la conception
 
+## 2026-10-05 (bascule)
+* **Décision** : [bascule automatique entre comptes](decisions/0027-bascule-automatique-entre-comptes.md) ; lot L30 ; migration 0028 réservée.
+* **Lot** : L29, plan de travail (epics, fermeture sur fusion, projection GitHub) ; migrations réservées 0026 (L29) et 0027 (L26).
+* **Décision** : [hébergement d'ameesh-approve par équipe](decisions/0026-hebergement-d-ameesh-approve-par-equipe.md) ; [contrat](ameesh-approve-hebergement-equipes.md) (codex3) ; lot L27.
+* **Jalon** : ameesh v1.0.0 publiée (manaty/ameesh, tag v1.0.0) ; bascule étapes 0 à 2 faites (base durable, sauvegarde quotidienne hors du poste, canon manaty/home fusionné), étape 3.1 (utilisateur ameesh-approve) faite.
+* **Précision** : [page d'approbation](decisions/0017-approbation-via-page-nexlink.md) servie par Nexlink sur `ameesh.nexlink.ph`.
+* **Décision** : [une session neuve par lot](decisions/0025-une-session-par-lot.md) ; lot L26 (parité d'exploitation v0 → v1).
+* **Lot** : L25, profil cluster (image, manifestes Kubernetes, rôle superviseur en lecture seule).
+
 ## 2026-10-04 (v1 terminée)
 * **Jalon** : v1 terminée sur `main` 2ff67ff — tous les lots L1–L9 et L9b fusionnés après revue ; `scripts/test.sh` complet : 652 tests verts sur chacun des deux pilotes (psql : 5 sautés, psycopg : 2 sautés) ; essai de bout en bout vert. Hors v1 : L11, L12, L13 fusionnés.
 

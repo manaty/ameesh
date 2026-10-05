@@ -18,6 +18,9 @@ export AMEESH_REQUIRE_DB=1
 # poste basculé, elle fixerait canon, fils et hôte sous les tests
 export AMEESH_CONFIG="$PWD/.config-absente-pour-les-tests.json"
 export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
+# aucun réseau dans les tests : ni clé de fournisseur, ni relevé de solde (L26)
+unset DEEPSEEK_API_KEY AMEESH_DEEPSEEK_API_BASE
+export AMEESH_BALANCE_INTERVAL=0
 PATTERN=("$@")
 
 echo
@@ -29,13 +32,13 @@ if [ ! -x "$VENV/bin/python" ]; then
   echo "=== création de $VENV (psycopg optionnel) ==="
   python3 -m venv "$VENV" || true
 fi
-if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import psycopg" 2>/dev/null; then
+if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import psycopg, yaml" 2>/dev/null; then
   echo
   echo "=== pilote psycopg ==="
   AMEESH_DRIVER=psycopg "$VENV/bin/python" -m unittest discover -s tests -t . -v "${PATTERN[@]}"
 elif [ -x "$VENV/bin/pip" ]; then
   echo "=== installation de psycopg dans $VENV ==="
-  if "$VENV/bin/pip" install --quiet 'psycopg[binary]' cryptography 2>/dev/null; then
+  if "$VENV/bin/pip" install --quiet 'psycopg[binary]' cryptography pyyaml 2>/dev/null; then
     echo
     echo "=== pilote psycopg ==="
     AMEESH_DRIVER=psycopg "$VENV/bin/python" -m unittest discover -s tests -t . -v "${PATTERN[@]}"

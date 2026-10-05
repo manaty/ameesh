@@ -1,0 +1,552 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ameesh — accountable teams of humans and AI agents</title>
+<meta name="description" content="ameesh coordinates mixed teams of humans and AI agents across Claude Code, Codex and DeepSeek Harness: canon as code, one runner per host, readable threads, and irreversible actions behind a gate with passkey-signed human receipts. Open source, AGPL-3.0-only.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#0f766e">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<style>
+:root {
+  --bg: #fbfaf7;
+  --bg-alt: #f2f0ea;
+  --card: #ffffff;
+  --fg: #1c1f24;
+  --muted: #5a6170;
+  --border: #d9d6cd;
+  --accent: #0f766e;
+  --accent-fg: #ffffff;
+  --accent-soft: #e3f3f1;
+  --warm: #c2410c;
+  --warm-soft: #fdeee4;
+  --code-bg: #1f2430;
+  --code-fg: #e8eaf0;
+  --code-muted: #9aa3b5;
+  --ok: #15803d;
+  --no: #b45309;
+  --shadow: 0 1px 2px rgba(20, 20, 30, .06), 0 6px 20px rgba(20, 20, 30, .06);
+  --radius: 14px;
+  --max: 1120px;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b;
+    --bg-alt: #171b23;
+    --card: #1b2029;
+    --fg: #e7e9ee;
+    --muted: #a3abba;
+    --border: #2e3542;
+    --accent: #2dd4bf;
+    --accent-fg: #06201d;
+    --accent-soft: #123430;
+    --warm: #fb923c;
+    --warm-soft: #3a2416;
+    --code-bg: #0c0f14;
+    --code-fg: #e8eaf0;
+    --code-muted: #8b94a7;
+    --ok: #4ade80;
+    --no: #fbbf24;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 6px 20px rgba(0, 0, 0, .25);
+  }
+}
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body {
+  margin: 0; background: var(--bg); color: var(--fg);
+  font: 16px/1.6 var(--font); overflow-x: hidden;
+}
+a { color: var(--accent); text-underline-offset: 3px; }
+a:hover { text-decoration-thickness: 2px; }
+:focus-visible { outline: 3px solid var(--warm); outline-offset: 2px; border-radius: 4px; }
+code, pre { font-family: var(--mono); }
+code { font-size: .92em; background: var(--bg-alt); border: 1px solid var(--border); border-radius: 6px; padding: .05em .35em; }
+.skip { position: absolute; left: -9999px; top: 0; background: var(--card); padding: .6rem 1rem; z-index: 10; }
+.skip:focus { left: 1rem; top: 1rem; }
+.wrap { max-width: var(--max); margin: 0 auto; padding: 0 16px; }
+@media (min-width: 720px) { .wrap { padding: 0 32px; } }
+
+/* header */
+header.top { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--border); }
+header.top .wrap { display: flex; align-items: center; gap: 1rem; min-height: 60px; }
+.brand { display: flex; align-items: center; gap: .55rem; font-weight: 700; font-size: 1.15rem; color: var(--fg); text-decoration: none; letter-spacing: .01em; }
+.brand svg { width: 30px; height: 30px; flex: none; }
+nav.main { margin-left: auto; }
+nav.main ul { list-style: none; display: flex; gap: .2rem; margin: 0; padding: 0; flex-wrap: wrap; justify-content: flex-end; }
+nav.main a { display: block; padding: .4rem .6rem; border-radius: 8px; color: var(--fg); text-decoration: none; font-size: .95rem; }
+nav.main a:hover { background: var(--bg-alt); }
+nav.main .hide-sm { display: none; }
+@media (min-width: 860px) { nav.main .hide-sm { display: block; } }
+nav.main a.cta { background: var(--accent); color: var(--accent-fg); font-weight: 600; }
+
+/* hero */
+.hero { padding: 56px 0 40px; }
+@media (min-width: 720px) { .hero { padding: 88px 0 56px; } }
+.eyebrow { display: inline-flex; flex-wrap: wrap; gap: .4rem; margin: 0 0 1.1rem; padding: 0; list-style: none; }
+.eyebrow li { font-size: .82rem; border: 1px solid var(--border); background: var(--card); border-radius: 999px; padding: .2rem .7rem; color: var(--muted); }
+h1 { font-size: clamp(2.1rem, 6vw, 3.6rem); line-height: 1.08; margin: 0 0 1.1rem; letter-spacing: -.02em; max-width: 20ch; }
+h1 em { font-style: normal; color: var(--accent); }
+.lead { font-size: clamp(1.05rem, 2.2vw, 1.25rem); color: var(--muted); max-width: 62ch; margin: 0 0 1.8rem; }
+.lead strong { color: var(--fg); font-weight: 600; }
+.buttons { display: flex; flex-wrap: wrap; gap: .75rem; }
+.btn { display: inline-flex; align-items: center; gap: .4rem; padding: .75rem 1.15rem; border-radius: 10px; font-weight: 600; text-decoration: none; border: 1px solid var(--border); color: var(--fg); background: var(--card); }
+.btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+.btn:hover { box-shadow: var(--shadow); }
+.harnesses { margin-top: 2.2rem; display: flex; flex-wrap: wrap; gap: .6rem 1.4rem; align-items: center; color: var(--muted); font-size: .95rem; }
+.harnesses span.h { font-weight: 600; color: var(--fg); }
+.hero-grid { display: grid; gap: 36px; grid-template-columns: minmax(0, 1fr); align-items: center; }
+@media (min-width: 1000px) { .hero-grid { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); } }
+figure.thread { margin: 0; background: var(--code-bg); color: var(--code-fg); border-radius: 18px; padding: 18px; font: 13.5px/1.55 var(--mono); box-shadow: var(--shadow); border: 1px solid var(--border); }
+.thread-head { display: flex; align-items: center; gap: .5rem; color: var(--code-muted); margin-bottom: 12px; }
+.thread-head .dot { width: 10px; height: 10px; border-radius: 50%; background: #2dd4bf; }
+.thread .entry { border-left: 3px solid #2dd4bf; padding: 4px 0 4px 12px; margin: 0 0 12px; }
+.thread p { margin: 0; overflow-wrap: anywhere; }
+.thread .meta { color: #5eead4; font-weight: 600; }
+.thread .body { color: var(--code-fg); }
+.thread .gate { border-top: 1px dashed #3a4152; padding-top: 12px; margin-top: 4px; }
+.thread .gate .p { color: #5eead4; }
+.thread .refused { color: #fdba74; }
+.thread .signed { color: #86efac; }
+.thread figcaption { color: var(--code-muted); font-family: var(--font); font-size: .8rem; margin-top: 12px; padding: 0; }
+
+/* sections */
+section { padding: 56px 0; }
+section.alt { background: var(--bg-alt); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+h2 { font-size: clamp(1.6rem, 4vw, 2.2rem); line-height: 1.15; margin: 0 0 .6rem; letter-spacing: -.01em; }
+.section-lead { color: var(--muted); max-width: 65ch; margin: 0 0 2rem; font-size: 1.05rem; }
+h3 { font-size: 1.1rem; margin: 0 0 .4rem; line-height: 1.3; }
+.grid { display: grid; gap: 16px; grid-template-columns: 1fr; }
+@media (min-width: 640px) { .grid.two, .grid.three { grid-template-columns: repeat(2, 1fr); } }
+@media (min-width: 980px) { .grid.three { grid-template-columns: repeat(3, 1fr); } }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; box-shadow: var(--shadow); }
+.card p { margin: 0; color: var(--muted); }
+.card p + p { margin-top: .5rem; }
+.card .cmd { margin-top: .7rem; font-size: .85rem; }
+.problem h3::before { content: ""; display: inline-block; width: .55rem; height: .55rem; border-radius: 50%; background: var(--warm); margin-right: .5rem; vertical-align: .12em; }
+.idea .tag { display: inline-block; font-size: .75rem; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--accent); margin-bottom: .35rem; }
+
+/* architecture */
+.arch { display: grid; gap: 28px; align-items: start; grid-template-columns: 1fr; }
+@media (min-width: 900px) { .arch { grid-template-columns: minmax(0, 470px) 1fr; } }
+figure { margin: 0; }
+figure.diagram { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; box-shadow: var(--shadow); }
+figure.diagram svg { display: block; width: 100%; height: auto; }
+figcaption { font-size: .88rem; color: var(--muted); margin-top: .5rem; padding: 0 4px; }
+.d-box { fill: var(--card); stroke: var(--border); stroke-width: 1.5; }
+.d-core { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+.d-inner { fill: var(--card); stroke: var(--border); stroke-width: 1.2; }
+.d-warm { fill: var(--warm-soft); stroke: var(--warm); stroke-width: 1.5; }
+.d-pill { fill: var(--bg-alt); stroke: var(--border); stroke-width: 1; }
+.d-t { fill: var(--fg); font: 600 13px var(--font); }
+.d-tb { fill: var(--fg); font: 700 14px var(--font); }
+.d-s { fill: var(--muted); font: 11.5px var(--font); }
+.d-l { fill: var(--accent); font: 600 11px var(--font); }
+.d-lw { fill: var(--warm); font: 600 11px var(--font); }
+.d-a { stroke: var(--accent); stroke-width: 1.8; fill: none; }
+.d-aw { stroke: var(--warm); stroke-width: 1.8; fill: none; }
+.d-m { fill: var(--accent); }
+.d-mw { fill: var(--warm); }
+.legend { list-style: none; padding: 0; margin: 0; display: grid; gap: 14px; }
+.legend li { padding-left: 1rem; border-left: 3px solid var(--accent); }
+.legend li.w { border-left-color: var(--warm); }
+.legend b { display: block; }
+.legend span { color: var(--muted); }
+
+/* approval sequence */
+ol.seq { list-style: none; margin: 0; padding: 0; counter-reset: s; display: grid; gap: 12px; }
+ol.seq li { counter-increment: s; position: relative; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 16px 16px 60px; box-shadow: var(--shadow); }
+ol.seq li::before { content: counter(s); position: absolute; left: 16px; top: 16px; width: 30px; height: 30px; border-radius: 50%; background: var(--accent); color: var(--accent-fg); font-weight: 700; display: grid; place-items: center; font-size: .95rem; }
+ol.seq li.human::before { background: var(--warm); color: #fff; }
+.actors { display: flex; flex-wrap: wrap; gap: .35rem; align-items: center; margin-bottom: .35rem; font-size: .8rem; }
+.actor { border-radius: 999px; padding: .1rem .55rem; font-weight: 600; background: var(--accent-soft); color: var(--fg); border: 1px solid var(--border); }
+.actor.h { background: var(--warm-soft); }
+.arrow { color: var(--muted); }
+ol.seq p { margin: 0; color: var(--muted); }
+ol.seq p strong { color: var(--fg); }
+.seq-grid { display: grid; gap: 28px; grid-template-columns: 1fr; }
+@media (min-width: 980px) { .seq-grid { grid-template-columns: 1fr 340px; } }
+.aside { position: sticky; top: 84px; }
+
+/* code */
+pre.term { background: var(--code-bg); color: var(--code-fg); border-radius: var(--radius); padding: 18px 20px; overflow-x: auto; font-size: .88rem; line-height: 1.6; margin: 0; border: 1px solid var(--border); }
+pre.term code { background: none; border: 0; padding: 0; font-size: inherit; color: inherit; border-radius: 0; }
+pre.term .c { color: var(--code-muted); }
+pre.term .p { color: #5eead4; user-select: none; }
+
+/* security */
+.sec { display: grid; gap: 16px; grid-template-columns: 1fr; }
+@media (min-width: 800px) { .sec { grid-template-columns: 1fr 1fr; } }
+.sec ul { margin: .4rem 0 0; padding-left: 1.2rem; }
+.sec li { margin: .5rem 0; color: var(--muted); }
+.sec li strong { color: var(--fg); }
+.sec .yes h3 { color: var(--ok); }
+.sec .not h3 { color: var(--no); }
+.note { margin-top: 18px; font-size: .95rem; color: var(--muted); max-width: 75ch; }
+
+/* roadmap */
+.road .card h3 { display: flex; align-items: center; gap: .5rem; }
+.badge { font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; border-radius: 999px; padding: .15rem .55rem; }
+.badge.done { background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent); }
+.badge.built { background: var(--bg-alt); color: var(--fg); border: 1px solid var(--border); }
+.badge.plan { background: var(--warm-soft); color: var(--warm); border: 1px solid var(--warm); }
+.road ul { margin: .4rem 0 0; padding-left: 1.1rem; color: var(--muted); }
+.road li { margin: .3rem 0; }
+
+footer { padding: 40px 0 56px; border-top: 1px solid var(--border); color: var(--muted); font-size: .95rem; }
+footer .cols { display: grid; gap: 20px; grid-template-columns: 1fr; }
+@media (min-width: 720px) { footer .cols { grid-template-columns: 2fr 1fr 1fr; } }
+footer ul { list-style: none; margin: 0; padding: 0; }
+footer li { margin: .3rem 0; }
+footer h2 { font-size: 1rem; margin: 0 0 .4rem; color: var(--fg); }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="./" aria-label="ameesh, home">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="#0f766e"/><g stroke="#ecfeff" stroke-width="2" stroke-linecap="round"><path d="M9 22 16 9l7 13zM16 9v8M9 22l7-5 7 5"/></g><g fill="#fdba74"><circle cx="16" cy="9" r="3"/><circle cx="9" cy="22" r="3"/><circle cx="23" cy="22" r="3"/></g><circle cx="16" cy="17" r="2.4" fill="#ecfeff"/></svg>
+      ameesh
+    </a>
+    <nav class="main" aria-label="Main">
+      <ul>
+        <li class="hide-sm"><a href="#ideas">Key ideas</a></li>
+        <li class="hide-sm"><a href="#approval">Approvals</a></li>
+        <li class="hide-sm"><a href="#security">Security</a></li>
+        <li class="hide-sm"><a href="#status">Status</a></li>
+        <li><a href="https://github.com/manaty/ameesh">GitHub</a></li>
+        <li><a class="cta" href="docs/">Docs</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<div class="hero">
+  <div class="wrap hero-grid">
+    <div>
+    <ul class="eyebrow" aria-label="Facts">
+      <li>Open source · AGPL-3.0-only</li>
+      <li>v1.0.0</li>
+      <li>Python 3 · Postgres</li>
+    </ul>
+    <h1>Humans and AI agents, working as <em>one accountable team</em>.</h1>
+    <p class="lead">ameesh coordinates mixed teams of humans and AI agents across agent harnesses. Every agent has a <strong>human responsible for it</strong>, runs <strong>where its humans decided</strong>, talks in <strong>threads anyone can read</strong>, and cannot merge, send or spend anything irreversible <strong>without a receipt a human signed on their phone</strong>.</p>
+    <div class="buttons">
+      <a class="btn primary" href="docs/getting-started/">Get started</a>
+      <a class="btn" href="docs/">Read the documentation</a>
+      <a class="btn" href="https://github.com/manaty/ameesh">Source on GitHub</a>
+    </div>
+    <p class="harnesses"><span>Runs agents in</span> <span class="h">Claude Code</span> <span class="h">Codex</span> <span class="h">DeepSeek Harness</span></p>
+    </div>
+    <figure class="thread" aria-label="Example of a readable thread and of the gate">
+      <div class="thread-head"><span class="dot" aria-hidden="true"></span>thread · acme-web</div>
+      <div class="entry">
+        <p class="meta">### human:alice → agent:orchestre</p>
+        <p class="body">Lot 7 of acme-web is ready to prepare.</p>
+      </div>
+      <div class="entry">
+        <p class="meta">### agent:orchestre → agent:relecteur</p>
+        <p class="body">Lot 7 is ready: review PR acme/acme-web#7 before the merge.</p>
+      </div>
+      <div class="gate">
+        <p><span class="p">$</span> ameesh action execute act_…</p>
+        <p class="refused">[receipt_required]</p>
+        <p><span class="p">$</span> ameesh action fetch-receipt act_…</p>
+        <p class="signed">receipt from human:alice · webauthn · verified</p>
+      </div>
+      <figcaption>Illustration: every message in clear; the merge waits for alice's passkey. Fictitious names, output abridged.</figcaption>
+    </figure>
+  </div>
+</div>
+
+<section class="alt" id="problems" aria-labelledby="problems-h">
+  <div class="wrap">
+    <h2 id="problems-h">The problems it solves</h2>
+    <p class="section-lead">Once several agents from several vendors work on the same project, alongside humans, a terminal per agent stops being enough.</p>
+    <div class="grid three">
+      <article class="card problem"><h3>Agents that cannot reach each other</h3><p>Each harness has its own session and no shared mailbox. ameesh gives every agent a durable mailbox on Postgres, with hooks that keep the v0 interface.</p></article>
+      <article class="card problem"><h3>Sessions that die with the terminal</h3><p>Orchestrators glued to an interactive session lose their watch when it closes. ameesh runs agents by turns under leases, resumes the same session, and still lets a human attach.</p></article>
+      <article class="card problem"><h3>Chatter nobody can audit</h3><p>Agent-to-agent messages vanish into private context. In ameesh every message that goes through it is written, verbatim, into a readable thread.</p></article>
+      <article class="card problem"><h3>An agent that merges or spends on its own</h3><p>A prompt injection or a mistake should not reach production. Irreversible and costly actions wait behind a gate for a human-signed receipt.</p></article>
+      <article class="card problem"><h3>Nobody knows who answers for an agent</h3><p>Responsibility, placement and credentials live in a reviewed canon. An agent without a responsible human, or placed against a host's policy, is never started.</p></article>
+      <article class="card problem"><h3>Costs that run away</h3><p>Each turn is accounted for. A budget guard pauses agents before an hourly cap or a subscription's pace is exceeded.</p></article>
+    </div>
+  </div>
+</section>
+
+<section id="ideas" aria-labelledby="ideas-h">
+  <div class="wrap">
+    <h2 id="ideas-h">Key ideas</h2>
+    <p class="section-lead">Declarations in git, state in the database, secrets on the host, authority on the human's phone.</p>
+    <div class="grid three">
+      <article class="card idea"><span class="tag">Canon as code</span><h3>Teams declared in OKF, in git</h3><p>Members, hosts, agents and placements are OKF cards in a git repository, changed by reviewed pull request. ameesh reads only the merged canonical commit, through git objects, and fails closed when it cannot.</p><p class="cmd"><code>ameesh canon check | sync</code></p></article>
+      <article class="card idea"><span class="tag">Runner</span><h3>One runner per host, with leases</h3><p>A single runner per machine claims its agents under exclusive leases, wakes on LISTEN/NOTIFY, and resumes each agent's harness on the same session. Lose the lease, and the harness is killed.</p><p class="cmd"><code>ameesh run</code> · <code>ameesh attach &lt;agent&gt;</code></p></article>
+      <article class="card idea"><span class="tag">Readable threads</span><h3>Every message, in clear</h3><p>Messages, action transitions and session summaries are appended to a Markdown thread per project or lot. Bodies that are not readable text are refused.</p><p class="cmd"><code>ameesh fil show &lt;project&gt;</code></p></article>
+      <article class="card idea"><span class="tag">The gate</span><h3>Irreversible actions need a receipt</h3><p>An action has a stable id and a digest. It runs only with a receipt bound to that digest, single use, with expiry. An unknown outcome is reconciled, never retried blindly.</p><p class="cmd"><code>ameesh action propose | execute | reconcile</code></p></article>
+      <article class="card idea"><span class="tag">Human receipts</span><h3>Signed with a passkey, out of reach</h3><p>ameesh-approve runs under its own Unix user, shows the action recomputed from the database, and has the human sign it with a passkey. Passkeys are enrolled by canon pull request. One instance per team, in a strict profile: its own host name is its WebAuthn identity, and <code>approve-check</code> keeps every verifier consistent with it.</p><p class="cmd"><code>ameesh-approve serve</code> · <code>ameesh approve-check</code></p></article>
+      <article class="card idea"><span class="tag">Governed placement</span><h3>Humans decide where agents run</h3><p>The project's responsible human places agents; each host's responsible human sets which harnesses, providers and credential modes it admits. ameesh never moves an agent by itself.</p><p class="cmd"><code>ameesh placement check</code></p></article>
+      <article class="card idea"><span class="tag">Budgets and cost</span><h3>Per-turn accounting, guarded turns</h3><p>Cost per turn for each harness, subscription gauges read from the harnesses' own logs and kept as history, the provider's balance and real spend, an hourly cap on pay-per-token usage, and model, effort and tier set per agent.</p><p class="cmd"><code>ameesh cost turns | gauges | balance</code></p></article>
+      <article class="card idea"><span class="tag">Progress view</span><h3>Lots, agents and budget at a glance</h3><p>A timeline of lots (requested, frozen, verdict, merged), what each agent is doing, and spend, as text, versioned JSON, or a standalone HTML page readable on a phone.</p><p class="cmd"><code>ameesh progress --html progress.html</code></p></article>
+      <article class="card idea"><span class="tag">Cluster profile</span><h3>One persistent agent per pod</h3><p>A runner image and example Kubernetes manifests: read-only canon, no inbound network, non-root, plus read-only Postgres roles for an external supervisor.</p><p class="cmd"><code>kubectl apply -k deploy/k8s</code></p></article>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="architecture" aria-labelledby="arch-h">
+  <div class="wrap">
+    <h2 id="arch-h">Architecture</h2>
+    <p class="section-lead">ameesh reads the canon and writes to it only by proposal. State lives in the database. Secrets are in neither. The approval service shares nothing with ameesh but receipts.</p>
+    <div class="arch">
+      <figure class="diagram">
+        <svg viewBox="0 0 400 640" role="img" aria-labelledby="arch-t arch-d">
+          <title id="arch-t">ameesh architecture</title>
+          <desc id="arch-d">The OKF canon in git is read by ameesh at the merged commit. Inside ameesh, a runner per host with leases drives Claude Code, Codex and DeepSeek Harness; a Postgres registry and mailbox hold the state; an action gate and readable threads sit beside them; a receipt verifier checks receipts produced by ameesh-approve, a separate service that a human uses with a passkey on a phone. The gate calls connectors such as git-merge.</desc>
+          <defs>
+            <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-m" d="M0 0 10 5 0 10z"/></marker>
+            <marker id="ahw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="d-mw" d="M0 0 10 5 0 10z"/></marker>
+          </defs>
+          <!-- canon -->
+          <rect class="d-box" x="20" y="10" width="360" height="72" rx="10"/>
+          <text class="d-tb" x="36" y="36">Canon · OKF in git</text>
+          <text class="d-s" x="36" y="55">members · hosts · agents · placements</text>
+          <text class="d-s" x="36" y="71">review policies · trusted passkeys · changed by PR</text>
+          <line class="d-a" x1="200" y1="84" x2="200" y2="114" marker-end="url(#ah)"/>
+          <text class="d-l" x="210" y="103">read at the merged commit</text>
+          <!-- ameesh core -->
+          <rect class="d-core" x="20" y="118" width="360" height="296" rx="12"/>
+          <text class="d-tb" x="36" y="142">ameesh · one runner per host</text>
+          <rect class="d-inner" x="36" y="156" width="160" height="62" rx="8"/>
+          <text class="d-t" x="48" y="180">Runner</text>
+          <text class="d-s" x="48" y="200">leases · turns · resume</text>
+          <rect class="d-inner" x="204" y="156" width="160" height="62" rx="8"/>
+          <text class="d-t" x="216" y="180">Registry + mailbox</text>
+          <text class="d-s" x="216" y="200">Postgres · LISTEN/NOTIFY</text>
+          <rect class="d-pill" x="36" y="230" width="100" height="28" rx="14"/>
+          <text class="d-s" x="86" y="248" text-anchor="middle">Claude Code</text>
+          <rect class="d-pill" x="142" y="230" width="72" height="28" rx="14"/>
+          <text class="d-s" x="178" y="248" text-anchor="middle">Codex</text>
+          <rect class="d-pill" x="220" y="230" width="144" height="28" rx="14"/>
+          <text class="d-s" x="292" y="248" text-anchor="middle">DeepSeek Harness</text>
+          <rect class="d-inner" x="36" y="272" width="160" height="62" rx="8"/>
+          <text class="d-t" x="48" y="296">Action gate</text>
+          <text class="d-s" x="48" y="316">digest · single use · expiry</text>
+          <rect class="d-inner" x="204" y="272" width="160" height="62" rx="8"/>
+          <text class="d-t" x="216" y="296">Readable threads</text>
+          <text class="d-s" x="216" y="316">every message, verbatim</text>
+          <rect class="d-inner" x="36" y="346" width="328" height="52" rx="8"/>
+          <text class="d-t" x="48" y="368">Receipt verification</text>
+          <text class="d-s" x="48" y="386">trust registry synced from the canon</text>
+          <!-- gate to connectors -->
+          <line class="d-a" x1="105" y1="414" x2="105" y2="454" marker-end="url(#ah)"/>
+          <text class="d-l" x="113" y="438">only with a receipt</text>
+          <rect class="d-box" x="20" y="458" width="170" height="64" rx="10"/>
+          <text class="d-t" x="32" y="483">Connectors</text>
+          <text class="d-s" x="32" y="503">git-merge (gh) · shell-noop</text>
+          <!-- approve -->
+          <rect class="d-warm" x="210" y="458" width="170" height="64" rx="10"/>
+          <text class="d-t" x="222" y="483">ameesh-approve</text>
+          <text class="d-s" x="222" y="503">own Unix user or host</text>
+          <line class="d-aw" x1="295" y1="454" x2="295" y2="418" marker-start="url(#ahw)" marker-end="url(#ahw)"/>
+          <text class="d-lw" x="303" y="440">receipts only</text>
+          <line class="d-aw" x1="295" y1="526" x2="295" y2="562" marker-start="url(#ahw)" marker-end="url(#ahw)"/>
+          <text class="d-lw" x="303" y="548">HTTPS page</text>
+          <rect class="d-warm" x="210" y="566" width="170" height="64" rx="10"/>
+          <text class="d-t" x="222" y="591">Human · phone</text>
+          <text class="d-s" x="222" y="611">passkey (WebAuthn)</text>
+          <!-- observability -->
+          <rect class="d-box" x="20" y="566" width="170" height="64" rx="10"/>
+          <text class="d-t" x="32" y="591">Observability</text>
+          <text class="d-s" x="32" y="611">list · decisions · progress</text>
+        </svg>
+        <figcaption>Components of ameesh v1. Teal: ameesh and its data; orange: the human approval path, out of the agents' reach.</figcaption>
+      </figure>
+      <ul class="legend">
+        <li><b>Canon</b><span>Declarations only. ameesh reads the merged commit of the canonical branch; local edits and unpushed commits are reported, never used. An unreadable or invalid canon closes new claims.</span></li>
+        <li><b>Runner and registry</b><span>One runner per host claims agents under exclusive, fenced leases. Postgres holds leases, sessions, mail, work items, actions and spend.</span></li>
+        <li><b>Readable threads</b><span>The mailbox is a delivery queue; the thread is the reference a human reads. One Markdown file per project or lot.</span></li>
+        <li><b>Action gate</b><span>The state <code>launched</code> and the consumed nonce are committed before the external call, which receives the action id as its idempotency key.</span></li>
+        <li class="w"><b>ameesh-approve</b><span>A separate service under its own Unix user. It recomputes what it shows from the database, and its token can request receipts, never sign them.</span></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="approval" aria-labelledby="approval-h">
+  <div class="wrap">
+    <h2 id="approval-h">How an approval works</h2>
+    <p class="section-lead">The end-to-end scenario of v1, as the demo plays it: an agent wants to merge a pull request.</p>
+    <div class="seq-grid">
+      <ol class="seq">
+        <li><div class="actors"><span class="actor">agent</span><span class="arrow" aria-hidden="true">→</span><span class="actor">gate</span></div><p><strong>The agent proposes</strong> a <code>git-merge</code> action. ameesh gives it a stable id and a digest of exactly what will happen. Its class is <code>irreversible</code>.</p></li>
+        <li><div class="actors"><span class="actor">gate</span></div><p><strong>Execution is refused</strong> with <code>[receipt_required]</code>. The action now waits in the human's queue: <code>ameesh decisions --for human:alice</code>.</p></li>
+        <li><div class="actors"><span class="actor">ameesh</span><span class="arrow" aria-hidden="true">→</span><span class="actor h">ameesh-approve</span></div><p><strong>ameesh requests an approval.</strong> The service recomputes the summary from the action in the database, never from the agent's text, and a single-use link is written to the thread.</p></li>
+        <li class="human"><div class="actors"><span class="actor h">human</span><span class="arrow" aria-hidden="true">→</span><span class="actor h">phone</span></div><p><strong>The human opens the link on their phone,</strong> sees the action, amount and short digest, and <strong>signs with their passkey</strong>. User verification is required, and only the approver's enrolled credentials are allowed.</p></li>
+        <li><div class="actors"><span class="actor">ameesh</span><span class="arrow" aria-hidden="true">←</span><span class="actor h">ameesh-approve</span></div><p><strong>ameesh fetches the receipt and verifies it itself:</strong> the digest, the origin and RP ID, the signature against the passkey registered in the canon, the expiry.</p></li>
+        <li><div class="actors"><span class="actor">gate</span><span class="arrow" aria-hidden="true">→</span><span class="actor">connector</span></div><p><strong>The action is launched.</strong> The nonce is consumed and <code>launched</code> is committed before the call; the connector receives the action id as idempotency key.</p></li>
+        <li><div class="actors"><span class="actor">gate</span></div><p><strong>If the answer is lost,</strong> the outcome is <code>unknown</code> and never retried automatically. <code>ameesh action reconcile</code> asks the connector what happened. Replaying the receipt fails with <code>[replay]</code>.</p></li>
+      </ol>
+      <aside class="aside" aria-label="Commands of the approval">
+        <pre class="term"><code><span class="c"># the gate, step by step</span>
+<span class="p">$ </span>ameesh action propose \
+    --connector git-merge \
+    --operation merge \
+    --project acme-web \
+    --target acme/acme-web#7 \
+    --approver human:alice
+<span class="p">$ </span>ameesh action execute act_…
+<span class="c">refused [receipt_required]</span>
+<span class="p">$ </span>ameesh action request act_… \
+    --approver human:alice
+<span class="p">$ </span>ameesh action fetch-receipt act_…
+<span class="p">$ </span>ameesh action execute act_…
+<span class="p">$ </span>ameesh action reconcile act_…</code></pre>
+      </aside>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="quickstart" aria-labelledby="quick-h">
+  <div class="wrap">
+    <h2 id="quick-h">Quickstart on the bench</h2>
+    <p class="section-lead">The whole v1 scenario on your machine: a local Postgres container, a fictitious organisation, fake harnesses, a fake <code>gh</code> and a software passkey. Nothing real is called, and the temporary database is dropped at the end.</p>
+    <pre class="term"><code><span class="p">$ </span>git clone https://github.com/manaty/ameesh.git &amp;&amp; cd ameesh
+<span class="p">$ </span>export AMEESH_PG_PASSWORD='choose-a-local-password' PGPASSWORD="$AMEESH_PG_PASSWORD"
+<span class="p">$ </span>scripts/pg-up.sh      <span class="c"># postgres:17 on 127.0.0.1:55432 only</span>
+<span class="p">$ </span>scripts/demo-v1.sh    <span class="c"># canon → runner → thread → gate → receipt → reconciliation</span>
+<span class="p">$ </span>scripts/test.sh       <span class="c"># the full suite, with the psql and psycopg drivers</span></code></pre>
+    <p class="note">Requirements: Python 3.9 or later, git, Docker, and the <code>psql</code> client or <code>psycopg</code>. Next: <a href="docs/getting-started/">Getting started</a>, then <a href="docs/guides/write-a-canon/">write your own canon</a>. Moving a running team from the v0 scripts is covered step by step, with rollback, in <a href="docs/guides/switch-from-v0/">Switch from a v0 setup</a>.</p>
+  </div>
+</section>
+
+<section id="security" aria-labelledby="sec-h">
+  <div class="wrap">
+    <h2 id="sec-h">Security, stated honestly</h2>
+    <p class="section-lead">What v1 guarantees, and what it does not yet. Straight from the specification.</p>
+    <div class="sec">
+      <div class="card yes">
+        <h3>Guaranteed in v1</h3>
+        <ul>
+          <li>An agent <strong>without a responsible human, or misplaced</strong> against its host's policy, does not run.</li>
+          <li><strong>No irreversible action without a valid receipt</strong> when it goes through ameesh's gate.</li>
+          <li>Receipts are <strong>bound to the digest, single use, and expire</strong>.</li>
+          <li>The registry of authenticators changes <strong>only by reviewed pull request</strong> to the canon.</li>
+          <li>A <strong>readable thread</strong> of every message that goes through ameesh.</li>
+        </ul>
+      </div>
+      <div class="card not">
+        <h3>Not yet</h3>
+        <ul>
+          <li><strong>Isolation of agents from each other</strong>: locally they share the same Unix user.</li>
+          <li>The gate protects against <strong>mistakes and prompt injection</strong>, not against a malicious agent sharing ameesh's Unix user, which could read business credentials or modify ameesh and its database.</li>
+          <li>Gate and business credentials under a separate user, network sandbox, MCP proxy.</li>
+          <li>Strong non-repudiation for <strong>synced</strong> passkeys (the high level means a hardware key).</li>
+          <li>Provenance signatures on agents' messages; messages exchanged outside ameesh are not captured.</li>
+        </ul>
+      </div>
+    </div>
+    <p class="note">Read the full <a href="docs/security/">security model</a>, including the lease invariant and the limits of the cluster profile.</p>
+  </div>
+</section>
+
+<section class="alt road" id="status" aria-labelledby="status-h">
+  <div class="wrap">
+    <h2 id="status-h">Status and roadmap</h2>
+    <p class="section-lead">v1 runs on a test bench today; the switch of a real team is documented step by step. No dates are promised.</p>
+    <div class="grid three">
+      <article class="card">
+        <h3><span class="badge done">Done</span> v1.0.0</h3>
+        <ul>
+          <li>Canon reading, validation and sync; responsible humans; ephemeral agents</li>
+          <li>Governed placement in the claim predicate</li>
+          <li>Readable threads</li>
+          <li>Actions, gate, reconciliation, <code>git-merge</code></li>
+          <li>Receipts (WebAuthn, device ES256; Ed25519 for tests and agent provenance, refused for human approval by default) and ameesh-approve</li>
+          <li>Events, coalescing, <code>ameesh attach</code></li>
+          <li>Storage interface; suite green on two drivers</li>
+        </ul>
+      </article>
+      <article class="card">
+        <h3><span class="badge built">Built</span> since v1.0.0</h3>
+        <ul>
+          <li>Turn interruption, session rotation with summary</li>
+          <li>Per-turn cost accounting and budget guard</li>
+          <li>Review classes by file scope, delay metrics per lot</li>
+          <li>Model catalogue and discovery</li>
+          <li>Real-time progress view</li>
+          <li>Cluster hosting profile</li>
+          <li>Operations: session per lot, alerts, restart on a brief, provider balance</li>
+          <li>ameesh-approve per team: strict profile, <code>approve-check</code>, local TLS</li>
+        </ul>
+      </article>
+      <article class="card">
+        <h3><span class="badge plan">Planned</span> next</h3>
+        <ul>
+          <li>Provisioning of hosted ameesh-approve (relay, dedicated page)</li>
+          <li>Model evaluation; harness descriptors and catalogue</li>
+          <li>Signal intake and a bounded self-repair loop</li>
+          <li>More thread transports; the gate as an MCP proxy</li>
+          <li>SQLite driver; one Unix user per agent</li>
+        </ul>
+      </article>
+    </div>
+    <p class="note">Details: <a href="docs/roadmap/">status and roadmap</a>. The design (specification, decisions, studies) is in <a href="https://github.com/manaty/ameesh/tree/main/docs/design"><code>docs/design/</code></a>, in French.</p>
+  </div>
+</section>
+
+<section id="license" aria-labelledby="license-h">
+  <div class="wrap">
+    <h2 id="license-h">License and contributing</h2>
+    <p class="section-lead">Open source from the first public release, with the design written down in the open.</p>
+    <div class="grid two">
+      <article class="card">
+        <h3>Free software, AGPL-3.0-only</h3>
+        <p>ameesh is released under the GNU Affero General Public License v3, <em>only</em> variant. Anyone who runs a modified ameesh as a network service must offer its source code to its users.</p>
+        <p><a href="https://github.com/manaty/ameesh/blob/main/LICENSE">Read the license</a></p>
+      </article>
+      <article class="card">
+        <h3>Contributing</h3>
+        <p>External contributions are accepted under a contributor license agreement, which is being prepared: open an issue first to discuss your proposal. Tests run on a real Postgres with both drivers.</p>
+        <p><a href="https://github.com/manaty/ameesh/blob/main/CONTRIBUTING.md">Contribution guide</a> · <a href="https://github.com/manaty/ameesh/issues">Issues</a></p>
+      </article>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap cols">
+    <div>
+      <p><strong>ameesh</strong> — coordination of mixed teams of humans and AI agents.</p>
+      <p>This site sets no cookie, runs no tracker, and loads nothing from third parties.</p>
+    </div>
+    <nav aria-label="Documentation">
+      <h2>Documentation</h2>
+      <ul>
+        <li><a href="docs/getting-started/">Getting started</a></li>
+        <li><a href="docs/concepts/">Concepts</a></li>
+        <li><a href="docs/guides/">Guides</a></li>
+        <li><a href="docs/reference/cli/">CLI reference</a></li>
+      </ul>
+    </nav>
+    <nav aria-label="Project">
+      <h2>Project</h2>
+      <ul>
+        <li><a href="https://github.com/manaty/ameesh">Source code</a></li>
+        <li><a href="https://github.com/manaty/ameesh/blob/main/LICENSE">License</a></li>
+        <li><a href="https://github.com/manaty/ameesh/blob/main/CONTRIBUTING.md">Contributing</a></li>
+        <li><a href="https://github.com/manaty/ameesh/tree/main/docs/design">Design (French)</a></li>
+      </ul>
+    </nav>
+  </div>
+</footer>
+</body>
+</html>

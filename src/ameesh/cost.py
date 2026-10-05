@@ -13,7 +13,8 @@
     jours) dans le stream-json `events.jsonl` de l'agent ;
   * Codex  : `rate_limits.primary`/`secondary` (`used_percent`,
     `window_minutes`, `resets_at`) dans les journaux de session
-    `~/.codex/sessions/**/*.jsonl`.
+    `<sessions>/**/*.jsonl` — sessions : argument > `AMEESH_CODEX_SESSIONS`
+    (surcharge explicite) > `$CODEX_HOME/sessions` > `~/.codex/sessions`.
 
 **Comptabilité par tour** (décision 0019 §3) :
 
@@ -79,6 +80,13 @@ PACE_CEILING = 0.90
 TAIL_BYTES = 4_000_000
 CODEX_FILES = 5
 
+#: marqueur de compte (L30, décision 0027) : l'exécuteur l'écrit dans le flux
+#: `events.jsonl` de l'agent juste avant chaque tour, quand des comptes sont
+#: déclarés pour le harnais. Les événements qui suivent (dont les
+#: `rate_limit_event` de Claude) appartiennent à ce compte. Un flux sans
+#: marqueur est celui du compte primaire (hôte d'avant L30).
+ACCOUNT_MARKER = "ameesh.account"
+
 
 class CostError(Exception):
     """Erreur de comptabilité (repère illisible, base absente)."""
@@ -106,6 +114,14 @@ class Gauge:
 
     def exceeded(self, now: float) -> bool:
         return self.used >= self.pace_cap(now)
+
+    def reset_passed(self, now: float) -> bool:
+        """La fenêtre publiée est-elle déjà remise à zéro (`resets_at` passé) ?
+
+        Le relevé est alors périmé : la fenêtre suivante est vierge tant qu'aucun
+        tour n'a publié de nouveau relevé (L30, retour au primaire).
+        """
+        return bool(self.resets_at) and now >= float(self.resets_at)
 
 
 @dataclass(frozen=True)
@@ -242,8 +258,11 @@ class CostBook:
         self.state_dir = state_dir if state_dir is not None else config_mod.load().state_dir
         self.prices_path = prices_path if prices_path is not None else os.environ.get(
             "AMEESH_PRICES") or os.path.expanduser("~/.config/nexlink-agents/prices.json")
-        self.codex_sessions = codex_sessions if codex_sessions is not None else os.path.expanduser(
-            "~/.codex/sessions")
+        # sessions Codex : argument > AMEESH_CODEX_SESSIONS (surcharge explicite)
+        # > $CODEX_HOME/sessions (comme Codex lui-même) > ~/.codex/sessions
+        self.codex_sessions = codex_sessions if codex_sessions is not None else (
+            os.environ.get("AMEESH_CODEX_SESSIONS") or os.path.join(
+                os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex"), "sessions"))
         self.db = db
         self.tools = dict(tools or {})
         self.clock = clock
@@ -300,12 +319,18 @@ class CostBook:
         return out
 
     # -- jauges de forfait --------------------------------------------------
-    def claude_gauges(self) -> list:
+    def claude_gauges(self, account: str | None = None, primary: str | None = None) -> list:
         """Le dernier `rate_limit_event` vu par un agent Claude.
 
         Le forfait est partagé par tout le compte : la jauge la plus récente de
         n'importe quel agent Claude vaut pour les autres.
+
+        `account` (L30) : seulement les événements de ce compte, reconnus par le
+        marqueur qui précède chaque tour ; un événement sans marqueur avant lui
+        appartient au compte `primary`.
         """
+        if account is not None:
+            return self._claude_gauges_of(account, primary or account)
         newest = None
         for agent in self.agents():
             if self.tool_of(agent) != "claude":
@@ -320,28 +345,67 @@ class CostBook:
             for line in reversed(self.events(agent, tail=True)):
                 if line.get("type") != "rate_limit_event":
                     continue
-                info = line.get("rate_limit_info") or {}
-                windows = info.get("unifiedWindows") or {}
-                if not isinstance(windows, dict):
+                gauges = _claude_windows(line)
+                if gauges is None:
                     break
-                newest = (mtime, [
-                    Gauge("claude", key, _fraction(value.get("utilization")),
-                          _epoch(value.get("resetsAt")),
-                          float(KNOWN_WINDOWS.get(key, KNOWN_WINDOWS["seven_day"])))
-                    for key, value in windows.items() if isinstance(value, dict)
-                ])
+                newest = (mtime, gauges)
                 break
         return newest[1] if newest else []
 
-    def codex_gauges(self) -> list:
+    def _claude_gauges_of(self, account: str, primary: str) -> list:
+        """Les jauges Claude d'UN compte (L30) : le dernier relevé de ce compte.
+
+        Chaque tour est précédé d'un marqueur daté ; le relevé le plus récent est
+        celui du tour au marqueur le plus récent, tous agents confondus. Dans un
+        flux sans aucun marqueur (agent d'avant L30), les relevés sont du compte
+        primaire et datés par le fichier.
+        """
+        best = None
+        for agent in self.agents():
+            if self.tool_of(agent) != "claude":
+                continue
+            path = os.path.join(self.agent_dir(agent), "events.jsonl")
+            try:
+                mtime = os.stat(path).st_mtime
+            except OSError:
+                continue
+            events = self.events(agent, tail=True)
+            marked = any(e.get("type") == ACCOUNT_MARKER for e in events)
+            current, stamp = primary, (0.0 if marked else mtime)
+            found = None
+            for event in events:
+                kind = event.get("type")
+                if kind == ACCOUNT_MARKER:
+                    if event.get("harness") not in (None, "", "claude"):
+                        continue
+                    current = str(event.get("account") or primary)
+                    try:
+                        stamp = float(event.get("ts") or 0.0)
+                    except (TypeError, ValueError):
+                        stamp = 0.0
+                    continue
+                if kind != "rate_limit_event" or current != account:
+                    continue
+                gauges = _claude_windows(event)
+                if gauges is not None:
+                    found = (stamp, gauges)
+            if found and (best is None or found[0] >= best[0]):
+                best = found
+        return best[1] if best else []
+
+    def codex_gauges(self, sessions: str | None = None) -> list:
         """Les `rate_limits` primaire et secondaire du journal de session le plus récent.
 
         Lecture **JSON structurée**, pas une expression régulière : l'ordre des clés
         n'est pas garanti (`plan_type` peut précéder `primary`), `secondary` peut
         être `null`, et une regex y perdait la jauge — donc la pause (sonde codex2).
+
+        `sessions` (L30) : le dossier de sessions d'un compte
+        (`<CODEX_HOME>/sessions`) ; par défaut celui de la machine.
         """
+        racine = sessions if sessions is not None else self.codex_sessions
         files = sorted(
-            glob.glob(os.path.join(self.codex_sessions, "**", "*.jsonl"), recursive=True),
+            glob.glob(os.path.join(racine, "**", "*.jsonl"), recursive=True),
             key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
         )[-CODEX_FILES:]
         for path in reversed(files):
@@ -382,7 +446,31 @@ class CostBook:
             out += self.claude_gauges()
         if harness in (None, "codex"):
             out += self.codex_gauges()
+        self.record_gauges(out)
         return out
+
+    def record_gauges(self, gauges: Sequence[Gauge], account: str | None = None) -> int:
+        """Historique des jauges (L26, migration 0027), là où elles sont lues.
+
+        Une ligne seulement quand la jauge change (ou toutes les dix minutes) ;
+        sans base, rien. **Ne lève jamais** : l'historique ne doit pas casser
+        la garde de budget qui lit les jauges avant chaque tour.
+
+        `account` (L30, migration 0028) : les jauges sont celles de ce compte.
+        """
+        if self.db is None or not gauges:
+            return 0
+        try:
+            lignes = []
+            for g in gauges:
+                ligne = {"harness": g.harness, "key": g.key, "used": g.used,
+                         "resets_at": g.resets_at, "window_s": g.window_s}
+                if account is not None:
+                    ligne["account"] = account
+                lignes.append(ligne)
+            return storage.of(self.db).operations.record_gauges(lignes)
+        except Exception:  # historique facultatif : jamais fatal
+            return 0
 
     def pace_exceeded(self, harness: str) -> str:
         """Le forfait d'un harnais avance-t-il trop vite ? La raison, ou ''.
@@ -546,6 +634,8 @@ class CostBook:
         # l'insertion : la ligne et le repère doivent porter la même session.
         session_id = session or self.session_of(agent)
         usage = self.turn_usage(agent, start, session=session_id, model=model)
+        # L30 : le compte du tour est celui du dernier marqueur AVANT le tour.
+        account = self.account_at(agent, start, usage.harness)
         cum_usd = cum_input = cum_cached = cum_out = None
         if usage.harness == "claude":
             totals = [float(e["total_cost_usd"]) for e in events
@@ -567,12 +657,43 @@ class CostBook:
             model=row["model"], session=row["session"], usd=row["usd"],
             input_tokens=row["input_tokens"], cached_input_tokens=row["cached_input_tokens"],
             output_tokens=row["output_tokens"], cum_usd=cum_usd, cum_input_tokens=cum_input,
-            cum_cached_input_tokens=cum_cached, cum_output_tokens=cum_out)
+            cum_cached_input_tokens=cum_cached, cum_output_tokens=cum_out,
+            account=account)
         return usage
+
+    def account_at(self, agent: str, start: int, harness: str | None = None) -> str | None:
+        """Le compte du tour qui commence à la ligne `start` du flux (L30), ou None.
+
+        C'est le dernier marqueur de compte écrit avant cette ligne : l'exécuteur
+        le pose juste avant de compter l'index de début du tour. None quand aucun
+        marqueur ne précède (hôte sans comptes déclarés).
+        """
+        path = os.path.join(self.agent_dir(agent), "events.jsonl")
+        found = None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for index, line in enumerate(fh):
+                    if index >= start:
+                        break
+                    if ACCOUNT_MARKER not in line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(event, dict) or event.get("type") != ACCOUNT_MARKER:
+                        continue
+                    if harness and event.get("harness") not in (None, "", harness):
+                        continue
+                    found = str(event.get("account") or "") or None
+        except OSError:
+            return None
+        return found
 
     # -- dépense ------------------------------------------------------------
     def spent(self, agent: str = "all", seconds: float = 3600.0,
-              harnesses: Sequence[str] | None = None) -> float:
+              harnesses: Sequence[str] | None = None,
+              account: str | None = None) -> float:
         """La dépense des `seconds` dernières secondes, lue sur `turn_costs`.
 
         `harnesses` restreint la somme à ces harnais : le plafond horaire de
@@ -582,19 +703,27 @@ class CostBook:
         """
         if self.db is None:
             return 0.0
+        if account is not None:
+            return storage.of(self.db).turn_costs.spent(seconds, agent=agent,
+                                                         harnesses=harnesses,
+                                                         account=account)
         return storage.of(self.db).turn_costs.spent(seconds, agent=agent,
                                                      harnesses=harnesses)
 
     def over(self, agent: str = "all", *,
-             paid_harnesses: Sequence[str] | None = None) -> str:
+             paid_harnesses: Sequence[str] | None = None, pace: bool = True) -> str:
         """Le garde-fou : raison si l'agent (ou le compte) doit s'arrêter, sinon ''.
 
         Le plafond horaire ne somme que l'usage payé au token
         (`paid_harnesses`, défaut `DEFAULT_PAID_HARNESSES`) ; les forfaits sont
         couverts par `pace_exceeded`, pas par cette somme (0019 §2).
+
+        `pace=False` (L30) : le rythme est jugé compte par compte par
+        `ameesh.accounts`, qui bascule au lieu de mettre en pause ; seul le
+        plafond horaire reste ici.
         """
         harness = self.tool_of(agent) if agent != "all" else ""
-        reason = self.pace_exceeded(harness) if harness else ""
+        reason = self.pace_exceeded(harness) if (harness and pace) else ""
         if reason:
             return reason
         paid = DEFAULT_PAID_HARNESSES if paid_harnesses is None else tuple(paid_harnesses)
@@ -605,18 +734,28 @@ class CostBook:
         return ""
 
     # -- rapport ------------------------------------------------------------
-    def report(self) -> list:
-        """Une ligne par agent : harnais, modèle, dépense 1 h/24 h, jauges."""
+    def report(self, accounts: dict | None = None) -> list:
+        """Une ligne par agent : harnais, modèle, dépense 1 h/24 h, jauges.
+
+        `accounts` (L30) : `{harnais: (compte actif, [Gauge…])}` pour les
+        harnais à comptes déclarés ; leurs jauges sont alors celles du compte
+        actif, et la ligne nomme ce compte (`account`).
+        """
         rows = []
         now = self.clock()
+        accounts = accounts or {}
         # Le forfait est partagé par tout le compte : les jauges se lisent une fois
         # par harnais, pas une fois par agent.
-        by_harness: dict = {}
+        by_harness: dict = {name: list(value[1]) for name, value in accounts.items()}
         for agent in self.agents():
             harness = self.tool_of(agent) or "?"
             if harness in ("claude", "codex") and harness not in by_harness:
                 by_harness[harness] = self.gauges(harness)
-            rows.append({
+            if harness in accounts:
+                rows.append({"account": accounts[harness][0]})
+            else:
+                rows.append({})
+            rows[-1].update({
                 "agent": agent,
                 "harness": harness,
                 "model": self.model_of(agent) or "défaut",
@@ -649,9 +788,25 @@ def format_report(rows: Iterable[dict]) -> str:
             "%s %.0f%% (rythme %.0f%%)" % (g["key"], g["used"] * 100, g["cap"] * 100)
             for g in row["gauges"]) or "—"
         lines.append("%-16s %-9s %-16s %10.4f %10.4f  %s" % (
-            row["agent"], row["harness"], row["model"],
+            row["agent"],
+            row["harness"] + ("/%s" % row["account"] if row.get("account") else ""),
+            row["model"],
             row["spent_1h"], row["spent_24h"], gauges))
     return "\n".join(lines)
+
+
+def _claude_windows(event: dict) -> list | None:
+    """Les fenêtres d'un `rate_limit_event` Claude, ou None si illisibles."""
+    info = event.get("rate_limit_info") or {}
+    windows = info.get("unifiedWindows") or {} if isinstance(info, dict) else None
+    if not isinstance(windows, dict):
+        return None
+    return [
+        Gauge("claude", key, _fraction(value.get("utilization")),
+              _epoch(value.get("resetsAt")),
+              float(KNOWN_WINDOWS.get(key, KNOWN_WINDOWS["seven_day"])))
+        for key, value in windows.items() if isinstance(value, dict)
+    ]
 
 
 def _find_rate_limits(node, depth: int = 0):

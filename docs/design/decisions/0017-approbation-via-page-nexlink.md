@@ -30,3 +30,12 @@ Pour la bascule du chantier, **ameesh-approve est exposé via une page Nexlink**
   existante devient une page Nexlink »).
 - Rien n'est exposé avant que le service ait passé sa revue de sécurité (L7) ;
   la mise en ligne reste un acte du propriétaire.
+
+# Précision (2026-10-05)
+
+Décision du propriétaire, rapportée par mesh-design : la page est **la page
+d'ameesh** (le service ameesh-approve, pas une page de contenu Nexlink),
+**servie par Nexlink sur `ameesh.nexlink.ph`**. RP ID `ameesh.nexlink.ph`,
+origine `https://ameesh.nexlink.ph`. Le service reste sur la boucle locale du
+PC (127.0.0.1:8765, utilisateur `ameesh-approve`) ; le relais HTTPS et le moyen
+d'atteindre le PC sans connexion entrante sont fournis côté Nexlink.

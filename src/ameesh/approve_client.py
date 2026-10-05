@@ -4,9 +4,18 @@
     POST /requests        dépose une demande d'approbation ; rend le lien à
                           usage unique à ouvrir sur le téléphone
     GET  /receipts/<id>   le reçu signé (200), en attente (202), échu (410)
+    GET  /health          la politique publiée par le service (RP ID,
+                          origines, profil), sans jeton : `ameesh approve-check`
 
 Configuration : `AMEESH_APPROVE_URL` (`approve_url`) et
-`AMEESH_APPROVE_TOKEN_FILE` (`approve_token_file`). Le jeton de service
+`AMEESH_APPROVE_TOKEN_FILE` (`approve_token_file`). `approve_url` est
+l'adresse machine de l'API, DISTINCTE de la `public_url` des pages humaines
+(lot L27) : boucle locale, accès privé, ou l'hôte public seulement si le
+service l'ouvre explicitement (`api_via_public` dans son JSON) — sinon il
+répond 421, et ce client le dit. Aucune URL n'est déduite d'une autre.
+Avec le TLS local du service (passthrough), `approve_url` vaut
+`https://127.0.0.1:PORT` et `AMEESH_APPROVE_TLS_NAME` (`approve_tls_name`)
+donne le nom `H` pour lequel le certificat est vérifié. Le jeton de service
 permet de DEMANDER une approbation, jamais d'en signer une ; il est lu dans
 un fichier régulier de l'utilisateur, en `0600` (même contrôle que le
 service : `approve.config.read_service_token`).
@@ -27,9 +36,12 @@ Le reçu récupéré n'est pas cru sur parole : l'appelant le VÉRIFIE lui-même
 """
 from __future__ import annotations
 
+import functools
+import http.client
 import ipaddress
 import json
 import re
+import ssl
 import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
@@ -37,6 +49,8 @@ from urllib.parse import urlsplit
 from .config import Config
 
 REQUEST_ID_RE = re.compile(r"^req_[0-9a-z]{26}$")
+_TLS_NAME_RE = re.compile(
+    r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
 TIMEOUT = 15.0
 MAX_RESPONSE = 1024 * 1024
 _LOOPBACK_NAMES = ("localhost",)
@@ -93,8 +107,50 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None     # 3xx → HTTPError : l'en-tête Authorization ne suit jamais
 
 
-def _opener() -> urllib.request.OpenerDirector:
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+class _NamedHTTPSConnection(http.client.HTTPSConnection):
+    """Connexion TLS à la boucle locale, certificat vérifié pour le nom `H`
+    (SNI et contrôle du nom) — l'en-tête Host reste l'adresse locale."""
+
+    def __init__(self, *args, tls_name: str, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tls_name = tls_name
+
+    def connect(self) -> None:
+        http.client.HTTPConnection.connect(self)
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self._tls_name)
+
+
+class _NamedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, tls_name: str):
+        super().__init__(context=ssl.create_default_context())
+        self._tls_name = tls_name
+
+    def https_open(self, req):
+        return self.do_open(functools.partial(_NamedHTTPSConnection, tls_name=self._tls_name),
+                            req, context=self._context)
+
+
+def tls_name(cfg: Config, url: str) -> str:
+    """Le nom TLS à vérifier, contrôlé (vide : celui de l'URL)."""
+    name = (getattr(cfg, "approve_tls_name", "") or "").strip().lower()
+    if not name:
+        return ""
+    if not _TLS_NAME_RE.fullmatch(name):
+        raise ApproveClientError("config", "AMEESH_APPROVE_TLS_NAME : nom d'hôte attendu")
+    parts = urlsplit(url)
+    if parts.scheme != "https" or not _loopback(parts.hostname or ""):
+        raise ApproveClientError(
+            "config", "AMEESH_APPROVE_TLS_NAME ne sert qu'avec AMEESH_APPROVE_URL "
+                      "https://127.0.0.1:PORT (TLS local du service) ; ailleurs, le nom "
+                      "vérifié est celui de l'URL")
+    return name
+
+
+def _opener(name: str = "") -> urllib.request.OpenerDirector:
+    handlers = [urllib.request.ProxyHandler({}), _NoRedirect()]
+    if name:
+        handlers.append(_NamedHTTPSHandler(name))
+    return urllib.request.build_opener(*handlers)
 
 
 def _token(cfg: Config) -> str:
@@ -108,18 +164,21 @@ def _token(cfg: Config) -> str:
         raise ApproveClientError("config", str(exc)) from exc
 
 
-def _call(cfg: Config, method: str, path: str, body: dict | None = None
-          ) -> tuple[int, bytes]:
-    url = endpoint(cfg.approve_url) + path
-    token = _token(cfg)
-    headers = {"Authorization": "Bearer " + token, "Accept": "application/json"}
+def _call(cfg: Config, method: str, path: str, body: dict | None = None, *,
+          authenticated: bool = True, url: str | None = None) -> tuple[int, bytes]:
+    base = endpoint(cfg.approve_url if url is None else url)
+    name = tls_name(cfg, base)
+    url = base + path
+    headers = {"Accept": "application/json"}
+    if authenticated:
+        headers["Authorization"] = "Bearer " + _token(cfg)
     data = None
     if body is not None:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with _opener().open(request, timeout=TIMEOUT) as response:
+        with _opener(name).open(request, timeout=TIMEOUT) as response:
             payload = response.read(MAX_RESPONSE + 1)
             if len(payload) > MAX_RESPONSE:
                 raise ApproveClientError("too_large", "réponse d'ameesh-approve trop grosse",
@@ -154,7 +213,28 @@ def _refusal(status: int, payload: bytes) -> ApproveClientError:
     data = _json(payload)
     code = str(data.get("error") or "http_%d" % status)[:64]
     message = " ".join(str(data.get("message") or "HTTP %d" % status).split())[:300]
+    if status == 421:
+        message += (" — l'API de service n'est pas servie sous cet hôte : AMEESH_APPROVE_URL "
+                    "vise la boucle locale du service, un accès privé, ou l'hôte public "
+                    "seulement si le service l'ouvre (api_via_public dans son JSON)")
     return ApproveClientError(code, message, status)
+
+
+HEALTH_FIELDS = ("rp_id", "origins", "public_url", "profile", "level", "api_via_public", "tls")
+
+
+def health(cfg: Config, *, url: str | None = None) -> dict:
+    """`GET /health` : la politique publiée par le service. Sans jeton (le
+    document ne porte aucun secret) : il ne quitte donc jamais ce poste."""
+    status, payload = _call(cfg, "GET", "/health", authenticated=False, url=url)
+    if status != 200:
+        raise _refusal(status, payload)
+    data = _json(payload)
+    if data.get("service") != "ameesh-approve" or not isinstance(data.get("rp_id"), str) \
+            or not isinstance(data.get("origins"), list) \
+            or not all(isinstance(o, str) for o in data["origins"]):
+        raise ApproveClientError("format", "réponse /health d'ameesh-approve illisible", status)
+    return {name: data.get(name) for name in HEALTH_FIELDS}
 
 
 def create_request(cfg: Config, *, action_id: str, approver: str, requested_by: str,

@@ -84,6 +84,13 @@ ce créateur ; sinon il est refusé, comme quand ce créateur n'est plus sur
 cet hôte ou que la lignée est rompue. sync ne place ni ne déplace un agent
 de lui-même : il suit les fiches Placement du canon.
 
+Plan de travail (L29) : `sync` recopie aussi les fiches `WorkPackage` dans
+`work_packages` (`sync_packages`), avec leur `canon_ref`, quel que soit
+l'hôte (le plan est commun). Une fiche en erreur n'est pas écrite (sa copie
+précédente reste) ; une fiche absente d'un membre lu est marquée retirée,
+jamais effacée ; les lots rattachés suivent le parent courant de leur fiche.
+Une erreur du plan ne bloque aucun agent.
+
 Le SQL est dans le stockage (`storage.of(db).canon`, `.ephemerals`,
 `.authenticators`, spec §10) ; la transaction du registre des
 authentificateurs, verrou compris, y est UNE opération
@@ -240,6 +247,8 @@ class SyncReport:
     diagnostic: str = ""
     #: registre des authentificateurs (§8.2), synchronisé par le même passage
     authenticators: AuthenticatorSync | None = None
+    #: plan de travail (L29) : fiches WorkPackage recopiées
+    packages: "PackageSync | None" = None
 
     @property
     def errors(self) -> list[Finding]:
@@ -261,7 +270,8 @@ class SyncReport:
                 "errors": len(self.errors),
                 "findings": [f.to_dict() for f in self.findings],
                 "authenticators": (self.authenticators.to_dict()
-                                   if self.authenticators is not None else None)}
+                                   if self.authenticators is not None else None),
+                "packages": self.packages.to_dict() if self.packages is not None else None}
 
 
 # --------------------------------------------------------------------------
@@ -297,7 +307,8 @@ def assess(canon: Canon, host: str,
         return CANON_INVALID, _describe(host_wide)
     others = canon_mod.errors(findings)
     if others:
-        return CANON_OK, "erreurs propres à des agents (non réclamables) : " + _describe(others)
+        return CANON_OK, ("erreurs propres à des agents (non réclamables) ou au plan : "
+                          + _describe(others))
     return CANON_OK, ""
 
 
@@ -989,6 +1000,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             actions.append(SyncAction(name, "hors canon",
                                       "inscrit à la main : non gouverné par sync"))
     _inherit_placements(db, host)
+    packages = sync_packages(db, canon, findings)
     if status == CANON_OK:
         record_state(db, host, status, diagnostic, canon)
     # registre des authentificateurs (§8.2) : copie de travail des fiches
@@ -999,7 +1011,66 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     record_authenticators(db, host, authenticators)
     return SyncReport(host=host, source=canon.source_label(), untrusted=canon.untrusted,
                       actions=actions, findings=findings, status=status,
-                      diagnostic=diagnostic, authenticators=authenticators)
+                      diagnostic=diagnostic, authenticators=authenticators,
+                      packages=packages)
+
+
+# --------------------------------------------------------------------------
+# plan de travail (L29)
+# --------------------------------------------------------------------------
+
+@dataclass
+class PackageSync:
+    created: list[str] = field(default_factory=list)
+    updated: list[str] = field(default_factory=list)
+    unchanged: list[str] = field(default_factory=list)
+    retired: list[str] = field(default_factory=list)
+    #: fiches en erreur : non écrites (la copie précédente, s'il y en a une, reste)
+    skipped: list[str] = field(default_factory=list)
+    relinked: int = 0
+
+    def to_dict(self) -> dict:
+        return {"created": self.created, "updated": self.updated,
+                "unchanged": self.unchanged, "retired": self.retired,
+                "skipped": self.skipped, "relinked_work_items": self.relinked}
+
+
+_PACKAGE_KEYS = ("kind", "title", "parent", "responsible", "team", "scope", "status",
+                 "canon_ref")
+
+
+def sync_packages(db: Db, canon: Canon, findings: list[Finding]) -> PackageSync:
+    """Recopie les fiches WorkPackage dans `work_packages` (une transaction)."""
+    done = PackageSync()
+    bad = {f.package for f in canon_mod.errors(findings) if f.package}
+    loaded = canon.loaded_members()
+    with db.transaction() as tx:
+        st = storage.of(tx)
+        before = {row["id"]: row for row in st.packages.all(include_absent=True)}
+        seen: set[str] = set()
+        for package in canon.packages:
+            seen.add(package.id)
+            if package.id in bad:
+                done.skipped.append(package.id)
+                continue
+            row = {"id": package.id, "kind": package.kind, "title": package.title,
+                   "parent": package.parent, "responsible": package.responsible,
+                   "team": package.team, "scope": package.scope, "status": package.status,
+                   "canon_ref": package.fiche.ref}
+            old = before.get(package.id)
+            if old is not None and old.get("present") and all(
+                    (old.get(k) or None) == (row.get(k) or None) for k in _PACKAGE_KEYS):
+                done.unchanged.append(package.id)
+                continue
+            st.packages.upsert(row)
+            (done.created if old is None else done.updated).append(package.id)
+        gone = [ident for ident, row in before.items()
+                if row.get("present") and ident not in seen
+                and _member_of(row.get("canon_ref")) in loaded]
+        st.packages.retire(gone)
+        done.retired = sorted(gone)
+        done.relinked = st.work.refresh_package_parents()
+    return done
 
 
 # --------------------------------------------------------------------------

@@ -20,6 +20,13 @@ class ActionSource(interface.ActionSource):
             "AND attnum > 0 AND NOT attisdropped", (table,))
         return {row["attname"] for row in rows}
 
-    def rows(self, table, action_id) -> list[dict]:
+    def rows(self, table, action_id, columns) -> list[dict]:
+        """Seulement les colonnes nommées (identifiants cités) : le rôle
+        d'approve n'a de droits que sur elles."""
+        names = [str(name) for name in columns]
+        if not names:
+            return []
         return self.db.query(
-            "SELECT * FROM %s WHERE action_id = %%s" % quote_ident(table), (action_id,))
+            "SELECT %s FROM %s WHERE action_id = %%s"
+            % (", ".join(quote_ident(name) for name in names), quote_ident(table)),
+            (action_id,))

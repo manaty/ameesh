@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Service « headless » exigé par le StatefulSet (serviceName) : il ne donne
+# qu'un nom DNS stable au pod. AUCUN port : l'exécuteur n'écoute rien, et ni
+# la porte ni ameesh-approve ne sont exposés dans ce profil minimal.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ameesh-agent
+  labels:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/component: runner
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: ameesh
+    app.kubernetes.io/component: runner
