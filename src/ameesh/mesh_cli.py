@@ -427,9 +427,10 @@ def cmd_import_v0(cfg: Config, args: argparse.Namespace) -> int:
             directory = os.path.join(inbox_root, name)
             if not os.path.isdir(directory):
                 continue
-            # le registre v0 (agents/<nom>.json) donne harnais, dossier, session
+            # le registre v0 (agents/<nom>.json) donne harnais, dossier, session ;
+            # un essai (--dry-run) n'écrit rien, registre compris
             agent_file = os.path.join(state, "agents", name + ".json")
-            if os.path.exists(agent_file):
+            if os.path.exists(agent_file) and not args.dry_run:
                 try:
                     with open(agent_file, encoding="utf-8") as fh:
                         seen = json.load(fh)

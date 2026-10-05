@@ -255,6 +255,7 @@ class MeshCliTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("2 message(s) à importer", proc.stdout)
         self.assertEqual(len(os.listdir(inbox)), 2)  # rien n'a bougé
+        self.assertIsNone(registry.get(self.db, AGENT)["session_id"])  # registre compris
 
         proc = self.mesh("import-v0", "--state", state)
         self.assertEqual(proc.returncode, 0, proc.stderr)

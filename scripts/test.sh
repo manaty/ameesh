@@ -14,6 +14,9 @@ cd "$(dirname "$0")/.."
 #: DSN sans mot de passe : le secret vient de PGPASSWORD ou de ~/.pgpass.
 export AMEESH_TEST_DSN=${AMEESH_TEST_DSN:-${AGENT_MESH_TEST_DSN:-postgresql://agent_mesh@127.0.0.1:55432/agent_mesh}}
 export AMEESH_REQUIRE_DB=1
+# jamais la configuration de l'hôte (~/.config/ameesh/config.json) : sur un
+# poste basculé, elle fixerait canon, fils et hôte sous les tests
+export AMEESH_CONFIG="$PWD/.config-absente-pour-les-tests.json"
 export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
 PATTERN=("$@")
 
