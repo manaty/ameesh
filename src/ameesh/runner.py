@@ -907,11 +907,13 @@ class AgentWorker(threading.Thread):
         Relu avec l'adaptateur du harnais, comme la boucle de lecture : les
         événements sont écrits ligne à ligne avant d'être analysés, donc ils
         survivent à un worker mort. Chaîne vide si le flux n'a rien annoncé ou
-        s'il est illisible : l'appelant garde alors le modèle qu'il a.
+        s'il est illisible : l'appelant garde alors le modèle qu'il a. Lecteur
+        seul : la comptabilité ne dépend pas de la présence du binaire.
         """
         modele = ""
         try:
-            adapter = self._adapter()
+            adapter = adapters.adapter_for(self.agent.get("harness") or "other",
+                                           resolve=False)
             with open(self._path("events.jsonl"), encoding="utf-8") as flux:
                 for numero, ligne in enumerate(flux):
                     if numero < debut:
@@ -922,7 +924,7 @@ class AgentWorker(threading.Thread):
                     annonce = self._parse(adapter, ligne).get("model")
                     if annonce:
                         modele = annonce
-        except (OSError, ValueError):
+        except (OSError, ValueError, adapters.HarnessMissing):
             return ""
         return modele
 

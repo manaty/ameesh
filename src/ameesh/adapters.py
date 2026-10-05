@@ -147,13 +147,15 @@ class HarnessAdapter:
     key = ""
     resume = ""
 
-    def __init__(self, binary: str | None = None):
+    def __init__(self, binary: str | None = None, *, resolve: bool = True):
         spec = SPECS.get(self.key)
         if spec is None:
             raise HarnessMissing("harnais inconnu : %r (connus : %s)"
                                  % (self.key, ", ".join(sorted(SPECS))))
         self.spec = spec
-        self.binary = resolve_binary(self.key, binary)
+        # `resolve=False` : lecteur seul, pour relire un flux déjà écrit. Le
+        # binaire n'est pas exigé — il a pu disparaître depuis le tour.
+        self.binary = resolve_binary(self.key, binary) if resolve else (binary or "")
 
     # -- commande ----------------------------------------------------------
     def _argv(self, base: tuple[str, ...], session_id: str | None,
@@ -342,8 +344,9 @@ ADAPTERS = {
 }
 
 
-def adapter_for(harness: str, binary: str | None = None) -> HarnessAdapter:
+def adapter_for(harness: str, binary: str | None = None, *,
+                resolve: bool = True) -> HarnessAdapter:
     cls = ADAPTERS.get(harness)
     if not cls:
         raise HarnessMissing("harnais inconnu : %r (connus : %s)" % (harness, ", ".join(HARNESSES)))
-    return cls(binary)
+    return cls(binary, resolve=resolve)
