@@ -1,0 +1,40 @@
+{
+  "id": "codex",
+  "name": "Codex CLI",
+  "version": "1.0.0",
+  "schema_version": "1",
+  "description": "Harnais en ligne de commande, piloté sans interface en journaux JSON (exec --json).",
+  "repository": "https://github.com/openai/codex",
+  "license": "Apache-2.0",
+  "capabilities": {},
+  "authentication": {},
+  "distribution": {},
+  "ameesh": {
+    "protocol": "cli",
+    "binary": "codex",
+    "binary_env": ["AMEESH_CODEX_BIN", "AGENT_MESH_CODEX_BIN"],
+    "command": ["--dangerously-bypass-hook-trust", "exec",
+                "--dangerously-bypass-approvals-and-sandbox", "--json"],
+    "interactive": [],
+    "session": {"flag": ["resume"]},
+    "stream": "codex-json",
+    "model": {"flag": ["-m", "{model}"]},
+    "effort": {"flag": ["-c", "model_reasoning_effort=\"{effort}\""]},
+    "tier": {"flag": ["-c", "service_tier=\"{tier}\""]},
+    "hooks": {
+      "mail": {
+        "command": ["agent-mail", "hook", "codex"],
+        "events": ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"]
+      }
+    },
+    "cost": {"source": "stream", "gauges": "sessions", "paid_per_token": false},
+    "accounts": {
+      "config_env": "CODEX_HOME",
+      "default_home": "~/.codex",
+      "session_store": "sessions",
+      "credentials": "auth.json",
+      "key_env": "OPENAI_API_KEY"
+    },
+    "install": {"note": "binaire `codex` installé par l'hôte ; distribution signée en L17"}
+  }
+}

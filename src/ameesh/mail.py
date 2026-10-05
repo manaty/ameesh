@@ -3,8 +3,10 @@
 
 Le dépôt d'un message est la seule écriture nécessaire : un trigger Postgres
 émet `pg_notify('agent_mail', …)`, ce qui réveille l'exécuteur du destinataire.
-La remise (`mark_delivered`) est faite par le hook du harnais ou par l'exécuteur
-après un tour : un message non remis est représenté par `delivered_at IS NULL`.
+La remise est faite par le hook du harnais, ou par l'exécuteur au lancement
+d'un tour dont la consigne porte le message — toujours par le même protocole :
+réserver (`reserve`), montrer, solder (`deliver`) la réservation qui porte son
+jeton. Un message non remis est représenté par `delivered_at IS NULL`.
 
 La boîte n'est que la file de distribution : chaque message déposé est aussi
 écrit dans son **fil lisible** (`fil.record`, R12). Un corps illisible (vide,
@@ -16,6 +18,7 @@ Le SQL est dans le stockage (`storage.of(db).mailbox`, spec §10).
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any, Sequence
 
 from . import fil, storage
@@ -107,6 +110,176 @@ def mark_delivered(db: Db, ids: Sequence[int]) -> int:
     return storage.of(db).mailbox.mark_delivered(ids)
 
 
+#: durée de vie d'une réservation (s) : l'exécuteur lance le harnais et solde
+#: en quelques secondes ; le hook émet aussitôt. Passé ce délai (panne), la
+#: réservation peut être reprise et le message est signalé « re-livré ».
+RESERVATION_TTL = 600.0
+HOOK_RESERVATION_TTL = 60.0
+
+
+def new_token() -> str:
+    """Jeton unique d'une réservation : seule la remise qui le porte la solde."""
+    return uuid.uuid4().hex
+
+
+def reserve(db: Db, recipient: str, owner: str | None, epoch: int | None, token: str,
+            *, ids: Sequence[int] | None = None, porteur: str,
+            ttl_seconds: float = RESERVATION_TTL, limit: int = 200) -> list[dict]:
+    """Réserve atomiquement des non-lus pour UNE remise (consigne ou hook).
+
+    Protocole unique de l'exécuteur et du hook : réserver sous un jeton,
+    montrer, puis solder (`deliver`) ou annuler (`release`) cette réservation
+    et elle seule. La ligne du destinataire est verrouillée dans le registre
+    et le bail (owner, epoch) contrôlé dans la même instruction ; un message
+    déjà réservé (réservation active) n'est jamais réservé deux fois. Chaque
+    message rendu porte `deja_consigne` : une réservation antérieure n'a
+    jamais été soldée (panne), il est peut-être déjà vu.
+    """
+    return storage.of(db).mailbox.reserve(
+        recipient, owner or None, epoch if owner else None, token, ids=ids,
+        porteur=porteur, ttl_seconds=ttl_seconds, limit=limit)
+
+
+def deliver(db: Db, recipient: str, owner: str | None, epoch: int | None, token: str,
+            ids: Sequence[int]) -> list[int]:
+    """Solde la réservation `token` : remis, si le bail est toujours le sien.
+
+    Rend les ids passés remis. Un id absent (bail perdu, réservation reprise)
+    reste non remis : il sera re-livré, signalé.
+    """
+    return storage.of(db).mailbox.deliver(recipient, owner or None,
+                                          epoch if owner else None, token, ids)
+
+
+def release(db: Db, recipient: str, token: str, ids: Sequence[int]) -> int:
+    """Annule la réservation `token` : rien n'a été montré."""
+    return storage.of(db).mailbox.release(recipient, token, ids)
+
+
+def maybe_redelivered(row: Any) -> bool:
+    """Déjà réservé sans être soldé (panne) : peut-être déjà vu."""
+    return bool(row.get("deja_consigne"))
+
+
+#: plafond par défaut de la consigne d'un tour de courrier, en octets UTF-8
+PROMPT_MAX_BYTES = 20000
+#: borne sûre d'un argument de processus (MAX_ARG_STRLEN = 128 Kio sous Linux)
+ARG_SAFE_BYTES = 120000
+#: budget minimal : de quoi porter au moins un message tronqué
+PROMPT_MIN_BYTES = 2000
+
+
+def octets(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _tronque(text: str, limite: int) -> tuple[str, int]:
+    """Coupe `text` à `limite` octets UTF-8 (sans couper un caractère) ;
+    rend (texte, octets retirés)."""
+    brut = text.encode("utf-8")
+    if len(brut) <= limite:
+        return text, 0
+    coupe = brut[:max(0, limite)].decode("utf-8", errors="ignore")
+    return coupe, len(brut) - octets(coupe)
+
+
+def _readable_body(row: dict, limite: int | None = None) -> str:
+    """Le corps lisible, comme dans le fil : jamais le payload structuré."""
+    body = row.get("body") or ""
+    if fil.unreadable_reason(body):
+        return "[corps non lisible, non reproduit : voir le fil, message n°%s]" % row.get("id")
+    text = fil.clean_text(body).strip("\n")
+    if limite is not None:
+        text, retire = _tronque(text, limite)
+        if retire:
+            text += ("\n[… tronqué : %d octet(s) de plus, texte complet dans le fil, "
+                     "message n°%s]" % (retire, row.get("id")))
+    return text
+
+
+def _verdict_note(db: Db | None, row: dict) -> str:
+    """La mention d'autorité d'un message signé (R4) ; vide s'il ne l'est pas."""
+    if db is None or not row.get("signature"):
+        return ""
+    from . import authority  # import tardif : authority n'est utile qu'aux messages signés
+    try:
+        verdict = authority.verify_message(db, normalize(row))
+    except Exception as exc:  # une vérification impossible n'accorde rien
+        return "  [⚠ signature non vérifiable : %s]" % exc
+    if verdict.authority:
+        return "  [autorité du propriétaire PROUVÉE (signature Ed25519)]"
+    if verdict.ok:
+        return "  [signé par un agent : authentique, sans autorité du propriétaire]"
+    return "  [⚠ signature NON valide : %s]" % verdict.reason
+
+
+def _block(db: Db | None, row: dict, limite: int | None = None, note: str | None = None
+           ) -> str:
+    """Le rendu d'un message : en-tête (n°, expéditeur, heure, nature,
+    autorité, re-livré) puis corps lisible cité ligne à ligne."""
+    nature = " (événement%s)" % (", urgent" if is_urgent(row) else "") \
+        if is_event(row) else ""
+    relivre = ("  [re-livré : déjà réservé pour une remise avant une panne, "
+               "tu l'as peut-être déjà traité]" if maybe_redelivered(row) else "")
+    moment = fil.iso_local(row.get("created_ts") or 0.0)
+    corps = _readable_body(row, limite)
+    return "— message n°%s de %s, %s%s%s%s :\n%s" % (
+        row.get("id"), row.get("sender") or "?", moment, nature,
+        _verdict_note(db, row) if note is None else note, relivre,
+        "\n".join("> " + line for line in corps.split("\n")))
+
+
+def _assemble(kind: str, blocks: Sequence[str], remaining: int) -> str:
+    from . import adapters  # import tardif : adapters ne dépend pas de la base
+    header = {"mail": adapters.MAIL_HEADER, "event": adapters.EVENT_HEADER,
+              "urgent": adapters.PRIORITY_HEADER}[kind]
+    footer = {"mail": adapters.MAIL_FOOTER, "event": adapters.EVENT_FOOTER,
+              "urgent": adapters.PRIORITY_FOOTER}[kind]
+    parts = [header % len(blocks), adapters.AUTHORITY_NOTE, *blocks]
+    if remaining > 0:
+        parts.append(adapters.MAIL_REMAINING % remaining)
+    parts.append(footer)
+    return "\n\n".join(parts)
+
+
+def prompt_for(db: Db | None, rows: Sequence[dict], *, kind: str,
+               budget: int = PROMPT_MAX_BYTES, extra_remaining: int = 0
+               ) -> tuple[str, list[dict], int]:
+    """La consigne d'un tour de courrier, bornée sur son rendu RÉEL complet.
+
+    `kind` : `mail`, `event` ou `urgent`. Les plus anciens d'abord : un message
+    n'entre que si la consigne entière (en-tête, rappel d'autorité, messages
+    cités, mention du reste, pied) tient dans `budget` octets UTF-8. Le
+    premier message entre toujours, tronqué au besoin : un message trop long
+    ne bloque jamais la boîte. Rend (texte, retenus, reste) ; `reste` (plus
+    `extra_remaining`) est le nombre de messages laissés au tour suivant.
+    """
+    budget = max(PROMPT_MIN_BYTES, int(budget))
+    total = len(rows) + extra_remaining
+    blocks: list[str] = []
+    for index, row in enumerate(rows):
+        note = _verdict_note(db, row)  # une vérification par message, pas par essai
+        bloc = _block(db, row, note=note)
+        if octets(_assemble(kind, blocks + [bloc], total - index - 1)) <= budget:
+            blocks.append(bloc)
+            continue
+        if blocks:
+            break
+        # Premier message trop long à lui seul : corps tronqué jusqu'à tenir.
+        limite = budget
+        while True:
+            bloc = _block(db, row, limite, note=note)
+            exces = octets(_assemble(kind, [bloc], total - 1)) - budget
+            if exces <= 0 or limite == 0:
+                break
+            limite = max(0, limite - exces - 16)
+        blocks.append(bloc)
+        break
+    retenus = list(rows[:len(blocks)])
+    reste = total - len(blocks)
+    return _assemble(kind, blocks, reste), retenus, reste
+
+
 def unread_counts(db: Db) -> dict[str, int]:
     return storage.of(db).mailbox.unread_counts()
 
@@ -136,6 +309,8 @@ def normalize(row: dict) -> dict:
         "signed_payload": row.get("signed_payload"),
         "nonce": row.get("nonce"),
         "signature_expires_ts": row.get("signature_expires_ts"),
+        # déjà réservé pour une remise jamais soldée (panne) : « re-livré »
+        "deja_consigne": bool(row.get("deja_consigne")),
     }
 
 

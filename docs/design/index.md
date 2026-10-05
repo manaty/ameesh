@@ -1,6 +1,7 @@
 # Conception d'ameesh
 
 * [Spécification d'ameesh v1](specification.md) - Périmètre, architecture, canon, actions, reçus, plan de lots.
+* [Descripteurs de harnais](descripteurs-de-harnais.md) - Manifeste ACP + clés `ameesh`, adaptateur ACP générique, fin de la liste fermée (L16, R22).
 * [Bascule vers ameesh v1 (brouillon)](bascule-v1.md) - Plan réversible : canon d'amorçage, ameesh-approve, orchestrateurs à tours.
 * [Exigences (R1–R23)](exigences.md) - Les exigences d'origine généralisées et celles ajoutées le 2026-10-03.
 * [Questions ouvertes](questions-ouvertes.md) - Ce qui attend une décision du propriétaire ou une étude.

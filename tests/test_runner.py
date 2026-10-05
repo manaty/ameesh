@@ -250,7 +250,9 @@ class RunnerTest(PgTestCase):
         self.assertIn("message pour dort : réveil du tour", sortie)
         tours = self.turns()
         self.assertEqual(len(tours), 1, sortie)
-        self.assertEqual(tours[0]["argv"][-1], adapters.MAIL_PROMPT)
+        # le contenu du message est dans la consigne (pas un renvoi vers inbox)
+        self.assertIn("réveille-toi", tours[0]["argv"][-1])
+        self.assertIn(adapters.AUTHORITY_NOTE, tours[0]["argv"][-1])
         # le message a été remis, le tour a été compté
         self.assertEqual(mail.unread(self.db, "dort"), [])
         self.assertEqual(int(registry.get(self.db, "dort")["turns"]), 1)

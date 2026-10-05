@@ -39,6 +39,10 @@ jobs:
       - id: pages
         uses: actions/configure-pages@v5
       - name: build (mkdocs --strict + landing page)
+        # URL of the site assistant (L33), a repository variable — not a
+        # secret: it is public in the page. Unset = chat bubble hidden.
+        env:
+          AMEESH_CHAT_ENDPOINT: ${{ vars.AMEESH_CHAT_ENDPOINT }}
         run: MKDOCS=mkdocs scripts/build-site.sh
       - uses: actions/upload-pages-artifact@v3
         with:

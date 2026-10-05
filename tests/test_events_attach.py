@@ -46,7 +46,8 @@ class EventsTest(PgTestCase):
         mail.send(self.db, "src", "evt", "événement 1", kind="event")
         spec = worker.pick()
         self.assertEqual(spec["kind"], "event")
-        self.assertEqual(spec["prompt"], adapters.EVENT_PROMPT)
+        self.assertIn("événement 1", spec["prompt"])
+        self.assertIn(adapters.EVENT_HEADER % 1, spec["prompt"])
         self.assertGreater(registry.get(self.db, "evt")["last_event_ts"] or 0, 0)
 
         # deuxième événement non urgent : la fenêtre est encore ouverte

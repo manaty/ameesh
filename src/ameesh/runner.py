@@ -160,6 +160,8 @@ class AgentWorker(threading.Thread):
         self.renew_failures = 0
         self.lease_deadline = float(lease.get("lease_expires_ts") or 0.0)
         self.pgid: int | None = None  # groupe du harnais en cours
+        #: dernier descripteur de harnais journalisé (chemin, empreinte) — L16
+        self.descriptor_seen: tuple[str, str] = ("", "")
         self.watchdog_lock = threading.Lock()
         self.watchdog_on = False
         self.watchdog_stop = threading.Event()
@@ -180,6 +182,8 @@ class AgentWorker(threading.Thread):
         #: la base : si l'écriture du marqueur échoue, ce worker-ci répare quand même
         #: au bon tarif (L13 B4). Effacé quand la ligne du grand livre est écrite.
         self._annonce_ram = ""
+        #: le harnais du tour de courrier en cours a-t-il été lancé ? (livraison)
+        self._courrier_lance = False
         #: rotation de session (0018) : compteurs de la session courante
         self.resume_summary = ""
         self.session_turns = 0
@@ -1155,14 +1159,7 @@ class AgentWorker(threading.Thread):
             # Le prioritaire passe devant la consigne en attente : c'est lui qui
             # ouvre le tour, la consigne interrompue suivra (0018).
             self.nudged = False
-            return {
-                "kind": "urgent",
-                "prompt": "\n\n".join(
-                    adapters.PRIORITY_PROMPT % (
-                        m.get("sender") or "?", (m.get("body") or "")[:2000])
-                    for m in autorises),
-                "ids": [int(m["id"]) for m in autorises if m.get("id") is not None],
-            }
+            return self._courrier_spec("urgent", autorises)
         prompt = registry.take_pending_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
         if prompt:
             self.nudged = False
@@ -1184,13 +1181,12 @@ class AgentWorker(threading.Thread):
         (`agent_registry.last_event_at`) : un redémarrage ne remet pas la
         fenêtre à zéro.
         """
-        ids = [int(m["id"]) for m in messages if m.get("id") is not None]
         events = [m for m in messages if mail.is_event(m)]
         autres = [m for m in messages if not mail.is_event(m)]
         if autres:
             if events:
                 registry.mark_event_wake(self.db, self.name)
-            return {"kind": "mail", "prompt": adapters.MAIL_PROMPT, "ids": ids}
+            return self._courrier_spec("mail", messages)
         if not events:
             return None
         fenetre = self.runner.event_coalesce
@@ -1201,15 +1197,145 @@ class AgentWorker(threading.Thread):
         if any(mail.is_urgent(m) and self.interrupt_allowed(m) for m in events) \
                 or fenetre <= 0 or (time.time() - dernier) >= fenetre:
             registry.mark_event_wake(self.db, self.name)
-            return {"kind": "event", "prompt": adapters.EVENT_PROMPT, "ids": ids}
+            return self._courrier_spec("event", events)
         return None  # fenêtre de regroupement en cours : on attend la suivante
 
     # -- un tour -----------------------------------------------------------
     def _adapter(self) -> adapters.HarnessAdapter:
         harness = self.agent.get("harness") or "other"
-        return adapters.adapter_for(harness)
+        adapter = adapters.adapter_for(harness)
+        # Traçabilité de chaîne d'approvisionnement (décision 0021) : chaque
+        # descripteur utilisé est journalisé avec sa provenance et son empreinte,
+        # une fois par changement (pas à chaque tour).
+        descriptor = adapter.descriptor
+        signature = (descriptor.path, descriptor.sha256)
+        if signature != self.descriptor_seen:
+            self.descriptor_seen = signature
+            log("[%s] descripteur %s : %s (%s, sha256 %s)"
+                % (self.name, descriptor.id, descriptor.path, descriptor.source,
+                   (descriptor.sha256 or "?")[:16]))
+        return adapter
+
+    #: préfixe du résumé de reprise (session neuve après rotation, 0018)
+    RESUME_PREFIX = "Reprise de session après rotation — résumé :\n%s\n\n"
+
+    def _budget_courrier(self) -> int:
+        """Octets UTF-8 disponibles pour la consigne d'un tour de courrier.
+
+        Le plafond (`AMEESH_PROMPT_MAIL_MAX`) borne la consigne ENTIÈRE, résumé
+        de reprise compris quand il ouvrira le tour ; jamais au-delà de la
+        borne sûre d'un argument de processus. Un résumé qui ne laisserait pas
+        `PROMPT_MIN_BYTES` au courrier les lui laisse quand même (la consigne
+        dépasse alors le plafond, jamais la borne de l'argument).
+        """
+        resume = mail.octets(self.RESUME_PREFIX % self.resume_summary) \
+            if self.resume_summary else 0
+        return min(self.runner.prompt_max_bytes, mail.ARG_SAFE_BYTES) - resume
+
+    def _courrier_spec(self, kind: str, messages: list[dict]) -> dict:
+        """Un tour de courrier : le CONTENU des messages est dans la consigne.
+
+        Plafond sur le rendu réel (`_budget_courrier`) : les plus anciens
+        d'abord ; les autres restent non livrés, mentionnés par leur nombre,
+        pour le tour suivant. `candidats` garde tous les messages : `run_turn`
+        refait le choix au moment de réserver.
+        """
+        prompt, retenus, reste = mail.prompt_for(self.db, messages, kind=kind,
+                                                 budget=self._budget_courrier())
+        return {
+            "kind": kind,
+            "prompt": prompt,
+            "ids": [int(m["id"]) for m in retenus if m.get("id") is not None],
+            "rows": retenus,
+            "candidats": list(messages),
+            "remaining": reste,
+        }
 
     def run_turn(self, spec: dict) -> bool:
+        """Un tour. Pour un tour de courrier, protocole de remise unique :
+        réservation sous un jeton (registre verrouillé, bail contrôlé), consigne
+        rendue sur les messages réservés, remise soldée juste après le lancement
+        du harnais (bail toujours exigé), réservation annulée si le tour n'a pas
+        pu démarrer.
+
+        Panne ou bail perdu entre réservation et remise : la réservation n'est
+        pas soldée ; elle expire ou change d'epoch, le message est remis plus
+        tard et signalé « re-livré » — un doublon signalé, jamais une perte.
+        """
+        candidats = spec.get("candidats")
+        if not candidats or self.runner.dry_run:
+            return self._run_turn(spec)
+        kind = spec["kind"]
+        budget = self._budget_courrier()
+        _texte, retenus, reste = mail.prompt_for(self.db, candidats, kind=kind,
+                                                 budget=budget)
+        jeton = mail.new_token()
+        try:
+            reserves = mail.reserve(
+                self.db, self.name, self.runner.runner_id, self.epoch, jeton,
+                ids=[int(m["id"]) for m in retenus], porteur="consigne",
+                ttl_seconds=mail.RESERVATION_TTL)
+        except db_mod.DbError as exc:
+            log("[%s] réservation du courrier impossible (%s) : tour reporté"
+                % (self.name, exc))
+            return False
+        if not reserves:
+            log("[%s] courrier du tour déjà réservé ou livré ailleurs, ou bail "
+                "perdu : tour annulé" % self.name)
+            return False
+        # La consigne est rendue sur les messages RÉSERVÉS (leur état exact :
+        # « re-livré » compris), dans le même budget.
+        prompt, inclus, _ = mail.prompt_for(self.db, reserves, kind=kind, budget=budget,
+                                            extra_remaining=reste)
+        ids = [int(m["id"]) for m in inclus]
+        hors = [int(m["id"]) for m in reserves if int(m["id"]) not in ids]
+        if hors:  # par construction vide ; jamais réservé sans être montré
+            mail.release(self.db, self.name, jeton, hors)
+        spec = dict(spec, prompt=prompt, rows=inclus, ids=ids, jeton=jeton)
+        self._courrier_lance = False
+        try:
+            return self._run_turn(spec)
+        finally:
+            if not self._courrier_lance:
+                # Le harnais n'a pas été lancé : rien n'a été vu, rien n'est livré.
+                try:
+                    mail.release(self.db, self.name, jeton, ids)
+                except db_mod.DbError as exc:
+                    # La réservation reste jusqu'à son échéance : le message sera
+                    # re-livré, signalé (aucune perte).
+                    log("[%s] annulation de la réservation impossible (%s)"
+                        % (self.name, exc))
+
+    def _livre_courrier(self, spec: dict) -> None:
+        """Le harnais est lancé avec la consigne : la réservation est soldée.
+
+        Remise fencée (jeton ET bail courant). Si le bail est perdu, les
+        messages restent non livrés et la remise est signalée incertaine : le
+        bail suivant les re-livrera en le disant.
+        """
+        if not spec.get("jeton"):
+            return
+        self._courrier_lance = True
+        ids = list(spec["ids"])
+        try:
+            livres = mail.deliver(self.db, self.name, self.runner.runner_id, self.epoch,
+                                  spec["jeton"], ids)
+        except db_mod.DbError as exc:
+            livres = []
+            log("[%s] remise du courrier non soldée (%s)" % (self.name, exc))
+        incertains = sorted(set(ids) - set(livres))
+        if incertains:
+            log("[%s] remise incertaine : message(s) %s montré(s) au harnais mais non "
+                "soldé(s) (bail perdu ou base indisponible) ; ils seront re-livrés, "
+                "signalés « re-livré »" % (self.name, ", ".join(map(str, incertains))))
+            self._fil_note(
+                "Remise incertaine : %d message(s) mis dans la consigne d'un tour "
+                "lancé n'ont pas pu être marqués livrés (bail perdu ou base "
+                "indisponible). Ils seront remis de nouveau, signalés « re-livré »."
+                % len(incertains),
+                meta={"action": "remise-incertaine", "messages": incertains})
+
+    def _run_turn(self, spec: dict) -> bool:
         harness = self.agent.get("harness") or "other"
         try:
             adapter = self._adapter()
@@ -1223,7 +1349,7 @@ class AgentWorker(threading.Thread):
         resume = ""
         if self.resume_summary and not session:
             # Session neuve après rotation (0018) : le résumé de reprise ouvre le tour.
-            resume = "Reprise de session après rotation — résumé :\n%s\n\n" % self.resume_summary
+            resume = self.RESUME_PREFIX % self.resume_summary
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
         model = self.agent.get("model") or self._state_read("model")
@@ -1237,6 +1363,11 @@ class AgentWorker(threading.Thread):
                                tier=tier or None)
         label = {"prompt": "consigne", "mail": "messages", "event": "événements",
                  "urgent": "prioritaire", "idle": "reprise"}[spec["kind"]]
+        if spec.get("jeton") and mail.octets(resume + spec["prompt"]) > mail.ARG_SAFE_BYTES:
+            # Garde-fou : le budget l'interdit ; jamais un E2BIG au lancement.
+            self.fail_turn("consigne trop longue", "consigne de %d octets"
+                           % mail.octets(resume + spec["prompt"]))
+            return False
         if self.runner.dry_run:
             log("[%s] tour %s (dry-run, session %s) : %s"
                 % (self.name, label, session or "neuve", " ".join(argv)))
@@ -1342,6 +1473,9 @@ class AgentWorker(threading.Thread):
             with self.lock:
                 self.proc = proc
                 self.pgid = proc.pid  # start_new_session : le groupe porte son pid
+            # Lancé (et publié, pour que l'arrêt le trouve) : les messages de la
+            # consigne sont livrés, et seulement eux.
+            self._livre_courrier(spec)
             # Course de publication : un déclencheur d'arrêt (bail perdu,
             # préemption, arrêt de l'exécuteur, échéance) a pu conclure pendant
             # que ce Popen n'était pas encore publié (proc=None). Le recontrôle
@@ -1448,9 +1582,6 @@ class AgentWorker(threading.Thread):
             self.nudged = True
         with self.runner.lock:
             self.runner.turns += 1
-        if spec["kind"] in ("mail", "event", "urgent") and ok and spec["ids"]:
-            # Si le hook du harnais les a déjà remis, c'est un no-op.
-            mail.mark_delivered(self.db, spec["ids"])
         return ok
 
     def fail_turn(self, status_text: str, error: str) -> None:
@@ -1531,6 +1662,11 @@ class Runner:
         self.idle_nudge = cfg.idle_nudge
         self.poll = max(1.0, cfg.poll)
         self.event_coalesce = max(0.0, cfg.event_coalesce)
+        #: plafond (octets UTF-8) de la consigne d'un tour de courrier, résumé de
+        #: reprise compris ; borné par l'argument de processus (128 Kio)
+        self.prompt_max_bytes = int(min(max(float(mail.PROMPT_MIN_BYTES),
+                                            cfg.prompt_mail_max),
+                                        float(mail.ARG_SAFE_BYTES)))
         self.session_max_tokens = max(0.0, cfg.session_max_tokens)
         self.session_max_turn_seconds = max(0.0, cfg.session_max_turn_seconds)
         self.session_min_turns = max(0, int(cfg.session_min_turns))

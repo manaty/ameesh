@@ -1,0 +1,44 @@
+{
+  "id": "deepseek",
+  "name": "DeepSeek Harness",
+  "version": "1.0.0",
+  "schema_version": "1",
+  "description": "Harnais en ligne de commande, piloté sans interface en flux JSON ; modèle et effort par patch YAML.",
+  "repository": "https://github.com/deepseek-ai/deepseek-harness",
+  "capabilities": {},
+  "authentication": {},
+  "distribution": {},
+  "ameesh": {
+    "protocol": "cli",
+    "binary": "dsh",
+    "binary_env": ["AMEESH_DSH_BIN", "AGENT_MESH_DSH_BIN"],
+    "launcher": ["--profile", "agent"],
+    "command": ["--json"],
+    "interactive": [],
+    "session": {"flag": ["--session-id"]},
+    "stream": "dsh-json",
+    "env": {"DSH_PERMISSION_MODE": "danger-full-access"},
+    "model": {
+      "default": "deepseek-flash",
+      "file": {
+        "template": "- id: agent-default-model\n  name: \"@deepseek-ai/dsh-agent-default-model\"\n  config:\n    provider: deepseek-official\n    model: {model}\n    reasoningEffort: {effort}\n"
+      },
+      "flag": ["--patch", "{path}"]
+    },
+    "effort": {"default": "max"},
+    "hooks": {
+      "mail": {
+        "command": ["agent-mail", "hook", "deepseek"],
+        "events": ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"]
+      }
+    },
+    "cost": {"source": "stream", "gauges": "balance", "paid_per_token": true},
+    "accounts": {
+      "config_env": "DSH_HOME",
+      "default_home": "~/.dsh",
+      "session_store": "sessions",
+      "key_env": "DEEPSEEK_API_KEY"
+    },
+    "install": {"note": "binaire `dsh` installé par l'hôte ; distribution signée en L17"}
+  }
+}

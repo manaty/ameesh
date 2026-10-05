@@ -25,7 +25,12 @@ MAIL_COLUMNS = """
     signature, signature_key, signed_payload, nonce,
     extract(epoch from created_at)::float8 as created_ts,
     extract(epoch from delivered_at)::float8 as delivered_ts,
-    extract(epoch from signature_expires_at)::float8 as signature_expires_ts
+    extract(epoch from signature_expires_at)::float8 as signature_expires_ts,
+    meta->'consigne'->>'runner' as consigne_runner,
+    meta->'consigne'->>'jeton' as consigne_jeton,
+    (meta->'consigne'->>'epoch')::bigint as consigne_epoch,
+    (meta->'consigne' IS NOT NULL
+     OR coalesce((meta->>'deja_consigne')::boolean, false)) as deja_consigne
 """
 
 
@@ -96,6 +101,130 @@ class Mailbox(interface.Mailbox):
              WHERE delivered_at IS NULL AND id IN (%s)
             RETURNING id
             """ % ", ".join(str(i) for i in clean)
+        )
+        return len(rows)
+
+    # -- réservation : un seul protocole pour l'exécuteur et le hook ----------
+    #
+    # Toute remise passe par : réserver (jeton unique) → montrer → solder la
+    # réservation qui porte CE jeton. Chaque instruction verrouille d'abord la
+    # ligne du destinataire dans `agent_registry` (FOR UPDATE), comme les
+    # opérations fencées du registre : réservations et remises d'un même
+    # destinataire sont sérialisées, et le bail (owner, epoch, échéance) est
+    # contrôlé sur la version courante de la ligne, après l'attente éventuelle.
+    #
+    # Une réservation est ACTIVE tant qu'elle n'a pas expiré et qu'elle
+    # appartient au bail courant (ou à une identité explicite, sans bail). Une
+    # réservation inactive (panne, bail repris) peut être reprise : le message
+    # est alors marqué `deja_consigne` et signalé « re-livré ».
+
+    @staticmethod
+    def _bail_sql(owner) -> str:
+        if owner:
+            return ("v.lease_owner = %s AND v.lease_epoch = %s"
+                    " AND v.lease_expires_at > clock_timestamp()")
+        return "TRUE"
+
+    @staticmethod
+    def _bail_params(owner, epoch) -> tuple:
+        return (owner, int(epoch)) if owner else ()
+
+    ACTIVE_SQL = """
+        m.meta->'consigne' IS NOT NULL
+        AND coalesce((m.meta->'consigne'->>'expire')::float8, 0)
+            > extract(epoch from clock_timestamp())
+        AND (m.meta->'consigne'->>'epoch' IS NULL
+             OR (m.meta->'consigne'->>'runner' = v.lease_owner
+                 AND (m.meta->'consigne'->>'epoch')::bigint = v.lease_epoch))
+    """
+
+    def reserve(self, recipient, owner, epoch, token, *, ids=None, porteur,
+                ttl_seconds, limit=200) -> list[dict]:
+        filtre = ""
+        if ids is not None:
+            clean = sorted({int(i) for i in ids})
+            if not clean:
+                return []
+            filtre = "AND m.id IN (%s)" % ", ".join(str(i) for i in clean)
+        sql = """
+            WITH v AS (
+                SELECT name, lease_owner, lease_epoch, lease_expires_at
+                  FROM agent_registry WHERE name = %%s FOR UPDATE
+            ), cibles AS (
+                SELECT m.id, (m.meta->'consigne' IS NOT NULL
+                              OR coalesce((m.meta->>'deja_consigne')::boolean, false))
+                             AS deja
+                  FROM agent_mailbox m, v
+                 WHERE m.recipient = %%s AND m.delivered_at IS NULL %s
+                   AND %s
+                   AND NOT (%s)
+                 ORDER BY m.id
+                 LIMIT %%s
+                 FOR UPDATE OF m
+            )
+            UPDATE agent_mailbox AS m
+               SET meta = m.meta || jsonb_build_object(
+                       'consigne', jsonb_build_object(
+                           'runner', %%s::text, 'epoch', %%s::bigint,
+                           'jeton', %%s::text, 'porteur', %%s::text,
+                           'ts', extract(epoch from clock_timestamp())::float8,
+                           'expire', extract(epoch from clock_timestamp())::float8
+                                     + %%s::float8),
+                       'deja_consigne', cibles.deja)
+              FROM cibles
+             WHERE m.id = cibles.id
+            RETURNING %s, cibles.deja AS deja_avant
+        """ % (filtre, self._bail_sql(owner), self.ACTIVE_SQL,
+               MAIL_COLUMNS.replace("id,", "m.id,", 1))
+        params = ((recipient, recipient) + self._bail_params(owner, epoch)
+                  + (int(limit), owner or None, int(epoch) if owner else None,
+                     token, porteur, float(ttl_seconds)))
+        rows = self.db.query(sql, params)
+        for row in rows:
+            # l'état AVANT cette réservation : « re-livré » si une réservation
+            # antérieure n'a jamais été soldée
+            row["deja_consigne"] = bool(row.pop("deja_avant", False))
+        return sorted(rows, key=lambda row: int(row["id"]))
+
+    def deliver(self, recipient, owner, epoch, token, ids) -> list[int]:
+        clean = sorted({int(i) for i in ids})
+        if not clean:
+            return []
+        rows = self.db.query(
+            """
+            WITH v AS (
+                SELECT name, lease_owner, lease_epoch, lease_expires_at
+                  FROM agent_registry WHERE name = %%s FOR UPDATE
+            )
+            UPDATE agent_mailbox AS m
+               SET delivered_at = now(), status = 'delivered'
+              FROM v
+             WHERE m.recipient = %%s AND m.delivered_at IS NULL AND m.id IN (%s)
+               AND m.meta->'consigne'->>'jeton' = %%s
+               AND %s
+            RETURNING m.id
+            """ % (", ".join(str(i) for i in clean), self._bail_sql(owner)),
+            (recipient, recipient, token) + self._bail_params(owner, epoch),
+        )
+        return sorted(int(row["id"]) for row in rows)
+
+    def release(self, recipient, token, ids) -> int:
+        clean = sorted({int(i) for i in ids})
+        if not clean:
+            return 0
+        rows = self.db.query(
+            """
+            WITH v AS (
+                SELECT name FROM agent_registry WHERE name = %%s FOR UPDATE
+            )
+            UPDATE agent_mailbox AS m
+               SET meta = m.meta - 'consigne'
+              FROM v
+             WHERE m.recipient = %%s AND m.delivered_at IS NULL AND m.id IN (%s)
+               AND m.meta->'consigne'->>'jeton' = %%s
+            RETURNING m.id
+            """ % ", ".join(str(i) for i in clean),
+            (recipient, recipient, token),
         )
         return len(rows)
 

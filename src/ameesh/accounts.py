@@ -72,21 +72,55 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from . import storage
-from .config import HARNESSES, NAME_RE
+from . import harnesses, storage
+from .config import NAME_RE
 
-#: variable d'environnement qui désigne le dossier de configuration du harnais
-CONFIG_ENV = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME", "deepseek": "DSH_HOME"}
-#: dossier par défaut du harnais quand la variable est absente
-DEFAULT_HOME = {"claude": "~/.claude", "codex": "~/.codex", "deepseek": "~/.dsh"}
-#: fichiers d'identifiants dont on vérifie la PRÉSENCE (jamais le contenu)
-CREDENTIALS = {"claude": ".credentials.json", "codex": "auth.json"}
-#: sous-dossier où le harnais range ses sessions
-SESSION_STORE = {"claude": "projects", "codex": "sessions", "deepseek": "sessions"}
-#: variable de clé d'API lue par le harnais, par défaut
-DEFAULT_KEY_ENV = {"deepseek": "DEEPSEEK_API_KEY", "claude": "ANTHROPIC_API_KEY",
-                   "codex": "OPENAI_API_KEY"}
 TYPES = ("config_dir", "api_key_env")
+
+
+def _account_key(harness: str, key: str, default: str = "") -> str:
+    """Une clé de compte déclarée par le descripteur du harnais (L16, R22).
+
+    Plus de table `harnais → variable/dossier` dans le code : un harnais
+    inconnu n'a simplement pas de valeur, et un harnais nouveau se décrit dans
+    son descripteur (`ameesh.accounts`).
+    """
+    descriptor = harnesses.get(harness)
+    if descriptor is None:
+        return default
+    value = descriptor.accounts.get(key)
+    return str(value) if isinstance(value, str) and value else default
+
+
+def config_env_of(harness: str) -> str:
+    """Variable qui désigne le dossier de configuration du harnais."""
+    return _account_key(harness, "config_env")
+
+
+def default_home_of(harness: str) -> str:
+    """Dossier de configuration par défaut quand la variable est absente."""
+    return _account_key(harness, "default_home", "~")
+
+
+def credentials_of(harness: str) -> str:
+    """Fichier d'identifiants dont on vérifie la PRÉSENCE (jamais le contenu)."""
+    return _account_key(harness, "credentials")
+
+
+def session_store_of(harness: str) -> str:
+    """Sous-dossier où le harnais range ses sessions."""
+    return _account_key(harness, "session_store")
+
+
+def default_key_env_of(harness: str) -> str:
+    """Variable de clé d'API lue par le harnais, par défaut."""
+    return _account_key(harness, "key_env")
+
+
+def _all_account_keys(key: str) -> set[str]:
+    return {value for value in (
+        _account_key(ident, key) for ident in harnesses.known_ids()) if value}
+
 
 
 class AccountError(ValueError):
@@ -125,21 +159,21 @@ class Profile:
         if self.kind == "config_dir" and self.path:
             return self.path
         environ = os.environ if environ is None else environ
-        inherited = environ.get(CONFIG_ENV.get(self.harness, "")) or ""
+        inherited = environ.get(config_env_of(self.harness)) or ""
         return os.path.abspath(os.path.expanduser(
-            inherited or DEFAULT_HOME.get(self.harness, "~")))
+            inherited or default_home_of(self.harness)))
 
     def session_store(self) -> str:
         """Le dossier des sessions du harnais pour ce compte (chemin résolu)."""
-        return os.path.realpath(os.path.join(self.home(), SESSION_STORE.get(self.harness, "")))
+        return os.path.realpath(os.path.join(self.home(), session_store_of(self.harness)))
 
     def describe(self) -> str:
         """Ce qu'on peut afficher : le type et l'emplacement, jamais la clé."""
         if self.kind == "api_key_env":
             source = ("fichier %s" % self.key_file) if self.key_file else (
                 "variable %s" % self.key_env if self.key_env else "variable héritée")
-            return "clé d'API → %s (%s)" % (self.env or DEFAULT_KEY_ENV.get(self.harness, "?"),
-                                            source)
+            return "clé d'API → %s (%s)" % (
+                self.env or default_key_env_of(self.harness) or "?", source)
         return "dossier %s" % (self.path or "par défaut")
 
 
@@ -164,8 +198,9 @@ def parse(raw) -> dict[str, list[Profile]]:
         raise AccountError("`accounts` doit être un objet {harnais: [profils]}")
     out: dict[str, list[Profile]] = {}
     for harness, items in raw.items():
-        if harness not in HARNESSES:
-            raise AccountError("harnais inconnu dans `accounts` : %r" % harness)
+        if harness not in harnesses.known_ids():
+            raise AccountError("harnais inconnu dans `accounts` : %r (descripteurs connus : %s)"
+                               % (harness, ", ".join(harnesses.known_ids()) or "aucun"))
         if not isinstance(items, list) or not items:
             raise AccountError("`accounts.%s` doit être une liste non vide" % harness)
         seen: set[str] = set()
@@ -212,14 +247,14 @@ def parse(raw) -> dict[str, list[Profile]]:
                 if bool(key_env) == bool(key_file):
                     raise AccountError("compte %s/%s : un seul de key_env ou key_file"
                                        % (harness, name))
-                if not (env or DEFAULT_KEY_ENV.get(harness)):
+                if not (env or default_key_env_of(harness)):
                     raise AccountError("compte %s/%s : variable `env` attendue" % (harness, name))
                 if key_file and not os.path.isabs(os.path.expanduser(key_file)):
                     raise AccountError("compte %s/%s : chemin absolu attendu" % (harness, name))
             profiles.append(Profile(
                 harness=harness, name=name, kind=kind,
                 path=_expand(path) if path else "",
-                env=env or (DEFAULT_KEY_ENV.get(harness, "") if kind == "api_key_env" else ""),
+                env=env or (default_key_env_of(harness) if kind == "api_key_env" else ""),
                 key_env=key_env, key_file=_expand(key_file) if key_file else "",
                 hourly_usd=hourly, min_balance=min_balance,
                 check_credentials=bool(item.get("check_credentials", True)),
@@ -268,7 +303,7 @@ def check(profile: Profile, environ=None) -> list[str]:
             problems.append("dossier d'un autre utilisateur")
         if info.st_mode & 0o077:
             problems.append("dossier non privé (%o, attendu 700)" % (info.st_mode & 0o777))
-        cred = CREDENTIALS.get(profile.harness)
+        cred = credentials_of(profile.harness)
         if cred and profile.check_credentials and sys.platform != "darwin":
             if not os.path.isfile(os.path.join(profile.path, cred)):
                 problems.append("identifiants absents (%s) : connexion humaine à faire" % cred)
@@ -314,8 +349,8 @@ def auth_variables(declared: dict[str, list[Profile]], *, selected: bool) -> set
             if selected and profile.env:
                 out.add(profile.env)
     if selected:
-        out.update(CONFIG_ENV.values())
-        out.update(DEFAULT_KEY_ENV.values())
+        out.update(_all_account_keys("config_env"))
+        out.update(_all_account_keys("key_env"))
     return out
 
 
@@ -334,7 +369,7 @@ def launch_env(env: dict, declared: dict[str, list[Profile]], profile: Profile |
     for name in auth_variables(declared, selected=profile is not None):
         env.pop(name, None)
     if profile is not None:
-        variable = CONFIG_ENV.get(profile.harness)
+        variable = config_env_of(profile.harness)
         if variable and profile.path == "" and environ.get(variable):
             # compte sans dossier déclaré : le dossier hérité de l'exécuteur
             # pour CE harnais (pas celui d'un autre harnais, ni d'un autre compte)
@@ -359,7 +394,7 @@ def apply_env(env: dict, profile: Profile, environ=None) -> None:
     if problems:
         raise AccountError("compte %s/%s inutilisable : %s"
                            % (profile.harness, profile.name, "; ".join(problems)))
-    variable = CONFIG_ENV.get(profile.harness)
+    variable = config_env_of(profile.harness)
     if profile.kind == "config_dir":
         if not profile.default and variable:
             env[variable] = profile.path

@@ -283,6 +283,38 @@ Dans cet ordre, sans raccourci :
    livre que si le bail est vivant et détenu par cet exécuteur. Le dossier ne
    donne jamais d'identité.
 
+   **Courrier pendant la coexistence (jusqu'à l'étape 8)** : la commande
+   `agent-mail` installée (`~/.local/bin/agent-mail`, celle qu'appellent les
+   hooks par leur chemin absolu) est encore la v0 : `agent-mail inbox` y lit la
+   boîte **fichier**, jamais la base. L'exécuteur v1 ne renvoie donc plus
+   l'agent vers `agent-mail inbox` : un tour déclenché par du courrier, des
+   événements (regroupés) ou un message prioritaire porte le **contenu** des
+   messages v1 dans sa consigne (expéditeur, horodatage, corps lisible comme
+   dans le fil, rappel qu'un message d'agent n'a jamais l'autorité du
+   propriétaire). Plafond sur la consigne **entière**, en octets UTF-8
+   (`AMEESH_PROMPT_MAIL_MAX`, 20 000 par défaut, résumé de reprise compris) :
+   les plus anciens d'abord, le nombre restant est indiqué, et ces
+   messages-là restent non livrés pour le tour suivant.
+
+   Une seule règle de remise, pour l'exécuteur comme pour le hook v1 :
+   **réserver** sous un jeton (la ligne de l'agent est verrouillée dans le
+   registre et le bail `owner`/`epoch` contrôlé dans la même instruction ; un
+   message déjà réservé ne l'est jamais deux fois), **montrer**, puis
+   **solder** cette réservation-là seulement, bail toujours vivant. L'exécuteur
+   solde juste après le lancement du harnais et annule si le tour ne démarre
+   pas (harnais absent, dossier absent, échec du lancement) ; le hook ne voit
+   donc jamais ce qui est dans la consigne, et livre ce qui arrive pendant le
+   tour. Bail perdu entre réservation et remise : rien n'est soldé, la remise
+   est signalée « incertaine » (journal et fil) ; panne : la réservation expire
+   ou change d'epoch, et le message est remis de nouveau, marqué « re-livré »
+   — un doublon signalé, jamais une perte.
+
+   L'agent **répond par `agent-mail send` (v0)** jusqu'à l'étape 8 : la
+   réponse part dans la boîte fichier v0 et l'opérateur la voit comme avant.
+   Pour vérifier qu'un message v1 a bien été vu : `ameesh fil show <projet>`
+   et le journal de l'exécuteur (le tour « messages » cite la consigne), plutôt
+   que `agent-mail inbox`.
+
 **Retour arrière, symétrique :**
 
 ```bash

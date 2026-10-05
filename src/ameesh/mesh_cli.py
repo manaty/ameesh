@@ -799,8 +799,7 @@ def cmd_set(cfg: Config, args) -> int:
         politique = agent.get("session_policy") or "défaut (%s)" % cfg.session_policy
         print("%s : modèle=%s effort=%s tier=%s session=%s (prend effet au prochain tour)"
               % (args.agent, modele, effort, tier, politique))
-        spec = adapters.SPECS.get(agent.get("harness") or "")
-        if valeurs.get("tier") and (spec is None or not spec.tier_flags):
+        if valeurs.get("tier") and not adapters.supports_tier(agent.get("harness") or ""):
             print("attention : le harnais %s ne déclare pas de tier : réglage sans effet"
                   % (agent.get("harness") or "?"), file=sys.stderr)
         return 0
@@ -1129,6 +1128,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     from . import canon_cli
     canon_cli.add_parsers(sub)
+
+    from . import harness_cli
+    harness_cli.add_parsers(sub)
 
     p_review = sub.add_parser(
         "review-class", help="classe de revue d'un changement (0018) : léger, normal, sensible")
