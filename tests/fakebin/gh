@@ -8,6 +8,7 @@
 Commandes comprises :
     gh pr merge <n> --repo <owner/repo> --merge|--squash|--rebase [...]
     gh pr view <n> --repo <owner/repo> --json state,mergeCommit
+    gh pr list …, gh api …   plan de travail (L29) : voir tests/fake_github.py
 
 `AMEESH_FAKE_GH_MODE` règle la fusion :
     ok (défaut)  fusionne, code 0 ;
@@ -81,6 +82,19 @@ def main():
     if not path:
         print("faux gh : AMEESH_FAKE_GH_STATE absent", file=sys.stderr)
         return 2
+    if argv[:1] == ["api"] or argv[:2] == ["pr", "list"]:
+        # plan de travail (L29) : émulation de `gh api` et `gh pr list`
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import fake_github
+        stdin = sys.stdin.read() if "--input" in argv else None
+        with open(path + ".lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            state = load(path)
+            code, out, err = fake_github.handle(state, argv, stdin)
+            save(path, state)
+        sys.stdout.write(out)
+        sys.stderr.write(err)
+        return code
     if len(argv) < 3 or argv[0] != "pr" or argv[1] not in ("merge", "view"):
         print("faux gh : commande non prise en charge : %s" % " ".join(argv), file=sys.stderr)
         return 2

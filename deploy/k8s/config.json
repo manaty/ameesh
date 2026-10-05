@@ -1,0 +1,11 @@
+{
+  "dsn": "postgresql://ameesh@ameesh-postgres:5432/ameesh?sslmode=require",
+  "schema": "public",
+  "project": "exemple",
+  "humans": ["alice"],
+  "canon": "/var/lib/ameesh/canon/repo",
+  "canon_ref": "origin/main",
+  "canon_sync_interval": 300,
+  "lease_ttl": 300,
+  "poll": 5
+}

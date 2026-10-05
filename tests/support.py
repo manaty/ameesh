@@ -25,6 +25,8 @@ from ameesh import migrations
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(REPO, "src")
 FAKEBIN = os.path.join(REPO, "tests", "fakebin")
+# la surcharge AMEESH_CODEX_SESSIONS prime sur CODEX_HOME : jamais héritée
+os.environ.pop("AMEESH_CODEX_SESSIONS", None)
 TEST_DSN = os.environ.get(
     "AMEESH_TEST_DSN", os.environ.get(
         "AGENT_MESH_TEST_DSN",
@@ -52,6 +54,12 @@ def apply_authenticators(db, members, **kwargs) -> dict:
         return receipts._apply_authenticators(lock, members, **kwargs)
 
 
+#: dossier Codex vide, partagé par les sous-processus de test
+EMPTY_CODEX_HOME = tempfile.mkdtemp(prefix="ameesh-test-codex-home-")
+# aussi pour les tests qui lisent les jauges dans le processus même
+os.environ["CODEX_HOME"] = EMPTY_CODEX_HOME
+
+
 def child_env(**extra: str) -> dict:
     """Environnement d'un sous-processus de test (CLI ou exécuteur)."""
     env = dict(os.environ)
@@ -65,9 +73,19 @@ def child_env(**extra: str) -> dict:
     # dossier réel hérité de l'environnement du développeur.
     for name in ("AMEESH_THREADS", "AMEESH_PROJECT", "AMEESH_HUMANS"):
         env.pop(name, None)
+    # Les jauges de forfait réelles du poste (journaux Codex de ~/.codex) ne
+    # fuient pas dans les tests : un forfait très consommé mettrait en pause les
+    # agents de test. Les tests de jauges posent leurs propres journaux.
+    env["CODEX_HOME"] = EMPTY_CODEX_HOME
+    # Aucun réseau dans les tests (L26) : pas de clé de fournisseur, pas de
+    # relevé de solde par l'exécuteur.
+    for name in ("DEEPSEEK_API_KEY", "AMEESH_DEEPSEEK_API_BASE"):
+        env.pop(name, None)
+    env["AMEESH_BALANCE_INTERVAL"] = "0"
     env["AMEESH_DSN"] = TEST_DSN
     env["PYTHONPATH"] = SRC + os.pathsep + env.get("PYTHONPATH", "")
     env["AMEESH_BIN_DIR"] = FAKEBIN
+    env.pop("AMEESH_CODEX_SESSIONS", None)   # isolement par CODEX_HOME (ci-dessus)
     env.update({k: str(v) for k, v in extra.items() if v is not None})
     return env
 
@@ -121,7 +139,9 @@ class PgTestCase(unittest.TestCase):
         """Chaque test part d'une base et d'un disque propres."""
         self.db.execute(
             "TRUNCATE agent_registry, agent_mailbox, mesh_approvals, "
-            "work_items, work_item_events, thread_index RESTART IDENTITY CASCADE")
+            "work_items, work_item_events, work_item_milestones, work_packages, "
+            "thread_index "
+            "RESTART IDENTITY CASCADE")
         shutil.rmtree(self.tmp, ignore_errors=True)
         os.makedirs(self.tmp, exist_ok=True)
         for path in (self.state, self.v0state, self.conf):

@@ -404,6 +404,28 @@ def _publish(db: Db, action_id: str, event: str, actor: str, *, detail: str = ""
                  % (event, action_id, _one(exc, 200)))
 
 
+def _close_lot_on_merge(db: Db, action_id: str, by: str) -> None:
+    """Fusion confirmée par la porte (`git-merge`) : le lot lié passe `merged`
+    et son jalon de fusion est posé (L29). Idempotent ; un lot fermé n'est
+    jamais rouvert (le constat est écrit au fil). Ne lève JAMAIS : l'issue de
+    l'action est déjà enregistrée, la fermeture du lot est une conséquence."""
+    try:
+        action = get(db, action_id)
+        if action is None or action.get("connector") != "git-merge" \
+                or action.get("state") != "confirmed" or not action.get("work_item"):
+            return
+        from . import work as work_mod
+        done = work_mod.close_merged(
+            db, int(action["work_item"]), sha=action.get("external_ref") or "",
+            actor=action.get("auth_approver") or by or "git-merge",
+            source="la porte (action %s)" % action_id, pr_ref=action.get("target"))
+        if done["result"] == "refused":
+            fil.warn("lot #%s : %s" % (action["work_item"], done["detail"]))
+    except Exception as exc:  # noqa: BLE001 - conséquence, jamais un obstacle
+        fil.warn("lot de l'action %s non fermé après la fusion (%s) : "
+                 "ameesh work sync-github le rattrapera" % (action_id, _one(exc, 200)))
+
+
 # --------------------------------------------------------------------------
 # demandes d'approbation déposées auprès d'ameesh-approve (§9)
 # --------------------------------------------------------------------------
@@ -818,6 +840,8 @@ def _record_late(db: Db, action_id: str, attempt: int, value, error, *, by: str)
                 _publish(target, action_id, outcome.state, by or "connector-late",
                          detail="issue tardive, après le délai%s" % (
                              " — %s" % outcome.detail if outcome.detail else ""))
+                if outcome.state == "confirmed":
+                    _close_lot_on_merge(target, action_id, by or "connector-late")
                 return
             event = "late_ignored"
         current = get(target, action_id)
@@ -951,6 +975,8 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
         raise ActionError(UNRECORDED, "action %s : issue %s non enregistrée (%s)"
                           % (action_id, outcome.state, settled.get("detail")))
     _publish(db, action_id, outcome.state, by, detail=outcome.detail or "")
+    if outcome.state == "confirmed":
+        _close_lot_on_merge(db, action_id, by)
     return {"action_id": action_id, "attempt": attempt, "state": outcome.state,
             "external_ref": outcome.external_ref, "detail": outcome.detail,
             "released": settled.get("released")}
@@ -1024,6 +1050,8 @@ def reconcile(db: Db, action_id: str, connector, *, by: str = "", force: bool = 
                           % (action_id, current["state"]))
     _publish(db, action_id, found.state, by or "reconcile",
              detail="réconciliation%s" % (" — %s" % found.detail if found.detail else ""))
+    if found.state == "confirmed":
+        _close_lot_on_merge(db, action_id, by or "reconcile")
     return {"action_id": action_id, "state": found.state, "found": True,
             "detail": found.detail, "external_ref": found.external_ref,
             "released": settled.get("released")}

@@ -1,0 +1,8 @@
+/* SPDX-License-Identifier: AGPL-3.0-only */
+/* System font stack: no web font is downloaded. */
+:root {
+  --md-text-font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --md-code-font: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+.md-typeset table:not([class]) { font-size: .74rem; }
+.md-typeset pre > code { font-size: .78rem; }

@@ -39,7 +39,7 @@ import sys
 import threading
 import time
 
-from . import adapters, canon as canon_mod, canon_sync, cost as cost_mod
+from . import account_turn, adapters, canon as canon_mod, canon_sync, cost as cost_mod
 from . import db as db_mod, fil, mail, registry, storage
 from .config import CHANNEL_LEASE, CHANNEL_MAIL, Config
 from .config import load as load_config
@@ -186,6 +186,12 @@ class AgentWorker(threading.Thread):
         self.session_tokens = 0.0
         self.last_turn_seconds = 0.0
         self.last_output = ""
+        #: `ameesh restart` (L26) : arrêt du tour en cours, puis session neuve
+        self.restarting = threading.Event()
+        #: comptes multiples (L30, 0027) : compte choisi pour le prochain tour, et
+        #: compte imposé au tour de résumé d'une bascule (l'ancien compte)
+        self._account = None
+        self._account_override = None
 
     # -- état local --------------------------------------------------------
     def _path(self, name: str) -> str:
@@ -198,6 +204,27 @@ class AgentWorker(threading.Thread):
                 return fh.read().strip() or None
         except OSError:
             return None
+
+    def current_session(self) -> str | None:
+        """La session à reprendre : celle du registre, sinon le fichier local.
+
+        Un fichier local **antérieur** au dernier oubli de session
+        (`session_reset_ts`, posé par `ameesh restart` appliqué sans bail)
+        n'est pas repris : il est effacé (L26).
+        """
+        session = (self.agent or {}).get("session_id")
+        if session:
+            return session
+        fichier = self.read_session_file()
+        reset = (self.agent or {}).get("session_reset_ts")
+        if fichier and reset:
+            try:
+                if os.stat(self._path("session")).st_mtime <= float(reset):
+                    os.unlink(self._path("session"))
+                    return None
+            except OSError:
+                return None
+        return fichier
 
     def write_session_file(self, session_id: str) -> None:
         try:
@@ -442,7 +469,8 @@ class AgentWorker(threading.Thread):
         """
         en_cause = (self.lease_lost.is_set() or self.deadline_passed()
                     or self.stopping.is_set() or self.watchdog_stop.is_set()
-                    or self.preempting.is_set() or self.stop_requested.is_set())
+                    or self.preempting.is_set() or self.stop_requested.is_set()
+                    or self.restarting.is_set())
         if not en_cause:
             return False
         if (self.deadline_passed() or self.stopping.is_set()
@@ -590,11 +618,66 @@ class AgentWorker(threading.Thread):
             if self.preempting.is_set():
                 self.stop_group_now("préemption", grace=1.0)
                 return
+            if self.restarting.is_set():
+                # `ameesh restart` (L26) : même point de passage, même grâce
+                self.stop_group_now("redémarrage demandé", grace=1.0)
+                return
+
+    def request_restart(self) -> None:
+        """`ameesh restart` (L26) : arrêter le tour en cours, puis appliquer."""
+        self.restarting.set()
+        self.wake.set()
+
+    def apply_restart_if_requested(self) -> bool:
+        """Applique une demande `ameesh restart` en attente, fencée par le bail.
+
+        En une écriture : session et lot de session oubliés, brief placé en
+        tête de la consigne en attente. Ici : fichier de session local effacé,
+        compteurs et résumé de reprise remis à zéro (la session neuve s'ouvre
+        sur le brief, pas sur un résumé). Jamais pendant un tour.
+        """
+        if self.proc is not None:
+            return False
+        agent = registry.get(self.db, self.name)
+        if agent is None or not agent.get("restart_requested_ts"):
+            self.restarting.clear()
+            return False
+        row = storage.of(self.db).operations.apply_restart(
+            self.name, self.runner.runner_id, self.epoch)
+        if not row:
+            return False
+        self.restarting.clear()
+        try:
+            os.unlink(self._path("session"))
+        except OSError:
+            pass
+        self.resume_summary = ""
+        self.session_turns = 0
+        self.session_tokens = 0.0
+        self.nudged = False
+        self.agent = registry.get(self.db, self.name) or self.agent
+        log_async("[%s] redémarrage appliqué : session oubliée, brief en tête" % self.name)
+        self._fil_note(
+            "Redémarrage appliqué : l'ancienne session (%s) est oubliée ; la session "
+            "neuve s'ouvre sur le brief déposé." % (row.get("forgotten_session") or "aucune"),
+            meta={"action": "restart", "session": row.get("forgotten_session") or ""})
+        return True
 
     # -- rotation de session (0018) ----------------------------------------
+    def session_policy(self) -> str:
+        """Politique de session effective (0025, L26) : réglage de l'agent
+        (`ameesh set session_policy=…`), sinon défaut de l'exécuteur."""
+        return ((self.agent or {}).get("session_policy") or "").strip() \
+            or self.cfg.session_policy
+
     def rotation_due(self) -> bool:
-        """Rotation due ? Jamais pendant un tour, jamais avant le minimum."""
+        """Rotation due ? Jamais pendant un tour, jamais avant le minimum.
+
+        Politique `jamais` : aucune rotation ; `taille` et `par-lot` : la
+        rotation sur la taille (L11) reste le garde-fou."""
         if self.proc is not None:
+            return False
+        if self.session_policy() == "jamais":
             return False
         if self.session_turns < self.runner.session_min_turns:
             return False
@@ -624,10 +707,13 @@ class AgentWorker(threading.Thread):
         """
         if not self.rotation_due():
             return False
-        ancienne = (self.agent or {}).get("session_id") or self.read_session_file()
-        log_async("[%s] rotation de session (tours=%d, tokens=%.0f, dernier tour=%.0fs)"
-                  % (self.name, self.session_turns, self.session_tokens,
-                     self.last_turn_seconds))
+        return self._rotate("tours=%d, tokens=%.0f, dernier tour=%.0fs" % (
+            self.session_turns, self.session_tokens, self.last_turn_seconds))
+
+    def _rotate(self, raison: str) -> bool:
+        """Le mécanisme de rotation (L11) : résumé dans la session, puis oubli."""
+        ancienne = self.current_session()
+        log_async("[%s] rotation de session (%s)" % (self.name, raison))
         ok = self.run_turn({"kind": "prompt", "prompt": adapters.SUMMARY_PROMPT, "ids": []})
         if not ok:
             # Résumé partiel, bail perdu pendant le tour, claim remplaçant : on ne
@@ -665,11 +751,78 @@ class AgentWorker(threading.Thread):
         self.session_turns = 0
         self.session_tokens = 0.0
         self._fil_note(
-            "Rotation de session : l'ancien id (%s) est conservé dans "
+            "Rotation de session (%s) : l'ancien id (%s) est conservé dans "
             "`session-history.jsonl` ; la session neuve repart du résumé ci-dessous.\n\n%s"
-            % (ancienne or "neuve", resume),
-            meta={"action": "rotation", "session": ancienne or ""})
+            % (raison, ancienne or "neuve", resume),
+            meta={"action": "rotation", "session": ancienne or "", "raison": raison})
         return True
+
+    # -- rotation au changement de lot (0025, L26) ---------------------------
+    def turn_lot(self, spec: dict) -> str | None:
+        """Le lot (`work_item`) d'un tour, ou None s'il n'est pas déductible.
+
+        1. Les messages du tour : s'ils portent UN seul lot (`--lot`), c'est
+           lui ; plusieurs lots distincts = ambigu, None.
+        2. Sinon, l'unique lot ouvert assigné à l'agent ; plusieurs = None.
+        Un tour dont le lot est inconnu ne déclenche jamais de rotation.
+        """
+        ops = storage.of(self.db).operations
+        try:
+            ids = [int(i) for i in spec.get("ids") or []]
+            if ids:
+                lots = ops.message_lots(ids)
+                if len(lots) == 1:
+                    return lots[0]
+                if len(lots) > 1:
+                    return None
+            assignes = ops.assigned_open_lots(self.name)
+        except db_mod.DbError as exc:
+            log_async("[%s] lot du tour illisible (%s)" % (self.name, exc))
+            return None
+        if len(assignes) == 1:
+            return str(assignes[0]["id"])
+        return None
+
+    def lot_rotation_due(self, lot: str | None) -> bool:
+        """Rotation au changement de lot due ? (politique `par-lot`)
+
+        Seulement si le lot du tour est connu, que la session courante a un
+        lot noté et qu'il diffère, et qu'il y a bien une session à tourner.
+        Jamais pendant un tour.
+        """
+        if not lot or self.proc is not None or self.session_policy() != "par-lot":
+            return False
+        courant = (self.agent or {}).get("session_work_item")
+        if not courant or str(courant) == str(lot):
+            return False
+        return bool(self.current_session())
+
+    def rotate_for_lot(self, spec: dict | None) -> dict | None:
+        """Avant un tour : ouvre une session neuve si le lot change (0025).
+
+        Mécanisme L11 (résumé dans l'ancienne session, puis oubli fencé par le
+        bail) : la session neuve s'ouvre sur le résumé de reprise. Une
+        consigne déjà prise par `pick()` est remise en attente le temps du
+        tour de résumé, puis reprise. Si le résumé échoue, le tour part dans
+        l'ancienne session et le nouveau lot y est noté : pas de nouvelle
+        tentative à chaque tour (l'alerte « session trop grosse » veille).
+        """
+        if not spec:
+            return spec
+        lot = spec.get("lot")
+        if not self.lot_rotation_due(lot):
+            return spec
+        courant = (self.agent or {}).get("session_work_item")
+        if spec.get("kind") == "prompt":
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+        ok = self._rotate("changement de lot %s → %s" % (courant, lot))
+        if not ok:
+            if storage.of(self.db).operations.set_session_work_item(
+                    self.name, self.runner.runner_id, self.epoch, str(lot)):
+                self.agent["session_work_item"] = str(lot)
+        if spec.get("kind") == "prompt":
+            return self.pick()
+        return spec
 
     # -- dossier de travail déplacé (0018) ---------------------------------
     #: profondeur maximale de recherche d'un dossier de travail déplacé :
@@ -768,7 +921,12 @@ class AgentWorker(threading.Thread):
             state_dir=self.cfg.state_dir, db=self.db,
             tools={self.name: self.agent.get("harness") or ""},
             hourly_usd=self.runner.budget_usd_per_hour)
-        return book.over(self.name)
+        # L30 (0027) : avec des comptes déclarés, le rythme se juge compte par
+        # compte et la garde bascule au lieu de mettre en pause.
+        raison = account_turn.choose(self, book)
+        if raison is None:
+            return book.over(self.name)
+        return raison or book.over(self.name, pace=False)
 
     def budget_ok(self) -> bool:
         """La garde de budget autorise-t-elle un tour ? Pose l'état de pause.
@@ -782,7 +940,9 @@ class AgentWorker(threading.Thread):
         suivants sont refusés : sans grand livre, l'exécuteur dépenserait en
         aveugle (verdict L13 B1).
         """
+        self._account = None
         if self.runner.budget_usd_per_hour <= 0:
+            account_turn.choose(self, None, pause=False)  # L30 : bascule sans pause
             return True
         # Réparation d'abord : un travail comptable en attente (marqueur
         # persistant) doit être écrit avant d'autoriser le moindre tour ; un
@@ -961,7 +1121,15 @@ class AgentWorker(threading.Thread):
             self._compta_en_echec = True
 
     def pick(self) -> dict | None:
-        """Le prochain tour à faire, ou None. Consomme la consigne en attente."""
+        """Le prochain tour à faire, ou None. Consomme la consigne en attente.
+
+        Le tour porte son lot (`lot`, L26) quand il est déductible."""
+        spec = self._pick()
+        if spec is not None:
+            spec["lot"] = self.turn_lot(spec)
+        return spec
+
+    def _pick(self) -> dict | None:
         agent = registry.get(self.db, self.name)
         if agent is None or agent.get("status") == "stopped":
             if agent is not None:
@@ -971,6 +1139,10 @@ class AgentWorker(threading.Thread):
         self.agent = agent
         if not self.budget_ok():
             return None  # garde de budget (L13) : aucun tour, état `paused` posé
+        # L30 : session ouverte sous un autre compte et non reprenable → résumé
+        # sous l'ancien compte, avant de consommer quoi que ce soit (jamais en
+        # plein tour).
+        account_turn.continuity(self)
         urgents = mail.unread_urgent(self.db, self.name)
         autorises = [m for m in urgents if self.interrupt_allowed(m)]
         for refuse in (m for m in urgents if m not in autorises):
@@ -1046,7 +1218,8 @@ class AgentWorker(threading.Thread):
             self.fail_turn("harnais absent", str(exc))
             return False
 
-        session = self.agent.get("session_id") or self.read_session_file()
+        compte = account_turn.for_turn(self)  # L30 : compte de ce tour (ou None)
+        session = self.current_session()
         resume = ""
         if self.resume_summary and not session:
             # Session neuve après rotation (0018) : le résumé de reprise ouvre le tour.
@@ -1054,10 +1227,14 @@ class AgentWorker(threading.Thread):
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
         model = self.agent.get("model") or self._state_read("model")
-        effort = self._state_read("effort")
+        effort = self._state_read("effort") or self.agent.get("effort") or ""
+        # Tier (L26) : passé par le descripteur du harnais (Codex :
+        # `service_tier`) ; sans effet sur un harnais qui n'en déclare pas.
+        tier = self._state_read("tier") or self.agent.get("tier") or ""
         patch = self._path("model.patch.yml") if (model or effort) else None
         argv = adapter.command(resume + spec["prompt"], session,
-                               model=model or None, effort=effort or None, patch=patch)
+                               model=model or None, effort=effort or None, patch=patch,
+                               tier=tier or None)
         label = {"prompt": "consigne", "mail": "messages", "event": "événements",
                  "urgent": "prioritaire", "idle": "reprise"}[spec["kind"]]
         if self.runner.dry_run:
@@ -1068,6 +1245,13 @@ class AgentWorker(threading.Thread):
                                    "tour %s (%s)" % (label, harness)):
             log("[%s] bail perdu avant le tour" % self.name)
             return False
+        lot = spec.get("lot")
+        if lot and str(lot) != str(self.agent.get("session_work_item") or ""):
+            # Le lot de la session courante (0025, L26) : noté au premier tour
+            # d'une session neuve, ou après une rotation refusée ; fencé.
+            if storage.of(self.db).operations.set_session_work_item(
+                    self.name, self.runner.runner_id, self.epoch, str(lot)):
+                self.agent["session_work_item"] = str(lot)
 
         cwd = self.agent.get("cwd")
         if not cwd or not os.path.isdir(cwd):
@@ -1103,9 +1287,15 @@ class AgentWorker(threading.Thread):
             "AGENT_MESH_LEASE_EPOCH": str(self.epoch),
         }
         env.update(identite)
+        if not account_turn.apply(self, env, compte):
+            return False  # profil inutilisable : consigne remise, rien lancé
         events_path = self._path("events.jsonl")
         stderr_path = self._path("stderr.log")
         started = time.time()
+        if compte is not None:
+            # Marqueur de compte AVANT l'index de début : les relevés du tour (et
+            # sa ligne de grand livre) sont attribués à ce compte (L30).
+            account_turn.mark(self, events_path, compte)
         # Index du flux avant le tour : `CostBook.record` ne compte que les
         # événements nouveaux (L13, 0019 §3).
         events_start = 0
@@ -1222,6 +1412,13 @@ class AgentWorker(threading.Thread):
             # l'état d'un agent qu'un remplaçant a pu reprendre.
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
+        if self.restarting.is_set() and not preempte and not ok:
+            # `ameesh restart` (L26) : le tour est arrêté ; sa consigne repart en
+            # attente, DERRIÈRE le brief que la demande placera en tête.
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            registry.set_status(self.db, self.name, "queued",
+                                status_text="tour arrêté : redémarrage demandé")
+            return False
         if preempte:
             # Message prioritaire reçu pendant le tour (0018) : la consigne
             # repart en attente, `pick()` servira le message en tête au tour
@@ -1274,8 +1471,9 @@ class AgentWorker(threading.Thread):
         self.ensure_watchdog()
         deadline = time.monotonic() + max(0.0, wait_seconds)
         while True:
+            self.apply_restart_if_requested()
             self.maybe_rotate()
-            spec = self.pick()
+            spec = self.rotate_for_lot(self.pick())
             if spec:
                 self.run_turn(spec)
                 return True
@@ -1291,8 +1489,9 @@ class AgentWorker(threading.Thread):
             while not self.stopping.is_set() and not self.runner.stop.is_set():
                 if not self.renew():
                     break
+                self.apply_restart_if_requested()
                 self.maybe_rotate()
-                spec = self.pick()
+                spec = self.rotate_for_lot(self.pick())
                 if spec is None:
                     self.wake.wait(timeout=self.wait_timeout(
                         min(self.runner.poll, max(1.0, self.runner.lease_ttl / 3.0))))
@@ -1396,6 +1595,16 @@ class Runner:
             target = payload.get("to")
             with self.lock:
                 worker = self.workers.get(target) if target else None
+            if payload.get("restart"):
+                # `ameesh restart` (L26) : le NOTIFY n'est qu'un réveil ; la
+                # demande est relue en base avant d'arrêter quoi que ce soit.
+                if worker is not None:
+                    agent = registry.get(self.db, target) or {}
+                    if agent.get("restart_requested_ts"):
+                        worker.request_restart()  # le signal d'abord
+                        log_async("redémarrage demandé pour %s : arrêt du tour" % target)
+                self.wake_all.set()
+                return
             prioritaire = False
             if worker is not None and payload.get("id"):
                 row = mail.get(self.db, int(payload["id"]))
@@ -1520,10 +1729,67 @@ class Runner:
             target=self._canon_sync_loop, daemon=True, name="canon-sync")
         self.canon_thread.start()
 
+    # -- solde des fournisseurs payés au token (L26) ------------------------
+    def balance_once(self, sources=None) -> int:
+        """Relève le solde de chaque source configurée ; ne lève jamais.
+
+        La clé n'est lue que par la source, dans l'environnement, et ne
+        figure dans aucun message : seuls le fournisseur et la raison courte
+        de l'échec sont journalisés.
+        """
+        from . import balance as balance_mod
+        # L30 : une source par compte de clé d'API déclaré (sinon l'historique)
+        paires = (balance_mod.account_sources(self.cfg) if sources is None
+                  else [(s, None) for s in sources])
+        paires = [(s, compte) for s, compte in paires if s.configured()]
+        if not paires:
+            return 0
+        db = None
+        releves = 0
+        try:
+            db = db_mod.connect(self.cfg)
+            for source, compte in paires:
+                try:
+                    releves += len(balance_mod.record(db, source, compte))
+                except (balance_mod.BalanceError, db_mod.DbError) as exc:
+                    log_async("solde %s%s : %s" % (
+                        source.provider, "/%s" % compte if compte else "",
+                        " ".join(str(exc).split())[:160]))
+        except Exception as exc:  # jamais fatal
+            log_async("solde : relevé impossible (%s)" % type(exc).__name__)
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        return releves
+
+    def start_balance_poll(self) -> None:
+        """Relevé périodique du solde (`AMEESH_BALANCE_INTERVAL`, défaut 900 s).
+
+        Rien en mode `--once`, avec un intervalle nul, ou sans clé de
+        fournisseur dans l'environnement."""
+        from . import balance as balance_mod
+        interval = max(0.0, float(self.cfg.balance_interval))
+        if self.once or interval <= 0:
+            return
+        if not any(s.configured() for s, _ in balance_mod.account_sources(self.cfg)):
+            return
+
+        def boucle() -> None:
+            while not self.stop.is_set():
+                self.balance_once()
+                if self.stop.wait(max(60.0, interval)):
+                    return
+
+        threading.Thread(target=boucle, daemon=True, name="solde").start()
+
     def run(self) -> int:
         log("démarrage : hôte %s, exécuteur %s, pilote %s, schéma %s"
             % (self.host, self.runner_id, self.db.name, self.cfg.schema))
         self.start_canon_sync()
+        self.start_balance_poll()
         if self.once:
             self.sweep()
             if not self.did_turn:
@@ -1702,6 +1968,11 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     except adapters.HarnessMissing as exc:
         print("attach : %s" % exc, file=sys.stderr)
         return 1
+    # L30 : la session interactive prend le compte actif du harnais ; un profil
+    # inutilisable est refusé AVANT de prendre le bail.
+    ok, compte = account_turn.attach_profile(cfg, db, agent.get("harness") or "")
+    if not ok:
+        return 1
     owner = attach_owner(cfg.host)
     ttl = max(5.0, ttl or cfg.lease_ttl)
     registry.reap(db, cfg.host)
@@ -1775,6 +2046,8 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     proc: subprocess.Popen | None = None
     code = 0
     try:
+        if not account_turn.apply_env_attach(env, compte, cfg):
+            return 1  # le `finally` rend le bail
         log_async("[%s] session interactive : %s" % (name, " ".join(argv)))
         proc = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True)
         # Course de publication (même correctif que B5a-P) : le veilleur a pu
@@ -1832,6 +2105,12 @@ def attach_main(argv: list[str] | None = None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    # `register --help` / `stop --help` affichent l'aide, jamais d'écriture en base
+    if argv and argv[0] in ("register", "stop") and any(a in ("-h", "--help") for a in argv[1:]):
+        print("usage: agent-runner register <agent> <harnais> [--session S] [--prompt P] [--cwd D] …\n"
+              "       agent-runner stop <agent>\n"
+              "       agent-runner [--once] [--agents a,b] [--poll S] …  (agent-runner --help)")
+        return 0
     cfg = load_config()
 
     if argv and argv[0] == "register":

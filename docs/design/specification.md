@@ -155,8 +155,66 @@ cwd: ~/src/acme                         # dossier de travail sur l'hôte
 **`type: Member`** (humains) — `title: smichea`, `roles: [...]`,
 `authenticators:` liste d'empreintes de clés publiques enrôlées (C7).
 
+**`type: WorkPackage`** (plan de travail, L29 ; [modèle et commandes](../PLAN-DE-TRAVAIL.md))
+
+```yaml
+type: WorkPackage
+title: "Recherche dans le catalogue"
+kind: lot                        # milestone | epic | lot
+parent: catalogue                # autre fiche WorkPackage (lot → epic|jalon, epic → jalon)
+responsible: human:alice         # REQUIS
+team: acme-web                   # facultatif
+scope: ["src/catalogue/**"]      # globs, facultatif
+status: draft                    # déclaratif, facultatif
+id: cat-recherche                # facultatif (défaut : nom du fichier)
+```
+
+Recopiée par `canon sync` dans `work_packages` (0026) ; ses erreurs ne
+bloquent aucun agent. L'état des lots reste dans `work_items`, projeté sur
+GitHub (une issue par lot, sous-issues de l'epic) qui reste une vue.
+
 Les rôles et politiques de revue viennent de `federation.yaml` (OKF Federation) ;
 ameesh ne les redéfinit pas.
+
+**`review_policies.risk_classes`** (profil ameesh, décision 0018) — la revue qu'un
+changement demande, **par portée de fichiers** :
+
+```yaml
+review_policies:
+  self_approval: forbidden        # OKF Federation : conservé, non interprété ici
+  risk_classes:
+    default: normal               # classe d'un fichier qu'aucune règle ne nomme
+    rules:
+      - paths: ["supabase/migrations/**", "**/*.sql"]
+        class: sensible
+      - paths: ["docs/**"]
+        class: light
+```
+
+`default` est facultatif (`normal` par défaut) ; une politique déclarée sans lui
+donne un **avertissement** de `canon check`, pas une erreur.
+
+Les classes sont `light` (léger : fusion dès que les tests ciblés sont verts,
+relecture après coup), `normal` (une revue d'un autre éditeur) et `sensitive`
+(sensible : gel, revue avant fusion, accord explicite). La classe d'un fichier
+est la **plus haute** des règles qui matchent, celle d'un changement la plus
+haute de ses fichiers — en cas de doute, la classe supérieure. `canon check`
+valide la déclaration ; `ameesh review-class <fichiers…|--diff REF>` calcule la
+classe d'un changement (`--diff REF` lit `merge-base(REF, HEAD)` → arbre de
+travail, renommages compris, plus les fichiers non suivis). Les motifs sont des
+globs de chemin de dépôt : `*` ne traverse pas `/`, `**` oui, et `docs` ne
+couvre pas `docs/a.md` (écrire `docs/**`).
+
+**Les jalons d'un lot** (R19, migration 0013) sont **écrits**, pas déduits d'un
+état : `requested` (création) et `merged` (entrée dans l'état) sont automatiques
+par trigger ; `frozen` (branche gelée pour la revue) et `verdict` (`ok` ou
+`blocked`, avec le commit relu) se déclarent par
+`ameesh work milestone <id> frozen|verdict [ok|blocked] --sha S [--note …]`.
+Les durées `demande → gel`, `gel → revue`, `gel → fusion` et le nombre de
+verdicts bloqués se lisent dans `ameesh work list` (colonne DÉLAI), `ameesh work
+show` (frise complète) et le pied de `ameesh list` ; la forme complète est
+rendue par l'opération de stockage `WorkItems.delays` (L24 et Nexlink la
+consomment).
 
 ## 4.3 Validation (`ameesh canon check`)
 
@@ -353,6 +411,14 @@ autre hôte** que les agents. En v1 :
 HTTPS obligatoire hors `localhost` (RP ID = domaine du service). Les tests
 utilisent un authentificateur logiciel ES256 (aucun téléphone requis).
 
+Une instance par équipe (décision 0026, lot L27) : profil strict par défaut
+(RP ID exactement égal à l'hôte `H` de l'unique origine `https://H`, zones et
+hôtes réservés refusés), `GET /health` sans secret et `ameesh approve-check`
+pour la concordance avec la politique des vérificateurs, TLS local facultatif
+derrière une passerelle en passthrough, rôle Postgres en lecture seule
+(`deploy/sql/role-approve.sql`). Exploitation :
+[héberger ameesh-approve](../profils/heberger-ameesh-approve.md).
+
 # 10. Stockage (C1)
 
 Paquet `ameesh.storage` : une classe `Storage` par pilote, des **opérations
@@ -430,6 +496,11 @@ client ; migrations réservées ci-dessous ; aucune dépense, aucun service publ
 | L22 | demandes aux humains : destinataire par le canon, échéances par gravité, remplaçants, escalade sans décision implicite (R23 : A9) | L2, L5 | 0020 | codex3 |
 | L23 | surveillance après livraison, réouverture sur récidive, corrélation avec les versions, notification du demandeur, auto-guérison des exécutions, balayage (R23 : A4, A10–A12) | L18, L21 | 0021 | codex |
 | L24 | vue temps réel de l'avancement : `ameesh progress --json` (lots, agents, jalons, budget) alimenté par les événements, vue de référence lisible sur téléphone (maquette : page de suivi du chantier Nexlink, privée) ([0024](decisions/0024-vue-temps-reel.md)) | L5, L8, L12 | — | codex |
+| L25 | profil d'hébergement « cluster » : image de l'exécuteur, manifestes Kubernetes d'exemple (un agent persistant par pod, canon en lecture seule), sonde `doctor --probe`, rôle Postgres de superviseur en lecture seule (contenus exclus par défaut) ([0011](decisions/0011-hebergement-configurable.md)) | L1, L2 | — | codex3 |
+| L26 | parité d'exploitation v0 → v1 : rotation de session au changement de lot et alerte « session trop grosse » ([0025](decisions/0025-une-session-par-lot.md)) ; `ameesh list --json` enrichi (harnais, modèle, effort, tier, état, depuis quand, lot courant, non-lus) ; usage par tour ; historique des jauges de forfait ; solde et dépense réelle du fournisseur payé au token ; alertes en flux `--json` (tour long, repos avec courrier, exécuteur mort, session trop grosse) ; `ameesh restart <agent> --brief` (session neuve) ; tier Codex dans `ameesh set` ; `ameesh interrupt` (R19, R20) | L11, L13 | 0027 | codex3 |
+| L27 | ameesh-approve multi-équipe ([0026](decisions/0026-hebergement-d-ameesh-approve-par-equipe.md), [contrat](ameesh-approve-hebergement-equipes.md)) : `approve_url` distincte de `public_url`, profil strict RP ID = hôte et origine unique, refus d'une zone ou d'un parent réservé, concordance service ↔ vérificateurs, droits DB propres à approve, bascule à hôte constant | L7, L9b | — | codex3 |
+| L29 | plan de travail : fiches `WorkPackage` au canon avec parent (jalon → epic → lot), responsable et périmètre ; `work_items` reliés à leur fiche et à leur parent ; fermeture automatique sur fusion de la PR ; projection GitHub (une issue par lot, sous-issues de l'epic, labels d'état), GitHub restant une vue et ses modifications des propositions ([0005](decisions/0005-canon-okf.md)) ; epics dans `ameesh progress` | L2, L10, L24 | 0026 | codex3 |
+| L30 | comptes multiples par fournisseur ([0027](decisions/0027-bascule-automatique-entre-comptes.md)) : liste ordonnée de comptes par hôte (profils d'identifiants : dossier de configuration du harnais ou clé d'API), jauges par compte, bascule automatique avant chaque tour au lieu de la pause, retour au primaire après remise à zéro, continuité de session quand le harnais le permet, journal des bascules | L12, L13, L26 | 0028 | codex3 |
 
 Ordre : L2, L4 et L6 en parallèle dès maintenant (fichiers nouveaux) ; L1 et L8
 après la fusion de B5a (ils touchent `runner.py` et `registry.py`) ; puis L3,

@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Public site of ameesh on GitHub Pages: landing page (site/landing/) at the
+# root, MkDocs documentation (site/docs/, mkdocs.yml) under /docs/.
+# Served at https://ameesh.manaty.net (custom domain, set in the repository's
+# Pages settings; _site/CNAME documents it).
+# The build is strict: a broken link or a missing page fails it.
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "mkdocs.yml"
+      - "scripts/build-site.sh"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: MkDocs and Material (pinned)
+        run: python -m pip install -r site/requirements.txt
+      - id: pages
+        uses: actions/configure-pages@v5
+      - name: build (mkdocs --strict + landing page)
+        run: MKDOCS=mkdocs scripts/build-site.sh
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

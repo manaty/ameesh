@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Aucune entrée : rien dans le cluster ne parle à l'exécuteur (effectif
+# seulement si le CNI applique les NetworkPolicy).
+#
+# La sortie reste ouverte dans cet exemple : l'agent a besoin de la base, du
+# dépôt du canon, de son dépôt de travail et de l'API de son fournisseur de
+# modèles. Pour la restreindre, ajouter `Egress` à policyTypes et des règles
+# `egress` (base par podSelector/namespaceSelector, DNS sur 53/UDP+TCP, le
+# reste par ipBlock — une NetworkPolicy standard ne filtre pas par nom de
+# domaine).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ameesh-agent-sans-entree
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: ameesh
+      app.kubernetes.io/component: runner
+  policyTypes:
+    - Ingress

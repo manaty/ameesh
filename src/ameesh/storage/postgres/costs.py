@@ -39,7 +39,21 @@ class TurnCosts(interface.TurnCosts):
 
     def insert(self, *, agent, harness, turn, model, session, usd, input_tokens,
                cached_input_tokens, output_tokens, cum_usd, cum_input_tokens,
-               cum_cached_input_tokens, cum_output_tokens) -> None:
+               cum_cached_input_tokens, cum_output_tokens, account=None) -> None:
+        if account is not None:
+            # L30 (migration 0028) : la colonne n'est écrite que si un compte est
+            # nommé — un hôte sans comptes déclarés n'en dépend pas.
+            self.db.execute(
+                "insert into turn_costs (agent, harness, turn, model, session, usd,"
+                " input_tokens, cached_input_tokens, output_tokens,"
+                " cum_usd, cum_input_tokens, cum_cached_input_tokens, cum_output_tokens,"
+                " account)"
+                " values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (agent, harness, turn, model, session,
+                 usd, input_tokens, cached_input_tokens,
+                 output_tokens, cum_usd, cum_input_tokens, cum_cached_input_tokens,
+                 cum_output_tokens, account))
+            return
         self.db.execute(
             "insert into turn_costs (agent, harness, turn, model, session, usd,"
             " input_tokens, cached_input_tokens, output_tokens,"
@@ -50,12 +64,15 @@ class TurnCosts(interface.TurnCosts):
              output_tokens, cum_usd, cum_input_tokens, cum_cached_input_tokens,
              cum_output_tokens))
 
-    def spent(self, seconds, *, agent, harnesses) -> float:
+    def spent(self, seconds, *, agent, harnesses, account=None) -> float:
         clauses = ["recorded_at >= now() - make_interval(secs => %s)"]
         params: list = [float(seconds)]
         if agent != "all":
             clauses.append("agent = %s")
             params.append(agent)
+        if account is not None:
+            clauses.append("account = %s")
+            params.append(account)
         if harnesses:
             clauses.append("harness in (%s)" % ", ".join(["%s"] * len(harnesses)))
             params.extend(harnesses)

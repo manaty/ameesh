@@ -122,6 +122,28 @@ def _lit(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
+def check(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
+          ) -> tuple[list[Migration], list[Migration], list[int]]:
+    """État des migrations en **lecture seule** (sonde `doctor --probe`).
+
+    Contrairement à `applied()`, n'exécute aucun DDL (pas de `create table if
+    not exists`) : la sonde ne doit rien écrire. Rend (manquantes, modifiées
+    après application, versions appliquées inconnues de ce code — base plus
+    récente que l'image, par exemple après un retour arrière).
+    """
+    row = db.query("SELECT to_regclass('schema_migrations') IS NOT NULL AS ok")[0]
+    done: dict[int, str] = {}
+    if row.get("ok"):
+        done = {int(r["version"]): r["checksum"]
+                for r in db.query("SELECT version, checksum FROM schema_migrations")}
+    known = discover(directory)
+    missing = [m for m in known if m.version not in done]
+    modified = [m for m in known if m.version in done and done[m.version] != m.checksum]
+    versions = {m.version for m in known}
+    unknown = sorted(v for v in done if v not in versions)
+    return missing, modified, unknown
+
+
 def status(db: PsqlDriver | PsycopgDriver) -> tuple[list[Migration], set[int]]:
     """(migrations connues, versions appliquées) — pour `agent-mesh doctor`."""
     return discover(), set(applied(db))

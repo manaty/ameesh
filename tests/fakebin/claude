@@ -13,13 +13,26 @@ import sys
 import time
 
 
+def _compte() -> dict:
+    """Le compte vu par le harnais (L30) : dossiers, et l'EMPREINTE de la clé
+    (jamais la clé, même factice)."""
+    import hashlib
+    cle = os.environ.get("DEEPSEEK_API_KEY")
+    return {
+        "CLAUDE_CONFIG_DIR": os.environ.get("CLAUDE_CONFIG_DIR"),
+        "CODEX_HOME": os.environ.get("CODEX_HOME"),
+        "DSH_HOME": os.environ.get("DSH_HOME"),
+        "cle": hashlib.sha256(cle.encode()).hexdigest()[:12] if cle else None,
+    }
+
+
 def main() -> int:
     args = sys.argv[1:]
     log = os.environ.get("AMEESH_TEST_LOG")
     if log:
         with open(log, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({
-                "harness": "claude", "argv": args,
+                "harness": "claude", "argv": args, "compte": _compte(),
                 "env": {k: os.environ.get(k) for k in (
                     "AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
                     "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
@@ -34,6 +47,10 @@ def main() -> int:
         session = args[args.index("--resume") + 1]
     print(json.dumps({"type": "system", "subtype": "init", "session_id": session,
                       "cwd": os.getcwd()}), flush=True)
+    if os.environ.get("AMEESH_TEST_RATE_LIMIT"):
+        # relevé de jauge enregistré (L30) : rejoué tel quel dans le flux
+        print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+            "unifiedWindows": json.loads(os.environ["AMEESH_TEST_RATE_LIMIT"])}}), flush=True)
     print(json.dumps({"type": "assistant", "message": {"content": [
         {"type": "text", "text": "bonjour du faux claude (session %s)" % session}]}}), flush=True)
     print(json.dumps({"type": "result", "subtype": "success", "result": "fini",

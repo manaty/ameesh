@@ -13,13 +13,25 @@
   ameesh key …                clés publiques (propriétaire / agent) ;
   ameesh approve | approvals | verify   approbations signées ;
   ameesh work …               lots (work_items) ;
-  ameesh cost …               coût des tours et jauges de forfait ;
+  ameesh cost …               coût des tours, usage par tour, jauges et leur
+        historique, solde du fournisseur payé au token (`cost turns|gauges|balance`) ;
+  ameesh accounts list | use <harnais> <compte> | auto [harnais]
+        comptes multiples par fournisseur : actif, jauges, forçage (L30) ;
+  ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais
+        réglages d'exécution, effet au prochain tour ;
+  ameesh alerts [--follow] [--json]     alertes d'exploitation (un objet par ligne) ;
+  ameesh restart <agent> --brief FICHIER|-   session neuve sur un brief ;
+  ameesh interrupt <agent> <message…>   interruption directe (expéditeurs habilités) ;
+  ameesh progress [--json] [--html FICHIER] [--project P] [--since 24h]
+        avancement : lots, agents, jalons, budget (schéma ameesh-progress/1) ;
   ameesh fil list | show <projet> [<lot>] [--last N] | tail <projet> [<lot>]
         les fils lisibles : tout message passé par ameesh, en clair (R12) ;
   ameesh receipt verify | authenticator list   reçus d'approbation (spec §8) ;
   ameesh action propose|show|list|request|approve|execute|reconcile|retry|replace|cancel
         actions sous porte (spec §7) ;
   ameesh decisions [--for human:ID]     décisions qui attendent un humain (C10) ;
+  ameesh approve-check [--url U] [--json]
+        concordance RP ID/origines entre ameesh-approve et ce vérificateur ;
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
   ameesh migrate | doctor     schéma et diagnostic ;
   ameesh canon check|show|sync          canon OKF : validation, fiches, registre ;
@@ -41,7 +53,16 @@ import sys
 MESH_COMMANDS = (
     "list", "show", "set", "key", "approve", "approvals", "verify", "work", "cost",
     "migrate", "doctor", "import-v0", "export-v0", "canon", "placement", "agent",
+    "review-class",
+    # L14 : le catalogue des modèles a son point d'entrée public, comme les autres
+    # (`ameesh models list|show|discover`) — sans cette ligne, la commande sortait en
+    # code 2 « sous-commande inconnue » AVANT toute base (revue B5).
+    "models",
+    # L30 : comptes multiples par fournisseur (`ameesh accounts list|use|auto`)
+    "accounts",
 )
+#: exploitation (L26) : alertes, redémarrage sur brief, interruption directe
+EXPLOITATION_COMMANDS = ("alerts", "restart", "interrupt")
 #: sous-commandes des reçus d'approbation (receipts_cli)
 RECEIPT_COMMANDS = ("receipt", "authenticator")
 #: actions sous porte et file des décisions (actions_cli)
@@ -63,9 +84,15 @@ def main(argv: list[str] | None = None) -> int:
     if command == "attach":
         from . import runner
         return runner.attach_main(rest)
+    if command == "progress":
+        from . import progress
+        return progress.main(rest)
     if command == "fil":
         from . import fil
         return fil.main(rest)
+    if command in EXPLOITATION_COMMANDS:
+        from . import exploitation
+        return exploitation.main(argv)
     if command in MESH_COMMANDS:
         from . import mesh_cli
         return mesh_cli.main(argv)
@@ -75,6 +102,9 @@ def main(argv: list[str] | None = None) -> int:
     if command in ACTION_COMMANDS:
         from . import actions_cli
         return actions_cli.main(argv)
+    if command == "approve-check":
+        from . import approve_check
+        return approve_check.main(rest)
     print("ameesh : sous-commande inconnue %r" % command, file=sys.stderr)
     print(__doc__)
     return 2

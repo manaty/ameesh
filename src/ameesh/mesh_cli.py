@@ -18,7 +18,7 @@
   agent-mesh work list [--state S] | work show <id> | work move <id> <état> | work note <id> "…"
   agent-mesh import-v0 [--agents a,b] [--dry-run]     bascule : boîte fichier v0 → Postgres
   agent-mesh export-v0 [--agents a,b] [--keep]        retour arrière : Postgres → boîte v0
-  agent-mesh migrate | doctor [--notify-test]
+  agent-mesh migrate | doctor [--notify-test | --probe]
   agent-mesh canon check|show|sync [--json] [--host H]   canon OKF (spec §4)
   agent-mesh placement check [--agent A] [--json]        placement gouverné (C4)
   agent-mesh agent spawn <nom> --by <créateur> --ttl 2h   agent éphémère (R14)
@@ -31,14 +31,17 @@ agent ne doit générer ni détenir sa clé privée.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
+import re
 import sys
 import time
 
-from . import authority, config as config_mod, cost as cost_mod, db as db_mod, identity
+from . import accounts as accounts_mod
+from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
 from . import migrations, placement, registry
-from . import signing, storage, work
+from . import fil, signing, storage, work
 from .config import Config
 from .db import Db
 
@@ -60,6 +63,20 @@ def _fmt_age(seconds: float) -> str:
     if seconds < 86400:
         return "il y a %dh" % (seconds // 3600)
     return "il y a %dj" % (seconds // 86400)
+
+
+def _fmt_span(seconds: float | None) -> str:
+    """Une durée (pas un âge) : 42s, 12m, 3h05, 2j."""
+    if seconds is None:
+        return "—"
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        return "%dm" % (seconds // 60)
+    if seconds < 86400:
+        return "%dh%02d" % (seconds // 3600, (seconds % 3600) // 60)
+    return "%dj" % (seconds // 86400)
 
 
 def _fmt_moment(epoch: float | None) -> str:
@@ -95,6 +112,10 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         if args.json:
             # C4 : verdict de placement de chaque agent (0022)
             placement.annotate(db, rows)
+            # L26 : champs d'exploitation (schéma `ameesh-agent/1`,
+            # docs/EXPLOITATION.md), ajoutés sans retirer les clés existantes
+            from . import exploitation
+            exploitation.annotate(cfg, db, rows)
             print(json.dumps(rows, ensure_ascii=False, indent=2))
             return 0
         if not rows:
@@ -114,6 +135,22 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
                  else "agent" if row.get("key_ready") else "—"),
                 _fmt_age(now - float(row.get("last_seen_ts") or 0)),
             ))
+            # Les lots sur la même vue (0018 point 5) : le compte par phase et ce
+            # qui attend le plus, pour que `ameesh list` dise où en est le travail.
+            lots = work.delays(db, limit=500)
+            if lots:
+                counts: dict[str, int] = {}
+                for lot in lots:
+                    name, _at = work.last_milestone(lot)
+                    counts[name] = counts.get(name, 0) + 1
+                oldest = min((float(lot["frozen_ts"]) for lot in lots
+                              if lot.get("frozen_ts") and not lot.get("reviewed_ts")),
+                             default=None)
+                detail = ", ".join("%s %d" % (name, counts[name])
+                                   for name, _at_key, _duration in reversed(work.MILESTONES)
+                                   if name in counts)
+                waiting = " — plus ancien gel : %s" % _fmt_age(now - oldest) if oldest else ""
+                print("lots     : %d (%s)%s" % (len(lots), detail, waiting))
         return 0
     finally:
         db.close()
@@ -330,32 +367,149 @@ def cmd_verify(cfg: Config, args: argparse.Namespace) -> int:
 # lots (work_items)
 # --------------------------------------------------------------------------
 
+def _delays_cell(row: dict | None, now: float) -> str:
+    """La phase courante d'un lot et l'âge de son dernier jalon (R19)."""
+    if not row:
+        return "—"
+    name, at = work.last_milestone(row)
+    if at is None:
+        return name
+    return "%s %s" % (name, _fmt_span(now - at))
+
+
+def _print_delays(row: dict) -> None:
+    """La frise d'un lot : jalons datés, durées entre eux."""
+    now = time.time()
+    parts = []
+    for name, at_key, _duration in work.MILESTONES:
+        at = row.get(at_key)
+        parts.append("%s %s" % (name, _fmt_age(now - float(at)) if at else "—"))
+    print("jalons   : %s" % " · ".join(reversed(parts)))
+    spans = " · ".join("%s %s" % (label, _fmt_span(value))
+                       for label, value in work.durations(row))
+    if row.get("blocked_verdicts"):
+        spans += " · verdicts bloqués %d/%d" % (row["blocked_verdicts"], row["verdicts"])
+    print("délais   : %s" % spans)
+
+
+def cmd_review_class(cfg: Config, args: argparse.Namespace) -> int:
+    """La classe de revue d'un changement (décision 0018 point 1, R19).
+
+    La politique est lue au canon (`review_policies.classes`) ; les fichiers
+    viennent des arguments ou de `--diff REF` (ref..HEAD + arbre de travail).
+    Une déclaration invalide refuse de classer : jamais une classe par défaut
+    rassurante sur une politique illisible.
+    """
+    from . import canon as canon_mod
+    from . import canon_cli, review as review_mod
+
+    canon = canon_cli.load_canon(cfg, args)
+    if not canon.readable:
+        print("erreur : canon illisible (%s)" % canon.root, file=sys.stderr)
+        return 1
+    policy, problems = review_mod.policy_from_federation(canon.federation)
+    if problems:
+        for code, _severity, message in problems:
+            print("%s : %s" % (code, message), file=sys.stderr)
+        return 1
+    if args.diff and args.paths:
+        print(USAGE_HINT % "review-class : --diff REF ou des fichiers, pas les deux",
+              file=sys.stderr)
+        return 2
+    in_repo = canon_mod.git_toplevel(os.getcwd())
+    if args.diff and in_repo is None:
+        print(USAGE_HINT % "review-class : --diff REF demande un dépôt git", file=sys.stderr)
+        return 1
+    # Hors dépôt, les chemins donnés sont lus depuis le dossier courant : c'est
+    # ce que l'appelant voit, et la politique n'a pas de racine à leur donner.
+    repo = in_repo or os.getcwd()
+    if args.diff:
+        try:
+            paths = canon_mod.git_changed_paths(repo, args.diff)
+        except canon_mod.GitError as exc:
+            # une référence illisible n'est pas « aucun fichier changé » : rendre
+            # une classe partielle ferait croire à un changement anodin (B2).
+            print(USAGE_HINT % ("review-class : %s" % exc), file=sys.stderr)
+            return 1
+        if not paths:
+            print("aucun fichier changé depuis %s" % args.diff)
+            return 0
+    elif args.paths:
+        # Les chemins sont donnés depuis le dossier courant : on les ramène à la
+        # racine du dépôt, parce que la politique est écrite en chemins de dépôt.
+        here = os.path.relpath(os.getcwd(), repo).replace(os.sep, "/")
+        paths = [p if here == "." else "%s/%s" % (here, p) for p in args.paths]
+    else:
+        print(USAGE_HINT % "review-class : des fichiers ou --diff REF", file=sys.stderr)
+        return 2
+    try:
+        result = review_mod.classify(policy, paths)
+    except review_mod.ReviewError as exc:
+        print(USAGE_HINT % ("review-class : %s" % exc), file=sys.stderr)
+        return 1
+    if args.json:
+        # `policy_ref` : le commit du canon lu, pour que la classe affichée soit
+        # rattachable à la politique qui l'a produite (mesh-design).
+        policy_ref = canon.sources[0].commit if canon.sources else ""
+        print(json.dumps(dict(result, root=canon.root, repo=repo, policy_ref=policy_ref),
+                         ensure_ascii=False, indent=2))
+        return 0
+    print("classe : %s" % result["class_display"])
+    for entry in result["files"]:
+        rule = ", ".join(entry["rule"]) if entry["rule"] else "défaut"
+        print("  %-52s %-9s %s" % (entry["path"], review_mod.DISPLAY[entry["class"]], rule))
+    return 0
+
+
 def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
+    from . import plan, plan_cli, stagnation  # plan de travail (L29)
     db = _open(cfg)
     try:
+        if args.work_command in plan_cli.COMMANDS:
+            return plan_cli.run(db, args)
         if args.work_command == "add":
             item = work.add(
                 db, title=args.title, type=args.type, source=args.source, app=args.app,
                 body=args.body or "", issue_ref=args.issue_ref, workstream=args.workstream,
-                assignee=args.assignee, budget_usd=args.budget, actor=args.actor)
-            print("lot #%d créé en %s : %s" % (item["id"], item["state"], item["title"]))
+                assignee=args.assignee, budget_usd=args.budget, actor=args.actor,
+                package=args.package)
+            print("lot #%d créé en %s : %s%s" % (
+                item["id"], item["state"], item["title"],
+                " (plan : %s)" % item["package_id"] if item.get("package_id") else ""))
             return 0
         if args.work_command == "list":
             rows = work.list_items(db, state=args.state, assignee=args.assignee, limit=args.limit)
+            plan.annotate(db, rows, threshold=stagnation.stale_after(args.stale_after))
+            # Les délais viennent d'un seul balayage, restreint aux lots
+            # affichés (jamais une requête par ligne) ; le JSON les porte aussi,
+            # pour la frise (L24). Le filtre porte sur les lignes rendues, pas
+            # sur une fenêtre globale : un lot ancien garde sa frise (B3).
+            delays = {row["work_item_id"]: row for row in
+                      work.delays(db, ids=[row["id"] for row in rows])}
+            for row in rows:
+                row["delays"] = delays.get(row["id"])
             if args.json:
                 print(json.dumps(rows, ensure_ascii=False, indent=2))
                 return 0
             if not rows:
                 print("aucun lot")
                 return 0
-            print("%-5s %-10s %-14s %-12s %-10s %s" % (
-                "ID", "TYPE", "ÉTAT", "ASSIGNÉ", "MAJ", "TITRE"))
             now = time.time()
+            print("%-5s %-10s %-14s %-12s %-10s %-12s %-12s %s" % (
+                "ID", "TYPE", "ÉTAT", "ASSIGNÉ", "MAJ", "DÉLAI", "EPIC", "TITRE"))
             for row in rows:
-                print("%-5d %-10s %-14s %-12s %-10s %s" % (
+                print("%-5d %-10s %-14s %-12s %-10s %-12s %-12s %s" % (
                     row["id"], row["type"], row["state"], (row.get("assignee") or "—")[:12],
                     _fmt_age(now - float(row.get("updated_ts") or 0)),
+                    _delays_cell(row.get("delays"), now), (row.get("epic") or "—")[:12],
                     row["title"][:60]))
+                notes = []
+                if row.get("stale"):
+                    notes.append("STAGNANT depuis %s" % plan.describe_age(row["stale"]["idle_s"]))
+                if row.get("waiting_for"):
+                    notes.append("attend : %s" % row["waiting_for"]["label"])
+                if notes:
+                    print("      %s" % " · ".join(notes))
             return 0
         if args.work_command == "show":
             item = work.get(db, args.id)
@@ -363,6 +517,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print(USAGE_HINT % ("lot %s introuvable" % args.id), file=sys.stderr)
                 return 1
             item["events"] = work.events(db, args.id)
+            item["milestones"] = work.milestones(db, args.id)
+            item["delays"] = work.timeline(db, args.id)
+            plan.annotate(db, [item])
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
@@ -373,11 +530,26 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s boucles : %-3s budget : %s" % (
                 item.get("issue_ref") or "—", item.get("loops"), _budget(item)))
+            if item.get("package_id") or item.get("epic"):
+                print("plan     : fiche %-12s epic : %s" % (
+                    item.get("package_id") or "—", item.get("epic") or "—"))
+            if item.get("state") == "closed":
+                print("fermé    : %s" % ("abandonné" if item.get("close_reason") == "abandoned"
+                                         else "remplacé par #%s" % item.get("superseded_by")))
+            if item.get("pr_ref"):
+                print("PR       : %s" % item["pr_ref"])
+            if item.get("waiting_for"):
+                print("attend   : %s" % item["waiting_for"]["label"])
+            if item.get("stale"):
+                print("STAGNANT : aucune activité depuis %s"
+                      % plan.describe_age(item["stale"]["idle_s"]))
             if item.get("body"):
                 print("corps    : %s" % item["body"])
             print("créé     : %s   maj : %s   fermé : %s" % (
                 _fmt_moment(item.get("created_ts")), _fmt_moment(item.get("updated_ts")),
                 _fmt_moment(item.get("closed_ts"))))
+            if item["delays"]:
+                _print_delays(item["delays"])
             for event in item["events"]:
                 print("  %s  %-14s %-12s %s" % (
                     _fmt_moment(event.get("created_ts")), event["state"],
@@ -390,6 +562,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "note":
             work.note(db, args.id, args.text, actor=args.actor)
             print("note ajoutée au lot #%d" % args.id)
+            return 0
+        if args.work_command == "milestone":
+            row = work.milestone(
+                db, args.id, args.kind, sha=args.sha or "", actor=args.actor or "",
+                verdict=args.verdict, note=args.note or "")
+            print("jalon %s ajouté au lot #%d%s" % (
+                row["kind"], args.id,
+                " (%s)" % row["verdict"] if row.get("verdict") else ""))
             return 0
         print(USAGE_HINT % "sous-commande work inconnue", file=sys.stderr)
         return 2
@@ -525,7 +705,7 @@ def cmd_migrate(cfg: Config, _args: argparse.Namespace) -> int:
 
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
     from . import cli
-    return cli.cmd_doctor(cfg, notify_test=args.notify_test)
+    return cli.cmd_doctor(cfg, notify_test=args.notify_test, probe=args.probe)
 
 
 # --------------------------------------------------------------------------
@@ -558,40 +738,173 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
         fh.write(valeur + "\n")
 
 
+#: clés de `ameesh set` (L13 : model, effort ; L26 : tier, session_policy)
+SET_KEYS = ("model", "effort", "tier", "session_policy")
+#: un tier est un identifiant court (passé tel quel au harnais par son descripteur)
+_TIER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+
 def cmd_set(cfg: Config, args) -> int:
-    """`ameesh set <agent> model=… effort=…` (L13, décision 0019 §1).
+    """`ameesh set <agent> model=… effort=… tier=… session_policy=…` (L13, L26).
 
     Écrit l'état d'exécution : le modèle dans le registre (visible par `list`)
-    et dans l'état local, l'effort dans l'état local. Le tour suivant les lit et
-    les applique ; une valeur vide revient au défaut.
+    et dans l'état local ; l'effort et le tier dans l'état local **et** en base
+    (L26 : `list --json` les rend quel que soit l'hôte) ; la politique de
+    session (`par-lot` | `taille` | `jamais`, décision 0025) en base seulement.
+    Le tour suivant les lit et les applique ; une valeur vide revient au
+    défaut. Le tier n'a d'effet que sur un harnais dont le descripteur le
+    déclare (Codex : `service_tier`).
     """
+    from . import adapters
+    from .config import SESSION_POLICIES
+
     db = db_mod.connect(cfg)
     try:
         db_mod.require_schema(db)
-        if registry.get(db, args.agent) is None:
+        agent = registry.get(db, args.agent)
+        if agent is None:
             print("agent inconnu : %s" % args.agent, file=sys.stderr)
             return 1
         valeurs: dict = {}
         for couple in args.values:
             cle, sep, valeur = couple.partition("=")
-            if not sep or cle not in ("model", "effort"):
-                print("usage : ameesh set <agent> model=… effort=…", file=sys.stderr)
+            valeur = valeur.strip()
+            if not sep or cle not in SET_KEYS:
+                print("usage : ameesh set <agent> model=… effort=… tier=… "
+                      "session_policy=%s" % "|".join(SESSION_POLICIES), file=sys.stderr)
+                return 2
+            if cle == "session_policy" and valeur and valeur not in SESSION_POLICIES:
+                print("session_policy invalide : %r (%s)"
+                      % (valeur, " | ".join(SESSION_POLICIES)), file=sys.stderr)
+                return 2
+            if cle == "tier" and valeur and not _TIER_RE.match(valeur):
+                print("tier invalide : %r (ex. fast, flex)" % valeur, file=sys.stderr)
                 return 2
             valeurs[cle] = valeur
         for cle, valeur in valeurs.items():
-            _ecrit_etat(cfg, args.agent, cle, valeur)
+            if cle in ("model", "effort", "tier"):
+                _ecrit_etat(cfg, args.agent, cle, valeur)
             if cle == "model":
                 if valeur:
                     registry.upsert(db, args.agent, model=valeur)
                 else:
                     storage.of(db).agents.clear_model(args.agent)
-        modele = registry.get(db, args.agent).get("model") or "défaut"
-        effort = _lit_etat(cfg, args.agent, "effort") or "défaut"
-        print("%s : modèle=%s effort=%s (prend effet au prochain tour)"
-              % (args.agent, modele, effort))
+        reglages = {k: v for k, v in valeurs.items() if k != "model"}
+        if reglages:
+            storage.of(db).operations.set_settings(args.agent, reglages)
+        agent = registry.get(db, args.agent) or {}
+        modele = agent.get("model") or "défaut"
+        effort = _lit_etat(cfg, args.agent, "effort") or agent.get("effort") or "défaut"
+        tier = _lit_etat(cfg, args.agent, "tier") or agent.get("tier") or "défaut"
+        politique = agent.get("session_policy") or "défaut (%s)" % cfg.session_policy
+        print("%s : modèle=%s effort=%s tier=%s session=%s (prend effet au prochain tour)"
+              % (args.agent, modele, effort, tier, politique))
+        spec = adapters.SPECS.get(agent.get("harness") or "")
+        if valeurs.get("tier") and (spec is None or not spec.tier_flags):
+            print("attention : le harnais %s ne déclare pas de tier : réglage sans effet"
+                  % (agent.get("harness") or "?"), file=sys.stderr)
         return 0
     finally:
         db.close()
+
+
+def _catalog_store(cfg):
+    db = db_mod.connect(cfg)
+    return db, storage.of(db).catalog
+
+
+def cmd_models_list(cfg, args) -> int:
+    db, store = _catalog_store(cfg)
+    try:
+        rows = store.listing(harness=getattr(args, "harness", None))
+    finally:
+        db.close()
+    if getattr(args, "json", False):
+        print(json.dumps(rows, default=str, ensure_ascii=False))
+        return 0
+    for row in rows:
+        retired = " (retiré)" if row.get("retired_at") else ""
+        harness = row.get("harness") or "-"
+        print(f"{row['provider']}/{row['model_id']}  [{harness}]{retired}")
+    return 0
+
+
+def cmd_models_show(cfg, args) -> int:
+    db, store = _catalog_store(cfg)
+    try:
+        rows = store.show(args.model)
+    finally:
+        db.close()
+    if getattr(args, "json", False):
+        print(json.dumps(rows, default=str, ensure_ascii=False))
+        return 0
+    for row in rows:
+        print(f"{row['provider']}/{row['model_id']}  ctx={row.get('context_window')}  "
+              f"prix={row.get('price_input')}/{row.get('price_cached')}/{row.get('price_output')}  "
+              f"source={row.get('source')}  harnais={row.get('harness') or '-'}  "
+              f"efforts={list(row.get('efforts') or [])}")
+    return 0
+
+
+#: La correspondance entre le vocabulaire de `--source` et les modules de découverte.
+DISCOVERY_SOURCES = {
+    "anthropic": "ameesh.discovery.anthropic",
+    "openai": "ameesh.discovery.openai",
+    "deepseek": "ameesh.discovery.deepseek",
+    "harness": "ameesh.discovery.harness",
+    "prices": "ameesh.discovery.prices",
+}
+
+
+def _source_module(name: str):
+    import importlib
+
+    return importlib.import_module(DISCOVERY_SOURCES[name])
+
+
+def cmd_models_discover(cfg, args) -> int:
+    """Découvre, enregistre, et prévient — sans jamais dépenser un token."""
+    names = [args.source] if getattr(args, "source", None) else list(DISCOVERY_SOURCES)
+    db, store = _catalog_store(cfg)
+    failures = 0
+    try:
+        for name in names:
+            result = _source_module(name).listing()
+            if getattr(args, "dry_run", False):
+                print(f"{name}: {len(result.models)} modèle(s), complet={result.complete} "
+                      f"{result.detail}".rstrip())
+                continue
+            sent: list[dict] = []
+            notify = getattr(args, "notify", None)
+
+            def emit(body: str, payload: dict, _sent=sent, _name=name) -> None:
+                # Le fil de l'équipe est DURABLE dans les deux cas (revue B4) :
+                # `mail.send` dépose un message et l'écrit ; sans destinataire, on
+                # écrit le fil directement, sans inventer de destinataire — mesh-design
+                # a demandé que --notify reste explicite, codex3 que le fil survive.
+                if notify:
+                    mail.send(db, args.sender, notify, body, kind="event", payload=payload,
+                              allow_structured=True)
+                else:
+                    # La cfg de la COMMANDE, pas `db.cfg` : un appelant de test peut
+                    # fournir une base sans configuration, et le fil doit quand même
+                    # s'écrire (sonde B4).
+                    fil.record(
+                        cfg, db, sender=args.sender, recipients=[], text=body,
+                        project=getattr(args, "project", None),
+                        meta={"kind": "event", "source": _name, "payload": payload},
+                    )
+                    print(body)
+                _sent.append({"body": body, "payload": payload})
+
+            decision = catalog.record(store, result, emit=emit)
+            if not result.complete:
+                failures += 1
+            print(f"{name}: {len(result.models)} vu(s), {len(decision.to_retire)} retiré(s)"
+                  + (f", {decision.refused_reason}" if decision.refused_reason else ""))
+    finally:
+        db.close()
+    return 1 if failures and not getattr(args, "dry_run", False) else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -608,6 +921,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.add_argument("agent")
     p_show.add_argument("--json", action="store_true")
     p_show.set_defaults(func=cmd_show)
+
+    p_models = sub.add_parser("models", help="catalogue des modèles (L14)")
+    models_sub = p_models.add_subparsers(dest="models_command")
+
+    p_models_list = models_sub.add_parser("list", help="lister le catalogue")
+    p_models_list.add_argument("--harness")
+    p_models_list.add_argument("--json", action="store_true")
+    p_models_list.set_defaults(func=cmd_models_list)
+
+    p_models_show = models_sub.add_parser("show", help="détail d'un modèle")
+    p_models_show.add_argument("model")
+    p_models_show.add_argument("--json", action="store_true")
+    p_models_show.set_defaults(func=cmd_models_show)
+
+    p_models_discover = models_sub.add_parser("discover", help="découvrir sans dépenser un token")
+    p_models_discover.add_argument("--source", choices=sorted(DISCOVERY_SOURCES))
+    p_models_discover.add_argument("--dry-run", action="store_true")
+    p_models_discover.add_argument("--notify", help="agent à réveiller d'un événement")
+    p_models_discover.add_argument("--sender", default=os.environ.get("AMEESH_AGENT") or "catalogue")
+    p_models_discover.set_defaults(func=cmd_models_discover)
 
     p_key = sub.add_parser("key", help="clés publiques du propriétaire")
     key_sub = p_key.add_subparsers(dest="key_command")
@@ -674,12 +1007,15 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--assignee", default=None)
     pw_add.add_argument("--budget", type=float, default=None)
     pw_add.add_argument("--actor", default="")
+    pw_add.add_argument("--package", default=None, help="fiche WorkPackage du lot (L29)")
     pw_add.set_defaults(func=cmd_work)
     pw_list = work_sub.add_parser("list")
     pw_list.add_argument("--state", default=None)
     pw_list.add_argument("--assignee", default=None)
     pw_list.add_argument("--limit", type=int, default=50)
     pw_list.add_argument("--json", action="store_true")
+    pw_list.add_argument("--stale-after", default=None,
+                         help="lot stagnant sans activité depuis (défaut 6h, L29)")
     pw_list.set_defaults(func=cmd_work)
     pw_show = work_sub.add_parser("show")
     pw_show.add_argument("id", type=int)
@@ -696,6 +1032,21 @@ def build_parser() -> argparse.ArgumentParser:
     pw_note.add_argument("text")
     pw_note.add_argument("--actor", default="")
     pw_note.set_defaults(func=cmd_work)
+    pw_ms = work_sub.add_parser(
+        "milestone", help="déclarer un jalon de la frise (gel, verdict) — R19")
+    pw_ms.add_argument("id", type=int)
+    pw_ms.add_argument("kind", choices=list(work.MANUAL_KINDS),
+                       help="frozen (branche gelée) ou verdict (revue rendue)")
+    pw_ms.add_argument("--sha", default="", help="le commit gelé ou relu")
+    # le verdict est un positionnel (`work milestone 1 verdict ok`), comme la
+    # frise se lit ; `frozen` n'en prend pas
+    pw_ms.add_argument("verdict", nargs="?", choices=list(work.VERDICTS), default=None,
+                       help="pour le jalon verdict : ok ou blocked")
+    pw_ms.add_argument("--note", default="")
+    pw_ms.add_argument("--actor", default="")
+    pw_ms.set_defaults(func=cmd_work)
+    from . import plan_cli
+    plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)
 
     p_cost = sub.add_parser("cost", help="coût des tours et jauges de forfait (L12)")
     cost_sub = p_cost.add_subparsers(dest="cost_command")
@@ -711,11 +1062,49 @@ def build_parser() -> argparse.ArgumentParser:
     pc_over = cost_sub.add_parser("over", help="code 0 si le rythme du forfait est dépassé")
     pc_over.add_argument("agent", nargs="?", default="all")
     pc_over.set_defaults(func=cmd_cost)
+    # L26 : usage par tour, historique des jauges, solde du fournisseur payé au token
+    pc_turns = cost_sub.add_parser("turns", help="usage par tour (in, cached, out, usd)")
+    pc_turns.add_argument("--agent", default=None)
+    pc_turns.add_argument("--since", default="24h", help="durée (16h, 2d) ou date ISO")
+    pc_turns.add_argument("--limit", type=int, default=500)
+    pc_turns.add_argument("--json", action="store_true")
+    pc_turns.set_defaults(func=cmd_cost)
+    pc_gauges = cost_sub.add_parser("gauges", help="historique des jauges de forfait")
+    pc_gauges.add_argument("--harness", default=None)
+    pc_gauges.add_argument("--since", default="7d")
+    pc_gauges.add_argument("--json", action="store_true")
+    pc_gauges.set_defaults(func=cmd_cost)
+    pc_bal = cost_sub.add_parser(
+        "balance", help="solde du fournisseur payé au token, dépense réelle par heure et jour")
+    pc_bal.add_argument("--provider", default=None, help="deepseek (défaut : tous)")
+    pc_bal.add_argument("--record", action="store_true",
+                        help="relever le solde maintenant (lecture seule, gratuite)")
+    pc_bal.add_argument("--since", default="7d")
+    pc_bal.add_argument("--json", action="store_true")
+    pc_bal.set_defaults(func=cmd_cost)
 
-    p_set = sub.add_parser("set", help="modèle/effort d'un agent, effet au prochain tour (L13)")
+    # L30 (0027) : comptes multiples par fournisseur
+    p_acc = sub.add_parser("accounts", help="comptes par fournisseur : actif, jauges, forçage (L30)")
+    acc_sub = p_acc.add_subparsers(dest="accounts_command")
+    pa_list = acc_sub.add_parser("list", help="comptes déclarés, compte actif, jauges, bascules")
+    pa_list.add_argument("--json", action="store_true")
+    pa_list.add_argument("--last", type=int, default=5, help="dernières bascules montrées")
+    pa_list.set_defaults(func=cmd_accounts)
+    pa_use = acc_sub.add_parser("use", help="forcer un compte (plus de bascule automatique)")
+    pa_use.add_argument("harness")
+    pa_use.add_argument("account")
+    pa_use.set_defaults(func=cmd_accounts)
+    pa_auto = acc_sub.add_parser("auto", help="rendre la main à la bascule automatique")
+    pa_auto.add_argument("harness", nargs="?", default=None,
+                         help="harnais (défaut : tous ceux qui ont des comptes)")
+    pa_auto.set_defaults(func=cmd_accounts)
+    p_acc.set_defaults(func=cmd_accounts)
+
+    p_set = sub.add_parser("set", help="réglages d'un agent, effet au prochain tour (L13, L26)")
     p_set.add_argument("agent")
     p_set.add_argument("values", nargs="+", metavar="clé=valeur",
-                       help="model=… effort=… (valeur vide = défaut)")
+                       help="model=… effort=… tier=… session_policy=par-lot|taille|jamais "
+                            "(valeur vide = défaut)")
     p_set.set_defaults(func=cmd_set)
 
     p_imp = sub.add_parser("import-v0", help="importer la boîte fichier v0 dans Postgres")
@@ -734,10 +1123,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_mig.set_defaults(func=cmd_migrate)
     p_doc = sub.add_parser("doctor")
     p_doc.add_argument("--notify-test", action="store_true")
+    p_doc.add_argument("--probe", action="store_true",
+                       help="sonde légère : base, schéma, migrations à jour ; rien d'autre")
     p_doc.set_defaults(func=cmd_doctor)
 
     from . import canon_cli
     canon_cli.add_parsers(sub)
+
+    p_review = sub.add_parser(
+        "review-class", help="classe de revue d'un changement (0018) : léger, normal, sensible")
+    p_review.add_argument("paths", nargs="*", metavar="FICHIER",
+                          help="fichiers à classer, relatifs au dépôt")
+    p_review.add_argument("--diff", default=None, metavar="REF",
+                          help="fichiers changés depuis REF (ref..HEAD + arbre de travail)")
+    canon_cli._canon_options(p_review)
+    p_review.set_defaults(func=cmd_review_class)
     return parser
 
 
@@ -750,25 +1150,214 @@ def cmd_cost(cfg: Config, args) -> int:
     what = getattr(args, "cost_command", None) or "report"
     db = _open(cfg)
     try:
+        if what in ("turns", "gauges", "balance"):
+            return _cost_l26(cfg, db, what, args)
         book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
         if what == "spent":
             seconds = float(getattr(args, "seconds", 3600.0) or 3600.0)
             print("%.4f" % book.spent(getattr(args, "agent", "all") or "all", seconds))
             return 0
         if what == "over":
-            reason = book.over(getattr(args, "agent", "all") or "all")
+            agent = getattr(args, "agent", "all") or "all"
+            harness = book.tool_of(agent) if agent != "all" else ""
+            items = accounts_mod.parse(cfg.accounts).get(harness) if harness else None
+            if items:
+                # L30 : le forfait n'est « dépassé » que si TOUS les comptes sont au seuil
+                now = time.time()
+                evals = [accounts_mod.evaluate(book, p, items, now) for p in items]
+                reason = "" if any(e.ok for e in evals) else (
+                    "tous les comptes %s au seuil — %s" % (harness, " ; ".join(
+                        "%s : %s" % (e.profile.name, e.reason) for e in evals)))
+                reason = reason or book.over(agent, pace=False)
+            else:
+                reason = book.over(agent)
             if reason:
                 print(reason)
                 return 0          # dépassé : c'est le code 0 de la référence
             return 1
-        rows = book.report()
+        # L30 : jauges par compte et compte actif, pour les harnais à comptes
+        try:
+            comptes = accounts_mod.report(cfg, db, book)
+        except accounts_mod.AccountError as exc:
+            print("comptes : configuration invalide : %s" % exc, file=sys.stderr)
+            comptes = []
+        actifs = {}
+        for ligne in comptes:
+            if ligne["active"]:
+                actifs[ligne["harness"]] = (ligne["account"], ligne["_gauges"])
+        rows = book.report(accounts=actifs)
+        for ligne in comptes:
+            ligne.pop("_gauges", None)
+        if comptes:
+            for row in rows:
+                if row["harness"] in actifs:
+                    row["accounts"] = [c for c in comptes if c["harness"] == row["harness"]]
         if getattr(args, "json", False):
             print(json.dumps(rows, indent=2, sort_keys=True, default=str))
         else:
             print(cost_mod.format_report(rows))
+            if comptes:
+                print()
+                print("comptes (hôte %s) :" % cfg.host)
+                print(accounts_mod.format_rows(comptes))
         return 0
     finally:
         db.close()
+
+
+def cmd_accounts(cfg: Config, args) -> int:
+    """`ameesh accounts list|use <harnais> <compte>|auto [harnais]` (L30, 0027).
+
+    Les profils viennent de la configuration de l'hôte ; seul l'état (compte
+    actif, forçage, journal des bascules) est en base. Rien n'affiche de secret :
+    un profil se montre par son type et son emplacement.
+    """
+    what = getattr(args, "accounts_command", None) or "list"
+    declares = accounts_mod.parse(cfg.accounts)  # AccountError -> code 1, message
+    qui = "human:%s" % (os.environ.get("USER") or getpass.getuser())
+    db = _open(cfg)
+    try:
+        if what == "use":
+            items = declares.get(args.harness)
+            if not items:
+                print("aucun compte déclaré pour %s (clé `accounts` de la configuration "
+                      "de l'hôte)" % args.harness, file=sys.stderr)
+                return 1
+            accounts_mod.force(db, cfg.host, args.harness, items, args.account, by=qui)
+            texte = ("Compte %s forcé pour %s sur %s par %s : plus de bascule automatique "
+                     "jusqu'à « ameesh accounts auto »." % (args.account, args.harness,
+                                                            cfg.host, qui))
+            fil.record(cfg, db, sender=qui, recipients=[], text=texte,
+                       meta={"action": "compte", "type": "manuel", "harnais": args.harness,
+                             "vers": args.account, "audit": "accounts"})
+            print(texte)
+            return 0
+        if what == "auto":
+            noms = [args.harness] if args.harness else sorted(declares)
+            for nom in noms:
+                if nom not in declares:
+                    print("aucun compte déclaré pour %s" % nom, file=sys.stderr)
+                    return 1
+                if accounts_mod.automatic(db, cfg.host, nom, by=qui):
+                    texte = ("Comptes %s sur %s : retour en bascule automatique (%s)."
+                             % (nom, cfg.host, qui))
+                    fil.record(cfg, db, sender=qui, recipients=[], text=texte,
+                               meta={"action": "compte", "type": "auto", "harnais": nom,
+                                     "audit": "accounts"})
+                    print(texte)
+                else:
+                    print("comptes %s : déjà en automatique" % nom)
+            return 0
+        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+        rows = accounts_mod.report(cfg, db, book)
+        for row in rows:
+            row.pop("_gauges", None)
+        bascules = storage.of(db).accounts.switches(cfg.host, None, max(0, getattr(args, "last", 5))) \
+            if declares else []
+        if getattr(args, "json", False):
+            print(json.dumps({"schema": "ameesh-accounts/1", "host": cfg.host,
+                              "accounts": rows, "switches": bascules},
+                             ensure_ascii=False, indent=2, default=str))
+            return 0
+        print(accounts_mod.format_rows(rows))
+        if bascules:
+            print()
+            print("dernières bascules :")
+            for b in bascules:
+                print("  %s  %-8s %-7s %s → %s  %s" % (
+                    _fmt_moment(b["at_ts"]), b["harness"], b["kind"],
+                    b["from_account"] or "—", b["to_account"], b["reason"] or ""))
+        return 0
+    finally:
+        db.close()
+
+
+def _since_seconds(text: str) -> float:
+    from . import progress
+    now = time.time()
+    return max(0.0, now - progress.parse_since(text, now))
+
+
+def _cost_l26(cfg: Config, db, what: str, args) -> int:
+    """`cost turns|gauges|balance` (L26) : lectures du grand livre, de
+    l'historique des jauges et des soldes ; le calcul des coûts n'est pas
+    touché. Schémas : docs/EXPLOITATION.md."""
+    ops = storage.of(db).operations
+    if what == "turns":
+        rows = ops.turns(agent=args.agent, since_s=_since_seconds(args.since),
+                         limit=args.limit)
+        if args.json:
+            print(json.dumps({"schema": "ameesh-turns/1", "turns": rows},
+                             ensure_ascii=False, indent=2))
+            return 0
+        print("%-19s %-16s %-9s %10s %10s %9s %10s" % (
+            "QUAND", "AGENT", "HARNAIS", "ENTRÉE", "CACHE", "SORTIE", "USD"))
+        for row in rows:
+            print("%-19s %-16s %-9s %10d %10d %9d %10.4f" % (
+                _fmt_moment(row["recorded_ts"]), row["agent"][:16], row["harness"][:9],
+                row["input_tokens"], row["cached_input_tokens"], row["output_tokens"],
+                row["usd"]))
+        return 0
+    if what == "gauges":
+        # un relevé frais d'abord : la commande lit aussi les journaux locaux de
+        # l'hôte, comme `cost report` (une ligne seulement si la jauge a bougé).
+        # L30 : un harnais à comptes déclarés est relevé compte par compte.
+        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+        declares = accounts_mod.parse(cfg.accounts)
+        accounts_mod.report(cfg, db, book, harnesses=[args.harness] if args.harness else None)
+        for nom in ([args.harness] if args.harness else ["claude", "codex"]):
+            if nom not in declares:
+                book.gauges(nom)
+        rows = ops.gauge_history(since_s=_since_seconds(args.since), harness=args.harness)
+        if args.json:
+            print(json.dumps({"schema": "ameesh-gauges/1", "readings": rows},
+                             ensure_ascii=False, indent=2))
+            return 0
+        for row in rows:
+            print("%s  %-7s %-16s %5.1f%%  remise %s" % (
+                _fmt_moment(row["observed_ts"]),
+                row["harness"] + ("/%s" % row["account"] if row.get("account") else ""),
+                row["key"],
+                float(row["used"]) * 100, _fmt_moment(row.get("resets_at_ts"))))
+        return 0
+    from . import balance as balance_mod
+    names = [args.provider] if args.provider else None
+    if args.provider and args.provider not in balance_mod.SOURCES:
+        print(USAGE_HINT % ("fournisseur sans source de solde : %s (connus : %s)"
+                            % (args.provider, ", ".join(balance_mod.SOURCES))),
+              file=sys.stderr)
+        return 2
+    errors = []
+    if args.record:
+        # L30 : un relevé par compte de clé d'API déclaré
+        for source, compte in balance_mod.account_sources(cfg, names=names):
+            nom = source.provider + ("/%s" % compte if compte else "")
+            if not source.configured():
+                errors.append("%s : clé absente de l'environnement" % nom)
+                continue
+            try:
+                balance_mod.record(db, source, compte)
+            except balance_mod.BalanceError as exc:
+                errors.append("%s : %s" % (nom, exc))
+    rows = ops.balances(provider=args.provider, since_s=_since_seconds(args.since))
+    report = dict(balance_mod.spend(rows), schema="ameesh-balance/1", errors=errors)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        for row in report["latest"]:
+            print("solde %s : %.4f %s (relevé %s)" % (
+                row["provider"] + ("/%s" % row["account"] if row.get("account") else ""),
+                row["total"], row["currency"],
+                _fmt_moment(row["observed_ts"])))
+        for slot in report["daily"]:
+            print("jour  %s  %s %.4f %s" % (slot["start"][:10], slot["provider"],
+                                            slot["spent"], slot["currency"]))
+        for slot in report["hourly"][-24:]:
+            print("heure %s  %s %.4f %s" % (slot["start"][:16], slot["provider"],
+                                            slot["spent"], slot["currency"]))
+        for error in errors:
+            print("erreur : %s" % error, file=sys.stderr)
+    return 1 if errors and args.record and not rows else 0
 
 
 def main(argv: list[str] | None = None) -> int:

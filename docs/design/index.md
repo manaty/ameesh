@@ -6,3 +6,4 @@
 * [Questions ouvertes](questions-ouvertes.md) - Ce qui attend une décision du propriétaire ou une étude.
 * [Décisions du propriétaire](decisions/) - Une décision par fichier, rapportée par mesh-design.
 * [Études](etudes/) - Messagerie, catalogue du travail, autorité humaine, métiers, standards des harnais.
+* [ameesh-approve : trois hébergements](ameesh-approve-hebergement-equipes.md) - Une identité WebAuthn par équipe, trois modes d'hébergement, bascule sans réenrôlement.

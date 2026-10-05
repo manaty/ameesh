@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Profil d'hébergement « cluster » d'ameesh — EXEMPLE (docs/profils/cluster.md).
+#
+# Un agent persistant par StatefulSet (1 réplique). Pour un second agent :
+# copier ce dossier en overlay et changer `nameSuffix`/`namePrefix` (le nom du
+# pod devient l'hôte du canon), ou dupliquer statefulset.yaml.
+#
+#   kubectl kustomize deploy/k8s            # rendu, sans rien appliquer
+#   kubectl apply -k deploy/k8s             # acte de l'exploitant, jamais d'un agent
+#
+# Les Secret ne font PAS partie des ressources : ils sont créés à part (voir
+# secrets.exemple.yaml, jamais rempli dans un dépôt).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# namespace: ameesh            # à décommenter / adapter
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: ameesh
+    includeSelectors: false
+
+resources:
+  - serviceaccount.yaml
+  - service.yaml
+  - networkpolicy.yaml
+  - statefulset.yaml
+
+configMapGenerator:
+  # config.json d'ameesh (AMEESH_CONFIG) : rien de secret dedans
+  - name: ameesh-config
+    files:
+      - config.json
+  # d'où cloner le canon (lecture seule, clé de déploiement en Secret)
+  - name: ameesh-canon
+    literals:
+      - url=git@git.example.invalid:exemple/canon.git
+      - branch=main
+      - fetch-interval=300
+
+images:
+  # image construite depuis le Dockerfile du dépôt, poussée dans VOTRE registre
+  - name: ameesh-runner
+    newName: registry.example.invalid/ameesh-runner
+    newTag: "1.0.0"

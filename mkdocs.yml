@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Documentation site of ameesh (English). Built under /docs/ of the public site;
+# the landing page (site/landing/) is copied at the root by scripts/build-site.sh.
+site_name: ameesh documentation
+site_description: >-
+  ameesh coordinates mixed teams of humans and AI agents across Claude Code,
+  Codex and DeepSeek Harness: canon as code, one runner per host, readable
+  threads, and irreversible actions behind a gate with passkey-signed receipts.
+site_url: https://ameesh.manaty.net/docs/
+repo_url: https://github.com/manaty/ameesh
+repo_name: manaty/ameesh
+edit_uri: ""
+copyright: ameesh is free software, released under AGPL-3.0-only.
+
+docs_dir: site/docs
+site_dir: _site/docs
+
+theme:
+  name: material
+  language: en
+  # No Google Fonts, no external requests: the system font stack is used.
+  font: false
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - navigation.indexes
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: deep orange
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: deep orange
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+extra:
+  # relative: the logo leads to the landing page, also in a local preview
+  homepage: ../
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/manaty/ameesh
+
+extra_css:
+  - assets/extra.css
+
+plugins:
+  - search
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: false
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Overview: index.md
+  - Getting started: getting-started.md
+  - Concepts:
+      - concepts/index.md
+      - The canon: concepts/canon.md
+      - Members, agents, hosts, placements: concepts/members-agents-hosts.md
+      - Runner and leases: concepts/runner-and-leases.md
+      - Sessions: concepts/sessions.md
+      - Readable threads: concepts/threads.md
+      - Actions and the gate: concepts/actions-and-gate.md
+      - Receipts and ameesh-approve: concepts/receipts-and-approve.md
+      - Budgets and cost: concepts/budgets.md
+  - Guides:
+      - guides/index.md
+      - Write a canon: guides/write-a-canon.md
+      - Run the demo: guides/run-the-demo.md
+      - Switch from a v0 setup: guides/switch-from-v0.md
+      - Cluster profile: guides/cluster-profile.md
+      - Progress view: guides/progress-view.md
+      - Model catalogue: guides/model-catalogue.md
+      - Review classes: guides/review-classes.md
+      - Operate agents: guides/operate-agents.md
+      - Host ameesh-approve for a team: guides/host-ameesh-approve.md
+  - Reference:
+      - CLI: reference/cli.md
+      - Configuration: reference/configuration.md
+  - Security model: security.md
+  - Status and roadmap: roadmap.md
+  - Design documents: design.md

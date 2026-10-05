@@ -22,7 +22,7 @@ import json
 import os
 import re
 import socket
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 #: DSN du banc local, **sans mot de passe** : le secret vient de PGPASSWORD ou
 #: de ~/.pgpass, ou d'un DSN complet dans AMEESH_DSN / le fichier de config.
@@ -37,6 +37,8 @@ DEFAULT_V0_CONFIG = "~/.config/agent-mail"
 SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 HARNESSES = ("claude", "codex", "deepseek")
+#: politiques de session d'un agent (décision 0025, L26)
+SESSION_POLICIES = ("par-lot", "taille", "jamais")
 
 #: canaux LISTEN/NOTIFY
 CHANNEL_MAIL = "agent_mail"
@@ -114,6 +116,14 @@ class Config:
     session_max_tokens: float = 150000.0
     session_max_turn_seconds: float = 900.0
     session_min_turns: int = 3
+    #: politique de session par défaut d'un agent sans réglage (0025, L26) :
+    #: `par-lot` (rotation au changement de lot, plus la rotation sur la
+    #: taille), `taille` (rotation sur la taille seulement), `jamais`
+    session_policy: str = "par-lot"
+    #: relevé périodique du solde des fournisseurs payés au token par
+    #: l'exécuteur (secondes, L26) ; 0 = jamais. Sans clé dans
+    #: l'environnement, rien n'est lu.
+    balance_interval: float = 900.0
     #: racines fouillées pour retrouver un dossier de travail déplacé (0018)
     worktree_roots: tuple[str, ...] = (_expand("~/development"),)
     #: racine des fils lisibles (transport `file`) ; vide = `<state_dir>/fils`
@@ -137,9 +147,24 @@ class Config:
     #: ameesh-approve (spec §9), côté client : URL de son API de service
     #: (AMEESH_APPROVE_URL ; https, ou http sur la boucle locale seulement) et
     #: fichier 0600 du jeton de service (AMEESH_APPROVE_TOKEN_FILE). Vides : pas
-    #: de demande d'approbation par ameesh (`ameesh action request`)
+    #: de demande d'approbation par ameesh (`ameesh action request`).
+    #: `approve_url` est l'adresse MACHINE de l'API, distincte de la
+    #: `public_url` des pages humaines du service (lot L27) : boucle locale,
+    #: accès privé, ou l'hôte public si le service l'ouvre explicitement
+    #: (`api_via_public` dans son JSON). Elle ne règle aucune confiance : le
+    #: RP ID et les origines des vérificateurs restent AMEESH_APPROVE_RP_ID et
+    #: AMEESH_APPROVE_ORIGINS (contrôle : `ameesh approve-check`).
     approve_url: str = ""
     approve_token_file: str = ""
+    #: TLS local du service (passthrough) appelé sur la boucle locale :
+    #: `approve_url` = https://127.0.0.1:PORT, certificat vérifié pour CE nom
+    #: d'hôte H (AMEESH_APPROVE_TLS_NAME) ; vide = nom de l'URL
+    approve_tls_name: str = ""
+    #: comptes multiples par fournisseur (L30, décision 0027) : la clé
+    #: `accounts` du fichier de configuration de l'HÔTE, telle quelle
+    #: (`{harnais: [profil, …]}`), validée par `ameesh.accounts`. Ce sont des
+    #: secrets d'hôte : jamais dans le canon, jamais en base.
+    accounts: dict = field(default_factory=dict)
 
     @property
     def responsible_required(self) -> bool:
@@ -254,6 +279,9 @@ def load(env: dict | None = None) -> Config:
         session_min_turns=int(_as_float(
             pick("AMEESH_SESSION_MIN_TURNS", "AGENT_MESH_SESSION_MIN_TURNS"),
             cfg.session_min_turns)),
+        session_policy=str(pick("AMEESH_SESSION_POLICY", default=cfg.session_policy)
+                           or "par-lot").strip(),
+        balance_interval=_as_float(pick("AMEESH_BALANCE_INTERVAL"), cfg.balance_interval),
         worktree_roots=tuple(
             _expand(n) for n in _as_names(
                 pick("AMEESH_WORKTREE_ROOTS", "AGENT_MESH_WORKTREE_ROOTS"))
@@ -280,11 +308,16 @@ def load(env: dict | None = None) -> Config:
         cfg,
         approve_url=str(pick("AMEESH_APPROVE_URL", default=cfg.approve_url) or "").strip(),
         approve_token_file=_expand(str(token_file)) if token_file else "",
+        approve_tls_name=str(pick("AMEESH_APPROVE_TLS_NAME", default=cfg.approve_tls_name)
+                             or "").strip().lower(),
     )
     if cfg.canon_ref.startswith("-"):
         raise SystemExit("AMEESH_CANON_REF invalide : %r" % cfg.canon_ref)
     if not SCHEMA_RE.match(cfg.schema):
         raise SystemExit("AGENT_MESH_SCHEMA invalide : %r" % cfg.schema)
+    if cfg.session_policy not in SESSION_POLICIES:
+        raise SystemExit("AMEESH_SESSION_POLICY invalide : %r (%s)"
+                         % (cfg.session_policy, " | ".join(SESSION_POLICIES)))
     if cfg.driver not in ("auto", "psycopg", "psql"):
         raise SystemExit("AGENT_MESH_DRIVER invalide : %r" % cfg.driver)
     if cfg.backend not in ("auto", "pg", "file"):

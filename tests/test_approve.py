@@ -1146,13 +1146,21 @@ class ApproveConfigTest(unittest.TestCase):
                 with self.assertRaises(approve_config.ApproveConfigError):
                     self.config(**overrides)
         self.assertEqual(self.config(bind="::1").bind, "::1")
+        # plusieurs origines, sous-domaine, préfixe de chemin : profil
+        # « compatible » seulement, et explicite (lot L27)
         cfg = self.config(origins=("https://approve.example.test",
-                                   "https://m.approve.example.test:8443"))
+                                   "https://m.approve.example.test:8443"),
+                          profile="compatible")
         self.assertEqual(cfg.public_hosts, frozenset({
             "approve.example.test", "approve.example.test:443",
             "m.approve.example.test:8443"}))
-        self.assertEqual(self.config(public_url=ORIGIN + "/approve/").base_url,
-                         ORIGIN + "/approve")
+        self.assertEqual(self.config(public_url=ORIGIN + "/approve/",
+                                     profile="compatible").base_url, ORIGIN + "/approve")
+        for overrides in (dict(origins=("https://approve.example.test",
+                                        "https://m.approve.example.test:8443")),
+                          dict(public_url=ORIGIN + "/approve/")):
+            with self.assertRaisesRegex(approve_config.ApproveConfigError, "profil strict"):
+                self.config(**overrides)
 
     def test_resume_stable_et_visible(self):
         action = normalize_action(make_action(target="a\u202eb\nc", args={"k": "\u2028"}))

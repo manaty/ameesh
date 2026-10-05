@@ -4,8 +4,11 @@
   ameesh-approve serve [--config F] [--rp-id R] [--origin O]… [--public-url U]
                        [--bind 127.0.0.1] [--port 8765] [--token-file F]
                        [--state-dir D] [--proposals-dir D] [--level standard|eleve]
-        lance le service sur la boucle locale (HTTPS assuré par le mandataire,
-        page Nexlink) ;
+                       [--profile strict|compatible] [--tls-cert F --tls-key F]
+        lance le service sur la boucle locale : HTTP derrière un mandataire
+        HTTPS, ou TLS local (--tls-cert/--tls-key) derrière une passerelle en
+        passthrough ; le certificat est relu quand il change (et sur SIGHUP) ;
+        profil strict par défaut (RP ID = hôte de l'unique origine https) ;
   ameesh-approve enroll-link --approver human:ID [--ttl S] [options de config]
         crée un lien d'enrôlement à usage unique (à ouvrir SUR LE TÉLÉPHONE) ;
         la passkey créée devient une PROPOSITION de canon, active après PR revue ;
@@ -21,6 +24,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import sys
 import threading
 import time
@@ -40,6 +44,9 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--state-dir", default=None)
     parser.add_argument("--proposals-dir", default=None)
     parser.add_argument("--level", default=None, choices=["standard", "eleve"])
+    parser.add_argument("--profile", default=None, choices=list(config_mod.PROFILES),
+                        help="strict (défaut : RP ID = hôte de l'unique origine) | "
+                             "compatible (essais locaux, explicite)")
 
 
 def _config(args: argparse.Namespace, **extra) -> config_mod.ApproveConfig:
@@ -47,6 +54,7 @@ def _config(args: argparse.Namespace, **extra) -> config_mod.ApproveConfig:
         "rp_id": args.rp_id, "origins": tuple(args.origin) or None,
         "public_url": args.public_url, "state_dir": args.state_dir,
         "proposals_dir": args.proposals_dir, "level": args.level,
+        "profile": args.profile,
     }
     overrides.update(extra)
     return config_mod.load(path=args.config, overrides=overrides)
@@ -57,8 +65,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from .service import ApproveService
     from .sources import ActionSourceError, DbActionSource
 
-    cfg = _config(args, bind=args.bind, port=args.port, token_file=args.token_file)
+    cfg = _config(args, bind=args.bind, port=args.port, token_file=args.token_file,
+                  tls_cert=args.tls_cert, tls_key=args.tls_key)
     token = config_mod.read_service_token(cfg.token_file)
+    tls = None
+    if cfg.tls:
+        from .tls import TlsReloader
+        tls = TlsReloader(cfg.tls_cert, cfg.tls_key,
+                          workdir=config_mod.ensure_private_dir(cfg.state_dir))
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s ameesh-approve %(levelname)s %(message)s")
     db = db_mod.connect(ameesh_config.load())
@@ -72,11 +86,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
             print("attention : %s — POST /requests répondra 503 tant qu'elle manque" % exc,
                   file=sys.stderr)
         service = ApproveService(cfg, db, source, service_token=token, db_lock=lock)
-        server = make_server(service)
+        server = make_server(service, tls=tls)
+        if tls is not None and hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, lambda _sig, _frame: tls.request_reload())
         host, port = server.server_address[:2]
-        print("ameesh-approve écoute sur http://%s:%d — RP ID %s, origines %s, état %s"
-              % (host if ":" not in host else "[%s]" % host, port, cfg.rp_id,
-                 ", ".join(cfg.origins), cfg.state_dir), file=sys.stderr)
+        print("ameesh-approve écoute sur %s://%s:%d — profil %s, RP ID %s, origines %s, "
+              "API de service %s, état %s"
+              % ("https" if tls is not None else "http",
+                 host if ":" not in host else "[%s]" % host, port, cfg.profile, cfg.rp_id,
+                 ", ".join(cfg.origins),
+                 "AUSSI sous l'hôte public (api_via_public)" if cfg.api_via_public
+                 else "sur la boucle locale seulement", cfg.state_dir), file=sys.stderr)
         try:
             server.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:
@@ -129,6 +149,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--bind", default=None, help="adresse de boucle locale")
     p_serve.add_argument("--port", type=int, default=None)
     p_serve.add_argument("--token-file", default=None)
+    p_serve.add_argument("--tls-cert", default=None,
+                         help="TLS local (passthrough) : certificat PEM de l'hôte, fichier "
+                              "privé 0600 de l'utilisateur du service")
+    p_serve.add_argument("--tls-key", default=None,
+                         help="TLS local : clé privée PEM, fichier privé 0600")
     p_serve.set_defaults(func=cmd_serve)
 
     p_enroll = sub.add_parser("enroll-link", help="lien d'enrôlement à usage unique")

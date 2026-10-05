@@ -1,0 +1,396 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Vue de référence d'ameesh progress (L24, décision 0024) : page statique
+     autonome, sans ressource réseau. Les données (schéma ameesh-progress/1)
+     sont embarquées plus bas par `ameesh progress --html`. -->
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:">
+<meta name="referrer" content="no-referrer">
+<title>Avancement ameesh</title>
+<style>
+:root {
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #6f6d68;
+  --grid: #e1e0d9; --axis: #c3c2b7;
+  --phase-build: #2a78d6; --phase-review: #eb6834; --phase-merge: #1baf7a;
+  --good: #0ca30c; --warning: #b57a00; --critical: #d03b3b; --neutral: #898781;
+  --now: #0b0b0b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #a3a29b;
+    --grid: #2c2c2a; --axis: #383835;
+    --phase-build: #3987e5; --phase-review: #d95926; --phase-merge: #199e70;
+    --good: #0ca30c; --warning: #fab219; --critical: #e66767; --neutral: #898781;
+    --now: #ffffff;
+  }
+}
+:root[data-theme="dark"] {
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #a3a29b;
+  --grid: #2c2c2a; --axis: #383835;
+  --phase-build: #3987e5; --phase-review: #d95926; --phase-merge: #199e70;
+  --good: #0ca30c; --warning: #fab219; --critical: #e66767; --neutral: #898781;
+  --now: #ffffff;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--page); color: var(--ink);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+main { max-width: 980px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 1.25rem; margin: 0 0 2px; }
+h2 { font-size: 1rem; margin: 0 0 10px; letter-spacing: .02em; }
+.sub { color: var(--ink-2); font-size: .85rem; }
+section { background: var(--surface); border: 1px solid var(--grid); border-radius: 10px;
+          padding: 14px; margin-top: 14px; }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: .8rem; color: var(--ink-2);
+          margin-bottom: 10px; }
+.legend i { display: inline-block; width: 14px; height: 8px; border-radius: 2px;
+            margin-right: 5px; vertical-align: middle; }
+.axis { position: relative; height: 18px; margin-left: 0; font-size: .7rem; color: var(--muted); }
+.axis span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+.lot { border-top: 1px solid var(--grid); padding: 8px 0; }
+.lot:first-of-type { border-top: 0; }
+.lot-head { display: flex; gap: 8px; align-items: baseline; cursor: pointer;
+            background: none; border: 0; padding: 0; color: inherit; font: inherit;
+            width: 100%; text-align: left; }
+.lot-id { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+.lot-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip { flex: none; font-size: .72rem; padding: 1px 7px; border-radius: 9px;
+        border: 1px solid currentColor; white-space: nowrap; }
+.st-active { color: var(--phase-build); } .st-review { color: var(--warning); }
+.st-blocked { color: var(--critical); } .st-approved { color: var(--good); }
+.st-merged { color: var(--neutral); } .st-closed { color: var(--neutral); }
+.st-stale { color: var(--warning); border-style: dashed; }
+.seg.stale { background: repeating-linear-gradient(90deg, var(--neutral) 0 3px, transparent 3px 7px) !important; opacity: .7; }
+.waiting { color: var(--ink-2); font-size: .8rem; margin-top: 3px; }
+.epic { border-top: 1px solid var(--grid); padding: 8px 0; }
+.epic:first-of-type { border-top: 0; }
+.epic .bar { position: relative; height: 8px; background: var(--grid); border-radius: 4px; margin-top: 4px; }
+.epic .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; background: var(--phase-merge); }
+.st-working { color: var(--good); } .st-idle { color: var(--neutral); }
+.st-paused { color: var(--warning); } .st-stopped { color: var(--critical); }
+.track { position: relative; height: 14px; margin-top: 6px; }
+.tick { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--grid); }
+.seg { position: absolute; top: 3px; height: 8px; }
+.seg + .seg { border-left: 2px solid var(--surface); }
+.seg.first { border-radius: 4px 0 0 4px; } .seg.last { border-radius: 0 4px 4px 0; }
+.seg.first.last { border-radius: 4px; }
+.seg.open { opacity: .55; }
+.mark { position: absolute; top: 0; width: 2px; height: 14px; background: var(--ink); }
+.nowline { position: absolute; top: -2px; bottom: -2px; width: 0;
+           border-left: 1px dashed var(--now); opacity: .6; }
+.lot-detail { display: none; font-size: .8rem; color: var(--ink-2); margin-top: 6px; }
+.lot.open .lot-detail { display: block; }
+.lot-detail dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 10px; margin: 0; }
+.lot-detail dt { color: var(--muted); }
+.lot-detail dd { margin: 0; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+.card { border: 1px solid var(--grid); border-radius: 8px; padding: 10px; min-width: 0; }
+.card-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.card-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.meta { color: var(--ink-2); font-size: .8rem; }
+.task { font-size: .82rem; margin-top: 4px; overflow-wrap: anywhere; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+.tile .v { font-size: 1.35rem; font-variant-numeric: tabular-nums; }
+.tile .l { color: var(--ink-2); font-size: .78rem; }
+.gauge { margin-top: 12px; }
+.gauge .bar { position: relative; height: 10px; background: var(--grid); border-radius: 5px; margin-top: 4px; }
+.gauge .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; background: var(--phase-build); }
+.gauge .fill.over { background: var(--critical); }
+.gauge .cap { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--ink); }
+table { border-collapse: collapse; width: 100%; font-size: .8rem; margin-top: 10px; }
+th, td { text-align: left; padding: 4px 6px; border-top: 1px solid var(--grid); }
+th { color: var(--muted); font-weight: 500; }
+td.n { text-align: right; font-variant-numeric: tabular-nums; }
+.table-wrap { overflow-x: auto; }
+.empty { color: var(--muted); font-size: .85rem; }
+.trunc { color: var(--warning); font-size: .85rem; margin: 0 0 8px; }
+ul.missing { color: var(--ink-2); font-size: .8rem; padding-left: 18px; margin: 0; }
+footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Avancement</h1>
+  <div class="sub" id="when"></div>
+
+  <section aria-labelledby="h-lots">
+    <h2 id="h-lots">Lots</h2>
+    <div class="legend" aria-hidden="true">
+      <span><i style="background:var(--phase-build)"></i>demande → gel</span>
+      <span><i style="background:var(--phase-review)"></i>gel → verdict (revue)</span>
+      <span><i style="background:var(--phase-merge)"></i>verdict → fusion</span>
+      <span><i style="background:var(--ink);width:2px;height:12px"></i>jalon</span>
+    </div>
+    <div class="axis" id="axis" aria-hidden="true"></div>
+    <div id="lots"></div>
+  </section>
+
+  <section aria-labelledby="h-epics">
+    <h2 id="h-epics">Epics</h2>
+    <div id="epics"></div>
+  </section>
+
+  <section aria-labelledby="h-agents">
+    <h2 id="h-agents">Agents</h2>
+    <div class="cards" id="agents"></div>
+  </section>
+
+  <section aria-labelledby="h-ms">
+    <h2 id="h-ms">Jalons du projet</h2>
+    <div id="milestones"></div>
+  </section>
+
+  <section aria-labelledby="h-budget">
+    <h2 id="h-budget">Budget</h2>
+    <div class="tiles" id="spend"></div>
+    <div id="plans"></div>
+    <div class="table-wrap" id="byagent"></div>
+  </section>
+
+  <section aria-labelledby="h-missing">
+    <h2 id="h-missing">Données manquantes</h2>
+    <ul class="missing" id="missing"></ul>
+  </section>
+
+  <footer id="foot"></footer>
+</main>
+
+<script type="application/json" id="data">/*__AMEESH_PROGRESS_DATA__*/null</script>
+<script>
+"use strict";
+(function () {
+  var D = JSON.parse(document.getElementById("data").textContent || "null");
+  if (!D || D.schema !== "ameesh-progress/1") {
+    document.getElementById("when").textContent = "données absentes ou schéma inconnu";
+    return;
+  }
+  var LOT_FR = {active: "actif", review: "en revue", blocked: "bloqué", approved: "approuvé", merged: "fusionné", closed: "fermé"};
+  var LOT_ICON = {active: "▶", review: "◐", blocked: "■", approved: "✓", merged: "●", closed: "✕"};
+  var AG_FR = {working: "travaille", idle: "repos", paused: "pause", stopped: "arrêt"};
+  var AG_ICON = {working: "▶", idle: "○", paused: "‖", stopped: "■"};
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    return e;
+  }
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
+  function hm(ts) {
+    if (!ts) return "—";
+    var d = new Date(ts * 1000), now = new Date(D.generated_ts * 1000);
+    var t = pad(d.getHours()) + ":" + pad(d.getMinutes());
+    return d.toDateString() === now.toDateString() ? t : pad(d.getDate()) + "/" + pad(d.getMonth() + 1) + " " + t;
+  }
+  function dur(s) {
+    if (s === null || s === undefined) return "?";
+    s = Math.max(0, Math.floor(s));
+    if (s < 60) return s + " s";
+    if (s < 3600) return Math.floor(s / 60) + " min";
+    if (s < 86400) { var mn = Math.floor((s % 3600) / 60); return Math.floor(s / 3600) + " h" + (mn ? " " + pad(mn) : ""); }
+    return Math.floor(s / 86400) + " j " + Math.floor((s % 86400) / 3600) + " h";
+  }
+  function usd(v) { return (v || 0).toFixed(2) + " $"; }
+  function chip(state, fr, icon) { return el("span", "chip st-" + state, (icon[state] || "") + " " + (fr[state] || state)); }
+
+  var from = D.window.from_ts, to = D.window.to_ts, span = Math.max(1, to - from);
+  function pct(ts) { return Math.min(100, Math.max(0, (ts - from) / span * 100)); }
+
+  document.getElementById("title").textContent = "Avancement" + (D.project ? " — " + D.project : "");
+  document.getElementById("when").textContent =
+    "instantané " + hm(D.generated_ts) + " · fenêtre " + dur(span) + (D.host ? " · hôte " + D.host : "");
+  document.getElementById("foot").textContent =
+    D.schema + " · généré " + D.generated_at + " · page statique, aucune ressource réseau";
+
+  // Axe : repères à l'heure locale ronde (ou au jour au-delà de 48 h), assez
+  // espacés pour la largeur réelle (téléphone compris) ; une étiquette porte
+  // l'heure, et la date seulement à minuit ou pour un pas d'un jour et plus.
+  var axis = document.getElementById("axis");
+  var maxLabels = Math.max(2, Math.floor((axis.clientWidth || 320) / 64));
+  var steps = [3600, 2 * 3600, 3 * 3600, 6 * 3600, 12 * 3600, 86400, 2 * 86400, 7 * 86400];
+  var step = steps[steps.length - 1];
+  for (var i = 0; i < steps.length; i++) { if (span / steps[i] <= maxLabels) { step = steps[i]; break; } }
+  var ticks = [], c = new Date(from * 1000);
+  c.setMinutes(0, 0, 0);
+  if (step >= 86400) c.setHours(0);
+  while (c.getTime() / 1000 <= to) {
+    var ts = c.getTime() / 1000;
+    var aligned = step >= 86400 ? true : (c.getHours() * 3600) % step === 0;
+    if (ts >= from && aligned) ticks.push(ts);
+    c.setHours(c.getHours() + (step >= 86400 ? 24 * Math.round(step / 86400) : 1));
+  }
+  ticks.forEach(function (ts) {
+    var d = new Date(ts * 1000);
+    var txt = (step >= 86400 || (d.getHours() === 0 && d.getMinutes() === 0))
+      ? pad(d.getDate()) + "/" + pad(d.getMonth() + 1) : pad(d.getHours()) + ":00";
+    var s = el("span", null, txt); s.style.left = pct(ts) + "%"; axis.appendChild(s);
+  });
+  function addTicks(track) {
+    ticks.forEach(function (ts) { var g = el("div", "tick"); g.style.left = pct(ts) + "%"; track.appendChild(g); });
+  }
+
+  // Lots
+  var lotsBox = document.getElementById("lots");
+  var cutLabels = {lots: "lots", actions: "actions"};
+  Object.keys(D.truncated || {}).forEach(function (k) {
+    var c = D.truncated[k];
+    lotsBox.appendChild(el("p", "trunc", "⚠ Tronqué : " + c.shown + " " + (cutLabels[k] || k)
+      + " affichés sur " + c.total + " (borne " + c.limit + ")."));
+  });
+  if (!D.lots.length) lotsBox.appendChild(el("p", "empty", "Aucun lot dans la fenêtre."));
+  D.lots.forEach(function (lot) {
+    var m = lot.milestones, row = el("div", "lot");
+    var head = el("button", "lot-head");
+    head.type = "button";
+    head.setAttribute("aria-expanded", "false");
+    head.appendChild(el("span", "lot-id", "#" + lot.id));
+    head.appendChild(el("span", "lot-title", lot.title + (lot.epic ? " [" + lot.epic + "]" : "")));
+    if (lot.stale) head.appendChild(el("span", "chip st-stale", "‖ stagnant " + dur(lot.stale.idle_s)));
+    if (lot.closed) head.appendChild(el("span", "chip st-closed", lot.closed.reason === "abandoned"
+      ? "✕ abandonné" : "✕ remplacé par #" + lot.closed.superseded_by));
+    else head.appendChild(chip(lot.state, LOT_FR, LOT_ICON));
+    head.addEventListener("click", function () {
+      row.classList.toggle("open");
+      head.setAttribute("aria-expanded", row.classList.contains("open") ? "true" : "false");
+    });
+    row.appendChild(head);
+    if (lot.waiting_for) row.appendChild(el("div", "waiting", "attend : " + lot.waiting_for.label));
+
+    var track = el("div", "track");
+    addTicks(track);
+    track.setAttribute("role", "img");
+    // un lot stagnant n'est pas dessiné actif jusqu'à maintenant : sa barre
+    // s'arrête à sa dernière activité, puis un pointillé neutre ; un lot fermé
+    // s'arrête à sa fermeture
+    var end = m.merged || (lot.closed && lot.closed.at_ts) || (lot.stale && lot.stale.since_ts) || to;
+    // demande → gel → verdict → fusion ; après un verdict bloquant, le lot
+    // repart en construction jusqu'à la fin de la barre.
+    var bounds = [
+      ["phase-build", m.requested, m.frozen || m.verdict || end],
+      ["phase-review", m.frozen, m.verdict || end],
+      [lot.verdict === "blocked" ? "phase-build" : "phase-merge", m.verdict, end]
+    ].filter(function (b) { return b[1] && b[2] && b[2] >= b[1] && b[2] > from; });
+    bounds.forEach(function (b, i) {
+      var a = pct(b[1]), z = pct(b[2]);
+      if (z - a <= 0) return;
+      var seg = el("div", "seg" + (i === 0 ? " first" : "") + (i === bounds.length - 1 ? " last" : "")
+                         + (!m.merged && !lot.closed && !lot.stale && i === bounds.length - 1 ? " open" : ""));
+      seg.style.left = a + "%"; seg.style.width = (z - a) + "%";
+      seg.style.background = "var(--" + b[0] + ")";
+      track.appendChild(seg);
+    });
+    if (lot.stale && lot.stale.since_ts < to) {
+      var sa = pct(Math.max(from, lot.stale.since_ts)), sz = pct(to);
+      if (sz > sa) { var ss = el("div", "seg stale"); ss.style.left = sa + "%"; ss.style.width = (sz - sa) + "%"; track.appendChild(ss); }
+    }
+    [m.frozen, m.verdict, m.merged].forEach(function (ts) {
+      if (ts && ts >= from) { var k = el("div", "mark"); k.style.left = "calc(" + pct(ts) + "% - 1px)"; track.appendChild(k); }
+    });
+    var nl = el("div", "nowline"); nl.style.left = "100%"; track.appendChild(nl);
+    track.setAttribute("aria-label", "demande " + hm(m.requested) + ", gel " + hm(m.frozen)
+      + ", verdict " + hm(m.verdict) + ", fusion " + hm(m.merged));
+    row.appendChild(track);
+
+    var det = el("div", "lot-detail"), dl = el("dl");
+    function add(k, v) { if (v === null || v === undefined || v === "") return; dl.appendChild(el("dt", null, k)); dl.appendChild(el("dd", null, v)); }
+    add("demande", hm(m.requested)); add("gel", hm(m.frozen));
+    add("verdict", hm(m.verdict) + (lot.verdict ? " (" + lot.verdict + ")" : ""));
+    add("fusion", hm(m.merged));
+    add("état du lot", lot.work_state);
+    if (lot.waiting_for) add("attend", lot.waiting_for.label);
+    if (lot.stale) add("stagnant depuis", hm(lot.stale.since_ts) + " (" + dur(lot.stale.idle_s) + ")");
+    add("epic", lot.epic); add("fiche", lot.package); add("PR", lot.pr_ref);
+    add("auteur", lot.assignee); add("revue", lot.reviewer);
+    add("verdicts bloquants", lot.blocked_verdicts === null ? "inconnu" : lot.blocked_verdicts);
+    add("mises en attente", lot.blocks);
+    add("projet", lot.project); add("ticket", lot.issue_ref);
+    if (lot.actions && lot.actions.length) add("actions", lot.actions.join(", "));
+    det.appendChild(dl); row.appendChild(det);
+    lotsBox.appendChild(row);
+  });
+
+  // Epics (L29)
+  var epBox = document.getElementById("epics");
+  var epics = D.epics || [];
+  if (!epics.length) epBox.appendChild(el("p", "empty", "Aucun epic déclaré au canon."));
+  epics.forEach(function (e) {
+    var row = el("div", "epic"), counted = e.lots_total - e.lots_abandoned;
+    row.appendChild(el("div", null, e.id + " — " + (e.title || "") + " : " + e.lots_merged + "/" + counted
+      + " lots fusionnés" + (e.lots_abandoned ? " (" + e.lots_abandoned + " abandonné(s))" : "")));
+    var bar = el("div", "bar"), fill = el("div", "fill");
+    fill.style.width = (counted ? Math.round(e.lots_merged / counted * 100) : 0) + "%";
+    bar.appendChild(fill); row.appendChild(bar);
+    bar.setAttribute("role", "img");
+    bar.setAttribute("aria-label", e.lots_merged + " sur " + counted + " lots fusionnés");
+    epBox.appendChild(row);
+  });
+
+  // Agents
+  var agBox = document.getElementById("agents");
+  if (!D.agents.length) agBox.appendChild(el("p", "empty", "Aucun agent."));
+  D.agents.forEach(function (a) {
+    var c = el("div", "card"), h = el("div", "card-head");
+    h.appendChild(el("span", "card-name", a.name));
+    h.appendChild(chip(a.state, AG_FR, AG_ICON));
+    c.appendChild(h);
+    c.appendChild(el("div", "meta", [a.harness || "?", a.model || "modèle par défaut",
+      "effort " + (a.effort || "défaut")].join(" · ")));
+    if (a.since_ts) c.appendChild(el("div", "meta", (a.state === "working" ? "tour depuis " : "depuis ") + dur(D.generated_ts - a.since_ts)));
+    if (a.turn) c.appendChild(el("div", "task", a.turn.task || a.turn.label || "tour en cours"));
+    else if ((a.state === "paused" || a.state === "stopped") && a.status_text) c.appendChild(el("div", "task", a.status_text));
+    if (a.unread) c.appendChild(el("div", "meta", a.unread + " message(s) non lu(s)"));
+    agBox.appendChild(c);
+  });
+
+  // Jalons du projet
+  var msBox = document.getElementById("milestones");
+  if (!D.milestones.length) msBox.appendChild(el("p", "empty", "Aucun jalon déclaré au canon."));
+  D.milestones.forEach(function (ms) {
+    var counted = (ms.lots_total || 0) - (ms.lots_abandoned || 0);
+    msBox.appendChild(el("div", null, (ms.at_ts ? hm(ms.at_ts) : "sans date") + " — " + (ms.title || "")
+      + (ms.lots_total !== undefined ? " : " + ms.lots_merged + "/" + counted + " lots fusionnés" : "")));
+  });
+
+  // Budget
+  var B = D.budget, sp = document.getElementById("spend");
+  [["payé au token, 1 h", B.spend["1h"].paid_usd], ["payé au token, 24 h", B.spend["24h"].paid_usd],
+   ["plafond horaire", B.hourly_cap_usd], ["total estimé, fenêtre", B.spend.window.total_usd]]
+    .forEach(function (p) { var t = el("div", "tile"); t.appendChild(el("div", "v", usd(p[1]))); t.appendChild(el("div", "l", p[0])); sp.appendChild(t); });
+  var plans = document.getElementById("plans");
+  if (!B.plans.length) plans.appendChild(el("p", "empty", "Aucune jauge de forfait lue sur cet hôte."));
+  B.plans.forEach(function (p) {
+    var g = el("div", "gauge");
+    g.appendChild(el("div", "meta", "forfait " + p.harness + " " + p.key + " : " + Math.round(p.used * 100)
+      + " % utilisé, rythme " + Math.round(p.pace_cap * 100) + " %" + (p.exceeded ? " — dépassé" : "")
+      + (p.resets_ts ? " · remise à zéro " + hm(p.resets_ts) : "")));
+    var bar = el("div", "bar"), f = el("div", "fill" + (p.exceeded ? " over" : ""));
+    f.style.width = Math.min(100, p.used * 100) + "%"; bar.appendChild(f);
+    var cap = el("div", "cap"); cap.style.left = "calc(" + Math.min(100, p.pace_cap * 100) + "% - 1px)"; bar.appendChild(cap);
+    g.appendChild(bar); plans.appendChild(g);
+  });
+  if (B.by_agent.length) {
+    var tb = el("table"), tr = el("tr");
+    ["agent", "harnais", "modèle", "tours", "USD", "jetons sortie"].forEach(function (h) { tr.appendChild(el("th", null, h)); });
+    tb.appendChild(tr);
+    B.by_agent.forEach(function (r) {
+      var x = el("tr");
+      x.appendChild(el("td", null, r.agent)); x.appendChild(el("td", null, r.harness + (r.paid ? " (payé)" : "")));
+      x.appendChild(el("td", null, r.model || "—")); x.appendChild(el("td", "n", r.turns));
+      x.appendChild(el("td", "n", r.usd.toFixed(4))); x.appendChild(el("td", "n", r.output_tokens));
+      tb.appendChild(x);
+    });
+    document.getElementById("byagent").appendChild(tb);
+  }
+
+  var miss = document.getElementById("missing");
+  (D.missing || []).forEach(function (t) { miss.appendChild(el("li", null, t)); });
+})();
+</script>
+</body>
+</html>

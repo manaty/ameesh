@@ -43,6 +43,11 @@ export AMEESH_GH_BIN="$REPO/tests/fakebin/gh"
 export AMEESH_FAKE_GH_STATE="$WORK/gh-etat.json" AMEESH_FAKE_GH_LOG="$WORK/gh-journal.jsonl"
 export AMEESH_CANON="$WORK/canon/acme" AMEESH_HOST=atelier
 export AMEESH_HUMANS=alice,bruno
+# jauges de forfait isolées, comme dans les tests : la garde de budget reste
+# active, mais elle lit un CODEX_HOME vide (effacé avec le dossier de travail),
+# jamais les journaux réels du poste (~/.codex) — un forfait réel avancé
+# mettrait sinon en pause les agents factices
+export CODEX_HOME="$(mktemp -d "$WORK/codex-home.XXXXXX")"
 export AMEESH_APPROVE_RP_ID=approve.example.test
 export AMEESH_APPROVE_ORIGINS=https://approve.example.test
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
@@ -145,8 +150,10 @@ lance ameesh canon check
 # ===========================================================================
 etape "2. Du canon vers le registre de l'hôte atelier"
 note "obligatoire sur chaque hôte avant toute réclamation : sans état « ok » du canon,"
-note "aucun agent du canon n'est réclamable (fail closed)"
-lance ameesh canon sync
+note "aucun agent du canon n'est réclamable (fail closed) ; la première fois, la branche"
+note "canonique de confiance du registre des authentificateurs est donnée par --bootstrap-ref"
+note "(journalisé, ignoré ensuite : les sync suivants partent du dernier commit appliqué)"
+lance ameesh canon sync --bootstrap-ref main
 lance ameesh show orchestre
 
 # ===========================================================================

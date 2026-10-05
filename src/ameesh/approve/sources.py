@@ -126,6 +126,12 @@ class DbActionSource:
 
     REQUIRED = ("action_id", "project", "connector", "operation", "target", "args", "amount",
                 "currency", "policy_version", "state")
+    #: tout ce que le service peut lire d'une action, et rien d'autre (lot
+    #: L27) : ni reçu, ni nonce, ni challenge. Le rôle Postgres d'approve
+    #: (deploy/sql/role-approve.sql) n'accorde que ces colonnes ; la lecture
+    #: les nomme donc une à une (un `SELECT *` échouerait sous ce rôle).
+    READ = REQUIRED + ("class", "action_class", "proposed_by", "work_item", "digest",
+                       "dedupe", "replaces", "replaced_by")
 
     def __init__(self, db, table: str = "actions", lock: threading.Lock | None = None):
         self.db = db
@@ -164,7 +170,9 @@ class DbActionSource:
         self.check()
         with self._lock:
             try:
-                rows = storage.of(self.db).action_source.rows(self.table, action_id)
+                present = self.columns()
+                wanted = [name for name in self.READ if name in present]
+                rows = storage.of(self.db).action_source.rows(self.table, action_id, wanted)
             except DbError as exc:
                 raise ActionSourceError("lecture de l'action impossible (%s)"
                                         % type(exc).__name__) from exc

@@ -102,10 +102,10 @@ class MigrationsTest(PgTestCase):
                 "SELECT count(*)::int AS n FROM information_schema.tables "
                 "WHERE table_schema = %s AND table_name IN ('agent_registry','agent_mailbox',"
                 "'schema_migrations','mesh_approvals','work_items','work_item_events',"
-                "'thread_index')",
+                "'work_item_milestones','thread_index')",
                 (schema,),
             )[0]["n"]
-            self.assertEqual(tables, 7)
+            self.assertEqual(tables, 8)
         finally:
             db.close()
             self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)

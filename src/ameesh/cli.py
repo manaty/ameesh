@@ -14,7 +14,8 @@
   agent-mail hook <claude|codex|deepseek>        hook : lit le JSON sur stdin, livre les non-lus
   agent-mail statusline                          barre d'état Claude Code : [chantier/nom] travail · dossier
   agent-mail migrate                             applique les migrations versionnées
-  agent-mail doctor [--notify-test]              diagnostic : pilote, schéma, migrations, LISTEN/NOTIFY
+  agent-mail doctor [--notify-test | --probe]    diagnostic : pilote, schéma, migrations, LISTEN/NOTIFY
+                                                 (--probe : sonde légère de conteneur)
 
 Identité d'une session : $AGENT_MAIL_NAME (le runner la pose pour le harnais
 qu'il lance). Si $AMEESH_RUNNER_ID et $AMEESH_LEASE_EPOCH sont aussi posées, le
@@ -480,7 +481,43 @@ def cmd_migrate(cfg: Config) -> int:
     return 0
 
 
-def cmd_doctor(cfg: Config, notify_test: bool) -> int:
+def cmd_probe(cfg: Config) -> int:
+    """Sonde légère (`doctor --probe`) : base joignable, schéma présent,
+    migrations à jour. Ni comptage, ni NOTIFY, ni écriture : faite pour une
+    sonde de conteneur appelée toutes les quelques secondes. Une ligne, code 0
+    (OK) ou 1 (KO)."""
+    try:
+        db = db_mod.connect(cfg)
+    except db_mod.Unavailable as exc:
+        print("sonde : KO — base injoignable (%s)" % exc)
+        return 1
+    try:
+        db_mod.require_schema(db)
+        missing, modified, unknown = migrations.check(db)
+    except db_mod.SchemaMissing:
+        print("sonde : KO — schéma absent (%s, schéma %s)"
+              % (config_mod.mask_dsn(cfg.dsn), cfg.schema))
+        return 1
+    except db_mod.DbError as exc:
+        print("sonde : KO — %s" % exc)
+        return 1
+    finally:
+        db.close()
+    if missing or modified:
+        print("sonde : KO — migrations %s%s" % (
+            "manquantes %s" % ",".join(m.label for m in missing) if missing else "",
+            ("%smodifiées %s" % ("; " if missing else "", ",".join(m.label for m in modified))
+             if modified else "")))
+        return 1
+    extra = (" ; base plus récente que ce code (versions %s)"
+             % ",".join("%04d" % v for v in unknown)) if unknown else ""
+    print("sonde : OK (pilote %s, schéma %s)%s" % (db.name, cfg.schema, extra))
+    return 0
+
+
+def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False) -> int:
+    if probe:
+        return cmd_probe(cfg)
     print("dsn        : %s" % config_mod.mask_dsn(cfg.dsn))
     print("schéma     : %s" % cfg.schema)
     print("hôte       : %s" % cfg.host)
@@ -535,6 +572,13 @@ def main(argv: list[str] | None = None) -> int:
         print(__doc__)
         return 0
     command, rest = argv[0], argv[1:]
+    # `--help` n'exécute JAMAIS une sous-commande (une relecture a appliqué des
+    # migrations à une base vivante avec `mail migrate --help`). Pour `send`, le
+    # texte peut contenir « --help » : seule la première position compte.
+    if (rest[:1] in (["-h"], ["--help"]) if command == "send"
+            else any(arg in ("-h", "--help") for arg in rest)):
+        print(__doc__)
+        return 0
     cfg = config_mod.load()
     try:
         if command == "hook":
@@ -542,7 +586,8 @@ def main(argv: list[str] | None = None) -> int:
         if command == "migrate":
             return cmd_migrate(cfg)
         if command == "doctor":
-            return cmd_doctor(cfg, notify_test="--notify-test" in rest)
+            return cmd_doctor(cfg, notify_test="--notify-test" in rest,
+                              probe="--probe" in rest)
         if command == "statusline":
             return cmd_statusline(cfg)
         if command == "alias":
