@@ -39,7 +39,7 @@ AGENT_COLUMNS = """
     extract(epoch from last_turn_at)::float8      as last_turn_ts,
     extract(epoch from last_event_at)::float8     as last_event_ts,
     responsible, team, provider, credential_mode, capabilities, canon_ref,
-    ephemeral, created_by,
+    ephemeral, created_by, priority, admitted_hosts, admitted_tags, memory_repository,
     extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts,
     session_policy, effort, tier, session_work_item,
     extract(epoch from status_since)::float8         as status_since_ts,
@@ -181,7 +181,7 @@ class Agents(interface.Agents):
                    lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
                    public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
                    responsible, team, provider, credential_mode, capabilities, canon_ref,
-                   ephemeral, created_by, ephemeral_expires_ts, responsible_ok,
+                   ephemeral, created_by, ephemeral_expires_ts, responsible_ok, priority,
                    __GOVERNED__ AS canon_governed,
                    (SELECT s.status FROM canon_state s WHERE s.host = o.host) AS canon_status,
                    (SELECT s.diagnostic FROM canon_state s
@@ -458,6 +458,29 @@ class Leases(interface.Leases):
             RETURNING r.name
             """,
             (name, owner, epoch),
+        )
+        return bool(rows)
+
+    def pause(self, name, owner, epoch, status_text) -> bool:
+        """Pause `blocked` fencée par un bail vivant (L31, 0028) : verrou
+        d'abord, puis recontrôle que le bail est toujours le nôtre, vivant, et
+        que l'agent n'est pas en tour (jamais de coupure au milieu d'un tour)."""
+        rows = self.db.query(
+            """
+            WITH verrou AS (
+                SELECT name, status, lease_owner, lease_epoch, lease_expires_at
+                  FROM agent_registry WHERE name = %s FOR UPDATE
+            )
+            UPDATE agent_registry AS r
+               SET status = 'blocked', status_text = %s, updated_at = now()
+              FROM verrou
+             WHERE r.name = verrou.name
+               AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+               AND verrou.lease_expires_at > clock_timestamp()
+               AND verrou.status NOT IN ('running', 'stopped')
+            RETURNING r.name
+            """,
+            (name, status_text, owner, int(epoch)),
         )
         return bool(rows)
 

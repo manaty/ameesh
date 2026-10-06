@@ -107,6 +107,7 @@ from . import canon as canon_mod
 from . import fil
 from . import placement as placement_mod
 from . import receipts, registry, storage
+from . import visibility as visibility_mod
 from .canon import Canon, Finding
 from .config import NAME_RE
 from .db import Db, DbError
@@ -121,6 +122,8 @@ _TTL_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$", re.I)
 
 DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "team",
                "provider", "credential_mode", "capabilities", "canon_ref", "ephemeral",
+               "priority", "admitted_hosts", "admitted_tags", "memory_repository",
+               "visibility_ok", "visibility_diagnostic",
                "placement_ok", "placement_diagnostic", "placement_ref")
 
 #: statuts de `canon_state` (0008)
@@ -837,7 +840,8 @@ def _same(row: dict, values: dict) -> bool:
 
 
 def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None, *,
-         trusted_ref: str | None = None, bootstrap_ref: str = "") -> SyncReport:
+         trusted_ref: str | None = None, bootstrap_ref: str = "",
+         forge=None) -> SyncReport:
     """Aligne le registre de `host` sur le canon et enregistre l'état du canon.
 
     Canon illisible : seul l'état `unreadable` est écrit, puis CanonUnreadable.
@@ -870,36 +874,57 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     block = canon_mod.blocking(findings)
     actions: list[SyncAction] = []
 
-    placed_here: dict[str, canon_mod.Placement] = {}
-    elsewhere: dict[str, list[canon_mod.Placement]] = {}
+    # L31 (0029) : une fiche `Placement` est une ADMISSION (hôtes nommés ou
+    # étiquettes). L'hôte d'une ligne du registre est un ÉTAT d'exécution : on
+    # ne déplace jamais un agent dont l'hôte courant est admis.
+    admitted_here: dict[str, canon_mod.Placement] = {}
+    other_admitted: dict[str, list[str]] = {}
     for agent in canon.agents:
-        placements = [p for p in canon.placements_of(agent.title)]
-        here = [p for p in placements if p.host == host]
-        if here:
-            placed_here.setdefault(agent.title, here[0])
-        elif placements:
-            elsewhere[agent.title] = placements
+        admission = placement_mod.admission_of(canon, agent.title)
+        if admission is None:
+            continue
+        admis = placement_mod.admitted_hosts(canon, admission)
+        if host in admis:
+            admitted_here.setdefault(agent.title, admission)
+        if admis:
+            other_admitted[agent.title] = [h for h in admis if h != host]
 
-    rows = _rows(db, host, sorted(placed_here))
+    rows = _rows(db, host, sorted(set(admitted_here) | set(other_admitted)))
 
-    for name in sorted(placed_here):
-        placement = placed_here[name]
+    for name in sorted(admitted_here):
+        admission = admitted_here[name]
         agent = canon.agent(name)
         if agent is None or not NAME_RE.match(name):
+            continue
+        row = rows.get(name)
+        # Hôte courant admis et différent de celui qu'on synchronise : on ne
+        # touche à rien, l'exécution reste où elle est (0029).
+        if row is not None and row.get("host") not in (None, host) \
+                and row.get("host") in other_admitted.get(name, []):
+            actions.append(SyncAction(
+                name, "laissé",
+                "tourne sur %s, hôte admis : « canon sync » ne le déplace pas"
+                % row.get("host")))
             continue
         reasons = block.reasons(name, [host])
         responsible = canon.resolve_human(agent.responsible) if not reasons else None
         verdict = placement_mod.evaluate(canon, name, host)
+        # L31 (0029) : règle de visibilité, repliée dans le verdict de placement
+        # (fail closed ; sans dépôt de mémoire, sans objet).
+        visibility_ok, visibility_diag = visibility_mod.annotate(
+            canon, agent, host, verdict, db=db, forge=forge)
+        host_fiche = canon.host(host)
+        cwd = host_fiche.policy.work_dir(agent.team) if host_fiche is not None else None
         values = {
             "harness": agent.harness or "other",
             "host": host,
-            "cwd": os.path.expanduser(placement.cwd) if placement.cwd else None,
+            "cwd": os.path.expanduser(cwd) if cwd else None,
             "model": agent.model,
             "budget_usd": agent.budget_usd_per_day,
             "responsible": responsible,
             "team": agent.team,
             "provider": agent.provider,
-            "credential_mode": placement.credential_mode or agent.credential_mode,
+            "credential_mode": admission.credential_mode or agent.credential_mode,
             # `approve` n'entre jamais au registre (R8) ; la fiche est de toute
             # façon bloquée par l'erreur agent-approve-capability
             "capabilities": None if agent.capabilities is None else [
@@ -907,6 +932,15 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
                 if c.strip().lower() not in canon_mod.FORBIDDEN_CAPABILITIES],
             "canon_ref": agent.fiche.ref,
             "ephemeral": False,
+            # L31 (0028) : priorité de pause sous pression critique de l'hôte
+            "priority": int(agent.priority or 0),
+            # L31 (0029) : admission déclarative (hôtes résolus, étiquettes) et
+            # dépôt de mémoire de la persona (règle de visibilité)
+            "admitted_hosts": placement_mod.admitted_hosts(canon, admission),
+            "admitted_tags": sorted(set(admission.tags())),
+            "memory_repository": agent.memory_repository,
+            "visibility_ok": visibility_ok,
+            "visibility_diagnostic": visibility_diag,
             # C4 : admissibilité du placement sur CET hôte (politique de la fiche Host),
             # pour le profil de ces valeurs (`_write_declared` écrit le profil évalué ;
             # un harnais non déclaré, refusé par toute politique qui restreint les
@@ -915,7 +949,6 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             "placement_diagnostic": verdict.diagnostic,
             "placement_ref": verdict.ref,
         }
-        row = rows.get(name)
         if row is None:
             _write_declared(db, name, values)
             action = SyncAction(name, "créé")
@@ -940,7 +973,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
 
     loaded = canon.loaded_members()
     for name, row in sorted(rows.items()):
-        if name in placed_here or row.get("host") != host:
+        if name in admitted_here or row.get("host") != host:
             continue
         if row.get("ephemeral") or not row.get("canon_ref"):
             continue  # éphémère, ou jamais venu du canon : sync ne le gouverne pas
@@ -960,25 +993,25 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
                 name, "laissé", "%s : retrait différé, non réclamable" % unverifiable,
                 block.reasons(name) if block.global_errors else [], verdict))
             continue
-        moved = elsewhere.get(name)
-        if moved and len(moved) == 1 and canon.agent(name) is not None:
-            target = moved[0].host or ""
-            # Le canon l'a placé ailleurs (décision humaine) : sync suit, et
-            # le placement n'est évalué que par la synchronisation de l'hôte cible.
+        cibles = other_admitted.get(name)
+        if cibles and canon.agent(name) is not None:
+            target = cibles[0]
+            # L'hôte courant n'est plus admis, mais un autre hôte l'est : le
+            # canon le déplace là (jamais hors d'un hôte admis).
             verdict = placement_mod.Verdict(
                 name, target, None,
-                "déplacé de %s : placement à évaluer par « ameesh canon sync » sur %s"
-                % (host, target), moved[0].fiche.ref)
+                "déplacé de %s : hôte admis %s, à évaluer par « ameesh canon sync » sur %s"
+                % (host, target, target), row.get("placement_ref"))
             storage.of(db).canon.move_host(
                 name, host, target=target, canon_ref=canon.agent(name).fiche.ref,
                 diagnostic=verdict.diagnostic, ref=verdict.ref)
             actions.append(SyncAction(
                 name, "déplacé",
-                "placé sur %s : non réclamable avant la synchronisation de cet hôte" % target,
+                "admis sur %s : non réclamable avant la synchronisation de cet hôte" % target,
                 placement=verdict))
             continue
-        why = "plus de placement" if canon.agent(name) is not None else "fiche absente"
-        # Sans placement sur cet hôte, plus réclamable ici, quel que soit son
+        why = "plus d'admission" if canon.agent(name) is not None else "fiche absente"
+        # Sans admission sur cet hôte, plus réclamable ici, quel que soit son
         # statut (fin de tour comprise) : écrit avant l'arrêt, colonnes
         # déclaratives seulement.
         verdict = placement_mod.evaluate(canon, name, host)
@@ -996,7 +1029,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
                                       placement=verdict))
     for name, row in sorted(rows.items()):
         if row.get("host") == host and not row.get("canon_ref") and not row.get("ephemeral") \
-                and name not in placed_here:
+                and name not in admitted_here:
             actions.append(SyncAction(name, "hors canon",
                                       "inscrit à la main : non gouverné par sync"))
     _inherit_placements(db, host)

@@ -38,6 +38,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 from . import account_turn, adapters, canon as canon_mod, canon_sync, cost as cost_mod
 from . import db as db_mod, fil, mail, registry, storage
@@ -60,8 +61,10 @@ class _AsyncLog:
     """
 
     def __init__(self, maxsize: int = 1024) -> None:
-        self.queue: "queue.Queue[str]" = queue.Queue(maxsize)
+        self.queue: "queue.Queue[str | None]" = queue.Queue(maxsize)
         self.perdus = 0
+        #: posé par `close` : plus rien n'entre dans la file (fin du processus)
+        self.ferme = False
         self.thread = threading.Thread(target=self._drain, name="journal", daemon=True)
         self.thread.start()
 
@@ -76,10 +79,38 @@ class _AsyncLog:
             log(message)
 
     def write(self, message: str) -> None:
+        if self.ferme:
+            # Après `close` (fin du processus), un fil démon tardif (canon,
+            # solde, veilleur) ne doit plus rien écrire : message abandonné.
+            self.perdus += 1
+            return
         try:
             self.queue.put_nowait(message)
         except queue.Full:
             self.perdus += 1
+
+    def close(self, timeout: float = 2.0) -> bool:
+        """Vide la file puis arrête le fil, **dans un délai borné**.
+
+        À appeler avant la fin de l'interpréteur : un fil démon encore dans un
+        `print` au moment de la finalisation garde le verrou de `sys.stdout`,
+        et le vidage final de CPython échoue alors en erreur fatale
+        (« could not acquire lock for <stdout> at interpreter shutdown »,
+        SIGABRT). Rend `True` si le fil s'est arrêté, `False` s'il est resté
+        bloqué (puits plein) au-delà du délai : l'appelant ne doit alors pas
+        laisser l'interpréteur se finaliser normalement.
+        """
+        fin = time.monotonic() + max(0.0, timeout)
+        self.ferme = True
+        thread = self.thread
+        if not thread.is_alive():
+            return True
+        try:
+            self.queue.put(None, timeout=max(0.0, fin - time.monotonic()))
+        except queue.Full:
+            return False
+        thread.join(timeout=max(0.0, fin - time.monotonic()))
+        return not thread.is_alive()
 
 
 _journal = _AsyncLog()
@@ -88,6 +119,51 @@ _journal = _AsyncLog()
 def log_async(message: str) -> None:
     """Journal d'un chemin qui ne doit **jamais** attendre le puits (battement)."""
     _journal.write(message)
+
+
+#: délai borné accordé au fil `journal` pour vider sa file à l'arrêt
+JOURNAL_CLOSE_TIMEOUT = 2.0
+
+
+def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
+    """Écrit `data` sur `fd` **sans jamais attendre** le puits (diagnostic).
+
+    Le descripteur passe en O_NONBLOCK le temps de l'écriture : un tube plein
+    rend EAGAIN, ignoré (message perdu). Toute erreur est ignorée.
+    """
+    try:
+        import fcntl
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        try:
+            os.write(fd, data)
+        finally:
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+    except (OSError, ImportError, ValueError):
+        pass
+
+
+def _sortie_sure(code: int, fils: "list[threading.Thread] | tuple" = ()) -> int:
+    """Prépare la fin du processus sans fil démon en train d'écrire.
+
+    À appeler dans le `finally` du point d'entrée, **après** la remise des
+    baux et la comptabilité (donc incontournable, même sur exception).
+    Vide puis arrête le fil `journal` (délai borné). Si lui ou l'un des `fils`
+    donnés (workers, qui écrivent par `log`) vit encore — bloqué sur un tube
+    plein, typiquement —, la finalisation normale de CPython abandonnerait le
+    processus (SIGABRT) en tentant de vider `sys.stdout` dont le verrou est
+    tenu : on sort alors par `os._exit(code)`, sans vidage (chaque `log` vide
+    déjà son flux), après un diagnostic qui n'attend jamais le puits. Aucune
+    écriture synchrone sur stdout/stderr ici : un arrêt ne pend jamais.
+    """
+    journal_arrete = _journal.close(JOURNAL_CLOSE_TIMEOUT)
+    vivants = [t for t in fils if t is not None and t.is_alive()]
+    if journal_arrete and not vivants:
+        return code
+    noms = ", ".join(t.name for t in vivants) or "journal"
+    _ecrire_sans_attendre(2, ("agent-runner : fil(s) encore actif(s) à l'arrêt (%s) : "
+                              "sortie immédiate\n" % noms).encode("utf-8", "replace"))
+    os._exit(code)
 
 
 def worktree_marker(cwd: str | None) -> dict:
@@ -1124,6 +1200,72 @@ class AgentWorker(threading.Thread):
         elif travail is not None:
             self._compta_en_echec = True
 
+    def maybe_relocate(self, pressure: dict) -> bool:
+        """Déplace l'agent vers un hôte admis disponible (L31, 0028), si activé.
+
+        Entre deux tours seulement : l'hôte d'exécution change (`relocate`) et
+        le worker s'arrête, ce qui rend le bail ; l'exécuteur de l'hôte
+        d'arrivée réclamera l'agent. Jamais au milieu d'un tour ; ne lève
+        jamais."""
+        if not self.runner.relocate:
+            return False
+        from . import relocation as relocation_mod
+        try:
+            plan = relocation_mod.plan(
+                self.agent.get("admitted_hosts") or [], self.runner.host, db=self.db,
+                current_limits=(pressure or {}).get("limits"),
+                limits_for=self.runner.host_limits_for,
+                shared_sessions=self.runner.shared_sessions)
+            if plan is None:
+                return False
+            result = relocation_mod.move(self.db, self.agent, plan,
+                                         current_host=self.runner.host,
+                                         owner=self.runner.runner_id, epoch=self.epoch)
+        except db_mod.DbError as exc:
+            log("[%s] déplacement impossible (%s)" % (self.name, exc))
+            return False
+        if result is None:
+            return False
+        log("[%s] déplacement vers %s : %s (session %s)" % (
+            self.name, result["target"], result["reason"],
+            "conservée" if result["keep_session"] else "tournée avec résumé"))
+        self._fil_note(
+            "Déplacement vers %s : %s. %s" % (
+                result["target"], result["reason"],
+                "La session est reprise (stockage partagé)." if result["keep_session"]
+                else "La session n'est pas portable : reprise sur un résumé en tête de "
+                     "consigne."),
+            meta={"action": "deplacement", "vers": result["target"]})
+        self.stopping.set()
+        self.wake.set()
+        return True
+
+    def _host_pressure_note(self, pressure: dict) -> None:
+        """Trace la contre-pression (L31, 0028) ; en critique, met en pause.
+
+        Ne touche JAMAIS un tour en cours : `_pick` s'exécute entre deux tours.
+        Seuls les agents de priorité la plus basse (0, le défaut) sont mis en
+        pause ; les autres attendent simplement que la pression redescende."""
+        if not pressure.get("critical"):
+            return
+        if int(self.agent.get("priority") or 0) > 0:
+            return
+        raisons = " ; ".join("%s %s (seuil %s)" % (b["label"], b["value"], b["limit"])
+                              for b in pressure.get("breaches") or [])
+        texte = "pression critique de l'hôte %s : %s" % (self.runner.host, raisons or "seuil")
+        if getattr(self, "_pressure_reason", "") == texte:
+            return
+        # Pause fencée par le bail : un worker périmé (bail perdu, remplacé,
+        # expiré) ou un tour en cours est refusé (L31, 0028).
+        if not registry.pause(self.db, self.name, self.runner.runner_id, self.epoch,
+                              "pression hôte"):
+            log("[%s] pause refusée : bail perdu, remplacé, ou tour en cours" % self.name)
+            return
+        self._pressure_reason = texte
+        self._fil_note("Pause : %s. Aucun nouveau tour tant que la pression ne "
+                       "redescend pas ; le tour en cours n'est jamais interrompu." % texte,
+                       meta={"action": "pression-hote", "hote": self.runner.host})
+
     def pick(self) -> dict | None:
         """Le prochain tour à faire, ou None. Consomme la consigne en attente.
 
@@ -1143,6 +1285,14 @@ class AgentWorker(threading.Thread):
         self.agent = agent
         if not self.budget_ok():
             return None  # garde de budget (L13) : aucun tour, état `paused` posé
+        # Contre-pression de l'hôte (L31, 0028) : au-dessus d'un seuil, aucun
+        # NOUVEAU tour ne démarre ; la consigne en attente n'est pas consommée.
+        pressure = self.runner.host_pressure()
+        if pressure.get("blocked"):
+            if self.maybe_relocate(pressure):
+                return None  # déplacé : le worker s'arrête, le bail sera rendu
+            self._host_pressure_note(pressure)
+            return None
         # L30 : session ouverte sous un autre compte et non reprenable → résumé
         # sous l'ancien compte, avant de consommer quoi que ce soit (jamais en
         # plein tour).
@@ -1218,7 +1368,6 @@ class AgentWorker(threading.Thread):
 
     #: préfixe du résumé de reprise (session neuve après rotation, 0018)
     RESUME_PREFIX = "Reprise de session après rotation — résumé :\n%s\n\n"
-
     def _budget_courrier(self) -> int:
         """Octets UTF-8 disponibles pour la consigne d'un tour de courrier.
 
@@ -1263,6 +1412,12 @@ class AgentWorker(threading.Thread):
         tard et signalé « re-livré » — un doublon signalé, jamais une perte.
         """
         candidats = spec.get("candidats")
+        # Dernier contrôle avant de consommer quoi que ce soit (L31, 0028) :
+        # couvre les tours ouverts directement (résumé de rotation de compte).
+        pression = self.runner.host_pressure()
+        if pression.get("blocked"):
+            self._host_pressure_note(pression)
+            return False
         if not candidats or self.runner.dry_run:
             return self._run_turn(spec)
         kind = spec["kind"]
@@ -1335,6 +1490,48 @@ class AgentWorker(threading.Thread):
                 % len(incertains),
                 meta={"action": "remise-incertaine", "messages": incertains})
 
+    def _open_turn_resource(self, turn_id: str, pgid: int | None) -> None:
+        """Rattache le groupe du tour (L31, 0028) ; ne casse jamais le tour."""
+        self._turn_open = False
+        try:
+            from . import containers as containers_mod
+            storage.of(self.db).turn_resources.open_turn(
+                turn_id, self.name, self.runner.host, pgid=pgid,
+                label=containers_mod.turn_labels(turn_id, self.name))
+            self._turn_open = True
+        except Exception as exc:  # ne casse jamais un tour
+            log("[%s] rattachement du tour %s impossible (%s)"
+                % (self.name, turn_id[:8], exc))
+
+    def _close_turn_resource(self, turn_id: str, pgid: int | None) -> None:
+        """Ferme la ressource du tour ; `orphan` si elle survit (L31, 0028).
+
+        Un groupe encore vivant après l'arrêt escaladé, ou un conteneur qui
+        porte encore l'étiquette du tour, est signalé orphelin : **jamais
+        supprimé** ici."""
+        if not getattr(self, "_turn_open", False):
+            return
+        self._turn_open = False
+        conteneurs: list[str] = []
+        runtime = self.runner.container_runtime()
+        if runtime is not None:
+            try:
+                conteneurs = runtime.running_for_turn(turn_id)
+            except Exception:  # un moteur indisponible n'est pas un orphelin
+                conteneurs = []
+        orphelin = bool(conteneurs) or bool(pgid and self._group_alive(pgid))
+        try:
+            storage.of(self.db).turn_resources.close_turn(
+                turn_id, orphan=orphelin, containers=conteneurs or None)
+        except Exception as exc:  # ne casse jamais la fin d'un tour
+            log("[%s] fermeture du rattachement du tour %s impossible (%s)"
+                % (self.name, turn_id[:8], exc))
+            return
+        if orphelin:
+            log("[%s] ressource orpheline du tour %s : %s"
+                % (self.name, turn_id[:8],
+                   ", ".join(conteneurs) if conteneurs else "groupe de processus survivant"))
+
     def _run_turn(self, spec: dict) -> bool:
         harness = self.agent.get("harness") or "other"
         try:
@@ -1396,10 +1593,18 @@ class AgentWorker(threading.Thread):
 
         env = os.environ.copy()
         env.update(adapter.env())
+        # L31 (0028) : identifiant du tour et étiquettes à poser sur les
+        # conteneurs lancés par ses outils, pour repérer les orphelins.
+        from . import containers as containers_mod
+        turn_id = uuid.uuid4().hex
+        self._turn_id = turn_id
+        turn_label = containers_mod.turn_labels(turn_id, self.name)
         identite = {
             "AGENT_MAIL_NAME": self.name,
             "AGENT_MAIL_STATE": self.cfg.v0_state,
             "AGENT_MAIL_CONFIG": self.cfg.config_dir,
+            "AMEESH_TURN_ID": turn_id,
+            containers_mod.LABELS_ENV: turn_label,
             # Noms courants (ameesh) — et les anciens en alias, pour que
             # l'outillage agent-mesh d'hier continue de fonctionner.
             "AMEESH_DSN": self.cfg.dsn,
@@ -1473,6 +1678,9 @@ class AgentWorker(threading.Thread):
             with self.lock:
                 self.proc = proc
                 self.pgid = proc.pid  # start_new_session : le groupe porte son pid
+            # L31 (0028) : rattache le groupe (et l'étiquette des conteneurs) au
+            # tour, pour repérer ce qui survivrait à sa fin.
+            self._open_turn_resource(turn_id, proc.pid)
             # Lancé (et publié, pour que l'arrêt le trouve) : les messages de la
             # consigne sont livrés, et seulement eux.
             self._livre_courrier(spec)
@@ -1518,6 +1726,7 @@ class AgentWorker(threading.Thread):
         finally:
             heartbeat_done.set()
             preempt_done.set()
+            pgid = self.pgid
             # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
             # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
             # du veilleur une fois `self.proc` effacé (sonde codex3 B5a-S).
@@ -1525,6 +1734,7 @@ class AgentWorker(threading.Thread):
             with self.lock:
                 self.proc = None
                 self.pgid = None
+            self._close_turn_resource(turn_id, pgid)
 
         duration = time.time() - started
         self.last_turn_seconds = duration
@@ -1678,12 +1888,28 @@ class Runner:
         self.lock = threading.Lock()
         self.listener = None          # écouteur LISTEN/NOTIFY courant
         self.listener_thread = None
+        #: workers attendus par `shutdown` ; un survivant force la sortie de `_sortie_sure`
+        self.stopped_threads: list = []
         #: `canon sync` de l'hôte : au démarrage puis périodiquement (spec §4.4)
         self.canon_sync_interval = max(0.0, cfg.canon_sync_interval)
         self.canon_thread: threading.Thread | None = None
         #: garde de budget (L13, 0019) : plafond horaire et cadence de contrôle
         self.budget_usd_per_hour = max(0.0, cfg.budget_usd_per_hour)
         self.budget_check_interval = max(1.0, cfg.budget_check_interval)
+        #: pression de l'hôte (L31, 0028) : seuils du canon et verdict caché
+        from . import resources as resources_mod
+        self._pressure_lock = threading.Lock()
+        self._host_limits = resources_mod.thresholds(None)
+        self._pressure: dict = {"blocked": False, "critical": False, "breaches": [],
+                                "limits": self._host_limits}
+        self._pressure_at = 0.0
+        self._all_host_limits: dict = {}
+        #: déplacement entre hôtes admis (L31, 0028), faux par défaut
+        self.relocate = bool(cfg.relocate)
+        self.shared_sessions = bool(cfg.shared_sessions)
+        #: moteur de conteneurs (L31, 0028) : None sans binaire/démon
+        from . import containers as containers_mod
+        self._container_runtime = containers_mod.Runtime.from_config(cfg)
         self.turns = 0
         self.did_turn = False
 
@@ -1764,10 +1990,11 @@ class Runner:
         while not self.stop.is_set():
             listener = storage.of(self.db).wakeups.subscribe([CHANNEL_MAIL, CHANNEL_LEASE])
             if listener is None:
-                log("LISTEN/NOTIFY indisponible avec ce pilote : sondage toutes les %ss" % self.poll)
+                log_async("LISTEN/NOTIFY indisponible avec ce pilote : sondage toutes les %ss"
+                          % self.poll)
                 return
             self.listener = listener
-            log("LISTEN %s, %s" % (CHANNEL_MAIL, CHANNEL_LEASE))
+            log_async("LISTEN %s, %s" % (CHANNEL_MAIL, CHANNEL_LEASE))
             try:
                 while not self.stop.is_set():
                     item = listener.wait(timeout=self.poll)
@@ -1775,7 +2002,8 @@ class Runner:
                         self.wake_all.set()  # battement de sondage
                         continue
                     if item.get("event") == "down":
-                        log("écoute interrompue (%s) : reconnexion" % (item.get("error") or "?"))
+                        log_async("écoute interrompue (%s) : reconnexion"
+                                  % (item.get("error") or "?"))
                         break
                     self.dispatch(item)
             finally:
@@ -1805,7 +2033,14 @@ class Runner:
             # du bail (sonde codex3 B5a-P).
             worker.stop_group_now("arrêt de l'exécuteur (dur)", grace=0, hard=True)
             worker.release_lease()
-        log("arrêt : %d bail(aux) rendu(s), %d tour(s)" % (len(workers), self.turns))
+        # L'écouteur (fil démon) ne doit plus écrire quand l'interpréteur se
+        # finalise : sa connexion est fermée ci-dessus, on l'attend, borné.
+        if self.listener_thread is not None:
+            self.listener_thread.join(timeout=2.0)
+        self.stopped_threads = list(workers)
+        # par la file : aucune écriture synchrone sur le chemin d'arrêt avant
+        # le repli de `_sortie_sure` (relecture codex2 de 669a6fe, B1)
+        log_async("arrêt : %d bail(aux) rendu(s), %d tour(s)" % (len(workers), self.turns))
 
     # -- canon sync (spec §4.4) --------------------------------------------
     def canon_sync_once(self) -> bool:
@@ -1824,6 +2059,11 @@ class Runner:
             db_mod.require_schema(db)
             canon = canon_mod.from_config(self.cfg)
             report = canon_sync.sync(db, canon, self.host)
+            # L31 : seuils de pression de l'hôte. `canon_sync_once` est aussi
+            # exercé sur un objet factice (tests d'authentificateurs).
+            refresh = getattr(self, "refresh_host_limits", None)
+            if refresh is not None:
+                refresh(canon)
             status = getattr(report, "status", None)
             if status and status != canon_sync.CANON_OK:
                 log_async("canon sync : %s (%s)"
@@ -1921,15 +2161,123 @@ class Runner:
 
         threading.Thread(target=boucle, daemon=True, name="solde").start()
 
+    # -- ressources de l'hôte (L31, 0028) -----------------------------------
+    def resource_once(self) -> dict | None:
+        """Relève et publie les ressources de l'hôte ; ne lève jamais.
+
+        Un relevé ne doit jamais empêcher un tour : toute erreur (poste sans
+        `/proc`, base indisponible) est journalisée et rend None."""
+        from . import resources as resources_mod
+        db = None
+        try:
+            db = db_mod.connect(self.cfg)
+            return resources_mod.collect(self.cfg, db)
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            log_async("ressources : relevé impossible (%s)" % type(exc).__name__)
+            return None
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    def start_resource_poll(self) -> None:
+        """Relevé périodique des ressources (`AMEESH_RESOURCE_INTERVAL`,
+        défaut 60 s). En mode `--once`, un seul relevé en ligne."""
+        interval = max(0.0, float(self.cfg.resource_interval))
+        if interval <= 0:
+            return
+        if self.once:
+            self.resource_once()
+            return
+
+        def boucle() -> None:
+            while not self.stop.is_set():
+                self.resource_once()
+                if self.stop.wait(max(10.0, interval)):
+                    return
+
+        threading.Thread(target=boucle, daemon=True, name="ressources").start()
+
+    def refresh_host_limits(self, canon) -> None:
+        """Met à jour les seuils de ressources de CET hôte depuis le canon.
+
+        Appelé après chaque `canon sync` (le canon est la source déclarative
+        des seuils) ; sans fiche Host, les valeurs par défaut prudentes
+        s'appliquent. Force le recalcul du verdict de pression.
+
+        Défensif sur les attributs : `canon_sync_once` est aussi exercé sur un
+        objet factice par les tests d'authentificateurs, qui n'a que `cfg` et
+        `host`."""
+        from . import resources as resources_mod
+        if canon is None or not hasattr(canon, "host"):
+            return  # objet factice des tests de `canon_sync_once`
+        host = canon.host(self.host)
+        policy = host.policy if host is not None else None
+        limits = resources_mod.thresholds(policy)
+        # seuils de TOUS les hôtes du canon : le déplacement (L31) compare les
+        # candidats avec la politique de leur propre hôte.
+        par_hote = {h.title: resources_mod.thresholds(h.policy)
+                    for h in (canon.hosts if canon is not None else [])}
+        lock = getattr(self, "_pressure_lock", None)
+        if lock is None:
+            self._host_limits = limits
+            return
+        with lock:
+            self._all_host_limits = par_hote
+            if limits != self._host_limits:
+                self._host_limits = limits
+                self._pressure_at = 0.0
+
+    def host_limits_for(self, host: str) -> dict | None:
+        """Seuils connus d'un hôte (dernier `canon sync`), ou None."""
+        return getattr(self, "_all_host_limits", {}).get(host)
+
+    def container_runtime(self):
+        """Le moteur de conteneurs de l'hôte, ou None (L31, 0028)."""
+        return getattr(self, "_container_runtime", None)
+
+    def host_pressure(self, now: float | None = None) -> dict:
+        """Verdict de pression de l'hôte (L31, 0028), cache court.
+
+        `blocked` : au moins un seuil est franchi — aucun nouveau tour ne
+        démarre, les tours en cours finissent. `critical` : un franchissement
+        est grave — les agents de plus faible priorité sont mis en pause, jamais
+        au milieu d'un tour. Sans relevé, aucune pression (on ne devine pas)."""
+        from . import resources as resources_mod
+        now = time.monotonic() if now is None else float(now)
+        with self._pressure_lock:
+            if now - self._pressure_at < 10.0:
+                return dict(self._pressure)
+            limits = self._host_limits
+        reading = None
+        try:
+            reading = storage.of(self.db).hosts.latest(self.host)
+        except db_mod.DbError:
+            reading = None
+        if reading is None:
+            verdict: dict = {"blocked": False, "critical": False, "breaches": [],
+                             "limits": limits}
+        else:
+            verdict = resources_mod.pressure(reading, limits=limits)
+            verdict["since"] = reading.get("sampled_ts")
+            verdict["reading"] = reading
+        with self._pressure_lock:
+            self._pressure = verdict
+            self._pressure_at = now
+        return dict(verdict)
+
     def run(self) -> int:
         log("démarrage : hôte %s, exécuteur %s, pilote %s, schéma %s"
             % (self.host, self.runner_id, self.db.name, self.cfg.schema))
         self.start_canon_sync()
         self.start_balance_poll()
+        self.start_resource_poll()
         if self.once:
             self.sweep()
             if not self.did_turn:
-                log("aucun travail disponible")
+                log_async("aucun travail disponible")  # chemin de sortie : par la file
             return 0 if self.did_turn else 3
         self.listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
         self.listener_thread.start()
@@ -1937,7 +2285,7 @@ class Runner:
             while not self.stop.is_set():
                 self.sweep()
                 if self.max_turns and self.turns >= self.max_turns:
-                    log("limite de %d tour(s) atteinte" % self.max_turns)
+                    log_async("limite de %d tour(s) atteinte" % self.max_turns)
                     break
                 self.wake_all.wait(timeout=self.poll)
                 self.wake_all.clear()
@@ -2228,15 +2576,22 @@ def attach_main(argv: list[str] | None = None) -> int:
     except db_mod.Unavailable as exc:
         print("ameesh attach : base injoignable : %s" % exc, file=sys.stderr)
         return 1
+    code = 1  # reste 1 si une exception traverse : le repli sort alors en échec
     try:
         try:
             db_mod.require_schema(db)
         except db_mod.SchemaMissing as exc:
             print("ameesh attach : %s" % exc, file=sys.stderr)
             return 1
-        return run_attach(cfg, db, parsed.agent, wait=parsed.wait, ttl=parsed.ttl)
+        code = run_attach(cfg, db, parsed.agent, wait=parsed.wait, ttl=parsed.ttl)
+        return code
     finally:
-        db.close()
+        try:
+            db.close()
+        finally:
+            # le battement et le veilleur journalisent par la file : la vider
+            # avant la finalisation, même sur exception (SIGABRT de l'exécuteur)
+            _sortie_sure(code)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2251,18 +2606,28 @@ def main(argv: list[str] | None = None) -> int:
 
     if argv and argv[0] == "register":
         db = db_mod.connect(cfg)
+        code = 1
         try:
             db_mod.require_schema(db)
-            return cmd_register(cfg, db, argv[1:])
+            code = cmd_register(cfg, db, argv[1:])
+            return code
         finally:
-            db.close()
+            try:
+                db.close()
+            finally:
+                _sortie_sure(code)
     if argv and argv[0] == "stop":
         db = db_mod.connect(cfg)
+        code = 1
         try:
             db_mod.require_schema(db)
-            return cmd_stop(cfg, db, argv[1:])
+            code = cmd_stop(cfg, db, argv[1:])
+            return code
         finally:
-            db.close()
+            try:
+                db.close()
+            finally:
+                _sortie_sure(code)
 
     parsed = build_parser().parse_args(argv)
     if parsed.host:
@@ -2281,6 +2646,10 @@ def main(argv: list[str] | None = None) -> int:
     except db_mod.Unavailable as exc:
         print("agent-runner : base injoignable : %s" % exc, file=sys.stderr)
         return 1
+    #: 1 tant que `run` n'a pas rendu : une exception sort en échec, y compris
+    #: par le repli `os._exit` de `_sortie_sure`
+    code = 1
+    runner: Runner | None = None
     try:
         if parsed.migrate:
             from . import migrations
@@ -2297,15 +2666,24 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         def handler(signum, _frame):
-            log("signal %d reçu : arrêt propre" % signum)
+            # Signal d'abord ; le journal part par la file : un `print` dans un
+            # gestionnaire de signal peut tomber pendant un autre `print` du
+            # fil principal (écriture réentrante sur le même flux).
             runner.stop.set()
             runner.wake_all.set()
+            log_async("signal %d reçu : arrêt propre" % signum)
 
         signal.signal(signal.SIGTERM, handler)
         signal.signal(signal.SIGINT, handler)
-        return runner.run()
+        code = runner.run()  # son `finally` rend les baux (shutdown)
+        return code
     finally:
-        db.close()
+        try:
+            db.close()
+        finally:
+            # Incontournable, même sur exception, après la remise des baux : aucun
+            # fil démon ne doit écrire pendant la finalisation (SIGABRT, 2026-10-05).
+            _sortie_sure(code, runner.stopped_threads if runner is not None else ())
 
 
 if __name__ == "__main__":

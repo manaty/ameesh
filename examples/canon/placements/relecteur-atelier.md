@@ -2,9 +2,10 @@
 type: Placement
 title: relecteur@atelier
 agent: relecteur
-host: atelier
+hosts: [atelier]
 credential_mode: api-key
-cwd: ~/acme/relecture
 ---
 
 # relecteur sur atelier
+
+Relecture sur le poste, à la clé d'API (compte secondaire).

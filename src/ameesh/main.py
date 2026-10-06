@@ -37,6 +37,7 @@
   ameesh canon check|show|sync          canon OKF : validation, fiches, registre ;
   ameesh harness list|show|check        descripteurs de harnais (L16) ;
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
+  ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -55,6 +56,8 @@ MESH_COMMANDS = (
     "list", "show", "set", "key", "approve", "approvals", "verify", "work", "cost",
     "migrate", "doctor", "import-v0", "export-v0", "canon", "placement", "agent",
     "review-class",
+    # L31 : ressources des hôtes (`ameesh hosts`)
+    "hosts",
     # L14 : le catalogue des modèles a son point d'entrée public, comme les autres
     # (`ameesh models list|show|discover`) — sans cette ligne, la commande sortait en
     # code 2 « sous-commande inconnue » AVANT toute base (revue B5).

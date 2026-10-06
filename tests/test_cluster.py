@@ -46,7 +46,7 @@ SIGNATURES = {
 CONTENUS = {
     "agent_mailbox": {"body", "payload", "meta"},
     "agent_registry": {"pending_prompt", "current_prompt", "restart_brief"},
-    "agent_mesh_overview": {"pending_prompt", "current_prompt"},
+    "agent_mesh_overview": {"pending_prompt", "current_prompt", "restart_brief"},
     "thread_index": {"last_excerpt"},
     "actions": {"args", "last_note"},
     "action_events": {"note"},

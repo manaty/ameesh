@@ -52,7 +52,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'body', 'payload', 'meta'
     ]),
     ('agent_mesh_overview', ARRAY[
-        'pending_prompt', 'current_prompt'
+        'pending_prompt', 'current_prompt', 'restart_brief'
     ]),
     ('agent_registry', ARRAY[
         'pending_prompt', 'current_prompt', 'restart_brief'

@@ -615,8 +615,8 @@ class _CanonDbCase(_TmpMixin, PgTestCase):
     def load(self) -> canon.Canon:
         return canon.load(self.root, untrusted=True)
 
-    def sync(self, host: str = "atelier") -> canon_sync.SyncReport:
-        return canon_sync.sync(self.db, self.load(), host)
+    def sync(self, host: str = "atelier", *, forge=None) -> canon_sync.SyncReport:
+        return canon_sync.sync(self.db, self.load(), host, forge=forge)
 
     def actions(self, report) -> dict[str, str]:
         return {a.agent: a.action for a in report.actions}
@@ -790,7 +790,7 @@ class SyncTest(_CanonDbCase):
         self.sync("banc")
         row = self.row("relecteur")
         self.assertEqual((row["host"], row["responsible"], row["cwd"]),
-                         ("banc", "human:alice", "/srv/acme/relecture"))
+                         ("banc", "human:alice", "/srv/acme/acme-web"))
 
     def test_canon_illisible_registre_inchange(self):
         registry.upsert(self.db, "manuel", harness="codex", host="atelier")

@@ -164,6 +164,32 @@ class Config:
     #: `approve_url` = https://127.0.0.1:PORT, certificat vérifié pour CE nom
     #: d'hôte H (AMEESH_APPROVE_TLS_NAME) ; vide = nom de l'URL
     approve_tls_name: str = ""
+    #: relevé périodique des ressources de l'hôte par l'exécuteur (secondes,
+    #: L31, 0028) ; 0 = aucun relevé.
+    resource_interval: float = 60.0
+    #: visibilité d'une persona (L31, 0029) : durée de cache du verdict, en
+    #: secondes, et délai maximal accordé à la vérification par la forge.
+    visibility_ttl: float = 300.0
+    visibility_timeout: float = 10.0
+    #: forge de la vérification de visibilité (L31, 0029) : `gh` (API des
+    #: droits), `git` (copie d'essai), `auto` (gh d'abord), ou vide.
+    forge: str = ""
+    #: forges (hôtes) que `gh api --hostname` sait interroger (L31, 0029) ;
+    #: `github.com` par défaut, `AMEESH_FORGE_HOSTS` en ajoute (GitHub
+    #: Enterprise), séparés par des virgules.
+    forge_hosts: tuple[str, ...] = ("github.com",)
+    #: moteur de conteneurs pour rattacher les conteneurs d'un tour (L31,
+    #: 0028) : `auto` (docker puis podman), un nom, ou `none` ; et le délai
+    #: maximal de la commande de lecture seule.
+    container_runtime: str = "auto"
+    container_timeout: float = 5.0
+    #: déplacement automatique entre hôtes admis (L31, 0028) : entre deux tours,
+    #: un agent d'un hôte sous pression passe à un hôte admis disponible ; faux
+    #: par défaut (le geste reste humain tant qu'il n'est pas éprouvé).
+    relocate: bool = False
+    #: stockage des sessions partagé entre hôtes (L31, 0028) : un déplacement
+    #: garde la session native au lieu de tourner avec un résumé.
+    shared_sessions: bool = False
     #: comptes multiples par fournisseur (L30, décision 0027) : la clé
     #: `accounts` du fichier de configuration de l'HÔTE, telle quelle
     #: (`{harnais: [profil, …]}`), validée par `ameesh.accounts`. Ce sont des
@@ -294,6 +320,25 @@ def load(env: dict | None = None) -> Config:
         threads_dir=_expand(threads_brut) if threads_brut else "",
         project=pick("AMEESH_PROJECT", default=cfg.project) or "",
         humans=pick("AMEESH_HUMANS", default=cfg.humans) or "",
+        resource_interval=_as_float(pick("AMEESH_RESOURCE_INTERVAL"),
+                                    cfg.resource_interval),
+        visibility_ttl=_as_float(pick("AMEESH_VISIBILITY_TTL"), cfg.visibility_ttl),
+        visibility_timeout=_as_float(pick("AMEESH_VISIBILITY_TIMEOUT"),
+                                     cfg.visibility_timeout),
+        forge=str(pick("AMEESH_FORGE", default=cfg.forge) or "").strip().lower(),
+        forge_hosts=tuple(
+            h.strip().lower() for h in _as_names(
+                pick("AMEESH_FORGE_HOSTS", default=None)) if h.strip()
+        ) or cfg.forge_hosts,
+        container_runtime=str(pick("AMEESH_CONTAINER_RUNTIME",
+                                   default=cfg.container_runtime) or "").strip().lower(),
+        container_timeout=_as_float(pick("AMEESH_CONTAINER_TIMEOUT"),
+                                    cfg.container_timeout),
+        relocate=bool(_as_bool(pick("AMEESH_RELOCATE", default=cfg.relocate), False,
+                               "AMEESH_RELOCATE")),
+        shared_sessions=bool(_as_bool(pick("AMEESH_SHARED_SESSIONS",
+                                           default=cfg.shared_sessions), False,
+                                      "AMEESH_SHARED_SESSIONS")),
     )
     canon = pick("AMEESH_CANON", "AGENT_MESH_CANON", default=cfg.canon) or ""
     cfg = replace(

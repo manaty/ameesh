@@ -126,6 +126,10 @@ credential_mode: api-key         # api-key | subscription
 budget_usd_per_day: 20           # facultatif
 tools: [git, mcp:transport-readonly]   # outils autorisés (noms de politique)
 reviewers: [codex3]              # facultatif
+priority: 5                      # pause sous pression critique de l'hôte (L31)
+memory:                          # dépôt de mémoire de la persona (L31, 0029)
+  mode: neutral
+  repository: "git@forge.example:equipe/persona-deepseek7.git"
 ```
 
 **`type: Host`**
@@ -134,23 +138,38 @@ reviewers: [codex3]              # facultatif
 type: Host
 title: pc-smichea
 responsible: human:smichea       # REQUIS
+tags: [perso, prod]              # étiquettes visées par les admissions (L31)
+admins: [human:alice]            # administrateurs : règle de visibilité (L31)
 policy:
   harnesses: [claude, codex, deepseek]   # absent = tous
   providers: [anthropic, openai, deepseek]
   credential_modes: [api-key, subscription]
   max_agents: 12
+  resources:                     # seuils de pression (L31, 0028)
+    min_mem_available: 1GiB
+    max_swap_used: 8GiB
+    max_load: 24
+    min_disk_free: 2GiB
+  work_roots: {acme-web: ~/acme/acme-web}   # dossier de travail par projet (L31)
+  work_root: ~/src               # défaut : work_root/<projet>
 ```
 
-**`type: Placement`**
+**`type: Placement`** — une **admission** (L31, 0029) : persona → hôtes admis
+(noms ou étiquettes), sans `cwd` ; l'hôte et le dossier de travail sont de
+l'état d'exécution.
 
 ```yaml
 type: Placement
 title: deepseek7@pc-smichea
 agent: deepseek7
-host: pc-smichea
+hosts: [pc-smichea, serveur-1]   # hôtes admis (ordre = préférence)
+host_tags: [prod]                # ou des étiquettes d'hôtes admis
 credential_mode: api-key
-cwd: ~/src/acme                         # dossier de travail sur l'hôte
 ```
+
+Les anciennes fiches (`host:` unique, `cwd:`) restent lues : `host` vaut un
+hôte admis unique et `cwd` est **ignoré** avec le constat
+`admission-cwd-ignored` (le dossier vient de `policy.work_roots` de l'hôte).
 
 **`type: Member`** (humains) — `title: smichea`, `roles: [...]`,
 `authenticators:` liste d'empreintes de clés publiques enrôlées (C7).
@@ -220,21 +239,40 @@ consomment).
 
 Erreurs bloquantes : fiche `Agent` sans `responsible` ou avec `approve` dans
 `capabilities` ; `responsible` qui ne résout pas vers un `Member` humain ;
-`Placement` vers un agent ou un hôte inconnu ; placement qui viole la politique
-de l'hôte (C4) ; deux placements pour un même agent ; **`harness` non vide sans
+`Placement` vers un agent ou un hôte inconnu, ou sans `hosts` ni `host_tags` ;
+admission qui viole la politique de l'hôte (C4) ; deux admissions pour un même
+agent ; `policy.resources` illisible (L31) ; **`harness` non vide sans
 descripteur connu** (`agent-harness-unknown`, `host-harness-unknown`, L16).
-Avertissements : hôte sans placement, agent sans placement, agent sans
-`harness`. Sortie lisible et `--json` (code, gravité,
+Avertissements : hôte sans admission, agent sans admission, agent sans
+`harness`, `cwd` d'admission ignoré (`admission-cwd-ignored`, L31), étiquette
+d'admission qui ne correspond à aucun hôte (`admission-tag-unknown`), clé de
+`policy.resources` inconnue. Sortie lisible et `--json` (code, gravité,
 fichier, explication), sur le modèle du validateur OKF Federation.
+
+**Règle de visibilité** (0029, L31) : une persona ne tourne sur un hôte que si
+son responsable et les `admins` de l'hôte ont accès au dépôt de mémoire de la
+persona (`memory.repository`) ; sans dépôt déclaré, la règle est sans objet.
+La vérification est faite par `canon sync` (API de la forge sur l'hôte DÉCLARÉ,
+`gh api --hostname`, repli copie d'essai ; `AMEESH_FORGE_HOSTS` pour les forges
+prises en charge), mise en cache peu de temps **pour un contexte donné** (dépôt
+et forge, humains requis, comptes résolus : tout changement force une
+revérification, un contexte illisible est un refus) et repliée dans
+`placement_ok` (`persona-hidden-from-host`) ; `canon check` reste hors ligne.
 
 ## 4.4 Du canon vers le registre
 
 `ameesh canon sync` (et le démarrage de l'exécuteur) met à jour, pour chaque
-agent placé sur l'hôte courant, les colonnes **déclaratives** du registre
-(`harness`, `host`, `cwd`, `model`, `budget`, `responsible`, `team`,
+agent admis sur l'hôte courant, les colonnes **déclaratives** du registre
+(`harness`, `host`, `cwd`, `admitted_hosts`, `admitted_tags`, `priority`,
+`memory_repository`, `model`, `budget`, `responsible`, `team`,
 `credential_mode`, `canon_ref` = chemin + SHA du fichier). Il ne touche jamais
-aux colonnes d'**état** (bail, session, statut, dépense, consigne). Un agent
-retiré du canon passe `stopped` à la fin de son tour en cours.
+aux colonnes d'**état** (bail, session, statut, dépense, consigne). Le `cwd`
+vient de `policy.work_roots` de l'hôte (racine de travail par projet), plus du
+placement. L'hôte de la ligne est un **état d'exécution** (0029) : `sync` ne
+déplace jamais un agent dont l'hôte courant est admis, même s'il synchronise un
+autre hôte admis pour lui ; il le déplace seulement si son hôte courant n'est
+plus admis et qu'un autre l'est. Un agent retiré du canon passe `stopped` à la
+fin de son tour en cours.
 
 **Agents éphémères** : `ameesh agent spawn <nom> --by <agent-créateur>` crée une
 ligne `ephemeral = true`, `responsible` = celui du créateur (copié à la
@@ -245,8 +283,16 @@ création, R14), capacités limitées à `read` et `propose`, échéance obligat
 Inchangé par rapport au banc actuel, sauf :
 
 - **Réclamation** (`claimable`) : un agent n'est réclamable que si `responsible`
-  est résolu (C3) et que son placement est admis par la politique de l'hôte
-  (C4). La raison du refus est écrite dans `status_text`.
+  est résolu (C3), que son placement est admis par la politique de l'hôte (C4)
+  et que la règle de visibilité est satisfaite (L31, 0029). La raison du refus
+  est écrite dans `status_text`.
+- **Pression et déplacement** (L31, 0028) : avant chaque tour, les seuils de
+  `policy.resources` de l'hôte sont comparés au dernier relevé ; un
+  franchissement retient la consigne, et un franchissement critique met en
+  pause les agents de plus faible priorité sans interrompre un tour. Si un
+  autre hôte admis est disponible, l'agent y est déplacé entre deux tours
+  (bail rendu puis repris ; session conservée si le stockage est partagé, sinon
+  rotation avec résumé) — actif seulement avec la configuration qui l'autorise.
 - **Invariant de bail (cible)** : aucun processus du groupe d'un agent n'est
   vivant après l'échéance connue de son bail, sauf renouvellement réussi,
   **à une marge d'ordonnancement près** (délai entre l'échéance et l'effet du

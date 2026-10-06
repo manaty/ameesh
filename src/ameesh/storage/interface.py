@@ -250,6 +250,14 @@ class Leases(Domain):
         """Oublie la session, fencé par un bail valide."""
 
     @abc.abstractmethod
+    def pause(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
+        """Met l'agent en pause (`blocked`) sous un bail VIVANT détenu par
+        `owner`/`epoch` (L31, 0028), et refuse un tour en cours ou un agent
+        arrêté. Verrou de ligne d'abord, conditions recontrôlées dans
+        l'écriture. Faux si le bail n'est plus le nôtre ou l'état incompatible.
+        """
+
+    @abc.abstractmethod
     def take_pending_prompt(self, name: str, owner: str, epoch: int) -> str | None:
         """Consomme la consigne en attente et passe l'agent en `running`."""
 
@@ -895,6 +903,22 @@ class Canon(Domain):
         """Suit un déplacement décidé au canon : placement à réévaluer sur `target`."""
 
     @abc.abstractmethod
+    def relocate(self, name: str, host: str, *, target: str, canon_ref: str,
+                 diagnostic: str, ref: str | None, keep_session: bool,
+                 owner: str, epoch: int, summary: str = "") -> dict | None:
+        """Déplace l'exécution vers un autre hôte ADMIS (L31, 0028), entre deux
+        tours : `host` devient `target`, le verdict de placement est effacé (le
+        sync de l'hôte d'arrivée le réévalue). `keep_session` conserve la
+        session native (stockage partagé) ; sinon elle est oubliée et `summary`
+        ouvre la consigne en attente (rotation avec résumé).
+
+        Fencé par le bail : verrou de ligne d'abord, puis recontrôle DANS
+        l'écriture que `owner`/`epoch` détiennent toujours un bail VIVANT, que
+        l'agent n'est pas en tour, et que `target` figure encore dans les
+        hôtes admis. Rend la ligne (`name`, `host`), ou None (worker périmé,
+        tour en cours, destination plus admise)."""
+
+    @abc.abstractmethod
     def stop_removed(self, name: str, host: str, *, pending_text: str,
                      stop_text: str) -> dict | None:
         """Arrête un agent retiré du canon (sauf en plein tour : arrêt demandé) ;
@@ -1275,6 +1299,104 @@ class Operations(Domain):
 
 
 # --------------------------------------------------------------------------
+# ressources des hôtes (lot L31, décision 0028, migration 0029)
+# --------------------------------------------------------------------------
+
+class HostResources(Domain):
+    """Relevés des ressources d'un hôte (état d'exécution, jamais canon).
+
+    Un relevé porte : hôte, instant, mémoire disponible, swap utilisé, charge
+    1 minute, nombre de CPU, disque libre (et le dossier mesuré), nombre de
+    tours en cours. Les mesures illisibles sont NULL : on ne devine pas.
+    Instants rendus en secondes epoch (`sampled_ts`).
+    """
+
+    @abc.abstractmethod
+    def record(self, reading: dict) -> dict:
+        """Ajoute un relevé (heure de la base) et élague les plus anciens que
+        l'horizon de conservation ; rend la ligne écrite."""
+
+    @abc.abstractmethod
+    def latest(self, host: str) -> dict | None:
+        """Le dernier relevé de l'hôte, ou None s'il n'y en a jamais eu."""
+
+    @abc.abstractmethod
+    def history(self, host: str, limit: int) -> list[dict]:
+        """Les `limit` derniers relevés de l'hôte, du plus ancien au plus récent."""
+
+    @abc.abstractmethod
+    def current(self, host: str | None) -> list[dict]:
+        """Le dernier relevé de CHAQUE hôte connu (celui de `host` seulement
+        s'il est donné), trié par nom d'hôte."""
+
+    @abc.abstractmethod
+    def turns_in_progress(self, host: str) -> int:
+        """Nombre d'agents de l'hôte en tour (statut `running`, bail vivant)."""
+
+
+class TurnResources(Domain):
+    """Ressources rattachées à un tour (lot L31, décision 0028).
+
+    L'exécuteur ouvre une ligne au lancement du harnais (groupe de processus,
+    étiquette de conteneur) et la ferme au retour du tour. Une ressource qui
+    survit à son tour est marquée `orphan` — **jamais supprimée** — et
+    `ameesh alerts` la signale (`orphan_resource`).
+    """
+
+    @abc.abstractmethod
+    def open_turn(self, turn_id: str, agent: str, host: str, *,
+                  pgid: int | None, label: str | None,
+                  containers: Sequence[str] | None = None) -> None:
+        """Ouvre la ligne d'un tour (idempotent sur `turn_id`)."""
+
+    @abc.abstractmethod
+    def close_turn(self, turn_id: str, *, orphan: bool,
+                   containers: Sequence[str] | None = None) -> None:
+        """Ferme la ligne : `done` si la ressource est rendue, `orphan` sinon."""
+
+    @abc.abstractmethod
+    def mark_orphan(self, turn_id: str,
+                    containers: Sequence[str] | None = None) -> None:
+        """Marque `orphan` une ressource qui survit à son tour."""
+
+    @abc.abstractmethod
+    def open_by_agent(self, agent: str) -> list[dict]:
+        """Les lignes encore `running` d'un agent, la plus récente d'abord."""
+
+    @abc.abstractmethod
+    def orphans(self, host: str | None = None, limit: int = 50) -> list[dict]:
+        """Les lignes `orphan` (de l'hôte si donné), les plus récentes d'abord."""
+
+    @abc.abstractmethod
+    def stale_running(self, older_than_s: float, host: str | None = None) -> list[dict]:
+        """Les lignes encore `running` ouvertes il y a plus de `older_than_s`
+        secondes : un exécuteur mort les a laissées derrière lui."""
+
+
+class Visibility(Domain):
+    """Cache court de la règle de visibilité (0029) : le responsable et les
+    administrateurs d'un hôte doivent avoir accès au dépôt de mémoire de la
+    persona. Fail closed : l'absence de verdict frais n'admet pas."""
+
+    @abc.abstractmethod
+    def cached(self, persona: str, host: str, now_ts: float,
+               context: str) -> dict | None:
+        """Le verdict NON EXPIRÉ pour (persona, hôte) **et ce contexte**
+        (empreinte du dépôt+forge, des humains requis et de leurs comptes) ;
+        None si l'empreinte diffère, même si un ancien verdict vit encore."""
+
+    @abc.abstractmethod
+    def put(self, persona: str, host: str, *, ok: bool, diagnostic: str,
+            repository: str | None, context: str, ttl_s: float) -> dict:
+        """Écrit (ou remplace) le verdict, son contexte et son échéance ; rend
+        la ligne."""
+
+    @abc.abstractmethod
+    def purge(self, now_ts: float) -> int:
+        """Efface les verdicts expirés ; rend le nombre de lignes."""
+
+
+# --------------------------------------------------------------------------
 # le stockage d'une connexion
 # --------------------------------------------------------------------------
 
@@ -1310,3 +1432,6 @@ class Storage(abc.ABC):
     placements: Placements
     progress: Progress
     operations: Operations
+    hosts: HostResources
+    turn_resources: TurnResources
+    visibility: Visibility

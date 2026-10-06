@@ -52,6 +52,30 @@ def diverged_diagnostic(evaluated: str | None, current: str | None) -> str:
                 evaluated or "aucun", current or "?"))
 
 
+def admitted_hosts(canon: Canon, admission) -> list[str]:
+    """Hôtes du canon admis par une admission (L31, 0029).
+
+    Ce sont les hôtes NOMMÉS (`hosts`, et l'ancien `host`) plus ceux dont une
+    étiquette figure dans `host_tags` ; sans doublon, triés par nom.
+    """
+    if admission is None:
+        return []
+    titles = set(admission.host_names())
+    tags = set(admission.tags())
+    if tags:
+        for host in canon.hosts:
+            if tags & set(host.tags or []):
+                titles.add(host.title)
+    return sorted(titles)
+
+
+def admission_of(canon: Canon, agent: str):
+    """L'admission unique d'une persona, ou None (aucune, ou plusieurs)."""
+    found = canon.placements_of(agent)
+    return found[0] if len(found) == 1 else None
+
+
+
 @dataclass
 class Verdict:
     """Le placement d'un agent sur un hôte est-il admis ?
@@ -85,22 +109,22 @@ class Verdict:
 
 
 def evaluate(canon: Canon, agent: str, host: str) -> Verdict:
-    """Admissibilité du placement de `agent` sur `host` (C4), fail closed.
+    """Admissibilité de `agent` sur `host` (C4, L31), fail closed.
 
-    Refusé si la fiche Agent est absente ou en double, si l'agent n'a pas de
-    placement sur cet hôte, s'il est placé plusieurs fois (placement ambigu),
-    si l'hôte n'a pas de fiche Host (politique inconnue) ou en a plusieurs, ou
-    si la politique de l'hôte refuse le harnais, le fournisseur, le modèle ou
-    le mode d'identifiants (`canon.placement_violations`).
+    Refusé si la fiche Agent est absente ou en double, si l'agent n'a pas
+    d'admission ou en a plusieurs (ambiguë), si `host` n'est pas admis par
+    l'admission (hôtes nommés ou étiquettes), si l'hôte n'a pas de fiche Host
+    (politique inconnue) ou en a plusieurs, ou si la politique de l'hôte
+    refuse le harnais, le fournisseur, le modèle ou le mode d'identifiants
+    (`canon.placement_violations`).
     """
     fiches = [a for a in canon.agents if a.title == agent]
     placements = canon.placements_of(agent)
-    here = [p for p in placements if p.host == host]
-    placement = here[0] if here else None
+    admission = placements[0] if len(placements) == 1 else None
     fiche = fiches[0] if fiches else None
     verdict = Verdict(
-        agent, host, False, ref=placement.fiche.ref if placement else None,
-        credential_mode=((placement.credential_mode if placement else None)
+        agent, host, False, ref=admission.fiche.ref if admission else None,
+        credential_mode=((admission.credential_mode if admission else None)
                          or (fiche.credential_mode if fiche else None)))
     if fiche is None:
         verdict.diagnostic = "fiche Agent %s introuvable dans le canon" % agent
@@ -109,14 +133,11 @@ def evaluate(canon: Canon, agent: str, host: str) -> Verdict:
         verdict.diagnostic = "fiche Agent %s déclarée %d fois : placement ambigu" % (
             agent, len(fiches))
         return verdict
-    if placement is None:
-        verdict.diagnostic = "aucun placement de %s sur %s (%s)" % (
-            agent, host, "placé sur : %s" % ", ".join(p.host or "?" for p in placements)
-            if placements else "agent sans placement")
-        return verdict
     if len(placements) > 1:
-        verdict.diagnostic = "placement ambigu : %s placé %d fois (%s)" % (
-            agent, len(placements), ", ".join(p.host or "?" for p in placements))
+        verdict.diagnostic = "admission ambiguë : %s admis %d fois" % (agent, len(placements))
+        return verdict
+    if admission is None:
+        verdict.diagnostic = "aucune admission de %s" % agent
         return verdict
     hosts = [h for h in canon.hosts if h.title == host]
     if not hosts:
@@ -125,23 +146,29 @@ def evaluate(canon: Canon, agent: str, host: str) -> Verdict:
     if len(hosts) > 1:
         verdict.diagnostic = "hôte %s déclaré %d fois : politique ambiguë" % (host, len(hosts))
         return verdict
-    reasons = canon_mod.placement_violations(fiche, hosts[0], placement)
+    admis = admitted_hosts(canon, admission)
+    if host not in admis:
+        verdict.diagnostic = "hôte %s non admis pour %s (admis : %s)" % (
+            host, agent, ", ".join(admis) or "aucun")
+        return verdict
+    reasons = canon_mod.placement_violations(fiche, hosts[0], admission)
     verdict.ok = not reasons
     verdict.diagnostic = " ; ".join(reasons)
     return verdict
 
 
 def verdicts(canon: Canon, host: str | None = None) -> list[Verdict]:
-    """Un verdict par placement (agent, hôte) du canon, ou de `host` seulement."""
+    """Un verdict par couple (agent, hôte admis) du canon, ou de `host`."""
     seen: dict[tuple[str, str], Verdict] = {}
-    for placement in canon.placements:
-        if not placement.agent or not placement.host:
+    for admission in canon.placements:
+        if not admission.agent:
             continue
-        if host is not None and placement.host != host:
-            continue
-        key = (placement.agent, placement.host)
-        if key not in seen:
-            seen[key] = evaluate(canon, *key)
+        for name in admitted_hosts(canon, admission):
+            if host is not None and name != host:
+                continue
+            key = (admission.agent, name)
+            if key not in seen:
+                seen[key] = evaluate(canon, *key)
     return [seen[key] for key in sorted(seen)]
 
 
@@ -149,13 +176,13 @@ def proposals(canon: Canon, agent: str,
               findings: list[Finding] | None = None) -> list[dict]:
     """Chaque hôte du canon : `agent` y serait-il admis, et avec quel mode ?
 
-    Admissible : la politique de l'hôte admet le harnais, le fournisseur et le
+    Admissible : l'admission de l'agent admet cet hôte (hôtes nommés ou
+    étiquettes), la politique de l'hôte admet le harnais, le fournisseur et le
     modèle de l'agent, au moins un mode d'identifiants, il reste de la place
     (`max_agents`, sans compter l'agent lui-même), et la fiche Host n'a pas
-    d'erreur bloquante. `credential_modes` : les modes admis (None = tous) ;
-    `credential_mode` : celui de la fiche s'il est admis, sinon le premier
-    admis — le placement peut le fixer. Rien n'est écrit : c'est une
-    proposition au responsable du projet.
+    d'erreur bloquante. `admitted` dit si l'admission couvre l'hôte ;
+    `credential_modes` : les modes admis (None = tous). Rien n'est écrit :
+    c'est une proposition au responsable du projet.
     """
     fiche = canon.agent(agent)
     if fiche is None:
@@ -163,24 +190,31 @@ def proposals(canon: Canon, agent: str,
     if findings is None:
         findings = canon_mod.validate(canon)
     block = canon_mod.blocking(findings)
-    placed = {p.host: p for p in canon.placements_of(agent) if p.host}
+    admission = admission_of(canon, agent)
+    admis = set(admitted_hosts(canon, admission))
     out = []
     for title in sorted({h.title for h in canon.hosts}):
         hosts = [h for h in canon.hosts if h.title == title]
         reasons: list[str] = []
         modes: list[str] | None = None
+        if admission is None:
+            reasons.append("aucune admission de %s, ou plusieurs (ambiguë)" % agent)
+        elif title not in admis:
+            reasons.append("hôte %s non admis pour %s (admis : %s)" % (
+                title, agent, ", ".join(sorted(admis)) or "aucun"))
         if len(hosts) > 1:
             reasons.append("hôte %s déclaré %d fois : politique ambiguë" % (title, len(hosts)))
         else:
             policy = hosts[0].policy
-            # harnais, fournisseur, modèle : ce que le placement ne peut pas changer
+            # harnais, fournisseur, modèle : ce que l'admission ne peut pas changer
             reasons += canon_mod.placement_violations(fiche, {"title": title, "policy": {
                 "harnesses": policy.harnesses, "providers": policy.providers,
                 "models": policy.models}})
             modes = None if policy.credential_modes is None else list(policy.credential_modes)
             if modes == []:
                 reasons.append("aucun mode d'identifiants admis par l'hôte %s" % title)
-            others = [p for p in canon.placements if p.host == title and p.agent != agent]
+            others = [p for p in canon.placements if p.agent != agent
+                      and title in admitted_hosts(canon, p)]
             if policy.max_agents is not None and len(others) >= policy.max_agents:
                 reasons.append("hôte %s complet : %d placement(s) pour max_agents = %d"
                                % (title, len(others), policy.max_agents))
@@ -192,12 +226,13 @@ def proposals(canon: Canon, agent: str,
             mode = fiche.credential_mode
         else:
             mode = modes[0] if modes else None
-        current = placed.get(title)
+        current = title in admis
         out.append({
-            "host": title, "admissible": not reasons, "credential_modes": modes,
-            "credential_mode": mode, "current": current is not None,
-            "current_credential_mode": (current.credential_mode or fiche.credential_mode)
-            if current is not None else None,
+            "host": title, "admissible": not reasons, "admitted": title in admis,
+            "credential_modes": modes,
+            "credential_mode": mode, "current": current,
+            "current_credential_mode": (admission.credential_mode or fiche.credential_mode)
+            if current and admission is not None else None,
             "reasons": reasons,
         })
     return out
@@ -205,14 +240,15 @@ def proposals(canon: Canon, agent: str,
 
 def report(canon: Canon, agent: str | None = None,
            findings: list[Finding] | None = None) -> list[dict]:
-    """`ameesh placement check` : placements actuels et admissibles, par agent."""
+    """`ameesh placement check` : admissions actuelles et hôtes admissibles, par agent."""
     if findings is None:
         findings = canon_mod.validate(canon)
     names = [agent] if agent else sorted({a.title for a in canon.agents})
     out = []
     for name in names:
         fiche = canon.agent(name)
-        hosts = list(dict.fromkeys(p.host for p in canon.placements_of(name) if p.host))
+        admission = admission_of(canon, name)
+        hosts = admitted_hosts(canon, admission)
         choices = proposals(canon, name, findings)
         out.append({
             "agent": name, "known": fiche is not None,
@@ -220,6 +256,7 @@ def report(canon: Canon, agent: str | None = None,
             "provider": fiche.provider if fiche else None,
             "model": fiche.model if fiche else None,
             "credential_mode": fiche.credential_mode if fiche else None,
+            "admitted": hosts,
             "placements": [evaluate(canon, name, h).to_dict() for h in hosts],
             "admissible": [c for c in choices if c["admissible"]],
             "refused": [c for c in choices if not c["admissible"]],

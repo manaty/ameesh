@@ -711,6 +711,13 @@ class Agent:
     tools: list[str] | None
     reviewers: list[str] | None
     fiche: Fiche
+    #: priorité de la persona (L31, 0028) : sous pression critique de l'hôte,
+    #: les agents de plus faible priorité sont mis en pause ; 0 par défaut.
+    priority: int = 0
+    #: dépôt de mémoire de la persona (L31, 0029) : `memory.repository` de la
+    #: fiche ; seul renseignement lu par la règle de visibilité (jamais un
+    #: secret, jamais un droit).
+    memory_repository: str | None = None
 
 
 @dataclass
@@ -720,6 +727,29 @@ class HostPolicy:
     models: list[str] | None = None
     credential_modes: list[str] | None = None
     max_agents: int | None = None
+    #: seuils de ressources de l'hôte (L31, 0028) : mapping
+    #: `{min_mem_available, max_swap_used, max_load, min_disk_free}` ; None =
+    #: valeurs par défaut prudentes (`ameesh.resources`).
+    resources: dict | None = None
+    #: racine de travail par projet (L31, 0029) : `work_roots[projet]` sinon
+    #: `work_root/<projet>` ; remplace le `cwd` d'une admission. None = pas de
+    #: dossier déduit.
+    work_root: str | None = None
+    work_roots: dict | None = None
+
+    def work_dir(self, project: str | None) -> str | None:
+        """Dossier de travail d'un projet sur cet hôte, ou None.
+
+        Un projet déclaré dans `work_roots` gagne ; sinon `work_root/<projet>`.
+        Sans projet, `work_root` lui-même."""
+        roots = self.work_roots or {}
+        if project and project in roots:
+            return str(roots[project])
+        if not self.work_root:
+            return None
+        if project:
+            return os.path.join(self.work_root, project)
+        return self.work_root
 
 
 @dataclass
@@ -728,16 +758,45 @@ class Host:
     responsible: str | None
     policy: HostPolicy
     fiche: Fiche
+    #: étiquettes de l'hôte (L31, 0029) : une admission peut viser des
+    #: `host_tags` au lieu de nommer les hôtes.
+    tags: list[str] | None = None
+    #: administrateurs humains de l'hôte (L31, 0029) : avec le responsable, ce
+    #: sont eux qui doivent avoir accès au dépôt de mémoire d'une persona pour
+    #: qu'elle tourne ici.
+    admins: list[str] | None = None
 
 
 @dataclass
 class Placement:
+    """Une ADMISSION (L31, 0029) : persona → hôtes ou étiquettes d'hôtes admis.
+
+    Plus de `cwd` (le dossier de travail est un réglage de l'hôte) ; les
+    anciennes fiches qui en portent un sont lues avec un constat
+    `admission-cwd-ignored`. `host` reste lu comme un hôte admis unique
+    (lecture transitoire des anciennes fiches)."""
+
     title: str
     agent: str | None
     host: str | None
     credential_mode: str | None
     cwd: str | None
     fiche: Fiche
+    #: hôtes admis (L31, 0029) et étiquettes d'hôtes admis ; lus avec l'ancien
+    #: `host` (hôte unique) et l'ancien `cwd` (ignoré).
+    hosts: list[str] | None = None
+    host_tags: list[str] | None = None
+
+    def host_names(self) -> list[str]:
+        """Hôtes NOMMÉS admis (l'ancien `host` compris), sans doublon."""
+        out: list[str] = []
+        for name in ([self.host] if self.host else []) + list(self.hosts or []):
+            if name and name not in out:
+                out.append(name)
+        return out
+
+    def tags(self) -> list[str]:
+        return [t for t in (self.host_tags or []) if t]
 
 
 @dataclass
@@ -839,18 +898,21 @@ class Canon:
             "sources": [s.to_dict() for s in self.sources],
             "members": [dict(title=m.title, roles=m.roles, **fiche(m.fiche))
                         for m in self.members],
-            "hosts": [dict(title=h.title, responsible=h.responsible,
+            "hosts": [dict(title=h.title, responsible=h.responsible, tags=h.tags,
+                           admins=h.admins,
                            policy=h.policy.__dict__.copy(), **fiche(h.fiche))
                       for h in self.hosts],
             "agents": [dict(title=a.title, responsible=a.responsible, team=a.team,
                             capabilities=a.capabilities, harness=a.harness, model=a.model,
                             provider=a.provider, credential_mode=a.credential_mode,
                             budget_usd_per_day=a.budget_usd_per_day, tools=a.tools,
-                            reviewers=a.reviewers,
+                            reviewers=a.reviewers, priority=a.priority,
+                            memory_repository=a.memory_repository,
                             hosts=[p.host for p in self.placements_of(a.title)],
                             **fiche(a.fiche))
                        for a in self.agents],
             "placements": [dict(title=p.title, agent=p.agent, host=p.host,
+                                hosts=p.hosts, host_tags=p.host_tags,
                                 credential_mode=p.credential_mode, cwd=p.cwd, **fiche(p.fiche))
                            for p in self.placements],
             "packages": [dict(id=w.id, title=w.title, kind=w.kind, parent=w.parent,
@@ -1596,6 +1658,25 @@ class _Loader:
                          "budget_usd_per_day illisible : %r (ignoré)" % (budget,), **where,
                          **subject)
                 budget = None
+        priority = fiche.data.get("priority")
+        if priority is not None:
+            try:
+                priority = int(priority)
+                if priority < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                self.add("agent-priority-invalid", WARNING,
+                         "priority illisible : %r (0 par défaut)" % (priority,), **where,
+                         **subject)
+                priority = None
+        memory = fiche.data.get("memory")
+        memory_repository = None
+        if memory is not None:
+            if not isinstance(memory, dict):
+                self.add("agent-memory-invalid", WARNING,
+                         "`memory` : mapping attendu (ignoré)", **where, **subject)
+            else:
+                memory_repository = _text(memory.get("repository"))
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
@@ -1609,6 +1690,8 @@ class _Loader:
             budget_usd_per_day=budget,
             tools=self._list(fiche, "tools", where, "agent-tools-invalid", **subject),
             reviewers=self._list(fiche, "reviewers", where, "agent-reviewers-invalid", **subject),
+            priority=0 if priority is None else priority,
+            memory_repository=memory_repository,
             fiche=fiche,
         ))
 
@@ -1643,17 +1726,90 @@ class _Loader:
                     self.add("host-policy-invalid", ERROR,
                              "`policy.max_agents` : entier positif attendu", **where, **subject)
                     policy.max_agents = 0
+            # Seuils de ressources (L31, 0028) : un mapping dont chaque clé est
+            # validée ici ; une clé illisible est une erreur (fail closed sur le
+            # seuil, qui retombe alors sur sa valeur par défaut prudente).
+            if raw.get("resources") is not None:
+                policy.resources = self._host_resources(raw["resources"], where, subject)
+            # Racines de travail (L31, 0029) : le dossier de travail d'une
+            # session est un réglage de l'hôte, plus du placement.
+            policy.work_root = _text(raw.get("work_root"))
+            roots = raw.get("work_roots")
+            if roots is not None:
+                if not isinstance(roots, dict) or not all(
+                        isinstance(k, str) and _text(v) for k, v in roots.items()):
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.work_roots` : mapping {projet: chemin} attendu",
+                             **where, **subject)
+                else:
+                    policy.work_roots = {str(k).strip(): str(v).strip()
+                                         for k, v in roots.items()}
+        tags = self._list(fiche, "tags", where, "host-tags-invalid", **subject)
+        admins = self._list(fiche, "admins", where, "host-admins-invalid", **subject)
         self.canon.hosts.append(Host(title=fiche.title,
                                      responsible=_text(fiche.data.get("responsible")),
-                                     policy=policy, fiche=fiche))
+                                     policy=policy, tags=tags, admins=admins, fiche=fiche))
+
+    def _host_resources(self, raw, where: dict, subject: dict) -> dict | None:
+        """Seuils `policy.resources` validés, ou None si rien n'est déclaré.
+
+        Chaque clé illisible est une erreur de `canon check` ; les clés
+        inconnues sont conservées avec un avertissement (OKF tolère les clés
+        inconnues, mais pas dans une politique qui gouverne des tours)."""
+        from . import resources as resources_mod  # import tardif : pas de cycle
+
+        if not isinstance(raw, dict):
+            self.add("host-policy-invalid", ERROR,
+                     "`policy.resources` : mapping attendu", **where, **subject)
+            return None
+        parsed: dict = {}
+        for key in resources_mod.THRESHOLD_KEYS:
+            value = raw.get(key)
+            if value is None:
+                continue
+            if key == "max_load":
+                try:
+                    number = float(value)
+                    if number < 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.resources.max_load` : nombre positif attendu",
+                             **where, **subject)
+                    continue
+                parsed[key] = number
+            else:
+                octets = resources_mod.parse_bytes(value)
+                if octets is None:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.resources.%s` : taille en octets attendue (ex. 1GiB)"
+                             % key, **where, **subject)
+                    continue
+                parsed[key] = octets
+        for unknown in sorted(set(raw) - set(resources_mod.THRESHOLD_KEYS)):
+            self.add("host-resources-unknown", WARNING,
+                     "`policy.resources.%s` : clé inconnue (ignorée)" % unknown,
+                     **where, **subject)
+        return parsed or None
 
     def _build_placement(self, fiche: Fiche, where: dict) -> None:
+        subject = {"agent": _text(fiche.data.get("agent")) or fiche.title}
+        cwd = _text(fiche.data.get("cwd"))
+        if cwd:
+            # L31 (0029) : le dossier de travail est un réglage de l'hôte ; le
+            # `cwd` d'une admission est lu puis ignoré (lecture transitoire).
+            self.add("admission-cwd-ignored", WARNING,
+                     "`cwd` %r ignoré : le dossier de travail est un réglage de l'hôte "
+                     "(`policy.work_roots`)" % cwd, **where, **subject)
         self.canon.placements.append(Placement(
             title=fiche.title,
             agent=_text(fiche.data.get("agent")),
             host=_text(fiche.data.get("host")),
+            hosts=self._list(fiche, "hosts", where, "admission-hosts-invalid", **subject),
+            host_tags=self._list(fiche, "host_tags", where, "admission-tags-invalid",
+                                 **subject),
             credential_mode=_text(fiche.data.get("credential_mode")),
-            cwd=_text(fiche.data.get("cwd")),
+            cwd=cwd,
             fiche=fiche,
         ))
 
@@ -1817,51 +1973,60 @@ def validate(canon: Canon) -> list[Finding]:
                     % (host.title, name, ", ".join(sorted(known_harnesses)) or "aucun"),
                     host.fiche, host=host.title)
 
-    # -- placements ----------------------------------------------------------------------
+    # -- admissions (ex-placements, L31/0029) --------------------------------------------
     host_names = {h.title for h in canon.hosts}
+    known_tags = {tag for h in canon.hosts for tag in (h.tags or [])}
     by_agent: dict[str, list[Placement]] = defaultdict(list)
-    by_host: dict[str, list[Placement]] = defaultdict(list)
+    #: hôte -> {id(admission): admission} (un hôte nommé ET étiqueté ne compte qu'une fois)
+    by_host: dict[str, dict[int, Placement]] = defaultdict(dict)
     for placement in canon.placements:
         f = placement.fiche
-        if not placement.agent or not placement.host:
+        if not placement.agent:
+            add("placement-incomplete", ERROR, "admission sans `agent`", f)
+            continue
+        if not placement.host_names() and not placement.tags():
             add("placement-incomplete", ERROR,
-                "placement sans %s" % ("`agent`" if not placement.agent else "`host`"), f,
-                **({"agent": placement.agent} if placement.agent else
-                   {"host": placement.host} if placement.host else {}))
+                "admission de %s sans `hosts` ni `host_tags`" % placement.agent, f,
+                agent=placement.agent)
             continue
         by_agent[placement.agent].append(placement)
-        by_host[placement.host].append(placement)
         if placement.agent not in agent_names:
             add("placement-agent-unknown", ERROR,
-                "placement vers un agent inconnu : %s" % placement.agent, f,
+                "admission vers un agent inconnu : %s" % placement.agent, f,
                 agent=placement.agent)
-        if placement.host not in host_names:
-            add("placement-host-unknown", ERROR,
-                "placement de %s vers un hôte inconnu : %s" % (placement.agent, placement.host),
-                f, agent=placement.agent)
-        agent = canon.agent(placement.agent)
-        host = canon.host(placement.host)
-        if agent is not None and host is not None:
-            for reason in placement_violations(agent, host, placement):
-                add("placement-policy-violation", ERROR,
-                    "%s sur %s : %s" % (agent.title, host.title, reason), f,
-                    agent=agent.title)
-        if placement.cwd and not (placement.cwd.startswith("~") or os.path.isabs(placement.cwd)):
-            add("placement-cwd-invalid", WARNING,
-                "cwd %r de %s : chemin absolu ou ~/… attendu" % (placement.cwd, placement.agent),
-                f, agent=placement.agent)
+        cibles = set(placement.host_names())
+        for tag in placement.tags():
+            if tag not in known_tags:
+                add("admission-tag-unknown", WARNING,
+                    "admission de %s : étiquette `%s` ne correspond à aucun hôte"
+                    % (placement.agent, tag), f, agent=placement.agent)
+            cibles |= {h.title for h in canon.hosts if tag in (h.tags or [])}
+        for name in sorted(cibles):
+            if name not in host_names:
+                add("placement-host-unknown", ERROR,
+                    "admission de %s vers un hôte inconnu : %s" % (placement.agent, name),
+                    f, agent=placement.agent)
+                continue
+            by_host[name][id(placement)] = placement
+            agent = canon.agent(placement.agent)
+            host = canon.host(name)
+            if agent is not None and host is not None:
+                for reason in placement_violations(agent, host, placement):
+                    add("placement-policy-violation", ERROR,
+                        "%s sur %s : %s" % (agent.title, host.title, reason), f,
+                        agent=agent.title)
     for name, group in by_agent.items():
         if len(group) > 1:
             for placement in group:
                 add("placement-duplicate", ERROR,
-                    "agent %s placé %d fois (%s)" % (
-                        name, len(group), ", ".join(p.host or "?" for p in group)),
+                    "agent %s admis %d fois (%s)" % (
+                        name, len(group), ", ".join(p.agent or "?" for p in group)),
                     placement.fiche, agent=name)
     for host in canon.hosts:
         limit = host.policy.max_agents
-        if limit is not None and len(by_host.get(host.title, [])) > limit:
+        if limit is not None and len(by_host.get(host.title, {})) > limit:
             add("host-max-agents", ERROR,
-                "hôte %s : %d placements pour max_agents = %d"
+                "hôte %s : %d admissions pour max_agents = %d"
                 % (host.title, len(by_host[host.title]), limit), host.fiche, host=host.title)
 
     # -- politique de revue par classe (décision 0018 point 1, R19) ------------
