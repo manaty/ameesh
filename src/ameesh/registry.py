@@ -279,6 +279,20 @@ def set_pending_prompt(db: Db, name: str, prompt: str | None) -> None:
     storage.of(db).agents.set_pending_prompt(name, prompt)
 
 
+def set_marked_block(db: Db, name: str, owner: str, epoch: int, status_text: str,
+                     error: str, error_prefix: str) -> str:
+    """Blocage marqué fencé par le bail (L35) : "done" | "kept" | "lease"."""
+    return storage.of(db).leases.set_marked_block(name, owner, epoch, status_text,
+                                                  error, error_prefix)
+
+
+def clear_marked_block(db: Db, name: str, owner: str, epoch: int, status_text: str,
+                       error_prefix: str) -> str:
+    """Levée du blocage marqué fencée par le bail (L35) : "done" | "kept" | "lease"."""
+    return storage.of(db).leases.clear_marked_block(name, owner, epoch, status_text,
+                                                    error_prefix)
+
+
 def take_pending_prompt(db: Db, name: str, owner: str, epoch: int) -> str | None:
     """Consomme la consigne en attente, atomiquement, et passe l'agent en `running`.
 

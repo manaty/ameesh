@@ -484,14 +484,69 @@ class Leases(interface.Leases):
         )
         return bool(rows)
 
+    #: blocage marqué (L35) : même forme que `pause` — verrou de ligne d'abord,
+    #: bail (propriétaire, epoch, échéance `clock_timestamp()`) et état
+    #: recontrôlés dans l'écriture. La décision est cette seule instruction ;
+    #: si elle n'écrit rien, une lecture dit seulement POURQUOI (bail ou statut
+    #: concurrent), sans rien décider : un bail perdu entre les deux ne peut
+    #: que faire répondre « lease », ce qui arrête le worker de toute façon.
+    _MARKED = """
+        WITH verrou AS (
+            SELECT name, status, status_text, last_error, lease_owner, lease_epoch,
+                   lease_expires_at
+              FROM agent_registry WHERE name = %%s FOR UPDATE
+        )
+        UPDATE agent_registry AS r
+           SET %s,
+               last_seen = now(), updated_at = now()
+          FROM verrou
+         WHERE r.name = verrou.name
+           AND verrou.lease_owner = %%s AND verrou.lease_epoch = %%s
+           AND verrou.lease_expires_at > clock_timestamp()
+           AND %s
+        RETURNING r.name
+    """
+    _MARK_OK = ("verrou.status_text = %s"
+                " AND starts_with(coalesce(verrou.last_error, ''), %s)")
+
+    def _marked_issue(self, rows, name, owner, epoch) -> str:
+        if rows:
+            return "done"
+        bail = self.db.query(
+            """
+            SELECT (lease_owner = %s AND lease_epoch = %s
+                    AND lease_expires_at > clock_timestamp()) AS ok
+              FROM agent_registry WHERE name = %s
+            """, (owner, int(epoch), name))
+        return "kept" if bail and bail[0]["ok"] else "lease"
+
+    def set_marked_block(self, name, owner, epoch, status_text, error, error_prefix) -> str:
+        sql = self._MARKED % (
+            "status = 'blocked', status_text = %s, last_error = %s",
+            "verrou.status <> 'stopped' AND (verrou.status <> 'blocked' OR ("
+            + self._MARK_OK + "))")
+        rows = self.db.query(sql, (name, status_text, error, owner, int(epoch),
+                                   status_text, error_prefix))
+        return self._marked_issue(rows, name, owner, epoch)
+
+    def clear_marked_block(self, name, owner, epoch, status_text, error_prefix) -> str:
+        sql = self._MARKED % (
+            "status = CASE WHEN r.pending_prompt IS NULL THEN 'idle' ELSE 'queued' END,"
+            " status_text = '', last_error = NULL",
+            "verrou.status = 'blocked' AND " + self._MARK_OK)
+        rows = self.db.query(sql, (name, owner, int(epoch), status_text, error_prefix))
+        return self._marked_issue(rows, name, owner, epoch)
+
     def take_pending_prompt(self, name, owner, epoch) -> str | None:
         """Verrou pris d'abord, échéance recontrôlée avec `clock_timestamp()`
         dans l'écriture (grille codex3) : une consigne n'est pas consommée
-        sous un bail expiré pendant l'attente du verrou."""
+        sous un bail expiré pendant l'attente du verrou, ni par un agent
+        arrêté entre la lecture du registre et cette écriture (L35)."""
         rows = self.db.query(
             """
             WITH verrou AS (
-                SELECT name, pending_prompt, lease_owner, lease_epoch, lease_expires_at
+                SELECT name, status, pending_prompt, lease_owner, lease_epoch,
+                       lease_expires_at
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
@@ -504,6 +559,7 @@ class Leases(interface.Leases):
              WHERE r.name = verrou.name
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
                AND verrou.pending_prompt IS NOT NULL
+               AND verrou.status <> 'stopped'
                AND verrou.lease_expires_at > clock_timestamp()
             RETURNING verrou.pending_prompt
             """,
@@ -515,7 +571,7 @@ class Leases(interface.Leases):
         rows = self.db.query(
             """
             WITH verrou AS (
-                SELECT name, lease_owner, lease_epoch, lease_expires_at
+                SELECT name, status, lease_owner, lease_epoch, lease_expires_at
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
@@ -524,6 +580,7 @@ class Leases(interface.Leases):
              WHERE r.name = verrou.name
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
                AND verrou.lease_expires_at > clock_timestamp()
+               AND verrou.status <> 'stopped'   -- arrêté entre lecture et tour (L35)
             RETURNING r.name
             """,
             (name, status_text, owner, epoch),

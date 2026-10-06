@@ -150,9 +150,34 @@ policy:
     max_swap_used: 8GiB
     max_load: 24
     min_disk_free: 2GiB
-  work_roots: {acme-web: ~/acme/acme-web}   # dossier de travail par projet (L31)
+  work_dirs: {deepseek7: ~/wt/deepseek7-lot12}   # dossier par agent (L35), prioritaire
+  work_roots: {acme-web: ~/acme/acme-web, nexlink: "~/dev/nexlink-{agent}"}   # par projet (L31)
   work_root: ~/src               # défaut : work_root/<projet>
 ```
+
+**Dossier de travail d'un agent sur l'hôte** (L31, 0029 ; L35) : c'est un
+réglage de l'hôte, jamais de la persona. Ordre de résolution, le premier qui
+donne un chemin gagne :
+
+1. `work_dirs[<agent>]` — un dossier nommé pour un agent précis ;
+2. `work_roots[<projet>]` — le projet est l'équipe (`team`) de l'agent ;
+3. `work_root/<projet>` (sans projet : `work_root`) ;
+4. **repli transitoire** : le `cwd` d'une ancienne fiche `Placement`
+   (constat `admission-cwd-inherited`, note de `canon sync`) ;
+5. rien : `cwd` vide au registre, constat `host-work-dir-missing`.
+
+Les trois formes de la politique acceptent le gabarit **`{agent}`**, remplacé
+par le nom de l'agent (`~/dev/nexlink-{agent}` → `~/dev/nexlink-codex2`). C'est
+la forme retenue pour « un worktree par agent » : une seule ligne exprime la
+convention d'un hôte entier, reste une règle de l'hôte (0029 : la persona n'a
+pas de position) et ne demande aucune mise à jour du canon quand un agent est
+admis. `work_dirs` couvre les **exceptions** (un agent dont le dossier ne suit
+pas la convention) ; il ne sert pas de registre complet des positions. Tout
+autre gabarit (`{projet}`, `{}`), une accolade orpheline ou un chemin vide est
+une erreur `host-policy-invalid` de `canon check` et le chemin n'est pas
+retenu : une faute de frappe ne devient jamais un dossier littéral. Un
+`work_dirs` qui nomme un agent absent du canon est un avertissement
+(`host-work-dir-agent-unknown`).
 
 **`type: Placement`** — une **admission** (L31, 0029) : persona → hôtes admis
 (noms ou étiquettes), sans `cwd` ; l'hôte et le dossier de travail sont de
@@ -168,8 +193,19 @@ credential_mode: api-key
 ```
 
 Les anciennes fiches (`host:` unique, `cwd:`) restent lues : `host` vaut un
-hôte admis unique et `cwd` est **ignoré** avec le constat
-`admission-cwd-ignored` (le dossier vient de `policy.work_roots` de l'hôte).
+hôte admis unique. Leur `cwd` est **ignoré** (`admission-cwd-ignored`) sur un
+hôte dont la politique donne un dossier pour l'agent ; sur un hôte qui n'en
+donne pas, il sert de **repli transitoire** (L35, `admission-cwd-inherited` :
+« cwd hérité de la fiche Placement, à migrer vers `policy.work_dirs` /
+`work_roots` »). L31 l'ignorait toujours : un hôte qui n'avait rien déclaré
+recevait un `cwd` vide et ses agents restaient bloqués à la mise à jour.
+
+**Calendrier de retrait du repli** : lu et signalé dès L35 (v1.3.x / v1.4) ;
+**retiré au plus tard en v1.5.0** — le `cwd` d'une admission redevient
+seulement ignoré, et un hôte sans dossier déclaré donne `host-work-dir-missing`
+; en v2.0 un `cwd` d'admission devient une erreur. Le retrait n'a lieu
+qu'après que `canon check` ne rapporte plus aucun `admission-cwd-inherited`
+sur les canons connus.
 
 **`type: Member`** (humains) — `title: smichea`, `roles: [...]`,
 `authenticators:` liste d'empreintes de clés publiques enrôlées (C7).
@@ -241,10 +277,15 @@ Erreurs bloquantes : fiche `Agent` sans `responsible` ou avec `approve` dans
 `capabilities` ; `responsible` qui ne résout pas vers un `Member` humain ;
 `Placement` vers un agent ou un hôte inconnu, ou sans `hosts` ni `host_tags` ;
 admission qui viole la politique de l'hôte (C4) ; deux admissions pour un même
-agent ; `policy.resources` illisible (L31) ; **`harness` non vide sans
+agent ; `policy.resources` illisible (L31) ; `policy.work_root`,
+`work_roots` ou `work_dirs` illisible, vide ou au gabarit inconnu (L35) ;
+**`harness` non vide sans
 descripteur connu** (`agent-harness-unknown`, `host-harness-unknown`, L16).
 Avertissements : hôte sans admission, agent sans admission, agent sans
-`harness`, `cwd` d'admission ignoré (`admission-cwd-ignored`, L31), étiquette
+`harness`, `cwd` d'admission ignoré (`admission-cwd-ignored`, L31) ou hérité
+en repli (`admission-cwd-inherited`, L35), agent admis sans dossier de travail
+sur un hôte (`host-work-dir-missing`, L35), `work_dirs` vers un agent inconnu
+(`host-work-dir-agent-unknown`, L35), étiquette
 d'admission qui ne correspond à aucun hôte (`admission-tag-unknown`), clé de
 `policy.resources` inconnue. Sortie lisible et `--json` (code, gravité,
 fichier, explication), sur le modèle du validateur OKF Federation.
@@ -267,8 +308,9 @@ agent admis sur l'hôte courant, les colonnes **déclaratives** du registre
 `memory_repository`, `model`, `budget`, `responsible`, `team`,
 `credential_mode`, `canon_ref` = chemin + SHA du fichier). Il ne touche jamais
 aux colonnes d'**état** (bail, session, statut, dépense, consigne). Le `cwd`
-vient de `policy.work_roots` de l'hôte (racine de travail par projet), plus du
-placement. L'hôte de la ligne est un **état d'exécution** (0029) : `sync` ne
+vient de la politique de l'hôte (`work_dirs`, `work_roots`, `work_root`, §4.2),
+avec le repli transitoire sur le `cwd` d'une ancienne admission ; ce repli, ou
+l'absence de tout dossier, est écrit dans la ligne de `canon sync` de l'agent. L'hôte de la ligne est un **état d'exécution** (0029) : `sync` ne
 déplace jamais un agent dont l'hôte courant est admis, même s'il synchronise un
 autre hôte admis pour lui ; il le déplace seulement si son hôte courant n'est
 plus admis et qu'un autre l'est. Un agent retiré du canon passe `stopped` à la
@@ -286,6 +328,21 @@ Inchangé par rapport au banc actuel, sauf :
   est résolu (C3), que son placement est admis par la politique de l'hôte (C4)
   et que la règle de visibilité est satisfaite (L31, 0029). La raison du refus
   est écrite dans `status_text`.
+- **Dossier de travail absent** (L35) : le tour ne démarre pas, la consigne
+  repart en attente, l'agent passe `blocked` (« dossier absent ») avec **une**
+  ligne de journal. Tant que dure le blocage, rien n'est consommé : à chaque
+  sondage l'exécuteur relit la ligne du registre et contrôle son `cwd` (gratuit
+  et silencieux) ; un `canon sync` qui le corrige ou le dossier recréé
+  débloquent au sondage suivant, le statut est levé (`idle`, ou `queued` si une
+  consigne attend) même sans travail. L'essai complet (adoption d'un worktree
+  déplacé, 0018) suit une attente croissante par agent, 5 s → 5 min. Pose et
+  levée du blocage sont des transitions atomiques fencées par le bail
+  (propriétaire, epoch, échéance) : jamais par-dessus un arrêt ou un autre
+  blocage (budget, pression), et sous un bail perdu rien n'est écrit, rien
+  n'est consommé, le worker s'arrête. Une levée qui trouve un statut écrit
+  entre-temps le conserve et ne reprend pas dans ce sondage ; en défense,
+  la prise de consigne et le début de tour refusent atomiquement un agent
+  arrêté.
 - **Pression et déplacement** (L31, 0028) : avant chaque tour, les seuils de
   `policy.resources` de l'hôte sont comparés au dernier relevé ; un
   franchissement retient la consigne, et un franchissement critique met en
@@ -557,6 +614,7 @@ client ; migrations réservées ci-dessous ; aucune dépense, aucun service publ
 | L29 | plan de travail : fiches `WorkPackage` au canon avec parent (jalon → epic → lot), responsable et périmètre ; `work_items` reliés à leur fiche et à leur parent ; fermeture automatique sur fusion de la PR ; projection GitHub (une issue par lot, sous-issues de l'epic, labels d'état), GitHub restant une vue et ses modifications des propositions ([0005](decisions/0005-canon-okf.md)) ; epics dans `ameesh progress` | L2, L10, L24 | 0026 | codex3 |
 | L30 | comptes multiples par fournisseur ([0027](decisions/0027-bascule-automatique-entre-comptes.md)) : liste ordonnée de comptes par hôte (profils d'identifiants : dossier de configuration du harnais ou clé d'API), jauges par compte, bascule automatique avant chaque tour au lieu de la pause, retour au primaire après remise à zéro, continuité de session quand le harnais le permet, journal des bascules | L12, L13, L26 | 0028 | codex3 |
 | L31 | ressources des hôtes et répartition ([0028](decisions/0028-ressources-des-hotes-et-repartition.md)) : relevés mémoire/swap/CPU/disque par exécuteur et `ameesh hosts`, seuils dans la politique d'hôte, contre-pression avant chaque tour, ressources orphelines (processus et conteneurs rattachés aux tours), admissions (persona → hôtes ou étiquettes d'hôtes admis, sans `cwd`, [0029](decisions/0029-persona-et-session.md)) avec lecture transitoire des anciennes fiches `Placement`, placement des sessions et déplacement entre deux tours | L3, L26, L30 | 0029 | codex3 |
+| L35 | correctif de la bascule v1.3.0 (régression de L31) : dossier de travail par agent dans la politique d'hôte (`work_dirs`, gabarit `{agent}` dans `work_root`/`work_roots`, validés par `canon check`) ; repli transitoire sur le `cwd` des anciennes fiches `Placement` avec diagnostic (`admission-cwd-inherited`, note de `canon sync`, retrait au plus tard en v1.5.0) ; `host-work-dir-missing` ; exécuteur : plus de tentative ni de journal à chaque sondage quand le dossier manque (attente croissante bornée, reprise dès que le registre change, statut levé) | L31 | — | autre éditeur |
 
 Ordre : L2, L4 et L6 en parallèle dès maintenant (fichiers nouveaux) ; L1 et L8
 après la fusion de B5a (ils touchent `runner.py` et `registry.py`) ; puis L3,
