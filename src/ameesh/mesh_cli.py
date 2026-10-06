@@ -20,7 +20,8 @@
   agent-mesh export-v0 [--agents a,b] [--keep]        retour arrière : Postgres → boîte v0
   agent-mesh migrate | doctor [--notify-test | --probe]
   agent-mesh canon check|show|sync [--json] [--host H]   canon OKF (spec §4)
-  agent-mesh placement check [--agent A] [--json]        placement gouverné (C4)
+  agent-mesh placement check [--agent A] [--json]        admissions et hôtes admissibles (C4)
+  agent-mesh hosts [--json] [HÔTE] [--history N]         ressources des hôtes (L31)
   agent-mesh agent spawn <nom> --by <créateur> --ttl 2h   agent éphémère (R14)
 
 L'autorité du propriétaire ne se déduit jamais d'un texte : elle se prouve par
@@ -77,6 +78,22 @@ def _fmt_span(seconds: float | None) -> str:
     if seconds < 86400:
         return "%dh%02d" % (seconds // 3600, (seconds % 3600) // 60)
     return "%dj" % (seconds // 86400)
+
+
+#: unités binaires, du plus grand au plus petit
+_BYTE_UNITS = (("TiB", 1024 ** 4), ("GiB", 1024 ** 3), ("MiB", 1024 ** 2), ("KiB", 1024))
+
+
+def _fmt_bytes(value: int | None) -> str:
+    """Une taille lisible : « 3.2 GiB », « 0 B », « — » si inconnue."""
+    if value is None:
+        return "—"
+    value = int(value)
+    for label, factor in _BYTE_UNITS:
+        if abs(value) >= factor:
+            return "%.1f %s" % (value / factor, label)
+    return "%d B" % value
+
 
 
 def _fmt_moment(epoch: float | None) -> str:
@@ -151,6 +168,94 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
                                    if name in counts)
                 waiting = " — plus ancien gel : %s" % _fmt_age(now - oldest) if oldest else ""
                 print("lots     : %d (%s)%s" % (len(lots), detail, waiting))
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh hosts [--json] [HOST]` : ressources des hôtes (L31, 0028).
+
+    Le dernier relevé de chaque hôte connu (canon et/ou base), ses seuils
+    (politique de la fiche `Host`, valeurs par défaut comprises), l'état de
+    pression et l'historique court. En `--json`, un objet `ameesh-host/1` par
+    ligne.
+    """
+    from . import canon as canon_mod
+    from . import resources as res
+
+    db = _open(cfg)
+    try:
+        canon = None
+        if cfg.canon:
+            try:
+                canon = canon_mod.from_config(cfg)
+            except canon_mod.CanonError:
+                canon = None
+        latest_by_host = {row["host"]: row for row in res.current(db)}
+        names = set(latest_by_host)
+        if canon is not None:
+            names |= {h.title for h in canon.hosts}
+        if args.host:
+            names = {args.host}
+        if not names:
+            print("aucun hôte connu : ni mesure publiée, ni fiche Host au canon")
+            return 0
+        now = time.time()
+        for name in sorted(names):
+            host = canon.host(name) if canon is not None else None
+            policy = host.policy if host is not None else None
+            limits = res.thresholds(policy)
+            latest = latest_by_host.get(name)
+            verdict = res.pressure(latest, policy) if latest is not None else None
+            history = res.history(db, name, args.history)
+            if args.json:
+                print(json.dumps({
+                    "schema": "ameesh-host/1",
+                    "host": name,
+                    "responsible": host.responsible if host is not None else None,
+                    "limits": limits,
+                    "latest": latest,
+                    "pressure": verdict,
+                    "history": history,
+                }, ensure_ascii=False, sort_keys=True), flush=True)
+                continue
+            resp = ("responsable %s" % host.responsible) if host is not None and host.responsible \
+                else "hôte sans fiche Host" if host is None else "responsable inconnu"
+            if latest is None:
+                print("%s — %s ; aucune mesure publiée" % (name, resp))
+                continue
+            age = _fmt_age(now - float(latest.get("sampled_ts") or now))
+            print("%s — %s ; mesure %s" % (name, resp, age))
+            print("  seuils     mémoire ≥ %s ; swap ≤ %s ; charge ≤ %.2f ; disque ≥ %s"
+                  % (_fmt_bytes(limits["min_mem_available"]),
+                     _fmt_bytes(limits["max_swap_used"]), limits["max_load"],
+                     _fmt_bytes(limits["min_disk_free"])))
+            print("  état       mémoire %s ; swap %s ; charge %s ; disque %s ; tours %s"
+                  % (_fmt_bytes(latest.get("mem_available_bytes")),
+                     _fmt_bytes(latest.get("swap_used_bytes")),
+                     ("%.2f" % latest["load1"]) if latest.get("load1") is not None else "—",
+                     _fmt_bytes(latest.get("disk_free_bytes")),
+                     latest.get("turns_in_progress")
+                     if latest.get("turns_in_progress") is not None else "—"))
+            if verdict and verdict["breaches"]:
+                tag = "CRITIQUE" if verdict["critical"] else "PRESSION"
+                detail = " ; ".join(
+                    "%s %s (seuil %s)" % (b["label"],
+                                          _fmt_bytes(b["value"]) if b["key"] != "max_load"
+                                          else "%.2f" % b["value"],
+                                          _fmt_bytes(b["limit"]) if b["key"] != "max_load"
+                                          else "%.2f" % b["limit"])
+                    for b in verdict["breaches"])
+                print("  %s  %s" % (tag, detail))
+            else:
+                print("  pression   aucune")
+            if history:
+                trace = " ".join(
+                    "%s→%s" % (_fmt_bytes(row.get("mem_available_bytes")),
+                               ("%.1f" % row["load1"]) if row.get("load1") is not None else "—")
+                    for row in history)
+                print("  historique  %d relevé(s) : %s" % (len(history), trace))
         return 0
     finally:
         db.close()
@@ -920,6 +1025,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.add_argument("agent")
     p_show.add_argument("--json", action="store_true")
     p_show.set_defaults(func=cmd_show)
+
+    p_hosts = sub.add_parser("hosts", help="ressources des hôtes (L31)")
+    p_hosts.add_argument("host", nargs="?", default=None, help="un seul hôte (sinon tous)")
+    p_hosts.add_argument("--history", type=int, default=10,
+                         help="nombre de relevés de l'historique court (défaut 10)")
+    p_hosts.add_argument("--json", action="store_true", help="un objet JSON par hôte")
+    p_hosts.set_defaults(func=cmd_hosts)
 
     p_models = sub.add_parser("models", help="catalogue des modèles (L14)")
     models_sub = p_models.add_subparsers(dest="models_command")

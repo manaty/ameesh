@@ -2,9 +2,8 @@
 type: Placement
 title: ouvrier@banc
 agent: ouvrier
-host: banc
+hosts: [banc]
 credential_mode: api-key
-cwd: /srv/acme/ouvrier
 ---
 
 # ouvrier sur banc

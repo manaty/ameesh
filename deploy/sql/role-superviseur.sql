@@ -127,7 +127,14 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'placement_ok', 'placement_diagnostic', 'placement_ref',
         'placement_profile', 'lease_expires_ts', 'last_seen_ts',
         'last_turn_ts', 'key_ready', 'has_owner_key',
-        'ephemeral_expires_ts', 'responsible_ok', 'unread'
+        'ephemeral_expires_ts', 'responsible_ok', 'unread',
+        -- L26 (0027), désormais exposés par la vue : réglages sans contenu
+        'session_policy', 'effort', 'tier', 'session_work_item',
+        'status_since', 'restart_requested_at', 'session_reset_at',
+        -- L31 (0029) : priorité, admission déclarative, dépôt de mémoire et
+        -- verdict de visibilité (pas de contenu)
+        'priority', 'admitted_hosts', 'admitted_tags', 'memory_repository',
+        'visibility_ok', 'visibility_diagnostic'
     ]),
     ('agent_registry', ARRAY[
         'name', 'chantier', 'harness', 'host', 'cwd', 'session_id',
@@ -142,7 +149,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'placement_profile',
         -- L26 (0027) : réglages et état de session, sans contenu
         'session_policy', 'effort', 'tier', 'session_work_item',
-        'status_since', 'restart_requested_at', 'session_reset_at'
+        'status_since', 'restart_requested_at', 'session_reset_at',
+        -- L31 (0029) : priorité, admission déclarative, dépôt de mémoire et
+        -- verdict de visibilité (pas de contenu)
+        'priority', 'admitted_hosts', 'admitted_tags', 'memory_repository',
+        'visibility_ok', 'visibility_diagnostic'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
@@ -209,6 +220,21 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('provider_balances', ARRAY[
         'id', 'provider', 'currency', 'total', 'granted', 'topped_up', 'available',
         'observed_at', 'account'
+    ]),
+    -- ressources des hôtes (L31, 0029) : des mesures et l'état des ressources
+    -- d'un tour, jamais un contenu
+    ('host_resources', ARRAY[
+        'id', 'host', 'sampled_at', 'mem_available_bytes', 'swap_used_bytes',
+        'load1', 'cpu_count', 'disk_free_bytes', 'disk_path', 'turns_in_progress'
+    ]),
+    ('turn_resources', ARRAY[
+        'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',
+        'started_at', 'ended_at', 'status'
+    ]),
+    -- verdict de la règle de visibilité (L31, 0029) : état, jamais de secret
+    ('visibility_checks', ARRAY[
+        'persona', 'host', 'ok', 'diagnostic', 'repository', 'context',
+        'checked_at', 'expires_at'
     ]),
     ('turn_costs', ARRAY[
         'id', 'agent', 'harness', 'turn', 'model', 'session', 'usd',

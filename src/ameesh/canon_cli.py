@@ -13,10 +13,13 @@
                                          recopie Member.authenticators dans le registre
                                          de confiance (§8.2) ; code 1 si erreur
   ameesh placement check [--agent A] [--json]
-                                         placements actuels (admis ou refusés, et
-                                         pourquoi) et placements admissibles (hôtes,
+                                         admissions actuelles (hôtes admis, verdicts
+                                         de placement) et hôtes admissibles (hôtes,
                                          modes d'identifiants) ; lecture seule, code 1
-                                         si un placement est refusé
+                                         si une admission est refusée
+  ameesh hosts [--json] [HÔTE] [--history N]
+                                         ressources des hôtes (L31) : dernier relevé,
+                                         seuils, pression et historique court
   ameesh agent spawn <nom> --by <créateur> --ttl <durée> [--cwd DIR] [--prompt T]
 
 Options communes du canon : `--canon DOSSIER` (sinon AMEESH_CANON), `--ref REV`
@@ -207,23 +210,28 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     print("hôtes      :")
     for h in canon.hosts:
         p = h.policy
-        print("  %-14s %-18s harnais %s ; fournisseurs %s ; modes %s ; max %s" % (
+        print("  %-14s %-18s harnais %s ; fournisseurs %s ; modes %s ; max %s%s" % (
             h.title, h.responsible or "SANS RESPONSABLE",
             "tous" if p.harnesses is None else _join(p.harnesses),
             "tous" if p.providers is None else _join(p.providers),
             "tous" if p.credential_modes is None else _join(p.credential_modes),
-            "—" if p.max_agents is None else p.max_agents))
+            "—" if p.max_agents is None else p.max_agents,
+            " ; étiquettes %s" % _join(h.tags) if h.tags else ""))
     print("agents     :")
     for a in canon.agents:
-        hosts = [pl.host or "?" for pl in canon.placements_of(a.title)]
+        hosts = placement_mod.admitted_hosts(canon, placement_mod.admission_of(canon, a.title))
         print("  %-14s %-18s %-12s %s/%s/%s [%s] → %s" % (
             a.title, a.responsible or "SANS RESPONSABLE", a.team or "—",
             a.harness or "?", a.provider or "?", a.credential_mode or "?",
             _join(a.capabilities), _join(hosts)))
-    print("placements :")
+    print("admissions :")
     for pl in canon.placements:
-        print("  %-14s → %-12s %-13s %s" % (
-            pl.agent or "?", pl.host or "?", pl.credential_mode or "—", pl.cwd or "—"))
+        cibles = "%s%s" % (
+            _join(pl.host_names()),
+            " +étiquettes %s" % _join(pl.tags()) if pl.tags() else "")
+        print("  %-14s → %-24s %-13s%s" % (
+            pl.agent or "?", cibles or "—", pl.credential_mode or "—",
+            " (cwd ignoré : %s)" % pl.cwd if pl.cwd else ""))
     print("constats   : %s (détail : ameesh canon check)" % _summary(findings))
     return 0
 

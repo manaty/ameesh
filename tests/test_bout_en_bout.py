@@ -70,9 +70,11 @@ class BoutEnBoutTest(PgTestCase):
             "standing_approvals, standing_reservations, mesh_consumed_nonces "
             "RESTART IDENTITY CASCADE")
         self.ws = os.path.join(self.tmp, "essai")
-        self.travail = {name: os.path.join(self.ws, "travail", name)
+        # L31 (0029) : le dossier de travail est un réglage de l'hôte, une
+        # racine par projet ; les deux personas acme-web la partagent.
+        self.travail = {name: os.path.join(self.ws, "travail", PROJECT)
                         for name in ("orchestre", "relecteur")}
-        for path in self.travail.values():
+        for path in set(self.travail.values()):
             os.makedirs(path)
         self.gh_state = os.path.join(self.ws, "gh-etat.json")
         self.gh_log = os.path.join(self.ws, "gh-journal.jsonl")
@@ -199,18 +201,20 @@ class BoutEnBoutTest(PgTestCase):
 
     # 1 ----------------------------------------------------------------------
     def etape_1_canon_check(self) -> None:
-        """Canon d'exemple, cwd des placements de l'hôte atelier ramenés au bac à sable."""
+        """Canon d'exemple, racine de travail de l'hôte atelier ramenée au bac à sable."""
         source = os.path.join(self.ws, "source-canon")
         shutil.copytree(EXAMPLE, source)
-        for fiche, agent in (("orchestre-atelier.md", "orchestre"),
-                             ("relecteur-atelier.md", "relecteur")):
-            path = os.path.join(source, "placements", fiche)
-            with open(path, encoding="utf-8") as fh:
-                text = fh.read()
-            text, count = re.subn(r"(?m)^cwd: .*$", "cwd: %s" % self.travail[agent], text)
-            self.assertEqual(count, 1, fiche)
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(text)
+        # L31 (0029) : le dossier de travail vient de `policy.work_roots` de
+        # l'hôte, plus du `cwd` (ignoré) du placement.
+        path = os.path.join(source, "hotes", "atelier.md")
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        text, count = re.subn(r"(?m)^  work_roots: .*$",
+                              "  work_roots: {%s: %s}" % (PROJECT, self.travail["orchestre"]),
+                              text)
+        self.assertEqual(count, 1, "hotes/atelier.md")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
         _bare, self.clone = publish(os.path.join(self.ws, "depots"), "acme", source)
         self.commit = git(self.clone, "rev-parse", "origin/main")
 

@@ -18,6 +18,7 @@ from .canon import Canon, Ephemerals
 from .catalog import Catalog
 from .costs import TurnCosts
 from .grants import Grants
+from .hosts import Hosts, TurnResources, Visibility
 from .mailbox import Mailbox
 from .operations import Operations
 from .packages import WorkPackages
@@ -59,3 +60,6 @@ class PostgresStorage(interface.Storage):
         self.placements = Placements(db)
         self.progress = Progress(db)
         self.operations = Operations(db)
+        self.hosts = Hosts(db)
+        self.turn_resources = TurnResources(db)
+        self.visibility = Visibility(db)

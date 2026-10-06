@@ -63,11 +63,27 @@ os.environ["CODEX_HOME"] = EMPTY_CODEX_HOME
 #: ceux de l'hôte, et posent les leurs explicitement quand ils en ont besoin
 EMPTY_HARNESS_DIR = tempfile.mkdtemp(prefix="ameesh-test-harnesses-")
 os.environ["AMEESH_HARNESSES_DIR"] = EMPTY_HARNESS_DIR
+
+#: barème de prix ABSENT : le fichier de prix de l'hôte
+#: (~/.config/nexlink-agents/prices.json) ne fuit pas dans les tests, ni dans
+#: le processus (l'exécuteur construit son `CostBook` en mémoire) ni dans les
+#: sous-processus. Les tests de tarif posent leur propre `AMEESH_PRICES`.
+EMPTY_PRICES = os.path.join(tempfile.mkdtemp(prefix="ameesh-test-prices-"), "absent.json")
+os.environ["AMEESH_PRICES"] = EMPTY_PRICES
 #: les binaires réels du poste (variables de l'exécuteur) ne fuient pas dans les
 #: tests : le banc pose ses faux harnais par `AMEESH_BIN_DIR` ou explicitement
 for _bin_var in ("AMEESH_CLAUDE_BIN", "AGENT_MESH_CLAUDE_BIN", "AMEESH_CODEX_BIN",
                  "AGENT_MESH_CODEX_BIN", "AMEESH_DSH_BIN", "AGENT_MESH_DSH_BIN"):
     os.environ.pop(_bin_var, None)
+#: les comptes réels du lanceur (dossiers de configuration et clés des
+#: harnais, `config_env`/`key_env` des descripteurs) ne fuient pas dans les
+#: tests : sans compte déclaré, un tour doit voir l'environnement « nu » du
+#: harnais. CODEX_HOME n'est pas retiré mais pointé sur un dossier vide
+#: (ci-dessus) : absent, Codex retomberait sur le ~/.codex réel.
+ACCOUNT_ENV_VARS = ("CLAUDE_CONFIG_DIR", "DSH_HOME",
+                    "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPSEEK_API_KEY")
+for _compte_var in ACCOUNT_ENV_VARS:
+    os.environ.pop(_compte_var, None)
 
 
 def child_env(**extra: str) -> dict:
@@ -79,6 +95,12 @@ def child_env(**extra: str) -> dict:
                  "AMEESH_REQUIRE_RESPONSIBLE", "AGENT_MESH_CANON", "AGENT_MESH_CANON_REF",
                  "AGENT_MESH_CANON_UNTRUSTED", "AGENT_MESH_REQUIRE_RESPONSIBLE"):
         env.pop(name, None)
+    # l'identité de session du lanceur (l'agent qui exécute la suite) ne fuit
+    # jamais dans un sous-processus : chaque test pose la sienne. Sans cela,
+    # un bail d'agent réel de la machine ferait échouer les tests d'autorité.
+    for name in ("AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
+                 "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH"):
+        env.pop(name, None)
     # Les fils vont sous l'état du test (AMEESH_STATE/fils), jamais dans un
     # dossier réel hérité de l'environnement du développeur.
     for name in ("AMEESH_THREADS", "AMEESH_PROJECT", "AMEESH_HUMANS"):
@@ -87,16 +109,27 @@ def child_env(**extra: str) -> dict:
     # fuient pas dans les tests : un forfait très consommé mettrait en pause les
     # agents de test. Les tests de jauges posent leurs propres journaux.
     env["CODEX_HOME"] = EMPTY_CODEX_HOME
+    # ni les comptes du lanceur (CLAUDE_CONFIG_DIR hérité, clés…)
+    for name in ACCOUNT_ENV_VARS:
+        env.pop(name, None)
     # Aucun réseau dans les tests (L26) : pas de clé de fournisseur, pas de
     # relevé de solde par l'exécuteur.
     for name in ("DEEPSEEK_API_KEY", "AMEESH_DEEPSEEK_API_BASE"):
         env.pop(name, None)
     env["AMEESH_BALANCE_INTERVAL"] = "0"
+    # Les relevés de ressources de l'hôte réel (L31) ne fuient pas non plus :
+    # les tests de pression posent eux-mêmes leur intervalle et leurs mesures.
+    env["AMEESH_RESOURCE_INTERVAL"] = "0"
+    # Aucun moteur de conteneurs réel pendant les tests (L31) : les tests de
+    # rattachement injectent leur propre façade.
+    env["AMEESH_CONTAINER_RUNTIME"] = "none"
     env["AMEESH_DSN"] = TEST_DSN
     env["PYTHONPATH"] = SRC + os.pathsep + env.get("PYTHONPATH", "")
     env["AMEESH_BIN_DIR"] = FAKEBIN
     # les descripteurs de harnais de l'hôte ne fuient pas non plus (L16)
     env["AMEESH_HARNESSES_DIR"] = EMPTY_HARNESS_DIR
+    # le barème de prix de l'hôte ne fuit pas : les tests de tarif posent le leur
+    env["AMEESH_PRICES"] = EMPTY_PRICES
     env.pop("AGENT_MESH_HARNESSES_DIR", None)
     env.pop("AMEESH_CODEX_SESSIONS", None)   # isolement par CODEX_HOME (ci-dessus)
     env.update({k: str(v) for k, v in extra.items() if v is not None})

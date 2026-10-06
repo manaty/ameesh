@@ -219,6 +219,16 @@ def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
     return storage.of(db).leases.clear_session(name, owner, epoch)
 
 
+def pause(db: Db, name: str, owner: str, epoch: int, status_text: str) -> bool:
+    """Met l'agent en pause sous un bail VIVANT détenu par ce worker (L31).
+
+    Faux si le bail n'est plus le nôtre, s'il a expiré (un remplaçant a pu
+    réclamer la ligne et lancer son tour), ou si un tour est en cours : une
+    pause ne coupe jamais un tour (0028). Verrou pris d'abord, conditions
+    recontrôlées dans l'écriture."""
+    return storage.of(db).leases.pause(name, owner, epoch, status_text)
+
+
 def pending_spend_put(db: Db, name: str, start_index: int, turn: str | None = None,
                       model: str | None = None) -> bool:
     """Pose (atomiquement) le marqueur comptable d'un tour : une seule ligne."""

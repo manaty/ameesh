@@ -12,7 +12,7 @@ import unittest
 from unittest import mock
 
 from ameesh import adapters, db as db_mod, mail, registry
-from ameesh.runner import AgentWorker, Runner
+from ameesh.runner import AgentWorker, Runner, _AsyncLog
 
 from .support import PgTestCase
 
@@ -225,8 +225,109 @@ class RunnerTest(PgTestCase):
         finally:
             proc.terminate()
             proc.wait(timeout=10)
+        # Arrêt propre, jamais une mort par signal : un fil démon encore dans un
+        # `print` à la finalisation faisait abandonner CPython (SIGABRT, core).
+        time.sleep(0.2)  # le fil lecteur finit de recueillir la sortie
+        self.assertGreaterEqual(proc.returncode, 0, "code %r\n%s" % (proc.returncode, "".join(lignes)))
+        self.assertNotIn("sortie immédiate", "".join(lignes))  # arrêt propre, sans repli
         # end_turn est fencé : le tour volé n'est pas compté
         self.assertEqual(int(registry.get(self.db, "vole")["turns"]), 0)
+
+    # -- arrêt borné (relecture codex2 de 669a6fe) --------------------------
+    def _lire_jusqu_a(self, fd: int, motif: str, timeout: float = 20.0) -> str:
+        import select
+        lu = b""
+        fin = time.monotonic() + timeout
+        while motif.encode() not in lu:
+            reste = fin - time.monotonic()
+            self.assertGreater(reste, 0, "motif %r absent :\n%s" % (motif, lu.decode(errors="replace")))
+            if select.select([fd], [], [], min(reste, 0.5))[0]:
+                lu += os.read(fd, 65536)
+        return lu.decode(errors="replace")
+
+    @staticmethod
+    def _remplir_tube(w: int) -> None:
+        """Remplit le tube sans toucher au mode du descripteur partagé avec le
+        fils : une description de fichier distincte (Linux, /proc) en O_NONBLOCK."""
+        fd = os.open("/proc/self/fd/%d" % w, os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            while True:
+                try:
+                    os.write(fd, b"x" * 65536)
+                except BlockingIOError:
+                    break
+        finally:
+            os.close(fd)
+
+    def test_arret_borne_stdout_et_stderr_bloques(self):
+        """Tube de sortie plein et jamais lu (stdout et stderr) : le SIGTERM
+        aboutit quand même, dans un délai borné, sans mort par signal."""
+        r, w = os.pipe()
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "ameesh.runner", "--agents", "personne", "--poll", "1"],
+            stdout=w, stderr=w, env=self.env(), cwd=self.tmp)
+        try:
+            self._lire_jusqu_a(r, "LISTEN")
+            self._remplir_tube(w)  # plus rien ne sort : toute écriture bloquerait
+            debut = time.monotonic()
+            proc.terminate()
+            code = proc.wait(timeout=30)
+            self.assertLess(time.monotonic() - debut, 15.0)
+            self.assertEqual(code, 0)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+            os.close(r)
+            os.close(w)
+
+    def test_arret_borne_stderr_seul_bloque(self):
+        r, w = os.pipe()
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "ameesh.runner", "--agents", "personne", "--poll", "1"],
+            stdout=subprocess.PIPE, stderr=w, text=True, env=self.env(), cwd=self.tmp)
+        lignes: list[str] = []
+        threading.Thread(
+            target=lambda: [lignes.append(line) for line in proc.stdout], daemon=True
+        ).start()
+        try:
+            self.wait_for(lambda: any("LISTEN" in l for l in lignes), timeout=20)
+            self._remplir_tube(w)
+            debut = time.monotonic()
+            proc.terminate()
+            code = proc.wait(timeout=30)
+            self.assertLess(time.monotonic() - debut, 15.0)
+            self.assertEqual(code, 0, "".join(lignes))
+            time.sleep(0.2)
+            self.assertTrue(any("arrêt : 0 bail" in l for l in lignes), "".join(lignes))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+            proc.stdout.close()
+            os.close(r)
+            os.close(w)
+
+    def test_exception_dans_run_journal_ferme_code_non_nul(self):
+        """Une exception de `run` : le journal est quand même vidé et fermé, le
+        code de sortie est non nul, sans SIGABRT (relecture codex2, B2)."""
+        script = (
+            "import sys\n"
+            "from ameesh import runner\n"
+            "def boom(self):\n"
+            "    for i in range(300):\n"
+            "        runner.log_async('m%d' % i)\n"
+            "    raise RuntimeError('boom')\n"
+            "runner.Runner.run = boom\n"
+            "sys.exit(runner.main(sys.argv[1:]))\n")
+        proc = subprocess.run(
+            [sys.executable, "-c", script, "--agents", "personne"],
+            capture_output=True, text=True, timeout=60, env=self.env(), cwd=self.tmp)
+        sortie = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 1, sortie)
+        self.assertIn("RuntimeError: boom", proc.stderr)
+        self.assertIn("m299", proc.stdout)  # journal entièrement vidé avant la sortie
+        self.assertNotIn("Fatal Python error", sortie)
 
     # -- NOTIFY ------------------------------------------------------------
     def test_notify_reveille_un_executeur_en_service(self):
@@ -498,7 +599,10 @@ class RunnerTest(PgTestCase):
                 lambda: registry.get(self.db, "perdu")["pending_prompt"] is not None, timeout=15)
         finally:
             proc.terminate()
-            proc.wait(timeout=10)
+            sortie, _ = proc.communicate(timeout=10)
+        # pas de mort par signal à l'arrêt (SIGABRT du fil `journal`, 2026-10-05)
+        self.assertGreaterEqual(proc.returncode, 0, "code %r\n%s" % (proc.returncode, sortie))
+        self.assertNotIn("sortie immédiate", sortie)
         row = registry.get(self.db, "perdu")
         self.assertEqual(row["pending_prompt"], "consigne du tour perdu")
         self.assertIsNone(row["current_prompt"])
@@ -980,6 +1084,38 @@ class RunnerTest(PgTestCase):
                 worker.proc.wait(timeout=5)
             worker.watchdog_stop.set()
 
+
+
+class JournalArretTest(unittest.TestCase):
+    """Le fil `journal` se vide puis s'arrête avant la finalisation (SIGABRT)."""
+
+    def test_close_vide_la_file_puis_arrete_le_fil(self):
+        recus: list[str] = []
+        with mock.patch("ameesh.runner.log", side_effect=recus.append):
+            journal = _AsyncLog()
+            for i in range(50):
+                journal.write("m%d" % i)
+            self.assertTrue(journal.close(timeout=5))
+            self.assertFalse(journal.thread.is_alive())
+            self.assertEqual(recus, ["m%d" % i for i in range(50)])
+            # après fermeture, un fil démon tardif n'écrit plus rien
+            journal.write("après")
+            self.assertTrue(journal.close(timeout=5))
+        self.assertNotIn("après", recus)
+        self.assertEqual(journal.perdus, 1)
+
+    def test_close_borne_si_le_puits_bloque(self):
+        libere = threading.Event()
+        with mock.patch("ameesh.runner.log", side_effect=lambda _m: libere.wait(10)):
+            journal = _AsyncLog(maxsize=1)
+            journal.write("bloque")
+            time.sleep(0.1)
+            journal.write("en file")
+            debut = time.monotonic()
+            self.assertFalse(journal.close(timeout=0.3))
+            self.assertLess(time.monotonic() - debut, 2.0)
+            libere.set()
+            self.assertTrue(journal.close(timeout=5))  # puits libéré : arrêt normal
 
 if __name__ == "__main__":
     unittest.main()

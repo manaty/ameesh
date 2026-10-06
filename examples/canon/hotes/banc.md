@@ -9,6 +9,7 @@ policy:
     - codex
   providers: [deepseek, openai]
   credential_modes: [api-key]
+  work_roots: {acme-web: /srv/acme/acme-web}
   max_agents: 2
 ---
 

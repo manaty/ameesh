@@ -51,8 +51,8 @@ class EvaluateTest(test_canon._TmpMixin, unittest.TestCase):
             type="Placement", agent="relecteur", host="nulle-part"))
         loaded = self.load()
         cas = {
-            ("orchestre", "atelier"): "placement ambigu : orchestre placé 2 fois",
-            ("ouvrier", "atelier"): "aucun placement de ouvrier sur atelier (placé sur : banc)",
+            ("orchestre", "atelier"): "admission ambiguë : orchestre admis 2 fois",
+            ("ouvrier", "atelier"): "hôte atelier non admis pour ouvrier (admis : banc)",
             ("fantome", "atelier"): "fiche Agent fantome introuvable",
             ("relecteur", "nulle-part"): "hôte nulle-part sans fiche Host",
         }
@@ -86,7 +86,10 @@ class EvaluateTest(test_canon._TmpMixin, unittest.TestCase):
         self.assertIn("fournisseur anthropic", textes)
         # le mode n'est pas un motif de refus : le placement peut le fixer
         choix = {c["host"]: c for c in placement.proposals(loaded, "relecteur")}
-        self.assertTrue(choix["banc"]["admissible"])
+        # l'admission de relecteur ne nomme que atelier (L31)
+        self.assertFalse(choix["banc"]["admissible"])
+        self.assertFalse(choix["banc"]["admitted"])
+        self.assertIn("non admis", " ".join(choix["banc"]["reasons"]))
         self.assertEqual(choix["banc"]["credential_mode"], "api-key")
         # hôte complet (max_agents, sans compter l'agent lui-même)
         write(self.root, "hotes/banc.md", host_card(
@@ -184,7 +187,7 @@ class PlacementTest(_PlacementDbCase):
                             "lease_epoch, status FROM agent_registry "
                             "WHERE name = 'orchestre'")[0]
         self.assertIs(row["placement_ok"], False)
-        self.assertIn("aucun placement de orchestre sur atelier", row["placement_diagnostic"])
+        self.assertIn("aucune admission de orchestre", row["placement_diagnostic"])
         self.assertEqual((row["lease_owner"], int(row["lease_epoch"]), row["status"]),
                          ("runner-x", epoch, "running"))
         # fin du tour : avant la synchronisation suivante, plus réclamable sur cet hôte
@@ -552,10 +555,16 @@ class PlacementCliTest(test_canon._CanonDbCase):
         self.assertEqual([p["host"] for p in entry["placements"]], ["atelier"])
         self.assertTrue(entry["placements"][0]["placement_ok"])
         admis = {c["host"]: c for c in entry["admissible"]}
-        self.assertEqual(sorted(admis), ["atelier", "banc"])
-        self.assertEqual(admis["banc"]["credential_modes"], ["api-key"])
+        # l'admission de relecteur ne nomme que atelier (L31, 0029) : banc est
+        # refusé faute d'admission, et sa politique est tout de même montrée
+        self.assertEqual(sorted(admis), ["atelier"])
         self.assertTrue(admis["atelier"]["current"])
-        # orchestre placé sur le banc : refusé, expliqué, et atelier proposé
+        refuses = {c["host"]: c for c in entry["refused"]}
+        self.assertIn("banc", refuses)
+        self.assertFalse(refuses["banc"]["admitted"])
+        self.assertIn("non admis", " ".join(refuses["banc"]["reasons"]))
+        self.assertEqual(refuses["banc"]["credential_modes"], ["api-key"])
+        # orchestre admis sur le banc : refusé par la politique, expliqué
         write(self.root, "placements/orchestre-atelier.md", fiche(
             type="Placement", agent="orchestre", host="banc", credential_mode="subscription"))
         proc = self.mesh("placement", "check", "--agent", "orchestre", "--json",
@@ -568,13 +577,16 @@ class PlacementCliTest(test_canon._CanonDbCase):
                         "fournisseur anthropic non admis",
                         "mode d'identifiants subscription non admis"):
             self.assertIn(attendu, actuel["placement_diagnostic"])
-        self.assertEqual([c["host"] for c in entry["admissible"]], ["atelier"])
-        self.assertEqual(entry["admissible"][0]["credential_mode"], "subscription")
-        self.assertEqual([c["host"] for c in entry["refused"]], ["banc"])
+        # aucun hôte pleinement admissible : atelier n'est pas admis, banc
+        # refuse la politique ; les deux sont expliqués
+        self.assertEqual([c["host"] for c in entry["admissible"]], [])
+        refuses = {c["host"]: c for c in entry["refused"]}
+        self.assertEqual(sorted(refuses), ["atelier", "banc"])
+        self.assertIn("non admis", " ".join(refuses["atelier"]["reasons"]))
         proc = self.mesh("placement", "check", "--agent", "orchestre", env=self.cli_env())
         self.assertEqual(proc.returncode, 1)
-        for attendu in ("REFUSÉ", "non réclamable sur banc", "admissibles :", "atelier",
-                        "mode subscription", "ameesh ne déplace aucun agent", "[NON APPROUVÉ]"):
+        for attendu in ("REFUSÉ", "non réclamable sur banc", "refusés",
+                        "ameesh ne déplace aucun agent", "[NON APPROUVÉ]"):
             self.assertIn(attendu, proc.stdout)
         # tous les agents ; un agent inconnu est une erreur
         data = json.loads(self.mesh("placement", "check", "--json", env=self.cli_env()).stdout)

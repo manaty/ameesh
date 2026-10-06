@@ -305,8 +305,12 @@ class TurnAccountingTest(Sandbox, PgTestCase):
         custom = os.path.join(self.tmp_cost, "custom-prices.json")
         with open(custom, "w", encoding="utf-8") as fh:
             json.dump({"deepseek-flash": [9.0, 9.0, 9.0]}, fh)
+        # restaure la valeur par défaut du banc (le fichier absent posé par
+        # `support`) : ne pas la supprimer, sinon les tests suivants reliraient
+        # le barème de l'hôte.
+        precedent = os.environ.get("AMEESH_PRICES", "")
         os.environ["AMEESH_PRICES"] = custom
-        self.addCleanup(os.environ.pop, "AMEESH_PRICES", None)
+        self.addCleanup(os.environ.__setitem__, "AMEESH_PRICES", precedent)
         book = cost.CostBook(state_dir=self.state, codex_sessions=self.codex)
         self.assertEqual(book.prices_path, custom)
 

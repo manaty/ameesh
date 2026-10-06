@@ -75,7 +75,10 @@ class Canon(interface.Canon):
     def host_rows(self, host, names) -> list[dict]:
         sql = """
             SELECT name, harness, host, cwd, model, budget_usd, responsible, team, provider,
-                   credential_mode, capabilities, canon_ref, ephemeral, status, status_text,
+                   credential_mode, capabilities, canon_ref, ephemeral, priority,
+                   admitted_hosts, admitted_tags, memory_repository,
+                   visibility_ok, visibility_diagnostic,
+                   status, status_text,
                    placement_ok, placement_diagnostic, placement_ref,
                    placement_profile IS NOT DISTINCT FROM __PROFILE__ AS profile_fresh,
                    (status = 'running' AND lease_expires_at > now()) AS in_turn
@@ -93,14 +96,18 @@ class Canon(interface.Canon):
         (celles que `placement.evaluate` a jugées), calculé par
         `ameesh_placement_profile` dans la même instruction."""
         caps = _caps_param(values["capabilities"])
+        ahosts = _caps_param(values.get("admitted_hosts"))
+        atags = _caps_param(values.get("admitted_tags"))
         self.db.query(
             """
             INSERT INTO agent_registry
                 (name, harness, host, cwd, model, budget_usd, responsible, team, provider,
                  credential_mode, capabilities, canon_ref, ephemeral, ephemeral_expires_at,
+                 priority, admitted_hosts, admitted_tags, memory_repository,
+                 visibility_ok, visibility_diagnostic,
                  placement_ok, placement_diagnostic, placement_ref, placement_profile)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, __CAPS__, %s, false, NULL,
-                    %s, %s, %s, __PROFILE__)
+                    %s, __AHOSTS__, __ATAGS__, %s, %s, %s, %s, %s, %s, __PROFILE__)
             ON CONFLICT (name) DO UPDATE SET
                 harness         = excluded.harness,
                 host            = excluded.host,
@@ -115,6 +122,12 @@ class Canon(interface.Canon):
                 canon_ref       = excluded.canon_ref,
                 ephemeral       = false,
                 ephemeral_expires_at = NULL,
+                priority        = excluded.priority,
+                admitted_hosts  = excluded.admitted_hosts,
+                admitted_tags   = excluded.admitted_tags,
+                memory_repository = excluded.memory_repository,
+                visibility_ok   = excluded.visibility_ok,
+                visibility_diagnostic = excluded.visibility_diagnostic,
                 placement_ok    = excluded.placement_ok,
                 placement_diagnostic = excluded.placement_diagnostic,
                 placement_ref   = excluded.placement_ref,
@@ -122,10 +135,15 @@ class Canon(interface.Canon):
                 updated_at      = now()
             RETURNING name
             """.replace("__CAPS__", _CAPS_SQL)
+               .replace("__AHOSTS__", _CAPS_SQL)
+               .replace("__ATAGS__", _CAPS_SQL)
                .replace("__PROFILE__", PROFILE_PARAMS_SQL),
             (name, values["harness"], values["host"], values["cwd"], values["model"],
              values["budget_usd"], values["responsible"], values["team"], values["provider"],
              values["credential_mode"], caps, caps, values["canon_ref"],
+             int(values.get("priority") or 0), ahosts, ahosts, atags, atags,
+             values.get("memory_repository"),
+             values.get("visibility_ok"), values.get("visibility_diagnostic") or "",
              values["placement_ok"], values["placement_diagnostic"], values["placement_ref"])
             + profile_params(values),
         )
@@ -193,6 +211,51 @@ class Canon(interface.Canon):
              WHERE name = %s AND host = %s
             """,
             (target, canon_ref, diagnostic, ref, name, host))
+
+    def relocate(self, name, host, *, target, canon_ref, diagnostic, ref,
+                 keep_session, owner, epoch, summary="") -> dict | None:
+        """Déplacement d'exécution entre deux hôtes admis (L31, 0028).
+
+        Fencé par le bail : verrou de ligne d'abord, puis, DANS l'écriture, le
+        bail doit être vivant et détenu par `owner`/`epoch`, l'agent ne doit
+        pas être en tour, et `target` doit encore figurer dans ses hôtes admis."""
+        rows = self.db.query(
+            """
+            WITH verrou AS (
+                SELECT name, host, status, admitted_hosts, lease_owner, lease_epoch,
+                       lease_expires_at
+                  FROM agent_registry WHERE name = %s FOR UPDATE
+            )
+            UPDATE agent_registry AS r
+               SET host = %s, responsible = NULL, canon_ref = %s,
+                   placement_ok = NULL, placement_diagnostic = %s::text,
+                   placement_ref = %s::text,
+                   placement_profile = NULL,
+                   session_id = CASE WHEN %s THEN r.session_id ELSE NULL END,
+                   session_work_item = CASE WHEN %s THEN r.session_work_item ELSE NULL END,
+                   session_reset_at = CASE WHEN %s THEN r.session_reset_at
+                                           ELSE clock_timestamp() END,
+                   pending_prompt = CASE
+                       WHEN %s OR coalesce(%s::text, '') = '' THEN r.pending_prompt
+                       ELSE concat_ws(E'\\n\\n', %s::text, r.pending_prompt) END,
+                   status = CASE WHEN %s THEN r.status ELSE 'queued' END,
+                   status_text = %s::text,
+                   updated_at = now()
+              FROM verrou
+             WHERE r.name = verrou.name
+               AND verrou.host = %s
+               AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+               AND verrou.lease_expires_at > clock_timestamp()
+               AND verrou.status NOT IN ('running', 'stopped')
+               AND %s = ANY(verrou.admitted_hosts)
+             RETURNING r.name, r.host
+            """,
+            (name, target, canon_ref, diagnostic, ref, bool(keep_session),
+             bool(keep_session), bool(keep_session), bool(keep_session), summary, summary,
+             bool(keep_session), "déplacé vers %s" % target,
+             host, owner, int(epoch), target),
+        )
+        return rows[0] if rows else None
 
     def stop_removed(self, name, host, *, pending_text, stop_text) -> dict | None:
         stopped = self.db.query(
