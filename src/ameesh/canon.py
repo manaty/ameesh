@@ -736,20 +736,90 @@ class HostPolicy:
     #: dossier déduit.
     work_root: str | None = None
     work_roots: dict | None = None
+    #: dossier de travail par agent (L35) : `work_dirs[agent]`, prioritaire sur
+    #: `work_roots` et `work_root`. Les trois formes acceptent le gabarit
+    #: `{agent}` (un worktree par agent : `~/src/nexlink-{agent}`).
+    work_dirs: dict | None = None
 
-    def work_dir(self, project: str | None) -> str | None:
-        """Dossier de travail d'un projet sur cet hôte, ou None.
+    def work_dir(self, project: str | None, agent: str | None = None) -> str | None:
+        """Dossier de travail d'un agent (et de son projet) sur cet hôte, ou None.
 
-        Un projet déclaré dans `work_roots` gagne ; sinon `work_root/<projet>`.
-        Sans projet, `work_root` lui-même."""
+        Ordre (L35) : `work_dirs[agent]`, puis `work_roots[projet]`, puis
+        `work_root/<projet>` (sans projet, `work_root` lui-même). `{agent}` est
+        remplacé par le nom de l'agent ; un gabarit sans agent connu ne donne
+        rien (None) plutôt qu'un chemin littéral."""
+        dirs = self.work_dirs or {}
+        if agent and agent in dirs:
+            return fill_work_template(dirs[agent], agent)
         roots = self.work_roots or {}
         if project and project in roots:
-            return str(roots[project])
+            return fill_work_template(roots[project], agent)
         if not self.work_root:
             return None
+        base = fill_work_template(self.work_root, agent)
+        if base is None:
+            return None
         if project:
-            return os.path.join(self.work_root, project)
-        return self.work_root
+            return os.path.join(base, project)
+        return base
+
+
+#: seul gabarit admis dans les chemins de travail d'une fiche Host (L35)
+WORK_TEMPLATE_FIELDS = ("agent",)
+_WORK_TEMPLATE_RE = re.compile(r"\{([^{}]*)\}")
+
+
+def fill_work_template(path: Any, agent: str | None) -> str | None:
+    """Remplace `{agent}` dans un chemin de travail ; None si l'agent manque."""
+    text = str(path)
+    if "{agent}" in text:
+        if not agent:
+            return None
+        text = text.replace("{agent}", agent)
+    return text
+
+
+def work_template_problem(path: str) -> str | None:
+    """Pourquoi un chemin de travail est refusé par `canon check`, ou None (L35).
+
+    Chemin vide, gabarit inconnu (`{projet}`, `{}`) ou accolade orpheline :
+    une faute de frappe ne doit pas devenir un dossier littéral `…/{agnet}`."""
+    if not isinstance(path, str) or not path.strip():
+        return "chemin vide"
+    unknown = [m for m in _WORK_TEMPLATE_RE.findall(path) if m not in WORK_TEMPLATE_FIELDS]
+    if unknown:
+        return "gabarit inconnu %s (seul {agent} est admis)" % ", ".join(
+            "{%s}" % u for u in unknown)
+    if "{" in _WORK_TEMPLATE_RE.sub("", path) or "}" in _WORK_TEMPLATE_RE.sub("", path):
+        return "accolade orpheline"
+    return None
+
+
+#: provenance d'un dossier de travail (L35), pour les diagnostics
+WORK_FROM_HOST = ("work_dirs", "work_roots", "work_root")
+WORK_FROM_PLACEMENT = "placement"
+
+
+def work_dir_for(host: "Host | None", agent: "Agent", admission: "Placement | None"
+                 ) -> tuple[str | None, str | None]:
+    """(dossier, provenance) d'un agent sur un hôte (L31, 0029 ; L35).
+
+    La politique de l'hôte gagne toujours. Repli TRANSITOIRE (L35) : si elle ne
+    donne rien pour cet agent, le `cwd` de l'ancienne fiche Placement, signalé
+    `admission-cwd-inherited` par `canon check` et noté par `canon sync`. Le
+    chemin rendu n'est pas développé (`~` reste) : l'appelant s'en charge."""
+    if host is not None:
+        policy = host.policy
+        dirs = policy.work_dirs or {}
+        roots = policy.work_roots or {}
+        found = policy.work_dir(agent.team, agent.title)
+        if found:
+            source = ("work_dirs" if agent.title in dirs else
+                      "work_roots" if agent.team and agent.team in roots else "work_root")
+            return found, source
+    if admission is not None and admission.cwd:
+        return admission.cwd, WORK_FROM_PLACEMENT
+    return None, None
 
 
 @dataclass
@@ -773,8 +843,10 @@ class Placement:
 
     Plus de `cwd` (le dossier de travail est un réglage de l'hôte) ; les
     anciennes fiches qui en portent un sont lues avec un constat
-    `admission-cwd-ignored`. `host` reste lu comme un hôte admis unique
-    (lecture transitoire des anciennes fiches)."""
+    `admission-cwd-ignored` quand la politique de l'hôte donne un dossier, ou
+    `admission-cwd-inherited` quand elle n'en donne pas : le `cwd` sert alors
+    de repli transitoire (L35, retiré au plus tard en v1.5.0). `host` reste lu
+    comme un hôte admis unique (lecture transitoire des anciennes fiches)."""
 
     title: str
     agent: str | None
@@ -783,7 +855,7 @@ class Placement:
     cwd: str | None
     fiche: Fiche
     #: hôtes admis (L31, 0029) et étiquettes d'hôtes admis ; lus avec l'ancien
-    #: `host` (hôte unique) et l'ancien `cwd` (ignoré).
+    #: `host` (hôte unique) et l'ancien `cwd` (repli transitoire, L35).
     hosts: list[str] | None = None
     host_tags: list[str] | None = None
 
@@ -1733,17 +1805,37 @@ class _Loader:
                 policy.resources = self._host_resources(raw["resources"], where, subject)
             # Racines de travail (L31, 0029) : le dossier de travail d'une
             # session est un réglage de l'hôte, plus du placement.
-            policy.work_root = _text(raw.get("work_root"))
-            roots = raw.get("work_roots")
-            if roots is not None:
-                if not isinstance(roots, dict) or not all(
-                        isinstance(k, str) and _text(v) for k, v in roots.items()):
+            # L35 : `work_dirs` (par agent) et le gabarit `{agent}` ; tout
+            # chemin déclaré doit être un texte non vide au gabarit connu (un
+            # chemin refusé n'est pas retenu : fail closed, pas de dossier).
+            if raw.get("work_root") is not None:
+                problem = work_template_problem(raw.get("work_root"))
+                if problem:
                     self.add("host-policy-invalid", ERROR,
-                             "`policy.work_roots` : mapping {projet: chemin} attendu",
-                             **where, **subject)
+                             "`policy.work_root` : %s" % problem, **where, **subject)
                 else:
-                    policy.work_roots = {str(k).strip(): str(v).strip()
-                                         for k, v in roots.items()}
+                    policy.work_root = str(raw["work_root"]).strip()
+            for key, label in (("work_roots", "projet"), ("work_dirs", "agent")):
+                mapping = raw.get(key)
+                if mapping is None:
+                    continue
+                if not isinstance(mapping, dict) or not mapping:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.%s` : mapping {%s: chemin} attendu" % (key, label),
+                             **where, **subject)
+                    continue
+                kept: dict = {}
+                for k, v in mapping.items():
+                    problem = ("clé vide" if not isinstance(k, str) or not k.strip()
+                               else work_template_problem(v))
+                    if problem:
+                        self.add("host-policy-invalid", ERROR,
+                                 "`policy.%s.%s` : %s" % (key, k, problem),
+                                 **where, **subject)
+                        continue
+                    kept[k.strip()] = v.strip()
+                if kept:
+                    setattr(policy, key, kept)
         tags = self._list(fiche, "tags", where, "host-tags-invalid", **subject)
         admins = self._list(fiche, "admins", where, "host-admins-invalid", **subject)
         self.canon.hosts.append(Host(title=fiche.title,
@@ -1794,13 +1886,11 @@ class _Loader:
 
     def _build_placement(self, fiche: Fiche, where: dict) -> None:
         subject = {"agent": _text(fiche.data.get("agent")) or fiche.title}
+        # L31 (0029) : le dossier de travail est un réglage de l'hôte. Le `cwd`
+        # d'une ancienne admission est conservé ici ; `validate` dit, hôte par
+        # hôte, s'il est ignoré (la politique de l'hôte donne un dossier) ou
+        # hérité en repli transitoire (L35 : elle n'en donne pas).
         cwd = _text(fiche.data.get("cwd"))
-        if cwd:
-            # L31 (0029) : le dossier de travail est un réglage de l'hôte ; le
-            # `cwd` d'une admission est lu puis ignoré (lecture transitoire).
-            self.add("admission-cwd-ignored", WARNING,
-                     "`cwd` %r ignoré : le dossier de travail est un réglage de l'hôte "
-                     "(`policy.work_roots`)" % cwd, **where, **subject)
         self.canon.placements.append(Placement(
             title=fiche.title,
             agent=_text(fiche.data.get("agent")),
@@ -2015,6 +2105,7 @@ def validate(canon: Canon) -> list[Finding]:
                     add("placement-policy-violation", ERROR,
                         "%s sur %s : %s" % (agent.title, host.title, reason), f,
                         agent=agent.title)
+                _check_work_dir(add, agent, host, placement)
     for name, group in by_agent.items():
         if len(group) > 1:
             for placement in group:
@@ -2023,6 +2114,11 @@ def validate(canon: Canon) -> list[Finding]:
                         name, len(group), ", ".join(p.agent or "?" for p in group)),
                     placement.fiche, agent=name)
     for host in canon.hosts:
+        for name in sorted(host.policy.work_dirs or {}):
+            if name not in agent_names:
+                add("host-work-dir-agent-unknown", WARNING,
+                    "politique de l'hôte %s : `work_dirs.%s` ne nomme aucun agent du canon"
+                    % (host.title, name), host.fiche, host=host.title)
         limit = host.policy.max_agents
         if limit is not None and len(by_host.get(host.title, {})) > limit:
             add("host-max-agents", ERROR,
@@ -2058,6 +2154,36 @@ def validate(canon: Canon) -> list[Finding]:
             add("host-unplaced", WARNING, "hôte %s sans placement" % host.title,
                 host.fiche, host=host.title)
     return findings
+
+
+def _check_work_dir(add, agent: Agent, host: Host, placement: Placement) -> None:
+    """Dossier de travail d'un agent admis sur un hôte (L31, 0029 ; L35).
+
+    - la politique de l'hôte donne un dossier et l'admission porte un `cwd` :
+      `admission-cwd-ignored` (la politique gagne) ;
+    - elle n'en donne pas et l'admission porte un `cwd` :
+      `admission-cwd-inherited` (repli transitoire, à migrer) ;
+    - ni l'un ni l'autre : `host-work-dir-missing` (l'exécuteur n'aurait aucun
+      dossier où lancer le harnais : la panne silencieuse de la bascule v1.3.0).
+    """
+    found = host.policy.work_dir(agent.team, agent.title)
+    where = placement.fiche
+    if found and placement.cwd:
+        add("admission-cwd-ignored", WARNING,
+            "`cwd` %r de l'admission de %s ignoré sur %s : la politique de l'hôte donne "
+            "%s" % (placement.cwd, agent.title, host.title, found), where,
+            agent=agent.title)
+    elif placement.cwd:
+        add("admission-cwd-inherited", WARNING,
+            "%s sur %s : cwd hérité de la fiche Placement (%s), repli transitoire — à "
+            "migrer vers `policy.work_dirs` / `work_roots` de l'hôte (repli retiré au "
+            "plus tard en v1.5.0)" % (agent.title, host.title, placement.cwd), where,
+            agent=agent.title)
+    elif not found:
+        add("host-work-dir-missing", WARNING,
+            "%s sur %s : aucun dossier de travail — déclarer `policy.work_dirs`, "
+            "`work_roots` ou `work_root` dans la fiche de l'hôte" % (agent.title, host.title),
+            host.fiche, agent=agent.title, host=host.title)
 
 
 def _validate_packages(canon: Canon, add) -> None:

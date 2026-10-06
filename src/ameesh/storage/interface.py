@@ -258,12 +258,35 @@ class Leases(Domain):
         """
 
     @abc.abstractmethod
+    def set_marked_block(self, name: str, owner: str, epoch: int, status_text: str,
+                         error: str, error_prefix: str) -> str:
+        """Pose un blocage MARQUÉ (L35 : « dossier absent ») sous un bail vivant.
+
+        Verrou de ligne d'abord, puis, dans l'écriture : bail détenu par
+        `owner`/`epoch` et non échu (`clock_timestamp()`), agent ni arrêté ni
+        déjà bloqué pour une AUTRE raison (budget, pression… : un blocage
+        marqué `status_text` + `error_prefix` est le seul remplaçable). Rend `"done"`
+        (posé), `"kept"` (bail vivant, statut concurrent préservé) ou
+        `"lease"` (bail perdu, remplacé ou échu : rien n'est écrit)."""
+
+    @abc.abstractmethod
+    def clear_marked_block(self, name: str, owner: str, epoch: int, status_text: str,
+                           error_prefix: str) -> str:
+        """Lève le blocage marqué (`blocked` + `status_text` exact + `last_error`
+        commençant par `error_prefix`) sous un bail vivant (L35) : `queued`
+        s'il reste une consigne, sinon `idle`. Rend `"done"`, `"kept"` (bail
+        vivant mais ce blocage n'est plus là : arrêt, autre blocage, déjà
+        levé — rien n'est écrasé) ou `"lease"` (rien n'est écrit)."""
+
+    @abc.abstractmethod
     def take_pending_prompt(self, name: str, owner: str, epoch: int) -> str | None:
-        """Consomme la consigne en attente et passe l'agent en `running`."""
+        """Consomme la consigne en attente et passe l'agent en `running` ;
+        refusé (None) sur un agent `stopped` (L35)."""
 
     @abc.abstractmethod
     def begin_turn(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
-        """Passe l'agent en `running` sous un bail vivant."""
+        """Passe l'agent en `running` sous un bail vivant ; refusé sur un agent
+        `stopped` (L35)."""
 
     @abc.abstractmethod
     def restore_prompt(self, name: str, owner: str, epoch: int) -> bool:

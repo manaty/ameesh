@@ -272,6 +272,17 @@ class AgentWorker(threading.Thread):
         #: compte imposé au tour de résumé d'une bascule (l'ancien compte)
         self._account = None
         self._account_override = None
+        #: dossier de travail absent (L35) : blocage en cours, `cwd` du registre
+        #: au dernier échec, attente courante et échéance du prochain essai
+        #: complet. Un blocage hérité d'un exécuteur précédent est repris tel
+        #: quel, pour que le statut soit levé dès que le dossier revient.
+        self._wd_blocked = (agent.get("status") == "blocked"
+                            and agent.get("status_text") == self.WORKDIR_STATUS
+                            and str(agent.get("last_error") or "").startswith(
+                                self.WORKDIR_ERROR))
+        self._wd_seen = agent.get("cwd")
+        self._wd_delay = 0.0
+        self._wd_next = 0.0
 
     # -- état local --------------------------------------------------------
     def _path(self, name: str) -> str:
@@ -978,6 +989,119 @@ class AgentWorker(threading.Thread):
                        meta={"action": "deplacement", "cwd": candidat})
         return candidat
 
+    # -- dossier de travail absent (L35) -------------------------------------
+    #: statut et préfixe d'erreur d'un blocage « dossier absent » (le statut
+    #: n'est levé que s'il porte exactement ces deux marques)
+    WORKDIR_STATUS = "dossier absent"
+    WORKDIR_ERROR = "dossier de travail absent"
+    #: attente croissante entre deux essais complets (adoption d'un dossier
+    #: déplacé comprise) : 5 s, 10 s, 20 s… bornée à 5 min, par agent
+    WORKDIR_BACKOFF_MIN = 5.0
+    WORKDIR_BACKOFF_MAX = 300.0
+
+    def _resolve_workdir(self, adopt: bool = True) -> str | None:
+        """Le dossier de travail utilisable, ou None.
+
+        Le `cwd` est celui de la ligne du registre relue par `pick()` (jamais
+        un cache de l'inscription) ; à défaut, adoption bornée d'un worktree
+        déplacé (0018), seulement si `adopt`."""
+        cwd = self.agent.get("cwd")
+        if cwd and os.path.isdir(cwd):
+            return cwd
+        return self.adopt_moved_worktree() if adopt else None
+
+    def _workdir_missing(self, force_status: bool = False) -> bool:
+        """Note un dossier absent (L35) ; faux si le bail n'est plus le nôtre.
+
+        Au CHANGEMENT d'état (nouveau blocage ou autre `cwd`), ou si
+        `force_status` (après `begin_turn`), le blocage est posé par une
+        transition atomique fencée par le bail : jamais par-dessus un arrêt ou
+        un autre blocage, jamais sous un bail perdu. L'état local et le journal
+        suivent l'issue de la transition ; hors changement, seule l'attente
+        double, bornée."""
+        cwd = self.agent.get("cwd")
+        nouveau = not self._wd_blocked or cwd != self._wd_seen
+        if nouveau or force_status:
+            message = "%s : %r" % (self.WORKDIR_ERROR, cwd)
+            issue = registry.set_marked_block(
+                self.db, self.name, self.runner.runner_id, self.epoch,
+                self.WORKDIR_STATUS, message, self.WORKDIR_ERROR)
+            if issue == "lease":
+                log("[%s] %s — blocage non posé : bail perdu ou remplacé"
+                    % (self.name, message))
+                self.lease_lost.set()
+                return False
+        if nouveau:
+            self._wd_delay = self.WORKDIR_BACKOFF_MIN
+            log("[%s] %s — tours suspendus ; nouvel essai dans %ds au plus tôt (attente "
+                "croissante, %ds au plus), immédiat si le registre change%s"
+                % (self.name, message, self.WORKDIR_BACKOFF_MIN, self.WORKDIR_BACKOFF_MAX,
+                   "" if issue == "done" else " (statut concurrent préservé)"))
+        else:
+            self._wd_delay = min(self.WORKDIR_BACKOFF_MAX,
+                                 max(self.WORKDIR_BACKOFF_MIN, self._wd_delay * 2))
+        self._wd_blocked = True
+        self._wd_seen = cwd
+        self._wd_next = time.monotonic() + self._wd_delay
+        return True
+
+    def _workdir_back(self, cwd: str) -> bool:
+        """Le dossier est revenu (L35) : levée atomique fencée par le bail,
+        PUIS état local et journal. Vrai seulement si la levée a eu lieu
+        (`done`) : sur `lease` (bail perdu) comme sur `kept` (arrêt ou autre
+        statut écrit entre-temps, conservé), faux — rien n'est consommé dans
+        ce sondage."""
+        issue = registry.clear_marked_block(
+            self.db, self.name, self.runner.runner_id, self.epoch,
+            self.WORKDIR_STATUS, self.WORKDIR_ERROR)
+        if issue == "lease":
+            if not self.lease_lost.is_set():
+                log("[%s] dossier de travail retrouvé (%s) mais bail perdu ou remplacé : "
+                    "pas de reprise ici" % (self.name, cwd))
+            self.lease_lost.set()
+            return False
+        self._wd_blocked = False
+        self._wd_seen = cwd
+        self._wd_delay = 0.0
+        self._wd_next = 0.0
+        if issue == "kept":
+            # Bail vivant mais notre blocage n'est plus là : un arrêt ou un autre
+            # statut a été écrit entre la lecture du registre et la levée. Il
+            # est conservé, et PAS de reprise dans ce sondage (rien consommé) :
+            # le sondage suivant relit la ligne et repasse par toutes les gardes
+            # de `pick()` (arrêt, budget, pression). L'état local se cale sur
+            # le statut conservé (le blocage « dossier absent » est fini).
+            row = registry.get(self.db, self.name)
+            if row is not None:
+                self.agent = row
+            log("[%s] dossier de travail retrouvé : %s — statut concurrent conservé "
+                "(%s%s), pas de reprise dans ce sondage"
+                % (self.name, cwd, (row or {}).get("status") or "?",
+                   " : %s" % row["status_text"] if row and row.get("status_text") else ""))
+            return False
+        log("[%s] dossier de travail retrouvé : %s — reprise" % (self.name, cwd))
+        return True
+
+    def workdir_ready(self) -> bool:
+        """Garde de `pick()` pendant un blocage « dossier absent » (L35).
+
+        Hors blocage : vrai (la détection a lieu au lancement d'un tour). En
+        blocage : contrôle gratuit du `cwd` du registre à chaque sondage — un
+        `canon sync` qui le corrige, ou le dossier recréé, débloque au sondage
+        suivant ; l'essai complet (adoption d'un worktree déplacé) attend son
+        échéance, sauf si la ligne du registre a changé. Rien n'est consommé
+        (consigne, courrier) tant que le dossier manque."""
+        if self.runner.dry_run or not self._wd_blocked:
+            return True
+        change = self.agent.get("cwd") != self._wd_seen
+        du = change or time.monotonic() >= self._wd_next
+        cwd = self._resolve_workdir(adopt=du)
+        if cwd:
+            return self._workdir_back(cwd)
+        if du:
+            self._workdir_missing()
+        return False
+
     def interrupt_allowed(self, row: dict) -> bool:
         """Un message ne préempte que s'il vient d'un expéditeur habilité (0018).
 
@@ -1293,6 +1417,10 @@ class AgentWorker(threading.Thread):
                 return None  # déplacé : le worker s'arrête, le bail sera rendu
             self._host_pressure_note(pressure)
             return None
+        # Dossier de travail absent (L35) : ni consigne ni courrier consommés,
+        # pas de tour tenté à chaque sondage.
+        if not self.workdir_ready():
+            return None
         # L30 : session ouverte sous un autre compte et non reprenable → résumé
         # sous l'ancien compte, avant de consommer quoi que ce soit (jamais en
         # plein tour).
@@ -1571,7 +1699,7 @@ class AgentWorker(threading.Thread):
             return True
         if not registry.begin_turn(self.db, self.name, self.runner.runner_id, self.epoch,
                                    "tour %s (%s)" % (label, harness)):
-            log("[%s] bail perdu avant le tour" % self.name)
+            log("[%s] bail perdu ou agent arrêté avant le tour" % self.name)
             return False
         lot = spec.get("lot")
         if lot and str(lot) != str(self.agent.get("session_work_item") or ""):
@@ -1581,14 +1709,13 @@ class AgentWorker(threading.Thread):
                     self.name, self.runner.runner_id, self.epoch, str(lot)):
                 self.agent["session_work_item"] = str(lot)
 
-        cwd = self.agent.get("cwd")
-        if not cwd or not os.path.isdir(cwd):
-            # Worktree renommé/déplacé (0018) : on tente une adoption bornée.
-            cwd = self.adopt_moved_worktree() or cwd
-        if not cwd or not os.path.isdir(cwd):
-            message = "dossier de travail absent : %r" % (cwd,)
-            log("[%s] %s" % (self.name, message))
-            self.fail_turn("dossier absent", message)
+        # Worktree renommé/déplacé (0018) : adoption bornée. Absent : la
+        # consigne repart en attente et `pick()` garde l'agent bloqué, avec une
+        # attente croissante et un journal au changement d'état (L35).
+        cwd = self._resolve_workdir()
+        if not cwd:
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            self._workdir_missing(force_status=True)
             return False
 
         env = os.environ.copy()

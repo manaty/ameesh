@@ -913,8 +913,17 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         # (fail closed ; sans dépôt de mémoire, sans objet).
         visibility_ok, visibility_diag = visibility_mod.annotate(
             canon, agent, host, verdict, db=db, forge=forge)
-        host_fiche = canon.host(host)
-        cwd = host_fiche.policy.work_dir(agent.team) if host_fiche is not None else None
+        # Dossier de travail (L31, 0029 ; L35) : politique de l'hôte d'abord
+        # (`work_dirs[agent]`, `work_roots[projet]`, `work_root`), repli
+        # transitoire sur le `cwd` d'une ancienne fiche Placement, noté ici.
+        cwd, cwd_source = canon_mod.work_dir_for(canon.host(host), agent, admission)
+        notes: list[str] = []
+        if cwd_source == canon_mod.WORK_FROM_PLACEMENT:
+            notes.append("cwd hérité de la fiche Placement (%s), à migrer vers "
+                         "policy.work_dirs / work_roots de l'hôte" % cwd)
+        elif cwd is None:
+            notes.append("aucun dossier de travail : déclarer policy.work_dirs / "
+                         "work_roots / work_root dans la fiche de l'hôte")
         values = {
             "harness": agent.harness or "other",
             "host": host,
@@ -960,9 +969,10 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         action.placement = verdict
         if reasons:
             action.blocked = reasons
-            action.detail = "non réclamable : erreur bloquante du canon"
+            notes.insert(0, "non réclamable : erreur bloquante du canon")
         if not verdict.ok:
-            action.detail = "non réclamable : placement refusé — %s" % verdict.diagnostic
+            notes.insert(0, "non réclamable : placement refusé — %s" % verdict.diagnostic)
+        action.detail = " ; ".join(notes)
         actions.append(action)
         if row is not None and row.get("status") == "stopped" \
                 and (row.get("status_text") or "").startswith(STOP_MARK):

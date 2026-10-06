@@ -127,9 +127,11 @@ projet), sur le modèle de [`examples/canon/`](../examples/canon/) :
   l'instant) ;
 * un `Host` `pc-smichea` (responsable `human:smichea` ; politique : harnais
   claude, codex, deepseek ; modes `subscription` pour claude/codex, `api-key`
-  pour deepseek) ;
+  pour deepseek ; **dossiers de travail** : `work_roots` par équipe, avec le
+  gabarit `{agent}` pour un worktree par agent, et `work_dirs` pour les
+  exceptions — voir [EXPLOITATION](EXPLOITATION.md#dossier-de-travail-des-agents-l31-l35)) ;
 * un `Agent` (avec `responsible`, sans capacité `approve`) et un `Placement`
-  (`cwd` = dossier de travail actuel) par agent : claude1–2, codex1–3,
+  (admission : `hosts: [pc-smichea]`, **sans** `cwd`) par agent : claude1–2, codex1–3,
   deepseek1–7 et les deux orchestrateurs. La liste et les outils viennent de
   la carte de l'étape 0. Un générateur `ameesh canon init --from-v0` n'existe
   pas encore : les fiches sont écrites à la main (ou par un agent, en
@@ -469,6 +471,91 @@ les boucles v0 (étape 4, retour arrière).
 
 ---
 
+## Mise à jour d'ameesh vers L35 — dossiers de travail
+
+Depuis L31 (v1.3.0), le dossier de travail vient de la fiche `Host`, plus du
+`cwd` des fiches `Placement`. Un hôte qui n'avait rien déclaré a vu ses agents
+recevoir un `cwd` vide et rester bloqués (« dossier de travail absent :
+None »). L35 ajoute `policy.work_dirs`, le gabarit `{agent}` et un repli
+transitoire sur l'ancien `cwd`.
+
+**Ce que v1.3.0 fait des réglages L35** (recette locale ci-dessous) :
+`canon check` 1.3.0 ne dit **rien** ; `work_dirs` est ignoré ; `{agent}` dans
+`work_roots` est recopié **littéralement** (`/wt/acme-{agent}` pour tous les
+agents de l'équipe). Un `canon check` 1.3.0 ne valide donc jamais un canon
+L35, et un exécuteur 1.3.0 encore actif (sync au démarrage et toutes les
+`AMEESH_CANON_SYNC_INTERVAL`, 300 s) écrirait ces chemins faux au registre.
+D'où l'ordre : **arrêter l'ancien, installer L35, valider avec L35, puis
+seulement publier**.
+
+1. **Préparer sans publier.** Écrire les réglages sur une branche du canon
+   (PR **non fusionnée**) : `policy.work_roots` par équipe, avec `{agent}`
+   pour un worktree par agent (ex. `nexlink:
+   "~/development/manaty/nexlink-{agent}"`), et `policy.work_dirs: {<agent>:
+   <chemin>}` pour les exceptions. Recette locale avec le binaire L35, hors
+   de l'installation de l'hôte et sans base :
+
+   ```bash
+   python3 -m venv /tmp/ameesh-l35 && /tmp/ameesh-l35/bin/pip install -q <dépôt ameesh au gel L35>
+   git clone -q <url du dépôt du canon> /tmp/canon-l35     # copie jetable, ~/canon intact
+   AMEESH_CONFIG=/tmp/aucune-config.json /tmp/ameesh-l35/bin/ameesh canon check \
+       --canon /tmp/canon-l35 --ref origin/<branche-PR> --host pc-smichea
+   #   attendu : 0 erreur, aucun host-policy-invalid, admission-cwd-inherited
+   #   ni host-work-dir-missing
+   ```
+
+2. **Arrêter l'ancien exécuteur, et avec lui son sync périodique** :
+   `systemctl --user stop agent-runner` (baux rendus, tours en cours tués avec
+   leur groupe). Ne lancer **aucun** `ameesh canon sync` 1.3.0 à partir d'ici.
+3. **Installer L35** (dépôt installé en éditable : `git -C
+   ~/development/manaty/ameesh checkout <gel L35>`), puis `ameesh --version`
+   et `ameesh canon check --fetch` avec CE binaire sur le canon actuel
+   (encore sans les nouveaux réglages) : le repli `admission-cwd-inherited`
+   y apparaît là où les anciens `cwd` servent encore.
+4. **Publier** : fusionner la PR du canon, puis `ameesh canon check --fetch`
+   (binaire L35) : 0 erreur, aucun `admission-cwd-inherited` ni
+   `host-work-dir-missing`.
+5. `ameesh canon sync --fetch` : aucune ligne « cwd hérité » ni « aucun
+   dossier de travail » ; `ameesh list --json` montre un `cwd` distinct et
+   existant pour chaque agent.
+6. `systemctl --user start agent-runner`. Un agent resté `blocked`
+   (« dossier absent ») repart seul dès que le `cwd` du registre est bon.
+7. Plus tard, retirer le `cwd` des fiches `Placement` (ignoré :
+   `admission-cwd-ignored`).
+
+**Retour arrière vers v1.3.0 — le paquet seul ne suffit pas.** Un canon L35
+lu par 1.3.0 donne des chemins littéraux (`…-{agent}`) et ignore `work_dirs`.
+Dans l'ordre :
+
+1. `systemctl --user stop agent-runner` (binaire L35).
+2. **Rendre le canon compatible 1.3.0 avant tout sync** : PR qui retire
+   `work_dirs` et tout `{agent}`, et ne garde que `work_roots: {<équipe>:
+   <chemin>}` / `work_root` ; `canon check` du binaire **L35** sur cette
+   branche (il valide un sous-ensemble que 1.3.0 lit à l'identique), puis
+   fusion.
+3. **Limite de 1.3.0** : un seul dossier par équipe et par hôte
+   (`work_roots[équipe]` ou `work_root/<équipe>`) ; le `cwd` des fiches
+   `Placement` est ignoré. Plusieurs agents d'une même équipe avec des
+   worktrees distincts (cas nexlink) **ne peuvent pas** tourner chacun dans le
+   sien en 1.3.0. Pour chacun de ces agents, avant de relancer : soit
+   l'arrêter (`agent-runner stop <agent>`), soit accepter le dossier commun de
+   l'équipe s'il n'y a qu'un agent actif à la fois, soit le rendre à la v0
+   (`ameesh export-v0 --agents <agent>`, étape 4).
+4. Réinstaller 1.3.0 (`git -C ~/development/manaty/ameesh checkout v1.3.0`),
+   `ameesh canon check --fetch`, `ameesh canon sync --fetch`, vérifier
+   `ameesh list --json` (aucun `cwd` contenant `{`, aucun agent actif sans
+   dossier), puis `systemctl --user start agent-runner`.
+
+**Recette locale de compatibilité** (faite pour L35 sur le canon d'exemple,
+sans base ni exécuteur, en lisant le même canon avec les deux versions) :
+
+| Canon d'essai (`atelier`) | L35 : orchestre / relecteur | 1.3.0 : orchestre / relecteur | `canon check` 1.3.0 |
+|---|---|---|---|
+| `work_roots: {acme-web: '/wt/acme-{agent}'}`, `work_dirs: {relecteur: /wt/relecture}` | `/wt/acme-orchestre` / `/wt/relecture` | `/wt/acme-{agent}` / `/wt/acme-{agent}` | aucun constat |
+| `work_roots: {acme-web: /wt/acme-web}` | `/wt/acme-web` / `/wt/acme-web` | `/wt/acme-web` / `/wt/acme-web` | aucun constat |
+
+---
+
 ## Risques et parades
 
 | Risque | Parade |
@@ -478,6 +565,8 @@ les boucles v0 (étape 4, retour arrière).
 | un message importé deux fois | `import-v0` déplace les fichiers dans `imported/` et ne réécrit pas un message déjà au fil |
 | canon invalide ou illisible | aucune nouvelle réclamation des agents du canon (fail closed) ; baux et tours en cours intacts ; `ameesh canon check` dit pourquoi |
 | un agent mal placé ou sans responsable | non réclamable (R14, C4) ; raison dans `status_text` |
+| mise à jour d'un hôte sans dossiers de travail déclarés (L31) | repli transitoire sur l'ancien `cwd` (L35) ; arrêter l'exécuteur ancien, installer L35 et valider avec lui **avant** de publier `work_dirs` / `{agent}` ; `canon check` avertit `admission-cwd-inherited` / `host-work-dir-missing` |
+| retour à 1.3.0 avec un canon L35 | chemins `{agent}` littéraux, `work_dirs` ignoré : rendre le canon compatible (un dossier par équipe) et arrêter les agents qui ont besoin d'un worktree propre **avant** tout sync 1.3.0 |
 | une action irréversible sans humain | la porte exige un reçu lié à l'empreinte, à usage unique, avec échéance ; issue inconnue → `reconcile`, jamais de nouvelle tentative automatique |
 | ameesh-approve exposé trop tôt | rien n'est mis en ligne avant la revue de L7 ; exposition = acte du propriétaire ; service sur la boucle locale seulement |
 | faux enrôlement de passkey | l'enrôlement n'est qu'une proposition ; confirmation hors bande et PR revue du canon avant toute activation |
