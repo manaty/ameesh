@@ -27,3 +27,5 @@
 * [Une session neuve par lot](0025-une-session-par-lot.md) - Construction et relecture : session neuve par lot, gardée jusqu'à la fusion ; orchestrateurs tournés avec résumé.
 * [Hébergement d'ameesh-approve par équipe](0026-hebergement-d-ameesh-approve-par-equipe.md) - PC + relais, page Nexlink ou serveur propre ; RP ID exactement égal à l'hôte de l'équipe.
 * [Bascule automatique entre comptes](0027-bascule-automatique-entre-comptes.md) - Compte secondaire quand le primaire approche sa limite, retour après la remise à zéro.
+* [Ressources des hôtes et répartition](0028-ressources-des-hotes-et-repartition.md) - Mesure, contre-pression, ressources orphelines, déplacement des agents entre hôtes admis.
+* [Persona et session](0029-persona-et-session.md) - Identité durable et mémoire séparées des exécutions ; double numérique des humains ; le canon déclare des règles de placement, pas la position.

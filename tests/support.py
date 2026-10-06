@@ -59,6 +59,16 @@ EMPTY_CODEX_HOME = tempfile.mkdtemp(prefix="ameesh-test-codex-home-")
 # aussi pour les tests qui lisent les jauges dans le processus même
 os.environ["CODEX_HOME"] = EMPTY_CODEX_HOME
 
+#: dossier de descripteurs de harnais vide (L16) : les tests ne voient jamais
+#: ceux de l'hôte, et posent les leurs explicitement quand ils en ont besoin
+EMPTY_HARNESS_DIR = tempfile.mkdtemp(prefix="ameesh-test-harnesses-")
+os.environ["AMEESH_HARNESSES_DIR"] = EMPTY_HARNESS_DIR
+#: les binaires réels du poste (variables de l'exécuteur) ne fuient pas dans les
+#: tests : le banc pose ses faux harnais par `AMEESH_BIN_DIR` ou explicitement
+for _bin_var in ("AMEESH_CLAUDE_BIN", "AGENT_MESH_CLAUDE_BIN", "AMEESH_CODEX_BIN",
+                 "AGENT_MESH_CODEX_BIN", "AMEESH_DSH_BIN", "AGENT_MESH_DSH_BIN"):
+    os.environ.pop(_bin_var, None)
+
 
 def child_env(**extra: str) -> dict:
     """Environnement d'un sous-processus de test (CLI ou exécuteur)."""
@@ -85,6 +95,9 @@ def child_env(**extra: str) -> dict:
     env["AMEESH_DSN"] = TEST_DSN
     env["PYTHONPATH"] = SRC + os.pathsep + env.get("PYTHONPATH", "")
     env["AMEESH_BIN_DIR"] = FAKEBIN
+    # les descripteurs de harnais de l'hôte ne fuient pas non plus (L16)
+    env["AMEESH_HARNESSES_DIR"] = EMPTY_HARNESS_DIR
+    env.pop("AGENT_MESH_HARNESSES_DIR", None)
     env.pop("AMEESH_CODEX_SESSIONS", None)   # isolement par CODEX_HOME (ci-dessus)
     env.update({k: str(v) for k, v in extra.items() if v is not None})
     return env

@@ -66,8 +66,12 @@ class SetModelEffortTest(PgTestCase):
         self.assertIn('model_reasoning_effort="e"', argv)
         dsh = adapter_for("deepseek", binary="/bin/echo")
         patch = os.path.join(self.tmp, "model.patch.yml")
-        argv = dsh.command("txt", None, model="deepseek-pro", effort="max", patch=patch)
+        argv = dsh.command("txt", "sess-1", model="deepseek-pro", effort="max", patch=patch)
         self.assertIn("--patch", argv)
+        # `--patch` est une option du lanceur dsh : avant `--json`, la session et le texte
+        self.assertEqual(argv[1:5], ["--profile", "agent", "--patch", patch])
+        self.assertLess(argv.index("--patch"), argv.index("--json"))
+        self.assertEqual(argv[-3:], ["--session-id", "sess-1", "txt"])
         with open(patch, encoding="utf-8") as fh:
             contenu = fh.read()
         self.assertIn("model: deepseek-pro", contenu)

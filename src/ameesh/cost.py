@@ -45,10 +45,11 @@ import os
 import re
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Sequence
 
 from . import config as config_mod
+from . import harnesses
 from . import storage
 
 #: Barème par défaut du poste de travail (reprise de l'outil de comptage
@@ -67,9 +68,27 @@ KNOWN_WINDOWS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
 #: Plafond horaire de l'usage payé au jeton, pour l'ensemble des agents
 #: (décision 0019 §2 : référence 10 USD/h).
 DEFAULT_HOURLY_USD = 10.0
-#: harnais dont l'usage est **payé au token** : seuls eux comptent dans le
-#: plafond horaire ; Claude/Codex sont des forfaits, gardés par le rythme.
-DEFAULT_PAID_HARNESSES = ("deepseek",)
+
+
+def gauges_source(harness: str) -> str:
+    """La source de jauges déclarée par le descripteur d'un harnais, ou ''."""
+    descriptor = harnesses.get(harness)
+    return str(descriptor.cost.get("gauges") or "") if descriptor else ""
+
+
+def paid_harnesses_of(host: str | None = None) -> tuple[str, ...]:
+    """Harnais dont l'usage est **payé au token** (0019 §2).
+
+    Lu dans les descripteurs (`ameesh.cost.paid_per_token`), plus dans une liste
+    fermée : un harnais nouveau se déclare. Si **aucun** descripteur n'est
+    lisible, la garde de budget refuse de deviner (fail-closed) plutôt que de
+    considérer tout l'usage comme un forfait.
+    """
+    descriptors = harnesses.scan(host=host)[0]
+    if not descriptors:
+        raise CostError("aucun descripteur de harnais lisible : le plafond horaire "
+                        "payé au token ne peut pas être appliqué")
+    return tuple(sorted(ident for ident, d in descriptors.items() if d.paid_per_token))
 
 #: Marge de rythme : on ne vise pas 100 % d'un forfait, mais la part écoulée + 10.
 PACE_MARGIN = 0.10
@@ -441,11 +460,22 @@ class CostBook:
         return []
 
     def gauges(self, harness: str | None = None) -> list:
-        out = []
-        if harness in (None, "claude"):
-            out += self.claude_gauges()
-        if harness in (None, "codex"):
-            out += self.codex_gauges()
+        """Les jauges de forfait, par **source déclarée** dans les descripteurs (L16).
+
+        `ameesh.cost.gauges` nomme le lecteur (`transcript` pour Claude,
+        `sessions` pour Codex) : le code ne connaît que des formats de journaux,
+        un harnais nouveau se décrit. Un harnais sans source de jauges n'en a
+        pas (le solde des fournisseurs payés au token est lu ailleurs, L26).
+        """
+        out: list = []
+        for ident, descriptor in harnesses.scan()[0].items():
+            if harness not in (None, ident):
+                continue
+            lecteur = {"transcript": self.claude_gauges,
+                       "sessions": self.codex_gauges}.get(
+                           str(descriptor.cost.get("gauges") or ""))
+            if lecteur is not None:
+                out += [replace(gauge, harness=ident) for gauge in lecteur()]
         self.record_gauges(out)
         return out
 
@@ -697,9 +727,9 @@ class CostBook:
         """La dépense des `seconds` dernières secondes, lue sur `turn_costs`.
 
         `harnesses` restreint la somme à ces harnais : le plafond horaire de
-        0019 §2 ne vise que l'**usage payé au token** (`DEFAULT_PAID_HARNESSES`),
-        pas les estimations des forfaits (Claude, Codex), dont la vraie limite
-        est la garde de rythme.
+        0019 §2 ne vise que l'**usage payé au token** (`paid_harnesses_of()`), pas
+        les estimations des forfaits (Claude, Codex), dont la vraie limite est
+        la garde de rythme.
         """
         if self.db is None:
             return 0.0
@@ -715,8 +745,9 @@ class CostBook:
         """Le garde-fou : raison si l'agent (ou le compte) doit s'arrêter, sinon ''.
 
         Le plafond horaire ne somme que l'usage payé au token
-        (`paid_harnesses`, défaut `DEFAULT_PAID_HARNESSES`) ; les forfaits sont
-        couverts par `pace_exceeded`, pas par cette somme (0019 §2).
+        (`paid_harnesses`, défaut `paid_harnesses_of()`, lu dans les descripteurs) ;
+        les forfaits sont couverts par `pace_exceeded`, pas par cette somme
+        (0019 §2).
 
         `pace=False` (L30) : le rythme est jugé compte par compte par
         `ameesh.accounts`, qui bascule au lieu de mettre en pause ; seul le
@@ -726,7 +757,7 @@ class CostBook:
         reason = self.pace_exceeded(harness) if (harness and pace) else ""
         if reason:
             return reason
-        paid = DEFAULT_PAID_HARNESSES if paid_harnesses is None else tuple(paid_harnesses)
+        paid = paid_harnesses_of() if paid_harnesses is None else tuple(paid_harnesses)
         hourly = self.spent("all", 3600, harnesses=paid)
         if hourly >= self.hourly_usd:
             return ("budget horaire (payé au token) : %.2f $ sur les 60 dernières minutes "
@@ -749,7 +780,10 @@ class CostBook:
         by_harness: dict = {name: list(value[1]) for name, value in accounts.items()}
         for agent in self.agents():
             harness = self.tool_of(agent) or "?"
-            if harness in ("claude", "codex") and harness not in by_harness:
+            # Les forfaits à jauges sont déclarés par les descripteurs (L16) :
+            # la jauge se lit une fois par harnais, jamais par agent.
+            if harness not in by_harness and gauges_source(harness) in ("transcript",
+                                                                        "sessions"):
                 by_harness[harness] = self.gauges(harness)
             if harness in accounts:
                 rows.append({"account": accounts[harness][0]})

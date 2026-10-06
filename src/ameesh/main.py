@@ -4,7 +4,7 @@
 
   ameesh mail <send|inbox|list|status|alias|hook|statusline|whoami>
         la boîte aux lettres ; `agent-mail` reste un alias (les hooks des
-        trois harnais l'appellent) ;
+        harnais l'appellent) ;
   ameesh run [options]        l'exécuteur de la machine ; `agent-runner` reste
         un alias ;
   ameesh attach <agent> [--wait] [--ttl S]
@@ -35,6 +35,7 @@
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
   ameesh migrate | doctor     schéma et diagnostic ;
   ameesh canon check|show|sync          canon OKF : validation, fiches, registre ;
+  ameesh harness list|show|check        descripteurs de harnais (L16) ;
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
@@ -58,6 +59,8 @@ MESH_COMMANDS = (
     # (`ameesh models list|show|discover`) — sans cette ligne, la commande sortait en
     # code 2 « sous-commande inconnue » AVANT toute base (revue B5).
     "models",
+    # L16 : descripteurs de harnais (`ameesh harness list|show|check`)
+    "harness",
     # L30 : comptes multiples par fournisseur (`ameesh accounts list|use|auto`)
     "accounts",
 )

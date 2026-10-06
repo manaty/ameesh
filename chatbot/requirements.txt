@@ -1,0 +1,3 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Aucune dépendance : la fonction n'utilise que la bibliothèque standard de
+# Python (HTTP sans redirection, signature S3 SigV4, JSON).

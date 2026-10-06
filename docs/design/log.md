@@ -1,6 +1,11 @@
 # Journal de la conception
 
+## 2026-10-05 (persona et harnais)
+* **Étude** : [persona et harnais](etudes/persona-et-harnais.md) ; spécification de la fiche Persona, des sessions, de la désignation au harnais et d'une mémoire neutre ; points à trancher dans les [questions ouvertes](questions-ouvertes.md).
+
 ## 2026-10-05 (bascule)
+* **Décision** : [persona et session](decisions/0029-persona-et-session.md) ; L31 étendu à la refonte du placement (admissions sans position).
+* **Décision** : [ressources des hôtes et répartition](decisions/0028-ressources-des-hotes-et-repartition.md) ; lot L31 ; migration 0029 réservée.
 * **Décision** : [bascule automatique entre comptes](decisions/0027-bascule-automatique-entre-comptes.md) ; lot L30 ; migration 0028 réservée.
 * **Lot** : L29, plan de travail (epics, fermeture sur fusion, projection GitHub) ; migrations réservées 0026 (L29) et 0027 (L26).
 * **Décision** : [hébergement d'ameesh-approve par équipe](decisions/0026-hebergement-d-ameesh-approve-par-equipe.md) ; [contrat](ameesh-approve-hebergement-equipes.md) (codex3) ; lot L27.

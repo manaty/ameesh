@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
+/.venv
 build/
 dist/
 *.egg-info/
@@ -10,3 +11,6 @@ dist/
 # site public : sortie de construction et venv de MkDocs (scripts/build-site.sh)
 _site/
 .venv-site/
+# assistant du site : index et archive reconstruits à chaque déploiement (L33)
+chatbot/index.json
+chatbot/dist/

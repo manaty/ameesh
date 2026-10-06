@@ -9,8 +9,17 @@ generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:30:00+02:00" 
 
 # Attend le propriétaire
 
-Aucune question n'attend le propriétaire au 2026-10-04 (Q1 à Q8 tranchées, voir
-les [décisions](decisions/)).
+Q1 à Q8 tranchées au 2026-10-04 (voir
+les [décisions](decisions/)). Ouvert au 2026-10-05 :
+
+- Persona et harnais ([étude](etudes/persona-et-harnais.md)) : amender
+  [0029](decisions/0029-persona-et-session.md) pour faire de la mémoire de
+  persona (un dépôt git par persona) un format neutre, géré par un composant
+  séparé, qui peut durer sans harnais maison ; mémoires natives des harnais
+  désactivées par défaut ; vérification de la règle de visibilité (API de la
+  forge ou copie d'essai, administrateurs des hôtes) ; création des
+  identifiants limités au dépôt ; qui consolide ; fiche Persona dans L31 ou
+  lot à part.
 
 # Attend une étude ou un prototype
 

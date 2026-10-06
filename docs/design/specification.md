@@ -221,8 +221,10 @@ consomment).
 Erreurs bloquantes : fiche `Agent` sans `responsible` ou avec `approve` dans
 `capabilities` ; `responsible` qui ne résout pas vers un `Member` humain ;
 `Placement` vers un agent ou un hôte inconnu ; placement qui viole la politique
-de l'hôte (C4) ; deux placements pour un même agent. Avertissements : hôte sans
-placement, agent sans placement. Sortie lisible et `--json` (code, gravité,
+de l'hôte (C4) ; deux placements pour un même agent ; **`harness` non vide sans
+descripteur connu** (`agent-harness-unknown`, `host-harness-unknown`, L16).
+Avertissements : hôte sans placement, agent sans placement, agent sans
+`harness`. Sortie lisible et `--json` (code, gravité,
 fichier, explication), sur le modèle du validateur OKF Federation.
 
 ## 4.4 Du canon vers le registre
@@ -260,6 +262,13 @@ Inchangé par rapport au banc actuel, sauf :
   réclamation automatique de cet agent, lance le harnais en interactif sur la
   **même session**, renouvelle le bail tant que la session vit, puis rend le
   bail. Refusé si un tour est en cours, sauf `--wait`.
+- **Harnais** (L16, R22) : plus de liste fermée. Un harnais est un
+  **descripteur** (manifeste ACP étendu, [documentation](descripteurs-de-harnais.md))
+  livré dans le paquet ou déposé par l'hôte ; l'adaptateur en ligne de commande
+  est piloté par le descripteur, et tout agent qui parle **ACP** passe par le
+  pont générique (`session/new|load|resume`, `session/prompt`,
+  `session/update`, permissions refusées par défaut, annulation propre). Un
+  `harness` inconnu des descripteurs est une erreur de `canon check`.
 
 # 6. Fil lisible (C5)
 
@@ -501,6 +510,7 @@ client ; migrations réservées ci-dessous ; aucune dépense, aucun service publ
 | L27 | ameesh-approve multi-équipe ([0026](decisions/0026-hebergement-d-ameesh-approve-par-equipe.md), [contrat](ameesh-approve-hebergement-equipes.md)) : `approve_url` distincte de `public_url`, profil strict RP ID = hôte et origine unique, refus d'une zone ou d'un parent réservé, concordance service ↔ vérificateurs, droits DB propres à approve, bascule à hôte constant | L7, L9b | — | codex3 |
 | L29 | plan de travail : fiches `WorkPackage` au canon avec parent (jalon → epic → lot), responsable et périmètre ; `work_items` reliés à leur fiche et à leur parent ; fermeture automatique sur fusion de la PR ; projection GitHub (une issue par lot, sous-issues de l'epic, labels d'état), GitHub restant une vue et ses modifications des propositions ([0005](decisions/0005-canon-okf.md)) ; epics dans `ameesh progress` | L2, L10, L24 | 0026 | codex3 |
 | L30 | comptes multiples par fournisseur ([0027](decisions/0027-bascule-automatique-entre-comptes.md)) : liste ordonnée de comptes par hôte (profils d'identifiants : dossier de configuration du harnais ou clé d'API), jauges par compte, bascule automatique avant chaque tour au lieu de la pause, retour au primaire après remise à zéro, continuité de session quand le harnais le permet, journal des bascules | L12, L13, L26 | 0028 | codex3 |
+| L31 | ressources des hôtes et répartition ([0028](decisions/0028-ressources-des-hotes-et-repartition.md)) : relevés mémoire/swap/CPU/disque par exécuteur et `ameesh hosts`, seuils dans la politique d'hôte, contre-pression avant chaque tour, ressources orphelines (processus et conteneurs rattachés aux tours), admissions (persona → hôtes ou étiquettes d'hôtes admis, sans `cwd`, [0029](decisions/0029-persona-et-session.md)) avec lecture transitoire des anciennes fiches `Placement`, placement des sessions et déplacement entre deux tours | L3, L26, L30 | 0029 | codex3 |
 
 Ordre : L2, L4 et L6 en parallèle dès maintenant (fichiers nouveaux) ; L1 et L8
 après la fusion de B5a (ils touchent `runner.py` et `registry.py`) ; puis L3,

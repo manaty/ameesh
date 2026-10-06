@@ -61,6 +61,9 @@ scripts/demo-v1.sh
 ```
 
 Switching the real site from v0: [`docs/BASCULE.md`](docs/BASCULE.md).
+The "Ask about ameesh" bubble of the public site (a serverless function that
+answers from the documentation only, with a spend cap and no conversation
+kept): [`chatbot/README.md`](chatbot/README.md).
 Hosting profile « cluster » (one persistent agent per Kubernetes pod, image,
 example manifests, read-only supervisor role):
 [`docs/profils/cluster.md`](docs/profils/cluster.md).

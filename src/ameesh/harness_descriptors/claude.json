@@ -1,0 +1,39 @@
+{
+  "id": "claude",
+  "name": "Claude Code",
+  "version": "1.0.0",
+  "schema_version": "1",
+  "description": "Harnais en ligne de commande, piloté sans interface en flux stream-json.",
+  "repository": "https://github.com/anthropics/claude-code",
+  "license": "proprietary",
+  "capabilities": {},
+  "authentication": {},
+  "distribution": {},
+  "ameesh": {
+    "protocol": "cli",
+    "binary": "claude",
+    "binary_env": ["AMEESH_CLAUDE_BIN", "AGENT_MESH_CLAUDE_BIN"],
+    "command": ["-p", "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions"],
+    "interactive": [],
+    "session": {"flag": ["--resume"]},
+    "stream": "claude-stream-json",
+    "env": {"CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"},
+    "model": {"flag": ["--model", "{model}"]},
+    "effort": {"flag": ["--effort", "{effort}"]},
+    "hooks": {
+      "mail": {
+        "command": ["agent-mail", "hook", "claude"],
+        "events": ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"]
+      }
+    },
+    "cost": {"source": "stream", "gauges": "transcript", "paid_per_token": false},
+    "accounts": {
+      "config_env": "CLAUDE_CONFIG_DIR",
+      "default_home": "~/.claude",
+      "session_store": "projects",
+      "credentials": ".credentials.json",
+      "key_env": "ANTHROPIC_API_KEY"
+    },
+    "install": {"note": "binaire `claude` installé par l'hôte ; distribution signée en L17"}
+  }
+}

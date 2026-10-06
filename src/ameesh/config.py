@@ -36,7 +36,8 @@ DEFAULT_V0_CONFIG = "~/.config/agent-mail"
 
 SCHEMA_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-HARNESSES = ("claude", "codex", "deepseek")
+#: plus de liste fermée de harnais (L16, R22) : les identifiants connus sont
+#: ceux des descripteurs (`ameesh.harnesses`, paquet + dossier de l'hôte).
 #: politiques de session d'un agent (décision 0025, L26)
 SESSION_POLICIES = ("par-lot", "taille", "jamais")
 
@@ -101,6 +102,9 @@ class Config:
     #: regroupement des événements (C9) : au plus un réveil par ce délai,
     #: sauf événement `urgent`. 0 = aucun regroupement.
     event_coalesce: float = 120.0
+    #: plafond (octets UTF-8) de la consigne entière d'un tour de courrier ;
+    #: au-delà, les messages les plus récents attendent le tour suivant
+    prompt_mail_max: float = 20000.0
     #: périodicité de `canon sync` par l'exécuteur (spec §4.4) ; 0 = seulement
     #: au démarrage. Sans canon configuré, rien n'est lancé.
     canon_sync_interval: float = 300.0
@@ -258,6 +262,7 @@ def load(env: dict | None = None) -> Config:
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
         event_coalesce=_as_float(
             pick("AMEESH_EVENT_COALESCE", "AGENT_MESH_EVENT_COALESCE"), cfg.event_coalesce),
+        prompt_mail_max=_as_float(pick("AMEESH_PROMPT_MAIL_MAX"), cfg.prompt_mail_max),
         canon_sync_interval=_as_float(
             pick("AMEESH_CANON_SYNC_INTERVAL", "AGENT_MESH_CANON_SYNC_INTERVAL"),
             cfg.canon_sync_interval),

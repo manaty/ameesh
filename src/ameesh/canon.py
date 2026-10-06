@@ -40,8 +40,9 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
+from . import harnesses
 from . import review as review_mod
-from .config import HARNESSES, NAME_RE
+from .config import NAME_RE
 
 try:  # facultatif : jamais requis
     import yaml as _yaml  # type: ignore
@@ -1759,6 +1760,11 @@ def validate(canon: Canon) -> list[Finding]:
                 % member.title, member.fiche, agent=member.title)
 
     # -- agents ------------------------------------------------------------------
+    # L16 (R22) : plus de liste fermée de harnais ; les identifiants valides sont
+    # ceux des descripteurs connus (paquet + dossier de l'hôte). Un `harness`
+    # inconnu est une ERREUR : l'agent ne serait réclamable nulle part, et le
+    # silence ferait croire à un harnais supporté.
+    known_harnesses = set(harnesses.known_ids())
     for agent in canon.agents:
         f = agent.fiche
         if not NAME_RE.match(agent.title):
@@ -1785,10 +1791,15 @@ def validate(canon: Canon) -> list[Finding]:
             add("agent-capability-unknown", WARNING,
                 "capacités inconnues pour %s : %s" % (agent.title, ", ".join(unknown)),
                 f, agent=agent.title)
-        if not agent.harness or agent.harness not in HARNESSES:
-            add("agent-harness-unknown", WARNING,
-                "harnais %r de %s sans adaptateur (connus : %s)"
-                % (agent.harness, agent.title, ", ".join(HARNESSES)), f, agent=agent.title)
+        if not agent.harness:
+            add("agent-harness-missing", WARNING,
+                "agent %s sans `harness` : aucun harnais ne sera lancé" % agent.title,
+                f, agent=agent.title)
+        elif agent.harness not in known_harnesses:
+            add("agent-harness-unknown", ERROR,
+                "harnais %r de %s sans descripteur connu (%s)"
+                % (agent.harness, agent.title, ", ".join(sorted(known_harnesses)) or "aucun"),
+                f, agent=agent.title)
 
     # -- hôtes -----------------------------------------------------------------------
     for host in canon.hosts:
@@ -1799,6 +1810,12 @@ def validate(canon: Canon) -> list[Finding]:
             add("host-responsible-unresolved", ERROR,
                 "responsable %r de l'hôte %s ne résout pas vers un Member humain"
                 % (host.responsible, host.title), host.fiche, host=host.title)
+        for name in host.policy.harnesses or []:
+            if name not in known_harnesses:
+                add("host-harness-unknown", ERROR,
+                    "politique de l'hôte %s : harnais %r sans descripteur connu (%s)"
+                    % (host.title, name, ", ".join(sorted(known_harnesses)) or "aucun"),
+                    host.fiche, host=host.title)
 
     # -- placements ----------------------------------------------------------------------
     host_names = {h.title for h in canon.hosts}
@@ -1855,6 +1872,13 @@ def validate(canon: Canon) -> list[Finding]:
     for code, severity, message in policy_problems:
         add(code, severity, message,
             **({"member": root_member, "path": "federation.yaml"} if root_member else {}))
+
+    # -- descripteurs de harnais (L16) --------------------------------------------------
+    # Les diagnostics du dossier de l'hôte (chaîne d'approvisionnement) sont
+    # remontés par `canon check` : un dossier non privé, un descripteur ignoré,
+    # un id de l'hôte qui masque celui du paquet.
+    for hf in harnesses.scan()[1]:
+        add(hf.code, hf.severity, hf.message, path=hf.path or None)
 
     # -- plan de travail (L29) ----------------------------------------------------------
     _validate_packages(canon, add)

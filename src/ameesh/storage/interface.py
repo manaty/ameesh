@@ -56,7 +56,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    restore_prompt end_turn
    pending_spend   put set_model get clear
    turn_costs      last_reading insert spent
-   mailbox         send unread unread_urgent get mark_delivered
+   mailbox         send unread unread_urgent get mark_delivered reserve deliver release
                    unread_counts history pending_recipients
                    pending_recipients_sorted unread_total
    wakeups         subscribe notify
@@ -456,6 +456,24 @@ class Mailbox(Domain):
     @abc.abstractmethod
     def mark_delivered(self, ids: Sequence[int]) -> int:
         """Marque remis ; rend le nombre de messages passés remis."""
+
+    @abc.abstractmethod
+    def reserve(self, recipient: str, owner: str | None, epoch: int | None,
+                token: str, *, ids: Sequence[int] | None = None, porteur: str,
+                ttl_seconds: float, limit: int = 200) -> list[dict]:
+        """Réserve atomiquement des non-lus sans réservation active (le
+        destinataire est verrouillé dans le registre, le bail (owner, epoch)
+        contrôlé s'il est donné) ; rend les messages réservés sous `token`."""
+
+    @abc.abstractmethod
+    def deliver(self, recipient: str, owner: str | None, epoch: int | None,
+                token: str, ids: Sequence[int]) -> list[int]:
+        """Solde la réservation `token` (et elle seule), bail vivant exigé s'il
+        est donné ; rend les ids passés remis."""
+
+    @abc.abstractmethod
+    def release(self, recipient: str, token: str, ids: Sequence[int]) -> int:
+        """Annule la réservation `token` (rien n'a été montré)."""
 
     @abc.abstractmethod
     def unread_counts(self) -> dict[str, int]:

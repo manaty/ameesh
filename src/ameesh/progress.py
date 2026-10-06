@@ -399,9 +399,11 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
 # --------------------------------------------------------------------------
 
 def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
-                 paid_harnesses: Iterable[str] = cost_mod.DEFAULT_PAID_HARNESSES,
+                 paid_harnesses: Iterable[str] | None = None,
                  hourly_cap: float = cost_mod.DEFAULT_HOURLY_USD) -> dict:
-    paid = tuple(paid_harnesses)
+    # Les harnais payés au token viennent des descripteurs (L16) : plus de liste
+    # fermée dans le code. `None` = les relire maintenant.
+    paid = cost_mod.paid_harnesses_of() if paid_harnesses is None else tuple(paid_harnesses)
     spend = {key: {"total_usd": 0.0, "paid_usd": 0.0} for key in ("window", "1h", "24h")}
     by_agent = []
     for row in cost_rows:

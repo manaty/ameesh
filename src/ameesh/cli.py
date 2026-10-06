@@ -41,7 +41,7 @@ from . import authority
 from . import backend as backend_mod
 from . import config as config_mod
 from . import db as db_mod
-from . import fil, identity, migrations, signing, storage
+from . import fil, identity, mail, migrations, signing, storage
 from .config import NAME_RE, Config
 
 MAX_STOP_BLOCKS = 3
@@ -117,6 +117,8 @@ def render(msgs: list[dict], verdicts: dict | None = None) -> str:
                            "propriétaire, expire %s]" % expire)
             else:
                 suffixe = "  [⚠ signature NON valide : %s]" % verdict.reason
+        if msg.get("deja_consigne"):
+            suffixe += "  [re-livré après une panne : peut-être déjà traité]"
         lines.append("— de %s à %s : %s%s" % (
             msg.get("from", "?"), moment, msg.get("text", ""), suffixe))
     lines.append("(répondre : agent-mail send <nom> \"…\")")
@@ -401,6 +403,54 @@ def _emit(payload: dict) -> bool:
         return False
 
 
+class _Remise:
+    """Une remise par le hook : le MÊME protocole que l'exécuteur (base).
+
+    Réserver sous un jeton (registre verrouillé, bail de l'identité contrôlé ;
+    jamais un message déjà réservé, notamment ceux de la consigne du tour en
+    cours), montrer, puis solder cette réservation et elle seule — ou
+    l'annuler si rien n'a été montré. Repli fichier : lecture et marquage v0.
+    """
+
+    def __init__(self, bk, name: str, binding) -> None:
+        self.bk, self.name = bk, name
+        self.pg = getattr(bk, "kind", None) == "pg"
+        self.owner = binding.runner_id if binding.bound_to_lease else None
+        self.epoch = binding.epoch if self.owner else None
+        self.jeton = mail.new_token()
+        self.msgs: list[dict] = []
+        self.ouverte = False
+
+    def prendre(self) -> list[dict]:
+        if not self.pg:
+            self.msgs = self.bk.unread(self.name)
+            return self.msgs
+        rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                            porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL)
+        self.ouverte = bool(rows)
+        self.msgs = [mail.normalize(row) for row in rows]
+        return self.msgs
+
+    def _ids(self) -> list[int]:
+        return [int(m["id"]) for m in self.msgs if m.get("id") is not None]
+
+    def solder(self) -> None:
+        if not self.pg:
+            self.bk.mark_read(self.name, self.msgs)
+            return
+        self.ouverte = False  # montré : jamais annulé, au pire re-livré signalé
+        mail.deliver(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
+                     self._ids())
+
+    def abandonner(self) -> None:
+        if self.pg and self.ouverte:
+            self.ouverte = False
+            try:
+                mail.release(self.bk.db, self.name, self.jeton, self._ids())
+            except Exception:  # la réservation expirera d'elle-même
+                pass
+
+
 def cmd_hook(cfg: Config, tool: str) -> int:
     """Hook de harnais : lit le JSON sur stdin, ne fait JAMAIS échouer l'agent."""
     try:
@@ -426,36 +476,41 @@ def cmd_hook(cfg: Config, tool: str) -> int:
     try:
         bk.register(name, tool, data.get("cwd"), data.get("session_id"))
         set_title(cfg, bk, name)
-        msgs = bk.unread(name)
-        verdicts = verdicts_for(bk, msgs)
-        if event == "Stop":
-            if not msgs:
-                bk.stop_counter(name, reset=True)
-                return 0
-            # stop_hook_active n'est pas fiable selon les harnais : on compte
-            # nous-mêmes les tours forcés d'affilée (comme la v0).
-            if bk.stop_counter(name) >= MAX_STOP_BLOCKS:
-                return 0
-            # Écrire d'abord : si le harnais a fermé son entrée, on ne consomme
-            # pas les messages pour autant.
-            if not _emit({"decision": "block", "reason": render(msgs, verdicts)}):
-                return 0
-            bk.stop_counter(name, bump=True)
-            bk.mark_read(name, msgs)
+        if event not in ("Stop", "SessionStart", "UserPromptSubmit", "PostToolUse"):
             return 0
-        if event in ("SessionStart", "UserPromptSubmit", "PostToolUse"):
-            if event == "UserPromptSubmit":
-                bk.stop_counter(name, reset=True)
+        if event == "UserPromptSubmit":
+            bk.stop_counter(name, reset=True)
+        remise = _Remise(bk, name, binding)
+        try:
+            msgs = remise.prendre()
+            if event == "Stop":
+                if not msgs:
+                    bk.stop_counter(name, reset=True)
+                    return 0
+                # stop_hook_active n'est pas fiable selon les harnais : on compte
+                # nous-mêmes les tours forcés d'affilée (comme la v0).
+                if bk.stop_counter(name) >= MAX_STOP_BLOCKS:
+                    return 0
+                # Écrire d'abord : si le harnais a fermé son entrée, on ne
+                # consomme pas les messages pour autant.
+                if not _emit({"decision": "block",
+                              "reason": render(msgs, verdicts_for(bk, msgs))}):
+                    return 0
+                remise.solder()
+                bk.stop_counter(name, bump=True)
+                return 0
             if not msgs:
                 return 0
             if not _emit({
                 "hookSpecificOutput": {
                     "hookEventName": event,
-                    "additionalContext": render(msgs, verdicts),
+                    "additionalContext": render(msgs, verdicts_for(bk, msgs)),
                 }
             }):
                 return 0
-            bk.mark_read(name, msgs)
+            remise.solder()
+        finally:
+            remise.abandonner()
     except Exception:
         return 0
     return 0
