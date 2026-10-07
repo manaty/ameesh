@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# ameesh notify — alertes d'exploitation POUSSÉES à l'humain responsable
+# (lot L38, décision 0030 point 4). Service UTILISATEUR, à côté de l'exécuteur
+# (agent-runner.service, docs/BASCULE.md étape 7) ; un seul par hôte (verrou
+# sur <état>/notify/state.json.lock).
+#
+# Installation :
+#   install -m 0644 deploy/systemd/ameesh-notify.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now ameesh-notify
+#   journalctl --user -u ameesh-notify -f
+#
+# Avant d'activer : la clé `notify` de ~/.config/ameesh/config.json (routes,
+# canaux ; jamais de secret), puis `ameesh notify --test human:<id>` et
+# `ameesh notify --once --dry-run`. Voir docs/EXPLOITATION.md, « Alertes
+# poussées — ameesh notify ».
+
+[Unit]
+Description=ameesh notify — alertes poussées au responsable humain
+After=network-online.target agent-runner.service
+Wants=network-online.target
+
+[Service]
+# AMEESH_DSN, AMEESH_HOST, AMEESH_CANON… (le même fichier que l'exécuteur)
+EnvironmentFile=%h/.config/ameesh/env
+# Secrets des canaux, fichier 0600 facultatif : AMEESH_SLACK_WEBHOOK=…,
+# AMEESH_NTFY_TOKEN=… (noms choisis par `webhook_env` / `token_env`)
+EnvironmentFile=-%h/.config/ameesh/notify.env
+ExecStart=%h/.local/share/ameesh/venv/bin/ameesh notify --interval 30
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

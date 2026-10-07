@@ -299,8 +299,9 @@ def _attach(db: Db, action: dict, raw: bytes, args: argparse.Namespace) -> dict:
     retry = not duplicate and action["state"] in ("failed", "unknown")
     # un refus signé (deny) n'annule qu'une action à approuver (approve le traite)
     decision = "approve" if duplicate or retry else None
+    # L44 (0031) : contre les authentificateurs du canon de l'action
     verdict = receipts.verify_receipt(
-        db, raw, policy, kind="action", expected_digest=expected,
+        db, raw, actions.policy_for(action, policy), kind="action", expected_digest=expected,
         expected_action_id=action["action_id"], expect_decision=decision, consume_by=None)
     if not verdict.ok:
         raise actions.ActionError(verdict.code, "reçu refusé : %s" % verdict.reason)

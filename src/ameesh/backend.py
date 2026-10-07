@@ -60,6 +60,10 @@ class FileBackend:
                 for f in os.listdir(self.agents_dir())
                 if f.endswith(".json") and f[:-5] != sender
             ]
+            # L36 (0030) : limité au chantier de l'expéditeur, comme la v0
+            own = identity.chantier_of(sender, self.cfg)
+            if own:
+                targets = [t for t in targets if identity.chantier_of(t, self.cfg) == own]
         else:
             targets = [dest]
         now = time.time()
@@ -140,7 +144,8 @@ class FileBackend:
         return done
 
     # -- agents ------------------------------------------------------------
-    def register(self, name: str, tool: str, cwd: str | None, session_id: str | None) -> None:
+    def register(self, name: str, tool: str, cwd: str | None, session_id: str | None,
+                 *, leased: bool = True) -> None:
         try:
             path = os.path.join(self.agents_dir(), name + ".json")
             with open(path, "w", encoding="utf-8") as fh:
@@ -231,7 +236,11 @@ class PgBackend:
             rows = registry.overview(self.db)
             # projet du fil : équipe du canon, sinon chantier (fil.agent_project)
             projects = {row["name"]: fil.agent_project(row) for row in rows}
-            targets = [row["name"] for row in rows if row["name"] != sender]
+            # L36 (0030) : « all » = l'équipe (ou le chantier) de l'expéditeur ;
+            # un expéditeur sans équipe ni chantier garde la diffusion globale.
+            own = projects.get(sender)
+            targets = [row["name"] for row in rows if row["name"] != sender
+                       and (not own or projects.get(row["name"]) == own)]
         else:
             targets = [dest]
         groups: dict[str, list[tuple[str, int]]] = {}
@@ -262,7 +271,19 @@ class PgBackend:
         return mail.mark_delivered(self.db, [m["id"] for m in msgs if m.get("id") is not None])
 
     # -- agents ------------------------------------------------------------
-    def register(self, name: str, tool: str, cwd: str | None, session_id: str | None) -> None:
+    def register(self, name: str, tool: str, cwd: str | None, session_id: str | None,
+                 *, leased: bool = True) -> None:
+        if not leased:
+            # L36 → L46 : un hook sans bail (session externe, shell qui a hérité
+            # de AGENT_MAIL_NAME) ne touche à la ligne d'un agent `execute` que
+            # pour `last_seen` : ni session, ni dossier, ni hôte, ni harnais —
+            # l'exécuteur reprendrait sinon une session étrangère, ailleurs.
+            # Un agent NÉ d'un hook sans bail est `externe` (L37, 0030). Une
+            # seule instruction : pas de course lecture → écriture.
+            registry.upsert_unleased(
+                self.db, name, chantier=identity.chantier_of(name, self.cfg),
+                harness=tool, host=self.cfg.host, cwd=cwd, session_id=session_id)
+            return
         registry.upsert(
             self.db, name,
             chantier=identity.chantier_of(name, self.cfg),

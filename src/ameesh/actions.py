@@ -51,12 +51,21 @@ une entrée lisible dans le fil du projet / du lot de l'action (§7.1, C5 :
 `_publish`, par `fil.record` qui ne lève jamais) : sans secret, arguments
 résumés.
 
+Canon de l'action (L44, décision 0031) : `actions.canon` est fixé à
+l'insertion par la base (déclencheur `ameesh_action_canon`, 0035) — le canon
+de l'agent proposant, celui de l'action remplacée pour un remplacement, ''
+(canon par défaut) pour un proposant humain ou inconnu. Tout reçu de
+l'action est vérifié contre les authentificateurs de CE canon
+(`policy_for`), et seul un grant dont l'authentificateur est déclaré par ce
+canon la couvre.
+
 Le SQL est dans le stockage (`storage.of(db).actions`, spec §10) : les
 transitions qui accordent une autorité y restent des fonctions PL/pgSQL
 (`ameesh_action_launch`, `ameesh_action_settle`, `ameesh_action_replace`).
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import os
 import re
@@ -217,6 +226,19 @@ def approval_request(action, approver: str, *, decision: str = "approve",
     except receipts.ReceiptError as exc:
         raise ActionError(INVALID, "demande d'approbation invalide : %s" % exc) from exc
     return request
+
+
+def canon_of(action: dict) -> str:
+    """Canon de l'action (L44, 0031) : '' = canon par défaut."""
+    return str(action.get("canon") or "")
+
+
+def policy_for(action: dict, policy: receipts.Policy | None = None) -> receipts.Policy:
+    """La politique de vérification d'un reçu de `action` : celle donnée (ou
+    de l'environnement), bornée aux authentificateurs du canon de l'action
+    (L44, 0031) — un authentificateur d'un autre canon n'y vaut jamais."""
+    base = policy if policy is not None else policy_from_env()
+    return dataclasses.replace(base, canon=canon_of(action))
 
 
 def policy_from_env(env: dict | None = None) -> receipts.Policy:
@@ -597,9 +619,10 @@ def _covering_grant(db: Db, action: dict) -> int | None:
     recontrôle tout sous verrou). Une réservation vivante de l'action passe en
     premier."""
     amount = int(action.get("amount") or 0)
+    # L44 (0031) : seuls les grants d'un authentificateur du canon de l'action
     rows = storage.of(db).actions.covering_grants(
         action["action_id"], amount, action["connector"], action["operation"],
-        action["class"], action.get("currency"))
+        action["class"], action.get("currency"), canon=canon_of(action))
     allowed = action.get("approvers") or []
     usable = []
     for row in rows:
@@ -619,7 +642,7 @@ def _covering_grant(db: Db, action: dict) -> int | None:
 def _verify(db: Db, action: dict, receipt, policy, *, expected_digest: str,
             expect_decision: str | None, now) -> receipts.ReceiptVerdict:
     verdict = receipts.verify_receipt(
-        db, receipt, policy if policy is not None else policy_from_env(), kind="action",
+        db, receipt, policy_for(action, policy), kind="action",
         expected_digest=expected_digest, expected_action_id=action["action_id"],
         expect_decision=expect_decision, consume_by=None, now=now)
     if not verdict.ok:

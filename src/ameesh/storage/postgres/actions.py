@@ -24,7 +24,7 @@ from .. import interface
 ACTION_COLUMNS = """
     action_id, project, work_item, proposed_by, connector, operation, target, args,
     class, amount, currency, policy_version, digest, dedupe, requires_receipt, approvers,
-    state, replaces, replaced_by, replace_approver, attempts, auth_kind, auth_approver,
+    canon, state, replaces, replaced_by, replace_approver, attempts, auth_kind, auth_approver,
     auth_nonce, auth_challenge, auth_authenticator_id, auth_grant_id, auth_by,
     external_ref, last_error, last_actor, last_note,
     extract(epoch from auth_expires_at)::float8 AS auth_expires_ts,
@@ -105,9 +105,11 @@ class Actions(interface.Actions):
         return approvals, unknown, interrupted
 
     def covering_grants(self, action_id, amount, connector, operation, action_class,
-                        currency) -> list[dict]:
+                        currency, canon="") -> list[dict]:
         """Lecture seule, sans verrou : simple pré-filtre ; la réservation se
-        fait au lancement, atomiquement, et y recontrôle tout sous verrou."""
+        fait au lancement, atomiquement, et y recontrôle tout sous verrou.
+        L44 (0031) : seuls les grants dont l'authentificateur est déclaré par
+        `canon` (celui de l'action) la couvrent."""
         return self.db.query(
             """
             SELECT s.id, s.approver,
@@ -120,10 +122,11 @@ class Actions(interface.Actions):
                AND s.valid_until > clock_timestamp()
                AND (%s::bigint = 0 OR s.currency = %s)
                AND EXISTS (SELECT 1 FROM authenticators a
-                            WHERE a.id = s.authenticator_id AND a.revoked_at IS NULL)
+                            WHERE a.id = s.authenticator_id AND a.revoked_at IS NULL
+                              AND a.canon = %s)
              ORDER BY s.valid_until, s.id
             """,
-            (action_id, amount, connector, operation, action_class, amount, currency),
+            (action_id, amount, connector, operation, action_class, amount, currency, canon),
         )
 
     def launched(self, *, action_id, grace, force) -> list[dict]:

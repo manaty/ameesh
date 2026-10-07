@@ -115,7 +115,7 @@ class Progress(interface.Progress):
             SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.provider,
                    r.credential_mode, r.status, r.status_text, r.current_prompt,
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,
-                   r.turns, r.lease_owner,
+                   r.turns, r.lease_owner, r.mode, r.stop_reason, r.responsible,
                    (r.lease_owner IS NOT NULL AND r.lease_expires_at > now()) AS lease_live,
                    extract(epoch from r.last_turn_at)::float8 AS last_turn_ts,
                    extract(epoch from r.last_seen)::float8    AS last_seen_ts,

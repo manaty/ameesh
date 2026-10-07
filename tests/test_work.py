@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 
-from ameesh import work
+from ameesh import registry, work
 
 from .support import PgTestCase
 
@@ -85,6 +85,8 @@ class WorkTest(PgTestCase):
             work.note(self.db, self._add()["id"], "  ")
 
     def test_assignation_et_budget(self):
+        # L37 (0030) : l'assigné d'un lot doit exister (attribution gardée)
+        registry.upsert(self.db, "deepseek7", harness="deepseek")
         item = self._add("avec budget", type="bug", app="nexlink", assignee="deepseek7",
                          budget_usd=3.5, source="rollbar", issue_ref="#42",
                          workstream="v1")

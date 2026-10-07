@@ -874,6 +874,26 @@ class AgentWorker(threading.Thread):
             return str(assignes[0]["id"])
         return None
 
+    def _note_delegate_turn(self, spec: dict) -> None:
+        """L40 (0030) : le tour qui commence compte pour les lots délégués à
+        cet agent — le lot du tour et ceux de ses messages. Noté une fois par
+        délégation (registre et journal du lot) : à l'échéance, le lot ne
+        reviendra pas au délégant. Jamais bloquant pour le tour."""
+        from . import work as work_mod
+
+        lots = {str(spec["lot"])} if spec.get("lot") else set()
+        try:
+            ids = [int(i) for i in spec.get("ids") or []]
+            if ids:
+                lots.update(storage.of(self.db).operations.message_lots(ids))
+            marques = work_mod.mark_delegate_turn(self.db, self.name, lots)
+        except (db_mod.DbError, ValueError) as exc:
+            log_async("[%s] tour sur lot délégué non noté (%s)" % (self.name, exc))
+            return
+        if marques:
+            log_async("[%s] tour sur lot(s) délégué(s) : %s"
+                      % (self.name, ", ".join("#%d" % i for i in marques)))
+
     def lot_rotation_due(self, lot: str | None) -> bool:
         """Rotation au changement de lot due ? (politique `par-lot`)
 
@@ -1708,6 +1728,7 @@ class AgentWorker(threading.Thread):
             if storage.of(self.db).operations.set_session_work_item(
                     self.name, self.runner.runner_id, self.epoch, str(lot)):
                 self.agent["session_work_item"] = str(lot)
+        self._note_delegate_turn(spec)
 
         # Worktree renommé/déplacé (0018) : adoption bornée. Absent : la
         # consigne repart en attente et `pick()` garde l'agent bloqué, avec une
@@ -1830,7 +1851,15 @@ class AgentWorker(threading.Thread):
                     if parsed.get("session") and not session_new:
                         session_new = parsed["session"]
                         self.write_session_file(session_new)
-                        registry.set_session(self.db, self.name, session_new)
+                        # L39 (0030) : le compte d'origine de la session, en
+                        # registre avec son id (le marqueur du flux reste la
+                        # source des relevés du tour)
+                        registry.set_session(
+                            self.db, self.name, session_new,
+                            compte.name if compte is not None else None)
+                        if self.agent is not None:
+                            self.agent["session_account"] = (
+                                compte.name if compte is not None else None)
                     if parsed.get("model") and parsed["model"] != modele_annonce:
                         modele_annonce = parsed["model"]  # source du tour (L13 B4)
                         self._compta_annonce(modele_annonce)  # persisté tout de suite
@@ -2031,6 +2060,11 @@ class Runner:
                                 "limits": self._host_limits}
         self._pressure_at = 0.0
         self._all_host_limits: dict = {}
+        #: L43 (0031) : `max_agents` physique (le plus strict des canons) et
+        #: provenance de chaque limite ; journal « hôte plein » une fois par valeur
+        self._host_max_agents: int | None = None
+        self._host_limits_origin: dict = {}
+        self._cap_logged: int | None = None
         #: déplacement entre hôtes admis (L31, 0028), faux par défaut
         self.relocate = bool(cfg.relocate)
         self.shared_sessions = bool(cfg.shared_sessions)
@@ -2039,9 +2073,49 @@ class Runner:
         self._container_runtime = containers_mod.Runtime.from_config(cfg)
         self.turns = 0
         self.did_turn = False
+        #: dernière erreur de traitement des délégations échues (L40), dite une fois
+        self._delegation_error: str | None = None
+        self._delegation_dry_seen: set = set()
 
     # -- réclamation -------------------------------------------------------
+    def expire_delegations_once(self) -> list[dict]:
+        """L40 (0030, point 5) : les délégations échues, à chaque passe.
+
+        Ne dépend d'aucun agent : tout exécuteur vivant traite toutes les
+        échéances ; deux exécuteurs simultanés ne rendent jamais deux fois un
+        lot (verrou de ligne et recontrôle, `work.expire_delegations`). En
+        dry-run, ce qui serait fait est seulement journalisé. Une erreur de
+        base est journalisée une fois, jamais fatale à la passe."""
+        from . import work as work_mod
+
+        try:
+            done = work_mod.expire_delegations(
+                self.db, actor="exécuteur %s" % self.runner_id, dry_run=self.dry_run)
+        except db_mod.DbError as exc:
+            message = "délégations échues non traitées (%s)" % exc
+            if message != self._delegation_error:
+                log_async(message)
+            self._delegation_error = message
+            return []
+        self._delegation_error = None
+        for row in done:
+            if row.get("dry_run"):
+                # rien n'est écrit en dry-run : dit une fois, pas à chaque passe
+                if row["delegation_id"] in self._delegation_dry_seen:
+                    continue
+                self._delegation_dry_seen.add(row["delegation_id"])
+            if row["outcome"] == "rendue":
+                log_async("délégation échue : lot #%s rendu à %s (%s n'y a fait aucun tour)%s"
+                          % (row["work_item_id"], row["delegated_by"], row["delegate"],
+                             " [dry-run]" if row.get("dry_run") else ""))
+            elif row["outcome"] == "soldee":
+                log_async("délégation soldée : lot #%s (travail de %s)%s"
+                          % (row["work_item_id"], row["delegate"],
+                             " [dry-run]" if row.get("dry_run") else ""))
+        return done
+
     def sweep(self) -> None:
+        self.expire_delegations_once()
         for row in registry.reap(self.db, self.host):
             log("bail expiré : %s (propriétaire %s)" % (row["name"], row.get("lease_owner")))
         with self.lock:
@@ -2053,6 +2127,17 @@ class Runner:
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
                     continue
+            if not self.once and not self.admits_new_worker(agent):
+                # L43 (0031) : hôte plein (max_agents physique) — l'agent reste
+                # réclamable, il le sera quand une place se libère
+                if getattr(self, "_cap_logged", None) != self._host_max_agents:
+                    self._cap_logged = self._host_max_agents
+                    log_async("hôte %s plein : max_agents = %s (fiche Host la plus stricte, "
+                              "%s) — %s attend une place"
+                              % (self.host, self._host_max_agents,
+                                 (getattr(self, "_host_limits_origin", None) or {}).get(
+                                     "max_agents", "?"), agent["name"]))
+                continue
             lease = registry.claim(self.db, agent["name"], self.runner_id, self.lease_ttl)
             if not lease:
                 continue  # un autre exécuteur a gagné la course
@@ -2178,24 +2263,74 @@ class Runner:
         ce qui ferme la réclamation (L2) sans toucher aux baux ni aux tours en
         cours. Un échec — canon, git, base — est journalisé et rend `False`.
         """
-        if not self.cfg.canon:
+        entries = canon_mod.configured(self.cfg)
+        if not entries:
             return True
         db = None
+        ok = True
         try:
             db = db_mod.connect(self.cfg)
             db_mod.require_schema(db)
-            canon = canon_mod.from_config(self.cfg)
-            report = canon_sync.sync(db, canon, self.host)
+            # L42 (0031) : chaque canon configuré est relu et synchronisé à chaque
+            # passe, le canon par défaut d'abord ; une erreur dans l'un n'empêche
+            # pas les autres. Les identifiants en double sont refusés (le second).
+            loaded: list = []
+            for index, entry in enumerate(entries):
+                try:
+                    canon = (canon_mod.from_config(self.cfg) if index == 0
+                             else canon_mod.from_config(self.cfg, entry=entry))
+                    ident = getattr(canon, "id", None)
+                    if ident and any(getattr(c, "id", None) == ident for c in loaded):
+                        raise canon_mod.CanonError(
+                            "configuration : identifiant de canon « %s » en double (%s) : "
+                            "ce canon n'est pas synchronisé" % (ident, entry.path))
+                    loaded.append(canon)
+                except Exception as exc:  # jamais fatal : le canon ferme, il ne tue pas
+                    ok = False
+                    log_async("canon sync en échec (%s) : %s" % (
+                        entry.path, " ".join(str(exc).split())[:200]))
+            if len(entries) > 1 and loaded and all(hasattr(c, "is_default") for c in loaded):
+                try:
+                    canon_sync.adopt_default(db, self.host, loaded)
+                except Exception as exc:
+                    ok = False
+                    log_async("canon par défaut : %s — aucun canon synchronisé"
+                              % " ".join(str(exc).split())[:300])
+                    # L46 : changement de canon par défaut refusé ou en échec
+                    # (transaction annulée) : AUCUN canon n'est synchronisé, le
+                    # nouveau canon par défaut prendrait sinon les lignes NULL
+                    # de l'ancien pour les siennes. Rien n'est fermé non plus.
+                    loaded = []
+            synced: list = []
+            for canon in loaded:
+                try:
+                    report = canon_sync.sync(db, canon, self.host)
+                    synced.append(canon)
+                    status = getattr(report, "status", None)
+                    if status and status != canon_sync.CANON_OK:
+                        log_async("canon sync%s : %s (%s)" % (
+                            " %s" % canon.id if len(loaded) > 1 else "", status,
+                            getattr(report, "diagnostic", None) or "sans détail"))
+                except Exception as exc:  # jamais fatal : le canon ferme, il ne tue pas
+                    ok = False
+                    log_async("canon sync en échec%s : %s" % (
+                        " (%s)" % getattr(canon, "id", "?") if len(loaded) > 1 else "",
+                        " ".join(str(exc).split())[:200]))
+            # L42 : un canon retiré de la configuration ne garde pas ses agents
+            # réclamables (seulement si tous les canons configurés sont chargés :
+            # jamais de fermeture sur une configuration lue en partie)
+            if len(loaded) == len(entries) and all(hasattr(c, "is_default") for c in loaded):
+                try:
+                    canon_sync.close_unconfigured(db, self.host, loaded)
+                except Exception as exc:
+                    ok = False
+                    log_async("canons retirés : %s" % " ".join(str(exc).split())[:200])
             # L31 : seuils de pression de l'hôte. `canon_sync_once` est aussi
             # exercé sur un objet factice (tests d'authentificateurs).
             refresh = getattr(self, "refresh_host_limits", None)
-            if refresh is not None:
-                refresh(canon)
-            status = getattr(report, "status", None)
-            if status and status != canon_sync.CANON_OK:
-                log_async("canon sync : %s (%s)"
-                          % (status, getattr(report, "diagnostic", None) or "sans détail"))
-            return True
+            if refresh is not None and synced:
+                refresh(*synced)
+            return ok
         except Exception as exc:  # jamais fatal : le canon ferme, il ne tue pas
             log_async("canon sync en échec : %s" % " ".join(str(exc).split())[:200])
             return False
@@ -2327,26 +2462,38 @@ class Runner:
 
         threading.Thread(target=boucle, daemon=True, name="ressources").start()
 
-    def refresh_host_limits(self, canon) -> None:
-        """Met à jour les seuils de ressources de CET hôte depuis le canon.
+    def refresh_host_limits(self, canon, *others) -> None:
+        """Met à jour les limites physiques de CET hôte depuis les canons.
 
         Appelé après chaque `canon sync` (le canon est la source déclarative
         des seuils) ; sans fiche Host, les valeurs par défaut prudentes
         s'appliquent. Force le recalcul du verdict de pression.
 
+        L43 (0031) : `others` sont les autres canons configurés. Les limites
+        PHYSIQUES (seuils de ressources, `max_agents` de l'hôte) sont les plus
+        strictes de toutes les fiches Host de cet hôte dans ces canons
+        (`resources.host_limits`) ; l'admission de chaque agent reste jugée
+        par la fiche de son canon (`canon sync`).
+
         Défensif sur les attributs : `canon_sync_once` est aussi exercé sur un
         objet factice par les tests d'authentificateurs, qui n'a que `cfg` et
         `host`."""
         from . import resources as resources_mod
-        if canon is None or not hasattr(canon, "host"):
+        canons = [c for c in (canon,) + tuple(others)
+                  if c is not None and hasattr(c, "host") and hasattr(c, "hosts")]
+        if not canons:
             return  # objet factice des tests de `canon_sync_once`
-        host = canon.host(self.host)
-        policy = host.policy if host is not None else None
-        limits = resources_mod.thresholds(policy)
-        # seuils de TOUS les hôtes du canon : le déplacement (L31) compare les
-        # candidats avec la politique de leur propre hôte.
-        par_hote = {h.title: resources_mod.thresholds(h.policy)
-                    for h in (canon.hosts if canon is not None else [])}
+        mine = resources_mod.host_limits(canons, self.host)
+        limits = mine["limits"]
+        # seuils de TOUS les hôtes des canons : le déplacement (L31) compare les
+        # candidats avec les limites physiques de leur propre hôte.
+        par_hote: dict = {}
+        for one in canons:
+            for h in one.hosts:
+                if h.title not in par_hote:
+                    par_hote[h.title] = resources_mod.host_limits(canons, h.title)["limits"]
+        self._host_max_agents = mine["max_agents"]
+        self._host_limits_origin = mine["origin"]
         lock = getattr(self, "_pressure_lock", None)
         if lock is None:
             self._host_limits = limits
@@ -2356,6 +2503,21 @@ class Runner:
             if limits != self._host_limits:
                 self._host_limits = limits
                 self._pressure_at = 0.0
+
+    def admits_new_worker(self, agent: dict) -> bool:
+        """L43 (0031) : `max_agents` PHYSIQUE de l'hôte (le plus petit des
+        fiches Host de tous les canons) borne le nombre de personas que cet
+        exécuteur fait tourner à la fois. Les éphémères n'y comptent pas (ils
+        n'ont pas d'admission ; `max_agents` compte des admissions). Sans
+        maximum déclaré : pas de borne."""
+        cap = getattr(self, "_host_max_agents", None)
+        if cap is None or (agent or {}).get("ephemeral"):
+            return True
+        with self.lock:
+            running = sum(1 for name, worker in self.workers.items()
+                          if name != (agent or {}).get("name") and worker.is_alive()
+                          and not (getattr(worker, "agent", None) or {}).get("ephemeral"))
+        return running < cap
 
     def host_limits_for(self, host: str) -> dict | None:
         """Seuils connus d'un hôte (dernier `canon sync`), ou None."""
@@ -2480,6 +2642,11 @@ def cmd_register(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
         ", session %s" % parsed.session if parsed.session else "",
         ", consigne en attente" if parsed.prompt else "",
     ))
+    if not parsed.session and row and row.get("session_id"):
+        # L39 (0030) : `register` sans --session GARDE la session enregistrée ;
+        # l'oublier proprement est le rôle de `ameesh resume --fresh`.
+        log("session enregistrée conservée (%s) : « ameesh resume %s --fresh » pour "
+            "repartir d'une session neuve" % (row["session_id"], parsed.name))
     return 0 if row else 1
 
 
@@ -2487,7 +2654,10 @@ def cmd_stop(cfg: Config, db: db_mod.Db, args: list[str]) -> int:
     if not args:
         print("usage: agent-runner stop <nom>", file=sys.stderr)
         return 2
-    registry.set_status(db, args[0], "stopped", status_text="arrêté à la main")
+    # L37 (0030) : raison structurée — un arrêt manuel ne lève pas
+    # `stopped_with_mail` (l'humain sait qu'il l'a arrêté)
+    registry.set_status(db, args[0], "stopped", status_text="arrêté à la main",
+                        stop_reason="manuel")
     log("agent %s marqué arrêté" % args[0])
     return 0
 

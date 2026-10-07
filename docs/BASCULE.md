@@ -181,6 +181,16 @@ appliqué ») jusqu'à ce que le propriétaire vide le journal
 Le registre garde ses colonnes et ses arrêts, sans effet tant qu'aucun
 exécuteur ne tourne.
 
+**Plusieurs canons** (manaty + Acme, L42) : `canons` dans
+`config.json` ou `AMEESH_CANONS` — voir
+[EXPLOITATION](EXPLOITATION.md#plusieurs-canons-l42-decision-0031). Le premier
+reste le canon par défaut ; un hôte à un seul canon ne change rien. Depuis
+L44 (migration 0035), chaque canon synchronise les passkeys de ses humains
+dans son propre registre : donner une `ref` à chaque entrée de `canons`, ou
+amorcer une fois chaque canon suivant (`ameesh canon sync --canon <id>
+--bootstrap-ref main`, journalisé) ; puis relancer `deploy/sql/role-approve.sql`
+(ameesh-approve lit `actions.canon` et `authenticators.canon`).
+
 ---
 
 ## Étape 3 — ameesh-approve **[P]**
@@ -283,7 +293,9 @@ Dans cet ordre, sans raccourci :
    (`agent-mail hook <harnais>`). Un agent lancé par l'exécuteur reçoit
    `AGENT_MAIL_NAME`, `AMEESH_RUNNER_ID` et `AMEESH_LEASE_EPOCH` : le hook ne
    livre que si le bail est vivant et détenu par cet exécuteur. Le dossier ne
-   donne jamais d'identité.
+   donne jamais d'identité. Une session externe n'en a une que si elle est
+   liée (`ameesh mail bind`, L41) : voir
+   [Passer les hooks à la v1](#passer-les-hooks-à-la-v1-avance-de-létape-8-pour-les-hooks-décision-0030).
 
    **Courrier pendant la coexistence (jusqu'à l'étape 8)** : la commande
    `agent-mail` installée (`~/.local/bin/agent-mail`, celle qu'appellent les
@@ -424,6 +436,10 @@ hôte (à la main ou par un minuteur).
 **Le service de surveillance** des orchestrateurs, service utilisateur à côté
 de l'exécuteur.
 
+**Les alertes poussées** (L38) : `ameesh notify`, service utilisateur à côté
+de l'exécuteur — unité d'exemple `deploy/systemd/ameesh-notify.service`,
+configuration et secrets dans [EXPLOITATION.md](EXPLOITATION.md#alertes-poussées--ameesh-notify).
+
 **ameesh-approve [P]**, service système sous son utilisateur, jamais celui des
 agents :
 
@@ -468,6 +484,178 @@ l'étape 4 ; `systemctl disable --now ameesh-approve`.
 **Retour arrière :** réinstaller les scripts depuis la sauvegarde, remettre
 `~/.local/bin/agent-mail` sur la v0, `ameesh export-v0` pour le courrier, puis
 les boucles v0 (étape 4, retour arrière).
+
+---
+
+## Passer les hooks à la v1 (avance de l'étape 8 pour les hooks, décision 0030)
+
+**Geste du propriétaire [P].** Cette section remplace une commande de
+`~/.local/bin` et modifie les configurations des harnais
+(`~/.claude*/settings.json`, `~/.codex*/hooks.json`). Aucun agent ne le fait
+à sa place : un agent peut préparer les commandes, mais c'est le propriétaire
+qui les lance et qui vérifie. Elle avance l'étape 8 **pour les hooks
+seulement** (décision 0030 « Pas de travail sans réveil possible », point 6,
+lot L41) : `nexlink-agent` et l'état fichier v0 restent en place.
+
+### Constat
+
+* Les hooks du poste appellent `~/.local/bin/agent-mail`, qui est encore la
+  **v0**, directement ou par le pont local `~/.local/bin/ameesh-session-mail-hook`
+  (configurations Claude secondaire et tertiaire), qui pose `AGENT_MAIL_NAME`
+  puis appelle la v0.
+* La v0 **tire l'identité du dossier** (`AGENT_MAIL_NAME`, sinon alias de
+  `~/.config/agent-mail/aliases.tsv` par préfixe, sinon nom du dossier) : une
+  session sous `~/Work` prenait l'identité `orchestrateur` d'une autre équipe.
+* La v0 lit la boîte **fichier** : une session externe ne voit jamais son
+  courrier v1 (Postgres). Même liée par le pont, elle ne reçoit que la boîte
+  fichier.
+* La v1 (`agent-mail hook <harnais>`, L41) ne tire jamais l'identité du
+  dossier : `AGENT_MAIL_NAME` (et le bail si l'exécuteur l'a posé), sinon la
+  **liaison de session** (`ameesh mail bind`, source `session`) retrouvée par
+  l'identifiant de session que le harnais passe au hook, avec contrôle du PID
+  ancêtre s'il est lié. Sans l'un ni l'autre : **rien n'est remis, rien n'est
+  écrit**, sortie 0.
+
+### Avant de commencer
+
+1. ameesh installé avec L41 dans le venv, schéma migré : `ameesh migrate`
+   (applique `0034_liaisons_de_session`), puis `ameesh mail bindings` répond
+   « aucune liaison de session ».
+2. **Plus aucun agent sous boucle v0** (`nexlink-agent list` : aucun agent
+   actif) : après le remplacement, `agent-mail send` et `agent-mail inbox`
+   parlent à la base, plus à la boîte fichier. Un agent encore mené par la v0
+   le serait sans courrier : le rendre d'abord à l'exécuteur (étapes 4 à 6),
+   ou reporter cette section.
+3. Courrier v0 en attente pour les sessions externes : `ameesh import-v0
+   --dry-run`, puis `ameesh import-v0 --agents <noms>` pour le passer en base.
+4. Noter, pour chaque session interactive à garder joignable, son harnais, son
+   identifiant de session et le PID du harnais (`ps -o pid,args -C claude`,
+   `-C codex`). L'identifiant est celui que le harnais passe au hook :
+   Claude le montre dans `/status` et dans le nom du transcript
+   (`~/.claude*/projects/…/<id>.jsonl`), Codex dans le nom du fichier de
+   session (`~/.codex*/sessions/…/rollout-…-<id>.jsonl`).
+
+### Sauvegarde
+
+```bash
+mkdir -p ~/backups/hooks-v1-$(date +%F-%H%M) && cd "$_"
+cp -a ~/.local/bin/agent-mail agent-mail.v0
+cp -a ~/.local/bin/ameesh-session-mail-hook .
+cp -a ~/.config/ameesh/external-session-bindings.json .
+for f in ~/.claude*/settings.json ~/.codex*/hooks.json; do
+  cp -a "$f" "$(echo "${f#$HOME/}" | tr / _)"
+done
+sha256sum * > SHA256SUMS
+```
+
+### Bascule
+
+L'ordre compte (L46). Le pont local pose `AGENT_MAIL_NAME` (source
+`explicit`) : tant qu'il appelle `agent-mail`, une v1 derrière lui
+remettrait à la session externe le courrier d'un agent nommé dans le pont —
+y compris d'un agent que l'exécuteur mène déjà (`coordinateur`), et
+écrirait sur sa ligne. Le pont est donc **retiré d'abord**, pendant que
+`agent-mail` est encore la v0 (qui ne lit que la boîte fichier et ne touche
+pas à la base) ; la v1 n'arrive qu'ensuite. Depuis L46, la v1 refuse de
+toute façon la remise `explicit` à un agent qui détient un bail vivant, et
+un hook sans bail ne change plus que `last_seen` sur la ligne d'un agent
+`execute` ; l'ordre ci-dessous reste la règle (il protège aussi un agent
+entre deux tours, sans bail vivant à l'instant).
+
+1. **Remplacer, dans les configurations des harnais, les hooks qui appellent
+   le pont** par l'appel direct à `agent-mail` (mêmes événements, même
+   harnais) :
+
+   ```text
+   /home/smichea/.local/bin/ameesh-session-mail-hook claude   →   /home/smichea/.local/bin/agent-mail hook claude
+   ```
+
+   (`~/.claude-secondary/settings.json`, `~/.claude-tertiary/settings.json`.)
+   Jusqu'au point 3, ces hooks appellent encore la v0, comme ceux de
+   `~/.claude`, `~/.codex` et `~/.codex-secondary` aujourd'hui : rien n'est lu
+   en base. Le pont `ameesh-session-mail-hook` et son fichier restent en
+   place, inutilisés, jusqu'à la fin de vie de la v0 (étape 8).
+
+   ```bash
+   grep -c ameesh-session-mail-hook ~/.claude*/settings.json ~/.codex*/hooks.json   # 0 partout
+   ```
+
+2. **Importer les liaisons du pont** (inertes pour la v0 ; le dossier `cwd`
+   du pont n'est pas repris : il ne donne jamais d'identité) :
+
+   ```bash
+   ameesh mail bind --import ~/.config/ameesh/external-session-bindings.json
+   ameesh mail bindings
+   ```
+
+   Le rapport dit, entrée par entrée, ce qui est importé et ce qui est ignoré
+   avec la raison : agent `execute` (mené par l'exécuteur, qui lui remet son
+   courrier : c'est le cas attendu d'un agent comme `coordinateur` après sa reprise par
+   l'exécuteur — L46 : l'import ne force jamais), agent qui détient un bail
+   vivant, session déjà liée à un autre agent, harnais ou nom invalide. Un
+   agent encore inconnu du registre y est inscrit comme **externe**. Une
+   session reprise depuis l'écriture du pont a un **nouveau PID** : la
+   relier avec le PID courant, sinon le hook la refusera (« pid … absent de
+   l'ascendance ») :
+
+   ```bash
+   ameesh mail bind <agent> --session <id> --harness claude|codex|deepseek --pid <PID du harnais>
+   ```
+
+   `--pid` est recommandé : sans lui, quiconque connaît l'identifiant de
+   session sur cet hôte reçoit le courrier de l'agent. Un agent `execute` est
+   refusé (« agent mené par l'exécuteur ; une session externe lui volerait son
+   courrier ») : le reclasser d'abord (`ameesh set <agent> mode=externe`) s'il
+   est en réalité une session humaine ; `--force` n'est qu'un dernier recours.
+
+3. **Remplacer `agent-mail` par la v1** (le lien vers le venv, comme les
+   autres commandes de l'étape 1) — en dernier, une fois le pont retiré des
+   configurations :
+
+   ```bash
+   ln -sfn ~/.local/share/ameesh/venv/bin/agent-mail ~/.local/bin/agent-mail
+   agent-mail --help | head -3          # « agent-mail (mesh v1) »
+   ```
+
+   Les hooks qui appellent `agent-mail hook <harnais>` et la barre d'état
+   (`agent-mail statusline`) passent à la v1 par ce lien.
+
+### Vérification
+
+```bash
+grep -c ameesh-session-mail-hook ~/.claude*/settings.json ~/.codex*/hooks.json   # 0 partout
+ameesh mail bindings
+```
+
+* **Dans une session liée** (demander à l'agent de lancer la commande, ou
+  depuis un shell lancé par la session) : `agent-mail whoami` affiche
+  `<agent> [session] liaison <harnais> <id> sur <hôte>, pid <N>, par <qui>`.
+  Puis `ameesh mail send <agent> "essai de remise v1" --from smichea`
+  depuis un terminal : le message apparaît au prochain prompt de la session,
+  et `ameesh fil show <projet>` le montre remis.
+* **Dans une session non liée** : `agent-mail whoami` répond « identité non
+  liée » (code 1) ; un message envoyé à un agent dont le dossier porterait le
+  nom **n'apparaît pas** dans la session, et reste non lu en base
+  (`ameesh mail inbox <agent>`).
+* Un agent de l'exécuteur : son tour suivant se passe comme avant
+  (`ameesh list`, journal de l'exécuteur), son hook remet sous son bail.
+
+### Retour arrière, symétrique
+
+1. Remettre la v0 : `cp -a ~/backups/hooks-v1-<date>/agent-mail.v0
+   ~/.local/bin/agent-mail` (le fichier, pas un lien), puis `agent-mail
+   --help | head -3` (« boîte aux lettres locale »).
+2. Remettre les configurations des harnais depuis la sauvegarde (les hooks
+   des configurations Claude secondaire et tertiaire rappellent
+   `ameesh-session-mail-hook`), et vérifier les empreintes
+   (`sha256sum -c SHA256SUMS` dans le dossier de sauvegarde, pour les
+   fichiers remis).
+3. Courrier v1 arrivé entre-temps pour les sessions externes :
+   `ameesh export-v0 --agents <noms>` le réécrit dans la boîte fichier, que la
+   v0 relit.
+4. Les liaisons en base sont inertes pour la v0 ; les révoquer si on renonce
+   à la bascule : `ameesh mail unbind --session <id> --harness <h>` pour
+   chacune (`ameesh mail bindings`).
 
 ---
 
@@ -556,6 +744,198 @@ sans base ni exécuteur, en lisant le même canon avec les deux versions) :
 
 ---
 
+## Mise à jour vers L36–L46 — décisions 0030 et 0031
+
+Les lots L36 à L46 apportent les migrations **0030 à 0036** : mode d'agent et
+raison d'arrêt (0030), délégation à échéance (0031), plusieurs canons (0032),
+compte de la session (0033), liaisons de session (0034), authentificateurs par
+canon (0035), puis les corrections de relecture de L46 (0036 : `actions.canon`
+immuable hors rebase du canon par défaut, heure de démarrage du PID lié). Les
+gestes marqués [P] sont ceux du propriétaire.
+
+**Ce qui casse l'ancien code — tout se met à jour ENSEMBLE.**
+
+* **0032** : la clé de `canon_state` devient `(host, canon)`. L'ancien code
+  écrit l'état du canon par `ON CONFLICT (host)` : après la migration, chacune
+  de ses synchronisations échoue (plus de contrainte unique sur `host` seul).
+* **0035** : l'index unique des authentificateurs devient `(canon, facade,
+  credential_id)`. L'ancien code inscrit par `ON CONFLICT (facade,
+  credential_id)` : sa synchronisation des passkeys échoue.
+* **0036** : un code L42–L45 qui changerait l'ordre des canons verrait son
+  rebase refusé (`actions.canon` immuable) — fermé, mais bloqué.
+
+Donc **tous les hôtes et tous les services qui partagent la base** —
+exécuteurs (`agent-runner`) de chaque hôte, `ameesh-approve`, `ameesh notify`,
+minuteurs de `canon sync`, hooks `agent-mail` v1 — sont arrêtés, puis mis à
+jour **ensemble**, avant d'être relancés. Pas d'hôte « en retard ».
+
+**Pas de retour arrière du code sans restauration de la base.** Les
+migrations ne se défont pas : remettre l'ancien code sur une base migrée, c'est
+le casser (ci-dessus). La sauvegarde prise **avant** `ameesh migrate` est le
+seul retour arrière.
+
+### Procédure
+
+1. **Arrêt partout** (chaque hôte, puis [P] le service système) :
+
+   ```bash
+   systemctl --user stop agent-runner ameesh-notify      # sur CHAQUE hôte
+   sudo systemctl stop ameesh-approve                    # [P]
+   ```
+
+   Vérifier qu'aucun bail ne reste vivant : `ameesh list` (aucun `bail:`), ou
+   attendre leur échéance.
+
+2. **Sauvegarde de la base, avant toute migration** :
+
+   ```bash
+   pg_dump --format=custom --file ~/backups/ameesh-avant-L46-$(date +%F-%H%M).dump "$AMEESH_DSN"
+   ```
+
+   (L'exercice de restauration de l'étape 1 vaut aussi ici.)
+
+3. **Code et migrations** : installer ameesh L46 dans le venv de chaque hôte
+   (et `/opt/ameesh/venv` pour ameesh-approve [P]), puis, **une seule fois** :
+
+   ```bash
+   ameesh migrate            # applique 0030 … 0036
+   ```
+
+4. **[P] Rôles SQL relancés** (idempotents, ils échouent sans rien changer si
+   le contrat n'est pas tenu) : ameesh-approve lit désormais `actions.canon` et
+   `authenticators.canon` (sans quoi il répond 503), le superviseur lit les
+   nouvelles colonnes (`mode`, `stop_reason`, `canon`, `canon_id`,
+   `session_bindings.pid_start`…) :
+
+   ```bash
+   PGOPTIONS='-c search_path=<schéma>' psql "<DSN admin>" -v ON_ERROR_STOP=1 -f deploy/sql/role-approve.sql
+   PGOPTIONS='-c search_path=<schéma>' psql "<DSN admin>" -v ON_ERROR_STOP=1 -f deploy/sql/role-superviseur.sql
+   ```
+
+5. **Reclasser à la main les agents externes existants.** 0030 donne
+   `mode = execute` à toute ligne existante ; seul un agent NÉ d'un hook sans
+   bail naît `externe`. Chaque session humaine déjà au registre (orchestrateur
+   interactif, session Codex ou Claude d'un humain) doit être reclassée, sans
+   quoi l'exécuteur pourrait la réclamer et reprendre sa session :
+
+   ```bash
+   ameesh set <agent> mode=externe       # un agent externe exige un responsable humain
+   ```
+
+   (Depuis L46, l'exécuteur ne réclame jamais un agent `externe`, et un hook
+   sans bail ne touche plus que `last_seen` sur la ligne d'un agent `execute`.)
+
+6. **Relance partout** (`systemctl --user start agent-runner ameesh-notify` ;
+   [P] `sudo systemctl start ameesh-approve`), puis la **vérification**
+   ci-dessous.
+
+### Changements visibles
+
+* **`send all`** ne va plus qu'à l'**équipe** (ou au chantier) de
+  l'expéditeur (L36) ; un expéditeur sans équipe ni chantier garde la
+  diffusion globale.
+* **`work add --assignee` / `work assign`** refusent un nom **inconnu** du
+  registre et un agent `externe` sans `--externe` (L37, règle 2 de 0030) ;
+  L46 : un nom nu d'humain connu est normalisé en `human:<id>`, un canon
+  momentanément invalide ne bloque plus, et le refus dit quoi faire
+  (`agent-runner register …`, `human:<id>`, `--externe`).
+* **`max_agents` physique** (le plus strict des fiches `Host` des canons de
+  l'hôte, L43) **plafonne l'exécuteur** : au-delà, les agents restent en
+  attente (journal de l'exécuteur), rien n'est arrêté.
+* `ameesh mail bind` refuse un agent `execute` sauf `--force` ; `ameesh adopt`
+  révoque les liaisons de session de l'agent adopté (L46).
+* Hooks `agent-mail` v1 et pont local : voir la section « Passer les hooks à
+  la v1 » ci-dessus — le pont est retiré **avant** que `agent-mail` ne passe
+  à la v1.
+
+### Vérification après migration
+
+```sql
+select mode, status, stop_reason, count(*) from agent_registry group by 1, 2, 3 order by 1, 2, 3;
+```
+
+* aucune session humaine en `execute` (sinon : étape 5) ;
+* `stop_reason` : NULL pour tout agent qui tourne ; pour les `stopped` /
+  `dead` déjà en base, la raison que disait leur texte libre (`manuel`,
+  `bail_expire`, `retire_du_canon`), NULL sinon — un ancien arrêt sans raison
+  lève `stopped_with_mail` s'il a du courrier : le relancer ou l'arrêter de
+  nouveau (`agent-runner stop`, raison `manuel`) ;
+* `ameesh canon check` puis `ameesh list` : agents du canon `idle`, canon `ok`
+  sur chaque hôte ; `ameesh alerts` : pas de `dead_runner` ni d'`orphan_lot`
+  inattendu ;
+* ameesh-approve répond (pas de 503) ; `ameesh notify --once --dry-run`.
+
+**Retour arrière** : arrêter de nouveau tous les services, **restaurer la
+sauvegarde de l'étape 2** (`pg_restore --clean --if-exists -d "$AMEESH_DSN"
+<fichier>`), remettre l'ancien code sur chaque hôte, relancer. Jamais l'ancien
+code sur la base migrée.
+
+---
+
+## Accueillir un second canon (Acme) — L45, décision 0031
+
+Pour faire tourner sur `pc-smichea` des agents déclarés dans le canon
+Acme (`~/development/acme/home`, fédération
+`acme-ingenierie`), à côté de ceux du canon manaty. Les étapes
+marquées [P] sont des gestes du propriétaire.
+
+**Prérequis.** ameesh avec les lots L42 à L44 installé ; `ameesh migrate`
+appliqué (migrations 0030 à 0035) ; **rôles SQL relancés** :
+`deploy/sql/role-approve.sql` et `deploy/sql/role-superviseur.sql` (sans quoi
+ameesh-approve répond 503 : il ne peut plus lire `actions.canon`).
+
+1. **[P] Fiches ameesh dans le canon Acme**, par une PR sur
+   acme/home, revue et fusionnée :
+   - `federation.yaml` : `ameesh: {scope: ameesh}` — ameesh ne lit que
+     `ameesh/` ; les `type: Agent` de `org/agent-harness/` (sous-agents Claude
+     Code) sont ignorés au lieu de rendre le canon invalide ;
+   - `ameesh/membres/smichea.md` (Member), `ameesh/hotes/pc-smichea.md`
+     (Host : harnais, fournisseurs, modes, `work_dirs` des agents d'Acme ;
+     **même `max_agents` que la fiche manaty** — le plus petit des deux
+     plafonne tout l'exécuteur) ;
+   - `ameesh/agents/<agent>.md` et `ameesh/placements/<agent>-pc-smichea.md`
+     pour chaque agent d'Acme (p. ex. `acme-docs`, `acme-securite-docs`).
+   Contrôle avant fusion, sur la branche de la PR :
+   `ameesh canon check --canon <copie de la branche> --ref HEAD` → 0 erreur.
+2. **[P] Configuration de l'hôte** (`~/.config/ameesh/config.json`) : passer
+   de `canon`/`canon_ref` à une liste, le canon manaty restant **le premier**
+   (canon par défaut : ne pas réordonner dans le même geste) :
+   ```json
+   "canons": [
+     {"path": "/home/smichea/canon", "ref": "origin/main"},
+     {"path": "/home/smichea/development/acme/home", "ref": "origin/main"}
+   ]
+   ```
+   La `ref` du second canon est sa branche de confiance pour les
+   authentificateurs (L44) ; sans elle, l'amorcer une fois :
+   `ameesh canon sync --canon acme-ingenierie --bootstrap-ref main`.
+3. **Vérifier**, sans rien lancer :
+   - `ameesh canon check` : un bloc par canon, les deux valides ;
+   - `ameesh canon sync --fetch` : chaque canon ne touche que ses lignes ;
+     aucun agent manaty arrêté ;
+   - `ameesh placement check --canon acme-ingenierie` : les agents
+     d'Acme admis sur `pc-smichea` ;
+   - `ameesh hosts` : origine de chaque limite (`[manaty]`,
+     `[acme-ingenierie]`).
+4. **Changer un agent de canon** (p. ex. un agent d'Acme déclaré à titre
+   provisoire dans le canon manaty, ou `coordinateur`) : [P] retirer sa
+   fiche du canon manaty (PR fusionnée, l'agent est arrêté « retiré du
+   canon », son nom est libéré), puis [P] la déclarer dans le canon
+   Acme : à la synchronisation suivante, la ligne change de canon et
+   repart, **avec sa boîte et son historique**. Dans l'autre ordre, le second
+   canon reçoit `canon-name-conflict` (local à la fiche) et n'écrit rien.
+5. **Agents** : `ameesh resume <agent>` (ou `ameesh adopt` pour une session
+   interactive existante) pour les mettre en route sous l'exécuteur.
+
+**Retour arrière.** Retirer le second canon de `canons` (ou revenir à
+`canon`/`canon_ref`) : l'exécuteur passe son état à `invalid`
+(`close_unconfigured`), ses agents ne sont plus réclamables, **rien n'est
+arrêté ni effacé** ; le canon manaty n'est pas touché. Les lignes du second
+canon restent dans le registre avec leur colonne `canon`, prêtes pour un
+nouvel essai.
+
+---
+
 ## Risques et parades
 
 | Risque | Parade |
@@ -567,6 +947,7 @@ sans base ni exécuteur, en lisant le même canon avec les deux versions) :
 | un agent mal placé ou sans responsable | non réclamable (R14, C4) ; raison dans `status_text` |
 | mise à jour d'un hôte sans dossiers de travail déclarés (L31) | repli transitoire sur l'ancien `cwd` (L35) ; arrêter l'exécuteur ancien, installer L35 et valider avec lui **avant** de publier `work_dirs` / `{agent}` ; `canon check` avertit `admission-cwd-inherited` / `host-work-dir-missing` |
 | retour à 1.3.0 avec un canon L35 | chemins `{agent}` littéraux, `work_dirs` ignoré : rendre le canon compatible (un dossier par équipe) et arrêter les agents qui ont besoin d'un worktree propre **avant** tout sync 1.3.0 |
+| une session externe prend l'identité d'un autre agent par son dossier (hooks v0) | hooks passés à la v1 (décision 0030, L41) : identité par `AGENT_MAIL_NAME` ou liaison de session explicite, PID ancêtre contrôlé ; sans liaison, rien n'est remis |
 | une action irréversible sans humain | la porte exige un reçu lié à l'empreinte, à usage unique, avec échéance ; issue inconnue → `reconcile`, jamais de nouvelle tentative automatique |
 | ameesh-approve exposé trop tôt | rien n'est mis en ligne avant la revue de L7 ; exposition = acte du propriétaire ; service sur la boucle locale seulement |
 | faux enrôlement de passkey | l'enrôlement n'est qu'une proposition ; confirmation hors bande et PR revue du canon avant toute activation |

@@ -119,10 +119,17 @@ class Mailbox(interface.Mailbox):
     # est alors marqué `deja_consigne` et signalé « re-livré ».
 
     @staticmethod
-    def _bail_sql(owner) -> str:
+    def _bail_sql(owner, *, reservation=False) -> str:
         if owner:
             return ("v.lease_owner = %s AND v.lease_epoch = %s"
                     " AND v.lease_expires_at > clock_timestamp()")
+        if reservation:
+            # L46 : une identité sans bail (explicite, liaison de session) ne
+            # réserve JAMAIS le courrier d'un agent qui détient un bail vivant
+            # — il est mené par l'exécuteur, qui le lui remet dans ses tours.
+            # Contrôlé sous le verrou de la ligne, dans l'instruction même.
+            return ("(v.lease_owner IS NULL OR v.lease_expires_at IS NULL"
+                    " OR v.lease_expires_at <= clock_timestamp())")
         return "TRUE"
 
     @staticmethod
@@ -174,7 +181,7 @@ class Mailbox(interface.Mailbox):
               FROM cibles
              WHERE m.id = cibles.id
             RETURNING %s, cibles.deja AS deja_avant
-        """ % (filtre, self._bail_sql(owner), self.ACTIVE_SQL,
+        """ % (filtre, self._bail_sql(owner, reservation=True), self.ACTIVE_SQL,
                MAIL_COLUMNS.replace("id,", "m.id,", 1))
         params = ((recipient, recipient) + self._bail_params(owner, epoch)
                   + (int(limit), owner or None, int(epoch) if owner else None,

@@ -37,7 +37,7 @@ def profile_params(values: dict) -> tuple:
 class Placements(interface.Placements):
 
     def recorded(self, host) -> list[dict]:
-        sql = ("SELECT name, host, placement_ok, placement_diagnostic, placement_ref, "
+        sql = ("SELECT name, host, canon, placement_ok, placement_diagnostic, placement_ref, "
                "placement_profile, %s AS placement_profile_current FROM agent_registry"
                % profile_sql())
         params: tuple = ()

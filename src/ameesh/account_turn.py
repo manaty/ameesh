@@ -162,16 +162,36 @@ def mark(worker, events_path: str, compte) -> None:
     worker._compte_session = compte.name
 
 
-def _session_account(worker) -> str | None:
-    """Le compte sous lequel la session courante a tourné (dernier marqueur).
+def marker_account(cfg, name: str, harness: str) -> str | None:
+    """Le compte du dernier marqueur du flux `events.jsonl` de l'agent (L30)."""
+    book = cost_mod.CostBook(state_dir=cfg.state_dir, db=None, tools={name: harness})
+    return book.account_at(name, sys.maxsize, harness)
 
-    Lu une fois dans le flux, puis tenu à jour par `mark` : `pick` passe ici à
-    chaque sondage, sans relire le flux.
+
+def recorded_session_account(cfg, row: dict | None) -> str | None:
+    """Le compte d'origine de la session enregistrée d'un agent (L39, 0030) :
+    `agent_registry.session_account`, sinon le dernier marqueur du flux
+    (sessions antérieures à L39). None : inconnu."""
+    row = row or {}
+    if row.get("session_account"):
+        return str(row["session_account"])
+    return marker_account(cfg, row.get("name") or "", row.get("harness") or "")
+
+
+def _session_account(worker) -> str | None:
+    """Le compte sous lequel la session courante a tourné.
+
+    L39 (0030) : d'abord le registre (`session_account`, écrit avec l'id de
+    session par l'exécuteur, ou par `ameesh adopt` pour une session qu'il n'a
+    pas ouverte) ; sinon le dernier marqueur du flux (compatibilité), lu une
+    fois puis tenu à jour par `mark` : `pick` passe ici à chaque sondage,
+    sans relire le flux.
     """
+    enregistre = (worker.agent or {}).get("session_account")
+    if enregistre:
+        return str(enregistre)
     if not hasattr(worker, "_compte_session"):
-        book = cost_mod.CostBook(state_dir=worker.cfg.state_dir, db=None,
-                                 tools={worker.name: _harness(worker)})
-        worker._compte_session = book.account_at(worker.name, sys.maxsize, _harness(worker))
+        worker._compte_session = marker_account(worker.cfg, worker.name, _harness(worker))
     return worker._compte_session
 
 
@@ -215,10 +235,47 @@ def continuity(worker) -> None:
         worker._fil_note(texte, meta={"action": "compte", "session": session,
                                       "continuite": "reprise"})
         worker._compte_session = new.name
+        # L39 : le registre suit (sinon `_session_account` relirait l'ancien
+        # compte à chaque sondage)
+        try:
+            registry.set_session_account(worker.db, worker.name, new.name)
+            if worker.agent is not None:
+                worker.agent["session_account"] = new.name
+        except db_mod.DbError as exc:
+            _log("[%s] compte de session non noté (%s)" % (worker.name, exc))
         return
     if not worker.peek():
         return
     rotate(worker, harness, old, new, session)
+
+
+def summary_possible(old, book, items, now: float | None = None) -> tuple[bool, str]:
+    """L'ancien compte peut-il encore porter le tour de résumé d'une rotation ?
+    (L39, décision 0030) `(vrai, "")` ou `(faux, raison)`.
+
+    Non s'il est retiré de la configuration, si son profil est inutilisable
+    (`accounts.check` : dossier, identifiants, clé) ou si l'une de ses jauges
+    est SATURÉE (100 %, fenêtre non remise à zéro) : le fournisseur refuserait
+    le tour. Un compte seulement « au seuil » de rythme (garde 0019) reste
+    utilisable pour un résumé — c'est la règle de 0027.
+    """
+    if old is None:
+        return False, "compte retiré de la configuration"
+    problems = accounts.check(old)
+    if problems:
+        return False, "; ".join(problems)
+    now = time.time() if now is None else now
+    try:
+        gauges = accounts.gauges_of(book, old, items) if book is not None else []
+    except Exception:
+        gauges = []
+    for gauge in gauges:
+        if gauge.reset_passed(now):
+            continue
+        if float(gauge.used or 0.0) >= 1.0:
+            return False, "forfait %s %s saturé (%.0f %%)" % (
+                old.harness, gauge.key, float(gauge.used) * 100)
+    return True, ""
 
 
 def rotate(worker, harness: str, old, new, session: str) -> bool:
@@ -227,7 +284,17 @@ def rotate(worker, harness: str, old, new, session: str) -> bool:
     _log("[%s] bascule de compte %s : session %s (compte %s) non reprenable sous %s — "
          "rotation avec résumé" % (worker.name, harness, session, nom_ancien, new.name))
     resume = ""
-    if old is not None and not accounts.check(old):
+    possible = old is not None and not accounts.check(old)
+    if possible:
+        # L39 : une jauge saturée de l'ancien compte ferait échouer le résumé
+        try:
+            book = cost_mod.CostBook(state_dir=worker.cfg.state_dir, db=None,
+                                     tools={worker.name: harness})
+            possible, _raison = summary_possible(old, book,
+                                                 accounts.profiles(worker.cfg, harness))
+        except Exception:
+            possible = True
+    if possible:
         # le résumé se fait sous l'ANCIEN compte, qui seul peut reprendre la session
         worker._account_override = old
         try:
@@ -237,9 +304,24 @@ def rotate(worker, harness: str, old, new, session: str) -> bool:
         finally:
             worker._account_override = None
     sans_resume = not resume
+    note = resume
     if sans_resume:
-        resume = FALLBACK_RESUME % (session, nom_ancien, new.name)
-    worker._session_history(session, resume)
+        note = FALLBACK_RESUME % (session, nom_ancien, new.name)
+        # L39 (0030) : ancien compte inutilisable ou résumé en échec — brief de
+        # reprise DÉTERMINISTE (registre, lots, fil, courrier, transcript), sans
+        # appel de modèle ; le fil n'en garde que la mention.
+        resume = note
+        try:
+            from . import reprise
+            resume = note + "\n\n" + reprise.deterministic_brief(
+                worker.cfg, worker.db, registry.get(worker.db, worker.name) or worker.agent,
+                session=session, account=old,
+                reason="bascule de compte %s : %s → %s" % (harness, nom_ancien, new.name),
+                consigne="La consigne de ce tour suit ce brief : reprends ton travail à "
+                         "partir de là, et termine chaque tour par un état clair.")
+        except Exception as exc:  # un brief manquant ne bloque jamais la rotation
+            _log("[%s] brief de reprise déterministe indisponible (%s)" % (worker.name, exc))
+    worker._session_history(session, note)
     if not registry.clear_session(worker.db, worker.name, worker.runner.runner_id,
                                   worker.epoch):
         _log("[%s] rotation de bascule annulée : bail perdu avant l'effacement" % worker.name)
@@ -258,7 +340,8 @@ def rotate(worker, harness: str, old, new, session: str) -> bool:
         "reprise sous le compte %s (stockage de sessions distinct). Rotation avec résumé "
         "de reprise (L11)%s ; l'ancien id est conservé dans `session-history.jsonl`.\n\n%s"
         % (harness, session, nom_ancien, new.name,
-           " — résumé indisponible, reprise sur le fil" if sans_resume else "", resume),
+           " — résumé indisponible, reprise sur un brief déterministe (L39)"
+           if sans_resume else "", note),
         meta={"action": "compte", "session": session, "continuite": "rotation"})
     return True
 

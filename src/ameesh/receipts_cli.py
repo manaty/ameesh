@@ -4,11 +4,13 @@
   ameesh receipt verify <fichier.json> [--rp-id R] [--origin O]… [--allow-facade F]…
                         [--level standard|eleve] [--digest sha256:…] [--action-id A]
                         [--kind action|standing|any] [--decision approve|deny|any]
-                        [--consume --by NOM] [--json]
-        vérifie un reçu ameesh-receipt/1 contre le registre de confiance ; sans
+                        [--canon ID] [--consume --by NOM] [--json]
+        vérifie un reçu ameesh-receipt/1 contre le registre de confiance (celui
+        du canon de l'objet approuvé, --canon ; défaut : le canon par défaut) ; sans
         --consume, le nonce est seulement contrôlé (non consommé) ; --consume
         exige --digest et --action-id ;
-  ameesh authenticator list [--approver human:ID] [--all] [--expect-commit SHA] [--json]
+  ameesh authenticator list [--approver human:ID] [--all] [--expect-commit SHA]
+                            [--canon ID] [--json]
         le registre des authentificateurs (copie de travail du canon).
 
 `--rp-id` et `--origin` ont pour défaut AMEESH_APPROVE_RP_ID et
@@ -56,6 +58,8 @@ def cmd_verify(cfg: Config, args: argparse.Namespace) -> int:
         allow_facades=frozenset(args.allow_facade) if args.allow_facade else receipts.HUMAN_FACADES,
         level=args.level,
         canon_commit=args.expect_commit or "",
+        # L44 (0031) : le canon de l'objet approuvé ('' = canon par défaut)
+        canon=args.canon or "",
     )
     db = _open(cfg)
     try:
@@ -88,7 +92,8 @@ def cmd_authenticator_list(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
         rows = receipts.list_authenticators(
-            db, approver=args.approver, include_revoked=args.all)
+            db, approver=args.approver, include_revoked=args.all,
+            canon=None if args.canon is None else args.canon)
         off = set()
         if args.expect_commit:
             off = {row["id"] for row in receipts.mismatched_authenticators(
@@ -112,7 +117,9 @@ def cmd_authenticator_list(cfg: Config, args: argparse.Namespace) -> int:
         print("%-22s %-13s %-24s %-9s %-17s %-16s %s" % (
             row["approver"][:22], row["facade"], row["credential_id"][:24], row["level"],
             row["key_fingerprint"][:16] + "…", _moment(row.get("enrolled_ts")), state))
-        print("%22s canon : %s" % ("", row.get("canon_ref") or "—"))
+        print("%22s canon : %s%s" % ("", row.get("canon_ref") or "—",
+                                     " (déclaré par le canon %s)" % row["canon"]
+                                     if row.get("canon") else ""))
     return 1 if off else 0
 
 
@@ -139,6 +146,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify.add_argument("--decision", choices=["approve", "deny", "any"], default="approve")
     p_verify.add_argument("--expect-commit", default=None,
                           help="l'authentificateur doit venir de ce commit du canon")
+    p_verify.add_argument("--canon", default="", metavar="ID",
+                          help="canon de l'objet approuvé (L44) : seuls ses authentificateurs "
+                               "sont admis ; défaut : le canon par défaut")
     p_verify.add_argument("--consume", action="store_true",
                           help="consommer le nonce (usage unique)")
     p_verify.add_argument("--by", default=None)
@@ -152,6 +162,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--all", action="store_true", help="avec les révoqués")
     p_list.add_argument("--expect-commit", default=None,
                         help="signaler les lignes qui ne viennent pas de ce commit")
+    p_list.add_argument("--canon", default=None, metavar="ID",
+                        help="seulement les authentificateurs de ce canon (L44 ; \"\" : le "
+                             "canon par défaut)")
     p_list.add_argument("--json", action="store_true")
     p_list.set_defaults(func=cmd_authenticator_list)
     return parser

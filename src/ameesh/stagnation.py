@@ -173,6 +173,77 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
     return _waiting("verdict", jalons.get("reviewer"))
 
 
+#: attentes dont le `who` est un agent qui doit travailler (L36)
+_AGENT_WAITS = ("start", "build", "fix", "verdict")
+
+
+def agent_states(db) -> dict[str, str]:
+    """`{nom: état}` de tous les agents du registre (`progress.agent_state`)."""
+    return agent_availability(db)[0]
+
+
+def agent_availability(db) -> tuple[dict[str, str], dict[str, str | None]]:
+    """`({nom: état}, {nom externe: responsable ou None})` en une lecture (L37)."""
+    return availability_of(storage.of(db).progress.agents(None))
+
+
+def availability_of(rows: Iterable[dict]) -> tuple[dict[str, str], dict[str, str | None]]:
+    """Les deux tables de `with_availability` depuis des lignes d'agents."""
+    from . import progress  # import tardif : progress importe ce module
+
+    rows = list(rows)
+    states = {r["name"]: progress.agent_state(r) for r in rows}
+    externals = {r["name"]: (r.get("responsible") or None) for r in rows
+                 if r.get("mode") == "externe"}
+    return states, externals
+
+
+def with_availability(detail: dict | None, states: dict[str, str] | None,
+                      externals: dict[str, str | None] | None = None) -> dict | None:
+    """Dit quand celui qu'attend un lot ne peut pas travailler (L36, décision 0030).
+
+    Un agent absent du registre est « inconnu », un agent arrêté (ou mort) est
+    « arrêté » : l'étiquette le dit, et `who_state` le porte pour les outils.
+    L37 : un agent EXTERNE (`externals`, nom → responsable) est une session
+    humaine qu'ameesh ne réveille pas : « (session externe, <responsable>) »,
+    `who_state` = `externe` et `responsible` = l'humain qui porte le lot.
+    Les humains (`human:…`) et les attentes sans agent ne sont pas touchés."""
+    if not detail or states is None or detail.get("what") not in _AGENT_WAITS:
+        return detail
+    if not detail.get("who"):
+        return detail
+    externals = externals or {}
+    notes: dict[str, str] = {}
+    responsible: str | None = None
+    for name in (n.strip() for n in str(detail["who"]).split(",")):
+        if not name or name.startswith("human:"):
+            continue
+        state = states.get(name)
+        if state is None:
+            notes[name] = "inconnu"
+        elif name in externals:
+            notes[name] = "externe"
+            responsible = responsible or externals[name]
+        elif state == "stopped":
+            notes[name] = "arrêté"
+    if not notes:
+        return detail
+    single = len(notes) == 1 and "," not in str(detail["who"])
+    if single and next(iter(notes.values())) == "externe":
+        suffix = " (session externe, %s)" % (responsible or "sans responsable")
+    elif single:
+        suffix = " (agent %s)" % next(iter(notes.values()))
+    else:
+        suffix = " (%s)" % ", ".join(
+            "%s %s" % (n, "session externe" if st == "externe" else st)
+            for n, st in notes.items())
+    out = dict(detail, label=detail["label"] + suffix,
+               who_state=notes if len(notes) > 1 else next(iter(notes.values())))
+    if "externe" in notes.values():
+        out["responsible"] = responsible
+    return out
+
+
 def legacy(detail: dict | None) -> str | None:
     """Le résumé en un mot (forme L26, `ameesh-alert/1`)."""
     return _LEGACY.get((detail or {}).get("what"))
@@ -219,15 +290,18 @@ def describe(db, rows: list[dict], *, now: float | None = None,
     st = storage.of(db)
     ids = [int(r["id"]) for r in rows]
     packages = {p["id"]: p for p in st.packages.all(include_absent=True)}
+    states, externals = agent_availability(db)
     events, milestones, actions, messages = _grouped(st, ids)
     out: dict[int, dict] = {}
     for row in rows:
         rid = int(row["id"])
         acts = actions.get(rid, [])
         jalons = progress._jalons_de_lot(row, events.get(rid, []), acts, milestones.get(rid))
-        detail = waiting(row, jalons, acts,
-                         responsible=(packages.get(row.get("package_id")) or {}).get(
-                             "responsible"))
+        detail = with_availability(
+            waiting(row, jalons, acts,
+                    responsible=(packages.get(row.get("package_id")) or {}).get(
+                        "responsible")),
+            states, externals)
         last = last_activity(row, events.get(rid, []), milestones.get(rid, []), acts,
                              messages.get(rid))
         out[rid] = {"waiting": detail, "waiting_for": legacy(detail),

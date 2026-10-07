@@ -3,6 +3,7 @@
 """agent-mesh — la CLI du mesh : observabilité, clés, approbations, lots.
 
   agent-mesh list [--json]                     mesh list : agents, hôte, bail, non lus, budget
+                                                (statut préfixé « ext/ » : agent externe, L37)
   agent-mesh show <agent> [--json]             détail d'un agent
   agent-mesh key generate --out DIR --i-am-the-owner   paire de clés (acte du propriétaire)
   agent-mesh key register <agent> --public-key FICHIER [--role owner|agent]
@@ -16,6 +17,7 @@
                                                 coût des tours et jauges de forfait
   agent-mesh work add --title T [--type bug|evolution] [--app A] [--assignee N] …
   agent-mesh work list [--state S] | work show <id> | work move <id> <état> | work note <id> "…"
+  agent-mesh work assign <id> <agent> [--externe] [--actor A]   réassigner (attribution gardée)
   agent-mesh import-v0 [--agents a,b] [--dry-run]     bascule : boîte fichier v0 → Postgres
   agent-mesh export-v0 [--agents a,b] [--keep]        retour arrière : Postgres → boîte v0
   agent-mesh migrate | doctor [--notify-test | --probe]
@@ -139,35 +141,46 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             print("aucun agent connu")
             return 0
         now = time.time()
-        print("%-20s %-9s %-10s %-11s %-22s %-8s %-13s %-4s %s" % (
-            "NOM", "HARNAIS", "HÔTE", "STATUT", "BAIL", "NON LUS", "BUDGET", "CLÉ", "VU"))
+        # Un seul balayage des lots pour toute la vue (L36) : le pied global
+        # et le compte par agent en dérivent.
+        lots = work.delays(db, limit=500)
+        open_by_agent: dict[str, int] = {}
+        for lot in lots:
+            if lot.get("assignee") and lot.get("state") not in work.TERMINAL:
+                open_by_agent[lot["assignee"]] = open_by_agent.get(lot["assignee"], 0) + 1
+        print("%-20s %-9s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
+            "NOM", "HARNAIS", "HÔTE", "STATUT", "BAIL", "NON LUS", "LOTS", "BUDGET", "CLÉ",
+            "VU"))
         for row in rows:
             status = row.get("status") or "?"
             if row.get("status_text"):
                 status = "%s/%s" % (status, row["status_text"][:22])
-            print("%-20s %-9s %-10s %-11s %-22s %-8d %-13s %-4s %s" % (
+            if row.get("mode") == "externe":
+                # L37 (0030) : session humaine, jamais réveillée par ameesh
+                status = "ext/" + status
+            print("%-20s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
                 row["name"][:20], (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
-                status[:11], _lease(row), int(row.get("unread") or 0), _budget(row),
+                status[:11], _lease(row), int(row.get("unread") or 0),
+                open_by_agent.get(row["name"], 0), _budget(row),
                 ("owner" if row.get("has_owner_key")
                  else "agent" if row.get("key_ready") else "—"),
                 _fmt_age(now - float(row.get("last_seen_ts") or 0)),
             ))
-            # Les lots sur la même vue (0018 point 5) : le compte par phase et ce
-            # qui attend le plus, pour que `ameesh list` dise où en est le travail.
-            lots = work.delays(db, limit=500)
-            if lots:
-                counts: dict[str, int] = {}
-                for lot in lots:
-                    name, _at = work.last_milestone(lot)
-                    counts[name] = counts.get(name, 0) + 1
-                oldest = min((float(lot["frozen_ts"]) for lot in lots
-                              if lot.get("frozen_ts") and not lot.get("reviewed_ts")),
-                             default=None)
-                detail = ", ".join("%s %d" % (name, counts[name])
-                                   for name, _at_key, _duration in reversed(work.MILESTONES)
-                                   if name in counts)
-                waiting = " — plus ancien gel : %s" % _fmt_age(now - oldest) if oldest else ""
-                print("lots     : %d (%s)%s" % (len(lots), detail, waiting))
+        # Les lots sur la même vue (0018 point 5) : le compte par phase et ce
+        # qui attend le plus, pour que `ameesh list` dise où en est le travail.
+        if lots:
+            counts: dict[str, int] = {}
+            for lot in lots:
+                name, _at = work.last_milestone(lot)
+                counts[name] = counts.get(name, 0) + 1
+            oldest = min((float(lot["frozen_ts"]) for lot in lots
+                          if lot.get("frozen_ts") and not lot.get("reviewed_ts")),
+                         default=None)
+            detail = ", ".join("%s %d" % (name, counts[name])
+                               for name, _at_key, _duration in reversed(work.MILESTONES)
+                               if name in counts)
+            waiting = " — plus ancien gel : %s" % _fmt_age(now - oldest) if oldest else ""
+            print("lots     : %d (%s)%s" % (len(lots), detail, waiting))
         return 0
     finally:
         db.close()
@@ -180,21 +193,23 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
     (politique de la fiche `Host`, valeurs par défaut comprises), l'état de
     pression et l'historique court. En `--json`, un objet `ameesh-host/1` par
     ligne.
+
+    L43 (0031) : seuils et `max_agents` sont les limites PHYSIQUES — les plus
+    strictes des fiches Host de tous les canons — avec la provenance de
+    chacune (`limits_origin`) et les fiches de chaque canon (`fiches`).
     """
     from . import canon as canon_mod
+    from . import placement as placement_mod
     from . import resources as res
 
     db = _open(cfg)
     try:
-        canon = None
-        if cfg.canon:
-            try:
-                canon = canon_mod.from_config(cfg)
-            except canon_mod.CanonError:
-                canon = None
+        # L42 (0031) : les fiches Host de tous les canons configurés (le canon
+        # par défaut d'abord)
+        canons = canon_mod.load_configured(cfg)
         latest_by_host = {row["host"]: row for row in res.current(db)}
         names = set(latest_by_host)
-        if canon is not None:
+        for canon in canons:
             names |= {h.title for h in canon.hosts}
         if args.host:
             names = {args.host}
@@ -202,12 +217,20 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             print("aucun hôte connu : ni mesure publiée, ni fiche Host au canon")
             return 0
         now = time.time()
+        many = len(canons) > 1
         for name in sorted(names):
-            host = canon.host(name) if canon is not None else None
-            policy = host.policy if host is not None else None
-            limits = res.thresholds(policy)
+            # L43 (0031) : chaque canon décrit l'hôte par sa fiche Host ; les
+            # limites physiques sont les plus strictes, avec leur provenance
+            fiches = canon_mod.host_fiches(canons, name)
+            host = fiches[0][1] if fiches else None
+            physical = res.host_limits(canons, name)
+            limits, origin = physical["limits"], physical["origin"]
+            admissions = {
+                canon.id: sum(1 for p in canon.placements if p.agent and name in
+                              placement_mod.admitted_hosts(canon, p))
+                for canon, _fiche in fiches}
             latest = latest_by_host.get(name)
-            verdict = res.pressure(latest, policy) if latest is not None else None
+            verdict = res.pressure(latest, limits=limits) if latest is not None else None
             history = res.history(db, name, args.history)
             if args.json:
                 print(json.dumps({
@@ -215,6 +238,13 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                     "host": name,
                     "responsible": host.responsible if host is not None else None,
                     "limits": limits,
+                    "max_agents": physical["max_agents"],
+                    "limits_origin": origin,
+                    "fiches": [{"canon": canon.id, "default": canon.is_default,
+                                "responsible": fiche.responsible,
+                                "max_agents": fiche.policy.max_agents,
+                                "admissions": admissions.get(canon.id, 0)}
+                               for canon, fiche in fiches],
                     "latest": latest,
                     "pressure": verdict,
                     "history": history,
@@ -224,13 +254,20 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                 else "hôte sans fiche Host" if host is None else "responsable inconnu"
             if latest is None:
                 print("%s — %s ; aucune mesure publiée" % (name, resp))
+                _print_host_fiches(fiches, physical, admissions, many=many)
                 continue
             age = _fmt_age(now - float(latest.get("sampled_ts") or now))
             print("%s — %s ; mesure %s" % (name, resp, age))
-            print("  seuils     mémoire ≥ %s ; swap ≤ %s ; charge ≤ %.2f ; disque ≥ %s"
-                  % (_fmt_bytes(limits["min_mem_available"]),
-                     _fmt_bytes(limits["max_swap_used"]), limits["max_load"],
-                     _fmt_bytes(limits["min_disk_free"])))
+            _print_host_fiches(fiches, physical, admissions, many=many)
+
+            def tag(key: str) -> str:
+                return " [%s]" % origin.get(key, res.DEFAULT_ORIGIN) if fiches else ""
+
+            print("  seuils     mémoire ≥ %s%s ; swap ≤ %s%s ; charge ≤ %.2f%s ; disque ≥ %s%s"
+                  % (_fmt_bytes(limits["min_mem_available"]), tag("min_mem_available"),
+                     _fmt_bytes(limits["max_swap_used"]), tag("max_swap_used"),
+                     limits["max_load"], tag("max_load"),
+                     _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free")))
             print("  état       mémoire %s ; swap %s ; charge %s ; disque %s ; tours %s"
                   % (_fmt_bytes(latest.get("mem_available_bytes")),
                      _fmt_bytes(latest.get("swap_used_bytes")),
@@ -261,6 +298,29 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         db.close()
 
 
+def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: bool) -> None:
+    """`ameesh hosts` (L43, 0031) : les fiches Host de l'hôte par canon, et le
+    `max_agents` physique (le plus strict) avec sa provenance."""
+    if not fiches:
+        return
+    if many or len(fiches) > 1:
+        print("  fiches     %s" % " ; ".join(
+            "%s (%s, max %s, %d admission(s))" % (
+                canon.id, fiche.responsible or "sans responsable",
+                "—" if fiche.policy.max_agents is None else fiche.policy.max_agents,
+                admissions.get(canon.id, 0))
+            for canon, fiche in fiches))
+    total = sum(admissions.values())
+    cap = physical["max_agents"]
+    if cap is None:
+        print("  agents     %d admission(s) ; max_agents non déclaré" % total)
+        return
+    print("  agents     %d admission(s) ; max_agents %d [%s]%s" % (
+        total, cap, physical["origin"].get("max_agents", "?"),
+        " — AU-DELÀ du maximum physique : l'exécuteur ne fait tourner que %d persona(s) "
+        "à la fois" % cap if total > cap else ""))
+
+
 def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
@@ -282,7 +342,20 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         print("harnais  : %-9s hôte : %-12s statut : %s%s" % (
             row.get("harness") or "?", row.get("host") or "—", row.get("status"),
             (" (%s)" % row["status_text"]) if row.get("status_text") else ""))
-        print("session  : %s" % (row.get("session_id") or "—"))
+        if row.get("stop_reason"):
+            print("arrêt    : %s" % row["stop_reason"])
+        # L37 (0030) : mode explicite ; un agent externe exige un responsable
+        if row.get("mode") == "externe":
+            print("mode     : externe (session humaine, non réveillable)%s" % (
+                "" if row.get("responsible")
+                else " — SANS responsable humain : obligatoire pour un agent externe"))
+        else:
+            print("mode     : execute (mené par un exécuteur, sous bail)")
+        # L39 (0033) : compte d'origine de la session, quand il est connu
+        print("session  : %s%s" % (row.get("session_id") or "—",
+                                   " (compte %s)" % row["session_account"]
+                                   if row.get("session_id") and row.get("session_account")
+                                   else ""))
         print("bail     : %s" % _lease(row))
         print("modèle   : %-9s budget : %s" % (row.get("model") or "—", _budget(row)))
         print("responsable : %s   équipe : %s%s" % (
@@ -566,6 +639,18 @@ def cmd_review_class(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_assignment(check: dict | None) -> None:
+    """Ce que l'attribution gardée (L37) a à dire : session externe forcée,
+    agent arrêté."""
+    if not check:
+        return
+    if check.get("externe"):
+        print("session externe : %s ne sera pas réveillé par ameesh ; le lot attend %s "
+              "(responsable)" % (check["assignee"], check["responsible"]))
+    if check.get("warning"):
+        print("avertissement : %s" % check["warning"], file=sys.stderr)
+
+
 def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
     from . import plan, plan_cli, stagnation  # plan de travail (L29)
     db = _open(cfg)
@@ -573,14 +658,62 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command in plan_cli.COMMANDS:
             return plan_cli.run(db, args)
         if args.work_command == "add":
+            # L37 (0030, règle 2) : attribution gardée — un assigné non
+            # réveillable est refusé AVANT la création (WorkError, code 1).
+            check = (work.check_assignee(db, args.assignee, externe=args.externe, cfg=cfg)
+                     if args.assignee else None)
             item = work.add(
                 db, title=args.title, type=args.type, source=args.source, app=args.app,
                 body=args.body or "", issue_ref=args.issue_ref, workstream=args.workstream,
                 assignee=args.assignee, budget_usd=args.budget, actor=args.actor,
-                package=args.package)
+                package=args.package, externe=args.externe, cfg=cfg)
             print("lot #%d créé en %s : %s%s" % (
                 item["id"], item["state"], item["title"],
                 " (plan : %s)" % item["package_id"] if item.get("package_id") else ""))
+            _print_assignment(check)
+            return 0
+        if args.work_command == "assign":
+            out = work.assign(db, args.id, args.agent, externe=args.externe,
+                              actor=args.actor, cfg=cfg)
+            print("lot #%d assigné à %s (avant : %s)" % (
+                out["item"]["id"], out["item"]["assignee"], out["previous"] or "personne"))
+            _print_assignment(out["check"])
+            return 0
+        if args.work_command == "delegate":
+            # L40 (0030, point 5) : délégation à échéance, gardée comme `assign`
+            out = work.delegate(db, args.id, args.agent, within=args.within,
+                                actor=args.actor, cfg=cfg)
+            item = out["item"]
+            print("lot #%d délégué à %s par %s, échéance dans %s (%s)" % (
+                item["id"], item["assignee"], item["delegated_by"],
+                work.span(float(item["due_ts"]) - float(item["delegated_ts"])),
+                _fmt_moment(item.get("due_ts"))))
+            if out.get("replaced"):
+                print("délégation précédente remplacée (%s, déléguée par %s)" % (
+                    out["replaced"]["delegate"], out["replaced"]["delegated_by"]))
+            if out.get("message_id"):
+                print("événement #%d déposé pour %s" % (out["message_id"], item["assignee"]))
+            if out.get("warning"):
+                print("avertissement : %s" % out["warning"], file=sys.stderr)
+            return 0
+        if args.work_command == "expire-delegations":
+            rows = work.expire_delegations(db, actor=args.actor or work.SYSTEM_SENDER,
+                                           dry_run=args.dry_run)
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+                return 0
+            if not rows:
+                print("aucune délégation échue")
+                return 0
+            for row in rows:
+                issue = {
+                    "rendue": "rendu à %s (aucun tour de %s)" % (row["delegated_by"],
+                                                                row["delegate"]),
+                    "soldee": "délégation soldée (travail de %s)" % row["delegate"],
+                    "annulee": "délégation annulée (lot fermé ou réassigné)",
+                }.get(row["outcome"], row["outcome"])
+                print("%slot #%s : %s" % ("[dry-run] " if row.get("dry_run") else "",
+                                          row["work_item_id"], issue))
             return 0
         if args.work_command == "list":
             rows = work.list_items(db, state=args.state, assignee=args.assignee, limit=args.limit)
@@ -613,6 +746,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     notes.append("STAGNANT depuis %s" % plan.describe_age(row["stale"]["idle_s"]))
                 if row.get("waiting_for"):
                     notes.append("attend : %s" % row["waiting_for"]["label"])
+                if row.get("delegation"):
+                    notes.append(row["delegation"]["label"])
                 if notes:
                     print("      %s" % " · ".join(notes))
             return 0
@@ -645,6 +780,12 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("PR       : %s" % item["pr_ref"])
             if item.get("waiting_for"):
                 print("attend   : %s" % item["waiting_for"]["label"])
+            if item.get("delegation"):
+                delegation = item["delegation"]
+                print("délégué  : %s (le %s%s)" % (
+                    delegation["label"], _fmt_moment(delegation.get("delegated_ts")),
+                    ", échéance %s" % _fmt_moment(delegation["due_ts"])
+                    if delegation.get("due_ts") else ""))
             if item.get("stale"):
                 print("STAGNANT : aucune activité depuis %s"
                       % plan.describe_age(item["stale"]["idle_s"]))
@@ -843,14 +984,15 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
         fh.write(valeur + "\n")
 
 
-#: clés de `ameesh set` (L13 : model, effort ; L26 : tier, session_policy)
-SET_KEYS = ("model", "effort", "tier", "session_policy")
+#: clés de `ameesh set` (L13 : model, effort ; L26 : tier, session_policy ;
+#: L37 : mode, `execute` | `externe`, décision 0030)
+SET_KEYS = ("model", "effort", "tier", "session_policy", "mode")
 #: un tier est un identifiant court (passé tel quel au harnais par son descripteur)
 _TIER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 def cmd_set(cfg: Config, args) -> int:
-    """`ameesh set <agent> model=… effort=… tier=… session_policy=…` (L13, L26).
+    """`ameesh set <agent> model=… effort=… tier=… session_policy=… mode=…` (L13, L26, L37).
 
     Écrit l'état d'exécution : le modèle dans le registre (visible par `list`)
     et dans l'état local ; l'effort et le tier dans l'état local **et** en base
@@ -858,7 +1000,8 @@ def cmd_set(cfg: Config, args) -> int:
     session (`par-lot` | `taille` | `jamais`, décision 0025) en base seulement.
     Le tour suivant les lit et les applique ; une valeur vide revient au
     défaut. Le tier n'a d'effet que sur un harnais dont le descripteur le
-    déclare (Codex : `service_tier`).
+    déclare (Codex : `service_tier`). Le mode (`execute` | `externe`, L37) est
+    écrit en base ; vide = `execute`.
     """
     from . import adapters
     from .config import SESSION_POLICIES
@@ -876,7 +1019,13 @@ def cmd_set(cfg: Config, args) -> int:
             valeur = valeur.strip()
             if not sep or cle not in SET_KEYS:
                 print("usage : ameesh set <agent> model=… effort=… tier=… "
-                      "session_policy=%s" % "|".join(SESSION_POLICIES), file=sys.stderr)
+                      "session_policy=%s mode=%s" % ("|".join(SESSION_POLICIES),
+                                                     "|".join(registry.MODES)),
+                      file=sys.stderr)
+                return 2
+            if cle == "mode" and valeur and valeur not in registry.MODES:
+                print("mode invalide : %r (%s)" % (valeur, " | ".join(registry.MODES)),
+                      file=sys.stderr)
                 return 2
             if cle == "session_policy" and valeur and valeur not in SESSION_POLICIES:
                 print("session_policy invalide : %r (%s)"
@@ -894,7 +1043,9 @@ def cmd_set(cfg: Config, args) -> int:
                     registry.upsert(db, args.agent, model=valeur)
                 else:
                     storage.of(db).agents.clear_model(args.agent)
-        reglages = {k: v for k, v in valeurs.items() if k != "model"}
+        if "mode" in valeurs:
+            registry.set_mode(db, args.agent, valeurs["mode"] or "execute")
+        reglages = {k: v for k, v in valeurs.items() if k not in ("model", "mode")}
         if reglages:
             storage.of(db).operations.set_settings(args.agent, reglages)
         agent = registry.get(db, args.agent) or {}
@@ -902,8 +1053,14 @@ def cmd_set(cfg: Config, args) -> int:
         effort = _lit_etat(cfg, args.agent, "effort") or agent.get("effort") or "défaut"
         tier = _lit_etat(cfg, args.agent, "tier") or agent.get("tier") or "défaut"
         politique = agent.get("session_policy") or "défaut (%s)" % cfg.session_policy
-        print("%s : modèle=%s effort=%s tier=%s session=%s (prend effet au prochain tour)"
-              % (args.agent, modele, effort, tier, politique))
+        print("%s : modèle=%s effort=%s tier=%s session=%s mode=%s (prend effet au "
+              "prochain tour)" % (args.agent, modele, effort, tier, politique,
+                                  agent.get("mode") or "execute"))
+        if agent.get("mode") == "externe" and not agent.get("responsible"):
+            # 0030 : un agent externe a obligatoirement un responsable humain
+            print("attention : agent externe sans responsable humain : ses lots et ses "
+                  "alertes n'ont personne à qui aller (désignez-le au canon)",
+                  file=sys.stderr)
         if valeurs.get("tier") and not adapters.supports_tier(agent.get("harness") or ""):
             print("attention : le harnais %s ne déclare pas de tier : réglage sans effet"
                   % (agent.get("harness") or "?"), file=sys.stderr)
@@ -1119,6 +1276,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--budget", type=float, default=None)
     pw_add.add_argument("--actor", default="")
     pw_add.add_argument("--package", default=None, help="fiche WorkPackage du lot (L29)")
+    pw_add.add_argument("--externe", action="store_true",
+                        help="forcer l'attribution à un agent externe qui a un responsable "
+                             "humain (L37, 0030)")
     pw_add.set_defaults(func=cmd_work)
     pw_list = work_sub.add_parser("list")
     pw_list.add_argument("--state", default=None)
@@ -1138,6 +1298,35 @@ def build_parser() -> argparse.ArgumentParser:
     pw_move.add_argument("--note", default=None)
     pw_move.add_argument("--actor", default="")
     pw_move.set_defaults(func=cmd_work)
+    pw_assign = work_sub.add_parser(
+        "assign", help="réassigner un lot à un agent réveillable (L37, 0030)")
+    pw_assign.add_argument("id", type=int)
+    pw_assign.add_argument("agent")
+    pw_assign.add_argument("--externe", action="store_true",
+                           help="forcer l'attribution à un agent externe qui a un "
+                                "responsable humain")
+    pw_assign.add_argument("--actor", default="")
+    pw_assign.set_defaults(func=cmd_work)
+    pw_delegate = work_sub.add_parser(
+        "delegate", help="déléguer un lot à un agent réveillable, à échéance (L40, 0030) : "
+                         "sans tour du délégué à l'échéance, le lot revient au délégant")
+    pw_delegate.add_argument("id", type=int)
+    pw_delegate.add_argument("agent")
+    pw_delegate.add_argument("--within", required=True,
+                             help="échéance : 30m, 2h, 1d (ou des secondes)")
+    pw_delegate.add_argument("--actor", default="",
+                             help="le délégant, à qui le lot reviendra (défaut : "
+                                  "l'assigné actuel ; human:… admis)")
+    pw_delegate.set_defaults(func=cmd_work)
+    pw_expire = work_sub.add_parser(
+        "expire-delegations",
+        help="traiter les délégations échues (fait aussi par l'exécuteur à chaque passe)")
+    pw_expire.add_argument("--dry-run", action="store_true",
+                           help="dire ce qui serait fait, sans rien écrire")
+    pw_expire.add_argument("--json", action="store_true")
+    pw_expire.add_argument("--actor", default="")
+    pw_expire.set_defaults(func=cmd_work)
+
     pw_note = work_sub.add_parser("note")
     pw_note.add_argument("id", type=int)
     pw_note.add_argument("text")
@@ -1215,7 +1404,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_set.add_argument("agent")
     p_set.add_argument("values", nargs="+", metavar="clé=valeur",
                        help="model=… effort=… tier=… session_policy=par-lot|taille|jamais "
-                            "(valeur vide = défaut)")
+                            "mode=execute|externe (valeur vide = défaut)")
     p_set.set_defaults(func=cmd_set)
 
     p_imp = sub.add_parser("import-v0", help="importer la boîte fichier v0 dans Postgres")

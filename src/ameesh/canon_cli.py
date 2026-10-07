@@ -25,11 +25,25 @@
 Options communes du canon : `--canon DOSSIER` (sinon AMEESH_CANON), `--ref REV`
 (sinon AMEESH_CANON_REF, le `ref` du manifeste, origin/main), `--fetch`.
 
+Plusieurs canons (L42, décision 0031) : `canon check`, `show` et `sync`
+traitent par défaut TOUS les canons configurés (`canons` / AMEESH_CANONS), le
+canon par défaut d'abord ; `--canon <id>` en choisit un par l'identifiant de
+sa fédération (un dossier reste accepté, lu comme canon par défaut). Avec un
+seul canon, la sortie est inchangée. `--ref` ne vise que le canon par défaut.
+L43 : `placement check` aussi ; le bloc d'un canon ne montre que SES agents
+(verdicts évalués et verdicts enregistrés au registre), et `canon show` son
+périmètre ameesh (`ameesh: {scope: …}` de federation.yaml).
+
 Registre des authentificateurs (§8.2) : `--ref` choisit ce qui est LU, jamais
 ce qui est canonique. La branche canonique de confiance est celle de la
 configuration de l'hôte (AMEESH_CANON_REF / `canon_ref`), sinon celle du
 manifeste du dernier commit appliqué (journal en base), sinon — premier
 amorçage — `--bootstrap-ref BRANCHE` (journalisé) ; sans rien de cela, refus.
+L44 (0031) : chaque canon a son registre et son journal ; la branche de
+confiance configurée d'un canon qui n'est pas le canon par défaut est la `ref`
+de SON entrée `canons` (AMEESH_CANONS n'en donne pas : amorçage par
+`canon sync --canon <id> --bootstrap-ref BRANCHE`). `--bootstrap-ref` ne sert
+qu'aux canons dont le registre n'est pas encore amorcé.
 """
 from __future__ import annotations
 
@@ -51,8 +65,40 @@ UNTRUSTED_TAG = "[NON APPROUVÉ] "
 def _load(cfg: Config, args: argparse.Namespace) -> canon_mod.Canon:
     if getattr(args, "ref", None):
         cfg = dataclasses.replace(cfg, canon_ref=args.ref)
-    return canon_mod.from_config(cfg, root=getattr(args, "canon", None),
+    wanted = getattr(args, "canon", None)
+    if wanted and len(canon_mod.configured(cfg)) > 1 and not os.path.isdir(wanted):
+        return _load_all(cfg, args)[0]
+    return canon_mod.from_config(cfg, root=wanted,
                                  fetch=bool(getattr(args, "fetch", False)))
+
+
+def _load_all(cfg: Config, args: argparse.Namespace) -> list[canon_mod.Canon]:
+    """Les canons visés (L42, 0031) : tous les canons configurés, ou celui de
+    `--canon <id>` ; un `--canon DOSSIER` (forme historique) est lu comme
+    canon par défaut. Un seul canon configuré : exactement `_load`."""
+    if getattr(args, "ref", None):
+        cfg = dataclasses.replace(cfg, canon_ref=args.ref)
+    fetch = bool(getattr(args, "fetch", False))
+    wanted = getattr(args, "canon", None)
+    entries = canon_mod.configured(cfg)
+    if wanted and (os.path.isdir(wanted) or not entries):
+        return [canon_mod.from_config(cfg, root=wanted, fetch=fetch)]
+    if len(entries) <= 1 and not wanted:
+        return [canon_mod.from_config(cfg, fetch=fetch)]
+    canons = canon_mod.from_config_all(cfg, fetch=fetch)
+    if not wanted:
+        return canons
+    chosen = [c for c in canons if c.id == wanted]
+    if chosen:
+        return chosen
+    # ni un identifiant configuré, ni un dossier : la forme historique (racine
+    # absente → canon illisible, « canon-missing », diagnostiqué comme avant)
+    return [canon_mod.from_config(cfg, root=wanted, fetch=fetch)]
+
+
+def _header(canon: canon_mod.Canon, many: bool) -> None:
+    if many:
+        print("== canon %s ==" % canon.label())
 
 
 def load_canon(cfg: Config, args: argparse.Namespace) -> canon_mod.Canon:
@@ -64,13 +110,17 @@ def _print_findings(findings: list[canon_mod.Finding]) -> None:
     for f in findings:
         print("%s%-8s %-30s %s — %s" % (
             UNTRUSTED_TAG if f.untrusted else "",
-            "ERREUR" if f.severity == canon_mod.ERROR else "avert.",
+            "ERREUR" if f.severity == canon_mod.ERROR
+            else "info." if f.severity == canon_mod.INFO else "avert.",
             f.code, f.where(), f.message))
 
 
 def _summary(findings: list[canon_mod.Finding]) -> str:
     errors = len(canon_mod.errors(findings))
-    return "%d erreur(s), %d avertissement(s)" % (errors, len(findings) - errors)
+    infos = sum(1 for f in findings if f.severity == canon_mod.INFO)
+    return "%d erreur(s), %d avertissement(s)%s" % (
+        errors, len(findings) - errors - infos,
+        ", %d information(s)" % infos if infos else "")
 
 
 def _moment(ts) -> str:
@@ -87,7 +137,7 @@ def _status_line(host: str, status: str, diagnostic: str, *, recorded: bool) -> 
                "" if recorded else "après ameesh canon sync : ", host))
 
 
-def _recorded(cfg: Config, host: str) -> dict | None:
+def _recorded(cfg: Config, host: str, canon: canon_mod.Canon | None = None) -> dict | None:
     """{"state": état enregistré ou None, "placements": verdicts écrits au
     registre pour l'hôte (`placement.recorded`), ou None si illisibles}, ou
     None sans base (check marche sans base)."""
@@ -96,9 +146,14 @@ def _recorded(cfg: Config, host: str) -> dict | None:
     except db_mod.DbError:
         return None
     try:
-        out = {"state": canon_sync.state(db, host), "placements": None}
+        out = {"state": canon_sync.state(db, host, canon), "placements": None}
         try:
-            out["placements"] = placement_mod.recorded(db, host)
+            rows = placement_mod.recorded(db, host)
+            # L43 (0031) : dans le bloc d'un canon, seuls SES agents (colonne
+            # `canon` du registre, NULL = canon par défaut ; les éphémères
+            # portent le canon de leur créateur)
+            out["placements"] = rows if canon is None else {
+                name: row for name, row in rows.items() if canon.owns(row.get("canon"))}
         except db_mod.DbError:
             pass                        # base pas encore migrée (0022)
         return out
@@ -139,15 +194,32 @@ def _recorded_line(host: str, recorded: dict | None) -> str:
 
 
 def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
-    canon = _load(cfg, args)
+    canons = _load_all(cfg, args)
+    if len(canons) == 1:
+        return _check_one(cfg, args, canons[0])
+    # L42 (0031) : un bloc par canon ; en JSON, {"canons": [...]}
+    code, out = 0, []
+    for canon in canons:
+        if args.json:
+            code = max(code, _check_one(cfg, args, canon, sink=out))
+        else:
+            _header(canon, True)
+            code = max(code, _check_one(cfg, args, canon))
+    if args.json:
+        print(json.dumps({"ok": code == 0, "canons": out}, ensure_ascii=False, indent=2))
+    return code
+
+
+def _check_one(cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
+               sink: list | None = None) -> int:
     host = getattr(args, "host", None) or cfg.host
     findings = canon_mod.validate(canon)
     errors = canon_mod.errors(findings)
     status, diagnostic = canon_sync.assess(canon, host, findings)
-    recorded = _recorded(cfg, host)
+    recorded = _recorded(cfg, host, canon)
     placements = placement_mod.verdicts(canon) if canon.readable else []
     if args.json:
-        print(json.dumps({
+        data = {
             "ok": not errors, "root": canon.root, "untrusted": canon.untrusted,
             "readable": canon.readable, "host": host,
             "canon_status": status, "diagnostic": diagnostic,
@@ -158,10 +230,17 @@ def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
                 dict(row, agent=name)
                 for name, row in sorted(((recorded or {}).get("placements") or {}).items())],
             "sources": [s.to_dict() for s in canon.sources],
-            "errors": len(errors), "warnings": len(findings) - len(errors),
+            "errors": len(errors),
+            "warnings": sum(1 for f in findings if f.severity == canon_mod.WARNING),
+            "infos": sum(1 for f in findings if f.severity == canon_mod.INFO),
             "findings": [f.to_dict() for f in findings],
             "placements": [v.to_dict() for v in placements],
-        }, ensure_ascii=False, indent=2))
+            "canon_id": canon.id, "default": canon.is_default,
+        }
+        if sink is not None:
+            sink.append(data)
+        else:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
         return 1 if errors else 0
     print("canon : %s" % canon.root)
     print("source : %s%s" % (UNTRUSTED_TAG if canon.untrusted else "", canon.source_label()))
@@ -196,7 +275,22 @@ def _join(values) -> str:
 
 
 def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
-    canon = _load(cfg, args)
+    canons = _load_all(cfg, args)
+    if len(canons) > 1 and args.json:
+        out = []
+        for canon in canons:
+            data = canon.to_dict()
+            data["findings"] = [f.to_dict() for f in canon_mod.validate(canon)]
+            out.append(data)
+        print(json.dumps({"canons": out}, ensure_ascii=False, indent=2))
+        return 0
+    for canon in canons:
+        _header(canon, len(canons) > 1)
+        _show_one(canon, args)
+    return 0
+
+
+def _show_one(canon: canon_mod.Canon, args: argparse.Namespace) -> int:
     findings = canon_mod.validate(canon)
     if args.json:
         data = canon.to_dict()
@@ -205,6 +299,16 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         return 0
     print("canon      : %s" % canon.root)
     print("source     : %s%s" % (UNTRUSTED_TAG if canon.untrusted else "", canon.source_label()))
+    if canon.scopes or canon.scope_unread:
+        # L43 (0031) : périmètre ameesh d'un canon partagé
+        print("périmètre  : %s" % " ; ".join(
+            ["%s → %s%s" % (member, ", ".join(s or "." for s in dirs),
+                            " (%d fiche(s) typée(s) hors périmètre ignorée(s))"
+                            % canon.out_of_scope[member]
+                            if canon.out_of_scope.get(member) else "")
+             for member, dirs in sorted(canon.scopes.items())]
+            + ["%s → NON LU (périmètre invalide ou absent)" % member
+               for member in sorted(canon.scope_unread)]))
     print("membres    : %s" % (", ".join(
         "%s (%s)" % (m.title, _join(m.roles)) for m in canon.members) or "—"))
     print("hôtes      :")
@@ -238,23 +342,53 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
 
 def cmd_sync(cfg: Config, args: argparse.Namespace) -> int:
     host = args.host or cfg.host
-    canon = _load(cfg, args)
+    canons = _load_all(cfg, args)
+    many = len(canons) > 1
     db = db_mod.connect(cfg)
+    code, out = 0, []
     try:
         db_mod.require_schema(db)
-        try:
-            # registre des authentificateurs : la branche canonique de confiance
-            # vient de la configuration de l'hôte (cfg.canon_ref, jamais --ref),
-            # du dernier commit appliqué, ou de --bootstrap-ref au premier amorçage
-            report = canon_sync.sync(db, canon, host, trusted_ref=cfg.canon_ref,
-                                     bootstrap_ref=args.bootstrap_ref or "")
-        except canon_sync.CanonUnreadable as exc:
-            return _print_unreadable(args, canon, exc)
+        if many and not getattr(args, "canon", None):
+            try:
+                canon_sync.adopt_default(db, host, canons)
+            except canon_sync.DefaultCanonError as exc:
+                # L46 : aucun canon n'est synchronisé — le nouveau canon par
+                # défaut prendrait les lignes de l'ancien pour les siennes
+                print("canon sync refusé : %s" % exc, file=sys.stderr)
+                return 1
+        for canon in canons:
+            if not args.json:
+                _header(canon, many)
+            code = max(code, _sync_one(db, cfg, args, canon, host,
+                                       sink=out if (many and args.json) else None))
     finally:
         db.close()
+    if many and args.json:
+        print(json.dumps({"host": host, "canons": out}, ensure_ascii=False, indent=2))
+    return code
+
+
+def _sync_one(db, cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
+              host: str, sink: list | None = None) -> int:
+    try:
+        # registre des authentificateurs : la branche canonique de confiance
+        # vient de la configuration de l'hôte POUR CE CANON (L44 : cfg.canon_ref
+        # pour le canon par défaut, la `ref` de son entrée `canons` sinon ;
+        # jamais --ref), du dernier commit appliqué de ce canon, ou de
+        # --bootstrap-ref au premier amorçage
+        report = canon_sync.sync(db, canon, host,
+                                 trusted_ref=canon_sync.configured_ref_for(cfg, canon),
+                                 bootstrap_ref=args.bootstrap_ref or "")
+    except canon_sync.CanonUnreadable as exc:
+        return _print_unreadable(args, canon, exc, sink=sink)
     auth_errors = report.authenticators.errors if report.authenticators else []
     if args.json:
-        print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+        data = report.to_dict()
+        if sink is not None:
+            data.update(canon_id=canon.id, default=canon.is_default)
+            sink.append(data)
+        else:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
         return 1 if report.errors or auth_errors else 0
     tag = UNTRUSTED_TAG if report.untrusted else ""
     print("%scanon sync sur %s — %s" % (tag, host, report.source))
@@ -287,7 +421,9 @@ def _print_packages(done) -> None:
     parts = ["%d %s" % (len(ids), label) for ids, label in (
         (done.created, "créée(s)"), (done.updated, "mise(s) à jour"),
         (done.unchanged, "inchangée(s)"), (done.retired, "retirée(s)"),
-        (done.skipped, "en erreur, non écrite(s)")) if ids]
+        (done.skipped, "en erreur, non écrite(s)"),
+        (getattr(done, "conflicts", []), "déclarée(s) par un autre canon, non écrite(s)"))
+        if ids]
     if not parts:
         return
     print("plan (WorkPackage) : %s%s" % (
@@ -332,16 +468,47 @@ def cmd_placement_check(cfg: Config, args: argparse.Namespace) -> int:
     Lecture seule : ni le canon ni le registre ne sont modifiés, aucun agent
     n'est déplacé. Code 1 si le canon est illisible, si l'agent demandé n'a
     pas de fiche, ou si un placement actuel est refusé.
+
+    L43 (0031) : plusieurs canons configurés — un bloc par canon (en JSON,
+    `{"canons": [...]}`), chacun avec SES agents jugés par SA fiche Host ;
+    `--canon <id>` en choisit un ; `--agent A` ne garde que le(s) canon(s) qui
+    le déclarent. Un seul canon : sortie inchangée.
     """
-    canon = _load(cfg, args)
+    canons = _load_all(cfg, args)
+    if getattr(args, "agent", None) and len(canons) > 1:
+        # L42 (0031) : l'agent est cherché dans tous les canons configurés
+        found = [c for c in canons if c.agent(args.agent) is not None]
+        canons = found or canons[:1]
+    if len(canons) == 1:
+        return _placement_one(args, canons[0])
+    code, out = 0, []
+    for canon in canons:
+        if not args.json:
+            _header(canon, True)
+        code = max(code, _placement_one(args, canon, sink=out if args.json else None))
+    if args.json:
+        print(json.dumps({"canons": out}, ensure_ascii=False, indent=2))
+    return code
+
+
+def _placement_one(args: argparse.Namespace, canon: canon_mod.Canon,
+                   sink: list | None = None) -> int:
+    """`placement check` pour UN canon (ses agents seulement)."""
     findings = canon_mod.validate(canon)
     errors = canon_mod.errors(findings)
+
+    def emit(data: dict) -> None:
+        if sink is not None:
+            data.update(canon_id=canon.id, default=canon.is_default)
+            sink.append(data)
+        else:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+
     if not canon.readable:
         if args.json:
-            print(json.dumps({"root": canon.root, "readable": False,
-                              "untrusted": canon.untrusted, "agents": [],
-                              "findings": [f.to_dict() for f in findings]},
-                             ensure_ascii=False, indent=2))
+            emit({"root": canon.root, "readable": False,
+                  "untrusted": canon.untrusted, "agents": [],
+                  "findings": [f.to_dict() for f in findings]})
             return 1
         print("canon ILLISIBLE (%s) : aucun placement évaluable" % canon.root)
         _print_findings(findings)
@@ -352,11 +519,11 @@ def cmd_placement_check(cfg: Config, args: argparse.Namespace) -> int:
                if not p["placement_ok"]]
     code = 1 if unknown or refused else 0
     if args.json:
-        print(json.dumps({
+        emit({
             "root": canon.root, "readable": True, "untrusted": canon.untrusted,
             "source": canon.source_label(), "errors": len(errors),
             "refused": len(refused), "agents": entries,
-        }, ensure_ascii=False, indent=2))
+        })
         return code
     tag = UNTRUSTED_TAG if canon.untrusted else ""
     print("canon : %s" % canon.root)
@@ -401,17 +568,22 @@ def cmd_placement_check(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def _print_unreadable(args: argparse.Namespace, canon: canon_mod.Canon,
-                      exc: canon_sync.CanonUnreadable) -> int:
+                      exc: canon_sync.CanonUnreadable, sink: list | None = None) -> int:
     """Canon illisible : seul l'état `unreadable` a été enregistré."""
     if args.json:
-        print(json.dumps({
+        data = {
             "host": exc.host, "source": "", "untrusted": canon.untrusted,
             "canon_status": canon_sync.CANON_UNREADABLE, "diagnostic": exc.diagnostic,
             "actions": [], "errors": len(canon_mod.errors(exc.findings)),
             "findings": [f.to_dict() for f in exc.findings],
             "authenticators": canon_sync.AuthenticatorSync(
                 canon_sync.AUTH_SKIPPED, "canon illisible : registre inchangé").to_dict(),
-        }, ensure_ascii=False, indent=2))
+        }
+        if sink is not None:
+            data.update(canon_id=canon.id, default=canon.is_default)
+            sink.append(data)
+        else:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
         return 1
     print("canon sync sur %s — canon ILLISIBLE (%s) : registre inchangé (agents et "
           "authentificateurs)" % (exc.host, canon.root))
@@ -434,12 +606,14 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
                   % (binding.describe(), args.by), file=sys.stderr)
             return 1
     ttl = canon_sync.parse_ttl(args.ttl)
-    canon = None
-    if cfg.canon:
+    # L42 (0031) : le nom de l'éphémère ne doit être déclaré par aucun canon
+    canon: list = []
+    for index, entry in enumerate(canon_mod.configured(cfg)):
         try:
-            canon = canon_mod.from_config(cfg)
+            canon.append(canon_mod.from_config(cfg) if index == 0
+                         else canon_mod.from_config(cfg, entry=entry))
         except canon_mod.CanonError:
-            canon = None
+            pass
     db = db_mod.connect(cfg)
     try:
         db_mod.require_schema(db)
@@ -463,7 +637,10 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def _canon_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--canon", default=None, help="racine du canon (sinon AMEESH_CANON)")
+    parser.add_argument("--canon", default=None,
+                        help="identifiant d'un canon configuré (L42 ; sinon tous pour "
+                             "check/show/sync, le canon par défaut ailleurs), ou racine "
+                             "d'un canon (sinon AMEESH_CANON)")
     parser.add_argument("--ref", default=None,
                         help="révision canonique (sinon AMEESH_CANON_REF, le ref du "
                              "manifeste, origin/main)")

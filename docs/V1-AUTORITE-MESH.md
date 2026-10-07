@@ -215,7 +215,10 @@ puis `psycopg` dans un venv avec `cryptography`). Couverture des points 3-5 :
   *signature* et son rôle, pas l'identité de l'opérateur. C'est cette limite
   (agents et clé sous le même utilisateur Unix) qui a conduit la v1 à placer
   l'autorité humaine dans ameesh-approve et le registre des authentificateurs
-  dans le canon, modifiable seulement par PR revue (spec §8.2).
+  dans le canon, modifiable seulement par PR revue (spec §8.2). Avec plusieurs
+  canons (L44, décision 0031), ce registre est tenu **par canon** : une passkey
+  ne vaut que pour les objets (actions) du canon qui la déclare, et n'est
+  révoquée que par lui (voir EXPLOITATION.md, « Plusieurs canons »).
 * **Un rôle par clé, pas encore de portées** : `owner`/`agent` est binaire ;
   des capacités plus fines (« approuver un merge mais pas la production »)
   viendront avec la porte de gouvernance.

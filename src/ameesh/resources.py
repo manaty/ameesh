@@ -230,6 +230,69 @@ def thresholds(policy=None) -> dict:
     }
 
 
+#: L43 (0031) : seuils PLANCHERS (plus strict = plus haut) ; les autres sont
+#: des plafonds (plus strict = plus bas)
+FLOOR_KEYS = ("min_mem_available", "min_disk_free")
+#: provenance d'une limite qu'aucune fiche Host ne déclare
+DEFAULT_ORIGIN = "défaut"
+
+
+def declared(policy) -> dict:
+    """Seuils DÉCLARÉS (et lisibles) d'une politique, sans valeur par défaut."""
+    raw = getattr(policy, "resources", None) if policy is not None else None
+    if raw is None and isinstance(policy, dict):
+        raw = policy.get("resources")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for key in THRESHOLD_KEYS:
+        value = _as_float(raw.get(key)) if key == "max_load" else parse_bytes(raw.get(key))
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def host_limits(canons, host: str) -> dict:
+    """Limites PHYSIQUES de `host` (L43, décision 0031 point 6) : les plus
+    strictes de toutes les fiches Host qui le décrivent dans les canons chargés.
+
+    * seuils de ressources : pour chaque clé, la valeur DÉCLARÉE la plus
+      stricte (plancher le plus haut, plafond le plus bas) ; une clé qu'aucune
+      fiche ne déclare prend sa valeur par défaut prudente. Une fiche qui se
+      tait sur une clé n'impose pas le défaut à celle qui la déclare (le
+      défaut n'est qu'un repli) ;
+    * `max_agents` : le plus petit des maxima déclarés (None : aucun).
+
+    `origin` dit d'où vient chaque limite (identifiant du canon, ou
+    « défaut ») ; `fiches` : les canons qui décrivent l'hôte. L'admission d'un
+    agent, elle, se juge toujours avec la fiche de SON canon (`placement`)."""
+    fiches = []
+    for canon in canons or ():
+        fiche = canon.host(host) if hasattr(canon, "host") else None
+        if fiche is not None:
+            fiches.append((getattr(canon, "id", "") or "?", fiche))
+    limits = thresholds(None)
+    origin = {key: DEFAULT_ORIGIN for key in THRESHOLD_KEYS}
+    best: dict = {}
+    for label, fiche in fiches:
+        for key, value in declared(getattr(fiche, "policy", None)).items():
+            current = best.get(key)
+            if current is None or (value > current[0] if key in FLOOR_KEYS
+                                   else value < current[0]):
+                best[key] = (value, label)
+    for key, (value, label) in best.items():
+        limits[key] = value
+        origin[key] = label
+    max_agents, max_origin = None, None
+    for label, fiche in fiches:
+        value = getattr(getattr(fiche, "policy", None), "max_agents", None)
+        if value is not None and (max_agents is None or value < max_agents):
+            max_agents, max_origin = value, label
+    origin["max_agents"] = max_origin or DEFAULT_ORIGIN
+    return {"host": host, "limits": limits, "max_agents": max_agents, "origin": origin,
+            "fiches": [label for label, _f in fiches]}
+
+
 def breaches(reading: dict, limits: dict) -> list[dict]:
     """Les seuils franchis par un relevé, du plus grave au moins grave.
 

@@ -15,10 +15,50 @@ from .. import interface
 ITEM_COLUMNS = """
     id, type, source, app, title, body, issue_ref, workstream, state, assignee,
     loops, budget_usd, spent_usd, package_id, package_parent, pr_ref, close_reason,
-    superseded_by,
+    superseded_by, delegated_by,
     extract(epoch from created_at)::float8 as created_ts,
     extract(epoch from updated_at)::float8 as updated_ts,
-    extract(epoch from closed_at)::float8  as closed_ts
+    extract(epoch from closed_at)::float8  as closed_ts,
+    extract(epoch from delegated_at)::float8 as delegated_ts,
+    extract(epoch from due_at)::float8 as due_ts
+"""
+
+#: états de lot terminés (une délégation n'y a plus d'objet)
+_CLOSED = "('merged', 'promoted', 'closed')"
+
+#: L40 (0030) : preuve que le délégué `d.delegate` a travaillé sur le lot
+#: depuis le début de la délégation — un tour noté par l'exécuteur
+#: (`first_turn_at`), une transition ou note du lot, un jalon, une action
+#: proposée ou un message lié au lot (`--lot`) de sa part. L'acteur est
+#: comparé avec et sans le préfixe `agent:` (forme des actions).
+_WORKED = """(
+    d.first_turn_at IS NOT NULL
+    OR EXISTS (SELECT 1 FROM work_item_events e
+                WHERE e.work_item_id = d.work_item_id
+                  AND e.actor IN (d.delegate, 'agent:' || d.delegate)
+                  AND e.created_at >= d.delegated_at)
+    OR EXISTS (SELECT 1 FROM work_item_milestones m
+                WHERE m.work_item_id = d.work_item_id
+                  AND m.actor IN (d.delegate, 'agent:' || d.delegate)
+                  AND m.at >= d.delegated_at)
+    OR EXISTS (SELECT 1 FROM actions a
+                WHERE a.work_item = d.work_item_id
+                  AND a.proposed_by = 'agent:' || d.delegate
+                  AND a.created_at >= d.delegated_at)
+    OR EXISTS (SELECT 1 FROM agent_mailbox b
+                WHERE btrim(b.work_item_id) = d.work_item_id::text
+                  AND b.sender = d.delegate
+                  AND b.created_at >= d.delegated_at)
+)"""
+
+#: colonnes d'une délégation (registre `work_item_delegations`)
+_DELEGATION_COLUMNS = """
+    d.id AS delegation_id, d.work_item_id, d.delegate, d.delegated_by, d.outcome,
+    d.resolved_by,
+    extract(epoch from d.delegated_at)::float8  AS delegated_ts,
+    extract(epoch from d.due_at)::float8        AS due_ts,
+    extract(epoch from d.first_turn_at)::float8 AS first_turn_ts,
+    extract(epoch from d.resolved_at)::float8   AS resolved_ts
 """
 
 
@@ -127,6 +167,201 @@ class WorkItems(interface.WorkItems):
             return None
         self._event(int(item_id), state, note, actor)
         return rows[0]
+
+    def assign(self, item_id, assignee, *, current, note, actor) -> dict | None:
+        """Réassignation (L37, 0030) : conditionnelle à l'assigné lu par
+        l'appelant (`current`, NULL compris) et à un lot encore ouvert ; la
+        ligne de journal part dans la même transaction. L40 : la délégation
+        en cours est effacée (issue `annulee` au registre)."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "UPDATE work_items SET assignee = %%s, updated_at = now(),"
+                "       delegated_by = NULL, delegated_at = NULL, due_at = NULL"
+                " WHERE id = %%s AND assignee IS NOT DISTINCT FROM %%s"
+                "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                " RETURNING %s" % ITEM_COLUMNS,
+                (assignee, int(item_id), current))
+            if not rows:
+                return None
+            tx.query(
+                "UPDATE work_item_delegations SET outcome = 'annulee', resolved_at = now(),"
+                "       resolved_by = %s"
+                " WHERE work_item_id = %s AND outcome IS NULL RETURNING id",
+                (actor or "", int(item_id)))
+            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            return rows[0]
+
+    # -- délégation à échéance (L40, 0030 point 5) ---------------------------
+    def delegate(self, item_id, delegate, *, current, delegated_by, within_s, note,
+                 actor) -> dict | None:
+        """Délègue le lot en UNE transaction, s'il a encore l'assigné `current`
+        et n'est pas fermé : la délégation en cours est remplacée (issue
+        `remplacee`), le lot passe au délégué avec délégant, début et
+        échéance, le registre reçoit la nouvelle ligne, le journal la note.
+        Rend `{item, delegation, replaced}` ou None (lot modifié entre-temps)."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT id FROM work_items WHERE id = %%s"
+                "   AND assignee IS NOT DISTINCT FROM %%s AND state NOT IN %s"
+                " FOR NO KEY UPDATE" % _CLOSED, (int(item_id), current))
+            if not rows:
+                return None
+            replaced = tx.query(
+                "UPDATE work_item_delegations SET outcome = 'remplacee', resolved_at = now(),"
+                "       resolved_by = %s"
+                " WHERE work_item_id = %s AND outcome IS NULL"
+                " RETURNING id, delegate, delegated_by,"
+                "           extract(epoch from due_at)::float8 AS due_ts",
+                (actor or "", int(item_id)))
+            rows = tx.query(
+                "UPDATE work_items SET assignee = %%s, delegated_by = %%s, delegated_at = now(),"
+                "       due_at = now() + make_interval(secs => %%s), updated_at = now()"
+                " WHERE id = %%s RETURNING %s" % ITEM_COLUMNS,
+                (delegate, delegated_by, float(within_s), int(item_id)))
+            item = rows[0]
+            delegation = tx.query(
+                "INSERT INTO work_item_delegations AS d"
+                "       (work_item_id, delegate, delegated_by, delegated_at, due_at)"
+                " SELECT id, %%s, %%s, delegated_at, due_at FROM work_items WHERE id = %%s"
+                " RETURNING %s" % _DELEGATION_COLUMNS,
+                (delegate, delegated_by, int(item_id)))[0]
+            WorkItems(tx)._event(int(item_id), item["state"], note, actor)
+            return {"item": item, "delegation": delegation,
+                    "replaced": replaced[0] if replaced else None}
+
+    def current_delegation(self, item_id) -> dict | None:
+        rows = self.db.query(
+            "SELECT %s, %s AS worked FROM work_item_delegations d"
+            " WHERE d.work_item_id = %%s AND d.outcome IS NULL" % (_DELEGATION_COLUMNS, _WORKED),
+            (int(item_id),))
+        return rows[0] if rows else None
+
+    def mark_delegate_turn(self, agent, item_ids, note) -> list[int]:
+        """Un tour de `agent` commence sur ces lots : la délégation en cours
+        qui lui est confiée reçoit son premier tour (une seule fois), et le
+        journal du lot le note (acteur : le délégué), en UNE transaction (le
+        pilote psql n'accepte pas un WITH qui écrit, imbriqué)."""
+        ids = sorted({int(i) for i in item_ids})
+        if not ids:
+            return []
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "UPDATE work_item_delegations SET first_turn_at = now()"
+                " WHERE outcome IS NULL AND first_turn_at IS NULL"
+                "   AND delegate = %%s AND work_item_id IN (%s)"
+                " RETURNING work_item_id" % ", ".join(["%s"] * len(ids)),
+                tuple([agent] + ids))
+            marques = sorted(int(r["work_item_id"]) for r in rows)
+            if marques:
+                tx.query(
+                    "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+                    " SELECT id, state, %%s, %%s FROM work_items WHERE id IN (%s)"
+                    " RETURNING id" % ", ".join(["%s"] * len(marques)),
+                    tuple([note, agent] + marques))
+            return marques
+
+    def due_delegations(self, now_ts) -> list[dict]:
+        """Délégations en cours dont l'échéance est passée à `now_ts`, avec
+        l'état du lot et la preuve de travail du délégué (`worked`)."""
+        return self.db.query(
+            "SELECT %s, %s AS worked, w.title, w.state, w.assignee"
+            "  FROM work_item_delegations d JOIN work_items w ON w.id = d.work_item_id"
+            " WHERE d.outcome IS NULL AND d.due_at < to_timestamp(%%s)"
+            " ORDER BY d.due_at, d.id" % (_DELEGATION_COLUMNS, _WORKED),
+            (float(now_ts),))
+
+    def resolve_delegation(self, delegation_id, *, now_ts, actor, describe) -> dict | None:
+        """Traite UNE délégation échue, en UNE transaction : verrou des lignes
+        du lot et de la délégation (`NO KEY UPDATE` : n'attend pas une
+        insertion au journal, qui ne prend que `KEY SHARE` sur le lot ; un
+        premier tour en cours d'écriture est attendu, puis vu), relecture de
+        la délégation (encore en cours, échue) et de la preuve de travail sous
+        ce verrou. Issue :
+
+        * `annulee` : lot fermé, ou assigné qui n'est plus le délégué —
+          l'échéance est effacée, rien d'autre ;
+        * `soldee` : le délégué a travaillé — l'échéance est effacée ;
+        * `rendue` : aucun travail — le lot revient au délégant, délégation
+          effacée.
+
+        `describe(issue, délégation)` rend la ligne de journal de l'issue (ou
+        rien), écrite dans la même transaction. None si un autre exécuteur
+        l'a déjà traitée : jamais deux retours."""
+        with self.db.transaction() as tx:
+            lot = tx.query(
+                "SELECT w.id FROM work_items w JOIN work_item_delegations d"
+                "    ON d.work_item_id = w.id WHERE d.id = %s FOR NO KEY UPDATE OF w, d",
+                (int(delegation_id),))
+            if not lot:
+                return None
+            # relu APRÈS le verrou, dans une instruction suivante : en READ
+            # COMMITTED elle voit l'issue posée par un exécuteur concurrent
+            rows = tx.query(
+                "SELECT %s, %s AS worked, w.title, w.state, w.assignee"
+                "  FROM work_item_delegations d JOIN work_items w ON w.id = d.work_item_id"
+                " WHERE d.id = %%s AND d.outcome IS NULL AND d.due_at < to_timestamp(%%s)"
+                % (_DELEGATION_COLUMNS, _WORKED),
+                (int(delegation_id), float(now_ts)))
+            if not rows:
+                return None
+            row = rows[0]
+            item_id = int(row["work_item_id"])
+            closed = row["state"] in ("merged", "promoted", "closed")
+            if closed or row.get("assignee") != row["delegate"]:
+                outcome = "annulee"
+            elif row.get("worked"):
+                outcome = "soldee"
+            else:
+                outcome = "rendue"
+            done = tx.query(
+                "UPDATE work_item_delegations SET outcome = %s, resolved_at = now(),"
+                "       resolved_by = %s"
+                " WHERE id = %s AND outcome IS NULL RETURNING id",
+                (outcome, actor or "", int(delegation_id)))
+            if not done:
+                return None
+            if outcome == "rendue":
+                item = tx.query(
+                    "UPDATE work_items SET assignee = %%s, delegated_by = NULL,"
+                    "       delegated_at = NULL, due_at = NULL, updated_at = now()"
+                    " WHERE id = %%s RETURNING %s" % ITEM_COLUMNS,
+                    (row["delegated_by"], item_id))
+            elif outcome == "annulee":
+                # L46 : lot fermé OU réassigné hors `work assign` — la
+                # délégation annulée ne laisse ni délégant ni date
+                item = tx.query(
+                    "UPDATE work_items SET delegated_by = NULL, delegated_at = NULL,"
+                    "       due_at = NULL WHERE id = %%s RETURNING %s" % ITEM_COLUMNS,
+                    (item_id,))
+            else:
+                item = tx.query(
+                    "UPDATE work_items SET due_at = NULL WHERE id = %%s RETURNING %s"
+                    % ITEM_COLUMNS, (item_id,))
+            text = describe(outcome, row) if describe else None
+            if text:
+                WorkItems(tx)._event(item_id, item[0]["state"], text, actor)
+            return dict(row, outcome=outcome, item=item[0])
+
+    def overdue_delegations(self, now_ts) -> list[dict]:
+        """Lots ouverts en retard : délégation en cours dont l'échéance est
+        passée et que personne n'a encore traitée (alerte `delegation_expired`)."""
+        return self.db.query(
+            "SELECT %s, w.title, w.state, w.assignee, w.package_id"
+            "  FROM work_item_delegations d JOIN work_items w ON w.id = d.work_item_id"
+            " WHERE d.outcome IS NULL AND d.due_at < to_timestamp(%%s)"
+            "   AND w.state NOT IN %s"
+            " ORDER BY d.due_at, d.id" % (_DELEGATION_COLUMNS, _CLOSED),
+            (float(now_ts),))
+
+    def returned_delegations(self, since_ts) -> list[dict]:
+        """Délégations rendues au délégant depuis `since_ts` (alerte
+        `delegation_expired`), avec le lot."""
+        return self.db.query(
+            "SELECT %s, w.title, w.state, w.assignee, w.package_id"
+            "  FROM work_item_delegations d JOIN work_items w ON w.id = d.work_item_id"
+            " WHERE d.outcome = 'rendue' AND d.resolved_at >= to_timestamp(%%s)"
+            " ORDER BY d.resolved_at, d.id" % _DELEGATION_COLUMNS,
+            (float(since_ts),))
 
     def note(self, item_id, state, text, actor) -> None:
         self._event(int(item_id), state, text, actor)

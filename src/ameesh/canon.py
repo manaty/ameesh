@@ -21,6 +21,14 @@ présents localement (`workspace_path`, relatif au dossier de travail commun,
 comme le validateur OKF Federation) sont lus aussi, chacun à `origin/<ref>`
 de son propre dépôt. Un membre absent est signalé, jamais deviné.
 
+Périmètre (L43, décision 0031) : `ameesh: {scope: <dossier>|[…]}` au premier
+niveau de federation.yaml borne les fiches du profil du bundle racine à ces
+dossiers (dans l'entrée `members[]` d'un autre membre : celles de ce membre).
+Hors du périmètre, un fichier de même `type` (sous-agent Claude Code d'un
+canon partagé, p. ex.) est ignoré — un constat d'information agrégé, jamais
+une erreur. Sans la clé, tout le bundle est lu. Un périmètre illisible ou
+introuvable : erreur, et aucune fiche du membre n'est lue (fail closed).
+
 YAML : PyYAML n'est pas une dépendance. Si `yaml` est importable, il est
 utilisé (`safe_load`, clés en double refusées) ; sinon un lecteur minimal
 couvre le sous-ensemble du profil (scalaires, chaînes entre guillemets,
@@ -34,6 +42,7 @@ import datetime as _dt
 import fnmatch
 import hashlib
 import os
+import posixpath
 import re
 import subprocess
 from collections import defaultdict
@@ -55,6 +64,18 @@ PACKAGE_KINDS = ("milestone", "epic", "lot")
 PACKAGE_PARENTS = {"milestone": (), "epic": ("milestone",), "lot": ("epic", "milestone")}
 #: identifiant d'une fiche WorkPackage (clé `id`, sinon nom du fichier sans `.md`)
 PACKAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+#: identifiant d'un canon (L42, décision 0031) : `id` de federation.yaml, sinon
+#: le nom du dossier ; jamais de `/` ni de `:` (il préfixe les références)
+CANON_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+#: provenance de l'identifiant d'un canon
+ID_FROM_FEDERATION = "federation"
+ID_FROM_DIRECTORY = "directory"
+#: référence d'une fiche (L2, L42) : `[<canon>/]<membre>:<chemin>@<version>`.
+#: Le canon PAR DÉFAUT garde le format historique, sans préfixe (aucun
+#: changement de données) ; un autre canon préfixe son identifiant.
+FICHE_REF_RE = re.compile(
+    r"^(?:(?P<canon>[A-Za-z0-9][A-Za-z0-9._-]{0,63})/)?(?P<member>[^:/\s]+):"
+    r"(?P<path>\S*)@(?P<version>\S+)$")
 KNOWN_CAPABILITIES = ("read", "report-drift", "propose")
 #: R8 : l'autorité de décision est réservée aux humains
 FORBIDDEN_CAPABILITIES = ("approve",)
@@ -68,6 +89,15 @@ FETCH_TIMEOUT = 180.0
 
 ERROR = "error"
 WARNING = "warning"
+#: L43 (0031) : constat d'information — ni bloquant, ni avertissement (p. ex.
+#: les fiches hors du périmètre ameesh d'un canon partagé, ignorées)
+INFO = "info"
+
+#: L43 (0031) : clé de federation.yaml (premier niveau pour le bundle racine,
+#: entrée `members[]` pour un autre membre) qui borne les fiches du profil
+#: ameesh à un ou plusieurs dossiers du bundle : `ameesh: {scope: ameesh}`
+SCOPE_KEY = "ameesh"
+SCOPE_FIELDS = ("scope",)
 
 
 class CanonError(ValueError):
@@ -684,7 +714,8 @@ class Fiche:
     title: str
     member: str
     path: str
-    ref: str                # canon_ref : `<membre>:<chemin>@<commit>`
+    ref: str                # canon_ref : `<membre>:<chemin>@<commit>` (canon par défaut),
+                            # `<canon>/<membre>:<chemin>@<commit>` sinon (L42)
     data: dict              # frontmatter complet (clés inconnues conservées)
     untrusted: bool = False
 
@@ -900,8 +931,61 @@ class Canon:
     load_findings: list[Finding] = field(default_factory=list)
     #: faux si la racine n'a pas pu être lue : aucune donnée n'est utilisable
     readable: bool = False
+    #: L42 (0031) : identité du canon — `id` de federation.yaml, sinon le nom
+    #: du dossier (`id_source` le dit) — et rang : le canon par défaut (le
+    #: premier configuré) garde les références et les lignes historiques
+    #: (`canon` NULL au registre) ; les autres préfixent leurs références et
+    #: écrivent leur identifiant.
+    id: str = ""
+    id_source: str = ""
+    is_default: bool = True
+    #: L43 (0031) : périmètre ameesh déclaré, par membre (`ameesh.scope` de
+    #: federation.yaml) : dossiers relatifs au bundle du membre ; un membre
+    #: absent de ce mapping est lu en entier (comportement historique).
+    scopes: dict = field(default_factory=dict)
+    #: membres dont le périmètre est invalide ou introuvable : aucune de leurs
+    #: fiches n'est lue, et ils ne comptent pas comme LUS (`loaded_members`) —
+    #: la synchronisation ne retire ni n'arrête rien pour absence (fail closed).
+    scope_unread: set = field(default_factory=set)
+    #: fiches du profil ignorées hors du périmètre, par membre (information)
+    out_of_scope: dict = field(default_factory=dict)
 
     # -- accès ---------------------------------------------------------------
+    @property
+    def state_key(self) -> str:
+        """Clé de `canon_state.canon` (L42) : '' pour le canon par défaut."""
+        return "" if self.is_default else self.id
+
+    @property
+    def registry_canon(self) -> str | None:
+        """Valeur de la colonne `canon` des lignes qu'il déclare : NULL (None)
+        pour le canon par défaut, son identifiant sinon (L42)."""
+        return None if self.is_default else self.id
+
+    def owns(self, row_canon: str | None) -> bool:
+        """Une ligne (registre, paquet) dont la colonne `canon` vaut
+        `row_canon` appartient-elle à ce canon ? NULL = canon par défaut."""
+        if row_canon is None or row_canon == "":
+            return self.is_default
+        return row_canon == self.id
+
+    def member_of(self, ref: str | None) -> str | None:
+        """Membre d'une référence de fiche de CE canon, ou None si la
+        référence est d'un autre canon (préfixe différent) ou illisible."""
+        parsed = split_ref(ref)
+        if parsed is None:
+            head = (ref or "").split(":", 1)[0]
+            return head if self.is_default and head and "/" not in head else None
+        prefix, member, _path, _version = parsed
+        if prefix is None:
+            return member if self.is_default else None
+        return member if prefix == self.id else None
+
+    def label(self) -> str:
+        """Nom lisible du canon : identifiant et racine."""
+        return "%s (%s%s)" % (self.id or "?", self.root,
+                              ", par défaut" if self.is_default else "")
+
     @property
     def untrusted(self) -> bool:
         return any(source.mode != "git" for source in self.sources)
@@ -917,7 +1001,9 @@ class Canon:
         return policies if isinstance(policies, dict) else {}
 
     def loaded_members(self) -> set[str]:
-        return {source.member for source in self.sources}
+        """Membres dont les fiches ont été lues. L43 : un membre au périmètre
+        invalide ou introuvable n'en est pas (rien n'est retiré pour absence)."""
+        return {source.member for source in self.sources} - set(self.scope_unread)
 
     def agent(self, name: str) -> Agent | None:
         for agent in self.agents:
@@ -945,6 +1031,10 @@ class Canon:
 
         Strict : un identifiant sans préfixe, un `agent:`, ou un Member en
         double ne résout pas (fail closed).
+
+        L43 (0031) : dans CE canon seulement — un agent, un hôte ou un paquet
+        se résout dans le canon qui le déclare ; un Member d'un autre canon de
+        l'hôte ne compte pas.
         """
         if not responsible or not responsible.startswith("human:"):
             return None
@@ -965,6 +1055,9 @@ class Canon:
 
         return {
             "root": self.root,
+            "id": self.id,
+            "id_source": self.id_source,
+            "default": self.is_default,
             "readable": self.readable,
             "untrusted": self.untrusted,
             "sources": [s.to_dict() for s in self.sources],
@@ -993,6 +1086,10 @@ class Canon:
                          for w in self.packages],
             "federation": {"id": (self.federation or {}).get("id"),
                            "roles": self.roles, "review_policies": self.review_policies},
+            # L43 (0031) : périmètre ameesh par membre, fiches ignorées hors périmètre
+            "ameesh_scope": {member: list(dirs) for member, dirs in sorted(self.scopes.items())},
+            "ameesh_scope_unread": sorted(self.scope_unread),
+            "out_of_scope": dict(sorted(self.out_of_scope.items())),
         }
 
 
@@ -1343,6 +1440,56 @@ def _relative_ok(path: str) -> bool:
     return norm != ".." and not norm.startswith(".." + os.sep)
 
 
+def parse_scope(value: Any) -> tuple[list[str] | None, str | None]:
+    """(dossiers, problème) d'un `ameesh.scope` (L43, 0031).
+
+    Une chaîne ou une liste non vide de dossiers RELATIFS au bundle du membre
+    (ni absolus, ni `..`, ni motifs, ni dossiers cachés) ; `.` désigne le
+    bundle entier (rendu ""). None sans valeur (pas de périmètre)."""
+    if value is None:
+        return None, None
+    items = [value] if isinstance(value, str) else value
+    if not isinstance(items, list) or not items:
+        return None, "dossier ou liste non vide de dossiers attendue"
+    out: list[str] = []
+    for item in items:
+        if not isinstance(item, str) or not item.strip():
+            return None, "dossier vide"
+        text = item.strip().replace("\\", "/")
+        norm = posixpath.normpath(text)
+        if text.startswith("/") or norm == ".." or norm.startswith("../"):
+            return None, "%r : dossier relatif au bundle attendu (ni absolu, ni `..`)" % item
+        if any(ch in norm for ch in "*?[]{}"):
+            return None, "%r : motif non admis (un dossier, pas un motif)" % item
+        if norm != "." and any(part.startswith(".") for part in norm.split("/")):
+            return None, "%r : dossier caché (jamais lu)" % item
+        norm = "" if norm == "." else norm
+        if norm not in out:
+            out.append(norm)
+    return out, None
+
+
+def in_scope(relpath: str, scope: Iterable[str] | None) -> bool:
+    """Le chemin (relatif au bundle) est-il dans le périmètre ? None = tout."""
+    if scope is None:
+        return True
+    rel = relpath.replace(os.sep, "/")
+    return any(s == "" or rel == s or rel.startswith(s + "/") for s in scope)
+
+
+def _profile_type(content: bytes | None) -> str | None:
+    """Type du profil ameesh déclaré dans le frontmatter, sans le valider
+    (compte des fiches ignorées hors périmètre, L43) ; None sinon."""
+    if not content:
+        return None
+    try:
+        block = split_frontmatter(content[:FRONTMATTER_MAX].decode("utf-8", "replace"))
+    except YamlError:
+        return None
+    found = _TYPED_RE.search(block or "")
+    return found.group(1) if found else None
+
+
 def _interesting(relpath: str) -> bool:
     parts = relpath.replace(os.sep, "/").split("/")
     if any(part.startswith(".") for part in parts):
@@ -1353,13 +1500,14 @@ def _interesting(relpath: str) -> bool:
 
 class _Loader:
     def __init__(self, root: str, *, ref: str, untrusted: bool, fetch: bool,
-                 use_pyyaml: bool | None):
+                 use_pyyaml: bool | None, default: bool = True):
         self.root = os.path.abspath(os.path.expanduser(root))
         self.ref = ref
         self.allow_untrusted = untrusted
         self.fetch = fetch
         self.use_pyyaml = use_pyyaml
-        self.canon = Canon(root=self.root)
+        self.canon = Canon(root=self.root, is_default=default)
+        _identify(self.canon, None)     # repli tant que le manifeste n'est pas lu
         self.fetched: set[str] = set()
         self.findings = self.canon.load_findings
 
@@ -1528,9 +1676,11 @@ class _Loader:
                 manifest = self._parse_manifest(raw, root_id) if raw is not None else None
             self._check_repository(root, root_entry)
         self.canon.federation = manifest
+        _identify(self.canon, manifest)   # L42 : avant les fiches (préfixe des références)
         self.canon.sources.append(root)
         if manifest is not None:
             self._members(manifest, root)
+            self._scopes(manifest, root)
         self.canon.readable = True
         self._read_fiches()
         if self.canon.untrusted:
@@ -1597,9 +1747,74 @@ class _Loader:
                     self._check_repository(source, entry)
                 self.canon.sources.append(source)
 
+    # -- périmètre ameesh (L43, 0031) ----------------------------------------------
+    def _scopes(self, manifest: dict, root: Source) -> None:
+        """Lit `ameesh: {scope: …}` : au premier niveau de federation.yaml pour
+        le bundle racine, dans l'entrée `members[]` d'un autre membre pour le
+        sien. Sans la clé, le membre est lu en entier (comportement historique).
+
+        Fail closed : un périmètre illisible est une erreur, et le membre n'est
+        pas lu du tout (`scope_unread`) — jamais lu en entier à la place."""
+        declared: list[tuple[str, Any, str]] = []
+        if SCOPE_KEY in manifest:
+            declared.append((root.member, manifest.get(SCOPE_KEY), SCOPE_KEY))
+        for entry in manifest["members"]:
+            if not isinstance(entry, dict) or not entry.get("id") or SCOPE_KEY not in entry:
+                continue
+            member = str(entry["id"])
+            if member == root.member:
+                self.add("ameesh-scope-ignored-key", WARNING,
+                         "`members[%s].%s` ignoré : le périmètre du bundle racine se déclare "
+                         "au premier niveau de federation.yaml (`%s: {scope: …}`)"
+                         % (member, SCOPE_KEY, SCOPE_KEY),
+                         member=root.member, path="federation.yaml")
+                continue
+            declared.append((member, entry.get(SCOPE_KEY), "members[%s].%s" % (member,
+                                                                              SCOPE_KEY)))
+        for member, raw, label in declared:
+            where = {"member": root.member, "path": "federation.yaml"}
+            if raw is None:
+                continue
+            if not isinstance(raw, dict):
+                self.add("ameesh-scope-invalid", ERROR,
+                         "`%s` : mapping attendu (`%s: {scope: <dossier>}`) — fiches ameesh "
+                         "de %s non lues" % (label, SCOPE_KEY, member), **where)
+                self.canon.scope_unread.add(member)
+                continue
+            for unknown in sorted(set(map(str, raw)) - set(SCOPE_FIELDS)):
+                self.add("ameesh-key-unknown", WARNING,
+                         "`%s.%s` : clé inconnue (ignorée)" % (label, unknown), **where)
+            scope, problem = parse_scope(raw.get("scope"))
+            if problem:
+                self.add("ameesh-scope-invalid", ERROR,
+                         "`%s.scope` : %s — fiches ameesh de %s non lues"
+                         % (label, problem, member), **where)
+                self.canon.scope_unread.add(member)
+                continue
+            if scope is not None:
+                self.canon.scopes[member] = scope
+
+    def _scope_missing(self, source: Source, present: Iterable[str]) -> bool:
+        """Un dossier du périmètre absent de la source : erreur, membre non lu."""
+        scope = self.canon.scopes.get(source.member)
+        if scope is None:
+            return False
+        present = list(present)
+        missing = [s for s in scope if s and not any(
+            p == s or p.startswith(s + "/") for p in present)]
+        if not missing:
+            return False
+        self.add("ameesh-scope-missing", ERROR,
+                 "périmètre ameesh %s absent de %s : fiches ameesh de %s non lues"
+                 % (", ".join(missing), source.describe(), source.member),
+                 member=source.member, path=source.prefix)
+        self.canon.scope_unread.add(source.member)
+        return True
+
     # -- fiches ------------------------------------------------------------------
-    def _files(self, source: Source) -> list[tuple[str, bytes | None, str]]:
-        """[(chemin affiché, contenu, empreinte)] des .md de la source."""
+    def _files(self, source: Source) -> list[tuple[str, str, bytes | None, str]]:
+        """[(chemin affiché, chemin dans le bundle, contenu, empreinte)] des .md
+        de la source ; [] si son périmètre ameesh est introuvable (L43)."""
         others = [s for s in self.canon.sources if s is not source]
         if source.mode == "git":
             nested = [s.prefix for s in others if s.mode == "git" and s.repo == source.repo
@@ -1612,15 +1827,22 @@ class _Loader:
                          "%s absent de %s (%s) : rien à lire" % (
                              source.prefix or "le bundle", source.rev, source.commit[:12]),
                          member=source.member, path=source.prefix)
-            for path, sha in listed:
-                rel = path[len(source.prefix) + 1:] if source.prefix else path
+            rels = [(path, path[len(source.prefix) + 1:] if source.prefix else path, sha)
+                    for path, sha in listed]
+            if listed and self._scope_missing(source, (rel for _p, rel, _s in rels)):
+                return []
+            for path, rel, sha in rels:
                 if not _interesting(rel):
                     continue
                 if any(path == n or path.startswith(n + "/") for n in nested):
                     continue
-                entries.append((path, sha))
-            blobs = _git_blobs(source.repo, [sha for _p, sha in entries])
-            return [(path, blobs.get(sha), source.commit) for path, sha in entries]
+                entries.append((path, rel, sha))
+            blobs = _git_blobs(source.repo, [sha for _p, _r, sha in entries])
+            return [(path, rel, blobs.get(sha), source.commit) for path, rel, sha in entries]
+        if self._scope_missing(source, [
+                s for s in self.canon.scopes.get(source.member) or []
+                if os.path.isdir(os.path.join(source.directory, s))]):
+            return []
         nested_dirs = [os.path.realpath(s.directory) for s in others
                        if _within(source.directory, s.directory)
                        and os.path.realpath(s.directory) != os.path.realpath(source.directory)]
@@ -1636,19 +1858,39 @@ class _Loader:
                 with open(full, "rb") as fh:
                     content = fh.read(FRONTMATTER_MAX)
                 digest = "untrusted:sha256:" + hashlib.sha256(content).hexdigest()
-                out.append((rel.replace(os.sep, "/"), content, digest))
+                rel = rel.replace(os.sep, "/")
+                out.append((rel, rel, content, digest))
         return out
 
     def _read_fiches(self) -> None:
         for source in self.canon.sources:
+            if source.member in self.canon.scope_unread:
+                continue            # L43 : périmètre illisible, rien n'est lu
             try:
                 files = self._files(source)
             except (GitError, OSError) as exc:
                 self.add("canon-git-error", ERROR, "lecture de %s : %s" % (source.member, exc),
                          member=source.member)
                 continue
-            for path, content, version in files:
+            scope = self.canon.scopes.get(source.member)
+            ignored: list[str] = []
+            for path, rel, content, version in files:
+                if not in_scope(rel, scope):
+                    # L43 (0031) : hors du périmètre ameesh, une fiche du même
+                    # `type` n'est pas une fiche ameesh (sous-agents Claude Code
+                    # d'Acme, p. ex.) : ignorée, sans constat bloquant
+                    if _profile_type(content):
+                        ignored.append(path)
+                    continue
                 self._fiche(source, path, content, version)
+            if ignored:
+                self.canon.out_of_scope[source.member] = len(ignored)
+                self.add("ameesh-scope-ignored", INFO,
+                         "%d fiche(s) typée(s) Agent/Host/Placement/Member/WorkPackage hors du "
+                         "périmètre ameesh (%s) ignorée(s), p. ex. %s"
+                         % (len(ignored), ", ".join(s or "." for s in scope),
+                            ", ".join(ignored[:3])),
+                         member=source.member, path=source.prefix)
 
     def _fiche(self, source: Source, path: str, content: bytes | None, version: str) -> None:
         where = {"member": source.member, "path": path}
@@ -1686,7 +1928,7 @@ class _Loader:
             return
         title = _text(data.get("title"))
         fiche = Fiche(type=kind, title=title or "", member=source.member, path=path,
-                      ref="%s:%s@%s" % (source.member, path, version), data=data,
+                      ref=make_ref(self.canon, source.member, path, version), data=data,
                       untrusted=source.mode != "git")
         if not title and kind != "Placement":
             subject = {"package": _package_stem(path)} if kind == "WorkPackage" else {}
@@ -1932,15 +2174,78 @@ def _text(value: Any) -> str | None:
     return text or None
 
 
+# ==========================================================================
+# Identité d'un canon et références qualifiées (L42, décision 0031)
+# ==========================================================================
+
+def _directory_id(root: str) -> str:
+    """Identifiant de repli : le nom du dossier, ramené à CANON_ID_RE."""
+    base = os.path.basename(os.path.normpath(root or "")) or "canon"
+    text = re.sub(r"[^A-Za-z0-9._-]+", "-", base).lstrip("._-")[:64]
+    return text if CANON_ID_RE.match(text) else "canon"
+
+
+def _identify(canon: Canon, manifest: dict | None) -> None:
+    """Pose `canon.id` : `id` de federation.yaml s'il est valide, sinon le nom
+    du dossier (`id_source` = directory ; le constat n'est ajouté qu'en
+    configuration à plusieurs canons, voir `note_identity`)."""
+    raw = (manifest or {}).get("id") if isinstance(manifest, dict) else None
+    text = str(raw).strip() if isinstance(raw, (str, int)) and not isinstance(raw, bool) \
+        else ""
+    if text and CANON_ID_RE.match(text):
+        canon.id, canon.id_source = text, ID_FROM_FEDERATION
+    else:
+        canon.id, canon.id_source = _directory_id(canon.root), ID_FROM_DIRECTORY
+
+
+def note_identity(canon: Canon) -> None:
+    """Constat (avertissement) d'un canon sans `id` valide dans federation.yaml,
+    identifié par le nom de son dossier. Ajouté seulement quand plusieurs
+    canons sont configurés : seul, un canon n'a pas besoin d'identité."""
+    if canon.id_source == ID_FROM_FEDERATION:
+        return
+    raw = (canon.federation or {}).get("id") if isinstance(canon.federation, dict) else None
+    code = "canon-id-invalid" if raw not in (None, "") else "canon-id-missing"
+    canon.load_findings.append(Finding(
+        code, WARNING,
+        "%s : identifié par le nom de son dossier, « %s » (déclarer `id` dans "
+        "federation.yaml%s)" % (
+            canon.root, canon.id,
+            " : %r hors de la grammaire [A-Za-z0-9._-]" % (raw,) if raw not in (None, "")
+            else ""),
+        path="federation.yaml", untrusted=canon.untrusted))
+
+
+def make_ref(canon: Canon, member: str, path: str, version: str) -> str:
+    """Référence d'une fiche : historique (`membre:chemin@version`) pour le
+    canon par défaut, préfixée de l'identifiant du canon pour les autres —
+    les deux fédérations de l'hôte peuvent nommer leur racine `home`."""
+    ref = "%s:%s@%s" % (member, path, version)
+    return ref if canon.is_default else "%s/%s" % (canon.id, ref)
+
+
+def split_ref(ref: str | None) -> tuple[str | None, str, str, str] | None:
+    """(canon ou None, membre, chemin, version) d'une référence de fiche, ou None."""
+    match = FICHE_REF_RE.fullmatch(ref or "")
+    if not match:
+        return None
+    return match.group("canon"), match.group("member"), match.group("path"), \
+        match.group("version")
+
+
 def load(root: str, *, ref: str = "", untrusted: bool = False, fetch: bool = False,
-         use_pyyaml: bool | None = None) -> Canon:
+         use_pyyaml: bool | None = None, default: bool = True) -> Canon:
     """Lit le canon (§4.1). Les problèmes de lecture sont dans `canon.load_findings`.
 
     Une erreur git imprévue (dépôt cassé, délai dépassé) rend le canon
     illisible (`readable` faux) au lieu de remonter : `canon sync` peut alors
     enregistrer l'état `unreadable`.
+
+    `default` (L42) : faux pour un canon qui n'est pas le premier configuré —
+    ses références sont alors préfixées de son identifiant.
     """
-    loader = _Loader(root, ref=ref, untrusted=untrusted, fetch=fetch, use_pyyaml=use_pyyaml)
+    loader = _Loader(root, ref=ref, untrusted=untrusted, fetch=fetch, use_pyyaml=use_pyyaml,
+                     default=default)
     try:
         return loader.load()
     except GitError as exc:
@@ -1955,13 +2260,106 @@ def load(root: str, *, ref: str = "", untrusted: bool = False, fetch: bool = Fal
         return loader.canon
 
 
-def from_config(cfg, *, root: str | None = None, fetch: bool = False) -> Canon:
-    """Le canon de la configuration (`AMEESH_CANON`, `AMEESH_CANON_REF`, …)."""
-    path = root or cfg.canon
-    if not path:
-        raise CanonError("aucun canon configuré : posez AMEESH_CANON (ou `canon` dans la "
-                         "configuration), ou passez --canon DOSSIER")
-    return load(path, ref=cfg.canon_ref, untrusted=cfg.canon_untrusted, fetch=fetch)
+def configured(cfg) -> tuple:
+    """Canons configurés (`config.CanonEntry`), le canon par défaut d'abord (L42)."""
+    entries = getattr(cfg, "canon_entries", None)
+    if entries is None:                 # configuration factice (tests)
+        path = getattr(cfg, "canon", "")
+        if not path:
+            return ()
+        from .config import CanonEntry
+        return (CanonEntry(path, getattr(cfg, "canon_ref", ""),
+                           bool(getattr(cfg, "canon_untrusted", False))),)
+    return tuple(entries)
+
+
+def from_config(cfg, *, root: str | None = None, fetch: bool = False,
+                entry=None) -> Canon:
+    """Le canon de la configuration (`AMEESH_CANON`, `AMEESH_CANON_REF`, …).
+
+    Sans `entry` : le canon par défaut (ou `root`, lu comme canon par défaut).
+    `entry` (L42, `config.CanonEntry`) : un autre canon configuré — il n'est le
+    canon par défaut que s'il est le premier de la liste."""
+    entries = configured(cfg)
+    if entry is not None:
+        default = bool(entries) and entries[0].path == entry.path
+        canon = load(entry.path, ref=entry.ref, untrusted=entry.untrusted, fetch=fetch,
+                     default=default)
+    else:
+        path = root or cfg.canon
+        if not path:
+            raise CanonError("aucun canon configuré : posez AMEESH_CANON (ou `canon` dans la "
+                             "configuration), ou passez --canon DOSSIER")
+        canon = load(path, ref=cfg.canon_ref, untrusted=cfg.canon_untrusted, fetch=fetch)
+    if len(entries) > 1:
+        note_identity(canon)
+    return canon
+
+
+def check_identities(canons: list[Canon]) -> None:
+    """Deux canons configurés avec le même identifiant : erreur de configuration."""
+    seen: dict[str, Canon] = {}
+    for canon in canons:
+        other = seen.get(canon.id)
+        if other is not None:
+            raise CanonError(
+                "configuration : deux canons ont l'identifiant « %s » (%s et %s) — "
+                "l'`id` de federation.yaml (sinon le nom du dossier) doit être unique "
+                "parmi les canons de l'hôte" % (canon.id, other.root, canon.root))
+        seen[canon.id] = canon
+
+
+def load_configured(cfg, *, fetch: bool = False) -> list[Canon]:
+    """Les canons configurés qui se laissent charger, le canon par défaut
+    d'abord (lecture seule : seuils, hôtes). Une configuration fautive d'un
+    canon ne masque pas les autres ; un identifiant en double est écarté."""
+    out: list[Canon] = []
+    for index, entry in enumerate(configured(cfg)):
+        try:
+            canon = from_config(cfg, fetch=fetch) if index == 0 \
+                else from_config(cfg, entry=entry, fetch=fetch)
+        except CanonError:
+            continue
+        if any(c.id == canon.id for c in out):
+            continue
+        out.append(canon)
+    return out
+
+
+def find_host(canons: Iterable[Canon], name: str) -> Host | None:
+    """Fiche Host `name` du premier canon qui la déclare (le canon par défaut
+    d'abord). L43 (0031) : à n'utiliser que pour l'AFFICHAGE (responsable) ;
+    l'admission d'un agent se juge avec la fiche de SON canon, et les limites
+    physiques avec `host_fiches` / `resources.host_limits`."""
+    for canon in canons:
+        host = canon.host(name)
+        if host is not None:
+            return host
+    return None
+
+
+def host_fiches(canons: Iterable[Canon], name: str) -> list[tuple[Canon, Host]]:
+    """(canon, fiche Host `name`) de chaque canon qui décrit cet hôte (L43),
+    le canon par défaut d'abord."""
+    out: list[tuple[Canon, Host]] = []
+    for canon in canons:
+        host = canon.host(name) if hasattr(canon, "host") else None
+        if host is not None:
+            out.append((canon, host))
+    return out
+
+
+def from_config_all(cfg, *, fetch: bool = False) -> list[Canon]:
+    """Tous les canons configurés (L42, décision 0031), le canon par défaut
+    d'abord. Identifiants en double : CanonError (aucun canon rendu)."""
+    entries = configured(cfg)
+    if not entries:
+        raise CanonError("aucun canon configuré : posez AMEESH_CANON ou AMEESH_CANONS (ou "
+                         "`canon` / `canons` dans la configuration)")
+    canons = [from_config(cfg, fetch=fetch)]
+    canons += [from_config(cfg, entry=entry, fetch=fetch) for entry in entries[1:]]
+    check_identities(canons)
+    return canons
 
 
 # ==========================================================================

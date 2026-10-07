@@ -256,6 +256,8 @@ class ProgressPgTest(PgTestCase):
         return action_id
 
     def test_instantane(self):
+        # L37 (0030) : l'assigné d'un lot doit exister (attribution gardée)
+        registry.upsert(self.db, "a1", chantier="demo", harness="codex", host=self.cfg.host)
         a = work.add(self.db, title="lot actif", app="demo", assignee="a1")
         work.move(self.db, a["id"], "build")
         b = work.add(self.db, title="lot en revue", app="demo")

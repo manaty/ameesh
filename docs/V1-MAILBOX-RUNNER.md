@@ -370,6 +370,36 @@ seulement un nom d'affichage pour la barre d'état et `whoami --cwd`
 `--from`, `status` et `whoami` refusent, et `inbox <nom>` reste une lecture
 sans consommation.
 
+**Sessions externes : liaison explicite (L41, décision 0030).** Une session
+interactive lancée par un humain n'a ni bail ni `AGENT_MAIL_NAME`. Elle n'a
+une identité que si elle est **liée** : `ameesh mail bind <agent> --session
+<id> --harness claude|codex|deepseek [--pid N]` (table `session_bindings`,
+migration 0034 ; une liaison active au plus par hôte, harnais et session).
+Le hook la retrouve par l'identifiant de session que le harnais lui passe en
+JSON ; si la liaison porte un PID, celui-ci doit être un ancêtre du processus
+du hook — et, L46 (migration 0036, `pid_start`), le MÊME processus : son heure
+de démarrage (champ 22 de `/proc/<pid>/stat`), relevée à la liaison, est
+recontrôlée ; un PID recyclé ne donne rien (re-lier avec `--pid`). Source `session` : jamais liée à un bail, donc soumise à la règle L36
+(elle ne remplace pas la session enregistrée d'un agent), et sans effet dès
+que l'agent détient un bail vivant (il est alors mené par l'exécuteur ; `bind`
+le refuse d'emblée). `whoami`, `send` et `inbox`, lancés dans la session, la
+retrouvent par leur ascendance ; `whoami` affiche la source et la liaison.
+Sans liaison, le hook ne remet rien et n'écrit rien. `bind --import` reprend
+le fichier du pont local (`external-session-bindings.json`), `unbind` révoque,
+`bindings` liste ; chaque liaison et révocation est écrite dans le fil.
+
+**Sans bail, jamais sur la ligne d'un agent `execute` (L46).** Un hook sans
+bail (source `explicit` ou `session`) ne fait avancer que `last_seen` sur la
+ligne d'un agent `execute` : ni hôte, ni harnais, ni session, ni dossier, ni
+chantier (une seule instruction, `registry.upsert_unleased`). Un agent inconnu
+naît `externe` ; la ligne d'un agent `externe` suit sa session (règle L36).
+La source `explicit` (`AGENT_MAIL_NAME` sans `AMEESH_RUNNER_ID`) ne reçoit
+rien tant que l'agent détient un bail vivant — refus dit par le hook, et
+appliqué sous verrou par la réservation elle-même pour toute identité sans
+bail. `ameesh mail bind` refuse un agent `execute` sauf `--force` (« agent
+mené par l'exécuteur ; une session externe lui volerait son courrier ») et
+inscrit un agent inconnu comme `externe`.
+
 **Hooks : écrire d'abord, marquer ensuite.** Le JSON est écrit sur stdout et
 vidé (`flush`) *avant* de marquer les messages remis ; si le harnais a fermé son
 entrée (BrokenPipe), la remise n'a pas lieu et le courrier reste pour le tour

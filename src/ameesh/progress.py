@@ -50,6 +50,7 @@ from . import db as db_mod
 from . import plan as plan_mod
 from . import stagnation
 from . import storage
+from . import work as work_mod
 
 SCHEMA = "ameesh-progress/1"
 DEFAULT_SINCE = "24h"
@@ -261,7 +262,9 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
               declared: list[dict] | None = None, *, packages: dict | None = None,
               now: float | None = None,
               stale_after: float = stagnation.DEFAULT_THRESHOLD_S,
-              messages_ts: float | None = None) -> dict:
+              messages_ts: float | None = None,
+              agent_states: dict[str, str] | None = None,
+              agent_externals: dict[str, str | None] | None = None) -> dict:
     jalons = _jalons_de_lot(item, events, actions, declared)
     packages = packages or {}
     package = packages.get(item.get("package_id"))
@@ -300,10 +303,14 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
                     "superseded_by": item.get("superseded_by"),
                     "at_ts": _round(closed_at)}
                    if item.get("state") == "closed" else None),
-        "waiting_for": stagnation.waiting(
-            item, jalons, actions, responsible=(package or {}).get("responsible")),
+        "waiting_for": stagnation.with_availability(
+            stagnation.waiting(item, jalons, actions,
+                               responsible=(package or {}).get("responsible")),
+            agent_states, agent_externals),
         "last_activity_ts": _round(last),
         "stale": stagnation.stale(item.get("state") or "", last, now, stale_after),
+        # L40 (0030) : délégation à échéance (champ ajouté)
+        "delegation": work_mod.delegation_view(item, now),
     }
 
 
@@ -391,6 +398,9 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
         "unread": int(row.get("unread") or 0),
         "pending_prompt": bool(row.get("has_pending_prompt")),
         "lease_live": bool(row.get("lease_live")),
+        # L37 (0030) : mode et raison d'arrêt structurée
+        "mode": row.get("mode") or "execute",
+        "stop_reason": row.get("stop_reason") if state == "stopped" else None,
     }
 
 
@@ -480,10 +490,12 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     packages = {p["id"]: p for p in package_rows}
     threshold = stagnation.stale_after() if stale_after is None else float(stale_after)
     messages = {int(r["work_item_id"]): r.get("last_ts") for r in st.lot_messages(ids)}
+    states, externals = stagnation.availability_of(st.agents(None))
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
-                      messages_ts=messages.get(int(item["id"])))
+                      messages_ts=messages.get(int(item["id"])), agent_states=states,
+                      agent_externals=externals)
             for item in items]
     plan = plan_mod.summarize(package_rows, st.package_items())
     action_rows = st.actions(since_ts=since_ts, project=project, limit=max_actions)
@@ -607,6 +619,8 @@ def format_text(snap: dict, width: int | None = None) -> str:
             line(" · ".join(extra), "    ")
         if lot.get("waiting_for"):
             line("attend : %s" % lot["waiting_for"]["label"], "    ")
+        if lot.get("delegation"):
+            line(lot["delegation"]["label"], "    ")
 
     epics = snap.get("epics") or []
     if epics:
