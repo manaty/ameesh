@@ -1,5 +1,17 @@
 # Journal de la conception
 
+## 2026-10-07 (soir : lots codés, non fusionnés)
+* **Relecture indépendante** de l'intégration : 5 défauts importants et une fuite possible de secret, corrigés par le lot L46 (migration 0036) ; `integ/0030-0031` @ 3eb40f9, suite complète verte (1408 tests, psql et psycopg).
+* **Lots** L36–L45 codés et intégrés sur la branche locale `integ/0030-0031` (20 commits sur `origin/main`, migrations 0030–0035) ; suite complète verte sur les deux pilotes (1388 tests, psql et psycopg). Rien n'est poussé ni fusionné : relecture et accord du propriétaire attendus.
+* **Second canon** : fiches ameesh de la seconde organisation préparées hors dépôt et validées par le code intégré.
+
+## 2026-10-07 (plusieurs canons)
+* **Décision** (modalités à confirmer) : [plusieurs canons](decisions/0031-plusieurs-canons.md) et [étude](etudes/plusieurs-canons.md) ; lots L42–L45 ; migration 0032 réservée.
+
+## 2026-10-07 (orchestration et vivacité)
+* **Décision** : [pas de travail sans réveil possible](decisions/0030-pas-de-travail-sans-reveil-possible.md) ; lots L36–L41 adoptés.
+* **Étude** : [orchestration et vivacité](etudes/orchestration-et-vivacite.md) — blocage d'un chantier par un orchestrateur externe arrêté ; décision proposée et lots L36–L41 ; migrations 0030–0031 réservées.
+
 ## 2026-10-05 (persona et harnais)
 * **Étude** : [persona et harnais](etudes/persona-et-harnais.md) ; spécification de la fiche Persona, des sessions, de la désignation au harnais et d'une mémoire neutre ; points à trancher dans les [questions ouvertes](questions-ouvertes.md).
 
