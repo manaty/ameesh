@@ -21,9 +21,12 @@ présents localement (`workspace_path`, relatif au dossier de travail commun,
 comme le validateur OKF Federation) sont lus aussi, chacun à `origin/<ref>`
 de son propre dépôt. Un membre absent est signalé, jamais deviné.
 
-Périmètre (L43, décision 0031) : `ameesh: {scope: <dossier>|[…]}` au premier
-niveau de federation.yaml borne les fiches du profil du bundle racine à ces
-dossiers (dans l'entrée `members[]` d'un autre membre : celles de ce membre).
+Périmètre (L43, décision 0031 ; forme L47, conforme au schéma OKF
+Federation) : `extensions: {ameesh: {scope: <dossier>|[…]}}` dans
+federation.yaml borne les fiches du profil du bundle racine à ces dossiers
+(`extensions.ameesh.members.<id>.scope` : celles d'un autre membre). L'ancienne
+forme (`ameesh:` au premier niveau, `members[].ameesh`) reste lue, avec un
+avertissement.
 Hors du périmètre, un fichier de même `type` (sous-agent Claude Code d'un
 canon partagé, p. ex.) est ignoré — un constat d'information agrégé, jamais
 une erreur. Sans la clé, tout le bundle est lu. Un périmètre illisible ou
@@ -1756,8 +1759,51 @@ class _Loader:
         Fail closed : un périmètre illisible est une erreur, et le membre n'est
         pas lu du tout (`scope_unread`) — jamais lu en entier à la place."""
         declared: list[tuple[str, Any, str]] = []
+        # L47 : forme conforme au schéma OKF Federation (seule la clé
+        # `extensions` est libre) : `extensions: {ameesh: {scope: …,
+        # members: {<id>: {scope: …}}}}`. Elle prime sur l'ancienne forme.
+        ext = (manifest.get("extensions") or {}) if isinstance(manifest, dict) else {}
+        ext = ext.get(SCOPE_KEY) if isinstance(ext, dict) else None
+        if ext is not None:
+            label = "extensions.%s" % SCOPE_KEY
+            if not isinstance(ext, dict):
+                self.add("ameesh-scope-invalid", ERROR,
+                         "`%s` : mapping attendu (`%s: {scope: <dossier>}`) — fiches ameesh "
+                         "de %s non lues" % (label, label, root.member),
+                         member=root.member, path="federation.yaml")
+                self.canon.scope_unread.add(root.member)
+                ext = {}
+            root_part = {k: v for k, v in ext.items() if k != "members"}
+            if root_part:
+                declared.append((root.member, root_part, label))
+            members = ext.get("members")
+            if members is not None and not isinstance(members, dict):
+                self.add("ameesh-scope-invalid", ERROR,
+                         "`%s.members` : mapping attendu (`<id>: {scope: …}`)" % label,
+                         member=root.member, path="federation.yaml")
+                members = {}
+            known = {str(e.get("id")) for e in manifest["members"] if isinstance(e, dict)}
+            for member, raw in sorted((members or {}).items()):
+                member = str(member)
+                if member == root.member:
+                    self.add("ameesh-scope-ignored-key", WARNING,
+                             "`%s.members.%s` ignoré : le périmètre du bundle racine se "
+                             "déclare dans `%s.scope`" % (label, member, label),
+                             member=root.member, path="federation.yaml")
+                    continue
+                if member not in known:
+                    self.add("ameesh-key-unknown", WARNING,
+                             "`%s.members.%s` : membre absent de `members` (ignoré)"
+                             % (label, member), member=root.member, path="federation.yaml")
+                    continue
+                declared.append((member, raw, "%s.members.%s" % (label, member)))
         if SCOPE_KEY in manifest:
-            declared.append((root.member, manifest.get(SCOPE_KEY), SCOPE_KEY))
+            self.add("ameesh-scope-legacy", WARNING,
+                     "`%s:` au premier niveau de federation.yaml n'est pas conforme au schéma "
+                     "OKF Federation : écrire `extensions: {%s: {scope: …}}`"
+                     % (SCOPE_KEY, SCOPE_KEY), member=root.member, path="federation.yaml")
+            if ext is None:
+                declared.append((root.member, manifest.get(SCOPE_KEY), SCOPE_KEY))
         for entry in manifest["members"]:
             if not isinstance(entry, dict) or not entry.get("id") or SCOPE_KEY not in entry:
                 continue
@@ -1765,12 +1811,16 @@ class _Loader:
             if member == root.member:
                 self.add("ameesh-scope-ignored-key", WARNING,
                          "`members[%s].%s` ignoré : le périmètre du bundle racine se déclare "
-                         "au premier niveau de federation.yaml (`%s: {scope: …}`)"
-                         % (member, SCOPE_KEY, SCOPE_KEY),
+                         "dans `extensions.%s.scope`" % (member, SCOPE_KEY, SCOPE_KEY),
                          member=root.member, path="federation.yaml")
                 continue
-            declared.append((member, entry.get(SCOPE_KEY), "members[%s].%s" % (member,
-                                                                              SCOPE_KEY)))
+            self.add("ameesh-scope-legacy", WARNING,
+                     "`members[%s].%s` n'est pas conforme au schéma OKF Federation : écrire "
+                     "`extensions.%s.members.%s.scope`" % (member, SCOPE_KEY, SCOPE_KEY, member),
+                     member=root.member, path="federation.yaml")
+            if ext is None or member not in ((ext or {}).get("members") or {}):
+                declared.append((member, entry.get(SCOPE_KEY), "members[%s].%s" % (member,
+                                                                                  SCOPE_KEY)))
         for member, raw, label in declared:
             where = {"member": root.member, "path": "federation.yaml"}
             if raw is None:

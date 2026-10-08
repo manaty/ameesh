@@ -84,7 +84,8 @@ Un seul canon, partout, et aucune trace de l'identité d'une fédération.
    * Les limites physiques que l'exécuteur applique (`max_agents`, seuils de
      ressources) sont **les plus strictes** des fiches de l'hôte.
 7. **Périmètre ameesh dans un canon partagé.** `federation.yaml` peut déclarer
-   `ameesh: {scope: <dossier>}`. Les fiches du profil ameesh (`Agent`, `Host`,
+   `extensions: {ameesh: {scope: <dossier>}}` (L47 : seule clé libre du
+   schéma OKF Federation). Les fiches du profil ameesh (`Agent`, `Host`,
    `Placement`, `Member`, `WorkPackage`) ne sont alors lues que sous ce
    dossier. Les `type: Agent` étrangers ailleurs dans le canon, comme les
    sous-agents Claude Code d'Acme, sont ignorés. Sans cette clé,
