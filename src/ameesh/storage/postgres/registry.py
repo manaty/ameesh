@@ -44,7 +44,8 @@ AGENT_COLUMNS = """
     session_policy, effort, tier, session_work_item,
     extract(epoch from status_since)::float8         as status_since_ts,
     extract(epoch from restart_requested_at)::float8 as restart_requested_ts,
-    extract(epoch from session_reset_at)::float8     as session_reset_ts
+    extract(epoch from session_reset_at)::float8     as session_reset_ts,
+    mode, stop_reason, session_account
 """
 
 
@@ -101,8 +102,10 @@ def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
 
     Vraie si l'agent de la ligne `alias` (une ligne de `agent_registry`, ou de
     la vue `agent_mesh_overview`) n'est pas gouverné par le canon
-    (`canon_governed_sql`), ou si le dernier état du canon de **son hôte**
-    (`canon_state`, écrit par `ameesh canon sync`) est `ok` **et** que son
+    (`canon_governed_sql`), ou si le dernier état de **son canon** sur **son
+    hôte** (`canon_state`, clé (host, canon) depuis L42/0031 ; colonne `canon`
+    de la ligne, NULL = canon par défaut ; écrit par `ameesh canon sync`) est
+    `ok` **et** que son
     placement sur cet hôte est admis par la politique de l'hôte
     (`placement_ok`, colonne déclarative écrite par `canon sync`, recopiée du
     créateur pour un éphémère ; C4, 0022) **pour le profil qu'il a
@@ -124,10 +127,28 @@ def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
     `claim()` ; à réutiliser telle quelle pour `ameesh attach` (C9).
     """
     a = _alias(alias)
+    # L42 (0031) : l'état est celui du canon DE L'AGENT sur son hôte (colonne
+    # `canon` ; NULL = canon par défaut, clé '') — un canon invalide ne ferme
+    # que ses propres agents et leurs éphémères (qui portent son canon)
     return """(NOT %(governed)s
        OR (EXISTS (SELECT 1 FROM canon_state s
-                    WHERE s.host = %(a)s.host AND s.status = 'ok')
+                    WHERE s.host = %(a)s.host AND s.canon = coalesce(%(a)s.canon, '')
+                      AND s.status = 'ok')
            AND coalesce(%(a)s.placement_ok, false)
+           AND %(a)s.placement_profile IS NOT DISTINCT FROM ameesh_placement_profile(
+                   %(a)s.host, %(a)s.harness, %(a)s.provider, %(a)s.model,
+                   %(a)s.credential_mode)))""" % {
+        "governed": canon_governed_sql(a), "a": a}
+
+
+def placement_admitted_sql(alias: str = "agent_registry") -> str:
+    """L46 : l'ADMISSION seule (placement admis pour le profil actuel), sans
+    l'état du canon de l'hôte — ce que `registry.wakeable` juge : un canon
+    momentanément invalide ne bloque pas une attribution (la réclamation,
+    elle, reste fermée par `canon_claim_predicate_sql`)."""
+    a = _alias(alias)
+    return """(NOT %(governed)s
+       OR (coalesce(%(a)s.placement_ok, false)
            AND %(a)s.placement_profile IS NOT DISTINCT FROM ameesh_placement_profile(
                    %(a)s.host, %(a)s.harness, %(a)s.provider, %(a)s.model,
                    %(a)s.credential_mode)))""" % {
@@ -141,20 +162,29 @@ def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
 class Agents(interface.Agents):
 
     def upsert(self, name, *, chantier, harness, host, cwd, session_id, status,
-               status_text, model, budget_usd) -> dict:
+               status_text, model, budget_usd, mode=None) -> dict:
+        # L37 (0030) : `mode` ne vaut qu'à l'INSERT — un agent existant
+        # (`execute`) n'est jamais basculé par une inscription.
         rows = self.db.query(
             """
             INSERT INTO agent_registry
                 (name, chantier, harness, host, cwd, session_id, status, status_text,
-                 model, budget_usd, last_seen, updated_at)
+                 model, budget_usd, mode, last_seen, updated_at)
             VALUES (%s, coalesce(%s,''), coalesce(%s,'other'), coalesce(%s,''), %s, %s,
-                    coalesce(%s,'idle'), coalesce(%s,''), %s, %s, now(), now())
+                    coalesce(%s,'idle'), coalesce(%s,''), %s, %s, coalesce(%s,'execute'),
+                    now(), now())
             ON CONFLICT (name) DO UPDATE SET
                 chantier    = coalesce(nullif(%s,''), agent_registry.chantier),
                 harness     = coalesce(nullif(%s,''), agent_registry.harness),
                 host        = coalesce(nullif(%s,''), agent_registry.host),
                 cwd         = coalesce(excluded.cwd,        agent_registry.cwd),
                 session_id  = coalesce(excluded.session_id, agent_registry.session_id),
+                -- L39 (0033) : une AUTRE session inscrite (register --session,
+                -- hook) a un compte d'origine inconnu
+                session_account = CASE
+                    WHEN excluded.session_id IS NOT NULL
+                     AND excluded.session_id IS DISTINCT FROM agent_registry.session_id
+                    THEN NULL ELSE agent_registry.session_account END,
                 status      = coalesce(%s, agent_registry.status),
                 status_text = coalesce(nullif(excluded.status_text,''), agent_registry.status_text),
                 model       = coalesce(excluded.model,      agent_registry.model),
@@ -164,7 +194,57 @@ class Agents(interface.Agents):
             RETURNING __COLUMNS__
             """.replace("__COLUMNS__", AGENT_COLUMNS),
             (name, chantier, harness, host, cwd, session_id, status, status_text,
-             model, budget_usd, chantier, harness, host, status),
+             model, budget_usd, mode, chantier, harness, host, status),
+        )
+        return rows[0]
+
+    def upsert_unleased(self, name, *, chantier, harness, host, cwd,
+                        session_id) -> dict:
+        # L46 : inscription par un hook SANS bail, en UNE instruction (pas de
+        # course lecture → écriture). Ligne neuve : agent `externe`. Ligne
+        # existante d'un agent `execute` : seul `last_seen` avance — ni hôte,
+        # ni harnais, ni session, ni dossier, ni chantier. Ligne `externe` :
+        # règle de L36 (hôte, harnais, chantier suivis ; session et dossier
+        # écrits seulement s'il n'y avait pas encore de session).
+        rows = self.db.query(
+            """
+            INSERT INTO agent_registry
+                (name, chantier, harness, host, cwd, session_id, mode,
+                 last_seen, updated_at)
+            VALUES (%s, coalesce(%s,''), coalesce(%s,'other'), coalesce(%s,''), %s, %s,
+                    'externe', now(), now())
+            ON CONFLICT (name) DO UPDATE SET
+                chantier = CASE WHEN agent_registry.mode = 'execute'
+                                THEN agent_registry.chantier
+                                ELSE coalesce(nullif(excluded.chantier,''),
+                                              agent_registry.chantier) END,
+                harness  = CASE WHEN agent_registry.mode = 'execute' OR %s::text IS NULL
+                                THEN agent_registry.harness
+                                ELSE coalesce(nullif(excluded.harness,''),
+                                              agent_registry.harness) END,
+                host     = CASE WHEN agent_registry.mode = 'execute'
+                                THEN agent_registry.host
+                                ELSE coalesce(nullif(excluded.host,''),
+                                              agent_registry.host) END,
+                cwd      = CASE WHEN agent_registry.mode = 'execute'
+                                  OR agent_registry.session_id IS NOT NULL
+                                THEN agent_registry.cwd
+                                ELSE coalesce(excluded.cwd, agent_registry.cwd) END,
+                session_id = CASE WHEN agent_registry.mode = 'execute'
+                                    OR agent_registry.session_id IS NOT NULL
+                                  THEN agent_registry.session_id
+                                  ELSE excluded.session_id END,
+                session_account = CASE
+                    WHEN agent_registry.mode <> 'execute'
+                     AND agent_registry.session_id IS NULL
+                     AND excluded.session_id IS NOT NULL
+                    THEN NULL ELSE agent_registry.session_account END,
+                last_seen  = now(),
+                updated_at = CASE WHEN agent_registry.mode = 'execute'
+                                  THEN agent_registry.updated_at ELSE now() END
+            RETURNING __COLUMNS__
+            """.replace("__COLUMNS__", AGENT_COLUMNS),
+            (name, chantier, harness, host, cwd, session_id, harness),
         )
         return rows[0]
 
@@ -182,12 +262,16 @@ class Agents(interface.Agents):
                    public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
                    responsible, team, provider, credential_mode, capabilities, canon_ref,
                    ephemeral, created_by, ephemeral_expires_ts, responsible_ok, priority,
+                   mode, stop_reason, canon,
                    __GOVERNED__ AS canon_governed,
-                   (SELECT s.status FROM canon_state s WHERE s.host = o.host) AS canon_status,
+                   (SELECT s.status FROM canon_state s WHERE s.host = o.host
+                       AND s.canon = coalesce(o.canon, '')) AS canon_status,
                    (SELECT s.diagnostic FROM canon_state s
-                     WHERE s.host = o.host) AS canon_diagnostic,
+                     WHERE s.host = o.host
+                       AND s.canon = coalesce(o.canon, '')) AS canon_diagnostic,
                    (SELECT extract(epoch from s.checked_at)::float8 FROM canon_state s
-                     WHERE s.host = o.host) AS canon_checked_ts,
+                     WHERE s.host = o.host
+                       AND s.canon = coalesce(o.canon, '')) AS canon_checked_ts,
                    __CLAIM_OK__ AS canon_claim_ok
             FROM agent_mesh_overview o
             ORDER BY last_seen_ts DESC NULLS LAST
@@ -201,6 +285,9 @@ class Agents(interface.Agents):
             FROM agent_registry
             WHERE host = %%s
               AND status <> 'stopped'
+              -- L46 : un agent `externe` (session humaine) n'est jamais mené
+              -- par l'exécuteur, même avec une session et du courrier.
+              AND mode = 'execute'
               AND (lease_owner IS NULL OR lease_expires_at < clock_timestamp())
               AND (NOT ephemeral OR ephemeral_expires_at > clock_timestamp())
               AND %s
@@ -219,11 +306,21 @@ class Agents(interface.Agents):
             (name,),
         )
 
-    def set_session(self, name, session_id) -> None:
+    def set_session(self, name, session_id, account=None) -> None:
+        # L39 (0033) : la session ET le compte sous lequel elle tourne, en une
+        # écriture (NULL : hôte sans comptes déclarés)
         self.db.execute(
-            "UPDATE agent_registry SET session_id = %s, updated_at = now() WHERE name = %s",
-            (session_id, name),
+            "UPDATE agent_registry SET session_id = %s, session_account = %s,"
+            " updated_at = now() WHERE name = %s",
+            (session_id, account, name),
         )
+
+    def set_session_account(self, name, account) -> bool:
+        rows = self.db.query(
+            "UPDATE agent_registry SET session_account = %s, updated_at = now()"
+            " WHERE name = %s AND session_id IS NOT NULL RETURNING name",
+            (account, name))
+        return bool(rows)
 
     def cwd_used(self, cwd, exclude) -> bool:
         rows = self.db.query(
@@ -232,19 +329,58 @@ class Agents(interface.Agents):
         )
         return bool(rows)
 
-    def set_status(self, name, status, status_text, error) -> None:
+    def set_status(self, name, status, status_text, error, stop_reason=None) -> None:
+        # L37 : la raison d'arrêt n'est gardée que pour `stopped`/`dead` (le
+        # déclencheur de 0030 l'efface pour tout autre statut).
         self.db.execute(
             """
             UPDATE agent_registry
                SET status = %s,
                    status_text = coalesce(%s, status_text),
                    last_error = %s,
+                   stop_reason = %s,
                    last_seen = now(),
                    updated_at = now()
              WHERE name = %s
             """,
-            (status, status_text, error, name),
+            (status, status_text, error, stop_reason, name),
         )
+
+    def set_mode(self, name, mode) -> bool:
+        rows = self.db.query(
+            "UPDATE agent_registry SET mode = %s, updated_at = now() WHERE name = %s"
+            " RETURNING name", (mode, name))
+        return bool(rows)
+
+    def wake_check(self, name) -> dict | None:
+        """Ce que `registry.wakeable` (L37, 0030) juge : mode, responsable,
+        statut, éphémère vivant, et la condition de réclamation du canon
+        (`canon_claim_predicate_sql`, la même que `claim`)."""
+        rows = self.db.query(
+            """
+            SELECT r.name, r.mode, r.status, r.stop_reason, r.responsible, r.host,
+                   r.canon_ref, r.placement_ok, r.placement_diagnostic,
+                   (NOT r.ephemeral OR r.ephemeral_expires_at > now()) AS alive,
+                   __GOVERNED__ AS canon_governed,
+                   __CLAIM_OK__ AS canon_claim_ok,
+                   __ADMITTED__ AS placement_admitted,
+                   (SELECT s.status FROM canon_state s WHERE s.host = r.host
+                       AND s.canon = coalesce(r.canon, '')) AS canon_status
+              FROM agent_registry r WHERE r.name = %s
+            """.replace("__GOVERNED__", canon_governed_sql("r"))
+               .replace("__CLAIM_OK__", canon_claim_predicate_sql("r"))
+               .replace("__ADMITTED__", placement_admitted_sql("r")),
+            (name,))
+        return rows[0] if rows else None
+
+    def human_known(self, human) -> bool:
+        # L46 : un humain déjà résolu par un canon (responsable d'un agent ou
+        # d'un paquet : `canon sync` n'écrit que des responsables résolus)
+        rows = self.db.query(
+            "SELECT 1 AS ok WHERE EXISTS (SELECT 1 FROM agent_registry WHERE responsible = %s)"
+            " OR EXISTS (SELECT 1 FROM work_packages WHERE responsible = %s)",
+            (human, human))
+        return bool(rows)
 
     def set_pending_prompt(self, name, prompt) -> None:
         self.db.execute(
@@ -315,6 +451,8 @@ class Leases(interface.Leases):
                    updated_at       = now()
               FROM verrou
              WHERE r.name = verrou.name
+               -- L46 : même règle que `claimable` — jamais un agent `externe`.
+               AND r.mode = 'execute'
                AND (r.lease_owner IS NULL OR r.lease_owner = %s
                     OR r.lease_expires_at < clock_timestamp())
                AND (NOT r.ephemeral OR r.ephemeral_expires_at > clock_timestamp())
@@ -336,6 +474,10 @@ class Leases(interface.Leases):
         un tour vivant (`status = 'running'` + bail vivant) jamais. Mêmes
         règles que `claimable` ; verrou pris d'abord et échéances
         recontrôlées avec `clock_timestamp()`.
+
+        L46 : contrairement à `claimable` / `claim`, le mode n'est PAS filtré —
+        `attach` est une session humaine interactive, ce qu'est par nature un
+        agent `externe` ; l'exécuteur, lui, ne le réclamera jamais.
         """
         sql = """
             WITH verrou AS (
@@ -430,7 +572,8 @@ class Leases(interface.Leases):
     def reap(self, host) -> list[dict]:
         sql = """
             UPDATE agent_registry
-               SET status = 'dead', status_text = 'bail expiré', updated_at = now()
+               SET status = 'dead', status_text = 'bail expiré', stop_reason = 'bail_expire',
+                   updated_at = now()
              WHERE status = 'running' AND lease_expires_at < clock_timestamp()
         """
         params: tuple = ()

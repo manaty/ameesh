@@ -57,20 +57,25 @@ class Grants(interface.Grants):
             "SELECT grant_id FROM standing_reservations WHERE action_id = %s "
             "AND released_at IS NULL ORDER BY id", (action_id,))
 
-    def candidates(self, connector, operation, action_class, amount, currency) -> list[dict]:
+    def candidates(self, connector, operation, action_class, amount, currency,
+                   canon="") -> list[dict]:
         """Simple PRÉ-FILTRE, sans verrou : la décision (révocation, échéance
         à l'heure réelle après le dernier verrou, cumul) est refaite par
-        `reserve` pour chaque candidat."""
+        `reserve` pour chaque candidat. L44 (0031) : seuls les grants dont
+        l'authentificateur est déclaré par `canon` (celui de l'action)."""
         return self.db.query(
             """
-            SELECT id FROM standing_approvals
-             WHERE connector = %s AND operations @> jsonb_build_array(%s::text)
-               AND action_class = %s AND revoked_at IS NULL AND valid_until > clock_timestamp()
-               AND consumed_amount + %s::bigint <= max_amount
-               AND (%s::bigint = 0 OR currency = %s)
-             ORDER BY valid_until, id
+            SELECT s.id FROM standing_approvals s
+             WHERE s.connector = %s AND s.operations @> jsonb_build_array(%s::text)
+               AND s.action_class = %s AND s.revoked_at IS NULL
+               AND s.valid_until > clock_timestamp()
+               AND s.consumed_amount + %s::bigint <= s.max_amount
+               AND (%s::bigint = 0 OR s.currency = %s)
+               AND EXISTS (SELECT 1 FROM authenticators a
+                            WHERE a.id = s.authenticator_id AND a.canon = %s)
+             ORDER BY s.valid_until, s.id
             """,
-            (connector, operation, action_class, amount, amount, currency),
+            (connector, operation, action_class, amount, amount, currency, canon),
         )
 
     def revoke(self, grant_id, by) -> bool:

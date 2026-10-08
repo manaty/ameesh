@@ -22,17 +22,31 @@ def _caps_param(capabilities) -> str | None:
     return None if capabilities is None else json.dumps(list(capabilities))
 
 
+#: L42 (0031) : la ligne appartient-elle au canon (id, défaut) ? NULL = canon
+#: par défaut. Garde des écritures destructrices de `canon sync`.
+_OWNER_SQL = " AND (canon = %s OR (canon IS NULL AND %s))"
+
+
+def _owner(owner) -> tuple[str, tuple]:
+    """(clause, paramètres) de la garde de propriété ; owner None : aucune garde."""
+    if owner is None:
+        return "", ()
+    ident, default = owner
+    return _OWNER_SQL, (ident, bool(default))
+
+
 class Canon(interface.Canon):
 
     def record_state(self, host, status, *, root, source, commit, good,
-                     diagnostic) -> None:
+                     diagnostic, canon="", canon_id=None) -> None:
         self.db.query(
             """
             INSERT INTO canon_state AS s
-                (host, status, root, source, last_good_commit, last_good_at, diagnostic,
-                 checked_at)
-            VALUES (%s, %s, %s, %s, %s, CASE WHEN %s THEN now() END, %s, now())
-            ON CONFLICT (host) DO UPDATE SET
+                (host, canon, canon_id, status, root, source, last_good_commit, last_good_at,
+                 diagnostic, checked_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, CASE WHEN %s THEN now() END, %s, now())
+            ON CONFLICT (host, canon) DO UPDATE SET
+                canon_id         = coalesce(excluded.canon_id, s.canon_id),
                 status           = excluded.status,
                 root             = excluded.root,
                 source           = excluded.source,
@@ -46,36 +60,128 @@ class Canon(interface.Canon):
                 checked_at       = excluded.checked_at
             RETURNING host
             """,
-            (host, status, root, source, commit, good, diagnostic),
+            (host, canon or "", canon_id, status, root, source, commit, good, diagnostic),
         )
 
-    def state(self, host) -> dict | None:
+    _STATE_COLUMNS = """
+        host, canon, canon_id, status, root, source, last_good_commit, diagnostic,
+        extract(epoch from last_good_at)::float8 AS last_good_ts,
+        extract(epoch from checked_at)::float8   AS checked_ts,
+        auth_status, auth_diagnostic,
+        extract(epoch from auth_checked_at)::float8 AS auth_checked_ts
+    """
+
+    def state(self, host, canon="") -> dict | None:
         rows = self.db.query(
-            """
-            SELECT host, status, root, source, last_good_commit, diagnostic,
-                   extract(epoch from last_good_at)::float8 AS last_good_ts,
-                   extract(epoch from checked_at)::float8   AS checked_ts,
-                   auth_status, auth_diagnostic,
-                   extract(epoch from auth_checked_at)::float8 AS auth_checked_ts
-              FROM canon_state WHERE host = %s
-            """,
-            (host,),
+            "SELECT %s FROM canon_state WHERE host = %%s AND canon = %%s" % self._STATE_COLUMNS,
+            (host, canon or ""),
         )
         return rows[0] if rows else None
 
-    def record_auth_state(self, host, status, diagnostic) -> dict | None:
+    def states(self, host) -> list[dict]:
+        return self.db.query(
+            "SELECT %s FROM canon_state WHERE host = %%s ORDER BY canon" % self._STATE_COLUMNS,
+            (host,))
+
+    def key_for_root(self, host, root) -> str | None:
         rows = self.db.query(
-            "SELECT auth_status, auth_diagnostic FROM canon_state WHERE host = %s", (host,))
+            "SELECT canon FROM canon_state WHERE host = %s AND root = %s AND canon <> '' "
+            "ORDER BY checked_at DESC LIMIT 1", (host, root))
+        return rows[0]["canon"] if rows else None
+
+    def record_auth_state(self, host, status, diagnostic, canon="") -> dict | None:
+        rows = self.db.query(
+            "SELECT auth_status, auth_diagnostic FROM canon_state "
+            "WHERE host = %s AND canon = %s", (host, canon or ""))
         self.db.query(
             "UPDATE canon_state SET auth_status = %s, auth_diagnostic = %s, "
-            "auth_checked_at = now() WHERE host = %s RETURNING host",
-            (status, diagnostic, host))
+            "auth_checked_at = now() WHERE host = %s AND canon = %s RETURNING host",
+            (status, diagnostic, host, canon or ""))
         return rows[0] if rows else None
+
+    def close_others(self, host, keep, diagnostic) -> list[str]:
+        rows = self.db.query(
+            """
+            UPDATE canon_state SET status = 'invalid', diagnostic = %s, checked_at = now()
+             WHERE host = %s AND status = 'ok'
+               AND NOT (canon = ANY(ARRAY(SELECT jsonb_array_elements_text(%s::jsonb))))
+            RETURNING canon
+            """, (diagnostic, host, json.dumps(list(keep))))
+        return sorted(r["canon"] for r in rows)
+
+    def lock_default_state(self, host) -> dict | None:
+        rows = self.db.query(
+            "SELECT %s FROM canon_state WHERE host = %%s AND canon = '' FOR UPDATE"
+            % self._STATE_COLUMNS, (host,))
+        return rows[0] if rows else None
+
+    def set_default_id(self, host, canon_id) -> None:
+        self.db.execute(
+            "UPDATE canon_state SET canon_id = %s WHERE host = %s AND canon = ''",
+            (canon_id, host))
+
+    def flag_default(self, host, status, diagnostic) -> None:
+        self.db.execute(
+            "UPDATE canon_state SET status = %s, diagnostic = %s, checked_at = now() "
+            "WHERE host = %s AND canon = ''", (status, diagnostic, host))
+
+    def rebase_default(self, host, previous, new_default="") -> dict:
+        """Le canon par défaut de l'hôte a changé (L42) : les lignes sans canon
+        (NULL) de l'ancien canon par défaut `previous` reçoivent son
+        identifiant, et son état est recopié sous sa propre clé s'il n'y en a
+        pas. Rien n'est arrêté ni effacé.
+
+        L44 (0031) : le canon des actions (`actions.canon`, '' = canon par
+        défaut) suit de même — '' passe à `previous`, puis `new_default` (id
+        du nouveau canon par défaut) passe à '' : un reçu d'une action garde
+        les authentificateurs de son canon."""
+        # L46 (0036) : `actions.canon` est immuable sauf pendant CE rebase ; le
+        # réglage ne vaut que pour la transaction de l'appelant (SET LOCAL),
+        # que `adopt_default` ouvre.
+        self.db.execute("SET LOCAL ameesh.rebase_default = 'on'")
+        moved_actions = self.db.query(
+            "UPDATE actions SET canon = %s WHERE canon = '' RETURNING action_id", (previous,))
+        if new_default and new_default != previous:
+            self.db.query("UPDATE actions SET canon = '' WHERE canon = %s RETURNING action_id",
+                          (new_default,))
+        agents = self.db.query(
+            "UPDATE agent_registry SET canon = %s, updated_at = now() "
+            "WHERE canon IS NULL AND host = %s AND (canon_ref IS NOT NULL OR ephemeral) "
+            "RETURNING name", (previous, host))
+        packages = self.db.query(
+            "UPDATE work_packages SET canon = %s WHERE canon IS NULL RETURNING id",
+            (previous,))
+        adopted: list = []
+        if new_default and new_default != previous:
+            # L46 : les lignes du NOUVEAU canon par défaut repassent à NULL —
+            # ses éphémères surtout, que sa synchronisation ne réécrit pas
+            # (sinon elles resteraient sous une clé fermée par
+            # `close_unconfigured`, non réclamables).
+            adopted = self.db.query(
+                "UPDATE agent_registry SET canon = NULL, updated_at = now() "
+                "WHERE canon = %s AND host = %s RETURNING name", (new_default, host))
+            self.db.query("UPDATE work_packages SET canon = NULL WHERE canon = %s "
+                          "RETURNING id", (new_default,))
+        self.db.query(
+            """
+            INSERT INTO canon_state
+                (host, canon, canon_id, status, root, source, last_good_commit, last_good_at,
+                 diagnostic, checked_at, auth_status, auth_diagnostic, auth_checked_at)
+            SELECT host, %s::text, %s::text, status, root, source, last_good_commit, last_good_at,
+                   diagnostic, checked_at, auth_status, auth_diagnostic, auth_checked_at
+              FROM canon_state WHERE host = %s AND canon = ''
+            ON CONFLICT (host, canon) DO NOTHING
+            RETURNING host
+            """, (previous, previous, host))
+        return {"agents": sorted(r["name"] for r in agents),
+                "packages": sorted(r["id"] for r in packages),
+                "actions": len(moved_actions),
+                "adopted": sorted(r["name"] for r in adopted)}
 
     def host_rows(self, host, names) -> list[dict]:
         sql = """
             SELECT name, harness, host, cwd, model, budget_usd, responsible, team, provider,
-                   credential_mode, capabilities, canon_ref, ephemeral, priority,
+                   credential_mode, capabilities, canon_ref, canon, ephemeral, priority,
                    admitted_hosts, admitted_tags, memory_repository,
                    visibility_ok, visibility_diagnostic,
                    status, status_text,
@@ -105,9 +211,9 @@ class Canon(interface.Canon):
                  credential_mode, capabilities, canon_ref, ephemeral, ephemeral_expires_at,
                  priority, admitted_hosts, admitted_tags, memory_repository,
                  visibility_ok, visibility_diagnostic,
-                 placement_ok, placement_diagnostic, placement_ref, placement_profile)
+                 placement_ok, placement_diagnostic, placement_ref, placement_profile, canon)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, __CAPS__, %s, false, NULL,
-                    %s, __AHOSTS__, __ATAGS__, %s, %s, %s, %s, %s, %s, __PROFILE__)
+                    %s, __AHOSTS__, __ATAGS__, %s, %s, %s, %s, %s, %s, __PROFILE__, %s)
             ON CONFLICT (name) DO UPDATE SET
                 harness         = excluded.harness,
                 host            = excluded.host,
@@ -132,6 +238,7 @@ class Canon(interface.Canon):
                 placement_diagnostic = excluded.placement_diagnostic,
                 placement_ref   = excluded.placement_ref,
                 placement_profile = excluded.placement_profile,
+                canon           = excluded.canon,
                 updated_at      = now()
             RETURNING name
             """.replace("__CAPS__", _CAPS_SQL)
@@ -145,14 +252,15 @@ class Canon(interface.Canon):
              values.get("memory_repository"),
              values.get("visibility_ok"), values.get("visibility_diagnostic") or "",
              values["placement_ok"], values["placement_diagnostic"], values["placement_ref"])
-            + profile_params(values),
+            + profile_params(values) + (values.get("canon"),),
         )
 
-    def clear_responsible(self, name, host) -> None:
+    def clear_responsible(self, name, host, owner=None) -> None:
+        guard, params = _owner(owner)
         self.db.execute(
             "UPDATE agent_registry SET responsible = NULL, updated_at = now() "
-            "WHERE name = %s AND host = %s AND NOT ephemeral AND responsible IS NOT NULL",
-            (name, host))
+            "WHERE name = %s AND host = %s AND NOT ephemeral AND responsible IS NOT NULL"
+            + guard, (name, host) + params)
 
     def set_placement(self, name, host, *, ok, diagnostic, ref, profile) -> None:
         self.db.execute(
@@ -172,7 +280,7 @@ class Canon(interface.Canon):
     def lineage_rows(self) -> list[dict]:
         return self.db.query(
             """
-            SELECT name, created_by, ephemeral, canon_ref, host,
+            SELECT name, created_by, ephemeral, canon_ref, canon, host,
                    placement_ok, placement_diagnostic, placement_ref, placement_profile,
                    __PROFILE__ AS profile_now
               FROM agent_registry
@@ -257,7 +365,9 @@ class Canon(interface.Canon):
         )
         return rows[0] if rows else None
 
-    def stop_removed(self, name, host, *, pending_text, stop_text) -> dict | None:
+    def stop_removed(self, name, host, *, pending_text, stop_text,
+                     owner=None) -> dict | None:
+        guard, params = _owner(owner)
         stopped = self.db.query(
             """
             UPDATE agent_registry
@@ -265,12 +375,15 @@ class Canon(interface.Canon):
                                  THEN status ELSE 'stopped' END,
                    status_text = CASE WHEN status = 'running' AND lease_expires_at > now()
                                       THEN %s ELSE %s END,
+                   -- L37 (0030) : raison structurée (gardée par le
+                   -- déclencheur seulement si l'arrêt a lieu maintenant)
+                   stop_reason = 'retire_du_canon',
                    updated_at = now()
              WHERE name = %s AND host = %s AND status <> 'stopped'
-               AND NOT ephemeral AND canon_ref IS NOT NULL
+               AND NOT ephemeral AND canon_ref IS NOT NULL __OWNER__
             RETURNING name, status
-            """,
-            (pending_text, stop_text, name, host),
+            """.replace("__OWNER__", guard),
+            (pending_text, stop_text, name, host) + params,
         )
         return stopped[0] if stopped else None
 
@@ -298,7 +411,7 @@ class Ephemerals(interface.Ephemerals):
             INSERT INTO agent_registry
                 (name, chantier, harness, host, cwd, model, responsible, team, provider,
                  credential_mode, capabilities, ephemeral, ephemeral_expires_at, created_by,
-                 placement_ok, placement_diagnostic, placement_ref, placement_profile)
+                 placement_ok, placement_diagnostic, placement_ref, placement_profile, canon)
             SELECT %s, c.chantier, c.harness, c.host, coalesce(%s, c.cwd), c.model,
                    c.responsible, c.team, c.provider, c.credential_mode,
                    ARRAY(SELECT x FROM unnest(ARRAY['read', 'propose']::text[]) AS x
@@ -319,7 +432,9 @@ class Ephemerals(interface.Ephemerals):
                              || ' ; actuel : ' || __NOW__ || ') : placement non hérité, à '
                              || 'réévaluer par « ameesh canon sync »'
                         ELSE c.placement_diagnostic END,
-                   c.placement_ref, c.placement_profile
+                   c.placement_ref, c.placement_profile,
+                   -- L42 (0031) : l'éphémère appartient au canon de son créateur
+                   c.canon
               FROM agent_registry c
              WHERE c.name = %s
                AND coalesce(c.responsible, '') <> ''

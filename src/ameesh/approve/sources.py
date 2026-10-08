@@ -9,7 +9,8 @@ recalcule son empreinte (spec §7.1) et en rend son propre résumé. Une
     amount (entier en unités mineures ou None), currency (ou None),
     policy_version, class, state, et facultativement proposed_by,
     work_item, digest (empreinte stockée, recoupée avec le recalcul), dedupe
-    (guaranteed | none), replaces, replaced_by.
+    (guaranteed | none), replaces, replaced_by, canon (L44 : canon de l'action,
+    '' = canon par défaut ; absent = canon par défaut).
 
 `DbActionSource` lit la table `actions` du lot L5 (spec §7.1). Si elle n'existe
 pas (L5 non migré), ou s'il lui manque une colonne de l'empreinte, l'erreur le
@@ -96,6 +97,11 @@ def normalize_action(raw: dict) -> dict:
         value = raw.get(name)
         if value is not None:
             action[name] = str(value)
+    # L44 (0031) : le canon de l'action borne les authentificateurs admis
+    canon = raw.get("canon")
+    if canon is not None and not isinstance(canon, str):
+        raise ActionSourceError("action : canon doit être un texte")
+    action["canon"] = canon or ""
     try:
         action["computed_digest"] = receipts.action_digest(
             {name: action[name] for name in receipts.ACTION_DIGEST_FIELDS})
@@ -131,7 +137,7 @@ class DbActionSource:
     #: (deploy/sql/role-approve.sql) n'accorde que ces colonnes ; la lecture
     #: les nomme donc une à une (un `SELECT *` échouerait sous ce rôle).
     READ = REQUIRED + ("class", "action_class", "proposed_by", "work_item", "digest",
-                       "dedupe", "replaces", "replaced_by")
+                       "dedupe", "replaces", "replaced_by", "canon")
 
     def __init__(self, db, table: str = "actions", lock: threading.Lock | None = None):
         self.db = db

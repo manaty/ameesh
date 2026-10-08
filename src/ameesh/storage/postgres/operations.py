@@ -76,6 +76,7 @@ class Operations(interface.Operations):
             SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.effort, r.tier,
                    r.session_policy, r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
+                   r.mode, r.stop_reason, r.responsible,
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,
                    (r.lease_owner IS NOT NULL
                     AND r.lease_expires_at > clock_timestamp()) AS lease_live,
@@ -173,6 +174,87 @@ class Operations(interface.Operations):
                       extract(epoch from r.session_reset_at)::float8 AS session_reset_ts
             """,
             params,
+        )
+        return rows[0] if rows else None
+
+    # -- adoption et reprise (L39, 0030) --------------------------------------
+    def adopt(self, name, *, harness, host, cwd, session_id, session_account, prompt,
+              status_text) -> dict | None:
+        rows = self.db.query(
+            """
+            WITH verrou AS (
+                SELECT name, lease_owner, lease_expires_at, session_id, mode, harness
+                  FROM agent_registry WHERE name = %s FOR UPDATE
+            )
+            UPDATE agent_registry AS r
+               SET mode = 'execute',
+                   harness = %s,
+                   host = %s,
+                   cwd = coalesce(%s::text, r.cwd),
+                   session_id = %s,
+                   session_account = %s::text,
+                   session_work_item = NULL,
+                   session_reset_at = clock_timestamp(),
+                   pending_prompt = concat_ws(E'\\n\\n', %s::text,
+                                              r.current_prompt, r.pending_prompt),
+                   current_prompt = NULL,
+                   restart_brief = NULL,
+                   restart_requested_at = NULL,
+                   status = 'queued',
+                   status_text = %s::text,
+                   last_seen = now(),
+                   updated_at = now()
+              FROM verrou
+             WHERE r.name = verrou.name
+               AND (verrou.lease_owner IS NULL
+                    OR verrou.lease_expires_at IS NULL
+                    OR verrou.lease_expires_at <= clock_timestamp())
+            RETURNING r.name, verrou.session_id AS previous_session,
+                      verrou.mode AS previous_mode, verrou.harness AS previous_harness
+            """,
+            (name, harness, host, cwd, session_id, session_account, prompt, status_text),
+        )
+        return rows[0] if rows else None
+
+    def resume(self, name, *, prompt, forget, status_text) -> dict | None:
+        # paramètres positionnels : `oubli` (booléen) répété là où il sert
+        oubli = bool(forget)
+        rows = self.db.query(
+            """
+            WITH verrou AS (
+                SELECT name, status, session_id,
+                       (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL
+                        AND lease_expires_at > clock_timestamp()) AS live
+                  FROM agent_registry WHERE name = %s FOR UPDATE
+            ), p AS (SELECT %s::boolean AS oubli, %s::text AS consigne)
+            UPDATE agent_registry AS r
+               SET session_id = CASE WHEN p.oubli THEN NULL ELSE r.session_id END,
+                   session_work_item = CASE WHEN p.oubli THEN NULL
+                                            ELSE r.session_work_item END,
+                   session_reset_at = CASE WHEN p.oubli THEN clock_timestamp()
+                                           ELSE r.session_reset_at END,
+                   pending_prompt = CASE
+                       WHEN verrou.live THEN concat_ws(E'\\n\\n', r.pending_prompt,
+                                                       p.consigne)
+                       ELSE concat_ws(E'\\n\\n', p.consigne, r.current_prompt,
+                                      r.pending_prompt) END,
+                   current_prompt = CASE WHEN verrou.live THEN r.current_prompt
+                                         ELSE NULL END,
+                   restart_brief = CASE WHEN verrou.live THEN r.restart_brief ELSE NULL END,
+                   restart_requested_at = CASE WHEN verrou.live THEN r.restart_requested_at
+                                               ELSE NULL END,
+                   status = 'queued',
+                   status_text = %s::text,
+                   last_seen = now(),
+                   updated_at = now()
+              FROM verrou, p
+             WHERE r.name = verrou.name
+               AND (NOT verrou.live
+                    OR (NOT p.oubli AND verrou.status NOT IN ('running', 'stopped')))
+            RETURNING r.name, verrou.session_id AS previous_session,
+                      verrou.status AS previous_status, verrou.live
+            """,
+            (name, oubli, prompt, status_text),
         )
         return rows[0] if rows else None
 

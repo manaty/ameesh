@@ -50,7 +50,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    métier) :
 
    agents          upsert get overview claimable mark_event_wake set_session
-                   cwd_used set_status set_pending_prompt clear_model count
+                   set_session_account cwd_used set_status set_mode wake_check set_pending_prompt
+                   clear_model count
    leases          claim attach_claim state renew release turn_in_progress
                    reap clear_session take_pending_prompt begin_turn
                    restore_prompt end_turn
@@ -63,10 +64,12 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    keys            info register revoke registered
    approvals       create recent candidates consume
    nonces          state consume
-   work            add get items move note events milestones add_milestone
+   work            add get items move note assign events milestones add_milestone
                    delays timeline link_package by_package close_merged close
-                   refresh_package_parents
-   packages        all get upsert retire
+                   refresh_package_parents delegate current_delegation
+                   mark_delegate_turn due_delegations resolve_delegation
+                   overdue_delegations returned_delegations
+   packages       all get upsert retire
    actions         get recent attempts events log_event last_event_note
                    decision_queues covering_grants launched propose bind
                    launch settle replace cancel
@@ -77,8 +80,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    stop_removed
    ephemerals      creator create exists
    authenticators  lock_registry registry_lock_held under_registry_lock
-                   canon_refs last_sync journal_head append_sync registered
-                   for_approver active_holders update_meta revoke insert
+                   canon_refs last_sync journal_head append_sync rebase_default
+                   registered for_approver active_holders update_meta revoke insert
    threads         index indexed
    grants          register reserve release live_reservations candidates
                    revoke get
@@ -86,9 +89,10 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    progress        lots lot_events lot_milestones lot_actions actions agents costs
                    packages package_items lot_messages
    operations      set_settings set_session_work_item listing request_restart
-                   apply_restart message_lots assigned_open_lots
+                   apply_restart adopt resume message_lots assigned_open_lots
                    open_lots_activity turns record_gauges gauge_history
                    record_balance balances
+   session_bindings active bind set_pid revoke listing with_pids
 
 3. Atomicité et verrous. Postgres tient les garanties par des écritures
    conditionnelles en une instruction (`UPDATE … WHERE`, `INSERT … ON
@@ -160,8 +164,25 @@ class Agents(Domain):
     def upsert(self, name: str, *, chantier: str | None, harness: str | None,
                host: str | None, cwd: str | None, session_id: str | None,
                status: str | None, status_text: str | None, model: str | None,
-               budget_usd: float | None) -> dict:
-        """Crée l'agent ou met à jour les champs fournis ; rend la ligne."""
+               budget_usd: float | None, mode: str | None = None) -> dict:
+        """Crée l'agent ou met à jour les champs fournis ; rend la ligne.
+
+        `mode` (L37, 0030) n'est écrit qu'à la création (défaut `execute`)."""
+
+    @abc.abstractmethod
+    def human_known(self, human: str) -> bool:
+        """L46 : `human:<id>` est-il déjà résolu en base (responsable d'un
+        agent ou d'un paquet du canon) ?"""
+
+    @abc.abstractmethod
+    def upsert_unleased(self, name: str, *, chantier: str | None, harness: str | None,
+                        host: str | None, cwd: str | None,
+                        session_id: str | None) -> dict:
+        """L46 : inscription par un hook SANS bail, en une instruction.
+
+        Ligne neuve : agent `externe`. Ligne d'un agent `execute` : seul
+        `last_seen` avance. Ligne `externe` : hôte/harnais/chantier suivis ;
+        session et dossier écrits seulement s'il n'y en avait pas."""
 
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
@@ -181,8 +202,14 @@ class Agents(Domain):
         """Note l'instant du dernier réveil d'événements."""
 
     @abc.abstractmethod
-    def set_session(self, name: str, session_id: str) -> None:
-        """Enregistre la session du harnais."""
+    def set_session(self, name: str, session_id: str, account: str | None = None) -> None:
+        """Enregistre la session du harnais et le compte sous lequel elle tourne
+        (`session_account`, L39 ; None : compte inconnu ou aucun compte déclaré)."""
+
+    @abc.abstractmethod
+    def set_session_account(self, name: str, account: str | None) -> bool:
+        """Change le compte de la session courante (reprise portable sous un
+        autre compte, L39) ; faux si l'agent est inconnu ou sans session."""
 
     @abc.abstractmethod
     def cwd_used(self, cwd: str, exclude: str) -> bool:
@@ -190,8 +217,21 @@ class Agents(Domain):
 
     @abc.abstractmethod
     def set_status(self, name: str, status: str, status_text: str | None,
-                   error: str | None) -> None:
-        """Pose le statut (et l'erreur) de l'agent."""
+                   error: str | None, stop_reason: str | None = None) -> None:
+        """Pose le statut (et l'erreur) de l'agent ; `stop_reason` (L37) n'est
+        gardé que pour `stopped` / `dead`."""
+
+    @abc.abstractmethod
+    def set_mode(self, name: str, mode: str) -> bool:
+        """Pose le mode (`execute` | `externe`, L37) ; faux si l'agent est inconnu."""
+
+    @abc.abstractmethod
+    def wake_check(self, name: str) -> dict | None:
+        """Ce qui dit si l'agent est réveillable (L37) : `mode`, `status`,
+        `responsible`, `alive` (éphémère non échu), `canon_claim_ok` (condition
+        de réclamation du canon), `placement_admitted` (L46 : admission seule,
+        sans l'état du canon), `canon_status`, `placement_diagnostic` ; None si
+        inconnu."""
 
     @abc.abstractmethod
     def set_pending_prompt(self, name: str, prompt: str | None) -> None:
@@ -668,6 +708,54 @@ class WorkItems(Domain):
         """Journalise une note et rafraîchit `updated_at`."""
 
     @abc.abstractmethod
+    def assign(self, item_id: int, assignee: str, *, current: str | None, note: str,
+               actor: str) -> dict | None:
+        """Réassigne le lot (L37) s'il a encore l'assigné `current` et n'est ni
+        fusionné ni fermé, et journalise, en UNE transaction ; None sinon.
+        L40 : efface la délégation en cours (issue `annulee`)."""
+
+    # -- délégation à échéance (L40, décision 0030 point 5) -------------------
+    @abc.abstractmethod
+    def delegate(self, item_id: int, delegate: str, *, current: str | None,
+                 delegated_by: str, within_s: float, note: str, actor: str) -> dict | None:
+        """Délègue le lot (assigné encore `current`, lot ouvert) en UNE
+        transaction : délégation en cours remplacée, lot au délégué avec
+        délégant, début et échéance (`now + within_s`), ligne au registre des
+        délégations, journal. Rend `{item, delegation, replaced}` ; None si
+        le lot a bougé."""
+
+    @abc.abstractmethod
+    def current_delegation(self, item_id: int) -> dict | None:
+        """La délégation en cours du lot (registre), avec `worked` (preuve de
+        travail du délégué depuis son début), ou None."""
+
+    @abc.abstractmethod
+    def mark_delegate_turn(self, agent: str, item_ids, note: str) -> list[int]:
+        """Premier tour de `agent` sur ces lots qui lui sont délégués : noté
+        une fois au registre (`first_turn_at`) et au journal (acteur : le
+        délégué). Rend les lots marqués."""
+
+    @abc.abstractmethod
+    def due_delegations(self, now_ts: float) -> list[dict]:
+        """Délégations en cours échues à `now_ts`, avec le lot et `worked`."""
+
+    @abc.abstractmethod
+    def resolve_delegation(self, delegation_id: int, *, now_ts: float, actor: str,
+                           describe) -> dict | None:
+        """Traite une délégation échue en UNE transaction, sous le verrou de la
+        ligne du lot (recontrôle après verrou) : `annulee` (lot fermé ou
+        assigné changé), `soldee` (travail du délégué) ou `rendue` (retour au
+        délégant). None si déjà traitée : un seul gagnant entre exécuteurs."""
+
+    @abc.abstractmethod
+    def overdue_delegations(self, now_ts: float) -> list[dict]:
+        """Délégations en cours échues, non traitées, sur des lots ouverts."""
+
+    @abc.abstractmethod
+    def returned_delegations(self, since_ts: float) -> list[dict]:
+        """Délégations rendues au délégant depuis `since_ts`."""
+
+    @abc.abstractmethod
     def events(self, item_id: int, limit: int) -> list[dict]:
         """Journal du lot, du plus récent au plus ancien."""
 
@@ -742,7 +830,7 @@ class WorkPackages(Domain):
     def all(self, *, include_absent: bool = False) -> list[dict]:
         """Les fiches (présentes au canon seulement, sauf `include_absent`), par id :
         id, kind, title, parent, responsible, team, scope (liste ou None),
-        status, canon_ref, present, synced_ts."""
+        status, canon_ref, canon (L42 ; NULL = canon par défaut), present, synced_ts."""
 
     @abc.abstractmethod
     def get(self, ident: str) -> dict | None:
@@ -802,9 +890,11 @@ class Actions(Domain):
 
     @abc.abstractmethod
     def covering_grants(self, action_id: str, amount: int, connector: str, operation: str,
-                        action_class: str, currency: str | None) -> list[dict]:
+                        action_class: str, currency: str | None,
+                        canon: str = "") -> list[dict]:
         """Grants vivants qui couvrent l'action (pré-filtre sans verrou), avec
-        `live` : une réservation vivante de l'action existe déjà."""
+        `live` : une réservation vivante de l'action existe déjà. L44 : seuls
+        ceux dont l'authentificateur est déclaré par `canon`."""
 
     @abc.abstractmethod
     def launched(self, *, action_id: str | None, grace: float, force: bool) -> list[dict]:
@@ -875,17 +965,58 @@ class Canon(Domain):
 
     @abc.abstractmethod
     def record_state(self, host: str, status: str, *, root: str, source: str,
-                     commit: str | None, good: bool, diagnostic: str) -> None:
-        """Écrit l'état du canon de l'hôte ; le dernier commit valide ne suit que `good`."""
+                     commit: str | None, good: bool, diagnostic: str,
+                     canon: str = "", canon_id: str | None = None) -> None:
+        """Écrit l'état du canon de l'hôte ; le dernier commit valide ne suit que
+        `good`. L42 (0031) : clé (host, canon), '' = canon par défaut ;
+        `canon_id` : identifiant réel du canon (gardé s'il n'est pas fourni)."""
 
     @abc.abstractmethod
-    def state(self, host: str) -> dict | None:
-        """Dernier état enregistré du canon de l'hôte, ou None."""
+    def state(self, host: str, canon: str = "") -> dict | None:
+        """Dernier état enregistré du canon `canon` ('' : par défaut) de l'hôte, ou None."""
 
     @abc.abstractmethod
-    def record_auth_state(self, host: str, status: str, diagnostic: str) -> dict | None:
+    def states(self, host: str) -> list[dict]:
+        """Tous les états enregistrés pour l'hôte, un par canon (L42)."""
+
+    @abc.abstractmethod
+    def key_for_root(self, host: str, root: str) -> str | None:
+        """Clé (non vide) d'un canon non par défaut déjà enregistré pour l'hôte
+        avec cette racine, ou None (L42 : identité d'un canon illisible)."""
+
+    @abc.abstractmethod
+    def record_auth_state(self, host: str, status: str, diagnostic: str,
+                          canon: str = "") -> dict | None:
         """Inscrit l'issue de la synchronisation des authentificateurs ; rend
         l'issue précédente (`auth_status`, `auth_diagnostic`), ou None."""
+
+    @abc.abstractmethod
+    def close_others(self, host: str, keep: Sequence[str], diagnostic: str) -> list[str]:
+        """Passe `invalid` les états `ok` de l'hôte dont la clé n'est pas dans
+        `keep` (canons retirés de la configuration, L42) ; rend leurs clés."""
+
+    @abc.abstractmethod
+    def lock_default_state(self, host: str) -> dict | None:
+        """L46 : la ligne '' (canon par défaut) de l'hôte, lue `FOR UPDATE`
+        (dans la transaction de l'appelant), ou None."""
+
+    @abc.abstractmethod
+    def set_default_id(self, host: str, canon_id: str) -> None:
+        """L46 : inscrit l'identifiant du canon par défaut sur la ligne '' de
+        l'hôte (dans la transaction du rebase)."""
+
+    @abc.abstractmethod
+    def flag_default(self, host: str, status: str, diagnostic: str) -> None:
+        """L46 : statut et diagnostic de la ligne '' seulement (ni racine, ni
+        source, ni identifiant)."""
+
+    @abc.abstractmethod
+    def rebase_default(self, host: str, previous: str, new_default: str = "") -> dict:
+        """Changement de canon par défaut (L42) : les lignes sans canon de
+        l'hôte (et les paquets sans canon) reçoivent l'identifiant `previous`.
+        L44 : les actions aussi ('' → `previous`, puis `new_default` → '').
+        L46 : les lignes (agents, éphémères compris, et paquets) du nouveau
+        canon par défaut `new_default` repassent à NULL."""
 
     @abc.abstractmethod
     def host_rows(self, host: str, names: Sequence[str]) -> list[dict]:
@@ -898,8 +1029,10 @@ class Canon(Domain):
         évalué des valeurs écrites, dans la même instruction."""
 
     @abc.abstractmethod
-    def clear_responsible(self, name: str, host: str) -> None:
-        """Vide le responsable d'un agent non éphémère de l'hôte."""
+    def clear_responsible(self, name: str, host: str,
+                          owner: tuple[str, bool] | None = None) -> None:
+        """Vide le responsable d'un agent non éphémère de l'hôte ; `owner`
+        (L42) : (id, défaut) du canon auquel la ligne doit appartenir."""
 
     @abc.abstractmethod
     def set_placement(self, name: str, host: str, *, ok: bool | None, diagnostic: str,
@@ -943,9 +1076,11 @@ class Canon(Domain):
 
     @abc.abstractmethod
     def stop_removed(self, name: str, host: str, *, pending_text: str,
-                     stop_text: str) -> dict | None:
+                     stop_text: str, owner: tuple[str, bool] | None = None) -> dict | None:
         """Arrête un agent retiré du canon (sauf en plein tour : arrêt demandé) ;
-        rend name et status, ou None s'il n'y avait rien à faire."""
+        rend name et status, ou None s'il n'y avait rien à faire. `owner` (L42) :
+        (id, défaut) du canon auquel la ligne doit appartenir — jamais celle
+        d'un autre canon."""
 
 
 class Ephemerals(Domain):
@@ -996,7 +1131,10 @@ class RegistryLock:
 
 class Authenticators(Domain):
     """Registre de confiance des authentificateurs (`authenticators`), son
-    verrou et le journal des synchronisations (`authenticator_syncs`)."""
+    verrou et le journal des synchronisations (`authenticator_syncs`).
+
+    L44 (0031) : registre et journal PAR CANON (`canon` : '' = canon par
+    défaut, l'identifiant du canon sinon) ; le verrou reste unique."""
 
     @abc.abstractmethod
     def lock_registry(self) -> RegistryLock:
@@ -1014,35 +1152,42 @@ class Authenticators(Domain):
         COMMIT ; toute exception annule la transaction entière."""
 
     @abc.abstractmethod
-    def canon_refs(self, revocations: Sequence[str]) -> list[dict]:
-        """`canon_ref` distincts des lignes actives ou révoquées par sync."""
+    def canon_refs(self, revocations: Sequence[str], canon: str = "") -> list[dict]:
+        """`canon_ref` distincts des lignes du canon, actives ou révoquées par sync."""
 
     @abc.abstractmethod
-    def last_sync(self) -> dict | None:
-        """Dernière synchronisation appliquée (journal), ou None."""
+    def last_sync(self, canon: str = "") -> dict | None:
+        """Dernière synchronisation appliquée du canon (son journal), ou None."""
 
     @abc.abstractmethod
-    def journal_head(self) -> int | None:
-        """Id de la dernière ligne du journal, ou None s'il est vide."""
+    def journal_head(self, canon: str = "") -> int | None:
+        """Id de la dernière ligne du journal du canon, ou None s'il est vide."""
 
     @abc.abstractmethod
     def append_sync(self, *, root_member: str, root_commit: str, commits_json: str,
                     branch: str, trust: str, host: str, summary_json: str,
-                    expected: int | None) -> bool:
-        """Journalise une synchronisation SI la dernière ligne est encore
-        `expected` (sinon rien, faux)."""
+                    expected: int | None, canon: str = "") -> bool:
+        """Journalise une synchronisation du canon SI la dernière ligne de son
+        journal est encore `expected` (sinon rien, faux)."""
 
     @abc.abstractmethod
-    def registered(self, *, approver: str | None, include_revoked: bool) -> list[dict]:
-        """Authentificateurs (actifs seulement, sauf `include_revoked`)."""
+    def rebase_default(self, previous: str, new_default: str) -> dict:
+        """Changement de canon par défaut : '' → `previous`, puis
+        `new_default` → '' (registre et journal), sous le verrou du registre."""
+
+    @abc.abstractmethod
+    def registered(self, *, approver: str | None, include_revoked: bool,
+                   canon: str | None = None) -> list[dict]:
+        """Authentificateurs (actifs seulement, sauf `include_revoked`) ; d'un
+        seul canon si `canon` n'est pas None."""
 
     @abc.abstractmethod
     def for_approver(self, approver: str) -> list[dict]:
         """Tous les authentificateurs de l'approbateur, révoqués compris."""
 
     @abc.abstractmethod
-    def active_holders(self, facade: str, credential_id: str) -> list[dict]:
-        """Approbateurs qui détiennent ce credential actif."""
+    def active_holders(self, facade: str, credential_id: str, canon: str = "") -> list[dict]:
+        """Approbateurs qui détiennent ce credential actif dans ce canon."""
 
     @abc.abstractmethod
     def update_meta(self, authenticator_id: int, *, level: str, aaguid: str | None,
@@ -1092,8 +1237,9 @@ class Grants(Domain):
 
     @abc.abstractmethod
     def candidates(self, connector: str, operation: str, action_class: str, amount: int,
-                   currency: str | None) -> list[dict]:
-        """Grants qui pourraient couvrir l'action (pré-filtre sans verrou)."""
+                   currency: str | None, canon: str = "") -> list[dict]:
+        """Grants qui pourraient couvrir l'action (pré-filtre sans verrou) ;
+        L44 : seuls ceux dont l'authentificateur est déclaré par `canon`."""
 
     @abc.abstractmethod
     def revoke(self, grant_id: int, by: str) -> bool:
@@ -1269,6 +1415,34 @@ class Operations(Domain):
         par ce bail. Rend la ligne (`brief`, `session_id` oubliée), ou None."""
 
     @abc.abstractmethod
+    def adopt(self, name: str, *, harness: str, host: str, cwd: str | None,
+              session_id: str, session_account: str | None, prompt: str,
+              status_text: str) -> dict | None:
+        """`ameesh adopt` (L39, 0030) en UNE instruction, seulement si aucun
+        bail n'est vivant (verrou d'abord, échéance recontrôlée à l'heure
+        réelle) : mode `execute`, harnais, hôte, dossier (s'il est donné),
+        session et son compte d'origine, lot de session oublié,
+        `session_reset_at` posé, consigne en attente = `prompt` EN TÊTE puis
+        la consigne courante d'un tour inachevé puis l'ancienne attente,
+        `current_prompt` effacé, demande de redémarrage effacée, statut
+        `queued`. Rend `{name, previous_session, previous_mode,
+        previous_harness}`, ou None (bail vivant, agent inconnu)."""
+
+    @abc.abstractmethod
+    def resume(self, name: str, *, prompt: str, forget: bool,
+               status_text: str) -> dict | None:
+        """`ameesh resume` (L39, 0030) en UNE instruction (verrou d'abord).
+
+        Sans bail vivant : `forget` oublie la session (et son compte, son lot,
+        `session_reset_at` posé) ; consigne en attente = `prompt` EN TÊTE puis
+        la consigne courante d'un tour inachevé puis l'ancienne attente ;
+        demande de redémarrage effacée ; statut `queued`. Avec un bail vivant
+        (agent au repos sous un exécuteur) : seulement sans `forget`, ni tour
+        en cours ni arrêt, et la consigne est ajoutée APRÈS l'attente (le tour
+        de l'exécuteur n'est pas touché). Rend `{name, previous_session,
+        previous_status, live}`, ou None (refus : réessayer)."""
+
+    @abc.abstractmethod
     def message_lots(self, ids: Sequence[int]) -> list[str]:
         """Lots (`work_item_id`, non vides, distincts) de ces messages."""
 
@@ -1420,6 +1594,48 @@ class Visibility(Domain):
 
 
 # --------------------------------------------------------------------------
+# liaisons de session (L41, décision 0030, migration 0034)
+# --------------------------------------------------------------------------
+
+class SessionBindings(Domain):
+    """Liaison explicite (hôte, harnais, identifiant de session) → agent.
+
+    Au plus UNE liaison active par (hôte, harnais, session) ; une liaison
+    n'est jamais effacée : la révoquer pose `revoked_at`."""
+
+    @abc.abstractmethod
+    def active(self, host: str, harness: str, session_id: str) -> dict | None:
+        """La liaison active de cette session sur cet hôte, ou None."""
+
+    @abc.abstractmethod
+    def bind(self, *, host: str, harness: str, session_id: str, agent: str,
+             pid: int | None, created_by: str,
+             pid_start: int | None = None) -> dict | None:
+        """Crée la liaison si la session n'en a pas d'active ; rend la ligne
+        créée, ou None si une liaison active existe déjà (rien n'est écrit).
+        L46 : `pid_start`, heure de démarrage du PID (NULL : non contrôlée)."""
+
+    @abc.abstractmethod
+    def set_pid(self, binding_id: int, pid: int | None,
+                pid_start: int | None = None) -> dict | None:
+        """Change le PID ancêtre exigé (et son heure de démarrage, L46) d'une
+        liaison ACTIVE ; None sinon."""
+
+    @abc.abstractmethod
+    def revoke(self, host: str, harness: str, session_id: str) -> dict | None:
+        """Révoque la liaison active de cette session ; rend la ligne, ou None."""
+
+    @abc.abstractmethod
+    def listing(self, *, host: str | None = None, agent: str | None = None,
+                include_revoked: bool = False) -> list[dict]:
+        """Les liaisons (actives seulement par défaut), récentes d'abord."""
+
+    @abc.abstractmethod
+    def with_pids(self, host: str, pids: Sequence[int]) -> list[dict]:
+        """Les liaisons actives de cet hôte dont le PID est dans `pids`."""
+
+
+# --------------------------------------------------------------------------
 # le stockage d'une connexion
 # --------------------------------------------------------------------------
 
@@ -1458,3 +1674,4 @@ class Storage(abc.ABC):
     hosts: HostResources
     turn_resources: TurnResources
     visibility: Visibility
+    session_bindings: SessionBindings

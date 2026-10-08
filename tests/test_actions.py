@@ -1564,7 +1564,7 @@ class ActionsCliTest(ActionsBase):
         self.assertEqual(self.execute(lost)["state"], "unknown")
         mine = work.add(self.db, title="choisir le transporteur", assignee=ALICE)
         work.move(self.db, mine["id"], "waiting_human")
-        theirs = work.add(self.db, title="valider la maquette", assignee="carol")
+        theirs = work.add(self.db, title="valider la maquette", assignee="human:carol")
         work.move(self.db, theirs["id"], "waiting_human")
 
         queue = json.loads(self.run_cli("decisions", "--json").stdout)

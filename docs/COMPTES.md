@@ -116,3 +116,13 @@ de l'exécuteur et dans le fil de l'équipe de l'agent qui l'a déclenchée. Une
 session reprise sous l'autre compte, ou tournée avec résumé, est dite dans le
 fil. Tous les comptes au seuil : l'agent passe en pause (`blocked`, « tous
 les comptes … au seuil »), comme avant L30.
+
+Le compte d'origine de la session courante est enregistré
+(`agent_registry.session_account`, L39) : l'exécuteur l'écrit avec l'id de
+session, `ameesh adopt` l'écrit pour une session interactive adoptée (compte
+sous lequel son fichier a été trouvé), et il s'efface avec la session. Le
+marqueur du flux `events.jsonl` ne sert plus que de repli pour les sessions
+antérieures. Quand ce compte est inutilisable (identifiants retirés, forfait
+saturé) et que la session n'est pas portable, la rotation ne peut pas résumer
+sous l'ancien compte : la session neuve s'ouvre sur un **brief de reprise
+déterministe** (voir `ameesh resume` dans [EXPLOITATION.md](EXPLOITATION.md)).

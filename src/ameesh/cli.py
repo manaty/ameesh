@@ -8,7 +8,16 @@
                                                  ou du lot (ameesh fil show <projet> [<lot>])
   agent-mail list                                agents, hôte, bail, non lus
   agent-mail inbox [NOM]                         messages non lus de NOM (sans les marquer lus)
-  agent-mail whoami                              identité liée ; --cwd = diagnostic
+  agent-mail whoami [--session ID --harness H]   identité liée et sa source (runner, explicit,
+                                                 session) ; --cwd DOSSIER = diagnostic
+  agent-mail bind <NOM> --session ID --harness claude|codex|deepseek [--pid N] [--force]
+                                                 lie une session EXTERNE (identifiant de session
+                                                 du harnais) à NOM, sur cet hôte (L41, 0030) ;
+                                                 agent `execute` refusé sans --force (L46)
+  agent-mail bind --import FICHIER               importe les liaisons du pont local
+                                                 (external-session-bindings.json)
+  agent-mail unbind --session ID --harness H     révoque la liaison de cette session
+  agent-mail bindings [--all] [--json]           liaisons de session actives (--all : révoquées aussi)
   agent-mail alias <NOM> <DOSSIER> [CHANTIER]    nomme les sessions dont le dossier commence par DOSSIER
   agent-mail status "<travail en cours>"         état de l'agent (registre + titre du terminal)
   agent-mail hook <claude|codex|deepseek>        hook : lit le JSON sur stdin, livre les non-lus
@@ -20,6 +29,14 @@
 Identité d'une session : $AGENT_MAIL_NAME (le runner la pose pour le harnais
 qu'il lance). Si $AMEESH_RUNNER_ID et $AMEESH_LEASE_EPOCH sont aussi posées, le
 bail doit être vivant et détenu par ce runner — l'identité est liée au bail.
+Sans $AGENT_MAIL_NAME, une session EXTERNE (lancée par un humain) n'a une
+identité que si elle est LIÉE (`bind`, source « session ») : le hook la
+retrouve par l'identifiant de session que le harnais lui passe et, si la
+liaison porte un --pid, exige que ce PID soit un ancêtre du hook ; une commande
+lancée dans la session (whoami, send, inbox) la retrouve par son ascendance.
+Sans identité, le hook ne remet RIEN et n'écrit rien. Une session liée ne
+remplace jamais la session enregistrée d'un agent, et un agent qui détient un
+bail vivant ne se lie pas (il est mené par l'exécuteur).
 Le dossier courant ne donne JAMAIS d'identité : lire dans le worktree d'un
 autre agent ne consomme pas son courrier. Les anciens noms AGENT_MESH_* restent
 acceptés en alias.
@@ -42,6 +59,7 @@ from . import backend as backend_mod
 from . import config as config_mod
 from . import db as db_mod
 from . import fil, identity, mail, migrations, signing, storage
+from . import session_bindings as sb
 from .config import NAME_RE, Config
 
 MAX_STOP_BLOCKS = 3
@@ -464,7 +482,12 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         bk = backend_mod.FileBackend(cfg)
     # L'identité vient de l'environnement (le runner la pose), jamais du dossier :
     # lire la doc d'un autre agent dans son worktree ne consomme plus son courrier.
-    binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
+    # L41 (0030) : sans AGENT_MAIL_NAME, seule la liaison explicite de CETTE
+    # session (hôte, harnais, identifiant reçu en JSON ; PID ancêtre s'il est
+    # lié) donne une identité. Sans liaison : rien n'est remis, rien n'est écrit.
+    binding = identity.resolve_binding(
+        cfg, bk.db if bk.kind == "pg" else None,
+        harness=tool, session_id=str(data.get("session_id") or ""))
     if not binding.ok:
         if binding.name:
             # Identité annoncée mais bail invalide : on le dit sur stderr, et
@@ -474,7 +497,18 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         return 0
     name = binding.name
     try:
-        bk.register(name, tool, data.get("cwd"), data.get("session_id"))
+        bk.register(name, tool, data.get("cwd"), data.get("session_id"),
+                    leased=binding.bound_to_lease)
+        if binding.source == "explicit" and bk.kind == "pg":
+            # L46 : AGENT_MAIL_NAME sans bail (pont local, shell qui en a
+            # hérité) ne prend jamais le courrier d'un agent mené par
+            # l'exécuteur (bail vivant). La réservation le refuse aussi, sous
+            # verrou ; ce contrôle-ci le dit.
+            holder = sb.lease_holder(bk.db, name)
+            if holder:
+                print("agent-mail : %s est mené par l'exécuteur (bail vivant de %s) — "
+                      "courrier laissé en place" % (name, holder), file=sys.stderr)
+                return 0
         set_title(cfg, bk, name)
         if event not in ("Stop", "SessionStart", "UserPromptSubmit", "PostToolUse"):
             return 0
@@ -513,6 +547,187 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             remise.abandonner()
     except Exception:
         return 0
+    return 0
+
+
+# --------------------------------------------------------------------------
+# liaisons de session (L41, décision 0030)
+# --------------------------------------------------------------------------
+
+def _options(rest: list[str], valued: tuple[str, ...], flags: tuple[str, ...] = (),
+             ) -> tuple[dict, list[str]]:
+    """Analyse minimale `--opt VALEUR` / `--drapeau` ; lève ValueError si incomplet."""
+    opts: dict = {}
+    positional: list[str] = []
+    index = 0
+    while index < len(rest):
+        arg = rest[index]
+        if arg in valued:
+            if index + 1 >= len(rest):
+                raise ValueError("%s attend une valeur" % arg)
+            opts[arg] = rest[index + 1]
+            index += 2
+            continue
+        if arg in flags:
+            opts[arg] = True
+        elif arg.startswith("--"):
+            raise ValueError("option inconnue : %s" % arg)
+        else:
+            positional.append(arg)
+        index += 1
+    return opts, positional
+
+
+def _actor() -> str:
+    """Qui lie ou délie : l'agent nommé par l'environnement, sinon l'humain local."""
+    name = os.environ.get("AGENT_MAIL_NAME") or ""
+    if name and NAME_RE.match(name):
+        return name
+    import getpass
+    return "human:%s" % (os.environ.get("USER") or getpass.getuser())
+
+
+_BIND_USAGE = ("usage: agent-mail bind <agent> --session ID --harness claude|codex|deepseek "
+               "[--pid N] [--force]\n       agent-mail bind --import FICHIER")
+
+
+def cmd_bind(bk, cfg: Config, rest: list[str]) -> int:
+    """L41 (0030) : lie une session externe à un agent, ou importe le pont local."""
+    try:
+        opts, positional = _options(rest, ("--session", "--harness", "--pid", "--import"),
+                                    ("--force",))
+    except ValueError as exc:
+        print("%s\n%s" % (exc, _BIND_USAGE), file=sys.stderr)
+        return 2
+    by = _actor()
+    if "--import" in opts:
+        if positional or any(k in opts for k in ("--session", "--harness", "--pid",
+                                                  "--force")):
+            print("--import s'utilise seul\n" + _BIND_USAGE, file=sys.stderr)
+            return 2
+        try:
+            report = sb.import_file(cfg, bk.db, opts["--import"], by=by)
+        except (OSError, ValueError) as exc:
+            print("import impossible : %s" % exc, file=sys.stderr)
+            return 1
+        print("liaisons importées : %d ; ignorées : %d" % (
+            len(report.imported), len(report.skipped)))
+        for session_id, agent, detail in report.imported:
+            print("  importée : %s → %s (%s)" % (session_id, agent, detail))
+        for session_id, reason in report.skipped:
+            print("  ignorée  : %s — %s" % (session_id, reason))
+        return 0
+    if len(positional) != 1 or "--session" not in opts or "--harness" not in opts:
+        print(_BIND_USAGE, file=sys.stderr)
+        return 2
+    try:
+        result = sb.bind(cfg, bk.db, positional[0], session_id=opts["--session"],
+                         harness=opts["--harness"], pid=opts.get("--pid"), by=by,
+                         force=bool(opts.get("--force")))
+    except sb.BindError as exc:
+        print("liaison refusée : %s" % exc, file=sys.stderr)
+        return 1
+    row = result.row
+    verbe = {"created": "liée", "updated": "re-liée (pid mis à jour)",
+             "unchanged": "déjà liée"}[result.status]
+    print("session %s %s %s à %s sur %s (pid %s)" % (
+        row.get("harness"), row.get("session_id"), verbe, row.get("agent"),
+        row.get("host"), row.get("pid") or "non contrôlé"))
+    for warning in result.warnings:
+        print("attention : %s" % warning, file=sys.stderr)
+    return 0
+
+
+def cmd_unbind(bk, cfg: Config, rest: list[str]) -> int:
+    usage = "usage: agent-mail unbind --session ID --harness claude|codex|deepseek"
+    try:
+        opts, positional = _options(rest, ("--session", "--harness"))
+    except ValueError as exc:
+        print("%s\n%s" % (exc, usage), file=sys.stderr)
+        return 2
+    if positional or "--session" not in opts or "--harness" not in opts:
+        print(usage, file=sys.stderr)
+        return 2
+    try:
+        row = sb.unbind(cfg, bk.db, session_id=opts["--session"],
+                        harness=opts["--harness"], by=_actor())
+    except sb.BindError as exc:
+        print("%s" % exc, file=sys.stderr)
+        return 2
+    if row is None:
+        print("aucune liaison active pour la session %s %s sur %s"
+              % (opts["--harness"], opts["--session"], cfg.host), file=sys.stderr)
+        return 1
+    print("liaison révoquée : session %s %s (était %s)" % (
+        row.get("harness"), row.get("session_id"), row.get("agent")))
+    return 0
+
+
+def cmd_bindings(bk, rest: list[str]) -> int:
+    usage = "usage: agent-mail bindings [--all] [--json]"
+    try:
+        opts, positional = _options(rest, (), ("--json", "--all"))
+    except ValueError as exc:
+        print("%s\n%s" % (exc, usage), file=sys.stderr)
+        return 2
+    if positional:
+        print(usage, file=sys.stderr)
+        return 2
+    rows = sb.listing(bk.db, include_revoked=bool(opts.get("--all")))
+    if opts.get("--json"):
+        print(json.dumps(rows, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("aucune liaison de session")
+        return 0
+    print("%-20s %-8s %-38s %-8s %-12s %-16s %s" % (
+        "AGENT", "HARNAIS", "SESSION", "PID", "HÔTE", "LIÉE LE", "PAR"))
+    for row in rows:
+        quand = time.strftime("%Y-%m-%d %H:%M", time.localtime(row.get("created_ts") or 0))
+        etat = ""
+        if row.get("revoked_ts"):
+            etat = "  (révoquée %s)" % time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(row["revoked_ts"]))
+        print("%-20s %-8s %-38s %-8s %-12s %-16s %s%s" % (
+            row.get("agent"), row.get("harness"), row.get("session_id"),
+            row.get("pid") or "-", row.get("host"), quand, row.get("created_by"), etat))
+    return 0
+
+
+def cmd_whoami(bk, cfg: Config, rest: list[str]) -> int:
+    if len(rest) > 1 and rest[0] == "--cwd":
+        # Diagnostic : le dossier ne donne aucune identité.
+        print("legacy %s (diagnostic, non autoritaire)"
+              % identity.legacy_name(rest[1], cfg))
+        return 0
+    try:
+        opts, _positional = _options(rest, ("--session", "--harness"))
+    except ValueError as exc:
+        print("%s\nusage: agent-mail whoami [--session ID --harness H] | --cwd DOSSIER"
+              % exc, file=sys.stderr)
+        return 2
+    db = bk.db if bk.kind == "pg" else None
+    if "--session" in opts or "--harness" in opts:
+        # L41 (0030) : la liaison d'une session nommée, comme le hook la verrait
+        # (le PID lié doit être un ancêtre de cette commande).
+        binding = identity.resolve_binding(cfg, db, harness=opts.get("--harness") or "",
+                                           session_id=opts.get("--session") or "")
+    else:
+        binding = identity.resolve_binding(cfg, db)
+    if not binding.ok:
+        print("identité non liée : %s" % (binding.reason or "AGENT_MAIL_NAME absente"),
+              file=sys.stderr)
+        if binding.session:
+            print("(%s)" % binding.describe_session(), file=sys.stderr)
+        return 1
+    if binding.source == "explicit":
+        print(binding.name)
+    elif binding.source == "session":
+        # L41 (0030) : la source et la liaison, pour qu'une session sache
+        # pourquoi elle reçoit ce courrier
+        print("%s [session] %s" % (binding.name, binding.describe_session()))
+    else:
+        print("%s [%s]" % (binding.name, binding.source))
     return 0
 
 
@@ -657,19 +872,17 @@ def main(argv: list[str] | None = None) -> int:
         if command == "list":
             return cmd_list(bk)
         if command == "whoami":
-            if len(rest) > 1 and rest[0] == "--cwd":
-                # Diagnostic : le dossier ne donne aucune identité.
-                print("legacy %s (diagnostic, non autoritaire)"
-                      % identity.legacy_name(rest[1], cfg))
-                return 0
-            binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
-            if not binding.ok:
-                print("identité non liée : %s" % (binding.reason or "AGENT_MAIL_NAME absente"),
-                      file=sys.stderr)
+            return cmd_whoami(bk, cfg, rest)
+        if command in ("bind", "unbind", "bindings"):
+            if bk.kind != "pg":
+                print("les liaisons de session exigent la base (AMEESH_DSN) : "
+                      "le repli fichier n'en a pas", file=sys.stderr)
                 return 1
-            print(binding.name if binding.source == "explicit"
-                  else "%s [%s]" % (binding.name, binding.source))
-            return 0
+            if command == "bind":
+                return cmd_bind(bk, cfg, rest)
+            if command == "unbind":
+                return cmd_unbind(bk, cfg, rest)
+            return cmd_bindings(bk, rest)
         if command == "status":
             return cmd_status(bk, cfg, rest)
         print(__doc__)

@@ -5,6 +5,8 @@
   ameesh mail <send|inbox|list|status|alias|hook|statusline|whoami>
         la boîte aux lettres ; `agent-mail` reste un alias (les hooks des
         harnais l'appellent) ;
+  ameesh mail <bind|unbind|bindings>
+        liaison explicite d'une session externe à un agent (L41, 0030) ;
   ameesh run [options]        l'exécuteur de la machine ; `agent-runner` reste
         un alias ;
   ameesh attach <agent> [--wait] [--ttl S]
@@ -20,7 +22,16 @@
   ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais
         réglages d'exécution, effet au prochain tour ;
   ameesh alerts [--follow] [--json]     alertes d'exploitation (un objet par ligne) ;
+  ameesh notify [--once] [--dry-run] [--interval S] [--json] | --test human:ID
+        alertes POUSSÉES à l'humain responsable (bureau, ntfy, Slack ;
+        clé `notify` de la configuration de l'hôte ; L38) ;
   ameesh restart <agent> --brief FICHIER|-   session neuve sur un brief ;
+  ameesh adopt <agent> --session ID --harness claude|codex|deepseek [--account C]
+        [--cwd D] [--brief FICHIER|-] [--force]
+        une session interactive existante (fermée) passe sous l'exécuteur (L39) ;
+  ameesh resume <agent> [--brief FICHIER|-] [--fresh]
+        relance un agent arrêté, mort ou au repos : même session si le compte
+        du prochain tour peut la reprendre, sinon brief de reprise déterministe ;
   ameesh interrupt <agent> <message…>   interruption directe (expéditeurs habilités) ;
   ameesh progress [--json] [--html FICHIER] [--project P] [--since 24h]
         avancement : lots, agents, jalons, budget (schéma ameesh-progress/1) ;
@@ -69,6 +80,8 @@ MESH_COMMANDS = (
 )
 #: exploitation (L26) : alertes, redémarrage sur brief, interruption directe
 EXPLOITATION_COMMANDS = ("alerts", "restart", "interrupt")
+#: adoption et reprise (L39, décision 0030)
+REPRISE_COMMANDS = ("adopt", "resume")
 #: sous-commandes des reçus d'approbation (receipts_cli)
 RECEIPT_COMMANDS = ("receipt", "authenticator")
 #: actions sous porte et file des décisions (actions_cli)
@@ -96,9 +109,16 @@ def main(argv: list[str] | None = None) -> int:
     if command == "fil":
         from . import fil
         return fil.main(rest)
+    if command == "notify":
+        # L38 (0030) : l'envoi des alertes au responsable humain
+        from . import notify
+        return notify.main(rest)
     if command in EXPLOITATION_COMMANDS:
         from . import exploitation
         return exploitation.main(argv)
+    if command in REPRISE_COMMANDS:
+        from . import reprise
+        return reprise.main(argv)
     if command in MESH_COMMANDS:
         from . import mesh_cli
         return mesh_cli.main(argv)

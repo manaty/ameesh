@@ -25,6 +25,7 @@ from .packages import WorkPackages
 from .placement import Placements
 from .progress import Progress
 from .registry import Agents, Leases, PendingSpend
+from .session_bindings import SessionBindings
 from .threads import Threads
 from .wakeups import Wakeups
 from .work import WorkItems
@@ -63,3 +64,4 @@ class PostgresStorage(interface.Storage):
         self.hosts = Hosts(db)
         self.turn_resources = TurnResources(db)
         self.visibility = Visibility(db)
+        self.session_bindings = SessionBindings(db)

@@ -478,15 +478,17 @@ def gauges_of(book, profile: Profile, items: list[Profile]) -> list:
 
 
 def evaluate(book, profile: Profile, items: list[Profile], now: float,
-             environ=None) -> Evaluation:
-    """Le compte est-il sous le seuil de la garde (0019) ? Ne lit aucun secret."""
+             environ=None, *, record: bool = True) -> Evaluation:
+    """Le compte est-il sous le seuil de la garde (0019) ? Ne lit aucun secret.
+
+    `record=False` (simulation, L39) : l'historique des jauges n'est pas écrit."""
     result = Evaluation(profile)
     result.problems = check(profile, environ)
     if result.problems:
         result.reason = "profil inutilisable : %s" % "; ".join(result.problems)
         return result
     result.gauges = gauges_of(book, profile, items)
-    if result.gauges:
+    if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)
         book.record_gauges(result.gauges, account=profile.name)
     depasses = []
@@ -548,24 +550,35 @@ def _label(evaluations: dict) -> str:
 
 
 def choose(db, host: str, harness: str, items: list[Profile], book, *,
-           now: float | None = None, agent: str | None = None, environ=None) -> Choice:
+           now: float | None = None, agent: str | None = None, environ=None,
+           simulate: bool = False) -> Choice:
     """Choisit le compte du prochain tour (voir l'en-tête du module).
 
     Seule écriture : la bascule (comparer-et-changer, journalisée) et les
     retenues. Une erreur de base remonte : l'appelant suspend (fail-closed).
+
+    `simulate=True` (L39, `ameesh resume`) : le compte que choisirait le
+    prochain tour, SANS AUCUNE écriture (ni bascule, ni retenue, ni historique
+    des jauges) ; `switched` dit la bascule qui aurait lieu.
     """
     now = time.time() if now is None else now
     store = storage.of(db).accounts
-    row = store.active(host, harness) or store.init_active(host, harness, items[0].name)
+    row = store.active(host, harness) or (
+        {"account": items[0].name, "forced": False} if simulate
+        else store.init_active(host, harness, items[0].name))
     names = [p.name for p in items]
     cache: dict[str, Evaluation] = {}
 
     def ev(profile: Profile) -> Evaluation:
         if profile.name not in cache:
-            cache[profile.name] = evaluate(book, profile, items, now, environ)
+            cache[profile.name] = evaluate(book, profile, items, now, environ,
+                                           record=not simulate)
         return cache[profile.name]
 
     active_name = row.get("account")
+    if active_name not in names and simulate:
+        row = {"account": items[0].name, "forced": False}
+        active_name = items[0].name
     if active_name not in names:
         # compte retiré de la configuration : retour au primaire, journalisé
         store.switch(host, harness, expected=active_name, to=items[0].name, kind="config",
@@ -592,6 +605,9 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         return until is not None and float(until) > now
 
     def switch_to(target: Profile, kind: str, reason: str) -> Choice | None:
+        if simulate:
+            return Choice(target, target, switched={"from": active.name, "to": target.name,
+                                                    "kind": kind, "reason": reason})
         if not store.switch(host, harness, expected=active.name, to=target.name, kind=kind,
                             reason=reason, agent=agent):
             return None  # un autre worker a changé le compte entre-temps
@@ -616,7 +632,8 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     for profile in items[index + 1:]:
         if held(profile) or not ev(profile).ok:
             continue
-        store.hold(host, harness, active.name, current.until, current.reason)
+        if not simulate:
+            store.hold(host, harness, active.name, current.until, current.reason)
         done = switch_to(profile, "bascule", "%s au seuil : %s" % (active.name, current.reason))
         if done is not None:
             return done

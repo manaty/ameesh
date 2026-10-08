@@ -139,7 +139,8 @@ def annotate(db, rows: list[dict], *, now: float | None = None,
              threshold: float = stagnation.DEFAULT_THRESHOLD_S) -> list[dict]:
     """Ajoute à chaque lot : `epic`, `waiting_for` (`{what, who, label}`),
     `stale`, `last_activity_ts` — calculés par le module `stagnation`, comme
-    l'alerte `stale_lot` et `ameesh progress`."""
+    l'alerte `stale_lot` et `ameesh progress` — et `delegation` (L40,
+    `work.delegation_view`)."""
     packages = {p["id"]: p for p in storage.of(db).packages.all(include_absent=True)}
     described = stagnation.describe(db, rows, now=now, threshold=threshold)
     for row in rows:
@@ -148,6 +149,8 @@ def annotate(db, rows: list[dict], *, now: float | None = None,
         row["waiting_for"] = info["waiting"]
         row["last_activity_ts"] = info["last_activity_ts"]
         row["stale"] = info["stale"]
+        # L40 (0030) : délégation à échéance (« délégué par X, échéance dans … »)
+        row["delegation"] = work_mod.delegation_view(row, now)
     return rows
 
 

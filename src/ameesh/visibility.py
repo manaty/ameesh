@@ -17,6 +17,12 @@ n'admet pas. Sans dépôt de mémoire déclaré, la règle est sans objet.
 
 `ameesh canon check` reste hors ligne : seule la synchronisation du canon et
 l'ouverture d'une session interrogent la forge.
+
+Plusieurs canons (L43, décision 0031 points 5 et 6) : `canon` est toujours le
+canon de la PERSONA. `H(hôte)` vient de la fiche Host de ce canon, et chaque
+humain (`human:<id>`) se résout dans les fiches Member de ce canon — jamais
+dans celles d'un autre canon de l'hôte. Un humain qui travaille dans deux
+canons y a une fiche Member dans chacun.
 """
 from __future__ import annotations
 

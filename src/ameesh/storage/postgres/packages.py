@@ -11,7 +11,7 @@ import json
 from .. import interface
 
 _COLUMNS = """
-    id, kind, title, parent, responsible, team, scope, status, canon_ref, present,
+    id, kind, title, parent, responsible, team, scope, status, canon_ref, canon, present,
     extract(epoch from synced_at)::float8 AS synced_ts
 """
 
@@ -34,19 +34,20 @@ class WorkPackages(interface.WorkPackages):
             """
             INSERT INTO work_packages
                 (id, kind, title, parent, responsible, team, scope, status, canon_ref,
-                 present, synced_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, true, now())
+                 canon, present, synced_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, true, now())
             ON CONFLICT (id) DO UPDATE SET
                 kind = excluded.kind, title = excluded.title, parent = excluded.parent,
                 responsible = excluded.responsible, team = excluded.team,
                 scope = excluded.scope, status = excluded.status,
-                canon_ref = excluded.canon_ref, present = true, synced_at = now()
+                canon_ref = excluded.canon_ref, canon = excluded.canon,
+                present = true, synced_at = now()
             RETURNING id
             """,
             (row["id"], row["kind"], row["title"], row.get("parent"), row.get("responsible"),
              row.get("team"),
              None if row.get("scope") is None else json.dumps(list(row["scope"])),
-             row.get("status"), row["canon_ref"]),
+             row.get("status"), row["canon_ref"], row.get("canon")),
         )
 
     def retire(self, idents) -> int:

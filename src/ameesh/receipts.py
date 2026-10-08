@@ -54,6 +54,15 @@ sous le verrou consultatif du registre (`lock_registry`). L'écriture elle-même
 revérifie en SQL (`pg_locks`) que la session le détient : hors de ce chemin,
 refus (`RegistryLockError`), rien n'est écrit.
 
+Authentificateurs PAR CANON (L44, décision 0031) : chaque ligne du registre
+appartient au canon qui l'a déclarée (`authenticators.canon`, '' = canon par
+défaut). Un reçu n'est vérifié que contre les authentificateurs du canon de
+l'objet approuvé (`Policy.canon` ; pour une action : `actions.canon`, le canon
+de son proposant) ; un authentificateur d'un autre canon est refusé (code
+`canon_ref`), même s'il porte la même passkey du même humain. Un grant ne
+couvre que les actions du canon de son authentificateur (`standing_cover`,
+`actions._covering_grant`).
+
 Le SQL est dans le stockage (spec §10) : `storage.of(db).authenticators`
 (registre, verrou), `.grants` (approbations permanentes), `.nonces`
 (consommation) ; les fonctions PL/pgSQL appelées et leurs garanties sont
@@ -283,6 +292,10 @@ class Policy:
     authentificateur enrôlé au niveau élevé et, en WebAuthn, BE=0.
     `canon_commit`, s'il est posé, exige que la ligne du registre vienne de ce
     commit du canon.
+    `canon` (L44, 0031) : le canon de l'objet approuvé — '' pour le canon par
+    défaut, l'identifiant du canon sinon. Seuls les authentificateurs déclarés
+    par CE canon sont admis ; un authentificateur d'un autre canon ne vaut
+    jamais ici (refus `canon_ref`).
     """
 
     rp_id: str = ""
@@ -293,6 +306,7 @@ class Policy:
     max_ttl: int = DEFAULT_MAX_TTL
     max_standing: int = DEFAULT_MAX_STANDING
     canon_commit: str = ""
+    canon: str = ""
 
     def __post_init__(self):
         origins = (self.origins,) if isinstance(self.origins, str) else tuple(self.origins or ())
@@ -305,6 +319,11 @@ class Policy:
             raise ReceiptError("niveau inconnu : %r (%s)" % (self.level, ", ".join(LEVELS)))
         if self.canon_commit and not _COMMIT_RE.fullmatch(self.canon_commit):
             raise ReceiptError("canon_commit : SHA de commit en hexadécimal attendu")
+        if self.canon is None:
+            object.__setattr__(self, "canon", "")
+        if not isinstance(self.canon, str) or self.canon != self.canon.strip():
+            raise ReceiptError("canon : identifiant de canon (texte) attendu, '' = canon "
+                               "par défaut")
 
 
 @dataclass(frozen=True)
@@ -512,9 +531,17 @@ def parse_public_key(facade: str, blob: bytes) -> cose.PublicKey:
 # --------------------------------------------------------------------------
 
 def list_authenticators(db: Db, *, approver: str | None = None,
-                        include_revoked: bool = False) -> list[dict]:
+                        include_revoked: bool = False, canon: str | None = None) -> list[dict]:
+    """Le registre ; `canon` (L44) : les lignes d'un seul canon ('' = canon
+    par défaut), None : tous les canons."""
     return storage.of(db).authenticators.registered(approver=approver,
-                                                    include_revoked=include_revoked)
+                                                    include_revoked=include_revoked,
+                                                    canon=canon)
+
+
+def canon_label(canon: str | None) -> str:
+    """Nom lisible d'un canon du registre ('' : le canon par défaut)."""
+    return "canon %s" % canon if canon else "canon par défaut"
 
 
 def mismatched_authenticators(db: Db, expected, *, include_revoked: bool = False) -> list[dict]:
@@ -538,12 +565,26 @@ def mismatched_authenticators(db: Db, expected, *, include_revoked: bool = False
     return out
 
 
-def _find_authenticator(db: Db, approver: str, facade: str,
-                        credential_id: str) -> tuple[dict | None, str, str]:
-    rows = storage.of(db).authenticators.for_approver(approver)
+def _find_authenticator(db: Db, approver: str, facade: str, credential_id: str,
+                        canon: str = "") -> tuple[dict | None, str, str]:
+    """La ligne ACTIVE de (approbateur, façade, credential) déclarée par
+    `canon` (L44 : jamais celle d'un autre canon), ou (None, code, raison)."""
+    everywhere = storage.of(db).authenticators.for_approver(approver)
+    rows = [row for row in everywhere if (row.get("canon") or "") == canon]
+    elsewhere = [row for row in everywhere if (row.get("canon") or "") != canon
+                 and row["facade"] == facade and row["credential_id"] == credential_id
+                 and row.get("revoked_ts") is None]
+    foreign = (None, CANON, (
+        "authentificateur %s/%s de %s déclaré par le %s, pas par le %s de l'objet "
+        "approuvé : un authentificateur ne vaut que pour son canon"
+        % (facade, credential_id[:16], approver,
+           canon_label(elsewhere[0].get("canon")), canon_label(canon)))) if elsewhere else None
     if not rows:
+        if foreign:
+            return foreign
         return None, UNKNOWN_APPROVER, (
-            "approbateur %s inconnu du registre de confiance (aucun authentificateur)" % approver)
+            "approbateur %s inconnu du registre de confiance du %s (aucun authentificateur)"
+            % (approver, canon_label(canon)))
     matching = [row for row in rows
                 if row["facade"] == facade and row["credential_id"] == credential_id]
     live = [row for row in matching if row.get("revoked_ts") is None]
@@ -552,7 +593,9 @@ def _find_authenticator(db: Db, approver: str, facade: str,
     if matching:
         return None, REVOKED, "authentificateur %s/%s de %s révoqué" % (
             facade, credential_id[:16], approver)
-    other = storage.of(db).authenticators.active_holders(facade, credential_id)
+    if foreign:
+        return foreign
+    other = storage.of(db).authenticators.active_holders(facade, credential_id, canon)
     if other:
         return None, FOREIGN_AUTHENTICATOR, (
             "le credential %s/%s n'est pas enrôlé pour %s (il appartient à un autre approbateur)"
@@ -694,9 +737,9 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
             return refuse(TTL, "grant trop long (%d s, maximum %d s)"
                           % (until - iat, policy.max_standing))
 
-    # 3. registre de confiance
+    # 3. registre de confiance — L44 (0031) : celui du canon de l'objet approuvé
     row, code, reason = _find_authenticator(
-        db, request["approver"], parsed.facade, parsed.credential_id)
+        db, request["approver"], parsed.facade, parsed.credential_id, policy.canon)
     if row is None:
         return refuse(code, reason)
     ctx.update(authenticator_id=int(row["id"]), level=row["level"])
@@ -913,7 +956,9 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> d
     """Trouve un grant qui couvre l'action et y réserve son montant.
 
     `action` : action_id, connector, operation, class, amount (facultatif),
-    currency (facultatif). Une réservation vivante existante pour l'action est
+    currency (facultatif), canon (facultatif, L44 : '' = canon par défaut).
+    Seuls les grants dont l'authentificateur est déclaré par le canon de
+    l'action la couvrent. Une réservation vivante existante pour l'action est
     réutilisée en priorité — si elle décrit la même action, sinon ReceiptError
     (`standing_reserve`). None = aucune couverture.
     """
@@ -927,7 +972,8 @@ def standing_cover(db: Db, action: dict, *, reserved_by: str | None = None) -> d
     # l'heure réelle après le dernier verrou, cumul) est refaite par
     # ameesh_standing_reserve pour chaque candidat
     rows = storage.of(db).grants.candidates(action["connector"], action["operation"],
-                                            action_class, value, currency)
+                                            action_class, value, currency,
+                                            canon=action.get("canon") or "")
     candidates += [int(row["id"]) for row in rows if int(row["id"]) not in candidates]
     for grant_id in candidates:
         reserved = standing_reserve(
@@ -982,8 +1028,12 @@ def _label(approver: str, facade: str, credential_id: str) -> str:
 
 #: motifs de révocation écrits par `_apply_authenticators` (et lui seul)
 SYNC_REVOCATIONS = ("absent du canon", "clé changée dans le canon")
-#: `canon_ref` d'une fiche lue par le canon (L2) : `<membre>:<chemin>@<commit>`
-FICHE_REF_RE = re.compile(r"^([^:\s]+):(\S*)@([0-9a-f]{40}|[0-9a-f]{64})$")
+#: `canon_ref` d'une fiche lue par le canon (L2) : `<membre>:<chemin>@<commit>` ;
+#: L42 (0031) : `<canon>/<membre>:<chemin>@<commit>` pour un canon qui n'est pas
+#: le canon par défaut (groupes nommés : canon, member, path, commit)
+FICHE_REF_RE = re.compile(
+    r"^(?:(?P<canon>[A-Za-z0-9][A-Za-z0-9._-]{0,63})/)?(?P<member>[^:/\s]+):"
+    r"(?P<path>\S*)@(?P<commit>[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
 # --------------------------------------------------------------------------
@@ -1025,14 +1075,18 @@ def _revocation_ref(row: dict, wanted: dict | None, member_refs: dict,
     if ref:
         return ref
     match = FICHE_REF_RE.fullmatch(row.get("canon_ref") or "")
+    # L44 (0031) : la ligne est de CE canon (colonne `canon`, seule lue par la
+    # synchronisation) ; sa référence garde son préfixe éventuel
     if match and source_commits and _COMMIT_RE.fullmatch(
-            str(source_commits.get(match.group(1)) or "")):
-        return "%s:%s@%s" % (match.group(1), match.group(2), source_commits[match.group(1)])
+            str(source_commits.get(match.group("member")) or "")):
+        prefix = "%s/" % match.group("canon") if match.group("canon") else ""
+        return "%s%s:%s@%s" % (prefix, match.group("member"), match.group("path"),
+                               source_commits[match.group("member")])
     return None
 
 
 def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: bool = True,
-                          source_commits: dict | None = None) -> dict:
+                          source_commits: dict | None = None, canon: str = "") -> dict:
     """Met la table `authenticators` en conformité avec le canon lu par ailleurs.
 
     RÈGLE (revue L9b, codex2/codex3) : écriture INTERNE, jamais un point
@@ -1085,6 +1139,13 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
     commit lu de sa source, `source_commits` = {membre du canon: commit}). Un
     hôte dont le canon est en retard peut ainsi être reconnu
     (`canon_sync.sync_authenticators`) avant de réactiver ce qui a été retiré.
+
+    Canon (L44, décision 0031) : `canon` est le canon synchronisé ('' = canon
+    par défaut, l'identifiant du canon sinon). Seules SES lignes sont lues,
+    mises à jour et révoquées — « absent du canon » veut dire absent de CE
+    canon : synchroniser A ne révoque jamais un humain, ni une passkey, de B.
+    Les lignes ajoutées portent ce canon ; une même passkey déclarée par deux
+    canons y a deux lignes, indépendantes.
 
     Renvoie {"added", "updated", "revoked", "unchanged", "frozen", "errors"}.
     """
@@ -1165,6 +1226,7 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
                     "aaguid": _normalize_aaguid(entry.get("aaguid")),
                     "level": _normalize_level(entry.get("level")),
                     "canon_ref": canon_ref,
+                    "canon": canon,
                 }
             except ReceiptError as exc:
                 errors.append("%s (%s) : %s" % (where, _label(approver, *identity), exc))
@@ -1192,7 +1254,8 @@ def _apply_authenticators(lock: RegistryLock, members: list, *, revoke_absent: b
 
     result = {"added": [], "updated": [], "revoked": [], "unchanged": 0,
               "frozen": sorted(frozen), "errors": errors}
-    active = list_authenticators(db)
+    # L44 (0031) : les lignes actives de CE canon seulement
+    active = list_authenticators(db, canon=canon)
     store = storage.of(db).authenticators       # écritures par la transaction du jeton
     keep: set[tuple[str, str]] = set()
     for row in active:

@@ -12,6 +12,16 @@ Canon (spec §4) : `AMEESH_CANON` (racine du bundle OKF), `AMEESH_CANON_REF`
 seulement) et `AMEESH_REQUIRE_RESPONSIBLE` (R14 dans `claimable` ; par défaut
 vrai dès qu'un canon est configuré, faux sinon pour la compatibilité du banc).
 
+Plusieurs canons (L42, décision 0031) : `canons` dans le fichier de
+configuration — liste de `{"path", "ref", "untrusted"}` (ou de chemins) — ou
+`AMEESH_CANONS` (chemins séparés par `:`). Le PREMIER est le canon par
+défaut : `canon`, `canon_ref` et `canon_untrusted` restent les siens
+(compatibilité), les suivants sont dans `extra_canons`. `canon` seul reste
+accepté (liste à un élément). Une liste venue de l'environnement
+(`AMEESH_CANONS` ou `AMEESH_CANON`) remplace celle du fichier ;
+`AMEESH_CANON_REF` ne vise que le canon par défaut, `AMEESH_CANON_UNTRUSTED`
+tous les canons déclarés par l'environnement.
+
 Les chemins v0 (`~/.local/state/agent-mail`, `~/.config/agent-mail`) restent les
 chemins du repli fichier et des alias : la CLI v1 reste compatible avec les
 outils v0 qui tournent en production sur ce PC.
@@ -82,6 +92,35 @@ def hostname() -> str:
 
 
 @dataclass(frozen=True)
+class CanonEntry:
+    """Un canon configuré (L42, décision 0031) : racine, révision, non approuvé."""
+
+    path: str
+    ref: str = ""
+    untrusted: bool = False
+
+
+def _canon_entry(raw, where: str) -> CanonEntry:
+    """Une entrée de `canons` (fichier de configuration) : chemin ou objet."""
+    if isinstance(raw, str):
+        raw = {"path": raw}
+    if not isinstance(raw, dict) or not isinstance(raw.get("path"), str) \
+            or not raw["path"].strip():
+        raise SystemExit("%s : entrée de `canons` invalide %r (attendu un chemin ou "
+                         "{\"path\", \"ref\", \"untrusted\"})" % (where, raw))
+    unknown = sorted(set(raw) - {"path", "ref", "untrusted"})
+    if unknown:
+        raise SystemExit("%s : clé(s) inconnue(s) dans `canons` : %s"
+                         % (where, ", ".join(unknown)))
+    ref = raw.get("ref") or ""
+    if not isinstance(ref, str):
+        raise SystemExit("%s : `ref` de canon invalide %r" % (where, ref))
+    return CanonEntry(path=_expand(raw["path"].strip()), ref=ref.strip(),
+                      untrusted=bool(_as_bool(raw.get("untrusted"), False,
+                                              "%s : untrusted" % where)))
+
+
+@dataclass(frozen=True)
 class Config:
     dsn: str = DEFAULT_DSN
     schema: str = "public"
@@ -145,6 +184,9 @@ class Config:
     #: lire les fichiers de travail d'un canon hors dépôt (tests, prototypes) :
     #: jamais par défaut, et chaque constat le signale
     canon_untrusted: bool = False
+    #: L42 (0031) : canons configurés APRÈS le canon par défaut (`canon`),
+    #: dans l'ordre ; vide = un seul canon (ou aucun)
+    extra_canons: tuple[CanonEntry, ...] = ()
     #: R14 : un agent sans humain responsable n'est pas réclamable. None = vrai
     #: si un canon est configuré, faux sinon (compatibilité du banc)
     require_responsible: bool | None = None
@@ -195,12 +237,28 @@ class Config:
     #: (`{harnais: [profil, …]}`), validée par `ameesh.accounts`. Ce sont des
     #: secrets d'hôte : jamais dans le canon, jamais en base.
     accounts: dict = field(default_factory=dict)
+    #: alertes poussées (L38, décision 0030 point 4) : la clé `notify` du
+    #: fichier de configuration de l'HÔTE, telle quelle (routes, canaux,
+    #: humain par défaut, types), validée par `ameesh.notify`. Jamais de
+    #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
+    #: fichier 0600 nommés par cette clé.
+    notify: dict = field(default_factory=dict)
 
     @property
     def responsible_required(self) -> bool:
         if self.require_responsible is None:
-            return bool(self.canon)
+            return bool(self.canon_entries)
         return bool(self.require_responsible)
+
+    @property
+    def canon_entries(self) -> tuple[CanonEntry, ...]:
+        """Canons configurés, le canon par défaut d'abord (L42, 0031) ; vide
+        sans canon. Le canon par défaut est toujours `canon`/`canon_ref`/
+        `canon_untrusted` : un `dataclasses.replace(cfg, canon=…)` le suit."""
+        if not self.canon:
+            return ()
+        return (CanonEntry(self.canon, self.canon_ref, self.canon_untrusted),) \
+            + tuple(self.extra_canons)
 
     @property
     def runner(self) -> str:
@@ -241,9 +299,12 @@ def load(env: dict | None = None) -> Config:
         if not isinstance(raw, dict):
             raise SystemExit("config illisible %s : objet JSON attendu" % cfg_path)
         known = {f for f in Config.__dataclass_fields__}  # type: ignore[attr-defined]
+        known.discard("extra_canons")   # `canons` (liste) ci-dessous, jamais tel quel
         if isinstance(raw.get("humans"), list):
             raw = dict(raw, humans=",".join(str(n) for n in raw["humans"]))
         cfg = replace(cfg, **{k: v for k, v in raw.items() if k in known})
+        if raw.get("canons") is not None:
+            cfg = replace(cfg, **_canons_from_file(raw, cfg_path))
 
     def pick(*names, default=None):
         for name in names:
@@ -340,7 +401,24 @@ def load(env: dict | None = None) -> Config:
                                            default=cfg.shared_sessions), False,
                                       "AMEESH_SHARED_SESSIONS")),
     )
-    canon = pick("AMEESH_CANON", "AGENT_MESH_CANON", default=cfg.canon) or ""
+    # L42 (0031) : une liste venue de l'environnement remplace celle du fichier
+    env_untrusted = _as_bool(pick("AMEESH_CANON_UNTRUSTED", "AGENT_MESH_CANON_UNTRUSTED",
+                                  default=None), None, "AMEESH_CANON_UNTRUSTED")
+    canons_env = pick("AMEESH_CANONS", default=None)
+    single_env = pick("AMEESH_CANON", "AGENT_MESH_CANON", default=None)
+    if canons_env:
+        paths = [_expand(p.strip()) for p in str(canons_env).split(":") if p.strip()]
+        if single_env and paths and _expand(str(single_env)) != paths[0]:
+            raise SystemExit("AMEESH_CANON (%s) et AMEESH_CANONS (premier : %s) se "
+                             "contredisent : le premier de AMEESH_CANONS est le canon par "
+                             "défaut" % (single_env, paths[0]))
+        cfg = replace(cfg, canon=paths[0] if paths else "", canon_ref="",
+                      canon_untrusted=bool(env_untrusted),
+                      extra_canons=tuple(CanonEntry(p, "", bool(env_untrusted))
+                                         for p in paths[1:]))
+    elif single_env:
+        cfg = replace(cfg, canon=str(single_env), extra_canons=())
+    canon = cfg.canon
     cfg = replace(
         cfg,
         canon=_expand(str(canon)) if canon else "",
@@ -363,6 +441,13 @@ def load(env: dict | None = None) -> Config:
     )
     if cfg.canon_ref.startswith("-"):
         raise SystemExit("AMEESH_CANON_REF invalide : %r" % cfg.canon_ref)
+    seen_paths: set[str] = set()
+    for entry in cfg.canon_entries:
+        if entry.ref.startswith("-"):
+            raise SystemExit("ref de canon invalide : %r (%s)" % (entry.ref, entry.path))
+        if entry.path in seen_paths:
+            raise SystemExit("canon configuré deux fois : %s" % entry.path)
+        seen_paths.add(entry.path)
     if not SCHEMA_RE.match(cfg.schema):
         raise SystemExit("AGENT_MESH_SCHEMA invalide : %r" % cfg.schema)
     if cfg.session_policy not in SESSION_POLICIES:
@@ -373,6 +458,26 @@ def load(env: dict | None = None) -> Config:
     if cfg.backend not in ("auto", "pg", "file"):
         raise SystemExit("AGENT_MESH_BACKEND invalide : %r" % cfg.backend)
     return cfg
+
+
+def _canons_from_file(raw: dict, where: str) -> dict:
+    """`canons` du fichier de configuration (L42, 0031) → champs de Config.
+
+    Le premier est le canon par défaut (`canon`, `canon_ref`,
+    `canon_untrusted`) ; `canon` et `canons` à la fois : erreur claire."""
+    items = raw.get("canons")
+    if not isinstance(items, list):
+        raise SystemExit("%s : `canons` doit être une liste" % where)
+    if any(raw.get(k) not in (None, "") for k in ("canon", "canon_ref")) \
+            or raw.get("canon_untrusted") is not None:
+        raise SystemExit("%s : `canon`/`canon_ref`/`canon_untrusted` et `canons` à la fois "
+                         "— le premier élément de `canons` est le canon par défaut" % where)
+    entries = [_canon_entry(item, where) for item in items]
+    if not entries:
+        return {"canon": "", "canon_ref": "", "canon_untrusted": False, "extra_canons": ()}
+    first = entries[0]
+    return {"canon": first.path, "canon_ref": first.ref, "canon_untrusted": first.untrusted,
+            "extra_canons": tuple(entries[1:])}
 
 
 def mask_dsn(dsn: str) -> str:

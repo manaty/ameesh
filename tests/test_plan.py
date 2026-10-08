@@ -575,6 +575,11 @@ class GithubTest(_PlanDb):
 # ==========================================================================
 
 class ProgressPlanTest(_PlanDb):
+    def setUp(self) -> None:
+        super().setUp()
+        # L37 (0030) : un lot ne s'assigne qu'à un agent connu et réveillable
+        registry.upsert(self.db, "ouvrier", harness="claude")
+
     def test_instantane_avec_le_plan(self):
         self.sync()
         a = work.add(self.db, title="recherche", package="cat-recherche", assignee="ouvrier")
@@ -592,6 +597,8 @@ class ProgressPlanTest(_PlanDb):
                         " WHERE work_item_id = %s", (c["id"],))
         d = work.add(self.db, title="abandonné")
         work.close(self.db, d["id"], abandoned=True)
+        # l'assigné existe : l'attente ne porte pas « (agent inconnu) » (L36)
+        registry.upsert(self.db, "ouvrier", harness="claude")
         snap = progress.snapshot(self.db, self.cfg, since="2d", book=_NoBook())
         self.assertEqual(snap["schema"], "ameesh-progress/1")
         lots = {lot["id"]: lot for lot in snap["lots"]}
@@ -629,6 +636,11 @@ class ProgressPlanTest(_PlanDb):
 
 
 class StagnationUnifiedTest(_PlanDb):
+    def setUp(self) -> None:
+        super().setUp()
+        # L37 (0030) : un lot ne s'assigne qu'à un agent connu et réveillable
+        registry.upsert(self.db, "ouvrier", harness="claude")
+
     """Module unique `stagnation` (L26 + L29) : messages comme activité, action
     en attente d'un humain d'abord, verdict bloquant seulement après le
     dernier gel, lot fermé jamais stagnant ; l'alerte garde `waiting_for`."""

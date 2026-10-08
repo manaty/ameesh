@@ -43,6 +43,7 @@ ameesh-approve serve | enroll-link | gen-token    # the approval service (own us
 ameesh approve-check [--json]                     # service and verifiers share RP ID/origins
 ameesh progress [--json|--html F] [--since 24h]  # lots, agents, milestones, budget (docs/PROGRESS.md)
 ameesh alerts [--follow] --json                   # long turn, idle with mail, dead runner, big session, stale lot
+ameesh notify [--once|--dry-run] | --test human:ID # push alerts to the responsible human (desktop, ntfy, Slack)
 ameesh restart <agent> --brief FILE|-             # stop the turn, forget the session, brief first
 ameesh interrupt <agent> <message…>               # direct interruption (authorised senders only)
 ameesh set <agent> tier=fast session_policy=par-lot|taille|jamais
@@ -111,6 +112,10 @@ scripts/demo-v1.sh
 
 # work items
 python3 -m ameesh.mesh_cli work add --title "un lot" --app nexlink --assignee deepseek7
+                                          # refused unless deepseek7 is wakeable (L37, decision 0030)
+python3 -m ameesh.mesh_cli work assign 1 deepseek8   # reassign, same guard
+python3 -m ameesh.mesh_cli work delegate 1 deepseek8 --within 30m
+                                          # no turn on the lot by then: back to the delegator (L40)
 python3 -m ameesh.mesh_cli work list      # + column DÉLAI (phase and age, R19)
 python3 -m ameesh.mesh_cli work show 1    # milestones and durations: demande → gel → revue → fusion
 ```
@@ -127,7 +132,13 @@ agent-mail send <dest> <texte…> [--from NOM] [--lot ID] [--kind request|reply|
                                                # dest = nom ou "all" ; --urgent : événement (C9)
 agent-mail list                                # nom, outil, âge, non lus, dossier, hôte, bail
 agent-mail inbox [NOM]                         # non lus, sans les marquer lus
-agent-mail whoami                              # identité liée (nom + bail), jamais le dossier
+agent-mail whoami                              # identité liée (nom + source : runner, explicit,
+                                               # session), jamais le dossier
+agent-mail bind <NOM> --session ID --harness claude|codex|deepseek [--pid N]
+                                               # lie une session externe (L41, décision 0030)
+agent-mail bind --import FICHIER               # importe les liaisons du pont local
+agent-mail unbind --session ID --harness H
+agent-mail bindings [--all] [--json]
 agent-mail alias <NOM> <DOSSIER> [CHANTIER]
 agent-mail status "<travail en cours>"
 agent-mail hook <claude|codex|deepseek>        # JSON identique à la v0
@@ -184,7 +195,7 @@ agent-mesh key generate --out DIR --i-am-the-owner     # bench / agent provenanc
 agent-mesh key register <agent> --public-key FICHIER [--role owner|agent] | key show|list|revoke <agent>
 agent-mesh approve --key FICHIER --action A --hash H [--kind K] [--expires 48h]
 agent-mesh approvals [--action A] [--hash H] | verify --action A --hash H [--consume]
-agent-mesh work add|list|show|move|note …
+agent-mesh work add|list|show|move|note|assign …
 agent-mesh import-v0 | export-v0                       # v0 → Postgres and back
 agent-mesh migrate | doctor [--notify-test]
 ```
@@ -217,6 +228,7 @@ ameesh agent spawn <name> --by <creator> --ttl 2h [--cwd DIR] [--prompt TEXT]
 |---|---|
 | `AMEESH_CANON` (config `canon`) | root of the OKF bundle; members of `federation.yaml` present locally (`workspace_path`) are followed |
 | `AMEESH_CANON_REF` (config `canon_ref`) | canonical revision to read (e.g. `origin/main`) |
+| `AMEESH_CANONS` (config `canons`) | several canons on one host (L42): paths separated by `:` (config: list of `{"path", "ref", "untrusted"}`); the first is the default canon, each sync only touches its own agents and its own authenticators (L44: per-canon registry, journal and trusted `ref`; a receipt only counts for objects of the canon that declares the passkey) — see `docs/EXPLOITATION.md` |
 | `AMEESH_CANON_UNTRUSTED=1` | allow a non-git canon (never by default) |
 | `AMEESH_REQUIRE_RESPONSIBLE` (config `require_responsible`) | R14 in `claimable`: an agent without a resolved human `responsible` is not claimable. **Default: on when a canon is configured, off otherwise** (bench compatibility). `0`/`1` force it. Expired ephemeral agents are never claimable, whatever this setting. |
 

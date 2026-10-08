@@ -88,6 +88,7 @@ lus sans borne (journal complet, toutes ses actions).
 | `waiting_for` | (L29) ce que le lot attend et de qui : `{what, who, label}` (`what` : start, build, verdict, fix, merge-approval, merge, merge-outcome, decision, unblock ; `who` null quand ameesh ne le sait pas) ; null pour un lot fusionné ou fermé |
 | `last_activity_ts` | (L29) dernière transition, note, jalon ou action |
 | `stale` | (L29) `{since_ts, idle_s, threshold_s}` si le lot non fermé n'a aucune activité depuis le seuil, sinon null ; la page ne le dessine plus actif |
+| `delegation` | (L40, 0030) délégation à échéance (`ameesh work delegate`) : `{delegated_by, delegate, delegated_ts, due_ts, due_in_s, overdue, settled, label}` — `due_in_s` négatif en retard, `due_ts` null et `settled` vrai quand la délégation est soldée (le délégué a travaillé), `label` : « délégué par X, échéance dans 12 min » / « délégué par X, en retard de 5 min » ; null hors délégation et pour un lot fusionné ou fermé (voir [EXPLOITATION.md](EXPLOITATION.md)) |
 
 Jalons (fonction unique `progress._jalons_de_lot`). Source : la table des
 jalons de lot (L10, `work_item_milestones`) quand le lot y a un gel ou un verdict
@@ -118,6 +119,7 @@ gel, sinon `review` (un lot regelé repasse en revue) ; `active` sinon
 | `since_ts` | début du tour en cours (`working`), fin du dernier tour (`idle`), dernière mise à jour sinon |
 | `turn` | tour en cours ou null : `{started_ts, duration_s, label, task}` (`task` = consigne en cours, tronquée à 140 caractères) |
 | `turns`, `unread`, `pending_prompt`, `lease_live` | tours comptés, non-lus, consigne en attente, bail vivant |
+| `mode`, `stop_reason` | `execute` \| `externe` ; raison d'arrêt structurée quand l'état est `stopped`, sinon `null` (L37, décision 0030) |
 
 État : `running` sous bail vivant → `working` ; `running` sans bail vivant,
 `stopped`, `dead` → `stopped` ; `blocked` (pause budget ou comptable de L13)

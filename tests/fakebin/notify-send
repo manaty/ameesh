@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Faux `notify-send` du banc de test (L38) — n'affiche jamais rien.
+
+Journalise son argv (une ligne JSON) dans `AMEESH_FAKE_NOTIFY_LOG` ;
+`AMEESH_FAKE_NOTIFY_EXIT` règle le code de sortie (défaut 0), avec un message
+sur stderr quand il n'est pas nul.
+"""
+import json
+import os
+import sys
+
+log = os.environ.get("AMEESH_FAKE_NOTIFY_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(sys.argv[1:], ensure_ascii=False) + "\n")
+code = int(os.environ.get("AMEESH_FAKE_NOTIFY_EXIT") or 0)
+if code:
+    print("faux notify-send : pas de bus de session", file=sys.stderr)
+sys.exit(code)

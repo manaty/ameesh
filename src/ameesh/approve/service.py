@@ -14,6 +14,10 @@
   consommer le nonce : ameesh le consomme à l'exécution), puis enregistré —
   l'enregistrement consomme le lien.
 * `receipt` : ameesh récupère le reçu et le vérifie lui-même.
+* L44 (0031) : l'action relue porte son canon (`actions.canon`) ; les
+  credentials proposés et la vérification du reçu se limitent aux
+  authentificateurs de CE canon — une passkey enregistrée par un autre canon
+  ne vaut jamais pour elle.
 * `create_enroll_link` / `enroll_view` / `enroll_submit` : cérémonie de
   création de passkey → fichier de PROPOSITION de canon ; jamais d'écriture
   dans `authenticators`.
@@ -21,6 +25,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hmac
 import hashlib
 import logging
@@ -163,11 +168,12 @@ class ApproveService:
                                "nouvelle tentative ; reconcile, puis décision qui assume le "
                                "doublon (assume_duplicate)" % action["connector"])
 
-    def _credentials(self, approver: str) -> list[str]:
-        """Credentials WebAuthn actifs de l'approbateur, au niveau exigé."""
+    def _credentials(self, approver: str, canon: str = "") -> list[str]:
+        """Credentials WebAuthn actifs de l'approbateur, au niveau exigé,
+        déclarés par `canon` (celui de l'action, L44)."""
         with self.db_lock:
             try:
-                rows = receipts.list_authenticators(self.db, approver=approver)
+                rows = receipts.list_authenticators(self.db, approver=approver, canon=canon)
             except DbError as exc:
                 raise ApproveError(503, "registry", "registre de confiance injoignable") from exc
         return [row["credential_id"] for row in rows
@@ -206,10 +212,12 @@ class ApproveService:
 
         action = self._action(action_id)
         self._check_state(action, assume_duplicate)
-        if not self._credentials(approver):
+        if not self._credentials(approver, action.get("canon") or ""):
             raise ApproveError(409, "no_authenticator",
                                "%s n'a aucun authentificateur WebAuthn actif au niveau %s "
-                               "(enrôlement puis PR du canon)" % (approver, self.cfg.level))
+                               "dans le %s de l'action (enrôlement puis PR du canon)"
+                               % (approver, self.cfg.level,
+                                  receipts.canon_label(action.get("canon"))))
         summary = render.render_summary(action, approver, requested_by,
                                         assume_duplicate=assume_duplicate)
         if len(summary.encode("utf-8")) > render.MAX_SUMMARY:
@@ -291,7 +299,7 @@ class ApproveService:
         record = self._live_record(token)
         action = self._check_unchanged(record)
         request = record["request"]
-        credentials = self._credentials(request["approver"])
+        credentials = self._credentials(request["approver"], action.get("canon") or "")
         if not credentials:
             raise ApproveError(409, "no_authenticator", "aucun authentificateur actif")
         return {
@@ -326,8 +334,10 @@ class ApproveService:
                 raise ApproveError(400, "format", "%s : base64url attendu" % name)
 
         record = self._live_record(token)
-        self._check_unchanged(record)
+        action = self._check_unchanged(record)
         request = dict(record["request"], decision=decision)
+        # L44 (0031) : vérifié contre les authentificateurs du canon de l'action
+        policy = dataclasses.replace(self.policy, canon=action.get("canon") or "")
         receipt = {
             "v": receipts.RECEIPT_VERSION,
             "request": request,
@@ -339,7 +349,7 @@ class ApproveService:
         with self.db_lock:
             try:
                 verdict = receipts.verify_receipt(
-                    self.db, receipt, self.policy, kind="action",
+                    self.db, receipt, policy, kind="action",
                     expected_digest=request["digest"], expected_action_id=request["action_id"],
                     expect_decision=decision, consume_by=None, now=self.clock())
             except DbError as exc:

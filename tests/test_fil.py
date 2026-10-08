@@ -810,12 +810,15 @@ class FilPgTest(PgTestCase):
             "SELECT project, entries FROM thread_index")}
         self.assertEqual(index, {"p1": 1, "p2": 1})
 
-        # l'expéditeur a un chantier : une seule entrée pour tous
-        registry.upsert(self.db, "alpha", chantier="nexlink")
-        PgBackend(self.cfg, self.db).send("alpha", "all", "Tout le monde en revue.")
-        [tous] = self.entries("nexlink")
-        self.assertEqual(sorted(tous.recipient.split(", ")),
-                         ["agent:beta", "agent:delta", "agent:gamma"])
+        # l'expéditeur a un chantier : « all » se limite à ce chantier (L36,
+        # décision 0030), une seule entrée dans son fil
+        registry.upsert(self.db, "alpha", chantier="p1")
+        targets = PgBackend(self.cfg, self.db).send("alpha", "all", "Tout le monde en revue.")
+        self.assertEqual(sorted(targets), ["beta", "delta"])
+        tous = self.entries("p1")[-1]
+        self.assertEqual(tous.text, "Tout le monde en revue.")
+        self.assertEqual(sorted(tous.recipient.split(", ")), ["agent:beta", "agent:delta"])
+        self.assertEqual(self.entries("p2")[-1].text, "Point d'équipe à 15 h.")
 
     # -- un fil inaccessible ne perd rien -----------------------------------
     def test_echec_du_fil_sans_perte_du_message(self):

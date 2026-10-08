@@ -108,7 +108,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'attempts', 'auth_kind', 'auth_approver', 'auth_authenticator_id',
         'auth_expires_at', 'auth_grant_id', 'auth_by', 'launch_deadline',
         'external_ref', 'last_error', 'last_actor', 'created_at',
-        'updated_at', 'approved_at', 'launched_at', 'finished_at'
+        'updated_at', 'approved_at', 'launched_at', 'finished_at',
+        -- L44 (0035) : canon de l'action (identifiant de fédération, pas de contenu)
+        'canon'
     ]),
     ('agent_mailbox', ARRAY[
         'id', 'sender', 'recipient', 'kind', 'work_item_id', 'status',
@@ -134,7 +136,13 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L31 (0029) : priorité, admission déclarative, dépôt de mémoire et
         -- verdict de visibilité (pas de contenu)
         'priority', 'admitted_hosts', 'admitted_tags', 'memory_repository',
-        'visibility_ok', 'visibility_diagnostic'
+        'visibility_ok', 'visibility_diagnostic',
+        -- L37 (0030) : mode d'agent et raison d'arrêt structurée (pas de contenu)
+        'mode', 'stop_reason',
+        -- L39 (0033) : NOM du compte d'origine de la session (jamais un profil)
+        'session_account',
+        -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
+        'canon'
     ]),
     ('agent_registry', ARRAY[
         'name', 'chantier', 'harness', 'host', 'cwd', 'session_id',
@@ -153,21 +161,33 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L31 (0029) : priorité, admission déclarative, dépôt de mémoire et
         -- verdict de visibilité (pas de contenu)
         'priority', 'admitted_hosts', 'admitted_tags', 'memory_repository',
-        'visibility_ok', 'visibility_diagnostic'
+        'visibility_ok', 'visibility_diagnostic',
+        -- L37 (0030) : mode d'agent et raison d'arrêt structurée (pas de contenu)
+        'mode', 'stop_reason',
+        -- L39 (0033) : NOM du compte d'origine de la session (jamais un profil)
+        'session_account',
+        -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
+        'canon'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
-        'host', 'applied_by', 'applied_at', 'summary'
+        'host', 'applied_by', 'applied_at', 'summary',
+        -- L44 (0035) : journal par canon
+        'canon'
     ]),
     ('authenticators', ARRAY[
         'id', 'approver', 'facade', 'key_fingerprint', 'aaguid', 'level',
         'canon_ref', 'enrolled_at', 'updated_at', 'revoked_at',
-        'revoked_reason'
+        'revoked_reason',
+        -- L44 (0035) : canon déclarant
+        'canon'
     ]),
     ('canon_state', ARRAY[
         'host', 'status', 'root', 'source', 'last_good_commit',
         'last_good_at', 'diagnostic', 'checked_at', 'auth_status',
-        'auth_diagnostic', 'auth_checked_at'
+        'auth_diagnostic', 'auth_checked_at',
+        -- L42 (0032) : état par (hôte, canon)
+        'canon', 'canon_id'
     ]),
     ('mesh_approvals', ARRAY[
         'id', 'approver', 'action', 'artifact_kind', 'artifact_hash',
@@ -254,6 +274,12 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'host', 'harness', 'from_account', 'to_account', 'kind', 'reason',
         'agent', 'at'
     ]),
+    -- liaisons de session (L41, 0030) : quelle session externe parle au nom
+    -- de quel agent ; même nature que agent_registry.session_id, aucun contenu
+    ('session_bindings', ARRAY[
+        'id', 'session_id', 'harness', 'host', 'agent', 'pid', 'pid_start', 'created_by',
+        'created_at', 'revoked_at'
+    ]),
     ('work_item_events', ARRAY[
         'id', 'work_item_id', 'state', 'actor', 'created_at'
     ]),
@@ -264,12 +290,21 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'type', 'source', 'app', 'title', 'issue_ref', 'workstream',
         'state', 'assignee', 'loops', 'budget_usd', 'spent_usd',
         'created_at', 'updated_at', 'closed_at',
-        'package_id', 'package_parent', 'pr_ref', 'close_reason', 'superseded_by'
+        'package_id', 'package_parent', 'pr_ref', 'close_reason', 'superseded_by',
+        -- L40 (0031) : délégation à échéance en cours (pas de contenu)
+        'delegated_by', 'delegated_at', 'due_at'
+    ]),
+    -- L40 (0031) : registre des délégations et de leur issue (de l'ÉTAT)
+    ('work_item_delegations', ARRAY[
+        'id', 'work_item_id', 'delegate', 'delegated_by', 'delegated_at', 'due_at',
+        'first_turn_at', 'outcome', 'resolved_at', 'resolved_by'
     ]),
     -- plan de travail (L29, 0026) : copie déclarative du canon, de l'ÉTAT
     ('work_packages', ARRAY[
         'id', 'kind', 'title', 'parent', 'responsible', 'team', 'scope', 'status',
-        'canon_ref', 'present', 'synced_at'
+        'canon_ref', 'present', 'synced_at',
+        -- L42 (0032) : canon déclarant
+        'canon'
     ]);
 
 \ir _contrat-superviseur.sql

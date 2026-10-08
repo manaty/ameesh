@@ -8,6 +8,14 @@ Les écritures du registre ne passent que par la transaction qui détient le
 verrou (`under_registry_lock`) : `receipts._apply_authenticators` les fait
 par `jeton.db`, après avoir revérifié le verrou dans `pg_locks`.
 
+L44 (0031) : registre et journal PAR CANON (colonne `canon`, '' = canon par
+défaut, 0035). Chaque lecture du journal (`last_sync`, `journal_head`,
+`append_sync`) et chaque lecture du registre faite par une synchronisation
+(`canon_refs`, `registered(canon=…)`) est bornée à un canon ; une ligne
+active est unique par (canon, facade, credential_id). Le verrou reste celui
+du registre entier : toutes les synchronisations, de tous les canons, se
+sérialisent.
+
 Verrou consultatif TRANSACTIONNEL de toute écriture du registre (revue L9b :
 B1, codex3). Le registre est unique par schéma : la clé ne dépend que de lui
 — ni du chemin du clone, ni de l'hôte, ni de `canon.root` —, deux clones ou
@@ -21,7 +29,7 @@ from .. import interface
 
 AUTH_COLUMNS = """
     id, approver, facade, credential_id, public_key, key_fingerprint, aaguid, level,
-    canon_ref,
+    canon_ref, canon,
     extract(epoch from enrolled_at)::float8 AS enrolled_ts,
     extract(epoch from updated_at)::float8  AS updated_ts,
     extract(epoch from revoked_at)::float8  AS revoked_ts,
@@ -70,52 +78,74 @@ class Authenticators(interface.Authenticators):
             lock = Authenticators(tx).lock_registry()
             return work(lock)
 
-    # -- journal des synchronisations ------------------------------------------
-    def canon_refs(self, revocations) -> list[dict]:
+    # -- journal des synchronisations (L44 : un journal par canon) ------------
+    def canon_refs(self, revocations, canon="") -> list[dict]:
         return self.db.query(
             "SELECT DISTINCT canon_ref FROM authenticators "
-            "WHERE revoked_at IS NULL OR revoked_reason IN (%s, %s)",
-            revocations)
+            "WHERE canon = %s AND (revoked_at IS NULL OR revoked_reason IN (%s, %s))",
+            (canon,) + tuple(revocations))
 
-    def last_sync(self) -> dict | None:
+    def last_sync(self, canon="") -> dict | None:
         rows = self.db.query(
             "SELECT id, root_member, root_commit, commits, branch, trust, host, applied_by, "
-            "extract(epoch from applied_at)::float8 AS applied_ts "
-            "FROM authenticator_syncs ORDER BY id DESC LIMIT 1")
+            "canon, extract(epoch from applied_at)::float8 AS applied_ts "
+            "FROM authenticator_syncs WHERE canon = %s ORDER BY id DESC LIMIT 1", (canon,))
         return rows[0] if rows else None
 
-    def journal_head(self) -> int | None:
-        rows = self.db.query("SELECT max(id) AS id FROM authenticator_syncs")
+    def journal_head(self, canon="") -> int | None:
+        rows = self.db.query("SELECT max(id) AS id FROM authenticator_syncs WHERE canon = %s",
+                             (canon,))
         if not rows or rows[0].get("id") is None:
             return None
         return int(rows[0]["id"])
 
     def append_sync(self, *, root_member, root_commit, commits_json, branch, trust, host,
-                    summary_json, expected) -> bool:
-        """Insertion conditionnée au journal lu sous le verrou : la ligne
-        n'est écrite que si la dernière est encore `expected`."""
+                    summary_json, expected, canon="") -> bool:
+        """Insertion conditionnée au journal DE CE CANON lu sous le verrou : la
+        ligne n'est écrite que si sa dernière est encore `expected`."""
         rows = self.db.query(
             """
             INSERT INTO authenticator_syncs
-                (root_member, root_commit, commits, branch, trust, host, summary)
-            SELECT %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb
-             WHERE (SELECT max(id) FROM authenticator_syncs) IS NOT DISTINCT FROM %s::bigint
+                (root_member, root_commit, commits, branch, trust, host, summary, canon)
+            SELECT %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s
+             WHERE (SELECT max(id) FROM authenticator_syncs WHERE canon = %s)
+                   IS NOT DISTINCT FROM %s::bigint
             RETURNING id
             """,
             (root_member, root_commit, commits_json, branch, trust, host, summary_json,
-             expected))
+             canon, canon, expected))
         return bool(rows)
 
+    def rebase_default(self, previous, new_default) -> dict:
+        """Changement de canon par défaut (L44, avec `canon.rebase_default` de
+        L42) : registre et journal du canon '' passent à `previous` (l'ancien
+        canon par défaut), puis ceux de `new_default` (son identifiant) passent
+        à ''. Toutes les lignes, révoquées comprises : l'historique suit son
+        canon. Sous le verrou du registre (l'appelant le détient)."""
+        moved = {}
+        for table in ("authenticators", "authenticator_syncs"):
+            first = self.db.query(
+                "UPDATE %s SET canon = %%s WHERE canon = '' RETURNING id" % table,
+                (previous,))
+            second = self.db.query(
+                "UPDATE %s SET canon = '' WHERE canon = %%s RETURNING id" % table,
+                (new_default,)) if new_default and new_default != previous else []
+            moved[table] = (len(first), len(second))
+        return moved
+
     # -- registre de confiance (§8.2) ----------------------------------------
-    def registered(self, *, approver, include_revoked) -> list[dict]:
+    def registered(self, *, approver, include_revoked, canon=None) -> list[dict]:
         sql = "SELECT %s FROM authenticators WHERE true" % AUTH_COLUMNS
         params: list = []
         if approver:
             sql += " AND approver = %s"
             params.append(approver)
+        if canon is not None:
+            sql += " AND canon = %s"
+            params.append(canon)
         if not include_revoked:
             sql += " AND revoked_at IS NULL"
-        sql += " ORDER BY approver, facade, credential_id, id"
+        sql += " ORDER BY canon, approver, facade, credential_id, id"
         return self.db.query(sql, tuple(params))
 
     def for_approver(self, approver) -> list[dict]:
@@ -123,10 +153,11 @@ class Authenticators(interface.Authenticators):
             "SELECT %s FROM authenticators WHERE approver = %%s ORDER BY id" % AUTH_COLUMNS,
             (approver,))
 
-    def active_holders(self, facade, credential_id) -> list[dict]:
+    def active_holders(self, facade, credential_id, canon="") -> list[dict]:
         return self.db.query(
-            "SELECT approver FROM authenticators WHERE facade = %s AND credential_id = %s "
-            "AND revoked_at IS NULL", (facade, credential_id))
+            "SELECT approver, canon FROM authenticators WHERE facade = %s "
+            "AND credential_id = %s AND canon = %s AND revoked_at IS NULL",
+            (facade, credential_id, canon))
 
     def update_meta(self, authenticator_id, *, level, aaguid, canon_ref) -> bool:
         rows = self.db.query(
@@ -151,12 +182,12 @@ class Authenticators(interface.Authenticators):
             """
             INSERT INTO authenticators
                 (approver, facade, credential_id, public_key, key_fingerprint, aaguid,
-                 level, canon_ref)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (facade, credential_id) WHERE revoked_at IS NULL DO NOTHING
+                 level, canon_ref, canon)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (canon, facade, credential_id) WHERE revoked_at IS NULL DO NOTHING
             RETURNING id
             """,
             (record["approver"], record["facade"], record["credential_id"],
              record["public_key"], record["key_fingerprint"], record["aaguid"],
-             record["level"], record["canon_ref"]))
+             record["level"], record["canon_ref"], record.get("canon") or ""))
         return bool(rows)
