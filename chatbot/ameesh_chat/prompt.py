@@ -16,7 +16,7 @@ import secrets
 
 from .search import Passage
 
-DOCS_URL = "https://ameesh.manaty.net/docs/"
+DOCS_URL = "https://ameesh.org/docs/"
 MAX_HISTORY_MESSAGES = 6          #: trois échanges
 MAX_HISTORY_CHARS = 1200          #: par message
 

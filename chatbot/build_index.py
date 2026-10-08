@@ -5,7 +5,7 @@
     python3 chatbot/build_index.py                 # → chatbot/index.json
     python3 chatbot/build_index.py --out FICHIER   # ailleurs
 
-Sources : `site/docs/` (pages publiques, liens vers https://ameesh.manaty.net/docs/)
+Sources : `site/docs/` (pages publiques, liens vers https://ameesh.org/docs/)
 et `docs/design/` (documents de conception en français, liens vers GitHub).
 L'index n'est pas versionné : il est reconstruit à chaque déploiement, à partir
 de ce qui est publié.

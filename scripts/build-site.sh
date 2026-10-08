@@ -24,7 +24,7 @@ fi
 rm -rf _site
 "$MKDOCS" build --strict --site-dir _site/docs
 # site/landing/CNAME arrive ainsi à la racine : il documente le domaine
-# personnalisé (https://ameesh.manaty.net) ; avec un déploiement par Actions,
+# personnalisé (https://ameesh.org) ; avec un déploiement par Actions,
 # c'est le réglage Pages du dépôt qui fait foi.
 cp -R site/landing/. _site/
 # Assistant du site (L33) : la bulle n'apparaît que si AMEESH_CHAT_ENDPOINT

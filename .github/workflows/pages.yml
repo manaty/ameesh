@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Public site of ameesh on GitHub Pages: landing page (site/landing/) at the
 # root, MkDocs documentation (site/docs/, mkdocs.yml) under /docs/.
-# Served at https://ameesh.manaty.net (custom domain, set in the repository's
+# Served at https://ameesh.org (custom domain, set in the repository's
 # Pages settings; _site/CNAME documents it).
 # The build is strict: a broken link or a missing page fails it.
 name: pages
