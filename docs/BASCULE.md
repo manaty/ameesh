@@ -886,7 +886,8 @@ ameesh-approve répond 503 : il ne peut plus lire `actions.canon`).
 
 1. **[P] Fiches ameesh dans le canon Acme**, par une PR sur
    acme/home, revue et fusionnée :
-   - `federation.yaml` : `ameesh: {scope: ameesh}` — ameesh ne lit que
+   - `federation.yaml` : `extensions: {ameesh: {scope: ameesh}}` (seule clé
+     libre du schéma OKF Federation) — ameesh ne lit que
      `ameesh/` ; les `type: Agent` de `org/agent-harness/` (sous-agents Claude
      Code) sont ignorés au lieu de rendre le canon invalide ;
    - `ameesh/membres/smichea.md` (Member), `ameesh/hotes/pc-smichea.md`

@@ -98,7 +98,9 @@ class _Canons(_TmpMixin):
         """Canon imitant Acme : sous-agents Claude Code hors périmètre,
         fiches ameesh sous `ameesh/`."""
         _bare, clone = publish(self.workspace, name)
-        extra = "ameesh:\n  scope: %s\n" % scope if scope is not None else ""
+        # L47 : forme conforme au schéma OKF Federation
+        extra = ("extensions:\n  ameesh:\n    scope: %s\n" % scope
+                 if scope is not None else "")
         write(clone, "federation.yaml", federation(ID_T, name, extra, extra_members))
         for sub in ("pr-reviewer", "qa-api-tester", "deployment-message"):
             write(clone, "org/agent-harness/agents/%s.md" % sub, SOUS_AGENT % sub)
@@ -231,6 +233,54 @@ class PerimetreTest(_Canons, unittest.TestCase):
         entry_libre = entry.replace("    ameesh:\n      scope: ameesh\n", "")
         loaded = canon.load(self.acme(name="t2", extra_members=entry_libre), default=False)
         self.assertIn("fiche-title-missing", codes(canon.validate(loaded), canon.ERROR))
+
+    def test_forme_extensions_sans_avertissement(self):
+        """L47 : `extensions.ameesh.scope` (seule clé libre du schéma OKF)."""
+        loaded = canon.load(self.acme(), default=False)
+        found = canon.validate(loaded)
+        self.assertEqual(canon.errors(found), [])
+        self.assertEqual(loaded.scopes, {"home": ["ameesh"]})
+        self.assertNotIn("ameesh-scope-legacy", codes(found, canon.WARNING))
+
+    def test_forme_historique_lue_et_avertie(self):
+        clone = self.acme()
+        write(clone, "federation.yaml", federation(ID_T, "t", "ameesh:\n  scope: ameesh\n"))
+        commit_all(clone)
+        loaded = canon.load(clone, default=False)
+        found = canon.validate(loaded)
+        self.assertEqual(canon.errors(found), [])
+        self.assertEqual(loaded.scopes, {"home": ["ameesh"]})
+        self.assertIn("ameesh-scope-legacy", codes(found, canon.WARNING))
+
+    def test_forme_extensions_prime_sur_l_historique(self):
+        clone = self.acme()
+        write(clone, "federation.yaml", federation(
+            ID_T, "t", "ameesh:\n  scope: ailleurs\nextensions:\n  ameesh:\n    scope: ameesh\n"))
+        commit_all(clone)
+        loaded = canon.load(clone, default=False)
+        self.assertEqual(loaded.scopes, {"home": ["ameesh"]})
+        self.assertEqual(canon.errors(canon.validate(loaded)), [])
+
+    def test_extensions_perimetre_d_un_autre_membre(self):
+        _bare, outil = publish(self.workspace, "outil")
+        write(outil, "knowledge/index.md", "---\ntype: Index\ntitle: outil\n---\n")
+        write(outil, "knowledge/agents/sous-agent.md", SOUS_AGENT % "sous-agent")
+        write(outil, "knowledge/ameesh/agents/t5.md", agent("t5", "bob", harness="codex"))
+        write(outil, "knowledge/ameesh/placements/t5.md", admission("t5"))
+        commit_all(outil, "membre outil")
+        entry = ("  - id: outil\n    ref: main\n    bundle: knowledge\n"
+                 "    entrypoint: index.md\n    workspace_path: outil\n"
+                 "    enforcement: migrating\n")
+        clone = self.acme(extra_members=entry)
+        write(clone, "federation.yaml", federation(
+            ID_T, "t", "extensions:\n  ameesh:\n    scope: ameesh\n    members:\n"
+                       "      outil:\n        scope: ameesh\n", entry))
+        commit_all(clone)
+        loaded = canon.load(clone, default=False)
+        found = canon.validate(loaded)
+        self.assertEqual(canon.errors(found), [], [f.to_dict() for f in found])
+        self.assertEqual(loaded.scopes, {"home": ["ameesh"], "outil": ["ameesh"]})
+        self.assertNotIn("ameesh-scope-legacy", codes(found, canon.WARNING))
 
     def test_sans_cle_rien_ne_change(self):
         loaded = canon.load(self.manaty())
