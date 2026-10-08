@@ -31,5 +31,5 @@ def handle(event, context):  # noqa: ARG001 - signature imposée par le runtime
         except (KeyError, ValueError, OSError) as error:
             log_event(evt="chat", status=503, code="config_" + type(error).__name__)
             return {"statusCode": 503, "headers": {"Content-Type": "application/json", "Cache-Control": "no-store"},
-                    "body": '{"error": "unavailable", "docs": "https://ameesh.manaty.net/docs/"}'}
+                    "body": '{"error": "unavailable", "docs": "https://ameesh.org/docs/"}'}
     return _APP.handle(event)

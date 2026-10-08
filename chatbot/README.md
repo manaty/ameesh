@@ -65,7 +65,7 @@ environment variables, never in the repository or the page.
 | `DEEPSEEK_API_KEY` | — | **secret**, required: a dedicated key, with a spending limit on the provider side too |
 | `CHAT_API_BASE` | `https://api.deepseek.com` | OpenAI-compatible base URL (HTTPS) |
 | `CHAT_MODEL` | `deepseek-flash` | model name as the API expects it (check the provider's model list) |
-| `ALLOWED_ORIGINS` | `https://ameesh.manaty.net` | comma-separated; CORS and POST are refused for other origins |
+| `ALLOWED_ORIGINS` | `https://ameesh.org` | comma-separated; CORS and POST are refused for other origins |
 | `MONTHLY_CAP_USD` | `20` | spend cap per calendar month (UTC) |
 | `DAILY_CAP_USD` | `MONTHLY_CAP_USD × 2 / 30` | spend cap per day (UTC) |
 | `MAX_REQUESTS_PER_DAY` | `2000` | model calls per day, all visitors |
@@ -183,7 +183,7 @@ scw function namespace create name=<namespace> region=fr-par
 scw function function create namespace-id=<namespace-id> name=<function> \
   runtime=python313 handler=handler.handle privacy=public http-option=redirected \
   min-scale=0 max-scale=1 memory-limit=256 timeout=30s \
-  environment-variables.ALLOWED_ORIGINS=https://ameesh.manaty.net \
+  environment-variables.ALLOWED_ORIGINS=https://ameesh.org \
   environment-variables.STATE_BUCKET=<bucket> \
   environment-variables.STATE_S3_REGION=fr-par \
   secret-environment-variables.0.key=DEEPSEEK_API_KEY \

@@ -51,7 +51,7 @@ class Config:
     api_key: str = ""
     api_base: str = "https://api.deepseek.com"
     model: str = "deepseek-flash"
-    allowed_origins: tuple = ("https://ameesh.manaty.net",)
+    allowed_origins: tuple = ("https://ameesh.org",)
     monthly_cap_usd: float = 20.0
     daily_cap_usd: float | None = None
     max_requests_per_day: int = 2000
@@ -80,7 +80,7 @@ class Config:
             raw = env.get(name)
             return kind(raw) if raw not in (None, "") else default
 
-        origins = env.get("ALLOWED_ORIGINS", "https://ameesh.manaty.net")
+        origins = env.get("ALLOWED_ORIGINS", "https://ameesh.org")
         return cls(
             api_key=env.get("DEEPSEEK_API_KEY", ""),
             api_base=env.get("CHAT_API_BASE", cls.api_base),

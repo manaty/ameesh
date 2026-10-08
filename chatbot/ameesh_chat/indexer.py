@@ -14,7 +14,7 @@ import os
 import re
 import unicodedata
 
-SITE_BASE = "https://ameesh.manaty.net/docs/"
+SITE_BASE = "https://ameesh.org/docs/"
 DESIGN_BASE = "https://github.com/manaty/ameesh/blob/main/docs/design/"
 MAX_CHARS = 1400
 

@@ -10,7 +10,7 @@
   var endpoint = (window.AMEESH_CHAT_ENDPOINT || "").trim();
   if (!endpoint || !/^https:\/\//.test(endpoint) || document.getElementById("amc-root")) return;
 
-  var DOCS = "https://ameesh.manaty.net/docs/";
+  var DOCS = "https://ameesh.org/docs/";
   var MAX_CHARS = 500;
   var MAX_HISTORY = 6;
   var TIMEOUT_MS = 35000;

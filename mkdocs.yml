@@ -6,7 +6,7 @@ site_description: >-
   ameesh coordinates mixed teams of humans and AI agents across Claude Code,
   Codex and DeepSeek Harness: canon as code, one runner per host, readable
   threads, and irreversible actions behind a gate with passkey-signed receipts.
-site_url: https://ameesh.manaty.net/docs/
+site_url: https://ameesh.org/docs/
 repo_url: https://github.com/manaty/ameesh
 repo_name: manaty/ameesh
 edit_uri: ""
