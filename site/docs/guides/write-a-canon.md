@@ -64,12 +64,29 @@ policy:
     - codex
   providers: [deepseek, openai]
   credential_modes: [api-key]
+  work_roots: {acme-web: /srv/acme/acme-web}
   max_agents: 2
 ---
 ```
 
 The host name is what the runner of that machine uses (`AMEESH_HOST`, else the
 machine's host name).
+
+The host also says **where agents work**: `policy.work_roots` gives a working
+directory per team (here every `acme-web` agent on `banc` works in
+`/srv/acme/acme-web`). Since v1.3.1, `policy.work_dirs` names a directory per
+agent, and the `{agent}` template gives one worktree per agent:
+
+```yaml
+policy:
+  work_roots: {acme-web: "/srv/acme/acme-web-{agent}"}   # /srv/acme/acme-web-ouvrier, …
+  work_dirs: {relecteur: /srv/acme/review}               # a named exception
+```
+
+The first path found wins: `work_dirs[<agent>]`, then `work_roots[<team>]`,
+then `work_root/<team>`. Optional `policy.resources` limits (memory, swap,
+load, disk) are described in
+[Runner and leases](../concepts/runner-and-leases.md#host-resources-and-back-pressure).
 
 ## 4. Agents
 
@@ -99,15 +116,24 @@ Every agent needs a `responsible` human, and none may have `approve`.
 type: Placement
 title: ouvrier@banc
 agent: ouvrier
-host: banc
+hosts: [banc]
 credential_mode: api-key
-cwd: /srv/acme/ouvrier
 ---
 ```
 
-Exactly one placement per agent. Secrets (API keys, subscription tokens) are
-**never** in the canon: the placement only says which credential mode is used;
-the secret is installed on the host.
+Exactly one placement per agent. A placement is an **admission**: `hosts`
+lists the hosts where the agent may run, in order of preference (or
+`host_tags` names host tags); it carries no working directory, which comes
+from the host. Secrets (API keys, subscription tokens) are **never** in the
+canon: the placement only says which credential mode is used; the secret is
+installed on the host.
+
+!!! note "Older placements with `host:` and `cwd:`"
+    A card with a single `host:` is still read. Its `cwd:` is ignored when the
+    host's policy gives a directory (`admission-cwd-ignored`); otherwise it is
+    used as a transitional fallback, with the warning
+    `admission-cwd-inherited`. That fallback is removed in v1.5.0 at the
+    latest: move the directory to the host's `work_dirs` or `work_roots`.
 
 ## 6. Review policies (optional)
 
@@ -176,3 +202,60 @@ Every later change (a new agent, a passkey, a moved placement, a stricter host
 policy) is a pull request, reviewed according to the federation's policy, then
 `ameesh canon sync --fetch` on each host. A pull request that is not merged has
 no effect.
+
+## 10. A second canon on the same host
+
+Since v1.4.0 a host can also run agents declared in another organisation's
+canon, next to its own (see
+[The canon](../concepts/canon.md#several-canons-on-one-host)). Say a partner
+keeps its canon in `~/development/partner/home`, a federation whose `id` is
+`partner`, shared with other tools.
+
+1. **ameesh cards in the second canon**, by a reviewed and merged pull request
+   on that canon:
+    - in `federation.yaml`, `extensions: {ameesh: {scope: ameesh}}`, so that
+      ameesh reads only the `ameesh/` folder and ignores other files of the same
+      `type`;
+    - a `Member` card for each human responsible there (humans are resolved in
+      the agent's own canon);
+    - a `Host` card for this host: that canon's policy here (harnesses,
+      providers, modes, `work_dirs` of its agents). Give it the **same
+      `max_agents`** as the first canon's card: the smallest one caps the
+      whole runner;
+    - an `Agent` and a `Placement` card for each of its agents.
+
+    Check the branch before merging:
+    `ameesh canon check --canon <checkout of the branch> --ref HEAD` (0 errors).
+
+2. **Host configuration**: turn `canon` into a list, keeping the `acme` canon
+   **first** (it stays the default canon; do not reorder in the same step):
+
+    ```json
+    "canons": [
+      {"path": "~/canon", "ref": "origin/main"},
+      {"path": "~/development/partner/home", "ref": "origin/main"}
+    ]
+    ```
+
+    The second `ref` is its trusted branch for passkeys; without it, bootstrap
+    it once with `ameesh canon sync --canon partner --bootstrap-ref main`.
+
+3. **Check**, before starting anything:
+
+    ```bash
+    ameesh canon check                        # one block per canon, both valid
+    ameesh canon sync --fetch                 # each canon touches only its own rows
+    ameesh placement check --canon partner     # the partner's agents admitted here
+    ameesh hosts                              # where each physical limit comes from
+    ```
+
+4. **Agents**: `ameesh resume <agent>` (or `ameesh adopt` for an existing
+   interactive session) to put them in service under the runner.
+
+To move an agent from one canon to the other, remove its card from the old
+canon first (the agent is stopped, its name freed), then declare it in the new
+one. In the other order the second canon gets `canon-name-conflict` and writes
+nothing.
+
+**Rollback**: remove the second canon from `canons`. Its agents are no longer
+claimable, nothing is stopped or deleted, and the first canon is untouched.

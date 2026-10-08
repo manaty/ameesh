@@ -52,6 +52,26 @@ least `AMEESH_SESSION_MIN_TURNS` turns (default 3) and **never during a turn**:
 3. the old session id is kept in the agent's session history;
 4. the next turn opens a **new** session, prefixed with the summary.
 
+## Adopting and resuming a session
+
+Since v1.4.0, putting a session back under ameesh is an operation of ameesh,
+never a prompt such as "resume session X":
+
+- `ameesh adopt <agent> --session ID --harness H` puts an **existing
+  interactive session**, once closed, under the runner. It finds the session
+  file under the harness's declared accounts and records the **account of
+  origin** of the session.
+- `ameesh resume <agent> [--fresh] [--brief FILE]` restarts a stopped, dead or
+  idle agent. It keeps the recorded session when the account of the next turn
+  can resume it; if the old account is still usable but the session cannot
+  move, the runner rotates at the first turn with a summary written under the
+  account of origin; otherwise (or with `--fresh`) the fresh session opens on
+  a **deterministic resume brief** that ameesh builds without calling a model
+  (identity and role, open lots and what they wait for, recent thread
+  exchanges, unread count, path of the old transcript).
+
+See [Operate agents](../guides/operate-agents.md#adopt-an-interactive-session-ameesh-adopt).
+
 ## Moved working directories
 
 When an agent is registered, the git identity of its working directory
@@ -59,6 +79,9 @@ When an agent is registered, the git identity of its working directory
 example a renamed worktree), a **unique** candidate is searched under
 `AMEESH_WORKTREE_ROOTS`, with bounded depth. It is adopted (registry updated,
 thread notified) only if it is not already another agent's working directory.
+The working directory itself comes from the host's policy (see
+[Runner and leases](runner-and-leases.md#working-directory)); a directory that
+is missing blocks the agent until it comes back.
 
 ## Model and effort per agent
 

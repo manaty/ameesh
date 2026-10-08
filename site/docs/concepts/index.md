@@ -37,7 +37,7 @@ receipts with ameesh.
 | **member** | a human (`human:<id>`) or an agent (`agent:<id>`) |
 | **card** | the declaration of a member, a host or a placement in the canon |
 | **host** | a machine or a cluster, with a responsible human and a policy |
-| **placement** | "this agent runs on this host, with this credential mode" |
+| **placement** | an admission: "this agent may run on these hosts (by name or tag), with this credential mode" |
 | **lot** | a unit of work (`work_items` in the database), with milestones requested → frozen → verdict → merged |
 | **action** | an effect on the outside world, classed `read`, `reversible`, `irreversible` or `costly` |
 | **receipt** | the signed proof that a human approved one attempt of an action |
