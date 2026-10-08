@@ -105,6 +105,22 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _stdout_closed() -> bool:
+    """Le lecteur de la sortie standard l'a-t-il fermée ? `poll` sur le
+    descripteur d'abord (POLLERR sur un tube sans lecteur) : après l'échec d'un
+    `print`, le tampon peut déjà être vide et `flush()` réussir quand même."""
+    try:
+        fd = sys.stdout.fileno()
+    except (AttributeError, ValueError, OSError):
+        fd = None
+    if fd is not None:
+        try:
+            import select
+            poller = select.poll()
+            poller.register(fd, select.POLLOUT)
+            if any(ev & (select.POLLERR | select.POLLHUP) for _, ev in poller.poll(0)):
+                return True
+        except (AttributeError, OSError, ValueError):
+            pass  # pas de poll (Windows) : le repli suffit
     try:
         sys.stdout.flush()
     except BrokenPipeError:

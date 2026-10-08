@@ -26,7 +26,25 @@ class _SortieFermee:
         self._fd = fd
 
 
+class _TamponDejaVide(_SortieFermee):
+    """Cas vu en CI : le `print` a échoué, mais le tampon est déjà vide et
+    `flush()` réussit — seul le descripteur dit que le lecteur est parti."""
+
+    def flush(self):
+        return None
+
+
 class TubeFermeTest(unittest.TestCase):
+    def test_tampon_deja_vide_code_141(self):
+        r, w = os.pipe()
+        os.close(r)
+        try:
+            with mock.patch.object(sys, "stdout", _TamponDejaVide(w)), \
+                    mock.patch.object(main_mod, "_dispatch", side_effect=BrokenPipeError):
+                self.assertEqual(main_mod.main(["alerts"]), 141)
+        finally:
+            os.close(w)
+
     def test_sortie_fermee_code_141(self):
         r, w = os.pipe()
         os.close(r)
