@@ -231,6 +231,10 @@ class AgentWorker(threading.Thread):
         self.proc: subprocess.Popen | None = None
         self.lock = threading.Lock()
         self.nudged = False
+        #: L48 : le dernier tour a échoué vite (harnais absent, introuvable,
+        #: sorti en erreur en moins de FAST_FAILURE_S) ; et leur série
+        self.fast_failure = False
+        self.fast_failures = 0
         self.last_activity = time.monotonic()
         self.state_dir = self.cfg.agent_dir(self.name)
         self.renew_failures = 0
@@ -1559,6 +1563,7 @@ class AgentWorker(threading.Thread):
         pas soldée ; elle expire ou change d'epoch, le message est remis plus
         tard et signalé « re-livré » — un doublon signalé, jamais une perte.
         """
+        self.fast_failure = False
         candidats = spec.get("candidats")
         # Dernier contrôle avant de consommer quoi que ce soit (L31, 0028) :
         # couvre les tours ouverts directement (résumé de rotation de compte).
@@ -1935,6 +1940,7 @@ class AgentWorker(threading.Thread):
             # B6a : le tour n'a pas abouti, la consigne repart en attente au lieu
             # d'être effacée par end_turn. Au pire elle est rejouée.
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            self.fast_failure = duration < self.runner.fast_failure_s
         registry.end_turn(
             self.db, self.name, self.runner.runner_id, self.epoch,
             status=status,
@@ -1950,8 +1956,43 @@ class AgentWorker(threading.Thread):
             self.runner.turns += 1
         return ok
 
+    def failure_wait(self) -> float:
+        """Attente avant le tour suivant après un échec : doublée à chaque échec
+        rapide consécutif, bornée par `failure_backoff_max` (L48)."""
+        base = self.runner.failure_backoff
+        if self.fast_failures <= 1:
+            return base
+        return min(self.runner.failure_backoff_max,
+                   base * (2 ** (self.fast_failures - 1)))
+
+    def stop_after_failures(self) -> None:
+        """L48 : trop d'échecs rapides consécutifs (harnais introuvable, qui
+        sort aussitôt…) : on arrête l'agent (`stop_reason` = erreur) au lieu de
+        relancer sans fin. La consigne reste en attente ; l'alerte d'agent
+        arrêté prévient le responsable ; `ameesh resume` le relance."""
+        n = self.fast_failures
+        derniere = (self.agent or {}).get("last_error") or ""
+        try:
+            fresh = registry.get(self.db, self.name) or {}
+            derniere = fresh.get("last_error") or derniere
+        except db_mod.DbError:
+            pass
+        texte = "arrêté après %d échecs rapides consécutifs" % n
+        log("[%s] %s : %s" % (self.name, texte, derniere or "cause inconnue"))
+        try:
+            registry.set_status(self.db, self.name, "stopped", status_text=texte,
+                                error=derniere or None, stop_reason="erreur")
+        except db_mod.DbError as exc:
+            log("[%s] arrêt après échecs non enregistré : %s" % (self.name, exc))
+        self._fil_note(
+            "Agent arrêté par l'exécuteur après %d échecs rapides consécutifs "
+            "(dernière erreur : %s). La consigne reste en attente ; corriger la "
+            "cause puis `ameesh resume %s`." % (n, derniere or "inconnue", self.name),
+            meta={"action": "arret_apres_echecs", "echecs": n})
+
     def fail_turn(self, status_text: str, error: str) -> None:
         """Un tour qui n'a pas pu démarrer : la consigne repart en attente (R5)."""
+        self.fast_failure = True
         registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
         registry.set_status(self.db, self.name, "blocked",
                             status_text=status_text, error=error)
@@ -1994,11 +2035,19 @@ class AgentWorker(threading.Thread):
                         min(self.runner.poll, max(1.0, self.runner.lease_ttl / 3.0))))
                     self.wake.clear()
                     continue
-                if not self.run_turn(spec):
-                    # Un message non remis ou un harnais en échec ne doit pas
-                    # produire une boucle serrée : on laisse retomber.
-                    self.wake.wait(timeout=self.runner.failure_backoff)
-                    self.wake.clear()
+                if self.run_turn(spec):
+                    self.fast_failures = 0
+                    continue
+                if self.fast_failure:
+                    self.fast_failures += 1
+                    if self.fast_failures >= self.runner.max_fast_failures:
+                        self.stop_after_failures()
+                        break
+                # Un message non remis ou un harnais en échec ne doit pas
+                # produire une boucle serrée : on laisse retomber, de plus en
+                # plus longtemps tant que les échecs rapides se suivent (L48).
+                self.wake.wait(timeout=self.failure_wait())
+                self.wake.clear()
         finally:
             self.release_lease()
 
@@ -2038,6 +2087,11 @@ class Runner:
         self.session_min_turns = max(0, int(cfg.session_min_turns))
         self.worktree_roots = tuple(cfg.worktree_roots)
         self.failure_backoff = 5.0
+        #: L48 : attente maximale entre deux tours en échec, durée sous laquelle
+        #: un échec compte comme rapide, et série d'échecs rapides qui arrête l'agent
+        self.failure_backoff_max = max(self.failure_backoff, cfg.failure_backoff_max)
+        self.fast_failure_s = max(0.0, cfg.fast_failure_s)
+        self.max_fast_failures = max(1, int(cfg.max_fast_failures))
         self.stop = threading.Event()
         self.wake_all = threading.Event()
         self.workers: dict[str, AgentWorker] = {}
