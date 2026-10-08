@@ -60,6 +60,7 @@ Rien d'autre : ce fichier ne fait que router vers les modules, pour que
 """
 from __future__ import annotations
 
+import os
 import sys
 
 #: sous-commandes servies par mesh_cli (parseur déjà en place)
@@ -89,6 +90,45 @@ ACTION_COMMANDS = ("action", "decisions")
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        return _dispatch(argv)
+    except BrokenPipeError:
+        # `ameesh alerts | head` : le lecteur a fermé la sortie, ce n'est pas
+        # une erreur. Seul ce cas est absorbé ; un tube cassé ailleurs (harnais,
+        # socket) remonte tel quel.
+        if not _stdout_closed():
+            raise
+        # la sortie restante irait au tube fermé, et Python le signalerait
+        # encore à l'arrêt : on la jette
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 141  # 128 + SIGPIPE, comme le shell
+
+
+def _stdout_closed() -> bool:
+    """Le lecteur de la sortie standard l'a-t-il fermée ? `poll` sur le
+    descripteur d'abord (POLLERR sur un tube sans lecteur) : après l'échec d'un
+    `print`, le tampon peut déjà être vide et `flush()` réussir quand même."""
+    try:
+        fd = sys.stdout.fileno()
+    except (AttributeError, ValueError, OSError):
+        fd = None
+    if fd is not None:
+        try:
+            import select
+            poller = select.poll()
+            poller.register(fd, select.POLLOUT)
+            if any(ev & (select.POLLERR | select.POLLHUP) for _, ev in poller.poll(0)):
+                return True
+        except (AttributeError, OSError, ValueError):
+            pass  # pas de poll (Windows) : le repli suffit
+    try:
+        sys.stdout.flush()
+    except BrokenPipeError:
+        return True
+    return False
+
+
+def _dispatch(argv: list[str] | None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__)

@@ -75,10 +75,12 @@ stop the database. Nothing depends on it yet.
 
 Create the project's canon on the model of
 [Write a canon](write-a-canon.md): a `Member` per human (`authenticators: []`
-for now), a `Host` for this machine with its policy, and an `Agent` (with
-`responsible`, without `approve`) and a `Placement` (`cwd` = the agent's
-current working directory) for **every** agent of the step 0 map, including
-orchestrators. There is no generator yet: the cards are written by hand (or
+for now), a `Host` for this machine with its policy (including
+`policy.work_dirs` or `work_roots`: each agent's current working directory),
+and an `Agent` (with `responsible`, without `approve`) and a `Placement`
+(`hosts: [<this host>]`) for **every** agent of the step 0 map, including
+orchestrators. A human's interactive session that should keep receiving mail
+is an agent in `externe` mode (see step 8). There is no generator yet: the cards are written by hand (or
 drafted by an agent) and the owner reviews the pull request.
 
 ```bash
@@ -264,9 +266,12 @@ WantedBy=multi-user.target
 
 After each merged canon pull request: `ameesh canon sync --fetch` on each host
 (by hand or with a timer). Watch: `ameesh alerts --follow --json` (long turn,
-idle with mail, dead runner, session too big, stale lot), `ameesh decisions`
-(pending approvals, unknown outcomes), the canon state per host. See
-[Operate agents](operate-agents.md).
+idle with mail, dead runner, session too big, stale lot, host pressure,
+stopped with mail, orphan lot, expired delegation), `ameesh decisions`
+(pending approvals, unknown outcomes), the canon state per host. To have those
+alerts **pushed** to the responsible human, run `ameesh notify` as a user
+service next to the runner (example unit `deploy/systemd/ameesh-notify.service`;
+see [Operate agents](operate-agents.md#pushed-alerts-ameesh-notify)).
 
 **Rollback:** disable the runner service (leases released, harness groups
 killed), then step 4's rollback agent by agent; disable ameesh-approve.
@@ -280,6 +285,114 @@ tested restore.
 
 **Rollback:** reinstall the scripts from the backup, point `agent-mail` back to
 v0, `ameesh export-v0` for the mail, then the v0 loops (step 4 rollback).
+
+### Moving the hooks to v1 ahead of step 8
+
+The v0 `agent-mail` takes an identity from the working directory and reads only
+the file mailbox, so a human's interactive session can pick up another agent's
+identity and never sees its v1 mail. Since v1.4.0 (decision 0030), the hooks can
+move to v1 before the rest of step 8; the v1 hook takes an identity only from
+`AGENT_MAIL_NAME` (with the runner's lease) or from an explicit **session
+binding**, and delivers nothing otherwise. An owner's act **[O]**:
+
+1. Prerequisites: `ameesh migrate` applied; no agent still run by a v0 loop
+   (after the switch, `agent-mail send` and `inbox` talk to the database);
+   pending v0 mail of external sessions imported (`ameesh import-v0 --agents
+   <names>`). Back up `agent-mail` and the harness configurations.
+2. If a local wrapper sets `AGENT_MAIL_NAME` for some sessions, **remove it
+   first** from the harness configurations (hooks call `agent-mail hook
+   <harness>` directly), while `agent-mail` is still v0.
+3. Bind each interactive session to keep reachable:
+   `ameesh mail bind <agent> --session <id> --harness <h> --pid <PID>` (or
+   `ameesh mail bind --import <file>` from a wrapper's bindings file), then
+   `ameesh mail bindings`. Agents born from such sessions are `externe`.
+4. Last, point `agent-mail` to the v1 entry point of the venv.
+
+Check: in a bound session, `agent-mail whoami` shows the agent with source
+`session`; in an unbound session it answers `identité non liée` ("identity not
+bound", exit 1) and
+nothing is delivered. **Rollback**, symmetric: restore the v0 `agent-mail` and
+the harness configurations from the backup, `ameesh export-v0 --agents
+<names>` for mail that arrived meanwhile, and `ameesh mail unbind` the
+bindings if you give up.
+
+## Upgrading an existing installation
+
+### To v1.3.x: working directories from the host
+
+Since v1.3.0, an agent's working directory comes from its host's `Host` card
+(`policy.work_roots`, `work_root`), no longer from the `cwd` of `Placement`
+cards; v1.3.1 adds `policy.work_dirs`, the `{agent}` template and a
+transitional fallback to the old placement `cwd` (warning
+`admission-cwd-inherited`, removed in v1.5.0). A v1.3.0 binary ignores
+`work_dirs` and copies `{agent}` literally, so the order matters:
+
+1. Write the new settings on a canon branch **without merging it**, and check
+   it with the new binary, outside the host's installation:
+   `ameesh canon check --canon <checkout> --ref origin/<branch>` (0 errors, no
+   `admission-cwd-inherited` nor `host-work-dir-missing`).
+2. Stop the old runner (and with it its periodic `canon sync`).
+3. Install the new version; `ameesh canon check --fetch` on the current canon
+   shows where the fallback is still used.
+4. Merge the canon pull request, `ameesh canon check --fetch`, then
+   `ameesh canon sync --fetch`; `ameesh list --json` shows a distinct, existing
+   `cwd` for each agent.
+5. Start the runner. An agent left `blocked` ("directory missing") resumes by
+   itself once its `cwd` is right.
+6. Later, remove `cwd` from the `Placement` cards.
+
+Rolling back to v1.3.0 needs a canon it reads the same way: one directory per
+team (`work_roots` without `{agent}`, no `work_dirs`) before any v1.3.0 sync.
+
+### To v1.4.0: migrations 0030 to 0036
+
+v1.4.0 brings the migrations **0030 to 0036** (agent mode and stop reason,
+delegations, several canons, the session's account, session bindings,
+authenticators per canon, and review fixes). **0032 and 0035 change unique
+keys that older code writes to**: after the migration, an older runner's
+canon sync and passkey sync fail. Therefore **every host and every service
+that shares the database** (runners, ameesh-approve, `ameesh notify`, canon
+sync timers, v1 `agent-mail` hooks) is stopped, upgraded **together**, and
+restarted. Migrations are not undone: the **backup taken before
+`ameesh migrate` is the only rollback**.
+
+```bash
+systemctl --user stop agent-runner ameesh-notify      # on EACH host
+sudo systemctl stop ameesh-approve                    # [O]
+ameesh list                                           # no live lease left
+
+pg_dump --format=custom --file ~/backups/ameesh-before-1.4.0-$(date +%F-%H%M).dump "$AMEESH_DSN"
+
+# install v1.4.0 in the venv of each host (and of ameesh-approve [O]), then ONCE:
+ameesh migrate                                        # applies 0030 … 0036
+
+# [O] re-run the SQL roles (idempotent): ameesh-approve now reads actions.canon and
+# authenticators.canon (it answers 503 otherwise); the supervisor reads the new columns
+PGOPTIONS='-c search_path=<schema>' psql "<admin DSN>" -v ON_ERROR_STOP=1 -f deploy/sql/role-approve.sql
+PGOPTIONS='-c search_path=<schema>' psql "<admin DSN>" -v ON_ERROR_STOP=1 -f deploy/sql/role-superviseur.sql
+
+# 0030 gives mode=execute to every existing row: reclassify humans' sessions by hand
+ameesh set <agent> mode=externe                       # an external agent needs a responsible human
+
+systemctl --user start agent-runner ameesh-notify     # on each host
+sudo systemctl start ameesh-approve                   # [O]
+```
+
+Then check: no human session left in `execute` mode; `ameesh canon check` and
+`ameesh list` (canon agents `idle`, canon `ok` on each host); `ameesh alerts`
+without unexpected `dead_runner` or `orphan_lot` (an old stop without a reason
+raises `stopped_with_mail` if it has mail: restart it or stop it again with
+`agent-runner stop`); ameesh-approve answers (no 503);
+`ameesh notify --once --dry-run`.
+
+Visible changes: `send all` reaches only the sender's team; `work add
+--assignee` and `work assign` refuse an unknown name and an external agent
+without `--externe`; the strictest `max_agents` of a host's `Host` cards caps
+the runner; `ameesh mail bind` refuses an `execute` agent without `--force`.
+
+**Rollback**: stop every service again, restore the backup
+(`pg_restore --clean --if-exists -d "$AMEESH_DSN" <file>`), reinstall the old
+code on each host, restart. Never the old code on the migrated database.
 
 ## Risks and countermeasures
 
@@ -297,3 +410,6 @@ v0, `ameesh export-v0` for the mail, then the v0 loops (step 4 rollback).
 | two concurrent `canon sync` (two hosts, an old canon) | registry lock taken before the check, monotonicity: an old commit never re-activates a removed passkey |
 | a replayed receipt | nonce consumed at launch, in the database |
 | the machine's disk dies | daily `pg_dump` off the machine, restore drill of step 1 |
+| upgrading a host whose working directories are not declared (v1.3.x) | transitional fallback to the placement `cwd`; stop the old runner, install and validate with the new binary **before** publishing `work_dirs` / `{agent}`; `canon check` warns `admission-cwd-inherited` / `host-work-dir-missing` |
+| an older host left running on a database migrated to v1.4.0 | all hosts and services stopped and upgraded together; backup before `ameesh migrate`; never old code on a migrated database |
+| a human's session takes another agent's identity from its folder (v0 hooks) | hooks moved to v1: identity from `AGENT_MAIL_NAME` or an explicit session binding, ancestor PID checked; without a binding nothing is delivered |

@@ -46,6 +46,62 @@ These lots are built and reviewed on the development line:
   passthrough gateway, a read-only database role per team, acceptance tests
   with two teams.
 
+## v1.3.0 and v1.3.1: host resources and working directories
+
+- **host resources**: each runner publishes memory, swap, load and disk
+  readings, `ameesh hosts`; limits in `policy.resources` of the `Host` card;
+  back-pressure before each turn (new turns held, lowest-priority agents
+  paused under critical pressure, never mid-turn); orphan turn resources
+  reported (`host_pressure`, `orphan_resource` alerts);
+- **admissions**: a `Placement` lists admitted hosts or host tags, without a
+  working directory; optional move to another admitted host between two turns
+  (`AMEESH_RELOCATE`); persona visibility rule for memory repositories;
+- **working directories from the host**: `policy.work_roots`, `work_root`, and
+  in v1.3.1 `policy.work_dirs` with the `{agent}` template; a transitional
+  fallback to the old placement `cwd` (`admission-cwd-inherited`, removed in
+  v1.5.0 at the latest); a missing directory blocks the agent with a single log
+  line and it resumes by itself when the directory comes back.
+
+## v1.4.0: no work without a way to wake the agent, several canons
+
+Design decision 0030, **no work without a way to wake the agent**:
+
+- explicit **agent mode** `execute` or `externe` (`ameesh set <agent>
+  mode=…`), structured **stop reason**; the runner never claims an external
+  agent;
+- **guarded assignment**: `ameesh work add --assignee` and `ameesh work
+  assign` give lots only to agents ameesh can wake; **delegation with a
+  deadline** (`ameesh work delegate --within`, `ameesh work
+  expire-delegations`): an untouched lot goes back to the delegator;
+- **adopt and resume** as ameesh operations: `ameesh adopt`, `ameesh resume
+  [--fresh] [--brief]`, with the session's account of origin and a
+  deterministic resume brief;
+- new alerts `stopped_with_mail`, `orphan_lot`, `delegation_expired`, and
+  **pushed alerts** to the responsible human with `ameesh notify` (desktop,
+  ntfy, Slack; secrets only from the environment or a `0600` file; systemd
+  user unit);
+- **explicit session bindings** (`ameesh mail bind|unbind|bindings`): an
+  identity never comes from the folder; `send all` reaches only the sender's
+  team; `ameesh list` shows a LOTS column.
+
+Design decision 0031, **several canons on one host**:
+
+- a list of canons (`canons`, `AMEESH_CANONS`), the first being the default;
+  a canon identified by its federation id; prefixed references for the other
+  canons;
+- each sync touches only its canon, with a canon state per (host, canon);
+  names global to their first declarer; humans resolved in the agent's canon;
+- a `Host` card per canon, with the strictest physical limits applied;
+  authenticators tracked per canon;
+- `extensions.ameesh.scope` in `federation.yaml` to bound ameesh cards to a
+  folder of a shared canon (the older top-level `ameesh:` key is still read,
+  with a warning);
+- `ameesh canon check|show|sync --canon <id>`.
+
+Also: `ameesh …` exits quietly with code 141 when the reader closes its output
+(`ameesh alerts | head`). Upgrading needs migrations 0030 to 0036 on all hosts
+at once: see [Upgrading an existing installation](guides/switch-from-v0.md#to-v140-migrations-0030-to-0036).
+
 ## Planned
 
 In no particular order, and without dates:

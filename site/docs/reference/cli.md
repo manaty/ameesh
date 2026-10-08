@@ -17,6 +17,11 @@ From a clone, `bin/ameesh`, `bin/agent-mail`, `bin/agent-runner` and
 `bin/ameesh-approve` do the same with `PYTHONPATH=src`, or use
 `PYTHONPATH=src python3 -m ameesh …`.
 
+**Closed output.** When the reader closes `ameesh`'s standard output (for
+example `ameesh alerts --json | head`), the command stops quietly, without a
+traceback, with exit code **141** (128 + `SIGPIPE`, as the shell reports it).
+A broken pipe anywhere else (a harness, a socket) is still an error.
+
 ## Mailbox: `ameesh mail` / `agent-mail`
 
 ```
@@ -25,7 +30,12 @@ agent-mail send <dest|all> <text…> [--from NAME] [--lot ID]
                 [--sign --key FILE] [--expires 24h]
 agent-mail list                       # agents, host, lease, unread
 agent-mail inbox [NAME]               # unread messages of NAME, without marking them read
-agent-mail whoami                     # bound identity (name + lease); --cwd = diagnostic
+agent-mail whoami [--session ID --harness H]   # bound identity and its source (runner, explicit,
+                                               # session); --cwd = diagnostic
+agent-mail bind <NAME> --session ID --harness claude|codex|deepseek [--pid N] [--force]
+agent-mail bind --import FILE         # import bindings from a local bridge file
+agent-mail unbind --session ID --harness H
+agent-mail bindings [--all] [--json]  # active session bindings (--all: revoked ones too)
 agent-mail alias <NAME> <DIR> [PROJECT]
 agent-mail status "<current work>"    # agent status (registry + terminal title)
 agent-mail hook <claude|codex|deepseek>   # hook: reads JSON on stdin, delivers unread mail
@@ -39,6 +49,20 @@ The session identity is `$AGENT_MAIL_NAME` (set by the runner). If
 alive and held by that runner. The working directory never gives an identity.
 Hooks never fail the agent: any error exits 0 silently. A message from an agent
 never carries the owner's authority; the sender is shown.
+
+**Session bindings** (v1.4.0). A session started by a human (an *external*
+session) has an identity only if it is **bound**: `bind` links the harness's
+own session id to an agent on this host, and the hook finds it by the session
+id the harness passes. With `--pid`, the bound PID must be an ancestor of the
+hook (recommended: without it, anyone who knows the session id on this host
+receives the agent's mail). Without `AGENT_MAIL_NAME` and without a binding,
+the hook **delivers nothing and writes nothing**. An agent in `execute` mode
+(run by a runner) is refused unless `--force`, since an external session would
+steal its mail; an agent holding a live lease never binds. `unbind` revokes the
+binding of one session.
+
+`send all` reaches only the sender's **team** (or project); a sender with
+neither keeps the global broadcast.
 
 `--kind event` wakes the agent like a message, coalesced (see
 `AMEESH_EVENT_COALESCE`); `--urgent` pierces the coalescing and, from an
@@ -86,6 +110,7 @@ end of a running turn; `--ttl` sets the lease duration.
 ```
 ameesh list [--json]                       # every agent (--json: schema ameesh-agent/1)
 ameesh show <agent> [--json]               # one agent
+ameesh hosts [HOST] [--history N] [--json] # host resources: last reading, limits, short history
 ameesh decisions [--for human:ID] [--json] # what waits for a human
 ameesh progress [--json] [--html FILE] [--project P] [--since SINCE]
 ameesh cost report [--json]                # agent, harness, model, spend, gauges
@@ -99,14 +124,29 @@ ameesh cost balance [--provider deepseek] [--record] [--since SINCE] [--json]
 `--since` takes a duration (`16h`, `2d`) or an ISO date. `cost balance
 --record` reads the balance now (read-only, free).
 
+`ameesh list` shows a **LOTS** column (open lots assigned to each agent) and
+prefixes the status of an external agent with `ext/`. `ameesh hosts` shows,
+per host, the last resource reading published by its runner (available memory,
+swap used, 1-minute load, free disk of the working directory, turns in
+progress), the effective limits and where each comes from, and the short
+history (`--history`, default 10 readings); `--json` gives one object per host
+(schema `ameesh-host/1`).
+
 ## Operating agents
 
 ```
 ameesh set <agent> key=value [key=value …]   # model=… effort=… tier=… session_policy=par-lot|taille|jamais
+                                             # mode=execute|externe
                                              # (empty value = default; effect at the next turn)
 ameesh alerts [--json] [--follow] [--interval S] [--long-turn S] [--idle-mail S]
               [--dead-grace S] [--session-tokens N] [--stale-lot S]
+              [--orphan-lot S] [--delegation-grace S]
+ameesh notify [--once] [--dry-run] [--json] [--interval S] [alert thresholds…]
+ameesh notify --test human:ID [--json]
 ameesh restart <agent> --brief FILE|- [--wait S] [--json]
+ameesh adopt <agent> --session ID --harness claude|codex|deepseek [--account ACCOUNT]
+             [--cwd DIR] [--brief FILE|-] [--chantier C] [--force] [--json]
+ameesh resume <agent> [--brief FILE|-] [--fresh] [--json]
 ameesh interrupt <agent> <message…> [--from SENDER]
 ```
 
@@ -119,10 +159,21 @@ ameesh interrupt <agent> <message…> [--from SENDER]
 | `--dead-grace` | lease expired for S seconds (default 30) |
 | `--session-tokens` | tokens re-read per turn above which the session is too big (default 15 M) |
 | `--stale-lot` | lot without activity for S seconds (default 21600 = 6 h) |
+| `--orphan-lot` | `intake`/`build` lot without activity nor a turn of its assignee for S seconds (default 1800) |
+| `--delegation-grace` | grace period after a delegation's deadline before `delegation_expired` is raised (default 300) |
+| `set … mode=` | `execute` (default: run by a runner under a lease) or `externe` (a human's session, mailbox only, never woken by ameesh) |
+| `notify --once` | a single pass, then exit |
+| `notify --dry-run` | print what would be sent; send nothing, write no state |
+| `notify --test` | a test message on each channel of that human (exit 0 if all pass, 1 otherwise, 2 without a channel) |
 | `restart --wait` | wait up to S seconds for the runner to apply the request |
+| `adopt --account` | look for the session file under this declared account only |
+| `adopt --force` | adopt even if a process still holds the session (warning in stderr and in the thread) |
+| `resume --fresh` | forget the recorded session and open a fresh one on a deterministic resume brief |
 | `interrupt --from` | sender (else the bound identity); must be an authorised sender |
 
-See [Operate agents](../guides/operate-agents.md) for the schemas.
+`ameesh notify` takes the same threshold options as `ameesh alerts`. See
+[Operate agents](../guides/operate-agents.md) for the schemas, the alert types,
+`adopt`, `resume` and the `notify` configuration.
 
 ## Readable threads: `ameesh fil`
 
@@ -137,13 +188,27 @@ ameesh fil tail <project> [<lot>] [--last N] [--meta] [--interval S]   # default
 ```
 ameesh work add --title TITLE [--type bug|evolution] [--source S] [--app APP]
                 [--body BODY] [--issue-ref REF] [--workstream W]
-                [--assignee A] [--budget USD] [--actor ACTOR]
+                [--assignee A] [--budget USD] [--actor ACTOR] [--externe]
 ameesh work list [--state S] [--assignee A] [--limit N] [--json]
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
+ameesh work assign <id> <agent> [--externe] [--actor A]
+ameesh work delegate <id> <agent> --within 30m|2h|1d|SECONDS [--actor A]
+ameesh work expire-delegations [--dry-run] [--json]
 ameesh work note <id> <text> [--actor A]
 ameesh work milestone <id> <frozen|verdict> [ok|blocked] [--sha SHA] [--note N] [--actor A]
 ```
+
+Since v1.4.0, `work add --assignee` and `work assign` give a lot only to an
+agent ameesh can **wake** (known, in `execute` mode, admitted on its host, with
+a responsible human when a canon is configured); otherwise they refuse with
+the reason (exit 1) and write nothing. A human (`human:<id>`) is always
+accepted. `--externe` forces the assignment to an external agent, only if it
+has a responsible human. `work delegate` hands a lot to a wakeable agent with a
+deadline: if the delegate has not worked on it by then, the lot goes back to
+the delegator (`--actor`, else the current assignee). The runner processes
+deadlines at every pass; `expire-delegations` does it by hand. See
+[Operate agents](../guides/operate-agents.md#guarded-assignment-and-delegation).
 
 ## Canon and placement
 
@@ -158,7 +223,7 @@ ameesh review-class [FILE …] [--diff REF] [--canon DIR] [--ref REV] [--fetch] 
 
 | Option | Meaning |
 |---|---|
-| `--canon` | canon root (else `AMEESH_CANON`) |
+| `--canon` | id of a configured canon (its federation id): only that canon; without it, `check`, `show` and `sync` process every configured canon, one block each (`{"canons": [...]}` in JSON). Also accepts a canon root (else `AMEESH_CANON`) |
 | `--ref` | canonical revision (else `AMEESH_CANON_REF`, the manifest's `ref`, `origin/main`) |
 | `--fetch` | `git fetch` before reading |
 | `--host` | host whose state is diagnosed or synced (else `AMEESH_HOST` / this machine) |
@@ -211,13 +276,15 @@ webauthn|ed25519|device-es256`, `--level standard|eleve`.
 ameesh receipt verify <file> [--rp-id RP_ID] [--origin ORIGIN]… [--allow-facade F]…
                       [--level standard|eleve] [--digest sha256:…] [--action-id ID]
                       [--kind action|standing|any] [--decision approve|deny|any]
-                      [--expect-commit SHA] [--consume] [--by BY] [--json]
-ameesh authenticator list [--approver human:ID] [--all] [--expect-commit SHA] [--json]
+                      [--expect-commit SHA] [--consume] [--by BY] [--canon ID] [--json]
+ameesh authenticator list [--approver human:ID] [--all] [--expect-commit SHA] [--canon ID] [--json]
 ```
 
 `--allow-facade` defaults to `webauthn` and `device-es256`. `--expect-commit`
 requires the authenticator to come from that canon commit. `--consume` consumes
 the nonce (single use). `authenticator list --all` includes revoked entries.
+With several canons, authenticators are kept per canon: `--canon ID` verifies a
+receipt against, or lists, the authenticators of that canon.
 
 ## Consistency with ameesh-approve: `ameesh approve-check`
 

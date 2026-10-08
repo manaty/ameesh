@@ -30,4 +30,4 @@
 * [Ressources des hôtes et répartition](0028-ressources-des-hotes-et-repartition.md) - Mesure, contre-pression, ressources orphelines, déplacement des agents entre hôtes admis.
 * [Persona et session](0029-persona-et-session.md) - Identité durable et mémoire séparées des exécutions ; double numérique des humains ; le canon déclare des règles de placement, pas la position.
 * [Pas de travail sans réveil possible](0030-pas-de-travail-sans-reveil-possible.md) - Attribution gardée, adoption et reprise par ameesh, alertes de vivacité poussées, délégation à échéance, identité jamais tirée du dossier.
-* [Plusieurs canons sur un même hôte](0031-plusieurs-canons.md) - Liste de canons, identité par fédération, synchronisation bornée au canon, noms au premier déclarant ; lots L42–L45 (modalités à confirmer).
+* [Plusieurs canons sur un même hôte](0031-plusieurs-canons.md) - Liste de canons, identité par fédération, synchronisation bornée au canon, noms au premier déclarant ; lots L42–L45, L47.

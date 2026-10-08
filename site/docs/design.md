@@ -27,6 +27,10 @@ Some decisions that shape what you read in this documentation:
 | 0019 | Budgets and routing: model and effort per task, caps, plan gauges read at the source. |
 | 0025 | One fresh session per lot for build and review agents. |
 | 0026 | ameesh-approve is hosted per team, in one of three modes, with a host name and RP ID of its own. |
+| 0028 | Each runner watches its host's resources; under pressure it holds new turns, and can move an agent to another admitted host between two turns. |
+| 0029 | A persona (identity, role, responsible human) is declared in the canon; a session is an execution of it, placed by ameesh. |
+| 0030 | No work without a way to wake the agent: explicit agent mode, guarded assignment, adopt and resume, pushed alerts, identity never from the folder. |
+| 0031 | Several canons on one host: a list of canons, identity by federation, each sync bounded to its canon, names global to their first declarer. |
 
 The design documents are the reference when they and this documentation
 disagree; please open an issue if you find such a disagreement.

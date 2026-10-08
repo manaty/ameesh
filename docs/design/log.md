@@ -1,5 +1,11 @@
 # Journal de la conception
 
+## 2026-10-08
+* **Fusion et déploiement** : conception (#7), lots L36–L46 (#8) et L47 (#9, périmètre sous `extensions.ameesh`, seule clé libre du schéma OKF Federation) ; migrations 0030–0036 appliquées ; deux canons en exploitation sur un même hôte.
+* **Décision** : [plusieurs canons](decisions/0031-plusieurs-canons.md) passe `stable`, modalités confirmées telles quelles.
+* **Convention** : un agent ameesh porte un nom de rôle ; les noms numérotés hérités de la v0 (`deepseekN`…) ne sont plus attribués, pour éviter les homonymes entre la boîte v0 et le registre.
+* **Version** 1.4.0.
+
 ## 2026-10-07 (soir : lots codés, non fusionnés)
 * **Relecture indépendante** de l'intégration : 5 défauts importants et une fuite possible de secret, corrigés par le lot L46 (migration 0036) ; `integ/0030-0031` @ 3eb40f9, suite complète verte (1408 tests, psql et psycopg).
 * **Lots** L36–L45 codés et intégrés sur la branche locale `integ/0030-0031` (20 commits sur `origin/main`, migrations 0030–0035) ; suite complète verte sur les deux pilotes (1388 tests, psql et psycopg). Rien n'est poussé ni fusionné : relecture et accord du propriétaire attendus.

@@ -32,6 +32,10 @@ credential_mode: subscription         # api-key | subscription
 budget_usd_per_day: 30                # optional
 tools: [git, "mcp:transport-readonly"]
 reviewers: [relecteur]                # optional
+priority: 5                           # optional: paused last under critical host pressure (v1.3.0)
+memory:                               # optional: the persona's memory repository (v1.3.0)
+  mode: neutral
+  repository: "git@forge.example:acme/persona-orchestre.git"
 ```
 
 **Responsibility.** An agent without a `responsible` that resolves to a unique
@@ -47,26 +51,54 @@ error: authority belongs to humans, and is proven by a receipt.
 type: Host
 title: banc
 responsible: human:alice      # REQUIRED
+tags: [test]                  # optional: labels that admissions can target (v1.3.0)
+admins: [human:bruno]         # optional: administrators, for the visibility rule (v1.3.0)
 policy:
   harnesses: [deepseek, codex]          # absent = all
   providers: [deepseek, openai]
   credential_modes: [api-key]
   max_agents: 2
+  resources:                            # optional pressure limits (v1.3.0)
+    min_mem_available: 1GiB
+    max_swap_used: 8GiB
+    max_load: 24
+    min_disk_free: 2GiB
+  work_roots: {acme-web: /srv/acme/acme-web}   # working directory per team (v1.3.0)
+  work_root: /srv                               # default: work_root/<team>
+  work_dirs: {ouvrier: /srv/acme/ouvrier}       # per agent, wins over the above (v1.3.1)
 ```
 
 The host's responsible human sets the rules of their machine, for example "only
-DeepSeek and Codex agents, billed by API key".
+DeepSeek and Codex agents, billed by API key". The host also decides **where**
+agents work: the working directory is `policy.work_dirs[<agent>]`, else
+`policy.work_roots[<team>]`, else `policy.work_root/<team>`, and each accepts
+the `{agent}` template (`/srv/acme/acme-web-{agent}`: one worktree per agent).
+See [Runner and leases](runner-and-leases.md#working-directory) for the
+transitional fallback and what the runner does when the directory is missing,
+and [host resources](runner-and-leases.md#host-resources-and-back-pressure) for
+`policy.resources`.
 
-## `Placement`: which agent runs where
+## `Placement`: which agent may run where
+
+Since v1.3.0 a `Placement` card is an **admission**: the hosts (by name or by
+tag) where an agent is admitted, without a working directory. The current host
+of the agent is execution state.
 
 ```yaml
 type: Placement
 title: orchestre@atelier
 agent: orchestre
-host: atelier
+hosts: [atelier]              # admitted hosts, in order of preference
+host_tags: [prod]             # or tags of admitted hosts
 credential_mode: subscription
-cwd: ~/acme/acme-web          # working directory on the host
 ```
+
+Older cards (a single `host:`, a `cwd:`) are still read: `host` is a single
+admitted host. Their `cwd` is ignored when the host's policy gives a directory
+(`admission-cwd-ignored`); when it does not, it is used as a **transitional
+fallback** with the warning `admission-cwd-inherited`. That fallback is removed
+in v1.5.0 at the latest: move working directories to `policy.work_dirs` /
+`work_roots`.
 
 **Governed placement.** The project's responsible human decides where an agent
 runs, within the policy of the host's responsible human. For every canon agent
@@ -80,7 +112,16 @@ interrupts a running lease.
 A verdict holds only for the profile it judged (host, harness, provider, model,
 credential mode). Any change made outside `canon sync` (registering the agent
 by hand with another harness, an import, manual SQL) closes new claims until
-the next sync. ameesh never moves an agent by itself.
+the next sync. `canon sync` never moves an agent whose current host is still
+admitted; ameesh moves an agent by itself only between two turns, to another
+admitted host, when relocation under pressure is enabled
+(`AMEESH_RELOCATE=1`).
+
+**Visibility rule** (v1.3.0). When an agent declares a memory repository
+(`memory.repository`), it runs on a host only if its responsible human and
+the host's `admins` have access to that repository. `canon sync` checks it
+through the forge (`AMEESH_FORGE`), caches the verdict briefly, and refuses the
+placement otherwise (`persona-hidden-from-host`); `canon check` stays offline.
 
 ```bash
 ameesh placement check [--agent A] [--json]   # read-only: current placements, why refused,
@@ -105,11 +146,15 @@ explanation):
 
 **Blocking errors**: an `Agent` without `responsible`, or with `approve` in
 `capabilities`; a `responsible` that does not resolve to a human `Member`; a
-`Placement` to an unknown agent or host; a placement that violates the host
-policy; two placements for the same agent.
+`Placement` to an unknown agent or host, or without `hosts` nor `host_tags`; a
+placement that violates the host policy; two placements for the same agent;
+an unreadable `policy.resources`.
 
 **Warnings**: a host without placement, an agent without placement, a review
-policy declared without a `default` class.
+policy declared without a `default` class, an admission tag that matches no
+host (`admission-tag-unknown`), a placement `cwd` ignored or inherited
+(`admission-cwd-ignored`, `admission-cwd-inherited`), an agent without a
+working directory (`host-work-dir-missing`).
 
 An error tied to an agent blocks that agent; an error tied to a host blocks the
 agents placed there; any other error (federation, unreadable profile card)

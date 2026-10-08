@@ -2,11 +2,11 @@
 type: Decision
 title: "Plusieurs canons sur un même hôte"
 description: "ameesh lit une liste de canons ; un canon est identifié par sa fédération ; chaque synchronisation ne touche que son canon ; noms globaux au premier déclarant ; humains et hôte décrits par chaque canon ; périmètre ameesh déclarable dans un canon partagé."
-status: draft
+status: stable
 tags: [canon, federation, multi-canon]
 decided_by: human:smichea
 decision_date: 2026-10-07
-attestation: "besoin confirmé par le propriétaire (« oui très important ») dans sa conversation avec claude3 ; modalités proposées par claude3, à confirmer ; non signée"
+attestation: "besoin confirmé par le propriétaire (« oui très important ») dans sa conversation avec claude3 ; modalités tranchées par claude3 sur délégation explicite du propriétaire (« tranche pour moi », 2026-10-08), après une nuit d'exploitation sur deux canons ; non signée"
 generated: { by: "claude3/claude-opus-5-5", at: "2026-10-07T15:40:00+02:00" }
 ---
 
@@ -34,5 +34,7 @@ modalités et le plan de lots L42–L45 sont dans l'étude
 
 # Statut
 
-Le besoin est décidé. Les modalités (points 4 à 6) restent `draft` jusqu'à leur
-confirmation par le propriétaire.
+Décision `stable` depuis le 2026-10-08. Les modalités (points 4 à 6) ont été
+confirmées telles quelles : elles tournent en production sur deux canons depuis
+le déploiement de L36–L47, sans conflit de nom ni débordement de
+synchronisation.
