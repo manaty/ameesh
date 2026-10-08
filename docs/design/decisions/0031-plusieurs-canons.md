@@ -29,7 +29,8 @@ modalités et le plan de lots L42–L45 sont dans l'étude
    l'hôte qu'il utilise, et l'exécuteur applique les limites physiques les
    plus strictes.
 6. Un canon partagé peut borner les fiches ameesh à un dossier
-   (`ameesh: {scope: …}` dans `federation.yaml`).
+   (`extensions: {ameesh: {scope: …}}` dans `federation.yaml`, seule clé
+   libre du schéma OKF Federation — forme corrigée par L47).
 
 # Statut
 
