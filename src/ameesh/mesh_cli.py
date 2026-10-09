@@ -151,6 +151,16 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         print("%-20s %-9s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
             "NOM", "HARNAIS", "HÔTE", "STATUT", "BAIL", "NON LUS", "LOTS", "BUDGET", "CLÉ",
             "VU"))
+        # L52d : chaque session parallèle juste sous sa persona (si elle est
+        # connue), dans l'ordre de la vue pour le reste
+        order = {row["name"]: index for index, row in enumerate(rows)}
+
+        def _rang(row: dict) -> tuple:
+            parent = row.get("parent_persona")
+            if parent in order:
+                return (order[parent], 1, row["name"])
+            return (order[row["name"]], 0, "")
+        rows = sorted(rows, key=_rang)
         for row in rows:
             status = row.get("status") or "?"
             if row.get("status_text"):
@@ -158,8 +168,12 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             if row.get("mode") == "externe":
                 # L37 (0030) : session humaine, jamais réveillée par ameesh
                 status = "ext/" + status
+            shown = row["name"]
+            if row.get("parent_persona") in order:
+                shown = "└ " + shown[len(row["parent_persona"]):] \
+                    if shown.startswith(row["parent_persona"]) else "└ " + shown
             print("%-20s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
-                row["name"][:20], (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
+                shown[:20], (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
                 status[:11], _lease(row), int(row.get("unread") or 0),
                 open_by_agent.get(row["name"], 0), _budget(row),
                 ("owner" if row.get("has_owner_key")

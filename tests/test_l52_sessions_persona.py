@@ -245,3 +245,57 @@ class FinDeFilleTest(PgTestCase):
         out = ps.close_finished(self.db, "pc")
         self.assertEqual([(o["stopped"], o["repatriated"]) for o in out], [(False, 1)])
         self.assertEqual(self.registre()["stop_reason"], "manuel")      # arrêt humain gardé
+
+
+class VueUniqueTest(PgTestCase):
+    """L52d : persona et sessions parallèles vues ensemble."""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("verif-a", "verif-b"):
+            registry.upsert(self.db, name, harness="deepseek", host="pc", mode="execute",
+                            chantier="p1")
+        self.db.execute("UPDATE agent_registry SET responsible = 'humain' "
+                        "WHERE name IN ('verif-a', 'verif-b')")
+        ps.open_child(self.db, "verif-a", "52", ttl_seconds=3600)
+        ps.open_child(self.db, "verif-a", "7", ttl_seconds=3600)
+
+    def test_list_json(self):
+        from ameesh import exploitation
+        rows = exploitation.annotate(self.cfg, self.db, registry.overview(self.db))
+        by = {r["name"]: r for r in rows}
+        self.assertEqual(by["verif-a"]["children"], ["verif-a.l52", "verif-a.l7"])
+        self.assertIsNone(by["verif-a"]["parent"])
+        self.assertEqual(by["verif-a.l52"]["parent"], "verif-a")
+        self.assertEqual(by["verif-b"]["children"], [])
+
+    def test_list_texte(self):
+        import argparse
+        import contextlib
+        import io
+        from ameesh import mesh_cli
+        out = io.StringIO()
+        with mock_open_db(self.db), contextlib.redirect_stdout(out):
+            mesh_cli.cmd_list(self.cfg, argparse.Namespace(json=False))
+        names = [line.split("  ")[0].strip() for line in out.getvalue().splitlines()[1:]
+                 if line and not line.startswith("lots")]
+        a = names.index("verif-a")
+        self.assertEqual(names[a + 1:a + 3], ["└ .l52", "└ .l7"])
+
+    def test_diffusion_a_la_persona_seulement(self):
+        from ameesh.backend import PgBackend
+        targets = PgBackend(self.cfg, self.db).send("verif-b", "all", "Point d'équipe.")
+        self.assertEqual(targets, ["verif-a"])
+
+
+def mock_open_db(db):
+    """`cmd_list` ouvre et ferme sa propre connexion : on lui prête celle du test."""
+    from unittest import mock
+
+    class _Prete:
+        def __getattr__(self, name):
+            return getattr(db, name)
+
+        def close(self):
+            pass
+    return mock.patch("ameesh.mesh_cli._open", lambda cfg: _Prete())

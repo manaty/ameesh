@@ -272,7 +272,10 @@ class Agents(interface.Agents):
                    (SELECT extract(epoch from s.checked_at)::float8 FROM canon_state s
                      WHERE s.host = o.host
                        AND s.canon = coalesce(o.canon, '')) AS canon_checked_ts,
-                   __CLAIM_OK__ AS canon_claim_ok
+                   __CLAIM_OK__ AS canon_claim_ok,
+                   -- L52b : persona dont cette ligne porte une session parallèle
+                   (SELECT r.parent_persona FROM agent_registry r
+                     WHERE r.name = o.name) AS parent_persona
             FROM agent_mesh_overview o
             ORDER BY last_seen_ts DESC NULLS LAST
             """.replace("__GOVERNED__", canon_governed_sql("o"))
