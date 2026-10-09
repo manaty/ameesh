@@ -248,6 +248,9 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: serveurs MCP de l'hôte (étude v2 E2) : nom → {command, args, env}. La
+    #: fiche de la persona dit lesquels sont PERMIS ; l'hôte dit comment les lancer.
+    mcp_servers: dict = field(default_factory=dict)
 
     @property
     def responsible_required(self) -> bool:

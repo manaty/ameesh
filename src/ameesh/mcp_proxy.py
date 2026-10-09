@@ -190,3 +190,55 @@ def main(argv) -> int:
             tools = []
     journal = Journal(args.journal or os.path.join(cfg.state_dir, "mcp", "%s.jsonl" % args.persona))
     return relayer(cmd, Policy(args.persona, args.server, tools), journal)
+
+
+# --------------------------------------------------------------------------
+# configuration MCP d'une persona : chaque serveur permis passe par le proxy
+# --------------------------------------------------------------------------
+
+def persona_config(persona: str, tools: list[str] | None, servers: dict,
+                   ameesh_bin: str = "ameesh") -> dict:
+    """La configuration `mcpServers` d'une persona (format Claude Code, repris par
+    les autres harnais) : seuls les serveurs dont elle a au moins un outil
+    permis, chacun lancé à travers `ameesh mcp-proxy`.
+
+    `servers` vient de l'hôte (`mcp_servers` : nom → {command, args, env}),
+    jamais du canon : la fiche dit ce qui est PERMIS, l'hôte dit COMMENT lancer.
+    """
+    out = {}
+    for name, spec in sorted((servers or {}).items()):
+        if not isinstance(spec, dict) or not spec.get("command"):
+            continue
+        tous, un_par_un = allowed_tools(tools, name)
+        if not (tous or un_par_un):
+            continue
+        entry = {"command": ameesh_bin,
+                 "args": ["mcp-proxy", "--persona", persona, "--server", name, "--",
+                          str(spec["command"]), *[str(a) for a in spec.get("args") or []]]}
+        if isinstance(spec.get("env"), dict):
+            entry["env"] = {str(k): str(v) for k, v in spec["env"].items()}
+        out[name] = entry
+    return {"mcpServers": out}
+
+
+def config_main(argv) -> int:
+    """`ameesh mcp-config <persona>` : configuration MCP de la persona, sur stdout."""
+    import argparse
+    from . import canon as canon_mod
+    from .config import load as load_config
+    p = argparse.ArgumentParser(prog="ameesh mcp-config")
+    p.add_argument("persona")
+    args = p.parse_args(argv)
+    cfg = load_config()
+    tools = None
+    for c in canon_mod.load_configured(cfg):
+        agent = c.agent(args.persona)
+        if agent is not None:
+            tools = agent.tools or []
+            break
+    if tools is None:
+        print("ameesh mcp-config : persona %s absente du canon" % args.persona, file=sys.stderr)
+        return 2
+    print(json.dumps(persona_config(args.persona, tools, getattr(cfg, "mcp_servers", {}) or {}),
+                     ensure_ascii=False, indent=2))
+    return 0

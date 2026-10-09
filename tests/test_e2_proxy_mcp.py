@@ -90,5 +90,21 @@ class RelaisTest(unittest.TestCase):
         self.assertIn("error", rep[2])
 
 
+
+class ConfigurationTest(unittest.TestCase):
+    def test_seuls_les_serveurs_permis_et_par_le_proxy(self):
+        servers = {"transport": {"command": "node", "args": ["t.js"], "env": {"X": "1"}},
+                   "paie": {"command": "paie-mcp"},
+                   "casse": {"args": ["sans commande"]}}
+        conf = mp.persona_config("verif-a", ["git", "mcp:transport/lire_colis"], servers)
+        self.assertEqual(list(conf["mcpServers"]), ["transport"])
+        t = conf["mcpServers"]["transport"]
+        self.assertEqual(t["command"], "ameesh")
+        self.assertEqual(t["args"], ["mcp-proxy", "--persona", "verif-a", "--server", "transport",
+                                     "--", "node", "t.js"])
+        self.assertEqual(t["env"], {"X": "1"})
+        self.assertEqual(mp.persona_config("x", [], servers), {"mcpServers": {}})
+
+
 if __name__ == "__main__":
     unittest.main()
