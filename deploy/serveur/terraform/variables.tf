@@ -29,19 +29,34 @@ variable "name" {
 variable "instance_type" {
   description = "Gabarit de la VM. Les agents lancent des tests (conteneurs, suites JS) : prévoir de la mémoire."
   type        = string
-  default     = "PRO2-S"
+  default     = "DEV1-L"
 }
 
 variable "disk_gb" {
-  description = "Taille du volume racine (Go) : sessions, dépôts de travail, images de conteneurs."
+  description = "Taille du volume racine (Go) : sessions, dépôts de travail, images de conteneurs. 80 Go de disque local sont inclus dans le prix d'une DEV1-L."
   type        = number
-  default     = 200
+  default     = 80
+}
+
+variable "volume_type" {
+  description = "Type du volume racine : « l_ssd » (local, inclus pour les DEV1) ou « sbs_volume » (bloc, facturé à part)."
+  type        = string
+  default     = "l_ssd"
 }
 
 variable "ssh_cidrs" {
   description = "Plages autorisées en SSH (administration). Vide = SSH fermé, accès par WireGuard seulement."
   type        = list(string)
   default     = []
+}
+
+variable "admin_ssh_keys" {
+  description = "Clés SSH publiques des SEULS administrateurs du mesh (accès root). Les autres clés de l'organisation chez l'hébergeur ne sont pas installées."
+  type        = list(string)
+  validation {
+    condition     = length(var.admin_ssh_keys) > 0
+    error_message = "Au moins une clé d'administrateur."
+  }
 }
 
 variable "wireguard_port" {

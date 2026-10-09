@@ -71,7 +71,7 @@ resource "scaleway_instance_server" "mesh" {
 
   root_volume {
     size_in_gb  = var.disk_gb
-    volume_type = "sbs_volume"
+    volume_type = var.volume_type
   }
 
   user_data = {
@@ -79,6 +79,7 @@ resource "scaleway_instance_server" "mesh" {
       organisation   = var.organisation
       wireguard_port = var.wireguard_port
       ameesh_ref     = var.ameesh_ref
+      admin_ssh_keys = var.admin_ssh_keys
     })
   }
 }
