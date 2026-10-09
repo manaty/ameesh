@@ -1,0 +1,26 @@
+#cloud-config
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Premier démarrage de la VM d'un mesh ameesh (lot L55). Gabarit Terraform :
+# $${…} est un littéral shell, $${organisation} n'en est pas un.
+# Tout le travail est dans installer-serveur.sh, rejouable à la main.
+
+package_update: true
+package_upgrade: true
+packages:
+  - git
+  - curl
+  - ca-certificates
+  - wireguard
+  - postgresql
+  - postgresql-contrib
+  - python3-venv
+  - python3-pip
+  - docker.io
+  - jq
+  - unattended-upgrades
+
+runcmd:
+  - [ sh, -c, "git clone https://github.com/manaty/ameesh.git /opt/ameesh/src" ]
+  - [ sh, -c, "cd /opt/ameesh/src && git checkout --detach ${ameesh_ref}" ]
+  - [ sh, -c, "ORGANISATION='${organisation}' WIREGUARD_PORT='${wireguard_port}' /opt/ameesh/src/deploy/serveur/installer-serveur.sh > /var/log/ameesh-installation.log 2>&1" ]

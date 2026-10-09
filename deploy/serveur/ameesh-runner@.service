@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Un exécuteur par persona sur le serveur d'un mesh (lot L55). Service SYSTÈME
+# sous l'utilisateur `ameesh` ; ajouter une persona ne coupe jamais le tour
+# d'une autre.
+#
+#   systemctl enable --now ameesh-runner@<persona>
+#   journalctl -u ameesh-runner@<persona> -f
+
+[Unit]
+Description=ameesh — exécuteur de la persona %i
+After=network-online.target postgresql.service wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+User=ameesh
+Group=ameesh
+WorkingDirectory=/home/ameesh
+# Clés API de l'organisation (0033 §3) : /etc/ameesh/harnais.env, 0640 root:ameesh.
+EnvironmentFile=-/etc/ameesh/harnais.env
+ExecStart=/opt/ameesh/venv/bin/ameesh run --agents %i --runner-id runner-%i@%H
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
