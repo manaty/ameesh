@@ -299,3 +299,26 @@ def mock_open_db(db):
         def close(self):
             pass
     return mock.patch("ameesh.mesh_cli._open", lambda cfg: _Prete())
+
+
+class ActiviteAvecFillesTest(PgTestCase):
+    """L52 × L59 : l'activité d'une persona comprend celle de ses filles."""
+
+    def setUp(self):
+        super().setUp()
+        registry.upsert(self.db, "verif-a", harness="deepseek", host="pc", mode="execute")
+        self.db.execute("UPDATE agent_registry SET responsible = 'humain' "
+                        "WHERE name = 'verif-a'")
+        ps.open_child(self.db, "verif-a", "52", ttl_seconds=3600)
+
+    def test_chronologie_unique(self):
+        from ameesh import activity, mail
+        mail.send(self.db, "orchestre", "verif-a", "Pour la persona.")
+        mail.send(self.db, "orchestre", "verif-a.l52", "Pour la fille.", work_item_id="52")
+        mail.send(self.db, "verif-a.l52", "verif-a", "De la fille à sa persona.")
+        items = activity.persona_events(self.db, "verif-a", 3600)
+        texts = [e["text"] for e in items]
+        self.assertEqual(len(items), 3)                 # l'échange interne une seule fois
+        self.assertIn("[.l52] ← orchestre (lot 52) : Pour la fille.", texts)
+        self.assertEqual(activity.children(self.db, "verif-a"), ["verif-a.l52"])
+        self.assertEqual(activity.children(self.db, "verif-b"), [])
