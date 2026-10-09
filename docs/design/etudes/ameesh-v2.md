@@ -263,6 +263,34 @@ travaillent pour accélérer les suivants (consigne du propriétaire).
 | **L58** | 2 | **Rôles** (C1–C5) : fiche `Role`, adressage `role:`, suppléance, absences, escalade |
 | **L59** | 2 | **Journal d'activité** (G1–G5) : `ameesh activity`, accès par responsabilité, conservation |
 
+## État au 2026-10-09 (fin de matinée)
+
+| Lot | PR | État | Dépend de |
+|---|---|---|---|
+| L55 profil serveur VM | #16 | VM du mesh Manaty créée et installée (Postgres 17, WireGuard, poste relié) | — |
+| L57 scission d'un mesh | #22 | script et procédure ; répétition sur la VM réussie ; exécution réelle à faire avec le propriétaire | L55 |
+| L51 fiche Persona, suppléants et supérieurs | #17 | prêt | — |
+| L58 rôles adressables | #20 | prêt | L51 |
+| L53 sauvegarde des sessions | #18 | prêt | — |
+| L54 mémoire de persona | #21 | prêt | — |
+| L52 historique des sessions (1re partie) | #24 | prêt ; sessions parallèles à faire | — |
+| L59 journal d'activité | #19 | prêt ; filtrage par responsabilité à faire | — |
+| L56 rôle Postgres des exécuteurs | #23 | prêt | — |
+| D1 identité OIDC | #25 | prêt | — |
+
+Ordre de fusion conseillé : #14 (1.4.3), #15 (cette conception), #16 puis #22,
+#17 puis #20, puis les autres dans n'importe quel ordre. Chaque PR a passé la
+suite complète sur les deux pilotes.
+
+Restent, à trancher ou à faire avec le propriétaire :
+- **exécuter L57** : déplacer le mesh Manaty sur la VM ;
+- **sessions parallèles** (fin de L52) : la refonte la plus risquée, à relire
+  avant de coder ;
+- **D2**, autorisations par relations : elles s'appuient sur L51, L59 et D1 ;
+- **E**, isolation : un utilisateur Unix par persona sur la VM, puis le proxy
+  MCP ;
+- **B2**, interface de conversation : avec Nexlink (manaty/nexlink#47).
+
 # Questions au propriétaire
 
 1. ~~Un mesh commun ou un mesh par organisation~~ : **un mesh par
