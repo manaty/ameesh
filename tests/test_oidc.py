@@ -41,7 +41,7 @@ def _premier(bits: int) -> int:
                 return False
         return True
     while True:
-        c = secrets.randbits(bits) | (1 << (bits - 1)) | 1
+        c = secrets.randbits(bits) | (3 << (bits - 2)) | 1   # deux bits hauts : p*q fait bien 2*bits
         if all(c % p for p in (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)) and probable(c):
             return c
 
