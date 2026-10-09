@@ -349,6 +349,27 @@ def pressure(reading: dict, policy=None, *, limits: dict | None = None) -> dict:
     }
 
 
+def _lisible(key: str, value) -> str:
+    """Une valeur de seuil lisible : octets en unités binaires, charge brute."""
+    if value is None:
+        return "—"
+    if key == "max_load":
+        return "%.2f" % float(value)
+    value = int(value)
+    for label, factor in (("TiB", 1024 ** 4), ("GiB", 1024 ** 3), ("MiB", 1024 ** 2),
+                          ("KiB", 1024)):
+        if abs(value) >= factor:
+            return "%.1f %s" % (value / factor, label)
+    return "%d B" % value
+
+
+def describe(found: list[dict]) -> str:
+    """Les franchissements en clair : « swap utilisé 17.5 GiB (seuil 16.0 GiB) »."""
+    return " ; ".join("%s %s (seuil %s)" % (b["label"], _lisible(b["key"], b["value"]),
+                                            _lisible(b["key"], b["limit"]))
+                      for b in found or [])
+
+
 def history(db: Db, host: str, limit: int = 10) -> list[dict]:
     return storage.of(db).hosts.history(host, limit)
 
