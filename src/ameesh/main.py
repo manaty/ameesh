@@ -52,6 +52,7 @@
   ameesh sessions <persona> [--json]    ses sessions, présentes et passées (L52) ;
   ameesh sessions open <persona> --lot N   session parallèle sur un lot (L52b) ;
   ameesh sessions close <fille>           la ferme, courrier rendu à la persona (L52e) ;
+  ameesh activity <persona> [--since 24h] [--json]   journal d'activité d'une persona (L59) ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -156,6 +157,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L52 (0032 §2) : les sessions d'une persona, présentes et passées
         from . import persona_sessions
         return persona_sessions.main(rest)
+    if command == "activity":
+        # L59 (0033 §9) : activité présente et passée d'une persona
+        from . import activity
+        return activity.main(rest)
     if command == "notify":
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
