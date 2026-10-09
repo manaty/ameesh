@@ -280,6 +280,12 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'session_id', 'harness', 'host', 'agent', 'pid', 'pid_start', 'created_by',
         'created_at', 'revoked_at'
     ]),
+    -- historique des sessions (L52, 0032 §2) : quelles sessions, quand, où ;
+    -- aucun contenu (le transcript reste chez le harnais)
+    ('persona_sessions', ARRAY[
+        'id', 'persona', 'session_id', 'harness', 'host', 'account', 'work_item',
+        'started_at', 'ended_at', 'end_reason'
+    ]),
     ('work_item_events', ARRAY[
         'id', 'work_item_id', 'state', 'actor', 'created_at'
     ]),
