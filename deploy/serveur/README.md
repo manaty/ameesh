@@ -68,6 +68,38 @@ Postgres n'est jamais exposé sur Internet.
    des humains restent sur leurs appareils.
 7. **Lancer une persona** : `systemctl enable --now ameesh-runner@<persona>`.
 
+## Personas isolées (étude v2 E1)
+
+Par défaut (`ameesh-runner@<persona>`), toutes les personas tournent sous
+l'utilisateur `ameesh` et peuvent lire leurs fichiers les unes des autres.
+Pour isoler une persona :
+
+```bash
+/opt/ameesh/src/deploy/serveur/ajouter-persona.sh <persona> [--docker]
+systemctl enable --now ameesh-persona@<persona>
+```
+
+* **Un utilisateur Unix `p-<persona>` par persona** : son dossier (0700)
+  porte ses sessions, sa mémoire, ses dépôts de travail et l'état de son
+  exécuteur, avec sa configuration ameesh, son `.pgpass` et son profil `dsh`.
+* **Sandbox de l'unité** : les autres dossiers de `/home` sont invisibles
+  (`ProtectHome=tmpfs`, son seul dossier remonté), le système est en lecture
+  seule sauf son dossier, et `NoNewPrivileges` est actif. Les clés des
+  harnais sont lues par systemd avant le passage à l'utilisateur de la
+  persona.
+* **Canons** : les placer dans un dossier lisible par le groupe
+  `ameesh-personas` (par exemple `/srv/ameesh/canons`), pas dans `/home/ameesh`.
+* **`--docker`** donne l'accès à Docker pour les tests, mais le groupe docker
+  équivaut à root : l'isolation tombe pour cette persona. Docker sans
+  privilèges par utilisateur reste à faire.
+* **Limite** : toutes les personas partagent le rôle Postgres des exécuteurs
+  (L56). Le cloisonnement des données par persona et le proxy MCP sont la
+  suite du volet E.
+
+Éprouvé dans un conteneur Debian 12 avec systemd. Deux personas `alpha` et
+`beta` tournent chacune sous son utilisateur, ne voient que leur dossier,
+et ne lisent pas les fichiers l'une de l'autre.
+
 ## Retour arrière
 
 - **Une persona** : `agent-runner stop <persona>`, puis `systemctl disable --now ameesh-runner@<persona>`.
