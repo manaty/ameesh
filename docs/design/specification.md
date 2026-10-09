@@ -209,6 +209,10 @@ sur les canons connus.
 
 **`type: Member`** (humains) — `title: smichea`, `roles: [...]`,
 `authenticators:` liste d'empreintes de clés publiques enrôlées (C7).
+`emails:` (étude v2 D1) : adresses par lesquelles le fournisseur d'identité
+OIDC de l'organisation désigne ce membre. Un jeton d'identité vérifié dont
+l'e-mail vérifié figure dans la fiche d'un seul membre se rattache à
+`human:<id>` ; sinon, à personne.
 
 **`type: WorkPackage`** (plan de travail, L29 ; [modèle et commandes](../PLAN-DE-TRAVAIL.md))
 
