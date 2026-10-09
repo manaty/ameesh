@@ -31,3 +31,4 @@
 * [Persona et session](0029-persona-et-session.md) - Identité durable et mémoire séparées des exécutions ; double numérique des humains ; le canon déclare des règles de placement, pas la position.
 * [Pas de travail sans réveil possible](0030-pas-de-travail-sans-reveil-possible.md) - Attribution gardée, adoption et reprise par ameesh, alertes de vivacité poussées, délégation à échéance, identité jamais tirée du dossier.
 * [Plusieurs canons sur un même hôte](0031-plusieurs-canons.md) - Liste de canons, identité par fédération, synchronisation bornée au canon, noms au premier déclarant ; lots L42–L45, L47.
+* [Persona, rôles et sessions](0032-persona-roles-et-sessions.md) - Persona = qui (personnalité liée à un canon : mémoire, rôles, droits, outils, agents, responsable avec suppléants et supérieurs) ; rôle = fonction dans un périmètre ; session = exécution ; pas d'ouvrier générique ; mémoire de persona prioritaire en v2.
