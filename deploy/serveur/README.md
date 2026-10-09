@@ -78,4 +78,4 @@ Postgres n'est jamais exposé sur Internet.
   utilisateur ou par pod est le volet E de l'étude v2.
 - Les harnais (Node, `dsh`, `codex`, `claude`) ne sont pas installés par ce
   lot : chaque organisation installe ceux de ses personas.
-- Pas encore éprouvé sur une VM réelle à la livraison du lot.
+- Éprouvé dans un conteneur Debian 12 avec systemd (installation rejouable, TLS imposé sur wg0, sauvegarde, ajout d'appareil, `ameesh doctor`) ; pas encore sur une VM réelle.
