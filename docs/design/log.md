@@ -4,6 +4,7 @@
 * **Bascule** : deepseek1 à 7 et l'orchestrateur Nexlink menés par l'exécuteur, un service par agent (`ameesh-runner-agent@<nom>`) ; plus aucune boucle v0.
 * **L48** (1.4.1) : échecs rapides de tour, attente doublée puis arrêt de l'agent.
 * **L49** (1.4.2) : le plafond horaire payé au token ne met plus en pause un agent au forfait (0019 §2) ; constaté quand la dépense DeepSeek a arrêté l'orchestrateur.
+* **L50** (1.4.3) : les notifications `orphan_lot` sont groupées par agent ; un coordinateur assigné à une vingtaine de lots en envoyait une par lot à chaque cycle.
 
 ## 2026-10-08
 * **Fusion et déploiement** : conception (#7), lots L36–L46 (#8) et L47 (#9, périmètre sous `extensions.ameesh`, seule clé libre du schéma OKF Federation) ; migrations 0030–0036 appliquées ; deux canons en exploitation sur un même hôte.
