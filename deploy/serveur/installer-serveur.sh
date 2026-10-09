@@ -22,7 +22,7 @@ SRC=${SRC:-/opt/ameesh/src}
 VENV=/opt/ameesh/venv
 HOST_NAME=${HOST_NAME:-$ORGANISATION-mesh-1}
 WG_NET=10.77.0
-PG_VERSION=$(ls /etc/postgresql | sort -n | tail -1)
+PG_VERSION=${PG_VERSION:-17}
 PG_CONF=/etc/postgresql/$PG_VERSION/main
 VERSION=$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo "?")
 
@@ -53,6 +53,24 @@ fi
 systemctl enable --now wg-quick@wg0
 
 # --- Postgres ------------------------------------------------------------------
+# Version de la communauté PostgreSQL (dépôt PGDG), la même que celle des
+# autres meshes : une sauvegarde se restaure d'un hôte à l'autre.
+if [[ ! -d $PG_CONF ]]; then
+  log "Postgres $PG_VERSION depuis apt.postgresql.org"
+  install -d /usr/share/postgresql-common/pgdg
+  curl -fsSo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    https://www.postgresql.org/media/keys/ACCC4CF8.asc
+  echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release; echo "$VERSION_CODENAME")-pgdg main" \
+    > /etc/apt/sources.list.d/pgdg.list
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "postgresql-$PG_VERSION" "postgresql-contrib-$PG_VERSION" >/dev/null 2>&1 \
+    || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "postgresql-$PG_VERSION"
+  # un cluster d'une autre version (paquet `postgresql` de la distribution) est retiré s'il est vide
+  for v in $(ls /etc/postgresql); do
+    [[ $v == "$PG_VERSION" ]] && continue
+    pg_dropcluster --stop "$v" main 2>/dev/null || true
+  done
+fi
 log "Postgres $PG_VERSION en TLS, sur localhost et wg0"
 install -d /etc/systemd/system/postgresql@.service.d
 cat > /etc/systemd/system/postgresql@.service.d/wireguard.conf <<'CONF'
@@ -63,6 +81,7 @@ Wants=wg-quick@wg0.service
 CONF
 install -m 0644 -o postgres -g postgres /dev/stdin "$PG_CONF/conf.d/ameesh.conf" <<CONF
 listen_addresses = 'localhost,$WG_NET.1'
+port = 5432
 ssl = on
 password_encryption = scram-sha-256
 CONF
@@ -77,7 +96,14 @@ for _ in $(seq 30); do pg_isready -q -h localhost && break; sleep 1; done
 pg_isready -h localhost
 if [[ ! -f /etc/ameesh/db.env ]]; then
   PW=$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
-  runuser -u postgres -- psql -v ON_ERROR_STOP=1 -q <<SQL
+  printf 'PGPASSWORD=%s\n' "$PW" | install -m 0640 -o root -g ameesh /dev/stdin /etc/ameesh/db.env
+  printf '127.0.0.1:5432:ameesh:ameesh:%s\n' "$PW" \
+    | install -m 0600 -o ameesh -g ameesh /dev/stdin /home/ameesh/.pgpass
+fi
+# rôle et base assurés à chaque passage (rejouable, et après un changement de version)
+PW=$(sed -n 's/^PGPASSWORD=//p' /etc/ameesh/db.env)
+cd /tmp
+runuser -u postgres -- psql -v ON_ERROR_STOP=1 -q <<SQL
 DO \$\$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'ameesh') THEN
     CREATE ROLE ameesh LOGIN;
@@ -85,13 +111,9 @@ DO \$\$ BEGIN
 END \$\$;
 ALTER ROLE ameesh PASSWORD '$PW';
 SQL
-  runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'ameesh'" | grep -q 1 \
-    || runuser -u postgres -- createdb -O ameesh ameesh
-  printf 'PGPASSWORD=%s\n' "$PW" | install -m 0640 -o root -g ameesh /dev/stdin /etc/ameesh/db.env
-  printf '127.0.0.1:5432:ameesh:ameesh:%s\n' "$PW" \
-    | install -m 0600 -o ameesh -g ameesh /dev/stdin /home/ameesh/.pgpass
-  unset PW
-fi
+runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'ameesh'" | grep -q 1 \
+  || runuser -u postgres -- createdb -O ameesh ameesh
+unset PW
 
 # --- ameesh --------------------------------------------------------------------
 log "ameesh ($(echo "$VERSION")) dans $VENV"
