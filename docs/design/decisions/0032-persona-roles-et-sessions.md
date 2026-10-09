@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "Persona, rôles et sessions : qui agit, à quel titre, dans quelle exécution"
-description: "Persona = qui (personnalité propre, liée à un seul canon : mémoire, rôles, droits, outils et skills, agents, responsable humain avec suppléants et supérieurs) ; rôle = fonction dans un périmètre ; session = exécution. Pas d'ouvrier générique ; mémoire par persona prioritaire en v2 ; les agents v1 vivent jusqu'à la fin de leur lot."
+description: "Persona = qui (personnalité propre, liée à un seul canon : mémoire, rôles, droits, outils et skills, sessions sauvegardées hors de l'appareil, responsable humain avec suppléants et supérieurs) ; rôle = fonction dans un périmètre ; session = exécution. Pas d'ouvrier générique ; mémoire par persona prioritaire en v2 ; les agents v1 vivent jusqu'à la fin de leur lot ; un mesh par organisation."
 status: stable
 tags: [persona, role, session, memoire, v2]
 decided_by: human:smichea
@@ -42,8 +42,12 @@ vérificateur des migrations de base de données, n'a aujourd'hui qu'un nom.
    - ses **rôles** ;
    - ses **droits** ;
    - ses **outils et skills** ;
-   - ses **agents** ;
+   - ses **sessions** (ses exécutions, en cours et passées) ;
    - son **humain responsable**, avec ses **suppléants** et ses **supérieurs**.
+
+   Les sessions font partie de la persona : elles sont **sauvegardées hors de
+   l'appareil qui les exécute**, sur un serveur du mesh ou, entre appareils,
+   via Nexlink. La perte d'un appareil ne fait pas perdre une persona.
 3. **Création de personas.** On pourra en créer de nouvelles **par clonage**
    ou **par assemblage**. Les modalités sont hors du périmètre de la v2.
 4. **Pas d'ouvrier générique.** Un ouvrier est spécialisé dans le domaine où
@@ -54,12 +58,13 @@ vérificateur des migrations de base de données, n'a aujourd'hui qu'un nom.
    serveur, sans perdre ce qu'elle sait.
 6. **Les agents v1 vivent jusqu'à la fin de leur lot.** Aucun n'est renommé.
    Les nouveaux sont créés comme personas, avec un nom de rôle.
+7. **Un mesh par organisation.** Une organisation a son mesh : sa base, ses
+   exécuteurs, ses personas. Un appareil peut participer aux meshes de
+   plusieurs organisations, avec un exécuteur par mesh. Plusieurs canons pour
+   une même organisation ne sont pas un besoin de la v2.
 
 # À préciser
 
-- **« Ses agents »** : le sens reste à préciser. Il peut s'agir des sessions
-  de la persona, des sous-agents auxquels elle délègue, ou des personas
-  qu'elle coordonne.
 - **Le modèle des rôles** :
   - l'adressage par rôle ;
   - le titulaire et les suppléants ;

@@ -99,6 +99,14 @@ Codex, sessions DeepSeek. Trois options :
 **Recommandation** : A4a comme règle, conformément à 0032 §5. A4b seulement
 pour finir un lot en cours, et pour les harnais qui le permettent.
 
+**A7. Sauvegarde des sessions** (0032 §2). Les sessions font partie de la
+persona : chaque exécuteur copie les sessions qu'il mène hors de l'appareil,
+à chaque fin de tour. Les cibles sont un stockage d'objets du mesh, sur un
+serveur ou chez l'hébergeur des sauvegardes. Entre appareils, la copie passe
+par Nexlink (volet B). La copie est chiffrée, car une session contient tout ce
+que l'agent a lu. Elle sert aussi à A4b : reprendre une session sur un autre
+hôte, c'est restaurer sa dernière copie.
+
 **A5. Comptes des modèles.** Un abonnement (Claude, Codex) utilisé sur un
 serveur, sans humain devant, doit être **vérifié avec les conditions de chaque
 fournisseur**. Hypothèse de travail :
@@ -221,10 +229,9 @@ ou par un humain. Il reste à concevoir :
 
 # Questions au propriétaire
 
-1. **Un mesh pour plusieurs organisations, ou un mesh par organisation ?**
-   Une base commune avec plusieurs canons (0031), ou des meshes séparés qui
-   coopèrent ? Le second est plus net pour des organisations distinctes, le
-   premier plus simple à démarrer.
+1. ~~Un mesh commun ou un mesh par organisation~~ : **un mesh par
+   organisation** (0032 §7). Reste ouvert : la coopération entre deux meshes,
+   quand une persona d'une organisation travaille pour une autre.
 2. **Premier serveur** : une VM chez l'hébergeur déjà utilisé pour les
    sauvegardes, ou directement le profil cluster ?
 3. **Quelles personas vont sur les serveurs ?** Les orchestrateurs et les
@@ -232,8 +239,8 @@ ou par un humain. Il reste à concevoir :
    interactives restant sur les postes ?
 4. **Nexlink comme fournisseur d'identité** (OIDC), ou un fournisseur séparé
    (Keycloak) que Nexlink utilise aussi ?
-5. **Les « agents » d'une persona** (0032, à préciser) : ses sessions, ses
-   sous-agents, ou les personas qu'elle coordonne ?
+5. ~~Les « agents » d'une persona~~ : **ses sessions**, sauvegardées hors de
+   l'appareil (0032 §2, A7).
 6. **Ordre** : les phases 1 et 2 d'abord, utiles dès un seul poste, ou le
    premier serveur d'abord (phase 3), pour soulager le poste au plus vite ?
 
