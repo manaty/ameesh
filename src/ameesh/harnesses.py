@@ -64,7 +64,9 @@ AUTH_TYPES = ("agent", "terminal")
 #: clés connues sous `ameesh`
 AMEESH_KEYS = ("protocol", "binary", "binary_env", "launcher", "command", "interactive",
                "session", "stream", "env", "model", "effort", "tier", "hooks",
-               "cost", "permissions", "acp", "accounts", "install")
+               "cost", "permissions", "acp", "accounts", "install", "backup")
+#: clés connues de `ameesh.backup` (L53 : sauvegarde des sessions hors de l'appareil)
+BACKUP_KEYS = ("session_files",)
 #: clés connues de `ameesh.accounts` (L30 : comptes multiples par fournisseur)
 ACCOUNT_KEYS = ("config_env", "default_home", "session_store", "credentials", "key_env")
 #: clés connues au premier niveau du manifeste
@@ -149,6 +151,9 @@ class HarnessDescriptor:
     permissions: Mapping[str, Any] = field(default_factory=dict)
     acp: Mapping[str, Any] = field(default_factory=dict)
     accounts: Mapping[str, str] = field(default_factory=dict)
+    #: L53 : motifs (relatifs au dossier du compte) des fichiers d'une session,
+    #: `{session}` remplacé par son identifiant ; vide = sauvegarde impossible.
+    session_files: tuple[str, ...] = ()
 
     @property
     def paid_per_token(self) -> bool:
@@ -783,6 +788,26 @@ def validate(document: Any, *, path: str = "") -> list[Finding]:
                                         "identifiant d'option attendu", path))
     if "install" in ameesh:
         _check_shape(ameesh.get("install"), "install", findings, path)
+    backup = ameesh.get("backup")
+    if backup is not None:
+        if not isinstance(backup, dict):
+            findings.append(Finding("harness-backup-invalid", ERROR,
+                                    "`ameesh.backup` : objet attendu", path))
+        else:
+            for key in backup:
+                if key not in BACKUP_KEYS:
+                    findings.append(Finding("harness-key-unknown", WARNING,
+                                            "`ameesh.backup.%s` : clé inconnue (ignorée)" % key,
+                                            path))
+            files = backup.get("session_files")
+            if files is not None and not (
+                    isinstance(files, list) and files
+                    and all(isinstance(f, str) and "{session}" in f and not f.startswith("/")
+                            and ".." not in f.split("/") for f in files)):
+                findings.append(Finding(
+                    "harness-backup-invalid", ERROR,
+                    "`ameesh.backup.session_files` : liste non vide de motifs relatifs au "
+                    "dossier du compte, chacun avec `{session}`, sans `..`", path))
     accounts = ameesh.get("accounts")
     if accounts is not None:
         if not isinstance(accounts, dict):
@@ -894,6 +919,10 @@ def _build(document: dict, path: str, source: str) -> HarnessDescriptor:
         accounts={k: str(v) for k, v in (ameesh.get("accounts") or {}).items()
                   if isinstance(k, str) and isinstance(v, str)}
         if isinstance(ameesh.get("accounts"), dict) else {},
+        session_files=tuple(
+            f for f in ((ameesh.get("backup") or {}).get("session_files") or [])
+            if isinstance(f, str))
+        if isinstance(ameesh.get("backup"), dict) else (),
     )
 
 

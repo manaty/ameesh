@@ -248,6 +248,11 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: sauvegarde des sessions hors de l'appareil (L53, 0032 §2) : la clé
+    #: `session_backup` du fichier de l'HÔTE (`target`, `recipients`,
+    #: `encrypt`, `min_interval_s`), validée par `ameesh.session_backup`.
+    #: Jamais de secret ici : les clés du stockage viennent de l'environnement.
+    session_backup: dict = field(default_factory=dict)
 
     @property
     def responsible_required(self) -> bool:

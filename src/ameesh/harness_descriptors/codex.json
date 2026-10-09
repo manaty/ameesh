@@ -35,6 +35,7 @@
       "credentials": "auth.json",
       "key_env": "OPENAI_API_KEY"
     },
+    "backup": {"session_files": ["sessions/*/*/*/rollout-*-{session}.jsonl"]},
     "install": {"note": "binaire `codex` installé par l'hôte ; distribution signée en L17"}
   }
 }
