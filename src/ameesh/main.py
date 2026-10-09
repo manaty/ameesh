@@ -49,6 +49,7 @@
   ameesh harness list|show|check        descripteurs de harnais (L16) ;
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
+  ameesh activity <persona> [--since 24h] [--json]   journal d'activité d'une persona (L59) ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -149,6 +150,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "fil":
         from . import fil
         return fil.main(rest)
+    if command == "activity":
+        # L59 (0033 §9) : activité présente et passée d'une persona
+        from . import activity
+        return activity.main(rest)
     if command == "notify":
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
