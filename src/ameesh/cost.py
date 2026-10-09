@@ -747,7 +747,7 @@ class CostBook:
         Le plafond horaire ne somme que l'usage payé au token
         (`paid_harnesses`, défaut `paid_harnesses_of()`, lu dans les descripteurs) ;
         les forfaits sont couverts par `pace_exceeded`, pas par cette somme
-        (0019 §2).
+        (0019 §2), et un agent au forfait n'y est pas soumis (L49).
 
         `pace=False` (L30) : le rythme est jugé compte par compte par
         `ameesh.accounts`, qui bascule au lieu de mettre en pause ; seul le
@@ -758,6 +758,11 @@ class CostBook:
         if reason:
             return reason
         paid = paid_harnesses_of() if paid_harnesses is None else tuple(paid_harnesses)
+        # L49 : un agent au forfait (harnais connu, non payé au token) n'est
+        # jamais mis en pause par le plafond payé au token des autres (0019 §2) ;
+        # un harnais inconnu reste soumis au plafond (fail-closed).
+        if harness and harness not in paid:
+            return ""
         hourly = self.spent("all", 3600, harnesses=paid)
         if hourly >= self.hourly_usd:
             return ("budget horaire (payé au token) : %.2f $ sur les 60 dernières minutes "

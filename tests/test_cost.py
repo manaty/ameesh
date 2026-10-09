@@ -510,6 +510,25 @@ class CostDbTest(Sandbox, PgTestCase):
         book.record("a1")
         self.assertIn("budget horaire", book.over("a1"))
 
+    def test_plafond_payé_au_token_ne_pause_pas_un_agent_au_forfait(self):
+        """L49 (0019 §2) : la dépense DeepSeek au-delà du plafond met en pause
+        les agents payés au token, pas l'orchestrateur au forfait Claude ; un
+        harnais inconnu reste soumis au plafond (fail-closed)."""
+        book = self.book(hourly_usd=0.10)
+        book.tools.update({"orch": "claude", "inconnu": ""})
+        os.makedirs(book.agent_dir("a1"), exist_ok=True)
+        with open(os.path.join(book.agent_dir("a1"), "tool"), "w", encoding="utf-8") as fh:
+            fh.write("deepseek")
+        self.write_events("a1", {"type": "status", "phase": "step_end",
+                                 "usage": {"inputTokens": 1_000_000, "cacheReadTokens": 0,
+                                           "outputTokens": 0}})
+        book.record("a1")
+        paid = ("deepseek",)
+        self.assertIn("budget horaire", book.over("a1", paid_harnesses=paid, pace=False))
+        self.assertEqual(book.over("orch", paid_harnesses=paid, pace=False), "")
+        self.assertIn("budget horaire", book.over("inconnu", paid_harnesses=paid, pace=False))
+        self.assertIn("budget horaire", book.over("all", paid_harnesses=paid))
+
     def test_report_liste_les_agents_et_leurs_jauges(self):
         book = self.book()
         os.makedirs(book.agent_dir("a1"), exist_ok=True)

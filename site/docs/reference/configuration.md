@@ -44,7 +44,7 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_FAILURE_BACKOFF_MAX` | `failure_backoff_max` | 300 s | wait between failed turns doubles from 5 s up to this |
 | `AMEESH_MAX_FAST_FAILURES` | `max_fast_failures` | 5 | consecutive fast failures after which the runner stops the agent (`stop_reason` `erreur`) |
 | `AMEESH_WORKTREE_ROOTS` | `worktree_roots` | `~/development` | where to look for a moved working directory |
-| `AMEESH_BUDGET_USD_PER_HOUR` | `budget_usd_per_hour` | 10 | hourly cap of pay-per-token usage (0 disables the guard) |
+| `AMEESH_BUDGET_USD_PER_HOUR` | `budget_usd_per_hour` | 10 | hourly cap of pay-per-token usage, summed over all pay-per-token agents; it pauses only those agents, never a subscription agent (0 disables the guard) |
 | `AMEESH_BUDGET_CHECK_INTERVAL` | `budget_check_interval` | 30 s | cadence of budget status updates |
 | `AMEESH_SESSION_POLICY` | `session_policy` | `par-lot` | default session policy (`par-lot`, `taille`, `jamais`) |
 | `AMEESH_BALANCE_INTERVAL` | `balance_interval` | 900 s | provider balance reading by the runner (0 = never; only with a key) |
