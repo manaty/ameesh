@@ -277,6 +277,9 @@ travaillent pour accélérer les suivants (consigne du propriétaire).
 | L59 journal d'activité | #19 | prêt ; filtrage par responsabilité à faire | — |
 | L56 rôle Postgres des exécuteurs | #23 | prêt | — |
 | D1 identité OIDC | #25 | prêt | — |
+| D2 accès à l'activité par relation | #27 | prêt | L59, L51, D1 |
+| E1 un utilisateur Unix par persona | #26 | éprouvé en conteneur | L57 |
+| E2 proxy MCP | #28 | prêt | — |
 
 Ordre de fusion conseillé : #14 (1.4.3), #15 (cette conception), #16 puis #22,
 #17 puis #20, puis les autres dans n'importe quel ordre. Chaque PR a passé la
@@ -284,8 +287,8 @@ suite complète sur les deux pilotes.
 
 Restent, à trancher ou à faire avec le propriétaire :
 - **exécuter L57** : déplacer le mesh Manaty sur la VM ;
-- **sessions parallèles** (fin de L52) : la refonte la plus risquée, à relire
-  avant de coder ;
+- **sessions parallèles** (fin de L52) : voir l'étude
+  [sessions parallèles](sessions-paralleles.md), à trancher avant de coder ;
 - **D2**, autorisations par relations : elles s'appuient sur L51, L59 et D1 ;
 - **E**, isolation : un utilisateur Unix par persona sur la VM, puis le proxy
   MCP ;

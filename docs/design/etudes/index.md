@@ -12,3 +12,4 @@
 * [Orchestration et vivacité](orchestration-et-vivacite.md) - Orchestrateur externe arrêté qui bloque un chantier : mode d'agent, attribution gardée, adoption et reprise, alertes poussées, délégation à échéance, cloisonnement des hooks ; lots L36–L41 proposés.
 * [Plusieurs canons](plusieurs-canons.md) - Ce qui casse quand deux canons partagent un hôte, le modèle par fédération, intérim pour Acme ; lots L42–L45.
 * [ameesh v2](ameesh-v2.md) - Personas sur plusieurs appareils et serveurs : base partagée, placement selon la capacité, déplacement avec la mémoire, Nexlink entre appareils, rôles, identité OIDC, autorisations par relations, isolation ; ordre en huit phases et questions.
+* [Sessions parallèles d'une persona](sessions-paralleles.md) - Fin de L52 : bail par session (A) ou sessions filles portées par des agents éphémères (B, recommandée pour la v2) ; lots L52b–L52e et questions.
