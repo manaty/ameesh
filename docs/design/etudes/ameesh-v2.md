@@ -230,19 +230,17 @@ ou par un humain. Il reste à concevoir :
 # Questions au propriétaire
 
 1. ~~Un mesh commun ou un mesh par organisation~~ : **un mesh par
-   organisation** (0032 §7). Reste ouvert : la coopération entre deux meshes,
-   quand une persona d'une organisation travaille pour une autre.
-2. **Premier serveur** : une VM chez l'hébergeur déjà utilisé pour les
-   sauvegardes, ou directement le profil cluster ?
-3. **Quelles personas vont sur les serveurs ?** Les orchestrateurs et les
-   ouvriers payés au jeton par défaut, les abonnements et les sessions
-   interactives restant sur les postes ?
-4. **Nexlink comme fournisseur d'identité** (OIDC), ou un fournisseur séparé
-   (Keycloak) que Nexlink utilise aussi ?
+   organisation**, étanche : aucune persona ne travaille pour une autre
+   organisation (0032 §7, 0033 §1).
+2. ~~Premier serveur~~ : **l'organisation choisit** (son infrastructure ou
+   une VM) ; profil VM et systemd d'abord (0033 §2).
+3. ~~Personas sur les serveurs~~ : les personas payées au jeton, sur les clés
+   API de l'organisation ; les abonnements restent sur les postes (0033 §3).
+4. ~~Fournisseur d'identité~~ : **OIDC générique** choisi par l'organisation ;
+   essais avec Keycloak et Supabase Auth ; Nexlink compatible (0033 §4).
 5. ~~Les « agents » d'une persona~~ : **ses sessions**, sauvegardées hors de
    l'appareil (0032 §2, A7).
-6. **Ordre** : les phases 1 et 2 d'abord, utiles dès un seul poste, ou le
-   premier serveur d'abord (phase 3), pour soulager le poste au plus vite ?
+6. ~~Ordre~~ : phase 3 et phase 1 en parallèle, puis les rôles (0033 §5).
 
 # Risques
 
