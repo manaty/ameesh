@@ -239,7 +239,10 @@ class PgBackend:
             # L36 (0030) : « all » = l'équipe (ou le chantier) de l'expéditeur ;
             # un expéditeur sans équipe ni chantier garde la diffusion globale.
             own = projects.get(sender)
+            # L52d : une diffusion va à la persona, pas à ses sessions
+            # parallèles (une seule lecture par persona)
             targets = [row["name"] for row in rows if row["name"] != sender
+                       and not row.get("parent_persona")
                        and (not own or projects.get(row["name"]) == own)]
         elif work_item_id and not signed:
             # L52c : le courrier d'un lot va à la session parallèle de la
