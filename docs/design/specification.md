@@ -132,6 +132,23 @@ memory:                          # dépôt de mémoire de la persona (L31, 0029)
   repository: "git@forge.example:equipe/persona-deepseek7.git"
 ```
 
+**`type: Persona`** (L51, [0029](decisions/0029-persona-et-session.md),
+[0032](decisions/0032-persona-roles-and-sessions.md)) replaces `Agent`, which
+remains readable during the transition (same keys and validation; declaring
+one name as both `Agent` and `Persona` is a duplicate). Additional fields:
+
+```yaml
+type: Persona
+title: migration-checker        # role name (convention of 2026-10-08)
+responsible: human:smichea
+harnesses: [deepseek, claude]    # admitted harnesses in preference order;
+                               # `harness` defaults to the first if omitted
+roles: [reviewer, domain-expert] # held roles (0033 §8 foundation and canon roles)
+```
+
+A `harness` outside `harnesses` produces a warning (`agent-harness-outside-list`);
+a listed harness without a descriptor is an error (`agent-harness-unknown`).
+
 **`type: Host`**
 
 ```yaml
@@ -209,6 +226,12 @@ sur les canons connus.
 
 **`type: Member`** (humains) — `title: smichea`, `roles: [...]`,
 `authenticators:` liste d'empreintes de clés publiques enrôlées (C7).
+`deputies:` and `superiors:` (L51, 0032 §2, 0033 §7): lists of `human:<id>`
+references in the same canon. Deputies can act in the responsible human's
+place under their own identities; superiors receive escalations. Unresolved
+or self references are errors (`member-deputies-unresolved`,
+`member-superiors-self`…). These cards declare the relationships; authorisation
+enforcement belongs to subsequent v2 work.
 
 **`type: WorkPackage`** (plan de travail, L29 ; [modèle et commandes](../PLAN-DE-TRAVAIL.md))
 
