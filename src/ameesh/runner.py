@@ -42,6 +42,7 @@ import uuid
 
 from . import account_turn, adapters, canon as canon_mod, canon_sync, cost as cost_mod
 from . import db as db_mod, fil, mail, registry, storage
+from . import persona_memory as memoire_mod
 from .config import CHANNEL_LEASE, CHANNEL_MAIL, Config
 from .config import load as load_config
 
@@ -1708,6 +1709,18 @@ class AgentWorker(threading.Thread):
         # `service_tier`) ; sans effet sur un harnais qui n'en déclare pas.
         tier = self._state_read("tier") or self.agent.get("tier") or ""
         patch = self._path("model.patch.yml") if (model or effort) else None
+        # L54 (0032 §5) : une session neuve d'une persona qui a une mémoire
+        # reçoit son index et la règle d'écriture en tête du premier message.
+        memoire = ""
+        if not session and self.agent.get("memory_repository") and not self.runner.dry_run:
+            try:
+                chemin = memoire_mod.open_copy(self.agent["memory_repository"],
+                                               self.cfg.state_dir, self.name,
+                                               cfg_raw=self.cfg.persona_memory)
+                memoire = memoire_mod.preface(chemin, self.name, None)
+            except (memoire_mod.MemoryError, OSError, subprocess.SubprocessError) as exc:
+                log("[%s] mémoire de persona indisponible pour ce tour : %s" % (self.name, exc))
+        resume = resume + memoire
         argv = adapter.command(resume + spec["prompt"], session,
                                model=model or None, effort=effort or None, patch=patch,
                                tier=tier or None)
@@ -1746,6 +1759,10 @@ class AgentWorker(threading.Thread):
 
         env = os.environ.copy()
         env.update(adapter.env())
+        if self.agent.get("memory_repository"):
+            # L54 : une seule mémoire par persona ; la mémoire native du harnais
+            # divergerait dans un compte (étude persona et harnais, §4).
+            env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         # L31 (0028) : identifiant du tour et étiquettes à poser sur les
         # conteneurs lancés par ses outils, pour repérer les orphelins.
         from . import containers as containers_mod
@@ -1948,6 +1965,7 @@ class AgentWorker(threading.Thread):
             error=error, cost_usd=cost,
         )
         self.last_activity = time.monotonic()
+        self._synchronise_memoire()
         if ok:
             self.session_turns += 1
         if spec["kind"] == "idle":
@@ -1955,6 +1973,37 @@ class AgentWorker(threading.Thread):
         with self.runner.lock:
             self.runner.turns += 1
         return ok
+
+    def _synchronise_memoire(self) -> None:
+        """L54 : commit et push de la mémoire de persona à la fin du tour, en fond."""
+        if not self.agent.get("memory_repository") or self.runner.dry_run:
+            return
+        chemin = memoire_mod.copy_dir(self.cfg.state_dir, self.name)
+        if not os.path.isdir(os.path.join(chemin, ".git")):
+            return
+        verrou = self.__dict__.setdefault("_memoire_verrou", threading.Lock())
+        if not verrou.acquire(blocking=False):
+            return
+
+        def pousser() -> None:
+            try:
+                r = memoire_mod.sync(chemin, "mémoire de %s : fin de tour" % self.name,
+                                     cfg_raw=self.cfg.persona_memory)
+                if r["status"] == "poussee":
+                    log("[%s] mémoire de persona poussée (%s)" % (self.name, r["commit"]))
+                elif r["status"] == "secret":
+                    log("[%s] ALERTE mémoire : secret probable dans %s, commit refusé"
+                        % (self.name, ", ".join(r["files"])))
+                elif r["status"] == "push_refuse":
+                    log("[%s] ALERTE mémoire : push refusé, copie gardée (%s)"
+                        % (self.name, r["error"]))
+            except Exception as exc:  # noqa: BLE001 — jamais fatal pour l'agent
+                log("[%s] synchronisation de la mémoire impossible : %s" % (self.name, exc))
+            finally:
+                verrou.release()
+
+        threading.Thread(target=pousser, daemon=True,
+                         name="%s-memoire" % self.name).start()
 
     def failure_wait(self) -> float:
         """Attente avant le tour suivant après un échec : doublée à chaque échec
