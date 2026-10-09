@@ -224,13 +224,14 @@ ou par un humain. Il reste à concevoir :
 - **G2. Contenu des sessions.** Le responsable peut ouvrir le transcript
   d'une session, présente ou passée, depuis la sauvegarde (A7). C'est la
   seule façon de savoir *pourquoi* un agent a fait quelque chose.
-- **G3. Accès.** Le responsable de la persona et ses suppléants. La règle
+- **G3. Accès.** Le responsable de la persona, ses suppléants et ses
+  supérieurs (0033 §9). La règle
   passe par les relations du volet D (« responsable de » → « peut lire
   l'activité de »). Chaque consultation d'un transcript est tracée.
 - **G4. Où.** En ligne de commande (`ameesh activity <persona>`), dans la vue
   temps réel de 0024 et dans Nexlink, avec la même interface publique (0015).
-- **G5. Conservation.** Une durée par organisation, fixée dans son canon. Les
-  sauvegardes de sessions suivent la même durée.
+- **G5. Conservation.** Une durée par organisation, fixée dans son canon ; à
+  défaut, 90 jours pour les transcripts et un an pour le journal (0033 §9).
 
 # Ordre proposé
 

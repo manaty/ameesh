@@ -58,11 +58,14 @@ sources:
 9. **Visibilité du responsable.** Un humain voit l'activité **présente et
    passée** des personas dont il est responsable : leurs sessions, leurs tours,
    leurs messages, leurs lots, leurs actions et leurs dépenses. La règle vaut
-   aussi pour ses suppléants, qui peuvent agir à sa place (§7). L'activité
+   aussi pour ses suppléants, qui peuvent agir à sa place (§7), et pour ses
+   supérieurs, vers qui les situations remontent. L'activité
    passée repose sur la sauvegarde des sessions
    ([0032](0032-persona-roles-et-sessions.md) §2) et sur les fils. La vue est
    celle de [0024](0024-vue-temps-reel.md), filtrée par responsabilité et
-   lisible sur téléphone.
+   lisible sur téléphone. Conservation par défaut, si le canon de
+   l'organisation n'en fixe pas : **90 jours** pour les transcripts de
+   sessions, **un an** pour le journal d'activité.
 
 # Conséquences
 
