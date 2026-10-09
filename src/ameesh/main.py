@@ -90,6 +90,7 @@
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
   ameesh menage [--apply] [--json]      ménage de ce que les agents créent (L73) ;
   ameesh conflicts [--all] [--json]     radar de conflits entre lots (L160b) ;
+  ameesh sessions <persona> [--json]    current and past persona sessions (L52);
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -207,6 +208,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "fil":
         from . import fil
         return fil.main(rest)
+    if command == "sessions":
+        # L52 (0032 §2): current and past persona sessions.
+        from . import persona_sessions
+        return persona_sessions.main(rest)
     if command == "notify":
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify

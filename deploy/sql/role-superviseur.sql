@@ -342,6 +342,12 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'repo', 'run_id', 'part', 'test', 'module', 'status', 'inherited', 'replay',
         'duration_s', 'failed_at', 'message_id', 'recorded_at'
     ]),
+    -- Session history (L52, 0032 §2): which sessions, when and where;
+    -- no content (transcripts stay in harness storage).
+    ('persona_sessions', ARRAY[
+        'id', 'persona', 'session_id', 'harness', 'host', 'account', 'work_item',
+        'started_at', 'ended_at', 'end_reason'
+    ]),
     ('work_item_events', ARRAY[
         'id', 'work_item_id', 'state', 'actor', 'created_at'
     ]),

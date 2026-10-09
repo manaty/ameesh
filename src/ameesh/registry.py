@@ -16,9 +16,11 @@ ce module garde les règles et les signatures publiques.
 """
 from __future__ import annotations
 
+import sys
+
 from typing import Sequence
 
-from . import storage
+from . import persona_sessions, storage
 from .config import NAME_RE
 from .db import Db
 from .storage.postgres import registry as _pg
@@ -250,6 +252,7 @@ def set_session(db: Db, name: str, session_id: str, account: str | None = None) 
     """Enregistre la session et, L39 (0030), le compte sous lequel elle tourne
     (`session_account` ; None : aucun compte déclaré pour le harnais)."""
     storage.of(db).agents.set_session(name, session_id, account)
+    record_session_history(db, name, session_id, account=account)
 
 
 def set_session_account(db: Db, name: str, account: str | None) -> bool:
@@ -267,7 +270,27 @@ def clear_session(db: Db, name: str, owner: str, epoch: int) -> bool:
     l'échéance est recontrôlée avec `clock_timestamp()` dans l'écriture, comme
     les autres opérations de bail.
     """
-    return storage.of(db).leases.clear_session(name, owner, epoch)
+    rows = _record_history(lambda: db.query(
+        "SELECT session_id FROM agent_registry WHERE name = %s", (name,))) or []
+    ok = storage.of(db).leases.clear_session(name, owner, epoch)
+    if ok and rows and rows[0].get("session_id"):
+        _record_history(lambda: persona_sessions.record_end(db, name, rows[0]["session_id"],
+                                                       "rotation"))
+    return ok
+
+
+def record_session_history(db: Db, name: str, session_id: str,
+                           account: str | None = None) -> None:
+    """Record an accepted session after runner or hook session filtering."""
+    _record_history(lambda: persona_sessions.record_start(db, name, session_id, account=account))
+
+
+def _record_history(action):
+    """History never blocks the agent, including before its migration is installed."""
+    try:
+        return action()
+    except Exception as exc:  # noqa: BLE001
+        print("ameesh: session history could not be recorded: %s" % exc, file=sys.stderr)
 
 
 def pause(db: Db, name: str, owner: str, epoch: int, status_text: str) -> bool:
