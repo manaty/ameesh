@@ -246,6 +246,23 @@ ou par un humain. Il reste à concevoir :
 | **7** | Autorisations par relations, OpenFGA optionnel (D2, D3, F3) | 2, 5 |
 | **8** | Isolation : utilisateur Unix ou pod, proxy MCP (E1–E3) | 3, 7 |
 
+# Lots (découpage du 2026-10-09)
+
+Le lot serveur passe en premier : dès qu'il est livré, des personas y
+travaillent pour accélérer les suivants (consigne du propriétaire).
+
+| Lot | Phase | Contenu |
+|---|---|---|
+| **L55** | 3 | **Profil serveur VM** : création de la VM par Terraform chez l'hébergeur de l'organisation ; installation (cloud-init) de Postgres en TLS, d'ameesh, des services systemd, des sauvegardes ; accès réseau privé des appareils (WireGuard) ; procédure et retour arrière |
+| **L56** | 3 | **Rôles Postgres** par hôte et par agent (D4) ; migrations par un rôle propriétaire distinct |
+| **L57** | 3 | **Scission des meshes** : exporter les personas et l'état d'un canon vers la base de son organisation (0033 §1) |
+| **L51** | 1 | **Fiche `Persona`** (double lecture de `Agent`) : `harnesses` ordonnés, `roles`, `memory.repository` ; fiche `Member` : `deputies`, `superiors`, rôles |
+| **L52** | 1 | **Personas et sessions au registre** : plusieurs sessions par persona, un bail par session |
+| **L53** | 1 | **Sauvegarde des sessions** (A7) : copie chiffrée en fin de tour vers le stockage d'objets du mesh ; restauration sur un autre hôte |
+| **L54** | 1 | **Mémoire de persona** (F1, P3/P4) : dépôt git, chargement au démarrage, consolidation en fin de lot |
+| **L58** | 2 | **Rôles** (C1–C5) : fiche `Role`, adressage `role:`, suppléance, absences, escalade |
+| **L59** | 2 | **Journal d'activité** (G1–G5) : `ameesh activity`, accès par responsabilité, conservation |
+
 # Questions au propriétaire
 
 1. ~~Un mesh commun ou un mesh par organisation~~ : **un mesh par
