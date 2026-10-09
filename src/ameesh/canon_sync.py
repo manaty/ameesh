@@ -182,7 +182,7 @@ class CanonUnreadable(canon_mod.CanonError):
 @dataclass
 class SyncAction:
     agent: str
-    action: str     # créé | mis à jour | inchangé | arrêté | arrêt demandé | réintégré | déplacé | laissé | fille recopiée | fille close
+    action: str     # créé | mis à jour | inchangé | arrêté | arrêt demandé | réintégré | déplacé | laissé | fille recopiée | fille : tour de mémoire | fille close
     detail: str = ""
     blocked: list[str] = field(default_factory=list)
     #: verdict de placement écrit pour cet agent (C4), s'il en a un
@@ -1348,6 +1348,11 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     # L52e : une fille dont le lot est terminé (ou échue) s'éteint ; son
     # courrier non remis revient à la persona
     for closed in persona_sessions.close_finished(db, host):
+        if closed.get("memory_turn"):
+            actions.append(SyncAction(closed["name"], "fille : tour de mémoire",
+                                      "lot terminé : tour de mémoire demandé avant "
+                                      "l'extinction"))
+            continue
         actions.append(SyncAction(closed["name"], "fille close",
                                   "%d message(s) rendu(s) à %s" % (
                                       closed["repatriated"], closed["persona"])))

@@ -251,6 +251,9 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: mémoire de persona (L54, 0032 §5) : la clé `persona_memory` de l'hôte
+    #: (`ssh_key` : clé limitée aux dépôts de mémoire). Jamais de secret ici.
+    persona_memory: dict = field(default_factory=dict)
 
     @property
     def responsible_required(self) -> bool:

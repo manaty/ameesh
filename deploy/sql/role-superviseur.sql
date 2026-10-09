@@ -169,7 +169,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
         'canon',
         -- L52b : persona dont cette ligne porte une session parallèle (un nom)
-        'parent_persona'
+        'parent_persona',
+        -- L52 × L54 : tour de mémoire de fin de lot demandé (un horodatage)
+        'closing_requested_at'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
