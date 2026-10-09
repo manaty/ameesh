@@ -48,7 +48,7 @@ sources:
    L'action est tracée comme faite par le suppléant, pour le responsable.
 8. **Socle commun de rôles, générique à tout métier intellectuel**, pas
    seulement au développement logiciel. Chaque canon le complète par ses rôles
-   propres. Proposition de socle, à valider :
+   propres. Socle validé par le propriétaire :
    - **coordinateur** : répartit et suit le travail ;
    - **auteur** : produit un livrable ;
    - **relecteur** : vérifie le livrable d'un autre ;
