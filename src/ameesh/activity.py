@@ -149,6 +149,26 @@ def render(agent: str, now_row: dict | None, items: list[dict], since: str) -> s
     return "\n".join(lines)
 
 
+def _controle_identite(cfg, source: str, persona: str) -> str | None:
+    """None si l'humain du jeton peut voir l'activité de `persona`, sinon la raison."""
+    from . import authz, canon as canon_mod, oidc
+    token = (sys.stdin.read() if source == "-" else open(source, encoding="utf-8").read()).strip()
+    try:
+        iss = str(oidc.split(token)[1].get("iss", "")).rstrip("/")
+        provider = next((p for p in oidc.providers(cfg) if p.issuer == iss), None)
+        if provider is None:
+            return "émetteur %r non configuré (identity.providers)" % iss
+        claims = oidc.verify(token, provider)
+    except (oidc.OidcError, OSError, KeyError) as exc:
+        return "jeton refusé : %s" % exc
+    canons = canon_mod.load_configured(cfg)
+    human = oidc.human_for(canons, claims)
+    if not human:
+        return "aucun membre du canon pour cet e-mail"
+    ok, raison = authz.can_view_activity(canons, human, persona)
+    return None if ok else raison
+
+
 def main(argv) -> int:
     from . import db as db_mod
     from .config import load as load_config
@@ -159,6 +179,9 @@ def main(argv) -> int:
     p.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
                    help="au plus N événements, les plus récents (défaut 200)")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--identity", metavar="JETON|-",
+                   help="jeton d'identité OIDC de l'humain qui consulte : l'accès est alors "
+                        "réservé au responsable, à ses suppléants et à ses supérieurs (D2)")
     args = p.parse_args(argv)
     try:
         since_s = parse_since(args.since)
@@ -166,6 +189,11 @@ def main(argv) -> int:
         print("ameesh activity : %s" % exc, file=sys.stderr)
         return 2
     cfg = load_config()
+    if args.identity:
+        refus = _controle_identite(cfg, args.identity, args.agent)
+        if refus:
+            print("ameesh activity : accès refusé — %s" % refus, file=sys.stderr)
+            return 4
     db = db_mod.connect(cfg)
     try:
         row = present(db, args.agent)
