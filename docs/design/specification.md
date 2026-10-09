@@ -132,6 +132,23 @@ memory:                          # dépôt de mémoire de la persona (L31, 0029)
   repository: "git@forge.example:equipe/persona-deepseek7.git"
 ```
 
+**`type: Persona`** (L51, [0029](decisions/0029-persona-et-session.md),
+[0032](decisions/0032-persona-roles-et-sessions.md)) — remplace `Agent`, qui
+reste lue pendant la transition (mêmes clés, mêmes contrôles ; un même nom
+déclaré en `Agent` et en `Persona` est un doublon). En plus :
+
+```yaml
+type: Persona
+title: verificateur-migrations   # nom de rôle (convention du 2026-10-08)
+responsible: human:smichea
+harnesses: [deepseek, claude]    # harnais admis, par ordre de préférence ;
+                                 # `harness` vaut le premier s'il est absent
+roles: [relecteur, referent]     # rôles tenus (socle de 0033 §8 et rôles du canon)
+```
+
+Un `harness` absent de `harnesses` est signalé (`agent-harness-outside-list`) ;
+un harnais de la liste sans descripteur est une erreur (`agent-harness-unknown`).
+
 **`type: Host`**
 
 ```yaml
@@ -209,6 +226,15 @@ sur les canons connus.
 
 **`type: Member`** (humains) — `title: smichea`, `roles: [...]`,
 `authenticators:` liste d'empreintes de clés publiques enrôlées (C7).
+`deputies:` et `superiors:` (L51, 0032 §2, 0033 §7) : listes de `human:<id>`
+du même canon — les suppléants peuvent tout faire à sa place, chacun sous sa
+propre identité ; les supérieurs reçoivent les escalades. Une référence qui ne
+résout pas, ou qui désigne le membre lui-même, est une erreur
+(`member-deputies-unresolved`, `member-superiors-self`…).
+`emails:` (étude v2 D1) : adresses par lesquelles le fournisseur d'identité
+OIDC de l'organisation désigne ce membre. Un jeton d'identité vérifié dont
+l'e-mail vérifié figure dans la fiche d'un seul membre se rattache à
+`human:<id>` ; sinon, à personne.
 
 **`type: WorkPackage`** (plan de travail, L29 ; [modèle et commandes](../PLAN-DE-TRAVAIL.md))
 
