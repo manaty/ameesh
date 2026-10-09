@@ -27,16 +27,22 @@ Postgres n'est jamais exposé sur Internet.
 
 ## Mise en place (actes de l'opérateur)
 
-1. **Projet de l'organisation.** Les identifiants de l'hébergeur doivent être
-   ceux de l'**organisation du mesh**, jamais ceux d'une autre (0033 §1).
-   Vérifier `scw info` (organisation, projet) avant tout `apply`.
+1. **Profil de l'organisation.** Un poste qui sert plusieurs organisations a
+   **un profil Scaleway nommé par organisation, et aucun profil par défaut** :
+   `scw` sans `-p` échoue au lieu d'agir chez la mauvaise organisation. Les
+   agents passent toujours `-p <organisation>` et vérifient avant toute
+   écriture : `scw -p <organisation> account project list`. Terraform exige
+   le profil et l'identifiant de l'organisation, et refuse un projet qui n'en
+   fait pas partie (0033 §1).
 2. **Créer la VM** :
 
    ```bash
    cd deploy/serveur/terraform
    cat > mesh.auto.tfvars <<EOF
-   project_id    = "<projet de l'organisation>"
-   organisation  = "<id court>"
+   scw_profile     = "<profil nommé de l'organisation>"
+   organization_id = "<identifiant de l'organisation Scaleway>"
+   project_id      = "<projet de l'organisation>"
+   organisation    = "<id court>"
    instance_type = "PRO2-S"
    ssh_cidrs     = ["<IP d'administration>/32"]
    ameesh_ref    = "<étiquette ou commit>"

@@ -16,12 +16,27 @@ terraform {
 }
 
 provider "scaleway" {
+  # Profil nommé de l'organisation (~/.config/scw/config.yaml), jamais un
+  # profil par défaut : aucune ambiguïté sur l'organisation visée (0033 §1).
+  profile    = var.scw_profile
   zone       = var.zone
   region     = var.region
   project_id = var.project_id
 }
 
-resource "scaleway_instance_ip" "mesh" {}
+# Garde-fou : le projet doit appartenir à l'organisation annoncée.
+data "scaleway_account_project" "mesh" {
+  project_id = var.project_id
+}
+
+resource "scaleway_instance_ip" "mesh" {
+  lifecycle {
+    precondition {
+      condition     = data.scaleway_account_project.mesh.organization_id == var.organization_id
+      error_message = "Le projet ${var.project_id} n'appartient pas à l'organisation ${var.organization_id} : mauvais profil Scaleway ?"
+    }
+  }
+}
 
 resource "scaleway_instance_security_group" "mesh" {
   name                    = "${var.name}-sg"

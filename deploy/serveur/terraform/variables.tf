@@ -1,5 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
+variable "scw_profile" {
+  description = "Profil Scaleway NOMMÉ de l'organisation (ex. « manaty »). Obligatoire : pas de profil par défaut."
+  type        = string
+}
+
+variable "organization_id" {
+  description = "Identifiant de l'organisation Scaleway attendue ; Terraform refuse d'agir si le projet n'en fait pas partie."
+  type        = string
+}
+
 variable "project_id" {
   description = "Projet de l'hébergeur où créer la VM : celui de l'ORGANISATION du mesh (0033 §1), jamais celui d'une autre."
   type        = string
