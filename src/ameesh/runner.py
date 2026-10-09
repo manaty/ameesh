@@ -42,6 +42,7 @@ import uuid
 
 from . import account_turn, adapters, canon as canon_mod, canon_sync, cost as cost_mod
 from . import db as db_mod, fil, mail, registry, storage
+from . import accounts as accounts_mod, session_backup as session_backup_mod
 from .config import CHANNEL_LEASE, CHANNEL_MAIL, Config
 from .config import load as load_config
 
@@ -1948,6 +1949,7 @@ class AgentWorker(threading.Thread):
             error=error, cost_usd=cost,
         )
         self.last_activity = time.monotonic()
+        self._sauvegarde_session(adapter, compte, session_new or session)
         if ok:
             self.session_turns += 1
         if spec["kind"] == "idle":
@@ -1955,6 +1957,53 @@ class AgentWorker(threading.Thread):
         with self.runner.lock:
             self.runner.turns += 1
         return ok
+
+    def _sauvegarde_session(self, adapter, compte, session) -> None:
+        """L53 (0032 §2) : copie de la session hors de l'appareil, en fond.
+
+        Jamais bloquante pour l'agent : une cible injoignable, un chiffrement
+        impossible ou une configuration invalide sont journalisés, le tour
+        suivant réessaie (la copie n'a lieu que si la session a changé).
+        """
+        if not session or self.runner.dry_run or not self.cfg.session_backup:
+            return
+        try:
+            conf = session_backup_mod.parse(self.cfg.session_backup)
+        except session_backup_mod.BackupError as exc:
+            if not getattr(self, "_sauvegarde_signalee", False):
+                log("[%s] sauvegarde des sessions désactivée : %s" % (self.name, exc))
+                self._sauvegarde_signalee = True
+            return
+        descriptor = getattr(adapter, "descriptor", None)
+        patterns = getattr(descriptor, "session_files", ()) if descriptor else ()
+        if conf is None or not patterns:
+            return
+        harness = self.agent.get("harness") or ""
+        home = (compte.home() if compte is not None else os.path.abspath(os.path.expanduser(
+            os.environ.get(accounts_mod.config_env_of(harness))
+            or accounts_mod.default_home_of(harness))))
+        verrou = self.__dict__.setdefault("_sauvegarde_verrou", threading.Lock())
+        if not verrou.acquire(blocking=False):
+            return          # une copie de cet agent est déjà en cours
+
+        def copier() -> None:
+            try:
+                r = session_backup_mod.backup(
+                    conf, host=self.cfg.host, agent=self.name, home=home, patterns=patterns,
+                    session=session, state_dir=self.cfg.state_dir)
+                if r["status"] == "copiee":
+                    log("[%s] session %s sauvegardée hors de l'appareil (%d fichier(s), %d o)"
+                        % (self.name, session, r["files"], r["bytes"]))
+                elif r["status"] == "introuvable":
+                    log("[%s] sauvegarde : fichiers de la session %s introuvables sous %s"
+                        % (self.name, session, home))
+            except Exception as exc:  # noqa: BLE001 — jamais fatal pour l'agent
+                log("[%s] sauvegarde de la session %s impossible : %s" % (self.name, session, exc))
+            finally:
+                verrou.release()
+
+        threading.Thread(target=copier, daemon=True,
+                         name="%s-sauvegarde-session" % self.name).start()
 
     def failure_wait(self) -> float:
         """Attente avant le tour suivant après un échec : doublée à chaque échec
