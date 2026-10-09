@@ -135,6 +135,49 @@ def repatriate(db, child: str, persona: str) -> tuple[int, int]:
     return len(moved), int(kept[0]["n"]) if kept else 0
 
 
+#: L52 × L54 : délai laissé au tour de mémoire d'une fille avant de l'éteindre
+#: quand même (un tour qui ne vient pas ne doit pas la garder en vie)
+MEMORY_TURN_TIMEOUT_S = 1800
+
+
+def _close_memory_copy(db, child: str) -> None:
+    """La copie locale de la mémoire de la fille : dernière poussée, puis
+    effacement. Jamais bloquant."""
+    cfg = getattr(db, "cfg", None)
+    if cfg is None:
+        return
+    try:
+        from . import persona_memory
+        path = persona_memory.copy_dir(cfg.state_dir, child)
+        if os.path.isdir(path):
+            persona_memory.close(path, cfg_raw=getattr(cfg, "persona_memory", None))
+    except Exception as exc:  # noqa: BLE001
+        print("ameesh : copie de mémoire de %s non fermée : %s" % (child, exc),
+              file=sys.stderr)
+
+
+def request_memory_turn(db, child: str) -> bool:
+    """L52 × L54 : demande à la fille son tour de mémoire de fin de lot (la
+    consigne s'ajoute à une consigne en attente, sans l'écraser). Faux si
+    elle n'a pas de dépôt de mémoire ou si c'est déjà demandé."""
+    from . import persona_memory
+    cfg = getattr(db, "cfg", None)
+    if cfg is None:
+        return False
+    prompt = persona_memory.consolidation_prompt(
+        persona_memory.copy_dir(cfg.state_dir, child))
+    rows = db.query(
+        "UPDATE agent_registry SET closing_requested_at = now(), "
+        "pending_prompt = CASE WHEN coalesce(pending_prompt, '') = '' THEN %s "
+        "                      ELSE pending_prompt || E'\\n\\n' || %s END, "
+        "status = CASE WHEN status IN ('idle', 'blocked') THEN 'queued' ELSE status END, "
+        "status_text = 'fin de lot : tour de mémoire demandé', updated_at = now() "
+        "WHERE name = %s AND closing_requested_at IS NULL "
+        "AND coalesce(memory_repository, '') <> '' AND status <> 'stopped' "
+        "RETURNING name", (prompt, prompt, child))
+    return bool(rows)
+
+
 def close_child(db, child: str, reason: str = "fin de lot") -> dict:
     """L52e : éteint une fille. Elle est marquée arrêtée (`fin_de_lot` ; un
     tour en cours se termine, rien n'est tué), son courrier non remis revient
@@ -155,6 +198,8 @@ def close_child(db, child: str, reason: str = "fin de lot") -> dict:
                             % reason, stop_reason="fin_de_lot")
     moved, kept = repatriate(db, child, persona)
     record_end(db, child, row.get("session_id"), reason)
+    if not was_stopped:
+        _close_memory_copy(db, child)
     return {"name": child, "persona": persona, "work_item": row.get("session_work_item"),
             "stopped": not was_stopped, "repatriated": moved, "kept_signed": kept}
 
@@ -165,7 +210,12 @@ def close_finished(db, host: str) -> list[dict]:
     une fille déjà arrêtée. Appelé à chaque `canon sync`."""
     rows = db.query(
         """
-        SELECT f.name, f.status,
+        SELECT f.name, f.status, coalesce(f.memory_repository, '') <> '' AS memory,
+               f.closing_requested_at IS NOT NULL AS asked,
+               (f.closing_requested_at IS NOT NULL
+                AND coalesce(f.pending_prompt, '') = ''
+                AND f.status NOT IN ('running', 'queued')) AS memory_done,
+               f.closing_requested_at < now() - make_interval(secs => %s) AS memory_late,
                CASE WHEN w.state IN ('promoted', 'closed') OR w.closed_at IS NOT NULL
                     THEN 'fin du lot ' || f.session_work_item
                     WHEN f.ephemeral_expires_at <= now() THEN 'échéance de la session parallèle'
@@ -178,10 +228,18 @@ def close_finished(db, host: str) -> list[dict]:
                 AND w.id = f.session_work_item::bigint
          WHERE f.parent_persona IS NOT NULL AND f.host = %s
          ORDER BY f.name
-        """, (host,))
+        """, (MEMORY_TURN_TIMEOUT_S, host))
     out = []
     for row in rows:
         if row.get("status") != "stopped" and row.get("why"):
+            # L52 × L54 : une fille qui a une mémoire fait d'abord son tour de
+            # mémoire ; elle s'éteint quand il est passé (ou trop tard)
+            if row.get("memory") and not row.get("asked"):
+                if request_memory_turn(db, row["name"]):
+                    out.append({"name": row["name"], "memory_turn": True})
+                    continue
+            elif row.get("memory") and not (row.get("memory_done") or row.get("memory_late")):
+                continue
             out.append(close_child(db, row["name"], row["why"]))
         elif row.get("status") == "stopped" and row.get("mail"):
             out.append(close_child(db, row["name"], "courrier rapatrié"))

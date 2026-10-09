@@ -322,3 +322,56 @@ class ActiviteAvecFillesTest(PgTestCase):
         self.assertIn("[.l52] ← orchestre (lot 52) : Pour la fille.", texts)
         self.assertEqual(activity.children(self.db, "verif-a"), ["verif-a.l52"])
         self.assertEqual(activity.children(self.db, "verif-b"), [])
+
+
+class TourDeMemoireDeFinTest(PgTestCase):
+    """L52 × L54 : une fille qui a une mémoire fait son tour de mémoire avant
+    de s'éteindre en fin de lot."""
+
+    def setUp(self):
+        super().setUp()
+        registry.upsert(self.db, "verif-a", harness="deepseek", host="pc", mode="execute")
+        self.db.execute("UPDATE agent_registry SET responsible = 'humain', "
+                        "memory_repository = 'git@forge:org/memoire-verif-a.git' "
+                        "WHERE name = 'verif-a'")
+        self.lot = str(self.db.query(
+            "INSERT INTO work_items (title, state) VALUES ('Lot', 'build') RETURNING id")[0]["id"])
+        ps.open_child(self.db, "verif-a", self.lot, ttl_seconds=3600)
+        self.child = ps.child_name("verif-a", self.lot)
+        self.db.execute("UPDATE work_items SET state = 'promoted' WHERE id = %s",
+                        (int(self.lot),))
+
+    def etat(self):
+        return self.db.query("SELECT status, pending_prompt, closing_requested_at "
+                             "FROM agent_registry WHERE name = %s", (self.child,))[0]
+
+    def test_tour_puis_extinction(self):
+        registry.set_pending_prompt(self.db, self.child, "Consigne en attente.")
+        out = ps.close_finished(self.db, "pc")
+        self.assertEqual(out, [{"name": self.child, "memory_turn": True}])
+        got = self.etat()
+        self.assertEqual(got["status"], "queued")
+        self.assertTrue(got["pending_prompt"].startswith("Consigne en attente.\n\nTOUR DE MÉMOIRE"))
+        self.assertIsNotNone(got["closing_requested_at"])
+        # tour pas encore passé : rien
+        self.assertEqual(ps.close_finished(self.db, "pc"), [])
+        # le tour est passé (consigne consommée, au repos) : extinction
+        self.db.execute("UPDATE agent_registry SET pending_prompt = NULL, status = 'idle' "
+                        "WHERE name = %s", (self.child,))
+        out = ps.close_finished(self.db, "pc")
+        self.assertEqual([(o["name"], o["stopped"]) for o in out], [(self.child, True)])
+        self.assertEqual(self.etat()["status"], "stopped")
+
+    def test_tour_qui_ne_vient_pas(self):
+        ps.close_finished(self.db, "pc")
+        self.db.execute("UPDATE agent_registry SET closing_requested_at = now() - "
+                        "interval '2 hours' WHERE name = %s", (self.child,))
+        out = ps.close_finished(self.db, "pc")
+        self.assertEqual([o["name"] for o in out], [self.child])
+        self.assertEqual(self.etat()["status"], "stopped")
+
+    def test_sans_memoire_extinction_directe(self):
+        self.db.execute("UPDATE agent_registry SET memory_repository = NULL "
+                        "WHERE name = %s", (self.child,))
+        out = ps.close_finished(self.db, "pc")
+        self.assertEqual([o.get("stopped") for o in out], [True])
