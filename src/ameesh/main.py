@@ -49,6 +49,8 @@
   ameesh harness list|show|check        descripteurs de harnais (L16) ;
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
+  ameesh mcp-proxy --persona P --server S -- <cmd>   proxy MCP contrôlé par la fiche (v2 E2) ;
+  ameesh mcp-config <persona>           sa configuration MCP, chaque serveur permis via le proxy ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -149,6 +151,13 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "fil":
         from . import fil
         return fil.main(rest)
+    if command == "mcp-config":
+        from . import mcp_proxy
+        return mcp_proxy.config_main(rest)
+    if command == "mcp-proxy":
+        # étude v2 E2 : point d'application des outils MCP d'une persona
+        from . import mcp_proxy
+        return mcp_proxy.main(rest)
     if command == "notify":
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
