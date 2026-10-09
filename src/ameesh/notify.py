@@ -776,6 +776,45 @@ def key_of(alert: dict) -> str:
     return json.dumps(list(exploitation.alert_key(alert)), ensure_ascii=False)
 
 
+#: lots nommés dans une alerte `orphan_lot` groupée ; les suivants sont comptés
+GROUPED_LOTS_SHOWN = 5
+
+
+def group_orphan_lots(alerts: list, resolve) -> list:
+    """L50 : une alerte `orphan_lot` par (agent, raison, destinataire), pas une par lot.
+
+    Un coordinateur assigné à vingt lots qui passe en `sans_tour` envoyait vingt
+    notifications. L'alerte groupée n'a ni `lot` ni `since` : sa clé reste la
+    même quand un lot entre ou sort du groupe, et la même situation qui dure ne
+    se renvoie pas. Le destinataire est résolu lot par lot avant le groupement
+    (le responsable d'un lot peut différer de celui de l'agent).
+    """
+    out, groups = [], {}
+    for alert in alerts:
+        if alert.get("type") != "orphan_lot":
+            out.append(alert)
+            continue
+        human = resolve(alert)[0]
+        groups.setdefault((alert.get("agent"), alert.get("reason"), human), []).append(alert)
+    for (agent, reason, human), lots in groups.items():
+        lots.sort(key=lambda a: str(a.get("lot")))
+        names = ", ".join("#%s « %s »" % (a.get("lot"), _clean(a.get("title"), 60))
+                          if a.get("title") else "#%s" % a.get("lot")
+                          for a in lots[:GROUPED_LOTS_SHOWN])
+        more = (" et %d autre(s)" % (len(lots) - GROUPED_LOTS_SHOWN)
+                if len(lots) > GROUPED_LOTS_SHOWN else "")
+        grouped = {"schema": lots[0].get("schema"), "type": "orphan_lot", "agent": agent,
+                   "reason": reason, "value": len(lots),
+                   "detail": "%d lot(s) orphelin(s) (%s) : %s%s" % (
+                       len(lots), reason or "?", names, more)}
+        if lots[0].get("host"):
+            grouped["host"] = lots[0]["host"]
+        if human:
+            grouped["responsible"] = human
+        out.append(grouped)
+    return out
+
+
 #: champs d'une alerte gardés dans l'état (de quoi écrire la résolution)
 _KEPT = ("type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
          "responsible", "stop_reason", "assignee")
@@ -812,6 +851,7 @@ class Notifier:
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
+        current = group_orphan_lots(current, router.resolve)
         wanted = {key_of(a): a for a in current if a.get("type") in self.ncfg.types}
         active = self.state["active"]
         for key in list(active):
