@@ -248,6 +248,9 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: identité des humains par OIDC (étude v2 D1, 0033 §4) : la clé `identity`
+    #: de l'hôte (`providers` : issuer, client_id, domains). Jamais de secret ici.
+    identity: dict = field(default_factory=dict)
 
     @property
     def responsible_required(self) -> bool:
