@@ -55,7 +55,7 @@ systemctl enable --now wg-quick@wg0
 # --- Postgres ------------------------------------------------------------------
 # Version de la communauté PostgreSQL (dépôt PGDG), la même que celle des
 # autres meshes : une sauvegarde se restaure d'un hôte à l'autre.
-if [[ ! -d $PG_CONF ]]; then
+if ! dpkg -s "postgresql-$PG_VERSION" >/dev/null 2>&1; then
   log "Postgres $PG_VERSION depuis apt.postgresql.org"
   install -d /usr/share/postgresql-common/pgdg
   curl -fsSo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
@@ -65,12 +65,14 @@ if [[ ! -d $PG_CONF ]]; then
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "postgresql-$PG_VERSION" "postgresql-contrib-$PG_VERSION" >/dev/null 2>&1 \
     || DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "postgresql-$PG_VERSION"
-  # un cluster d'une autre version (paquet `postgresql` de la distribution) est retiré s'il est vide
-  for v in $(ls /etc/postgresql); do
-    [[ $v == "$PG_VERSION" ]] && continue
-    pg_dropcluster --stop "$v" main 2>/dev/null || true
-  done
 fi
+# Un cluster d'une autre version (paquet `postgresql` de la distribution, au
+# premier démarrage) est retiré : la base du mesh n'y a encore rien écrit.
+for v in $(ls /etc/postgresql); do
+  [[ $v == "$PG_VERSION" ]] && continue
+  pg_dropcluster --stop "$v" main || true
+done
+[[ -d $PG_CONF ]] || pg_createcluster "$PG_VERSION" main --port 5432
 log "Postgres $PG_VERSION en TLS, sur localhost et wg0"
 install -d /etc/systemd/system/postgresql@.service.d
 cat > /etc/systemd/system/postgresql@.service.d/wireguard.conf <<'CONF'
