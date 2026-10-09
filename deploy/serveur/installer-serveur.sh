@@ -24,6 +24,7 @@ HOST_NAME=${HOST_NAME:-$ORGANISATION-mesh-1}
 WG_NET=10.77.0
 PG_VERSION=$(ls /etc/postgresql | sort -n | tail -1)
 PG_CONF=/etc/postgresql/$PG_VERSION/main
+VERSION=$(git -C "$SRC" rev-parse --short HEAD 2>/dev/null || echo "?")
 
 log() { echo "== $*"; }
 
@@ -37,15 +38,17 @@ install -d -m 0750 -o root -g ameesh /etc/ameesh
 log "WireGuard (wg0, $WG_NET.1/24, port $WIREGUARD_PORT)"
 install -d -m 0700 /etc/wireguard
 if [[ ! -f /etc/wireguard/wg0.conf ]]; then
-  umask 077
-  wg genkey > /etc/wireguard/serveur.key
-  wg pubkey < /etc/wireguard/serveur.key > /etc/wireguard/serveur.pub
-  cat > /etc/wireguard/wg0.conf <<CONF
+  (  # umask restreint aux seules clés : il ne doit pas fuir sur la suite
+    umask 077
+    wg genkey > /etc/wireguard/serveur.key
+    wg pubkey < /etc/wireguard/serveur.key > /etc/wireguard/serveur.pub
+    cat > /etc/wireguard/wg0.conf <<CONF
 [Interface]
 Address = $WG_NET.1/24
 ListenPort = $WIREGUARD_PORT
 PrivateKey = $(cat /etc/wireguard/serveur.key)
 CONF
+  )
 fi
 systemctl enable --now wg-quick@wg0
 
@@ -58,7 +61,7 @@ cat > /etc/systemd/system/postgresql@.service.d/wireguard.conf <<'CONF'
 After=wg-quick@wg0.service
 Wants=wg-quick@wg0.service
 CONF
-cat > "$PG_CONF/conf.d/ameesh.conf" <<CONF
+install -m 0644 -o postgres -g postgres /dev/stdin "$PG_CONF/conf.d/ameesh.conf" <<CONF
 listen_addresses = 'localhost,$WG_NET.1'
 ssl = on
 password_encryption = scram-sha-256
@@ -69,7 +72,9 @@ grep -q "ameesh-mesh" "$HBA" || cat >> "$HBA" <<CONF
 hostssl ameesh  all  $WG_NET.0/24  scram-sha-256
 CONF
 systemctl daemon-reload
-systemctl restart postgresql
+systemctl restart "postgresql@$PG_VERSION-main"
+for _ in $(seq 30); do pg_isready -q -h localhost && break; sleep 1; done
+pg_isready -h localhost
 if [[ ! -f /etc/ameesh/db.env ]]; then
   PW=$(head -c 32 /dev/urandom | base64 | tr -d '/+=' | head -c 32)
   runuser -u postgres -- psql -v ON_ERROR_STOP=1 -q <<SQL
@@ -82,16 +87,14 @@ ALTER ROLE ameesh PASSWORD '$PW';
 SQL
   runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'ameesh'" | grep -q 1 \
     || runuser -u postgres -- createdb -O ameesh ameesh
-  umask 077
-  printf 'PGPASSWORD=%s\n' "$PW" > /etc/ameesh/db.env
-  chgrp ameesh /etc/ameesh/db.env && chmod 0640 /etc/ameesh/db.env
-  printf '127.0.0.1:5432:ameesh:ameesh:%s\n' "$PW" > /home/ameesh/.pgpass
-  chown ameesh:ameesh /home/ameesh/.pgpass && chmod 0600 /home/ameesh/.pgpass
+  printf 'PGPASSWORD=%s\n' "$PW" | install -m 0640 -o root -g ameesh /dev/stdin /etc/ameesh/db.env
+  printf '127.0.0.1:5432:ameesh:ameesh:%s\n' "$PW" \
+    | install -m 0600 -o ameesh -g ameesh /dev/stdin /home/ameesh/.pgpass
   unset PW
 fi
 
 # --- ameesh --------------------------------------------------------------------
-log "ameesh ($(git -C "$SRC" rev-parse --short HEAD)) dans $VENV"
+log "ameesh ($(echo "$VERSION")) dans $VENV"
 [[ -d $VENV ]] || python3 -m venv "$VENV"
 "$VENV/bin/pip" install -q --upgrade pip
 "$VENV/bin/pip" install -q --force-reinstall --no-deps "$SRC"
@@ -128,7 +131,7 @@ systemctl enable --now ameesh-sauvegarde.timer
 IP=$(curl -fsS --max-time 5 https://api.ipify.org || hostname -I | awk '{print $1}')
 cat > /root/ameesh-serveur.txt <<TXT
 Mesh ameesh de l'organisation « $ORGANISATION » — hôte $HOST_NAME
-  ameesh      $(git -C "$SRC" rev-parse --short HEAD)
+  ameesh      $(echo "$VERSION")
   WireGuard   $IP:$WIREGUARD_PORT, clé publique $(cat /etc/wireguard/serveur.pub)
   Postgres    $WG_NET.1:5432, base ameesh, rôle ameesh, TLS obligatoire depuis wg0
               (mot de passe : /etc/ameesh/db.env, jamais affiché)
