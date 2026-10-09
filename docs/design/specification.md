@@ -149,6 +149,23 @@ roles: [relecteur, referent]     # rôles tenus (socle de 0033 §8 et rôles du 
 Un `harness` absent de `harnesses` est signalé (`agent-harness-outside-list`) ;
 un harnais de la liste sans descripteur est une erreur (`agent-harness-unknown`).
 
+**`type: Role`** (L58, [0032](decisions/0032-persona-roles-et-sessions.md),
+[0033](decisions/0033-meshes-etanches-hebergement-et-identite.md) §7-8) — une
+fonction dans un périmètre, adressable (`role:<rôle>@<équipe>`) :
+
+```yaml
+type: Role
+title: verificateur-bd           # minuscules, chiffres, tirets
+team: ima                        # périmètre ; absent = toutes les équipes du canon
+holder: verif-a                  # titulaire : persona du canon ou human:<id>
+deputies: [verif-b, human:bruno] # suppléants, dans l'ordre
+```
+
+Le socle commun (coordinateur, auteur, relecteur, approbateur, référent,
+veilleur) est complété par les rôles propres au canon. Contrôles :
+`role-title-invalid`, `role-holder-missing`, `role-holder-unresolved`,
+`role-duplicate` (même rôle et même équipe).
+
 **`type: Host`**
 
 ```yaml

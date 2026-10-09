@@ -63,7 +63,7 @@ except Exception:  # pragma: no cover - dépend de l'environnement
 
 #: `Persona` (L51, 0029/0032) se lit comme `Agent`, qu'elle remplace ; les deux
 #: coexistent pendant la transition.
-PROFILE_TYPES = ("Agent", "Persona", "Host", "Placement", "Member", "WorkPackage")
+PROFILE_TYPES = ("Agent", "Persona", "Host", "Placement", "Member", "WorkPackage", "Role")
 #: les sortes de fiches WorkPackage (plan de travail, L29) et les parents admis
 PACKAGE_KINDS = ("milestone", "epic", "lot")
 PACKAGE_PARENTS = {"milestone": (), "epic": ("milestone",), "lot": ("epic", "milestone")}
@@ -650,6 +650,8 @@ def split_frontmatter(text: str) -> str | None:
     raise YamlError("frontmatter non fermé (ou plus grand que %d Kio)" % (FRONTMATTER_MAX // 1024))
 
 
+#: nom de rôle (L58) : le socle commun de 0033 §8 et les rôles propres aux canons
+ROLE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _TYPED_RE = re.compile(r"^type:\s*[\"']?(%s)[\"']?\s*(#.*)?$" % "|".join(PROFILE_TYPES), re.M)
 
 
@@ -923,6 +925,22 @@ class Placement:
 
 
 @dataclass
+class Role:
+    """Un rôle (L58, 0032, 0033 §8) : une fonction dans un périmètre (`team`),
+    tenue par un titulaire puis, dans l'ordre, par ses suppléants. Titulaire et
+    suppléants sont des personas du canon ou des humains (`human:<id>`)."""
+    title: str
+    team: str | None
+    holder: str | None
+    deputies: list[str] | None
+    fiche: Fiche
+
+    @property
+    def chain(self) -> list[str]:
+        return [x for x in [self.holder, *(self.deputies or [])] if x]
+
+
+@dataclass
 class WorkPackage:
     """Une fiche du plan de travail (L29) : jalon, epic ou lot."""
 
@@ -946,6 +964,7 @@ class Canon:
     hosts: list[Host] = field(default_factory=list)
     placements: list[Placement] = field(default_factory=list)
     packages: list[WorkPackage] = field(default_factory=list)
+    role_cards: list[Role] = field(default_factory=list)   # fiches Role (L58)
     federation: dict | None = None
     #: constats de lecture (source, fédération, frontmatter, champs)
     load_findings: list[Finding] = field(default_factory=list)
@@ -2223,6 +2242,13 @@ class _Loader:
         ))
 
 
+    def _build_role(self, fiche: Fiche, where: dict) -> None:
+        self.canon.role_cards.append(Role(
+            title=fiche.title, team=_text(fiche.data.get("team")),
+            holder=_text(fiche.data.get("holder")),
+            deputies=self._list(fiche, "deputies", where, "role-deputies-invalid"),
+            fiche=fiche))
+
     def _build_workpackage(self, fiche: Fiche, where: dict) -> None:
         ident = _text(fiche.data.get("id")) or _package_stem(fiche.path)
         subject = {"package": ident}
@@ -2547,6 +2573,34 @@ def validate(canon: Canon) -> list[Finding]:
                         "%s de %s : un humain ne peut pas être son propre %s"
                         % (key, member.title, "suppléant" if key == "deputies" else "supérieur"),
                         member.fiche)
+
+    # -- rôles (L58, 0032, 0033 §8) -------------------------------------------------
+    seen_roles: dict = {}
+    for role in canon.role_cards:
+        f = role.fiche
+        if not ROLE_NAME_RE.match(role.title):
+            add("role-title-invalid", ERROR,
+                "nom de rôle %r : minuscules, chiffres et tirets" % role.title, f)
+            continue
+        key = (role.title, role.team or "")
+        if key in seen_roles:
+            add("role-duplicate", ERROR, "rôle %s%s déclaré deux fois" % (
+                role.title, "@" + role.team if role.team else ""), f)
+        seen_roles[key] = role
+        if not role.holder:
+            add("role-holder-missing", ERROR, "rôle %s sans titulaire (`holder`)" % role.title, f)
+        for ref in role.chain:
+            if ref.startswith("human:"):
+                if canon.resolve_human(ref) is None:
+                    add("role-holder-unresolved", ERROR,
+                        "rôle %s : %r ne résout pas vers un Member humain" % (role.title, ref), f)
+            elif canon.agent(ref) is None:
+                add("role-holder-unresolved", ERROR,
+                    "rôle %s : %r n'est ni une persona du canon ni human:<id>"
+                    % (role.title, ref), f)
+        if len(set(role.chain)) != len(role.chain):
+            add("role-chain-duplicate", WARNING,
+                "rôle %s : un même titulaire ou suppléant apparaît deux fois" % role.title, f)
 
     # -- hôtes -----------------------------------------------------------------------
     for host in canon.hosts:

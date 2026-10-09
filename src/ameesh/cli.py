@@ -250,6 +250,24 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     if not NAME_RE.match(sender) or not text:
         print("expéditeur ou texte invalide", file=sys.stderr)
         return 2
+    if dest.startswith("role:"):
+        # L58 (0032, 0033 §8) : un rôle se résout à l'envoi vers la première
+        # persona disponible de sa chaîne (titulaire, puis suppléants).
+        if bk.kind != "pg":
+            print("adresse de rôle : la base du mesh est requise", file=sys.stderr)
+            return 2
+        from . import canon as canon_mod, roles as roles_mod
+        try:
+            rows = bk.db.query("SELECT team FROM agent_registry WHERE name = %s", (sender,))
+            res = roles_mod.resolve(bk.db, canon_mod.load_configured(cfg), dest,
+                                    sender_team=(rows[0].get("team") if rows else None))
+        except roles_mod.RoleError as exc:
+            print("rôle : %s" % exc, file=sys.stderr)
+            return 2
+        print(res.describe(), file=sys.stderr)
+        if not res.ok:
+            return 3
+        dest = res.name
     if dest != "all" and not NAME_RE.match(dest):
         print("destinataire invalide", file=sys.stderr)
         return 2

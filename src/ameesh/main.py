@@ -49,6 +49,7 @@
   ameesh harness list|show|check        descripteurs de harnais (L16) ;
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
+  ameesh roles [--team T] [--json]      rôles du canon et qui les tient en ce moment (L58) ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -149,6 +150,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "fil":
         from . import fil
         return fil.main(rest)
+    if command == "roles":
+        # L58 (0032, 0033 §8) : rôles du canon et leur résolution présente
+        from . import roles
+        return roles.main(rest)
     if command == "notify":
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
