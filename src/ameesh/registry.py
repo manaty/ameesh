@@ -42,7 +42,7 @@ canon_claim_predicate_sql = _pg.canon_claim_predicate_sql
 #: sous bail ; `externe` = session humaine, boîte seulement, non réveillable
 MODES = ("execute", "externe")
 #: raisons d'arrêt structurées (`stop_reason`, L37) ; NULL tant que l'agent tourne
-STOP_REASONS = ("manuel", "bail_expire", "retire_du_canon", "externe", "erreur")
+STOP_REASONS = ("manuel", "bail_expire", "retire_du_canon", "externe", "erreur", "fin_de_lot")
 
 
 def _check_name(name: str) -> str:

@@ -171,3 +171,77 @@ class AcheminementParLotTest(PgTestCase):
         rows = self.db.query("SELECT recipient, work_item_id FROM agent_mailbox ORDER BY id")
         self.assertEqual([(r["recipient"], r["work_item_id"]) for r in rows],
                          [("verif-a.l52", "52"), ("verif-a", "53"), ("verif-a", None)])
+
+
+class FinDeFilleTest(PgTestCase):
+    """L52e : une fille s'éteint en fin de lot, son courrier revient à la persona."""
+
+    def setUp(self):
+        super().setUp()
+        registry.upsert(self.db, "verif-a", harness="deepseek", host="pc", mode="execute")
+        self.db.execute("UPDATE agent_registry SET responsible = 'humain' "
+                        "WHERE name = 'verif-a'")
+        self.lot = str(self.db.query(
+            "INSERT INTO work_items (title, state) VALUES ('Lot', 'build') RETURNING id")[0]["id"])
+        ps.open_child(self.db, "verif-a", self.lot, ttl_seconds=3600)
+        self.child = ps.child_name("verif-a", self.lot)
+
+    def deposit(self, signed=False):
+        from ameesh import mail
+        return mail.send(self.db, "orchestre", self.child, "Point sur le lot.",
+                         work_item_id=self.lot,
+                         signature_key="cle" if signed else None)
+
+    def registre(self):
+        return self.db.query("SELECT status, stop_reason FROM agent_registry WHERE name = %s",
+                             (self.child,))[0]
+
+    def test_fermeture_a_la_main(self):
+        registry.set_session(self.db, self.child, "f1")
+        self.deposit()
+        self.deposit(signed=True)
+        out = ps.close_child(self.db, self.child)
+        self.assertEqual((out["persona"], out["stopped"], out["repatriated"],
+                          out["kept_signed"]), ("verif-a", True, 1, 1))
+        self.assertEqual(dict(self.registre()), {"status": "stopped",
+                                                 "stop_reason": "fin_de_lot"})
+        rows = self.db.query("SELECT recipient FROM agent_mailbox ORDER BY id")
+        self.assertEqual([r["recipient"] for r in rows], ["verif-a", self.child])
+        self.assertEqual(ps.sessions(self.db, "verif-a")[0]["end_reason"], "fin de lot")
+        # idempotent
+        again = ps.close_child(self.db, self.child)
+        self.assertEqual((again["stopped"], again["repatriated"]), (False, 0))
+        # le courrier du lot ne va plus à la fille arrêtée
+        self.assertEqual(ps.route(self.db, "verif-a", self.lot), "verif-a")
+
+    def test_refus(self):
+        with self.assertRaisesRegex(ps.ChildError, "pas une session parallèle"):
+            ps.close_child(self.db, "verif-a")
+        with self.assertRaisesRegex(ps.ChildError, "inconnu"):
+            ps.close_child(self.db, "personne")
+
+    def test_fin_du_lot(self):
+        self.assertEqual(ps.close_finished(self.db, "pc"), [])        # lot en cours
+        self.deposit()
+        self.db.execute("UPDATE work_items SET state = 'promoted', closed_at = now() "
+                        "WHERE id = %s", (int(self.lot),))
+        self.assertEqual(ps.close_finished(self.db, "autre-hote"), [])
+        out = ps.close_finished(self.db, "pc")
+        self.assertEqual([(o["name"], o["repatriated"]) for o in out], [(self.child, 1)])
+        self.assertEqual(self.registre()["stop_reason"], "fin_de_lot")
+        self.assertEqual(ps.close_finished(self.db, "pc"), [])         # rien de plus
+
+    def test_echeance(self):
+        self.db.execute("UPDATE agent_registry SET ephemeral_expires_at = now() - "
+                        "interval '1 minute' WHERE name = %s", (self.child,))
+        out = ps.close_finished(self.db, "pc")
+        self.assertEqual([o["name"] for o in out], [self.child])
+        self.assertEqual(self.registre()["status"], "stopped")
+
+    def test_courrier_reste_chez_une_fille_arretee(self):
+        self.db.execute("UPDATE agent_registry SET status = 'stopped', stop_reason = 'manuel' "
+                        "WHERE name = %s", (self.child,))
+        self.deposit()
+        out = ps.close_finished(self.db, "pc")
+        self.assertEqual([(o["stopped"], o["repatriated"]) for o in out], [(False, 1)])
+        self.assertEqual(self.registre()["stop_reason"], "manuel")      # arrêt humain gardé
