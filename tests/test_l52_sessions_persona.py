@@ -139,3 +139,35 @@ class SessionsFillesTest(PgTestCase):
         self.assertEqual(got["cwd"], "/w/lot52")            # dossier propre à la fille
         self.assertEqual(storage.of(self.db).ephemerals.refresh_children("pc"), [])
         self.assertEqual(storage.of(self.db).ephemerals.refresh_children("autre-hote"), [])
+
+
+class AcheminementParLotTest(PgTestCase):
+    """L52c : le courrier d'un lot va à la fille de la persona sur ce lot."""
+
+    def setUp(self):
+        super().setUp()
+        registry.upsert(self.db, "verif-a", harness="deepseek", host="pc", mode="execute")
+        self.db.execute("UPDATE agent_registry SET responsible = 'humain' "
+                        "WHERE name = 'verif-a'")
+        ps.open_child(self.db, "verif-a", "52", ttl_seconds=3600)
+
+    def send(self, lot=None, signed=None):
+        from ameesh.backend import PgBackend
+        return PgBackend(self.cfg, self.db).send("orchestre", "verif-a", "Avance sur le lot.",
+                                                 work_item_id=lot, signed=signed)
+
+    def test_route(self):
+        self.assertEqual(ps.route(self.db, "verif-a", "52"), "verif-a.l52")
+        self.assertEqual(ps.route(self.db, "verif-a", "53"), "verif-a")
+        self.assertEqual(ps.route(self.db, "verif-a", None), "verif-a")
+        self.db.execute("UPDATE agent_registry SET status = 'stopped' "
+                        "WHERE name = 'verif-a.l52'")
+        self.assertEqual(ps.route(self.db, "verif-a", "52"), "verif-a")
+
+    def test_envoi(self):
+        self.assertEqual(self.send("52"), ["verif-a.l52"])
+        self.assertEqual(self.send("53"), ["verif-a"])
+        self.assertEqual(self.send(), ["verif-a"])
+        rows = self.db.query("SELECT recipient, work_item_id FROM agent_mailbox ORDER BY id")
+        self.assertEqual([(r["recipient"], r["work_item_id"]) for r in rows],
+                         [("verif-a.l52", "52"), ("verif-a", "53"), ("verif-a", None)])

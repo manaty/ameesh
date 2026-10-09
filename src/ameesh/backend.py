@@ -18,7 +18,7 @@ import time
 
 from . import config as config_mod
 from . import db as db_mod
-from . import fil, identity, mail, registry
+from . import fil, identity, mail, persona_sessions, registry
 from .config import Config
 
 
@@ -241,6 +241,11 @@ class PgBackend:
             own = projects.get(sender)
             targets = [row["name"] for row in rows if row["name"] != sender
                        and (not own or projects.get(row["name"]) == own)]
+        elif work_item_id and not signed:
+            # L52c : le courrier d'un lot va à la session parallèle de la
+            # persona sur ce lot, s'il y en a une. Un message signé garde son
+            # destinataire : la signature le couvre.
+            targets = [persona_sessions.route(self.db, dest, work_item_id)]
         else:
             targets = [dest]
         groups: dict[str, list[tuple[str, int]]] = {}

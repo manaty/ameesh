@@ -102,6 +102,25 @@ def sessions(db, persona: str, limit: int = 50) -> list[dict]:
         (persona, int(limit)))
 
 
+def route(db, recipient: str, work_item: str | None) -> str:
+    """L52c : destinataire effectif d'un message sur un lot. Le courrier adressé
+    à une persona avec un lot va à sa fille vivante sur ce lot, s'il y en a
+    une ; sinon à la persona. Jamais bloquant : en cas d'erreur (base en retard
+    de migration comprise), la persona."""
+    if not work_item:
+        return recipient
+    try:
+        rows = db.query(
+            "SELECT name FROM agent_registry WHERE parent_persona = %s "
+            "AND session_work_item = %s AND status <> 'stopped' "
+            "AND ephemeral_expires_at > now() ORDER BY name LIMIT 1",
+            (recipient, str(work_item)))
+    except Exception as exc:  # noqa: BLE001
+        print("ameesh : acheminement par lot ignoré : %s" % exc, file=sys.stderr)
+        return recipient
+    return rows[0]["name"] if rows else recipient
+
+
 def open_child(db, persona: str, work_item: str, *, ttl_seconds: float,
                max_parallel: int = 3, cwd: str | None = None,
                canons: list | None = None) -> dict:
