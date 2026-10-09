@@ -214,12 +214,30 @@ ou par un humain. Il reste à concevoir :
   peut lire quelle mémoire. La règle de visibilité de 0029 en est le premier
   cas.
 
+# Volet G — visibilité du responsable (0033 §9)
+
+- **G1. Journal d'activité par persona.** Une vue chronologique : sessions
+  ouvertes et closes, tours (déclencheur, durée, issue), messages reçus et
+  envoyés, lots (états, verdicts), actions et reçus, dépenses. Le registre, les
+  fils, les coûts par tour et les actions en ont déjà la matière. Il manque la
+  vue par persona, et la conservation au-delà de la vie d'une session.
+- **G2. Contenu des sessions.** Le responsable peut ouvrir le transcript
+  d'une session, présente ou passée, depuis la sauvegarde (A7). C'est la
+  seule façon de savoir *pourquoi* un agent a fait quelque chose.
+- **G3. Accès.** Le responsable de la persona et ses suppléants. La règle
+  passe par les relations du volet D (« responsable de » → « peut lire
+  l'activité de »). Chaque consultation d'un transcript est tracée.
+- **G4. Où.** En ligne de commande (`ameesh activity <persona>`), dans la vue
+  temps réel de 0024 et dans Nexlink, avec la même interface publique (0015).
+- **G5. Conservation.** Une durée par organisation, fixée dans son canon. Les
+  sauvegardes de sessions suivent la même durée.
+
 # Ordre proposé
 
 | Phase | Contenu | Dépend de |
 |---|---|---|
 | **1** | Persona et session séparées (fiche `Persona`, registre, plusieurs sessions par persona) ; mémoire de persona (F1) | 0029, 0032 |
-| **2** | Rôles (C1–C5) | 1 |
+| **2** | Rôles (C1–C5) ; journal d'activité par persona (G1, G3, G4) | 1 |
 | **3** | Base partagée et rôles Postgres par agent (A1, D4) ; premier serveur en VM et systemd (A2) | 1 |
 | **4** | Placement selon la capacité et déplacement entre deux lots (A3, A4a) ; comptes API sur serveur (A5) | 1, 3 |
 | **5** | Identité OIDC et ameesh-approve déployé (D1, B3) | 3 |

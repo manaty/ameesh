@@ -55,6 +55,14 @@ sources:
    - **approbateur** : décide et engage l'organisation ;
    - **référent** : fait autorité sur un domaine ;
    - **veilleur** : surveille des sources et signale.
+9. **Visibilité du responsable.** Un humain voit l'activité **présente et
+   passée** des personas dont il est responsable : leurs sessions, leurs tours,
+   leurs messages, leurs lots, leurs actions et leurs dépenses. La règle vaut
+   aussi pour ses suppléants, qui peuvent agir à sa place (§7). L'activité
+   passée repose sur la sauvegarde des sessions
+   ([0032](0032-persona-roles-et-sessions.md) §2) et sur les fils. La vue est
+   celle de [0024](0024-vue-temps-reel.md), filtrée par responsabilité et
+   lisible sur téléphone.
 
 # Conséquences
 
