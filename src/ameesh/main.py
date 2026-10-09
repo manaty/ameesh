@@ -50,6 +50,7 @@
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
   ameesh sessions <persona> [--json]    ses sessions, présentes et passées (L52) ;
+  ameesh sessions open <persona> --lot N   session parallèle sur un lot (L52b) ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,

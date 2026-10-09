@@ -78,7 +78,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    write_declared clear_responsible set_placement
                    lineage_rows revive clear_pending_stop move_host
                    stop_removed
-   ephemerals      creator create exists
+   ephemerals      creator create exists create_child children refresh_children
    authenticators  lock_registry registry_lock_held under_registry_lock
                    canon_refs last_sync journal_head append_sync rebase_default
                    registered for_approver active_holders update_meta revoke insert
@@ -1099,6 +1099,25 @@ class Ephemerals(Domain):
     @abc.abstractmethod
     def exists(self, name: str) -> bool:
         """Un agent de ce nom existe-t-il ?"""
+
+    @abc.abstractmethod
+    def create_child(self, name: str, persona: str, work_item: str, *,
+                     cwd: str | None = None, ttl_seconds: float) -> dict | None:
+        """L52b : crée la fille d'une persona (session parallèle sur un lot),
+        atomiquement depuis la ligne de la persona : responsable, équipe,
+        capacités, harnais et profil recopiés. None si le nom est pris ou si
+        la persona n'est plus éligible (arrêtée, éphémère, sans responsable)."""
+
+    @abc.abstractmethod
+    def children(self, persona: str) -> list[dict]:
+        """L52b : les filles d'une persona, vivantes ou non."""
+
+    @abc.abstractmethod
+    def refresh_children(self, host: str) -> list[dict]:
+        """L52b : recopie dans les filles de cet hôte ce qu'elles héritent de
+        leur persona (responsable, équipe, capacités, harnais, profil ; ni
+        l'hôte ni le dossier de travail) ;
+        rend les filles modifiées."""
 
 
 # --------------------------------------------------------------------------
