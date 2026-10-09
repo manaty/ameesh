@@ -138,7 +138,7 @@ from dataclasses import dataclass, field
 from . import canon as canon_mod
 from . import fil
 from . import placement as placement_mod
-from . import receipts, registry, storage
+from . import persona_sessions, receipts, registry, storage
 from . import visibility as visibility_mod
 from .canon import Canon, Finding
 from .config import NAME_RE
@@ -182,7 +182,7 @@ class CanonUnreadable(canon_mod.CanonError):
 @dataclass
 class SyncAction:
     agent: str
-    action: str     # créé | mis à jour | inchangé | arrêté | arrêt demandé | réintégré | déplacé | laissé | fille recopiée
+    action: str     # créé | mis à jour | inchangé | arrêté | arrêt demandé | réintégré | déplacé | laissé | fille recopiée | fille close
     detail: str = ""
     blocked: list[str] = field(default_factory=list)
     #: verdict de placement écrit pour cet agent (C4), s'il en a un
@@ -1345,6 +1345,12 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     for child in storage.of(db).ephemerals.refresh_children(host):
         actions.append(SyncAction(child["name"], "fille recopiée",
                                   "héritage relu depuis %s" % child["parent_persona"]))
+    # L52e : une fille dont le lot est terminé (ou échue) s'éteint ; son
+    # courrier non remis revient à la persona
+    for closed in persona_sessions.close_finished(db, host):
+        actions.append(SyncAction(closed["name"], "fille close",
+                                  "%d message(s) rendu(s) à %s" % (
+                                      closed["repatriated"], closed["persona"])))
     _inherit_placements(db, host, canon)
     packages = sync_packages(db, canon, findings, ident=ident)
     findings.extend(packages.findings)

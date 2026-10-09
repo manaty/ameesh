@@ -121,6 +121,73 @@ def route(db, recipient: str, work_item: str | None) -> str:
     return rows[0]["name"] if rows else recipient
 
 
+def repatriate(db, child: str, persona: str) -> tuple[int, int]:
+    """L52e : le courrier non remis d'une fille revient à sa persona. Un
+    message signé reste où il est (la signature couvre le destinataire) : il
+    lèvera l'alerte `stopped_with_mail`. Rend (rapatriés, signés laissés)."""
+    moved = db.query(
+        "UPDATE agent_mailbox SET recipient = %s "
+        "WHERE recipient = %s AND delivered_at IS NULL AND signature_key IS NULL "
+        "RETURNING id", (persona, child))
+    kept = db.query(
+        "SELECT count(*) AS n FROM agent_mailbox "
+        "WHERE recipient = %s AND delivered_at IS NULL", (child,))
+    return len(moved), int(kept[0]["n"]) if kept else 0
+
+
+def close_child(db, child: str, reason: str = "fin de lot") -> dict:
+    """L52e : éteint une fille. Elle est marquée arrêtée (`fin_de_lot` ; un
+    tour en cours se termine, rien n'est tué), son courrier non remis revient
+    à la persona et sa session est close dans l'historique. Idempotent : une
+    fille déjà arrêtée voit seulement son courrier rapatrié."""
+    from . import registry
+    rows = db.query("SELECT name, parent_persona, status, session_id, session_work_item "
+                    "FROM agent_registry WHERE name = %s", (child,))
+    if not rows:
+        raise ChildError("agent inconnu du registre : %s" % child)
+    row = rows[0]
+    persona = row.get("parent_persona")
+    if not persona:
+        raise ChildError("%s n'est pas une session parallèle (aucune persona mère)" % child)
+    was_stopped = row.get("status") == "stopped"
+    if not was_stopped:
+        registry.set_status(db, child, "stopped", status_text="session parallèle close : %s"
+                            % reason, stop_reason="fin_de_lot")
+    moved, kept = repatriate(db, child, persona)
+    record_end(db, child, row.get("session_id"), reason)
+    return {"name": child, "persona": persona, "work_item": row.get("session_work_item"),
+            "stopped": not was_stopped, "repatriated": moved, "kept_signed": kept}
+
+
+def close_finished(db, host: str) -> list[dict]:
+    """L52e : ferme les filles de cet hôte dont le lot est terminé (promu ou
+    clos) ou dont l'échéance est passée, et rapatrie le courrier resté chez
+    une fille déjà arrêtée. Appelé à chaque `canon sync`."""
+    rows = db.query(
+        """
+        SELECT f.name, f.status,
+               CASE WHEN w.state IN ('promoted', 'closed') OR w.closed_at IS NOT NULL
+                    THEN 'fin du lot ' || f.session_work_item
+                    WHEN f.ephemeral_expires_at <= now() THEN 'échéance de la session parallèle'
+               END AS why,
+               EXISTS (SELECT 1 FROM agent_mailbox m WHERE m.recipient = f.name
+                         AND m.delivered_at IS NULL AND m.signature_key IS NULL) AS mail
+          FROM agent_registry f
+          LEFT JOIN work_items w
+                 ON f.session_work_item ~ '^[0-9]{1,18}$'
+                AND w.id = f.session_work_item::bigint
+         WHERE f.parent_persona IS NOT NULL AND f.host = %s
+         ORDER BY f.name
+        """, (host,))
+    out = []
+    for row in rows:
+        if row.get("status") != "stopped" and row.get("why"):
+            out.append(close_child(db, row["name"], row["why"]))
+        elif row.get("status") == "stopped" and row.get("mail"):
+            out.append(close_child(db, row["name"], "courrier rapatrié"))
+    return out
+
+
 def open_child(db, persona: str, work_item: str, *, ttl_seconds: float,
                max_parallel: int = 3, cwd: str | None = None,
                canons: list | None = None) -> dict:
@@ -265,12 +332,58 @@ def main_open(argv) -> int:
     return 0
 
 
+def main_close(argv) -> int:
+    """`ameesh sessions close <fille> [--reason TEXTE] [--json]` (L52e).
+
+    Depuis une session d'agent : seulement la fille elle-même ou sa persona."""
+    from . import identity
+    from . import db as db_mod
+    from .config import load as load_config
+    p = argparse.ArgumentParser(prog="ameesh sessions close",
+                                description="Ferme une session parallèle (L52e).")
+    p.add_argument("child")
+    p.add_argument("--reason", default="fin de lot")
+    p.add_argument("--json", action="store_true")
+    args = p.parse_args(argv)
+    cfg = load_config()
+    db = db_mod.connect(cfg)
+    try:
+        db_mod.require_schema(db)
+        if os.environ.get("AGENT_MAIL_NAME"):
+            binding = identity.resolve_binding(cfg, db)
+            rows = db.query("SELECT parent_persona FROM agent_registry WHERE name = %s",
+                            (args.child,))
+            allowed = {args.child, (rows[0].get("parent_persona") if rows else None)}
+            if not binding.ok or binding.name not in allowed:
+                print("refus : cette session est %s ; elle ne ferme que sa propre session "
+                      "parallèle ou celles de sa persona" % binding.describe(), file=sys.stderr)
+                return 1
+        try:
+            out = close_child(db, args.child, args.reason)
+        except ChildError as exc:
+            print("refus : %s" % exc, file=sys.stderr)
+            return 1
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    print("session parallèle %s %s ; %d message(s) rendu(s) à %s%s" % (
+        out["name"], "close" if out["stopped"] else "déjà arrêtée", out["repatriated"],
+        out["persona"],
+        (" ; %d message(s) signé(s) laissé(s) chez la fille" % out["kept_signed"])
+        if out["kept_signed"] else ""))
+    return 0
+
+
 def main(argv) -> int:
-    """`ameesh sessions <persona> [--limit N] [--json]` ; `ameesh sessions open …`."""
+    """`ameesh sessions <persona> [--limit N] [--json]` ; `… open|close …`."""
     from . import db as db_mod
     from .config import load as load_config
     if argv and argv[0] == "open" and len(argv) > 1:
         return main_open(argv[1:])
+    if argv and argv[0] == "close" and len(argv) > 1:
+        return main_close(argv[1:])
     p = argparse.ArgumentParser(prog="ameesh sessions",
                                 description="Sessions d'une persona, présentes et passées (L52).")
     p.add_argument("persona")
