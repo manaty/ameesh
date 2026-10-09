@@ -182,7 +182,7 @@ class CanonUnreadable(canon_mod.CanonError):
 @dataclass
 class SyncAction:
     agent: str
-    action: str     # créé | mis à jour | inchangé | arrêté | arrêt demandé | réintégré | déplacé | laissé
+    action: str     # créé | mis à jour | inchangé | arrêté | arrêt demandé | réintégré | déplacé | laissé | fille recopiée
     detail: str = ""
     blocked: list[str] = field(default_factory=list)
     #: verdict de placement écrit pour cet agent (C4), s'il en a un
@@ -1340,6 +1340,11 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
                 and not row.get("ephemeral") and name not in admitted_here:
             actions.append(SyncAction(name, "hors canon",
                                       "inscrit à la main : non gouverné par sync"))
+    # L52b : les filles (sessions parallèles) relisent ce qu'elles héritent de
+    # leur persona, puis son verdict de placement comme tout éphémère
+    for child in storage.of(db).ephemerals.refresh_children(host):
+        actions.append(SyncAction(child["name"], "fille recopiée",
+                                  "héritage relu depuis %s" % child["parent_persona"]))
     _inherit_placements(db, host, canon)
     packages = sync_packages(db, canon, findings, ident=ident)
     findings.extend(packages.findings)

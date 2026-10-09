@@ -164,6 +164,9 @@ class Config:
     failure_backoff_max: float = 300.0
     fast_failure_s: float = 60.0
     max_fast_failures: int = 5
+    #: L52b : sessions parallèles (filles) ouvertes au plus par persona, en
+    #: plus de sa session principale
+    max_parallel_sessions: int = 3
     #: politique de session par défaut d'un agent sans réglage (0025, L26) :
     #: `par-lot` (rotation au changement de lot, plus la rotation sur la
     #: taille), `taille` (rotation sur la taille seulement), `jamais`
@@ -381,6 +384,8 @@ def load(env: dict | None = None) -> Config:
         fast_failure_s=_as_float(pick("AMEESH_FAST_FAILURE_S"), cfg.fast_failure_s),
         max_fast_failures=int(_as_float(pick("AMEESH_MAX_FAST_FAILURES"),
                                         cfg.max_fast_failures)),
+        max_parallel_sessions=int(_as_float(pick("AMEESH_MAX_PARALLEL_SESSIONS"),
+                                            cfg.max_parallel_sessions)),
         session_policy=str(pick("AMEESH_SESSION_POLICY", default=cfg.session_policy)
                            or "par-lot").strip(),
         balance_interval=_as_float(pick("AMEESH_BALANCE_INTERVAL"), cfg.balance_interval),

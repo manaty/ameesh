@@ -451,3 +451,65 @@ class Ephemerals(interface.Ephemerals):
 
     def exists(self, name) -> bool:
         return bool(self.db.query("SELECT 1 AS x FROM agent_registry WHERE name = %s", (name,)))
+
+    #: L52b : colonnes qu'une fille hérite de sa persona, recopiées à la
+    #: création puis à chaque `canon sync` (une fille n'a pas de fiche)
+    _INHERITED = ("chantier", "harness", "host", "cwd", "model", "responsible", "team",
+                  "provider", "credential_mode", "capabilities", "effort", "tier",
+                  "session_policy", "priority", "memory_repository", "canon")
+
+    #: … sauf l'hôte et le dossier de travail, propres à la fille une fois créée
+    _REFRESHED = tuple(c for c in _INHERITED if c not in ("host", "cwd"))
+
+    def create_child(self, name, persona, work_item, *, cwd=None, ttl_seconds) -> dict | None:
+        cols = ", ".join(self._INHERITED)
+        picks = ", ".join("coalesce(%s, p.cwd)" if c == "cwd" else "p." + c
+                          for c in self._INHERITED)
+        created = self.db.query(
+            """
+            INSERT INTO agent_registry
+                (name, %s, ephemeral, ephemeral_expires_at, created_by, parent_persona,
+                 session_work_item, placement_ok, placement_diagnostic, placement_ref,
+                 placement_profile)
+            SELECT %%s, %s, true, now() + make_interval(secs => %%s), p.name, p.name,
+                   %%s, p.placement_ok, p.placement_diagnostic, p.placement_ref,
+                   p.placement_profile
+              FROM agent_registry p
+             WHERE p.name = %%s
+               AND NOT p.ephemeral
+               AND p.parent_persona IS NULL
+               AND coalesce(p.responsible, '') <> ''
+               AND p.status <> 'stopped'
+            ON CONFLICT (name) DO NOTHING
+            RETURNING name, parent_persona, responsible, host, harness, capabilities,
+                      session_work_item, placement_ok, placement_diagnostic,
+                      extract(epoch from ephemeral_expires_at)::float8 AS ephemeral_expires_ts
+            """ % (cols, picks),
+            (name, cwd, ttl_seconds, work_item, persona),
+        )
+        return created[0] if created else None
+
+    def children(self, persona) -> list[dict]:
+        return self.db.query(
+            """
+            SELECT name, session_work_item, status, session_id, host,
+                   extract(epoch from ephemeral_expires_at)::float8 AS ephemeral_expires_ts,
+                   (ephemeral_expires_at > now() AND status <> 'stopped') AS alive
+              FROM agent_registry WHERE parent_persona = %s ORDER BY name
+            """,
+            (persona,),
+        )
+
+    def refresh_children(self, host) -> list[dict]:
+        sets = ", ".join("%s = p.%s" % (c, c) for c in self._REFRESHED)
+        differs = " OR ".join("f.%s IS DISTINCT FROM p.%s" % (c, c) for c in self._REFRESHED)
+        return self.db.query(
+            """
+            UPDATE agent_registry f
+               SET %s, updated_at = now()
+              FROM agent_registry p
+             WHERE f.parent_persona = p.name AND f.host = %%s AND (%s)
+            RETURNING f.name, f.parent_persona
+            """ % (sets, differs),
+            (host,),
+        )

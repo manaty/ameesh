@@ -167,7 +167,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L39 (0033) : NOM du compte d'origine de la session (jamais un profil)
         'session_account',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
-        'canon'
+        'canon',
+        -- L52b : persona dont cette ligne porte une session parallèle (un nom)
+        'parent_persona'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
@@ -284,7 +286,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- aucun contenu (le transcript reste chez le harnais)
     ('persona_sessions', ARRAY[
         'id', 'persona', 'session_id', 'harness', 'host', 'account', 'work_item',
-        'started_at', 'ended_at', 'end_reason'
+        'started_at', 'ended_at', 'end_reason', 'agent'
     ]),
     ('work_item_events', ARRAY[
         'id', 'work_item_id', 'state', 'actor', 'created_at'
