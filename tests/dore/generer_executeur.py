@@ -6,7 +6,8 @@
 Les valeurs suivent le schéma réel : états de lot de `work.STATES`, `kind`
 de 0012, identifiant et empreinte d'action de 0010, clés du pilote pour
 `leases.state` et `hosts.*`, identifiant d'exécuteur de 16 caractères
-hexadécimaux (L110), payload du déclencheur `agent_lease` (0001)."""
+hexadécimaux (L110), payload `agent_lease` du fil (`name`, renommé par le serveur depuis le
+déclencheur de 0001)."""
 import json, os, sys, uuid
 sys.path.insert(0, "src")
 from ameesh.executeur_mediee import contrat as C, evenements as E, porte as P, interfaces as I
@@ -105,9 +106,9 @@ ARGS = {  # op: (args, kwargs, résultat)
  "work.mark_delegate_turn": ([AG, [812], "délégation : tour de inge-front sur le lot"], {}, [812]),
  # session
  "leases.state": ([AG], {}, {"lease_owner": OWN, "lease_epoch": EP, "status": "running", "live": True}),
- "agents.overview": ([], {}, [{"name": AG, "team": "ingénieur", "chantier": "site",
+ "agents.overview": ([], {}, [{"name": AG, "role": "ingénieur", "team": "ingénieur", "chantier": "site",
                                 "canon_governed": True, "status": "running"},
-                               {"name": "coord", "team": "coordinateur", "chantier": "site",
+                               {"name": "coord", "role": "coordinateur", "team": "coordinateur", "chantier": "site",
                                 "canon_governed": True, "status": "idle"}]),
  "mailbox.send": ([AG, "coord", "PR prête."], {"host": None, "kind": "notify", "payload": None,
                   "work_item_id": "812", "signature": None, "signature_key": None,
@@ -223,7 +224,7 @@ json.dump({"schema": "ameesh-exec-golden/1", "famille": "erreurs", "cas": erreur
 
 # événements
 evs = [E.Event("k3f9:17", "agent_mail", {"to": AG, "id": 812}),
-       E.Event("k3f9:18", "agent_lease", {"agent": AG, "owner": OWN, "epoch": EP, "status": "running"}),
+       E.Event("k3f9:18", "agent_lease", {"name": AG, "owner": OWN, "epoch": EP, "status": "running"}),
        E.Event("k3f9:19", "ameesh_budget", {"scope": "mesh"})]
 sse = E.format_retry() + "".join(E.format_sse(e) for e in evs) + E.format_ping()
 evenements = {

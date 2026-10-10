@@ -3012,7 +3012,7 @@
     "naturelle": true
    },
    "regles": [
-    "annuaire réduit : name, team, chantier, canon_governed, status seulement (pas de colonne role : le projet du fil se déduit de team/chantier, fil.agent_project)"
+    "annuaire réduit : name, role, team, chantier, canon_governed, status seulement ; role = team (le registre n'a pas de colonne rôle ; chaîne vide sans équipe) ; le projet du fil se déduit de team/chantier (fil.agent_project)"
    ]
   },
   {

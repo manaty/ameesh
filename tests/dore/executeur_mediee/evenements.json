@@ -16,7 +16,7 @@
    "entetes": {
     "Content-Type": "text/event-stream"
    },
-   "texte": "retry: 3000\n\nid: k3f9:17\nevent: agent_mail\ndata: {\"to\":\"inge-front\",\"id\":812}\n\nid: k3f9:18\nevent: agent_lease\ndata: {\"agent\":\"inge-front\",\"owner\":\"exec:7f3a9c2e4b1d6058:anna-portable:4121\",\"epoch\":42,\"status\":\"running\"}\n\nid: k3f9:19\nevent: ameesh_budget\ndata: {\"scope\":\"mesh\"}\n\n: ping\n\n"
+   "texte": "retry: 3000\n\nid: k3f9:17\nevent: agent_mail\ndata: {\"to\":\"inge-front\",\"id\":812}\n\nid: k3f9:18\nevent: agent_lease\ndata: {\"name\":\"inge-front\",\"owner\":\"exec:7f3a9c2e4b1d6058:anna-portable:4121\",\"epoch\":42,\"status\":\"running\"}\n\nid: k3f9:19\nevent: ameesh_budget\ndata: {\"scope\":\"mesh\"}\n\n: ping\n\n"
   },
   "evenements": [
    {
@@ -31,7 +31,7 @@
     "id": "k3f9:18",
     "channel": "agent_lease",
     "data": {
-     "agent": "inge-front",
+     "name": "inge-front",
      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
      "epoch": 42,
      "status": "running"
@@ -71,7 +71,7 @@
       "id": "k3f9:18",
       "channel": "agent_lease",
       "data": {
-       "agent": "inge-front",
+       "name": "inge-front",
        "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
        "epoch": 42,
        "status": "running"

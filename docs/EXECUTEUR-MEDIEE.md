@@ -1,7 +1,8 @@
 # Exécuteur médié : le contrat de `/api/exec/v1`
 
 Contrat figé par le lot L107 (version `1.0.0`, schéma
-`ameesh-exec-contract/1`). Étude et décision :
+`ameesh-exec-contract/1`), complété à l'assemblage de la voie B (version
+`1.1.0`, compatible : voir « Contrat 1.1 »). Étude et décision :
 `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -58,7 +59,9 @@ Les portées :
 - **agregat** : une donnée agrégée.
 
 Comptes : 61 opérations, dont 23 lectures et 38 écritures. 51 passent par
-`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Le test
+`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Cinq
+lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
+servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
 signature et les mêmes types. Il vérifie aussi que l'interface entière (221
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
@@ -132,6 +135,58 @@ fait la correspondance.
 
 Un réveil ne fait jamais foi : l'exécuteur relit toujours la base.
 
+## Contrat 1.1
+
+L'assemblage de la voie B (L108 à L114) a relevé des écarts entre le
+client, le serveur et les jeux dorés. Ils sont tranchés ici, dans
+`contrat.json` (version `1.1.0`) et dans les jeux dorés, régénérés par
+`tests/dore/generer_executeur.py`. Le client et le serveur lisent la même
+table : aucun écart n'est toléré d'un côté seulement.
+
+- **Jeux dorés conformes au schéma.** États de lot de `work.STATES`,
+  `kind` de 0012, identifiants et empreintes d'action de 0010, clés du
+  pilote pour `hosts.record` (`mem_available_bytes`, `swap_used_bytes`,
+  `load1`, `cpu_count`, `disk_free_bytes`, `disk_path`,
+  `turns_in_progress`), identifiant d'exécuteur sur 16 caractères
+  hexadécimaux, code d'enrôlement de 24 caractères Crockford.
+- **`leases.state`** rend `{lease_owner, lease_epoch, status, live}`, les
+  clés que lit `registry.lease_matches`.
+- **NOTIFY `agent_lease`.** Sur le fil, le payload est `{name, owner,
+  epoch, status}`. Le déclencheur de 0001 écrit `agent` ; le serveur le
+  renomme `name` à la réception (`flux.wire_payload`) et filtre sur `name`.
+- **Idempotence.** `request_sha256` canonise aussi les décimaux (un TTL de
+  90.5 s, un coût de 0.031 $), à la manière d'ECMAScript (RFC 8785).
+  `90.0` et `90` ont la même empreinte. NaN, les infinis et les entiers
+  hors de ±(2^53 − 1) donnent 400 `bad_args`.
+- **`agents.overview`** (annuaire réduit de la session) : `name`, `role`,
+  `team`, `chantier`, `canon_governed`, `status`. `role` vaut `team` : le
+  registre n'a pas de colonne « rôle ».
+- **Lignes ouvertes au jeton de session** (`session: true`) :
+  `mailbox.reserve`, `mailbox.deliver`, `mailbox.release` (le hook
+  `agent-mail` dans la VM), `mailbox.unread` (`mail inbox`) et
+  `threads.index`. L'agent contrôlé doit être celui du jeton, et
+  l'enveloppe de bail doit porter son agent et son epoch. Le bail du tour
+  (`AMEESH_RUNNER_ID`, `AMEESH_LEASE_EPOCH`) entre au carnet de la session.
+- **`threads.index`** : l'auteur est `agent:<nom>` (membre du fil,
+  `fil.member`) ; le nom nu reste admis.
+- **`HostInfo.limits`** (`GET /host`) : `{"max_agents": int|null,
+  "resources": {"min_mem_available", "max_swap_used", "max_load",
+  "min_disk_free"}}`, tiré du canon (`resources.host_limits`). Un seuil
+  absent prend son défaut prudent côté exécuteur.
+- **Porte.** `GateAck.from_json` lève `ValueError` pour tout corps faux.
+  Un état illisible vaut `stopped` pour un hôte médié. `max_concurrent`
+  vaut 1 par défaut.
+- **Coûts.** `turn_costs.insert` venu d'un appareil est rangé
+  `source=device`, avec l'exécuteur et le bail de l'enveloppe, quelles que
+  soient les valeurs reçues (forçages `executeur`, `owner_enveloppe`,
+  `epoch_enveloppe`). Pour la dépense d'un appareil, seuls les relevés du
+  relais (`source=relay`) comptent dans les plafonds : `turn_costs.spent`
+  ignore `source=device`.
+- **Interfaces.** `IdentityProvider.issue_session_token` lève
+  `ScopeError("forbidden_scope")` quand le bail n'appartient pas à
+  l'exécuteur ou que l'agent est hors de son invitation. Les commandes
+  sont `ameesh host` (serveur) et `ameesh device` (appareil).
+
 ## Porte d'hôte
 
 Le runner Compute écrit `ameesh-host-state/1`. Ce message porte `state`
@@ -143,10 +198,10 @@ Le runner Compute écrit `ameesh-host-state/1`. Ce message porte `state`
 L'exécuteur répond par `ameesh-host-ack/1`, qui porte `seq`, `state`,
 `in_turn`, `held` et `drained`. Il relaie aussi l'état au serveur par
 `PUT /host/availability` (`porte.availability_body`). Un état illisible
-vaut `draining` d'après `GateState.unreadable()` ; L112 le remplace par un
-repli réglable (`host_gate_fallback`) : `stopped` pour un hôte médié,
-`available` pour un hôte classique (consigne du propriétaire, voir
-`porte_hote`).
+vaut `stopped` pour un hôte médié (`GateState.unreadable()`, contrat 1.1) ;
+un hôte classique doté d'une porte garde un repli réglable
+(`host_gate_fallback`, L112, voir `porte_hote`). `caps.max_concurrent`
+absent vaut 1 (`porte.DEFAULT_MAX_CONCURRENT`).
 
 La classe abstraite est `porte.HostGate` :
 

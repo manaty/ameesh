@@ -125,7 +125,8 @@ class GardesTest(MedieBase):
     def test_porte_fermee_aucune_reclamation(self):
         from ameesh.executeur_mediee import porte
         runner = self.runner()
-        runner.gate = mock.Mock(state=lambda: porte.GateState("draining", 3))
+        # L112 dans L109 : la porte relayée au serveur est celle du contrôleur
+        runner.host_gate.gate = mock.Mock(state=lambda: porte.GateState("draining", 3))
         self.responder.script["leases.reap"] = []
         runner.sweep()
         self.assertNotIn("agents.claimable", self.transport.ops())

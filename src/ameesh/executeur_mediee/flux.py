@@ -9,8 +9,9 @@ connexion dédiée). Chaque NOTIFY reçu entre dans un tampon circulaire de
 lisent ce tampon après leur curseur, filtré par hôte :
 
 * `agent_mail` : si `to` est un agent admis sur l'hôte de l'exécuteur ;
-* `agent_lease` : si l'agent (`agent`, payload du déclencheur de 0001 et
-  du contrat 1.1) est admis ;
+* `agent_lease` : si l'agent (`name`) est admis. Le déclencheur de 0001
+  écrit `agent` ; le serveur le renomme `name` à la réception (contrat
+  1.1, `wire_payload`), seule forme qui sort sur le fil ;
 * `ameesh_budget` et `reset` : à tous.
 
 Un curseur d'un autre flux, mal formé, ou sorti du tampon donne un seul
@@ -44,7 +45,7 @@ def visible(event: Event, admitted: Iterable[str]) -> bool:
     if event.channel == "agent_mail":
         who = data.get("to")
     elif event.channel == "agent_lease":
-        who = data.get("agent")
+        who = data.get("name")
     else:
         return False
     return isinstance(who, str) and who in admitted
@@ -119,9 +120,10 @@ class EventHub:
 
     # -- écriture ---------------------------------------------------------------
     def publish(self, channel: str, data: dict) -> Event:
+        data = wire_payload(channel, data)
         with self._cond:
             self._n += 1
-            event = Event(cursor(self.stream, self._n), channel, dict(data))
+            event = Event(cursor(self.stream, self._n), channel, data)
             self._ring.append((self._n, event))
             self._cond.notify_all()
         return event
@@ -175,6 +177,17 @@ class EventHub:
                 self._cond.wait(remaining)
 
 
+def wire_payload(channel: str, data: dict) -> dict:
+    """Le payload tel qu'il sort sur le fil (contrat 1.1) : pour
+    `agent_lease`, la clé `agent` du déclencheur de 0001 devient `name`
+    (`{"name", "owner", "epoch", "status"}`) ; les autres canaux passent
+    tels quels."""
+    data = dict(data or {})
+    if channel == "agent_lease" and "agent" in data and "name" not in data:
+        data["name"] = data.pop("agent")
+    return data
+
+
 def _payload(raw: Any) -> dict:
     if isinstance(raw, dict):
         return raw
@@ -185,4 +198,4 @@ def _payload(raw: Any) -> dict:
     return value if isinstance(value, dict) else {"payload": value}
 
 
-__all__ = ["CHANNELS", "EventHub", "visible"]
+__all__ = ["CHANNELS", "EventHub", "visible", "wire_payload"]

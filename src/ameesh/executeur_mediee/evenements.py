@@ -26,11 +26,12 @@ Un réveil ne porte jamais de donnée qui fasse foi et peut se perdre :
 l'exécuteur relit toujours en base et garde son sondage.
 
 Payloads (ceux des déclencheurs, contrat 1.1) : `agent_mail` =
-`{"to", "id", "from"}` (0001) ; `agent_lease` = `{"agent", "owner",
-"epoch", "status"}` (0001) ; `ameesh_budget` = celui de 0042.
+`{"to", "id", "from"}` (0001) ; `agent_lease` = `{"name", "owner",
+"epoch", "status"}` (le déclencheur de 0001 écrit `agent`, le serveur le
+renomme `name` : `flux.wire_payload`) ; `ameesh_budget` = celui de 0042.
 
 Filtrage (serveur, L108) : `agent_mail` et `agent_lease` seulement si le
-destinataire (`to`) ou l'agent (`agent`) est admis sur l'hôte de
+destinataire (`to`) ou l'agent (`name`) est admis sur l'hôte de
 l'exécuteur ; `ameesh_budget` passe à tous.
 """
 from __future__ import annotations

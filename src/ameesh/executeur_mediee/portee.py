@@ -356,12 +356,19 @@ class HostScopeRules(ScopeRules):
                 or not r.get("scope")]
 
     #: colonnes de l'annuaire réduit (contrat 1.1) : de quoi calculer le
-    #: projet du fil (`fil.agent_project`), rien d'autre
-    OVERVIEW_KEYS = ("name", "team", "chantier", "canon_governed", "status")
+    #: projet du fil (`fil.agent_project`), plus `role`, rien d'autre
+    OVERVIEW_KEYS = ("name", "role", "team", "chantier", "canon_governed", "status")
 
     def _filter_agents_overview(self, principal, value):
-        # annuaire réduit : ni consigne, ni dossier, ni bail, ni hôte
-        return [{k: r.get(k) for k in self.OVERVIEW_KEYS} for r in value or ()]
+        # annuaire réduit : ni consigne, ni dossier, ni bail, ni hôte.
+        # `role` (contrat 1.0, gardé en 1.1) : le registre n'a pas de colonne
+        # « rôle » ; c'est l'équipe de la fiche (`team`), chaîne vide sinon
+        rows = []
+        for r in value or ():
+            row = {k: r.get(k) for k in self.OVERVIEW_KEYS}
+            row["role"] = r.get("team") or ""
+            rows.append(row)
+        return rows
 
     def _filter_work_get(self, principal, value):
         if not value:

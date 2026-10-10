@@ -358,7 +358,8 @@ class PorteeTest(ServeurExecTest):
                             {"require_responsible": False}).body["value"]
         self.assertEqual([r["name"] for r in claimable], ["inge-front"])
         overview = self.op("agents.overview", token=SESSION).body["value"]
-        self.assertTrue(all(set(r) == {"name", "team", "chantier", "canon_governed", "status"}
+        self.assertTrue(all(set(r) == {"name", "role", "team", "chantier", "canon_governed",
+                                       "status"} and r["role"] == (r["team"] or "")
                             for r in overview))
         budgets = storage.of(self.db).budgets
         budgets.put("", 3600, 5.0, actor="human:x")

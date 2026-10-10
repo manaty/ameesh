@@ -459,6 +459,7 @@
      "value": [
       {
        "name": "inge-front",
+       "role": "ingénieur",
        "team": "ingénieur",
        "chantier": "site",
        "canon_governed": true,
@@ -466,6 +467,7 @@
       },
       {
        "name": "coord",
+       "role": "coordinateur",
        "team": "coordinateur",
        "chantier": "site",
        "canon_governed": true,
