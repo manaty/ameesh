@@ -56,3 +56,38 @@ travail attend, `ameesh notify` envoie à l'orchestrateur un courrier `event`
 d'`ameesh` : la liste des agents au repos de son équipe et des lots ouverts
 sans agent. Réponse attendue : leur confier ces lots (`--lot`), ou en créer
 (`--new-lot`). Un même épisode n'est envoyé qu'une fois.
+
+## Livraison et déploiements
+
+Règles du propriétaire (2026-10-10), après qu'une version mineure (1.6.2) est
+restée 4 h fusionnée sans être déployée :
+
+1. **Fusionner d'abord.** Une PR à CI verte qui débloque une demande du
+   propriétaire se fusionne avant tout nouveau chantier.
+2. **Une correction de bug se fusionne et se déploie sans attendre** (règle du
+   propriétaire, 2026-10-11) : dès que la CI est verte, avec le déroulé de
+   `deploy/mise-a-jour` (vérifier, sauvegarder, installer, migrer, redémarrer
+   hors tour, contrôler, retour possible). Le propriétaire et les agents
+   touchés sont prévenus après coup.
+3. **Les autres déploiements se préparent entièrement** (nouvelle fonction,
+   version mineure, migration qui change le comportement) : étiquette posée,
+   `deploy/mise-a-jour/poste.sh verifier <REF>` et `deploy/mise-a-jour/vm.sh
+   verifier <REF>` passés, plan de retour connu (étape `retour`). Ils sont
+   proposés au propriétaire dès son retour, en premier point, avec les choix
+   possibles : version seule ou `main` entier, migrations, risques. Une
+   consigne de veille ne se contente jamais d'interdire « tout déploiement »
+   sans le préparer. Les gestes en production d'un projet, les dépenses et les
+   secrets restent des décisions du propriétaire.
+4. **Redémarrer détaché.** `poste.sh redemarrer` ne redémarre un exécuteur
+   qu'hors tour : l'agent qui le lance alors qu'il a lui-même un exécuteur
+   sur le poste le lance détaché (`setsid`/`nohup`), sinon il s'attend
+   lui-même.
+5. **Réserver les migrations.** Les numéros de migration se réservent dès le
+   début d'un lot, annoncés dans le lot et au journal de conception, pour
+   éviter les renumérotations en cascade quand plusieurs lots fusionnent à la
+   suite.
+6. **Essai à blanc avant toute étiquette de release.** Avant de poser une
+   étiquette qui publie (application, installeur, image), le workflow de
+   release tourne en essai à blanc sur le SHA exact, sur toutes les plateformes
+   cibles ; l'étiquette n'est posée que s'il est vert. On ne déplace jamais une
+   étiquette publiée : on pose la suivante.
