@@ -249,8 +249,16 @@ close() -> None
 
 ## Le serveur (L108)
 
-`ameesh serve --exec-only --auth-file FICHIER [--listen 127.0.0.1:8471]`
-sert `/api/exec/v1` seul, tant que `ameesh serve` (L84) n'existe pas. Le
+`ameesh serve --exec-only --server-url URL [--listen 127.0.0.1:8471]
+[--work-repos FICHIER]` sert `/api/exec/v1` seul, tant que `ameesh serve`
+(L84) n'existe pas. Depuis l'assemblage de la voie B, il sert l'identité des
+exécuteurs enrôlés (L110, `LockedIdentity` sur `DbIdentityProvider`), le
+relais de modèle sous `/api/exec/v1/llm/` (L111, `--no-relay` pour s'en
+passer) et, avec `--work-repos`, le dépôt de travail (L113). Il synchronise
+aussi le canon de chaque hôte médié enrôlé (`--canon-sync`, 60 s). Les
+limites de `GET /host` viennent du canon (`resources.host_limits`).
+`--auth-file` (jetons fixes, `bouchon.StaticAuth`) reste pour les bancs
+d'essai ; il exclut le relais. Le
 serveur utilise la bibliothèque standard (`http.server`) et n'ajoute aucune
 dépendance. Une écoute hors de la boucle locale exige TLS (`--tls-cert`,
 `--tls-key`) ou `--allow-plain` derrière un mandataire qui termine TLS.
@@ -311,17 +319,24 @@ plus de 24 h sont élaguées toutes les 10 minutes, l'audit après 90 jours.
 
 **Points d'intégration.**
 
-- **L110.** Un `IdentityProvider` passé à la place de `StaticAuth` ouvre
-  `/enroll`, `/token` et `/session-token`. Le serveur recontrôle le bail de
-  `/session-token` dans sa transaction avant d'appeler
-  `issue_session_token`.
-- **L111 et L113.** Ils montent leurs routes par
-  `ExecApp(extra_routes={"llm": …, "bundle": …})`. La colonne
-  `turn_costs.source` (ligne `device`, hors plafond) est à L111 : en
-  attendant, `turn_costs.insert` écrit la ligne telle quelle.
+- **L110.** `LockedIdentity` (une connexion dédiée, un appel à la fois,
+  rouverte après une panne) ouvre `/enroll`, `/token` et `/session-token`
+  et vérifie chaque jeton par `verify_token(db, jeton, kind=…)`. Le serveur
+  recontrôle le bail de `/session-token` dans sa transaction avant
+  d'appeler `issue_session_token`.
+- **L111.** Le relais est monté au niveau HTTP (`extra_routes["llm"]`,
+  objet doté de `handle`) : `relay.ExecutorTokens` vérifie le jeton de
+  session par L110 (`kind="session"`), puis relit le bail en base ; c'est
+  cet owner qui est inscrit au grand livre (`source=relay`). Une ligne
+  `turn_costs` déclarée par l'appareil est rangée `source=device`, hors
+  plafond.
+- **L113.** `extra_routes["bundle"]` : `depot.WorkDepot` (voir « Dépôt de
+  travail »).
 - **L112.** L'exécuteur relaie sa porte par `PUT /host/availability` au
-  démarrage et à chaque changement : sans ce rapport, l'hôte reste
-  indisponible.
+  démarrage, à chaque changement et jusqu'à ce que le serveur l'ait reçue
+  (nouvel essai toutes les 5 s) : sans ce rapport, l'hôte reste
+  indisponible. Sans porte configurée, l'exécuteur médié rapporte
+  `AlwaysAvailable`.
 
 ## Client et mode médié (L109)
 

@@ -3852,7 +3852,7 @@ def main(argv: list[str] | None = None) -> int:
             # Signal d'abord ; le journal part par la file : un `print` dans un
             # gestionnaire de signal peut tomber pendant un autre `print` du
             # fil principal (écriture réentrante sur le même flux).
-            if (signum == signal.SIGTERM and runner.can_drain_on_sigterm()
+            if (signum in (signal.SIGTERM, signal.SIGINT) and runner.can_drain_on_sigterm()
                     and not runner.sigterm_requested and not runner.stop.is_set()):
                 # L114b : premier SIGTERM d'un exécuteur médié — retrait au
                 # point sûr (90 s au plus), puis baux rendus ; un second

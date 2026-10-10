@@ -170,8 +170,15 @@ policy:
              "-nodes", "-days", "2", "-subj", "/CN=ameesh-essai",
              "-addext", "subjectAltName=IP:%s" % PASSERELLE,
              "-keyout", os.path.join(d, "key.pem"), "-out", os.path.join(d, "ca.pem")])
-        os.chmod(d, 0o755)
-        os.chmod(os.path.join(d, "ca.pem"), 0o644)
+        os.chmod(os.path.join(d, "ca.pem"), 0o600)
+        os.chmod(os.path.join(d, "key.pem"), 0o600)
+        # copie publique du certificat, seule montée dans le conteneur
+        pub = os.path.join(self.dir, "ca-public")
+        os.makedirs(pub)
+        shutil.copy(os.path.join(d, "ca.pem"), os.path.join(pub, "ca.pem"))
+        os.chmod(pub, 0o755)
+        os.chmod(os.path.join(pub, "ca.pem"), 0o644)
+        self.ca_public = pub
         return d
 
     def demarrer_faux(self):
@@ -241,7 +248,7 @@ policy:
              "-v", "%s:/run/ameesh-gate/state:ro" % os.path.join(self.gate, "state"),
              "-v", "%s:/run/ameesh-gate/ack" % os.path.join(self.gate, "ack"),
              "-v", "%s:/run/ameesh-enroll:ro" % enroll,
-             "-v", "%s:/run/ameesh-ca:ro" % ca,
+             "-v", "%s:/run/ameesh-ca:ro" % self.ca_public,
              "-e", "AMEESH_EXEC_URL=" + URL, "-e", "AMEESH_EXEC_HOST=" + HOTE,
              "-e", "SSL_CERT_FILE=/run/ameesh-ca/ca.pem",
              "-e", "NODE_EXTRA_CA_CERTS=/run/ameesh-ca/ca.pem",

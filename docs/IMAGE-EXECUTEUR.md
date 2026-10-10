@@ -128,9 +128,13 @@ lecture seule. Seuls le volume et `/tmp` (un `tmpfs` suffit) sont inscrits.
   - `drain_deadline_ts` vaut 90 s au plus.
   - Au-delà, le tour est interrompu comme une préemption : la consigne est
     remise en attente.
-- **SIGTERM (ou SIGINT).** C'est le même drainage, borné à **90 s**, puis la
-  sortie avec le code 0. Le délai d'arrêt du lanceur doit donc être d'au
-  moins **100 s** (`TimeoutStopSec=100`, ou `stop -t 100`).
+- **SIGTERM (ou SIGINT).** C'est le même drainage, borné à **90 s**
+  (`AMEESH_HOST_GATE_DRAIN`), puis la sortie avec le code 0 dès que plus
+  aucun bail n'est détenu (L114b : `GateController.terminate`, la porte ne
+  peut plus rouvrir la réclamation, un `stopped` de sa part reste
+  appliqué). Un second signal arrête tout de suite. Le délai d'arrêt du
+  lanceur doit donc être d'au moins **100 s** (`TimeoutStopSec=100`, ou
+  `stop -t 100`).
 - **SIGKILL ou coupure.** Rien n'est écrit. Le bail ameesh échoit en 90 s au
   plus. Le courrier réservé est remis à nouveau et signalé comme doublon.
   Les dossiers restés sur le volume sont effacés au démarrage suivant.
@@ -157,7 +161,11 @@ L'acquittement porte `seq`, `state`, `in_turn` (les agents encore en tour),
 - **Mandataire.** L'egress peut être transparent : la VM résout le nom et
   nftables n'ouvre que l'adresse du serveur, sur le port 443. Il peut aussi
   passer par un mandataire CONNECT (`HTTPS_PROXY`), qui ne doit admettre que
-  ce nom et ce port.
+  ce nom et ce port. Le client de l'exécuteur le respecte (L114b : tunnel
+  CONNECT, `NO_PROXY`, `Proxy-Authorization` tiré de `user:mot@`), comme
+  l'enrôlement (`urllib`). `dsh` (Node) ne le suit que si la VM pose aussi
+  `NODE_USE_ENV_PROXY=1` (Node 22.21 et plus) : point à vérifier sur
+  l'image réelle.
 - **Entrant.** Aucun.
 - **Horloge.** L'heure de la VM doit être juste à ±30 s près : les assertions
   ES256 vivent 60 s.
@@ -172,7 +180,7 @@ L'acquittement porte `seq`, `state`, `in_turn` (les agents encore en tour),
 | 3 | appareil non enrôlé et aucun code | demander un code au propriétaire |
 | 4 | enrôlement refusé : code faux, échu ou usé, ou attestation fausse | demander un nouveau code ; ne pas relancer avec le même |
 | 5 | le volume appartient à un autre serveur, mesh ou hôte | ne pas relancer ; signaler, ne pas effacer seul |
-| 6 | exécuteur révoqué par le serveur | effacer le volume ; ne pas relancer sans nouveau code |
+| 6 | exécuteur révoqué par le serveur (en marche, ou dès `GET /host` au démarrage) | effacer le volume ; ne pas relancer sans nouveau code |
 
 ## 8. Santé et journaux
 
