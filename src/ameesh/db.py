@@ -1132,7 +1132,14 @@ def explain(exc: BaseException, limit: int = 160) -> str:
 # --------------------------------------------------------------------------
 
 def connect(cfg: Config, driver: str | None = None) -> PsqlDriver | PsycopgDriver:
-    """Ouvre une connexion. Lève `Unavailable` si la base (ou le pilote) manque."""
+    """Ouvre une connexion. Lève `Unavailable` si la base (ou le pilote) manque.
+
+    L109 : `backend: mediated` (exécuteur médié, session du harnais dans la
+    VM) n'a pas de base : la « connexion » est le client de `/api/exec/v1`
+    (`storage.remote.RemoteDb`), que `storage.of()` reconnaît."""
+    if getattr(cfg, "backend", "") == "mediated":
+        from .storage import remote
+        return remote.connect(cfg)  # type: ignore[return-value]
     wanted = driver or cfg.driver
     errors: list[str] = []
     if wanted in ("auto", "psycopg"):

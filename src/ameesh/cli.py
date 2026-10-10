@@ -541,6 +541,11 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                   % (binding.name, binding.reason), file=sys.stderr)
         return 0
     name = binding.name
+    if not getattr(bk, "hook_delivery", True):
+        # L109 : session médiée (VM) — identité vérifiée par le jeton de
+        # session ; ni inscription ni remise par le hook (opérations de
+        # l'exécuteur) : le courrier attend le tour suivant.
+        return 0
     try:
         inscription = [tool, data.get("cwd"), data.get("session_id"),
                        binding.runner_id if binding.bound_to_lease else None,
