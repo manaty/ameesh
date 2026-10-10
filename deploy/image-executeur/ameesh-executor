@@ -18,7 +18,7 @@ ENROLL_DIR="${AMEESH_EXEC_ENROLL_DIR:-/run/ameesh-enroll}"
 ACK_DIR="$(dirname "${AMEESH_HOST_GATE_ACK:-/run/ameesh-gate/ack/ack.json}")"
 
 log() { printf 'ameesh-executor : %s\n' "$*"; }
-die() { code="$1"; shift; log "$*" >&2; exit "$code"; }
+die() { rc="$1"; shift; log "$*" >&2; exit "$rc"; }
 
 enrolled() { [ -s "$HOME_DIR/executor.json" ]; }
 
@@ -63,14 +63,16 @@ umask 077
 
 # --- 2. enrôlement au premier démarrage --------------------------------------
 if ! enrolled; then
+    # Le code ne quitte jamais son fichier : ni argument (/proc/<pid>/cmdline),
+    # ni variable d'environnement, ni journal. `ameesh device` le lit lui-même
+    # (`--code-file`) ; ce script ne le lit pas.
     code_file="$ENROLL_DIR/code"
     [ -s "$code_file" ] || die 3 "appareil non enrôlé et aucun code ($code_file)"
-    code="$(tr -d ' \r\n' < "$code_file")"
     attest=""
     if [ "${AMEESH_EXEC_ATTEST:-0}" = 1 ]; then
         # Défi pour la clé d'appareil Nexlink (facultatif) : écrit à côté de
         # l'acquittement, la réponse est attendue 120 s au plus.
-        ameesh device challenge --server "$url" --code "$code" --home "$HOME_DIR" \
+        ameesh device challenge --server "$url" --code-file "$code_file" --home "$HOME_DIR" \
             > "$ACK_DIR/attest-challenge.txt.tmp"
         mv "$ACK_DIR/attest-challenge.txt.tmp" "$ACK_DIR/attest-challenge.txt"
         i=0
@@ -81,15 +83,14 @@ if ! enrolled; then
         rm -f "$ACK_DIR/attest-challenge.txt"
     fi
     if [ -n "$attest" ]; then
-        ameesh device enroll --server "$url" --code "$code" --home "$HOME_DIR" \
+        ameesh device enroll --server "$url" --code-file "$code_file" --home "$HOME_DIR" \
             --label "${AMEESH_EXEC_LABEL:-}" --attestation "$attest" \
             || die 4 "enrôlement refusé (code faux, échu, déjà utilisé, ou attestation fausse)"
     else
-        ameesh device enroll --server "$url" --code "$code" --home "$HOME_DIR" \
+        ameesh device enroll --server "$url" --code-file "$code_file" --home "$HOME_DIR" \
             --label "${AMEESH_EXEC_LABEL:-}" \
             || die 4 "enrôlement refusé (code faux, échu ou déjà utilisé)"
     fi
-    unset code
 fi
 
 # --- 3. le volume est-il celui de ce mesh ? -----------------------------------

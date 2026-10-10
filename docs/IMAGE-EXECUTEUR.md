@@ -75,8 +75,11 @@ configuration dans ces variables. Ne posez jamais `AMEESH_DSN`,
 
 **Enrôlement, pas à pas.** Au premier démarrage, `executor.json` est absent.
 
-1. L'entrée lit `/run/ameesh-enroll/code`.
-2. Elle lance `ameesh device enroll`.
+1. L'entrée vérifie que `/run/ameesh-enroll/code` existe, sans le lire.
+2. Elle lance `ameesh device enroll --code-file /run/ameesh-enroll/code`,
+   qui lit le code lui-même. Le code ne paraît jamais dans une ligne de
+   commande (`/proc/<pid>/cmdline`), dans l'environnement ni dans un
+   journal ; `tests/test_l114_image_executeur.py` le vérifie.
 3. Le code est usé côté serveur, qu'il soit accepté ou non.
 
 La VM ne peut pas effacer ce fichier, puisque le montage est `:ro`. Le
@@ -291,5 +294,8 @@ L'acquittement porte `seq`, `state`, `in_turn` (les agents encore en tour),
     arrêté en 3 s ;
   - le code de sortie est 6 sur `executor_revoked` ; aujourd'hui, c'est 0 ;
   - `HttpTokenSource` (L110) est la source de jetons du transport (L109) ;
+- l'option `--code-file FICHIER` (ou `-` pour stdin) de `ameesh device
+  enroll` et `ameesh device challenge`, à la place de `--code`, dans
+  `host_cli.py` (L110), que l'entrée appelle déjà ;
 - `HTTPS_PROXY` (CONNECT) dans le transport `http.client` de L109, à
   vérifier aussi pour `dsh` en L115.
