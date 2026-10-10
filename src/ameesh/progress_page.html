@@ -1,6 +1,6 @@
 <!doctype html>
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
-<!-- Vue de référence d'ameesh progress (L24, décision 0024) : page statique
+<!-- Vue de référence d'ameesh progress (L24, décision 0024 ; feuille de route L96) : page statique
      autonome, sans ressource réseau. Les données (schéma ameesh-progress/1)
      sont embarquées plus bas par `ameesh progress --html`. -->
 <html lang="fr">
@@ -120,6 +120,31 @@ ul.missing { color: var(--ink-2); font-size: .8rem; padding-left: 18px; margin: 
 .subhead { font-size: .85rem; color: var(--ink-2); margin: 12px 0 4px; }
 .project.idle-project { opacity: .7; }
 footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
+/* L96 : feuille de route (Gantt), prévu face au réel */
+.rm-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.rm-toggle { font: inherit; font-size: .78rem; color: var(--ink-2); background: none;
+             border: 1px solid var(--grid); border-radius: 6px; padding: 1px 8px; cursor: pointer; }
+.rm-group { color: var(--muted); font-size: .75rem; letter-spacing: .04em; margin: 12px 0 2px; }
+.rm-row { border-top: 1px solid var(--grid); padding: 6px 0; }
+.rm-label { display: flex; gap: 8px; align-items: baseline; font-size: .86rem; }
+.rm-label .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rm-track { position: relative; height: 16px; margin-top: 4px; }
+.rm-plan { position: absolute; top: 2px; height: 12px; border-radius: 3px;
+           border: 1px dashed var(--phase-build); background: transparent; }
+.rm-real { position: absolute; top: 5px; height: 6px; border-radius: 3px; background: var(--phase-build); }
+.rm-real.done { background: var(--phase-merge); }
+.rm-real.late { background: var(--critical); }
+.rm-mark { position: absolute; top: 3px; width: 10px; height: 10px; margin-left: -5px;
+           transform: rotate(45deg); background: var(--ink); }
+.rm-mark.due { background: transparent; border: 2px solid var(--warning); }
+.rm-mark.done { transform: none; border-radius: 50%; background: var(--phase-merge); }
+.rm-mark.decision { transform: none; border-radius: 50%; background: var(--warning); }
+.rm-tick { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--grid); }
+.rm-today { position: absolute; top: -3px; bottom: -3px; width: 0; border-left: 2px solid var(--critical); }
+.rm-detail { color: var(--ink-2); font-size: .76rem; margin-top: 2px; overflow-wrap: anywhere; }
+.rm-detail a { color: inherit; }
+.st-late { color: var(--critical); } .st-proposed { color: var(--warning); border-style: dashed; }
+.st-done { color: var(--good); }
 </style>
 </head>
 <body>
@@ -130,6 +155,27 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
   <section aria-labelledby="h-projects" id="projects-section">
     <h2 id="h-projects">Projets</h2>
     <div id="projects"></div>
+  </section>
+
+  <section aria-labelledby="h-roadmap" id="roadmap-section">
+    <div class="rm-head">
+      <h2 id="h-roadmap">Feuille de route</h2>
+      <button type="button" class="rm-toggle" id="roadmap-toggle" aria-expanded="true">masquer</button>
+    </div>
+    <div id="roadmap-body">
+      <div class="legend" aria-hidden="true">
+        <span><i style="border:1px dashed var(--phase-build);height:10px"></i>prévu</span>
+        <span><i style="background:var(--phase-build)"></i>réel, en cours</span>
+        <span><i style="background:var(--phase-merge)"></i>réel, livré</span>
+        <span><i style="background:var(--critical)"></i>après la date prévue</span>
+        <span><i style="background:var(--ink);width:9px;height:9px;transform:rotate(45deg)"></i>livraison prévue</span>
+        <span><i style="border:2px solid var(--warning);width:9px;height:9px;transform:rotate(45deg)"></i>échéance d'un engagement</span>
+        <span><i style="background:var(--warning);width:9px;height:9px;border-radius:50%"></i>décision attendue</span>
+        <span><i style="background:var(--critical);width:2px;height:12px"></i>aujourd'hui</span>
+      </div>
+      <div class="axis" id="rm-axis" aria-hidden="true"></div>
+      <div id="roadmap"></div>
+    </div>
   </section>
 
   <section aria-labelledby="h-lots">
@@ -367,7 +413,7 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
     (p.warnings || []).forEach(function (w) { box.appendChild(el("div", "warn", "⚠ " + w)); });
     if (p.agents.length) {
       var wrap = el("div", "table-wrap"), tb = el("table"), tr = el("tr");
-      ["agent", "état", "paiement", "24 h", "non lus", "lot en cours"].forEach(function (h) { tr.appendChild(el("th", null, h)); });
+      ["agent", "état", "paiement", "24 h", "non lus", "lot en cours", "dernière avancée"].forEach(function (h) { tr.appendChild(el("th", null, h)); });
       tb.appendChild(tr);
       p.agents.forEach(function (a) {
         var x = el("tr"), st = el("td");
@@ -379,9 +425,13 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
         x.appendChild(el("td", null, PAY_FR[a.payment] || "?"));
         x.appendChild(el("td", "n", usd(a.usd_24h)));
         x.appendChild(el("td", "n", a.unread));
-        x.appendChild(el("td", null, a.lot ? "#" + a.lot.id + " " + a.lot.title
+        x.appendChild(el("td", null, (a.lot ? "#" + a.lot.id + " " + a.lot.title
           + (a.open_lots > 1 ? " (+" + (a.open_lots - 1) + ")" : "")
-          : (a.task ? "tour : " + a.task : "—")));
+          : (a.task ? "tour : " + a.task : "—"))
+          + (a.lot && a.on_task_since_ts ? " (depuis " + dur(D.generated_ts - a.on_task_since_ts) + ")" : "")));
+        // L96 : la dernière avancée lue dans le fil (une ligne)
+        x.appendChild(el("td", null, a.last_update ? a.last_update.text + " (il y a "
+          + dur(D.generated_ts - a.last_update.ts) + ")" : "—"));
         tb.appendChild(x);
       });
       wrap.appendChild(tb); box.appendChild(wrap);
@@ -521,6 +571,166 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
     });
     document.getElementById("byagent").appendChild(tb);
   }
+
+  // Feuille de route (L96) : epics, jalons, tâches, engagements et décisions
+  // attendues sur une frise en jours ; prévu (pointillé) face au réel (plein)
+  (function () {
+    var R = D.roadmap, sec = document.getElementById("roadmap-section");
+    if (!R) { sec.style.display = "none"; return; }
+    var body = document.getElementById("roadmap-body"), tg = document.getElementById("roadmap-toggle");
+    var hidden = false;
+    try { hidden = window.localStorage.getItem("ameesh-roadmap-hidden") === "1"; } catch (e) { hidden = false; }
+    function apply() {
+      body.style.display = hidden ? "none" : "";
+      tg.textContent = hidden ? "afficher" : "masquer";
+      tg.setAttribute("aria-expanded", hidden ? "false" : "true");
+    }
+    tg.addEventListener("click", function () {
+      hidden = !hidden; apply();
+      try { window.localStorage.setItem("ameesh-roadmap-hidden", hidden ? "1" : "0"); } catch (e) { /* sans stockage */ }
+    });
+    apply();
+    var f = R.window.from_ts, t = R.window.to_ts, sp = Math.max(1, t - f);
+    function px(ts) { return Math.min(100, Math.max(0, (ts - f) / sp * 100)); }
+    function dayTs(iso) {
+      if (!iso) return null;
+      var p = String(iso).split("-");
+      return new Date(+p[0], +p[1] - 1, +p[2]).getTime() / 1000;
+    }
+    function dm(iso) { if (!iso) return "—"; var p = String(iso).split("-"); return p[2] + "/" + p[1]; }
+    function dmTs(ts) { if (!ts) return "—"; var d = new Date(ts * 1000); return pad(d.getDate()) + "/" + pad(d.getMonth() + 1); }
+    var todayTs = dayTs(R.today) + 43200;
+    var LBL = {start: "début", end: "fin", delivery: "livraison", demandee: "demandée", debut: "en cours",
+               soumise: "soumise", verdict: "verdict", livree: "livrée"};
+    var ST = {en_cours: "en cours", a_valider: "à valider", validee: "validée", bloquee: "bloquée",
+              livree: "livrée", abandonnee: "abandonnée"};
+    var axis = document.getElementById("rm-axis"), days = Math.round(sp / 86400);
+    var stepDays = [1, 2, 7, 14, 28].filter(function (k) { return days / k <= Math.max(2, Math.floor((axis.clientWidth || 320) / 56)); })[0] || 28;
+    var ticks = [];
+    for (var d = new Date(f * 1000); d.getTime() / 1000 < t; d.setDate(d.getDate() + stepDays)) ticks.push(d.getTime() / 1000);
+    ticks.forEach(function (ts) { var s = el("span", null, dmTs(ts)); s.style.left = px(ts) + "%"; axis.appendChild(s); });
+    var box = document.getElementById("roadmap");
+    function track(parts) {
+      var tr = el("div", "rm-track");
+      tr.setAttribute("role", "img");
+      ticks.forEach(function (ts) { var g = el("div", "rm-tick"); g.style.left = px(ts) + "%"; tr.appendChild(g); });
+      parts.forEach(function (p) {
+        if (p.mark) {
+          if (!p.at || p.at < f || p.at > t) return;
+          var m = el("div", "rm-mark" + (p.cls ? " " + p.cls : "")); m.style.left = px(p.at) + "%";
+          if (p.title) m.title = p.title;
+          tr.appendChild(m); return;
+        }
+        if (!p.a || !p.b || p.b < f || p.a > t) return;
+        var a = px(p.a), z = px(p.b);
+        var bar = el("div", p.cls); bar.style.left = a + "%"; bar.style.width = Math.max(0.6, z - a) + "%";
+        tr.appendChild(bar);
+      });
+      var n = el("div", "rm-today"); n.style.left = px(todayTs) + "%"; tr.appendChild(n);
+      return tr;
+    }
+    function planned(p) {
+      var out = ["start", "end", "delivery"].filter(function (k) { return p && p[k]; })
+        .map(function (k) { return LBL[k] + " " + dm(p[k]); });
+      return out.length ? "prévu : " + out.join(", ") : "sans date prévue";
+    }
+    function source(det, src) {
+      if (!src || !src.label) return;
+      det.appendChild(document.createTextNode(" · source : "));
+      if (src.url) { var a = el("a", null, src.label); a.href = src.url; a.rel = "noreferrer noopener"; det.appendChild(a); }
+      else det.appendChild(document.createTextNode(src.label));
+    }
+    function late(head, l) {
+      if (!l) return;
+      head.appendChild(el("span", "chip st-late", l.open ? "⚠ en retard de " + l.days + " j"
+        : "livrée avec " + l.days + " j de retard"));
+    }
+    function planBars(p, real, ended) {
+      var ps = dayTs(p.start), pe = dayTs(p.end), pd = dayTs(p.delivery);
+      var parts = [];
+      var pa = ps || (real && (real.debut || real.demandee)), pz = pe || pd;
+      if (pa && pz) parts.push({a: pa, b: pz + 86400, cls: "rm-plan"});
+      var ra = real && (real.debut || real.demandee), rz = (real && real.livree) || (ended ? null : todayTs);
+      var target = pd || pe;
+      if (ra && rz) {
+        var done = real && real.livree;
+        if (target && rz > target + 86400) {
+          parts.push({a: ra, b: target + 86400, cls: "rm-real" + (done ? " done" : "")});
+          parts.push({a: target + 86400, b: rz, cls: "rm-real late"});
+        } else parts.push({a: ra, b: rz, cls: "rm-real" + (done ? " done" : "")});
+      }
+      if (pd) parts.push({mark: true, at: pd + 43200, title: "livraison prévue " + dm(p.delivery)});
+      if (real && real.livree) parts.push({mark: true, at: real.livree, cls: "done", title: "livrée " + dmTs(real.livree)});
+      return parts;
+    }
+    function group(title, rows, render) {
+      if (!rows || !rows.length) return;
+      box.appendChild(el("div", "rm-group", title + " (" + rows.length + ")"));
+      rows.forEach(render);
+    }
+    function pkgRow(p) {
+      var row = el("div", "rm-row"), head = el("div", "rm-label");
+      head.appendChild(el("span", "lot-id", p.id));
+      head.appendChild(el("span", "t", p.title));
+      if (p.units_total) head.appendChild(el("span", "meta", p.units_delivered + "/" + p.units_total + " livrée(s)"));
+      late(head, p.late);
+      row.appendChild(head);
+      // le réel d'une fiche court jusqu'à aujourd'hui tant que tout n'est pas livré
+      var pr = {debut: p.real.debut, livree: p.progress === 1 ? p.real.livree : null};
+      row.appendChild(track(planBars(p.planned, pr, false)));
+      var det = el("div", "rm-detail", planned(p.planned));
+      source(det, p.source);
+      row.appendChild(det); box.appendChild(row);
+    }
+    group("Jalons", R.milestones, pkgRow);
+    group("Epics", R.epics, pkgRow);
+    group("Tâches", R.tasks, function (x) {
+      var row = el("div", "rm-row"), head = el("div", "rm-label");
+      head.appendChild(el("span", "lot-id", "#" + x.id));
+      head.appendChild(el("span", "t", x.title + (x.epic ? " [" + x.epic + "]" : "")));
+      head.appendChild(el("span", "chip st-" + (x.state === "livree" ? "done" : "active"), ST[x.state] || x.state));
+      late(head, x.late);
+      row.appendChild(head);
+      row.appendChild(track(planBars(x.planned, x.real, x.state === "abandonnee")));
+      var reached = ["demandee", "debut", "soumise", "verdict", "livree"].filter(function (k) { return x.real[k]; })
+        .map(function (k) { return LBL[k] + " " + dmTs(x.real[k]); });
+      var det = el("div", "rm-detail", [planned(x.planned), reached.length ? "réel : " + reached.join(", ") : "",
+        x.assignee || ""].filter(Boolean).join(" · "));
+      source(det, x.source);
+      if (x.commitments.length) det.appendChild(document.createTextNode(" · engagement(s) "
+        + x.commitments.map(function (i) { return "e" + i; }).join(", ")));
+      row.appendChild(det); box.appendChild(row);
+    });
+    var CST = {proposed: "proposé, à valider", open: "ouvert", done: "tenu", cancelled: "annulé"};
+    group("Engagements", R.commitments, function (c) {
+      var row = el("div", "rm-row"), head = el("div", "rm-label");
+      head.appendChild(el("span", "lot-id", "e" + c.id));
+      head.appendChild(el("span", "t", c.what));
+      head.appendChild(el("span", "chip st-" + (c.fulfilled ? "done" : c.status === "proposed" ? "proposed" : "active"),
+        c.fulfilled ? "tenu" : CST[c.status] || c.status));
+      late(head, c.late);
+      row.appendChild(head);
+      row.appendChild(track([{mark: true, at: dayTs(c.due) + 43200, cls: c.fulfilled ? "done" : "due", title: "pour " + dm(c.due)}]));
+      var det = el("div", "rm-detail", ["pour " + dm(c.due), c.owner || "", c.project ? "projet " + c.project : "",
+        c.lot ? "tâche #" + c.lot : "", c.depends_on.length ? "dépend de " + c.depends_on.join(", ") : ""]
+        .filter(Boolean).join(" · "));
+      source(det, c.source);
+      row.appendChild(det); box.appendChild(row);
+    });
+    group("Décisions attendues", R.decisions, function (c) {
+      var row = el("div", "rm-row"), head = el("div", "rm-label");
+      head.appendChild(el("span", "lot-id", c.id ? "e" + c.id : "#" + c.lot));
+      head.appendChild(el("span", "t", c.what));
+      if (c.status === "proposed") head.appendChild(el("span", "chip st-proposed", "proposé, à valider"));
+      row.appendChild(head);
+      row.appendChild(track([{mark: true, at: c.due ? dayTs(c.due) + 43200 : todayTs, cls: "decision"}]));
+      var det = el("div", "rm-detail", (c.due ? "pour " + dm(c.due) : "sans date") + (c.owner ? " · " + c.owner : ""));
+      source(det, c.source);
+      row.appendChild(det); box.appendChild(row);
+    });
+    if (!R.tasks.length && !R.epics.length && !R.milestones.length && !R.commitments.length && !R.decisions.length)
+      box.appendChild(el("p", "empty", "Rien à planifier : aucune tâche ouverte, aucune date prévue, aucun engagement."));
+  })();
 
   var miss = document.getElementById("missing");
   (D.missing || []).forEach(function (t) { miss.appendChild(el("li", null, t)); });

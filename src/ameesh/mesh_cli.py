@@ -873,6 +873,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             item["milestones"] = work.milestones(db, args.id)
             item["delays"] = work.timeline(db, args.id)
             plan.annotate(db, [item])
+            # L96 : dates prévues (feuille de route)
+            planned = (storage.of(db).roadmap.item_plans([args.id]) or [{}])[0]
+            item["planned"] = {k: planned.get("planned_" + k)
+                               for k in ("start", "end", "delivery", "source", "by")}
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
@@ -886,6 +890,12 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if item.get("package_id") or item.get("epic"):
                 print("plan     : fiche %-12s epic : %s" % (
                     item.get("package_id") or "—", item.get("epic") or "—"))
+            if any(item["planned"].get(k) for k in ("start", "end", "delivery")):
+                print("prévu    : début %s · fin %s · livraison %s%s" % (
+                    item["planned"]["start"] or "—", item["planned"]["end"] or "—",
+                    item["planned"]["delivery"] or "—",
+                    " (source : %s)" % item["planned"]["source"]
+                    if item["planned"].get("source") else ""))
             if item.get("state") == "closed":
                 print("fermé    : %s" % ("abandonné" if item.get("close_reason") == "abandoned"
                                          else "remplacé par #%s" % item.get("superseded_by")))

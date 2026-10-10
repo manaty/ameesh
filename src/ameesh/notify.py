@@ -65,8 +65,8 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 #: L94 : la sous-utilisation (forfait perdu, agents au repos, orchestrateur
 #: tenu, hôte à vide) est poussée comme la surcharge.
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
-                 "delegation_expired", "plan_underused", "idle_capacity",
-                 "orchestrator_held", "host_underused", "balance_low")
+                 "delegation_expired", "engagement_overdue", "plan_underused",
+                 "idle_capacity", "orchestrator_held", "host_underused", "balance_low")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -95,6 +95,7 @@ TYPE_LABELS = {
     "dead_runner": "exécuteur mort",
     "idle_with_mail": "agent au repos avec du courrier",
     "delegation_expired": "délégation échue",
+    "engagement_overdue": "engagement ou date prévue dépassé",
     "long_turn": "tour long",
     "session_too_big": "session trop grosse",
     "stale_lot": "lot stagnant",
@@ -813,7 +814,9 @@ def key_of(alert: dict) -> str:
 #: champs d'une alerte gardés dans l'état (de quoi écrire la résolution)
 _KEPT = ("type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
          "responsible", "stop_reason", "assignee", "harness", "account", "gauge",
-         "provider", "currency", "urgent")
+         "provider", "currency", "urgent",
+         # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
+         "commitment", "package", "due")
 
 
 # --------------------------------------------------------------------------

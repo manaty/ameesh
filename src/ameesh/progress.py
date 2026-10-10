@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Vue temps réel de l'avancement (lot L24, décision 0024).
 
-  ameesh progress [--json] [--project P] [--since 24h] [--stale-after 6h]
-  ameesh progress --html FICHIER [--project P] [--since 24h] [--stale-after 6h]
+  ameesh progress [--json] [--project P] [--since 24h] [--stale-after 6h] [--no-gantt]
+  ameesh progress --html FICHIER [--project P] [--since 24h] [--stale-after 6h] [--no-gantt]
 
 L'état courant et la frise du projet, **alimentés par ce qu'ameesh enregistre
 lui-même** (transitions des lots `work_items`, actions sous porte, tours et
@@ -27,6 +27,10 @@ git ni par le board :
   jamais additionnées (L95) ; dépense réelle tirée des soldes face à
   l'estimation ; tokens d'entrée, de cache relu et de sortie ; tours en
   échec à part ; toutes les fenêtres de tous les comptes déclarés.
+* **feuille de route** (L96, clé `roadmap`, schéma `ameesh-roadmap/1`) : le
+  Gantt des epics, tâches, jalons et engagements, prévu face au réel, ligne
+  du jour, retards et source de chaque élément ; affiché par défaut,
+  `--no-gantt` le retire.
 
 Le JSON suit le schéma versionné `ameesh-progress/1`
 (`docs/PROGRESS.md`). `--html` écrit une page statique autonome (aucune
@@ -82,7 +86,11 @@ _WAITING = ("blocked", "waiting_human")
 #: ce que la vue ne sait pas encore lire (dit dans le JSON, jamais deviné)
 MISSING = (
     "jalons du projet : fiches WorkPackage `milestone` du canon synchronisé "
-    "(`ameesh canon sync`) ; sans date déclarée (`at_ts` null)",
+    "(`ameesh canon sync`) ; leur date vient de la fiche (`date`, `delivery`) ou "
+    "de `ameesh work plan <fiche>` ; sans date, `at_ts` est null",
+    "feuille de route (L96) : dates prévues posées par `ameesh work plan` ou au "
+    "canon, engagements de `ameesh plan add` ; une date dite en conversation et "
+    "jamais enregistrée n'y est pas",
     "jalons de lot : lus dans la table des jalons de lot (L10) quand un gel ou "
     "un verdict y est déclaré, sinon déduits du journal des transitions et des "
     "actions de fusion",
@@ -541,7 +549,7 @@ def _truncation(rows: list[dict], limit: int) -> dict | None:
 def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = None,
              book: cost_mod.CostBook | None = None, now: float | None = None,
              max_lots: int = MAX_LOTS, max_actions: int = MAX_ACTIONS,
-             stale_after: float | None = None) -> dict:
+             stale_after: float | None = None, gantt: bool = True) -> dict:
     """L'instantané `ameesh-progress/1` (voir docs/PROGRESS.md).
 
     Les bornes (`max_lots`, `max_actions`) ne limitent que le RENDU : les
@@ -614,6 +622,12 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     # L62 : la vue par projet en tête (une requête de plus, agrégée)
     from . import projects as projects_mod
     by_project = projects_mod.snapshot(db, project=project, now=now)
+    # L96 : la feuille de route en Gantt (prévu face au réel), affichée par
+    # défaut ; `--no-gantt` la retire
+    roadmap = None
+    if gantt:
+        from . import roadmap as roadmap_mod
+        roadmap = roadmap_mod.build(db, now=now, project=project)
 
     return {
         "schema": SCHEMA,
@@ -625,6 +639,9 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         "window": {"from_ts": _round(since_ts), "to_ts": _round(now)},
         # L62 (champ ajouté) : projets, agents et lot en cours, lots sans agent
         "projects": by_project["projects"],
+        # L96 (champ ajouté) : feuille de route, schéma ameesh-roadmap/1 ; null
+        # avec --no-gantt
+        "roadmap": roadmap,
         "lots": lots,
         "agents": agents,
         "milestones": plan["milestones"],
@@ -691,6 +708,12 @@ def format_text(snap: dict, width: int | None = None) -> str:
         out.extend(projects_mod.format_lines(
             {"generated_ts": now, "projects": snap["projects"]}, width,
             show_inactive=bool(snap.get("project")), indent="  "))
+
+    if snap.get("roadmap"):
+        # L96 : la feuille de route (Gantt texte), avant le détail des lots
+        from . import roadmap as roadmap_mod
+        out.append("")
+        out.extend(roadmap_mod.format_gantt(snap["roadmap"], width).splitlines())
 
     out.append("")
     line("LOTS (%d)" % len(snap["lots"]))
@@ -766,7 +789,7 @@ def format_text(snap: dict, width: int | None = None) -> str:
             progress = ("%d/%d lots fusionnés" % (
                 ms["lots_merged"], ms["lots_total"] - ms.get("lots_abandoned", 0))
                 if "lots_total" in ms else "")
-            line("%s %s%s" % (_hm(ms.get("at_ts"), now) if ms.get("at_ts") else "sans date",
+            line("%s %s%s" % (ms["date"] if ms.get("date") else "sans date",
                               ms.get("title", ""), " — %s" % progress if progress else ""), "  ")
     else:
         line("JALONS : aucun déclaré au canon")
@@ -901,6 +924,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project", default=None, help="projet (app, workstream, équipe)")
     parser.add_argument("--since", default=DEFAULT_SINCE,
                         help="début de la fenêtre : durée (16h, 2d) ou date ISO (défaut 24h)")
+    parser.add_argument("--no-gantt", action="store_true",
+                        help="sans la feuille de route en Gantt (affichée par défaut, L96)")
     parser.add_argument("--stale-after", default=None,
                         help="lot stagnant sans activité depuis cette durée (défaut "
                              "AMEESH_STALE_AFTER, sinon 6h)")
@@ -921,7 +946,8 @@ def main(argv: list[str] | None = None) -> int:
             db_mod.require_schema(db, defer=True)
             # L61 : lectures regroupées (db.batched) — deux allers-retours
             snap = db_mod.batched(db, lambda db: snapshot(
-                db, cfg, since=args.since, project=args.project, stale_after=threshold))
+                db, cfg, since=args.since, project=args.project, stale_after=threshold,
+                gantt=not args.no_gantt))
         finally:
             db.close()
         if args.html:

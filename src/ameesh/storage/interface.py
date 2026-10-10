@@ -89,6 +89,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    progress        lots lot_events lot_milestones lot_actions actions agents costs
                    packages package_items lot_messages
    projects        board
+   roadmap         plan_item item_plans plan_package items commitments
+                   add_commitment record_proposal set_commitment
    operations      set_settings set_session_work_item listing request_restart
                    apply_restart adopt resume message_lots assigned_open_lots
                    open_lots_activity turns record_gauges gauge_history
@@ -898,7 +900,10 @@ class WorkPackages(Domain):
     def all(self, *, include_absent: bool = False) -> list[dict]:
         """Les fiches (présentes au canon seulement, sauf `include_absent`), par id :
         id, kind, title, parent, responsible, team, scope (liste ou None),
-        status, canon_ref, canon (L42 ; NULL = canon par défaut), present, synced_ts."""
+        status, canon_ref, canon (L42 ; NULL = canon par défaut), present, synced_ts ;
+        L96 : dates du canon `start_on`, `end_on`, `delivery_on` et dates posées
+        dans ameesh `planned_start`, `planned_end`, `planned_delivery`,
+        `planned_source`, `planned_by` (jours ISO ou None)."""
 
     @abc.abstractmethod
     def get(self, ident: str) -> dict | None:
@@ -1390,7 +1395,9 @@ class Progress(Domain):
     @abc.abstractmethod
     def packages(self) -> list[dict]:
         """Les fiches WorkPackage présentes (L29) : id, kind, title, parent,
-        responsible, team, status, canon_ref."""
+        responsible, team, status, canon_ref ; L96 : `start_on`, `end_on`,
+        `delivery_on` (canon), `planned_start`, `planned_end`,
+        `planned_delivery`, `planned_source`, `planned_by` (ameesh)."""
 
     @abc.abstractmethod
     def package_items(self) -> list[dict]:
@@ -1451,6 +1458,73 @@ class Projects(Domain):
         au plus `max_lots`, les plus récemment modifiés d'abord — id, title,
         state, app, workstream, package_team, assignee, updated_ts ; chaque
         élément porte `total` (avant la borne)."""
+
+
+# --------------------------------------------------------------------------
+# feuille de route (lot L96, migration 0044) : dates prévues, engagements
+# --------------------------------------------------------------------------
+
+class Roadmap(Domain):
+    """Dates prévues des tâches et des fiches du plan, engagements datés.
+
+    Les dates sont des jours calendaires, échangées en texte ISO
+    (`AAAA-MM-JJ`) ; None = pas de date. Aucun état ni jalon de métier ici :
+    les dates réelles se lisent dans le journal (`progress`)."""
+
+    @abc.abstractmethod
+    def plan_item(self, item_id: int, dates: dict, *, source: str | None,
+                  actor: str) -> dict | None:
+        """Pose les dates prévues d'une tâche (`dates` : clés parmi `start`,
+        `end`, `delivery` ; valeur None = date effacée ; clé absente =
+        inchangée), avec qui et quand (`planned_by`, `planned_at`). Ce n'est
+        PAS une activité de la tâche : ni `updated_at` ni le journal ne
+        bougent (une replanification ne masque pas une stagnation). Rend
+        `{id, planned_start, planned_end, planned_delivery, planned_source,
+        planned_by, planned_ts}`, ou None si la tâche est inconnue."""
+
+    @abc.abstractmethod
+    def item_plans(self, ids: Sequence[int]) -> list[dict]:
+        """Les dates prévues de ces tâches (même forme que `plan_item`)."""
+
+    @abc.abstractmethod
+    def plan_package(self, ident: str, dates: dict, *, source: str | None,
+                     actor: str) -> dict | None:
+        """Pose les dates prévues (côté ameesh) d'une fiche WorkPackage ; None
+        si elle est inconnue. Les dates du canon (`start_on`…) ne sont pas
+        touchées."""
+
+    @abc.abstractmethod
+    def items(self, *, since_ts: float, limit: int,
+              done_states: Sequence[str]) -> list[dict]:
+        """Les tâches de la feuille de route : ouvertes (état hors de
+        `done_states`, fourni par l'appelant), ou datées, ou portant un
+        engagement en cours, ou modifiées depuis `since_ts` — colonnes de `work_items` utiles à la
+        frise (id, title, state, app, workstream, assignee, package_id,
+        created_ts, updated_ts, closed_ts) et dates prévues ; `total` avant
+        la borne."""
+
+    @abc.abstractmethod
+    def commitments(self, *, statuses: Sequence[str] | None = None,
+                    ids: Sequence[int] | None = None) -> list[dict]:
+        """Les engagements (tous, ou de ces statuts, ou ces ids), par
+        échéance puis id. Instants en `*_ts`, `due_on` en texte ISO,
+        `depends_on` en liste."""
+
+    @abc.abstractmethod
+    def add_commitment(self, row: dict) -> dict:
+        """Écrit un engagement (clés de la table) et le rend."""
+
+    @abc.abstractmethod
+    def record_proposal(self, row: dict) -> dict | None:
+        """Écrit une proposition (`status = 'proposed'`) sauf si sa
+        `proposal_key` existe déjà : None dans ce cas."""
+
+    @abc.abstractmethod
+    def set_commitment(self, ident: int, *, current: Sequence[str],
+                       values: dict) -> dict | None:
+        """Change un engagement (`status`, `due_on`, `note`…) s'il est dans
+        l'un des statuts `current` ; None sinon (inconnu ou déjà changé).
+        Un statut `done` ou `cancelled` pose `closed_at`."""
 
 
 # --------------------------------------------------------------------------
@@ -1855,6 +1929,7 @@ class Storage(abc.ABC):
     placements: Placements
     progress: Progress
     projects: Projects
+    roadmap: Roadmap
     operations: Operations
     hosts: HostResources
     turn_resources: TurnResources

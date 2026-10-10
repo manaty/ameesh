@@ -252,6 +252,26 @@ assignee; the lot comes back to them. At the deadline (`--within`: `30m`, `2h`,
 A new delegation replaces the previous one. `work list`, `work show` and
 `ameesh progress` say "delegated by X, due in 12 min" or "overdue by …".
 
+## Dated commitments and the roadmap: `ameesh plan`
+
+**Rule for orchestrators:** every dated commitment made in a conversation
+("we'll do it on Monday", "delivery on Thursday") is recorded in ameesh **when
+it is made**, with its source:
+
+```bash
+ameesh plan add "Separate accounts per organisation" --pour 2026-10-12 \
+    --projet ameesh --lot 65 --source "conversation of 2026-10-10"
+ameesh work plan 65 --debut 2026-10-10 --fin 2026-10-11 --livraison 2026-10-12
+```
+
+A date that only lives in a conversation or in the body of a task is neither
+on the Gantt (`ameesh plan show`, and the roadmap section of `ameesh
+progress`) nor watched by the `engagement_overdue` alert, which notify pushes
+to the responsible human. `ameesh plan propose` reads the canon's decisions
+and the bodies of open tasks and **proposes** commitments, decision
+milestones and dependencies; nothing is created without `--record`, and a
+recorded proposal waits for `ameesh plan accept`.
+
 ## Session bindings
 
 The working directory **never** gives an identity (decision 0030). A session

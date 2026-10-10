@@ -42,6 +42,11 @@
   ameesh projects [--json] [--project P] [--all]
         projets en cours : agents, état, lot en cours, non-lus, dépense 24 h,
         forfait ou token, lots sans agent (schéma ameesh-projects/1, L62) ;
+  ameesh plan add "quoi" --pour J [--projet P] [--lot N] [--source S] | list
+        | accept <id> | done <id> | cancel <id> | propose [--record] | show [--json]
+        feuille de route : engagements datés, propositions tirées des décisions,
+        Gantt texte (schéma ameesh-roadmap/1, L96) ; dates prévues d'une
+        tâche ou d'une fiche : `ameesh work plan <id> --debut J --fin J --livraison J` ;
   ameesh fil list | show <projet> [<lot>] [--last N] | tail <projet> [<lot>]
         les fils lisibles : tout message passé par ameesh, en clair (R12) ;
   ameesh receipt verify | authenticator list   reçus d'approbation (spec §8) ;
@@ -161,6 +166,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "projects":
         from . import projects
         return projects.main(rest)
+    if command == "plan":
+        # L96 : feuille de route (engagements, propositions, Gantt)
+        from . import roadmap
+        return roadmap.main(rest)
     if command == "fil":
         from . import fil
         return fil.main(rest)

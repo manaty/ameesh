@@ -1390,7 +1390,9 @@ class PackageSync:
 
 
 _PACKAGE_KEYS = ("kind", "title", "parent", "responsible", "team", "scope", "status",
-                 "canon_ref", "canon")
+                 "canon_ref", "canon",
+                 # L96 : dates déclarées au canon
+                 "start_on", "end_on", "delivery_on")
 
 
 def sync_packages(db: Db, canon: Canon, findings: list[Finding], *,
@@ -1435,7 +1437,9 @@ def sync_packages(db: Db, canon: Canon, findings: list[Finding], *,
                    "parent": package.parent, "responsible": package.responsible,
                    "team": package.team, "scope": package.scope, "status": package.status,
                    "canon_ref": package.fiche.ref,
-                   "canon": None if canon.is_default else ident}
+                   "canon": None if canon.is_default else ident,
+                   "start_on": package.start, "end_on": package.end,
+                   "delivery_on": package.delivery}
             if old is not None and old.get("present") and all(
                     (old.get(k) or None) == (row.get(k) or None) for k in _PACKAGE_KEYS):
                 done.unchanged.append(package.id)

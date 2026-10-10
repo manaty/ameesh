@@ -60,6 +60,7 @@
 --       actions.args, .last_note
 --       action_events.note
 --       work_items.body
+--       commitments.note (L96)
 --       work_item_events.note
 --       work_item_milestones.note
 --       mesh_approvals.meta (et mesh_approvals_status)
@@ -300,6 +301,13 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     -- plafonds de budget du mesh (L70, 0042) et leur journal : de l'ÉTAT
     -- (montants, acteur), aucun contenu
+    -- feuille de route (L96, 0044) : engagements datés, de l'ÉTAT (quoi, pour
+    -- quand, porteur, source) ; la note libre est un CONTENU
+    ('commitments', ARRAY[
+        'id', 'what', 'due_on', 'kind', 'status', 'owner', 'project', 'work_item_id',
+        'package_id', 'source_kind', 'source_ref', 'depends_on', 'created_by',
+        'created_at', 'updated_at', 'closed_at', 'proposal_key'
+    ]),
     ('budget_limits', ARRAY[
         'scope', 'window_s', 'usd', 'set_by', 'updated_at'
     ]),
@@ -324,7 +332,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'created_at', 'updated_at', 'closed_at',
         'package_id', 'package_parent', 'pr_ref', 'close_reason', 'superseded_by',
         -- L40 (0031) : délégation à échéance en cours (pas de contenu)
-        'delegated_by', 'delegated_at', 'due_at'
+        'delegated_by', 'delegated_at', 'due_at',
+        -- L96 (0044) : dates prévues
+        'planned_start', 'planned_end', 'planned_delivery', 'planned_source',
+        'planned_by', 'planned_at'
     ]),
     -- L40 (0031) : registre des délégations et de leur issue (de l'ÉTAT)
     ('work_item_delegations', ARRAY[
@@ -336,7 +347,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'kind', 'title', 'parent', 'responsible', 'team', 'scope', 'status',
         'canon_ref', 'present', 'synced_at',
         -- L42 (0032) : canon déclarant
-        'canon'
+        'canon',
+        -- L96 (0044) : dates du canon et dates posées dans ameesh
+        'start_on', 'end_on', 'delivery_on', 'planned_start', 'planned_end',
+        'planned_delivery', 'planned_source', 'planned_by', 'planned_at'
     ]);
 
 \ir _contrat-superviseur.sql

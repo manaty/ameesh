@@ -64,6 +64,11 @@ except Exception:  # pragma: no cover - dépend de l'environnement
 PROFILE_TYPES = ("Agent", "Host", "Placement", "Member", "WorkPackage")
 #: les sortes de fiches WorkPackage (plan de travail, L29) et les parents admis
 PACKAGE_KINDS = ("milestone", "epic", "lot")
+#: L96 : dates d'une fiche WorkPackage (`date` = date d'un jalon, alias de `delivery`)
+PACKAGE_DATE_KEYS = ("start", "end", "delivery", "date")
+#: L96 : fiches Decision gardées pour proposer la feuille de route (corps borné)
+DECISION_TYPE = "Decision"
+DECISION_BODY_MAX = 64 * 1024
 PACKAGE_PARENTS = {"milestone": (), "epic": ("milestone",), "lot": ("epic", "milestone")}
 #: identifiant d'une fiche WorkPackage (clé `id`, sinon nom du fichier sans `.md`)
 PACKAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -922,6 +927,20 @@ class WorkPackage:
     scope: list[str] | None
     status: str | None
     fiche: Fiche
+    #: L96 : dates déclarées (jours ISO) — début, fin, livraison (ou `date`
+    #: d'un jalon)
+    start: str | None = None
+    end: str | None = None
+    delivery: str | None = None
+
+
+@dataclass
+class DecisionNote:
+    """L96 : une fiche `Decision` du canon, lue pour proposer des éléments de
+    feuille de route (jamais pour décider : ameesh n'en tire aucun droit)."""
+
+    fiche: Fiche
+    body: str
 
 
 @dataclass
@@ -933,6 +952,8 @@ class Canon:
     hosts: list[Host] = field(default_factory=list)
     placements: list[Placement] = field(default_factory=list)
     packages: list[WorkPackage] = field(default_factory=list)
+    #: L96 : fiches Decision (frontmatter et corps), pour `ameesh plan propose`
+    decisions: list[DecisionNote] = field(default_factory=list)
     federation: dict | None = None
     #: constats de lecture (source, fédération, frontmatter, champs)
     load_findings: list[Finding] = field(default_factory=list)
@@ -1978,6 +1999,9 @@ class _Loader:
         if not isinstance(data, dict):
             return
         kind = data.get("type")
+        if kind == DECISION_TYPE:
+            self._decision(source, path, content, version, data)
+            return
         if kind not in PROFILE_TYPES:
             return
         title = _text(data.get("title"))
@@ -2225,6 +2249,7 @@ class _Loader:
         ident = _text(fiche.data.get("id")) or _package_stem(fiche.path)
         subject = {"package": ident}
         scope = self._list(fiche, "scope", where, "package-scope-invalid", **subject)
+        dates = {key: self._day(fiche, key, where, **subject) for key in PACKAGE_DATE_KEYS}
         self.canon.packages.append(WorkPackage(
             id=ident, title=fiche.title,
             kind=_text(fiche.data.get("kind")),
@@ -2233,7 +2258,40 @@ class _Loader:
             team=_text(fiche.data.get("team")),
             scope=scope,
             status=_text(fiche.data.get("status")),
-            fiche=fiche))
+            fiche=fiche,
+            start=dates["start"], end=dates["end"],
+            # `date` : la date d'un jalon, alias de `delivery`
+            delivery=dates["delivery"] or dates["date"]))
+
+    def _day(self, fiche: Fiche, key: str, where: dict, **subject) -> str | None:
+        """L96 : une date de fiche (`AAAA-MM-JJ`), ou None ; illisible =
+        avertissement et date ignorée (le plan reste lu)."""
+        value = fiche.data.get(key)
+        if value is None or value == "":
+            return None
+        text = str(value).strip()[:10]
+        try:
+            return _dt.date.fromisoformat(text).isoformat()
+        except ValueError:
+            self.add("package-date-invalid", WARNING,
+                     "`%s` : date illisible %r (attendu AAAA-MM-JJ) — ignorée" % (key, value),
+                     **where, **subject)
+            return None
+
+    def _decision(self, source, path: str, content: bytes, version: str, data: dict) -> None:
+        """L96 : garde une fiche Decision (frontmatter et corps, borné)."""
+        title = _text(data.get("title")) or _package_stem(path)
+        text = content[:DECISION_BODY_MAX].decode("utf-8", "replace")
+        lines = text.lstrip("\ufeff").split("\n")
+        body = text
+        for idx in range(1, len(lines)):
+            if lines[idx].rstrip("\r \t") in ("---", "..."):
+                body = "\n".join(lines[idx + 1:])
+                break
+        fiche = Fiche(type=DECISION_TYPE, title=title, member=source.member, path=path,
+                      ref=make_ref(self.canon, source.member, path, version), data=data,
+                      untrusted=source.mode != "git")
+        self.canon.decisions.append(DecisionNote(fiche=fiche, body=body))
 
 
 def _package_stem(path: str) -> str:

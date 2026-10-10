@@ -11,7 +11,15 @@ grand livre des coûts (`turn_costs`). Ni git ni le board ne sont lus.
 ameesh progress [--project P] [--since 24h] [--stale-after 6h]   # texte, terminal étroit
 ameesh progress --json [--project P] [--since 24h]   # ce schéma
 ameesh progress --html FICHIER [--project P] [--since 24h]
+ameesh progress … --no-gantt                         # sans la feuille de route (L96)
 ```
+
+* **Feuille de route** (L96) : la frise des epics, jalons, tâches,
+  engagements et décisions attendues, prévu face au réel, est **affichée par
+  défaut** (texte : section FEUILLE DE ROUTE après PROJETS ; page : section
+  « Feuille de route » avec un bouton « masquer », mémorisé par le
+  navigateur ; JSON : clé `roadmap`). `--no-gantt` la retire (`roadmap:
+  null`). Sa fenêtre est la sienne (jours), pas `--since`.
 
 * `--since` : début de la fenêtre, durée (`90m`, `16h`, `2d`/`2j`) ou date
   ISO 8601 (`2026-10-05`, `2026-10-05T08:00Z` ; sans fuseau = heure locale).
@@ -49,6 +57,7 @@ Codes de sortie : 0, 1 (base injoignable, schéma absent, erreur SQL),
 | `host` | texte | hôte qui a produit l'instantané |
 | `project` | texte \| null | filtre `--project` |
 | `window` | `{from_ts, to_ts}` | fenêtre de la frise |
+| `roadmap` | objet \| null | (L96) la feuille de route, schéma `ameesh-roadmap/1` ([EXPLOITATION.md](EXPLOITATION.md), « Feuille de route ») ; `null` avec `--no-gantt` |
 | `projects` | liste | (L62) la vue par projet de `ameesh projects` (schéma des éléments : `ameesh-projects/1`, [EXPLOITATION.md](EXPLOITATION.md)) ; filtrée par `--project` sur le nom du projet ; en tête du texte et de la page |
 | `lots` | liste | voir ci-dessous, du plus ancien au plus récent |
 | `agents` | liste | voir ci-dessous, par nom |
@@ -131,15 +140,19 @@ comptable posé avant chaque tour (`spend_pending`).
 
 Jalons du **projet** déclarés au canon (fiches `WorkPackage` de sorte
 `milestone`, L29, [plan de travail](PLAN-DE-TRAVAIL.md)) : `{id, title,
-at_ts, status, responsible, canon_ref, epics, lots_total, lots_merged,
-lots_abandoned, lots_open, lots_pending, progress}`. `at_ts` est null (le
-profil ne déclare pas de date) ; vide sans plan synchronisé.
+at_ts, date, status, responsible, canon_ref, epics, lots_total, lots_merged,
+lots_abandoned, lots_open, lots_pending, progress}`. L96 : `date` est le jour
+du jalon (ISO) — posé par `ameesh work plan <fiche> --livraison J`, sinon
+déclaré au canon (`date` ou `delivery`) — et `at_ts` son minuit local ; null
+sans date. Vide sans plan synchronisé.
 
 ## `epics[]` (L29)
 
-`{id, title, milestone, responsible, status, canon_ref, lots, work_items,
-lots_total, lots_merged, lots_abandoned, lots_open, lots_pending,
-progress}`. Les unités d'un epic sont ses fiches `lot` (`lots[]` :
+`{id, title, milestone, responsible, status, canon_ref, planned, lots,
+work_items, lots_total, lots_merged, lots_abandoned, lots_open, lots_pending,
+progress}`. `planned` (L96) : `{start, end, delivery, source}` — dates
+prévues effectives (posées dans ameesh, sinon au canon ; `source` :
+`ameesh`, `canon`, `mixte` ou null). Les unités d'un epic sont ses fiches `lot` (`lots[]` :
 `{id, title, status, work_items}`, statut `pending` sans lot créé, `open`,
 `merged`, `abandoned`) et les lots rattachés directement à l'epic
 (`work_items`). `progress` = fusionnées / (total − abandonnées), null si
