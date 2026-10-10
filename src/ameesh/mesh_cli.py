@@ -19,6 +19,10 @@
   agent-mesh work add --title T [--type bug|evolution] [--app A] [--assignee N] …
   agent-mesh work list [--state S] | work show <id> | work move <id> <état> | work note <id> "…"
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   réassigner (attribution gardée)
+  agent-mesh work merged <id> --sha S [--note …]   fusion faite hors PR : tout état ouvert → merged
+  agent-mesh work move <id> merged --correct "raison"   corriger un promoted posé par erreur
+                                                (l'acteur des commandes work : --actor, sinon
+                                                l'identité liée de la session, sinon « inconnu »)
   agent-mesh import-v0 [--agents a,b] [--dry-run]     bascule : boîte fichier v0 → Postgres
   agent-mesh export-v0 [--agents a,b] [--keep]        retour arrière : Postgres → boîte v0
   agent-mesh migrate | doctor [--notify-test | --probe]
@@ -766,10 +770,30 @@ def _print_assignment(check: dict | None) -> None:
         print("avertissement : %s" % check["warning"], file=sys.stderr)
 
 
+#: sous-commandes `work` dont `--actor` a son propre sens (le délégant de
+#: `delegate`) ou son propre défaut non vide (relevés, échéances)
+_OWN_ACTOR = ("delegate", "expire-delegations", "sync-branches")
+
+
+def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
+    """L'acteur des commandes `work` (correctif du 2026-10-11) : `--actor`,
+    sinon l'identité liée de la session, jamais vide (« inconnu », averti).
+    Une correction d'état (`move --correct`) vérifie en plus qui corrige."""
+    if args.work_command == "move" and getattr(args, "correct", None) is not None:
+        args.actor = work.corrector(cfg, db, args.actor)
+        return
+    if args.work_command in _OWN_ACTOR or getattr(args, "actor", None) is None:
+        return
+    args.actor, warning = work.resolve_actor(cfg, db, args.actor)
+    if warning:
+        print("avertissement : %s" % warning, file=sys.stderr)
+
+
 def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
     from . import plan, plan_cli, stagnation  # plan de travail (L29)
     db = _open(cfg)
     try:
+        _work_actor(cfg, db, args)
         if args.work_command in plan_cli.COMMANDS:
             return plan_cli.run(db, args)
         if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
@@ -951,8 +975,21 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     (event.get("actor") or "—")[:12], event["note"]))
             return 0
         if args.work_command == "move":
-            item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor)
-            print("lot #%d → %s (boucles %s)" % (item["id"], item["state"], item["loops"]))
+            item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor,
+                             correct=args.correct)
+            print("lot #%d → %s (boucles %s)%s" % (
+                item["id"], item["state"], item["loops"],
+                " — correction tracée au journal, par %s" % args.actor
+                if args.correct is not None else ""))
+            return 0
+        if args.work_command == "merged":
+            done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
+                               actor=args.actor)
+            if done["result"] == "already":
+                print("lot #%d déjà %s : rien à faire" % (args.id, done["item"]["state"]))
+            else:
+                print("lot #%d → merged (commit %s, déclaré par %s)" % (
+                    args.id, args.sha.strip().lower()[:12], args.actor))
             return 0
         if args.work_command == "note":
             work.note(db, args.id, args.text, actor=args.actor)
@@ -1550,8 +1587,22 @@ def build_parser() -> argparse.ArgumentParser:
     pw_move.add_argument("id", type=int)
     pw_move.add_argument("state", choices=list(work.STATES))
     pw_move.add_argument("--note", default=None)
-    pw_move.add_argument("--actor", default="")
+    pw_move.add_argument("--actor", default="",
+                         help="défaut : l'identité liée de la session (AGENT_MAIL_NAME)")
+    pw_move.add_argument("--correct", default=None, metavar="RAISON",
+                         help="corriger un état posé par erreur (promoted → merged), hors "
+                              "machine à états, tracé au journal ; réservé aux humains et aux "
+                              "orchestrateurs ou agents de conception")
     pw_move.set_defaults(func=cmd_work)
+    pw_merged = work_sub.add_parser(
+        "merged", help="déclarer la fusion d'un lot faite hors PR et sans gel (fusion locale "
+                       "sur la cible) : tout état ouvert → merged, jalon merged avec le commit")
+    pw_merged.add_argument("id", type=int)
+    pw_merged.add_argument("--sha", required=True, help="le commit de fusion")
+    pw_merged.add_argument("--note", default="")
+    pw_merged.add_argument("--actor", default="",
+                           help="défaut : l'identité liée de la session (AGENT_MAIL_NAME)")
+    pw_merged.set_defaults(func=cmd_work)
     pw_assign = work_sub.add_parser(
         "assign", help="réassigner un lot à un agent réveillable (L37, 0030)")
     pw_assign.add_argument("id", type=int)

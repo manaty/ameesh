@@ -4,7 +4,8 @@
   ameesh work link <id> <fiche>|--none
   ameesh work close <id> --abandoned | --superseded-by <id> [--note …]
   ameesh work sync-merges --git-dir D [--target origin/main] [--repo R] [--dry-run] [--json]
-  ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]  (L118)
+  ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]  (L118 : branche
+                            ou commit de fusion qui désigne le lot)
   ameesh work sync-github --repo R [--limit N] [--dry-run] [--json]
   ameesh work project-github --repo R [--dry-run] [--canon-url URL] [--json]
   ameesh work plan <id|fiche> [--debut J] [--fin J] [--livraison J] [--source S]  (L96)
@@ -57,8 +58,10 @@ def add_parsers(work_sub, func) -> None:
     p_merges.set_defaults(func=func)
 
     p_branches = work_sub.add_parser(
-        "sync-branches", help="fermer les lots dont la branche est fusionnée dans sa cible, "
-                              "avec ou sans PR (L118 ; fait aussi par l'exécuteur)")
+        "sync-branches", help="fermer les lots dont la fusion dans leur cible est constatée, "
+                              "avec ou sans PR : branche du lot, ou commit de fusion qui "
+                              "porte « ameesh-work: <id> » (ou #<id> si git config "
+                              "ameesh.lotRef hash) — L118 ; fait aussi par l'exécuteur")
     p_branches.add_argument("--host", default=None,
                             help="hôte dont les assignés sont examinés (défaut : cet hôte)")
     p_branches.add_argument("--all-hosts", action="store_true",
@@ -163,13 +166,12 @@ def _sync_branches(db, args: argparse.Namespace) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     if not report["results"]:
-        print("aucun lot ouvert avec une branche%s" % (" sur %s" % host if host else ""))
+        print("aucun lot ouvert à examiner%s" % (" sur %s" % host if host else ""))
         return 0
     for entry in report["results"]:
         print("lot #%-5d %-36s %-14s %s" % (
-            entry["work_item"], entry["branch"], _BRANCH_RESULTS.get(entry["result"],
-                                                                    entry["result"]),
-            entry["detail"]))
+            entry["work_item"], entry["branch"] or "(sans branche)",
+            _BRANCH_RESULTS.get(entry["result"], entry["result"]), entry["detail"]))
     print("%d lot(s) fermé(s)%s" % (report["merged"], " (essai)" if args.dry_run else ""))
     return 0
 

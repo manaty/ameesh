@@ -285,13 +285,15 @@ def _bare(name: str) -> str:
     return name[len("agent:"):] if name.startswith("agent:") else name
 
 
-def orchestrators(cfg, db, listing: list, *, declared=(), canons=None) -> list:
+def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
+                  roles=ORCHESTRATOR_ROLES) -> list:
     """Les orchestrateurs connus : déclarés (`--orchestrators`,
     `AMEESH_ALERT_ORCHESTRATORS`), fiche Agent du canon dont `roles` (ou
-    `role`) nomme un orchestrateur, ou agent qui a confié des lots (délégation
-    ou `work assign`) dans les 30 derniers jours. Seulement des agents du
-    registre."""
+    `role`) nomme un orchestrateur (ou l'un des `roles` donnés), ou agent qui
+    a confié des lots (délégation ou `work assign`) dans les 30 derniers
+    jours. Seulement des agents du registre."""
     names = {row["name"] for row in listing}
+    wanted = {str(r).strip().lower() for r in roles}
     found = {_bare(n) for n in declared or () if n}
     if canons is None:
         from . import canon as canon_mod
@@ -302,10 +304,10 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None) -> list:
     for canon in canons or []:
         for agent in getattr(canon, "agents", None) or []:
             data = getattr(getattr(agent, "fiche", None), "data", None) or {}
-            roles = data.get("roles") or data.get("role") or []
-            if isinstance(roles, str):
-                roles = [roles]
-            if any(str(r).strip().lower() in ORCHESTRATOR_ROLES for r in roles):
+            fiche_roles = data.get("roles") or data.get("role") or []
+            if isinstance(fiche_roles, str):
+                fiche_roles = [fiche_roles]
+            if any(str(r).strip().lower() in wanted for r in fiche_roles):
                 found.add(agent.title)
     try:
         found |= {_bare(n) for n in storage.of(db).operations.assigners(

@@ -6,9 +6,11 @@
 Pour chaque projet (l'équipe `team` de l'agent, à défaut son `chantier`) :
 
 * ses agents, avec leur état (au travail, en pause, au repos, arrêté) et la
-  raison d'une pause ou d'un arrêt, le lot en cours (lot de la session, à
-  défaut le lot ouvert assigné le plus récent), les non-lus, la dépense des
-  24 dernières heures et le mode de paiement (forfait ou au token) ;
+  raison d'une pause ou d'un arrêt, le lot en cours (le dernier lot ouvert
+  cité par l'agent dans son courrier, à défaut le lot de sa session, à
+  défaut le lot ouvert assigné le plus récent ; jamais un lot fusionné ou
+  fermé), les non-lus, la dépense des 24 dernières heures et le mode de
+  paiement (forfait ou au token) ;
 * ses lots ouverts SANS agent pour les faire avancer (non assignés, assignés
   à un agent arrêté ou inconnu du registre) ;
 * un signalement quand le projet a du travail ouvert mais aucun agent actif.
@@ -105,13 +107,21 @@ def _paid_harnesses():
         return None
 
 
+#: candidats au lot en cours, du plus parlant au moins parlant : le dernier lot
+#: cité par l'agent dans son courrier, celui de sa session, son lot assigné le
+#: plus récent (correctif du 2026-10-11)
+_LOT_SOURCES = (("mail_lot", "mail"), ("session_lot", "session"), ("assigned_lot", "assigned"))
+#: un lot dans ces états n'est jamais « en cours »
+_DONE = ("merged", "promoted", "closed")
+
+
 def _lot_of(row: dict) -> dict | None:
-    if row.get("session_lot_id") is not None:
-        return {"id": int(row["session_lot_id"]), "title": row.get("session_lot_title") or "",
-                "state": row.get("session_lot_state"), "source": "session"}
-    if row.get("assigned_lot_id") is not None:
-        return {"id": int(row["assigned_lot_id"]), "title": row.get("assigned_lot_title") or "",
-                "state": row.get("assigned_lot_state"), "source": "assigned"}
+    """Le lot en cours d'un agent : le premier candidat OUVERT de `_LOT_SOURCES`
+    (la lecture ne rend que des lots ouverts ; l'état est revérifié ici)."""
+    for prefix, source in _LOT_SOURCES:
+        if row.get(prefix + "_id") is not None and row.get(prefix + "_state") not in _DONE:
+            return {"id": int(row[prefix + "_id"]), "title": row.get(prefix + "_title") or "",
+                    "state": row.get(prefix + "_state"), "source": source}
     return None
 
 

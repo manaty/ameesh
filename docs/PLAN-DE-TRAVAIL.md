@@ -93,7 +93,7 @@ Ces règles sont dans un seul module, `ameesh.stagnation`, appelé par
 ## Fusion constatée : fermeture automatique
 
 Une fusion se prouve **par le contenu**, jamais par le nom (une branche se
-renomme, une fusion se fait par rebase, squash ou cherry-pick). Quatre voies,
+renomme, une fusion se fait par rebase, squash ou cherry-pick). Cinq voies,
 toutes idempotentes, qui posent le lot en `merged` avec son jalon `merged`
 (commit et auteur de la fusion) :
 
@@ -139,7 +139,18 @@ toutes idempotentes, qui posent le lot en `merged` avec son jalon `merged`
    avance retrouvé dans la cible (ancêtre, patch-id, squash), ou commit de
    fusion qui cite la branche. L'exécuteur fait ce relevé toutes les 5 min
    dans le dossier de travail de l'assigné ; voir EXPLOITATION.md,
-   « Courrier lié aux lots et fusion des branches ».
+   « Courrier lié aux lots et fusion des branches ». Le même relevé ferme un
+   lot, avec ou sans branche, qu'un commit de **fusion** de la cible désigne
+   par une ligne `ameesh-work: <id>` (ou par `#<id>` dans son titre si le
+   dépôt l'active : `git config ameesh.lotRef hash`) ;
+5. **la déclaration** (correctif du 2026-10-11), pour une fusion que rien
+   d'autre ne voit :
+
+   ```
+   ameesh work merged <id> --sha <commit de fusion> [--note …]
+   ```
+
+   tout état ouvert → `merged`, en une fois, jalon `merged` avec le commit.
 
 Un lot absorbé par un autre se clôt par `--superseded-by`.
 

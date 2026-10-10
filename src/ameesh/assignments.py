@@ -17,6 +17,8 @@ sous-utilisation se trompaient et la frise restait vide.
 
 Sans option, rien ne change, hors l'avertissement. Un `--lot` qui ne
 désigne aucun lot connu reste une simple étiquette du fil, comme avant.
+Correctif du 2026-10-11 : pour tout expéditeur, un `--lot` qui désigne un
+lot ouvert (numéro ou étiquette unique) est enregistré par son numéro.
 """
 from __future__ import annotations
 
@@ -33,11 +35,13 @@ class AssignmentError(RuntimeError):
     """Rattachement refusé : rien n'est déposé, le message dit quoi faire."""
 
 
-def is_orchestrator(cfg, db, name: str) -> bool:
+def is_orchestrator(cfg, db, name: str, *, roles=None) -> bool:
     """`name` est-il un orchestrateur ? Déclaré (`AMEESH_ALERT_ORCHESTRATORS`),
     agent qui a confié des lots dans les 30 derniers jours, ou fiche Agent du
     canon dont `roles` nomme un orchestrateur (`sous_utilisation.orchestrators`,
-    lu en dernier : le canon coûte une lecture du dépôt)."""
+    lu en dernier : le canon coûte une lecture du dépôt). `roles` : les rôles
+    du canon qui comptent (défaut : orchestrateur ; `work.CORRECTOR_ROLES`
+    ajoute les agents de conception)."""
     from . import sous_utilisation as su
 
     declared = {su._bare(n) for n in (os.environ.get(ORCHESTRATORS_ENV) or "").split(",")
@@ -51,7 +55,8 @@ def is_orchestrator(cfg, db, name: str) -> bool:
     except Exception:
         pass
     try:
-        return name in su.orchestrators(cfg, db, [{"name": name}], declared=())
+        return name in su.orchestrators(cfg, db, [{"name": name}], declared=(),
+                                        roles=roles or su.ORCHESTRATOR_ROLES)
     except Exception:
         return False
 
@@ -98,7 +103,17 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         if lot is None and has_open:
             return out
         if not is_orchestrator(cfg, db, sender):
-            # un `--lot` d'un autre agent reste une étiquette du fil (inchangé)
+            # un `--lot` d'un autre agent n'assigne rien ; mais une étiquette
+            # qui désigne un lot ouvert est rendue par son numéro, pour tout
+            # expéditeur : le fil, l'activité du lot et le lot en cours
+            # (`ameesh projects`) la lisent. Sinon, étiquette libre (inchangé).
+            if lot is not None:
+                try:
+                    item = resolve_lot(db, lot)
+                except AssignmentError:
+                    item = None
+                if item is not None:
+                    out.update(lot=item, work_item_id=str(item["id"]))
             return out
         out["orchestrator"] = True
     else:
