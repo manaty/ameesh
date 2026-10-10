@@ -5,6 +5,15 @@ Une seule instruction, un seul aller-retour : les agents (état, non-lus, lot
 en cours, dépense 24 h) et les lots ouverts sont agrégés en deux tableaux
 JSON dans une même ligne. Lecture seule, sans migration ; les deux pilotes
 (psql, psycopg) rendent les colonnes `json` déjà décodées.
+
+Lot en cours (correctif du 2026-10-11) : trois candidats, tous OUVERTS — un
+lot fusionné ou fermé n'est jamais « en cours » : le dernier lot cité par
+l'agent dans ses `CITED_SCAN` derniers messages (`mail_lot_*`), le lot de sa
+session (`session_lot_*`), le lot ouvert assigné le plus récent
+(`assigned_lot_*`). Une référence de lot (`work_item_id` d'un message, lot
+de session) est un numéro, ou une étiquette qui désigne UN SEUL lot ouvert
+(issue, fiche du plan, branche, premier mot du titre : même règle que
+`work.open_by_ref`).
 """
 from __future__ import annotations
 
@@ -12,6 +21,17 @@ from .. import interface
 
 #: états de lot terminés (même liste que `work_items` ailleurs)
 _CLOSED = "('merged', 'promoted', 'closed')"
+#: messages de l'agent examinés au plus pour trouver le lot qu'il cite
+CITED_SCAN = 200
+
+
+def _lot_ref(expr: str) -> str:
+    """Le numéro du lot que désigne la référence `expr` (texte) : un numéro
+    (`12`, `#12`), sinon l'étiquette unique d'un lot ouvert (`open_labels`)."""
+    ref = "btrim(%s)" % expr
+    return ("CASE WHEN %s ~ '^#?[0-9]{1,18}$' THEN ltrim(%s, '#')::bigint"
+            " ELSE (SELECT l.id FROM open_labels l WHERE l.ref = lower(%s)) END"
+            % (ref, ref, ref))
 
 _BOARD_SQL = """
 WITH unread AS (
@@ -30,6 +50,17 @@ WITH unread AS (
       FROM work_items
      WHERE assignee IS NOT NULL AND state NOT IN __CLOSED__
      ORDER BY assignee, updated_at DESC, id DESC
+), open_labels AS (
+    -- une étiquette (issue, fiche du plan, branche, premier mot du titre) qui
+    -- désigne UN SEUL lot ouvert ; ambiguë, elle ne désigne rien
+    SELECT k.ref, min(w.id) AS id
+      FROM work_items w
+     CROSS JOIN LATERAL (VALUES (lower(w.issue_ref)), (lower(w.package_id)),
+                                (lower(w.branch)),
+                                (lower(rtrim(split_part(btrim(w.title), ' ', 1), ':')))) k(ref)
+     WHERE w.state NOT IN __CLOSED__ AND coalesce(k.ref, '') <> ''
+     GROUP BY k.ref
+    HAVING count(DISTINCT w.id) = 1
 ), agents AS (
     SELECT r.name, r.chantier, r.team, r.harness, r.host, r.provider, r.credential_mode,
            r.status, r.status_text, r.mode, r.stop_reason, r.responsible,
@@ -43,6 +74,7 @@ WITH unread AS (
            coalesce(u.n, 0)::bigint AS unread,
            sw.id AS session_lot_id, sw.title AS session_lot_title,
            sw.state AS session_lot_state,
+           ml.id AS mail_lot_id, ml.title AS mail_lot_title, ml.state AS mail_lot_state,
            a.id AS assigned_lot_id, a.title AS assigned_lot_title,
            a.state AS assigned_lot_state,
            coalesce(a.n, 0)::bigint AS open_lots,
@@ -52,22 +84,33 @@ WITH unread AS (
            lu.work_item_id AS last_update_lot,
            (SELECT extract(epoch from least(
                        (SELECT min(e.created_at) FROM work_item_events e
-                         WHERE e.work_item_id = coalesce(sw.id, a.id)
+                         WHERE e.work_item_id = coalesce(ml.id, sw.id, a.id)
                            AND (e.actor IN (r.name, 'agent:' || r.name)
                                 OR position(('assigné à ' || r.name) in e.note) = 1)),
                        (SELECT min(m.created_at) FROM agent_mailbox m
                          WHERE m.sender = r.name
-                           AND m.work_item_id = coalesce(sw.id, a.id)::text)))::float8
+                           AND m.work_item_id = coalesce(ml.id, sw.id, a.id)::text)))::float8
            ) AS on_task_since_ts
       FROM agent_registry r
       LEFT JOIN spend_pending p ON p.agent = r.name
       LEFT JOIN unread u ON u.recipient = r.name
       LEFT JOIN spend s ON s.agent = r.name
       LEFT JOIN assigned a ON a.assignee = r.name
+      -- le lot de la session : numéro ou étiquette, s'il est OUVERT
       LEFT JOIN LATERAL (
           SELECT w.id, w.title, w.state FROM work_items w
-           WHERE w.id = CASE WHEN r.session_work_item ~ '^[0-9]{1,18}$'
-                             THEN r.session_work_item::bigint END) sw ON true
+           WHERE w.id = __SESSION_REF__ AND w.state NOT IN __CLOSED__) sw ON true
+      -- le dernier lot OUVERT cité par l'agent dans ses derniers messages
+      -- (hors événements ; index agent_mailbox_sender_idx de 0044)
+      LEFT JOIN LATERAL (
+          SELECT w.id, w.title, w.state
+            FROM (SELECT m.id, m.work_item_id AS ref
+                    FROM agent_mailbox m
+                   WHERE m.sender = r.name AND m.kind <> 'event'
+                   ORDER BY m.id DESC LIMIT __CITED_SCAN__) c
+            JOIN work_items w ON w.id = __MAIL_REF__ AND w.state NOT IN __CLOSED__
+           WHERE coalesce(btrim(c.ref), '') <> ''
+           ORDER BY c.id DESC LIMIT 1) ml ON true
       -- L96 : la dernière avancée de l'agent, lue dans le fil (son dernier
       -- message, index agent_mailbox_sender_idx de 0044)
       LEFT JOIN LATERAL (
@@ -91,7 +134,10 @@ SELECT (SELECT coalesce(json_agg(agents ORDER BY agents.name), '[]'::json) FROM 
            AS agents,
        (SELECT coalesce(json_agg(lots ORDER BY lots.updated_ts DESC, lots.id DESC),
                         '[]'::json) FROM lots) AS lots
-""".replace("__CLOSED__", _CLOSED)
+""".replace("__SESSION_REF__", _lot_ref("r.session_work_item")) \
+  .replace("__MAIL_REF__", _lot_ref("c.ref")) \
+  .replace("__CITED_SCAN__", str(CITED_SCAN)) \
+  .replace("__CLOSED__", _CLOSED)
 
 
 class Projects(interface.Projects):

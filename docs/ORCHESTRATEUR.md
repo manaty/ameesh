@@ -46,8 +46,53 @@ avec ou sans PR : fusion directe, avance rapide, squash. La cible par défaut
 est celle du dépôt (`git config ameesh.target develop` dans le clone si
 l'équipe n'intègre pas sur la branche par défaut), ou `--target`.
 
-Sans branche, fermer à la main : `ameesh work close <id> --superseded-by`
-ou `ameesh work move <id> …`.
+## Fusion sans PR ni branche déclarée
+
+Une équipe qui fusionne en local sur sa branche d'intégration (`--no-ff`,
+sans PR) fait fermer ses lots par l'exécuteur en les **désignant dans le
+commit de fusion** :
+
+```
+git merge --no-ff agent/claude1-veille -m "Merge #93 COMPUTE-IDLE" -m "ameesh-work: 93"
+```
+
+* la ligne `ameesh-work: <id>` désigne le lot, toujours ;
+* `#<id>` dans le titre du commit de fusion le désigne aussi, **si le
+  dépôt l'active** (`git config ameesh.lotRef hash`) — à ne faire que si ces
+  numéros sont des lots ameesh : ailleurs « (#45) » est une PR GitHub ;
+* la cible est celle du dépôt : poser une fois dans le clone `git config
+  ameesh.target origin/develop` (fusions poussées puis récupérées) ou
+  `develop` (fusions faites dans ce clone) quand l'équipe n'intègre pas sur
+  la branche par défaut. Une cible introuvable est une erreur du relevé,
+  visible dans `ameesh work sync-branches`.
+
+Le relevé passe toutes les 5 min dans le dossier de travail de l'assigné :
+le lot doit être assigné à un agent de l'hôte. Le lot fermé reçoit le
+commit de fusion et une note qui dit comment la fusion a été constatée.
+
+À la main, quand le relevé ne peut pas la voir (lot sans assigné, autre
+hôte, commit qui ne le désigne pas) :
+
+```
+ameesh work merged <id> --sha <commit de fusion> [--note "…"]
+```
+
+depuis tout état ouvert, en une fois ; l'acteur est votre identité liée.
+L'alerte `stale_lot` rappelle cette commande pour un lot inactif.
+
+Autres fermetures : `ameesh work close <id> --abandoned | --superseded-by
+<id>`. Un lot passé `promoted` par erreur : `ameesh work move <id> merged
+--correct "raison"` (humains, orchestrateurs et agents de conception
+seulement ; tracé au journal).
+
+## Le lot en cours
+
+`ameesh projects` montre comme lot en cours d'un agent le dernier lot
+**ouvert** qu'il cite dans son courrier (`--lot <id|RÉF>`), sinon le lot de
+sa session, sinon son lot assigné le plus récent ; jamais un lot fusionné ou
+fermé. Demandez aux agents de citer leur lot (`--lot`) dans leurs comptes
+rendus, relectures comprises : une référence (`RÉF` du titre) qui désigne un
+seul lot ouvert est enregistrée par son numéro, quel que soit l'expéditeur.
 
 ## Le courrier « Capacité au repos »
 
