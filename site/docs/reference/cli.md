@@ -30,7 +30,7 @@ on its first line.
 ## Mailbox: `ameesh mail` / `agent-mail`
 
 ```
-agent-mail send <dest|all> <text…> [--from NAME] [--lot ID]
+agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"]
                 [--kind request|reply|notify|event] [--urgent]
                 [--sign --key FILE] [--expires 24h]
 agent-mail list                       # agents, host, lease, unread
@@ -176,6 +176,9 @@ ameesh interrupt <agent> <message…> [--from SENDER]
 | `set … mode=` | `execute` (default: run by a runner under a lease) or `externe` (a human's session, mailbox only, never woken by ameesh) |
 | `notify --once` | a single pass, then exit |
 | `notify --dry-run` | print what would be sent; send nothing, write no state |
+| `notify --take-idle` | auto-take from the improvement backlog: wakeable agent idle without a lot for S seconds (default 1800; 0 disables; L119) |
+| `notify --take-max-per-hour` | auto-takes per sliding hour, whole mesh (default 2) |
+| `notify --take-paid` | let pay-per-token agents take too (after subscription agents; never during `balance_low`) |
 | `notify --test` | a test message on each channel of that human (exit 0 if all pass, 1 otherwise, 2 without a channel) |
 | `restart --wait` | wait up to S seconds for the runner to apply the request |
 | `adopt --account` | look for the session file under this declared account only |
@@ -195,21 +198,64 @@ ameesh fil show <project> [<lot>] [--last N] [--meta]
 ameesh fil tail <project> [<lot>] [--last N] [--meta] [--interval S]   # default 0.5 s
 ```
 
+**Mail linked to lots (L118).** When the sender is an orchestrator (declared
+in `AMEESH_ALERT_ORCHESTRATORS`, `roles: [orchestrateur]` on its canon Agent
+record, or an agent that assigned lots in the last 30 days):
+
+* a message to an agent with **no open lot** prints a warning (stderr and the
+  thread metadata); the message is still delivered;
+* `--lot ID|REF` resolves an open lot (number, `#12`, or a unique reference:
+  `issue_ref`, plan record, branch, first word of the title) and assigns it to
+  the recipient if it has no assignee, belongs to the sender or to a human,
+  through the guarded assignment (a refusal delivers nothing, exit 2). A lot
+  owned by **another agent** is never taken over: warning with the
+  `ameesh work assign` command. An unknown reference stays a free thread label;
+* `--new-lot "title"` (any sender) creates the lot, assigned to the recipient,
+  and attaches the message to it;
+* a single `agent/…` branch quoted in the message is set on the attached lot
+  when it has none.
+
+From any other sender, `--lot` stays a plain thread label. See
+`docs/ORCHESTRATEUR.md`.
+
 ## Work items: `ameesh work`
 
 ```
 ameesh work add --title TITLE [--type bug|evolution] [--source S] [--app APP]
                 [--body BODY] [--issue-ref REF] [--workstream W]
                 [--assignee A] [--budget USD] [--actor ACTOR] [--externe]
+                [--branch agent/…] [--target BRANCH]
 ameesh work list [--state S] [--assignee A] [--limit N] [--json]
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
-ameesh work assign <id> <agent> [--externe] [--actor A]
+ameesh work assign <id> <agent> [--externe] [--actor A] [--branch agent/…] [--target BRANCH]
+ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]
 ameesh work delegate <id> <agent> --within 30m|2h|1d|SECONDS [--actor A]
 ameesh work expire-delegations [--dry-run] [--json]
 ameesh work note <id> <text> [--actor A]
 ameesh work milestone <id> <frozen|verdict> [ok|blocked] [--sha SHA] [--note N] [--actor A]
+ameesh work backlog add --title T --value "expected value" --score 1-100
+                        [--priority 1|2|3] [--source S] [--team T] [--requires CAP …]
+                        [--body B] [--package FICHE] [--json]
+ameesh work backlog list [--all] [--limit N] [--json]
 ```
+
+**Continuous-improvement backlog** (L119, decision 0037). `work backlog add`
+queues a lot of type `improvement` (in `intake`, unassigned); the expected
+value (one sentence) and its score are mandatory, refused otherwise by the CLI
+and by the database. `work backlog list` shows the queue in take order:
+priority, then score, then age (`--all` also lists items already taken and not
+finished). At every pass, `ameesh notify` hands the best-ranked matching item
+(team, required capabilities) to a wakeable agent idle for `--take-idle`
+(30 min), through guarded assignment and a mail tied to the lot — **only if no
+work awaits it** (no open lot, unread mail, pending prompt or open session lot)
+**and no project lot waits for a taker**. The take mail forbids any
+irreversible or production step (deploy, merge, data deletion, production
+server, committed spend): the agent proposes it to a human. Subscription agents
+first; pay-per-token agents only with `--take-paid`, never during
+`balance_low`; nothing while a budget cap is reached or the agent's host is
+under pressure, on low battery or not ready; at most `--take-max-per-hour` (2)
+takes per sliding hour for the whole mesh.
 
 Since v1.4.0, `work add --assignee` and `work assign` give a lot only to an
 agent ameesh can **wake** (known, in `execute` mode, admitted on its host, with
@@ -221,6 +267,18 @@ deadline: if the delegate has not worked on it by then, the lot goes back to
 the delegator (`--actor`, else the current assignee). The runner processes
 deadlines at every pass; `expire-delegations` does it by hand. See
 [Operate agents](../guides/operate-agents.md#guarded-assignment-and-delegation).
+
+**Branch of a lot (L118).** `--branch` records the lot's branch, `--target`
+its target (default: `git config ameesh.target` in the repository, else
+`origin/HEAD`, else `main`/`master`). The runner checks, every
+`AMEESH_BRANCH_SWEEP_INTERVAL` (300 s), the open lots with a branch whose
+assignee is on its host, in the assignee's working directory (read only, no
+`fetch`), and closes as merged the lot whose branch entered its target, with
+or without a PR: tip merged by a merge commit, last commit seen ahead found in
+the target (ancestor, patch-id, squash — also after the branch was deleted),
+or a merge commit of the target quoting the full branch name. A freshly
+created branch, already an ancestor of its target, is not a merge.
+`work sync-branches` runs the same check by hand (`--dry-run`: close nothing).
 
 ## Canon and placement
 

@@ -772,6 +772,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
     try:
         if args.work_command in plan_cli.COMMANDS:
             return plan_cli.run(db, args)
+        if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
+            from . import backlog
+            return backlog.run(db, args)
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
@@ -781,7 +784,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 db, title=args.title, type=args.type, source=args.source, app=args.app,
                 body=args.body or "", issue_ref=args.issue_ref, workstream=args.workstream,
                 assignee=args.assignee, budget_usd=args.budget, actor=args.actor,
-                package=args.package, externe=args.externe, cfg=cfg)
+                package=args.package, externe=args.externe, cfg=cfg,
+                branch=args.branch, branch_target=args.target)
             print("lot #%d créé en %s : %s%s" % (
                 item["id"], item["state"], item["title"],
                 " (plan : %s)" % item["package_id"] if item.get("package_id") else ""))
@@ -789,9 +793,15 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "assign":
             out = work.assign(db, args.id, args.agent, externe=args.externe,
-                              actor=args.actor, cfg=cfg)
-            print("lot #%d assigné à %s (avant : %s)" % (
-                out["item"]["id"], out["item"]["assignee"], out["previous"] or "personne"))
+                              actor=args.actor, cfg=cfg, branch=args.branch,
+                              branch_target=args.target)
+            if out["previous"] == out["item"]["assignee"]:
+                print("lot #%d : branche %s (assigné à %s)" % (
+                    out["item"]["id"], out["item"].get("branch"), out["item"]["assignee"]))
+            else:
+                print("lot #%d assigné à %s (avant : %s)%s" % (
+                    out["item"]["id"], out["item"]["assignee"], out["previous"] or "personne",
+                    " ; branche %s" % out["item"]["branch"] if args.branch else ""))
             _print_assignment(out["check"])
             return 0
         if args.work_command == "delegate":
@@ -912,6 +922,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                          else "remplacé par #%s" % item.get("superseded_by")))
             if item.get("pr_ref"):
                 print("PR       : %s" % item["pr_ref"])
+            if item.get("branch"):
+                print("branche  : %s → %s%s" % (
+                    item["branch"], item.get("branch_target") or "cible par défaut du dépôt",
+                    " (dernier commit vu en avance : %s)" % item["branch_head"][:12]
+                    if item.get("branch_head") else ""))
             if item.get("waiting_for"):
                 print("attend   : %s" % item["waiting_for"]["label"])
             if item.get("delegation"):
@@ -1498,7 +1513,9 @@ def build_parser() -> argparse.ArgumentParser:
     work_sub = p_work.add_subparsers(dest="work_command")
     pw_add = work_sub.add_parser("add")
     pw_add.add_argument("--title", required=True)
-    pw_add.add_argument("--type", default="evolution", choices=["bug", "evolution"])
+    pw_add.add_argument("--type", default="evolution", choices=["bug", "evolution"],
+                        help="un élément de la file d'amélioration passe par "
+                             "`ameesh work backlog add` (L119)")
     pw_add.add_argument("--source", default="")
     pw_add.add_argument("--app", default="")
     pw_add.add_argument("--body", default=None)
@@ -1511,6 +1528,11 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--externe", action="store_true",
                         help="forcer l'attribution à un agent externe qui a un responsable "
                              "humain (L37, 0030)")
+    pw_add.add_argument("--branch", default=None,
+                        help="branche du lot : sa fusion dans la cible ferme le lot (L118)")
+    pw_add.add_argument("--target", default=None,
+                        help="branche cible (défaut : git config ameesh.target du dépôt, "
+                             "sinon origin/HEAD)")
     pw_add.set_defaults(func=cmd_work)
     pw_list = work_sub.add_parser("list")
     pw_list.add_argument("--state", default=None)
@@ -1537,6 +1559,10 @@ def build_parser() -> argparse.ArgumentParser:
     pw_assign.add_argument("--externe", action="store_true",
                            help="forcer l'attribution à un agent externe qui a un "
                                 "responsable humain")
+    pw_assign.add_argument("--branch", default=None,
+                           help="branche du lot (L118) ; possible sur un lot déjà assigné "
+                                "à cet agent")
+    pw_assign.add_argument("--target", default=None, help="branche cible (voir work add)")
     pw_assign.add_argument("--actor", default="")
     pw_assign.set_defaults(func=cmd_work)
     pw_delegate = work_sub.add_parser(
@@ -1579,6 +1605,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_ms.set_defaults(func=cmd_work)
     from . import plan_cli
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)
+    from . import backlog
+    backlog.add_parsers(work_sub, cmd_work)  # file d'amélioration (L119, 0037)
 
     p_cost = sub.add_parser("cost", help="coût des tours et jauges de forfait (L12)")
     cost_sub = p_cost.add_subparsers(dest="cost_command")

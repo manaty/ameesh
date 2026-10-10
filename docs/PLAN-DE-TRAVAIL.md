@@ -93,7 +93,7 @@ Ces règles sont dans un seul module, `ameesh.stagnation`, appelé par
 ## Fusion constatée : fermeture automatique
 
 Une fusion se prouve **par le contenu**, jamais par le nom (une branche se
-renomme, une fusion se fait par rebase, squash ou cherry-pick). Trois voies,
+renomme, une fusion se fait par rebase, squash ou cherry-pick). Quatre voies,
 toutes idempotentes, qui posent le lot en `merged` avec son jalon `merged`
 (commit et auteur de la fusion) :
 
@@ -126,6 +126,20 @@ toutes idempotentes, qui posent le lot en `merged` avec son jalon `merged`
    correspondance, sans casse) ou par une ligne `ameesh-lot: <id>` du corps ;
    une ligne `ameesh-work: <n>` désigne un lot précis (et seulement lui).
    Seuls les lots créés **avant** la fusion sont fermés.
+
+4. **la branche du lot** (L118), avec ou sans PR ni gel :
+
+   ```
+   ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]
+   ```
+
+   un lot qui porte sa branche (`work add|assign --branch`, ou branche
+   `agent/…` citée par un `mail send --lot`) est fermé quand elle entre dans
+   sa cible : pointe entrée par un commit de fusion, dernier commit vu en
+   avance retrouvé dans la cible (ancêtre, patch-id, squash), ou commit de
+   fusion qui cite la branche. L'exécuteur fait ce relevé toutes les 5 min
+   dans le dossier de travail de l'assigné ; voir EXPLOITATION.md,
+   « Courrier lié aux lots et fusion des branches ».
 
 Un lot absorbé par un autre se clôt par `--superseded-by`.
 
@@ -199,3 +213,37 @@ cycle actuel des lots tient dans `roadmap_dev.CORRESPONDANCES`, que le futur
 module « développement » reprendra. Détail, schéma `ameesh-roadmap/1` et
 consigne des orchestrateurs : [EXPLOITATION.md](EXPLOITATION.md), « Feuille
 de route ».
+
+## File d'amélioration continue (L119, décision 0037)
+
+```
+ameesh work backlog add --title T --value "valeur attendue" --score 1-100
+                        [--priority 1|2|3] [--source S] [--team E] [--requires CAP …]
+ameesh work backlog list [--all] [--json]
+```
+
+Un élément de la file est un lot de type `improvement`, en `intake`, sans
+assigné ; sa valeur attendue (une phrase) et son score sont obligatoires : pas
+de travail pour occuper. La file se lit dans l'ordre de prise : priorité, puis
+score, puis ancienneté. Un élément en file n'est ni stagnant ni un « lot sans
+assigné » d'`idle_capacity` : il attend son preneur.
+
+À chaque passage, `ameesh notify` confie l'élément le mieux classé qui
+correspond à l'équipe et aux capacités d'un agent réveillable au repos depuis
+`--take-idle` (30 min), par l'attribution gardée et un courrier lié au lot.
+Garde-fous :
+
+* **seulement si aucun lot ne l'attend** : ni lot ouvert, ni courrier non lu,
+  ni consigne en attente, ni lot de session encore ouvert ; et tant qu'un lot
+  du projet attend un preneur, aucune amélioration n'est prise ;
+* **jamais un geste irréversible ou de production** : le courrier de prise
+  l'interdit (déploiement, fusion, suppression de données, serveur de
+  production, dépense engagée) ; l'agent le propose à un humain ;
+* forfaits d'abord ; le token seulement avec `--take-paid`, jamais pendant
+  `balance_low` ; rien sous un plafond atteint ni sur un hôte sous pression,
+  sur batterie faible ou non prêt ; au plus `--take-max-per-hour` (2) prises
+  par heure glissante pour tout le mesh.
+
+Quand des agents sont au repos et que la file est vide (et qu'aucun lot du
+projet n'attend), l'alerte `backlog_empty` invite l'humain responsable à la
+remplir.

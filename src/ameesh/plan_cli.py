@@ -4,6 +4,7 @@
   ameesh work link <id> <fiche>|--none
   ameesh work close <id> --abandoned | --superseded-by <id> [--note …]
   ameesh work sync-merges --git-dir D [--target origin/main] [--repo R] [--dry-run] [--json]
+  ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]  (L118)
   ameesh work sync-github --repo R [--limit N] [--dry-run] [--json]
   ameesh work project-github --repo R [--dry-run] [--canon-url URL] [--json]
   ameesh work plan <id|fiche> [--debut J] [--fin J] [--livraison J] [--source S]  (L96)
@@ -20,7 +21,8 @@ import sys
 
 from . import plan_git, plan_github, work
 
-COMMANDS = ("link", "close", "sync-merges", "sync-github", "project-github", "plan")
+COMMANDS = ("link", "close", "sync-merges", "sync-branches", "sync-github", "project-github",
+            "plan")
 
 
 def add_parsers(work_sub, func) -> None:
@@ -53,6 +55,18 @@ def add_parsers(work_sub, func) -> None:
     p_merges.add_argument("--dry-run", action="store_true", help="dire sans fermer")
     p_merges.add_argument("--json", action="store_true")
     p_merges.set_defaults(func=func)
+
+    p_branches = work_sub.add_parser(
+        "sync-branches", help="fermer les lots dont la branche est fusionnée dans sa cible, "
+                              "avec ou sans PR (L118 ; fait aussi par l'exécuteur)")
+    p_branches.add_argument("--host", default=None,
+                            help="hôte dont les assignés sont examinés (défaut : cet hôte)")
+    p_branches.add_argument("--all-hosts", action="store_true",
+                            help="tous les assignés (leurs dossiers doivent être ici)")
+    p_branches.add_argument("--dry-run", action="store_true", help="dire sans fermer")
+    p_branches.add_argument("--actor", default="")
+    p_branches.add_argument("--json", action="store_true")
+    p_branches.set_defaults(func=func)
 
     p_sync = work_sub.add_parser(
         "sync-github", help="fermer les lots dont la PR est fusionnée (lecture seule de GitHub)")
@@ -107,6 +121,8 @@ def run(db, args: argparse.Namespace) -> int:
         return 0
     if command == "sync-merges":
         return _sync_merges(db, args)
+    if command == "sync-branches":
+        return _sync_branches(db, args)
     try:
         return _github(db, args)
     except plan_github.GithubError as exc:
@@ -130,6 +146,31 @@ def _plan(db, args: argparse.Namespace) -> int:
         label, row.get("planned_start") or "—", row.get("planned_end") or "—",
         row.get("planned_delivery") or "—",
         " (source : %s)" % row["planned_source"] if row.get("planned_source") else ""))
+    return 0
+
+
+#: libellés des issues d'un relevé des branches
+_BRANCH_RESULTS = {"merged": "FERMÉ (livré)", "already": "déjà livré", "refused": "lot fermé",
+                   "would-merge": "serait fermé", "open": "ouvert", "skipped": "ignoré",
+                   "no-repo": "sans dépôt", "no-target": "sans cible", "error": "erreur"}
+
+
+def _sync_branches(db, args: argparse.Namespace) -> int:
+    """L118 : la fusion d'une branche, avec ou sans PR."""
+    host = None if args.all_hosts else (args.host or db.cfg.host)
+    report = plan_git.sync_branches(db, host=host, dry_run=args.dry_run, actor=args.actor)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    if not report["results"]:
+        print("aucun lot ouvert avec une branche%s" % (" sur %s" % host if host else ""))
+        return 0
+    for entry in report["results"]:
+        print("lot #%-5d %-36s %-14s %s" % (
+            entry["work_item"], entry["branch"], _BRANCH_RESULTS.get(entry["result"],
+                                                                    entry["result"]),
+            entry["detail"]))
+    print("%d lot(s) fermé(s)%s" % (report["merged"], " (essai)" if args.dry_run else ""))
     return 0
 
 

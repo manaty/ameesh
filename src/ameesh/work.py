@@ -82,9 +82,13 @@ def add(
     package: str | None = None,
     externe: bool = False,
     cfg=None,
+    branch: str | None = None,
+    branch_target: str | None = None,
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
-    (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError)."""
+    (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
+    L118 : `branch` (et `branch_target`) nomment la branche du lot, dont la
+    fusion le fermera (`plan_git.sync_branches`)."""
     if type not in ("bug", "evolution"):
         raise WorkError("type inconnu : %r (bug ou evolution)" % type)
     if not (title or "").strip():
@@ -95,12 +99,62 @@ def add(
     elif externe:
         raise WorkError("--externe sans assigné : rien à forcer")
     fiche = _package(db, package) if package else None
+    branch, branch_target = _branch_args(branch, branch_target)
     return storage.of(db).work.add(
         type=type, source=source, app=app, title=title.strip(), body=body,
         issue_ref=issue_ref, workstream=workstream, assignee=assignee,
         budget_usd=budget_usd, note="création" + (" (plan : %s)" % package if package else ""),
         actor=actor, package_id=fiche["id"] if fiche else None,
-        package_parent=fiche.get("parent") if fiche else None)
+        package_parent=fiche.get("parent") if fiche else None,
+        branch=branch, branch_target=branch_target)
+
+
+# --------------------------------------------------------------------------
+# branche d'un lot (L118)
+# --------------------------------------------------------------------------
+
+def _branch_args(branch, target) -> tuple:
+    """(branche, cible) validées, ou (None, None) ; une cible sans branche
+    est refusée."""
+    from . import plan_git
+
+    branch = (branch or "").strip() or None
+    target = (target or "").strip() or None
+    if target and not branch:
+        raise WorkError("une cible sans branche : précisez aussi --branch")
+    try:
+        return (plan_git.check_ref(branch, "branche") if branch else None,
+                plan_git.check_ref(target, "cible") if target else None)
+    except ValueError as exc:
+        raise WorkError(str(exc)) from exc
+
+
+def set_branch(db: Db, item_id: int, branch: str, target: str | None = None, *,
+               actor: str = "", source: str = "") -> dict:
+    """L118 : la branche (et la cible) d'un lot ouvert ; journalisée. Rend
+    le lot. Une branche identique (et la même cible) ne réécrit rien."""
+    branch, target = _branch_args(branch, target)
+    if not branch:
+        raise WorkError("branche vide")
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s introuvable" % item_id)
+    if item.get("branch") == branch and (target is None or item.get("branch_target") == target):
+        return item
+    target = target if target is not None else (
+        item.get("branch_target") if item.get("branch") == branch else None)
+    note = "branche %s%s%s (avant : %s)" % (
+        branch, " vers %s" % target if target else "",
+        " — %s" % source if source else "", item.get("branch") or "aucune")
+    row = storage.of(db).work.set_branch(item_id, branch, target, note=note, actor=actor)
+    if row is None:
+        raise WorkError("lot %s déjà %s : branche non posée" % (item_id, item["state"]))
+    return row
+
+
+def open_lots(db: Db, assignee: str) -> list[dict]:
+    """L118 : les lots ouverts d'un assigné (ni livrés, ni fermés)."""
+    return storage.of(db).work.open_for(assignee)
 
 
 # --------------------------------------------------------------------------
@@ -230,18 +284,26 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
 
 
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",
-           cfg=None) -> dict:
+           cfg=None, branch: str | None = None, branch_target: str | None = None) -> dict:
     """Réassigne un lot ouvert (L37, `ameesh work assign`), sous la même garde
     que la création (`check_assignee`). Une ligne de journal dit l'ancien et
-    le nouvel assigné. Rend `{item, check, previous}`."""
+    le nouvel assigné. Rend `{item, check, previous}`.
+
+    L118 : `branch` (et `branch_target`) posent aussi la branche du lot ; avec
+    une branche, un lot déjà assigné à cet agent n'est pas une erreur (seule
+    la branche est posée)."""
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s introuvable" % item_id)
     if item["state"] in MERGED_STATES or item["state"] == "closed":
         raise WorkError("lot %s déjà %s : rien à réassigner" % (item_id, item["state"]))
     previous = item.get("assignee")
+    _branch_args(branch, branch_target)
     check = check_assignee(db, assignee, externe=externe, cfg=cfg)
     if previous == check["assignee"]:
+        if branch:
+            row = set_branch(db, item_id, branch, branch_target, actor=actor)
+            return {"item": row, "check": check, "previous": previous}
         raise WorkError("lot %s déjà assigné à %s" % (item_id, previous))
     note = "assigné à %s%s (avant : %s)%s" % (
         check["assignee"],
@@ -254,6 +316,8 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
                                      actor=actor)
     if row is None:
         raise WorkError("lot %s modifié entre-temps : réessayez" % item_id)
+    if branch:
+        row = set_branch(db, item_id, branch, branch_target, actor=actor)
     return {"item": row, "check": check, "previous": previous}
 
 

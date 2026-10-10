@@ -161,6 +161,7 @@ pushes them by default:
 | `idle_capacity` | wakeable agents idle without a lot for more than `--idle-capacity` (30 min) while lots wait unassigned, mail waits at a busy agent, or pay-per-token agents work while subscription agents sleep; suggests dispatching or waking the orchestrator |
 | `orchestrator_held` | an orchestrator (`--orchestrators`, `roles: [orchestrateur]` in its canon fiche, or an agent that handed out lots) is held by `ameesh attach` for more than `--orchestrator-held` (30 min) with unread mail |
 | `host_underused` | a host stays almost idle for `--host-underused` (1 h: load per CPU below 0.25, under one turn on average) while another host is under pressure or agents wait elsewhere; a suggestion only, nothing is moved |
+| `backlog_empty` | wakeable agents idle without a lot for more than `--backlog-empty` (30 min), the improvement backlog has nothing left to take and no project lot waits; asks to fill it (`ameesh work backlog add`, L119) |
 | `balance_low` | a pay-per-token provider's runway at the real spend rate (balance readings over 6 h, top-ups ignored) falls under `--balance-hours` (48 h), or its balance under `--balance-min` USD (20); urgent under 12 h or 5 USD |
 
 A threshold of 0 disables the matching alert.

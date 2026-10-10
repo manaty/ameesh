@@ -84,6 +84,12 @@ La proposition passe par une PR sur le canon (branche `auditeur/<sujet>`, sans
 fusion) ou par une demande d'approbation (`ameesh action propose`). Elle dit
 le constat, les chiffres, la règle proposée et son inverse.
 
+Un constat qui appelle du travail plutôt qu'une règle (test instable, dette,
+alerte qui revient) va dans la file d'amélioration ([0037](design/decisions/0037-jamais-a-l-arret.md)) :
+`ameesh work backlog add --title … --value "valeur attendue" --score N
+--source "auditeur"`. Les agents au repos le prendront ; jamais un élément
+qui demanderait un geste irréversible ou de production.
+
 ### Jamais
 
 `ameesh approve`, une fusion, une écriture sur `main`, la lecture ou la copie

@@ -57,6 +57,7 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_BALANCE_INTERVAL` | `balance_interval` | 900 s | provider balance reading by the runner (0 = never; only with a key) |
 | `AMEESH_DEEPSEEK_API_BASE` | — | the provider's API | base URL of the balance reading |
 | `AMEESH_RESOURCE_INTERVAL` | `resource_interval` | 60 s | host resource reading by the runner (0 = none; see `ameesh hosts`) |
+| `AMEESH_BRANCH_SWEEP_INTERVAL` | `branch_sweep_interval` | 300 s | runner check of lot branches: a lot whose branch is merged into its target is closed (L118; 0 = none) |
 | `AMEESH_RELOCATE` | `relocate` | off | move an agent of a host under pressure to another admitted host, between two turns |
 | `AMEESH_SHARED_SESSIONS` | `shared_sessions` | off | session storage shared between hosts: a move keeps the native session instead of rotating with a summary |
 | `AMEESH_CONTAINER_RUNTIME` | `container_runtime` | `auto` | containers attached to a turn: `auto` (docker, then podman), a runtime name, or `none` |
@@ -66,6 +67,8 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_VISIBILITY_TTL`, `AMEESH_VISIBILITY_TIMEOUT` | `visibility_ttl`, `visibility_timeout` | 300 s, 10 s | cache duration and timeout of the visibility check |
 | `AMEESH_ALERT_LONG_TURN`, `_IDLE_MAIL`, `_DEAD_GRACE`, `_SESSION_TOKENS`, `_STALE_LOT`, `_ORPHAN_LOT`, `_DELEGATION_GRACE`, `_INTERVAL` | — | see `ameesh alerts` | alert thresholds (also used by `ameesh notify`) |
 | `AMEESH_ALERT_PLAN_TAIL`, `_PLAN_USED`, `_PLAN_PACE_GAP`, `_IDLE_CAPACITY`, `_ORCHESTRATOR_HELD`, `_ORCHESTRATORS`, `_HOST_UNDERUSED`, `_HOST_UNDERUSED_LOAD`, `_HOST_UNDERUSED_TURNS` | 86400, 50, 25, 1800, 1800, —, 3600, 0.25, 1 | see `ameesh alerts` | underuse alert thresholds (L94); 0 disables |
+| `AMEESH_ALERT_BACKLOG_EMPTY` | 1800 | see `ameesh alerts` | `backlog_empty`: idle agents and an empty improvement backlog (L119); 0 disables |
+| `AMEESH_TAKE_IDLE`, `AMEESH_TAKE_MAX_PER_HOUR`, `AMEESH_TAKE_PAID` | 1800, 2, — | see `ameesh notify` | auto-take from the improvement backlog by idle agents (L119, decision 0037); `AMEESH_TAKE_IDLE=0` disables, `AMEESH_TAKE_PAID=1` lets pay-per-token agents take |
 | `AMEESH_ALERT_BALANCE_HOURS`, `_BALANCE_MIN`, `_BALANCE_WINDOW` | 48, 20, 21600 | see `ameesh alerts` | `balance_low`: runway at the real spend rate (from balance readings), USD floor, averaging window (L94) |
 | `AMEESH_PRICES` | — | built-in defaults | price table (JSON) |
 | `AMEESH_<HARNESS>_BIN`, `AMEESH_BIN_DIR` | — | `PATH` | harness binaries (`CLAUDE`, `CODEX`, `DSH`) |

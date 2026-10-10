@@ -205,3 +205,249 @@ def sync_merges(db, repo_dir: str, *, target: str = DEFAULT_TARGET, dry_run: boo
     return {"git_dir": repo_dir, "target": target, "dry_run": bool(dry_run),
             "results": results,
             "merged": sum(1 for r in results if r["result"] == "merged")}
+
+
+# --------------------------------------------------------------------------
+# L118 : fusion d'une BRANCHE constatée, avec ou sans PR
+# --------------------------------------------------------------------------
+#
+# Une équipe qui fusionne directement sur sa branche cible ne passe ni par
+# une PR (`sync-github`) ni par un gel déclaré (`sync-merges`) : ses lots
+# restaient ouverts après la fusion. Un lot peut porter sa branche
+# (`work add|assign --branch`, ou déduite d'un message `mail send --lot` qui
+# cite une branche `agent/…`) ; le relevé périodique de l'exécuteur
+# (`sync_branches`) la cherche dans le dépôt de l'assigné — son dossier de
+# travail au registre, posé par `policy.work_dirs`/`work_roots` du canon
+# (L35) : tous les worktrees d'un dépôt partagent ses références.
+#
+# Une branche tout juste créée depuis sa cible en est déjà « ancêtre » : ce
+# n'est pas une fusion. La fusion est constatée, dans cet ordre :
+#
+# 1. la pointe de la branche est ancêtre de la cible SANS être sur sa chaîne
+#    de premiers parents (un commit de fusion l'y a fait entrer) ;
+# 2. la pointe est sur cette chaîne (avance rapide, ou branche sans travail) :
+#    le dernier commit vu EN AVANCE par un relevé précédent (`branch_head`)
+#    est entré dans la cible (ancêtre, patch-id ou squash : `probe`) ;
+# 3. branche en avance : son contenu est entré par patch-id ou squash
+#    (`probe`) ;
+# 4. branche supprimée : le dernier commit vu (`probe`), sinon un commit de
+#    fusion de la cible dont le message cite la branche (nom entier).
+#
+# Lecture seule du dépôt, aucun `fetch`. La cible : celle du lot, sinon
+# `git config ameesh.target` du dépôt, sinon `origin/HEAD`, sinon main.
+
+#: une branche citée dans un message (`agent/…`)
+CITED_BRANCH_RE = re.compile(r"(?<![\w./-])(agent/[A-Za-z0-9._/-]*[A-Za-z0-9_-])")
+#: nom de référence admis pour une branche ou une cible
+_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+#: caractères qui prolongent un nom de branche (citation à nom entier)
+_REF_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._/-")
+#: commits de fusion lus au plus pour une citation
+MAX_MERGE_MENTIONS = 200
+#: lots examinés au plus par relevé
+MAX_BRANCH_LOTS = 1000
+#: clé de configuration git du dépôt qui nomme la cible par défaut
+TARGET_GIT_KEY = "ameesh.target"
+DEFAULT_TARGETS = ("origin/main", "main", "origin/master", "master")
+
+
+def check_ref(name: str, what: str = "branche") -> str:
+    """Un nom de branche (ou de cible) admissible, sinon ValueError."""
+    text = (name or "").strip()
+    if not _REF_RE.match(text) or ".." in text or "//" in text or text.endswith(
+            ("/", ".", ".lock")) or "@{" in text:
+        raise ValueError("%s invalide : %r (lettres, chiffres, . _ / -)" % (what, name))
+    return text
+
+
+def cited_branch(text: str) -> str | None:
+    """La branche `agent/…` citée par un message, si elle est UNIQUE (deux
+    branches citées : on ne devine pas)."""
+    found = {m.rstrip(".") for m in CITED_BRANCH_RE.findall(text or "")}
+    found = {b for b in found if b != "agent/"}
+    return next(iter(found)) if len(found) == 1 else None
+
+
+def default_target(repo: str) -> str | None:
+    """La cible par défaut du dépôt : `git config ameesh.target`, sinon la
+    branche par défaut du dépôt distant (`origin/HEAD`), sinon main/master."""
+    configured = _out(repo, "config", "--get", TARGET_GIT_KEY)
+    if configured and _commit(repo, configured):
+        return configured
+    head = _out(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    if head and _commit(repo, head):
+        return head
+    for candidate in DEFAULT_TARGETS:
+        if _commit(repo, candidate):
+            return candidate
+    return None
+
+
+def _tip(repo: str, branch: str) -> str | None:
+    for ref in ("refs/heads/" + branch, "refs/remotes/origin/" + branch):
+        found = _commit(repo, ref)
+        if found:
+            return found
+    return None
+
+
+def _on_first_parent(repo: str, commit: str, head: str) -> bool:
+    chain = _out(repo, "rev-list", "--first-parent", "--max-count=%d" % MAX_TARGET_COMMITS,
+                 head)
+    return bool(chain) and commit in chain.split()
+
+
+def _mentions(message: str, branch: str) -> bool:
+    start = message.find(branch)
+    while start >= 0:
+        end = start + len(branch)
+        before = message[start - 1] if start else " "
+        after = message[end] if end < len(message) else " "
+        if before not in _REF_CHARS and (after not in _REF_CHARS or (
+                after == "." and (end + 1 >= len(message)
+                                  or message[end + 1] not in _REF_CHARS))):
+            return True
+        start = message.find(branch, start + 1)
+    return False
+
+
+def merge_mentioning(repo: str, branch: str, head: str,
+                     since_ts: float | None = None) -> str | None:
+    """Le plus récent commit de FUSION de `head` dont le message cite la
+    branche (nom entier : `agent/x` ne cite pas `agent/x-2`), ou None. Un
+    commit ordinaire qui cite la branche (compte rendu de revue) ne compte pas."""
+    args = ["log", "--merges", "--format=%H%x00%B%x1e", "-F", "--grep=%s" % branch,
+            "--max-count=%d" % MAX_MERGE_MENTIONS]
+    if since_ts:
+        args.append("--since=@%d" % int(since_ts))
+    out = _out(repo, *args, head)
+    for record in (out or "").split("\x1e"):
+        sha, _sep, message = record.strip().partition("\x00")
+        if sha and _mentions(message, branch):
+            return sha
+    return None
+
+
+def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None = None,
+                 since_ts: float | None = None) -> dict:
+    """La branche est-elle entrée dans `target` ? Rend `{merged, how, ref, tip,
+    ahead, detail}` ; `ahead` : la pointe a du travail absent de la cible
+    (l'appelant la retient comme `branch_head`)."""
+    head = _commit(repo, target)
+    if head is None:
+        raise MergeProbeError("cible %r introuvable dans %s" % (target, repo))
+    tip = _tip(repo, branch)
+    out = {"merged": False, "how": None, "ref": None, "tip": tip, "ahead": False}
+
+    def seen() -> dict | None:
+        if not seen_head:
+            return None
+        found = probe(repo, seen_head, target)
+        if found["merged"]:
+            return dict(out, merged=True, how="vu-" + found["how"], ref=found["ref"],
+                        detail="dernier commit vu en avance (%s) : %s"
+                               % (seen_head[:12], found["detail"]))
+        return None
+
+    def mention(why: str) -> dict:
+        sha = merge_mentioning(repo, branch, head, since_ts)
+        if sha:
+            return dict(out, merged=True, how="message", ref=sha,
+                        detail="commit de fusion %s de %s qui cite %s" % (sha[:12], target,
+                                                                          branch))
+        return dict(out, detail=why)
+
+    if tip is None:
+        return seen() or mention("branche %s introuvable (ni locale ni origin/)" % branch)
+    if _git(repo, "merge-base", "--is-ancestor", tip, head).returncode == 0:
+        if not _on_first_parent(repo, tip, head):
+            return dict(out, merged=True, how="ancestor", ref=tip,
+                        detail="%s (%s) entrée dans %s par un commit de fusion"
+                               % (branch, tip[:12], target))
+        return seen() or mention("%s n'a aucun travail propre : sa pointe %s est sur la "
+                                 "ligne de %s" % (branch, tip[:12], target))
+    out["ahead"] = True
+    found = probe(repo, tip, target)
+    if found["merged"]:
+        return dict(out, merged=True, how=found["how"], ref=found["ref"],
+                    detail="%s : %s" % (branch, found["detail"]))
+    return dict(out, detail="%s en avance sur %s (%s)" % (branch, target, tip[:12]))
+
+
+def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = False,
+                  actor: str = "", limit: int = MAX_BRANCH_LOTS) -> dict:
+    """L118 : ferme les lots ouverts dont la branche est entrée dans sa cible.
+
+    Le dépôt d'un lot est le dossier de travail de son assigné au registre ;
+    avec `host`, seuls les assignés de cet hôte sont examinés (les dossiers
+    des autres hôtes n'y sont pas), avec `agents`, seulement ceux-là. La
+    fermeture passe par `work.close_merged` (idempotente, jamais de
+    réouverture) et s'écrit dans le fil du lot. Rend le compte rendu."""
+    import os
+
+    from . import fil, registry
+
+    st = storage.of(db)
+    results: list[dict] = []
+    for row in st.work.open_with_branch(limit):
+        assignee = (row.get("assignee") or "").strip()
+        entry = {"work_item": int(row["id"]), "branch": row["branch"],
+                 "target": row.get("branch_target"), "assignee": assignee or None,
+                 "result": "skipped", "how": None, "ref": None, "detail": ""}
+        if agents is not None and assignee not in agents:
+            continue
+        reg = registry.get(db, assignee) if assignee and ":" not in assignee else None
+        if reg is None:
+            if host is None:
+                entry["detail"] = "aucun agent assigné : dépôt inconnu"
+                results.append(entry)
+            continue
+        if host is not None and (reg.get("host") or "") != host:
+            continue
+        repo = os.path.expanduser(reg.get("cwd") or "")
+        if not repo or not os.path.isdir(repo):
+            entry.update(result="no-repo", detail="dossier de travail de %s absent (%s)"
+                         % (assignee, repo or "non déclaré"))
+            results.append(entry)
+            continue
+        try:
+            target = row.get("branch_target") or default_target(repo)
+            if not target:
+                entry.update(result="no-target", detail="aucune cible : `git config %s "
+                             "<branche>` dans %s, ou --target" % (TARGET_GIT_KEY, repo))
+                results.append(entry)
+                continue
+            entry["target"] = target
+            found = branch_probe(repo, row["branch"], target, seen_head=row.get("branch_head"),
+                                 since_ts=row.get("created_ts"))
+        except (MergeProbeError, GitError) as exc:
+            entry.update(result="error", detail=str(exc))
+            results.append(entry)
+            continue
+        entry.update(how=found["how"], ref=found["ref"], detail=found["detail"], result="open",
+                     repo=repo)
+        if not found["merged"]:
+            if found["ahead"] and found["tip"] and found["tip"] != row.get("branch_head") \
+                    and not dry_run:
+                st.work.set_branch_head(int(row["id"]), row["branch"], found["tip"])
+            results.append(entry)
+            continue
+        if dry_run:
+            entry["result"] = "would-merge"
+            results.append(entry)
+            continue
+        done = work_mod.close_merged(
+            db, int(row["id"]), sha=found["ref"] or "", actor=actor or "git:%s" % target,
+            source="branche %s (%s)" % (row["branch"], found["how"]))
+        entry.update(result=done["result"], detail="%s — %s" % (found["detail"], done["detail"]))
+        if done["result"] == "merged":
+            text = ("Lot #%d « %s » livré : la branche %s est entrée dans %s (%s, commit %s). "
+                    "Fermé par le relevé des branches de l'exécuteur."
+                    % (int(row["id"]), row.get("title") or "", row["branch"], target,
+                       found["how"], (found["ref"] or "?")[:12]))
+            fil.record(db.cfg, db, sender=work_mod.SYSTEM_SENDER, recipients=[assignee],
+                       text=text, project=fil.project_for(db.cfg, fil.agent_project(reg)),
+                       lot=str(row["id"]), meta={"kind": "event"})
+        results.append(entry)
+    return {"host": host, "dry_run": bool(dry_run), "results": results,
+            "merged": sum(1 for r in results if r["result"] == "merged")}
