@@ -40,7 +40,7 @@ SIGNATURES = {
     "agent_registry": {"public_key"},
     "agent_mesh_overview": {"public_key"},
     "authenticators": {"public_key", "credential_id"},
-    # exécuteurs médiés (voie B, 0048 et 0049)
+    # exécuteurs médiés (voie B, 0050 et 0051)
     "executor_tokens": {"token_sha256"},
     "executor_invitations": {"code_sha256"},
     "executor_assertion_jti": {"jti"},

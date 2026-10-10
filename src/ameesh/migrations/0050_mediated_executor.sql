@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
--- 0048_mediated_executor — le serveur de l'API d'exécuteur médiée
+-- 0050_mediated_executor — le serveur de l'API d'exécuteur médiée
 -- (`/api/exec/v1`, lot L108 ; contrat L107, `docs/EXECUTEUR-MEDIEE.md`).
 --
 -- Trois tables, écrites par le serveur seul (jamais par un exécuteur en
@@ -22,8 +22,8 @@
 --   (opération, agent, statut, code d'erreur, bail perdu, rejeu). Jamais
 --   d'argument ni de corps : rien d'autrui, aucun secret.
 --
--- Numérotation de la voie B : 0048 (L108), 0049 (L110), 0050 (L111), après
--- 0043 à 0046 (L95, L96, L73, L105) et 0047 (L106), lots de la 1.6.0.
+-- Numérotation de la voie B : 0050 (L108), 0051 (L110), 0052 (L111), après
+-- 0043 à 0047 (lots de la 1.6.0), 0048 (L63) et 0049 (réservé à L119).
 
 create table if not exists exec_idempotency (
     executor_id    text not null,

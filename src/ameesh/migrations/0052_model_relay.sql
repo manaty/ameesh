@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
--- 0050_relais_de_modele — le grand livre distingue la mesure du relais de
+-- 0052_model_relay — le grand livre distingue la mesure du relais de
 -- modèle de la déclaration d'un appareil (lot L111, étude de l'exécuteur
 -- médié §5).
 --
@@ -18,8 +18,8 @@
 -- `executor`, `lease_owner`, `lease_epoch` : le bail sous lequel la requête
 -- relayée a été faite (tirés du jeton de session) ; NULL hors relais.
 --
--- Numérotation de la voie B : 0048 (L108), 0049 (L110), 0050 (L111), après
--- 0043 à 0047 (lots de la 1.6.0).
+-- Numérotation de la voie B : 0050 (L108), 0051 (L110), 0052 (L111), après
+-- 0043 à 0047 (lots de la 1.6.0), 0048 (L63) et 0049 (réservé à L119).
 
 alter table turn_costs add column if not exists source text not null default 'harness';
 

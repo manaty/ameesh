@@ -1217,13 +1217,14 @@ Retour arrière : l'ancien code, sans autre geste.
 La 1.7.0 apporte la voie B, l'exécuteur médié (L107 à L115,
 [EXECUTEUR-MEDIEE.md](EXECUTEUR-MEDIEE.md)) : un appareil prêté, sans accès
 à la base, fait tourner des agents en parlant au serveur du mesh par
-`/api/exec/v1`. Trois migrations suivent 0047 :
+`/api/exec/v1`. Trois migrations suivent 0048 (L63, `pid_started_at`) ; 0049
+est réservé à L119 :
 
 | Migration | Lot | Contenu |
 |---|---|---|
-| **0048** `mediated_executor` | L108 | tables `exec_idempotency`, `exec_host_availability`, `exec_audit` |
-| **0049** `executor_identity` | L110 | tables `executor_invitations`, `executors`, `executor_tokens`, `executor_assertion_jti`, `executor_events` |
-| **0050** `model_relay` | L111 | `turn_costs.source` (`harness` par défaut), `executor`, `lease_owner`, `lease_epoch` |
+| **0050** `mediated_executor` | L108 | tables `exec_idempotency`, `exec_host_availability`, `exec_audit` |
+| **0051** `executor_identity` | L110 | tables `executor_invitations`, `executors`, `executor_tokens`, `executor_assertion_jti`, `executor_events` |
+| **0052** `model_relay` | L111 | `turn_costs.source` (`harness` par défaut), `executor`, `lease_owner`, `lease_epoch` |
 
 **Rien ne change pour un hôte classique.** Les tables sont neuves, la
 colonne `source` a un défaut, et un exécuteur 1.6.x tourne sans erreur sur
@@ -1239,7 +1240,7 @@ appareil (`ameesh host enroll`) sont des gestes de déploiement à part, chacun
 soumis au propriétaire.
 
 Retour arrière : l'ancien code. La base reste migrée ; l'ancien code ignore
-les tables de 0048 et 0049, et la colonne `source` de 0050 (il compte alors
+les tables de 0050 et 0051, et la colonne `source` de 0052 (il compte alors
 aussi les lignes `device`, qui n'existent que si un appareil a été enrôlé).
 
 ---
