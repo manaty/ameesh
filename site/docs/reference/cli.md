@@ -22,6 +22,11 @@ example `ameesh alerts --json | head`), the command stops quietly, without a
 traceback, with exit code **141** (128 + `SIGPIPE`, as the shell reports it).
 A broken pipe anywhere else (a harness, a socket) is still an error.
 
+**Version.** `ameesh --version` (or `ameesh version`) prints the installed
+package version, read with `importlib.metadata` (from a clone without
+installation: the `pyproject.toml` next to `src/`). `ameesh doctor` prints it
+on its first line.
+
 ## Mailbox: `ameesh mail` / `agent-mail`
 
 ```
@@ -109,6 +114,7 @@ end of a running turn; `--ttl` sets the lease duration.
 
 ```
 ameesh list [--json]                       # every agent (--json: schema ameesh-agent/1)
+ameesh projects [--project P] [--all] [--json]  # projects in progress: who works on what (ameesh-projects/1)
 ameesh show <agent> [--json]               # one agent
 ameesh hosts [HOST] [--history N] [--json] # host resources: last reading, limits, short history
 ameesh decisions [--for human:ID] [--json] # what waits for a human
@@ -124,8 +130,14 @@ ameesh cost balance [--provider deepseek] [--record] [--since SINCE] [--json]
 `--since` takes a duration (`16h`, `2d`) or an ISO date. `cost balance
 --record` reads the balance now (read-only, free).
 
-`ameesh list` shows a **LOTS** column (open lots assigned to each agent) and
-prefixes the status of an external agent with `ext/`. `ameesh hosts` shows,
+`ameesh list` shows a **PROJECT** column (the agent's team, else its
+chantier) and groups agents by project, a **LOTS** column (open lots assigned
+to each agent) and prefixes the status of an external agent with `ext/`.
+`ameesh projects` shows, per project, each agent's state (working, paused,
+idle, stopped, with the reason), its current lot, unread mail, 24 h spend and
+whether it runs on a plan or pays per token, plus the open lots nobody can
+move forward; it flags projects with open work and no active agent. The same
+view heads `ameesh progress` (text, HTML page, `projects` key in JSON). `ameesh hosts` shows,
 per host, the last resource reading published by its runner (available memory,
 swap used, 1-minute load, free disk of the working directory, turns in
 progress), the effective limits and where each comes from, and the short

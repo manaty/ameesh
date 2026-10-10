@@ -1,5 +1,24 @@
 # Journal de la conception
 
+## 2026-10-10 (répartition des comptes)
+* **Amendement** de [0034](decisions/0034-consommer-d-abord-ce-qui-expire.md), accord du propriétaire : `ameesh accounts list` montrait le compte Claude primaire à 35 % de sa semaine (rythme 55 %) et les deux autres jamais utilisés, leurs forfaits hebdomadaires perdus. Le primaire, toujours en fenêtre ouverte, gagnait toujours le choix par échéance. Désormais, une nouvelle session va au compte le plus en retard sur son rythme (plus petit `utilisé / rythme` sur sa fenêtre la plus contraignante ; sans relevé : 0 %, en premier) ; l'échéance et l'ordre déclaré départagent. Forçage, continuité, pause et Codex inchangés.
+* **L117** (1.6.2) : la règle, sa raison dans le journal de l'exécuteur et dans `ameesh accounts list` (« le plus en retard sur son rythme ; avant : … »).
+* **1.6.2** : `ameesh --version` / `ameesh version` (version du paquet, `importlib.metadata`, repli sur `pyproject.toml` dans un arbre source) ; `ameesh doctor` l'affiche en première ligne.
+
+## 2026-10-10 (auditeur interne)
+* **Décision** : [auditeur interne](decisions/0036-auditeur-interne.md). Demande du propriétaire : « qu'ameesh ait un auditeur interne qui régulièrement, par exemple une fois par heure, regarde que tout se passe bien, que l'utilisation des ressources est optimale, et adapte les règles si besoin ». Persona `auditeur` (DeepSeek `deepseek-flash`), marge d'action en deux niveaux, consigne [AUDITEUR.md](../AUDITEUR.md). Fiche et placement proposés au canon manaty, mise en service après leur fusion. À ouvrir : un lot pour router les alertes urgentes vers un agent dans `ameesh notify`.
+
+## 2026-10-10 (sous-utilisation)
+* **L94** : la sous-utilisation alerte autant que la surcharge (« la surconso comme la sous-conso devrait alerter ameesh ») — `plan_underused` (forfait perdu à la remise à zéro, pertes au sens de L74), `idle_capacity` (agents réveillables au repos pendant que du travail attend, ou que le token travaille), `orchestrator_held` (orchestrateur tenu par `attach` avec du courrier, prolonge 0030), `host_underused` (suggestion de déplacement, 0028) ; poussées par `ameesh notify`. Ajout validé par le propriétaire : `balance_low`, autonomie d'un fournisseur payé au token au rythme réel des relevés de solde (48 h, 20 USD ; urgente sous 12 h ou 5 USD).
+
+## 2026-10-10 (comptes au forfait)
+* **Décision** : [consommer d'abord ce qui expire](decisions/0034-consommer-d-abord-ce-qui-expire.md), qui amende 0027 ; lot L74.
+* **L74** : comptes au forfait en réservoir — choix par échéance de la capacité inutilisée sous le seuil de rythme, continuité de session, relevé échu à 0 % (même règle que L71), choix journalisés avec leur raison, capacité perdue à la remise à zéro dans `ameesh accounts list`.
+
+## 2026-10-10
+* **L60** : rotation de session DeepSeek et plafond de contexte qui agit. Les tours DeepSeek étaient inscrits sans session ni modèle, et leur usage par étape ignoré : jamais de rotation sur la taille, 2,34 milliards de jetons relus en 24 h. Au-delà de 15 M jetons relus au dernier tour (`context_max_tokens`, migration 0041), la session est tournée avec résumé de reprise. Le modèle du tour DeepSeek est connu (défaut du descripteur passé au harnais) : fin du barème `pro` appliqué par prudence, qui gonflait l'estimation d'un facteur 12,7 face au solde. Ligne du grand livre clé par son marqueur comptable : plus de doublon quand un exécuteur s'arrête entre l'écriture et l'effacement.
+* **L62** : vue par projet, `ameesh projects` (schéma `ameesh-projects/1`) — agents, état et raison, lot en cours, non-lus, dépense 24 h, forfait ou token, lots ouverts sans agent, projets sans agent actif ; colonne PROJET dans `ameesh list` ; la même vue en tête de `ameesh progress`. Retour du propriétaire : on ne voyait pas quels projets étaient en cours ni qui travaillait sur quoi.
+
 ## 2026-10-09
 * **Bascule** : deepseek1 à 7 et l'orchestrateur Nexlink menés par l'exécuteur, un service par agent (`ameesh-runner-agent@<nom>`) ; plus aucune boucle v0.
 * **L48** (1.4.1) : échecs rapides de tour, attente doublée puis arrêt de l'agent.

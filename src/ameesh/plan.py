@@ -114,6 +114,7 @@ def summarize(packages: Iterable[dict], items: Iterable[dict]) -> dict:
             id=pid, title=epic.get("title"), milestone=milestone_of(pid, by_id),
             responsible=epic.get("responsible"), status=epic.get("status"),
             canon_ref=epic.get("canon_ref"),
+            planned=planned_dates(epic),         # L96
             lots=[{"id": p["id"], "title": p.get("title"), "status": lot_status[p["id"]],
                    "work_items": [int(i["id"]) for i in by_package.get(p["id"], [])]}
                   for p in sorted(lots, key=lambda p: p["id"])],
@@ -123,12 +124,58 @@ def summarize(packages: Iterable[dict], items: Iterable[dict]) -> dict:
     for pid in sorted(p for p in by_id if by_id[p].get("kind") == "milestone"):
         ms = by_id[pid]
         _lots, direct, statuses = units_under(pid)
+        # L96 : la date du jalon (posée dans ameesh, sinon déclarée au canon)
+        day = planned_dates(ms)["delivery"]
         milestones.append(dict(
-            id=pid, title=ms.get("title"), at_ts=None, status=ms.get("status"),
+            id=pid, title=ms.get("title"), at_ts=day_start_ts(day), date=day,
+            status=ms.get("status"),
             responsible=ms.get("responsible"), canon_ref=ms.get("canon_ref"),
             epics=[e["id"] for e in epics if e["milestone"] == pid],
             **_tally(statuses)))
     return {"epics": epics, "milestones": milestones, "lots": lot_status}
+
+
+# --------------------------------------------------------------------------
+# dates prévues d'une fiche (L96)
+# --------------------------------------------------------------------------
+
+#: dates d'une fiche : (clé, colonne posée dans ameesh, colonne du canon)
+PACKAGE_DATES = (("start", "planned_start", "start_on"), ("end", "planned_end", "end_on"),
+                 ("delivery", "planned_delivery", "delivery_on"))
+
+
+def planned_dates(package: dict | None) -> dict:
+    """Les dates prévues effectives d'une fiche : celles posées dans ameesh
+    (`ameesh work plan <fiche>`) priment, sinon celles du canon. Rend
+    `{start, end, delivery, source}` — `source` : `ameesh`, `canon`, `mixte`
+    ou None."""
+    package = package or {}
+    out: dict = {}
+    origins = set()
+    for key, mine, canon in PACKAGE_DATES:
+        if package.get(mine):
+            out[key] = package[mine]
+            origins.add("ameesh")
+        elif package.get(canon):
+            out[key] = package[canon]
+            origins.add("canon")
+        else:
+            out[key] = None
+    out["source"] = (origins.pop() if len(origins) == 1 else "mixte") if origins else None
+    return out
+
+
+def day_start_ts(day: str | None) -> float | None:
+    """Minuit local d'un jour ISO, en secondes epoch (None si pas de jour)."""
+    if not day:
+        return None
+    import datetime as _dt
+    import time as _time
+    try:
+        moment = _dt.date.fromisoformat(str(day)[:10])
+    except ValueError:
+        return None
+    return float(_time.mktime(moment.timetuple()))
 
 
 # --------------------------------------------------------------------------

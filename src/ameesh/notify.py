@@ -53,7 +53,7 @@ from dataclasses import dataclass, field
 
 from . import config as config_mod
 from . import db as db_mod
-from . import exploitation, fil, storage
+from . import exploitation, fil, sous_utilisation, storage
 from .config import Config
 
 NOTIFY_SCHEMA = "ameesh-notify/1"
@@ -62,8 +62,12 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 #: L38 (0030) : types envoyés par défaut. `delegation_expired` arrive avec L40 :
 #: il est accepté ici sans dépendre de son code (un type absent n'est jamais
 #: levé, c'est tout).
+#: L94 : la sous-utilisation (forfait perdu, agents au repos, orchestrateur
+#: tenu, hôte à vide) est poussée comme la surcharge.
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
-                 "delegation_expired")
+                 "delegation_expired", "engagement_overdue", "plan_underused",
+                 "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
+                 "host_not_ready", "host_power_low")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -92,11 +96,22 @@ TYPE_LABELS = {
     "dead_runner": "exécuteur mort",
     "idle_with_mail": "agent au repos avec du courrier",
     "delegation_expired": "délégation échue",
+    "engagement_overdue": "engagement ou date prévue dépassé",
     "long_turn": "tour long",
     "session_too_big": "session trop grosse",
     "stale_lot": "lot stagnant",
     "host_pressure": "hôte sous pression",
     "orphan_resource": "ressource orpheline",
+    "tmpfs_full": "tmpfs presque plein",
+    "worktree_kept": "worktree gardé en fin de lot",
+    "tmp_orphan": "entrée de /tmp laissée par un tour",
+    "plan_underused": "forfait sous-employé",
+    "idle_capacity": "capacité au repos",
+    "orchestrator_held": "orchestrateur tenu par une session",
+    "host_underused": "hôte sous-employé",
+    "balance_low": "solde bas",
+    "host_not_ready": "hôte non prêt",
+    "host_power_low": "batterie faible de l'hôte",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired")
@@ -345,8 +360,24 @@ def duration(seconds) -> str:
     return "%d j %d h" % (s // 86400, (s % 86400) // 3600)
 
 
+def _account(alert: dict) -> str | None:
+    """`harnais/compte` d'une alerte de jauge (L94, `plan_underused`), ou
+    `fournisseur[/compte]` d'une alerte de solde (`balance_low`)."""
+    if alert.get("provider"):
+        return _clean(alert["provider"], 32) + (
+            "/%s" % _clean(alert["account"], 64) if alert.get("account") else "")
+    if alert.get("gauge") is None and alert.get("account") is None:
+        return None
+    return "%s/%s" % (_clean(alert.get("harness") or "?", 32),
+                      _clean(alert.get("account") or "défaut", 64))
+
+
 def _subject(alert: dict) -> str:
     parts = []
+    if _account(alert):
+        parts.append("compte %s" % _account(alert))
+        if alert.get("gauge"):
+            parts.append("fenêtre %s" % _clean(alert["gauge"], 32))
     if alert.get("agent"):
         parts.append("agent %s" % _clean(alert["agent"], 64))
     if alert.get("lot") is not None:
@@ -373,7 +404,7 @@ def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
     subject = _subject(alert)
     since = alert.get("since")
     start = float(since) if since is not None else (float(raised_ts) if raised_ts else None)
-    who = alert.get("agent") or alert.get("host") or (
+    who = alert.get("agent") or alert.get("host") or _account(alert) or (
         "lot #%s" % alert["lot"] if alert.get("lot") is not None else "")
     suffix = " (%s)" % _clean(who, 64) if who else ""
     if event == "resolved":
@@ -395,7 +426,10 @@ def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
     elif raised_ts:
         lines.append("constatée le %s" % local_time(raised_ts))
     title, body = _readable(title, "\n".join(lines), detail)
-    return Message(title, body, urgent=kind in URGENT_TYPES)
+    # L94, L106 : une alerte peut se dire urgente elle-même (`balance_low`
+    # sous 12 h, `host_power_low` au seuil d'arrêt), au-delà des types
+    # toujours urgents
+    return Message(title, body, urgent=kind in URGENT_TYPES or bool(alert.get("urgent")))
 
 
 def render_summary(bucket: dict, host: str) -> Message:
@@ -408,6 +442,12 @@ def render_summary(bucket: dict, host: str) -> Message:
     if bucket.get("resolved"):
         parts.append("résolues : %d" % int(bucket["resolved"]))
     title = "ameesh : %d alerte(s) non détaillée(s) (limite de débit)" % total
+    # L94 : la sous-utilisation a sa ligne dans le résumé
+    underuse = sum(n for kind, n in raised.items() if kind in sous_utilisation.UNDERUSE_TYPES)
+    if underuse:
+        parts.append("sous-utilisation : %d (%s)" % (underuse, ", ".join(
+            "%d %s" % (n, TYPE_LABELS.get(kind, kind)) for kind, n in sorted(raised.items())
+            if kind in sous_utilisation.UNDERUSE_TYPES)))
     body = "%s\nvoir `ameesh alerts` sur l'hôte %s" % (" ; ".join(parts) or "—", host)
     return Message(title, body, urgent=any(k in URGENT_TYPES for k in raised))
 
@@ -778,7 +818,10 @@ def key_of(alert: dict) -> str:
 
 #: champs d'une alerte gardés dans l'état (de quoi écrire la résolution)
 _KEPT = ("type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
-         "responsible", "stop_reason", "assignee")
+         "responsible", "stop_reason", "assignee", "harness", "account", "gauge",
+         "provider", "currency", "urgent",
+         # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
+         "commitment", "package", "due")
 
 
 # --------------------------------------------------------------------------

@@ -56,7 +56,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    reap clear_session take_pending_prompt begin_turn
                    restore_prompt end_turn
    pending_spend   put set_model get clear
-   turn_costs      last_reading insert spent
+   turn_costs      last_reading insert spent ledger correct
    mailbox         send unread unread_urgent get mark_delivered reserve deliver release
                    unread_counts history pending_recipients
                    pending_recipients_sorted unread_total
@@ -88,11 +88,19 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    placements      recorded
    progress        lots lot_events lot_milestones lot_actions actions agents costs
                    packages package_items lot_messages
+   projects        board
+   roadmap         plan_item item_plans plan_package items commitments
+                   add_commitment record_proposal set_commitment
    operations      set_settings set_session_work_item listing request_restart
                    apply_restart adopt resume message_lots assigned_open_lots
                    open_lots_activity turns record_gauges gauge_history
-                   record_balance balances
+                   latest_gauges assigners record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
+   budgets         limits put events
+   turn_resources  open_turn close_turn mark_orphan get open_by_agent orphans
+                   stale_running
+   housekeeping    log recent summary last_measure register_worktree worktrees
+                   set_worktree_status
 
 3. Atomicité et verrous. Postgres tient les garanties par des écritures
    conditionnelles en une instruction (`UPDATE … WHERE`, `INSERT … ON
@@ -187,6 +195,10 @@ class Agents(Domain):
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
         """La ligne de l'agent, ou None."""
+
+    @abc.abstractmethod
+    def harnesses(self) -> dict[str, str]:
+        """L71 : `{agent: harnais}` pour tout le registre (comptabilité, jauges)."""
 
     @abc.abstractmethod
     def overview(self) -> list[dict]:
@@ -435,22 +447,25 @@ class TurnCosts(Domain):
     (`PendingSpend`) ; ce domaine n'ouvre aucune transaction."""
 
     @abc.abstractmethod
-    def last_reading(self, agent: str, harness: str,
+    def last_reading(self, agent: str | None, harness: str,
                      session: str | None = None) -> dict | None:
         """Dernier relevé CONNU (cumul en dollars ou en jetons non nul) de
         l'agent pour ce harnais — de cette session seulement si `session` est
         donnée : session, cum_usd, cum_input_tokens, cum_cached_input_tokens,
-        cum_output_tokens ; ou None."""
+        cum_output_tokens ; ou None. `agent=None` (L71) : tout agent."""
 
     @abc.abstractmethod
     def insert(self, *, agent: str, harness: str, turn: str | None, model: str | None,
                session: str | None, usd: float, input_tokens: int,
                cached_input_tokens: int, output_tokens: int, cum_usd: float | None,
                cum_input_tokens: int | None, cum_cached_input_tokens: int | None,
-               cum_output_tokens: int | None, account: str | None = None) -> None:
+               cum_output_tokens: int | None, account: str | None = None,
+               spend_key: str | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
         telle quelle et n'a rien écrit. `account` (L30, migration 0028) : le
-        compte qui a porté le tour ; None = colonne non écrite."""
+        compte qui a porté le tour ; None = colonne non écrite. `spend_key`
+        (L60, migration 0041) : clé du marqueur comptable ; une ligne portant
+        déjà cette clé n'est pas réécrite (faux). Vrai si la ligne est écrite."""
 
     @abc.abstractmethod
     def spent(self, seconds: float, *, agent: str,
@@ -458,6 +473,61 @@ class TurnCosts(Domain):
         """Somme des coûts des `seconds` dernières secondes (horloge de la
         base), de l'agent (`"all"` : tout le compte, comme `cost spent`), de
         ces harnais seulement si donnés, de ce compte seulement si donné (L30)."""
+
+    @abc.abstractmethod
+    def spent_between(self, from_ts: float, to_ts: float, *,
+                      harnesses: Sequence[str]) -> float:
+        """L95 : somme des coûts de ces harnais dont la ligne est écrite dans
+        ]from_ts, to_ts] (epoch) ; les lignes écartées (0043) ne comptent pas.
+        Sert à comparer l'estimation à la baisse réelle d'un solde sur le même
+        intervalle."""
+
+    @abc.abstractmethod
+    def ledger(self, *, since_ts: float | None = None) -> list[dict]:
+        """L95 : les lignes du grand livre (depuis `since_ts` si donné), dans
+        l'ordre d'écriture (`recorded_ts`, `id`) : id, agent, harness, turn,
+        model, session, account, usd, input_tokens, cached_input_tokens,
+        output_tokens, cum_*, recorded_ts, et `void_reason` (None si la
+        migration 0043 n'est pas passée). Lecture seule."""
+
+    @abc.abstractmethod
+    def correct(self, *, run_id: str, actor: str, corrections: Sequence[dict]) -> int:
+        """L95 (migration 0043) : applique des corrections en UNE transaction.
+        Chacune `{id, kind, reason, set}` ; `set` ne nomme que `usd`, `model`,
+        `input_tokens`, `cached_input_tokens`, `output_tokens` ou
+        `void_reason`. La copie complète de la ligne d'avant va d'abord au
+        journal `turn_cost_corrections`, puis la ligne est mise à jour ; une
+        ligne déjà écartée n'est pas touchée. Rien n'est supprimé. Rend le
+        nombre de lignes corrigées."""
+
+
+# --------------------------------------------------------------------------
+# plafonds de budget du mesh (L70, décision 0019 §2, migration 0042)
+# --------------------------------------------------------------------------
+
+class Budgets(Domain):
+    """Plafonds de budget réglés en base, pour tout le mesh, et leur journal.
+
+    Une ligne par (portée, fenêtre) : portée `''` = tout le mesh, sinon un
+    agent ; fenêtre 3600 ou 86400 s. Les changements sont journalisés dans
+    la même transaction (acteur, ancienne et nouvelle valeur) ; un
+    déclencheur réveille les exécuteurs (canal `ameesh_budget`)."""
+
+    @abc.abstractmethod
+    def limits(self) -> list[dict]:
+        """Toutes les lignes : scope, window_s, usd, set_by, updated_ts."""
+
+    @abc.abstractmethod
+    def put(self, scope: str, window_s: int, usd: float | None, *,
+            actor: str) -> tuple[bool, float | None]:
+        """Pose (`usd` > 0) ou retire (`usd` None) un plafond, et journalise,
+        en UNE transaction (verrou de la ligne). Rend (changé, ancienne
+        valeur) ; rien n'est écrit ni journalisé si la valeur est la même."""
+
+    @abc.abstractmethod
+    def events(self, limit: int, scope: str | None = None) -> list[dict]:
+        """Les derniers changements, récents d'abord : scope, window_s,
+        old_usd, new_usd, actor, at_ts."""
 
 
 # --------------------------------------------------------------------------
@@ -844,7 +914,10 @@ class WorkPackages(Domain):
     def all(self, *, include_absent: bool = False) -> list[dict]:
         """Les fiches (présentes au canon seulement, sauf `include_absent`), par id :
         id, kind, title, parent, responsible, team, scope (liste ou None),
-        status, canon_ref, canon (L42 ; NULL = canon par défaut), present, synced_ts."""
+        status, canon_ref, canon (L42 ; NULL = canon par défaut), present, synced_ts ;
+        L96 : dates du canon `start_on`, `end_on`, `delivery_on` et dates posées
+        dans ameesh `planned_start`, `planned_end`, `planned_delivery`,
+        `planned_source`, `planned_by` (jours ISO ou None)."""
 
     @abc.abstractmethod
     def get(self, ident: str) -> dict | None:
@@ -1336,7 +1409,9 @@ class Progress(Domain):
     @abc.abstractmethod
     def packages(self) -> list[dict]:
         """Les fiches WorkPackage présentes (L29) : id, kind, title, parent,
-        responsible, team, status, canon_ref."""
+        responsible, team, status, canon_ref ; L96 : `start_on`, `end_on`,
+        `delivery_on` (canon), `planned_start`, `planned_end`,
+        `planned_delivery`, `planned_source`, `planned_by` (ameesh)."""
 
     @abc.abstractmethod
     def package_items(self) -> list[dict]:
@@ -1371,20 +1446,120 @@ class Progress(Domain):
 
 
 # --------------------------------------------------------------------------
+# vue par projet (lot L62) : qui travaille sur quoi
+# --------------------------------------------------------------------------
+
+class Projects(Domain):
+    """Lecture de la vue par projet (`ameesh projects`, L62). Aucune écriture.
+
+    UNE requête, UN aller-retour : la vue se rafraîchit souvent et sert aussi
+    d'en-tête à `ameesh progress`."""
+
+    @abc.abstractmethod
+    def board(self, *, max_lots: int) -> dict:
+        """`{"agents": [...], "lots": [...]}`.
+
+        `agents` : un élément par agent du registre — name, chantier, team,
+        harness, host, provider, credential_mode, status, status_text, mode,
+        stop_reason, responsible, lease_live, turn_started_ts,
+        status_since_ts, last_turn_ts, updated_ts, last_seen_ts, unread,
+        lot de session (`session_lot_id` / `_title` / `_state`), lot assigné
+        ouvert le plus récent (`assigned_lot_id` / `_title` / `_state`),
+        `open_lots` (lots ouverts assignés), `usd_24h` et `turns_24h`
+        (grand livre, horloge de la base).
+
+        `lots` : les lots OUVERTS (ni `merged`, ni `promoted`, ni `closed`),
+        au plus `max_lots`, les plus récemment modifiés d'abord — id, title,
+        state, app, workstream, package_team, assignee, updated_ts ; chaque
+        élément porte `total` (avant la borne)."""
+
+
+# --------------------------------------------------------------------------
+# feuille de route (lot L96, migration 0044) : dates prévues, engagements
+# --------------------------------------------------------------------------
+
+class Roadmap(Domain):
+    """Dates prévues des tâches et des fiches du plan, engagements datés.
+
+    Les dates sont des jours calendaires, échangées en texte ISO
+    (`AAAA-MM-JJ`) ; None = pas de date. Aucun état ni jalon de métier ici :
+    les dates réelles se lisent dans le journal (`progress`)."""
+
+    @abc.abstractmethod
+    def plan_item(self, item_id: int, dates: dict, *, source: str | None,
+                  actor: str) -> dict | None:
+        """Pose les dates prévues d'une tâche (`dates` : clés parmi `start`,
+        `end`, `delivery` ; valeur None = date effacée ; clé absente =
+        inchangée), avec qui et quand (`planned_by`, `planned_at`). Ce n'est
+        PAS une activité de la tâche : ni `updated_at` ni le journal ne
+        bougent (une replanification ne masque pas une stagnation). Rend
+        `{id, planned_start, planned_end, planned_delivery, planned_source,
+        planned_by, planned_ts}`, ou None si la tâche est inconnue."""
+
+    @abc.abstractmethod
+    def item_plans(self, ids: Sequence[int]) -> list[dict]:
+        """Les dates prévues de ces tâches (même forme que `plan_item`)."""
+
+    @abc.abstractmethod
+    def plan_package(self, ident: str, dates: dict, *, source: str | None,
+                     actor: str) -> dict | None:
+        """Pose les dates prévues (côté ameesh) d'une fiche WorkPackage ; None
+        si elle est inconnue. Les dates du canon (`start_on`…) ne sont pas
+        touchées."""
+
+    @abc.abstractmethod
+    def items(self, *, since_ts: float, limit: int,
+              done_states: Sequence[str]) -> list[dict]:
+        """Les tâches de la feuille de route : ouvertes (état hors de
+        `done_states`, fourni par l'appelant), ou datées, ou portant un
+        engagement en cours, ou modifiées depuis `since_ts` — colonnes de `work_items` utiles à la
+        frise (id, title, state, app, workstream, assignee, package_id,
+        created_ts, updated_ts, closed_ts) et dates prévues ; `total` avant
+        la borne."""
+
+    @abc.abstractmethod
+    def commitments(self, *, statuses: Sequence[str] | None = None,
+                    ids: Sequence[int] | None = None) -> list[dict]:
+        """Les engagements (tous, ou de ces statuts, ou ces ids), par
+        échéance puis id. Instants en `*_ts`, `due_on` en texte ISO,
+        `depends_on` en liste."""
+
+    @abc.abstractmethod
+    def add_commitment(self, row: dict) -> dict:
+        """Écrit un engagement (clés de la table) et le rend."""
+
+    @abc.abstractmethod
+    def record_proposal(self, row: dict) -> dict | None:
+        """Écrit une proposition (`status = 'proposed'`) sauf si sa
+        `proposal_key` existe déjà : None dans ce cas."""
+
+    @abc.abstractmethod
+    def set_commitment(self, ident: int, *, current: Sequence[str],
+                       values: dict) -> dict | None:
+        """Change un engagement (`status`, `due_on`, `note`…) s'il est dans
+        l'un des statuts `current` ; None sinon (inconnu ou déjà changé).
+        Un statut `done` ou `cancelled` pose `closed_at`."""
+
+
+# --------------------------------------------------------------------------
 # exploitation (lot L26, migration 0027) : réglages, redémarrage, historiques
 # --------------------------------------------------------------------------
 
 class Operations(Domain):
     """Ce que l'orchestrateur lit et règle pour exploiter les agents (L26).
 
-    Réglages d'agent (`session_policy`, `effort`, `tier`), lot de la session
+    Réglages d'agent (`session_policy`, `effort`, `tier`,
+    `context_max_tokens`, `turn_max_seconds`, `turn_mail_max`), lot de la session
     courante, demande de redémarrage, lectures enrichies pour `ameesh list
     --json` et `ameesh alerts`, usage par tour, historique des jauges de
     forfait et soldes d'un fournisseur payé au token. Instants en secondes
     epoch (`*_ts`) ; une liste vide d'ids rend une liste vide."""
 
     #: colonnes réglables par `set_settings` (liste fermée)
-    SETTINGS = ("session_policy", "effort", "tier")
+    SETTINGS = ("session_policy", "effort", "tier", "context_max_tokens",
+                "turn_max_seconds", "turn_mail_max")
+    #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
+    INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max")
 
     @abc.abstractmethod
     def set_settings(self, name: str, values: dict) -> bool:
@@ -1399,7 +1574,8 @@ class Operations(Domain):
 
     @abc.abstractmethod
     def listing(self) -> list[dict]:
-        """Une ligne par agent : réglages, statut et `status_since_ts`, bail
+        """Une ligne par agent : réglages, dossier de travail (`cwd`), statut et
+        `status_since_ts`, bail
         (`lease_live`, `lease_expires_ts`), tour en cours (`turn_started_ts`,
         `turn_label` du marqueur comptable), non-lus (`unread`,
         `oldest_unread_ts`), lot de session (`session_work_item`,
@@ -1494,11 +1670,34 @@ class Operations(Domain):
         observed_ts, account (L30 ; None sans comptes). `account` filtre."""
 
     @abc.abstractmethod
+    def latest_gauges(self, *, since_s: float) -> list[dict]:
+        """L94 : le DERNIER relevé de chaque jauge (harness, account, key)
+        observé dans les `since_s` dernières secondes : harness, key, used,
+        resets_at_ts, window_s, observed_ts, account (None sans comptes)."""
+
+    @abc.abstractmethod
+    def assigners(self, *, since_s: float) -> list[str]:
+        """L94 : les acteurs qui ont confié des lots dans les `since_s`
+        dernières secondes — délégants (`work_item_delegations.delegated_by`)
+        et auteurs d'une réassignation (`work assign`, note « assigné à … »)
+        autres que le nouvel assigné. Noms tels qu'écrits (préfixe `agent:`
+        compris), triés, sans doublon."""
+
+    @abc.abstractmethod
     def record_balance(self, *, provider: str, currency: str, total: float,
                        granted: float | None, topped_up: float | None,
-                       available: bool | None, account: str | None = None) -> dict:
+                       available: bool | None, account: str | None = None,
+                       unless_within_s: float | None = None) -> dict | None:
         """Ajoute un solde horodaté (heure de la base) ; rend la ligne.
-        `account` (L30) : le compte (clé d'API) dont c'est le solde."""
+        `account` (L30) : le compte (clé d'API) dont c'est le solde.
+        `unless_within_s` (L71) : rien n'est écrit (None) si un relevé de ce
+        fournisseur, compte et devise a moins de `unless_within_s` secondes."""
+
+    @abc.abstractmethod
+    def recent_balance(self, *, provider: str, account: str | None,
+                       within_s: float) -> bool:
+        """L71 : un relevé de ce fournisseur (et compte) a-t-il moins de
+        `within_s` secondes ? (plusieurs exécuteurs sur la même clé)"""
 
     @abc.abstractmethod
     def balances(self, *, provider: str | None, since_s: float,
@@ -1544,6 +1743,13 @@ class HostResources(Domain):
     def turns_in_progress(self, host: str) -> int:
         """Nombre d'agents de l'hôte en tour (statut `running`, bail vivant)."""
 
+    @abc.abstractmethod
+    def usage(self, host: str, since_s: float) -> dict:
+        """L94 : l'utilisation de l'hôte sur les `since_s` dernières secondes :
+        `samples`, `first_ts`, `last_ts`, `max_load_per_cpu`,
+        `avg_load_per_cpu` (charge 1 min / CPU ; None sans mesure),
+        `max_turns`, `avg_turns` (tours en cours)."""
+
 
 class TurnResources(Domain):
     """Ressources rattachées à un tour (lot L31, décision 0028).
@@ -1571,6 +1777,10 @@ class TurnResources(Domain):
         """Marque `orphan` une ressource qui survit à son tour."""
 
     @abc.abstractmethod
+    def get(self, turn_id: str) -> dict | None:
+        """La ligne d'un tour (L73 : un conteneur étiqueté par ce tour), ou None."""
+
+    @abc.abstractmethod
     def open_by_agent(self, agent: str) -> list[dict]:
         """Les lignes encore `running` d'un agent, la plus récente d'abord."""
 
@@ -1582,6 +1792,55 @@ class TurnResources(Domain):
     def stale_running(self, older_than_s: float, host: str | None = None) -> list[dict]:
         """Les lignes encore `running` ouvertes il y a plus de `older_than_s`
         secondes : un exécuteur mort les a laissées derrière lui."""
+
+
+class Housekeeping(Domain):
+    """Ménage de ce que les agents créent (lot L73, migration 0045).
+
+    Deux tables d'état d'exécution : le journal du ménage
+    (`housekeeping_log` : supprimé, évincé, retiré, gardé, signalé, avec la
+    taille) et les worktrees apparus pendant un tour (`managed_worktrees`),
+    rattachés à l'agent, au tour et au lot. Les décisions (quoi supprimer,
+    quand, à quelles conditions) sont dans `ameesh.menage`.
+    """
+
+    @abc.abstractmethod
+    def log(self, host: str, entries: Sequence[dict], *, actor: str) -> int:
+        """Ajoute des lignes au journal (clés : kind, action, path, bytes,
+        agent, lot, detail, data) ; rend le nombre de lignes écrites. Élague
+        les lignes de plus de 30 jours."""
+
+    @abc.abstractmethod
+    def recent(self, host: str | None, since_s: float, limit: int = 50) -> list[dict]:
+        """Les lignes des `since_s` dernières secondes (de l'hôte si donné),
+        les plus récentes d'abord ; instant en `at_ts`."""
+
+    @abc.abstractmethod
+    def summary(self, host: str | None, since_s: float) -> list[dict]:
+        """Par (hôte, kind, action) : nombre de lignes et octets, sur les
+        `since_s` dernières secondes (les bilans `mesure` exclus)."""
+
+    @abc.abstractmethod
+    def last_measure(self, host: str | None) -> list[dict]:
+        """Le dernier bilan (`kind = mesure`) de chaque hôte (ou de `host`)."""
+
+    @abc.abstractmethod
+    def register_worktree(self, *, host: str, path: str, repo: str, agent: str,
+                          lot: str | None, turn_id: str | None, branch: str,
+                          head: str) -> dict | None:
+        """Enregistre un worktree apparu pendant un tour ; None s'il est déjà
+        suivi (vivant ou gardé) sur cet hôte."""
+
+    @abc.abstractmethod
+    def worktrees(self, host: str | None, statuses: Sequence[str] | None = None,
+                  limit: int = 500) -> list[dict]:
+        """Worktrees suivis (de l'hôte, des statuts donnés), les plus anciens
+        d'abord ; instants en `created_ts`, `checked_ts`, `ended_ts`."""
+
+    @abc.abstractmethod
+    def set_worktree_status(self, worktree_id: int, status: str, detail: str) -> dict | None:
+        """Change le statut d'un worktree suivi (`ended_at` posé pour
+        `removed` et `gone`) ; rend la ligne, ou None."""
 
 
 class Visibility(Domain):
@@ -1668,6 +1927,7 @@ class Storage(abc.ABC):
     pending_spend: PendingSpend
     turn_costs: TurnCosts
     accounts: Accounts
+    budgets: Budgets
     mailbox: Mailbox
     wakeups: Wakeups
     keys: Keys
@@ -1684,8 +1944,11 @@ class Storage(abc.ABC):
     grants: Grants
     placements: Placements
     progress: Progress
+    projects: Projects
+    roadmap: Roadmap
     operations: Operations
     hosts: HostResources
     turn_resources: TurnResources
     visibility: Visibility
+    housekeeping: Housekeeping
     session_bindings: SessionBindings

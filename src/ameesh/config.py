@@ -54,6 +54,8 @@ SESSION_POLICIES = ("par-lot", "taille", "jamais")
 #: canaux LISTEN/NOTIFY
 CHANNEL_MAIL = "agent_mail"
 CHANNEL_LEASE = "agent_lease"
+#: L70 : changement d'un plafond de budget en base (migration 0042)
+CHANNEL_BUDGET = "ameesh_budget"
 
 
 def _expand(path: str) -> str:
@@ -65,6 +67,14 @@ def _as_float(value, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _as_count(value, default: int) -> int:
+    """Entier ≥ 0 (L105) ; une valeur illisible, négative ou infinie : défaut."""
+    nombre = _as_float(value, float(default))
+    if nombre != nombre or nombre in (float("inf"), float("-inf")) or nombre < 0:
+        return default
+    return int(nombre)
 
 
 def _as_names(value) -> tuple[str, ...]:
@@ -131,7 +141,13 @@ class Config:
     config_dir: str = _expand(DEFAULT_V0_CONFIG)
     host: str = hostname()
     runner_id: str = ""
-    connect_timeout: float = 3.0
+    #: délai de connexion à la base (libpq `connect_timeout`, secondes). 10 s
+    #: et non 3 : une base distante (VPN, plusieurs centaines de ms d'aller-
+    #: retour) dépassait 3 s au moindre à-coup du lien (L72).
+    connect_timeout: float = 10.0
+    #: L72 : attente maximale entre deux essais quand la base est injoignable
+    #: (attente doublée à chaque échec, de 2 s jusqu'à cette borne)
+    db_retry_max: float = 60.0
     #: au-delà, une requête est annulée par le serveur (0 = pas de limite).
     #: Empêche un renouvellement de bail de bloquer le battement indéfiniment.
     statement_timeout_ms: float = 30000.0
@@ -150,6 +166,12 @@ class Config:
     #: garde de budget (0019, R20) : plafond horaire de l'usage payé au token
     #: (somme des tours des 60 dernières minutes) ; 0 = garde désactivée.
     budget_usd_per_hour: float = 10.0
+    #: L70 : plafond par jour glissant (24 h) de l'usage payé au token ;
+    #: 0 = aucun. Défaut local : `ameesh budget set` (en base) l'emporte.
+    budget_usd_per_day: float = 0.0
+    #: L70 : réglages de budget donnés EXPLICITEMENT (fichier ou environnement),
+    #: pour dire la source d'un plafond (`config` ou `défaut`) ; calculé par `load`
+    budget_explicit: tuple[str, ...] = ()
     #: intervalle minimal entre deux vérifications de budget d'un agent en pause
     budget_check_interval: float = 30.0
     #: expéditeurs autorisés à interrompre un tour (0018, R19) ; sans canon,
@@ -159,11 +181,34 @@ class Config:
     session_max_tokens: float = 150000.0
     session_max_turn_seconds: float = 900.0
     session_min_turns: int = 3
+    #: plafond de contexte (L60) : au-delà de ce nombre de jetons d'entrée
+    #: relus (cache compris) au dernier tour, la session est tournée avant le
+    #: tour suivant ; réglable par agent (`ameesh set context_max_tokens=…`).
+    #: 0 = plafond désactivé.
+    context_max_tokens: float = 15_000_000.0
+    #: L105 : durée maximale d'un tour d'agent mené (secondes). Au-delà, le
+    #: tour se clôt au prochain point sûr (fin de l'appel d'outil en cours) et
+    #: le travail reprend au tour suivant, dans la même session ; réglable par
+    #: agent (`ameesh set turn_max_seconds=…`). 0 = pas de durée maximale.
+    turn_max_seconds: float = 1800.0
+    #: L105 : messages remis par le hook de courrier pendant un même tour ;
+    #: les suivants attendent le tour suivant, et l'agent est invité à
+    #: conclure. Réglable par agent (`ameesh set turn_mail_max=…`). 0 = sans borne.
+    turn_mail_max: int = 5
     #: L48 : échecs de tour — attente maximale entre deux tours en échec, durée
     #: sous laquelle un échec est « rapide », série d'échecs rapides qui arrête l'agent
     failure_backoff_max: float = 300.0
     fast_failure_s: float = 60.0
     max_fast_failures: int = 5
+    #: L106 : binaires des harnais choisis par l'hôte (`{"claude": "/chemin"}`),
+    #: après `AMEESH_<HARNAIS>_BIN` et avant le PATH (`adapters.resolve_harness`)
+    harness_bins: dict = field(default_factory=dict)
+    #: L106 : hôte non prêt (binaire, interpréteur introuvable) — attente
+    #: maximale entre deux essais (doublée à chaque échec, de 15 s à cette borne)
+    host_retry_max: float = 300.0
+    #: L106 : arrêt propre sur batterie critique — délai laissé aux tours en
+    #: cours pour finir avant d'être arrêtés (SIGTERM, consigne remise en attente)
+    power_stop_grace: float = 120.0
     #: politique de session par défaut d'un agent sans réglage (0025, L26) :
     #: `par-lot` (rotation au changement de lot, plus la rotation sur la
     #: taille), `taille` (rotation sur la taille seulement), `jamais`
@@ -214,6 +259,10 @@ class Config:
     #: relevé périodique des ressources de l'hôte par l'exécuteur (secondes,
     #: L31, 0028) ; 0 = aucun relevé.
     resource_interval: float = 60.0
+    #: passage périodique du ménage par l'exécuteur (secondes, L73) : quotas
+    #: des dossiers temporaires et des caches, worktrees des lots finis ;
+    #: 0 = aucun passage périodique (le ménage autour des tours reste).
+    housekeeping_interval: float = 600.0
     #: visibilité d'une persona (L31, 0029) : durée de cache du verdict, en
     #: secondes, et délai maximal accordé à la vérification par la forge.
     visibility_ttl: float = 300.0
@@ -305,6 +354,7 @@ def load(env: dict | None = None) -> Config:
             raise SystemExit("config illisible %s : objet JSON attendu" % cfg_path)
         known = {f for f in Config.__dataclass_fields__}  # type: ignore[attr-defined]
         known.discard("extra_canons")   # `canons` (liste) ci-dessous, jamais tel quel
+        known.discard("budget_explicit")  # calculé, jamais lu tel quel
         if isinstance(raw.get("humans"), list):
             raw = dict(raw, humans=",".join(str(n) for n in raw["humans"]))
         cfg = replace(cfg, **{k: v for k, v in raw.items() if k in known})
@@ -346,6 +396,7 @@ def load(env: dict | None = None) -> Config:
         runner_id=pick("AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID", default=cfg.runner_id),
         connect_timeout=_as_float(pick("AMEESH_CONNECT_TIMEOUT", "AGENT_MESH_CONNECT_TIMEOUT"),
                                   cfg.connect_timeout),
+        db_retry_max=_as_float(pick("AMEESH_DB_RETRY_MAX"), cfg.db_retry_max),
         statement_timeout_ms=_as_float(
             pick("AMEESH_STATEMENT_TIMEOUT_MS", "AGENT_MESH_STATEMENT_TIMEOUT_MS"),
             cfg.statement_timeout_ms),
@@ -361,6 +412,14 @@ def load(env: dict | None = None) -> Config:
         budget_usd_per_hour=_as_float(
             pick("AMEESH_BUDGET_USD_PER_HOUR", "AGENT_MESH_BUDGET_USD_PER_HOUR"),
             cfg.budget_usd_per_hour),
+        budget_usd_per_day=_as_float(
+            pick("AMEESH_BUDGET_USD_PER_DAY"), cfg.budget_usd_per_day),
+        budget_explicit=tuple(
+            key for key, names in (
+                ("budget_usd_per_hour", ("AMEESH_BUDGET_USD_PER_HOUR",
+                                         "AGENT_MESH_BUDGET_USD_PER_HOUR")),
+                ("budget_usd_per_day", ("AMEESH_BUDGET_USD_PER_DAY",)))
+            if key in raw or pick(*names)),
         budget_check_interval=_as_float(
             pick("AMEESH_BUDGET_CHECK_INTERVAL", "AGENT_MESH_BUDGET_CHECK_INTERVAL"),
             cfg.budget_check_interval),
@@ -376,11 +435,18 @@ def load(env: dict | None = None) -> Config:
         session_min_turns=int(_as_float(
             pick("AMEESH_SESSION_MIN_TURNS", "AGENT_MESH_SESSION_MIN_TURNS"),
             cfg.session_min_turns)),
+        context_max_tokens=max(0.0, _as_float(pick("AMEESH_CONTEXT_MAX_TOKENS"),
+                                              cfg.context_max_tokens)),
+        turn_max_seconds=max(0.0, _as_float(pick("AMEESH_TURN_MAX_SECONDS"),
+                                            cfg.turn_max_seconds)),
+        turn_mail_max=_as_count(pick("AMEESH_TURN_MAIL_MAX"), cfg.turn_mail_max),
         failure_backoff_max=_as_float(pick("AMEESH_FAILURE_BACKOFF_MAX"),
                                       cfg.failure_backoff_max),
         fast_failure_s=_as_float(pick("AMEESH_FAST_FAILURE_S"), cfg.fast_failure_s),
         max_fast_failures=int(_as_float(pick("AMEESH_MAX_FAST_FAILURES"),
                                         cfg.max_fast_failures)),
+        host_retry_max=_as_float(pick("AMEESH_HOST_RETRY_MAX"), cfg.host_retry_max),
+        power_stop_grace=_as_float(pick("AMEESH_POWER_STOP_GRACE"), cfg.power_stop_grace),
         session_policy=str(pick("AMEESH_SESSION_POLICY", default=cfg.session_policy)
                            or "par-lot").strip(),
         balance_interval=_as_float(pick("AMEESH_BALANCE_INTERVAL"), cfg.balance_interval),
@@ -393,6 +459,8 @@ def load(env: dict | None = None) -> Config:
         humans=pick("AMEESH_HUMANS", default=cfg.humans) or "",
         resource_interval=_as_float(pick("AMEESH_RESOURCE_INTERVAL"),
                                     cfg.resource_interval),
+        housekeeping_interval=_as_float(pick("AMEESH_HOUSEKEEPING_INTERVAL"),
+                                        cfg.housekeeping_interval),
         visibility_ttl=_as_float(pick("AMEESH_VISIBILITY_TTL"), cfg.visibility_ttl),
         visibility_timeout=_as_float(pick("AMEESH_VISIBILITY_TIMEOUT"),
                                      cfg.visibility_timeout),
@@ -463,6 +531,10 @@ def load(env: dict | None = None) -> Config:
     if cfg.session_policy not in SESSION_POLICIES:
         raise SystemExit("AMEESH_SESSION_POLICY invalide : %r (%s)"
                          % (cfg.session_policy, " | ".join(SESSION_POLICIES)))
+    if not isinstance(cfg.harness_bins, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) and v.strip()
+            for k, v in cfg.harness_bins.items()):
+        raise SystemExit("config illisible : `harness_bins` attend {harnais: chemin}")
     if cfg.driver not in ("auto", "psycopg", "psql"):
         raise SystemExit("AGENT_MESH_DRIVER invalide : %r" % cfg.driver)
     if cfg.backend not in ("auto", "pg", "file"):

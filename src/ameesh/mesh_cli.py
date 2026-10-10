@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """agent-mesh — la CLI du mesh : observabilité, clés, approbations, lots.
 
-  agent-mesh list [--json]                     mesh list : agents, hôte, bail, non lus, budget
-                                                (statut préfixé « ext/ » : agent externe, L37)
+  agent-mesh list [--json]                     mesh list : agents, projet, hôte, bail, non lus,
+                                                budget, regroupés par projet (L62) ; statut
+                                                préfixé « ext/ » : agent externe (L37)
   agent-mesh show <agent> [--json]             détail d'un agent
   agent-mesh key generate --out DIR --i-am-the-owner   paire de clés (acte du propriétaire)
   agent-mesh key register <agent> --public-key FICHIER [--role owner|agent]
@@ -24,6 +25,7 @@
   agent-mesh canon check|show|sync [--json] [--host H]   canon OKF (spec §4)
   agent-mesh placement check [--agent A] [--json]        admissions et hôtes admissibles (C4)
   agent-mesh hosts [--json] [HÔTE] [--history N]         ressources des hôtes (L31)
+  agent-mesh menage [--dry-run | --apply] [--json]       ménage des agents (L73)
   agent-mesh agent spawn <nom> --by <créateur> --ttl 2h   agent éphémère (R14)
 
 L'autorité du propriétaire ne se déduit jamais d'un texte : elle se prouve par
@@ -42,6 +44,7 @@ import sys
 import time
 
 from . import accounts as accounts_mod
+from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
 from . import migrations, placement, registry
 from . import fil, signing, storage, work
@@ -52,9 +55,8 @@ USAGE_HINT = "agent-mesh: %s"
 
 
 def _open(cfg: Config) -> Db:
-    db = db_mod.connect(cfg)
-    db_mod.require_schema(db)
-    return db
+    # L61 : la vérification de schéma part avec la première requête
+    return db_mod.open_db(cfg)
 
 
 def _fmt_age(seconds: float) -> str:
@@ -126,8 +128,16 @@ def _lease(row: dict) -> str:
 
 def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
+    # L61 : agents et lots préchargés en un seul aller-retour (db.prefetch) ;
+    # le code ci-dessous lit ensuite ces réponses sans retourner à la base
+    db = db_mod.prefetch(db, lambda d: (registry.overview(d), work.delays(d, limit=500)))
     try:
         rows = registry.overview(db)
+        # L62 : le projet de chaque agent (équipe, à défaut chantier), en
+        # colonne et en clé JSON ajoutée ; le tableau est regroupé par projet
+        from .projects import agent_project, project_label
+        for row in rows:
+            row["project"] = agent_project(row)
         if args.json:
             # C4 : verdict de placement de chaque agent (0022)
             placement.annotate(db, rows)
@@ -148,9 +158,12 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         for lot in lots:
             if lot.get("assignee") and lot.get("state") not in work.TERMINAL:
                 open_by_agent[lot["assignee"]] = open_by_agent.get(lot["assignee"], 0) + 1
-        print("%-20s %-9s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
-            "NOM", "HARNAIS", "HÔTE", "STATUT", "BAIL", "NON LUS", "LOTS", "BUDGET", "CLÉ",
-            "VU"))
+        # regroupé par projet (tri stable : dans un projet, l'ordre de
+        # `overview`, vu le plus récemment d'abord) ; les sans-projet en dernier
+        rows.sort(key=lambda r: (r["project"] is None, r["project"] or ""))
+        print("%-20s %-12s %-9s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
+            "NOM", "PROJET", "HARNAIS", "HÔTE", "STATUT", "BAIL", "NON LUS", "LOTS", "BUDGET",
+            "CLÉ", "VU"))
         for row in rows:
             status = row.get("status") or "?"
             if row.get("status_text"):
@@ -158,8 +171,9 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             if row.get("mode") == "externe":
                 # L37 (0030) : session humaine, jamais réveillée par ameesh
                 status = "ext/" + status
-            print("%-20s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
-                row["name"][:20], (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
+            print("%-20s %-12s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
+                row["name"][:20], project_label(row["project"])[:12],
+                (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
                 status[:11], _lease(row), int(row.get("unread") or 0),
                 open_by_agent.get(row["name"], 0), _budget(row),
                 ("owner" if row.get("has_owner_key")
@@ -199,6 +213,7 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
     chacune (`limits_origin`) et les fiches de chaque canon (`fiches`).
     """
     from . import canon as canon_mod
+    from . import menage as menage_mod
     from . import placement as placement_mod
     from . import resources as res
 
@@ -208,7 +223,12 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         # par défaut d'abord)
         canons = canon_mod.load_configured(cfg)
         latest_by_host = {row["host"]: row for row in res.current(db)}
-        names = set(latest_by_host)
+        # L73 : bilan du ménage par hôte (dernier passage, 24 h de journal,
+        # worktrees suivis)
+        hk = storage.of(db).housekeeping
+        measure_by_host = {row["host"]: row for row in hk.last_measure(None)}
+        names_hk = set(measure_by_host)
+        names = set(latest_by_host) | names_hk
         for canon in canons:
             names |= {h.title for h in canon.hosts}
         if args.host:
@@ -232,6 +252,8 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             latest = latest_by_host.get(name)
             verdict = res.pressure(latest, limits=limits) if latest is not None else None
             history = res.history(db, name, args.history)
+            menage = _host_menage(hk, name, menage_mod.effective(canons, name),
+                                  measure_by_host.get(name), latest)
             if args.json:
                 print(json.dumps({
                     "schema": "ameesh-host/1",
@@ -248,6 +270,7 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                     "latest": latest,
                     "pressure": verdict,
                     "history": history,
+                    "housekeeping": menage,
                 }, ensure_ascii=False, sort_keys=True), flush=True)
                 continue
             resp = ("responsable %s" % host.responsible) if host is not None and host.responsible \
@@ -255,6 +278,7 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             if latest is None:
                 print("%s — %s ; aucune mesure publiée" % (name, resp))
                 _print_host_fiches(fiches, physical, admissions, many=many)
+                _print_host_menage(menage)
                 continue
             age = _fmt_age(now - float(latest.get("sampled_ts") or now))
             print("%s — %s ; mesure %s" % (name, resp, age))
@@ -264,10 +288,13 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                 return " [%s]" % origin.get(key, res.DEFAULT_ORIGIN) if fiches else ""
 
             print("  seuils     mémoire ≥ %s%s ; swap ≤ %s%s ; charge ≤ %.2f%s ; disque ≥ %s%s"
+                  " ; tmpfs ≤ %s%s"
                   % (_fmt_bytes(limits["min_mem_available"]), tag("min_mem_available"),
                      _fmt_bytes(limits["max_swap_used"]), tag("max_swap_used"),
                      limits["max_load"], tag("max_load"),
-                     _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free")))
+                     _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free"),
+                     res.fmt_value("max_tmpfs_used", limits.get("max_tmpfs_used")),
+                     tag("max_tmpfs_used")))
             print("  état       mémoire %s ; swap %s ; charge %s ; disque %s ; tours %s"
                   % (_fmt_bytes(latest.get("mem_available_bytes")),
                      _fmt_bytes(latest.get("swap_used_bytes")),
@@ -275,18 +302,27 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                      _fmt_bytes(latest.get("disk_free_bytes")),
                      latest.get("turns_in_progress")
                      if latest.get("turns_in_progress") is not None else "—"))
+            if latest.get("on_ac") is not None or latest.get("battery_percent") is not None:
+                # L106 : alimentation d'un portable
+                print("  alimentation %s%s ; seuils batterie %s %% (plus de tour), %s %% "
+                      "(arrêt)" % (
+                          "secteur" if latest.get("on_ac") else
+                          "batterie" if latest.get("on_ac") is False else "inconnue",
+                          " %s %%" % latest["battery_percent"]
+                          if latest.get("battery_percent") is not None else "",
+                          limits.get("min_battery_percent"),
+                          limits.get("stop_battery_percent")))
+
             if verdict and verdict["breaches"]:
                 tag = "CRITIQUE" if verdict["critical"] else "PRESSION"
                 detail = " ; ".join(
-                    "%s %s (seuil %s)" % (b["label"],
-                                          _fmt_bytes(b["value"]) if b["key"] != "max_load"
-                                          else "%.2f" % b["value"],
-                                          _fmt_bytes(b["limit"]) if b["key"] != "max_load"
-                                          else "%.2f" % b["limit"])
+                    "%s %s (seuil %s)" % (b["label"], res.fmt_value(b["key"], b["value"]),
+                                          res.fmt_value(b["key"], b["limit"]))
                     for b in verdict["breaches"])
                 print("  %s  %s" % (tag, detail))
             else:
                 print("  pression   aucune")
+            _print_host_menage(menage)
             if history:
                 trace = " ".join(
                     "%s→%s" % (_fmt_bytes(row.get("mem_available_bytes")),
@@ -296,6 +332,84 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         return 0
     finally:
         db.close()
+
+
+def _host_menage(hk, host: str, policy, measure_row: dict | None,
+                 latest: dict | None) -> dict:
+    """`ameesh hosts` (L73) : /tmp du système, dossiers gérés, journal 24 h,
+    worktrees suivis."""
+    from . import resources as res
+    data = (measure_row or {}).get("data") or {}
+    tmp = None
+    if latest is not None and latest.get("tmp_size_bytes"):
+        tmp = {"path": latest.get("tmp_path"), "fstype": latest.get("tmp_fstype"),
+               "size_bytes": latest.get("tmp_size_bytes"),
+               "used_bytes": latest.get("tmp_used_bytes"),
+               "fraction": res.tmpfs_fraction(latest)}
+    worktrees = hk.worktrees(host, ("active", "kept"))
+    return {
+        "policy": policy.as_dict(),
+        "system_tmp": tmp,
+        "tmpfs_alert": bool(tmp and tmp["fraction"] is not None
+                            and tmp["fraction"] >= policy.tmpfs_alert),
+        "measure": data or None,
+        "measured_ts": (measure_row or {}).get("at_ts"),
+        "last_24h": hk.summary(host, 86400.0),
+        "worktrees": {"active": sum(1 for w in worktrees if w["status"] == "active"),
+                      "kept": [{"path": w["path"], "agent": w["agent"], "lot": w["lot"],
+                                "detail": w["detail"]}
+                               for w in worktrees if w["status"] == "kept"]},
+    }
+
+
+def _print_host_menage(menage: dict) -> None:
+    tmp = menage.get("system_tmp")
+    policy = menage["policy"]
+    if tmp:
+        part = tmp.get("fraction")
+        print("  /tmp       %s %s / %s%s%s" % (
+            tmp.get("fstype") or "?", _fmt_bytes(tmp.get("used_bytes")),
+            _fmt_bytes(tmp.get("size_bytes")),
+            " (%d %%)" % round(part * 100) if part is not None else " (sur disque)",
+            " — ALERTE : au-delà de %d %% (ameesh menage pour voir ce qui l'occupe)"
+            % round(policy["tmpfs_alert"] * 100) if menage.get("tmpfs_alert") else ""))
+    m = menage.get("measure")
+    if m:
+        print("  ménage     dossiers temporaires %s (quota %s par agent) ; caches %s / %s"
+              "%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
+                      _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
+                      " ; %d entrée(s) /tmp signalée(s) (%s)" % (
+                          m["orphans"], _fmt_bytes(m.get("orphan_bytes")))
+                      if m.get("orphans") else ""))
+    conteneurs = (m or {}).get("containers") or {}
+    if conteneurs.get("ameesh") is not None or conteneurs.get("others") is not None:
+        ours = conteneurs.get("ameesh") or []
+        autres = conteneurs.get("others") or []
+        print("  conteneurs %d lancé(s) par un tour d'ameesh%s ; %d autre(s) signalé(s)%s" % (
+            len(ours),
+            " (%s)" % " ; ".join("%s : %s" % (c["path"], c.get("detail") or c["action"])
+                                 for c in ours[:3]) if ours else "",
+            len(autres),
+            " (jamais supprimés : %s)" % " ; ".join(c["command"] for c in autres[:5])
+            if autres else ""))
+    faits = menage.get("last_24h") or []
+    if faits:
+        print("  24 h       %s" % " ; ".join(
+            "%s %s ×%d%s" % (r["kind"], r["action"], r["n"],
+                             " (%s)" % _fmt_bytes(r["bytes"]) if r.get("bytes") else "")
+            for r in faits))
+    wt = menage.get("worktrees") or {}
+    if wt.get("active") or wt.get("kept"):
+        print("  worktrees  %d suivi(s) en attente de fin de lot ; %d gardé(s)%s" % (
+            wt.get("active", 0), len(wt.get("kept") or []),
+            " : " + " ; ".join("%s (%s)" % (k["path"], k["detail"]) for k in wt["kept"][:5])
+            if wt.get("kept") else ""))
+
+
+def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh menage` (L73) : voir `ameesh.menage.cmd_menage`."""
+    from . import menage
+    return menage.cmd_menage(cfg, args)
 
 
 def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: bool) -> None:
@@ -324,11 +438,12 @@ def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: 
 def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
-        row = registry.get(db, args.agent)
+        # L61 : la ligne et la clé en un seul aller-retour (db.batched)
+        row, info = db_mod.batched(db, lambda db: (
+            registry.get(db, args.agent), authority.key_info(db, args.agent)))
         if row is None:
             print(USAGE_HINT % ("agent inconnu : %s" % args.agent), file=sys.stderr)
             return 1
-        info = authority.key_info(db, args.agent)
         row = dict(row)
         row["key_ready"] = bool(info and info.get("public_key") and not info.get("key_revoked_ts"))
         row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
@@ -716,16 +831,25 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                           row["work_item_id"], issue))
             return 0
         if args.work_command == "list":
-            rows = work.list_items(db, state=args.state, assignee=args.assignee, limit=args.limit)
-            plan.annotate(db, rows, threshold=stagnation.stale_after(args.stale_after))
-            # Les délais viennent d'un seul balayage, restreint aux lots
-            # affichés (jamais une requête par ligne) ; le JSON les porte aussi,
-            # pour la frise (L24). Le filtre porte sur les lignes rendues, pas
-            # sur une fenêtre globale : un lot ancien garde sa frise (B3).
-            delays = {row["work_item_id"]: row for row in
-                      work.delays(db, ids=[row["id"] for row in rows])}
-            for row in rows:
-                row["delays"] = delays.get(row["id"])
+            threshold = stagnation.stale_after(args.stale_after)
+
+            def lire(db):
+                rows = work.list_items(db, state=args.state, assignee=args.assignee,
+                                       limit=args.limit)
+                plan.annotate(db, rows, threshold=threshold)
+                # Les délais viennent d'un seul balayage, restreint aux lots
+                # affichés (jamais une requête par ligne) ; le JSON les porte
+                # aussi, pour la frise (L24). Le filtre porte sur les lignes
+                # rendues, pas sur une fenêtre globale : un lot ancien garde sa
+                # frise (B3).
+                delays = {row["work_item_id"]: row for row in
+                          work.delays(db, ids=[row["id"] for row in rows])}
+                for row in rows:
+                    row["delays"] = delays.get(row["id"])
+                return rows
+
+            # L61 : lectures regroupées — deux allers-retours en tout
+            rows = db_mod.batched(db, lire)
             if args.json:
                 print(json.dumps(rows, ensure_ascii=False, indent=2))
                 return 0
@@ -760,6 +884,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             item["milestones"] = work.milestones(db, args.id)
             item["delays"] = work.timeline(db, args.id)
             plan.annotate(db, [item])
+            # L96 : dates prévues (feuille de route)
+            planned = (storage.of(db).roadmap.item_plans([args.id]) or [{}])[0]
+            item["planned"] = {k: planned.get("planned_" + k)
+                               for k in ("start", "end", "delivery", "source", "by")}
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
@@ -773,6 +901,12 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if item.get("package_id") or item.get("epic"):
                 print("plan     : fiche %-12s epic : %s" % (
                     item.get("package_id") or "—", item.get("epic") or "—"))
+            if any(item["planned"].get(k) for k in ("start", "end", "delivery")):
+                print("prévu    : début %s · fin %s · livraison %s%s" % (
+                    item["planned"]["start"] or "—", item["planned"]["end"] or "—",
+                    item["planned"]["delivery"] or "—",
+                    " (source : %s)" % item["planned"]["source"]
+                    if item["planned"].get("source") else ""))
             if item.get("state") == "closed":
                 print("fermé    : %s" % ("abandonné" if item.get("close_reason") == "abandoned"
                                          else "remplacé par #%s" % item.get("superseded_by")))
@@ -951,7 +1085,8 @@ def cmd_migrate(cfg: Config, _args: argparse.Namespace) -> int:
 
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
     from . import cli
-    return cli.cmd_doctor(cfg, notify_test=args.notify_test, probe=args.probe)
+    return cli.cmd_doctor(cfg, notify_test=args.notify_test, probe=args.probe,
+                          harness=getattr(args, "harness", False))
 
 
 # --------------------------------------------------------------------------
@@ -985,14 +1120,60 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 
 
 #: clés de `ameesh set` (L13 : model, effort ; L26 : tier, session_policy ;
-#: L37 : mode, `execute` | `externe`, décision 0030)
-SET_KEYS = ("model", "effort", "tier", "session_policy", "mode")
+#: L37 : mode, `execute` | `externe`, décision 0030 ; L60 : context_max_tokens ;
+#: L105 : turn_max_seconds, turn_mail_max)
+SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
+            "turn_max_seconds", "turn_mail_max")
+#: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
+_TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
+
+
+def parse_token_count(valeur: str) -> int:
+    """`15000000`, `15M`, `1.5m`, `500k` → entier ≥ 0 ; ValueError sinon (L60)."""
+    texte = valeur.strip().lower().replace("_", "")
+    facteur = 1
+    if texte and texte[-1] in _TOKEN_SUFFIXES:
+        facteur = _TOKEN_SUFFIXES[texte[-1]]
+        texte = texte[:-1]
+    nombre = float(texte)
+    if nombre != nombre or nombre < 0 or nombre * facteur > 2 ** 62:
+        raise ValueError(valeur)
+    return int(round(nombre * facteur))
+
+
+#: suffixes acceptés par `turn_max_seconds` (`30m`, `2h`, `90s`)
+_DURATION_SUFFIXES = {"s": 1, "m": 60, "h": 3600}
+
+
+def parse_duration(valeur: str) -> int:
+    """`1800`, `90s`, `30m`, `1.5h` → secondes entières ≥ 0 ; ValueError sinon (L105)."""
+    texte = valeur.strip().lower().replace("_", "")
+    facteur = 1
+    if texte and texte[-1] in _DURATION_SUFFIXES:
+        facteur = _DURATION_SUFFIXES[texte[-1]]
+        texte = texte[:-1]
+    nombre = float(texte)
+    if nombre != nombre or nombre < 0 or nombre * facteur > 2 ** 40:
+        raise ValueError(valeur)
+    return int(round(nombre * facteur))
+
+
+def parse_count(valeur: str) -> int:
+    """Entier ≥ 0 (`5`) ; ValueError sinon (L105)."""
+    nombre = int(valeur.strip())
+    if nombre < 0 or nombre > 2 ** 31:
+        raise ValueError(valeur)
+    return nombre
+
+
 #: un tier est un identifiant court (passé tel quel au harnais par son descripteur)
 _TIER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 def cmd_set(cfg: Config, args) -> int:
-    """`ameesh set <agent> model=… effort=… tier=… session_policy=… mode=…` (L13, L26, L37).
+    """`ameesh set <agent> model=… effort=… tier=… session_policy=… mode=…
+    context_max_tokens=… turn_max_seconds=… turn_mail_max=…` (L13, L26, L37,
+    L60, L105).
 
     Écrit l'état d'exécution : le modèle dans le registre (visible par `list`)
     et dans l'état local ; l'effort et le tier dans l'état local **et** en base
@@ -1001,14 +1182,18 @@ def cmd_set(cfg: Config, args) -> int:
     Le tour suivant les lit et les applique ; une valeur vide revient au
     défaut. Le tier n'a d'effet que sur un harnais dont le descripteur le
     déclare (Codex : `service_tier`). Le mode (`execute` | `externe`, L37) est
-    écrit en base ; vide = `execute`.
+    écrit en base ; vide = `execute`. Le plafond de contexte
+    (`context_max_tokens`, L60 : `15M`, `500k`, `0` = désactivé) est écrit en
+    base ; vide = défaut de l'exécuteur. Les plafonds du tour (L105) aussi :
+    `turn_max_seconds` (`30m`, `2h`, `0` = sans limite) et `turn_mail_max`
+    (messages remis par le hook pendant un tour, `0` = sans borne).
     """
     from . import adapters
     from .config import SESSION_POLICIES
 
     db = db_mod.connect(cfg)
     try:
-        db_mod.require_schema(db)
+        db_mod.require_schema(db, defer=True)
         agent = registry.get(db, args.agent)
         if agent is None:
             print("agent inconnu : %s" % args.agent, file=sys.stderr)
@@ -1019,8 +1204,9 @@ def cmd_set(cfg: Config, args) -> int:
             valeur = valeur.strip()
             if not sep or cle not in SET_KEYS:
                 print("usage : ameesh set <agent> model=… effort=… tier=… "
-                      "session_policy=%s mode=%s" % ("|".join(SESSION_POLICIES),
-                                                     "|".join(registry.MODES)),
+                      "session_policy=%s mode=%s context_max_tokens=N|15M|0 "
+                      "turn_max_seconds=30m|2h|0 turn_mail_max=N|0"
+                      % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
             if cle == "mode" and valeur and valeur not in registry.MODES:
@@ -1034,6 +1220,27 @@ def cmd_set(cfg: Config, args) -> int:
             if cle == "tier" and valeur and not _TIER_RE.match(valeur):
                 print("tier invalide : %r (ex. fast, flex)" % valeur, file=sys.stderr)
                 return 2
+            if cle == "context_max_tokens" and valeur:
+                try:
+                    valeur = str(parse_token_count(valeur))
+                except ValueError:
+                    print("context_max_tokens invalide : %r (ex. 15M, 500k, 0 = "
+                          "désactivé)" % valeur, file=sys.stderr)
+                    return 2
+            if cle == "turn_max_seconds" and valeur:
+                try:
+                    valeur = str(parse_duration(valeur))
+                except ValueError:
+                    print("turn_max_seconds invalide : %r (ex. 30m, 2h, 0 = sans "
+                          "limite)" % valeur, file=sys.stderr)
+                    return 2
+            if cle == "turn_mail_max" and valeur:
+                try:
+                    valeur = str(parse_count(valeur))
+                except ValueError:
+                    print("turn_mail_max invalide : %r (ex. 5, 0 = sans borne)" % valeur,
+                          file=sys.stderr)
+                    return 2
             valeurs[cle] = valeur
         for cle, valeur in valeurs.items():
             if cle in ("model", "effort", "tier"):
@@ -1053,9 +1260,22 @@ def cmd_set(cfg: Config, args) -> int:
         effort = _lit_etat(cfg, args.agent, "effort") or agent.get("effort") or "défaut"
         tier = _lit_etat(cfg, args.agent, "tier") or agent.get("tier") or "défaut"
         politique = agent.get("session_policy") or "défaut (%s)" % cfg.session_policy
-        print("%s : modèle=%s effort=%s tier=%s session=%s mode=%s (prend effet au "
-              "prochain tour)" % (args.agent, modele, effort, tier, politique,
-                                  agent.get("mode") or "execute"))
+        from .exploitation import (effective_context_max, effective_turn_mail_max,
+                                   effective_turn_max_seconds)
+
+        def _txt(valeur: int, cle: str, zero: str) -> str:
+            return (zero if valeur == 0 else "%d" % valeur) + (
+                "" if agent.get(cle) is not None else " (défaut)")
+        plafond_txt = _txt(effective_context_max(cfg, agent), "context_max_tokens",
+                           "désactivé")
+        duree_txt = _txt(effective_turn_max_seconds(cfg, agent), "turn_max_seconds",
+                         "sans limite")
+        courrier_txt = _txt(effective_turn_mail_max(cfg, agent), "turn_mail_max",
+                            "sans borne")
+        print("%s : modèle=%s effort=%s tier=%s session=%s mode=%s contexte=%s "
+              "tour_max_s=%s courrier_par_tour=%s (prend effet au prochain tour)"
+              % (args.agent, modele, effort, tier, politique,
+                 agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt))
         if agent.get("mode") == "externe" and not agent.get("responsible"):
             # 0030 : un agent externe a obligatoirement un responsable humain
             print("attention : agent externe sans responsable humain : ses lots et ses "
@@ -1189,6 +1409,18 @@ def build_parser() -> argparse.ArgumentParser:
                          help="nombre de relevés de l'historique court (défaut 10)")
     p_hosts.add_argument("--json", action="store_true", help="un objet JSON par hôte")
     p_hosts.set_defaults(func=cmd_hosts)
+
+    p_menage = sub.add_parser(
+        "menage", help="ménage de ce que les agents créent (L73) ; essai par défaut")
+    mode = p_menage.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true",
+                      help="montrer seulement (défaut) : rien n'est supprimé")
+    mode.add_argument("--apply", action="store_true",
+                      help="exécuter (humain ou exécuteur seulement, jamais une session "
+                           "d'agent)")
+    p_menage.add_argument("--by", default="", help="qui déclenche (journal), ex. human:alice")
+    p_menage.add_argument("--json", action="store_true", help="rapport `ameesh-menage/1`")
+    p_menage.set_defaults(func=cmd_menage)
 
     p_models = sub.add_parser("models", help="catalogue des modèles (L14)")
     models_sub = p_models.add_subparsers(dest="models_command")
@@ -1373,6 +1605,9 @@ def build_parser() -> argparse.ArgumentParser:
     pc_gauges.add_argument("--harness", default=None)
     pc_gauges.add_argument("--since", default="7d")
     pc_gauges.add_argument("--json", action="store_true")
+    pc_gauges.add_argument("--record", action="store_true",
+                           help="relève d'abord les jauges des journaux locaux (écrit "
+                                "l'historique) ; sans elle, lecture seule")
     pc_gauges.set_defaults(func=cmd_cost)
     pc_bal = cost_sub.add_parser(
         "balance", help="solde du fournisseur payé au token, dépense réelle par heure et jour")
@@ -1382,6 +1617,9 @@ def build_parser() -> argparse.ArgumentParser:
     pc_bal.add_argument("--since", default="7d")
     pc_bal.add_argument("--json", action="store_true")
     pc_bal.set_defaults(func=cmd_cost)
+    # L95 : correction tracée du grand livre (essai par défaut)
+    from . import grand_livre
+    grand_livre.add_parser(cost_sub, cmd_cost)
 
     # L30 (0027) : comptes multiples par fournisseur
     p_acc = sub.add_parser("accounts", help="comptes par fournisseur : actif, jauges, forçage (L30)")
@@ -1390,20 +1628,26 @@ def build_parser() -> argparse.ArgumentParser:
     pa_list.add_argument("--json", action="store_true")
     pa_list.add_argument("--last", type=int, default=5, help="dernières bascules montrées")
     pa_list.set_defaults(func=cmd_accounts)
-    pa_use = acc_sub.add_parser("use", help="forcer un compte (plus de bascule automatique)")
+    pa_use = acc_sub.add_parser("use", help="forcer un compte (plus de choix automatique)")
     pa_use.add_argument("harness")
     pa_use.add_argument("account")
     pa_use.set_defaults(func=cmd_accounts)
-    pa_auto = acc_sub.add_parser("auto", help="rendre la main à la bascule automatique")
+    pa_auto = acc_sub.add_parser("auto", help="rendre la main au choix automatique (0034)")
     pa_auto.add_argument("harness", nargs="?", default=None,
                          help="harnais (défaut : tous ceux qui ont des comptes)")
     pa_auto.set_defaults(func=cmd_accounts)
     p_acc.set_defaults(func=cmd_accounts)
 
+    # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
+    from . import budget as budget_mod
+    budget_mod.add_parsers(sub)
+
     p_set = sub.add_parser("set", help="réglages d'un agent, effet au prochain tour (L13, L26)")
     p_set.add_argument("agent")
     p_set.add_argument("values", nargs="+", metavar="clé=valeur",
                        help="model=… effort=… tier=… session_policy=par-lot|taille|jamais "
+                            "context_max_tokens=15M|0 "
+                            "turn_max_seconds=30m|2h|0 turn_mail_max=5|0 "
                             "mode=execute|externe (valeur vide = défaut)")
     p_set.set_defaults(func=cmd_set)
 
@@ -1425,6 +1669,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--notify-test", action="store_true")
     p_doc.add_argument("--probe", action="store_true",
                        help="sonde légère : base, schéma, migrations à jour ; rien d'autre")
+    p_doc.add_argument("--harness", action="store_true",
+                       help="binaires des harnais servis par l'hôte (chemin, provenance, "
+                            "interpréteur) et unités d'exécuteur (L106)")
     p_doc.set_defaults(func=cmd_doctor)
 
     from . import canon_cli
@@ -1451,11 +1698,24 @@ def cmd_cost(cfg: Config, args) -> int:
     ce qui est écrit ici, c'est la base (`turn_costs`, migration 0014).
     """
     what = getattr(args, "cost_command", None) or "report"
+    if what == "correct":
+        # L95 : l'essai lit aussi une base d'avant la migration 0043
+        from . import grand_livre
+        return grand_livre.main(cfg, args)
     db = _open(cfg)
     try:
         if what in ("turns", "gauges", "balance"):
             return _cost_l26(cfg, db, what, args)
-        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+        if what == "report":
+            # L61 : le rapport lisait la dépense agent par agent (deux
+            # requêtes chacun, ~67 s vers une base distante) : ses lectures
+            # sont préchargées en quelques allers-retours (db.prefetch)
+            db = db_mod.prefetch(db, lambda d: _cost_report_reads(cfg, d))
+        # L70 : les plafonds en vigueur (base > configuration > défaut), ceux
+        # que la garde des exécuteurs applique
+        from . import budget as budget_mod
+        limites = budget_mod.current(cfg, db)
+        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, **limites.book_kwargs())
         if what == "spent":
             seconds = float(getattr(args, "seconds", 3600.0) or 3600.0)
             print("%.4f" % book.spent(getattr(args, "agent", "all") or "all", seconds))
@@ -1480,7 +1740,8 @@ def cmd_cost(cfg: Config, args) -> int:
             return 1
         # L30 : jauges par compte et compte actif, pour les harnais à comptes
         try:
-            comptes = accounts_mod.report(cfg, db, book)
+            # L71 : un affichage ne relève pas les jauges (lecture seule)
+            comptes = accounts_mod.report(cfg, db, book, record=False)
         except accounts_mod.AccountError as exc:
             print("comptes : configuration invalide : %s" % exc, file=sys.stderr)
             comptes = []
@@ -1499,6 +1760,14 @@ def cmd_cost(cfg: Config, args) -> int:
             print(json.dumps(rows, indent=2, sort_keys=True, default=str))
         else:
             print(cost_mod.format_report(rows))
+            # L95 : dépense réelle (soldes) face à l'estimation, sur 24 h
+            for entry in _real_spend_24h(db):
+                print(balance_mod.describe(entry))
+            print()
+            print(budget_mod.summary_line(limites))
+            for agent, caps in sorted(limites.agents.items()):
+                print("  plafond de %s : %s" % (agent, " · ".join(
+                    "%s %.2f $" % (budget_mod.LABELS[w], v) for w, v in sorted(caps.items()))))
             if comptes:
                 print()
                 print("comptes (hôte %s) :" % cfg.host)
@@ -1506,6 +1775,34 @@ def cmd_cost(cfg: Config, args) -> int:
         return 0
     finally:
         db.close()
+
+
+def _real_spend_24h(db) -> list:
+    """L95 : dépense réelle des fournisseurs payés au token sur 24 h, face à
+    l'estimation du grand livre ; vide si rien n'est lisible."""
+    try:
+        paid = cost_mod.paid_harnesses_of()
+    except cost_mod.CostError:
+        return []
+    now = time.time()
+    return [dict(entry, period="24h")
+            for entry in balance_mod.compare(db, paid, now - 86400.0, now)]
+
+
+def _cost_report_reads(cfg: Config, db) -> None:
+    """Les lectures de `cost report`, jouées à blanc par `db.prefetch` (L61) :
+    plafonds (L70), comptes et rapport par agent. Rien n'est affiché."""
+    from . import budget as budget_mod
+    limites = budget_mod.current(cfg, db)
+    book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, **limites.book_kwargs())
+    try:
+        comptes = accounts_mod.report(cfg, db, book)
+    except accounts_mod.AccountError:
+        comptes = []
+    actifs = {ligne["harness"]: (ligne["account"], ligne["_gauges"])
+              for ligne in comptes if ligne["active"]}
+    book.report(accounts=actifs)
+    _real_spend_24h(db)
 
 
 def cmd_accounts(cfg: Config, args) -> int:
@@ -1527,7 +1824,7 @@ def cmd_accounts(cfg: Config, args) -> int:
                       "de l'hôte)" % args.harness, file=sys.stderr)
                 return 1
             accounts_mod.force(db, cfg.host, args.harness, items, args.account, by=qui)
-            texte = ("Compte %s forcé pour %s sur %s par %s : plus de bascule automatique "
+            texte = ("Compte %s forcé pour %s sur %s par %s : plus de choix automatique "
                      "jusqu'à « ameesh accounts auto »." % (args.account, args.harness,
                                                             cfg.host, qui))
             fil.record(cfg, db, sender=qui, recipients=[], text=texte,
@@ -1542,7 +1839,7 @@ def cmd_accounts(cfg: Config, args) -> int:
                     print("aucun compte déclaré pour %s" % nom, file=sys.stderr)
                     return 1
                 if accounts_mod.automatic(db, cfg.host, nom, by=qui):
-                    texte = ("Comptes %s sur %s : retour en bascule automatique (%s)."
+                    texte = ("Comptes %s sur %s : retour au choix automatique (%s)."
                              % (nom, cfg.host, qui))
                     fil.record(cfg, db, sender=qui, recipients=[], text=texte,
                                meta={"action": "compte", "type": "auto", "harnais": nom,
@@ -1552,7 +1849,8 @@ def cmd_accounts(cfg: Config, args) -> int:
                     print("comptes %s : déjà en automatique" % nom)
             return 0
         book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
-        rows = accounts_mod.report(cfg, db, book)
+        # L71 : `accounts list` est un affichage — aucun relevé écrit
+        rows = accounts_mod.report(cfg, db, book, record=False)
         for row in rows:
             row.pop("_gauges", None)
         bascules = storage.of(db).accounts.switches(cfg.host, None, max(0, getattr(args, "last", 5))) \
@@ -1602,15 +1900,19 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
                 row["usd"]))
         return 0
     if what == "gauges":
-        # un relevé frais d'abord : la commande lit aussi les journaux locaux de
-        # l'hôte, comme `cost report` (une ligne seulement si la jauge a bougé).
-        # L30 : un harnais à comptes déclarés est relevé compte par compte.
-        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
-        declares = accounts_mod.parse(cfg.accounts)
-        accounts_mod.report(cfg, db, book, harnesses=[args.harness] if args.harness else None)
-        for nom in ([args.harness] if args.harness else ["claude", "codex"]):
-            if nom not in declares:
-                book.gauges(nom)
+        if args.record:
+            # `--record` : un relevé frais d'abord, depuis les journaux locaux
+            # de l'hôte, comme `cost report` (une ligne seulement si la jauge
+            # a bougé). L30 : un harnais à comptes déclarés est relevé compte
+            # par compte. Sans l'option (L61), la commande ne fait que lire
+            # l'historique : l'exécuteur relève déjà avant chaque tour.
+            book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+            declares = accounts_mod.parse(cfg.accounts)
+            accounts_mod.report(cfg, db, book,
+                                harnesses=[args.harness] if args.harness else None)
+            for nom in ([args.harness] if args.harness else ["claude", "codex"]):
+                if nom not in declares:
+                    book.gauges(nom)
         rows = ops.gauge_history(since_s=_since_seconds(args.since), harness=args.harness)
         if args.json:
             print(json.dumps({"schema": "ameesh-gauges/1", "readings": rows},

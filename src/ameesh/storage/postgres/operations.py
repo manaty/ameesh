@@ -43,7 +43,8 @@ class Operations(interface.Operations):
         if not cols:
             return bool(self.db.query("SELECT 1 AS ok FROM agent_registry WHERE name = %s",
                                       (name,)))
-        sets = ", ".join("%s = nullif(%%s, '')" % col for col in cols)
+        sets = ", ".join("%s = nullif(%%s, '')%s" % (
+            col, "::bigint" if col in self.INTEGER_SETTINGS else "") for col in cols)
         params: list[Any] = [values[col] if values[col] is not None else "" for col in cols]
         rows = self.db.query(
             "UPDATE agent_registry SET " + sets + ", updated_at = now()"
@@ -74,9 +75,12 @@ class Operations(interface.Operations):
         return self.db.query(
             """
             SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.effort, r.tier,
-                   r.session_policy, r.session_id, r.session_work_item,
+                   r.cwd,  -- L73b : dossiers de travail protégés par le ménage
+                   r.session_policy, r.context_max_tokens, r.turn_max_seconds, r.turn_mail_max,
+                   r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
+                   r.last_error,  -- L106 : le détail de « hôte non prêt »
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,
                    (r.lease_owner IS NOT NULL
                     AND r.lease_expires_at > clock_timestamp()) AS lease_live,
@@ -92,7 +96,11 @@ class Operations(interface.Operations):
                    sw.title AS session_lot_title, sw.state AS session_lot_state,
                    aw.id AS assigned_lot_id, aw.title AS assigned_lot_title,
                    aw.state AS assigned_lot_state,
-                   (t.input_tokens + t.cached_input_tokens)::bigint AS last_turn_reread_tokens,
+                   -- L60 : Codex compte déjà le cache dans input_tokens
+                   (CASE WHEN t.harness = 'codex'
+                         THEN greatest(t.input_tokens, t.cached_input_tokens)
+                         ELSE t.input_tokens + t.cached_input_tokens
+                    END)::bigint AS last_turn_reread_tokens,
                    t.session AS last_turn_session,
                    extract(epoch from t.recorded_at)::float8 AS last_turn_recorded_ts
               FROM agent_registry r
@@ -103,14 +111,14 @@ class Operations(interface.Operations):
                    WHERE mb.recipient = r.name AND mb.delivered_at IS NULL) m ON true
               LEFT JOIN LATERAL (
                   SELECT w.title, w.state FROM work_items w
-                   WHERE r.session_work_item ~ '^[0-9]{1,18}$'
-                     AND w.id = r.session_work_item::bigint) sw ON true
+                   WHERE w.id = CASE WHEN r.session_work_item ~ '^[0-9]{1,18}$'
+                                     THEN r.session_work_item::bigint END) sw ON true
               LEFT JOIN LATERAL (
                   SELECT w.id, w.title, w.state FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                    ORDER BY w.updated_at DESC, w.id DESC LIMIT 1) aw ON true
               LEFT JOIN LATERAL (
-                  SELECT c.input_tokens, c.cached_input_tokens, c.session, c.recorded_at
+                  SELECT c.harness, c.input_tokens, c.cached_input_tokens, c.session, c.recorded_at
                     FROM turn_costs c
                    WHERE c.agent = r.name
                    ORDER BY c.recorded_at DESC, c.id DESC LIMIT 1) t ON true
@@ -303,7 +311,8 @@ class Operations(interface.Operations):
         sql = ("SELECT id, agent, harness, turn, model, session, usd::float8 AS usd,"
                " input_tokens, cached_input_tokens, output_tokens,"
                " extract(epoch from recorded_at)::float8 AS recorded_ts"
-               " FROM turn_costs WHERE recorded_at >= now() - make_interval(secs => %s)")
+               " FROM turn_costs WHERE recorded_at >= now() - make_interval(secs => %s)"
+               " AND void_reason IS NULL")
         params: list = [float(since_s)]
         if agent:
             sql += " AND agent = %s"
@@ -357,9 +366,64 @@ class Operations(interface.Operations):
         sql += " ORDER BY observed_at, id"
         return _sans_compte_nul(self.db.query(sql, tuple(params)))
 
+    def latest_gauges(self, *, since_s) -> list[dict]:
+        return self.db.query(
+            """
+            SELECT DISTINCT ON (harness, account, gauge_key)
+                   harness, gauge_key AS key, used,
+                   extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,
+                   extract(epoch from observed_at)::float8 AS observed_ts, account
+              FROM quota_gauge_readings
+             WHERE observed_at >= now() - make_interval(secs => %s)
+             ORDER BY harness, account, gauge_key, observed_at DESC, id DESC
+            """,
+            (float(since_s),))
+
+    def assigners(self, *, since_s) -> list[str]:
+        rows = self.db.query(
+            """
+            SELECT DISTINCT who FROM (
+                SELECT d.delegated_by AS who FROM work_item_delegations d
+                 WHERE d.delegated_at >= now() - make_interval(secs => %s)
+                UNION ALL
+                SELECT e.actor FROM work_item_events e
+                  JOIN work_items w ON w.id = e.work_item_id
+                 WHERE e.created_at >= now() - make_interval(secs => %s)
+                   AND e.note LIKE %s
+                   AND e.actor <> ''
+                   AND e.actor IS DISTINCT FROM w.assignee
+            ) a WHERE coalesce(who, '') <> '' ORDER BY who
+            """,
+            (float(since_s), float(since_s), "assigné à %"))
+        return [row["who"] for row in rows]
+
     # -- soldes --------------------------------------------------------------
     def record_balance(self, *, provider, currency, total, granted, topped_up,
-                       available, account=None) -> dict:
+                       available, account=None, unless_within_s=None) -> dict | None:
+        if unless_within_s is not None and unless_within_s > 0:
+            # L71 : une seule instruction — deux exécuteurs qui relèvent la
+            # même clé à quelques secondes d'écart n'écrivent qu'une ligne.
+            rows = self.db.query(
+                """
+                INSERT INTO provider_balances (provider, currency, total, granted,
+                                               topped_up, available, account)
+                SELECT %s, %s, %s, %s, %s, %s, %s
+                 WHERE NOT EXISTS (
+                       SELECT 1 FROM provider_balances
+                        WHERE provider = %s AND currency = %s
+                          AND account IS NOT DISTINCT FROM %s
+                          AND observed_at > now() - make_interval(secs => %s))
+                RETURNING provider, currency, total::float8 AS total,
+                          granted::float8 AS granted, topped_up::float8 AS topped_up,
+                          available, account,
+                          extract(epoch from observed_at)::float8 AS observed_ts
+                """,
+                (provider, currency, float(total),
+                 None if granted is None else float(granted),
+                 None if topped_up is None else float(topped_up), available, account,
+                 provider, currency, account, float(unless_within_s)),
+            )
+            return rows[0] if rows else None
         rows = self.db.query(
             """
             INSERT INTO provider_balances (provider, currency, total, granted, topped_up,
@@ -374,6 +438,18 @@ class Operations(interface.Operations):
              None if topped_up is None else float(topped_up), available, account),
         )
         return rows[0]
+
+    def recent_balance(self, *, provider, account, within_s) -> bool:
+        rows = self.db.query(
+            """
+            SELECT 1 AS found FROM provider_balances
+             WHERE provider = %s AND account IS NOT DISTINCT FROM %s
+               AND observed_at > now() - make_interval(secs => %s)
+             LIMIT 1
+            """,
+            (provider, account, float(within_s)),
+        )
+        return bool(rows)
 
     def balances(self, *, provider, since_s, account=None) -> list[dict]:
         filtre = " AND provider = %s" if provider else ""

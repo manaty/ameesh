@@ -260,12 +260,14 @@ class _Base(PgTestCase):
 
 
 class ChoixTest(_Base):
-    """`accounts.choose` sur Postgres réel : bascule, retour, pause, course."""
+    """`accounts.choose` sur Postgres réel : bascule, continuité, pause, course."""
 
     def _items(self):
         return accounts.parse({"codex": self._codex_comptes()})["codex"]
 
-    def test_bascule_puis_retour_apres_remise_a_zero(self):
+    def test_bascule_au_seuil_puis_retour_par_ordre_declare(self):
+        """0034 (amende 0027 §2–3) : plus de retenue ; à la remise à zéro, les
+        deux relevés échus comptent pour 0 % et l'ordre déclaré départage."""
         items = self._items()
         now = time.time()
         _codex_rollout(items[0].path, 95, now + 3600)   # primaire au seuil
@@ -274,43 +276,49 @@ class ChoixTest(_Base):
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertEqual(choix.profile.name, "secondaire")
         self.assertEqual(choix.switched["kind"], "bascule")
-        retenue = storage.of(self.db).accounts.holds(self.cfg.host, "codex")["primaire"]
-        self.assertAlmostEqual(float(retenue["until_ts"]), now + 3600, places=0)
-        # avant la remise à zéro : on reste sur le secondaire
+        self.assertIn("primaire au seuil", choix.switched["reason"])
+        self.assertEqual(storage.of(self.db).accounts.holds(self.cfg.host, "codex"), {})
+        # avant la remise à zéro : le primaire est toujours au seuil
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now + 60)
         self.assertEqual(choix.profile.name, "secondaire")
         self.assertIsNone(choix.switched)
-        # fenêtre du primaire remise à zéro (resets_at passé) : retour
+        # fenêtres remises à zéro (resets_at passé) : égalité, ordre déclaré
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now + 3700)
         self.assertEqual(choix.profile.name, "primaire")
-        self.assertEqual(choix.switched["kind"], "retour")
+        self.assertEqual(choix.switched["kind"], "bascule")
         self.assertEqual([(b["from_account"], b["to_account"], b["kind"])
                           for b in self._bascules()],
                          [("primaire", "secondaire", "bascule"),
-                          ("secondaire", "primaire", "retour")])
+                          ("secondaire", "primaire", "bascule")])
         # jauges par compte dans l'historique de L26 (colonne de compte, 0028)
         comptes = {r["account"] for r in self.db.query(
             "SELECT DISTINCT account FROM quota_gauge_readings")}
         self.assertEqual(comptes, {"primaire", "secondaire"})
 
-    def test_pas_de_retour_avant_la_remise_a_zero_meme_sous_le_rythme(self):
-        """Sans retenue, le primaire repasserait sous le plafond de rythme quand
-        la fenêtre avance, et les comptes alterneraient (0027 §3 : retour à la
-        remise à zéro seulement)."""
+    def test_la_session_garde_son_compte_sous_son_seuil(self):
+        """0034 §4 (remplace la retenue de 0027 §3) : le primaire repasse sous
+        son plafond de rythme, mais la session ouverte sur le secondaire y
+        reste ; sans session, le choix va au plus en retard sur son rythme
+        (amendement 0034 du 2026-10-10, L117) : encore le secondaire."""
         items = self._items()
         now = time.time()
-        _codex_rollout(items[0].path, 85, now + 3600)  # écoulé 80 % → plafond 90 %…
+        _codex_rollout(items[0].path, 95, now + 3600)
         _codex_rollout(items[1].path, 5, now + 3600)
         book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
-        # à 85 % pour 80 % écoulés (plafond 90 %) : sous le seuil, on reste
-        self.assertEqual(accounts.choose(self.db, self.cfg.host, "codex", items, book,
-                                         now=now).profile.name, "primaire")
-        _codex_rollout(items[0].path, 95, now + 3600)
         self.assertEqual(accounts.choose(self.db, self.cfg.host, "codex", items, book,
                                          now=now).profile.name, "secondaire")
-        _codex_rollout(items[0].path, 85, now + 3600)  # relevé redescendu ? retenu quand même
+        _codex_rollout(items[0].path, 85, now + 3600)  # écoulé 80 % → plafond 90 %
+        choix = accounts.choose(self.db, self.cfg.host, "codex", items, book,
+                                now=now + 600, session_account="secondaire")
+        self.assertEqual(choix.profile.name, "secondaire")
+        self.assertTrue(choix.kept)
+        self.assertIsNone(choix.switched)
         self.assertEqual(accounts.choose(self.db, self.cfg.host, "codex", items, book,
                                          now=now + 600).profile.name, "secondaire")
+        # le primaire redevient le plus en retard : une nouvelle session y va
+        _codex_rollout(items[1].path, 89, now + 3600)   # 89 % contre 85 %
+        self.assertEqual(accounts.choose(self.db, self.cfg.host, "codex", items, book,
+                                         now=now + 600).profile.name, "primaire")
 
     def test_tous_au_seuil_pause(self):
         items = self._items()
@@ -352,7 +360,7 @@ class ChoixTest(_Base):
         self.assertEqual(choix.profile.name, "primaire")
         with self.assertRaises(accounts.AccountError):
             accounts.force(self.db, self.cfg.host, "codex", items, "inconnu", by="human:test")
-        self.assertEqual([b["kind"] for b in self._bascules()], ["manuel", "auto", "retour"])
+        self.assertEqual([b["kind"] for b in self._bascules()], ["manuel", "auto", "bascule"])
 
     def test_profil_invalide_jamais_choisi(self):
         comptes = self._codex_comptes()

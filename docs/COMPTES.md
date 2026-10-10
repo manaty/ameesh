@@ -1,10 +1,35 @@
-# Comptes multiples par fournisseur (L30)
+# Comptes multiples par fournisseur (L30, L74, L117)
 
-Quand le compte actif d'un harnais atteint le seuil de la garde de budget
-(`min(90 %, part écoulée + 10 points)`, décision 0019), les tours suivants
-passent au compte suivant de la liste au lieu de mettre les agents en pause ;
-ils reviennent au primaire dès que sa fenêtre est remise à zéro (décision
-0027). Jamais au milieu d'un tour. Étude :
+Les comptes au forfait d'un fournisseur forment un **réservoir**, pas une
+liste de secours (décision
+[0034](design/decisions/0034-consommer-d-abord-ce-qui-expire.md), qui amende
+[0027](design/decisions/0027-bascule-automatique-entre-comptes.md)) : un
+forfait non consommé avant sa remise à zéro est perdu. Avant chaque tour, le
+compte est choisi ainsi :
+
+1. **Forçage** (`ameesh accounts use`) : ce compte, ou pause s'il est au
+   seuil. `ameesh accounts auto` rend la main à la règle.
+2. **Continuité** : une session en cours reste sur son compte tant que
+   celui-ci est sous son seuil — pas de changement en cours de session pour un
+   gain marginal.
+3. Sinon (ouverture de session, rotation, ou compte de la session au seuil) :
+   parmi les comptes **utilisables** (profil valide, sous le seuil de la garde
+   `min(90 %, part écoulée + 10 points)` dans **toutes** leurs fenêtres,
+   décision 0019), celui qui a **le plus de retard sur son rythme** : le plus
+   petit rapport `utilisé / rythme` (le rythme est le plafond de la garde à cet
+   instant de la fenêtre, colonne « rythme » de `ameesh accounts list`), pris
+   sur sa fenêtre la plus contraignante (5 h ou 7 jours). Un compte sans
+   fenêtre ouverte ou sans relevé compte pour 0 % utilisé : il passe **en
+   premier**. À égalité, celui dont la capacité inutilisée expire le plus tôt,
+   puis l'ordre déclaré (amendement du 2026-10-10 à 0034, lot L117 : un compte
+   jamais utilisé ne doit pas rester inutilisé ; avant, le primaire, toujours
+   en fenêtre ouverte, gagnait toujours).
+4. Tous les comptes au seuil : pause.
+
+Un relevé dont la fenêtre est échue (`resets_at` passé) compte pour **0 %**
+(même règle que L71) : un compte resté à 93 % sur une fenêtre close n'est plus
+écarté, il est essayé, et son premier tour rapporte sa jauge. Les jauges sont
+relues à chaque choix. Jamais au milieu d'un tour. Étude :
 [docs/design/etudes/comptes-multiples.md](design/etudes/comptes-multiples.md).
 
 Le respect des conditions d'utilisation de chaque fournisseur pour l'usage de
@@ -74,7 +99,9 @@ dans le canon :
 }
 ```
 
-* L'ordre est la priorité : le premier est le primaire.
+* L'ordre départage les égalités de retard et d'échéance (par exemple deux
+  comptes jamais utilisés, ou les clés d'API sans jauge) : le premier est le
+  primaire.
 * `config_dir` sans `path` : le dossier que le harnais prendrait de lui-même
   dans l'environnement de l'exécuteur (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`
   hérités s'ils sont posés, sinon `~/.claude` / `~/.codex`). Ses jauges Codex
@@ -86,7 +113,10 @@ dans le canon :
   seulement) ; fichier de clé **0600** ; variable de clé présente. Un compte
   qui échoue n'est jamais choisi, et `ameesh accounts list` dit pourquoi.
 * `hourly_usd` : plafond horaire du compte (dépense des tours attribués au
-  compte). `min_balance` : le compte est au seuil quand son dernier solde
+  compte). Il est propre à l'hôte et s'ajoute aux plafonds du mesh, qui se
+  règlent en base pour toutes les machines par `ameesh budget set` (L70,
+  voir [EXPLOITATION.md](EXPLOITATION.md#plafonds-de-budget-du-mesh--ameesh-budget-l70)) ;
+  un compte au seuil bascule, un plafond du mesh atteint met en pause. `min_balance` : le compte est au seuil quand son dernier solde
   relevé est au plus ce montant (relevé par l'exécuteur, ou
   `ameesh cost balance --record`).
 * Isolement : sur un hôte à comptes, chaque harnais lancé (tour ou `ameesh
@@ -103,19 +133,56 @@ dans le canon :
 ## 3. Suivre et forcer
 
 ```sh
-ameesh accounts list [--json]          # comptes, actif, état, jauges, dernières bascules
-ameesh accounts use claude secondaire  # forçage manuel (plus de bascule automatique)
-ameesh accounts auto [claude]          # retour en automatique
+ameesh accounts list [--json]          # comptes, dernier choix, état, jauges, pertes, bascules
+ameesh accounts use claude secondaire  # forçage manuel (plus de choix automatique)
+ameesh accounts auto [claude]          # retour au choix automatique (0034)
 ameesh cost report                     # dépense par agent, compte actif, jauges par compte
 ameesh cost gauges                     # historique des jauges, par compte
 ameesh cost balance --record           # soldes, par compte de clé d'API
+ameesh budget                          # plafonds du mesh en vigueur, source, pauses (L70)
 ```
 
-Chaque bascule est journalisée en base (`account_switches`), dans le journal
-de l'exécuteur et dans le fil de l'équipe de l'agent qui l'a déclenchée. Une
+`ameesh accounts list` montre, pour chaque compte, la capacité **perdue à la
+prochaine remise à zéro** de chaque fenêtre en cours si rien ne change, et le
+compte que prendrait une nouvelle session, avec sa raison (la même que celle
+du choix) :
+
+```
+harnais   compte         actif   état     jauges
+claude    primaire       oui     ok       five_hour 37% (rythme 83%), seven_day 35% (rythme 55%)
+                                          ↳ perdu à la remise à zéro si rien ne change : five_hour 63 % dans 1 h 21, seven_day 65 % dans 3 j 20 h
+claude    secondaire             ok       —
+                                          ↳ prochain choix pour une nouvelle session : sans relevé : 0 % utilisé, le plus en retard sur son rythme ; avant : tertiaire sans relevé : 0 % utilisé, primaire seven_day 35 % utilisé (rythme 55 %)
+claude    tertiaire              ok       —
+```
+
+La colonne « actif » est le **dernier compte choisi** pour une nouvelle
+session (ligne `account_active`) : des agents dont la session est ouverte sur
+un autre compte y restent tant qu'il est sous son seuil.
+
+`accounts list` et `cost report` sont des lectures : ils n'écrivent aucun
+relevé de jauge (L71) ; le relevé revient aux exécuteurs, avant chaque tour,
+ou à `ameesh cost gauges`. Un relevé dont la fenêtre est échue (`resets_at`
+passé) compte pour **0 %** : un compte inutilisé dont le dernier relevé date
+d'une fenêtre close n'est plus jugé au seuil (il ne servait pas, donc son
+relevé n'était jamais rafraîchi). L'affichage garde le dernier relevé :
+« codex-300min 0% (rythme 90%, remise à zéro passée, dernier relevé 93%) ».
+
+Chaque choix de compte est journalisé avec sa raison dans le journal de
+l'exécuteur (`[agent] compte claude : secondaire — sans relevé : 0 % utilisé,
+le plus en retard sur son rythme ; avant : tertiaire sans relevé : 0 %
+utilisé, primaire seven_day 35 % utilisé (rythme 55 %)`, ou `— continuité :
+la session reste sur primaire, sous son seuil`), une fois par changement de choix et non à
+chaque sondage. Chaque changement du dernier choix est journalisé en base
+(`account_switches`, type `bascule`, avec la même raison) et dans le fil de
+l'équipe de l'agent qui l'a déclenché. Les retenues jusqu'à la remise à zéro
+(`account_holds`) et les « retours au primaire » de 0027 §3 ne sont plus
+posés : le choix par retard sur le rythme les remplace. Une
 session reprise sous l'autre compte, ou tournée avec résumé, est dite dans le
-fil. Tous les comptes au seuil : l'agent passe en pause (`blocked`, « tous
-les comptes … au seuil »), comme avant L30.
+fil. Codex n'est jamais portable : un changement de compte d'une session
+Codex passe toujours par la rotation avec résumé (0027 §5), c'est pourquoi il
+n'a lieu qu'au seuil. Tous les comptes au seuil : l'agent passe en pause
+(`blocked`, « tous les comptes … au seuil »), comme avant L30.
 
 Le compte d'origine de la session courante est enregistré
 (`agent_registry.session_account`, L39) : l'exécuteur l'écrit avec l'id de

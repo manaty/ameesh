@@ -152,6 +152,19 @@ it disappears. Thresholds can also be set with `AMEESH_ALERT_LONG_TURN`,
 `AMEESH_ALERT_ORPHAN_LOT`, `AMEESH_ALERT_DELEGATION_GRACE` and
 `AMEESH_ALERT_INTERVAL`.
 
+**Underuse alerts** (L94) flag waste as well as overload, and `ameesh notify`
+pushes them by default:
+
+| Type | Raised when |
+|---|---|
+| `plan_underused` | a subscription account will lose unused capacity at its next reset: less than `--plan-used` % (50) used with less than `--plan-tail` (24 h, at most a quarter of the window) left, or more than `--plan-pace-gap` points (25) below the allowed pace on a window of a day or more; reports the estimated loss |
+| `idle_capacity` | wakeable agents idle without a lot for more than `--idle-capacity` (30 min) while lots wait unassigned, mail waits at a busy agent, or pay-per-token agents work while subscription agents sleep; suggests dispatching or waking the orchestrator |
+| `orchestrator_held` | an orchestrator (`--orchestrators`, `roles: [orchestrateur]` in its canon fiche, or an agent that handed out lots) is held by `ameesh attach` for more than `--orchestrator-held` (30 min) with unread mail |
+| `host_underused` | a host stays almost idle for `--host-underused` (1 h: load per CPU below 0.25, under one turn on average) while another host is under pressure or agents wait elsewhere; a suggestion only, nothing is moved |
+| `balance_low` | a pay-per-token provider's runway at the real spend rate (balance readings over 6 h, top-ups ignored) falls under `--balance-hours` (48 h), or its balance under `--balance-min` USD (20); urgent under 12 h or 5 USD |
+
+A threshold of 0 disables the matching alert.
+
 ## Pushed alerts: `ameesh notify`
 
 `ameesh alerts` is **pulled**; `ameesh notify` (v1.4.0) follows the same alerts
@@ -238,6 +251,26 @@ assignee; the lot comes back to them. At the deadline (`--within`: `30m`, `2h`,
 
 A new delegation replaces the previous one. `work list`, `work show` and
 `ameesh progress` say "delegated by X, due in 12 min" or "overdue by …".
+
+## Dated commitments and the roadmap: `ameesh plan`
+
+**Rule for orchestrators:** every dated commitment made in a conversation
+("we'll do it on Monday", "delivery on Thursday") is recorded in ameesh **when
+it is made**, with its source:
+
+```bash
+ameesh plan add "Separate accounts per organisation" --pour 2026-10-12 \
+    --projet ameesh --lot 65 --source "conversation of 2026-10-10"
+ameesh work plan 65 --debut 2026-10-10 --fin 2026-10-11 --livraison 2026-10-12
+```
+
+A date that only lives in a conversation or in the body of a task is neither
+on the Gantt (`ameesh plan show`, and the roadmap section of `ameesh
+progress`) nor watched by the `engagement_overdue` alert, which notify pushes
+to the responsible human. `ameesh plan propose` reads the canon's decisions
+and the bodies of open tasks and **proposes** commitments, decision
+milestones and dependencies; nothing is created without `--record`, and a
+recorded proposal waits for `ameesh plan accept`.
 
 ## Session bindings
 

@@ -45,7 +45,8 @@ AGENT_COLUMNS = """
     extract(epoch from status_since)::float8         as status_since_ts,
     extract(epoch from restart_requested_at)::float8 as restart_requested_ts,
     extract(epoch from session_reset_at)::float8     as session_reset_ts,
-    mode, stop_reason, session_account
+    mode, stop_reason, session_account, context_max_tokens,
+    turn_max_seconds, turn_mail_max
 """
 
 
@@ -252,6 +253,10 @@ class Agents(interface.Agents):
         rows = self.db.query("SELECT %s FROM agent_registry WHERE name = %%s" % AGENT_COLUMNS,
                              (name,))
         return rows[0] if rows else None
+
+    def harnesses(self) -> dict[str, str]:
+        rows = self.db.query("SELECT name, harness FROM agent_registry")
+        return {row["name"]: row["harness"] or "" for row in rows}
 
     def overview(self) -> list[dict]:
         return self.db.query(

@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Vue temps réel de l'avancement (lot L24, décision 0024).
 
-  ameesh progress [--json] [--project P] [--since 24h] [--stale-after 6h]
-  ameesh progress --html FICHIER [--project P] [--since 24h] [--stale-after 6h]
+  ameesh progress [--json] [--project P] [--since 24h] [--stale-after 6h] [--no-gantt]
+  ameesh progress --html FICHIER [--project P] [--since 24h] [--stale-after 6h] [--no-gantt]
 
 L'état courant et la frise du projet, **alimentés par ce qu'ameesh enregistre
 lui-même** (transitions des lots `work_items`, actions sous porte, tours et
 baux du registre, marqueur comptable, grand livre `turn_costs`) — jamais par
 git ni par le board :
 
+* **projets** (L62, en tête) : la vue de `ameesh projects` — par projet,
+  ses agents, leur état, leur lot en cours, non-lus, dépense 24 h, forfait ou
+  token, et ses lots ouverts sans agent ;
 * **lots** : jalons datés demande → gel → verdict → fusion quand ils sont
   connus, état (actif, en revue, bloqué, approuvé, fusionné, fermé),
   blocages ; et (L29) ce que le lot attend et de qui (`waiting_for`), s'il
@@ -20,8 +23,14 @@ git ni par le board :
   durée et tâche du tour en cours ;
 * **jalons du projet** : les fiches `WorkPackage` de sorte `milestone` du
   canon (L29), avec leur progression ; aucun n'est inventé ;
-* **budget** : dépense réelle des harnais payés au token, estimations des
-  forfaits, jauges de forfait déjà lues par `ameesh cost`.
+* **budget** : dépense payée au token et valeur consommée sur les forfaits,
+  jamais additionnées (L95) ; dépense réelle tirée des soldes face à
+  l'estimation ; tokens d'entrée, de cache relu et de sortie ; tours en
+  échec à part ; toutes les fenêtres de tous les comptes déclarés.
+* **feuille de route** (L96, clé `roadmap`, schéma `ameesh-roadmap/1`) : le
+  Gantt des epics, tâches, jalons et engagements, prévu face au réel, ligne
+  du jour, retards et source de chaque élément ; affiché par défaut,
+  `--no-gantt` le retire.
 
 Le JSON suit le schéma versionné `ameesh-progress/1`
 (`docs/PROGRESS.md`). `--html` écrit une page statique autonome (aucune
@@ -77,7 +86,11 @@ _WAITING = ("blocked", "waiting_human")
 #: ce que la vue ne sait pas encore lire (dit dans le JSON, jamais deviné)
 MISSING = (
     "jalons du projet : fiches WorkPackage `milestone` du canon synchronisé "
-    "(`ameesh canon sync`) ; sans date déclarée (`at_ts` null)",
+    "(`ameesh canon sync`) ; leur date vient de la fiche (`date`, `delivery`) ou "
+    "de `ameesh work plan <fiche>` ; sans date, `at_ts` est null",
+    "feuille de route (L96) : dates prévues posées par `ameesh work plan` ou au "
+    "canon, engagements de `ameesh plan add` ; une date dite en conversation et "
+    "jamais enregistrée n'y est pas",
     "jalons de lot : lus dans la table des jalons de lot (L10) quand un gel ou "
     "un verdict y est déclaré, sinon déduits du journal des transitions et des "
     "actions de fusion",
@@ -410,26 +423,50 @@ def build_agent(row: dict, now: float, effort: str | None = None) -> dict:
 
 def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
                  paid_harnesses: Iterable[str] | None = None,
-                 hourly_cap: float = cost_mod.DEFAULT_HOURLY_USD) -> dict:
+                 hourly_cap: float = cost_mod.DEFAULT_HOURLY_USD,
+                 real: list[dict] | None = None,
+                 accounts: list[dict] | None = None) -> dict:
+    """La section `budget` de l'instantané.
+
+    L95 : la dépense **payée au token** (`paid_usd`, de vrais dollars) et la
+    **valeur consommée sur les forfaits** (`plan_value_usd`, équivalent
+    théorique au barème, qui ne coûte rien de plus par tour) ne s'additionnent
+    plus pour l'affichage ; `total_usd` reste dans le JSON pour les lecteurs
+    d'avant. `real` : dépense réelle tirée des soldes, face à l'estimation
+    (`balance.compare`). `accounts` : tous les comptes déclarés de l'hôte,
+    toutes leurs fenêtres, la capacité perdue à la prochaine remise à zéro et
+    le prochain compte choisi (`accounts.report`, L74).
+    """
     # Les harnais payés au token viennent des descripteurs (L16) : plus de liste
     # fermée dans le code. `None` = les relire maintenant.
     paid = cost_mod.paid_harnesses_of() if paid_harnesses is None else tuple(paid_harnesses)
-    spend = {key: {"total_usd": 0.0, "paid_usd": 0.0} for key in ("window", "1h", "24h")}
+    spend = {key: {"total_usd": 0.0, "paid_usd": 0.0, "plan_value_usd": 0.0}
+             for key in ("window", "1h", "24h")}
     by_agent = []
     for row in cost_rows:
         is_paid = (row.get("harness") or "") in paid
         for key, col in (("window", "usd_window"), ("1h", "usd_1h"), ("24h", "usd_24h")):
             value = float(row.get(col) or 0.0)
             spend[key]["total_usd"] += value
-            if is_paid:
-                spend[key]["paid_usd"] += value
+            spend[key]["paid_usd" if is_paid else "plan_value_usd"] += value
+        turns = int(row.get("turns") or 0)
+        failed = int(row.get("failed_turns") or 0)
+        inputs = int(row.get("input_tokens") or 0)
+        cached = int(row.get("cached_input_tokens") or 0)
         by_agent.append({
             "agent": row["agent"], "harness": row.get("harness"),
             "model": row.get("model") or None, "paid": is_paid,
             "usd": round(float(row.get("usd_window") or 0.0), 6),
-            "turns": int(row.get("turns") or 0),
-            "input_tokens": int(row.get("input_tokens") or 0),
-            "cached_input_tokens": int(row.get("cached_input_tokens") or 0),
+            # L95 : un tour sans aucun usage (échec du harnais, tour
+            # interrompu) n'est pas du travail : compté à part
+            "turns": turns - failed,
+            "failed_turns": failed,
+            "input_tokens": inputs,
+            "cached_input_tokens": cached,
+            # entrée hors cache : Codex compte le cache DANS `input_tokens`,
+            # les autres harnais à part (`TurnUsage.reread_tokens`)
+            "fresh_input_tokens": (max(inputs - cached, 0)
+                                   if row.get("harness") == "codex" else inputs),
             "output_tokens": int(row.get("output_tokens") or 0),
         })
     for bucket in spend.values():
@@ -440,14 +477,61 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
         "paid_harnesses": list(paid),
         "hourly_cap_usd": float(hourly_cap),
         "spend": spend,
-        "by_agent": [r for r in by_agent if r["usd"] or r["turns"]],
+        "real": list(real or []),
+        "by_agent": [r for r in by_agent if r["usd"] or r["turns"] or r["failed_turns"]],
         "plans": [{
-            "harness": g.harness, "key": g.key, "used": round(g.used, 4),
+            "harness": g.harness, "key": g.key, "used": round(g.used_at(now), 4),
             "pace_cap": round(g.pace_cap(now), 4), "elapsed": round(g.elapsed(now), 4),
             "resets_ts": _round(g.resets_at), "window_s": g.window_s,
             "exceeded": g.exceeded(now),
         } for g in gauges],
+        "accounts": [_account_view(row) for row in (accounts or [])],
     }
+
+
+def _account_view(row: dict) -> dict:
+    """Un compte de `accounts.report` pour l'instantané (aucun secret : le
+    type et l'emplacement seulement)."""
+    return {
+        "harness": row["harness"], "account": row["account"],
+        "active": bool(row.get("active")), "forced": bool(row.get("forced")),
+        "ok": bool(row.get("ok")), "reason": row.get("reason") or "",
+        "next": bool(row.get("next")), "why": row.get("why") or "",
+        "expires_in_s": row.get("expires_in_s"),
+        "gauges": [{
+            "key": g["key"], "used": round(float(g["used"]), 4),
+            "last_used": round(float(g.get("last_used", g["used"])), 4),
+            "pace_cap": round(float(g["cap"]), 4), "elapsed": round(float(g["elapsed"]), 4),
+            "resets_ts": _round(g.get("resets_at")),
+            "reset_passed": bool(g.get("reset_passed")),
+        } for g in row.get("gauges") or []],
+        "losses": [{"key": l["key"], "resets_ts": _round(l["resets_at"]),
+                    "in_s": int(l["in_s"]), "lost": round(float(l["lost"]), 4)}
+                   for l in row.get("losses") or []],
+    }
+
+
+def _real_spend(db, paid: Iterable[str], since_ts: float, now: float) -> list[dict]:
+    """Dépense réelle (soldes) face à l'estimation, sur la fenêtre et sur 24 h
+    (L95). Un relevé illisible n'empêche jamais l'instantané."""
+    from . import balance as balance_mod
+    paid = tuple(paid)
+    try:
+        start = min(since_ts, now - 86400.0)
+        rows = storage.of(db).operations.balances(provider=None,
+                                                  since_s=max(0.0, now - start) + 1.0)
+        out = []
+        periods = [("24h", now - 86400.0)]
+        if abs(since_ts - (now - 86400.0)) > 60.0:
+            periods.insert(0, ("window", since_ts))   # fenêtre autre que 24 h
+        for key, begin in periods:
+            for entry in balance_mod.compare(db, paid, begin, now, rows=rows):
+                out.append(dict(entry, period=key))
+        return out
+    except db_mod.DbError:
+        raise
+    except (KeyError, TypeError, ValueError):
+        return []
 
 
 # --------------------------------------------------------------------------
@@ -465,7 +549,7 @@ def _truncation(rows: list[dict], limit: int) -> dict | None:
 def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = None,
              book: cost_mod.CostBook | None = None, now: float | None = None,
              max_lots: int = MAX_LOTS, max_actions: int = MAX_ACTIONS,
-             stale_after: float | None = None) -> dict:
+             stale_after: float | None = None, gantt: bool = True) -> dict:
     """L'instantané `ameesh-progress/1` (voir docs/PROGRESS.md).
 
     Les bornes (`max_lots`, `max_actions`) ne limitent que le RENDU : les
@@ -513,10 +597,37 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     if book is None:
         book = cost_mod.CostBook(state_dir=cfg.state_dir if cfg else None, db=db)
     try:
-        gauges = book.gauges()
+        # lecture seule (L61) : l'historique des jauges est tenu par l'exécuteur
+        gauges = book.gauges(record=False)
     except (OSError, ValueError):
         gauges = []
-    hourly = getattr(cfg, "budget_usd_per_hour", None) or cost_mod.DEFAULT_HOURLY_USD
+    # L95 : tous les comptes déclarés, toutes leurs fenêtres (lecture seule)
+    accounts: list = []
+    if cfg is not None:
+        from . import accounts as accounts_mod
+        try:
+            accounts = accounts_mod.report(cfg, db, book, now=now, record=False)
+        except accounts_mod.AccountError:
+            accounts = []
+    paid = cost_mod.paid_harnesses_of()
+    real = _real_spend(db, paid, since_ts, now)
+    # L70 : plafonds en vigueur (base > configuration de l'hôte > défaut)
+    limits = None
+    if cfg is not None:
+        from . import budget as budget_mod
+        limits = budget_mod.current(cfg, db).as_dict()
+        hourly = limits["per_hour_usd"] or 0.0
+    else:
+        hourly = cost_mod.DEFAULT_HOURLY_USD
+    # L62 : la vue par projet en tête (une requête de plus, agrégée)
+    from . import projects as projects_mod
+    by_project = projects_mod.snapshot(db, project=project, now=now)
+    # L96 : la feuille de route en Gantt (prévu face au réel), affichée par
+    # défaut ; `--no-gantt` la retire
+    roadmap = None
+    if gantt:
+        from . import roadmap as roadmap_mod
+        roadmap = roadmap_mod.build(db, now=now, project=project)
 
     return {
         "schema": SCHEMA,
@@ -526,13 +637,20 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         "host": getattr(cfg, "host", None),
         "project": project or None,
         "window": {"from_ts": _round(since_ts), "to_ts": _round(now)},
+        # L62 (champ ajouté) : projets, agents et lot en cours, lots sans agent
+        "projects": by_project["projects"],
+        # L96 (champ ajouté) : feuille de route, schéma ameesh-roadmap/1 ; null
+        # avec --no-gantt
+        "roadmap": roadmap,
         "lots": lots,
         "agents": agents,
         "milestones": plan["milestones"],
         "epics": plan["epics"],
         "stale_after_s": int(threshold),
         "actions": [build_action(r) for r in action_rows],
-        "budget": build_budget(cost_rows, gauges, now, hourly_cap=hourly),
+        "budget": dict(build_budget(cost_rows, gauges, now, hourly_cap=hourly,
+                                    paid_harnesses=paid, real=real, accounts=accounts),
+                       limits=limits),
         "truncated": truncated,
         "missing": list(MISSING),
     }
@@ -581,6 +699,21 @@ def format_text(snap: dict, width: int | None = None) -> str:
     line("avancement%s — %s (fenêtre %s)" % (
         " de %s" % snap["project"] if snap.get("project") else "",
         _hm(now, now), _duration(hours * 3600)))
+
+    if "projects" in snap:
+        # L62 : qui travaille sur quoi, avant le détail des lots
+        from . import projects as projects_mod
+        out.append("")
+        line("PROJETS (%d en cours)" % sum(1 for p in snap["projects"] if p["active"]))
+        out.extend(projects_mod.format_lines(
+            {"generated_ts": now, "projects": snap["projects"]}, width,
+            show_inactive=bool(snap.get("project")), indent="  "))
+
+    if snap.get("roadmap"):
+        # L96 : la feuille de route (Gantt texte), avant le détail des lots
+        from . import roadmap as roadmap_mod
+        out.append("")
+        out.extend(roadmap_mod.format_gantt(snap["roadmap"], width).splitlines())
 
     out.append("")
     line("LOTS (%d)" % len(snap["lots"]))
@@ -656,7 +789,7 @@ def format_text(snap: dict, width: int | None = None) -> str:
             progress = ("%d/%d lots fusionnés" % (
                 ms["lots_merged"], ms["lots_total"] - ms.get("lots_abandoned", 0))
                 if "lots_total" in ms else "")
-            line("%s %s%s" % (_hm(ms.get("at_ts"), now) if ms.get("at_ts") else "sans date",
+            line("%s %s%s" % (ms["date"] if ms.get("date") else "sans date",
                               ms.get("title", ""), " — %s" % progress if progress else ""), "  ")
     else:
         line("JALONS : aucun déclaré au canon")
@@ -665,19 +798,76 @@ def format_text(snap: dict, width: int | None = None) -> str:
     budget = snap["budget"]
     sp = budget["spend"]
     line("BUDGET (USD)")
-    line("payé au token : 1 h %.2f · 24 h %.2f · fenêtre %.2f (plafond %.2f/h)" % (
+    line("dépensé (payé au token, estimé) : 1 h %.2f · 24 h %.2f · fenêtre %.2f "
+         "(plafond %.2f/h)" % (
         sp["1h"]["paid_usd"], sp["24h"]["paid_usd"], sp["window"]["paid_usd"],
         budget["hourly_cap_usd"]), "  ")
-    line("total estimé : 1 h %.2f · 24 h %.2f · fenêtre %.2f" % (
-        sp["1h"]["total_usd"], sp["24h"]["total_usd"], sp["window"]["total_usd"]), "  ")
+    lim = budget.get("limits")
+    if lim:
+        # L70 : plafonds en vigueur et leur source (`ameesh budget`)
+        line("plafonds : %s/h (%s) · %s/jour (%s)%s" % (
+            "%.2f" % lim["per_hour_usd"] if lim.get("per_hour_usd") else "aucun",
+            lim["per_hour_source"],
+            "%.2f" % lim["per_day_usd"] if lim.get("per_day_usd") else "aucun",
+            lim["per_day_source"],
+            " · %d agent(s) à plafond propre" % len(lim["agents"]) if lim["agents"] else ""),
+            "  ")
+    # L95 : la valeur des forfaits n'est pas une dépense, jamais additionnée
+    line("valeur consommée sur les forfaits (équivalent au barème, non payée au "
+         "tour) : 1 h %.2f · 24 h %.2f · fenêtre %.2f" % (
+             sp["1h"].get("plan_value_usd", 0.0), sp["24h"].get("plan_value_usd", 0.0),
+             sp["window"].get("plan_value_usd", 0.0)), "  ")
+    from . import balance as balance_mod
+    for entry in budget.get("real") or []:
+        line(balance_mod.describe(entry), "  ")
+    for row in budget.get("by_agent") or []:
+        line("%s (%s%s) : %d tour(s)%s · entrée %s · cache relu %s · sortie %s · %.2f $" % (
+            row["agent"], row["harness"] or "?", ", payé" if row["paid"] else "",
+            row["turns"], " + %d en échec" % row["failed_turns"] if row.get("failed_turns")
+            else "", _tokens(row.get("fresh_input_tokens", row["input_tokens"])),
+            _tokens(row["cached_input_tokens"]), _tokens(row["output_tokens"]),
+            row["usd"]), "  ")
+    covered = {a["harness"] for a in budget.get("accounts") or []}
+    for acc in budget.get("accounts") or []:
+        line("compte %s/%s%s%s : %s" % (
+            acc["harness"], acc["account"], " (actif)" if acc["active"] else "",
+            " — prochain choix" if acc["next"] else "",
+            ", ".join(_gauge_text(g) for g in acc["gauges"]) or "aucune jauge lue"), "  ")
+        if acc["reason"]:
+            line("↳ %s" % acc["reason"], "    ")
+        if acc["losses"]:
+            line("↳ perdu à la remise à zéro si rien ne change : %s" % ", ".join(
+                "%s %.0f\u00a0%% dans %s" % (l["key"], l["lost"] * 100, _duration(l["in_s"]))
+                for l in acc["losses"]), "    ")
     for plan in budget["plans"]:
+        if plan["harness"] in covered:
+            continue                # déjà montré compte par compte
         # espace insécable avant « % » : la coupure ne l'isole jamais
         line("forfait %s %s : %.0f\u00a0%% (rythme %.0f\u00a0%%)%s" % (
             plan["harness"], plan["key"], plan["used"] * 100, plan["pace_cap"] * 100,
             " — DÉPASSÉ" if plan["exceeded"] else ""), "  ")
-    if not budget["plans"]:
+    if not budget["plans"] and not budget.get("accounts"):
         line("forfaits : aucune jauge lue sur cet hôte", "  ")
     return "\n".join(out)
+
+
+def _tokens(n) -> str:
+    """Un nombre de jetons lisible : 1 234, 12,3 k, 4,56 M."""
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return ("%.2f M" % (n / 1e6)).replace(".", ",")
+    if n >= 10_000:
+        return ("%.1f k" % (n / 1e3)).replace(".", ",")
+    return str(n)
+
+
+def _gauge_text(g: dict) -> str:
+    text = "%s %.0f\u00a0%% (rythme %.0f\u00a0%%)" % (g["key"], g["used"] * 100,
+                                                     g["pace_cap"] * 100)
+    if g.get("reset_passed"):
+        text += " remise à zéro passée"
+    return text
+
 
 
 # --------------------------------------------------------------------------
@@ -734,6 +924,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project", default=None, help="projet (app, workstream, équipe)")
     parser.add_argument("--since", default=DEFAULT_SINCE,
                         help="début de la fenêtre : durée (16h, 2d) ou date ISO (défaut 24h)")
+    parser.add_argument("--no-gantt", action="store_true",
+                        help="sans la feuille de route en Gantt (affichée par défaut, L96)")
     parser.add_argument("--stale-after", default=None,
                         help="lot stagnant sans activité depuis cette durée (défaut "
                              "AMEESH_STALE_AFTER, sinon 6h)")
@@ -751,9 +943,11 @@ def main(argv: list[str] | None = None) -> int:
             raise ProgressError("--stale-after : %s" % exc)
         db = db_mod.connect(cfg)
         try:
-            db_mod.require_schema(db)
-            snap = snapshot(db, cfg, since=args.since, project=args.project,
-                            stale_after=threshold)
+            db_mod.require_schema(db, defer=True)
+            # L61 : lectures regroupées (db.batched) — deux allers-retours
+            snap = db_mod.batched(db, lambda db: snapshot(
+                db, cfg, since=args.since, project=args.project, stale_after=threshold,
+                gantt=not args.no_gantt))
         finally:
             db.close()
         if args.html:

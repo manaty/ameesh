@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """ameesh — la commande du mesh, et ses sous-commandes.
 
+  ameesh --version | version  la version du paquet installé ;
   ameesh mail <send|inbox|list|status|alias|hook|statusline|whoami>
         la boîte aux lettres ; `agent-mail` reste un alias (les hooks des
         harnais l'appellent) ;
@@ -19,7 +20,11 @@
         historique, solde du fournisseur payé au token (`cost turns|gauges|balance`) ;
   ameesh accounts list | use <harnais> <compte> | auto [harnais]
         comptes multiples par fournisseur : actif, jauges, forçage (L30) ;
+  ameesh budget [--json] | set --per-hour X [--per-day Y] [--agent A]
+        | unset [--per-hour] [--per-day] [--agent A]
+        plafonds de budget du mesh, en base, relus à chaud (L70) ;
   ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais
+        context_max_tokens=15M|0 turn_max_seconds=30m|2h|0 turn_mail_max=5|0
         réglages d'exécution, effet au prochain tour ;
   ameesh alerts [--follow] [--json]     alertes d'exploitation (un objet par ligne) ;
   ameesh notify [--once] [--dry-run] [--interval S] [--json] | --test human:ID
@@ -35,6 +40,14 @@
   ameesh interrupt <agent> <message…>   interruption directe (expéditeurs habilités) ;
   ameesh progress [--json] [--html FICHIER] [--project P] [--since 24h]
         avancement : lots, agents, jalons, budget (schéma ameesh-progress/1) ;
+  ameesh projects [--json] [--project P] [--all]
+        projets en cours : agents, état, lot en cours, non-lus, dépense 24 h,
+        forfait ou token, lots sans agent (schéma ameesh-projects/1, L62) ;
+  ameesh plan add "quoi" --pour J [--projet P] [--lot N] [--source S] | list
+        | accept <id> | done <id> | cancel <id> | propose [--record] | show [--json]
+        feuille de route : engagements datés, propositions tirées des décisions,
+        Gantt texte (schéma ameesh-roadmap/1, L96) ; dates prévues d'une
+        tâche ou d'une fiche : `ameesh work plan <id> --debut J --fin J --livraison J` ;
   ameesh fil list | show <projet> [<lot>] [--last N] | tail <projet> [<lot>]
         les fils lisibles : tout message passé par ameesh, en clair (R12) ;
   ameesh receipt verify | authenticator list   reçus d'approbation (spec §8) ;
@@ -49,6 +62,7 @@
   ameesh harness list|show|check        descripteurs de harnais (L16) ;
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
+  ameesh menage [--apply] [--json]      ménage de ce que les agents créent (L73) ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -70,6 +84,8 @@ MESH_COMMANDS = (
     "review-class",
     # L31 : ressources des hôtes (`ameesh hosts`)
     "hosts",
+    # L73 : ménage de ce que les agents créent (`ameesh menage [--apply]`)
+    "menage",
     # L14 : le catalogue des modèles a son point d'entrée public, comme les autres
     # (`ameesh models list|show|discover`) — sans cette ligne, la commande sortait en
     # code 2 « sous-commande inconnue » AVANT toute base (revue B5).
@@ -78,6 +94,8 @@ MESH_COMMANDS = (
     "harness",
     # L30 : comptes multiples par fournisseur (`ameesh accounts list|use|auto`)
     "accounts",
+    # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
+    "budget",
 )
 #: exploitation (L26) : alertes, redémarrage sur brief, interruption directe
 EXPLOITATION_COMMANDS = ("alerts", "restart", "interrupt")
@@ -134,6 +152,10 @@ def _dispatch(argv: list[str] | None) -> int:
         print(__doc__)
         return 0
     command, rest = argv[0], argv[1:]
+    if command in ("--version", "version"):
+        from . import version
+        print("ameesh %s" % version())
+        return 0
     if command == "mail":
         from . import cli
         return cli.main(rest)
@@ -146,6 +168,13 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "progress":
         from . import progress
         return progress.main(rest)
+    if command == "projects":
+        from . import projects
+        return projects.main(rest)
+    if command == "plan":
+        # L96 : feuille de route (engagements, propositions, Gantt)
+        from . import roadmap
+        return roadmap.main(rest)
     if command == "fil":
         from . import fil
         return fil.main(rest)

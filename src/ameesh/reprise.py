@@ -624,8 +624,12 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
         return out
     previous = account_turn.recorded_session_account(cfg, row)
     book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, tools={row["name"]: harness})
+    # L74 (0034 §4) : la session garde son compte d'origine tant qu'il est sous
+    # son seuil
+    origine = previous or next((p.name for p in items if p.home() == accounts.Profile(
+        harness=harness, name="(défaut)").home()), None)
     choice = accounts.choose(db, cfg.host, harness, items, book, agent=row["name"],
-                             simulate=True)
+                             simulate=True, session_account=origine)
     nxt = choice.profile or choice.active or items[0]
     if choice.profile is None:
         out["warnings"].append("tous les comptes %s sont au seuil (%s) : l'agent reprendra "
