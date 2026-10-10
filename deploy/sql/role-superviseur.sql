@@ -342,7 +342,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L96 (0044) : dates prévues
         'planned_start', 'planned_end', 'planned_delivery', 'planned_source',
         'planned_by', 'planned_at',
-        -- L118 (0048) : branche du lot, sa cible, dernier commit vu en avance
+        -- L118 (0050) : branche du lot, sa cible, dernier commit vu en avance
         'branch', 'branch_target', 'branch_head'
     ]),
     -- L40 (0031) : registre des délégations et de leur issue (de l'ÉTAT)

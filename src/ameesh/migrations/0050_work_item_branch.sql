@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
--- 0048_work_item_branch — la branche d'un lot et sa cible (lot L118).
+-- 0050_work_item_branch — la branche d'un lot et sa cible (lot L118).
 --
 -- Le 2026-10-10, les lots d'un orchestrateur restaient ouverts après la
 -- fusion de leur branche : l'équipe fusionne directement sur la branche cible,
