@@ -111,6 +111,14 @@ ameesh cost gauges                     # historique des jauges, par compte
 ameesh cost balance --record           # soldes, par compte de clé d'API
 ```
 
+`accounts list` et `cost report` sont des lectures : ils n'écrivent aucun
+relevé de jauge (L71) ; le relevé revient aux exécuteurs, avant chaque tour,
+ou à `ameesh cost gauges`. Un relevé dont la fenêtre est échue (`resets_at`
+passé) compte pour **0 %** : un compte inutilisé dont le dernier relevé date
+d'une fenêtre close n'est plus jugé au seuil (il ne servait pas, donc son
+relevé n'était jamais rafraîchi). L'affichage garde le dernier relevé :
+« codex-300min 0% (rythme 90%, remise à zéro passée, dernier relevé 93%) ».
+
 Chaque bascule est journalisée en base (`account_switches`), dans le journal
 de l'exécuteur et dans le fil de l'équipe de l'agent qui l'a déclenchée. Une
 session reprise sous l'autre compte, ou tournée avec résumé, est dite dans le

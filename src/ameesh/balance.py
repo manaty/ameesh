@@ -202,24 +202,37 @@ def account_sources(cfg, *, env: dict | None = None, transport: Transport | None
     return out
 
 
-def record(db, source: BalanceSource, account: str | None = None) -> list[dict]:
+def record(db, source: BalanceSource, account: str | None = None,
+           min_interval_s: float = 0.0) -> list[dict]:
     """Lit le solde et l'enregistre (une ligne par devise).
 
     `account` (L30, migration 0028) : le compte (clé d'API) dont la source porte
     la clé ; la série de soldes est alors celle de ce compte.
+
+    `min_interval_s` (L71) : relevé **partagé** entre exécuteurs. Chaque
+    exécuteur qui voit la clé relève le solde ; sans garde, deux exécuteurs
+    écrivaient deux lignes toutes les 15 minutes. Si un relevé de ce
+    fournisseur (et compte) a moins de `min_interval_s` secondes, rien n'est
+    demandé au fournisseur ni écrit ; l'écriture elle-même est conditionnelle,
+    pour deux relèves lancées à la même seconde.
     """
+    ops = storage.of(db).operations
+    if min_interval_s > 0 and ops.recent_balance(
+            provider=source.provider, account=account, within_s=min_interval_s):
+        return []
     rows = []
     for reading in source.fetch():
-        if account is None:
-            rows.append(storage.of(db).operations.record_balance(
-                provider=reading.provider, currency=reading.currency, total=reading.total,
-                granted=reading.granted, topped_up=reading.topped_up,
-                available=reading.available))
-        else:
-            rows.append(storage.of(db).operations.record_balance(
-                provider=reading.provider, currency=reading.currency, total=reading.total,
-                granted=reading.granted, topped_up=reading.topped_up,
-                available=reading.available, account=account))
+        extra: dict = {}
+        if account is not None:
+            extra["account"] = account
+        if min_interval_s > 0:
+            extra["unless_within_s"] = min_interval_s
+        row = ops.record_balance(
+            provider=reading.provider, currency=reading.currency, total=reading.total,
+            granted=reading.granted, topped_up=reading.topped_up,
+            available=reading.available, **extra)
+        if row is not None:
+            rows.append(row)
     return rows
 
 

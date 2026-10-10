@@ -493,8 +493,8 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         book.record_gauges(result.gauges, account=profile.name)
     depasses = []
     for gauge in result.gauges:
-        if gauge.reset_passed(now):
-            continue  # fenêtre remise à zéro depuis le relevé : vierge
+        # fenêtre remise à zéro depuis le relevé : vierge (L71 : `exceeded`
+        # compte alors 0 %, voir `Gauge.used_at`)
         if gauge.exceeded(now):
             depasses.append(gauge)
     if depasses:
@@ -696,10 +696,15 @@ def automatic(db, host: str, harness: str, *, by: str) -> bool:
 
 def report(cfg, db, book, *, now: float | None = None,
            harnesses: list[str] | None = None,
-           evaluate_fn: Callable | None = None) -> list[dict]:
+           evaluate_fn: Callable | None = None,
+           record: bool = True) -> list[dict]:
     """Une ligne par compte déclaré : actif, forcé, état, jauges, retenue.
 
-    Lecture seule : aucune bascule n'est faite ici.
+    Lecture seule : aucune bascule n'est faite ici. `record=False` (L71) :
+    l'historique des jauges n'est pas écrit non plus — c'est le cas des
+    commandes d'affichage (`ameesh accounts list`, `ameesh cost report`) ;
+    le relevé revient aux exécuteurs (avant chaque tour) ou à une demande
+    explicite.
     """
     now = time.time() if now is None else now
     declared = parse(getattr(cfg, "accounts", None) or {})
@@ -712,7 +717,7 @@ def report(cfg, db, book, *, now: float | None = None,
         holds = store.holds(cfg.host, harness) if store else {}
         active_name = (active or {}).get("account") or items[0].name
         for profile in items:
-            result = (evaluate_fn or evaluate)(book, profile, items, now)
+            result = (evaluate_fn or evaluate)(book, profile, items, now, record=record)
             hold = holds.get(profile.name) or {}
             rows.append({
                 "harness": harness,
@@ -727,7 +732,10 @@ def report(cfg, db, book, *, now: float | None = None,
                 "hold_until": hold.get("until_ts"),
                 "hourly_usd": profile.hourly_usd,
                 "gauges": [
-                    {"key": g.key, "used": g.used, "cap": g.pace_cap(now),
+                    # L71 : une fenêtre échue compte pour 0 % ; le dernier
+                    # relevé reste lisible (`last_used`)
+                    {"key": g.key, "used": g.used_at(now), "last_used": g.used,
+                     "cap": g.pace_cap(now),
                      "elapsed": g.elapsed(now), "resets_at": g.resets_at,
                      "reset_passed": g.reset_passed(now)}
                     for g in result.gauges
@@ -748,7 +756,8 @@ def format_rows(rows: list[dict]) -> str:
         gauges = ", ".join(
             "%s %.0f%% (rythme %.0f%%%s)" % (
                 g["key"], g["used"] * 100, g["cap"] * 100,
-                ", remise à zéro passée" if g.get("reset_passed") else "")
+                ", remise à zéro passée, dernier relevé %.0f%%"
+                % (g.get("last_used", g["used"]) * 100) if g.get("reset_passed") else "")
             for g in row["gauges"]) or "—"
         lines.append("%-9s %-14s %-7s %-8s %s" % (
             row["harness"], row["account"], actif, etat, gauges))

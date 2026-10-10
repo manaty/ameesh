@@ -359,7 +359,31 @@ class Operations(interface.Operations):
 
     # -- soldes --------------------------------------------------------------
     def record_balance(self, *, provider, currency, total, granted, topped_up,
-                       available, account=None) -> dict:
+                       available, account=None, unless_within_s=None) -> dict | None:
+        if unless_within_s is not None and unless_within_s > 0:
+            # L71 : une seule instruction — deux exécuteurs qui relèvent la
+            # même clé à quelques secondes d'écart n'écrivent qu'une ligne.
+            rows = self.db.query(
+                """
+                INSERT INTO provider_balances (provider, currency, total, granted,
+                                               topped_up, available, account)
+                SELECT %s, %s, %s, %s, %s, %s, %s
+                 WHERE NOT EXISTS (
+                       SELECT 1 FROM provider_balances
+                        WHERE provider = %s AND currency = %s
+                          AND account IS NOT DISTINCT FROM %s
+                          AND observed_at > now() - make_interval(secs => %s))
+                RETURNING provider, currency, total::float8 AS total,
+                          granted::float8 AS granted, topped_up::float8 AS topped_up,
+                          available, account,
+                          extract(epoch from observed_at)::float8 AS observed_ts
+                """,
+                (provider, currency, float(total),
+                 None if granted is None else float(granted),
+                 None if topped_up is None else float(topped_up), available, account,
+                 provider, currency, account, float(unless_within_s)),
+            )
+            return rows[0] if rows else None
         rows = self.db.query(
             """
             INSERT INTO provider_balances (provider, currency, total, granted, topped_up,
@@ -374,6 +398,18 @@ class Operations(interface.Operations):
              None if topped_up is None else float(topped_up), available, account),
         )
         return rows[0]
+
+    def recent_balance(self, *, provider, account, within_s) -> bool:
+        rows = self.db.query(
+            """
+            SELECT 1 AS found FROM provider_balances
+             WHERE provider = %s AND account IS NOT DISTINCT FROM %s
+               AND observed_at > now() - make_interval(secs => %s)
+             LIMIT 1
+            """,
+            (provider, account, float(within_s)),
+        )
+        return bool(rows)
 
     def balances(self, *, provider, since_s, account=None) -> list[dict]:
         filtre = " AND provider = %s" if provider else ""
