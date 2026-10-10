@@ -22,10 +22,9 @@ from __future__ import annotations
 import os
 import re
 import shutil
-import sys
 import time
 
-from . import storage
+from . import platform, storage
 from .db import Db
 
 #: valeurs par défaut prudentes des seuils (0028), quand la fiche Host n'en
@@ -76,7 +75,7 @@ THRESHOLD_KEYS = ("min_mem_available", "max_swap_used", "max_load", "min_disk_fr
 FRACTION_KEYS = ("max_tmpfs_used",)
 #: dossier des sources d'alimentation (Linux) ; surchargé par les tests
 POWER_SUPPLY_ENV = "AMEESH_POWER_SUPPLY_DIR"
-POWER_SUPPLY_DIR = "/sys/class/power_supply"
+POWER_SUPPLY_DIR = platform.host.POWER_SUPPLY_DIR
 
 #: horizon de conservation des relevés (secondes) ; l'historique court de
 #: `ameesh hosts` n'a pas besoin de plus, et la table ne grandit pas sans fin.
@@ -155,114 +154,32 @@ def parse_percent(value) -> float | None:
     return number
 
 
-def boot_time(path: str = "/proc/stat") -> float | None:
-    """Instant du démarrage de l'hôte (epoch), ou None hors Linux (L106)."""
+def boot_time(path: str | None = None) -> float | None:
+    """Instant du démarrage de l'hôte (epoch), ou None s'il est inconnu (L106,
+    via la couche plateforme L63)."""
     try:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith("btime "):
-                    return float(line.split()[1])
-    except (OSError, ValueError, IndexError):
-        return None
-    return None
-
-
-def _read(path: str) -> str | None:
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return fh.read().strip()
-    except (OSError, UnicodeDecodeError):
+        return platform.boot_time(path)
+    except platform.NotAvailable:
         return None
 
 
 def power(base: str | None = None) -> dict:
     """Alimentation de l'hôte (L106) : `on_ac` (secteur), `battery_percent`.
 
-    Linux : `/sys/class/power_supply` — secteur (`Mains`, `USB*`, champ
-    `online`) et batteries du SYSTÈME (`scope` ≠ `Device` : pas la souris),
-    pourcentage pondéré par la capacité quand plusieurs batteries. Sans
-    source de secteur déclarée, l'état de charge des batteries tranche
-    (`Discharging` = sur batterie). Ailleurs, ou illisible : None (« inconnu ») —
-    on ne devine pas, et aucune garde ne se déclenche sur un inconnu. Un
-    autre système se branchera ici (pas de couche plateforme pour l'instant).
-    """
-    out: dict = {"on_ac": None, "battery_percent": None}
-    base = base or os.environ.get(POWER_SUPPLY_ENV) or POWER_SUPPLY_DIR
-    if not sys.platform.startswith("linux") and base == POWER_SUPPLY_DIR:
-        return out
+    Lue par la couche plateforme (L63) : sysfs sous Linux, psutil sous macOS
+    et Windows. `base` (ou `AMEESH_POWER_SUPPLY_DIR`) : un dossier au format
+    /sys/class/power_supply, pour les tests. Inconnu : None — on ne devine
+    pas, et aucune garde ne se déclenche sur un inconnu."""
+    return platform.power(base or os.environ.get(POWER_SUPPLY_ENV) or None)
+
+
+def _meminfo(path: str | None = None) -> dict[str, int]:
+    """(mémoire disponible, swap utilisé) en octets, par la couche plateforme ;
+    `path` : un fichier au format /proc/meminfo. Illisible : {} (rien publié)."""
     try:
-        names = sorted(os.listdir(base))
-    except OSError:
-        return out
-    mains: list[bool] = []
-    batteries: list[tuple[float, float, str]] = []  # (pourcentage, poids, état)
-    for name in names:
-        root = os.path.join(base, name)
-        kind = (_read(os.path.join(root, "type")) or "").lower()
-        if kind in ("mains", "usb", "usb_c", "usb_pd", "usb_pd_drp", "wireless"):
-            online = _read(os.path.join(root, "online"))
-            if online in ("0", "1", "2"):
-                mains.append(online != "0")
-        elif kind == "battery":
-            if (_read(os.path.join(root, "scope")) or "").lower() == "device":
-                continue
-            if _read(os.path.join(root, "present")) == "0":
-                continue
-            percent = parse_percent(_read(os.path.join(root, "capacity")))
-            poids = 1.0
-            for now_key, full_key in (("energy_now", "energy_full"),
-                                      ("charge_now", "charge_full")):
-                now_v = _as_float(_read(os.path.join(root, now_key)))
-                full_v = _as_float(_read(os.path.join(root, full_key)))
-                if now_v is not None and full_v:
-                    if percent is None:
-                        percent = max(0.0, min(100.0, 100.0 * now_v / full_v))
-                    poids = full_v
-                    break
-            if percent is None:
-                continue
-            etat = (_read(os.path.join(root, "status")) or "").lower()
-            batteries.append((percent, poids, etat))
-    if batteries:
-        total = sum(b[1] for b in batteries) or 1.0
-        out["battery_percent"] = round(sum(b[0] * b[1] for b in batteries) / total, 1)
-    if any(mains):
-        out["on_ac"] = True
-    elif mains:
-        out["on_ac"] = False
-    elif batteries:
-        etats = {b[2] for b in batteries}
-        if "discharging" in etats:
-            out["on_ac"] = False
-        elif etats & {"charging", "full", "not charging"}:
-            out["on_ac"] = True
-    return out
-
-
-def _meminfo(path: str = "/proc/meminfo") -> dict[str, int]:
-    """(mémoire disponible, swap utilisé) en octets, lus dans /proc/meminfo.
-
-    Un noyau sans `MemAvailable` (très ancien) est traité comme illisible :
-    mieux vaut ne rien publier que publier un zéro trompeur.
-    """
-    values: dict[str, int] = {}
-    try:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                key, _, rest = line.partition(":")
-                if not rest:
-                    continue
-                number = rest.strip().split()[0]
-                values[key.strip()] = int(number) * 1024
-    except (OSError, ValueError, IndexError):
+        return platform.memory(path)
+    except platform.NotAvailable:
         return {}
-    out: dict[str, int] = {}
-    if "MemAvailable" in values:
-        out["mem_available_bytes"] = values["MemAvailable"]
-    total, free = values.get("SwapTotal"), values.get("SwapFree")
-    if total is not None and free is not None:
-        out["swap_used_bytes"] = max(0, total - free)
-    return out
 
 
 def cpu_count() -> int | None:
@@ -274,10 +191,7 @@ def cpu_count() -> int | None:
 
 def load1() -> float | None:
     """Charge système sur 1 minute, ou None si le poste ne la donne pas."""
-    try:
-        return float(os.getloadavg()[0])
-    except (OSError, ValueError):
-        return None
+    return platform.load_average()
 
 
 def disk_free(path: str | None) -> int | None:
@@ -289,29 +203,15 @@ def disk_free(path: str | None) -> int | None:
         return None
 
 
-def _mount_of(path: str, mounts: str = "/proc/mounts") -> tuple[str, str] | None:
+def _mount_of(path: str, mounts: str | None = None) -> tuple[str, str] | None:
     """(point de montage, type) du système de fichiers qui porte `path`."""
-    real = os.path.realpath(path)
-    best: tuple[str, str] | None = None
-    try:
-        with open(mounts, encoding="utf-8") as fh:
-            for line in fh:
-                parts = line.split()
-                if len(parts) < 3:
-                    continue
-                point = parts[1].replace("\\040", " ")
-                if real == point or real.startswith(point.rstrip("/") + "/") or point == "/":
-                    if best is None or len(point) > len(best[0]):
-                        best = (point, parts[2])
-    except OSError:
-        return None
-    return best
+    return platform.mount_of(path, mounts)
 
 
-def fs_usage(path: str | None, *, mounts: str = "/proc/mounts") -> dict:
+def fs_usage(path: str | None, *, mounts: str | None = None) -> dict:
     """Occupation du système de fichiers de `path` (L73) : chemin, type
     (`tmpfs`, `ext4`…), taille et octets utilisés ; valeurs None si
-    illisibles. Lecture seule, sans parcours : `statvfs` seulement."""
+    illisibles. Lecture seule, sans parcours : `shutil.disk_usage` seulement."""
     out = {"tmp_path": path, "tmp_fstype": None, "tmp_size_bytes": None,
            "tmp_used_bytes": None}
     if not path or not os.path.isdir(path):
@@ -319,13 +219,12 @@ def fs_usage(path: str | None, *, mounts: str = "/proc/mounts") -> dict:
     mount = _mount_of(path, mounts)
     if mount is not None:
         out["tmp_fstype"] = mount[1]
-    try:
-        st = os.statvfs(path)
+    try:  # mêmes valeurs que statvfs (f_blocks, f_bfree), sur tous les OS
+        usage = shutil.disk_usage(path)
     except OSError:
         return out
-    size = st.f_blocks * st.f_frsize
-    out["tmp_size_bytes"] = int(size)
-    out["tmp_used_bytes"] = int(size - st.f_bfree * st.f_frsize)
+    out["tmp_size_bytes"] = int(usage.total)
+    out["tmp_used_bytes"] = int(usage.used)
     return out
 
 

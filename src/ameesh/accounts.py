@@ -81,12 +81,11 @@ from __future__ import annotations
 
 import os
 import stat
-import sys
 import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from . import harnesses, storage
+from . import harnesses, platform, storage
 from .config import NAME_RE
 
 TYPES = ("config_dir", "api_key_env")
@@ -328,7 +327,7 @@ def check(profile: Profile, environ=None) -> list[str]:
         if info.st_mode & 0o077:
             problems.append("dossier non privé (%o, attendu 700)" % (info.st_mode & 0o777))
         cred = credentials_of(profile.harness)
-        if cred and profile.check_credentials and sys.platform != "darwin":
+        if cred and profile.check_credentials and not platform.is_macos():
             if not os.path.isfile(os.path.join(profile.path, cred)):
                 problems.append("identifiants absents (%s) : connexion humaine à faire" % cred)
         return problems

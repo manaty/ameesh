@@ -58,7 +58,7 @@ from . import authority
 from . import backend as backend_mod
 from . import config as config_mod
 from . import db as db_mod
-from . import fil, identity, mail, migrations, signing, storage
+from . import fil, identity, mail, migrations, platform, signing, storage
 from . import session_bindings as sb
 from .config import NAME_RE, Config
 
@@ -148,23 +148,8 @@ def render(msgs: list[dict], verdicts: dict | None = None) -> str:
 
 
 def find_tty() -> str | None:
-    pid = os.getpid()
-    for _ in range(12):
-        for fd in ("1", "2", "0"):
-            try:
-                target = os.readlink("/proc/%d/fd/%s" % (pid, fd))
-                if target.startswith("/dev/pts/"):
-                    return target
-            except OSError:
-                pass
-        try:
-            with open("/proc/%d/stat" % pid) as fh:
-                pid = int(fh.read().rsplit(")", 1)[1].split()[1])
-        except (OSError, IndexError, ValueError):
-            return None
-        if pid <= 1:
-            return None
-    return None
+    """Le terminal de l'humain (couche plateforme, L63), ou None."""
+    return platform.human_tty()
 
 
 def set_title(cfg: Config, bk, name: str) -> None:
