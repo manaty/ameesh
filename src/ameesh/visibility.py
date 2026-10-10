@@ -3,8 +3,9 @@
 
 **Une persona ne tourne sur la machine d'un humain que si cet humain a accès au
 dépôt de mémoire de la persona.** Pour un serveur ou un hôte de cluster, la
-règle porte sur son responsable (`responsible` de la fiche `Host`) et sur ses
-administrateurs (`admins`).
+règle porte sur son responsable (`responsible` de la fiche `Host`), sur ses
+administrateurs (`admins`) et sur ses occupants (`occupants`, L110 : les
+humains qui ont l'accès physique à la machine sans l'administrer).
 
 La vérification est faite par l'API de la forge (`gh api --hostname <forge>`,
 droits du dépôt) et, en repli pour un poste personnel (un seul humain), par une
@@ -93,17 +94,24 @@ class Result:
 
 
 def host_human_refs(canon, host: str) -> list[str] | None:
-    """Références humaines BRUTES de `H(hôte)` (responsable + admins), ou None.
+    """Références humaines BRUTES de `H(hôte)` (responsable + admins +
+    occupants), ou None.
 
-    None si l'hôte n'a pas de fiche : on ne peut alors rien résoudre."""
+    None si l'hôte n'a pas de fiche : on ne peut alors rien résoudre. Les
+    `occupants` (L110) sont les humains qui ont l'accès physique à la machine
+    sans l'administrer ; sans `occupants` déclarés, `H(hôte)` reste le
+    responsable et les admins."""
     fiche = canon.host(host)
     if fiche is None:
         return None
-    return [ref for ref in [fiche.responsible] + list(fiche.admins or []) if ref]
+    refs = [fiche.responsible] + list(fiche.admins or []) \
+        + list(getattr(fiche, "occupants", None) or [])
+    return [ref for ref in refs if ref]
 
 
 def host_humans(canon, host: str) -> list[str] | None:
-    """`H(hôte)` : responsable + administrateurs résolus, ou None (fail closed).
+    """`H(hôte)` : responsable, administrateurs et occupants résolus, ou None
+    (fail closed).
 
     None dès qu'un humain déclaré ne résout pas vers un `Member` unique : on ne
     peut pas prouver son accès, donc on n'admet pas."""
@@ -226,7 +234,7 @@ class Forge:
             if permission not in READ_PERMISSIONS:
                 return False, "%s n'a pas accès au dépôt %s (permission %s)" % (
                     human, repo.identity, permission)
-        return True, "responsable et administrateurs de l'hôte ont accès au dépôt"
+        return True, "responsable, administrateurs et occupants de l'hôte ont accès au dépôt"
 
 
 def decision_context(canon, host: str, repository: str | None, forge: Forge) -> dict:

@@ -140,6 +140,7 @@ title: pc-smichea
 responsible: human:smichea       # REQUIS
 tags: [perso, prod]              # étiquettes visées par les admissions (L31)
 admins: [human:alice]            # administrateurs : règle de visibilité (L31)
+occupants: [human:anna]          # accès physique sans administrer (L110) ; absent = aucun
 policy:
   harnesses: [claude, codex, deepseek]   # absent = tous
   providers: [anthropic, openai, deepseek]
@@ -291,8 +292,8 @@ d'admission qui ne correspond à aucun hôte (`admission-tag-unknown`), clé de
 fichier, explication), sur le modèle du validateur OKF Federation.
 
 **Règle de visibilité** (0029, L31) : une persona ne tourne sur un hôte que si
-son responsable et les `admins` de l'hôte ont accès au dépôt de mémoire de la
-persona (`memory.repository`) ; sans dépôt déclaré, la règle est sans objet.
+son responsable, les `admins` et les `occupants` de l'hôte ont accès au dépôt
+de mémoire de la persona (`memory.repository`) ; sans dépôt déclaré, la règle est sans objet.
 La vérification est faite par `canon sync` (API de la forge sur l'hôte DÉCLARÉ,
 `gh api --hostname`, repli copie d'essai ; `AMEESH_FORGE_HOSTS` pour les forges
 prises en charge), mise en cache peu de temps **pour un contexte donné** (dépôt

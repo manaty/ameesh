@@ -869,6 +869,13 @@ class Host:
     #: sont eux qui doivent avoir accès au dépôt de mémoire d'une persona pour
     #: qu'elle tourne ici.
     admins: list[str] | None = None
+    #: humains qui ont l'ACCÈS PHYSIQUE à la machine (L110, 0029), distincts
+    #: des `admins` : un enfant qui utilise le portable prêté ne l'administre
+    #: pas, mais peut tout lire dans la VM. Ils comptent dans `H(hôte)` comme
+    #: le responsable et les admins. Absent : aucun occupant au-delà du
+    #: responsable et des admins — seules les personas lisibles par eux
+    #: partent sur la machine (défaut sûr : rien n'est supposé de plus).
+    occupants: list[str] | None = None
 
 
 @dataclass
@@ -1067,7 +1074,7 @@ class Canon:
             "members": [dict(title=m.title, roles=m.roles, **fiche(m.fiche))
                         for m in self.members],
             "hosts": [dict(title=h.title, responsible=h.responsible, tags=h.tags,
-                           admins=h.admins,
+                           admins=h.admins, occupants=h.occupants,
                            policy=h.policy.__dict__.copy(), **fiche(h.fiche))
                       for h in self.hosts],
             "agents": [dict(title=a.title, responsible=a.responsible, team=a.team,
@@ -2130,9 +2137,11 @@ class _Loader:
                     setattr(policy, key, kept)
         tags = self._list(fiche, "tags", where, "host-tags-invalid", **subject)
         admins = self._list(fiche, "admins", where, "host-admins-invalid", **subject)
+        occupants = self._list(fiche, "occupants", where, "host-occupants-invalid", **subject)
         self.canon.hosts.append(Host(title=fiche.title,
                                      responsible=_text(fiche.data.get("responsible")),
-                                     policy=policy, tags=tags, admins=admins, fiche=fiche))
+                                     policy=policy, tags=tags, admins=admins,
+                                     occupants=occupants, fiche=fiche))
 
     def _host_resources(self, raw, where: dict, subject: dict) -> dict | None:
         """Seuils `policy.resources` validés, ou None si rien n'est déclaré.
@@ -2504,6 +2513,13 @@ def validate(canon: Canon) -> list[Finding]:
             add("host-responsible-unresolved", ERROR,
                 "responsable %r de l'hôte %s ne résout pas vers un Member humain"
                 % (host.responsible, host.title), host.fiche, host=host.title)
+        for ref in host.occupants or []:
+            # L110 (0029) : un occupant qui ne résout pas rend la règle de
+            # visibilité illisible pour cet hôte (refus) ; autant le dire ici
+            if canon.resolve_human(ref) is None:
+                add("host-occupant-unresolved", ERROR,
+                    "occupant %r de l'hôte %s ne résout pas vers un Member humain"
+                    % (ref, host.title), host.fiche, host=host.title)
         for name in host.policy.harnesses or []:
             if name not in known_harnesses:
                 add("host-harness-unknown", ERROR,
