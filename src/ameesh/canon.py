@@ -767,7 +767,8 @@ class HostPolicy:
     credential_modes: list[str] | None = None
     max_agents: int | None = None
     #: seuils de ressources de l'hôte (L31, 0028) : mapping
-    #: `{min_mem_available, max_swap_used, max_load, min_disk_free}` ; None =
+    #: `{min_mem_available, max_swap_used, max_load, min_disk_free}`, plus
+    #: l'alimentation (L106) `{min_battery_percent, stop_battery_percent}` ; None =
     #: valeurs par défaut prudentes (`ameesh.resources`).
     resources: dict | None = None
     #: racine de travail par projet (L31, 0029) : `work_roots[projet]` sinon
@@ -2211,6 +2212,15 @@ class _Loader:
                              % key, **where, **subject)
                     continue
                 parsed[key] = part
+            elif key in resources_mod.POWER_KEYS:
+                # L106 : seuils de batterie, en pourcentage
+                percent = resources_mod.parse_percent(value)
+                if percent is None:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.resources.%s` : pourcentage de 0 à 100 attendu"
+                             % key, **where, **subject)
+                    continue
+                parsed[key] = percent
             else:
                 octets = resources_mod.parse_bytes(value)
                 if octets is None:

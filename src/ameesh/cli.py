@@ -23,7 +23,7 @@
   agent-mail hook <claude|codex|deepseek>        hook : lit le JSON sur stdin, livre les non-lus
   agent-mail statusline                          barre d'état Claude Code : [chantier/nom] travail · dossier
   agent-mail migrate                             applique les migrations versionnées
-  agent-mail doctor [--notify-test | --probe]    diagnostic : pilote, schéma, migrations, LISTEN/NOTIFY
+  agent-mail doctor [--notify-test | --probe | --harness]  diagnostic : pilote, schéma, migrations, LISTEN/NOTIFY ; harnais de l'hôte (L106)
                                                  (--probe : sonde légère de conteneur)
 
 Identité d'une session : $AGENT_MAIL_NAME (le runner la pose pour le harnais
@@ -943,9 +943,22 @@ def driver_warnings(driver: str, remote: bool) -> list[str]:
     ]
 
 
-def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False) -> int:
+def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
+               harness: bool = False) -> int:
     if probe:
         return cmd_probe(cfg)
+    if harness:
+        # L106 : binaires des harnais et unités d'exécuteur de l'hôte
+        from . import hostcheck
+        try:
+            db = db_mod.connect(cfg)
+        except db_mod.Unavailable as exc:
+            print("base       : injoignable (%s) — harnais vérifiés sans les agents" % exc)
+            return hostcheck.cmd_harness(cfg)
+        try:
+            return hostcheck.cmd_harness(cfg, db)
+        finally:
+            db.close()
     print("dsn        : %s" % config_mod.mask_dsn(cfg.dsn))
     print("schéma     : %s" % cfg.schema)
     print("hôte       : %s" % cfg.host)
@@ -996,6 +1009,14 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False) -> int:
     unread = storage.of(db).mailbox.unread_total()
     print("agents     : %d" % agents)
     print("non lus    : %d" % unread)
+    # L106 : un agent mené sans unité d'exécuteur ne repart pas après une
+    # coupure de l'hôte (signalé, sans changer le verdict)
+    from . import hostcheck
+    try:
+        for line in hostcheck.missing_runner_lines(cfg, db):
+            print(line)
+    except db_mod.DbError:
+        pass
     verdict = 0
     if notify_test:
         channel = "ameesh_doctor"
@@ -1043,7 +1064,7 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_migrate(cfg)
         if command == "doctor":
             return cmd_doctor(cfg, notify_test="--notify-test" in rest,
-                              probe="--probe" in rest)
+                              probe="--probe" in rest, harness="--harness" in rest)
         if command == "statusline":
             return cmd_statusline(cfg)
         if command == "alias":

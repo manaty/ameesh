@@ -76,6 +76,15 @@ EMPTY_SYSTEM_TMP = tempfile.mkdtemp(prefix="ameesh-test-system-tmp-")
 os.environ["AMEESH_SYSTEM_TMP"] = EMPTY_SYSTEM_TMP
 #: les binaires réels du poste (variables de l'exécuteur) ne fuient pas dans les
 #: tests : le banc pose ses faux harnais par `AMEESH_BIN_DIR` ou explicitement
+#: L106 : ni les emplacements connus des harnais (mise, ~/.local/bin, npx), ni
+#: le PATH du gestionnaire systemd du poste : un test « binaire introuvable »
+#: ne doit pas trouver le vrai harnais du développeur. Et l'alimentation du
+#: poste (portable sur batterie) ne bloque pas les tours des tests : un dossier
+#: de sources d'alimentation vide (« inconnu »), les tests de L106 posent le leur.
+os.environ["AMEESH_HARNESS_SEARCH"] = ""
+os.environ["AMEESH_SYSTEMCTL"] = ""
+EMPTY_POWER_SUPPLY = tempfile.mkdtemp(prefix="ameesh-test-power-")
+os.environ["AMEESH_POWER_SUPPLY_DIR"] = EMPTY_POWER_SUPPLY
 for _bin_var in ("AMEESH_CLAUDE_BIN", "AGENT_MESH_CLAUDE_BIN", "AMEESH_CODEX_BIN",
                  "AGENT_MESH_CODEX_BIN", "AMEESH_DSH_BIN", "AGENT_MESH_DSH_BIN"):
     os.environ.pop(_bin_var, None)

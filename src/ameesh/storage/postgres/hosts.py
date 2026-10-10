@@ -32,7 +32,8 @@ def _array(values) -> str | None:
 READING_COLUMNS = (
     "id, host, extract(epoch from sampled_at)::float8 AS sampled_ts, "
     "mem_available_bytes, swap_used_bytes, load1, cpu_count, disk_free_bytes, "
-    "disk_path, turns_in_progress, tmp_path, tmp_fstype, tmp_size_bytes, tmp_used_bytes"
+    "disk_path, turns_in_progress, tmp_path, tmp_fstype, tmp_size_bytes, tmp_used_bytes, "
+    "on_ac, battery_percent"
 )
 
 #: colonnes d'une ressource de tour
@@ -51,15 +52,17 @@ class Hosts(interface.HostResources):
             INSERT INTO host_resources
                 (host, mem_available_bytes, swap_used_bytes, load1, cpu_count,
                  disk_free_bytes, disk_path, turns_in_progress,
-                 tmp_path, tmp_fstype, tmp_size_bytes, tmp_used_bytes)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 tmp_path, tmp_fstype, tmp_size_bytes, tmp_used_bytes,
+                 on_ac, battery_percent)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING """ + READING_COLUMNS,
             (reading.get("host") or "", reading.get("mem_available_bytes"),
              reading.get("swap_used_bytes"), reading.get("load1"),
              reading.get("cpu_count"), reading.get("disk_free_bytes"),
              reading.get("disk_path"), reading.get("turns_in_progress"),
              reading.get("tmp_path"), reading.get("tmp_fstype"),
-             reading.get("tmp_size_bytes"), reading.get("tmp_used_bytes")),
+             reading.get("tmp_size_bytes"), reading.get("tmp_used_bytes"),
+             reading.get("on_ac"), reading.get("battery_percent")),
         )
         # Historique court : au-delà de sept jours, la ligne n'a plus d'usage
         # et la table ne doit pas grandir sans fin.

@@ -66,7 +66,8 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 #: tenu, hôte à vide) est poussée comme la surcharge.
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
-                 "idle_capacity", "orchestrator_held", "host_underused", "balance_low")
+                 "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
+                 "host_not_ready", "host_power_low")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -109,6 +110,8 @@ TYPE_LABELS = {
     "orchestrator_held": "orchestrateur tenu par une session",
     "host_underused": "hôte sous-employé",
     "balance_low": "solde bas",
+    "host_not_ready": "hôte non prêt",
+    "host_power_low": "batterie faible de l'hôte",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired")
@@ -423,7 +426,9 @@ def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
     elif raised_ts:
         lines.append("constatée le %s" % local_time(raised_ts))
     title, body = _readable(title, "\n".join(lines), detail)
-    # L94 : une alerte peut se dire urgente elle-même (`balance_low` sous 12 h)
+    # L94, L106 : une alerte peut se dire urgente elle-même (`balance_low`
+    # sous 12 h, `host_power_low` au seuil d'arrêt), au-delà des types
+    # toujours urgents
     return Message(title, body, urgent=kind in URGENT_TYPES or bool(alert.get("urgent")))
 
 
