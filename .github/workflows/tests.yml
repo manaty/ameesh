@@ -1,29 +1,106 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-# Intégration continue d'ameesh : la suite complète sur un vrai Postgres 17,
-# avec les deux pilotes de base (psql et psycopg). Aucun secret n'est utilisé :
-# la base de service n'existe que le temps du job.
+# Intégration continue d'ameesh : la suite sur un vrai Postgres 17, avec les
+# deux pilotes de base (psql et psycopg). Aucun secret n'est utilisé : chaque
+# base de service n'existe que le temps de sa part.
+#
+# L116 — la suite est découpée en parts parallèles par scripts/test-parts.py
+# (par module, équilibré par tests/parts/durees.json), chaque part avec son
+# propre Postgres :
+#   - psycopg : la suite complète, en 4 parts, sur chaque PR et chaque push ;
+#   - psql    : sur une PR, seulement les modules « pilote »
+#               (tests/parts/pilote-psql.txt) ; la suite complète, en 6 parts,
+#               sur push vers main ou release/*, et à la main (workflow_dispatch).
+# Le job final « tests » agrège les parts : c'est le nom de vérification stable.
 name: tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, "release/**"]
   pull_request:
+  workflow_dispatch:
 
+# une exécution dépassée (nouveau commit sur la même branche ou PR) est annulée
 concurrency:
-  group: tests-${{ github.ref }}
+  group: tests-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
+env:
+  AMEESH_TEST_DSN: postgresql://ameesh@127.0.0.1:5432/ameesh
+  PGPASSWORD: ameesh-ci
+  AMEESH_REQUIRE_DB: "1"
+  AMEESH_BALANCE_INTERVAL: "0"
+  PYTHONPATH: src
+
 jobs:
-  tests:
+  psycopg:
+    name: psycopg ${{ matrix.part }}/4
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        driver: [psql, psycopg]
+        part: [1, 2, 3, 4]
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ameesh
+          POSTGRES_PASSWORD: ameesh-ci
+          POSTGRES_DB: ameesh
+        ports: ["5432:5432"]
+        # base jetable : données en mémoire
+        options: >-
+          --tmpfs /var/lib/postgresql/data
+          --health-cmd "pg_isready -U ameesh"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      AMEESH_DRIVER: psycopg
+    steps:
+      - uses: actions/checkout@v4
+      - id: py
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # environnement Python en cache : la clé suit pyproject.toml
+      - id: venv
+        uses: actions/cache@v4
+        with:
+          path: .venv-ci
+          key: venv-${{ runner.os }}-py${{ steps.py.outputs.python-version }}-psycopg-${{ hashFiles('pyproject.toml') }}
+      - name: dépendances (pilote psycopg)
+        if: steps.venv.outputs.cache-hit != 'true'
+        run: |
+          python -m venv .venv-ci
+          .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41'
+      - &base
+        name: base jetable (sans fsync) et client psql
+        run: |
+          command -v psql >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q postgresql-client; }
+          psql "$AMEESH_TEST_DSN" -q -c "ALTER SYSTEM SET fsync = off" \
+            -c "ALTER SYSTEM SET synchronous_commit = off" \
+            -c "ALTER SYSTEM SET full_page_writes = off" -c "SELECT pg_reload_conf()"
+      - &git
+        name: identité git des tests (dépôts temporaires)
+        run: |
+          git config --global user.name "ameesh ci"
+          git config --global user.email "ci@ameesh.invalid"
+          git config --global init.defaultBranch main
+      - name: part ${{ matrix.part }}/4
+        run: .venv-ci/bin/python scripts/test-parts.py lancer --parts 4 --part ${{ matrix.part }} --pilote psycopg
+
+  psql:
+    name: psql ${{ matrix.part }}/${{ github.event_name == 'pull_request' && 1 || 6 }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: ${{ fromJSON(github.event_name == 'pull_request' && '[1]' || '[1, 2, 3, 4, 5, 6]') }}
     services:
       postgres:
         image: postgres:17
@@ -33,28 +110,35 @@ jobs:
           POSTGRES_DB: ameesh
         ports: ["5432:5432"]
         options: >-
+          --tmpfs /var/lib/postgresql/data
           --health-cmd "pg_isready -U ameesh"
-          --health-interval 5s --health-timeout 5s --health-retries 20
+          --health-interval 2s --health-timeout 5s --health-retries 30
     env:
-      AMEESH_TEST_DSN: postgresql://ameesh@127.0.0.1:5432/ameesh
-      PGPASSWORD: ameesh-ci
-      AMEESH_REQUIRE_DB: "1"
-      AMEESH_DRIVER: ${{ matrix.driver }}
-      PYTHONPATH: src
+      AMEESH_DRIVER: psql
+      PARTS: ${{ github.event_name == 'pull_request' && 1 || 6 }}
+      # sur une PR : les modules « pilote » seulement
+      LISTE: ${{ github.event_name == 'pull_request' && 'tests/parts/pilote-psql.txt' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: client psql
-        run: sudo apt-get update -q && sudo apt-get install -y -q postgresql-client
-      - name: dépendances facultatives (pilote psycopg)
-        if: matrix.driver == 'psycopg'
-        run: python -m pip install 'psycopg[binary]>=3.1' 'cryptography>=41'
-      - name: identité git des tests (dépôts temporaires)
+      - *base
+      - *git
+      - name: part ${{ matrix.part }}
+        run: python scripts/test-parts.py lancer --parts "$PARTS" --part ${{ matrix.part }} --pilote psql ${LISTE:+--liste "$LISTE"}
+
+  # nom de vérification stable : vert seulement si toutes les parts le sont
+  tests:
+    name: tests
+    if: always()
+    needs: [psycopg, psql]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: bilan des parts
         run: |
-          git config --global user.name "ameesh ci"
-          git config --global user.email "ci@ameesh.invalid"
-          git config --global init.defaultBranch main
-      - name: suite complète
-        run: python -m unittest discover -s tests -t . -v
+          echo "psycopg : ${{ needs.psycopg.result }}"
+          echo "psql    : ${{ needs.psql.result }}"
+          test "${{ needs.psycopg.result }}" = success
+          test "${{ needs.psql.result }}" = success
