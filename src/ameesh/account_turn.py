@@ -276,9 +276,7 @@ def summary_possible(old, book, items, now: float | None = None) -> tuple[bool, 
     except Exception:
         gauges = []
     for gauge in gauges:
-        if gauge.reset_passed(now):
-            continue
-        if float(gauge.used or 0.0) >= 1.0:
+        if float(gauge.used_at(now) or 0.0) >= 1.0:  # échue : 0 % (L71)
             return False, "forfait %s %s saturé (%.0f %%)" % (
                 old.harness, gauge.key, float(gauge.used) * 100)
     return True, ""

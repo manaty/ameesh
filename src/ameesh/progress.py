@@ -442,7 +442,7 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
         "spend": spend,
         "by_agent": [r for r in by_agent if r["usd"] or r["turns"]],
         "plans": [{
-            "harness": g.harness, "key": g.key, "used": round(g.used, 4),
+            "harness": g.harness, "key": g.key, "used": round(g.used_at(now), 4),
             "pace_cap": round(g.pace_cap(now), 4), "elapsed": round(g.elapsed(now), 4),
             "resets_ts": _round(g.resets_at), "window_s": g.window_s,
             "exceeded": g.exceeded(now),

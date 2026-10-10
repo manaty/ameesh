@@ -1530,7 +1530,8 @@ def cmd_cost(cfg: Config, args) -> int:
             return 1
         # L30 : jauges par compte et compte actif, pour les harnais à comptes
         try:
-            comptes = accounts_mod.report(cfg, db, book)
+            # L71 : un affichage ne relève pas les jauges (lecture seule)
+            comptes = accounts_mod.report(cfg, db, book, record=False)
         except accounts_mod.AccountError as exc:
             print("comptes : configuration invalide : %s" % exc, file=sys.stderr)
             comptes = []
@@ -1615,7 +1616,8 @@ def cmd_accounts(cfg: Config, args) -> int:
                     print("comptes %s : déjà en automatique" % nom)
             return 0
         book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
-        rows = accounts_mod.report(cfg, db, book)
+        # L71 : `accounts list` est un affichage — aucun relevé écrit
+        rows = accounts_mod.report(cfg, db, book, record=False)
         for row in rows:
             row.pop("_gauges", None)
         bascules = storage.of(db).accounts.switches(cfg.host, None, max(0, getattr(args, "last", 5))) \

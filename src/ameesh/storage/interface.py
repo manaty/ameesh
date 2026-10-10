@@ -189,6 +189,10 @@ class Agents(Domain):
         """La ligne de l'agent, ou None."""
 
     @abc.abstractmethod
+    def harnesses(self) -> dict[str, str]:
+        """L71 : `{agent: harnais}` pour tout le registre (comptabilité, jauges)."""
+
+    @abc.abstractmethod
     def overview(self) -> list[dict]:
         """Vue d'observabilité (`mesh list --json`), colonnes du canon comprises."""
 
@@ -421,12 +425,12 @@ class TurnCosts(Domain):
     (`PendingSpend`) ; ce domaine n'ouvre aucune transaction."""
 
     @abc.abstractmethod
-    def last_reading(self, agent: str, harness: str,
+    def last_reading(self, agent: str | None, harness: str,
                      session: str | None = None) -> dict | None:
         """Dernier relevé CONNU (cumul en dollars ou en jetons non nul) de
         l'agent pour ce harnais — de cette session seulement si `session` est
         donnée : session, cum_usd, cum_input_tokens, cum_cached_input_tokens,
-        cum_output_tokens ; ou None."""
+        cum_output_tokens ; ou None. `agent=None` (L71) : tout agent."""
 
     @abc.abstractmethod
     def insert(self, *, agent: str, harness: str, turn: str | None, model: str | None,
@@ -1488,9 +1492,18 @@ class Operations(Domain):
     @abc.abstractmethod
     def record_balance(self, *, provider: str, currency: str, total: float,
                        granted: float | None, topped_up: float | None,
-                       available: bool | None, account: str | None = None) -> dict:
+                       available: bool | None, account: str | None = None,
+                       unless_within_s: float | None = None) -> dict | None:
         """Ajoute un solde horodaté (heure de la base) ; rend la ligne.
-        `account` (L30) : le compte (clé d'API) dont c'est le solde."""
+        `account` (L30) : le compte (clé d'API) dont c'est le solde.
+        `unless_within_s` (L71) : rien n'est écrit (None) si un relevé de ce
+        fournisseur, compte et devise a moins de `unless_within_s` secondes."""
+
+    @abc.abstractmethod
+    def recent_balance(self, *, provider: str, account: str | None,
+                       within_s: float) -> bool:
+        """L71 : un relevé de ce fournisseur (et compte) a-t-il moins de
+        `within_s` secondes ? (plusieurs exécuteurs sur la même clé)"""
 
     @abc.abstractmethod
     def balances(self, *, provider: str | None, since_s: float,

@@ -253,6 +253,10 @@ class Agents(interface.Agents):
                              (name,))
         return rows[0] if rows else None
 
+    def harnesses(self) -> dict[str, str]:
+        rows = self.db.query("SELECT name, harness FROM agent_registry")
+        return {row["name"]: row["harness"] or "" for row in rows}
+
     def overview(self) -> list[dict]:
         return self.db.query(
             """

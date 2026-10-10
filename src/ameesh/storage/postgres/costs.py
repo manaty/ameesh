@@ -25,16 +25,20 @@ class TurnCosts(interface.TurnCosts):
     def last_reading(self, agent, harness, session=None) -> dict | None:
         columns = ("session, cum_usd, cum_input_tokens, cum_cached_input_tokens,"
                    " cum_output_tokens")
-        where = ("where agent = %s and harness = %s"
+        where = ("where harness = %s"
                  " and (cum_usd is not null or cum_input_tokens is not null)")
-        if session is None:
-            rows = self.db.query(
-                "select " + columns + " from turn_costs " + where +
-                " order by recorded_at desc, id desc limit 1", (agent, harness))
-        else:
-            rows = self.db.query(
-                "select " + columns + " from turn_costs " + where + " and session = %s"
-                " order by recorded_at desc, id desc limit 1", (agent, harness, session))
+        params: list = [harness]
+        if agent is not None:
+            # L71 : `agent=None` cherche le relevé de la session chez tout
+            # agent (session reprise sous un autre nom)
+            where += " and agent = %s"
+            params.append(agent)
+        if session is not None:
+            where += " and session = %s"
+            params.append(session)
+        rows = self.db.query(
+            "select " + columns + " from turn_costs " + where +
+            " order by recorded_at desc, id desc limit 1", tuple(params))
         return rows[0] if rows else None
 
     def insert(self, *, agent, harness, turn, model, session, usd, input_tokens,

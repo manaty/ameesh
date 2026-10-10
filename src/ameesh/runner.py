@@ -2072,6 +2072,16 @@ class AgentWorker(threading.Thread):
             # Marqueur de compte AVANT l'index de début : les relevés du tour (et
             # sa ligne de grand livre) sont attribués à ce compte (L30).
             account_turn.mark(self, events_path, compte)
+        # L71 : marqueur de tour AVANT l'index de début — la session reprise
+        # (vide = neuve). Sans total connu de cette session, `CostBook.record`
+        # ne compte pas son cumul entier comme le coût du tour.
+        try:
+            with open(events_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": cost_mod.TURN_MARKER, "resume": session or "",
+                                     "ts": time.time(), "agent": self.name},
+                                    ensure_ascii=False) + "\n")
+        except OSError as exc:
+            log("[%s] marqueur de tour non écrit (%s)" % (self.name, exc))
         # Index du flux avant le tour : `CostBook.record` ne compte que les
         # événements nouveaux (L13, 0019 §3).
         events_start = 0
@@ -2788,7 +2798,7 @@ class Runner:
         self.canon_thread.start()
 
     # -- solde des fournisseurs payés au token (L26) ------------------------
-    def balance_once(self, sources=None) -> int:
+    def balance_once(self, sources=None, min_interval_s: float = 0.0) -> int:
         """Relève le solde de chaque source configurée ; ne lève jamais.
 
         La clé n'est lue que par la source, dans l'environnement, et ne
@@ -2808,7 +2818,8 @@ class Runner:
             db = db_mod.connect(self.cfg)
             for source, compte in paires:
                 try:
-                    releves += len(balance_mod.record(db, source, compte))
+                    releves += len(balance_mod.record(db, source, compte,
+                                                      min_interval_s=min_interval_s))
                 except (balance_mod.BalanceError, db_mod.DbError) as exc:
                     log_async("solde %s%s : %s" % (
                         source.provider, "/%s" % compte if compte else "",
@@ -2837,7 +2848,9 @@ class Runner:
 
         def boucle() -> None:
             while not self.stop.is_set():
-                self.balance_once()
+                # L71 : un relevé par période pour tous les exécuteurs de la
+                # base, pas un par exécuteur (moitié de période de marge)
+                self.balance_once(min_interval_s=interval / 2.0)
                 if self.stop.wait(max(60.0, interval)):
                     return
 

@@ -106,6 +106,14 @@ CODEX_FILES = 5
 #: marqueur est celui du compte primaire (hôte d'avant L30).
 ACCOUNT_MARKER = "ameesh.account"
 
+#: marqueur de tour (L71) : l'exécuteur l'écrit dans le flux juste avant
+#: chaque tour, avec la session qu'il **reprend** (`resume`, vide pour une
+#: session neuve). Sans lui, le premier tour d'une session reprise dont le
+#: grand livre ne connaît aucun relevé (session adoptée, base neuve) était
+#: compté au cumul de toute la session (Claude `total_cost_usd`, Codex
+#: `turn.completed`), pas à la différence.
+TURN_MARKER = "ameesh.turn"
+
 
 class CostError(Exception):
     """Erreur de comptabilité (repère illisible, base absente)."""
@@ -131,8 +139,18 @@ class Gauge:
         """Le plafond de rythme : min(90 %, part écoulée + 10 points)."""
         return min(PACE_CEILING, self.elapsed(now) + PACE_MARGIN)
 
+    def used_at(self, now: float) -> float:
+        """L'utilisation **valable à `now`** : 0 si la fenêtre est échue (L71).
+
+        Un relevé dont `resets_at` est passé décrit une fenêtre close ; la
+        suivante est vierge. Le garder à sa dernière valeur rendait un compte
+        inutilisé « au seuil » pour toujours : il ne servait pas, donc son
+        relevé n'était jamais rafraîchi.
+        """
+        return 0.0 if self.reset_passed(now) else self.used
+
     def exceeded(self, now: float) -> bool:
-        return self.used >= self.pace_cap(now)
+        return self.used_at(now) >= self.pace_cap(now)
 
     def reset_passed(self, now: float) -> bool:
         """La fenêtre publiée est-elle déjà remise à zéro (`resets_at` passé) ?
@@ -297,6 +315,7 @@ class CostBook:
         self.tools = dict(tools or {})
         self.clock = clock
         self.hourly_usd = hourly_usd
+        self._registry: dict | None = None
 
     # -- état local ---------------------------------------------------------
     def agent_dir(self, agent: str) -> str:
@@ -310,15 +329,49 @@ class CostBook:
             return []
         return sorted(n for n in names if os.path.isdir(self.agent_dir(n)))
 
+    def registry_tools(self) -> dict:
+        """`{agent: harnais}` lu **une fois** dans le registre (L71), ou `{}`.
+
+        Le fichier d'état `<agent>/tool` n'est plus écrit : sans le registre,
+        les jauges Claude ne trouvaient aucun agent Claude (« — » dans
+        `accounts list`, `cost report`, `progress`) et `cost report` affichait
+        le harnais « ? ». Sans base (ou base illisible), rien : on retombe sur
+        l'état local et sur le contenu du flux.
+        """
+        if self._registry is None:
+            self._registry = {}
+            if self.db is not None:
+                try:
+                    self._registry = dict(storage.of(self.db).agents.harnesses())
+                except Exception:  # lecture facultative : jamais fatale à la garde
+                    self._registry = {}
+        return self._registry
+
     def tool_of(self, agent: str) -> str:
-        """Le harnais d'un agent : injecté, sinon l'état local (`<agent>/tool`)."""
+        """Le harnais d'un agent : injecté, sinon le registre (L71), sinon
+        l'état local historique (`<agent>/tool`)."""
         if agent in self.tools:
             return self.tools[agent]
+        known = self.registry_tools().get(agent)
+        if known:
+            return known
         try:
             with open(os.path.join(self.agent_dir(agent), "tool"), encoding="utf-8") as fh:
                 return fh.read().strip()
         except OSError:
             return ""
+
+    def _claude_candidate(self, agent: str) -> bool:
+        """Cet agent peut-il porter des relevés Claude ? (L71)
+
+        Un harnais connu et autre que `claude` : non. Un harnais **inconnu**
+        (exécuteur sans base, agent absent du registre) : oui — seul Claude
+        écrit des `rate_limit_event`, que le lecteur reconnaît à leur type ;
+        avant L71, un exécuteur ne voyait que son propre flux et la garde
+        inter-agents ignorait les relevés des autres agents Claude.
+        """
+        harness = self.tool_of(agent)
+        return harness in ("", "claude")
 
     def model_of(self, agent: str) -> str:
         try:
@@ -363,7 +416,7 @@ class CostBook:
             return self._claude_gauges_of(account, primary or account)
         newest = None
         for agent in self.agents():
-            if self.tool_of(agent) != "claude":
+            if not self._claude_candidate(agent):
                 continue
             path = os.path.join(self.agent_dir(agent), "events.jsonl")
             try:
@@ -392,7 +445,7 @@ class CostBook:
         """
         best = None
         for agent in self.agents():
-            if self.tool_of(agent) != "claude":
+            if not self._claude_candidate(agent):
                 continue
             path = os.path.join(self.agent_dir(agent), "events.jsonl")
             try:
@@ -567,6 +620,116 @@ class CostBook:
         }
 
 
+    def session_reading(self, agent: str, harness: str, session: str,
+                        start: int) -> dict:
+        """Le dernier total **connu** d'une session, hors relevés de l'agent (L71).
+
+        D'abord le grand livre, tous agents confondus (session reprise sous un
+        autre nom) ; sinon le flux local de l'agent **avant** le tour (relevés
+        d'avant une base neuve). `{}` si rien n'est connu.
+        """
+        if self.db is not None:
+            try:
+                row = storage.of(self.db).turn_costs.last_reading(None, harness, session)
+            except Exception:
+                row = None
+            if row is not None:
+                return {
+                    "session": row["session"],
+                    "cum_usd": float(row["cum_usd"]) if row["cum_usd"] is not None else None,
+                    "cum_usage": [int(row["cum_input_tokens"] or 0),
+                                  int(row["cum_cached_input_tokens"] or 0),
+                                  int(row["cum_output_tokens"] or 0)]
+                    if row["cum_input_tokens"] is not None else None,
+                }
+        before = self.events(agent)[:max(0, start)] if start else []
+        current = ""
+        found: dict = {}
+        for event in before:
+            kind = event.get("type")
+            ident = event.get("session_id") or event.get("thread_id")
+            if isinstance(ident, str) and ident:
+                current = ident
+            if current != session:
+                continue
+            if harness == "claude" and kind == "result" \
+                    and isinstance(event.get("total_cost_usd"), (int, float)):
+                found = {"session": session, "cum_usd": float(event["total_cost_usd"]),
+                         "cum_usage": None}
+            elif harness == "codex" and kind == "turn.completed":
+                u = event.get("usage") or {}
+                found = {"session": session, "cum_usd": None,
+                         "cum_usage": [int(u.get("input_tokens", 0)),
+                                       int(u.get("cached_input_tokens", 0)),
+                                       int(u.get("output_tokens", 0))]}
+        return found
+
+    def resumed_session(self, agent: str, start: int) -> str | None:
+        """La session que le tour commençant à `start` **reprend** (L71).
+
+        Lue dans le dernier marqueur de tour avant `start` ; `""` pour une
+        session neuve, None sans marqueur (flux d'avant L71 : comportement
+        historique, le premier relevé d'une session vaut le tour).
+        """
+        path = os.path.join(self.agent_dir(agent), "events.jsonl")
+        found = None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for index, line in enumerate(fh):
+                    if index >= start:
+                        break
+                    if TURN_MARKER not in line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(event, dict) and event.get("type") == TURN_MARKER:
+                        found = str(event.get("resume") or "")
+        except OSError:
+            return None
+        return found
+
+    def codex_thread_total_before_turn(self, thread: str) -> list | None:
+        """L'usage cumulé d'un fil Codex **avant** son dernier tour (L71).
+
+        Lu dans le journal de session du fil (`rollout-…-<fil>.jsonl`) : le
+        dernier `token_count` qui précède le dernier `task_started`. None si le
+        journal est introuvable ou muet (le tour est alors compté au cumul,
+        fail-closed).
+        """
+        if not thread:
+            return None
+        paths = glob.glob(os.path.join(self.codex_sessions, "**", "*%s.jsonl" % thread),
+                          recursive=True)
+        if not paths:
+            return None
+        last_total = None
+        before_turn = None
+        try:
+            with open(max(paths, key=os.path.getmtime), encoding="utf-8") as fh:
+                for line in fh:
+                    if "task_started" not in line and "token_count" not in line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    payload = event.get("payload") if isinstance(event, dict) else None
+                    if not isinstance(payload, dict):
+                        continue
+                    if payload.get("type") == "task_started":
+                        before_turn = last_total
+                    elif payload.get("type") == "token_count":
+                        total = (payload.get("info") or {}).get("total_token_usage")
+                        if isinstance(total, dict):
+                            last_total = [int(total.get("input_tokens", 0)),
+                                          int(total.get("cached_input_tokens", 0)),
+                                          int(total.get("output_tokens", 0))]
+        except (OSError, ValueError, TypeError):
+            return None
+        return before_turn
+
     def session_of(self, agent: str) -> str | None:
         """La session (ou le fil) courante d'un agent, lue sur **tout** son flux.
 
@@ -605,6 +768,16 @@ class CostBook:
         # La session se résout AVANT le repère : c'est elle qui dit lequel comparer.
         session = session or self.session_of(agent)
         cum = self.baseline(agent, harness, session)
+        # L71 : session reprise sans relevé de l'agent — le dernier total CONNU
+        # de la session (autre agent, ou flux local d'avant le tour) sert de repère.
+        if harness in ("claude", "codex") and session and cum.get("session") != session:
+            known = self.session_reading(agent, harness, session, start)
+            if known:
+                cum = known
+        # Reprise d'une session dont aucun total n'est connu : le cumul du
+        # harnais porte toute l'histoire de la session, pas ce tour.
+        unknown_resume = (bool(session) and cum.get("session") != session
+                          and self.resumed_session(agent, start) == session)
 
         if harness == "claude":
             totals = [float(e["total_cost_usd"]) for e in events
@@ -613,6 +786,15 @@ class CostBook:
             last = cum.get("cum_usd")
             if not totals:
                 usd = 0.0
+            elif unknown_resume:
+                # L71 : total d'avant le tour inconnu — estimation par les
+                # jetons du tour (`usage` de `result` est celui du tour), au
+                # barème ; le cumul de la ligne sert de repère au tour suivant.
+                usd = sum(
+                    ((_num(u, "input_tokens") + _num(u, "cache_creation_input_tokens")) * pin
+                     + _num(u, "cache_read_input_tokens") * pcache
+                     + _num(u, "output_tokens") * pout) / 1e6
+                    for u in usage)
             elif last is None or session != cum.get("session"):
                 # Session neuve (ou inconnue) : son `total_cost_usd` cumulé part de
                 # zéro, donc le dernier relevé EST le coût du tour. Le soustraire
@@ -637,6 +819,12 @@ class CostBook:
             current = [int(last.get("input_tokens", 0)), int(last.get("cached_input_tokens", 0)),
                        int(last.get("output_tokens", 0))]
             previous = cum.get("cum_usage")
+            if unknown_resume:
+                # L71 : fil repris sans relevé connu — le total du fil avant le
+                # tour se lit dans son journal de session Codex, s'il est là.
+                before = self.codex_thread_total_before_turn(session)
+                if before is not None:
+                    previous, cum = before, dict(cum, session=session)
             if session == cum.get("session") and isinstance(previous, list) and len(previous) == 3 \
                     and all(c >= p for c, p in zip(current, previous)):
                 # Même fil : `turn.completed` porte l'usage **cumulé** du fil.
@@ -792,12 +980,16 @@ class CostBook:
         return ""
 
     # -- rapport ------------------------------------------------------------
-    def report(self, accounts: dict | None = None) -> list:
+    def report(self, accounts: dict | None = None, *, record: bool = False) -> list:
         """Une ligne par agent : harnais, modèle, dépense 1 h/24 h, jauges.
 
         `accounts` (L30) : `{harnais: (compte actif, [Gauge…])}` pour les
         harnais à comptes déclarés ; leurs jauges sont alors celles du compte
         actif, et la ligne nomme ce compte (`account`).
+
+        L71 : une **lecture** — l'historique des jauges n'est écrit que si
+        `record` est vrai. Avec un registre, seuls ses agents sont listés (les
+        dossiers d'état `fils`, `hooks`, `notify`… ne sont pas des agents).
         """
         rows = []
         now = self.clock()
@@ -805,13 +997,16 @@ class CostBook:
         # Le forfait est partagé par tout le compte : les jauges se lisent une fois
         # par harnais, pas une fois par agent.
         by_harness: dict = {name: list(value[1]) for name, value in accounts.items()}
+        registre = self.registry_tools()
         for agent in self.agents():
+            if registre and agent not in registre and agent not in self.tools:
+                continue
             harness = self.tool_of(agent) or "?"
             # Les forfaits à jauges sont déclarés par les descripteurs (L16) :
             # la jauge se lit une fois par harnais, jamais par agent.
             if harness not in by_harness and gauges_source(harness) in ("transcript",
                                                                         "sessions"):
-                by_harness[harness] = self.gauges(harness)
+                by_harness[harness] = self.gauges(harness, record=record)
             if harness in accounts:
                 rows.append({"account": accounts[harness][0]})
             else:
@@ -825,7 +1020,9 @@ class CostBook:
                 "gauges": [
                     {
                         "key": g.key,
-                        "used": g.used,
+                        "used": g.used_at(now),          # L71 : 0 si fenêtre échue
+                        "last_used": g.used,
+                        "reset_passed": g.reset_passed(now),
                         "cap": g.pace_cap(now),
                         "elapsed": g.elapsed(now),
                         "resets_at": g.resets_at,
@@ -846,7 +1043,10 @@ def format_report(rows: Iterable[dict]) -> str:
         "agent", "harnais", "modèle", "1 h (USD)", "24 h (USD)", "jauges")]
     for row in rows:
         gauges = ", ".join(
-            "%s %.0f%% (rythme %.0f%%)" % (g["key"], g["used"] * 100, g["cap"] * 100)
+            "%s %.0f%% (rythme %.0f%%%s)" % (
+                g["key"], g["used"] * 100, g["cap"] * 100,
+                ", remise à zéro passée, dernier relevé %.0f%%" % (g["last_used"] * 100)
+                if g.get("reset_passed") else "")
             for g in row["gauges"]) or "—"
         lines.append("%-16s %-9s %-16s %10.4f %10.4f  %s" % (
             row["agent"],
@@ -931,6 +1131,11 @@ def _read_tail(path: str, limit: int = TAIL_BYTES) -> str:
             return fh.read().decode("utf-8", "ignore")
     except OSError:
         return ""
+
+
+def _num(usage: dict, key: str) -> int:
+    value = usage.get(key) if isinstance(usage, dict) else None
+    return int(value) if isinstance(value, (int, float)) else 0
 
 
 def _sum(usages: Iterable[dict], key: str) -> int:
