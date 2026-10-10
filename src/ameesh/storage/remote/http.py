@@ -20,6 +20,7 @@ TLS obligatoire, sauf vers la boucle locale (essais, mandataire local).
 """
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 import os
@@ -117,6 +118,48 @@ def check_url(url: str) -> urllib.parse.SplitResult:
     return parts
 
 
+def https_proxy_for(host: str, environ: Optional[Mapping[str, str]] = None
+                    ) -> Optional[tuple]:
+    """Le mandataire HTTPS à prendre pour joindre `host` : `(hôte, port,
+    en-têtes du CONNECT)`, ou None (pas de `HTTPS_PROXY`, hôte dans
+    `NO_PROXY`, boucle locale). Un mandataire `user:mot@hôte` donne
+    `Proxy-Authorization: Basic`. Seul un mandataire `http://` est pris
+    (le CONNECT part en clair jusqu'à lui, le TLS reste de bout en bout)."""
+    env = os.environ if environ is None else environ
+    if host in _LOOPBACK:
+        return None
+    raw = ""
+    for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        if env.get(name):
+            raw = env[name].strip()
+            break
+    if not raw:
+        return None
+    no_proxy = env.get("NO_PROXY", env.get("no_proxy", ""))
+    for entry in (e.strip().lower() for e in no_proxy.split(",")):
+        if not entry:
+            continue
+        if entry == "*":
+            return None
+        entry = entry.split(":")[0].lstrip(".")
+        h = host.lower()
+        if h == entry or h.endswith("." + entry):
+            return None
+    if "://" not in raw:
+        raw = "http://" + raw
+    parts = urllib.parse.urlsplit(raw)
+    if parts.scheme != "http" or not parts.hostname:
+        raise ValueError("HTTPS_PROXY : mandataire http://hôte:port attendu (%s)"
+                         % parts.scheme)
+    headers = {}
+    if parts.username is not None:
+        user = urllib.parse.unquote(parts.username)
+        word = urllib.parse.unquote(parts.password or "")
+        headers["Proxy-Authorization"] = "Basic " + base64.b64encode(
+            ("%s:%s" % (user, word)).encode("utf-8")).decode("ascii")
+    return parts.hostname, parts.port or 3128, headers
+
+
 class HttpTransport(ExecTransport):
     """`ExecTransport` sur HTTP(S). `tokens` : jeton d'exécuteur (routes
     `op`, `events`, `host`…) ; `session_tokens` : jeton de session
@@ -147,9 +190,17 @@ class HttpTransport(ExecTransport):
     def _connection(self, timeout: float) -> http.client.HTTPConnection:
         host, port = self.parts.hostname, self.parts.port
         if self.parts.scheme == "https":
-            return http.client.HTTPSConnection(
-                host, port, timeout=timeout,
-                context=self.ssl_context or ssl.create_default_context())
+            context = self.ssl_context or ssl.create_default_context()
+            proxy = https_proxy_for(host)
+            if proxy is not None:
+                # L114b : mandataire de l'appareil (`HTTPS_PROXY`, `NO_PROXY`
+                # respecté) : tunnel CONNECT, TLS de bout en bout jusqu'au
+                # serveur du mesh
+                conn = http.client.HTTPSConnection(proxy[0], proxy[1], timeout=timeout,
+                                                   context=context)
+                conn.set_tunnel(host, port or 443, headers=proxy[2])
+                return conn
+            return http.client.HTTPSConnection(host, port, timeout=timeout, context=context)
         return http.client.HTTPConnection(host, port, timeout=timeout)
 
     def _token(self, source: Optional[TokenSource], refresh: bool = False) -> str:

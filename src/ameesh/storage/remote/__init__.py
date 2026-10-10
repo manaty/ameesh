@@ -30,7 +30,8 @@ from .http import FileTokenSource, HttpTransport, StaticTokenSource
 
 __all__ = ["DRIVER", "EXECUTOR", "SESSION", "LeaseBook", "RemoteDb", "RemoteStorage",
            "RemoteSubscription", "HttpTransport", "FileTokenSource", "StaticTokenSource",
-           "connect", "is_mediated", "set_token_source_factory", "supported"]
+           "connect", "is_mediated", "set_token_source_factory", "supported",
+           "token_source_factory_is_default"]
 
 
 def _default_token_source(cfg: Any) -> TokenSource:
@@ -50,6 +51,11 @@ def set_token_source_factory(factory: Optional[Callable[[Any], TokenSource]]) ->
     ES256 signée par la clé de la VM). None rétablit la source fichier."""
     global _token_source_factory
     _token_source_factory = factory or _default_token_source
+
+
+def token_source_factory_is_default() -> bool:
+    """Aucune fabrique posée par `set_token_source_factory` ?"""
+    return _token_source_factory is _default_token_source
 
 
 def is_mediated(cfg: Any) -> bool:

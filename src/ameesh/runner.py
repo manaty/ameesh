@@ -3205,6 +3205,27 @@ class Runner:
                 self._host_limits = limits
                 self._pressure_at = 0.0
 
+    #: L114b : SIGTERM reçu, retrait à engager par la boucle principale
+    sigterm_requested = False
+
+    def can_drain_on_sigterm(self) -> bool:
+        """L114b : un exécuteur médié doté d'une porte se retire au point sûr
+        sur SIGTERM, au lieu d'arrêter ses tours en 3 s."""
+        return (bool(getattr(self, "mediated", False)) and not self.once
+                and getattr(self, "host_gate", None) is not None)
+
+    def _sigterm_drained(self) -> bool:
+        """Retrait engagé par SIGTERM et terminé (aucun bail détenu). Engage
+        le retrait au premier appel qui suit le signal."""
+        if self.sigterm_requested and not getattr(self, "_draining_for_sigterm", False):
+            self._draining_for_sigterm = True
+            self.host_gate.terminate()
+        if not getattr(self, "_draining_for_sigterm", False):
+            return False
+        with self.lock:
+            alive = [w for w in self.workers.values() if w.is_alive()]
+        return not alive
+
     def gate_holds(self) -> bool:
         """Porte d'hôte fermée (L112, `draining` ou `stopped`) : aucune
         réclamation, aucun nouveau tour. Toujours faux sans porte."""
@@ -3300,6 +3321,9 @@ class Runner:
         reprise = Reprise(self.db_retry_max)
         try:
             while not self.stop.is_set():
+                if self._sigterm_drained():
+                    log_async("retrait terminé après SIGTERM : arrêt")
+                    break
                 try:
                     self.sweep()
                 except db_mod.DbError as exc:
@@ -3329,7 +3353,9 @@ class Runner:
                 if self.max_turns and self.turns >= self.max_turns:
                     log_async("limite de %d tour(s) atteinte" % self.max_turns)
                     break
-                self.wake_all.wait(timeout=self.poll)
+                self.wake_all.wait(timeout=min(self.poll, 1.0)
+                                   if getattr(self, "_draining_for_sigterm", False)
+                                   else self.poll)
                 self.wake_all.clear()
         finally:
             self.shutdown()
@@ -3732,6 +3758,11 @@ def main(argv: list[str] | None = None) -> int:
         except db_mod.DbError as exc:
             if not mediated:
                 raise
+            if getattr(exc, "code", None) == "executor_revoked":
+                # L114 (§7) : révoqué avant même la fiche de l'hôte
+                print("agent-runner : exécuteur révoqué par le serveur : %s" % exc,
+                      file=sys.stderr)
+                return EXIT_REVOKED
             # L109 : la fiche de l'hôte (`GET /host`) est illisible au démarrage
             print("agent-runner : fiche de l'hôte indisponible : %s" % exc, file=sys.stderr)
             return 1
@@ -3740,6 +3771,17 @@ def main(argv: list[str] | None = None) -> int:
             # Signal d'abord ; le journal part par la file : un `print` dans un
             # gestionnaire de signal peut tomber pendant un autre `print` du
             # fil principal (écriture réentrante sur le même flux).
+            if (signum == signal.SIGTERM and runner.can_drain_on_sigterm()
+                    and not runner.sigterm_requested and not runner.stop.is_set()):
+                # L114b : premier SIGTERM d'un exécuteur médié — retrait au
+                # point sûr (90 s au plus), puis baux rendus ; un second
+                # signal arrête tout de suite. Le retrait est engagé par la
+                # boucle principale (aucun verrou pris ici).
+                runner.sigterm_requested = True
+                runner.wake_all.set()
+                log_async("signal %d reçu : retrait de l'hôte (%ds au plus), puis arrêt"
+                          % (signum, int(runner.host_gate.drain_s)))
+                return
             runner.stop.set()
             runner.wake_all.set()
             log_async("signal %d reçu : arrêt propre" % signum)

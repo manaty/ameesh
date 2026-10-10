@@ -406,3 +406,36 @@ class HttpTokenSource(TokenSource):
                 raise Unavailable("réponse de jeton illisible")
             self._token, self._expires = token, float(body.get("expires_ts") or 0.0)
             return token
+
+
+# --------------------------------------------------------------------------
+# branchement dans le client de L109
+# --------------------------------------------------------------------------
+
+def token_source_for(cfg: Any) -> TokenSource:
+    """Fabrique de `storage.remote` (`set_token_source_factory`) : le
+    fichier de jeton s'il est configuré (banc d'essai, `exec_token_file`),
+    sinon l'identité de l'appareil enrôlé (`HttpTokenSource`, clé du volume
+    `AMEESH_EXEC_HOME`). L'URL de l'état d'enrôlement doit être celle de la
+    configuration : un volume enrôlé ailleurs est refusé."""
+    path = getattr(cfg, "exec_token_file", "") or ""
+    if path:
+        from ..storage.remote.http import FileTokenSource
+        return FileTokenSource(path)
+    try:
+        source = HttpTokenSource.from_device()
+    except (DeviceError, OSError, ValueError) as exc:
+        raise Unavailable("exécuteur médié : aucune source de jeton (%s)" % exc) from None
+    wanted = getattr(cfg, "exec_url", "") or os.environ.get("AMEESH_EXEC_URL", "")
+    if wanted and jose.normalize_server_url(wanted) != source.server_url:
+        raise Unavailable("appareil enrôlé auprès de %s, pas de %s"
+                          % (source.server_url, jose.normalize_server_url(wanted)))
+    return source
+
+
+def install_token_source() -> None:
+    """Branche `token_source_for` dans le client de L109, sauf si une autre
+    fabrique a déjà été posée (essais)."""
+    from ..storage import remote
+    if remote.token_source_factory_is_default():
+        remote.set_token_source_factory(token_source_for)

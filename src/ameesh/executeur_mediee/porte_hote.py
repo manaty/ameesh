@@ -562,6 +562,9 @@ class GateController:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.acks: list[GateAck] = []  # derniers acquittements (essais, `show`)
+        #: L114b : retrait demandé par SIGTERM (état forcé, la porte ne peut
+        #: que l'aggraver en `stopped`)
+        self._terminating: GateState | None = None
 
     # -- lectures (tous fils) ---------------------------------------------
     @property
@@ -596,13 +599,40 @@ class GateController:
         self._thread = threading.Thread(target=self._loop, daemon=True, name="porte-hote")
         self._thread.start()
 
+    def terminate(self, drain_s: float | None = None) -> GateState:
+        """L114b : SIGTERM reçu par un exécuteur médié. Retrait local, comme
+        un `draining` de la porte : plus de réclamation, chaque tour finit au
+        point sûr, préemption à l'échéance (`drain_s`, défaut celui du
+        contrôleur, 90 s), puis baux rendus. La porte ne peut plus rouvrir
+        la réclamation ; un `stopped` de sa part reste appliqué."""
+        now = self._clock()
+        current = self.current
+        delay = self.drain_s if drain_s is None else max(0.0, float(drain_s))
+        forced = GateState(state="draining", seq=current.seq, until_ts=None,
+                           drain_deadline_ts=now + delay, caps=dict(current.caps),
+                           reason="sigterm")
+        self._terminating = forced
+        if current.state != "stopped":
+            self.apply(forced)
+        return forced
+
+    @property
+    def terminating(self) -> bool:
+        return self._terminating is not None
+
+    def _effective(self, state: GateState) -> GateState:
+        forced = self._terminating
+        if forced is None or state.state == "stopped":
+            return state
+        return forced
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
                 state = self.gate.wait_change(self.TICK)
                 if self._stop.is_set():
                     return
-                self.apply(state)
+                self.apply(self._effective(state))
                 self.tick()
             except Exception as exc:  # la porte ne tue jamais l'exécuteur
                 self._log("porte d'hôte : erreur du contrôleur (%s)" % exc)
