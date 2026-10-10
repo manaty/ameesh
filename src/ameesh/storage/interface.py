@@ -440,19 +440,27 @@ class TurnCosts(Domain):
                cached_input_tokens: int, output_tokens: int, cum_usd: float | None,
                cum_input_tokens: int | None, cum_cached_input_tokens: int | None,
                cum_output_tokens: int | None, account: str | None = None,
-               spend_key: str | None = None) -> bool:
+               spend_key: str | None = None, source: str | None = None,
+               executor: str | None = None, lease_owner: str | None = None,
+               lease_epoch: int | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
         telle quelle et n'a rien écrit. `account` (L30, migration 0028) : le
         compte qui a porté le tour ; None = colonne non écrite. `spend_key`
         (L60, migration 0041) : clé du marqueur comptable ; une ligne portant
-        déjà cette clé n'est pas réécrite (faux). Vrai si la ligne est écrite."""
+        déjà cette clé n'est pas réécrite (faux). Vrai si la ligne est écrite.
+        `source`, `executor`, `lease_owner`, `lease_epoch` (L111, migration
+        0111) : `relay` pour la mesure du relais de modèle, `device` pour la
+        déclaration d'un appareil médié (hors plafond) ; None = colonnes non
+        écrites (`source` vaut alors `harness`)."""
 
     @abc.abstractmethod
     def spent(self, seconds: float, *, agent: str,
               harnesses: Sequence[str] | None, account: str | None = None) -> float:
         """Somme des coûts des `seconds` dernières secondes (horloge de la
         base), de l'agent (`"all"` : tout le compte, comme `cost spent`), de
-        ces harnais seulement si donnés, de ce compte seulement si donné (L30)."""
+        ces harnais seulement si donnés, de ce compte seulement si donné (L30).
+        Les lignes `source = 'device'` (L111) ne comptent jamais : la dépense
+        d'un appareil médié est celle que le relais a mesurée."""
 
 
 # --------------------------------------------------------------------------

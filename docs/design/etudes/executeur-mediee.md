@@ -468,10 +468,12 @@ ajoute la clé et appelle DeepSeek.
 
 Contrat du relais (L111) :
 
-* **Passage OpenAI-compatible** : `POST /api/exec/v1/llm/deepseek/v1/chat/completions`
-  (et `/v1/models`), corps transmis tel quel, à trois exceptions : `model`
-  doit être admis (politique de l'hôte ∩ persona), `max_tokens` plafonné,
-  `stream_options.include_usage` forcé pour lire l'usage en flux.
+* **Passage Messages** (corrigé par L111 : `dsh` parle le protocole
+  *Messages* compatible Anthropic, pas `chat/completions`) :
+  `POST /api/exec/v1/llm/deepseek/v1/messages` (et `GET /v1/models`), corps
+  transmis tel quel, à deux exceptions : `model` doit être admis (politique
+  de l'hôte ∩ persona), `max_tokens` plafonné ; l'usage se lit dans
+  `message_start` et `message_delta`, toujours présents en flux.
 * **Coût** : à la fin de chaque réponse, le relais écrit `turn_costs`
   (`source = relay`, agent et tour tirés du jeton de session, plus un
   en-tête `X-Ameesh-Turn` facultatif) : c'est la ligne qui compte au plafond
@@ -483,8 +485,10 @@ Contrat du relais (L111) :
   « plafond atteint » comme aujourd'hui, L49).
 * **Harnais** : `dsh` doit accepter une URL de base et une clé fournies par
   l'environnement (`DEEPSEEK_API_KEY` = jeton de session,
-  `DEEPSEEK_BASE_URL` = relais). **À vérifier en premier par L111** ; à
-  défaut, un fournisseur « openai-compatible » dans le patch de profil `dsh`.
+  `DEEPSEEK_BASE_URL` = relais). **Vérifié par L111** (essai réel de `dsh`
+  0.2.0-rc.2 contre un faux fournisseur) : ces deux variables suffisent,
+  l'environnement de lancement prime sur le magasin d'identifiants ; aucun
+  patch de profil ni mandataire (EXPLOITATION.md, « Relais de modèle »).
 * La clé du serveur reste où elle est (trousseau du serveur, 0014) ; elle
   n'apparaît dans aucune réponse ni aucun journal.
 
