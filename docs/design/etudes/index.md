@@ -11,3 +11,4 @@
 * [Persona et harnais](persona-et-harnais.md) - Identité, consignes et mémoire d'une persona à travers Claude Code, Codex, dsh et ACP ; mémoire intérimaire neutre ; lots proposés.
 * [Orchestration et vivacité](orchestration-et-vivacite.md) - Orchestrateur externe arrêté qui bloque un chantier : mode d'agent, attribution gardée, adoption et reprise, alertes poussées, délégation à échéance, cloisonnement des hooks ; lots L36–L41 proposés.
 * [Plusieurs canons](plusieurs-canons.md) - Ce qui casse quand deux canons partagent un hôte, le modèle par fédération, intérim pour Acme ; lots L42–L45.
+* [Exécuteur médié](executeur-mediee.md) - Exécuteur sur un appareil prêté sans accès à la base : backend de stockage distant (61 opérations, 38 écritures), fencing serveur, enrôlement P-256, inactivité Compute, relais de modèle ; lots L107–L115.
