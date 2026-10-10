@@ -9,6 +9,9 @@ lui-même** (transitions des lots `work_items`, actions sous porte, tours et
 baux du registre, marqueur comptable, grand livre `turn_costs`) — jamais par
 git ni par le board :
 
+* **projets** (L62, en tête) : la vue de `ameesh projects` — par projet,
+  ses agents, leur état, leur lot en cours, non-lus, dépense 24 h, forfait ou
+  token, et ses lots ouverts sans agent ;
 * **lots** : jalons datés demande → gel → verdict → fusion quand ils sont
   connus, état (actif, en revue, bloqué, approuvé, fusionné, fermé),
   blocages ; et (L29) ce que le lot attend et de qui (`waiting_for`), s'il
@@ -442,7 +445,7 @@ def build_budget(cost_rows: list[dict], gauges: list, now: float, *,
         "spend": spend,
         "by_agent": [r for r in by_agent if r["usd"] or r["turns"]],
         "plans": [{
-            "harness": g.harness, "key": g.key, "used": round(g.used, 4),
+            "harness": g.harness, "key": g.key, "used": round(g.used_at(now), 4),
             "pace_cap": round(g.pace_cap(now), 4), "elapsed": round(g.elapsed(now), 4),
             "resets_ts": _round(g.resets_at), "window_s": g.window_s,
             "exceeded": g.exceeded(now),
@@ -513,10 +516,21 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     if book is None:
         book = cost_mod.CostBook(state_dir=cfg.state_dir if cfg else None, db=db)
     try:
-        gauges = book.gauges()
+        # lecture seule (L61) : l'historique des jauges est tenu par l'exécuteur
+        gauges = book.gauges(record=False)
     except (OSError, ValueError):
         gauges = []
-    hourly = getattr(cfg, "budget_usd_per_hour", None) or cost_mod.DEFAULT_HOURLY_USD
+    # L70 : plafonds en vigueur (base > configuration de l'hôte > défaut)
+    limits = None
+    if cfg is not None:
+        from . import budget as budget_mod
+        limits = budget_mod.current(cfg, db).as_dict()
+        hourly = limits["per_hour_usd"] or 0.0
+    else:
+        hourly = cost_mod.DEFAULT_HOURLY_USD
+    # L62 : la vue par projet en tête (une requête de plus, agrégée)
+    from . import projects as projects_mod
+    by_project = projects_mod.snapshot(db, project=project, now=now)
 
     return {
         "schema": SCHEMA,
@@ -526,13 +540,16 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         "host": getattr(cfg, "host", None),
         "project": project or None,
         "window": {"from_ts": _round(since_ts), "to_ts": _round(now)},
+        # L62 (champ ajouté) : projets, agents et lot en cours, lots sans agent
+        "projects": by_project["projects"],
         "lots": lots,
         "agents": agents,
         "milestones": plan["milestones"],
         "epics": plan["epics"],
         "stale_after_s": int(threshold),
         "actions": [build_action(r) for r in action_rows],
-        "budget": build_budget(cost_rows, gauges, now, hourly_cap=hourly),
+        "budget": dict(build_budget(cost_rows, gauges, now, hourly_cap=hourly),
+                       limits=limits),
         "truncated": truncated,
         "missing": list(MISSING),
     }
@@ -581,6 +598,15 @@ def format_text(snap: dict, width: int | None = None) -> str:
     line("avancement%s — %s (fenêtre %s)" % (
         " de %s" % snap["project"] if snap.get("project") else "",
         _hm(now, now), _duration(hours * 3600)))
+
+    if "projects" in snap:
+        # L62 : qui travaille sur quoi, avant le détail des lots
+        from . import projects as projects_mod
+        out.append("")
+        line("PROJETS (%d en cours)" % sum(1 for p in snap["projects"] if p["active"]))
+        out.extend(projects_mod.format_lines(
+            {"generated_ts": now, "projects": snap["projects"]}, width,
+            show_inactive=bool(snap.get("project")), indent="  "))
 
     out.append("")
     line("LOTS (%d)" % len(snap["lots"]))
@@ -668,6 +694,16 @@ def format_text(snap: dict, width: int | None = None) -> str:
     line("payé au token : 1 h %.2f · 24 h %.2f · fenêtre %.2f (plafond %.2f/h)" % (
         sp["1h"]["paid_usd"], sp["24h"]["paid_usd"], sp["window"]["paid_usd"],
         budget["hourly_cap_usd"]), "  ")
+    lim = budget.get("limits")
+    if lim:
+        # L70 : plafonds en vigueur et leur source (`ameesh budget`)
+        line("plafonds : %s/h (%s) · %s/jour (%s)%s" % (
+            "%.2f" % lim["per_hour_usd"] if lim.get("per_hour_usd") else "aucun",
+            lim["per_hour_source"],
+            "%.2f" % lim["per_day_usd"] if lim.get("per_day_usd") else "aucun",
+            lim["per_day_source"],
+            " · %d agent(s) à plafond propre" % len(lim["agents"]) if lim["agents"] else ""),
+            "  ")
     line("total estimé : 1 h %.2f · 24 h %.2f · fenêtre %.2f" % (
         sp["1h"]["total_usd"], sp["24h"]["total_usd"], sp["window"]["total_usd"]), "  ")
     for plan in budget["plans"]:
@@ -751,9 +787,10 @@ def main(argv: list[str] | None = None) -> int:
             raise ProgressError("--stale-after : %s" % exc)
         db = db_mod.connect(cfg)
         try:
-            db_mod.require_schema(db)
-            snap = snapshot(db, cfg, since=args.since, project=args.project,
-                            stale_after=threshold)
+            db_mod.require_schema(db, defer=True)
+            # L61 : lectures regroupées (db.batched) — deux allers-retours
+            snap = db_mod.batched(db, lambda db: snapshot(
+                db, cfg, since=args.since, project=args.project, stale_after=threshold))
         finally:
             db.close()
         if args.html:

@@ -344,7 +344,7 @@ def open_backend(cfg: Config) -> tuple[FileBackend | PgBackend, str | None]:
         return FileBackend(cfg), None
     try:
         db = db_mod.connect(cfg)
-        db_mod.require_schema(db)
+        db_mod.require_schema(db, defer=True)
         return PgBackend(cfg, db), None
     except db_mod.Unavailable as exc:
         if mode == "pg":

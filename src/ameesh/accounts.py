@@ -44,24 +44,38 @@ quand son dernier solde relevé (`provider_balances.account`, relevé par
 l'exécuteur ou `ameesh cost balance --record`) est au plus ce montant ; il
 redevient éligible au premier relevé au-dessus (solde rechargé).
 
-**Choix du compte, avant chaque tour** (`choose`) :
+**Choix du compte, avant chaque tour** (`choose`, décision 0034 qui amende
+0027 §2–3) — les comptes d'un fournisseur forment un **réservoir** :
 
-1. un compte quitté au seuil reste retenu jusqu'à la remise à zéro de sa
-   fenêtre (`resets_at`) : le **retour** vers un compte antérieur de la liste
-   (le primaire d'abord) se fait dès que sa retenue est échue et qu'il est
-   sous le seuil ;
-2. sinon le compte actif, s'il est sous le seuil ;
-3. sinon le premier compte suivant sous le seuil (**bascule**) ;
+1. forçage manuel (`ameesh accounts use`) : ce compte, ou pause s'il est au
+   seuil ; `ameesh accounts auto` rend la main à la règle ;
+2. **continuité** : la session en cours de l'agent reste sur son compte tant
+   que celui-ci est sous son seuil — pas de changement en cours de session
+   pour un gain marginal ;
+3. sinon (ouverture ou rotation de session, ou compte de la session au
+   seuil) : parmi les comptes **utilisables** (profil valide, sous le seuil),
+   celui dont la **capacité inutilisée expire le plus tôt** (`expiry` : la
+   remise à zéro la plus proche parmi ses fenêtres en cours) ; un compte sans
+   fenêtre en cours (relevé échu, non daté ou absent) passe après ; à
+   égalité, l'ordre déclaré ;
 4. sinon pause : tous les comptes sont au seuil.
 
 Le seuil est celui de la garde (0019, inchangé) : `min(90 %, part écoulée +
-10 points)` sur les vraies jauges **du compte** — Claude : les
-`rate_limit_event` du flux des agents, attribués par le marqueur de compte qui
-précède chaque tour ; Codex : les journaux de session du `CODEX_HOME` du
-compte. Une fenêtre dont `resets_at` est passé compte pour vierge.
+10 points)` sur les vraies jauges **du compte**, relues à chaque choix —
+Claude : les `rate_limit_event` du flux des agents, attribués par le marqueur
+de compte qui précède chaque tour ; Codex : les journaux de session du
+`CODEX_HOME` du compte. Une fenêtre dont `resets_at` est passé compte pour
+0 % (`Gauge.used_at`, L71) : un compte sans relevé récent est essayé, pas
+écarté — son premier tour rapporte sa jauge.
 
-Le changement se fait en base par comparer-et-changer (`storage.accounts`) :
-deux workers qui voient le même seuil n'écrivent qu'une bascule.
+Chaque choix porte sa raison (`Choice.why`, « five_hour expire dans 52 min,
+0 % utilisé »), journalisée par l'exécuteur (`account_turn.choose`).
+
+La ligne `account_active` garde le **dernier compte choisi** pour une
+nouvelle session (et le forçage) ; elle change en base par
+comparer-et-changer (`storage.accounts`) : deux workers qui font le même
+choix n'écrivent qu'une bascule. Les retenues (`account_holds`) de 0027 §3 ne
+sont plus posées : le choix par échéance les remplace.
 """
 from __future__ import annotations
 
@@ -493,8 +507,8 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         book.record_gauges(result.gauges, account=profile.name)
     depasses = []
     for gauge in result.gauges:
-        if gauge.reset_passed(now):
-            continue  # fenêtre remise à zéro depuis le relevé : vierge
+        # fenêtre remise à zéro depuis le relevé : vierge (L71 : `exceeded`
+        # compte alors 0 %, voir `Gauge.used_at`)
         if gauge.exceeded(now):
             depasses.append(gauge)
     if depasses:
@@ -539,27 +553,86 @@ class Choice:
     """Le compte retenu pour le prochain tour, et ce qui a changé."""
 
     profile: Profile | None              #: None = pause, tous les comptes au seuil
-    active: Profile | None               #: compte actif (même au seuil)
+    active: Profile | None               #: dernier compte choisi (même au seuil)
     reason: str = ""                     #: raison de la pause
     switched: dict | None = None         #: {from, to, kind, reason} si CE choix a basculé
     forced: bool = False
+    why: str = ""                        #: raison du choix (journal, 0034 §5)
+    kept: bool = False                   #: continuité : la session garde son compte
 
 
 def _label(evaluations: dict) -> str:
     return " ; ".join("%s : %s" % (name, ev.reason) for name, ev in evaluations.items())
 
 
+def duration(seconds: float) -> str:
+    """Une durée lisible : « 52 min », « 3 h 10 », « 2 j 4 h »."""
+    minutes = max(0, int(round(seconds / 60.0)))
+    if minutes < 60:
+        return "%d min" % minutes
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return "%d h %02d" % (hours, minutes) if minutes else "%d h" % hours
+    days, hours = divmod(hours, 24)
+    return "%d j %d h" % (days, hours) if hours else "%d j" % days
+
+
+def expiry(gauges, now: float) -> tuple | None:
+    """L'échéance du compte (0034 §1) : `(resets_at, inutilisé, jauge)` de sa
+    fenêtre en cours qui se remet à zéro le plus tôt, ou None (aucune fenêtre
+    en cours : relevé échu, non daté ou absent — rien n'expire)."""
+    best = None
+    for gauge in gauges:
+        found = gauge.expiring(now)
+        if found is not None and (best is None or found[0] < best[0]):
+            best = (found[0], found[1], gauge)
+    return best
+
+
+def explain(result: Evaluation, now: float) -> str:
+    """La raison lisible d'un choix par échéance : « five_hour expire dans
+    52 min, 0 % utilisé »."""
+    found = expiry(result.gauges, now)
+    if found is not None:
+        resets_at, _unused, gauge = found
+        return "%s expire dans %s, %.0f %% utilisé" % (
+            gauge.key, duration(resets_at - now), gauge.used_at(now) * 100)
+    if any(g.reset_passed(now) for g in result.gauges):
+        return "relevé échu (fenêtre remise à zéro : 0 %), essayé"
+    if result.gauges:
+        return "jauges non datées, sous le seuil"
+    return "sans jauge de forfait, sous le seuil"
+
+
+def rank(items: list[Profile], evaluations: dict, now: float) -> list[Profile]:
+    """Les comptes utilisables, du premier à consommer au dernier (0034 §1).
+
+    Clé : l'échéance de la capacité inutilisée (la plus proche d'abord ; sans
+    fenêtre en cours, après), puis l'ordre déclaré."""
+    def key(pair):
+        index, profile = pair
+        found = expiry(evaluations[profile.name].gauges, now)
+        return (found[0] if found is not None else float("inf"), index)
+    usable = [(i, p) for i, p in enumerate(items) if evaluations[p.name].ok]
+    return [p for _i, p in sorted(usable, key=key)]
+
+
 def choose(db, host: str, harness: str, items: list[Profile], book, *,
            now: float | None = None, agent: str | None = None, environ=None,
-           simulate: bool = False) -> Choice:
+           simulate: bool = False, session_account: str | None = None) -> Choice:
     """Choisit le compte du prochain tour (voir l'en-tête du module).
 
-    Seule écriture : la bascule (comparer-et-changer, journalisée) et les
-    retenues. Une erreur de base remonte : l'appelant suspend (fail-closed).
+    `session_account` : le compte sous lequel tourne la session en cours de
+    l'agent (None : pas de session, ou session neuve) — elle le garde tant
+    qu'il est sous son seuil (0034 §4).
+
+    Seule écriture : le dernier compte choisi (`account_active`,
+    comparer-et-changer, journalisé `bascule`) et l'historique des jauges.
+    Une erreur de base remonte : l'appelant suspend (fail-closed).
 
     `simulate=True` (L39, `ameesh resume`) : le compte que choisirait le
-    prochain tour, SANS AUCUNE écriture (ni bascule, ni retenue, ni historique
-    des jauges) ; `switched` dit la bascule qui aurait lieu.
+    prochain tour, SANS AUCUNE écriture (ni bascule, ni historique des
+    jauges) ; `switched` dit la bascule qui aurait lieu.
     """
     now = time.time() if now is None else now
     store = storage.of(db).accounts
@@ -588,71 +661,59 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         active_name = row.get("account") if row.get("account") in names else items[0].name
     active = by_name(items, active_name) or items[0]
 
+    # 1. forçage manuel : il prime, même sur la continuité
     if row.get("forced"):
         current = ev(active)
         if current.ok:
-            return Choice(active, active, forced=True)
+            return Choice(active, active, forced=True,
+                          why="forcé (ameesh accounts use)")
         return Choice(None, active, reason="compte %s forcé (ameesh accounts use) : %s"
                       % (active.name, current.reason), forced=True)
 
-    holds = store.holds(host, harness)
-
-    def held(profile: Profile) -> bool:
-        hold = holds.get(profile.name)
-        if not hold:
-            return False
-        until = hold.get("until_ts")
-        return until is not None and float(until) > now
-
-    def switch_to(target: Profile, kind: str, reason: str) -> Choice | None:
-        if simulate:
-            return Choice(target, target, switched={"from": active.name, "to": target.name,
-                                                    "kind": kind, "reason": reason})
-        if not store.switch(host, harness, expected=active.name, to=target.name, kind=kind,
-                            reason=reason, agent=agent):
-            return None  # un autre worker a changé le compte entre-temps
-        store.release(host, harness, target.name)
-        return Choice(target, target, switched={"from": active.name, "to": target.name,
-                                                "kind": kind, "reason": reason})
-
-    index = names.index(active.name)
-    # 1. retour vers un compte antérieur, primaire d'abord, dès sa remise à zéro
-    for profile in items[:index]:
-        if held(profile) or not ev(profile).ok:
-            continue
-        done = switch_to(profile, "retour", "fenêtre de %s remise à zéro" % profile.name)
-        if done is not None:
-            return done
-        return _reread(store, host, harness, items, active)
-    # 2. le compte actif, s'il est sous le seuil
-    current = ev(active)
-    if current.ok:
-        return Choice(active, active)
-    # 3. le premier compte suivant sous le seuil
-    for profile in items[index + 1:]:
-        if held(profile) or not ev(profile).ok:
-            continue
-        if not simulate:
-            store.hold(host, harness, active.name, current.until, current.reason)
-        done = switch_to(profile, "bascule", "%s au seuil : %s" % (active.name, current.reason))
-        if done is not None:
-            return done
-        return _reread(store, host, harness, items, active)
-    # 4. tous au seuil : pause
+    # 2. continuité : la session garde son compte tant qu'il est sous son seuil
+    # (les autres comptes ne sont alors pas relus : rien à choisir)
+    own = by_name(items, session_account) if session_account else None
+    if own is not None and ev(own).ok:
+        return Choice(own, active, kept=True,
+                      why="continuité : la session reste sur %s, sous son seuil" % own.name)
     for profile in items:
         ev(profile)
-    for profile in items:
-        if held(profile) and cache[profile.name].ok:
-            cache[profile.name].reason = "retenu jusqu'à la remise à zéro de sa fenêtre"
-    return Choice(None, active, reason="tous les comptes %s au seuil — %s"
-                  % (harness, _label(cache)))
+    # 3. le compte dont la capacité inutilisée expire le plus tôt
+    ranked = rank(items, cache, now)
+    if not ranked:
+        return Choice(None, active, reason="tous les comptes %s au seuil — %s"
+                      % (harness, _label(cache)))
+    target = ranked[0]
+    why = explain(cache[target.name], now)
+    if len(ranked) > 1:
+        why += " (avant %s)" % ", ".join(
+            "%s : %s" % (p.name, explain(cache[p.name], now)) for p in ranked[1:])
+    left = own if own is not None else (active if target.name != active.name else None)
+    if left is not None and not cache[left.name].ok:
+        why = "%s au seuil (%s) ; %s" % (left.name, cache[left.name].reason, why)
+    if target.name == active.name:
+        return Choice(target, active, why=why)
+    switched = {"from": active.name, "to": target.name, "kind": "bascule", "reason": why}
+    if simulate:
+        return Choice(target, target, switched=switched, why=why)
+    if store.switch(host, harness, expected=active.name, to=target.name, kind="bascule",
+                    reason=why, agent=agent):
+        store.release(host, harness, target.name)  # retenue d'avant 0034, s'il en reste
+        return Choice(target, target, switched=switched, why=why)
+    # course : un autre worker a changé le dernier choix entre-temps ; un
+    # forçage posé entre-temps prime, sinon notre choix tient
+    fresh = store.active(host, harness) or {}
+    if fresh.get("forced"):
+        return _reread(store, host, harness, items, active)
+    return Choice(target, by_name(items, fresh.get("account")) or target, why=why)
 
 
 def _reread(store, host: str, harness: str, items: list[Profile], fallback: Profile) -> Choice:
-    """Course perdue : un autre worker a basculé ; on prend le compte en place."""
+    """Course perdue contre un forçage : on prend le compte en place."""
     row = store.active(host, harness) or {}
     profile = by_name(items, row.get("account")) or fallback
-    return Choice(profile, profile, forced=bool(row.get("forced")))
+    return Choice(profile, profile, forced=bool(row.get("forced")),
+                  why="forcé (ameesh accounts use)" if row.get("forced") else "")
 
 
 def current(db, host: str, harness: str, items: list[Profile]) -> Profile:
@@ -696,10 +757,15 @@ def automatic(db, host: str, harness: str, *, by: str) -> bool:
 
 def report(cfg, db, book, *, now: float | None = None,
            harnesses: list[str] | None = None,
-           evaluate_fn: Callable | None = None) -> list[dict]:
+           evaluate_fn: Callable | None = None,
+           record: bool = True) -> list[dict]:
     """Une ligne par compte déclaré : actif, forcé, état, jauges, retenue.
 
-    Lecture seule : aucune bascule n'est faite ici.
+    Lecture seule : aucune bascule n'est faite ici. `record=False` (L71) :
+    l'historique des jauges n'est pas écrit non plus — c'est le cas des
+    commandes d'affichage (`ameesh accounts list`, `ameesh cost report`) ;
+    le relevé revient aux exécuteurs (avant chaque tour) ou à une demande
+    explicite.
     """
     now = time.time() if now is None else now
     declared = parse(getattr(cfg, "accounts", None) or {})
@@ -712,7 +778,7 @@ def report(cfg, db, book, *, now: float | None = None,
         holds = store.holds(cfg.host, harness) if store else {}
         active_name = (active or {}).get("account") or items[0].name
         for profile in items:
-            result = (evaluate_fn or evaluate)(book, profile, items, now)
+            result = (evaluate_fn or evaluate)(book, profile, items, now, record=record)
             hold = holds.get(profile.name) or {}
             rows.append({
                 "harness": harness,
@@ -727,14 +793,41 @@ def report(cfg, db, book, *, now: float | None = None,
                 "hold_until": hold.get("until_ts"),
                 "hourly_usd": profile.hourly_usd,
                 "gauges": [
-                    {"key": g.key, "used": g.used, "cap": g.pace_cap(now),
+                    # L71 : une fenêtre échue compte pour 0 % ; le dernier
+                    # relevé reste lisible (`last_used`)
+                    {"key": g.key, "used": g.used_at(now), "last_used": g.used,
+                     "cap": g.pace_cap(now),
                      "elapsed": g.elapsed(now), "resets_at": g.resets_at,
                      "reset_passed": g.reset_passed(now)}
                     for g in result.gauges
                 ],
                 "_gauges": list(result.gauges),
             })
+        _forecast(rows[len(rows) - len(items):], items, now)
     return rows
+
+
+def _forecast(rows: list[dict], items: list[Profile], now: float) -> None:
+    """L74 (0034 §5) : pour chaque compte, la capacité **perdue** à la prochaine
+    remise à zéro de chaque fenêtre en cours si rien ne change (`losses`), son
+    échéance (`expires_in_s`), et le compte que prendrait une nouvelle session
+    (`next`, avec sa raison `why`)."""
+    evaluations = {}
+    for row, profile in zip(rows, items):
+        result = Evaluation(profile, reason=row["reason"], gauges=row["_gauges"])
+        evaluations[profile.name] = result
+        row["losses"] = [
+            {"key": g.key, "resets_at": found[0], "in_s": found[0] - now, "lost": found[1]}
+            for g in row["_gauges"] for found in [g.expiring(now)] if found is not None]
+        found = expiry(row["_gauges"], now)
+        row["expires_in_s"] = (found[0] - now) if found is not None else None
+        row["next"] = False
+        row["why"] = explain(result, now) if row["ok"] else ""
+    ranked = rank(items, evaluations, now)
+    forced = [row for row in rows if row["forced"]]
+    target = forced[0]["account"] if forced else (ranked[0].name if ranked else None)
+    for row in rows:
+        row["next"] = row["account"] == target and row["ok"]
 
 
 def format_rows(rows: list[dict]) -> str:
@@ -748,13 +841,23 @@ def format_rows(rows: list[dict]) -> str:
         gauges = ", ".join(
             "%s %.0f%% (rythme %.0f%%%s)" % (
                 g["key"], g["used"] * 100, g["cap"] * 100,
-                ", remise à zéro passée" if g.get("reset_passed") else "")
+                ", remise à zéro passée, dernier relevé %.0f%%"
+                % (g.get("last_used", g["used"]) * 100) if g.get("reset_passed") else "")
             for g in row["gauges"]) or "—"
         lines.append("%-9s %-14s %-7s %-8s %s" % (
             row["harness"], row["account"], actif, etat, gauges))
         if row["reason"]:
             lines.append("%-9s %-14s %-7s %-8s ↳ %s" % ("", "", "", "", row["reason"]))
-        if row.get("hold_until"):
+        if row.get("losses"):
+            lines.append("%-9s %-14s %-7s %-8s ↳ perdu à la remise à zéro si rien ne change : %s"
+                         % ("", "", "", "", ", ".join(
+                             "%s %.0f %% dans %s" % (l["key"], l["lost"] * 100,
+                                                     duration(l["in_s"]))
+                             for l in row["losses"])))
+        if row.get("next"):
+            lines.append("%-9s %-14s %-7s %-8s ↳ prochain choix pour une nouvelle session : %s"
+                         % ("", "", "", "", row.get("why") or "—"))
+        if row.get("hold_until") and float(row["hold_until"]) > time.time():
             lines.append("%-9s %-14s %-7s %-8s ↳ retenu jusqu'à %s" % (
                 "", "", "", "", time.strftime("%Y-%m-%d %H:%M",
                                               time.localtime(float(row["hold_until"])))))

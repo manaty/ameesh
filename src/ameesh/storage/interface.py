@@ -88,11 +88,13 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    placements      recorded
    progress        lots lot_events lot_milestones lot_actions actions agents costs
                    packages package_items lot_messages
+   projects        board
    operations      set_settings set_session_work_item listing request_restart
                    apply_restart adopt resume message_lots assigned_open_lots
                    open_lots_activity turns record_gauges gauge_history
                    record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
+   budgets         limits put events
 
 3. Atomicité et verrous. Postgres tient les garanties par des écritures
    conditionnelles en une instruction (`UPDATE … WHERE`, `INSERT … ON
@@ -187,6 +189,10 @@ class Agents(Domain):
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
         """La ligne de l'agent, ou None."""
+
+    @abc.abstractmethod
+    def harnesses(self) -> dict[str, str]:
+        """L71 : `{agent: harnais}` pour tout le registre (comptabilité, jauges)."""
 
     @abc.abstractmethod
     def overview(self) -> list[dict]:
@@ -421,22 +427,25 @@ class TurnCosts(Domain):
     (`PendingSpend`) ; ce domaine n'ouvre aucune transaction."""
 
     @abc.abstractmethod
-    def last_reading(self, agent: str, harness: str,
+    def last_reading(self, agent: str | None, harness: str,
                      session: str | None = None) -> dict | None:
         """Dernier relevé CONNU (cumul en dollars ou en jetons non nul) de
         l'agent pour ce harnais — de cette session seulement si `session` est
         donnée : session, cum_usd, cum_input_tokens, cum_cached_input_tokens,
-        cum_output_tokens ; ou None."""
+        cum_output_tokens ; ou None. `agent=None` (L71) : tout agent."""
 
     @abc.abstractmethod
     def insert(self, *, agent: str, harness: str, turn: str | None, model: str | None,
                session: str | None, usd: float, input_tokens: int,
                cached_input_tokens: int, output_tokens: int, cum_usd: float | None,
                cum_input_tokens: int | None, cum_cached_input_tokens: int | None,
-               cum_output_tokens: int | None, account: str | None = None) -> None:
+               cum_output_tokens: int | None, account: str | None = None,
+               spend_key: str | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
         telle quelle et n'a rien écrit. `account` (L30, migration 0028) : le
-        compte qui a porté le tour ; None = colonne non écrite."""
+        compte qui a porté le tour ; None = colonne non écrite. `spend_key`
+        (L60, migration 0041) : clé du marqueur comptable ; une ligne portant
+        déjà cette clé n'est pas réécrite (faux). Vrai si la ligne est écrite."""
 
     @abc.abstractmethod
     def spent(self, seconds: float, *, agent: str,
@@ -444,6 +453,35 @@ class TurnCosts(Domain):
         """Somme des coûts des `seconds` dernières secondes (horloge de la
         base), de l'agent (`"all"` : tout le compte, comme `cost spent`), de
         ces harnais seulement si donnés, de ce compte seulement si donné (L30)."""
+
+
+# --------------------------------------------------------------------------
+# plafonds de budget du mesh (L70, décision 0019 §2, migration 0042)
+# --------------------------------------------------------------------------
+
+class Budgets(Domain):
+    """Plafonds de budget réglés en base, pour tout le mesh, et leur journal.
+
+    Une ligne par (portée, fenêtre) : portée `''` = tout le mesh, sinon un
+    agent ; fenêtre 3600 ou 86400 s. Les changements sont journalisés dans
+    la même transaction (acteur, ancienne et nouvelle valeur) ; un
+    déclencheur réveille les exécuteurs (canal `ameesh_budget`)."""
+
+    @abc.abstractmethod
+    def limits(self) -> list[dict]:
+        """Toutes les lignes : scope, window_s, usd, set_by, updated_ts."""
+
+    @abc.abstractmethod
+    def put(self, scope: str, window_s: int, usd: float | None, *,
+            actor: str) -> tuple[bool, float | None]:
+        """Pose (`usd` > 0) ou retire (`usd` None) un plafond, et journalise,
+        en UNE transaction (verrou de la ligne). Rend (changé, ancienne
+        valeur) ; rien n'est écrit ni journalisé si la valeur est la même."""
+
+    @abc.abstractmethod
+    def events(self, limit: int, scope: str | None = None) -> list[dict]:
+        """Les derniers changements, récents d'abord : scope, window_s,
+        old_usd, new_usd, actor, at_ts."""
 
 
 # --------------------------------------------------------------------------
@@ -1357,20 +1395,52 @@ class Progress(Domain):
 
 
 # --------------------------------------------------------------------------
+# vue par projet (lot L62) : qui travaille sur quoi
+# --------------------------------------------------------------------------
+
+class Projects(Domain):
+    """Lecture de la vue par projet (`ameesh projects`, L62). Aucune écriture.
+
+    UNE requête, UN aller-retour : la vue se rafraîchit souvent et sert aussi
+    d'en-tête à `ameesh progress`."""
+
+    @abc.abstractmethod
+    def board(self, *, max_lots: int) -> dict:
+        """`{"agents": [...], "lots": [...]}`.
+
+        `agents` : un élément par agent du registre — name, chantier, team,
+        harness, host, provider, credential_mode, status, status_text, mode,
+        stop_reason, responsible, lease_live, turn_started_ts,
+        status_since_ts, last_turn_ts, updated_ts, last_seen_ts, unread,
+        lot de session (`session_lot_id` / `_title` / `_state`), lot assigné
+        ouvert le plus récent (`assigned_lot_id` / `_title` / `_state`),
+        `open_lots` (lots ouverts assignés), `usd_24h` et `turns_24h`
+        (grand livre, horloge de la base).
+
+        `lots` : les lots OUVERTS (ni `merged`, ni `promoted`, ni `closed`),
+        au plus `max_lots`, les plus récemment modifiés d'abord — id, title,
+        state, app, workstream, package_team, assignee, updated_ts ; chaque
+        élément porte `total` (avant la borne)."""
+
+
+# --------------------------------------------------------------------------
 # exploitation (lot L26, migration 0027) : réglages, redémarrage, historiques
 # --------------------------------------------------------------------------
 
 class Operations(Domain):
     """Ce que l'orchestrateur lit et règle pour exploiter les agents (L26).
 
-    Réglages d'agent (`session_policy`, `effort`, `tier`), lot de la session
+    Réglages d'agent (`session_policy`, `effort`, `tier`,
+    `context_max_tokens`), lot de la session
     courante, demande de redémarrage, lectures enrichies pour `ameesh list
     --json` et `ameesh alerts`, usage par tour, historique des jauges de
     forfait et soldes d'un fournisseur payé au token. Instants en secondes
     epoch (`*_ts`) ; une liste vide d'ids rend une liste vide."""
 
     #: colonnes réglables par `set_settings` (liste fermée)
-    SETTINGS = ("session_policy", "effort", "tier")
+    SETTINGS = ("session_policy", "effort", "tier", "context_max_tokens")
+    #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
+    INTEGER_SETTINGS = ("context_max_tokens",)
 
     @abc.abstractmethod
     def set_settings(self, name: str, values: dict) -> bool:
@@ -1482,9 +1552,18 @@ class Operations(Domain):
     @abc.abstractmethod
     def record_balance(self, *, provider: str, currency: str, total: float,
                        granted: float | None, topped_up: float | None,
-                       available: bool | None, account: str | None = None) -> dict:
+                       available: bool | None, account: str | None = None,
+                       unless_within_s: float | None = None) -> dict | None:
         """Ajoute un solde horodaté (heure de la base) ; rend la ligne.
-        `account` (L30) : le compte (clé d'API) dont c'est le solde."""
+        `account` (L30) : le compte (clé d'API) dont c'est le solde.
+        `unless_within_s` (L71) : rien n'est écrit (None) si un relevé de ce
+        fournisseur, compte et devise a moins de `unless_within_s` secondes."""
+
+    @abc.abstractmethod
+    def recent_balance(self, *, provider: str, account: str | None,
+                       within_s: float) -> bool:
+        """L71 : un relevé de ce fournisseur (et compte) a-t-il moins de
+        `within_s` secondes ? (plusieurs exécuteurs sur la même clé)"""
 
     @abc.abstractmethod
     def balances(self, *, provider: str | None, since_s: float,
@@ -1654,6 +1733,7 @@ class Storage(abc.ABC):
     pending_spend: PendingSpend
     turn_costs: TurnCosts
     accounts: Accounts
+    budgets: Budgets
     mailbox: Mailbox
     wakeups: Wakeups
     keys: Keys
@@ -1670,6 +1750,7 @@ class Storage(abc.ABC):
     grants: Grants
     placements: Placements
     progress: Progress
+    projects: Projects
     operations: Operations
     hosts: HostResources
     turn_resources: TurnResources

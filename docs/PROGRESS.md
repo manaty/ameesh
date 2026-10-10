@@ -49,6 +49,7 @@ Codes de sortie : 0, 1 (base injoignable, schéma absent, erreur SQL),
 | `host` | texte | hôte qui a produit l'instantané |
 | `project` | texte \| null | filtre `--project` |
 | `window` | `{from_ts, to_ts}` | fenêtre de la frise |
+| `projects` | liste | (L62) la vue par projet de `ameesh projects` (schéma des éléments : `ameesh-projects/1`, [EXPLOITATION.md](EXPLOITATION.md)) ; filtrée par `--project` sur le nom du projet ; en tête du texte et de la page |
 | `lots` | liste | voir ci-dessous, du plus ancien au plus récent |
 | `agents` | liste | voir ci-dessous, par nom |
 | `milestones` | liste | jalons du projet : fiches `WorkPackage` `milestone` du canon (L29) |
@@ -160,6 +161,7 @@ sont toujours dans son champ `actions`, même au-delà de la borne.
 | `currency` | `"USD"` |
 | `paid_harnesses` | harnais payés au token (dépense réelle) ; les autres sont des forfaits dont le coût est une estimation |
 | `hourly_cap_usd` | plafond horaire de l'usage payé au token (décision 0019) |
+| `limits` | L70 : plafonds en vigueur et leur source (`base`, `config`, `défaut`) — même forme que `limits` de `ameesh budget --json` ; null sans configuration |
 | `spend` | `{window, 1h, 24h}`, chacun `{total_usd, paid_usd}` |
 | `by_agent` | `{agent, harness, model, paid, usd, turns, input_tokens, cached_input_tokens, output_tokens}` sur la fenêtre |
 | `plans` | jauges de forfait : `{harness, key, used, pace_cap, elapsed, resets_ts, window_s, exceeded}` (fractions 0..1) |

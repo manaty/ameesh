@@ -48,6 +48,7 @@ ameesh restart <agent> --brief FILE|-             # stop the turn, forget the se
 ameesh interrupt <agent> <message…>               # direct interruption (authorised senders only)
 ameesh set <agent> tier=fast session_policy=par-lot|taille|jamais
 ameesh cost turns | gauges | balance --json       # usage per turn, plan gauges history, paid-per-token balance
+ameesh budget [set --per-hour X --per-day Y [--agent A] | unset …]  # mesh-wide paid-per-token caps, in the database, hot-reloaded
 ```
 
 Operating agents (L26: session per lot, enriched `list --json`, alerts,
@@ -308,12 +309,25 @@ ameesh attach <agent> [--wait] [--ttl S]      # session interactive sur le bail 
 
 ## Language choice
 
-**Python 3 (stdlib) + `psycopg` when importable, otherwise the `psql` binary.**
+**Python 3 (stdlib) + `psycopg`, with the `psql` binary as a fallback.**
 Justified in [`docs/V1-MAILBOX-RUNNER.md`](docs/V1-MAILBOX-RUNNER.md):
 v0 is Python (same alias/identity/hook semantics, one runtime, no second
 toolchain), the stdlib already covers JSON/subprocess/sockets/threads, and Node
-has no stdlib Postgres client — it would have forced a dependency, whereas the
-Python path runs with **zero** dependencies via `psql`.
+has no stdlib Postgres client. Since L61, `psycopg[binary]` is a package
+dependency (`pip install` brings it): the `psql` fallback opens one subprocess
+and one TLS connection per query — ~1.5 s each against a remote database —
+so it stays a fallback (psycopg missing or without libpq), and `ameesh doctor`
+warns when it serves a remote database. Round trips and connection cost
+against a remote database: [`docs/EXPLOITATION.md`](docs/EXPLOITATION.md),
+section « Base distante ».
+
+Install (or upgrade an existing install, which also pulls psycopg):
+
+```bash
+python3 -m venv ~/.local/share/ameesh/venv
+~/.local/share/ameesh/venv/bin/pip install -e <path to your ameesh clone>
+ameesh doctor          # driver, schema, and — for a remote database — latency
+```
 
 ## Tests
 

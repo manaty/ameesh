@@ -162,6 +162,11 @@ def _session_binding(cfg: Config, db, harness: str | None,
                 return Binding(reason=_UNBOUND)
         holder = sb.lease_holder(db, row["agent"])
     except Exception as exc:  # table absente, base en panne : rien n'est lié
+        if getattr(db, "_schema_missing", False):
+            # L61 : la vérification de schéma (jointe à cette première
+            # requête) a trouvé une base non migrée — c'est l'erreur à dire,
+            # pas « non lié »
+            raise
         return Binding(reason="liaison de session illisible (%s)"
                        % " ".join(str(exc).split())[:120])
     if holder:

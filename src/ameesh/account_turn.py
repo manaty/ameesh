@@ -5,7 +5,9 @@ Points d'accroche de `runner.AgentWorker`, regroupés ici pour que l'exécuteur
 ne porte que des appels d'une ligne :
 
 * `choose`     — avant chaque tour, dans la garde de budget : choisit le compte
-                 (bascule, retour au primaire, ou pause si tous sont au seuil) ;
+                 (0034 : la session garde son compte sous son seuil ; sinon
+                 celui dont la capacité inutilisée expire le plus tôt ; pause
+                 si tous sont au seuil) et journalise le choix et sa raison ;
 * `continuity` — avant de consommer le travail : si la session de l'agent a
                  été ouverte sous un autre compte et que le harnais ne peut pas
                  la reprendre sous le nouveau, rotation avec résumé (L11) ;
@@ -64,11 +66,17 @@ def choose(worker, book=None, *, pause: bool = True) -> str | None:
                                  tools={worker.name: harness})
     try:
         choice = accounts.choose(worker.db, worker.cfg.host, harness, items, book,
-                                 agent=worker.name)
+                                 agent=worker.name,
+                                 session_account=session_account(worker, items))
+    except db_mod.Unavailable:
+        # Base injoignable (L72) : ce n'est ni une pause budget ni un problème
+        # de migration — l'exécuteur suspend les tours et réessaie, avec son
+        # propre statut « base injoignable », levé au retour de la base.
+        raise
     except db_mod.DbError as exc:
         # sans état des comptes, on ne sait pas quel compte est sous le seuil
-        return ("état des comptes indisponible (%s) : « ameesh migrate » ?"
-                % " ".join(str(exc).split())[:160]) if pause else None
+        return ("état des comptes indisponible (%s)" % db_mod.explain(exc)
+                if pause else None)
     if choice.switched:
         journal(worker, harness, choice.switched)
     if choice.profile is None:
@@ -76,8 +84,47 @@ def choose(worker, book=None, *, pause: bool = True) -> str | None:
             return choice.reason
         worker._account = choice.active
         return None
+    log_choice(worker, harness, choice)
     worker._account = choice.profile
     return ""
+
+
+def session_account(worker, items) -> str | None:
+    """Le compte de la session en cours de l'agent (0034 §4), ou None.
+
+    None sans session (ouverture : le choix est libre). Session d'avant L30
+    (aucun compte noté) : le compte déclaré dont le dossier est celui que le
+    harnais prend par défaut, s'il y en a un.
+    """
+    try:
+        if not worker.current_session():
+            return None
+    except Exception:
+        return None
+    name = _session_account(worker)
+    if name:
+        return name
+    default = accounts.Profile(harness=items[0].harness, name="(défaut)")
+    for profile in items:
+        if profile.home() == default.home():
+            return profile.name
+    return None
+
+
+def log_choice(worker, harness: str, choice) -> None:
+    """Chaque choix de compte est journalisé avec sa raison (0034 §5).
+
+    Une ligne au journal de l'exécuteur quand le compte retenu ou la nature
+    du choix (échéance, continuité, forçage) change pour cet agent — pas à
+    chaque sondage : la garde passe ici avant chaque tour et à chaque sondage
+    d'un agent en attente, et la raison (« expire dans 52 min ») vieillit.
+    """
+    cle = (choice.profile.name, choice.kept, choice.forced)
+    if getattr(worker, "_account_choice_logged", None) == cle:
+        return
+    worker._account_choice_logged = cle
+    _log("[%s] compte %s : %s — %s" % (worker.name, harness, choice.profile.name,
+                                      choice.why or "seul compte utilisable"))
 
 
 def journal(worker, harness: str, switched: dict) -> None:
@@ -86,14 +133,10 @@ def journal(worker, harness: str, switched: dict) -> None:
     La ligne `account_switches` est déjà écrite (même transaction que le
     changement de compte) ; ici, la trace lisible.
     """
-    if switched["kind"] == "retour":
-        texte = ("Retour au compte %s pour %s (%s) : les tours suivants quittent le "
-                 "compte %s." % (switched["to"], harness, switched["reason"], switched["from"]))
-    else:
-        texte = ("Bascule de compte %s : %s → %s (%s). Les tours suivants utilisent le "
-                 "compte %s ; retour automatique au primaire après la remise à zéro de "
-                 "sa fenêtre." % (harness, switched["from"], switched["to"],
-                                  switched["reason"], switched["to"]))
+    texte = ("Bascule de compte %s : %s → %s (%s). Les nouvelles sessions vont au "
+             "compte %s ; une session en cours garde son compte tant qu'il est sous "
+             "son seuil (0034)." % (harness, switched["from"], switched["to"],
+                                    switched["reason"], switched["to"]))
     _log("[%s] %s" % (worker.name, texte))
     worker._fil_note(texte, meta={"action": "compte", "type": switched["kind"],
                                   "harnais": harness, "de": switched["from"],
@@ -120,9 +163,10 @@ def for_turn(worker):
         return worker._account
     try:
         return accounts.current(worker.db, worker.cfg.host, harness, items)
+    except db_mod.Unavailable:
+        raise  # panne de base (L72) : la consigne est remise, pas d'échec de tour
     except db_mod.DbError as exc:
-        worker._account_error = "état des comptes indisponible : %s" % (
-            " ".join(str(exc).split())[:160])
+        worker._account_error = "état des comptes indisponible : %s" % db_mod.explain(exc)
         return INVALID
 
 
@@ -270,9 +314,7 @@ def summary_possible(old, book, items, now: float | None = None) -> tuple[bool, 
     except Exception:
         gauges = []
     for gauge in gauges:
-        if gauge.reset_passed(now):
-            continue
-        if float(gauge.used or 0.0) >= 1.0:
+        if float(gauge.used_at(now) or 0.0) >= 1.0:  # échue : 0 % (L71)
             return False, "forfait %s %s saturé (%.0f %%)" % (
                 old.harness, gauge.key, float(gauge.used) * 100)
     return True, ""
@@ -362,7 +404,8 @@ def attach_profile(cfg, db, harness: str):
     try:
         profile = accounts.current(db, cfg.host, harness, items)
     except db_mod.DbError as exc:
-        print("attach : état des comptes indisponible : %s" % exc, file=sys.stderr)
+        print("attach : état des comptes indisponible : %s" % db_mod.explain(exc),
+              file=sys.stderr)
         return False, None
     problems = accounts.check(profile)
     if problems:

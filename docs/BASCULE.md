@@ -461,6 +461,22 @@ ProtectHome=read-only
 WantedBy=multi-user.target
 ```
 
+**Base distante (VPN, WireGuard)** : depuis L72, l'exécuteur traverse une
+panne passagère de la base sans s'arrêter (voir
+[EXPLOITATION.md](EXPLOITATION.md#panne-passagère-de-la-base-l72)). Deux
+réglages du DSN complètent : des *keepalives* TCP pour qu'une connexion morte
+(LISTEN, pilote psycopg) soit détectée en une minute plutôt qu'au délai TCP du
+noyau (un quart d'heure et plus), et un délai de connexion adapté au lien :
+
+```bash
+# ~/.config/ameesh/env (ou AMEESH_DSN de l'unité)
+AMEESH_DSN='postgresql://ameesh@10.77.0.1:5432/ameesh?keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=3&tcp_user_timeout=60000'
+AMEESH_CONNECT_TIMEOUT=10   # défaut depuis L72 (3 s avant)
+```
+
+Côté serveur, `tcp_keepalives_idle = 60` dans `postgresql.conf` libère de même
+les sessions d'un client disparu.
+
 À surveiller : agents basculés sans bail vivant, non-lus de plus de 15 min,
 baux expirés, `ameesh decisions` (approbations en attente, issues inconnues à
 trancher), état du canon par hôte (`ameesh canon check`).
@@ -934,6 +950,117 @@ ameesh-approve répond 503 : il ne peut plus lire `actions.canon`).
 arrêté ni effacé** ; le canon manaty n'est pas touché. Les lignes du second
 canon restent dans le registre avec leur colonne `canon`, prêtes pour un
 nouvel essai.
+
+## Mise à jour vers L60–L74
+
+Les lots L60, L61, L62, L70, L71, L72 et L74 apportent deux migrations,
+**0041** (L60 : `agent_registry.context_max_tokens`, `turn_costs.spend_key`
+et son index unique) et **0042** (L70 : `budget_limits`, `budget_events`,
+déclencheur `NOTIFY ameesh_budget`). Le paquet dépend désormais de psycopg
+(L61). Deux scripts, lancés par le propriétaire depuis le poste, font chaque
+geste en étapes séparées, s'arrêtent à la première erreur et n'affichent
+aucun secret : [`deploy/mise-a-jour/poste.sh`](../deploy/mise-a-jour/poste.sh)
+et [`deploy/mise-a-jour/vm.sh`](../deploy/mise-a-jour/vm.sh). Ils lisent
+leurs paramètres (adresse du serveur, personas du serveur, exécuteurs de
+l'ancienne base) dans `~/.config/ameesh/bascule.env`, celui de la bascule
+L57, hors du dépôt.
+
+**Contrairement à L36–L46, rien ne casse l'ancien code.** 0041 et 0042
+n'ajoutent que des colonnes nullables, un index unique sur une colonne que
+l'ancien code n'écrit pas (NULL partout), et des tables neuves. Un exécuteur
+encore à l'ancienne version tourne donc sans erreur sur une base migrée :
+on migre une fois, puis on redémarre chaque exécuteur **à son premier instant
+hors tour**, sans arrêt général. Le retour arrière du code ne demande pas de
+restaurer la base.
+
+**Ce que verra l'exploitation après le redémarrage.**
+
+* **L60** : une session DeepSeek qui a relu plus de 15 M jetons à son dernier
+  tour est tournée avec résumé de reprise **avant le tour suivant**. Les
+  sessions longues des DeepSeek tourneront donc au premier tour qui suit la
+  mise à jour : c'est attendu. Réglage par agent :
+  `ameesh set <agent> context_max_tokens=…` (0 = désactivé).
+* **L74** (décision 0034) : le choix du compte au forfait change de règle
+  (capacité qui expire le plus tôt, continuité de session). Une bascule de
+  compte au premier tour est possible, journalisée avec sa raison.
+* **L70** : `ameesh budget` montre les plafonds en vigueur. Base vide : la
+  configuration de l'hôte et les défauts s'appliquent comme avant.
+* **L72** : un exécuteur survit à une coupure passagère de la base (statut
+  « base injoignable », reprise seule).
+
+### Poste — `deploy/mise-a-jour/poste.sh`
+
+Le venv `~/.local/share/ameesh/venv` est installé **non éditable**, depuis
+un instantané `~/.local/share/ameesh/src-<sha>` (lien `src-current`).
+L'étape `installer` suit le même usage.
+
+1. `poste.sh verifier` : bases visées (sans mot de passe), exécuteurs, accès
+   SSH au serveur. Rien n'est modifié.
+2. `poste.sh sauvegarder` : `pg_dump -Fc` de la base du mesh (celle du
+   serveur) depuis le poste, sauvegarde du serveur (`ameesh-sauvegarde`), et
+   `pg_dump` de l'ancienne base, dans `~/backups/ameesh/`.
+3. `poste.sh installer [REF]` : instantané du commit REF, installé avec ses
+   dépendances (psycopg). La version précédente est notée pour le retour.
+   Les exécuteurs en cours gardent l'ancien code en mémoire : enchaîner sans
+   attendre.
+4. `poste.sh migrer` : `ameesh migrate` **une seule fois** pour la base du
+   mesh, partagée par le poste et le serveur. Puis l'ancienne base, avec sa
+   propre configuration (`config-ancienne-base.json`) : **oui, elle aussi**.
+   Le démarrage de l'exécuteur ne vérifie que la présence du schéma, mais le
+   nouveau code écrit `turn_costs.spend_key` à chaque tour et lit
+   `context_max_tokens` : sans 0041, ses tours échoueraient.
+5. `poste.sh role` : `deploy/sql/role-superviseur.sql` (colonnes de 0041 et
+   tables de 0042 au contrat) réappliqué sur chaque base **où le rôle existe
+   déjà**. Sur le serveur, en superutilisateur local, par SSH. Un rôle
+   absent n'est pas créé : c'est une décision à part.
+6. `poste.sh redemarrer` : chaque `ameesh-runner-agent@<p>` actif est
+   redémarré **un par un**, dès que `ameesh show <p>` ne dit plus `running`.
+   Une persona longue en tour ne bloque pas les autres : le script repasse
+   sur la liste (au plus `ATTENTE_MAX`, 2 h). Puis `ameesh-notify`, puis les
+   exécuteurs de l'ancienne base (`UNITES_RESTE`), lus avec sa configuration.
+   Une unité qui ne reste pas active arrête le script.
+7. `poste.sh controler` : `ameesh doctor`, `ameesh budget`,
+   `ameesh accounts list`, `ameesh projects`, `ameesh alerts`, unités en
+   échec, `doctor` de l'ancienne base.
+
+### Serveur — `deploy/mise-a-jour/vm.sh` (depuis le poste)
+
+Sur le serveur (profil L55), ameesh est un clone détaché dans
+`/opt/ameesh/src`, installé non éditable dans `/opt/ameesh/venv`. Les
+personas tournent sous `ameesh-runner@<p>` (service système, utilisateur
+`ameesh`). **Pas de migration ici** : la base du serveur est celle que
+`poste.sh migrer` vient de migrer.
+
+1. `vm.sh verifier` : commit et version installés, unités, migrations
+   passées.
+2. `vm.sh installer [REF]` : le serveur récupère REF chez l'origine ; s'il ne
+   le trouve pas (branche non poussée), il le reçoit en paquet git par SSH.
+   Extraction détachée, installation avec psycopg. Le commit d'avant est
+   noté dans `/opt/ameesh/precedent`.
+3. `vm.sh redemarrer` : refuse tant que 0041 et 0042 ne sont pas passées,
+   puis redémarre chaque persona du serveur hors tour, une par une.
+4. `vm.sh controler` : unités actives, quinze lignes de journal par persona,
+   `ameesh show`, `ameesh doctor` sur le serveur.
+
+Attention : `/opt/ameesh/src` ne garde que les fichiers du commit installé.
+Si ce commit ne contient pas encore `deploy/serveur/` (L55, L57), ces
+fichiers disparaissent du clone. Les copies installées (gabarit systemd,
+script de sauvegarde) restent en place, mais `installer-serveur.sh` n'est
+plus rejouable depuis ce clone tant que L55 et L57 ne sont pas dans la
+version installée.
+
+### Retour arrière
+
+* **Code, poste** : `poste.sh retour` réinstalle l'instantané précédent
+  (`src-<sha>` d'avant), puis redémarre comme à l'étape 6.
+* **Code, serveur** : `vm.sh retour` remet le commit de
+  `/opt/ameesh/precedent`, puis redémarre.
+* **Base** : rien à défaire. L'ancien code ignore les colonnes et les tables
+  de 0041 et 0042. Les plafonds posés par `ameesh budget` ne sont plus
+  appliqués par l'ancien code : il reprend ceux de la configuration.
+  Restaurer une sauvegarde de l'étape 2 (`pg_restore --clean`, exécuteurs
+  arrêtés) n'est utile qu'en cas de données abîmées. Ce retour perd tout ce
+  qui a été écrit depuis.
 
 ---
 

@@ -43,7 +43,8 @@ class Operations(interface.Operations):
         if not cols:
             return bool(self.db.query("SELECT 1 AS ok FROM agent_registry WHERE name = %s",
                                       (name,)))
-        sets = ", ".join("%s = nullif(%%s, '')" % col for col in cols)
+        sets = ", ".join("%s = nullif(%%s, '')%s" % (
+            col, "::bigint" if col in self.INTEGER_SETTINGS else "") for col in cols)
         params: list[Any] = [values[col] if values[col] is not None else "" for col in cols]
         rows = self.db.query(
             "UPDATE agent_registry SET " + sets + ", updated_at = now()"
@@ -74,7 +75,7 @@ class Operations(interface.Operations):
         return self.db.query(
             """
             SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.effort, r.tier,
-                   r.session_policy, r.session_id, r.session_work_item,
+                   r.session_policy, r.context_max_tokens, r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,
@@ -92,7 +93,11 @@ class Operations(interface.Operations):
                    sw.title AS session_lot_title, sw.state AS session_lot_state,
                    aw.id AS assigned_lot_id, aw.title AS assigned_lot_title,
                    aw.state AS assigned_lot_state,
-                   (t.input_tokens + t.cached_input_tokens)::bigint AS last_turn_reread_tokens,
+                   -- L60 : Codex compte déjà le cache dans input_tokens
+                   (CASE WHEN t.harness = 'codex'
+                         THEN greatest(t.input_tokens, t.cached_input_tokens)
+                         ELSE t.input_tokens + t.cached_input_tokens
+                    END)::bigint AS last_turn_reread_tokens,
                    t.session AS last_turn_session,
                    extract(epoch from t.recorded_at)::float8 AS last_turn_recorded_ts
               FROM agent_registry r
@@ -110,7 +115,7 @@ class Operations(interface.Operations):
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                    ORDER BY w.updated_at DESC, w.id DESC LIMIT 1) aw ON true
               LEFT JOIN LATERAL (
-                  SELECT c.input_tokens, c.cached_input_tokens, c.session, c.recorded_at
+                  SELECT c.harness, c.input_tokens, c.cached_input_tokens, c.session, c.recorded_at
                     FROM turn_costs c
                    WHERE c.agent = r.name
                    ORDER BY c.recorded_at DESC, c.id DESC LIMIT 1) t ON true
@@ -359,7 +364,31 @@ class Operations(interface.Operations):
 
     # -- soldes --------------------------------------------------------------
     def record_balance(self, *, provider, currency, total, granted, topped_up,
-                       available, account=None) -> dict:
+                       available, account=None, unless_within_s=None) -> dict | None:
+        if unless_within_s is not None and unless_within_s > 0:
+            # L71 : une seule instruction — deux exécuteurs qui relèvent la
+            # même clé à quelques secondes d'écart n'écrivent qu'une ligne.
+            rows = self.db.query(
+                """
+                INSERT INTO provider_balances (provider, currency, total, granted,
+                                               topped_up, available, account)
+                SELECT %s, %s, %s, %s, %s, %s, %s
+                 WHERE NOT EXISTS (
+                       SELECT 1 FROM provider_balances
+                        WHERE provider = %s AND currency = %s
+                          AND account IS NOT DISTINCT FROM %s
+                          AND observed_at > now() - make_interval(secs => %s))
+                RETURNING provider, currency, total::float8 AS total,
+                          granted::float8 AS granted, topped_up::float8 AS topped_up,
+                          available, account,
+                          extract(epoch from observed_at)::float8 AS observed_ts
+                """,
+                (provider, currency, float(total),
+                 None if granted is None else float(granted),
+                 None if topped_up is None else float(topped_up), available, account,
+                 provider, currency, account, float(unless_within_s)),
+            )
+            return rows[0] if rows else None
         rows = self.db.query(
             """
             INSERT INTO provider_balances (provider, currency, total, granted, topped_up,
@@ -374,6 +403,18 @@ class Operations(interface.Operations):
              None if topped_up is None else float(topped_up), available, account),
         )
         return rows[0]
+
+    def recent_balance(self, *, provider, account, within_s) -> bool:
+        rows = self.db.query(
+            """
+            SELECT 1 AS found FROM provider_balances
+             WHERE provider = %s AND account IS NOT DISTINCT FROM %s
+               AND observed_at > now() - make_interval(secs => %s)
+             LIMIT 1
+            """,
+            (provider, account, float(within_s)),
+        )
+        return bool(rows)
 
     def balances(self, *, provider, since_s, account=None) -> list[dict]:
         filtre = " AND provider = %s" if provider else ""

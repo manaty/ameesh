@@ -702,7 +702,7 @@ class StagnationUnifiedTest(_PlanDb):
 
 
 class _NoBook:
-    def gauges(self):
+    def gauges(self, harness=None, *, record=True):
         return []
 
 

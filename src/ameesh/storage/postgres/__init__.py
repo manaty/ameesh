@@ -12,6 +12,7 @@ from .. import interface
 from .action_source import ActionSource
 from .accounts import Accounts
 from .actions import Actions
+from .budgets import Budgets
 from .authenticators import Authenticators
 from .authority import Approvals, Keys, Nonces
 from .canon import Canon, Ephemerals
@@ -24,6 +25,7 @@ from .operations import Operations
 from .packages import WorkPackages
 from .placement import Placements
 from .progress import Progress
+from .projects import Projects
 from .registry import Agents, Leases, PendingSpend
 from .session_bindings import SessionBindings
 from .threads import Threads
@@ -43,6 +45,7 @@ class PostgresStorage(interface.Storage):
         self.pending_spend = PendingSpend(db)
         self.turn_costs = TurnCosts(db)
         self.accounts = Accounts(db)
+        self.budgets = Budgets(db)
         self.catalog = Catalog(db)
         self.mailbox = Mailbox(db)
         self.wakeups = Wakeups(db)
@@ -60,6 +63,7 @@ class PostgresStorage(interface.Storage):
         self.grants = Grants(db)
         self.placements = Placements(db)
         self.progress = Progress(db)
+        self.projects = Projects(db)
         self.operations = Operations(db)
         self.hosts = Hosts(db)
         self.turn_resources = TurnResources(db)

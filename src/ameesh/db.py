@@ -27,6 +27,7 @@ Règles communes :
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import os
 import pty
@@ -35,6 +36,7 @@ import re
 import select
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -45,6 +47,8 @@ from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from .config import Config, mask_dsn
 
+#: sonde de connexion ET de schéma (L61) : une seule requête pour les deux
+_SCHEMA_PROBE = "SELECT to_regclass('agent_registry') IS NOT NULL AS ok"
 _SQL_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
 _NOTIFY_RE = re.compile(
     r'^Asynchronous notification "([^"]+)" with payload "(.*)" received from server process'
@@ -57,6 +61,22 @@ _CONNECT_HINTS = (
     "no such file or directory",
     "timeout expired",
     "server closed the connection",
+    # coupure en cours de requête ou de session (L72) : réseau, VPN, serveur
+    # redémarré — même famille que l'échec de connexion
+    "could not receive data",
+    "could not send data",
+    "connection timed out",
+    "no route to host",
+    "network is unreachable",
+    "ssl syscall",
+    "ssl connection has been closed",
+    "terminating connection",
+    "the database system is starting up",
+    "the database system is shutting down",
+    "connection is lost",
+    "connection is closed",
+    "connection already closed",
+    "consuming input failed",
     "password authentication failed",
     "database \"",
     "role \"",
@@ -69,11 +89,120 @@ class DbError(RuntimeError):
 
 
 class Unavailable(DbError):
-    """La base n'est pas joignable (ou le pilote n'existe pas)."""
+    """La base n'est pas joignable (ou le pilote n'existe pas).
+
+    Panne passagère pour l'exécuteur (L72) : il réessaie avec une attente
+    croissante au lieu de s'arrêter."""
 
 
 class SchemaMissing(DbError):
     """La base répond mais les tables agent-mesh ne sont pas migrées."""
+
+
+# --------------------------------------------------------------------------
+# compteur d'allers-retours (L61)
+# --------------------------------------------------------------------------
+
+class Trace:
+    """Compte les connexions et les allers-retours d'un processus.
+
+    Un aller-retour, c'est un échange client → serveur → client : une requête,
+    une instruction, un lot en pipeline (`query_batch`), un sous-processus
+    `psql`. Les connexions sont comptées à part (TCP + TLS + authentification :
+    plusieurs allers-retours réseau à elles seules).
+
+    `AMEESH_DB_TRACE=FICHIER` (ou `stderr`) : à la sortie du processus, une
+    ligne JSON `{"connects", "round_trips", "statements"}` y est ajoutée — c'est
+    ce que lisent les tests qui bornent le nombre de requêtes d'une commande.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.connects = 0
+        self.round_trips = 0
+        self.statements: list[str] = []
+
+    def connect(self) -> None:
+        self.connects += 1
+
+    def trip(self, sql: str = "") -> None:
+        self.round_trips += 1
+        self.statements.append(" ".join(str(sql).split())[:160])
+
+    def snapshot(self) -> dict:
+        return {"connects": self.connects, "round_trips": self.round_trips,
+                "statements": list(self.statements)}
+
+
+TRACE = Trace()
+
+
+def _trace_dump() -> None:
+    target = os.environ.get("AMEESH_DB_TRACE", "")
+    if not target:
+        return
+    line = json.dumps(dict(TRACE.snapshot(), argv=sys.argv[1:]),
+                      ensure_ascii=False)
+    try:
+        if target in ("1", "stderr"):
+            sys.stderr.write(line + "\n")
+        else:
+            with open(target, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+if os.environ.get("AMEESH_DB_TRACE"):
+    import atexit
+    atexit.register(_trace_dump)
+
+
+def startup_options(cfg: Config, existing: str = "") -> str:
+    """Les réglages de session passés DANS le paquet de démarrage (`options`
+    libpq) plutôt qu'en `SET` après connexion : zéro aller-retour de plus.
+
+    `existing` : les options déjà voulues par l'utilisateur (paramètre
+    `options` du DSN ou PGOPTIONS), conservées devant les nôtres.
+    """
+    parts = [existing.strip()] if existing and existing.strip() else []
+    if cfg.schema != "public":
+        # Schéma autoportant : pas de repli sur public, sinon un
+        # `CREATE TABLE IF NOT EXISTS` verrait la table de public et ne
+        # créerait rien (isolation des tests et des chantiers).
+        parts.append("-c search_path=%s" % quote_ident(cfg.schema))
+    if cfg.statement_timeout_ms and cfg.statement_timeout_ms > 0:
+        # Sans lui, une requête qui pend (réseau, verrou) bloquerait le
+        # battement de bail et laisserait un harnais tourner sans bail.
+        parts.append("-c statement_timeout=%d" % int(cfg.statement_timeout_ms))
+    return " ".join(parts)
+
+
+def dsn_has_options(dsn: str) -> bool:
+    """Le DSN fixe-t-il déjà `options` (il primerait sur PGOPTIONS) ?"""
+    if "://" in dsn:
+        return bool(re.search(r"[?&]options=", dsn))
+    return bool(re.search(r"(?:^|\s)options\s*=", dsn))
+
+
+def is_remote(cfg: Config) -> bool:
+    """La base est-elle hors de cette machine (ni socket Unix, ni boucle locale) ?"""
+    dsn = cfg.dsn or ""
+    host = ""
+    if "://" in dsn:
+        parts = urlsplit(dsn)
+        host = parts.hostname or ""
+        query = dict(kv.split("=", 1) for kv in parts.query.split("&") if "=" in kv)
+        host = unquote(query.get("host", "")) or host
+    else:
+        match = re.search(r"(?:^|\s)host\s*=\s*(\S+)", dsn)
+        host = match.group(1).strip("'\"") if match else ""
+    host = host or os.environ.get("PGHOST", "")
+    if not host or host.startswith("/") or host.startswith("@"):
+        return False
+    return host not in ("localhost", "127.0.0.1", "::1") and not host.startswith("127.")
 
 
 # --------------------------------------------------------------------------
@@ -170,6 +299,27 @@ def _normalize_row(row: dict) -> dict:
     return {key: _normalize(value) for key, value in row.items()}
 
 
+def _parse_json_rows(text: str) -> list[dict]:
+    """Le texte JSON d'un `_json_query` (pilote psql) → liste de dicts."""
+    if not text:
+        return []
+    try:
+        rows = json.loads(text)
+    except ValueError as exc:
+        raise DbError("réponse JSON illisible de psql : %.120s" % text) from exc
+    if isinstance(rows, dict):
+        rows = [rows]
+    return [_normalize_row(row) for row in rows]
+
+
+def _batch_item(item) -> tuple[str, Sequence[Any]]:
+    """`query_batch` accepte `sql` seul ou `(sql, params)`."""
+    if isinstance(item, str):
+        return item, ()
+    sql, params = item
+    return sql, tuple(params or ())
+
+
 # --------------------------------------------------------------------------
 # DSN
 # --------------------------------------------------------------------------
@@ -228,37 +378,53 @@ class PsqlDriver:
         # propre ligne de commande, et reçoit le search_path par son amorce.
         self._interactive_args = list(base_args)
         self._bootstrap = ""
-        if cfg.schema != "public":
-            # Schéma autoportant : pas de repli sur public, sinon un
-            # `CREATE TABLE IF NOT EXISTS` verrait la table de public et ne
-            # créerait rien (isolation des tests et des chantiers).
-            schema = "SET search_path TO %s;" % quote_ident(cfg.schema)
-            self._args += ["-c", schema[:-1]]
-            self._bootstrap = schema + "\n"
-        if cfg.statement_timeout_ms and cfg.statement_timeout_ms > 0:
-            # Sans lui, une requête qui pend (réseau, verrou) bloquerait le
-            # battement de bail et laisserait un harnais tourner sans bail.
-            timeout = "SET statement_timeout = %d;" % int(cfg.statement_timeout_ms)
-            self._args += ["-c", timeout[:-1]]
-            self._bootstrap = timeout + "\n" + self._bootstrap
+        if not dsn_has_options(base):
+            # L61 : search_path et statement_timeout dans le paquet de
+            # démarrage (PGOPTIONS) — aucun `SET` à envoyer avant la requête.
+            options = startup_options(cfg, self.env.get("PGOPTIONS", ""))
+            if options:
+                self.env["PGOPTIONS"] = options
+        else:
+            # le DSN fixe `options` (il primerait sur PGOPTIONS) : réglages en SET
+            if cfg.schema != "public":
+                schema = "SET search_path TO %s;" % quote_ident(cfg.schema)
+                self._args += ["-c", schema[:-1]]
+                self._bootstrap = schema + "\n"
+            if cfg.statement_timeout_ms and cfg.statement_timeout_ms > 0:
+                timeout = "SET statement_timeout = %d;" % int(cfg.statement_timeout_ms)
+                self._args += ["-c", timeout[:-1]]
+                self._bootstrap = timeout + "\n" + self._bootstrap
+        #: résultat de la vérification de schéma, faite avec la sonde de
+        #: connexion (L61 : un seul sous-processus pour les deux)
+        self._schema_ok: bool | None = None
         self._check()
 
     # -- interne -----------------------------------------------------------
     def _run(self, extra: list[str], stdin: str | None = None) -> subprocess.CompletedProcess:
+        # un sous-processus = une connexion et un échange
+        TRACE.connect()
+        TRACE.trip(" ".join(extra[1:]) if extra[:1] == ["-c"] else " ".join(extra))
         try:
             return subprocess.run(
                 self._args + extra, input=stdin, capture_output=True, text=True,
                 env=self.env, timeout=self._client_timeout,
             )
         except subprocess.TimeoutExpired as exc:
-            raise DbError(
+            # Le serveur annule lui-même une requête trop longue
+            # (statement_timeout, 5 s plus tôt) : un délai CLIENT dépassé dit
+            # donc que le serveur ne répond plus — réseau ou base (L72).
+            raise Unavailable(
                 "psql : délai client dépassé (%ss) — requête abandonnée"
                 % self._client_timeout) from exc
         except OSError as exc:
             raise Unavailable("psql n'a pas pu démarrer : %s" % exc) from exc
 
     def _check(self) -> None:
-        proc = self._run(["-c", "SELECT 1"])
+        # La sonde de connexion dit aussi si le schéma est migré : la
+        # vérification de `require_schema` ne coûte pas un psql de plus.
+        proc = self._run(["-c", _SCHEMA_PROBE])
+        if proc.returncode == 0:
+            self._schema_ok = proc.stdout.strip() in ("t", "true")
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip().splitlines()
             message = detail[-1] if detail else "code %d" % proc.returncode
@@ -284,16 +450,38 @@ class PsqlDriver:
         proc = self._run(["-c", _json_query(bind(sql, params))])
         if proc.returncode != 0:
             raise self._fail(proc)
-        text = proc.stdout.strip()
-        if not text:
+        return _parse_json_rows(proc.stdout.strip())
+
+    def query_batch(self, items: Sequence[tuple]) -> list[list[dict]]:
+        """Plusieurs SELECT indépendants en UN sous-processus psql et UNE
+        instruction : chaque requête devient une sous-requête agrégée en JSON,
+        réunies par `json_build_array` (psql n'enverrait sinon ses `-c` qu'un
+        par un, un aller-retour chacun). Même contrat que
+        `PsycopgDriver.query_batch` : des lectures, pas de DML."""
+        items = [_batch_item(item) for item in items]
+        if not items:
             return []
-        try:
-            rows = json.loads(text)
-        except ValueError as exc:
-            raise DbError("réponse JSON illisible de psql : %.120s" % text) from exc
-        if isinstance(rows, dict):
-            rows = [rows]
-        return [_normalize_row(row) for row in rows]
+        if len(items) == 1:
+            return [self.query(*items[0])]
+        if any(not pure_read(sql) or ";" in sql.strip().rstrip(";") for sql, _ in items):
+            return [self.query(sql, params) for sql, params in items]
+        out: list[list[dict]] = []
+        for start in range(0, len(items), 90):  # json_build_array : 100 arguments au plus
+            chunk = items[start:start + 90]
+            parts = ["(SELECT coalesce(json_agg(row_to_json(t)), '[]'::json) FROM (\n%s\n) t)"
+                     % bind(sql.strip().rstrip(";"), params) for sql, params in chunk]
+            proc = self._run(["-c", "SELECT json_build_array(%s)::text" % ",\n".join(parts)])
+            if proc.returncode != 0:
+                raise self._fail(proc)
+            text = proc.stdout.strip()
+            try:
+                results = json.loads(text)
+            except ValueError as exc:
+                raise DbError("réponse JSON illisible de psql : %.120s" % text) from exc
+            if not isinstance(results, list) or len(results) != len(chunk):
+                raise DbError("psql : réponse de lot inattendue")
+            out += [[_normalize_row(row) for row in (rows or [])] for rows in results]
+        return out
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         proc = self._run(["-c", bind(sql, params)])
@@ -358,6 +546,7 @@ class _PsqlTransaction:
             self._depth += 1
             return self
         self._err = tempfile.TemporaryFile()
+        TRACE.connect()
         try:
             self.proc = subprocess.Popen(
                 self.driver._interactive_args, stdin=subprocess.PIPE,
@@ -431,6 +620,7 @@ class _PsqlTransaction:
         if self.proc is None:
             raise DbError("psql : transaction fermée")
         self._seq += 1
+        TRACE.trip(sql)
         marker = ("%s_%d__" % (self._token, self._seq)).encode()
         payload = sql.rstrip().rstrip(";") + ";\nSELECT '%s';\n" % marker.decode()
         try:
@@ -450,8 +640,8 @@ class _PsqlTransaction:
             ready, _, _ = select.select([fd], [], [], wait)
             if not ready:
                 self._close(abort=True)
-                raise DbError("psql : délai client dépassé (%ss) — transaction annulée"
-                              % timeout)
+                raise Unavailable("psql : délai client dépassé (%ss) — transaction annulée"
+                                  % timeout)
             chunk = os.read(fd, 65536)
             if not chunk:
                 raise self._failure()
@@ -459,16 +649,11 @@ class _PsqlTransaction:
 
     # -- interface ---------------------------------------------------------
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
-        text = self._run(_json_query(bind(sql, params))).strip()
-        if not text:
-            return []
-        try:
-            rows = json.loads(text)
-        except ValueError as exc:
-            raise DbError("réponse JSON illisible de psql : %.120s" % text) from exc
-        if isinstance(rows, dict):
-            rows = [rows]
-        return [_normalize_row(row) for row in rows]
+        return _parse_json_rows(self._run(_json_query(bind(sql, params))).strip())
+
+    def query_batch(self, items: Sequence[tuple]) -> list[list[dict]]:
+        """Dans une transaction ouverte : séquentiel, sur la même session."""
+        return [self.query(sql, params) for sql, params in map(_batch_item, items)]
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         self._run(bind(sql, params))
@@ -590,7 +775,16 @@ class _PsqlListener:
 # --------------------------------------------------------------------------
 
 class PsycopgDriver:
-    """Pilote psycopg 3 : connexion directe, LISTEN/NOTIFY natif."""
+    """Pilote psycopg 3 : connexion directe, LISTEN/NOTIFY natif.
+
+    L61 — chaque aller-retour compte quand la base est loin :
+
+    * search_path et statement_timeout partent dans le paquet de démarrage
+      (`options`), pas en `SET` ; la connexion établie suffit comme sonde ;
+    * `require_schema(db, defer=True)` ne coûte rien sur le moment : la
+      vérification part en pipeline AVEC la requête suivante ;
+    * `query_batch` envoie plusieurs SELECT indépendants en un seul échange.
+    """
 
     name = "psycopg"
 
@@ -603,30 +797,152 @@ class PsycopgDriver:
         self._psycopg = psycopg
         self._dict_row = dict_row
         self.cfg = cfg
+        #: reconnexion après une coupure (L72) : un seul fil rouvre la connexion
+        self._reconnect_lock = threading.Lock()
+        #: transactions explicites ouvertes : jamais de reconnexion au milieu
+        self._tx_depth = 0
+        self._schema_ok: bool | None = None
+        #: vérification de schéma différée, jointe à la prochaine requête
+        self._schema_pending = False
+        #: la vérification différée a trouvé le schéma absent (voir _schema_from)
+        self._schema_missing = False
         self.conn = self._connect()
-        self._check()
 
     def _connect(self):
+        kwargs: dict = dict(autocommit=True,
+                            connect_timeout=max(1, int(self.cfg.connect_timeout)),
+                            row_factory=self._dict_row)
         try:
-            return self._psycopg.connect(
-                self.cfg.dsn, autocommit=True,
-                connect_timeout=max(1, int(self.cfg.connect_timeout)),
-                row_factory=self._dict_row,
-            )
+            existing = self._psycopg.conninfo.conninfo_to_dict(self.cfg.dsn).get("options")
+        except Exception:
+            existing = None
+        if existing is None:
+            # un `options=` explicite écraserait PGOPTIONS : on le reprend
+            existing = os.environ.get("PGOPTIONS", "")
+        options = startup_options(self.cfg, str(existing or ""))
+        if options:
+            kwargs["options"] = options
+        TRACE.connect()
+        try:
+            return self._psycopg.connect(self.cfg.dsn, **kwargs)
         except Exception as exc:  # psycopg.OperationalError et cie
             raise Unavailable("psycopg : %s" % _one_line(exc)) from exc
 
     def _check(self) -> None:
-        if self.cfg.schema != "public":
-            self.conn.execute("SET search_path TO %s" % quote_ident(self.cfg.schema))
-        if self.cfg.statement_timeout_ms and self.cfg.statement_timeout_ms > 0:
-            self.conn.execute("SET statement_timeout = %d" % int(self.cfg.statement_timeout_ms))
+        TRACE.trip("SELECT 1")
         try:
+            if self.cfg.schema != "public":
+                self.conn.execute("SET search_path TO %s" % quote_ident(self.cfg.schema))
+            if self.cfg.statement_timeout_ms and self.cfg.statement_timeout_ms > 0:
+                self.conn.execute("SET statement_timeout = %d"
+                                  % int(self.cfg.statement_timeout_ms))
             self.conn.execute("SELECT 1").fetchone()
         except Exception as exc:
             raise Unavailable("psycopg : %s" % _one_line(exc)) from exc
 
+    def _live(self) -> None:
+        """Rouvre la connexion si une coupure l'a cassée (L72).
+
+        psycopg marque la connexion `broken` (ou `closed`) après une erreur
+        réseau, et ne se reconnecte jamais seul : sans ceci, une panne de base
+        de quelques secondes rendait le pilote inutilisable jusqu'au
+        redémarrage du processus. Jamais au milieu d'une transaction
+        explicite : la suite de ses instructions passerait hors transaction ;
+        on lève `Unavailable`, la transaction est perdue (annulée par la
+        coupure) et l'appelant la rejoue en entier."""
+        conn = self.conn
+        if not (getattr(conn, "closed", False) or getattr(conn, "broken", False)):
+            return
+        if self._tx_depth:
+            raise Unavailable("psycopg : connexion perdue pendant une transaction")
+        with self._reconnect_lock:
+            if self.conn is not conn:
+                return  # un autre fil a déjà rouvert
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self.conn = self._connect()
+            self._check()
+
+    # -- vérification de schéma différée ------------------------------------
+    def _pipeline_ok(self) -> bool:
+        try:
+            return bool(self._psycopg.Pipeline.is_supported())
+        except Exception:
+            return False
+
+    def _settle_schema(self) -> None:
+        """Vérifie maintenant (une requête) le schéma laissé en attente."""
+        self._schema_pending = False
+        require_schema(self)
+
+    def _run_batch(self, items: list, *, probe: bool, fetch: bool) -> list:
+        """Un seul échange (pipeline) : la sonde de schéma éventuelle, puis
+        les requêtes. Rend, par requête, ses lignes (`fetch`) ou son rowcount."""
+        TRACE.trip(" ;; ".join(sql for sql, _ in items))
+        statements = ([(_SCHEMA_PROBE, ())] if probe else []) + list(items)
+        cursors = []
+        try:
+            with self.conn.pipeline():
+                for sql, params in statements:
+                    cur = self.conn.cursor()
+                    if params:
+                        cur.execute(sql, tuple(params))
+                    else:
+                        cur.execute(sql)
+                    cursors.append(cur)
+            out = []
+            for cur in cursors[1 if probe else 0:]:
+                if fetch:
+                    out.append([_normalize_row(dict(row)) for row in cur.fetchall()])
+                else:
+                    out.append(cur.rowcount)
+        except Exception as exc:
+            if probe:
+                self._schema_from(cursors)
+            raise _map_error(exc) from exc
+        if probe:
+            self._schema_from(cursors)
+        return out
+
+    def _schema_from(self, cursors: list) -> None:
+        """Lit la sonde jointe ; lève SchemaMissing si le schéma manque."""
+        try:
+            row = cursors[0].fetchone() if cursors else None
+        except Exception:
+            row = None
+        if row is None:
+            return  # sonde sans réponse : l'erreur de la requête dira le reste
+        self._schema_ok = bool(dict(row).get("ok"))
+        if not self._schema_ok:
+            # définitif pour cette connexion : un appelant qui avale l'erreur
+            # (« liaison illisible → non lié ») ne doit pas continuer comme si
+            # de rien n'était — la requête suivante redit de migrer
+            self._schema_missing = True
+            raise SchemaMissing(_schema_message(self))
+
+    def _deferred(self, sql: str) -> bool:
+        """La vérification en attente peut-elle voyager avec `sql` ?"""
+        if self._schema_missing:
+            raise SchemaMissing(_schema_message(self))
+        if not self._schema_pending:
+            return False
+        if (";" in sql.strip().rstrip(";") or not self._pipeline_ok()
+                or self.conn.info.transaction_status != self._psycopg.pq.TransactionStatus.IDLE):
+            # plusieurs instructions (interdit en pipeline), ou transaction
+            # ouverte : la sonde passe seule, d'abord
+            self._settle_schema()
+            return False
+        self._schema_pending = False
+        return True
+
+    # -- interface ---------------------------------------------------------
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
+        self._live()
+        if self._deferred(sql):
+            return self._run_batch([(sql, params)], probe=True, fetch=True)[0]
+        TRACE.trip(sql)
         try:
             with self.conn.cursor() as cur:
                 if params:
@@ -637,7 +953,39 @@ class PsycopgDriver:
         except Exception as exc:
             raise _map_error(exc) from exc
 
+    def query_batch(self, items: Sequence[tuple]) -> list[list[dict]]:
+        """Plusieurs SELECT indépendants en UN aller-retour (pipeline psycopg).
+
+        `items` : des `(sql, params)` (ou `sql` seul). Rend une liste de
+        résultats dans le même ordre. Sans pipeline (libpq < 14) : séquentiel.
+        Pas de DML ici : une erreur annule le lot entier.
+        """
+        items = [_batch_item(item) for item in items]
+        if not items:
+            return []
+        self._live()
+        if self._schema_missing:
+            raise SchemaMissing(_schema_message(self))
+        probe = False
+        if self._schema_pending:
+            if any(";" in sql.strip().rstrip(";") for sql, _ in items):
+                self._settle_schema()
+            else:
+                probe = self._deferred(items[0][0])
+        if len(items) == 1 and not probe:
+            return [self.query(*items[0])]
+        if not self._pipeline_ok() or any(";" in sql.strip().rstrip(";") for sql, _ in items):
+            if probe:
+                self._schema_pending = True
+                self._settle_schema()
+            return [self.query(sql, params) for sql, params in items]
+        return self._run_batch(items, probe=probe, fetch=True)
+
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
+        self._live()
+        if self._deferred(sql):
+            return self._run_batch([(sql, params)], probe=True, fetch=False)[0]
+        TRACE.trip(sql)
         try:
             with self.conn.cursor() as cur:
                 if params:
@@ -649,6 +997,12 @@ class PsycopgDriver:
             raise _map_error(exc) from exc
 
     def script(self, sql: str) -> None:
+        self._live()
+        if self._schema_missing:
+            raise SchemaMissing(_schema_message(self))
+        if self._schema_pending:
+            self._settle_schema()
+        TRACE.trip(sql)
         try:
             with self.conn.transaction():
                 self.conn.execute(sql)
@@ -660,16 +1014,25 @@ class PsycopgDriver:
         """Transaction explicite sur la connexion (BEGIN … COMMIT, ROLLBACK sur
         exception) ; rend le pilote lui-même, dont les requêtes passent par
         cette connexion. Imbriquée : un point de sauvegarde."""
+        self._live()
+        if self._schema_missing:
+            raise SchemaMissing(_schema_message(self))
+        if self._schema_pending:
+            self._settle_schema()
+        self._tx_depth += 1
         try:
             with self.conn.transaction():
                 yield self
         except self._psycopg.Error as exc:
             raise _map_error(exc) from exc
+        finally:
+            self._tx_depth -= 1
 
     def listen(self, channels: Iterable[str]) -> "Listener":
         try:
             conn = self._connect()
             for channel in channels:
+                TRACE.trip("LISTEN %s" % channel)
                 conn.execute("LISTEN %s" % quote_ident(channel))
         except AttributeError as exc:  # psycopg trop ancien
             raise Unavailable("psycopg sans support LISTEN : %s" % exc) from exc
@@ -682,6 +1045,7 @@ class PsycopgDriver:
             pass
 
     def ping(self) -> None:
+        self._live()
         self._check()
 
 
@@ -739,6 +1103,30 @@ def _map_error(exc: Exception) -> DbError:
     return DbError(_one_line(exc))
 
 
+def is_unavailable(exc: BaseException) -> bool:
+    """La base est-elle injoignable (panne passagère, L72) plutôt qu'en erreur ?"""
+    return isinstance(exc, Unavailable)
+
+
+def explain(exc: BaseException, limit: int = 160) -> str:
+    """Cause lisible d'une erreur de base, sur une ligne, pour un statut ou un
+    journal (L72). Un délai de connexion dépassé n'est pas un problème de
+    migration : « ameesh migrate » n'est suggéré que si une table manque."""
+    text = _one_line(exc)[:limit]
+    low = text.lower()
+    if "timeout expired" in low or "délai client dépassé" in low or "timed out" in low:
+        return ("délai de connexion dépassé, base injoignable (réseau, VPN ou serveur ; "
+                "délai réglable par AMEESH_CONNECT_TIMEOUT) : %s" % text)
+    if isinstance(exc, Unavailable):
+        return "base injoignable : %s" % text
+    if isinstance(exc, SchemaMissing) or (
+            "does not exist" in low and ("relation" in low or "table" in low
+                                         or "column" in low or "colonne" in low)) \
+            or "n'existe pas" in low:
+        return "%s : « ameesh migrate » ?" % text
+    return text
+
+
 # --------------------------------------------------------------------------
 # fabrique
 # --------------------------------------------------------------------------
@@ -762,14 +1150,297 @@ def connect(cfg: Config, driver: str | None = None) -> PsqlDriver | PsycopgDrive
     raise Unavailable(" ; ".join(errors) or "aucun pilote Postgres disponible")
 
 
-def require_schema(db: PsqlDriver | PsycopgDriver) -> None:
-    """Vérifie que les migrations sont passées, avec un message actionnable."""
-    row = db.query("SELECT to_regclass('agent_registry') IS NOT NULL AS ok")[0]
-    if not row.get("ok"):
-        raise SchemaMissing(
-            "schéma agent-mesh absent (base %s, schéma %s) : lancez « agent-mesh migrate »"
-            % (mask_dsn(db.cfg.dsn), db.cfg.schema)
-        )
+def _schema_message(db) -> str:
+    return ("schéma agent-mesh absent (base %s, schéma %s) : lancez « agent-mesh migrate »"
+            % (mask_dsn(db.cfg.dsn), db.cfg.schema))
+
+
+def require_schema(db: PsqlDriver | PsycopgDriver, *, defer: bool = False) -> None:
+    """Vérifie que les migrations sont passées, avec un message actionnable.
+
+    L61 : la réponse est gardée sur la connexion (pilote psql : elle vient de
+    la sonde de connexion, sans requête de plus). `defer=True` (psycopg) :
+    rien n'est envoyé maintenant, la vérification part avec la prochaine
+    requête et `SchemaMissing` est levée à ce moment-là.
+    """
+    if getattr(db, "_schema_ok", None) is True:
+        return
+    if defer and hasattr(db, "_schema_pending"):
+        db._schema_pending = True
+        return
+    ok = bool(db.query(_SCHEMA_PROBE)[0].get("ok"))
+    if hasattr(db, "_schema_ok"):
+        db._schema_ok = ok
+    if not ok:
+        raise SchemaMissing(_schema_message(db))
+
+
+def open_db(cfg: Config) -> PsqlDriver | PsycopgDriver:
+    """Connexion + schéma vérifié, au moindre coût (L61) : le chemin des
+    commandes. Avec psycopg, la vérification voyage avec la première requête
+    (`SchemaMissing` peut donc venir d'elle) ; avec psql, de la sonde."""
+    db = connect(cfg)
+    try:
+        require_schema(db, defer=True)
+    except BaseException:
+        db.close()
+        raise
+    return db
+
+
+# --------------------------------------------------------------------------
+# lecture groupée (L61)
+# --------------------------------------------------------------------------
+#
+# Une commande de lecture (`work list`, `progress`, `alerts`…) enchaîne des
+# requêtes indépendantes, éparpillées dans les modules métier : sur une base
+# lointaine, chacune coûte un aller-retour. `batched(db, fn)` les regroupe
+# SANS toucher au SQL des opérations de stockage (règle de `storage`) :
+#
+# 1. `fn` est d'abord jouée « à blanc » sur un enregistreur : chaque SELECT
+#    inconnu est noté et reçoit une liste vide ;
+# 2. les SELECT notés partent en UN aller-retour (`query_batch`) ;
+# 3. on rejoue à blanc avec ces réponses : les requêtes qui dépendaient des
+#    premières (`WHERE id IN (…)`) apparaissent, et partent au tour suivant ;
+# 4. quand plus rien de neuf n'apparaît, `fn` est jouée pour de vrai : ses
+#    lectures sont servies par les réponses gardées, toute autre requête va
+#    à la base. Le résultat est donc toujours celui d'une vraie exécution —
+#    au pire, une requête imprévue coûte son aller-retour, comme avant.
+#
+# Seules les lectures pures sont regroupées (SELECT/WITH sans DML, sans verrou,
+# sans fonction à effet) ; une écriture ou une transaction arrête la passe à
+# blanc, et, dans la vraie passe, coupe le cache (lecture de ses écritures).
+# `fn` ne doit rien afficher ni écrire hors de la base : elle est rejouée.
+
+_READ_RE = re.compile(r"^\s*\(?\s*(select|with|values)\b", re.I)
+_UNSAFE_RE = re.compile(
+    r"\b(insert|update|delete|merge|truncate|for\s+(no\s+key\s+)?update|for\s+(key\s+)?share"
+    r"|pg_advisory\w*|nextval|setval|pg_notify|set_config|pg_sleep|txid_current\w*"
+    r"|pg_current_xact_id\w*|lo_\w+|dblink\w*)\b", re.I)
+#: écart toléré entre deux « maintenant » passés en paramètre (époque, en s)
+_NOW_SLACK = 120.0
+#: historiques en ajout seul, qu'aucune vue ne relit : un INSERT dans l'une
+#: d'elles (relevé de jauges fait en passant par un affichage) ne retire du
+#: cache que les réponses qui la lisent, au lieu de tout couper
+APPEND_ONLY = ("quota_gauge_readings",)
+_INSERT_RE = re.compile(r"^\s*insert\s+into\s+([A-Za-z_][A-Za-z0-9_]*)\b", re.I)
+
+
+class _Abort(Exception):
+    """Une passe à blanc rencontre une écriture : elle s'arrête là."""
+
+
+def pure_read(sql: str) -> bool:
+    """SELECT sans effet : peut être regroupé et rejoué depuis le cache."""
+    return bool(_READ_RE.match(sql)) and not _UNSAFE_RE.search(sql)
+
+
+def _same_params(left: tuple, right: tuple) -> bool:
+    if len(left) != len(right):
+        return False
+    for a, b in zip(left, right):
+        if a == b and type(a) is type(b):
+            continue
+        # un horodatage « maintenant » recalculé entre deux passes
+        if (isinstance(a, float) and isinstance(b, float) and a > 1e9 and b > 1e9
+                and abs(a - b) <= _NOW_SLACK):
+            continue
+        return False
+    return True
+
+
+class _Answers:
+    """Réponses gardées, par SQL puis paramètres (horodatages tolérés)."""
+
+    def __init__(self) -> None:
+        self._by_sql: dict[str, list[tuple[tuple, list[dict]]]] = {}
+        #: requêtes refusées par la base pendant le préchargement : jamais
+        #: redemandées par les passes à blanc suivantes
+        self.refused: list[tuple[str, tuple]] = []
+
+    def get(self, sql: str, params: tuple):
+        for known, rows in self._by_sql.get(sql, ()):
+            if _same_params(known, params):
+                return copy.deepcopy(rows)
+        return None
+
+    def forget(self, table: str) -> None:
+        """Oublie les réponses des requêtes qui lisent `table`."""
+        pattern = re.compile(r"\b%s\b" % re.escape(table), re.I)
+        for sql in [sql for sql in self._by_sql if pattern.search(sql)]:
+            del self._by_sql[sql]
+
+    def put(self, sql: str, params: tuple, rows: list[dict]) -> None:
+        self._by_sql.setdefault(sql, []).append((params, rows))
+
+
+class _Recorder:
+    """La connexion vue par une passe à blanc : aucune requête n'est envoyée."""
+
+    def __init__(self, db, answers: _Answers):
+        self._db = db
+        self._answers = answers
+        self.cfg = db.cfg
+        self.name = db.name
+        self.misses: list[tuple[str, tuple]] = []
+
+    def __getattr__(self, name: str):
+        value = getattr(self._db, name)
+        if callable(value):
+            raise _Abort(name)  # une méthode inconnue : on ne devine pas
+        return value
+
+    def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
+        params = tuple(params or ())
+        rows = self._answers.get(sql, params)
+        if rows is not None:
+            return rows
+        if not pure_read(sql):
+            raise _Abort(sql)
+        if sql.count("%s") != len(params) or (sql, params) in self._answers.refused:
+            # requête bâtie sur une réponse vide de la passe à blanc : elle
+            # serait refusée ; la vraie passe la construira correctement
+            return []
+        if not any(s == sql and _same_params(p, params) for s, p in self.misses):
+            self.misses.append((sql, params))
+        return []
+
+    def query_batch(self, items: Sequence[tuple]) -> list[list[dict]]:
+        return [self.query(sql, params) for sql, params in map(_batch_item, items)]
+
+    def execute(self, *_a, **_k):
+        raise _Abort("execute")
+
+    def script(self, *_a, **_k):
+        raise _Abort("script")
+
+    def transaction(self):
+        raise _Abort("transaction")
+
+    def listen(self, *_a, **_k):
+        raise _Abort("listen")
+
+    def close(self) -> None:
+        pass
+
+
+class _Replay:
+    """La connexion vue par la vraie passe : lectures servies par les réponses
+    gardées tant qu'aucune écriture n'a eu lieu, le reste va à la base."""
+
+    def __init__(self, db, answers: _Answers, *, owns: bool = False):
+        self._db = db
+        self._answers: _Answers | None = answers
+        #: `prefetch` : la vue remplace la connexion, sa fermeture la ferme
+        self._owns = owns
+
+    def __getattr__(self, name: str):
+        return getattr(self._db, name)
+
+    def _cut(self, sql: str = "") -> None:
+        match = _INSERT_RE.match(sql or "")
+        if match and self._answers is not None and match.group(1).lower() in APPEND_ONLY:
+            self._answers.forget(match.group(1).lower())
+            return
+        self._answers = None
+
+    def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
+        if self._answers is not None:
+            rows = self._answers.get(sql, tuple(params or ()))
+            if rows is not None:
+                return rows
+        if not pure_read(sql):
+            self._cut(sql)
+        return self._db.query(sql, params)
+
+    def query_batch(self, items: Sequence[tuple]) -> list[list[dict]]:
+        items = [_batch_item(item) for item in items]
+        out: list = [None] * len(items)
+        todo = []
+        for index, (sql, params) in enumerate(items):
+            rows = self._answers.get(sql, params) if self._answers is not None else None
+            if rows is None:
+                todo.append(index)
+            else:
+                out[index] = rows
+        if todo:
+            for index, rows in zip(todo, self._db.query_batch([items[i] for i in todo])):
+                out[index] = rows
+        return out
+
+    def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
+        self._cut(sql)
+        return self._db.execute(sql, params)
+
+    def script(self, sql: str) -> None:
+        self._cut()
+        return self._db.script(sql)
+
+    def transaction(self):
+        self._cut()
+        return self._db.transaction()
+
+    def close(self) -> None:
+        if self._owns:
+            self._db.close()
+        # sinon la connexion appartient à l'appelant de `batched`
+
+
+def batched(db, fn, *, levels: int = 4):
+    """Exécute `fn(db)` en regroupant ses lectures (voir plus haut).
+
+    `levels` borne le nombre d'allers-retours de préchargement (une requête
+    qui dépend d'une autre en demande un de plus). Rend la valeur de `fn`.
+    """
+    if isinstance(db, (_Recorder, _Replay)) or not hasattr(db, "query_batch"):
+        return fn(db)
+    return fn(_Replay(db, _preload(db, fn, levels)))
+
+
+def prefetch(db, fn, *, levels: int = 4):
+    """Précharge les lectures de `fn` (passes à blanc, voir plus haut) et rend
+    une connexion qui les sert : le code qui suit, inchangé, lit depuis ces
+    réponses ; toute autre requête va à la base. La fermer ferme `db`.
+
+    Pour une commande dont le code de lecture est déjà écrit en ligne :
+    `db = db_mod.prefetch(db, lambda d: (registry.overview(d), …))`."""
+    if isinstance(db, (_Recorder, _Replay)) or not hasattr(db, "query_batch"):
+        return db
+    return _Replay(db, _preload(db, fn, levels), owns=True)
+
+
+def _preload(db, fn, levels: int) -> _Answers:
+    answers = _Answers()
+    for _level in range(levels):
+        recorder = _Recorder(db, answers)
+        try:
+            fn(recorder)
+        except Exception:
+            pass  # réponses vides ou écriture : on garde ce qui a été noté
+        if not recorder.misses:
+            break
+        try:
+            results = db.query_batch(recorder.misses)
+        except (SchemaMissing, Unavailable):
+            raise
+        except DbError:
+            # une requête de la passe à blanc est invalide (bâtie sur une
+            # réponse vide) : le lot échoue en entier. Repli : une à une, les
+            # fautives écartées — la vraie passe fera les bonnes.
+            results = []
+            for sql, params in recorder.misses:
+                try:
+                    results.append(db.query(sql, params))
+                except (SchemaMissing, Unavailable):
+                    raise
+                except DbError:
+                    results.append(None)
+        for (sql, params), rows in zip(recorder.misses, results):
+            if rows is None:
+                answers.refused.append((sql, params))
+            else:
+                answers.put(sql, params, rows)
+    return answers
 
 
 def listener(db: PsqlDriver | PsycopgDriver, channels: Iterable[str]) -> "Listener | None":

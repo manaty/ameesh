@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """agent-mesh — la CLI du mesh : observabilité, clés, approbations, lots.
 
-  agent-mesh list [--json]                     mesh list : agents, hôte, bail, non lus, budget
-                                                (statut préfixé « ext/ » : agent externe, L37)
+  agent-mesh list [--json]                     mesh list : agents, projet, hôte, bail, non lus,
+                                                budget, regroupés par projet (L62) ; statut
+                                                préfixé « ext/ » : agent externe (L37)
   agent-mesh show <agent> [--json]             détail d'un agent
   agent-mesh key generate --out DIR --i-am-the-owner   paire de clés (acte du propriétaire)
   agent-mesh key register <agent> --public-key FICHIER [--role owner|agent]
@@ -52,9 +53,8 @@ USAGE_HINT = "agent-mesh: %s"
 
 
 def _open(cfg: Config) -> Db:
-    db = db_mod.connect(cfg)
-    db_mod.require_schema(db)
-    return db
+    # L61 : la vérification de schéma part avec la première requête
+    return db_mod.open_db(cfg)
 
 
 def _fmt_age(seconds: float) -> str:
@@ -126,8 +126,16 @@ def _lease(row: dict) -> str:
 
 def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
+    # L61 : agents et lots préchargés en un seul aller-retour (db.prefetch) ;
+    # le code ci-dessous lit ensuite ces réponses sans retourner à la base
+    db = db_mod.prefetch(db, lambda d: (registry.overview(d), work.delays(d, limit=500)))
     try:
         rows = registry.overview(db)
+        # L62 : le projet de chaque agent (équipe, à défaut chantier), en
+        # colonne et en clé JSON ajoutée ; le tableau est regroupé par projet
+        from .projects import agent_project, project_label
+        for row in rows:
+            row["project"] = agent_project(row)
         if args.json:
             # C4 : verdict de placement de chaque agent (0022)
             placement.annotate(db, rows)
@@ -148,9 +156,12 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         for lot in lots:
             if lot.get("assignee") and lot.get("state") not in work.TERMINAL:
                 open_by_agent[lot["assignee"]] = open_by_agent.get(lot["assignee"], 0) + 1
-        print("%-20s %-9s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
-            "NOM", "HARNAIS", "HÔTE", "STATUT", "BAIL", "NON LUS", "LOTS", "BUDGET", "CLÉ",
-            "VU"))
+        # regroupé par projet (tri stable : dans un projet, l'ordre de
+        # `overview`, vu le plus récemment d'abord) ; les sans-projet en dernier
+        rows.sort(key=lambda r: (r["project"] is None, r["project"] or ""))
+        print("%-20s %-12s %-9s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
+            "NOM", "PROJET", "HARNAIS", "HÔTE", "STATUT", "BAIL", "NON LUS", "LOTS", "BUDGET",
+            "CLÉ", "VU"))
         for row in rows:
             status = row.get("status") or "?"
             if row.get("status_text"):
@@ -158,8 +169,9 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             if row.get("mode") == "externe":
                 # L37 (0030) : session humaine, jamais réveillée par ameesh
                 status = "ext/" + status
-            print("%-20s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
-                row["name"][:20], (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
+            print("%-20s %-12s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
+                row["name"][:20], project_label(row["project"])[:12],
+                (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
                 status[:11], _lease(row), int(row.get("unread") or 0),
                 open_by_agent.get(row["name"], 0), _budget(row),
                 ("owner" if row.get("has_owner_key")
@@ -324,11 +336,12 @@ def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: 
 def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
-        row = registry.get(db, args.agent)
+        # L61 : la ligne et la clé en un seul aller-retour (db.batched)
+        row, info = db_mod.batched(db, lambda db: (
+            registry.get(db, args.agent), authority.key_info(db, args.agent)))
         if row is None:
             print(USAGE_HINT % ("agent inconnu : %s" % args.agent), file=sys.stderr)
             return 1
-        info = authority.key_info(db, args.agent)
         row = dict(row)
         row["key_ready"] = bool(info and info.get("public_key") and not info.get("key_revoked_ts"))
         row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
@@ -716,16 +729,25 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                           row["work_item_id"], issue))
             return 0
         if args.work_command == "list":
-            rows = work.list_items(db, state=args.state, assignee=args.assignee, limit=args.limit)
-            plan.annotate(db, rows, threshold=stagnation.stale_after(args.stale_after))
-            # Les délais viennent d'un seul balayage, restreint aux lots
-            # affichés (jamais une requête par ligne) ; le JSON les porte aussi,
-            # pour la frise (L24). Le filtre porte sur les lignes rendues, pas
-            # sur une fenêtre globale : un lot ancien garde sa frise (B3).
-            delays = {row["work_item_id"]: row for row in
-                      work.delays(db, ids=[row["id"] for row in rows])}
-            for row in rows:
-                row["delays"] = delays.get(row["id"])
+            threshold = stagnation.stale_after(args.stale_after)
+
+            def lire(db):
+                rows = work.list_items(db, state=args.state, assignee=args.assignee,
+                                       limit=args.limit)
+                plan.annotate(db, rows, threshold=threshold)
+                # Les délais viennent d'un seul balayage, restreint aux lots
+                # affichés (jamais une requête par ligne) ; le JSON les porte
+                # aussi, pour la frise (L24). Le filtre porte sur les lignes
+                # rendues, pas sur une fenêtre globale : un lot ancien garde sa
+                # frise (B3).
+                delays = {row["work_item_id"]: row for row in
+                          work.delays(db, ids=[row["id"] for row in rows])}
+                for row in rows:
+                    row["delays"] = delays.get(row["id"])
+                return rows
+
+            # L61 : lectures regroupées — deux allers-retours en tout
+            rows = db_mod.batched(db, lire)
             if args.json:
                 print(json.dumps(rows, ensure_ascii=False, indent=2))
                 return 0
@@ -985,14 +1007,30 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 
 
 #: clés de `ameesh set` (L13 : model, effort ; L26 : tier, session_policy ;
-#: L37 : mode, `execute` | `externe`, décision 0030)
-SET_KEYS = ("model", "effort", "tier", "session_policy", "mode")
+#: L37 : mode, `execute` | `externe`, décision 0030 ; L60 : context_max_tokens)
+SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens")
+#: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
+_TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
+
+
+def parse_token_count(valeur: str) -> int:
+    """`15000000`, `15M`, `1.5m`, `500k` → entier ≥ 0 ; ValueError sinon (L60)."""
+    texte = valeur.strip().lower().replace("_", "")
+    facteur = 1
+    if texte and texte[-1] in _TOKEN_SUFFIXES:
+        facteur = _TOKEN_SUFFIXES[texte[-1]]
+        texte = texte[:-1]
+    nombre = float(texte)
+    if nombre != nombre or nombre < 0 or nombre * facteur > 2 ** 62:
+        raise ValueError(valeur)
+    return int(round(nombre * facteur))
 #: un tier est un identifiant court (passé tel quel au harnais par son descripteur)
 _TIER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 def cmd_set(cfg: Config, args) -> int:
-    """`ameesh set <agent> model=… effort=… tier=… session_policy=… mode=…` (L13, L26, L37).
+    """`ameesh set <agent> model=… effort=… tier=… session_policy=… mode=…
+    context_max_tokens=…` (L13, L26, L37, L60).
 
     Écrit l'état d'exécution : le modèle dans le registre (visible par `list`)
     et dans l'état local ; l'effort et le tier dans l'état local **et** en base
@@ -1001,14 +1039,16 @@ def cmd_set(cfg: Config, args) -> int:
     Le tour suivant les lit et les applique ; une valeur vide revient au
     défaut. Le tier n'a d'effet que sur un harnais dont le descripteur le
     déclare (Codex : `service_tier`). Le mode (`execute` | `externe`, L37) est
-    écrit en base ; vide = `execute`.
+    écrit en base ; vide = `execute`. Le plafond de contexte
+    (`context_max_tokens`, L60 : `15M`, `500k`, `0` = désactivé) est écrit en
+    base ; vide = défaut de l'exécuteur.
     """
     from . import adapters
     from .config import SESSION_POLICIES
 
     db = db_mod.connect(cfg)
     try:
-        db_mod.require_schema(db)
+        db_mod.require_schema(db, defer=True)
         agent = registry.get(db, args.agent)
         if agent is None:
             print("agent inconnu : %s" % args.agent, file=sys.stderr)
@@ -1019,8 +1059,8 @@ def cmd_set(cfg: Config, args) -> int:
             valeur = valeur.strip()
             if not sep or cle not in SET_KEYS:
                 print("usage : ameesh set <agent> model=… effort=… tier=… "
-                      "session_policy=%s mode=%s" % ("|".join(SESSION_POLICIES),
-                                                     "|".join(registry.MODES)),
+                      "session_policy=%s mode=%s context_max_tokens=N|15M|0"
+                      % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
             if cle == "mode" and valeur and valeur not in registry.MODES:
@@ -1034,6 +1074,13 @@ def cmd_set(cfg: Config, args) -> int:
             if cle == "tier" and valeur and not _TIER_RE.match(valeur):
                 print("tier invalide : %r (ex. fast, flex)" % valeur, file=sys.stderr)
                 return 2
+            if cle == "context_max_tokens" and valeur:
+                try:
+                    valeur = str(parse_token_count(valeur))
+                except ValueError:
+                    print("context_max_tokens invalide : %r (ex. 15M, 500k, 0 = "
+                          "désactivé)" % valeur, file=sys.stderr)
+                    return 2
             valeurs[cle] = valeur
         for cle, valeur in valeurs.items():
             if cle in ("model", "effort", "tier"):
@@ -1053,9 +1100,13 @@ def cmd_set(cfg: Config, args) -> int:
         effort = _lit_etat(cfg, args.agent, "effort") or agent.get("effort") or "défaut"
         tier = _lit_etat(cfg, args.agent, "tier") or agent.get("tier") or "défaut"
         politique = agent.get("session_policy") or "défaut (%s)" % cfg.session_policy
-        print("%s : modèle=%s effort=%s tier=%s session=%s mode=%s (prend effet au "
-              "prochain tour)" % (args.agent, modele, effort, tier, politique,
-                                  agent.get("mode") or "execute"))
+        from .exploitation import effective_context_max
+        plafond = effective_context_max(cfg, agent)
+        plafond_txt = ("désactivé" if plafond == 0 else "%d" % plafond) + (
+            "" if agent.get("context_max_tokens") is not None else " (défaut)")
+        print("%s : modèle=%s effort=%s tier=%s session=%s mode=%s contexte=%s (prend "
+              "effet au prochain tour)" % (args.agent, modele, effort, tier, politique,
+                                          agent.get("mode") or "execute", plafond_txt))
         if agent.get("mode") == "externe" and not agent.get("responsible"):
             # 0030 : un agent externe a obligatoirement un responsable humain
             print("attention : agent externe sans responsable humain : ses lots et ses "
@@ -1373,6 +1424,9 @@ def build_parser() -> argparse.ArgumentParser:
     pc_gauges.add_argument("--harness", default=None)
     pc_gauges.add_argument("--since", default="7d")
     pc_gauges.add_argument("--json", action="store_true")
+    pc_gauges.add_argument("--record", action="store_true",
+                           help="relève d'abord les jauges des journaux locaux (écrit "
+                                "l'historique) ; sans elle, lecture seule")
     pc_gauges.set_defaults(func=cmd_cost)
     pc_bal = cost_sub.add_parser(
         "balance", help="solde du fournisseur payé au token, dépense réelle par heure et jour")
@@ -1390,20 +1444,25 @@ def build_parser() -> argparse.ArgumentParser:
     pa_list.add_argument("--json", action="store_true")
     pa_list.add_argument("--last", type=int, default=5, help="dernières bascules montrées")
     pa_list.set_defaults(func=cmd_accounts)
-    pa_use = acc_sub.add_parser("use", help="forcer un compte (plus de bascule automatique)")
+    pa_use = acc_sub.add_parser("use", help="forcer un compte (plus de choix automatique)")
     pa_use.add_argument("harness")
     pa_use.add_argument("account")
     pa_use.set_defaults(func=cmd_accounts)
-    pa_auto = acc_sub.add_parser("auto", help="rendre la main à la bascule automatique")
+    pa_auto = acc_sub.add_parser("auto", help="rendre la main au choix automatique (0034)")
     pa_auto.add_argument("harness", nargs="?", default=None,
                          help="harnais (défaut : tous ceux qui ont des comptes)")
     pa_auto.set_defaults(func=cmd_accounts)
     p_acc.set_defaults(func=cmd_accounts)
 
+    # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
+    from . import budget as budget_mod
+    budget_mod.add_parsers(sub)
+
     p_set = sub.add_parser("set", help="réglages d'un agent, effet au prochain tour (L13, L26)")
     p_set.add_argument("agent")
     p_set.add_argument("values", nargs="+", metavar="clé=valeur",
                        help="model=… effort=… tier=… session_policy=par-lot|taille|jamais "
+                            "context_max_tokens=15M|0 "
                             "mode=execute|externe (valeur vide = défaut)")
     p_set.set_defaults(func=cmd_set)
 
@@ -1455,7 +1514,16 @@ def cmd_cost(cfg: Config, args) -> int:
     try:
         if what in ("turns", "gauges", "balance"):
             return _cost_l26(cfg, db, what, args)
-        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+        if what == "report":
+            # L61 : le rapport lisait la dépense agent par agent (deux
+            # requêtes chacun, ~67 s vers une base distante) : ses lectures
+            # sont préchargées en quelques allers-retours (db.prefetch)
+            db = db_mod.prefetch(db, lambda d: _cost_report_reads(cfg, d))
+        # L70 : les plafonds en vigueur (base > configuration > défaut), ceux
+        # que la garde des exécuteurs applique
+        from . import budget as budget_mod
+        limites = budget_mod.current(cfg, db)
+        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, **limites.book_kwargs())
         if what == "spent":
             seconds = float(getattr(args, "seconds", 3600.0) or 3600.0)
             print("%.4f" % book.spent(getattr(args, "agent", "all") or "all", seconds))
@@ -1480,7 +1548,8 @@ def cmd_cost(cfg: Config, args) -> int:
             return 1
         # L30 : jauges par compte et compte actif, pour les harnais à comptes
         try:
-            comptes = accounts_mod.report(cfg, db, book)
+            # L71 : un affichage ne relève pas les jauges (lecture seule)
+            comptes = accounts_mod.report(cfg, db, book, record=False)
         except accounts_mod.AccountError as exc:
             print("comptes : configuration invalide : %s" % exc, file=sys.stderr)
             comptes = []
@@ -1499,6 +1568,11 @@ def cmd_cost(cfg: Config, args) -> int:
             print(json.dumps(rows, indent=2, sort_keys=True, default=str))
         else:
             print(cost_mod.format_report(rows))
+            print()
+            print(budget_mod.summary_line(limites))
+            for agent, caps in sorted(limites.agents.items()):
+                print("  plafond de %s : %s" % (agent, " · ".join(
+                    "%s %.2f $" % (budget_mod.LABELS[w], v) for w, v in sorted(caps.items()))))
             if comptes:
                 print()
                 print("comptes (hôte %s) :" % cfg.host)
@@ -1506,6 +1580,21 @@ def cmd_cost(cfg: Config, args) -> int:
         return 0
     finally:
         db.close()
+
+
+def _cost_report_reads(cfg: Config, db) -> None:
+    """Les lectures de `cost report`, jouées à blanc par `db.prefetch` (L61) :
+    plafonds (L70), comptes et rapport par agent. Rien n'est affiché."""
+    from . import budget as budget_mod
+    limites = budget_mod.current(cfg, db)
+    book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, **limites.book_kwargs())
+    try:
+        comptes = accounts_mod.report(cfg, db, book)
+    except accounts_mod.AccountError:
+        comptes = []
+    actifs = {ligne["harness"]: (ligne["account"], ligne["_gauges"])
+              for ligne in comptes if ligne["active"]}
+    book.report(accounts=actifs)
 
 
 def cmd_accounts(cfg: Config, args) -> int:
@@ -1527,7 +1616,7 @@ def cmd_accounts(cfg: Config, args) -> int:
                       "de l'hôte)" % args.harness, file=sys.stderr)
                 return 1
             accounts_mod.force(db, cfg.host, args.harness, items, args.account, by=qui)
-            texte = ("Compte %s forcé pour %s sur %s par %s : plus de bascule automatique "
+            texte = ("Compte %s forcé pour %s sur %s par %s : plus de choix automatique "
                      "jusqu'à « ameesh accounts auto »." % (args.account, args.harness,
                                                             cfg.host, qui))
             fil.record(cfg, db, sender=qui, recipients=[], text=texte,
@@ -1542,7 +1631,7 @@ def cmd_accounts(cfg: Config, args) -> int:
                     print("aucun compte déclaré pour %s" % nom, file=sys.stderr)
                     return 1
                 if accounts_mod.automatic(db, cfg.host, nom, by=qui):
-                    texte = ("Comptes %s sur %s : retour en bascule automatique (%s)."
+                    texte = ("Comptes %s sur %s : retour au choix automatique (%s)."
                              % (nom, cfg.host, qui))
                     fil.record(cfg, db, sender=qui, recipients=[], text=texte,
                                meta={"action": "compte", "type": "auto", "harnais": nom,
@@ -1552,7 +1641,8 @@ def cmd_accounts(cfg: Config, args) -> int:
                     print("comptes %s : déjà en automatique" % nom)
             return 0
         book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
-        rows = accounts_mod.report(cfg, db, book)
+        # L71 : `accounts list` est un affichage — aucun relevé écrit
+        rows = accounts_mod.report(cfg, db, book, record=False)
         for row in rows:
             row.pop("_gauges", None)
         bascules = storage.of(db).accounts.switches(cfg.host, None, max(0, getattr(args, "last", 5))) \
@@ -1602,15 +1692,19 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
                 row["usd"]))
         return 0
     if what == "gauges":
-        # un relevé frais d'abord : la commande lit aussi les journaux locaux de
-        # l'hôte, comme `cost report` (une ligne seulement si la jauge a bougé).
-        # L30 : un harnais à comptes déclarés est relevé compte par compte.
-        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
-        declares = accounts_mod.parse(cfg.accounts)
-        accounts_mod.report(cfg, db, book, harnesses=[args.harness] if args.harness else None)
-        for nom in ([args.harness] if args.harness else ["claude", "codex"]):
-            if nom not in declares:
-                book.gauges(nom)
+        if args.record:
+            # `--record` : un relevé frais d'abord, depuis les journaux locaux
+            # de l'hôte, comme `cost report` (une ligne seulement si la jauge
+            # a bougé). L30 : un harnais à comptes déclarés est relevé compte
+            # par compte. Sans l'option (L61), la commande ne fait que lire
+            # l'historique : l'exécuteur relève déjà avant chaque tour.
+            book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+            declares = accounts_mod.parse(cfg.accounts)
+            accounts_mod.report(cfg, db, book,
+                                harnesses=[args.harness] if args.harness else None)
+            for nom in ([args.harness] if args.harness else ["claude", "codex"]):
+                if nom not in declares:
+                    book.gauges(nom)
         rows = ops.gauge_history(since_s=_since_seconds(args.since), harness=args.harness)
         if args.json:
             print(json.dumps({"schema": "ameesh-gauges/1", "readings": rows},

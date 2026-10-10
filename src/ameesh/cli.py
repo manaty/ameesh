@@ -63,6 +63,10 @@ from . import session_bindings as sb
 from .config import NAME_RE, Config
 
 MAX_STOP_BLOCKS = 3
+#: L61 : un hook ne réinscrit pas l'agent (aller-retour vers la base) plus
+#: d'une fois par cette durée, tant que harnais, dossier, session et bail
+#: n'ont pas changé — `last_seen` avance alors par pas d'au plus une minute.
+REGISTER_EVERY_S = 60.0
 
 #: verdict neutre pour le comptage : un message non signé n'a aucune autorité
 _NO_PROOF = authority.Verdict(False, "non signé")
@@ -387,19 +391,22 @@ def cmd_statusline(cfg: Config) -> int:
     name = binding.name if binding.ok else identity.legacy_name(cwd, cfg)
     home = os.path.expanduser("~")
     short = "~" + cwd[len(home):] if cwd.startswith(home) else cwd
-    try:
-        bk, _warning = backend_mod.open_backend(cfg)
-    except db_mod.DbError:
-        bk = backend_mod.FileBackend(cfg)
+    # L61 : la même connexion (une seconde coûtait 1 à 2 s vers une base distante)
+    bk = _bk
     chantier = identity.chantier_of(name, cfg)
+
+    def lire(db):
+        lu = bk if db is None else backend_mod.PgBackend(cfg, db)
+        return (lu.get_status(name) if chantier else ""), len(lu.unread(name))
+
+    # statut et non-lus en un seul aller-retour (db.batched)
+    status, unread = (db_mod.batched(bk.db, lire) if bk.kind == "pg" else lire(None))
     parts = []
     if chantier:
-        status = bk.get_status(name)
         parts.append("\033[1;36m[%s/%s]\033[0m%s" % (chantier, name, (" " + status) if status else ""))
     else:
         parts.append("\033[1;36m%s\033[0m" % name)
     parts.append("\033[2m%s\033[0m" % short)
-    unread = len(bk.unread(name))
     if unread:
         parts.append("\033[33m✉ %d\033[0m" % unread)
     print("  ·  ".join(parts))
@@ -469,6 +476,35 @@ class _Remise:
                 pass
 
 
+def _register_stamp(cfg: Config, name: str) -> str:
+    return os.path.join(cfg.state_dir, "hooks", name + ".inscription")
+
+
+def _register_due(cfg: Config, name: str, key: list) -> bool:
+    """L61 : l'inscription de cette session est-elle à refaire ? Oui si la
+    clé (harnais, dossier, session, bail) a changé ou si la dernière date de
+    plus de REGISTER_EVERY_S. Un état local illisible : oui."""
+    try:
+        with open(_register_stamp(cfg, name), encoding="utf-8") as fh:
+            last = json.load(fh)
+        return (last.get("key") != key
+                or not 0 <= time.time() - float(last.get("ts") or 0) < REGISTER_EVERY_S)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return True
+
+
+def _register_done(cfg: Config, name: str, key: list) -> None:
+    path = _register_stamp(cfg, name)
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        tmp = "%s.%d" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"key": key, "ts": time.time()}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def cmd_hook(cfg: Config, tool: str) -> int:
     """Hook de harnais : lit le JSON sur stdin, ne fait JAMAIS échouer l'agent."""
     try:
@@ -485,9 +521,18 @@ def cmd_hook(cfg: Config, tool: str) -> int:
     # L41 (0030) : sans AGENT_MAIL_NAME, seule la liaison explicite de CETTE
     # session (hôte, harnais, identifiant reçu en JSON ; PID ancêtre s'il est
     # lié) donne une identité. Sans liaison : rien n'est remis, rien n'est écrit.
-    binding = identity.resolve_binding(
-        cfg, bk.db if bk.kind == "pg" else None,
-        harness=tool, session_id=str(data.get("session_id") or ""))
+    try:
+        binding = identity.resolve_binding(
+            cfg, bk.db if bk.kind == "pg" else None,
+            harness=tool, session_id=str(data.get("session_id") or ""))
+    except db_mod.DbError:
+        # L61 : la vérification de schéma voyage avec la première requête ;
+        # un schéma absent (ou une base tombée entre-temps) donne le même
+        # repli fichier qu'avant, quand open_backend le détectait.
+        bk.close()
+        bk = backend_mod.FileBackend(cfg)
+        binding = identity.resolve_binding(
+            cfg, None, harness=tool, session_id=str(data.get("session_id") or ""))
     if not binding.ok:
         if binding.name:
             # Identité annoncée mais bail invalide : on le dit sur stderr, et
@@ -497,8 +542,14 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         return 0
     name = binding.name
     try:
-        bk.register(name, tool, data.get("cwd"), data.get("session_id"),
-                    leased=binding.bound_to_lease)
+        inscription = [tool, data.get("cwd"), data.get("session_id"),
+                       binding.runner_id if binding.bound_to_lease else None,
+                       binding.epoch if binding.bound_to_lease else None]
+        if bk.kind != "pg" or _register_due(cfg, name, inscription):
+            bk.register(name, tool, data.get("cwd"), data.get("session_id"),
+                        leased=binding.bound_to_lease)
+            if bk.kind == "pg":
+                _register_done(cfg, name, inscription)
         if binding.source == "explicit" and bk.kind == "pg":
             # L46 : AGENT_MAIL_NAME sans bail (pont local, shell qui en a
             # hérité) ne prend jamais le courrier d'un agent mené par
@@ -785,19 +836,61 @@ def cmd_probe(cfg: Config) -> int:
     return 0
 
 
+def driver_warnings(driver: str, remote: bool) -> list[str]:
+    """L61 : le pilote psql ouvre une connexion (TLS compris) par requête ;
+    sur une base distante, c'est 1 à 2 s par requête. psycopg est la voie
+    normale (dépendance du paquet) : son absence se corrige ici."""
+    if driver != "psql" or not remote:
+        return []
+    return [
+        "attention  : pilote psql avec une base DISTANTE — un sous-processus et une "
+        "connexion TLS par requête (~1,5 s chacune à 180 ms d'aller-retour) ;",
+        "             installez psycopg dans l'environnement d'ameesh : %s -m pip install "
+        "'psycopg[binary]>=3.1'" % sys.executable,
+    ]
+
+
 def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False) -> int:
     if probe:
         return cmd_probe(cfg)
     print("dsn        : %s" % config_mod.mask_dsn(cfg.dsn))
     print("schéma     : %s" % cfg.schema)
     print("hôte       : %s" % cfg.host)
+    started = time.monotonic()
     try:
         db = db_mod.connect(cfg)
     except db_mod.Unavailable as exc:
         print("pilote     : aucun (%s)" % exc)
         print("verdict    : KO — la CLI basculerait sur les fichiers %s" % cfg.v0_state)
         return 1
+    connected = time.monotonic() - started
     print("pilote     : %s" % db.name)
+    remote = db_mod.is_remote(cfg)
+    if remote:
+        # L61 : sur une base distante, chaque aller-retour coûte la latence
+        # du réseau ; la connexion (TCP + TLS + authentification) plusieurs.
+        started = time.monotonic()
+        try:
+            db.ping()
+            trip = time.monotonic() - started
+            print("réseau     : base distante ; connexion %d ms, requête simple %d ms"
+                  % (connected * 1000, trip * 1000))
+        except db_mod.DbError:
+            pass
+    for line in driver_warnings(db.name, remote):
+        print(line)
+    if remote and db.name == "psycopg" and "sslnegotiation" not in (cfg.dsn or ""):
+        # L61 : négociation TLS directe (libpq et serveur ≥ 17) — un
+        # aller-retour de moins à chaque connexion (1,31 → 1,12 s mesuré)
+        try:
+            import psycopg
+            info = db.conn.info
+            if (psycopg.pq.version() >= 170000 and info.server_version >= 170000
+                    and db.conn.pgconn.ssl_in_use):
+                print("conseil    : ajoutez sslnegotiation=direct au DSN (libpq et serveur "
+                      "≥ 17) : un aller-retour de moins par connexion")
+        except Exception:
+            pass
     try:
         db_mod.require_schema(db)
     except db_mod.SchemaMissing as exc:
