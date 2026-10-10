@@ -46,7 +46,7 @@
 --     inutiles à la supervision ; l'empreinte suffit :
 --       agent_registry.public_key (et la vue agent_mesh_overview)
 --       authenticators.public_key, .credential_id
---   * exécuteurs médiés (voie B, 0050 et 0051) — empreintes de jetons et de
+--   * exécuteurs médiés (voie B, 0051 et 0052) — empreintes de jetons et de
 --     codes, identifiants d'assertions, clé et attestation d'appareil,
 --     réponses rejouables du cache d'idempotence :
 --       executor_tokens.token_sha256, executor_invitations.code_sha256,
@@ -290,7 +290,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'spend_key',
         -- L95 (0043) : raison d'une ligne écartée des sommes
         'void_reason',
-        -- L111 (0052) : provenance (harness, relay, device) et bail
+        -- L111 (0053) : provenance (harness, relay, device) et bail
         'source', 'executor', 'lease_owner', 'lease_epoch'
     ]),
     -- corrections du grand livre (L95, 0043) : copie d'une ligne de
@@ -299,7 +299,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'run_id', 'turn_cost_id', 'kind', 'reason', 'old_row', 'new_values',
         'actor', 'at'
     ]),
-    -- exécuteurs médiés (voie B : 0050, 0051) : de l'ÉTAT, jamais une
+    -- exécuteurs médiés (voie B : 0051, 0052) : de l'ÉTAT, jamais une
     -- empreinte de jeton ou de code, ni une réponse rejouable
     ('exec_idempotency', ARRAY[
         'executor_id', 'key', 'op', 'request_sha256', 'status', 'at'
