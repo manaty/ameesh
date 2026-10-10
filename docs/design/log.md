@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-10 (comptes au forfait)
+* **Décision** : [consommer d'abord ce qui expire](decisions/0034-consommer-d-abord-ce-qui-expire.md), qui amende 0027 ; lot L74.
+
 ## 2026-10-09
 * **Bascule** : deepseek1 à 7 et l'orchestrateur Nexlink menés par l'exécuteur, un service par agent (`ameesh-runner-agent@<nom>`) ; plus aucune boucle v0.
 * **L48** (1.4.1) : échecs rapides de tour, attente doublée puis arrêt de l'agent.
