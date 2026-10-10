@@ -78,10 +78,15 @@ restée 4 h fusionnée sans être déployée :
    consigne de veille ne se contente jamais d'interdire « tout déploiement »
    sans le préparer. Les gestes en production d'un projet, les dépenses et les
    secrets restent des décisions du propriétaire.
-4. **Redémarrer détaché.** `poste.sh redemarrer` ne redémarre un exécuteur
-   qu'hors tour : l'agent qui le lance alors qu'il a lui-même un exécuteur
-   sur le poste le lance détaché (`setsid`/`nohup`), sinon il s'attend
-   lui-même.
+4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` ne redémarre
+   un exécuteur qu'hors tour. Un agent qui tourne lui-même sous une unité
+   d'exécuteur du poste le lance dans une unité systemd distincte :
+   `systemd-run --user --unit=ameesh-redemarrer-$(date +%s) bash
+   deploy/mise-a-jour/poste.sh redemarrer <REF>`. Un `setsid` ou un `nohup`
+   ne suffit pas : le script reste dans le groupe de contrôle de l'unité de
+   l'agent, et il est tué quand le script redémarre cette unité, avant
+   d'avoir traité les exécuteurs suivants. Une session humaine attachée
+   (`ameesh attach`) bloque le redémarrage de son exécuteur jusqu'à sa sortie.
 5. **Réserver les migrations.** Les numéros de migration se réservent dès le
    début d'un lot, annoncés dans le lot et au journal de conception, pour
    éviter les renumérotations en cascade quand plusieurs lots fusionnent à la
