@@ -366,6 +366,22 @@ def idle_agents(listing: list, now: float, idle_s: float) -> list:
     return idle
 
 
+def is_backlog_item(lot: dict) -> bool:
+    """Élément de la file d'amélioration encore à prendre (L119) : il attend un
+    preneur automatique, ce n'est ni un lot en souffrance ni un lot stagnant."""
+    return (lot.get("type") == "improvement" and not (lot.get("assignee") or "").strip()
+            and lot.get("state") == "intake")
+
+
+def waiting_project_lots(lots: list) -> list:
+    """Les lots du projet ouverts sans assigné (hors file d'amélioration) : du
+    travail demandé qui attend qu'on le confie. Tant qu'il y en a, la prise
+    automatique s'abstient (0037) et `idle_capacity` le signale."""
+    return [lot for lot in lots
+            if not (lot.get("assignee") or "").strip()
+            and lot.get("state") in WAITING_LOT_STATES and not is_backlog_item(lot)]
+
+
 def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                   idle_s: float = DEFAULT_IDLE_CAPACITY_S, paid=None,
                   lots: list | None = None) -> list:
@@ -376,9 +392,7 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         return []
     if lots is None:
         lots = storage.of(db).operations.open_lots_activity(500)
-    waiting_lots = [lot for lot in lots
-                    if not (lot.get("assignee") or "").strip()
-                    and lot.get("state") in WAITING_LOT_STATES]
+    waiting_lots = waiting_project_lots(lots)
     backlog = [row for row in listing
                if _state(row) in ("working", "paused") and int(row.get("unread") or 0)
                and row.get("oldest_unread_ts") is not None
@@ -603,6 +617,9 @@ def backlog_empty(db, listing: list, now: float, *,
     if not idle:
         return []
     if storage.of(db).work.backlog(open_only=True, limit=1):
+        return []
+    # des lots du projet attendent un preneur : c'est `idle_capacity` qui parle
+    if waiting_project_lots(storage.of(db).operations.open_lots_activity(500)):
         return []
     names = sorted(row["name"] for row in idle)
     return [_alert(

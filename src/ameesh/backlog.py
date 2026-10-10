@@ -19,6 +19,16 @@ l'élément de plus forte valeur qui correspond à son équipe et à ses
 capacités. Le lot lui est assigné (attribution gardée de L37) et lui est
 annoncé par un courrier lié au lot (`--lot`), qui le réveille. Garde-fous :
 
+* **aucun lot ne l'attend** : l'agent n'a ni lot ouvert, ni courrier non lu,
+  ni consigne en attente, ni lot de session encore ouvert ; et tant qu'un lot
+  du projet attend un preneur (ouvert, sans assigné, hors file), personne ne
+  prend d'amélioration — c'est à l'orchestrateur ou à l'humain de le confier
+  (`idle_capacity` le signale) ;
+* **jamais un geste irréversible ou de production** : le courrier de prise
+  l'interdit en toutes lettres (déploiement, fusion, suppression de données,
+  serveur de production, dépense engagée) ; l'agent le propose à un humain et
+  s'arrête là. Le circuit du projet (relecture, intégration par qui en a le
+  droit) reste le seul chemin vers la production ;
 * les agents au forfait d'abord ; un agent payé au token ne prend rien sauf
   `allow_paid`, et jamais pendant une alerte `balance_low` ;
 * un plafond de budget atteint (`CostBook.over`), un agent en pause budget
@@ -130,7 +140,10 @@ def take_message(item: dict) -> str:
     return ("Lot #%d, pris dans la file d'amélioration (aucune demande humaine ni lot du "
             "projet ne t'attendait) : %s\nValeur attendue : %s%s\n"
             "Suis le circuit normal de ton projet (relecture, vérifications, intégration "
-            "par qui en a le droit). Aucun déploiement sans humain. Si l'élément n'a plus "
+            "par qui en a le droit). Interdit dans ce lot : tout geste irréversible ou de "
+            "production (déploiement, fusion, suppression de données, serveur de "
+            "production, dépense engagée) — propose-le à un humain et arrête-toi là. "
+            "Si un lot ou un courrier t'arrive, il passe avant celui-ci. Si l'élément n'a plus "
             "de valeur, dis-le et rends-le (ameesh work note, puis ameesh work close "
             "--abandoned) plutôt que de travailler pour occuper." % (
                 int(item["id"]), item["title"], item.get("expected_value") or "",
@@ -140,6 +153,18 @@ def take_message(item: dict) -> str:
 def _blocked_hosts(alerts: list) -> set:
     return {a.get("host") for a in alerts or () if a.get("type") in HOST_BLOCKING_ALERTS
             and a.get("host")}
+
+
+def _awaited(row: dict) -> bool:
+    """Un travail attend-il déjà cet agent ? (lot, courrier, consigne, lot de
+    session encore ouvert) — il passe avant toute amélioration."""
+    from . import stagnation
+    if row.get("assigned_lot_id") is not None or int(row.get("unread") or 0):
+        return True
+    if row.get("has_pending_prompt"):
+        return True
+    state = row.get("session_lot_state")
+    return bool(state) and state not in stagnation.DONE_STATES
 
 
 def _default_budget_check(cfg, db):
@@ -170,13 +195,17 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     queue = items(db, open_only=True, limit=200)
     if not queue:
         return []
+    # un lot du projet attend un preneur : il passe avant toute amélioration
+    if sous_utilisation.waiting_project_lots(st.operations.open_lots_activity(500)):
+        return []
     listing = st.operations.listing() if listing is None else listing
     # un agent du mesh en pause budget : le plafond est atteint, on ne charge pas
     if any(row.get("status") == "blocked"
            and (row.get("status_text") or "").startswith(budget_mod.PAUSE_PREFIX)
            for row in listing):
         return []
-    idle = sous_utilisation.idle_agents(listing, now, idle_s)
+    idle = [row for row in sous_utilisation.idle_agents(listing, now, idle_s)
+            if not _awaited(row)]
     if not idle:
         return []
     alerts = alerts or []

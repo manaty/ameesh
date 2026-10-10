@@ -108,7 +108,7 @@ class PriseTest(_Base):
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["sender"], rows[0]["recipient"], rows[0]["work_item_id"]),
                          ("ameesh", "claude1", str(haut["id"])))
-        self.assertIn("Aucun déploiement sans humain", rows[0]["body"])
+        self.assertIn("geste irréversible ou de production", rows[0]["body"])
         notes = [e["note"] for e in work.events(self.db, haut["id"])]
         self.assertTrue(any(n.startswith(backlog.AUTO_TAKE_NOTE) for n in notes))
         # l'agent a maintenant un lot (et du courrier) : il ne prend plus rien
@@ -168,6 +168,38 @@ class PriseTest(_Base):
         self.assertIsNone(work.get(self.db, autre["id"])["assignee"])
         self.assertIsNone(work.get(self.db, cap["id"])["assignee"])
 
+    def test_aucun_lot_ne_l_attend(self):
+        self.agent("claude1")
+        item = self.element("dette", 50)
+        # un lot du projet attend un preneur : il passe avant l'amélioration
+        lot = work.add(self.db, title="demande humaine")
+        self.assertEqual(self.take(), [])
+        work.close(self.db, lot["id"], abandoned=True)
+        # courrier non lu, consigne en attente, lot de session encore ouvert
+        self.db.execute("INSERT INTO agent_mailbox (sender, recipient, body)"
+                        " VALUES ('human:proprio', 'claude1', 'à toi')")
+        self.assertEqual(self.take(), [])
+        self.db.execute("UPDATE agent_mailbox SET delivered_at = now()")
+        self.db.execute("UPDATE agent_registry SET pending_prompt = 'reprends'"
+                        " WHERE name = 'claude1'")
+        self.assertEqual(self.take(), [])
+        self.db.execute("UPDATE agent_registry SET pending_prompt = NULL")
+        autre = work.add(self.db, title="lot de session", assignee="human:proprio")
+        self.db.execute("UPDATE agent_registry SET session_work_item = %s"
+                        " WHERE name = 'claude1'", (str(autre["id"]),))
+        self.assertEqual(self.take(), [])
+        self.db.execute("UPDATE agent_registry SET session_work_item = NULL")
+        self.assertEqual([t["item"]["id"] for t in self.take()], [item["id"]])
+
+    def test_file_non_comptee_comme_travail_en_attente(self):
+        # un élément de la file n'est pas un « lot sans assigné » d'idle_capacity
+        self.agent("claude1", since_s=60)
+        self.element("dette", 50)
+        idle = [a for a in exploitation.alerts(self.cfg, self.db, now=self.now,
+                                               **_seuils(idle_capacity_s=30))
+                if a["type"] == "idle_capacity"]
+        self.assertEqual(idle, [])
+
     def test_a_blanc(self):
         self.agent("claude1")
         item = self.element("dette", 50)
@@ -194,6 +226,10 @@ class AlerteEtNotifyTest(_Base):
         self.assertEqual(out[0]["responsible"], "human:proprio")
         self.assertIn("ameesh work backlog add", out[0]["detail"])
         self.assertEqual(alertes(backlog_empty_s=0), [])
+        # un lot du projet attend : idle_capacity parle, pas backlog_empty
+        lot = work.add(self.db, title="demande humaine")
+        self.assertEqual(alertes(), [])
+        work.close(self.db, lot["id"], abandoned=True)
         self.element("dette", 50)
         self.assertEqual(alertes(), [])
 

@@ -199,3 +199,37 @@ cycle actuel des lots tient dans `roadmap_dev.CORRESPONDANCES`, que le futur
 module « développement » reprendra. Détail, schéma `ameesh-roadmap/1` et
 consigne des orchestrateurs : [EXPLOITATION.md](EXPLOITATION.md), « Feuille
 de route ».
+
+## File d'amélioration continue (L119, décision 0037)
+
+```
+ameesh work backlog add --title T --value "valeur attendue" --score 1-100
+                        [--priority 1|2|3] [--source S] [--team E] [--requires CAP …]
+ameesh work backlog list [--all] [--json]
+```
+
+Un élément de la file est un lot de type `improvement`, en `intake`, sans
+assigné ; sa valeur attendue (une phrase) et son score sont obligatoires : pas
+de travail pour occuper. La file se lit dans l'ordre de prise : priorité, puis
+score, puis ancienneté. Un élément en file n'est ni stagnant ni un « lot sans
+assigné » d'`idle_capacity` : il attend son preneur.
+
+À chaque passage, `ameesh notify` confie l'élément le mieux classé qui
+correspond à l'équipe et aux capacités d'un agent réveillable au repos depuis
+`--take-idle` (30 min), par l'attribution gardée et un courrier lié au lot.
+Garde-fous :
+
+* **seulement si aucun lot ne l'attend** : ni lot ouvert, ni courrier non lu,
+  ni consigne en attente, ni lot de session encore ouvert ; et tant qu'un lot
+  du projet attend un preneur, aucune amélioration n'est prise ;
+* **jamais un geste irréversible ou de production** : le courrier de prise
+  l'interdit (déploiement, fusion, suppression de données, serveur de
+  production, dépense engagée) ; l'agent le propose à un humain ;
+* forfaits d'abord ; le token seulement avec `--take-paid`, jamais pendant
+  `balance_low` ; rien sous un plafond atteint ni sur un hôte sous pression,
+  sur batterie faible ou non prêt ; au plus `--take-max-per-hour` (2) prises
+  par heure glissante pour tout le mesh.
+
+Quand des agents sont au repos et que la file est vide (et qu'aucun lot du
+projet n'attend), l'alerte `backlog_empty` invite l'humain responsable à la
+remplir.
