@@ -270,6 +270,10 @@ class AgentWorker(threading.Thread):
         self.session_tokens = 0.0
         self.last_turn_seconds = 0.0
         self.last_output = ""
+        #: plafond de contexte (L60) : jetons d'entrée relus (cache compris) par
+        #: le dernier tour inscrit au grand livre, et sa session
+        self.last_turn_reread = 0
+        self.last_turn_reread_session: str | None = None
         #: `ameesh restart` (L26) : arrêt du tour en cours, puis session neuve
         self.restarting = threading.Event()
         #: comptes multiples (L30, 0027) : compte choisi pour le prochain tour, et
@@ -749,6 +753,7 @@ class AgentWorker(threading.Thread):
         self.resume_summary = ""
         self.session_turns = 0
         self.session_tokens = 0.0
+        self.last_turn_reread = 0
         self.nudged = False
         self.agent = registry.get(self.db, self.name) or self.agent
         log_async("[%s] redémarrage appliqué : session oubliée, brief en tête" % self.name)
@@ -779,6 +784,34 @@ class AgentWorker(threading.Thread):
         return (self.session_tokens >= self.runner.session_max_tokens
                 or self.last_turn_seconds >= self.runner.session_max_turn_seconds)
 
+    def context_max_tokens(self) -> int:
+        """Plafond de contexte effectif (L60) : réglage de l'agent
+        (`ameesh set context_max_tokens=…`), sinon défaut de l'exécuteur
+        (`AMEESH_CONTEXT_MAX_TOKENS`). 0 = désactivé."""
+        from .exploitation import effective_context_max
+        return effective_context_max(self.cfg, self.agent)
+
+    def context_rotation_due(self) -> bool:
+        """Le dernier tour a-t-il relu plus que le plafond de contexte ? (L60)
+
+        La mesure est celle de l'alerte `session_too_big` : entrée + entrée
+        relue en cache du dernier tour inscrit au grand livre. Chaque étape
+        d'un tour relit tout le contexte : une session qui grossit coûte de
+        plus en plus cher à chaque tour, et l'alerte seule n'y changeait rien.
+        Ni minimum de tours, ni rotation pendant un tour ; la politique
+        `jamais` s'en dispense ; il faut une session courante, et que le
+        relevé soit bien celui de cette session.
+        """
+        if self.proc is not None or self.session_policy() == "jamais":
+            return False
+        plafond = self.context_max_tokens()
+        if plafond <= 0 or self.last_turn_reread < plafond:
+            return False
+        session = self.current_session()
+        if not session:
+            return False
+        return self.last_turn_reread_session in (None, session)
+
     def _session_history(self, session_id: str | None, resume: str) -> None:
         """Garde l'ancien id de session et son résumé (audit, 0018)."""
         entry = {
@@ -800,6 +833,10 @@ class AgentWorker(threading.Thread):
         session est oubliée : le prochain tour repart d'une session neuve,
         préfixé par le résumé. Ne se déclenche jamais pendant un tour.
         """
+        if self.context_rotation_due():
+            return self._rotate("plafond de contexte : %d jetons relus au dernier tour "
+                                "(plafond %d)" % (self.last_turn_reread,
+                                                  self.context_max_tokens()))
         if not self.rotation_due():
             return False
         return self._rotate("tours=%d, tokens=%.0f, dernier tour=%.0fs" % (
@@ -845,6 +882,8 @@ class AgentWorker(threading.Thread):
         self.agent = registry.get(self.db, self.name) or self.agent
         self.session_turns = 0
         self.session_tokens = 0.0
+        self.last_turn_reread = 0
+        self.last_turn_reread_session = None
         self._fil_note(
             "Rotation de session (%s) : l'ancien id (%s) est conservé dans "
             "`session-history.jsonl` ; la session neuve repart du résumé ci-dessous.\n\n%s"
@@ -1261,12 +1300,21 @@ class AgentWorker(threading.Thread):
             annonce = self._annonce_des_evenements(debut)
             if annonce:
                 modele = annonce
-            book.record(self.name, start=debut,
-                        turn=travail.get("turn") or None,
-                        session=travail.get("session") or None,
-                        # `""` = modèle inconnu : tarif le plus cher (fail-closed),
-                        # jamais un repli sur un état local mutable.
-                        model=modele)
+            # Clé du marqueur (L60) : la même pour l'écriture de fin de tour et
+            # pour sa réparation, qui ne double donc plus la ligne.
+            cree = travail.get("created_ts")
+            cle = ("%s:%d:%.6f" % (self.name, debut, float(cree))
+                   if cree is not None else None)
+            usage = book.record(self.name, start=debut, key=cle,
+                                turn=travail.get("turn") or None,
+                                session=travail.get("session") or None,
+                                # `""` = modèle inconnu : tarif le plus cher
+                                # (fail-closed), jamais un repli sur un état
+                                # local mutable.
+                                model=modele)
+            # Mesure du plafond de contexte (L60), lue sur la ligne écrite.
+            self.last_turn_reread = usage.reread_tokens
+            self.last_turn_reread_session = usage.session
             registry.pending_spend_clear(self.db, self.name)
             self._annonce_ram = ""
             self._compta_en_echec = False
@@ -1703,6 +1751,12 @@ class AgentWorker(threading.Thread):
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
         model = self.agent.get("model") or self._state_read("model")
+        if not model and adapter.spec.model_file and adapter.spec.defaults.get("model"):
+            # Modèle livré par fichier (DeepSeek, L60) : sans réglage, le défaut
+            # du descripteur est passé explicitement. Le modèle du tour est
+            # alors connu (grand livre au bon tarif, jamais « inconnu ») au
+            # lieu de dépendre du profil local du harnais.
+            model = adapter.spec.defaults["model"]
         effort = self._state_read("effort") or self.agent.get("effort") or ""
         # Tier (L26) : passé par le descripteur du harnais (Codex :
         # `service_tier`) ; sans effet sur un harnais qui n'en déclare pas.
@@ -1873,8 +1927,10 @@ class AgentWorker(threading.Thread):
                         self.last_output = (self.last_output + "\n" + text)[-4000:]
                     usage = parsed.get("usage")
                     if isinstance(usage, dict):
-                        self.session_tokens += float(usage.get("input_tokens") or 0) \
-                            + float(usage.get("output_tokens") or 0)
+                        # Clés de chaque harnais normalisées (L60 : l'usage
+                        # par étape de DeepSeek, `inputTokens`, comptait zéro).
+                        entree, _cache, sortie = adapters.usage_tokens(usage)
+                        self.session_tokens += float(entree + sortie)
                     if parsed.get("cost") is not None:
                         cost = parsed["cost"]
                     if parsed.get("error"):

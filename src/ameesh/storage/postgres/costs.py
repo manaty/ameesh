@@ -39,30 +39,33 @@ class TurnCosts(interface.TurnCosts):
 
     def insert(self, *, agent, harness, turn, model, session, usd, input_tokens,
                cached_input_tokens, output_tokens, cum_usd, cum_input_tokens,
-               cum_cached_input_tokens, cum_output_tokens, account=None) -> None:
+               cum_cached_input_tokens, cum_output_tokens, account=None,
+               spend_key=None) -> bool:
+        cols = ["agent", "harness", "turn", "model", "session", "usd",
+                "input_tokens", "cached_input_tokens", "output_tokens",
+                "cum_usd", "cum_input_tokens", "cum_cached_input_tokens",
+                "cum_output_tokens"]
+        values: list = [agent, harness, turn, model, session, usd, input_tokens,
+                        cached_input_tokens, output_tokens, cum_usd, cum_input_tokens,
+                        cum_cached_input_tokens, cum_output_tokens]
         if account is not None:
             # L30 (migration 0028) : la colonne n'est écrite que si un compte est
             # nommé — un hôte sans comptes déclarés n'en dépend pas.
-            self.db.execute(
-                "insert into turn_costs (agent, harness, turn, model, session, usd,"
-                " input_tokens, cached_input_tokens, output_tokens,"
-                " cum_usd, cum_input_tokens, cum_cached_input_tokens, cum_output_tokens,"
-                " account)"
-                " values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (agent, harness, turn, model, session,
-                 usd, input_tokens, cached_input_tokens,
-                 output_tokens, cum_usd, cum_input_tokens, cum_cached_input_tokens,
-                 cum_output_tokens, account))
-            return
-        self.db.execute(
-            "insert into turn_costs (agent, harness, turn, model, session, usd,"
-            " input_tokens, cached_input_tokens, output_tokens,"
-            " cum_usd, cum_input_tokens, cum_cached_input_tokens, cum_output_tokens)"
-            " values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (agent, harness, turn, model, session,
-             usd, input_tokens, cached_input_tokens,
-             output_tokens, cum_usd, cum_input_tokens, cum_cached_input_tokens,
-             cum_output_tokens))
+            cols.append("account")
+            values.append(account)
+        suffix = ""
+        if spend_key is not None:
+            # L60 (migration 0041) : un marqueur comptable n'écrit qu'une ligne,
+            # même rejoué après une écriture dont l'effacement n'a pas suivi.
+            cols.append("spend_key")
+            values.append(spend_key)
+            suffix = " on conflict (spend_key) do nothing"
+        sql = ("insert into turn_costs (" + ", ".join(cols) + ") values ("
+               + ", ".join(["%s"] * len(cols)) + ")")
+        if not suffix:
+            self.db.execute(sql, tuple(values))
+            return True
+        return bool(self.db.query(sql + suffix + " returning id", tuple(values)))
 
     def spent(self, seconds, *, agent, harnesses, account=None) -> float:
         clauses = ["recorded_at >= now() - make_interval(secs => %s)"]

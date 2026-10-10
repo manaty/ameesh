@@ -311,7 +311,14 @@ test (trois messages → trois notifications) a attrapé le bug.
   tour de résumé est joué dans la session, le résumé est écrit dans le fil
   (R12), l'ancien id de session est conservé dans
   `<état>/<agent>/session-history.jsonl`, puis la session est oubliée : le tour
-  suivant ouvre une session neuve préfixée par le résumé.
+  suivant ouvre une session neuve préfixée par le résumé. La taille est lue
+  dans l'usage du flux de chaque harnais (clés normalisées par
+  `adapters.usage_tokens` ; DeepSeek publie un usage par étape). **Plafond de
+  contexte (L60)** : si le dernier tour a relu plus de
+  `AMEESH_CONTEXT_MAX_TOKENS` jetons (défaut 15 M, entrée + cache, réglable par
+  agent avec `ameesh set <agent> context_max_tokens=…`), la même rotation a
+  lieu avant le tour suivant, sans minimum de tours (voir
+  [EXPLOITATION.md](EXPLOITATION.md#plafond-de-contexte-l60)).
 * **Dossier de travail déplacé (0018)** : à l'inscription, l'identité git du
   dossier (dépôt commun + branche) est écrite dans
   `<état>/<agent>/worktree.json`. Si le cwd a disparu, un candidat **unique**
@@ -457,6 +464,9 @@ les sessions réelles.
   la **source du tour** : le modèle annoncé par le flux du harnais, sinon celui
   figé au lancement dans le marqueur ; s'il est inconnu, on facture le tarif le
   plus cher connu de la famille (`deepseek-pro` pour DeepSeek), jamais le défaut.
+  DeepSeek n'annonce pas son modèle dans le flux : sans réglage, l'exécuteur
+  lui passe le modèle par défaut du descripteur (L60), qui devient le modèle
+  figé du tour.
   Avant chaque tour, la garde interroge `CostBook.over` : plafond horaire
   glissant de l'usage **payé au token** (`AMEESH_BUDGET_USD_PER_HOUR`, défaut
   10 $/h ; le forfait Claude/Codex n'entre pas dans cette somme) et garde de

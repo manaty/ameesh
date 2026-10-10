@@ -170,6 +170,17 @@ class TurnUsage:
             "output_tokens": int(self.output_tokens),
         }
 
+    @property
+    def reread_tokens(self) -> int:
+        """Jetons d'entrée **relus** par le tour, cache compris (L60).
+
+        C'est la mesure du plafond de contexte : chaque étape d'un tour relit
+        tout le contexte de la session. Codex compte déjà l'entrée en cache
+        dans `input_tokens` ; les autres harnais la comptent à part."""
+        if self.harness == "codex":
+            return max(int(self.input_tokens), int(self.cached_input_tokens))
+        return int(self.input_tokens) + int(self.cached_input_tokens)
+
 
 def load_prices(path: str | None = None) -> dict:
     """Le barème : les défauts, corrigés par le fichier JSON s'il existe.
@@ -647,7 +658,8 @@ class CostBook:
                          input_tokens=tin, cached_input_tokens=tcache, output_tokens=tout)
 
     def record(self, agent: str, start: int = 0, turn: str | None = None,
-               session: str | None = None, model: str | None = None) -> TurnUsage:
+               session: str | None = None, model: str | None = None,
+               key: str | None = None) -> TurnUsage:
         """Compte le tour qui vient de finir : **une** ligne `turn_costs`.
 
         La ligne porte le cumul brut du harnais, qui sert de repère au tour
@@ -656,6 +668,10 @@ class CostBook:
 
         La base est donc obligatoire ici : sans elle, il n'y a pas de grand livre,
         et un repère en fichier serait exactement le défaut que ce lot corrige.
+
+        `key` (L60) : la clé du marqueur comptable du tour. Un marqueur rejoué
+        après une écriture réussie mais pas effacée (exécuteur arrêté entre les
+        deux) ne réécrit pas la ligne : avant L60, il la doublait.
         """
         if self.db is None:
             raise CostError("record sans base : le repère de cumul vit dans turn_costs")
@@ -679,6 +695,7 @@ class CostBook:
                 cum_input = int(last.get("input_tokens", 0))
                 cum_cached = int(last.get("cached_input_tokens", 0))
                 cum_out = int(last.get("output_tokens", 0))
+        usage = replace(usage, session=session_id or None)
         row = usage.row()
         row["turn"] = turn or usage.turn
         row["session"] = session_id
@@ -688,7 +705,7 @@ class CostBook:
             input_tokens=row["input_tokens"], cached_input_tokens=row["cached_input_tokens"],
             output_tokens=row["output_tokens"], cum_usd=cum_usd, cum_input_tokens=cum_input,
             cum_cached_input_tokens=cum_cached, cum_output_tokens=cum_out,
-            account=account)
+            account=account, spend_key=key)
         return usage
 
     def account_at(self, agent: str, start: int, harness: str | None = None) -> str | None:
@@ -875,10 +892,14 @@ def _find_rate_limits(node, depth: int = 0):
 
 
 def _last_session(events: Iterable[dict]) -> str:
-    """L'identifiant de session/fil le plus récent du flux, s'il y en a un."""
+    """L'identifiant de session/fil le plus récent du flux, s'il y en a un.
+
+    `sessionId` est la clé du harnais DeepSeek (`{"type": "session",
+    "sessionId": …}`) et du pont ACP : sans elle, les tours DeepSeek étaient
+    inscrits au grand livre sans session (L60)."""
     found = None
     for event in events:
-        for key in ("session_id", "thread_id"):
+        for key in ("session_id", "thread_id", "sessionId"):
             value = event.get(key)
             if isinstance(value, str) and value:
                 found = value
