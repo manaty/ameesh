@@ -609,6 +609,56 @@ class Leases(interface.Leases):
         )
         return bool(rows)
 
+    def hold_note(self, name, owner, epoch, status_text) -> bool:
+        """Texte d'attente (L31b) : même verrou et mêmes recontrôles que
+        `pause`, mais le statut reste ce qu'il est (`idle` ou `queued`)."""
+        rows = self.db.query(
+            """
+            WITH verrou AS (
+                SELECT name, status, status_text, lease_owner, lease_epoch,
+                       lease_expires_at
+                  FROM agent_registry WHERE name = %s FOR UPDATE
+            )
+            UPDATE agent_registry AS r
+               SET status_text = %s, updated_at = now()
+              FROM verrou
+             WHERE r.name = verrou.name
+               AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+               AND verrou.lease_expires_at > clock_timestamp()
+               AND verrou.status IN ('idle', 'queued')
+            RETURNING r.name
+            """,
+            (name, status_text, owner, int(epoch)),
+        )
+        return bool(rows)
+
+    def release_hold(self, name, owner, epoch, status_text, restore="") -> bool:
+        """Levée (L31b) : seulement notre texte, sous notre bail vivant ; une
+        pause `blocked` repasse `queued` ou `idle` selon la consigne."""
+        rows = self.db.query(
+            """
+            WITH verrou AS (
+                SELECT name, status, status_text, lease_owner, lease_epoch,
+                       lease_expires_at
+                  FROM agent_registry WHERE name = %s FOR UPDATE
+            )
+            UPDATE agent_registry AS r
+               SET status = CASE WHEN verrou.status <> 'blocked' THEN r.status
+                                 WHEN r.pending_prompt IS NULL THEN 'idle'
+                                 ELSE 'queued' END,
+                   status_text = %s, updated_at = now()
+              FROM verrou
+             WHERE r.name = verrou.name
+               AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
+               AND verrou.lease_expires_at > clock_timestamp()
+               AND verrou.status IN ('idle', 'queued', 'blocked')
+               AND coalesce(verrou.status_text, '') = %s
+            RETURNING r.name
+            """,
+            (name, restore or "", owner, int(epoch), status_text),
+        )
+        return bool(rows)
+
     def pause(self, name, owner, epoch, status_text) -> bool:
         """Pause `blocked` fencée par un bail vivant (L31, 0028) : verrou
         d'abord, puis recontrôle que le bail est toujours le nôtre, vivant, et

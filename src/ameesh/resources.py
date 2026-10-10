@@ -609,6 +609,13 @@ def fmt_value(key: str, value) -> str:
     return "%d B" % number
 
 
+def describe(found: list[dict]) -> str:
+    """Les franchissements en clair : « swap utilisé 17.5 GiB (seuil 16.0 GiB) »."""
+    return " ; ".join("%s %s (seuil %s)" % (b["label"], fmt_value(b["key"], b["value"]),
+                                            fmt_value(b["key"], b["limit"]))
+                      for b in found or [])
+
+
 def history(db: Db, host: str, limit: int = 10) -> list[dict]:
     return storage.of(db).hosts.history(host, limit)
 
