@@ -2501,17 +2501,20 @@ class AgentWorker(threading.Thread):
             return False
         # L73 : dossier temporaire de l'agent et caches gérés ; worktrees et
         # /tmp relevés avant le tour. Jamais bloquant : un ménage impossible
-        # laisse le tour partir avec l'environnement d'origine.
+        # laisse le tour partir avec l'environnement d'origine. Pas sur un
+        # exécuteur médié : le journal du ménage (`housekeeping.*`) n'est pas
+        # au contrat 1.1, et le dossier de travail est effacé en fin de bail.
         menage_tour = None
-        try:
-            from . import menage as menage_mod
-            menage_tour = menage_mod.Turn.begin(
-                self.cfg, self.runner.housekeeping_policy(), self.name, cwd,
-                new_session=not session, base_env=env)
-            env.update(menage_tour.env)
-        except Exception as exc:
-            log("[%s] ménage avant le tour impossible (%s)" % (self.name, exc))
-            menage_tour = None
+        if not getattr(self.runner, "mediated", False):
+            try:
+                from . import menage as menage_mod
+                menage_tour = menage_mod.Turn.begin(
+                    self.cfg, self.runner.housekeeping_policy(), self.name, cwd,
+                    new_session=not session, base_env=env)
+                env.update(menage_tour.env)
+            except Exception as exc:
+                log("[%s] ménage avant le tour impossible (%s)" % (self.name, exc))
+                menage_tour = None
         events_path = self._path("events.jsonl")
         stderr_path = self._path("stderr.log")
         started = time.time()
@@ -3701,8 +3704,8 @@ class Runner:
         """Passage périodique du ménage (`AMEESH_HOUSEKEEPING_INTERVAL`, défaut
         600 s ; 0 = aucun). En mode `--once`, aucun passage périodique."""
         interval = max(0.0, float(getattr(self.cfg, "housekeeping_interval", 0) or 0))
-        if interval <= 0 or self.once:
-            return
+        if interval <= 0 or self.once or getattr(self, "mediated", False):
+            return  # exécuteur médié : pas de base, pas de ménage local (contrat 1.1)
 
         def boucle() -> None:
             while not self.stop.wait(max(30.0, interval)):

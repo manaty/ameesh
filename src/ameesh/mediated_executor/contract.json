@@ -3631,7 +3631,7 @@
   }
  ],
  "refusees": {
-  "total_interface": 221,
+  "total_interface": 243,
   "raisons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3645,6 +3645,7 @@
    "ephemerals": "pas de création d'agent depuis l'appareil",
    "grants": "autorité (0012)",
    "hosts": "hors du sous-ensemble de l'exécuteur médié",
+   "housekeeping": "ménage de l'hôte (L73) : serveur seulement, l'appareil efface son dossier en fin de bail",
    "keys": "hors du sous-ensemble de l'exécuteur médié",
    "leases": "hors du sous-ensemble de l'exécuteur médié",
    "mailbox": "hors du sous-ensemble de l'exécuteur médié",
@@ -3654,8 +3655,10 @@
    "placements": "placement : serveur seulement",
    "progress": "vue des humains (/api/v1)",
    "projects": "vue des humains (/api/v1)",
+   "roadmap": "feuille de route (L96) : serveur seulement",
    "session_bindings": "session toujours liée au bail : la recherche de liaison rend vide",
    "threads": "hors du sous-ensemble de l'exécuteur médié",
+   "turn_costs": "hors du sous-ensemble de l'exécuteur médié",
    "turn_resources": "hors du sous-ensemble de l'exécuteur médié",
    "visibility": "visibilité 0029 : serveur seulement",
    "wakeups": "hors du sous-ensemble de l'exécuteur médié",
@@ -3771,7 +3774,17 @@
     "revoke"
    ],
    "hosts": [
-    "history"
+    "history",
+    "usage"
+   ],
+   "housekeeping": [
+    "last_measure",
+    "log",
+    "recent",
+    "register_worktree",
+    "set_worktree_status",
+    "summary",
+    "worktrees"
    ],
    "keys": [
     "register",
@@ -3795,7 +3808,9 @@
    ],
    "operations": [
     "adopt",
+    "assigners",
     "gauge_history",
+    "latest_gauges",
     "listing",
     "open_lots_activity",
     "recent_balance",
@@ -3829,6 +3844,16 @@
    "projects": [
     "board"
    ],
+   "roadmap": [
+    "add_commitment",
+    "commitments",
+    "item_plans",
+    "items",
+    "plan_item",
+    "plan_package",
+    "record_proposal",
+    "set_commitment"
+   ],
    "session_bindings": [
     "active",
     "bind",
@@ -3840,7 +3865,13 @@
    "threads": [
     "indexed"
    ],
+   "turn_costs": [
+    "correct",
+    "ledger",
+    "spent_between"
+   ],
    "turn_resources": [
+    "get",
     "mark_orphan",
     "open_by_agent",
     "orphans",

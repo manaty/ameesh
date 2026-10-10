@@ -63,9 +63,17 @@ Comptes : 62 opérations, dont 24 lectures et 38 écritures. 52 passent par
 lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
 servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (221
-opérations) est classée, admise ou refusée. Toute opération ajoutée à
+signature et les mêmes types. Il vérifie aussi que l'interface entière (243
+opérations depuis la 1.6.x) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
+
+Les 22 opérations ajoutées à l'interface par la 1.6.x sont refusées à
+l'appareil : `housekeeping.*` (ménage, L73), `roadmap.*` (feuille de route,
+L96), `turn_costs.correct`, `ledger`, `spent_between` (grand livre, L95),
+`operations.assigners`, `latest_gauges` (sous-utilisation, L94),
+`hosts.usage` et `turn_resources.get`. Un exécuteur médié ne fait ni ménage
+local ni passage périodique de ménage : son dossier de travail est effacé en
+fin de bail.
 
 ## Requête et réponse
 
