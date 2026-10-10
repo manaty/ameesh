@@ -56,6 +56,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 
+from . import platform
 from . import resources as resources_mod
 from . import storage
 
@@ -627,22 +628,15 @@ def owns_worktree(path: str, cwd: str | None, other_cwds) -> bool:
     return True
 
 
-def worktree_in_use(path: str, proc_root: str = "/proc") -> bool:
-    """Un processus de l'hôte a-t-il son dossier courant dans ce worktree ?
-    (Linux ; faux si `/proc` est illisible.)"""
-    target = _real(path)
+def worktree_in_use(path: str) -> bool:
+    """Un processus de l'hôte travaille-t-il dans ce worktree (dossier courant
+    ou fichier ouvert dedans) ? Lu par la couche plateforme (L63). Si l'OS ne
+    permet pas de le savoir, la réponse est OUI (fail-closed) : le worktree
+    attend plutôt que d'être retiré sous les pieds d'un agent."""
     try:
-        pids = [p for p in os.listdir(proc_root) if p.isdigit()]
-    except OSError:
-        return False
-    for pid in pids:
-        try:
-            where = os.readlink(os.path.join(proc_root, pid, "cwd"))
-        except OSError:
-            continue
-        if _under(where.removesuffix(" (deleted)"), target):
-            return True
-    return False
+        return bool(platform.holders(_real(path)))
+    except platform.NotAvailable:
+        return True
 
 
 def remove_worktree(path: str, repo: str) -> tuple[bool, str]:

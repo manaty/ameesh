@@ -358,8 +358,12 @@ def for_hook(cfg: Config, db, harness: str, session_id: str,
 def by_ancestry(cfg: Config, db, chain: Iterable[int] | None = None) -> dict | None:
     """La liaison (avec PID) dont le harnais est l'ancêtre le plus proche de ce
     processus — pour `whoami`, `send`, `inbox` lancés DANS une session liée
-    (ils ne reçoivent pas l'identifiant de session). None sinon."""
-    chain = list(ancestors() if chain is None else chain)
+    (ils ne reçoivent pas l'identifiant de session). None sinon, et None si
+    l'OS ne permet pas de remonter l'ascendance (L63, fail-closed)."""
+    try:
+        chain = list(ancestors() if chain is None else chain)
+    except platform.NotAvailable:
+        return None
     if not chain:
         return None
     rows = [r for r in storage.of(db).session_bindings.with_pids(cfg.host, chain)
