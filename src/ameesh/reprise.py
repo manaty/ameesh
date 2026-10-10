@@ -26,7 +26,7 @@ import re
 import sys
 import time
 
-from . import accounts, account_turn, fil, identity, mail, registry, stagnation, storage
+from . import accounts, account_turn, fil, identity, mail, platform, registry, stagnation, storage
 from . import config as config_mod
 from . import cost as cost_mod
 from . import db as db_mod
@@ -142,65 +142,22 @@ def locate(cfg: Config, harness: str, session_id: str,
     return None, None, searched
 
 
-def _ancestors() -> set[int]:
-    """Ce processus et ses ascendants : leur ligne de commande porte l'id de
-    session passé à `ameesh adopt`, ils ne « tiennent » pas la session."""
-    out: set[int] = set()
-    pid = os.getpid()
-    while pid > 1 and pid not in out:
-        out.add(pid)
-        try:
-            with open("/proc/%d/stat" % pid, encoding="utf-8", errors="replace") as fh:
-                stat = fh.read()
-            pid = int(stat.rsplit(")", 1)[1].split()[1])
-        except (OSError, ValueError, IndexError):
-            break
-    return out
+def holders(path: str, session_id: str) -> list[dict]:
+    """Les processus qui tiennent la session : fichier ouvert (ou dossier
+    ouvert ou courant), ou id de session sur la ligne de commande (`codex
+    resume <id>`, `claude --resume <id>`) — hors ce processus et ses
+    ascendants, dont la ligne de commande porte l'id passé à `ameesh adopt`.
+    Par la couche plateforme (L63) ; les processus illisibles (autre
+    utilisateur, disparus) sont ignorés.
 
-
-def holders(path: str, session_id: str, *, proc: str = "/proc") -> list[dict]:
-    """Les processus qui tiennent la session : fichier (ou dossier) ouvert, ou
-    id de session sur la ligne de commande (`codex resume <id>`, `claude
-    --resume <id>`). Parcours de `/proc/*/fd` ; les processus illisibles
-    (autre utilisateur, disparus) sont ignorés.
+    Lève `platform.NotAvailable` si l'OS ne permet pas de le vérifier :
+    jamais de liste vide qui voudrait dire « personne » sans contrôle.
 
     Limite connue : Claude Code n'ouvre son journal que le temps d'une
     écriture ; une session interactive démarrée sans `--resume` n'est donc vue
     que si elle écrit au moment du contrôle.
     """
-    real = os.path.realpath(path)
-    is_dir = os.path.isdir(real)
-    mine = _ancestors()
-    found = []
-    try:
-        pids = [p for p in os.listdir(proc) if p.isdigit()]
-    except OSError:
-        return []
-    for pid in pids:
-        hit = ""
-        fd_dir = os.path.join(proc, pid, "fd")
-        try:
-            fds = os.listdir(fd_dir)
-        except OSError:
-            fds = []
-        for fd in fds:
-            try:
-                target = os.readlink(os.path.join(fd_dir, fd))
-            except OSError:
-                continue
-            if target == real or (is_dir and target.startswith(real + os.sep)):
-                hit = "fichier ouvert"
-                break
-        try:
-            with open(os.path.join(proc, pid, "cmdline"), "rb") as fh:
-                argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
-        except OSError:
-            argv = []
-        if not hit and int(pid) not in mine and any(session_id in arg for arg in argv[1:]):
-            hit = "id de session sur la ligne de commande"
-        if hit:
-            found.append({"pid": int(pid), "why": hit, "cmd": " ".join(argv)[:160]})
-    return found
+    return platform.holders(path, session_id, exclude=platform.ancestry())
 
 
 def session_cwd(harness: str, path: str) -> str | None:
@@ -485,7 +442,23 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
                    " (aucun compte déclaré : ajoutez le dossier du harnais dans `accounts` "
                    "de la configuration de l'hôte, ou posez sa variable CODEX_HOME / "
                    "CLAUDE_CONFIG_DIR / DSH_HOME)"))
-    tenants = holders(path, session_id) if path else []
+    # L63 : si l'OS ne permet pas de vérifier que la session est fermée,
+    # refus (fail-closed), sauf --force — journalisé comme un forçage
+    unverified = ""
+    try:
+        tenants = holders(path, session_id) if path else []
+    except platform.NotAvailable as exc:
+        tenants, unverified = [], str(exc)
+    if unverified and not force:
+        raise RepriseError(
+            "impossible de vérifier que la session %s est fermée sur cet hôte (%s) : "
+            "adoption refusée (ou --force, à vos risques : si elle est encore ouverte, "
+            "deux harnais écriraient la même session)" % (session_id, unverified))
+    if unverified:
+        avert = ("--force : session %s adoptée sans vérifier qu'elle est fermée (%s)"
+                 % (session_id, unverified))
+        warn(avert)
+        constats.append(avert)
     if tenants and not force:
         raise RepriseError(
             "la session %s est encore ouverte (%s) : fermez d'abord la session interactive "
@@ -563,10 +536,11 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
                        "".join("\n- %s" % c for c in constats)),
                project=_project(cfg, after),
                meta={"audit": "adopt", "session": session_id, "account": compte or "",
-                     "harness": harness, "forced": bool(tenants),
+                     "harness": harness, "forced": bool(tenants or unverified),
                      "previous_session": result.get("previous_session") or ""})
     return {"agent": name, "session": session_id, "harness": harness, "account": compte,
-            "path": path, "cwd": effectif, "forced": bool(tenants), "wakeable": ok,
+            "path": path, "cwd": effectif, "forced": bool(tenants or unverified),
+            "wakeable": ok,
             "previous_session": result.get("previous_session"),
             "previous_mode": result.get("previous_mode"), "notes": constats}
 
@@ -843,7 +817,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="première consigne sous l'exécuteur (défaut : reprise standard)")
     p_ad.add_argument("--chantier", default=None, help="chantier (agent nouveau)")
     p_ad.add_argument("--force", action="store_true",
-                      help="adopter même si un processus tient encore la session (journalisé)")
+                      help="adopter même si un processus tient encore la session, ou si "
+                           "cet hôte ne permet pas de le vérifier (journalisé)")
     p_ad.add_argument("--json", action="store_true")
     p_ad.set_defaults(func=cmd_adopt)
 

@@ -23,6 +23,11 @@ license-files = ["LICENSE"]
 dependencies = [
     "psycopg[binary]>=3.1; platform_machine == 'x86_64' or platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'arm64'",
     "psycopg>=3.1; platform_machine != 'x86_64' and platform_machine != 'AMD64' and platform_machine != 'aarch64' and platform_machine != 'arm64'",
+    # L63 : la couche plateforme (`ameesh.platform`) lit processus, heure de
+    # démarrage et mesures de l'hôte par psutil (roues Linux, macOS, Windows).
+    # Sous Linux, un repli par /proc reste en place si psutil manque ; ailleurs,
+    # sans psutil, les garanties refusent (NotAvailable) au lieu de passer.
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]

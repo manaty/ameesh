@@ -15,8 +15,12 @@ liaison EXPLICITE, en base :
 * `--pid` (recommandé) : le PID du harnais. Le hook n'accepte alors la liaison
   que si ce PID est un ancêtre de son propre processus — un identifiant de
   session recopié dans un autre processus ne donne rien. L46 : l'heure de
-  démarrage du processus (champ 22 de /proc/<pid>/stat) est enregistrée avec
-  le PID et recontrôlée : un PID recyclé par un autre processus ne vaut rien ;
+  démarrage du processus est enregistrée avec le PID et recontrôlée : un PID
+  recyclé par un autre processus ne vaut rien. L63 : en secondes epoch
+  (`pid_started_at`, migration 0048) par la couche plateforme, sur tous les
+  OS ; l'ancienne valeur en tops d'horloge Linux (`pid_start`, 0036) reste
+  lue par conversion. Si l'OS ne donne ni l'ascendance ni l'heure de
+  démarrage, la liaison `--pid` est refusée : jamais de contrôle muet ;
 * refusée si l'agent détient un bail vivant (il est mené par l'exécuteur,
   qui lui remet son courrier dans la consigne de ses tours), ou si la session
   est déjà liée à un autre agent ;
@@ -35,7 +39,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from . import fil, registry, storage
+from . import fil, platform, registry, storage
 from .config import NAME_RE, Config
 
 #: harnais dont le hook passe un identifiant de session
@@ -44,10 +48,6 @@ HARNESSES = ("claude", "codex", "deepseek")
 #: un identifiant de session : imprimable, sans espace, 200 caractères au plus
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,199}$")
 
-#: profondeur maximale de l'ascendance remontée (comme le pont local)
-_MAX_DEPTH = 64
-
-
 class BindError(ValueError):
     """Liaison refusée : le message dit pourquoi (aucune écriture faite)."""
 
@@ -55,50 +55,47 @@ class BindError(ValueError):
 def ancestors(pid: int | None = None) -> list[int]:
     """L41 (0030) : l'ascendance du processus, du plus proche au plus lointain.
 
-    Inclut `pid` lui-même (par défaut le processus courant), puis remonte
-    `/proc/<pid>/status` (`PPid:`) jusqu'à init — comme `find_tty` et le pont
-    local `ameesh-session-mail-hook`. Liste vide hors Linux."""
-    out: list[int] = []
-    current = os.getpid() if pid is None else int(pid)
-    for _ in range(_MAX_DEPTH):
-        if current <= 1 or current in out:
-            break
-        out.append(current)
-        try:
-            with open("/proc/%d/status" % current, encoding="utf-8") as fh:
-                parent = next((int(line.split()[1]) for line in fh
-                               if line.startswith("PPid:")), 0)
-        except (OSError, ValueError, IndexError):
-            break
-        current = parent
-    return out
+    Inclut `pid` lui-même (par défaut le processus courant), puis ses
+    ascendants jusqu'à init, par la couche plateforme (L63). Lève
+    `platform.NotAvailable` si l'OS ne permet pas de la remonter."""
+    return platform.ancestry(pid)
 
 
-def pid_start(pid: int | None) -> int | None:
-    """L46 : l'heure de démarrage du processus `pid` (champ 22 de
-    /proc/<pid>/stat, en tops d'horloge depuis le démarrage de l'hôte), ou
-    None (processus absent, hors Linux). Avec le PID, elle identifie un
-    processus : un PID recyclé a une autre heure de démarrage."""
+def pid_started_at(pid: int | None) -> float | None:
+    """L46, L63 : l'heure de démarrage du processus `pid` en secondes epoch,
+    ou None (pas de PID, processus absent). Avec le PID, elle identifie un
+    processus : un PID recyclé a une autre heure de démarrage. Lève
+    `platform.NotAvailable` si l'OS ne la donne pas."""
     if not pid:
         return None
-    try:
-        with open("/proc/%d/stat" % int(pid), encoding="utf-8", errors="replace") as fh:
-            data = fh.read()
-        # le nom (champ 2) est entre parenthèses et peut contenir espaces et
-        # parenthèses : les champs suivants commencent après la DERNIÈRE « ) »
-        fields = data[data.rindex(")") + 2:].split()
-        return int(fields[22 - 3])
-    except (OSError, ValueError, IndexError):
-        return None
+    return platform.start_time(int(pid))
+
+
+def expected_start(row: dict) -> float | None:
+    """L'heure de démarrage enregistrée d'une liaison, en secondes epoch :
+    `pid_started_at` (L63), sinon l'ancienne `pid_start` (tops d'horloge
+    Linux, 0036) convertie. None : aucune heure enregistrée. Lève
+    `platform.NotAvailable` si l'ancienne valeur ne se convertit pas ici."""
+    if row.get("pid_started_at") is not None:
+        return float(row["pid_started_at"])
+    if row.get("pid_start") is not None:
+        return platform.ticks_to_epoch(int(row["pid_start"]))
+    return None
 
 
 def _same_process(row: dict) -> bool:
     """L46 : le PID lié est-il encore le MÊME processus ? Vrai sans heure de
-    démarrage enregistrée (liaison antérieure : contrôle du seul PID)."""
-    expected = row.get("pid_start")
-    if not row.get("pid") or expected is None:
+    démarrage enregistrée (liaison antérieure à L46 : contrôle du seul PID).
+    L63 : faux si l'OS ne permet pas de le vérifier (fail-closed)."""
+    if not row.get("pid"):
         return True
-    return pid_start(int(row["pid"])) == int(expected)
+    try:
+        expected = expected_start(row)
+        if expected is None:
+            return True
+        return platform.same_start(expected, pid_started_at(int(row["pid"])))
+    except platform.NotAvailable:
+        return False
 
 
 def check_harness(harness: str) -> str:
@@ -181,16 +178,22 @@ def bind(cfg: Config, db, agent: str, *, session_id: str, harness: str,
                         % (agent, EXECUTE_REFUSAL, agent))
     store = storage.of(db).session_bindings
     host = cfg.host
-    # L46 : l'heure de démarrage du PID lié, contrôlée par le hook avec le PID
-    start = pid_start(pid) if pid is not None else None
+    # L46 : l'heure de démarrage du PID lié, contrôlée par le hook avec le PID ;
+    # L63 : sans moyen de la lire sur cet OS, pas de liaison --pid (le hook ne
+    # pourrait rien vérifier)
+    try:
+        start = pid_started_at(pid) if pid is not None else None
+    except platform.NotAvailable as exc:
+        raise BindError("--pid %d invérifiable sur cet hôte (%s) : liaison refusée"
+                        % (pid, exc)) from None
     row = store.bind(host=host, harness=harness, session_id=session_id, agent=agent,
-                     pid=pid, created_by=by, pid_start=start)
+                     pid=pid, created_by=by, pid_started_at=start)
     status = "created"
     if row is None:
         current = store.active(host, harness, session_id)
         if current is None:  # révoquée entre-temps : on réessaie une fois
             row = store.bind(host=host, harness=harness, session_id=session_id,
-                             agent=agent, pid=pid, created_by=by, pid_start=start)
+                             agent=agent, pid=pid, created_by=by, pid_started_at=start)
             if row is None:
                 raise BindError("liaison concurrente de la session %s : réessayez"
                                 % session_id)
@@ -200,7 +203,8 @@ def bind(cfg: Config, db, agent: str, *, session_id: str, harness: str,
                             % (harness, session_id, current.get("agent"),
                                session_id, harness))
         elif pid is not None and (current.get("pid") != pid
-                                  or current.get("pid_start") != start):
+                                  or current.get("pid_start") is not None
+                                  or current.get("pid_started_at") != start):
             row = store.set_pid(int(current["id"]), pid, start) or current
             status = "updated"
         else:
@@ -337,7 +341,11 @@ def for_hook(cfg: Config, db, harness: str, session_id: str,
         return None, "session %s %s non liée (ameesh mail bind)" % (harness, session_id)
     pid = row.get("pid")
     if pid:
-        chain = list(ancestors() if chain is None else chain)
+        try:
+            chain = list(ancestors() if chain is None else chain)
+        except platform.NotAvailable as exc:
+            return row, ("ascendance du hook invérifiable sur cet hôte (%s) : liaison "
+                         "--pid sans effet" % exc)
         if int(pid) not in chain:
             return row, ("pid %s de la liaison absent de l'ascendance du hook "
                          "(session reprise ailleurs ? re-liez avec --pid)" % pid)
@@ -350,8 +358,12 @@ def for_hook(cfg: Config, db, harness: str, session_id: str,
 def by_ancestry(cfg: Config, db, chain: Iterable[int] | None = None) -> dict | None:
     """La liaison (avec PID) dont le harnais est l'ancêtre le plus proche de ce
     processus — pour `whoami`, `send`, `inbox` lancés DANS une session liée
-    (ils ne reçoivent pas l'identifiant de session). None sinon."""
-    chain = list(ancestors() if chain is None else chain)
+    (ils ne reçoivent pas l'identifiant de session). None sinon, et None si
+    l'OS ne permet pas de remonter l'ascendance (L63, fail-closed)."""
+    try:
+        chain = list(ancestors() if chain is None else chain)
+    except platform.NotAvailable:
+        return None
     if not chain:
         return None
     rows = [r for r in storage.of(db).session_bindings.with_pids(cfg.host, chain)

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from .. import interface
 
-_COLUMNS = ("id, session_id, harness, host, agent, pid, pid_start, created_by,"
+_COLUMNS = ("id, session_id, harness, host, agent, pid, pid_start, pid_started_at,"
+            " created_by,"
             " extract(epoch from created_at)::float8 as created_ts,"
             " extract(epoch from revoked_at)::float8 as revoked_ts")
 
@@ -24,23 +25,27 @@ class SessionBindings(interface.SessionBindings):
             (host, harness, session_id))
         return rows[0] if rows else None
 
+    # L63 : seule `pid_started_at` (secondes epoch) est écrite ; `pid_start`
+    # (tops d'horloge, 0036) est remise à NULL à chaque nouvelle écriture
     def bind(self, *, host, harness, session_id, agent, pid, created_by,
-             pid_start=None) -> dict | None:
+             pid_started_at=None) -> dict | None:
         rows = self.db.query(
-            "insert into session_bindings (session_id, harness, host, agent, pid, pid_start,"
-            " created_by) values (%%s, %%s, %%s, %%s, %%s, %%s, %%s)"
+            "insert into session_bindings (session_id, harness, host, agent, pid,"
+            " pid_started_at, created_by) values (%%s, %%s, %%s, %%s, %%s, %%s, %%s)"
             " on conflict (host, harness, session_id) where revoked_at is null do nothing"
             " returning %s" % _COLUMNS,
             (session_id, harness, host, agent, int(pid) if pid else None,
-             int(pid_start) if pid and pid_start is not None else None, created_by))
+             float(pid_started_at) if pid and pid_started_at is not None else None,
+             created_by))
         return rows[0] if rows else None
 
-    def set_pid(self, binding_id, pid, pid_start=None) -> dict | None:
+    def set_pid(self, binding_id, pid, pid_started_at=None) -> dict | None:
         rows = self.db.query(
-            "update session_bindings set pid = %%s, pid_start = %%s"
+            "update session_bindings set pid = %%s, pid_start = null, pid_started_at = %%s"
             " where id = %%s and revoked_at is null returning %s" % _COLUMNS,
             (int(pid) if pid else None,
-             int(pid_start) if pid and pid_start is not None else None, int(binding_id)))
+             float(pid_started_at) if pid and pid_started_at is not None else None,
+             int(binding_id)))
         return rows[0] if rows else None
 
     def revoke(self, host, harness, session_id) -> dict | None:

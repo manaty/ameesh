@@ -20,9 +20,8 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 
-from . import adapters, harnesses, registry
+from . import adapters, harnesses, platform, registry
 
 #: modèle d'unité d'exécuteur par agent (docs/BASCULE.md, deploy/systemd)
 RUNNER_TEMPLATE = "ameesh-runner-agent@%s.service"
@@ -41,7 +40,7 @@ def _systemctl(*args: str) -> str | None:
     if choisi == "":
         return None
     binary = choisi or shutil.which("systemctl")
-    if not binary or not sys.platform.startswith("linux"):
+    if not binary or not platform.is_linux():
         return None
     try:
         proc = subprocess.run([binary, "--user", *args], capture_output=True, text=True,

@@ -18,6 +18,7 @@ import unittest
 from unittest import mock
 
 from ameesh import accounts, adapters, canon, cost, harnesses
+from ameesh import platform as os_layer
 
 from .support import FAKEBIN, child_env
 from .test_canon import fiche, write
@@ -240,7 +241,6 @@ class DescriptorTest(_Tmp):
         with self.assertRaises(harnesses.DescriptorError):
             harnesses._secure_read(os.path.join(lien, "gemini.json"), lien)
 
-    @unittest.skipUnless(os.path.isdir("/proc/self/fd"), "comptage des fd via /proc")
     def test_secure_read_ne_fuit_pas_de_descripteur(self):
         """Le dossier parent est refermé sur chaque lecture réussie (codex2)."""
         path = self.write_host("gemini")
@@ -248,10 +248,13 @@ class DescriptorTest(_Tmp):
             octets = fh.read()
         for _ in range(3):  # chauffe : rien ne doit rester ouvert
             harnesses._secure_read(path, self.hosts)
-        avant = len(os.listdir("/proc/self/fd"))
+        try:  # L63 : par la couche plateforme (psutil, ou /proc en repli)
+            avant = os_layer.open_fd_count()
+        except os_layer.NotAvailable as exc:
+            self.skipTest(str(exc))
         for _ in range(20):
             self.assertEqual(harnesses._secure_read(path, self.hosts), octets)
-        apres = len(os.listdir("/proc/self/fd"))
+        apres = os_layer.open_fd_count()
         self.assertEqual(apres, avant, "descripteurs de dossiers non refermés")
 
     def test_type_non_regulier_refuse_sans_bloquer(self):
