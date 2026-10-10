@@ -10,6 +10,17 @@ pas modifiée : elle sert de retour arrière.
 Durée d'arrêt des personas déplacées : 15 à 30 minutes. Aucune n'est coupée
 en plein tour.
 
+## En un script
+
+`basculer-mesh.sh` enchaîne les points 1 à 5 depuis le poste, une étape à la
+fois (`verifier`, `preparer`, `arreter`, `copier`, `rebrancher`, `demarrer`,
+`etat`). Ses paramètres (organisation, dépôts, dossiers, personas déplacées)
+sont dans `~/.config/ameesh/bascule.env`, hors du dépôt ; l'en-tête du script
+les décrit. La scission s'y fait **sur le poste** : la part des autres
+organisations ne quitte jamais le poste, seule celle de l'organisation va sur
+la VM. Les sessions interactives (`PERSONAS_ATTACHEES`) ne sont pas relancées :
+leur humain les rattache (`ameesh attach`) une fois la bascule faite.
+
 ## 0. Préalables
 
 - La VM de l'organisation installée (`README.md`), le poste dans son WireGuard
