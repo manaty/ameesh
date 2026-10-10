@@ -61,7 +61,9 @@ try:  # facultatif : jamais requis
 except Exception:  # pragma: no cover - dépend de l'environnement
     _yaml = None
 
-PROFILE_TYPES = ("Agent", "Host", "Placement", "Member", "WorkPackage")
+#: `Persona` (L51, 0029/0032) se lit comme `Agent`, qu'elle remplace ; les deux
+#: coexistent pendant la transition.
+PROFILE_TYPES = ("Agent", "Persona", "Host", "Placement", "Member", "WorkPackage")
 #: les sortes de fiches WorkPackage (plan de travail, L29) et les parents admis
 PACKAGE_KINDS = ("milestone", "epic", "lot")
 #: L96 : dates d'une fiche WorkPackage (`date` = date d'un jalon, alias de `delivery`)
@@ -734,6 +736,11 @@ class Member:
     roles: list[str] | None
     authenticators: list | None
     fiche: Fiche
+    #: L51 (0032 §2, 0033 §7) : humains qui peuvent tout faire à sa place
+    #: (`deputies`) et vers qui les situations remontent (`superiors`) ;
+    #: références `human:<id>`.
+    deputies: list[str] | None = None
+    superiors: list[str] | None = None
 
 
 @dataclass
@@ -757,6 +764,16 @@ class Agent:
     #: fiche ; seul renseignement lu par la règle de visibilité (jamais un
     #: secret, jamais un droit).
     memory_repository: str | None = None
+    #: L51 (0029 §1) : harnais admis, par ordre de préférence (fiche `Persona`) ;
+    #: `harness` vaut le premier quand la fiche ne le donne pas.
+    harnesses: list[str] | None = None
+    #: L51 (0032) : rôles tenus par la persona, tels que déclarés (le modèle
+    #: des rôles est le lot L58).
+    roles: list[str] | None = None
+
+    @property
+    def is_persona(self) -> bool:
+        return self.fiche.type == "Persona"
 
 
 @dataclass
@@ -2036,7 +2053,9 @@ class _Loader:
         self.canon.members.append(Member(
             title=fiche.title, roles=roles,
             authenticators=authenticators if isinstance(authenticators, list) else None,
-            fiche=fiche))
+            fiche=fiche,
+            deputies=self._list(fiche, "deputies", where, "member-deputies-invalid"),
+            superiors=self._list(fiche, "superiors", where, "member-superiors-invalid")))
 
     def _build_agent(self, fiche: Fiche, where: dict) -> None:
         subject = {"agent": fiche.title}
@@ -2070,13 +2089,15 @@ class _Loader:
                          "`memory` : mapping attendu (ignoré)", **where, **subject)
             else:
                 memory_repository = _text(memory.get("repository"))
+        harnesses = self._list(fiche, "harnesses", where, "agent-harnesses-invalid", **subject)
+        harness = _text(fiche.data.get("harness")) or (harnesses[0] if harnesses else None)
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
             team=_text(fiche.data.get("team")),
             capabilities=self._list(fiche, "capabilities", where, "agent-capabilities-invalid",
                                     **subject),
-            harness=_text(fiche.data.get("harness")),
+            harness=harness,
             model=_text(fiche.data.get("model")),
             provider=_text(fiche.data.get("provider")),
             credential_mode=_text(fiche.data.get("credential_mode")),
@@ -2086,7 +2107,13 @@ class _Loader:
             priority=0 if priority is None else priority,
             memory_repository=memory_repository,
             fiche=fiche,
+            harnesses=harnesses,
+            roles=self._list(fiche, "roles", where, "agent-roles-invalid", **subject),
         ))
+
+    def _build_persona(self, fiche: Fiche, where: dict) -> None:
+        """L51 : une fiche `Persona` se lit comme une fiche `Agent` (0029, 0032)."""
+        self._build_agent(fiche, where)
 
     def _build_host(self, fiche: Fiche, where: dict) -> None:
         subject = {"host": fiche.title}
@@ -2587,6 +2614,32 @@ def validate(canon: Canon) -> list[Finding]:
                 "harnais %r de %s sans descripteur connu (%s)"
                 % (agent.harness, agent.title, ", ".join(sorted(known_harnesses)) or "aucun"),
                 f, agent=agent.title)
+        for name in agent.harnesses or []:
+            if name != agent.harness and name not in known_harnesses:
+                add("agent-harness-unknown", ERROR,
+                    "harnais %r (`harnesses`) de %s sans descripteur connu" % (name, agent.title),
+                    f, agent=agent.title)
+        if agent.harnesses and agent.harness and agent.harness not in agent.harnesses:
+            add("agent-harness-outside-list", WARNING,
+                "`harness` %r de %s absent de `harnesses` (%s)"
+                % (agent.harness, agent.title, ", ".join(agent.harnesses)),
+                f, agent=agent.title)
+
+    # -- suppléants et supérieurs des humains (L51, 0032 §2, 0033 §7) ---------------
+    for member in canon.members:
+        for key, values in (("deputies", member.deputies), ("superiors", member.superiors)):
+            for ref in values or []:
+                resolved = canon.resolve_human(ref)
+                if resolved is None:
+                    add("member-%s-unresolved" % key, ERROR,
+                        "%s %r de %s ne résout pas vers un Member humain (attendu "
+                        "human:<id> d'une fiche Member unique)" % (key, ref, member.title),
+                        member.fiche)
+                elif resolved == "human:%s" % member.title:
+                    add("member-%s-self" % key, ERROR,
+                        "%s de %s : un humain ne peut pas être son propre %s"
+                        % (key, member.title, "suppléant" if key == "deputies" else "supérieur"),
+                        member.fiche)
 
     # -- hôtes -----------------------------------------------------------------------
     for host in canon.hosts:
