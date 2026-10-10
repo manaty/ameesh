@@ -162,12 +162,29 @@ sont toujours dans son champ `actions`, même au-delà de la borne.
 | `paid_harnesses` | harnais payés au token (dépense réelle) ; les autres sont des forfaits dont le coût est une estimation |
 | `hourly_cap_usd` | plafond horaire de l'usage payé au token (décision 0019) |
 | `limits` | L70 : plafonds en vigueur et leur source (`base`, `config`, `défaut`) — même forme que `limits` de `ameesh budget --json` ; null sans configuration |
-| `spend` | `{window, 1h, 24h}`, chacun `{total_usd, paid_usd}` |
-| `by_agent` | `{agent, harness, model, paid, usd, turns, input_tokens, cached_input_tokens, output_tokens}` sur la fenêtre |
-| `plans` | jauges de forfait : `{harness, key, used, pace_cap, elapsed, resets_ts, window_s, exceeded}` (fractions 0..1) |
+| `spend` | `{window, 1h, 24h}`, chacun `{paid_usd, plan_value_usd, total_usd}` : `paid_usd` = **dépensé** (payé au token, estimé tour par tour) ; `plan_value_usd` (L95) = **valeur consommée sur les forfaits**, équivalent théorique au barème qui ne coûte rien de plus par tour ; `total_usd` = leur somme, gardée pour les lecteurs d'avant L95 mais à ne plus afficher |
+| `real` | L95 : dépense **réelle** tirée des relevés de solde (`ameesh cost balance`), face à l'estimation, une entrée par (fournisseur, devise, période) : `{provider, currency, period (24h, ou window si la fenêtre n'est pas de 24 h), real_spent, topups, estimated_usd, gap_usd, alert, start_ts, end_ts, readings, accounts}` — voir ci-dessous |
+| `by_agent` | `{agent, harness, model, paid, usd, turns, failed_turns, input_tokens, fresh_input_tokens, cached_input_tokens, output_tokens}` sur la fenêtre. L95 : `turns` ne compte que les tours qui ont consommé quelque chose ; `failed_turns` les tours sans aucun usage (échec du harnais, tour interrompu : 0 $ et 0 jeton) ; `fresh_input_tokens` l'entrée hors cache (Codex compte le cache dans `input_tokens`) |
+| `plans` | jauges de forfait lues sur l'hôte : `{harness, key, used, pace_cap, elapsed, resets_ts, window_s, exceeded}` (fractions 0..1) |
+| `accounts` | L95 : chaque compte déclaré de l'hôte (`ameesh accounts list`), avec **toutes** ses fenêtres : `{harness, account, active, forced, ok, reason, next, why, expires_in_s, gauges: [{key, used, last_used, pace_cap, elapsed, resets_ts, reset_passed}], losses: [{key, resets_ts, in_s, lost}]}` ; `losses` = capacité perdue à la prochaine remise à zéro si rien ne change, `next` = compte que prendrait une nouvelle session (L74, décision 0034) ; vide sans comptes déclarés |
 
-Les jauges sont celles de `ameesh cost` : lues dans les journaux locaux des
-harnais **de l'hôte qui produit l'instantané** ; leur historique est en base depuis L26
+**Dépense réelle face à l'estimation (L95).** La baisse des soldes entre deux
+relevés est la dépense réelle (une hausse est une recharge, comptée à part
+dans `topups`). L'estimation `estimated_usd` est la somme du grand livre du
+harnais de même nom sur l'intervalle **réellement couvert** par les relevés
+(`start_ts` → `end_ts`), pas sur la fenêtre demandée. `alert` est vrai quand
+l'écart `gap_usd` (estimé − réel) dépasse à la fois 25 % de la dépense réelle
+(`AMEESH_BUDGET_GAP`, fraction) et 0,50 $ ; une devise autre que l'USD n'est
+pas comparée (`gap_usd` null). Les lignes écartées par `ameesh cost correct`
+(migration 0043) ne comptent nulle part.
+
+La page HTML et la sortie texte n'additionnent jamais `paid_usd` et
+`plan_value_usd` : deux totaux distincts, « dépensé (payé au token) » et
+« valeur consommée sur les forfaits ».
+
+Les jauges et les comptes sont ceux de `ameesh cost` et `ameesh accounts
+list` : lus dans les journaux locaux des harnais **de l'hôte qui produit
+l'instantané** ; leur historique est en base depuis L26
 (`ameesh cost gauges --json`, voir `docs/EXPLOITATION.md`).
 
 ## Exemple (abrégé)
@@ -195,7 +212,8 @@ harnais **de l'hôte qui produit l'instantané** ; leur historique est en base d
   }],
   "milestones": [],
   "epics": [],
-  "budget": {"spend": {"1h": {"total_usd": 0.4, "paid_usd": 0.1}}, "plans": []},
+  "budget": {"spend": {"1h": {"paid_usd": 0.1, "plan_value_usd": 0.3, "total_usd": 0.4}},
+             "real": [], "plans": [], "accounts": []},
   "missing": ["…"]
 }
 ```

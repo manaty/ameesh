@@ -22,7 +22,7 @@ WITH unread AS (
 ), spend AS (
     SELECT agent, coalesce(sum(usd), 0)::float8 AS usd_24h, count(*)::bigint AS turns_24h
       FROM turn_costs
-     WHERE recorded_at >= now() - interval '24 hours'
+     WHERE recorded_at >= now() - interval '24 hours' AND void_reason IS NULL
      GROUP BY agent
 ), assigned AS (
     SELECT DISTINCT ON (assignee) assignee, id, title, state,

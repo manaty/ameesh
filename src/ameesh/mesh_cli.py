@@ -43,6 +43,7 @@ import sys
 import time
 
 from . import accounts as accounts_mod
+from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
 from . import migrations, placement, registry
 from . import fil, signing, storage, work
@@ -1436,6 +1437,9 @@ def build_parser() -> argparse.ArgumentParser:
     pc_bal.add_argument("--since", default="7d")
     pc_bal.add_argument("--json", action="store_true")
     pc_bal.set_defaults(func=cmd_cost)
+    # L95 : correction tracée du grand livre (essai par défaut)
+    from . import grand_livre
+    grand_livre.add_parser(cost_sub, cmd_cost)
 
     # L30 (0027) : comptes multiples par fournisseur
     p_acc = sub.add_parser("accounts", help="comptes par fournisseur : actif, jauges, forçage (L30)")
@@ -1510,6 +1514,10 @@ def cmd_cost(cfg: Config, args) -> int:
     ce qui est écrit ici, c'est la base (`turn_costs`, migration 0014).
     """
     what = getattr(args, "cost_command", None) or "report"
+    if what == "correct":
+        # L95 : l'essai lit aussi une base d'avant la migration 0043
+        from . import grand_livre
+        return grand_livre.main(cfg, args)
     db = _open(cfg)
     try:
         if what in ("turns", "gauges", "balance"):
@@ -1568,6 +1576,9 @@ def cmd_cost(cfg: Config, args) -> int:
             print(json.dumps(rows, indent=2, sort_keys=True, default=str))
         else:
             print(cost_mod.format_report(rows))
+            # L95 : dépense réelle (soldes) face à l'estimation, sur 24 h
+            for entry in _real_spend_24h(db):
+                print(balance_mod.describe(entry))
             print()
             print(budget_mod.summary_line(limites))
             for agent, caps in sorted(limites.agents.items()):
@@ -1580,6 +1591,18 @@ def cmd_cost(cfg: Config, args) -> int:
         return 0
     finally:
         db.close()
+
+
+def _real_spend_24h(db) -> list:
+    """L95 : dépense réelle des fournisseurs payés au token sur 24 h, face à
+    l'estimation du grand livre ; vide si rien n'est lisible."""
+    try:
+        paid = cost_mod.paid_harnesses_of()
+    except cost_mod.CostError:
+        return []
+    now = time.time()
+    return [dict(entry, period="24h")
+            for entry in balance_mod.compare(db, paid, now - 86400.0, now)]
 
 
 def _cost_report_reads(cfg: Config, db) -> None:
@@ -1595,6 +1618,7 @@ def _cost_report_reads(cfg: Config, db) -> None:
     actifs = {ligne["harness"]: (ligne["account"], ligne["_gauges"])
               for ligne in comptes if ligne["active"]}
     book.report(accounts=actifs)
+    _real_spend_24h(db)
 
 
 def cmd_accounts(cfg: Config, args) -> int:

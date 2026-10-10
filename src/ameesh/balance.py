@@ -293,3 +293,124 @@ def spend(rows: Iterable[dict]) -> dict:
                     "amount": round(delta, 6)}, account))
     out["latest"] = [dict(points[-1]) for points in series.values() if points]
     return out
+
+
+# --------------------------------------------------------------------------
+# dépense réelle face à l'estimation (lot L95)
+# --------------------------------------------------------------------------
+
+#: écart signalé entre l'estimation (`turn_costs`) et la baisse réelle du solde :
+#: au-delà de `GAP_RATIO` de la dépense réelle ET de `GAP_MIN_USD` (en deçà, le
+#: pas des relevés — un toutes les 15 minutes — suffit à l'expliquer).
+GAP_RATIO = 0.25
+GAP_MIN_USD = 0.50
+
+
+def gap_ratio() -> float:
+    """Le seuil d'écart relatif : `AMEESH_BUDGET_GAP` (fraction, 0.25 = 25 %)."""
+    try:
+        value = float(os.environ.get("AMEESH_BUDGET_GAP") or GAP_RATIO)
+    except ValueError:
+        return GAP_RATIO
+    return value if value > 0 else GAP_RATIO
+
+
+def real_spend(rows: Iterable[dict], from_ts: float, to_ts: float) -> list[dict]:
+    """Dépense réelle de `from_ts` à `to_ts`, par (fournisseur, devise).
+
+    Par série (fournisseur, devise, compte) : le relevé de départ est le
+    dernier relevé à `from_ts` ou avant, sinon le premier de l'intervalle ;
+    chaque baisse constatée ensuite (jusqu'à `to_ts`) est une dépense, chaque
+    hausse un rechargement (pas une dépense). Les comptes d'un même
+    fournisseur et d'une même devise s'additionnent. `start_ts` et `end_ts`
+    disent l'intervalle **réellement couvert** par les relevés : c'est sur
+    lui que l'estimation se compare. Une série sans deux relevés n'en dit rien.
+    """
+    series: dict = {}
+    for row in sorted(rows, key=lambda r: (r["provider"], r["currency"],
+                                           r.get("account") or "", r["observed_ts"])):
+        if float(row["observed_ts"]) > to_ts:
+            continue
+        series.setdefault((row["provider"], row["currency"], row.get("account")),
+                          []).append(row)
+    out: dict = {}
+    for (provider, currency, account), points in series.items():
+        before = [p for p in points if float(p["observed_ts"]) <= from_ts]
+        base = before[-1] if before else points[0]
+        tail = [p for p in points if float(p["observed_ts"]) > float(base["observed_ts"])]
+        if not tail:
+            continue
+        slot = out.setdefault((provider, currency), {
+            "provider": provider, "currency": currency, "spent": 0.0, "topups": 0.0,
+            "readings": 0, "start_ts": float(base["observed_ts"]),
+            "end_ts": float(tail[-1]["observed_ts"]), "accounts": []})
+        prev = base
+        for cur in tail:
+            delta = float(prev["total"]) - float(cur["total"])
+            if delta > 0:
+                slot["spent"] += delta
+            elif delta < 0:
+                slot["topups"] += -delta
+            prev = cur
+        slot["readings"] += len(tail) + 1
+        slot["start_ts"] = min(slot["start_ts"], float(base["observed_ts"]))
+        slot["end_ts"] = max(slot["end_ts"], float(tail[-1]["observed_ts"]))
+        if account is not None:
+            slot["accounts"].append(account)
+    for slot in out.values():
+        slot["spent"] = round(slot["spent"], 6)
+        slot["topups"] = round(slot["topups"], 6)
+    return [out[k] for k in sorted(out)]
+
+
+def compare(db, paid_harnesses: Iterable[str], from_ts: float, to_ts: float, *,
+            rows: list[dict] | None = None) -> list[dict]:
+    """La dépense réelle (soldes) de chaque fournisseur payé au token, face à
+    l'estimation du grand livre sur le **même intervalle** (L95).
+
+    Le fournisseur se rapproche du harnais de même nom (`deepseek`). Rend une
+    entrée par (fournisseur, devise) : `real_spent` (baisse des soldes, dans sa devise),
+    `topups`, `estimated_usd` (`turn_costs`), `gap_usd` (estimé − réel),
+    `alert` (écart au-delà du seuil). Une devise autre que l'USD n'est pas
+    comparée (`gap_usd` null). Lecture seule.
+    """
+    paid = set(paid_harnesses)
+    if rows is None:
+        rows = storage.of(db).operations.balances(
+            provider=None, since_s=max(0.0, to_ts - from_ts) + 1.0)
+    ledger = storage.of(db).turn_costs
+    out = []
+    for entry in real_spend(rows, from_ts, to_ts):
+        harness = entry["provider"]
+        estimated = (ledger.spent_between(entry["start_ts"], entry["end_ts"],
+                                          harnesses=[harness])
+                     if harness in paid else None)
+        item = dict(entry, real_spent=round(entry["spent"], 6), estimated_usd=None,
+                    gap_usd=None, alert=False)
+        item.pop("spent")
+        if estimated is not None and entry["currency"] == "USD":
+            gap = estimated - entry["spent"]
+            item["estimated_usd"] = round(estimated, 6)
+            item["gap_usd"] = round(gap, 6)
+            item["alert"] = abs(gap) > max(GAP_MIN_USD, gap_ratio() * entry["spent"])
+        elif estimated is not None:
+            item["estimated_usd"] = round(estimated, 6)
+        out.append(item)
+    return out
+
+
+def describe(entry: dict) -> str:
+    """Dépense réelle d'un fournisseur face à l'estimation (L95), en une ligne."""
+    period = {"window": "fenêtre", "24h": "24 h"}.get(entry.get("period"), "")
+    text = "dépense réelle %s%s (soldes) : %.2f %s" % (
+        entry["provider"], " " + period if period else "", entry["real_spent"],
+        entry["currency"])
+    if entry.get("estimated_usd") is not None:
+        text += " · estimée %.2f $" % entry["estimated_usd"]
+    if entry.get("gap_usd") is not None:
+        text += " · écart %+.2f $" % entry["gap_usd"]
+        if entry.get("alert"):
+            text += " — ÉCART AU-DELÀ DU SEUIL"
+    if entry.get("topups"):
+        text += " · recharge(s) %.2f" % entry["topups"]
+    return text

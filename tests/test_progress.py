@@ -176,8 +176,11 @@ class BudgetTest(unittest.TestCase):
         ]
         gauges = [cost.Gauge("claude", "five_hour", 0.8, NOW + 3600, 5 * 3600)]
         b = progress.build_budget(rows, gauges, NOW)
-        self.assertEqual(b["spend"]["1h"], {"total_usd": 1.5, "paid_usd": 0.5})
-        self.assertEqual(b["spend"]["window"], {"total_usd": 5.5, "paid_usd": 1.5})
+        # L95 : payé au token et valeur des forfaits séparés (`total_usd` gardé)
+        self.assertEqual(b["spend"]["1h"], {"total_usd": 1.5, "paid_usd": 0.5,
+                                            "plan_value_usd": 1.0})
+        self.assertEqual(b["spend"]["window"], {"total_usd": 5.5, "paid_usd": 1.5,
+                                                "plan_value_usd": 4.0})
         self.assertEqual([r["paid"] for r in b["by_agent"]], [True, False])
         plan = b["plans"][0]
         self.assertEqual(plan["key"], "five_hour")

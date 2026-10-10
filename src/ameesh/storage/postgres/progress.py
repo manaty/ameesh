@@ -136,7 +136,9 @@ class Progress(interface.Progress):
         return self.db.query(sql, params)
 
     def costs(self, *, since_ts, agents) -> list[dict]:
-        clauses = ["recorded_at >= least(to_timestamp(%s), now() - interval '24 hours')"]
+        # L95 (0043) : les lignes écartées par `cost correct` ne comptent pas
+        clauses = ["recorded_at >= least(to_timestamp(%s), now() - interval '24 hours')",
+                   "void_reason IS NULL"]
         params: list = [float(since_ts)]
         if agents is not None:
             names = list(agents)
@@ -154,6 +156,9 @@ class Progress(interface.Progress):
                    coalesce(sum(usd) FILTER (WHERE recorded_at >= now() - interval '24 hours'),
                             0)::float8 AS usd_24h,
                    count(*) FILTER (WHERE %s)::bigint AS turns,
+                   count(*) FILTER (WHERE %s AND usd = 0 AND input_tokens = 0
+                                     AND cached_input_tokens = 0
+                                     AND output_tokens = 0)::bigint AS failed_turns,
                    coalesce(sum(input_tokens) FILTER (WHERE %s), 0)::bigint AS input_tokens,
                    coalesce(sum(cached_input_tokens) FILTER (WHERE %s), 0)::bigint
                        AS cached_input_tokens,
@@ -163,5 +168,5 @@ class Progress(interface.Progress):
              WHERE %s
              GROUP BY agent, harness, coalesce(model, '')
              ORDER BY agent, harness, 3
-            """ % (win, win, win, win, win, " AND ".join(clauses)),
-            tuple([float(since_ts)] * 5 + params))
+            """ % (win, win, win, win, win, win, " AND ".join(clauses)),
+            tuple([float(since_ts)] * 6 + params))
