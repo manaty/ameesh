@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
--- 0106_alimentation_hote — alimentation de l'hôte dans les relevés de
+-- 0047_alimentation_hote — alimentation de l'hôte dans les relevés de
 -- ressources (lot L106, survivre à une coupure de l'hôte).
 --
 -- Le 2026-10-10, un portable hôte d'une dizaine d'agents s'est éteint
@@ -12,8 +12,10 @@
 -- Les SEUILS restent déclaratifs (`policy.resources.min_battery_percent`,
 -- `stop_battery_percent` de la fiche Host, valeurs par défaut sinon).
 --
--- Le numéro 0106 (celui du lot) laisse libres 0043 et suivants aux lots
--- parallèles : les migrations s'appliquent par version manquante.
+-- Numérotée 0106 (celui du lot) pendant son développement, renumérotée 0047
+-- à l'intégration dans la 1.6.0 : la suite des migrations reste continue
+-- (0043 à 0047). Une base de test qui aurait appliqué 0106 l'a déjà ; les
+-- `add column if not exists` rendent 0047 sans effet sur elle.
 
 alter table host_resources add column if not exists on_ac boolean;
 alter table host_resources add column if not exists battery_percent double precision;
