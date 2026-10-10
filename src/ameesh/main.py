@@ -56,7 +56,10 @@
   ameesh harness list|show|check        descripteurs de harnais (L16) ;
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
-  ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
+  ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère ;
+  ameesh serve --exec-only --auth-file FICHIER [--listen HÔTE:PORT] …
+        l'API d'exécuteur médiée (/api/exec/v1, L108) : un exécuteur sur un
+        appareil sans accès à la base (docs/EXECUTEUR-MEDIEE.md).
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
 `ameesh-approve` (python -m ameesh.approve), lancée sous son propre
@@ -180,6 +183,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command in ACTION_COMMANDS:
         from . import actions_cli
         return actions_cli.main(argv)
+    if command == "serve":
+        # L108 : l'API d'exécuteur médiée ; L84 y ajoutera l'interface
+        from .executeur_mediee import serveur
+        return serveur.main(rest)
     if command == "approve-check":
         from . import approve_check
         return approve_check.main(rest)

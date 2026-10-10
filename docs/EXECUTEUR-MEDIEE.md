@@ -176,3 +176,79 @@ close() -> None
     ES256 de 60 s au plus.
 - **L112, inactivité.** `FileGate(HostGate)` et `SocketGate(HostGate)`, sur
   les schémas de `porte`.
+
+## Le serveur (L108)
+
+`ameesh serve --exec-only --auth-file FICHIER [--listen 127.0.0.1:8471]`
+sert `/api/exec/v1` seul, tant que `ameesh serve` (L84) n'existe pas. Le
+serveur utilise la bibliothèque standard (`http.server`) et n'ajoute aucune
+dépendance. Une écoute hors de la boucle locale exige TLS (`--tls-cert`,
+`--tls-key`) ou `--allow-plain` derrière un mandataire qui termine TLS.
+
+| Fichier | Rôle |
+|---|---|
+| `executeur_mediee/serveur.py` | `ExecApp` (routes, sans socket), `ExecHTTPServer`, `main` |
+| `executeur_mediee/repartiteur.py` | `PgDispatcher` : transaction, idempotence, fencing, audit |
+| `executeur_mediee/portee.py` | `HostScopeRules` : une règle par ligne de la table |
+| `executeur_mediee/flux.py` | `EventHub` : une écoute `LISTEN`, tampon, filtre par hôte |
+| `executeur_mediee/bouchon.py` | `StaticAuth`, jetons fixes, en attendant L110 |
+| `migrations/0047_executeur_mediee.sql` | `exec_idempotency`, `exec_host_availability`, `exec_audit` |
+
+**Agents admis.** Un agent est admis s'il remplit toutes ces conditions :
+
+- il est inscrit sur l'hôte de l'exécuteur ;
+- il est gouverné par le canon ;
+- son placement est admis pour son profil actuel ;
+- il figure dans la liste blanche de l'invitation, si elle existe ;
+- son mode d'identifiants fait partie de `--credential-modes`, si l'option
+  est donnée.
+
+Un agent inscrit à la main n'est jamais admis sur un hôte médié.
+
+**Une transaction par opération.** Le serveur y enchaîne, dans l'ordre :
+
+1. le verrou d'idempotence et la relecture de la clé ;
+2. la portée ;
+3. le fencing sous `FOR UPDATE` ;
+4. l'appel du pilote ;
+5. l'écriture de la réponse d'idempotence ;
+6. l'audit.
+
+Toutes les écritures de portée B sont fencées, y compris celles que
+l'interface ne fence pas (`agents.set_status`, `pending_spend.*`,
+`turn_resources.*`, `threads.index`…). Une écriture de portée S exige que le
+bail du jeton de session tienne encore (même epoch, même exécuteur, bail
+vivant). Sinon le serveur répond `401 token_expired`.
+
+**Porte d'hôte.** `PUT /host/availability` garde le dernier état rapporté
+(`seq` ne recule pas). L'hôte est indisponible dans trois cas : aucun état
+rapporté, un état autre que `available`, ou une fenêtre `until_ts` échue.
+Dans ces cas, `leases.claim` répond `403 host_unavailable` et
+`agents.claimable` rend une liste vide.
+
+**Bornes.**
+
+- Corps limité à 1 Mio (`413`).
+- `limit` limité à 200, listes d'identifiants à 1 000, relevés de jauge à 100.
+- 600 requêtes par minute et par exécuteur, 1 200 par adresse (`429`,
+  `Retry-After`).
+- 256 connexions simultanées.
+- Une connexion SSE dure au plus 10 minutes, la vie d'un jeton d'accès.
+
+**Audit.** `exec_audit` reçoit chaque écriture, chaque rejeu et chaque
+refus. Il ne garde jamais ni argument ni corps. Les clés d'idempotence de
+plus de 24 h sont élaguées toutes les 10 minutes, l'audit après 90 jours.
+
+**Points d'intégration.**
+
+- **L110.** Un `IdentityProvider` passé à la place de `StaticAuth` ouvre
+  `/enroll`, `/token` et `/session-token`. Le serveur recontrôle le bail de
+  `/session-token` dans sa transaction avant d'appeler
+  `issue_session_token`.
+- **L111 et L113.** Ils montent leurs routes par
+  `ExecApp(extra_routes={"llm": …, "bundle": …})`. La colonne
+  `turn_costs.source` (ligne `device`, hors plafond) est à L111 : en
+  attendant, `turn_costs.insert` écrit la ligne telle quelle.
+- **L112.** L'exécuteur relaie sa porte par `PUT /host/availability` au
+  démarrage et à chaque changement : sans ce rapport, l'hôte reste
+  indisponible.
