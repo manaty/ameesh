@@ -1390,11 +1390,11 @@ def build_parser() -> argparse.ArgumentParser:
     pa_list.add_argument("--json", action="store_true")
     pa_list.add_argument("--last", type=int, default=5, help="dernières bascules montrées")
     pa_list.set_defaults(func=cmd_accounts)
-    pa_use = acc_sub.add_parser("use", help="forcer un compte (plus de bascule automatique)")
+    pa_use = acc_sub.add_parser("use", help="forcer un compte (plus de choix automatique)")
     pa_use.add_argument("harness")
     pa_use.add_argument("account")
     pa_use.set_defaults(func=cmd_accounts)
-    pa_auto = acc_sub.add_parser("auto", help="rendre la main à la bascule automatique")
+    pa_auto = acc_sub.add_parser("auto", help="rendre la main au choix automatique (0034)")
     pa_auto.add_argument("harness", nargs="?", default=None,
                          help="harnais (défaut : tous ceux qui ont des comptes)")
     pa_auto.set_defaults(func=cmd_accounts)
@@ -1480,7 +1480,8 @@ def cmd_cost(cfg: Config, args) -> int:
             return 1
         # L30 : jauges par compte et compte actif, pour les harnais à comptes
         try:
-            comptes = accounts_mod.report(cfg, db, book)
+            # L71 : un affichage ne relève pas les jauges (lecture seule)
+            comptes = accounts_mod.report(cfg, db, book, record=False)
         except accounts_mod.AccountError as exc:
             print("comptes : configuration invalide : %s" % exc, file=sys.stderr)
             comptes = []
@@ -1527,7 +1528,7 @@ def cmd_accounts(cfg: Config, args) -> int:
                       "de l'hôte)" % args.harness, file=sys.stderr)
                 return 1
             accounts_mod.force(db, cfg.host, args.harness, items, args.account, by=qui)
-            texte = ("Compte %s forcé pour %s sur %s par %s : plus de bascule automatique "
+            texte = ("Compte %s forcé pour %s sur %s par %s : plus de choix automatique "
                      "jusqu'à « ameesh accounts auto »." % (args.account, args.harness,
                                                             cfg.host, qui))
             fil.record(cfg, db, sender=qui, recipients=[], text=texte,
@@ -1542,7 +1543,7 @@ def cmd_accounts(cfg: Config, args) -> int:
                     print("aucun compte déclaré pour %s" % nom, file=sys.stderr)
                     return 1
                 if accounts_mod.automatic(db, cfg.host, nom, by=qui):
-                    texte = ("Comptes %s sur %s : retour en bascule automatique (%s)."
+                    texte = ("Comptes %s sur %s : retour au choix automatique (%s)."
                              % (nom, cfg.host, qui))
                     fil.record(cfg, db, sender=qui, recipients=[], text=texte,
                                meta={"action": "compte", "type": "auto", "harnais": nom,
@@ -1552,7 +1553,8 @@ def cmd_accounts(cfg: Config, args) -> int:
                     print("comptes %s : déjà en automatique" % nom)
             return 0
         book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
-        rows = accounts_mod.report(cfg, db, book)
+        # L71 : `accounts list` est un affichage — aucun relevé écrit
+        rows = accounts_mod.report(cfg, db, book, record=False)
         for row in rows:
             row.pop("_gauges", None)
         bascules = storage.of(db).accounts.switches(cfg.host, None, max(0, getattr(args, "last", 5))) \

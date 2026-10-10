@@ -2,6 +2,7 @@
 
 ## 2026-10-10 (comptes au forfait)
 * **Décision** : [consommer d'abord ce qui expire](decisions/0034-consommer-d-abord-ce-qui-expire.md), qui amende 0027 ; lot L74.
+* **L74** : comptes au forfait en réservoir — choix par échéance de la capacité inutilisée sous le seuil de rythme, continuité de session, relevé échu à 0 % (même règle que L71), choix journalisés avec leur raison, capacité perdue à la remise à zéro dans `ameesh accounts list`.
 
 ## 2026-10-09
 * **Bascule** : deepseek1 à 7 et l'orchestrateur Nexlink menés par l'exécuteur, un service par agent (`ameesh-runner-agent@<nom>`) ; plus aucune boucle v0.

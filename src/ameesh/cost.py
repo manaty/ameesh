@@ -131,8 +131,18 @@ class Gauge:
         """Le plafond de rythme : min(90 %, part écoulée + 10 points)."""
         return min(PACE_CEILING, self.elapsed(now) + PACE_MARGIN)
 
+    def used_at(self, now: float) -> float:
+        """L'utilisation **valable à `now`** : 0 si la fenêtre est échue (L71).
+
+        Un relevé dont `resets_at` est passé décrit une fenêtre close ; la
+        suivante est vierge. Le garder à sa dernière valeur rendait un compte
+        inutilisé « au seuil » pour toujours : il ne servait pas, donc son
+        relevé n'était jamais rafraîchi.
+        """
+        return 0.0 if self.reset_passed(now) else self.used
+
     def exceeded(self, now: float) -> bool:
-        return self.used >= self.pace_cap(now)
+        return self.used_at(now) >= self.pace_cap(now)
 
     def reset_passed(self, now: float) -> bool:
         """La fenêtre publiée est-elle déjà remise à zéro (`resets_at` passé) ?
@@ -141,6 +151,18 @@ class Gauge:
         tour n'a publié de nouveau relevé (L30, retour au primaire).
         """
         return bool(self.resets_at) and now >= float(self.resets_at)
+
+    def expiring(self, now: float) -> tuple[float, float] | None:
+        """(échéance, capacité inutilisée) de la fenêtre en cours, ou None (L74).
+
+        La capacité inutilisée (`1 − utilisé`, part de la fenêtre) est perdue à
+        la remise à zéro `resets_at` si rien ne la consomme d'ici là (0034).
+        None : fenêtre non datée, ou échue (la suivante ne court qu'au premier
+        usage : rien n'expire).
+        """
+        if not self.resets_at or self.reset_passed(now):
+            return None
+        return float(self.resets_at), max(0.0, 1.0 - float(self.used or 0.0))
 
 
 @dataclass(frozen=True)
