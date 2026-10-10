@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-10 (exécuteur médié, 1.7.0)
+* **Voie B** livrée en 1.7.0 : contrat figé de `/api/exec/v1` (L107, contrat 1.1), serveur `ameesh serve --exec-only` (L108), client distant et mode médié de l'exécuteur (L109), enrôlement et identité des appareils (L110), relais de modèle (L111), porte d'hôte (L112), dépôt de travail (L113), image `ameesh-executor` (L114), essai de bout en bout (L115 : sept étapes sur sept). Migrations 0048 à 0050. La décision reste proposée ([00xx](decisions/00xx-executeur-mediee.md)) ; rien n'est activé en production.
+
 ## 2026-10-10 (répartition des comptes)
 * **Amendement** de [0034](decisions/0034-consommer-d-abord-ce-qui-expire.md), accord du propriétaire : `ameesh accounts list` montrait le compte Claude primaire à 35 % de sa semaine (rythme 55 %) et les deux autres jamais utilisés, leurs forfaits hebdomadaires perdus. Le primaire, toujours en fenêtre ouverte, gagnait toujours le choix par échéance. Désormais, une nouvelle session va au compte le plus en retard sur son rythme (plus petit `utilisé / rythme` sur sa fenêtre la plus contraignante ; sans relevé : 0 %, en premier) ; l'échéance et l'ordre déclaré départagent. Forçage, continuité, pause et Codex inchangés.
 * **L117** (1.6.2) : la règle, sa raison dans le journal de l'exécuteur et dans `ameesh accounts list` (« le plus en retard sur son rythme ; avant : … »).

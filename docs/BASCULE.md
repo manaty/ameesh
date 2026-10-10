@@ -1212,6 +1212,36 @@ mise à jour, que les identifiants des comptes jamais utilisés sont présents
 installée : vérifier « ameesh 1.6.2 » sur chaque hôte après la mise à jour.
 Retour arrière : l'ancien code, sans autre geste.
 
+## Mise à jour vers 1.7.0
+
+La 1.7.0 apporte la voie B, l'exécuteur médié (L107 à L115,
+[EXECUTEUR-MEDIEE.md](EXECUTEUR-MEDIEE.md)) : un appareil prêté, sans accès
+à la base, fait tourner des agents en parlant au serveur du mesh par
+`/api/exec/v1`. Trois migrations suivent 0047 :
+
+| Migration | Lot | Contenu |
+|---|---|---|
+| **0048** `executeur_mediee` | L108 | tables `exec_idempotency`, `exec_host_availability`, `exec_audit` |
+| **0049** `identite_des_executeurs` | L110 | tables `executor_invitations`, `executors`, `executor_tokens`, `executor_assertion_jti`, `executor_events` |
+| **0050** `relais_de_modele` | L111 | `turn_costs.source` (`harness` par défaut), `executor`, `lease_owner`, `lease_epoch` |
+
+**Rien ne change pour un hôte classique.** Les tables sont neuves, la
+colonne `source` a un défaut, et un exécuteur 1.6.x tourne sans erreur sur
+une base migrée. Le plafond de dépense ignore les lignes `source = 'device'`,
+qu'aucun hôte classique n'écrit. Sans porte d'hôte configurée
+(`AMEESH_HOST_GATE`), l'exécuteur se comporte comme en 1.6.2. On migre, puis
+on redémarre les exécuteurs, comme pour la 1.6.0.
+
+**Rien n'est activé.** Le serveur `ameesh serve --exec-only`, un rôle
+Postgres propre au serveur (`ameesh_exec`, à créer), la clé de release de
+l'image (IMAGE-EXECUTEUR.md §9), l'image signée et l'enrôlement d'un premier
+appareil (`ameesh host enroll`) sont des gestes de déploiement à part, chacun
+soumis au propriétaire.
+
+Retour arrière : l'ancien code. La base reste migrée ; l'ancien code ignore
+les tables de 0048 et 0049, et la colonne `source` de 0050 (il compte alors
+aussi les lignes `device`, qui n'existent que si un appareil a été enrôlé).
+
 ---
 
 ## Risques et parades
