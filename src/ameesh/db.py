@@ -1130,6 +1130,11 @@ _UNSAFE_RE = re.compile(
     r"|pg_current_xact_id\w*|lo_\w+|dblink\w*)\b", re.I)
 #: écart toléré entre deux « maintenant » passés en paramètre (époque, en s)
 _NOW_SLACK = 120.0
+#: historiques en ajout seul, qu'aucune vue ne relit : un INSERT dans l'une
+#: d'elles (relevé de jauges fait en passant par un affichage) ne retire du
+#: cache que les réponses qui la lisent, au lieu de tout couper
+APPEND_ONLY = ("quota_gauge_readings",)
+_INSERT_RE = re.compile(r"^\s*insert\s+into\s+([A-Za-z_][A-Za-z0-9_]*)\b", re.I)
 
 
 class _Abort(Exception):
@@ -1169,6 +1174,12 @@ class _Answers:
             if _same_params(known, params):
                 return copy.deepcopy(rows)
         return None
+
+    def forget(self, table: str) -> None:
+        """Oublie les réponses des requêtes qui lisent `table`."""
+        pattern = re.compile(r"\b%s\b" % re.escape(table), re.I)
+        for sql in [sql for sql in self._by_sql if pattern.search(sql)]:
+            del self._by_sql[sql]
 
     def put(self, sql: str, params: tuple, rows: list[dict]) -> None:
         self._by_sql.setdefault(sql, []).append((params, rows))
@@ -1237,7 +1248,11 @@ class _Replay:
     def __getattr__(self, name: str):
         return getattr(self._db, name)
 
-    def _cut(self) -> None:
+    def _cut(self, sql: str = "") -> None:
+        match = _INSERT_RE.match(sql or "")
+        if match and self._answers is not None and match.group(1).lower() in APPEND_ONLY:
+            self._answers.forget(match.group(1).lower())
+            return
         self._answers = None
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
@@ -1246,7 +1261,7 @@ class _Replay:
             if rows is not None:
                 return rows
         if not pure_read(sql):
-            self._cut()
+            self._cut(sql)
         return self._db.query(sql, params)
 
     def query_batch(self, items: Sequence[tuple]) -> list[list[dict]]:
@@ -1265,7 +1280,7 @@ class _Replay:
         return out
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
-        self._cut()
+        self._cut(sql)
         return self._db.execute(sql, params)
 
     def script(self, sql: str) -> None:

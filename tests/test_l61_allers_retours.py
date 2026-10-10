@@ -27,6 +27,8 @@ BORNES = {
     "list": 1,
     "work list": 2,
     "progress": 2,
+    #: indépendant du nombre d'agents (avant L61 : deux requêtes par agent)
+    "cost report": 3,
     #: hook sous bail, sans courrier (PostToolUse) : contrôle du bail, réservation
     "hook": 2,
 }
@@ -93,6 +95,15 @@ class TestAllersRetours(PgTestCase):
         trace = self._trace(self.mesh, "progress", "--json")
         self.assertIn("ameesh-progress/1", trace["stdout"])
         self._borne(trace, BORNES["progress"])
+
+    def test_cost_report(self):
+        for index in range(8):
+            name = "agent%d" % index
+            registry.upsert(self.db, name, harness="claude", host="h1", cwd="/tmp")
+            os.makedirs(self.cfg.agent_dir(name), exist_ok=True)
+        trace = self._trace(self.mesh, "cost", "report")
+        self.assertIn("agent7", trace["stdout"])
+        self._borne(trace, BORNES["cost report"])
 
     def test_hook_sous_bail(self):
         owner = "runner-l61"

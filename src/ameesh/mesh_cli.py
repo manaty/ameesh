@@ -1470,6 +1470,11 @@ def cmd_cost(cfg: Config, args) -> int:
     try:
         if what in ("turns", "gauges", "balance"):
             return _cost_l26(cfg, db, what, args)
+        if what == "report":
+            # L61 : le rapport lisait la dépense agent par agent (deux
+            # requêtes chacun, ~67 s vers une base distante) : ses lectures
+            # sont préchargées en quelques allers-retours (db.prefetch)
+            db = db_mod.prefetch(db, lambda d: _cost_report_reads(cfg, d))
         book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
         if what == "spent":
             seconds = float(getattr(args, "seconds", 3600.0) or 3600.0)
@@ -1521,6 +1526,19 @@ def cmd_cost(cfg: Config, args) -> int:
         return 0
     finally:
         db.close()
+
+
+def _cost_report_reads(cfg: Config, db) -> None:
+    """Les lectures de `cost report`, jouées à blanc par `db.prefetch` (L61) :
+    comptes et rapport par agent. Rien n'est affiché."""
+    book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+    try:
+        comptes = accounts_mod.report(cfg, db, book)
+    except accounts_mod.AccountError:
+        comptes = []
+    actifs = {ligne["harness"]: (ligne["account"], ligne["_gauges"])
+              for ligne in comptes if ligne["active"]}
+    book.report(accounts=actifs)
 
 
 def cmd_accounts(cfg: Config, args) -> int:
