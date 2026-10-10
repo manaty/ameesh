@@ -200,6 +200,9 @@ class PlatformTest(unittest.TestCase):
 
     def test_point_de_montage_et_alimentation_depuis_des_fichiers(self):
         with tempfile.TemporaryDirectory() as tmp:
+            # Une table de montage porte des chemins réels ; sur macOS le
+            # dossier temporaire passe par un lien (/var -> /private/var).
+            tmp = os.path.realpath(tmp)
             mounts = os.path.join(tmp, "mounts")
             with open(mounts, "w") as fh:
                 fh.write("rootfs / ext4 rw 0 0\ntmpfs %s tmpfs rw 0 0\n" % tmp)
