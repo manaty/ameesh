@@ -3990,7 +3990,7 @@ def _connect_at_start(cfg: Config, *, wait: bool) -> "db_mod.Db | None":
 
     L106 : en service (`wait`), une base injoignable au démarrage — l'hôte
     redémarre et le conteneur Postgres local, ou le tunnel vers la base, n'est
-    pas encore là (2026-10-10 : `ameesh-runner-ima` sorti en échec à 12:35:20,
+    pas encore là (2026-10-10 : un exécuteur du poste sorti en échec à 12:35:20,
     relancé à la main à 12:39) — n'est plus une sortie en échec : attente
     croissante (2 s… `db_retry_max`), jusqu'à la base ou un signal d'arrêt. En
     `--once`, l'échec reste immédiat."""
