@@ -44,7 +44,8 @@ class TurnCosts(interface.TurnCosts):
     def insert(self, *, agent, harness, turn, model, session, usd, input_tokens,
                cached_input_tokens, output_tokens, cum_usd, cum_input_tokens,
                cum_cached_input_tokens, cum_output_tokens, account=None,
-               spend_key=None) -> bool:
+               spend_key=None, source=None, executor=None, lease_owner=None,
+               lease_epoch=None) -> bool:
         cols = ["agent", "harness", "turn", "model", "session", "usd",
                 "input_tokens", "cached_input_tokens", "output_tokens",
                 "cum_usd", "cum_input_tokens", "cum_cached_input_tokens",
@@ -57,6 +58,13 @@ class TurnCosts(interface.TurnCosts):
             # nommé — un hôte sans comptes déclarés n'en dépend pas.
             cols.append("account")
             values.append(account)
+        # L111 (migration 0111) : provenance et bail, écrits seulement quand
+        # ils sont donnés (relais de modèle, déclaration d'un appareil médié).
+        for column, value in (("source", source), ("executor", executor),
+                              ("lease_owner", lease_owner), ("lease_epoch", lease_epoch)):
+            if value is not None:
+                cols.append(column)
+                values.append(value)
         suffix = ""
         if spend_key is not None:
             # L60 (migration 0041) : un marqueur comptable n'écrit qu'une ligne,
@@ -72,7 +80,10 @@ class TurnCosts(interface.TurnCosts):
         return bool(self.db.query(sql + suffix + " returning id", tuple(values)))
 
     def spent(self, seconds, *, agent, harnesses, account=None) -> float:
-        clauses = ["recorded_at >= now() - make_interval(secs => %s)"]
+        # L111 : la déclaration d'un appareil médié ne compte pas, le relais
+        # de modèle a mesuré la même dépense (`source = 'relay'`).
+        clauses = ["recorded_at >= now() - make_interval(secs => %s)",
+                   "source <> 'device'"]
         params: list = [float(seconds)]
         if agent != "all":
             clauses.append("agent = %s")

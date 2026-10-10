@@ -114,7 +114,9 @@ def child_env(**extra: str) -> dict:
         env.pop(name, None)
     # Aucun réseau dans les tests (L26) : pas de clé de fournisseur, pas de
     # relevé de solde par l'exécuteur.
-    for name in ("DEEPSEEK_API_KEY", "AMEESH_DEEPSEEK_API_BASE"):
+    # ni un relais de modèle (L111) : un exécuteur de test n'est jamais médié
+    for name in ("DEEPSEEK_API_KEY", "AMEESH_DEEPSEEK_API_BASE", "DEEPSEEK_BASE_URL",
+                 "AMEESH_EXEC_URL", "AMEESH_RELAY_URL"):
         env.pop(name, None)
     env["AMEESH_BALANCE_INTERVAL"] = "0"
     # Les relevés de ressources de l'hôte réel (L31) ne fuient pas non plus :

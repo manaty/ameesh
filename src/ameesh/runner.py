@@ -2067,6 +2067,18 @@ class AgentWorker(threading.Thread):
         env.update(identite)
         if not account_turn.apply(self, env, compte):
             return False  # profil inutilisable : consigne remise, rien lancé
+        # L111 : exécuteur médié (appareil prêté) — URL du relais de modèle et
+        # jeton de session court, dans l'environnement du harnais seulement ;
+        # sans jeton, pas de tour (jamais de repli sur une clé locale).
+        from . import relay as relay_mod
+        try:
+            relay_mod.apply_turn_env(env, harness, agent=self.name,
+                                     owner=self.runner.runner_id, epoch=self.epoch,
+                                     turn_id=turn_id)
+        except relay_mod.RelayTurnError as exc:
+            log("[%s] %s : tour non lancé" % (self.name, exc))
+            self.fail_turn("relais de modèle indisponible", str(exc))
+            return False
         events_path = self._path("events.jsonl")
         stderr_path = self._path("stderr.log")
         started = time.time()
