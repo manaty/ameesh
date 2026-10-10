@@ -75,7 +75,8 @@ class Operations(interface.Operations):
         return self.db.query(
             """
             SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.effort, r.tier,
-                   r.session_policy, r.context_max_tokens, r.session_id, r.session_work_item,
+                   r.session_policy, r.context_max_tokens, r.turn_max_seconds, r.turn_mail_max,
+                   r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,

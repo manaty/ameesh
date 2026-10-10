@@ -69,6 +69,14 @@ def _as_float(value, default: float) -> float:
         return default
 
 
+def _as_count(value, default: int) -> int:
+    """Entier ≥ 0 (L105) ; une valeur illisible, négative ou infinie : défaut."""
+    nombre = _as_float(value, float(default))
+    if nombre != nombre or nombre in (float("inf"), float("-inf")) or nombre < 0:
+        return default
+    return int(nombre)
+
+
 def _as_names(value) -> tuple[str, ...]:
     """Liste de noms séparés par des virgules -> tuple propre (ordre gardé)."""
     return tuple(n.strip() for n in str(value or "").split(",") if n.strip())
@@ -178,6 +186,15 @@ class Config:
     #: tour suivant ; réglable par agent (`ameesh set context_max_tokens=…`).
     #: 0 = plafond désactivé.
     context_max_tokens: float = 15_000_000.0
+    #: L105 : durée maximale d'un tour d'agent mené (secondes). Au-delà, le
+    #: tour se clôt au prochain point sûr (fin de l'appel d'outil en cours) et
+    #: le travail reprend au tour suivant, dans la même session ; réglable par
+    #: agent (`ameesh set turn_max_seconds=…`). 0 = pas de durée maximale.
+    turn_max_seconds: float = 1800.0
+    #: L105 : messages remis par le hook de courrier pendant un même tour ;
+    #: les suivants attendent le tour suivant, et l'agent est invité à
+    #: conclure. Réglable par agent (`ameesh set turn_mail_max=…`). 0 = sans borne.
+    turn_mail_max: int = 5
     #: L48 : échecs de tour — attente maximale entre deux tours en échec, durée
     #: sous laquelle un échec est « rapide », série d'échecs rapides qui arrête l'agent
     failure_backoff_max: float = 300.0
@@ -407,6 +424,9 @@ def load(env: dict | None = None) -> Config:
             cfg.session_min_turns)),
         context_max_tokens=max(0.0, _as_float(pick("AMEESH_CONTEXT_MAX_TOKENS"),
                                               cfg.context_max_tokens)),
+        turn_max_seconds=max(0.0, _as_float(pick("AMEESH_TURN_MAX_SECONDS"),
+                                            cfg.turn_max_seconds)),
+        turn_mail_max=_as_count(pick("AMEESH_TURN_MAIL_MAX"), cfg.turn_mail_max),
         failure_backoff_max=_as_float(pick("AMEESH_FAILURE_BACKOFF_MAX"),
                                       cfg.failure_backoff_max),
         fast_failure_s=_as_float(pick("AMEESH_FAST_FAILURE_S"), cfg.fast_failure_s),

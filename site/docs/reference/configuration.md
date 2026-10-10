@@ -39,7 +39,9 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_INTERRUPT_SENDERS` | `interrupt_senders` | — | senders whose `--urgent` messages interrupt a turn |
 | `AMEESH_SESSION_MAX_TOKENS` | `session_max_tokens` | 150000 | rotate the session above this size |
 | `AMEESH_SESSION_MAX_TURN_SECONDS` | `session_max_turn_seconds` | 900 | rotate after a turn longer than this |
-| `AMEESH_CONTEXT_MAX_TOKENS` | `context_max_tokens` | 15000000 | rotate the session before the next turn when the last turn re-read more input tokens (cache included) than this; per agent: `ameesh set <agent> context_max_tokens=…`; 0 = off |
+| `AMEESH_CONTEXT_MAX_TOKENS` | `context_max_tokens` | 15000000 | close the turn at the next safe point and rotate the session when the turn re-reads more input tokens (cache included) than this; per agent: `ameesh set <agent> context_max_tokens=…`; 0 = off |
+| `AMEESH_TURN_MAX_SECONDS` | `turn_max_seconds` | 1800 | close a turn that runs longer at the next safe point (end of the running tool call); work resumes next turn, same session; per agent: `ameesh set <agent> turn_max_seconds=…`; 0 = no limit |
+| `AMEESH_TURN_MAIL_MAX` | `turn_mail_max` | 5 | messages the mail hook delivers during one runner-led turn; the rest wait for the next turn and the agent is asked to wrap up; per agent: `ameesh set <agent> turn_mail_max=…`; 0 = no bound |
 | `AMEESH_SESSION_MIN_TURNS` | `session_min_turns` | 3 | minimum turns before a rotation |
 | `AMEESH_FAST_FAILURE_S` | `fast_failure_s` | 60 s | a failed turn shorter than this counts as a fast failure (1.4.1) |
 | `AMEESH_FAILURE_BACKOFF_MAX` | `failure_backoff_max` | 300 s | wait between failed turns doubles from 5 s up to this |
