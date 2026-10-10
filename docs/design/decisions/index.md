@@ -32,3 +32,4 @@
 * [Pas de travail sans réveil possible](0030-pas-de-travail-sans-reveil-possible.md) - Attribution gardée, adoption et reprise par ameesh, alertes de vivacité poussées, délégation à échéance, identité jamais tirée du dossier.
 * [Plusieurs canons sur un même hôte](0031-plusieurs-canons.md) - Liste de canons, identité par fédération, synchronisation bornée au canon, noms au premier déclarant ; lots L42–L45, L47.
 * [Consommer d'abord ce qui expire](0034-consommer-d-abord-ce-qui-expire.md) - Les comptes au forfait forment un réservoir : chaque tour prend le compte dont la capacité inutilisée expire le plus tôt, sous le rythme permis ; amende 0027.
+* [Auditeur interne](0036-auditeur-interne.md) - Une persona DeepSeek flash vérifie chaque heure et à chaque alerte urgente agents, forfaits, dépense, machines, CI et lots ; agit seule sur le réversible, propose le reste.
