@@ -46,6 +46,12 @@
 --     inutiles à la supervision ; l'empreinte suffit :
 --       agent_registry.public_key (et la vue agent_mesh_overview)
 --       authenticators.public_key, .credential_id
+--   * exécuteurs médiés (voie B, 0048 et 0049) — empreintes de jetons et de
+--     codes, identifiants d'assertions, clé et attestation d'appareil,
+--     réponses rejouables du cache d'idempotence :
+--       executor_tokens.token_sha256, executor_invitations.code_sha256,
+--       executor_assertion_jti.jti, executors.public_key, .device_attestation,
+--       exec_idempotency.response
 --
 --   * CONTENUS — texte libre écrit par les agents ou les humains : corps et
 --     charges des messages, consignes, extraits de fil, arguments et notes
@@ -264,7 +270,40 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'cum_input_tokens', 'cum_cached_input_tokens', 'cum_output_tokens',
         'recorded_at', 'account',
         -- L60 (0041) : clé du marqueur comptable (agent, index, instant)
-        'spend_key'
+        'spend_key',
+        -- L111 (0050) : provenance (harness, relay, device) et bail
+        'source', 'executor', 'lease_owner', 'lease_epoch'
+    ]),
+    -- exécuteurs médiés (voie B : 0048, 0049) : de l'ÉTAT, jamais une
+    -- empreinte de jeton ou de code, ni une réponse rejouable
+    ('exec_idempotency', ARRAY[
+        'executor_id', 'key', 'op', 'request_sha256', 'status', 'at'
+    ]),
+    ('exec_host_availability', ARRAY[
+        'host', 'executor_id', 'available', 'state', 'seq', 'until_at', 'caps',
+        'reason', 'updated_at'
+    ]),
+    ('exec_audit', ARRAY[
+        'id', 'at', 'executor_id', 'host', 'principal', 'agent', 'op', 'route',
+        'status', 'error', 'fenced', 'replayed', 'idempotency_key'
+    ]),
+    ('executor_invitations', ARRAY[
+        'mesh', 'host', 'agents_allowlist', 'created_by', 'created_at',
+        'expires_at', 'consumed_at', 'executor_id', 'cancelled_at'
+    ]),
+    ('executors', ARRAY[
+        'id', 'mesh', 'host', 'thumbprint', 'agents_allowlist', 'label',
+        'device_key_sha256', 'enrolled_by', 'enrolled_at', 'last_seen_at',
+        'revoked_at', 'revoked_by', 'revoked_why'
+    ]),
+    ('executor_tokens', ARRAY[
+        'kind', 'executor_id', 'agent', 'epoch', 'created_at', 'expires_at'
+    ]),
+    ('executor_assertion_jti', ARRAY[
+        'executor_id', 'expires_at'
+    ]),
+    ('executor_events', ARRAY[
+        'id', 'at', 'kind', 'host', 'executor_id', 'actor', 'detail'
     ]),
     -- comptes multiples (L30, 0028) : des NOMS de comptes et l'état de bascule,
     -- jamais un profil (dossier, clé) : ceux-là restent sur l'hôte

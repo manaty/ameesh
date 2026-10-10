@@ -40,6 +40,12 @@ SIGNATURES = {
     "agent_registry": {"public_key"},
     "agent_mesh_overview": {"public_key"},
     "authenticators": {"public_key", "credential_id"},
+    # exécuteurs médiés (voie B, 0048 et 0049)
+    "executor_tokens": {"token_sha256"},
+    "executor_invitations": {"code_sha256"},
+    "executor_assertion_jti": {"jti"},
+    "executors": {"public_key", "device_attestation"},
+    "exec_idempotency": {"response"},
 }
 #: contenus (texte libre) : refusés au rôle de base, seuls lisibles par le rôle
 #: « contenus » (role-superviseur-contenus.sql)
