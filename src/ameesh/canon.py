@@ -774,6 +774,12 @@ class HostPolicy:
     #: `work_roots` et `work_root`. Les trois formes acceptent le gabarit
     #: `{agent}` (un worktree par agent : `~/src/nexlink-{agent}`).
     work_dirs: dict | None = None
+    #: hôte volatil (L112) : appareil prêté qui peut disparaître à tout
+    #: moment (VM Compute) ; son bail est court, 90 s par défaut
+    volatile: bool = False
+    #: durée du bail des agents de cet hôte (secondes, L112) ; None = 90 s
+    #: pour un hôte volatil, sinon la configuration de l'exécuteur
+    lease_ttl: float | None = None
 
     def work_dir(self, project: str | None, agent: str | None = None) -> str | None:
         """Dossier de travail d'un agent (et de son projet) sur cet hôte, ou None.
@@ -2090,6 +2096,23 @@ class _Loader:
                     self.add("host-policy-invalid", ERROR,
                              "`policy.max_agents` : entier positif attendu", **where, **subject)
                     policy.max_agents = 0
+            # L112 : hôte volatil et durée de son bail
+            if raw.get("volatile") is not None:
+                if isinstance(raw["volatile"], bool):
+                    policy.volatile = raw["volatile"]
+                else:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.volatile` : booléen attendu", **where, **subject)
+                    policy.volatile = True  # prudence : bail court
+            if raw.get("lease_ttl") is not None:
+                value = raw["lease_ttl"]
+                if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                        and 10 <= value <= 3600:
+                    policy.lease_ttl = float(value)
+                else:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.lease_ttl` : nombre de secondes entre 10 et 3600 "
+                             "attendu", **where, **subject)
             # Seuils de ressources (L31, 0028) : un mapping dont chaque clé est
             # validée ici ; une clé illisible est une erreur (fail closed sur le
             # seuil, qui retombe alors sur sa valeur par défaut prudente).

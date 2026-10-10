@@ -63,7 +63,7 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 #: il est accepté ici sans dépendre de son code (un type absent n'est jamais
 #: levé, c'est tout).
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
-                 "delegation_expired")
+                 "delegation_expired", "host_unavailable", "host_drain_overdue")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -97,6 +97,8 @@ TYPE_LABELS = {
     "stale_lot": "lot stagnant",
     "host_pressure": "hôte sous pression",
     "orphan_resource": "ressource orpheline",
+    "host_unavailable": "hôte indisponible",
+    "host_drain_overdue": "retrait d'hôte en retard",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired")

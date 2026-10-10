@@ -267,6 +267,21 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: porte d'hôte (L112) : état d'inactivité écrit par le runner Compute.
+    #: `host_gate` : vide (aucune porte, hôte classique inchangé), `file` ou
+    #: `socket` ; `host_gate_path` : le fichier d'état ou la socket (défauts
+    #: `/run/ameesh-gate/state.json`, `/run/ameesh-gate/gate.sock`) ;
+    #: `host_gate_ack` : fichier d'acquittement (défaut : `ack.json` à côté).
+    host_gate: str = ""
+    host_gate_path: str = ""
+    host_gate_ack: str = ""
+    #: état retenu quand la porte est illisible ou absente : vide = `stopped`
+    #: pour un hôte médié, `available` pour un hôte classique
+    host_gate_fallback: str = ""
+    #: hôte médié (exécuteur sans accès à la base, VM d'un appareil prêté)
+    host_mediated: bool = False
+    #: délai de retrait quand l'état `draining` ne donne pas d'échéance (s)
+    host_gate_drain: float = 90.0
 
     @property
     def responsible_required(self) -> bool:
@@ -480,6 +495,26 @@ def load(env: dict | None = None) -> Config:
         approve_tls_name=str(pick("AMEESH_APPROVE_TLS_NAME", default=cfg.approve_tls_name)
                              or "").strip().lower(),
     )
+    # L112 : porte d'hôte
+    gate_path = pick("AMEESH_HOST_GATE_PATH", default=cfg.host_gate_path) or ""
+    gate_ack = pick("AMEESH_HOST_GATE_ACK", default=cfg.host_gate_ack) or ""
+    cfg = replace(
+        cfg,
+        host_gate=str(pick("AMEESH_HOST_GATE", default=cfg.host_gate) or "").strip().lower(),
+        host_gate_path=_expand(str(gate_path)) if gate_path else "",
+        host_gate_ack=_expand(str(gate_ack)) if gate_ack else "",
+        host_gate_fallback=str(pick("AMEESH_HOST_GATE_FALLBACK",
+                                    default=cfg.host_gate_fallback) or "").strip().lower(),
+        host_mediated=bool(_as_bool(pick("AMEESH_HOST_MEDIATED", default=cfg.host_mediated),
+                                    False, "AMEESH_HOST_MEDIATED")),
+        host_gate_drain=max(0.0, _as_float(pick("AMEESH_HOST_GATE_DRAIN"),
+                                           cfg.host_gate_drain)),
+    )
+    if cfg.host_gate not in ("", "none", "file", "socket"):
+        raise SystemExit("AMEESH_HOST_GATE invalide : %r (file | socket)" % cfg.host_gate)
+    if cfg.host_gate_fallback not in ("", "available", "draining", "stopped"):
+        raise SystemExit("AMEESH_HOST_GATE_FALLBACK invalide : %r "
+                         "(available | draining | stopped)" % cfg.host_gate_fallback)
     if cfg.canon_ref.startswith("-"):
         raise SystemExit("AMEESH_CANON_REF invalide : %r" % cfg.canon_ref)
     seen_paths: set[str] = set()

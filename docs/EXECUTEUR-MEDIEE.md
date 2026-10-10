@@ -19,6 +19,8 @@ en silence.
 | `src/ameesh/executeur_mediee/evenements.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/executeur_mediee/porte.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
 | `src/ameesh/executeur_mediee/interfaces.py` | interfaces entre L108, L109 et L110 |
+| `src/ameesh/executeur_mediee/porte_hote.py` | L112 : `FileGate`, `SocketGate`, contrôleur de l'exécuteur, bail d'hôte volatil |
+| `src/ameesh/executeur_mediee/disponibilite.py` | L112 : disponibilité des hôtes côté serveur, alertes |
 | `tests/dore/executeur_mediee/*.json` | jeux d'essai dorés, partagés par le serveur et le client |
 | `tests/test_l107_contrat_executeur.py` | cohérence de la table, des jeux dorés et des interfaces |
 
@@ -137,7 +139,10 @@ Le runner Compute écrit `ameesh-host-state/1`. Ce message porte `state`
 L'exécuteur répond par `ameesh-host-ack/1`, qui porte `seq`, `state`,
 `in_turn`, `held` et `drained`. Il relaie aussi l'état au serveur par
 `PUT /host/availability` (`porte.availability_body`). Un état illisible
-vaut `draining`.
+vaut `draining` d'après `GateState.unreadable()` ; L112 le remplace par un
+repli réglable (`host_gate_fallback`) : `stopped` pour un hôte médié,
+`available` pour un hôte classique (consigne du propriétaire, voir
+`porte_hote`).
 
 La classe abstraite est `porte.HostGate` :
 
@@ -175,4 +180,10 @@ close() -> None
     `ams1.…` pour un jeton de session lié au bail. L'assertion est un JWS
     ES256 de 60 s au plus.
 - **L112, inactivité.** `FileGate(HostGate)` et `SocketGate(HostGate)`, sur
-  les schémas de `porte`.
+  les schémas de `porte` (livrés dans `porte_hote`, avec le contrôleur de
+  l'exécuteur `GateController`, `lease_ttl_for` et `TransportSink`, que L109
+  branche sur `ExecTransport.put_availability`). Côté serveur,
+  `disponibilite` : `check_body`, `admissible`, `AvailabilityRegistry`
+  (mémoire, fichier ; L108 peut la mettre en base) et les alertes
+  `host_unavailable`, `host_drain_overdue`. Exploitation :
+  `docs/EXPLOITATION.md`, « Porte d'hôte ».
