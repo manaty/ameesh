@@ -217,6 +217,12 @@ class Config:
     #: L106 : arrêt propre sur batterie critique — délai laissé aux tours en
     #: cours pour finir avant d'être arrêtés (SIGTERM, consigne remise en attente)
     power_stop_grace: float = 120.0
+    #: arrêt de l'exécuteur (SIGTERM de systemd, SIGINT) : drainage — plus de
+    #: nouveau tour, le tour en cours et son travail de fond finissent dans
+    #: cette borne (secondes), puis arrêt ; 0 = arrêt immédiat (le tour en
+    #: cours est arrêté, sa consigne remise en attente). Un second signal
+    #: arrête tout de suite. L'unité systemd garde TimeoutStopSec au-dessus.
+    drain_seconds: float = 1800.0
     #: politique de session par défaut d'un agent sans réglage (0025, L26) :
     #: `par-lot` (rotation au changement de lot, plus la rotation sur la
     #: taille), `taille` (rotation sur la taille seulement), `jamais`
@@ -466,6 +472,7 @@ def load(env: dict | None = None) -> Config:
                                         cfg.max_fast_failures)),
         host_retry_max=_as_float(pick("AMEESH_HOST_RETRY_MAX"), cfg.host_retry_max),
         power_stop_grace=_as_float(pick("AMEESH_POWER_STOP_GRACE"), cfg.power_stop_grace),
+        drain_seconds=float(_as_count(pick("AMEESH_DRAIN_SECONDS"), int(cfg.drain_seconds))),
         session_policy=str(pick("AMEESH_SESSION_POLICY", default=cfg.session_policy)
                            or "par-lot").strip(),
         balance_interval=_as_float(pick("AMEESH_BALANCE_INTERVAL"), cfg.balance_interval),

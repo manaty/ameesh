@@ -2207,6 +2207,14 @@ class AgentWorker(threading.Thread):
         """
         self.fast_failure = False
         candidats = spec.get("candidats")
+        if self.runner.draining.is_set():
+            # Drainage commencé entre le choix du tour et son lancement : rien
+            # ne part ; une consigne déjà prise repart en attente.
+            if registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch):
+                registry.set_status(self.db, self.name, "queued",
+                                    status_text="exécuteur en arrêt : consigne remise en "
+                                                "attente")
+            return False
         # Dernier contrôle avant de consommer quoi que ce soit (L31, 0028) :
         # couvre les tours ouverts directement (résumé de rotation de compte).
         pression = self.runner.host_pressure()
@@ -2914,6 +2922,8 @@ class AgentWorker(threading.Thread):
         self.ensure_watchdog()
         try:
             while not self.stopping.is_set() and not self.runner.stop.is_set():
+                if self.runner.draining.is_set():
+                    break  # drainage : le tour d'avant est fini, aucun autre ne part
                 if not self.renew():
                     break
                 # L72 : une base injoignable n'arrête plus le worker (son fil
@@ -2953,8 +2963,8 @@ class AgentWorker(threading.Thread):
                     if self.fast_failures >= self.runner.max_fast_failures:
                         self.stop_after_failures()
                         break
-                if self.stopping.is_set():
-                    break  # arrêt demandé (L106 : batterie) — bail rendu sans attendre
+                if self.stopping.is_set() or self.runner.draining.is_set():
+                    break  # arrêt demandé (L106 : batterie ; drainage) — bail rendu sans attendre
                 # Un message non remis ou un harnais en échec ne doit pas
                 # produire une boucle serrée : on laisse retomber, de plus en
                 # plus longtemps tant que les échecs rapides se suivent (L48).
@@ -3014,6 +3024,14 @@ class Runner:
         self.power_stop_grace = max(0.0, float(getattr(cfg, "power_stop_grace", 120.0)))
         #: arrêt sur batterie en cours : plus aucune réclamation de bail
         self.power_hold = threading.Event()
+        #: arrêt demandé par un signal (SIGTERM de systemd) : drainage — plus
+        #: de nouveau tour, le tour en cours et son travail de fond finissent,
+        #: au plus `drain_seconds` ; un second signal arrête tout de suite
+        self.drain_seconds = max(0.0, float(getattr(cfg, "drain_seconds", 1800.0)))
+        self.draining = threading.Event()
+        self._drain_deadline = 0.0
+        self._drain_since = 0.0
+        self._drain_woken = False
         self._power_state = "unknown"
         self._power_thread: threading.Thread | None = None
         adapters.configure(cfg)
@@ -3120,6 +3138,8 @@ class Runner:
                     del self.workers[name]
         if self.power_hold.is_set():
             return  # L106 : arrêt sur batterie — aucun bail repris avant le secteur
+        if self.draining.is_set():
+            return  # drainage : aucun nouvel agent, aucun nouveau tour
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
@@ -3285,6 +3305,59 @@ class Runner:
                                         reprise.minimum * 2 ** (reprise.echecs - 1)))
 
     # -- arrêt -------------------------------------------------------------
+    def request_stop(self, signum: int) -> None:
+        """Un signal d'arrêt (SIGTERM de systemd, SIGINT). Appelé depuis le
+        gestionnaire de signal : aucun verrou, des drapeaux et la file du
+        journal seulement.
+
+        Premier signal : DRAINAGE — plus de nouveau tour ; le tour en cours
+        et son travail de fond finissent, au plus `drain_seconds`, puis
+        l'exécuteur rend ses baux et sort (`_drained`). Un redémarrage
+        ordinaire (`systemctl restart`) ne tue donc plus le tour en cours.
+        Second signal, borne nulle, ou passage unique : arrêt immédiat, comme
+        avant (tour arrêté, consigne remise en attente)."""
+        if self.once or self.drain_seconds <= 0 or self.draining.is_set():
+            immediat = self.draining.is_set()
+            self.stop.set()
+            self.wake_all.set()
+            log_async("signal %d reçu : %s" % (
+                signum, "second signal, arrêt immédiat (tour en cours et travail de "
+                        "fond arrêtés)" if immediat else "arrêt propre"))
+            return
+        self._drain_since = time.monotonic()
+        self._drain_deadline = self._drain_since + self.drain_seconds
+        self.draining.set()
+        self.wake_all.set()
+        log_async("signal %d reçu : drainage — plus de nouveau tour ; le tour en cours et "
+                  "son travail de fond finissent (au plus %ds), puis arrêt ; un second "
+                  "signal arrête tout de suite" % (signum, int(self.drain_seconds)))
+
+    def _drained(self) -> bool:
+        """Drainage en cours : vrai quand l'exécuteur peut s'arrêter — plus
+        aucun worker vivant (chacun sort après son tour) ni travail de fond en
+        délai de grâce, ou borne atteinte (l'arrêt arrête alors ce qui reste)."""
+        with self.lock:
+            workers = list(self.workers.items())
+        if not self._drain_woken:
+            # hors du gestionnaire de signal : les workers au repos sortent
+            self._drain_woken = True
+            for _nom, worker in workers:
+                worker.wake.set()
+        en_tour = sorted(nom for nom, worker in workers if worker.is_alive())
+        fond = self.background.running_count()
+        duree = int(time.monotonic() - self._drain_since)
+        if not en_tour and not fond:
+            log_async("drainage terminé en %ds : plus de tour ni de travail de fond, "
+                      "arrêt" % duree)
+            return True
+        if time.monotonic() >= self._drain_deadline:
+            log_async("drainage : borne de %ds atteinte — arrêt de ce qui reste (%s)"
+                      % (int(self.drain_seconds), ", ".join(
+                          (["tour de %s" % ", ".join(en_tour)] if en_tour else [])
+                          + (["travail de fond de %d tour(s)" % fond] if fond else []))))
+            return True
+        return False
+
     def shutdown(self) -> None:
         self.stop.set()
         self.wake_all.set()
@@ -3892,6 +3965,8 @@ class Runner:
         reprise = Reprise(self.db_retry_max)
         try:
             while not self.stop.is_set():
+                if self.draining.is_set() and self._drained():
+                    break  # `shutdown` rend les baux et arrête ce qui resterait
                 try:
                     self.power_guard()
                 except Exception as exc:  # la garde ne fait jamais tomber l'exécuteur
@@ -4354,10 +4429,9 @@ def main(argv: list[str] | None = None) -> int:
         def handler(signum, _frame):
             # Signal d'abord ; le journal part par la file : un `print` dans un
             # gestionnaire de signal peut tomber pendant un autre `print` du
-            # fil principal (écriture réentrante sur le même flux).
-            runner.stop.set()
-            runner.wake_all.set()
-            log_async("signal %d reçu : arrêt propre" % signum)
+            # fil principal (écriture réentrante sur le même flux). Premier
+            # signal : drainage ; second : arrêt immédiat (`request_stop`).
+            runner.request_stop(signum)
 
         signal.signal(signal.SIGTERM, handler)
         signal.signal(signal.SIGINT, handler)

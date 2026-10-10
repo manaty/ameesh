@@ -238,6 +238,10 @@ ExecStartPre=-%h/.local/share/ameesh/venv/bin/ameesh canon sync --fetch
 ExecStart=%h/.local/share/ameesh/venv/bin/agent-runner --poll 5
 Restart=always
 RestartSec=5
+# stop: SIGTERM to the runner only, which drains (running turns and their
+# background work finish, at most AMEESH_DRAIN_SECONDS = 30 min)
+KillMode=mixed
+TimeoutStopSec=35min
 
 [Install]
 WantedBy=default.target
