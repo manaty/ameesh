@@ -63,7 +63,7 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 #: il est accepté ici sans dépendre de son code (un type absent n'est jamais
 #: levé, c'est tout).
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
-                 "delegation_expired")
+                 "delegation_expired", "engagement_overdue")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -92,6 +92,7 @@ TYPE_LABELS = {
     "dead_runner": "exécuteur mort",
     "idle_with_mail": "agent au repos avec du courrier",
     "delegation_expired": "délégation échue",
+    "engagement_overdue": "engagement ou date prévue dépassé",
     "long_turn": "tour long",
     "session_too_big": "session trop grosse",
     "stale_lot": "lot stagnant",
@@ -778,7 +779,9 @@ def key_of(alert: dict) -> str:
 
 #: champs d'une alerte gardés dans l'état (de quoi écrire la résolution)
 _KEPT = ("type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
-         "responsible", "stop_reason", "assignee")
+         "responsible", "stop_reason", "assignee",
+         # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
+         "commitment", "package", "due")
 
 
 # --------------------------------------------------------------------------

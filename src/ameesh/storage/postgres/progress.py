@@ -70,7 +70,15 @@ class Progress(interface.Progress):
 
     def packages(self) -> list[dict]:
         return self.db.query(
-            "SELECT id, kind, title, parent, responsible, team, status, canon_ref"
+            "SELECT id, kind, title, parent, responsible, team, status, canon_ref,"
+            # L96 : dates du canon et dates posées dans ameesh (jours ISO)
+            "       to_char(start_on, 'YYYY-MM-DD') AS start_on,"
+            "       to_char(end_on, 'YYYY-MM-DD') AS end_on,"
+            "       to_char(delivery_on, 'YYYY-MM-DD') AS delivery_on,"
+            "       to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
+            "       to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
+            "       to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery,"
+            "       planned_source, planned_by"
             "  FROM work_packages WHERE present ORDER BY id")
 
     def package_items(self) -> list[dict]:

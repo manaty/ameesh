@@ -47,7 +47,18 @@ WITH unread AS (
            a.state AS assigned_lot_state,
            coalesce(a.n, 0)::bigint AS open_lots,
            coalesce(s.usd_24h, 0)::float8 AS usd_24h,
-           coalesce(s.turns_24h, 0)::bigint AS turns_24h
+           coalesce(s.turns_24h, 0)::bigint AS turns_24h,
+           lu.body AS last_update_body, lu.ts AS last_update_ts,
+           lu.work_item_id AS last_update_lot,
+           (SELECT extract(epoch from least(
+                       (SELECT min(e.created_at) FROM work_item_events e
+                         WHERE e.work_item_id = coalesce(sw.id, a.id)
+                           AND (e.actor IN (r.name, 'agent:' || r.name)
+                                OR position(('assigné à ' || r.name) in e.note) = 1)),
+                       (SELECT min(m.created_at) FROM agent_mailbox m
+                         WHERE m.sender = r.name
+                           AND m.work_item_id = coalesce(sw.id, a.id)::text)))::float8
+           ) AS on_task_since_ts
       FROM agent_registry r
       LEFT JOIN spend_pending p ON p.agent = r.name
       LEFT JOIN unread u ON u.recipient = r.name
@@ -57,6 +68,14 @@ WITH unread AS (
           SELECT w.id, w.title, w.state FROM work_items w
            WHERE r.session_work_item ~ '^[0-9]{1,18}$'
              AND w.id = r.session_work_item::bigint) sw ON true
+      -- L96 : la dernière avancée de l'agent, lue dans le fil (son dernier
+      -- message ; index agent_mailbox_sender_idx de 0044)
+      LEFT JOIN LATERAL (
+          SELECT left(m.body, 400) AS body, m.work_item_id,
+                 extract(epoch from m.created_at)::float8 AS ts
+            FROM agent_mailbox m
+           WHERE m.sender = r.name AND m.kind <> 'event'
+           ORDER BY m.id DESC LIMIT 1) lu ON true
 ), lots AS (
     SELECT w.id, w.title, w.state, w.app, w.workstream, w.assignee,
            k.team AS package_team,

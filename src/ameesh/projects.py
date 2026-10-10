@@ -46,6 +46,8 @@ SCHEMA = "ameesh-projects/1"
 MAX_LOTS = 500
 #: longueur d'un titre de lot affiché
 TITLE_CHARS = 48
+#: longueur de la dernière avancée affichée (une ligne, L96)
+LAST_UPDATE_CHARS = 120
 #: libellé du projet d'un agent ou d'un lot qui n'en déclare aucun
 NO_PROJECT = "(sans projet)"
 
@@ -128,6 +130,17 @@ def build_agent(row: dict, now: float, paid_harnesses=None) -> dict:
     elif state == "paused":
         reason = _text(row.get("status_text")) or None
     lot = _lot_of(row)
+    # L96 : la dernière avancée lue dans le fil (première ligne non vide de son
+    # dernier message) et depuis quand il est sur sa tâche
+    last_update = None
+    if row.get("last_update_ts") is not None:
+        first = next((l for l in str(row.get("last_update_body") or "").splitlines()
+                      if l.strip()), "")
+        last_update = {"ts": round(float(row["last_update_ts"]), 3),
+                       "text": _short(first, LAST_UPDATE_CHARS),
+                       "lot": int(row["last_update_lot"])
+                       if str(row.get("last_update_lot") or "").isdigit() else None}
+    on_task = row.get("on_task_since_ts") if lot else None
     task = None
     if state == "working" and lot is None:
         task = _short(row.get("status_text"), 80) or None
@@ -145,6 +158,8 @@ def build_agent(row: dict, now: float, paid_harnesses=None) -> dict:
         "task": task,
         "open_lots": int(row.get("open_lots") or 0),
         "unread": int(row.get("unread") or 0),
+        "last_update": last_update,
+        "on_task_since_ts": round(float(on_task), 3) if on_task else None,
         "usd_24h": round(float(row.get("usd_24h") or 0.0), 6),
         "turns_24h": int(row.get("turns_24h") or 0),
         "active": state != "stopped",
@@ -298,11 +313,19 @@ def _headline(p: dict) -> str:
 NARROW_WIDTH = 90
 
 
-def _doing(a: dict) -> str:
+def _last_update(a: dict, now: float) -> str:
+    """« dernière avancée il y a 12m : … » (L96)."""
+    last = a["last_update"]
+    return "avancée il y a %s : %s" % (_span(now - last["ts"]), last["text"])
+
+
+def _doing(a: dict, now: float | None = None) -> str:
     if a["lot"]:
         doing = "#%s %s" % (a["lot"]["id"], a["lot"]["title"])
         if a["open_lots"] > 1:
             doing += " (+%d)" % (a["open_lots"] - 1)
+        if a.get("on_task_since_ts") and now is not None:
+            doing += " (depuis %s)" % _span(now - a["on_task_since_ts"])
         return doing
     if a["task"]:
         return "tour : " + a["task"]
@@ -349,14 +372,19 @@ def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = 
                     a["name"], state_label(a, now), pay, a["usd_24h"], a["unread"]),
                     indent + "  ")
                 if _doing(a) != "—":
-                    wrap(_doing(a), indent + "    ")
+                    wrap(_doing(a, now), indent + "    ")
+                if a.get("last_update"):
+                    wrap(_last_update(a, now), indent + "    ")
                 if a["reason"]:
                     wrap("raison : " + a["reason"], indent + "    ")
                 continue
             head = indent + "  %-*s %-19s %-7s %8.2f %4d  " % (
                 name_w, a["name"][:name_w], state_label(a, now)[:19], pay, a["usd_24h"],
                 a["unread"])
-            out.append(head + _short(_doing(a), max(12, width - len(head))))
+            out.append(head + _short(_doing(a, now), max(12, width - len(head))))
+            if a.get("last_update"):
+                pad = indent + "  " + " " * (name_w + 1)
+                out.append(pad + _short(_last_update(a, now), max(20, width - len(pad))))
             if a["reason"]:
                 pad = indent + "  " + " " * (name_w + 1)
                 out.append(pad + _short("raison : " + a["reason"], max(20, width - len(pad))))
