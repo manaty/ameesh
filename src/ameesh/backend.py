@@ -50,7 +50,7 @@ class FileBackend:
     def send(self, sender: str, dest: str, text: str, host: str | None = None,
              signed: dict | None = None, work_item_id: str | None = None,
              allow_structured: bool = False, kind: str = "notify",
-             urgent: bool = False) -> list[str]:
+             urgent: bool = False, thread_meta: dict | None = None) -> list[str]:
         # Le repli fichier ne stocke pas de signature (format v0 strict) : la
         # CLI prévient l'appelant, le message part quand même.
         fil.ensure_readable(text, allow_structured)
@@ -99,9 +99,10 @@ class FileBackend:
             fil.record(
                 self.cfg, None, sender=sender, recipients=[t for t, _ in sent], text=text,
                 ts=now, project=project, lot=work_item_id,
-                meta={"repli": "fichier", "host": host or socket.gethostname(),
-                      "diffusion": "all" if dest == "all" else None,
-                      "v0": ["%s/%s" % (t, f) for t, f in sent]})
+                meta=dict(thread_meta or {}, repli="fichier",
+                          host=host or socket.gethostname(),
+                          diffusion="all" if dest == "all" else None,
+                          v0=["%s/%s" % (t, f) for t, f in sent]))
         return targets
 
     def unread(self, name: str) -> list[dict]:
@@ -229,7 +230,7 @@ class PgBackend:
     def send(self, sender: str, dest: str, text: str, host: str | None = None,
              signed: dict | None = None, work_item_id: str | None = None,
              allow_structured: bool = False, kind: str = "notify",
-             urgent: bool = False) -> list[str]:
+             urgent: bool = False, thread_meta: dict | None = None) -> list[str]:
         fil.ensure_readable(text, allow_structured)
         projects: dict[str, str] = {}
         if dest == "all":
@@ -252,7 +253,7 @@ class PgBackend:
                 self.db, sender, target, text, host=host, work_item_id=work_item_id,
                 allow_structured=allow_structured, thread=(dest != "all"),
                 kind=kind, payload={"urgent": True} if urgent else None,
-                **dict(signed or {}))
+                thread_meta=thread_meta, **dict(signed or {}))
             registry.upsert(self.db, target, host=host)
             if dest == "all":
                 project = fil.project_for(self.cfg, projects.get(sender), projects.get(target))

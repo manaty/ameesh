@@ -346,7 +346,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L119 (0049) : file d'amélioration ; expected_value est une phrase
         -- courte, lisible comme le titre (ÉTAT), le reste des scalaires
         'expected_value', 'value_score', 'priority', 'team',
-        'required_capabilities'
+        'required_capabilities',
+        -- L118 (0050) : branche du lot, sa cible, dernier commit vu en avance
+        'branch', 'branch_target', 'branch_head'
     ]),
     -- L40 (0031) : registre des délégations et de leur issue (de l'ÉTAT)
     ('work_item_delegations', ARRAY[

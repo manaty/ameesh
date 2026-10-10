@@ -882,6 +882,7 @@ class Notifier:
                     "raised_ts": now, "human": None, "source": None, "status": "nouvelle",
                     "channels": {}}
                 self._raise(entry, router, now)
+                self._brief_orchestrators(db, alert, router)
             elif entry["status"] in ("sans_destinataire", "sans_canal"):
                 # un responsable (ou une route) a pu apparaître depuis
                 self._raise(entry, router, now)
@@ -954,6 +955,40 @@ class Notifier:
         entry["channels"] = {c.name: {"ok": False, "attempts": 0, "error": None}
                              for c in channels}
         self._attempt(entry, "raised", now)
+
+    # -- orchestrateurs (L118) ------------------------------------------------
+    def _brief_orchestrators(self, db, alert: dict, router: Router) -> None:
+        """`idle_capacity` levée : l'orchestrateur de chaque projet reçoit, par
+        courrier `event`, ses agents au repos sans lot et les lots ouverts sans
+        agent — c'est lui qui peut répartir. Une fois par levée (même
+        dédoublonnage que les canaux) ; jamais fatal au passage."""
+        try:
+            listing = list(router.agents().values())
+            titles = {}
+            for lot in (alert.get("lots") or ())[:12]:
+                item = storage.of(db).work.get(int(lot))
+                if item:
+                    titles[int(lot)] = item.get("title") or ""
+            briefs = sous_utilisation.orchestrator_briefs(alert, listing, titles)
+        except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
+            self.log("courrier aux orchestrateurs non préparé (%s)" % exc)
+            return
+        from . import mail, work
+        for orch, text in sorted(briefs.items()):
+            if self.dry_run:
+                self.log("[%s] courrier à l'orchestrateur %s (essai) : %s"
+                         % (alert.get("type"), orch, text))
+                continue
+            try:
+                mail.send(db, work.SYSTEM_SENDER, orch, text, kind="event",
+                          payload={"alert": alert.get("type"),
+                                   "agents": list(alert.get("agents") or ()),
+                                   "lots": list(alert.get("lots") or ())})
+                self.log("[%s] courrier déposé pour l'orchestrateur %s"
+                         % (alert.get("type"), orch))
+            except Exception as exc:  # noqa: BLE001
+                self.log("[%s] courrier à l'orchestrateur %s non déposé (%s)"
+                         % (alert.get("type"), orch, exc))
 
     # -- résolution -----------------------------------------------------------
     def _resolved(self, key: str, entry: dict, now: float) -> None:

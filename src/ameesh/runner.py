@@ -3438,6 +3438,51 @@ class Runner:
                 except Exception:
                     pass
 
+    def branch_sweep_once(self) -> dict | None:
+        """L118 : un relevé des branches des lots ouverts dont l'assigné est sur
+        cet hôte (et, avec `--agents`, parmi eux) : une branche fusionnée dans
+        sa cible, avec ou sans PR, fait passer son lot livré
+        (`plan_git.sync_branches`). Sa propre connexion ; ne lève jamais."""
+        from . import plan_git
+        db = None
+        try:
+            db = db_mod.connect(self.cfg)
+            report = plan_git.sync_branches(
+                db, host=self.host, agents=set(self.agents_filter) if self.agents_filter
+                else None, dry_run=self.dry_run, actor="exécuteur %s" % self.runner_id)
+            for entry in report["results"]:
+                if entry["result"] in ("merged", "would-merge"):
+                    log_async("lot #%s livré : %s%s" % (
+                        entry["work_item"], entry["detail"],
+                        " [dry-run]" if entry["result"] == "would-merge" else ""))
+            return report
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            message = "relevé des branches impossible (%s : %s)" % (type(exc).__name__, exc)
+            if message != getattr(self, "_branch_sweep_error", None):
+                log_async(message)
+            self._branch_sweep_error = message
+            return None
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    def start_branch_sweep_poll(self) -> None:
+        """Relevé périodique des branches (`AMEESH_BRANCH_SWEEP_INTERVAL`,
+        défaut 300 s ; 0 = aucun). L'exécuteur, et non `notify` : il tourne sur
+        chaque hôte, là où sont les dossiers de travail des assignés."""
+        interval = max(0.0, float(getattr(self.cfg, "branch_sweep_interval", 0) or 0))
+        if interval <= 0 or self.once:
+            return
+
+        def boucle() -> None:
+            while not self.stop.wait(max(30.0, interval)):
+                self.branch_sweep_once()
+
+        threading.Thread(target=boucle, daemon=True, name="branches").start()
+
     def start_housekeeping_poll(self) -> None:
         """Passage périodique du ménage (`AMEESH_HOUSEKEEPING_INTERVAL`, défaut
         600 s ; 0 = aucun). En mode `--once`, aucun passage périodique."""
@@ -3688,6 +3733,7 @@ class Runner:
         self.start_balance_poll()
         self.start_resource_poll()
         self.start_housekeeping_poll()
+        self.start_branch_sweep_poll()
         if self.once:
             self.sweep()
             if not self.did_turn:

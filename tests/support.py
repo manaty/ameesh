@@ -136,6 +136,8 @@ def child_env(**extra: str) -> dict:
     # Ni passage périodique du ménage (L73) ni /tmp réel : chaque test de
     # ménage pose son intervalle et son dossier temporaire du système.
     env["AMEESH_HOUSEKEEPING_INTERVAL"] = "0"
+    # ni relevé périodique des branches (L118) : les tests le lancent eux-mêmes
+    env["AMEESH_BRANCH_SWEEP_INTERVAL"] = "0"
     env["AMEESH_SYSTEM_TMP"] = EMPTY_SYSTEM_TMP
     # Aucun moteur de conteneurs réel pendant les tests (L31) : les tests de
     # rattachement injectent leur propre façade.

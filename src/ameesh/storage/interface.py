@@ -770,9 +770,35 @@ class WorkItems(Domain):
     def add(self, *, type: str, source: str, app: str, title: str, body: str,  # noqa: A002
             issue_ref: str | None, workstream: str | None, assignee: str | None,
             budget_usd: float | None, note: str, actor: str,
-            package_id: str | None = None, package_parent: str | None = None) -> dict:
+            package_id: str | None = None, package_parent: str | None = None,
+            branch: str | None = None, branch_target: str | None = None) -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
-        `package_id`, L29) et sa première ligne de journal ; rend le lot."""
+        `package_id`, L29 ; avec sa branche si `branch`, L118) et sa première
+        ligne de journal ; rend le lot."""
+
+    @abc.abstractmethod
+    def set_branch(self, item_id: int, branch: str | None, target: str | None, *,
+                   note: str, actor: str) -> dict | None:
+        """L118 : pose la branche et la cible d'un lot ouvert (journalisé) ;
+        None si le lot n'est plus ouvert."""
+
+    @abc.abstractmethod
+    def set_branch_head(self, item_id: int, branch: str, head: str | None) -> bool:
+        """L118 : retient le dernier commit de la branche vu en avance sur sa
+        cible, si la branche du lot est toujours `branch`."""
+
+    @abc.abstractmethod
+    def open_with_branch(self, limit: int) -> list[dict]:
+        """L118 : les lots ouverts qui portent une branche."""
+
+    @abc.abstractmethod
+    def open_for(self, assignee: str) -> list[dict]:
+        """L118 : les lots ouverts d'un assigné."""
+
+    @abc.abstractmethod
+    def open_by_ref(self, ref: str) -> list[dict]:
+        """L118 : les lots ouverts désignés par une référence (issue, fiche,
+        branche, premier mot du titre)."""
 
     @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:

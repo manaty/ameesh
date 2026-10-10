@@ -57,6 +57,7 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_BALANCE_INTERVAL` | `balance_interval` | 900 s | provider balance reading by the runner (0 = never; only with a key) |
 | `AMEESH_DEEPSEEK_API_BASE` | — | the provider's API | base URL of the balance reading |
 | `AMEESH_RESOURCE_INTERVAL` | `resource_interval` | 60 s | host resource reading by the runner (0 = none; see `ameesh hosts`) |
+| `AMEESH_BRANCH_SWEEP_INTERVAL` | `branch_sweep_interval` | 300 s | runner check of lot branches: a lot whose branch is merged into its target is closed (L118; 0 = none) |
 | `AMEESH_RELOCATE` | `relocate` | off | move an agent of a host under pressure to another admitted host, between two turns |
 | `AMEESH_SHARED_SESSIONS` | `shared_sessions` | off | session storage shared between hosts: a move keeps the native session instead of rotating with a summary |
 | `AMEESH_CONTAINER_RUNTIME` | `container_runtime` | `auto` | containers attached to a turn: `auto` (docker, then podman), a runtime name, or `none` |

@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-10 (affectations suivies)
+* **L118** : l'orchestrateur confiait le travail par courrier sans lot (agents « sans lot » dans `ameesh projects`, `idle_capacity` trompée, frise vide) et ses lots restaient ouverts après la fusion directe de leur branche sur la cible, sans PR ni gel. Désormais : `mail send --lot <id|réf>` rattache et assigne le lot au destinataire (garde L37 ; jamais repris à un autre agent), `--new-lot "titre"` le crée, un orchestrateur qui écrit à un agent sans lot est averti ; un lot porte sa branche et sa cible (migration 0050), l'exécuteur constate la fusion par le contenu (commit de fusion, avance rapide, squash, commit de fusion qui cite la branche) et ferme le lot ; `idle_capacity` part aussi en courrier `event` aux orchestrateurs. Consigne : [ORCHESTRATEUR.md](../ORCHESTRATEUR.md).
+
 ## 2026-10-10 (jamais à l'arrêt)
 * **Décision** (proposée) : [ameesh ne s'arrête jamais, il s'améliore](decisions/0037-jamais-a-l-arret.md). Quand rien n'attend, les agents au forfait dorment et leur capacité est perdue ; une file d'amélioration continue leur donne du travail à valeur attendue, sans humain pour le confier.
 * **L119** : `ameesh work backlog add|list` (lots `improvement`, migration 0049 : valeur attendue, score, priorité, équipe, capacités) ; prise automatique à chaque passage d'`ameesh notify`, seulement si aucun lot n'attend l'agent ni le projet, jamais de geste irréversible ou de production ; forfaits d'abord, plafonds, pression de l'hôte, débit par heure compté en base ; alerte `backlog_empty`.
