@@ -1906,14 +1906,16 @@ class SessionBindings(Domain):
     @abc.abstractmethod
     def bind(self, *, host: str, harness: str, session_id: str, agent: str,
              pid: int | None, created_by: str,
-             pid_start: int | None = None) -> dict | None:
+             pid_started_at: float | None = None) -> dict | None:
         """Crée la liaison si la session n'en a pas d'active ; rend la ligne
         créée, ou None si une liaison active existe déjà (rien n'est écrit).
-        L46 : `pid_start`, heure de démarrage du PID (NULL : non contrôlée)."""
+        L46, L63 : `pid_started_at`, heure de démarrage du PID en secondes
+        epoch (NULL : non contrôlée). L'ancienne `pid_start` (tops d'horloge
+        Linux, 0036) n'est plus écrite ; elle reste lue."""
 
     @abc.abstractmethod
     def set_pid(self, binding_id: int, pid: int | None,
-                pid_start: int | None = None) -> dict | None:
+                pid_started_at: float | None = None) -> dict | None:
         """Change le PID ancêtre exigé (et son heure de démarrage, L46) d'une
         liaison ACTIVE ; None sinon."""
 

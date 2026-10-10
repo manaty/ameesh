@@ -385,8 +385,13 @@ migration 0034 ; une liaison active au plus par hôte, harnais et session).
 Le hook la retrouve par l'identifiant de session que le harnais lui passe en
 JSON ; si la liaison porte un PID, celui-ci doit être un ancêtre du processus
 du hook — et, L46 (migration 0036, `pid_start`), le MÊME processus : son heure
-de démarrage (champ 22 de `/proc/<pid>/stat`), relevée à la liaison, est
-recontrôlée ; un PID recyclé ne donne rien (re-lier avec `--pid`). Source `session` : jamais liée à un bail, donc soumise à la règle L36
+de démarrage, relevée à la liaison, est recontrôlée ; un PID recyclé ne
+donne rien (re-lier avec `--pid`). L63 (migration 0048, `pid_started_at`) :
+cette heure est en secondes epoch, lue par la couche plateforme
+(`ameesh.platform`) sur tous les OS ; une ancienne `pid_start` (tops
+d'horloge Linux) reste lue par conversion, sous Linux seulement. Si l'OS ne
+donne ni l'ascendance ni l'heure de démarrage, `bind --pid` est refusé et le
+hook ne remet rien (jamais de contrôle muet). Source `session` : jamais liée à un bail, donc soumise à la règle L36
 (elle ne remplace pas la session enregistrée d'un agent), et sans effet dès
 que l'agent détient un bail vivant (il est alors mené par l'exécuteur ; `bind`
 le refuse d'emblée). `whoami`, `send` et `inbox`, lancés dans la session, la

@@ -76,7 +76,7 @@ jobs:
         if: steps.venv.outputs.cache-hit != 'true'
         run: |
           python -m venv .venv-ci
-          .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41'
+          .venv-ci/bin/pip install 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
       - &base
         name: base jetable (sans fsync) et client psql
         run: |
@@ -128,11 +128,30 @@ jobs:
       - name: part ${{ matrix.part }}
         run: python scripts/test-parts.py lancer --parts "$PARTS" --part ${{ matrix.part }} --pilote psql ${LISTE:+--liste "$LISTE"}
 
+  # L63 : la couche plateforme (ameesh.platform) et son lint, sans base, sous
+  # macOS avec psutil. Sous Linux, les parts psycopg passent par psutil et les
+  # parts psql (sans psutil) par le repli /proc.
+  platform-macos:
+    name: plateforme macOS
+    runs-on: macos-latest
+    timeout-minutes: 10
+    env:
+      AMEESH_REQUIRE_DB: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: psutil
+        run: python -m pip install 'psutil>=5.9'
+      - name: couche plateforme et lint
+        run: python -m unittest -v tests.test_l63_platform.PlatformTest tests.test_l63_platform.LintTest
+
   # nom de vérification stable : vert seulement si toutes les parts le sont
   tests:
     name: tests
     if: always()
-    needs: [psycopg, psql]
+    needs: [psycopg, psql, platform-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -140,5 +159,7 @@ jobs:
         run: |
           echo "psycopg : ${{ needs.psycopg.result }}"
           echo "psql    : ${{ needs.psql.result }}"
+          echo "macOS   : ${{ needs.platform-macos.result }}"
           test "${{ needs.psycopg.result }}" = success
           test "${{ needs.psql.result }}" = success
+          test "${{ needs.platform-macos.result }}" = success
