@@ -50,6 +50,16 @@ def log(message: str) -> None:
     print("%s %s" % (time.strftime("%H:%M:%S"), message), flush=True)
 
 
+def _duree(secondes: float) -> str:
+    """Une durée lisible : « 45 s », « 7 min 05 s », « 2 h 13 min »."""
+    secondes = int(max(0.0, secondes))
+    if secondes < 60:
+        return "%d s" % secondes
+    if secondes < 3600:
+        return "%d min %02d s" % (secondes // 60, secondes % 60)
+    return "%d h %02d min" % (secondes // 3600, secondes % 3600 // 60)
+
+
 class _AsyncLog:
     """Journal non bloquant pour le fil du battement (sondes codex3 B5a-N).
 
@@ -1042,7 +1052,17 @@ class AgentWorker(threading.Thread):
 
         L105 : un tour clos par le plafond de contexte force la rotation au
         premier passage (le grand livre d'un tour interrompu peut ne rien dire).
+
+        Sous la pression de l'hôte, une rotation due ATTEND la fin de la
+        pression (le tour de résumé ne partirait pas) : elle n'est ni tentée
+        ni annulée à chaque passage (2026-10-10 : 62 rotations annulées en une
+        soirée), et la ligne de fin de l'épisode de pression la cite.
         """
+        if self.proc is None and (self.rotation_forcee or self.context_rotation_due()
+                                  or self.rotation_due()):
+            if self._held_by_pressure(self.runner.host_pressure()):
+                self.runner.pressure_delayed(self.name, rotation=True)
+                return False
         if self.rotation_forcee and self.proc is None:
             raison, self.rotation_forcee = self.rotation_forcee, None
             if self.session_policy() != "jamais" and self.current_session():
@@ -1060,7 +1080,14 @@ class AgentWorker(threading.Thread):
         """Le mécanisme de rotation (L11) : résumé dans la session, puis oubli."""
         ancienne = self.current_session()
         log_async("[%s] rotation de session (%s)" % (self.name, raison))
+        self._refus_pression = False
         ok = self.run_turn({"kind": "prompt", "prompt": adapters.SUMMARY_PROMPT, "ids": []})
+        if not ok and self._refus_pression:
+            # la pression est venue entre le choix et le lancement : la
+            # rotation attend sa fin (ligne de fin de l'épisode), sans trace
+            # au fil à chaque passage
+            self.runner.pressure_delayed(self.name, rotation=True)
+            return False
         if not ok:
             # Résumé partiel, bail perdu pendant le tour, claim remplaçant : on ne
             # touche à rien. Effacer la session ici effacerait celle du remplaçant
@@ -1926,6 +1953,20 @@ class AgentWorker(threading.Thread):
         self.wake.set()
         return True
 
+    def _held_by_pressure(self, pressure: dict) -> bool:
+        """La pression de l'hôte retient-elle le prochain tour de cet agent ?
+
+        Oui dès qu'un seuil est franchi (L31, 0028) — sauf pour un
+        orchestrateur sous une pression NON critique et hors batterie basse :
+        ses tours sont courts, et c'est lui qui distribue le travail des autres
+        (2026-10-10 : charge jusqu'à 43 pour 12 CPU, plus aucun tour, pas même
+        le sien, et personne pour répartir)."""
+        if not pressure.get("blocked"):
+            return False
+        if pressure.get("critical") or not self.runner.is_orchestrator(self.name):
+            return True
+        return any(b.get("power") for b in pressure.get("breaches") or ())
+
     def _host_pressure_note(self, pressure: dict) -> None:
         """Trace la contre-pression (L31, 0028) ; en critique, met en pause.
 
@@ -1938,6 +1979,8 @@ class AgentWorker(threading.Thread):
                 or int(self.agent.get("priority") or 0) > 0):
             self._host_pressure_hold(raisons)
             return
+        if self._work_waiting():
+            self.runner.pressure_delayed(self.name)
         texte = "pression critique de l'hôte %s : %s" % (self.runner.host, raisons)
         if getattr(self, "_pressure_reason", "") == texte:
             return
@@ -1945,7 +1988,10 @@ class AgentWorker(threading.Thread):
         # expiré) ou un tour en cours est refusé (L31, 0028).
         if not registry.pause(self.db, self.name, self.runner.runner_id, self.epoch,
                               "pause : " + texte):
-            log("[%s] pause refusée : bail perdu, remplacé, ou tour en cours" % self.name)
+            if getattr(self, "_pause_refused", "") != texte:  # dit une fois
+                self._pause_refused = texte
+                log_async("[%s] pause refusée : bail perdu, remplacé, ou tour en cours"
+                          % self.name)
             return
         if not getattr(self, "_pressure_text", ""):
             self._pressure_before = self.agent.get("status_text") or ""
@@ -1970,9 +2016,11 @@ class AgentWorker(threading.Thread):
         Sans elle, un agent retenu restait `queued`, erreur vide, sans raison
         lisible. Le statut ne change pas ; seul le texte dit ce qui retient le
         tour, et seulement quand du travail attend. Fencé par le bail ; ne lève
-        jamais."""
+        jamais. Le journal, lui, ne dit l'attente qu'une fois par épisode de
+        pression, pour tous les agents (`Runner._pressure_episode_update`)."""
         if not self._work_waiting():
             return
+        self.runner.pressure_delayed(self.name)
         texte = "en attente : pression de l'hôte %s — %s" % (self.runner.host, raisons)
         if getattr(self, "_pressure_text", "") == texte:
             return
@@ -1985,13 +2033,13 @@ class AgentWorker(threading.Thread):
         if posee:
             if not getattr(self, "_pressure_text", ""):
                 self._pressure_before = self.agent.get("status_text") or ""
-                log("[%s] %s" % (self.name, texte))
             self._pressure_text = texte
 
     def _host_pressure_release(self) -> None:
         """L31b : la pression est retombée — l'attente ou la pause s'efface,
         si son texte est toujours en place (personne ne l'a remplacé) ; le texte
         d'avant (« reprise : même session »…) revient."""
+        self._pause_refused = ""
         texte = getattr(self, "_pressure_text", "")
         if not texte:
             return
@@ -2005,7 +2053,7 @@ class AgentWorker(threading.Thread):
         self._pressure_text = ""
         self._pressure_reason = ""
         if levee:
-            log("[%s] pression de l'hôte retombée : les tours reprennent" % self.name)
+            # la fin de l'épisode est dite une fois, pour tous les agents
             agent = registry.get(self.db, self.name)
             if agent is not None:
                 self.agent = agent
@@ -2047,9 +2095,10 @@ class AgentWorker(threading.Thread):
         if not self.budget_ok():
             return None  # garde de budget (L13) : aucun tour, état `paused` posé
         # Contre-pression de l'hôte (L31, 0028) : au-dessus d'un seuil, aucun
-        # NOUVEAU tour ne démarre ; la consigne en attente n'est pas consommée.
+        # NOUVEAU tour ne démarre ; la consigne en attente n'est pas consommée
+        # (l'orchestrateur excepté, sous une pression non critique).
         pressure = self.runner.host_pressure()
-        if pressure.get("blocked"):
+        if self._held_by_pressure(pressure):
             if self.maybe_relocate(pressure):
                 return None  # déplacé : le worker s'arrête, le bail sera rendu
             self._host_pressure_note(pressure)
@@ -2218,9 +2267,12 @@ class AgentWorker(threading.Thread):
         # Dernier contrôle avant de consommer quoi que ce soit (L31, 0028) :
         # couvre les tours ouverts directement (résumé de rotation de compte).
         pression = self.runner.host_pressure()
-        if pression.get("blocked"):
+        self._refus_pression = self._held_by_pressure(pression)
+        if self._refus_pression:
             self._host_pressure_note(pression)
             return False
+        if pression.get("blocked"):
+            self.runner.pressure_bypassed(self.name)  # orchestrateur, non critique
         if not candidats or self.runner.dry_run:
             return self._run_turn(spec)
         kind = spec["kind"]
@@ -3061,6 +3113,15 @@ class Runner:
                                 "limits": self._host_limits}
         self._pressure_at = 0.0
         self._all_host_limits: dict = {}
+        #: épisode de pression en cours (une ligne de journal à son début, une
+        #: à sa fin : durée, tours retardés), ou None
+        self._pressure_episode: dict | None = None
+        #: orchestrateurs (rôle `orchestrateur` au canon, relu à chaque `canon
+        #: sync` ; `AMEESH_ALERT_ORCHESTRATORS`) : sous une pression NON
+        #: critique, leurs tours partent quand même
+        from . import sous_utilisation as su
+        self._orchestrators_declared = frozenset(su.declared_orchestrators())
+        self._orchestrators_roles: frozenset = frozenset()
         #: L43 (0031) : `max_agents` physique (le plus strict des canons) et
         #: provenance de chaque limite ; journal « hôte plein » une fois par valeur
         self._host_max_agents: int | None = None
@@ -3466,6 +3527,9 @@ class Runner:
             refresh = getattr(self, "refresh_host_limits", None)
             if refresh is not None and synced:
                 refresh(*synced)
+            orchestres = getattr(self, "refresh_orchestrators", None)
+            if orchestres is not None and synced:
+                orchestres(*synced)
             return ok
         except Exception as exc:  # jamais fatal : le canon ferme, il ne tue pas
             log_async("canon sync en échec : %s" % " ".join(str(exc).split())[:200])
@@ -3812,7 +3876,76 @@ class Runner:
         with self._pressure_lock:
             self._pressure = verdict
             self._pressure_at = now
+            self._pressure_episode_update(verdict)
         return dict(verdict)
+
+    # -- pression : orchestrateurs et épisodes ------------------------------
+    def is_orchestrator(self, name: str) -> bool:
+        """`name` est-il un orchestrateur ? Rôle au canon (`roles:
+        [orchestrateur]` de sa fiche Agent) ou `AMEESH_ALERT_ORCHESTRATORS`."""
+        return (name in getattr(self, "_orchestrators_declared", ())
+                or name in getattr(self, "_orchestrators_roles", ()))
+
+    def refresh_orchestrators(self, *canons) -> None:
+        """Après chaque `canon sync` : les agents au rôle d'orchestrateur."""
+        from . import sous_utilisation as su
+        self._orchestrators_roles = frozenset(su.role_orchestrators(canons))
+
+    def _pressure_episode_update(self, verdict: dict) -> None:
+        """À chaque verdict FRAIS, sous `_pressure_lock` : une ligne de journal
+        au début d'un épisode de pression, une à sa fin — début, fin, durée,
+        tours retardés —, jamais une par tentative de tour."""
+        from . import resources as resources_mod
+        episode = getattr(self, "_pressure_episode", None)
+        if verdict.get("blocked"):
+            if episode is None:
+                self._pressure_episode = {"since": time.time(),
+                                          "critical": bool(verdict.get("critical")),
+                                          "delayed": set(), "rotations": set(),
+                                          "orchestrator_turns": 0}
+                batterie = any(b.get("power") for b in verdict.get("breaches") or ())
+                log_async("pression de l'hôte %s : début — %s ; plus de nouveau tour%s"
+                          % (self.host, resources_mod.describe(verdict.get("breaches"))
+                             or "seuil",
+                             " (pression critique)" if verdict.get("critical") else
+                             " (batterie basse)" if batterie else
+                             " sauf ceux d'un orchestrateur (pression non critique)"))
+            elif verdict.get("critical"):
+                episode["critical"] = True
+            return
+        if episode is None:
+            return
+        self._pressure_episode = None
+        fin = time.time()
+        retardes = sorted(episode["delayed"])
+        log_async("pression de l'hôte %s : fin — de %s à %s (%s)%s ; %d tour(s) retardé(s)%s"
+                  "%s%s" % (
+                      self.host, time.strftime("%H:%M:%S", time.localtime(episode["since"])),
+                      time.strftime("%H:%M:%S", time.localtime(fin)),
+                      _duree(fin - episode["since"]),
+                      ", critique par moments" if episode["critical"] else "",
+                      len(retardes),
+                      " (%s%s)" % (", ".join(retardes[:12]), ", …" if len(retardes) > 12
+                                   else "") if retardes else "",
+                      " ; rotation de session reportée : %s"
+                      % ", ".join(sorted(episode["rotations"])) if episode["rotations"] else "",
+                      " ; %d tour(s) d'orchestrateur passé(s)" % episode["orchestrator_turns"]
+                      if episode["orchestrator_turns"] else ""))
+
+    def pressure_delayed(self, agent: str, *, rotation: bool = False) -> None:
+        """Un tour (ou une rotation de session) de `agent` attend la fin de
+        l'épisode de pression en cours : compté pour sa ligne de fin."""
+        with self._pressure_lock:
+            episode = getattr(self, "_pressure_episode", None)
+            if episode is not None:
+                episode["rotations" if rotation else "delayed"].add(agent)
+
+    def pressure_bypassed(self, agent: str) -> None:
+        """Un tour d'orchestrateur part malgré la pression (non critique)."""
+        with self._pressure_lock:
+            episode = getattr(self, "_pressure_episode", None)
+            if episode is not None:
+                episode["orchestrator_turns"] += 1
 
     def power_reading(self) -> dict:
         """Alimentation de l'hôte (L106) ; surchargée par les tests."""
