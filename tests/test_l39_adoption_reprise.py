@@ -464,6 +464,10 @@ class SessionAccountTest(_Base):
         dernier = self.turns()[-1]
         self.assertNotIn("resume", dernier["argv"])
         self.assertIn("# Brief de reprise de rb", dernier["argv"][-1])
+        # encadré comme un brief d'ameesh, jamais comme le résumé de l'agent
+        self.assertIn('auteur="ameesh, brief déterministe" autorite="aucune"',
+                      dernier["argv"][-1])
+        self.assertNotIn("que tu as écrit toi-même", dernier["argv"][-1])
         self.assertIn("brief déterministe (L39)", self._fil())
 
 
