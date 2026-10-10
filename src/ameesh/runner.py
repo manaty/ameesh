@@ -1868,25 +1868,83 @@ class AgentWorker(threading.Thread):
         Ne touche JAMAIS un tour en cours : `_pick` s'exécute entre deux tours.
         Seuls les agents de priorité la plus basse (0, le défaut) sont mis en
         pause ; les autres attendent simplement que la pression redescende."""
-        if not pressure.get("critical"):
+        from . import resources as resources_mod
+        raisons = resources_mod.describe(pressure.get("breaches")) or "seuil"
+        if (not pressure.get("critical")
+                or int(self.agent.get("priority") or 0) > 0):
+            self._host_pressure_hold(raisons)
             return
-        if int(self.agent.get("priority") or 0) > 0:
-            return
-        raisons = " ; ".join("%s %s (seuil %s)" % (b["label"], b["value"], b["limit"])
-                              for b in pressure.get("breaches") or [])
-        texte = "pression critique de l'hôte %s : %s" % (self.runner.host, raisons or "seuil")
+        texte = "pression critique de l'hôte %s : %s" % (self.runner.host, raisons)
         if getattr(self, "_pressure_reason", "") == texte:
             return
         # Pause fencée par le bail : un worker périmé (bail perdu, remplacé,
         # expiré) ou un tour en cours est refusé (L31, 0028).
         if not registry.pause(self.db, self.name, self.runner.runner_id, self.epoch,
-                              "pression hôte"):
+                              "pause : " + texte):
             log("[%s] pause refusée : bail perdu, remplacé, ou tour en cours" % self.name)
             return
+        if not getattr(self, "_pressure_text", ""):
+            self._pressure_before = self.agent.get("status_text") or ""
         self._pressure_reason = texte
+        self._pressure_text = "pause : " + texte
         self._fil_note("Pause : %s. Aucun nouveau tour tant que la pression ne "
                        "redescend pas ; le tour en cours n'est jamais interrompu." % texte,
                        meta={"action": "pression-hote", "hote": self.runner.host})
+
+    def _work_waiting(self) -> bool:
+        """Une consigne ou du courrier attend ce worker (L31b)."""
+        if self.agent.get("pending_prompt"):
+            return True
+        try:
+            return bool(mail.unread(self.db, self.name, limit=1))
+        except db_mod.DbError:
+            return False
+
+    def _host_pressure_hold(self, raisons: str) -> None:
+        """L31b : une attente de pression se VOIT (`ameesh show`, `ameesh list`).
+
+        Sans elle, un agent retenu restait `queued`, erreur vide, sans raison
+        lisible. Le statut ne change pas ; seul le texte dit ce qui retient le
+        tour, et seulement quand du travail attend. Fencé par le bail ; ne lève
+        jamais."""
+        if not self._work_waiting():
+            return
+        texte = "en attente : pression de l'hôte %s — %s" % (self.runner.host, raisons)
+        if getattr(self, "_pressure_text", "") == texte:
+            return
+        try:
+            posee = registry.hold_note(self.db, self.name, self.runner.runner_id,
+                                       self.epoch, texte)
+        except db_mod.DbError as exc:
+            log("[%s] attente de pression non affichée (%s)" % (self.name, exc))
+            return
+        if posee:
+            if not getattr(self, "_pressure_text", ""):
+                self._pressure_before = self.agent.get("status_text") or ""
+                log("[%s] %s" % (self.name, texte))
+            self._pressure_text = texte
+
+    def _host_pressure_release(self) -> None:
+        """L31b : la pression est retombée — l'attente ou la pause s'efface,
+        si son texte est toujours en place (personne ne l'a remplacé) ; le texte
+        d'avant (« reprise : même session »…) revient."""
+        texte = getattr(self, "_pressure_text", "")
+        if not texte:
+            return
+        try:
+            levee = registry.release_hold(self.db, self.name, self.runner.runner_id,
+                                          self.epoch, texte,
+                                          getattr(self, "_pressure_before", ""))
+        except db_mod.DbError as exc:
+            log("[%s] levée de l'attente de pression impossible (%s)" % (self.name, exc))
+            return
+        self._pressure_text = ""
+        self._pressure_reason = ""
+        if levee:
+            log("[%s] pression de l'hôte retombée : les tours reprennent" % self.name)
+            agent = registry.get(self.db, self.name)
+            if agent is not None:
+                self.agent = agent
 
     def pick(self) -> dict | None:
         """Le prochain tour à faire, ou None. Consomme la consigne en attente.
@@ -1932,6 +1990,7 @@ class AgentWorker(threading.Thread):
                 return None  # déplacé : le worker s'arrête, le bail sera rendu
             self._host_pressure_note(pressure)
             return None
+        self._host_pressure_release()
         # Hôte non prêt (L106) : harnais introuvable — rien n'est consommé,
         # nouvel essai à échéance, reprise d'elle-même.
         if not self.host_ready():
