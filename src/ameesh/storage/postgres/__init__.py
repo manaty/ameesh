@@ -20,6 +20,7 @@ from .costs import TurnCosts
 from .grants import Grants
 from .hosts import Hosts, TurnResources, Visibility
 from .mailbox import Mailbox
+from .menage import Housekeeping
 from .operations import Operations
 from .packages import WorkPackages
 from .placement import Placements
@@ -64,4 +65,5 @@ class PostgresStorage(interface.Storage):
         self.hosts = Hosts(db)
         self.turn_resources = TurnResources(db)
         self.visibility = Visibility(db)
+        self.housekeeping = Housekeeping(db)
         self.session_bindings = SessionBindings(db)
