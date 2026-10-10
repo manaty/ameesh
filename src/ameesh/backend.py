@@ -331,6 +331,56 @@ class PgBackend:
         self.db.close()
 
 
+class MediatedBackend(PgBackend):
+    """L109 : la session du harnais dans la VM d'un exécuteur médié.
+
+    Elle n'a que le jeton de session lié au bail (`AMEESH_EXEC_TOKEN`) : les
+    opérations de la route `session/op` (identité par `leases.state`,
+    annuaire réduit, envoi, lots, proposition d'action). Ce que le serveur
+    ne lui ouvre pas est sauté ici, jamais tenté :
+
+    * pas d'inscription par le hook : l'exécuteur a déjà tout écrit sous son
+      bail (`agents.upsert` exige le jeton d'exécuteur) ;
+    * pas de remise de courrier par le hook (`hook_delivery` faux) : la
+      réservation est une opération de l'exécuteur ; le courrier attend le
+      tour suivant, et un urgent préempte le tour côté exécuteur ;
+    * l'envoi n'écrit ni la ligne du destinataire, ni le fil local (index
+      des fils : opération de l'exécuteur)."""
+
+    kind = "pg"
+    mediated = True
+    hook_delivery = False
+
+    def send(self, sender: str, dest: str, text: str, host: str | None = None,
+             signed: dict | None = None, work_item_id: str | None = None,
+             allow_structured: bool = False, kind: str = "notify",
+             urgent: bool = False) -> list[str]:
+        fil.ensure_readable(text, allow_structured)
+        if dest == "all":
+            rows = registry.overview(self.db)
+            projects = {row["name"]: fil.agent_project(row) for row in rows}
+            own = projects.get(sender)
+            targets = [row["name"] for row in rows if row["name"] != sender
+                       and (not own or projects.get(row["name"]) == own)]
+        else:
+            targets = [dest]
+        for target in targets:
+            mail.send(self.db, sender, target, text, host=host, work_item_id=work_item_id,
+                      allow_structured=allow_structured, thread=False, kind=kind,
+                      payload={"urgent": True} if urgent else None, **dict(signed or {}))
+        return targets
+
+    def register(self, name: str, tool: str, cwd: str | None, session_id: str | None,
+                 *, leased: bool = True) -> None:
+        return None
+
+    def get_status(self, name: str) -> str:
+        return ""
+
+    def set_status(self, name: str, text: str) -> None:
+        raise db_mod.DbError("statut libre : non admis depuis une session médiée")
+
+
 def open_backend(cfg: Config) -> tuple[FileBackend | PgBackend, str | None]:
     """Ouvre le backend voulu. Renvoie (backend, avertissement lisible ou None).
 
@@ -342,6 +392,9 @@ def open_backend(cfg: Config) -> tuple[FileBackend | PgBackend, str | None]:
     mode = cfg.backend
     if mode == "file":
         return FileBackend(cfg), None
+    if mode == "mediated":
+        # L109 : pas de repli fichier dans la VM (rien n'y serait lu)
+        return MediatedBackend(cfg, db_mod.connect(cfg)), None
     try:
         db = db_mod.connect(cfg)
         db_mod.require_schema(db, defer=True)

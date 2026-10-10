@@ -252,3 +252,69 @@ plus de 24 h sont élaguées toutes les 10 minutes, l'audit après 90 jours.
 - **L112.** L'exécuteur relaie sa porte par `PUT /host/availability` au
   démarrage et à chaque changement : sans ce rapport, l'hôte reste
   indisponible.
+
+## Client et mode médié (L109)
+
+Le client vit dans `src/ameesh/storage/remote/` :
+
+| Fichier | Rôle |
+|---|---|
+| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 61 opérations), `LeaseBook` (carnet des baux) |
+| `http.py` | `HttpTransport(ExecTransport)`, `StaticTokenSource`, `FileTokenSource` |
+| `events.py` | `RemoteSubscription` : SSE, repli en attente longue, curseur gardé |
+| `__init__.py` | `connect(cfg)`, `set_token_source_factory` (point d'attache de L110) |
+
+- **Choix du stockage.** `storage.of(db)` rend le stockage distant pour une
+  `RemoteDb`. `db.connect(cfg)` rend une `RemoteDb` quand
+  `backend: mediated` ; `exec_url` (`AMEESH_EXEC_URL`) donne le serveur.
+- **Hors table.** Toute opération refusée lève `NotSupportedRemotely` avant
+  tout appel. Une connexion de session n'appelle que `session/op`, une
+  connexion d'exécuteur que `op`.
+- **Enveloppe de bail.** Elle vient des arguments `owner`/`epoch`, sinon du
+  carnet des baux, tenu par `claim`, `renew`, `release` et chaque réponse
+  `fenced`. Sans bail détenu, l'opération rend sa valeur de refus sans
+  appel.
+- **Transport.** Un 401 renouvelle le jeton une fois. Une coupure, un 429
+  ou un 5xx donnent deux nouveaux essais (même `Idempotency-Key`,
+  `Retry-After` borné à 5 s), puis `Unavailable` : les reprises de L72
+  prennent le relais. TLS obligatoire hors de la boucle locale.
+- **Jeton d'exécuteur.** Par défaut, il est lu dans un fichier 0600
+  (`exec_token_file`, `AMEESH_EXEC_TOKEN_FILE`). L110 fournit la vraie
+  source par `set_token_source_factory(factory)`.
+
+Le mode médié de l'exécuteur (`runner.py`, `Runner.mediated`) :
+
+- l'hôte, l'owner (`exec:<id>:<hôte>:<pid>`), le bail et les limites
+  viennent de `GET /host` ;
+- ni synchronisation du canon, ni relevé des soldes, ni échéance des
+  délégations, ni déplacement entre hôtes, ni connexion à la base ; le
+  relevé des ressources passe par `hosts.record` ;
+- aucune réclamation quand la porte d'hôte n'est pas `available`
+  (`Runner.gate`, `AlwaysAvailable` par défaut ; L112 la remplace) ;
+- un événement `reset` du flux réveille tous les workers ;
+- `executor_revoked` arrête l'exécuteur, sans nouvel essai ;
+- le harnais reçoit `AMEESH_BACKEND=mediated`, `AMEESH_EXEC_URL` et
+  `AMEESH_EXEC_TOKEN` (jeton de session demandé après `begin_turn`), jamais
+  de DSN ;
+- `agent-runner register|stop` et `--migrate` sont refusés.
+
+La session du harnais (`backend.MediatedBackend`) passe par le jeton de
+session : `mail whoami`, `mail send`, `work move|note`, `action propose`.
+
+Écarts relevés avec le contrat 1.0.0 (à trancher par une version 1.1) :
+
+1. Le hook `agent-mail` réserve, livre et relâche le courrier, et
+   `mail inbox` lit `mailbox.unread`. Ces opérations sont de la route `op`
+   (jeton d'exécuteur) : une session ne peut pas les appeler. En mode
+   médié, le hook ne remet rien (le courrier attend le tour suivant) et
+   `mail inbox` échoue.
+2. `threads.index` est de la route `op` : `mail send` et `action propose`
+   en session n'écrivent pas le fil (avertissement de `fil.record`).
+3. `threads.index` contrôle `author` comme nom d'agent, mais `fil.record`
+   envoie `agent:<nom>` : `validate_request` répond `bad_args`.
+4. Jeux dorés : `leases.state` rend `owner`/`epoch` au lieu de
+   `lease_owner`/`lease_epoch` (clés du pilote, lues par
+   `registry.lease_matches`) ; `work.*` emploie les états `doing`/`review`,
+   absents de `work.STATES`.
+5. `HostInfo.limits` : « format de `resources.host_limits` » est ambigu. Le
+   client lit `max_agents` et les seuils (à plat ou sous `resources`).

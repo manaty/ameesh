@@ -1621,7 +1621,8 @@ class AgentWorker(threading.Thread):
         le worker s'arrête, ce qui rend le bail ; l'exécuteur de l'hôte
         d'arrivée réclamera l'agent. Jamais au milieu d'un tour ; ne lève
         jamais."""
-        if not self.runner.relocate:
+        if not self.runner.relocate or getattr(self.runner, "mediated", False):
+            # L109 : le déplacement entre hôtes passe au serveur en mode médié
             return False
         from . import relocation as relocation_mod
         try:
@@ -1926,6 +1927,27 @@ class AgentWorker(threading.Thread):
                 % len(incertains),
                 meta={"action": "remise-incertaine", "messages": incertains})
 
+    def _mediated_env(self, env: dict) -> None:
+        """L109 : la session du harnais d'un exécuteur médié parle au serveur
+        avec un jeton de session lié au bail (jamais d'accès à la base) :
+        `AMEESH_BACKEND=mediated`, `AMEESH_EXEC_URL`, `AMEESH_EXEC_TOKEN`.
+        Sans jeton (serveur injoignable), le tour part quand même : seules
+        les commandes `ameesh` de la session échoueront."""
+        from .executeur_mediee import contrat as exec_contrat
+        from .executeur_mediee.interfaces import ENV_SERVER_URL, ENV_SESSION_TOKEN
+        for name in ("AMEESH_DSN", "AGENT_MESH_DSN", "AMEESH_DATABASE_URL",
+                     "AGENT_MESH_DATABASE_URL", ENV_SESSION_TOKEN):
+            env.pop(name, None)
+        env["AMEESH_BACKEND"] = env["AGENT_MESH_BACKEND"] = "mediated"
+        env[ENV_SERVER_URL] = getattr(self.db, "url", "") or self.cfg.exec_url
+        try:
+            issued = self.db.session_token(
+                exec_contrat.Fence(self.name, self.runner.runner_id, self.epoch))
+            env[ENV_SESSION_TOKEN] = issued.token
+        except db_mod.DbError as exc:
+            log_async("[%s] jeton de session indisponible (%s) : les commandes ameesh de la "
+                      "session échoueront" % (self.name, db_mod.explain(exc)))
+
     def _open_turn_resource(self, turn_id: str, pgid: int | None) -> None:
         """Rattache le groupe du tour (L31, 0028) ; ne casse jamais le tour."""
         self._turn_open = False
@@ -2065,6 +2087,8 @@ class AgentWorker(threading.Thread):
             "AGENT_MESH_LEASE_EPOCH": str(self.epoch),
         }
         env.update(identite)
+        if getattr(self.runner, "mediated", False):
+            self._mediated_env(env)
         if not account_turn.apply(self, env, compte):
             return False  # profil inutilisable : consigne remise, rien lancé
         events_path = self._path("events.jsonl")
@@ -2473,9 +2497,47 @@ class Runner:
         self._container_runtime = containers_mod.Runtime.from_config(cfg)
         self.turns = 0
         self.did_turn = False
+        #: L109 : exécuteur médié — pas de base, le serveur du mesh par
+        #: `/api/exec/v1` (`storage.remote`). Synchronisation du canon, relevé
+        #: des soldes, échéance des délégations et déplacement entre hôtes
+        #: passent au serveur ; l'hôte, l'owner, le bail et les limites
+        #: viennent de `GET /host`. Porte d'hôte (L112) : `AlwaysAvailable`
+        #: par défaut.
+        self.mediated = getattr(db, "driver", None) == "mediated"
+        from .executeur_mediee import porte as porte_mod
+        self.gate = porte_mod.AlwaysAvailable()
+        self.host_info = None
+        if self.mediated:
+            self._mediated_setup()
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
         self._delegation_error: str | None = None
         self._delegation_dry_seen: set = set()
+
+    # -- exécuteur médié (L109) ---------------------------------------------
+    def _mediated_setup(self) -> None:
+        """La fiche de l'hôte rendue par le serveur (`GET /host`) : hôte fixé
+        à l'enrôlement, owner `exec:<id>:<hôte>:<pid>`, bail imposé, limites
+        (à la place de `resources.host_limits` sur le canon local)."""
+        from . import resources as resources_mod
+        from .executeur_mediee import contrat as exec_contrat
+        info = self.db.host_info()
+        self.host_info = info
+        owner = exec_contrat.owner_for(info.executor_id, info.host, os.getpid())
+        self.cfg = dataclasses.replace(self.cfg, host=info.host, runner_id=owner)
+        self.host = info.host
+        self.runner_id = owner
+        if info.lease_ttl_s:
+            self.lease_ttl = float(info.lease_ttl_s)
+        limits = dict(info.limits or {})
+        resources = dict(limits.get("resources") or {})
+        resources.update({k: v for k, v in limits.items()
+                          if k in resources_mod.THRESHOLD_KEYS})
+        self._host_limits = resources_mod.thresholds({"resources": resources})
+        self._pressure["limits"] = self._host_limits
+        maximum = limits.get("max_agents")
+        self._host_max_agents = int(maximum) if maximum is not None else None
+        self._host_limits_origin = {"max_agents": "serveur"}
+        self.relocate = False
 
     # -- réclamation -------------------------------------------------------
     def expire_delegations_once(self) -> list[dict]:
@@ -2488,6 +2550,8 @@ class Runner:
         base est journalisée une fois, jamais fatale à la passe."""
         from . import work as work_mod
 
+        if getattr(self, "mediated", False):
+            return []  # L109 : l'échéance des délégations passe au serveur
         try:
             done = work_mod.expire_delegations(
                 self.db, actor="exécuteur %s" % self.runner_id, dry_run=self.dry_run)
@@ -2523,6 +2587,8 @@ class Runner:
                 if not worker.is_alive():
                     log("worker %s terminé" % name)
                     del self.workers[name]
+        if getattr(self, "mediated", False) and not self.gate.state().may_claim:
+            return  # L109/L112 : porte d'hôte fermée, aucune nouvelle réclamation
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
@@ -2575,6 +2641,14 @@ class Runner:
                     worker.wake.set()
             self.wake_all.set()
             log_async("plafond de budget changé en base : relecture")
+            return
+        if item.get("channel") == "reset":
+            # L109 : trou de reprise du flux d'événements du serveur — des
+            # réveils ont pu se perdre : chaque worker relit en base.
+            with self.lock:
+                for worker in self.workers.values():
+                    worker.wake.set()
+            self.wake_all.set()
             return
         if item.get("channel") == CHANNEL_MAIL:
             try:
@@ -2715,6 +2789,8 @@ class Runner:
         ce qui ferme la réclamation (L2) sans toucher aux baux ni aux tours en
         cours. Un échec — canon, git, base — est journalisé et rend `False`.
         """
+        if getattr(self, "mediated", False):
+            return True  # L109 : le canon est synchronisé par le serveur
         entries = canon_mod.configured(self.cfg)
         if not entries:
             return True
@@ -2806,6 +2882,8 @@ class Runner:
         En mode `--once`, le sync est fait en ligne (le fil n'aurait pas le
         temps de tourner) ; sinon un fil dédié s'en charge.
         """
+        if getattr(self, "mediated", False):
+            return  # L109 : le canon est synchronisé par le serveur
         if not self.cfg.canon or self.canon_sync_interval <= 0:
             if self.cfg.canon:
                 self.canon_sync_once()  # seulement au démarrage
@@ -2827,6 +2905,8 @@ class Runner:
         figure dans aucun message : seuls le fournisseur et la raison courte
         de l'échec sont journalisés.
         """
+        if getattr(self, "mediated", False):
+            return 0  # L109 : les soldes sont relevés par le serveur (sans clé ici)
         from . import balance as balance_mod
         # L30 : une source par compte de clé d'API déclaré (sinon l'historique)
         paires = (balance_mod.account_sources(self.cfg) if sources is None
@@ -2863,7 +2943,7 @@ class Runner:
         fournisseur dans l'environnement."""
         from . import balance as balance_mod
         interval = max(0.0, float(self.cfg.balance_interval))
-        if self.once or interval <= 0:
+        if self.once or interval <= 0 or getattr(self, "mediated", False):
             return
         if not any(s.configured() for s, _ in balance_mod.account_sources(self.cfg)):
             return
@@ -2885,6 +2965,13 @@ class Runner:
         Un relevé ne doit jamais empêcher un tour : toute erreur (poste sans
         `/proc`, base indisponible) est journalisée et rend None."""
         from . import resources as resources_mod
+        if getattr(self, "mediated", False):
+            # L109 : relevé auto-déclaré par la connexion distante (`hosts.record`)
+            try:
+                return resources_mod.collect(self.cfg, self.db)
+            except Exception as exc:  # jamais fatal pour l'exécuteur
+                log_async("ressources : relevé impossible (%s)" % type(exc).__name__)
+                return None
         db = None
         try:
             db = db_mod.connect(self.cfg)
@@ -3031,6 +3118,11 @@ class Runner:
                 try:
                     self.sweep()
                 except db_mod.DbError as exc:
+                    if getattr(exc, "code", None) == "executor_revoked":
+                        # L109 : exécuteur révoqué par le serveur — arrêt, sans
+                        # nouvel essai (les baux sont déjà relâchés côté serveur)
+                        log_async("exécuteur révoqué par le serveur : arrêt (%s)" % exc)
+                        break
                     if self.stop.is_set():
                         # arrêt en cours : systemd a pu tuer le `psql` fils
                         # avec nous (« psql : code -15 ») — rien à réessayer
@@ -3375,6 +3467,13 @@ def main(argv: list[str] | None = None) -> int:
               "       agent-runner [--once] [--agents a,b] [--poll S] …  (agent-runner --help)")
         return 0
     cfg = load_config()
+    mediated = cfg.backend == "mediated"
+    if mediated and argv and argv[0] in ("register", "stop"):
+        # L109 : un exécuteur médié ne déclare ni n'arrête d'agent (le
+        # serveur et le canon le font) ; il ne réclame que ce qu'on lui admet
+        print("agent-runner %s : non admis pour un exécuteur médié (backend mediated)"
+              % argv[0], file=sys.stderr)
+        return 2
 
     if argv and argv[0] == "register":
         db = db_mod.connect(cfg)
@@ -3416,13 +3515,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         db = db_mod.connect(cfg)
     except db_mod.Unavailable as exc:
-        print("agent-runner : base injoignable : %s" % exc, file=sys.stderr)
+        print("agent-runner : %s injoignable : %s"
+              % ("serveur du mesh" if mediated else "base", exc), file=sys.stderr)
         return 1
     #: 1 tant que `run` n'a pas rendu : une exception sort en échec, y compris
     #: par le repli `os._exit` de `_sortie_sure`
     code = 1
     runner: Runner | None = None
     try:
+        if parsed.migrate and mediated:
+            print("agent-runner : --migrate sans objet pour un exécuteur médié",
+                  file=sys.stderr)
+            return 2
         if parsed.migrate:
             from . import migrations
             migrations.migrate(db, log=log)
@@ -3432,10 +3536,17 @@ def main(argv: list[str] | None = None) -> int:
             print("agent-runner : %s" % exc, file=sys.stderr)
             return 1
         agents = [a for a in (parsed.agents or "").split(",") if a] or None
-        runner = Runner(
-            cfg, db, agents=agents, once=parsed.once, wait=parsed.wait,
-            dry_run=parsed.dry_run, max_turns=parsed.max_turns,
-        )
+        try:
+            runner = Runner(
+                cfg, db, agents=agents, once=parsed.once, wait=parsed.wait,
+                dry_run=parsed.dry_run, max_turns=parsed.max_turns,
+            )
+        except db_mod.DbError as exc:
+            if not mediated:
+                raise
+            # L109 : la fiche de l'hôte (`GET /host`) est illisible au démarrage
+            print("agent-runner : fiche de l'hôte indisponible : %s" % exc, file=sys.stderr)
+            return 1
 
         def handler(signum, _frame):
             # Signal d'abord ; le journal part par la file : un `print` dans un

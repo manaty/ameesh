@@ -127,7 +127,7 @@ class Config:
     dsn: str = DEFAULT_DSN
     schema: str = "public"
     driver: str = "auto"  # auto | psycopg | psql
-    backend: str = "auto"  # auto | pg | file
+    backend: str = "auto"  # auto | pg | file | mediated
     state_dir: str = _expand(DEFAULT_STATE)
     v0_state: str = _expand(DEFAULT_V0_STATE)
     config_dir: str = _expand(DEFAULT_V0_CONFIG)
@@ -267,6 +267,12 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: L109 : exécuteur médié (`backend: mediated`) — URL du serveur du mesh
+    #: (`/api/exec/v1`) et fichier 0600 du jeton d'accès de l'exécuteur (la
+    #: source réelle du jeton est l'identité de l'exécuteur, L110). Dans la
+    #: VM, la session du harnais reçoit AMEESH_EXEC_URL et AMEESH_EXEC_TOKEN.
+    exec_url: str = ""
+    exec_token_file: str = ""
 
     @property
     def responsible_required(self) -> bool:
@@ -352,6 +358,7 @@ def load(env: dict | None = None) -> Config:
         state_dir = ancien if (os.path.isdir(ancien) and not os.path.isdir(neuf)) else neuf
     # Fils lisibles : AMEESH_THREADS > `threads_dir` du JSON > `<état>/fils`.
     threads_brut = pick("AMEESH_THREADS", default=cfg.threads_dir)
+    exec_token_file = pick("AMEESH_EXEC_TOKEN_FILE", default=cfg.exec_token_file)
     cfg = replace(
         cfg,
         dsn=pick("AMEESH_DSN", "AGENT_MESH_DSN", "AMEESH_DATABASE_URL",
@@ -441,6 +448,8 @@ def load(env: dict | None = None) -> Config:
         shared_sessions=bool(_as_bool(pick("AMEESH_SHARED_SESSIONS",
                                            default=cfg.shared_sessions), False,
                                       "AMEESH_SHARED_SESSIONS")),
+        exec_url=str(pick("AMEESH_EXEC_URL", default=cfg.exec_url) or "").strip(),
+        exec_token_file=_expand(str(exec_token_file)) if exec_token_file else "",
     )
     # L42 (0031) : une liste venue de l'environnement remplace celle du fichier
     env_untrusted = _as_bool(pick("AMEESH_CANON_UNTRUSTED", "AGENT_MESH_CANON_UNTRUSTED",
@@ -496,8 +505,11 @@ def load(env: dict | None = None) -> Config:
                          % (cfg.session_policy, " | ".join(SESSION_POLICIES)))
     if cfg.driver not in ("auto", "psycopg", "psql"):
         raise SystemExit("AGENT_MESH_DRIVER invalide : %r" % cfg.driver)
-    if cfg.backend not in ("auto", "pg", "file"):
+    if cfg.backend not in ("auto", "pg", "file", "mediated"):
         raise SystemExit("AGENT_MESH_BACKEND invalide : %r" % cfg.backend)
+    if cfg.backend == "mediated" and not cfg.exec_url:
+        raise SystemExit("backend mediated : URL du serveur absente (exec_url ou "
+                         "AMEESH_EXEC_URL)")
     return cfg
 
 
