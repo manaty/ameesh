@@ -211,7 +211,13 @@ class HttpTransport(ExecTransport):
     def _once(self, method: str, path: str, body: Any, headers: dict,
               timeout: Optional[float] = None) -> _Response:
         data = None
-        if body is not None:
+        if isinstance(body, (bytes, bytearray)):
+            # dépôt de travail (L113) : paquet git brut
+            data = bytes(body)
+            if len(data) > C.MAX_BUNDLE_BYTES:
+                raise db_mod.DbError("paquet trop gros pour %s (%d octets)" % (path, len(data)))
+            headers = dict(headers, **{"Content-Type": "application/octet-stream"})
+        elif body is not None:
             data = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             if len(data) > C.MAX_BODY_BYTES:
                 raise db_mod.DbError("corps trop gros pour %s (%d octets)" % (path, len(data)))
@@ -384,6 +390,27 @@ class HttpTransport(ExecTransport):
                                kind="session")
         except (KeyError, TypeError, ValueError) as exc:
             raise db_mod.DbError("jeton de session illisible : %s" % exc)
+
+    # -- dépôt de travail (L113) -------------------------------------------------
+    def _bundle_headers(self, fence: C.Fence) -> dict:
+        return {C.HDR_LEASE_OWNER: fence.owner, C.HDR_LEASE_EPOCH: str(int(fence.epoch))}
+
+    def get_work(self, fence: C.Fence) -> tuple:
+        """`GET /work/{agent}/bundle` : (archive tar du commit, en-têtes)."""
+        resp = self.request("GET", self._path("bundle_in", agent=fence.agent),
+                            source=self.tokens, headers=dict(self._bundle_headers(fence),
+                                                             Accept="application/x-tar"),
+                            timeout=max(self.timeout, 120.0))
+        return resp.raw, resp.headers
+
+    def put_work(self, fence: C.Fence, base: str, bundle: bytes) -> dict:
+        """`POST /work/{agent}/bundle` : le paquet git des commits de
+        l'appareil après `base` ; rend `ameesh-exec-bundle/1`."""
+        headers = dict(self._bundle_headers(fence), **{C.HDR_BASE: base})
+        resp = self.request("POST", self._path("bundle_out", agent=fence.agent), bundle,
+                            source=self.tokens, headers=headers,
+                            timeout=max(self.timeout, 120.0))
+        return resp.body or {}
 
     # -- hors interface --------------------------------------------------------
     def health(self) -> dict:

@@ -493,3 +493,41 @@ Les tables de L110 (migration 0049) ne référencent aucune table d'autorité.
 `Principal` ne porte aucun droit d'approbation. Le contrat refuse toutes les
 opérations `approvals`, `nonces`, `grants` et `authenticators`.
 `tests/test_l110_enrolement.py` le vérifie.
+
+## Dépôt de travail (L113)
+
+L'appareil n'a ni identifiant de forge, ni clone du dépôt. Le travail
+passe par le serveur (`executeur_mediee/depot.py`, monté par
+`ameesh serve --work-repos FICHIER [--work-cache DOSSIER]`).
+
+- **Prise du bail.** `GET /work/{agent}/bundle`, avec le jeton d'accès et
+  l'enveloppe de bail en en-têtes (`X-Ameesh-Lease-Owner`,
+  `X-Ameesh-Lease-Epoch`). Le serveur rend l'archive tar EXACTE du commit
+  de départ : la branche `agent/<nom>` si elle existe sur la forge, sinon
+  la branche de base du dépôt. L'archive est construite depuis l'arbre
+  (modes et liens compris), sans les attributs `export-ignore`. L'appareil
+  en fait un dépôt git sous `<AMEESH_EXEC_HOME>/work/<agent>/<epoch>`. Son
+  premier commit est recréé à l'identique des deux côtés (même arbre,
+  auteur, date et message fixes) ; le serveur l'annonce
+  (`X-Ameesh-Device-Base`) et l'appareil le vérifie.
+- **Après chaque tour, et à la fin du bail.** L'appareil envoie le paquet
+  git de ses commits depuis le dernier envoi (`POST`, `X-Ameesh-Base`,
+  64 Mio au plus). Le serveur rejoue chaque commit sur son historique :
+  même arbre, même auteur, même message, le committer est l'exécuteur.
+  Il pousse ensuite `agent/<nom>` avec ses propres identifiants, en avance
+  rapide seulement (`--force-with-lease`). Il rend
+  `ameesh-exec-bundle/1` : `{branch, commit, device_head, commits}`.
+- **Fin du bail.** Le travail non commité est commité, envoyé, puis le
+  dossier est effacé. Un bail perdu efface aussi le dossier, sans envoi.
+
+Refus : bail mort ou d'un autre exécuteur (403 `forbidden_scope`), base
+inconnue (409 `idempotency_mismatch`), commit de fusion ou sous-module
+(400 `bad_args`). Sans dépôt monté, la route rend 404 : l'exécuteur
+travaille alors dans un dossier vide.
+
+`--work-repos` :
+
+```json
+{"agents": {"inge-front": {"repo": "/srv/git/site.git", "base": "main"}},
+ "default": {"repo": "git@forge.example:org/site.git", "base": "main"}}
+```

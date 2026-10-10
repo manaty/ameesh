@@ -90,6 +90,26 @@ IDEMPOTENCY_RETENTION_S = 24 * 3600
 #: taille maximale d'un corps de requête `op` (au-delà : 413 too_large)
 MAX_BODY_BYTES = 1 << 20
 
+#: dépôt de travail (L113) : taille maximale d'un paquet git envoyé par
+#: l'appareil (`POST /work/{agent}/bundle`, au-delà : 413 too_large)
+MAX_BUNDLE_BYTES = 64 << 20
+#: dépôt de travail : schéma de la réponse au dépôt d'un paquet
+SCHEMA_BUNDLE = "ameesh-exec-bundle/1"
+#: dépôt de travail : en-têtes (le GET n'a pas de corps ; le POST porte le
+#: paquet brut). Enveloppe de bail : owner et epoch, l'agent est dans le
+#: chemin.
+HDR_LEASE_OWNER = "X-Ameesh-Lease-Owner"
+HDR_LEASE_EPOCH = "X-Ameesh-Lease-Epoch"
+#: commit du serveur dont l'archive est rendue
+HDR_COMMIT = "X-Ameesh-Commit"
+#: commit de base que l'appareil doit recréer à l'identique sur l'archive
+HDR_DEVICE_BASE = "X-Ameesh-Device-Base"
+#: branche de l'agent sur la forge
+HDR_BRANCH = "X-Ameesh-Branch"
+#: POST : dernier commit de l'appareil déjà reçu par le serveur (prérequis
+#: du paquet)
+HDR_BASE = "X-Ameesh-Base"
+
 
 # --------------------------------------------------------------------------
 # erreurs

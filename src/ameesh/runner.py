@@ -508,6 +508,9 @@ class AgentWorker(threading.Thread):
 
     def release_lease(self) -> None:
         self.watchdog_stop.set()  # le veilleur n'a plus de bail à défendre
+        # L113 : le travail part au serveur sous le bail, puis le dossier est
+        # effacé (même bail perdu : rien ne doit rester sur l'appareil)
+        self._depot_push(final=True)
         if self.lease_lost.is_set():
             return
         try:
@@ -1292,10 +1295,87 @@ class AgentWorker(threading.Thread):
         Le `cwd` est celui de la ligne du registre relue par `pick()` (jamais
         un cache de l'inscription) ; à défaut, adoption bornée d'un worktree
         déplacé (0018), seulement si `adopt`."""
+        if getattr(self.runner, "mediated", False):
+            return self._mediated_workdir()  # L113 : dépôt de travail
         cwd = self.agent.get("cwd")
         if cwd and os.path.isdir(cwd):
             return cwd
         return self.adopt_moved_worktree() if adopt else None
+
+    # -- dépôt de travail de l'exécuteur médié (L113) -------------------------
+    def _depot_dir(self) -> str:
+        from .executeur_mediee import appareil
+        return os.path.join(appareil.home(), "work", self.name, str(int(self.epoch)))
+
+    def _depot_fence(self):
+        from .executeur_mediee import contrat as exec_contrat
+        return exec_contrat.Fence(self.name, self.runner.runner_id, int(self.epoch))
+
+    def _mediated_workdir(self) -> str | None:
+        """Le dossier de travail d'un exécuteur médié : l'archive du commit
+        rendue par le serveur à la prise du bail (`depot.checkout`), sous
+        `<AMEESH_EXEC_HOME>/work/<agent>/<epoch>`. Sans dépôt monté sur le
+        serveur (404) : un dossier vide. None si l'archive est illisible."""
+        from .executeur_mediee import depot
+        path = self._depot_dir()
+        if getattr(self, "_depot_ready", None) == path and os.path.isdir(path):
+            return path
+        parent = os.path.dirname(path)
+        if os.path.isdir(parent):
+            for old in os.listdir(parent):  # dossiers d'un bail précédent
+                if os.path.join(parent, old) != path:
+                    depot.wipe(os.path.join(parent, old))
+        depot.wipe(path)
+        transport = getattr(self.db, "transport", None)
+        if not hasattr(transport, "get_work"):
+            os.makedirs(path, mode=0o700, exist_ok=True)
+            self._depot_active = False
+            self._depot_ready = path
+            return path
+        try:
+            meta = depot.checkout(transport, self._depot_fence(), path)
+            log_async("[%s] dépôt de travail : %s (%s) dans %s"
+                      % (self.name, meta["branch"], meta["commit"][:12], path))
+            self._depot_active = True
+        except db_mod.DbError as exc:
+            if getattr(exc, "code", None) != "op_not_allowed":
+                log_async("[%s] dépôt de travail indisponible : %s" % (self.name, exc))
+                depot.wipe(path)
+                return None
+            os.makedirs(path, mode=0o700, exist_ok=True)
+            self._depot_active = False
+            log_async("[%s] aucun dépôt de travail sur le serveur : dossier vide %s"
+                      % (self.name, path))
+        except (depot.DepotError, OSError, subprocess.SubprocessError) as exc:
+            log_async("[%s] dépôt de travail illisible : %s" % (self.name, exc))
+            depot.wipe(path)
+            return None
+        self._depot_ready = path
+        return path
+
+    def _depot_push(self, *, final: bool = False) -> None:
+        """Après un tour, et à la fin du bail (`final` : travail non commité
+        commité, puis dossier effacé) : les commits de l'appareil partent au
+        serveur, qui pousse la branche de l'agent. Ne lève jamais."""
+        if not getattr(self.runner, "mediated", False):
+            return
+        from .executeur_mediee import depot
+        path = getattr(self, "_depot_ready", None)
+        try:
+            if path and getattr(self, "_depot_active", False) and os.path.isdir(path) \
+                    and not self.lease_lost.is_set():
+                reply = depot.push(self.db.transport, self._depot_fence(), path,
+                                   commit_pending=final)
+                if reply:
+                    log_async("[%s] dépôt de travail : %d commit(s) poussé(s) sur %s (%s)"
+                              % (self.name, reply.get("commits", 0), reply.get("branch"),
+                                 str(reply.get("commit") or "")[:12]))
+        except (db_mod.DbError, depot.DepotError, OSError, subprocess.SubprocessError) as exc:
+            log_async("[%s] dépôt de travail : envoi impossible (%s)" % (self.name, exc))
+        finally:
+            if final and path:
+                depot.wipe(path)
+                self._depot_ready = None
 
     def _workdir_missing(self, force_status: bool = False) -> bool:
         """Note un dossier absent (L35) ; faux si le bail n'est plus le nôtre.
@@ -2484,6 +2564,7 @@ class AgentWorker(threading.Thread):
                     continue
                 try:
                     reussi = self.run_turn(spec)
+                    self._depot_push()  # L113 : commits du tour au serveur
                 except db_mod.Unavailable as exc:
                     # Panne avant le lancement du harnais (ou après-tour au-delà
                     # du bail) : la consigne éventuellement consommée repartira

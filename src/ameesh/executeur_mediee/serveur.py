@@ -26,7 +26,7 @@ Routes (`contrat.ROUTES`) :
 | `POST /session/op` | session | une opération « session » de la table |
 | `GET /events` | accès | SSE, ou attente longue avec `?wait=` |
 | `/llm/…` | session (`x-api-key`) | relais de modèle (L111), monté par `extra_routes["llm"]` |
-| `/work/{agent}/bundle` | — | monté par L113 (`extra_routes`) ; 404 sinon |
+| `/work/{agent}/bundle` | accès + bail (en-têtes) | dépôt de travail (L113, `depot.WorkDepot`), monté par `--work-repos` ; 404 sinon |
 
 Bornes : corps ≤ `contrat.MAX_BODY_BYTES` (413 `too_large`, sans lecture),
 débit par adresse avant authentification et par exécuteur après (429
@@ -41,6 +41,7 @@ import dataclasses
 import json
 import logging
 import math
+import os
 import socket
 import sys
 import threading
@@ -78,6 +79,9 @@ class Response:
     headers: dict = dataclasses.field(default_factory=dict)
     #: flux SSE : itérateur de blocs texte (la connexion se ferme à la fin)
     stream: Optional[Iterator[str]] = None
+    #: corps binaire (archive du dépôt de travail, L113) ; `headers` porte
+    #: son Content-Type
+    raw: Optional[bytes] = None
 
 
 @dataclasses.dataclass
@@ -155,6 +159,14 @@ def canon_limits(loader: Callable[[], Any]) -> Callable[[str], Mapping]:
     return limits
 
 
+def body_limit(path: str) -> int:
+    """Taille maximale du corps d'une requête : `MAX_BUNDLE_BYTES` pour le
+    dépôt d'un paquet git (L113), `MAX_BODY_BYTES` ailleurs."""
+    if path.startswith(contrat.PREFIX + "/work/") and path.endswith("/bundle"):
+        return contrat.MAX_BUNDLE_BYTES
+    return contrat.MAX_BODY_BYTES
+
+
 def _error(code: str, message: str = "", *, retry_after: Optional[float] = None) -> Response:
     status, body, headers = error_response(code, message or contrat.ERRORS[code].meaning,
                                            retry_after=retry_after)
@@ -197,7 +209,7 @@ class ExecApp:
         sub = path[len(contrat.PREFIX):]
         if not self.ip_limiter.allow(client_ip):
             return _error("rate_limited", "trop de requêtes", retry_after=2)
-        if len(body) > contrat.MAX_BODY_BYTES:
+        if len(body) > body_limit(path):
             return _error("too_large", "corps trop gros")
         try:
             return self._route(method, sub, query, _lower(headers), body)
@@ -576,7 +588,7 @@ class ExecHandler(BaseHTTPRequestHandler):
                 self._write(_error("bad_request", "Content-Length invalide"), close=True)
                 return
             length = int(lengths[0].strip())
-        if length > contrat.MAX_BODY_BYTES:
+        if length > body_limit(urllib.parse.urlsplit(self.path).path):
             self._write(_error("too_large", "corps trop gros"), close=True)
             return
         body = self.rfile.read(length) if length else b""
@@ -603,10 +615,12 @@ class ExecHandler(BaseHTTPRequestHandler):
                 pass
             return
         payload = b""
-        if response.body is not None:
+        if response.raw is not None:
+            payload = response.raw
+        elif response.body is not None:
             payload = json.dumps(response.body, ensure_ascii=False).encode("utf-8")
         self.send_response(response.status)
-        if payload:
+        if payload and response.raw is None:
             self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
@@ -630,6 +644,7 @@ USAGE = """ameesh serve --exec-only --server-url URL [--listen HÔTE:PORT]
         [--credential-modes relay,...] [--harnesses dsh,...] [--models m,...]
         [--rate-per-minute N] [--pool N] [--tls-cert F --tls-key F] [--allow-plain]
         [--no-relay] [--canon-sync S] [--auth-file FICHIER]
+        [--work-repos FICHIER [--work-cache DOSSIER]]
 
 Le serveur de l'API d'exécuteur médiée (/api/exec/v1, lots L108 à L111).
 Tant que `ameesh serve` (L84) n'existe pas, seul --exec-only est servi.
@@ -638,7 +653,10 @@ des jetons fixes (banc d'essai seulement). --server-url : l'URL publique,
 celle que l'appareil a reçue avec son code (audience des assertions). Le
 relais de modèle (L111) est monté sous /api/exec/v1/llm/ (--no-relay pour
 s'en passer). --canon-sync S : canon synchronisé pour chaque hôte médié
-enrôlé toutes les S secondes (défaut 60 ; 0 : jamais). Une écoute hors de
+enrôlé toutes les S secondes (défaut 60 ; 0 : jamais). --work-repos : le
+dépôt de travail (L113, `executeur_mediee.depot`) est monté sous
+/api/exec/v1/work/{agent}/bundle ; --work-cache garde ses clones nus
+(défaut ~/.local/state/ameesh/depot). Une écoute hors de
 la boucle locale exige TLS (--tls-cert/--tls-key) ou --allow-plain derrière
 un mandataire inverse qui termine TLS."""
 
@@ -662,6 +680,8 @@ def _parse(argv) -> argparse.Namespace:
     p.add_argument("--allow-plain", action="store_true")
     p.add_argument("--no-relay", action="store_true")
     p.add_argument("--canon-sync", type=float, default=60.0)
+    p.add_argument("--work-repos", default="")
+    p.add_argument("--work-cache", default="")
     return p.parse_args(argv)
 
 
@@ -826,15 +846,27 @@ def main(argv=None) -> int:
                   " --auth-file), ou --no-relay", file=sys.stderr)
             return 2
         app.extra_routes["llm"] = build_relay(cfg, auth, app.pool)
+    if args.work_repos:
+        from . import depot
+        try:
+            repos = depot.RepoMap.from_file(args.work_repos)
+        except (OSError, ValueError) as exc:
+            print("ameesh serve : --work-repos : %s" % exc, file=sys.stderr)
+            return 2
+        cache = args.work_cache or os.path.expanduser("~/.local/state/ameesh/depot")
+        app.extra_routes["bundle"] = depot.WorkDepot(repos, cache,
+                                                     depot.lease_checker(app.pool))
     if args.canon_sync > 0 and isinstance(auth, LockedIdentity):
         threading.Thread(target=_canon_loop, args=(app, cfg, args.canon_sync),
                          daemon=True, name="canon-hotes-medies").start()
     server = ExecHTTPServer(app, (host, int(port)), tls=tls)
     threading.Thread(target=_purge_loop, args=(app,), daemon=True).start()
-    log.info("API d'exécuteur médiée sur %s:%s%s (contrat %s, identité %s, relais %s)",
+    log.info("API d'exécuteur médiée sur %s:%s%s (contrat %s, identité %s, relais %s,"
+             " dépôt de travail %s)",
              host, port, contrat.PREFIX, app.contract.version,
              "L110" if isinstance(auth, LockedIdentity) else "jetons fixes",
-             "monté" if "llm" in app.extra_routes else "absent")
+             "monté" if "llm" in app.extra_routes else "absent",
+             "monté" if "bundle" in app.extra_routes else "absent")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
