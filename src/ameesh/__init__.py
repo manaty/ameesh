@@ -23,12 +23,12 @@ def version() -> str:
         pass
     import os
     import re
-    chemin = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          os.pardir, os.pardir, "pyproject.toml")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        os.pardir, os.pardir, "pyproject.toml")
     try:
-        with open(chemin, encoding="utf-8") as fh:
-            texte = fh.read()
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
     except OSError:
         return "inconnue"
-    trouve = re.search(r'^version\s*=\s*"([^"]+)"', texte, re.M)
-    return trouve.group(1) if trouve else "inconnue"
+    found = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+    return found.group(1) if found else "inconnue"
