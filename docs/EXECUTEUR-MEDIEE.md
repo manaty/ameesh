@@ -22,7 +22,7 @@ en silence.
 | `src/ameesh/mediated_executor/interfaces.py` | interfaces entre L108, L109 et L110 |
 | `src/ameesh/mediated_executor/host_gate.py` | L112 : `FileGate`, `SocketGate`, contrôleur de l'exécuteur, bail d'hôte volatil |
 | `src/ameesh/mediated_executor/availability.py` | L112 : disponibilité des hôtes côté serveur, alertes |
-| `tests/dore/mediated_executor/*.json` | jeux d'essai dorés, partagés par le serveur et le client |
+| `tests/golden/mediated_executor/*.json` | jeux d'essai dorés, partagés par le serveur et le client |
 | `tests/test_l107_executor_contract.py` | cohérence de la table, des jeux dorés et des interfaces |
 | `src/ameesh/mediated_executor/identity.py` | serveur : codes d'enrôlement, `DbIdentityProvider`, `verify_token`, révocation (L110) |
 | `src/ameesh/mediated_executor/device.py` | appareil : clé P-256, enrôlement, `HttpTokenSource` (L110) |
@@ -110,7 +110,7 @@ Idempotency-Key: <uuid>         (obligatoire pour toute écriture)
 
 Le corps d'une erreur a la forme
 `{"schema": "ameesh-exec-error/1", "error", "message", "retry_after"?}`.
-La table complète est `contrat.ERRORS`. Côté client, `client_exception`
+La table complète est `contract.ERRORS`. Côté client, `client_exception`
 fait la correspondance.
 
 | HTTP | Codes | Exception côté client |
@@ -148,7 +148,7 @@ Un réveil ne fait jamais foi : l'exécuteur relit toujours la base.
 L'assemblage de la voie B (L108 à L114) a relevé des écarts entre le
 client, le serveur et les jeux dorés. Ils sont tranchés ici, dans
 `contract.json` (version `1.1.0`) et dans les jeux dorés, régénérés par
-`tests/dore/generate_executor.py`. Le client et le serveur lisent la même
+`tests/golden/generate_executor.py`. Le client et le serveur lisent la même
 table : aucun écart n'est toléré d'un côté seulement.
 
 - **Jeux dorés conformes au schéma.** États de lot de `work.STATES`,
@@ -161,7 +161,7 @@ table : aucun écart n'est toléré d'un côté seulement.
   clés que lit `registry.lease_matches`.
 - **NOTIFY `agent_lease`.** Sur le fil, le payload est `{name, owner,
   epoch, status}`. Le déclencheur de 0001 écrit `agent` ; le serveur le
-  renomme `name` à la réception (`flux.wire_payload`) et filtre sur `name`.
+  renomme `name` à la réception (`stream.wire_payload`) et filtre sur `name`.
 - **Idempotence.** `request_sha256` canonise aussi les décimaux (un TTL de
   90.5 s, un coût de 0.031 $), à la manière d'ECMAScript (RFC 8785).
   `90.0` et `90` ont la même empreinte. NaN, les infinis et les entiers
@@ -208,13 +208,13 @@ Le runner Compute écrit `ameesh-host-state/1`. Ce message porte `state`
 
 L'exécuteur répond par `ameesh-host-ack/1`, qui porte `seq`, `state`,
 `in_turn`, `held` et `drained`. Il relaie aussi l'état au serveur par
-`PUT /host/availability` (`porte.availability_body`). Un état illisible
+`PUT /host/availability` (`gate.availability_body`). Un état illisible
 vaut `stopped` pour un hôte médié (`GateState.unreadable()`, contrat 1.1) ;
 un hôte classique doté d'une porte garde un repli réglable
-(`host_gate_fallback`, L112, voir `porte_hote`). `caps.max_concurrent`
-absent vaut 1 (`porte.DEFAULT_MAX_CONCURRENT`).
+(`host_gate_fallback`, L112, voir `host_gate`). `caps.max_concurrent`
+absent vaut 1 (`gate.DEFAULT_MAX_CONCURRENT`).
 
-La classe abstraite est `porte.HostGate` :
+La classe abstraite est `gate.HostGate` :
 
 ```python
 state() -> GateState
@@ -233,7 +233,7 @@ close() -> None
   - Le serveur valide chaque requête par `Contract.validate_request`. Il
     authentifie par `ExecutorAuth.verify(token) -> Principal`, avec un
     bouchon jusqu'à L110.
-  - Le flux d'événements suit `evenements`. La route `GET /host` rend
+  - Le flux d'événements suit `events`. La route `GET /host` rend
     `HostInfo`.
 - **L109, client.**
   - `interfaces.ExecTransport` : `call`, `session_call`, `poll_events`,
@@ -241,7 +241,7 @@ close() -> None
   - `RemoteStorage` lève `NotSupportedRemotely` hors de la table. Les
     erreurs passent par `client_exception`.
   - Les essais tournent contre un faux serveur nourri de
-    `tests/dore/mediated_executor`.
+    `tests/golden/mediated_executor`.
 - **L110, identité.**
   - `interfaces.IdentityProvider` : `verify`, `enroll`,
     `issue_access_token`, `issue_session_token` et `revoke`.
@@ -250,10 +250,10 @@ close() -> None
     `ams1.…` pour un jeton de session lié au bail. L'assertion est un JWS
     ES256 de 60 s au plus.
 - **L112, inactivité.** `FileGate(HostGate)` et `SocketGate(HostGate)`, sur
-  les schémas de `porte` (livrés dans `porte_hote`, avec le contrôleur de
+  les schémas de `gate` (livrés dans `host_gate`, avec le contrôleur de
   l'exécuteur `GateController`, `lease_ttl_for` et `TransportSink`, que L109
   branche sur `ExecTransport.put_availability`). Côté serveur,
-  `disponibilite` : `check_body`, `admissible`, `AvailabilityRegistry`
+  `availability` : `check_body`, `admissible`, `AvailabilityRegistry`
   (mémoire, fichier ; L108 peut la mettre en base) et les alertes
   `host_unavailable`, `host_drain_overdue`. Exploitation :
   `docs/EXPLOITATION.md`, « Porte d'hôte ».
@@ -268,7 +268,7 @@ relais de modèle sous `/api/exec/v1/llm/` (L111, `--no-relay` pour s'en
 passer) et, avec `--work-repos`, le dépôt de travail (L113). Il synchronise
 aussi le canon de chaque hôte médié enrôlé (`--canon-sync`, 60 s). Les
 limites de `GET /host` viennent du canon (`resources.host_limits`).
-`--auth-file` (jetons fixes, `bouchon.StaticAuth`) reste pour les bancs
+`--auth-file` (jetons fixes, `stub.StaticAuth`) reste pour les bancs
 d'essai ; il exclut le relais. Le
 serveur utilise la bibliothèque standard (`http.server`) et n'ajoute aucune
 dépendance. Une écoute hors de la boucle locale exige TLS (`--tls-cert`,
@@ -341,7 +341,7 @@ plus de 24 h sont élaguées toutes les 10 minutes, l'audit après 90 jours.
   cet owner qui est inscrit au grand livre (`source=relay`). Une ligne
   `turn_costs` déclarée par l'appareil est rangée `source=device`, hors
   plafond.
-- **L113.** `extra_routes["bundle"]` : `depot.WorkDepot` (voir « Dépôt de
+- **L113.** `extra_routes["bundle"]` : `work_repo.WorkDepot` (voir « Dépôt de
   travail »).
 - **L112.** L'exécuteur relaie sa porte par `PUT /host/availability` au
   démarrage, à chaque changement et jusqu'à ce que le serveur l'ait reçue
@@ -415,7 +415,7 @@ session : `mail whoami`, `mail send`, `work move|note`, `action propose`.
 5. `HostInfo.limits` : « format de `resources.host_limits` » est ambigu. Le
    client lit `max_agents` et les seuils (à plat ou sous `resources`).
 
-  les schémas de `porte`.
+  les schémas de `gate`.
 
 ## Identité des appareils (L110)
 

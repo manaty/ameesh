@@ -33,7 +33,7 @@ from ameesh.runner import Runner
 from .support import PgTestCase, child_env
 from .test_l43_perimetre_hote import HOST, _Canons, host
 
-GOLDEN = os.path.join(os.path.dirname(__file__), "dore", "mediated_executor", "gate.json")
+GOLDEN = os.path.join(os.path.dirname(__file__), "golden", "mediated_executor", "gate.json")
 
 
 def attendre(cond, timeout: float = 15.0, pas: float = 0.05):

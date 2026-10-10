@@ -2,7 +2,7 @@
 """L107 : le contrat de l'API d'exécuteur médiée est cohérent et figé.
 
 Sans base : la table (`contract.json`) est confrontée à `storage.interface`,
-les jeux dorés (`tests/dore/mediated_executor/`) au contrat, et les
+les jeux dorés (`tests/golden/mediated_executor/`) au contrat, et les
 interfaces figées entre L108, L109, L110 et L112 à leur liste de méthodes.
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ from ameesh.mediated_executor import gate as P
 from ameesh.storage import interface as SI
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DORE = os.path.join(REPO, "tests", "dore", "mediated_executor")
+GOLDEN_DIR = os.path.join(REPO, "tests", "golden", "mediated_executor")
 HINTS = typing.get_type_hints(SI.Storage)
 
 
@@ -69,13 +69,13 @@ ARGS_THREADS = {"project": "site", "lot": "812", "transport": "github", "host": 
 
 
 def _golden(name: str) -> dict:
-    with open(os.path.join(DORE, name), encoding="utf-8") as fh:
+    with open(os.path.join(GOLDEN_DIR, name), encoding="utf-8") as fh:
         return json.load(fh)
 
 
 def _op_cases() -> list:
     out = []
-    for fn in sorted(os.listdir(DORE)):
+    for fn in sorted(os.listdir(GOLDEN_DIR)):
         g = _golden(fn)
         if g["family"] in ("errors", "events", "gate", "identity"):
             continue

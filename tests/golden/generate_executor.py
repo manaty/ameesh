@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Génère les jeux d'essai dorés de l'exécuteur médié (contrat 1.1).
 
-    python3 tests/dore/generate_executor.py tests/dore/mediated_executor
+    python3 tests/golden/generate_executor.py tests/golden/mediated_executor
 
 Les valeurs suivent le schéma réel : états de lot de `work.STATES`, `kind`
 de 0012, identifiant et empreinte d'action de 0010, clés du pilote pour

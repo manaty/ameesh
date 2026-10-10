@@ -3,9 +3,9 @@
 
 * `contract.json` : la table FERMÉE des 61 opérations admises (livrée dans la
   roue, lue par le serveur et par l'exécuteur de la VM) ;
-* `contrat` : chargeur, enveloppes, idempotence, erreurs ;
-* `evenements` : flux SSE et attente longue ;
-* `porte` : `HostGate` et `ameesh-host-state/1` ;
+* `contract` : chargeur, enveloppes, idempotence, erreurs ;
+* `events` : flux SSE et attente longue ;
+* `gate` : `HostGate` et `ameesh-host-state/1` ;
 * `interfaces` : interfaces figées entre L108, L109, L110 et L112.
 
 Référence : `docs/EXECUTEUR-MEDIEE.md`.

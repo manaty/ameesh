@@ -23,20 +23,20 @@ from ameesh.mediated_executor import events as E
 from ameesh.mediated_executor.interfaces import ExecTransport, HostInfo, IssuedToken
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DORE = os.path.join(REPO, "tests", "dore", "mediated_executor")
+GOLDEN_DIR = os.path.join(REPO, "tests", "golden", "mediated_executor")
 ACCESS = "amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 SESSION = "ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 OWNER = "exec:7f3a9c2e4b1d6058:anna-portable:4121"
 
 
 def golden(name: str) -> dict:
-    with open(os.path.join(DORE, name + ".json"), encoding="utf-8") as fh:
+    with open(os.path.join(GOLDEN_DIR, name + ".json"), encoding="utf-8") as fh:
         return json.load(fh)
 
 
 def op_cases() -> list:
     out = []
-    for fn in sorted(os.listdir(DORE)):
+    for fn in sorted(os.listdir(GOLDEN_DIR)):
         g = golden(fn[:-5])
         if g["family"] in ("errors", "events", "gate", "identity"):
             continue

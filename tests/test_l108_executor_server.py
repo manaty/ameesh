@@ -37,7 +37,7 @@ from ameesh.mediated_executor.server import ExecApp, ExecHTTPServer
 
 from tests.support import PgTestCase
 
-DORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dore", "mediated_executor")
+GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden", "mediated_executor")
 HOST = "anna-portable"
 EXEC = "7f3a9c2e4b1d6058"
 OWNER = "exec:7f3a9c2e4b1d6058:anna-portable:4121"
@@ -51,7 +51,7 @@ FAR = 4e9
 
 def _golden_cases() -> list:
     cases = []
-    for path in sorted(glob.glob(os.path.join(DORE, "*.json"))):
+    for path in sorted(glob.glob(os.path.join(GOLDEN_DIR, "*.json"))):
         with open(path, encoding="utf-8") as fh:
             cases.extend(json.load(fh).get("cases") or ())
     return cases

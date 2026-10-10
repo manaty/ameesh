@@ -513,7 +513,7 @@ class TransportSink(AvailabilitySink):
 
 
 class RegistrySink(AvailabilitySink):
-    """Vers un registre de disponibilité (`disponibilite`), avec l'acquittement."""
+    """Vers un registre de disponibilité (`availability`), avec l'acquittement."""
 
     def __init__(self, registry, host: str, executor_id: str,
                  log: Callable[[str], None] | None = None):

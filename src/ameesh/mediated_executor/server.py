@@ -21,7 +21,7 @@ Routes (`contract.ROUTES`) :
 | `POST /enroll`, `POST /token` | (L110) | délégués à l'`IdentityProvider` ; 404 sans lui |
 | `GET /host` | accès | `HostInfo` : limites, bail imposé, agents admis, disponibilité |
 | `PUT /host/availability` | accès | état de la porte d'hôte (L112), 204 |
-| `POST /op` | accès | une opération de la table (`repartiteur`) |
+| `POST /op` | accès | une opération de la table (`dispatcher`) |
 | `POST /session-token` | accès + enveloppe | jeton de session (L110), bail recontrôlé ici |
 | `POST /session/op` | session | une opération « session » de la table |
 | `GET /events` | accès | SSE, ou attente longue avec `?wait=` |

@@ -129,10 +129,10 @@ class MessagesTest(unittest.TestCase):
         message = jose.enroll_proof_message(body["code"], body["public_key"], SERVER)
         self.assertTrue(jose.verify_b64(body["public_key"], message, body["proof"]))
         # même forme que le jeu doré de L107
-        with open(os.path.join(os.path.dirname(__file__), "dore", "mediated_executor",
+        with open(os.path.join(os.path.dirname(__file__), "golden", "mediated_executor",
                                "identity.json"), encoding="utf-8") as fh:
-            dore = json.load(fh)
-        self.assertEqual(set(body), set(dore["enroll"]["request"]["body"]))
+            golden = json.load(fh)
+        self.assertEqual(set(body), set(golden["enroll"]["request"]["body"]))
 
     def test_defi_nexlink_ascii(self):
         key = device.DeviceKey.generate()

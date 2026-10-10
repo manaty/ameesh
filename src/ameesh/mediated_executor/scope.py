@@ -27,7 +27,7 @@ lot ou tour hors portée), `host_unavailable` (porte d'hôte fermée),
 
 Le fencing (portée B, et le bail du jeton de session pour les écritures de
 portée S) n'est PAS ici : le répartiteur le refait sous verrou de ligne,
-dans la transaction de l'opération (`repartiteur`).
+dans la transaction de l'opération (`dispatcher`).
 """
 from __future__ import annotations
 
