@@ -1,0 +1,476 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "famille": "agents",
+ "cas": [
+  {
+   "nom": "agents.claimable/ok",
+   "op": "agents.claimable",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.claimable",
+     "args": [
+      "anna-portable",
+      [
+       "inge-front"
+      ]
+     ],
+     "kwargs": {
+      "require_responsible": false
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": [
+      {
+       "name": "inge-front",
+       "chantier": "site",
+       "harness": "dsh",
+       "host": "anna-portable",
+       "cwd": "/var/lib/ameesh-exec/work/inge-front/42",
+       "status": "queued",
+       "lease_owner": null,
+       "lease_epoch": 41,
+       "lease_expires_ts": null
+      }
+     ],
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "agents.get/ok",
+   "op": "agents.get",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.get",
+     "args": [
+      "inge-front"
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "name": "inge-front",
+      "chantier": "site",
+      "harness": "dsh",
+      "host": "anna-portable",
+      "cwd": "/var/lib/ameesh-exec/work/inge-front/42",
+      "status": "idle",
+      "lease_owner": null,
+      "lease_epoch": 41,
+      "lease_expires_ts": null
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "agents.cwd_used/ok",
+   "op": "agents.cwd_used",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.cwd_used",
+     "args": [
+      "/var/lib/ameesh-exec/work/inge-front/42",
+      "inge-front"
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": false,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "agents.harnesses/ok",
+   "op": "agents.harnesses",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.harnesses",
+     "args": [],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "inge-front": "dsh"
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "agents.set_status/ok",
+   "op": "agents.set_status",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "36059856-2764-592b-ba61-8d4c6abe3367"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.set_status",
+     "args": [
+      "inge-front",
+      "idle",
+      "en attente",
+      null
+     ],
+     "kwargs": {},
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": null,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "agents.set_status/bail-perdu",
+   "op": "agents.set_status",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "8257a6a4-1bdc-5285-b36a-ff4262dc0062"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.set_status",
+     "args": [
+      "inge-front",
+      "idle",
+      "en attente",
+      null
+     ],
+     "kwargs": {},
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": null,
+     "server_ts": 1791640000.12,
+     "fenced": true
+    }
+   }
+  },
+  {
+   "nom": "agents.set_session/ok",
+   "op": "agents.set_session",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "a25fcd24-29cf-520d-b483-a2a38bdbc244"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.set_session",
+     "args": [
+      "inge-front",
+      "sess-5d1e",
+      null
+     ],
+     "kwargs": {},
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": null,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "agents.set_session_account/ok",
+   "op": "agents.set_session_account",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "57e50951-758d-513b-aef4-4e9f6f67360b"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.set_session_account",
+     "args": [
+      "inge-front",
+      null
+     ],
+     "kwargs": {},
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": true,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "agents.set_pending_prompt/ok",
+   "op": "agents.set_pending_prompt",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "60385445-ce2d-5f0c-853a-e0c55b3ac013"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.set_pending_prompt",
+     "args": [
+      "inge-front",
+      null
+     ],
+     "kwargs": {},
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": null,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "agents.mark_event_wake/ok",
+   "op": "agents.mark_event_wake",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "d3111c9a-2bc7-5216-b72c-9557a0baf30a"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.mark_event_wake",
+     "args": [
+      "inge-front"
+     ],
+     "kwargs": {},
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": null,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "agents.upsert/ok",
+   "op": "agents.upsert",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "2f7e91cf-c733-5786-9298-60dd2018123e"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.upsert",
+     "args": [
+      "inge-front"
+     ],
+     "kwargs": {
+      "chantier": null,
+      "harness": null,
+      "host": null,
+      "cwd": "/var/lib/ameesh-exec/work/inge-front/42",
+      "session_id": null,
+      "status": null,
+      "status_text": null,
+      "model": null,
+      "budget_usd": null
+     },
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "name": "inge-front",
+      "chantier": "site",
+      "harness": "dsh",
+      "host": "anna-portable",
+      "cwd": "/var/lib/ameesh-exec/work/inge-front/42",
+      "status": "idle",
+      "lease_owner": null,
+      "lease_epoch": 41,
+      "lease_expires_ts": null
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "agents.overview/ok",
+   "op": "agents.overview",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/session/op",
+    "entetes": {
+     "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.overview",
+     "args": [],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": [
+      {
+       "name": "inge-front",
+       "role": "ingénieur",
+       "status": "running"
+      },
+      {
+       "name": "coord",
+       "role": "coordinateur",
+       "status": "idle"
+      }
+     ],
+     "server_ts": 1791640000.12
+    }
+   }
+  }
+ ]
+}

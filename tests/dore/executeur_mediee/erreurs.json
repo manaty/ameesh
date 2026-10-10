@@ -1,0 +1,445 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "famille": "erreurs",
+ "cas": [
+  {
+   "nom": "forbidden_scope/autre-agent",
+   "op": "agents.get",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.get",
+     "args": [
+      "tresorier"
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 403,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-error/1",
+     "error": "forbidden_scope",
+     "message": "agent hors de la portée de l'exécuteur"
+    }
+   }
+  },
+  {
+   "nom": "forbidden_scope/owner-etranger",
+   "op": "leases.claim",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "0b9f6c1e-1c0a-4d1e-9a51-6c2d3f4e5a60"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "leases.claim",
+     "args": [
+      "inge-front",
+      "exec:0000:autre:1",
+      90.0
+     ],
+     "kwargs": {
+      "require_responsible": false
+     }
+    }
+   },
+   "reponse": {
+    "statut": 403,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-error/1",
+     "error": "forbidden_scope",
+     "message": "owner non préfixé par l'exécuteur authentifié"
+    }
+   }
+  },
+  {
+   "nom": "host_unavailable",
+   "op": "leases.claim",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "0b9f6c1e-1c0a-4d1e-9a51-6c2d3f4e5a60"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "leases.claim",
+     "args": [
+      "inge-front",
+      "exec:7f3a:anna-portable:4121",
+      90.0
+     ],
+     "kwargs": {
+      "require_responsible": false
+     }
+    }
+   },
+   "reponse": {
+    "statut": 403,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-error/1",
+     "error": "host_unavailable",
+     "message": "hôte indisponible"
+    }
+   }
+  },
+  {
+   "nom": "executor_revoked",
+   "op": "agents.get",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.get",
+     "args": [
+      "inge-front"
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 403,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-error/1",
+     "error": "executor_revoked",
+     "message": "exécuteur révoqué"
+    }
+   }
+  },
+  {
+   "nom": "op_not_allowed/approbation",
+   "op": "approvals.consume",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "0b9f6c1e-1c0a-4d1e-9a51-6c2d3f4e5a60"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "approvals.consume",
+     "args": [],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 404,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-error/1",
+     "error": "op_not_allowed",
+     "message": "opération non admise"
+    }
+   }
+  },
+  {
+   "nom": "op_not_allowed/mauvaise-route",
+   "op": "mailbox.send",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "0b9f6c1e-1c0a-4d1e-9a51-6c2d3f4e5a60"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "mailbox.send",
+     "args": [
+      "inge-front",
+      "coord",
+      "PR prête."
+     ],
+     "kwargs": {
+      "host": null,
+      "kind": "message",
+      "payload": null,
+      "work_item_id": "812",
+      "signature": null,
+      "signature_key": null,
+      "signed_payload": null,
+      "nonce": null,
+      "created_us": null,
+      "expires_us": null
+     }
+    }
+   },
+   "reponse": {
+    "statut": 404,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-error/1",
+     "error": "op_not_allowed",
+     "message": "opération de session : /session/op"
+    }
+   }
+  },
+  {
+   "nom": "fence_required",
+   "op": "agents.set_status",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "0b9f6c1e-1c0a-4d1e-9a51-6c2d3f4e5a60"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.set_status",
+     "args": [
+      "inge-front",
+      "idle",
+      null,
+      null
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 400,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-error/1",
+     "error": "fence_required",
+     "message": "enveloppe de bail obligatoire"
+    }
+   }
+  },
+  {
+   "nom": "idempotency_key_required",
+   "op": "leases.begin_turn",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "leases.begin_turn",
+     "args": [
+      "inge-front",
+      "exec:7f3a:anna-portable:4121",
+      42,
+      "tour"
+     ],
+     "kwargs": {},
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 400,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-error/1",
+     "error": "idempotency_key_required",
+     "message": "Idempotency-Key obligatoire pour une écriture"
+    }
+   }
+  },
+  {
+   "nom": "idempotency_mismatch",
+   "op": "leases.claim",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "f6ac80e4-1d59-56bf-8eba-5acc92ea884d"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "leases.claim",
+     "args": [
+      "inge-front",
+      "exec:7f3a:anna-portable:4121",
+      60.0
+     ],
+     "kwargs": {
+      "require_responsible": false
+     }
+    }
+   },
+   "reponse": {
+    "statut": 409,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-error/1",
+     "error": "idempotency_mismatch",
+     "message": "clé déjà employée pour une autre requête"
+    }
+   }
+  },
+  {
+   "nom": "bad_args/upsert-hors-cwd",
+   "op": "agents.upsert",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "0b9f6c1e-1c0a-4d1e-9a51-6c2d3f4e5a60"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.upsert",
+     "args": [
+      "inge-front"
+     ],
+     "kwargs": {
+      "chantier": null,
+      "harness": null,
+      "host": null,
+      "cwd": "/var/lib/ameesh-exec/work/inge-front/42",
+      "session_id": null,
+      "status": null,
+      "status_text": null,
+      "model": "deepseek-reasoner",
+      "budget_usd": null
+     },
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 400,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-error/1",
+     "error": "bad_args",
+     "message": "agents.upsert : seul cwd est admis"
+    }
+   }
+  },
+  {
+   "nom": "token_expired",
+   "op": "agents.get",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.get",
+     "args": [
+      "inge-front"
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 401,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-error/1",
+     "error": "token_expired",
+     "message": "jeton échu"
+    }
+   }
+  },
+  {
+   "nom": "rate_limited",
+   "op": "agents.get",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.get",
+     "args": [
+      "inge-front"
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 429,
+    "entetes": {
+     "Retry-After": "2"
+    },
+    "corps": {
+     "schema": "ameesh-exec-error/1",
+     "error": "rate_limited",
+     "message": "trop de requêtes",
+     "retry_after": 2
+    }
+   }
+  },
+  {
+   "nom": "unavailable",
+   "op": "agents.get",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "agents.get",
+     "args": [
+      "inge-front"
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 503,
+    "entetes": {
+     "Retry-After": "5"
+    },
+    "corps": {
+     "schema": "ameesh-exec-error/1",
+     "error": "unavailable",
+     "message": "base indisponible",
+     "retry_after": 5
+    }
+   }
+  }
+ ]
+}

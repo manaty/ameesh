@@ -1,0 +1,112 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "famille": "porte",
+ "etats": [
+  {
+   "schema": "ameesh-host-state/1",
+   "state": "available",
+   "seq": 7,
+   "until_ts": 1791647200.12,
+   "drain_deadline_ts": null,
+   "caps": {
+    "max_concurrent": 1,
+    "cpu_share": 0.5,
+    "memory_mb": 4096
+   },
+   "reason": "idle"
+  },
+  {
+   "schema": "ameesh-host-state/1",
+   "state": "draining",
+   "seq": 8,
+   "until_ts": null,
+   "drain_deadline_ts": 1791640090.12,
+   "caps": {
+    "max_concurrent": 1
+   },
+   "reason": "user_active"
+  },
+  {
+   "schema": "ameesh-host-state/1",
+   "state": "stopped",
+   "seq": 9,
+   "until_ts": null,
+   "drain_deadline_ts": null,
+   "caps": {},
+   "reason": "revoked"
+  }
+ ],
+ "acquittements": [
+  {
+   "schema": "ameesh-host-ack/1",
+   "seq": 7,
+   "state": "available",
+   "in_turn": [],
+   "held": [],
+   "drained": false,
+   "ts": 1791640000.12
+  },
+  {
+   "schema": "ameesh-host-ack/1",
+   "seq": 8,
+   "state": "draining",
+   "in_turn": [
+    "inge-front"
+   ],
+   "held": [
+    "inge-front"
+   ],
+   "drained": false,
+   "ts": 1791640001.12
+  },
+  {
+   "schema": "ameesh-host-ack/1",
+   "seq": 8,
+   "state": "draining",
+   "in_turn": [],
+   "held": [],
+   "drained": true,
+   "ts": 1791640040.12
+  }
+ ],
+ "illisibles": [
+  {
+   "schema": "ameesh-host-state/0",
+   "state": "available",
+   "seq": 1
+  },
+  {
+   "schema": "ameesh-host-state/1",
+   "state": "sleeping",
+   "seq": 2
+  },
+  {
+   "schema": "ameesh-host-state/1",
+   "state": "available",
+   "seq": "3"
+  }
+ ],
+ "disponibilite": {
+  "requete": {
+   "methode": "PUT",
+   "chemin": "/api/exec/v1/host/availability",
+   "entetes": {
+    "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+   },
+   "corps": {
+    "schema": "ameesh-exec-availability/1",
+    "available": false,
+    "state": "draining",
+    "seq": 8,
+    "until_ts": null,
+    "caps": {
+     "max_concurrent": 1
+    },
+    "reason": "user_active"
+   }
+  },
+  "reponse": {
+   "statut": 204
+  }
+ }
+}

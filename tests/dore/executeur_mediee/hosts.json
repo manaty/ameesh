@@ -1,0 +1,148 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "famille": "hosts",
+ "cas": [
+  {
+   "nom": "hosts.record/ok",
+   "op": "hosts.record",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "0759aa88-8472-56b0-ab69-0959cc76aa9b"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "hosts.record",
+     "args": [
+      {
+       "host": "anna-portable",
+       "cpu_load": 0.4,
+       "memory_available_mb": 5120
+      }
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "host": "anna-portable",
+      "cpu_load": 0.4,
+      "memory_available_mb": 5120,
+      "observed_ts": 1791640000.12
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "hosts.latest/ok",
+   "op": "hosts.latest",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "hosts.latest",
+     "args": [
+      "anna-portable"
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "host": "anna-portable",
+      "cpu_load": 0.4,
+      "memory_available_mb": 5120,
+      "observed_ts": 1791640000.12
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "hosts.current/ok",
+   "op": "hosts.current",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "hosts.current",
+     "args": [
+      "anna-portable"
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": [
+      {
+       "host": "anna-portable",
+       "cpu_load": 0.4,
+       "memory_available_mb": 5120,
+       "observed_ts": 1791640000.12
+      }
+     ],
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "hosts.turns_in_progress/ok",
+   "op": "hosts.turns_in_progress",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "hosts.turns_in_progress",
+     "args": [
+      "anna-portable"
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": 1,
+     "server_ts": 1791640000.12
+    }
+   }
+  }
+ ]
+}

@@ -1,0 +1,42 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "famille": "keys",
+ "cas": [
+  {
+   "nom": "keys.info/ok",
+   "op": "keys.info",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "keys.info",
+     "args": [
+      "coord"
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "public_key": "MCowBQYDK2VwAyEA…",
+      "fingerprint": "sha256:9c1f…",
+      "role": "coordinator",
+      "registered_ts": 1790776000.12,
+      "revoked_ts": null
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  }
+ ]
+}

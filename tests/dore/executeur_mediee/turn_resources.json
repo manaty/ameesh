@@ -1,0 +1,85 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "famille": "turn_resources",
+ "cas": [
+  {
+   "nom": "turn_resources.open_turn/ok",
+   "op": "turn_resources.open_turn",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "dc82dbde-f72a-59ac-b644-d420541fd493"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "turn_resources.open_turn",
+     "args": [
+      "turn-77",
+      "inge-front",
+      "anna-portable"
+     ],
+     "kwargs": {
+      "pgid": 4188,
+      "label": "dsh"
+     },
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": null,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "turn_resources.close_turn/ok",
+   "op": "turn_resources.close_turn",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "5524c29e-e195-5fb6-8308-7b099fec2ca2"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "turn_resources.close_turn",
+     "args": [
+      "turn-77"
+     ],
+     "kwargs": {
+      "orphan": false
+     },
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": null,
+     "server_ts": 1791640000.12
+    }
+   }
+  }
+ ]
+}

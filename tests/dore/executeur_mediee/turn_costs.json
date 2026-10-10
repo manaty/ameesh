@@ -1,0 +1,128 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "famille": "turn_costs",
+ "cas": [
+  {
+   "nom": "turn_costs.insert/ok",
+   "op": "turn_costs.insert",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "2d231f65-00ab-5650-a23f-3e8b5b26111c"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "turn_costs.insert",
+     "args": [],
+     "kwargs": {
+      "agent": "inge-front",
+      "harness": "dsh",
+      "turn": "turn-77",
+      "model": "deepseek-chat",
+      "session": "sess-5d1e",
+      "usd": 0.031,
+      "input_tokens": 12000,
+      "cached_input_tokens": 8000,
+      "output_tokens": 900,
+      "cum_usd": 0.12,
+      "cum_input_tokens": 50000,
+      "cum_cached_input_tokens": 30000,
+      "cum_output_tokens": 4000,
+      "spend_key": "turn-77"
+     },
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": true,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "turn_costs.last_reading/ok",
+   "op": "turn_costs.last_reading",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "turn_costs.last_reading",
+     "args": [
+      "inge-front",
+      "dsh",
+      "sess-5d1e"
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "session": "sess-5d1e",
+      "cum_usd": 0.12,
+      "cum_input_tokens": 50000,
+      "cum_cached_input_tokens": 30000,
+      "cum_output_tokens": 4000
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "turn_costs.spent/ok",
+   "op": "turn_costs.spent",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "turn_costs.spent",
+     "args": [
+      3600.0
+     ],
+     "kwargs": {
+      "agent": "inge-front",
+      "harnesses": [
+       "dsh"
+      ]
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": 0.42,
+     "server_ts": 1791640000.12
+    }
+   }
+  }
+ ]
+}

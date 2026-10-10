@@ -1,0 +1,383 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "famille": "mailbox",
+ "cas": [
+  {
+   "nom": "mailbox.unread/ok",
+   "op": "mailbox.unread",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "mailbox.unread",
+     "args": [
+      "inge-front",
+      50
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": [
+      {
+       "id": 812,
+       "sender": "coord",
+       "recipient": "inge-front",
+       "body": "Lot 812 : relis la PR.",
+       "kind": "message",
+       "payload": {},
+       "work_item_id": "812",
+       "created_ts": 1791639990.5,
+       "delivered_ts": null
+      }
+     ],
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "mailbox.unread_urgent/ok",
+   "op": "mailbox.unread_urgent",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "mailbox.unread_urgent",
+     "args": [
+      "inge-front",
+      50
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": [],
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "mailbox.get/ok",
+   "op": "mailbox.get",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "mailbox.get",
+     "args": [
+      812
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "id": 812,
+      "sender": "coord",
+      "recipient": "inge-front",
+      "body": "Lot 812 : relis la PR.",
+      "kind": "message",
+      "payload": {},
+      "work_item_id": "812",
+      "created_ts": 1791639990.5,
+      "delivered_ts": null
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "mailbox.reserve/ok",
+   "op": "mailbox.reserve",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "b423515e-707a-5ce7-b528-0bccb849e466"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "mailbox.reserve",
+     "args": [
+      "inge-front",
+      "exec:7f3a:anna-portable:4121",
+      42,
+      "tok-9a2c"
+     ],
+     "kwargs": {
+      "porteur": "turn",
+      "ttl_seconds": 600.0
+     },
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": [
+      {
+       "id": 812,
+       "sender": "coord",
+       "recipient": "inge-front",
+       "body": "Lot 812 : relis la PR.",
+       "kind": "message",
+       "payload": {},
+       "work_item_id": "812",
+       "created_ts": 1791639990.5,
+       "delivered_ts": null
+      }
+     ],
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "mailbox.reserve/bail-perdu",
+   "op": "mailbox.reserve",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "8b191ad3-8e33-5bba-b16e-63b0e83da1cc"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "mailbox.reserve",
+     "args": [
+      "inge-front",
+      "exec:7f3a:anna-portable:4121",
+      42,
+      "tok-9a2c"
+     ],
+     "kwargs": {
+      "porteur": "turn",
+      "ttl_seconds": 600.0
+     },
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": [],
+     "server_ts": 1791640000.12,
+     "fenced": true
+    }
+   }
+  },
+  {
+   "nom": "mailbox.deliver/ok",
+   "op": "mailbox.deliver",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "dd67f202-b8bf-5590-ade6-bce6a6ed1383"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "mailbox.deliver",
+     "args": [
+      "inge-front",
+      "exec:7f3a:anna-portable:4121",
+      42,
+      "tok-9a2c",
+      [
+       812
+      ]
+     ],
+     "kwargs": {},
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": [
+      812
+     ],
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "mailbox.release/ok",
+   "op": "mailbox.release",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "f27d65ea-98bc-5f7e-af06-24f0173371bc"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "mailbox.release",
+     "args": [
+      "inge-front",
+      "tok-9a2c",
+      [
+       812
+      ]
+     ],
+     "kwargs": {},
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": 1,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "mailbox.send/ok",
+   "op": "mailbox.send",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/session/op",
+    "entetes": {
+     "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "635419d6-5288-5c69-9206-e09badb4b826"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "mailbox.send",
+     "args": [
+      "inge-front",
+      "coord",
+      "PR prête."
+     ],
+     "kwargs": {
+      "host": null,
+      "kind": "message",
+      "payload": null,
+      "work_item_id": "812",
+      "signature": null,
+      "signature_key": null,
+      "signed_payload": null,
+      "nonce": null,
+      "created_us": null,
+      "expires_us": null
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "id": 813,
+      "created_ts": 1791640000.12,
+      "sender_project": "site",
+      "recipient_project": "site"
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "mailbox.mark_delivered/ok",
+   "op": "mailbox.mark_delivered",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/session/op",
+    "entetes": {
+     "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "de677d34-6722-51d1-86f2-9b8c4cd0d893"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "mailbox.mark_delivered",
+     "args": [
+      [
+       812
+      ]
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": 1,
+     "server_ts": 1791640000.12
+    }
+   }
+  }
+ ]
+}

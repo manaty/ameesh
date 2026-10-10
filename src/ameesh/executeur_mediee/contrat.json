@@ -1,0 +1,3774 @@
+{
+ "schema": "ameesh-exec-contract/1",
+ "version": "1.0.0",
+ "prefixe": "/api/exec/v1",
+ "description": "Contrat de l'API d'exécuteur médiée (L107) : la liste FERMÉE des opérations de storage.interface qu'un exécuteur d'appareil peut appeler, leur portée et leur fencing. Référence : docs/EXECUTEUR-MEDIEE.md.",
+ "portees": {
+  "A": "l'agent nommé (param_agent) est admis sur l'hôte de l'exécuteur",
+  "B": "A, et l'enveloppe fence porte le bail vivant de cet agent ; owner préfixé par exec:<executor_id>:",
+  "H": "hôte forcé à celui de l'exécuteur ; rendu limité à cet hôte",
+  "S": "jeton de session : agent et epoch tirés du jeton, pas du corps",
+  "agregat": "donnée agrégée ou publique du mesh, sans donnée d'autrui"
+ },
+ "forces": {
+  "hote_executeur": "l'hôte fixé à l'enrôlement remplace la valeur reçue",
+  "agent_session": "l'agent du jeton de session remplace la valeur reçue"
+ },
+ "operations": [
+  {
+   "nom": "agents.claimable",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {
+    "host": "hote_executeur"
+   },
+   "parametres": [
+    {
+     "nom": "host",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "names",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "array",
+       "null"
+      ],
+      "items": {
+       "type": "string"
+      }
+     },
+     "requis": true
+    },
+    {
+     "nom": "require_responsible",
+     "sorte": "nomme",
+     "schema": {
+      "type": "boolean"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "names restreint aux agents admis sur l'hôte ; hôte indisponible : liste vide"
+   ]
+  },
+  {
+   "nom": "agents.get",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "A"
+   ],
+   "fence": false,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "agents.cwd_used",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "A"
+   ],
+   "fence": false,
+   "param_agent": "exclude",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "cwd",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "exclude",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "boolean"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "réponse limitée aux agents de l'hôte"
+   ]
+  },
+  {
+   "nom": "agents.harnesses",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {},
+   "parametres": [],
+   "resultat": {
+    "type": "object",
+    "additionalProperties": {
+     "type": "string"
+    }
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "rendu filtré : agents de l'hôte seulement"
+   ]
+  },
+  {
+   "nom": "agents.set_status",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "status",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "status_text",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "error",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "stop_reason",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": false,
+     "defaut": null
+    }
+   ],
+   "resultat": {
+    "type": "null"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "agents.set_session",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "session_id",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "account",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": false,
+     "defaut": null
+    }
+   ],
+   "resultat": {
+    "type": "null"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "agents.set_session_account",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "account",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "boolean"
+   },
+   "refus": false,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "agents.set_pending_prompt",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "prompt",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "null"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "agents.mark_event_wake",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "null"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "agents.upsert",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "chantier",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "harness",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "host",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "cwd",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "session_id",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "status",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "status_text",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "model",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "budget_usd",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "number",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "mode",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": false,
+     "defaut": null
+    }
+   ],
+   "resultat": {
+    "type": "object"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": [
+    "seul champ non nul admis : cwd ; tout autre champ non nul : 400 bad_args",
+    "création refusée : agent inconnu → 403 forbidden_scope"
+   ]
+  },
+  {
+   "nom": "leases.claim",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "A",
+    "H"
+   ],
+   "fence": false,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "ttl_seconds",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "number"
+     },
+     "requis": true
+    },
+    {
+     "nom": "require_responsible",
+     "sorte": "nomme",
+     "schema": {
+      "type": "boolean"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": [
+    "owner préfixé par exec:<executor_id>: sinon 403 forbidden_scope",
+    "ttl_seconds borné par le lease_ttl de l'hôte (GET /host)",
+    "hôte indisponible : 403 host_unavailable"
+   ]
+  },
+  {
+   "nom": "leases.renew",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "epoch",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    },
+    {
+     "nom": "ttl_seconds",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "number"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": [
+     "number",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": [
+    "ttl_seconds borné par le lease_ttl de l'hôte"
+   ]
+  },
+  {
+   "nom": "leases.release",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "epoch",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "boolean"
+   },
+   "refus": false,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": [
+    "déclenche l'effacement du dossier de travail (L113)"
+   ]
+  },
+  {
+   "nom": "leases.reap",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {
+    "host": "hote_executeur"
+   },
+   "parametres": [
+    {
+     "nom": "host",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "leases.begin_turn",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "epoch",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    },
+    {
+     "nom": "status_text",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "boolean"
+   },
+   "refus": false,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "leases.end_turn",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "epoch",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    },
+    {
+     "nom": "status",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "status_text",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "error",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "cost_usd",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "number",
+       "null"
+      ]
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "boolean"
+   },
+   "refus": false,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": [
+    "cost_usd indicatif : le relais fait foi"
+   ]
+  },
+  {
+   "nom": "leases.take_pending_prompt",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "epoch",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": []
+  },
+  {
+   "nom": "leases.restore_prompt",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "epoch",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "boolean"
+   },
+   "refus": false,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": []
+  },
+  {
+   "nom": "leases.pause",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "epoch",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    },
+    {
+     "nom": "status_text",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "boolean"
+   },
+   "refus": false,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "leases.clear_session",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "epoch",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "boolean"
+   },
+   "refus": false,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "leases.set_marked_block",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "epoch",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    },
+    {
+     "nom": "status_text",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "error",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "error_prefix",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "string"
+   },
+   "refus": "lease",
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "leases.clear_marked_block",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "epoch",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    },
+    {
+     "nom": "status_text",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "error_prefix",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "string"
+   },
+   "refus": "lease",
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "mailbox.unread",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "A"
+   ],
+   "fence": false,
+   "param_agent": "recipient",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "recipient",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "limit",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "mailbox.unread_urgent",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "A"
+   ],
+   "fence": false,
+   "param_agent": "recipient",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "recipient",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "limit",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "mailbox.get",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "A"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "message_id",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "le destinataire du message doit être un agent admis sur l'hôte, sinon null"
+   ]
+  },
+  {
+   "nom": "mailbox.reserve",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "recipient",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "recipient",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "epoch",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "token",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "ids",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "array",
+       "null"
+      ],
+      "items": {
+       "type": "integer"
+      }
+     },
+     "requis": false,
+     "defaut": null
+    },
+    {
+     "nom": "porteur",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "ttl_seconds",
+     "sorte": "nomme",
+     "schema": {
+      "type": "number"
+     },
+     "requis": true
+    },
+    {
+     "nom": "limit",
+     "sorte": "nomme",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": false,
+     "defaut": 200
+    }
+   ],
+   "resultat": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refus": [],
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": [
+    "owner et epoch non nuls à distance"
+   ]
+  },
+  {
+   "nom": "mailbox.deliver",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "recipient",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "recipient",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "epoch",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "token",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "ids",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "array",
+      "items": {
+       "type": "integer"
+      }
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "array",
+    "items": {
+     "type": "integer"
+    }
+   },
+   "refus": [],
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": [
+    "owner et epoch non nuls à distance"
+   ]
+  },
+  {
+   "nom": "mailbox.release",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "recipient",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "recipient",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "token",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "ids",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "array",
+      "items": {
+       "type": "integer"
+      }
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "integer"
+   },
+   "refus": 0,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": []
+  },
+  {
+   "nom": "pending_spend.put",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "start_index",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    },
+    {
+     "nom": "turn",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "model",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "boolean"
+   },
+   "refus": false,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": [
+    "marqueur fail-closed (0019)"
+   ]
+  },
+  {
+   "nom": "pending_spend.set_model",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "model",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "boolean"
+   },
+   "refus": false,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "pending_spend.clear",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "boolean"
+   },
+   "refus": false,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": []
+  },
+  {
+   "nom": "pending_spend.get",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "A"
+   ],
+   "fence": false,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "turn_costs.insert",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "agent",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "agent",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "harness",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "turn",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "model",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "session",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "usd",
+     "sorte": "nomme",
+     "schema": {
+      "type": "number"
+     },
+     "requis": true
+    },
+    {
+     "nom": "input_tokens",
+     "sorte": "nomme",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    },
+    {
+     "nom": "cached_input_tokens",
+     "sorte": "nomme",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    },
+    {
+     "nom": "output_tokens",
+     "sorte": "nomme",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    },
+    {
+     "nom": "cum_usd",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "number",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "cum_input_tokens",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "cum_cached_input_tokens",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "cum_output_tokens",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "account",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": false,
+     "defaut": null
+    },
+    {
+     "nom": "spend_key",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": false,
+     "defaut": null
+    }
+   ],
+   "resultat": {
+    "type": "boolean"
+   },
+   "refus": false,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": [
+    "ligne rangée source=device, hors plafond ; le relais fait foi (L111)"
+   ]
+  },
+  {
+   "nom": "turn_costs.last_reading",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "A"
+   ],
+   "fence": false,
+   "param_agent": "agent",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "agent",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "harness",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "session",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": false,
+     "defaut": null
+    }
+   ],
+   "resultat": {
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "agent=null refusé à distance : 400 bad_args"
+   ]
+  },
+  {
+   "nom": "turn_costs.spent",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "A",
+    "agregat"
+   ],
+   "fence": false,
+   "param_agent": "agent",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "seconds",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "number"
+     },
+     "requis": true
+    },
+    {
+     "nom": "agent",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "harnesses",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "array",
+       "null"
+      ],
+      "items": {
+       "type": "string"
+      }
+     },
+     "requis": true
+    },
+    {
+     "nom": "account",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": false,
+     "defaut": null
+    }
+   ],
+   "resultat": {
+    "type": "number"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "agent=\"all\" admis : un total, rien d'autre"
+   ]
+  },
+  {
+   "nom": "budgets.limits",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "agregat"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {},
+   "parametres": [],
+   "resultat": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "plafonds du mesh"
+   ]
+  },
+  {
+   "nom": "accounts.active",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {
+    "host": "hote_executeur"
+   },
+   "parametres": [
+    {
+     "nom": "host",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "harness",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "operations.balances",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "agregat"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "provider",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "since_s",
+     "sorte": "nomme",
+     "schema": {
+      "type": "number"
+     },
+     "requis": true
+    },
+    {
+     "nom": "account",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": false,
+     "defaut": null
+    }
+   ],
+   "resultat": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "soldes, sans clé"
+   ]
+  },
+  {
+   "nom": "operations.apply_restart",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": false,
+     "defaut": null
+    },
+    {
+     "nom": "epoch",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "requis": false,
+     "defaut": null
+    }
+   ],
+   "resultat": {
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": [
+    "owner et epoch non nuls à distance"
+   ]
+  },
+  {
+   "nom": "operations.message_lots",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "A"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "ids",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "array",
+      "items": {
+       "type": "integer"
+      }
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "array",
+    "items": {
+     "type": "string"
+    }
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "seuls les messages des agents admis sur l'hôte comptent"
+   ]
+  },
+  {
+   "nom": "operations.set_session_work_item",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "owner",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "epoch",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    },
+    {
+     "nom": "work_item",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "boolean"
+   },
+   "refus": false,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "operations.record_gauges",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "readings",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "array",
+      "items": {
+       "type": "object"
+      }
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "integer"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": [
+    "jauges des comptes de l'hôte seulement"
+   ]
+  },
+  {
+   "nom": "turn_resources.open_turn",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B",
+    "H"
+   ],
+   "fence": true,
+   "param_agent": "agent",
+   "forces": {
+    "host": "hote_executeur"
+   },
+   "parametres": [
+    {
+     "nom": "turn_id",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "agent",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "host",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "pgid",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "label",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "containers",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "array",
+       "null"
+      ],
+      "items": {
+       "type": "string"
+      }
+     },
+     "requis": false,
+     "defaut": null
+    }
+   ],
+   "resultat": {
+    "type": "null"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "turn_resources.close_turn",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": null,
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "turn_id",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "orphan",
+     "sorte": "nomme",
+     "schema": {
+      "type": "boolean"
+     },
+     "requis": true
+    },
+    {
+     "nom": "containers",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "array",
+       "null"
+      ],
+      "items": {
+       "type": "string"
+      }
+     },
+     "requis": false,
+     "defaut": null
+    }
+   ],
+   "resultat": {
+    "type": "null"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": [
+    "le tour doit appartenir à l'agent de l'enveloppe de bail"
+   ]
+  },
+  {
+   "nom": "hosts.record",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "reading",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "object"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "object"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": [
+    "reading.host forcé à l'hôte de l'exécuteur ; auto-déclaré, jamais une preuve"
+   ]
+  },
+  {
+   "nom": "hosts.latest",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {
+    "host": "hote_executeur"
+   },
+   "parametres": [
+    {
+     "nom": "host",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "hosts.current",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {
+    "host": "hote_executeur"
+   },
+   "parametres": [
+    {
+     "nom": "host",
+     "sorte": "positionnel",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "hosts.turns_in_progress",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {
+    "host": "hote_executeur"
+   },
+   "parametres": [
+    {
+     "nom": "host",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "integer"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": []
+  },
+  {
+   "nom": "keys.info",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "agregat"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "agent",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "clé publique d'un expéditeur signé"
+   ]
+  },
+  {
+   "nom": "threads.index",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "author",
+   "forces": {
+    "host": "hote_executeur"
+   },
+   "parametres": [
+    {
+     "nom": "project",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "lot",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "transport",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "host",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "location",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "entry_id",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "mailbox_ids",
+     "sorte": "nomme",
+     "schema": {
+      "type": "array",
+      "items": {
+       "type": "integer"
+      }
+     },
+     "requis": true
+    },
+    {
+     "nom": "author",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "excerpt",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "ts",
+     "sorte": "nomme",
+     "schema": {
+      "type": "number"
+     },
+     "requis": true
+    },
+    {
+     "nom": "trace",
+     "sorte": "nomme",
+     "schema": {
+      "type": "object"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "null"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": [
+    "author = agent de l'enveloppe de bail"
+   ]
+  },
+  {
+   "nom": "work.mark_delegate_turn",
+   "ecriture": true,
+   "transport": "op",
+   "portee": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "agent",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "agent",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "item_ids",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "array",
+      "items": {
+       "type": "integer"
+      }
+     },
+     "requis": true
+    },
+    {
+     "nom": "note",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "array",
+    "items": {
+     "type": "integer"
+    }
+   },
+   "refus": [],
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": [
+    "lots assignés ou délégués à l'agent seulement"
+   ]
+  },
+  {
+   "nom": "wakeups.subscribe",
+   "ecriture": false,
+   "transport": "events",
+   "portee": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "channels",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "anyOf": [
+     {
+      "$ref": "ameesh-exec-events/1"
+     },
+     {
+      "type": "null"
+     }
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "servie par GET /api/exec/v1/events, jamais par /op"
+   ]
+  },
+  {
+   "nom": "leases.state",
+   "ecriture": false,
+   "transport": "session/op",
+   "portee": [
+    "S"
+   ],
+   "fence": false,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "name = agent du jeton de session"
+   ]
+  },
+  {
+   "nom": "agents.overview",
+   "ecriture": false,
+   "transport": "session/op",
+   "portee": [
+    "S",
+    "agregat"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {},
+   "parametres": [],
+   "resultat": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "annuaire réduit : name, role, status seulement"
+   ]
+  },
+  {
+   "nom": "mailbox.send",
+   "ecriture": true,
+   "transport": "session/op",
+   "portee": [
+    "S"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {
+    "sender": "agent_session",
+    "host": "hote_executeur"
+   },
+   "parametres": [
+    {
+     "nom": "sender",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "recipient",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "body",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "host",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "kind",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "payload",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "object",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "work_item_id",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "signature",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "signature_key",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "signed_payload",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "nonce",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "created_us",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "expires_us",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "object"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": [
+    "le destinataire doit exister (pas de création implicite)"
+   ]
+  },
+  {
+   "nom": "mailbox.mark_delivered",
+   "ecriture": true,
+   "transport": "session/op",
+   "portee": [
+    "S"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "ids",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "array",
+      "items": {
+       "type": "integer"
+      }
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "integer"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": true
+   },
+   "regles": [
+    "messages adressés à l'agent du jeton seulement"
+   ]
+  },
+  {
+   "nom": "work.get",
+   "ecriture": false,
+   "transport": "session/op",
+   "portee": [
+    "S"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "item_id",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "lot du projet de l'agent, sinon null"
+   ]
+  },
+  {
+   "nom": "work.move",
+   "ecriture": true,
+   "transport": "session/op",
+   "portee": [
+    "S"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {
+    "actor": "agent_session"
+   },
+   "parametres": [
+    {
+     "nom": "item_id",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    },
+    {
+     "nom": "state",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "current",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "loops",
+     "sorte": "nomme",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    },
+    {
+     "nom": "note",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "actor",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": [
+    "lot assigné à l'agent"
+   ]
+  },
+  {
+   "nom": "work.note",
+   "ecriture": true,
+   "transport": "session/op",
+   "portee": [
+    "S"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {
+    "actor": "agent_session"
+   },
+   "parametres": [
+    {
+     "nom": "item_id",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "integer"
+     },
+     "requis": true
+    },
+    {
+     "nom": "state",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "text",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "actor",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "null"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": [
+    "lot assigné à l'agent"
+   ]
+  },
+  {
+   "nom": "actions.get",
+   "ecriture": false,
+   "transport": "session/op",
+   "portee": [
+    "S"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {
+    "with_receipts": false
+   },
+   "parametres": [
+    {
+     "nom": "action_id",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "with_receipts",
+     "sorte": "nomme",
+     "schema": {
+      "type": "boolean"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "action proposée par l'agent du jeton"
+   ]
+  },
+  {
+   "nom": "actions.propose",
+   "ecriture": true,
+   "transport": "session/op",
+   "portee": [
+    "S"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forces": {
+    "proposed_by": "agent_session"
+   },
+   "parametres": [
+    {
+     "nom": "action_id",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "project",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "work_item",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "proposed_by",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "connector",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "operation",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "target",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "args_json",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "action_class",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "amount",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "currency",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": true
+    },
+    {
+     "nom": "policy_version",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "digest",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "dedupe",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "requires_receipt",
+     "sorte": "nomme",
+     "schema": {
+      "type": "boolean"
+     },
+     "requis": true
+    },
+    {
+     "nom": "approvers_json",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    },
+    {
+     "nom": "note",
+     "sorte": "nomme",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "null"
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "requise",
+    "naturelle": false
+   },
+   "regles": [
+    "proposer seulement : execute reste au serveur (0012)"
+   ]
+  }
+ ],
+ "refusees": {
+  "total_interface": 221,
+  "raisons": {
+   "accounts": "hors du sous-ensemble de l'exécuteur médié",
+   "action_source": "autorité (0012)",
+   "actions": "hors du sous-ensemble de l'exécuteur médié",
+   "agents": "hors du sous-ensemble de l'exécuteur médié",
+   "approvals": "autorité : jamais d'approbation depuis l'appareil (0012)",
+   "authenticators": "autorité (0012)",
+   "budgets": "hors du sous-ensemble de l'exécuteur médié",
+   "canon": "le canon n'est jamais lu ni écrit par l'appareil",
+   "catalog": "catalogue : serveur seulement",
+   "ephemerals": "pas de création d'agent depuis l'appareil",
+   "grants": "autorité (0012)",
+   "hosts": "hors du sous-ensemble de l'exécuteur médié",
+   "keys": "hors du sous-ensemble de l'exécuteur médié",
+   "leases": "hors du sous-ensemble de l'exécuteur médié",
+   "mailbox": "hors du sous-ensemble de l'exécuteur médié",
+   "nonces": "autorité (0012)",
+   "operations": "hors du sous-ensemble de l'exécuteur médié",
+   "packages": "canon et paquets : serveur seulement",
+   "placements": "placement : serveur seulement",
+   "progress": "vue des humains (/api/v1)",
+   "projects": "vue des humains (/api/v1)",
+   "session_bindings": "session toujours liée au bail : la recherche de liaison rend vide",
+   "threads": "hors du sous-ensemble de l'exécuteur médié",
+   "turn_resources": "hors du sous-ensemble de l'exécuteur médié",
+   "visibility": "visibilité 0029 : serveur seulement",
+   "wakeups": "hors du sous-ensemble de l'exécuteur médié",
+   "work": "hors du sous-ensemble de l'exécuteur médié"
+  },
+  "operations": {
+   "accounts": [
+    "hold",
+    "holds",
+    "init_active",
+    "release",
+    "set_auto",
+    "switch",
+    "switches"
+   ],
+   "action_source": [
+    "columns",
+    "rows"
+   ],
+   "actions": [
+    "attempts",
+    "bind",
+    "cancel",
+    "covering_grants",
+    "decision_queues",
+    "events",
+    "last_event_note",
+    "launch",
+    "launched",
+    "log_event",
+    "recent",
+    "replace",
+    "settle"
+   ],
+   "agents": [
+    "clear_model",
+    "count",
+    "human_known",
+    "set_mode",
+    "upsert_unleased",
+    "wake_check"
+   ],
+   "approvals": [
+    "candidates",
+    "consume",
+    "create",
+    "recent"
+   ],
+   "authenticators": [
+    "active_holders",
+    "append_sync",
+    "canon_refs",
+    "for_approver",
+    "insert",
+    "journal_head",
+    "last_sync",
+    "lock_registry",
+    "rebase_default",
+    "registered",
+    "registry_lock_held",
+    "revoke",
+    "under_registry_lock",
+    "update_meta"
+   ],
+   "budgets": [
+    "events",
+    "put"
+   ],
+   "canon": [
+    "clear_pending_stop",
+    "clear_responsible",
+    "close_others",
+    "flag_default",
+    "host_rows",
+    "key_for_root",
+    "lineage_rows",
+    "lock_default_state",
+    "move_host",
+    "rebase_default",
+    "record_auth_state",
+    "record_state",
+    "relocate",
+    "revive",
+    "set_default_id",
+    "set_placement",
+    "state",
+    "states",
+    "stop_removed",
+    "write_declared"
+   ],
+   "catalog": [
+    "active",
+    "known",
+    "listing",
+    "retire",
+    "show",
+    "update_prices",
+    "upsert_harnesses",
+    "upsert_models"
+   ],
+   "ephemerals": [
+    "create",
+    "creator",
+    "exists"
+   ],
+   "grants": [
+    "candidates",
+    "get",
+    "live_reservations",
+    "register",
+    "release",
+    "reserve",
+    "revoke"
+   ],
+   "hosts": [
+    "history"
+   ],
+   "keys": [
+    "register",
+    "registered",
+    "revoke"
+   ],
+   "leases": [
+    "attach_claim",
+    "turn_in_progress"
+   ],
+   "mailbox": [
+    "history",
+    "pending_recipients",
+    "pending_recipients_sorted",
+    "unread_counts",
+    "unread_total"
+   ],
+   "nonces": [
+    "consume",
+    "state"
+   ],
+   "operations": [
+    "adopt",
+    "assigned_open_lots",
+    "gauge_history",
+    "listing",
+    "open_lots_activity",
+    "recent_balance",
+    "record_balance",
+    "request_restart",
+    "resume",
+    "set_settings",
+    "turns"
+   ],
+   "packages": [
+    "all",
+    "get",
+    "retire",
+    "upsert"
+   ],
+   "placements": [
+    "recorded"
+   ],
+   "progress": [
+    "actions",
+    "agents",
+    "costs",
+    "lot_actions",
+    "lot_events",
+    "lot_messages",
+    "lot_milestones",
+    "lots",
+    "package_items",
+    "packages"
+   ],
+   "projects": [
+    "board"
+   ],
+   "session_bindings": [
+    "active",
+    "bind",
+    "listing",
+    "revoke",
+    "set_pid",
+    "with_pids"
+   ],
+   "threads": [
+    "indexed"
+   ],
+   "turn_resources": [
+    "mark_orphan",
+    "open_by_agent",
+    "orphans",
+    "stale_running"
+   ],
+   "visibility": [
+    "cached",
+    "purge",
+    "put"
+   ],
+   "wakeups": [
+    "notify"
+   ],
+   "work": [
+    "add",
+    "add_milestone",
+    "assign",
+    "by_package",
+    "close",
+    "close_merged",
+    "current_delegation",
+    "delays",
+    "delegate",
+    "due_delegations",
+    "events",
+    "items",
+    "link_package",
+    "milestones",
+    "overdue_delegations",
+    "refresh_package_parents",
+    "resolve_delegation",
+    "returned_delegations",
+    "timeline"
+   ]
+  }
+ }
+}

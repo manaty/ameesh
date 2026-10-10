@@ -1,0 +1,154 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "famille": "pending_spend",
+ "cas": [
+  {
+   "nom": "pending_spend.put/ok",
+   "op": "pending_spend.put",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "66845416-3c68-5435-b1f7-094736d5e907"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "pending_spend.put",
+     "args": [
+      "inge-front",
+      0,
+      "turn-77",
+      "deepseek-chat"
+     ],
+     "kwargs": {},
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": true,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "pending_spend.set_model/ok",
+   "op": "pending_spend.set_model",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "cdddf821-71fe-5d25-b9e3-42c90fe417dd"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "pending_spend.set_model",
+     "args": [
+      "inge-front",
+      "deepseek-chat"
+     ],
+     "kwargs": {},
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": true,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "pending_spend.clear/ok",
+   "op": "pending_spend.clear",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json",
+     "Idempotency-Key": "a427655e-d2bb-52a3-ad84-5eaf49a85b8b"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "pending_spend.clear",
+     "args": [
+      "inge-front"
+     ],
+     "kwargs": {},
+     "fence": {
+      "agent": "inge-front",
+      "owner": "exec:7f3a:anna-portable:4121",
+      "epoch": 42
+     }
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": true,
+     "server_ts": 1791640000.12
+    }
+   }
+  },
+  {
+   "nom": "pending_spend.get/ok",
+   "op": "pending_spend.get",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "pending_spend.get",
+     "args": [
+      "inge-front"
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": {
+      "agent": "inge-front",
+      "start_index": 0,
+      "turn": "turn-77",
+      "model": "deepseek-chat",
+      "created_ts": 1791639970.12
+     },
+     "server_ts": 1791640000.12
+    }
+   }
+  }
+ ]
+}

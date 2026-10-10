@@ -1,0 +1,37 @@
+{
+ "schema": "ameesh-exec-golden/1",
+ "famille": "accounts",
+ "cas": [
+  {
+   "nom": "accounts.active/ok",
+   "op": "accounts.active",
+   "requete": {
+    "methode": "POST",
+    "chemin": "/api/exec/v1/op",
+    "entetes": {
+     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "Content-Type": "application/json"
+    },
+    "corps": {
+     "schema": "ameesh-exec-op/1",
+     "op": "accounts.active",
+     "args": [
+      "anna-portable",
+      "dsh"
+     ],
+     "kwargs": {}
+    }
+   },
+   "reponse": {
+    "statut": 200,
+    "entetes": {},
+    "corps": {
+     "schema": "ameesh-exec-result/1",
+     "ok": true,
+     "value": null,
+     "server_ts": 1791640000.12
+    }
+   }
+  }
+ ]
+}

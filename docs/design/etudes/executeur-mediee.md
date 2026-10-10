@@ -204,7 +204,7 @@ entrant sur l'appareil : tout part de la VM.
 | `GET  /api/exec/v1/health` | aucune | version du contrat, heure du serveur |
 
 Une seule route `op` plutôt qu'une route par opération : le contrat **est**
-la table de la section 1, versée en JSON (`docs/api/executor-v1.json`, L107) ;
+la table de la section 1, versée en JSON (`src/ameesh/executeur_mediee/contrat.json`, L107, référence `docs/EXECUTEUR-MEDIEE.md`) ;
 un seul répartiteur et une fonction de portée par opération. Les routes
 humaines (`/api/v1/executors…`, section 3) appartiennent à `/api/v1`.
 
@@ -532,7 +532,7 @@ Tailles : **S** ≤ 1 jour, **M** 2–3 jours, **L** 4–5 jours (agent seul).
 
 | Lot | Contenu | Dépend de | Taille | Côté Nexlink |
 |---|---|---|---|---|
-| **L107 — contrat figé** | `docs/api/executor-v1.json` : table des 61 opérations (nom, arguments, retour, écriture, portée) ; `src/ameesh/executor_api/contract.py` : enveloppes, codes d'erreur, `GateState`/`HostGate`, schémas `ameesh-exec-*/1` ; jeux d'essai JSON dorés (requête et réponse par opération), partagés par serveur et client ; fixtures de jetons | cette étude | S | — |
+| **L107 — contrat figé** | `src/ameesh/executeur_mediee/contrat.json` (livrée dans la roue) : table des 61 opérations (nom, arguments, retour, écriture, portée) ; `src/ameesh/executeur_mediee/` (`contrat`, `evenements`, `porte`, `interfaces`) : enveloppes, codes d'erreur, `GateState`/`HostGate`, schémas `ameesh-exec-*/1` ; jeux d'essai JSON dorés (requête et réponse par opération), partagés par serveur et client ; fixtures de jetons | cette étude | S | — |
 | **L108 — serveur d'exécuteur** | `/api/exec/v1` dans `ameesh serve` (ou `--exec-only`) : répartiteur `op` et `session/op`, une fonction de portée par opération, fencing transactionnel, `exec_idempotency`, rôle `ameesh_exec`, flux `events` (SSE et attente longue) filtré par hôte, `GET /host`, `PUT /host/availability` et garde de `claim` ; vérification de jeton derrière `ExecutorAuth.verify(token) -> Principal` (bouchon jusqu'à L110) ; tests : chaque opération hors portée refusée, bail perdu → valeur de refus | L107 | L | — |
 | **L109 — client de stockage distant** | `storage/remote/` : `RemoteDb` (`name`, `ping`), `RemoteStorage` (61 opérations, le reste lève `NotSupportedRemotely`), `storage.of()` qui choisit selon la connexion ; `RemoteSubscription` (SSE, repli attente longue) ; clés d'idempotence, reprises, correspondance des erreurs ; mode `mediated` de l'exécuteur (pas de sync du canon, de solde, de déplacement, d'échéance de délégation ; limites lues par `GET /host`) ; `agent-mail` et `ameesh mail/work/action` par `AMEESH_EXEC_TOKEN` ; essais sur un faux serveur nourri des jeux dorés | L107 | L | — |
 | **L110 — enrôlement et identité** | migrations `executors`, `executor_invitations`, `executor_tokens` ; `ameesh executor invite|enroll|list|revoke` ; `POST /enroll`, `/token`, `/session-token` ; assertion ES256 (`cryptography` côté appareil, `p256.verify` côté serveur) ; révocation qui relâche les baux ; routes humaines `/api/v1/executors…` derrière L86 (CLI locale du serveur en attendant) ; liaison facultative `device_attestation` | L107 | M | signature d'un défi par la clé d'appareil (facultatif) |
