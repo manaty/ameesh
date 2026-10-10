@@ -1,11 +1,11 @@
 {
  "schema": "ameesh-exec-golden/1",
- "famille": "identite",
+ "family": "identity",
  "enroll": {
-  "requete": {
-   "methode": "POST",
-   "chemin": "/api/exec/v1/enroll",
-   "corps": {
+  "request": {
+   "method": "POST",
+   "path": "/api/exec/v1/enroll",
+   "body": {
     "schema": "ameesh-exec-enroll/1",
     "code": "K7QF-2M9D-XW4P-8RTA-J3NC-5HVB",
     "public_key": {
@@ -19,9 +19,9 @@
     "label": "portable (VM Compute)"
    }
   },
-  "reponse": {
-   "statut": 201,
-   "corps": {
+  "response": {
+   "status": 201,
+   "body": {
     "executor_id": "7f3a9c2e4b1d6058",
     "mesh": "mesh-exemple",
     "host": "anna-portable",
@@ -30,16 +30,16 @@
   }
  },
  "token": {
-  "requete": {
-   "methode": "POST",
-   "chemin": "/api/exec/v1/token",
-   "corps": {
+  "request": {
+   "method": "POST",
+   "path": "/api/exec/v1/token",
+   "body": {
     "assertion": "<JWS ES256 (signature JOSE r||s) : iss=7f3a9c2e4b1d6058, aud=https://mesh.exemple, iat, exp<=iat+60, jti>"
    }
   },
-  "reponse": {
-   "statut": 200,
-   "corps": {
+  "response": {
+   "status": 200,
+   "body": {
     "schema": "ameesh-exec-token/1",
     "access_token": "amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "token_type": "Bearer",
@@ -48,13 +48,13 @@
   }
  },
  "session_token": {
-  "requete": {
-   "methode": "POST",
-   "chemin": "/api/exec/v1/session-token",
-   "entetes": {
+  "request": {
+   "method": "POST",
+   "path": "/api/exec/v1/session-token",
+   "headers": {
     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
    },
-   "corps": {
+   "body": {
     "fence": {
      "agent": "inge-front",
      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
@@ -62,9 +62,9 @@
     }
    }
   },
-  "reponse": {
-   "statut": 200,
-   "corps": {
+  "response": {
+   "status": 200,
+   "body": {
     "schema": "ameesh-exec-session-token/1",
     "access_token": "ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
     "token_type": "Bearer",
@@ -73,16 +73,16 @@
   }
  },
  "host": {
-  "requete": {
-   "methode": "GET",
-   "chemin": "/api/exec/v1/host",
-   "entetes": {
+  "request": {
+   "method": "GET",
+   "path": "/api/exec/v1/host",
+   "headers": {
     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
    }
   },
-  "reponse": {
-   "statut": 200,
-   "corps": {
+  "response": {
+   "status": 200,
+   "body": {
     "schema": "ameesh-exec-host/1",
     "host": "anna-portable",
     "mesh": "mesh-exemple",
@@ -113,13 +113,13 @@
   }
  },
  "health": {
-  "requete": {
-   "methode": "GET",
-   "chemin": "/api/exec/v1/health"
+  "request": {
+   "method": "GET",
+   "path": "/api/exec/v1/health"
   },
-  "reponse": {
-   "statut": 200,
-   "corps": {
+  "response": {
+   "status": 200,
+   "body": {
     "schema": "ameesh-exec-health/1",
     "contract": "1.1.0",
     "server_ts": 1791640000.12

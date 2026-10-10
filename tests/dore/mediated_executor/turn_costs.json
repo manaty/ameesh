@@ -1,19 +1,19 @@
 {
  "schema": "ameesh-exec-golden/1",
- "famille": "turn_costs",
- "cas": [
+ "family": "turn_costs",
+ "cases": [
   {
-   "nom": "turn_costs.insert/ok",
+   "name": "turn_costs.insert/ok",
    "op": "turn_costs.insert",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "2d231f65-00ab-5650-a23f-3e8b5b26111c"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "turn_costs.insert",
      "args": [],
@@ -40,10 +40,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": true,
@@ -52,16 +52,16 @@
    }
   },
   {
-   "nom": "turn_costs.last_reading/ok",
+   "name": "turn_costs.last_reading/ok",
    "op": "turn_costs.last_reading",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "turn_costs.last_reading",
      "args": [
@@ -72,10 +72,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": {
@@ -90,16 +90,16 @@
    }
   },
   {
-   "nom": "turn_costs.spent/ok",
+   "name": "turn_costs.spent/ok",
    "op": "turn_costs.spent",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "turn_costs.spent",
      "args": [
@@ -113,10 +113,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": 0.42,

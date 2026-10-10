@@ -1,24 +1,24 @@
 {
  "schema": "ameesh-exec-golden/1",
- "famille": "evenements",
+ "family": "events",
  "sse": {
-  "requete": {
-   "methode": "GET",
-   "chemin": "/api/exec/v1/events",
-   "entetes": {
+  "request": {
+   "method": "GET",
+   "path": "/api/exec/v1/events",
+   "headers": {
     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     "Accept": "text/event-stream",
     "Last-Event-ID": "k3f9:16"
    }
   },
-  "reponse": {
-   "statut": 200,
-   "entetes": {
+  "response": {
+   "status": 200,
+   "headers": {
     "Content-Type": "text/event-stream"
    },
-   "texte": "retry: 3000\n\nid: k3f9:17\nevent: agent_mail\ndata: {\"to\":\"inge-front\",\"id\":812}\n\nid: k3f9:18\nevent: agent_lease\ndata: {\"name\":\"inge-front\",\"owner\":\"exec:7f3a9c2e4b1d6058:anna-portable:4121\",\"epoch\":42,\"status\":\"running\"}\n\nid: k3f9:19\nevent: ameesh_budget\ndata: {\"scope\":\"mesh\"}\n\n: ping\n\n"
+   "text": "retry: 3000\n\nid: k3f9:17\nevent: agent_mail\ndata: {\"to\":\"inge-front\",\"id\":812}\n\nid: k3f9:18\nevent: agent_lease\ndata: {\"name\":\"inge-front\",\"owner\":\"exec:7f3a9c2e4b1d6058:anna-portable:4121\",\"epoch\":42,\"status\":\"running\"}\n\nid: k3f9:19\nevent: ameesh_budget\ndata: {\"scope\":\"mesh\"}\n\n: ping\n\n"
   },
-  "evenements": [
+  "events": [
    {
     "id": "k3f9:17",
     "channel": "agent_mail",
@@ -46,17 +46,17 @@
    }
   ]
  },
- "attente_longue": {
-  "requete": {
-   "methode": "GET",
-   "chemin": "/api/exec/v1/events?wait=25&after=k3f9:16",
-   "entetes": {
+ "long_poll": {
+  "request": {
+   "method": "GET",
+   "path": "/api/exec/v1/events?wait=25&after=k3f9:16",
+   "headers": {
     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
    }
   },
-  "reponse": {
-   "statut": 200,
-   "corps": {
+  "response": {
+   "status": 200,
+   "body": {
     "schema": "ameesh-exec-events/1",
     "events": [
      {
@@ -89,34 +89,34 @@
    }
   }
  },
- "attente_longue_vide": {
-  "requete": {
-   "methode": "GET",
-   "chemin": "/api/exec/v1/events?wait=25&after=k3f9:19",
-   "entetes": {
+ "long_poll_empty": {
+  "request": {
+   "method": "GET",
+   "path": "/api/exec/v1/events?wait=25&after=k3f9:19",
+   "headers": {
     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
    }
   },
-  "reponse": {
-   "statut": 200,
-   "corps": {
+  "response": {
+   "status": 200,
+   "body": {
     "schema": "ameesh-exec-events/1",
     "events": [],
     "last_id": "k3f9:19"
    }
   }
  },
- "reprise_trou": {
-  "requete": {
-   "methode": "GET",
-   "chemin": "/api/exec/v1/events?wait=25&after=a001:5",
-   "entetes": {
+ "gap_resume": {
+  "request": {
+   "method": "GET",
+   "path": "/api/exec/v1/events?wait=25&after=a001:5",
+   "headers": {
     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
    }
   },
-  "reponse": {
-   "statut": 200,
-   "corps": {
+  "response": {
+   "status": 200,
+   "body": {
     "schema": "ameesh-exec-events/1",
     "events": [
      {

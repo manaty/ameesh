@@ -100,10 +100,10 @@ class FileGateTest(unittest.TestCase):
         with open(GOLDEN, encoding="utf-8") as fh:
             golden = json.load(fh)
         g = self.gate()
-        for d in golden["etats"]:
+        for d in golden["states"]:
             ecrit_etat(self.path, d)
             self.assertEqual(g.state().to_json(), d)
-        for d in golden["illisibles"]:
+        for d in golden["unreadable"]:
             ecrit_etat(self.path, d)
             self.assertEqual(g.state().state, "stopped")
 
@@ -399,7 +399,7 @@ class DisponibiliteTest(unittest.TestCase):
             self.golden = json.load(fh)
 
     def test_corps_dore_et_admission(self):
-        body = self.golden["disponibilite"]["requete"]["corps"]
+        body = self.golden["availability"]["request"]["body"]
         self.assertEqual(D.check_body(body), body)
         for mauvais in (dict(body, schema="x"), dict(body, state="sleeping"),
                         dict(body, available=True), dict(body, seq="8")):

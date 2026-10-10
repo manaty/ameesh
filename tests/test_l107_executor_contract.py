@@ -77,9 +77,9 @@ def _op_cases() -> list:
     out = []
     for fn in sorted(os.listdir(DORE)):
         g = _golden(fn)
-        if g["famille"] in ("erreurs", "evenements", "porte", "identite"):
+        if g["family"] in ("errors", "events", "gate", "identity"):
             continue
-        out.extend(g["cas"])
+        out.extend(g["cases"])
     return out
 
 
@@ -113,7 +113,7 @@ class TableTest(unittest.TestCase):
                 params = list(sig.parameters.values())[1:]
                 self.assertEqual([p.name for p in op.params], [p.name for p in params])
                 for tp, p in zip(op.params, params):
-                    kind = {p.POSITIONAL_OR_KEYWORD: "positionnel", p.KEYWORD_ONLY: "nomme"}[p.kind]
+                    kind = {p.POSITIONAL_OR_KEYWORD: "positional", p.KEYWORD_ONLY: "keyword"}[p.kind]
                     self.assertEqual(tp.kind, kind, p.name)
                     self.assertEqual(tp.required, p.default is p.empty, p.name)
                     if p.default is not p.empty:
@@ -175,26 +175,26 @@ class EnveloppesTest(unittest.TestCase):
         expected = {n for n, o in self.c.operations.items() if o.transport != "events"}
         self.assertEqual(covered, expected)
         ev = _golden("events.json")
-        self.assertTrue(ev["sse"]["evenements"])
+        self.assertTrue(ev["sse"]["events"])
 
     def test_dores_conformes(self):
         for case in _op_cases():
-            with self.subTest(cas=case["nom"]):
+            with self.subTest(cas=case["name"]):
                 op = self.c.get(case["op"])
-                req = case["requete"]
-                route = req["chemin"][len(C.PREFIX) + 1:]
+                req = case["request"]
+                route = req["path"][len(C.PREFIX) + 1:]
                 self.assertIn(route, op.routes)
-                self.assertEqual(case["nom"].endswith("/session"), route != op.transport)
-                token = req["entetes"]["Authorization"].split()[1]
+                self.assertEqual(case["name"].endswith("/session"), route != op.transport)
+                token = req["headers"]["Authorization"].split()[1]
                 prefix = I.SESSION_TOKEN_PREFIX if route == "session/op" else I.ACCESS_TOKEN_PREFIX
                 self.assertTrue(token.startswith(prefix))
-                key = req["entetes"].get(C.IDEMPOTENCY_HEADER)
+                key = req["headers"].get(C.IDEMPOTENCY_HEADER)
                 self.assertEqual(bool(key), op.write)
-                parsed = C.OpRequest.from_json(req["corps"])
-                self.assertEqual(parsed.to_json(), req["corps"])
+                parsed = C.OpRequest.from_json(req["body"])
+                self.assertEqual(parsed.to_json(), req["body"])
                 self.c.validate_request(parsed, route=route, idempotency_key=key)
-                res = C.OpResult.from_json(case["reponse"]["corps"])
-                self.assertEqual(case["reponse"]["statut"], 200)
+                res = C.OpResult.from_json(case["response"]["body"])
+                self.assertEqual(case["response"]["status"], 200)
                 self.assertTrue(C.conforms(res.value, op.result), res.value)
                 if res.fenced:
                     self.assertTrue(op.fence)
@@ -227,12 +227,12 @@ class EnveloppesTest(unittest.TestCase):
             c.validate_request(C.OpRequest("approvals.consume"), route="op", idempotency_key="k")
 
     def test_erreurs_dorees_et_exceptions_client(self):
-        for case in _golden("errors.json")["cas"]:
-            with self.subTest(cas=case["nom"]):
-                body = case["reponse"]["corps"]
+        for case in _golden("errors.json")["cases"]:
+            with self.subTest(cas=case["name"]):
+                body = case["response"]["body"]
                 self.assertEqual(body["schema"], C.SCHEMA_ERROR)
                 spec = C.ERRORS[body["error"]]
-                self.assertEqual(case["reponse"]["statut"], spec.status)
+                self.assertEqual(case["response"]["status"], spec.status)
         expect = {
             "forbidden_scope": C.Forbidden, "host_unavailable": C.Forbidden,
             "executor_revoked": C.ExecutorRevoked, "op_not_allowed": C.NotSupportedRemotely,
@@ -299,8 +299,8 @@ class EnveloppesTest(unittest.TestCase):
 class EvenementsTest(unittest.TestCase):
     def test_sse_dore(self):
         g = _golden("events.json")
-        parsed = list(E.parse_sse(g["sse"]["reponse"]["texte"].splitlines(True)))
-        self.assertEqual([e.to_json() for e in parsed], g["sse"]["evenements"])
+        parsed = list(E.parse_sse(g["sse"]["response"]["text"].splitlines(True)))
+        self.assertEqual([e.to_json() for e in parsed], g["sse"]["events"])
         for e in parsed:
             self.assertIn(e.channel, E.CHANNELS)
             sig = e.as_signal()
@@ -309,11 +309,11 @@ class EvenementsTest(unittest.TestCase):
 
     def test_attente_longue_doree(self):
         g = _golden("events.json")
-        evs, last = E.parse_long_poll(g["attente_longue"]["reponse"]["corps"])
+        evs, last = E.parse_long_poll(g["long_poll"]["response"]["body"])
         self.assertEqual(last, evs[-1].id)
-        evs, last = E.parse_long_poll(g["attente_longue_vide"]["reponse"]["corps"])
+        evs, last = E.parse_long_poll(g["long_poll_empty"]["response"]["body"])
         self.assertEqual((evs, last), ([], "k3f9:19"))
-        evs, _ = E.parse_long_poll(g["reprise_trou"]["reponse"]["corps"])
+        evs, _ = E.parse_long_poll(g["gap_resume"]["response"]["body"])
         self.assertEqual(evs[0].channel, E.RESET)
 
     def test_curseur(self):
@@ -326,11 +326,11 @@ class EvenementsTest(unittest.TestCase):
 class PorteTest(unittest.TestCase):
     def test_etats_dores(self):
         g = _golden("gate.json")
-        states = [P.GateState.from_json(s) for s in g["etats"]]
+        states = [P.GateState.from_json(s) for s in g["states"]]
         self.assertEqual([s.state for s in states], list(P.STATES))
-        self.assertEqual([s.to_json() for s in states], g["etats"])
+        self.assertEqual([s.to_json() for s in states], g["states"])
         self.assertTrue(states[0].may_claim and not states[1].may_claim)
-        for bad in g["illisibles"]:
+        for bad in g["unreadable"]:
             with self.assertRaises(ValueError):
                 P.GateState.from_json(bad)
         # contrat 1.1 : porte illisible d'un hôte médié = arrêt
@@ -344,9 +344,9 @@ class PorteTest(unittest.TestCase):
                      "held": "a"}, None):
             with self.assertRaises(ValueError):
                 P.GateAck.from_json(bad)
-        for ack in g["acquittements"]:
+        for ack in g["acks"]:
             self.assertEqual(P.GateAck.from_json(ack).to_json(), ack)
-        body = g["disponibilite"]["requete"]["corps"]
+        body = g["availability"]["request"]["body"]
         self.assertEqual(body, P.availability_body(states[1]))
         self.assertFalse(body["available"])
 
@@ -387,17 +387,17 @@ class InterfacesFigeesTest(unittest.TestCase):
 
     def test_identite_doree(self):
         g = _golden("identity.json")
-        host = I.HostInfo.from_json(g["host"]["reponse"]["corps"])
-        self.assertEqual(host.to_json(), g["host"]["reponse"]["corps"])
+        host = I.HostInfo.from_json(g["host"]["response"]["body"])
+        self.assertEqual(host.to_json(), g["host"]["response"]["body"])
         self.assertEqual(host.contract_version, C.load().version)
-        tok = g["token"]["reponse"]["corps"]
+        tok = g["token"]["response"]["body"]
         self.assertEqual(tok["schema"], C.SCHEMA_TOKEN)
         self.assertTrue(tok["access_token"].startswith(I.ACCESS_TOKEN_PREFIX))
-        ses = g["session_token"]["reponse"]["corps"]
+        ses = g["session_token"]["response"]["body"]
         self.assertEqual(ses["schema"], C.SCHEMA_SESSION_TOKEN)
         self.assertTrue(ses["access_token"].startswith(I.SESSION_TOKEN_PREFIX))
-        C.Fence.from_json(g["session_token"]["requete"]["corps"]["fence"])
-        self.assertEqual(g["enroll"]["requete"]["corps"]["schema"], C.SCHEMA_ENROLL)
+        C.Fence.from_json(g["session_token"]["request"]["body"]["fence"])
+        self.assertEqual(g["enroll"]["request"]["body"]["schema"], C.SCHEMA_ENROLL)
 
 
 if __name__ == "__main__":

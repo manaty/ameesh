@@ -142,9 +142,9 @@ def case(name, op, req_body, status, resp_body, *, route="/op", token=ACC, key=N
     if key:
         h[C.IDEMPOTENCY_HEADER] = key
     h.update(extra_headers or {})
-    return {"nom": name, "op": op,
-            "requete": {"methode": "POST", "chemin": C.PREFIX + route, "entetes": h, "corps": req_body},
-            "reponse": {"statut": status, "entetes": resp_headers or {}, "corps": resp_body}}
+    return {"name": name, "op": op,
+            "request": {"method": "POST", "path": C.PREFIX + route, "headers": h, "body": req_body},
+            "response": {"status": status, "headers": resp_headers or {}, "body": resp_body}}
 
 
 for name, op in c.operations.items():
@@ -175,7 +175,7 @@ for name, op in c.operations.items():
                           resp_headers={C.IDEMPOTENCY_REPLAYED_HEADER: "true"}))
 
 for fam, cases in families.items():
-    json.dump({"schema": "ameesh-exec-golden/1", "famille": fam, "cas": cases},
+    json.dump({"schema": "ameesh-exec-golden/1", "family": fam, "cases": cases},
               open(os.path.join(OUT, fam + ".json"), "w"), ensure_ascii=False, indent=1)
 
 # erreurs
@@ -221,7 +221,7 @@ erreurs = [
  err("unavailable", "agents.get", C.OpRequest("agents.get", (AG,)).to_json(), 503, "unavailable",
      "base indisponible", retry=5),
 ]
-json.dump({"schema": "ameesh-exec-golden/1", "famille": "erreurs", "cas": erreurs},
+json.dump({"schema": "ameesh-exec-golden/1", "family": "errors", "cases": erreurs},
           open(os.path.join(OUT, "errors.json"), "w"), ensure_ascii=False, indent=1)
 
 # événements
@@ -230,21 +230,21 @@ evs = [E.Event("k3f9:17", "agent_mail", {"to": AG, "id": 812}),
        E.Event("k3f9:19", "ameesh_budget", {"scope": "mesh"})]
 sse = E.format_retry() + "".join(E.format_sse(e) for e in evs) + E.format_ping()
 evenements = {
- "schema": "ameesh-exec-golden/1", "famille": "evenements",
- "sse": {"requete": {"methode": "GET", "chemin": C.PREFIX + "/events",
-                     "entetes": {"Authorization": ACC, "Accept": "text/event-stream",
+ "schema": "ameesh-exec-golden/1", "family": "events",
+ "sse": {"request": {"method": "GET", "path": C.PREFIX + "/events",
+                     "headers": {"Authorization": ACC, "Accept": "text/event-stream",
                                  "Last-Event-ID": "k3f9:16"}},
-         "reponse": {"statut": 200, "entetes": {"Content-Type": "text/event-stream"}, "texte": sse},
-         "evenements": [e.to_json() for e in evs]},
- "attente_longue": {"requete": {"methode": "GET", "chemin": C.PREFIX + "/events?wait=25&after=k3f9:16",
-                                "entetes": {"Authorization": ACC}},
-                    "reponse": {"statut": 200, "corps": E.long_poll_body(evs, last_id="k3f9:19")}},
- "attente_longue_vide": {"requete": {"methode": "GET", "chemin": C.PREFIX + "/events?wait=25&after=k3f9:19",
-                                     "entetes": {"Authorization": ACC}},
-                         "reponse": {"statut": 200, "corps": E.long_poll_body([], last_id="k3f9:19")}},
- "reprise_trou": {"requete": {"methode": "GET", "chemin": C.PREFIX + "/events?wait=25&after=a001:5",
-                              "entetes": {"Authorization": ACC}},
-                  "reponse": {"statut": 200, "corps": E.long_poll_body(
+         "response": {"status": 200, "headers": {"Content-Type": "text/event-stream"}, "text": sse},
+         "events": [e.to_json() for e in evs]},
+ "long_poll": {"request": {"method": "GET", "path": C.PREFIX + "/events?wait=25&after=k3f9:16",
+                                "headers": {"Authorization": ACC}},
+                    "response": {"status": 200, "body": E.long_poll_body(evs, last_id="k3f9:19")}},
+ "long_poll_empty": {"request": {"method": "GET", "path": C.PREFIX + "/events?wait=25&after=k3f9:19",
+                                     "headers": {"Authorization": ACC}},
+                         "response": {"status": 200, "body": E.long_poll_body([], last_id="k3f9:19")}},
+ "gap_resume": {"request": {"method": "GET", "path": C.PREFIX + "/events?wait=25&after=a001:5",
+                              "headers": {"Authorization": ACC}},
+                  "response": {"status": 200, "body": E.long_poll_body(
                       [E.Event("k3f9:19", E.RESET, {"reason": "gap"})], last_id="k3f9:19")}},
 }
 json.dump(evenements, open(os.path.join(OUT, "events.json"), "w"), ensure_ascii=False, indent=1)
@@ -254,17 +254,17 @@ st_av = P.GateState("available", 7, until_ts=TS + 7200, caps={"max_concurrent": 
 st_dr = P.GateState("draining", 8, drain_deadline_ts=TS + 90, caps={"max_concurrent": 1}, reason="user_active")
 st_st = P.GateState("stopped", 9, reason="revoked")
 porte = {
- "schema": "ameesh-exec-golden/1", "famille": "porte",
- "etats": [s.to_json() for s in (st_av, st_dr, st_st)],
- "acquittements": [P.GateAck(7, "available", ts=TS).to_json(),
+ "schema": "ameesh-exec-golden/1", "family": "gate",
+ "states": [s.to_json() for s in (st_av, st_dr, st_st)],
+ "acks": [P.GateAck(7, "available", ts=TS).to_json(),
                    P.GateAck(8, "draining", in_turn=[AG], held=[AG], drained=False, ts=TS + 1).to_json(),
                    P.GateAck(8, "draining", drained=True, ts=TS + 40).to_json()],
- "illisibles": [{"schema": "ameesh-host-state/0", "state": "available", "seq": 1},
+ "unreadable": [{"schema": "ameesh-host-state/0", "state": "available", "seq": 1},
                 {"schema": "ameesh-host-state/1", "state": "sleeping", "seq": 2},
                 {"schema": "ameesh-host-state/1", "state": "available", "seq": "3"}],
- "disponibilite": {"requete": {"methode": "PUT", "chemin": C.PREFIX + "/host/availability",
-                               "entetes": {"Authorization": ACC}, "corps": P.availability_body(st_dr)},
-                   "reponse": {"statut": 204}},
+ "availability": {"request": {"method": "PUT", "path": C.PREFIX + "/host/availability",
+                               "headers": {"Authorization": ACC}, "body": P.availability_body(st_dr)},
+                   "response": {"status": 204}},
 }
 json.dump(porte, open(os.path.join(OUT, "gate.json"), "w"), ensure_ascii=False, indent=1)
 
@@ -275,26 +275,26 @@ hi = I.HostInfo(host=HOST, mesh="mesh-exemple", executor_id=EXEC, limits={"max_a
                 lease_ttl_s=90.0, lease_renew_s=30.0, harnesses=["dsh"], models=["deepseek-chat"],
                 agents=[AG], available=True, contract_version=c.version)
 identite = {
- "schema": "ameesh-exec-golden/1", "famille": "identite",
- "enroll": {"requete": {"methode": "POST", "chemin": C.PREFIX + "/enroll", "corps": {
+ "schema": "ameesh-exec-golden/1", "family": "identity",
+ "enroll": {"request": {"method": "POST", "path": C.PREFIX + "/enroll", "body": {
      "schema": C.SCHEMA_ENROLL, "code": "K7QF-2M9D-XW4P-8RTA-J3NC-5HVB",
      "public_key": {"kty": "EC", "crv": "P-256", "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
                     "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"},
      "proof": "<ES256 base64url sur JCS({code, public_key, server_url})>",
      "device_attestation": None, "label": "portable (VM Compute)"}},
-            "reponse": {"statut": 201, "corps": {"executor_id": EXEC, "mesh": "mesh-exemple",
+            "response": {"status": 201, "body": {"executor_id": EXEC, "mesh": "mesh-exemple",
                                                   "host": HOST, "server_time": TS}}},
- "token": {"requete": {"methode": "POST", "chemin": C.PREFIX + "/token",
-                       "corps": {"assertion": "<JWS ES256 (signature JOSE r||s) : iss=7f3a9c2e4b1d6058, aud=https://mesh.exemple, iat, exp<=iat+60, jti>"}},
-           "reponse": {"statut": 200, "corps": I.IssuedToken(ACC.split()[1], TS + 600, "executor").to_json()}},
- "session_token": {"requete": {"methode": "POST", "chemin": C.PREFIX + "/session-token",
-                               "entetes": {"Authorization": ACC},
-                               "corps": {"fence": C.Fence(AG, OWN, EP).to_json()}},
-                   "reponse": {"statut": 200, "corps": I.IssuedToken(SES.split()[1], TS + 90, "session").to_json()}},
- "host": {"requete": {"methode": "GET", "chemin": C.PREFIX + "/host", "entetes": {"Authorization": ACC}},
-          "reponse": {"statut": 200, "corps": hi.to_json()}},
- "health": {"requete": {"methode": "GET", "chemin": C.PREFIX + "/health"},
-            "reponse": {"statut": 200, "corps": {"schema": C.SCHEMA_HEALTH, "contract": c.version,
+ "token": {"request": {"method": "POST", "path": C.PREFIX + "/token",
+                       "body": {"assertion": "<JWS ES256 (signature JOSE r||s) : iss=7f3a9c2e4b1d6058, aud=https://mesh.exemple, iat, exp<=iat+60, jti>"}},
+           "response": {"status": 200, "body": I.IssuedToken(ACC.split()[1], TS + 600, "executor").to_json()}},
+ "session_token": {"request": {"method": "POST", "path": C.PREFIX + "/session-token",
+                               "headers": {"Authorization": ACC},
+                               "body": {"fence": C.Fence(AG, OWN, EP).to_json()}},
+                   "response": {"status": 200, "body": I.IssuedToken(SES.split()[1], TS + 90, "session").to_json()}},
+ "host": {"request": {"method": "GET", "path": C.PREFIX + "/host", "headers": {"Authorization": ACC}},
+          "response": {"status": 200, "body": hi.to_json()}},
+ "health": {"request": {"method": "GET", "path": C.PREFIX + "/health"},
+            "response": {"status": 200, "body": {"schema": C.SCHEMA_HEALTH, "contract": c.version,
                                                   "server_ts": TS}}},
 }
 json.dump(identite, open(os.path.join(OUT, "identity.json"), "w"), ensure_ascii=False, indent=1)

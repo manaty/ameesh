@@ -105,16 +105,16 @@ class HostScopeRules(ScopeRules):
               fence: Optional[Fence]) -> dict:
         kwargs = dict(bound)
         for param, value in op.forced.items():
-            if value == "hote_executeur":
+            if value == "executor_host":
                 kwargs[param] = principal.host
             elif value == "agent_session":
                 kwargs[param] = self._session_identity(principal, op, param)
-            elif value == "executeur":
+            elif value == "executor":
                 kwargs[param] = principal.executor_id
-            elif value in ("owner_enveloppe", "epoch_enveloppe"):
+            elif value in ("envelope_owner", "envelope_epoch"):
                 if fence is None:
                     raise ScopeError("bad_args", "enveloppe de bail absente")
-                kwargs[param] = fence.owner if value == "owner_enveloppe" else fence.epoch
+                kwargs[param] = fence.owner if value == "envelope_owner" else fence.epoch
             else:
                 kwargs[param] = value
         if op.transport == "session/op":
@@ -141,7 +141,7 @@ class HostScopeRules(ScopeRules):
                 self._require_admitted(principal, fence.agent)
             if "A" in op.scope and op.agent_param:
                 value = kwargs.get(op.agent_param)
-                if not ("agregat" in op.scope and value == "all"):
+                if not ("aggregate" in op.scope and value == "all"):
                     self._require_admitted(principal, value)
         rule = getattr(self, "_apply_" + op.name.replace(".", "_"), None)
         if rule is not None:

@@ -37,18 +37,18 @@ la VM et le serveur la lisent à l'exécution. Elle est livrée dans la roue
 
 Chaque ligne de la table donne :
 
-- `nom` : l'opération de `storage.interface` ;
-- `ecriture` ;
+- `name` : l'opération de `storage.interface` ;
+- `write` : écriture ou lecture ;
 - `transport` : `op`, `session/op` ou `events` ;
-- `portee` ;
+- `scope` : la portée ;
 - `fence` ;
 - `param_agent` ;
-- `forces` : les paramètres que le serveur remplace ;
-- `parametres` : le nom, la sorte (`positionnel` ou `nomme`), le schéma, `requis` et le défaut ;
-- `resultat` : son schéma ;
-- `refus` : la valeur rendue quand le bail est perdu ;
-- `idempotence` ;
-- `regles`.
+- `forced` : les paramètres que le serveur remplace ;
+- `params` : le nom, la sorte (`kind` : `positional` ou `keyword`), le schéma, `required` et le défaut (`default`) ;
+- `result` : son schéma ;
+- `refusal` : la valeur rendue quand le bail est perdu ;
+- `idempotency` ;
+- `rules` : les règles propres à l'opération.
 
 Les portées :
 
@@ -56,7 +56,7 @@ Les portées :
 - **B** : la portée A, plus une enveloppe de bail vivante.
 - **H** : l'hôte est forcé à celui de l'exécuteur.
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
-- **agregat** : une donnée agrégée.
+- **aggregate** : une donnée agrégée.
 
 Comptes : 62 opérations, dont 24 lectures et 38 écritures. 52 passent par
 `op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Cinq
@@ -96,7 +96,7 @@ Idempotency-Key: <uuid>         (obligatoire pour toute écriture)
   valeurs `owner` et `epoch` doivent égaler celles des arguments. Le serveur
   la recontrôle sous `FOR UPDATE`, dans la transaction de l'opération.
 - **Bail perdu.** Ce n'est pas une erreur. Le serveur répond `200` avec
-  `"fenced": true`, et `value` vaut la valeur `refus` de la ligne.
+  `"fenced": true`, et `value` vaut la valeur `refusal` de la ligne.
 - **Owner.** Sa forme est `exec:<executor_id>:<hôte>:<pid>` (`owner_for`).
 - **Idempotence.** Le client tire la clé une seule fois par appel logique,
   puis la réutilise à chaque nouvel essai. L'empreinte de la requête est le
@@ -189,8 +189,8 @@ table : aucun écart n'est toléré d'un côté seulement.
   vaut 1 par défaut.
 - **Coûts.** `turn_costs.insert` venu d'un appareil est rangé
   `source=device`, avec l'exécuteur et le bail de l'enveloppe, quelles que
-  soient les valeurs reçues (forçages `executeur`, `owner_enveloppe`,
-  `epoch_enveloppe`). Pour la dépense d'un appareil, seuls les relevés du
+  soient les valeurs reçues (forçages `executor`, `envelope_owner`,
+  `envelope_epoch`). Pour la dépense d'un appareil, seuls les relevés du
   relais (`source=relay`) comptent dans les plafonds : `turn_costs.spent`
   ignore `source=device`.
 - **Interfaces.** `IdentityProvider.issue_session_token` lève

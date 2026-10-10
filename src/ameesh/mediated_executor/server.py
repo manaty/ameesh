@@ -440,8 +440,8 @@ class ExecApp:
             if not math.isfinite(wait):
                 return _error("bad_request", "wait : nombre attendu")
             wait = min(max(wait, 0.0), float(events.MAX_WAIT_S))
-            events, last = self.hub.poll(after, admitted, wait)
-            return Response(200, events.long_poll_body(events, last_id=last))
+            evs, last = self.hub.poll(after, admitted, wait)
+            return Response(200, events.long_poll_body(evs, last_id=last))
         return Response(200, None, {"Content-Type": "text/event-stream; charset=utf-8",
                                     "Cache-Control": "no-store"},
                         stream=self._sse(principal, after, admitted))
@@ -456,10 +456,10 @@ class ExecApp:
             remaining = end - time.monotonic()
             if remaining <= 0:
                 return
-            events, cursor = self.hub.poll(cursor, admitted,
+            evs, cursor = self.hub.poll(cursor, admitted,
                                            min(float(events.PING_INTERVAL_S), remaining))
-            if events:
-                for event in events:
+            if evs:
+                for event in evs:
                     yield events.format_sse(event)
             else:
                 yield events.format_ping()

@@ -1,47 +1,47 @@
 {
  "schema": "ameesh-exec-contract/1",
  "version": "1.1.0",
- "prefixe": "/api/exec/v1",
+ "prefix": "/api/exec/v1",
  "description": "Contrat de l'API d'exécuteur médiée (L107) : la liste FERMÉE des opérations de storage.interface qu'un exécuteur d'appareil peut appeler, leur portée et leur fencing. Référence : docs/EXECUTEUR-MEDIEE.md.",
- "portees": {
+ "scopes": {
   "A": "l'agent nommé (param_agent) est admis sur l'hôte de l'exécuteur",
   "B": "A, et l'enveloppe fence porte le bail vivant de cet agent ; owner préfixé par exec:<executor_id>:",
   "H": "hôte forcé à celui de l'exécuteur ; rendu limité à cet hôte",
   "S": "jeton de session : agent et epoch tirés du jeton, pas du corps",
-  "agregat": "donnée agrégée ou publique du mesh, sans donnée d'autrui"
+  "aggregate": "donnée agrégée ou publique du mesh, sans donnée d'autrui"
  },
- "forces": {
-  "hote_executeur": "l'hôte fixé à l'enrôlement remplace la valeur reçue",
+ "forced": {
+  "executor_host": "l'hôte fixé à l'enrôlement remplace la valeur reçue",
   "agent_session": "l'agent du jeton de session remplace la valeur reçue",
-  "executeur": "l'identifiant de l'exécuteur authentifié remplace la valeur reçue",
-  "owner_enveloppe": "l'owner de l'enveloppe de bail remplace la valeur reçue",
-  "epoch_enveloppe": "l'epoch de l'enveloppe de bail remplace la valeur reçue"
+  "executor": "l'identifiant de l'exécuteur authentifié remplace la valeur reçue",
+  "envelope_owner": "l'owner de l'enveloppe de bail remplace la valeur reçue",
+  "envelope_epoch": "l'epoch de l'enveloppe de bail remplace la valeur reçue"
  },
  "operations": [
   {
-   "nom": "agents.claimable",
-   "ecriture": false,
+   "name": "agents.claimable",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "H"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {
-    "host": "hote_executeur"
+   "forced": {
+    "host": "executor_host"
    },
-   "parametres": [
+   "params": [
     {
-     "nom": "host",
-     "sorte": "positionnel",
+     "name": "host",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "names",
-     "sorte": "positionnel",
+     "name": "names",
+     "kind": "positional",
      "schema": {
       "type": [
        "array",
@@ -51,1359 +51,1359 @@
        "type": "string"
       }
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "require_responsible",
-     "sorte": "nomme",
+     "name": "require_responsible",
+     "kind": "keyword",
      "schema": {
       "type": "boolean"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "array",
     "items": {
      "type": "object"
     }
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "names restreint aux agents admis sur l'hôte ; hôte indisponible : liste vide"
    ]
   },
   {
-   "nom": "agents.get",
-   "ecriture": false,
+   "name": "agents.get",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "A"
    ],
    "fence": false,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "object",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "agents.cwd_used",
-   "ecriture": false,
+   "name": "agents.cwd_used",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "A"
    ],
    "fence": false,
    "param_agent": "exclude",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "cwd",
-     "sorte": "positionnel",
+     "name": "cwd",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "exclude",
-     "sorte": "positionnel",
+     "name": "exclude",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "boolean"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "réponse limitée aux agents de l'hôte"
    ]
   },
   {
-   "nom": "agents.harnesses",
-   "ecriture": false,
+   "name": "agents.harnesses",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "H"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {},
-   "parametres": [],
-   "resultat": {
+   "forced": {},
+   "params": [],
+   "result": {
     "type": "object",
     "additionalProperties": {
      "type": "string"
     }
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "rendu filtré : agents de l'hôte seulement"
    ]
   },
   {
-   "nom": "agents.set_status",
-   "ecriture": true,
+   "name": "agents.set_status",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "status",
-     "sorte": "positionnel",
+     "name": "status",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "status_text",
-     "sorte": "positionnel",
+     "name": "status_text",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "error",
-     "sorte": "positionnel",
+     "name": "error",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "stop_reason",
-     "sorte": "positionnel",
+     "name": "stop_reason",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     }
    ],
-   "resultat": {
+   "result": {
     "type": "null"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "agents.set_session",
-   "ecriture": true,
+   "name": "agents.set_session",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "session_id",
-     "sorte": "positionnel",
+     "name": "session_id",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "account",
-     "sorte": "positionnel",
+     "name": "account",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     }
    ],
-   "resultat": {
+   "result": {
     "type": "null"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "agents.set_session_account",
-   "ecriture": true,
+   "name": "agents.set_session_account",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "account",
-     "sorte": "positionnel",
+     "name": "account",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "boolean"
    },
-   "refus": false,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "agents.set_pending_prompt",
-   "ecriture": true,
+   "name": "agents.set_pending_prompt",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "prompt",
-     "sorte": "positionnel",
+     "name": "prompt",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "null"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "agents.mark_event_wake",
-   "ecriture": true,
+   "name": "agents.mark_event_wake",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "null"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "agents.upsert",
-   "ecriture": true,
+   "name": "agents.upsert",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "chantier",
-     "sorte": "nomme",
+     "name": "chantier",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "harness",
-     "sorte": "nomme",
+     "name": "harness",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "host",
-     "sorte": "nomme",
+     "name": "host",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "cwd",
-     "sorte": "nomme",
+     "name": "cwd",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "session_id",
-     "sorte": "nomme",
+     "name": "session_id",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "status",
-     "sorte": "nomme",
+     "name": "status",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "status_text",
-     "sorte": "nomme",
+     "name": "status_text",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "model",
-     "sorte": "nomme",
+     "name": "model",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "budget_usd",
-     "sorte": "nomme",
+     "name": "budget_usd",
+     "kind": "keyword",
      "schema": {
       "type": [
        "number",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "mode",
-     "sorte": "nomme",
+     "name": "mode",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     }
    ],
-   "resultat": {
+   "result": {
     "type": "object"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "seul champ non nul admis : cwd ; tout autre champ non nul : 400 bad_args",
     "création refusée : agent inconnu → 403 forbidden_scope"
    ]
   },
   {
-   "nom": "leases.claim",
-   "ecriture": true,
+   "name": "leases.claim",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "A",
     "H"
    ],
    "fence": false,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "ttl_seconds",
-     "sorte": "positionnel",
+     "name": "ttl_seconds",
+     "kind": "positional",
      "schema": {
       "type": "number"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "require_responsible",
-     "sorte": "nomme",
+     "name": "require_responsible",
+     "kind": "keyword",
      "schema": {
       "type": "boolean"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "object",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": [
+   "rules": [
     "owner préfixé par exec:<executor_id>: sinon 403 forbidden_scope",
     "ttl_seconds borné par le lease_ttl de l'hôte (GET /host)",
     "hôte indisponible : 403 host_unavailable"
    ]
   },
   {
-   "nom": "leases.renew",
-   "ecriture": true,
+   "name": "leases.renew",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "epoch",
-     "sorte": "positionnel",
+     "name": "epoch",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "ttl_seconds",
-     "sorte": "positionnel",
+     "name": "ttl_seconds",
+     "kind": "positional",
      "schema": {
       "type": "number"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "number",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "ttl_seconds borné par le lease_ttl de l'hôte"
    ]
   },
   {
-   "nom": "leases.release",
-   "ecriture": true,
+   "name": "leases.release",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "epoch",
-     "sorte": "positionnel",
+     "name": "epoch",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "boolean"
    },
-   "refus": false,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": [
+   "rules": [
     "déclenche l'effacement du dossier de travail (L113)"
    ]
   },
   {
-   "nom": "leases.reap",
-   "ecriture": true,
+   "name": "leases.reap",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "H"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {
-    "host": "hote_executeur"
+   "forced": {
+    "host": "executor_host"
    },
-   "parametres": [
+   "params": [
     {
-     "nom": "host",
-     "sorte": "positionnel",
+     "name": "host",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "array",
     "items": {
      "type": "object"
     }
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "leases.begin_turn",
-   "ecriture": true,
+   "name": "leases.begin_turn",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "epoch",
-     "sorte": "positionnel",
+     "name": "epoch",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "status_text",
-     "sorte": "positionnel",
+     "name": "status_text",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "boolean"
    },
-   "refus": false,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "leases.end_turn",
-   "ecriture": true,
+   "name": "leases.end_turn",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "epoch",
-     "sorte": "positionnel",
+     "name": "epoch",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "status",
-     "sorte": "nomme",
+     "name": "status",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "status_text",
-     "sorte": "nomme",
+     "name": "status_text",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "error",
-     "sorte": "nomme",
+     "name": "error",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "cost_usd",
-     "sorte": "nomme",
+     "name": "cost_usd",
+     "kind": "keyword",
      "schema": {
       "type": [
        "number",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "boolean"
    },
-   "refus": false,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": [
+   "rules": [
     "cost_usd indicatif : le relais fait foi"
    ]
   },
   {
-   "nom": "leases.take_pending_prompt",
-   "ecriture": true,
+   "name": "leases.take_pending_prompt",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "epoch",
-     "sorte": "positionnel",
+     "name": "epoch",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "string",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "leases.restore_prompt",
-   "ecriture": true,
+   "name": "leases.restore_prompt",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "epoch",
-     "sorte": "positionnel",
+     "name": "epoch",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "boolean"
    },
-   "refus": false,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "leases.pause",
-   "ecriture": true,
+   "name": "leases.pause",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "epoch",
-     "sorte": "positionnel",
+     "name": "epoch",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "status_text",
-     "sorte": "positionnel",
+     "name": "status_text",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "boolean"
    },
-   "refus": false,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "leases.clear_session",
-   "ecriture": true,
+   "name": "leases.clear_session",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "epoch",
-     "sorte": "positionnel",
+     "name": "epoch",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "boolean"
    },
-   "refus": false,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "leases.set_marked_block",
-   "ecriture": true,
+   "name": "leases.set_marked_block",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "epoch",
-     "sorte": "positionnel",
+     "name": "epoch",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "status_text",
-     "sorte": "positionnel",
+     "name": "status_text",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "error",
-     "sorte": "positionnel",
+     "name": "error",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "error_prefix",
-     "sorte": "positionnel",
+     "name": "error_prefix",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "string"
    },
-   "refus": "lease",
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": "lease",
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "leases.clear_marked_block",
-   "ecriture": true,
+   "name": "leases.clear_marked_block",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "epoch",
-     "sorte": "positionnel",
+     "name": "epoch",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "status_text",
-     "sorte": "positionnel",
+     "name": "status_text",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "error_prefix",
-     "sorte": "positionnel",
+     "name": "error_prefix",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "string"
    },
-   "refus": "lease",
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": "lease",
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "mailbox.unread",
-   "ecriture": false,
+   "name": "mailbox.unread",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "A"
    ],
    "fence": false,
    "param_agent": "recipient",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "recipient",
-     "sorte": "positionnel",
+     "name": "recipient",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "limit",
-     "sorte": "positionnel",
+     "name": "limit",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "array",
     "items": {
      "type": "object"
     }
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "limit borné à 200",
     "session : recipient = agent du jeton"
    ],
    "session": true
   },
   {
-   "nom": "mailbox.unread_urgent",
-   "ecriture": false,
+   "name": "mailbox.unread_urgent",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "A"
    ],
    "fence": false,
    "param_agent": "recipient",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "recipient",
-     "sorte": "positionnel",
+     "name": "recipient",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "limit",
-     "sorte": "positionnel",
+     "name": "limit",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "array",
     "items": {
      "type": "object"
     }
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "mailbox.get",
-   "ecriture": false,
+   "name": "mailbox.get",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "A"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "message_id",
-     "sorte": "positionnel",
+     "name": "message_id",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "object",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "le destinataire du message doit être un agent admis sur l'hôte, sinon null"
    ]
   },
   {
-   "nom": "mailbox.reserve",
-   "ecriture": true,
+   "name": "mailbox.reserve",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "recipient",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "recipient",
-     "sorte": "positionnel",
+     "name": "recipient",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "epoch",
-     "sorte": "positionnel",
+     "name": "epoch",
+     "kind": "positional",
      "schema": {
       "type": [
        "integer",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "token",
-     "sorte": "positionnel",
+     "name": "token",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "ids",
-     "sorte": "nomme",
+     "name": "ids",
+     "kind": "keyword",
      "schema": {
       "type": [
        "array",
@@ -1413,664 +1413,664 @@
        "type": "integer"
       }
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     },
     {
-     "nom": "porteur",
-     "sorte": "nomme",
+     "name": "porteur",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "ttl_seconds",
-     "sorte": "nomme",
+     "name": "ttl_seconds",
+     "kind": "keyword",
      "schema": {
       "type": "number"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "limit",
-     "sorte": "nomme",
+     "name": "limit",
+     "kind": "keyword",
      "schema": {
       "type": "integer"
      },
-     "requis": false,
-     "defaut": 200
+     "required": false,
+     "default": 200
     }
    ],
-   "resultat": {
+   "result": {
     "type": "array",
     "items": {
      "type": "object"
     }
    },
-   "refus": [],
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": [],
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": [
+   "rules": [
     "owner et epoch non nuls à distance",
     "session : recipient = agent du jeton, epoch = epoch du jeton"
    ],
    "session": true
   },
   {
-   "nom": "mailbox.deliver",
-   "ecriture": true,
+   "name": "mailbox.deliver",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "recipient",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "recipient",
-     "sorte": "positionnel",
+     "name": "recipient",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "epoch",
-     "sorte": "positionnel",
+     "name": "epoch",
+     "kind": "positional",
      "schema": {
       "type": [
        "integer",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "token",
-     "sorte": "positionnel",
+     "name": "token",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "ids",
-     "sorte": "positionnel",
+     "name": "ids",
+     "kind": "positional",
      "schema": {
       "type": "array",
       "items": {
        "type": "integer"
       }
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "array",
     "items": {
      "type": "integer"
     }
    },
-   "refus": [],
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": [],
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": [
+   "rules": [
     "owner et epoch non nuls à distance",
     "session : recipient = agent du jeton, epoch = epoch du jeton"
    ],
    "session": true
   },
   {
-   "nom": "mailbox.release",
-   "ecriture": true,
+   "name": "mailbox.release",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "recipient",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "recipient",
-     "sorte": "positionnel",
+     "name": "recipient",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "token",
-     "sorte": "positionnel",
+     "name": "token",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "ids",
-     "sorte": "positionnel",
+     "name": "ids",
+     "kind": "positional",
      "schema": {
       "type": "array",
       "items": {
        "type": "integer"
       }
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "integer"
    },
-   "refus": 0,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": 0,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": [
+   "rules": [
     "session : recipient = agent du jeton, epoch de l'enveloppe = epoch du jeton"
    ],
    "session": true
   },
   {
-   "nom": "pending_spend.put",
-   "ecriture": true,
+   "name": "pending_spend.put",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "start_index",
-     "sorte": "positionnel",
+     "name": "start_index",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "turn",
-     "sorte": "positionnel",
+     "name": "turn",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "model",
-     "sorte": "positionnel",
+     "name": "model",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "boolean"
    },
-   "refus": false,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "marqueur fail-closed (0019)"
    ]
   },
   {
-   "nom": "pending_spend.set_model",
-   "ecriture": true,
+   "name": "pending_spend.set_model",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "model",
-     "sorte": "positionnel",
+     "name": "model",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "boolean"
    },
-   "refus": false,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "pending_spend.clear",
-   "ecriture": true,
+   "name": "pending_spend.clear",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "boolean"
    },
-   "refus": false,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "pending_spend.get",
-   "ecriture": false,
+   "name": "pending_spend.get",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "A"
    ],
    "fence": false,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "object",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "turn_costs.insert",
-   "ecriture": true,
+   "name": "turn_costs.insert",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "agent",
-   "forces": {
+   "forced": {
     "source": "device",
-    "executor": "executeur",
-    "lease_owner": "owner_enveloppe",
-    "lease_epoch": "epoch_enveloppe"
+    "executor": "executor",
+    "lease_owner": "envelope_owner",
+    "lease_epoch": "envelope_epoch"
    },
-   "parametres": [
+   "params": [
     {
-     "nom": "agent",
-     "sorte": "nomme",
+     "name": "agent",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "harness",
-     "sorte": "nomme",
+     "name": "harness",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "turn",
-     "sorte": "nomme",
+     "name": "turn",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "model",
-     "sorte": "nomme",
+     "name": "model",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "session",
-     "sorte": "nomme",
+     "name": "session",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "usd",
-     "sorte": "nomme",
+     "name": "usd",
+     "kind": "keyword",
      "schema": {
       "type": "number"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "input_tokens",
-     "sorte": "nomme",
+     "name": "input_tokens",
+     "kind": "keyword",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "cached_input_tokens",
-     "sorte": "nomme",
+     "name": "cached_input_tokens",
+     "kind": "keyword",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "output_tokens",
-     "sorte": "nomme",
+     "name": "output_tokens",
+     "kind": "keyword",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "cum_usd",
-     "sorte": "nomme",
+     "name": "cum_usd",
+     "kind": "keyword",
      "schema": {
       "type": [
        "number",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "cum_input_tokens",
-     "sorte": "nomme",
+     "name": "cum_input_tokens",
+     "kind": "keyword",
      "schema": {
       "type": [
        "integer",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "cum_cached_input_tokens",
-     "sorte": "nomme",
+     "name": "cum_cached_input_tokens",
+     "kind": "keyword",
      "schema": {
       "type": [
        "integer",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "cum_output_tokens",
-     "sorte": "nomme",
+     "name": "cum_output_tokens",
+     "kind": "keyword",
      "schema": {
       "type": [
        "integer",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "account",
-     "sorte": "nomme",
+     "name": "account",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     },
     {
-     "nom": "spend_key",
-     "sorte": "nomme",
+     "name": "spend_key",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     },
     {
-     "nom": "source",
-     "sorte": "nomme",
+     "name": "source",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     },
     {
-     "nom": "executor",
-     "sorte": "nomme",
+     "name": "executor",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     },
     {
-     "nom": "lease_owner",
-     "sorte": "nomme",
+     "name": "lease_owner",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     },
     {
-     "nom": "lease_epoch",
-     "sorte": "nomme",
+     "name": "lease_epoch",
+     "kind": "keyword",
      "schema": {
       "type": [
        "integer",
        "null"
       ]
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     }
    ],
-   "resultat": {
+   "result": {
     "type": "boolean"
    },
-   "refus": false,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": [
+   "rules": [
     "ligne rangée source=device avec l'exécuteur et le bail de l'enveloppe, quelles que soient les valeurs reçues",
     "hors plafond : seuls les relevés du relais (source=relay) font foi pour la dépense d'un appareil (turn_costs.spent ignore source=device)"
    ]
   },
   {
-   "nom": "turn_costs.last_reading",
-   "ecriture": false,
+   "name": "turn_costs.last_reading",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "A"
    ],
    "fence": false,
    "param_agent": "agent",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "agent",
-     "sorte": "positionnel",
+     "name": "agent",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "harness",
-     "sorte": "positionnel",
+     "name": "harness",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "session",
-     "sorte": "positionnel",
+     "name": "session",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "object",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "agent=null refusé à distance : 400 bad_args"
    ]
   },
   {
-   "nom": "turn_costs.spent",
-   "ecriture": false,
+   "name": "turn_costs.spent",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "A",
-    "agregat"
+    "aggregate"
    ],
    "fence": false,
    "param_agent": "agent",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "seconds",
-     "sorte": "positionnel",
+     "name": "seconds",
+     "kind": "positional",
      "schema": {
       "type": "number"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "agent",
-     "sorte": "nomme",
+     "name": "agent",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "harnesses",
-     "sorte": "nomme",
+     "name": "harnesses",
+     "kind": "keyword",
      "schema": {
       "type": [
        "array",
@@ -2080,447 +2080,447 @@
        "type": "string"
       }
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "account",
-     "sorte": "nomme",
+     "name": "account",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     }
    ],
-   "resultat": {
+   "result": {
     "type": "number"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "agent=\"all\" admis : un total, rien d'autre"
    ]
   },
   {
-   "nom": "budgets.limits",
-   "ecriture": false,
+   "name": "budgets.limits",
+   "write": false,
    "transport": "op",
-   "portee": [
-    "agregat"
+   "scope": [
+    "aggregate"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {},
-   "parametres": [],
-   "resultat": {
+   "forced": {},
+   "params": [],
+   "result": {
     "type": "array",
     "items": {
      "type": "object"
     }
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "plafonds du mesh"
    ]
   },
   {
-   "nom": "accounts.active",
-   "ecriture": false,
+   "name": "accounts.active",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "H"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {
-    "host": "hote_executeur"
+   "forced": {
+    "host": "executor_host"
    },
-   "parametres": [
+   "params": [
     {
-     "nom": "host",
-     "sorte": "positionnel",
+     "name": "host",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "harness",
-     "sorte": "positionnel",
+     "name": "harness",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "object",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "operations.balances",
-   "ecriture": false,
+   "name": "operations.balances",
+   "write": false,
    "transport": "op",
-   "portee": [
-    "agregat"
+   "scope": [
+    "aggregate"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "provider",
-     "sorte": "nomme",
+     "name": "provider",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "since_s",
-     "sorte": "nomme",
+     "name": "since_s",
+     "kind": "keyword",
      "schema": {
       "type": "number"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "account",
-     "sorte": "nomme",
+     "name": "account",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     }
    ],
-   "resultat": {
+   "result": {
     "type": "array",
     "items": {
      "type": "object"
     }
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "soldes, sans clé"
    ]
   },
   {
-   "nom": "operations.apply_restart",
-   "ecriture": true,
+   "name": "operations.apply_restart",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     },
     {
-     "nom": "epoch",
-     "sorte": "positionnel",
+     "name": "epoch",
+     "kind": "positional",
      "schema": {
       "type": [
        "integer",
        "null"
       ]
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "object",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": [
+   "rules": [
     "owner et epoch non nuls à distance"
    ]
   },
   {
-   "nom": "operations.message_lots",
-   "ecriture": false,
+   "name": "operations.message_lots",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "A"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "ids",
-     "sorte": "positionnel",
+     "name": "ids",
+     "kind": "positional",
      "schema": {
       "type": "array",
       "items": {
        "type": "integer"
       }
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "array",
     "items": {
      "type": "string"
     }
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "seuls les messages des agents admis sur l'hôte comptent"
    ]
   },
   {
-   "nom": "operations.assigned_open_lots",
-   "ecriture": false,
+   "name": "operations.assigned_open_lots",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "A"
    ],
    "fence": false,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "array",
     "items": {
      "type": "object"
     }
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "lots ouverts assignés à l'agent : id, title, state, updated_ts (lot du tour, rotation au changement de lot, 0025) ; contrat 1.1"
    ]
   },
   {
-   "nom": "operations.set_session_work_item",
-   "ecriture": true,
+   "name": "operations.set_session_work_item",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "owner",
-     "sorte": "positionnel",
+     "name": "owner",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "epoch",
-     "sorte": "positionnel",
+     "name": "epoch",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "work_item",
-     "sorte": "positionnel",
+     "name": "work_item",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "boolean"
    },
-   "refus": false,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "operations.record_gauges",
-   "ecriture": true,
+   "name": "operations.record_gauges",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "H"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "readings",
-     "sorte": "positionnel",
+     "name": "readings",
+     "kind": "positional",
      "schema": {
       "type": "array",
       "items": {
        "type": "object"
       }
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "integer"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "jauges des comptes de l'hôte seulement"
    ]
   },
   {
-   "nom": "turn_resources.open_turn",
-   "ecriture": true,
+   "name": "turn_resources.open_turn",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B",
     "H"
    ],
    "fence": true,
    "param_agent": "agent",
-   "forces": {
-    "host": "hote_executeur"
+   "forced": {
+    "host": "executor_host"
    },
-   "parametres": [
+   "params": [
     {
-     "nom": "turn_id",
-     "sorte": "positionnel",
+     "name": "turn_id",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "agent",
-     "sorte": "positionnel",
+     "name": "agent",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "host",
-     "sorte": "positionnel",
+     "name": "host",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "pgid",
-     "sorte": "nomme",
+     "name": "pgid",
+     "kind": "keyword",
      "schema": {
       "type": [
        "integer",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "label",
-     "sorte": "nomme",
+     "name": "label",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "containers",
-     "sorte": "nomme",
+     "name": "containers",
+     "kind": "keyword",
      "schema": {
       "type": [
        "array",
@@ -2530,50 +2530,50 @@
        "type": "string"
       }
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     }
    ],
-   "resultat": {
+   "result": {
     "type": "null"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "turn_resources.close_turn",
-   "ecriture": true,
+   "name": "turn_resources.close_turn",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": null,
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "turn_id",
-     "sorte": "positionnel",
+     "name": "turn_id",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "orphan",
-     "sorte": "nomme",
+     "name": "orphan",
+     "kind": "keyword",
      "schema": {
       "type": "boolean"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "containers",
-     "sorte": "nomme",
+     "name": "containers",
+     "kind": "keyword",
      "schema": {
       "type": [
        "array",
@@ -2583,392 +2583,392 @@
        "type": "string"
       }
      },
-     "requis": false,
-     "defaut": null
+     "required": false,
+     "default": null
     }
    ],
-   "resultat": {
+   "result": {
     "type": "null"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "le tour doit appartenir à l'agent de l'enveloppe de bail"
    ]
   },
   {
-   "nom": "hosts.record",
-   "ecriture": true,
+   "name": "hosts.record",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "H"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "reading",
-     "sorte": "positionnel",
+     "name": "reading",
+     "kind": "positional",
      "schema": {
       "type": "object"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "object"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": [
+   "rules": [
     "reading.host forcé à l'hôte de l'exécuteur ; auto-déclaré, jamais une preuve",
     "clés du relevé : celles de host_resources (mem_available_bytes, swap_used_bytes, load1, cpu_count, disk_free_bytes, disk_path, turns_in_progress) ; rendu : la ligne écrite (id, host, sampled_ts, mêmes clés)"
    ]
   },
   {
-   "nom": "hosts.latest",
-   "ecriture": false,
+   "name": "hosts.latest",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "H"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {
-    "host": "hote_executeur"
+   "forced": {
+    "host": "executor_host"
    },
-   "parametres": [
+   "params": [
     {
-     "nom": "host",
-     "sorte": "positionnel",
+     "name": "host",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "object",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "hosts.current",
-   "ecriture": false,
+   "name": "hosts.current",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "H"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {
-    "host": "hote_executeur"
+   "forced": {
+    "host": "executor_host"
    },
-   "parametres": [
+   "params": [
     {
-     "nom": "host",
-     "sorte": "positionnel",
+     "name": "host",
+     "kind": "positional",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "array",
     "items": {
      "type": "object"
     }
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "hosts.turns_in_progress",
-   "ecriture": false,
+   "name": "hosts.turns_in_progress",
+   "write": false,
    "transport": "op",
-   "portee": [
+   "scope": [
     "H"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {
-    "host": "hote_executeur"
+   "forced": {
+    "host": "executor_host"
    },
-   "parametres": [
+   "params": [
     {
-     "nom": "host",
-     "sorte": "positionnel",
+     "name": "host",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "integer"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": []
+   "rules": []
   },
   {
-   "nom": "keys.info",
-   "ecriture": false,
+   "name": "keys.info",
+   "write": false,
    "transport": "op",
-   "portee": [
-    "agregat"
+   "scope": [
+    "aggregate"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "agent",
-     "sorte": "positionnel",
+     "name": "agent",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "object",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "clé publique d'un expéditeur signé"
    ]
   },
   {
-   "nom": "threads.index",
-   "ecriture": true,
+   "name": "threads.index",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "author",
-   "forces": {
-    "host": "hote_executeur"
+   "forced": {
+    "host": "executor_host"
    },
-   "parametres": [
+   "params": [
     {
-     "nom": "project",
-     "sorte": "nomme",
+     "name": "project",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "lot",
-     "sorte": "nomme",
+     "name": "lot",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "transport",
-     "sorte": "nomme",
+     "name": "transport",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "host",
-     "sorte": "nomme",
+     "name": "host",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "location",
-     "sorte": "nomme",
+     "name": "location",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "entry_id",
-     "sorte": "nomme",
+     "name": "entry_id",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "mailbox_ids",
-     "sorte": "nomme",
+     "name": "mailbox_ids",
+     "kind": "keyword",
      "schema": {
       "type": "array",
       "items": {
        "type": "integer"
       }
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "author",
-     "sorte": "nomme",
+     "name": "author",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "excerpt",
-     "sorte": "nomme",
+     "name": "excerpt",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "ts",
-     "sorte": "nomme",
+     "name": "ts",
+     "kind": "keyword",
      "schema": {
       "type": "number"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "trace",
-     "sorte": "nomme",
+     "name": "trace",
+     "kind": "keyword",
      "schema": {
       "type": "object"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "null"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": [
+   "rules": [
     "author = agent:<agent de l'enveloppe> (membre du fil, `fil.member`) ; le nom nu est aussi admis",
     "session : l'enveloppe porte l'agent et l'epoch du jeton"
    ],
    "session": true
   },
   {
-   "nom": "work.mark_delegate_turn",
-   "ecriture": true,
+   "name": "work.mark_delegate_turn",
+   "write": true,
    "transport": "op",
-   "portee": [
+   "scope": [
     "B"
    ],
    "fence": true,
    "param_agent": "agent",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "agent",
-     "sorte": "positionnel",
+     "name": "agent",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "item_ids",
-     "sorte": "positionnel",
+     "name": "item_ids",
+     "kind": "positional",
      "schema": {
       "type": "array",
       "items": {
        "type": "integer"
       }
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "note",
-     "sorte": "positionnel",
+     "name": "note",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "array",
     "items": {
      "type": "integer"
     }
    },
-   "refus": [],
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": [],
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "lots assignés ou délégués à l'agent seulement"
    ]
   },
   {
-   "nom": "wakeups.subscribe",
-   "ecriture": false,
+   "name": "wakeups.subscribe",
+   "write": false,
    "transport": "events",
-   "portee": [
+   "scope": [
     "H"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "channels",
-     "sorte": "positionnel",
+     "name": "channels",
+     "kind": "positional",
      "schema": {
       "type": "array",
       "items": {
        "type": "string"
       }
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "anyOf": [
      {
       "$ref": "ameesh-exec-events/1"
@@ -2978,661 +2978,661 @@
      }
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "servie par GET /api/exec/v1/events, jamais par /op"
    ]
   },
   {
-   "nom": "leases.state",
-   "ecriture": false,
+   "name": "leases.state",
+   "write": false,
    "transport": "session/op",
-   "portee": [
+   "scope": [
     "S"
    ],
    "fence": false,
    "param_agent": "name",
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "name",
-     "sorte": "positionnel",
+     "name": "name",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "object",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "name = agent du jeton de session",
     "rendu : {lease_owner, lease_epoch, status, live} (clés du pilote, lues par registry.lease_matches)"
    ]
   },
   {
-   "nom": "agents.overview",
-   "ecriture": false,
+   "name": "agents.overview",
+   "write": false,
    "transport": "session/op",
-   "portee": [
+   "scope": [
     "S",
-    "agregat"
+    "aggregate"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {},
-   "parametres": [],
-   "resultat": {
+   "forced": {},
+   "params": [],
+   "result": {
     "type": "array",
     "items": {
      "type": "object"
     }
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "annuaire réduit : name, role, team, chantier, canon_governed, status seulement ; role = team (le registre n'a pas de colonne rôle ; chaîne vide sans équipe) ; le projet du fil se déduit de team/chantier (fil.agent_project)"
    ]
   },
   {
-   "nom": "mailbox.send",
-   "ecriture": true,
+   "name": "mailbox.send",
+   "write": true,
    "transport": "session/op",
-   "portee": [
+   "scope": [
     "S"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {
+   "forced": {
     "sender": "agent_session",
-    "host": "hote_executeur"
+    "host": "executor_host"
    },
-   "parametres": [
+   "params": [
     {
-     "nom": "sender",
-     "sorte": "positionnel",
+     "name": "sender",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "recipient",
-     "sorte": "positionnel",
+     "name": "recipient",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "body",
-     "sorte": "positionnel",
+     "name": "body",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "host",
-     "sorte": "nomme",
+     "name": "host",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "kind",
-     "sorte": "nomme",
+     "name": "kind",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "payload",
-     "sorte": "nomme",
+     "name": "payload",
+     "kind": "keyword",
      "schema": {
       "type": [
        "object",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "work_item_id",
-     "sorte": "nomme",
+     "name": "work_item_id",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "signature",
-     "sorte": "nomme",
+     "name": "signature",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "signature_key",
-     "sorte": "nomme",
+     "name": "signature_key",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "signed_payload",
-     "sorte": "nomme",
+     "name": "signed_payload",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "nonce",
-     "sorte": "nomme",
+     "name": "nonce",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "created_us",
-     "sorte": "nomme",
+     "name": "created_us",
+     "kind": "keyword",
      "schema": {
       "type": [
        "integer",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "expires_us",
-     "sorte": "nomme",
+     "name": "expires_us",
+     "kind": "keyword",
      "schema": {
       "type": [
        "integer",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "object"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": [
+   "rules": [
     "le destinataire doit exister (pas de création implicite)"
    ]
   },
   {
-   "nom": "mailbox.mark_delivered",
-   "ecriture": true,
+   "name": "mailbox.mark_delivered",
+   "write": true,
    "transport": "session/op",
-   "portee": [
+   "scope": [
     "S"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "ids",
-     "sorte": "positionnel",
+     "name": "ids",
+     "kind": "positional",
      "schema": {
       "type": "array",
       "items": {
        "type": "integer"
       }
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "integer"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "messages adressés à l'agent du jeton seulement"
    ]
   },
   {
-   "nom": "work.get",
-   "ecriture": false,
+   "name": "work.get",
+   "write": false,
    "transport": "session/op",
-   "portee": [
+   "scope": [
     "S"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {},
-   "parametres": [
+   "forced": {},
+   "params": [
     {
-     "nom": "item_id",
-     "sorte": "positionnel",
+     "name": "item_id",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "object",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "lot du projet de l'agent, sinon null"
    ]
   },
   {
-   "nom": "work.move",
-   "ecriture": true,
+   "name": "work.move",
+   "write": true,
    "transport": "session/op",
-   "portee": [
+   "scope": [
     "S"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {
+   "forced": {
     "actor": "agent_session"
    },
-   "parametres": [
+   "params": [
     {
-     "nom": "item_id",
-     "sorte": "positionnel",
+     "name": "item_id",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "state",
-     "sorte": "positionnel",
+     "name": "state",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "current",
-     "sorte": "nomme",
+     "name": "current",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "loops",
-     "sorte": "nomme",
+     "name": "loops",
+     "kind": "keyword",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "note",
-     "sorte": "nomme",
+     "name": "note",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "actor",
-     "sorte": "nomme",
+     "name": "actor",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "object",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": [
+   "rules": [
     "lot assigné à l'agent"
    ]
   },
   {
-   "nom": "work.note",
-   "ecriture": true,
+   "name": "work.note",
+   "write": true,
    "transport": "session/op",
-   "portee": [
+   "scope": [
     "S"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {
+   "forced": {
     "actor": "agent_session"
    },
-   "parametres": [
+   "params": [
     {
-     "nom": "item_id",
-     "sorte": "positionnel",
+     "name": "item_id",
+     "kind": "positional",
      "schema": {
       "type": "integer"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "state",
-     "sorte": "positionnel",
+     "name": "state",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "text",
-     "sorte": "positionnel",
+     "name": "text",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "actor",
-     "sorte": "positionnel",
+     "name": "actor",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "null"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": [
+   "rules": [
     "lot assigné à l'agent"
    ]
   },
   {
-   "nom": "actions.get",
-   "ecriture": false,
+   "name": "actions.get",
+   "write": false,
    "transport": "session/op",
-   "portee": [
+   "scope": [
     "S"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {
+   "forced": {
     "with_receipts": false
    },
-   "parametres": [
+   "params": [
     {
-     "nom": "action_id",
-     "sorte": "positionnel",
+     "name": "action_id",
+     "kind": "positional",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "with_receipts",
-     "sorte": "nomme",
+     "name": "with_receipts",
+     "kind": "keyword",
      "schema": {
       "type": "boolean"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": [
      "object",
      "null"
     ]
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "aucune",
-    "naturelle": true
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
    },
-   "regles": [
+   "rules": [
     "action proposée par l'agent du jeton"
    ]
   },
   {
-   "nom": "actions.propose",
-   "ecriture": true,
+   "name": "actions.propose",
+   "write": true,
    "transport": "session/op",
-   "portee": [
+   "scope": [
     "S"
    ],
    "fence": false,
    "param_agent": null,
-   "forces": {
+   "forced": {
     "proposed_by": "agent_session"
    },
-   "parametres": [
+   "params": [
     {
-     "nom": "action_id",
-     "sorte": "nomme",
+     "name": "action_id",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "project",
-     "sorte": "nomme",
+     "name": "project",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "work_item",
-     "sorte": "nomme",
+     "name": "work_item",
+     "kind": "keyword",
      "schema": {
       "type": [
        "integer",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "proposed_by",
-     "sorte": "nomme",
+     "name": "proposed_by",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "connector",
-     "sorte": "nomme",
+     "name": "connector",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "operation",
-     "sorte": "nomme",
+     "name": "operation",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "target",
-     "sorte": "nomme",
+     "name": "target",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "args_json",
-     "sorte": "nomme",
+     "name": "args_json",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "action_class",
-     "sorte": "nomme",
+     "name": "action_class",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "amount",
-     "sorte": "nomme",
+     "name": "amount",
+     "kind": "keyword",
      "schema": {
       "type": [
        "integer",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "currency",
-     "sorte": "nomme",
+     "name": "currency",
+     "kind": "keyword",
      "schema": {
       "type": [
        "string",
        "null"
       ]
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "policy_version",
-     "sorte": "nomme",
+     "name": "policy_version",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "digest",
-     "sorte": "nomme",
+     "name": "digest",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "dedupe",
-     "sorte": "nomme",
+     "name": "dedupe",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "requires_receipt",
-     "sorte": "nomme",
+     "name": "requires_receipt",
+     "kind": "keyword",
      "schema": {
       "type": "boolean"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "approvers_json",
-     "sorte": "nomme",
+     "name": "approvers_json",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     },
     {
-     "nom": "note",
-     "sorte": "nomme",
+     "name": "note",
+     "kind": "keyword",
      "schema": {
       "type": "string"
      },
-     "requis": true
+     "required": true
     }
    ],
-   "resultat": {
+   "result": {
     "type": "null"
    },
-   "refus": null,
-   "idempotence": {
-    "cle": "requise",
-    "naturelle": false
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": false
    },
-   "regles": [
+   "rules": [
     "proposer seulement : execute reste au serveur (0012)"
    ]
   }
  ],
- "refusees": {
-  "total_interface": 243,
-  "raisons": {
+ "refused": {
+  "interface_total": 243,
+  "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
    "actions": "hors du sous-ensemble de l'exécuteur médié",
@@ -3908,5 +3908,5 @@
    ]
   }
  },
- "session_aussi": "une ligne marquée `session: true` est servie par sa route (`op`) ET par `session/op` : avec le jeton de session, l'agent contrôlé (param_agent, `agent:` retiré) doit être celui du jeton, et l'enveloppe de bail (portée B) doit porter cet agent et l'epoch du jeton ; le fencing est le même. C'est la voie du hook `agent-mail` et de `mail inbox` dans la VM (contrat 1.1)."
+ "session_also": "une ligne marquée `session: true` est servie par sa route (`op`) ET par `session/op` : avec le jeton de session, l'agent contrôlé (param_agent, `agent:` retiré) doit être celui du jeton, et l'enveloppe de bail (portée B) doit porter cet agent et l'epoch du jeton ; le fencing est le même. C'est la voie du hook `agent-mail` et de `mail inbox` dans la VM (contrat 1.1)."
 }

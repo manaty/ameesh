@@ -132,7 +132,7 @@ class MessagesTest(unittest.TestCase):
         with open(os.path.join(os.path.dirname(__file__), "dore", "mediated_executor",
                                "identity.json"), encoding="utf-8") as fh:
             dore = json.load(fh)
-        self.assertEqual(set(body), set(dore["enroll"]["requete"]["corps"]))
+        self.assertEqual(set(body), set(dore["enroll"]["request"]["body"]))
 
     def test_defi_nexlink_ascii(self):
         key = device.DeviceKey.generate()
@@ -364,13 +364,13 @@ class IdentiteBaseTest(PgTestCase):
 
     def test_liaison_a_la_cle_d_appareil_nexlink(self):
         key = device.DeviceKey.generate()
-        device = device.DeviceKey.generate()  # la clé d'appareil Nexlink, simulée
+        device_key = device.DeviceKey.generate()  # la clé d'appareil Nexlink, simulée
         code = self.invite()["code"]
         challenge = device.attestation_challenge(key, server_url=SERVER, code=code)
         attestation = {"schema": jose.SCHEMA_ATTESTATION,
-                       "device_public_key": jose.b64u(jose.spki_from_point(device.point)),
-                       "signature": device.sign_b64(challenge)}
-        bad = dict(attestation, signature=device.sign_b64(b"autre chose"))
+                       "device_public_key": jose.b64u(jose.spki_from_point(device_key.point)),
+                       "signature": device_key.sign_b64(challenge)}
+        bad = dict(attestation, signature=device_key.sign_b64(b"autre chose"))
         self.assertAuth("token_invalid", self.provider.enroll,
                         device.enroll_request(key, code=code, server_url=SERVER,
                                                 device_attestation=bad), server_url=SERVER)
@@ -379,7 +379,7 @@ class IdentiteBaseTest(PgTestCase):
                              server_url=SERVER)
         row = self.db.query("SELECT device_key_sha256 FROM executors")[0]
         self.assertEqual(row["device_key_sha256"],
-                         hashlib.sha256(jose.spki_from_point(device.point)).hexdigest())
+                         hashlib.sha256(jose.spki_from_point(device_key.point)).hexdigest())
 
     # -- jetons -------------------------------------------------------------
     def test_jeton_d_acces(self):

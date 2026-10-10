@@ -55,6 +55,7 @@ from typing import Any, Callable, Iterator, Optional
 from .. import jcs, storage
 from ..db import DbError, Unavailable
 from . import contract
+from .contract import load as load_contract
 from .contract import Contract, Fence, NotSupportedRemotely, OpRequest, OpResult, Operation
 from .interfaces import ExecDispatcher, Principal, ScopeError
 from .scope import DEFAULT_LEASE_TTL_S, HostScopeRules, Immediate
@@ -230,7 +231,7 @@ class PgDispatcher(ExecDispatcher):
                  lease_ttl_s: float = DEFAULT_LEASE_TTL_S,
                  clock: Callable[[], float] = time.time):
         self.pool = pool
-        self.contract = contract or contract.load()
+        self.contract = contract or load_contract()
         self.credential_modes = credential_modes
         self.lease_ttl_s = lease_ttl_s
         self.clock = clock

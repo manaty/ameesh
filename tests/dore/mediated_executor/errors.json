@@ -1,18 +1,18 @@
 {
  "schema": "ameesh-exec-golden/1",
- "famille": "erreurs",
- "cas": [
+ "family": "errors",
+ "cases": [
   {
-   "nom": "forbidden_scope/autre-agent",
+   "name": "forbidden_scope/autre-agent",
    "op": "agents.get",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.get",
      "args": [
@@ -21,10 +21,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 403,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-error/1",
      "error": "forbidden_scope",
      "message": "agent hors de la portée de l'exécuteur"
@@ -32,17 +32,17 @@
    }
   },
   {
-   "nom": "forbidden_scope/owner-etranger",
+   "name": "forbidden_scope/owner-etranger",
    "op": "leases.claim",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "0b9f6c1e-1c0a-4d1e-9a51-6c2d3f4e5a60"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.claim",
      "args": [
@@ -55,10 +55,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 403,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-error/1",
      "error": "forbidden_scope",
      "message": "owner non préfixé par l'exécuteur authentifié"
@@ -66,17 +66,17 @@
    }
   },
   {
-   "nom": "host_unavailable",
+   "name": "host_unavailable",
    "op": "leases.claim",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "0b9f6c1e-1c0a-4d1e-9a51-6c2d3f4e5a60"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.claim",
      "args": [
@@ -89,10 +89,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 403,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-error/1",
      "error": "host_unavailable",
      "message": "hôte indisponible"
@@ -100,16 +100,16 @@
    }
   },
   {
-   "nom": "executor_revoked",
+   "name": "executor_revoked",
    "op": "agents.get",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.get",
      "args": [
@@ -118,10 +118,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 403,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 403,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-error/1",
      "error": "executor_revoked",
      "message": "exécuteur révoqué"
@@ -129,27 +129,27 @@
    }
   },
   {
-   "nom": "op_not_allowed/approbation",
+   "name": "op_not_allowed/approbation",
    "op": "approvals.consume",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "0b9f6c1e-1c0a-4d1e-9a51-6c2d3f4e5a60"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "approvals.consume",
      "args": [],
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 404,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 404,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-error/1",
      "error": "op_not_allowed",
      "message": "opération non admise"
@@ -157,17 +157,17 @@
    }
   },
   {
-   "nom": "op_not_allowed/mauvaise-route",
+   "name": "op_not_allowed/mauvaise-route",
    "op": "mailbox.send",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "0b9f6c1e-1c0a-4d1e-9a51-6c2d3f4e5a60"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "mailbox.send",
      "args": [
@@ -189,10 +189,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 404,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 404,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-error/1",
      "error": "op_not_allowed",
      "message": "opération de session : /session/op"
@@ -200,17 +200,17 @@
    }
   },
   {
-   "nom": "fence_required",
+   "name": "fence_required",
    "op": "agents.set_status",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "0b9f6c1e-1c0a-4d1e-9a51-6c2d3f4e5a60"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.set_status",
      "args": [
@@ -222,10 +222,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 400,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 400,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-error/1",
      "error": "fence_required",
      "message": "enveloppe de bail obligatoire"
@@ -233,16 +233,16 @@
    }
   },
   {
-   "nom": "idempotency_key_required",
+   "name": "idempotency_key_required",
    "op": "leases.begin_turn",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.begin_turn",
      "args": [
@@ -259,10 +259,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 400,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 400,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-error/1",
      "error": "idempotency_key_required",
      "message": "Idempotency-Key obligatoire pour une écriture"
@@ -270,17 +270,17 @@
    }
   },
   {
-   "nom": "idempotency_mismatch",
+   "name": "idempotency_mismatch",
    "op": "leases.claim",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "f6ac80e4-1d59-56bf-8eba-5acc92ea884d"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.claim",
      "args": [
@@ -293,10 +293,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 409,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 409,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-error/1",
      "error": "idempotency_mismatch",
      "message": "clé déjà employée pour une autre requête"
@@ -304,17 +304,17 @@
    }
   },
   {
-   "nom": "bad_args/upsert-hors-cwd",
+   "name": "bad_args/upsert-hors-cwd",
    "op": "agents.upsert",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "0b9f6c1e-1c0a-4d1e-9a51-6c2d3f4e5a60"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.upsert",
      "args": [
@@ -338,10 +338,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 400,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 400,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-error/1",
      "error": "bad_args",
      "message": "agents.upsert : seul cwd est admis"
@@ -349,16 +349,16 @@
    }
   },
   {
-   "nom": "token_expired",
+   "name": "token_expired",
    "op": "agents.get",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.get",
      "args": [
@@ -367,10 +367,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 401,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 401,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-error/1",
      "error": "token_expired",
      "message": "jeton échu"
@@ -378,16 +378,16 @@
    }
   },
   {
-   "nom": "rate_limited",
+   "name": "rate_limited",
    "op": "agents.get",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.get",
      "args": [
@@ -396,12 +396,12 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 429,
-    "entetes": {
+   "response": {
+    "status": 429,
+    "headers": {
      "Retry-After": "2"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-error/1",
      "error": "rate_limited",
      "message": "trop de requêtes",
@@ -410,16 +410,16 @@
    }
   },
   {
-   "nom": "unavailable",
+   "name": "unavailable",
    "op": "agents.get",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.get",
      "args": [
@@ -428,12 +428,12 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 503,
-    "entetes": {
+   "response": {
+    "status": 503,
+    "headers": {
      "Retry-After": "5"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-error/1",
      "error": "unavailable",
      "message": "base indisponible",

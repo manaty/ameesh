@@ -1,7 +1,7 @@
 {
  "schema": "ameesh-exec-golden/1",
- "famille": "porte",
- "etats": [
+ "family": "gate",
+ "states": [
   {
    "schema": "ameesh-host-state/1",
    "state": "available",
@@ -36,7 +36,7 @@
    "reason": "revoked"
   }
  ],
- "acquittements": [
+ "acks": [
   {
    "schema": "ameesh-host-ack/1",
    "seq": 7,
@@ -69,7 +69,7 @@
    "ts": 1791640040.12
   }
  ],
- "illisibles": [
+ "unreadable": [
   {
    "schema": "ameesh-host-state/0",
    "state": "available",
@@ -86,14 +86,14 @@
    "seq": "3"
   }
  ],
- "disponibilite": {
-  "requete": {
-   "methode": "PUT",
-   "chemin": "/api/exec/v1/host/availability",
-   "entetes": {
+ "availability": {
+  "request": {
+   "method": "PUT",
+   "path": "/api/exec/v1/host/availability",
+   "headers": {
     "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
    },
-   "corps": {
+   "body": {
     "schema": "ameesh-exec-availability/1",
     "available": false,
     "state": "draining",
@@ -105,8 +105,8 @@
     "reason": "user_active"
    }
   },
-  "reponse": {
-   "statut": 204
+  "response": {
+   "status": 204
   }
  }
 }

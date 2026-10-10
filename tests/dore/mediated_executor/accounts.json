@@ -1,18 +1,18 @@
 {
  "schema": "ameesh-exec-golden/1",
- "famille": "accounts",
- "cas": [
+ "family": "accounts",
+ "cases": [
   {
-   "nom": "accounts.active/ok",
+   "name": "accounts.active/ok",
    "op": "accounts.active",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "accounts.active",
      "args": [
@@ -22,10 +22,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": null,

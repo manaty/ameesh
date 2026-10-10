@@ -34,11 +34,11 @@ def _call(db, name: str, args, kwargs):
 
 def _prime(db, case: dict) -> None:
     """Le carnet des baux tel qu'un exécuteur qui détient le bail du cas doré."""
-    fence = case["requete"]["corps"].get("fence")
+    fence = case["request"]["body"].get("fence")
     if fence:
         db.book.hold(fence["agent"], fence["owner"], fence["epoch"])
         if case["op"] == "turn_resources.close_turn":
-            db.book.open_turn(case["requete"]["corps"]["args"][0], fence["agent"])
+            db.book.open_turn(case["request"]["body"]["args"][0], fence["agent"])
 
 
 class RejeuDoreTest(unittest.TestCase):
@@ -47,15 +47,15 @@ class RejeuDoreTest(unittest.TestCase):
     def test_chaque_operation_produit_la_requete_doree(self):
         vues = set()
         for case in op_cases():
-            with self.subTest(case=case["nom"]):
-                corps = case["requete"]["corps"]
+            with self.subTest(case=case["name"]):
+                corps = case["request"]["body"]
                 op = CONTRAT.get(case["op"])
-                route_doree = case["requete"]["chemin"][len(C.PREFIX) + 1:]
+                route_doree = case["request"]["path"][len(C.PREFIX) + 1:]
                 mode = "session" if route_doree == "session/op" else "executor"
                 transport = GoldenTransport(Responder.only(case))
                 db = make_db(transport, mode=mode)
                 _prime(db, case)
-                if case["nom"].endswith("/rejoue"):
+                if case["name"].endswith("/rejoue"):
                     continue  # même requête que `/ok` : servie par le serveur, pas le client
                 value = _call(db, case["op"], corps["args"], corps["kwargs"])
                 self.assertEqual(len(transport.calls), 1, transport.calls)
@@ -64,7 +64,7 @@ class RejeuDoreTest(unittest.TestCase):
                 self.assertEqual(body, corps, "requête différente du jeu doré")
                 self.assertEqual(key is not None, op.write,
                                  "Idempotency-Key : présente pour toute écriture, seulement")
-                self.assertEqual(value, case["reponse"]["corps"]["value"])
+                self.assertEqual(value, case["response"]["body"]["value"])
                 vues.add(case["op"])
         attendues = {n for n, o in CONTRAT.operations.items() if o.transport != "events"}
         self.assertEqual(attendues - vues, set(), "opérations de la table sans cas doré rejoué")
@@ -197,9 +197,9 @@ class ErreursTest(unittest.TestCase):
 
     def test_chaque_erreur_doree_devient_l_exception_du_contrat(self):
         for case in error_cases():
-            corps = case["reponse"]["corps"]
-            with self.subTest(case=case["nom"]):
-                exc = C.client_exception(case["reponse"]["statut"], corps)
+            corps = case["response"]["body"]
+            with self.subTest(case=case["name"]):
+                exc = C.client_exception(case["response"]["status"], corps)
                 self.assertIsInstance(exc, self.ATTENDU[corps["error"]])
                 if corps["error"] == "executor_revoked":
                     self.assertEqual(exc.code, "executor_revoked")
@@ -315,14 +315,14 @@ class HttpTransportTest(unittest.TestCase):
         rhttp.HttpTransport("https://mesh.exemple")
 
     def test_flux_sse_dore(self):
-        g = golden("evenements")["sse"]
+        g = golden("events")["sse"]
         self.server.queue("GET", "/events", (200, {"Content-Type": "text/event-stream"},
-                                             g["reponse"]["texte"]))
+                                             g["response"]["text"]))
         events = []
         with self.assertRaises(db_mod.Unavailable):  # le serveur ferme : coupure
             for ev in _transport(self.server).stream_events("k3f9:16"):
                 events.append(ev.to_json())
-        self.assertEqual(events, g["evenements"])
+        self.assertEqual(events, g["events"])
         self.assertEqual(self.server.requests[-1]["headers"]["Last-Event-ID"], "k3f9:16")
         self.assertEqual(self.server.requests[-1]["headers"]["Accept"], "text/event-stream")
 
@@ -332,19 +332,19 @@ class HttpTransportTest(unittest.TestCase):
             list(_transport(self.server).stream_events(None))
 
     def test_attente_longue_doree(self):
-        g = golden("evenements")["attente_longue"]
-        self.server.queue("GET", "/events", (200, {}, g["reponse"]["corps"]))
+        g = golden("events")["long_poll"]
+        self.server.queue("GET", "/events", (200, {}, g["response"]["body"]))
         events, last = _transport(self.server).poll_events("k3f9:16", 25)
-        self.assertEqual([e.to_json() for e in events], g["reponse"]["corps"]["events"])
+        self.assertEqual([e.to_json() for e in events], g["response"]["body"]["events"])
         self.assertEqual(last, "k3f9:19")
         self.assertEqual(self.server.requests[-1]["path"],
                          "/api/exec/v1/events?wait=25&after=k3f9:16")
 
     def test_fiche_hote_et_jeton_de_session(self):
-        ident = golden("identite")
-        self.server.queue("GET", "/host", (200, {}, ident["host"]["reponse"]["corps"]))
+        ident = golden("identity")
+        self.server.queue("GET", "/host", (200, {}, ident["host"]["response"]["body"]))
         self.server.queue("POST", "/session-token",
-                          (200, {}, ident["session_token"]["reponse"]["corps"]))
+                          (200, {}, ident["session_token"]["response"]["body"]))
         transport = _transport(self.server)
         info = transport.host_info()
         self.assertEqual((info.host, info.executor_id, info.lease_ttl_s),
@@ -352,7 +352,7 @@ class HttpTransportTest(unittest.TestCase):
         issued = transport.session_token(C.Fence("inge-front", OWNER, 42))
         self.assertEqual(issued.token, SESSION)
         self.assertEqual(self.server.requests[-1]["body"],
-                         ident["session_token"]["requete"]["corps"])
+                         ident["session_token"]["request"]["body"])
 
 
 # --------------------------------------------------------------------------
@@ -361,7 +361,7 @@ class HttpTransportTest(unittest.TestCase):
 
 class AbonnementTest(unittest.TestCase):
     def _events(self):
-        return [E.Event.from_json(e) for e in golden("evenements")["sse"]["evenements"]]
+        return [E.Event.from_json(e) for e in golden("events")["sse"]["events"]]
 
     def test_sse_rend_les_signaux_puis_down(self):
         transport = GoldenTransport()
@@ -399,7 +399,7 @@ class AbonnementTest(unittest.TestCase):
     def test_repli_attente_longue(self):
         transport = GoldenTransport()
         transport.stream_error = C.NotSupportedRemotely("pas de SSE")
-        g = golden("evenements")["attente_longue"]["reponse"]["corps"]
+        g = golden("events")["long_poll"]["response"]["body"]
         transport.polls = [E.parse_long_poll(g)]
         db = make_db(transport)
         sub = storage.of(db).wakeups.subscribe(list(E.CHANNELS))

@@ -1,19 +1,19 @@
 {
  "schema": "ameesh-exec-golden/1",
- "famille": "leases",
- "cas": [
+ "family": "leases",
+ "cases": [
   {
-   "nom": "leases.claim/ok",
+   "name": "leases.claim/ok",
    "op": "leases.claim",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "f6ac80e4-1d59-56bf-8eba-5acc92ea884d"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.claim",
      "args": [
@@ -26,10 +26,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": {
@@ -48,17 +48,17 @@
    }
   },
   {
-   "nom": "leases.claim/rejoue",
+   "name": "leases.claim/rejoue",
    "op": "leases.claim",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "f6ac80e4-1d59-56bf-8eba-5acc92ea884d"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.claim",
      "args": [
@@ -71,12 +71,12 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {
+   "response": {
+    "status": 200,
+    "headers": {
      "Idempotency-Replayed": "true"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": {
@@ -95,17 +95,17 @@
    }
   },
   {
-   "nom": "leases.renew/ok",
+   "name": "leases.renew/ok",
    "op": "leases.renew",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "606c57f1-9cb3-5a4d-864d-6b6b4a399886"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.renew",
      "args": [
@@ -122,10 +122,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": 1791640090.12,
@@ -134,17 +134,17 @@
    }
   },
   {
-   "nom": "leases.release/ok",
+   "name": "leases.release/ok",
    "op": "leases.release",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "a7d8f3ee-8667-53a5-8a71-3f29cff2895e"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.release",
      "args": [
@@ -160,10 +160,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": true,
@@ -172,17 +172,17 @@
    }
   },
   {
-   "nom": "leases.reap/ok",
+   "name": "leases.reap/ok",
    "op": "leases.reap",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "ba3fc4b1-da84-5d56-8427-773a7043822f"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.reap",
      "args": [
@@ -191,10 +191,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": [],
@@ -203,17 +203,17 @@
    }
   },
   {
-   "nom": "leases.begin_turn/ok",
+   "name": "leases.begin_turn/ok",
    "op": "leases.begin_turn",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "52951ad6-a5a5-5b44-9bcb-459a62100792"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.begin_turn",
      "args": [
@@ -230,10 +230,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": true,
@@ -242,17 +242,17 @@
    }
   },
   {
-   "nom": "leases.begin_turn/bail-perdu",
+   "name": "leases.begin_turn/bail-perdu",
    "op": "leases.begin_turn",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "dc50282f-838d-5cb0-b50b-ce5086dd3e07"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.begin_turn",
      "args": [
@@ -269,10 +269,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": false,
@@ -282,17 +282,17 @@
    }
   },
   {
-   "nom": "leases.end_turn/ok",
+   "name": "leases.end_turn/ok",
    "op": "leases.end_turn",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "52edf462-2d68-519f-a9e9-dd05d465b6eb"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.end_turn",
      "args": [
@@ -313,10 +313,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": true,
@@ -325,17 +325,17 @@
    }
   },
   {
-   "nom": "leases.take_pending_prompt/ok",
+   "name": "leases.take_pending_prompt/ok",
    "op": "leases.take_pending_prompt",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "12a71dc3-f200-5fb4-ae40-fd2fd448a290"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.take_pending_prompt",
      "args": [
@@ -351,10 +351,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": "Reprends le lot 812.",
@@ -363,17 +363,17 @@
    }
   },
   {
-   "nom": "leases.restore_prompt/ok",
+   "name": "leases.restore_prompt/ok",
    "op": "leases.restore_prompt",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "8afc3010-95fd-50bb-81dc-bd721cf641cb"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.restore_prompt",
      "args": [
@@ -389,10 +389,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": true,
@@ -401,17 +401,17 @@
    }
   },
   {
-   "nom": "leases.pause/ok",
+   "name": "leases.pause/ok",
    "op": "leases.pause",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "3462f8a4-3b7e-5c82-8a62-8b75b5a8e79e"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.pause",
      "args": [
@@ -428,10 +428,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": true,
@@ -440,17 +440,17 @@
    }
   },
   {
-   "nom": "leases.clear_session/ok",
+   "name": "leases.clear_session/ok",
    "op": "leases.clear_session",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "df20cc4b-8012-5f45-8c9a-25d0b6ac2a37"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.clear_session",
      "args": [
@@ -466,10 +466,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": true,
@@ -478,17 +478,17 @@
    }
   },
   {
-   "nom": "leases.set_marked_block/ok",
+   "name": "leases.set_marked_block/ok",
    "op": "leases.set_marked_block",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "be7c6346-9b2e-55e1-831c-b9db1d171eeb"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.set_marked_block",
      "args": [
@@ -507,10 +507,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": "done",
@@ -519,17 +519,17 @@
    }
   },
   {
-   "nom": "leases.set_marked_block/bail-perdu",
+   "name": "leases.set_marked_block/bail-perdu",
    "op": "leases.set_marked_block",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "57dcd569-f127-57f1-a829-e54fea2389e0"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.set_marked_block",
      "args": [
@@ -548,10 +548,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": "lease",
@@ -561,17 +561,17 @@
    }
   },
   {
-   "nom": "leases.clear_marked_block/ok",
+   "name": "leases.clear_marked_block/ok",
    "op": "leases.clear_marked_block",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "45cfeb99-319e-565d-b1d9-1e32f6a9ccd7"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.clear_marked_block",
      "args": [
@@ -589,10 +589,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": "done",
@@ -601,16 +601,16 @@
    }
   },
   {
-   "nom": "leases.state/ok",
+   "name": "leases.state/ok",
    "op": "leases.state",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/session/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
      "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "leases.state",
      "args": [
@@ -619,10 +619,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": {

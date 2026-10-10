@@ -53,7 +53,7 @@ def _golden_cases() -> list:
     cases = []
     for path in sorted(glob.glob(os.path.join(DORE, "*.json"))):
         with open(path, encoding="utf-8") as fh:
-            cases.extend(json.load(fh).get("cas") or ())
+            cases.extend(json.load(fh).get("cases") or ())
     return cases
 
 
@@ -188,12 +188,12 @@ class ServeurExecTest(PgTestCase):
         return self.request("POST", route, body, token=token, key=key)
 
     def golden(self, case, **overrides):
-        req = case["requete"]
-        sub = req["chemin"][len(C.PREFIX):]
-        headers = {k: v for k, v in req["entetes"].items()}
+        req = case["request"]
+        sub = req["path"][len(C.PREFIX):]
+        headers = {k: v for k, v in req["headers"].items()}
         headers.update(overrides)
-        raw = json.dumps(req["corps"]).encode()
-        return self.app.handle(req["methode"], C.PREFIX + sub, headers, raw,
+        raw = json.dumps(req["body"]).encode()
+        return self.app.handle(req["method"], C.PREFIX + sub, headers, raw,
                                client_ip="127.0.0.1")
 
 
@@ -201,14 +201,14 @@ class DoreTest(ServeurExecTest):
     """Les jeux dorés de L107, rejoués un par un sur une base remise à zéro."""
 
     def prepare(self, case):
-        name = case["nom"]
-        corps = case["requete"]["corps"]
+        name = case["name"]
+        corps = case["request"]["body"]
         if name.endswith("bail-perdu"):
             self.hold("inge-front", OWNER, 43)
         if name in ("leases.claim/ok", "leases.claim/rejoue", "idempotency_mismatch"):
             self.free("inge-front")
         if name in ("leases.claim/rejoue", "idempotency_mismatch"):
-            first = [c for c in _golden_cases() if c["nom"] == "leases.claim/ok"][0]
+            first = [c for c in _golden_cases() if c["name"] == "leases.claim/ok"][0]
             self.assertEqual(self.golden(first).status, 200)
         if name == "host_unavailable":
             self.availability("draining", 2)
@@ -247,7 +247,7 @@ class DoreTest(ServeurExecTest):
         cases = _golden_cases()
         self.assertGreater(len(cases), 70)
         for case in cases:
-            with self.subTest(cas=case["nom"]):
+            with self.subTest(cas=case["name"]):
                 self.reset()
                 self.auth.force = None
                 case = copy.deepcopy(case)
@@ -258,25 +258,25 @@ class DoreTest(ServeurExecTest):
                 finally:
                     self.app.pool, self.dispatcher.pool, self.app.limiter = saved
                     self.auth.force = None
-                expected = case["reponse"]
-                self.assertEqual(resp.status, expected["statut"], resp.body)
-                for header, value in expected.get("entetes", {}).items():
+                expected = case["response"]
+                self.assertEqual(resp.status, expected["status"], resp.body)
+                for header, value in expected.get("headers", {}).items():
                     self.assertEqual(resp.headers.get(header), value)
-                if expected["statut"] != 200:
+                if expected["status"] != 200:
                     self.assertEqual(resp.body["schema"], C.SCHEMA_ERROR)
-                    self.assertEqual(resp.body["error"], expected["corps"]["error"])
+                    self.assertEqual(resp.body["error"], expected["body"]["error"])
                     continue
                 op = self.contract.operations[case["op"]]
                 self.assertEqual(resp.body["schema"], C.SCHEMA_RESULT)
                 self.assertTrue(resp.body["ok"])
                 self.assertTrue(C.conforms(resp.body["value"], op.result),
-                                (case["nom"], resp.body["value"]))
-                if case["nom"].endswith("bail-perdu"):
+                                (case["name"], resp.body["value"]))
+                if case["name"].endswith("bail-perdu"):
                     self.assertTrue(resp.body.get("fenced"))
                     self.assertEqual(resp.body["value"], op.refusal)
-                    self.assertEqual(resp.body["value"], expected["corps"]["value"])
+                    self.assertEqual(resp.body["value"], expected["body"]["value"])
                 else:
-                    self.assertFalse(resp.body.get("fenced", False), case["nom"])
+                    self.assertFalse(resp.body.get("fenced", False), case["name"])
 
     def test_sante_et_hote(self):
         health = self.request("GET", "/health", token=None)
@@ -306,11 +306,11 @@ class PorteeTest(ServeurExecTest):
         refused = 0
         for case in _golden_cases():
             op = self.contract.operations.get(case["op"])
-            if (op is None or not case["nom"].endswith("/ok") or op.transport != "op"
+            if (op is None or not case["name"].endswith("/ok") or op.transport != "op"
                     or not (("A" in op.scope and op.agent_param) or "B" in op.scope)):
                 continue
             with self.subTest(op=op.name):
-                corps = self._swap(case["requete"]["corps"], "inge-front", "tresorier")
+                corps = self._swap(case["request"]["body"], "inge-front", "tresorier")
                 self.hold("tresorier", OWNER.replace(HOST, "autre-hote"), 42)
                 resp = self.request("POST", "/op", corps,
                                     key=C.new_idempotency_key() if op.write else None)
@@ -487,8 +487,8 @@ class FencingTest(ServeurExecTest):
         out = []
         for case in _golden_cases():
             op = self.contract.operations.get(case["op"])
-            if op and op.fence and case["nom"].endswith("/ok"):
-                corps = case["requete"]["corps"]
+            if op and op.fence and case["name"].endswith("/ok"):
+                corps = case["request"]["body"]
                 out.append((op, corps["args"], corps["kwargs"]))
         return out
 

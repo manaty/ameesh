@@ -1,19 +1,19 @@
 {
  "schema": "ameesh-exec-golden/1",
- "famille": "pending_spend",
- "cas": [
+ "family": "pending_spend",
+ "cases": [
   {
-   "nom": "pending_spend.put/ok",
+   "name": "pending_spend.put/ok",
    "op": "pending_spend.put",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "66845416-3c68-5435-b1f7-094736d5e907"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "pending_spend.put",
      "args": [
@@ -30,10 +30,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": true,
@@ -42,17 +42,17 @@
    }
   },
   {
-   "nom": "pending_spend.set_model/ok",
+   "name": "pending_spend.set_model/ok",
    "op": "pending_spend.set_model",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "cdddf821-71fe-5d25-b9e3-42c90fe417dd"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "pending_spend.set_model",
      "args": [
@@ -67,10 +67,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": true,
@@ -79,17 +79,17 @@
    }
   },
   {
-   "nom": "pending_spend.clear/ok",
+   "name": "pending_spend.clear/ok",
    "op": "pending_spend.clear",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "a427655e-d2bb-52a3-ad84-5eaf49a85b8b"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "pending_spend.clear",
      "args": [
@@ -103,10 +103,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": true,
@@ -115,16 +115,16 @@
    }
   },
   {
-   "nom": "pending_spend.get/ok",
+   "name": "pending_spend.get/ok",
    "op": "pending_spend.get",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "pending_spend.get",
      "args": [
@@ -133,10 +133,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": {

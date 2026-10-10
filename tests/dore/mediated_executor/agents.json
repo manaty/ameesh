@@ -1,18 +1,18 @@
 {
  "schema": "ameesh-exec-golden/1",
- "famille": "agents",
- "cas": [
+ "family": "agents",
+ "cases": [
   {
-   "nom": "agents.claimable/ok",
+   "name": "agents.claimable/ok",
    "op": "agents.claimable",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.claimable",
      "args": [
@@ -26,10 +26,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": [
@@ -50,16 +50,16 @@
    }
   },
   {
-   "nom": "agents.get/ok",
+   "name": "agents.get/ok",
    "op": "agents.get",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.get",
      "args": [
@@ -68,10 +68,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": {
@@ -90,16 +90,16 @@
    }
   },
   {
-   "nom": "agents.cwd_used/ok",
+   "name": "agents.cwd_used/ok",
    "op": "agents.cwd_used",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.cwd_used",
      "args": [
@@ -109,10 +109,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": false,
@@ -121,26 +121,26 @@
    }
   },
   {
-   "nom": "agents.harnesses/ok",
+   "name": "agents.harnesses/ok",
    "op": "agents.harnesses",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.harnesses",
      "args": [],
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": {
@@ -151,17 +151,17 @@
    }
   },
   {
-   "nom": "agents.set_status/ok",
+   "name": "agents.set_status/ok",
    "op": "agents.set_status",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "36059856-2764-592b-ba61-8d4c6abe3367"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.set_status",
      "args": [
@@ -178,10 +178,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": null,
@@ -190,17 +190,17 @@
    }
   },
   {
-   "nom": "agents.set_status/bail-perdu",
+   "name": "agents.set_status/bail-perdu",
    "op": "agents.set_status",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "8257a6a4-1bdc-5285-b36a-ff4262dc0062"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.set_status",
      "args": [
@@ -217,10 +217,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": null,
@@ -230,17 +230,17 @@
    }
   },
   {
-   "nom": "agents.set_session/ok",
+   "name": "agents.set_session/ok",
    "op": "agents.set_session",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "a25fcd24-29cf-520d-b483-a2a38bdbc244"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.set_session",
      "args": [
@@ -256,10 +256,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": null,
@@ -268,17 +268,17 @@
    }
   },
   {
-   "nom": "agents.set_session_account/ok",
+   "name": "agents.set_session_account/ok",
    "op": "agents.set_session_account",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "57e50951-758d-513b-aef4-4e9f6f67360b"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.set_session_account",
      "args": [
@@ -293,10 +293,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": true,
@@ -305,17 +305,17 @@
    }
   },
   {
-   "nom": "agents.set_pending_prompt/ok",
+   "name": "agents.set_pending_prompt/ok",
    "op": "agents.set_pending_prompt",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "60385445-ce2d-5f0c-853a-e0c55b3ac013"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.set_pending_prompt",
      "args": [
@@ -330,10 +330,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": null,
@@ -342,17 +342,17 @@
    }
   },
   {
-   "nom": "agents.mark_event_wake/ok",
+   "name": "agents.mark_event_wake/ok",
    "op": "agents.mark_event_wake",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "d3111c9a-2bc7-5216-b72c-9557a0baf30a"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.mark_event_wake",
      "args": [
@@ -366,10 +366,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": null,
@@ -378,17 +378,17 @@
    }
   },
   {
-   "nom": "agents.upsert/ok",
+   "name": "agents.upsert/ok",
    "op": "agents.upsert",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "2f7e91cf-c733-5786-9298-60dd2018123e"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.upsert",
      "args": [
@@ -412,10 +412,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": {
@@ -434,26 +434,26 @@
    }
   },
   {
-   "nom": "agents.overview/ok",
+   "name": "agents.overview/ok",
    "op": "agents.overview",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/session/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
      "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "agents.overview",
      "args": [],
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": [

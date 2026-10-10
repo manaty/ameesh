@@ -327,14 +327,14 @@ def request_sha256(body: Mapping) -> str:
 
 #: portées : A agent admis ; B A + bail (fence) ; H hôte forcé ;
 #: S jeton de session ; agregat donnée agrégée
-SCOPES = ("A", "B", "H", "S", "agregat")
+SCOPES = ("A", "B", "H", "S", "aggregate")
 TRANSPORTS = ("op", "session/op", "events")
 
 
 @dataclasses.dataclass(frozen=True)
 class Param:
     name: str
-    #: "positionnel" (positionnel ou nommé) ou "nomme" (nommé seulement)
+    #: "positional" (positionnel ou nommé) ou "keyword" (nommé seulement)
     kind: str
     schema: dict
     required: bool
@@ -352,7 +352,7 @@ class Operation:
     fence: bool
     #: paramètre qui porte le nom d'agent contrôlé (portées A et B), ou None
     agent_param: Optional[str]
-    #: paramètres remplacés par le serveur : {param: "hote_executeur" |
+    #: paramètres remplacés par le serveur : {param: "executor_host" |
     #: "agent_session" | valeur littérale}
     forced: Mapping[str, Any]
     params: tuple
@@ -410,7 +410,7 @@ class Contract:
         bad_args) si la liaison échoue."""
         op = self.get(name)
         kwargs = dict(kwargs or {})
-        positional = [p for p in op.params if p.kind == "positionnel"]
+        positional = [p for p in op.params if p.kind == "positional"]
         if len(args) > len(positional):
             raise ValueError("%s : trop d'arguments positionnels" % name)
         bound: dict = {}
@@ -472,16 +472,16 @@ def agent_name(value: Any) -> Any:
 
 
 def _param(d: Mapping) -> Param:
-    return Param(d["nom"], d["sorte"], d["schema"], d["requis"], d.get("defaut"))
+    return Param(d["name"], d["kind"], d["schema"], d["required"], d.get("default"))
 
 
 def _operation(d: Mapping) -> Operation:
     return Operation(
-        name=d["nom"], write=d["ecriture"], transport=d["transport"],
-        scope=tuple(d["portee"]), fence=d["fence"], agent_param=d["param_agent"],
-        forced=dict(d["forces"]), params=tuple(_param(p) for p in d["parametres"]),
-        result=d["resultat"], refusal=d["refus"],
-        naturally_idempotent=d["idempotence"]["naturelle"], rules=tuple(d["regles"]),
+        name=d["name"], write=d["write"], transport=d["transport"],
+        scope=tuple(d["scope"]), fence=d["fence"], agent_param=d["param_agent"],
+        forced=dict(d["forced"]), params=tuple(_param(p) for p in d["params"]),
+        result=d["result"], refusal=d["refusal"],
+        naturally_idempotent=d["idempotency"]["natural"], rules=tuple(d["rules"]),
         session=bool(d.get("session", False)))
 
 
@@ -498,11 +498,11 @@ def parse(data: Mapping) -> Contract:
         if op.session and op.transport != "op":
             raise ValueError("ligne invalide (session hors route op) : %s" % op.name)
         ops[op.name] = op
-    ref = data["refusees"]
-    return Contract(version=data["version"], prefix=data["prefixe"], operations=ops,
+    ref = data["refused"]
+    return Contract(version=data["version"], prefix=data["prefix"], operations=ops,
                     refused={k: tuple(v) for k, v in ref["operations"].items()},
-                    refused_reasons=dict(ref["raisons"]),
-                    interface_total=ref["total_interface"])
+                    refused_reasons=dict(ref["reasons"]),
+                    interface_total=ref["interface_total"])
 
 
 @lru_cache(maxsize=1)

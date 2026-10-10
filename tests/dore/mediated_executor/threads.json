@@ -1,19 +1,19 @@
 {
  "schema": "ameesh-exec-golden/1",
- "famille": "threads",
- "cas": [
+ "family": "threads",
+ "cases": [
   {
-   "nom": "threads.index/ok",
+   "name": "threads.index/ok",
    "op": "threads.index",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "b56e21fa-9f9b-5027-b334-0e7899ff6434"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "threads.index",
      "args": [],
@@ -41,10 +41,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": null,
@@ -53,17 +53,17 @@
    }
   },
   {
-   "nom": "threads.index/session",
+   "name": "threads.index/session",
    "op": "threads.index",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/session/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
      "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
      "Content-Type": "application/json",
      "Idempotency-Key": "2c7226fe-845a-5898-99d8-9b3153716a8b"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "threads.index",
      "args": [],
@@ -91,10 +91,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": null,

@@ -38,14 +38,14 @@ def op_cases() -> list:
     out = []
     for fn in sorted(os.listdir(DORE)):
         g = golden(fn[:-5])
-        if g["famille"] in ("erreurs", "evenements", "porte", "identite"):
+        if g["family"] in ("errors", "events", "gate", "identity"):
             continue
-        out.extend(g["cas"])
+        out.extend(g["cases"])
     return out
 
 
 def error_cases() -> list:
-    return golden("erreurs")["cas"]
+    return golden("errors")["cases"]
 
 
 def _key(route: str, body: dict) -> str:
@@ -80,8 +80,8 @@ class Responder:
         self.contract = C.load()
         self.cases: dict[str, list] = {}
         for case in op_cases() + (error_cases() if include_errors else []):
-            route = "session/op" if case["requete"]["chemin"].endswith("/session/op") else "op"
-            self.cases.setdefault(_key(route, case["requete"]["corps"]), []).append(case)
+            route = "session/op" if case["request"]["path"].endswith("/session/op") else "op"
+            self.cases.setdefault(_key(route, case["request"]["body"]), []).append(case)
         #: réponses imposées par opération (prioritaires sur les cas dorés)
         self.script: dict[str, Any] = {}
         #: journal : (route, corps, clé d'idempotence)
@@ -96,8 +96,8 @@ class Responder:
     def only(cls, case: dict) -> "Responder":
         """Un répondeur qui ne connaît que ce cas doré."""
         responder = cls()
-        route = "session/op" if case["requete"]["chemin"].endswith("/session/op") else "op"
-        responder.cases = {_key(route, case["requete"]["corps"]): [case]}
+        route = "session/op" if case["request"]["path"].endswith("/session/op") else "op"
+        responder.cases = {_key(route, case["request"]["body"]): [case]}
         return responder
 
     def _scripted(self, name: str, body: dict) -> Optional[tuple]:
@@ -130,8 +130,8 @@ class Responder:
             raise AssertionError("requête sans cas doré ni script : %s %s"
                                  % (route, json.dumps(body, ensure_ascii=False)))
         case = found[0]
-        rep = case["reponse"]
-        return rep["statut"], dict(rep.get("entetes") or {}), rep["corps"]
+        rep = case["response"]
+        return rep["status"], dict(rep.get("headers") or {}), rep["body"]
 
 
 class GoldenTransport(ExecTransport):
@@ -144,7 +144,7 @@ class GoldenTransport(ExecTransport):
         self.stream_calls: list = []
         self.poll_calls: list = []
         self.polls: list = []           # [(événements, curseur)] rendus par `poll_events`
-        self.host = HostInfo.from_json(golden("identite")["host"]["reponse"]["corps"])
+        self.host = HostInfo.from_json(golden("identity")["host"]["response"]["body"])
         self.host_error: Optional[BaseException] = None
         self.session_tokens: list = []
         self.url = "https://mesh.exemple"
@@ -200,7 +200,7 @@ class GoldenTransport(ExecTransport):
 
     def session_token(self, fence):
         self.session_tokens.append(fence)
-        body = golden("identite")["session_token"]["reponse"]["corps"]
+        body = golden("identity")["session_token"]["response"]["body"]
         return IssuedToken(body["access_token"], body["expires_ts"], "session")
 
 

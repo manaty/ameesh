@@ -1,18 +1,18 @@
 {
  "schema": "ameesh-exec-golden/1",
- "famille": "actions",
- "cas": [
+ "family": "actions",
+ "cases": [
   {
-   "nom": "actions.get/ok",
+   "name": "actions.get/ok",
    "op": "actions.get",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/session/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
      "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "actions.get",
      "args": [
@@ -23,10 +23,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": {
@@ -41,17 +41,17 @@
    }
   },
   {
-   "nom": "actions.propose/ok",
+   "name": "actions.propose/ok",
    "op": "actions.propose",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/session/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
      "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
      "Content-Type": "application/json",
      "Idempotency-Key": "1e2c3872-9e35-5823-bb8b-fc16594fb7d3"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "actions.propose",
      "args": [],
@@ -76,10 +76,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": null,

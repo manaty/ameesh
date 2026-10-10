@@ -1,18 +1,18 @@
 {
  "schema": "ameesh-exec-golden/1",
- "famille": "mailbox",
- "cas": [
+ "family": "mailbox",
+ "cases": [
   {
-   "nom": "mailbox.unread/ok",
+   "name": "mailbox.unread/ok",
    "op": "mailbox.unread",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "mailbox.unread",
      "args": [
@@ -22,10 +22,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": [
@@ -46,16 +46,16 @@
    }
   },
   {
-   "nom": "mailbox.unread/session",
+   "name": "mailbox.unread/session",
    "op": "mailbox.unread",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/session/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
      "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "mailbox.unread",
      "args": [
@@ -65,10 +65,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": [
@@ -89,16 +89,16 @@
    }
   },
   {
-   "nom": "mailbox.unread_urgent/ok",
+   "name": "mailbox.unread_urgent/ok",
    "op": "mailbox.unread_urgent",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "mailbox.unread_urgent",
      "args": [
@@ -108,10 +108,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": [],
@@ -120,16 +120,16 @@
    }
   },
   {
-   "nom": "mailbox.get/ok",
+   "name": "mailbox.get/ok",
    "op": "mailbox.get",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "mailbox.get",
      "args": [
@@ -138,10 +138,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": {
@@ -160,17 +160,17 @@
    }
   },
   {
-   "nom": "mailbox.reserve/ok",
+   "name": "mailbox.reserve/ok",
    "op": "mailbox.reserve",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "b423515e-707a-5ce7-b528-0bccb849e466"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "mailbox.reserve",
      "args": [
@@ -190,10 +190,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": [
@@ -214,17 +214,17 @@
    }
   },
   {
-   "nom": "mailbox.reserve/bail-perdu",
+   "name": "mailbox.reserve/bail-perdu",
    "op": "mailbox.reserve",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "8b191ad3-8e33-5bba-b16e-63b0e83da1cc"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "mailbox.reserve",
      "args": [
@@ -244,10 +244,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": [],
@@ -257,17 +257,17 @@
    }
   },
   {
-   "nom": "mailbox.reserve/session",
+   "name": "mailbox.reserve/session",
    "op": "mailbox.reserve",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/session/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
      "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
      "Content-Type": "application/json",
      "Idempotency-Key": "68fb51e2-d161-54c6-9e2f-11ff69b5f940"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "mailbox.reserve",
      "args": [
@@ -287,10 +287,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": [
@@ -311,17 +311,17 @@
    }
   },
   {
-   "nom": "mailbox.deliver/ok",
+   "name": "mailbox.deliver/ok",
    "op": "mailbox.deliver",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "dd67f202-b8bf-5590-ade6-bce6a6ed1383"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "mailbox.deliver",
      "args": [
@@ -341,10 +341,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": [
@@ -355,17 +355,17 @@
    }
   },
   {
-   "nom": "mailbox.deliver/session",
+   "name": "mailbox.deliver/session",
    "op": "mailbox.deliver",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/session/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
      "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
      "Content-Type": "application/json",
      "Idempotency-Key": "981b94c2-b95c-56a4-ad49-b761fc9f92b0"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "mailbox.deliver",
      "args": [
@@ -385,10 +385,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": [
@@ -399,17 +399,17 @@
    }
   },
   {
-   "nom": "mailbox.release/ok",
+   "name": "mailbox.release/ok",
    "op": "mailbox.release",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/op",
+    "headers": {
      "Authorization": "Bearer amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
      "Content-Type": "application/json",
      "Idempotency-Key": "f27d65ea-98bc-5f7e-af06-24f0173371bc"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "mailbox.release",
      "args": [
@@ -427,10 +427,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": 1,
@@ -439,17 +439,17 @@
    }
   },
   {
-   "nom": "mailbox.release/session",
+   "name": "mailbox.release/session",
    "op": "mailbox.release",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/session/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
      "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
      "Content-Type": "application/json",
      "Idempotency-Key": "cd28006c-fd45-5ec5-826e-cd66c237340e"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "mailbox.release",
      "args": [
@@ -467,10 +467,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": 1,
@@ -479,17 +479,17 @@
    }
   },
   {
-   "nom": "mailbox.send/ok",
+   "name": "mailbox.send/ok",
    "op": "mailbox.send",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/session/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
      "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
      "Content-Type": "application/json",
      "Idempotency-Key": "635419d6-5288-5c69-9206-e09badb4b826"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "mailbox.send",
      "args": [
@@ -511,10 +511,10 @@
      }
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": {
@@ -528,17 +528,17 @@
    }
   },
   {
-   "nom": "mailbox.mark_delivered/ok",
+   "name": "mailbox.mark_delivered/ok",
    "op": "mailbox.mark_delivered",
-   "requete": {
-    "methode": "POST",
-    "chemin": "/api/exec/v1/session/op",
-    "entetes": {
+   "request": {
+    "method": "POST",
+    "path": "/api/exec/v1/session/op",
+    "headers": {
      "Authorization": "Bearer ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
      "Content-Type": "application/json",
      "Idempotency-Key": "de677d34-6722-51d1-86f2-9b8c4cd0d893"
     },
-    "corps": {
+    "body": {
      "schema": "ameesh-exec-op/1",
      "op": "mailbox.mark_delivered",
      "args": [
@@ -549,10 +549,10 @@
      "kwargs": {}
     }
    },
-   "reponse": {
-    "statut": 200,
-    "entetes": {},
-    "corps": {
+   "response": {
+    "status": 200,
+    "headers": {},
+    "body": {
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": 1,
