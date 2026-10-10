@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """agent-mesh — la CLI du mesh : observabilité, clés, approbations, lots.
 
-  agent-mesh list [--json]                     mesh list : agents, hôte, bail, non lus, budget
-                                                (statut préfixé « ext/ » : agent externe, L37)
+  agent-mesh list [--json]                     mesh list : agents, projet, hôte, bail, non lus,
+                                                budget, regroupés par projet (L62) ; statut
+                                                préfixé « ext/ » : agent externe (L37)
   agent-mesh show <agent> [--json]             détail d'un agent
   agent-mesh key generate --out DIR --i-am-the-owner   paire de clés (acte du propriétaire)
   agent-mesh key register <agent> --public-key FICHIER [--role owner|agent]
@@ -128,6 +129,11 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
         rows = registry.overview(db)
+        # L62 : le projet de chaque agent (équipe, à défaut chantier), en
+        # colonne et en clé JSON ajoutée ; le tableau est regroupé par projet
+        from .projects import agent_project, project_label
+        for row in rows:
+            row["project"] = agent_project(row)
         if args.json:
             # C4 : verdict de placement de chaque agent (0022)
             placement.annotate(db, rows)
@@ -148,9 +154,12 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         for lot in lots:
             if lot.get("assignee") and lot.get("state") not in work.TERMINAL:
                 open_by_agent[lot["assignee"]] = open_by_agent.get(lot["assignee"], 0) + 1
-        print("%-20s %-9s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
-            "NOM", "HARNAIS", "HÔTE", "STATUT", "BAIL", "NON LUS", "LOTS", "BUDGET", "CLÉ",
-            "VU"))
+        # regroupé par projet (tri stable : dans un projet, l'ordre de
+        # `overview`, vu le plus récemment d'abord) ; les sans-projet en dernier
+        rows.sort(key=lambda r: (r["project"] is None, r["project"] or ""))
+        print("%-20s %-12s %-9s %-10s %-11s %-22s %-8s %-5s %-13s %-4s %s" % (
+            "NOM", "PROJET", "HARNAIS", "HÔTE", "STATUT", "BAIL", "NON LUS", "LOTS", "BUDGET",
+            "CLÉ", "VU"))
         for row in rows:
             status = row.get("status") or "?"
             if row.get("status_text"):
@@ -158,8 +167,9 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             if row.get("mode") == "externe":
                 # L37 (0030) : session humaine, jamais réveillée par ameesh
                 status = "ext/" + status
-            print("%-20s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
-                row["name"][:20], (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
+            print("%-20s %-12s %-9s %-10s %-11s %-22s %-8d %-5d %-13s %-4s %s" % (
+                row["name"][:20], project_label(row["project"])[:12],
+                (row.get("harness") or "?")[:9], (row.get("host") or "")[:10],
                 status[:11], _lease(row), int(row.get("unread") or 0),
                 open_by_agent.get(row["name"], 0), _budget(row),
                 ("owner" if row.get("has_owner_key")

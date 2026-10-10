@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-10
+* **L62** : vue par projet, `ameesh projects` (schéma `ameesh-projects/1`) — agents, état et raison, lot en cours, non-lus, dépense 24 h, forfait ou token, lots ouverts sans agent, projets sans agent actif ; colonne PROJET dans `ameesh list` ; la même vue en tête de `ameesh progress`. Retour du propriétaire : on ne voyait pas quels projets étaient en cours ni qui travaillait sur quoi.
+
 ## 2026-10-09
 * **Bascule** : deepseek1 à 7 et l'orchestrateur Nexlink menés par l'exécuteur, un service par agent (`ameesh-runner-agent@<nom>`) ; plus aucune boucle v0.
 * **L48** (1.4.1) : échecs rapides de tour, attente doublée puis arrêt de l'agent.

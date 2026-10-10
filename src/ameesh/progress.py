@@ -9,6 +9,9 @@ lui-même** (transitions des lots `work_items`, actions sous porte, tours et
 baux du registre, marqueur comptable, grand livre `turn_costs`) — jamais par
 git ni par le board :
 
+* **projets** (L62, en tête) : la vue de `ameesh projects` — par projet,
+  ses agents, leur état, leur lot en cours, non-lus, dépense 24 h, forfait ou
+  token, et ses lots ouverts sans agent ;
 * **lots** : jalons datés demande → gel → verdict → fusion quand ils sont
   connus, état (actif, en revue, bloqué, approuvé, fusionné, fermé),
   blocages ; et (L29) ce que le lot attend et de qui (`waiting_for`), s'il
@@ -517,6 +520,9 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     except (OSError, ValueError):
         gauges = []
     hourly = getattr(cfg, "budget_usd_per_hour", None) or cost_mod.DEFAULT_HOURLY_USD
+    # L62 : la vue par projet en tête (une requête de plus, agrégée)
+    from . import projects as projects_mod
+    by_project = projects_mod.snapshot(db, project=project, now=now)
 
     return {
         "schema": SCHEMA,
@@ -526,6 +532,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         "host": getattr(cfg, "host", None),
         "project": project or None,
         "window": {"from_ts": _round(since_ts), "to_ts": _round(now)},
+        # L62 (champ ajouté) : projets, agents et lot en cours, lots sans agent
+        "projects": by_project["projects"],
         "lots": lots,
         "agents": agents,
         "milestones": plan["milestones"],
@@ -581,6 +589,15 @@ def format_text(snap: dict, width: int | None = None) -> str:
     line("avancement%s — %s (fenêtre %s)" % (
         " de %s" % snap["project"] if snap.get("project") else "",
         _hm(now, now), _duration(hours * 3600)))
+
+    if "projects" in snap:
+        # L62 : qui travaille sur quoi, avant le détail des lots
+        from . import projects as projects_mod
+        out.append("")
+        line("PROJETS (%d en cours)" % sum(1 for p in snap["projects"] if p["active"]))
+        out.extend(projects_mod.format_lines(
+            {"generated_ts": now, "projects": snap["projects"]}, width,
+            show_inactive=bool(snap.get("project")), indent="  "))
 
     out.append("")
     line("LOTS (%d)" % len(snap["lots"]))
