@@ -2024,7 +2024,10 @@ class AgentWorker(threading.Thread):
         Sans elle, un agent retenu restait `queued`, erreur vide, sans raison
         lisible. Le statut ne change pas ; seul le texte dit ce qui retient le
         tour, et seulement quand du travail attend. Fencé par le bail ; ne lève
-        jamais."""
+        jamais. Pas sur un exécuteur médié : `leases.hold_note` n'est pas au
+        contrat 1.1 (l'attente y reste muette, comme en 1.6.x)."""
+        if getattr(self.runner, "mediated", False):
+            return
         if not self._work_waiting():
             return
         texte = "en attente : pression de l'hôte %s — %s" % (self.runner.host, raisons)
@@ -2048,6 +2051,10 @@ class AgentWorker(threading.Thread):
         d'avant (« reprise : même session »…) revient."""
         texte = getattr(self, "_pressure_text", "")
         if not texte:
+            return
+        if getattr(self.runner, "mediated", False):
+            # `leases.release_hold` hors contrat 1.1 : sur un exécuteur médié,
+            # une pause critique n'est pas levée d'elle-même (comme avant L31b)
             return
         try:
             levee = registry.release_hold(self.db, self.name, self.runner.runner_id,

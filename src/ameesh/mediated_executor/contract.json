@@ -3631,7 +3631,7 @@
   }
  ],
  "refused": {
-  "interface_total": 243,
+  "interface_total": 245,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3793,6 +3793,8 @@
    ],
    "leases": [
     "attach_claim",
+    "hold_note",
+    "release_hold",
     "turn_in_progress"
    ],
    "mailbox": [

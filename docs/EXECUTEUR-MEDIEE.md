@@ -63,7 +63,7 @@ Comptes : 62 opérations, dont 24 lectures et 38 écritures. 52 passent par
 lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
 servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (243
+signature et les mêmes types. Il vérifie aussi que l'interface entière (245
 opérations depuis la 1.6.x) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -74,6 +74,12 @@ L96), `turn_costs.correct`, `ledger`, `spent_between` (grand livre, L95),
 `hosts.usage` et `turn_resources.get`. Un exécuteur médié ne fait ni ménage
 local ni passage périodique de ménage : son dossier de travail est effacé en
 fin de bail.
+
+Les deux opérations de L31b (`leases.hold_note`, `leases.release_hold` :
+l'attente de pression de l'hôte affichée dans `ameesh show`) sont refusées de
+même. Sur un exécuteur médié, l'attente de pression ne s'affiche pas, et une
+pause critique n'est pas levée d'elle-même quand la pression retombe,
+comme avant L31b.
 
 ## Requête et réponse
 
