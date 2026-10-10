@@ -303,6 +303,20 @@ class Leases(Domain):
         """Oublie la session, fencé par un bail valide."""
 
     @abc.abstractmethod
+    def hold_note(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
+        """Dit pourquoi un tour attend (L31b), sans changer le statut : le
+        texte de statut est posé sous un bail VIVANT détenu par `owner`/`epoch`,
+        seulement si l'agent est `idle` ou `queued`. Faux sinon."""
+
+    @abc.abstractmethod
+    def release_hold(self, name: str, owner: str, epoch: int, status_text: str,
+                     restore: str = "") -> bool:
+        """Lève une attente ou une pause de pression (L31b) : seulement si le
+        texte de statut est toujours `status_text` (personne ne l'a remplacé),
+        sous un bail vivant. Une pause (`blocked`) repasse `queued` ou `idle`
+        selon la consigne en attente ; le texte redevient `restore`."""
+
+    @abc.abstractmethod
     def pause(self, name: str, owner: str, epoch: int, status_text: str) -> bool:
         """Met l'agent en pause (`blocked`) sous un bail VIVANT détenu par
         `owner`/`epoch` (L31, 0028), et refuse un tour en cours ou un agent
