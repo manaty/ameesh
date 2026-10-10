@@ -110,8 +110,8 @@ class Operations(interface.Operations):
                    WHERE mb.recipient = r.name AND mb.delivered_at IS NULL) m ON true
               LEFT JOIN LATERAL (
                   SELECT w.title, w.state FROM work_items w
-                   WHERE r.session_work_item ~ '^[0-9]{1,18}$'
-                     AND w.id = r.session_work_item::bigint) sw ON true
+                   WHERE w.id = CASE WHEN r.session_work_item ~ '^[0-9]{1,18}$'
+                                     THEN r.session_work_item::bigint END) sw ON true
               LEFT JOIN LATERAL (
                   SELECT w.id, w.title, w.state FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
