@@ -449,7 +449,7 @@ class TurnCosts(Domain):
         (L60, migration 0041) : clé du marqueur comptable ; une ligne portant
         déjà cette clé n'est pas réécrite (faux). Vrai si la ligne est écrite.
         `source`, `executor`, `lease_owner`, `lease_epoch` (L111, migration
-        0111) : `relay` pour la mesure du relais de modèle, `device` pour la
+        0050) : `relay` pour la mesure du relais de modèle, `device` pour la
         déclaration d'un appareil médié (hors plafond) ; None = colonnes non
         écrites (`source` vaut alors `harness`)."""
 

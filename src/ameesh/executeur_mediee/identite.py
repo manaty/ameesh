@@ -5,7 +5,7 @@
   humain habilité (`ameesh host enroll`) ;
 * `DbIdentityProvider` : l'implémentation de `interfaces.IdentityProvider`
   (`enroll`, `issue_access_token`, `issue_session_token`, `revoke`,
-  `verify`) sur les tables de la migration 0110 ;
+  `verify`) sur les tables de la migration 0049 ;
 * `verify_token(db, token, *, kind=None) -> Principal` : la seule vue de
   l'identité dont L108 (serveur d'exécuteur) et L111 (relais de modèle) ont
   besoin. Lève `interfaces.AuthError` (`token_expired`, `token_invalid`,

@@ -58,7 +58,7 @@ class TurnCosts(interface.TurnCosts):
             # nommé — un hôte sans comptes déclarés n'en dépend pas.
             cols.append("account")
             values.append(account)
-        # L111 (migration 0111) : provenance et bail, écrits seulement quand
+        # L111 (migration 0050) : provenance et bail, écrits seulement quand
         # ils sont donnés (relais de modèle, déclaration d'un appareil médié).
         for column, value in (("source", source), ("executor", executor),
                               ("lease_owner", lease_owner), ("lease_epoch", lease_epoch)):

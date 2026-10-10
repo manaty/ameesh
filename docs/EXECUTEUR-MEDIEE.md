@@ -207,7 +207,7 @@ dépendance. Une écoute hors de la boucle locale exige TLS (`--tls-cert`,
 | `executeur_mediee/portee.py` | `HostScopeRules` : une règle par ligne de la table |
 | `executeur_mediee/flux.py` | `EventHub` : une écoute `LISTEN`, tampon, filtre par hôte |
 | `executeur_mediee/bouchon.py` | `StaticAuth`, jetons fixes, en attendant L110 |
-| `migrations/0047_executeur_mediee.sql` | `exec_idempotency`, `exec_host_availability`, `exec_audit` |
+| `migrations/0048_executeur_mediee.sql` | `exec_idempotency`, `exec_host_availability`, `exec_audit` |
 
 **Agents admis.** Un agent est admis s'il remplit toutes ces conditions :
 
@@ -434,7 +434,7 @@ illisible pour l'hôte, donc refusée (`host-occupant-unresolved`).
 
 ### Jamais d'approbation (0012)
 
-Les tables de L110 (migration 0110) ne référencent aucune table d'autorité.
+Les tables de L110 (migration 0049) ne référencent aucune table d'autorité.
 `Principal` ne porte aucun droit d'approbation. Le contrat refuse toutes les
 opérations `approvals`, `nonces`, `grants` et `authenticators`.
 `tests/test_l110_enrolement.py` le vérifie.

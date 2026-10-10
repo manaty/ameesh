@@ -210,7 +210,7 @@ class JamaisDApprobationTest(unittest.TestCase):
     def test_aucune_table_d_autorite_dans_le_code_l110(self):
         files = [os.path.join(SRC, "executeur_mediee", n)
                  for n in ("identite.py", "appareil.py", "jose.py")]
-        files.append(os.path.join(SRC, "migrations", "0110_identite_des_executeurs.sql"))
+        files.append(os.path.join(SRC, "migrations", "0049_identite_des_executeurs.sql"))
         for path in files:
             with open(path, encoding="utf-8") as fh:
                 text = fh.read()
