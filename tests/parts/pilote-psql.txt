@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Modules « pilote » : ceux que la CI d'une PR passe AUSSI avec le pilote psql
+# (L116). Le reste de la suite ne dépend pas du pilote : il tourne avec psycopg
+# sur la PR, et la suite psql complète tourne sur main, release/* et à la main
+# (workflow_dispatch). Un module ajouté ici doit exister (scripts/test-parts.py
+# refuse un nom inconnu).
+#
+# Règle : on liste les tests de la couche base (db.py), des migrations et du
+# stockage (ameesh.storage), et ceux qui exercent un comportement propre à un
+# pilote (connexion persistante, notifications, nombre d'allers-retours).
+
+# couche base : migrations sur un schéma neuf
+test_migrations
+# stockage : le catalogue en base, opérations du domaine (paramètres en liste)
+test_catalog_store
+# verrous et baux : comportement différent entre psql et psycopg
+test_registry_lease
+# allers-retours comptés par le pilote lui-même (AMEESH_DB_TRACE)
+test_l61_allers_retours
+# panne de base, reconnexion, réveils (listener)
+test_l72_panne_de_base
+# notifications : le listener psql persistant (le test force AMEESH_DRIVER=psql)
+test_events_attach
