@@ -70,8 +70,21 @@ os.environ["AMEESH_HARNESSES_DIR"] = EMPTY_HARNESS_DIR
 #: sous-processus. Les tests de tarif posent leur propre `AMEESH_PRICES`.
 EMPTY_PRICES = os.path.join(tempfile.mkdtemp(prefix="ameesh-test-prices-"), "absent.json")
 os.environ["AMEESH_PRICES"] = EMPTY_PRICES
+#: L73 : le /tmp du système vu par le ménage, vide et propre à la suite (le
+#: vrai /tmp de la machine n'est ni mesuré ni balayé par les tests)
+EMPTY_SYSTEM_TMP = tempfile.mkdtemp(prefix="ameesh-test-system-tmp-")
+os.environ["AMEESH_SYSTEM_TMP"] = EMPTY_SYSTEM_TMP
 #: les binaires réels du poste (variables de l'exécuteur) ne fuient pas dans les
 #: tests : le banc pose ses faux harnais par `AMEESH_BIN_DIR` ou explicitement
+#: L106 : ni les emplacements connus des harnais (mise, ~/.local/bin, npx), ni
+#: le PATH du gestionnaire systemd du poste : un test « binaire introuvable »
+#: ne doit pas trouver le vrai harnais du développeur. Et l'alimentation du
+#: poste (portable sur batterie) ne bloque pas les tours des tests : un dossier
+#: de sources d'alimentation vide (« inconnu »), les tests de L106 posent le leur.
+os.environ["AMEESH_HARNESS_SEARCH"] = ""
+os.environ["AMEESH_SYSTEMCTL"] = ""
+EMPTY_POWER_SUPPLY = tempfile.mkdtemp(prefix="ameesh-test-power-")
+os.environ["AMEESH_POWER_SUPPLY_DIR"] = EMPTY_POWER_SUPPLY
 for _bin_var in ("AMEESH_CLAUDE_BIN", "AGENT_MESH_CLAUDE_BIN", "AMEESH_CODEX_BIN",
                  "AGENT_MESH_CODEX_BIN", "AMEESH_DSH_BIN", "AGENT_MESH_DSH_BIN"):
     os.environ.pop(_bin_var, None)
@@ -122,6 +135,10 @@ def child_env(**extra: str) -> dict:
     # Les relevés de ressources de l'hôte réel (L31) ne fuient pas non plus :
     # les tests de pression posent eux-mêmes leur intervalle et leurs mesures.
     env["AMEESH_RESOURCE_INTERVAL"] = "0"
+    # Ni passage périodique du ménage (L73) ni /tmp réel : chaque test de
+    # ménage pose son intervalle et son dossier temporaire du système.
+    env["AMEESH_HOUSEKEEPING_INTERVAL"] = "0"
+    env["AMEESH_SYSTEM_TMP"] = EMPTY_SYSTEM_TMP
     # Aucun moteur de conteneurs réel pendant les tests (L31) : les tests de
     # rattachement injectent leur propre façade.
     env["AMEESH_CONTAINER_RUNTIME"] = "none"

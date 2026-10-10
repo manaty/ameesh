@@ -27,9 +27,29 @@ DEFAULT_TIMEOUT = 5.0
 LABELS_ENV = "AMEESH_CONTAINER_LABELS"
 
 
-def turn_labels(turn_id: str, agent: str) -> str:
-    """Les étiquettes d'un tour, au format `clé=valeur,clé=valeur`."""
-    return "ameesh.turn=%s,ameesh.agent=%s" % (turn_id, agent)
+def turn_labels(turn_id: str, agent: str, lot: str | None = None) -> str:
+    """Les étiquettes d'un tour, au format `clé=valeur,clé=valeur`.
+
+    L73 : `ameesh.lot=<lot>` quand le lot du tour est connu — le conteneur vit
+    alors jusqu'à la fin du lot (base de test réutilisée d'un tour à l'autre),
+    sinon jusqu'à la fin du tour."""
+    out = "ameesh.turn=%s,ameesh.agent=%s" % (turn_id, agent)
+    if lot:
+        out += ",ameesh.lot=%s" % lot
+    return out
+
+
+def parse_labels(value) -> dict:
+    """Étiquettes d'une ligne `ps` : mapping (podman) ou texte `k=v,k=v`
+    (docker)."""
+    if isinstance(value, dict):
+        return {str(k): str(v) for k, v in value.items()}
+    out: dict = {}
+    for part in str(value or "").split(","):
+        key, sep, val = part.partition("=")
+        if sep and key.strip():
+            out[key.strip()] = val.strip()
+    return out
 
 
 def runtime_binary(name: str = "") -> str | None:
@@ -87,6 +107,59 @@ class Runtime:
             self._labels[turn_id] = self._ids("ameesh.turn=%s" % turn_id)
         return list(self._labels[turn_id])
 
+    def list_all(self) -> list[dict] | None:
+        """Tous les conteneurs EN COURS (L73, lecture seule) : `id`, `name`,
+        `image`, `created`, `labels` ; None si le moteur ne répond pas."""
+        argv = [self.binary, "ps", "--no-trunc", "--format", "{{json .}}"]
+        try:
+            proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if getattr(proc, "returncode", 1) != 0:
+            return None
+        import json
+        out: list[dict] = []
+        text = (proc.stdout or "").strip()
+        rows: list = []
+        if text.startswith("["):        # podman ancien : un tableau JSON
+            try:
+                rows = json.loads(text)
+            except ValueError:
+                rows = []
+        else:
+            for line in text.splitlines():
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            names = row.get("Names") or row.get("Name") or ""
+            if isinstance(names, list):
+                names = ",".join(str(n) for n in names)
+            out.append({
+                "id": str(row.get("ID") or row.get("Id") or ""),
+                "name": str(names),
+                "image": str(row.get("Image") or ""),
+                "created": str(row.get("CreatedAt") or row.get("Created") or ""),
+                "status": str(row.get("Status") or row.get("State") or ""),
+                "labels": parse_labels(row.get("Labels")),
+            })
+        return out
+
+    def remove(self, ident: str) -> tuple[bool, str]:
+        """`rm -f -v <id>` (L73) : réservé aux conteneurs ÉTIQUETÉS par un tour
+        d'ameesh (l'appelant le vérifie) ; les volumes anonymes partent avec."""
+        argv = [self.binary, "rm", "-f", "-v", ident]
+        try:
+            proc = self.run(argv, capture_output=True, text=True, timeout=self.timeout * 6)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, str(exc)
+        if getattr(proc, "returncode", 1) != 0:
+            return False, (getattr(proc, "stderr", "") or "refusé").strip()[:300]
+        return True, ""
+
     def running_for_agent(self, agent: str) -> list[str]:
         """Identifiants des conteneurs étiquetés par un agent (repli, lecture
         seule : l'âge et l'absence de connexion se lisent ensuite sur place)."""
@@ -99,3 +172,74 @@ def running_for_turn(cfg, turn_id: str) -> list[str]:
     """Raccourci : les conteneurs d'un tour, vide si aucun moteur configuré."""
     runtime = Runtime.from_config(cfg)
     return runtime.running_for_turn(turn_id) if runtime is not None else []
+
+
+# --------------------------------------------------------------------------
+# L73 : étiquetage automatique (`docker run` / `create` d'un tour)
+# --------------------------------------------------------------------------
+
+#: script posé devant le vrai binaire dans le PATH d'un tour : il ajoute les
+#: étiquettes du tour (`AMEESH_CONTAINER_LABELS`) à `run` et `create` (et
+#: `container run|create`), et transmet tout le reste tel quel au vrai binaire
+#: (`AMEESH_REAL_DOCKER` / `AMEESH_REAL_PODMAN`). Un conteneur lancé par
+#: l'API (bibliothèque, compose) n'est pas étiqueté : il reste signalé.
+SHIM = r"""#!/bin/sh
+# Posé par ameesh (L73) : étiquette les conteneurs lancés par un tour.
+case "${0##*/}" in
+  docker) real="$AMEESH_REAL_DOCKER" ;;
+  podman) real="$AMEESH_REAL_PODMAN" ;;
+  *) real="" ;;
+esac
+if [ -z "$real" ] || [ ! -x "$real" ]; then
+  echo "ameesh : moteur de conteneurs introuvable (${0##*/})" >&2
+  exit 127
+fi
+if [ "$1" = run ] || [ "$1" = create ]; then
+  pre="$1"; shift
+elif [ "$1" = container ] && { [ "$2" = run ] || [ "$2" = create ]; }; then
+  pre="$1 $2"; shift 2
+else
+  exec "$real" "$@"
+fi
+if [ -n "$AMEESH_CONTAINER_LABELS" ]; then
+  old_ifs=$IFS; IFS=,; set -f
+  rev=""
+  for l in $AMEESH_CONTAINER_LABELS; do rev="$l,$rev"; done
+  for l in $rev; do set -- --label "$l" "$@"; done
+  IFS=$old_ifs; set +f
+fi
+exec "$real" $pre "$@"
+"""
+
+
+def install_shims(directory: str, path_env: str) -> dict:
+    """Écrit les scripts d'étiquetage dans `directory` pour les moteurs
+    présents dans `path_env` ; rend les variables à poser (PATH, binaires
+    réels), vide si aucun moteur."""
+    import os
+    found = {}
+    for name in CANDIDATES:
+        real = shutil.which(name, path=path_env)
+        if real and os.path.dirname(os.path.realpath(real)) != os.path.realpath(directory):
+            found[name] = real
+    if not found:
+        return {}
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    for name in found:
+        target = os.path.join(directory, name)
+        current = None
+        try:
+            with open(target, encoding="utf-8") as fh:
+                current = fh.read()
+        except OSError:
+            pass
+        if current != SHIM:
+            tmp = target + ".tmp-%d" % os.getpid()
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(SHIM)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, target)
+    env = {"PATH": directory + os.pathsep + path_env}
+    for name, real in found.items():
+        env["AMEESH_REAL_%s" % name.upper()] = real
+    return env

@@ -23,7 +23,7 @@
   agent-mail hook <claude|codex|deepseek>        hook : lit le JSON sur stdin, livre les non-lus
   agent-mail statusline                          barre d'état Claude Code : [chantier/nom] travail · dossier
   agent-mail migrate                             applique les migrations versionnées
-  agent-mail doctor [--notify-test | --probe]    diagnostic : pilote, schéma, migrations, LISTEN/NOTIFY
+  agent-mail doctor [--notify-test | --probe | --harness]  diagnostic : pilote, schéma, migrations, LISTEN/NOTIFY ; harnais de l'hôte (L106)
                                                  (--probe : sonde légère de conteneur)
 
 Identité d'une session : $AGENT_MAIL_NAME (le runner la pose pour le harnais
@@ -446,12 +446,16 @@ class _Remise:
         self.msgs: list[dict] = []
         self.ouverte = False
 
-    def prendre(self) -> list[dict]:
+    def prendre(self, limite: int | None = None) -> list[dict]:
+        """Réserve les non-lus ; au plus `limite` (L105 : borne du tour)."""
         if not self.pg:
             self.msgs = self.bk.unread(self.name)
+            if limite is not None:
+                self.msgs = self.msgs[:max(0, limite)]
             return self.msgs
         rows = mail.reserve(self.bk.db, self.name, self.owner, self.epoch, self.jeton,
-                            porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL)
+                            porteur="hook", ttl_seconds=mail.HOOK_RESERVATION_TTL,
+                            limit=200 if limite is None else max(1, limite))
         self.ouverte = bool(rows)
         self.msgs = [mail.normalize(row) for row in rows]
         return self.msgs
@@ -474,6 +478,64 @@ class _Remise:
                 mail.release(self.bk.db, self.name, self.jeton, self._ids())
             except Exception:  # la réservation expirera d'elle-même
                 pass
+
+
+# --------------------------------------------------------------------------
+# courrier borné pendant un tour (L105)
+# --------------------------------------------------------------------------
+
+def avis_borne(attente: int, borne: int) -> str:
+    """Ce que le hook dit à l'agent quand la borne du tour est atteinte."""
+    return ("[ameesh] %d message(s) en attente restent pour ton tour suivant : au plus "
+            "%d message(s) te sont remis pendant un même tour. Conclus ce tour : "
+            "termine l'étape en cours, puis rends la main ; l'exécuteur te remettra "
+            "la suite au tour suivant." % (attente, borne))
+
+
+def tour_path(cfg: Config, name: str) -> str:
+    """État du courrier remis par le hook pendant le tour en cours (L105)."""
+    return os.path.join(cfg.state_dir, "hooks", name + ".tour.json")
+
+
+def tour_lit(cfg: Config, name: str, turn: str) -> dict:
+    """Compteur du tour `turn` ; un autre tour (ou rien de lisible) : zéro."""
+    try:
+        with open(tour_path(cfg, name), encoding="utf-8") as fh:
+            etat = json.load(fh)
+        if isinstance(etat, dict) and etat.get("turn") == turn:
+            return {"turn": turn, "remis": int(etat.get("remis") or 0),
+                    "attente": int(etat.get("attente") or 0),
+                    "signale": bool(etat.get("signale"))}
+    except (OSError, ValueError, TypeError):
+        pass
+    return {"turn": turn, "remis": 0, "attente": 0, "signale": False}
+
+
+def _tour_ecrit(cfg: Config, name: str, etat: dict) -> None:
+    path = tour_path(cfg, name)
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        tmp = "%s.%d" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(etat, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _attente(bk, name: str, hors: list[dict]) -> int:
+    """Non-lus restants, hors des messages de cette remise."""
+    ids = {m.get("id") for m in hors if m.get("id") is not None}
+    fichiers = {m.get("_file") for m in hors if m.get("_file")}
+
+    def reste(m: dict) -> bool:
+        if m.get("id") is not None:
+            return m["id"] not in ids
+        return m.get("_file") not in fichiers
+    try:
+        return sum(1 for m in bk.unread(name) if reste(m))
+    except Exception:
+        return 0
 
 
 def _register_stamp(cfg: Config, name: str) -> str:
@@ -570,9 +632,34 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             return 0
         if event == "UserPromptSubmit":
             bk.stop_counter(name, reset=True)
+        # L105 : pendant un tour mené par l'exécuteur, au plus `turn_mail_max`
+        # messages remis ; au-delà, rien n'est réservé (ils restent pour le
+        # tour suivant), le Stop n'est plus bloqué, et l'agent est invité à
+        # conclure son tour.
+        tour = os.environ.get("AMEESH_TURN_ID") or ""
+        borne = cfg.turn_mail_max if (tour and binding.bound_to_lease) else 0
+        etat = tour_lit(cfg, name, tour) if borne else None
+        if etat is not None and etat["remis"] >= borne:
+            if event == "Stop":
+                return 0
+            attente = _attente(bk, name, [])
+            etat["attente"] = attente
+            if attente and not etat["signale"] and _emit({
+                    "hookSpecificOutput": {"hookEventName": event,
+                                           "additionalContext": avis_borne(attente, borne)}}):
+                etat["signale"] = True
+            _tour_ecrit(cfg, name, etat)
+            return 0
         remise = _Remise(bk, name, binding)
         try:
-            msgs = remise.prendre()
+            msgs = remise.prendre(borne - etat["remis"] if etat is not None else None)
+            avis = ""
+            if etat is not None and msgs and etat["remis"] + len(msgs) >= borne:
+                attente = _attente(bk, name, msgs)
+                etat["attente"] = attente
+                if attente:
+                    avis = "\n\n" + avis_borne(attente, borne)
+                    etat["signale"] = True
             if event == "Stop":
                 if not msgs:
                     bk.stop_counter(name, reset=True)
@@ -584,9 +671,12 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 # Écrire d'abord : si le harnais a fermé son entrée, on ne
                 # consomme pas les messages pour autant.
                 if not _emit({"decision": "block",
-                              "reason": render(msgs, verdicts_for(bk, msgs))}):
+                              "reason": render(msgs, verdicts_for(bk, msgs)) + avis}):
                     return 0
                 remise.solder()
+                if etat is not None:
+                    etat["remis"] += len(msgs)
+                    _tour_ecrit(cfg, name, etat)
                 bk.stop_counter(name, bump=True)
                 return 0
             if not msgs:
@@ -594,11 +684,14 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             if not _emit({
                 "hookSpecificOutput": {
                     "hookEventName": event,
-                    "additionalContext": render(msgs, verdicts_for(bk, msgs)),
+                    "additionalContext": render(msgs, verdicts_for(bk, msgs)) + avis,
                 }
             }):
                 return 0
             remise.solder()
+            if etat is not None:
+                etat["remis"] += len(msgs)
+                _tour_ecrit(cfg, name, etat)
         finally:
             remise.abandonner()
     except Exception:
@@ -855,9 +948,22 @@ def driver_warnings(driver: str, remote: bool) -> list[str]:
     ]
 
 
-def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False) -> int:
+def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
+               harness: bool = False) -> int:
     if probe:
         return cmd_probe(cfg)
+    if harness:
+        # L106 : binaires des harnais et unités d'exécuteur de l'hôte
+        from . import hostcheck
+        try:
+            db = db_mod.connect(cfg)
+        except db_mod.Unavailable as exc:
+            print("base       : injoignable (%s) — harnais vérifiés sans les agents" % exc)
+            return hostcheck.cmd_harness(cfg)
+        try:
+            return hostcheck.cmd_harness(cfg, db)
+        finally:
+            db.close()
     print("dsn        : %s" % config_mod.mask_dsn(cfg.dsn))
     print("schéma     : %s" % cfg.schema)
     print("hôte       : %s" % cfg.host)
@@ -908,6 +1014,14 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False) -> int:
     unread = storage.of(db).mailbox.unread_total()
     print("agents     : %d" % agents)
     print("non lus    : %d" % unread)
+    # L106 : un agent mené sans unité d'exécuteur ne repart pas après une
+    # coupure de l'hôte (signalé, sans changer le verdict)
+    from . import hostcheck
+    try:
+        for line in hostcheck.missing_runner_lines(cfg, db):
+            print(line)
+    except db_mod.DbError:
+        pass
     verdict = 0
     if notify_test:
         channel = "ameesh_doctor"
@@ -955,7 +1069,7 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_migrate(cfg)
         if command == "doctor":
             return cmd_doctor(cfg, notify_test="--notify-test" in rest,
-                              probe="--probe" in rest)
+                              probe="--probe" in rest, harness="--harness" in rest)
         if command == "statusline":
             return cmd_statusline(cfg)
         if command == "alias":

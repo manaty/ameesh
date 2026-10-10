@@ -39,11 +39,17 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_INTERRUPT_SENDERS` | `interrupt_senders` | — | senders whose `--urgent` messages interrupt a turn |
 | `AMEESH_SESSION_MAX_TOKENS` | `session_max_tokens` | 150000 | rotate the session above this size |
 | `AMEESH_SESSION_MAX_TURN_SECONDS` | `session_max_turn_seconds` | 900 | rotate after a turn longer than this |
-| `AMEESH_CONTEXT_MAX_TOKENS` | `context_max_tokens` | 15000000 | rotate the session before the next turn when the last turn re-read more input tokens (cache included) than this; per agent: `ameesh set <agent> context_max_tokens=…`; 0 = off |
+| `AMEESH_CONTEXT_MAX_TOKENS` | `context_max_tokens` | 15000000 | close the turn at the next safe point and rotate the session when the turn re-reads more input tokens (cache included) than this; per agent: `ameesh set <agent> context_max_tokens=…`; 0 = off |
+| `AMEESH_TURN_MAX_SECONDS` | `turn_max_seconds` | 1800 | close a turn that runs longer at the next safe point (end of the running tool call); work resumes next turn, same session; per agent: `ameesh set <agent> turn_max_seconds=…`; 0 = no limit |
+| `AMEESH_TURN_MAIL_MAX` | `turn_mail_max` | 5 | messages the mail hook delivers during one runner-led turn; the rest wait for the next turn and the agent is asked to wrap up; per agent: `ameesh set <agent> turn_mail_max=…`; 0 = no bound |
 | `AMEESH_SESSION_MIN_TURNS` | `session_min_turns` | 3 | minimum turns before a rotation |
 | `AMEESH_FAST_FAILURE_S` | `fast_failure_s` | 60 s | a failed turn shorter than this counts as a fast failure (1.4.1) |
 | `AMEESH_FAILURE_BACKOFF_MAX` | `failure_backoff_max` | 300 s | wait between failed turns doubles from 5 s up to this |
-| `AMEESH_MAX_FAST_FAILURES` | `max_fast_failures` | 5 | consecutive fast failures after which the runner stops the agent (`stop_reason` `erreur`) |
+| `AMEESH_MAX_FAST_FAILURES` | `max_fast_failures` | 5 | consecutive fast failures after which the runner stops the agent (`stop_reason` `erreur`); host errors (harness or interpreter not found, database unreachable, missing working directory) never count |
+| `AMEESH_<HARNESS>_BIN` | `harness_bins` | — | harness binary (`{"claude": "/path"}` in the file); then `AMEESH_BIN_DIR`, `PATH`, the systemd user manager `PATH`, known locations (mise, `~/.local/bin`, npx cache) |
+| `AMEESH_HARNESS_SEARCH` | — | known locations | directories searched after `PATH` (`:`-separated, globs allowed); empty disables every fallback |
+| `AMEESH_HOST_RETRY_MAX` | `host_retry_max` | 300 s | "host not ready": the wait between two attempts doubles from 15 s up to this; the agent resumes by itself |
+| `AMEESH_POWER_STOP_GRACE` | `power_stop_grace` | 120 s | on critical battery, time left to running turns before a clean stop |
 | `AMEESH_WORKTREE_ROOTS` | `worktree_roots` | `~/development` | where to look for a moved working directory |
 | `AMEESH_BUDGET_USD_PER_HOUR` | `budget_usd_per_hour` | 10 | hourly cap of pay-per-token usage, summed over all pay-per-token agents; it pauses only those agents, never a subscription agent (0 disables the guard) |
 | `AMEESH_BUDGET_CHECK_INTERVAL` | `budget_check_interval` | 30 s | cadence of budget status updates |
@@ -59,6 +65,8 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_FORGE_HOSTS` | `forge_hosts` | `github.com` | forge hosts `gh api --hostname` can query (comma-separated) |
 | `AMEESH_VISIBILITY_TTL`, `AMEESH_VISIBILITY_TIMEOUT` | `visibility_ttl`, `visibility_timeout` | 300 s, 10 s | cache duration and timeout of the visibility check |
 | `AMEESH_ALERT_LONG_TURN`, `_IDLE_MAIL`, `_DEAD_GRACE`, `_SESSION_TOKENS`, `_STALE_LOT`, `_ORPHAN_LOT`, `_DELEGATION_GRACE`, `_INTERVAL` | — | see `ameesh alerts` | alert thresholds (also used by `ameesh notify`) |
+| `AMEESH_ALERT_PLAN_TAIL`, `_PLAN_USED`, `_PLAN_PACE_GAP`, `_IDLE_CAPACITY`, `_ORCHESTRATOR_HELD`, `_ORCHESTRATORS`, `_HOST_UNDERUSED`, `_HOST_UNDERUSED_LOAD`, `_HOST_UNDERUSED_TURNS` | 86400, 50, 25, 1800, 1800, —, 3600, 0.25, 1 | see `ameesh alerts` | underuse alert thresholds (L94); 0 disables |
+| `AMEESH_ALERT_BALANCE_HOURS`, `_BALANCE_MIN`, `_BALANCE_WINDOW` | 48, 20, 21600 | see `ameesh alerts` | `balance_low`: runway at the real spend rate (from balance readings), USD floor, averaging window (L94) |
 | `AMEESH_PRICES` | — | built-in defaults | price table (JSON) |
 | `AMEESH_<HARNESS>_BIN`, `AMEESH_BIN_DIR` | — | `PATH` | harness binaries (`CLAUDE`, `CODEX`, `DSH`) |
 

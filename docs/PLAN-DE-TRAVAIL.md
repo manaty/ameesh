@@ -26,6 +26,9 @@ team: acme-web               # facultatif
 scope: ["src/catalogue/recherche/**"]   # globs de fichiers, facultatif
 status: draft                # déclaratif, facultatif (cycle de la fiche, pas l'avancement)
 id: cat-recherche            # facultatif : par défaut le nom du fichier sans .md
+start: 2026-10-12            # L96, facultatifs : début, fin, livraison prévus (AAAA-MM-JJ)
+end: 2026-10-16
+delivery: 2026-10-19         # un jalon peut écrire `date:` (alias de delivery)
 ```
 
 Règles vérifiées par `ameesh canon check` :
@@ -39,6 +42,7 @@ Règles vérifiées par `ameesh canon check` :
 | `package-responsible-missing` / `-unresolved` | erreur | responsable absent, ou qui ne résout pas vers un Member humain unique |
 | `package-duplicate`, `package-id-invalid` | erreur | identifiant en double ou hors grammaire (`[A-Za-z0-9][A-Za-z0-9._-]*`, 64 car.) |
 | `package-lot-orphan` | avertissement | lot sans parent |
+| `package-date-invalid` | avertissement | (L96) `start`, `end`, `delivery` ou `date` illisible (attendu `AAAA-MM-JJ`) : la date est ignorée, la fiche reste lue |
 
 Une erreur du plan **ne bloque aucun agent** (elle n'entre pas dans la
 condition de réclamation) ; elle figure au diagnostic du canon.
@@ -160,3 +164,38 @@ Champs **ajoutés** au schéma `ameesh-progress/1` (voir [PROGRESS.md](PROGRESS.
 `milestone`), `stale_after_s`, et par lot `package`, `epic`, `pr_ref`,
 `closed`, `waiting_for`, `last_activity_ts`, `stale`. Le texte et la page
 montrent l'attente, la stagnation et la section EPICS.
+
+## Feuille de route : dates prévues et engagements (L96)
+
+Le plan dit **quoi** ; la feuille de route dit **pour quand**, et compare au
+réel. Migration 0044.
+
+* **Dates prévues** d'une tâche (`ameesh work plan <id> --debut J --fin J
+  --livraison J --source S`) et d'une fiche (`ameesh work plan <fiche> …`,
+  qui prime sur les dates du canon ci-dessus). La replanification n'est pas
+  une activité de la tâche.
+* **Engagements datés** (`ameesh plan add "…" --pour J --projet P --source
+  S [--lot N] [--depend-de REF]`) et **jalons de décision** (`--decision`) ;
+  `plan accept | done | cancel`. Un engagement rattaché à une tâche est tenu
+  à sa livraison.
+* **Propositions** (`ameesh plan propose [--from docs/design/decisions]
+  [--record]`) : tirées des fiches `Decision` (question ouverte → jalon de
+  décision ; « pour le 2026-10-20 », « on fera ça lundi » → engagement ;
+  « lots L97–L104 », « même vague que L95 » → élément et dépendances) et du
+  corps des tâches ouvertes. À valider : rien n'est créé sans `--record`,
+  rien n'est daté sans `plan accept`.
+* **Gantt** : `ameesh plan show [--json]` et la section `roadmap` de `ameesh
+  progress` (affichée par défaut, `--no-gantt` pour la retirer) — epics et
+  jalons (prévu de la fiche, réel de leurs tâches), tâches (prévu face aux
+  jalons réels génériques : demandée, en cours, soumise, verdict, livrée),
+  engagements, décisions attendues, ligne du jour, retards, source de chaque
+  élément ; plus « qui avance sur quoi ».
+* **Alerte** `engagement_overdue` (poussée par `ameesh notify`) : un
+  engagement ou une date prévue passé sans que l'élément soit atteint.
+
+Le suivi de projet est au **cœur générique** : le code de la feuille de
+route ne nomme aucun état ni jalon de métier ; la correspondance avec le
+cycle actuel des lots tient dans `roadmap_dev.CORRESPONDANCES`, que le futur
+module « développement » reprendra. Détail, schéma `ameesh-roadmap/1` et
+consigne des orchestrateurs : [EXPLOITATION.md](EXPLOITATION.md), « Feuille
+de route ».

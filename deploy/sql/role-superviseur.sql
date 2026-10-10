@@ -66,6 +66,7 @@
 --       actions.args, .last_note
 --       action_events.note
 --       work_items.body
+--       commitments.note (L96)
 --       work_item_events.note
 --       work_item_milestones.note
 --       mesh_approvals.meta (et mesh_approvals_status)
@@ -174,6 +175,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'session_account',
         -- L60 (0041) : plafond de contexte (un nombre, pas de contenu)
         'context_max_tokens',
+        -- L105 (0046) : plafonds du tour (des nombres, pas de contenu)
+        'turn_max_seconds', 'turn_mail_max',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
         'canon'
     ]),
@@ -253,11 +256,25 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- d'un tour, jamais un contenu
     ('host_resources', ARRAY[
         'id', 'host', 'sampled_at', 'mem_available_bytes', 'swap_used_bytes',
-        'load1', 'cpu_count', 'disk_free_bytes', 'disk_path', 'turns_in_progress'
+        'load1', 'cpu_count', 'disk_free_bytes', 'disk_path', 'turns_in_progress',
+        -- L73 : occupation du /tmp du système
+        'tmp_path', 'tmp_fstype', 'tmp_size_bytes', 'tmp_used_bytes',
+        -- L106 (0047) : alimentation de l'hôte
+        'on_ac', 'battery_percent'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',
         'started_at', 'ended_at', 'status'
+    ]),
+    -- ménage (L73, 0045) : journal (chemins, tailles, commandes proposées)
+    -- et worktrees suivis ; de l'état d'exécution, jamais un contenu
+    ('housekeeping_log', ARRAY[
+        'id', 'host', 'at', 'actor', 'kind', 'action', 'path', 'bytes', 'agent',
+        'lot', 'detail', 'data'
+    ]),
+    ('managed_worktrees', ARRAY[
+        'id', 'host', 'path', 'repo', 'agent', 'lot', 'turn_id', 'branch', 'head',
+        'created_at', 'status', 'detail', 'checked_at', 'ended_at'
     ]),
     -- verdict de la règle de visibilité (L31, 0029) : état, jamais de secret
     ('visibility_checks', ARRAY[
@@ -271,8 +288,16 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'recorded_at', 'account',
         -- L60 (0041) : clé du marqueur comptable (agent, index, instant)
         'spend_key',
+        -- L95 (0043) : raison d'une ligne écartée des sommes
+        'void_reason',
         -- L111 (0050) : provenance (harness, relay, device) et bail
         'source', 'executor', 'lease_owner', 'lease_epoch'
+    ]),
+    -- corrections du grand livre (L95, 0043) : copie d'une ligne de
+    -- turn_costs et valeurs écrites, de l'ÉTAT comptable, aucun contenu
+    ('turn_cost_corrections', ARRAY[
+        'id', 'run_id', 'turn_cost_id', 'kind', 'reason', 'old_row', 'new_values',
+        'actor', 'at'
     ]),
     -- exécuteurs médiés (voie B : 0048, 0049) : de l'ÉTAT, jamais une
     -- empreinte de jeton ou de code, ni une réponse rejouable
@@ -319,6 +344,13 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     -- plafonds de budget du mesh (L70, 0042) et leur journal : de l'ÉTAT
     -- (montants, acteur), aucun contenu
+    -- feuille de route (L96, 0044) : engagements datés, de l'ÉTAT (quoi, pour
+    -- quand, porteur, source) ; la note libre est un CONTENU
+    ('commitments', ARRAY[
+        'id', 'what', 'due_on', 'kind', 'status', 'owner', 'project', 'work_item_id',
+        'package_id', 'source_kind', 'source_ref', 'depends_on', 'created_by',
+        'created_at', 'updated_at', 'closed_at', 'proposal_key'
+    ]),
     ('budget_limits', ARRAY[
         'scope', 'window_s', 'usd', 'set_by', 'updated_at'
     ]),
@@ -343,7 +375,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'created_at', 'updated_at', 'closed_at',
         'package_id', 'package_parent', 'pr_ref', 'close_reason', 'superseded_by',
         -- L40 (0031) : délégation à échéance en cours (pas de contenu)
-        'delegated_by', 'delegated_at', 'due_at'
+        'delegated_by', 'delegated_at', 'due_at',
+        -- L96 (0044) : dates prévues
+        'planned_start', 'planned_end', 'planned_delivery', 'planned_source',
+        'planned_by', 'planned_at'
     ]),
     -- L40 (0031) : registre des délégations et de leur issue (de l'ÉTAT)
     ('work_item_delegations', ARRAY[
@@ -355,7 +390,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'kind', 'title', 'parent', 'responsible', 'team', 'scope', 'status',
         'canon_ref', 'present', 'synced_at',
         -- L42 (0032) : canon déclarant
-        'canon'
+        'canon',
+        -- L96 (0044) : dates du canon et dates posées dans ameesh
+        'start_on', 'end_on', 'delivery_on', 'planned_start', 'planned_end',
+        'planned_delivery', 'planned_source', 'planned_by', 'planned_at'
     ]);
 
 \ir _contrat-superviseur.sql

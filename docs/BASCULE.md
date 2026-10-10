@@ -415,7 +415,10 @@ Description=ameesh — exécuteur de l'hôte (un par machine)
 After=network-online.target
 
 [Service]
-EnvironmentFile=%h/.config/ameesh/env        # AMEESH_HOST, AMEESH_CANON, AMEESH_APPROVE_*
+# L106 : PATH explicite — l'unité peut démarrer avant que la session n'importe
+# le sien (shims et installations mise, node pour dsh)
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/ameesh/env        # AMEESH_HOST, AMEESH_CANON, AMEESH_APPROVE_* (PATH=… possible)
 ExecStartPre=-%h/.local/share/ameesh/venv/bin/ameesh canon sync --fetch
 ExecStart=%h/.local/share/ameesh/venv/bin/agent-runner --poll 5
 Restart=always
@@ -428,6 +431,19 @@ WantedBy=default.target
 ```bash
 systemctl --user daemon-reload && systemctl --user enable --now agent-runner
 journalctl --user -u agent-runner -f
+ameesh doctor --harness     # L106 : binaires résolus (chemin, provenance), unités manquantes
+```
+
+**Un exécuteur par agent** (la forme retenue sur le poste) : le modèle
+`deploy/systemd/ameesh-runner-agent@.service` (même PATH explicite), une
+instance par agent mené — **y compris un agent tenu en `ameesh attach`** :
+si la session interactive meurt, c'est son exécuteur qui reprend la même
+session (L106). `ameesh doctor` signale un agent mené sans unité activée.
+
+```bash
+install -m 0644 'deploy/systemd/ameesh-runner-agent@.service' ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ameesh-runner-agent@<agent>
 ```
 
 Après chaque PR fusionnée au canon : `ameesh canon sync --fetch` sur chaque
@@ -1061,6 +1077,138 @@ version installée.
   Restaurer une sauvegarde de l'étape 2 (`pg_restore --clean`, exécuteurs
   arrêtés) n'est utile qu'en cas de données abîmées. Ce retour perd tout ce
   qui a été écrit depuis.
+
+## Mise à jour vers 1.6.0
+
+La 1.6.0 réunit L73 (ménage automatique), L94 (sous-utilisation et
+`balance_low`), L95 (budget juste, `ameesh cost correct`), L96 (feuille de
+route, `ameesh plan`, `ameesh work plan`), L105 (plafonds en cours de tour)
+et L106 (coupure de l'hôte). Elle apporte cinq migrations, qui suivent 0042 :
+
+| Migration | Lot | Contenu |
+|---|---|---|
+| **0043** `grand_livre_corrige` | L95 | `turn_costs.void_reason`, table `turn_cost_corrections` (journal append-only) |
+| **0044** `feuille_de_route` | L96 | dates prévues de `work_items` et `work_packages`, table `commitments`, index du fil par expéditeur |
+| **0045** `menage` | L73 | colonnes du `/tmp` dans `host_resources`, tables `managed_worktrees` et `housekeeping_log` |
+| **0046** `plafonds_du_tour` | L105 | `agent_registry.turn_max_seconds`, `turn_mail_max` |
+| **0047** `alimentation_hote` | L106 | `host_resources.on_ac`, `battery_percent` (développée sous le numéro 0106) |
+
+**Comme pour L60–L74, rien ne casse l'ancien code** : des colonnes
+nullables ou avec défaut, et des tables neuves. Un exécuteur 1.5.x tourne
+sans erreur sur une base migrée. **L'inverse est faux** : un exécuteur 1.6.0
+écrit les colonnes de 0045 et 0047 à chaque relevé de l'hôte, et lit celles
+de 0046 à chaque tour. On migre donc **avant** de redémarrer, jamais après.
+
+Les scripts sont ceux de L60–L74, dans le même ordre ; seul le contrôle des
+migrations de `vm.sh redemarrer` change (0041 à 0047).
+
+1. **Poste** : `poste.sh verifier`, `sauvegarder`, `installer [REF]`.
+2. **Migrations** : `poste.sh migrer` applique 0043 à 0047 sur la base du
+   mesh, une seule fois, puis sur l'ancienne base. Contrôle :
+   `ameesh doctor` ne signale plus de migration manquante.
+3. **Rôle superviseur** : `poste.sh role` réapplique
+   `deploy/sql/role-superviseur.sql` sur chaque base où le rôle existe. Le
+   contrat lit désormais `turn_costs.void_reason` et `turn_cost_corrections`
+   (0043), les dates prévues et `commitments` sans sa note (0044),
+   `managed_worktrees`, `housekeeping_log` et les colonnes du `/tmp` (0045),
+   les plafonds du tour (0046) et l'alimentation de l'hôte (0047).
+   `commitments.note` est un contenu : il n'est lu qu'avec
+   `role-superviseur-contenus.sql`, appliqué à part, sur décision. Sans
+   cette étape, un superviseur échoue sur les nouvelles colonnes, sans rien
+   casser d'autre.
+4. **Arrêter l'agent fantôme `orchestrator`**, avant le redémarrage. Ce nom
+   est inscrit au registre sans exécuteur qui le mène. Après la mise à jour,
+   `ameesh doctor` le signalerait comme agent mené sans unité (L106), et les
+   alertes de vivacité et de sous-utilisation le compteraient :
+
+   ```bash
+   ameesh show orchestrator            # vérifier : aucun tour, aucun lot ouvert
+   agent-runner stop orchestrator      # raison d'arrêt `manuel`, jamais relancé seul
+   ```
+
+   Un lot encore assigné à `orchestrator` est réassigné d'abord
+   (`ameesh work assign <lot> <agent>`).
+5. **Drop-in PATH pour l'exécuteur de l'ancienne base.** Les unités
+   `ameesh-runner-agent@` et `ameesh-notify` du dépôt portent un PATH
+   explicite depuis L106 : au démarrage de l'hôte, elles partent avant que
+   la session n'importe le sien (harnais introuvable, `node` absent pour
+   `dsh`). L'unité de l'ancienne base (celle de `UNITES_RESTE`) a été écrite
+   à la main, sans ce PATH. On lui ajoute un drop-in, sans réécrire l'unité :
+
+   ```bash
+   u=<unité de l'ancienne base>        # ex. ameesh-runner-<base>
+   mkdir -p ~/.config/systemd/user/$u.service.d
+   cat > ~/.config/systemd/user/$u.service.d/path.conf <<'INI'
+   [Service]
+   Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
+   INI
+   systemctl --user daemon-reload
+   systemctl --user show $u -p Environment    # le PATH y figure
+   ```
+
+   Le redémarrage de l'étape suivante le prend en compte.
+6. **Redémarrage des exécuteurs** : `poste.sh redemarrer` (un par un, hors
+   tour, puis `ameesh-notify`, puis l'ancienne base), puis, depuis le poste,
+   `vm.sh installer [REF]` et `vm.sh redemarrer`, qui refuse tant que 0041 à
+   0047 ne sont pas toutes passées.
+7. **Contrôle** : `poste.sh controler`, `vm.sh controler`, puis sur chaque
+   hôte :
+
+   ```bash
+   ameesh doctor --harness     # binaires des harnais résolus, chemin et provenance
+   ameesh doctor               # aucun agent mené sans unité d'exécuteur activée
+   ameesh hosts                # /tmp et alimentation dans le relevé
+   ameesh alerts
+   ```
+
+   `doctor --harness` doit trouver chaque harnais **par le PATH de l'unité**
+   ou ses emplacements connus, pas par celui d'un terminal ouvert.
+
+**Ce que verra l'exploitation après le redémarrage.**
+
+* **L105** : un tour d'agent mené est clos au point sûr après 30 min
+  (`AMEESH_TURN_MAX_SECONDS`), et le hook de courrier remet au plus
+  5 messages par tour (`AMEESH_TURN_MAIL_MAX`). Les tours longs habituels
+  seront coupés et reprendront au tour suivant, dans la même session. Par
+  agent : `ameesh set <agent> turn_max_seconds=… turn_mail_max=…` (0 =
+  sans borne).
+* **L73** : les tours reçoivent un `TMPDIR` par agent et par session, sous
+  `<état>/.menage/tmp`. Les worktrees créés pendant un tour sont retirés à
+  la fin de leur lot s'ils sont propres et poussés. `ameesh menage` est en
+  essai par défaut ; rien hors des dossiers marqués n'est supprimé.
+* **L94** : de nouvelles alertes (`plan_underused`, `idle_capacity`,
+  `orchestrator_held`, `host_underused`, `balance_low`), poussées par
+  `ameesh notify` par défaut. Une première vague est attendue.
+* **L95** : la page d'avancement sépare la dépense payée au token de la
+  valeur consommée sur les forfaits. `ameesh cost correct` est un essai en
+  lecture seule ; `--apply` corrige le grand livre en une transaction,
+  après relecture de l'essai.
+* **L96** : le Gantt en tête de `ameesh progress`, les engagements datés
+  (`ameesh plan`) et l'alerte `engagement_overdue`.
+* **L106** : un hôte qui n'est pas prêt (harnais introuvable, base
+  injoignable) met ses agents en « hôte non prêt » sans les arrêter
+  (`host_not_ready`). Sur batterie, plus de nouveau tour sous 25 %, arrêt
+  propre sous 10 % (`host_power_low`).
+
+**Retour arrière** : comme pour L60–L74 (`poste.sh retour`, `vm.sh
+retour`). La base reste migrée : l'ancien code ignore les colonnes et les
+tables de 0043 à 0047. Les corrections de `ameesh cost correct --apply`
+restent écrites ; l'ancien code ne lit pas `void_reason` et recompte donc les
+lignes écartées.
+
+## Mise à jour vers 1.6.2
+
+La 1.6.2 apporte L117 (amendement de 0034) : sans migration, un simple
+redémarrage des exécuteurs. **Ce que verra l'exploitation** : la prochaine
+nouvelle session d'un agent au forfait ira au compte le plus en retard sur
+son rythme, en premier à un compte jamais utilisé. Une bascule
+(`account_switches`, type `bascule`) est donc attendue vers le secondaire,
+puis le tertiaire, journalisée avec sa raison (« sans relevé : 0 % utilisé,
+le plus en retard sur son rythme ; avant : … »). Les sessions en cours
+restent sur leur compte tant qu'il est sous son seuil. Vérifier, avant la
+mise à jour, que les identifiants des comptes jamais utilisés sont présents
+(`ameesh accounts list`, état `ok`) : c'est la première fois qu'ils serviront.
+Retour arrière : l'ancien code, sans autre geste.
 
 ---
 

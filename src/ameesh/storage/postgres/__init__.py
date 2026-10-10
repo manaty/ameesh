@@ -21,11 +21,13 @@ from .costs import TurnCosts
 from .grants import Grants
 from .hosts import Hosts, TurnResources, Visibility
 from .mailbox import Mailbox
+from .menage import Housekeeping
 from .operations import Operations
 from .packages import WorkPackages
 from .placement import Placements
 from .progress import Progress
 from .projects import Projects
+from .roadmap import Roadmap
 from .registry import Agents, Leases, PendingSpend
 from .session_bindings import SessionBindings
 from .threads import Threads
@@ -64,8 +66,10 @@ class PostgresStorage(interface.Storage):
         self.placements = Placements(db)
         self.progress = Progress(db)
         self.projects = Projects(db)
+        self.roadmap = Roadmap(db)
         self.operations = Operations(db)
         self.hosts = Hosts(db)
         self.turn_resources = TurnResources(db)
         self.visibility = Visibility(db)
+        self.housekeeping = Housekeeping(db)
         self.session_bindings = SessionBindings(db)

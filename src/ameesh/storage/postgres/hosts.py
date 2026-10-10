@@ -32,7 +32,8 @@ def _array(values) -> str | None:
 READING_COLUMNS = (
     "id, host, extract(epoch from sampled_at)::float8 AS sampled_ts, "
     "mem_available_bytes, swap_used_bytes, load1, cpu_count, disk_free_bytes, "
-    "disk_path, turns_in_progress"
+    "disk_path, turns_in_progress, tmp_path, tmp_fstype, tmp_size_bytes, tmp_used_bytes, "
+    "on_ac, battery_percent"
 )
 
 #: colonnes d'une ressource de tour
@@ -50,13 +51,18 @@ class Hosts(interface.HostResources):
             """
             INSERT INTO host_resources
                 (host, mem_available_bytes, swap_used_bytes, load1, cpu_count,
-                 disk_free_bytes, disk_path, turns_in_progress)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                 disk_free_bytes, disk_path, turns_in_progress,
+                 tmp_path, tmp_fstype, tmp_size_bytes, tmp_used_bytes,
+                 on_ac, battery_percent)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING """ + READING_COLUMNS,
             (reading.get("host") or "", reading.get("mem_available_bytes"),
              reading.get("swap_used_bytes"), reading.get("load1"),
              reading.get("cpu_count"), reading.get("disk_free_bytes"),
-             reading.get("disk_path"), reading.get("turns_in_progress")),
+             reading.get("disk_path"), reading.get("turns_in_progress"),
+             reading.get("tmp_path"), reading.get("tmp_fstype"),
+             reading.get("tmp_size_bytes"), reading.get("tmp_used_bytes"),
+             reading.get("on_ac"), reading.get("battery_percent")),
         )
         # Historique court : au-delà de sept jours, la ligne n'a plus d'usage
         # et la table ne doit pas grandir sans fin.
@@ -87,6 +93,21 @@ class Hosts(interface.HostResources):
             "SELECT DISTINCT ON (host) " + READING_COLUMNS + " FROM host_resources"
             + where + " ORDER BY host, sampled_at DESC, id DESC", tuple(params))
         return rows
+
+    def usage(self, host, since_s) -> dict:
+        rows = self.db.query(
+            """
+            SELECT count(*)::int AS samples,
+                   extract(epoch from min(sampled_at))::float8 AS first_ts,
+                   extract(epoch from max(sampled_at))::float8 AS last_ts,
+                   max(load1 / nullif(cpu_count, 0))::float8 AS max_load_per_cpu,
+                   avg(load1 / nullif(cpu_count, 0))::float8 AS avg_load_per_cpu,
+                   max(turns_in_progress)::int AS max_turns,
+                   avg(turns_in_progress)::float8 AS avg_turns
+              FROM host_resources
+             WHERE host = %s AND sampled_at >= now() - make_interval(secs => %s)
+            """, (host, float(since_s)))
+        return rows[0] if rows else {"samples": 0}
 
     def turns_in_progress(self, host) -> int:
         rows = self.db.query(
@@ -130,6 +151,12 @@ class TurnResources(interface.TurnResources):
             " WHERE turn_id = %s AND status <> 'done' RETURNING id",
             (_array(containers), turn_id),
         )
+
+    def get(self, turn_id) -> dict | None:
+        rows = self.db.query(
+            "SELECT " + TURN_COLUMNS + " FROM turn_resources WHERE turn_id = %s",
+            (turn_id,))
+        return rows[0] if rows else None
 
     def open_by_agent(self, agent) -> list[dict]:
         return self.db.query(

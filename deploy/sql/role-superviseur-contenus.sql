@@ -72,6 +72,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('work_item_milestones', ARRAY[
         'note'
     ]),
+    ('commitments', ARRAY[
+        'note'
+    ]),
     ('work_items', ARRAY[
         'body'
     ]);

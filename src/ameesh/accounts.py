@@ -53,11 +53,14 @@ redevient éligible au premier relevé au-dessus (solde rechargé).
    que celui-ci est sous son seuil — pas de changement en cours de session
    pour un gain marginal ;
 3. sinon (ouverture ou rotation de session, ou compte de la session au
-   seuil) : parmi les comptes **utilisables** (profil valide, sous le seuil),
-   celui dont la **capacité inutilisée expire le plus tôt** (`expiry` : la
-   remise à zéro la plus proche parmi ses fenêtres en cours) ; un compte sans
-   fenêtre en cours (relevé échu, non daté ou absent) passe après ; à
-   égalité, l'ordre déclaré ;
+   seuil) : parmi les comptes **utilisables** (profil valide, sous le seuil
+   dans toutes leurs fenêtres), celui qui a **le plus de retard sur son
+   rythme** (`lag` : le plus petit rapport utilisé / autorisé à cet instant,
+   `used_at / pace_cap`, pris sur sa fenêtre la plus contraignante — L117,
+   amendement de 0034 du 2026-10-10) ; un compte sans fenêtre ouverte ou sans
+   relevé compte pour 0 % utilisé, donc passe en premier ; à égalité, la
+   capacité inutilisée qui **expire le plus tôt** (`expiry`, la règle 0034 du
+   matin), puis l'ordre déclaré ;
 4. sinon pause : tous les comptes sont au seuil.
 
 Le seuil est celui de la garde (0019, inchangé) : `min(90 %, part écoulée +
@@ -68,14 +71,15 @@ de compte qui précède chaque tour ; Codex : les journaux de session du
 0 % (`Gauge.used_at`, L71) : un compte sans relevé récent est essayé, pas
 écarté — son premier tour rapporte sa jauge.
 
-Chaque choix porte sa raison (`Choice.why`, « five_hour expire dans 52 min,
-0 % utilisé »), journalisée par l'exécuteur (`account_turn.choose`).
+Chaque choix porte sa raison (`Choice.why`, « sans relevé : 0 % utilisé, le
+plus en retard sur son rythme ; avant : primaire seven_day 35 % utilisé
+(rythme 55 %) »), journalisée par l'exécuteur (`account_turn.choose`).
 
 La ligne `account_active` garde le **dernier compte choisi** pour une
 nouvelle session (et le forçage) ; elle change en base par
 comparer-et-changer (`storage.accounts`) : deux workers qui font le même
 choix n'écrivent qu'une bascule. Les retenues (`account_holds`) de 0027 §3 ne
-sont plus posées : le choix par échéance les remplace.
+sont plus posées : le choix par retard sur le rythme les remplace.
 """
 from __future__ import annotations
 
@@ -280,6 +284,16 @@ def parse(raw) -> dict[str, list[Profile]]:
 def profiles(cfg, harness: str) -> list[Profile]:
     """Les comptes déclarés pour ce harnais (liste vide : aucun, comportement d'avant L30)."""
     return parse(getattr(cfg, "accounts", None) or {}).get(harness, [])
+
+
+def homes(cfg, harness: str) -> list[str]:
+    """L95 : les dossiers de configuration des comptes déclarés du harnais
+    (où vivent leurs journaux de session) ; vide sans comptes ou si la
+    configuration est invalide — jamais une erreur pour un lecteur."""
+    try:
+        return [p.home() for p in profiles(cfg, harness) if p.kind == "config_dir"]
+    except (AccountError, OSError):
+        return []
 
 
 def by_name(items: list[Profile], name: str | None) -> Profile | None:
@@ -589,32 +603,70 @@ def expiry(gauges, now: float) -> tuple | None:
     return best
 
 
+def lag(gauges, now: float) -> tuple[float, object | None]:
+    """Le retard du compte sur son rythme (L117, amendement 0034 du 2026-10-10) :
+    `(rapport, jauge)` de sa fenêtre **la plus contraignante**, où le rapport
+    est l'utilisé valable à `now` sur l'autorisé à cet instant de la fenêtre
+    (`used_at / pace_cap`, le même plafond que la garde 0019). Plus il est
+    petit, plus le compte est en retard. Un compte sans jauge, ou dont toutes
+    les fenêtres sont échues, vaut 0 : il passe en premier.
+
+    La fenêtre la plus contraignante plutôt que la plus longue : c'est la
+    distance réelle du compte à la garde (qui l'écarte dès qu'UNE fenêtre
+    atteint 1), comme 0034 §1 le retenait déjà ; quand la fenêtre de 7 jours
+    est la plus en avance — le cas où un forfait hebdomadaire se perd — c'est
+    elle qui décide, et une session neuve n'est pas envoyée sur un compte dont
+    la fenêtre de 5 h est presque au seuil.
+    """
+    best: tuple[float, object | None] = (0.0, None)
+    for gauge in gauges:
+        cap = gauge.pace_cap(now)
+        ratio = gauge.used_at(now) / cap if cap > 0 else 1.0
+        if best[1] is None or ratio > best[0]:
+            best = (ratio, gauge)
+    return best
+
+
 def explain(result: Evaluation, now: float) -> str:
-    """La raison lisible d'un choix par échéance : « five_hour expire dans
-    52 min, 0 % utilisé »."""
-    found = expiry(result.gauges, now)
-    if found is not None:
-        resets_at, _unused, gauge = found
-        return "%s expire dans %s, %.0f %% utilisé" % (
-            gauge.key, duration(resets_at - now), gauge.used_at(now) * 100)
-    if any(g.reset_passed(now) for g in result.gauges):
-        return "relevé échu (fenêtre remise à zéro : 0 %), essayé"
-    if result.gauges:
-        return "jauges non datées, sous le seuil"
-    return "sans jauge de forfait, sous le seuil"
+    """Le retard d'un compte sur son rythme, lisible : « seven_day 35 %
+    utilisé (rythme 55 %) », « sans relevé : 0 % utilisé »."""
+    _ratio, gauge = lag(result.gauges, now)
+    if gauge is None:
+        return "sans relevé : 0 % utilisé"
+    if all(g.reset_passed(now) for g in result.gauges):
+        return "relevé échu (fenêtre remise à zéro) : 0 % utilisé"
+    if not gauge.resets_at:
+        return "%s %.0f %% utilisé (jauge non datée, rythme %.0f %%)" % (
+            gauge.key, gauge.used_at(now) * 100, gauge.pace_cap(now) * 100)
+    return "%s %.0f %% utilisé (rythme %.0f %%)" % (
+        gauge.key, gauge.used_at(now) * 100, gauge.pace_cap(now) * 100)
 
 
 def rank(items: list[Profile], evaluations: dict, now: float) -> list[Profile]:
-    """Les comptes utilisables, du premier à consommer au dernier (0034 §1).
+    """Les comptes utilisables, du premier à consommer au dernier (0034 amendée).
 
-    Clé : l'échéance de la capacité inutilisée (la plus proche d'abord ; sans
+    Clé : le retard sur le rythme (`lag`, le plus petit rapport d'abord), puis
+    l'échéance de la capacité inutilisée (la plus proche d'abord ; sans
     fenêtre en cours, après), puis l'ordre déclaré."""
     def key(pair):
         index, profile = pair
-        found = expiry(evaluations[profile.name].gauges, now)
-        return (found[0] if found is not None else float("inf"), index)
+        gauges = evaluations[profile.name].gauges
+        found = expiry(gauges, now)
+        return (round(lag(gauges, now)[0], 6),
+                found[0] if found is not None else float("inf"), index)
     usable = [(i, p) for i, p in enumerate(items) if evaluations[p.name].ok]
     return [p for _i, p in sorted(usable, key=key)]
+
+
+def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
+    """La raison du choix d'une nouvelle session (journal, `accounts list`) :
+    « sans relevé : 0 % utilisé, le plus en retard sur son rythme ; avant :
+    primaire seven_day 35 % utilisé (rythme 55 %) »."""
+    why = "%s, le plus en retard sur son rythme" % explain(evaluations[ranked[0].name], now)
+    if len(ranked) > 1:
+        why += " ; avant : %s" % ", ".join(
+            "%s %s" % (p.name, explain(evaluations[p.name], now)) for p in ranked[1:])
+    return why
 
 
 def choose(db, host: str, harness: str, items: list[Profile], book, *,
@@ -678,16 +730,13 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                       why="continuité : la session reste sur %s, sous son seuil" % own.name)
     for profile in items:
         ev(profile)
-    # 3. le compte dont la capacité inutilisée expire le plus tôt
+    # 3. le compte le plus en retard sur son rythme (amendement 0034, L117)
     ranked = rank(items, cache, now)
     if not ranked:
         return Choice(None, active, reason="tous les comptes %s au seuil — %s"
                       % (harness, _label(cache)))
     target = ranked[0]
-    why = explain(cache[target.name], now)
-    if len(ranked) > 1:
-        why += " (avant %s)" % ", ".join(
-            "%s : %s" % (p.name, explain(cache[p.name], now)) for p in ranked[1:])
+    why = reason_of(ranked, cache, now)
     left = own if own is not None else (active if target.name != active.name else None)
     if left is not None and not cache[left.name].ok:
         why = "%s au seuil (%s) ; %s" % (left.name, cache[left.name].reason, why)
@@ -811,7 +860,7 @@ def _forecast(rows: list[dict], items: list[Profile], now: float) -> None:
     """L74 (0034 §5) : pour chaque compte, la capacité **perdue** à la prochaine
     remise à zéro de chaque fenêtre en cours si rien ne change (`losses`), son
     échéance (`expires_in_s`), et le compte que prendrait une nouvelle session
-    (`next`, avec sa raison `why`)."""
+    (`next`, avec sa raison `why`, la même que celle du choix — L117)."""
     evaluations = {}
     for row, profile in zip(rows, items):
         result = Evaluation(profile, reason=row["reason"], gauges=row["_gauges"])
@@ -822,12 +871,15 @@ def _forecast(rows: list[dict], items: list[Profile], now: float) -> None:
         found = expiry(row["_gauges"], now)
         row["expires_in_s"] = (found[0] - now) if found is not None else None
         row["next"] = False
-        row["why"] = explain(result, now) if row["ok"] else ""
+        row["why"] = ""
     ranked = rank(items, evaluations, now)
     forced = [row for row in rows if row["forced"]]
     target = forced[0]["account"] if forced else (ranked[0].name if ranked else None)
     for row in rows:
         row["next"] = row["account"] == target and row["ok"]
+        if row["next"]:
+            row["why"] = ("forcé (ameesh accounts use)" if forced
+                          else reason_of(ranked, evaluations, now))
 
 
 def format_rows(rows: list[dict]) -> str:

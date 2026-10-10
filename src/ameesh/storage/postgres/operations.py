@@ -75,9 +75,11 @@ class Operations(interface.Operations):
         return self.db.query(
             """
             SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.effort, r.tier,
-                   r.session_policy, r.context_max_tokens, r.session_id, r.session_work_item,
+                   r.session_policy, r.context_max_tokens, r.turn_max_seconds, r.turn_mail_max,
+                   r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
+                   r.last_error,  -- L106 : le détail de « hôte non prêt »
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,
                    (r.lease_owner IS NOT NULL
                     AND r.lease_expires_at > clock_timestamp()) AS lease_live,
@@ -108,8 +110,8 @@ class Operations(interface.Operations):
                    WHERE mb.recipient = r.name AND mb.delivered_at IS NULL) m ON true
               LEFT JOIN LATERAL (
                   SELECT w.title, w.state FROM work_items w
-                   WHERE r.session_work_item ~ '^[0-9]{1,18}$'
-                     AND w.id = r.session_work_item::bigint) sw ON true
+                   WHERE w.id = CASE WHEN r.session_work_item ~ '^[0-9]{1,18}$'
+                                     THEN r.session_work_item::bigint END) sw ON true
               LEFT JOIN LATERAL (
                   SELECT w.id, w.title, w.state FROM work_items w
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
@@ -308,7 +310,8 @@ class Operations(interface.Operations):
         sql = ("SELECT id, agent, harness, turn, model, session, usd::float8 AS usd,"
                " input_tokens, cached_input_tokens, output_tokens,"
                " extract(epoch from recorded_at)::float8 AS recorded_ts"
-               " FROM turn_costs WHERE recorded_at >= now() - make_interval(secs => %s)")
+               " FROM turn_costs WHERE recorded_at >= now() - make_interval(secs => %s)"
+               " AND void_reason IS NULL")
         params: list = [float(since_s)]
         if agent:
             sql += " AND agent = %s"
@@ -361,6 +364,37 @@ class Operations(interface.Operations):
             params.append(account)
         sql += " ORDER BY observed_at, id"
         return _sans_compte_nul(self.db.query(sql, tuple(params)))
+
+    def latest_gauges(self, *, since_s) -> list[dict]:
+        return self.db.query(
+            """
+            SELECT DISTINCT ON (harness, account, gauge_key)
+                   harness, gauge_key AS key, used,
+                   extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,
+                   extract(epoch from observed_at)::float8 AS observed_ts, account
+              FROM quota_gauge_readings
+             WHERE observed_at >= now() - make_interval(secs => %s)
+             ORDER BY harness, account, gauge_key, observed_at DESC, id DESC
+            """,
+            (float(since_s),))
+
+    def assigners(self, *, since_s) -> list[str]:
+        rows = self.db.query(
+            """
+            SELECT DISTINCT who FROM (
+                SELECT d.delegated_by AS who FROM work_item_delegations d
+                 WHERE d.delegated_at >= now() - make_interval(secs => %s)
+                UNION ALL
+                SELECT e.actor FROM work_item_events e
+                  JOIN work_items w ON w.id = e.work_item_id
+                 WHERE e.created_at >= now() - make_interval(secs => %s)
+                   AND e.note LIKE %s
+                   AND e.actor <> ''
+                   AND e.actor IS DISTINCT FROM w.assignee
+            ) a WHERE coalesce(who, '') <> '' ORDER BY who
+            """,
+            (float(since_s), float(since_s), "assigné à %"))
+        return [row["who"] for row in rows]
 
     # -- soldes --------------------------------------------------------------
     def record_balance(self, *, provider, currency, total, granted, topped_up,
