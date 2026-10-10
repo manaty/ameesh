@@ -160,6 +160,18 @@ class Gauge:
         """
         return bool(self.resets_at) and now >= float(self.resets_at)
 
+    def expiring(self, now: float) -> tuple[float, float] | None:
+        """(échéance, capacité inutilisée) de la fenêtre en cours, ou None (L74).
+
+        La capacité inutilisée (`1 − utilisé`, part de la fenêtre) est perdue à
+        la remise à zéro `resets_at` si rien ne la consomme d'ici là (0034).
+        None : fenêtre non datée, ou échue (la suivante ne court qu'au premier
+        usage : rien n'expire).
+        """
+        if not self.resets_at or self.reset_passed(now):
+            return None
+        return float(self.resets_at), max(0.0, 1.0 - float(self.used or 0.0))
+
 
 @dataclass(frozen=True)
 class TurnUsage:

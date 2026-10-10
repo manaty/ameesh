@@ -1434,11 +1434,11 @@ def build_parser() -> argparse.ArgumentParser:
     pa_list.add_argument("--json", action="store_true")
     pa_list.add_argument("--last", type=int, default=5, help="dernières bascules montrées")
     pa_list.set_defaults(func=cmd_accounts)
-    pa_use = acc_sub.add_parser("use", help="forcer un compte (plus de bascule automatique)")
+    pa_use = acc_sub.add_parser("use", help="forcer un compte (plus de choix automatique)")
     pa_use.add_argument("harness")
     pa_use.add_argument("account")
     pa_use.set_defaults(func=cmd_accounts)
-    pa_auto = acc_sub.add_parser("auto", help="rendre la main à la bascule automatique")
+    pa_auto = acc_sub.add_parser("auto", help="rendre la main au choix automatique (0034)")
     pa_auto.add_argument("harness", nargs="?", default=None,
                          help="harnais (défaut : tous ceux qui ont des comptes)")
     pa_auto.set_defaults(func=cmd_accounts)
@@ -1591,7 +1591,7 @@ def cmd_accounts(cfg: Config, args) -> int:
                       "de l'hôte)" % args.harness, file=sys.stderr)
                 return 1
             accounts_mod.force(db, cfg.host, args.harness, items, args.account, by=qui)
-            texte = ("Compte %s forcé pour %s sur %s par %s : plus de bascule automatique "
+            texte = ("Compte %s forcé pour %s sur %s par %s : plus de choix automatique "
                      "jusqu'à « ameesh accounts auto »." % (args.account, args.harness,
                                                             cfg.host, qui))
             fil.record(cfg, db, sender=qui, recipients=[], text=texte,
@@ -1606,7 +1606,7 @@ def cmd_accounts(cfg: Config, args) -> int:
                     print("aucun compte déclaré pour %s" % nom, file=sys.stderr)
                     return 1
                 if accounts_mod.automatic(db, cfg.host, nom, by=qui):
-                    texte = ("Comptes %s sur %s : retour en bascule automatique (%s)."
+                    texte = ("Comptes %s sur %s : retour au choix automatique (%s)."
                              % (nom, cfg.host, qui))
                     fil.record(cfg, db, sender=qui, recipients=[], text=texte,
                                meta={"action": "compte", "type": "auto", "harnais": nom,

@@ -1,5 +1,9 @@
 # Journal de la conception
 
+## 2026-10-10 (comptes au forfait)
+* **Décision** : [consommer d'abord ce qui expire](decisions/0034-consommer-d-abord-ce-qui-expire.md), qui amende 0027 ; lot L74.
+* **L74** : comptes au forfait en réservoir — choix par échéance de la capacité inutilisée sous le seuil de rythme, continuité de session, relevé échu à 0 % (même règle que L71), choix journalisés avec leur raison, capacité perdue à la remise à zéro dans `ameesh accounts list`.
+
 ## 2026-10-10
 * **L60** : rotation de session DeepSeek et plafond de contexte qui agit. Les tours DeepSeek étaient inscrits sans session ni modèle, et leur usage par étape ignoré : jamais de rotation sur la taille, 2,34 milliards de jetons relus en 24 h. Au-delà de 15 M jetons relus au dernier tour (`context_max_tokens`, migration 0041), la session est tournée avec résumé de reprise. Le modèle du tour DeepSeek est connu (défaut du descripteur passé au harnais) : fin du barème `pro` appliqué par prudence, qui gonflait l'estimation d'un facteur 12,7 face au solde. Ligne du grand livre clé par son marqueur comptable : plus de doublon quand un exécuteur s'arrête entre l'écriture et l'effacement.
 

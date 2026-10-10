@@ -1,10 +1,30 @@
-# Comptes multiples par fournisseur (L30)
+# Comptes multiples par fournisseur (L30, L74)
 
-Quand le compte actif d'un harnais atteint le seuil de la garde de budget
-(`min(90 %, part écoulée + 10 points)`, décision 0019), les tours suivants
-passent au compte suivant de la liste au lieu de mettre les agents en pause ;
-ils reviennent au primaire dès que sa fenêtre est remise à zéro (décision
-0027). Jamais au milieu d'un tour. Étude :
+Les comptes au forfait d'un fournisseur forment un **réservoir**, pas une
+liste de secours (décision
+[0034](design/decisions/0034-consommer-d-abord-ce-qui-expire.md), qui amende
+[0027](design/decisions/0027-bascule-automatique-entre-comptes.md)) : un
+forfait non consommé avant sa remise à zéro est perdu. Avant chaque tour, le
+compte est choisi ainsi :
+
+1. **Forçage** (`ameesh accounts use`) : ce compte, ou pause s'il est au
+   seuil. `ameesh accounts auto` rend la main à la règle.
+2. **Continuité** : une session en cours reste sur son compte tant que
+   celui-ci est sous son seuil — pas de changement en cours de session pour un
+   gain marginal.
+3. Sinon (ouverture de session, rotation, ou compte de la session au seuil) :
+   parmi les comptes **utilisables** (profil valide, sous le seuil de la garde
+   `min(90 %, part écoulée + 10 points)`, décision 0019), celui dont **la
+   capacité inutilisée expire le plus tôt** : la remise à zéro la plus proche
+   parmi ses fenêtres en cours (5 h, 7 jours…). Un compte sans fenêtre en
+   cours (relevé échu, non daté, ou aucun relevé) n'a rien qui expire : il
+   passe après. À égalité, l'ordre déclaré.
+4. Tous les comptes au seuil : pause.
+
+Un relevé dont la fenêtre est échue (`resets_at` passé) compte pour **0 %**
+(même règle que L71) : un compte resté à 93 % sur une fenêtre close n'est plus
+écarté, il est essayé, et son premier tour rapporte sa jauge. Les jauges sont
+relues à chaque choix. Jamais au milieu d'un tour. Étude :
 [docs/design/etudes/comptes-multiples.md](design/etudes/comptes-multiples.md).
 
 Le respect des conditions d'utilisation de chaque fournisseur pour l'usage de
@@ -74,7 +94,8 @@ dans le canon :
 }
 ```
 
-* L'ordre est la priorité : le premier est le primaire.
+* L'ordre départage les égalités d'échéance (et les comptes sans jauge
+  datée, comme les clés d'API) : le premier est le primaire.
 * `config_dir` sans `path` : le dossier que le harnais prendrait de lui-même
   dans l'environnement de l'exécuteur (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`
   hérités s'ils sont posés, sinon `~/.claude` / `~/.codex`). Ses jauges Codex
@@ -103,13 +124,30 @@ dans le canon :
 ## 3. Suivre et forcer
 
 ```sh
-ameesh accounts list [--json]          # comptes, actif, état, jauges, dernières bascules
-ameesh accounts use claude secondaire  # forçage manuel (plus de bascule automatique)
-ameesh accounts auto [claude]          # retour en automatique
+ameesh accounts list [--json]          # comptes, dernier choix, état, jauges, pertes, bascules
+ameesh accounts use claude secondaire  # forçage manuel (plus de choix automatique)
+ameesh accounts auto [claude]          # retour au choix automatique (0034)
 ameesh cost report                     # dépense par agent, compte actif, jauges par compte
 ameesh cost gauges                     # historique des jauges, par compte
 ameesh cost balance --record           # soldes, par compte de clé d'API
 ```
+
+`ameesh accounts list` montre, pour chaque compte, la capacité **perdue à la
+prochaine remise à zéro** de chaque fenêtre en cours si rien ne change, et le
+compte que prendrait une nouvelle session, avec sa raison :
+
+```
+harnais   compte         actif   état     jauges
+codex     primaire       oui     ok       codex-300min 10% (rythme 50%), codex-10080min 20% (rythme 53%)
+                                          ↳ perdu à la remise à zéro si rien ne change : codex-300min 90 % dans 3 h, codex-10080min 80 % dans 4 j
+codex     secondaire             ok       codex-300min 0% (rythme 90%), codex-10080min 5% (rythme 24%)
+                                          ↳ perdu à la remise à zéro si rien ne change : codex-300min 100 % dans 52 min, codex-10080min 95 % dans 6 j
+                                          ↳ prochain choix pour une nouvelle session : codex-300min expire dans 52 min, 0 % utilisé (avant primaire : …)
+```
+
+La colonne « actif » est le **dernier compte choisi** pour une nouvelle
+session (ligne `account_active`) : des agents dont la session est ouverte sur
+un autre compte y restent tant qu'il est sous son seuil.
 
 `accounts list` et `cost report` sont des lectures : ils n'écrivent aucun
 relevé de jauge (L71) ; le relevé revient aux exécuteurs, avant chaque tour,
@@ -119,11 +157,20 @@ d'une fenêtre close n'est plus jugé au seuil (il ne servait pas, donc son
 relevé n'était jamais rafraîchi). L'affichage garde le dernier relevé :
 « codex-300min 0% (rythme 90%, remise à zéro passée, dernier relevé 93%) ».
 
-Chaque bascule est journalisée en base (`account_switches`), dans le journal
-de l'exécuteur et dans le fil de l'équipe de l'agent qui l'a déclenchée. Une
+Chaque choix de compte est journalisé avec sa raison dans le journal de
+l'exécuteur (`[agent] compte codex : secondaire — codex-300min expire dans
+52 min, 0 % utilisé (avant primaire : …)`, ou `— continuité : la session reste
+sur primaire, sous son seuil`), une fois par changement de choix et non à
+chaque sondage. Chaque changement du dernier choix est journalisé en base
+(`account_switches`, type `bascule`, avec la même raison) et dans le fil de
+l'équipe de l'agent qui l'a déclenché. Les retenues jusqu'à la remise à zéro
+(`account_holds`) et les « retours au primaire » de 0027 §3 ne sont plus
+posés : le choix par échéance les remplace. Une
 session reprise sous l'autre compte, ou tournée avec résumé, est dite dans le
-fil. Tous les comptes au seuil : l'agent passe en pause (`blocked`, « tous
-les comptes … au seuil »), comme avant L30.
+fil. Codex n'est jamais portable : un changement de compte d'une session
+Codex passe toujours par la rotation avec résumé (0027 §5), c'est pourquoi il
+n'a lieu qu'au seuil. Tous les comptes au seuil : l'agent passe en pause
+(`blocked`, « tous les comptes … au seuil »), comme avant L30.
 
 Le compte d'origine de la session courante est enregistré
 (`agent_registry.session_account`, L39) : l'exécuteur l'écrit avec l'id de

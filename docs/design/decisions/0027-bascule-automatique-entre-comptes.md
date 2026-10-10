@@ -3,6 +3,7 @@ type: Decision
 title: "Bascule automatique vers un compte secondaire, retour au primaire après la remise à zéro"
 description: "Pour chaque fournisseur, une liste ordonnée de comptes ; quand le compte actif approche sa limite, les tours suivants passent au compte suivant, et reviennent au primaire dès que sa fenêtre est remise à zéro."
 status: stable
+amended_by: ["0034-consommer-d-abord-ce-qui-expire.md"]
 tags: [budgets, forfaits, comptes, routage]
 decided_by: human:smichea
 decision_date: 2026-10-05
