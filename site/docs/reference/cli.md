@@ -22,6 +22,11 @@ example `ameesh alerts --json | head`), the command stops quietly, without a
 traceback, with exit code **141** (128 + `SIGPIPE`, as the shell reports it).
 A broken pipe anywhere else (a harness, a socket) is still an error.
 
+**Version.** `ameesh --version` (or `ameesh version`) prints the installed
+package version, read with `importlib.metadata` (from a clone without
+installation: the `pyproject.toml` next to `src/`). `ameesh doctor` prints it
+on its first line.
+
 ## Mailbox: `ameesh mail` / `agent-mail`
 
 ```

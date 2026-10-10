@@ -154,6 +154,8 @@ attribuée au compte) ou un **solde** (relevé par compte).
 La bascule au seuil et le retour au primaire (0027 §2–3) sont remplacés par
 un choix par échéance : les comptes forment un réservoir, une session garde
 son compte tant qu'il est sous son seuil, et une nouvelle session (ou une
-rotation) va au compte dont la capacité inutilisée expire le plus tôt. Le
+rotation) va au compte dont la capacité inutilisée expire le plus tôt —
+amendé le 2026-10-10 (L117) : au compte le plus en retard sur son rythme,
+l'échéance ne servant plus qu'à départager. Le
 tableau de continuité ci-dessus reste la règle de reprise ou de résumé quand
 une session change de compte. Voir [la page d'exploitation](../../COMPTES.md).

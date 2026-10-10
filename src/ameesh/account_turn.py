@@ -6,8 +6,9 @@ ne porte que des appels d'une ligne :
 
 * `choose`     — avant chaque tour, dans la garde de budget : choisit le compte
                  (0034 : la session garde son compte sous son seuil ; sinon
-                 celui dont la capacité inutilisée expire le plus tôt ; pause
-                 si tous sont au seuil) et journalise le choix et sa raison ;
+                 celui qui a le plus de retard sur son rythme, amendement
+                 L117 ; pause si tous sont au seuil) et journalise le choix et
+                 sa raison ;
 * `continuity` — avant de consommer le travail : si la session de l'agent a
                  été ouverte sous un autre compte et que le harnais ne peut pas
                  la reprendre sous le nouveau, rotation avec résumé (L11) ;
@@ -115,9 +116,10 @@ def log_choice(worker, harness: str, choice) -> None:
     """Chaque choix de compte est journalisé avec sa raison (0034 §5).
 
     Une ligne au journal de l'exécuteur quand le compte retenu ou la nature
-    du choix (échéance, continuité, forçage) change pour cet agent — pas à
-    chaque sondage : la garde passe ici avant chaque tour et à chaque sondage
-    d'un agent en attente, et la raison (« expire dans 52 min ») vieillit.
+    du choix (retard sur le rythme, continuité, forçage) change pour cet
+    agent — pas à chaque sondage : la garde passe ici avant chaque tour et à
+    chaque sondage d'un agent en attente, et la raison (« 35 % utilisé
+    (rythme 55 %) ») vieillit.
     """
     cle = (choice.profile.name, choice.kept, choice.forced)
     if getattr(worker, "_account_choice_logged", None) == cle:
