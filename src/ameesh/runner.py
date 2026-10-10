@@ -1304,8 +1304,12 @@ class AgentWorker(threading.Thread):
 
     # -- dépôt de travail de l'exécuteur médié (L113) -------------------------
     def _depot_dir(self) -> str:
+        """`<AMEESH_EXEC_HOME>/work/<agent>` : un chemin STABLE d'un bail à
+        l'autre (dsh lie sa session au dossier : un chemin par epoch rendait
+        la reprise impossible, essai L115). Le contenu, lui, est refait à
+        chaque prise de bail et effacé à la fin."""
         from .executeur_mediee import appareil
-        return os.path.join(appareil.home(), "work", self.name, str(int(self.epoch)))
+        return os.path.join(appareil.home(), "work", self.name)
 
     def _depot_fence(self):
         from .executeur_mediee import contrat as exec_contrat
@@ -1314,18 +1318,13 @@ class AgentWorker(threading.Thread):
     def _mediated_workdir(self) -> str | None:
         """Le dossier de travail d'un exécuteur médié : l'archive du commit
         rendue par le serveur à la prise du bail (`depot.checkout`), sous
-        `<AMEESH_EXEC_HOME>/work/<agent>/<epoch>`. Sans dépôt monté sur le
+        `<AMEESH_EXEC_HOME>/work/<agent>`. Sans dépôt monté sur le
         serveur (404) : un dossier vide. None si l'archive est illisible."""
         from .executeur_mediee import depot
         path = self._depot_dir()
         if getattr(self, "_depot_ready", None) == path and os.path.isdir(path):
             return path
-        parent = os.path.dirname(path)
-        if os.path.isdir(parent):
-            for old in os.listdir(parent):  # dossiers d'un bail précédent
-                if os.path.join(parent, old) != path:
-                    depot.wipe(os.path.join(parent, old))
-        depot.wipe(path)
+        depot.wipe(path)  # reste d'un bail précédent (arrêt brutal)
         transport = getattr(self.db, "transport", None)
         if not hasattr(transport, "get_work"):
             os.makedirs(path, mode=0o700, exist_ok=True)

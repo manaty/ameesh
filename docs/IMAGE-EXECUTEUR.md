@@ -64,7 +64,7 @@ configuration dans ces variables. Ne posez jamais `AMEESH_DSN`,
 | `/var/lib/ameesh-exec/` | **volume persistant**, `rw`, uid 10001, `0700` | tout l'état de l'exécuteur (ci-dessous) |
 | `/var/lib/ameesh-exec/key.pem` | (volume) | la clé P-256 de l'exécuteur, PKCS#8 PEM, `0600`. Elle est créée à l'enrôlement ; une clé plus ouverte est refusée |
 | `/var/lib/ameesh-exec/executor.json` | (volume) | `ameesh-exec-device/1` : `executor_id`, `mesh`, `host`, `server_url`. Aucun secret |
-| `/var/lib/ameesh-exec/work/<agent>/<epoch>/` | (volume) | dossier de travail, `cwd` du tour. **Effacé** à la fin du bail, au drainage, à la révocation, et en entier à chaque démarrage |
+| `/var/lib/ameesh-exec/work/<agent>/` | (volume) | dossier de travail, `cwd` du tour : l'archive du commit rendue par le serveur (L113), chemin stable d'un bail à l'autre (dsh lie sa session au dossier). **Effacé** à la fin du bail, au drainage, à la révocation, et en entier à chaque démarrage |
 | `/var/lib/ameesh-exec/harness/` | (volume) | `DSH_HOME` : la session du harnais, effacée avec le dossier de travail |
 | `/var/lib/ameesh-exec/state/` | (volume) | `AMEESH_STATE` : l'état local d'ameesh, sans secret |
 | `/run/ameesh-enroll/code` | `:ro`, **propre au job**, premier démarrage seulement | le code d'enrôlement : une ligne, 24 caractères de Crockford, avec ou sans tirets |

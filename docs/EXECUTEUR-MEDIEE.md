@@ -524,7 +524,8 @@ passe par le serveur (`executeur_mediee/depot.py`, monté par
   de départ : la branche `agent/<nom>` si elle existe sur la forge, sinon
   la branche de base du dépôt. L'archive est construite depuis l'arbre
   (modes et liens compris), sans les attributs `export-ignore`. L'appareil
-  en fait un dépôt git sous `<AMEESH_EXEC_HOME>/work/<agent>/<epoch>`. Son
+  en fait un dépôt git sous `<AMEESH_EXEC_HOME>/work/<agent>` (chemin
+  stable d'un bail à l'autre : dsh lie sa session au dossier). Son
   premier commit est recréé à l'identique des deux côtés (même arbre,
   auteur, date et message fixes) ; le serveur l'annonce
   (`X-Ameesh-Device-Base`) et l'appareil le vérifie.
