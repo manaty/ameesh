@@ -12,10 +12,21 @@ license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 # Pas de classifier `License ::` : depuis PEP 639, il est incompatible avec
 # l'expression SPDX ci-dessus (setuptools refuse le build — verdict codex3 B1).
-# psycopg est optionnel : sans lui, la couche db utilise le binaire psql.
-dependencies = []
+# L61 : psycopg est la voie normale, donc une dépendance. Une « extra par
+# défaut » n'existe pas pour pip (PEP 771 non adoptée) : `pip install ameesh`
+# n'installerait pas l'extra, et le pilote psql — un sous-processus et une
+# connexion TLS par requête, 1 à 2 s chacune vers une base distante — deviendrait
+# la voie de fait. Les roues binaires couvrent x86_64 et aarch64 (Linux, macOS,
+# Windows) ; ailleurs, psycopg pur Python utilise la libpq du système, et sans
+# elle l'import échoue proprement : la couche db retombe alors sur `psql`
+# (repli conservé, `ameesh doctor` le signale si la base est distante).
+dependencies = [
+    "psycopg[binary]>=3.1; platform_machine == 'x86_64' or platform_machine == 'AMD64' or platform_machine == 'aarch64' or platform_machine == 'arm64'",
+    "psycopg>=3.1; platform_machine != 'x86_64' and platform_machine != 'AMD64' and platform_machine != 'aarch64' and platform_machine != 'arm64'",
+]
 
 [project.optional-dependencies]
+#: conservée pour les commandes d'installation existantes (`ameesh[psycopg]`)
 psycopg = ["psycopg[binary]>=3.1"]
 crypto = ["cryptography>=41"]
 

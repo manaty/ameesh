@@ -513,7 +513,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     if book is None:
         book = cost_mod.CostBook(state_dir=cfg.state_dir if cfg else None, db=db)
     try:
-        gauges = book.gauges()
+        # lecture seule (L61) : l'historique des jauges est tenu par l'exécuteur
+        gauges = book.gauges(record=False)
     except (OSError, ValueError):
         gauges = []
     hourly = getattr(cfg, "budget_usd_per_hour", None) or cost_mod.DEFAULT_HOURLY_USD
@@ -751,9 +752,10 @@ def main(argv: list[str] | None = None) -> int:
             raise ProgressError("--stale-after : %s" % exc)
         db = db_mod.connect(cfg)
         try:
-            db_mod.require_schema(db)
-            snap = snapshot(db, cfg, since=args.since, project=args.project,
-                            stale_after=threshold)
+            db_mod.require_schema(db, defer=True)
+            # L61 : lectures regroupées (db.batched) — deux allers-retours
+            snap = db_mod.batched(db, lambda db: snapshot(
+                db, cfg, since=args.since, project=args.project, stale_after=threshold))
         finally:
             db.close()
         if args.html:

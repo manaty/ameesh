@@ -29,7 +29,7 @@ AMEESH_DRIVER=psql python3 -m unittest discover -s tests -t . -v "${PATTERN[@]}"
 
 VENV=.venv
 if [ ! -x "$VENV/bin/python" ]; then
-  echo "=== création de $VENV (psycopg optionnel) ==="
+  echo "=== création de $VENV (pilote psycopg, dépendance du paquet depuis L61) ==="
   python3 -m venv "$VENV" || true
 fi
 if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import psycopg, yaml" 2>/dev/null; then

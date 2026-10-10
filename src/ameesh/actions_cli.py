@@ -56,9 +56,8 @@ from .db import Db
 
 
 def _open(cfg: Config) -> Db:
-    db = db_mod.connect(cfg)
-    db_mod.require_schema(db)
-    return db
+    # L61 : la vérification de schéma part avec la première requête
+    return db_mod.open_db(cfg)
 
 
 def _moment(epoch) -> str:

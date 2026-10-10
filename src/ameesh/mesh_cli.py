@@ -52,9 +52,8 @@ USAGE_HINT = "agent-mesh: %s"
 
 
 def _open(cfg: Config) -> Db:
-    db = db_mod.connect(cfg)
-    db_mod.require_schema(db)
-    return db
+    # L61 : la vérification de schéma part avec la première requête
+    return db_mod.open_db(cfg)
 
 
 def _fmt_age(seconds: float) -> str:
@@ -126,6 +125,9 @@ def _lease(row: dict) -> str:
 
 def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
+    # L61 : agents et lots préchargés en un seul aller-retour (db.prefetch) ;
+    # le code ci-dessous lit ensuite ces réponses sans retourner à la base
+    db = db_mod.prefetch(db, lambda d: (registry.overview(d), work.delays(d, limit=500)))
     try:
         rows = registry.overview(db)
         if args.json:
@@ -324,11 +326,12 @@ def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: 
 def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     try:
-        row = registry.get(db, args.agent)
+        # L61 : la ligne et la clé en un seul aller-retour (db.batched)
+        row, info = db_mod.batched(db, lambda db: (
+            registry.get(db, args.agent), authority.key_info(db, args.agent)))
         if row is None:
             print(USAGE_HINT % ("agent inconnu : %s" % args.agent), file=sys.stderr)
             return 1
-        info = authority.key_info(db, args.agent)
         row = dict(row)
         row["key_ready"] = bool(info and info.get("public_key") and not info.get("key_revoked_ts"))
         row["public_key_fingerprint"] = (info or {}).get("public_key_fingerprint")
@@ -716,16 +719,25 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                           row["work_item_id"], issue))
             return 0
         if args.work_command == "list":
-            rows = work.list_items(db, state=args.state, assignee=args.assignee, limit=args.limit)
-            plan.annotate(db, rows, threshold=stagnation.stale_after(args.stale_after))
-            # Les délais viennent d'un seul balayage, restreint aux lots
-            # affichés (jamais une requête par ligne) ; le JSON les porte aussi,
-            # pour la frise (L24). Le filtre porte sur les lignes rendues, pas
-            # sur une fenêtre globale : un lot ancien garde sa frise (B3).
-            delays = {row["work_item_id"]: row for row in
-                      work.delays(db, ids=[row["id"] for row in rows])}
-            for row in rows:
-                row["delays"] = delays.get(row["id"])
+            threshold = stagnation.stale_after(args.stale_after)
+
+            def lire(db):
+                rows = work.list_items(db, state=args.state, assignee=args.assignee,
+                                       limit=args.limit)
+                plan.annotate(db, rows, threshold=threshold)
+                # Les délais viennent d'un seul balayage, restreint aux lots
+                # affichés (jamais une requête par ligne) ; le JSON les porte
+                # aussi, pour la frise (L24). Le filtre porte sur les lignes
+                # rendues, pas sur une fenêtre globale : un lot ancien garde sa
+                # frise (B3).
+                delays = {row["work_item_id"]: row for row in
+                          work.delays(db, ids=[row["id"] for row in rows])}
+                for row in rows:
+                    row["delays"] = delays.get(row["id"])
+                return rows
+
+            # L61 : lectures regroupées — deux allers-retours en tout
+            rows = db_mod.batched(db, lire)
             if args.json:
                 print(json.dumps(rows, ensure_ascii=False, indent=2))
                 return 0
@@ -1008,7 +1020,7 @@ def cmd_set(cfg: Config, args) -> int:
 
     db = db_mod.connect(cfg)
     try:
-        db_mod.require_schema(db)
+        db_mod.require_schema(db, defer=True)
         agent = registry.get(db, args.agent)
         if agent is None:
             print("agent inconnu : %s" % args.agent, file=sys.stderr)
@@ -1373,6 +1385,9 @@ def build_parser() -> argparse.ArgumentParser:
     pc_gauges.add_argument("--harness", default=None)
     pc_gauges.add_argument("--since", default="7d")
     pc_gauges.add_argument("--json", action="store_true")
+    pc_gauges.add_argument("--record", action="store_true",
+                           help="relève d'abord les jauges des journaux locaux (écrit "
+                                "l'historique) ; sans elle, lecture seule")
     pc_gauges.set_defaults(func=cmd_cost)
     pc_bal = cost_sub.add_parser(
         "balance", help="solde du fournisseur payé au token, dépense réelle par heure et jour")
@@ -1602,15 +1617,19 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
                 row["usd"]))
         return 0
     if what == "gauges":
-        # un relevé frais d'abord : la commande lit aussi les journaux locaux de
-        # l'hôte, comme `cost report` (une ligne seulement si la jauge a bougé).
-        # L30 : un harnais à comptes déclarés est relevé compte par compte.
-        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
-        declares = accounts_mod.parse(cfg.accounts)
-        accounts_mod.report(cfg, db, book, harnesses=[args.harness] if args.harness else None)
-        for nom in ([args.harness] if args.harness else ["claude", "codex"]):
-            if nom not in declares:
-                book.gauges(nom)
+        if args.record:
+            # `--record` : un relevé frais d'abord, depuis les journaux locaux
+            # de l'hôte, comme `cost report` (une ligne seulement si la jauge
+            # a bougé). L30 : un harnais à comptes déclarés est relevé compte
+            # par compte. Sans l'option (L61), la commande ne fait que lire
+            # l'historique : l'exécuteur relève déjà avant chaque tour.
+            book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+            declares = accounts_mod.parse(cfg.accounts)
+            accounts_mod.report(cfg, db, book,
+                                harnesses=[args.harness] if args.harness else None)
+            for nom in ([args.harness] if args.harness else ["claude", "codex"]):
+                if nom not in declares:
+                    book.gauges(nom)
         rows = ops.gauge_history(since_s=_since_seconds(args.since), harness=args.harness)
         if args.json:
             print(json.dumps({"schema": "ameesh-gauges/1", "readings": rows},
