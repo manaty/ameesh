@@ -19,6 +19,9 @@
         historique, solde du fournisseur payé au token (`cost turns|gauges|balance`) ;
   ameesh accounts list | use <harnais> <compte> | auto [harnais]
         comptes multiples par fournisseur : actif, jauges, forçage (L30) ;
+  ameesh budget [--json] | set --per-hour X [--per-day Y] [--agent A]
+        | unset [--per-hour] [--per-day] [--agent A]
+        plafonds de budget du mesh, en base, relus à chaud (L70) ;
   ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais
         context_max_tokens=15M|0
         réglages d'exécution, effet au prochain tour ;
@@ -79,6 +82,8 @@ MESH_COMMANDS = (
     "harness",
     # L30 : comptes multiples par fournisseur (`ameesh accounts list|use|auto`)
     "accounts",
+    # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
+    "budget",
 )
 #: exploitation (L26) : alertes, redémarrage sur brief, interruption directe
 EXPLOITATION_COMMANDS = ("alerts", "restart", "interrupt")

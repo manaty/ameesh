@@ -12,6 +12,7 @@ from .. import interface
 from .action_source import ActionSource
 from .accounts import Accounts
 from .actions import Actions
+from .budgets import Budgets
 from .authenticators import Authenticators
 from .authority import Approvals, Keys, Nonces
 from .canon import Canon, Ephemerals
@@ -43,6 +44,7 @@ class PostgresStorage(interface.Storage):
         self.pending_spend = PendingSpend(db)
         self.turn_costs = TurnCosts(db)
         self.accounts = Accounts(db)
+        self.budgets = Budgets(db)
         self.catalog = Catalog(db)
         self.mailbox = Mailbox(db)
         self.wakeups = Wakeups(db)

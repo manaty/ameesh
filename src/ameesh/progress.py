@@ -517,7 +517,14 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         gauges = book.gauges(record=False)
     except (OSError, ValueError):
         gauges = []
-    hourly = getattr(cfg, "budget_usd_per_hour", None) or cost_mod.DEFAULT_HOURLY_USD
+    # L70 : plafonds en vigueur (base > configuration de l'hôte > défaut)
+    limits = None
+    if cfg is not None:
+        from . import budget as budget_mod
+        limits = budget_mod.current(cfg, db).as_dict()
+        hourly = limits["per_hour_usd"] or 0.0
+    else:
+        hourly = cost_mod.DEFAULT_HOURLY_USD
 
     return {
         "schema": SCHEMA,
@@ -533,7 +540,8 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
         "epics": plan["epics"],
         "stale_after_s": int(threshold),
         "actions": [build_action(r) for r in action_rows],
-        "budget": build_budget(cost_rows, gauges, now, hourly_cap=hourly),
+        "budget": dict(build_budget(cost_rows, gauges, now, hourly_cap=hourly),
+                       limits=limits),
         "truncated": truncated,
         "missing": list(MISSING),
     }
@@ -669,6 +677,16 @@ def format_text(snap: dict, width: int | None = None) -> str:
     line("payé au token : 1 h %.2f · 24 h %.2f · fenêtre %.2f (plafond %.2f/h)" % (
         sp["1h"]["paid_usd"], sp["24h"]["paid_usd"], sp["window"]["paid_usd"],
         budget["hourly_cap_usd"]), "  ")
+    lim = budget.get("limits")
+    if lim:
+        # L70 : plafonds en vigueur et leur source (`ameesh budget`)
+        line("plafonds : %s/h (%s) · %s/jour (%s)%s" % (
+            "%.2f" % lim["per_hour_usd"] if lim.get("per_hour_usd") else "aucun",
+            lim["per_hour_source"],
+            "%.2f" % lim["per_day_usd"] if lim.get("per_day_usd") else "aucun",
+            lim["per_day_source"],
+            " · %d agent(s) à plafond propre" % len(lim["agents"]) if lim["agents"] else ""),
+            "  ")
     line("total estimé : 1 h %.2f · 24 h %.2f · fenêtre %.2f" % (
         sp["1h"]["total_usd"], sp["24h"]["total_usd"], sp["window"]["total_usd"]), "  ")
     for plan in budget["plans"]:

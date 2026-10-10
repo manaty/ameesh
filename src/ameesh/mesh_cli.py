@@ -1444,6 +1444,10 @@ def build_parser() -> argparse.ArgumentParser:
     pa_auto.set_defaults(func=cmd_accounts)
     p_acc.set_defaults(func=cmd_accounts)
 
+    # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
+    from . import budget as budget_mod
+    budget_mod.add_parsers(sub)
+
     p_set = sub.add_parser("set", help="réglages d'un agent, effet au prochain tour (L13, L26)")
     p_set.add_argument("agent")
     p_set.add_argument("values", nargs="+", metavar="clé=valeur",
@@ -1505,7 +1509,11 @@ def cmd_cost(cfg: Config, args) -> int:
             # requêtes chacun, ~67 s vers une base distante) : ses lectures
             # sont préchargées en quelques allers-retours (db.prefetch)
             db = db_mod.prefetch(db, lambda d: _cost_report_reads(cfg, d))
-        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+        # L70 : les plafonds en vigueur (base > configuration > défaut), ceux
+        # que la garde des exécuteurs applique
+        from . import budget as budget_mod
+        limites = budget_mod.current(cfg, db)
+        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, **limites.book_kwargs())
         if what == "spent":
             seconds = float(getattr(args, "seconds", 3600.0) or 3600.0)
             print("%.4f" % book.spent(getattr(args, "agent", "all") or "all", seconds))
@@ -1550,6 +1558,11 @@ def cmd_cost(cfg: Config, args) -> int:
             print(json.dumps(rows, indent=2, sort_keys=True, default=str))
         else:
             print(cost_mod.format_report(rows))
+            print()
+            print(budget_mod.summary_line(limites))
+            for agent, caps in sorted(limites.agents.items()):
+                print("  plafond de %s : %s" % (agent, " · ".join(
+                    "%s %.2f $" % (budget_mod.LABELS[w], v) for w, v in sorted(caps.items()))))
             if comptes:
                 print()
                 print("comptes (hôte %s) :" % cfg.host)
@@ -1561,8 +1574,10 @@ def cmd_cost(cfg: Config, args) -> int:
 
 def _cost_report_reads(cfg: Config, db) -> None:
     """Les lectures de `cost report`, jouées à blanc par `db.prefetch` (L61) :
-    comptes et rapport par agent. Rien n'est affiché."""
-    book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+    plafonds (L70), comptes et rapport par agent. Rien n'est affiché."""
+    from . import budget as budget_mod
+    limites = budget_mod.current(cfg, db)
+    book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, **limites.book_kwargs())
     try:
         comptes = accounts_mod.report(cfg, db, book)
     except accounts_mod.AccountError:
