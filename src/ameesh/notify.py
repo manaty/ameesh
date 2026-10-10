@@ -66,7 +66,7 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 #: tenu, hôte à vide) est poussée comme la surcharge.
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
                  "delegation_expired", "plan_underused", "idle_capacity",
-                 "orchestrator_held", "host_underused")
+                 "orchestrator_held", "host_underused", "balance_low")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -104,6 +104,7 @@ TYPE_LABELS = {
     "idle_capacity": "capacité au repos",
     "orchestrator_held": "orchestrateur tenu par une session",
     "host_underused": "hôte sous-employé",
+    "balance_low": "solde bas",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired")
@@ -353,7 +354,11 @@ def duration(seconds) -> str:
 
 
 def _account(alert: dict) -> str | None:
-    """`harnais/compte` d'une alerte de jauge (L94, `plan_underused`)."""
+    """`harnais/compte` d'une alerte de jauge (L94, `plan_underused`), ou
+    `fournisseur[/compte]` d'une alerte de solde (`balance_low`)."""
+    if alert.get("provider"):
+        return _clean(alert["provider"], 32) + (
+            "/%s" % _clean(alert["account"], 64) if alert.get("account") else "")
     if alert.get("gauge") is None and alert.get("account") is None:
         return None
     return "%s/%s" % (_clean(alert.get("harness") or "?", 32),
@@ -414,7 +419,8 @@ def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
     elif raised_ts:
         lines.append("constatée le %s" % local_time(raised_ts))
     title, body = _readable(title, "\n".join(lines), detail)
-    return Message(title, body, urgent=kind in URGENT_TYPES)
+    # L94 : une alerte peut se dire urgente elle-même (`balance_low` sous 12 h)
+    return Message(title, body, urgent=kind in URGENT_TYPES or bool(alert.get("urgent")))
 
 
 def render_summary(bucket: dict, host: str) -> Message:
@@ -803,7 +809,8 @@ def key_of(alert: dict) -> str:
 
 #: champs d'une alerte gardés dans l'état (de quoi écrire la résolution)
 _KEPT = ("type", "agent", "lot", "title", "host", "since", "detail", "reason", "value",
-         "responsible", "stop_reason", "assignee", "harness", "account", "gauge")
+         "responsible", "stop_reason", "assignee", "harness", "account", "gauge",
+         "provider", "currency", "urgent")
 
 
 # --------------------------------------------------------------------------

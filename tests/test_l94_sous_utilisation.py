@@ -264,6 +264,68 @@ class HostUnderusedTest(_Base):
         self.assertEqual(self.alertes(host_underused_s=0), [])
 
 
+class BalanceLowTest(_Base):
+    def setUp(self):
+        super().setUp()
+        self.db.execute("TRUNCATE provider_balances RESTART IDENTITY")
+
+    def solde(self, total, ago_s, provider="deepseek", currency="USD"):
+        self.db.execute(
+            "INSERT INTO provider_balances (provider, currency, total, observed_at) "
+            "VALUES (%s, %s, %s, now() - make_interval(secs => %s))",
+            (provider, currency, total, ago_s))
+
+    def alertes(self, **kw):
+        return _types(exploitation.alerts(self.cfg, self.db, now=self.now, **_seuils(**kw)),
+                      "balance_low")
+
+    def test_autonomie_au_rythme_reel_recharges_ignorees(self):
+        # 4 h de relevés : 40 → 36 (−4), recharge +50, 86 → 84 (−2) : 6 USD en
+        # 4 h, soit 1,5 USD/h ; 84 USD tiennent 56 h
+        for total, ago in ((40, 4 * HEURE), (36, 3 * HEURE), (86, 2 * HEURE),
+                           (84, 0)):
+            self.solde(total, ago)
+        self.agent("deepseek1", "deepseek")
+        self.assertEqual(self.alertes(), [])
+        out = self.alertes(balance_hours=60)
+        self.assertEqual(len(out), 1)
+        alerte = out[0]
+        self.assertEqual((alerte["provider"], alerte["causes"], alerte["urgent"]),
+                         ("deepseek", ["autonomie"], False))
+        self.assertAlmostEqual(alerte["rate_per_h"], 1.5, places=2)
+        self.assertAlmostEqual(alerte["autonomy_h"], 56.0, places=1)
+        self.assertAlmostEqual(alerte["empty_ts"], self.now + 56 * HEURE, delta=120)
+        self.assertEqual(alerte["responsible"], "human:proprio")
+        for texte in ("84.00 USD", "1.50 USD/h", "autonomie ≈ 2 j 8 h", "épuisement prévu"):
+            self.assertIn(texte, alerte["detail"])
+        self.assertEqual(self.alertes(balance_hours=50), [])
+
+    def test_solde_bas_et_urgence(self):
+        self.solde(30, 2 * HEURE)
+        self.solde(18, 0)            # 6 USD/h : 3 h d'autonomie
+        out = self.alertes()
+        self.assertEqual((out[0]["causes"], out[0]["urgent"]), (["autonomie", "solde"], True))
+        message = notify.render(out[0], "raised", self.now)
+        self.assertTrue(message.urgent)
+        self.assertEqual(message.title, "ameesh : solde bas (deepseek)")
+        # seuils réglables, 0 désactive
+        self.assertEqual(self.alertes(balance_hours=0, balance_min_usd=0), [])
+        out = self.alertes(balance_hours=0)
+        self.assertEqual((out[0]["causes"], out[0]["urgent"]), (["solde"], True))
+
+    def test_sans_depense_ni_releves_suffisants(self):
+        self.solde(19, 60)           # un seul relevé : rythme inconnu, solde bas
+        out = self.alertes()
+        self.assertEqual((out[0]["causes"], out[0]["urgent"], out[0]["rate_per_h"]),
+                         (["solde"], False, None))
+        self.assertIn("rythme réel inconnu", out[0]["detail"])
+        # autre devise : pas de plancher en USD, et sans dépense pas d'autonomie
+        self.db.execute("TRUNCATE provider_balances")
+        self.solde(10, 2 * HEURE, currency="CNY")
+        self.solde(10, 0, currency="CNY")
+        self.assertEqual(self.alertes(), [])
+
+
 class NotifyTest(_Base):
     def test_types_par_defaut_texte_et_resume(self):
         for kind in sous_utilisation.UNDERUSE_TYPES:

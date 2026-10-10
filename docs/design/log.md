@@ -1,7 +1,7 @@
 # Journal de la conception
 
 ## 2026-10-10 (sous-utilisation)
-* **L94** : la sous-utilisation alerte autant que la surcharge (« la surconso comme la sous-conso devrait alerter ameesh ») — `plan_underused` (forfait perdu à la remise à zéro, pertes au sens de L74), `idle_capacity` (agents réveillables au repos pendant que du travail attend, ou que le token travaille), `orchestrator_held` (orchestrateur tenu par `attach` avec du courrier, prolonge 0030), `host_underused` (suggestion de déplacement, 0028) ; poussées par `ameesh notify`.
+* **L94** : la sous-utilisation alerte autant que la surcharge (« la surconso comme la sous-conso devrait alerter ameesh ») — `plan_underused` (forfait perdu à la remise à zéro, pertes au sens de L74), `idle_capacity` (agents réveillables au repos pendant que du travail attend, ou que le token travaille), `orchestrator_held` (orchestrateur tenu par `attach` avec du courrier, prolonge 0030), `host_underused` (suggestion de déplacement, 0028) ; poussées par `ameesh notify`. Ajout validé par le propriétaire : `balance_low`, autonomie d'un fournisseur payé au token au rythme réel des relevés de solde (48 h, 20 USD ; urgente sous 12 h ou 5 USD).
 
 ## 2026-10-09
 * **Bascule** : deepseek1 à 7 et l'orchestrateur Nexlink menés par l'exécuteur, un service par agent (`ameesh-runner-agent@<nom>`) ; plus aucune boucle v0.

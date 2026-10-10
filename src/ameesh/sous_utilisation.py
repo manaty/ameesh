@@ -45,6 +45,19 @@ from . import storage
 
 UNDERUSE_TYPES = ("plan_underused", "idle_capacity", "orchestrator_held", "host_underused")
 
+#: `balance_low` (L94, ajout validé par le propriétaire) : solde bas d'un
+#: fournisseur payé au token — autonomie au rythme RÉEL sous 48 h, ou solde
+#: sous 20 USD ; urgente sous 12 h ou sous 5 USD. Le rythme réel vient des
+#: relevés de solde (`provider_balances`), moyenne glissante sur 6 h, les
+#: hausses (recharges) ignorées — jamais de l'estimation `turn_costs`.
+DEFAULT_BALANCE_HOURS = 48.0
+DEFAULT_BALANCE_MIN_USD = 20.0
+DEFAULT_BALANCE_WINDOW_S = 6 * 3600.0
+BALANCE_URGENT_HOURS = 12.0
+BALANCE_URGENT_USD = 5.0
+#: en deçà de cette durée couverte par les relevés, pas de rythme
+BALANCE_MIN_SPAN_S = 1800.0
+
 #: seuils par défaut
 #: `plan_underused/fin_de_fenetre` : il reste moins de 24 h (au plus le quart
 #: de la fenêtre : 1 h 15 pour une fenêtre de 5 h) et moins de 50 % utilisés
@@ -479,6 +492,88 @@ def host_underused(cfg, db, listing: list, now: float, *,
 
 
 # --------------------------------------------------------------------------
+# balance_low
+# --------------------------------------------------------------------------
+
+def _local_time(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+
+
+def balance_rate(points: list) -> tuple | None:
+    """(dépense, durée couverte en s) d'une série de soldes chronologique :
+    somme des baisses entre relevés successifs ; une hausse est une recharge,
+    ignorée. None si la série couvre moins de `BALANCE_MIN_SPAN_S`."""
+    if len(points) < 2:
+        return None
+    span = float(points[-1]["observed_ts"]) - float(points[0]["observed_ts"])
+    if span < BALANCE_MIN_SPAN_S:
+        return None
+    spent = sum(max(0.0, float(a["total"]) - float(b["total"]))
+                for a, b in zip(points, points[1:]))
+    return spent, span
+
+
+def balance_low(db, listing: list, now: float, *,
+                hours: float = DEFAULT_BALANCE_HOURS,
+                min_usd: float = DEFAULT_BALANCE_MIN_USD,
+                window_s: float = DEFAULT_BALANCE_WINDOW_S) -> list:
+    if hours <= 0 and min_usd <= 0:
+        return []
+    rows = storage.of(db).operations.balances(provider=None,
+                                              since_s=max(window_s, BALANCE_MIN_SPAN_S))
+    series: dict = {}
+    for row in rows:
+        series.setdefault((row["provider"], row["currency"], row.get("account")),
+                          []).append(row)
+    out = []
+    for (provider, currency, account), points in sorted(
+            series.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2] or "")):
+        points.sort(key=lambda r: float(r["observed_ts"]))
+        last = points[-1]
+        total = float(last["total"])
+        measured = balance_rate(points)
+        rate = measured[0] / measured[1] * 3600.0 if measured else None
+        autonomy_h = (total / rate) if rate else None
+        causes = []
+        if hours > 0 and autonomy_h is not None and autonomy_h < hours:
+            causes.append("autonomie")
+        usd = currency.upper() == "USD"
+        if min_usd > 0 and usd and total < min_usd:
+            causes.append("solde")
+        if not causes:
+            continue
+        who = "%s/%s" % (provider, account) if account else provider
+        parts = ["solde %s : %.2f %s (relevé le %s)" % (
+            who, total, currency, _local_time(last["observed_ts"]))]
+        if rate is not None:
+            parts.append("rythme réel %.2f %s/h (moyenne sur %s, recharges ignorées)"
+                         % (rate, currency, _duration(measured[1])))
+        else:
+            parts.append("rythme réel inconnu (relevés insuffisants)")
+        empty_ts = None
+        if autonomy_h is not None:
+            empty_ts = float(last["observed_ts"]) + autonomy_h * 3600.0
+            parts.append("autonomie ≈ %s, épuisement prévu le %s"
+                         % (_duration(autonomy_h * 3600.0), _local_time(empty_ts)))
+        elif rate == 0:
+            parts.append("aucune dépense constatée sur la fenêtre")
+        parts.append("recharger le compte, ou orienter le travail vers les forfaits")
+        urgent = ((autonomy_h is not None and autonomy_h < BALANCE_URGENT_HOURS)
+                  or (usd and total < BALANCE_URGENT_USD))
+        out.append(_alert(
+            "balance_low", None, None, round(total, 4),
+            min_usd if causes == ["solde"] else hours, " ; ".join(parts),
+            provider=provider, currency=currency, account=account, causes=causes,
+            balance=round(total, 4), rate_per_h=round(rate, 4) if rate is not None else None,
+            autonomy_h=round(autonomy_h, 2) if autonomy_h is not None else None,
+            empty_ts=round(empty_ts, 3) if empty_ts is not None else None,
+            observed_ts=round(float(last["observed_ts"]), 3), urgent=bool(urgent),
+            responsible=_common_responsible(
+                [r for r in listing if r.get("harness") == provider])))
+    return out
+
+
+# --------------------------------------------------------------------------
 # entrée
 # --------------------------------------------------------------------------
 
@@ -492,6 +587,9 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
            host_underused_s: float = DEFAULT_HOST_UNDERUSED_S,
            host_underused_load: float = DEFAULT_HOST_UNDERUSED_LOAD,
            host_underused_turns: float = DEFAULT_HOST_UNDERUSED_TURNS,
+           balance_hours: float = DEFAULT_BALANCE_HOURS,
+           balance_min_usd: float = DEFAULT_BALANCE_MIN_USD,
+           balance_window_s: float = DEFAULT_BALANCE_WINDOW_S,
            idle_mail_s: float = 300.0) -> list:
     """Les alertes de sous-utilisation en cours (non triées)."""
     now = time.time() if now is None else float(now)
@@ -510,4 +608,6 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
     out += host_underused(cfg, db, listing, now, window_s=host_underused_s,
                           load_max=host_underused_load, turns_max=host_underused_turns,
                           idle_mail_s=idle_mail_s, canons=canons)
+    out += balance_low(db, listing, now, hours=balance_hours, min_usd=balance_min_usd,
+                       window_s=balance_window_s)
     return out
