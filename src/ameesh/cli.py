@@ -959,6 +959,8 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
             return hostcheck.cmd_harness(cfg, db)
         finally:
             db.close()
+    from . import version
+    print("version    : ameesh %s" % version())
     print("dsn        : %s" % config_mod.mask_dsn(cfg.dsn))
     print("schéma     : %s" % cfg.schema)
     print("hôte       : %s" % cfg.host)

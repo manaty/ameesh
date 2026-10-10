@@ -1208,6 +1208,8 @@ le plus en retard sur son rythme ; avant : … »). Les sessions en cours
 restent sur leur compte tant qu'il est sous son seuil. Vérifier, avant la
 mise à jour, que les identifiants des comptes jamais utilisés sont présents
 (`ameesh accounts list`, état `ok`) : c'est la première fois qu'ils serviront.
+`ameesh --version` (et la première ligne de `ameesh doctor`) dit la version
+installée : vérifier « ameesh 1.6.2 » sur chaque hôte après la mise à jour.
 Retour arrière : l'ancien code, sans autre geste.
 
 ---
