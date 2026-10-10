@@ -64,18 +64,30 @@ restée 4 h fusionnée sans être déployée :
 
 1. **Fusionner d'abord.** Une PR à CI verte qui débloque une demande du
    propriétaire se fusionne avant tout nouveau chantier.
-2. **Un déploiement en attente se prépare entièrement** : étiquette posée,
+2. **Une correction de bug se fusionne et se déploie sans attendre** (règle du
+   propriétaire, 2026-10-11) : dès que la CI est verte, avec le déroulé de
+   `deploy/mise-a-jour` (vérifier, sauvegarder, installer, migrer, redémarrer
+   hors tour, contrôler, retour possible). Le propriétaire et les agents
+   touchés sont prévenus après coup.
+3. **Les autres déploiements se préparent entièrement** (nouvelle fonction,
+   version mineure, migration qui change le comportement) : étiquette posée,
    `deploy/mise-a-jour/poste.sh verifier <REF>` et `deploy/mise-a-jour/vm.sh
-   verifier <REF>` passés, plan de retour connu (étape `retour`). Il est
-   proposé au propriétaire dès son retour, en premier point, avec les choix
-   possibles : version seule ou `main` entier, migrations, risques. Seul le
-   propriétaire décide du déploiement ; une consigne de veille ne se contente
-   jamais d'interdire « tout déploiement » sans le préparer.
-3. **Redémarrer détaché.** `poste.sh redemarrer` ne redémarre un exécuteur
+   verifier <REF>` passés, plan de retour connu (étape `retour`). Ils sont
+   proposés au propriétaire dès son retour, en premier point, avec les choix
+   possibles : version seule ou `main` entier, migrations, risques. Une
+   consigne de veille ne se contente jamais d'interdire « tout déploiement »
+   sans le préparer. Les gestes en production d'un projet, les dépenses et les
+   secrets restent des décisions du propriétaire.
+4. **Redémarrer détaché.** `poste.sh redemarrer` ne redémarre un exécuteur
    qu'hors tour : l'agent qui le lance alors qu'il a lui-même un exécuteur
    sur le poste le lance détaché (`setsid`/`nohup`), sinon il s'attend
    lui-même.
-4. **Réserver les migrations.** Les numéros de migration se réservent dès le
+5. **Réserver les migrations.** Les numéros de migration se réservent dès le
    début d'un lot, annoncés dans le lot et au journal de conception, pour
    éviter les renumérotations en cascade quand plusieurs lots fusionnent à la
    suite.
+6. **Essai à blanc avant toute étiquette de release.** Avant de poser une
+   étiquette qui publie (application, installeur, image), le workflow de
+   release tourne en essai à blanc sur le SHA exact, sur toutes les plateformes
+   cibles ; l'étiquette n'est posée que s'il est vert. On ne déplace jamais une
+   étiquette publiée : on pose la suivante.
