@@ -13,7 +13,11 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   tout ce qui touche à la production sont relus avant fusion ; voir
   `docs/design/decisions/0018-vitesse-des-agents.md`.
 - **Tests** : la suite tourne sur un vrai Postgres avec les deux pilotes ;
-  `scripts/test.sh` en local, l'intégration continue sur chaque PR.
+  `scripts/test.sh` en local (ou `scripts/test-parallele.sh -n 4`, en parts
+  parallèles), l'intégration continue sur chaque PR : psycopg complet et psql
+  sur les modules de `tests/parts/pilote-psql.txt` ; le psql complet tourne
+  sur `main` et `release/*`. Un module de test qui touche la couche base ou un
+  comportement propre à un pilote s'ajoute à cette liste.
 - **En-tête de licence** `SPDX-License-Identifier: AGPL-3.0-only` en tête des
   nouveaux fichiers source.
 

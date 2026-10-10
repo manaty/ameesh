@@ -5,7 +5,7 @@ export PYTHONPATH := src$(if $(PYTHONPATH),:$(PYTHONPATH))
 #: DSN du banc local, sans mot de passe : PGPASSWORD ou ~/.pgpass fournit le secret.
 export AMEESH_DSN ?= postgresql://agent_mesh@127.0.0.1:55432/agent_mesh
 
-.PHONY: help pg-up migrate doctor test list mesh-list keys work clean-schemas
+.PHONY: help pg-up migrate doctor test test-parallele list mesh-list keys work clean-schemas
 
 help:
 	@sed -n '1,20p' Makefile
@@ -21,6 +21,9 @@ doctor:            ## diagnostic complet (pilote, schéma, LISTEN/NOTIFY)
 
 test:              ## suite complète, deux pilotes (psql puis psycopg)
 	./scripts/test.sh
+
+test-parallele:    ## suite complète en 4 parts parallèles par pilote (une base par part)
+	./scripts/test-parallele.sh -n 4
 
 list:              ## agents connus, hôte, bail, non lus (vue v0-compatible)
 	$(PYTHON) -m ameesh list
