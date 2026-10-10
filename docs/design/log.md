@@ -1,5 +1,9 @@
 # Journal de la conception
 
+## 2026-10-10 (jamais à l'arrêt)
+* **Décision** (proposée) : [ameesh ne s'arrête jamais, il s'améliore](decisions/0037-jamais-a-l-arret.md). Quand rien n'attend, les agents au forfait dorment et leur capacité est perdue ; une file d'amélioration continue leur donne du travail à valeur attendue, sans humain pour le confier.
+* **L119** : `ameesh work backlog add|list` (lots `improvement`, migration 0049 : valeur attendue, score, priorité, équipe, capacités) ; prise automatique à chaque passage d'`ameesh notify`, seulement si aucun lot n'attend l'agent ni le projet, jamais de geste irréversible ou de production ; forfaits d'abord, plafonds, pression de l'hôte, débit par heure compté en base ; alerte `backlog_empty`.
+
 ## 2026-10-10 (répartition des comptes)
 * **Amendement** de [0034](decisions/0034-consommer-d-abord-ce-qui-expire.md), accord du propriétaire : `ameesh accounts list` montrait le compte Claude primaire à 35 % de sa semaine (rythme 55 %) et les deux autres jamais utilisés, leurs forfaits hebdomadaires perdus. Le primaire, toujours en fenêtre ouverte, gagnait toujours le choix par échéance. Désormais, une nouvelle session va au compte le plus en retard sur son rythme (plus petit `utilisé / rythme` sur sa fenêtre la plus contraignante ; sans relevé : 0 %, en premier) ; l'échéance et l'ordre déclaré départagent. Forçage, continuité, pause et Codex inchangés.
 * **L117** (1.6.2) : la règle, sa raison dans le journal de l'exécuteur et dans `ameesh accounts list` (« le plus en retard sur son rythme ; avant : … »).

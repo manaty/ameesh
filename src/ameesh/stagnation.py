@@ -317,11 +317,15 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
     Une ligne : id, title, state, assignee, `last_activity_ts`, `idle_s`,
     `waiting_for` (un mot de `WAITING_FOR` ou None, forme L26) et `waiting`
     (`{what, who, label}`, L29)."""
+    from . import sous_utilisation
     now = time.time() if now is None else float(now)
     st = storage.of(db)
+    # L119 (0037) : un élément de la file d'amélioration qui attend son
+    # preneur n'est pas stagnant, il est en file
     rows = [r for r in st.operations.open_lots_activity(limit)
             if r.get("last_activity_ts") is not None
-            and now - float(r["last_activity_ts"]) >= float(threshold_s)]
+            and now - float(r["last_activity_ts"]) >= float(threshold_s)
+            and not sous_utilisation.is_backlog_item(r)]
     described = describe(db, rows, now=now, threshold=threshold_s)
     out = []
     for row in rows:

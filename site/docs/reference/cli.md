@@ -176,6 +176,9 @@ ameesh interrupt <agent> <message…> [--from SENDER]
 | `set … mode=` | `execute` (default: run by a runner under a lease) or `externe` (a human's session, mailbox only, never woken by ameesh) |
 | `notify --once` | a single pass, then exit |
 | `notify --dry-run` | print what would be sent; send nothing, write no state |
+| `notify --take-idle` | auto-take from the improvement backlog: wakeable agent idle without a lot for S seconds (default 1800; 0 disables; L119) |
+| `notify --take-max-per-hour` | auto-takes per sliding hour, whole mesh (default 2) |
+| `notify --take-paid` | let pay-per-token agents take too (after subscription agents; never during `balance_low`) |
 | `notify --test` | a test message on each channel of that human (exit 0 if all pass, 1 otherwise, 2 without a channel) |
 | `restart --wait` | wait up to S seconds for the runner to apply the request |
 | `adopt --account` | look for the session file under this declared account only |
@@ -209,7 +212,28 @@ ameesh work delegate <id> <agent> --within 30m|2h|1d|SECONDS [--actor A]
 ameesh work expire-delegations [--dry-run] [--json]
 ameesh work note <id> <text> [--actor A]
 ameesh work milestone <id> <frozen|verdict> [ok|blocked] [--sha SHA] [--note N] [--actor A]
+ameesh work backlog add --title T --value "expected value" --score 1-100
+                        [--priority 1|2|3] [--source S] [--team T] [--requires CAP …]
+                        [--body B] [--package FICHE] [--json]
+ameesh work backlog list [--all] [--limit N] [--json]
 ```
+
+**Continuous-improvement backlog** (L119, decision 0037). `work backlog add`
+queues a lot of type `improvement` (in `intake`, unassigned); the expected
+value (one sentence) and its score are mandatory, refused otherwise by the CLI
+and by the database. `work backlog list` shows the queue in take order:
+priority, then score, then age (`--all` also lists items already taken and not
+finished). At every pass, `ameesh notify` hands the best-ranked matching item
+(team, required capabilities) to a wakeable agent idle for `--take-idle`
+(30 min), through guarded assignment and a mail tied to the lot — **only if no
+work awaits it** (no open lot, unread mail, pending prompt or open session lot)
+**and no project lot waits for a taker**. The take mail forbids any
+irreversible or production step (deploy, merge, data deletion, production
+server, committed spend): the agent proposes it to a human. Subscription agents
+first; pay-per-token agents only with `--take-paid`, never during
+`balance_low`; nothing while a budget cap is reached or the agent's host is
+under pressure, on low battery or not ready; at most `--take-max-per-hour` (2)
+takes per sliding hour for the whole mesh.
 
 Since v1.4.0, `work add --assignee` and `work assign` give a lot only to an
 agent ameesh can **wake** (known, in `execute` mode, admitted on its host, with

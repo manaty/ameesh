@@ -286,7 +286,7 @@ class Operations(interface.Operations):
     def open_lots_activity(self, limit) -> list[dict]:
         return self.db.query(
             """
-            SELECT w.id, w.title, w.state, w.assignee, w.package_id,
+            SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    extract(epoch from w.updated_at)::float8 AS updated_ts,
                    extract(epoch from w.created_at)::float8 AS created_ts,
                    extract(epoch from greatest(

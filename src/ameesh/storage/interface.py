@@ -68,7 +68,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    delays timeline link_package by_package close_merged close
                    refresh_package_parents delegate current_delegation
                    mark_delegate_turn due_delegations resolve_delegation
-                   overdue_delegations returned_delegations
+                   overdue_delegations returned_delegations backlog_add backlog
+                   auto_takes_since
    packages       all get upsert retire
    actions         get recent attempts events log_event last_event_note
                    decision_queues covering_grants launched propose bind
@@ -901,6 +902,28 @@ class WorkItems(Domain):
     def refresh_package_parents(self) -> int:
         """Recopie dans les lots le parent courant de leur fiche ; rend le nombre
         de lots changés."""
+
+    # -- file d'amélioration (L119, décision 0037) ------------------------------
+    @abc.abstractmethod
+    def backlog_add(self, *, title: str, body: str, source: str, expected_value: str,
+                    value_score: int, priority: int, team: str | None,
+                    required_capabilities: list | None, package_id: str | None,
+                    package_parent: str | None, note: str, actor: str) -> dict:
+        """Crée un élément de la file : un lot `improvement` en `intake`, sans
+        assigné, et sa première ligne de journal ; rend le lot."""
+
+    @abc.abstractmethod
+    def backlog(self, *, open_only: bool, limit: int) -> list[dict]:
+        """Les éléments de la file dans l'ordre de prise (priorité, puis valeur
+        décroissante, puis ancienneté). `open_only` : seulement ceux qu'on peut
+        encore prendre (`intake`, sans assigné) ; sinon tous les éléments non
+        terminés."""
+
+    @abc.abstractmethod
+    def auto_takes_since(self, seconds: float, note_prefix: str) -> int:
+        """Nombre de prises automatiques (lignes de journal dont la note
+        commence par `note_prefix`) sur les `seconds` dernières secondes, tous
+        hôtes confondus."""
 
 
 # --------------------------------------------------------------------------

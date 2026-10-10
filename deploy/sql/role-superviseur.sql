@@ -65,8 +65,9 @@
 --       work_item_milestones.note
 --       mesh_approvals.meta (et mesh_approvals_status)
 --
--- Restent lisibles, comme ÉTAT : titres de lots (work_items.title), cibles
--- d'actions (actions.target), diagnostics courts (status_text, last_error,
+-- Restent lisibles, comme ÉTAT : titres de lots (work_items.title), valeur
+-- attendue des éléments de la file d'amélioration (work_items.expected_value,
+-- L119), cibles d'actions (actions.target), diagnostics courts (status_text, last_error,
 -- action_attempts.error, placement_diagnostic, canon_state.diagnostic,
 -- authenticator_syncs.summary). Ils peuvent citer un extrait d'erreur d'un
 -- harnais ; les retirer ici si ce n'est pas acceptable.
@@ -341,7 +342,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'delegated_by', 'delegated_at', 'due_at',
         -- L96 (0044) : dates prévues
         'planned_start', 'planned_end', 'planned_delivery', 'planned_source',
-        'planned_by', 'planned_at'
+        'planned_by', 'planned_at',
+        -- L119 (0049) : file d'amélioration ; expected_value est une phrase
+        -- courte, lisible comme le titre (ÉTAT), le reste des scalaires
+        'expected_value', 'value_score', 'priority', 'team',
+        'required_capabilities'
     ]),
     -- L40 (0031) : registre des délégations et de leur issue (de l'ÉTAT)
     ('work_item_delegations', ARRAY[
