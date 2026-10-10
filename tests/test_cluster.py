@@ -51,6 +51,7 @@ CONTENUS = {
     "actions": {"args", "last_note"},
     "action_events": {"note"},
     "work_items": {"body"},
+    "commitments": {"note"},
     "work_item_events": {"note"},
     "work_item_milestones": {"note"},
     "mesh_approvals": {"meta"},

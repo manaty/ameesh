@@ -69,7 +69,7 @@ WITH unread AS (
            WHERE r.session_work_item ~ '^[0-9]{1,18}$'
              AND w.id = r.session_work_item::bigint) sw ON true
       -- L96 : la dernière avancée de l'agent, lue dans le fil (son dernier
-      -- message ; index agent_mailbox_sender_idx de 0044)
+      -- message, index agent_mailbox_sender_idx de 0044)
       LEFT JOIN LATERAL (
           SELECT left(m.body, 400) AS body, m.work_item_id,
                  extract(epoch from m.created_at)::float8 AS ts
