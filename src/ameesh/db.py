@@ -57,6 +57,22 @@ _CONNECT_HINTS = (
     "no such file or directory",
     "timeout expired",
     "server closed the connection",
+    # coupure en cours de requête ou de session (L72) : réseau, VPN, serveur
+    # redémarré — même famille que l'échec de connexion
+    "could not receive data",
+    "could not send data",
+    "connection timed out",
+    "no route to host",
+    "network is unreachable",
+    "ssl syscall",
+    "ssl connection has been closed",
+    "terminating connection",
+    "the database system is starting up",
+    "the database system is shutting down",
+    "connection is lost",
+    "connection is closed",
+    "connection already closed",
+    "consuming input failed",
     "password authentication failed",
     "database \"",
     "role \"",
@@ -69,7 +85,10 @@ class DbError(RuntimeError):
 
 
 class Unavailable(DbError):
-    """La base n'est pas joignable (ou le pilote n'existe pas)."""
+    """La base n'est pas joignable (ou le pilote n'existe pas).
+
+    Panne passagère pour l'exécuteur (L72) : il réessaie avec une attente
+    croissante au lieu de s'arrêter."""
 
 
 class SchemaMissing(DbError):
@@ -251,7 +270,10 @@ class PsqlDriver:
                 env=self.env, timeout=self._client_timeout,
             )
         except subprocess.TimeoutExpired as exc:
-            raise DbError(
+            # Le serveur annule lui-même une requête trop longue
+            # (statement_timeout, 5 s plus tôt) : un délai CLIENT dépassé dit
+            # donc que le serveur ne répond plus — réseau ou base (L72).
+            raise Unavailable(
                 "psql : délai client dépassé (%ss) — requête abandonnée"
                 % self._client_timeout) from exc
         except OSError as exc:
@@ -450,8 +472,8 @@ class _PsqlTransaction:
             ready, _, _ = select.select([fd], [], [], wait)
             if not ready:
                 self._close(abort=True)
-                raise DbError("psql : délai client dépassé (%ss) — transaction annulée"
-                              % timeout)
+                raise Unavailable("psql : délai client dépassé (%ss) — transaction annulée"
+                                  % timeout)
             chunk = os.read(fd, 65536)
             if not chunk:
                 raise self._failure()
@@ -603,6 +625,10 @@ class PsycopgDriver:
         self._psycopg = psycopg
         self._dict_row = dict_row
         self.cfg = cfg
+        #: reconnexion après une coupure (L72) : un seul fil rouvre la connexion
+        self._reconnect_lock = threading.Lock()
+        #: transactions explicites ouvertes : jamais de reconnexion au milieu
+        self._tx_depth = 0
         self.conn = self._connect()
         self._check()
 
@@ -617,16 +643,43 @@ class PsycopgDriver:
             raise Unavailable("psycopg : %s" % _one_line(exc)) from exc
 
     def _check(self) -> None:
-        if self.cfg.schema != "public":
-            self.conn.execute("SET search_path TO %s" % quote_ident(self.cfg.schema))
-        if self.cfg.statement_timeout_ms and self.cfg.statement_timeout_ms > 0:
-            self.conn.execute("SET statement_timeout = %d" % int(self.cfg.statement_timeout_ms))
         try:
+            if self.cfg.schema != "public":
+                self.conn.execute("SET search_path TO %s" % quote_ident(self.cfg.schema))
+            if self.cfg.statement_timeout_ms and self.cfg.statement_timeout_ms > 0:
+                self.conn.execute("SET statement_timeout = %d"
+                                  % int(self.cfg.statement_timeout_ms))
             self.conn.execute("SELECT 1").fetchone()
         except Exception as exc:
             raise Unavailable("psycopg : %s" % _one_line(exc)) from exc
 
+    def _live(self) -> None:
+        """Rouvre la connexion si une coupure l'a cassée (L72).
+
+        psycopg marque la connexion `broken` (ou `closed`) après une erreur
+        réseau, et ne se reconnecte jamais seul : sans ceci, une panne de base
+        de quelques secondes rendait le pilote inutilisable jusqu'au
+        redémarrage du processus. Jamais au milieu d'une transaction
+        explicite : la suite de ses instructions passerait hors transaction ;
+        on lève `Unavailable`, la transaction est perdue (annulée par la
+        coupure) et l'appelant la rejoue en entier."""
+        conn = self.conn
+        if not (getattr(conn, "closed", False) or getattr(conn, "broken", False)):
+            return
+        if self._tx_depth:
+            raise Unavailable("psycopg : connexion perdue pendant une transaction")
+        with self._reconnect_lock:
+            if self.conn is not conn:
+                return  # un autre fil a déjà rouvert
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self.conn = self._connect()
+            self._check()
+
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
+        self._live()
         try:
             with self.conn.cursor() as cur:
                 if params:
@@ -638,6 +691,7 @@ class PsycopgDriver:
             raise _map_error(exc) from exc
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
+        self._live()
         try:
             with self.conn.cursor() as cur:
                 if params:
@@ -649,6 +703,7 @@ class PsycopgDriver:
             raise _map_error(exc) from exc
 
     def script(self, sql: str) -> None:
+        self._live()
         try:
             with self.conn.transaction():
                 self.conn.execute(sql)
@@ -660,11 +715,15 @@ class PsycopgDriver:
         """Transaction explicite sur la connexion (BEGIN … COMMIT, ROLLBACK sur
         exception) ; rend le pilote lui-même, dont les requêtes passent par
         cette connexion. Imbriquée : un point de sauvegarde."""
+        self._live()
+        self._tx_depth += 1
         try:
             with self.conn.transaction():
                 yield self
         except self._psycopg.Error as exc:
             raise _map_error(exc) from exc
+        finally:
+            self._tx_depth -= 1
 
     def listen(self, channels: Iterable[str]) -> "Listener":
         try:
@@ -682,6 +741,7 @@ class PsycopgDriver:
             pass
 
     def ping(self) -> None:
+        self._live()
         self._check()
 
 
@@ -737,6 +797,30 @@ def _map_error(exc: Exception) -> DbError:
     if "does not exist" in text and ("relation" in text or "table" in text):
         return SchemaMissing(_one_line(exc))
     return DbError(_one_line(exc))
+
+
+def is_unavailable(exc: BaseException) -> bool:
+    """La base est-elle injoignable (panne passagère, L72) plutôt qu'en erreur ?"""
+    return isinstance(exc, Unavailable)
+
+
+def explain(exc: BaseException, limit: int = 160) -> str:
+    """Cause lisible d'une erreur de base, sur une ligne, pour un statut ou un
+    journal (L72). Un délai de connexion dépassé n'est pas un problème de
+    migration : « ameesh migrate » n'est suggéré que si une table manque."""
+    text = _one_line(exc)[:limit]
+    low = text.lower()
+    if "timeout expired" in low or "délai client dépassé" in low or "timed out" in low:
+        return ("délai de connexion dépassé, base injoignable (réseau, VPN ou serveur ; "
+                "délai réglable par AMEESH_CONNECT_TIMEOUT) : %s" % text)
+    if isinstance(exc, Unavailable):
+        return "base injoignable : %s" % text
+    if isinstance(exc, SchemaMissing) or (
+            "does not exist" in low and ("relation" in low or "table" in low
+                                         or "column" in low or "colonne" in low)) \
+            or "n'existe pas" in low:
+        return "%s : « ameesh migrate » ?" % text
+    return text
 
 
 # --------------------------------------------------------------------------

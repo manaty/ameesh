@@ -65,10 +65,15 @@ def choose(worker, book=None, *, pause: bool = True) -> str | None:
     try:
         choice = accounts.choose(worker.db, worker.cfg.host, harness, items, book,
                                  agent=worker.name)
+    except db_mod.Unavailable:
+        # Base injoignable (L72) : ce n'est ni une pause budget ni un problème
+        # de migration — l'exécuteur suspend les tours et réessaie, avec son
+        # propre statut « base injoignable », levé au retour de la base.
+        raise
     except db_mod.DbError as exc:
         # sans état des comptes, on ne sait pas quel compte est sous le seuil
-        return ("état des comptes indisponible (%s) : « ameesh migrate » ?"
-                % " ".join(str(exc).split())[:160]) if pause else None
+        return ("état des comptes indisponible (%s)" % db_mod.explain(exc)
+                if pause else None)
     if choice.switched:
         journal(worker, harness, choice.switched)
     if choice.profile is None:
@@ -120,9 +125,10 @@ def for_turn(worker):
         return worker._account
     try:
         return accounts.current(worker.db, worker.cfg.host, harness, items)
+    except db_mod.Unavailable:
+        raise  # panne de base (L72) : la consigne est remise, pas d'échec de tour
     except db_mod.DbError as exc:
-        worker._account_error = "état des comptes indisponible : %s" % (
-            " ".join(str(exc).split())[:160])
+        worker._account_error = "état des comptes indisponible : %s" % db_mod.explain(exc)
         return INVALID
 
 
@@ -362,7 +368,8 @@ def attach_profile(cfg, db, harness: str):
     try:
         profile = accounts.current(db, cfg.host, harness, items)
     except db_mod.DbError as exc:
-        print("attach : état des comptes indisponible : %s" % exc, file=sys.stderr)
+        print("attach : état des comptes indisponible : %s" % db_mod.explain(exc),
+              file=sys.stderr)
         return False, None
     problems = accounts.check(profile)
     if problems:

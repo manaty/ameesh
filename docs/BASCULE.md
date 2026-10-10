@@ -461,6 +461,22 @@ ProtectHome=read-only
 WantedBy=multi-user.target
 ```
 
+**Base distante (VPN, WireGuard)** : depuis L72, l'exécuteur traverse une
+panne passagère de la base sans s'arrêter (voir
+[EXPLOITATION.md](EXPLOITATION.md#panne-passagère-de-la-base-l72)). Deux
+réglages du DSN complètent : des *keepalives* TCP pour qu'une connexion morte
+(LISTEN, pilote psycopg) soit détectée en une minute plutôt qu'au délai TCP du
+noyau (un quart d'heure et plus), et un délai de connexion adapté au lien :
+
+```bash
+# ~/.config/ameesh/env (ou AMEESH_DSN de l'unité)
+AMEESH_DSN='postgresql://ameesh@10.77.0.1:5432/ameesh?keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=3&tcp_user_timeout=60000'
+AMEESH_CONNECT_TIMEOUT=10   # défaut depuis L72 (3 s avant)
+```
+
+Côté serveur, `tcp_keepalives_idle = 60` dans `postgresql.conf` libère de même
+les sessions d'un client disparu.
+
 À surveiller : agents basculés sans bail vivant, non-lus de plus de 15 min,
 baux expirés, `ameesh decisions` (approbations en attente, issues inconnues à
 trancher), état du canon par hôte (`ameesh canon check`).
