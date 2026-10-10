@@ -3,7 +3,7 @@
 (amendement du 2026-10-10 à la décision 0034).
 
 Constat : le compte primaire, toujours en fenêtre ouverte et sous son rythme,
-gagnait toujours le choice « ce qui expire le plus tôt » ; les deux autres
+gagnait toujours le choix « ce qui expire le plus tôt » ; les deux autres
 comptes payés n'avaient jamais servi, leur forfait hebdomadaire était perdu.
 Règle amendée : pour une nouvelle session, parmi les comptes sous leur seuil
 dans toutes leurs fenêtres, celui qui a le plus de retard sur son rythme
@@ -29,14 +29,14 @@ WEEK = 7 * DAY
 
 
 def _codex_weekly(home: str, used_percent: float, resets_at: float,
-                 court: tuple | None = None) -> None:
+                 short: tuple | None = None) -> None:
     """Un journal Codex avec la fenêtre de 7 jours (`secondary`) et, si
-    `court` est donné, celle de 5 h (`primary`) : `(pourcentage, resets_at)`."""
+    `short` est donné, celle de 5 h (`primary`) : `(pourcentage, resets_at)`."""
     folder = os.path.join(home, "sessions", "2026", "10", "10")
     os.makedirs(folder, exist_ok=True)
     limits = {"plan_type": "pro",
-              "primary": ({"used_percent": court[0], "window_minutes": 300,
-                           "resets_at": court[1]} if court else None),
+              "primary": ({"used_percent": short[0], "window_minutes": 300,
+                           "resets_at": short[1]} if short else None),
               "secondary": {"used_percent": used_percent, "window_minutes": 10080,
                             "resets_at": resets_at}}
     with open(os.path.join(folder, "rollout-test.jsonl"), "w", encoding="utf-8") as fh:
@@ -64,12 +64,12 @@ class RepartitionTest(_Base):
 
     def test_three_accounts_two_without_reading_choice_goes_to_unused(self):
         """Le constat du 2026-10-10 : primaire à 35 % de sa semaine (rythme
-        55 %), les deux autres jamais utilisés. Le choice ne reste plus au
+        55 %), les deux autres jamais utilisés. Le choix ne reste plus au
         primaire ; entre les deux comptes neufs, l'ordre déclaré."""
         items = self._items()
         now = float(int(time.time()))
         # 45 % de la semaine écoulée : rythme 55 %
-        _codex_weekly(items[0].path, 35, now + 0.55 * WEEK, court=(37, now + 2 * HOUR))
+        _codex_weekly(items[0].path, 35, now + 0.55 * WEEK, short=(37, now + 2 * HOUR))
         choice = self._choose(items, now)
         self.assertEqual(choice.profile.name, "secondaire")
         self.assertEqual(choice.switched["from"], "primaire")
@@ -80,11 +80,11 @@ class RepartitionTest(_Base):
         # la bascule en base porte la même raison
         self.assertEqual(self.db.query("SELECT reason FROM account_switches")[0]["reason"],
                          choice.why)
-        # `ameesh accounts list` : même prochain choice, même raison
+        # `ameesh accounts list` : même prochain choix, même raison
         cfg = mock.Mock(host=self.cfg.host, accounts={"codex": self.declared})
         rows = accounts.report(cfg, self.db, self._book(), now=now, record=False)
         self.assertEqual([r["account"] for r in rows if r["next"]], ["secondaire"])
-        self.assertIn("↳ prochain choice pour une nouvelle session : sans relevé : 0 % "
+        self.assertIn("↳ prochain choix pour une nouvelle session : sans relevé : 0 % "
                       "utilisé, le plus en retard sur son rythme ; avant : tertiaire",
                       accounts.format_rows(rows))
 
@@ -120,7 +120,7 @@ class RepartitionTest(_Base):
         now = float(int(time.time()))
         _codex_weekly(items[0].path, 35, now + 0.55 * WEEK)
         # secondaire : 1 % de sa semaine, mais 95 % de sa fenêtre de 5 h
-        _codex_weekly(items[1].path, 1, now + 0.55 * WEEK, court=(95, now + HOUR))
+        _codex_weekly(items[1].path, 1, now + 0.55 * WEEK, short=(95, now + HOUR))
         _codex_weekly(items[2].path, 20, now + 0.55 * WEEK)
         choice = self._choose(items, now)
         self.assertEqual(choice.profile.name, "tertiaire")
