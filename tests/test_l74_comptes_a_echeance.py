@@ -2,9 +2,10 @@
 """L74 — consommer d'abord la capacité qui expire le plus tôt (décision 0034).
 
 Les comptes d'un fournisseur forment un réservoir : pour chaque tour, parmi
-les comptes sous leur seuil de rythme, celui dont la capacité inutilisée
-expire le plus tôt ; une session garde son compte tant qu'il est sous son
-seuil ; un relevé échu compte pour 0 % ; le forçage prime ; tous au seuil :
+les comptes sous leur seuil de rythme, celui qui a le plus de retard sur son
+rythme (amendement du 2026-10-10, L117 ; à égalité, celui dont la capacité
+inutilisée expire le plus tôt) ; une session garde son compte tant qu'il est
+sous son seuil ; un relevé échu compte pour 0 % ; le forçage prime ; tous au seuil :
 pause. Mêmes jauges enregistrées que L30 (journaux de session Codex rejoués).
 """
 from __future__ import annotations
@@ -56,21 +57,24 @@ class ChoixParEcheanceTest(_Base):
         return accounts.choose(self.db, self.cfg.host, "codex", items, self._book(),
                                now=now, **kw)
 
-    def test_le_compte_qui_expire_le_plus_tot_passe_devant(self):
+    def test_le_cas_du_matin_va_au_secondaire(self):
         """Le cas du 2026-10-10 : primaire à 20 % de sa fenêtre de 7 jours,
-        5 h du secondaire inutilisée qui se remet à zéro dans 52 min."""
+        5 h du secondaire inutilisée qui se remet à zéro dans 52 min. Le
+        secondaire est aussi le plus en retard sur son rythme (L117)."""
         items = self._items()
         now = time.time()
         _codex_deux_fenetres(items[0].path, (10, now + 3 * HEURE), (20, now + 4 * JOUR))
         _codex_deux_fenetres(items[1].path, (0, now + 52 * 60), (5, now + 6 * JOUR))
         choix = self._choisir(items, now)
         self.assertEqual(choix.profile.name, "secondaire")
-        self.assertIn("codex-300min expire dans 52 min, 0 % utilisé", choix.why)
+        self.assertIn("codex-10080min 5 % utilisé (rythme 24 %), le plus en retard "
+                      "sur son rythme ; avant : primaire codex-10080min 20 % utilisé",
+                      choix.why)
         self.assertEqual(choix.switched["kind"], "bascule")
         self.assertEqual([(b["from_account"], b["to_account"]) for b in self._bascules()],
                          [("primaire", "secondaire")])
         # le journal des bascules porte la raison du choix
-        self.assertIn("expire dans 52 min", self.db.query(
+        self.assertIn("le plus en retard sur son rythme", self.db.query(
             "SELECT reason FROM account_switches")[0]["reason"])
 
     def test_egalite_ordre_declare(self):
@@ -80,15 +84,16 @@ class ChoixParEcheanceTest(_Base):
             _codex_rollout(profil.path, 10, now + 2 * HEURE)
         self.assertEqual(self._choisir(items, now).profile.name, "primaire")
 
-    def test_sans_releve_ordre_declare_apres_les_echeances_connues(self):
-        """Un compte sans fenêtre en cours n'expire pas : il passe après ceux
-        dont la capacité expire, mais reste choisi s'il est seul sous le seuil."""
+    def test_sans_releve_passe_en_premier(self):
+        """Amendement du 2026-10-10 (L117) : un compte sans relevé compte pour
+        0 % utilisé, il passe AVANT un compte dont la fenêtre court ; entre
+        comptes sans relevé, l'ordre déclaré."""
         items = self._items(3)
         now = time.time()
-        _codex_rollout(items[2].path, 10, now + 2 * HEURE)
+        _codex_rollout(items[0].path, 10, now + 2 * HEURE)
+        self.assertEqual(self._choisir(items, now).profile.name, "secondaire")
+        _codex_rollout(items[1].path, 95, now + 2 * HEURE)     # au seuil
         self.assertEqual(self._choisir(items, now).profile.name, "tertiaire")
-        _codex_rollout(items[2].path, 95, now + 2 * HEURE)
-        self.assertEqual(self._choisir(items, now).profile.name, "primaire")
 
     def test_le_rythme_reste_la_garde(self):
         """Le compte qui expire le plus tôt mais au-dessus de son plafond de
@@ -157,7 +162,7 @@ class ChoixParEcheanceTest(_Base):
         self.assertTrue(choix.kept)
         self.assertIn("continuité", choix.why)
         self.assertEqual(self._bascules(), [])                 # rien ne change en base
-        # le compte de la session atteint son seuil : choix par échéance
+        # le compte de la session atteint son seuil : le plus en retard
         _codex_rollout(items[0].path, 95, now + 3 * HEURE)
         choix = self._choisir(items, now, session_account="primaire")
         self.assertEqual(choix.profile.name, "secondaire")
@@ -206,8 +211,9 @@ class RapportTest(_Base):
         texte = accounts.format_rows(lignes)
         self.assertIn("perdu à la remise à zéro si rien ne change : codex-300min 100 % "
                       "dans 52 min", texte)
-        self.assertIn("prochain choix pour une nouvelle session : codex-300min expire "
-                      "dans 52 min, 0 % utilisé", texte)
+        self.assertIn("prochain choix pour une nouvelle session : codex-10080min 5 % "
+                      "utilisé (rythme 24 %), le plus en retard sur son rythme ; avant : "
+                      "primaire codex-10080min 20 % utilisé (rythme 53 %)", texte)
         # lecture seule : aucun relevé écrit (L71)
         self.assertEqual(self.db.query("SELECT count(*) AS n FROM quota_gauge_readings")[0]["n"],
                          0)
@@ -221,7 +227,7 @@ class RapportTest(_Base):
 class ExecuteurTest(_Base):
     """Dans l'exécuteur : continuité de session, choix à l'ouverture, journal."""
 
-    def test_session_en_cours_reste_nouvelle_session_va_a_l_echeance(self):
+    def test_session_en_cours_reste_nouvelle_session_va_au_plus_en_retard(self):
         comptes = self._codex_comptes()
         _runner, ancien = self._worker("cxa", "codex", {"codex": comptes})
         _runner2, neuf = self._worker("cxb", "codex", {"codex": comptes})
@@ -243,14 +249,14 @@ class ExecuteurTest(_Base):
                 self.assertEqual(len(tours), 1)
                 self.assertEqual(tours[0]["compte"]["CODEX_HOME"], comptes[0]["path"])
                 self.assertIn("resume", tours[0]["argv"])
-                # cxb n'a pas de session : choix par échéance → secondaire
+                # cxb n'a pas de session : le plus en retard → secondaire
                 self._tour(neuf)
                 self.assertEqual(self.turns()[-1]["compte"]["CODEX_HOME"],
                                  comptes[1]["path"])
             texte = "\n".join(journal)
             self.assertIn("[cxa] compte codex : primaire — continuité", texte)
-            self.assertIn("[cxb] compte codex : secondaire — codex-300min expire dans", texte)
-            self.assertIn("0 % utilisé", texte)
+            self.assertIn("[cxb] compte codex : secondaire — codex-300min 0 % utilisé "
+                          "(rythme 90 %), le plus en retard sur son rythme", texte)
             # cxb a maintenant sa session sur le secondaire : continuité,
             # journalisée une fois, pas à chaque sondage
             avant = len(journal)
