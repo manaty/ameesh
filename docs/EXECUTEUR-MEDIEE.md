@@ -63,8 +63,8 @@ Comptes : 62 opérations, dont 24 lectures et 38 écritures. 52 passent par
 lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
 servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (245
-opérations depuis la 1.6.x) est classée, admise ou refusée. Toute opération ajoutée à
+signature et les mêmes types. Il vérifie aussi que l'interface entière (253
+opérations depuis la 1.6.x et L118, L119) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
 Les 22 opérations ajoutées à l'interface par la 1.6.x sont refusées à
@@ -80,6 +80,13 @@ l'attente de pression de l'hôte affichée dans `ameesh show`) sont refusées de
 même. Sur un exécuteur médié, l'attente de pression ne s'affiche pas, et une
 pause critique n'est pas levée d'elle-même quand la pression retombe,
 comme avant L31b.
+
+Les huit opérations `work.*` de L118 (lots liés au courrier, branches des
+lots : `open_by_ref`, `open_for`, `set_branch`, `open_with_branch`,
+`set_branch_head`) et de L119 (file d'amélioration : `backlog`,
+`backlog_add`, `auto_takes_since`) sont refusées aussi. Un exécuteur médié
+ne fait pas de relevé des branches : c'est l'affaire des hôtes classiques et
+du serveur ; `mail send --lot` n'est pas disponible depuis un appareil.
 
 ## Requête et réponse
 

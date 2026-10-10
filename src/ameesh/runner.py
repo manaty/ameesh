@@ -3802,8 +3802,8 @@ class Runner:
         défaut 300 s ; 0 = aucun). L'exécuteur, et non `notify` : il tourne sur
         chaque hôte, là où sont les dossiers de travail des assignés."""
         interval = max(0.0, float(getattr(self.cfg, "branch_sweep_interval", 0) or 0))
-        if interval <= 0 or self.once:
-            return
+        if interval <= 0 or self.once or getattr(self, "mediated", False):
+            return  # exécuteur médié : `work.open_with_branch` hors contrat 1.1
 
         def boucle() -> None:
             while not self.stop.wait(max(30.0, interval)):

@@ -19,7 +19,7 @@ import textwrap
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ENTRY = os.path.join(REPO, "deploy", "image-executeur", "ameesh-executor")
+ENTRY = os.path.join(REPO, "deploy", "executor-image", "ameesh-executor")
 CODE = "K7Q2-9XWD-4MZP-HT3V-R8NB-6YCF"
 URL = "https://mesh.exemple.org"
 

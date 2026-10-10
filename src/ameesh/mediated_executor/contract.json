@@ -3631,7 +3631,7 @@
   }
  ],
  "refused": {
-  "interface_total": 245,
+  "interface_total": 253,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3891,6 +3891,9 @@
     "add",
     "add_milestone",
     "assign",
+    "auto_takes_since",
+    "backlog",
+    "backlog_add",
     "by_package",
     "close",
     "close_merged",
@@ -3902,10 +3905,15 @@
     "items",
     "link_package",
     "milestones",
+    "open_by_ref",
+    "open_for",
+    "open_with_branch",
     "overdue_delegations",
     "refresh_package_parents",
     "resolve_delegation",
     "returned_delegations",
+    "set_branch",
+    "set_branch_head",
     "timeline"
    ]
   }
