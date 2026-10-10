@@ -16,7 +16,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import account_turn, accounts, balance, cost, registry, storage
+from ameesh import account_turn, accounts, adapters, balance, cost, registry, storage
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
@@ -423,6 +423,11 @@ class ExecuteurTest(_Base):
             self.assertEqual(tours[1]["compte"]["CLAUDE_CONFIG_DIR"], comptes[1]["path"])
             self.assertNotIn("--resume", tours[1]["argv"])
             self.assertIn("Reprise de session après rotation", tours[1]["argv"][-1])
+            # le résumé de l'agent, encadré : sa propre note, sans autorité
+            self.assertEqual(tours[0]["argv"][-1], adapters.SUMMARY_PROMPT)
+            self.assertIn("le résumé que tu as écrit toi-même", tours[1]["argv"][-1])
+            self.assertIn('auteur="toi-même, session précédente" autorite="aucune"',
+                          tours[1]["argv"][-1])
             self.assertIn("rotation avec résumé", self._fil().lower())
         finally:
             worker.watchdog_stop.set()

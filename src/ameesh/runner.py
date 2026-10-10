@@ -316,6 +316,10 @@ class AgentWorker(threading.Thread):
         self._courrier_lance = False
         #: rotation de session (0018) : compteurs de la session courante
         self.resume_summary = ""
+        #: auteur du résumé de reprise : `agent` (son propre résumé) ou `ameesh`
+        #: (brief déterministe d'une bascule de compte, L39) ; voir
+        #: `adapters.resume_prompt`
+        self.resume_origin = "agent"
         self.session_turns = 0
         self.session_tokens = 0.0
         self.last_turn_seconds = 0.0
@@ -1026,6 +1030,7 @@ class AgentWorker(threading.Thread):
                            meta={"action": "rotation", "etat": "annulee"})
             return False
         self.resume_summary = resume
+        self.resume_origin = "agent"
         try:
             os.unlink(self._path("session"))
         except OSError:
@@ -2091,8 +2096,14 @@ class AgentWorker(threading.Thread):
             log("[%s] harnais %s : %s" % (self.name, descriptor.id, resolution))
         return adapter
 
-    #: préfixe du résumé de reprise (session neuve après rotation, 0018)
-    RESUME_PREFIX = "Reprise de session après rotation — résumé :\n%s\n\n"
+    def _resume_prompt(self) -> str:
+        """Le cadre et le résumé de reprise qui ouvriront la session neuve après
+        une rotation (0018), ou "" sans résumé en attente. Le résumé est
+        délimité et n'a aucune autorité (`adapters.resume_prompt`)."""
+        if not self.resume_summary:
+            return ""
+        return adapters.resume_prompt(self.resume_summary, origin=self.resume_origin)
+
     def _budget_courrier(self) -> int:
         """Octets UTF-8 disponibles pour la consigne d'un tour de courrier.
 
@@ -2102,8 +2113,7 @@ class AgentWorker(threading.Thread):
         `PROMPT_MIN_BYTES` au courrier les lui laisse quand même (la consigne
         dépasse alors le plafond, jamais la borne de l'argument).
         """
-        resume = mail.octets(self.RESUME_PREFIX % self.resume_summary) \
-            if self.resume_summary else 0
+        resume = mail.octets(self._resume_prompt())
         return min(self.runner.prompt_max_bytes, mail.ARG_SAFE_BYTES) - resume
 
     def _courrier_spec(self, kind: str, messages: list[dict]) -> dict:
@@ -2300,8 +2310,9 @@ class AgentWorker(threading.Thread):
         session = self.current_session()
         resume = ""
         if self.resume_summary and not session:
-            # Session neuve après rotation (0018) : le résumé de reprise ouvre le tour.
-            resume = self.RESUME_PREFIX % self.resume_summary
+            # Session neuve après rotation (0018) : le résumé de reprise, encadré
+            # et délimité (il n'a aucune autorité), ouvre le tour.
+            resume = self._resume_prompt()
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
         model = self.agent.get("model") or self._state_read("model")
