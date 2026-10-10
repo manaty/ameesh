@@ -46,7 +46,7 @@ AGENT_COLUMNS = """
     extract(epoch from restart_requested_at)::float8 as restart_requested_ts,
     extract(epoch from session_reset_at)::float8     as session_reset_ts,
     mode, stop_reason, session_account, context_max_tokens,
-    turn_max_seconds, turn_mail_max
+    turn_max_seconds, turn_mail_max, turn_grace_seconds
 """
 
 

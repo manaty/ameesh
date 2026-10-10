@@ -553,6 +553,36 @@ def avis_borne(attente: int, borne: int) -> str:
             "la suite au tour suivant." % (attente, borne))
 
 
+def avis_borne_travail(attente: int, borne: int, travail: list[str]) -> str:
+    """Borne atteinte, mais un travail lancé pendant le tour tourne encore :
+    le tour n'est pas coupé pour le courrier (le conclure maintenant
+    laisserait ce travail sans personne pour en lire le résultat)."""
+    return ("[ameesh] %d message(s) en attente restent pour ton tour suivant : au plus "
+            "%d message(s) te sont remis pendant un même tour. Un travail lancé pendant "
+            "ce tour tourne encore (%s) : ne conclus pas avant sa fin ; conclus ensuite "
+            "ce tour, l'exécuteur te remettra la suite au tour suivant."
+            % (attente, borne, " ; ".join(travail[:3])
+               + (" ; …" if len(travail) > 3 else "")))
+
+
+#: le travail du tour (processus de fond, conteneurs) est relevé au plus à ce
+#: rythme par le hook, une fois la borne du courrier atteinte (secondes)
+TRAVAIL_RELEVE_S = 30.0
+
+
+def _travail_du_tour(cfg: Config, bk, tour: str, etat: dict) -> list[str]:
+    """Le travail lancé pendant ce tour qui tourne encore : tant qu'il y en a,
+    la borne du courrier ne demande pas de conclure. Relevé espacé (l'état
+    du tour garde le dernier relevé)."""
+    maintenant = time.time()
+    if maintenant - float(etat.get("travail_ts") or 0.0) < TRAVAIL_RELEVE_S:
+        return list(etat.get("travail") or [])
+    from . import background
+    travail = background.hook_jobs(cfg, bk.db if bk.kind == "pg" else None, tour)
+    etat["travail"], etat["travail_ts"] = travail, maintenant
+    return travail
+
+
 def tour_path(cfg: Config, name: str) -> str:
     """État du courrier remis par le hook pendant le tour en cours (L105)."""
     return os.path.join(cfg.state_dir, "hooks", name + ".tour.json")
@@ -566,10 +596,15 @@ def tour_lit(cfg: Config, name: str, turn: str) -> dict:
         if isinstance(etat, dict) and etat.get("turn") == turn:
             return {"turn": turn, "remis": int(etat.get("remis") or 0),
                     "attente": int(etat.get("attente") or 0),
-                    "signale": bool(etat.get("signale"))}
+                    "signale": bool(etat.get("signale")),
+                    # borne atteinte pendant un travail du tour (dit une fois)
+                    "differe": bool(etat.get("differe")),
+                    "travail": [str(t) for t in etat.get("travail") or []],
+                    "travail_ts": float(etat.get("travail_ts") or 0.0)}
     except (OSError, ValueError, TypeError):
         pass
-    return {"turn": turn, "remis": 0, "attente": 0, "signale": False}
+    return {"turn": turn, "remis": 0, "attente": 0, "signale": False, "differe": False,
+            "travail": [], "travail_ts": 0.0}
 
 
 def _tour_ecrit(cfg: Config, name: str, etat: dict) -> None:
@@ -691,7 +726,9 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         # L105 : pendant un tour mené par l'exécuteur, au plus `turn_mail_max`
         # messages remis ; au-delà, rien n'est réservé (ils restent pour le
         # tour suivant), le Stop n'est plus bloqué, et l'agent est invité à
-        # conclure son tour.
+        # conclure son tour — jamais tant qu'un travail lancé pendant le tour
+        # tourne encore (processus de fond, conteneurs du tour) : il le saura,
+        # et l'invitation viendra après.
         tour = os.environ.get("AMEESH_TURN_ID") or ""
         borne = cfg.turn_mail_max if (tour and binding.bound_to_lease) else 0
         etat = tour_lit(cfg, name, tour) if borne else None
@@ -700,10 +737,17 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 return 0
             attente = _attente(bk, name, [])
             etat["attente"] = attente
-            if attente and not etat["signale"] and _emit({
-                    "hookSpecificOutput": {"hookEventName": event,
-                                           "additionalContext": avis_borne(attente, borne)}}):
-                etat["signale"] = True
+            if attente and not etat["signale"]:
+                travail = _travail_du_tour(cfg, bk, tour, etat)
+                if not travail:
+                    if _emit({"hookSpecificOutput": {
+                            "hookEventName": event,
+                            "additionalContext": avis_borne(attente, borne)}}):
+                        etat["signale"] = True
+                elif not etat["differe"] and _emit({"hookSpecificOutput": {
+                        "hookEventName": event,
+                        "additionalContext": avis_borne_travail(attente, borne, travail)}}):
+                    etat["differe"] = True
             _tour_ecrit(cfg, name, etat)
             return 0
         remise = _Remise(bk, name, binding)
@@ -714,8 +758,13 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 attente = _attente(bk, name, msgs)
                 etat["attente"] = attente
                 if attente:
-                    avis = "\n\n" + avis_borne(attente, borne)
-                    etat["signale"] = True
+                    travail = _travail_du_tour(cfg, bk, tour, etat)
+                    if travail:
+                        avis = "\n\n" + avis_borne_travail(attente, borne, travail)
+                        etat["differe"] = True
+                    else:
+                        avis = "\n\n" + avis_borne(attente, borne)
+                        etat["signale"] = True
             if event == "Stop":
                 if not msgs:
                     bk.stop_counter(name, reset=True)

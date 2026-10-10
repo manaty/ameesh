@@ -584,8 +584,29 @@ class AgentWorker(threading.Thread):
         except PermissionError:
             return True
 
-    def terminate(self, grace: float | None = None, hard: bool = False) -> None:
+    def _reap_group(self, pgid: int | None, skip: int | None) -> None:
+        """Zombies adoptés du groupe (l'exécuteur est sous-moissonneur de ses
+        tours) : moissonnés, sinon ils gardent le groupe « vivant » pour
+        `killpg(…, 0)`. Jamais `skip`, le harnais, qu'attend son `Popen`."""
+        tracker = getattr(self.runner, "background", None)
+        if pgid is None or tracker is None or not tracker.subreaper:
+            return
+        from . import platform as os_layer
+        try:
+            table = os_layer.process_table()
+        except os_layer.NotAvailable:
+            return
+        for p in table:
+            if p["pgid"] == pgid and p["zombie"] and p["pid"] != skip:
+                os_layer.reap(p["pid"])
+
+    def terminate(self, grace: float | None = None, hard: bool = False,
+                  group: bool = True) -> None:
         """Arrête le harnais et tout son groupe.
+
+        `group=False` (tour clos à un point sûr, L105) : le harnais SEUL est
+        arrêté (SIGTERM, grâce, puis SIGKILL) ; le travail lancé en fond
+        pendant le tour garde son délai de grâce (fin de `_run_turn`).
 
         Par défaut : SIGTERM, 3 secondes de grâce, puis SIGKILL. `hard=True`
         (perte du bail) envoie SIGKILL **directement, avant tout journal** : le
@@ -606,12 +627,21 @@ class AgentWorker(threading.Thread):
             proc = self.proc
         if proc is None:
             return
-        pgid = self._group(proc)
+        pgid = self._group(proc) if group else None
         if proc.poll() is None and not hard:
             self._signal_group(pgid, proc, signal.SIGTERM)
             deadline = time.monotonic() + max(0.0, self.TERMINATE_GRACE if grace is None else grace)
             while time.monotonic() < deadline and proc.poll() is None:
                 time.sleep(0.05)
+        if not group:
+            if proc.poll() is None:
+                self._signal_group(None, proc, signal.SIGKILL)
+                log_async("[%s] le harnais survit : SIGKILL (harnais seul)" % self.name)
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            return
         if not self._group_alive(pgid) and proc.poll() is not None:
             # Groupe mort **et** enfant direct moissonné : rien à faire. Si le
             # pid n'est pas un chef de groupe (groupe inconnu) mais que l'enfant
@@ -630,13 +660,18 @@ class AgentWorker(threading.Thread):
                 proc.wait(timeout=max(0.0, fin - time.monotonic()))
             except subprocess.TimeoutExpired:
                 pass
+        moisson = 0.0
         while time.monotonic() < fin and self._group_alive(pgid):
+            if time.monotonic() >= moisson:
+                # sous-moissonneur : les membres tués sont nos zombies
+                self._reap_group(pgid, proc.pid)
+                moisson = time.monotonic() + 0.05
             time.sleep(0.005)
         if self._group_alive(pgid):
             log_async("[%s] groupe toujours vivant après SIGKILL (état noyau ?)" % self.name)
 
     def stop_group_now(self, reason: str, *, grace: float | None = None,
-                       hard: bool = False) -> bool:
+                       hard: bool = False, group: bool = True) -> bool:
         """Point de passage **unique** de tout arrêt de harnais (0018, verdicts codex3).
 
         1. Le signal part d'abord (`terminate`, qui n'écrit rien avant) ;
@@ -647,7 +682,8 @@ class AgentWorker(threading.Thread):
 
         Tous les déclencheurs — échéance, bail perdu, arrêt de l'exécuteur,
         préemption, et demain la garde de budget (L13) — passent par ici : un
-        nouveau chemin hérite des sondes paramétrées.
+        nouveau chemin hérite des sondes paramétrées. `group=False` : le
+        harnais seul (tour clos à un point sûr ; voir `terminate`).
         """
         with self.lock:
             proc = self.proc
@@ -660,7 +696,7 @@ class AgentWorker(threading.Thread):
             log_async("[%s] arrêt demandé (%s) : harnais non encore publié"
                       % (self.name, reason))
             return False
-        self.terminate(grace=grace, hard=hard)
+        self.terminate(grace=grace, hard=hard, group=group)
         log_async("[%s] harnais arrêté (%s)" % (self.name, reason))
         return True
 
@@ -921,6 +957,29 @@ class AgentWorker(threading.Thread):
         (`AMEESH_TURN_MAIL_MAX`). 0 = sans borne."""
         from .exploitation import effective_turn_mail_max
         return effective_turn_mail_max(self.cfg, self.agent)
+
+    def turn_grace_seconds(self) -> int:
+        """Délai de grâce du travail de fond d'un tour : réglage de l'agent
+        (`ameesh set turn_grace_seconds=…`), sinon défaut de l'hôte
+        (`AMEESH_TURN_GRACE_SECONDS`, 20 min). 0 = nettoyage immédiat."""
+        from .exploitation import effective_turn_grace_seconds
+        return effective_turn_grace_seconds(self.cfg, self.agent)
+
+    def _urgent_end(self) -> str:
+        """Raison d'un arrêt d'urgence du tour qui s'achève, ou '' : fin
+        normale (le harnais a fini, ou il a été clos à un point sûr), dont le
+        travail de fond a son délai de grâce."""
+        if self.lease_lost.is_set() or self.deadline_passed():
+            return "bail perdu"
+        if self.preempting.is_set():
+            return "préemption"
+        if self.restarting.is_set():
+            return "redémarrage demandé"
+        if self._power_texte:
+            return "batterie critique"
+        if self.runner.stop.is_set():
+            return "arrêt de l'exécuteur"
+        return ""
 
     def turn_close_due(self, started: float, reread: int,
                        now: float | None = None) -> str | None:
@@ -2296,7 +2355,26 @@ class AgentWorker(threading.Thread):
         except Exception as exc:
             log("[%s] ménage après le tour %s impossible (%s)" % (self.name, turn_id[:8], exc))
 
+    def _with_background_note(self, spec: dict) -> tuple[dict, list[str]]:
+        """Le travail de fond des tours précédents (délai de grâce) : ce qui
+        tourne encore, ce qui a fini (code de sortie), ce qui a été arrêté —
+        dit à l'agent en tête de consigne, jamais dans un tour de résumé. Rend
+        la consigne et les tours clos à noter « dits » une fois le harnais
+        lancé. Une consigne déjà à la borne d'un argument garde sa place : la
+        note attend alors le tour suivant."""
+        tracker = getattr(self.runner, "background", None)
+        if tracker is None or spec.get("prompt") == adapters.SUMMARY_PROMPT:
+            return spec, []
+        note, dits = tracker.note_for(self.name)
+        if not note:
+            return spec, []
+        if mail.octets(self._resume_prompt() + note + spec["prompt"]) > mail.ARG_SAFE_BYTES:
+            return spec, []
+        return dict(spec, prompt=note + spec["prompt"]), dits
+
     def _run_turn(self, spec: dict) -> bool:
+        # Travail de fond des tours précédents : en tête de consigne.
+        spec, fond_dits = self._with_background_note(spec)
         harness = self.agent.get("harness") or "other"
         try:
             adapter = self._adapter()
@@ -2408,9 +2486,13 @@ class AgentWorker(threading.Thread):
         menage_tour = None
         try:
             from . import menage as menage_mod
+            # session neuve : dossier temporaire vidé — jamais sous le travail
+            # de fond d'un tour précédent encore en délai de grâce
+            fond = getattr(self.runner, "background", None)
             menage_tour = menage_mod.Turn.begin(
                 self.cfg, self.runner.housekeeping_policy(), self.name, cwd,
-                new_session=not session, base_env=env)
+                new_session=not session and not (fond and fond.has_jobs(self.name)),
+                base_env=env)
             env.update(menage_tour.env)
         except Exception as exc:
             log("[%s] ménage avant le tour impossible (%s)" % (self.name, exc))
@@ -2480,14 +2562,19 @@ class AgentWorker(threading.Thread):
         #: la résolution, interpréteur absent) — erreur de l'hôte
         echec_lancement = ""
         lignes = 0
+        proc = None
         try:
             with open(stderr_path, "ab") as stderr:
                 try:
-                    proc = subprocess.Popen(
-                        argv, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
-                        text=True, bufsize=1, env=env,
-                        start_new_session=True,  # son groupe : on peut le tuer en entier
-                    )
+                    # Le moissonneur de l'exécuteur ne touche jamais un harnais,
+                    # même pas pendant son lancement (voir `background`).
+                    with self.runner.launch_lock:
+                        proc = subprocess.Popen(
+                            argv, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
+                            text=True, bufsize=1, env=env,
+                            start_new_session=True,  # son groupe : on peut le tuer en entier
+                        )
+                        self.runner.harness_pids.add(proc.pid)
                 except OSError as exc:
                     raise _LancementImpossible("lancement impossible de %s : %s"
                                                % (argv[0], exc.strerror or exc)) from exc
@@ -2500,6 +2587,8 @@ class AgentWorker(threading.Thread):
             # Lancé (et publié, pour que l'arrêt le trouve) : les messages de la
             # consigne sont livrés, et seulement eux.
             self._livre_courrier(spec)
+            if fond_dits:  # la note du travail de fond a été montrée
+                self.runner.background.mark_reported(fond_dits)
             # Course de publication : un déclencheur d'arrêt (bail perdu,
             # préemption, arrêt de l'exécuteur, échéance) a pu conclure pendant
             # que ce Popen n'était pas encore publié (proc=None). Le recontrôle
@@ -2562,9 +2651,11 @@ class AgentWorker(threading.Thread):
                             # Point sûr : l'appel d'outil en cours est fini et son
                             # résultat est dans la session. Aucun harnais mené
                             # n'offre d'interruption propre en mode non
-                            # interactif : arrêt propre habituel (SIGTERM, grâce).
+                            # interactif : arrêt propre habituel (SIGTERM, grâce)
+                            # du harnais SEUL — le travail lancé en fond pendant
+                            # le tour garde son délai de grâce.
                             clos = True
-                            self.stop_group_now("tour clos : %s" % cloture)
+                            self.stop_group_now("tour clos : %s" % cloture, group=False)
                     usage = parsed.get("usage")
                     if isinstance(usage, dict):
                         # Clés de chaque harnais normalisées (L60 : l'usage
@@ -2587,14 +2678,36 @@ class AgentWorker(threading.Thread):
             heartbeat_done.set()
             preempt_done.set()
             pgid = self.pgid
-            # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
-            # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
-            # du veilleur une fois `self.proc` effacé (sonde codex3 B5a-S).
-            self.terminate()
+            # Fin NORMALE (harnais fini et moissonné, aucun arrêt d'urgence) :
+            # ce qui tourne encore — processus du groupe, conteneurs du tour
+            # sans lot — garde un délai de grâce (`background`). Sinon, ou
+            # sans délai, le nettoyage habituel, tout de suite.
+            fond = None
+            try:
+                if (proc is not None and pgid and proc.poll() is not None
+                        and not self.runner.once and self.turn_grace_seconds() > 0
+                        and not self._urgent_end()):
+                    fond = self.runner.background.survivors(turn_id, pgid)
+            except Exception as exc:  # dans le doute, le nettoyage d'avant
+                log_async("[%s] travail de fond du tour %s non examiné (%s)"
+                          % (self.name, turn_id[:8], exc))
+                fond = None
+            if fond is None:
+                # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
+                # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
+                # du veilleur une fois `self.proc` effacé (sonde codex3 B5a-S).
+                self.terminate()
             with self.lock:
                 self.proc = None
                 self.pgid = None
-            self._close_turn_resource(turn_id, pgid)
+            with self.runner.launch_lock:
+                self.runner.harness_pids.discard(pgid)
+            if fond is not None:
+                self.runner.background.start(
+                    agent=self.name, turn_id=turn_id, pgid=pgid, members=fond[0],
+                    containers=fond[1], grace_s=self.turn_grace_seconds())
+            else:
+                self._close_turn_resource(turn_id, pgid)
             self._menage_apres_tour(menage_tour, turn_id, spec)
 
         duration = time.time() - started
@@ -2945,6 +3058,14 @@ class Runner:
         #: valeurs par défaut tant qu'aucun canon n'est lu
         from . import menage as menage_mod
         self._housekeeping = menage_mod.Policy()
+        #: travail de fond des tours finis, en délai de grâce (suivi par le
+        #: fil `fond` en mode service) ; pids des harnais lancés, que le
+        #: moissonneur des orphelins adoptés ne touche jamais (lancement
+        #: compris : `launch_lock`)
+        from . import background as background_mod
+        self.background = background_mod.Tracker(self, log=log_async)
+        self.launch_lock = threading.Lock()
+        self.harness_pids: set[int] = set()
         self.turns = 0
         self.did_turn = False
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
@@ -3184,6 +3305,9 @@ class Runner:
             # du bail (sonde codex3 B5a-P).
             worker.stop_group_now("arrêt de l'exécuteur (dur)", grace=0, hard=True)
             worker.release_lease()
+        # Travail de fond encore en délai de grâce : le nettoyage habituel,
+        # tout de suite (rien ne survit à l'exécuteur qui le suit).
+        self.background.stop_all("arrêt de l'exécuteur")
         # L'écouteur (fil démon) ne doit plus écrire quand l'interpréteur se
         # finalise : sa connexion est fermée ci-dessus, on l'attend, borné.
         if self.listener_thread is not None:
@@ -3411,9 +3535,13 @@ class Runner:
         return getattr(self, "_housekeeping", None) or menage_mod.Policy()
 
     def agents_in_turn(self) -> set:
+        """Agents en tour sur cet exécuteur — et ceux dont le travail de fond
+        d'un tour fini tourne encore (délai de grâce) : le ménage les traite
+        de même (dossier temporaire, caches, worktrees)."""
         with self.lock:
-            return {name for name, worker in self.workers.items()
-                    if worker.is_alive() and getattr(worker, "proc", None) is not None}
+            en_tour = {name for name, worker in self.workers.items()
+                       if worker.is_alive() and getattr(worker, "proc", None) is not None}
+        return en_tour | self.background.agents()
 
     def housekeeping_once(self) -> dict | None:
         """Un passage de ménage (L73) ; ne lève jamais.
@@ -3752,6 +3880,12 @@ class Runner:
             return 0 if self.did_turn else 3
         self.listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
         self.listener_thread.start()
+        # Travail de fond des tours (délai de grâce) : l'exécuteur adopte les
+        # orphelins de ses tours (codes de sortie), et les suit.
+        self.background.start_monitor(self.stop)
+        if not self.background.subreaper:
+            log_async("travail de fond des tours : pas de sous-moissonneur sur cet OS, "
+                      "codes de sortie inconnus")
         # L106 : après l'écoute (un réveil n'attend pas ces vérifications)
         self.log_harnesses()
         self.report_boot_orphans()

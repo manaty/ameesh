@@ -1638,7 +1638,8 @@ class Operations(Domain):
     """Ce que l'orchestrateur lit et règle pour exploiter les agents (L26).
 
     Réglages d'agent (`session_policy`, `effort`, `tier`,
-    `context_max_tokens`, `turn_max_seconds`, `turn_mail_max`), lot de la session
+    `context_max_tokens`, `turn_max_seconds`, `turn_mail_max`,
+    `turn_grace_seconds`), lot de la session
     courante, demande de redémarrage, lectures enrichies pour `ameesh list
     --json` et `ameesh alerts`, usage par tour, historique des jauges de
     forfait et soldes d'un fournisseur payé au token. Instants en secondes
@@ -1646,9 +1647,10 @@ class Operations(Domain):
 
     #: colonnes réglables par `set_settings` (liste fermée)
     SETTINGS = ("session_policy", "effort", "tier", "context_max_tokens",
-                "turn_max_seconds", "turn_mail_max")
+                "turn_max_seconds", "turn_mail_max", "turn_grace_seconds")
     #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
-    INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max")
+    INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max",
+                        "turn_grace_seconds")
 
     @abc.abstractmethod
     def set_settings(self, name: str, values: dict) -> bool:
@@ -1847,6 +1849,10 @@ class TurnResources(Domain):
     étiquette de conteneur) et la ferme au retour du tour. Une ressource qui
     survit à son tour est marquée `orphan` — **jamais supprimée** — et
     `ameesh alerts` la signale (`orphan_resource`).
+
+    Délai de grâce (travail de fond d'un tour fini normalement) : la ligne
+    reste `running`, son `ended_at` marque la fin du tour ; elle est fermée
+    à la fin du travail de fond ou à l'échéance de la grâce.
     """
 
     @abc.abstractmethod
@@ -1859,6 +1865,13 @@ class TurnResources(Domain):
     def close_turn(self, turn_id: str, *, orphan: bool,
                    containers: Sequence[str] | None = None) -> None:
         """Ferme la ligne : `done` si la ressource est rendue, `orphan` sinon."""
+
+    @abc.abstractmethod
+    def begin_grace(self, turn_id: str,
+                    containers: Sequence[str] | None = None) -> None:
+        """Le tour est fini mais son travail de fond tourne encore (délai de
+        grâce) : `ended_at` posé, la ligne reste `running` (ses conteneurs ne
+        sont pas supprimés par le ménage tant qu'elle l'est)."""
 
     @abc.abstractmethod
     def mark_orphan(self, turn_id: str,
@@ -1880,7 +1893,8 @@ class TurnResources(Domain):
     @abc.abstractmethod
     def stale_running(self, older_than_s: float, host: str | None = None) -> list[dict]:
         """Les lignes encore `running` ouvertes il y a plus de `older_than_s`
-        secondes : un exécuteur mort les a laissées derrière lui."""
+        secondes (fin du tour, pour une ligne en délai de grâce) : un
+        exécuteur mort les a laissées derrière lui."""
 
 
 class Housekeeping(Domain):

@@ -28,7 +28,8 @@
         | unset [--per-hour] [--per-day] [--agent A]
         plafonds de budget du mesh, en base, relus à chaud (L70) ;
   ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais
-        context_max_tokens=15M|0 turn_max_seconds=30m|2h|0 turn_mail_max=5|0
+        context_max_tokens=15M|0 turn_max_seconds=30m|2h|0 turn_mail_max=20|0
+        turn_grace_seconds=20m|0
         réglages d'exécution, effet au prochain tour ;
   ameesh alerts [--follow] [--json]     alertes d'exploitation (un objet par ligne) ;
   ameesh notify [--once] [--dry-run] [--interval S] [--json] | --test human:ID
