@@ -1,0 +1,39 @@
+#cloud-config
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Premier démarrage de la VM d'un mesh ameesh (lot L55). Gabarit Terraform :
+# $${…} est un littéral shell, $${organisation} n'en est pas un.
+# Tout le travail est dans installer-serveur.sh, rejouable à la main.
+
+package_update: true
+package_upgrade: true
+packages:
+  - git
+  - curl
+  - ca-certificates
+  - wireguard
+  - postgresql-common
+  - python3-venv
+  - python3-pip
+  - docker.io
+  - jq
+  - unattended-upgrades
+
+write_files:
+  - path: /etc/ameesh-admins.pub
+    owner: root:root
+    permissions: '0600'
+    content: |
+%{ for k in admin_ssh_keys ~}
+      ${k}
+%{ endfor ~}
+
+runcmd:
+  # Accès root réservé aux administrateurs du mesh (0029 : qui administre une
+  # machine lit tout ce qu'elle contient) : l'hébergeur ne recopie plus les
+  # clés de toute l'organisation.
+  - [ sh, -c, "systemctl disable --now scw-fetch-ssh-keys.service scw-fetch-ssh-keys.timer 2>/dev/null || true" ]
+  - [ sh, -c, "install -m 0600 /etc/ameesh-admins.pub /root/.ssh/authorized_keys" ]
+  - [ sh, -c, "git clone https://github.com/manaty/ameesh.git /opt/ameesh/src" ]
+  - [ sh, -c, "cd /opt/ameesh/src && git checkout --detach ${ameesh_ref}" ]
+  - [ sh, -c, "ORGANISATION='${organisation}' WIREGUARD_PORT='${wireguard_port}' /opt/ameesh/src/deploy/serveur/installer-serveur.sh > /var/log/ameesh-installation.log 2>&1" ]
