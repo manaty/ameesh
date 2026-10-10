@@ -772,6 +772,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
     try:
         if args.work_command in plan_cli.COMMANDS:
             return plan_cli.run(db, args)
+        if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
+            from . import backlog
+            return backlog.run(db, args)
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
@@ -1510,7 +1513,9 @@ def build_parser() -> argparse.ArgumentParser:
     work_sub = p_work.add_subparsers(dest="work_command")
     pw_add = work_sub.add_parser("add")
     pw_add.add_argument("--title", required=True)
-    pw_add.add_argument("--type", default="evolution", choices=["bug", "evolution"])
+    pw_add.add_argument("--type", default="evolution", choices=["bug", "evolution"],
+                        help="un élément de la file d'amélioration passe par "
+                             "`ameesh work backlog add` (L119)")
     pw_add.add_argument("--source", default="")
     pw_add.add_argument("--app", default="")
     pw_add.add_argument("--body", default=None)
@@ -1600,6 +1605,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_ms.set_defaults(func=cmd_work)
     from . import plan_cli
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)
+    from . import backlog
+    backlog.add_parsers(work_sub, cmd_work)  # file d'amélioration (L119, 0037)
 
     p_cost = sub.add_parser("cost", help="coût des tours et jauges de forfait (L12)")
     cost_sub = p_cost.add_subparsers(dest="cost_command")

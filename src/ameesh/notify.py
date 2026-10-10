@@ -4,9 +4,13 @@
   ameesh notify [--once] [--dry-run] [--json] [--interval S]
                 [--long-turn S] [--idle-mail S] [--dead-grace S]
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
+                [--take-idle S] [--take-max-per-hour N] [--take-paid]
         suit les alertes d'exploitation (`ameesh alerts --follow`, mêmes
         seuils, mêmes clés de dédoublonnage) et envoie chaque alerte levée
         et chaque résolution à l'humain responsable, sur ses canaux.
+        L119 (0037) : à chaque passage, la prise automatique confie un
+        élément de la file d'amélioration aux agents au repos
+        (`ameesh.backlog.auto_take`) ; `--take-idle 0` la coupe.
   ameesh notify --test human:<id> [--json]
         envoie un message de test sur chacun des canaux de cet humain.
 
@@ -67,7 +71,7 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
-                 "host_not_ready", "host_power_low")
+                 "host_not_ready", "host_power_low", "backlog_empty")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -112,6 +116,7 @@ TYPE_LABELS = {
     "balance_low": "solde bas",
     "host_not_ready": "hôte non prêt",
     "host_power_low": "batterie faible de l'hôte",
+    "backlog_empty": "file d'amélioration vide",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired")
@@ -837,8 +842,11 @@ class Notifier:
     retenter les canaux en échec, envoyer les résumés de débit."""
 
     def __init__(self, cfg: Config, ncfg: NotifyConfig, state: dict | None = None, *,
-                 sender=None, dry_run: bool = False, emit=None, log=None, clock=None):
+                 sender=None, dry_run: bool = False, emit=None, log=None, clock=None,
+                 take: dict | None = None):
         self.cfg, self.ncfg = cfg, ncfg
+        #: L119 : réglages de la prise automatique (`backlog.auto_take`) ; None la coupe
+        self.take = take
         self.state = state if state is not None else empty_state()
         self.dry_run = dry_run
         self.sender = sender or (DrySender() if dry_run else Sender(timeout=ncfg.timeout))
@@ -886,6 +894,8 @@ class Notifier:
             if not self._pending(entry):
                 del self.state["resolved"][key]
         self._summaries(now)
+        if self.take:
+            self._auto_take(db, current, now)
         for human in list(self.state["rate"]):
             window = [t for t in self.state["rate"][human] if now - t < RATE_WINDOW_S]
             if window:
@@ -893,6 +903,24 @@ class Notifier:
             else:
                 del self.state["rate"][human]
         return records
+
+    # -- prise automatique (L119, décision 0037) ------------------------------
+    def _auto_take(self, db, current: list, now: float) -> None:
+        from . import backlog
+        try:
+            taken = backlog.auto_take(self.cfg, db, now=now, alerts=current,
+                                      dry_run=self.dry_run, **self.take)
+        except db_mod.DbError:
+            raise
+        except Exception as exc:     # la prise ne fait jamais tomber les alertes
+            self.log("prise automatique en échec : %s" % _clean(exc, 200))
+            return
+        for take in taken:
+            item = take["item"]
+            entry = {"alert": {"type": "auto_take", "agent": take["agent"],
+                               "lot": int(item["id"]), "title": item.get("title")},
+                     "human": None, "source": "file d'amélioration"}
+            self._record("auto_take", entry, "a_blanc" if self.dry_run else "prise", {})
 
     # -- levée ----------------------------------------------------------------
     def _raise(self, entry: dict, router: Router, now: float) -> None:
@@ -1131,7 +1159,8 @@ def send_test(ncfg: NotifyConfig, human: str, host: str, sender=None) -> list:
 def _format(record: dict) -> str:
     who = record.get("human") or "—"
     what = "[%s] %s" % (record.get("type"), _subject(record))
-    event = {"raised": "levée", "resolved": "résolue", "summary": "résumé"}.get(
+    event = {"raised": "levée", "resolved": "résolue", "summary": "résumé",
+             "auto_take": "prise automatique"}.get(
         record["event"], record["event"])
     channels = ", ".join("%s %s" % (k, v) for k, v in sorted(record["channels"].items()))
     line = "%s %s → %s : %s%s" % (event, what, who, record["delivery"].replace("_", " "),
@@ -1182,7 +1211,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test", metavar="human:ID", default=None,
                         help="envoie un message de test sur chacun des canaux de cet humain")
     exploitation.add_threshold_arguments(parser)
+    # L119 (0037) : prise automatique dans la file d'amélioration
+    from . import backlog
+    parser.add_argument("--take-idle", type=float,
+                        default=exploitation._env_float("AMEESH_TAKE_IDLE",
+                                                        backlog.DEFAULT_TAKE_IDLE_S),
+                        help="prise automatique : agent réveillable au repos sans lot depuis "
+                             "S secondes (défaut 1800 ; 0 coupe la prise)")
+    parser.add_argument("--take-max-per-hour", type=int,
+                        default=int(exploitation._env_float(
+                            "AMEESH_TAKE_MAX_PER_HOUR", backlog.DEFAULT_TAKE_MAX_PER_HOUR)),
+                        help="prises automatiques au plus par heure glissante, pour tout le "
+                             "mesh (défaut 2)")
+    parser.add_argument("--take-paid", action="store_true",
+                        default=os.environ.get("AMEESH_TAKE_PAID", "") == "1",
+                        help="autoriser la prise par des agents payés au token (après les "
+                             "agents au forfait ; jamais pendant balance_low)")
     return parser
+
+
+def take_settings(args) -> dict | None:
+    """Réglages de `backlog.auto_take` lus des options ; None si la prise est coupée."""
+    idle = float(getattr(args, "take_idle", 0) or 0)
+    most = int(getattr(args, "take_max_per_hour", 0) or 0)
+    if idle <= 0 or most <= 0:
+        return None
+    return {"idle_s": idle, "max_per_hour": most,
+            "allow_paid": bool(getattr(args, "take_paid", False))}
 
 
 def _interval(args, ncfg: NotifyConfig) -> float:
@@ -1234,7 +1289,8 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
         else:
             print(_format(record), flush=True)
 
-    notifier = Notifier(cfg, ncfg, state, dry_run=args.dry_run, emit=emit)
+    notifier = Notifier(cfg, ncfg, state, dry_run=args.dry_run, emit=emit,
+                        take=take_settings(args))
     seuils = exploitation.thresholds(args)
     interval = _interval(args, ncfg)
     db = None
