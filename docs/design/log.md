@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-10 (affectations suivies)
+* **L118** : l'orchestrateur confiait le travail par courrier sans lot (agents « sans lot » dans `ameesh projects`, `idle_capacity` trompée, frise vide) et ses lots restaient ouverts après la fusion directe de leur branche sur la cible, sans PR ni gel. Désormais : `mail send --lot <id|réf>` rattache et assigne le lot au destinataire (garde L37 ; jamais repris à un autre agent), `--new-lot "titre"` le crée, un orchestrateur qui écrit à un agent sans lot est averti ; un lot porte sa branche et sa cible (migration 0048), l'exécuteur constate la fusion par le contenu (commit de fusion, avance rapide, squash, commit de fusion qui cite la branche) et ferme le lot ; `idle_capacity` part aussi en courrier `event` aux orchestrateurs. Consigne : [ORCHESTRATEUR.md](../ORCHESTRATEUR.md).
+
 ## 2026-10-10 (répartition des comptes)
 * **Amendement** de [0034](decisions/0034-consommer-d-abord-ce-qui-expire.md), accord du propriétaire : `ameesh accounts list` montrait le compte Claude primaire à 35 % de sa semaine (rythme 55 %) et les deux autres jamais utilisés, leurs forfaits hebdomadaires perdus. Le primaire, toujours en fenêtre ouverte, gagnait toujours le choix par échéance. Désormais, une nouvelle session va au compte le plus en retard sur son rythme (plus petit `utilisé / rythme` sur sa fenêtre la plus contraignante ; sans relevé : 0 %, en premier) ; l'échéance et l'ordre déclaré départagent. Forçage, continuité, pause et Codex inchangés.
 * **L117** (1.6.2) : la règle, sa raison dans le journal de l'exécuteur et dans `ameesh accounts list` (« le plus en retard sur son rythme ; avant : … »).

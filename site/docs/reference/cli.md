@@ -30,7 +30,7 @@ on its first line.
 ## Mailbox: `ameesh mail` / `agent-mail`
 
 ```
-agent-mail send <dest|all> <text…> [--from NAME] [--lot ID]
+agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"]
                 [--kind request|reply|notify|event] [--urgent]
                 [--sign --key FILE] [--expires 24h]
 agent-mail list                       # agents, host, lease, unread
@@ -195,16 +195,38 @@ ameesh fil show <project> [<lot>] [--last N] [--meta]
 ameesh fil tail <project> [<lot>] [--last N] [--meta] [--interval S]   # default 0.5 s
 ```
 
+**Mail linked to lots (L118).** When the sender is an orchestrator (declared
+in `AMEESH_ALERT_ORCHESTRATORS`, `roles: [orchestrateur]` on its canon Agent
+record, or an agent that assigned lots in the last 30 days):
+
+* a message to an agent with **no open lot** prints a warning (stderr and the
+  thread metadata); the message is still delivered;
+* `--lot ID|REF` resolves an open lot (number, `#12`, or a unique reference:
+  `issue_ref`, plan record, branch, first word of the title) and assigns it to
+  the recipient if it has no assignee, belongs to the sender or to a human,
+  through the guarded assignment (a refusal delivers nothing, exit 2). A lot
+  owned by **another agent** is never taken over: warning with the
+  `ameesh work assign` command. An unknown reference stays a free thread label;
+* `--new-lot "title"` (any sender) creates the lot, assigned to the recipient,
+  and attaches the message to it;
+* a single `agent/…` branch quoted in the message is set on the attached lot
+  when it has none.
+
+From any other sender, `--lot` stays a plain thread label. See
+`docs/ORCHESTRATEUR.md`.
+
 ## Work items: `ameesh work`
 
 ```
 ameesh work add --title TITLE [--type bug|evolution] [--source S] [--app APP]
                 [--body BODY] [--issue-ref REF] [--workstream W]
                 [--assignee A] [--budget USD] [--actor ACTOR] [--externe]
+                [--branch agent/…] [--target BRANCH]
 ameesh work list [--state S] [--assignee A] [--limit N] [--json]
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
-ameesh work assign <id> <agent> [--externe] [--actor A]
+ameesh work assign <id> <agent> [--externe] [--actor A] [--branch agent/…] [--target BRANCH]
+ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]
 ameesh work delegate <id> <agent> --within 30m|2h|1d|SECONDS [--actor A]
 ameesh work expire-delegations [--dry-run] [--json]
 ameesh work note <id> <text> [--actor A]
@@ -221,6 +243,18 @@ deadline: if the delegate has not worked on it by then, the lot goes back to
 the delegator (`--actor`, else the current assignee). The runner processes
 deadlines at every pass; `expire-delegations` does it by hand. See
 [Operate agents](../guides/operate-agents.md#guarded-assignment-and-delegation).
+
+**Branch of a lot (L118).** `--branch` records the lot's branch, `--target`
+its target (default: `git config ameesh.target` in the repository, else
+`origin/HEAD`, else `main`/`master`). The runner checks, every
+`AMEESH_BRANCH_SWEEP_INTERVAL` (300 s), the open lots with a branch whose
+assignee is on its host, in the assignee's working directory (read only, no
+`fetch`), and closes as merged the lot whose branch entered its target, with
+or without a PR: tip merged by a merge commit, last commit seen ahead found in
+the target (ancestor, patch-id, squash — also after the branch was deleted),
+or a merge commit of the target quoting the full branch name. A freshly
+created branch, already an ancestor of its target, is not a merge.
+`work sync-branches` runs the same check by hand (`--dry-run`: close nothing).
 
 ## Canon and placement
 
