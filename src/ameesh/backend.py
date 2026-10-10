@@ -253,7 +253,12 @@ class PgBackend:
                 allow_structured=allow_structured, thread=(dest != "all"),
                 kind=kind, payload={"urgent": True} if urgent else None,
                 **dict(signed or {}))
-            registry.upsert(self.db, target, host=host)
+            if registry.get(self.db, target) is None:
+                # destinataire inconnu : il naît sur l'hôte de l'envoi. Un
+                # agent existant ne change JAMAIS d'hôte par un envoi : un
+                # humain qui écrit depuis le serveur déplaçait l'agent d'un
+                # appareil prêté hors de son hôte (essai L115)
+                registry.upsert(self.db, target, host=host)
             if dest == "all":
                 project = fil.project_for(self.cfg, projects.get(sender), projects.get(target))
                 groups.setdefault(project, []).append((target, message_id))
