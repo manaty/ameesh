@@ -52,7 +52,7 @@ WITH unread AS (
      ORDER BY assignee, updated_at DESC, id DESC
 ), open_labels AS (
     -- une étiquette (issue, fiche du plan, branche, premier mot du titre) qui
-    -- désigne UN SEUL lot ouvert ; ambiguë, elle ne désigne rien
+    -- désigne UN SEUL lot ouvert (ambiguë, elle ne désigne rien)
     SELECT k.ref, min(w.id) AS id
       FROM work_items w
      CROSS JOIN LATERAL (VALUES (lower(w.issue_ref)), (lower(w.package_id)),
@@ -101,7 +101,7 @@ WITH unread AS (
           SELECT w.id, w.title, w.state FROM work_items w
            WHERE w.id = __SESSION_REF__ AND w.state NOT IN __CLOSED__) sw ON true
       -- le dernier lot OUVERT cité par l'agent dans ses derniers messages
-      -- (hors événements ; index agent_mailbox_sender_idx de 0044)
+      -- (hors événements, index agent_mailbox_sender_idx de 0044)
       LEFT JOIN LATERAL (
           SELECT w.id, w.title, w.state
             FROM (SELECT m.id, m.work_item_id AS ref
