@@ -178,21 +178,29 @@ EOF"
     /opt/ameesh/venv/bin/ameesh cost balance 2>&1 | tail -3" || echo "solde illisible (à vérifier)"
 }
 
+# arrêt d'UNE persona à son premier instant hors tour (sondage court)
+arreter_une() {
+  local p=$1 st
+  for _ in $(seq 1 1440); do
+    st=$(psql_ancienne -c "SELECT status FROM agent_registry WHERE name = '$p'")
+    if [ "$st" != running ]; then
+      systemctl --user stop "ameesh-runner-agent@$p.service"
+      echo "$p : arrêté (était $st)"; return 0
+    fi
+    sleep 5
+  done
+  echo "$p : toujours en tour après 2 h : arrêt manuel requis" >&2
+}
+
 arreter() {
   mapfile -t garde < <(personas)
-  etape "arrêt entre deux tours (${#garde[@]} personas)"
+  etape "arrêt entre deux tours, en parallèle (${#garde[@]} personas)"
+  local enfants=()
   for p in "${garde[@]}"; do
     unite_active "$p" || continue
-    printf '%s : ' "$p"
-    for _ in $(seq 1 480); do
-      st=$(psql_ancienne -c "SELECT status FROM agent_registry WHERE name = '$p'")
-      if [ "$st" != running ]; then
-        systemctl --user stop "ameesh-runner-agent@$p.service"; echo "arrêté (était $st)"; break
-      fi
-      sleep 15
-    done
-    unite_active "$p" && echo "toujours en tour après 2 h : arrêt manuel requis" >&2
+    arreter_une "$p" & enfants+=($!)
   done
+  [ ${#enfants[@]} -gt 0 ] && wait "${enfants[@]}"
   systemctl --user stop ameesh-notify.service 2>/dev/null || true
   for p in $PERSONAS_ATTACHEES; do
     echo "$p : session interactive — ne rien envoyer jusqu'au rebranchement"
