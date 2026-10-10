@@ -169,6 +169,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'session_account',
         -- L60 (0041) : plafond de contexte (un nombre, pas de contenu)
         'context_max_tokens',
+        -- L105 (0046) : plafonds du tour (des nombres, pas de contenu)
+        'turn_max_seconds', 'turn_mail_max',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
         'canon'
     ]),

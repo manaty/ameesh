@@ -873,7 +873,17 @@ class CostBook:
                       if e.get("type") == "result" and isinstance(e.get("total_cost_usd"), (int, float))]
             usage = [e.get("usage") or {} for e in events if e.get("type") == "result"]
             last = cum.get("cum_usd")
-            if not totals:
+            if not usage:
+                # L105 : tour clos avant son `result` (plafond du tour, arrêt,
+                # préemption) — l'usage de chaque appel, lu sur les messages du
+                # modèle (une fois par id), au barème ; aucun cumul n'est relevé.
+                usage = _claude_call_usages(events)
+                usd = sum(
+                    ((_num(u, "input_tokens") + _num(u, "cache_creation_input_tokens")) * pin
+                     + _num(u, "cache_read_input_tokens") * pcache
+                     + _num(u, "output_tokens") * pout) / 1e6
+                    for u in usage)
+            elif not totals:
                 usd = 0.0
             elif unknown_resume:
                 # L71 : total d'avant le tour inconnu — estimation par les
@@ -1200,6 +1210,29 @@ def format_totals(sums: dict) -> list:
         lines.append("mode de paiement inconnu          : 1 h %.4f $ · 24 h %.4f $" % (
             sums["unknown"]["1h"], sums["unknown"]["24h"]))
     return lines
+
+
+def _claude_call_usages(events: Sequence[dict]) -> list[dict]:
+    """L105 : l'usage de chaque appel au modèle d'un tour Claude sans `result`.
+
+    Le flux répète l'usage d'un message sur chacun de ses blocs : il n'est
+    compté qu'une fois par id de message."""
+    vus: set = set()
+    out: list[dict] = []
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        message = event.get("message") or {}
+        usage = message.get("usage") if isinstance(message, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        ident = message.get("id")
+        if ident:
+            if ident in vus:
+                continue
+            vus.add(ident)
+        out.append(usage)
+    return out
 
 
 def _claude_windows(event: dict) -> list | None:

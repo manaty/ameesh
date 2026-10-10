@@ -4,7 +4,8 @@
 
 Émet le même flux JSONL que `claude -p --output-format stream-json`, journalise
 son argv dans $AMEESH_TEST_LOG, et obéit à deux variables de banc :
-AMEESH_TEST_SLEEP (secondes de sommeil) et AMEESH_TEST_EXIT (code).
+AMEESH_TEST_SLEEP (secondes de sommeil) et AMEESH_TEST_EXIT (code) ; L105 :
+AMEESH_TEST_CLAUDE_CALLS (JSON : appels au modèle, jetons relus, outil, durée).
 """
 import json
 import os
@@ -36,7 +37,8 @@ def main() -> int:
                 "env": {k: os.environ.get(k) for k in (
                     "AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
                     "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
-                    "AMEESH_HOST", "AMEESH_SCHEMA",
+                    "AMEESH_HOST", "AMEESH_SCHEMA", "AMEESH_TURN_MAIL_MAX",
+                    "AMEESH_TURN_ID",
                     # L73 : dossier temporaire et caches gérés
                     "TMPDIR", "TMP", "TEMP", "AMEESH_TMPDIR", "AMEESH_CACHE_DIR",
                     "npm_config_cache", "npm_config_store_dir", "YARN_CACHE_FOLDER")},
@@ -64,6 +66,24 @@ def main() -> int:
         # relevé de jauge enregistré (L30) : rejoué tel quel dans le flux
         print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
             "unifiedWindows": json.loads(os.environ["AMEESH_TEST_RATE_LIMIT"])}}), flush=True)
+    appels = json.loads(os.environ.get("AMEESH_TEST_CLAUDE_CALLS") or "[]")
+    for index, appel in enumerate(appels):
+        # L105 : un appel au modèle — usage par message (répété sur chaque bloc,
+        # comme le vrai flux), puis, s'il appelle un outil, son résultat
+        relus = int(appel.get("reread", 0))
+        usage = {"input_tokens": relus // 10, "cache_read_input_tokens": relus - relus // 10,
+                 "output_tokens": 10}
+        message = {"id": "msg-%d" % index, "usage": usage}
+        print(json.dumps({"type": "assistant", "message": dict(message, content=[
+            {"type": "text", "text": "appel %d" % index}])}), flush=True)
+        if appel.get("tool"):
+            print(json.dumps({"type": "assistant", "message": dict(message, content=[
+                {"type": "tool_use", "id": "outil-%d" % index, "name": "x", "input": {}}])}),
+                flush=True)
+            time.sleep(float(appel.get("sleep", 0)))
+            print(json.dumps({"type": "user", "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "outil-%d" % index,
+                 "content": "ok"}]}}), flush=True)
     print(json.dumps({"type": "assistant", "message": {"content": [
         {"type": "text", "text": "bonjour du faux claude (session %s)" % session}]}}), flush=True)
     print(json.dumps({"type": "result", "subtype": "success", "result": "fini",

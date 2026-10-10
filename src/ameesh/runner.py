@@ -320,6 +320,13 @@ class AgentWorker(threading.Thread):
         #: le dernier tour inscrit au grand livre, et sa session
         self.last_turn_reread = 0
         self.last_turn_reread_session: str | None = None
+        #: plafonds du tour (L105) : le tour suivant reprend le travail d'un
+        #: tour clos (raison), et la rotation forcée par le plafond de contexte
+        #: atteint pendant un tour (raison) attend le prochain passage entre deux tours
+        self.suite: str | None = None
+        self.rotation_forcee: str | None = None
+        #: raison de la clôture du dernier tour (L105), None s'il a fini seul
+        self.last_turn_closed: str | None = None
         #: `ameesh restart` (L26) : arrêt du tour en cours, puis session neuve
         self.restarting = threading.Event()
         #: comptes multiples (L30, 0027) : compte choisi pour le prochain tour, et
@@ -835,6 +842,7 @@ class AgentWorker(threading.Thread):
         self.session_tokens = 0.0
         self.last_turn_reread = 0
         self.nudged = False
+        self.suite = self.rotation_forcee = None  # L105 : la session neuve part du brief
         self.agent = registry.get(self.db, self.name) or self.agent
         log_async("[%s] redémarrage appliqué : session oubliée, brief en tête" % self.name)
         self._fil_note(
@@ -870,6 +878,37 @@ class AgentWorker(threading.Thread):
         (`AMEESH_CONTEXT_MAX_TOKENS`). 0 = désactivé."""
         from .exploitation import effective_context_max
         return effective_context_max(self.cfg, self.agent)
+
+    def turn_max_seconds(self) -> int:
+        """Durée maximale d'un tour (L105) : réglage de l'agent
+        (`ameesh set turn_max_seconds=…`), sinon défaut de l'exécuteur
+        (`AMEESH_TURN_MAX_SECONDS`). 0 = sans limite."""
+        from .exploitation import effective_turn_max_seconds
+        return effective_turn_max_seconds(self.cfg, self.agent)
+
+    def turn_mail_max(self) -> int:
+        """Messages remis par le hook pendant un tour (L105) : réglage de
+        l'agent (`ameesh set turn_mail_max=…`), sinon défaut de l'exécuteur
+        (`AMEESH_TURN_MAIL_MAX`). 0 = sans borne."""
+        from .exploitation import effective_turn_mail_max
+        return effective_turn_mail_max(self.cfg, self.agent)
+
+    def turn_close_due(self, started: float, reread: int,
+                       now: float | None = None) -> str | None:
+        """Le tour en cours doit-il se clore au prochain point sûr ? (L105)
+
+        Deux plafonds : les jetons relus depuis le début du tour (somme des
+        appels, la mesure du plafond de contexte L60) et la durée du tour.
+        Rend la raison, ou None."""
+        plafond = self.context_max_tokens()
+        if plafond > 0 and reread >= plafond and self.session_policy() != "jamais":
+            return "plafond de contexte : %d jetons relus dans le tour (plafond %d)" % (
+                reread, plafond)
+        duree_max = self.turn_max_seconds()
+        ecoule = (time.time() if now is None else now) - started
+        if duree_max > 0 and ecoule >= duree_max:
+            return "durée maximale du tour : %ds (plafond %ds)" % (int(ecoule), duree_max)
+        return None
 
     def context_rotation_due(self) -> bool:
         """Le dernier tour a-t-il relu plus que le plafond de contexte ? (L60)
@@ -912,7 +951,14 @@ class AgentWorker(threading.Thread):
         (R12), l'ancien id est conservé dans l'historique de l'état, puis la
         session est oubliée : le prochain tour repart d'une session neuve,
         préfixé par le résumé. Ne se déclenche jamais pendant un tour.
+
+        L105 : un tour clos par le plafond de contexte force la rotation au
+        premier passage (le grand livre d'un tour interrompu peut ne rien dire).
         """
+        if self.rotation_forcee and self.proc is None:
+            raison, self.rotation_forcee = self.rotation_forcee, None
+            if self.session_policy() != "jamais" and self.current_session():
+                return self._rotate(raison)
         if self.context_rotation_due():
             return self._rotate("plafond de contexte : %d jetons relus au dernier tour "
                                 "(plafond %d)" % (self.last_turn_reread,
@@ -1748,6 +1794,12 @@ class AgentWorker(threading.Thread):
             # ouvre le tour, la consigne interrompue suivra (0018).
             self.nudged = False
             return self._courrier_spec("urgent", autorises)
+        if self.suite:
+            # L105 : le tour précédent a été clos par un plafond ; le travail
+            # reprend avant toute nouvelle consigne (le courrier suit, par le hook).
+            raison, self.suite = self.suite, None
+            self.nudged = False
+            return {"kind": "suite", "prompt": adapters.SUITE_PROMPT % raison, "ids": []}
         prompt = registry.take_pending_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
         if prompt:
             self.nudged = False
@@ -2032,7 +2084,8 @@ class AgentWorker(threading.Thread):
                                model=model or None, effort=effort or None, patch=patch,
                                tier=tier or None)
         label = {"prompt": "consigne", "mail": "messages", "event": "événements",
-                 "urgent": "prioritaire", "idle": "reprise"}[spec["kind"]]
+                 "urgent": "prioritaire", "idle": "reprise",
+                 "suite": "suite"}[spec["kind"]]
         if spec.get("jeton") and mail.octets(resume + spec["prompt"]) > mail.ARG_SAFE_BYTES:
             # Garde-fou : le budget l'interdit ; jamais un E2BIG au lancement.
             self.fail_turn("consigne trop longue", "consigne de %d octets"
@@ -2096,6 +2149,8 @@ class AgentWorker(threading.Thread):
             # consomme rien (et le dossier ne donne jamais d'identité).
             "AMEESH_LEASE_EPOCH": str(self.epoch),
             "AGENT_MESH_LEASE_EPOCH": str(self.epoch),
+            # L105 : borne du courrier remis par le hook pendant ce tour
+            "AMEESH_TURN_MAIL_MAX": str(self.turn_mail_max()),
         }
         env.update(identite)
         if not account_turn.apply(self, env, compte):
@@ -2144,6 +2199,14 @@ class AgentWorker(threading.Thread):
         error: str | None = None
         result_code = 0
         self.last_output = ""
+        # L105 : plafonds pendant le tour — jetons relus (une fois par appel)
+        # et durée ; jamais sur un tour de résumé (rotation, bascule de compte)
+        plafonne = spec.get("prompt") != adapters.SUMMARY_PROMPT
+        relus = 0
+        appels_vus: set = set()
+        cloture: str | None = None
+        clos = False
+        self.last_turn_closed = None
 
         # Marqueur comptable **avant** le lancement : si on ne peut pas garantir
         # une trace, on ne dépense pas (fail-closed, L13 B5). Le marqueur est
@@ -2226,6 +2289,26 @@ class AgentWorker(threading.Thread):
                     for text in parsed.get("display") or []:
                         log("[%s] %s" % (self.name, text))
                         self.last_output = (self.last_output + "\n" + text)[-4000:]
+                    if plafonne and not clos:
+                        appel = parsed.get("call_usage")
+                        if isinstance(appel, dict):
+                            ident = parsed.get("call_id")
+                            if not ident or ident not in appels_vus:
+                                if ident:
+                                    appels_vus.add(ident)
+                                relus += adapters.reread_tokens(harness, appel)
+                        if cloture is None:
+                            cloture = self.turn_close_due(started, relus)
+                            if cloture:
+                                log_async("[%s] %s : tour clos au prochain point sûr"
+                                          % (self.name, cloture))
+                        if cloture and parsed.get("safe_point"):
+                            # Point sûr : l'appel d'outil en cours est fini et son
+                            # résultat est dans la session. Aucun harnais mené
+                            # n'offre d'interruption propre en mode non
+                            # interactif : arrêt propre habituel (SIGTERM, grâce).
+                            clos = True
+                            self.stop_group_now("tour clos : %s" % cloture)
                     usage = parsed.get("usage")
                     if isinstance(usage, dict):
                         # Clés de chaque harnais normalisées (L60 : l'usage
@@ -2263,6 +2346,10 @@ class AgentWorker(threading.Thread):
         # même si le bail a été perdu ou le tour préempté (L13 B1). Le modèle
         # est celui du lancement, déjà figé dans le marqueur (L13 B4).
         self._compta_termine(modele_annonce)
+        if clos and not lost and not preempte and not self.restarting.is_set():
+            # L105 : tour clos par un plafond — un tour abouti, pas un échec ;
+            # le code de sortie est celui de l'arrêt demandé.
+            result_code, error = 0, None
         ok = result_code == 0 and not lost and not error
         if error is None and result_code != 0:
             error = "le harnais a rendu le code %d" % result_code
@@ -2307,11 +2394,16 @@ class AgentWorker(threading.Thread):
             self.fast_failure = duration < self.runner.fast_failure_s
         if self._session_en_attente is not None:
             self._avec_reprise("session du tour", self._enregistre_session)
+        if ok and clos:
+            self._turn_closed(cloture or "plafond", duration)
+        elif ok:
+            self._note_courrier_borne(turn_id, duration)
         self._avec_reprise(
             "fin de tour", registry.end_turn,
             self.db, self.name, self.runner.runner_id, self.epoch,
             status=status,
-            status_text="%s en %ds%s" % (label, int(duration), "" if ok else " (échec)"),
+            status_text="%s en %ds%s" % (label, int(duration), "" if ok else " (échec)")
+            + (" (clos : %s)" % cloture.split(" :")[0] if ok and clos and cloture else ""),
             error=error, cost_usd=cost,
         )
         self.last_activity = time.monotonic()
@@ -2322,6 +2414,44 @@ class AgentWorker(threading.Thread):
         with self.runner.lock:
             self.runner.turns += 1
         return ok
+
+    def _turn_closed(self, raison: str, duration: float) -> None:
+        """Après un tour clos par un plafond (L105) : la suite au tour suivant,
+        et, pour le plafond de contexte, la rotation avec résumé de reprise
+        avant lui. Journalisé, et noté dans le fil."""
+        self.last_turn_closed = raison
+        self.suite = raison
+        contexte = raison.startswith("plafond de contexte")
+        if contexte:
+            self.rotation_forcee = raison
+        log_async("[%s] tour clos après %ds (%s) : %s" % (
+            self.name, int(duration), raison,
+            "rotation de session puis suite" if contexte else "suite au tour suivant"))
+        self._fil_note(
+            "Tour clos par l'exécuteur à un point sûr après %ds (%s). %s"
+            % (int(duration), raison,
+               "La session est tournée (résumé de reprise) avant le tour suivant, "
+               "qui reprend le travail en cours." if contexte else
+               "Le tour suivant reprend le travail en cours, dans la même session."),
+            meta={"action": "tour-clos", "raison": raison, "tour_s": round(duration, 1)})
+
+    def _note_courrier_borne(self, turn_id: str, duration: float) -> None:
+        """Le hook a-t-il borné le courrier de ce tour ? (L105) Le tour a été
+        conclu sur son invitation : journal et fil, le reste du courrier ouvre
+        le tour suivant, et la rotation existante a son passage entre les deux."""
+        from . import cli as cli_mod
+        etat = cli_mod.tour_lit(self.cfg, self.name, turn_id)
+        if not etat.get("signale"):
+            return
+        self.last_turn_closed = "courrier borné"
+        log_async("[%s] tour conclu après %ds : courrier borné (%d remis, %d en attente)"
+                  % (self.name, int(duration), etat["remis"], etat["attente"]))
+        self._fil_note(
+            "Tour conclu après %ds sur la borne du courrier : %d message(s) remis "
+            "pendant le tour, %d en attente pour le tour suivant."
+            % (int(duration), etat["remis"], etat["attente"]),
+            meta={"action": "courrier-borne", "remis": etat["remis"],
+                  "attente": etat["attente"], "tour_s": round(duration, 1)})
 
     def failure_wait(self) -> float:
         """Attente avant le tour suivant après un échec : doublée à chaque échec

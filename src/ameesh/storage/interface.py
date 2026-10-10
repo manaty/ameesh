@@ -1535,16 +1535,17 @@ class Operations(Domain):
     """Ce que l'orchestrateur lit et règle pour exploiter les agents (L26).
 
     Réglages d'agent (`session_policy`, `effort`, `tier`,
-    `context_max_tokens`), lot de la session
+    `context_max_tokens`, `turn_max_seconds`, `turn_mail_max`), lot de la session
     courante, demande de redémarrage, lectures enrichies pour `ameesh list
     --json` et `ameesh alerts`, usage par tour, historique des jauges de
     forfait et soldes d'un fournisseur payé au token. Instants en secondes
     epoch (`*_ts`) ; une liste vide d'ids rend une liste vide."""
 
     #: colonnes réglables par `set_settings` (liste fermée)
-    SETTINGS = ("session_policy", "effort", "tier", "context_max_tokens")
+    SETTINGS = ("session_policy", "effort", "tier", "context_max_tokens",
+                "turn_max_seconds", "turn_mail_max")
     #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
-    INTEGER_SETTINGS = ("context_max_tokens",)
+    INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max")
 
     @abc.abstractmethod
     def set_settings(self, name: str, values: dict) -> bool:
