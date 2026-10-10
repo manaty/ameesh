@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-10 (livraison)
+* **Consigne** : livraison et déploiements ([ORCHESTRATEUR.md](../ORCHESTRATEUR.md)), décidée par le propriétaire après que 1.6.2 est restée 4 h fusionnée sans déploiement — PR verte qui débloque le propriétaire fusionnée avant tout nouveau chantier ; déploiement en attente préparé entièrement (étiquette, `verifier` poste et VM, `retour` connu) et proposé en premier point, le propriétaire seul décidant ; `poste.sh redemarrer` détaché quand l'agent a un exécuteur sur le poste ; numéros de migration réservés dès le début d'un lot.
+
 ## 2026-10-10 (affectations suivies)
 * **L118** : l'orchestrateur confiait le travail par courrier sans lot (agents « sans lot » dans `ameesh projects`, `idle_capacity` trompée, frise vide) et ses lots restaient ouverts après la fusion directe de leur branche sur la cible, sans PR ni gel. Désormais : `mail send --lot <id|réf>` rattache et assigne le lot au destinataire (garde L37 ; jamais repris à un autre agent), `--new-lot "titre"` le crée, un orchestrateur qui écrit à un agent sans lot est averti ; un lot porte sa branche et sa cible (migration 0050), l'exécuteur constate la fusion par le contenu (commit de fusion, avance rapide, squash, commit de fusion qui cite la branche) et ferme le lot ; `idle_capacity` part aussi en courrier `event` aux orchestrateurs. Consigne : [ORCHESTRATEUR.md](../ORCHESTRATEUR.md).
 

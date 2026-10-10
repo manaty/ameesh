@@ -56,3 +56,26 @@ travail attend, `ameesh notify` envoie à l'orchestrateur un courrier `event`
 d'`ameesh` : la liste des agents au repos de son équipe et des lots ouverts
 sans agent. Réponse attendue : leur confier ces lots (`--lot`), ou en créer
 (`--new-lot`). Un même épisode n'est envoyé qu'une fois.
+
+## Livraison et déploiements
+
+Règles du propriétaire (2026-10-10), après qu'une version mineure (1.6.2) est
+restée 4 h fusionnée sans être déployée :
+
+1. **Fusionner d'abord.** Une PR à CI verte qui débloque une demande du
+   propriétaire se fusionne avant tout nouveau chantier.
+2. **Un déploiement en attente se prépare entièrement** : étiquette posée,
+   `deploy/mise-a-jour/poste.sh verifier <REF>` et `deploy/mise-a-jour/vm.sh
+   verifier <REF>` passés, plan de retour connu (étape `retour`). Il est
+   proposé au propriétaire dès son retour, en premier point, avec les choix
+   possibles : version seule ou `main` entier, migrations, risques. Seul le
+   propriétaire décide du déploiement ; une consigne de veille ne se contente
+   jamais d'interdire « tout déploiement » sans le préparer.
+3. **Redémarrer détaché.** `poste.sh redemarrer` ne redémarre un exécuteur
+   qu'hors tour : l'agent qui le lance alors qu'il a lui-même un exécuteur
+   sur le poste le lance détaché (`setsid`/`nohup`), sinon il s'attend
+   lui-même.
+4. **Réserver les migrations.** Les numéros de migration se réservent dès le
+   début d'un lot, annoncés dans le lot et au journal de conception, pour
+   éviter les renumérotations en cascade quand plusieurs lots fusionnent à la
+   suite.
