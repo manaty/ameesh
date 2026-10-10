@@ -139,6 +139,11 @@ policy:
   credential_modes: [api-key]
   models: ["deepseek-*"]
   max_agents: 1
+  # la machine de tests a peu de disque : sans ce plancher abaissé, la
+  # contre-pression de l'hôte (L31, 2 Gio par défaut) retient le premier tour
+  # (et prouve au passage que HostInfo.limits vient du canon)
+  resources:
+    min_disk_free: 300000000
 ---
 
 # banc
