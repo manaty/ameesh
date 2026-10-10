@@ -152,18 +152,25 @@ EOF"
     d=$(dossier "$DOSSIER_POSTE" "$p"); cible=$(dossier "$DOSSIER_VM" "$p")
     depot=$(git -C "$d" remote get-url origin)
     branche=$(git -C "$d" branch --show-current)
-    ssh_vm "[ -d '$cible/.git' ] || runuser -u ameesh -- git clone -q '$depot' '$cible'"
-    # commits locaux (non poussés) : par un paquet git, rien n'est poussé
-    if [ -n "$(git -C "$d" rev-list HEAD --not --remotes=origin | head -1)" ]; then
-      git -C "$d" bundle create -q "$TRAVAIL/$p.bundle" HEAD --not --remotes=origin
+    sha=$(git -C "$d" rev-parse HEAD)
+    ssh_vm "[ -d '$cible/.git' ] || runuser -u ameesh -- git clone -q '$depot' '$cible'
+      cd '$cible' && runuser -u ameesh -- git fetch -q origin"
+    # commit du poste absent de la VM après le fetch (commits jamais poussés,
+    # ou branche distante supprimée depuis) : par un paquet git, rien n'est poussé
+    if ! ssh_vm "cd '$cible' && runuser -u ameesh -- git cat-file -e '$sha^{commit}'" 2>/dev/null; then
+      bases=$(git -C "$d" for-each-ref --format='^%(objectname)' refs/remotes/origin/main refs/remotes/origin/develop)
+      # shellcheck disable=SC2086
+      git -C "$d" bundle create -q "$TRAVAIL/$p.bundle" HEAD $bases
       scp -q -o BatchMode=yes "$TRAVAIL/$p.bundle" "root@$VM:/tmp/$p.bundle"
-      ssh_vm "chown ameesh /tmp/$p.bundle; cd '$cible' && runuser -u ameesh -- git fetch -q /tmp/$p.bundle 'HEAD:refs/heads/$branche' && rm -f /tmp/$p.bundle"
-    else
-      ssh_vm "cd '$cible' && runuser -u ameesh -- git fetch -q origin '$branche:$branche'"
+      ssh_vm "chown ameesh /tmp/$p.bundle; cd '$cible' && runuser -u ameesh -- git fetch -q /tmp/$p.bundle HEAD && rm -f /tmp/$p.bundle"
     fi
-    ssh_vm "cd '$cible' && runuser -u ameesh -- git checkout -q '$branche' && \
+    # la branche pointe EXACTEMENT sur le commit du poste (pas sur la pointe
+    # d'origin, qui peut différer quand les commits locaux sont sur d'autres
+    # branches distantes)
+    ssh_vm "cd '$cible' && runuser -u ameesh -- git checkout -q -B '$branche' '$sha' && \
       (runuser -u ameesh -- git branch -q --set-upstream-to='origin/$branche' 2>/dev/null || true) && \
-      echo '$p : '\$(runuser -u ameesh -- git status -sb | head -1)"
+      test \"\$(runuser -u ameesh -- git rev-parse HEAD)\" = '$sha' && \
+      echo '$p : '\$(runuser -u ameesh -- git status -sb | head -1)' @ ${sha:0:9}'"
   done
   etape "clé DeepSeek vue par un exécuteur (solde, aucun tour)"
   ssh_vm "systemd-run --quiet --pipe --wait --uid=ameesh --gid=ameesh \
