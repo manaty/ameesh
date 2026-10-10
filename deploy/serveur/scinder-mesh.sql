@@ -55,10 +55,34 @@ DELETE FROM standing_approvals WHERE authenticator_id IN
 DELETE FROM authenticators       WHERE coalesce(canon, '') <> :'canon_garde';
 DELETE FROM work_packages        WHERE coalesce(canon, '') <> :'canon_garde';
 
+DELETE FROM account_switches    WHERE agent NOT IN (SELECT name FROM garde);
+DELETE FROM visibility_checks   WHERE persona NOT IN (SELECT name FROM garde);
+
+-- traces gardées qui nomment une persona retirée (auteur d'un événement de lot,
+-- dernier auteur d'un fil) : anonymisées, le nom d'un agent d'une autre
+-- organisation ne passe pas dans ce mesh (0033 §1, 0015)
+-- tout `agent:<nom>` hors des personas gardées (agents disparus du registre
+-- compris), et les noms nus des personas retirées
+CREATE TEMP TABLE noms_retires AS
+  SELECT name AS nom FROM retire UNION SELECT 'agent:' || name FROM retire;
+UPDATE work_item_events     SET actor = 'agent:autre-organisation'
+ WHERE actor IN (SELECT nom FROM noms_retires)
+    OR (actor LIKE 'agent:%' AND substr(actor, 7) NOT IN (SELECT name FROM garde));
+UPDATE work_item_milestones SET actor = 'agent:autre-organisation'
+ WHERE actor IN (SELECT nom FROM noms_retires)
+    OR (actor LIKE 'agent:%' AND substr(actor, 7) NOT IN (SELECT name FROM garde));
+UPDATE action_events        SET actor = 'agent:autre-organisation'
+ WHERE actor IN (SELECT nom FROM noms_retires)
+    OR (actor LIKE 'agent:%' AND substr(actor, 7) NOT IN (SELECT name FROM garde));
+UPDATE thread_index         SET last_author = NULL, last_excerpt = ''
+ WHERE last_author IN (SELECT nom FROM noms_retires)
+    OR (last_author LIKE 'agent:%' AND substr(last_author, 7) NOT IN (SELECT name FROM garde));
+
 DELETE FROM agent_registry WHERE name IN (SELECT name FROM retire);
 
 SELECT 'personas gardées' AS quoi, count(*) FROM agent_registry
 UNION ALL SELECT 'messages', count(*) FROM agent_mailbox
 UNION ALL SELECT 'lots', count(*) FROM work_items
-UNION ALL SELECT 'tours comptés', count(*) FROM turn_costs;
+UNION ALL SELECT 'tours comptés', count(*) FROM turn_costs
+UNION ALL SELECT 'traces anonymisées', (SELECT count(*) FROM work_item_events WHERE actor = 'agent:autre-organisation');
 COMMIT;
