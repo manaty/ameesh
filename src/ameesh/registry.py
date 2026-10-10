@@ -280,6 +280,20 @@ def pause(db: Db, name: str, owner: str, epoch: int, status_text: str) -> bool:
     return storage.of(db).leases.pause(name, owner, epoch, status_text)
 
 
+def hold_note(db: Db, name: str, owner: str, epoch: int, status_text: str) -> bool:
+    """Dit pourquoi le prochain tour attend (L31b), statut inchangé, sous un
+    bail vivant détenu par ce worker ; refusé hors `idle`/`queued`."""
+    return storage.of(db).leases.hold_note(name, owner, epoch, status_text)
+
+
+def release_hold(db: Db, name: str, owner: str, epoch: int, status_text: str,
+                 restore: str = "") -> bool:
+    """Lève l'attente ou la pause de pression (L31b) si son texte est toujours
+    en place ; une pause `blocked` repasse `queued`/`idle`, le texte d'avant
+    (`restore`) revient."""
+    return storage.of(db).leases.release_hold(name, owner, epoch, status_text, restore)
+
+
 def pending_spend_put(db: Db, name: str, start_index: int, turn: str | None = None,
                       model: str | None = None) -> bool:
     """Pose (atomiquement) le marqueur comptable d'un tour : une seule ligne."""

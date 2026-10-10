@@ -6,7 +6,7 @@ from __future__ import annotations
 import os
 import unittest
 
-from ameesh import canon, exploitation, registry, storage
+from ameesh import canon, exploitation, registry, resources, storage
 
 from . import test_canon
 from .test_canon import write
@@ -125,6 +125,82 @@ class PressureDbTest(test_canon._CanonDbCase):
         # la consigne n'a pas été consommée
         self.assertTrue(row.get("pending_prompt"))
 
+    def test_attente_de_pression_visible(self):
+        # L31b : un agent prioritaire n'est pas mis en pause, mais son attente
+        # se lit dans le texte de statut — sans quoi il restait `queued`, muet.
+        chemin = os.path.join(self.root, "agents/orchestre.md")
+        with open(chemin, encoding="utf-8") as fh:
+            texte = fh.read()
+        write(self.root, "agents/orchestre.md",
+              texte.replace("budget_usd_per_day: 30", "budget_usd_per_day: 30\npriority: 4"))
+        set_host_resources(self.root, min_mem_available="100TiB")
+        self.sync()
+        registry.set_pending_prompt(self.db, "orchestre", "consigne qui doit attendre")
+        proc = self.runner("--once", "--wait", "0", env=self.env(
+            AMEESH_CANON=self.root, AMEESH_CANON_UNTRUSTED="1",
+            AMEESH_HOST="atelier", AMEESH_RESOURCE_INTERVAL="30"))
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertEqual(self.turns(), [])
+        row = registry.get(self.db, "orchestre")
+        self.assertEqual(row["status"], "queued")  # pas de pause : priorité 4
+        self.assertIn("en attente : pression de l'hôte atelier", row["status_text"])
+        self.assertIn("mémoire disponible", row["status_text"])
+        self.assertIn("seuil 100.0 TiB", row["status_text"])
+        self.assertTrue(row.get("pending_prompt"))
+
+    def test_pas_d_attente_affichee_sans_travail(self):
+        chemin = os.path.join(self.root, "agents/orchestre.md")
+        with open(chemin, encoding="utf-8") as fh:
+            texte = fh.read()
+        write(self.root, "agents/orchestre.md",
+              texte.replace("budget_usd_per_day: 30", "budget_usd_per_day: 30\npriority: 4"))
+        set_host_resources(self.root, min_mem_available="100TiB")
+        self.sync()
+        self.runner("--once", "--wait", "0", env=self.env(
+            AMEESH_CANON=self.root, AMEESH_CANON_UNTRUSTED="1",
+            AMEESH_HOST="atelier", AMEESH_RESOURCE_INTERVAL="30"))
+        row = registry.get(self.db, "orchestre")
+        self.assertNotIn("pression", row.get("status_text") or "")
+
+    def _bail(self, nom):
+        self.sync()
+        row = registry.claim(self.db, nom, "runner-test", 60.0)
+        self.assertIsNotNone(row)
+        return int(row["lease_epoch"])
+
+    def test_levee_de_l_attente_rend_le_texte_d_avant(self):
+        epoch = self._bail("orchestre")
+        registry.set_status(self.db, "orchestre", "queued", "reprise : même session")
+        attente = "en attente : pression de l'hôte atelier — swap"
+        self.assertTrue(registry.hold_note(self.db, "orchestre", "runner-test", epoch, attente))
+        row = registry.get(self.db, "orchestre")
+        self.assertEqual((row["status"], row["status_text"]), ("queued", attente))
+        # un autre bail ne lève rien
+        self.assertFalse(registry.release_hold(self.db, "orchestre", "autre", epoch, attente))
+        self.assertTrue(registry.release_hold(self.db, "orchestre", "runner-test", epoch,
+                                              attente, "reprise : même session"))
+        row = registry.get(self.db, "orchestre")
+        self.assertEqual((row["status"], row["status_text"]),
+                         ("queued", "reprise : même session"))
+
+    def test_levee_de_la_pause_critique(self):
+        epoch = self._bail("orchestre")
+        self.assertTrue(registry.pause(self.db, "orchestre", "runner-test", epoch,
+                                       "pause : pression critique"))
+        # texte remplacé par quelqu'un d'autre : la levée ne l'écrase pas
+        self.assertFalse(registry.release_hold(self.db, "orchestre", "runner-test", epoch,
+                                               "pause : autre chose"))
+        registry.set_pending_prompt(self.db, "orchestre", "à faire")
+        self.assertTrue(registry.release_hold(self.db, "orchestre", "runner-test", epoch,
+                                              "pause : pression critique"))
+        row = registry.get(self.db, "orchestre")
+        self.assertEqual((row["status"], row["status_text"]), ("queued", ""))
+
+    def test_attente_refusee_en_tour(self):
+        epoch = self._bail("orchestre")
+        registry.set_status(self.db, "orchestre", "running", "tour")
+        self.assertFalse(registry.hold_note(self.db, "orchestre", "runner-test", epoch, "x"))
+
     def test_alerte_host_pressure(self):
         storage.of(self.db).hosts.record({
             "host": "atelier", "mem_available_bytes": 0, "swap_used_bytes": 0,
@@ -140,3 +216,15 @@ class PressureDbTest(test_canon._CanonDbCase):
     def test_aucune_alerte_sans_releve(self):
         self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db)
                           if a["type"] == "host_pressure"], [])
+
+
+class DescribeTest(unittest.TestCase):
+    def test_franchissements_lisibles(self):
+        texte = resources.describe([
+            {"key": "max_swap_used", "label": "swap utilisé", "value": int(17.5 * 1024 ** 3),
+             "limit": 16 * 1024 ** 3, "critical": False},
+            {"key": "max_load", "label": "charge 1 min", "value": 30.0, "limit": 24.0,
+             "critical": False}])
+        self.assertEqual(texte, "swap utilisé 17.5 GiB (seuil 16.0 GiB) ; "
+                                "charge 1 min 30.00 (seuil 24.00)")
+        self.assertEqual(resources.describe([]), "")
