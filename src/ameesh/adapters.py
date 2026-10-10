@@ -34,7 +34,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from typing import Sequence
 
-from . import harnesses
+from . import harnesses, platform
 from .harnesses import DescriptorError, HarnessDescriptor, Setting
 
 # Consigne d'un tour déclenché par du courrier : le CONTENU des messages est
@@ -324,7 +324,7 @@ def systemd_manager_path(env: Mapping[str, str] | None = None) -> str:
     Linux, sans `systemctl`, ou si les replis sont coupés (`AMEESH_HARNESS_SEARCH`
     vide)."""
     env = os.environ if env is None else env
-    if env.get(SEARCH_ENV) == "" or not sys.platform.startswith("linux"):
+    if env.get(SEARCH_ENV) == "" or not platform.is_linux():
         return ""
     systemctl = shutil.which("systemctl", path=env.get("PATH") or os.defpath) \
         or ("/usr/bin/systemctl" if _executable("/usr/bin/systemctl") else None)

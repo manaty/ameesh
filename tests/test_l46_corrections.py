@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import time
 import unittest
 from unittest import mock
 
 from ameesh import canon, canon_sync, mail, registry
+from ameesh import platform as os_layer
 from ameesh.storage.postgres import canon as pg_canon
 
 from .support import PgTestCase
@@ -414,18 +416,21 @@ class PidRecycleTest(PgTestCase):
         import os
         from ameesh import identity, session_bindings as sb
         moi = os.getpid()
-        debut = sb.pid_start(moi)
-        self.assertIsInstance(debut, int)
-        self.assertIsNone(sb.pid_start(2 ** 22 + 12345))
+        debut = sb.pid_started_at(moi)
+        self.assertIsInstance(debut, float)   # L63 : secondes epoch
+        self.assertLess(abs(debut - time.time()), 24 * 3600 * 365)
+        self.assertIsNone(sb.pid_started_at(2 ** 22 + 12345))
         sb.bind(self.cfg, self.db, "alpha", session_id="s-1", harness="claude", pid=moi,
                 by="human:proprio")
         [row] = sb.listing(self.db)
-        self.assertEqual((row["pid"], row["pid_start"]), (moi, debut))
+        self.assertEqual(row["pid"], moi)
+        self.assertAlmostEqual(row["pid_started_at"], debut, places=3)
+        self.assertIsNone(row["pid_start"])   # l'ancienne colonne n'est plus écrite
         chaine = sb.ancestors()
         self.assertEqual(sb.for_hook(self.cfg, self.db, "claude", "s-1", chaine)[1], "")
         self.assertEqual(sb.by_ancestry(self.cfg, self.db, chaine)["agent"], "alpha")
         # même PID, autre processus (PID recyclé) : rien
-        self.db.execute("UPDATE session_bindings SET pid_start = pid_start + 1")
+        self.db.execute("UPDATE session_bindings SET pid_started_at = pid_started_at + 5")
         row, why = sb.for_hook(self.cfg, self.db, "claude", "s-1", chaine)
         self.assertIn("réutilisé", why)
         self.assertIsNone(sb.by_ancestry(self.cfg, self.db, chaine))
@@ -437,8 +442,62 @@ class PidRecycleTest(PgTestCase):
         self.assertEqual(out.status, "updated")
         self.assertEqual(sb.for_hook(self.cfg, self.db, "claude", "s-1", chaine)[1], "")
         # liaison antérieure (sans heure de démarrage) : seul le PID est contrôlé
-        self.db.execute("UPDATE session_bindings SET pid_start = NULL")
+        self.db.execute("UPDATE session_bindings SET pid_started_at = NULL")
         self.assertEqual(sb.for_hook(self.cfg, self.db, "claude", "s-1", chaine)[1], "")
+
+    @unittest.skipUnless(os_layer.is_linux(), "tops d'horloge : Linux")
+    def test_ancienne_heure_en_tops_lue_par_conversion(self):
+        """L63 : une liaison L46 (pid_start en tops, 0036) reste reconnue."""
+        import os
+        from ameesh import platform, session_bindings as sb
+        moi = os.getpid()
+        sb.bind(self.cfg, self.db, "alpha", session_id="s-1", harness="claude", pid=moi,
+                by="human:proprio")
+        hertz = os.sysconf("SC_CLK_TCK")
+        tops = round((sb.pid_started_at(moi) - platform.boot_time()) * hertz)
+        self.db.execute("UPDATE session_bindings SET pid_started_at = NULL, pid_start = %s",
+                        (tops,))
+        chaine = sb.ancestors()
+        self.assertEqual(sb.for_hook(self.cfg, self.db, "claude", "s-1", chaine)[1], "")
+        # une autre heure (PID recyclé) : refusée
+        self.db.execute("UPDATE session_bindings SET pid_start = %s", (tops + 10 * hertz,))
+        self.assertIn("réutilisé", sb.for_hook(self.cfg, self.db, "claude", "s-1", chaine)[1])
+        # hors Linux, des tops ne se convertissent pas : refus (fail-closed)
+        self.db.execute("UPDATE session_bindings SET pid_start = %s", (tops,))
+        with mock.patch.object(platform, "SYSTEM", "macos"):
+            self.assertIn("réutilisé",
+                          sb.for_hook(self.cfg, self.db, "claude", "s-1", chaine)[1])
+        # une re-liaison écrit pid_started_at et efface pid_start
+        out = sb.bind(self.cfg, self.db, "alpha", session_id="s-1", harness="claude",
+                      pid=moi, by="human:proprio")
+        self.assertEqual(out.status, "updated")
+        [row] = sb.listing(self.db)
+        self.assertIsNone(row["pid_start"])
+        self.assertIsNotNone(row["pid_started_at"])
+
+    def test_os_muet_refuse_la_liaison_pid(self):
+        """L63 : sans heure de démarrage lisible, pas de liaison --pid, et une
+        liaison existante n'est pas reconnue (jamais de contrôle muet)."""
+        import os
+        from ameesh import platform, session_bindings as sb
+        moi = os.getpid()
+        sb.bind(self.cfg, self.db, "alpha", session_id="s-1", harness="claude", pid=moi,
+                by="human:proprio")
+        chaine = sb.ancestors()
+        muet = platform.NotAvailable("heure de démarrage d'un processus", "test")
+        with mock.patch.object(platform, "start_time", side_effect=muet):
+            with self.assertRaises(sb.BindError) as ctx:
+                sb.bind(self.cfg, self.db, "alpha", session_id="s-2", harness="claude",
+                        pid=moi, by="human:proprio")
+            self.assertIn("invérifiable", str(ctx.exception))
+            self.assertIn("réutilisé", sb.for_hook(self.cfg, self.db, "claude", "s-1",
+                                                   chaine)[1])
+            self.assertIsNone(sb.by_ancestry(self.cfg, self.db, chaine))
+        with mock.patch.object(platform, "ancestry",
+                               side_effect=platform.NotAvailable("ascendance", "test")):
+            self.assertIn("invérifiable",
+                          sb.for_hook(self.cfg, self.db, "claude", "s-1")[1])
+            self.assertIsNone(sb.by_ancestry(self.cfg, self.db))
 
 
 if __name__ == "__main__":

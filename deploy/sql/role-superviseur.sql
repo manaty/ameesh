@@ -322,7 +322,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- de quel agent ; même nature que agent_registry.session_id, aucun contenu
     ('session_bindings', ARRAY[
         'id', 'session_id', 'harness', 'host', 'agent', 'pid', 'pid_start', 'created_by',
-        'created_at', 'revoked_at'
+        'created_at', 'revoked_at',
+        -- L63 (0048) : heure de démarrage du PID lié, secondes epoch
+        'pid_started_at'
     ]),
     ('work_item_events', ARRAY[
         'id', 'work_item_id', 'state', 'actor', 'created_at'

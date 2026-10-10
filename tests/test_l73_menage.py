@@ -294,6 +294,16 @@ class WorktreeEtatTest(_Tmp):
         self.addCleanup(proc.kill)
         self.assertTrue(menage.worktree_in_use(wt))
 
+    def test_processus_dans_le_worktree_os_muet(self):
+        """L63 : si l'OS ne dit pas qui travaille dedans, le worktree attend."""
+        from unittest import mock
+        from ameesh import platform
+        wt = os.path.join(self.base, "wt-muet")
+        os.makedirs(wt)
+        muet = platform.NotAvailable("détenteurs d'un fichier", "test", "macos")
+        with mock.patch.object(platform, "holders", side_effect=muet):
+            self.assertTrue(menage.worktree_in_use(wt))
+
 
 # ==========================================================================
 # conteneurs (L73) : étiquetage, liste, suppression des seuls conteneurs d'un tour

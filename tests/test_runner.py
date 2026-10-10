@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from ameesh import adapters, db as db_mod, mail, registry
+from ameesh import platform as os_layer
 from ameesh.runner import AgentWorker, Runner, _AsyncLog
 
 from .support import PgTestCase
@@ -248,16 +249,30 @@ class RunnerTest(PgTestCase):
     @staticmethod
     def _remplir_tube(w: int) -> None:
         """Remplit le tube sans toucher au mode du descripteur partagé avec le
-        fils : une description de fichier distincte (Linux, /proc) en O_NONBLOCK."""
-        fd = os.open("/proc/self/fd/%d" % w, os.O_WRONLY | os.O_NONBLOCK)
-        try:
-            while True:
-                try:
-                    os.write(fd, b"x" * 65536)
-                except BlockingIOError:
-                    break
-        finally:
-            os.close(fd)
+        fils (L63 : sans /proc, donc sur tous les OS POSIX). Un fil écrit un
+        octet à la fois en mode bloquant ; le tube est plein quand le fil
+        reste bloqué. Il écrit sur sa propre copie du descripteur et se
+        termine (tube cassé) quand le test ferme `r`."""
+        ecrits = [0]
+        copie = os.dup(w)
+
+        def remplir() -> None:
+            try:
+                while True:
+                    os.write(copie, b"x")
+                    ecrits[0] += 1
+            except OSError:
+                pass
+            finally:
+                os.close(copie)
+
+        threading.Thread(target=remplir, daemon=True, name="remplir-tube").start()
+        dernier, stable_depuis = -1, time.monotonic()
+        while time.monotonic() - stable_depuis < 0.3:
+            time.sleep(0.05)
+            if ecrits[0] != dernier:
+                dernier, stable_depuis = ecrits[0], time.monotonic()
+        assert ecrits[0] > 0, "tube non rempli"
 
     def test_arret_borne_stdout_et_stderr_bloques(self):
         """Tube de sortie plein et jamais lu (stdout et stderr) : le SIGTERM
@@ -634,10 +649,10 @@ class RunnerTest(PgTestCase):
         worker.proc = parent
         worker.pgid = parent.pid
         try:
+            self.assertTrue(os_layer.alive(enfant_pid), "enfant mort avant l'arrêt")
             worker.terminate(grace=0)
             self.assertIsNotNone(parent.poll())
-            self.wait_for(
-                lambda: not os.path.exists("/proc/%d" % enfant_pid), timeout=5)
+            self.wait_for(lambda: not os_layer.alive(enfant_pid), timeout=5)
         finally:
             if parent.poll() is None:
                 parent.kill()
@@ -675,9 +690,10 @@ class RunnerTest(PgTestCase):
         worker.proc = parent
         worker.pgid = parent.pid
         try:
+            self.assertTrue(os_layer.alive(enfant_pid), "enfant mort avant l'arrêt")
             worker.terminate(grace=1.0)
             self.assertIsNotNone(parent.poll())
-            self.wait_for(lambda: not os.path.exists("/proc/%d" % enfant_pid), timeout=5)
+            self.wait_for(lambda: not os_layer.alive(enfant_pid), timeout=5)
         finally:
             if parent.poll() is None:
                 parent.kill()
