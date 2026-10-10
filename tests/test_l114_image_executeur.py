@@ -47,6 +47,8 @@ FAKE = textwrap.dedent("""\
 
 @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("sh"),
                      "Linux et sh requis (/proc)")
+@unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                 "le point d'entrée refuse root (uid 10001 attendu) : banc lancé en root")
 class EntreeSansCodeVisible(unittest.TestCase):
 
     def setUp(self):
