@@ -88,6 +88,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    placements      recorded
    progress        lots lot_events lot_milestones lot_actions actions agents costs
                    packages package_items lot_messages
+   projects        board
    operations      set_settings set_session_work_item listing request_restart
                    apply_restart adopt resume message_lots assigned_open_lots
                    open_lots_activity turns record_gauges gauge_history
@@ -1394,6 +1395,35 @@ class Progress(Domain):
 
 
 # --------------------------------------------------------------------------
+# vue par projet (lot L62) : qui travaille sur quoi
+# --------------------------------------------------------------------------
+
+class Projects(Domain):
+    """Lecture de la vue par projet (`ameesh projects`, L62). Aucune écriture.
+
+    UNE requête, UN aller-retour : la vue se rafraîchit souvent et sert aussi
+    d'en-tête à `ameesh progress`."""
+
+    @abc.abstractmethod
+    def board(self, *, max_lots: int) -> dict:
+        """`{"agents": [...], "lots": [...]}`.
+
+        `agents` : un élément par agent du registre — name, chantier, team,
+        harness, host, provider, credential_mode, status, status_text, mode,
+        stop_reason, responsible, lease_live, turn_started_ts,
+        status_since_ts, last_turn_ts, updated_ts, last_seen_ts, unread,
+        lot de session (`session_lot_id` / `_title` / `_state`), lot assigné
+        ouvert le plus récent (`assigned_lot_id` / `_title` / `_state`),
+        `open_lots` (lots ouverts assignés), `usd_24h` et `turns_24h`
+        (grand livre, horloge de la base).
+
+        `lots` : les lots OUVERTS (ni `merged`, ni `promoted`, ni `closed`),
+        au plus `max_lots`, les plus récemment modifiés d'abord — id, title,
+        state, app, workstream, package_team, assignee, updated_ts ; chaque
+        élément porte `total` (avant la borne)."""
+
+
+# --------------------------------------------------------------------------
 # exploitation (lot L26, migration 0027) : réglages, redémarrage, historiques
 # --------------------------------------------------------------------------
 
@@ -1720,6 +1750,7 @@ class Storage(abc.ABC):
     grants: Grants
     placements: Placements
     progress: Progress
+    projects: Projects
     operations: Operations
     hosts: HostResources
     turn_resources: TurnResources

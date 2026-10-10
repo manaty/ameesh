@@ -111,6 +111,11 @@ td.n { text-align: right; font-variant-numeric: tabular-nums; }
 .empty { color: var(--muted); font-size: .85rem; }
 .trunc { color: var(--warning); font-size: .85rem; margin: 0 0 8px; }
 ul.missing { color: var(--ink-2); font-size: .8rem; padding-left: 18px; margin: 0; }
+.project { border-top: 1px solid var(--grid); padding: 10px 0; }
+.project:first-of-type { border-top: 0; padding-top: 0; }
+.project-name { font-weight: 600; }
+.warn { color: var(--warning); font-size: .82rem; margin-top: 3px; }
+.project.idle-project { opacity: .7; }
 footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
 </style>
 </head>
@@ -118,6 +123,11 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
 <main>
   <h1 id="title">Avancement</h1>
   <div class="sub" id="when"></div>
+
+  <section aria-labelledby="h-projects" id="projects-section">
+    <h2 id="h-projects">Projets</h2>
+    <div id="projects"></div>
+  </section>
 
   <section aria-labelledby="h-lots">
     <h2 id="h-lots">Lots</h2>
@@ -330,6 +340,54 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
     bar.setAttribute("role", "img");
     bar.setAttribute("aria-label", e.lots_merged + " sur " + counted + " lots fusionnés");
     epBox.appendChild(row);
+  });
+
+  // Projets (L62) : qui travaille sur quoi, lots ouverts sans agent
+  var PAY_FR = {plan: "forfait", token: "token"};
+  var pjBox = document.getElementById("projects");
+  if (!D.projects) document.getElementById("projects-section").style.display = "none";
+  else if (!D.projects.length) pjBox.appendChild(el("p", "empty", "Aucun projet."));
+  (D.projects || []).forEach(function (p) {
+    var box = el("div", "project" + (p.active ? "" : " idle-project"));
+    var head = el("div");
+    head.appendChild(el("span", "project-name", p.name || "(sans projet)"));
+    var parts = ["working", "paused", "idle", "stopped"].filter(function (k) { return p.counts[k]; })
+      .map(function (k) { return p.counts[k] + " " + AG_FR[k]; });
+    var meta = [p.agents.length + " agent(s)" + (parts.length ? " : " + parts.join(", ") : "")];
+    if (p.lots_open) meta.push(p.lots_open + " lot(s) ouvert(s)");
+    if (p.unread) meta.push(p.unread + " non lu(s)");
+    if (p.usd_24h) meta.push("24 h " + usd(p.usd_24h) + " (token " + usd(p.usd_24h_token) + ")");
+    head.appendChild(el("span", "meta", " — " + meta.join(" · ")));
+    box.appendChild(head);
+    (p.warnings || []).forEach(function (w) { box.appendChild(el("div", "warn", "⚠ " + w)); });
+    if (p.agents.length) {
+      var wrap = el("div", "table-wrap"), tb = el("table"), tr = el("tr");
+      ["agent", "état", "paiement", "24 h", "non lus", "lot en cours"].forEach(function (h) { tr.appendChild(el("th", null, h)); });
+      tb.appendChild(tr);
+      p.agents.forEach(function (a) {
+        var x = el("tr"), st = el("td");
+        x.appendChild(el("td", null, a.name + (a.mode === "externe" ? " (ext)" : "")));
+        st.appendChild(chip(a.state, AG_FR, AG_ICON));
+        if (a.since_ts) st.appendChild(el("span", "meta", " " + dur(D.generated_ts - a.since_ts)));
+        if (a.reason) st.appendChild(el("div", "meta", a.reason));
+        x.appendChild(st);
+        x.appendChild(el("td", null, PAY_FR[a.payment] || "?"));
+        x.appendChild(el("td", "n", usd(a.usd_24h)));
+        x.appendChild(el("td", "n", a.unread));
+        x.appendChild(el("td", null, a.lot ? "#" + a.lot.id + " " + a.lot.title
+          + (a.open_lots > 1 ? " (+" + (a.open_lots - 1) + ")" : "")
+          : (a.task ? "tour : " + a.task : "—")));
+        tb.appendChild(x);
+      });
+      wrap.appendChild(tb); box.appendChild(wrap);
+    }
+    var WHY = {unassigned: "non assigné", stopped: "assigné à {a}, arrêté",
+               unknown: "assigné à {a}, inconnu du registre", external: "assigné à {a}, session externe"};
+    (p.lots_without_agent || []).forEach(function (l) {
+      box.appendChild(el("div", "waiting", "sans agent : #" + l.id + " " + l.state + " — " + l.title
+        + " (" + (WHY[l.why] || l.why).replace("{a}", l.assignee || "") + ")"));
+    });
+    pjBox.appendChild(box);
   });
 
   // Agents

@@ -25,6 +25,7 @@ from .operations import Operations
 from .packages import WorkPackages
 from .placement import Placements
 from .progress import Progress
+from .projects import Projects
 from .registry import Agents, Leases, PendingSpend
 from .session_bindings import SessionBindings
 from .threads import Threads
@@ -62,6 +63,7 @@ class PostgresStorage(interface.Storage):
         self.grants = Grants(db)
         self.placements = Placements(db)
         self.progress = Progress(db)
+        self.projects = Projects(db)
         self.operations = Operations(db)
         self.hosts = Hosts(db)
         self.turn_resources = TurnResources(db)

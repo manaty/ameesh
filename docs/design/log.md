@@ -6,6 +6,7 @@
 
 ## 2026-10-10
 * **L60** : rotation de session DeepSeek et plafond de contexte qui agit. Les tours DeepSeek étaient inscrits sans session ni modèle, et leur usage par étape ignoré : jamais de rotation sur la taille, 2,34 milliards de jetons relus en 24 h. Au-delà de 15 M jetons relus au dernier tour (`context_max_tokens`, migration 0041), la session est tournée avec résumé de reprise. Le modèle du tour DeepSeek est connu (défaut du descripteur passé au harnais) : fin du barème `pro` appliqué par prudence, qui gonflait l'estimation d'un facteur 12,7 face au solde. Ligne du grand livre clé par son marqueur comptable : plus de doublon quand un exécuteur s'arrête entre l'écriture et l'effacement.
+* **L62** : vue par projet, `ameesh projects` (schéma `ameesh-projects/1`) — agents, état et raison, lot en cours, non-lus, dépense 24 h, forfait ou token, lots ouverts sans agent, projets sans agent actif ; colonne PROJET dans `ameesh list` ; la même vue en tête de `ameesh progress`. Retour du propriétaire : on ne voyait pas quels projets étaient en cours ni qui travaillait sur quoi.
 
 ## 2026-10-09
 * **Bascule** : deepseek1 à 7 et l'orchestrateur Nexlink menés par l'exécuteur, un service par agent (`ameesh-runner-agent@<nom>`) ; plus aucune boucle v0.

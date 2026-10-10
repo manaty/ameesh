@@ -39,6 +39,9 @@
   ameesh interrupt <agent> <message…>   interruption directe (expéditeurs habilités) ;
   ameesh progress [--json] [--html FICHIER] [--project P] [--since 24h]
         avancement : lots, agents, jalons, budget (schéma ameesh-progress/1) ;
+  ameesh projects [--json] [--project P] [--all]
+        projets en cours : agents, état, lot en cours, non-lus, dépense 24 h,
+        forfait ou token, lots sans agent (schéma ameesh-projects/1, L62) ;
   ameesh fil list | show <projet> [<lot>] [--last N] | tail <projet> [<lot>]
         les fils lisibles : tout message passé par ameesh, en clair (R12) ;
   ameesh receipt verify | authenticator list   reçus d'approbation (spec §8) ;
@@ -152,6 +155,9 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "progress":
         from . import progress
         return progress.main(rest)
+    if command == "projects":
+        from . import projects
+        return projects.main(rest)
     if command == "fil":
         from . import fil
         return fil.main(rest)
