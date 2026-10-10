@@ -56,6 +56,7 @@
   ameesh harness list|show|check        descripteurs de harnais (L16) ;
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
+  ameesh menage [--apply] [--json]      ménage de ce que les agents créent (L73) ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -77,6 +78,8 @@ MESH_COMMANDS = (
     "review-class",
     # L31 : ressources des hôtes (`ameesh hosts`)
     "hosts",
+    # L73 : ménage de ce que les agents créent (`ameesh menage [--apply]`)
+    "menage",
     # L14 : le catalogue des modèles a son point d'entrée public, comme les autres
     # (`ameesh models list|show|discover`) — sans cette ligne, la commande sortait en
     # code 2 « sous-commande inconnue » AVANT toute base (revue B5).

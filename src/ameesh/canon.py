@@ -774,6 +774,10 @@ class HostPolicy:
     #: `work_roots` et `work_root`. Les trois formes acceptent le gabarit
     #: `{agent}` (un worktree par agent : `~/src/nexlink-{agent}`).
     work_dirs: dict | None = None
+    #: ménage (L73) : `{tmp_root, cache_root, tmp_quota, cache_quota,
+    #: tmpfs_alert, redirect, xdg_cache, worktrees, orphan_min_size}` validé
+    #: par `ameesh.menage.parse_policy` ; None = valeurs par défaut.
+    housekeeping: dict | None = None
 
     def work_dir(self, project: str | None, agent: str | None = None) -> str | None:
         """Dossier de travail d'un agent (et de son projet) sur cet hôte, ou None.
@@ -2095,6 +2099,19 @@ class _Loader:
             # seuil, qui retombe alors sur sa valeur par défaut prudente).
             if raw.get("resources") is not None:
                 policy.resources = self._host_resources(raw["resources"], where, subject)
+            # Ménage (L73) : dossiers gérés, quotas, alerte tmpfs ; une clé
+            # illisible est une erreur et prend sa valeur par défaut.
+            if raw.get("housekeeping") is not None:
+                from . import menage as menage_mod  # import tardif : pas de cycle
+                parsed, problems, unknown = menage_mod.parse_policy(raw["housekeeping"])
+                for problem in problems:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.housekeeping` : %s" % problem, **where, **subject)
+                for key in unknown:
+                    self.add("host-housekeeping-unknown", WARNING,
+                             "`policy.housekeeping.%s` : clé inconnue (ignorée)" % key,
+                             **where, **subject)
+                policy.housekeeping = parsed or None
             # Racines de travail (L31, 0029) : le dossier de travail d'une
             # session est un réglage de l'hôte, plus du placement.
             # L35 : `work_dirs` (par agent) et le gabarit `{agent}` ; tout
@@ -2162,6 +2179,14 @@ class _Loader:
                              **where, **subject)
                     continue
                 parsed[key] = number
+            elif key in resources_mod.FRACTION_KEYS:
+                part = resources_mod.parse_fraction(value)
+                if part is None:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.resources.%s` : part attendue (0 < x <= 1, ou « 80%% »)"
+                             % key, **where, **subject)
+                    continue
+                parsed[key] = part
             else:
                 octets = resources_mod.parse_bytes(value)
                 if octets is None:

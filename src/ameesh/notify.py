@@ -97,6 +97,9 @@ TYPE_LABELS = {
     "stale_lot": "lot stagnant",
     "host_pressure": "hôte sous pression",
     "orphan_resource": "ressource orpheline",
+    "tmpfs_full": "tmpfs presque plein",
+    "worktree_kept": "worktree gardé en fin de lot",
+    "tmp_orphan": "entrée de /tmp laissée par un tour",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired")

@@ -1968,6 +1968,34 @@ class AgentWorker(threading.Thread):
                 % (self.name, turn_id[:8],
                    ", ".join(conteneurs) if conteneurs else "groupe de processus survivant"))
 
+    def _menage_apres_tour(self, menage_tour, turn_id: str, spec: dict) -> None:
+        """L73 : quota du dossier temporaire, worktrees apparus, /tmp signalé ;
+        journalisé. Ne casse jamais la fin d'un tour."""
+        if menage_tour is None:
+            return
+        try:
+            lot = spec.get("lot") or self.agent.get("session_work_item") or None
+            entries = menage_tour.end(lot=str(lot) if lot else None, turn_id=turn_id,
+                                      db=self.db, host=self.runner.host)
+            # conteneurs étiquetés par CE tour, sans lot : supprimés tout de
+            # suite (ceux d'un lot attendent sa fin, au passage périodique)
+            if not menage_tour.off:
+                from . import menage as menage_mod
+                entries += menage_mod.reap_containers(
+                    self.runner.container_runtime(), self.db, self.runner.host,
+                    only_turn=turn_id)["entries"]
+            if entries:
+                storage.of(self.db).housekeeping.log(
+                    self.runner.host, entries, actor="runner:%s" % self.runner.runner_id)
+                for entry in entries:
+                    if entry["kind"] == "orphan":
+                        log("[%s] /tmp : %s (%s) apparu pendant le tour — signalé, jamais "
+                            "supprimé : %s" % (self.name, entry["path"],
+                                               entry.get("bytes"),
+                                               (entry.get("data") or {}).get("command")))
+        except Exception as exc:
+            log("[%s] ménage après le tour %s impossible (%s)" % (self.name, turn_id[:8], exc))
+
     def _run_turn(self, spec: dict) -> bool:
         harness = self.agent.get("harness") or "other"
         try:
@@ -2040,7 +2068,9 @@ class AgentWorker(threading.Thread):
         from . import containers as containers_mod
         turn_id = uuid.uuid4().hex
         self._turn_id = turn_id
-        turn_label = containers_mod.turn_labels(turn_id, self.name)
+        lot_du_tour = lot or self.agent.get("session_work_item") or None
+        turn_label = containers_mod.turn_labels(
+            turn_id, self.name, str(lot_du_tour) if lot_du_tour else None)
         identite = {
             "AGENT_MAIL_NAME": self.name,
             "AGENT_MAIL_STATE": self.cfg.v0_state,
@@ -2067,6 +2097,19 @@ class AgentWorker(threading.Thread):
         env.update(identite)
         if not account_turn.apply(self, env, compte):
             return False  # profil inutilisable : consigne remise, rien lancé
+        # L73 : dossier temporaire de l'agent et caches gérés ; worktrees et
+        # /tmp relevés avant le tour. Jamais bloquant : un ménage impossible
+        # laisse le tour partir avec l'environnement d'origine.
+        menage_tour = None
+        try:
+            from . import menage as menage_mod
+            menage_tour = menage_mod.Turn.begin(
+                self.cfg, self.runner.housekeeping_policy(), self.name, cwd,
+                new_session=not session, base_env=env)
+            env.update(menage_tour.env)
+        except Exception as exc:
+            log("[%s] ménage avant le tour impossible (%s)" % (self.name, exc))
+            menage_tour = None
         events_path = self._path("events.jsonl")
         stderr_path = self._path("stderr.log")
         started = time.time()
@@ -2207,6 +2250,7 @@ class AgentWorker(threading.Thread):
                 self.proc = None
                 self.pgid = None
             self._close_turn_resource(turn_id, pgid)
+            self._menage_apres_tour(menage_tour, turn_id, spec)
 
         duration = time.time() - started
         self.last_turn_seconds = duration
@@ -2471,6 +2515,10 @@ class Runner:
         #: moteur de conteneurs (L31, 0028) : None sans binaire/démon
         from . import containers as containers_mod
         self._container_runtime = containers_mod.Runtime.from_config(cfg)
+        #: ménage (L73) : politique de la fiche Host (dernier `canon sync`),
+        #: valeurs par défaut tant qu'aucun canon n'est lu
+        from . import menage as menage_mod
+        self._housekeeping = menage_mod.Policy()
         self.turns = 0
         self.did_turn = False
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
@@ -2917,6 +2965,64 @@ class Runner:
 
         threading.Thread(target=boucle, daemon=True, name="ressources").start()
 
+    # -- ménage (L73) -----------------------------------------------------
+    def housekeeping_policy(self):
+        """Politique de ménage de l'hôte (L73) ; défauts sans canon."""
+        from . import menage as menage_mod
+        return getattr(self, "_housekeeping", None) or menage_mod.Policy()
+
+    def agents_in_turn(self) -> set:
+        with self.lock:
+            return {name for name, worker in self.workers.items()
+                    if worker.is_alive() and getattr(worker, "proc", None) is not None}
+
+    def housekeeping_once(self) -> dict | None:
+        """Un passage de ménage (L73) ; ne lève jamais.
+
+        Les caches partagés ne sont évincés que si aucun tour de cet hôte ne
+        tourne (d'après la base : les autres exécuteurs de l'hôte comptent)."""
+        from . import menage as menage_mod
+        db = None
+        try:
+            db = db_mod.connect(self.cfg)
+            en_tour = self.agents_in_turn()
+            try:
+                busy = bool(en_tour) or storage.of(db).hosts.turns_in_progress(self.host) > 0
+            except Exception:
+                busy = True
+            report = menage_mod.run_pass(
+                self.cfg, db, self.housekeeping_policy(), host=self.host,
+                actor="runner:%s" % self.runner_id, busy=busy, agents_in_turn=en_tour,
+                runtime=self.container_runtime())
+            faits = [e for e in report["entries"] if e["kind"] != "mesure"]
+            if faits:
+                log_async("ménage : %s" % " ; ".join(
+                    "%s %s %s" % (e["kind"], e["action"], e.get("path") or "")
+                    for e in faits[:10]))
+            return report
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            log_async("ménage : passage impossible (%s : %s)" % (type(exc).__name__, exc))
+            return None
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
+    def start_housekeeping_poll(self) -> None:
+        """Passage périodique du ménage (`AMEESH_HOUSEKEEPING_INTERVAL`, défaut
+        600 s ; 0 = aucun). En mode `--once`, aucun passage périodique."""
+        interval = max(0.0, float(getattr(self.cfg, "housekeeping_interval", 0) or 0))
+        if interval <= 0 or self.once:
+            return
+
+        def boucle() -> None:
+            while not self.stop.wait(max(30.0, interval)):
+                self.housekeeping_once()
+
+        threading.Thread(target=boucle, daemon=True, name="menage").start()
+
     def refresh_host_limits(self, canon, *others) -> None:
         """Met à jour les limites physiques de CET hôte depuis les canons.
 
@@ -2949,6 +3055,8 @@ class Runner:
                     par_hote[h.title] = resources_mod.host_limits(canons, h.title)["limits"]
         self._host_max_agents = mine["max_agents"]
         self._host_limits_origin = mine["origin"]
+        from . import menage as menage_mod
+        self._housekeeping = menage_mod.effective(canons, self.host)
         lock = getattr(self, "_pressure_lock", None)
         if lock is None:
             self._host_limits = limits
@@ -3018,6 +3126,7 @@ class Runner:
         self.start_canon_sync()
         self.start_balance_poll()
         self.start_resource_poll()
+        self.start_housekeeping_poll()
         if self.once:
             self.sweep()
             if not self.did_turn:

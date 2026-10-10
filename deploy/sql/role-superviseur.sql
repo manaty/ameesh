@@ -247,11 +247,23 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- d'un tour, jamais un contenu
     ('host_resources', ARRAY[
         'id', 'host', 'sampled_at', 'mem_available_bytes', 'swap_used_bytes',
-        'load1', 'cpu_count', 'disk_free_bytes', 'disk_path', 'turns_in_progress'
+        'load1', 'cpu_count', 'disk_free_bytes', 'disk_path', 'turns_in_progress',
+        -- L73 : occupation du /tmp du système
+        'tmp_path', 'tmp_fstype', 'tmp_size_bytes', 'tmp_used_bytes'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',
         'started_at', 'ended_at', 'status'
+    ]),
+    -- ménage (L73, 0045) : journal (chemins, tailles, commandes proposées)
+    -- et worktrees suivis ; de l'état d'exécution, jamais un contenu
+    ('housekeeping_log', ARRAY[
+        'id', 'host', 'at', 'actor', 'kind', 'action', 'path', 'bytes', 'agent',
+        'lot', 'detail', 'data'
+    ]),
+    ('managed_worktrees', ARRAY[
+        'id', 'host', 'path', 'repo', 'agent', 'lot', 'turn_id', 'branch', 'head',
+        'created_at', 'status', 'detail', 'checked_at', 'ended_at'
     ]),
     -- verdict de la règle de visibilité (L31, 0029) : état, jamais de secret
     ('visibility_checks', ARRAY[

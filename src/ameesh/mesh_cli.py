@@ -25,6 +25,7 @@
   agent-mesh canon check|show|sync [--json] [--host H]   canon OKF (spec §4)
   agent-mesh placement check [--agent A] [--json]        admissions et hôtes admissibles (C4)
   agent-mesh hosts [--json] [HÔTE] [--history N]         ressources des hôtes (L31)
+  agent-mesh menage [--dry-run | --apply] [--json]       ménage des agents (L73)
   agent-mesh agent spawn <nom> --by <créateur> --ttl 2h   agent éphémère (R14)
 
 L'autorité du propriétaire ne se déduit jamais d'un texte : elle se prouve par
@@ -211,6 +212,7 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
     chacune (`limits_origin`) et les fiches de chaque canon (`fiches`).
     """
     from . import canon as canon_mod
+    from . import menage as menage_mod
     from . import placement as placement_mod
     from . import resources as res
 
@@ -220,7 +222,12 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         # par défaut d'abord)
         canons = canon_mod.load_configured(cfg)
         latest_by_host = {row["host"]: row for row in res.current(db)}
-        names = set(latest_by_host)
+        # L73 : bilan du ménage par hôte (dernier passage, 24 h de journal,
+        # worktrees suivis)
+        hk = storage.of(db).housekeeping
+        measure_by_host = {row["host"]: row for row in hk.last_measure(None)}
+        names_hk = set(measure_by_host)
+        names = set(latest_by_host) | names_hk
         for canon in canons:
             names |= {h.title for h in canon.hosts}
         if args.host:
@@ -244,6 +251,8 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             latest = latest_by_host.get(name)
             verdict = res.pressure(latest, limits=limits) if latest is not None else None
             history = res.history(db, name, args.history)
+            menage = _host_menage(hk, name, menage_mod.effective(canons, name),
+                                  measure_by_host.get(name), latest)
             if args.json:
                 print(json.dumps({
                     "schema": "ameesh-host/1",
@@ -260,6 +269,7 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                     "latest": latest,
                     "pressure": verdict,
                     "history": history,
+                    "housekeeping": menage,
                 }, ensure_ascii=False, sort_keys=True), flush=True)
                 continue
             resp = ("responsable %s" % host.responsible) if host is not None and host.responsible \
@@ -267,6 +277,7 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             if latest is None:
                 print("%s — %s ; aucune mesure publiée" % (name, resp))
                 _print_host_fiches(fiches, physical, admissions, many=many)
+                _print_host_menage(menage)
                 continue
             age = _fmt_age(now - float(latest.get("sampled_ts") or now))
             print("%s — %s ; mesure %s" % (name, resp, age))
@@ -276,10 +287,13 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                 return " [%s]" % origin.get(key, res.DEFAULT_ORIGIN) if fiches else ""
 
             print("  seuils     mémoire ≥ %s%s ; swap ≤ %s%s ; charge ≤ %.2f%s ; disque ≥ %s%s"
+                  " ; tmpfs ≤ %s%s"
                   % (_fmt_bytes(limits["min_mem_available"]), tag("min_mem_available"),
                      _fmt_bytes(limits["max_swap_used"]), tag("max_swap_used"),
                      limits["max_load"], tag("max_load"),
-                     _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free")))
+                     _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free"),
+                     res.fmt_value("max_tmpfs_used", limits.get("max_tmpfs_used")),
+                     tag("max_tmpfs_used")))
             print("  état       mémoire %s ; swap %s ; charge %s ; disque %s ; tours %s"
                   % (_fmt_bytes(latest.get("mem_available_bytes")),
                      _fmt_bytes(latest.get("swap_used_bytes")),
@@ -290,15 +304,13 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             if verdict and verdict["breaches"]:
                 tag = "CRITIQUE" if verdict["critical"] else "PRESSION"
                 detail = " ; ".join(
-                    "%s %s (seuil %s)" % (b["label"],
-                                          _fmt_bytes(b["value"]) if b["key"] != "max_load"
-                                          else "%.2f" % b["value"],
-                                          _fmt_bytes(b["limit"]) if b["key"] != "max_load"
-                                          else "%.2f" % b["limit"])
+                    "%s %s (seuil %s)" % (b["label"], res.fmt_value(b["key"], b["value"]),
+                                          res.fmt_value(b["key"], b["limit"]))
                     for b in verdict["breaches"])
                 print("  %s  %s" % (tag, detail))
             else:
                 print("  pression   aucune")
+            _print_host_menage(menage)
             if history:
                 trace = " ".join(
                     "%s→%s" % (_fmt_bytes(row.get("mem_available_bytes")),
@@ -308,6 +320,84 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         return 0
     finally:
         db.close()
+
+
+def _host_menage(hk, host: str, policy, measure_row: dict | None,
+                 latest: dict | None) -> dict:
+    """`ameesh hosts` (L73) : /tmp du système, dossiers gérés, journal 24 h,
+    worktrees suivis."""
+    from . import resources as res
+    data = (measure_row or {}).get("data") or {}
+    tmp = None
+    if latest is not None and latest.get("tmp_size_bytes"):
+        tmp = {"path": latest.get("tmp_path"), "fstype": latest.get("tmp_fstype"),
+               "size_bytes": latest.get("tmp_size_bytes"),
+               "used_bytes": latest.get("tmp_used_bytes"),
+               "fraction": res.tmpfs_fraction(latest)}
+    worktrees = hk.worktrees(host, ("active", "kept"))
+    return {
+        "policy": policy.as_dict(),
+        "system_tmp": tmp,
+        "tmpfs_alert": bool(tmp and tmp["fraction"] is not None
+                            and tmp["fraction"] >= policy.tmpfs_alert),
+        "measure": data or None,
+        "measured_ts": (measure_row or {}).get("at_ts"),
+        "last_24h": hk.summary(host, 86400.0),
+        "worktrees": {"active": sum(1 for w in worktrees if w["status"] == "active"),
+                      "kept": [{"path": w["path"], "agent": w["agent"], "lot": w["lot"],
+                                "detail": w["detail"]}
+                               for w in worktrees if w["status"] == "kept"]},
+    }
+
+
+def _print_host_menage(menage: dict) -> None:
+    tmp = menage.get("system_tmp")
+    policy = menage["policy"]
+    if tmp:
+        part = tmp.get("fraction")
+        print("  /tmp       %s %s / %s%s%s" % (
+            tmp.get("fstype") or "?", _fmt_bytes(tmp.get("used_bytes")),
+            _fmt_bytes(tmp.get("size_bytes")),
+            " (%d %%)" % round(part * 100) if part is not None else " (sur disque)",
+            " — ALERTE : au-delà de %d %% (ameesh menage pour voir ce qui l'occupe)"
+            % round(policy["tmpfs_alert"] * 100) if menage.get("tmpfs_alert") else ""))
+    m = menage.get("measure")
+    if m:
+        print("  ménage     dossiers temporaires %s (quota %s par agent) ; caches %s / %s"
+              "%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
+                      _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
+                      " ; %d entrée(s) /tmp signalée(s) (%s)" % (
+                          m["orphans"], _fmt_bytes(m.get("orphan_bytes")))
+                      if m.get("orphans") else ""))
+    conteneurs = (m or {}).get("containers") or {}
+    if conteneurs.get("ameesh") is not None or conteneurs.get("others") is not None:
+        ours = conteneurs.get("ameesh") or []
+        autres = conteneurs.get("others") or []
+        print("  conteneurs %d lancé(s) par un tour d'ameesh%s ; %d autre(s) signalé(s)%s" % (
+            len(ours),
+            " (%s)" % " ; ".join("%s : %s" % (c["path"], c.get("detail") or c["action"])
+                                 for c in ours[:3]) if ours else "",
+            len(autres),
+            " (jamais supprimés : %s)" % " ; ".join(c["command"] for c in autres[:5])
+            if autres else ""))
+    faits = menage.get("last_24h") or []
+    if faits:
+        print("  24 h       %s" % " ; ".join(
+            "%s %s ×%d%s" % (r["kind"], r["action"], r["n"],
+                             " (%s)" % _fmt_bytes(r["bytes"]) if r.get("bytes") else "")
+            for r in faits))
+    wt = menage.get("worktrees") or {}
+    if wt.get("active") or wt.get("kept"):
+        print("  worktrees  %d suivi(s) en attente de fin de lot ; %d gardé(s)%s" % (
+            wt.get("active", 0), len(wt.get("kept") or []),
+            " : " + " ; ".join("%s (%s)" % (k["path"], k["detail"]) for k in wt["kept"][:5])
+            if wt.get("kept") else ""))
+
+
+def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh menage` (L73) : voir `ameesh.menage.cmd_menage`."""
+    from . import menage
+    return menage.cmd_menage(cfg, args)
 
 
 def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: bool) -> None:
@@ -1240,6 +1330,18 @@ def build_parser() -> argparse.ArgumentParser:
                          help="nombre de relevés de l'historique court (défaut 10)")
     p_hosts.add_argument("--json", action="store_true", help="un objet JSON par hôte")
     p_hosts.set_defaults(func=cmd_hosts)
+
+    p_menage = sub.add_parser(
+        "menage", help="ménage de ce que les agents créent (L73) ; essai par défaut")
+    mode = p_menage.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true",
+                      help="montrer seulement (défaut) : rien n'est supprimé")
+    mode.add_argument("--apply", action="store_true",
+                      help="exécuter (humain ou exécuteur seulement, jamais une session "
+                           "d'agent)")
+    p_menage.add_argument("--by", default="", help="qui déclenche (journal), ex. human:alice")
+    p_menage.add_argument("--json", action="store_true", help="rapport `ameesh-menage/1`")
+    p_menage.set_defaults(func=cmd_menage)
 
     p_models = sub.add_parser("models", help="catalogue des modèles (L14)")
     models_sub = p_models.add_subparsers(dest="models_command")

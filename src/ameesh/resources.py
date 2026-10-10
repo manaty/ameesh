@@ -37,6 +37,12 @@ DEFAULT_MIN_MEM_AVAILABLE = 1024 ** 3
 DEFAULT_MAX_SWAP_USED = 8 * 1024 ** 3
 DEFAULT_MAX_LOAD_FACTOR = 2.0
 DEFAULT_MIN_DISK_FREE = 2 * 1024 ** 3
+#: L73 : part maximale d'un /tmp en tmpfs (mémoire et swap) occupée avant la
+#: contre-pression. Ne s'applique qu'à un tmpfs : un /tmp sur disque relève
+#: du disque libre. Critique à mi-chemin entre le seuil et le plein.
+DEFAULT_MAX_TMPFS_USED = 0.8
+#: dossier temporaire du système mesuré (surchargé par AMEESH_SYSTEM_TMP)
+DEFAULT_SYSTEM_TMP = "/tmp"
 
 #: facteurs de gravité : au-delà, la pression est CRITIQUE (pause des agents
 #: les moins prioritaires, jamais au milieu d'un tour).
@@ -46,7 +52,10 @@ CRITICAL_SWAP_FACTOR = 2.0     # swap >= le double du plafond
 CRITICAL_LOAD_FACTOR = 2.0     # charge >= le double du plafond
 
 #: clés de seuil reconnues dans `policy.resources` (liste fermée)
-THRESHOLD_KEYS = ("min_mem_available", "max_swap_used", "max_load", "min_disk_free")
+THRESHOLD_KEYS = ("min_mem_available", "max_swap_used", "max_load", "min_disk_free",
+                  "max_tmpfs_used")
+#: seuils exprimés en PART (0 < x <= 1, ou texte « 80% ») et non en octets
+FRACTION_KEYS = ("max_tmpfs_used",)
 
 #: horizon de conservation des relevés (secondes) ; l'historique court de
 #: `ameesh hosts` n'a pas besoin de plus, et la table ne grandit pas sans fin.
@@ -87,6 +96,23 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
     if not decimal_ok and "." in number and factor == 1:
         return None
     return int(float(number) * factor)
+
+
+def parse_fraction(value) -> float | None:
+    """Une part (0 < x <= 1) : nombre, ou texte « 80% » ; None si illisible."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            number = float(text[:-1]) / 100.0 if text.endswith("%") else float(text)
+        except ValueError:
+            return None
+    elif isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        return None
+    return number if 0.0 < number <= 1.0 else None
 
 
 def _as_float(value) -> float | None:
@@ -148,8 +174,63 @@ def disk_free(path: str | None) -> int | None:
         return None
 
 
+def _mount_of(path: str, mounts: str = "/proc/mounts") -> tuple[str, str] | None:
+    """(point de montage, type) du système de fichiers qui porte `path`."""
+    real = os.path.realpath(path)
+    best: tuple[str, str] | None = None
+    try:
+        with open(mounts, encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                point = parts[1].replace("\\040", " ")
+                if real == point or real.startswith(point.rstrip("/") + "/") or point == "/":
+                    if best is None or len(point) > len(best[0]):
+                        best = (point, parts[2])
+    except OSError:
+        return None
+    return best
+
+
+def fs_usage(path: str | None, *, mounts: str = "/proc/mounts") -> dict:
+    """Occupation du système de fichiers de `path` (L73) : chemin, type
+    (`tmpfs`, `ext4`…), taille et octets utilisés ; valeurs None si
+    illisibles. Lecture seule, sans parcours : `statvfs` seulement."""
+    out = {"tmp_path": path, "tmp_fstype": None, "tmp_size_bytes": None,
+           "tmp_used_bytes": None}
+    if not path or not os.path.isdir(path):
+        return out
+    mount = _mount_of(path, mounts)
+    if mount is not None:
+        out["tmp_fstype"] = mount[1]
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return out
+    size = st.f_blocks * st.f_frsize
+    out["tmp_size_bytes"] = int(size)
+    out["tmp_used_bytes"] = int(size - st.f_bfree * st.f_frsize)
+    return out
+
+
+def system_tmp() -> str:
+    """Le dossier temporaire du système mesuré (`AMEESH_SYSTEM_TMP`, /tmp)."""
+    return os.environ.get("AMEESH_SYSTEM_TMP") or DEFAULT_SYSTEM_TMP
+
+
+def tmpfs_fraction(reading: dict) -> float | None:
+    """Part occupée du /tmp d'un relevé s'il est en tmpfs, sinon None."""
+    if (reading or {}).get("tmp_fstype") != "tmpfs":
+        return None
+    size, used = reading.get("tmp_size_bytes"), reading.get("tmp_used_bytes")
+    if not size or used is None:
+        return None
+    return round(float(used) / float(size), 4)
+
+
 def sample(host: str, *, path: str | None = None, now: float | None = None,
-           turns_in_progress: int | None = None) -> dict:
+           turns_in_progress: int | None = None, tmp: str | None = None) -> dict:
     """Un relevé de l'hôte : les mesures lisibles, les autres à None.
 
     `path` est le dossier dont on mesure le disque (le dossier de travail de
@@ -167,6 +248,7 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
         "turns_in_progress": turns_in_progress,
     }
     out.update(_meminfo())
+    out.update(fs_usage(system_tmp() if tmp is None else tmp))
     return out
 
 
@@ -221,12 +303,14 @@ def thresholds(policy=None) -> dict:
     swap = parse_bytes(raw.get("max_swap_used"))
     disk = parse_bytes(raw.get("min_disk_free"))
     load = _as_float(raw.get("max_load"))
+    tmpfs = parse_fraction(raw.get("max_tmpfs_used"))
     cpus = cpu_count() or 1
     return {
         "min_mem_available": DEFAULT_MIN_MEM_AVAILABLE if mem is None else mem,
         "max_swap_used": DEFAULT_MAX_SWAP_USED if swap is None else swap,
         "max_load": (DEFAULT_MAX_LOAD_FACTOR * cpus) if load is None else load,
         "min_disk_free": DEFAULT_MIN_DISK_FREE if disk is None else disk,
+        "max_tmpfs_used": DEFAULT_MAX_TMPFS_USED if tmpfs is None else tmpfs,
     }
 
 
@@ -246,7 +330,9 @@ def declared(policy) -> dict:
         return {}
     out: dict = {}
     for key in THRESHOLD_KEYS:
-        value = _as_float(raw.get(key)) if key == "max_load" else parse_bytes(raw.get(key))
+        value = (_as_float(raw.get(key)) if key == "max_load"
+                 else parse_fraction(raw.get(key)) if key in FRACTION_KEYS
+                 else parse_bytes(raw.get(key)))
         if value is not None:
             out[key] = value
     return out
@@ -326,6 +412,14 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
             limits["max_load"], CRITICAL_LOAD_FACTOR)
     floor("min_disk_free", "disque libre", reading.get("disk_free_bytes"),
           limits["min_disk_free"], CRITICAL_DISK_FACTOR)
+    # L73 : un /tmp en tmpfs vit en mémoire et en swap ; critique à mi-chemin
+    # entre le seuil et le plein.
+    part = tmpfs_fraction(reading)
+    limit = limits.get("max_tmpfs_used")
+    if part is not None and limit is not None and part > limit:
+        out.append({"key": "max_tmpfs_used", "label": "tmpfs %s occupé"
+                    % (reading.get("tmp_path") or "/tmp"), "value": part, "limit": limit,
+                    "critical": part >= limit + (1.0 - limit) / 2.0})
     out.sort(key=lambda b: (not b["critical"], b["key"]))
     return out
 
@@ -347,6 +441,22 @@ def pressure(reading: dict, policy=None, *, limits: dict | None = None) -> dict:
         "blocked": bool(found),
         "critical": any(b["critical"] for b in found),
     }
+
+
+def fmt_value(key: str, value) -> str:
+    """Valeur lisible d'un seuil ou d'une mesure (octets, charge ou part)."""
+    if value is None:
+        return "—"
+    if key == "max_load":
+        return "%.2f" % float(value)
+    if key in FRACTION_KEYS:
+        return "%d %%" % round(float(value) * 100)
+    number = int(value)
+    for label, factor in (("TiB", 1024 ** 4), ("GiB", 1024 ** 3), ("MiB", 1024 ** 2),
+                          ("KiB", 1024)):
+        if abs(number) >= factor:
+            return "%.1f %s" % (number / factor, label)
+    return "%d B" % number
 
 
 def history(db: Db, host: str, limit: int = 10) -> list[dict]:

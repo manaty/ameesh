@@ -36,8 +36,21 @@ def main() -> int:
                 "env": {k: os.environ.get(k) for k in (
                     "AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
                     "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
-                    "AMEESH_HOST", "AMEESH_SCHEMA")},
+                    "AMEESH_HOST", "AMEESH_SCHEMA",
+                    # L73 : dossier temporaire et caches gérés
+                    "TMPDIR", "TMP", "TEMP", "AMEESH_TMPDIR", "AMEESH_CACHE_DIR",
+                    "npm_config_cache", "npm_config_store_dir", "YARN_CACHE_FOLDER")},
             }) + "\n")
+    if os.environ.get("AMEESH_TEST_MAKE_TMP"):
+        # L73 : un tour qui laisse des fichiers dans son TMPDIR et une entrée
+        # dans le /tmp du système (chemin donné), comme un clone de relecture
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, prefix="tour-") as fh:
+            fh.write(b"x" * 4096)
+        dehors = os.environ["AMEESH_TEST_MAKE_TMP"]
+        os.makedirs(dehors, exist_ok=True)
+        with open(os.path.join(dehors, "gros"), "wb") as fh:
+            fh.write(b"y" * 200_000)
     if os.environ.get("AMEESH_TEST_SLEEP"):
         time.sleep(float(os.environ["AMEESH_TEST_SLEEP"]))
     if os.environ.get("AMEESH_TEST_KILL_SELF"):

@@ -95,6 +95,10 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
    budgets         limits put events
+   turn_resources  open_turn close_turn mark_orphan get open_by_agent orphans
+                   stale_running
+   housekeeping    log recent summary last_measure register_worktree worktrees
+                   set_worktree_status
 
 3. Atomicité et verrous. Postgres tient les garanties par des écritures
    conditionnelles en une instruction (`UPDATE … WHERE`, `INSERT … ON
@@ -1636,6 +1640,10 @@ class TurnResources(Domain):
         """Marque `orphan` une ressource qui survit à son tour."""
 
     @abc.abstractmethod
+    def get(self, turn_id: str) -> dict | None:
+        """La ligne d'un tour (L73 : un conteneur étiqueté par ce tour), ou None."""
+
+    @abc.abstractmethod
     def open_by_agent(self, agent: str) -> list[dict]:
         """Les lignes encore `running` d'un agent, la plus récente d'abord."""
 
@@ -1647,6 +1655,55 @@ class TurnResources(Domain):
     def stale_running(self, older_than_s: float, host: str | None = None) -> list[dict]:
         """Les lignes encore `running` ouvertes il y a plus de `older_than_s`
         secondes : un exécuteur mort les a laissées derrière lui."""
+
+
+class Housekeeping(Domain):
+    """Ménage de ce que les agents créent (lot L73, migration 0045).
+
+    Deux tables d'état d'exécution : le journal du ménage
+    (`housekeeping_log` : supprimé, évincé, retiré, gardé, signalé, avec la
+    taille) et les worktrees apparus pendant un tour (`managed_worktrees`),
+    rattachés à l'agent, au tour et au lot. Les décisions (quoi supprimer,
+    quand, à quelles conditions) sont dans `ameesh.menage`.
+    """
+
+    @abc.abstractmethod
+    def log(self, host: str, entries: Sequence[dict], *, actor: str) -> int:
+        """Ajoute des lignes au journal (clés : kind, action, path, bytes,
+        agent, lot, detail, data) ; rend le nombre de lignes écrites. Élague
+        les lignes de plus de 30 jours."""
+
+    @abc.abstractmethod
+    def recent(self, host: str | None, since_s: float, limit: int = 50) -> list[dict]:
+        """Les lignes des `since_s` dernières secondes (de l'hôte si donné),
+        les plus récentes d'abord ; instant en `at_ts`."""
+
+    @abc.abstractmethod
+    def summary(self, host: str | None, since_s: float) -> list[dict]:
+        """Par (hôte, kind, action) : nombre de lignes et octets, sur les
+        `since_s` dernières secondes (les bilans `mesure` exclus)."""
+
+    @abc.abstractmethod
+    def last_measure(self, host: str | None) -> list[dict]:
+        """Le dernier bilan (`kind = mesure`) de chaque hôte (ou de `host`)."""
+
+    @abc.abstractmethod
+    def register_worktree(self, *, host: str, path: str, repo: str, agent: str,
+                          lot: str | None, turn_id: str | None, branch: str,
+                          head: str) -> dict | None:
+        """Enregistre un worktree apparu pendant un tour ; None s'il est déjà
+        suivi (vivant ou gardé) sur cet hôte."""
+
+    @abc.abstractmethod
+    def worktrees(self, host: str | None, statuses: Sequence[str] | None = None,
+                  limit: int = 500) -> list[dict]:
+        """Worktrees suivis (de l'hôte, des statuts donnés), les plus anciens
+        d'abord ; instants en `created_ts`, `checked_ts`, `ended_ts`."""
+
+    @abc.abstractmethod
+    def set_worktree_status(self, worktree_id: int, status: str, detail: str) -> dict | None:
+        """Change le statut d'un worktree suivi (`ended_at` posé pour
+        `removed` et `gone`) ; rend la ligne, ou None."""
 
 
 class Visibility(Domain):
@@ -1755,4 +1812,5 @@ class Storage(abc.ABC):
     hosts: HostResources
     turn_resources: TurnResources
     visibility: Visibility
+    housekeeping: Housekeeping
     session_bindings: SessionBindings
