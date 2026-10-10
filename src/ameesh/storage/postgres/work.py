@@ -470,11 +470,13 @@ class WorkItems(interface.WorkItems):
             " RETURNING id", (head, int(item_id), branch, head))
         return bool(rows)
 
-    def open_with_branch(self, limit) -> list[dict]:
-        """Les lots ouverts qui portent une branche, du plus ancien au plus récent."""
+    def open_for_sweep(self, limit) -> list[dict]:
+        """Les lots ouverts que le relevé des fusions examine — avec une
+        branche ou un assigné —, du plus ancien au plus récent."""
         return self.db.query(
             "SELECT %s FROM work_items"
-            " WHERE branch IS NOT NULL AND state NOT IN ('merged', 'promoted', 'closed')"
+            " WHERE (branch IS NOT NULL OR assignee IS NOT NULL)"
+            "   AND state NOT IN ('merged', 'promoted', 'closed')"
             " ORDER BY id LIMIT %%s" % ITEM_COLUMNS, (int(limit),))
 
     def open_for(self, assignee) -> list[dict]:

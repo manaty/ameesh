@@ -134,7 +134,9 @@ ameesh cost balance [--provider deepseek] [--record] [--since SINCE] [--json]
 chantier) and groups agents by project, a **LOTS** column (open lots assigned
 to each agent) and prefixes the status of an external agent with `ext/`.
 `ameesh projects` shows, per project, each agent's state (working, paused,
-idle, stopped, with the reason), its current lot, unread mail, 24 h spend and
+idle, stopped, with the reason), its current lot (the last open lot the agent
+quoted in its own mail, else its session's lot, else its most recent open
+assigned lot; never a merged or closed lot), unread mail, 24 h spend and
 whether it runs on a plan or pays per token, plus the open lots nobody can
 move forward; it flags projects with open work and no active agent. The same
 view heads `ameesh progress` (text, HTML page, `projects` key in JSON). `ameesh hosts` shows,
@@ -215,7 +217,9 @@ record, or an agent that assigned lots in the last 30 days):
 * a single `agent/…` branch quoted in the message is set on the attached lot
   when it has none.
 
-From any other sender, `--lot` stays a plain thread label. See
+From any other sender, `--lot` assigns nothing; when it designates an open
+lot (number, or a reference matching a single open lot) the message is tied
+to the lot's number, otherwise it stays a plain thread label. See
 `docs/ORCHESTRATEUR.md`.
 
 ## Work items: `ameesh work`
@@ -228,6 +232,8 @@ ameesh work add --title TITLE [--type bug|evolution] [--source S] [--app APP]
 ameesh work list [--state S] [--assignee A] [--limit N] [--json]
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
+ameesh work move <id> merged --correct REASON [--actor A]
+ameesh work merged <id> --sha SHA [--note N] [--actor A]
 ameesh work assign <id> <agent> [--externe] [--actor A] [--branch agent/…] [--target BRANCH]
 ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]
 ameesh work delegate <id> <agent> --within 30m|2h|1d|SECONDS [--actor A]
@@ -279,6 +285,25 @@ the target (ancestor, patch-id, squash — also after the branch was deleted),
 or a merge commit of the target quoting the full branch name. A freshly
 created branch, already an ancestor of its target, is not a merge.
 `work sync-branches` runs the same check by hand (`--dry-run`: close nothing).
+A configured `ameesh.target` that does not resolve is reported as an error,
+never silently replaced by `main`.
+
+**Merges without a PR or a branch.** The same check also covers open lots
+without a branch whose assignee is on the host: a merge commit of the target,
+made after the lot was created, designates the lot with an `ameesh-work: <id>`
+line, or with `#<id>` in its subject when the repository opts in
+(`git config ameesh.lotRef hash`; elsewhere `(#45)` is a GitHub PR number).
+The closed lot records the merge commit and a note saying how the merge was
+found. By hand, `work merged <id> --sha SHA` moves a lot from any open state
+(`intake`, `build`, `qa`, `blocked`, `waiting_human`) to `merged` at once,
+with its `merged` milestone; a closed lot is never reopened. A lot set to
+`promoted` by mistake goes back with `work move <id> merged --correct
+"reason"`, logged, for humans and orchestrator or design agents only.
+
+**Actor.** Without `--actor`, `work` commands record the session's bound
+identity (`AGENT_MAIL_NAME`, or a session binding), else `inconnu` with a
+warning — never an empty actor. `work delegate` keeps its meaning (`--actor`
+is the delegator).
 
 ## Canon and placement
 

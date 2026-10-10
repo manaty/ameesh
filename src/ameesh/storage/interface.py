@@ -788,8 +788,9 @@ class WorkItems(Domain):
         cible, si la branche du lot est toujours `branch`."""
 
     @abc.abstractmethod
-    def open_with_branch(self, limit: int) -> list[dict]:
-        """L118 : les lots ouverts qui portent une branche."""
+    def open_for_sweep(self, limit: int) -> list[dict]:
+        """L118 : les lots ouverts que le relevé des fusions examine (avec une
+        branche ou un assigné), du plus ancien au plus récent."""
 
     @abc.abstractmethod
     def open_for(self, assignee: str) -> list[dict]:
@@ -1512,8 +1513,10 @@ class Projects(Domain):
         harness, host, provider, credential_mode, status, status_text, mode,
         stop_reason, responsible, lease_live, turn_started_ts,
         status_since_ts, last_turn_ts, updated_ts, last_seen_ts, unread,
-        lot de session (`session_lot_id` / `_title` / `_state`), lot assigné
-        ouvert le plus récent (`assigned_lot_id` / `_title` / `_state`),
+        lot de session (`session_lot_id` / `_title` / `_state`), dernier lot
+        cité par l'agent dans son courrier (`mail_lot_id` / `_title` /
+        `_state`), lot assigné ouvert le plus récent (`assigned_lot_id` /
+        `_title` / `_state`) — trois lots OUVERTS, ou nuls,
         `open_lots` (lots ouverts assignés), `usd_24h` et `turns_24h`
         (grand livre, horloge de la base).
 

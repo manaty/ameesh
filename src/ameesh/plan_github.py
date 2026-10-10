@@ -50,10 +50,12 @@ from . import storage
 from . import work as work_mod
 from .connectors import ConnectorError
 from .connectors.git_merge import resolve_gh
+from .plan_git import WORK_TRAILER_RE
 
 _REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100}$")
 _LOT_LINE_RE = re.compile(r"(?im)^[ \t>*-]*ameesh-lot[ \t]*:[ \t]*([A-Za-z0-9][A-Za-z0-9._-]*)[ \t]*$")
-_WORK_LINE_RE = re.compile(r"(?im)^[ \t>*-]*ameesh-work[ \t]*:[ \t]*#?([1-9][0-9]{0,17})[ \t]*$")
+#: une ligne `ameesh-work: <n>` (même forme dans un commit de fusion : `plan_git`)
+_WORK_LINE_RE = WORK_TRAILER_RE
 _MARKER_RE = re.compile(r"<!-- ameesh:package=([A-Za-z0-9][A-Za-z0-9._-]*)(?: d=([0-9a-f.]*))? -->")
 
 #: labels d'état d'une issue de lot
