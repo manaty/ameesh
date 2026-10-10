@@ -418,6 +418,40 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         responsible=responsible)]
 
 
+def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = None) -> dict:
+    """L118 : `idle_capacity` part aussi aux orchestrateurs, qui peuvent agir.
+
+    Rend `{orchestrateur: texte}` : à chacun, les agents au repos sans lot de
+    SON équipe (tous s'il n'en a pas) et les lots ouverts sans agent (un lot
+    ne dit pas son équipe : tous). Un orchestrateur sans agent à occuper ne
+    reçoit rien ; il n'est jamais cité dans sa propre liste."""
+    if alert.get("type") != "idle_capacity":
+        return {}
+    by_name = {row["name"]: row for row in listing}
+    titles = lot_titles or {}
+    lots = [int(l) for l in alert.get("lots") or ()]
+    out = {}
+    for orch in alert.get("orchestrators") or ():
+        team = ((by_name.get(orch) or {}).get("team") or "").strip()
+        names = [n for n in alert.get("agents") or () if n != orch and (
+            not team or ((by_name.get(n) or {}).get("team") or "").strip() == team)]
+        if not names:
+            continue
+        parts = ["Capacité au repos : %d agent(s) réveillable(s) sans lot depuis plus de %s : "
+                 "%s." % (len(names), _duration(alert.get("threshold") or 0), ", ".join(names))]
+        if lots:
+            parts.append("Lots ouverts sans agent : %s." % ", ".join(
+                "#%d%s" % (i, " « %s »" % titles[i] if titles.get(i) else "")
+                for i in lots[:12]) + (" …" if len(lots) > 12 else ""))
+        else:
+            parts.append("Aucun lot ouvert sans agent.")
+        parts.append("Confie-leur du travail en le liant à un lot : ameesh mail send <agent> "
+                     "\"…\" --lot <id> (ou --new-lot \"titre\"), ou ameesh work assign <lot> "
+                     "<agent>.")
+        out[orch] = " ".join(parts)
+    return out
+
+
 # --------------------------------------------------------------------------
 # host_underused
 # --------------------------------------------------------------------------

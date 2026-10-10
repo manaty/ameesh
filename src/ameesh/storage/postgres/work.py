@@ -15,7 +15,7 @@ from .. import interface
 ITEM_COLUMNS = """
     id, type, source, app, title, body, issue_ref, workstream, state, assignee,
     loops, budget_usd, spent_usd, package_id, package_parent, pr_ref, close_reason,
-    superseded_by, delegated_by,
+    superseded_by, delegated_by, branch, branch_target, branch_head,
     extract(epoch from created_at)::float8 as created_ts,
     extract(epoch from updated_at)::float8 as updated_ts,
     extract(epoch from closed_at)::float8  as closed_ts,
@@ -113,18 +113,19 @@ class _Refrozen(Exception):
 class WorkItems(interface.WorkItems):
 
     def add(self, *, type, source, app, title, body, issue_ref, workstream,  # noqa: A002
-            assignee, budget_usd, note, actor, package_id=None, package_parent=None) -> dict:
+            assignee, budget_usd, note, actor, package_id=None, package_parent=None,
+            branch=None, branch_target=None) -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal."""
         rows = self.db.query(
             """
             INSERT INTO work_items
                 (type, source, app, title, body, issue_ref, workstream, assignee,
-                 budget_usd, state, package_id, package_parent)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'intake', %s, %s)
+                 budget_usd, state, package_id, package_parent, branch, branch_target)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'intake', %s, %s, %s, %s)
             RETURNING __COLUMNS__
             """.replace("__COLUMNS__", ITEM_COLUMNS),
             (type, source, app, title, body, issue_ref, workstream, assignee,
-             budget_usd, package_id, package_parent),
+             budget_usd, package_id, package_parent, branch, branch_target),
         )
         item = rows[0]
         self._event(int(item["id"]), "intake", note, actor)
@@ -436,6 +437,61 @@ class WorkItems(interface.WorkItems):
                 return None
             WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
             return rows[0]
+
+    # -- branche d'un lot (L118) ---------------------------------------------
+    def set_branch(self, item_id, branch, target, *, note, actor) -> dict | None:
+        """Pose la branche (et la cible) d'un lot ouvert, avec une ligne de
+        journal ; le dernier commit vu est oublié si la branche change. None
+        si le lot n'est plus ouvert."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "UPDATE work_items SET"
+                "       branch_head = CASE WHEN branch IS DISTINCT FROM %%s"
+                "                          THEN NULL ELSE branch_head END,"
+                "       branch = %%s, branch_target = %%s, updated_at = now()"
+                " WHERE id = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
+                " RETURNING %s" % ITEM_COLUMNS,
+                (branch, branch, target, int(item_id)))
+            if not rows:
+                return None
+            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            return rows[0]
+
+    def set_branch_head(self, item_id, branch, head) -> bool:
+        """Retient le dernier commit de la branche vu en avance sur sa cible
+        (sans journal ni `updated_at` : un relevé n'est pas une activité du
+        lot). Conditionné à la branche lue : rien si elle a changé."""
+        rows = self.db.query(
+            "UPDATE work_items SET branch_head = %s"
+            " WHERE id = %s AND branch = %s AND branch_head IS DISTINCT FROM %s"
+            " RETURNING id", (head, int(item_id), branch, head))
+        return bool(rows)
+
+    def open_with_branch(self, limit) -> list[dict]:
+        """Les lots ouverts qui portent une branche, du plus ancien au plus récent."""
+        return self.db.query(
+            "SELECT %s FROM work_items"
+            " WHERE branch IS NOT NULL AND state NOT IN ('merged', 'promoted', 'closed')"
+            " ORDER BY id LIMIT %%s" % ITEM_COLUMNS, (int(limit),))
+
+    def open_for(self, assignee) -> list[dict]:
+        """Les lots ouverts (ni fusionnés, ni promus, ni fermés) d'un assigné."""
+        return self.db.query(
+            "SELECT %s FROM work_items"
+            " WHERE assignee = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
+            " ORDER BY id" % ITEM_COLUMNS, (assignee,))
+
+    def open_by_ref(self, ref) -> list[dict]:
+        """Les lots ouverts désignés par une référence : `issue_ref`, fiche du
+        plan (`package_id`), branche, ou premier mot du titre (« REF : … »),
+        sans distinction de casse."""
+        return self.db.query(
+            "SELECT %s FROM work_items"
+            " WHERE state NOT IN ('merged', 'promoted', 'closed')"
+            "   AND (lower(issue_ref) = lower(%%s) OR lower(package_id) = lower(%%s)"
+            "        OR lower(branch) = lower(%%s)"
+            "        OR lower(rtrim(split_part(btrim(title), ' ', 1), ':')) = lower(%%s))"
+            " ORDER BY id" % ITEM_COLUMNS, (ref, ref, ref, ref))
 
     def by_package(self, package_id) -> list[dict]:
         return self.db.query(

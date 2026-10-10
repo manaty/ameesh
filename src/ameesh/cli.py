@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """agent-mail (mesh v1) — boîte aux lettres des agents, sur Postgres.
 
-  agent-mail send <dest> <texte…> [--from NOM] [--lot ID]
+  agent-mail send <dest> <texte…> [--from NOM] [--lot ID|RÉF] [--new-lot "titre"]
                                                  dépose un message (dest = nom, ou "all")
                                                  et l'écrit dans le fil lisible du projet
-                                                 ou du lot (ameesh fil show <projet> [<lot>])
+                                                 ou du lot (ameesh fil show <projet> [<lot>]) ;
+                                                 d'un orchestrateur, --lot rattache le lot
+                                                 au destinataire et --new-lot le crée (L118)
   agent-mail list                                agents, hôte, bail, non lus
   agent-mail inbox [NOM]                         messages non lus de NOM (sans les marquer lus)
   agent-mail whoami [--session ID --harness H]   identité liée et sa source (runner, explicit,
@@ -202,10 +204,11 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     key_path = None
     expires = None
     lot = None
+    new_lot = None
     kind = "notify"
     urgent = False
     args = list(args)
-    for flag in ("--from", "--key", "--expires", "--lot", "--kind"):
+    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--kind"):
         if flag in args:
             index = args.index(flag)
             value = args[index + 1] if index + 1 < len(args) else None
@@ -218,6 +221,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 expires = value
             elif flag == "--lot":
                 lot = value
+            elif flag == "--new-lot":
+                new_lot = value if value is not None else ""
             else:
                 kind = value
     if "--urgent" in args:
@@ -236,12 +241,18 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--expires n'a de sens qu'avec --sign/--key", file=sys.stderr)
         return 2
     if len(args) < 2:
-        print("usage: agent-mail send <dest|all> <texte…> [--from NOM] [--lot ID] "
-              "[--kind request|reply|notify|event] [--urgent] "
+        print("usage: agent-mail send <dest|all> <texte…> [--from NOM] [--lot ID|RÉF] "
+              "[--new-lot \"titre\"] [--kind request|reply|notify|event] [--urgent] "
               "[--sign --key FICHIER] [--expires 24h]", file=sys.stderr)
         return 2
     if lot is not None and not NAME_RE.match(lot):
         print("lot invalide : %r (lettres, chiffres, . _ -)" % lot, file=sys.stderr)
+        return 2
+    if new_lot is not None and lot is not None:
+        print("--lot OU --new-lot, pas les deux", file=sys.stderr)
+        return 2
+    if new_lot is not None and not new_lot.strip():
+        print("--new-lot : titre vide", file=sys.stderr)
         return 2
     dest, text = args[0], " ".join(args[1:]).strip()
     if not sender:
@@ -295,9 +306,37 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             print("attention : en repli fichier, la signature n'est pas conservée",
                   file=sys.stderr)
 
+    # L118 : le courrier qui confie du travail est lié à un lot (avant le
+    # dépôt : une attribution refusée ne dépose rien)
+    thread_meta = None
+    if new_lot is not None and (bk.kind != "pg" or dest == "all"):
+        print("--new-lot exige la base et un destinataire précis", file=sys.stderr)
+        return 2
+    if bk.kind == "pg" and dest != "all":
+        from . import assignments, plan_git
+        try:
+            linked = assignments.link_message(
+                cfg, bk.db, sender=sender, recipient=dest, lot=lot, new_lot=new_lot,
+                branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None)
+        except assignments.AssignmentError as exc:
+            print("message non déposé — %s" % exc, file=sys.stderr)
+            return 2
+        lot = linked["work_item_id"]
+        for warning in linked["warnings"]:
+            print("attention : %s" % warning, file=sys.stderr)
+        if linked["warnings"]:
+            thread_meta = {"avertissement": " ; ".join(linked["warnings"])}
+        item = linked["lot"]
+        if item is not None and (linked["created"] or linked["assigned"] or linked["branch"]):
+            print("lot #%d %s%s%s" % (
+                int(item["id"]), "créé et assigné à %s" % dest if linked["created"]
+                else "assigné à %s" % dest if linked["assigned"] else "rattaché",
+                " : %s" % item.get("title") if linked["created"] else "",
+                " (branche %s)" % linked["branch"] if linked["branch"] else ""))
+
     targets = bk.send(sender, dest, text, host=cfg.host, signed=signed,
                       work_item_id=lot, allow_structured=allow_structured,
-                      kind=kind, urgent=urgent)
+                      kind=kind, urgent=urgent, thread_meta=thread_meta)
     if not targets:
         print("aucun destinataire")
     elif signed:

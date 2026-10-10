@@ -263,6 +263,9 @@ class Config:
     #: des dossiers temporaires et des caches, worktrees des lots finis ;
     #: 0 = aucun passage périodique (le ménage autour des tours reste).
     housekeeping_interval: float = 600.0
+    #: relevé périodique des branches par l'exécuteur (secondes, L118) : un
+    #: lot dont la branche est fusionnée dans sa cible passe livré ; 0 = aucun.
+    branch_sweep_interval: float = 300.0
     #: visibilité d'une persona (L31, 0029) : durée de cache du verdict, en
     #: secondes, et délai maximal accordé à la vérification par la forge.
     visibility_ttl: float = 300.0
@@ -461,6 +464,8 @@ def load(env: dict | None = None) -> Config:
                                     cfg.resource_interval),
         housekeeping_interval=_as_float(pick("AMEESH_HOUSEKEEPING_INTERVAL"),
                                         cfg.housekeeping_interval),
+        branch_sweep_interval=_as_float(pick("AMEESH_BRANCH_SWEEP_INTERVAL"),
+                                        cfg.branch_sweep_interval),
         visibility_ttl=_as_float(pick("AMEESH_VISIBILITY_TTL"), cfg.visibility_ttl),
         visibility_timeout=_as_float(pick("AMEESH_VISIBILITY_TIMEOUT"),
                                      cfg.visibility_timeout),
