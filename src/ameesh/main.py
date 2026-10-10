@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """ameesh — la commande du mesh, et ses sous-commandes.
 
+  ameesh --version | version  la version du paquet installé ;
   ameesh mail <send|inbox|list|status|alias|hook|statusline|whoami>
         la boîte aux lettres ; `agent-mail` reste un alias (les hooks des
         harnais l'appellent) ;
@@ -152,6 +153,10 @@ def _dispatch(argv: list[str] | None) -> int:
         print(__doc__)
         return 0
     command, rest = argv[0], argv[1:]
+    if command in ("--version", "version"):
+        from . import version
+        print("ameesh %s" % version())
+        return 0
     if command == "mail":
         from . import cli
         return cli.main(rest)

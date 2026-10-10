@@ -1,4 +1,4 @@
-# Comptes multiples par fournisseur (L30, L74)
+# Comptes multiples par fournisseur (L30, L74, L117)
 
 Les comptes au forfait d'un fournisseur forment un **réservoir**, pas une
 liste de secours (décision
@@ -14,11 +14,16 @@ compte est choisi ainsi :
    gain marginal.
 3. Sinon (ouverture de session, rotation, ou compte de la session au seuil) :
    parmi les comptes **utilisables** (profil valide, sous le seuil de la garde
-   `min(90 %, part écoulée + 10 points)`, décision 0019), celui dont **la
-   capacité inutilisée expire le plus tôt** : la remise à zéro la plus proche
-   parmi ses fenêtres en cours (5 h, 7 jours…). Un compte sans fenêtre en
-   cours (relevé échu, non daté, ou aucun relevé) n'a rien qui expire : il
-   passe après. À égalité, l'ordre déclaré.
+   `min(90 %, part écoulée + 10 points)` dans **toutes** leurs fenêtres,
+   décision 0019), celui qui a **le plus de retard sur son rythme** : le plus
+   petit rapport `utilisé / rythme` (le rythme est le plafond de la garde à cet
+   instant de la fenêtre, colonne « rythme » de `ameesh accounts list`), pris
+   sur sa fenêtre la plus contraignante (5 h ou 7 jours). Un compte sans
+   fenêtre ouverte ou sans relevé compte pour 0 % utilisé : il passe **en
+   premier**. À égalité, celui dont la capacité inutilisée expire le plus tôt,
+   puis l'ordre déclaré (amendement du 2026-10-10 à 0034, lot L117 : un compte
+   jamais utilisé ne doit pas rester inutilisé ; avant, le primaire, toujours
+   en fenêtre ouverte, gagnait toujours).
 4. Tous les comptes au seuil : pause.
 
 Un relevé dont la fenêtre est échue (`resets_at` passé) compte pour **0 %**
@@ -94,8 +99,9 @@ dans le canon :
 }
 ```
 
-* L'ordre départage les égalités d'échéance (et les comptes sans jauge
-  datée, comme les clés d'API) : le premier est le primaire.
+* L'ordre départage les égalités de retard et d'échéance (par exemple deux
+  comptes jamais utilisés, ou les clés d'API sans jauge) : le premier est le
+  primaire.
 * `config_dir` sans `path` : le dossier que le harnais prendrait de lui-même
   dans l'environnement de l'exécuteur (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`
   hérités s'ils sont posés, sinon `~/.claude` / `~/.codex`). Ses jauges Codex
@@ -138,15 +144,16 @@ ameesh budget                          # plafonds du mesh en vigueur, source, pa
 
 `ameesh accounts list` montre, pour chaque compte, la capacité **perdue à la
 prochaine remise à zéro** de chaque fenêtre en cours si rien ne change, et le
-compte que prendrait une nouvelle session, avec sa raison :
+compte que prendrait une nouvelle session, avec sa raison (la même que celle
+du choix) :
 
 ```
 harnais   compte         actif   état     jauges
-codex     primaire       oui     ok       codex-300min 10% (rythme 50%), codex-10080min 20% (rythme 53%)
-                                          ↳ perdu à la remise à zéro si rien ne change : codex-300min 90 % dans 3 h, codex-10080min 80 % dans 4 j
-codex     secondaire             ok       codex-300min 0% (rythme 90%), codex-10080min 5% (rythme 24%)
-                                          ↳ perdu à la remise à zéro si rien ne change : codex-300min 100 % dans 52 min, codex-10080min 95 % dans 6 j
-                                          ↳ prochain choix pour une nouvelle session : codex-300min expire dans 52 min, 0 % utilisé (avant primaire : …)
+claude    primaire       oui     ok       five_hour 37% (rythme 83%), seven_day 35% (rythme 55%)
+                                          ↳ perdu à la remise à zéro si rien ne change : five_hour 63 % dans 1 h 21, seven_day 65 % dans 3 j 20 h
+claude    secondaire             ok       —
+                                          ↳ prochain choix pour une nouvelle session : sans relevé : 0 % utilisé, le plus en retard sur son rythme ; avant : tertiaire sans relevé : 0 % utilisé, primaire seven_day 35 % utilisé (rythme 55 %)
+claude    tertiaire              ok       —
 ```
 
 La colonne « actif » est le **dernier compte choisi** pour une nouvelle
@@ -162,14 +169,15 @@ relevé n'était jamais rafraîchi). L'affichage garde le dernier relevé :
 « codex-300min 0% (rythme 90%, remise à zéro passée, dernier relevé 93%) ».
 
 Chaque choix de compte est journalisé avec sa raison dans le journal de
-l'exécuteur (`[agent] compte codex : secondaire — codex-300min expire dans
-52 min, 0 % utilisé (avant primaire : …)`, ou `— continuité : la session reste
-sur primaire, sous son seuil`), une fois par changement de choix et non à
+l'exécuteur (`[agent] compte claude : secondaire — sans relevé : 0 % utilisé,
+le plus en retard sur son rythme ; avant : tertiaire sans relevé : 0 %
+utilisé, primaire seven_day 35 % utilisé (rythme 55 %)`, ou `— continuité :
+la session reste sur primaire, sous son seuil`), une fois par changement de choix et non à
 chaque sondage. Chaque changement du dernier choix est journalisé en base
 (`account_switches`, type `bascule`, avec la même raison) et dans le fil de
 l'équipe de l'agent qui l'a déclenché. Les retenues jusqu'à la remise à zéro
 (`account_holds`) et les « retours au primaire » de 0027 §3 ne sont plus
-posés : le choix par échéance les remplace. Une
+posés : le choix par retard sur le rythme les remplace. Une
 session reprise sous l'autre compte, ou tournée avec résumé, est dite dans le
 fil. Codex n'est jamais portable : un changement de compte d'une session
 Codex passe toujours par la rotation avec résumé (0027 §5), c'est pourquoi il

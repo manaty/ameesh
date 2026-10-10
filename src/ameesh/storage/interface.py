@@ -1583,7 +1583,8 @@ class Operations(Domain):
 
     @abc.abstractmethod
     def listing(self) -> list[dict]:
-        """Une ligne par agent : réglages, statut et `status_since_ts`, bail
+        """Une ligne par agent : réglages, dossier de travail (`cwd`), statut et
+        `status_since_ts`, bail
         (`lease_live`, `lease_expires_ts`), tour en cours (`turn_started_ts`,
         `turn_label` du marqueur comptable), non-lus (`unread`,
         `oldest_unread_ts`), lot de session (`session_work_item`,

@@ -224,7 +224,7 @@ class WorktreeEtatTest(_Tmp):
         _git("worktree", "add", "-q", wt, "-b", "lot", cwd=main)
         self.assertEqual([w["path"] for w in menage.list_worktrees(main)][1:], [wt])
         st = menage.worktree_state(wt)
-        self.assertTrue(st["clean"] and st["pushed"], st)
+        self.assertTrue(st["clean"] and st["pushed"] and st["integrated"], st)
         _write(os.path.join(wt, "brouillon.txt"), 3)
         st = menage.worktree_state(wt)
         self.assertFalse(st["clean"])
@@ -233,15 +233,66 @@ class WorktreeEtatTest(_Tmp):
         _git("commit", "-q", "-m", "travail", cwd=wt)
         st = menage.worktree_state(wt)
         self.assertTrue(st["clean"])
-        self.assertFalse(st["pushed"])
+        self.assertFalse(st["pushed"] or st["integrated"])
         self.assertIn("non poussés", st["reason"])
+        # L73b : poussé sur sa branche mais pas fusionné — pas intégré
+        _git("push", "-q", "origin", "lot", cwd=wt)
+        st = menage.worktree_state(wt)
+        self.assertTrue(st["pushed"])
+        self.assertFalse(st["integrated"])
+        self.assertIn("poussé mais non fusionné", st["reason"])
         # intégré par rebase : le même changement est sur origin/main
         _git("cherry-pick", "lot", cwd=main)
         _git("push", "-q", "origin", "main", cwd=main)
         _git("fetch", "-q", "origin", cwd=wt)
         _git("remote", "set-head", "origin", "main", cwd=main)
-        self.assertTrue(menage.worktree_state(wt)["pushed"])
+        self.assertTrue(menage.worktree_state(wt)["integrated"])
+        # verrouillé : signalé, jamais retirable
+        _git("worktree", "lock", wt, cwd=main)
+        self.assertTrue(menage.list_worktrees(main)[1]["locked"])
+        st = menage.worktree_state(wt)
+        self.assertTrue(st["locked"])
+        self.assertIn("verrouillé", st["reason"])
         self.assertFalse(menage.worktree_state(os.path.join(self.base, "absent"))["exists"])
+
+    def test_integre_par_fusion_ecrasee(self):
+        main = _repo(self.base)
+        wt = os.path.join(self.base, "wt")
+        _git("worktree", "add", "-q", wt, "-b", "lot", cwd=main)
+        for nom in ("a.txt", "b.txt"):
+            _write(os.path.join(wt, nom), 3)
+            _git("add", nom, cwd=wt)
+            _git("commit", "-q", "-m", nom, cwd=wt)
+        _git("push", "-q", "origin", "lot", cwd=wt)
+        self.assertFalse(menage.worktree_state(wt)["integrated"])
+        _git("merge", "-q", "--squash", "lot", cwd=main)
+        _git("commit", "-q", "-m", "lot (#1)", cwd=main)
+        _git("push", "-q", "origin", "main", cwd=main)
+        self.assertTrue(menage.worktree_state(wt)["integrated"])
+
+    def test_attribution_au_seul_agent_qui_l_a_cree(self):
+        a1 = os.path.join(self.base, "a1")
+        a2 = os.path.join(self.base, "a1", "imbrique-a2")
+        sous = os.path.join(a1, ".claude", "worktrees", "agent-x")
+        self.assertTrue(menage.owns_worktree(sous, a1, []))
+        # hors du dossier de l'agent : un autre agent du même dépôt
+        self.assertFalse(menage.owns_worktree(os.path.join(self.base, "relecture"), a1, []))
+        self.assertFalse(menage.owns_worktree(a1, a1, []))
+        # même dossier partagé avec un autre agent : dans le doute, non
+        self.assertFalse(menage.owns_worktree(sous, a1, [a1]))
+        # sous le dossier d'un autre agent plus proche du worktree : à lui
+        self.assertFalse(menage.owns_worktree(os.path.join(a2, "wt"), a1, [a2]))
+        self.assertTrue(menage.owns_worktree(sous, a1, [a2, os.path.join(self.base, "b")]))
+        self.assertFalse(menage.owns_worktree(sous, None, []))
+
+    def test_processus_dans_le_worktree(self):
+        wt = os.path.join(self.base, "wt")
+        os.makedirs(wt)
+        self.assertFalse(menage.worktree_in_use(wt))
+        proc = subprocess.Popen(["sleep", "30"], cwd=wt)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        self.assertTrue(menage.worktree_in_use(wt))
 
 
 # ==========================================================================
@@ -372,7 +423,10 @@ class MenageDbTest(PgTestCase):
         tour = menage.Turn.begin(self.cfgl, pol, "a1", main, new_session=True, base_env={})
         self.assertFalse(os.path.exists(os.path.join(mine, "de-la-session-precedente")))
         self.assertEqual(tour.env["TMPDIR"], mine)
-        # pendant le tour : un worktree de relecture et un clone dans /tmp
+        # pendant le tour : un worktree de sous-agent (sous le dossier de
+        # l'agent), un worktree hors de son dossier, et un clone dans /tmp
+        sous = os.path.join(main, ".claude", "worktrees", "agent-x")
+        _git("worktree", "add", "-q", "--detach", sous, cwd=main)
         wt = os.path.join(self.tmp, "relecture")
         _git("worktree", "add", "-q", "--detach", wt, cwd=main)
         _write(os.path.join(systeme, "clone", "f"), 5000)
@@ -384,7 +438,11 @@ class MenageDbTest(PgTestCase):
         self.assertIn(("orphan", "signaled"), kinds)
         self.assertTrue(os.path.exists(os.path.join(systeme, "clone", "f")))   # jamais supprimé
         rows = storage.of(self.db).housekeeping.worktrees("pc")
-        self.assertEqual([(r["path"], r["agent"], r["lot"]) for r in rows], [(wt, "a1", "7")])
+        self.assertEqual(sorted((r["path"], r["agent"], r["lot"]) for r in rows),
+                         sorted([(sous, "a1", "7"), (wt, "a1", None)]))
+        detail = {r["path"]: r["detail"] for r in rows}
+        self.assertTrue(detail[wt].startswith(menage.UNATTRIBUTED), detail)
+        self.assertFalse(detail[sous].startswith(menage.UNATTRIBUTED), detail)
         # session reprise : le dossier temporaire est conservé
         menage.Turn.begin(self.cfgl, pol, "a1", main, new_session=False, base_env={})
         self.assertTrue(os.path.exists(os.path.join(mine, "garde-pour-la-session")))
@@ -406,11 +464,13 @@ class MenageDbTest(PgTestCase):
         attend = self._suivi(main, "attend", ouvert)
         work.close(self.db, fini, abandoned=True)
         pol = menage.Policy()
-        essai = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", dry_run=True)
+        plus_tard = time.time() + 2 * 3600   # garde d'âge d'une heure franchie
+        essai = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", dry_run=True,
+                                now=plus_tard)
         self.assertTrue(os.path.isdir(propre))
         self.assertEqual(storage.of(self.db).housekeeping.recent("pc", 3600), [])
         self.assertIn("retrait", {p["action"] for p in essai["plan"]})
-        menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t")
+        menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=plus_tard)
         self.assertFalse(os.path.exists(propre))
         self.assertTrue(os.path.isdir(sale))
         self.assertTrue(os.path.isdir(attend))
@@ -423,6 +483,82 @@ class MenageDbTest(PgTestCase):
                    if a["type"] == "worktree_kept"]
         self.assertEqual([a["path"] for a in alertes], [sale])
         self.assertIn("non suivi", alertes[0]["detail"])
+
+    def test_worktree_d_un_autre_agent_survit_a_la_fin_du_lot_du_tour(self):
+        """L73b, cas réel : un agent crée un worktree de relecture PENDANT le
+        tour d'un autre agent sur le même dépôt ; le lot de ce tour est
+        fusionné ; le worktree de relecture n'est pas retiré."""
+        main = _repo(self.tmp)
+        a1 = os.path.join(self.tmp, "a1")
+        _git("worktree", "add", "-q", a1, "-b", "a1", cwd=main)
+        registry.upsert(self.db, "a1", harness="claude", host="pc", cwd=a1)
+        registry.upsert(self.db, "a2", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a2"))
+        lot = self._lot("lot du tour")
+        tour = menage.Turn.begin(self.cfgl, menage.Policy(), "a1", a1, new_session=False,
+                                 base_env={})
+        relecture = os.path.join(self.tmp, "relecture-a2")
+        _git("worktree", "add", "-q", relecture, "-b", "relecture", cwd=main)  # par a2
+        tour.end(lot=str(lot), turn_id="t" * 32, db=self.db, host="pc")
+        rows = storage.of(self.db).housekeeping.worktrees("pc")
+        self.assertEqual([(r["path"], r["lot"]) for r in rows], [(relecture, None)])
+        work.close(self.db, lot, abandoned=True)
+        loin = time.time() + 30 * 24 * 3600
+        for lotless in (False, True):
+            rapport = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
+                                      actor="t", include_lotless=lotless, now=loin)
+            self.assertTrue(os.path.isdir(relecture))
+            self.assertNotIn("retrait", {p["action"] for p in rapport["plan"]})
+        self.assertEqual([r["status"] for r in storage.of(self.db).housekeeping.worktrees("pc")],
+                         ["active"])
+
+    def test_garde_fous_age_tour_en_cours_verrou_et_integration(self):
+        main = _repo(self.tmp)
+        fini = self._lot("fini")
+        jeune = self._suivi(main, "jeune", fini)
+        pol = menage.Policy()
+        work.close(self.db, fini, abandoned=True)
+
+        def plan(**kw):
+            rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                                      dry_run=True, **kw)
+            return {p["path"]: p for p in rapport["plan"] if p.get("kind") == "worktree"}
+
+        # (b) moins d'une heure : attend
+        self.assertEqual(plan()[jeune]["action"], "attend")
+        plus_tard = time.time() + 2 * 3600
+        self.assertEqual(plan(now=plus_tard)[jeune]["action"], "retrait")
+        # dossier modifié récemment : attend aussi
+        self.assertEqual(plan(now=os.stat(jeune).st_mtime + 600)[jeune]["action"], "attend")
+        # (c) l'agent propriétaire a un tour en cours : attend
+        p = plan(now=plus_tard, agents_in_turn={"a1"})[jeune]
+        self.assertEqual(p["action"], "attend")
+        self.assertIn("tour en cours", p["detail"])
+        # verrouillé : gardé
+        _git("worktree", "lock", jeune, cwd=main)
+        p = plan(now=plus_tard)[jeune]
+        self.assertEqual(p["action"], "garde")
+        self.assertIn("verrouillé", p["detail"])
+        _git("worktree", "unlock", jeune, cwd=main)
+        # (d) poussé mais pas fusionné : gardé ; fusionné : retiré
+        _write(os.path.join(jeune, "f.txt"), 3)
+        _git("add", ".", cwd=jeune)
+        _git("commit", "-q", "-m", "travail", cwd=jeune)
+        _git("push", "-q", "origin", "jeune", cwd=jeune)
+        menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=plus_tard)
+        self.assertTrue(os.path.isdir(jeune))
+        rows = storage.of(self.db).housekeeping.worktrees("pc")
+        self.assertEqual(rows[0]["status"], "kept")
+        self.assertIn("poussé mais non fusionné", rows[0]["detail"])
+        _git("merge", "-q", "--ff-only", "jeune", cwd=main)
+        _git("push", "-q", "origin", "main", cwd=main)
+        menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=plus_tard)
+        self.assertFalse(os.path.exists(jeune))
+        # le dossier de travail d'un agent (ou un dossier qui le contient) : gardé
+        parent = self._suivi(main, "parent", fini)
+        registry.upsert(self.db, "a3", harness="claude", host="pc",
+                        cwd=os.path.join(parent, "sous-dossier"))
+        self.assertEqual(plan(now=plus_tard)[parent]["action"], "garde")
 
     def test_dossier_d_agent_disparu_et_caches_remis_pendant_un_tour(self):
         registry.upsert(self.db, "a1", harness="claude", host="pc")
