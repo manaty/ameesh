@@ -322,6 +322,9 @@ class AgentWorker(threading.Thread):
         self.last_turn_reread_session: str | None = None
         #: `ameesh restart` (L26) : arrêt du tour en cours, puis session neuve
         self.restarting = threading.Event()
+        #: porte d'hôte (L112) : raison de l'arrêt du tour en cours parce que
+        #: l'hôte se retire (point sûr, échéance, arrêt), None sinon
+        self.host_yield: str | None = None
         #: comptes multiples (L30, 0027) : compte choisi pour le prochain tour, et
         #: compte imposé au tour de résumé d'une bascule (l'ancien compte)
         self._account = None
@@ -801,6 +804,39 @@ class AgentWorker(threading.Thread):
                 # `ameesh restart` (L26) : même point de passage, même grâce
                 self.stop_group_now("redémarrage demandé", grace=1.0)
                 return
+
+    def yield_to_host(self, reason: str) -> None:
+        """Porte d'hôte (L112) : l'échéance du retrait est atteinte, ou l'hôte
+        s'arrête — le tour en cours s'arrête (point de passage unique, grâce
+        brève) ; sa consigne repartira en attente, la session est gardée."""
+        self.host_yield = reason
+        self.wake.set()
+        threading.Thread(target=self.stop_group_now, args=("l'hôte se retire : %s" % reason,),
+                         kwargs={"grace": 1.0}, daemon=True,
+                         name="%s-retrait" % self.name).start()
+
+    def _leave_for_host(self) -> None:
+        """Porte d'hôte fermée (L112) : plus aucun tour ici. État de la
+        session écrit, consigne éventuelle remise en attente, statut dit ;
+        le bail est rendu par `run()` en sortant. Écritures au mieux : si le
+        réseau est déjà coupé, le bail échoit seul et le courrier sera
+        re-livré, signalé."""
+        gate = getattr(self.runner, "host_gate", None)
+        etat = gate.current if gate is not None else None
+        texte = "hôte indisponible (%s, %s) : reprise au retour de l'hôte" % (
+            etat.state if etat else "?", etat.reason if etat else "?")
+        log_async("[%s] l'hôte se retire : bail rendu (%s)" % (self.name, texte))
+        if self.lease_lost.is_set():
+            return
+        try:
+            if self._session_en_attente is not None:
+                self._enregistre_session()
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            row = registry.get(self.db, self.name) or {}
+            if row.get("status") in ("running", "idle", "queued"):
+                registry.set_status(self.db, self.name, "queued", status_text=texte)
+        except db_mod.DbError as exc:
+            log_async("[%s] état de retrait non écrit (%s)" % (self.name, db_mod.explain(exc)))
 
     def request_restart(self) -> None:
         """`ameesh restart` (L26) : arrêter le tour en cours, puis appliquer."""
@@ -1717,6 +1753,8 @@ class AgentWorker(threading.Thread):
             self.agent = agent = registry.get(self.db, self.name) or agent
         if not self.budget_ok():
             return None  # garde de budget (L13) : aucun tour, état `paused` posé
+        if self.runner.gate_holds():
+            return None  # porte d'hôte fermée (L112) : rien n'est consommé
         # Contre-pression de l'hôte (L31, 0028) : au-dessus d'un seuil, aucun
         # NOUVEAU tour ne démarre ; la consigne en attente n'est pas consommée.
         pressure = self.runner.host_pressure()
@@ -1854,6 +1892,14 @@ class AgentWorker(threading.Thread):
         pression = self.runner.host_pressure()
         if pression.get("blocked"):
             self._host_pressure_note(pression)
+            return False
+        if self.runner.gate_holds():
+            # L112 : l'hôte se retire entre le choix du tour et son lancement —
+            # une consigne déjà prise repart en attente, rien n'est lancé.
+            try:
+                registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            except db_mod.DbError:
+                pass
             return False
         if not candidats or self.runner.dry_run:
             return self._run_turn(spec)
@@ -2134,6 +2180,7 @@ class AgentWorker(threading.Thread):
         error: str | None = None
         result_code = 0
         self.last_output = ""
+        self.host_yield = None
 
         # Marqueur comptable **avant** le lancement : si on ne peut pas garantir
         # une trace, on ne dépense pas (fail-closed, L13 B5). Le marqueur est
@@ -2216,6 +2263,13 @@ class AgentWorker(threading.Thread):
                     for text in parsed.get("display") or []:
                         log("[%s] %s" % (self.name, text))
                         self.last_output = (self.last_output + "\n" + text)[-4000:]
+                    if parsed.get("safe_point") and self.host_yield is None \
+                            and self.runner.gate_holds():
+                        # L112 : l'hôte se retire — point sûr, l'appel d'outil en
+                        # cours est fini et son résultat est dans la session.
+                        self.host_yield = "point sûr"
+                        self.stop_group_now("l'hôte se retire : tour arrêté au point sûr",
+                                            grace=1.0)
                     usage = parsed.get("usage")
                     if isinstance(usage, dict):
                         # Clés de chaque harnais normalisées (L60 : l'usage
@@ -2264,6 +2318,23 @@ class AgentWorker(threading.Thread):
             # l'état d'un agent qu'un remplaçant a pu reprendre.
             self._avec_reprise("consigne remise en attente", registry.restore_prompt,
                                self.db, self.name, self.runner.runner_id, self.epoch)
+            return False
+        if self.host_yield is not None:
+            # L112 : l'hôte se retire — comme une préemption : la consigne
+            # repart en attente, la session est gardée ; le worker rend son
+            # bail au passage suivant (`_leave_for_host`).
+            raison = self.host_yield
+            self._avec_reprise("consigne remise en attente", registry.restore_prompt,
+                               self.db, self.name, self.runner.runner_id, self.epoch)
+            self._avec_reprise("statut de fin de tour", registry.set_status,
+                               self.db, self.name, "queued",
+                               status_text="tour interrompu : l'hôte se retire (%s)" % raison)
+            self._fil_note(
+                "Tour interrompu après %ds : l'hôte se retire (%s). La consigne repart "
+                "en attente ; le travail reprendra dans la même session au retour de "
+                "l'hôte." % (int(duration), raison),
+                meta={"action": "retrait-hote", "raison": raison,
+                      "tour_s": round(duration, 1)})
             return False
         if self.restarting.is_set() and not preempte and not ok:
             # `ameesh restart` (L26) : le tour est arrêté ; sa consigne repart en
@@ -2381,6 +2452,10 @@ class AgentWorker(threading.Thread):
         self.ensure_watchdog()
         try:
             while not self.stopping.is_set() and not self.runner.stop.is_set():
+                if self.runner.gate_holds():
+                    # L112 : porte d'hôte fermée — le bail est rendu (finally)
+                    self._leave_for_host()
+                    break
                 if not self.renew():
                     break
                 # L72 : une base injoignable n'arrête plus le worker (son fil
@@ -2414,6 +2489,8 @@ class AgentWorker(threading.Thread):
                 if reussi:
                     self.fast_failures = 0
                     continue
+                if self.host_yield is not None or self.runner.gate_holds():
+                    continue  # L112 : retrait de l'hôte, pas un échec de tour
                 if self.fast_failure:
                     self.fast_failures += 1
                     if self.fast_failures >= self.runner.max_fast_failures:
@@ -2524,6 +2601,10 @@ class Runner:
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
         self._delegation_error: str | None = None
         self._delegation_dry_seen: set = set()
+        #: porte d'hôte (L112) : None sans porte configurée (hôte classique,
+        #: comportement inchangé)
+        from .executeur_mediee import porte_hote
+        self.host_gate = porte_hote.controller_from_config(self, log=log_async)
 
     # -- exécuteur médié (L109) ---------------------------------------------
     def _mediated_setup(self) -> None:
@@ -2599,6 +2680,8 @@ class Runner:
                 if not worker.is_alive():
                     log("worker %s terminé" % name)
                     del self.workers[name]
+        if self.gate_holds():
+            return  # L112 : porte d'hôte fermée — aucune réclamation
         if getattr(self, "mediated", False) and not self.gate.state().may_claim:
             return  # L109/L112 : porte d'hôte fermée, aucune nouvelle réclamation
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
@@ -2788,6 +2871,9 @@ class Runner:
         if self.listener_thread is not None:
             self.listener_thread.join(timeout=2.0)
         self.stopped_threads = list(workers)
+        if getattr(self, "host_gate", None) is not None:
+            self.host_gate.tick()  # dernier acquittement : plus aucun bail
+            self.host_gate.stop()
         # par la file : aucune écriture synchrone sur le chemin d'arrêt avant
         # le repli de `_sortie_sure` (relecture codex2 de 669a6fe, B1)
         log_async("arrêt : %d bail(aux) rendu(s), %d tour(s)" % (len(workers), self.turns))
@@ -3039,6 +3125,14 @@ class Runner:
             return  # objet factice des tests de `canon_sync_once`
         mine = resources_mod.host_limits(canons, self.host)
         limits = mine["limits"]
+        # L112 : bail court d'un hôte volatil (fiche Host), sinon la config
+        from .executeur_mediee import porte_hote
+        cfg = getattr(self, "cfg", None)
+        ttl = porte_hote.lease_ttl_for(canons, self.host, cfg.lease_ttl if cfg is not None
+                                       else getattr(self, "lease_ttl", 300.0))
+        if ttl != getattr(self, "lease_ttl", ttl):
+            log_async("bail des agents de %s : %ds (fiche Host)" % (self.host, int(ttl)))
+        self.lease_ttl = ttl
         # seuils de TOUS les hôtes des canons : le déplacement (L31) compare les
         # candidats avec les limites physiques de leur propre hôte.
         par_hote: dict = {}
@@ -3058,12 +3152,32 @@ class Runner:
                 self._host_limits = limits
                 self._pressure_at = 0.0
 
+    def gate_holds(self) -> bool:
+        """Porte d'hôte fermée (L112, `draining` ou `stopped`) : aucune
+        réclamation, aucun nouveau tour. Toujours faux sans porte."""
+        gate = getattr(self, "host_gate", None)
+        return gate is not None and gate.holds_turns()
+
+    def _gate_admits(self, agent: dict) -> bool:
+        """`caps.max_concurrent` de la porte (L112) : agents à la fois sur
+        l'appareil, éphémères compris (la porte compte des processus)."""
+        gate = getattr(self, "host_gate", None)
+        cap = gate.max_concurrent() if gate is not None else None
+        if cap is None:
+            return True
+        with self.lock:
+            running = sum(1 for name, worker in self.workers.items()
+                          if name != (agent or {}).get("name") and worker.is_alive())
+        return running < cap
+
     def admits_new_worker(self, agent: dict) -> bool:
         """L43 (0031) : `max_agents` PHYSIQUE de l'hôte (le plus petit des
         fiches Host de tous les canons) borne le nombre de personas que cet
         exécuteur fait tourner à la fois. Les éphémères n'y comptent pas (ils
         n'ont pas d'admission ; `max_agents` compte des admissions). Sans
         maximum déclaré : pas de borne."""
+        if getattr(self, "host_gate", None) is not None and not self._gate_admits(agent):
+            return False  # L112 : `caps.max_concurrent` de la porte
         cap = getattr(self, "_host_max_agents", None)
         if cap is None or (agent or {}).get("ephemeral"):
             return True
@@ -3117,6 +3231,8 @@ class Runner:
         self.start_canon_sync()
         self.start_balance_poll()
         self.start_resource_poll()
+        if self.host_gate is not None and not self.once:
+            self.host_gate.start()
         if self.once:
             self.sweep()
             if not self.did_turn:

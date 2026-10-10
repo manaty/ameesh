@@ -66,6 +66,13 @@ SUMMARY_PROMPT = (
     "décisions prises, fichiers touchés, prochaine action. Sois concis et factuel, "
     "sans outils : ce résumé sera le seul contexte de la session suivante."
 )
+#: L105 : tour suivant un tour clos par un plafond (contexte, durée) — le
+#: travail en cours reprend là où il s'est arrêté
+SUITE_PROMPT = (
+    "Suite : ton tour précédent a été clos par l'exécuteur à un point sûr (%s). "
+    "Reprends le travail en cours là où il s'est arrêté, sans refaire ce qui est "
+    "fait. Avance par étapes courtes et rends la main dès qu'une étape est stable."
+)
 IDLE_PROMPT = (
     "Reprise : si ton lot n'est ni gelé ni fusionné, continue-le ; sinon prends "
     "la suite de ton affectation (board, workstream). Si tu n'as rien à faire, "
@@ -245,13 +252,28 @@ class ClaudeStream(StreamReader):
             if event.get("model"):
                 out["model"] = event["model"]  # modèle effectif annoncé (L13 B4)
         elif kind == "assistant":
+            message = event.get("message") or {}
             texts = [
                 chunk.get("text", "")
-                for chunk in (event.get("message") or {}).get("content") or []
+                for chunk in message.get("content") or []
                 if isinstance(chunk, dict) and chunk.get("type") == "text"
             ]
             if texts:
                 out["display"] = texts
+            if isinstance(message.get("usage"), dict):
+                # L105 : usage d'UN appel au modèle (répété sur chaque bloc du
+                # même message : l'id sert à ne le compter qu'une fois)
+                out["call_usage"] = message["usage"]
+                if message.get("id"):
+                    out["call_id"] = str(message["id"])
+        elif kind == "user":
+            # L105 : un résultat d'outil rendu au modèle — l'appel d'outil est
+            # fini, c'est un point sûr pour clore le tour
+            contenu = (event.get("message") or {}).get("content")
+            if isinstance(contenu, list) and any(
+                    isinstance(chunk, dict) and chunk.get("type") == "tool_result"
+                    for chunk in contenu):
+                out["safe_point"] = True
         elif kind == "result":
             out["final"] = event.get("result") or ""
             out["display"] = ["== fin du tour : %s" % (event.get("result") or "")[:300]]
@@ -280,6 +302,9 @@ class CodexStream(StreamReader):
             item = event.get("item") or {}
             if item.get("type") == "agent_message" and item.get("text"):
                 out["display"] = [item["text"]]
+            elif item.get("type") not in (None, "", "agent_message", "reasoning"):
+                # L105 : une action (commande, outil, fichier) terminée : point sûr
+                out["safe_point"] = True
         elif kind == "turn.completed":
             out["display"] = ["== fin du tour"]
             if isinstance(event.get("usage"), dict):
@@ -305,6 +330,8 @@ class DshStream(StreamReader):
         if kind == "status" and event.get("phase") == "step_end":
             if isinstance(event.get("usage"), dict):
                 out["usage"] = event["usage"]
+                out["call_usage"] = event["usage"]  # L105 : une étape = un appel
+            out["safe_point"] = True  # L105 : fin d'étape, outils compris
         elif kind == "session":
             out["session"] = event.get("sessionId") or event.get("session_id")
             if event.get("model"):
@@ -342,6 +369,17 @@ def usage_tokens(usage: Mapping | None) -> tuple[int, int, int]:
             lu("output_tokens", "outputTokens"))
 
 
+def reread_tokens(harness: str, usage: Mapping | None) -> int:
+    """Jetons d'entrée relus par UN appel, cache compris (L105).
+
+    Même mesure que le grand livre (`TurnUsage.reread_tokens`, L60) : Codex
+    compte déjà le cache dans l'entrée, les autres harnais à part."""
+    entree, cache, _sortie = usage_tokens(usage)
+    if harness == "codex":
+        return max(entree, cache)
+    return entree + cache
+
+
 class AcpStream(StreamReader):
     """Événements du pont ACP (`ameesh.acp`) : voir `acp.py` pour l'émission."""
 
@@ -363,6 +401,8 @@ class AcpStream(StreamReader):
             titre = event.get("title") or event.get("name") or event.get("toolCallId") or "?"
             statut = event.get("status") or ""
             out["display"] = ["[outil] %s%s" % (titre, " (%s)" % statut if statut else "")]
+            if statut in ("completed", "failed"):
+                out["safe_point"] = True  # L105 : appel d'outil terminé
         elif kind == "permission":
             out["display"] = ["[permission %s] %s%s" % (
                 event.get("decision") or "?", event.get("title") or event.get("toolCallId") or "?",
@@ -379,6 +419,8 @@ class AcpStream(StreamReader):
             # d'un harnais hors Claude/Codex (0019 §3).
             if isinstance(event.get("usage"), dict):
                 out["usage"] = event["usage"]
+                out["call_usage"] = event["usage"]  # L105 : une étape = un appel
+            out["safe_point"] = True
         elif kind == "final":
             text = event.get("text") or ""
             out["final"] = text
