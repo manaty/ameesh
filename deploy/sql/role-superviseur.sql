@@ -343,7 +343,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L96 (0044) : dates prévues
         'planned_start', 'planned_end', 'planned_delivery', 'planned_source',
         'planned_by', 'planned_at',
-        -- L119 (0048) : file d'amélioration ; expected_value est une phrase
+        -- L119 (0049) : file d'amélioration ; expected_value est une phrase
         -- courte, lisible comme le titre (ÉTAT), le reste des scalaires
         'expected_value', 'value_score', 'priority', 'team',
         'required_capabilities'

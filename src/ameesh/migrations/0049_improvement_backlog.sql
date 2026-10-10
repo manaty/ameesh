@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
--- 0048_improvement_backlog — la file d'amélioration continue (lot L119,
+-- 0049_improvement_backlog — la file d'amélioration continue (lot L119,
 -- décision 0037 « ameesh ne s'arrête jamais, il s'améliore »).
 --
 -- Pas de table neuve : un élément de la file est un lot (`work_items`) de
