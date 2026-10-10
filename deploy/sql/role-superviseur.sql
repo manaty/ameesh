@@ -166,6 +166,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'mode', 'stop_reason',
         -- L39 (0033) : NOM du compte d'origine de la session (jamais un profil)
         'session_account',
+        -- L60 (0041) : plafond de contexte (un nombre, pas de contenu)
+        'context_max_tokens',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
         'canon'
     ]),
@@ -260,7 +262,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'agent', 'harness', 'turn', 'model', 'session', 'usd',
         'input_tokens', 'cached_input_tokens', 'output_tokens', 'cum_usd',
         'cum_input_tokens', 'cum_cached_input_tokens', 'cum_output_tokens',
-        'recorded_at', 'account'
+        'recorded_at', 'account',
+        -- L60 (0041) : clé du marqueur comptable (agent, index, instant)
+        'spend_key'
     ]),
     -- comptes multiples (L30, 0028) : des NOMS de comptes et l'état de bascule,
     -- jamais un profil (dossier, clé) : ceux-là restent sur l'hôte

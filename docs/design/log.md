@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-10
+* **L60** : rotation de session DeepSeek et plafond de contexte qui agit. Les tours DeepSeek étaient inscrits sans session ni modèle, et leur usage par étape ignoré : jamais de rotation sur la taille, 2,34 milliards de jetons relus en 24 h. Au-delà de 15 M jetons relus au dernier tour (`context_max_tokens`, migration 0041), la session est tournée avec résumé de reprise. Le modèle du tour DeepSeek est connu (défaut du descripteur passé au harnais) : fin du barème `pro` appliqué par prudence, qui gonflait l'estimation d'un facteur 12,7 face au solde. Ligne du grand livre clé par son marqueur comptable : plus de doublon quand un exécuteur s'arrête entre l'écriture et l'effacement.
+
 ## 2026-10-09
 * **Bascule** : deepseek1 à 7 et l'orchestrateur Nexlink menés par l'exécuteur, un service par agent (`ameesh-runner-agent@<nom>`) ; plus aucune boucle v0.
 * **L48** (1.4.1) : échecs rapides de tour, attente doublée puis arrêt de l'agent.

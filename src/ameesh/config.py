@@ -165,6 +165,11 @@ class Config:
     session_max_tokens: float = 150000.0
     session_max_turn_seconds: float = 900.0
     session_min_turns: int = 3
+    #: plafond de contexte (L60) : au-delà de ce nombre de jetons d'entrée
+    #: relus (cache compris) au dernier tour, la session est tournée avant le
+    #: tour suivant ; réglable par agent (`ameesh set context_max_tokens=…`).
+    #: 0 = plafond désactivé.
+    context_max_tokens: float = 15_000_000.0
     #: L48 : échecs de tour — attente maximale entre deux tours en échec, durée
     #: sous laquelle un échec est « rapide », série d'échecs rapides qui arrête l'agent
     failure_backoff_max: float = 300.0
@@ -383,6 +388,8 @@ def load(env: dict | None = None) -> Config:
         session_min_turns=int(_as_float(
             pick("AMEESH_SESSION_MIN_TURNS", "AGENT_MESH_SESSION_MIN_TURNS"),
             cfg.session_min_turns)),
+        context_max_tokens=max(0.0, _as_float(pick("AMEESH_CONTEXT_MAX_TOKENS"),
+                                              cfg.context_max_tokens)),
         failure_backoff_max=_as_float(pick("AMEESH_FAILURE_BACKOFF_MAX"),
                                       cfg.failure_backoff_max),
         fast_failure_s=_as_float(pick("AMEESH_FAST_FAILURE_S"), cfg.fast_failure_s),

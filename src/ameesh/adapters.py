@@ -292,12 +292,20 @@ class CodexStream(StreamReader):
 
 
 class DshStream(StreamReader):
-    """Flux JSON du harnais DeepSeek (dsh)."""
+    """Flux JSON du harnais DeepSeek (dsh).
+
+    L'usage est publié **par étape** (`status`/`step_end`, clés `inputTokens`,
+    `cacheReadTokens`, `outputTokens`) : il remonte comme `usage` pour que la
+    taille de session se mesure (L60 ; avant, il était ignoré et la rotation
+    sur la taille ne se déclenchait jamais pour DeepSeek)."""
 
     def parse_event(self, event: dict) -> dict:
         kind = event.get("type")
         out: dict = {}
-        if kind == "session":
+        if kind == "status" and event.get("phase") == "step_end":
+            if isinstance(event.get("usage"), dict):
+                out["usage"] = event["usage"]
+        elif kind == "session":
             out["session"] = event.get("sessionId") or event.get("session_id")
             if event.get("model"):
                 out["model"] = event["model"]  # modèle effectif annoncé (L13 B4)
@@ -313,6 +321,25 @@ class DshStream(StreamReader):
         elif kind == "error":
             out["error"] = event.get("message") or "erreur du harnais"
         return out
+
+
+def usage_tokens(usage: Mapping | None) -> tuple[int, int, int]:
+    """(entrée, entrée relue en cache, sortie) d'un usage de flux, quel que
+    soit le harnais (L60) : Claude (`input_tokens`, `cache_read_input_tokens`),
+    Codex (`input_tokens`, `cached_input_tokens`), DeepSeek et ACP
+    (`inputTokens`, `cacheReadTokens`, `outputTokens`). Une valeur absente ou
+    illisible compte zéro."""
+
+    def lu(*keys: str) -> int:
+        for key in keys:
+            value = (usage or {}).get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return max(int(value), 0)
+        return 0
+
+    return (lu("input_tokens", "inputTokens"),
+            lu("cache_read_input_tokens", "cached_input_tokens", "cacheReadTokens"),
+            lu("output_tokens", "outputTokens"))
 
 
 class AcpStream(StreamReader):

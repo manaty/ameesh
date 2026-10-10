@@ -38,6 +38,15 @@ def main() -> int:
     print(json.dumps({"type": "session", "sessionId": session}), flush=True)
     print(json.dumps({"type": "text", "text": "bonjour du faux dsh (session %s)" % session}),
           flush=True)
+    # Usage par étape (L60) : `AMEESH_TEST_DSH_USAGE=entrée,cache,sortie;…`,
+    # une étape par triplet, comme le vrai flux (`status`/`step_end`).
+    for numero, etape in enumerate(filter(None, os.environ.get(
+            "AMEESH_TEST_DSH_USAGE", "").split(";")), start=1):
+        entree, cache, sortie = (int(v) for v in etape.split(","))
+        print(json.dumps({"type": "status", "phase": "step_end", "turn": 1, "step": numero,
+                          "usage": {"inputTokens": entree, "cacheReadTokens": cache,
+                                    "outputTokens": sortie, "cacheWriteTokens": 0,
+                                    "totalTokens": entree + cache + sortie}}), flush=True)
     print(json.dumps({"type": "final", "text": "fini", "cost_usd": 0.002}), flush=True)
     return int(os.environ.get("AMEESH_TEST_EXIT", "0"))
 

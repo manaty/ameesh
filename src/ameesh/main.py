@@ -20,6 +20,7 @@
   ameesh accounts list | use <harnais> <compte> | auto [harnais]
         comptes multiples par fournisseur : actif, jauges, forçage (L30) ;
   ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais
+        context_max_tokens=15M|0
         réglages d'exécution, effet au prochain tour ;
   ameesh alerts [--follow] [--json]     alertes d'exploitation (un objet par ligne) ;
   ameesh notify [--once] [--dry-run] [--interval S] [--json] | --test human:ID

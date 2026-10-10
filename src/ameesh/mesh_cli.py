@@ -997,14 +997,30 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 
 
 #: clés de `ameesh set` (L13 : model, effort ; L26 : tier, session_policy ;
-#: L37 : mode, `execute` | `externe`, décision 0030)
-SET_KEYS = ("model", "effort", "tier", "session_policy", "mode")
+#: L37 : mode, `execute` | `externe`, décision 0030 ; L60 : context_max_tokens)
+SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens")
+#: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
+_TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
+
+
+def parse_token_count(valeur: str) -> int:
+    """`15000000`, `15M`, `1.5m`, `500k` → entier ≥ 0 ; ValueError sinon (L60)."""
+    texte = valeur.strip().lower().replace("_", "")
+    facteur = 1
+    if texte and texte[-1] in _TOKEN_SUFFIXES:
+        facteur = _TOKEN_SUFFIXES[texte[-1]]
+        texte = texte[:-1]
+    nombre = float(texte)
+    if nombre != nombre or nombre < 0 or nombre * facteur > 2 ** 62:
+        raise ValueError(valeur)
+    return int(round(nombre * facteur))
 #: un tier est un identifiant court (passé tel quel au harnais par son descripteur)
 _TIER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 def cmd_set(cfg: Config, args) -> int:
-    """`ameesh set <agent> model=… effort=… tier=… session_policy=… mode=…` (L13, L26, L37).
+    """`ameesh set <agent> model=… effort=… tier=… session_policy=… mode=…
+    context_max_tokens=…` (L13, L26, L37, L60).
 
     Écrit l'état d'exécution : le modèle dans le registre (visible par `list`)
     et dans l'état local ; l'effort et le tier dans l'état local **et** en base
@@ -1013,7 +1029,9 @@ def cmd_set(cfg: Config, args) -> int:
     Le tour suivant les lit et les applique ; une valeur vide revient au
     défaut. Le tier n'a d'effet que sur un harnais dont le descripteur le
     déclare (Codex : `service_tier`). Le mode (`execute` | `externe`, L37) est
-    écrit en base ; vide = `execute`.
+    écrit en base ; vide = `execute`. Le plafond de contexte
+    (`context_max_tokens`, L60 : `15M`, `500k`, `0` = désactivé) est écrit en
+    base ; vide = défaut de l'exécuteur.
     """
     from . import adapters
     from .config import SESSION_POLICIES
@@ -1031,8 +1049,8 @@ def cmd_set(cfg: Config, args) -> int:
             valeur = valeur.strip()
             if not sep or cle not in SET_KEYS:
                 print("usage : ameesh set <agent> model=… effort=… tier=… "
-                      "session_policy=%s mode=%s" % ("|".join(SESSION_POLICIES),
-                                                     "|".join(registry.MODES)),
+                      "session_policy=%s mode=%s context_max_tokens=N|15M|0"
+                      % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
             if cle == "mode" and valeur and valeur not in registry.MODES:
@@ -1046,6 +1064,13 @@ def cmd_set(cfg: Config, args) -> int:
             if cle == "tier" and valeur and not _TIER_RE.match(valeur):
                 print("tier invalide : %r (ex. fast, flex)" % valeur, file=sys.stderr)
                 return 2
+            if cle == "context_max_tokens" and valeur:
+                try:
+                    valeur = str(parse_token_count(valeur))
+                except ValueError:
+                    print("context_max_tokens invalide : %r (ex. 15M, 500k, 0 = "
+                          "désactivé)" % valeur, file=sys.stderr)
+                    return 2
             valeurs[cle] = valeur
         for cle, valeur in valeurs.items():
             if cle in ("model", "effort", "tier"):
@@ -1065,9 +1090,13 @@ def cmd_set(cfg: Config, args) -> int:
         effort = _lit_etat(cfg, args.agent, "effort") or agent.get("effort") or "défaut"
         tier = _lit_etat(cfg, args.agent, "tier") or agent.get("tier") or "défaut"
         politique = agent.get("session_policy") or "défaut (%s)" % cfg.session_policy
-        print("%s : modèle=%s effort=%s tier=%s session=%s mode=%s (prend effet au "
-              "prochain tour)" % (args.agent, modele, effort, tier, politique,
-                                  agent.get("mode") or "execute"))
+        from .exploitation import effective_context_max
+        plafond = effective_context_max(cfg, agent)
+        plafond_txt = ("désactivé" if plafond == 0 else "%d" % plafond) + (
+            "" if agent.get("context_max_tokens") is not None else " (défaut)")
+        print("%s : modèle=%s effort=%s tier=%s session=%s mode=%s contexte=%s (prend "
+              "effet au prochain tour)" % (args.agent, modele, effort, tier, politique,
+                                          agent.get("mode") or "execute", plafond_txt))
         if agent.get("mode") == "externe" and not agent.get("responsible"):
             # 0030 : un agent externe a obligatoirement un responsable humain
             print("attention : agent externe sans responsable humain : ses lots et ses "
@@ -1419,6 +1448,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_set.add_argument("agent")
     p_set.add_argument("values", nargs="+", metavar="clé=valeur",
                        help="model=… effort=… tier=… session_policy=par-lot|taille|jamais "
+                            "context_max_tokens=15M|0 "
                             "mode=execute|externe (valeur vide = défaut)")
     p_set.set_defaults(func=cmd_set)
 

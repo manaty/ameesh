@@ -433,10 +433,13 @@ class TurnCosts(Domain):
                session: str | None, usd: float, input_tokens: int,
                cached_input_tokens: int, output_tokens: int, cum_usd: float | None,
                cum_input_tokens: int | None, cum_cached_input_tokens: int | None,
-               cum_output_tokens: int | None, account: str | None = None) -> None:
+               cum_output_tokens: int | None, account: str | None = None,
+               spend_key: str | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
         telle quelle et n'a rien écrit. `account` (L30, migration 0028) : le
-        compte qui a porté le tour ; None = colonne non écrite."""
+        compte qui a porté le tour ; None = colonne non écrite. `spend_key`
+        (L60, migration 0041) : clé du marqueur comptable ; une ligne portant
+        déjà cette clé n'est pas réécrite (faux). Vrai si la ligne est écrite."""
 
     @abc.abstractmethod
     def spent(self, seconds: float, *, agent: str,
@@ -1363,14 +1366,17 @@ class Progress(Domain):
 class Operations(Domain):
     """Ce que l'orchestrateur lit et règle pour exploiter les agents (L26).
 
-    Réglages d'agent (`session_policy`, `effort`, `tier`), lot de la session
+    Réglages d'agent (`session_policy`, `effort`, `tier`,
+    `context_max_tokens`), lot de la session
     courante, demande de redémarrage, lectures enrichies pour `ameesh list
     --json` et `ameesh alerts`, usage par tour, historique des jauges de
     forfait et soldes d'un fournisseur payé au token. Instants en secondes
     epoch (`*_ts`) ; une liste vide d'ids rend une liste vide."""
 
     #: colonnes réglables par `set_settings` (liste fermée)
-    SETTINGS = ("session_policy", "effort", "tier")
+    SETTINGS = ("session_policy", "effort", "tier", "context_max_tokens")
+    #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
+    INTEGER_SETTINGS = ("context_max_tokens",)
 
     @abc.abstractmethod
     def set_settings(self, name: str, values: dict) -> bool:
