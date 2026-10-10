@@ -247,7 +247,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- d'un tour, jamais un contenu
     ('host_resources', ARRAY[
         'id', 'host', 'sampled_at', 'mem_available_bytes', 'swap_used_bytes',
-        'load1', 'cpu_count', 'disk_free_bytes', 'disk_path', 'turns_in_progress'
+        'load1', 'cpu_count', 'disk_free_bytes', 'disk_path', 'turns_in_progress',
+        -- L106 (0106) : alimentation de l'hôte
+        'on_ac', 'battery_percent'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',
