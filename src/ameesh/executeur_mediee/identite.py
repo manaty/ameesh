@@ -410,6 +410,8 @@ class DbIdentityProvider(IdentityProvider):
         with self.db.transaction() as tx:
             released = _revoke_in(tx, executor_id, by=by, why=why)
         self.forget(executor_id)
+        for provider in list(_PROVIDERS.values()):
+            provider.forget(executor_id)
         return len(released)
 
 
