@@ -61,10 +61,13 @@ avec un `pg_dump` pris **après** l'arrêt. Puis
 
 ## 4. Sessions et mémoire
 
-- Les sessions des personas qui tourneront **sur la VM** y sont restaurées
-  depuis leur sauvegarde (`ameesh session restore`, lot L53), ou copiées. Une
-  session Claude ou DeepSeek est rangée sous un nom tiré du dossier de
-  travail : le renommer si ce dossier diffère sur la VM.
+- Les sessions des personas qui tourneront **sur la VM** ne se copient pas
+  quand le dossier de travail change : DeepSeek (dsh) inscrit le dossier
+  d'origine dans l'en-tête de la session et refuse de la reprendre ailleurs
+  (essai réel du 2026-10-10). Reprendre ces personas sur une session neuve :
+  `ameesh resume <persona> --fresh` (brief de reprise déterministe). Une
+  session ne se garde que si le dossier est identique (`ameesh session
+  restore`, lot L53).
 - Les personas qui ont un dépôt de mémoire (L54) le reclonent d'elles-mêmes à
   leur prochaine session.
 

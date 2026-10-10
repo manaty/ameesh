@@ -229,19 +229,10 @@ copier() {
     rm -f /tmp/mesh.sql
     runuser -l ameesh -c 'ameesh migrate && ameesh doctor' | tail -5
     runuser -l ameesh -c 'ameesh canon sync --fetch' | tail -8"
-  etape "sessions des personas déplacées"
-  for p in $PERSONAS_VM; do
-    d=$(dossier "$DOSSIER_POSTE" "$p"); cible=$(dossier "$DOSSIER_VM" "$p")
-    # dsh range une session sous le dossier de travail : /a/b → --a-b--
-    src="$HOME/.dsh/sessions/-$(echo "$d" | tr '/' '-')--"
-    dst="/home/ameesh/.dsh/sessions/-$(echo "$cible" | tr '/' '-')--"
-    if [ -d "$src" ]; then
-      tar -C "$src" -cf - . | ssh_vm "install -d -m 700 -o ameesh -g ameesh '$dst' && tar -C '$dst' -xf - && chown -R ameesh:ameesh '$dst'"
-      echo "$p : session copiée"
-    else
-      echo "$p : pas de session DeepSeek sur le poste ($src)"
-    fi
-  done
+  # Les sessions DeepSeek ne se déplacent pas : dsh inscrit le dossier de
+  # travail d'origine dans l'en-tête et refuse de les reprendre ailleurs
+  # (« corrupt session log … cwd identify … »). `demarrer` reprend donc les
+  # personas déplacées sur une session neuve (brief de reprise déterministe).
 }
 
 rebrancher() {
@@ -320,6 +311,8 @@ demarrer() {
   etape "serveur"
   for p in $PERSONAS_VM; do
     systemctl --user disable --now "ameesh-runner-agent@$p.service" 2>/dev/null || true
+    # session non portable d'un dossier à l'autre : session neuve sur brief
+    env -u AMEESH_DSN -u AGENT_MESH_DSN ameesh resume "$p" --fresh | tail -1
     ssh_vm "systemctl enable --now ameesh-runner@$p && systemctl is-active ameesh-runner@$p" | sed "s/^/$p : /"
   done
   etape "poste"
