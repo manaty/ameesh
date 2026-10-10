@@ -550,3 +550,64 @@ travaille alors dans un dossier vide.
 {"agents": {"inge-front": {"repo": "/srv/git/site.git", "base": "main"}},
  "default": {"repo": "git@forge.example:org/site.git", "base": "main"}}
 ```
+
+## Essai de bout en bout (L115)
+
+`scripts/essai-voie-b/essai.py`, lancé en root sur une machine de tests
+dotée de Docker (aucun secret), monte tout sur la même machine :
+
+- un Postgres jetable (`scripts/pg-up.sh`, nom et port propres à l'essai) ;
+- un canon d'essai (hôte volatil `banc`, agent `ouvrier` sur dsh) et une
+  « forge » locale (dépôt nu) pour le dépôt de travail ;
+- un faux fournisseur DeepSeek compatible Anthropic Messages
+  (`faux_fournisseur.py`) ;
+- `ameesh serve --exec-only` en TLS sur la passerelle Docker : API,
+  identité L110, relais L111, dépôt de travail L113 ;
+- l'exécuteur dans un conteneur qui imite la VM Compute
+  (`scripts/essai-voie-b/Containerfile`) : volume `/var/lib/ameesh-exec`,
+  porte `/run/ameesh-gate`, code dans `/run/ameesh-enroll/code`, point
+  d'entrée `ameesh-executor` de l'image, vrai `dsh` installé par npm
+  (`--dsh faux` : le faux harnais du banc).
+
+Résultat du 2026-10-10 (dsh 0.2.0-rc.2, 8 vCPU) : les sept étapes passent.
+
+| Étape | Résultat |
+|---|---|
+| 1. enrôlement | OK en 2,2 s ; le code n'est pas écrit sur le volume |
+| 2. tour d'agent (vrai dsh, par le relais) | OK, 4,0 s du courrier au tour fini |
+| 3. remise du courrier | OK en 2,2 s |
+| 4. coût | OK : 2 lignes `source=relay` (qui comptent), 1 ligne `source=device` (hors plafond) |
+| 5. `draining` | OK : bail rendu en 1,0 s, `drained: true`, dossier effacé |
+| 6. `available` et reprise | OK : nouveau bail, tour en 4,4 s |
+| 7. révocation | OK : sortie 6 en 9,4 s |
+
+Appels HTTP au serveur pendant un tour (du courrier au tour fini, sondage
+de secours à 2 s compris) : 43 au premier tour (39 `op`, 1 archive du
+dépôt, 1 jeton de session, 2 requêtes de modèle), 39 au second. Aller-retour
+`GET /health` depuis le conteneur : 2,9 ms en médiane.
+
+L'essai a trouvé et fait corriger :
+
+- `operations.assigned_open_lots` manquait au contrat (lot du tour) ;
+- le profil dsh `agent` n'existait pas dans l'image ;
+- `.dockerignore` excluait le point d'entrée de l'image ;
+- un dossier de travail par epoch empêchait dsh de reprendre sa session ;
+- un courrier envoyé depuis le serveur déplaçait l'agent hors de son hôte ;
+- la contre-pression de disque (L31, 2 Gio) retient les tours sans le dire
+  dans le journal de l'exécuteur (L31b, sur `main`, le montre).
+
+Reste à faire pour un essai sur une vraie machine Windows ou Mac :
+
+- la VM Compute réelle (Hyper-V, Virtualization.framework) et son lanceur :
+  montage du volume, de la porte et du code, `TimeoutStopSec` de 100 s,
+  relance selon le code de sortie ;
+- un serveur du mesh joignable en HTTPS par un vrai certificat, et l'egress
+  limité à lui (nftables ou mandataire `HTTPS_PROXY`) ; `dsh` derrière un
+  mandataire demande `NODE_USE_ENV_PROXY=1`, non vérifié ;
+- la porte écrite par le vrai runner Compute (inactivité réelle de
+  l'utilisateur), et l'attestation de la clé d'appareil Nexlink ;
+- la vraie clé DeepSeek côté serveur (le relais n'a vu qu'un faux
+  fournisseur) et un dépôt de forge réel, avec les identifiants du serveur ;
+- l'image signée (`deploy/image-executeur`, dsh épinglé par empreinte), et
+  sa taille (1,3 Go avec dsh par npm) ;
+- le hook `agent-mail` de dsh : l'essai n'a fait aucun appel `session/op`.
