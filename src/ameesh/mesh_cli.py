@@ -25,6 +25,7 @@
   agent-mesh canon check|show|sync [--json] [--host H]   canon OKF (spec §4)
   agent-mesh placement check [--agent A] [--json]        admissions et hôtes admissibles (C4)
   agent-mesh hosts [--json] [HÔTE] [--history N]         ressources des hôtes (L31)
+  agent-mesh menage [--dry-run | --apply] [--json]       ménage des agents (L73)
   agent-mesh agent spawn <nom> --by <créateur> --ttl 2h   agent éphémère (R14)
 
 L'autorité du propriétaire ne se déduit jamais d'un texte : elle se prouve par
@@ -43,6 +44,7 @@ import sys
 import time
 
 from . import accounts as accounts_mod
+from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
 from . import migrations, placement, registry
 from . import fil, signing, storage, work
@@ -211,6 +213,7 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
     chacune (`limits_origin`) et les fiches de chaque canon (`fiches`).
     """
     from . import canon as canon_mod
+    from . import menage as menage_mod
     from . import placement as placement_mod
     from . import resources as res
 
@@ -220,7 +223,12 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         # par défaut d'abord)
         canons = canon_mod.load_configured(cfg)
         latest_by_host = {row["host"]: row for row in res.current(db)}
-        names = set(latest_by_host)
+        # L73 : bilan du ménage par hôte (dernier passage, 24 h de journal,
+        # worktrees suivis)
+        hk = storage.of(db).housekeeping
+        measure_by_host = {row["host"]: row for row in hk.last_measure(None)}
+        names_hk = set(measure_by_host)
+        names = set(latest_by_host) | names_hk
         for canon in canons:
             names |= {h.title for h in canon.hosts}
         if args.host:
@@ -244,6 +252,8 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             latest = latest_by_host.get(name)
             verdict = res.pressure(latest, limits=limits) if latest is not None else None
             history = res.history(db, name, args.history)
+            menage = _host_menage(hk, name, menage_mod.effective(canons, name),
+                                  measure_by_host.get(name), latest)
             if args.json:
                 print(json.dumps({
                     "schema": "ameesh-host/1",
@@ -260,6 +270,7 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                     "latest": latest,
                     "pressure": verdict,
                     "history": history,
+                    "housekeeping": menage,
                 }, ensure_ascii=False, sort_keys=True), flush=True)
                 continue
             resp = ("responsable %s" % host.responsible) if host is not None and host.responsible \
@@ -267,6 +278,7 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
             if latest is None:
                 print("%s — %s ; aucune mesure publiée" % (name, resp))
                 _print_host_fiches(fiches, physical, admissions, many=many)
+                _print_host_menage(menage)
                 continue
             age = _fmt_age(now - float(latest.get("sampled_ts") or now))
             print("%s — %s ; mesure %s" % (name, resp, age))
@@ -276,10 +288,13 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                 return " [%s]" % origin.get(key, res.DEFAULT_ORIGIN) if fiches else ""
 
             print("  seuils     mémoire ≥ %s%s ; swap ≤ %s%s ; charge ≤ %.2f%s ; disque ≥ %s%s"
+                  " ; tmpfs ≤ %s%s"
                   % (_fmt_bytes(limits["min_mem_available"]), tag("min_mem_available"),
                      _fmt_bytes(limits["max_swap_used"]), tag("max_swap_used"),
                      limits["max_load"], tag("max_load"),
-                     _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free")))
+                     _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free"),
+                     res.fmt_value("max_tmpfs_used", limits.get("max_tmpfs_used")),
+                     tag("max_tmpfs_used")))
             print("  état       mémoire %s ; swap %s ; charge %s ; disque %s ; tours %s"
                   % (_fmt_bytes(latest.get("mem_available_bytes")),
                      _fmt_bytes(latest.get("swap_used_bytes")),
@@ -287,18 +302,27 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                      _fmt_bytes(latest.get("disk_free_bytes")),
                      latest.get("turns_in_progress")
                      if latest.get("turns_in_progress") is not None else "—"))
+            if latest.get("on_ac") is not None or latest.get("battery_percent") is not None:
+                # L106 : alimentation d'un portable
+                print("  alimentation %s%s ; seuils batterie %s %% (plus de tour), %s %% "
+                      "(arrêt)" % (
+                          "secteur" if latest.get("on_ac") else
+                          "batterie" if latest.get("on_ac") is False else "inconnue",
+                          " %s %%" % latest["battery_percent"]
+                          if latest.get("battery_percent") is not None else "",
+                          limits.get("min_battery_percent"),
+                          limits.get("stop_battery_percent")))
+
             if verdict and verdict["breaches"]:
                 tag = "CRITIQUE" if verdict["critical"] else "PRESSION"
                 detail = " ; ".join(
-                    "%s %s (seuil %s)" % (b["label"],
-                                          _fmt_bytes(b["value"]) if b["key"] != "max_load"
-                                          else "%.2f" % b["value"],
-                                          _fmt_bytes(b["limit"]) if b["key"] != "max_load"
-                                          else "%.2f" % b["limit"])
+                    "%s %s (seuil %s)" % (b["label"], res.fmt_value(b["key"], b["value"]),
+                                          res.fmt_value(b["key"], b["limit"]))
                     for b in verdict["breaches"])
                 print("  %s  %s" % (tag, detail))
             else:
                 print("  pression   aucune")
+            _print_host_menage(menage)
             if history:
                 trace = " ".join(
                     "%s→%s" % (_fmt_bytes(row.get("mem_available_bytes")),
@@ -308,6 +332,84 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         return 0
     finally:
         db.close()
+
+
+def _host_menage(hk, host: str, policy, measure_row: dict | None,
+                 latest: dict | None) -> dict:
+    """`ameesh hosts` (L73) : /tmp du système, dossiers gérés, journal 24 h,
+    worktrees suivis."""
+    from . import resources as res
+    data = (measure_row or {}).get("data") or {}
+    tmp = None
+    if latest is not None and latest.get("tmp_size_bytes"):
+        tmp = {"path": latest.get("tmp_path"), "fstype": latest.get("tmp_fstype"),
+               "size_bytes": latest.get("tmp_size_bytes"),
+               "used_bytes": latest.get("tmp_used_bytes"),
+               "fraction": res.tmpfs_fraction(latest)}
+    worktrees = hk.worktrees(host, ("active", "kept"))
+    return {
+        "policy": policy.as_dict(),
+        "system_tmp": tmp,
+        "tmpfs_alert": bool(tmp and tmp["fraction"] is not None
+                            and tmp["fraction"] >= policy.tmpfs_alert),
+        "measure": data or None,
+        "measured_ts": (measure_row or {}).get("at_ts"),
+        "last_24h": hk.summary(host, 86400.0),
+        "worktrees": {"active": sum(1 for w in worktrees if w["status"] == "active"),
+                      "kept": [{"path": w["path"], "agent": w["agent"], "lot": w["lot"],
+                                "detail": w["detail"]}
+                               for w in worktrees if w["status"] == "kept"]},
+    }
+
+
+def _print_host_menage(menage: dict) -> None:
+    tmp = menage.get("system_tmp")
+    policy = menage["policy"]
+    if tmp:
+        part = tmp.get("fraction")
+        print("  /tmp       %s %s / %s%s%s" % (
+            tmp.get("fstype") or "?", _fmt_bytes(tmp.get("used_bytes")),
+            _fmt_bytes(tmp.get("size_bytes")),
+            " (%d %%)" % round(part * 100) if part is not None else " (sur disque)",
+            " — ALERTE : au-delà de %d %% (ameesh menage pour voir ce qui l'occupe)"
+            % round(policy["tmpfs_alert"] * 100) if menage.get("tmpfs_alert") else ""))
+    m = menage.get("measure")
+    if m:
+        print("  ménage     dossiers temporaires %s (quota %s par agent) ; caches %s / %s"
+              "%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
+                      _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
+                      " ; %d entrée(s) /tmp signalée(s) (%s)" % (
+                          m["orphans"], _fmt_bytes(m.get("orphan_bytes")))
+                      if m.get("orphans") else ""))
+    conteneurs = (m or {}).get("containers") or {}
+    if conteneurs.get("ameesh") is not None or conteneurs.get("others") is not None:
+        ours = conteneurs.get("ameesh") or []
+        autres = conteneurs.get("others") or []
+        print("  conteneurs %d lancé(s) par un tour d'ameesh%s ; %d autre(s) signalé(s)%s" % (
+            len(ours),
+            " (%s)" % " ; ".join("%s : %s" % (c["path"], c.get("detail") or c["action"])
+                                 for c in ours[:3]) if ours else "",
+            len(autres),
+            " (jamais supprimés : %s)" % " ; ".join(c["command"] for c in autres[:5])
+            if autres else ""))
+    faits = menage.get("last_24h") or []
+    if faits:
+        print("  24 h       %s" % " ; ".join(
+            "%s %s ×%d%s" % (r["kind"], r["action"], r["n"],
+                             " (%s)" % _fmt_bytes(r["bytes"]) if r.get("bytes") else "")
+            for r in faits))
+    wt = menage.get("worktrees") or {}
+    if wt.get("active") or wt.get("kept"):
+        print("  worktrees  %d suivi(s) en attente de fin de lot ; %d gardé(s)%s" % (
+            wt.get("active", 0), len(wt.get("kept") or []),
+            " : " + " ; ".join("%s (%s)" % (k["path"], k["detail"]) for k in wt["kept"][:5])
+            if wt.get("kept") else ""))
+
+
+def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh menage` (L73) : voir `ameesh.menage.cmd_menage`."""
+    from . import menage
+    return menage.cmd_menage(cfg, args)
 
 
 def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: bool) -> None:
@@ -782,6 +884,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             item["milestones"] = work.milestones(db, args.id)
             item["delays"] = work.timeline(db, args.id)
             plan.annotate(db, [item])
+            # L96 : dates prévues (feuille de route)
+            planned = (storage.of(db).roadmap.item_plans([args.id]) or [{}])[0]
+            item["planned"] = {k: planned.get("planned_" + k)
+                               for k in ("start", "end", "delivery", "source", "by")}
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
@@ -795,6 +901,12 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if item.get("package_id") or item.get("epic"):
                 print("plan     : fiche %-12s epic : %s" % (
                     item.get("package_id") or "—", item.get("epic") or "—"))
+            if any(item["planned"].get(k) for k in ("start", "end", "delivery")):
+                print("prévu    : début %s · fin %s · livraison %s%s" % (
+                    item["planned"]["start"] or "—", item["planned"]["end"] or "—",
+                    item["planned"]["delivery"] or "—",
+                    " (source : %s)" % item["planned"]["source"]
+                    if item["planned"].get("source") else ""))
             if item.get("state") == "closed":
                 print("fermé    : %s" % ("abandonné" if item.get("close_reason") == "abandoned"
                                          else "remplacé par #%s" % item.get("superseded_by")))
@@ -973,7 +1085,8 @@ def cmd_migrate(cfg: Config, _args: argparse.Namespace) -> int:
 
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
     from . import cli
-    return cli.cmd_doctor(cfg, notify_test=args.notify_test, probe=args.probe)
+    return cli.cmd_doctor(cfg, notify_test=args.notify_test, probe=args.probe,
+                          harness=getattr(args, "harness", False))
 
 
 # --------------------------------------------------------------------------
@@ -1007,8 +1120,10 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 
 
 #: clés de `ameesh set` (L13 : model, effort ; L26 : tier, session_policy ;
-#: L37 : mode, `execute` | `externe`, décision 0030 ; L60 : context_max_tokens)
-SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens")
+#: L37 : mode, `execute` | `externe`, décision 0030 ; L60 : context_max_tokens ;
+#: L105 : turn_max_seconds, turn_mail_max)
+SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
+            "turn_max_seconds", "turn_mail_max")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1024,13 +1139,41 @@ def parse_token_count(valeur: str) -> int:
     if nombre != nombre or nombre < 0 or nombre * facteur > 2 ** 62:
         raise ValueError(valeur)
     return int(round(nombre * facteur))
+
+
+#: suffixes acceptés par `turn_max_seconds` (`30m`, `2h`, `90s`)
+_DURATION_SUFFIXES = {"s": 1, "m": 60, "h": 3600}
+
+
+def parse_duration(valeur: str) -> int:
+    """`1800`, `90s`, `30m`, `1.5h` → secondes entières ≥ 0 ; ValueError sinon (L105)."""
+    texte = valeur.strip().lower().replace("_", "")
+    facteur = 1
+    if texte and texte[-1] in _DURATION_SUFFIXES:
+        facteur = _DURATION_SUFFIXES[texte[-1]]
+        texte = texte[:-1]
+    nombre = float(texte)
+    if nombre != nombre or nombre < 0 or nombre * facteur > 2 ** 40:
+        raise ValueError(valeur)
+    return int(round(nombre * facteur))
+
+
+def parse_count(valeur: str) -> int:
+    """Entier ≥ 0 (`5`) ; ValueError sinon (L105)."""
+    nombre = int(valeur.strip())
+    if nombre < 0 or nombre > 2 ** 31:
+        raise ValueError(valeur)
+    return nombre
+
+
 #: un tier est un identifiant court (passé tel quel au harnais par son descripteur)
 _TIER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 def cmd_set(cfg: Config, args) -> int:
     """`ameesh set <agent> model=… effort=… tier=… session_policy=… mode=…
-    context_max_tokens=…` (L13, L26, L37, L60).
+    context_max_tokens=… turn_max_seconds=… turn_mail_max=…` (L13, L26, L37,
+    L60, L105).
 
     Écrit l'état d'exécution : le modèle dans le registre (visible par `list`)
     et dans l'état local ; l'effort et le tier dans l'état local **et** en base
@@ -1041,7 +1184,9 @@ def cmd_set(cfg: Config, args) -> int:
     déclare (Codex : `service_tier`). Le mode (`execute` | `externe`, L37) est
     écrit en base ; vide = `execute`. Le plafond de contexte
     (`context_max_tokens`, L60 : `15M`, `500k`, `0` = désactivé) est écrit en
-    base ; vide = défaut de l'exécuteur.
+    base ; vide = défaut de l'exécuteur. Les plafonds du tour (L105) aussi :
+    `turn_max_seconds` (`30m`, `2h`, `0` = sans limite) et `turn_mail_max`
+    (messages remis par le hook pendant un tour, `0` = sans borne).
     """
     from . import adapters
     from .config import SESSION_POLICIES
@@ -1059,7 +1204,8 @@ def cmd_set(cfg: Config, args) -> int:
             valeur = valeur.strip()
             if not sep or cle not in SET_KEYS:
                 print("usage : ameesh set <agent> model=… effort=… tier=… "
-                      "session_policy=%s mode=%s context_max_tokens=N|15M|0"
+                      "session_policy=%s mode=%s context_max_tokens=N|15M|0 "
+                      "turn_max_seconds=30m|2h|0 turn_mail_max=N|0"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
@@ -1081,6 +1227,20 @@ def cmd_set(cfg: Config, args) -> int:
                     print("context_max_tokens invalide : %r (ex. 15M, 500k, 0 = "
                           "désactivé)" % valeur, file=sys.stderr)
                     return 2
+            if cle == "turn_max_seconds" and valeur:
+                try:
+                    valeur = str(parse_duration(valeur))
+                except ValueError:
+                    print("turn_max_seconds invalide : %r (ex. 30m, 2h, 0 = sans "
+                          "limite)" % valeur, file=sys.stderr)
+                    return 2
+            if cle == "turn_mail_max" and valeur:
+                try:
+                    valeur = str(parse_count(valeur))
+                except ValueError:
+                    print("turn_mail_max invalide : %r (ex. 5, 0 = sans borne)" % valeur,
+                          file=sys.stderr)
+                    return 2
             valeurs[cle] = valeur
         for cle, valeur in valeurs.items():
             if cle in ("model", "effort", "tier"):
@@ -1100,13 +1260,22 @@ def cmd_set(cfg: Config, args) -> int:
         effort = _lit_etat(cfg, args.agent, "effort") or agent.get("effort") or "défaut"
         tier = _lit_etat(cfg, args.agent, "tier") or agent.get("tier") or "défaut"
         politique = agent.get("session_policy") or "défaut (%s)" % cfg.session_policy
-        from .exploitation import effective_context_max
-        plafond = effective_context_max(cfg, agent)
-        plafond_txt = ("désactivé" if plafond == 0 else "%d" % plafond) + (
-            "" if agent.get("context_max_tokens") is not None else " (défaut)")
-        print("%s : modèle=%s effort=%s tier=%s session=%s mode=%s contexte=%s (prend "
-              "effet au prochain tour)" % (args.agent, modele, effort, tier, politique,
-                                          agent.get("mode") or "execute", plafond_txt))
+        from .exploitation import (effective_context_max, effective_turn_mail_max,
+                                   effective_turn_max_seconds)
+
+        def _txt(valeur: int, cle: str, zero: str) -> str:
+            return (zero if valeur == 0 else "%d" % valeur) + (
+                "" if agent.get(cle) is not None else " (défaut)")
+        plafond_txt = _txt(effective_context_max(cfg, agent), "context_max_tokens",
+                           "désactivé")
+        duree_txt = _txt(effective_turn_max_seconds(cfg, agent), "turn_max_seconds",
+                         "sans limite")
+        courrier_txt = _txt(effective_turn_mail_max(cfg, agent), "turn_mail_max",
+                            "sans borne")
+        print("%s : modèle=%s effort=%s tier=%s session=%s mode=%s contexte=%s "
+              "tour_max_s=%s courrier_par_tour=%s (prend effet au prochain tour)"
+              % (args.agent, modele, effort, tier, politique,
+                 agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt))
         if agent.get("mode") == "externe" and not agent.get("responsible"):
             # 0030 : un agent externe a obligatoirement un responsable humain
             print("attention : agent externe sans responsable humain : ses lots et ses "
@@ -1240,6 +1409,18 @@ def build_parser() -> argparse.ArgumentParser:
                          help="nombre de relevés de l'historique court (défaut 10)")
     p_hosts.add_argument("--json", action="store_true", help="un objet JSON par hôte")
     p_hosts.set_defaults(func=cmd_hosts)
+
+    p_menage = sub.add_parser(
+        "menage", help="ménage de ce que les agents créent (L73) ; essai par défaut")
+    mode = p_menage.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true",
+                      help="montrer seulement (défaut) : rien n'est supprimé")
+    mode.add_argument("--apply", action="store_true",
+                      help="exécuter (humain ou exécuteur seulement, jamais une session "
+                           "d'agent)")
+    p_menage.add_argument("--by", default="", help="qui déclenche (journal), ex. human:alice")
+    p_menage.add_argument("--json", action="store_true", help="rapport `ameesh-menage/1`")
+    p_menage.set_defaults(func=cmd_menage)
 
     p_models = sub.add_parser("models", help="catalogue des modèles (L14)")
     models_sub = p_models.add_subparsers(dest="models_command")
@@ -1436,6 +1617,9 @@ def build_parser() -> argparse.ArgumentParser:
     pc_bal.add_argument("--since", default="7d")
     pc_bal.add_argument("--json", action="store_true")
     pc_bal.set_defaults(func=cmd_cost)
+    # L95 : correction tracée du grand livre (essai par défaut)
+    from . import grand_livre
+    grand_livre.add_parser(cost_sub, cmd_cost)
 
     # L30 (0027) : comptes multiples par fournisseur
     p_acc = sub.add_parser("accounts", help="comptes par fournisseur : actif, jauges, forçage (L30)")
@@ -1463,6 +1647,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_set.add_argument("values", nargs="+", metavar="clé=valeur",
                        help="model=… effort=… tier=… session_policy=par-lot|taille|jamais "
                             "context_max_tokens=15M|0 "
+                            "turn_max_seconds=30m|2h|0 turn_mail_max=5|0 "
                             "mode=execute|externe (valeur vide = défaut)")
     p_set.set_defaults(func=cmd_set)
 
@@ -1484,6 +1669,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--notify-test", action="store_true")
     p_doc.add_argument("--probe", action="store_true",
                        help="sonde légère : base, schéma, migrations à jour ; rien d'autre")
+    p_doc.add_argument("--harness", action="store_true",
+                       help="binaires des harnais servis par l'hôte (chemin, provenance, "
+                            "interpréteur) et unités d'exécuteur (L106)")
     p_doc.set_defaults(func=cmd_doctor)
 
     from . import canon_cli
@@ -1510,6 +1698,10 @@ def cmd_cost(cfg: Config, args) -> int:
     ce qui est écrit ici, c'est la base (`turn_costs`, migration 0014).
     """
     what = getattr(args, "cost_command", None) or "report"
+    if what == "correct":
+        # L95 : l'essai lit aussi une base d'avant la migration 0043
+        from . import grand_livre
+        return grand_livre.main(cfg, args)
     db = _open(cfg)
     try:
         if what in ("turns", "gauges", "balance"):
@@ -1568,6 +1760,9 @@ def cmd_cost(cfg: Config, args) -> int:
             print(json.dumps(rows, indent=2, sort_keys=True, default=str))
         else:
             print(cost_mod.format_report(rows))
+            # L95 : dépense réelle (soldes) face à l'estimation, sur 24 h
+            for entry in _real_spend_24h(db):
+                print(balance_mod.describe(entry))
             print()
             print(budget_mod.summary_line(limites))
             for agent, caps in sorted(limites.agents.items()):
@@ -1580,6 +1775,18 @@ def cmd_cost(cfg: Config, args) -> int:
         return 0
     finally:
         db.close()
+
+
+def _real_spend_24h(db) -> list:
+    """L95 : dépense réelle des fournisseurs payés au token sur 24 h, face à
+    l'estimation du grand livre ; vide si rien n'est lisible."""
+    try:
+        paid = cost_mod.paid_harnesses_of()
+    except cost_mod.CostError:
+        return []
+    now = time.time()
+    return [dict(entry, period="24h")
+            for entry in balance_mod.compare(db, paid, now - 86400.0, now)]
 
 
 def _cost_report_reads(cfg: Config, db) -> None:
@@ -1595,6 +1802,7 @@ def _cost_report_reads(cfg: Config, db) -> None:
     actifs = {ligne["harness"]: (ligne["account"], ligne["_gauges"])
               for ligne in comptes if ligne["active"]}
     book.report(accounts=actifs)
+    _real_spend_24h(db)
 
 
 def cmd_accounts(cfg: Config, args) -> int:

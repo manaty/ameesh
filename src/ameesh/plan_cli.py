@@ -6,6 +6,7 @@
   ameesh work sync-merges --git-dir D [--target origin/main] [--repo R] [--dry-run] [--json]
   ameesh work sync-github --repo R [--limit N] [--dry-run] [--json]
   ameesh work project-github --repo R [--dry-run] [--canon-url URL] [--json]
+  ameesh work plan <id|fiche> [--debut J] [--fin J] [--livraison J] [--source S]  (L96)
 
 Gardées hors de `mesh_cli` (qui les branche) pour que leurs évolutions n'y
 touchent pas. Voir `plan_github` pour les règles de GitHub (vue, jamais
@@ -19,7 +20,7 @@ import sys
 
 from . import plan_git, plan_github, work
 
-COMMANDS = ("link", "close", "sync-merges", "sync-github", "project-github")
+COMMANDS = ("link", "close", "sync-merges", "sync-github", "project-github", "plan")
 
 
 def add_parsers(work_sub, func) -> None:
@@ -61,6 +62,20 @@ def add_parsers(work_sub, func) -> None:
     p_sync.add_argument("--json", action="store_true")
     p_sync.set_defaults(func=func)
 
+    p_plan = work_sub.add_parser(
+        "plan", help="dates prévues d'une tâche ou d'une fiche WorkPackage (L96)")
+    p_plan.add_argument("target", help="numéro de tâche, ou identifiant de fiche")
+    p_plan.add_argument("--debut", "--start", dest="debut", default=None,
+                        help="début prévu : AAAA-MM-JJ, demain, lundi… ; - efface")
+    p_plan.add_argument("--fin", "--end", dest="fin", default=None, help="fin prévue")
+    p_plan.add_argument("--livraison", "--deploiement", "--delivery", dest="livraison",
+                        default=None, help="livraison ou déploiement prévu")
+    p_plan.add_argument("--source", default=None,
+                        help="d'où vient la date (conversation, décision, message…)")
+    p_plan.add_argument("--actor", default="")
+    p_plan.add_argument("--json", action="store_true")
+    p_plan.set_defaults(func=func)
+
     p_proj = work_sub.add_parser(
         "project-github", help="projeter le plan en issues GitHub (vue, jamais source)")
     p_proj.add_argument("--repo", required=True, help="owner/repo")
@@ -74,6 +89,8 @@ def add_parsers(work_sub, func) -> None:
 def run(db, args: argparse.Namespace) -> int:
     """Exécute une sous-commande du plan sur la connexion `db` ouverte."""
     command = args.work_command
+    if command == "plan":
+        return _plan(db, args)
     if command == "link":
         if args.none == bool(args.package):
             print("erreur : une fiche OU --none", file=sys.stderr)
@@ -95,6 +112,25 @@ def run(db, args: argparse.Namespace) -> int:
     except plan_github.GithubError as exc:
         print("erreur : %s" % exc, file=sys.stderr)
         return 1
+
+
+def _plan(db, args: argparse.Namespace) -> int:
+    """L96 : dates prévues d'une tâche ou d'une fiche WorkPackage."""
+    from . import roadmap
+
+    kwargs = {k: v for k, v in (("start", args.debut), ("end", args.fin),
+                                ("delivery", args.livraison)) if v is not None}
+    out = roadmap.plan(db, args.target, source=args.source, actor=args.actor, **kwargs)
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+    row = out["plan"]
+    label = "tâche #%s" % out["target"] if out["kind"] == "task" else "fiche %s" % out["target"]
+    print("%s : début %s · fin %s · livraison %s%s" % (
+        label, row.get("planned_start") or "—", row.get("planned_end") or "—",
+        row.get("planned_delivery") or "—",
+        " (source : %s)" % row["planned_source"] if row.get("planned_source") else ""))
+    return 0
 
 
 def _sync_merges(db, args: argparse.Namespace) -> int:

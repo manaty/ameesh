@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-10 (sous-utilisation)
+* **L94** : la sous-utilisation alerte autant que la surcharge (« la surconso comme la sous-conso devrait alerter ameesh ») — `plan_underused` (forfait perdu à la remise à zéro, pertes au sens de L74), `idle_capacity` (agents réveillables au repos pendant que du travail attend, ou que le token travaille), `orchestrator_held` (orchestrateur tenu par `attach` avec du courrier, prolonge 0030), `host_underused` (suggestion de déplacement, 0028) ; poussées par `ameesh notify`. Ajout validé par le propriétaire : `balance_low`, autonomie d'un fournisseur payé au token au rythme réel des relevés de solde (48 h, 20 USD ; urgente sous 12 h ou 5 USD).
+
 ## 2026-10-10 (comptes au forfait)
 * **Décision** : [consommer d'abord ce qui expire](decisions/0034-consommer-d-abord-ce-qui-expire.md), qui amende 0027 ; lot L74.
 * **L74** : comptes au forfait en réservoir — choix par échéance de la capacité inutilisée sous le seuil de rythme, continuité de session, relevé échu à 0 % (même règle que L71), choix journalisés avec leur raison, capacité perdue à la remise à zéro dans `ameesh accounts list`.

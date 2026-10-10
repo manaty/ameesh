@@ -17,7 +17,13 @@ suspend les tours est un domaine à part, posé et effacé par l'exécuteur.
 """
 from __future__ import annotations
 
+import json
+
 from .. import interface
+
+#: colonnes qu'une correction du grand livre peut écrire (L95)
+_CORRECTABLE = ("usd", "model", "input_tokens", "cached_input_tokens", "output_tokens",
+                "void_reason")
 
 
 class TurnCosts(interface.TurnCosts):
@@ -72,7 +78,9 @@ class TurnCosts(interface.TurnCosts):
         return bool(self.db.query(sql + suffix + " returning id", tuple(values)))
 
     def spent(self, seconds, *, agent, harnesses, account=None) -> float:
-        clauses = ["recorded_at >= now() - make_interval(secs => %s)"]
+        # L95 (0043) : une ligne écartée par `cost correct` ne compte plus
+        clauses = ["recorded_at >= now() - make_interval(secs => %s)",
+                   "void_reason IS NULL"]
         params: list = [float(seconds)]
         if agent != "all":
             clauses.append("agent = %s")
@@ -87,3 +95,57 @@ class TurnCosts(interface.TurnCosts):
             "select coalesce(sum(usd), 0) as usd from turn_costs where "
             + " and ".join(clauses), tuple(params))
         return float(rows[0]["usd"]) if rows else 0.0
+
+    def spent_between(self, from_ts, to_ts, *, harnesses) -> float:
+        names = list(harnesses)
+        if not names:
+            return 0.0
+        rows = self.db.query(
+            "select coalesce(sum(usd), 0)::float8 as usd from turn_costs"
+            " where recorded_at > to_timestamp(%s) and recorded_at <= to_timestamp(%s)"
+            " and void_reason is null and harness in (" + ", ".join(["%s"] * len(names)) + ")",
+            tuple([float(from_ts), float(to_ts)] + names))
+        return float(rows[0]["usd"]) if rows else 0.0
+
+    # -- corrections tracées (L95, migration 0043) ---------------------------
+    def ledger(self, *, since_ts=None) -> list[dict]:
+        # `to_jsonb(t)->>'void_reason'` : la colonne n'existe qu'après 0043,
+        # et l'essai doit pouvoir lire une base qui ne l'a pas encore
+        sql = ("SELECT t.id, t.agent, t.harness, t.turn, t.model, t.session, t.account,"
+               " t.usd::float8 AS usd, t.input_tokens, t.cached_input_tokens,"
+               " t.output_tokens, t.cum_usd::float8 AS cum_usd, t.cum_input_tokens,"
+               " t.cum_cached_input_tokens, t.cum_output_tokens,"
+               " to_jsonb(t)->>'void_reason' AS void_reason,"
+               " extract(epoch from t.recorded_at)::float8 AS recorded_ts"
+               " FROM turn_costs t")
+        params: tuple = ()
+        if since_ts is not None:
+            sql += " WHERE t.recorded_at >= to_timestamp(%s)"
+            params = (float(since_ts),)
+        return self.db.query(sql + " ORDER BY t.recorded_at, t.id", params)
+
+    def correct(self, *, run_id, actor, corrections) -> int:
+        done = 0
+        with self.db.transaction() as tx:
+            for item in corrections:
+                values = {k: v for k, v in (item.get("set") or {}).items()
+                          if k in _CORRECTABLE}
+                if not values:
+                    continue
+                logged = tx.query(
+                    "INSERT INTO turn_cost_corrections (run_id, turn_cost_id, kind, reason,"
+                    " old_row, new_values, actor)"
+                    " SELECT %s, t.id, %s, %s, to_jsonb(t), %s::jsonb, %s"
+                    " FROM turn_costs t WHERE t.id = %s AND t.void_reason IS NULL"
+                    " RETURNING id",
+                    (run_id, item["kind"], item["reason"], json.dumps(values, sort_keys=True),
+                     actor, int(item["id"])))
+                if not logged:
+                    continue
+                cols = sorted(values)
+                tx.execute(
+                    "UPDATE turn_costs SET " + ", ".join("%s = %%s" % c for c in cols)
+                    + " WHERE id = %s",
+                    tuple(values[c] for c in cols) + (int(item["id"]),))
+                done += 1
+        return done

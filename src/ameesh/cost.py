@@ -320,6 +320,7 @@ class CostBook:
         hourly_usd: float = DEFAULT_HOURLY_USD,
         daily_usd: float = 0.0,
         agent_limits: dict | None = None,
+        codex_homes: Sequence[str] | None = None,
     ) -> None:
         self.state_dir = state_dir if state_dir is not None else config_mod.load().state_dir
         self.prices_path = prices_path if prices_path is not None else os.environ.get(
@@ -338,6 +339,9 @@ class CostBook:
         #: propres aux agents, `{agent: {3600|86400: usd}}` (`ameesh.budget`)
         self.daily_usd = daily_usd
         self.agent_limits = dict(agent_limits or {})
+        #: L95 : dossiers Codex des comptes déclarés (`CODEX_HOME`), où chercher
+        #: le journal d'un fil (modèle, total avant le tour) en plus du défaut
+        self.codex_homes = [h for h in (codex_homes or []) if h]
 
     # -- état local ---------------------------------------------------------
     def agent_dir(self, agent: str) -> str:
@@ -720,16 +724,13 @@ class CostBook:
         journal est introuvable ou muet (le tour est alors compté au cumul,
         fail-closed).
         """
-        if not thread:
-            return None
-        paths = glob.glob(os.path.join(self.codex_sessions, "**", "*%s.jsonl" % thread),
-                          recursive=True)
-        if not paths:
+        path = self.codex_rollout(thread)
+        if not path:
             return None
         last_total = None
         before_turn = None
         try:
-            with open(max(paths, key=os.path.getmtime), encoding="utf-8") as fh:
+            with open(path, encoding="utf-8") as fh:
                 for line in fh:
                     if "task_started" not in line and "token_count" not in line:
                         continue
@@ -751,6 +752,68 @@ class CostBook:
         except (OSError, ValueError, TypeError):
             return None
         return before_turn
+
+    def codex_session_roots(self) -> list:
+        """Les dossiers de sessions Codex de la machine : le défaut, puis ceux
+        des comptes déclarés (L95), sans doublon."""
+        out: list = []
+        for root in [self.codex_sessions] + [os.path.join(h, "sessions")
+                                             for h in self.codex_homes]:
+            root = os.path.abspath(os.path.expanduser(root))
+            if root not in out:
+                out.append(root)
+        return out
+
+    def codex_rollout(self, thread: str | None) -> str | None:
+        """Le journal de session d'un fil Codex (`rollout-…-<fil>.jsonl`), le
+        plus récent de tous les dossiers de sessions connus, ou None."""
+        if not thread or not re.fullmatch(r"[A-Za-z0-9._-]+", thread):
+            return None
+        paths: list = []
+        for root in self.codex_session_roots():
+            paths += glob.glob(os.path.join(root, "**", "*%s.jsonl" % thread), recursive=True)
+        if not paths:
+            return None
+        return max(paths, key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0)
+
+    def codex_thread_model(self, thread: str | None) -> str:
+        """Le modèle d'un fil Codex (L95), ou ''.
+
+        `codex exec --json` n'annonce pas son modèle : il se lit dans le
+        journal de session du fil (dernier `turn_context.model`, ou
+        `thread_settings_applied`) ; à défaut, dans le `model` de la
+        configuration (`config.toml`) du dossier Codex où vit le fil, sinon de
+        celui de la machine. Lecture seule ; '' si rien n'est lisible (le tour
+        reste « inconnu », facturé au plus cher connu).
+        """
+        path = self.codex_rollout(thread)
+        found = ""
+        if path:
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    for line in fh:
+                        if '"model"' not in line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except ValueError:
+                            continue
+                        found = _codex_event_model(event) or found
+            except OSError:
+                pass
+        if found:
+            return found
+        homes = []
+        if path:
+            # <home>/sessions/AAAA/MM/JJ/rollout-….jsonl
+            homes.append(os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.dirname(os.path.dirname(path))))))
+        homes += [os.path.dirname(root) for root in self.codex_session_roots()]
+        for home in homes:
+            model = _codex_config_model(os.path.join(home, "config.toml"))
+            if model:
+                return model
+        return ""
 
     def session_of(self, agent: str) -> str | None:
         """La session (ou le fil) courante d'un agent, lue sur **tout** son flux.
@@ -779,6 +842,13 @@ class CostBook:
         # la famille, jamais le défaut (mesh-design, 0019 §3, fail-closed).
         if model is None:
             model = self.model_of(agent)
+        events = self.events(agent, start)
+        # La session se résout AVANT le repère : c'est elle qui dit lequel comparer.
+        session = session or self.session_of(agent)
+        if not model and harness == "codex":
+            # L95 : Codex n'annonce pas son modèle dans `exec --json` ; il se
+            # lit dans le journal de session du fil, ou sa configuration.
+            model = self.codex_thread_model(session)
         prices = load_prices(self.prices_path)
         if model and model in prices:
             pin, pcache, pout = prices[model]
@@ -786,9 +856,6 @@ class CostBook:
         else:
             pin, pcache, pout = max_price_of(prices, harness or "deepseek")
             modele = model or "inconnu"
-        events = self.events(agent, start)
-        # La session se résout AVANT le repère : c'est elle qui dit lequel comparer.
-        session = session or self.session_of(agent)
         cum = self.baseline(agent, harness, session)
         # L71 : session reprise sans relevé de l'agent — le dernier total CONNU
         # de la session (autre agent, ou flux local d'avant le tour) sert de repère.
@@ -806,7 +873,17 @@ class CostBook:
                       if e.get("type") == "result" and isinstance(e.get("total_cost_usd"), (int, float))]
             usage = [e.get("usage") or {} for e in events if e.get("type") == "result"]
             last = cum.get("cum_usd")
-            if not totals:
+            if not usage:
+                # L105 : tour clos avant son `result` (plafond du tour, arrêt,
+                # préemption) — l'usage de chaque appel, lu sur les messages du
+                # modèle (une fois par id), au barème ; aucun cumul n'est relevé.
+                usage = _claude_call_usages(events)
+                usd = sum(
+                    ((_num(u, "input_tokens") + _num(u, "cache_creation_input_tokens")) * pin
+                     + _num(u, "cache_read_input_tokens") * pcache
+                     + _num(u, "output_tokens") * pout) / 1e6
+                    for u in usage)
+            elif not totals:
                 usd = 0.0
             elif unknown_resume:
                 # L71 : total d'avant le tour inconnu — estimation par les
@@ -1033,6 +1110,10 @@ class CostBook:
         rows = []
         now = self.clock()
         accounts = accounts or {}
+        try:
+            paid = set(paid_harnesses_of())
+        except CostError:
+            paid = None          # aucun descripteur : on ne devine pas
         # Le forfait est partagé par tout le compte : les jauges se lisent une fois
         # par harnais, pas une fois par agent.
         by_harness: dict = {name: list(value[1]) for name, value in accounts.items()}
@@ -1054,6 +1135,9 @@ class CostBook:
                 "agent": agent,
                 "harness": harness,
                 "model": self.model_of(agent) or "défaut",
+                # L95 : payé au token (vrais dollars) ou forfait (équivalent
+                # théorique au barème) ; None si les descripteurs sont illisibles
+                "paid": (harness in paid) if paid is not None else None,
                 "spent_1h": self.spent(agent, 3600),
                 "spent_24h": self.spent(agent, 86400),
                 "gauges": [
@@ -1077,9 +1161,10 @@ class CostBook:
 # --------------------------------------------------------------------------
 
 def format_report(rows: Iterable[dict]) -> str:
-    """Le tableau de `ameesh cost report`."""
-    lines = ["%-16s %-9s %-16s %10s %10s  %s" % (
-        "agent", "harnais", "modèle", "1 h (USD)", "24 h (USD)", "jauges")]
+    """Le tableau de `ameesh cost report`, puis ses deux totaux (L95)."""
+    rows = list(rows)
+    lines = ["%-16s %-9s %-16s %-8s %10s %10s  %s" % (
+        "agent", "harnais", "modèle", "paiement", "1 h (USD)", "24 h (USD)", "jauges")]
     for row in rows:
         gauges = ", ".join(
             "%s %.0f%% (rythme %.0f%%%s)" % (
@@ -1087,12 +1172,67 @@ def format_report(rows: Iterable[dict]) -> str:
                 ", remise à zéro passée, dernier relevé %.0f%%" % (g["last_used"] * 100)
                 if g.get("reset_passed") else "")
             for g in row["gauges"]) or "—"
-        lines.append("%-16s %-9s %-16s %10.4f %10.4f  %s" % (
+        lines.append("%-16s %-9s %-16s %-8s %10.4f %10.4f  %s" % (
             row["agent"],
             row["harness"] + ("/%s" % row["account"] if row.get("account") else ""),
-            row["model"],
+            row["model"], PAYMENT_LABELS.get(row.get("paid"), "?"),
             row["spent_1h"], row["spent_24h"], gauges))
+    lines.append("")
+    lines += format_totals(totals(rows))
     return "\n".join(lines)
+
+
+#: libellé du mode de paiement d'une ligne de rapport (L95)
+PAYMENT_LABELS = {True: "token", False: "forfait", None: "?"}
+
+
+def totals(rows: Iterable[dict]) -> dict:
+    """Les deux totaux d'un rapport, jamais additionnés (L95) : `paid` =
+    dépense payée au token (de vrais dollars, estimés tour par tour) ;
+    `plan_value` = valeur consommée sur les forfaits (équivalent théorique au
+    barème : un tour au forfait ne coûte rien de plus). Une ligne dont le
+    mode est inconnu compte dans `unknown`."""
+    out = {key: {"1h": 0.0, "24h": 0.0} for key in ("paid", "plan_value", "unknown")}
+    for row in rows:
+        key = {True: "paid", False: "plan_value"}.get(row.get("paid"), "unknown")
+        out[key]["1h"] += float(row.get("spent_1h") or 0.0)
+        out[key]["24h"] += float(row.get("spent_24h") or 0.0)
+    return {k: {w: round(v, 6) for w, v in d.items()} for k, d in out.items()}
+
+
+def format_totals(sums: dict) -> list:
+    lines = ["dépensé (payé au token, estimé)  : 1 h %.4f $ · 24 h %.4f $" % (
+                 sums["paid"]["1h"], sums["paid"]["24h"]),
+             "valeur consommée sur les forfaits : 1 h %.4f $ · 24 h %.4f $ "
+             "(équivalent au barème, non payé au tour)" % (
+                 sums["plan_value"]["1h"], sums["plan_value"]["24h"])]
+    if sums["unknown"]["1h"] or sums["unknown"]["24h"]:
+        lines.append("mode de paiement inconnu          : 1 h %.4f $ · 24 h %.4f $" % (
+            sums["unknown"]["1h"], sums["unknown"]["24h"]))
+    return lines
+
+
+def _claude_call_usages(events: Sequence[dict]) -> list[dict]:
+    """L105 : l'usage de chaque appel au modèle d'un tour Claude sans `result`.
+
+    Le flux répète l'usage d'un message sur chacun de ses blocs : il n'est
+    compté qu'une fois par id de message."""
+    vus: set = set()
+    out: list[dict] = []
+    for event in events:
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        message = event.get("message") or {}
+        usage = message.get("usage") if isinstance(message, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        ident = message.get("id")
+        if ident:
+            if ident in vus:
+                continue
+            vus.add(ident)
+        out.append(usage)
+    return out
 
 
 def _claude_windows(event: dict) -> list | None:
@@ -1133,6 +1273,41 @@ def _find_rate_limits(node, depth: int = 0):
             if found:
                 return found
     return None
+
+
+def _codex_event_model(event) -> str:
+    """Le modèle porté par un événement du journal de session Codex, ou ''."""
+    if not isinstance(event, dict):
+        return ""
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return ""
+    kind = event.get("type")
+    if kind in ("turn_context", "session_meta") and isinstance(payload.get("model"), str):
+        return payload["model"].strip()
+    if payload.get("type") == "thread_settings_applied":
+        settings = payload.get("thread_settings")
+        if isinstance(settings, dict) and isinstance(settings.get("model"), str):
+            return settings["model"].strip()
+    return ""
+
+
+_TOML_MODEL = re.compile(r'^\s*model\s*=\s*"([^"]+)"\s*(?:#.*)?$')
+
+
+def _codex_config_model(path: str) -> str:
+    """`model = "…"` de premier niveau d'un `config.toml` Codex, ou ''."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                if line.lstrip().startswith("["):
+                    break               # une table : on sort du premier niveau
+                match = _TOML_MODEL.match(line)
+                if match:
+                    return match.group(1).strip()
+    except OSError:
+        pass
+    return ""
 
 
 def _last_session(events: Iterable[dict]) -> str:

@@ -316,11 +316,18 @@ class LimitesPhysiquesTest(_Canons, unittest.TestCase):
             "max_swap_used": 4 * GIB,                  # T (plus bas plafond)
             "max_load": defaut["max_load"],            # personne ne le déclare
             "min_disk_free": 10 * GIB,                 # T
+            "max_tmpfs_used": defaut["max_tmpfs_used"],  # L73 : personne
+            # L106 : seuils de batterie, personne ne les déclare
+            "min_battery_percent": resources.DEFAULT_MIN_BATTERY_PERCENT,
+            "stop_battery_percent": resources.DEFAULT_STOP_BATTERY_PERCENT,
         })
         self.assertEqual(got["max_agents"], 3)
         self.assertEqual(got["origin"], {
             "min_mem_available": ID_A, "max_swap_used": ID_T,
             "max_load": resources.DEFAULT_ORIGIN, "min_disk_free": ID_T,
+            "max_tmpfs_used": resources.DEFAULT_ORIGIN,
+            "min_battery_percent": resources.DEFAULT_ORIGIN,
+            "stop_battery_percent": resources.DEFAULT_ORIGIN,
             "max_agents": ID_T})
         self.assertEqual(got["fiches"], [ID_A, ID_T])
         # une fiche qui se tait n'impose pas le défaut à celle qui déclare

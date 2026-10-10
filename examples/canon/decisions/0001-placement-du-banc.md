@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "Le banc n'accepte que des agents à la clé d'API"
-description: "Exemple de fiche d'un autre type : ameesh l'ignore (seuls Agent, Host, Placement et Member sont lus)."
+description: "Exemple de fiche d'un autre type : elle ne règle rien dans ameesh ; `ameesh plan propose` la lit seulement pour proposer des éléments de feuille de route (L96)."
 status: stable
 tags: [placement, infrastructure]
 decided_by: human:bruno

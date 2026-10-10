@@ -23,7 +23,7 @@
         | unset [--per-hour] [--per-day] [--agent A]
         plafonds de budget du mesh, en base, relus à chaud (L70) ;
   ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais
-        context_max_tokens=15M|0
+        context_max_tokens=15M|0 turn_max_seconds=30m|2h|0 turn_mail_max=5|0
         réglages d'exécution, effet au prochain tour ;
   ameesh alerts [--follow] [--json]     alertes d'exploitation (un objet par ligne) ;
   ameesh notify [--once] [--dry-run] [--interval S] [--json] | --test human:ID
@@ -42,6 +42,11 @@
   ameesh projects [--json] [--project P] [--all]
         projets en cours : agents, état, lot en cours, non-lus, dépense 24 h,
         forfait ou token, lots sans agent (schéma ameesh-projects/1, L62) ;
+  ameesh plan add "quoi" --pour J [--projet P] [--lot N] [--source S] | list
+        | accept <id> | done <id> | cancel <id> | propose [--record] | show [--json]
+        feuille de route : engagements datés, propositions tirées des décisions,
+        Gantt texte (schéma ameesh-roadmap/1, L96) ; dates prévues d'une
+        tâche ou d'une fiche : `ameesh work plan <id> --debut J --fin J --livraison J` ;
   ameesh fil list | show <projet> [<lot>] [--last N] | tail <projet> [<lot>]
         les fils lisibles : tout message passé par ameesh, en clair (R12) ;
   ameesh receipt verify | authenticator list   reçus d'approbation (spec §8) ;
@@ -56,6 +61,7 @@
   ameesh harness list|show|check        descripteurs de harnais (L16) ;
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
+  ameesh menage [--apply] [--json]      ménage de ce que les agents créent (L73) ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -77,6 +83,8 @@ MESH_COMMANDS = (
     "review-class",
     # L31 : ressources des hôtes (`ameesh hosts`)
     "hosts",
+    # L73 : ménage de ce que les agents créent (`ameesh menage [--apply]`)
+    "menage",
     # L14 : le catalogue des modèles a son point d'entrée public, comme les autres
     # (`ameesh models list|show|discover`) — sans cette ligne, la commande sortait en
     # code 2 « sous-commande inconnue » AVANT toute base (revue B5).
@@ -158,6 +166,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "projects":
         from . import projects
         return projects.main(rest)
+    if command == "plan":
+        # L96 : feuille de route (engagements, propositions, Gantt)
+        from . import roadmap
+        return roadmap.main(rest)
     if command == "fil":
         from . import fil
         return fil.main(rest)

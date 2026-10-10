@@ -212,8 +212,11 @@ class CourrierDansLaConsigneTest(PgTestCase):
         self.assertIsNone(ligne["consigne_runner"])   # réservation libérée
         self.assertFalse(ligne["deja_consigne"])      # rien n'a été vu
         self.assertEqual(self.turns(), [])
-        # le tour suivant le livre, sans mention « re-livré »
-        spec = worker.pick()
+        # le tour suivant le livre, sans mention « re-livré » — L106 : une fois
+        # le harnais retrouvé, à l'échéance du nouvel essai (hôte non prêt)
+        with self._env_harnais():
+            worker._host_next = 0.0
+            spec = worker.pick()
         self.assertNotIn("re-livré", spec["prompt"])
         with self._env_harnais():
             self.assertTrue(worker.run_turn(spec))
@@ -233,8 +236,11 @@ class CourrierDansLaConsigneTest(PgTestCase):
 
         with self._env_harnais(), mock.patch.object(
                 runner_mod.subprocess, "Popen", side_effect=popen):
-            with self.assertRaises(OSError):
-                worker.run_turn(spec)
+            # L106 : un lancement impossible est une erreur de l'hôte, plus une
+            # exception qui tue le worker
+            self.assertFalse(worker.run_turn(spec))
+        self.assertFalse(worker.fast_failure)
+        self.assertEqual(registry.get(self.db, "oserror")["status_text"], "hôte non prêt")
         ligne = self._ligne(mid)
         self.assertIsNone(ligne["delivered_ts"])
         self.assertIsNone(ligne["consigne_runner"])

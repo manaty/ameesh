@@ -25,6 +25,16 @@ ameesh progress --html FILE [--project P] [--since 24h]
 Exit codes: 0; 1 (database unreachable, schema missing, SQL error); 2 (unreadable
 option).
 
+## Roadmap (Gantt)
+
+Since L96 the view opens on the **roadmap**: plan milestones and epics,
+tasks, dated commitments and pending decisions on a day scale, planned dates
+(dashed) against the milestones actually reached (requested, in progress,
+submitted, verdict, delivered), today's line, delays, and the source of each
+element (canon card, commitment, decision). It is shown by default; `ameesh
+progress --no-gantt` drops it and the page has a "masquer" button. The same
+data is `ameesh plan show [--json]` (schema `ameesh-roadmap/1`).
+
 ## Lot milestones
 
 Milestones are **declared**, not guessed. `requested` and `merged` are

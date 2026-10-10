@@ -282,6 +282,16 @@ def profiles(cfg, harness: str) -> list[Profile]:
     return parse(getattr(cfg, "accounts", None) or {}).get(harness, [])
 
 
+def homes(cfg, harness: str) -> list[str]:
+    """L95 : les dossiers de configuration des comptes déclarés du harnais
+    (où vivent leurs journaux de session) ; vide sans comptes ou si la
+    configuration est invalide — jamais une erreur pour un lecteur."""
+    try:
+        return [p.home() for p in profiles(cfg, harness) if p.kind == "config_dir"]
+    except (AccountError, OSError):
+        return []
+
+
 def by_name(items: list[Profile], name: str | None) -> Profile | None:
     for profile in items:
         if profile.name == name:

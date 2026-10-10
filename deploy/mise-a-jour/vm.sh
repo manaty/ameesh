@@ -12,7 +12,7 @@
 #   installer    code REF dans /opt/ameesh/src (détaché), installé dans
 #                /opt/ameesh/venv (dépendance psycopg comprise)
 #   redemarrer   ameesh-runner@<persona>, une par une, chacune hors tour ;
-#                refuse tant que 0041 et 0042 ne sont pas passées
+#                refuse tant que 0041 à 0047 ne sont pas passées (1.6.0)
 #   controler    unités actives, journal récent, ameesh doctor sur le serveur
 #   retour       réinstalle le commit d'avant et redémarre
 #
@@ -57,7 +57,7 @@ verifier() {
   for p in $PERSONAS_VM; do
     echo "$p : $(ssh_vm "systemctl is-active ameesh-runner@$p" || true), statut $(statut "$p")"
   done
-  etape "migrations de la base du mesh (0041 et 0042 attendues après poste.sh migrer)"
+  etape "migrations de la base du mesh (0041 à 0047 attendues après poste.sh migrer)"
   ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c 'SELECT version FROM schema_migrations WHERE version >= 37 ORDER BY version'" | tr '\n' ' '; echo
 }
 
@@ -89,8 +89,10 @@ installer() {
 
 redemarrer() {
   local n restantes suivantes debut=$SECONDS st
-  n=$(ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c 'SELECT count(*) FROM schema_migrations WHERE version IN (41, 42)'")
-  [ "$n" = 2 ] || { echo "migrations 0041/0042 absentes de la base du mesh : lancer d'abord « poste.sh migrer »" >&2; exit 1; }
+  # 1.6.0 : le code écrit les colonnes de 0045 et 0047 à chaque relevé de
+  # l'hôte ; sans elles, l'exécuteur redémarré échouerait
+  n=$(ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c 'SELECT count(*) FROM schema_migrations WHERE version BETWEEN 41 AND 47'")
+  [ "$n" = 7 ] || { echo "migrations 0041 à 0047 incomplètes dans la base du mesh : lancer d'abord « poste.sh migrer »" >&2; exit 1; }
   # shellcheck disable=SC2206
   restantes=($PERSONAS_VM)
   etape "exécuteurs du serveur (${#restantes[@]}), un par un hors tour"
@@ -133,7 +135,7 @@ retour() {
     git -C $SRC checkout -q --detach \"\$(cat $PRECEDENT)\"
     $VENV/bin/pip install -q --force-reinstall --no-deps $SRC
     echo \"code : \$(git -C $SRC rev-parse --short HEAD)\""
-  echo "base inchangée : 0041 et 0042 n'ajoutent que des colonnes et des tables, que l'ancien code ignore"
+  echo "base inchangée : 0041 à 0047 n'ajoutent que des colonnes et des tables, que l'ancien code ignore"
   redemarrer
 }
 

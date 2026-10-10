@@ -21,6 +21,9 @@ After=network-online.target agent-runner.service
 Wants=network-online.target
 
 [Service]
+# PATH explicite (L106) : l'unité peut démarrer avant l'import du PATH de la
+# session ; notify-send est dans le système
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # AMEESH_DSN, AMEESH_HOST, AMEESH_CANON… (le même fichier que l'exécuteur)
 EnvironmentFile=%h/.config/ameesh/env
 # Secrets des canaux, fichier 0600 facultatif : AMEESH_SLACK_WEBHOOK=…,

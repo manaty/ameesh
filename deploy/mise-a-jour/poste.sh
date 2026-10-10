@@ -17,7 +17,7 @@
 #                puis les exécuteurs de l'ancienne base
 #   controler    doctor, budget, accounts list, projects, alerts
 #   retour       réinstalle la version précédente et redémarre (sans toucher
-#                aux bases : 0041 et 0042 sont additives)
+#                aux bases : 0041 à 0047 sont additives)
 #
 # REF (installer) : commit, branche ou étiquette du dépôt qui contient ce
 # script ; défaut : HEAD de ce dépôt.
@@ -245,7 +245,7 @@ retour() {
   etape "réinstallation de $precedent"
   "$VENV/bin/pip" install -q --force-reinstall --no-deps "$PARTAGE/$precedent"
   ln -sfn "$precedent" "$PARTAGE/src-current"
-  echo "bases inchangées : 0041 et 0042 n'ajoutent que des colonnes et des tables, que l'ancien code ignore"
+  echo "bases inchangées : 0041 à 0047 n'ajoutent que des colonnes et des tables, que l'ancien code ignore"
   redemarrer
 }
 
