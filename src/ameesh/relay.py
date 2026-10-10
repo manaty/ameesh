@@ -565,8 +565,8 @@ class Relay:
 
     `db` : connexion `ameesh.db` (grand livre, plafonds) ; `cfg` : la
     configuration de l'hôte serveur (`budget_usd_per_hour`…, défauts des
-    plafonds du mesh) ; `connect` (facultatif) : fabrique de connexion
-    `http.client` vers l'amont, injectable pour les essais.
+    plafonds du mesh). L'amont est une URL par fournisseur
+    (`RelayConfig.upstreams`) : le faux fournisseur local des essais.
     """
 
     def __init__(self, *, verifier: TokenVerifier, policy: ModelPolicy, db, cfg,
@@ -612,7 +612,11 @@ class Relay:
             model = body.get("model")
             if not isinstance(model, str) or not model:
                 raise Refused(400, "invalid_request_error", "champ model absent")
-            reason = self.policy.refusal(identity, model)
+            try:
+                reason = self.policy.refusal(identity, model)
+            except Exception as exc:  # canon illisible : rien n'est admis
+                log.error("relais : politique illisible (%s)", type(exc).__name__)
+                raise Refused(503, "api_error", "politique des modèles illisible") from None
             if reason:
                 log.warning("relais : refus de modèle (%s, %s) : %s",
                             identity.agent, identity.host, reason)
