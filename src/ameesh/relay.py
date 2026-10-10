@@ -170,7 +170,7 @@ class StaticTokens:
 
 class ExecutorTokens:
     """`TokenVerifier` sur l'identité des exécuteurs (L110), monté par
-    `ameesh serve` : le jeton est vérifié par `identite.verify_token`
+    `ameesh serve` : le jeton est vérifié par `identity.verify_token`
     (`kind="session"` : échu, révoqué, bail perdu ou epoch changé → refus),
     puis le bail est relu en base (`lease_owner`, même agent, même epoch,
     owner de cet exécuteur, vivant) : c'est cet owner qui est inscrit au
@@ -185,7 +185,7 @@ class ExecutorTokens:
         self._lease = lease
 
     def verify_token(self, token: str) -> Identity:
-        from .executeur_mediee.interfaces import AuthError
+        from .mediated_executor.interfaces import AuthError
         try:
             principal = self._verify(token)
         except AuthError as exc:

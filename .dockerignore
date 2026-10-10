@@ -26,6 +26,6 @@ bin
 **/config.json
 # exceptions : le point d'entrée de l'image (L114), le binaire dsh épinglé
 # déposé au contexte, et l'essai de bout en bout (L115, faux harnais)
-!deploy/image-executeur/ameesh-executor
-!deploy/image-executeur/dsh
+!deploy/executor-image/ameesh-executor
+!deploy/executor-image/dsh
 !tests/fakebin/dsh

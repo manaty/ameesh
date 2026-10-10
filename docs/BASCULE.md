@@ -1221,7 +1221,7 @@ La 1.7.0 apporte la voie B, l'exécuteur médié (L107 à L115,
 
 | Migration | Lot | Contenu |
 |---|---|---|
-| **0048** `executeur_mediee` | L108 | tables `exec_idempotency`, `exec_host_availability`, `exec_audit` |
+| **0048** `mediated_executor` | L108 | tables `exec_idempotency`, `exec_host_availability`, `exec_audit` |
 | **0049** `identite_des_executeurs` | L110 | tables `executor_invitations`, `executors`, `executor_tokens`, `executor_assertion_jti`, `executor_events` |
 | **0050** `relais_de_modele` | L111 | `turn_costs.source` (`harness` par défaut), `executor`, `lease_owner`, `lease_epoch` |
 

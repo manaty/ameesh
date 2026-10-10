@@ -15,18 +15,18 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/executeur_mediee/contrat.json` | la table fermée des 62 opérations et la liste des 159 refusées |
-| `src/ameesh/executeur_mediee/contrat.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
-| `src/ameesh/executeur_mediee/evenements.py` | flux SSE, attente longue, curseurs |
-| `src/ameesh/executeur_mediee/porte.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
-| `src/ameesh/executeur_mediee/interfaces.py` | interfaces entre L108, L109 et L110 |
-| `src/ameesh/executeur_mediee/porte_hote.py` | L112 : `FileGate`, `SocketGate`, contrôleur de l'exécuteur, bail d'hôte volatil |
-| `src/ameesh/executeur_mediee/disponibilite.py` | L112 : disponibilité des hôtes côté serveur, alertes |
-| `tests/dore/executeur_mediee/*.json` | jeux d'essai dorés, partagés par le serveur et le client |
-| `tests/test_l107_contrat_executeur.py` | cohérence de la table, des jeux dorés et des interfaces |
-| `src/ameesh/executeur_mediee/identite.py` | serveur : codes d'enrôlement, `DbIdentityProvider`, `verify_token`, révocation (L110) |
-| `src/ameesh/executeur_mediee/appareil.py` | appareil : clé P-256, enrôlement, `HttpTokenSource` (L110) |
-| `src/ameesh/executeur_mediee/jose.py` | formats ES256 partagés : JWK, empreinte, JWS, défi Nexlink (L110) |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 62 opérations et la liste des 159 refusées |
+| `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
+| `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
+| `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
+| `src/ameesh/mediated_executor/interfaces.py` | interfaces entre L108, L109 et L110 |
+| `src/ameesh/mediated_executor/host_gate.py` | L112 : `FileGate`, `SocketGate`, contrôleur de l'exécuteur, bail d'hôte volatil |
+| `src/ameesh/mediated_executor/availability.py` | L112 : disponibilité des hôtes côté serveur, alertes |
+| `tests/dore/mediated_executor/*.json` | jeux d'essai dorés, partagés par le serveur et le client |
+| `tests/test_l107_executor_contract.py` | cohérence de la table, des jeux dorés et des interfaces |
+| `src/ameesh/mediated_executor/identity.py` | serveur : codes d'enrôlement, `DbIdentityProvider`, `verify_token`, révocation (L110) |
+| `src/ameesh/mediated_executor/device.py` | appareil : clé P-256, enrôlement, `HttpTokenSource` (L110) |
+| `src/ameesh/mediated_executor/jose.py` | formats ES256 partagés : JWK, empreinte, JWS, défi Nexlink (L110) |
 | `src/ameesh/host_cli.py` | `ameesh host enroll\|revoke\|list\|show`, `ameesh device enroll\|challenge\|show` (L110) |
 
 La table est dans le paquet, et non sous `docs/`, parce que l'exécuteur de
@@ -139,8 +139,8 @@ Un réveil ne fait jamais foi : l'exécuteur relit toujours la base.
 
 L'assemblage de la voie B (L108 à L114) a relevé des écarts entre le
 client, le serveur et les jeux dorés. Ils sont tranchés ici, dans
-`contrat.json` (version `1.1.0`) et dans les jeux dorés, régénérés par
-`tests/dore/generer_executeur.py`. Le client et le serveur lisent la même
+`contract.json` (version `1.1.0`) et dans les jeux dorés, régénérés par
+`tests/dore/generate_executor.py`. Le client et le serveur lisent la même
 table : aucun écart n'est toléré d'un côté seulement.
 
 - **Jeux dorés conformes au schéma.** États de lot de `work.STATES`,
@@ -233,7 +233,7 @@ close() -> None
   - `RemoteStorage` lève `NotSupportedRemotely` hors de la table. Les
     erreurs passent par `client_exception`.
   - Les essais tournent contre un faux serveur nourri de
-    `tests/dore/executeur_mediee`.
+    `tests/dore/mediated_executor`.
 - **L110, identité.**
   - `interfaces.IdentityProvider` : `verify`, `enroll`,
     `issue_access_token`, `issue_session_token` et `revoke`.
@@ -268,12 +268,12 @@ dépendance. Une écoute hors de la boucle locale exige TLS (`--tls-cert`,
 
 | Fichier | Rôle |
 |---|---|
-| `executeur_mediee/serveur.py` | `ExecApp` (routes, sans socket), `ExecHTTPServer`, `main` |
-| `executeur_mediee/repartiteur.py` | `PgDispatcher` : transaction, idempotence, fencing, audit |
-| `executeur_mediee/portee.py` | `HostScopeRules` : une règle par ligne de la table |
-| `executeur_mediee/flux.py` | `EventHub` : une écoute `LISTEN`, tampon, filtre par hôte |
-| `executeur_mediee/bouchon.py` | `StaticAuth`, jetons fixes, en attendant L110 |
-| `migrations/0048_executeur_mediee.sql` | `exec_idempotency`, `exec_host_availability`, `exec_audit` |
+| `mediated_executor/server.py` | `ExecApp` (routes, sans socket), `ExecHTTPServer`, `main` |
+| `mediated_executor/dispatcher.py` | `PgDispatcher` : transaction, idempotence, fencing, audit |
+| `mediated_executor/scope.py` | `HostScopeRules` : une règle par ligne de la table |
+| `mediated_executor/stream.py` | `EventHub` : une écoute `LISTEN`, tampon, filtre par hôte |
+| `mediated_executor/stub.py` | `StaticAuth`, jetons fixes, en attendant L110 |
+| `migrations/0048_mediated_executor.sql` | `exec_idempotency`, `exec_host_availability`, `exec_audit` |
 
 **Agents admis.** Un agent est admis s'il remplit toutes ces conditions :
 
@@ -461,7 +461,7 @@ session : `mail whoami`, `mail send`, `work move|note`, `action propose`.
 ### `verify_token`, pour L108 et L111
 
 ```python
-from ameesh.executeur_mediee.identite import verify_token
+from ameesh.mediated_executor.identity import verify_token
 principal = verify_token(db, token, kind="executor" | "session" | None)
 ```
 
@@ -510,12 +510,12 @@ illisible pour l'hôte, donc refusée (`host-occupant-unresolved`).
 Les tables de L110 (migration 0049) ne référencent aucune table d'autorité.
 `Principal` ne porte aucun droit d'approbation. Le contrat refuse toutes les
 opérations `approvals`, `nonces`, `grants` et `authenticators`.
-`tests/test_l110_enrolement.py` le vérifie.
+`tests/test_l110_enrollment.py` le vérifie.
 
 ## Dépôt de travail (L113)
 
 L'appareil n'a ni identifiant de forge, ni clone du dépôt. Le travail
-passe par le serveur (`executeur_mediee/depot.py`, monté par
+passe par le serveur (`mediated_executor/work_repo.py`, monté par
 `ameesh serve --work-repos FICHIER [--work-cache DOSSIER]`).
 
 - **Prise du bail.** `GET /work/{agent}/bundle`, avec le jeton d'accès et
@@ -553,18 +553,18 @@ travaille alors dans un dossier vide.
 
 ## Essai de bout en bout (L115)
 
-`scripts/essai-voie-b/essai.py`, lancé en root sur une machine de tests
+`scripts/path-b-trial/trial.py`, lancé en root sur une machine de tests
 dotée de Docker (aucun secret), monte tout sur la même machine :
 
 - un Postgres jetable (`scripts/pg-up.sh`, nom et port propres à l'essai) ;
 - un canon d'essai (hôte volatil `banc`, agent `ouvrier` sur dsh) et une
   « forge » locale (dépôt nu) pour le dépôt de travail ;
 - un faux fournisseur DeepSeek compatible Anthropic Messages
-  (`faux_fournisseur.py`) ;
+  (`fake_provider.py`) ;
 - `ameesh serve --exec-only` en TLS sur la passerelle Docker : API,
   identité L110, relais L111, dépôt de travail L113 ;
 - l'exécuteur dans un conteneur qui imite la VM Compute
-  (`scripts/essai-voie-b/Containerfile`) : volume `/var/lib/ameesh-exec`,
+  (`scripts/path-b-trial/Containerfile`) : volume `/var/lib/ameesh-exec`,
   porte `/run/ameesh-gate`, code dans `/run/ameesh-enroll/code`, point
   d'entrée `ameesh-executor` de l'image, vrai `dsh` installé par npm
   (`--dsh faux` : le faux harnais du banc).
@@ -608,6 +608,6 @@ Reste à faire pour un essai sur une vraie machine Windows ou Mac :
   l'utilisateur), et l'attestation de la clé d'appareil Nexlink ;
 - la vraie clé DeepSeek côté serveur (le relais n'a vu qu'un faux
   fournisseur) et un dépôt de forge réel, avec les identifiants du serveur ;
-- l'image signée (`deploy/image-executeur`, dsh épinglé par empreinte), et
+- l'image signée (`deploy/executor-image`, dsh épinglé par empreinte), et
   sa taille (1,3 Go avec dsh par npm) ;
 - le hook `agent-mail` de dsh : l'essai n'a fait aucun appel `session/op`.

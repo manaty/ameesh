@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Transport HTTP de l'exécuteur médié (`/api/exec/v1`, lot L109).
 
-`HttpTransport` implémente `executeur_mediee.interfaces.ExecTransport` avec
+`HttpTransport` implémente `mediated_executor.interfaces.ExecTransport` avec
 la bibliothèque standard (`http.client`) :
 
 * **jeton** : `Authorization: Bearer …`, tiré d'une `TokenSource` (L110 en
@@ -13,7 +13,7 @@ la bibliothèque standard (`http.client`) :
 * **nouvelles tentatives** : coupure, délai, 429, 5xx — quelques essais
   rapprochés (attente bornée, `Retry-After` respecté jusqu'à la borne), puis
   `Unavailable` : les reprises L72 de l'exécuteur prennent le relais ;
-* **erreurs** : `contrat.client_exception` (`Forbidden`, `ExecutorRevoked`,
+* **erreurs** : `contract.client_exception` (`Forbidden`, `ExecutorRevoked`,
   `NotSupportedRemotely`, `DbError`, `Unavailable`).
 
 TLS obligatoire, sauf vers la boucle locale (essais, mandataire local).
@@ -31,10 +31,10 @@ import urllib.parse
 from typing import Any, Callable, Iterator, Mapping, Optional
 
 from ... import db as db_mod
-from ...executeur_mediee import contrat as C
-from ...executeur_mediee import evenements as E
-from ...executeur_mediee import porte as P
-from ...executeur_mediee.interfaces import (
+from ...mediated_executor import contract as C
+from ...mediated_executor import events as E
+from ...mediated_executor import gate as P
+from ...mediated_executor.interfaces import (
     ENV_SESSION_TOKEN, ExecTransport, HostInfo, IssuedToken, TokenSource)
 
 #: délai d'une requête ordinaire (secondes)
@@ -252,7 +252,7 @@ class HttpTransport(ExecTransport):
                 timeout: Optional[float] = None) -> _Response:
         """Une requête, avec renouvellement du jeton (une fois) et nouveaux
         essais en panne passagère. Rend une réponse 2xx, sinon lève
-        l'exception de `contrat.client_exception`."""
+        l'exception de `contract.client_exception`."""
         refreshed = False
         attempt = 0
         while True:

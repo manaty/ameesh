@@ -1139,9 +1139,9 @@ def connect(cfg: Config, driver: str | None = None) -> PsqlDriver | PsycopgDrive
     (`storage.remote.RemoteDb`), que `storage.of()` reconnaît."""
     if getattr(cfg, "backend", "") == "mediated":
         from .storage import remote
-        from .executeur_mediee import appareil
+        from .mediated_executor import device
         # L110 dans L109 : jeton d'accès par l'identité de l'appareil enrôlé
-        appareil.install_token_source()
+        device.install_token_source()
         return remote.connect(cfg)  # type: ignore[return-value]
     wanted = driver or cfg.driver
     errors: list[str] = []

@@ -7,8 +7,8 @@ Contrat de l'API : `docs/EXECUTEUR-MEDIEE.md`. Étude :
 `docs/design/etudes/executeur-mediee.md`.
 
 Une modification incompatible ouvre `ameesh-executor/2`. Elle ne retouche
-jamais la v1 en silence. Brouillons : `deploy/image-executeur/Containerfile`
-et `deploy/image-executeur/ameesh-executor` (aucune image construite ni
+jamais la v1 en silence. Brouillons : `deploy/executor-image/Containerfile`
+et `deploy/executor-image/ameesh-executor` (aucune image construite ni
 publiée).
 
 ## 1. Point d'entrée
@@ -79,7 +79,7 @@ configuration dans ces variables. Ne posez jamais `AMEESH_DSN`,
 2. Elle lance `ameesh device enroll --code-file /run/ameesh-enroll/code`,
    qui lit le code lui-même. Le code ne paraît jamais dans une ligne de
    commande (`/proc/<pid>/cmdline`), dans l'environnement ni dans un
-   journal ; `tests/test_l114_image_executeur.py` le vérifie.
+   journal ; `tests/test_l114_executor_image.py` le vérifie.
 3. Le code est usé côté serveur, qu'il soit accepté ou non.
 
 La VM ne peut pas effacer ce fichier, puisque le montage est `:ro`. Le
@@ -222,22 +222,22 @@ L'acquittement porte `seq`, `state`, `in_turn` (les agents encore en tour),
   `r‖s`, 64 octets, en base64url sans remplissage, soit **86 caractères**.
   C'est la valeur de `recipe.image_signature`.
   - Vérification croisée faite le 2026-10-10 : une signature de
-    `signer-release.py` est acceptée par le code de vérification du hub
+    `sign_release.py` est acceptée par le code de vérification du hub
     (Node, `dsaEncoding: 'ieee-p1363'`), et refusée pour une autre image.
 - **Procédure de release.**
   1. La CI construit l'image et la pousse. Elle relève le digest.
   2. Le propriétaire signe sur son poste :
-     `deploy/image-executeur/signer-release.py sign --key <clé> <image@digest>`.
+     `deploy/executor-image/sign_release.py sign --key <clé> <image@digest>`.
      La commande rend `ameesh-release-signature/1` : `{image,
      image_signature, public_key}`.
-  3. Il vérifie : `signer-release.py verify --pub … <image> <signature>`.
+  3. Il vérifie : `sign_release.py verify --pub … <image> <signature>`.
   4. Le triplet est publié dans les notes de release.
   5. Nexlink épingle `image` et `image_signature` dans la recette.
 - **Création de la clé**, une seule fois, par le propriétaire :
 
   ```sh
   openssl ecparam -name prime256v1 -genkey -noout | openssl pkcs8 -topk8 -out ameesh-release.pem
-  signer-release.py public --key ameesh-release.pem   # → AMEESH_RELEASE_PUBLIC_KEY
+  sign_release.py public --key ameesh-release.pem   # → AMEESH_RELEASE_PUBLIC_KEY
   ```
 
 - **Rotation et compromission.** On crée une nouvelle clé, on re-signe les

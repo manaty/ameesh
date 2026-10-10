@@ -18,12 +18,12 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-from ameesh.executeur_mediee import contrat as C
-from ameesh.executeur_mediee import evenements as E
-from ameesh.executeur_mediee.interfaces import ExecTransport, HostInfo, IssuedToken
+from ameesh.mediated_executor import contract as C
+from ameesh.mediated_executor import events as E
+from ameesh.mediated_executor.interfaces import ExecTransport, HostInfo, IssuedToken
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DORE = os.path.join(REPO, "tests", "dore", "executeur_mediee")
+DORE = os.path.join(REPO, "tests", "dore", "mediated_executor")
 ACCESS = "amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 SESSION = "ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 OWNER = "exec:7f3a9c2e4b1d6058:anna-portable:4121"

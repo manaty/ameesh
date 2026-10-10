@@ -135,7 +135,7 @@ def _guard(cfg: Config, db, args) -> tuple:
 
 def cmd_enroll(cfg: Config, db, args) -> int:
     from . import authority
-    from .executeur_mediee import identite
+    from .mediated_executor import identity
     canon, fiche, reason = _guard(cfg, db, args)
     agents = None
     if args.agents:
@@ -147,12 +147,12 @@ def cmd_enroll(cfg: Config, db, args) -> int:
                           % (args.host, ", ".join(outside)))
     mesh = args.mesh or canon.id
     try:
-        ttl = authority.parse_ttl(args.ttl, identite.INVITATION_TTL_DEFAULT_S)
+        ttl = authority.parse_ttl(args.ttl, identity.INVITATION_TTL_DEFAULT_S)
     except authority.AuthorityError as exc:
         raise Refused(str(exc))
-    if ttl > identite.INVITATION_TTL_MAX_S:
-        raise Refused("code d'enrôlement : %d min au plus" % (identite.INVITATION_TTL_MAX_S // 60))
-    invitation = identite.create_invitation(db, mesh=mesh, host=args.host, created_by=args.by,
+    if ttl > identity.INVITATION_TTL_MAX_S:
+        raise Refused("code d'enrôlement : %d min au plus" % (identity.INVITATION_TTL_MAX_S // 60))
+    invitation = identity.create_invitation(db, mesh=mesh, host=args.host, created_by=args.by,
                                             agents=agents, ttl_s=ttl)
     invitation["authorized_as"] = reason
     if args.json:
@@ -169,11 +169,11 @@ def cmd_enroll(cfg: Config, db, args) -> int:
 
 
 def cmd_revoke(cfg: Config, db, args) -> int:
-    from .executeur_mediee import identite
+    from .mediated_executor import identity
     _guard(cfg, db, args)
     if not args.why or not args.why.strip():
         raise Refused("--why TEXTE requis (journal de la révocation)")
-    result = identite.revoke_host(db, args.host, by=args.by, why=args.why.strip(),
+    result = identity.revoke_host(db, args.host, by=args.by, why=args.why.strip(),
                                   executor_id=args.executor)
     if args.json:
         print(json.dumps({"schema": "ameesh-host-revoke/1", **result},
@@ -194,9 +194,9 @@ def cmd_revoke(cfg: Config, db, args) -> int:
 
 
 def cmd_list(cfg: Config, db, args) -> int:
-    from .executeur_mediee import identite
-    executors = identite.list_executors(db)
-    pending = identite.pending_invitations(db)
+    from .mediated_executor import identity
+    executors = identity.list_executors(db)
+    pending = identity.pending_invitations(db)
     if args.json:
         print(json.dumps({"schema": "ameesh-host-list/1", "executors": executors,
                           "invitations": pending}, ensure_ascii=False, indent=2))
@@ -221,7 +221,7 @@ def cmd_list(cfg: Config, db, args) -> int:
 
 
 def cmd_show(cfg: Config, db, args) -> int:
-    from .executeur_mediee import identite
+    from .mediated_executor import identity
     fiche_info = None
     try:
         canons = canon_mod.load_configured(cfg)
@@ -234,10 +234,10 @@ def cmd_show(cfg: Config, db, args) -> int:
                       "admins": list(fiche.admins or []),
                       "occupants": list(fiche.occupants) if fiche.occupants is not None else None,
                       "admitted_agents": sorted(admitted_agents(canon, fiche))}
-    executors = identite.list_executors(db, args.host)
-    leases = identite.host_leases(db, [e["id"] for e in executors if not e.get("revoked_ts")])
-    pending = identite.pending_invitations(db, args.host)
-    journal = identite.events(db, args.host)
+    executors = identity.list_executors(db, args.host)
+    leases = identity.host_leases(db, [e["id"] for e in executors if not e.get("revoked_ts")])
+    pending = identity.pending_invitations(db, args.host)
+    journal = identity.events(db, args.host)
     if args.json:
         print(json.dumps({"schema": "ameesh-host-show/1", "host": args.host, "fiche": fiche_info,
                           "executors": executors, "leases": leases, "invitations": pending,
@@ -298,13 +298,13 @@ def _read_code(args) -> str:
 
 
 def cmd_device(args) -> int:
-    from .executeur_mediee import appareil
+    from .mediated_executor import device
     directory = args.home
     if args.device_command in ("challenge", "enroll"):
         args.code = _read_code(args)
     if args.device_command == "challenge":
-        key, created = appareil.load_or_create_key(directory)
-        challenge = appareil.attestation_challenge(key, server_url=args.server, code=args.code)
+        key, created = device.load_or_create_key(directory)
+        challenge = device.attestation_challenge(key, server_url=args.server, code=args.code)
         sys.stdout.write(challenge.decode("ascii"))
         if created:
             print("(clé de l'exécuteur créée : %s)" % key.path, file=sys.stderr)
@@ -314,18 +314,18 @@ def cmd_device(args) -> int:
         if args.attestation:
             with open(args.attestation, encoding="utf-8") as fh:
                 attestation = json.load(fh)
-        state = appareil.enroll(args.server, args.code, directory=directory, label=args.label,
+        state = device.enroll(args.server, args.code, directory=directory, label=args.label,
                                 device_attestation=attestation)
         print("appareil enrôlé : exécuteur %s, hôte %s, mesh %s" % (
             state["executor_id"], state["host"], state["mesh"]))
         return 0
     # show
-    state = appareil.load_state(directory)
-    key_path = os.path.join(appareil.home(directory), appareil.KEY_FILE)
-    info = {"home": appareil.home(directory), "enrolled": state is not None,
+    state = device.load_state(directory)
+    key_path = os.path.join(device.home(directory), device.KEY_FILE)
+    info = {"home": device.home(directory), "enrolled": state is not None,
             "state": state, "key": os.path.exists(key_path)}
     if info["key"]:
-        key = appareil.load_key(directory)
+        key = device.load_key(directory)
         info["thumbprint"] = key.thumbprint()
         info["signer"] = key.signer
     if args.json:
@@ -397,7 +397,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(sys.argv[1:] if argv is None else argv)
     if args.group == "device":
         from .db import DbError
-        from .executeur_mediee.appareil import DeviceError
+        from .mediated_executor.device import DeviceError
         try:
             return cmd_device(args)
         except (DeviceError, DbError, OSError, ValueError) as exc:

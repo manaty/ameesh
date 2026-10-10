@@ -22,8 +22,8 @@ import threading
 from typing import Optional, Sequence
 
 from ... import db as db_mod
-from ...executeur_mediee import contrat as C
-from ...executeur_mediee import evenements as E
+from ...mediated_executor import contract as C
+from ...mediated_executor import events as E
 
 
 class RemoteSubscription:

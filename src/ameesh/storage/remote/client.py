@@ -27,8 +27,8 @@ import typing
 from typing import Any, Callable, Mapping, Optional
 
 from ... import db as db_mod
-from ...executeur_mediee import contrat as C
-from ...executeur_mediee.interfaces import ExecTransport, HostInfo, IssuedToken
+from ...mediated_executor import contract as C
+from ...mediated_executor.interfaces import ExecTransport, HostInfo, IssuedToken
 from .. import interface as SI
 
 #: nom du pilote (`Storage.driver`, `RemoteDb.driver`)

@@ -23,7 +23,7 @@ import os
 from typing import Any, Callable, Mapping, Optional
 
 from ... import db as db_mod
-from ...executeur_mediee.interfaces import ENV_SERVER_URL, ENV_SESSION_TOKEN, TokenSource
+from ...mediated_executor.interfaces import ENV_SERVER_URL, ENV_SESSION_TOKEN, TokenSource
 from .client import DRIVER, EXECUTOR, SESSION, LeaseBook, RemoteDb, RemoteStorage, supported
 from .events import RemoteSubscription
 from .http import FileTokenSource, HttpTransport, StaticTokenSource

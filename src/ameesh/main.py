@@ -205,8 +205,8 @@ def _dispatch(argv: list[str] | None) -> int:
         return actions_cli.main(argv)
     if command == "serve":
         # L108 : l'API d'exécuteur médiée ; L84 y ajoutera l'interface
-        from .executeur_mediee import serveur
-        return serveur.main(rest)
+        from .mediated_executor import server
+        return server.main(rest)
     if command in ("host", "device"):
         # L110 : enrôlement et identité des exécuteurs médiés
         from . import host_cli

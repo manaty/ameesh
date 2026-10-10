@@ -1513,23 +1513,23 @@ class AgentWorker(threading.Thread):
         l'autre (dsh lie sa session au dossier : un chemin par epoch rendait
         la reprise impossible, essai L115). Le contenu, lui, est refait à
         chaque prise de bail et effacé à la fin."""
-        from .executeur_mediee import appareil
-        return os.path.join(appareil.home(), "work", self.name)
+        from .mediated_executor import device
+        return os.path.join(device.home(), "work", self.name)
 
     def _depot_fence(self):
-        from .executeur_mediee import contrat as exec_contrat
-        return exec_contrat.Fence(self.name, self.runner.runner_id, int(self.epoch))
+        from .mediated_executor import contract as exec_contract
+        return exec_contract.Fence(self.name, self.runner.runner_id, int(self.epoch))
 
     def _mediated_workdir(self) -> str | None:
         """Le dossier de travail d'un exécuteur médié : l'archive du commit
-        rendue par le serveur à la prise du bail (`depot.checkout`), sous
+        rendue par le serveur à la prise du bail (`work_repo.checkout`), sous
         `<AMEESH_EXEC_HOME>/work/<agent>`. Sans dépôt monté sur le
         serveur (404) : un dossier vide. None si l'archive est illisible."""
-        from .executeur_mediee import depot
+        from .mediated_executor import work_repo
         path = self._depot_dir()
         if getattr(self, "_depot_ready", None) == path and os.path.isdir(path):
             return path
-        depot.wipe(path)  # reste d'un bail précédent (arrêt brutal)
+        work_repo.wipe(path)  # reste d'un bail précédent (arrêt brutal)
         transport = getattr(self.db, "transport", None)
         if not hasattr(transport, "get_work"):
             os.makedirs(path, mode=0o700, exist_ok=True)
@@ -1537,22 +1537,22 @@ class AgentWorker(threading.Thread):
             self._depot_ready = path
             return path
         try:
-            meta = depot.checkout(transport, self._depot_fence(), path)
+            meta = work_repo.checkout(transport, self._depot_fence(), path)
             log_async("[%s] dépôt de travail : %s (%s) dans %s"
                       % (self.name, meta["branch"], meta["commit"][:12], path))
             self._depot_active = True
         except db_mod.DbError as exc:
             if getattr(exc, "code", None) != "op_not_allowed":
                 log_async("[%s] dépôt de travail indisponible : %s" % (self.name, exc))
-                depot.wipe(path)
+                work_repo.wipe(path)
                 return None
             os.makedirs(path, mode=0o700, exist_ok=True)
             self._depot_active = False
             log_async("[%s] aucun dépôt de travail sur le serveur : dossier vide %s"
                       % (self.name, path))
-        except (depot.DepotError, OSError, subprocess.SubprocessError) as exc:
+        except (work_repo.DepotError, OSError, subprocess.SubprocessError) as exc:
             log_async("[%s] dépôt de travail illisible : %s" % (self.name, exc))
-            depot.wipe(path)
+            work_repo.wipe(path)
             return None
         self._depot_ready = path
         return path
@@ -1563,22 +1563,22 @@ class AgentWorker(threading.Thread):
         serveur, qui pousse la branche de l'agent. Ne lève jamais."""
         if not getattr(self.runner, "mediated", False):
             return
-        from .executeur_mediee import depot
+        from .mediated_executor import work_repo
         path = getattr(self, "_depot_ready", None)
         try:
             if path and getattr(self, "_depot_active", False) and os.path.isdir(path) \
                     and not self.lease_lost.is_set():
-                reply = depot.push(self.db.transport, self._depot_fence(), path,
+                reply = work_repo.push(self.db.transport, self._depot_fence(), path,
                                    commit_pending=final)
                 if reply:
                     log_async("[%s] dépôt de travail : %d commit(s) poussé(s) sur %s (%s)"
                               % (self.name, reply.get("commits", 0), reply.get("branch"),
                                  str(reply.get("commit") or "")[:12]))
-        except (db_mod.DbError, depot.DepotError, OSError, subprocess.SubprocessError) as exc:
+        except (db_mod.DbError, work_repo.DepotError, OSError, subprocess.SubprocessError) as exc:
             log_async("[%s] dépôt de travail : envoi impossible (%s)" % (self.name, exc))
         finally:
             if final and path:
-                depot.wipe(path)
+                work_repo.wipe(path)
                 self._depot_ready = None
 
     def _workdir_missing(self, force_status: bool = False) -> bool:
@@ -2291,7 +2291,7 @@ class AgentWorker(threading.Thread):
         `AMEESH_BACKEND=mediated`, `AMEESH_EXEC_URL`, `AMEESH_EXEC_TOKEN`.
         Sans jeton (serveur injoignable), le tour part quand même : seules
         les commandes `ameesh` de la session échoueront."""
-        from .executeur_mediee.interfaces import ENV_SERVER_URL, ENV_SESSION_TOKEN
+        from .mediated_executor.interfaces import ENV_SERVER_URL, ENV_SESSION_TOKEN
         for name in ("AMEESH_DSN", "AGENT_MESH_DSN", "AMEESH_DATABASE_URL",
                      "AGENT_MESH_DATABASE_URL", ENV_SESSION_TOKEN):
             env.pop(name, None)
@@ -3084,8 +3084,8 @@ class Runner:
         #: configuration, sinon `AlwaysAvailable`, relayée au serveur
         #: (`_mediated_gate`).
         self.mediated = getattr(db, "driver", None) == "mediated"
-        from .executeur_mediee import porte as porte_mod
-        self.gate = porte_mod.AlwaysAvailable()
+        from .mediated_executor import gate as gate_mod
+        self.gate = gate_mod.AlwaysAvailable()
         self.host_info = None
         if self.mediated:
             self._mediated_setup()
@@ -3094,8 +3094,8 @@ class Runner:
         self._delegation_dry_seen: set = set()
         #: porte d'hôte (L112) : None sans porte configurée (hôte classique,
         #: comportement inchangé)
-        from .executeur_mediee import porte_hote
-        self.host_gate = porte_hote.controller_from_config(self, log=log_async)
+        from .mediated_executor import host_gate
+        self.host_gate = host_gate.controller_from_config(self, log=log_async)
         if self.mediated:
             self._mediated_gate()
 
@@ -3106,13 +3106,13 @@ class Runner:
         jusqu'à ce que le serveur l'ait reçue ; sans porte configurée,
         `AlwaysAvailable` (le serveur doit quand même apprendre que l'hôte
         est disponible : sans rapport, il le tient pour indisponible)."""
-        from .executeur_mediee import porte as porte_mod
-        from .executeur_mediee import porte_hote
-        sink = porte_hote.TransportSink(self.db.transport, log=log_async)
+        from .mediated_executor import gate as gate_mod
+        from .mediated_executor import host_gate
+        sink = host_gate.TransportSink(self.db.transport, log=log_async)
         if self.host_gate is None:
-            self.host_gate = porte_hote.GateController(
-                self, porte_mod.AlwaysAvailable(),
-                drain_s=getattr(self.cfg, "host_gate_drain", porte_mod.DEFAULT_DRAIN_S),
+            self.host_gate = host_gate.GateController(
+                self, gate_mod.AlwaysAvailable(),
+                drain_s=getattr(self.cfg, "host_gate_drain", gate_mod.DEFAULT_DRAIN_S),
                 sink=sink, log=log_async)
         else:
             self.host_gate.sink = sink
@@ -3132,7 +3132,7 @@ class Runner:
         """Le jeton de session du bail (agent, owner, epoch) : demandé une
         fois (`POST /session-token`), réutilisé pour la session du harnais
         et le relais de modèle. Lève `DbError` si le serveur le refuse."""
-        from .executeur_mediee import contrat as exec_contrat
+        from .mediated_executor import contract as exec_contract
         key = (agent, owner, int(epoch))
         now = time.monotonic()
         with self._session_tokens_lock:
@@ -3141,7 +3141,7 @@ class Runner:
             hit = self._session_tokens.get(key)
             if hit is not None and now - hit[0] < self.SESSION_TOKEN_REUSE_S:
                 return hit[1]
-        issued = self.db.session_token(exec_contrat.Fence(agent, owner, int(epoch)))
+        issued = self.db.session_token(exec_contract.Fence(agent, owner, int(epoch)))
         with self._session_tokens_lock:
             self._session_tokens[key] = (now, issued.token)
         return issued.token
@@ -3151,10 +3151,10 @@ class Runner:
         à l'enrôlement, owner `exec:<id>:<hôte>:<pid>`, bail imposé, limites
         (à la place de `resources.host_limits` sur le canon local)."""
         from . import resources as resources_mod
-        from .executeur_mediee import contrat as exec_contrat
+        from .mediated_executor import contract as exec_contract
         info = self.db.host_info()
         self.host_info = info
-        owner = exec_contrat.owner_for(info.executor_id, info.host, os.getpid())
+        owner = exec_contract.owner_for(info.executor_id, info.host, os.getpid())
         self.cfg = dataclasses.replace(self.cfg, host=info.host, runner_id=owner)
         self.host = info.host
         self.runner_id = owner
@@ -3734,9 +3734,9 @@ class Runner:
         mine = resources_mod.host_limits(canons, self.host)
         limits = mine["limits"]
         # L112 : bail court d'un hôte volatil (fiche Host), sinon la config
-        from .executeur_mediee import porte_hote
+        from .mediated_executor import host_gate
         cfg = getattr(self, "cfg", None)
-        ttl = porte_hote.lease_ttl_for(canons, self.host, cfg.lease_ttl if cfg is not None
+        ttl = host_gate.lease_ttl_for(canons, self.host, cfg.lease_ttl if cfg is not None
                                        else getattr(self, "lease_ttl", 300.0))
         if ttl != getattr(self, "lease_ttl", ttl):
             log_async("bail des agents de %s : %ds (fiche Host)" % (self.host, int(ttl)))
