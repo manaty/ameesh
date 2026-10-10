@@ -86,7 +86,10 @@ dans le canon :
   seulement) ; fichier de clé **0600** ; variable de clé présente. Un compte
   qui échoue n'est jamais choisi, et `ameesh accounts list` dit pourquoi.
 * `hourly_usd` : plafond horaire du compte (dépense des tours attribués au
-  compte). `min_balance` : le compte est au seuil quand son dernier solde
+  compte). Il est propre à l'hôte et s'ajoute aux plafonds du mesh, qui se
+  règlent en base pour toutes les machines par `ameesh budget set` (L70,
+  voir [EXPLOITATION.md](EXPLOITATION.md#plafonds-de-budget-du-mesh--ameesh-budget-l70)) ;
+  un compte au seuil bascule, un plafond du mesh atteint met en pause. `min_balance` : le compte est au seuil quand son dernier solde
   relevé est au plus ce montant (relevé par l'exécuteur, ou
   `ameesh cost balance --record`).
 * Isolement : sur un hôte à comptes, chaque harnais lancé (tour ou `ameesh
@@ -109,6 +112,7 @@ ameesh accounts auto [claude]          # retour en automatique
 ameesh cost report                     # dépense par agent, compte actif, jauges par compte
 ameesh cost gauges                     # historique des jauges, par compte
 ameesh cost balance --record           # soldes, par compte de clé d'API
+ameesh budget                          # plafonds du mesh en vigueur, source, pauses (L70)
 ```
 
 Chaque bascule est journalisée en base (`account_switches`), dans le journal

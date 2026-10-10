@@ -93,6 +93,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    open_lots_activity turns record_gauges gauge_history
                    record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
+   budgets         limits put events
 
 3. Atomicité et verrous. Postgres tient les garanties par des écritures
    conditionnelles en une instruction (`UPDATE … WHERE`, `INSERT … ON
@@ -444,6 +445,35 @@ class TurnCosts(Domain):
         """Somme des coûts des `seconds` dernières secondes (horloge de la
         base), de l'agent (`"all"` : tout le compte, comme `cost spent`), de
         ces harnais seulement si donnés, de ce compte seulement si donné (L30)."""
+
+
+# --------------------------------------------------------------------------
+# plafonds de budget du mesh (L70, décision 0019 §2, migration 0042)
+# --------------------------------------------------------------------------
+
+class Budgets(Domain):
+    """Plafonds de budget réglés en base, pour tout le mesh, et leur journal.
+
+    Une ligne par (portée, fenêtre) : portée `''` = tout le mesh, sinon un
+    agent ; fenêtre 3600 ou 86400 s. Les changements sont journalisés dans
+    la même transaction (acteur, ancienne et nouvelle valeur) ; un
+    déclencheur réveille les exécuteurs (canal `ameesh_budget`)."""
+
+    @abc.abstractmethod
+    def limits(self) -> list[dict]:
+        """Toutes les lignes : scope, window_s, usd, set_by, updated_ts."""
+
+    @abc.abstractmethod
+    def put(self, scope: str, window_s: int, usd: float | None, *,
+            actor: str) -> tuple[bool, float | None]:
+        """Pose (`usd` > 0) ou retire (`usd` None) un plafond, et journalise,
+        en UNE transaction (verrou de la ligne). Rend (changé, ancienne
+        valeur) ; rien n'est écrit ni journalisé si la valeur est la même."""
+
+    @abc.abstractmethod
+    def events(self, limit: int, scope: str | None = None) -> list[dict]:
+        """Les derniers changements, récents d'abord : scope, window_s,
+        old_usd, new_usd, actor, at_ts."""
 
 
 # --------------------------------------------------------------------------
@@ -1654,6 +1684,7 @@ class Storage(abc.ABC):
     pending_spend: PendingSpend
     turn_costs: TurnCosts
     accounts: Accounts
+    budgets: Budgets
     mailbox: Mailbox
     wakeups: Wakeups
     keys: Keys

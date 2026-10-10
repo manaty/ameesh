@@ -54,6 +54,8 @@ SESSION_POLICIES = ("par-lot", "taille", "jamais")
 #: canaux LISTEN/NOTIFY
 CHANNEL_MAIL = "agent_mail"
 CHANNEL_LEASE = "agent_lease"
+#: L70 : changement d'un plafond de budget en base (migration 0042)
+CHANNEL_BUDGET = "ameesh_budget"
 
 
 def _expand(path: str) -> str:
@@ -150,6 +152,12 @@ class Config:
     #: garde de budget (0019, R20) : plafond horaire de l'usage payé au token
     #: (somme des tours des 60 dernières minutes) ; 0 = garde désactivée.
     budget_usd_per_hour: float = 10.0
+    #: L70 : plafond par jour glissant (24 h) de l'usage payé au token ;
+    #: 0 = aucun. Défaut local : `ameesh budget set` (en base) l'emporte.
+    budget_usd_per_day: float = 0.0
+    #: L70 : réglages de budget donnés EXPLICITEMENT (fichier ou environnement),
+    #: pour dire la source d'un plafond (`config` ou `défaut`) ; calculé par `load`
+    budget_explicit: tuple[str, ...] = ()
     #: intervalle minimal entre deux vérifications de budget d'un agent en pause
     budget_check_interval: float = 30.0
     #: expéditeurs autorisés à interrompre un tour (0018, R19) ; sans canon,
@@ -305,6 +313,7 @@ def load(env: dict | None = None) -> Config:
             raise SystemExit("config illisible %s : objet JSON attendu" % cfg_path)
         known = {f for f in Config.__dataclass_fields__}  # type: ignore[attr-defined]
         known.discard("extra_canons")   # `canons` (liste) ci-dessous, jamais tel quel
+        known.discard("budget_explicit")  # calculé, jamais lu tel quel
         if isinstance(raw.get("humans"), list):
             raw = dict(raw, humans=",".join(str(n) for n in raw["humans"]))
         cfg = replace(cfg, **{k: v for k, v in raw.items() if k in known})
@@ -361,6 +370,14 @@ def load(env: dict | None = None) -> Config:
         budget_usd_per_hour=_as_float(
             pick("AMEESH_BUDGET_USD_PER_HOUR", "AGENT_MESH_BUDGET_USD_PER_HOUR"),
             cfg.budget_usd_per_hour),
+        budget_usd_per_day=_as_float(
+            pick("AMEESH_BUDGET_USD_PER_DAY"), cfg.budget_usd_per_day),
+        budget_explicit=tuple(
+            key for key, names in (
+                ("budget_usd_per_hour", ("AMEESH_BUDGET_USD_PER_HOUR",
+                                         "AGENT_MESH_BUDGET_USD_PER_HOUR")),
+                ("budget_usd_per_day", ("AMEESH_BUDGET_USD_PER_DAY",)))
+            if key in raw or pick(*names)),
         budget_check_interval=_as_float(
             pick("AMEESH_BUDGET_CHECK_INTERVAL", "AGENT_MESH_BUDGET_CHECK_INTERVAL"),
             cfg.budget_check_interval),

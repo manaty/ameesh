@@ -41,8 +41,8 @@ import time
 import uuid
 
 from . import account_turn, adapters, canon as canon_mod, canon_sync, cost as cost_mod
-from . import db as db_mod, fil, mail, registry, storage
-from .config import CHANNEL_LEASE, CHANNEL_MAIL, Config
+from . import budget as budget_mod, db as db_mod, fil, mail, registry, storage
+from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
 from .config import load as load_config
 
 
@@ -1141,14 +1141,16 @@ class AgentWorker(threading.Thread):
         """Raison de pause budget pour cet agent, ou '' (jauges + dépense).
 
         Le harnais est passé au `CostBook` (l'état local ne porte pas toujours
-        `tool`) ; le plafond horaire est celui de l'exécuteur (0019 §2).
+        `tool`) ; les plafonds sont ceux du mesh, relus en base à chaud (L70 :
+        base > configuration de l'hôte > défaut), plus ceux de l'agent.
         """
-        if self.runner.budget_usd_per_hour <= 0:
+        limites = self.runner.budget_limits(self.db)
+        if limites.per_hour <= 0:
             return ""
         book = cost_mod.CostBook(
             state_dir=self.cfg.state_dir, db=self.db,
             tools={self.name: self.agent.get("harness") or ""},
-            hourly_usd=self.runner.budget_usd_per_hour)
+            **limites.book_kwargs())
         # L30 (0027) : avec des comptes déclarés, le rythme se juge compte par
         # compte et la garde bascule au lieu de mettre en pause.
         raison = account_turn.choose(self, book)
@@ -1169,7 +1171,7 @@ class AgentWorker(threading.Thread):
         aveugle (verdict L13 B1).
         """
         self._account = None
-        if self.runner.budget_usd_per_hour <= 0:
+        if self.runner.budget_limits(self.db).per_hour <= 0:
             account_turn.choose(self, None, pause=False)  # L30 : bascule sans pause
             return True
         # Réparation d'abord : un travail comptable en attente (marqueur
@@ -2106,6 +2108,10 @@ class Runner:
         #: garde de budget (L13, 0019) : plafond horaire et cadence de contrôle
         self.budget_usd_per_hour = max(0.0, cfg.budget_usd_per_hour)
         self.budget_check_interval = max(1.0, cfg.budget_check_interval)
+        #: L70 : plafonds réglés en base pour tout le mesh, relus à chaud
+        #: (cache court, invalidé par le réveil `ameesh_budget`) ; le plafond
+        #: horaire de la configuration ci-dessus reste le défaut
+        self.budget_cache = budget_mod.Cache()
         #: pression de l'hôte (L31, 0028) : seuils du canon et verdict caché
         from . import resources as resources_mod
         self._pressure_lock = threading.Lock()
@@ -2207,6 +2213,11 @@ class Runner:
                     self.workers[agent["name"]] = worker
                 worker.start()
 
+    def budget_limits(self, db) -> "budget_mod.Limits":
+        """Les plafonds en vigueur (L70) : base (cache court) > config > défaut."""
+        return self.budget_cache.limits(self.cfg, db,
+                                        hourly_default=self.budget_usd_per_hour)
+
     # -- écoute ------------------------------------------------------------
     def dispatch(self, item: dict) -> None:
         """Réveille (ou préempte) le worker visé, **signal avant journal**.
@@ -2215,6 +2226,16 @@ class Runner:
         saturé retarder la préemption (verdict codex3 L11 B1) : tous les signaux
         partent d'abord, la journalisation passe par la file bornée.
         """
+        if item.get("channel") == CHANNEL_BUDGET:
+            # L70 : un plafond a changé en base ; le réveil n'est qu'un signal,
+            # la garde relit la table au prochain sondage de chaque worker.
+            self.budget_cache.invalidate()
+            with self.lock:
+                for worker in self.workers.values():
+                    worker.wake.set()
+            self.wake_all.set()
+            log_async("plafond de budget changé en base : relecture")
+            return
         if item.get("channel") == CHANNEL_MAIL:
             try:
                 payload = json.loads(item.get("payload") or "{}")
@@ -2254,13 +2275,14 @@ class Runner:
 
     def _listen_loop(self) -> None:
         while not self.stop.is_set():
-            listener = storage.of(self.db).wakeups.subscribe([CHANNEL_MAIL, CHANNEL_LEASE])
+            listener = storage.of(self.db).wakeups.subscribe(
+                [CHANNEL_MAIL, CHANNEL_LEASE, CHANNEL_BUDGET])
             if listener is None:
                 log_async("LISTEN/NOTIFY indisponible avec ce pilote : sondage toutes les %ss"
                           % self.poll)
                 return
             self.listener = listener
-            log_async("LISTEN %s, %s" % (CHANNEL_MAIL, CHANNEL_LEASE))
+            log_async("LISTEN %s, %s, %s" % (CHANNEL_MAIL, CHANNEL_LEASE, CHANNEL_BUDGET))
             try:
                 while not self.stop.is_set():
                     item = listener.wait(timeout=self.poll)

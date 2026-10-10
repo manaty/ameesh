@@ -48,6 +48,7 @@ ameesh restart <agent> --brief FILE|-             # stop the turn, forget the se
 ameesh interrupt <agent> <message…>               # direct interruption (authorised senders only)
 ameesh set <agent> tier=fast session_policy=par-lot|taille|jamais
 ameesh cost turns | gauges | balance --json       # usage per turn, plan gauges history, paid-per-token balance
+ameesh budget [set --per-hour X --per-day Y [--agent A] | unset …]  # mesh-wide paid-per-token caps, in the database, hot-reloaded
 ```
 
 Operating agents (L26: session per lot, enriched `list --json`, alerts,

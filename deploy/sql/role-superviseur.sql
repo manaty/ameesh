@@ -274,6 +274,14 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'host', 'harness', 'from_account', 'to_account', 'kind', 'reason',
         'agent', 'at'
     ]),
+    -- plafonds de budget du mesh (L70, 0042) et leur journal : de l'ÉTAT
+    -- (montants, acteur), aucun contenu
+    ('budget_limits', ARRAY[
+        'scope', 'window_s', 'usd', 'set_by', 'updated_at'
+    ]),
+    ('budget_events', ARRAY[
+        'id', 'scope', 'window_s', 'old_usd', 'new_usd', 'actor', 'at'
+    ]),
     -- liaisons de session (L41, 0030) : quelle session externe parle au nom
     -- de quel agent ; même nature que agent_registry.session_id, aucun contenu
     ('session_bindings', ARRAY[

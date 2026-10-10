@@ -1400,6 +1400,10 @@ def build_parser() -> argparse.ArgumentParser:
     pa_auto.set_defaults(func=cmd_accounts)
     p_acc.set_defaults(func=cmd_accounts)
 
+    # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
+    from . import budget as budget_mod
+    budget_mod.add_parsers(sub)
+
     p_set = sub.add_parser("set", help="réglages d'un agent, effet au prochain tour (L13, L26)")
     p_set.add_argument("agent")
     p_set.add_argument("values", nargs="+", metavar="clé=valeur",
@@ -1455,7 +1459,11 @@ def cmd_cost(cfg: Config, args) -> int:
     try:
         if what in ("turns", "gauges", "balance"):
             return _cost_l26(cfg, db, what, args)
-        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+        # L70 : les plafonds en vigueur (base > configuration > défaut), ceux
+        # que la garde des exécuteurs applique
+        from . import budget as budget_mod
+        limites = budget_mod.current(cfg, db)
+        book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, **limites.book_kwargs())
         if what == "spent":
             seconds = float(getattr(args, "seconds", 3600.0) or 3600.0)
             print("%.4f" % book.spent(getattr(args, "agent", "all") or "all", seconds))
@@ -1499,6 +1507,11 @@ def cmd_cost(cfg: Config, args) -> int:
             print(json.dumps(rows, indent=2, sort_keys=True, default=str))
         else:
             print(cost_mod.format_report(rows))
+            print()
+            print(budget_mod.summary_line(limites))
+            for agent, caps in sorted(limites.agents.items()):
+                print("  plafond de %s : %s" % (agent, " · ".join(
+                    "%s %.2f $" % (budget_mod.LABELS[w], v) for w, v in sorted(caps.items()))))
             if comptes:
                 print()
                 print("comptes (hôte %s) :" % cfg.host)

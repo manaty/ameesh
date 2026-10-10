@@ -69,6 +69,10 @@ KNOWN_WINDOWS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
 #: (décision 0019 §2 : référence 10 USD/h).
 DEFAULT_HOURLY_USD = 10.0
 
+#: L70 : fenêtres glissantes des plafonds (secondes → libellés de la raison)
+WINDOW_LABELS = {3600: ("horaire", "les 60 dernières minutes"),
+                 86400: ("journalier", "les 24 dernières heures")}
+
 
 def gauges_source(harness: str) -> str:
     """La source de jauges déclarée par le descripteur d'un harnais, ou ''."""
@@ -273,6 +277,8 @@ class CostBook:
         tools: dict | None = None,
         clock: Callable[[], float] = time.time,
         hourly_usd: float = DEFAULT_HOURLY_USD,
+        daily_usd: float = 0.0,
+        agent_limits: dict | None = None,
     ) -> None:
         self.state_dir = state_dir if state_dir is not None else config_mod.load().state_dir
         self.prices_path = prices_path if prices_path is not None else os.environ.get(
@@ -286,6 +292,10 @@ class CostBook:
         self.tools = dict(tools or {})
         self.clock = clock
         self.hourly_usd = hourly_usd
+        #: L70 : plafond du mesh par jour glissant (0 = aucun) et plafonds
+        #: propres aux agents, `{agent: {3600|86400: usd}}` (`ameesh.budget`)
+        self.daily_usd = daily_usd
+        self.agent_limits = dict(agent_limits or {})
 
     # -- état local ---------------------------------------------------------
     def agent_dir(self, agent: str) -> str:
@@ -752,6 +762,11 @@ class CostBook:
         `pace=False` (L30) : le rythme est jugé compte par compte par
         `ameesh.accounts`, qui bascule au lieu de mettre en pause ; seul le
         plafond horaire reste ici.
+
+        L70 : même règle pour le plafond par jour glissant du mesh
+        (`daily_usd`) et pour les plafonds propres à l'agent
+        (`agent_limits`, sa seule dépense payée au token). Un plafond nul ou
+        absent ne s'applique pas.
         """
         harness = self.tool_of(agent) if agent != "all" else ""
         reason = self.pace_exceeded(harness) if (harness and pace) else ""
@@ -763,10 +778,22 @@ class CostBook:
         # un harnais inconnu reste soumis au plafond (fail-closed).
         if harness and harness not in paid:
             return ""
-        hourly = self.spent("all", 3600, harnesses=paid)
-        if hourly >= self.hourly_usd:
-            return ("budget horaire (payé au token) : %.2f $ sur les 60 dernières minutes "
-                    "(plafond %.2f $)" % (hourly, self.hourly_usd))
+        # L70 : plafonds du mesh (heure, jour glissant), puis ceux de l'agent
+        for window, cap in ((3600, self.hourly_usd), (86400, self.daily_usd)):
+            if cap and cap > 0:
+                total = self.spent("all", window, harnesses=paid)
+                if total >= cap:
+                    return ("budget %s (payé au token) : %.2f $ sur %s "
+                            "(plafond %.2f $)" % (WINDOW_LABELS[window][0], total,
+                                                  WINDOW_LABELS[window][1], cap))
+        if agent != "all":
+            for window, cap in sorted((self.agent_limits.get(agent) or {}).items()):
+                if cap and cap > 0 and window in WINDOW_LABELS:
+                    total = self.spent(agent, window, harnesses=paid)
+                    if total >= cap:
+                        return ("budget %s de l'agent %s (payé au token) : %.2f $ sur %s "
+                                "(plafond %.2f $)" % (WINDOW_LABELS[window][0], agent, total,
+                                                      WINDOW_LABELS[window][1], cap))
         return ""
 
     # -- rapport ------------------------------------------------------------
