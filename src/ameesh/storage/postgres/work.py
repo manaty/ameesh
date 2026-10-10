@@ -11,11 +11,13 @@ laisse une ligne dans `work_item_events` (qui, quand, pourquoi).
 from __future__ import annotations
 
 from .. import interface
+from . import catalog as _catalog
 
 ITEM_COLUMNS = """
     id, type, source, app, title, body, issue_ref, workstream, state, assignee,
     loops, budget_usd, spent_usd, package_id, package_parent, pr_ref, close_reason,
     superseded_by, delegated_by,
+    expected_value, value_score, priority, team, required_capabilities,
     extract(epoch from created_at)::float8 as created_ts,
     extract(epoch from updated_at)::float8 as updated_ts,
     extract(epoch from closed_at)::float8  as closed_ts,
@@ -516,6 +518,42 @@ class WorkItems(interface.WorkItems):
             RETURNING w.id
             """)
         return len(rows)
+
+    # -- file d'amélioration (L119, décision 0037) ------------------------------
+    def backlog_add(self, *, title, body, source, expected_value, value_score, priority,
+                    team, required_capabilities, package_id, package_parent, note,
+                    actor) -> dict:
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                INSERT INTO work_items
+                    (type, source, title, body, state, expected_value, value_score,
+                     priority, team, required_capabilities, package_id, package_parent)
+                VALUES ('improvement', %s, %s, %s, 'intake', %s, %s, %s, %s, %s::text[],
+                        %s, %s)
+                RETURNING __COLUMNS__
+                """.replace("__COLUMNS__", ITEM_COLUMNS),
+                (source, title, body, expected_value, int(value_score), int(priority), team,
+                 _catalog._text_array(required_capabilities) if required_capabilities else None,
+                 package_id, package_parent))
+            item = rows[0]
+            WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
+            return item
+
+    def backlog(self, *, open_only, limit) -> list[dict]:
+        where = ("state = 'intake' AND assignee IS NULL" if open_only
+                 else "state NOT IN %s" % _CLOSED)
+        return self.db.query(
+            "SELECT %s FROM work_items WHERE type = 'improvement' AND %s"
+            " ORDER BY coalesce(priority, 2), value_score DESC NULLS LAST, id"
+            " LIMIT %%s" % (ITEM_COLUMNS, where), (int(limit),))
+
+    def auto_takes_since(self, seconds, note_prefix) -> int:
+        rows = self.db.query(
+            "SELECT count(*)::bigint AS n FROM work_item_events"
+            " WHERE created_at > now() - make_interval(secs => %s)"
+            "   AND starts_with(note, %s)", (float(seconds), note_prefix))
+        return int(rows[0]["n"]) if rows else 0
 
     def _event(self, item_id, state, note, actor) -> None:
         self.db.execute(

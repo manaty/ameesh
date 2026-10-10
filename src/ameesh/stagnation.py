@@ -319,9 +319,13 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
     (`{what, who, label}`, L29)."""
     now = time.time() if now is None else float(now)
     st = storage.of(db)
+    # L119 (0037) : un élément de la file d'amélioration qui attend son
+    # preneur n'est pas stagnant, il est en file
     rows = [r for r in st.operations.open_lots_activity(limit)
             if r.get("last_activity_ts") is not None
-            and now - float(r["last_activity_ts"]) >= float(threshold_s)]
+            and now - float(r["last_activity_ts"]) >= float(threshold_s)
+            and not (r.get("type") == "improvement" and not r.get("assignee")
+                     and r.get("state") == "intake")]
     described = describe(db, rows, now=now, threshold=threshold_s)
     out = []
     for row in rows:

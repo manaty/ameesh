@@ -43,7 +43,8 @@ import time
 from . import cost as cost_mod
 from . import storage
 
-UNDERUSE_TYPES = ("plan_underused", "idle_capacity", "orchestrator_held", "host_underused")
+UNDERUSE_TYPES = ("plan_underused", "idle_capacity", "orchestrator_held", "host_underused",
+                  "backlog_empty")
 
 #: `balance_low` (L94, ajout validé par le propriétaire) : solde bas d'un
 #: fournisseur payé au token — autonomie au rythme RÉEL sous 48 h, ou solde
@@ -340,11 +341,16 @@ def orchestrator_held(listing: list, now: float, orchestras: list, *,
 # idle_capacity
 # --------------------------------------------------------------------------
 
-def idle_capacity(db, listing: list, now: float, orchestras: list, *,
-                  idle_s: float = DEFAULT_IDLE_CAPACITY_S, paid=None,
-                  lots: list | None = None) -> list:
-    if idle_s <= 0:
-        return []
+def idle_since(row: dict) -> float:
+    """Début du repos : le dernier changement de statut ou le dernier tour."""
+    return max(float(row.get("status_since_ts") or 0.0), float(row.get("last_turn_ts") or 0.0))
+
+
+def idle_agents(listing: list, now: float, idle_s: float) -> list:
+    """Les agents réveillables au repos sans lot ni courrier depuis au moins
+    `idle_s` : mode `execute`, exécuteur vivant (pas une session attachée),
+    au repos (ni en tour, ni en pause de budget, ni arrêtés). Partagé par
+    `idle_capacity`, `backlog_empty` et la prise automatique (L119)."""
     idle = []
     for row in listing:
         if (row.get("mode") or "execute") != "execute" or _state(row) != "idle":
@@ -353,11 +359,19 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
             continue
         if row.get("assigned_lot_id") is not None:
             continue
-        since = max(float(row.get("status_since_ts") or 0.0),
-                    float(row.get("last_turn_ts") or 0.0))
+        since = idle_since(row)
         if not since or now - since < idle_s:
             continue
         idle.append(row)
+    return idle
+
+
+def idle_capacity(db, listing: list, now: float, orchestras: list, *,
+                  idle_s: float = DEFAULT_IDLE_CAPACITY_S, paid=None,
+                  lots: list | None = None) -> list:
+    if idle_s <= 0:
+        return []
+    idle = idle_agents(listing, now, idle_s)
     if not idle:
         return []
     if lots is None:
@@ -574,6 +588,33 @@ def balance_low(db, listing: list, now: float, *,
 
 
 # --------------------------------------------------------------------------
+# backlog_empty (L119, décision 0037)
+# --------------------------------------------------------------------------
+
+def backlog_empty(db, listing: list, now: float, *,
+                  idle_s: float = DEFAULT_IDLE_CAPACITY_S) -> list:
+    """`backlog_empty` : des agents réveillables sont au repos sans lot depuis
+    plus de `idle_s` et la file d'amélioration n'a plus d'élément à prendre.
+    ameesh ne doit s'arrêter que faute de travail : l'humain responsable est
+    invité à remplir la file (`ameesh work backlog add`)."""
+    if idle_s <= 0:
+        return []
+    idle = idle_agents(listing, now, idle_s)
+    if not idle:
+        return []
+    if storage.of(db).work.backlog(open_only=True, limit=1):
+        return []
+    names = sorted(row["name"] for row in idle)
+    return [_alert(
+        "backlog_empty", None, None, len(names), idle_s,
+        "%d agent(s) réveillable(s) au repos sans lot depuis plus de %s (%s) et la file "
+        "d'amélioration est vide. Action : ajouter des éléments à valeur attendue "
+        "(ameesh work backlog add), ou confier un lot (ameesh work assign)"
+        % (len(names), _duration(idle_s), ", ".join(names)),
+        agents=names, responsible=_common_responsible(idle))]
+
+
+# --------------------------------------------------------------------------
 # entrée
 # --------------------------------------------------------------------------
 
@@ -590,6 +631,7 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
            balance_hours: float = DEFAULT_BALANCE_HOURS,
            balance_min_usd: float = DEFAULT_BALANCE_MIN_USD,
            balance_window_s: float = DEFAULT_BALANCE_WINDOW_S,
+           backlog_empty_s: float = DEFAULT_IDLE_CAPACITY_S,
            idle_mail_s: float = 300.0) -> list:
     """Les alertes de sous-utilisation en cours (non triées)."""
     now = time.time() if now is None else float(now)
@@ -610,4 +652,5 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
                           idle_mail_s=idle_mail_s, canons=canons)
     out += balance_low(db, listing, now, hours=balance_hours, min_usd=balance_min_usd,
                        window_s=balance_window_s)
+    out += backlog_empty(db, listing, now, idle_s=backlog_empty_s)
     return out
