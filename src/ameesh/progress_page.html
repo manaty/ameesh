@@ -115,6 +115,9 @@ ul.missing { color: var(--ink-2); font-size: .8rem; padding-left: 18px; margin: 
 .project:first-of-type { border-top: 0; padding-top: 0; }
 .project-name { font-weight: 600; }
 .warn { color: var(--warning); font-size: .82rem; margin-top: 3px; }
+.account { border-top: 1px solid var(--grid); padding: 8px 0; }
+.account:first-child { border-top: 0; }
+.subhead { font-size: .85rem; color: var(--ink-2); margin: 12px 0 4px; }
 .project.idle-project { opacity: .7; }
 footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
 </style>
@@ -159,6 +162,8 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
   <section aria-labelledby="h-budget">
     <h2 id="h-budget">Budget</h2>
     <div class="tiles" id="spend"></div>
+    <div id="real"></div>
+    <div id="accounts"></div>
     <div id="plans"></div>
     <div class="table-wrap" id="byagent"></div>
   </section>
@@ -416,32 +421,102 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
       + (ms.lots_total !== undefined ? " : " + ms.lots_merged + "/" + counted + " lots fusionnés" : "")));
   });
 
-  // Budget
+  // Budget (L95) : dépense payée au token et valeur des forfaits, jamais additionnées
   var B = D.budget, sp = document.getElementById("spend");
-  [["payé au token, 1 h", B.spend["1h"].paid_usd], ["payé au token, 24 h", B.spend["24h"].paid_usd],
-   ["plafond horaire", B.hourly_cap_usd], ["total estimé, fenêtre", B.spend.window.total_usd]]
+  function pv(b) { return b.plan_value_usd !== undefined ? b.plan_value_usd : 0; }
+  [["dépensé (payé au token), 1 h", B.spend["1h"].paid_usd],
+   ["dépensé (payé au token), 24 h", B.spend["24h"].paid_usd],
+   ["dépensé (payé au token), fenêtre", B.spend.window.paid_usd],
+   ["plafond horaire", B.hourly_cap_usd],
+   ["valeur consommée sur les forfaits, 24 h", pv(B.spend["24h"])],
+   ["valeur consommée sur les forfaits, fenêtre", pv(B.spend.window)]]
     .forEach(function (p) { var t = el("div", "tile"); t.appendChild(el("div", "v", usd(p[1]))); t.appendChild(el("div", "l", p[0])); sp.appendChild(t); });
-  var plans = document.getElementById("plans");
-  if (!B.plans.length) plans.appendChild(el("p", "empty", "Aucune jauge de forfait lue sur cet hôte."));
-  B.plans.forEach(function (p) {
-    var g = el("div", "gauge");
-    g.appendChild(el("div", "meta", "forfait " + p.harness + " " + p.key + " : " + Math.round(p.used * 100)
-      + " % utilisé, rythme " + Math.round(p.pace_cap * 100) + " %" + (p.exceeded ? " — dépassé" : "")
-      + (p.resets_ts ? " · remise à zéro " + hm(p.resets_ts) : "")));
-    var bar = el("div", "bar"), f = el("div", "fill" + (p.exceeded ? " over" : ""));
-    f.style.width = Math.min(100, p.used * 100) + "%"; bar.appendChild(f);
-    var cap = el("div", "cap"); cap.style.left = "calc(" + Math.min(100, p.pace_cap * 100) + "% - 1px)"; bar.appendChild(cap);
-    g.appendChild(bar); plans.appendChild(g);
+  sp.parentNode.insertBefore(el("p", "meta", "Les montants payés au token sont estimés tour par tour (barème × jetons) ; "
+    + "la valeur des forfaits est un équivalent au barème, qui ne coûte rien de plus par tour."), sp.nextSibling);
+
+  // Dépense réelle (soldes des fournisseurs) face à l'estimation
+  var realBox = document.getElementById("real"), PERIOD = {window: "fenêtre", "24h": "24 h"};
+  (B.real || []).forEach(function (r) {
+    var txt = "dépense réelle " + r.provider + " " + (PERIOD[r.period] || "") + " (soldes) : "
+      + r.real_spent.toFixed(2) + " " + r.currency;
+    if (r.estimated_usd !== null && r.estimated_usd !== undefined) txt += " · estimée " + usd(r.estimated_usd);
+    if (r.gap_usd !== null && r.gap_usd !== undefined) txt += " · écart " + (r.gap_usd >= 0 ? "+" : "") + r.gap_usd.toFixed(2) + " $";
+    if (r.topups) txt += " · recharge(s) " + r.topups.toFixed(2);
+    txt += " · relevés " + hm(r.start_ts) + " → " + hm(r.end_ts);
+    realBox.appendChild(el("div", r.alert ? "warn" : "meta", (r.alert ? "⚠ écart au-delà du seuil — " : "") + txt));
   });
+
+  function gaugeBar(label, used, capv, over) {
+    var g = el("div", "gauge");
+    g.appendChild(el("div", "meta", label));
+    var bar = el("div", "bar"), f = el("div", "fill" + (over ? " over" : ""));
+    f.style.width = Math.min(100, used * 100) + "%"; bar.appendChild(f);
+    var cap = el("div", "cap"); cap.style.left = "calc(" + Math.min(100, capv * 100) + "% - 1px)"; bar.appendChild(cap);
+    bar.setAttribute("role", "img");
+    bar.setAttribute("aria-label", Math.round(used * 100) + " % utilisé, rythme " + Math.round(capv * 100) + " %");
+    g.appendChild(bar);
+    return g;
+  }
+
+  // Comptes déclarés (L74) : toutes les fenêtres, capacité perdue, prochain choix
+  var accBox = document.getElementById("accounts"), covered = {};
+  if ((B.accounts || []).length) accBox.appendChild(el("div", "subhead", "Comptes des forfaits (hôte " + (D.host || "?") + ")"));
+  (B.accounts || []).forEach(function (a) {
+    covered[a.harness] = true;
+    var box = el("div", "account");
+    var head = el("div");
+    head.appendChild(el("strong", null, a.harness + " / " + a.account));
+    var flags = [];
+    if (a.active) flags.push(a.forced ? "actif (forcé)" : "actif");
+    if (a.next) flags.push("prochain choix");
+    if (!a.ok) flags.push("au seuil");
+    if (flags.length) head.appendChild(el("span", "meta", " — " + flags.join(" · ")));
+    box.appendChild(head);
+    if (!a.gauges.length) box.appendChild(el("div", "meta", "aucune jauge lue pour ce compte"));
+    a.gauges.forEach(function (g) {
+      var over = g.used >= g.pace_cap;
+      box.appendChild(gaugeBar(g.key + " : " + Math.round(g.used * 100) + " % utilisé, rythme " + Math.round(g.pace_cap * 100) + " %"
+        + (g.reset_passed ? " — remise à zéro passée (dernier relevé " + Math.round(g.last_used * 100) + " %)"
+           : (g.resets_ts ? " · remise à zéro " + hm(g.resets_ts) : "")), g.used, g.pace_cap, over));
+    });
+    if (a.losses.length) box.appendChild(el("div", "meta", "perdu à la remise à zéro si rien ne change : "
+      + a.losses.map(function (l) { return l.key + " " + Math.round(l.lost * 100) + " % dans " + dur(l.in_s); }).join(", ")));
+    if (a.reason) box.appendChild(el("div", "warn", a.reason));
+    if (a.next && a.why) box.appendChild(el("div", "meta", "prochain choix : " + a.why));
+    accBox.appendChild(box);
+  });
+
+  // Jauges des harnais sans comptes déclarés
+  var plans = document.getElementById("plans");
+  var rest = B.plans.filter(function (p) { return !covered[p.harness]; });
+  if (!rest.length && !(B.accounts || []).length) plans.appendChild(el("p", "empty", "Aucune jauge de forfait lue sur cet hôte."));
+  rest.forEach(function (p) {
+    plans.appendChild(gaugeBar("forfait " + p.harness + " " + p.key + " : " + Math.round(p.used * 100)
+      + " % utilisé, rythme " + Math.round(p.pace_cap * 100) + " %" + (p.exceeded ? " — dépassé" : "")
+      + (p.resets_ts ? " · remise à zéro " + hm(p.resets_ts) : ""), p.used, p.pace_cap, p.exceeded));
+  });
+
+  // Par agent : tours (échecs à part) et jetons d'entrée, de cache relu, de sortie
+  function tok(n) {
+    n = n || 0;
+    if (n >= 1e6) return (n / 1e6).toFixed(2).replace(".", ",") + " M";
+    if (n >= 1e4) return (n / 1e3).toFixed(1).replace(".", ",") + " k";
+    return String(n);
+  }
   if (B.by_agent.length) {
     var tb = el("table"), tr = el("tr");
-    ["agent", "harnais", "modèle", "tours", "USD", "jetons sortie"].forEach(function (h) { tr.appendChild(el("th", null, h)); });
+    ["agent", "harnais", "modèle", "tours", "en échec", "USD", "entrée", "cache relu", "sortie"].forEach(function (h) { tr.appendChild(el("th", null, h)); });
     tb.appendChild(tr);
     B.by_agent.forEach(function (r) {
       var x = el("tr");
-      x.appendChild(el("td", null, r.agent)); x.appendChild(el("td", null, r.harness + (r.paid ? " (payé)" : "")));
+      x.appendChild(el("td", null, r.agent));
+      x.appendChild(el("td", null, r.harness + (r.paid ? " (payé)" : " (forfait)")));
       x.appendChild(el("td", null, r.model || "—")); x.appendChild(el("td", "n", r.turns));
-      x.appendChild(el("td", "n", r.usd.toFixed(4))); x.appendChild(el("td", "n", r.output_tokens));
+      x.appendChild(el("td", "n", r.failed_turns || 0));
+      x.appendChild(el("td", "n", r.usd.toFixed(4)));
+      x.appendChild(el("td", "n", tok(r.fresh_input_tokens !== undefined ? r.fresh_input_tokens : r.input_tokens)));
+      x.appendChild(el("td", "n", tok(r.cached_input_tokens)));
+      x.appendChild(el("td", "n", tok(r.output_tokens)));
       tb.appendChild(x);
     });
     document.getElementById("byagent").appendChild(tb);

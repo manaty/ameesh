@@ -308,7 +308,8 @@ class Operations(interface.Operations):
         sql = ("SELECT id, agent, harness, turn, model, session, usd::float8 AS usd,"
                " input_tokens, cached_input_tokens, output_tokens,"
                " extract(epoch from recorded_at)::float8 AS recorded_ts"
-               " FROM turn_costs WHERE recorded_at >= now() - make_interval(secs => %s)")
+               " FROM turn_costs WHERE recorded_at >= now() - make_interval(secs => %s)"
+               " AND void_reason IS NULL")
         params: list = [float(since_s)]
         if agent:
             sql += " AND agent = %s"

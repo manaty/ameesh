@@ -56,7 +56,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    reap clear_session take_pending_prompt begin_turn
                    restore_prompt end_turn
    pending_spend   put set_model get clear
-   turn_costs      last_reading insert spent
+   turn_costs      last_reading insert spent ledger correct
    mailbox         send unread unread_urgent get mark_delivered reserve deliver release
                    unread_counts history pending_recipients
                    pending_recipients_sorted unread_total
@@ -457,6 +457,32 @@ class TurnCosts(Domain):
         """Somme des coûts des `seconds` dernières secondes (horloge de la
         base), de l'agent (`"all"` : tout le compte, comme `cost spent`), de
         ces harnais seulement si donnés, de ce compte seulement si donné (L30)."""
+
+    @abc.abstractmethod
+    def spent_between(self, from_ts: float, to_ts: float, *,
+                      harnesses: Sequence[str]) -> float:
+        """L95 : somme des coûts de ces harnais dont la ligne est écrite dans
+        ]from_ts, to_ts] (epoch) ; les lignes écartées (0043) ne comptent pas.
+        Sert à comparer l'estimation à la baisse réelle d'un solde sur le même
+        intervalle."""
+
+    @abc.abstractmethod
+    def ledger(self, *, since_ts: float | None = None) -> list[dict]:
+        """L95 : les lignes du grand livre (depuis `since_ts` si donné), dans
+        l'ordre d'écriture (`recorded_ts`, `id`) : id, agent, harness, turn,
+        model, session, account, usd, input_tokens, cached_input_tokens,
+        output_tokens, cum_*, recorded_ts, et `void_reason` (None si la
+        migration 0043 n'est pas passée). Lecture seule."""
+
+    @abc.abstractmethod
+    def correct(self, *, run_id: str, actor: str, corrections: Sequence[dict]) -> int:
+        """L95 (migration 0043) : applique des corrections en UNE transaction.
+        Chacune `{id, kind, reason, set}` ; `set` ne nomme que `usd`, `model`,
+        `input_tokens`, `cached_input_tokens`, `output_tokens` ou
+        `void_reason`. La copie complète de la ligne d'avant va d'abord au
+        journal `turn_cost_corrections`, puis la ligne est mise à jour ; une
+        ligne déjà écartée n'est pas touchée. Rien n'est supprimé. Rend le
+        nombre de lignes corrigées."""
 
 
 # --------------------------------------------------------------------------

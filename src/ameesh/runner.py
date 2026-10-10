@@ -1499,9 +1499,12 @@ class AgentWorker(threading.Thread):
             self._compta_en_echec = True
             return False
         try:
+            from . import accounts as accounts_mod
             book = cost_mod.CostBook(
                 state_dir=self.cfg.state_dir, db=self.db,
-                tools={self.name: self.agent.get("harness") or ""})
+                tools={self.name: self.agent.get("harness") or ""},
+                # L95 : le journal d'un fil Codex vit dans le dossier du compte
+                codex_homes=accounts_mod.homes(self.cfg, "codex"))
             # Le modèle **du tour** se relit dans les événements du tour, qui sont
             # sur disque : ni le marqueur (modèle du lancement, ou annonce non
             # persistée), ni la mémoire d'un worker mort ne font foi quand le flux

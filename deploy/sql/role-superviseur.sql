@@ -276,7 +276,15 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'cum_input_tokens', 'cum_cached_input_tokens', 'cum_output_tokens',
         'recorded_at', 'account',
         -- L60 (0041) : clé du marqueur comptable (agent, index, instant)
-        'spend_key'
+        'spend_key',
+        -- L95 (0043) : raison d'une ligne écartée des sommes
+        'void_reason'
+    ]),
+    -- corrections du grand livre (L95, 0043) : copie d'une ligne de
+    -- turn_costs et valeurs écrites, de l'ÉTAT comptable, aucun contenu
+    ('turn_cost_corrections', ARRAY[
+        'id', 'run_id', 'turn_cost_id', 'kind', 'reason', 'old_row', 'new_values',
+        'actor', 'at'
     ]),
     -- comptes multiples (L30, 0028) : des NOMS de comptes et l'état de bascule,
     -- jamais un profil (dossier, clé) : ceux-là restent sur l'hôte
