@@ -24,10 +24,14 @@ l'humain. Trois familles, trois règles :
   de l'hôte.
 * **Worktrees** : ceux qui APPARAISSENT pendant un tour (diff de `git
   worktree list` avant/après, sous-agents compris) sont enregistrés avec
-  l'agent, le tour et le lot. À la fin du lot (fusion ou fermeture), ils sont
-  retirés par `git worktree remove` (jamais forcé) s'ils sont propres et
-  que leur HEAD est sur le dépôt distant (ou intégré par rebase, `git
-  cherry`) ; sinon ils sont GARDÉS et signalés (`worktree_kept`) au
+  l'agent, le tour et le lot — s'ils sont sous le dossier de travail de
+  l'agent ; ceux d'ailleurs (un autre agent qui travaille sur le même dépôt)
+  sont suivis « non attribués » et jamais retirés (L73b). À la fin du lot
+  (fusion ou fermeture), ils sont retirés par `git worktree remove` (jamais
+  forcé) s'ils sont propres, non verrouillés, âgés d'au moins une heure,
+  sans tour en cours de leur agent ni processus dedans, et que leur HEAD est
+  INTÉGRÉ à la branche principale distante (ancêtre, rebase, fusion écrasée :
+  `git cherry`, `git merge-tree`) ; sinon GARDÉS et signalés (`worktree_kept`) au
   responsable.
 
 Ce qu'ameesh n'a pas créé n'est JAMAIS supprimé automatiquement : une entrée
@@ -67,6 +71,12 @@ DEFAULT_ORPHAN_MIN_SIZE = 50 * MIB   # entrée de /tmp signalée au-delà
 EVICT_MIN_AGE_S = 3600.0
 #: âge au-delà duquel un worktree SANS lot est retirable par `menage --apply`
 LOTLESS_TTL_S = 7 * 24 * 3600.0
+#: âge minimal d'un worktree retiré (secondes, depuis son enregistrement ET
+#: depuis la dernière modification de son dossier) : jamais un worktree neuf
+WORKTREE_MIN_AGE_S = 3600.0
+#: préfixe du détail d'un worktree apparu pendant un tour mais pas créé par
+#: l'agent du tour (L73b) : suivi pour être vu, jamais retiré automatiquement
+UNATTRIBUTED = "non attribué"
 #: borne d'un parcours de taille (fichiers) : au-delà, la taille est un minimum
 WALK_LIMIT = 300_000
 #: délai maximal d'une commande git (secondes)
@@ -488,7 +498,7 @@ def list_worktrees(cwd: str | None) -> list[dict]:
         key, _, value = line.partition(" ")
         if key == "worktree":
             current = {"path": os.path.abspath(value), "head": "", "branch": "",
-                       "detached": False, "bare": False}
+                       "detached": False, "bare": False, "locked": False}
         elif key == "HEAD":
             current["head"] = value
         elif key == "branch":
@@ -497,6 +507,8 @@ def list_worktrees(cwd: str | None) -> list[dict]:
             current["detached"] = True
         elif key == "bare":
             current["bare"] = True
+        elif key == "locked":
+            current["locked"] = True
     return out
 
 
@@ -507,14 +519,39 @@ def common_dir(cwd: str) -> str:
     return os.path.abspath(os.path.join(cwd, proc.stdout.strip()))
 
 
+def _default_remote_ref(path: str) -> str:
+    """Branche principale du dépôt distant (`origin/HEAD`, sinon `origin/main`,
+    sinon `origin/master`) ; vide si aucune n'existe."""
+    upstream = _git(["rev-parse", "--abbrev-ref", "origin/HEAD"], path)
+    candidates = []
+    if upstream is not None and upstream.returncode == 0 and upstream.stdout.strip() \
+            and upstream.stdout.strip() != "origin/HEAD":
+        candidates.append(upstream.stdout.strip())
+    candidates += ["origin/main", "origin/master"]
+    for ref in candidates:
+        found = _git(["rev-parse", "--verify", "--quiet", ref + "^{commit}"], path)
+        if found is not None and found.returncode == 0:
+            return ref
+    return ""
+
+
 def worktree_state(path: str) -> dict:
-    """État d'un worktree pour son retrait : `exists`, `clean`, `pushed`,
-    `head`, `reason` (pourquoi il ne peut pas être retiré, vide sinon)."""
+    """État d'un worktree pour son retrait : `exists`, `clean`, `pushed` (HEAD
+    sur une branche distante), `integrated` (HEAD contenu dans la branche
+    principale distante, ou intégré par rebase), `locked` (`git worktree
+    lock`), `head`, `reason` (pourquoi il ne peut pas être retiré, vide
+    sinon).
+
+    Seul `integrated` autorise un retrait : une branche poussée mais pas
+    fusionnée est du travail en cours (L73b)."""
     out = {"exists": os.path.isdir(path), "clean": False, "pushed": False,
-           "head": "", "reason": ""}
+           "integrated": False, "locked": False, "head": "", "reason": ""}
     if not out["exists"]:
         out["reason"] = "dossier disparu"
         return out
+    gitdir = _git(["rev-parse", "--absolute-git-dir"], path)
+    if gitdir is not None and gitdir.returncode == 0 and gitdir.stdout.strip():
+        out["locked"] = os.path.exists(os.path.join(gitdir.stdout.strip(), "locked"))
     status = _git(["status", "--porcelain", "--untracked-files=normal"], path)
     if status is None or status.returncode != 0:
         out["reason"] = "état git illisible"
@@ -524,24 +561,88 @@ def worktree_state(path: str) -> dict:
     head = _git(["rev-parse", "HEAD"], path)
     out["head"] = head.stdout.strip() if head is not None and head.returncode == 0 else ""
     remote = _git(["for-each-ref", "--contains", "HEAD", "--count=1", "refs/remotes"], path)
-    if remote is not None and remote.returncode == 0 and remote.stdout.strip():
-        out["pushed"] = True
-    else:
-        # Intégré par rebase : chaque commit propre a un équivalent sur la
-        # branche par défaut du dépôt distant (`git cherry` : lignes « - »).
-        upstream = _git(["rev-parse", "--abbrev-ref", "origin/HEAD"], path)
-        ref = upstream.stdout.strip() if upstream is not None and upstream.returncode == 0 \
-            else "origin/main"
-        cherry = _git(["cherry", ref, "HEAD"], path)
-        if cherry is not None and cherry.returncode == 0:
-            lines = [line for line in cherry.stdout.splitlines() if line.strip()]
-            out["pushed"] = all(line.startswith("-") for line in lines)
-    if dirty:
+    out["pushed"] = bool(remote is not None and remote.returncode == 0 and remote.stdout.strip())
+    ref = _default_remote_ref(path) if out["head"] else ""
+    if ref:
+        ancestor = _git(["merge-base", "--is-ancestor", "HEAD", ref], path)
+        if ancestor is not None and ancestor.returncode == 0:
+            out["integrated"] = True
+        else:
+            # Intégré par rebase : chaque commit propre a un équivalent sur la
+            # branche principale du dépôt distant (`git cherry` : lignes « - »).
+            cherry = _git(["cherry", ref, "HEAD"], path)
+            if cherry is not None and cherry.returncode == 0:
+                lines = [line for line in cherry.stdout.splitlines() if line.strip()]
+                out["integrated"] = all(line.startswith("-") for line in lines)
+        if not out["integrated"]:
+            # Fusion par écrasement (squash) : fusionner HEAD dans la branche
+            # principale ne changerait rien (`git merge-tree`, git ≥ 2.38).
+            merged = _git(["merge-tree", "--write-tree", ref, "HEAD"], path)
+            tree = _git(["rev-parse", ref + "^{tree}"], path)
+            if merged is not None and merged.returncode == 0 and tree is not None \
+                    and tree.returncode == 0 and merged.stdout.strip():
+                out["integrated"] = (merged.stdout.split()[0] == tree.stdout.strip())
+    if out["locked"]:
+        out["reason"] = "verrouillé (git worktree lock)"
+    elif dirty:
         out["reason"] = "%d fichier(s) modifié(s) ou non suivi(s)" % len(dirty)
-    elif not out["pushed"]:
-        out["reason"] = "commits non poussés (HEAD %s absent du dépôt distant)" % (
-            out["head"][:12] or "?")
+    elif not out["integrated"]:
+        out["reason"] = "HEAD %s non intégré à %s (%s)" % (
+            out["head"][:12] or "?", ref or "la branche principale distante",
+            "poussé mais non fusionné" if out["pushed"] else "commits non poussés")
     return out
+
+
+def _under(path: str, root: str) -> bool:
+    """`path` est `root` ou se trouve dessous (chemins absolus normalisés)."""
+    path, root = os.path.normpath(path), os.path.normpath(root)
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _real(path: str) -> str:
+    return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def owns_worktree(path: str, cwd: str | None, other_cwds) -> bool:
+    """Le worktree `path`, apparu pendant un tour lancé dans `cwd`, a-t-il été
+    créé par CET agent ? (L73b)
+
+    `git worktree list` couvre tout le dépôt : un worktree apparu pendant le
+    tour peut être celui d'un autre agent qui travaille en parallèle sur le
+    même dépôt. Critère retenu, le plus sûr dont on dispose sans trace du
+    processus créateur : le worktree est SOUS le dossier de travail de
+    l'agent (sous-agents, `.claude/worktrees/…`), et aucun autre agent n'a ce
+    même dossier ni un dossier plus proche du worktree. Dans le doute : non."""
+    if not cwd:
+        return False
+    mine, target = _real(cwd), _real(path)
+    if target == mine or not _under(target, mine):
+        return False
+    for other in other_cwds or ():
+        if not other:
+            continue
+        theirs = _real(other)
+        if theirs == mine or (_under(target, theirs) and _under(theirs, mine)):
+            return False
+    return True
+
+
+def worktree_in_use(path: str, proc_root: str = "/proc") -> bool:
+    """Un processus de l'hôte a-t-il son dossier courant dans ce worktree ?
+    (Linux ; faux si `/proc` est illisible.)"""
+    target = _real(path)
+    try:
+        pids = [p for p in os.listdir(proc_root) if p.isdigit()]
+    except OSError:
+        return False
+    for pid in pids:
+        try:
+            where = os.readlink(os.path.join(proc_root, pid, "cwd"))
+        except OSError:
+            continue
+        if _under(where.removesuffix(" (deleted)"), target):
+            return True
+    return False
 
 
 def remove_worktree(path: str, repo: str) -> tuple[bool, str]:
@@ -558,6 +659,16 @@ def remove_worktree(path: str, repo: str) -> tuple[bool, str]:
 def prune_worktrees(repo: str) -> None:
     if repo and os.path.isdir(repo):
         _git(["worktree", "prune"], repo)
+
+
+def _other_agent_cwds(db, agent: str):
+    """Dossiers de travail des AUTRES agents du registre ; False si le
+    registre est illisible (aucun worktree n'est alors attribué)."""
+    try:
+        return [row["cwd"] for row in storage.of(db).operations.listing()
+                if row.get("name") != agent and row.get("cwd")]
+    except Exception:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -625,21 +736,36 @@ class Turn:
         if policy.worktrees and self.cwd and db is not None:
             known_cwd = os.path.abspath(self.cwd)
             repo = ""
+            others = None  # dossiers des autres agents, lus au premier besoin
             for wt in list_worktrees(self.cwd):
                 if wt["path"] in self.worktrees_before or wt["path"] == known_cwd \
                         or wt.get("bare"):
                     continue
+                if others is None:
+                    others = _other_agent_cwds(db, self.agent)
+                # L73b : `git worktree list` couvre tout le dépôt ; un worktree
+                # d'un autre agent apparu pendant ce tour n'est pas à nous.
+                mine = others is not False and owns_worktree(wt["path"], self.cwd, others)
                 repo = repo or common_dir(self.cwd)
-                row = storage.of(db).housekeeping.register_worktree(
-                    host=host, path=wt["path"], repo=repo, agent=self.agent, lot=lot,
-                    turn_id=turn_id, branch=wt.get("branch") or "", head=wt.get("head") or "")
-                if row is not None:
-                    self.entries.append({
-                        "kind": "worktree", "action": "registered", "path": wt["path"],
-                        "agent": self.agent, "lot": lot,
-                        "detail": "apparu pendant le tour %s (%s) ; retiré à la fin du lot "
-                                  "s'il est propre et poussé"
-                                  % (turn_id[:8], wt.get("branch") or "détaché")})
+                hk = storage.of(db).housekeeping
+                row = hk.register_worktree(
+                    host=host, path=wt["path"], repo=repo, agent=self.agent,
+                    lot=lot if mine else None, turn_id=turn_id,
+                    branch=wt.get("branch") or "", head=wt.get("head") or "")
+                if row is None:
+                    continue
+                if mine:
+                    detail = ("apparu pendant le tour %s (%s) ; retiré à la fin du lot s'il "
+                              "est propre et intégré à la branche principale"
+                              % (turn_id[:8], wt.get("branch") or "détaché"))
+                else:
+                    detail = ("%s : apparu pendant le tour %s (%s) hors du dossier de "
+                              "l'agent ; jamais retiré automatiquement"
+                              % (UNATTRIBUTED, turn_id[:8], wt.get("branch") or "détaché"))
+                    hk.set_worktree_status(row["id"], "active", detail)
+                self.entries.append({
+                    "kind": "worktree", "action": "registered", "path": wt["path"],
+                    "agent": self.agent, "lot": lot if mine else None, "detail": detail})
         exclude = tuple(v for v in (self.env.get("TMPDIR"), self.env.get("AMEESH_CACHE_DIR"))
                         if v)
         for found in new_tmp_entries(self.tmp_before, min_size=policy.orphan_min_size,
@@ -695,14 +821,44 @@ def _lot_state(db, lot) -> str | None:
     return row.get("state") if row else None
 
 
+def _mtime(path: str) -> float | None:
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
 def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
-                   protected: set[str], now: float) -> tuple[list[dict], list[dict]]:
-    """Fin de lot des worktrees suivis : (lignes du journal, plan lisible)."""
+                   protected: set[str], now: float,
+                   running: set | None = None) -> tuple[list[dict], list[dict]]:
+    """Fin de lot des worktrees suivis : (lignes du journal, plan lisible).
+
+    Garde-fous (L73b) avant tout retrait : worktree attribué à l'agent du
+    tour (jamais un worktree « non attribué »), pas le dossier de travail
+    d'un agent ni un dossier qui en contient un, agent propriétaire sans tour
+    en cours (`running`), au moins `WORKTREE_MIN_AGE_S` depuis son
+    enregistrement et depuis la dernière modification de son dossier, non
+    verrouillé, aucun processus dedans, propre, et HEAD INTÉGRÉ à la branche
+    principale distante (poussé ne suffit pas)."""
     entries: list[dict] = []
     plan: list[dict] = []
+    running = set(running or ())
     store = storage.of(db).housekeeping
     for row in store.worktrees(host, ("active", "kept")):
         path, lot = row["path"], row.get("lot")
+        base = {"kind": "worktree", "path": path, "agent": row["agent"], "lot": lot}
+        if (row.get("detail") or "").startswith(UNATTRIBUTED):
+            if not os.path.isdir(path):
+                plan.append(dict(base, action="disparu", detail=UNATTRIBUTED))
+                if not dry_run:
+                    prune_worktrees(row.get("repo") or "")
+                    store.set_worktree_status(row["id"], "gone",
+                                              "dossier disparu (%s)" % UNATTRIBUTED)
+                    entries.append(dict(base, action="gone", detail="dossier disparu ; "
+                                        "git worktree prune (%s)" % UNATTRIBUTED))
+            else:
+                plan.append(dict(base, action="garde", detail=row.get("detail")))
+            continue
         state = _lot_state(db, lot) if lot else None
         ended = state in LOT_ENDED
         lotless_due = (include_lotless and not lot
@@ -713,12 +869,21 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
                          if lot else "sans lot"})
             continue
         why = ("lot #%s %s" % (lot, state)) if ended else "sans lot depuis plus de 7 j"
-        if os.path.abspath(path) in protected:
-            plan.append({"path": path, "agent": row["agent"], "lot": lot, "action": "garde",
-                         "detail": "dossier de travail d'un agent"})
+        target = _real(path)
+        if any(_under(_real(cwd), target) for cwd in protected):
+            plan.append(dict(base, action="garde", detail="dossier de travail d'un agent"))
+            continue
+        if row["agent"] in running:
+            plan.append(dict(base, action="attend",
+                             detail="%s ; tour en cours de %s" % (why, row["agent"])))
+            continue
+        moments = [float(row.get("created_ts") or now), _mtime(path)]
+        youngest = max(m for m in moments if m is not None)
+        if now - youngest < WORKTREE_MIN_AGE_S:
+            plan.append(dict(base, action="attend",
+                             detail="%s ; créé ou modifié il y a moins d'une heure" % why))
             continue
         st = worktree_state(path)
-        base = {"kind": "worktree", "path": path, "agent": row["agent"], "lot": lot}
         if not st["exists"]:
             plan.append(dict(base, action="disparu", detail=why))
             if not dry_run:
@@ -727,7 +892,14 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
                 entries.append(dict(base, action="gone", detail="dossier disparu ; "
                                     "git worktree prune (%s)" % why))
             continue
-        if not st["clean"] or not st["pushed"]:
+        if st["locked"]:
+            plan.append(dict(base, action="garde", detail="%s ; %s" % (why, st["reason"])))
+            continue
+        if worktree_in_use(path):
+            plan.append(dict(base, action="attend",
+                             detail="%s ; un processus travaille dedans" % why))
+            continue
+        if not st["clean"] or not st["integrated"]:
             detail = "%s : gardé — %s" % (why, st["reason"])
             plan.append(dict(base, action="garde", detail=detail))
             if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
@@ -744,7 +916,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
         if ok:
             store.set_worktree_status(row["id"], "removed", why)
             entries.append(dict(base, action="removed", bytes=size,
-                                detail="%s : propre et poussé, git worktree remove" % why))
+                                detail="%s : propre et intégré, git worktree remove" % why))
         else:
             detail = "%s : retrait refusé par git — %s" % (why, error)
             store.set_worktree_status(row["id"], "kept", detail)
@@ -832,7 +1004,7 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     * caches partagés : éviction jusqu'au quota, seulement si aucun tour ne
       tourne (`busy` faux) ;
     * worktrees suivis dont le lot est fini : retirés s'ils sont propres et
-      poussés, sinon gardés et signalés ;
+      intégrés (garde-fous de `_worktree_pass`), sinon gardés et signalés ;
     * bilan (`mesure`) et signalements de /tmp récents (rien n'y est touché).
 
     `dry_run` : rien n'est supprimé ni écrit en base ; le plan est rendu."""
@@ -847,11 +1019,14 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     troot, croot = tmp_root(cfg, policy), cache_root(cfg, policy)
     registered: set[str] = set()
     protected: set[str] = set()
+    running: set[str] = set(agents_in_turn)
     try:
         for row in storage.of(db).operations.listing():
             registered.add(row["name"])
             if row.get("cwd"):
                 protected.add(os.path.abspath(os.path.expanduser(row["cwd"])))
+            if row.get("status") == "running" and row.get("lease_live"):
+                running.add(row["name"])
     except Exception:  # registre illisible : on ne supprime aucun dossier d'agent
         registered = None  # type: ignore[assignment]
     # 1. dossiers temporaires des agents
@@ -905,10 +1080,13 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
         if result["over_quota"]:
             skipped.append("caches : quota encore dépassé (fichiers de moins d'une heure)")
     # 3. worktrees
-    if policy.worktrees:
+    if policy.worktrees and registered is None:
+        # sans registre, ni dossiers d'agents ni tours en cours connus
+        skipped.append("worktrees : registre illisible, aucun retrait")
+    elif policy.worktrees:
         wt_entries, wt_plan = _worktree_pass(db, host, dry_run=dry_run,
                                              include_lotless=include_lotless,
-                                             protected=protected, now=now)
+                                             protected=protected, now=now, running=running)
         entries += wt_entries
         plan += wt_plan
     # 4. conteneurs : ceux des tours d'ameesh finis supprimés, autres signalés
