@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sys
 import time
 
 from . import storage
@@ -45,8 +46,29 @@ CRITICAL_DISK_FACTOR = 0.5     # disque libre <= la moitié du plancher
 CRITICAL_SWAP_FACTOR = 2.0     # swap >= le double du plafond
 CRITICAL_LOAD_FACTOR = 2.0     # charge >= le double du plafond
 
+#: L106 : alimentation d'un portable. Sur batterie, sous `min_battery_percent`
+#: aucun NOUVEAU tour ne part (alerte `host_power_low`) ; sous
+#: `stop_battery_percent`, l'exécuteur s'arrête proprement (tours finis ou
+#: arrêtés au point sûr, consignes remises en attente, baux rendus) ; au retour
+#: du secteur, il reprend seul.
+#:
+#: 25 % : un tour dure jusqu'à 15 min (`session_max_turn_seconds`) et une
+#: dizaine d'agents vident une batterie de portable en moins d'une heure
+#: (2026-10-10 : débranché à 11:06, « batterie faible » à 11:56, coupure à
+#: 12:10) — les tours en cours doivent pouvoir finir avant le seuil d'arrêt.
+#: 10 % : au-dessus des seuils d'UPower (critique 5 %, action 2 %), qui
+#: mettent l'hôte en veille ou l'éteignent sans attendre personne ; il reste
+#: quelques minutes pour l'arrêt propre (`power_stop_grace`, 120 s).
+DEFAULT_MIN_BATTERY_PERCENT = 25.0
+DEFAULT_STOP_BATTERY_PERCENT = 10.0
+POWER_KEYS = ("min_battery_percent", "stop_battery_percent")
+
 #: clés de seuil reconnues dans `policy.resources` (liste fermée)
-THRESHOLD_KEYS = ("min_mem_available", "max_swap_used", "max_load", "min_disk_free")
+THRESHOLD_KEYS = ("min_mem_available", "max_swap_used", "max_load", "min_disk_free",
+                  *POWER_KEYS)
+#: dossier des sources d'alimentation (Linux) ; surchargé par les tests
+POWER_SUPPLY_ENV = "AMEESH_POWER_SUPPLY_DIR"
+POWER_SUPPLY_DIR = "/sys/class/power_supply"
 
 #: horizon de conservation des relevés (secondes) ; l'historique court de
 #: `ameesh hosts` n'a pas besoin de plus, et la table ne grandit pas sans fin.
@@ -96,6 +118,100 @@ def _as_float(value) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def parse_percent(value) -> float | None:
+    """Un pourcentage de 0 à 100 (« 25 », 25, « 25% »), ou None."""
+    if isinstance(value, str):
+        value = value.strip().rstrip("%").strip()
+    number = _as_float(value)
+    if number is None or not 0.0 <= number <= 100.0:
+        return None
+    return number
+
+
+def boot_time(path: str = "/proc/stat") -> float | None:
+    """Instant du démarrage de l'hôte (epoch), ou None hors Linux (L106)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("btime "):
+                    return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _read(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def power(base: str | None = None) -> dict:
+    """Alimentation de l'hôte (L106) : `on_ac` (secteur), `battery_percent`.
+
+    Linux : `/sys/class/power_supply` — secteur (`Mains`, `USB*`, champ
+    `online`) et batteries du SYSTÈME (`scope` ≠ `Device` : pas la souris),
+    pourcentage pondéré par la capacité quand plusieurs batteries. Sans
+    source de secteur déclarée, l'état de charge des batteries tranche
+    (`Discharging` = sur batterie). Ailleurs, ou illisible : None (« inconnu ») —
+    on ne devine pas, et aucune garde ne se déclenche sur un inconnu. Un
+    autre système se branchera ici (pas de couche plateforme pour l'instant).
+    """
+    out: dict = {"on_ac": None, "battery_percent": None}
+    base = base or os.environ.get(POWER_SUPPLY_ENV) or POWER_SUPPLY_DIR
+    if not sys.platform.startswith("linux") and base == POWER_SUPPLY_DIR:
+        return out
+    try:
+        names = sorted(os.listdir(base))
+    except OSError:
+        return out
+    mains: list[bool] = []
+    batteries: list[tuple[float, float, str]] = []  # (pourcentage, poids, état)
+    for name in names:
+        root = os.path.join(base, name)
+        kind = (_read(os.path.join(root, "type")) or "").lower()
+        if kind in ("mains", "usb", "usb_c", "usb_pd", "usb_pd_drp", "wireless"):
+            online = _read(os.path.join(root, "online"))
+            if online in ("0", "1", "2"):
+                mains.append(online != "0")
+        elif kind == "battery":
+            if (_read(os.path.join(root, "scope")) or "").lower() == "device":
+                continue
+            if _read(os.path.join(root, "present")) == "0":
+                continue
+            percent = parse_percent(_read(os.path.join(root, "capacity")))
+            poids = 1.0
+            for now_key, full_key in (("energy_now", "energy_full"),
+                                      ("charge_now", "charge_full")):
+                now_v = _as_float(_read(os.path.join(root, now_key)))
+                full_v = _as_float(_read(os.path.join(root, full_key)))
+                if now_v is not None and full_v:
+                    if percent is None:
+                        percent = max(0.0, min(100.0, 100.0 * now_v / full_v))
+                    poids = full_v
+                    break
+            if percent is None:
+                continue
+            etat = (_read(os.path.join(root, "status")) or "").lower()
+            batteries.append((percent, poids, etat))
+    if batteries:
+        total = sum(b[1] for b in batteries) or 1.0
+        out["battery_percent"] = round(sum(b[0] * b[1] for b in batteries) / total, 1)
+    if any(mains):
+        out["on_ac"] = True
+    elif mains:
+        out["on_ac"] = False
+    elif batteries:
+        etats = {b[2] for b in batteries}
+        if "discharging" in etats:
+            out["on_ac"] = False
+        elif etats & {"charging", "full", "not charging"}:
+            out["on_ac"] = True
+    return out
 
 
 def _meminfo(path: str = "/proc/meminfo") -> dict[str, int]:
@@ -167,6 +283,7 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
         "turns_in_progress": turns_in_progress,
     }
     out.update(_meminfo())
+    out.update(power())
     return out
 
 
@@ -221,18 +338,22 @@ def thresholds(policy=None) -> dict:
     swap = parse_bytes(raw.get("max_swap_used"))
     disk = parse_bytes(raw.get("min_disk_free"))
     load = _as_float(raw.get("max_load"))
+    low = parse_percent(raw.get("min_battery_percent"))
+    stop = parse_percent(raw.get("stop_battery_percent"))
     cpus = cpu_count() or 1
     return {
         "min_mem_available": DEFAULT_MIN_MEM_AVAILABLE if mem is None else mem,
         "max_swap_used": DEFAULT_MAX_SWAP_USED if swap is None else swap,
         "max_load": (DEFAULT_MAX_LOAD_FACTOR * cpus) if load is None else load,
         "min_disk_free": DEFAULT_MIN_DISK_FREE if disk is None else disk,
+        "min_battery_percent": DEFAULT_MIN_BATTERY_PERCENT if low is None else low,
+        "stop_battery_percent": DEFAULT_STOP_BATTERY_PERCENT if stop is None else stop,
     }
 
 
 #: L43 (0031) : seuils PLANCHERS (plus strict = plus haut) ; les autres sont
 #: des plafonds (plus strict = plus bas)
-FLOOR_KEYS = ("min_mem_available", "min_disk_free")
+FLOOR_KEYS = ("min_mem_available", "min_disk_free", *POWER_KEYS)
 #: provenance d'une limite qu'aucune fiche Host ne déclare
 DEFAULT_ORIGIN = "défaut"
 
@@ -246,7 +367,12 @@ def declared(policy) -> dict:
         return {}
     out: dict = {}
     for key in THRESHOLD_KEYS:
-        value = _as_float(raw.get(key)) if key == "max_load" else parse_bytes(raw.get(key))
+        if key == "max_load":
+            value = _as_float(raw.get(key))
+        elif key in POWER_KEYS:
+            value = parse_percent(raw.get(key))
+        else:
+            value = parse_bytes(raw.get(key))
         if value is not None:
             out[key] = value
     return out
@@ -326,7 +452,33 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
             limits["max_load"], CRITICAL_LOAD_FACTOR)
     floor("min_disk_free", "disque libre", reading.get("disk_free_bytes"),
           limits["min_disk_free"], CRITICAL_DISK_FACTOR)
+    etat = power_state(reading, limits)
+    if etat["state"] in ("low", "stop"):
+        # L106 : jamais `critical` — la pause des agents peu prioritaires ne
+        # sert à rien ici ; l'arrêt propre (`stop`) est l'affaire de l'exécuteur
+        out.append({"key": "min_battery_percent", "label": "batterie (sur batterie)",
+                    "value": etat["battery_percent"], "limit": etat["min"],
+                    "critical": False, "power": etat["state"]})
     out.sort(key=lambda b: (not b["critical"], b["key"]))
+    return out
+
+
+def power_state(reading: dict | None, limits: dict | None = None) -> dict:
+    """État d'alimentation (L106) : `ok`, `low` (sur batterie sous le seuil :
+    plus de nouveau tour), `stop` (sous le seuil d'arrêt : arrêt propre), ou
+    `unknown` (pas de mesure : aucune garde)."""
+    reading = reading or {}
+    limits = limits or thresholds(None)
+    low = float(limits.get("min_battery_percent", DEFAULT_MIN_BATTERY_PERCENT))
+    stop = float(limits.get("stop_battery_percent", DEFAULT_STOP_BATTERY_PERCENT))
+    on_ac, percent = reading.get("on_ac"), reading.get("battery_percent")
+    out = {"on_ac": on_ac, "battery_percent": percent, "min": low, "stop": stop}
+    if on_ac is None and percent is None:
+        out["state"] = "unknown"
+    elif on_ac is False and percent is not None and float(percent) < low:
+        out["state"] = "stop" if float(percent) <= stop else "low"
+    else:
+        out["state"] = "ok"
     return out
 
 
@@ -346,6 +498,7 @@ def pressure(reading: dict, policy=None, *, limits: dict | None = None) -> dict:
         "breaches": found,
         "blocked": bool(found),
         "critical": any(b["critical"] for b in found),
+        "power": power_state(reading, limits),
     }
 
 

@@ -63,7 +63,7 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 #: il est accepté ici sans dépendre de son code (un type absent n'est jamais
 #: levé, c'est tout).
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
-                 "delegation_expired")
+                 "delegation_expired", "host_not_ready", "host_power_low")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -97,6 +97,8 @@ TYPE_LABELS = {
     "stale_lot": "lot stagnant",
     "host_pressure": "hôte sous pression",
     "orphan_resource": "ressource orpheline",
+    "host_not_ready": "hôte non prêt",
+    "host_power_low": "batterie faible de l'hôte",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired")
@@ -395,7 +397,9 @@ def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
     elif raised_ts:
         lines.append("constatée le %s" % local_time(raised_ts))
     title, body = _readable(title, "\n".join(lines), detail)
-    return Message(title, body, urgent=kind in URGENT_TYPES)
+    # L106 : une alerte peut se dire urgente elle-même (`host_power_low` au
+    # seuil d'arrêt), au-delà des types toujours urgents
+    return Message(title, body, urgent=kind in URGENT_TYPES or bool(alert.get("urgent")))
 
 
 def render_summary(bucket: dict, host: str) -> Message:

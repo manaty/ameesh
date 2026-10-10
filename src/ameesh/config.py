@@ -183,6 +183,15 @@ class Config:
     failure_backoff_max: float = 300.0
     fast_failure_s: float = 60.0
     max_fast_failures: int = 5
+    #: L106 : binaires des harnais choisis par l'hôte (`{"claude": "/chemin"}`),
+    #: après `AMEESH_<HARNAIS>_BIN` et avant le PATH (`adapters.resolve_harness`)
+    harness_bins: dict = field(default_factory=dict)
+    #: L106 : hôte non prêt (binaire, interpréteur introuvable) — attente
+    #: maximale entre deux essais (doublée à chaque échec, de 15 s à cette borne)
+    host_retry_max: float = 300.0
+    #: L106 : arrêt propre sur batterie critique — délai laissé aux tours en
+    #: cours pour finir avant d'être arrêtés (SIGTERM, consigne remise en attente)
+    power_stop_grace: float = 120.0
     #: politique de session par défaut d'un agent sans réglage (0025, L26) :
     #: `par-lot` (rotation au changement de lot, plus la rotation sur la
     #: taille), `taille` (rotation sur la taille seulement), `jamais`
@@ -412,6 +421,8 @@ def load(env: dict | None = None) -> Config:
         fast_failure_s=_as_float(pick("AMEESH_FAST_FAILURE_S"), cfg.fast_failure_s),
         max_fast_failures=int(_as_float(pick("AMEESH_MAX_FAST_FAILURES"),
                                         cfg.max_fast_failures)),
+        host_retry_max=_as_float(pick("AMEESH_HOST_RETRY_MAX"), cfg.host_retry_max),
+        power_stop_grace=_as_float(pick("AMEESH_POWER_STOP_GRACE"), cfg.power_stop_grace),
         session_policy=str(pick("AMEESH_SESSION_POLICY", default=cfg.session_policy)
                            or "par-lot").strip(),
         balance_interval=_as_float(pick("AMEESH_BALANCE_INTERVAL"), cfg.balance_interval),
@@ -494,6 +505,10 @@ def load(env: dict | None = None) -> Config:
     if cfg.session_policy not in SESSION_POLICIES:
         raise SystemExit("AMEESH_SESSION_POLICY invalide : %r (%s)"
                          % (cfg.session_policy, " | ".join(SESSION_POLICIES)))
+    if not isinstance(cfg.harness_bins, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) and v.strip()
+            for k, v in cfg.harness_bins.items()):
+        raise SystemExit("config illisible : `harness_bins` attend {harnais: chemin}")
     if cfg.driver not in ("auto", "psycopg", "psql"):
         raise SystemExit("AGENT_MESH_DRIVER invalide : %r" % cfg.driver)
     if cfg.backend not in ("auto", "pg", "file"):

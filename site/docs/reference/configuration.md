@@ -43,7 +43,11 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_SESSION_MIN_TURNS` | `session_min_turns` | 3 | minimum turns before a rotation |
 | `AMEESH_FAST_FAILURE_S` | `fast_failure_s` | 60 s | a failed turn shorter than this counts as a fast failure (1.4.1) |
 | `AMEESH_FAILURE_BACKOFF_MAX` | `failure_backoff_max` | 300 s | wait between failed turns doubles from 5 s up to this |
-| `AMEESH_MAX_FAST_FAILURES` | `max_fast_failures` | 5 | consecutive fast failures after which the runner stops the agent (`stop_reason` `erreur`) |
+| `AMEESH_MAX_FAST_FAILURES` | `max_fast_failures` | 5 | consecutive fast failures after which the runner stops the agent (`stop_reason` `erreur`); host errors (harness or interpreter not found, database unreachable, missing working directory) never count |
+| `AMEESH_<HARNESS>_BIN` | `harness_bins` | — | harness binary (`{"claude": "/path"}` in the file); then `AMEESH_BIN_DIR`, `PATH`, the systemd user manager `PATH`, known locations (mise, `~/.local/bin`, npx cache) |
+| `AMEESH_HARNESS_SEARCH` | — | known locations | directories searched after `PATH` (`:`-separated, globs allowed); empty disables every fallback |
+| `AMEESH_HOST_RETRY_MAX` | `host_retry_max` | 300 s | "host not ready": the wait between two attempts doubles from 15 s up to this; the agent resumes by itself |
+| `AMEESH_POWER_STOP_GRACE` | `power_stop_grace` | 120 s | on critical battery, time left to running turns before a clean stop |
 | `AMEESH_WORKTREE_ROOTS` | `worktree_roots` | `~/development` | where to look for a moved working directory |
 | `AMEESH_BUDGET_USD_PER_HOUR` | `budget_usd_per_hour` | 10 | hourly cap of pay-per-token usage, summed over all pay-per-token agents; it pauses only those agents, never a subscription agent (0 disables the guard) |
 | `AMEESH_BUDGET_CHECK_INTERVAL` | `budget_check_interval` | 30 s | cadence of budget status updates |

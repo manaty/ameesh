@@ -78,6 +78,7 @@ class Operations(interface.Operations):
                    r.session_policy, r.context_max_tokens, r.session_id, r.session_work_item,
                    r.status, r.status_text, r.current_prompt, r.lease_owner,
                    r.mode, r.stop_reason, r.responsible,
+                   r.last_error,  -- L106 : le détail de « hôte non prêt »
                    (r.pending_prompt IS NOT NULL) AS has_pending_prompt,
                    (r.lease_owner IS NOT NULL
                     AND r.lease_expires_at > clock_timestamp()) AS lease_live,

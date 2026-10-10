@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# ameesh — exécuteur d'UN agent, service UTILISATEUR (modèle : %i = l'agent).
+# Une instance par agent mené sur l'hôte, y compris un agent tenu en
+# `ameesh attach` : si la session interactive meurt (coupure, terminal tué),
+# c'est cette unité qui reprend la même session (L106).
+#
+# Installation :
+#   install -m 0644 'deploy/systemd/ameesh-runner-agent@.service' ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ameesh-runner-agent@<agent>
+#   journalctl --user -u ameesh-runner-agent@<agent> -f
+#   ameesh doctor --harness        # binaires résolus, unités manquantes
+#
+# PATH (L106) : une unité utilisateur peut démarrer AVANT que la session
+# n'importe son PATH dans le gestionnaire systemd (2026-10-10 : `claude`
+# introuvable, `node` absent pour dsh, au redémarrage après une coupure). Le
+# PATH est donc posé ici, explicitement : shims mise, ~/.local/bin, système.
+# Un hôte qui installe ses harnais ailleurs le complète dans
+# ~/.config/ameesh/env (PATH=… en entier : systemd n'y développe pas $PATH),
+# ou nomme ses binaires (`harness_bins` de config.json, AMEESH_<HARNAIS>_BIN).
+# L'exécuteur cherche de toute façon, après le PATH : le PATH du gestionnaire
+# systemd (relu à chaque essai), puis les emplacements connus (installations
+# mise, ~/.local/bin, cache npx) — et journalise le chemin absolu retenu.
+
+[Unit]
+Description=ameesh — exécuteur de l'agent %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
+# AMEESH_DSN, AMEESH_HOST, AMEESH_CANON… ; peut redéfinir PATH (facultatif)
+EnvironmentFile=-%h/.config/ameesh/env
+ExecStart=%h/.local/share/ameesh/venv/bin/ameesh run --agents %i --runner-id runner-%i@%H
+# Une base pas encore là au démarrage n'est plus une sortie en échec (L106,
+# attente croissante) ; une sortie anormale relance l'exécuteur.
+Restart=on-failure
+RestartSec=30
+# arrêt propre : SIGTERM, tours arrêtés au point sûr, consignes remises en
+# attente, baux rendus (l'exécuteur s'en charge en moins de 15 s)
+TimeoutStopSec=30
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

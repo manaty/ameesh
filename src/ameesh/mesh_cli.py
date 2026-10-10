@@ -287,14 +287,29 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                      _fmt_bytes(latest.get("disk_free_bytes")),
                      latest.get("turns_in_progress")
                      if latest.get("turns_in_progress") is not None else "—"))
+            if latest.get("on_ac") is not None or latest.get("battery_percent") is not None:
+                # L106 : alimentation d'un portable
+                print("  alimentation %s%s ; seuils batterie %s %% (plus de tour), %s %% "
+                      "(arrêt)" % (
+                          "secteur" if latest.get("on_ac") else
+                          "batterie" if latest.get("on_ac") is False else "inconnue",
+                          " %s %%" % latest["battery_percent"]
+                          if latest.get("battery_percent") is not None else "",
+                          limits.get("min_battery_percent"),
+                          limits.get("stop_battery_percent")))
+
+            def valeur(key, value):
+                if key == "max_load":
+                    return "%.2f" % value
+                if key in res.POWER_KEYS:
+                    return "%s %%" % value
+                return _fmt_bytes(value)
+
             if verdict and verdict["breaches"]:
                 tag = "CRITIQUE" if verdict["critical"] else "PRESSION"
                 detail = " ; ".join(
-                    "%s %s (seuil %s)" % (b["label"],
-                                          _fmt_bytes(b["value"]) if b["key"] != "max_load"
-                                          else "%.2f" % b["value"],
-                                          _fmt_bytes(b["limit"]) if b["key"] != "max_load"
-                                          else "%.2f" % b["limit"])
+                    "%s %s (seuil %s)" % (b["label"], valeur(b["key"], b["value"]),
+                                          valeur(b["key"], b["limit"]))
                     for b in verdict["breaches"])
                 print("  %s  %s" % (tag, detail))
             else:
@@ -973,7 +988,8 @@ def cmd_migrate(cfg: Config, _args: argparse.Namespace) -> int:
 
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
     from . import cli
-    return cli.cmd_doctor(cfg, notify_test=args.notify_test, probe=args.probe)
+    return cli.cmd_doctor(cfg, notify_test=args.notify_test, probe=args.probe,
+                          harness=getattr(args, "harness", False))
 
 
 # --------------------------------------------------------------------------
@@ -1484,6 +1500,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--notify-test", action="store_true")
     p_doc.add_argument("--probe", action="store_true",
                        help="sonde légère : base, schéma, migrations à jour ; rien d'autre")
+    p_doc.add_argument("--harness", action="store_true",
+                       help="binaires des harnais servis par l'hôte (chemin, provenance, "
+                            "interpréteur) et unités d'exécuteur (L106)")
     p_doc.set_defaults(func=cmd_doctor)
 
     from . import canon_cli

@@ -415,7 +415,10 @@ Description=ameesh — exécuteur de l'hôte (un par machine)
 After=network-online.target
 
 [Service]
-EnvironmentFile=%h/.config/ameesh/env        # AMEESH_HOST, AMEESH_CANON, AMEESH_APPROVE_*
+# L106 : PATH explicite — l'unité peut démarrer avant que la session n'importe
+# le sien (shims et installations mise, node pour dsh)
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/ameesh/env        # AMEESH_HOST, AMEESH_CANON, AMEESH_APPROVE_* (PATH=… possible)
 ExecStartPre=-%h/.local/share/ameesh/venv/bin/ameesh canon sync --fetch
 ExecStart=%h/.local/share/ameesh/venv/bin/agent-runner --poll 5
 Restart=always
@@ -428,6 +431,19 @@ WantedBy=default.target
 ```bash
 systemctl --user daemon-reload && systemctl --user enable --now agent-runner
 journalctl --user -u agent-runner -f
+ameesh doctor --harness     # L106 : binaires résolus (chemin, provenance), unités manquantes
+```
+
+**Un exécuteur par agent** (la forme retenue sur le poste) : le modèle
+`deploy/systemd/ameesh-runner-agent@.service` (même PATH explicite), une
+instance par agent mené — **y compris un agent tenu en `ameesh attach`** :
+si la session interactive meurt, c'est son exécuteur qui reprend la même
+session (L106). `ameesh doctor` signale un agent mené sans unité activée.
+
+```bash
+install -m 0644 'deploy/systemd/ameesh-runner-agent@.service' ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ameesh-runner-agent@<agent>
 ```
 
 Après chaque PR fusionnée au canon : `ameesh canon sync --fetch` sur chaque

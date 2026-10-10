@@ -131,7 +131,37 @@ bytes or with a unit such as `1GiB`), else prudent defaults.
   turn.
 - A resource of a turn that survives it (process group, container labelled
   `ameesh.turn`/`ameesh.agent`) is reported (`orphan_resource`), never
-  removed.
+  removed. Resources opened before the host's last boot are reported as soon
+  as the runner starts.
+- **Laptop power** (L106): the reading includes mains and battery
+  (`/sys/class/power_supply` on Linux, "unknown" elsewhere). On battery, below
+  `min_battery_percent` (25 by default) no new turn starts (`host_power_low`
+  alert); below `stop_battery_percent` (10) the runner stops cleanly — running
+  turns get `AMEESH_POWER_STOP_GRACE` (120 s) to finish, then are stopped at a
+  safe point, prompts go back to the queue, leases are released (urgent
+  alert). When mains power returns, the runner claims its agents again by
+  itself. Agents meant to be always available belong on a server.
+
+## Host not ready
+
+A harness binary or interpreter that cannot be found (a user unit started
+before the session imported its `PATH`, `node` missing for `dsh`), a harness
+that could not execute (exit 126/127 without output), an unreachable database
+(also at startup) or a missing working directory are **host** errors, not
+agent failures: the agent shows `blocked` "hôte non prêt", the prompt and mail
+wait, the fast-failure series does not move, the agent is never stopped. The
+runner retries (15 s, doubling up to `AMEESH_HOST_RETRY_MAX`) and resumes by
+itself; `host_not_ready` alerts the agent's responsible. Binaries are resolved
+from `AMEESH_<HARNESS>_BIN`, `harness_bins`, `AMEESH_BIN_DIR`, `PATH`, the
+systemd user manager's `PATH`, then known locations (mise installs and shims,
+`~/.local/bin`, the npx cache); the absolute path is logged at startup.
+`ameesh doctor --harness` checks the same, and lists agents run without an
+enabled runner unit.
+
+An agent held in `ameesh attach` should also have an enabled runner
+(`systemctl --user enable ameesh-runner-agent@<agent>`): when the interactive
+session dies without releasing its lease, that runner resumes the same session
+once.
 - **Moving between admitted hosts** is off by default (`AMEESH_RELOCATE=1`):
   when the host is under pressure and another host admitted for the agent is
   available, the agent moves there between two turns. The native session is
