@@ -56,6 +56,9 @@
   ameesh harness list|show|check        descripteurs de harnais (L16) ;
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
+  ameesh host enroll|revoke|list|show   enrôlement des appareils prêtés (L110,
+        humain habilité seulement) ;
+  ameesh device enroll|challenge|show   côté appareil, dans la VM (L110) ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère ;
   ameesh serve --exec-only --auth-file FICHIER [--listen HÔTE:PORT] …
         l'API d'exécuteur médiée (/api/exec/v1, L108) : un exécuteur sur un
@@ -187,6 +190,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L108 : l'API d'exécuteur médiée ; L84 y ajoutera l'interface
         from .executeur_mediee import serveur
         return serveur.main(rest)
+    if command in ("host", "device"):
+        # L110 : enrôlement et identité des exécuteurs médiés
+        from . import host_cli
+        return host_cli.main(argv)
     if command == "approve-check":
         from . import approve_check
         return approve_check.main(rest)
