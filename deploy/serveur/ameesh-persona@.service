@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Exécuteur d'une persona ISOLÉE (étude v2 E1) : sous son propre utilisateur
+# Unix `p-<persona>`, créé par ajouter-persona.sh. Ses fichiers sont illisibles
+# par les autres personas ; les clés des harnais (/etc/ameesh/harnais.env) sont
+# lues par systemd avant le passage à cet utilisateur.
+#
+#   ajouter-persona.sh <persona> && systemctl enable --now ameesh-persona@<persona>
+
+[Unit]
+Description=ameesh — exécuteur de la persona isolée %i
+After=network-online.target postgresql.service wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+User=p-%i
+Group=ameesh-personas
+WorkingDirectory=/home/p-%i
+EnvironmentFile=-/etc/ameesh/harnais.env
+ExecStart=/opt/ameesh/venv/bin/ameesh run --agents %i --runner-id runner-%i@%H
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/home/p-%i /tmp
+ProtectHome=tmpfs
+BindPaths=/home/p-%i
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

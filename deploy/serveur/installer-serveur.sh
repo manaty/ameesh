@@ -31,6 +31,7 @@ log() { echo "== $*"; }
 # --- utilisateur des exécuteurs ----------------------------------------------
 log "utilisateur ameesh"
 id ameesh >/dev/null 2>&1 || useradd --create-home --shell /bin/bash ameesh
+chmod 0750 /home/ameesh   # illisible par les personas isolées (E1)
 usermod -aG docker ameesh
 install -d -m 0750 -o root -g ameesh /etc/ameesh
 
@@ -140,7 +141,8 @@ runuser -l ameesh -c "ameesh migrate"
 
 # --- exécuteurs ----------------------------------------------------------------
 log "gabarit systemd ameesh-runner@<persona>"
-install -m 0644 "$SRC/deploy/serveur/ameesh-runner@.service" /etc/systemd/system/
+install -m 0644 "$SRC/deploy/serveur/ameesh-runner@.service" "$SRC/deploy/serveur/ameesh-persona@.service" \
+  /etc/systemd/system/
 systemctl daemon-reload
 
 # --- sauvegardes ---------------------------------------------------------------
