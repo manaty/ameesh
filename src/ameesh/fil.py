@@ -785,8 +785,9 @@ def record(cfg: Config, db, *, sender: str, recipients: Sequence[str], text: str
         try:
             index(db, cfg, transport, thread, entry, external_id, ids)
         except Exception as exc:
-            _warn("index des fils non mis à jour (%s) — le fil et le message sont intacts ; "
-                  "« ameesh migrate » ?" % " ".join(str(exc).split())[:200])
+            from . import db as db_mod
+            _warn("index des fils non mis à jour (%s) — le fil et le message sont intacts"
+                  % db_mod.explain(exc, 200))
     return external_id
 
 

@@ -166,6 +166,46 @@ def _sortie_sure(code: int, fils: "list[threading.Thread] | tuple" = ()) -> int:
     os._exit(code)
 
 
+class Reprise:
+    """Attente exponentielle bornée pendant une panne de base (L72).
+
+    Un compteur par point d'appel (passe de l'exécuteur, écoute, worker,
+    battement) : 2 s, 4 s, 8 s… jusqu'à `maximum`, remis à zéro au premier
+    succès. Rien d'autre : le journal reste à l'appelant, qui sait où il est.
+    """
+
+    MINIMUM = 2.0
+
+    def __init__(self, maximum: float = 60.0, minimum: float | None = None):
+        self.minimum = float(self.MINIMUM if minimum is None else minimum)
+        self.maximum = max(self.minimum, float(maximum))
+        self.echecs = 0
+        self.depuis = 0.0
+
+    @property
+    def en_panne(self) -> bool:
+        return self.echecs > 0
+
+    def echec(self) -> float:
+        """Compte un échec ; rend l'attente avant le prochain essai."""
+        if not self.echecs:
+            self.depuis = time.time()
+        self.echecs += 1
+        return min(self.maximum, self.minimum * (2 ** min(self.echecs - 1, 30)))
+
+    def duree(self) -> float:
+        return max(0.0, time.time() - self.depuis) if self.echecs else 0.0
+
+    def retablie(self) -> tuple[int, float] | None:
+        """Succès : (échecs, durée de la panne) si on sortait d'une panne."""
+        if not self.echecs:
+            return None
+        bilan = (self.echecs, self.duree())
+        self.echecs = 0
+        self.depuis = 0.0
+        return bilan
+
+
 def worktree_marker(cwd: str | None) -> dict:
     """Identité git d'un dossier de travail (0018 : suivre un renommage).
 
@@ -257,7 +297,13 @@ class AgentWorker(threading.Thread):
         self._budget_reason = ""
         #: la comptabilité du dernier tour a échoué : plus de tour à l'aveugle.
         #: Un marqueur persistant rend la suspension durable au redémarrage (B5).
-        self._compta_en_echec = self._compta_en_attente() is not None
+        #: L72 : base injoignable à la création — doute, donc suspension, mais
+        #: levée dès qu'une lecture dit qu'aucun marqueur n'attend
+        self._compta_doute = False
+        try:
+            self._compta_en_echec = self._compta_en_attente() is not None
+        except db_mod.Unavailable:
+            self._compta_en_echec = self._compta_doute = True
         #: modèle annoncé par le flux du tour en cours, gardé en mémoire **en plus** de
         #: la base : si l'écriture du marqueur échoue, ce worker-ci répare quand même
         #: au bon tarif (L13 B4). Effacé quand la ligne du grand livre est écrite.
@@ -287,6 +333,14 @@ class AgentWorker(threading.Thread):
         self._wd_seen = agent.get("cwd")
         self._wd_delay = 0.0
         self._wd_next = 0.0
+        #: panne de base (L72) : attente croissante entre deux essais, consigne
+        #: consommée par un tour qui n'a pas pu partir (à remettre en attente
+        #: au retour de la base), statut « base injoignable » posé, et session
+        #: ouverte par le harnais mais pas encore enregistrée au registre
+        self._reprise = Reprise(getattr(runner, "db_retry_max", 60.0))
+        self._consigne_a_restaurer = False
+        self._base_marquee = False
+        self._session_en_attente: tuple[str, str | None] | None = None
 
     # -- état local --------------------------------------------------------
     def _path(self, name: str) -> str:
@@ -401,10 +455,23 @@ class AgentWorker(threading.Thread):
             return False
         if error is not None:
             self.renew_failures += 1
-            echec = ("[%s] battement : base injoignable (%s) — échec %d/%d"
-                     % (self.name, error, self.renew_failures, self.MAX_RENEW_FAILURES))
-            definitive = (self.renew_failures >= self.MAX_RENEW_FAILURES
-                          or time.time() >= self.lease_deadline)
+            if isinstance(error, db_mod.Unavailable) and self.lease_deadline > 0:
+                # L72 : base injoignable, échéance connue — le harnais continue
+                # tant que le bail court encore ; seule l'échéance (ici, et le
+                # veilleur qui n'attend personne) l'arrête. Le compte d'échecs
+                # n'a plus de sens : le battement réessaie vite (2 s, 4 s…).
+                reste = self.lease_deadline - time.time()
+                echec = ("[%s] battement : %s — échec %d, bail valable encore %ds : "
+                         "le tour continue, nouvel essai bientôt"
+                         % (self.name, db_mod.explain(error), self.renew_failures,
+                            max(0, int(reste))))
+                definitive = reste <= 0
+            else:
+                echec = ("[%s] battement : base injoignable (%s) — échec %d/%d"
+                         % (self.name, error, self.renew_failures,
+                            self.MAX_RENEW_FAILURES))
+                definitive = (self.renew_failures >= self.MAX_RENEW_FAILURES
+                              or time.time() >= self.lease_deadline)
             if not definitive:
                 # Diagnostic par la file non bloquante : le fil du battement
                 # doit continuer à surveiller l'échéance même si le puits est
@@ -423,6 +490,9 @@ class AgentWorker(threading.Thread):
             self.lease_lost.set()
             self.stop_group_now("bail perdu (epoch %d)" % self.epoch, grace=0, hard=True)
             return False
+        if self.renew_failures:
+            log_async("[%s] battement : base de nouveau joignable, bail renouvelé après "
+                      "%d échec(s)" % (self.name, self.renew_failures))
         self.renew_failures = 0
         self.lease_deadline = float(expires)
         return True
@@ -674,9 +744,19 @@ class AgentWorker(threading.Thread):
     def _heartbeat(self, stop_event: threading.Event) -> None:
         self.ensure_watchdog()
         interval = max(3.0, self.runner.lease_ttl / 3.0)
-        while not stop_event.wait(self.wait_timeout(interval)):
+        # L72 : après un échec, nouvel essai rapide (2 s, 4 s… jusqu'à
+        # l'intervalle normal) — une base revenue doit prolonger le bail avant
+        # son échéance, pas un tiers de bail plus tard.
+        reprise = Reprise(maximum=interval)
+        attente = interval
+        while not stop_event.wait(self.wait_timeout(attente)):
             if not self.renew():
                 return
+            if self.renew_failures:
+                attente = reprise.echec()
+            else:
+                reprise.retablie()
+                attente = interval
 
     # -- choix du travail --------------------------------------------------
     def idle_due(self) -> bool:
@@ -1013,6 +1093,112 @@ class AgentWorker(threading.Thread):
                        meta={"action": "deplacement", "cwd": candidat})
         return candidat
 
+    # -- panne de base (L72) -------------------------------------------------
+    #: statut et préfixe d'erreur du blocage « base injoignable » ; levé
+    #: seulement s'il porte exactement ces deux marques (comme L35)
+    DB_STATUS = "base injoignable"
+    DB_ERROR = "base injoignable"
+
+    def _marque_base(self, agent: dict | None) -> bool:
+        agent = agent or {}
+        return (agent.get("status") == "blocked"
+                and agent.get("status_text") == self.DB_STATUS
+                and str(agent.get("last_error") or "").startswith(self.DB_ERROR))
+
+    def _panne_de_base(self, exc: BaseException, ou: str) -> None:
+        """Base injoignable entre deux tours : journal, statut si possible,
+        attente croissante. Aucun tour ne part ; le bail reste défendu par
+        `renew()` à chaque passage de la boucle et par le veilleur."""
+        attente = self._reprise.echec()
+        log_async("[%s] %s pendant %s — tours suspendus, nouvel essai dans %ds "
+                  "(échec %d, panne depuis %ds)"
+                  % (self.name, db_mod.explain(exc), ou, int(attente),
+                     self._reprise.echecs, int(self._reprise.duree())))
+        if not self._base_marquee:
+            # Une panne partielle (une requête sur deux) laisse ce statut
+            # visible dans `ameesh show`/`list` ; une panne franche l'empêche
+            # d'être écrit, et rien n'est perdu : il est retenté au prochain
+            # échec, puis levé au retour de la base.
+            try:
+                issue = registry.set_marked_block(
+                    self.db, self.name, self.runner.runner_id, self.epoch,
+                    self.DB_STATUS, "%s : %s" % (self.DB_ERROR, db_mod.explain(exc)),
+                    self.DB_ERROR)
+                self._base_marquee = issue in ("done", "kept")
+                if issue == "lease":
+                    self.lease_lost.set()
+            except db_mod.DbError:
+                pass
+        self.wake.wait(timeout=self.wait_timeout(attente))
+        self.wake.clear()
+
+    def _base_retablie(self) -> None:
+        bilan = self._reprise.retablie()
+        if bilan:
+            log_async("[%s] base de nouveau joignable après %ds (%d échec(s)) : reprise"
+                      % (self.name, int(bilan[1]), bilan[0]))
+
+    def _avec_reprise(self, quoi: str, fn, *args, **kwargs):
+        """Appel de base réessayé pendant une panne, tant que le bail court (L72).
+
+        Pour l'après-tour : le harnais a fini, son issue est en mémoire et doit
+        être écrite (fin de tour, consigne remise, grand livre) plutôt que
+        perdue. Lève `Unavailable` si le bail est perdu, échu, ou l'exécuteur
+        arrêté : la réclamation suivante remettra la consigne en attente (R5).
+        """
+        reprise = Reprise(self.runner.db_retry_max)
+        while True:
+            try:
+                resultat = fn(*args, **kwargs)
+            except db_mod.Unavailable as exc:
+                attente = reprise.echec()
+                if (self.lease_lost.is_set() or self.deadline_passed()
+                        or self.runner.stop.is_set()):
+                    raise
+                log_async("[%s] %s : %s — nouvel essai dans %ds (échec %d)"
+                          % (self.name, quoi, db_mod.explain(exc), int(attente),
+                             reprise.echecs))
+                self.runner.stop.wait(self.wait_timeout(attente))
+                if not self.renew() or self.lease_lost.is_set():
+                    raise
+                continue
+            bilan = reprise.retablie()
+            if bilan:
+                log_async("[%s] %s : base de nouveau joignable après %d échec(s)"
+                          % (self.name, quoi, bilan[0]))
+            return resultat
+
+    def _restaure_consigne(self) -> None:
+        """Un tour interrompu par une panne avant le lancement du harnais : sa
+        consigne (déjà consommée) repart en attente au retour de la base, et un
+        statut `running` resté en plan est remplacé par le blocage « base
+        injoignable », que `_pick` lève aussitôt (idle ou queued)."""
+        registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+        self._consigne_a_restaurer = False
+        try:
+            agent = registry.get(self.db, self.name) or {}
+            if agent.get("status") == "running":
+                registry.set_marked_block(
+                    self.db, self.name, self.runner.runner_id, self.epoch,
+                    self.DB_STATUS, "%s : tour non lancé" % self.DB_ERROR, self.DB_ERROR)
+        except db_mod.Unavailable:
+            raise
+        except db_mod.DbError:
+            pass
+
+    def _enregistre_session(self) -> None:
+        """Session ouverte par le harnais pendant une panne : enregistrée au
+        registre dès que possible (sinon le tour suivant reprendrait l'ancienne,
+        `current_session` préférant le registre au fichier local)."""
+        session, compte = self._session_en_attente
+        registry.set_session(self.db, self.name, session, compte)
+        self._session_en_attente = None
+        if self.agent is not None:
+            self.agent["session_id"] = session
+            self.agent["session_account"] = compte
+        log_async("[%s] session %s enregistrée au registre (différée par une panne)"
+                  % (self.name, session))
+
     # -- dossier de travail absent (L35) -------------------------------------
     #: statut et préfixe d'erreur d'un blocage « dossier absent » (le statut
     #: n'est levé que s'il porte exactement ces deux marques)
@@ -1181,6 +1367,7 @@ class AgentWorker(threading.Thread):
         self._budget_paused = bool(raison)
         if not raison:
             self._budget_reason = ""
+            self._leve_pause_budget()
             return True
         maintenant = time.monotonic()
         if maintenant >= self._budget_next_check:
@@ -1195,6 +1382,21 @@ class AgentWorker(threading.Thread):
                                "redescend pas." % raison,
                                meta={"action": "budget", "raison": raison})
         return False
+
+    def _leve_pause_budget(self) -> None:
+        """La garde laisse passer : une pause budget encore affichée est levée
+        (L72). Sans cela, un agent mis en pause (par exemple quand l'état des
+        comptes était illisible pendant une panne de base) restait `blocked`
+        jusqu'à son prochain tour, même la jauge redescendue."""
+        agent = self.agent or {}
+        texte = agent.get("status_text") or ""
+        if agent.get("status") != "blocked" or not texte.startswith("budget : "):
+            return
+        issue = registry.clear_marked_block(self.db, self.name, self.runner.runner_id,
+                                            self.epoch, texte, "")
+        if issue == "done":
+            self.agent = dict(agent, status="idle", status_text="")
+            log_async("[%s] pause budget levée (%s)" % (self.name, texte))
 
     def _state_read(self, key: str) -> str:
         """Lit une valeur d'état locale (`model`, `effort`) ; '' si absente."""
@@ -1213,6 +1415,11 @@ class AgentWorker(threading.Thread):
         """
         try:
             return registry.pending_spend_get(self.db, self.name)
+        except db_mod.Unavailable:
+            # L72 : base injoignable — ni marqueur ni doute à mémoriser : la
+            # panne suspend déjà les tours, et un `{}` ici rendait la
+            # suspension définitive jusqu'au redémarrage du worker.
+            raise
         except db_mod.DbError:
             return {}
 
@@ -1227,6 +1434,8 @@ class AgentWorker(threading.Thread):
             registry.pending_spend_put(self.db, self.name, int(start), tour,
                                        model if model is not None else "")
             return True
+        except db_mod.Unavailable:
+            raise  # L72 : rien lancé ; la consigne est remise au retour de la base
         except db_mod.DbError as exc:
             self._compta_en_echec = True
             log_async("[%s] marqueur de comptabilité non posé (%s) : tour refusé"
@@ -1280,6 +1489,11 @@ class AgentWorker(threading.Thread):
     def _compta_repare(self) -> None:
         """Avant un tour : rejoue le travail en attente ; `{}` suspend."""
         travail = self._compta_en_attente()
+        if travail is None and self._compta_doute:
+            # L72 : la suspension venait d'une base injoignable à la création
+            # du worker ; aucun marqueur n'attend, rien à réparer.
+            self._compta_doute = False
+            self._compta_en_echec = False
         if travail:
             if self._annonce_ram:
                 # Ce worker a vu l'annonce du flux ; si la base ne l'a pas gardée,
@@ -1340,7 +1554,9 @@ class AgentWorker(threading.Thread):
         Le modèle **annoncé par le flux** du harnais prime sur celui figé au
         lancement : c'est la source du tour (mesh-design, 0019 §3).
         """
-        travail = self._compta_en_attente()
+        # L72 : le tour a eu lieu ; sa ligne de grand livre attend la base
+        # plutôt que d'être remise à une réparation ultérieure.
+        travail = self._avec_reprise("comptabilité du tour", self._compta_en_attente)
         if travail:
             if model_annonce:
                 travail = dict(travail, model=model_annonce)
@@ -1431,6 +1647,23 @@ class AgentWorker(threading.Thread):
             self.stopping.set()
             return None
         self.agent = agent
+        if self._session_en_attente is not None:
+            self._enregistre_session()
+        if self._marque_base(agent):
+            # L72 : la base répond de nouveau — le blocage « base injoignable »
+            # (posé par cet exécuteur ou hérité d'un précédent) est levé ici,
+            # sans reprise manuelle.
+            issue = registry.clear_marked_block(
+                self.db, self.name, self.runner.runner_id, self.epoch,
+                self.DB_STATUS, self.DB_ERROR)
+            if issue == "lease":
+                self.lease_lost.set()
+                return None
+            if issue == "done":
+                log_async("[%s] base de nouveau joignable : blocage « %s » levé"
+                          % (self.name, self.DB_STATUS))
+            self._base_marquee = False
+            self.agent = agent = registry.get(self.db, self.name) or agent
         if not self.budget_ok():
             return None  # garde de budget (L13) : aucun tour, état `paused` posé
         # Contre-pression de l'hôte (L31, 0028) : au-dessus d'un seuil, aucun
@@ -1859,9 +2092,19 @@ class AgentWorker(threading.Thread):
                         # L39 (0030) : le compte d'origine de la session, en
                         # registre avec son id (le marqueur du flux reste la
                         # source des relevés du tour)
-                        registry.set_session(
-                            self.db, self.name, session_new,
-                            compte.name if compte is not None else None)
+                        try:
+                            registry.set_session(
+                                self.db, self.name, session_new,
+                                compte.name if compte is not None else None)
+                        except db_mod.DbError as exc:
+                            # L72 : une panne de base ne tue pas le tour (le
+                            # bail, lui, est défendu par le battement) ;
+                            # l'enregistrement est rejoué après le tour.
+                            self._session_en_attente = (
+                                session_new, compte.name if compte is not None else None)
+                            log_async("[%s] session %s non enregistrée (%s) : rejouée "
+                                      "après le tour" % (self.name, session_new,
+                                                         db_mod.explain(exc)))
                         if self.agent is not None:
                             self.agent["session_account"] = (
                                 compte.name if compte is not None else None)
@@ -1915,22 +2158,27 @@ class AgentWorker(threading.Thread):
             # fence par epoch ne suffit pas : un bail expiré mais pas encore
             # repris porte toujours notre epoch), et `set_status` écraserait
             # l'état d'un agent qu'un remplaçant a pu reprendre.
-            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            self._avec_reprise("consigne remise en attente", registry.restore_prompt,
+                               self.db, self.name, self.runner.runner_id, self.epoch)
             return False
         if self.restarting.is_set() and not preempte and not ok:
             # `ameesh restart` (L26) : le tour est arrêté ; sa consigne repart en
             # attente, DERRIÈRE le brief que la demande placera en tête.
-            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
-            registry.set_status(self.db, self.name, "queued",
-                                status_text="tour arrêté : redémarrage demandé")
+            self._avec_reprise("consigne remise en attente", registry.restore_prompt,
+                               self.db, self.name, self.runner.runner_id, self.epoch)
+            self._avec_reprise("statut de fin de tour", registry.set_status,
+                               self.db, self.name, "queued",
+                               status_text="tour arrêté : redémarrage demandé")
             return False
         if preempte:
             # Message prioritaire reçu pendant le tour (0018) : la consigne
             # repart en attente, `pick()` servira le message en tête au tour
             # suivant, sur la même session. Le fil garde la trace.
-            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
-            registry.set_status(self.db, self.name, "queued",
-                                status_text="tour interrompu : message prioritaire")
+            self._avec_reprise("consigne remise en attente", registry.restore_prompt,
+                               self.db, self.name, self.runner.runner_id, self.epoch)
+            self._avec_reprise("statut de fin de tour", registry.set_status,
+                               self.db, self.name, "queued",
+                               status_text="tour interrompu : message prioritaire")
             self._fil_note(
                 "Tour interrompu par un message prioritaire ; la consigne du tour "
                 "repart en attente et le message prioritaire passe en tête.",
@@ -1939,9 +2187,13 @@ class AgentWorker(threading.Thread):
         if not ok:
             # B6a : le tour n'a pas abouti, la consigne repart en attente au lieu
             # d'être effacée par end_turn. Au pire elle est rejouée.
-            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            self._avec_reprise("consigne remise en attente", registry.restore_prompt,
+                               self.db, self.name, self.runner.runner_id, self.epoch)
             self.fast_failure = duration < self.runner.fast_failure_s
-        registry.end_turn(
+        if self._session_en_attente is not None:
+            self._avec_reprise("session du tour", self._enregistre_session)
+        self._avec_reprise(
+            "fin de tour", registry.end_turn,
             self.db, self.name, self.runner.runner_id, self.epoch,
             status=status,
             status_text="%s en %ds%s" % (label, int(duration), "" if ok else " (échec)"),
@@ -2027,15 +2279,35 @@ class AgentWorker(threading.Thread):
             while not self.stopping.is_set() and not self.runner.stop.is_set():
                 if not self.renew():
                     break
-                self.apply_restart_if_requested()
-                self.maybe_rotate()
-                spec = self.rotate_for_lot(self.pick())
+                # L72 : une base injoignable n'arrête plus le worker (son fil
+                # mourait sur l'exception) : tours suspendus, attente
+                # croissante, reprise d'elle-même au retour de la base.
+                try:
+                    if self._consigne_a_restaurer:
+                        self._restaure_consigne()
+                    self.apply_restart_if_requested()
+                    self.maybe_rotate()
+                    spec = self.rotate_for_lot(self.pick())
+                except db_mod.Unavailable as exc:
+                    self._panne_de_base(exc, "le choix du tour")
+                    continue
+                self._base_retablie()
                 if spec is None:
                     self.wake.wait(timeout=self.wait_timeout(
                         min(self.runner.poll, max(1.0, self.runner.lease_ttl / 3.0))))
                     self.wake.clear()
                     continue
-                if self.run_turn(spec):
+                try:
+                    reussi = self.run_turn(spec)
+                except db_mod.Unavailable as exc:
+                    # Panne avant le lancement du harnais (ou après-tour au-delà
+                    # du bail) : la consigne éventuellement consommée repartira
+                    # en attente au retour de la base. Pas un échec de tour :
+                    # la série d'échecs rapides (L48) n'est pas touchée.
+                    self._consigne_a_restaurer = True
+                    self._panne_de_base(exc, "le tour")
+                    continue
+                if reussi:
                     self.fast_failures = 0
                     continue
                 if self.fast_failure:
@@ -2092,6 +2364,8 @@ class Runner:
         self.failure_backoff_max = max(self.failure_backoff, cfg.failure_backoff_max)
         self.fast_failure_s = max(0.0, cfg.fast_failure_s)
         self.max_fast_failures = max(1, int(cfg.max_fast_failures))
+        #: L72 : attente maximale entre deux essais quand la base est injoignable
+        self.db_retry_max = max(Reprise.MINIMUM, float(getattr(cfg, "db_retry_max", 60.0)))
         self.stop = threading.Event()
         self.wake_all = threading.Event()
         self.workers: dict[str, AgentWorker] = {}
@@ -2253,30 +2527,66 @@ class Runner:
         self.wake_all.set()
 
     def _listen_loop(self) -> None:
+        """Écoute LISTEN/NOTIFY, reconnectée après une coupure (L72) : attente
+        croissante tant que la base ne répond pas (le sondage `poll` des
+        workers et de la passe prend le relais), journal borné."""
+        reprise = Reprise(self.db_retry_max, minimum=1.0)
+        annonce = False
         while not self.stop.is_set():
             listener = storage.of(self.db).wakeups.subscribe([CHANNEL_MAIL, CHANNEL_LEASE])
             if listener is None:
+                try:
+                    self.db.ping()
+                except db_mod.DbError as exc:
+                    # psycopg : la connexion d'écoute n'a pas pu s'ouvrir
+                    attente = reprise.echec()
+                    log_async("écoute impossible (%s) : nouvel essai dans %ds"
+                              % (db_mod.explain(exc), int(attente)))
+                    self.stop.wait(attente)
+                    continue
                 log_async("LISTEN/NOTIFY indisponible avec ce pilote : sondage toutes les %ss"
                           % self.poll)
                 return
             self.listener = listener
-            log_async("LISTEN %s, %s" % (CHANNEL_MAIL, CHANNEL_LEASE))
+            if not annonce:
+                log_async("LISTEN %s, %s" % (CHANNEL_MAIL, CHANNEL_LEASE))
+                annonce = True
+            debut = time.monotonic()
+            # une écoute qui tient plus longtemps qu'une tentative de connexion
+            # est vivante : la panne est finie pour elle
+            vivante_apres = max(1.0, float(self.cfg.connect_timeout)) + self.poll
             try:
                 while not self.stop.is_set():
                     item = listener.wait(timeout=self.poll)
                     if item is None:
+                        if (reprise.en_panne
+                                and time.monotonic() - debut >= vivante_apres):
+                            bilan = reprise.retablie()
+                            log_async("écoute rétablie après %ds (%d échec(s))"
+                                      % (int(bilan[1]), bilan[0]))
                         self.wake_all.set()  # battement de sondage
                         continue
                     if item.get("event") == "down":
-                        log_async("écoute interrompue (%s) : reconnexion"
-                                  % (item.get("error") or "?"))
+                        attente = reprise.echec()
+                        log_async("écoute interrompue (%s) : reconnexion dans %ds"
+                                  % (item.get("error") or "?", int(attente)))
                         break
-                    self.dispatch(item)
+                    try:
+                        self.dispatch(item)
+                    except db_mod.DbError as exc:
+                        # réveil sans détail : chaque worker relira lui-même
+                        log_async("réveil sans détail (%s)" % db_mod.explain(exc))
+                        with self.lock:
+                            for worker in self.workers.values():
+                                worker.wake.set()
+                        self.wake_all.set()
             finally:
                 listener.close()
                 self.listener = None
             if not self.stop.is_set():
-                time.sleep(1.0)
+                self.stop.wait(reprise.minimum if not reprise.en_panne
+                               else min(reprise.maximum,
+                                        reprise.minimum * 2 ** (reprise.echecs - 1)))
 
     # -- arrêt -------------------------------------------------------------
     def shutdown(self) -> None:
@@ -2624,9 +2934,29 @@ class Runner:
             return 0 if self.did_turn else 3
         self.listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
         self.listener_thread.start()
+        reprise = Reprise(self.db_retry_max)
         try:
             while not self.stop.is_set():
-                self.sweep()
+                try:
+                    self.sweep()
+                except db_mod.DbError as exc:
+                    if self.stop.is_set():
+                        # arrêt en cours : systemd a pu tuer le `psql` fils
+                        # avec nous (« psql : code -15 ») — rien à réessayer
+                        break
+                    # L72 : une passe en échec n'arrête plus l'exécuteur (et
+                    # avec lui tous les harnais de l'hôte) : on réessaie.
+                    attente = reprise.echec()
+                    log_async("passe de l'exécuteur en échec (%s) : nouvel essai dans %ds "
+                              "(échec %d, panne depuis %ds) ; les tours en cours continuent"
+                              % (db_mod.explain(exc), int(attente), reprise.echecs,
+                                 int(reprise.duree())))
+                    self.stop.wait(attente)
+                    continue
+                bilan = reprise.retablie()
+                if bilan:
+                    log_async("base de nouveau joignable après %ds (%d échec(s)) : passe "
+                              "de l'exécuteur reprise" % (int(bilan[1]), bilan[0]))
                 if self.max_turns and self.turns >= self.max_turns:
                     log_async("limite de %d tour(s) atteinte" % self.max_turns)
                     break
