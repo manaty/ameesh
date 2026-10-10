@@ -459,13 +459,17 @@ class CostBook:
                 return gauges
         return []
 
-    def gauges(self, harness: str | None = None) -> list:
+    def gauges(self, harness: str | None = None, *, record: bool = True) -> list:
         """Les jauges de forfait, par **source déclarée** dans les descripteurs (L16).
 
         `ameesh.cost.gauges` nomme le lecteur (`transcript` pour Claude,
         `sessions` pour Codex) : le code ne connaît que des formats de journaux,
         un harnais nouveau se décrit. Un harnais sans source de jauges n'en a
         pas (le solde des fournisseurs payés au token est lu ailleurs, L26).
+
+        `record=False` (L61) : lecture seule, rien n'est écrit dans
+        l'historique — les commandes de lecture (`progress`, `cost gauges`
+        sans `--record`) ; l'exécuteur, lui, relève avant chaque tour.
         """
         out: list = []
         for ident, descriptor in harnesses.scan()[0].items():
@@ -476,7 +480,8 @@ class CostBook:
                            str(descriptor.cost.get("gauges") or ""))
             if lecteur is not None:
                 out += [replace(gauge, harness=ident) for gauge in lecteur()]
-        self.record_gauges(out)
+        if record:
+            self.record_gauges(out)
         return out
 
     def record_gauges(self, gauges: Sequence[Gauge], account: str | None = None) -> int:
