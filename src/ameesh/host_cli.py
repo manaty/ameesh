@@ -20,11 +20,15 @@ déclare l'hôte. La fiche `Host` doit exister au canon.
 
 Dans la VM de l'appareil :
 
-  ameesh device enroll --server URL --code CODE [--label L] [--attestation FICHIER]
+  ameesh device enroll --server URL (--code-file FICHIER|- | --code CODE)
+                       [--label L] [--attestation FICHIER]
         génère la clé P-256 (0600, volume persistant), s'enrôle, garde l'état ;
-  ameesh device challenge --server URL --code CODE
+  ameesh device challenge --server URL (--code-file FICHIER|- | --code CODE)
         le défi à faire signer par la clé d'appareil Nexlink (facultatif) ;
   ameesh device show [--json]           état de l'appareil (sans secret).
+
+Le code d'enrôlement se passe de préférence par `--code-file` (ou `-` pour
+l'entrée standard) : `--code` le laisse dans /proc/<pid>/cmdline.
 
 `AMEESH_EXEC_HOME` (défaut /var/lib/ameesh-exec) : dossier de la clé et de
 l'état de l'appareil.
@@ -159,8 +163,8 @@ def cmd_enroll(cfg: Config, db, args) -> int:
     print("  à usage unique, valable jusqu'à %s ; émis par %s (%s)"
           % (_moment(invitation["expires_ts"]), args.by, reason))
     print("  agents : %s" % (", ".join(agents) if agents else "ceux que le canon admet"))
-    print("  dans la VM : ameesh device enroll --server <URL du serveur> --code %s"
-          % invitation["code"])
+    print("  dans la VM : ameesh device enroll --server <URL du serveur> --code-file -"
+          " (code sur l'entrée standard : jamais dans la ligne de commande)")
     return 0
 
 
@@ -277,9 +281,27 @@ def cmd_show(cfg: Config, db, args) -> int:
 # appareil
 # --------------------------------------------------------------------------
 
+def _read_code(args) -> str:
+    """Le code d'enrôlement : `--code`, sinon le fichier `--code-file` (ou
+    stdin pour `-`). Jamais recopié dans un journal ni dans l'environnement."""
+    if args.code_file is None:
+        return args.code
+    if args.code_file == "-":
+        text = sys.stdin.readline()
+    else:
+        with open(args.code_file, encoding="ascii") as fh:
+            text = fh.read(256)
+    code = "".join(text.split())
+    if not code:
+        raise ValueError("code d'enrôlement vide (%s)" % args.code_file)
+    return code
+
+
 def cmd_device(args) -> int:
     from .executeur_mediee import appareil
     directory = args.home
+    if args.device_command in ("challenge", "enroll"):
+        args.code = _read_code(args)
     if args.device_command == "challenge":
         key, created = appareil.load_or_create_key(directory)
         challenge = appareil.attestation_challenge(key, server_url=args.server, code=args.code)
@@ -354,7 +376,12 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("enroll", "challenge"):
         d = dsub.add_parser(name)
         d.add_argument("--server", required=True)
-        d.add_argument("--code", required=True)
+        source = d.add_mutually_exclusive_group(required=True)
+        source.add_argument("--code", default=None,
+                            help="code d'enrôlement (visible dans la ligne de commande : "
+                                 "préférez --code-file)")
+        source.add_argument("--code-file", default=None,
+                            help="fichier qui contient le code, ou - pour l'entrée standard")
         d.add_argument("--home", default=None)
         if name == "enroll":
             d.add_argument("--label", default="")

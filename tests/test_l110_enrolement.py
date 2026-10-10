@@ -536,6 +536,100 @@ class IdentiteBaseTest(PgTestCase):
             source.access_token(refresh=True)
 
 
+class DeviceCliTest(PgTestCase):
+    """La vraie commande `ameesh device enroll --code-file` : le code n'est
+    ni dans la ligne de commande, ni dans l'environnement, ni dans la sortie."""
+
+    invite = IdentiteBaseTest.invite
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.db.execute("TRUNCATE executor_events, executor_assertion_jti, executor_tokens, "
+                        "executors, executor_invitations RESTART IDENTITY CASCADE")
+        self.provider = identite.DbIdentityProvider(self.db, mesh="mesh-exemple")
+
+    def _serve(self, seen):
+        import http.server
+        import threading
+        provider = self.provider
+        test = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                pid = test.proc.pid
+                for name in ("cmdline", "environ"):
+                    with open("/proc/%d/%s" % (pid, name), "rb") as fh:
+                        seen[name] = fh.read()
+                try:
+                    status, reply = 201, provider.enroll(body, server_url=test.url)
+                except I.AuthError as exc:
+                    status, reply = 401, C.error_body(exc.code, str(exc))
+                data = json.dumps(reply).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+    def _enroll(self, *source, stdin=None):
+        import subprocess
+        import sys
+        seen: dict = {}
+        self._serve(seen)
+        code = self.invite()["code"]
+        home = _key_dir()
+        argv = [sys.executable, "-m", "ameesh.main", "device", "enroll", "--server", self.url,
+                "--home", home, *source]
+        if source[-1] != "-":
+            with open(source[-1], "w", encoding="ascii") as fh:
+                fh.write(code + "\n")
+        self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True, env=self.env(),
+                                     cwd=self.tmp)
+        out, err = self.proc.communicate(code + "\n" if source[-1] == "-" else "", timeout=60)
+        self.assertEqual(self.proc.returncode, 0, err)
+        self.assertIn("appareil enrôlé", out)
+        self.assertTrue(seen, "le serveur n'a rien reçu")
+        for variant in (code, code.replace("-", ""), jose.normalize_code(code)):
+            for name, raw in seen.items():
+                with self.subTest(where=name):
+                    self.assertNotIn(variant.encode(), raw)
+            self.assertNotIn(variant, out + err)
+        with open(os.path.join(home, appareil.STATE_FILE), encoding="utf-8") as fh:
+            self.assertNotIn(jose.normalize_code(code), fh.read())
+
+    def test_code_file(self):
+        path = os.path.join(self.tmp, "code.txt")
+        self._enroll("--code-file", path)
+
+    def test_code_sur_l_entree_standard(self):
+        self._enroll("--code-file", "-")
+
+    def test_code_et_code_file_exclusifs(self):
+        for args in ([], ["--code", "X", "--code-file", "-"]):
+            proc = self.mesh("device", "enroll", "--server", SERVER, *args)
+            self.assertEqual(proc.returncode, 2, proc.stderr)
+        import subprocess
+        import sys
+        proc = subprocess.run([sys.executable, "-m", "ameesh.main", "device", "challenge",
+                               "--server", SERVER, "--home", _key_dir(), "--code-file", "-"],
+                              input="", capture_output=True, text=True, env=self.env(),
+                              cwd=self.tmp, timeout=60)
+        self.assertEqual(proc.returncode, 1, proc.stderr)  # entrée standard vide : refus
+        self.assertIn("vide", proc.stderr)
+
+
 # ==========================================================================
 # CLI
 # ==========================================================================

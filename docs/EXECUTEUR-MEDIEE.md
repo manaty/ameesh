@@ -198,7 +198,11 @@ close() -> None
      à usage unique, 15 min par défaut et 1 h au plus. Il est lié au mesh, à
      l'hôte et à la liste d'agents. Chaque agent de la liste doit être admis
      sur l'hôte par le canon. Seul le SHA-256 du code est gardé.
-2. Dans la VM : `ameesh device enroll --server https://mesh.exemple --code …`.
+2. Dans la VM : `ameesh device enroll --server https://mesh.exemple --code-file -`
+   (code lu sur l'entrée standard, ou `--code-file FICHIER`). `--code CODE`
+   reste accepté mais laisse le code dans la ligne de commande
+   (`/proc/<pid>/cmdline`) : à éviter. `--code` et `--code-file` sont
+   exclusifs, l'un des deux est obligatoire.
    - La clé P-256 est générée au premier appel, en PKCS#8 PEM, dans
      `AMEESH_EXEC_HOME` (`/var/lib/ameesh-exec` par défaut) : fichier `0600`
      dans un dossier `0700`. Une clé trop ouverte est refusée.
@@ -206,7 +210,7 @@ close() -> None
    - L'état (`executor.json`, `0600`) garde l'identifiant de l'exécuteur,
      l'hôte, le mesh et l'URL du serveur, sans secret.
 3. Liaison facultative à la clé d'appareil Nexlink :
-   `ameesh device challenge --server … --code …` écrit le défi (ASCII, une
+   `ameesh device challenge --server … --code-file -` écrit le défi (ASCII, une
    ligne par champ). L'application de bureau le signe avec la clé d'appareil.
    `--attestation FICHIER` le joint à l'enrôlement :
    `{"schema": "ameesh-device-attestation/1", "device_public_key": <SPKI
