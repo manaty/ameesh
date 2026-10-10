@@ -55,8 +55,8 @@ WITH unread AS (
       LEFT JOIN assigned a ON a.assignee = r.name
       LEFT JOIN LATERAL (
           SELECT w.id, w.title, w.state FROM work_items w
-           WHERE r.session_work_item ~ '^[0-9]{1,18}$'
-             AND w.id = r.session_work_item::bigint) sw ON true
+           WHERE w.id = CASE WHEN r.session_work_item ~ '^[0-9]{1,18}$'
+                             THEN r.session_work_item::bigint END) sw ON true
 ), lots AS (
     SELECT w.id, w.title, w.state, w.app, w.workstream, w.assignee,
            k.team AS package_team,
