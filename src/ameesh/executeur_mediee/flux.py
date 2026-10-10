@@ -9,8 +9,8 @@ connexion dédiée). Chaque NOTIFY reçu entre dans un tampon circulaire de
 lisent ce tampon après leur curseur, filtré par hôte :
 
 * `agent_mail` : si `to` est un agent admis sur l'hôte de l'exécuteur ;
-* `agent_lease` : si l'agent (`agent` dans le payload du trigger de 0001,
-  `name` dans le contrat) est admis ;
+* `agent_lease` : si l'agent (`agent`, payload du déclencheur de 0001 et
+  du contrat 1.1) est admis ;
 * `ameesh_budget` et `reset` : à tous.
 
 Un curseur d'un autre flux, mal formé, ou sorti du tampon donne un seul
@@ -44,7 +44,7 @@ def visible(event: Event, admitted: Iterable[str]) -> bool:
     if event.channel == "agent_mail":
         who = data.get("to")
     elif event.channel == "agent_lease":
-        who = data.get("name", data.get("agent"))
+        who = data.get("agent")
     else:
         return False
     return isinstance(who, str) and who in admitted

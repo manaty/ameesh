@@ -18,7 +18,7 @@
      "op": "leases.claim",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       90.0
      ],
      "kwargs": {
@@ -39,7 +39,7 @@
       "host": "anna-portable",
       "cwd": "/var/lib/ameesh-exec/work/inge-front/42",
       "status": "queued",
-      "lease_owner": "exec:7f3a:anna-portable:4121",
+      "lease_owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "lease_epoch": 42,
       "lease_expires_ts": 1791640090.12
      },
@@ -63,7 +63,7 @@
      "op": "leases.claim",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       90.0
      ],
      "kwargs": {
@@ -86,7 +86,7 @@
       "host": "anna-portable",
       "cwd": "/var/lib/ameesh-exec/work/inge-front/42",
       "status": "queued",
-      "lease_owner": "exec:7f3a:anna-portable:4121",
+      "lease_owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "lease_epoch": 42,
       "lease_expires_ts": 1791640090.12
      },
@@ -110,14 +110,14 @@
      "op": "leases.renew",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       42,
       90.0
      ],
      "kwargs": {},
      "fence": {
       "agent": "inge-front",
-      "owner": "exec:7f3a:anna-portable:4121",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "epoch": 42
      }
     }
@@ -149,13 +149,13 @@
      "op": "leases.release",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       42
      ],
      "kwargs": {},
      "fence": {
       "agent": "inge-front",
-      "owner": "exec:7f3a:anna-portable:4121",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "epoch": 42
      }
     }
@@ -218,14 +218,14 @@
      "op": "leases.begin_turn",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       42,
       "tour en cours"
      ],
      "kwargs": {},
      "fence": {
       "agent": "inge-front",
-      "owner": "exec:7f3a:anna-portable:4121",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "epoch": 42
      }
     }
@@ -257,14 +257,14 @@
      "op": "leases.begin_turn",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       42,
       "tour en cours"
      ],
      "kwargs": {},
      "fence": {
       "agent": "inge-front",
-      "owner": "exec:7f3a:anna-portable:4121",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "epoch": 42
      }
     }
@@ -297,7 +297,7 @@
      "op": "leases.end_turn",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       42
      ],
      "kwargs": {
@@ -308,7 +308,7 @@
      },
      "fence": {
       "agent": "inge-front",
-      "owner": "exec:7f3a:anna-portable:4121",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "epoch": 42
      }
     }
@@ -340,13 +340,13 @@
      "op": "leases.take_pending_prompt",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       42
      ],
      "kwargs": {},
      "fence": {
       "agent": "inge-front",
-      "owner": "exec:7f3a:anna-portable:4121",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "epoch": 42
      }
     }
@@ -378,13 +378,13 @@
      "op": "leases.restore_prompt",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       42
      ],
      "kwargs": {},
      "fence": {
       "agent": "inge-front",
-      "owner": "exec:7f3a:anna-portable:4121",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "epoch": 42
      }
     }
@@ -416,14 +416,14 @@
      "op": "leases.pause",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       42,
       "pression de l'hôte"
      ],
      "kwargs": {},
      "fence": {
       "agent": "inge-front",
-      "owner": "exec:7f3a:anna-portable:4121",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "epoch": 42
      }
     }
@@ -455,13 +455,13 @@
      "op": "leases.clear_session",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       42
      ],
      "kwargs": {},
      "fence": {
       "agent": "inge-front",
-      "owner": "exec:7f3a:anna-portable:4121",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "epoch": 42
      }
     }
@@ -493,7 +493,7 @@
      "op": "leases.set_marked_block",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       42,
       "dossier absent",
       "cwd: /x",
@@ -502,7 +502,7 @@
      "kwargs": {},
      "fence": {
       "agent": "inge-front",
-      "owner": "exec:7f3a:anna-portable:4121",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "epoch": 42
      }
     }
@@ -534,7 +534,7 @@
      "op": "leases.set_marked_block",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       42,
       "dossier absent",
       "cwd: /x",
@@ -543,7 +543,7 @@
      "kwargs": {},
      "fence": {
       "agent": "inge-front",
-      "owner": "exec:7f3a:anna-portable:4121",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "epoch": 42
      }
     }
@@ -576,7 +576,7 @@
      "op": "leases.clear_marked_block",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       42,
       "dossier absent",
       "cwd:"
@@ -584,7 +584,7 @@
      "kwargs": {},
      "fence": {
       "agent": "inge-front",
-      "owner": "exec:7f3a:anna-portable:4121",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "epoch": 42
      }
     }
@@ -626,8 +626,8 @@
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": {
-      "owner": "exec:7f3a:anna-portable:4121",
-      "epoch": 42,
+      "lease_owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
+      "lease_epoch": 42,
       "status": "running",
       "live": true
      },

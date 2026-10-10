@@ -336,20 +336,20 @@ class MediatedBackend(PgBackend):
 
     Elle n'a que le jeton de session lié au bail (`AMEESH_EXEC_TOKEN`) : les
     opérations de la route `session/op` (identité par `leases.state`,
-    annuaire réduit, envoi, lots, proposition d'action). Ce que le serveur
-    ne lui ouvre pas est sauté ici, jamais tenté :
+    annuaire réduit, envoi, lots, proposition d'action) et, depuis le
+    contrat 1.1, les lignes `session: true` de la route `op` (réservation,
+    remise et relâche du courrier par le hook, `mailbox.unread` pour
+    `mail inbox`, index des fils), pour l'agent et l'epoch du jeton
+    seulement. Ce que le serveur ne lui ouvre pas est sauté ici :
 
     * pas d'inscription par le hook : l'exécuteur a déjà tout écrit sous son
       bail (`agents.upsert` exige le jeton d'exécuteur) ;
-    * pas de remise de courrier par le hook (`hook_delivery` faux) : la
-      réservation est une opération de l'exécuteur ; le courrier attend le
-      tour suivant, et un urgent préempte le tour côté exécuteur ;
-    * l'envoi n'écrit ni la ligne du destinataire, ni le fil local (index
-      des fils : opération de l'exécuteur)."""
+    * l'envoi n'écrit pas la ligne du destinataire (pas de création
+      implicite à distance)."""
 
     kind = "pg"
     mediated = True
-    hook_delivery = False
+    hook_delivery = True
 
     def send(self, sender: str, dest: str, text: str, host: str | None = None,
              signed: dict | None = None, work_item_id: str | None = None,
@@ -366,7 +366,7 @@ class MediatedBackend(PgBackend):
             targets = [dest]
         for target in targets:
             mail.send(self.db, sender, target, text, host=host, work_item_id=work_item_id,
-                      allow_structured=allow_structured, thread=False, kind=kind,
+                      allow_structured=allow_structured, thread=True, kind=kind,
                       payload={"urgent": True} if urgent else None, **dict(signed or {}))
         return targets
 

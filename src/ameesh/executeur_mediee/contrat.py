@@ -6,6 +6,14 @@ l'identité (L110) et la porte d'hôte (L112) s'appuient dessus en parallèle.
 Une modification incompatible passe par une nouvelle version du contrat
 (`ameesh-exec-contract/2`), jamais par une retouche silencieuse.
 
+Version 1.1 (assemblage de la voie B) : les écarts relevés par L108 à L112
+sont tranchés ici, dans `contrat.json`, dans les jeux dorés et dans
+`docs/EXECUTEUR-MEDIEE.md` (« Contrat 1.1 ») ; le client et le serveur
+suivent la même table. Ajouts compatibles : lignes servies aussi par
+`session/op` (`Operation.session`), forçages `executeur`,
+`owner_enveloppe`, `epoch_enveloppe`, empreinte d'idempotence définie pour
+les nombres décimaux.
+
 Il contient :
 
 * le chargeur de la table des opérations (`contrat.json`, livrée dans la
@@ -283,8 +291,14 @@ def new_idempotency_key() -> str:
 def request_sha256(body: Mapping) -> str:
     """Empreinte d'une requête pour l'idempotence : SHA-256 (hex) du JSON
     canonique (RFC 8785) du corps complet, `fence` compris. Même clé et même
-    empreinte : réponse rejouée ; même clé, autre empreinte : 409."""
-    return hashlib.sha256(jcs.canonicalize(dict(body))).hexdigest()
+    empreinte : réponse rejouée ; même clé, autre empreinte : 409.
+
+    Contrat 1.1 : les nombres décimaux (un TTL de 90.5 s, un coût de
+    0.031 $) sont écrits comme ECMAScript (RFC 8785 §3.2.2.3,
+    `jcs.canonicalize(doubles=True)`) ; `90.0` et `90` ont la même
+    empreinte. Restent refusés (`jcs.JcsError`, 400 `bad_args`) : NaN, les
+    infinis et les entiers hors de ±(2^53 − 1)."""
+    return hashlib.sha256(jcs.canonicalize(dict(body), doubles=True)).hexdigest()
 
 
 # --------------------------------------------------------------------------
@@ -329,6 +343,16 @@ class Operation:
     #: obligatoire pour toute écriture)
     naturally_idempotent: bool
     rules: tuple
+    #: contrat 1.1 : ligne de la route `op` servie AUSSI par `session/op`
+    #: (hook `agent-mail`, `mail inbox`, index des fils depuis la VM)
+    session: bool = False
+
+    @property
+    def routes(self) -> tuple:
+        """Les routes qui servent la ligne."""
+        if self.session and self.transport == "op":
+            return ("op", "session/op")
+        return (self.transport,)
 
     @property
     def domain(self) -> str:
@@ -396,7 +420,7 @@ class Contract:
         (`bad_args`, `fence_required`, `idempotency_key_required`).
         Les contrôles de PORTÉE ne sont pas ici : ils sont à L108."""
         op = self.get(req.op)
-        if op.transport != route:
+        if route not in op.routes:
             raise NotSupportedRemotely("%s n'est pas servie par %s" % (req.op, route))
         try:
             bound = self.bind(req.op, req.args, req.kwargs)
@@ -404,10 +428,11 @@ class Contract:
             raise ValueError("bad_args") from exc
         if op.fence and req.fence is None:
             raise ValueError("fence_required")
-        if not op.fence and req.fence is not None and op.transport == "session/op":
+        if not op.fence and req.fence is not None and route == "session/op":
             raise ValueError("bad_args")
         if op.fence and req.fence is not None:
-            if op.agent_param and bound.get(op.agent_param) not in (None, req.fence.agent):
+            if op.agent_param and agent_name(bound.get(op.agent_param)) not in (
+                    None, req.fence.agent):
                 raise ValueError("bad_args")
             for k in ("owner", "epoch"):
                 if k in bound and bound[k] is not None and bound[k] != getattr(req.fence, k):
@@ -415,6 +440,15 @@ class Contract:
         if op.write and not idempotency_key:
             raise ValueError("idempotency_key_required")
         return bound
+
+
+def agent_name(value: Any) -> Any:
+    """Le nom d'agent d'une valeur de `param_agent` : `agent:<nom>` (membre
+    d'un fil, `fil.member`) donne `<nom>` ; toute autre valeur est rendue
+    telle quelle."""
+    if isinstance(value, str) and value.startswith("agent:"):
+        return value[len("agent:"):]
+    return value
 
 
 def _param(d: Mapping) -> Param:
@@ -427,7 +461,8 @@ def _operation(d: Mapping) -> Operation:
         scope=tuple(d["portee"]), fence=d["fence"], agent_param=d["param_agent"],
         forced=dict(d["forces"]), params=tuple(_param(p) for p in d["parametres"]),
         result=d["resultat"], refusal=d["refus"],
-        naturally_idempotent=d["idempotence"]["naturelle"], rules=tuple(d["regles"]))
+        naturally_idempotent=d["idempotence"]["naturelle"], rules=tuple(d["regles"]),
+        session=bool(d.get("session", False)))
 
 
 def parse(data: Mapping) -> Contract:
@@ -440,6 +475,8 @@ def parse(data: Mapping) -> Contract:
             raise ValueError("opération en double : %s" % op.name)
         if op.transport not in TRANSPORTS or not set(op.scope) <= set(SCOPES):
             raise ValueError("ligne invalide : %s" % op.name)
+        if op.session and op.transport != "op":
+            raise ValueError("ligne invalide (session hors route op) : %s" % op.name)
         ops[op.name] = op
     ref = data["refusees"]
     return Contract(version=data["version"], prefix=data["prefixe"], operations=ops,

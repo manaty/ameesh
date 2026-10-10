@@ -19,8 +19,13 @@
      "args": [
       {
        "host": "anna-portable",
-       "cpu_load": 0.4,
-       "memory_available_mb": 5120
+       "mem_available_bytes": 5368709120,
+       "swap_used_bytes": 0,
+       "load1": 0.4,
+       "cpu_count": 4,
+       "disk_free_bytes": 21474836480,
+       "disk_path": "/var/lib/ameesh-exec",
+       "turns_in_progress": 1
       }
      ],
      "kwargs": {}
@@ -34,9 +39,15 @@
      "ok": true,
      "value": {
       "host": "anna-portable",
-      "cpu_load": 0.4,
-      "memory_available_mb": 5120,
-      "observed_ts": 1791640000.12
+      "mem_available_bytes": 5368709120,
+      "swap_used_bytes": 0,
+      "load1": 0.4,
+      "cpu_count": 4,
+      "disk_free_bytes": 21474836480,
+      "disk_path": "/var/lib/ameesh-exec",
+      "turns_in_progress": 1,
+      "id": 77,
+      "sampled_ts": 1791640000.12
      },
      "server_ts": 1791640000.12
     }
@@ -69,9 +80,15 @@
      "ok": true,
      "value": {
       "host": "anna-portable",
-      "cpu_load": 0.4,
-      "memory_available_mb": 5120,
-      "observed_ts": 1791640000.12
+      "mem_available_bytes": 5368709120,
+      "swap_used_bytes": 0,
+      "load1": 0.4,
+      "cpu_count": 4,
+      "disk_free_bytes": 21474836480,
+      "disk_path": "/var/lib/ameesh-exec",
+      "turns_in_progress": 1,
+      "id": 77,
+      "sampled_ts": 1791640000.12
      },
      "server_ts": 1791640000.12
     }
@@ -105,9 +122,15 @@
      "value": [
       {
        "host": "anna-portable",
-       "cpu_load": 0.4,
-       "memory_available_mb": 5120,
-       "observed_ts": 1791640000.12
+       "mem_available_bytes": 5368709120,
+       "swap_used_bytes": 0,
+       "load1": 0.4,
+       "cpu_count": 4,
+       "disk_free_bytes": 21474836480,
+       "disk_path": "/var/lib/ameesh-exec",
+       "turns_in_progress": 1,
+       "id": 77,
+       "sampled_ts": 1791640000.12
       }
      ],
      "server_ts": 1791640000.12

@@ -168,6 +168,39 @@ class StaticTokens:
         return identity
 
 
+class ExecutorTokens:
+    """`TokenVerifier` sur l'identité des exécuteurs (L110), monté par
+    `ameesh serve` : le jeton est vérifié par `identite.verify_token`
+    (`kind="session"` : échu, révoqué, bail perdu ou epoch changé → refus),
+    puis le bail est relu en base (`lease_owner`, même agent, même epoch,
+    owner de cet exécuteur, vivant) : c'est cet owner qui est inscrit au
+    grand livre.
+
+    `verify(token) -> Principal` lève `AuthError` ; `lease(principal) ->
+    owner | None`."""
+
+    def __init__(self, verify: Callable[[str], object],
+                 lease: Callable[[object], str | None]):
+        self._verify = verify
+        self._lease = lease
+
+    def verify_token(self, token: str) -> Identity:
+        from .executeur_mediee.interfaces import AuthError
+        try:
+            principal = self._verify(token)
+        except AuthError as exc:
+            raise TokenError(exc.code) from None
+        if getattr(principal, "kind", None) != "session" or not principal.agent:
+            raise TokenError("jeton de session attendu")
+        owner = self._lease(principal)
+        if not owner:
+            raise TokenError("bail du jeton de session terminé")
+        return Identity(executor=principal.executor_id, host=principal.host,
+                        agent=principal.agent, lease_owner=owner,
+                        lease_epoch=int(principal.epoch),
+                        expires_ts=principal.expires_ts or None)
+
+
 # ==========================================================================
 # modèles admis
 # ==========================================================================

@@ -50,7 +50,8 @@ class RejeuDoreTest(unittest.TestCase):
             with self.subTest(case=case["nom"]):
                 corps = case["requete"]["corps"]
                 op = CONTRAT.get(case["op"])
-                mode = "session" if op.transport == "session/op" else "executor"
+                route_doree = case["requete"]["chemin"][len(C.PREFIX) + 1:]
+                mode = "session" if route_doree == "session/op" else "executor"
                 transport = GoldenTransport(Responder.only(case))
                 db = make_db(transport, mode=mode)
                 _prime(db, case)
@@ -59,7 +60,7 @@ class RejeuDoreTest(unittest.TestCase):
                 value = _call(db, case["op"], corps["args"], corps["kwargs"])
                 self.assertEqual(len(transport.calls), 1, transport.calls)
                 route, body, key = transport.calls[0]
-                self.assertEqual(route, op.transport)
+                self.assertEqual(route, route_doree)
                 self.assertEqual(body, corps, "requête différente du jeu doré")
                 self.assertEqual(key is not None, op.write,
                                  "Idempotency-Key : présente pour toute écriture, seulement")
@@ -167,7 +168,7 @@ class NonPrisEnChargeTest(unittest.TestCase):
     def test_routes_selon_le_jeton(self):
         session = make_db(mode="session")
         with self.assertRaises(C.NotSupportedRemotely):
-            storage.of(session).mailbox.unread("inge-front", 10)  # route op
+            storage.of(session).agents.get("inge-front")  # route op seule
         executor = make_db()
         with self.assertRaises(C.NotSupportedRemotely):
             storage.of(executor).work.get(812)  # route session/op
@@ -347,7 +348,7 @@ class HttpTransportTest(unittest.TestCase):
         transport = _transport(self.server)
         info = transport.host_info()
         self.assertEqual((info.host, info.executor_id, info.lease_ttl_s),
-                         ("anna-portable", "7f3a", 90.0))
+                         ("anna-portable", "7f3a9c2e4b1d6058", 90.0))
         issued = transport.session_token(C.Fence("inge-front", OWNER, 42))
         self.assertEqual(issued.token, SESSION)
         self.assertEqual(self.server.requests[-1]["body"],

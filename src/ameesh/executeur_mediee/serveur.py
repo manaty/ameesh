@@ -3,7 +3,12 @@
 
 `ameesh serve --exec-only` le lance seul, tant que `ameesh serve` (L84,
 interface utilisateur et `/api/v1`) n'existe pas ; L84 montera `ExecApp`
-sous le même préfixe. Serveur de la bibliothèque standard
+sous le même préfixe. Assemblage de la voie B : l'identité des exécuteurs
+(L110, `LockedIdentity` sur `identite.DbIdentityProvider`) sert `/enroll`,
+`/token` et `/session-token` ; le relais de modèle (L111) est monté sous
+`/llm/` (`extra_routes={"llm": relay}`) ; les limites de `GET /host`
+viennent du canon (`resources.host_limits`) ; le canon est synchronisé par
+le serveur pour chaque hôte médié enrôlé. Serveur de la bibliothèque standard
 (`http.server`), aucune dépendance nouvelle ; défenses reprises
 d'ameesh-approve (limitation de débit, journal masqué, TLS local
 facultatif).
@@ -20,7 +25,8 @@ Routes (`contrat.ROUTES`) :
 | `POST /session-token` | accès + enveloppe | jeton de session (L110), bail recontrôlé ici |
 | `POST /session/op` | session | une opération « session » de la table |
 | `GET /events` | accès | SSE, ou attente longue avec `?wait=` |
-| `/work/{agent}/bundle`, `/llm/…` | — | montés par L113 et L111 (`extra_routes`) ; 404 sinon |
+| `/llm/…` | session (`x-api-key`) | relais de modèle (L111), monté par `extra_routes["llm"]` |
+| `/work/{agent}/bundle` | — | monté par L113 (`extra_routes`) ; 404 sinon |
 
 Bornes : corps ≤ `contrat.MAX_BODY_BYTES` (413 `too_large`, sans lecture),
 débit par adresse avant authentification et par exécuteur après (429
@@ -84,6 +90,69 @@ class HostPolicy:
     models: tuple = ()
     #: limites de l'hôte (format de `resources.host_limits`) ; None : {}
     limits: Optional[Callable[[str], Mapping]] = None
+
+
+class LockedIdentity(IdentityProvider):
+    """L'identité de L110 (`identite.DbIdentityProvider`) partagée par les
+    fils du serveur : une connexion dédiée, un appel à la fois. Une
+    connexion tombée (`Unavailable`) est rouverte à l'appel suivant."""
+
+    def __init__(self, connect: Callable[[], Any], *, mesh: Optional[str] = None):
+        self._connect = connect
+        self._mesh = mesh
+        self._lock = threading.Lock()
+        self._provider = None
+
+    def _call(self, name: str, *args, **kwargs):
+        from .identite import DbIdentityProvider
+        with self._lock:
+            if self._provider is None:
+                self._provider = DbIdentityProvider(self._connect(), mesh=self._mesh)
+            try:
+                return getattr(self._provider, name)(*args, **kwargs)
+            except Unavailable:
+                try:
+                    self._provider.db.close()
+                except Exception:
+                    pass
+                self._provider = None
+                raise
+
+    def verify(self, token: str) -> Principal:
+        return self._call("verify", token)
+
+    def verify_kind(self, token: str, kind: Optional[str]) -> Principal:
+        return self._call("verify_kind", token, kind)
+
+    def enroll(self, request, *, server_url: str) -> dict:
+        return self._call("enroll", request, server_url=server_url)
+
+    def issue_access_token(self, assertion: str, *, server_url: str):
+        return self._call("issue_access_token", assertion, server_url=server_url)
+
+    def issue_session_token(self, principal: Principal, fence: Fence):
+        return self._call("issue_session_token", principal, fence)
+
+    def revoke(self, executor_id: str, *, by: str, why: str) -> int:
+        return self._call("revoke", executor_id, by=by, why=why)
+
+
+def canon_limits(loader: Callable[[], Any]) -> Callable[[str], Mapping]:
+    """`HostPolicy.limits` tiré du canon (contrat 1.1, `HostInfo.limits`) :
+    `{"max_agents": int|None, "resources": {seuils}}`. Canon illisible :
+    `{}` (l'exécuteur garde ses seuils par défaut prudents)."""
+    from .. import resources as resources_mod
+
+    def limits(host: str) -> Mapping:
+        try:
+            current = loader()
+        except Exception as exc:
+            log.warning("limites de l'hôte illisibles (canon) : %s", str(exc)[:200])
+            return {}
+        canons = [current] if current is not None else []
+        found = resources_mod.host_limits(canons, host)
+        return {"max_agents": found["max_agents"], "resources": dict(found["limits"])}
+    return limits
 
 
 def _error(code: str, message: str = "", *, retry_after: Optional[float] = None) -> Response:
@@ -173,11 +242,22 @@ class ExecApp:
             return self._session_token(principal, body)
         return self._events(principal, query, headers)
 
+    def raw_route(self, target: str) -> Optional[Any]:
+        """Une route montée au niveau HTTP (objet doté de `handle(handler)`,
+        le relais de modèle de L111), ou None."""
+        relay = self.extra_routes.get("llm")
+        if relay is None or not hasattr(relay, "handle"):
+            return None
+        path = urllib.parse.urlsplit(target).path
+        return relay if path.startswith(contrat.PREFIX + "/llm/") else None
+
     def _extra_name(self, sub: str) -> Optional[str]:
         if sub.startswith("/work/") and sub.endswith("/bundle"):
             return "bundle" if "bundle" in self.extra_routes else None
         if sub.startswith("/llm/"):
-            return "llm" if "llm" in self.extra_routes else None
+            route = self.extra_routes.get("llm")
+            return "llm" if route is not None and callable(route) \
+                and not hasattr(route, "handle") else None
         return None
 
     # -- authentification ---------------------------------------------------------
@@ -480,6 +560,12 @@ class ExecHandler(BaseHTTPRequestHandler):
         log.info("%s", redact(format % args)[:200])
 
     def _serve(self) -> None:
+        relay = self.server.app.raw_route(self.path)
+        if relay is not None:
+            # relais de modèle (L111) : il lit son corps, authentifie le jeton
+            # de session (`x-api-key`) et recopie le flux du fournisseur
+            relay.handle(self)
+            return
         lengths = self.headers.get_all("Content-Length") or []
         if self.headers.get("Transfer-Encoding"):
             self._write(_error("bad_request", "Content-Length obligatoire"), close=True)
@@ -539,16 +625,22 @@ class ExecHandler(BaseHTTPRequestHandler):
 # `ameesh serve --exec-only`
 # --------------------------------------------------------------------------
 
-USAGE = """ameesh serve --exec-only --auth-file FICHIER [--listen HÔTE:PORT]
-        [--mesh NOM] [--server-url URL] [--lease-ttl S] [--lease-renew S]
+USAGE = """ameesh serve --exec-only --server-url URL [--listen HÔTE:PORT]
+        [--mesh NOM] [--lease-ttl S] [--lease-renew S]
         [--credential-modes relay,...] [--harnesses dsh,...] [--models m,...]
         [--rate-per-minute N] [--pool N] [--tls-cert F --tls-key F] [--allow-plain]
+        [--no-relay] [--canon-sync S] [--auth-file FICHIER]
 
-Le serveur de l'API d'exécuteur médiée (/api/exec/v1, lot L108). Tant que
-`ameesh serve` (L84) n'existe pas, seul --exec-only est servi. --auth-file :
-jetons fixes (bouchon, en attendant l'enrôlement de L110). Une écoute hors
-de la boucle locale exige TLS (--tls-cert/--tls-key) ou --allow-plain
-derrière un mandataire inverse qui termine TLS."""
+Le serveur de l'API d'exécuteur médiée (/api/exec/v1, lots L108 à L111).
+Tant que `ameesh serve` (L84) n'existe pas, seul --exec-only est servi.
+Identité : celle des exécuteurs enrôlés (L110) ; --auth-file remplace par
+des jetons fixes (banc d'essai seulement). --server-url : l'URL publique,
+celle que l'appareil a reçue avec son code (audience des assertions). Le
+relais de modèle (L111) est monté sous /api/exec/v1/llm/ (--no-relay pour
+s'en passer). --canon-sync S : canon synchronisé pour chaque hôte médié
+enrôlé toutes les S secondes (défaut 60 ; 0 : jamais). Une écoute hors de
+la boucle locale exige TLS (--tls-cert/--tls-key) ou --allow-plain derrière
+un mandataire inverse qui termine TLS."""
 
 
 def _parse(argv) -> argparse.Namespace:
@@ -568,6 +660,8 @@ def _parse(argv) -> argparse.Namespace:
     p.add_argument("--tls-cert")
     p.add_argument("--tls-key")
     p.add_argument("--allow-plain", action="store_true")
+    p.add_argument("--no-relay", action="store_true")
+    p.add_argument("--canon-sync", type=float, default=60.0)
     return p.parse_args(argv)
 
 
@@ -578,7 +672,7 @@ def _split(text: str) -> tuple:
 def build(cfg, auth: ExecutorAuth, *, mesh: str, pool_size: int = 8,
           policy: Optional[HostPolicy] = None, credential_modes=None,
           server_url: str = "", rate_per_minute: int = DEFAULT_RATE_PER_MINUTE,
-          listen: bool = True) -> ExecApp:
+          listen: bool = True, extra_routes: Optional[Mapping[str, Any]] = None) -> ExecApp:
     """Assemble le serveur sur la base de `cfg` (réservoir, répartiteur,
     écoute LISTEN). `listen=False` : flux sans écoute (essais)."""
     from .. import db as db_mod
@@ -594,7 +688,79 @@ def build(cfg, auth: ExecutorAuth, *, mesh: str, pool_size: int = 8,
     hub = EventHub(subscribe if listen else None)
     hub.start()
     return ExecApp(dispatcher, auth, hub, mesh=mesh, policy=policy, server_url=server_url,
-                   rate_per_minute=rate_per_minute)
+                   rate_per_minute=rate_per_minute, extra_routes=extra_routes)
+
+
+def build_relay(cfg, identity: LockedIdentity, pool: ConnectionPool):
+    """Le relais de modèle (L111) branché sur l'identité des exécuteurs :
+    jeton de session vérifié par L110, bail recontrôlé en base."""
+    from .. import db as db_mod
+    from .. import relay as relay_mod
+    verifier = relay_mod.ExecutorTokens(
+        lambda token: identity.verify_kind(token, "session"),
+        lambda principal: lease_owner(pool, principal))
+    return relay_mod.Relay(verifier=verifier,
+                           policy=relay_mod.CanonPolicy(relay_mod._canon_loader(cfg)),
+                           db=db_mod.connect(cfg), cfg=cfg)
+
+
+def lease_owner(pool: ConnectionPool, principal: Principal) -> Optional[str]:
+    """L'owner du bail lié à un jeton de session, s'il vit encore : même
+    agent, même epoch, owner de cet exécuteur, même hôte. None sinon."""
+    if not principal.agent or principal.epoch is None:
+        return None
+    with pool.connection() as conn:
+        rows = conn.query(
+            "SELECT lease_owner FROM agent_registry WHERE name = %s AND lease_epoch = %s"
+            "   AND lease_expires_at > clock_timestamp() AND host = %s"
+            "   AND starts_with(lease_owner, %s)",
+            (principal.agent, int(principal.epoch), principal.host,
+             "exec:%s:" % principal.executor_id))
+    return rows[0]["lease_owner"] if rows else None
+
+
+def mediated_hosts(db) -> list:
+    """Les hôtes qui ont au moins un exécuteur enrôlé non révoqué."""
+    rows = db.query("SELECT DISTINCT host FROM executors WHERE revoked_at IS NULL"
+                    " ORDER BY host")
+    return [r["host"] for r in rows]
+
+
+def sync_canon_once(cfg, db) -> list:
+    """Synchronise le canon par défaut pour chaque hôte médié (les
+    admissions, la politique et la visibilité de ses agents) ; rend les
+    hôtes synchronisés. Jamais fatal : un échec est journalisé."""
+    from .. import canon as canon_mod
+    from .. import canon_sync
+    done = []
+    try:
+        hosts = mediated_hosts(db)
+        if not hosts or not canon_mod.configured(cfg):
+            return done
+        canon = canon_mod.from_config(cfg)
+    except Exception as exc:
+        log.warning("canon des hôtes médiés illisible : %s", " ".join(str(exc).split())[:200])
+        return done
+    for host in hosts:
+        try:
+            canon_sync.sync(db, canon, host,
+                            trusted_ref=canon_sync.configured_ref_for(cfg, canon))
+            done.append(host)
+        except Exception as exc:
+            log.warning("canon sync de %s en échec : %s", host,
+                        " ".join(str(exc).split())[:200])
+    return done
+
+
+def _canon_loop(app: ExecApp, cfg, interval: float) -> None:
+    while True:
+        try:
+            with app.pool.connection() as conn:
+                sync_canon_once(cfg, conn)
+        except Exception as exc:
+            log.warning("canon des hôtes médiés : %s", str(exc)[:200])
+        if app.closing.wait(interval):
+            return
 
 
 def _purge_loop(app: ExecApp) -> None:
@@ -614,9 +780,9 @@ def main(argv=None) -> int:
         print("ameesh serve : seul --exec-only est servi (l'interface de L84 viendra)",
               file=sys.stderr)
         return 2
-    if not args.auth_file:
-        print("ameesh serve : --auth-file requis tant que l'identité de L110 manque",
-              file=sys.stderr)
+    if not args.auth_file and not args.server_url:
+        print("ameesh serve : --server-url requis (URL publique du serveur, audience des"
+              " assertions des exécuteurs)", file=sys.stderr)
         return 2
     host, _, port = args.listen.rpartition(":")
     host = host.strip("[]") or "127.0.0.1"
@@ -630,29 +796,45 @@ def main(argv=None) -> int:
               " (--tls-cert/--tls-key, ou --allow-plain derrière un mandataire TLS)",
               file=sys.stderr)
         return 2
-    from .bouchon import StaticAuth
-    try:
-        auth = StaticAuth.from_file(args.auth_file)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        print("ameesh serve : %s" % exc, file=sys.stderr)
-        return 2
     cfg = config_mod.load()
+    if args.auth_file:
+        from .bouchon import StaticAuth
+        try:
+            auth = StaticAuth.from_file(args.auth_file)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print("ameesh serve : %s" % exc, file=sys.stderr)
+            return 2
+    else:
+        auth = LockedIdentity(lambda: db_mod.connect(cfg), mesh=args.mesh or None)
     probe = db_mod.connect(cfg)
     try:
         db_mod.require_schema(probe)
     finally:
         probe.close()
+    from .. import relay as relay_mod
     policy = HostPolicy(lease_ttl_s=args.lease_ttl, lease_renew_s=args.lease_renew,
-                        harnesses=_split(args.harnesses), models=_split(args.models))
+                        harnesses=_split(args.harnesses), models=_split(args.models),
+                        limits=canon_limits(relay_mod._canon_loader(cfg)))
     modes = frozenset(_split(args.credential_modes)) or None
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     app = build(cfg, auth, mesh=args.mesh, pool_size=args.pool, policy=policy,
                 credential_modes=modes, server_url=args.server_url,
                 rate_per_minute=args.rate_per_minute)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    if not args.no_relay:
+        if not isinstance(auth, LockedIdentity):
+            print("ameesh serve : le relais exige l'identité des exécuteurs (sans"
+                  " --auth-file), ou --no-relay", file=sys.stderr)
+            return 2
+        app.extra_routes["llm"] = build_relay(cfg, auth, app.pool)
+    if args.canon_sync > 0 and isinstance(auth, LockedIdentity):
+        threading.Thread(target=_canon_loop, args=(app, cfg, args.canon_sync),
+                         daemon=True, name="canon-hotes-medies").start()
     server = ExecHTTPServer(app, (host, int(port)), tls=tls)
     threading.Thread(target=_purge_loop, args=(app,), daemon=True).start()
-    log.info("API d'exécuteur médiée sur %s:%s%s (contrat %s)", host, port, contrat.PREFIX,
-             app.contract.version)
+    log.info("API d'exécuteur médiée sur %s:%s%s (contrat %s, identité %s, relais %s)",
+             host, port, contrat.PREFIX, app.contract.version,
+             "L110" if isinstance(auth, LockedIdentity) else "jetons fixes",
+             "monté" if "llm" in app.extra_routes else "absent")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

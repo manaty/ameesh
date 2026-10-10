@@ -405,6 +405,8 @@ def is_mediated(cfg) -> bool:
     http(s) du serveur du mesh à la place du DSN, L109)."""
     if bool(getattr(cfg, "host_mediated", False)):
         return True
+    if str(getattr(cfg, "backend", "") or "") == "mediated":
+        return True  # L109 : `backend: mediated`
     dsn = str(getattr(cfg, "dsn", "") or "")
     return dsn.startswith(("http://", "https://"))
 
@@ -476,10 +478,24 @@ class TransportSink(AvailabilitySink):
     """Vers le serveur, par le transport de L109 : le corps figé
     `ameesh-exec-availability/1`, une fois par changement d'état."""
 
-    def __init__(self, transport, log: Callable[[str], None] | None = None):
+    #: nouvel essai d'un rapport en échec (secondes)
+    RETRY_S = 5.0
+
+    def __init__(self, transport, log: Callable[[str], None] | None = None,
+                 clock: Callable[[], float] = time.monotonic):
         self.transport = transport
         self._log = log or (lambda _m: None)
+        self._clock = clock
         self._sent: tuple | None = None
+        self._failed_at: float | None = None
+        self._failures = 0
+
+    def pending(self, state: GateState) -> bool:
+        """Un rapport reste-t-il à envoyer (état non reçu par le serveur, et
+        dernier échec assez ancien) ? Le contrôleur rappelle `report`."""
+        if _key(state) == self._sent:
+            return False
+        return self._failed_at is None or self._clock() - self._failed_at >= self.RETRY_S
 
     def report(self, state: GateState, ack: GateAck | None) -> None:
         if _key(state) == self._sent:
@@ -487,8 +503,13 @@ class TransportSink(AvailabilitySink):
         try:
             self.transport.put_availability(state)
             self._sent = _key(state)
-        except Exception as exc:  # serveur injoignable : renvoyé au prochain rapport
-            self._log("disponibilité non relayée au serveur (%s)" % exc)
+            self._failed_at, self._failures = None, 0
+        except Exception as exc:  # serveur injoignable : renvoyé toutes les RETRY_S
+            self._failed_at = self._clock()
+            self._failures += 1
+            if self._failures in (1, 10) or self._failures % 100 == 0:
+                self._log("disponibilité non relayée au serveur (%s), essai %d"
+                          % (exc, self._failures))
 
 
 class RegistrySink(AvailabilitySink):
@@ -558,9 +579,10 @@ class GateController:
         """Aucun nouveau tour (draining, stopped)."""
         return not self.current.may_claim
 
-    def max_concurrent(self) -> int | None:
-        cap = self.current.caps.get("max_concurrent")
-        return int(cap) if isinstance(cap, int) and not isinstance(cap, bool) else None
+    def max_concurrent(self) -> int:
+        """`caps.max_concurrent` de la porte, sinon `DEFAULT_MAX_CONCURRENT`
+        (contrat 1.1)."""
+        return self.current.max_concurrent
 
     def describe(self) -> str:
         st = self.current
@@ -684,6 +706,9 @@ class GateController:
             self._overdue = True
             self._log("porte d'hôte : retrait en retard de %ds, baux encore détenus : %s"
                       % (int(now - self.deadline), ", ".join(held)))
+        pending = getattr(self.sink, "pending", None)
+        if pending is not None and pending(state):
+            self._report(None)  # rapport au serveur encore en échec : nouvel essai
         ack = GateAck(seq=state.seq, state=state.state, in_turn=tuple(in_turn),
                       held=tuple(held), drained=drained, ts=now)
         key = (ack.seq, ack.state, ack.in_turn, ack.held, ack.drained)

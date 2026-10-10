@@ -16,7 +16,7 @@
      "schema": "ameesh-exec-op/1",
      "op": "actions.get",
      "args": [
-      "act-3b7e"
+      "act_01J9ZK3B7EQ4M8RTXW2HC5NVDA"
      ],
      "kwargs": {
       "with_receipts": false
@@ -30,7 +30,7 @@
      "schema": "ameesh-exec-result/1",
      "ok": true,
      "value": {
-      "action_id": "act-3b7e",
+      "action_id": "act_01J9ZK3B7EQ4M8RTXW2HC5NVDA",
       "state": "proposed",
       "connector": "github",
       "operation": "merge_pr",
@@ -56,7 +56,7 @@
      "op": "actions.propose",
      "args": [],
      "kwargs": {
-      "action_id": "act-3b7e",
+      "action_id": "act_01J9ZK3B7EQ4M8RTXW2HC5NVDA",
       "project": "site",
       "work_item": 812,
       "proposed_by": "inge-front",
@@ -68,8 +68,8 @@
       "amount": null,
       "currency": null,
       "policy_version": "1",
-      "digest": "sha256:…",
-      "dedupe": "merge-812",
+      "digest": "sha256:3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e3b7e",
+      "dedupe": "guaranteed",
       "requires_receipt": true,
       "approvers_json": "[]",
       "note": "fusion après revue"

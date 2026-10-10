@@ -1,6 +1,6 @@
 {
  "schema": "ameesh-exec-contract/1",
- "version": "1.0.0",
+ "version": "1.1.0",
  "prefixe": "/api/exec/v1",
  "description": "Contrat de l'API d'exécuteur médiée (L107) : la liste FERMÉE des opérations de storage.interface qu'un exécuteur d'appareil peut appeler, leur portée et leur fencing. Référence : docs/EXECUTEUR-MEDIEE.md.",
  "portees": {
@@ -12,7 +12,10 @@
  },
  "forces": {
   "hote_executeur": "l'hôte fixé à l'enrôlement remplace la valeur reçue",
-  "agent_session": "l'agent du jeton de session remplace la valeur reçue"
+  "agent_session": "l'agent du jeton de session remplace la valeur reçue",
+  "executeur": "l'identifiant de l'exécuteur authentifié remplace la valeur reçue",
+  "owner_enveloppe": "l'owner de l'enveloppe de bail remplace la valeur reçue",
+  "epoch_enveloppe": "l'epoch de l'enveloppe de bail remplace la valeur reçue"
  },
  "operations": [
   {
@@ -1267,7 +1270,11 @@
     "cle": "aucune",
     "naturelle": true
    },
-   "regles": []
+   "regles": [
+    "limit borné à 200",
+    "session : recipient = agent du jeton"
+   ],
+   "session": true
   },
   {
    "nom": "mailbox.unread_urgent",
@@ -1447,8 +1454,10 @@
     "naturelle": false
    },
    "regles": [
-    "owner et epoch non nuls à distance"
-   ]
+    "owner et epoch non nuls à distance",
+    "session : recipient = agent du jeton, epoch = epoch du jeton"
+   ],
+   "session": true
   },
   {
    "nom": "mailbox.deliver",
@@ -1523,8 +1532,10 @@
     "naturelle": false
    },
    "regles": [
-    "owner et epoch non nuls à distance"
-   ]
+    "owner et epoch non nuls à distance",
+    "session : recipient = agent du jeton, epoch = epoch du jeton"
+   ],
+   "session": true
   },
   {
    "nom": "mailbox.release",
@@ -1573,7 +1584,10 @@
     "cle": "requise",
     "naturelle": false
    },
-   "regles": []
+   "regles": [
+    "session : recipient = agent du jeton, epoch de l'enveloppe = epoch du jeton"
+   ],
+   "session": true
   },
   {
    "nom": "pending_spend.put",
@@ -1750,7 +1764,12 @@
    ],
    "fence": true,
    "param_agent": "agent",
-   "forces": {},
+   "forces": {
+    "source": "device",
+    "executor": "executeur",
+    "lease_owner": "owner_enveloppe",
+    "lease_epoch": "epoch_enveloppe"
+   },
    "parametres": [
     {
      "nom": "agent",
@@ -1900,6 +1919,54 @@
      },
      "requis": false,
      "defaut": null
+    },
+    {
+     "nom": "source",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": false,
+     "defaut": null
+    },
+    {
+     "nom": "executor",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": false,
+     "defaut": null
+    },
+    {
+     "nom": "lease_owner",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "requis": false,
+     "defaut": null
+    },
+    {
+     "nom": "lease_epoch",
+     "sorte": "nomme",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "requis": false,
+     "defaut": null
     }
    ],
    "resultat": {
@@ -1911,7 +1978,8 @@
     "naturelle": false
    },
    "regles": [
-    "ligne rangée source=device, hors plafond ; le relais fait foi (L111)"
+    "ligne rangée source=device avec l'exécuteur et le bail de l'enveloppe, quelles que soient les valeurs reçues",
+    "hors plafond : seuls les relevés du relais (source=relay) font foi pour la dépense d'un appareil (turn_costs.spent ignore source=device)"
    ]
   },
   {
@@ -2525,7 +2593,8 @@
     "naturelle": false
    },
    "regles": [
-    "reading.host forcé à l'hôte de l'exécuteur ; auto-déclaré, jamais une preuve"
+    "reading.host forcé à l'hôte de l'exécuteur ; auto-déclaré, jamais une preuve",
+    "clés du relevé : celles de host_resources (mem_available_bytes, swap_used_bytes, load1, cpu_count, disk_free_bytes, disk_path, turns_in_progress) ; rendu : la ligne écrite (id, host, sampled_ts, mêmes clés)"
    ]
   },
   {
@@ -2782,8 +2851,10 @@
     "naturelle": false
    },
    "regles": [
-    "author = agent de l'enveloppe de bail"
-   ]
+    "author = agent:<agent de l'enveloppe> (membre du fil, `fil.member`) ; le nom nu est aussi admis",
+    "session : l'enveloppe porte l'agent et l'epoch du jeton"
+   ],
+   "session": true
   },
   {
    "nom": "work.mark_delegate_turn",
@@ -2913,7 +2984,8 @@
     "naturelle": true
    },
    "regles": [
-    "name = agent du jeton de session"
+    "name = agent du jeton de session",
+    "rendu : {lease_owner, lease_epoch, status, live} (clés du pilote, lues par registry.lease_matches)"
    ]
   },
   {
@@ -2940,7 +3012,7 @@
     "naturelle": true
    },
    "regles": [
-    "annuaire réduit : name, role, status seulement"
+    "annuaire réduit : name, team, chantier, canon_governed, status seulement (pas de colonne role : le projet du fil se déduit de team/chantier, fil.agent_project)"
    ]
   },
   {
@@ -3770,5 +3842,6 @@
     "timeline"
    ]
   }
- }
+ },
+ "session_aussi": "une ligne marquée `session: true` est servie par sa route (`op`) ET par `session/op` : avec le jeton de session, l'agent contrôlé (param_agent, `agent:` retiré) doit être celui du jeton, et l'enveloppe de bail (portée B) doit porter cet agent et l'epoch du jeton ; le fencing est le même. C'est la voie du hook `agent-mail` et de `mail inbox` dans la VM (contrat 1.1)."
 }

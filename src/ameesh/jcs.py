@@ -18,9 +18,14 @@ Ce qui est fait, selon la RFC 8785 :
 
 Ce qui est **refusé** plutôt que mal sérialisé :
 
-* les nombres non entiers (la sérialisation ECMAScript des doubles n'est pas
-  reproduite ici) ; un flottant entier (`1.0`) est accepté et écrit `1` comme
-  le ferait ECMAScript ; `-0.0` s'écrit `0` ;
+* les nombres non entiers, par défaut ; un flottant entier (`1.0`) est
+  accepté et écrit `1` comme le ferait ECMAScript ; `-0.0` s'écrit `0`.
+  Avec `doubles=True` (empreinte d'idempotence de l'API d'exécuteur, contrat
+  1.1), les doubles sont écrits comme `Number.prototype.toString`
+  d'ECMAScript (RFC 8785 §3.2.2.3) : chiffres les plus courts qui relisent
+  le même double, notation exponentielle hors de [1e-6, 1e21[. Les reçus et
+  les empreintes d'action gardent le refus : un signataire tiers n'a pas à
+  reproduire cette sérialisation ;
 * les entiers hors de l'intervalle sûr ±(2^53 − 1) : au-delà, un double ne
   distingue plus deux entiers voisins (2^53 et 2^53 + 1 ont la même
   représentation), et deux signataires pourraient ne pas voir le même nombre ;
@@ -67,13 +72,36 @@ def _string(text: str) -> str:
     return "".join(out)
 
 
-def _number(value) -> str:
+def _double(value: float) -> str:
+    """Un double fini non entier, comme `Number.prototype.toString`."""
+    from decimal import Decimal
+    sign = "-" if value < 0 else ""
+    sign_, digits_t, exponent = Decimal(repr(abs(value))).normalize().as_tuple()
+    digits = "".join(str(d) for d in digits_t)
+    k = len(digits)
+    n = exponent + k  # position de la virgule
+    if k <= n <= 21:
+        body = digits + "0" * (n - k)
+    elif 0 < n <= 21:
+        body = digits[:n] + "." + digits[n:]
+    elif -6 < n <= 0:
+        body = "0." + "0" * (-n) + digits
+    else:
+        e = n - 1
+        mantissa = digits[0] + ("." + digits[1:] if k > 1 else "")
+        body = "%se%s%d" % (mantissa, "+" if e > 0 else "-", abs(e))
+    return sign + body
+
+
+def _number(value, doubles: bool = False) -> str:
     if isinstance(value, int):
         if abs(value) > MAX_SAFE_INTEGER:
             raise JcsError("entier hors de l'intervalle sûr ±(2^53-1) : %d" % value)
         return str(value)
     if not math.isfinite(value):
         raise JcsError("nombre non fini refusé : %r" % value)
+    if doubles:
+        return "0" if value == 0 else _double(value)
     if not value.is_integer():
         raise JcsError("nombre non entier refusé : %r (JCS des doubles non pris en charge)" % value)
     if abs(value) > MAX_SAFE_INTEGER:
@@ -87,7 +115,7 @@ def _utf16_key(key: str) -> bytes:
     return key.encode("utf-16-be")
 
 
-def _encode(value, out: list, depth: int) -> None:
+def _encode(value, out: list, depth: int, doubles: bool = False) -> None:
     if depth > MAX_DEPTH:
         raise JcsError("imbrication trop profonde (> %d)" % MAX_DEPTH)
     if value is None:
@@ -99,7 +127,7 @@ def _encode(value, out: list, depth: int) -> None:
     elif isinstance(value, str):
         out.append(_string(value))
     elif isinstance(value, (int, float)):
-        out.append(_number(value))
+        out.append(_number(value, doubles))
     elif isinstance(value, dict):
         items = []
         for key, item in value.items():
@@ -114,29 +142,29 @@ def _encode(value, out: list, depth: int) -> None:
                 out.append(",")
             out.append(encoded_key)
             out.append(":")
-            _encode(item, out, depth + 1)
+            _encode(item, out, depth + 1, doubles)
         out.append("}")
     elif isinstance(value, (list, tuple)):
         out.append("[")
         for index, item in enumerate(value):
             if index:
                 out.append(",")
-            _encode(item, out, depth + 1)
+            _encode(item, out, depth + 1, doubles)
         out.append("]")
     else:
         raise JcsError("type non JSON : %s" % type(value).__name__)
 
 
-def dumps(value) -> str:
-    """Forme canonique JCS (texte)."""
+def dumps(value, *, doubles: bool = False) -> str:
+    """Forme canonique JCS (texte). `doubles` : voir l'en-tête."""
     out: list[str] = []
-    _encode(value, out, 0)
+    _encode(value, out, 0, doubles)
     return "".join(out)
 
 
-def canonicalize(value) -> bytes:
+def canonicalize(value, *, doubles: bool = False) -> bytes:
     """Forme canonique JCS, en octets UTF-8 — ce qui est haché et signé."""
-    return dumps(value).encode("utf-8")
+    return dumps(value, doubles=doubles).encode("utf-8")
 
 
 def _no_duplicates(pairs):

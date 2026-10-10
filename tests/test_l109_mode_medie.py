@@ -82,7 +82,7 @@ class FicheHoteTest(MedieBase):
         self.assertTrue(runner.mediated)
         self.assertEqual(runner.host, "anna-portable")
         self.assertEqual(runner.cfg.host, "anna-portable")
-        self.assertEqual(runner.runner_id, "exec:7f3a:anna-portable:%d" % os.getpid())
+        self.assertEqual(runner.runner_id, "exec:7f3a9c2e4b1d6058:anna-portable:%d" % os.getpid())
         self.assertEqual(runner.lease_ttl, 90.0)
         self.assertEqual(runner._host_max_agents, 1)
         self.assertFalse(runner.relocate)
@@ -339,23 +339,36 @@ class SessionTest(unittest.TestCase):
         self.responder.script["mailbox.send"] = {
             "id": 813, "created_ts": 1791640000.12, "sender_project": "site",
             "recipient_project": "site"}
+        self.responder.script["threads.index"] = None
         code, out, err = self.ameesh("mail", "send", "coord", "PR prête pour relecture.",
                                      "--lot", "812")
         self.assertEqual(code, 0, err)
         self.assertIn("coord", out)
-        self.assertEqual(self.server.ops(), ["leases.state", "mailbox.send"])
-        req = self.session_requests()[-1]
+        # contrat 1.1 : le fil est indexé depuis la session, auteur `agent:<nom>`
+        self.assertEqual(self.server.ops(), ["leases.state", "mailbox.send", "threads.index"])
+        index = [r for r in self.session_requests() if r["body"]["op"] == "threads.index"][0]
+        self.assertEqual(index["body"]["kwargs"]["author"], "agent:inge-front")
+        self.assertEqual(index["body"]["fence"]["epoch"], 42)
+        req = [r for r in self.session_requests() if r["body"]["op"] == "mailbox.send"][-1]
         self.assertEqual(req["body"]["args"][:2], ["inge-front", "coord"])
         self.assertTrue(req["headers"].get(C.IDEMPOTENCY_HEADER))
         self.assert_session_only()
 
-    def test_hook_sans_inscription_ni_remise(self):
+    def test_hook_remet_par_la_session(self):
+        # contrat 1.1 : réservation du hook avec le jeton de session ; pas
+        # d'inscription (l'exécuteur a tout écrit sous son bail)
+        self.responder.script["mailbox.reserve"] = []
         code, out, _err = self.ameesh("mail", "hook", "claude",
                                       stdin=json.dumps({"hook_event_name": "Stop",
                                                         "session_id": "s1"}))
         self.assertEqual(code, 0)
         self.assertEqual(out, "")
-        self.assertEqual(self.server.ops(), ["leases.state"])
+        self.assertIn("mailbox.reserve", self.server.ops())
+        self.assertNotIn("agents.upsert", self.server.ops())
+        reserve = [r for r in self.session_requests() if r["body"]["op"] == "mailbox.reserve"]
+        self.assertEqual(reserve[0]["body"]["fence"],
+                         {"agent": "inge-front", "owner": OWNER, "epoch": 42})
+        self.assert_session_only()
 
     def test_hook_bail_invalide_ne_touche_a_rien(self):
         self.responder.script["leases.state"] = {
@@ -366,12 +379,13 @@ class SessionTest(unittest.TestCase):
         self.assertEqual((code, out), (0, ""))
         self.assertIn("non liée", err)
 
-    def test_inbox_non_admise_par_le_contrat(self):
-        # écart du contrat L107 : `mailbox.unread` est de la route `op`
+    def test_inbox_par_la_session(self):
+        # contrat 1.1 : `mailbox.unread` est ouverte au jeton de session
+        self.responder.script["mailbox.unread"] = []
         code, _out, err = self.ameesh("mail", "inbox")
-        self.assertEqual(code, 1)
-        self.assertIn("mailbox.unread", err)
-        self.assertNotIn("mailbox.unread", self.server.ops())
+        self.assertEqual(code, 0, err)
+        self.assertIn("mailbox.unread", self.server.ops())
+        self.assert_session_only()
 
     def test_work_note_et_move(self):
         # les états des jeux dorés (`doing`, `review`) ne sont pas ceux de

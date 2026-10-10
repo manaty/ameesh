@@ -123,6 +123,8 @@ def log_async(message: str) -> None:
 
 #: délai borné accordé au fil `journal` pour vider sa file à l'arrêt
 JOURNAL_CLOSE_TIMEOUT = 2.0
+#: code de sortie d'un exécuteur médié révoqué par le serveur (L114, §7)
+EXIT_REVOKED = 6
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -1979,7 +1981,6 @@ class AgentWorker(threading.Thread):
         `AMEESH_BACKEND=mediated`, `AMEESH_EXEC_URL`, `AMEESH_EXEC_TOKEN`.
         Sans jeton (serveur injoignable), le tour part quand même : seules
         les commandes `ameesh` de la session échoueront."""
-        from .executeur_mediee import contrat as exec_contrat
         from .executeur_mediee.interfaces import ENV_SERVER_URL, ENV_SESSION_TOKEN
         for name in ("AMEESH_DSN", "AGENT_MESH_DSN", "AMEESH_DATABASE_URL",
                      "AGENT_MESH_DATABASE_URL", ENV_SESSION_TOKEN):
@@ -1987,9 +1988,8 @@ class AgentWorker(threading.Thread):
         env["AMEESH_BACKEND"] = env["AGENT_MESH_BACKEND"] = "mediated"
         env[ENV_SERVER_URL] = getattr(self.db, "url", "") or self.cfg.exec_url
         try:
-            issued = self.db.session_token(
-                exec_contrat.Fence(self.name, self.runner.runner_id, self.epoch))
-            env[ENV_SESSION_TOKEN] = issued.token
+            env[ENV_SESSION_TOKEN] = self.runner.session_token_for(
+                self.name, self.runner.runner_id, self.epoch)
         except db_mod.DbError as exc:
             log_async("[%s] jeton de session indisponible (%s) : les commandes ameesh de la "
                       "session échoueront" % (self.name, db_mod.explain(exc)))
@@ -2142,9 +2142,15 @@ class AgentWorker(threading.Thread):
         # sans jeton, pas de tour (jamais de repli sur une clé locale).
         from . import relay as relay_mod
         try:
+            relay_env = None
+            if getattr(self.runner, "mediated", False):
+                # le relais est sur le serveur du mesh de CET exécuteur
+                relay_env = {"AMEESH_RELAY_URL": os.environ.get("AMEESH_RELAY_URL", ""),
+                             "AMEESH_EXEC_URL": getattr(self.db, "url", "")
+                             or self.cfg.exec_url}
             relay_mod.apply_turn_env(env, harness, agent=self.name,
                                      owner=self.runner.runner_id, epoch=self.epoch,
-                                     turn_id=turn_id)
+                                     turn_id=turn_id, environ=relay_env)
         except relay_mod.RelayTurnError as exc:
             log("[%s] %s : tour non lancé" % (self.name, exc))
             self.fail_turn("relais de modèle indisponible", str(exc))
@@ -2590,8 +2596,9 @@ class Runner:
         #: `/api/exec/v1` (`storage.remote`). Synchronisation du canon, relevé
         #: des soldes, échéance des délégations et déplacement entre hôtes
         #: passent au serveur ; l'hôte, l'owner, le bail et les limites
-        #: viennent de `GET /host`. Porte d'hôte (L112) : `AlwaysAvailable`
-        #: par défaut.
+        #: viennent de `GET /host`. Porte d'hôte (L112) : celle de la
+        #: configuration, sinon `AlwaysAvailable`, relayée au serveur
+        #: (`_mediated_gate`).
         self.mediated = getattr(db, "driver", None) == "mediated"
         from .executeur_mediee import porte as porte_mod
         self.gate = porte_mod.AlwaysAvailable()
@@ -2605,8 +2612,56 @@ class Runner:
         #: comportement inchangé)
         from .executeur_mediee import porte_hote
         self.host_gate = porte_hote.controller_from_config(self, log=log_async)
+        if self.mediated:
+            self._mediated_gate()
 
     # -- exécuteur médié (L109) ---------------------------------------------
+    def _mediated_gate(self) -> None:
+        """L112 dans L109 : la porte de l'hôte est relayée au serveur
+        (`PUT /host/availability`) au démarrage, à chaque changement et
+        jusqu'à ce que le serveur l'ait reçue ; sans porte configurée,
+        `AlwaysAvailable` (le serveur doit quand même apprendre que l'hôte
+        est disponible : sans rapport, il le tient pour indisponible)."""
+        from .executeur_mediee import porte as porte_mod
+        from .executeur_mediee import porte_hote
+        sink = porte_hote.TransportSink(self.db.transport, log=log_async)
+        if self.host_gate is None:
+            self.host_gate = porte_hote.GateController(
+                self, porte_mod.AlwaysAvailable(),
+                drain_s=getattr(self.cfg, "host_gate_drain", porte_mod.DEFAULT_DRAIN_S),
+                sink=sink, log=log_async)
+        else:
+            self.host_gate.sink = sink
+        self.gate = self.host_gate.gate
+        # jetons de session : un par bail (agent, owner, epoch), il vit tant
+        # que le bail vit ; partagé par la session du harnais et le relais
+        self._session_tokens: dict = {}
+        self._session_tokens_lock = threading.Lock()
+        from . import relay as relay_mod
+        relay_mod.set_session_token_source(
+            lambda agent, owner, epoch, _turn: self.session_token_for(agent, owner, epoch))
+
+    #: un jeton de session vit au plus 12 h (L110) ; renouvelé avant
+    SESSION_TOKEN_REUSE_S = 11 * 3600.0
+
+    def session_token_for(self, agent: str, owner: str, epoch: int) -> str:
+        """Le jeton de session du bail (agent, owner, epoch) : demandé une
+        fois (`POST /session-token`), réutilisé pour la session du harnais
+        et le relais de modèle. Lève `DbError` si le serveur le refuse."""
+        from .executeur_mediee import contrat as exec_contrat
+        key = (agent, owner, int(epoch))
+        now = time.monotonic()
+        with self._session_tokens_lock:
+            for stale in [k for k in self._session_tokens if k[0] == agent and k != key]:
+                del self._session_tokens[stale]
+            hit = self._session_tokens.get(key)
+            if hit is not None and now - hit[0] < self.SESSION_TOKEN_REUSE_S:
+                return hit[1]
+        issued = self.db.session_token(exec_contrat.Fence(agent, owner, int(epoch)))
+        with self._session_tokens_lock:
+            self._session_tokens[key] = (now, issued.token)
+        return issued.token
+
     def _mediated_setup(self) -> None:
         """La fiche de l'hôte rendue par le serveur (`GET /host`) : hôte fixé
         à l'enrôlement, owner `exec:<id>:<hôte>:<pid>`, bail imposé, limites
@@ -2621,11 +2676,11 @@ class Runner:
         self.runner_id = owner
         if info.lease_ttl_s:
             self.lease_ttl = float(info.lease_ttl_s)
+        # contrat 1.1 : `limits` = {"max_agents": int|null, "resources":
+        # {seuils de resources.THRESHOLD_KEYS}} (interfaces.HostInfo)
         limits = dict(info.limits or {})
-        resources = dict(limits.get("resources") or {})
-        resources.update({k: v for k, v in limits.items()
-                          if k in resources_mod.THRESHOLD_KEYS})
-        self._host_limits = resources_mod.thresholds({"resources": resources})
+        self._host_limits = resources_mod.thresholds(
+            {"resources": dict(limits.get("resources") or {})})
         self._pressure["limits"] = self._host_limits
         maximum = limits.get("max_agents")
         self._host_max_agents = int(maximum) if maximum is not None else None
@@ -2682,8 +2737,6 @@ class Runner:
                     del self.workers[name]
         if self.gate_holds():
             return  # L112 : porte d'hôte fermée — aucune réclamation
-        if getattr(self, "mediated", False) and not self.gate.state().may_claim:
-            return  # L109/L112 : porte d'hôte fermée, aucune nouvelle réclamation
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
@@ -3233,6 +3286,10 @@ class Runner:
         self.start_resource_poll()
         if self.host_gate is not None and not self.once:
             self.host_gate.start()
+        elif self.host_gate is not None and getattr(self, "mediated", False):
+            # `--once` médié : la disponibilité est rapportée une fois au
+            # serveur avant la réclamation
+            self.host_gate.apply(self.host_gate.gate.state())
         if self.once:
             self.sweep()
             if not self.did_turn:
@@ -3250,6 +3307,7 @@ class Runner:
                         # L109 : exécuteur révoqué par le serveur — arrêt, sans
                         # nouvel essai (les baux sont déjà relâchés côté serveur)
                         log_async("exécuteur révoqué par le serveur : arrêt (%s)" % exc)
+                        self.revoked = True
                         break
                     if self.stop.is_set():
                         # arrêt en cours : systemd a pu tuer le `psql` fils
@@ -3275,7 +3333,9 @@ class Runner:
                 self.wake_all.clear()
         finally:
             self.shutdown()
-        return 0
+        # L114 (interface `ameesh-executor/1`, §7) : 6 = exécuteur révoqué,
+        # le lanceur efface le volume et ne relance pas sans nouveau code
+        return EXIT_REVOKED if getattr(self, "revoked", False) else 0
 
 
 # --------------------------------------------------------------------------

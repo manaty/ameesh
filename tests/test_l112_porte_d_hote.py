@@ -332,9 +332,10 @@ class ControleurTest(unittest.TestCase):
         self.assertTrue(any("en retard" in m for m in self.log))
 
     def test_plafond_de_concurrence(self):
-        self.assertIsNone(self.ctl.max_concurrent())
-        self.ctl.apply(P.GateState("available", 2, caps={"max_concurrent": 1}))
-        self.assertEqual(self.ctl.max_concurrent(), 1)
+        # contrat 1.1 : sans `caps.max_concurrent`, le défaut explicite
+        self.assertEqual(self.ctl.max_concurrent(), P.DEFAULT_MAX_CONCURRENT)
+        self.ctl.apply(P.GateState("available", 2, caps={"max_concurrent": 3}))
+        self.assertEqual(self.ctl.max_concurrent(), 3)
 
 
 # ==========================================================================

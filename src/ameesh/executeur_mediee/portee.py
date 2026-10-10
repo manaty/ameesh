@@ -35,7 +35,7 @@ from typing import Any, Mapping, Optional
 
 from ..storage.postgres.mailbox import PROJECT_SQL
 from ..storage.postgres.registry import canon_governed_sql, placement_admitted_sql
-from .contrat import Fence, Operation
+from .contrat import Fence, Operation, agent_name
 from .interfaces import Principal, ScopeError, ScopeRules
 
 #: bornes de taille des arguments (en plus de `contrat.MAX_BODY_BYTES`)
@@ -109,11 +109,31 @@ class HostScopeRules(ScopeRules):
                 kwargs[param] = principal.host
             elif value == "agent_session":
                 kwargs[param] = self._session_identity(principal, op, param)
+            elif value == "executeur":
+                kwargs[param] = principal.executor_id
+            elif value in ("owner_enveloppe", "epoch_enveloppe"):
+                if fence is None:
+                    raise ScopeError("bad_args", "enveloppe de bail absente")
+                kwargs[param] = fence.owner if value == "owner_enveloppe" else fence.epoch
             else:
                 kwargs[param] = value
         if op.transport == "session/op":
             if not principal.agent:
                 raise ScopeError("forbidden_scope", "jeton de session sans agent")
+        elif principal.kind == "session":
+            # contrat 1.1 : ligne de la route `op` servie aussi par
+            # `session/op` (hook agent-mail, mail inbox, index des fils) —
+            # l'agent et l'epoch sont ceux du jeton, jamais ceux du corps
+            if not principal.agent or principal.epoch is None:
+                raise ScopeError("forbidden_scope", "jeton de session sans agent")
+            if op.agent_param and agent_name(kwargs.get(op.agent_param)) != principal.agent:
+                raise ScopeError("forbidden_scope", "seul l'agent du jeton de session")
+            if "B" in op.scope:
+                if (fence is None or fence.agent != principal.agent
+                        or int(fence.epoch) != int(principal.epoch)):
+                    raise ScopeError("forbidden_scope",
+                                     "enveloppe de bail ≠ agent et epoch du jeton de session")
+                self._require_admitted(principal, fence.agent)
         else:
             if "B" in op.scope:
                 if fence is None:   # déjà refusé par validate_request
@@ -335,11 +355,13 @@ class HostScopeRules(ScopeRules):
         return [r for r in value or () if (r.get("scope") or "") in admitted
                 or not r.get("scope")]
 
+    #: colonnes de l'annuaire réduit (contrat 1.1) : de quoi calculer le
+    #: projet du fil (`fil.agent_project`), rien d'autre
+    OVERVIEW_KEYS = ("name", "team", "chantier", "canon_governed", "status")
+
     def _filter_agents_overview(self, principal, value):
-        # annuaire réduit : ni consigne, ni dossier, ni bail. `role` : l'équipe
-        # de la fiche (le registre n'a pas de colonne « rôle »)
-        return [{"name": r.get("name"), "role": r.get("team") or "", "status": r.get("status")}
-                for r in value or ()]
+        # annuaire réduit : ni consigne, ni dossier, ni bail, ni hôte
+        return [{k: r.get(k) for k in self.OVERVIEW_KEYS} for r in value or ()]
 
     def _filter_work_get(self, principal, value):
         if not value:

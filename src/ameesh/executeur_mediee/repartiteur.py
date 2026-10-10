@@ -365,18 +365,13 @@ class PgDispatcher(ExecDispatcher):
 
 
 def request_digest(body: Mapping) -> str:
-    """Empreinte d'idempotence d'un corps : `contrat.request_sha256` (JCS),
-    sauf si le corps porte un nombre non entier, que `ameesh.jcs` refuse
-    (« JCS des doubles non pris en charge ») : un TTL de 90.5 s, un coût de
-    0.031 $… Repli : SHA-256 d'un JSON trié et compact (`repr` des flottants,
-    déterministe), préfixé `json:`. L'empreinte ne quitte jamais le serveur :
-    seule sa stabilité compte (écart du contrat L107, signalé)."""
+    """Empreinte d'idempotence d'un corps : `contrat.request_sha256` (JCS,
+    doubles à la manière d'ECMAScript, contrat 1.1). Un nombre que JCS
+    refuse (NaN, infini, entier hors de ±(2^53 − 1)) : 400 `bad_args`."""
     try:
         return contrat.request_sha256(body)
     except jcs.JcsError:
-        text = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-                          allow_nan=False)
-        return "json:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+        raise _Refusal("bad_args", "nombre non canonisable (JCS)")
 
 
 def _dumps(value) -> str:

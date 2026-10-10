@@ -124,7 +124,12 @@ class IdentityProvider(ExecutorAuth):
     def issue_session_token(self, principal: Principal, fence: Fence) -> IssuedToken:
         """`POST /session-token` : `fence` doit être un bail vivant de
         l'exécuteur `principal` (contrôlé par l'appelant, L108, dans sa
-        transaction) ; le jeton porte (exécuteur, agent, epoch)."""
+        transaction) ; le jeton porte (exécuteur, agent, epoch). Il vit
+        tant que ce bail vit (renouvellements compris), au plus 12 h ;
+        `expires_ts` annonce l'échéance du bail à l'émission. Lève
+        `AuthError` (`token_invalid`, `executor_revoked`) ou
+        `ScopeError("forbidden_scope")` (owner d'un autre exécuteur, agent
+        hors de la liste de l'invitation, bail perdu)."""
 
     @abc.abstractmethod
     def revoke(self, executor_id: str, *, by: str, why: str) -> int:
@@ -154,8 +159,11 @@ class HostInfo:
     host: str
     mesh: str
     executor_id: str
-    #: limites de l'hôte (max_agents, seuils 0028), au format de
-    #: `resources.host_limits`
+    #: limites physiques de l'hôte (contrat 1.1) : `{"max_agents": int |
+    #: null, "resources": {"min_mem_available": octets, "max_swap_used":
+    #: octets, "max_load": nombre, "min_disk_free": octets}}` — `max_agents`
+    #: et `limits` de `resources.host_limits`, les seuils absents prenant
+    #: leur défaut prudent côté exécuteur (`resources.thresholds`)
     limits: Mapping[str, Any]
     lease_ttl_s: float
     lease_renew_s: float

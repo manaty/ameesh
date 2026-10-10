@@ -7,6 +7,7 @@ interfaces figées entre L108, L109, L110 et L112 à leur liste de méthodes.
 """
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
@@ -62,6 +63,11 @@ def _schema(ann: str) -> dict:
     raise AssertionError("annotation non prévue par le contrat : %s" % ann)
 
 
+ARGS_THREADS = {"project": "site", "lot": "812", "transport": "github", "host": "h",
+                "location": "owner/repo#812", "entry_id": "c-1", "mailbox_ids": [1],
+                "author": "agent:a", "excerpt": "x", "ts": 1.5, "trace": {}}
+
+
 def _golden(name: str) -> dict:
     with open(os.path.join(DORE, name), encoding="utf-8") as fh:
         return json.load(fh)
@@ -87,6 +93,11 @@ class TableTest(unittest.TestCase):
         self.assertEqual(sum(o.write for o in ops), 38)
         self.assertEqual(sum(not o.write for o in ops), 23)
         self.assertEqual(sum(o.transport == "session/op" for o in ops), 9)
+        # contrat 1.1 : lignes de la route op servies aussi par session/op
+        self.assertEqual(sorted(o.name for o in ops if o.session),
+                         ["mailbox.deliver", "mailbox.release", "mailbox.reserve",
+                          "mailbox.unread", "threads.index"])
+        self.assertEqual(self.c.version, "1.1.0")
         self.assertEqual([o.name for o in ops if o.transport == "events"], ["wakeups.subscribe"])
         self.assertEqual(self.c.prefix, C.PREFIX)
 
@@ -170,15 +181,17 @@ class EnveloppesTest(unittest.TestCase):
             with self.subTest(cas=case["nom"]):
                 op = self.c.get(case["op"])
                 req = case["requete"]
-                self.assertEqual(req["chemin"], C.PREFIX + "/" + op.transport)
+                route = req["chemin"][len(C.PREFIX) + 1:]
+                self.assertIn(route, op.routes)
+                self.assertEqual(case["nom"].endswith("/session"), route != op.transport)
                 token = req["entetes"]["Authorization"].split()[1]
-                prefix = I.SESSION_TOKEN_PREFIX if op.transport == "session/op" else I.ACCESS_TOKEN_PREFIX
+                prefix = I.SESSION_TOKEN_PREFIX if route == "session/op" else I.ACCESS_TOKEN_PREFIX
                 self.assertTrue(token.startswith(prefix))
                 key = req["entetes"].get(C.IDEMPOTENCY_HEADER)
                 self.assertEqual(bool(key), op.write)
                 parsed = C.OpRequest.from_json(req["corps"])
                 self.assertEqual(parsed.to_json(), req["corps"])
-                self.c.validate_request(parsed, route=op.transport, idempotency_key=key)
+                self.c.validate_request(parsed, route=route, idempotency_key=key)
                 res = C.OpResult.from_json(case["reponse"]["corps"])
                 self.assertEqual(case["reponse"]["statut"], 200)
                 self.assertTrue(C.conforms(res.value, op.result), res.value)
@@ -248,6 +261,38 @@ class EnveloppesTest(unittest.TestCase):
         self.assertNotEqual(C.request_sha256(a), C.request_sha256(dict(a, args=["a", "exec:x:h:1", 60.0])))
         self.assertNotEqual(C.new_idempotency_key(), C.new_idempotency_key())
         self.assertEqual(C.owner_for("7f3a", "h", 12), "exec:7f3a:h:12")
+        # contrat 1.1 : nombres décimaux écrits comme ECMAScript (RFC 8785)
+        c = dict(a, args=["a", "exec:x:h:1", 90.5])
+        self.assertEqual(C.request_sha256(c), hashlib.sha256(
+            b'{"args":["a","exec:x:h:1",90.5],"kwargs":{"require_responsible":false},'
+            b'"op":"leases.claim","schema":"ameesh-exec-op/1"}').hexdigest())
+        self.assertEqual(C.request_sha256(dict(a, args=["a", "exec:x:h:1", 90])),
+                         C.request_sha256(a))
+        from ameesh import jcs
+        for value, text in ((0.031, "0.031"), (1e21, "1e+21"), (1e-7, "1e-7"),
+                            (1e-6, "0.000001"), (-0.0, "0"), (123.0, "123"),
+                            (0.1 + 0.2, "0.30000000000000004")):
+            self.assertEqual(jcs.dumps(value, doubles=True), text)
+        with self.assertRaises(jcs.JcsError):
+            jcs.dumps(0.5)  # reçus et actions : toujours refusé
+        with self.assertRaises(jcs.JcsError):
+            C.request_sha256(dict(a, args=[float("nan")]))
+
+    def test_lignes_ouvertes_a_la_session(self):
+        """Contrat 1.1 : le hook et `mail inbox` passent par session/op."""
+        f = C.Fence("a", "exec:x:h:1", 3)
+        req = C.OpRequest("mailbox.release", ("a", "tok", [1]), {}, f)
+        self.c.validate_request(req, route="session/op", idempotency_key="k")
+        self.c.validate_request(req, route="op", idempotency_key="k")
+        self.c.validate_request(C.OpRequest("mailbox.unread", ("a", 5)), route="session/op")
+        with self.assertRaises(C.NotSupportedRemotely):
+            self.c.validate_request(C.OpRequest("agents.get", ("a",)), route="session/op")
+        idx = dict(ARGS_THREADS, author="agent:a")
+        self.c.validate_request(C.OpRequest("threads.index", (), idx, f), route="op",
+                                idempotency_key="k")
+        with self.assertRaises(ValueError):
+            self.c.validate_request(C.OpRequest("threads.index", (), dict(idx, author="agent:b"),
+                                                f), route="op", idempotency_key="k")
 
 
 class EvenementsTest(unittest.TestCase):
@@ -287,7 +332,17 @@ class PorteTest(unittest.TestCase):
         for bad in g["illisibles"]:
             with self.assertRaises(ValueError):
                 P.GateState.from_json(bad)
-        self.assertEqual(P.GateState.unreadable().state, "draining")
+        # contrat 1.1 : porte illisible d'un hôte médié = arrêt
+        self.assertEqual(P.GateState.unreadable().state, "stopped")
+        self.assertEqual(states[2].max_concurrent, P.DEFAULT_MAX_CONCURRENT)
+        self.assertEqual(states[0].max_concurrent, 1)
+        for bad in ({"schema": C.SCHEMA_HOST_ACK}, {"schema": C.SCHEMA_HOST_ACK, "seq": "1",
+                     "state": "available"},
+                    {"schema": C.SCHEMA_HOST_ACK, "seq": 1, "state": "dormant"},
+                    {"schema": C.SCHEMA_HOST_ACK, "seq": 1, "state": "draining",
+                     "held": "a"}, None):
+            with self.assertRaises(ValueError):
+                P.GateAck.from_json(bad)
         for ack in g["acquittements"]:
             self.assertEqual(P.GateAck.from_json(ack).to_json(), ack)
         body = g["disponibilite"]["requete"]["corps"]

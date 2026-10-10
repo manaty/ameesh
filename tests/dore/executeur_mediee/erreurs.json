@@ -81,7 +81,7 @@
      "op": "leases.claim",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       90.0
      ],
      "kwargs": {
@@ -177,7 +177,7 @@
      ],
      "kwargs": {
       "host": null,
-      "kind": "message",
+      "kind": "notify",
       "payload": null,
       "work_item_id": "812",
       "signature": null,
@@ -247,14 +247,14 @@
      "op": "leases.begin_turn",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       42,
       "tour"
      ],
      "kwargs": {},
      "fence": {
       "agent": "inge-front",
-      "owner": "exec:7f3a:anna-portable:4121",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "epoch": 42
      }
     }
@@ -285,7 +285,7 @@
      "op": "leases.claim",
      "args": [
       "inge-front",
-      "exec:7f3a:anna-portable:4121",
+      "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       60.0
      ],
      "kwargs": {
@@ -333,7 +333,7 @@
      },
      "fence": {
       "agent": "inge-front",
-      "owner": "exec:7f3a:anna-portable:4121",
+      "owner": "exec:7f3a9c2e4b1d6058:anna-portable:4121",
       "epoch": 42
      }
     }

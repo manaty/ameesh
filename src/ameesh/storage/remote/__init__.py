@@ -14,7 +14,8 @@ Configuration (`backend: mediated`) :
   un fichier 0600 (`exec_token_file`, `AMEESH_EXEC_TOKEN_FILE`) ; L110
   remplace la fabrique par `set_token_source_factory` ;
 * session du harnais : le jeton de session `AMEESH_EXEC_TOKEN`, posé par
-  l'exécuteur après `begin_turn` ; sa présence choisit le mode session.
+  l'exécuteur après `begin_turn` ; sa présence choisit le mode session. Le
+  bail du tour (`AMEESH_RUNNER_ID`, `AMEESH_LEASE_EPOCH`) entre au carnet.
 """
 from __future__ import annotations
 
@@ -83,4 +84,20 @@ def connect(cfg: Any, *, mode: Optional[str] = None,
             transport = HttpTransport(url, tokens=_token_source_factory(cfg))
     except ValueError as exc:
         raise db_mod.Unavailable(str(exc))
-    return RemoteDb(cfg, transport, mode=mode, url=url)
+    db = RemoteDb(cfg, transport, mode=mode, url=url)
+    if mode == SESSION:
+        _seed_session_lease(db, env)
+    return db
+
+
+def _seed_session_lease(db: RemoteDb, env: Mapping[str, str]) -> None:
+    """Session du harnais : le bail du tour, posé par l'exécuteur dans
+    l'environnement (`AGENT_MAIL_NAME`, `AMEESH_RUNNER_ID`,
+    `AMEESH_LEASE_EPOCH`), entre au carnet : les lignes `session: true`
+    (relâche du courrier, index des fils) portent ainsi leur enveloppe. Le
+    serveur la recontrôle contre le jeton (agent et epoch)."""
+    agent = (env.get("AGENT_MAIL_NAME") or "").strip()
+    owner = (env.get("AMEESH_RUNNER_ID") or env.get("AGENT_MESH_RUNNER_ID") or "").strip()
+    epoch = (env.get("AMEESH_LEASE_EPOCH") or env.get("AGENT_MESH_LEASE_EPOCH") or "").strip()
+    if agent and owner and epoch.isdigit():
+        db.book.hold(agent, owner, int(epoch))

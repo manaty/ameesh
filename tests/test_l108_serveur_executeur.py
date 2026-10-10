@@ -39,8 +39,8 @@ from tests.support import PgTestCase
 
 DORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dore", "executeur_mediee")
 HOST = "anna-portable"
-EXEC = "7f3a"
-OWNER = "exec:7f3a:anna-portable:4121"
+EXEC = "7f3a9c2e4b1d6058"
+OWNER = "exec:7f3a9c2e4b1d6058:anna-portable:4121"
 TOKEN = "amx1." + "A" * 43
 SESSION = "ams1." + "B" * 43
 OTHER_TOKEN = "amx1." + "C" * 43          # autre exécuteur, autre hôte
@@ -234,45 +234,14 @@ class DoreTest(ServeurExecTest):
                             " 'dossier absent', last_error = 'cwd: /x' WHERE name = 'inge-front'")
         if name == "actions.get/ok":
             self.propose_action(corps["args"][0])
-        if name.startswith("actions."):
-            self.fix_action(corps)
-        if corps.get("op") == "mailbox.send" and corps["kwargs"].get("kind") == "message":
-            # `message` n'est pas un `kind` admis par 0012 (request, reply,
-            # notify, event) : écart des jeux dorés, signalé
-            corps["kwargs"]["kind"] = "request"
-        if corps.get("op") in ("work.move", "work.note"):
-            # `doing` et `review` ne sont pas des états de lot (0026) : écart
-            # des jeux dorés, signalé ; `build` et `qa` à la place
-            states = {"doing": "build", "review": "qa"}
-            corps["args"] = [states.get(a, a) if isinstance(a, str) else a
-                             for a in corps["args"]]
-            if "current" in corps["kwargs"]:
-                corps["kwargs"]["current"] = states.get(corps["kwargs"]["current"],
-                                                        corps["kwargs"]["current"])
 
     def propose_action(self, action_id):
         storage.of(self.db).actions.propose(
-            action_id=self.valid_action_id(action_id), project="site", work_item=812,
+            action_id=action_id, project="site", work_item=812,
             proposed_by="agent:inge-front", connector="github", operation="merge_pr",
             target="owner/repo#812", args_json="{}", action_class="reversible", amount=None,
             currency=None, policy_version="1", digest="sha256:" + "0" * 64, dedupe="guaranteed",
             requires_receipt=True, approvers_json="[]", note="")
-
-    @staticmethod
-    def valid_action_id(action_id):
-        return "act_" + (action_id.replace("-", "").replace("act", "") + "0" * 26)[:26]
-
-    def fix_action(self, corps):
-        """Les valeurs dorées d'action (`act-3b7e`, `sha256:…`, `merge-812`)
-        ne passent pas les contraintes de la table `actions` (0010) : écart
-        signalé dans le rapport de L108 ; on les rend valides ici."""
-        if corps["op"] == "actions.get":
-            corps["args"][0] = self.valid_action_id(corps["args"][0])
-        else:
-            kw = corps["kwargs"]
-            kw["action_id"] = self.valid_action_id(kw["action_id"])
-            kw["digest"] = "sha256:" + "0" * 64
-            kw["dedupe"] = "guaranteed"
 
     def test_jeux_dores(self):
         cases = _golden_cases()
@@ -389,7 +358,8 @@ class PorteeTest(ServeurExecTest):
                             {"require_responsible": False}).body["value"]
         self.assertEqual([r["name"] for r in claimable], ["inge-front"])
         overview = self.op("agents.overview", token=SESSION).body["value"]
-        self.assertTrue(all(set(r) == {"name", "role", "status"} for r in overview))
+        self.assertTrue(all(set(r) == {"name", "team", "chantier", "canon_governed", "status"}
+                            for r in overview))
         budgets = storage.of(self.db).budgets
         budgets.put("", 3600, 5.0, actor="human:x")
         budgets.put("tresorier", 3600, 1.0, actor="human:x")
@@ -428,6 +398,59 @@ class PorteeTest(ServeurExecTest):
         # marquer remis : seulement les messages de l'agent du jeton
         self.assertEqual(self.op("mailbox.mark_delivered", [[900]], token=SESSION)
                          .body["value"], 0)
+
+    def test_hook_et_inbox_par_la_session(self):
+        """Contrat 1.1 : réserver, remettre, relâcher, lire les non-lus et
+        indexer le fil avec le jeton de session — pour l'agent et l'epoch du
+        jeton seulement."""
+        S = "/session/op"
+        unread = self.op("mailbox.unread", ["inge-front", 10], token=SESSION, route=S)
+        self.assertEqual([m["id"] for m in unread.body["value"]], [812])
+        self.assertEqual(self.op("mailbox.unread", ["tresorier", 10], token=SESSION,
+                                 route=S).body["error"], "forbidden_scope")
+        fence = ("inge-front", OWNER, 42)
+        got = self.op("mailbox.reserve", ["inge-front", OWNER, 42, "tok-1"],
+                      {"porteur": "hook", "ttl_seconds": 60.0}, fence=fence, token=SESSION,
+                      route=S)
+        self.assertEqual([m["id"] for m in got.body["value"]], [812], got.body)
+        done = self.op("mailbox.deliver", ["inge-front", OWNER, 42, "tok-1", [812]],
+                       fence=fence, token=SESSION, route=S)
+        self.assertEqual(done.body["value"], [812])
+        self.assertEqual(self.op("mailbox.release", ["inge-front", "tok-1", [812]],
+                                 fence=fence, token=SESSION, route=S).status, 200)
+        # enveloppe d'une autre epoch que celle du jeton : refus
+        stale = self.op("mailbox.release", ["inge-front", "tok-1", [812]],
+                        fence=("inge-front", OWNER, 41), token=SESSION, route=S)
+        self.assertEqual(stale.body["error"], "forbidden_scope")
+        # index des fils : l'auteur est le membre `agent:<nom>`
+        idx = self.op("threads.index", [], {
+            "project": "site", "lot": "812", "transport": "github", "host": "x",
+            "location": "owner/repo#812", "entry_id": "c-9", "mailbox_ids": [812],
+            "author": "agent:inge-front", "excerpt": "ok", "ts": 1791640000.5,
+            "trace": {}}, fence=fence, token=SESSION, route=S)
+        self.assertEqual(idx.status, 200, idx.body)
+        # une ligne de l'exécuteur seul reste fermée à la session
+        self.assertEqual(self.op("agents.get", ["inge-front"], token=SESSION, route=S)
+                         .body["error"], "op_not_allowed")
+
+    def test_cout_d_un_appareil_range_device(self):
+        """Contrat 1.1 : `turn_costs.insert` d'un appareil est rangé
+        `source=device`, avec l'exécuteur et le bail de l'enveloppe, quoi
+        que dise le corps ; il ne compte pas au plafond."""
+        resp = self.op("turn_costs.insert", [], {
+            "agent": "inge-front", "harness": "dsh", "turn": "t-1", "model": "m",
+            "session": None, "usd": 1.25, "input_tokens": 1, "cached_input_tokens": 0,
+            "output_tokens": 1, "cum_usd": None, "cum_input_tokens": None,
+            "cum_cached_input_tokens": None, "cum_output_tokens": None,
+            "source": "relay", "executor": "autre", "lease_owner": "x", "lease_epoch": 1},
+            fence=("inge-front", OWNER, 42))
+        self.assertEqual(resp.status, 200, resp.body)
+        row = self.db.query("SELECT source, executor, lease_owner, lease_epoch"
+                            " FROM turn_costs WHERE turn = 't-1'")[0]
+        self.assertEqual((row["source"], row["executor"], row["lease_owner"],
+                          int(row["lease_epoch"])), ("device", EXEC, OWNER, 42))
+        self.assertEqual(storage.of(self.db).turn_costs.spent(
+            3600, agent="inge-front", harnesses=None), 0.0)
 
     def test_aucun_recu_ni_approbation(self):
         """Toute opération refusée par la table (approbations, nonces,
@@ -669,7 +692,7 @@ class FluxTest(ServeurExecTest):
         self.hub.publish("agent_mail", {"to": "inge-front", "id": 812, "from": "coord"})
         self.hub.publish("agent_mail", {"to": "tresorier", "id": 900})
         self.hub.publish("agent_lease", {"agent": "inge-front", "epoch": 42})
-        self.hub.publish("agent_lease", {"name": "tresorier"})
+        self.hub.publish("agent_lease", {"agent": "tresorier"})
         self.hub.publish("ameesh_budget", {"scope": ""})
         body = self.poll(start).body
         self.assertEqual(body["schema"], C.SCHEMA_EVENTS)

@@ -220,7 +220,7 @@ class RemoteStorage(SI.Storage):
         if op.transport == "events":
             from .events import RemoteSubscription
             return RemoteSubscription(db, list(args[0] if args else kwargs.get("channels") or []))
-        if op.transport == "op" and db.mode != EXECUTOR:
+        if op.transport == "op" and db.mode != EXECUTOR and not op.session:
             raise C.NotSupportedRemotely(
                 "%s exige le jeton d'exécuteur (route op) : non admise depuis une session"
                 % name)
@@ -240,7 +240,9 @@ class RemoteStorage(SI.Storage):
         request = C.OpRequest(name, tuple(_jsonable(list(args))), _jsonable(dict(kwargs)),
                               fence)
         key = C.new_idempotency_key() if op.write else None
-        if op.transport == "session/op":
+        if op.transport == "session/op" or db.mode == SESSION:
+            # contrat 1.1 : une ligne `session: true` passe par `session/op`
+            # avec le jeton de session
             result = db.transport.session_call(request, idempotency_key=key)
         else:
             result = db.transport.call(request, idempotency_key=key)
@@ -254,10 +256,8 @@ class RemoteStorage(SI.Storage):
             agent = book.turn_agent(bound.get("turn_id"))
         if not agent:
             return None
-        agent = str(agent)
-        if agent.startswith("agent:"):
-            # `threads.index` : l'auteur est un membre du fil (`fil.member`)
-            agent = agent[len("agent:"):]
+        # `threads.index` : l'auteur est un membre du fil (`fil.member`)
+        agent = str(C.agent_name(str(agent)))
         owner, epoch = bound.get("owner"), bound.get("epoch")
         if owner is not None and epoch is not None:
             return C.Fence(agent, str(owner), int(epoch))

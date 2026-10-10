@@ -26,7 +26,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DORE = os.path.join(REPO, "tests", "dore", "executeur_mediee")
 ACCESS = "amx1.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 SESSION = "ams1.BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-OWNER = "exec:7f3a:anna-portable:4121"
+OWNER = "exec:7f3a9c2e4b1d6058:anna-portable:4121"
 
 
 def golden(name: str) -> dict:

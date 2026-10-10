@@ -18,15 +18,19 @@ lit et acquitte ce qu'il a fait :
 États :
 
 * `available` : l'exécuteur réclame, dans la limite
-  `min(caps.max_concurrent, max_agents de l'hôte)` ;
+  `min(caps.max_concurrent, max_agents de l'hôte)` ; `caps.max_concurrent`
+  absent vaut `DEFAULT_MAX_CONCURRENT` (1 : un appareil prêté fait tourner
+  un agent à la fois, sauf si le runner en annonce plus) ;
 * `draining` : aucune nouvelle réclamation ; chaque tour finit au point sûr ;
   au-delà de `drain_deadline_ts` (défaut : maintenant + 90 s), préemption du
   tour (consigne remise en attente) ; puis `leases.release` de chaque bail,
   effacement des dossiers, acquittement `drained: true` ;
 * `stopped` : arrêt immédiat, sans écriture (le bail échoira).
 
-Un état illisible, absent ou d'un schéma inconnu vaut `draining` (prudence :
-on finit le travail en cours, on n'en prend pas d'autre).
+Un état illisible, absent ou d'un schéma inconnu vaut `stopped` pour un hôte
+médié (contrat 1.1 : sans porte lisible, l'appareil n'est peut-être plus
+inactif ; aucun tour). Un hôte classique doté d'une porte peut choisir un
+autre repli (`host_gate_fallback`, L112).
 """
 from __future__ import annotations
 
@@ -50,14 +54,17 @@ SOCKET_PATH = GATE_DIR + "/gate.sock"
 FILE_POLL_S = 2.0
 #: délai de drainage par défaut si `drain_deadline_ts` est absent
 DEFAULT_DRAIN_S = 90.0
+#: agents à la fois quand `caps.max_concurrent` est absent (contrat 1.1)
+DEFAULT_MAX_CONCURRENT = 1
 
 
 @dataclasses.dataclass(frozen=True)
 class GateState:
     """`ameesh-host-state/1`. `seq` croît à chaque écriture du runner.
 
-    `caps` (profil Compute §4.10) : `max_concurrent` (int), `cpu_share`
-    (0–1), `memory_mb` (int) ; clés absentes : pas de limite de la porte."""
+    `caps` (profil Compute §4.10) : `max_concurrent` (int ≥ 0, défaut
+    `DEFAULT_MAX_CONCURRENT`), `cpu_share` (0–1), `memory_mb` (int) ;
+    `cpu_share` et `memory_mb` absents : pas de limite de la porte."""
 
     state: str
     seq: int
@@ -73,6 +80,14 @@ class GateState:
     @property
     def may_claim(self) -> bool:
         return self.state == "available"
+
+    @property
+    def max_concurrent(self) -> int:
+        """`caps.max_concurrent`, sinon `DEFAULT_MAX_CONCURRENT`."""
+        cap = self.caps.get("max_concurrent")
+        if isinstance(cap, int) and not isinstance(cap, bool) and cap >= 0:
+            return cap
+        return DEFAULT_MAX_CONCURRENT
 
     def to_json(self) -> dict:
         return {"schema": SCHEMA_HOST_STATE, "state": self.state, "seq": self.seq,
@@ -97,8 +112,9 @@ class GateState:
 
     @classmethod
     def unreadable(cls, seq: int = -1) -> "GateState":
-        """L'état retenu quand la porte est illisible : drainage."""
-        return cls(state="draining", seq=seq, reason="unknown")
+        """L'état retenu quand la porte d'un hôte médié est illisible :
+        arrêt (contrat 1.1)."""
+        return cls(state="stopped", seq=seq, reason="unknown")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -123,11 +139,26 @@ class GateAck:
 
     @classmethod
     def from_json(cls, d: Any) -> "GateAck":
+        """Lit un acquittement ; `ValueError` pour tout corps faux (contrat
+        1.1 : jamais `KeyError` ni `TypeError`)."""
         if not isinstance(d, Mapping) or d.get("schema") != SCHEMA_HOST_ACK:
             raise ValueError("schéma %s attendu" % SCHEMA_HOST_ACK)
-        return cls(seq=int(d["seq"]), state=str(d["state"]),
-                   in_turn=tuple(d.get("in_turn") or ()), held=tuple(d.get("held") or ()),
-                   drained=bool(d.get("drained")), ts=float(d.get("ts") or 0.0))
+        seq, state = d.get("seq"), d.get("state")
+        if not isinstance(seq, int) or isinstance(seq, bool):
+            raise ValueError("seq : entier attendu")
+        if state not in STATES:
+            raise ValueError("state : %s attendu" % " | ".join(STATES))
+        lists = {}
+        for key in ("in_turn", "held"):
+            value = d.get(key) or ()
+            if not isinstance(value, (list, tuple)) or not all(isinstance(v, str) for v in value):
+                raise ValueError("%s : liste de noms attendue" % key)
+            lists[key] = tuple(value)
+        ts = d.get("ts") or 0.0
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+            raise ValueError("ts : nombre attendu")
+        return cls(seq=seq, state=state, in_turn=lists["in_turn"], held=lists["held"],
+                   drained=d.get("drained") is True, ts=float(ts))
 
 
 def availability_body(state: GateState) -> dict:
