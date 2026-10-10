@@ -1,0 +1,114 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
+# Point d'entrée de l'image `ameesh-executor` (L114, BROUILLON).
+# Interface figée : docs/IMAGE-EXECUTEUR.md. Ce script ne fait que :
+#   1. contrôler l'utilisateur, l'URL et le volume ;
+#   2. enrôler l'appareil au premier démarrage (code à usage unique, fichier) ;
+#   3. vérifier que le volume appartient bien à ce mesh, ce serveur et cet hôte ;
+#   4. purger les dossiers de travail laissés par un arrêt brutal ;
+#   5. remplacer son processus par `ameesh run` (backend médié, porte fichier).
+#
+#   ameesh-executor [run]     défaut
+#   ameesh-executor health    sonde : 0 si enrôlé et exécuteur vivant
+#   ameesh-executor show      état de l'appareil, sans secret (JSON)
+set -eu
+
+HOME_DIR="${AMEESH_EXEC_HOME:-/var/lib/ameesh-exec}"
+ENROLL_DIR="${AMEESH_EXEC_ENROLL_DIR:-/run/ameesh-enroll}"
+ACK_DIR="$(dirname "${AMEESH_HOST_GATE_ACK:-/run/ameesh-gate/ack/ack.json}")"
+
+log() { printf 'ameesh-executor : %s\n' "$*"; }
+die() { rc="$1"; shift; log "$*" >&2; exit "$rc"; }
+
+enrolled() { [ -s "$HOME_DIR/executor.json" ]; }
+
+runner_alive() {
+    for f in /proc/[0-9]*/cmdline; do
+        tr '\0' ' ' < "$f" 2>/dev/null | grep -qE '(^|/)ameesh run( |$)' && return 0
+    done
+    return 1
+}
+
+state_field() {
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' \
+        "$HOME_DIR/executor.json" "$1"
+}
+
+cmd="${1:-run}"
+[ $# -gt 0 ] && shift   # le reste va à `ameesh run`
+case "$cmd" in
+    health)
+        enrolled || exit 1
+        runner_alive || exit 1
+        exit 0 ;;
+    show)
+        exec ameesh device show --json --home "$HOME_DIR" ;;
+    run) ;;
+    *)  die 2 "commande inconnue : $cmd (run | health | show)" ;;
+esac
+
+# --- 1. contrôles -----------------------------------------------------------
+[ "$(id -u)" != 0 ] || die 2 "refus de tourner en root (uid 10001 attendu)"
+url="${AMEESH_EXEC_URL:-}"
+case "$url" in
+    https://*) ;;
+    "") die 2 "AMEESH_EXEC_URL absente (https://<serveur du mesh>)" ;;
+    *)  die 2 "AMEESH_EXEC_URL : https obligatoire ($url)" ;;
+esac
+url="${url%/}"
+[ -d "$HOME_DIR" ] && [ -w "$HOME_DIR" ] \
+    || die 2 "volume $HOME_DIR absent ou non inscriptible par $(id -u)"
+chmod 0700 "$HOME_DIR"
+umask 077
+
+# --- 2. enrôlement au premier démarrage --------------------------------------
+if ! enrolled; then
+    # Le code ne quitte jamais son fichier : ni argument (/proc/<pid>/cmdline),
+    # ni variable d'environnement, ni journal. `ameesh device` le lit lui-même
+    # (`--code-file`) ; ce script ne le lit pas.
+    code_file="$ENROLL_DIR/code"
+    [ -s "$code_file" ] || die 3 "appareil non enrôlé et aucun code ($code_file)"
+    attest=""
+    if [ "${AMEESH_EXEC_ATTEST:-0}" = 1 ]; then
+        # Défi pour la clé d'appareil Nexlink (facultatif) : écrit à côté de
+        # l'acquittement, la réponse est attendue 120 s au plus.
+        ameesh device challenge --server "$url" --code-file "$code_file" --home "$HOME_DIR" \
+            > "$ACK_DIR/attest-challenge.txt.tmp"
+        mv "$ACK_DIR/attest-challenge.txt.tmp" "$ACK_DIR/attest-challenge.txt"
+        i=0
+        while [ ! -s "$ENROLL_DIR/attestation.json" ] && [ "$i" -lt 120 ]; do
+            sleep 1; i=$((i + 1))
+        done
+        [ -s "$ENROLL_DIR/attestation.json" ] && attest="$ENROLL_DIR/attestation.json"
+        rm -f "$ACK_DIR/attest-challenge.txt"
+    fi
+    if [ -n "$attest" ]; then
+        ameesh device enroll --server "$url" --code-file "$code_file" --home "$HOME_DIR" \
+            --label "${AMEESH_EXEC_LABEL:-}" --attestation "$attest" \
+            || die 4 "enrôlement refusé (code faux, échu, déjà utilisé, ou attestation fausse)"
+    else
+        ameesh device enroll --server "$url" --code-file "$code_file" --home "$HOME_DIR" \
+            --label "${AMEESH_EXEC_LABEL:-}" \
+            || die 4 "enrôlement refusé (code faux, échu ou déjà utilisé)"
+    fi
+fi
+
+# --- 3. le volume est-il celui de ce mesh ? -----------------------------------
+[ "$(state_field server_url)" = "$url" ] \
+    || die 5 "volume enrôlé auprès d'un autre serveur ($(state_field server_url))"
+if [ -n "${AMEESH_EXEC_MESH:-}" ] && [ "$(state_field mesh)" != "$AMEESH_EXEC_MESH" ]; then
+    die 5 "volume enrôlé pour le mesh $(state_field mesh), attendu $AMEESH_EXEC_MESH"
+fi
+if [ -n "${AMEESH_EXEC_HOST:-}" ] && [ "$(state_field host)" != "$AMEESH_EXEC_HOST" ]; then
+    die 5 "volume enrôlé pour l'hôte $(state_field host), attendu $AMEESH_EXEC_HOST"
+fi
+
+# --- 4. aucun bail n'est détenu au démarrage : rien ne doit rester -------------
+rm -rf "$HOME_DIR/work" "$HOME_DIR/harness"
+mkdir -p "$HOME_DIR/work" "$HOME_DIR/harness" "$HOME_DIR/state"
+
+log "exécuteur $(state_field executor_id), hôte $(state_field host), mesh $(state_field mesh)"
+
+# --- 5. l'exécuteur remplace ce script (tini lui relaie SIGTERM) -------------
+export AMEESH_BACKEND=mediated AMEESH_EXEC_URL="$url" AMEESH_EXEC_HOME="$HOME_DIR"
+exec ameesh run "$@"
