@@ -32,7 +32,8 @@ on its first line.
 ```
 agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"]
                 [--kind request|reply|notify|event] [--urgent]
-                [--sign --key FILE] [--expires 24h]
+                [--sign --key FILE] [--expires 24h] [--queue]
+agent-mail forward <OLD> <NEW> [--dry-run] [--json]   # redeliver a dead mailbox
 agent-mail list                       # agents, host, lease, unread
 agent-mail inbox [NAME]               # unread messages of NAME, without marking them read
 agent-mail whoami [--session ID --harness H]   # bound identity and its source (runner, explicit,
@@ -67,7 +68,21 @@ steal its mail; an agent holding a live lease never binds. `unbind` revokes the
 binding of one session.
 
 `send all` reaches only the sender's **team** (or project); a sender with
-neither keeps the global broadcast.
+neither keeps the global broadcast, and stopped agents are left out (`--queue`
+includes them).
+
+**Undeliverable mail** (2026-10-11). With the database, `send` deposits
+nothing (exit code 2) when the recipient is not in the registry — no agent is
+created, and close names are suggested (edit distance, prefix, and for a role
+name such as `orchestrator` the orchestrators of the sender's team) —, when the
+recipient is **stopped** (unless `--queue`; the message says since when, why,
+who is responsible and which agent took over its work, when known), or when
+the sender identity is a stopped agent (the session's bound identity,
+`whoami`, is shown). A send never writes the recipient into the registry.
+Mail left more than 15 minutes in a stopped or unknown mailbox raises the
+`mail_undeliverable` alert. `forward` redelivers the pending mail of a stopped
+(or unknown) agent to a live one, keeping the original sender and date; the
+original is no longer pending.
 
 `--kind event` wakes the agent like a message, coalesced (see
 `AMEESH_EVENT_COALESCE`); `--urgent` pierces the coalescing and, from an
@@ -154,7 +169,7 @@ ameesh set <agent> key=value [key=value …]   # model=… effort=… tier=… s
                                              # (empty value = default; effect at the next turn)
 ameesh alerts [--json] [--follow] [--interval S] [--long-turn S] [--idle-mail S]
               [--dead-grace S] [--session-tokens N] [--stale-lot S]
-              [--orphan-lot S] [--delegation-grace S]
+              [--orphan-lot S] [--delegation-grace S] [--mail-undeliverable S]
 ameesh notify [--once] [--dry-run] [--json] [--interval S] [alert thresholds…]
 ameesh notify --test human:ID [--json]
 ameesh restart <agent> --brief FILE|- [--wait S] [--json]
@@ -175,6 +190,7 @@ ameesh interrupt <agent> <message…> [--from SENDER]
 | `--stale-lot` | lot without activity for S seconds (default 21600 = 6 h) |
 | `--orphan-lot` | `intake`/`build` lot without activity nor a turn of its assignee for S seconds (default 1800) |
 | `--delegation-grace` | grace period after a delegation's deadline before `delegation_expired` is raised (default 300) |
+| `--mail-undeliverable` | mail pending for S seconds in the mailbox of a stopped agent or of a name absent from the registry (default 900; 0 disables `mail_undeliverable`) |
 | `set … mode=` | `execute` (default: run by a runner under a lease) or `externe` (a human's session, mailbox only, never woken by ameesh) |
 | `notify --once` | a single pass, then exit |
 | `notify --dry-run` | print what would be sent; send nothing, write no state |

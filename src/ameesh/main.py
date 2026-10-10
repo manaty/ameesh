@@ -5,7 +5,10 @@
   ameesh --version | version  la version du paquet installé ;
   ameesh mail <send|inbox|list|status|alias|hook|statusline|whoami>
         la boîte aux lettres ; `agent-mail` reste un alias (les hooks des
-        harnais l'appellent) ;
+        harnais l'appellent) ; `send` refuse un destinataire inconnu (noms
+        proches proposés) ou arrêté (sauf --queue) ;
+  ameesh mail forward <ancien> <nouveau> [--dry-run]
+        re-livre le courrier en attente d'un agent arrêté à un agent vivant ;
   ameesh mail <bind|unbind|bindings>
         liaison explicite d'une session externe à un agent (L41, 0030) ;
   ameesh run [options]        l'exécuteur de la machine ; `agent-runner` reste

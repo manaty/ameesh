@@ -71,7 +71,7 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
-                 "host_not_ready", "host_power_low", "backlog_empty")
+                 "host_not_ready", "host_power_low", "backlog_empty", "mail_undeliverable")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -117,9 +117,11 @@ TYPE_LABELS = {
     "host_not_ready": "hôte non prêt",
     "host_power_low": "batterie faible de l'hôte",
     "backlog_empty": "file d'amélioration vide",
+    "mail_undeliverable": "courrier en souffrance",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
-URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired")
+URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
+                "mail_undeliverable")
 
 _TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -960,16 +962,22 @@ class Notifier:
     def _brief_orchestrators(self, db, alert: dict, router: Router) -> None:
         """`idle_capacity` levée : l'orchestrateur de chaque projet reçoit, par
         courrier `event`, ses agents au repos sans lot et les lots ouverts sans
-        agent — c'est lui qui peut répartir. Une fois par levée (même
-        dédoublonnage que les canaux) ; jamais fatal au passage."""
+        agent — c'est lui qui peut répartir. `mail_undeliverable` levée : les
+        orchestrateurs de l'équipe reçoivent le courrier en souffrance et le
+        geste (`ameesh mail forward`). Une fois par levée (même dédoublonnage
+        que les canaux) ; jamais fatal au passage."""
+        from . import undeliverable
         try:
-            listing = list(router.agents().values())
-            titles = {}
-            for lot in (alert.get("lots") or ())[:12]:
-                item = storage.of(db).work.get(int(lot))
-                if item:
-                    titles[int(lot)] = item.get("title") or ""
-            briefs = sous_utilisation.orchestrator_briefs(alert, listing, titles)
+            if alert.get("type") == "mail_undeliverable":
+                briefs = undeliverable.orchestrator_briefs(alert)
+            else:
+                listing = list(router.agents().values())
+                titles = {}
+                for lot in (alert.get("lots") or ())[:12]:
+                    item = storage.of(db).work.get(int(lot))
+                    if item:
+                        titles[int(lot)] = item.get("title") or ""
+                briefs = sous_utilisation.orchestrator_briefs(alert, listing, titles)
         except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
             self.log("courrier aux orchestrateurs non préparé (%s)" % exc)
             return
@@ -980,10 +988,13 @@ class Notifier:
                          % (alert.get("type"), orch, text))
                 continue
             try:
-                mail.send(db, work.SYSTEM_SENDER, orch, text, kind="event",
-                          payload={"alert": alert.get("type"),
-                                   "agents": list(alert.get("agents") or ()),
-                                   "lots": list(alert.get("lots") or ())})
+                payload = {"alert": alert.get("type"),
+                           "agents": list(alert.get("agents") or ()),
+                           "lots": list(alert.get("lots") or ())}
+                if alert.get("type") == "mail_undeliverable":
+                    payload.update(recipient=alert.get("agent"), reason=alert.get("reason"),
+                                   count=alert.get("value"))
+                mail.send(db, work.SYSTEM_SENDER, orch, text, kind="event", payload=payload)
                 self.log("[%s] courrier déposé pour l'orchestrateur %s"
                          % (alert.get("type"), orch))
             except Exception as exc:  # noqa: BLE001

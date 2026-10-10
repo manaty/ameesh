@@ -102,6 +102,20 @@ d'`ameesh` : la liste des agents au repos de son équipe et des lots ouverts
 sans agent. Réponse attendue : leur confier ces lots (`--lot`), ou en créer
 (`--new-lot`). Un même épisode n'est envoyé qu'une fois.
 
+## Le courrier « Courrier en souffrance »
+
+Un message adressé à un nom absent du registre, ou à un agent arrêté, n'est
+lu par personne. `ameesh mail send` le refuse désormais (noms proches
+proposés ; `--queue` pour déposer quand même chez un agent arrêté), mais du
+courrier peut encore y attendre. Passé 15 min, `ameesh notify` envoie à
+l'orchestrateur de l'équipe un courrier `event` d'`ameesh` : le destinataire,
+le nombre de messages, leurs expéditeurs, et l'agent qui a repris le travail
+s'il est connu. Réponse attendue : re-livrer à l'agent qui porte le travail
+(`ameesh mail forward <ancien> <nouveau>`, expéditeur et date d'origine
+gardés ; à soi-même si le message nous était destiné), ou faire relancer
+l'agent par son responsable (`ameesh resume <agent>`), puis prévenir les
+expéditeurs du bon nom.
+
 ## Livraison et déploiements
 
 Règles du propriétaire (2026-10-10), après qu'une version mineure (1.6.2) est

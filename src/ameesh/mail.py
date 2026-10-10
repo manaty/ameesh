@@ -223,10 +223,19 @@ def _block(db: Db | None, row: dict, limite: int | None = None, note: str | None
                "tu l'as peut-être déjà traité]" if maybe_redelivered(row) else "")
     moment = fil.iso_local(row.get("created_ts") or 0.0)
     corps = _readable_body(row, limite)
-    return "— message n°%s de %s, %s%s%s%s :\n%s" % (
+    return "— message n°%s de %s, %s%s%s%s%s :\n%s" % (
         row.get("id"), row.get("sender") or "?", moment, nature,
-        _verdict_note(db, row) if note is None else note, relivre,
+        _verdict_note(db, row) if note is None else note, relivre, forwarded_note(row),
         "\n".join("> " + line for line in corps.split("\n")))
+
+
+def forwarded_note(row: Any) -> str:
+    """La mention d'un message renvoyé d'une boîte morte (`ameesh mail
+    forward`) : vide pour un message ordinaire."""
+    origin = row.get("forwarded_from")
+    if not origin:
+        return ""
+    return "  [renvoyé : d'abord adressé à %s, dont la boîte n'était plus lue]" % origin
 
 
 def _assemble(kind: str, blocks: Sequence[str], remaining: int) -> str:
@@ -311,6 +320,8 @@ def normalize(row: dict) -> dict:
         "signature_expires_ts": row.get("signature_expires_ts"),
         # déjà réservé pour une remise jamais soldée (panne) : « re-livré »
         "deja_consigne": bool(row.get("deja_consigne")),
+        # renvoyé d'une boîte morte (`ameesh mail forward`) : le premier destinataire
+        "forwarded_from": row.get("forwarded_from"),
     }
 
 

@@ -2,12 +2,19 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """agent-mail (mesh v1) — boîte aux lettres des agents, sur Postgres.
 
-  agent-mail send <dest> <texte…> [--from NOM] [--lot ID|RÉF] [--new-lot "titre"]
+  agent-mail send <dest> <texte…> [--from NOM] [--lot ID|RÉF] [--new-lot "titre"] [--queue]
                                                  dépose un message (dest = nom, ou "all")
                                                  et l'écrit dans le fil lisible du projet
                                                  ou du lot (ameesh fil show <projet> [<lot>]) ;
                                                  d'un orchestrateur, --lot rattache le lot
-                                                 au destinataire et --new-lot le crée (L118)
+                                                 au destinataire et --new-lot le crée (L118) ;
+                                                 refusé vers un nom absent du registre (noms
+                                                 proches proposés), vers un agent arrêté
+                                                 (sauf --queue) et depuis une identité arrêtée
+  agent-mail forward <ancien> <nouveau> [--dry-run] [--json]
+                                                 re-livre le courrier en attente d'un agent
+                                                 arrêté (ou absent du registre) à un agent
+                                                 vivant : expéditeur et date gardés
   agent-mail list                                agents, hôte, bail, non lus
   agent-mail inbox [NOM]                         messages non lus de NOM (sans les marquer lus)
   agent-mail whoami [--session ID --harness H]   identité liée et sa source (runner, explicit,
@@ -143,6 +150,7 @@ def render(msgs: list[dict], verdicts: dict | None = None) -> str:
                 suffixe = "  [⚠ signature NON valide : %s]" % verdict.reason
         if msg.get("deja_consigne"):
             suffixe += "  [re-livré après une panne : peut-être déjà traité]"
+        suffixe += mail.forwarded_note(msg)
         lines.append("— de %s à %s : %s%s" % (
             msg.get("from", "?"), moment, msg.get("text", ""), suffixe))
     lines.append("(répondre : agent-mail send <nom> \"…\")")
@@ -213,6 +221,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     if "--urgent" in args:
         urgent = True
         args = [arg for arg in args if arg != "--urgent"]
+    # dépôt explicite chez un agent arrêté (lu à sa reprise, ou renvoyé)
+    queue = "--queue" in args
+    args = [arg for arg in args if arg != "--queue"]
+    explicit = sender is not None
     if kind not in ("request", "reply", "notify", "event"):
         print("kind invalide : %r (request|reply|notify|event)" % (kind,), file=sys.stderr)
         return 2
@@ -228,7 +240,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     if len(args) < 2:
         print("usage: agent-mail send <dest|all> <texte…> [--from NOM] [--lot ID|RÉF] "
               "[--new-lot \"titre\"] [--kind request|reply|notify|event] [--urgent] "
-              "[--sign --key FICHIER] [--expires 24h]", file=sys.stderr)
+              "[--sign --key FICHIER] [--expires 24h] [--queue]", file=sys.stderr)
         return 2
     if lot is not None and not NAME_RE.match(lot):
         print("lot invalide : %r (lettres, chiffres, . _ -)" % lot, file=sys.stderr)
@@ -240,11 +252,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--new-lot : titre vide", file=sys.stderr)
         return 2
     dest, text = args[0], " ".join(args[1:]).strip()
+    binding = None
     if not sender:
         binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
         if not binding.ok:
-            print("expéditeur non lié : posez AGENT_MAIL_NAME (le runner le fait) "
-                  "ou passez --from NOM", file=sys.stderr)
+            # la raison quand une identité est annoncée (ex. « agent arrêté »)
+            print("expéditeur non lié%s : posez AGENT_MAIL_NAME (le runner le fait) "
+                  "ou passez --from NOM" % (
+                      " (%s : %s)" % (binding.name, binding.reason)
+                      if binding.name and binding.reason else ""), file=sys.stderr)
             return 2
         sender = binding.name
     if not NAME_RE.match(sender) or not text:
@@ -291,6 +307,20 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             print("attention : en repli fichier, la signature n'est pas conservée",
                   file=sys.stderr)
 
+    # Courrier en souffrance (2026-10-11) : ni agent fantôme, ni boîte morte,
+    # ni réponse vers une identité arrêtée — refusé AVANT tout dépôt (et avant
+    # qu'un lot soit créé ou rattaché). Le repli fichier n'a pas de registre.
+    if bk.kind == "pg":
+        from . import undeliverable
+        try:
+            notes = undeliverable.check_send(cfg, bk.db, sender=sender, dest=dest, queue=queue,
+                                             explicit=explicit, binding=binding)
+        except undeliverable.Refused as exc:
+            print("message non déposé — %s" % exc, file=sys.stderr)
+            return 2
+        for note in notes:
+            print("attention : %s" % note, file=sys.stderr)
+
     # L118 : le courrier qui confie du travail est lié à un lot (avant le
     # dépôt : une attribution refusée ne dépose rien)
     thread_meta = None
@@ -319,9 +349,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 " : %s" % item.get("title") if linked["created"] else "",
                 " (branche %s)" % linked["branch"] if linked["branch"] else ""))
 
+    skipped: list[str] = []
     targets = bk.send(sender, dest, text, host=cfg.host, signed=signed,
                       work_item_id=lot, allow_structured=allow_structured,
-                      kind=kind, urgent=urgent, thread_meta=thread_meta)
+                      kind=kind, urgent=urgent, thread_meta=thread_meta,
+                      include_stopped=queue, skipped=skipped)
+    if skipped:
+        print("attention : non déposé pour %s (%s) — --queue pour déposer quand même" % (
+            ", ".join(sorted(skipped)), "arrêtés : personne ne lit leur boîte"
+            if len(skipped) > 1 else "arrêté : personne ne lit sa boîte"), file=sys.stderr)
     if not targets:
         print("aucun destinataire")
     elif signed:
@@ -355,6 +391,7 @@ def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
                 marque = "  [signé par un agent]"
             else:
                 marque = "  [⚠ signature NON valide : %s]" % verdict.reason
+        marque += mail.forwarded_note(msg)
         print("de %s%s : %s" % (msg.get("from"), marque, msg.get("text")))
     return 0
 
@@ -862,6 +899,60 @@ def cmd_bindings(bk, rest: list[str]) -> int:
     return 0
 
 
+_FORWARD_USAGE = "usage: agent-mail forward <ancien> <nouveau> [--dry-run] [--json]"
+
+
+def cmd_forward(bk, cfg: Config, rest: list[str]) -> int:
+    """Vide une boîte morte : re-livre le courrier en attente d'un agent arrêté
+    (ou absent du registre) à un agent vivant (`undeliverable.forward`)."""
+    from . import undeliverable
+    try:
+        opts, positional = _options(rest, (), ("--dry-run", "--json"))
+    except ValueError as exc:
+        print("%s\n%s" % (exc, _FORWARD_USAGE), file=sys.stderr)
+        return 2
+    if len(positional) != 2 or not all(NAME_RE.match(name) for name in positional):
+        print(_FORWARD_USAGE, file=sys.stderr)
+        return 2
+    old, new = positional
+    try:
+        result = undeliverable.forward(cfg, bk.db, old, new, actor=_actor(),
+                                       dry_run=bool(opts.get("--dry-run")))
+    except undeliverable.Refused as exc:
+        print("renvoi refusé — %s" % exc, file=sys.stderr)
+        return 1
+    if opts.get("--json"):
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+    if result["dry_run"]:
+        rows = result["messages"]
+        if not rows:
+            print("aucun message en attente pour %s : rien à renvoyer" % old)
+            return 0
+        print("à blanc : %d message(s) en attente pour %s (%s) seraient re-livré(s) à %s :"
+              % (len(rows), old, result["old_state"], new))
+        for row in rows:
+            print("  n°%s de %s, %s%s" % (
+                row["id"], row.get("sender") or "?",
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(row.get("created_ts") or 0)),
+                " (%s)" % row["kind"] if row.get("kind") not in (None, "notify") else ""))
+        return 0
+    moved = result["forwarded"]
+    if not moved:
+        print("aucun message en attente pour %s : rien à renvoyer" % old)
+        return 0
+    senders: dict = {}
+    for row in moved:
+        senders[row.get("sender") or "?"] = senders.get(row.get("sender") or "?", 0) + 1
+    print("%d message(s) re-livré(s) de %s (%s) à %s : %s" % (
+        len(moved), old, result["old_state"], new,
+        ", ".join("n°%s → n°%s" % (r["original_id"], r["new_id"]) for r in moved)))
+    print("expéditeurs : %s ; expéditeur et date d'origine gardés, renvoi noté dans le fil"
+          % ", ".join("%s (%d)" % kv for kv in sorted(senders.items(),
+                                                       key=lambda kv: (-kv[1], kv[0]))))
+    return 0
+
+
 def cmd_whoami(bk, cfg: Config, rest: list[str]) -> int:
     if len(rest) > 1 and rest[0] == "--cwd":
         # Diagnostic : le dossier ne donne aucune identité.
@@ -1106,6 +1197,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_list(bk)
         if command == "whoami":
             return cmd_whoami(bk, cfg, rest)
+        if command == "forward":
+            if bk.kind != "pg":
+                print("le renvoi exige la base (AMEESH_DSN) : le repli fichier n'a pas de "
+                      "registre", file=sys.stderr)
+                return 1
+            return cmd_forward(bk, cfg, rest)
         if command in ("bind", "unbind", "bindings"):
             if bk.kind != "pg":
                 print("les liaisons de session exigent la base (AMEESH_DSN) : "
