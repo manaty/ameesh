@@ -89,6 +89,8 @@ ARGS = {  # op: (args, kwargs, résultat)
       "available": 18.5, "account": None, "observed_ts": TS - 600}]),
  "operations.apply_restart": ([AG, OWN, EP], {}, {"brief": "Résumé du tour précédent.", "session_id": "sess-5d1e"}),
  "operations.message_lots": ([[812]], {}, ["812"]),
+ "operations.assigned_open_lots": ([AG], {}, [{"id": 812, "title": "Page d'accueil", "state": "build",
+                                              "updated_ts": TS - 600}]),
  "operations.set_session_work_item": ([AG, OWN, EP, "812"], {}, True),
  "operations.record_gauges": ([[{"harness": "dsh", "key": "requests", "used": 0.2,
                                   "resets_at": None, "window_s": 3600}]], {}, 1),

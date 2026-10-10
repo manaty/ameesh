@@ -207,11 +207,12 @@ policy:
                  30, 0.5, "serveur")
 
     def image(self):
-        if self.args.reconstruire or run(["docker", "image", "inspect", IMAGE],
-                                         check=False).returncode != 0:
-            horodate("construction de l'image (dsh %s)" % self.args.dsh)
-            run(["docker", "build", "-q", "-f", os.path.join(HERE, "Containerfile"),
-                 "--build-arg", "DSH=%s" % self.args.dsh, "-t", IMAGE, "."], timeout=1800)
+        # toujours reconstruite : les couches système et dsh restent en cache,
+        # seule la roue ameesh change d'un essai à l'autre
+        horodate("construction de l'image (dsh %s)" % self.args.dsh)
+        run(["docker", "build", "-q", "-f", os.path.join(HERE, "Containerfile"),
+             "--build-arg", "DSH=%s" % self.args.dsh, "-t", IMAGE, "."], timeout=1800)
+        run(["docker", "image", "prune", "-f"], check=False)
 
     def porte(self, state: str, seq: int):
         path = os.path.join(self.gate, "state", "state.json")
@@ -256,7 +257,7 @@ policy:
              IMAGE, "run", "--poll", "2"])
 
     # -- mesures ----------------------------------------------------------------------
-    _REQ = re.compile(r'^(\S+ \S+) ameesh\.exec "(\w+) (\S+) HTTP')
+    _REQ = re.compile(r'^(\S+ \S+) ameesh\.exec \S+ (GET|POST|PUT|DELETE) (\S+) \d+')
 
     def requetes(self, t0: float, t1: float) -> dict:
         """Requêtes reçues par le serveur entre t0 et t1, par route."""
@@ -345,7 +346,8 @@ policy:
             show = json.loads(run(["docker", "exec", EXEC, "ameesh-executor", "show"]).stdout)
             code_lu = run(["docker", "exec", EXEC, "sh", "-c",
                            "grep -rl %s /var/lib/ameesh-exec || true" % invit["code"]]).stdout
-            self.etape("1-enrolement", rows[0][1] == HOTE and show.get("host") == HOTE
+            self.etape("1-enrolement", rows[0][1] == HOTE
+                       and (show.get("state") or {}).get("host") == HOTE
                        and not code_lu.strip(), executeur=rows[0][0],
                        duree_s=round(time.time() - t0, 2), code_sur_volume=bool(code_lu.strip()))
         except Exception as exc:
@@ -447,7 +449,6 @@ policy:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--dsh", choices=("npm", "faux"), default="npm")
-    p.add_argument("--reconstruire", action="store_true")
     p.add_argument("--garder", action="store_true", help="garder conteneurs et base")
     p.add_argument("--dossier", default="/srv/ameesh/essai")
     args = p.parse_args()

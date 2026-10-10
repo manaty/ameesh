@@ -289,7 +289,7 @@ L'acquittement porte `seq`, `state`, `in_turn` (les agents encore en tour),
 
 | Dépendance (contrat v0.1 §6) | Ce qu'elle devient | Lots ameesh |
 |---|---|---|
-| **D1** API d'exécuteur médiée | `/api/exec/v1` sur le serveur du mesh : le contrat est figé (61 opérations), le serveur, le client, le relais de modèle et le dépôt de travail | L107 (contrat, fait), L108 (serveur), L109 (client), L111 (relais), L113 (dépôt de travail) |
+| **D1** API d'exécuteur médiée | `/api/exec/v1` sur le serveur du mesh : le contrat est figé (62 opérations, version 1.1), le serveur, le client, le relais de modèle et le dépôt de travail | L107 (contrat, fait), L108 (serveur), L109 (client), L111 (relais), L113 (dépôt de travail) |
 | **D2** émetteur de jetons serveur à serveur | **abandonné en v0.2**. Le hub ne voit, ne détient ni ne relaie aucun jeton. L'exécuteur obtient lui-même ses jetons (`amx1` de 10 min, `ams1` liés au bail), par sa clé enrôlée | L110 (enrôlement et identité) |
 | **D3** fiche Host et admission | la fiche `Host` au canon (`policy.volatile`, `occupants`), l'admission des agents sur l'hôte, et le code d'enrôlement lié à l'hôte et à une liste d'agents. **Sans fiche, aucun code n'est émis** | L110 (codes, révocation), L112 (porte d'hôte), canon du mesh (PR revue par un mainteneur) |
 | image et empaquetage | cette interface ; les brouillons du `Containerfile` et de l'entrée | **L114** |

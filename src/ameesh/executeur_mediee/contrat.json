@@ -2332,6 +2332,41 @@
    ]
   },
   {
+   "nom": "operations.assigned_open_lots",
+   "ecriture": false,
+   "transport": "op",
+   "portee": [
+    "A"
+   ],
+   "fence": false,
+   "param_agent": "name",
+   "forces": {},
+   "parametres": [
+    {
+     "nom": "name",
+     "sorte": "positionnel",
+     "schema": {
+      "type": "string"
+     },
+     "requis": true
+    }
+   ],
+   "resultat": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refus": null,
+   "idempotence": {
+    "cle": "aucune",
+    "naturelle": true
+   },
+   "regles": [
+    "lots ouverts assignés à l'agent : id, title, state, updated_ts (lot du tour, rotation au changement de lot, 0025) ; contrat 1.1"
+   ]
+  },
+  {
    "nom": "operations.set_session_work_item",
    "ecriture": true,
    "transport": "op",
@@ -3760,7 +3795,6 @@
    ],
    "operations": [
     "adopt",
-    "assigned_open_lots",
     "gauge_history",
     "listing",
     "open_lots_activity",

@@ -107,6 +107,15 @@ fi
 rm -rf "$HOME_DIR/work" "$HOME_DIR/harness"
 mkdir -p "$HOME_DIR/work" "$HOME_DIR/harness" "$HOME_DIR/state"
 
+# --- 4b. profil `agent` de dsh (gabarit `headless`), recréé à chaque démarrage --
+# L'exécuteur lance `dsh --profile agent` ; le profil vit sous $DSH_HOME, que
+# l'étape 4 vient d'effacer. Aucune clé ni URL n'y est écrite.
+dsh_bin="${AMEESH_DSH_BIN:-dsh}"
+if [ -n "${DSH_HOME:-}" ] && command -v "$dsh_bin" >/dev/null 2>&1; then
+    "$dsh_bin" agent --from-default-profile headless --dump-config >/dev/null 2>&1 \
+        || log "profil dsh « agent » non créé : les tours dsh échoueront"
+fi
+
 log "exécuteur $(state_field executor_id), hôte $(state_field host), mesh $(state_field mesh)"
 
 # --- 5. l'exécuteur remplace ce script (tini lui relaie SIGTERM) -------------

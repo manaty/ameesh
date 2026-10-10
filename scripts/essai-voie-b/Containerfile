@@ -13,11 +13,6 @@ RUN set -eux; apt-get update; \
     apt-get install -y --no-install-recommends python3 python3-pip python3-venv git tini \
         ca-certificates; \
     rm -rf /var/lib/apt/lists/*
-COPY pyproject.toml README.md LICENSE /src/
-COPY src /src/src
-RUN python3 -m venv /opt/ameesh && /opt/ameesh/bin/pip install --no-cache-dir /src \
-        'cryptography>=41' && rm -rf /src
-ENV PATH=/opt/ameesh/bin:$PATH
 COPY tests/fakebin/dsh /usr/local/lib/faux-dsh
 RUN if [ "$DSH" = npm ]; then \
         npm install -g --omit=dev "@deepseek-ai/dsh@$DSH_VERSION" && npm cache clean --force \
@@ -26,6 +21,11 @@ RUN if [ "$DSH" = npm ]; then \
         sed -i '1s|.*|#!/usr/bin/env python3|' /usr/local/lib/faux-dsh \
         && install -m 0755 /usr/local/lib/faux-dsh /usr/local/bin/dsh; \
     fi
+COPY pyproject.toml README.md LICENSE /src/
+COPY src /src/src
+RUN python3 -m venv /opt/ameesh && /opt/ameesh/bin/pip install --no-cache-dir /src \
+        'cryptography>=41' && rm -rf /src
+ENV PATH=/opt/ameesh/bin:$PATH
 COPY deploy/image-executeur/ameesh-executor /usr/local/bin/ameesh-executor
 RUN chmod 0755 /usr/local/bin/ameesh-executor \
     && useradd --uid 10001 --user-group --no-create-home --home-dir /var/lib/ameesh-exec \

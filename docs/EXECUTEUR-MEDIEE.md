@@ -15,7 +15,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/executeur_mediee/contrat.json` | la table fermée des 61 opérations et la liste des 160 refusées |
+| `src/ameesh/executeur_mediee/contrat.json` | la table fermée des 62 opérations et la liste des 159 refusées |
 | `src/ameesh/executeur_mediee/contrat.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/executeur_mediee/evenements.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/executeur_mediee/porte.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -58,7 +58,7 @@ Les portées :
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
 - **agregat** : une donnée agrégée.
 
-Comptes : 61 opérations, dont 23 lectures et 38 écritures. 51 passent par
+Comptes : 62 opérations, dont 24 lectures et 38 écritures. 52 passent par
 `op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Cinq
 lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
 servies aussi par `session/op`. Le test
@@ -167,6 +167,9 @@ table : aucun écart n'est toléré d'un côté seulement.
   `threads.index`. L'agent contrôlé doit être celui du jeton, et
   l'enveloppe de bail doit porter son agent et son epoch. Le bail du tour
   (`AMEESH_RUNNER_ID`, `AMEESH_LEASE_EPOCH`) entre au carnet de la session.
+- **`operations.assigned_open_lots`** entre dans la table (lecture, portée
+  A) : l'exécuteur en a besoin pour le lot du tour (rotation de session au
+  changement de lot, 0025). L'essai L115 l'a trouvé manquant.
 - **`threads.index`** : l'auteur est `agent:<nom>` (membre du fil,
   `fil.member`) ; le nom nu reste admis.
 - **`HostInfo.limits`** (`GET /host`) : `{"max_agents": int|null,
@@ -344,7 +347,7 @@ Le client vit dans `src/ameesh/storage/remote/` :
 
 | Fichier | Rôle |
 |---|---|
-| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 61 opérations), `LeaseBook` (carnet des baux) |
+| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 62 opérations), `LeaseBook` (carnet des baux) |
 | `http.py` | `HttpTransport(ExecTransport)`, `StaticTokenSource`, `FileTokenSource` |
 | `events.py` | `RemoteSubscription` : SSE, repli en attente longue, curseur gardé |
 | `__init__.py` | `connect(cfg)`, `set_token_source_factory` (point d'attache de L110) |

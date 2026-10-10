@@ -89,9 +89,10 @@ class TableTest(unittest.TestCase):
 
     def test_comptes(self):
         ops = self.c.operations.values()
-        self.assertEqual(len(self.c.operations), 61)
+        # contrat 1.1 : + operations.assigned_open_lots (lot du tour)
+        self.assertEqual(len(self.c.operations), 62)
         self.assertEqual(sum(o.write for o in ops), 38)
-        self.assertEqual(sum(not o.write for o in ops), 23)
+        self.assertEqual(sum(not o.write for o in ops), 24)
         self.assertEqual(sum(o.transport == "session/op" for o in ops), 9)
         # contrat 1.1 : lignes de la route op servies aussi par session/op
         self.assertEqual(sorted(o.name for o in ops if o.session),
