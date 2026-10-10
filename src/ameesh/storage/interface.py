@@ -92,7 +92,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    operations      set_settings set_session_work_item listing request_restart
                    apply_restart adopt resume message_lots assigned_open_lots
                    open_lots_activity turns record_gauges gauge_history
-                   record_balance balances
+                   latest_gauges assigners record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
    budgets         limits put events
    turn_resources  open_turn close_turn mark_orphan get open_by_agent orphans
@@ -1554,6 +1554,20 @@ class Operations(Domain):
         observed_ts, account (L30 ; None sans comptes). `account` filtre."""
 
     @abc.abstractmethod
+    def latest_gauges(self, *, since_s: float) -> list[dict]:
+        """L94 : le DERNIER relevé de chaque jauge (harness, account, key)
+        observé dans les `since_s` dernières secondes : harness, key, used,
+        resets_at_ts, window_s, observed_ts, account (None sans comptes)."""
+
+    @abc.abstractmethod
+    def assigners(self, *, since_s: float) -> list[str]:
+        """L94 : les acteurs qui ont confié des lots dans les `since_s`
+        dernières secondes — délégants (`work_item_delegations.delegated_by`)
+        et auteurs d'une réassignation (`work assign`, note « assigné à … »)
+        autres que le nouvel assigné. Noms tels qu'écrits (préfixe `agent:`
+        compris), triés, sans doublon."""
+
+    @abc.abstractmethod
     def record_balance(self, *, provider: str, currency: str, total: float,
                        granted: float | None, topped_up: float | None,
                        available: bool | None, account: str | None = None,
@@ -1612,6 +1626,13 @@ class HostResources(Domain):
     @abc.abstractmethod
     def turns_in_progress(self, host: str) -> int:
         """Nombre d'agents de l'hôte en tour (statut `running`, bail vivant)."""
+
+    @abc.abstractmethod
+    def usage(self, host: str, since_s: float) -> dict:
+        """L94 : l'utilisation de l'hôte sur les `since_s` dernières secondes :
+        `samples`, `first_ts`, `last_ts`, `max_load_per_cpu`,
+        `avg_load_per_cpu` (charge 1 min / CPU ; None sans mesure),
+        `max_turns`, `avg_turns` (tours en cours)."""
 
 
 class TurnResources(Domain):
