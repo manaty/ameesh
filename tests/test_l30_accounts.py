@@ -298,7 +298,8 @@ class ChoixTest(_Base):
     def test_la_session_garde_son_compte_sous_son_seuil(self):
         """0034 §4 (remplace la retenue de 0027 §3) : le primaire repasse sous
         son plafond de rythme, mais la session ouverte sur le secondaire y
-        reste ; sans session, le choix est libre."""
+        reste ; sans session, le choix va au plus en retard sur son rythme
+        (amendement 0034 du 2026-10-10, L117) : encore le secondaire."""
         items = self._items()
         now = time.time()
         _codex_rollout(items[0].path, 95, now + 3600)
@@ -312,6 +313,10 @@ class ChoixTest(_Base):
         self.assertEqual(choix.profile.name, "secondaire")
         self.assertTrue(choix.kept)
         self.assertIsNone(choix.switched)
+        self.assertEqual(accounts.choose(self.db, self.cfg.host, "codex", items, book,
+                                         now=now + 600).profile.name, "secondaire")
+        # le primaire redevient le plus en retard : une nouvelle session y va
+        _codex_rollout(items[1].path, 89, now + 3600)   # 89 % contre 85 %
         self.assertEqual(accounts.choose(self.db, self.cfg.host, "codex", items, book,
                                          now=now + 600).profile.name, "primaire")
 

@@ -1,5 +1,9 @@
 # Journal de la conception
 
+## 2026-10-10 (répartition des comptes)
+* **Amendement** de [0034](decisions/0034-consommer-d-abord-ce-qui-expire.md), accord du propriétaire : `ameesh accounts list` montrait le compte Claude primaire à 35 % de sa semaine (rythme 55 %) et les deux autres jamais utilisés, leurs forfaits hebdomadaires perdus. Le primaire, toujours en fenêtre ouverte, gagnait toujours le choix par échéance. Désormais, une nouvelle session va au compte le plus en retard sur son rythme (plus petit `utilisé / rythme` sur sa fenêtre la plus contraignante ; sans relevé : 0 %, en premier) ; l'échéance et l'ordre déclaré départagent. Forçage, continuité, pause et Codex inchangés.
+* **L117** (1.6.2) : la règle, sa raison dans le journal de l'exécuteur et dans `ameesh accounts list` (« le plus en retard sur son rythme ; avant : … »).
+
 ## 2026-10-10 (auditeur interne)
 * **Décision** : [auditeur interne](decisions/0036-auditeur-interne.md). Demande du propriétaire : « qu'ameesh ait un auditeur interne qui régulièrement, par exemple une fois par heure, regarde que tout se passe bien, que l'utilisation des ressources est optimale, et adapte les règles si besoin ». Persona `auditeur` (DeepSeek `deepseek-flash`), marge d'action en deux niveaux, consigne [AUDITEUR.md](../AUDITEUR.md). Fiche et placement proposés au canon manaty, mise en service après leur fusion. À ouvrir : un lot pour router les alertes urgentes vers un agent dans `ameesh notify`.
 

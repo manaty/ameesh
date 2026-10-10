@@ -1196,6 +1196,20 @@ tables de 0043 à 0047. Les corrections de `ameesh cost correct --apply`
 restent écrites ; l'ancien code ne lit pas `void_reason` et recompte donc les
 lignes écartées.
 
+## Mise à jour vers 1.6.2
+
+La 1.6.2 apporte L117 (amendement de 0034) : sans migration, un simple
+redémarrage des exécuteurs. **Ce que verra l'exploitation** : la prochaine
+nouvelle session d'un agent au forfait ira au compte le plus en retard sur
+son rythme, en premier à un compte jamais utilisé. Une bascule
+(`account_switches`, type `bascule`) est donc attendue vers le secondaire,
+puis le tertiaire, journalisée avec sa raison (« sans relevé : 0 % utilisé,
+le plus en retard sur son rythme ; avant : … »). Les sessions en cours
+restent sur leur compte tant qu'il est sous son seuil. Vérifier, avant la
+mise à jour, que les identifiants des comptes jamais utilisés sont présents
+(`ameesh accounts list`, état `ok`) : c'est la première fois qu'ils serviront.
+Retour arrière : l'ancien code, sans autre geste.
+
 ---
 
 ## Risques et parades
