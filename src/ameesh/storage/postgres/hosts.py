@@ -88,6 +88,21 @@ class Hosts(interface.HostResources):
             + where + " ORDER BY host, sampled_at DESC, id DESC", tuple(params))
         return rows
 
+    def usage(self, host, since_s) -> dict:
+        rows = self.db.query(
+            """
+            SELECT count(*)::int AS samples,
+                   extract(epoch from min(sampled_at))::float8 AS first_ts,
+                   extract(epoch from max(sampled_at))::float8 AS last_ts,
+                   max(load1 / nullif(cpu_count, 0))::float8 AS max_load_per_cpu,
+                   avg(load1 / nullif(cpu_count, 0))::float8 AS avg_load_per_cpu,
+                   max(turns_in_progress)::int AS max_turns,
+                   avg(turns_in_progress)::float8 AS avg_turns
+              FROM host_resources
+             WHERE host = %s AND sampled_at >= now() - make_interval(secs => %s)
+            """, (host, float(since_s)))
+        return rows[0] if rows else {"samples": 0}
+
     def turns_in_progress(self, host) -> int:
         rows = self.db.query(
             "SELECT count(*)::int AS n FROM agent_registry"
