@@ -355,7 +355,7 @@ class ApproveFlowTest(ApproveBase):
         self.assertEqual(status, 410)
         status, _headers, text = self.page(path)
         self.assertEqual(status, 410)
-        self.assertIn("déjà servi", text)
+        self.assertIn("already been used", text)
         status, receipt = self.fetch_receipt(data["request_id"])
         self.assertEqual(receipt["request"]["decision"], "approve")
 
@@ -385,7 +385,7 @@ class ApproveFlowTest(ApproveBase):
         self.clock.offset = self.acfg.link_ttl + 1
         status, _headers, text = self.page(path)
         self.assertEqual(status, 410)
-        self.assertIn("expiré", text)
+        self.assertIn("expired", text)
         status, result = self.submit(path, self.sign(self.alice, page))
         self.assertEqual((status, result["error"]), (410, "expired"))
         status, result = self.fetch_receipt(data["request_id"])
@@ -442,7 +442,7 @@ class ApproveFlowTest(ApproveBase):
         self.source.put(dict(action, args={"pr": 43, "method": "merge"}))
         status, _headers, text = self.page(path)
         self.assertEqual(status, 409)
-        self.assertIn("changé", text)
+        self.assertIn("changed", text)
         status, result = self.submit(path, self.sign(self.alice, page))
         self.assertEqual((status, result["error"]), (409, "action_changed"))
         # action annulée entre la demande et la signature : plus rien à approuver
@@ -585,14 +585,14 @@ class ApproveFlowTest(ApproveBase):
             self.assertNotIn(planted, text)
         self.assertIn("exemple/depot#42", text)
         self.assertEqual(self.summary_of(text), expected)
-        self.assertIn("champs ignorés", self.log.getvalue())
+        self.assertIn("ignored fields", self.log.getvalue())
         self.assertNotIn("Approuver 1 EUR", self.log.getvalue())
 
     def test_echappement_html_et_caracteres_trompeurs(self):
         hostile = make_action(
             project='p"><svg onload=alert(1)>',
             operation="merge</code><script>alert(2)</script>",
-            target="<script>alert(1)</script>\nmontant : 0 EUR",
+            target="<script>alert(1)</script>\namount: 0 EUR",
             args={"note": "<img src=x onerror=alert(3)>", "rtl": "fichier\u202egnp.exe",
                   "zw": "a\u200bb", "q": "\" ' & </pre>"},
             amount=12345, currency="EUR")
@@ -611,7 +611,7 @@ class ApproveFlowTest(ApproveBase):
         # une valeur ne s'étale jamais sur plusieurs lignes du résumé
         summary = self.summary_of(text)
         self.assertEqual(len(summary.splitlines()), 13)
-        self.assertIn("cible : <script>alert(1)</script>\\u{000a}montant : 0 EUR", summary)
+        self.assertIn("target: <script>alert(1)</script>\\u{000a}amount: 0 EUR", summary)
         self.assertEqual(render.summary_digest(summary), data["summary_digest"])
         # sosie : cible avec un « о » cyrillique signalée
         _a, _d, path = self.create(make_action(target="exemple/dep\u043et#42"))
@@ -624,7 +624,7 @@ class ApproveFlowTest(ApproveBase):
         self.submit(path, self.sign(self.alice, self.page_data(text)))
         self.api("POST", "/requests", {"x": 1}, auth="mauvais-jeton-" + "z" * 40)
         journal = self.log.getvalue()
-        self.assertIn("/a/<jeton>", journal)
+        self.assertIn("/a/<token>", journal)
         self.assertIn(data["request_id"], journal)
         for secret in (token, self.service_token, "mauvais-jeton-" + "z" * 40):
             self.assertNotIn(secret, journal)
@@ -690,8 +690,8 @@ class ApproveRetryTest(ApproveBase):
                          (action["action_id"], digest_of(action), False))
         status, _headers, text = self.page(path)
         self.assertEqual(status, 200, text)
-        self.assertIn("Nouvelle tentative de la MÊME action", text)
-        self.assertIn("échoué de façon certaine", text)
+        self.assertIn("New attempt of the SAME action", text)
+        self.assertIn("definitely failed", text)
         self.assertNotIn("DOUBLON", text)
         page = self.page_data(text)
         self.assertEqual(page["kind"], "approve")
@@ -759,21 +759,21 @@ class ApproveAssumeDuplicateTest(ApproveBase):
         self.assertEqual(status, 200, text)
         self.assertSecurityHeaders(_headers)
         # EN CLAIR : une décision d'assomption de doublon, pas une approbation
-        self.assertIn("<title>Doublon à assumer — ameesh</title>", text)
+        self.assertIn("<title>Duplicate to assume — ameesh</title>", text)
         self.assertEqual(html.unescape(re.search(r"<h1>(.*?)</h1>", text).group(1)),
-                         "Assumer le risque d'un DOUBLON")
-        self.assertNotIn("Approbation demandée", text)
+                         "Assume the risk of a DUPLICATE")
+        self.assertNotIn("Approval requested", text)
         alert = re.search(r'<section class="duplicate" role="alert">(.*?)</section>', text, re.S)
         self.assertIsNotNone(alert)
         alert = alert.group(1)
-        self.assertIn("PAS une approbation ordinaire", alert)
-        self.assertIn("assumez le risque d'un DOUBLON de cette action", alert)
-        self.assertIn("INCONNUE", alert)
+        self.assertIn("NOT an ordinary approval", alert)
+        self.assertIn("assume the risk of a DUPLICATE of this action", alert)
+        self.assertIn("UNKNOWN", alert)
         for shown in (action["action_id"], "exemple/depot#42", "123.45 EUR", "git-merge / merge"):
             self.assertIn(shown, alert)
-        self.assertIn('class="approve">Assumer le doublon</button>', text)
-        self.assertNotIn(">Approuver</button>", text)
-        self.assertIn("Action remplacée", text)
+        self.assertIn('class="approve">Assume the duplicate</button>', text)
+        self.assertNotIn(">Approve</button>", text)
+        self.assertIn("Replaced action", text)
         self.assertIn(render.short_digest(expected), text)
         self.assertIn(digest_of(action), text)
         page = self.page_data(text)
@@ -783,10 +783,10 @@ class ApproveAssumeDuplicateTest(ApproveBase):
         summary = self.summary_of(text)
         lines = summary.splitlines()
         self.assertEqual(lines[0], "ameesh-summary/1")
-        self.assertTrue(lines[1].startswith("décision : ASSUMER LE RISQUE D'UN DOUBLON"), lines)
-        self.assertEqual(lines[2], "action remplacée : %s" % action["action_id"])
-        self.assertIn("empreinte de l'action : %s" % digest_of(action), lines)
-        self.assertIn("empreinte de la décision : %s" % expected, lines)
+        self.assertTrue(lines[1].startswith("decision: ASSUME THE RISK OF A DUPLICATE"), lines)
+        self.assertEqual(lines[2], "replaced action: %s" % action["action_id"])
+        self.assertIn("action digest: %s" % digest_of(action), lines)
+        self.assertIn("decision digest: %s" % expected, lines)
         self.assertEqual(render.summary_digest(summary), data["summary_digest"])
         self.assertEqual(summary, render.render_summary(normalize_action(action), ALICE, AGENT,
                                                         assume_duplicate=True))
@@ -809,7 +809,7 @@ class ApproveAssumeDuplicateTest(ApproveBase):
                                            expected_digest=digest_of(action),
                                            expected_action_id=action["action_id"])
         self.assertEqual(mismatch.code, receipts.DIGEST_MISMATCH)
-        self.assertIn("doublon assumé", self.log.getvalue())
+        self.assertIn("duplicate assumed", self.log.getvalue())
 
     def test_approbation_ordinaire_ne_vaut_pas_assomption(self):
         action = self.unknown_action(dedupe="guaranteed")
@@ -863,14 +863,14 @@ class ApproveAssumeDuplicateTest(ApproveBase):
         self.assertEqual((status, result["decision"]), (200, "deny"))
 
     def test_echappement_dans_l_encadre(self):
-        hostile = self.unknown_action(target="<b>x</b>‮\nmontant : 0 EUR",
+        hostile = self.unknown_action(target="<b>x</b>‮\namount: 0 EUR",
                                       operation="merge<script>")
         _a, _d, path = self.create(hostile, extra={"assume_duplicate": True})
         status, _headers, text = self.page(path)
         self.assertEqual(status, 200)
         alert = re.search(r'<section class="duplicate" role="alert">(.*?)</section>',
                           text, re.S).group(1)
-        self.assertIn("&lt;b&gt;x&lt;/b&gt;\\u{202e}\\u{000a}montant : 0 EUR", alert)
+        self.assertIn("&lt;b&gt;x&lt;/b&gt;\\u{202e}\\u{000a}amount: 0 EUR", alert)
         self.assertNotIn("<script>", alert)
         self.assertNotIn("‮", text)
 
@@ -965,7 +965,7 @@ class ApproveEnrollTest(ApproveBase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         link = urlsplit(proc.stdout.strip())
         self.assertEqual("%s://%s" % (link.scheme, link.netloc), ORIGIN)
-        self.assertIn("TÉLÉPHONE", proc.stderr)
+        self.assertIn("ON THE PHONE", proc.stderr)
         return link.path
 
     def authenticators(self) -> int:
@@ -1167,16 +1167,16 @@ class ApproveConfigTest(unittest.TestCase):
         summary = render.render_summary(action, ALICE, AGENT)
         self.assertEqual(summary, render.render_summary(dict(action), ALICE, AGENT))
         self.assertTrue(summary.startswith("ameesh-summary/1\n"))
-        self.assertIn("cible : a\\u{202e}b\\u{000a}c\n", summary)
-        self.assertIn('arguments : {"k":"\\u{2028}"}\n', summary)
+        self.assertIn("target: a\\u{202e}b\\u{000a}c\n", summary)
+        self.assertIn('arguments: {"k":"\\u{2028}"}\n', summary)
         self.assertEqual(render.visible("a\\u{0041}"), "a\\\\u{0041}")
-        self.assertEqual(render.format_amount(5, "JPY"), "5 JPY (5 en unités mineures)")
-        self.assertEqual(render.format_amount(1234, "KWD"), "1.234 KWD (1234 en unités mineures)")
+        self.assertEqual(render.format_amount(5, "JPY"), "5 JPY (5 in minor units)")
+        self.assertEqual(render.format_amount(1234, "KWD"), "1.234 KWD (1234 in minor units)")
 
     def test_redaction_du_journal(self):
         token = secrets.token_urlsafe(32)
         self.assertEqual(approve_server.redact("GET /a/%s HTTP/1.1" % token),
-                         "GET /a/<jeton> HTTP/1.1")
+                         "GET /a/<token> HTTP/1.1")
         self.assertNotIn(token, approve_server.redact("Bearer %s" % token))
 
 

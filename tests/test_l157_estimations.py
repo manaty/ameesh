@@ -152,16 +152,16 @@ class IssueHeaderTest(unittest.TestCase):
                 "estimate_minutes": 120, "estimate_source": "conception", "estimate_by": "w1",
                 "planned_start": "2026-10-12", "planned_delivery": "2026-10-15"}
         body = self.view(item).body
-        self.assertIn("Durée estimée 2 h · prévu : début 12/10/2026, livraison 15/10/2026",
+        self.assertIn("Estimated duration 2 h · planned: start 2026-10-12, delivery 2026-10-15",
                       body)
         self.assertNotIn("conception", body)       # la source n'est pas publiée
-        self.assertNotIn("réel", body)
+        self.assertNotIn("actual", body)
         done = dict(item, state="merged", started_ts=NOW - 9600, merged_ts=NOW)
         self.assertIn("2 h 40 (+40 min, ×1.33)", self.view(done).body)
         # ni estimation ni date : l'en-tête ne change pas (aucune réécriture d'issue)
         bare = {"id": 13, "title": "x", "type": "bug", "state": "build"}
         self.assertIsNone(plan_github._plan_line(bare))
-        self.assertNotIn("Durée", self.view(bare, public=False).body)
+        self.assertNotIn("Duration", self.view(bare, public=False).body)
 
 
 class VersionOnlyTest(unittest.TestCase):
@@ -258,7 +258,7 @@ class EstimatesPgTest(PgTestCase):
         # sur une fiche : refusé ; lot livré : estimation figée
         proc = self.mesh("work", "plan", "fiche-x", "--estimate", "2h")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("se pose sur une tâche", proc.stderr)
+        self.assertIn("applies to a task", proc.stderr)
         work.move(self.db, lot["id"], "build")
         work.merged(self.db, lot["id"], sha="abcdef1")
         with self.assertRaises(estimates.EstimateError):

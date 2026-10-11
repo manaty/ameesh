@@ -377,8 +377,8 @@ class MergeSweepTest(_Base):
         self.merge("feature/cli", "Merge\n\nameesh-work: %d" % lot["id"])
         proc = self.mesh("work", "sync-branches")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("(sans branche)", proc.stdout)
-        self.assertIn("FERMÉ", proc.stdout)
+        self.assertIn("(no branch)", proc.stdout)
+        self.assertIn("CLOSED", proc.stdout)
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 
 
