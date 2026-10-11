@@ -30,7 +30,11 @@ Pendant cette phase d'observation, le radar n'envoie AUCUN courrier (L160c).
 Configuration de l'hôte (clé `radar`) :
 
     "radar": {"projects": {"ameesh": {"repo": "~/work/ameesh",
-                                      "migrations": "src/ameesh/migrations"}}}
+                                      "migrations": "src/ameesh/migrations",
+                                      "github": "manaty/ameesh"}}}
+
+`github` (facultatif, sinon déduit de l'URL `origin`) : le dépôt où lire l'état
+de la CI des PR, pour savoir si un conflit bloque.
 """
 from __future__ import annotations
 
@@ -48,12 +52,17 @@ from .canon import GIT_TIMEOUT, GitError, _git, _git_env
 
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
-PROJECT_KEYS = ("repo", "migrations", "target")
+PROJECT_KEYS = ("repo", "migrations", "target", "github")
 #: une migration numérotée : `NNNN_nom.sql`
 MIGRATION_RE = re.compile(r"^([0-9]{4})_[^/]+$")
 #: paires gardées au plus dans le cache d'un exécuteur
 MAX_CACHE = 20000
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_GITHUB_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+#: URL `origin` d'un dépôt GitHub (https ou ssh)
+_ORIGIN_RE = re.compile(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$")
+#: conclusions de check qui ne bloquent pas une PR verte
+CI_OK = frozenset(("SUCCESS", "NEUTRAL", "SKIPPED"))
 
 
 class SettingsError(ValueError):
@@ -66,6 +75,7 @@ class Project:
     repo: str
     migrations: str = ""
     target: str = ""
+    github: str = ""
 
 
 @dataclass
@@ -105,15 +115,18 @@ def parse_settings(raw) -> Settings:
         if not isinstance(repo, str) or not repo.strip():
             raise SettingsError("%s.repo : chemin du dépôt attendu" % where)
         texts = {}
-        for key in ("migrations", "target"):
+        for key in ("migrations", "target", "github"):
             text = value.get(key) or ""
             if not isinstance(text, str):
                 raise SettingsError("%s.%s : texte attendu" % (where, key))
             texts[key] = text.strip().strip("/")
         if texts["target"]:
             plan_git.check_ref(texts["target"], "cible")
+        if texts["github"] and not _GITHUB_RE.match(texts["github"]):
+            raise SettingsError("%s.github : dépôt « owner/repo » attendu" % where)
         projects[name] = Project(name=name, repo=os.path.expanduser(repo.strip()),
-                                 migrations=texts["migrations"], target=texts["target"])
+                                 migrations=texts["migrations"], target=texts["target"],
+                                 github=texts["github"])
     return Settings(projects=projects)
 
 
@@ -374,9 +387,10 @@ def write_journal(cfg, project: str, report: dict) -> dict:
 
 
 def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None = None,
-             now=time.time) -> list[dict]:
+             now=time.time, ci="github") -> list[dict]:
     """Un passage du radar sur les projets déclarés par l'hôte ; rend la ligne
-    de journal de chacun. Aucun courrier (observation, L160c)."""
+    de journal de chacun, avec ses envois (`mail`, L160c). `ci` : la fonction
+    `branche -> {number, green} | None`, par défaut lue sur GitHub."""
     from . import storage
     settings = settings if settings is not None else settings_of(cfg)
     if not settings.projects:
@@ -395,8 +409,226 @@ def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None =
         report.update(schema=SCHEMA, project=project.name, ts=started,
                       duration_s=round(now() - started, 3), error=error)
         line = write_journal(cfg, project.name, report)
-        lines.append(dict(line, project=project.name))
+        sent = [] if error else send_mail(cfg, db, project, report, ci=ci)
+        lines.append(dict(line, project=project.name, mail=sent))
     return lines
+
+
+# --------------------------------------------------------------------------
+# courrier (L160c) : passif sur conflit nouveau, réveil seulement s'il bloque
+# --------------------------------------------------------------------------
+
+def github_slug(project: Project) -> str | None:
+    """Le dépôt GitHub du projet : `github`, sinon l'URL `origin` du clone."""
+    if project.github:
+        return project.github
+    url = plan_git._out(project.repo, "remote", "get-url", "origin") or ""
+    match = _ORIGIN_RE.search(url.strip())
+    return match.group(1) if match else None
+
+
+def ci_green(rollup) -> bool:
+    """`statusCheckRollup` d'une PR : vert si au moins un check, et tous
+    terminés sans échec."""
+    if not rollup:
+        return False
+    for check in rollup:
+        if check.get("__typename") == "StatusContext" or "state" in check \
+                and "conclusion" not in check:
+            if (check.get("state") or "").upper() != "SUCCESS":
+                return False
+        elif (check.get("status") or "").upper() != "COMPLETED" \
+                or (check.get("conclusion") or "").upper() not in CI_OK:
+            return False
+    return True
+
+
+def github_ci(project: Project, gh=None):
+    """La fonction `branche -> {number, url, green} | None` du projet (PR
+    ouverte de la branche), lue avec `gh` ; None si le dépôt GitHub est inconnu.
+    Une erreur de `gh` vaut « pas verte » : le courrier reste passif."""
+    slug = github_slug(project)
+    if not slug:
+        return None
+    from . import plan_github
+
+    def status(branch: str):
+        nonlocal gh
+        try:
+            gh = gh or plan_github.Gh()
+            rows = plan_github._json(gh, ["pr", "list", "--repo", slug, "--head", branch,
+                                          "--state", "open", "--json",
+                                          "number,url,statusCheckRollup"]) or []
+        except plan_github.GithubError:
+            return None
+        if not rows:
+            return None
+        return {"number": rows[0].get("number"), "url": rows[0].get("url"),
+                "green": ci_green(rows[0].get("statusCheckRollup"))}
+    return status
+
+
+def conflicts_of(report: dict) -> dict:
+    """{clé: conflit} d'un rapport : paires en conflit, lots en conflit avec
+    leur cible, numéros de migration en double (mêmes clés que `_states`)."""
+    out = {}
+    for pair in report.get("pairs") or ():
+        if pair["state"] == "conflict":
+            out["pair:%d-%d" % tuple(pair["lots"])] = {
+                "kind": "pair", "lots": list(pair["lots"]), "files": pair["files"],
+                "target": pair["target"]}
+    for one in report.get("against_target") or ():
+        if one["state"] == "conflict":
+            out["target:%d" % one["work_item"]] = {
+                "kind": "target", "lots": [one["work_item"]], "files": one["files"],
+                "target": one["target"]}
+    for dup in report.get("migrations") or ():
+        out["migration:%s:%s" % (dup["target"], dup["number"])] = {
+            "kind": "migration", "lots": sorted({h["work_item"] for h in dup["lots"]}),
+            "files": [h["path"] for h in dup["lots"]], "target": dup["target"],
+            "number": dup["number"], "in_target": dup["in_target"]}
+    return out
+
+
+def _files(files) -> str:
+    files = list(files or ())
+    return ", ".join(files[:6]) + (" …" if len(files) > 6 else "") if files else "—"
+
+
+def _who(branches: dict, lot: int) -> str:
+    one = branches.get(lot) or {}
+    return "#%d « %s » (%s, %s)" % (lot, one.get("title") or "", one.get("branch") or "?",
+                                    one.get("assignee") or "non assigné")
+
+
+def message_text(conflict: dict, lot: int, branches: dict, *, ci=None,
+                 merged=()) -> str:
+    """Le courrier du radar pour l'assigné de `lot`."""
+    mine = branches.get(lot) or {}
+    head = "Radar de conflits, lot #%d « %s »" % (lot, mine.get("title") or "")
+    if ci is not None:
+        return ("%s : ta PR #%s est verte mais ne peut pas fusionner, ta branche %s est "
+                "en conflit avec %s sur %s%s. Intègre %s dans ta branche et résous le "
+                "conflit." % (head, ci.get("number"), mine.get("branch") or "?",
+                              conflict["target"], _files(conflict["files"]),
+                              " (%s y est entré)" % ", ".join("#%d" % n for n in merged)
+                              if merged else "", conflict["target"]))
+    if conflict["kind"] == "pair":
+        other = [n for n in conflict["lots"] if n != lot][0]
+        return ("%s : ta branche et celle du lot %s se fusionnent en conflit sur %s. Rien "
+                "ne bloque encore : le second des deux à entrer dans %s devra résoudre ; "
+                "tu seras réveillé si c'est toi et que ta PR est verte."
+                % (head, _who(branches, other), _files(conflict["files"]),
+                   conflict["target"]))
+    if conflict["kind"] == "target":
+        return ("%s : ta branche %s ne fusionne plus proprement dans %s (conflit sur %s). "
+                "Intègre %s dans ta branche avant ta demande de fusion ; tu seras réveillé "
+                "si ta PR est verte et toujours bloquée."
+                % (head, mine.get("branch") or "?", conflict["target"],
+                   _files(conflict["files"]), conflict["target"]))
+    others = [_who(branches, n) for n in conflict["lots"] if n != lot]
+    return ("%s : le numéro de migration %s est en double (%s)%s%s. Prends le premier "
+            "numéro libre de %s et signale-le à l'autre lot."
+            % (head, conflict["number"], _files(conflict["files"]),
+               " ; aussi pris par le lot %s" % ", ".join(others) if others else "",
+               " ; déjà dans %s : %s" % (conflict["target"], conflict["in_target"])
+               if conflict.get("in_target") else "", conflict["target"]))
+
+
+def _notified_path(cfg, project: str) -> str:
+    return os.path.join(journal_dir(cfg), project + ".notified")
+
+
+def read_notified(cfg, project: str) -> dict:
+    """{clé: {lot: niveau}} des conflits déjà signalés (`passive`, `blocking`) ;
+    pour un conflit avec la cible, `merged` : les lots fusionnés d'où il vient."""
+    try:
+        with open(_notified_path(cfg, project), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data.get("keys") or {} if isinstance(data, dict) else {}
+
+
+def _write_notified(cfg, project: str, keys: dict) -> None:
+    directory = journal_dir(cfg)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".%s.notified." % project)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"schema": SCHEMA, "keys": keys}, fh, ensure_ascii=False, indent=1)
+    os.replace(tmp, _notified_path(cfg, project))
+
+
+def _merged_partners(db, lot: int, keys, present) -> list[int]:
+    """Les lots déjà signalés en conflit avec `lot` qui ont quitté le radar
+    parce qu'ils sont fusionnés."""
+    from . import work
+    partners = set()
+    for key in keys:
+        if key.startswith("pair:"):
+            pair = [int(n) for n in key[5:].split("-")]
+            if lot in pair:
+                partners.update(n for n in pair if n != lot and n not in present)
+    merged = []
+    for other in sorted(partners):
+        row = work.get(db, other)
+        if row and row.get("state") in work.MERGED_STATES:
+            merged.append(other)
+    return merged
+
+
+def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[dict]:
+    """Le courrier d'un passage : un message par lot concerné et par conflit
+    nouveau (passif), puis un réveil quand un conflit avec la cible bloque
+    une PR verte. Rend les envois `{key, lot, to, level, message_id}`."""
+    from . import mail, work
+    if ci == "github":
+        ci = github_ci(project)
+    before = read_notified(cfg, project.name)
+    current = conflicts_of(report)
+    branches = {b["work_item"]: b for b in report.get("branches") or ()}
+    keys: dict = {}
+    sent: list[dict] = []
+    for key, conflict in sorted(current.items()):
+        done = dict(before.get(key) or {})
+        for lot in conflict["lots"]:
+            one = branches.get(lot) or {}
+            to = one.get("assignee")
+            if not to or to.startswith(work.HUMAN_PREFIX):
+                continue
+            level, status = "passive", None
+            if conflict["kind"] == "target" and done.get(str(lot)) != "blocking" and ci:
+                status = ci(one["branch"])
+                if status and status.get("green"):
+                    level = "blocking"
+            if done.get(str(lot)) in (level, "blocking"):
+                continue
+            if conflict["kind"] == "target" and "merged" not in done:
+                # les lots fusionnés d'où vient le conflit, notés à sa première
+                # vue : leurs paires quittent le radar avec eux
+                done["merged"] = _merged_partners(db, lot, before, branches)
+            data = {"project": project.name, "key": key, "kind": conflict["kind"],
+                    "lots": conflict["lots"], "files": conflict["files"],
+                    "target": conflict["target"]}
+            if level == "blocking":
+                data.update(pr=status.get("number"), merged=done.get("merged") or [])
+            text = message_text(conflict, lot, branches,
+                                ci=status if level == "blocking" else None,
+                                merged=done.get("merged") or ())
+            try:
+                message_id = mail.send(
+                    db, work.SYSTEM_SENDER, to, text, kind="event", work_item_id=str(lot),
+                    payload={"radar_blocking" if level == "blocking" else "radar": data})
+            except Exception:  # noqa: BLE001 - réessayé au passage suivant
+                continue
+            done[str(lot)] = level
+            sent.append({"key": key, "lot": lot, "to": to, "level": level,
+                         "message_id": message_id})
+        if done:
+            keys[key] = done
+    if keys != before:
+        _write_notified(cfg, project.name, keys)
+    return sent
 
 
 # --------------------------------------------------------------------------

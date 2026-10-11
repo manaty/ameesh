@@ -61,14 +61,16 @@ _RESERVED_SQL = """
         > extract(epoch from clock_timestamp())
 """
 
-#: L125 : un message PASSIF — accusé, copie, diffusion à tous, jamais urgent —
+#: L125 : un message PASSIF — accusé, copie, diffusion à tous, conflit signalé
+#: par le radar (L160c), jamais urgent —
 #: n'ouvre pas de tour à lui seul (même règle que `mail.passive_reason`).
 #: `{t}` : l'alias de la table `agent_mailbox` (`PASSIVE_SQL.format(t="mb")`).
 PASSIVE_SQL = (
     "(NOT {t}.payload @> '{{\"urgent\": true}}'::jsonb"
     " AND ({t}.payload @> '{{\"ack\": true}}'::jsonb"
     " OR {t}.payload @> '{{\"broadcast\": true}}'::jsonb"
-    " OR coalesce({t}.payload->>'cc', '') <> ''))")
+    " OR coalesce({t}.payload->>'cc', '') <> ''"
+    " OR coalesce(jsonb_typeof({t}.payload->'radar'), '') = 'object'))")
 
 
 class Mailbox(interface.Mailbox):
