@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""L224 : l'id de session d'un agent ne vient que de son propre harnais, et un
+id inconnu du stockage du harnais n'est jamais repris.
+
+Incident du 2026-10-11 : mesh-design (harnais claude) lance `codex exec` pour
+une relecture ; le processus hérite de l'environnement du tour
+(AGENT_MAIL_NAME, AMEESH_RUNNER_ID, AMEESH_LEASE_EPOCH…), et le hook
+agent-mail de codex se présente comme mesh-design. ameesh retient l'id codex
+(01a129ab…) comme session de mesh-design ; chaque tour suivant échoue
+(`claude --resume` sur un id que Claude Code ne connaît pas), puis cinq échecs
+rapides et l'arrêt. Postgres réel ; faux harnais `claude`.
+"""
+from __future__ import annotations
+
+import json
+import os
+import unittest
+from unittest import mock
+
+from ameesh import cli, mail, registry
+from ameesh.runner import AgentWorker, Runner
+
+from .support import FAKEBIN, PgTestCase
+
+CODEX = "01a129ab-3aeb-76a2-beaf-c5829c01f373"
+CLAUDE = "0ecd16ab-c729-44ef-80b4-5cfd20c789ad"
+
+
+class HarnaisDuHookTest(unittest.TestCase):
+    def test_harnais_etranger(self):
+        with mock.patch.dict(os.environ, {"AMEESH_HARNESS": "claude"}):
+            self.assertEqual(cli.hook_foreign_harness("codex"), "claude")
+            self.assertEqual(cli.hook_foreign_harness("claude"), "")
+        with mock.patch.dict(os.environ, {"AMEESH_HARNESS": ""}):
+            # session hors exécuteur (ou exécuteur d'avant L224) : pas de contrôle
+            self.assertEqual(cli.hook_foreign_harness("codex"), "")
+
+
+class _Base(PgTestCase):
+    def _worker(self, name: str):
+        runner = Runner(self.cfg, self.db, once=True)
+        cwd = os.path.join(self.tmp, "work", name)
+        os.makedirs(cwd, exist_ok=True)
+        self.register(name, "claude", cwd=cwd)
+        lease = registry.claim(self.db, name, runner.runner_id, 3600)
+        self.assertIsNotNone(lease)
+        worker = AgentWorker(runner, registry.get(self.db, name), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        return runner, worker
+
+
+class HookEtrangerSousBailTest(_Base):
+    """Le hook de codex lancé pendant un tour claude : ni inscription, ni
+    courrier remis ; le refus est journalisé une fois."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        _runner, self.worker = self._worker("md")
+        registry.set_session(self.db, "md", CLAUDE)
+        mail.send(self.db, "orchestrateur", "md", "Pour la session claude.")
+
+    def _hook(self, harness: str, event: str, session: str):
+        env = self.env(AGENT_MAIL_NAME="md", AMEESH_RUNNER_ID=self.worker.runner.runner_id,
+                       AMEESH_LEASE_EPOCH=str(self.worker.epoch), AMEESH_HARNESS="claude")
+        return self.cli("hook", harness, env=env, stdin=json.dumps(
+            {"hook_event_name": event, "session_id": session, "cwd": self.tmp}))
+
+    def _non_remis(self) -> int:
+        return self.db.query(
+            "SELECT count(*)::int AS n FROM agent_mailbox "
+            "WHERE recipient = 'md' AND delivered_at IS NULL")[0]["n"]
+
+    def _refus_au_fil(self) -> int:
+        marques = os.path.join(self.state, "hooks")
+        return len([f for f in os.listdir(marques) if f.startswith("md.refus-")]
+                   ) if os.path.isdir(marques) else 0
+
+    def test_hook_codex_refuse(self):
+        for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"):
+            with self.subTest(event=event):
+                proc = self._hook("codex", event, CODEX)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, "")
+                self.assertIn("hook codex refusé pour md", proc.stderr)
+                self.assertEqual(self._non_remis(), 1)
+        self.assertEqual(registry.get(self.db, "md")["session_id"], CLAUDE)
+        self.assertEqual(self._refus_au_fil(), 1)  # une fois par (harnais, session)
+
+    def test_le_hook_du_harnais_de_l_agent_sert_toujours(self):
+        self._hook("codex", "PostToolUse", CODEX)
+        proc = self._hook("claude", "PostToolUse", CLAUDE)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        contexte = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Pour la session claude.", contexte)
+        self.assertEqual(self._non_remis(), 0)
+
+
+class RepriseVerifieeTest(_Base):
+    """Avant un --resume, l'id est cherché dans le stockage de sessions du
+    harnais (Claude Code : `<CLAUDE_CONFIG_DIR>/projects/<dossier>/<id>.jsonl`)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.home = os.path.join(self.tmp, "claude-home")
+        os.makedirs(os.path.join(self.home, "projects", "-work-md"))
+
+    def _session_sur_disque(self, session: str) -> None:
+        with open(os.path.join(self.home, "projects", "-work-md", session + ".jsonl"),
+                  "w", encoding="utf-8") as fh:
+            fh.write("{}\n")
+
+    def _env(self):
+        return mock.patch.dict(os.environ, {
+            "AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+            "CLAUDE_CONFIG_DIR": self.home, "AMEESH_SESSION_STORE_CHECK": "1"})
+
+    def _tour(self, worker) -> bool:
+        return worker.run_turn({"kind": "prompt", "prompt": "travail", "ids": []})
+
+    def _reprises(self) -> list[str | None]:
+        out = []
+        for tour in self.turns():
+            argv = tour["argv"]
+            out.append(argv[argv.index("--resume") + 1] if "--resume" in argv else None)
+        return out
+
+    def test_id_inconnu_jamais_repris_brief_de_reprise(self):
+        _runner, worker = self._worker("md-neuve")
+        registry.set_session(self.db, "md-neuve", CODEX)
+        worker.agent = registry.get(self.db, "md-neuve")
+        with self._env():
+            self.assertTrue(self._tour(worker))
+        self.assertEqual(self._reprises(), [None])
+        self.assertIn("session %s inconnue du harnais" % CODEX,
+                      " ".join(self.turns()[-1]["argv"]))
+        self.assertEqual(worker.resume_origin, "ameesh")
+        self.assertFalse(worker.fast_failure)
+        # la session neuve du flux devient celle de l'agent
+        self.assertEqual(registry.get(self.db, "md-neuve")["session_id"], "claude-sess-1")
+
+    def test_retour_a_la_derniere_session_principale_connue(self):
+        _runner, worker = self._worker("md-mere")
+        self._session_sur_disque(CLAUDE)
+        worker.write_session_file(CLAUDE)  # écrit depuis le flux du harnais
+        registry.set_session(self.db, "md-mere", CODEX)
+        worker.agent = registry.get(self.db, "md-mere")
+        with self._env():
+            self.assertTrue(self._tour(worker))
+        self.assertEqual(self._reprises(), [CLAUDE])
+        self.assertEqual(registry.get(self.db, "md-mere")["session_id"], CLAUDE)
+
+    def test_session_locale_inconnue_elle_aussi(self):
+        _runner, worker = self._worker("md-locale")
+        worker.write_session_file("claude-perdue")
+        registry.set_session(self.db, "md-locale", CODEX)
+        worker.agent = registry.get(self.db, "md-locale")
+        with self._env():
+            self.assertTrue(self._tour(worker))
+        self.assertEqual(self._reprises(), [None])
+
+    def test_session_connue_reprise(self):
+        _runner, worker = self._worker("md-ok")
+        self._session_sur_disque(CLAUDE)
+        registry.set_session(self.db, "md-ok", CLAUDE)
+        worker.agent = registry.get(self.db, "md-ok")
+        with self._env():
+            self.assertTrue(self._tour(worker))
+        self.assertEqual(self._reprises(), [CLAUDE])
+
+    def test_le_tour_pose_le_harnais_pour_ses_hooks(self):
+        _runner, worker = self._worker("md-env")
+        with self._env():
+            self.assertTrue(self._tour(worker))
+        self.assertEqual(self.turns()[-1]["env"].get("AMEESH_HARNESS"), "claude")
+
+
+if __name__ == "__main__":
+    unittest.main()
