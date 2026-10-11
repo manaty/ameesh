@@ -94,6 +94,35 @@ fermé. Demandez aux agents de citer leur lot (`--lot`) dans leurs comptes
 rendus, relectures comprises : une référence (`RÉF` du titre) qui désigne un
 seul lot ouvert est enregistrée par son numéro, quel que soit l'expéditeur.
 
+## Chaque lot a son issue GitHub
+
+ameesh crée et tient une issue GitHub par lot, dans le dépôt de son projet
+(L126). Le titre, l'état (étiquette `ameesh:<état>`), le type, la priorité et
+l'assigné suivent le lot. Quand le lot est fusionné, livré ou fermé, ameesh
+ferme l'issue avec un commentaire qui dit pourquoi. L'issue d'un lot est son
+`issue_ref` (`ameesh work show <id>`), utilisable avec `--lot`.
+
+* Ne jamais créer à la main l'issue d'un lot : créer le lot (`--new-lot`,
+  `ameesh work add`). Son issue suit au passage suivant d'`ameesh notify`,
+  en moins d'une minute.
+* Une PR qui livre un lot porte ces deux lignes dans sa **description** :
+
+  ```
+  ameesh-work: <numéro du lot>
+  Closes #<numéro de l'issue>
+  ```
+
+  `ameesh-work` relie la PR au lot. `Closes` ferme l'issue à la fusion, et
+  relie aussi la PR au lot par son issue (`ameesh work sync-github`).
+* Un dépôt public ne reçoit que le titre du lot et sa ligne
+  « Résumé public : … », si le corps en a une. Le reste du corps n'est jamais
+  publié. Un titre qui contient un chemin local, un nom d'hôte, une adresse,
+  un identifiant de compte, un secret ou un terme exclu par l'organisation
+  n'a pas d'issue : le refus est journalisé, corriger le titre.
+* Une modification faite dans GitHub n'est jamais reprise dans ameesh :
+  c'est le lot qu'on change. Garder le marqueur `<!-- ameesh:work=… -->` du
+  corps de l'issue, qui la relie au lot.
+
 ## Le courrier « Capacité au repos »
 
 Quand des agents réveillables restent au repos sans lot pendant que du

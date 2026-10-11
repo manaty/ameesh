@@ -300,6 +300,12 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: issues GitHub des lots (L126) : la clé `github` du fichier de
+    #: configuration de l'HÔTE, telle quelle (`projects` : projet → dépôt,
+    #: `host` : hôte désigné pour la projection automatique, `interval`,
+    #: `exclude_terms`), validée par `ameesh.plan_github`. Jamais de secret
+    #: ici : le jeton de `gh` reste dans son environnement.
+    github: dict = field(default_factory=dict)
 
     @property
     def responsible_required(self) -> bool:

@@ -8,6 +8,7 @@
                             ou commit de fusion qui désigne le lot)
   ameesh work sync-github --repo R [--limit N] [--dry-run] [--json]
   ameesh work project-github --repo R [--dry-run] [--canon-url URL] [--json]
+  ameesh work project-github --app P [--repo R] [--dry-run] [--json]   (L126)
   ameesh work plan <id|fiche> [--debut J] [--fin J] [--livraison J] [--source S]  (L96)
 
 Gardées hors de `mesh_cli` (qui les branche) pour que leurs évolutions n'y
@@ -94,11 +95,18 @@ def add_parsers(work_sub, func) -> None:
     p_plan.set_defaults(func=func)
 
     p_proj = work_sub.add_parser(
-        "project-github", help="projeter le plan en issues GitHub (vue, jamais source)")
-    p_proj.add_argument("--repo", required=True, help="owner/repo")
-    p_proj.add_argument("--dry-run", action="store_true", help="montrer sans rien écrire")
+        "project-github", help="une issue GitHub par lot d'un projet (--app, L126), ou le "
+                               "plan en issues (--repo seul) — vue, jamais source")
+    p_proj.add_argument("--app", default=None, metavar="PROJET",
+                        help="projet dont chaque lot a son issue ; dépôt lu dans "
+                             "github.projects (configuration de l'hôte)")
+    p_proj.add_argument("--repo", default=None,
+                        help="owner/repo : le dépôt du plan ; avec --app, remplace le dépôt "
+                             "configuré")
+    p_proj.add_argument("--dry-run", action="store_true",
+                        help="lire GitHub et montrer sans rien écrire")
     p_proj.add_argument("--canon-url", default=None,
-                        help="base des liens vers les fiches (ex. https://…/blob/{commit})")
+                        help="plan : base des liens vers les fiches (ex. https://…/blob/{commit})")
     p_proj.add_argument("--json", action="store_true")
     p_proj.set_defaults(func=func)
 
@@ -234,6 +242,12 @@ def _github(db, args: argparse.Namespace) -> int:
                   % (row["work_item"], row["pr"], row["work_item"]), file=sys.stderr)
         return 1 if report["refused"] else 0
     if command == "project-github":
+        if args.app:
+            return _project_lots(db, gh, args)
+        if not args.repo:
+            print("erreur : --app <projet> (une issue par lot, L126) ou --repo owner/repo "
+                  "(le plan)", file=sys.stderr)
+            return 2
         report = plan_github.project_github(db, gh, args.repo, dry_run=args.dry_run,
                                             canon_url=args.canon_url)
         if args.json:
@@ -243,6 +257,96 @@ def _github(db, args: argparse.Namespace) -> int:
         return 0
     print("erreur : sous-commande inconnue : %s" % command, file=sys.stderr)
     return 2
+
+
+def _project_lots(db, gh, args: argparse.Namespace) -> int:
+    """L126 : une issue par lot du projet `--app`, dans le dépôt configuré."""
+    cfg = getattr(db, "cfg", None)
+    settings = plan_github.settings_of(cfg)
+    project = settings.project_name(args.app) or args.app.strip()
+    repo = args.repo or settings.repo_for(args.app)
+    if not repo:
+        print("erreur : projet %s absent de `github.projects` (configuration de l'hôte) : "
+              "ajoutez-le, ou précisez --repo owner/repo" % args.app, file=sys.stderr)
+        return 2
+    report = plan_github.project_lots(
+        db, gh, project, repo, dry_run=args.dry_run, settings=settings,
+        forge_hosts=getattr(cfg, "forge_hosts", None) or (),
+        local_host=getattr(cfg, "host", None))
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    _print_lot_issues(report)
+    return 0
+
+
+#: libellés des actions sur une issue de lot (essai, réel)
+_LOT_ACTIONS = {"create": ("à créer", "créée"), "update": ("à mettre à jour", "mise à jour"),
+                "close": ("à fermer", "fermée"), "unchanged": ("inchangée", "inchangée"),
+                "refused": ("REFUSÉE", "REFUSÉE"),
+                "deferred": ("reportée", "reportée au passage suivant")}
+
+
+def _print_lot_issues(report: dict) -> None:
+    dry = report["dry_run"]
+    print("%sissues des lots du projet %s sur %s (%s) : %d lot(s)" % (
+        "[essai] " if dry else "", report["project"], report["repo"],
+        "dépôt public : titre et résumé public seulement" if report["public"]
+        else "dépôt privé : corps du lot publié, sans secret", len(report["issues"])))
+    if report["visibility"] not in ("public", "private"):
+        print("  visibilité du dépôt : %s — traité comme public" % report["visibility"])
+    for name in report["labels_created"]:
+        print("  étiquette %s %s" % (name, "à créer" if dry else "créée"))
+    quiet = 0
+    for row in report["issues"]:
+        if row["action"] == "unchanged":
+            quiet += 1
+            continue
+        verb = _LOT_ACTIONS.get(row["action"], (row["action"],) * 2)[0 if dry else 1]
+        print("  lot %-5s %-6s %-16s %s%s%s" % (
+            row["work_item"], "#%s" % row["number"] if row.get("number") else "", verb,
+            row.get("title") or "", " [%s]" % " ".join(row["labels"])
+            if row["action"] == "create" else "",
+            " (%s)" % ", ".join(row["changes"]) if row.get("changes") else ""))
+        if row.get("comment"):
+            print("        commentaire : %s" % row["comment"])
+        if row.get("error"):
+            print("        ERREUR : %s" % row["error"])
+    if quiet:
+        print("  %d issue(s) inchangée(s)" % quiet)
+    for row in report["refused"]:
+        print("REFUSÉ : lot %s — %s : %s ; %s tant que le titre du lot n'est pas corrigé" % (
+            row["work_item"], row["field"], ", ".join(row["reasons"]),
+            "titre de #%s gardé tel quel" % row["number"] if row.get("number")
+            else "rien n'est publié"))
+    for row in report["withheld"]:
+        print("  retenu : lot %s — %s non publié (%s)" % (row["work_item"], row["field"],
+                                                         ", ".join(row["reasons"])))
+    for row in report["human_edits"]:
+        if row["kept"]:
+            print("  modifiée dans GitHub : #%s (lot %s), %s gardé(s) tel(s) quel(s) — jamais "
+                  "repris dans ameesh" % (row["number"], row["work_item"],
+                                          ", ".join(row["kept"])))
+        if row["replaced"]:
+            print("  modifiée dans GitHub : #%s (lot %s), %s réécrit(s) : le lot a changé" % (
+                row["number"], row["work_item"], ", ".join(row["replaced"])))
+    for row in report["issue_refs"]:
+        if row["result"] != "set":
+            print("  issue_ref du lot %s : %s" % (row["work_item"], row.get("detail")))
+    for row in report["duplicates"]:
+        print("  doublon : #%s du lot %s (gardée : #%s)%s" % (
+            row["number"], row["work_item"], row["kept"], " — fermée" if row.get("closed")
+            else ""))
+    for row in report["orphans"]:
+        print("  issue(s) %s : %s (lot %s)" % (", ".join("#%s" % n for n in row["numbers"]),
+                                               row["detail"], row["work_item"]))
+    counts = report["counts"]
+    print("%d %s, %d %s, %d %s, %d refusée(s)%s%s" % (
+        counts["created"], "à créer" if dry else "créée(s)",
+        counts["updated"], "à mettre à jour" if dry else "mise(s) à jour",
+        counts["closed"], "à fermer" if dry else "fermée(s)", counts["refused"],
+        ", %d reportée(s)" % counts["deferred"] if counts["deferred"] else "",
+        ", %d erreur(s)" % counts["errors"] if counts["errors"] else ""))
 
 
 def _print_projection(report: dict) -> None:

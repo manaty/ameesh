@@ -69,7 +69,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    refresh_package_parents delegate current_delegation
                    mark_delegate_turn due_delegations resolve_delegation
                    overdue_delegations returned_delegations backlog_add backlog
-                   auto_takes_since
+                   auto_takes_since issue_feed set_issue_ref
    packages       all get upsert retire
    actions         get recent attempts events log_event last_event_note
                    decision_queues covering_grants launched propose bind
@@ -967,6 +967,24 @@ class WorkItems(Domain):
         """Nombre de prises automatiques (lignes de journal dont la note
         commence par `note_prefix`) sur les `seconds` dernières secondes, tous
         hôtes confondus."""
+
+    # -- issues GitHub des lots (L126) ------------------------------------------
+    @abc.abstractmethod
+    def issue_feed(self, limit: int) -> list[dict]:
+        """Les lots que la projection en issues examine : ouverts, ou qui
+        portent une `issue_ref` (les `limit` plus récents), par id croissant.
+        Chaque ligne ajoute l'équipe de la fiche du plan (`package_team`) et
+        l'équipe, le chantier et l'hôte de l'assigné au registre
+        (`assignee_team`, `assignee_chantier`, `assignee_host`). Une
+        instruction."""
+
+    @abc.abstractmethod
+    def set_issue_ref(self, item_id: int, issue_ref: str | None, *,
+                      current: str | None) -> bool:
+        """Pose `issue_ref` si le lot porte encore `current` (NULL et chaîne
+        vide confondus) : faux si la valeur a changé entre-temps (un autre
+        projecteur l'a posée). Ni journal ni `updated_at` : une projection
+        n'est pas une activité du lot."""
 
 
 # --------------------------------------------------------------------------

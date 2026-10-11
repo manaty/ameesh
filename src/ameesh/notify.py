@@ -11,6 +11,9 @@
         L119 (0037) : à chaque passage, la prise automatique confie un
         élément de la file d'amélioration aux agents au repos
         (`ameesh.backlog.auto_take`) ; `--take-idle 0` la coupe.
+        L126 : sur l'hôte que désigne la clé `github` de la configuration,
+        chaque passage tient aussi les issues GitHub des lots
+        (`ameesh.plan_github.Projector`).
   ameesh notify --test human:<id> [--json]
         envoie un message de test sur chacun des canaux de cet humain.
 
@@ -855,6 +858,8 @@ class Notifier:
         self.emit = emit or (lambda record: None)
         self.log = log or _stderr_log
         self.clock = clock or time.time
+        #: L126 : projection des lots en issues GitHub (créée au premier passage)
+        self._projector = None
 
     # -- passage --------------------------------------------------------------
     def run_pass(self, db, current: list | None = None, thresholds: dict | None = None,
@@ -898,6 +903,7 @@ class Notifier:
         self._summaries(now)
         if self.take:
             self._auto_take(db, current, now)
+        self._github_issues(db, now)
         for human in list(self.state["rate"]):
             window = [t for t in self.state["rate"][human] if now - t < RATE_WINDOW_S]
             if window:
@@ -905,6 +911,23 @@ class Notifier:
             else:
                 del self.state["rate"][human]
         return records
+
+    # -- issues GitHub des lots (L126) ------------------------------------------
+    def _github_issues(self, db, now: float) -> None:
+        """Chaque lot a son issue GitHub, tenue par ameesh : la projection
+        tourne ici, sur l'hôte que désigne la clé `github` de la configuration
+        (`plan_github.Projector`). Sans cette clé, rien ; une erreur (GitHub,
+        `gh`, base) est journalisée et ne touche jamais aux alertes."""
+        if not getattr(self.cfg, "github", None):
+            return
+        from . import plan_github
+        try:
+            if self._projector is None:
+                self._projector = plan_github.Projector(
+                    self.cfg, dry_run=self.dry_run, log=self.log, clock=self.clock)
+            self._projector.tick(db, now)
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au passage des alertes
+            self.log("issues GitHub : passage en échec (%s)" % _clean(exc, 200))
 
     # -- prise automatique (L119, décision 0037) ------------------------------
     def _auto_take(self, db, current: list, now: float) -> None:

@@ -178,6 +178,11 @@ ameesh work project-github --repo owner/repo [--dry-run] [--canon-url URL] [--js
 * `--dry-run` lit GitHub et montre ce qui serait créé ou mis à jour, sans
   rien écrire.
 
+Les **lots** eux-mêmes, rattachés à une fiche ou non, ont chacun leur issue
+(L126) : `ameesh work project-github --app <projet>`, dépôt lu dans la
+configuration de l'hôte, tenue automatique par `ameesh notify` ; voir
+[EXPLOITATION.md](EXPLOITATION.md), « Issues GitHub des lots ».
+
 `gh` est résolu comme pour le connecteur `git-merge` (`AMEESH_GH_BIN`,
 `AMEESH_BIN_DIR/gh`, PATH) ; les tests utilisent un faux `gh`
 (`tests/fake_github.py`), jamais GitHub.
