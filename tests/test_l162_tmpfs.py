@@ -234,6 +234,44 @@ class AbandonDbTest(_Systeme, PgTestCase):
         return menage.run_pass(self.cfgl, self.db, kw.pop("policy", self.pol), host="pc",
                                actor="t", now=time.time() + decalage, **kw)
 
+    def _en_tour(self, agent: str) -> None:
+        """`agent` en tour sur l'hôte « pc » : statut running, bail vivant."""
+        registry.upsert(self.db, agent, harness="claude", host="pc")
+        registry.claim(self.db, agent, "runner-" + agent, 600)
+        registry.set_status(self.db, agent, "running")
+
+    def test_entree_pendant_le_tour_d_un_autre_agent_non_attribuee(self):
+        """#222 : une entrée apparue pendant que a2 tournait aussi sur l'hôte
+        peut être la sienne : non attribuée, jamais supprimée (comme les
+        worktrees d'un autre agent, L73b)."""
+        self._en_tour("a2")
+        autre = os.path.join(self.sys, "codex3-94a-r2")
+        entries = self._tour(lambda: _write(os.path.join(autre, "f"), 5000))
+        signale = [e for e in entries if e["kind"] == "orphan"]
+        self.assertEqual([e["path"] for e in signale], [autre])
+        self.assertIsNone(signale[0]["agent"])
+        self.assertIn(menage.UNATTRIBUTED, signale[0]["detail"])
+        self.assertIn("a2", signale[0]["detail"])
+        registry.set_status(self.db, "a2", "idle")
+        self._passage(3 * 3600)   # bien au-delà de orphan_idle
+        self.assertTrue(os.path.exists(autre))
+
+    def test_entree_deja_signalee_par_le_tour_d_un_autre_agent_pas_reprise(self):
+        """#222 : l'entrée que le tour de a2 a signalée n'est pas imputée une
+        seconde fois au tour de a1, ouvert avant lui et fini après."""
+        registry.upsert(self.db, "a2", harness="claude", host="pc")
+        tour_a1 = menage.Turn.begin(self.cfgl, self.pol, "a1", None, new_session=False,
+                                    base_env={})
+        tour_a2 = menage.Turn.begin(self.cfgl, self.pol, "a2", None, new_session=False,
+                                    base_env={})
+        autre = os.path.join(self.sys, "build-a2")
+        _write(os.path.join(autre, "f"), 5000)
+        entrees_a2 = tour_a2.end(lot=None, turn_id="u" * 32, db=self.db, host="pc")
+        storage.of(self.db).housekeeping.log("pc", entrees_a2, actor="test")
+        self.assertEqual([e["agent"] for e in entrees_a2 if e["kind"] == "orphan"], ["a2"])
+        entrees_a1 = tour_a1.end(lot=None, turn_id="t" * 32, db=self.db, host="pc")
+        self.assertEqual([e for e in entrees_a1 if e["kind"] == "orphan"], [])
+
     def test_abandonne_supprime_recent_attend_essai_ne_touche_rien(self):
         abandon = os.path.join(self.sys, "preuve-images")
         self.addCleanup(subprocess.run, ["chmod", "-R", "u+rwx", abandon],
