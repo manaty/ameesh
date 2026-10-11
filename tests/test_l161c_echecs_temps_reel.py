@@ -229,11 +229,12 @@ class FauxApi:
     exécution, check runs d'une tête."""
 
     def __init__(self):
-        self.live, self.done, self.checks = [], {}, {}
+        self.live, self.queued, self.done, self.checks = [], [], {}, {}
 
     def __call__(self, path):
         if "/actions/runs?" in path:
-            return {"workflow_runs": list(self.live)}
+            return {"workflow_runs": list(self.queued if "status=queued" in path
+                                          else self.live)}
         if "/actions/runs/" in path:
             return self.done.get(int(path.rsplit("/", 1)[1]), {"status": "in_progress"})
         if "/check-runs" in path:
@@ -263,6 +264,11 @@ class WatcherTest(PgTestCase):
             self.cfg, github={"projects": {"ameesh": DEPOT}, "host": self.cfg.host})
         self.api = FauxApi()
         self.watcher = ci.Watcher(self.cfg_ci, api=self.api)
+        # une exécution verte de main déjà relevée : la référence du rouge hérité
+        st = storage.of(self.db)
+        st.ci.open_run(DEPOT, 100, head_sha="0" * 40, branch="main", event="push",
+                       base="main", work_item_id=None, url=None)
+        st.ci.conclude(DEPOT, 100, "success")
 
     def mails(self, to):
         """Les messages d'ameesh à `to`, du plus ancien au plus récent."""
@@ -405,6 +411,95 @@ class WatcherTest(PgTestCase):
         self.api.live = [run_view(502, new, "lot/1-un")]
         out = self.watcher.tick(self.db)
         self.assertEqual([o["withdrawn"] for o in out if o["action"] == "superseded"], [[]])
+
+    def _urgent_non_lu(self, run_id, sha):
+        self.api.live = [run_view(run_id, sha, "lot/1-un")]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=run_id)])]
+        self.watcher.tick(self.db)
+        self.watcher.tick(self.db)
+        (urgent,) = self.mails("dev-a")
+        self.assertTrue(mail.is_urgent(urgent))
+        return urgent
+
+    def test_suivante_en_attente_quand_l_ancienne_est_annulee(self):
+        # relecture (1) : la nouvelle exécution attend un runner quand
+        # l'ancienne est annulée ; vue en attente, elle remplace l'ancienne
+        urgent = self._urgent_non_lu(411, "a1" * 20)
+        self.api.live, self.api.queued = [], [run_view(412, "a2" * 20, "lot/1-un")]
+        self.api.done[411] = {"status": "completed", "conclusion": "cancelled"}
+        out = self.watcher.tick(self.db)
+        self.assertEqual([o["withdrawn"] for o in out if o["action"] == "superseded"],
+                         [[urgent["id"]]])
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 411)["status"], "superseded")
+        self.assertEqual(mail.unread(self.db, "dev-a"), [])
+        self.assertEqual(len(self.mails("dev-a")), 1)
+
+    def test_annulee_avant_que_la_suivante_soit_vue(self):
+        # relecture (1), ordre défavorable : l'ancienne est conclue annulée
+        # avant tout relevé de la nouvelle ; la nouvelle tête, vue plus tard,
+        # retire quand même les non-lus de l'ancienne
+        urgent = self._urgent_non_lu(421, "b1" * 20)
+        self.api.live = []
+        self.api.done[421] = {"status": "completed", "conclusion": "cancelled"}
+        self.watcher.tick(self.db)
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 421)["status"], "cancelled")
+        self.api.live = [run_view(422, "b2" * 20, "lot/1-un")]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([o["withdrawn"] for o in out if o["action"] == "superseded"],
+                         [[urgent["id"]]])
+        self.assertEqual(mail.unread(self.db, "dev-a"), [])
+        # une exécution plus ancienne vue après coup ne remplace pas la nouvelle
+        self.api.live = [run_view(420, "b0" * 20, "lot/1-un")]
+        self.watcher.tick(self.db)
+        self.assertEqual(storage.of(self.db).ci.run(DEPOT, 422)["status"], "running")
+
+    def test_sans_base_relevee_passif(self):
+        # relecture (4) : aucune exécution conclue de main relevée, l'échec
+        # est peut-être hérité : message passif, jamais urgent
+        self.db.execute("DELETE FROM ci_runs WHERE run_id = 100")
+        sha = "c1" * 20
+        self.api.live = [run_view(431, sha, "lot/1-un")]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=431)])]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([(o["to"], o["urgent"]) for o in out], [("dev-a", False)])
+        (m,) = self.mails("dev-a")
+        self.assertFalse(mail.is_urgent(m))
+        self.assertEqual(mail.passive_reason(m), "ci_passif")
+        self.assertIn("peut-être hérités", m["body"])
+        self.assertIn("premier échec", m["body"])
+        self.assertIsNone(storage.of(self.db).ci.run(DEPOT, 431)["urgent_message_id"])
+        # le suivant n'est plus « premier », et toujours sans urgent
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1", execution=431),
+                                           ev_test("tests.test_b.T.test_2", execution=431)])]
+        out = self.watcher.tick(self.db)
+        self.assertEqual([o["urgent"] for o in out], [False])
+        self.assertIn("échec suivant", self.mails("dev-a")[-1]["body"])
+
+    def test_retrait_reserve_au_courrier_de_ci(self):
+        # relecture (5) : withdraw ne touche qu'un message de CI d'ameesh
+        autre = mail.send(self.db, "dev-b", "dev-a", "un message d'agent")
+        systeme = mail.send(self.db, work.SYSTEM_SENDER, "dev-a", "autre événement",
+                            kind="event")
+        self.assertEqual(storage.of(self.db).mailbox.withdraw([autre, systeme], {"x": 1}), [])
+
+    def test_main_rouge_une_seule_alerte(self):
+        # relecture (2) : deux exécutions rouges de suite sur main, de deux
+        # lots : la même alerte, qui ne se résout pas entre les deux
+        for run_id, sha, lot in ((441, "d1" * 20, self.lot_main), (442, "d2" * 20, self.lot)):
+            self.api.live = [run_view(run_id, sha, "main",
+                                      message="L (#9)\n\nameesh-work: %d\n" % lot["id"])]
+            self.api.checks[sha] = [check_run([ev_test("tests.test_x.T.test_y",
+                                                       execution=run_id)])]
+            self.watcher.tick(self.db)
+            self.api.live = []
+            self.api.done[run_id] = {"status": "completed", "conclusion": "failure"}
+            self.watcher.tick(self.db)
+            (alerte,) = [a for a in exploitation.alerts(self.cfg, self.db)
+                         if a["type"] == "ci_main_red"]
+            if run_id == 441:
+                cle = exploitation.alert_key(alerte)
+        self.assertEqual(alerte["lot"], self.lot["id"])
+        self.assertEqual(exploitation.alert_key(alerte), cle)
 
     def test_extrait_illisible_part_sans_extrait(self):
         sha = "7" * 40

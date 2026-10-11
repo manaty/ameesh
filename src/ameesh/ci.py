@@ -10,12 +10,12 @@ test en échec au schéma `ameesh-test-event/1` (L161b). `ameesh notify`, sur
 l'hôte que désigne `github.host` (comme les issues des lots, L126), fait à
 chaque passage un relevé (`Watcher.tick`) :
 
-1. les exécutions en cours du workflow des tests (`WORKFLOWS`) de chaque dépôt
+1. les exécutions en cours ou en attente du workflow des tests (`WORKFLOWS`) de chaque dépôt
    de `github.projects` (une requête par dépôt) ; chacune est rattachée à un
    lot : par sa branche (`work_items.branch`, L118), sinon par la ligne
    `ameesh-work: <id>` de son commit de tête (une fusion dans main) ;
 2. une nouvelle tête sur la branche d'un lot remplace l'exécution précédente
-   (`superseded`) : les messages de CI de l'ancienne tête que l'agent n'a
+   (`superseded`), en cours ou déjà annulée : les messages de CI de l'ancienne tête que l'agent n'a
    pas encore reçus sont retirés sans être montrés ; un message déjà remis
    reste, car l'agent a pu agir ;
 3. pour chaque exécution suivie, les check runs « tests (flux) » de sa tête :
@@ -26,7 +26,9 @@ Courrier, de `ameesh` à l'assigné du lot, rangé dans le fil du lot, selon
 L125 :
 
 * premier échec de la tête : **urgent**, un seul par exécution (la CI seule ne
-  peut pas déclencher `turn_churn`) ;
+  peut pas déclencher `turn_churn`) ; passif (`ci_passif`) tant qu'aucune
+  exécution conclue de la base n'a été relevée, car l'échec est peut-être
+  hérité ;
 * échecs suivants : un événement ordinaire par relevé (regroupé par la
   fenêtre de 90 s du courrier) ;
 * verdict (vert, ou rouge avec la liste) : un événement ordinaire ; rien pour
@@ -51,6 +53,10 @@ from . import storage
 
 #: workflows dont les exécutions sont suivies (nom du fichier)
 WORKFLOWS = ("tests.yml",)
+#: états GitHub d'une exécution pas encore conclue que le relevé lit : une
+#: exécution en attente d'un runner est vue dès la poussée, avant que
+#: l'exécution qu'elle remplace soit annulée
+LIVE_STATUSES = ("in_progress", "queued")
 #: préfixe du nom des check runs publiés par `scripts/ci-flux.py publier`
 CHECK_PREFIX = "tests (flux)"
 SCHEMA = "ameesh-test-event/1"
@@ -171,13 +177,18 @@ def _failure_lines(failures: list[dict], *, detail: bool) -> list[str]:
 
 
 def failure_text(run: dict, lot: dict | None, failures: list[dict], *, first: bool,
-                 detail: bool = True) -> str:
+                 detail: bool = True, unknown_base: bool = False) -> str:
     """Le message d'un ou plusieurs échecs nouveaux d'une exécution."""
     head = _head(run, lot)
     what = ("premier échec" if len(failures) == 1 else "%d premiers échecs" % len(failures)) \
         if first else ("échec suivant" if len(failures) == 1
                        else "%d échecs suivants" % len(failures))
-    lines = ["%s : %s." % (head, what), ""] + _failure_lines(failures, detail=detail)
+    lines = ["%s : %s." % (head, what), ""]
+    if unknown_base:
+        lines += ["Aucune exécution conclue de %s n'a encore été relevée : ces échecs sont "
+                  "peut-être hérités, d'où ce message sans réveil." % (run.get("base") or "main"),
+                  ""]
+    lines += _failure_lines(failures, detail=detail)
     lines += ["", "La suite continue, verdict à la fin. Une nouvelle poussée remplace ce "
                   "passage : les messages que tu n'as pas encore lus seront retirés. Inutile "
                   "d'attendre la CI dans ton tour (gh pr checks --watch) : ameesh te prévient."]
@@ -291,17 +302,19 @@ class Watcher:
     # -- un dépôt --------------------------------------------------------------
     def watch(self, db, repo: str) -> list[dict]:
         st = storage.of(db)
-        data = self.api("repos/%s/actions/runs?status=in_progress&per_page=50" % repo) or {}
-        live = [r for r in data.get("workflow_runs") or ()
-                if str(r.get("path") or "").rsplit("/", 1)[-1] in WORKFLOWS]
+        live = {}
+        for status in LIVE_STATUSES:
+            data = self.api("repos/%s/actions/runs?status=%s&per_page=50" % (repo, status)) or {}
+            for r in data.get("workflow_runs") or ():
+                if str(r.get("path") or "").rsplit("/", 1)[-1] in WORKFLOWS:
+                    live.setdefault(int(r["id"]), r)
         lots = [r for r in st.work.open_for_sweep(500) if r.get("branch")]
         out: list[dict] = []
-        for run in sorted(live, key=lambda r: int(r["id"])):
-            out += self._follow(db, repo, run, lots)
-        live_ids = {int(r["id"]) for r in live}
+        for run_id in sorted(live):
+            out += self._follow(db, repo, live[run_id], lots)
         for row in st.ci.running(repo):
             out += self._failures(db, repo, row)
-            if int(row["run_id"]) not in live_ids:
+            if int(row["run_id"]) not in live:
                 out += self._conclude(db, repo, row)
         return out
 
@@ -321,7 +334,7 @@ class Watcher:
         if not branch or branch in BASE_BRANCHES:
             return []
         out = []
-        old = st.ci.supersede(repo, branch, run.get("head_sha") or "")
+        old = st.ci.supersede(repo, branch, run.get("head_sha") or "", run_id)
         if old:
             ids = st.ci.message_ids(repo, [r["run_id"] for r in old])
             withdrawn = st.mailbox.withdraw(ids, {
@@ -344,6 +357,10 @@ class Watcher:
         reference = st.ci.base_failures(repo, row.get("base") or BASE_BRANCHES[0])
         if reference and int(reference["run_id"]) == int(row["run_id"]):
             reference = {}
+        # aucune exécution conclue de la base relevée (juste après le
+        # déploiement, base peu active) : un échec peut être hérité sans
+        # qu'on le sache, il n'est pas imputé par un urgent
+        unknown_base = not reference
         before = set(reference.get("tests") or ())
         new = []
         for ev in events:
@@ -362,20 +379,26 @@ class Watcher:
         if not to:
             return [{"action": "failures", "repo": repo, "run_id": row["run_id"],
                      "tests": [f["test"] for f in own], "to": None}]
-        first = not row.get("urgent_message_id")
-        text = failure_text(row, lot, own, first=first)
-        short = failure_text(row, lot, own, first=first, detail=False)
+        # premier message de l'exécution (un passif sans base compte aussi)
+        first = not row.get("urgent_message_id") and not any(
+            f.get("message_id") for f in st.ci.failures(repo, int(row["run_id"])))
+        urgent = first and not unknown_base
+        text = failure_text(row, lot, own, first=first, unknown_base=unknown_base)
+        short = failure_text(row, lot, own, first=first, unknown_base=unknown_base,
+                             detail=False)
         payload = {"ci": {"repo": repo, "run_id": row["run_id"], "head_sha": row["head_sha"],
                           "branch": row["branch"], "kind": "failure",
                           "tests": [f["test"] for f in own]}}
-        message_id = _send(db, to, text, short, lot=lot["id"], payload=payload, urgent=first)
-        if first:
+        if unknown_base:
+            payload["ci_passif"] = True
+        message_id = _send(db, to, text, short, lot=lot["id"], payload=payload, urgent=urgent)
+        if urgent:
             st.ci.set_message(repo, int(row["run_id"]), "urgent", message_id)
             row["urgent_message_id"] = message_id
         st.ci.set_failure_message(repo, int(row["run_id"]),
                                   [(f["part"], f["test"]) for f in own], message_id)
         return [{"action": "failures", "repo": repo, "run_id": row["run_id"],
-                 "tests": [f["test"] for f in own], "to": to, "urgent": first,
+                 "tests": [f["test"] for f in own], "to": to, "urgent": urgent,
                  "message_id": message_id}]
 
     def _conclude(self, db, repo: str, row: dict) -> list[dict]:

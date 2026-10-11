@@ -625,7 +625,8 @@ class Mailbox(Domain):
     def withdraw(self, ids: Sequence[int], note: dict) -> list[int]:
         """L161c : retire des messages NON REMIS et sans réservation active
         (marqués remis sans être montrés, `note` dans `meta.retire`) ; rend
-        les ids retirés. Un message déjà remis ou en cours de remise reste."""
+        les ids retirés. Un message déjà remis ou en cours de remise reste ;
+        seuls les messages de CI d'`ameesh` (`payload.ci`) peuvent l'être."""
 
     @abc.abstractmethod
     def reserve(self, recipient: str, owner: str | None, epoch: int | None,
@@ -2196,9 +2197,10 @@ class CiResults(Domain):
         """`running` → `status` ; False si elle était déjà conclue."""
 
     @abc.abstractmethod
-    def supersede(self, repo: str, branch: str, head_sha: str) -> list[dict]:
-        """Les exécutions `running` de la branche sur une autre tête passent
-        `superseded` ; rend celles qui ont changé."""
+    def supersede(self, repo: str, branch: str, head_sha: str, run_id: int) -> list[dict]:
+        """Les exécutions `running` ou `cancelled` de la branche, plus
+        anciennes que `run_id` et sur une autre tête, passent `superseded` ;
+        rend celles qui ont changé."""
 
     @abc.abstractmethod
     def set_message(self, repo: str, run_id: int, which: str, message_id: int) -> None:

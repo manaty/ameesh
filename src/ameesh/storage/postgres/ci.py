@@ -60,14 +60,17 @@ class CiResults(interface.CiResults):
             """, (status, repo, int(run_id)))
         return bool(rows)
 
-    def supersede(self, repo, branch, head_sha) -> list[dict]:
+    def supersede(self, repo, branch, head_sha, run_id) -> list[dict]:
+        # une exécution annulée avant que la suivante soit vue l'est aussi :
+        # ses messages non lus sont alors retirés
         return self.db.query(
             """
             UPDATE ci_runs SET status = 'superseded', superseded_by = %%s,
-                               concluded_at = now()
-             WHERE repo = %%s AND branch = %%s AND status = 'running' AND head_sha <> %%s
+                               concluded_at = coalesce(concluded_at, now())
+             WHERE repo = %%s AND branch = %%s AND status IN ('running', 'cancelled')
+               AND head_sha <> %%s AND run_id < %%s
             RETURNING %s
-            """ % RUN_COLUMNS, (head_sha, repo, branch, head_sha))
+            """ % RUN_COLUMNS, (head_sha, repo, branch, head_sha, int(run_id)))
 
     def set_message(self, repo, run_id, which, message_id) -> None:
         column = {"urgent": "urgent_message_id", "verdict": "verdict_message_id"}[which]
