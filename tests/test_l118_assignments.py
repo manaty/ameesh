@@ -87,7 +87,7 @@ class MailLinksLotsTest(_Base):
 
     def test_new_lot_cree_et_assigne(self):
         proc = self.send("dev2", "Nouveau chantier, branche agent/dev2-ci.", "--from", "orch",
-                         "--new-lot", "CI plus rapide")
+                         "--new-lot", "CI plus rapide", "--estimate", "2h")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         rows = work.list_items(self.db, assignee="dev2")
         self.assertEqual([(r["title"], r["branch"]) for r in rows],
@@ -96,7 +96,8 @@ class MailLinksLotsTest(_Base):
         self.assertIn("créé et assigné à dev2", proc.stdout)
 
     def test_garde_d_attribution_rien_n_est_depose(self):
-        proc = self.send("inconnu", "Travail pour toi.", "--from", "orch", "--new-lot", "x")
+        proc = self.send("inconnu", "Travail pour toi.", "--from", "orch", "--new-lot", "x",
+                         "--estimate", "1h")
         self.assertEqual(proc.returncode, 2)
         self.assertIn("message non déposé", proc.stderr)
         self.assertEqual(self.unread("inconnu"), [])

@@ -3,7 +3,7 @@
 de base #1, cycle de vie des worktrees).
 
 ameesh fait le ménage de ce que SES agents créent, au lieu de le laisser à
-l'humain. Trois familles, trois règles :
+l'humain. Quatre familles, quatre règles :
 
 * **Dossier temporaire d'un agent** (jetable) : `TMPDIR`/`TMP`/`TEMP` d'un
   tour pointent vers `<tmp_root>/<agent>` (par défaut
@@ -34,12 +34,24 @@ l'humain. Trois familles, trois règles :
   `git cherry`, `git merge-tree`) ; sinon GARDÉS et signalés (`worktree_kept`) au
   responsable.
 
-Ce qu'ameesh n'a pas créé n'est JAMAIS supprimé automatiquement : une entrée
-de `/tmp` apparue pendant un tour (clone de relecture, `--cacheDirectory`
-explicite, venv) est signalée (`tmp_orphan`) avec la commande à lancer, et
-rien de plus. Toute suppression passe par [`_safe_rmtree`], qui refuse un
-chemin hors des dossiers gérés, un lien symbolique, ou une racine sans
-marqueur `.ameesh-menage`.
+* **Entrées de `/tmp` laissées par un tour** (L162 : clone de relecture,
+  `--cacheDirectory` explicite, image `docker save`) : apparues pendant le
+  tour d'un agent, elles sont signalées (`tmp_orphan`) avec la commande à
+  lancer ; une entrée signalée est SUPPRIMÉE par le passage périodique si
+  elle est un enfant direct du `/tmp` du système, à l'utilisateur, la même
+  que celle signalée (inode), attribuée à un agent du registre sans tour en
+  cours, rien dedans n'a changé depuis `orphan_idle` (2 h, mtime ET ctime),
+  aucun processus ne la tient, et aucune copie git dedans n'a de travail non
+  commité ou non poussé (`orphan_cleanup: false` : jamais, par hôte).
+
+Ce qu'ameesh n'a pas créé ni vu apparaître pendant un tour n'est JAMAIS
+supprimé automatiquement. Toute suppression dans un dossier géré passe par
+[`_safe_rmtree`], qui refuse un chemin hors des dossiers gérés, un lien
+symbolique, ou une racine sans marqueur `.ameesh-menage` ; dans `/tmp`, par
+[`_remove_tmp_entry`], qui revérifie l'entrée juste avant.
+
+Les dossiers gérés ne sont jamais en mémoire (L162) : une racine déclarée sur
+un tmpfs est écartée au profit de `<état>/.menage/…`.
 
 Tout est journalisé (`housekeeping_log`, migration 0045) et visible dans
 `ameesh hosts` ; `ameesh menage [--apply]` montre ou déclenche un passage.
@@ -82,6 +94,20 @@ UNATTRIBUTED = "non attribué"
 WALK_LIMIT = 300_000
 #: délai maximal d'une commande git (secondes)
 GIT_TIMEOUT = 20.0
+#: L162 : inactivité (secondes) au-delà de laquelle une entrée de /tmp laissée
+#: par un tour est supprimée (`policy.housekeeping.orphan_idle`)
+DEFAULT_ORPHAN_IDLE_S = 2 * 3600.0
+#: L162 : horizon des signalements relus par le passage (le journal en garde 30 j)
+ORPHAN_LOOKBACK_S = 7 * 24 * 3600.0
+#: L162 : nombre de plus grosses entrées de /tmp dites quand le tmpfs se remplit
+TMP_TOP = 5
+#: L162 : systèmes de fichiers en mémoire — jamais une racine gérée
+MEMORY_FS = ("tmpfs", "ramfs")
+#: L162 : l'action attendue quand le tmpfs se remplit (alertes, journal)
+TMPFS_ACTION = ("action attendue : supprimer ce qui ne sert plus (commande par entrée "
+                "dans `ameesh menage`) ; le ménage supprime seul une entrée laissée par "
+                "un tour, inchangée depuis %s et tenue par aucun processus ; les agents "
+                "écrivent dans $TMPDIR, jamais en dur dans /tmp")
 
 #: dossier géré sous l'état d'ameesh (un nom d'agent ne commence jamais par
 #: un point : pas de collision avec `<état>/<agent>`)
@@ -101,7 +127,8 @@ XDG_CACHE = ("xdg", ("XDG_CACHE_HOME",))
 LOT_ENDED = ("merged", "promoted", "closed")
 
 POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_alert",
-               "redirect", "xdg_cache", "worktrees", "orphan_min_size")
+               "redirect", "xdg_cache", "worktrees", "orphan_min_size",
+               "orphan_cleanup", "orphan_idle")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -122,6 +149,10 @@ class Policy:
     xdg_cache: bool = False
     worktrees: bool = True
     orphan_min_size: int = DEFAULT_ORPHAN_MIN_SIZE
+    #: L162 : supprimer les entrées de /tmp abandonnées par un tour
+    orphan_cleanup: bool = True
+    #: L162 : inactivité (secondes) avant cette suppression
+    orphan_idle: float = DEFAULT_ORPHAN_IDLE_S
     #: provenance de chaque clé déclarée (identifiant du canon)
     origin: dict = field(default_factory=dict, compare=False)
 
@@ -170,7 +201,13 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`tmpfs_alert` : part attendue (0 < x <= 1, ou « 60% »)")
         else:
             parsed["tmpfs_alert"] = part
-    for key in ("redirect", "xdg_cache", "worktrees"):
+    if raw.get("orphan_idle") is not None:
+        seconds = parse_idle(raw["orphan_idle"])
+        if seconds is None:
+            problems.append("`orphan_idle` : durée attendue (ex. 2h, 90m, 7200)")
+        else:
+            parsed["orphan_idle"] = seconds
+    for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup"):
         if raw.get(key) is None:
             continue
         if not isinstance(raw[key], bool):
@@ -181,12 +218,28 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
     return parsed, problems, unknown
 
 
+def parse_idle(value) -> float | None:
+    """Durée d'inactivité (L162) : secondes (nombre), ou texte « 2h », « 90m »,
+    « 1d » ; None si illisible ou non positive."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else None
+    from . import stagnation  # import tardif : pas de cycle
+    try:
+        return stagnation.parse_duration(str(value))
+    except ValueError:
+        return None
+
+
 def effective(canons, host: str) -> Policy:
     """Politique de ménage de `host` d'après toutes les fiches Host des canons.
 
     Chemins et booléens : la première fiche qui les déclare (canon par défaut
     d'abord). Quotas, taille de signalement et seuil d'alerte : le plus strict
-    (le plus bas), comme les limites physiques de L43."""
+    (le plus bas), comme les limites physiques de L43. L162 : la suppression
+    des entrées de /tmp abandonnées est coupée dès qu'UNE fiche la coupe, et
+    l'inactivité exigée est la plus longue."""
     values: dict = {}
     origin: dict = {}
     for canon in canons or ():
@@ -200,6 +253,9 @@ def effective(canons, host: str) -> Policy:
                 values[key], origin[key] = value, label
             elif key in ("tmp_quota", "cache_quota", "orphan_min_size", "tmpfs_alert") \
                     and value < values[key]:
+                values[key], origin[key] = value, label
+            elif (key == "orphan_idle" and value > values[key]) or \
+                    (key == "orphan_cleanup" and value is False and values[key] is not False):
                 values[key], origin[key] = value, label
     return Policy(origin=origin, **values)
 
@@ -218,14 +274,46 @@ def _expand(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
+def in_memory(path: str) -> bool:
+    """`path` (existant ou non) est-il sur un système de fichiers en mémoire
+    (tmpfs) ? Faux si on ne sait pas le dire (L162)."""
+    try:
+        mount = platform.mount_of(path)
+    except Exception:  # lecture des montages impossible : on ne devine pas
+        return False
+    return bool(mount) and mount[1] in MEMORY_FS
+
+
+def _disk_root(declared: str | None, default: str) -> str:
+    """La racine déclarée, sauf si elle est en mémoire alors que le défaut
+    (sous l'état d'ameesh) ne l'est pas : un dossier géré vit sur disque (L162,
+    le /tmp en tmpfs de 12 Go plein le 2026-10-11 a bloqué tous les tours)."""
+    if not declared:
+        return default
+    chosen = _expand(declared)
+    if in_memory(chosen) and not in_memory(default):
+        return default
+    return chosen
+
+
+def declared_root_refused(cfg, policy: Policy) -> list[str]:
+    """Les racines déclarées écartées parce qu'en mémoire (pour le rapport)."""
+    out = []
+    for key, effective_root in (("tmp_root", tmp_root(cfg, policy)),
+                                ("cache_root", cache_root(cfg, policy))):
+        declared = getattr(policy, key)
+        if declared and _expand(declared) != effective_root:
+            out.append("%s %s en mémoire (tmpfs) : écarté, %s utilisé"
+                       % (key, declared, effective_root))
+    return out
+
+
 def tmp_root(cfg, policy: Policy) -> str:
-    return _expand(policy.tmp_root) if policy.tmp_root else \
-        os.path.join(cfg.state_dir, MANAGED_DIR, "tmp")
+    return _disk_root(policy.tmp_root, os.path.join(cfg.state_dir, MANAGED_DIR, "tmp"))
 
 
 def cache_root(cfg, policy: Policy) -> str:
-    return _expand(policy.cache_root) if policy.cache_root else \
-        os.path.join(cfg.state_dir, MANAGED_DIR, "cache")
+    return _disk_root(policy.cache_root, os.path.join(cfg.state_dir, MANAGED_DIR, "cache"))
 
 
 def agent_tmp(cfg, policy: Policy, agent: str) -> str:
@@ -258,8 +346,12 @@ def _shims_wanted(cfg) -> bool:
 def turn_env(cfg, policy: Policy, agent: str, base_env: dict) -> dict:
     """Variables à poser dans l'environnement d'un tour (crée les dossiers).
 
-    `TMPDIR`/`TMP`/`TEMP` sont toujours redirigés (c'est l'objet du lot) ;
-    une variable de cache déjà posée dans `base_env` est respectée."""
+    `TMPDIR`/`TMP`/`TEMP` sont toujours redirigés (c'est l'objet du lot) vers
+    le dossier de l'agent, SUR DISQUE (L162 : une racine déclarée en tmpfs est
+    écartée) : le harnais et tous ses enfants en héritent — Node
+    (`os.tmpdir()`, donc le cache de Jest), Python, Go, Rust, et le client
+    docker/podman (podman y copie ses images). Une variable de cache déjà
+    posée dans `base_env` est respectée."""
     if not policy.redirect or disabled(base_env):
         return {}
     troot, croot = tmp_root(cfg, policy), cache_root(cfg, policy)
@@ -442,7 +534,9 @@ def new_tmp_entries(before: set[str] | None, *, path: str | None = None,
                     min_size: int = DEFAULT_ORPHAN_MIN_SIZE,
                     exclude: tuple[str, ...] = ()) -> list[dict]:
     """Entrées de /tmp apparues depuis `before`, à nous, d'au moins
-    `min_size` octets : chemin, taille, commande proposée."""
+    `min_size` octets : chemin, taille, commande proposée, et l'identité de
+    l'entrée (`ino`, `dev`) — le ménage ne supprime que CETTE entrée-là, pas
+    une homonyme recréée depuis (L162)."""
     if before is None:
         return []
     base = path or resources_mod.system_tmp()
@@ -463,8 +557,338 @@ def new_tmp_entries(before: set[str] | None, *, path: str | None = None,
         size = size_of(full)
         if size < min_size:
             continue
-        out.append({"path": full, "bytes": size, "command": "rm -rf -- %s" % shlex.quote(full)})
+        out.append({"path": full, "bytes": size, "command": "rm -rf -- %s" % shlex.quote(full),
+                    "ino": st.st_ino, "dev": st.st_dev})
     return out
+
+
+# --------------------------------------------------------------------------
+# /tmp du système : entrées laissées par un tour, supprimées si abandonnées
+# (L162 ; incident du 2026-10-11 à 03:38 : tmpfs de 12 Go plein à 83 %,
+# porte de pression fermée, treize agents au repos)
+# --------------------------------------------------------------------------
+
+def _blocks(st) -> int:
+    return st.st_blocks * 512 if getattr(st, "st_blocks", None) else st.st_size
+
+
+def fmt_idle(seconds: float) -> str:
+    """« 2 h », « 90 min », « 45 s »."""
+    seconds = max(0, int(round(float(seconds))))
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return "%d h" % (seconds // 3600)
+    if seconds >= 60:
+        return "%d min" % (seconds // 60)
+    return "%d s" % seconds
+
+
+def scan_activity(path: str, limit: int = WALK_LIMIT) -> dict:
+    """Parcours d'une entrée pour juger de son abandon : `bytes`, `latest` (la
+    plus récente des dates de modification ET de changement d'état de
+    l'entrée et de tout ce qu'elle contient — le ctime parce qu'une archive
+    extraite garde les mtimes de l'archive), `complete`, `why`.
+
+    Sans suivre les liens ni changer de système de fichiers. Un point de
+    montage dedans, une entrée illisible ou plus de `limit` entrées rendent le
+    parcours incomplet : on ne juge pas ce qu'on n'a pas vu."""
+    out: dict = {"bytes": 0, "latest": None, "complete": True, "why": ""}
+    try:
+        top = os.lstat(path)
+    except OSError as exc:
+        out.update(complete=False, why="illisible (%s)" % (exc.strerror or exc))
+        return out
+    latest = max(top.st_mtime, top.st_ctime)
+    if not stat.S_ISDIR(top.st_mode):
+        out.update(bytes=_blocks(top), latest=latest)
+        return out
+    count = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        out.update(complete=False, why="entrée illisible : %s" % entry.path)
+                        continue
+                    count += 1
+                    latest = max(latest, st.st_mtime, st.st_ctime)
+                    if stat.S_ISDIR(st.st_mode):
+                        if st.st_dev != top.st_dev:
+                            out.update(complete=False, latest=latest,
+                                       why="point de montage dedans : %s" % entry.path)
+                            return out
+                        stack.append(entry.path)
+                    else:
+                        out["bytes"] += _blocks(st)
+                    if count >= limit:
+                        out.update(complete=False, latest=latest,
+                                   why="plus de %d entrées : activité non vérifiable" % limit)
+                        return out
+        except OSError:
+            out.update(complete=False, why="dossier illisible : %s" % current)
+    out["latest"] = latest
+    return out
+
+
+def _git_copies(path: str) -> list[str]:
+    """L'entrée et ses sous-dossiers directs qui sont des copies git (`.git`
+    dossier, ou fichier d'un worktree) : clone, worktree de relecture."""
+    if os.path.islink(path) or not os.path.isdir(path):
+        return []
+    candidates = [path]
+    try:
+        with os.scandir(path) as it:
+            candidates += [e.path for e in it if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        pass
+    return [c for c in candidates if os.path.lexists(os.path.join(c, ".git"))]
+
+
+def unsaved_git_work(path: str) -> str:
+    """Pourquoi une copie git de l'entrée porte du travail à garder, vide
+    sinon : verrouillée, modifications non commitées (ou état illisible),
+    HEAD sur aucune branche distante (commits jamais poussés)."""
+    for copy in _git_copies(path):
+        st = worktree_state(copy)
+        if st["locked"]:
+            return "%s verrouillé (git worktree lock)" % copy
+        if not st["clean"]:
+            return "%s : %s" % (copy, st["reason"] or "modifications non commitées")
+        if not (st["pushed"] or st["integrated"]):
+            return "%s : HEAD %s sur aucune branche distante" % (copy, st["head"][:12] or "?")
+    return ""
+
+
+def tmp_holder(path: str) -> str:
+    """Le processus qui tient `path` (fichier ouvert dedans, dossier courant,
+    chemin sur sa ligne de commande), en clair ; vide si aucun. Si l'OS ne
+    permet pas de le savoir, une raison : l'entrée est gardée (fail-closed)."""
+    try:
+        found = platform.holders(_real(path), needle=os.path.abspath(path))
+    except platform.NotAvailable as exc:
+        return "détenteurs illisibles (%s)" % exc
+    if not found:
+        return ""
+    first = found[0]
+    why = first.get("why") or ""
+    if "ligne de commande" in why:
+        why = "chemin sur la ligne de commande"
+    return "tenu par le processus %s (%s : %s)" % (first.get("pid"), why,
+                                                   (first.get("cmd") or "")[:80])
+
+
+def _tmp_entry_problem(path: str, base: str, ino=None, dev=None) -> str:
+    """Pourquoi `path` n'est pas une entrée de /tmp que le ménage peut
+    supprimer, vide si elle l'est : enfant direct de `base` (le /tmp du
+    système, jamais ailleurs), dossier ou fichier ordinaire (pas un lien), à
+    l'utilisateur, et — si connue — la MÊME entrée que celle signalée (inode)."""
+    name = os.path.basename(path)
+    if not name or name in (".", "..") or \
+            os.path.realpath(os.path.dirname(os.path.abspath(path))) != os.path.realpath(base):
+        return "hors du /tmp du système (%s)" % base
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return "illisible"
+    if stat.S_ISLNK(st.st_mode) or not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+        return "ni dossier ni fichier ordinaire"
+    if st.st_uid != os.getuid():
+        return "appartient à un autre utilisateur"
+    if ino is not None and (st.st_ino, st.st_dev) != (ino, dev):
+        return "recréée depuis le signalement (autre inode)"
+    return ""
+
+
+def _remove_tmp_entry(path: str, base: str, ino=None, dev=None) -> int:
+    """Supprime une entrée de /tmp, revérifiée juste avant
+    (`_tmp_entry_problem`) ; rend les octets libérés."""
+    problem = _tmp_entry_problem(path, base, ino, dev)
+    if problem:
+        raise RefusedDeletion("%s : %s" % (path, problem))
+    before = size_of(path)
+    if stat.S_ISDIR(os.lstat(path).st_mode):
+        _make_owned_dirs_writable(path)
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        os.unlink(path)
+    left = size_of(path) if os.path.lexists(path) else 0
+    return max(0, before - left)
+
+
+def _make_owned_dirs_writable(top: str) -> None:
+    """Rend lecture, écriture et traversée à NOS dossiers sous `top` (un cache
+    de modules Go est en lecture seule) : sans cela, la suppression resterait
+    partielle. Aucun lien suivi, aucun dossier d'un autre utilisateur touché."""
+    uid = os.getuid()
+
+    def ouvrir(full: str) -> None:
+        try:
+            st = os.lstat(full)
+            if stat.S_ISDIR(st.st_mode) and st.st_uid == uid and (st.st_mode & 0o700) != 0o700:
+                os.chmod(full, stat.S_IMODE(st.st_mode) | 0o700)
+        except OSError:
+            pass
+
+    ouvrir(top)
+    for current, dirs, _files in os.walk(top):   # followlinks=False
+        for name in dirs:   # avant que os.walk n'y descende
+            ouvrir(os.path.join(current, name))
+
+
+def _orphan_verdict(row: dict, policy: Policy, *, base: str, registered, protected: set,
+                    running: set, now: float) -> tuple[str, str]:
+    """(`suppression` | `attend` | `garde`, raison) pour une entrée signalée
+    encore présente. Toutes les conditions de la suppression, la moins chère
+    d'abord ; le moindre doute garde l'entrée."""
+    path = row["path"]
+    data = row.get("data") or {}
+    if not policy.orphan_cleanup:
+        return "garde", "suppression coupée sur cet hôte (orphan_cleanup: false)"
+    problem = _tmp_entry_problem(path, base, data.get("ino"), data.get("dev"))
+    if problem:
+        return "garde", problem
+    agent = row.get("agent")
+    if registered is None:
+        return "garde", "registre illisible"
+    if not agent or agent not in registered:
+        return "garde", "agent %s absent du registre" % (agent or "?")
+    if agent in running:
+        return "attend", "tour en cours de %s" % agent
+    target = _real(path)
+    if any(_under(p, target) for p in protected):
+        return "garde", "contient un dossier de travail d'agent ou un dossier géré"
+    scan = scan_activity(path)
+    if not scan["complete"]:
+        return "garde", scan["why"]
+    idle = now - float(scan["latest"])
+    if idle < policy.orphan_idle:
+        return "attend", "modifié il y a %s (supprimé après %s sans changement)" % (
+            fmt_idle(max(0.0, idle)), fmt_idle(policy.orphan_idle))
+    work = unsaved_git_work(path)
+    if work:
+        return "garde", "travail git à garder — %s" % work
+    holder = tmp_holder(path)
+    if holder:
+        return "attend", holder
+    return "suppression", "laissé par le tour %s de %s, inchangé depuis %s, tenu par aucun " \
+        "processus" % (str(data.get("turn") or "?")[:8], agent, fmt_idle(idle))
+
+
+def orphan_pass(db, host: str, policy: Policy, *, registered, protected: set,
+                running: set, dry_run: bool, now: float) -> tuple[list, list, list]:
+    """Entrées de /tmp signalées pendant un tour (L162) : (lignes du journal,
+    plan lisible, entrées encore présentes avec leur sort).
+
+    La dernière ligne de chaque chemin compte : `signaled` est candidate,
+    `deleted` est close (une homonyme recréée hors d'un tour n'est pas à
+    nous). Suppression seulement si `_orphan_verdict` le permet ; sinon
+    l'entrée reste signalée, avec la raison. Rien n'est écrit en base ici."""
+    base = resources_mod.system_tmp()
+    protected_real = {_real(p) for p in protected if p}
+    entries: list[dict] = []
+    plan: list[dict] = []
+    present: list[dict] = []
+    if not host:   # sans nom d'hôte, les signalements des autres hôtes s'y mêleraient
+        return entries, plan, present
+    try:
+        rows = storage.of(db).housekeeping.recent(host, ORPHAN_LOOKBACK_S, 500, kind="orphan")
+    except Exception:
+        return entries, plan, present
+    seen: set = set()
+    for row in rows:
+        path = row.get("path") or ""
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if row.get("action") != "signaled" or not os.path.lexists(path):
+            continue
+        data = row.get("data") or {}
+        base_item = {"kind": "orphan", "path": path, "agent": row.get("agent"),
+                     "lot": row.get("lot")}
+        action, why = _orphan_verdict(row, policy, base=base, registered=registered,
+                                      protected=protected_real, running=running, now=now)
+        size = size_of(path)
+        plan.append(dict(base_item, action=action, bytes=size, detail=why))
+        item = {"path": path, "bytes": size, "agent": row.get("agent"),
+                "at_ts": row.get("at_ts"), "status": action, "detail": why,
+                "command": data.get("command") or "rm -rf -- %s" % shlex.quote(path)}
+        if action != "suppression" or dry_run:
+            present.append(item)
+            continue
+        worktrees = [common_dir(c) for c in _git_copies(path)
+                     if os.path.isfile(os.path.join(c, ".git"))]
+        try:
+            freed = _remove_tmp_entry(path, base, data.get("ino"), data.get("dev"))
+        except (OSError, RefusedDeletion) as exc:
+            item.update(status="garde", detail="suppression refusée : %s" % exc)
+            present.append(item)
+            continue
+        for repo in worktrees:
+            prune_worktrees(repo)
+        entries.append(dict(base_item, action="deleted", bytes=freed,
+                            detail="entrée de /tmp abandonnée : %s" % why,
+                            data={"turn": data.get("turn"), "command": item["command"]}))
+        if os.path.lexists(path):  # suppression partielle : ce qui reste est dit
+            present.append(dict(item, bytes=size_of(path), status="garde",
+                                detail="suppression partielle (fichiers d'un autre "
+                                       "utilisateur ?)"))
+    return entries, plan, present
+
+
+def _owner(uid: int) -> str:
+    try:
+        import pwd  # Unix seulement
+        return pwd.getpwuid(uid).pw_name
+    except (ImportError, KeyError):
+        return str(uid)
+
+
+def tmp_top(base: str | None = None, n: int = TMP_TOP) -> list[dict]:
+    """Les `n` plus grosses entrées de premier niveau du /tmp du système
+    (lecture seule ; taille bornée à `WALK_LIMIT` fichiers par entrée) :
+    `path`, `bytes`, `owner`, `mtime`."""
+    base = base or resources_mod.system_tmp()
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        full = os.path.join(base, name)
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            continue
+        out.append({"path": full, "bytes": size_of(full), "owner": _owner(st.st_uid),
+                    "mtime": st.st_mtime})
+    out.sort(key=lambda e: (-e["bytes"], e["path"]))
+    return out[:n]
+
+
+def describe_top(top) -> str:
+    """« /tmp/a 2.2 GiB (smichea, laissé par b1 : attend — …) ; … »."""
+    parts = []
+    for e in top or ():
+        who = e.get("owner") or "?"
+        if e.get("agent"):
+            who += ", laissé par %s" % e["agent"]
+            if e.get("status"):
+                who += " : %s" % e["status"]
+        parts.append("%s %s (%s)" % (e.get("path"), _fmt(e.get("bytes")), who))
+    return " ; ".join(parts)
+
+
+def tmpfs_hint(top, policy: Policy) -> str:
+    """Le complément d'une alerte de tmpfs plein : les plus grosses entrées
+    (si un bilan les a relevées) et l'action attendue."""
+    plus_gros = ("plus gros dans /tmp : %s" % describe_top(top)) if top else \
+        "plus gros dans /tmp : `ameesh menage` sur l'hôte"
+    return "%s — %s" % (plus_gros, TMPFS_ACTION % fmt_idle(policy.orphan_idle))
 
 
 # --------------------------------------------------------------------------
@@ -762,15 +1186,18 @@ class Turn:
                     "agent": self.agent, "lot": lot if mine else None, "detail": detail})
         exclude = tuple(v for v in (self.env.get("TMPDIR"), self.env.get("AMEESH_CACHE_DIR"))
                         if v)
+        sort = (("supprimé par le ménage après %s sans changement s'il n'est tenu par aucun "
+                 "processus (L162)" % fmt_idle(policy.orphan_idle)) if policy.orphan_cleanup
+                else "jamais supprimé automatiquement (orphan_cleanup: false)")
         for found in new_tmp_entries(self.tmp_before, min_size=policy.orphan_min_size,
                                      exclude=exclude):
             self.entries.append({
                 "kind": "orphan", "action": "signaled", "path": found["path"],
                 "bytes": found["bytes"], "agent": self.agent, "lot": lot,
                 "detail": "apparu dans /tmp pendant le tour %s de %s (attribution probable) ; "
-                          "hors des dossiers gérés : jamais supprimé automatiquement"
-                          % (turn_id[:8], self.agent),
-                "data": {"command": found["command"], "turn": turn_id}})
+                          "hors des dossiers gérés : %s" % (turn_id[:8], self.agent, sort),
+                "data": {"command": found["command"], "turn": turn_id,
+                         "ino": found["ino"], "dev": found["dev"]}})
         return self.entries
 
 
@@ -779,7 +1206,11 @@ class Turn:
 # --------------------------------------------------------------------------
 
 def measure(cfg, policy: Policy) -> dict:
-    """Occupation des dossiers gérés et du /tmp du système (lecture seule)."""
+    """Occupation des dossiers gérés et du /tmp du système (lecture seule).
+
+    L162 : dès que le /tmp en tmpfs atteint l'alerte (ou le seuil de pression
+    par défaut, s'il est plus bas), ses `TMP_TOP` plus grosses entrées
+    (`system_tmp_top`), que les alertes reprennent."""
     troot, croot = tmp_root(cfg, policy), cache_root(cfg, policy)
     agents: dict = {}
     if os.path.isdir(troot):
@@ -793,6 +1224,8 @@ def measure(cfg, policy: Policy) -> dict:
         if os.path.isdir(full):
             caches[name] = size_of(full)
     system = resources_mod.fs_usage(resources_mod.system_tmp())
+    fraction = resources_mod.tmpfs_fraction(system)
+    seuil = min(policy.tmpfs_alert, resources_mod.DEFAULT_MAX_TMPFS_USED)
     return {
         "tmp_root": troot, "tmp_bytes": sum(agents.values()), "tmp_by_agent": agents,
         "tmp_quota": policy.tmp_quota,
@@ -801,7 +1234,8 @@ def measure(cfg, policy: Policy) -> dict:
         "cache_root": croot, "cache_bytes": sum(caches.values()), "cache_by_name": caches,
         "cache_quota": policy.cache_quota,
         "system_tmp": system,
-        "system_tmp_fraction": resources_mod.tmpfs_fraction(system),
+        "system_tmp_fraction": fraction,
+        "system_tmp_top": tmp_top() if fraction is not None and fraction >= seuil else [],
         "tmpfs_alert": policy.tmpfs_alert,
     }
 
@@ -999,7 +1433,10 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
       tourne (`busy` faux) ;
     * worktrees suivis dont le lot est fini : retirés s'ils sont propres et
       intégrés (garde-fous de `_worktree_pass`), sinon gardés et signalés ;
-    * bilan (`mesure`) et signalements de /tmp récents (rien n'y est touché).
+    * entrées de /tmp signalées pendant un tour : supprimées si abandonnées
+      (garde-fous de `_orphan_verdict`, L162), sinon dites avec la raison ;
+    * bilan (`mesure`), avec les plus grosses entrées de /tmp si le tmpfs
+      atteint l'alerte.
 
     `dry_run` : rien n'est supprimé ni écrit en base ; le plan est rendu."""
     now = time.time() if now is None else float(now)
@@ -1087,22 +1524,28 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     conteneurs = reap_containers(runtime, db, host, dry_run=dry_run)
     entries += conteneurs["entries"]
     plan += conteneurs["plan"]
-    # 5. signalements récents encore présents (lecture seule)
-    orphans = []
+    # 5. entrées de /tmp laissées par un tour (L162) : supprimées si
+    #    abandonnées (garde-fous de `_orphan_verdict`), sinon signalées
+    gardes = protected | {troot, croot, cfg.state_dir}
     try:
-        seen = set()
-        for row in storage.of(db).housekeeping.recent(host, 7 * 24 * 3600.0, 500):
-            if row["kind"] != "orphan" or row["path"] in seen:
-                continue
-            seen.add(row["path"])
-            if os.path.lexists(row["path"]):
-                orphans.append({"path": row["path"], "bytes": size_of(row["path"]),
-                                "agent": row.get("agent"), "at_ts": row.get("at_ts"),
-                                "command": (row.get("data") or {}).get("command")
-                                or "rm -rf -- %s" % shlex.quote(row["path"])})
-    except Exception:
-        orphans = []
+        orphan_entries, orphan_plan, orphans = orphan_pass(
+            db, host, policy, registered=registered, protected=gardes, running=running,
+            dry_run=dry_run, now=now)
+    except Exception as exc:  # jamais fatal pour le passage
+        orphan_entries, orphan_plan, orphans = [], [], []
+        skipped.append("/tmp : passage impossible (%s)" % type(exc).__name__)
+    entries += orphan_entries
+    plan += orphan_plan
+    skipped += declared_root_refused(cfg, policy)
     report_measure = measure(cfg, policy)
+    # les plus grosses entrées de /tmp, avec ce que le ménage en fera
+    sorts = {o["path"]: o for o in orphans}
+    for top in report_measure.get("system_tmp_top") or ():
+        known = sorts.get(top["path"])
+        if known is not None:
+            top.update(agent=known.get("agent"), status=known.get("status"),
+                       detail=known.get("detail"))
+        top["command"] = "rm -rf -- %s" % shlex.quote(top["path"])
     report_measure["containers"] = {
         "ameesh": conteneurs["ameesh"], "others": conteneurs["others"]}
     if not dry_run:
@@ -1158,8 +1601,9 @@ def print_report(report: dict) -> None:
                 _fmt(sys_tmp.get("tmp_size_bytes")), sys_tmp.get("tmp_fstype") or "?",
                 " — ALERTE : au-delà de %d %%" % round(m["tmpfs_alert"] * 100)
                 if (m.get("system_tmp_fraction") or 0) >= m["tmpfs_alert"] else ""))
-    rows = report["plan"] if report["dry_run"] else [
-        e for e in report["entries"] if e["kind"] != "mesure"]
+    # en essai, les entrées de /tmp ont leur propre section (avec la commande)
+    rows = [p for p in report["plan"] if p.get("kind") != "orphan"] if report["dry_run"] \
+        else [e for e in report["entries"] if e["kind"] != "mesure"]
     if not rows:
         print("  rien à faire")
     for row in rows:
@@ -1181,10 +1625,21 @@ def print_report(report: dict) -> None:
                                               c.get("status") or "?", c["command"]))
     orphans = report.get("orphans") or []
     if orphans:
-        print("  hors dossiers gérés (jamais supprimé par ameesh ; à décider par un humain) :")
+        print("  entrées de /tmp laissées par un tour (supprimées seules une fois abandonnées) :")
         for o in orphans:
-            print("    %s  %s  (agent %s)  →  %s" % (_fmt(o["bytes"]), o["path"],
-                                                  o.get("agent") or "?", o["command"]))
+            print("    %s  %s  (agent %s)  %s%s  →  %s" % (
+                _fmt(o["bytes"]), o["path"], o.get("agent") or "?", o.get("status") or "",
+                " — %s" % o["detail"] if o.get("detail") else "", o["command"]))
+    top = (report.get("measure") or {}).get("system_tmp_top") or []
+    if top:
+        print("  plus grosses entrées de %s :" % ((m.get("system_tmp") or {}).get("tmp_path")
+                                                   or "/tmp"))
+        for e in top:
+            print("    %s  %s  (%s%s)  →  %s" % (
+                _fmt(e.get("bytes")), e["path"], e.get("owner") or "?",
+                ", laissée par %s : %s" % (e["agent"], e.get("status") or "?")
+                if e.get("agent") else ", hors tour d'agent : à décider",
+                e.get("command") or ""))
 
 
 def cmd_menage(cfg, args) -> int:
@@ -1235,4 +1690,4 @@ def cmd_menage(cfg, args) -> int:
 
 __all__ = ["Policy", "parse_policy", "effective", "turn_env", "Turn", "run_pass",
            "measure", "evict_lru", "worktree_state", "list_worktrees", "cmd_menage",
-           "caller_refusal"]
+           "caller_refusal", "orphan_pass", "tmp_top", "tmpfs_hint", "in_memory"]

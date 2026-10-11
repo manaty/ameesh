@@ -259,6 +259,7 @@ def _assemble(kind: str, blocks: Sequence[str], remaining: int) -> str:
     if remaining > 0:
         parts.append(adapters.MAIL_REMAINING % remaining)
     parts.append(footer)
+    parts.append(adapters.TMP_NOTE)  # L162 : $TMPDIR, jamais /tmp en dur
     return "\n\n".join(parts)
 
 

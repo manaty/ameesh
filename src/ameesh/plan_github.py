@@ -1031,6 +1031,9 @@ def _lot_head(item: dict, *, public: bool, guard: Guard, project: str,
     else:
         parts.append(_assignee_text(item, public, guard))
     lines = [" · ".join(parts)]
+    planning = _plan_line(item)
+    if planning:
+        lines.append(planning)
     if not public and not minimal:
         extra = ["projet `%s`" % project] if project else []
         if (item.get("workstream") or "").strip():
@@ -1041,6 +1044,43 @@ def _lot_head(item: dict, *, public: bool, guard: Guard, project: str,
             text = " · ".join(extra)
             lines.append(text[0].upper() + text[1:])
     return lines
+
+
+def _day_fr(day: str | None) -> str | None:
+    """« 2026-10-12 » → « 12/10/2026 »."""
+    text = str(day or "")[:10]
+    parts = text.split("-")
+    return "%s/%s/%s" % (parts[2], parts[1], parts[0]) if len(parts) == 3 else None
+
+
+def _plan_line(item: dict) -> str | None:
+    """L157 : la ligne de planification de l'en-tête — durée estimée, dates
+    prévues (L96) et, une fois le lot livré, la durée réelle et l'écart.
+    Aucun nom ni aucune source : des nombres et des dates seulement. None
+    sans estimation ni date prévue (l'issue reste inchangée)."""
+    from . import estimates
+
+    minutes = item.get("estimate_minutes")
+    dates = [(label, _day_fr(item.get(key))) for label, key in (
+        ("début", "planned_start"), ("fin", "planned_end"),
+        ("livraison", "planned_delivery"))]
+    dates = [(label, day) for label, day in dates if day]
+    if not minutes and not dates:
+        return None
+    parts = ["Durée estimée %s" % estimates.label(minutes) if minutes
+             else "Durée non estimée"]
+    if dates:
+        parts.append("prévu : " + ", ".join("%s %s" % pair for pair in dates))
+    if item.get("merged_ts") is not None and item.get("state") in work_mod.MERGED_STATES:
+        v = estimates.view(item, merged_ts=item.get("merged_ts"))
+        if v.get("actual_minutes") is not None:
+            text = "réel %s" % estimates.label(v["actual_minutes"])
+            if v.get("gap_minutes") is not None:
+                text += " (%s%s, %s)" % ("+" if v["gap_minutes"] >= 0 else "−",
+                                        estimates.label(abs(v["gap_minutes"])),
+                                        estimates.ratio_text(v["ratio"]))
+            parts.append(text)
+    return " · ".join(parts)
 
 
 def _lot_footer(item: dict) -> str:

@@ -99,6 +99,7 @@ lus sans borne (journal complet, toutes ses actions).
 | `last_activity_ts` | (L29) dernière transition, note, jalon ou action |
 | `stale` | (L29) `{since_ts, idle_s, threshold_s}` si le lot non fermé n'a aucune activité depuis le seuil, sinon null ; la page ne le dessine plus actif |
 | `delegation` | (L40, 0030) délégation à échéance (`ameesh work delegate`) : `{delegated_by, delegate, delegated_ts, due_ts, due_in_s, overdue, settled, label}` — `due_in_s` négatif en retard, `due_ts` null et `settled` vrai quand la délégation est soldée (le délégué a travaillé), `label` : « délégué par X, échéance dans 12 min » / « délégué par X, en retard de 5 min » ; null hors délégation et pour un lot fusionné ou fermé (voir [EXPLOITATION.md](EXPLOITATION.md)) |
+| `estimate` | (L157) durée estimée et réel mesuré : `{minutes, source, by, at_ts, started_ts, finished_ts, actual_minutes, elapsed_minutes, ratio, gap_minutes, overrun, label}` — début = premier passage en build (ou qa) ou premier tour de l'assigné, fin = fusion ; `elapsed_minutes` en cours, `actual_minutes` une fois livré ; `label` : « estimé 2 h · réel 2 h 40 (+40 min, ×1,33) » (voir [EXPLOITATION.md](EXPLOITATION.md), « Durée estimée et durée réelle des lots ») |
 
 Jalons (fonction unique `progress._jalons_de_lot`). Source : la table des
 jalons de lot (L10, `work_item_milestones`) quand le lot y a un gel ou un verdict
