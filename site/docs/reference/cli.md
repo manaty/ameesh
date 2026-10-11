@@ -159,7 +159,7 @@ ameesh cost balance [--provider deepseek] [--record] [--since SINCE] [--json]
 --record` reads the balance now (read-only, free).
 
 `ameesh list` shows a **PROJECT** column (the agent's team, else its
-chantier) and groups agents by project, a **LOTS** column (open lots assigned
+chantier, the `--chantier` of `register` and `adopt`) and groups agents by project, a **LOTS** column (open lots assigned
 to each agent) and prefixes the status of an external agent with `ext/`.
 `ameesh projects` shows, per project, each agent's state (working, paused,
 idle, stopped, with the reason), its current lot (the last open lot the agent
@@ -277,7 +277,7 @@ ameesh work note <id> <text> [--actor A]
 ameesh work milestone <id> <frozen|verdict> [ok|blocked] [--sha SHA] [--note N] [--actor A]
 ameesh work backlog add --title T --value "expected value" --score 1-100
                         [--priority 1|2|3] [--source S] [--team T] [--requires CAP …]
-                        [--body B] [--package FICHE] [--json]
+                        [--body B] [--package CARD] [--json]
 ameesh work backlog list [--all] [--limit N] [--json]
 ameesh work unrecorded [--since 24h|2h|7d|ISO-DATE] [--limit N] [--json]
 ```
@@ -301,8 +301,8 @@ when an agent of the registry creates the lot** (`work add`, `mail send
 --new-lot`): refused otherwise, nothing is created; a human gets a warning.
 ameesh measures the actual duration itself: start = first move to `build`
 (or `qa`), or the assignee's first turn on the lot (noted by the runner);
-end = the `merged` milestone. `work show` (line « durée »), `ameesh projects`
-(short **DURÉE** column: `1h10/2h` elapsed/estimated, `2h` not started,
+end = the `merged` milestone. `work show` (line « durée », duration), `ameesh projects`
+(short **DURÉE** column, duration: `1h10/2h` elapsed/estimated, `2h` not started,
 `2h40/2h!` overrun), `ameesh progress`, the roadmap and the header of the
 lots' GitHub issues (L126) show the estimate, the actual duration and the
 gap. `work estimates` gives, over delivered lots, the actual/estimated ratio

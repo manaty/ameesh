@@ -10,7 +10,10 @@ Card types are described in
 ## 1. Layout
 
 Any layout works; ameesh reads the `type` in each file's frontmatter. The
-example uses one folder per kind:
+example uses one folder per kind. Folder, file and member names are those of
+the example canon shipped in `examples/canon/` (in French: `membres` members,
+`hotes` hosts, `orchestre` orchestrator, `relecteur` reviewer, `ouvrier`
+worker, `atelier` workshop, `banc` test bench); they are plain identifiers:
 
 ```
 examples/canon/
@@ -58,7 +61,7 @@ request.
 ---
 type: Host
 title: banc
-description: "Serveur de test : DeepSeek et Codex seulement, clé d'API seulement."
+description: "Test server: DeepSeek and Codex only, API key only."
 responsible: human:alice
 policy:
   harnesses:

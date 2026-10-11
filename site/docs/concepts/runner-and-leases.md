@@ -148,7 +148,7 @@ A harness binary or interpreter that cannot be found (a user unit started
 before the session imported its `PATH`, `node` missing for `dsh`), a harness
 that could not execute (exit 126/127 without output), an unreachable database
 (also at startup) or a missing working directory are **host** errors, not
-agent failures: the agent shows `blocked` "hôte non prêt", the prompt and mail
+agent failures: the agent shows `blocked` "hôte non prêt" (host not ready), the prompt and mail
 wait, the fast-failure series does not move, the agent is never stopped. The
 runner retries (15 s, doubling up to `AMEESH_HOST_RETRY_MAX`) and resumes by
 itself; `host_not_ready` alerts the agent's responsible. Binaries are resolved
