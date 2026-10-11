@@ -66,7 +66,7 @@ le numéro du lot.**
   ```
 
   Priorité : 1 haute (bloque l'humain ou un projet), 2 normale, 3 basse.
-  Estimation : la durée prévue jusqu'à la PR verte. Le lot L157 (#166) ajoute
+  Estimation : la durée prévue jusqu'à la PR verte. Le lot L157 (n° 166) ajoute
   aux lots une durée estimée : une fois livrée, elle se pose par son option de
   `work add` ; d'ici là, une ligne « Estimation : … » dans le corps.
 * **Confier** : `ameesh mail send <agent> "…" --lot <id>` sur le lot créé.
