@@ -160,9 +160,17 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         raise AssignmentError(str(exc)) from exc
     if item is not None:
         out.update(lot=item, work_item_id=str(item["id"]))
-    if not has_open and not out["assigned"]:
+    if not has_open and not out["assigned"] and not _is_chat(db, recipient):
         out["warnings"].append(
             "%s n'a aucun lot ouvert : ce travail n'apparaîtra ni dans ameesh projects "
             "ni dans les alertes — rattachez-le (--lot <id|réf>) ou créez-le "
             "(--new-lot \"titre\")" % recipient)
     return out
+
+
+def _is_chat(db, name: str) -> bool:
+    """L123 : le chat du propriétaire n'a jamais de lot ; lui écrire (réponse
+    d'un orchestrateur) ne confie pas de travail."""
+    from . import registry
+    from .chat import CHAT_PREFIX, is_chat_agent
+    return name.startswith(CHAT_PREFIX) and is_chat_agent(registry.get(db, name))

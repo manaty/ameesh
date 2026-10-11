@@ -36,7 +36,10 @@ ameesh mail send <agent> "<text>"                 # agent-mail, unchanged for th
 ameesh fil list | show <project> [<lot>]          # readable threads
 ameesh action propose | execute | reconcile …     # the gate
 ameesh action request | fetch-receipt <id>        # ask ameesh-approve, attach the receipt
-ameesh decisions [--for human:ID]                 # what waits for a human
+ameesh decisions [--all] [--for human:ID]         # what waits for a human, all projects
+ameesh decide ask --lot <id> --question … --option a=…   # an agent asks the owner (L124)
+ameesh decide <id> <option|"text"> [--key F]      # the owner answers (humans only)
+ameesh chat                                       # the owner's own chat agent (L123)
 ameesh receipt verify | authenticator list        # receipts, trust registry
 ameesh review-class <files…|--diff REF>           # review class of a change (canon policy)
 ameesh-approve serve | enroll-link | gen-token    # the approval service (own user)

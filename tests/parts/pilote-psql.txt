@@ -24,3 +24,5 @@ test_events_attach
 # courrier en souffrance : renvoi en une transaction (psql persistant), lecture
 # du courrier en souffrance jointe à la vue par projet (une requête)
 test_undeliverable
+# stockage : domaine `decisions` (agent_mailbox, jsonb) et vue par projet (L124)
+test_l124_decisions

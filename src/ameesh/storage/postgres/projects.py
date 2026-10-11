@@ -2,9 +2,10 @@
 """Pilote Postgres : lecture de la vue par projet (`ameesh projects`, L62).
 
 Une seule instruction, un seul aller-retour : les agents (état, non-lus, lot
-en cours, dépense 24 h) et les lots ouverts sont agrégés en deux tableaux
-JSON dans une même ligne. Lecture seule, sans migration ; les deux pilotes
-(psql, psycopg) rendent les colonnes `json` déjà décodées.
+en cours, dépense 24 h), les lots ouverts, le courrier en souffrance et (L124)
+les demandes de décision en attente sont agrégés en tableaux JSON dans une
+même ligne. Lecture seule, sans migration ; les deux pilotes (psql, psycopg)
+rendent les colonnes `json` déjà décodées.
 
 Lot en cours (correctif du 2026-10-11) : trois candidats, tous OUVERTS — un
 lot fusionné ou fermé n'est jamais « en cours » : le dernier lot cité par
@@ -18,6 +19,7 @@ de session) est un numéro, ou une étiquette qui désigne UN SEUL lot ouvert
 from __future__ import annotations
 
 from .. import interface
+from .decisions import PENDING_BOARD_SQL
 from .mailbox import DEAD_LETTERS_SQL
 
 #: états de lot terminés (même liste que `work_items` ailleurs)
@@ -139,12 +141,16 @@ SELECT (SELECT coalesce(json_agg(agents ORDER BY agents.name), '[]'::json) FROM 
        (SELECT coalesce(json_agg(lots ORDER BY lots.updated_ts DESC, lots.id DESC),
                         '[]'::json) FROM lots) AS lots,
        (SELECT coalesce(json_agg(dead ORDER BY dead.recipient, dead.sender), '[]'::json)
-          FROM dead) AS dead_letters
+          FROM dead) AS dead_letters,
+       -- L124 : les demandes de décision en attente (ligne d'en-tête de la vue)
+       (SELECT coalesce(json_agg(d ORDER BY d.id), '[]'::json) FROM (__DECISIONS__) d)
+           AS decisions
 """.replace("__SESSION_REF__", _lot_ref("r.session_work_item")) \
   .replace("__MAIL_REF__", _lot_ref("c.ref")) \
   .replace("__CITED_SCAN__", str(CITED_SCAN)) \
   .replace("__CLOSED__", _CLOSED) \
-  .replace("__DEAD__", DEAD_LETTERS_SQL.strip())
+  .replace("__DEAD__", DEAD_LETTERS_SQL.strip()) \
+  .replace("__DECISIONS__", PENDING_BOARD_SQL)
 
 
 class Projects(interface.Projects):
@@ -153,4 +159,5 @@ class Projects(interface.Projects):
         rows = self.db.query(_BOARD_SQL, (int(max_lots),))
         row = rows[0] if rows else {}
         return {"agents": list(row.get("agents") or []), "lots": list(row.get("lots") or []),
-                "dead_letters": list(row.get("dead_letters") or [])}
+                "dead_letters": list(row.get("dead_letters") or []),
+                "decisions": list(row.get("decisions") or [])}

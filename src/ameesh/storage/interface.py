@@ -90,6 +90,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    progress        lots lot_events lot_milestones lot_actions actions agents costs
                    packages package_items lot_messages
    projects        board
+   decisions       create get pending history pending_for_lot close register_chat
    roadmap         plan_item item_plans plan_package items commitments
                    add_commitment record_proposal set_commitment
    operations      set_settings set_session_work_item listing request_restart
@@ -1547,7 +1548,7 @@ class Projects(Domain):
 
     @abc.abstractmethod
     def board(self, *, max_lots: int) -> dict:
-        """`{"agents": [...], "lots": [...], "dead_letters": [...]}`.
+        """`{"agents": [...], "lots": [...], "dead_letters": [...], "decisions": [...]}`.
 
         `agents` : un élément par agent du registre — name, chantier, team,
         harness, host, provider, credential_mode, status, status_text, mode,
@@ -1566,7 +1567,70 @@ class Projects(Domain):
         élément porte `total` (avant la borne).
 
         `dead_letters` : le courrier en souffrance, comme
-        `mailbox.dead_letters` (une ligne par destinataire et expéditeur)."""
+        `mailbox.dead_letters` (une ligne par destinataire et expéditeur).
+
+        `decisions` (L124) : les demandes de décision EN ATTENTE, les plus
+        anciennes d'abord (au plus 500) — id, owner (destinataire
+        `human:<id>`, ou `human:*`), requester, created_ts, urgent, due_ts ;
+        dans la même instruction (la vue reste à un aller-retour)."""
+
+
+# --------------------------------------------------------------------------
+# demandes de décision au propriétaire (lot L124) : sans migration, dans
+# `agent_mailbox` (kind `request`, `payload.decision`)
+# --------------------------------------------------------------------------
+
+class Decisions(Domain):
+    """Demandes de décision déposées par les agents pour un humain (L124).
+
+    Une demande est une ligne de `agent_mailbox` : `kind = 'request'`,
+    destinataire `human:<id>` (ou `human:*` sans responsable connu), objet
+    `payload.decision` (question, options, recommandation, échéance, état,
+    réponse). En attente tant que `delivered_at` est NULL ; répondue ou
+    retirée, elle est close (`delivered_at` posé) en UNE écriture
+    conditionnelle : deux réponses simultanées, un seul gagnant. Les lignes
+    rendues portent id, sender, recipient, body, payload (dict), work_item_id,
+    status, host, created_ts et closed_ts (`delivered_at`).
+
+    `register_chat` inscrit l'agent de conversation du propriétaire (L123) :
+    mode `externe` (jamais réclamé par un exécuteur), responsable humain."""
+
+    @abc.abstractmethod
+    def create(self, *, sender: str, recipient: str, body: str, payload: dict,
+               work_item_id: str | None, host: str | None) -> dict:
+        """Dépose la demande (le dépôt réveille, comme tout courrier) ; rend
+        id, created_ts et `sender_project` (projet du fil de l'expéditeur)."""
+
+    @abc.abstractmethod
+    def get(self, decision_id: int) -> dict | None:
+        """La demande `decision_id` (en attente ou close), ou None."""
+
+    @abc.abstractmethod
+    def pending(self, *, limit: int) -> list[dict]:
+        """Les demandes en attente, les plus anciennes d'abord."""
+
+    @abc.abstractmethod
+    def history(self, *, limit: int) -> list[dict]:
+        """Les demandes closes (répondues, retirées), les plus récentes d'abord."""
+
+    @abc.abstractmethod
+    def pending_for_lot(self, lot: str) -> list[dict]:
+        """Les demandes en attente rattachées au lot `lot` (`work_item_id`)."""
+
+    @abc.abstractmethod
+    def close(self, decision_id: int, *, status: str, record: dict) -> dict | None:
+        """Clôt la demande si elle est encore en attente : `status`
+        (`answered` | `delivered`), `record` fusionné dans `payload.decision`
+        (état, réponse ou retrait). Rend la ligne close, ou None (déjà close,
+        inconnue) — rien n'est écrit."""
+
+    @abc.abstractmethod
+    def register_chat(self, name: str, *, human: str, host: str, harness: str,
+                      cwd: str | None, status_text: str) -> dict | None:
+        """Inscrit (ou rafraîchit) l'agent de conversation `name` : mode
+        `externe`, responsable `human`, session oubliée (le hook inscrit la
+        nouvelle). None si `name` est un agent `execute` ou détient un bail
+        vivant : rien n'est écrit."""
 
 
 # --------------------------------------------------------------------------
@@ -2063,6 +2127,7 @@ class Storage(abc.ABC):
     placements: Placements
     progress: Progress
     projects: Projects
+    decisions: Decisions
     roadmap: Roadmap
     operations: Operations
     hosts: HostResources

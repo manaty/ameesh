@@ -67,6 +67,17 @@ def main() -> int:
         if os.environ.get("AMEESH_TEST_BACKGROUND_PID"):
             with open(os.environ["AMEESH_TEST_BACKGROUND_PID"], "w", encoding="utf-8") as fh:
                 fh.write(str(fond.pid))
+    if os.environ.get("AMEESH_TEST_RUN"):
+        # L123 : une commande lancée DANS la session, comme par l'outil Bash
+        # du harnais (`ameesh chat` de bout en bout) ; son résultat au journal
+        import subprocess
+        proc = subprocess.run(os.environ["AMEESH_TEST_RUN"], shell=True,
+                              capture_output=True, text=True)
+        if log:
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"harness": "claude", "run": {
+                    "code": proc.returncode, "stdout": proc.stdout,
+                    "stderr": proc.stderr}}) + "\n")
     if os.environ.get("AMEESH_TEST_SLEEP"):
         time.sleep(float(os.environ["AMEESH_TEST_SLEEP"]))
     if os.environ.get("AMEESH_TEST_KILL_SELF"):

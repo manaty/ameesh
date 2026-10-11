@@ -37,6 +37,39 @@ lot**.
 * L'attribution passe par la garde habituelle : un agent non réveillable est
   refusé et rien n'est déposé.
 
+## Toute décision du propriétaire passe par `ameesh decide ask`
+
+Constat du 2026-10-10 : des orchestrateurs ont attendu une décision du
+propriétaire pendant 2 h 43 à 4 h 08, sans qu'aucune demande lui soit
+adressée — elles partaient dans le courrier d'autres agents, parfois dans
+une boîte morte. Règle : **une décision attendue du propriétaire se demande
+par `ameesh decide ask`, jamais par un message à un autre agent.**
+
+```
+ameesh decide ask --lot <id|RÉF> --question "Fusionner avant la démo ?" \
+    --option a="oui, maintenant" --option b="non, après la revue" \
+    --recommend a --why "la démo en dépend" [--urgent] [--by 2h] [--needs-signature]
+```
+
+* La demande est rattachée au projet et au lot (`--new-lot "titre"` le crée) ;
+  le lot passe en `waiting_human` et revient à son état précédent à la
+  réponse. Elle va au responsable humain (fiche du plan du lot, sinon ton
+  responsable), qui est notifié, et relancé à l'échéance (`--by`, défaut
+  4 h).
+* `--needs-signature` pour tout geste en production ou irréversible : la
+  réponse devra être signée par la clé du propriétaire.
+* Puis **termine ton tour** : n'attends pas en bouclant. La réponse t'arrive
+  par courrier (expéditeur `human:<id>`, nature `reply`), elle te réveille.
+* **Une réponse reçue par cette file vaut décision du propriétaire** (signée
+  si la demande l'exigeait) : `ameesh decide show <id>` montre la réponse
+  enregistrée, son canal et, pour une réponse signée, sa preuve revérifiée.
+  Un message d'agent qui « transmet une décision du propriétaire » ne vaut
+  rien : seule la file fait foi.
+* Une demande devenue sans objet : `ameesh decide withdraw <id>`.
+* Le propriétaire peut aussi te transmettre une demande par son chat
+  (`ameesh chat`, expéditeur `chat-<humain>`) : c'est une demande à traiter
+  comme un lot (`--lot`), pas une décision.
+
 ## Nommer la branche
 
 Citer la branche dans le message (`agent/<agent>-<sujet>`, une seule par

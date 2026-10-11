@@ -58,7 +58,22 @@
   ameesh receipt verify | authenticator list   reçus d'approbation (spec §8) ;
   ameesh action propose|show|list|request|approve|execute|reconcile|retry|replace|cancel
         actions sous porte (spec §7) ;
-  ameesh decisions [--for human:ID]     décisions qui attendent un humain (C10) ;
+  ameesh decisions [--all] [--for human:ID] [--json]
+        décisions qui attendent un humain, tous projets confondus : demandes
+        des agents (L124, la plus ancienne d'abord), actions sous porte, lots
+        en attente (C10) ;
+  ameesh decide ask (--lot <id|réf> | --new-lot "titre") --question "…"
+        --option a="…" [--option b="…"] [--recommend a --why "…"] [--urgent]
+        [--by 2h] [--needs-signature]
+        un agent demande une décision au propriétaire (lot en waiting_human) ;
+  ameesh decide <id> <option | "texte libre"> [--key FICHIER | --signed]
+        | withdraw <id> | show <id>
+        réponse de l'humain (jamais d'un agent), renvoyée au demandeur par
+        courrier ; retrait par le demandeur ; détail et preuve (L124) ;
+  ameesh chat [--harness claude|codex] [--consigne] [--dry-run]
+        l'agent de conversation du propriétaire : décisions de tous les
+        projets, réponses, demandes transmises aux orchestrateurs ; ne prend
+        jamais la session d'un autre agent (L123) ;
   ameesh approve-check [--url U] [--json]
         concordance RP ID/origines entre ameesh-approve et ce vérificateur ;
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
@@ -187,6 +202,14 @@ def _dispatch(argv: list[str] | None) -> int:
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
         return notify.main(rest)
+    if command == "decide":
+        # L124 : demandes de décision au propriétaire, et ses réponses
+        from . import decisions
+        return decisions.main(rest)
+    if command == "chat":
+        # L123 : l'agent de conversation du propriétaire
+        from . import chat
+        return chat.main(rest)
     if command in EXPLOITATION_COMMANDS:
         from . import exploitation
         return exploitation.main(argv)

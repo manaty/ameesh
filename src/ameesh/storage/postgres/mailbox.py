@@ -47,6 +47,9 @@ DEAD_LETTERS_SQL = """
       LEFT JOIN agent_registry r ON r.name = m.recipient
      WHERE m.delivered_at IS NULL
        AND (r.name IS NULL OR r.status = 'stopped')
+       -- L124 : une demande de décision attend un humain (`human:<id>`),
+       -- jamais un agent : elle n'est pas en souffrance
+       AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)
      GROUP BY m.recipient, m.sender, r.name
 """
 
