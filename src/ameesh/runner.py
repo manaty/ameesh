@@ -2858,7 +2858,9 @@ class AgentWorker(threading.Thread):
                     for text in parsed.get("display") or []:
                         log("[%s] %s" % (self.name, text))
                         self.last_output = (self.last_output + "\n" + text)[-4000:]
-                    if plafonne and not clos:
+                    if plafonne:
+                        # L217b : le flux se lit jusqu'au bout, même après la
+                        # clôture — un appel déjà en tampon compte encore.
                         relus_mesures = relus_mesures or isinstance(
                             parsed.get("call_usage") or parsed.get("subagent_call_usage"), dict)
                         appel = parsed.get("call_usage")
@@ -2875,12 +2877,12 @@ class AgentWorker(threading.Thread):
                                 if ident:
                                     appels_vus.add(ident)
                                 relus_sous_agents += adapters.reread_tokens(harness, appel)
-                        if cloture is None:
+                        if cloture is None and not clos:
                             cloture = self.turn_close_due(started, relus)
                             if cloture:
                                 log_async("[%s] %s : tour clos au prochain point sûr"
                                           % (self.name, cloture))
-                        if cloture and parsed.get("safe_point"):
+                        if cloture and not clos and parsed.get("safe_point"):
                             # Point sûr : l'appel d'outil en cours est fini et son
                             # résultat est dans la session. Aucun harnais mené
                             # n'offre d'interruption propre en mode non
