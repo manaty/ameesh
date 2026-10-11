@@ -444,7 +444,9 @@ retire, saute ou affaiblit un test ; une migration qui change un comportement.
    test, et l'inverse (annuler le commit de fusion). Puis
    `ameesh work move <lot> qa`.
 5. *CI verte sur une base à jour* : `gh pr checks <n> --watch` ; si la branche
-   principale a avancé, `gh pr update-branch <n>`, puis la CI de nouveau.
+   principale a avancé, `gh pr update-branch <n>`, puis la CI de nouveau. Les
+   échecs remontés en temps réel (L161c) vont à l'assigné du lot, pas à
+   l'auditeur : `ameesh ci status <lot>` montre ce qu'ameesh en a relevé.
 6. *Relecture* par un autre que lui, avant la fusion. La classe vient de
    `ameesh review-class --diff origin/main` dans le worktree (politique du
    canon ; sans politique déclarée, `normal`). Pour l'auditeur, sont toujours

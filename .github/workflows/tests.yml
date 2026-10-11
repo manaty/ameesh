@@ -43,6 +43,12 @@
 # counts the leaks (failures of modules the map did not select) and the
 # provisional green (P0 and P1 green in every part), kept as the `leaks`
 # artifact for the two-week review (L161i).
+#
+# L161c — pendant la part, `ci-flux.py publier` (arrière-plan) tient le check
+# run « tests (flux) <part> » de la tête poussée : chaque échec y entre dès
+# qu'il est écrit. `ameesh notify` le relève et l'envoie aussitôt à l'agent du
+# lot (ameesh.ci). D'où `checks: write` sur les parts ; sans ce droit (PR d'une
+# fourche), rien n'est publié et la part n'en est pas affectée.
 name: tests
 
 on:
@@ -134,8 +140,12 @@ jobs:
           --tmpfs /var/lib/postgresql/data
           --health-cmd "pg_isready -U ameesh"
           --health-interval 2s --health-timeout 5s --health-retries 30
+    permissions:
+      contents: read
+      checks: write  # L161c : check run « tests (flux) »
     env:
       AMEESH_DRIVER: psycopg
+      FLUX_NOM: tests (flux) psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
     steps:
       - uses: actions/checkout@v4
       - id: py
@@ -173,10 +183,25 @@ jobs:
         with:
           name: plan
           path: ${{ runner.temp }}
+      - &publier
+        name: publication du flux en direct (check run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          nohup python3 scripts/ci-flux.py publier "$RUNNER_TEMP/flux.jsonl" --nom "$FLUX_NOM"
+          > "$RUNNER_TEMP/publier.log" 2>&1 &
       - name: part ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
         run: >-
           .venv-ci/bin/python scripts/test-parts.py lancer --plan "$RUNNER_TEMP/plan.json"
           --part ${{ matrix.part }} --pilote psycopg --flux "$RUNNER_TEMP/flux.jsonl"
+      - &fermer
+        name: fin du check run du flux
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci-flux.py fermer "$RUNNER_TEMP/flux.jsonl" --nom "$FLUX_NOM"
+          cat "$RUNNER_TEMP/publier.log" 2>/dev/null || true
       - &resume
         name: résumé du flux
         if: always()
@@ -213,8 +238,12 @@ jobs:
           --tmpfs /var/lib/postgresql/data
           --health-cmd "pg_isready -U ameesh"
           --health-interval 2s --health-timeout 5s --health-retries 30
+    permissions:
+      contents: read
+      checks: write  # L161c
     env:
       AMEESH_DRIVER: psql
+      FLUX_NOM: tests (flux) psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -223,10 +252,12 @@ jobs:
       - *base
       - *git
       - *plan
+      - *publier
       - name: part ${{ matrix.part }}
         run: >-
           python scripts/test-parts.py lancer --plan "$RUNNER_TEMP/plan.json"
           --part ${{ matrix.part }} --pilote psql --flux "$RUNNER_TEMP/flux.jsonl"
+      - *fermer
       - *resume
       - name: flux en artefact
         if: always()

@@ -338,6 +338,10 @@ class AgentWorker(threading.Thread):
         #: le dernier tour inscrit au grand livre, et sa session
         self.last_turn_reread = 0
         self.last_turn_reread_session: str | None = None
+        #: L217 : relevé du flux du dernier tour, fil principal (la mesure du
+        #: plafond pendant le tour) et sous-agents (pour information)
+        self.last_turn_main_reread = 0
+        self.last_turn_subagent_reread = 0
         #: plafonds du tour (L105) : le tour suivant reprend le travail d'un
         #: tour clos (raison), et la rotation forcée par le plafond de contexte
         #: atteint pendant un tour (raison) attend le prochain passage entre deux tours
@@ -1413,6 +1417,51 @@ class AgentWorker(threading.Thread):
             self.agent["session_account"] = compte
         log_async("[%s] session %s enregistrée au registre (différée par une panne)"
                   % (self.name, session))
+
+    def _ecarte_session_fille(self, refusee: str) -> None:
+        """L166 : le harnais refuse de reprendre `refusee`, session fille
+        (sous-agent, fourche) retenue à tort comme session de l'agent. Le tour
+        suivant repart de la dernière session principale connue (le fichier
+        local, écrit seulement depuis le flux du harnais), sinon d'une session
+        neuve ouverte sur le brief de reprise déterministe. Fencé par le bail."""
+        principale = self.read_session_file()
+        if principale == refusee:
+            principale = None
+        if principale:
+            registry.set_session(self.db, self.name, principale, None)
+            if self.agent is not None:
+                self.agent["session_id"] = principale
+                self.agent["session_account"] = None
+            suite = "reprise de la dernière session principale connue (%s)" % principale
+        else:
+            if not registry.clear_session(self.db, self.name, self.runner.runner_id,
+                                          self.epoch):
+                return  # bail perdu : rien n'est touché (L11 B3)
+            try:
+                os.unlink(self._path("session"))  # sinon `current_session` le relirait
+            except OSError:
+                pass
+            try:
+                from . import reprise
+                self.resume_summary = reprise.deterministic_brief(
+                    self.cfg, self.db, registry.get(self.db, self.name) or self.agent,
+                    session=refusee, reason="session fille %s écartée" % refusee,
+                    consigne="La consigne de ce tour suit ce brief : reprends ton "
+                             "travail à partir de là.")
+                self.resume_origin = "ameesh"
+            except Exception as exc:  # un brief manquant n'empêche pas l'oubli
+                log_async("[%s] brief de reprise déterministe indisponible (%s)"
+                          % (self.name, exc))
+            self.agent = registry.get(self.db, self.name) or self.agent
+            self.session_turns = 0
+            self.session_tokens = 0.0
+            suite = "session neuve ouverte sur le brief de reprise"
+        log_async("[%s] session fille %s écartée : %s" % (self.name, refusee, suite))
+        self._fil_note(
+            "Session %s refusée par le harnais (session fille : sous-agent ou "
+            "fourche) ; %s. Pas compté comme échec rapide." % (refusee, suite),
+            meta={"action": "session-fille", "session": refusee,
+                  "reprise": principale or ""})
 
     # -- hôte non prêt (L106) ------------------------------------------------
     #: statut et préfixe d'erreur d'un blocage « hôte non prêt » (levé seulement
@@ -2682,6 +2731,9 @@ class AgentWorker(threading.Thread):
         # et durée ; jamais sur un tour de résumé (rotation, bascule de compte)
         plafonne = spec.get("prompt") != adapters.SUMMARY_PROMPT
         relus = 0
+        #: L217 : jetons relus par les sous-agents, à part et pour information
+        #: (jamais comptés au plafond de contexte, qui mesure le fil principal)
+        relus_sous_agents = 0
         appels_vus: set = set()
         cloture: str | None = None
         clos = False
@@ -2792,6 +2844,13 @@ class AgentWorker(threading.Thread):
                                 if ident:
                                     appels_vus.add(ident)
                                 relus += adapters.reread_tokens(harness, appel)
+                        appel = parsed.get("subagent_call_usage")
+                        if isinstance(appel, dict):
+                            ident = parsed.get("call_id")
+                            if not ident or ident not in appels_vus:
+                                if ident:
+                                    appels_vus.add(ident)
+                                relus_sous_agents += adapters.reread_tokens(harness, appel)
                         if cloture is None:
                             cloture = self.turn_close_due(started, relus)
                             if cloture:
@@ -2862,6 +2921,12 @@ class AgentWorker(threading.Thread):
 
         duration = time.time() - started
         self.last_turn_seconds = duration
+        # L217 : fil principal et sous-agents, mesurés à part dans le flux
+        self.last_turn_main_reread = relus
+        self.last_turn_subagent_reread = relus_sous_agents
+        if relus_sous_agents:
+            log_async("[%s] jetons relus dans le tour : %d fil principal, %d sous-agents "
+                      "(hors plafond)" % (self.name, relus, relus_sous_agents))
         lost = self.lease_lost.is_set()
         preempte = self.preempting.is_set()
         # Comptabilité **avant** toute sortie anticipée : la dépense a eu lieu,
@@ -2934,6 +2999,13 @@ class AgentWorker(threading.Thread):
                 if not self._power_texte:
                     self._host_not_ready(hote)
                 return False
+            if session and adapters.child_session_refused(error):
+                # L166 : la session reprise était une session fille ; la
+                # reprendre encore échouerait de même. Pas un échec rapide :
+                # le tour suivant repart d'une session saine.
+                self.fast_failure = False
+                self._avec_reprise("session fille écartée",
+                                   self._ecarte_session_fille, session)
         if self._session_en_attente is not None:
             self._avec_reprise("session du tour", self._enregistre_session)
         if ok and clos:

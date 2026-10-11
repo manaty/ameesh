@@ -363,8 +363,9 @@ def is_urgent(row: Any) -> bool:
 #: clés du payload qui rendent un message PASSIF : déposé sans réveil, il est
 #: lu au tour suivant de son destinataire (dans la consigne du tour, ou par le
 #: hook pendant un tour) — accusé de réception, copie, diffusion à tous,
-#: conflit signalé par le radar (L160c). Un message `urgent` n'est jamais passif.
-PASSIVE_KEYS = ("ack", "cc", "broadcast", "radar")
+#: conflit signalé par le radar (L160c), échec de CI peut-être hérité faute
+#: d'exécution relevée de la base (L161c). Un message `urgent` n'est jamais passif.
+PASSIVE_KEYS = ("ack", "cc", "broadcast", "radar", "ci_passif")
 
 #: un accusé de réception reconnu à l'envoi tient en au plus ce nombre de
 #: caractères…
@@ -391,8 +392,8 @@ def _payload(row: Any) -> dict:
 
 
 def passive_reason(row: Any) -> str:
-    """L125 : `ack`, `cc`, `broadcast` ou `radar` si ce message n'ouvre pas de tour à
-    lui seul ; '' s'il réveille son destinataire."""
+    """L125 : `ack`, `cc`, `broadcast`, `radar` ou `ci_passif` si ce message
+    n'ouvre pas de tour à lui seul ; '' s'il réveille son destinataire."""
     payload = _payload(row)
     if payload.get("urgent"):
         return ""
@@ -414,7 +415,7 @@ def passive_label(row: Any) -> str:
         cible = str(_payload(row).get("cc") or "")
         return "copie d'un message à %s" % (cible if NAME_RE.match(cible) else "?")
     return {"ack": "accusé de réception", "broadcast": "diffusion à tous",
-            "radar": "radar de conflits"}.get(reason, "")
+            "radar": "radar de conflits", "ci_passif": "CI sans référence de la base"}.get(reason, "")
 
 
 def _nature(row: Any) -> str:
