@@ -575,7 +575,11 @@ class MenageDbTest(PgTestCase):
         pol = menage.Policy(cache_quota=10)
         menage.turn_env(self.cfgl, pol, "a1", {})
         menage.turn_env(self.cfgl, pol, "parti", {})
-        _write(os.path.join(menage.agent_tmp(self.cfgl, pol, "parti"), "f"), 100)
+        _write(os.path.join(menage.agent_tmp(self.cfgl, pol, "parti"), "f"), 100,
+               age_s=3 * 3600)
+        # L219: an orphan directory is deleted once idle for `orphan_idle`
+        ancien = time.time() - 3 * 3600
+        os.utime(menage.agent_tmp(self.cfgl, pol, "parti"), (ancien, ancien))
         pnpm = os.path.join(menage.cache_root(self.cfgl, pol), "pnpm", "v3", "f")
         _write(pnpm, 5000, age_s=7200)
         rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", busy=True)
@@ -661,7 +665,11 @@ class MenageDbTest(PgTestCase):
     def test_cli_essai_par_defaut_apply_refuse_a_un_agent(self):
         pol = menage.Policy()
         cfg_state = self.cfgl
-        menage.turn_env(cfg_state, pol, "parti", {})
+        # L219: same mesh as the CLI (owner file), idle for 3 h
+        cfg_state.dsn, cfg_state.schema = self.cfg.dsn, self.cfg.schema
+        parti = menage.turn_env(cfg_state, pol, "parti", {})["TMPDIR"]
+        ancien = time.time() - 3 * 3600
+        os.utime(parti, (ancien, ancien))
         proc = self.mesh("menage")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("ESSAI", proc.stdout)

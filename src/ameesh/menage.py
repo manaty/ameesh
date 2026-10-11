@@ -12,7 +12,9 @@ l'humain. Quatre familles, quatre règles :
   fichiers (bloc-notes du harnais, sorties de tests) d'un tour à l'autre. Il
   est vidé au premier tour d'une session neuve (rotation, changement de lot,
   `restart`), borné par un quota (éviction des fichiers les plus anciens à la
-  fin de chaque tour) et supprimé quand l'agent n'existe plus au registre.
+  fin de chaque tour) et supprimé quand l'agent n'existe plus au registre —
+  L219 : seulement s'il appartient à CE mesh (fichier `.<agent>.owner`),
+  sans tour en cours ni activité depuis `orphan_idle`.
 * **Caches partagés de l'hôte** (réutilisables) : `npm_config_cache`, store
   pnpm (`npm_config_store_dir`/`pnpm_config_store_dir`), `YARN_CACHE_FOLDER`
   — et, sur demande de la politique, `XDG_CACHE_HOME` — pointent vers
@@ -114,6 +116,11 @@ TMPFS_ACTION = ("action attendue : supprimer ce qui ne sert plus (commande par e
 MANAGED_DIR = ".menage"
 #: marqueur posé par ameesh à la racine d'un dossier qu'il gère
 MARKER = ".ameesh-menage"
+#: L219: owner file of an agent's temporary directory, next to it in the tmp
+#: root (`.<agent>.owner`, never inside: the start of a session empties the
+#: directory and the quota evicts its oldest files). It names the mesh that
+#: created the directory (`mesh_key`).
+OWNER_SUFFIX = ".owner"
 
 #: caches partagés : nom du sous-dossier → variables d'environnement
 CACHES = (
@@ -324,6 +331,61 @@ def cache_names(policy: Policy) -> list[tuple[str, tuple[str, ...]]]:
     return list(CACHES) + ([XDG_CACHE] if policy.xdg_cache else [])
 
 
+def mesh_key(cfg) -> str:
+    """L219: identity of the mesh (database and schema) shared by its runners:
+    a hash of the DSN without user, password or options, and of the schema.
+    Two meshes of one host that share the state directory have two keys."""
+    import hashlib
+    from urllib.parse import urlsplit
+
+    dsn = str(getattr(cfg, "dsn", "") or "")
+    if "://" in dsn:
+        parts = urlsplit(dsn)
+        where = "%s:%s/%s" % ((parts.hostname or "").lower(), parts.port or 5432,
+                              parts.path.lstrip("/"))
+    else:
+        fields = dict(t.split("=", 1) for t in dsn.split() if "=" in t)
+        where = "%s:%s/%s" % (fields.get("host", "").lower(), fields.get("port", "5432"),
+                              fields.get("dbname", ""))
+    text = "%s|%s" % (where, getattr(cfg, "schema", "") or "public")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def owner_file(troot: str, agent: str) -> str:
+    return os.path.join(troot, ".%s%s" % (agent, OWNER_SUFFIX))
+
+
+def read_owner(troot: str, agent: str) -> str | None:
+    """The mesh key written for `agent`'s temporary directory, or None."""
+    try:
+        with open(owner_file(troot, agent), encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def _write_owner(troot: str, agent: str, key: str) -> None:
+    if read_owner(troot, agent) == key:
+        return
+    path = owner_file(troot, agent)
+    tmp = "%s.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(key + "\n")
+    os.replace(tmp, path)
+
+
+def last_activity(path: str) -> float:
+    """Latest mtime under `path` (the directory itself included; bounded
+    walk), 0 if unreadable."""
+    try:
+        latest = os.lstat(path).st_mtime
+    except OSError:
+        return 0.0
+    for _p, _size, mtime in _files(path):
+        latest = max(latest, mtime)
+    return latest
+
+
 def _ensure_root(root: str) -> None:
     os.makedirs(root, mode=0o700, exist_ok=True)
     marker = os.path.join(root, MARKER)
@@ -359,6 +421,9 @@ def turn_env(cfg, policy: Policy, agent: str, base_env: dict) -> dict:
     _ensure_root(croot)
     mine = os.path.join(troot, agent)
     os.makedirs(mine, mode=0o700, exist_ok=True)
+    # L219: the directory belongs to this mesh (another mesh sharing the
+    # state directory never deletes it)
+    _write_owner(troot, agent, mesh_key(cfg))
     out = {"TMPDIR": mine, "TMP": mine, "TEMP": mine,
            "AMEESH_TMPDIR": mine, "AMEESH_CACHE_DIR": croot}
     for name, variables in cache_names(policy):
@@ -1421,6 +1486,24 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
     return out
 
 
+def orphan_tmp_problem(path: str, owner: str | None, key: str, policy: Policy, *,
+                       now: float) -> str:
+    """L219: why the temporary directory of an agent ABSENT from the registry
+    is kept, empty if it may be deleted. It must carry this mesh's owner file
+    (a directory without one may belong to another mesh sharing the state
+    directory, or predate L219: kept) and show no activity for
+    `orphan_idle` (a turn writes in it)."""
+    if owner is None:
+        return "sans propriétaire (autre mesh du poste, ou antérieur à L219)"
+    if owner != key:
+        return "appartient à un autre mesh"
+    idle = now - last_activity(path)
+    if idle < policy.orphan_idle:
+        return "actif il y a %d min (moins de %d min)" % (idle // 60,
+                                                         policy.orphan_idle // 60)
+    return ""
+
+
 def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
              busy: bool = False, agents_in_turn: set | None = None,
              include_lotless: bool = False, now: float | None = None,
@@ -1461,17 +1544,34 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     except Exception:  # registre illisible : on ne supprime aucun dossier d'agent
         registered = None  # type: ignore[assignment]
     # 1. dossiers temporaires des agents
+    key = mesh_key(cfg)
     if os.path.isdir(troot) and _managed(troot):
         for name in sorted(os.listdir(troot)):
             full = os.path.join(troot, name)
             if name == MARKER or not os.path.isdir(full) or os.path.islink(full):
                 continue
+            owner = read_owner(troot, name)
+            if owner is not None and owner != key:
+                # L219: another mesh of this host (same state directory)
+                # manages it: never deleted nor evicted here
+                continue
             if registered is not None and name not in registered:
+                # L219: checked BEFORE deleting — an agent in turn keeps its
+                # directory, registered or not
+                why = ("en tour" if name in running
+                       else orphan_tmp_problem(full, owner, key, policy, now=now))
+                if why:
+                    skipped.append("tmp %s gardé : %s" % (full, why))
+                    continue
                 size = size_of(full)
                 plan.append({"kind": "tmp", "path": full, "agent": name, "action": "suppression",
                              "bytes": size, "detail": "agent absent du registre"})
                 if not dry_run:
                     freed = _safe_rmtree(full, troot)
+                    try:
+                        os.unlink(owner_file(troot, name))
+                    except OSError:
+                        pass
                     entries.append({"kind": "tmp", "action": "deleted", "path": full,
                                     "bytes": freed, "agent": name,
                                     "detail": "agent absent du registre"})
