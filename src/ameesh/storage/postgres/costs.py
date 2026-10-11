@@ -113,7 +113,8 @@ class TurnCosts(interface.TurnCosts):
         rows = self.db.query(
             "select coalesce(sum(usd), 0)::float8 as usd from turn_costs"
             " where recorded_at > to_timestamp(%s) and recorded_at <= to_timestamp(%s)"
-            " and void_reason is null and harness in (" + ", ".join(["%s"] * len(names)) + ")",
+            " and void_reason is null and source <> 'device' and harness in ("
+            + ", ".join(["%s"] * len(names)) + ")",
             tuple([float(from_ts), float(to_ts)] + names))
         return float(rows[0]["usd"]) if rows else 0.0
 

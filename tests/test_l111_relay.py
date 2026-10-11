@@ -278,8 +278,17 @@ class RelaisTest(PgTestCase):
             source="device")
         self.assertEqual(storage_of(self.db).turn_costs.spent(3600, agent="a1",
                                                               harnesses=("deepseek",)), 0.0)
+        # Balance reconciliation must also exclude the device's duplicate report.
+        self.assertEqual(storage_of(self.db).turn_costs.spent_between(
+            0, time.time() + 3600, harnesses=("deepseek",)), 0.0)
         response, _ = self.post(self.body())
         self.assertEqual(response.status, 200)
+        rows = self.wait_for(lambda: any(row["source"] == "relay" for row in self.rows())
+                             and self.rows())
+        measured = sum(float(row["usd"]) for row in rows if row["source"] == "relay")
+        self.assertGreater(measured, 0.0)
+        self.assertAlmostEqual(storage_of(self.db).turn_costs.spent_between(
+            0, time.time() + 3600, harnesses=("deepseek",)), measured)
 
     def test_taille_et_debit_bornes(self):
         response, _ = self.post(None, raw=b"{" + b" " * (70 * 1024) + b"}")
