@@ -339,11 +339,14 @@ def _inside(target: str, real: str, is_dir: bool) -> bool:
     return target == real or (is_dir and target.startswith(real.rstrip(os.sep) + os.sep))
 
 
-def holders(path: str, needle: str | None = None, exclude=()) -> list[dict]:
+def holders(path: str, needle: str | None = None, exclude=(), *,
+            mapped: bool = False) -> list[dict]:
     """Les processus qui tiennent `path` : fichier ouvert (dans le dossier,
     si `path` en est un), dossier courant dans `path` (dossier seulement), ou
     `needle` sur la ligne de commande (hors argv[0] et hors les PID de
-    `exclude`). Chaque détenteur : `{"pid", "why", "cmd"}`.
+    `exclude`). #248 : avec `mapped`, aussi l'exécutable et les fichiers
+    projetés en mémoire (module natif `.node`, binaire electron). Chaque
+    détenteur : `{"pid", "why", "cmd"}`.
 
     Les processus illisibles (autre utilisateur, disparus) sont ignorés, mais
     si ce processus-ci ne peut même pas lire SES fichiers ouverts, ou si l'OS
@@ -354,9 +357,9 @@ def holders(path: str, needle: str | None = None, exclude=()) -> list[dict]:
     exclude = set(int(p) for p in exclude)
     ps = _psutil()
     if ps is not None:
-        return _holders_psutil(ps, real, is_dir, needle, exclude)
+        return _holders_psutil(ps, real, is_dir, needle, exclude, mapped)
     if _proc_ok():
-        return _holders_proc(real, is_dir, needle, exclude)
+        return _holders_proc(real, is_dir, needle, exclude, mapped)
     raise NotAvailable("détenteurs d'un fichier",
                        "ni psutil ni /proc pour lister les fichiers ouverts")
 
@@ -369,7 +372,7 @@ def _verdict(pid: int, hit: str, argv: list[str], needle, exclude) -> dict | Non
     return None
 
 
-def _holders_psutil(ps, real, is_dir, needle, exclude) -> list[dict]:
+def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False) -> list[dict]:
     me = os.getpid()
     try:
         ps.Process(me).open_files()
@@ -396,6 +399,13 @@ def _holders_psutil(ps, real, is_dir, needle, exclude) -> list[dict]:
                             hit = "dossier courant"
                     except (ps.AccessDenied, ps.ZombieProcess, OSError):
                         pass
+                if not hit and mapped:
+                    try:
+                        paths = [proc.exe()] + [m.path for m in proc.memory_maps()]
+                    except (ps.AccessDenied, ps.ZombieProcess, OSError, AttributeError):
+                        paths = []
+                    if any(p and _inside(os.path.realpath(p), real, is_dir) for p in paths):
+                        hit = "fichier projeté"
                 try:
                     argv = [str(a) for a in proc.cmdline()]
                 except (ps.AccessDenied, ps.ZombieProcess, OSError):
@@ -408,7 +418,28 @@ def _holders_psutil(ps, real, is_dir, needle, exclude) -> list[dict]:
     return found
 
 
-def _holders_proc(real, is_dir, needle, exclude) -> list[dict]:
+def _mapped_proc(pid: str, real: str, is_dir: bool) -> str:
+    """#248 : l'exécutable ou un fichier projeté (`maps`) du processus sous
+    `real` ; "" sinon ou si illisible."""
+    try:
+        if _inside(os.readlink(os.path.join(PROC, pid, "exe")), real, is_dir):
+            return "fichier projeté"
+    except OSError:
+        pass
+    try:
+        with open(os.path.join(PROC, pid, "maps"), encoding="utf-8",
+                  errors="replace") as fh:
+            for line in fh:
+                parts = line.split(None, 5)
+                if len(parts) == 6 and parts[5].startswith("/") and \
+                        _inside(parts[5].rstrip("\n"), real, is_dir):
+                    return "fichier projeté"
+    except OSError:
+        pass
+    return ""
+
+
+def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
     except OSError as exc:
@@ -441,6 +472,8 @@ def _holders_proc(real, is_dir, needle, exclude) -> list[dict]:
                     hit = "dossier courant"
             except OSError:
                 pass
+        if not hit and mapped:
+            hit = _mapped_proc(pid, real, is_dir)
         try:
             with open(os.path.join(PROC, pid, "cmdline"), "rb") as fh:
                 argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
