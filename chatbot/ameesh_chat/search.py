@@ -84,22 +84,28 @@ def stem(word: str) -> str:
 
 def tokens(text: str, *, expand: bool = False) -> list[str]:
     """Jetons de recherche ; `expand` ajoute les équivalents du glossaire (requête)."""
-    out: list[str] = []
+    return [t for group in term_groups(text, expand=expand) for t in group]
+
+
+def term_groups(text: str, *, expand: bool = False) -> list[tuple[str, ...]]:
+    """Jetons groupés : un mot et son équivalent du glossaire forment un seul terme."""
+    out: list[tuple[str, ...]] = []
     for raw in _WORD.findall(normalize(text)):
         if any(_is_cjk(ch) for ch in raw):
             chars = [ch for ch in raw if _is_cjk(ch)]
-            out.extend(chars[i] + chars[i + 1] for i in range(len(chars) - 1))
+            out.extend((chars[i] + chars[i + 1],) for i in range(len(chars) - 1))
             if len(chars) == 1:
-                out.append(chars[0])
+                out.append((chars[0],))
             rest = "".join(ch for ch in raw if not _is_cjk(ch))
             if len(rest) > 1:
-                out.append(stem(rest))
+                out.append((stem(rest),))
             continue
         if raw in STOPWORDS or (len(raw) < 2 and not raw.isdigit()):
             continue
-        out.append(stem(raw))
-        if expand and raw in GLOSSARY:
-            out.append(stem(GLOSSARY[raw]))
+        if expand and raw in GLOSSARY and stem(GLOSSARY[raw]) != stem(raw):
+            out.append((stem(raw), stem(GLOSSARY[raw])))
+        else:
+            out.append((stem(raw),))
     return out
 
 
@@ -160,24 +166,32 @@ class Index:
         return cls(list(data.get("passages", [])))
 
     def search(self, query: str, *, context: str = "", limit: int = 20) -> list[Hit]:
-        """`context` : la question précédente, à poids réduit (suite de conversation)."""
-        weights: dict[str, float] = {}
-        for t in tokens(query, expand=True):
-            weights[t] = max(weights.get(t, 0.0), 1.0)
-        for t in tokens(context, expand=True):
-            weights[t] = max(weights.get(t, 0.0), 0.4)
+        """`context` : la question précédente, à poids réduit (suite de conversation).
+
+        Un mot de la requête et sa traduction du glossaire comptent pour un seul
+        terme (la meilleure des deux) : un passage qui contient les deux langues
+        n'est pas compté deux fois.
+        """
+        weights: dict[tuple[str, ...], float] = {}
+        for g in term_groups(query, expand=True):
+            weights[g] = max(weights.get(g, 0.0), 1.0)
+        for g in term_groups(context, expand=True):
+            weights[g] = max(weights.get(g, 0.0), 0.4)
         hits: list[Hit] = []
         for p in self.passages:
             score = 0.0
             norm = self.K1 * (1 - self.B + self.B * p._length / (self.avg_len or 1.0))
-            for t, w in weights.items():
-                f = p._tf.get(t)
-                if not f:
-                    continue
-                s = self.idf.get(t, 0.0) * f * (self.K1 + 1) / (f + norm)
-                if t in p._title_terms:
-                    s *= self.TITLE_BOOST
-                score += w * s
+            for group, w in weights.items():
+                best = 0.0
+                for t in group:
+                    f = p._tf.get(t)
+                    if not f:
+                        continue
+                    s = self.idf.get(t, 0.0) * f * (self.K1 + 1) / (f + norm)
+                    if t in p._title_terms:
+                        s *= self.TITLE_BOOST
+                    best = max(best, s)
+                score += w * best
             if score > 0:
                 if p.source == "site":
                     score *= self.SITE_BOOST
