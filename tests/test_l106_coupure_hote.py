@@ -657,7 +657,10 @@ class CoupureTest(PgTestCase):
         runner = Runner(self.cfg, self.db, once=True)
         with mock.patch.object(resources, "boot_time", return_value=time.time() - 3600), \
                 mock.patch.object(runner_mod, "log"):
-            self.assertEqual(runner.report_boot_orphans(), [])
+            restes = [r["turn_id"] for r in runner.report_boot_orphans()]
+        # (une ligne d'un autre test, avec conteneur, peut rester orpheline)
+        self.assertNotIn(seul, restes)
+        self.assertNotIn(deja, restes)
         for turn in (seul, deja):
             self.assertEqual(turns.get(turn)["status"], "done")
         alertes = [a["turn"] for a in exploitation.alerts(self.cfg, self.db)
