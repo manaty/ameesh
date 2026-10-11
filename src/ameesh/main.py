@@ -13,6 +13,7 @@
         liaison explicite d'une session externe à un agent (L41, 0030) ;
   ameesh run [options]        l'exécuteur de la machine ; `agent-runner` reste
         un alias ;
+  ameesh activity <persona> [--since 24h] [--json]   persona activity log (L59);
   ameesh attach <agent> [--wait] [--ttl S]
         une session interactive sur le bail de l'agent, même session (C9) ;
   ameesh list | show          observabilité (hôte, bail, non-lus, budget, clé) ;
@@ -194,6 +195,9 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "attach":
         from . import runner
         return runner.attach_main(rest)
+    if command == "activity":
+        from . import activity
+        return activity.main(rest)
     if command == "progress":
         from . import progress
         return progress.main(rest)
