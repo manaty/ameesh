@@ -67,7 +67,7 @@ avec un `pg_dump` pris **après** l'arrêt. Puis
   (essai réel du 2026-10-10). Reprendre ces personas sur une session neuve :
   `ameesh resume <persona> --fresh` (brief de reprise déterministe). Une
   session ne se garde que si le dossier est identique (`ameesh session
-  restore`, lot L53).
+  restore`, lot L53, pas encore dans main).
 - Les personas qui ont un dépôt de mémoire (L54) le reclonent d'elles-mêmes à
   leur prochaine session.
 

@@ -72,7 +72,9 @@ Postgres n'est jamais exposé sur Internet.
 
 - **Une persona** : `agent-runner stop <persona>`, puis `systemctl disable --now ameesh-runner@<persona>`.
   Elle peut ensuite reprendre sur un poste avec la même procédure, à condition
-  que sa session y soit présente (sauvegarde des sessions : lot L53).
+  que sa session y soit présente. La sauvegarde des sessions (lot L53,
+  `ameesh session restore`) n'est pas encore dans main : à défaut,
+  `ameesh resume <persona> --fresh`.
 - **La VM** : `pg_dump` final (`systemctl start ameesh-sauvegarde`), copie
   hors de la VM, puis `terraform destroy`.
 
@@ -84,4 +86,16 @@ Postgres n'est jamais exposé sur Internet.
   utilisateur ou par pod est le volet E de l'étude v2.
 - Les harnais (Node, `dsh`, `codex`, `claude`) ne sont pas installés par ce
   lot : chaque organisation installe ceux de ses personas.
-- Éprouvé dans un conteneur Debian 12 avec systemd (installation rejouable, TLS imposé sur wg0, sauvegarde, ajout d'appareil, `ameesh doctor`) ; pas encore sur une VM réelle.
+- Éprouvé dans un conteneur Debian 12 avec systemd (installation rejouable,
+  TLS imposé sur wg0, sauvegarde, ajout d'appareil, `ameesh doctor`), puis
+  sur la VM du mesh de Manaty, où ce code tourne depuis la bascule du
+  2026-10-10.
+
+## Mise à jour
+
+Une fois installé, le serveur se met à jour depuis le poste avec
+[`deploy/mise-a-jour/vm.sh`](../mise-a-jour/vm.sh) (procédure :
+`docs/BASCULE.md`). `vm.sh installer` ne fait que remplacer le code et le
+paquet : le gabarit `ameesh-runner@.service` et le script de sauvegarde
+installés ne changent que si l'on rejoue `installer-serveur.sh`, sans risque
+(idempotent) : `ORGANISATION=<id> /opt/ameesh/src/deploy/serveur/installer-serveur.sh`.

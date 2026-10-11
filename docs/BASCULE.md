@@ -1063,12 +1063,11 @@ personas tournent sous `ameesh-runner@<p>` (service système, utilisateur
 4. `vm.sh controler` : unités actives, quinze lignes de journal par persona,
    `ameesh show`, `ameesh doctor` sur le serveur.
 
-Attention : `/opt/ameesh/src` ne garde que les fichiers du commit installé.
-Si ce commit ne contient pas encore `deploy/serveur/` (L55, L57), ces
-fichiers disparaissent du clone. Les copies installées (gabarit systemd,
-script de sauvegarde) restent en place, mais `installer-serveur.sh` n'est
-plus rejouable depuis ce clone tant que L55 et L57 ne sont pas dans la
-version installée.
+`/opt/ameesh/src` ne garde que les fichiers du commit installé. Depuis
+L135, `deploy/serveur/` (L55, L57) est dans main : un commit de main garde
+`installer-serveur.sh` rejouable depuis ce clone. Un commit plus ancien
+(avant L135) fait disparaître ces fichiers du clone ; les copies installées
+(gabarit systemd, script de sauvegarde) restent alors en place.
 
 ### Retour arrière
 

@@ -18,3 +18,5 @@ chatbot/dist/
 deploy/serveur/terraform/.terraform/
 deploy/serveur/terraform/*.tfstate*
 deploy/serveur/terraform/*.tfvars
+# plan enregistré : il embarque l'état (identifiants d'organisation, clés SSH)
+deploy/serveur/terraform/*.plan
