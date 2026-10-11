@@ -30,6 +30,12 @@
 # Les modules de test touchés par les fichiers changés (--depuis HEAD^1 : la
 # cible pour une PR, le commit précédent sur main) passent en premier dans
 # chaque part. Rien n'est sauté ; le découpage en parts ne change pas.
+#
+# L161c — pendant la part, `ci-flux.py publier` (arrière-plan) tient le check
+# run « tests (flux) <part> » de la tête poussée : chaque échec y entre dès
+# qu'il est écrit. `ameesh notify` le relève et l'envoie aussitôt à l'agent du
+# lot (ameesh.ci). D'où `checks: write` sur les parts ; sans ce droit (PR d'une
+# fourche), rien n'est publié et la part n'en est pas affectée.
 name: tests
 
 on:
@@ -106,8 +112,12 @@ jobs:
           --tmpfs /var/lib/postgresql/data
           --health-cmd "pg_isready -U ameesh"
           --health-interval 2s --health-timeout 5s --health-retries 30
+    permissions:
+      contents: read
+      checks: write  # L161c : check run « tests (flux) »
     env:
       AMEESH_DRIVER: psycopg
+      FLUX_NOM: tests (flux) psycopg ${{ matrix.part }}/4
     steps:
       - uses: actions/checkout@v4
         with:
@@ -142,10 +152,25 @@ jobs:
           git config --global user.name "ameesh ci"
           git config --global user.email "ci@ameesh.invalid"
           git config --global init.defaultBranch main
+      - &publier
+        name: publication du flux en direct (check run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          nohup python3 scripts/ci-flux.py publier "$RUNNER_TEMP/flux.jsonl" --nom "$FLUX_NOM"
+          > "$RUNNER_TEMP/publier.log" 2>&1 &
       - name: part ${{ matrix.part }}/4
         run: >-
           .venv-ci/bin/python scripts/test-parts.py lancer --parts 4 --part ${{ matrix.part }}
           --pilote psycopg --depuis HEAD^1 --flux "$RUNNER_TEMP/flux.jsonl"
+      - &fermer
+        name: fin du check run du flux
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci-flux.py fermer "$RUNNER_TEMP/flux.jsonl" --nom "$FLUX_NOM"
+          cat "$RUNNER_TEMP/publier.log" 2>/dev/null || true
       - &resume
         name: résumé du flux
         if: always()
@@ -181,9 +206,13 @@ jobs:
           --tmpfs /var/lib/postgresql/data
           --health-cmd "pg_isready -U ameesh"
           --health-interval 2s --health-timeout 5s --health-retries 30
+    permissions:
+      contents: read
+      checks: write  # L161c
     env:
       AMEESH_DRIVER: psql
       PARTS: ${{ github.event_name == 'pull_request' && 1 || 6 }}
+      FLUX_NOM: tests (flux) psql ${{ matrix.part }}/${{ github.event_name == 'pull_request' && 1 || 6 }}
       # sur une PR : les modules « pilote » seulement
       LISTE: ${{ github.event_name == 'pull_request' && 'tests/parts/pilote-psql.txt' || '' }}
     steps:
@@ -195,10 +224,12 @@ jobs:
           python-version: "3.12"
       - *base
       - *git
+      - *publier
       - name: part ${{ matrix.part }}
         run: >-
           python scripts/test-parts.py lancer --parts "$PARTS" --part ${{ matrix.part }}
           --pilote psql ${LISTE:+--liste "$LISTE"} --depuis HEAD^1 --flux "$RUNNER_TEMP/flux.jsonl"
+      - *fermer
       - *resume
       - name: flux en artefact
         if: always()

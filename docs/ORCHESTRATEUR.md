@@ -230,6 +230,12 @@ ferme l'issue avec un commentaire qui dit pourquoi. L'issue d'un lot est son
 
   `ameesh-work` relie la PR au lot. `Closes` ferme l'issue à la fusion, et
   relie aussi la PR au lot par son issue (`ameesh work sync-github`).
+* Après une poussée, ne pas attendre la CI dans le tour (ni
+  `gh pr checks --watch`, ni `gh run watch`) : ameesh envoie à l'assigné du
+  lot chaque test en échec dès qu'il apparaît (urgent au premier), puis le
+  verdict, et retire ce qui n'a pas été lu si une nouvelle poussée arrive
+  (L161c). `ameesh ci status <lot>` montre l'état ; voir EXPLOITATION.md,
+  « Échecs de CI au courrier de l'agent du lot ».
 * Un dépôt public ne reçoit que le titre du lot et sa ligne
   « Résumé public : … », si le corps en a une. Le reste du corps n'est jamais
   publié. Un titre qui contient un chemin local, un nom d'hôte, une adresse,

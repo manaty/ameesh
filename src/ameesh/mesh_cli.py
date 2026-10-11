@@ -33,6 +33,7 @@
   agent-mesh hosts [--json] [HÔTE] [--history N]         ressources des hôtes (L31)
   agent-mesh menage [--dry-run | --apply] [--json]       ménage des agents (L73)
   agent-mesh conflicts [--project P] [--all] [--json]   radar de conflits entre lots (L160b)
+  agent-mesh ci status <lot> [--limit N] [--json]       CI relevée en direct, échecs (L161c)
   agent-mesh agent spawn <nom> --by <créateur> --ttl 2h   agent éphémère (R14)
 
 L'autorité du propriétaire ne se déduit jamais d'un texte : elle se prouve par
@@ -421,6 +422,12 @@ def cmd_conflicts(cfg: Config, args: argparse.Namespace) -> int:
     """`ameesh conflicts` (L160b) : voir `ameesh.radar.cmd_conflicts`."""
     from . import radar
     return radar.cmd_conflicts(cfg, args)
+
+
+def cmd_ci(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh ci status` (L161c) : voir `ameesh.ci.cmd_ci`."""
+    from . import ci
+    return ci.cmd_ci(cfg, args)
 
 
 def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
@@ -1580,6 +1587,16 @@ def build_parser() -> argparse.ArgumentParser:
                              help="aussi les paires qui se recouvrent sans conflit")
     p_conflicts.add_argument("--json", action="store_true", help="rapport `ameesh-radar/1`")
     p_conflicts.set_defaults(func=cmd_conflicts)
+
+    p_ci = sub.add_parser("ci", help="CI relevée en direct par ameesh notify (L161c)")
+    ci_sub = p_ci.add_subparsers(dest="ci_command", required=True)
+    p_ci_status = ci_sub.add_parser(
+        "status", help="dernières exécutions de CI d'un lot et leurs tests en échec")
+    p_ci_status.add_argument("id", type=int, help="numéro du lot")
+    p_ci_status.add_argument("--limit", type=int, default=5,
+                             help="exécutions montrées au plus (défaut 5)")
+    p_ci_status.add_argument("--json", action="store_true", help="rapport `ameesh-ci-status/1`")
+    p_ci_status.set_defaults(func=cmd_ci)
 
     p_models = sub.add_parser("models", help="catalogue des modèles (L14)")
     models_sub = p_models.add_subparsers(dest="models_command")

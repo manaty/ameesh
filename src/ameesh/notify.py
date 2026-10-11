@@ -13,7 +13,9 @@
         (`ameesh.backlog.auto_take`) ; `--take-idle 0` la coupe.
         L126 : sur l'hôte que désigne la clé `github` de la configuration,
         chaque passage tient aussi les issues GitHub des lots
-        (`ameesh.plan_github.Projector`).
+        (`ameesh.plan_github.Projector`) et relève la CI en cours : chaque
+        test en échec part au courrier de l'agent du lot (L161c,
+        `ameesh.ci.Watcher`).
   ameesh notify --test human:<id> [--json]
         envoie un message de test sur chacun des canaux de cet humain.
 
@@ -77,7 +79,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "host_not_ready", "host_power_low", "backlog_empty", "mail_undeliverable",
                  # L124 : une demande de décision attend le propriétaire, et sa
                  # relance à l'échéance (urgentes si la demande l'est)
-                 "decision_pending", "decision_overdue")
+                 "decision_pending", "decision_overdue",
+                 # L161c : la CI de main est rouge (elle bloque les déploiements)
+                 "ci_main_red")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -129,10 +133,11 @@ TYPE_LABELS = {
     # L125 : mesure de l'effet du regroupement du courrier ; pas poussée par
     # défaut (à ajouter dans `notify.types` pour la recevoir)
     "turn_churn": "tours courts en rafale",
+    "ci_main_red": "CI rouge sur main",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
-                "mail_undeliverable")
+                "mail_undeliverable", "ci_main_red")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.
@@ -876,6 +881,8 @@ class Notifier:
         self.clock = clock or time.time
         #: L126 : projection des lots en issues GitHub (créée au premier passage)
         self._projector = None
+        #: L161c : relevé de la CI, échecs au courrier de l'agent du lot
+        self._ci_watcher = None
 
     # -- passage --------------------------------------------------------------
     def run_pass(self, db, current: list | None = None, thresholds: dict | None = None,
@@ -922,6 +929,7 @@ class Notifier:
         if self.take:
             self._auto_take(db, current, now)
         self._github_issues(db, now)
+        self._ci_failures(db)
         for human in list(self.state["rate"]):
             window = [t for t in self.state["rate"][human] if now - t < RATE_WINDOW_S]
             if window:
@@ -946,6 +954,22 @@ class Notifier:
             self._projector.tick(db, now)
         except Exception as exc:  # noqa: BLE001 - jamais fatal au passage des alertes
             self.log("issues GitHub : passage en échec (%s)" % _clean(exc, 200))
+
+    # -- échecs de CI au courrier de l'agent du lot (L161c) ----------------------
+    def _ci_failures(self, db) -> None:
+        """Le relevé de la CI (`ci.Watcher`), sur le même hôte désigné que les
+        issues (`github.host`). Une erreur est journalisée, jamais fatale."""
+        if not getattr(self.cfg, "github", None):
+            return
+        from . import ci
+        try:
+            if self._ci_watcher is None:
+                self._ci_watcher = ci.Watcher(self.cfg, dry_run=self.dry_run, log=self.log,
+                                              clock=self.clock)
+            for record in self._ci_watcher.tick(db):
+                self.log(ci.describe(record))
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au passage des alertes
+            self.log("CI : relevé en échec (%s)" % _clean(exc, 200))
 
     # -- prise automatique (L119, décision 0037) ------------------------------
     def _auto_take(self, db, current: list, now: float) -> None:

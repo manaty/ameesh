@@ -622,6 +622,12 @@ class Mailbox(Domain):
         """Marque remis ; rend le nombre de messages passés remis."""
 
     @abc.abstractmethod
+    def withdraw(self, ids: Sequence[int], note: dict) -> list[int]:
+        """L161c : retire des messages NON REMIS et sans réservation active
+        (marqués remis sans être montrés, `note` dans `meta.retire`) ; rend
+        les ids retirés. Un message déjà remis ou en cours de remise reste."""
+
+    @abc.abstractmethod
     def reserve(self, recipient: str, owner: str | None, epoch: int | None,
                 token: str, *, ids: Sequence[int] | None = None, porteur: str,
                 ttl_seconds: float, limit: int = 200) -> list[dict]:
@@ -2154,6 +2160,73 @@ class SessionBindings(Domain):
 
 
 # --------------------------------------------------------------------------
+# résultats de CI relevés en direct (`ci_runs`, `ci_test_failures`, L161c)
+# --------------------------------------------------------------------------
+
+class CiResults(Domain):
+    """Exécutions de CI suivies et leurs tests en échec (jamais les réussites)."""
+
+    @abc.abstractmethod
+    def run(self, repo: str, run_id: int) -> dict | None:
+        """L'exécution suivie, ou None."""
+
+    @abc.abstractmethod
+    def open_run(self, repo: str, run_id: int, *, head_sha: str, branch: str, event: str,
+                 base: str, work_item_id: int | None, url: str | None) -> dict:
+        """Enregistre l'exécution (`running`) si elle est nouvelle ; la rend."""
+
+    @abc.abstractmethod
+    def running(self, repo: str) -> list[dict]:
+        """Les exécutions encore `running` du dépôt."""
+
+    @abc.abstractmethod
+    def conclude(self, repo: str, run_id: int, status: str) -> bool:
+        """`running` → `status` ; False si elle était déjà conclue."""
+
+    @abc.abstractmethod
+    def supersede(self, repo: str, branch: str, head_sha: str) -> list[dict]:
+        """Les exécutions `running` de la branche sur une autre tête passent
+        `superseded` ; rend celles qui ont changé."""
+
+    @abc.abstractmethod
+    def set_message(self, repo: str, run_id: int, which: str, message_id: int) -> None:
+        """Note le message `urgent` ou `verdict` envoyé pour l'exécution."""
+
+    @abc.abstractmethod
+    def failures(self, repo: str, run_id: int) -> list[dict]:
+        """Les tests en échec de l'exécution, dans l'ordre où ils ont échoué."""
+
+    @abc.abstractmethod
+    def add_failure(self, repo: str, run_id: int, *, part: str, test: str, module: str,
+                    status: str, inherited: bool, excerpt: str, replay: str,
+                    duration_s: float | None, failed_at: str | None) -> bool:
+        """Enregistre un échec ; False s'il l'était déjà (même part, même test)."""
+
+    @abc.abstractmethod
+    def set_failure_message(self, repo: str, run_id: int, tests: Sequence[tuple],
+                            message_id: int) -> None:
+        """Note le message qui a signalé ces échecs (`(part, test)`)."""
+
+    @abc.abstractmethod
+    def base_failures(self, repo: str, branch: str) -> dict:
+        """Dernière exécution conclue (verte ou rouge) de `branch` :
+        `{run_id, head_sha, tests}` (tests en échec), ou {} sans exécution."""
+
+    @abc.abstractmethod
+    def message_ids(self, repo: str, run_ids: Sequence[int]) -> list[int]:
+        """Les messages envoyés pour ces exécutions (urgent et échecs)."""
+
+    @abc.abstractmethod
+    def for_lot(self, work_item_id: int, limit: int) -> list[dict]:
+        """Les exécutions d'un lot, de la plus récente à la plus ancienne."""
+
+    @abc.abstractmethod
+    def latest_concluded(self, branches: Sequence[str]) -> list[dict]:
+        """Par dépôt et par branche parmi `branches`, la dernière exécution
+        conclue verte ou rouge."""
+
+
+# --------------------------------------------------------------------------
 # le stockage d'une connexion
 # --------------------------------------------------------------------------
 
@@ -2198,3 +2271,4 @@ class Storage(abc.ABC):
     visibility: Visibility
     housekeeping: Housekeeping
     session_bindings: SessionBindings
+    ci: CiResults

@@ -156,6 +156,24 @@ class Mailbox(interface.Mailbox):
         )
         return len(rows)
 
+    def withdraw(self, ids, note) -> list[int]:
+        clean = sorted({int(i) for i in ids})
+        if not clean:
+            return []
+        rows = self.db.query(
+            """
+            UPDATE agent_mailbox AS m
+               SET delivered_at = now(), status = 'delivered',
+                   meta = m.meta || jsonb_build_object('retire', %%s::jsonb)
+             WHERE m.delivered_at IS NULL AND m.id IN (%s)
+               AND NOT (m.meta->'consigne' IS NOT NULL
+                        AND coalesce((m.meta->'consigne'->>'expire')::float8, 0)
+                            > extract(epoch from clock_timestamp()))
+            RETURNING m.id
+            """ % ", ".join(str(i) for i in clean),
+            (json.dumps(note, ensure_ascii=False),))
+        return sorted(int(row["id"]) for row in rows)
+
     # -- réservation : un seul protocole pour l'exécuteur et le hook ----------
     #
     # Toute remise passe par : réserver (jeton unique) → montrer → solder la
