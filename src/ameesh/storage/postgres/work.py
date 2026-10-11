@@ -881,6 +881,93 @@ class WorkItems(interface.WorkItems):
             "  FROM estimate_references ORDER BY id DESC LIMIT 1")
         return rows[0] if rows else None
 
+    # -- actual time by phase and merged diff size (L157c) ------------------------
+    def measure_candidates(self, *, ids, retry_diff_s, since_s, limit) -> list[dict]:
+        sql = (
+            "SELECT w.id, w.state, w.assignee, w.branch, w.branch_target, w.change_size,"
+            "       extract(epoch from w.started_at)::float8 AS started_ts,"
+            "       extract(epoch from fus.at)::float8 AS merged_ts, fus.sha AS merge_sha,"
+            "       (m.work_item_id IS NOT NULL) AS measured,"
+            "       (m.diff_files IS NOT NULL) AS has_diff,"
+            "       (m.ci_minutes IS NOT NULL) AS has_ci"
+            "  FROM work_items w"
+            "  JOIN LATERAL (SELECT x.at, x.sha FROM work_item_milestones x"
+            "                 WHERE x.work_item_id = w.id AND x.kind = 'merged'"
+            "                 ORDER BY x.at, x.id LIMIT 1) fus ON true"
+            "  LEFT JOIN work_item_measures m ON m.work_item_id = w.id"
+            " WHERE w.started_at IS NOT NULL AND w.state <> 'closed'")
+        params: list = []
+        if ids is not None:
+            ids = [int(i) for i in ids]
+            if not ids:
+                return []
+            sql += " AND w.id IN (%s)" % ", ".join(["%s"] * len(ids))
+            params += ids
+        else:
+            # measured without a diff, or without CI though the lot has a
+            # branch: retried while recent
+            sql += (" AND (m.work_item_id IS NULL OR ((m.diff_files IS NULL"
+                    "      OR (m.ci_minutes IS NULL AND w.branch IS NOT NULL))"
+                    "      AND fus.at > now() - make_interval(secs => %s)))")
+            params.append(float(retry_diff_s))
+            if since_s is not None:
+                sql += " AND fus.at > now() - make_interval(secs => %s)"
+                params.append(float(since_s))
+        sql += " ORDER BY fus.at DESC, w.id DESC LIMIT %s"
+        params.append(int(limit))
+        return self.db.query(sql, tuple(params))
+
+    _MEASURE_COLUMNS = (
+        "work_item_id, extract(epoch from measured_at)::float8 AS measured_ts,"
+        " extract(epoch from started_at)::float8 AS started_ts,"
+        " extract(epoch from merged_at)::float8 AS merged_ts,"
+        " total_minutes::float8 AS total_minutes, agent_minutes::float8 AS agent_minutes,"
+        " ci_minutes::float8 AS ci_minutes, review_minutes::float8 AS review_minutes,"
+        " human_minutes::float8 AS human_minutes, ci_runs, merge_sha, diff_files,"
+        " diff_insertions, diff_deletions, measured_size, declared_size")
+
+    def save_measure(self, item_id, measure) -> dict:
+        m = measure
+        rows = self.db.query(
+            "INSERT INTO work_item_measures (work_item_id, started_at, merged_at,"
+            "  total_minutes, agent_minutes, ci_minutes, review_minutes, human_minutes,"
+            "  ci_runs, merge_sha, diff_files, diff_insertions, diff_deletions,"
+            "  measured_size, declared_size)"
+            " VALUES (%s, to_timestamp(%s), to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s,"
+            "         %s, %s, %s, %s, %s)"
+            " ON CONFLICT (work_item_id) DO UPDATE SET measured_at = now(),"
+            "  started_at = excluded.started_at, merged_at = excluded.merged_at,"
+            + ", ".join(
+                # a measure whose CI could not be read never replaces phases
+                # measured with a known CI
+                "  %s = CASE WHEN excluded.ci_minutes IS NULL"
+                " AND work_item_measures.ci_minutes IS NOT NULL"
+                " THEN work_item_measures.%s ELSE excluded.%s END" % (c, c, c)
+                for c in ("total_minutes", "agent_minutes", "ci_minutes", "review_minutes",
+                          "human_minutes", "ci_runs")) + ","
+            "  merge_sha = coalesce(excluded.merge_sha, work_item_measures.merge_sha),"
+            "  diff_files = coalesce(excluded.diff_files, work_item_measures.diff_files),"
+            "  diff_insertions = coalesce(excluded.diff_insertions,"
+            "                             work_item_measures.diff_insertions),"
+            "  diff_deletions = coalesce(excluded.diff_deletions,"
+            "                            work_item_measures.diff_deletions),"
+            "  measured_size = coalesce(excluded.measured_size,"
+            "                           work_item_measures.measured_size),"
+            "  declared_size = excluded.declared_size"
+            " RETURNING " + self._MEASURE_COLUMNS,
+            (int(item_id), float(m["started_ts"]), float(m["merged_ts"]),
+             m["total_minutes"], m["agent_minutes"], m.get("ci_minutes"),
+             m["review_minutes"], m["human_minutes"], m.get("ci_runs"), m.get("merge_sha"),
+             m.get("diff_files"), m.get("diff_insertions"), m.get("diff_deletions"),
+             m.get("measured_size"), m.get("declared_size")))
+        return rows[0]
+
+    def measure(self, item_id) -> dict | None:
+        rows = self.db.query(
+            "SELECT " + self._MEASURE_COLUMNS + " FROM work_item_measures"
+            " WHERE work_item_id = %s", (int(item_id),))
+        return rows[0] if rows else None
+
     def _event(self, item_id, state, note, actor) -> None:
         self.db.execute(
             "INSERT INTO work_item_events (work_item_id, state, note, actor) "

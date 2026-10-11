@@ -64,6 +64,7 @@
 --       work_item_events.note
 --       work_item_milestones.note
 --       mesh_approvals.meta (et mesh_approvals_status)
+--       ci_test_failures.excerpt (sortie d'un test en échec, L161c)
 --
 -- Restent lisibles, comme ÉTAT : titres de lots (work_items.title), valeur
 -- attendue des éléments de la file d'amélioration (work_items.expected_value,
@@ -329,6 +330,18 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L63 (0048) : heure de démarrage du PID lié, secondes epoch
         'pid_started_at'
     ]),
+    -- L161c (0055) : exécutions de CI relevées et leurs tests en échec (de
+    -- l'ÉTAT : noms de tests, commandes pour rejouer ; l'extrait de sortie
+    -- est un CONTENU)
+    ('ci_runs', ARRAY[
+        'repo', 'run_id', 'head_sha', 'branch', 'event', 'base', 'work_item_id',
+        'status', 'superseded_by', 'url', 'first_seen_at', 'concluded_at',
+        'urgent_message_id', 'verdict_message_id'
+    ]),
+    ('ci_test_failures', ARRAY[
+        'repo', 'run_id', 'part', 'test', 'module', 'status', 'inherited', 'replay',
+        'duration_s', 'failed_at', 'message_id', 'recorded_at'
+    ]),
     ('work_item_events', ARRAY[
         'id', 'work_item_id', 'state', 'actor', 'created_at'
     ]),
@@ -375,6 +388,14 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('work_resolutions', ARRAY[
         'work_item_id', 'other_item_id', 'commit_sha', 'lot_tip', 'other_tip', 'ref',
         'files', 'created_by', 'created_at'
+    ]),
+    -- L157c (0056): actual time of a delivered lot by phase and size of its
+    -- merged diff (durations and line counts: STATE)
+    ('work_item_measures', ARRAY[
+        'work_item_id', 'measured_at', 'started_at', 'merged_at', 'total_minutes',
+        'agent_minutes', 'ci_minutes', 'review_minutes', 'human_minutes', 'ci_runs',
+        'merge_sha', 'diff_files', 'diff_insertions', 'diff_deletions',
+        'measured_size', 'declared_size'
     ]),
     -- L40 (0031) : registre des délégations et de leur issue (de l'ÉTAT)
     ('work_item_delegations', ARRAY[

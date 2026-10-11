@@ -34,6 +34,7 @@
   agent-mesh hosts [--json] [HÔTE] [--history N]         ressources des hôtes (L31)
   agent-mesh menage [--dry-run | --apply] [--json]       ménage des agents (L73)
   agent-mesh conflicts [--project P] [--all] [--json]   radar de conflits entre lots (L160b)
+  agent-mesh ci status <lot> [--limit N] [--json]       CI relevée en direct, échecs (L161c)
   agent-mesh agent spawn <nom> --by <créateur> --ttl 2h   agent éphémère (R14)
 
 L'autorité du propriétaire ne se déduit jamais d'un texte : elle se prouve par
@@ -422,6 +423,12 @@ def cmd_conflicts(cfg: Config, args: argparse.Namespace) -> int:
     """`ameesh conflicts` (L160b) : voir `ameesh.radar.cmd_conflicts`."""
     from . import radar
     return radar.cmd_conflicts(cfg, args)
+
+
+def cmd_ci(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh ci status` (L161c) : voir `ameesh.ci.cmd_ci`."""
+    from . import ci
+    return ci.cmd_ci(cfg, args)
 
 
 def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
@@ -846,6 +853,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             ref = estimates.proposal(db, type=item.get("type"), size=item.get("change_size"),
                                      assignee=item.get("assignee"))
             print("référence : %s" % estimates.proposal_label(ref))
+            # L157c: planned dates at the p80, in the assignee's queue ordered
+            # at the median (only with a published reference table)
+            from . import lot_schedule
+            scheduled = lot_schedule.schedule_new(db, item, actor=args.actor)
+            if scheduled:
+                print("planned  : %s → %s (%s)" % (
+                    scheduled["planned_start"], scheduled["planned_end"], scheduled["source"]))
             if warn_estimate:
                 print("avertissement : %s" % estimates.missing(item["id"]), file=sys.stderr)
             _print_assignment(check)
@@ -969,6 +983,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # L160d : résolutions préparées où le lot est l'un des deux côtés
             from . import resolutions
             item["resolutions"] = resolutions.of_lot(db, args.id)
+            # L157c: actual time by phase and merged diff size, once delivered
+            from . import lot_measures
+            item["measure"] = lot_measures.view(storage.of(db).work.measure(args.id))
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
@@ -1002,6 +1019,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 estimates.proposal_label(item["estimate_reference"]),
                 " — taille %s" % estimates.SIZE_LABELS.get(item["change_size"])
                 if item.get("change_size") else ""))
+            if item["measure"]:
+                print("phases   : %s" % lot_measures.describe_phases(item["measure"]))
+                print("size     : %s" % lot_measures.describe_size(item["measure"]))
             if len(item["estimates"]) > 1:
                 print("estimé   : %s" % " → ".join(
                     "%s (%s)" % (estimates.label(e["minutes"]), e.get("estimated_by") or "?")
@@ -1601,6 +1621,16 @@ def build_parser() -> argparse.ArgumentParser:
                              help="aussi les paires qui se recouvrent sans conflit")
     p_conflicts.add_argument("--json", action="store_true", help="rapport `ameesh-radar/1`")
     p_conflicts.set_defaults(func=cmd_conflicts)
+
+    p_ci = sub.add_parser("ci", help="CI relevée en direct par ameesh notify (L161c)")
+    ci_sub = p_ci.add_subparsers(dest="ci_command", required=True)
+    p_ci_status = ci_sub.add_parser(
+        "status", help="dernières exécutions de CI d'un lot et leurs tests en échec")
+    p_ci_status.add_argument("id", type=int, help="numéro du lot")
+    p_ci_status.add_argument("--limit", type=int, default=5,
+                             help="exécutions montrées au plus (défaut 5)")
+    p_ci_status.add_argument("--json", action="store_true", help="rapport `ameesh-ci-status/1`")
+    p_ci_status.set_defaults(func=cmd_ci)
 
     p_models = sub.add_parser("models", help="catalogue des modèles (L14)")
     models_sub = p_models.add_subparsers(dest="models_command")

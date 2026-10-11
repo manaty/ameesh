@@ -62,13 +62,15 @@ _RESERVED_SQL = """
 """
 
 #: L125 : un message PASSIF — accusé, copie, diffusion à tous, conflit signalé
-#: par le radar (L160c), jamais urgent —
+#: par le radar (L160c), échec de CI sans référence de la base (L161c),
+#: jamais urgent —
 #: n'ouvre pas de tour à lui seul (même règle que `mail.passive_reason`).
 #: `{t}` : l'alias de la table `agent_mailbox` (`PASSIVE_SQL.format(t="mb")`).
 PASSIVE_SQL = (
     "(NOT {t}.payload @> '{{\"urgent\": true}}'::jsonb"
     " AND ({t}.payload @> '{{\"ack\": true}}'::jsonb"
     " OR {t}.payload @> '{{\"broadcast\": true}}'::jsonb"
+    " OR {t}.payload @> '{{\"ci_passif\": true}}'::jsonb"
     " OR coalesce({t}.payload->>'cc', '') <> ''"
     " OR coalesce(jsonb_typeof({t}.payload->'radar'), '') = 'object'))")
 
@@ -155,6 +157,25 @@ class Mailbox(interface.Mailbox):
             """ % ", ".join(str(i) for i in clean)
         )
         return len(rows)
+
+    def withdraw(self, ids, note) -> list[int]:
+        clean = sorted({int(i) for i in ids})
+        if not clean:
+            return []
+        rows = self.db.query(
+            """
+            UPDATE agent_mailbox AS m
+               SET delivered_at = now(), status = 'delivered',
+                   meta = m.meta || jsonb_build_object('retire', %%s::jsonb)
+             WHERE m.delivered_at IS NULL AND m.id IN (%s)
+               AND m.sender = 'ameesh' AND m.payload ? 'ci'
+               AND NOT (m.meta->'consigne' IS NOT NULL
+                        AND coalesce((m.meta->'consigne'->>'expire')::float8, 0)
+                            > extract(epoch from clock_timestamp()))
+            RETURNING m.id
+            """ % ", ".join(str(i) for i in clean),
+            (json.dumps(note, ensure_ascii=False),))
+        return sorted(int(row["id"]) for row in rows)
 
     # -- réservation : un seul protocole pour l'exécuteur et le hook ----------
     #

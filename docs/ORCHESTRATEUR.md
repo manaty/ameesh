@@ -166,6 +166,19 @@ un avertissement.
 * **La consigne d'un lot** demande, dans le message de fin, la durée réelle
   et, si elle s'écarte de l'estimation, la phase qui l'explique (agent, CI,
   relecture, humain).
+* **Planned dates at the p80, order at the median** (L157c). `ameesh work
+  schedule` shows, for each agent, its queue of open lots with their
+  planned dates: lots chained at the median of their reference group (or
+  of their estimate), each dated at its p80; `--apply` writes them, keeping
+  the dates you set yourself (`--force` to overwrite). `ameesh work add
+  --assignee` dates the new lot this way when a reference table is
+  published. Declaring the size and the assignee makes the dates closer.
+* **The actual time is measured by phase** (L157c). After the merge, the
+  runner stores the time spent in each phase (agent, CI, review, human) and
+  the size of the merged diff against the declared size: `ameesh work show
+  <id>` (lines « phases » and « size »). Compare them with your estimate by
+  phase; a declared size that keeps differing from the measured one is a
+  sign to declare differently.
 * L'estimation comparée au réel est celle **en vigueur au début** du travail :
   ré-estimer en cours de route est permis et tracé, mais ne corrige pas
   l'écart. L'auditeur interne audite ces écarts et ajuste le processus
@@ -283,6 +296,12 @@ ferme l'issue avec un commentaire qui dit pourquoi. L'issue d'un lot est son
 
   `ameesh-work` relie la PR au lot. `Closes` ferme l'issue à la fusion, et
   relie aussi la PR au lot par son issue (`ameesh work sync-github`).
+* Après une poussée, ne pas attendre la CI dans le tour (ni
+  `gh pr checks --watch`, ni `gh run watch`) : ameesh envoie à l'assigné du
+  lot chaque test en échec dès qu'il apparaît (urgent au premier), puis le
+  verdict, et retire ce qui n'a pas été lu si une nouvelle poussée arrive
+  (L161c). `ameesh ci status <lot>` montre l'état ; voir EXPLOITATION.md,
+  « Échecs de CI au courrier de l'agent du lot ».
 * Un dépôt public ne reçoit que le titre du lot et sa ligne
   « Résumé public : … », si le corps en a une. Le reste du corps n'est jamais
   publié. Un titre qui contient un chemin local, un nom d'hôte, une adresse,
