@@ -51,6 +51,14 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   Les listes centrales (`tests/parts/pilote-psql.txt`…) ont une entrée par
   ligne, rangée par ordre alphabétique, sa raison en commentaire sur la même
   ligne ; `scripts/test-parts.py` refuse une liste mal rangée.
+- **Migrations** (L122) : un numéro de migration se réserve avant d'écrire
+  le fichier, avec `ameesh work migration <lot>` (après un `git fetch`) ; le
+  fichier s'appelle `src/ameesh/migrations/<numéro réservé>_<nom>.sql`. Une
+  contribution sans lot prend le numéro suivant le plus haut de `main` et de
+  toutes les PR ouvertes. Deux migrations de même numéro font échouer la
+  suite unitaire (`tests/test_l122_numeros_de_migration.py`) : la dernière
+  venue se renumérote. Une migration ne fait qu'ajouter, sauf version majeure
+  (voir ci-dessous).
 - **En-tête de licence** `SPDX-License-Identifier: AGPL-3.0-only` en tête des
   nouveaux fichiers source.
 

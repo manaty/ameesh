@@ -20,6 +20,7 @@
   agent-mesh work list [--state S] | work show <id> | work move <id> <état> | work note <id> "…"
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   réassigner (attribution gardée)
   agent-mesh work merged <id> --sha S [--note …]   fusion faite hors PR : tout état ouvert → merged
+  agent-mesh work migration <id> [--number N | --release]   réserver le numéro de migration du lot (L122)
   agent-mesh work move <id> merged --correct "raison"   corriger un promoted posé par erreur
                                                 (l'acteur des commandes work : --actor, sinon
                                                 l'identité liée de la session, sinon « inconnu »)
@@ -996,6 +997,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     item["branch"], item.get("branch_target") or "cible par défaut du dépôt",
                     " (dernier commit vu en avance : %s)" % item["branch_head"][:12]
                     if item.get("branch_head") else ""))
+            if item.get("migration"):
+                print("migration: %04d réservée (L122)" % item["migration"])
             if item.get("waiting_for"):
                 print("attend   : %s" % item["waiting_for"]["label"])
             if item.get("delegation"):
@@ -1018,6 +1021,19 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("  %s  %-14s %-12s %s" % (
                     _fmt_moment(event.get("created_ts")), event["state"],
                     (event.get("actor") or "—")[:12], event["note"]))
+            return 0
+        if args.work_command == "migration":
+            # L122 : numéro de migration réservé au lot, avant d'écrire le fichier
+            item = work.reserve_migration(db, args.id, args.number, release=args.release,
+                                          repo=args.repo, actor=args.actor)
+            if args.json:
+                print(json.dumps(item, ensure_ascii=False, indent=2))
+            elif item.get("migration") is None:
+                print("lot #%d : aucune migration réservée" % item["id"])
+            else:
+                print("lot #%d : migration %04d réservée — fichier "
+                      "src/ameesh/migrations/%04d_<nom>.sql" % (
+                          item["id"], item["migration"], item["migration"]))
             return 0
         if args.work_command == "move":
             item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor,
@@ -1682,6 +1698,22 @@ def build_parser() -> argparse.ArgumentParser:
     pw_show.add_argument("id", type=int)
     pw_show.add_argument("--json", action="store_true")
     pw_show.set_defaults(func=cmd_work)
+    pw_mig = work_sub.add_parser(
+        "migration", help="réserver au lot le prochain numéro de migration libre (L122), "
+                          "avant d'écrire le fichier ; idempotent, visible dans work show")
+    pw_mig.add_argument("id", type=int)
+    pw_mig.add_argument("--number", type=int, default=None,
+                        help="réserver ce numéro précis (refusé s'il est réservé par un "
+                             "autre lot)")
+    pw_mig.add_argument("--release", action="store_true",
+                        help="libérer la réservation (le lot n'ajoute plus de migration)")
+    pw_mig.add_argument("--repo", default=None,
+                        help="dépôt ameesh dont les branches comptent (défaut : le dépôt "
+                             "git courant)")
+    pw_mig.add_argument("--json", action="store_true")
+    pw_mig.add_argument("--actor", default="",
+                        help="défaut : l'identité liée de la session (AGENT_MAIL_NAME)")
+    pw_mig.set_defaults(func=cmd_work)
     pw_move = work_sub.add_parser("move")
     pw_move.add_argument("id", type=int)
     pw_move.add_argument("state", choices=list(work.STATES))

@@ -355,7 +355,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- instant) et début mesuré du travail — de l'ÉTAT, comme les dates
         -- prévues
         'estimate_minutes', 'estimate_source', 'estimate_by', 'estimate_at',
-        'started_at'
+        'started_at',
+        -- L122 (0053) : numéro de migration réservé par le lot
+        'migration'
     ]),
     -- L157 (0052) : historique des estimations d'un lot (de l'ÉTAT)
     ('work_item_estimates', ARRAY[
