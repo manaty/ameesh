@@ -168,7 +168,7 @@ LOT_ENDED = ("merged", "promoted", "closed")
 
 POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_alert",
                "redirect", "xdg_cache", "worktrees", "orphan_min_size",
-               "orphan_cleanup", "orphan_idle")
+               "orphan_cleanup", "orphan_idle", "deps", "deps_idle")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -193,6 +193,10 @@ class Policy:
     orphan_cleanup: bool = True
     #: L162 : inactivité (secondes) avant cette suppression
     orphan_idle: float = DEFAULT_ORPHAN_IDLE_S
+    #: #248: node_modules shared per lockfile (npm wrapper, links, GC)
+    deps: bool = True
+    #: #248: idle time (seconds) before an unreferenced entry is deleted
+    deps_idle: float = 3 * 24 * 3600.0
     #: provenance de chaque clé déclarée (identifiant du canon)
     origin: dict = field(default_factory=dict, compare=False)
 
@@ -241,13 +245,15 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`tmpfs_alert` : part attendue (0 < x <= 1, ou « 60% »)")
         else:
             parsed["tmpfs_alert"] = part
-    if raw.get("orphan_idle") is not None:
-        seconds = parse_idle(raw["orphan_idle"])
+    for key in ("orphan_idle", "deps_idle"):
+        if raw.get(key) is None:
+            continue
+        seconds = parse_idle(raw[key])
         if seconds is None:
-            problems.append("`orphan_idle` : durée attendue (ex. 2h, 90m, 7200)")
+            problems.append("`%s` : durée attendue (ex. 2h, 90m, 7200)" % key)
         else:
-            parsed["orphan_idle"] = seconds
-    for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup"):
+            parsed[key] = seconds
+    for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup", "deps"):
         if raw.get(key) is None:
             continue
         if not isinstance(raw[key], bool):
@@ -294,8 +300,9 @@ def effective(canons, host: str) -> Policy:
             elif key in ("tmp_quota", "cache_quota", "orphan_min_size", "tmpfs_alert") \
                     and value < values[key]:
                 values[key], origin[key] = value, label
-            elif (key == "orphan_idle" and value > values[key]) or \
-                    (key == "orphan_cleanup" and value is False and values[key] is not False):
+            elif (key in ("orphan_idle", "deps_idle") and value > values[key]) or \
+                    (key in ("orphan_cleanup", "deps") and value is False
+                     and values[key] is not False):
                 values[key], origin[key] = value, label
     return Policy(origin=origin, **values)
 
@@ -693,6 +700,13 @@ def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
         out.update(containers_mod.install_shims(
             os.path.join(cfg.state_dir, MANAGED_DIR, "bin"),
             base_env.get("PATH") or os.defpath))
+    if policy.deps:
+        # #248: `npm ci` links the node_modules shared per lockfile; no
+        # install in a review worktree
+        from . import deps as deps_mod
+        out.update(deps_mod.install_shim(
+            os.path.join(cfg.state_dir, MANAGED_DIR, deps_mod.SHIM_DIR),
+            out.get("PATH") or base_env.get("PATH") or os.defpath))
     return out
 
 
@@ -1472,6 +1486,17 @@ class Turn:
                 raise
         if policy.worktrees:
             turn.worktrees_before = {w["path"] for w in list_worktrees(cwd)}
+        if policy.deps and cwd and os.path.isdir(cwd):
+            # #248: packages of the agent's worktree without node_modules get
+            # the shared tree when it is already in the cache (never installs)
+            from . import deps as deps_mod
+            try:
+                for done in deps_mod.link_ready(cwd, cache_root(cfg, policy)):
+                    turn.entries.append({
+                        "kind": "deps", "action": "linked", "path": done["package"],
+                        "agent": agent, "detail": "node_modules -> %s" % done["target"]})
+            except Exception:
+                pass                       # never blocks a turn
         turn.tmp_before = tmp_names()
         return turn
 
@@ -1952,6 +1977,18 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                              result["files"])})
         if result["over_quota"]:
             skipped.append("caches : quota encore dépassé (fichiers de moins d'une heure)")
+    # 2b. #248: node_modules shared per lockfile, entries no worktree links to
+    if policy.deps and os.path.isdir(croot) and _managed(croot):
+        from . import deps as deps_mod
+        for line in deps_mod.gc_node_modules(croot, now=now, idle=policy.deps_idle,
+                                             dry_run=dry_run):
+            if line["action"] == "would-delete":
+                plan.append({"kind": "deps", "path": line["path"], "action": "suppression",
+                             "bytes": line["bytes"], "detail": line["detail"]})
+            elif line["action"] == "kept":
+                skipped.append("deps %s gardé : %s" % (line["path"], line["detail"]))
+            else:
+                entries.append(line)
     # 3. worktrees
     if policy.worktrees and registered is None:
         # sans registre, ni dossiers d'agents ni tours en cours connus

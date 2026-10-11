@@ -72,6 +72,13 @@ def has_psutil() -> bool:
     return psutil is not None
 
 
+def machine() -> str:
+    """The CPU architecture (`x86_64`, `arm64`…), "" if unknown (#248: native
+    node modules are built for it)."""
+    import platform as stdlib_platform
+    return stdlib_platform.machine() or ""
+
+
 from .process import (alive, ancestry, become_subreaper, boot_time,  # noqa: E402
                       command_line, environ, holders, open_fd_count, process_table,
                       reap, start_time, same_start, ticks_to_epoch)

@@ -1,0 +1,413 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""node_modules shared per lockfile (lot #248, L231): cache key, fill once
+under a lock, read-only entry, symlink, git exclude, local fallback, the npm
+wrapper of the turns (review worktrees refused), garbage collection, and the
+housekeeping wiring. Offline: fake installers and fake trees, no npm."""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import tempfile
+import time
+import unittest
+from unittest import mock
+
+from ameesh import deps, menage
+
+from . import support  # noqa: F401  (isolated environment, L142)
+
+LOCK = {"name": "app", "lockfileVersion": 3,
+        "packages": {"": {"name": "app", "dependencies": {"left-pad": "^1.0.0"}},
+                     "node_modules/left-pad": {"version": "1.3.0"}}}
+MANIFEST = {"name": "app", "dependencies": {"left-pad": "^1.0.0"},
+            "scripts": {"postinstall": "node scripts/patch.cjs", "test": "jest"}}
+
+
+def _package(top: str, name: str = "app", lock: dict | None = None,
+             manifest: dict | None = None) -> str:
+    pkg = os.path.join(top, name)
+    os.makedirs(os.path.join(pkg, "scripts"), exist_ok=True)
+    os.makedirs(os.path.join(pkg, "patches"), exist_ok=True)
+    os.makedirs(os.path.join(pkg, "src"), exist_ok=True)
+    with open(os.path.join(pkg, "package.json"), "w") as fh:
+        json.dump(manifest or MANIFEST, fh)
+    with open(os.path.join(pkg, deps.LOCKFILE), "w") as fh:
+        json.dump(lock or LOCK, fh)
+    for rel, text in (("scripts/patch.cjs", "// patch"), ("patches/x.patch", "--- a"),
+                      ("src/index.js", "module.exports = 1")):
+        with open(os.path.join(pkg, rel), "w") as fh:
+            fh.write(text)
+    return pkg
+
+
+class FakeInstaller:
+    """Writes a small node_modules (a package, a .bin symlink) where it runs,
+    and remembers where; fails in the directories listed in `fail_in`."""
+
+    def __init__(self, fail_in=()):
+        self.calls: list[str] = []
+        self.fail_in = tuple(fail_in)
+
+    def __call__(self, directory: str, env=None) -> None:
+        self.calls.append(directory)
+        if any(directory.startswith(f) for f in self.fail_in):
+            raise deps.FillError("npm ci failed (1): fake")
+        # what the lifecycle script needs was copied beside the lockfile
+        assert os.path.isfile(os.path.join(directory, "scripts", "patch.cjs"))
+        assert os.path.isfile(os.path.join(directory, "patches", "x.patch"))
+        modules = os.path.join(directory, deps.NODE_MODULES)
+        os.makedirs(os.path.join(modules, "left-pad", "lib"))
+        os.makedirs(os.path.join(modules, ".bin"))
+        with open(os.path.join(modules, "left-pad", "lib", "index.js"), "w") as fh:
+            fh.write("module.exports = s => s")
+        os.symlink("../left-pad/lib/index.js", os.path.join(modules, ".bin", "left-pad"))
+
+
+def _git(cwd: str, *args: str) -> str:
+    return subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True,
+                          check=True, env=dict(os.environ, GIT_AUTHOR_NAME="t",
+                                               GIT_AUTHOR_EMAIL="t@t",
+                                               GIT_COMMITTER_NAME="t",
+                                               GIT_COMMITTER_EMAIL="t@t")).stdout
+
+
+class _Base(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = self._tmp.name
+        self.cache = os.path.join(self.base, "cache")
+        os.makedirs(self.cache)
+        self.patches = [mock.patch.object(deps, "node_version", return_value="v26"),
+                        mock.patch.object(deps, "_say")]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self.patches:
+            patch.stop()
+        # entries are read-only: unseal before the temporary directory goes
+        deps._unseal(self.base)
+        self._tmp.cleanup()
+
+
+class CacheKeyTests(_Base):
+    def test_key_follows_what_decides_the_install(self):
+        pkg = _package(os.path.join(self.base, "w1"))
+        key = deps.cache_key(pkg)
+        self.assertEqual(key, deps.cache_key(_package(os.path.join(self.base, "w2"))))
+        self.assertEqual(deps.key_files(pkg), ["package-lock.json", "package.json",
+                                               "patches/x.patch", "scripts/patch.cjs"])
+        with open(os.path.join(pkg, "src", "index.js"), "w") as fh:
+            fh.write("changed")                     # source: same key
+        self.assertEqual(key, deps.cache_key(pkg))
+        with open(os.path.join(pkg, "scripts", "patch.cjs"), "w") as fh:
+            fh.write("// other patch")              # lifecycle script: new key
+        self.assertNotEqual(key, deps.cache_key(pkg))
+        other = _package(os.path.join(self.base, "w3"))
+        with open(os.path.join(other, "patches", "x.patch"), "w") as fh:
+            fh.write("--- b")
+        self.assertNotEqual(key, deps.cache_key(other))
+        self.assertNotEqual(key, deps.cache_key(_package(os.path.join(self.base, "w4")),
+                                                node="v27"))
+
+
+class LinkTests(_Base):
+    def test_filled_once_then_linked_read_only_with_writable_tool_caches(self):
+        installer = FakeInstaller()
+        first = _package(os.path.join(self.base, "w1"))
+        second = _package(os.path.join(self.base, "w2"))
+        one = deps.link_package(first, self.cache, installer=installer)
+        two = deps.link_package(second, self.cache, installer=installer)
+        self.assertEqual((one["status"], one["filled"]), ("linked", True))
+        self.assertEqual((two["status"], two["filled"]), ("linked", False))
+        self.assertEqual(len(installer.calls), 1)          # npm ci once per lockfile
+        target = deps.entry_modules(deps.nm_root(self.cache), one["key"], "app")
+        self.assertTrue(installer.calls[0].endswith(os.path.join(one["key"], "app")))
+        for pkg in (first, second):
+            link = os.path.join(pkg, "node_modules")
+            self.assertTrue(os.path.islink(link))
+            self.assertEqual(os.readlink(link), target)
+            self.assertTrue(os.path.isfile(os.path.join(link, "left-pad", "lib",
+                                                        "index.js")))
+            self.assertTrue(deps.is_shared_link(link, self.cache))
+        # only package.json and the lockfile stay beside the entry's node_modules
+        self.assertEqual(sorted(os.listdir(os.path.dirname(target))),
+                         ["node_modules", "package-lock.json", "package.json"])
+        marker = deps.read_marker(deps.entry_of(deps.nm_root(self.cache), one["key"]))
+        self.assertEqual((marker["schema"], marker["package"], marker["files"]),
+                         (deps.SCHEMA, "app", 2))
+        # read-only tree: no new file, no change, no deletion through the link
+        with self.assertRaises(PermissionError):
+            open(os.path.join(first, "node_modules", "left-pad", "new.js"), "w")
+        with self.assertRaises(PermissionError):
+            open(os.path.join(first, "node_modules", "left-pad", "lib", "index.js"), "w")
+        with self.assertRaises(PermissionError):
+            os.unlink(os.path.join(first, "node_modules", "left-pad", "lib", "index.js"))
+        # babel/eslint (.cache) and vite/vitest (.vite) can still write
+        for name in deps.WRITABLE:
+            with open(os.path.join(first, "node_modules", name, "probe"), "w") as fh:
+                fh.write("ok")
+        self.assertEqual(sorted(os.path.basename(p) for p in deps.live_links(
+            deps.entry_of(deps.nm_root(self.cache), one["key"]))), ["node_modules"] * 2)
+
+    def test_local_directory_kept_unless_replace(self):
+        pkg = _package(os.path.join(self.base, "w1"))
+        os.makedirs(os.path.join(pkg, "node_modules", "old"))
+        installer = FakeInstaller()
+        self.assertEqual(deps.link_package(pkg, self.cache, installer=installer)["status"],
+                         "local-kept")
+        self.assertEqual(installer.calls, [])
+        done = deps.link_package(pkg, self.cache, installer=installer, replace=True)
+        self.assertEqual((done["status"], done["replaced"]), ("linked", True))
+        self.assertTrue(os.path.islink(os.path.join(pkg, "node_modules")))
+        self.assertEqual([n for n in os.listdir(pkg) if "ameesh-old" in n], [])
+
+    def test_fill_failure_falls_back_to_local_npm_ci(self):
+        pkg = _package(os.path.join(self.base, "w1"))
+        installer = FakeInstaller(fail_in=(deps.nm_root(self.cache),))
+        done = deps.link_package(pkg, self.cache, installer=installer)
+        self.assertEqual(done["status"], "local")
+        self.assertIn("fake", done["reason"])
+        self.assertEqual(installer.calls[-1], pkg)
+        self.assertFalse(os.path.islink(os.path.join(pkg, "node_modules")))
+        self.assertEqual(deps.entries(self.cache), [])     # no partial entry left
+
+    def test_fill_held_by_another_agent_falls_back_after_the_wait(self):
+        pkg = _package(os.path.join(self.base, "w1"))
+        root = deps.nm_root(self.cache)
+        os.makedirs(root)
+        key = deps.cache_key(pkg)
+        held = deps._lock(os.path.join(root, key + ".lock"), wait=0)
+        try:
+            done = deps.link_package(pkg, self.cache, installer=FakeInstaller(), wait=0)
+        finally:
+            held.close()
+        self.assertEqual(done["status"], "local")
+        self.assertIn("another fill", done["reason"])
+
+    def test_no_fill_and_link_ready(self):
+        installer = FakeInstaller()
+        first = _package(os.path.join(self.base, "w1"))
+        second = _package(os.path.join(self.base, "w2"))
+        self.assertEqual(deps.link_package(first, self.cache, fill_missing=False)["status"],
+                         "not-cached")
+        self.assertEqual(deps.link_ready(os.path.join(self.base, "w1"), self.cache), [])
+        deps.link_package(first, self.cache, installer=installer)
+        ready = deps.link_ready(os.path.join(self.base, "w2"), self.cache)
+        self.assertEqual([r["package"] for r in ready], [second])
+        self.assertEqual(len(installer.calls), 1)
+        review = _package(os.path.join(self.base, "nexlink-codex2-review-ime"))
+        self.assertEqual(deps.link_ready(os.path.dirname(review), self.cache), [])
+
+    def test_find_packages_skips_node_modules_hidden_and_symlinks(self):
+        top = os.path.join(self.base, "repo")
+        for name in ("website", "mobile"):
+            _package(top, name)
+        _package(os.path.join(top, "website", "node_modules"), "dep")
+        _package(os.path.join(top, ".worktrees"), "spike")
+        os.symlink(os.path.join(top, "mobile"), os.path.join(top, "alias"))
+        self.assertEqual(deps.find_packages(top),
+                         [os.path.join(top, "mobile"), os.path.join(top, "website")])
+
+    def test_symlink_ignored_by_git_where_the_pattern_is_a_directory(self):
+        repo = os.path.join(self.base, "repo")
+        os.makedirs(repo)
+        _git(repo, "init", "-q", "-b", "main")
+        with open(os.path.join(repo, ".gitignore"), "w") as fh:
+            fh.write("node_modules/\n")
+        pkg = _package(repo, "mobile")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", "init")
+        done = deps.link_package(pkg, self.cache, installer=FakeInstaller())
+        self.assertEqual(done["excluded"], "/mobile/node_modules")
+        self.assertEqual(_git(repo, "status", "--porcelain"), "")
+        # a second link of the same path adds nothing
+        os.unlink(os.path.join(pkg, "node_modules"))
+        self.assertIsNone(deps.link_package(pkg, self.cache)["excluded"])
+        with open(os.path.join(repo, ".git", "info", "exclude")) as fh:
+            self.assertEqual(fh.read().count("/mobile/node_modules"), 1)
+
+
+class ReviewAndShimTests(_Base):
+    def test_review_worktree_names(self):
+        for name in ("nexlink-codex2-review-ime", "review-98-r2", "dh2b-review",
+                     "codex1-rel-smoke-review-2119d7d", "ameesh-relecture-12"):
+            self.assertTrue(deps.is_review_worktree(os.path.join(self.base, name)), name)
+        for name in ("nexlink-codex1", "nexlink-codex1-billing-306", "reviewer-tools",
+                     "ameesh-dev7"):
+            self.assertFalse(deps.is_review_worktree(os.path.join(self.base, name)), name)
+
+    def _npm(self, *args, cwd, env=None, installer=None):
+        calls = []
+
+        def execute(path, argv, env):
+            calls.append((argv[1:], env.get(deps.PASSTHROUGH_ENV)))
+            return 0
+        base_env = {"PATH": self.fake_bin, "AMEESH_CACHE_DIR": self.cache}
+        base_env.update(env or {})
+        code = deps.npm_shim(list(args), env=base_env, cwd=cwd, execute=execute,
+                             installer=installer or FakeInstaller())
+        return code, calls
+
+    def setUp(self):
+        super().setUp()
+        self.fake_bin = os.path.join(self.base, "bin")
+        os.makedirs(self.fake_bin)
+        with open(os.path.join(self.fake_bin, "npm"), "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(os.path.join(self.fake_bin, "npm"), 0o755)
+
+    def test_ci_links_instead_of_installing(self):
+        pkg = _package(os.path.join(self.base, "nexlink-codex1"))
+        os.makedirs(os.path.join(pkg, "src", "deep"))
+        installer = FakeInstaller()
+        code, calls = self._npm("ci", "--no-audit", cwd=os.path.join(pkg, "src", "deep"),
+                                installer=installer)
+        self.assertEqual((code, calls), (0, []))
+        self.assertTrue(os.path.islink(os.path.join(pkg, "node_modules")))
+        code, calls = self._npm("install", cwd=pkg, installer=installer)
+        self.assertEqual((code, calls), (0, []))
+        self.assertEqual(len(installer.calls), 1)
+
+    def test_install_refused_in_a_review_worktree(self):
+        pkg = _package(os.path.join(self.base, "nexlink-codex2-review-ime"))
+        for args in (("ci",), ("install",), ("i", "left-pad"), ("install-ci-test",)):
+            code, calls = self._npm(*args, cwd=pkg)
+            self.assertEqual((code, calls), (1, []), args)
+        self.assertFalse(os.path.lexists(os.path.join(pkg, "node_modules")))
+        # reading is fine: npm test, npm run
+        self.assertEqual(self._npm("test", cwd=pkg), (0, [(["test"], "1")]))
+        # the explicit override
+        code, _calls = self._npm("ci", cwd=pkg, env={"AMEESH_DEPS": "allow-review"})
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.islink(os.path.join(pkg, "node_modules")))
+
+    def test_install_of_a_package_unlinks_then_runs_npm(self):
+        pkg = _package(os.path.join(self.base, "w1"))
+        self._npm("ci", cwd=pkg)
+        code, calls = self._npm("install", "is-odd", cwd=pkg)
+        self.assertEqual((code, calls), (0, [(["install", "is-odd"], "1")]))
+        self.assertFalse(os.path.lexists(os.path.join(pkg, "node_modules")))
+
+    def test_passthrough_cases(self):
+        pkg = _package(os.path.join(self.base, "w1"))
+        # options that change the tree, lockfile out of sync, global, off
+        for args, env in ((("ci", "--omit=dev"), None), (("ci",), {"AMEESH_DEPS": "off"}),
+                          (("install", "-g", "x"), None), (("run", "build"), None)):
+            code, calls = self._npm(*args, cwd=pkg, env=env)
+            self.assertEqual((code, calls), (0, [(list(args), "1")]), args)
+        manifest = dict(MANIFEST, dependencies={"left-pad": "^1.0.0", "is-odd": "^3"})
+        stale = _package(os.path.join(self.base, "w2"), manifest=manifest)
+        self.assertEqual(self._npm("ci", cwd=stale), (0, [(["ci"], "1")]))
+        self.assertFalse(os.path.lexists(os.path.join(stale, "node_modules")))
+        # inside the real npm: no recursion
+        self.assertEqual(self._npm("ci", cwd=pkg, env={deps.PASSTHROUGH_ENV: "1"}),
+                         (0, [(["ci"], "1")]))
+
+    def test_install_shim_and_real_npm(self):
+        shim_dir = os.path.join(self.base, ".menage", deps.SHIM_DIR)
+        env = deps.install_shim(shim_dir, self.fake_bin, python="/usr/bin/python3")
+        self.assertEqual(env["PATH"], shim_dir + os.pathsep + self.fake_bin)
+        self.assertEqual(env["AMEESH_REAL_NPM"], os.path.join(self.fake_bin, "npm"))
+        with open(os.path.join(shim_dir, "npm")) as fh:
+            self.assertIn("exec /usr/bin/python3 -m ameesh.deps npm", fh.read())
+        self.assertTrue(os.access(os.path.join(shim_dir, "npm"), os.X_OK))
+        self.assertEqual(deps.real_npm({"PATH": env["PATH"]}),
+                         os.path.join(self.fake_bin, "npm"))
+        self.assertEqual(deps.install_shim(shim_dir, os.path.join(self.base, "none")), {})
+
+
+class GcTests(_Base):
+    def test_unreferenced_entry_deleted_once_idle(self):
+        pkg = _package(os.path.join(self.base, "w1"))
+        done = deps.link_package(pkg, self.cache, installer=FakeInstaller())
+        entry = deps.entry_of(deps.nm_root(self.cache), done["key"])
+        later = time.time() + 10 * 24 * 3600
+        self.assertEqual(deps.gc_node_modules(self.cache, now=later), [])   # linked
+        os.unlink(os.path.join(pkg, "node_modules"))
+        self.assertEqual(deps.gc_node_modules(self.cache), [])              # not idle yet
+        plan = deps.gc_node_modules(self.cache, now=later, dry_run=True)
+        self.assertEqual([p["action"] for p in plan], ["would-delete"])
+        self.assertTrue(os.path.isdir(entry))
+        held = deps._lock(os.path.join(deps.nm_root(self.cache), done["key"] + ".lock"),
+                          wait=0)
+        try:
+            self.assertEqual(deps.gc_node_modules(self.cache, now=later), [])  # filling
+        finally:
+            held.close()
+        lines = deps.gc_node_modules(self.cache, now=later)
+        self.assertEqual([(line["kind"], line["action"]) for line in lines],
+                         [("deps", "deleted")])
+        self.assertFalse(os.path.lexists(entry))
+
+    def test_partial_entry_deleted_after_an_hour(self):
+        root = deps.nm_root(self.cache)
+        partial = os.path.join(root, "f" * 64, "app", "node_modules", "x")
+        os.makedirs(partial)
+        os.chmod(os.path.dirname(partial), 0o555)
+        self.assertEqual(deps.gc_node_modules(self.cache), [])
+        lines = deps.gc_node_modules(self.cache, now=time.time() + 2 * 3600)
+        self.assertEqual([line["detail"] for line in lines], ["partial fill (no .complete.json)"])
+        self.assertEqual(os.listdir(root), [])
+
+    def test_remove_tree_refuses_outside_and_never_follows_a_link(self):
+        outside = _package(os.path.join(self.base, "w1"))
+        root = deps.nm_root(self.cache)
+        os.makedirs(root)
+        with self.assertRaises(RuntimeError):
+            deps.remove_tree(outside, root)
+        link = os.path.join(root, "k")
+        os.symlink(outside, link)
+        deps.remove_tree(link, root)
+        self.assertTrue(os.path.isfile(os.path.join(outside, "package.json")))
+
+
+class _Cfg:
+    def __init__(self, state_dir: str):
+        self.state_dir = state_dir
+        self.host = "pc"
+        self.container_runtime = "none"
+
+
+class MenageWiringTests(_Base):
+    def test_policy_keys(self):
+        parsed, problems, unknown = menage.parse_policy({"deps": False, "deps_idle": "12h"})
+        self.assertEqual((parsed, problems, unknown),
+                         ({"deps": False, "deps_idle": 12 * 3600.0}, [], []))
+        self.assertEqual(menage.parse_policy({"deps": "yes"})[1], ["`deps` : booléen attendu"])
+        self.assertTrue(menage.Policy().deps)
+
+    def test_turn_env_puts_the_npm_wrapper_first(self):
+        fake_bin = os.path.join(self.base, "bin")
+        os.makedirs(fake_bin)
+        with open(os.path.join(fake_bin, "npm"), "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(os.path.join(fake_bin, "npm"), 0o755)
+        cfg = _Cfg(os.path.join(self.base, "state"))
+        env = menage.turn_env(cfg, menage.Policy(), "dev7", {"PATH": fake_bin})
+        shim_dir = os.path.join(cfg.state_dir, menage.MANAGED_DIR, deps.SHIM_DIR)
+        self.assertEqual(env["PATH"].split(os.pathsep), [shim_dir, fake_bin])
+        self.assertEqual(env["AMEESH_REAL_NPM"], os.path.join(fake_bin, "npm"))
+        off = menage.turn_env(cfg, menage.Policy(deps=False), "dev7", {"PATH": fake_bin})
+        self.assertNotIn("PATH", off)
+
+    def test_turn_begin_links_ready_packages_of_the_cwd(self):
+        cfg = _Cfg(os.path.join(self.base, "state"))
+        policy = menage.Policy(worktrees=False)
+        croot = menage.cache_root(cfg, policy)
+        first = _package(os.path.join(self.base, "w1"))
+        second = _package(os.path.join(self.base, "w2"))
+        deps.link_package(first, croot, installer=FakeInstaller())
+        turn = menage.Turn.begin(cfg, policy, "dev7", os.path.dirname(second),
+                                 new_session=False, base_env={"PATH": ""})
+        try:
+            self.assertTrue(os.path.islink(os.path.join(second, "node_modules")))
+            self.assertIn(("deps", "linked", second),
+                          [(e["kind"], e["action"], e["path"]) for e in turn.entries])
+        finally:
+            turn.lock.release()
+
+
+if __name__ == "__main__":
+    unittest.main()
