@@ -183,6 +183,51 @@ def child_env(**extra: str) -> dict:
     return env
 
 
+#: L161e : dossier de mesure de la carte test → code (vide : pas de mesure)
+CARTE = os.environ.get("CARTE_MESURE", "")
+
+
+def table_stats(db, schema: str) -> dict:
+    """L161e : compteurs d'activité des tables d'un schéma (lectures,
+    écritures), après avoir vidé ceux de cette connexion ; les
+    sous-processus vident les leurs en se fermant."""
+    db.query("select pg_stat_force_next_flush()")
+    rows = db.query(
+        "select relname, coalesce(seq_scan, 0) + coalesce(idx_scan, 0) as lectures, "
+        "n_tup_ins + n_tup_upd + n_tup_del as ecritures "
+        "from pg_stat_user_tables where schemaname = %s", (schema,))
+    return {r["relname"]: (int(r["lectures"]), int(r["ecritures"])) for r in rows}
+
+
+def tables_touchees(avant: dict, apres: dict) -> dict:
+    """Tables dont un compteur a bougé : {table: {"l": lectures, "e": écritures}}."""
+    touchees = {}
+    for table, (lectures, ecritures) in sorted(apres.items()):
+        l0, e0 = avant.get(table, (0, 0))
+        if lectures > l0 or ecritures > e0:
+            touchees[table] = {"l": lectures - l0, "e": ecritures - e0}
+    return touchees
+
+
+def noter_tables(cls) -> None:
+    """L161e : les tables touchées par une classe de test, dans le dossier de
+    mesure de la carte. Jamais bloquant."""
+    avant = getattr(cls, "_carte_tables", None)
+    if not CARTE or avant is None:
+        return
+    try:
+        touchees = tables_touchees(avant, table_stats(cls.db, cls.schema))
+        dossier = os.path.join(CARTE, "tables")
+        os.makedirs(dossier, exist_ok=True)
+        ligne = json.dumps({"classe": "%s.%s" % (cls.__module__, cls.__qualname__),
+                            "tables": touchees}, ensure_ascii=False)
+        with open(os.path.join(dossier, "%d.jsonl" % os.getpid()), "a", encoding="utf-8") as fh:
+            fh.write(ligne + "\n")
+    except Exception as exc:  # la mesure ne casse jamais un test
+        print("carte : tables de %s non relevées (%s)" % (cls.__qualname__, exc),
+              file=sys.stderr)
+
+
 class PgTestCase(unittest.TestCase):
     """Base : un schéma migré, un bac à sable disque, des utilitaires CLI."""
 
@@ -218,9 +263,15 @@ class PgTestCase(unittest.TestCase):
                 raise AssertionError(message) from exc
             raise unittest.SkipTest(message) from exc
         migrations.migrate(cls.db, log=None)
+        if CARTE:
+            try:
+                cls._carte_tables = table_stats(cls.db, cls.schema)
+            except Exception:
+                cls._carte_tables = None
 
     @classmethod
     def tearDownClass(cls) -> None:
+        noter_tables(cls)
         try:
             cls.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % cls.schema)
             cls.db.close()
