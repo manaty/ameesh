@@ -334,7 +334,8 @@ jobs:
             test "${{ needs.doc-readers.result }}" = success
             exit 0
           fi
-          # a driver is skipped only when the plan gave it no part
-          test "${{ needs.psycopg.result }}" = success || { test '${{ needs.plan.outputs.psycopg }}' = '[]' && test "${{ needs.psycopg.result }}" = skipped; }
+          # code changed: psycopg always runs (an empty matrix, e.g. tests moved to
+          # a subfolder, is an error); psql may be skipped when the plan gave it no part
+          test "${{ needs.psycopg.result }}" = success
           test "${{ needs.psql.result }}" = success || { test '${{ needs.plan.outputs.psql }}' = '[]' && test "${{ needs.psql.result }}" = skipped; }
           test "${{ needs.platform-macos.result }}" = success

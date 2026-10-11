@@ -22,6 +22,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
@@ -338,6 +339,51 @@ class PlanTest(unittest.TestCase):
         self.assertTrue(parts._plan_pilote(str(f)))
         self.assertEqual(json.loads(plan.outputs(p)["psycopg"]), [1, 2, 3, 4])
 
+    def test_each_module_in_exactly_one_part_with_the_map(self):
+        mods = parts.modules()
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, check=True,
+                              capture_output=True, text=True).stdout.strip()
+        card = {"schema": carte.SCHEMA, "commit": head, "genere": NOW.isoformat(),
+                "modules": {m: {"durees": {"psycopg": 1.0 + 7 * (i % 5), "psql": 2.0 + i % 3},
+                                "echecs": []} for i, m in enumerate(mods)},
+                "blocs": {}, "donnees": {}, "dossiers": {}, "tables": {}, "migrations": {}}
+        p = plan.make_plan("push", card, NOW)
+        self.assertTrue(p["map"]["used"], p["map"])
+        for driver in ("psycopg", "psql"):
+            with self.subTest(driver=driver):
+                seen = [m for ps in p["parts"][driver] for m in ps["modules"]]
+                self.assertEqual(sorted(seen), mods)  # every one, none twice
+
+    def _main_plan(self) -> dict:
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        old, sys.stdout = sys.stdout, io.StringIO()
+        try:
+            code = plan.main(["plan", "--out", str(d / "plan.json"), "--event", "push"])
+        finally:
+            sys.stdout = old
+        self.assertEqual(code, 0)
+        return json.loads((d / "plan.json").read_text(encoding="utf-8"))
+
+    def test_exception_in_make_plan_falls_back_to_the_full_suite(self):
+        def boom(*a, **k):
+            raise KeyError("blocs")
+        with mock.patch.object(plan, "make_plan", boom):
+            p = self._main_plan()
+        self.assertEqual(p["why"], "planning failed")
+        self.assertIn("KeyError", p["unsure"][0])
+        self.assertTrue(all(ps["modules"] is None for ps in p["parts"]["psycopg"]))
+
+    def test_stale_always_entry_falls_back_instead_of_failing(self):
+        # L161f review (3): lire_liste raised SystemExit, out of reach of `except Exception`
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d)
+        (d / "toujours.txt").write_text("test_gone_long_ago\n", encoding="utf-8")
+        with mock.patch.object(plan, "ALWAYS_FILE", d / "toujours.txt"):
+            p = self._main_plan()
+        self.assertEqual(p["why"], "planning failed")
+        self.assertIn("test_gone_long_ago", p["unsure"][0])
+
     def test_command_line_never_fails_on_a_bad_map(self):
         d = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, d)
@@ -393,6 +439,36 @@ class ProvisionalGreenTest(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual((events[0]["statut"], events[0]["rouges"]), ("rouge", [module]))
         self.assertEqual(lines[-1]["type"], "impacted")
+
+    def test_broken_setupclass_is_red_in_its_module(self):
+        # L161f review (1): « setUpClass (tests.test_x.C) » was put in module « tests »,
+        # a provisional green and a P3 leak for a migration breaking a P1 setUpClass
+        class Broken(unittest.TestCase):
+            @classmethod
+            def setUpClass(cls):
+                raise RuntimeError("migration")
+
+            def test_never(self):
+                pass
+
+        _, rest = _cases()
+        module = __name__.rsplit(".", 1)[-1]
+        lines = self._run((module,), Broken, rest)
+        error = next(x for x in lines if x["type"] == "test" and x["statut"] == "erreur")
+        self.assertEqual(error["module"], module)
+        event = next(x for x in lines if x["type"] == "impacted")
+        self.assertEqual((event["statut"], event["rouges"]), ("rouge", [module]))
+
+    def test_module_of_fixture_and_import_errors(self):
+        from unittest.suite import _ErrorHolder
+        module = __name__.rsplit(".", 1)[-1]
+        for description in (f"setUpModule ({__name__})", f"tearDownModule ({__name__})",
+                            f"setUpClass ({__name__}.C)", f"tearDownClass ({__name__}.C)",
+                            f"setUpClass ({__name__}._cases.<locals>.Impacted)"):
+            with self.subTest(description=description):
+                self.assertEqual(parts._module_de(_ErrorHolder(description)), module)
+        failed = unittest.defaultTestLoader.loadTestsFromName("tests.test_absent_l161f")
+        self.assertEqual(parts._module_de(next(iter(failed))), "test_absent_l161f")
 
     def test_no_impacted_module_green_at_once(self):
         _, rest = _cases()
@@ -471,8 +547,13 @@ class WorkflowTest(unittest.TestCase):
         for driver in ("psycopg", "psql"):
             self.assertIn(f"part: ${{{{ fromJSON(needs.plan.outputs.{driver}) }}}}", self.text)
             self.assertIn(f"if: needs.plan.outputs.{driver} != '[]'", self.text)
-            self.assertIn(f"test '${{{{ needs.plan.outputs.{driver} }}}}' = '[]' && test "
-                          f"\"${{{{ needs.{driver}.result }}}}\" = skipped", self.text)
+        # L161f review (2): with code changed, an empty psycopg matrix is an error
+        skipped = ("test '${{{{ needs.plan.outputs.{0} }}}}' = '[]' && test "
+                   "\"${{{{ needs.{0}.result }}}}\" = skipped")
+        job = self.text[self.text.index("\n  tests:\n"):]
+        self.assertIn(skipped.format("psql"), job)
+        self.assertNotIn(skipped.format("psycopg"), job)
+        self.assertIn('test "${{ needs.psycopg.result }}" = success\n', job)
 
     def test_leaks_job_never_required(self):
         job = self.text[self.text.index("\n  bilan:\n"):self.text.index("\n  tests:\n")]

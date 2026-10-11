@@ -263,8 +263,18 @@ def selection(args) -> tuple[list[str], float, list[str], dict[str, float]]:
 
 def _module_de(test) -> str:
     module = type(test).__module__
-    if module.startswith("unittest"):  # _ErrorHolder (setUpClass en échec)
-        module = getattr(test, "description", "?").split("(")[-1].split(".")[0]
+    if module.startswith("unittest"):
+        # _ErrorHolder : « setUpClass (tests.test_x.C) », « setUpModule (tests.test_x) » ;
+        # _FailedTest (import en échec) : sa méthode porte le nom du module.
+        description = getattr(test, "description", None)
+        if description is None:
+            module = getattr(test, "_testMethodName", "?")
+        else:
+            methode, _, cible = description.rpartition(" (")
+            module = cible.rstrip(")")
+            if methode.endswith("Class"):  # module.Classe, qualname avec points possible
+                while "." in module and module not in sys.modules:
+                    module = module.rsplit(".", 1)[0]
     return module.rsplit(".", 1)[-1]
 
 

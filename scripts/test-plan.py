@@ -190,8 +190,15 @@ def is_foundation(path: str) -> bool:
     return path.startswith(FOUNDATION) or path == "pyproject.toml"
 
 
-def read_list(path: pathlib.Path, known: list[str]) -> list[str]:
-    return parts.lire_liste(path, known) if path.exists() else []
+def read_list(path: pathlib.Path, known: list[str], required: bool = False) -> list[str]:
+    """`parts.lire_liste`, whose SystemExit (stale or unsorted entry) becomes a
+    ValueError: `main` catches it and falls back to the full suite."""
+    if not path.exists() and not required:
+        return []
+    try:
+        return parts.lire_liste(path, known)
+    except SystemExit as exc:
+        raise ValueError(str(exc)) from None
 
 
 class Impact:
@@ -545,7 +552,7 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     for driver, (n_pr, n_other) in PARTS.items():
         selected = modules
         if driver == "psql" and pr:
-            selected = parts.lire_liste(PILOT_FILE, modules)
+            selected = read_list(PILOT_FILE, modules, required=True)
         plan["parts"][driver] = [] if skip else split(
             selected, driver, n_pr if pr else n_other, card, classes)
     every = [m for m in modules]
