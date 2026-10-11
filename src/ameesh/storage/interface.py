@@ -810,11 +810,12 @@ class WorkItems(Domain):
             package_id: str | None = None, package_parent: str | None = None,
             branch: str | None = None, branch_target: str | None = None,
             priority: int | None = None, estimate_minutes: int | None = None,
-            estimate_source: str | None = None) -> dict:
+            estimate_source: str | None = None, change_size: str | None = None) -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
-        si `estimate_minutes`, L157) et sa première ligne de journal ; rend le
+        si `estimate_minutes`, L157 ; avec la taille déclarée du changement
+        si `change_size`, L157b) et sa première ligne de journal ; rend le
         lot."""
 
     @abc.abstractmethod
@@ -840,6 +841,17 @@ class WorkItems(Domain):
         """L157 : les lots livrés, les plus récents d'abord, avec début mesuré,
         fusion, estimation en vigueur au début (`late` si posée après),
         auteur, source et nombre d'estimations."""
+
+    @abc.abstractmethod
+    def publish_reference(self, body: dict, *, actor: str) -> dict:
+        """L157b : publie une table de référence des durées (schéma
+        `ameesh-estimate-reference/1`) ; rend `{id, published_by,
+        published_ts}`."""
+
+    @abc.abstractmethod
+    def reference(self) -> dict | None:
+        """L157b : la table de référence en vigueur, la dernière publiée
+        (`{id, published_by, published_ts, body}`), ou None."""
 
     @abc.abstractmethod
     def set_branch(self, item_id: int, branch: str | None, target: str | None, *,

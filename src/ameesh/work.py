@@ -79,6 +79,8 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
 #: 2 normale, 3 basse ; sans priorité, le lot n'en a pas (NULL)
 PRIORITIES = (1, 2, 3)
 PRIORITY_LABELS = {1: "haute", 2: "normale", 3: "basse"}
+#: L157b : taille déclarée du changement d'un lot (petit, moyen, gros)
+SIZES = ("s", "m", "l")
 
 #: colonnes rendues pour un lot (pilote Postgres ; alias de compatibilité)
 ITEM_COLUMNS = _pg.ITEM_COLUMNS
@@ -173,6 +175,7 @@ def add(
     priority: int | None = None,
     estimate=None,
     estimate_source: str | None = None,
+    size: str | None = None,
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
@@ -183,13 +186,17 @@ def add(
 
     L157 : `estimate` (« 2h », « 90m », ou des minutes) est la durée estimée,
     posée avec sa source et son auteur (`actor`). La règle « obligatoire pour
-    un agent » est appliquée par les points d'entrée (`estimates.check`)."""
+    un agent » est appliquée par les points d'entrée (`estimates.check`).
+    L157b : `size` (`s`, `m`, `l`) est la taille déclarée du changement, une
+    clé de la table de référence des durées."""
     minutes = None
     if estimate not in (None, ""):
         from . import estimates
         minutes = estimates.parse(estimate)
     if type not in ("bug", "evolution"):
         raise WorkError("type inconnu : %r (bug ou evolution)" % type)
+    if size not in (None, "") and size not in SIZES:
+        raise WorkError("taille inconnue : %r (s, m ou l)" % (size,))
     if not (title or "").strip():
         raise WorkError("titre obligatoire")
     if priority is not None and priority not in PRIORITIES:
@@ -211,7 +218,7 @@ def add(
         branch=branch, branch_target=branch_target, priority=priority,
         estimate_minutes=minutes,
         estimate_source=(" ".join(str(estimate_source or "").split()) or None)
-        if minutes else None)
+        if minutes else None, change_size=size or None)
 
 
 # --------------------------------------------------------------------------

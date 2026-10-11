@@ -27,10 +27,18 @@ audite le processus d'estimation (qui dépend de l'organisation) et l'ajuste ».
   après le début est comptée à part (`tardive`). C'est la matière de
   l'auditeur (docs/AUDITEUR.md), qui ajuste le processus d'estimation.
 
-Le JSON de `work estimates` suit le schéma `ameesh-estimates/1`.
+* **Référence** (L157b, `work estimates --publish`) : l'auditeur publie à
+  son passage quotidien une table (médiane et p80 de la durée réelle par
+  type, taille, hôte et harnais ; biais de chaque estimateur) ; `work add`
+  et `work show` la LISENT pour proposer l'estimation de référence, sans
+  calcul ; `estimate_bias` se lit aussi dans cette table.
+
+Le JSON de `work estimates` suit le schéma `ameesh-estimates/1` ; la table
+publiée, `ameesh-estimate-reference/1`.
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 import time
@@ -385,4 +393,192 @@ def format_report(rep: dict) -> str:
         out.append("")
         out.append("aucun lot livré avec une estimation posée avant le début : rien à "
                    "comparer encore")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# table de référence des durées (L157b)
+# --------------------------------------------------------------------------
+#
+# Précision du propriétaire (2026-10-11) : ameesh ne fait AUCUNE analyse des
+# lots passés à la demande. L'auditeur, à son passage quotidien, publie la
+# table (`ameesh work estimates --publish`) ; `work add` et `work show` la
+# LISENT pour proposer l'estimation de référence ; l'alerte `estimate_bias`
+# vient de ce passage (le biais est rangé dans la table publiée).
+
+REFERENCE_SCHEMA = "ameesh-estimate-reference/1"
+#: un groupe de moins de lots ne sert pas de référence (on remonte d'un cran)
+MIN_LOTS = 3
+#: ratio réel/estimé médian d'un estimateur hors de cette plage : `estimate_bias`
+BIAS_LOW, BIAS_HIGH = 0.5, 2.0
+#: clés des groupes, de la plus fine à la plus large ; la lecture prend le
+#: premier groupe d'au moins MIN_LOTS lots
+LEVELS = (("type", "size", "host", "harness"), ("type", "size"), ("type",), ())
+UNKNOWN = "?"
+SIZE_LABELS = {"s": "petit", "m": "moyen", "l": "gros"}
+
+
+def _level_name(level) -> str:
+    return ",".join(level) or "*"
+
+
+def build_reference(rows: list[dict], agents: dict | None = None, *,
+                    now: float | None = None) -> dict:
+    """La table `ameesh-estimate-reference/1` depuis les lots livrés
+    (`work.estimate_history`) et le registre (`agents` : nom → `{host,
+    harness}` de l'assigné). Calcul de l'AUDITEUR (`--publish`), jamais à la
+    création d'un lot.
+
+    `groups` : par niveau de `LEVELS`, la médiane et le p80 de la durée réelle
+    (fusion − début, en minutes) ; `estimators` : par auteur d'estimation, le
+    ratio réel/estimé (médiane, p80) des lots estimés avant le début ;
+    `bias` : ceux d'au moins MIN_LOTS lots dont la médiane sort de
+    ×0,5–×2."""
+    now = time.time() if now is None else float(now)
+    agents = agents or {}
+    lots = []
+    for row in rows:
+        if row.get("started_ts") is None or row.get("merged_ts") is None:
+            continue
+        who = agents.get(row.get("assignee") or "") or {}
+        actual = max(0.0, float(row["merged_ts"]) - float(row["started_ts"])) / 60.0
+        estimate = int(row["estimate_minutes"]) if row.get("estimate_minutes") else None
+        lots.append({"type": row.get("type") or UNKNOWN,
+                     "size": row.get("change_size") or UNKNOWN,
+                     "host": who.get("host") or UNKNOWN,
+                     "harness": who.get("harness") or UNKNOWN,
+                     "actual": actual, "estimate": estimate,
+                     "by": row.get("estimate_by") or work_mod.UNKNOWN_ACTOR,
+                     "late": bool(row.get("late"))})
+    groups = []
+    for level in LEVELS:
+        buckets: dict = {}
+        for lot in lots:
+            key = tuple(lot[k] for k in level)
+            if UNKNOWN in key:          # une clé inconnue ne fait pas un groupe
+                continue
+            buckets.setdefault(key, []).append(lot["actual"])
+        for key, values in sorted(buckets.items()):
+            group = {"level": _level_name(level), "lots": len(values),
+                     "median_minutes": quantile(values, 0.5),
+                     "p80_minutes": quantile(values, 0.8)}
+            group.update(zip(level, key))
+            groups.append(group)
+    by_author: dict = {}
+    for lot in lots:
+        if lot["estimate"] and not lot["late"]:
+            by_author.setdefault(lot["by"], []).append(lot["actual"] / lot["estimate"])
+    estimators = []
+    for name, ratios in sorted(by_author.items()):
+        median = quantile(ratios, 0.5)
+        estimators.append({"estimator": name, "lots": len(ratios), "median_ratio": median,
+                           "p80_ratio": quantile(ratios, 0.8),
+                           "biased": len(ratios) >= MIN_LOTS
+                           and not BIAS_LOW <= median <= BIAS_HIGH})
+    return {"schema": REFERENCE_SCHEMA, "generated_ts": round(now, 3),
+            "delivered": len(rows), "measured": len(lots), "min_lots": MIN_LOTS,
+            "bias_range": [BIAS_LOW, BIAS_HIGH], "groups": groups,
+            "estimators": estimators,
+            "bias": [e for e in estimators if e["biased"]]}
+
+
+def publish(db, *, actor: str = "", now: float | None = None) -> dict:
+    """Le passage de l'auditeur : calcule la table sur les lots livrés et la
+    publie (une ligne de `estimate_references`, la plus récente en vigueur).
+    Rend `{id, published_by, published_ts, body}`."""
+    from . import registry
+
+    rows = storage.of(db).work.estimate_history(app=None, limit=HISTORY_LIMIT)
+    agents = {a["name"]: a for a in registry.overview(db)}
+    body = build_reference(rows, agents, now=now)
+    row = storage.of(db).work.publish_reference(body, actor=actor)
+    return dict(row, body=body)
+
+
+def current_reference(db) -> dict | None:
+    """La table en vigueur (simple lecture), ou None ; illisible : None."""
+    try:
+        row = storage.of(db).work.reference()
+    except Exception:  # noqa: BLE001 - table absente ou illisible : pas de référence
+        return None
+    if not row:
+        return None
+    body = row.get("body")
+    if isinstance(body, (str, bytes)):
+        try:
+            body = json.loads(body)
+        except ValueError:
+            return None
+    if not isinstance(body, dict) or body.get("schema") != REFERENCE_SCHEMA:
+        return None
+    return dict(row, body=body)
+
+
+def lookup(body: dict, *, type=None, size=None, host=None, harness=None) -> dict | None:  # noqa: A002
+    """Le groupe de référence d'un lot : le plus fin de `LEVELS` dont toutes
+    les clés sont connues et qui compte au moins `min_lots` lots. Lecture
+    seule, sans calcul."""
+    wanted = {"type": type, "size": size, "host": host, "harness": harness}
+    minimum = int(body.get("min_lots") or MIN_LOTS)
+    for level in LEVELS:
+        if any(not wanted[k] for k in level):
+            continue
+        name = _level_name(level)
+        for group in body.get("groups") or ():
+            if group.get("level") == name and all(group.get(k) == wanted[k] for k in level) \
+                    and int(group.get("lots") or 0) >= minimum:
+                return group
+    return None
+
+
+def proposal(db, *, type=None, size=None, assignee=None) -> dict | None:  # noqa: A002
+    """L'estimation de référence d'un lot (pour `work add` et `work show`) :
+    `{median_minutes, p80_minutes, lots, level, …, published_ts,
+    published_by}`, ou None (pas de table publiée, aucun groupe assez
+    fourni). Lit la table en vigueur et le registre ; aucun calcul sur
+    l'historique."""
+    ref = current_reference(db)
+    if ref is None:
+        return None
+    host = harness = None
+    if assignee:
+        from . import registry
+        try:
+            agent = registry.get(db, assignee) or {}
+        except Exception:  # noqa: BLE001 - registre illisible : groupe plus large
+            agent = {}
+        host, harness = agent.get("host"), agent.get("harness")
+    group = lookup(ref["body"], type=type, size=size, host=host, harness=harness)
+    if group is None:
+        return None
+    return dict(group, published_ts=ref.get("published_ts"),
+                published_by=ref.get("published_by") or None)
+
+
+def proposal_label(p: dict | None) -> str:
+    """« médiane 25 min · p80 40 min (evolution, moyen, 12 lots ; table du
+    2026-10-11 par auditeur) », ou « aucune (…) »."""
+    if not p:
+        return "aucune (pas de table publiée, ou moins de %d lots semblables)" % MIN_LOTS
+    keys = [p.get("type"), SIZE_LABELS.get(p.get("size"), p.get("size")), p.get("host"),
+            p.get("harness")]
+    where = ", ".join(str(k) for k in keys if k) or "tous les lots"
+    when = (time.strftime("%Y-%m-%d", time.gmtime(float(p["published_ts"])))
+            if p.get("published_ts") else "?")
+    return "médiane %s · p80 %s (%s, %d lots ; table du %s par %s)" % (
+        label(p["median_minutes"]), label(p["p80_minutes"]), where, int(p["lots"]), when,
+        p.get("published_by") or "?")
+
+
+def format_published(row: dict) -> str:
+    """Le compte rendu de `work estimates --publish`."""
+    body = row["body"]
+    out = ["table de référence n°%s publiée : %d lot(s) livré(s), %d mesuré(s), %d groupe(s)"
+           % (row.get("id"), body["delivered"], body["measured"], len(body["groups"]))]
+    for e in body["estimators"]:
+        out.append("  %-24s %4d lot(s)  médiane %s  p80 %s%s" % (
+            str(e["estimator"])[:24], e["lots"], _ratio_cell(e["median_ratio"]),
+            _ratio_cell(e["p80_ratio"]), "  BIAIS (estimate_bias)" if e["biased"] else ""))
+    if not body["estimators"]:
+        out.append("  aucun estimateur mesuré (lots livrés estimés avant le début)")
     return "\n".join(out)

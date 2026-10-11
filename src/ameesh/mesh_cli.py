@@ -831,13 +831,17 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 assignee=args.assignee, budget_usd=args.budget, actor=args.actor,
                 package=args.package, externe=args.externe, cfg=cfg,
                 branch=args.branch, branch_target=args.target, priority=args.priority,
-                estimate=minutes, estimate_source=args.estimate_source)
+                estimate=minutes, estimate_source=args.estimate_source, size=args.size)
             print("lot #%d créé en %s : %s%s%s%s" % (
                 item["id"], item["state"], item["title"],
                 " (plan : %s)" % item["package_id"] if item.get("package_id") else "",
                 " (priorité %s)" % work.PRIORITY_LABELS.get(item.get("priority"))
                 if item.get("priority") else "",
                 " — estimé %s" % estimates.label(minutes) if minutes else ""))
+            # L157b : l'estimation de référence, LUE dans la table de l'auditeur
+            ref = estimates.proposal(db, type=item.get("type"), size=item.get("change_size"),
+                                     assignee=item.get("assignee"))
+            print("référence : %s" % estimates.proposal_label(ref))
             if warn_estimate:
                 print("avertissement : %s" % estimates.missing(item["id"]), file=sys.stderr)
             _print_assignment(check)
@@ -954,6 +958,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             item["estimate"] = estimates.view(
                 item, merged_ts=(item["delays"] or {}).get("merged_ts"))
             item["estimates"] = storage.of(db).work.estimates(args.id)
+            # L157b : estimation de référence (lecture de la table publiée)
+            item["estimate_reference"] = estimates.proposal(
+                db, type=item.get("type"), size=item.get("change_size"),
+                assignee=item.get("assignee"))
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
@@ -983,6 +991,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 if est.get("minutes") else "",
                 "" if est.get("started_ts") is None
                 else " — début mesuré %s" % _fmt_moment(est["started_ts"])])))
+            print("référence: %s%s" % (
+                estimates.proposal_label(item["estimate_reference"]),
+                " — taille %s" % estimates.SIZE_LABELS.get(item["change_size"])
+                if item.get("change_size") else ""))
             if len(item["estimates"]) > 1:
                 print("estimé   : %s" % " → ".join(
                     "%s (%s)" % (estimates.label(e["minutes"]), e.get("estimated_by") or "?")
@@ -1685,6 +1697,9 @@ def build_parser() -> argparse.ArgumentParser:
                              "minutes) — obligatoire pour un agent (L157)")
     pw_add.add_argument("--estimate-source", default=None, metavar="SOURCE",
                         help="d'où vient l'estimation (conception, historique bug ×1,3…)")
+    pw_add.add_argument("--size", default=None, choices=list(work.SIZES),
+                        help="taille du changement : s petit, m moyen, l gros — une clé de "
+                             "l'estimation de référence (L157b)")
     pw_add.set_defaults(func=cmd_work)
     pw_list = work_sub.add_parser("list")
     pw_list.add_argument("--state", default=None)

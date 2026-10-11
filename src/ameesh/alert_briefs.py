@@ -19,7 +19,7 @@ from __future__ import annotations
 from . import sous_utilisation
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
-BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused")
+BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias")
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
@@ -82,6 +82,18 @@ def _plan_underused(alert: dict) -> str:
             "ameesh projects." % (alert.get("detail") or "?", move))
 
 
+def _estimate_bias(alert: dict) -> str:
+    """L157b : à l'estimateur et aux orchestrateurs."""
+    ratio = alert.get("value")
+    sens = ("sous-estime" if ratio is not None and float(ratio) > 1 else "surestime")
+    return ("Biais d'estimation : %s. %s %s les lots. Action attendue : partir de "
+            "l'estimation de référence (affichée par ameesh work add et ameesh work show, "
+            "table publiée par l'auditeur) et ne s'en écarter qu'en le justifiant "
+            "(--estimate-source), estimation décomposée en phases (agent, CI, attente de "
+            "relecture, humain)." % (alert.get("detail") or "?", alert.get("agent") or "?",
+                                    sens))
+
+
 def _for_auditor(alert: dict) -> str:
     """`idle_capacity` à l'auditeur : le constat et l'action de l'alerte."""
     return "Capacité au repos : %s." % (alert.get("detail") or "?")
@@ -93,7 +105,8 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
     l'équipe de l'assigné ; `plan_underused`, ceux des équipes des agents au
-    repos. Auditeurs : toujours. Un agent à la fois orchestrateur et auditeur
+    repos ; `estimate_bias` (L157b), ceux de l'équipe de l'estimateur, et
+    l'estimateur lui-même s'il est un agent du registre. Auditeurs : toujours. Un agent à la fois orchestrateur et auditeur
     reçoit le texte d'orchestrateur."""
     kind = alert.get("type")
     if kind not in BRIEFED_TYPES:
@@ -107,10 +120,15 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         if kind == "stale_lot":
             text = _stale_lot(alert)
             teams = {_team(by_name, alert.get("agent"))} - {""}
+        elif kind == "estimate_bias":
+            text = _estimate_bias(alert)
+            teams = {_team(by_name, alert.get("agent"))} - {""}
         else:
             text = _plan_underused(alert)
             teams = {_team(by_name, n) for n in alert.get("idle_agents") or ()} - {""}
         out = {o: text for o in _of_teams(orchestras, by_name, teams)}
+        if kind == "estimate_bias" and alert.get("agent") in by_name:
+            out.setdefault(alert["agent"], text)       # l'estimateur lui-même
         audit_text = text
     for name in auditor_names or ():
         out.setdefault(name, audit_text)
