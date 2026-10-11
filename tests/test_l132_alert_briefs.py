@@ -86,7 +86,9 @@ class NotifierBriefsTest(PgTestCase):
     def setUp(self):
         super().setUp()
         for name, team in (("orch", "a"), ("dev1", "a"), ("auditeur", None)):
-            registry.upsert(self.db, name, harness="claude", host=self.cfg.host, team=team)
+            registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
+            self.db.execute("UPDATE agent_registry SET team = %s WHERE name = %s",
+                            (team, name))
         self.now = time.time()
 
     def mails(self, name):
