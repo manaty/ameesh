@@ -1154,16 +1154,16 @@ def _help_choices(binary: str, option: str) -> frozenset[str] | None:
     de cette seule option), None si l'aide est illisible, expirée ou muette."""
     cle = (binary, option)
     if cle not in _HELP_CACHE:
-        _HELP_CACHE[cle] = None
         try:
             proc = subprocess.run([binary, "--help"], capture_output=True,
                                   timeout=10, stdin=subprocess.DEVNULL)
         except Exception:  # noqa: BLE001 — OSError, expiration, etc.
-            return None
-        if proc.returncode != 0 or not option:
-            return None
-        texte = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
-        _HELP_CACHE[cle] = _option_choices(texte, option)
+            proc = None
+        choix = None
+        if proc is not None and proc.returncode == 0 and option:
+            texte = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+            choix = _option_choices(texte, option)
+        _HELP_CACHE[cle] = choix
     return _HELP_CACHE[cle]
 
 

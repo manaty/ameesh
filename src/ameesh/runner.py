@@ -4586,12 +4586,17 @@ def stop_group_now(proc: subprocess.Popen, reason: str, *, name: str = "",
 
 def _attach_permission_mode(cfg: Config, name: str) -> str:
     """L223 : le mode de permission réglé pour l'agent (`ameesh set <agent>
-    permission_mode=…`, état local de son hôte), '' sans réglage."""
+    permission_mode=…`, état local de son hôte), '' sans réglage ; un réglage
+    illisible (droits, octets invalides) est ignoré avec un avertissement."""
+    chemin = os.path.join(cfg.agent_dir(name), "permission_mode")
     try:
-        with open(os.path.join(cfg.agent_dir(name), "permission_mode"),
-                  encoding="utf-8") as fh:
+        with open(chemin, encoding="utf-8") as fh:
             return fh.read().strip()
-    except OSError:
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError) as exc:  # ValueError : UnicodeDecodeError
+        print("ameesh attach : réglage permission_mode illisible (%s : %s), ignoré"
+              % (chemin, exc), file=sys.stderr)
         return ""
 
 
@@ -4688,20 +4693,23 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
             stop.wait(max(0.05, min(0.5, reste)))
 
     thread = threading.Thread(target=battement, daemon=True, name="%s-attach" % name)
-    thread.start()
     veille = threading.Thread(target=veilleur, daemon=True, name="%s-attach-veilleur" % name)
-    veille.start()
-    argv = adapter.interactive_command(agent.get("session_id"),
-                                       permission_mode=_attach_permission_mode(cfg, name))
-    env = _attach_env(cfg, name, owner, epoch)
-    env.update(adapter.env())
-    env.update(_attach_tmp_env(cfg, name, env))
-    cwd = agent.get("cwd") or None
-    if cwd and not os.path.isdir(cwd):
-        cwd = None
     proc: subprocess.Popen | None = None
     code = 0
     try:
+        # verdict codex #182 (P2) : tout ce qui suit la prise du bail est sous le
+        # `finally` — une erreur ou un Ctrl-C pendant la préparation (réglage
+        # illisible, `claude --help` lent) rend quand même le bail
+        thread.start()
+        veille.start()
+        argv = adapter.interactive_command(agent.get("session_id"),
+                                           permission_mode=_attach_permission_mode(cfg, name))
+        env = _attach_env(cfg, name, owner, epoch)
+        env.update(adapter.env())
+        env.update(_attach_tmp_env(cfg, name, env))
+        cwd = agent.get("cwd") or None
+        if cwd and not os.path.isdir(cwd):
+            cwd = None
         if not account_turn.apply_env_attach(env, compte, cfg):
             return 1  # le `finally` rend le bail
         log_async("[%s] session interactive : %s" % (name, " ".join(argv)))
@@ -4720,10 +4728,13 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         if proc is not None:
             stop_group_now(proc, "interruption (attach)", name=name)
             code = proc.wait()
+        else:
+            code = 130  # interrompu avant le lancement du harnais
     finally:
         stop.set()
-        thread.join(timeout=5)
-        veille.join(timeout=5)
+        for fil in (thread, veille):
+            if fil.ident is not None:
+                fil.join(timeout=5)
         try:
             registry.release(db, name, owner, epoch)
         except db_mod.DbError:
