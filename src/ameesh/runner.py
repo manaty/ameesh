@@ -3943,6 +3943,8 @@ class Runner:
                     log_async("lot #%s livré : %s%s" % (
                         entry["work_item"], entry["detail"],
                         " [dry-run]" if entry["result"] == "would-merge" else ""))
+            if not self.dry_run:
+                self.measure_once(db)
             self.radar_once(db)
             return report
         except Exception as exc:  # jamais fatal pour l'exécuteur
@@ -3957,6 +3959,23 @@ class Runner:
                     db.close()
                 except Exception:
                     pass
+
+    def measure_once(self, db) -> None:
+        """L157c: measures the lots delivered since the last sweep (phases,
+        merged diff) with the repositories of this host. Never raises."""
+        from . import lot_measures
+        try:
+            errors: list = []
+            for row in lot_measures.measure_pending(
+                    db, host=self.host,
+                    agents=set(self.agents_filter) if self.agents_filter else None,
+                    errors=errors):
+                log_async("lot #%s measured: %s" % (
+                    row["work_item_id"], lot_measures.describe_phases(row)))
+            for lot, exc in errors:
+                log_async("lot #%s not measured (%s: %s)" % (lot, type(exc).__name__, exc))
+        except Exception as exc:  # never fatal for the runner
+            log_async("lot measures impossible (%s: %s)" % (type(exc).__name__, exc))
 
     def radar_once(self, db) -> None:
         """L160b : un passage du radar de conflits, après le relevé des
