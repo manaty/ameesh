@@ -23,6 +23,13 @@
 # (tests/parts/lecteurs-doc.txt) tournent, sans base, dans « lecteurs de la
 # doc ». Et une exécution de main n'est jamais annulée par la suivante : chaque
 # fusion garde son verdict.
+#
+# L161b — chaque part écrit ses résultats au fil de l'eau (--flux, JSON lignes,
+# un test par ligne, schéma ameesh-test-event/1), publiés en artefact
+# (flux-<pilote>-<part>) et résumés dans le résumé du job (scripts/ci-flux.py).
+# Les modules de test touchés par les fichiers changés (--depuis HEAD^1 : la
+# cible pour une PR, le commit précédent sur main) passent en premier dans
+# chaque part. Rien n'est sauté ; le découpage en parts ne change pas.
 name: tests
 
 on:
@@ -42,6 +49,8 @@ permissions:
   contents: read
 
 env:
+  # L161b : commit poussé (tête de la PR), à côté du commit de fusion testé
+  AMEESH_CI_TETE: ${{ github.event.pull_request.head.sha || github.sha }}
   AMEESH_TEST_DSN: postgresql://ameesh@127.0.0.1:5432/ameesh
   PGPASSWORD: ameesh-ci
   AMEESH_REQUIRE_DB: "1"
@@ -101,6 +110,8 @@ jobs:
       AMEESH_DRIVER: psycopg
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # L161b : HEAD^1, pour l'ordre
       - id: py
         uses: actions/setup-python@v5
         with:
@@ -132,7 +143,21 @@ jobs:
           git config --global user.email "ci@ameesh.invalid"
           git config --global init.defaultBranch main
       - name: part ${{ matrix.part }}/4
-        run: .venv-ci/bin/python scripts/test-parts.py lancer --parts 4 --part ${{ matrix.part }} --pilote psycopg
+        run: >-
+          .venv-ci/bin/python scripts/test-parts.py lancer --parts 4 --part ${{ matrix.part }}
+          --pilote psycopg --depuis HEAD^1 --flux "$RUNNER_TEMP/flux.jsonl"
+      - &resume
+        name: résumé du flux
+        if: always()
+        run: python scripts/ci-flux.py resume "$RUNNER_TEMP/flux.jsonl" >> "$GITHUB_STEP_SUMMARY"
+      - name: flux en artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flux-psycopg-${{ matrix.part }}
+          path: ${{ runner.temp }}/flux.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
 
   psql:
     name: psql ${{ matrix.part }}/${{ github.event_name == 'pull_request' && 1 || 6 }}
@@ -163,13 +188,26 @@ jobs:
       LISTE: ${{ github.event_name == 'pull_request' && 'tests/parts/pilote-psql.txt' || '' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - *base
       - *git
       - name: part ${{ matrix.part }}
-        run: python scripts/test-parts.py lancer --parts "$PARTS" --part ${{ matrix.part }} --pilote psql ${LISTE:+--liste "$LISTE"}
+        run: >-
+          python scripts/test-parts.py lancer --parts "$PARTS" --part ${{ matrix.part }}
+          --pilote psql ${LISTE:+--liste "$LISTE"} --depuis HEAD^1 --flux "$RUNNER_TEMP/flux.jsonl"
+      - *resume
+      - name: flux en artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flux-psql-${{ matrix.part }}
+          path: ${{ runner.temp }}/flux.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
 
   # L63 : la couche plateforme (ameesh.platform) et son lint, sans base, sous
   # macOS avec psutil. Sous Linux, les parts psycopg passent par psutil et les
