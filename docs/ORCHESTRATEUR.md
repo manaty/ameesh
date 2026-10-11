@@ -22,8 +22,8 @@ lot**.
 
 | Situation | Commande |
 |---|---|
-| Nouveau travail | `ameesh mail send <agent> "…" --new-lot "RÉF : titre"` |
-| Demande d'un humain (L130) | `ameesh work add --title "RÉF : titre" --source "… « phrase exacte »" --priority N`, puis le message `--lot <id>` |
+| Nouveau travail | `ameesh mail send <agent> "…" --new-lot "RÉF : titre" --estimate 2h` |
+| Demande d'un humain (L130) | `ameesh work add --title "RÉF : titre" --source "… « phrase exacte »" --priority N --estimate 2h`, puis le message `--lot <id>` |
 | Lot existant, sans agent | `ameesh mail send <agent> "…" --lot <id\|RÉF>` |
 | Reprendre un lot à un autre agent | `ameesh work assign <id> <agent>`, puis le message `--lot <id>` |
 | Message sur un lot (relance, question) | `ameesh mail send <agent> "…" --lot <id>` |
@@ -61,17 +61,15 @@ le numéro du lot.**
   ```
   ameesh work add --title "RÉF : titre court" \
       --source "human:<id> (chat|courrier|session) : « <phrase exacte> »" \
-      --priority 1|2|3 [--type bug] [--assignee <agent>] \
-      --body "Estimation : 2 h"
+      --priority 1|2|3 --estimate 2h [--type bug] [--assignee <agent>]
   ```
 
   Priorité : 1 haute (bloque l'humain ou un projet), 2 normale, 3 basse.
-  Estimation : la durée prévue jusqu'à la PR verte. Le lot L157 (n° 166) ajoute
-  aux lots une durée estimée : une fois livrée, elle se pose par son option de
-  `work add` ; d'ici là, une ligne « Estimation : … » dans le corps.
+  Estimation : la durée prévue jusqu'à la fusion (L157, voir « Tout lot porte
+  une durée estimée dès sa création » ci-dessous).
 * **Confier** : `ameesh mail send <agent> "…" --lot <id>` sur le lot créé.
-  `--new-lot "titre"` confie en un seul geste, et rattache le courrier (qui
-  porte la phrase de l'humain) au lot créé, mais sans priorité ni estimation :
+  `--new-lot "titre" --estimate 2h` confie en un seul geste, et rattache le
+  courrier (qui porte la phrase de l'humain) au lot créé, mais sans priorité :
   `work add` reste préférable.
 * **Répondre** en citant le lot : « Enregistré : lot #142, priorité haute,
   estimation 2 h. »
@@ -87,6 +85,38 @@ source ([EXPLOITATION.md](EXPLOITATION.md#demandes-dhumains-sans-lot--ameesh-wor
 L'auditeur le passe à chaque passage court. Ce qu'un humain dit directement
 dans une session n'est pas en base : seul l'agent qui l'entend peut
 l'enregistrer.
+
+## Tout lot porte une durée estimée dès sa création
+
+Demande du propriétaire (2026-10-11, lot L157) : ameesh prévoit la roadmap
+complète des projets, donc **tout lot porte une durée estimée dès sa
+création**, posée par celui qui le conçoit. Un lot créé par un agent sans
+estimation est refusé (`work add`, `mail send --new-lot`) ; un humain reçoit
+un avertissement.
+
+| Situation | Commande |
+|---|---|
+| Créer un lot | `ameesh work add --title "RÉF : titre" --estimate 2h --estimate-source conception` |
+| Confier un nouveau travail | `ameesh mail send <agent> "…" --new-lot "RÉF : titre" --estimate 90m` |
+| Estimer ou ré-estimer un lot existant | `ameesh work plan <id> --estimate 1h30 --estimate-source "revue du découpage"` |
+| Voir l'estimation, le réel et l'écart | `ameesh work show <id>`, `ameesh projects` (colonne DURÉE) |
+| Écarts passés, pour calibrer | `ameesh work estimates [--app <projet>]` |
+
+* La durée est du temps **écoulé** (horloge murale), du début du travail à
+  la fusion, attentes comprises : `90m`, `2h`, `1h30`, `1,5h`, `2d` (48 h),
+  ou des minutes. Au-delà de quelques jours, découper le lot.
+* Le **début** est mesuré par ameesh : premier passage du lot en `build`, ou
+  premier tour de l'agent assigné sur le lot ; la **fin** est la fusion.
+  Rien à déclarer.
+* Estimer depuis l'historique : `ameesh work estimates` donne, par type de
+  lot et par auteur d'estimation, la médiane et le p80 du ratio réel/estimé
+  sur les lots livrés. Un ratio médian de ×1,4 sur les bugs veut dire :
+  multiplier l'intuition par 1,4. La source dit d'où vient le chiffre
+  (« historique bug ×1,4 »).
+* L'estimation comparée au réel est celle **en vigueur au début** du travail :
+  ré-estimer en cours de route est permis et tracé, mais ne corrige pas
+  l'écart. L'auditeur interne audite ces écarts et ajuste le processus
+  (docs/AUDITEUR.md).
 
 ## Toute décision du propriétaire passe par `ameesh decide ask`
 
@@ -189,8 +219,8 @@ ferme l'issue avec un commentaire qui dit pourquoi. L'issue d'un lot est son
 `issue_ref` (`ameesh work show <id>`), utilisable avec `--lot`.
 
 * Ne jamais créer à la main l'issue d'un lot : créer le lot (`--new-lot`,
-  `ameesh work add`). Son issue suit au passage suivant d'`ameesh notify`,
-  en moins d'une minute.
+  `ameesh work add`, avec `--estimate`). Son issue suit au passage suivant
+  d'`ameesh notify`, en moins d'une minute.
 * Une PR qui livre un lot porte ces deux lignes dans sa **description** :
 
   ```
@@ -257,7 +287,7 @@ Quand des agents réveillables restent au repos sans lot pendant que du
 travail attend, `ameesh notify` envoie à l'orchestrateur un courrier `event`
 d'`ameesh` : la liste des agents au repos de son équipe et des lots ouverts
 sans agent. Réponse attendue : leur confier ces lots (`--lot`), ou en créer
-(`--new-lot`). Un même épisode n'est envoyé qu'une fois.
+(`--new-lot … --estimate`). Un même épisode n'est envoyé qu'une fois.
 
 ## Le courrier « Courrier en souffrance »
 

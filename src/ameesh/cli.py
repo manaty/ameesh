@@ -2,12 +2,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """agent-mail (mesh v1) — boîte aux lettres des agents, sur Postgres.
 
-  agent-mail send <dest> <texte…> [--from NOM] [--lot ID|RÉF] [--new-lot "titre"] [--queue]
+  agent-mail send <dest> <texte…> [--from NOM] [--lot ID|RÉF] [--new-lot "titre"
+                 [--estimate 2h]] [--queue]
                                                  dépose un message (dest = nom, ou "all")
                                                  et l'écrit dans le fil lisible du projet
                                                  ou du lot (ameesh fil show <projet> [<lot>]) ;
                                                  d'un orchestrateur, --lot rattache le lot
-                                                 au destinataire et --new-lot le crée (L118) ;
+                                                 au destinataire et --new-lot le crée (L118),
+                                                 avec sa durée estimée --estimate (L157 :
+                                                 obligatoire quand un agent crée le lot) ;
                                                  refusé vers un nom absent du registre (noms
                                                  proches proposés), vers un agent arrêté
                                                  (sauf --queue) et depuis une identité arrêtée
@@ -227,7 +230,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     ack = "--ack" in args
     args = [arg for arg in args if arg != "--ack"]
     explicit_sender = "--from" in args
-    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--kind"):
+    estimate = None
+    for flag in ("--from", "--key", "--expires", "--lot", "--new-lot", "--kind", "--estimate"):
         if flag in args:
             index = args.index(flag)
             value = args[index + 1] if index + 1 < len(args) else None
@@ -242,6 +246,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 lot = value
             elif flag == "--new-lot":
                 new_lot = value if value is not None else ""
+            elif flag == "--estimate":
+                estimate = value if value is not None else ""
             else:
                 kind = value
     if "--urgent" in args:
@@ -272,7 +278,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if len(args) < 2:
         print("usage: agent-mail send <dest|all> <texte…> [--from NOM] [--lot ID|RÉF] "
-              "[--new-lot \"titre\"] [--kind request|reply|notify|event] [--urgent] "
+              "[--new-lot \"titre\" [--estimate 2h]] [--kind request|reply|notify|event] "
+              "[--urgent] "
               "[--ack] [--cc NOM[,NOM…]] [--sign --key FICHIER] [--expires 24h] [--queue]",
               file=sys.stderr)
         return 2
@@ -284,6 +291,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     if new_lot is not None and not new_lot.strip():
         print("--new-lot : titre vide", file=sys.stderr)
+        return 2
+    if estimate is not None and new_lot is None:
+        print("--estimate accompagne --new-lot (la durée estimée du lot créé ; pour un lot "
+              "existant : ameesh work plan <id> --estimate 2h)", file=sys.stderr)
         return 2
     dest, text = args[0], " ".join(args[1:]).strip()
     binding = None
@@ -399,7 +410,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         try:
             linked = assignments.link_message(
                 cfg, bk.db, sender=sender, recipient=dest, lot=lot, new_lot=new_lot,
-                branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None)
+                branch=plan_git.cited_branch(text) if (lot or new_lot is not None) else None,
+                estimate=estimate)
         except assignments.AssignmentError as exc:
             print("message non déposé — %s" % exc, file=sys.stderr)
             return 2

@@ -30,3 +30,5 @@ test_l124_decisions
 test_l130_demandes_sans_lot
 # stockage : signalements de /tmp filtrés par `kind` (housekeeping.recent, L162)
 test_l162_tmpfs
+# stockage : estimations (booléens liés, transactions, historique) — L157
+test_l157_estimations
