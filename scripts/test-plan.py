@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import builtins
 import collections
 import datetime
 import importlib.util
@@ -97,8 +98,9 @@ FOUNDATION = ("tests/support.py", "tests/__init__.py", "tests/fakebin/", ".githu
               "scripts/test-parts.py", "scripts/test-plan.py", "scripts/carte.py",
               "scripts/carte_mesure.py", "scripts/ci-flux.py", "scripts/version-only.py")
 #: a migration that is not purely additive impacts every database test
+#: (any `drop`, `alter table t drop c` included; `create or replace` rewrites)
 _NOT_ADDITIVE = re.compile(
-    r"\b(drop\s+(table|column|index|constraint|view|function|trigger|type|schema)"
+    r"\b(drop|create\s+or\s+replace"
     r"|rename\s+(to|column)|alter\s+column\s+[\w\"]+\s+(set\s+data\s+)?type"
     r"|truncate)\b", re.I)
 
@@ -266,7 +268,7 @@ def _python(card: dict, impact: Impact, status: str, path: str, head: str,
         impact.hit(listers, f"{path} (new file in {where})")
         return
     added = set(new) - set(old)
-    stripped = _without_new_functions(source, added, _method_names(card)) if added else new
+    stripped = _without_new_functions(source, added) if added else new
     for name, info in sorted(old.items()):
         after = new.get(name)
         if after is not None and after["empreinte"] == info.get("empreinte"):
@@ -280,41 +282,48 @@ def _python(card: dict, impact: Impact, status: str, path: str, head: str,
     impact.unknown_blocks.extend(f"{path}::{b}" for b in sorted(added))
 
 
-def _method_names(card: dict) -> set[str]:
-    return {b.rsplit(".", 1)[-1] for bs in card.get("blocs", {}).values() for b in bs if "." in b}
+def _dynamic(tree: ast.AST) -> bool:
+    """Whether the module may reach a function by a computed name: `import *`,
+    `globals()`, `vars()`, `locals()`, or `getattr` with a name that is not a
+    literal (`getattr(self, "_" + kind)`). A new function is then never taken out."""
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and any(a.name == "*" for a in n.names):
+            return True
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name):
+            if n.func.id in ("globals", "vars", "locals"):
+                return True
+            if n.func.id in ("getattr", "hasattr") and len(n.args) > 1 \
+                    and not isinstance(n.args[1], ast.Constant):
+                return True
+    return False
 
 
-def _without_new_functions(source: str, added: set[str], methods: set[str]) -> dict:
-    """The blocks of `source` once its new, plain functions are taken out.
+def _without_new_functions(source: str, added: set[str]) -> dict:
+    """The blocks of `source` once its new, plain module-level functions are
+    taken out.
 
     A new function runs only when a caller runs it, and that caller changed:
     its tests are found there (study, section 1). Taking it out keeps its
-    module or class unchanged for the map. A function stays in (its module
-    or class counts as changed) when it is decorated (a decorator runs at
-    import: registration), a dunder, a method whose name exists elsewhere
-    (it may override a base class method), or a name the module also binds
-    otherwise. New classes always count: their body runs at import.
+    module unchanged for the map. A function stays in (its module counts as
+    changed) when it is decorated (a decorator runs at import: registration),
+    a dunder, or a name the module also binds otherwise or a builtin it may
+    shadow (`def list()`). Nothing is taken out of a module that may call a
+    function by a computed name (`_dynamic`). New methods and new classes
+    always count: a method may override a base class method or be dispatched
+    by name (`do_DELETE` of BaseHTTPRequestHandler), a class body runs at import.
     """
     tree = ast.parse(source)
+    if _dynamic(tree):
+        return carte.blocs(source)[0]
     bound = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
              and isinstance(n.ctx, ast.Store)}
     bound |= {(a.asname or a.name).split(".")[0] for n in ast.walk(tree)
               if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
-
-    def strip(body: list, prefix: str) -> list:
-        kept = []
-        for node in body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                    and prefix + node.name in added and not node.decorator_list \
-                    and not node.name.startswith("__") and node.name not in bound \
-                    and not (prefix and node.name in methods):
-                continue
-            if isinstance(node, ast.ClassDef):
-                node.body = strip(node.body, prefix + node.name + ".") or [ast.Pass()]
-            kept.append(node)
-        return kept
-
-    tree.body = strip(tree.body, "")
+    bound |= set(dir(builtins))
+    tree.body = [node for node in tree.body
+                 if not (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                         and node.name in added and not node.decorator_list
+                         and not node.name.startswith("__") and node.name not in bound)]
     return carte.blocs(ast.unparse(tree))[0]
 
 
@@ -471,7 +480,8 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
                    unknown_blocks=impact.unknown_blocks, foundation=impact.foundation,
                    sure=not impact.unsure)
         out["phase2_safe"] = (out["sure"] and age is not None and age <= PHASE2_MAX_AGE_H
-                              and not impact.unknown_blocks and not impact.foundation)
+                              and not impact.unknown_blocks and not impact.foundation
+                              and not impact.untested)
     changes = changes or []
     out["changed"] = len(changes)
     for m, r in always_hits(changes, always).items():
@@ -530,6 +540,21 @@ def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
     return out
 
 
+def doc_readers(files: list[str], card: dict | None,
+                modules: list[str]) -> tuple[list[str], list[str]]:
+    """Readers of a documentation-only change: the declared ones
+    (`tests/parts/lecteurs-doc.txt`) plus, with a usable map, the measured
+    ones; and the measured readers that need the database, which the
+    doc-readers job (no Postgres) cannot run."""
+    readers = {n.split(".", 1)[1] for n in version_only.doc_readers()}
+    measured: set[str] = set()
+    if card is not None:
+        for f in files:
+            measured |= set(card.get("donnees", {}).get(f, ()))
+    db = sorted(m for m in measured - readers if m in modules and m in _db_modules(card or {}))
+    return sorted(m for m in readers | measured if m in modules), db
+
+
 def make_plan(event: str, card: dict | None, now: datetime.datetime | None = None,
               head: str = "HEAD", repo: pathlib.Path = REPO) -> dict:
     now = now or datetime.datetime.now(datetime.timezone.utc)
@@ -541,11 +566,17 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     classes = {m: tuple(c) for m, c in plan["classes"].items()}
     plan["doc_readers"] = []
     if plan["docs_only"]:
-        readers = {n.split(".", 1)[1] for n in version_only.doc_readers()}
-        if plan["map"] and plan["map"]["used"]:
-            for f in plan.get("files", []):
-                readers |= set(card.get("donnees", {}).get(f, ()))
-        plan["doc_readers"] = sorted(m for m in readers if m in modules)
+        used = card if plan["map"] and plan["map"]["used"] else None
+        plan["doc_readers"], db_readers = doc_readers(plan.get("files", []), used, modules)
+        if db_readers:  # doc-readers has no Postgres: the full parts run them
+            plan["docs_only"] = False
+            plan["why"] = (f"documentation read by database tests "
+                           f"({', '.join(db_readers)}): full parts")
+            plan["doc_readers"] = []
+            for m in db_readers:
+                if plan["classes"].get(m, ["P3"])[0] not in ("P0", "P1"):
+                    plan["classes"][m] = ["P1", "reads the changed documentation"]
+            classes = {m: tuple(c) for m, c in plan["classes"].items()}
     skip = plan["version_only"] or plan["docs_only"]
     pr = event == "pull_request"
     plan["parts"] = {}

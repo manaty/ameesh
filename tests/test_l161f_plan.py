@@ -83,6 +83,7 @@ class _Repo:
         self.write("docs/guide.md", "# Guide\n")
         self.write("deploy/install.sh", "echo\n")
         self.base = self.commit()
+        self.code = CODE_V1  # src/ameesh/code.py at the map commit
 
     def write(self, rel: str, text: str) -> None:
         f = self.path / rel
@@ -99,14 +100,14 @@ class _Repo:
 
     def card(self) -> dict:
         """A map of the first commit: who executed, read, listed, touched what."""
-        infos, _ = carte.blocs(CODE_V1)
+        infos, _ = carte.blocs(self.code)
         users = {"<module>": ["test_a", "test_b", "test_c"], "used": ["test_a"],
                  "untested": [], "Box": ["test_b"], "Box.get": ["test_b"]}
         return {
             "schema": carte.SCHEMA, "commit": self.base, "genere": NOW.isoformat(),
             "modules": {m: {"durees": {"psycopg": 1.0}, "echecs": []}
                         for m in ("test_a", "test_b", "test_c", "test_db", "test_old")},
-            "blocs": {"src/ameesh/code.py": {n: {**i, "modules": users[n]}
+            "blocs": {"src/ameesh/code.py": {n: {**i, "modules": users.get(n, [])}
                                              for n, i in infos.items()}},
             "donnees": {"data/conf.json": ["test_c"], "deploy/sql/role.sql": ["test_cluster"]},
             "dossiers": {"data": ["test_lister"], "src/ameesh/migrations": ["test_migrations"]},
@@ -170,14 +171,34 @@ class JudgeTest(unittest.TestCase):
                 self.repo.commit()
                 self.assertIn("test_c", self.repo.judge().p1, why)
 
-    def test_new_method_overriding_a_known_name_counts_for_its_class(self):
-        added = "\n    def put(self):\n        pass\n"
-        self.repo.write("src/ameesh/code.py", CODE_V1 + added)
+    def test_new_method_always_counts_for_its_class(self):
+        # L161f review (a): a method may override a base method or be dispatched
+        # by name (do_DELETE of BaseHTTPRequestHandler), even with a new name
+        self.repo.write("src/ameesh/code.py", CODE_V1 + "\n    def do_DELETE(self):\n        pass\n")
         self.repo.commit()
-        self.assertNotIn("test_b", self.repo.judge().p1)  # `put` exists nowhere
-        self.repo.write("src/ameesh/code.py", CODE_V1 + added.replace("put", "get"))
-        self.repo.commit()  # a second `get`: may override, Box changed
         self.assertIn("test_b", self.repo.judge().p1)
+
+    def test_new_function_shadowing_a_builtin_counts(self):
+        self.repo.write("src/ameesh/code.py", CODE_V1 + "\n\ndef list():\n    pass\n")
+        self.repo.commit()
+        self.assertIn("test_c", self.repo.judge().p1)
+
+    def test_nothing_taken_out_of_a_dynamic_module(self):
+        def judged(line: str) -> dict:
+            self.repo.code = CODE_V1 + line + "\n"  # the map knows the line
+            self.repo.write("src/ameesh/code.py", self.repo.code)
+            self.repo.base = self.repo.commit()
+            self.repo.write("src/ameesh/code.py", self.repo.code + "\n\ndef _extra():\n    pass\n")
+            self.repo.commit()
+            return self.repo.judge().p1
+
+        for why, line in {"getattr with a computed name": "f = getattr(Box, '_' + 'x', None)",
+                          "globals()": "g = globals()",
+                          "import *": "from os.path import *"}.items():
+            with self.subTest(why):
+                self.assertIn("test_c", judged(line), why)
+        # a literal getattr name stays static: the new function is taken out
+        self.assertEqual(judged("f = getattr(Box, 'size')"), {})
 
     def test_removed_file_impacts_all_its_tests(self):
         self.repo.remove("src/ameesh/code.py")
@@ -254,6 +275,49 @@ class MapTest(unittest.TestCase):
         self.repo = _Repo()
         self.addCleanup(self.repo.close)
 
+    def _classify(self) -> dict:
+        mods = ["test_a", "test_b", "test_c", "test_db"]
+        with mock.patch.object(plan, "ALWAYS_FILE", self.repo.path / "none.txt"):
+            return plan.classify(mods, self.repo.card(), NOW, head="HEAD", repo=self.repo.path)
+
+    def test_phase2_unsafe_with_changed_lines_without_a_test(self):
+        # L161f review (4)
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x * 2", "x * 3"))
+        self.repo.commit()
+        out = self._classify()
+        self.assertTrue(out["sure"])
+        self.assertEqual([u["block"] for u in out["untested"]], ["untested"])
+        self.assertFalse(out["phase2_safe"])
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        self.assertTrue(self._classify()["phase2_safe"])
+
+    def test_rewrites_and_bare_drops_are_not_additive(self):
+        # L161f review (4)
+        for sql in ("create or replace function f() returns int as $$ select 1 $$ language sql;",
+                    "create or replace view v as select id from things;",
+                    "alter table things drop id;",
+                    "alter table things alter column id drop not null;"):
+            with self.subTest(sql):
+                self.assertTrue(plan._NOT_ADDITIVE.search(sql), sql)
+        for sql in ("alter table things add column name text;",
+                    "create table if not exists more (id int);",
+                    "create index things_id on things (id);"):
+            with self.subTest(sql):
+                self.assertFalse(plan._NOT_ADDITIVE.search(sql), sql)
+
+    def test_doc_readers_needing_the_database(self):
+        # L161f review (c): doc-readers has no Postgres
+        card = self.repo.card()
+        card["donnees"]["docs/guide.md"] = ["test_c", "test_db"]
+        declared = {n.split(".", 1)[1] for n in plan.version_only.doc_readers()}
+        mods = ["test_a", "test_c", "test_db", *declared]
+        readers, db = plan.doc_readers(["docs/guide.md"], card, mods)
+        self.assertEqual(db, ["test_db"])
+        self.assertEqual(readers, sorted({"test_c", "test_db", *declared}))
+        readers, db = plan.doc_readers(["docs/guide.md"], None, mods)  # map not used
+        self.assertEqual((readers, db), (sorted(declared), []))
+
     def test_map_problems(self):
         card = self.repo.card()
         self.assertEqual(plan.map_problem(card, NOW, "HEAD", self.repo.path), ("", 0.0))
@@ -284,7 +348,7 @@ class MapTest(unittest.TestCase):
             source = f.read_text(encoding="utf-8")
             def prints(blocks):
                 return {k: v["empreinte"] for k, v in blocks.items()}
-            self.assertEqual(prints(plan._without_new_functions(source, set(), set())),
+            self.assertEqual(prints(plan._without_new_functions(source, set())),
                              prints(carte.blocs(source)[0]), f)
 
 
@@ -353,6 +417,30 @@ class PlanTest(unittest.TestCase):
             with self.subTest(driver=driver):
                 seen = [m for ps in p["parts"][driver] for m in ps["modules"]]
                 self.assertEqual(sorted(seen), mods)  # every one, none twice
+
+    def test_docs_only_read_by_a_database_test_runs_the_parts(self):
+        mods = parts.modules()
+        db, plain = mods[0], mods[1]
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, check=True,
+                              capture_output=True, text=True).stdout.strip()
+        card = {"schema": carte.SCHEMA, "commit": head, "genere": NOW.isoformat(),
+                "modules": {m: {"durees": {"psycopg": 1.0}, "echecs": []} for m in mods},
+                "blocs": {}, "dossiers": {}, "migrations": {},
+                "donnees": {"docs/guide.md": [db, plain]}, "tables": {"things": [db]}}
+        docs = {"version_only": False, "docs_only": True, "why": "docs", "files": ["docs/guide.md"]}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)):
+            p = plan.make_plan("pull_request", card, NOW)
+        self.assertFalse(p["docs_only"])
+        self.assertIn(db, p["why"])
+        self.assertEqual(p["doc_readers"], [])
+        self.assertEqual(p["classes"][db][0], "P1")
+        self.assertTrue(p["parts"]["psycopg"])
+        card["tables"] = {}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)):
+            p = plan.make_plan("pull_request", card, NOW)
+        self.assertTrue(p["docs_only"])
+        self.assertIn(db, p["doc_readers"])
+        self.assertEqual(p["parts"]["psycopg"], [])
 
     def _main_plan(self) -> dict:
         d = pathlib.Path(tempfile.mkdtemp())
