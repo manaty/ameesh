@@ -161,10 +161,13 @@ class FakeGh:
     def __init__(self):
         self.head = None
         self.ci = "pending"
+        self.fail = False
         self.calls: list = []
 
     def __call__(self, args, timeout=60.0):
         self.calls.append(args)
+        if self.fail:
+            return subprocess.CompletedProcess(args, 4, "", "authentication required")
         if args[:2] == ["pr", "list"]:
             check = {"pending": {"status": "IN_PROGRESS", "conclusion": None},
                      "green": {"status": "COMPLETED", "conclusion": "SUCCESS"},
@@ -180,6 +183,7 @@ class PrLandTest(_Land):
     def test_merge_pushed_to_the_branch_then_pr_merged_when_green(self):
         gh = FakeGh()
         self.queued(4)
+        gh.head = self.tip(4)
         out = self.land(4, gh=gh)
         self.assertEqual(out["result"], "landing", out)
         row = self.fake.queue_rows[4]
@@ -208,6 +212,7 @@ class PrLandTest(_Land):
             with self.subTest(why):
                 gh = FakeGh()
                 self.queued(4)
+                gh.head = self.tip(4)
                 out = self.land(4, gh=gh)
                 gh.head, gh.ci = (out["sha"], "red") if why == "red" else ("f" * 40, "green")
                 self.assertEqual(self.land(4, gh=gh)["result"], "ejected")
@@ -215,6 +220,33 @@ class PrLandTest(_Land):
                               self.fake.queue_rows[4]["reason"])
                 self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls))
                 _git(self.repo, "push", "-q", "-f", "origin", "%s:lot/4-d" % self.tip(4))
+
+    def test_pr_not_at_the_freeze_ejects_before_any_push(self):
+        gh = FakeGh()
+        self.queued(4)
+        before = _git(self.origin, "rev-parse", "lot/4-d")
+        gh.head, gh.ci = "e" * 40, "green"
+        self.assertEqual(self.land(4, gh=gh)["result"], "ejected")
+        self.assertIn("not at the freeze", self.fake.queue_rows[4]["reason"])
+        self.assertEqual(_git(self.origin, "rev-parse", "lot/4-d"), before)
+
+    def test_github_error_while_landing_keeps_it_landing(self):
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        locks: dict = {}
+        out = self.land(4, gh=gh, locks=locks)
+        self.assertEqual(out["result"], "landing", out)
+        gh.fail = True
+        failed = self.land(4, gh=gh, locks=locks)
+        self.assertEqual(failed["result"], "error", failed)
+        self.assertIn("authentication required", failed["error"])
+        row = self.fake.queue_rows[4]
+        self.assertEqual((row["state"], row["landing_sha"]), ("landing", out["sha"]))
+        self.assertTrue(locks, "the lease is kept")
+        self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls))
+        gh.fail, gh.head, gh.ci = False, out["sha"], "green"
+        self.assertEqual(self.land(4, gh=gh, locks=locks)["result"], "landed")
 
     def test_no_pr_ejects(self):
         self.queued(4)

@@ -271,6 +271,13 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
             out = _eject(db, row, project, "no open PR for %s" % row["branch"],
                          "Open the PR, then ameesh work queue add %d." % lot)
             return dict(out, result="ejected")
+        if not merge_queue._same(status["head"], row["frozen_sha"]):
+            unlock()
+            out = _eject(db, row, project, "PR #%s is at %s, not at the freeze %s" % (
+                status["number"], (status["head"] or "?")[:12], row["frozen_sha"][:12]),
+                "Something pushed to the branch after its freeze: freeze again, then "
+                "ameesh work queue add %d." % lot)
+            return dict(out, result="ejected")
         proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify", url,
                                 "%s:refs/heads/%s" % (merged["sha"], row["branch"]),
                                 timeout=FETCH_TIMEOUT)
@@ -291,10 +298,16 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         return {"lot": lot, "result": "landing", "sha": merged["sha"],
                 "replayed": merged["files"] if merged["state"] == "replayed" else []}
     except (GitError, LandError, OSError, ValueError) as exc:
+        error = {"lot": lot, "result": "error", "error": "%s: %s" % (type(exc).__name__, exc)}
+        if row["state"] == "landing":
+            # its branch holds the merge commit: it stays `landing`, lease kept,
+            # and the PR is read again at the next pass (an error never merges)
+            ops.queue_update(lot, reason="reading PR failed (%s): retried" % str(exc)[:200])
+            return error
         unlock()
         ops.queue_update(lot, state="queued", reason="landing failed (%s): retried"
                          % str(exc)[:200])
-        return {"lot": lot, "result": "error", "error": "%s: %s" % (type(exc).__name__, exc)}
+        return error
 
 
 def _follow_pr(db, project, row: dict, slug, unlock, *, gh) -> dict:
