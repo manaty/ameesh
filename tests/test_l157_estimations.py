@@ -192,7 +192,7 @@ class VersionOnlyTest(unittest.TestCase):
         self.assertIn("scripts/version-only.py HEAD^1 HEAD", text)
         # les trois groupes de parts dépendent du constat ; le bilan l'accepte
         self.assertEqual(text.count("if: needs.changes.outputs.version_only != 'true'"), 3)
-        self.assertIn("needs: [changes, psycopg, psql, platform-macos]", text)
+        self.assertIn("needs: [changes, psycopg, psql, platform-macos", text)
 
 
 class EstimatesPgTest(PgTestCase):

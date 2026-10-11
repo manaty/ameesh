@@ -21,6 +21,14 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   **que le numéro de version** (`pyproject.toml` seul, la seule ligne
   `version = "…"`) ne relance pas la suite : `main` l'a déjà validée pour ce
   contenu ; le contrôle « tests » reste vert (`scripts/version-only.py`, L157).
+- **PR de documentation seule** (L161a) : si chaque fichier changé est sous
+  `docs/` ou `site/`, ou un `*.md` hors de `src/`, `tests/`, `.github/` et
+  `examples/`, la CI ne passe que les tests qui lisent la documentation,
+  sans base (« lecteurs de la doc », moins d'une minute). Un test qui ouvre
+  un fichier de `docs/` ou `site/` se déclare dans
+  `tests/parts/lecteurs-doc.txt` ; `tests/test_l161a_ci_sans_code.py` le
+  vérifie. Sur `main`, la suite complète tourne à chaque fusion et n'est
+  jamais annulée par la fusion suivante.
 - **Tests indépendants du poste** (L142) : le poste et la CI donnent le même
   verdict. À l'import, `tests/support.py` retire toutes les variables
   `AMEESH_*`, `AGENT_MESH_*` et `AGENT_MAIL_*` de la session (identité
