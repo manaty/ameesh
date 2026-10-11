@@ -182,6 +182,31 @@ class AttachPermissionTest(PgTestCase):
         self.assertEqual(self.mesh("set", "perm", "permission_mode=a b").returncode, 2)
         self.assertIsNotNone(registry.get(self.db, "perm"))
 
+    def test_attach_reglage_illisible_ignore(self):
+        # verdict codex #182 (P2) : octet 0xff dans le réglage de l'agent
+        dossier = self.cfg.agent_dir("perm")
+        os.makedirs(dossier, exist_ok=True)
+        with open(os.path.join(dossier, "permission_mode"), "wb") as fh:
+            fh.write(b"\xffplan")
+        self.assertEqual(self._attach()[:2], ["--permission-mode", "auto"])
+        self.assertIsNone(registry.get(self.db, "perm")["lease_owner"])
+
+    def test_attach_ctrl_c_pendant_la_preparation_rend_le_bail(self):
+        # verdict codex #182 (P2) : Ctrl-C pendant un `claude --help` lent
+        base = dict(_sans_variable(), AMEESH_BIN_DIR=FAKEBIN, AMEESH_TEST_LOG=self.turns_log)
+        vrai_run = subprocess.run
+
+        def run(argv, *a, **k):
+            if argv[-1:] == ["--help"]:
+                raise KeyboardInterrupt
+            return vrai_run(argv, *a, **k)
+        with mock.patch.dict(os.environ, base, clear=True), \
+                mock.patch.object(adapters.subprocess, "run", side_effect=run):
+            self.assertEqual(run_attach(self.cfg, self.db, "perm", ttl=30), 130)
+        self.assertIsNone(registry.get(self.db, "perm")["lease_owner"])
+        # l'aide interrompue n'est pas retenue comme illisible
+        self.assertEqual(self._attach()[:2], ["--permission-mode", "auto"])
+
     def test_attach_survit_a_une_aide_en_erreur(self):
         # verdict codex #182 (3) : l'aide est lue avant le try/finally de
         # l'attach ; une erreur ne doit ni l'interrompre ni garder le bail
