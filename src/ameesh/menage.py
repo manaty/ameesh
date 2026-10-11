@@ -112,10 +112,14 @@ TMP_TOP = 5
 #: L162 : systèmes de fichiers en mémoire — jamais une racine gérée
 MEMORY_FS = ("tmpfs", "ramfs")
 #: L162 : l'action attendue quand le tmpfs se remplit (alertes, journal)
+#: #234: since #222 the housekeeping deletes by itself only a signal attributed
+#: before #222; a new /tmp entry is never charged to a turn nor deleted
 TMPFS_ACTION = ("action attendue : supprimer ce qui ne sert plus (commande par entrée "
-                "dans `ameesh menage`) ; le ménage supprime seul une entrée laissée par "
-                "un tour, inchangée depuis %s et tenue par aucun processus ; les agents "
-                "écrivent dans $TMPDIR, jamais en dur dans /tmp")
+                "dans `ameesh menage` ou dans l'alerte `tmp_orphan`) ; le ménage ne "
+                "supprime seul qu'une entrée signalée attribuée d'avant #222, inchangée "
+                "depuis %s et tenue par aucun processus ; une entrée apparue depuis n'est "
+                "jamais supprimée par ameesh ; les agents écrivent dans $TMPDIR, jamais "
+                "en dur dans /tmp")
 
 #: dossier géré sous l'état d'ameesh (un nom d'agent ne commence jamais par
 #: un point : pas de collision avec `<état>/<agent>`)
