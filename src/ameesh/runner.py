@@ -4584,6 +4584,17 @@ def stop_group_now(proc: subprocess.Popen, reason: str, *, name: str = "",
     log_async("[%s] harnais arrêté (%s)" % (name or "?", reason))
 
 
+def _attach_permission_mode(cfg: Config, name: str) -> str:
+    """L223 : le mode de permission réglé pour l'agent (`ameesh set <agent>
+    permission_mode=…`, état local de son hôte), '' sans réglage."""
+    try:
+        with open(os.path.join(cfg.agent_dir(name), "permission_mode"),
+                  encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
 def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
                ttl: float | None = None) -> int:
     """`ameesh attach <agent>` : bail interactif sur la même session (C9).
@@ -4680,7 +4691,8 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     thread.start()
     veille = threading.Thread(target=veilleur, daemon=True, name="%s-attach-veilleur" % name)
     veille.start()
-    argv = adapter.interactive_command(agent.get("session_id"))
+    argv = adapter.interactive_command(agent.get("session_id"),
+                                       permission_mode=_attach_permission_mode(cfg, name))
     env = _attach_env(cfg, name, owner, epoch)
     env.update(adapter.env())
     env.update(_attach_tmp_env(cfg, name, env))

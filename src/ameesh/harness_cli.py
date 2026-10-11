@@ -85,6 +85,12 @@ def _show_text(descriptor: harnesses.HarnessDescriptor) -> None:
     print("commande       : %s" % (" ".join(descriptor.command) or "—"))
     if descriptor.attach:
         print("interactif     : %s" % (" ".join(descriptor.interactive) or "—"))
+        regle = descriptor.interactive_permission
+        if regle:
+            print("permission     : %s (défaut %s%s%s)" % (
+                " ".join(regle["flag"]), regle["default"] or "—",
+                ", env : %s" % ", ".join(regle["env"]) if regle["env"] else "",
+                ", repli : %s" % regle["fallback"] if regle["fallback"] else ""))
     else:
         print("interactif     : non déclaré (attach indisponible)")
     print("session        : %s" % (" ".join(descriptor.session_flag) or "— (ACP)"))
