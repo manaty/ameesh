@@ -14,3 +14,7 @@ _site/
 # assistant du site : index et archive reconstruits à chaque déploiement (L33)
 chatbot/index.json
 chatbot/dist/
+# Terraform (profil serveur, L55)
+deploy/serveur/terraform/.terraform/
+deploy/serveur/terraform/*.tfstate*
+deploy/serveur/terraform/*.tfvars
