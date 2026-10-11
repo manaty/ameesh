@@ -122,6 +122,12 @@ class Hosts(interface.HostResources):
             """, (host, float(since_s)))
         return rows[0] if rows else {"samples": 0}
 
+    def since(self, host, since_s) -> list[dict]:
+        return self.db.query(
+            "SELECT " + READING_COLUMNS + " FROM host_resources WHERE host = %s"
+            " AND sampled_at >= now() - make_interval(secs => %s)"
+            " ORDER BY sampled_at, id", (host, float(since_s)))
+
     def lend_basis(self, host, since_s, slot_s, percentile) -> dict:
         rows = self.db.query(
             """

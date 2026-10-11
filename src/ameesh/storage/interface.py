@@ -2032,6 +2032,11 @@ class HostResources(Domain):
         """Nombre d'agents de l'hôte en tour (statut `running`, bail vivant)."""
 
     @abc.abstractmethod
+    def since(self, host: str, since_s: float) -> list[dict]:
+        """L159g: the readings of the host over the last `since_s` seconds,
+        oldest first (the pilot report)."""
+
+    @abc.abstractmethod
     def lend_basis(self, host: str, since_s: float, slot_s: float,
                    percentile: float) -> dict:
         """L159d: history behind the lendable capacity, over the last
