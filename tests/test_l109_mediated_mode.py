@@ -353,6 +353,13 @@ class SessionTest(unittest.TestCase):
         req = [r for r in self.session_requests() if r["body"]["op"] == "mailbox.send"][-1]
         self.assertEqual(req["body"]["args"][:2], ["inge-front", "coord"])
         self.assertTrue(req["headers"].get(C.IDEMPOTENCY_HEADER))
+
+    def test_new_work_item_refused_before_mail_is_sent(self):
+        code, _out, err = self.ameesh("mail", "send", "coord", "Review the change.",
+                                     "--new-lot", "Review", "--estimate", "1h")
+        self.assertEqual(code, 2)
+        self.assertIn("mediated contract 1.1", err)
+        self.assertEqual(self.server.ops(), ["leases.state"])
         self.assert_session_only()
 
     def test_hook_remet_par_la_session(self):

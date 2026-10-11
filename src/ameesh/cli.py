@@ -402,10 +402,16 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     # L118 : le courrier qui confie du travail est lié à un lot (avant le
     # dépôt : une attribution refusée ne dépose rien)
     thread_meta = None
+    if new_lot is not None and getattr(bk, "mediated", False):
+        print("--new-lot is unavailable in mediated contract 1.1; create and assign "
+              "the work item on the server before sending mail", file=sys.stderr)
+        return 2
     if new_lot is not None and (bk.kind != "pg" or dest == "all"):
         print("--new-lot exige la base et un destinataire précis", file=sys.stderr)
         return 2
-    if bk.kind == "pg" and dest != "all":
+    # Contract 1.1 permits a thread label, but not assignment or work creation.
+    # The server remains responsible for linking and assigning work items.
+    if bk.kind == "pg" and dest != "all" and not getattr(bk, "mediated", False):
         from . import assignments, plan_git
         try:
             linked = assignments.link_message(
