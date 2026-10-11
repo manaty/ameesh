@@ -22,6 +22,12 @@ qu'il ne fait jamais, et comment il en rend compte.
   l'alerte ;
 * le courrier « Analyse profonde » d'`ameesh`, chaque nuit, ou une demande du
   propriétaire : analyse profonde ;
+* le courrier `event` d'`ameesh` sur une alerte que l'orchestrateur doit
+  traiter (L132) : « Lot stagnant : … », « Forfait sous-employé : … »,
+  « Capacité au repos : … », et leur « Relance » 6 h plus tard si l'alerte
+  dure. La commande citée est le geste de l'orchestrateur ; l'auditeur vérifie
+  au passage court suivant qu'il a été fait, et sinon le nomme dans son
+  rapport (une relance reçue veut dire que rien n'a bougé en 6 h) ;
 * le courrier « Déploiement … », envoyé par l'unité de redémarrage qu'il a
   lancée hors de son tour (voir « Déployer ») ;
 * la relance « Reprise » de l'exécuteur (`--idle-nudge`), qui vaut un passage
