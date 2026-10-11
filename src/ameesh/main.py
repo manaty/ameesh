@@ -85,7 +85,7 @@
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
   ameesh migrate | doctor     schéma et diagnostic ;
   ameesh canon check|show|sync          canon OKF : validation, fiches, registre ;
-  ameesh harness list|show|check        descripteurs de harnais (L16) ;
+  ameesh harness list|show|check|versions  harnesses (L16, L120) ;
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
   ameesh menage [--apply] [--json]      ménage de ce que les agents créent (L73) ;

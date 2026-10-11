@@ -133,14 +133,14 @@ class VersionDbTest(PgTestCase):
     def test_cli(self):
         storage.of(self.db).hosts.record_harness_version(
             "other-host", "claude", path="/c", version="1.0.0", raw="1.0.0")
-        proc = self.cli("harness", "versions", "--probe", "--json", env=self.env(**FAKE_ENV))
+        proc = self.mesh("harness", "versions", "--probe", "--json", env=self.env(**FAKE_ENV))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         out = json.loads(proc.stdout)
         self.assertEqual(out["schema"], "ameesh-harness-versions/1")
         claude = {t["harness"]: t for t in out["harnesses"]}["claude"]
         self.assertTrue(claude["differs"])
         self.assertEqual(claude["behind"], ["other-host"])
-        text = self.cli("harness", "versions", env=self.env(**FAKE_ENV))
+        text = self.mesh("harness", "versions", env=self.env(**FAKE_ENV))
         self.assertEqual(text.returncode, 0, text.stderr)
         self.assertIn("hosts differ", text.stdout)
         self.assertIn("behind: other-host", text.stdout)
