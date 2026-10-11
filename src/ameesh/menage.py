@@ -65,6 +65,7 @@ import getpass
 import json
 import os
 import shlex
+import re
 import shutil
 import stat
 import subprocess
@@ -352,12 +353,62 @@ def cache_names(policy: Policy) -> list[tuple[str, tuple[str, ...]]]:
     return list(CACHES) + ([XDG_CACHE] if policy.xdg_cache else [])
 
 
+def _conninfo_fields(dsn: str) -> dict[str, str]:
+    """The fields of a DSN, URI or key=value, following libpq's rules (quotes
+    and backslashes, percent-encoding, query parameters, several hosts). Pure
+    Python: the psql driver runs without psycopg, and the key must not depend
+    on the driver."""
+    from urllib.parse import parse_qsl, unquote
+
+    fields: dict[str, str] = {}
+    if re.match(r"postgres(?:ql)?://", dsn):
+        rest = dsn.split("://", 1)[1]
+        rest, _, query = rest.partition("?")
+        netloc, _, path = rest.partition("/")
+        netloc = netloc.rpartition("@")[2]
+        hosts, ports = [], []
+        for item in netloc.split(","):
+            m = re.fullmatch(r"(\[[^\]]*\]|[^:]*)(?::(.*))?", item)
+            hosts.append(unquote(m.group(1).strip("[]")))
+            ports.append(unquote(m.group(2) or ""))
+        if any(hosts):
+            fields["host"] = ",".join(hosts)
+        if any(ports):
+            fields["port"] = ",".join(ports)
+        if path:
+            fields["dbname"] = unquote(path)
+        fields.update(parse_qsl(query, keep_blank_values=True))
+        return fields
+    pos, n = 0, len(dsn)
+    while True:
+        while pos < n and dsn[pos].isspace():
+            pos += 1
+        if pos >= n:
+            return fields
+        m = re.compile(r"([^=\s]+)\s*=\s*").match(dsn, pos)
+        if not m:
+            return fields
+        pos, value, quoted = m.end(), [], False
+        if pos < n and dsn[pos] == "'":
+            pos, quoted = pos + 1, True
+        while pos < n:
+            ch = dsn[pos]
+            if ch == "\\" and pos + 1 < n:
+                value.append(dsn[pos + 1])
+                pos += 2
+                continue
+            if (quoted and ch == "'") or (not quoted and ch.isspace()):
+                pos += 1
+                break
+            value.append(ch)
+            pos += 1
+        fields[m.group(1)] = "".join(value)
+
+
 def _dsn_where(dsn: str) -> str:
     """Where a DSN points (host, hostaddr, port, dbname), whatever its form
     (URI, key=value, query parameters)."""
-    from psycopg.conninfo import conninfo_to_dict
-
-    fields = {k: str(v) for k, v in conninfo_to_dict(dsn).items() if v is not None}
+    fields = _conninfo_fields(dsn)
     return "%s|%s|%s|%s" % ((fields.get("host") or "").lower(), fields.get("hostaddr") or "",
                             fields.get("port") or "5432", fields.get("dbname") or "")
 

@@ -324,6 +324,37 @@ class MeshKeyParamsTest(unittest.TestCase):
         # second review, point 4
         self.assertNotEqual(key("hostaddr=10.0.0.1 dbname=d"), key("hostaddr=10.0.0.2 dbname=d"))
 
+    DSNS = (
+        "postgresql://u:p@H.example:5433/base?sslmode=require",
+        "postgres://u@[::1]:5432/d%20b",
+        "postgresql://h1:5432,h2:5433/d",
+        "postgresql:///d?host=%2Fvar%2Frun%2Fpostgresql&port=5434",
+        "postgresql://h/d?hostaddr=10.0.0.1",
+        "host=h port = 5433 dbname='ma base' user=u password='a\\'b c'",
+        "hostaddr=10.0.0.1 dbname=d\\ x",
+        "",
+    )
+
+    def test_without_psycopg(self):
+        # the psql driver runs without psycopg: the key needs only Python
+        with mock.patch.dict("sys.modules", {"psycopg": None, "psycopg.conninfo": None}):
+            for dsn in self.DSNS:
+                menage.mesh_key(_Cfg("/s", dsn, "public"))
+        self.assertEqual(menage._conninfo_fields("host=h port = 5433 dbname='ma base' x='a\\'b'"),
+                         {"host": "h", "port": "5433", "dbname": "ma base", "x": "a'b"})
+
+    def test_same_fields_as_libpq(self):
+        try:
+            from psycopg.conninfo import conninfo_to_dict
+        except ImportError:
+            self.skipTest("psycopg absent")
+        for dsn in self.DSNS:
+            want = {k: str(v) for k, v in conninfo_to_dict(dsn).items()
+                    if k in ("host", "hostaddr", "port", "dbname")}
+            got = {k: v for k, v in menage._conninfo_fields(dsn).items()
+                   if k in ("host", "hostaddr", "port", "dbname")}
+            self.assertEqual(got, want, dsn)
+
 
 if __name__ == "__main__":
     unittest.main()
