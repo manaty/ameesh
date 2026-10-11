@@ -119,7 +119,7 @@ class ReferencePgTest(PgTestCase):
         work.merged(self.db, lot_id, sha="abcdef1")
         # un seul instant pour les trois dates : avec le pilote psql, chaque
         # requête a sa transaction, donc son propre now()
-        at = float(self.db.query("SELECT extract(epoch from now())::float8 AS t")[0]["t"])
+        at = float(self.db.query("SELECT extract(epoch from now())::float8 AS at_epoch")[0]["at_epoch"])
         self.db.execute(
             "UPDATE work_items SET started_at = to_timestamp(%s) - make_interval(mins => %s)"
             " WHERE id = %s", (at, int(started_min_ago), int(lot_id)))
