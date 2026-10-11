@@ -442,7 +442,7 @@ class ResolutionsDbTest(PgTestCase):
         self.assertIn("conflicts: shared.py", opened.stdout)
         _write(resolutions.worktree_path(repo, b, a), "shared.py", RESOLVED)
         done = self.mesh("work", "resolve", str(b), "--with", str(a), "--repo", repo,
-                        "--json", env=env)
+                        "--done", "--json", env=env)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(json.loads(done.stdout)["ref"], None)
         cfg = dataclasses.replace(self.cfg, radar={"projects": {"p": {"repo": repo}}})
