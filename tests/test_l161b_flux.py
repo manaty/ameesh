@@ -187,8 +187,9 @@ class WorkflowTest(unittest.TestCase):
             debut = texte.index(f"\n  {pilote}:\n")
             fin = re.compile(r"\n  [#\w]").search(texte, debut + 1).start()
             job = texte[debut:fin]
-            self.assertIn("fetch-depth: 2", job, pilote)
-            self.assertIn('--depuis HEAD^1 --flux "$RUNNER_TEMP/flux.jsonl"', job, pilote)
+            # L161f : l'ordre vient du plan du job « plan », lu par chaque part
+            self.assertIn('--plan "$RUNNER_TEMP/plan.json"', job, pilote)
+            self.assertIn('--flux "$RUNNER_TEMP/flux.jsonl"', job, pilote)
             self.assertIn(f"name: flux-{pilote}-${{{{ matrix.part }}}}", job, pilote)
             self.assertIn("actions/upload-artifact@v4", job, pilote)
             # résumé (ancre &resume, reprise par *resume) et artefact, même en échec

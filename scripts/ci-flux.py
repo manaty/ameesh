@@ -19,7 +19,12 @@ docs/design/etudes/l161-tests-par-impact.md, section 3) :
   `succes_inattendu`), `duree_s`, et pour un échec `extrait` (40 lignes au
   plus) et `rejouer` (la commande qui le relance seul) ;
 * `fin` : une par part ; `statut` (`succes`, `echec`, `interrompu`),
-  `comptes` par statut, `duree_s`.
+  `comptes` par statut, `duree_s` ;
+* `impacted` (L161f, parts run from a plan only): once the P0 and P1
+  modules of the part are done; `statut` (`vert`, `rouge`), `modules`,
+  `rouges` (impacted modules that failed). When every part says `vert`, the
+  impacted tests are green: the provisional green
+  (`scripts/test-plan.py leaks`).
 
 Chaque ligne porte aussi `v`, `schema`, `type`, `ts` (UTC) et le contexte
 de la CI : `depot`, `tete` (commit poussé), `fusion` (commit testé),
@@ -43,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import datetime
 import json
 import os
 import pathlib
@@ -75,6 +81,13 @@ def lire(chemin: str | pathlib.Path) -> tuple[list[dict], int]:
     return evenements, illisibles
 
 
+def _instant(ts):
+    try:
+        return datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def _duree(s: float) -> str:
     return f"{s:.1f} s" if s < 60 else f"{int(s // 60)} min {int(s % 60):02d} s"
 
@@ -105,6 +118,14 @@ def resume(chemins: list[str]) -> str:
         sortie.append("")
         classes = debut.get("classes", {})
         touches = [m for m in debut.get("modules", []) if classes.get(m, "P3") != "P3"]
+        impacted = next((e for e in evenements if e.get("type") == "impacted"), None)
+        if impacted is not None:
+            when = ""
+            t0, t1 = _instant(debut.get("ts")), _instant(impacted.get("ts"))
+            if t0 and t1:
+                when = f" after {_duree((t1 - t0).total_seconds())}"
+            sortie.append(f"Impacted modules (P0, P1): "
+                          f"{'green' if impacted.get('statut') == 'vert' else 'red'}{when}\n")
         if touches:
             sortie.append("Passés d'abord (touchés par la PR) : "
                           + ", ".join(f"`{m}` ({classes[m]})" for m in touches) + "\n")

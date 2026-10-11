@@ -189,10 +189,15 @@ class VersionOnlyTest(unittest.TestCase):
 
     def test_workflow(self):
         text = (REPO / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
-        self.assertIn("scripts/version-only.py HEAD^1 HEAD", text)
-        # les trois groupes de parts dépendent du constat ; le bilan l'accepte
-        self.assertEqual(text.count("if: needs.changes.outputs.version_only != 'true'"), 3)
-        self.assertIn("needs: [changes, psycopg, psql, platform-macos", text)
+        # L161f : le job « plan » fait le constat (scripts/test-plan.py, qui
+        # reprend scripts/version-only.py) ; ses matrices sont vides pour une PR
+        # de version seule, et le bilan l'accepte
+        self.assertIn("python3 scripts/test-plan.py plan", text)
+        self.assertIn("if: needs.plan.outputs.psycopg != '[]'", text)
+        self.assertIn("if: needs.plan.outputs.psql != '[]'", text)
+        self.assertIn("if: needs.plan.outputs.code == 'true'", text)
+        self.assertIn('if [ "${{ needs.plan.outputs.version_only }}" = "true" ]', text)
+        self.assertIn("needs: [plan, psycopg, psql, platform-macos", text)
 
 
 class EstimatesPgTest(PgTestCase):
