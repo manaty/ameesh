@@ -191,6 +191,22 @@ class ReleveTest(unittest.TestCase):
         self.assertEqual(self.faits(), [{"c": "tests.test_x.Cl.test_y",
                                          "sans_mesure": f"{sys.executable} -m ameesh.cli"}])
 
+    def test_fichiers_en_argument(self):
+        sql = os.path.join(self.repo, "deploy/sql/role.sql")
+        self.releve.hook("subprocess.Popen", ("psql", ["psql", "-v", "role=x", "-f", sql],
+                                              None, None))
+        self.releve.hook("subprocess.Popen", ("x", ["x", "--file=deploy/sql/role.sql",
+                                                    "src/m.py", "absent"], self.repo, None))
+        self.assertEqual(self.faits(), [{"c": "tests.test_x.Cl.test_y",
+                                         "f": "deploy/sql/role.sql"}])
+
+    def test_venv_ignore(self):
+        venv = pathlib.Path(self.repo, ".venv-carte/lib/site-packages/p/METADATA")
+        venv.parent.mkdir(parents=True)
+        venv.write_text("x")
+        self.releve.hook("open", (str(venv), "r", os.O_RDONLY))
+        self.assertEqual(self.faits(), [])
+
     def test_ligne_pth_inerte_sans_mesure(self):
         env = {k: v for k, v in os.environ.items() if k != mesure.ENV_DOSSIER}
         sortie = subprocess.run([sys.executable, "-c", mesure.ligne_pth() +

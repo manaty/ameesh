@@ -9,8 +9,10 @@ chaque sous-processus Python lancé par un test (CLI, exécuteur) tant que
 * couverture du code (`coverage.process_startup()`, contexte statique lu dans
   `CARTE_CONTEXTE`, posé par la suite au début de chaque test) ;
 * hook d'audit : fichiers du dépôt qui ne sont pas du Python, lus
-  (`open`), dossiers listés (`os.listdir`, `os.scandir`), et sous-processus
-  Python lancés avec un environnement qui perd la mesure.
+  (`open`) ou passés en argument d'un sous-processus (`psql -f
+  deploy/sql/…`, qu'aucun hook Python ne voit), dossiers listés
+  (`os.listdir`, `os.scandir`), et sous-processus Python lancés avec un
+  environnement qui perd la mesure.
 
 Chaque processus écrit ses relevés dans `DIR/lectures/<pid>-<hasard>.jsonl`,
 une ligne par fait nouveau, aussitôt : un sous-processus tué en garde la trace.
@@ -30,7 +32,7 @@ ENV_DOSSIER = "CARTE_MESURE"
 ENV_CONTEXTE = "CARTE_CONTEXTE"
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_IGNORES = (".git", "__pycache__")
+_IGNORES = (".git", "__pycache__", "site-packages")
 _SUFFIXES_CODE = (".py", ".pyc", ".pyo")
 _ECRITURE = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
 
@@ -49,7 +51,8 @@ def chemin_du_depot(chemin, repo: str = REPO) -> str | None:
     if relatif == ".":
         return "."
     morceaux = relatif.split(os.sep)
-    if any(m in _IGNORES for m in morceaux) or relatif.endswith(_SUFFIXES_CODE):
+    if any(m in _IGNORES or m.startswith(".venv") for m in morceaux) \
+            or relatif.endswith(_SUFFIXES_CODE):
         return None
     return "/".join(morceaux)
 
@@ -99,9 +102,29 @@ class Releve:
         finally:
             self._dans_le_hook = False
 
+    def _arguments(self, argv, cwd) -> None:
+        """Fichiers du dépôt nommés dans la ligne de commande (`-f F`,
+        `--file=F`) : le programme lancé les lit hors de notre vue."""
+        if isinstance(argv, (str, bytes)) or not argv:
+            return
+        base = os.fsdecode(cwd) if isinstance(cwd, (str, bytes)) else os.getcwd()
+        for arg in list(argv)[1:]:
+            if isinstance(arg, bytes):
+                arg = os.fsdecode(arg)
+            if not isinstance(arg, str) or not arg or arg.startswith("-") and "=" not in arg:
+                continue
+            for candidat in (arg, arg.split("=", 1)[-1]):
+                chemin = os.path.join(base, candidat)
+                if os.path.isfile(chemin):
+                    relatif = chemin_du_depot(chemin, self.repo)
+                    if relatif:
+                        self.noter("f", relatif)
+                    break
+
     def _traiter(self, evenement: str, args) -> None:
         if evenement == "subprocess.Popen":
-            executable, argv, _cwd, env = args
+            executable, argv, cwd, env = args
+            self._arguments(argv, cwd)
             perdu = env is not None and not (
                 "COVERAGE_PROCESS_START" in env and ENV_CONTEXTE in env)
             if perdu and _est_python(executable, argv):
