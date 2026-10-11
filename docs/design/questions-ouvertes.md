@@ -21,6 +21,13 @@ the [decisions](decisions/)). Open as of 2026-10-05:
   credentials limited to the repository; who consolidates; Persona card in L31 or
   a separate lot.
 
+- Resident agent ([study](etudes/agent-resident.md), 2026-10-10): the owner
+  accepted the study's 7 recommendations on 2026-10-10 (decision 0035). Still
+  open, as the recommendations do not cover them: which agents are resident
+  by default (orchestrators and permanent roles?); who can talk to an agent;
+  the sleep delay (30 min) and the `attach` maximum duration (2 h); Codex
+  `app-server` (experimental) now or later; `!stop`.
+
 # Awaiting a study or a prototype
 
 - Licenses: drafting the CLA and ownership of contributions produced by
