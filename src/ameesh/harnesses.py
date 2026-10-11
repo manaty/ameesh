@@ -892,6 +892,15 @@ def _check_interactive_permission(value: Any, path: str) -> list[Finding]:
                 findings.append(Finding("harness-permission-mode-invalid", ERROR,
                                         "`ameesh.interactive_permission.%s`: %r not in "
                                         "`choices`" % (key, mode), path))
+    # codex r3 (#182): a reserved mode is never a default nor a fallback
+    reserved = set(m for m in (_strings(value.get("explicit_only")) or []))
+    for key in ("default", "fallback"):
+        mode = value.get(key)
+        if isinstance(mode, str) and mode in reserved:
+            findings.append(Finding("harness-permission-mode-invalid", ERROR,
+                                    "`ameesh.interactive_permission.%s`: %r is reserved "
+                                    "for the agent setting (`explicit_only`)" % (key, mode),
+                                    path))
     return findings
 
 
@@ -909,9 +918,14 @@ def _interactive_permission(value: Any) -> dict:
 
     def modes(key: str) -> tuple[str, ...]:
         return tuple(m for m in (_strings(value.get(key)) or []) if PERMISSION_MODE_RE.match(m))
-    return {"flag": tuple(flag), "default": mode("default"), "fallback": mode("fallback"),
+    reserved = modes("explicit_only")
+
+    def unreserved(key: str) -> str:
+        return "" if mode(key) in reserved else mode(key)
+    return {"flag": tuple(flag), "default": unreserved("default"),
+            "fallback": unreserved("fallback"),
             "env": tuple(n for n in (_strings(value.get("env")) or []) if ENV_RE.match(n)),
-            "choices": modes("choices"), "explicit_only": modes("explicit_only")}
+            "choices": modes("choices"), "explicit_only": reserved}
 
 
 def _build(document: dict, path: str, source: str) -> HarnessDescriptor:

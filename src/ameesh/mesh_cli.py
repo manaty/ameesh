@@ -1424,11 +1424,22 @@ def cmd_set(cfg: Config, args) -> int:
                     print("mail_batch invalide : %r (ex. 90s, 2m, 0 = réveil immédiat)"
                           % valeur, file=sys.stderr)
                     return 2
-            if cle == "permission_mode" and valeur \
-                    and not harnesses.PERMISSION_MODE_RE.match(valeur):
-                print("invalid permission_mode: %r (e.g. auto, acceptEdits)" % valeur,
-                      file=sys.stderr)
-                return 2
+            if cle == "permission_mode" and valeur:
+                # codex r3 (#182): checked against the agent harness's allowlist
+                harness = agent.get("harness") or ""
+                descriptor = harnesses.get(harness)
+                rule = descriptor.interactive_permission if descriptor else {}
+                if not rule:
+                    print("permission_mode: harness %r declares no interactive "
+                          "permission mode" % harness, file=sys.stderr)
+                    return 2
+                allowed = rule.get("choices") or ()
+                if not harnesses.PERMISSION_MODE_RE.match(valeur) \
+                        or (allowed and valeur not in allowed):
+                    print("invalid permission_mode: %r (%s)"
+                          % (valeur, " | ".join(allowed) or "e.g. auto, acceptEdits"),
+                          file=sys.stderr)
+                    return 2
             valeurs[cle] = valeur
         for cle, valeur in valeurs.items():
             if cle in ("model", "effort", "tier", "mail_batch", "permission_mode"):

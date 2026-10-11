@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import dataclasses
 import unittest
 from unittest import mock
 
@@ -143,6 +144,32 @@ class PermissionModeTest(unittest.TestCase):
         codes = [f.code for f in harnesses.validate(document)]
         self.assertIn("harness-permission-mode-invalid", codes)
 
+    def test_reserved_mode_never_default_nor_fallback(self):
+        # codex r3 (#182) P1: refused by validation, dropped by normalization
+        # and refused again at resolution
+        for key in ("default", "fallback"):
+            raw = {"flag": ["--permission-mode", "{mode}"], "default": "auto",
+                   "fallback": "acceptEdits", "explicit_only": ["bypassPermissions"],
+                   key: "bypassPermissions"}
+            messages = [f.message for f in harnesses._check_interactive_permission(raw, "")]
+            self.assertTrue(any("reserved" in m and key in m for m in messages), messages)
+            self.assertEqual(harnesses._interactive_permission(raw)[key], "")
+        claude = self._claude()
+        rule = dict(harnesses.get("claude").interactive_permission)
+        # the fallback case with the help unavailable, as codex reproduced it
+        for key in ("default", "fallback"):
+            adapters._HELP_CACHE.clear()
+            raw = dict(rule, **{key: "bypassPermissions"})
+            claude.descriptor = dataclasses.replace(claude.descriptor,
+                                                    interactive_permission=raw)
+            with mock.patch.object(adapters.subprocess, "run", side_effect=OSError("no help")):
+                self.assertNotEqual(claude.permission_mode(), "bypassPermissions", key)
+                self.assertNotIn("bypassPermissions", claude.interactive_command("s1"), key)
+        # the agent setting still may
+        claude.descriptor = dataclasses.replace(claude.descriptor, interactive_permission=rule)
+        adapters._HELP_CACHE.clear()
+        self.assertEqual(claude.permission_mode("bypassPermissions"), "bypassPermissions")
+
 
 class AttachPermissionTest(PgTestCase):
     def setUp(self):
@@ -181,6 +208,23 @@ class AttachPermissionTest(PgTestCase):
         self.assertEqual(self._attach()[:2], ["--permission-mode", "auto"])
         self.assertEqual(self.mesh("set", "perm", "permission_mode=a b").returncode, 2)
         self.assertIsNotNone(registry.get(self.db, "perm"))
+
+    def test_set_permission_mode_checked_against_choices(self):
+        # codex r3 (#182) P2: an unknown mode is refused and not stored
+        proc = self.mesh("set", "perm", "permission_mode=notAMode")
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("invalid permission_mode", proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.cfg.agent_dir("perm"),
+                                                     "permission_mode")))
+        proc = self.mesh("set", "perm", "permission_mode=bypassPermissions")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # a harness without an interactive permission mode refuses the setting
+        cwd = os.path.join(self.tmp, "work", "cx")
+        os.makedirs(cwd, exist_ok=True)
+        self.register("cx", "codex", cwd=cwd)
+        proc = self.mesh("set", "cx", "permission_mode=auto")
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("declares no interactive permission mode", proc.stderr)
 
     def test_attach_unreadable_setting_ignored(self):
         # codex verdict #182 (P2): byte 0xff in the agent setting

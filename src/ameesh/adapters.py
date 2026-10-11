@@ -1086,7 +1086,7 @@ class HarnessAdapter:
         if not rule:
             return ""
         allowed, reserved = rule.get("choices") or (), rule.get("explicit_only") or ()
-        mode = ""
+        mode, by_agent = "", False
         sources = [("agent setting", explicit)]
         sources += [(n, os.environ.get(n)) for n in rule["env"]]
         for rank, (origin, value) in enumerate(sources):
@@ -1103,16 +1103,21 @@ class HarnessAdapter:
                 print("ameesh: permission mode %r ignored (%s: %s), using the default"
                       % (value, origin, refusal), file=sys.stderr)
                 continue
-            mode = value
+            mode, by_agent = value, rank == 0
             break
         mode = mode or rule["default"]
-        if mode and rule["fallback"] and mode != rule["fallback"]:
+        # codex r3 (#182): a reserved mode only ever comes from the agent
+        # setting, never from the default nor the fallback
+        if mode in reserved and not by_agent:
+            mode = ""
+        fallback = "" if rule["fallback"] in reserved else rule["fallback"]
+        if mode and fallback and mode != fallback:
             try:
                 known = _help_choices(self.binary, _flag_name(rule["flag"]))
             except Exception:  # noqa: BLE001 — reading the help must never fail the attach
                 known = None
             if known is None or mode not in known:
-                return rule["fallback"]
+                return fallback
         return mode
 
     def env(self) -> dict[str, str]:
