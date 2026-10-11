@@ -1,27 +1,27 @@
 ---
 type: Decision
-title: "Nom : ameesh, logo carriole, dépôt manaty/ameesh"
-description: "Le paquet agent-mesh devient ameesh ; renommage complet immédiat ; dépôt privé puis public à la première release."
+title: "Name: ameesh, buggy logo, repository manaty/ameesh"
+description: "The agent-mesh package becomes ameesh; full renaming right away; private repository, then public at the first release."
 status: stable
 tags: [nom, depot, release]
 decided_by: human:smichea
 decision_date: 2026-10-03
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:00:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-« amesh » est pris par trois projets d'agents (tlhc/amesh, samchung95/amesh, code-rabi/amesh) et par le paquet PyPI amesh (radar de pluie de Tokyo). « agent-mesh » est le nom d'un produit commercial (Solace Agent Mesh). « ameesh » est libre sur PyPI, npm, crates.io, Homebrew, AUR et Docker Hub ; c'est par ailleurs un prénom indien, sans projet logiciel homonyme.
+"amesh" is taken by three agent projects (tlhc/amesh, samchung95/amesh, code-rabi/amesh) and by the PyPI package amesh (a Tokyo rain radar). "agent-mesh" is the name of a commercial product (Solace Agent Mesh). "ameesh" is free on PyPI, npm, crates.io, Homebrew, AUR and Docker Hub; it is also an Indian first name, with no software project of the same name.
 
-# Décision
+# Decision
 
-- Nom : **ameesh** (prononcé comme *amish*). Logo : une **carriole amish** (buggy noir à capote).
-- Portée du renommage : **tout le projet** — dépôt, module Python, commandes (une commande `ameesh` à sous-commandes), variables d'environnement ; `agent-mail` reste un alias car les hooks des harnais l'appellent.
-- Moment : **immédiat**, sans attendre la fin de la revue de sécurité en cours.
-- Dépôt : **github.com/manaty/ameesh**, **privé** maintenant, **public après la première release**.
+- Name: **ameesh** (pronounced like *amish*). Logo: an **Amish buggy** (black buggy with a hood).
+- Scope of the renaming: **the whole project** — repository, Python module, commands (a single `ameesh` command with subcommands), environment variables; `agent-mail` remains an alias because the harness hooks call it.
+- Timing: **immediate**, without waiting for the end of the ongoing security review.
+- Repository: **github.com/manaty/ameesh**, **private** now, **public after the first release**.
 
-# Conséquences
+# Consequences
 
-- Dépôt créé privé le 2026-10-03 (main à c4d11d5).
-- Avant le passage public : retirer le DSN de banc avec mot de passe codé en dur, passer l'historique au détecteur de secrets, choisir une licence (décision du propriétaire à venir).
+- Repository created private on 2026-10-03 (main at c4d11d5).
+- Before going public: remove the test bench DSN with a hard-coded password, run the history through a secret scanner, choose a licence (owner decision to come).

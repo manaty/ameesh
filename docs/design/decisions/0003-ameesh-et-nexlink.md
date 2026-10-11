@@ -1,27 +1,27 @@
 ---
 type: Decision
-title: "ameesh est un produit autonome, utilisé par Nexlink et intégré nativement"
-description: "Partage des rôles entre Nexlink (identités, pages, messages, signatures humaines) et ameesh (exécution)."
+title: "ameesh is a standalone product, used by Nexlink and natively integrated"
+description: "Split of roles between Nexlink (identities, pages, messages, human signatures) and ameesh (execution)."
 status: stable
 tags: [nexlink, architecture]
 decided_by: human:smichea
 decision_date: 2026-10-03
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:00:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-La spec Nexlink agents-and-teams (AM1–AM15) prévoyait déjà comptes agents, conversations de chantier, signatures par clés d'appareil, relais et baux ; ameesh v1 a son propre registre, sa boîte, ses baux et ses signatures. Les deux se recouvrent.
+The Nexlink agents-and-teams spec (AM1–AM15) already provided for agent accounts, project conversations, signatures by device keys, relays and leases; ameesh v1 has its own registry, mailbox, leases and signatures. The two overlap.
 
-# Décision
+# Decision
 
-- ameesh est un **produit autonome** ; **Nexlink l'utilise** (les organisations de Nexlink font tourner leurs agents avec ameesh).
-- **Intégration native** : Nexlink est un moyen de communication d'ameesh et affiche les projets, modules et lots.
-- Partage : **Nexlink** = organisations, membres humains, comptes agents, conversations, notifications, signatures humaines sur appareil, audit ; **ameesh** = exécuteur par machine, adaptateurs des harnais, sessions, tours, baux d'exécution, budget, cycle de vie des lots, vérification de l'autorité.
-- Les échanges agent↔agent passent **aussi** par la messagerie, visibles des humains, rangés en un fil par lot.
+- ameesh is a **standalone product**; **Nexlink uses it** (Nexlink organisations run their agents with ameesh).
+- **Native integration**: Nexlink is a communication channel for ameesh and displays projects, modules and lots.
+- Split: **Nexlink** = organisations, human members, agent accounts, conversations, notifications, human signatures on device, audit; **ameesh** = per-machine runner, harness adapters, sessions, turns, execution leases, budget, lot lifecycle, authority verification.
+- Agent↔agent exchanges **also** go through the messaging, visible to humans, filed in one thread per lot.
 
-# Conséquences
+# Consequences
 
-- Le cœur d'ameesh expose des interfaces (annuaire, messagerie, catalogue du travail, autorité, baux) ; Nexlink est un connecteur, natif et prioritaire, pas une dépendance du cœur.
-- Voir [0005](0005-canon-okf.md) : les pages Nexlink sont une vue du canon OKF.
+- The ameesh core exposes interfaces (directory, messaging, work catalogue, authority, leases); Nexlink is a connector, native and preferred, not a dependency of the core.
+- See [0005](0005-canon-okf.md): Nexlink pages are a view of the OKF canon.

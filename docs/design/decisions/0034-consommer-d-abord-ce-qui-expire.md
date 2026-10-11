@@ -1,122 +1,124 @@
 ---
 type: Decision
-title: "Consommer d'abord la capacité qui expire le plus tôt"
-description: "Entre les comptes au forfait d'un même fournisseur, ameesh choisit pour chaque nouvelle session le compte le plus en retard sur son rythme (amendement du 2026-10-10), à égalité celui dont la capacité inutilisée expire le plus tôt, dans la limite du rythme permis, au lieu de garder les comptes secondaires en secours. Amende 0027."
+title: "Consume first the capacity that expires soonest"
+description: "Among a provider's plan accounts, ameesh picks for each new session the account furthest behind its pace (amendment of 2026-10-10), on a tie the one whose unused capacity expires soonest, within the allowed pace, instead of keeping the secondary accounts as backup. Amends 0027."
 status: stable
 tags: [budgets, forfaits, comptes, routage]
 decided_by: human:smichea
 decision_date: 2026-10-10
-attestation: "décision du propriétaire dans sa conversation avec claude3 (mesh-design) ; non signée"
+attestation: "owner decision in his conversation with claude3 (mesh-design); unsigned"
 generated: { by: "claude3/claude-opus-5-5", at: "2026-10-10T08:00:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-[0027](0027-bascule-automatique-entre-comptes.md) traite les comptes d'un
-fournisseur comme une liste ordonnée : le primaire sert seul, et le suivant
-ne prend le relais qu'au seuil. Le 2026-10-10, le compte Codex primaire était
-à 20 % de sa fenêtre de 7 jours, pour un rythme permis de 52 %. Pendant ce
-temps, la fenêtre de 5 h du compte secondaire, inutilisée, se remettait à
-zéro sans avoir servi. Un forfait non consommé avant sa remise à zéro est
-perdu. Le même jour, une estimation montrait que les forfaits dormaient
-pendant que des modèles payés au token faisaient le travail.
+[0027](0027-bascule-automatique-entre-comptes.md) treats a provider's accounts
+as an ordered list: the primary serves alone, and the next one
+only takes over at the threshold. On 2026-10-10, the primary Codex account was
+at 20% of its 7-day window, for an allowed pace of 52%. Meanwhile,
+the secondary account's 5-hour window, unused, was reset
+without having been used. A plan not consumed before its reset is
+lost. The same day, an estimate showed that the plans were sleeping
+while pay-per-token models were doing the work.
 
-S'y ajoutait un défaut : un relevé de jauge dont la fenêtre était échue
-gardait sa dernière valeur (93 %). Le compte paraissait donc saturé, et
-ameesh ne l'aurait jamais choisi.
+On top of that there was a defect: a gauge reading whose window had expired
+kept its last value (93%). The account therefore looked saturated, and
+ameesh would never have picked it.
 
-# Décision
+# Decision
 
-1. **Les comptes au forfait d'un fournisseur forment un réservoir**, et non
-   une liste de secours. Pour chaque tour, ameesh choisit, parmi les comptes
-   utilisables (identifiants présents, sous leur seuil de rythme de
-   [0019](0019-budgets-et-routage.md)), celui dont **la capacité inutilisée
-   expire le plus tôt**. Il retient la fenêtre la plus contraignante du
-   compte, et à égalité, l'ordre déclaré. *Amendé le 2026-10-10, voir
-   ci-dessous : le critère premier est désormais le retard sur le rythme.*
-2. **Le rythme reste la garde.** Un compte n'est jamais poussé au-delà de
-   `min(90 %, part écoulée + 10 points)` de sa fenêtre. La pause ne survient
-   que lorsque tous les comptes sont au seuil.
-3. **Un relevé périmé ne bloque pas.** Un relevé dont la fenêtre est échue
-   compte pour 0 %. Un compte sans relevé récent est **relu** avant d'être
-   écarté, ou essayé, puisque le premier tour rapporte sa jauge.
-4. **Continuité des sessions.** On ne change pas de compte en cours de
-   session pour un gain marginal. Une session reste sur son compte tant que
-   celui-ci est sous son seuil. Le choix se fait à l'ouverture d'une session
-   (0025 : une session par lot) et à la rotation, avec les règles de
-   reprise ou de résumé de 0027 §5. Une session Codex n'est jamais portable
-   d'un compte à l'autre.
-5. **Transparence.** Chaque choix de compte est journalisé avec sa raison
-   (« expire dans 52 min, 0 % utilisé »). `ameesh accounts list` montre, pour
-   chaque compte, la capacité qui sera perdue à la prochaine remise à zéro si
-   rien ne change.
-6. **Forçage humain inchangé.** `ameesh accounts use` continue de primer, et
-   `ameesh accounts auto` rend la main à cette règle.
+1. **A provider's plan accounts form a pool**, not
+   a backup list. For each turn, ameesh picks, among the usable
+   accounts (credentials present, under their pace threshold from
+   [0019](0019-budgets-et-routage.md)), the one whose **unused capacity
+   expires soonest**. It uses the account's most constraining window,
+   and on a tie, the declared order. *Amended on 2026-10-10, see
+   below: the primary criterion is now the lag behind pace.*
+2. **Pace remains the guard.** An account is never pushed beyond
+   `min(90 %, elapsed share of the window + 10 points)` of its window. The pause only happens
+   when all accounts are at the threshold.
+3. **A stale reading does not block.** A reading whose window has expired
+   counts as 0%. An account with no recent reading is **re-read** before being
+   set aside, or tried, since the first turn reports its gauge.
+4. **Session continuity.** The account is not changed during a
+   session for a marginal gain. A session stays on its account as long as
+   that account is under its threshold. The choice is made when a session is
+   opened (0025: one session per lot) and at rotation, with the
+   resumption or summary rules of 0027 §5. A Codex session is never portable
+   from one account to another.
+5. **Transparency.** Each account choice is logged with its reason
+   (« expire dans 52 min, 0 % utilisé », "expires in 52 min, 0% used").
+   `ameesh accounts list` shows, for each account, the capacity that will be
+   lost at the next reset if nothing changes.
+6. **Human override unchanged.** `ameesh accounts use` still takes precedence,
+   and `ameesh accounts auto` hands control back to this rule.
 
-# Conséquences
+# Consequences
 
-- Amende 0027 §2–3 : « bascule au seuil » et « retour au primaire » sont
-  remplacés par ce choix. La pause quand tous les comptes sont au seuil, la
-  journalisation et la continuité restent.
-- Lot L74 (implémentation), après le correctif des relevés périmés (L71).
-- Le respect des conditions d'utilisation de chaque fournisseur pour l'usage
-  de plusieurs comptes reste de la responsabilité de l'équipe (0027).
+- Amends 0027 §2–3: "switch at the threshold" and "return to the primary" are
+  replaced by this choice. The pause when all accounts are at the threshold, the
+  logging and the continuity remain.
+- Lot L74 (implementation), after the fix for stale readings (L71).
+- Compliance with each provider's terms of use regarding the use
+  of several accounts remains the team's responsibility (0027).
 
-# Amendement du 2026-10-10 : répartir entre tous les comptes
+# Amendment of 2026-10-10: spread across all accounts
 
-Accord du propriétaire le 2026-10-10 ; lot L117.
+Owner's approval on 2026-10-10; lot L117.
 
-## Constat
+## Finding
 
-Le soir même, `ameesh accounts list` montrait le compte Claude primaire à
-37 % de sa fenêtre de 5 h (rythme 83 %) et à 35 % de sa fenêtre de 7 jours
-(rythme 55 %). Les comptes secondaire et tertiaire affichaient « — » : jamais
-utilisés. Leurs forfaits hebdomadaires étaient perdus, alors que trois
-abonnements sont payés.
+That same evening, `ameesh accounts list` showed the primary Claude account at
+37% of its 5-hour window (pace 83%) and at 35% of its 7-day window
+(pace 55%). The secondary and tertiary accounts showed « — »: never
+used. Their weekly plans were being lost, although three
+subscriptions are paid for.
 
-La règle du §1 en était la cause. Le primaire a toujours une fenêtre ouverte,
-donc une capacité « qui expire », et il reste sous son rythme. Un compte sans
-fenêtre ouverte n'a rien qui expire et passait après. Le primaire gagnait donc
-toujours, et la continuité de session (§4) figeait la situation.
+The rule of §1 was the cause. The primary always has an open window,
+hence a capacity "that expires", and it stays under its pace. An account with no
+open window has nothing that expires and came after. The primary therefore always
+won, and session continuity (§4) froze the situation.
 
-## Règle amendée (§1)
+## Amended rule (§1)
 
-**Un compte jamais utilisé ne doit pas rester inutilisé.** Pour une nouvelle
-session, ou à la rotation, ameesh retient, parmi les comptes utilisables
-(identifiants présents, sous leur seuil de rythme dans **toutes** leurs
-fenêtres), celui qui a **le plus de retard sur son rythme** :
+**A never-used account must not stay unused.** For a new
+session, or at rotation, ameesh picks, among the usable accounts
+(credentials present, under their pace threshold in **all** their
+windows), the one that is **furthest behind its pace**:
 
-- le retard d'un compte est le rapport entre l'utilisé et l'autorisé à cet
-  instant de la fenêtre, `utilisé / min(90 %, part écoulée + 10 points)`. Le
-  dénominateur est le plafond de la garde de [0019](0019-budgets-et-routage.md),
-  celui qu'affiche la colonne « rythme ». Le plus petit rapport l'emporte ;
-- le rapport est pris sur la **fenêtre la plus contraignante** du compte (le
-  plus grand rapport parmi ses fenêtres), comme le §1 le faisait déjà. C'est la
-  distance réelle du compte à la garde, qui l'écarte dès qu'une seule fenêtre
-  atteint son plafond. Quand la fenêtre de 7 jours est la plus avancée, ce qui
-  est le cas où un forfait hebdomadaire se perd, c'est elle qui décide. Une
-  session neuve n'est pas envoyée vers un compte dont la fenêtre de 5 h touche
-  presque son seuil, même si sa semaine est en retard ;
-- un compte sans fenêtre ouverte (relevé échu) ou sans relevé compte pour 0 %
-  utilisé. Il passe donc en premier, et son premier tour rapporte sa jauge ;
-- à égalité de rapport, la capacité inutilisée qui **expire le plus tôt** (la
-  règle du §1 d'origine), puis l'ordre déclaré.
+- an account's lag is the ratio between what is used and what is allowed at this
+  point of the window, `utilisé / min(90 %, elapsed share of the window + 10 points)`. The
+  denominator is the guard ceiling of [0019](0019-budgets-et-routage.md),
+  the one shown by the « rythme » ("pace") column. The smallest ratio wins;
+- the ratio is taken on the account's **most constraining window** (the
+  largest ratio among its windows), as §1 already did. It is the
+  account's actual distance to the guard, which sets it aside as soon as a single window
+  reaches its ceiling. When the 7-day window is the most advanced, which
+  is the case where a weekly plan gets lost, it is the one that decides. A
+  fresh session is not sent to an account whose 5-hour window is
+  almost at its threshold, even if its week is behind;
+- an account with no open window (expired reading) or with no reading counts as 0%
+  used. It therefore goes first, and its first turn reports its gauge;
+- on an equal ratio, the unused capacity that **expires soonest** (the
+  original §1 rule), then the declared order.
 
-Chaque nouvelle session ajoute de l'usage au compte choisi, qui recule ainsi
-dans le classement. Les sessions se répartissent entre les comptes au lieu de
-s'accumuler sur le primaire.
+Each new session adds usage to the chosen account, which thus moves back
+in the ranking. Sessions are spread across the accounts instead of
+piling up on the primary.
 
-## Inchangé
+## Unchanged
 
-Le forçage (`ameesh accounts use`, §6), la continuité tant que le compte de la
-session est sous son seuil (§4), la pause quand tous les comptes sont au seuil
-(§2) et la règle de Codex, dont une session n'est jamais portable d'un compte à
-l'autre.
+The override (`ameesh accounts use`, §6), continuity as long as the session's
+account is under its threshold (§4), the pause when all accounts are at the threshold
+(§2) and the Codex rule, under which a session is never portable from one account to
+another.
 
-## Transparence (§5)
+## Transparency (§5)
 
-La raison journalisée dit le retard du compte choisi, puis celui des comptes
-qui le suivent : « compte claude : secondaire — sans relevé : 0 % utilisé, le
+The logged reason states the lag of the chosen account, then that of the accounts
+that follow it: « compte claude : secondaire — sans relevé : 0 % utilisé, le
 plus en retard sur son rythme ; avant : tertiaire sans relevé : 0 % utilisé,
-primaire seven_day 35 % utilisé (rythme 55 %) ». `ameesh accounts list` donne
-la même raison pour le prochain choix d'une nouvelle session.
+primaire seven_day 35 % utilisé (rythme 55 %) » ("claude account: secondary —
+no reading: 0% used, furthest behind its pace; ahead of: tertiary no reading:
+0% used, primary seven_day 35% used (pace 55%)"). `ameesh accounts list` gives
+the same reason for the next choice of a new session.
