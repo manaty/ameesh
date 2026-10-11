@@ -1510,16 +1510,50 @@ class Turn:
         sort = (("supprimé par le ménage après %s sans changement s'il n'est tenu par aucun "
                  "processus (L162)" % fmt_idle(policy.orphan_idle)) if policy.orphan_cleanup
                 else "jamais supprimé automatiquement (orphan_cleanup: false)")
-        for found in new_tmp_entries(self.tmp_before, min_size=policy.orphan_min_size,
-                                     exclude=exclude):
-            self.entries.append({
+        found_all = new_tmp_entries(self.tmp_before, min_size=policy.orphan_min_size,
+                                    exclude=exclude)
+        others, signaled = self._other_turns(db, host) if found_all else (None, set())
+        for found in found_all:
+            if (found["path"], str(found["ino"]), str(found["dev"])) in signaled:
+                continue  # #222 : déjà signalée par le tour d'un autre agent
+            entry = {
                 "kind": "orphan", "action": "signaled", "path": found["path"],
                 "bytes": found["bytes"], "agent": self.agent, "lot": lot,
                 "detail": "apparu dans /tmp pendant le tour %s de %s (attribution probable) ; "
                           "hors des dossiers gérés : %s" % (turn_id[:8], self.agent, sort),
                 "data": {"command": found["command"], "turn": turn_id,
-                         "ino": found["ino"], "dev": found["dev"]}})
+                         "ino": found["ino"], "dev": found["dev"]}}
+            if others:
+                # #222 : /tmp est commun à l'hôte ; une entrée apparue pendant que
+                # d'autres agents tournaient peut être la leur (comme un worktree
+                # d'un autre agent, L73b) : non attribuée, donc jamais supprimée
+                # (`_orphan_verdict` garde une entrée sans agent).
+                entry.update(agent=None, lot=None, detail=(
+                    "%s : apparu dans /tmp pendant le tour %s de %s, avec %s aussi en tour "
+                    "sur l'hôte ; jamais supprimé automatiquement"
+                    % (UNATTRIBUTED, turn_id[:8], self.agent, ", ".join(sorted(others)))))
+            self.entries.append(entry)
         return self.entries
+
+    def _other_turns(self, db, host: str) -> tuple[set | None, set]:
+        """#222 : (autres agents en tour sur `host`, entrées de /tmp déjà
+        signalées par le tour d'un autre agent depuis le début de celui-ci).
+        Sans base ou registre illisible : (None, vide), l'imputation d'avant."""
+        if db is None or not host:
+            return None, set()
+        try:
+            others = {r["name"] for r in storage.of(db).operations.listing()
+                      if r["name"] != self.agent and r.get("host") == host
+                      and r.get("status") == "running" and r.get("lease_live")}
+            rows = storage.of(db).housekeeping.recent(
+                host, max(0.0, time.time() - self.started) + 60, 500, kind="orphan")
+        except Exception:
+            return None, set()
+        signaled = {(r.get("path"), str((r.get("data") or {}).get("ino")),
+                     str((r.get("data") or {}).get("dev")))
+                    for r in rows
+                    if r.get("action") == "signaled" and r.get("agent") not in (None, self.agent)}
+        return others, signaled
 
 
 # --------------------------------------------------------------------------

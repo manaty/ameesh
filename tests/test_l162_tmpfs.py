@@ -206,6 +206,55 @@ class PressionDuTmpfsTest(unittest.TestCase):
         self.assertFalse(runner_mod.Runner.tmpfs_pressure_pass(faux))
 
 
+class ImputationSansBaseTest(_Systeme, unittest.TestCase):
+    """#222 : à qui imputer une entrée de /tmp apparue pendant le tour ;
+    registre et journal du ménage simulés."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="l222-")
+        self.addCleanup(subprocess.run, ["rm", "-rf", self.tmp], capture_output=True)
+        self.sys = self.systeme(self.tmp)
+        self.cfgl = _Cfg(os.path.join(self.tmp, "etat"))
+        self.pol = menage.Policy(orphan_min_size=1)
+
+    def _fin(self, listing: list, recent=lambda chemin: []) -> tuple[str, list]:
+        """Un tour de a1 pendant lequel une entrée apparaît dans le faux /tmp."""
+        chemin = os.path.join(self.sys, "codex3-94a-r2")
+        fausse = mock.Mock()
+        fausse.operations.listing.return_value = listing
+        fausse.housekeeping.recent.side_effect = lambda *a, **k: recent(chemin)
+        tour = menage.Turn.begin(self.cfgl, self.pol, "a1", None, new_session=False,
+                                 base_env={})
+        _write(os.path.join(chemin, "f"), 5000)
+        with mock.patch.object(menage.storage, "of", return_value=fausse):
+            entries = tour.end(lot="9", turn_id="t" * 32, db=object(), host="pc")
+        return chemin, [e for e in entries if e["kind"] == "orphan"]
+
+    def test_autre_agent_en_tour_sur_l_hote_entree_non_attribuee(self):
+        chemin, signale = self._fin([
+            {"name": "a2", "host": "pc", "status": "running", "lease_live": True},
+            {"name": "a3", "host": "ailleurs", "status": "running", "lease_live": True},
+            {"name": "a4", "host": "pc", "status": "idle", "lease_live": True}])
+        self.assertEqual([(e["path"], e["agent"], e["lot"]) for e in signale],
+                         [(chemin, None, None)])
+        self.assertIn(menage.UNATTRIBUTED, signale[0]["detail"])
+        self.assertIn("avec a2 aussi en tour", signale[0]["detail"])
+
+    def test_seul_en_tour_entree_imputee_comme_avant(self):
+        chemin, signale = self._fin([
+            {"name": "a1", "host": "pc", "status": "running", "lease_live": True}])
+        self.assertEqual([(e["path"], e["agent"], e["lot"]) for e in signale],
+                         [(chemin, "a1", "9")])
+
+    def test_deja_signalee_par_le_tour_d_un_autre_agent_pas_reprise(self):
+        def recent(chemin):
+            st = os.lstat(chemin)
+            return [{"path": chemin, "action": "signaled", "agent": "a2",
+                     "data": {"ino": st.st_ino, "dev": st.st_dev}}]
+        _chemin, signale = self._fin([], recent)
+        self.assertEqual(signale, [])
+
+
 # ==========================================================================
 # avec la base : entrées abandonnées supprimées, alertes
 # ==========================================================================
