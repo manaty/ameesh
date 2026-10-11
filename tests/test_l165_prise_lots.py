@@ -30,7 +30,7 @@ class _Lots(_Base):
 
 class PriseDeLotTest(_Lots):
     def test_lot_de_l_equipe_pris_et_orchestrateur_prevenu(self):
-        self.agent("orchestrateur", team="nexlink", status="working")
+        self.agent("orchestrateur", team="nexlink", status="running")
         self.agent("deepseek7", "deepseek", team="nexlink")
         self.agent("claude1", team="nexlink")
         self.agent("dev1", team="ameesh")
