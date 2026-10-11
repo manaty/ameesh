@@ -311,6 +311,78 @@ class OrphanTmpTest(PgTestCase):
         turn.end(lot=None, turn_id="t")
         self.assertFalse(os.path.exists(os.path.join(mine, "f")))
 
+    # -- third review of #176 -------------------------------------------------
+
+    def test_two_meshes_resuming_a_homonym_at_once_get_two_directories(self):
+        # point 1: `other` resumes `a1` just as `mine`, which also saw no
+        # owner (and checked the name under its lock), writes its owner
+        troot = menage.tmp_root(self.mine, self.pol)
+        real, holds = menage._write_owner, []
+
+        def write(*a, **kw):
+            if not holds:
+                holds.append(None)
+                holds[0] = menage.hold_tmp(self.other, self.pol, "a1", new_session=False)
+            return real(*a, **kw)
+        with mock.patch.object(menage, "LOCK_WAIT_S", 0.1), \
+                mock.patch.object(menage, "CLEAR_WAIT_S", 0.1), \
+                mock.patch.object(menage, "_write_owner", write):
+            ours = menage.hold_tmp(self.mine, self.pol, "a1", new_session=False)
+        theirs = holds[0]
+        try:
+            self.assertNotEqual(ours.path, theirs.path)
+            self.assertEqual(menage.read_owner(troot, os.path.basename(ours.path)),
+                             menage.mesh_key(self.mine))
+            self.assertEqual(menage.read_owner(troot, os.path.basename(theirs.path)),
+                             menage.mesh_key(self.other))
+        finally:
+            ours.release()
+            theirs.release()
+
+    def test_turn_end_does_not_evict_while_another_runner_uses_it(self):
+        # point 2: two live users of `a1` (a runner taking over the lease)
+        self.pol = menage.Policy(tmp_quota=10)
+        first = menage.Turn.begin(self.mine, self.pol, "a1", None, new_session=False,
+                                  base_env={})
+        second = menage.Turn.begin(self.mine, self.pol, "a1", None, new_session=False,
+                                   base_env={})
+        self.assertEqual(first.tmp, second.tmp)
+        old = os.path.join(first.tmp, "vieux")
+        _write(old, age_s=3 * HOUR)
+        first.end(lot=None, turn_id="t1")
+        self.assertTrue(os.path.exists(old))
+        # the second still holds it: no pass takes it either
+        self.assertIsNone(self._hold_exclusive(self.mine, "a1"))
+        second.end(lot=None, turn_id="t2")
+        self.assertFalse(os.path.exists(old))
+
+    def test_fallback_directory_is_always_locked(self):
+        # point 3: the lock of a fallback name may be missed
+        self._tmp(self.mine, "a1")
+        held = self._hold_exclusive(self.mine, "a1")
+        real, missed = menage.tmp_lock, []
+
+        def lock(troot, name, **kw):
+            if menage.FALLBACK_SEP in name and len(missed) < 2:
+                missed.append(name)
+                return None
+            return real(troot, name, **kw)
+        try:
+            with mock.patch.object(menage, "LOCK_WAIT_S", 0.1), \
+                    mock.patch.object(menage, "CLEAR_WAIT_S", 0.1), \
+                    mock.patch.object(menage, "tmp_lock", lock):
+                hold = menage.hold_tmp(self.mine, self.pol, "a1", new_session=False)
+                self.assertIsNotNone(hold.lock)
+                self.assertNotIn(os.path.basename(hold.path), missed)
+                hold.release()
+                with mock.patch.object(menage, "tmp_lock",
+                                       lambda troot, name, **kw: None
+                                       if menage.FALLBACK_SEP in name else real(troot, name, **kw)):
+                    with self.assertRaises(OSError):
+                        menage.hold_tmp(self.mine, self.pol, "a1", new_session=False)
+        finally:
+            held.close()
+
 
 class MeshKeyParamsTest(unittest.TestCase):
 
@@ -323,6 +395,11 @@ class MeshKeyParamsTest(unittest.TestCase):
         self.assertNotEqual(key("postgresql://h/d?port=5433"), key("postgresql://h/d"))
         # second review, point 4
         self.assertNotEqual(key("hostaddr=10.0.0.1 dbname=d"), key("hostaddr=10.0.0.2 dbname=d"))
+        # third review, point 4: a host name is case-insensitive, a socket path is not
+        self.assertEqual(key("host=PG.example dbname=d"), key("host=pg.example dbname=d"))
+        self.assertNotEqual(key("host=/srv/PG-A dbname=d"), key("host=/srv/pg-a dbname=d"))
+        self.assertNotEqual(key("postgresql:///d?host=%2Fsrv%2FPG-A"),
+                            key("postgresql:///d?host=%2Fsrv%2Fpg-a"))
 
     DSNS = (
         "postgresql://u:p@H.example:5433/base?sslmode=require",

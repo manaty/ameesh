@@ -141,6 +141,8 @@ FALLBACK_SEP = "+"
 #: directory. Emptying (exclusive) waits less: a live session of the agent
 #: (`attach`) holds it shared, and then the directory is not emptied
 LOCK_WAIT_S, CLEAR_WAIT_S = 30.0, 5.0
+#: L219: fallback names tried before giving up
+FALLBACK_TRIES = 5
 
 #: caches partagés : nom du sous-dossier → variables d'environnement
 CACHES = (
@@ -409,7 +411,10 @@ def _dsn_where(dsn: str) -> str:
     """Where a DSN points (host, hostaddr, port, dbname), whatever its form
     (URI, key=value, query parameters)."""
     fields = _conninfo_fields(dsn)
-    return "%s|%s|%s|%s" % ((fields.get("host") or "").lower(), fields.get("hostaddr") or "",
+    # host names are case-insensitive, socket paths are not
+    host = ",".join(h if h.startswith(("/", "@")) else h.lower()
+                    for h in (fields.get("host") or "").split(","))
+    return "%s|%s|%s|%s" % (host, fields.get("hostaddr") or "",
                             fields.get("port") or "5432", fields.get("dbname") or "")
 
 
@@ -555,6 +560,21 @@ class TmpHold:
             self.lock.close()
             self.lock = None
 
+    def exclusive_now(self) -> bool:
+        """Turn the shared lock into the exclusive one without waiting: false
+        if another holder of the shared lock remains (a runner taking over
+        the lease). On failure the lock may be lost (flock converts by
+        releasing first): only for the end of the hold."""
+        import fcntl
+
+        if self.lock is None:
+            return False
+        try:
+            fcntl.flock(self.lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        return True
+
 
 def hold_tmp(cfg, policy: Policy, agent: str, *, new_session: bool) -> TmpHold:
     """L219: the agent's temporary directory, locked (shared) for a turn.
@@ -564,46 +584,61 @@ def hold_tmp(cfg, policy: Policy, agent: str, *, new_session: bool) -> TmpHold:
     owner file). The shared lock only waits for a pass deleting or evicting
     (exclusive, the time of an rm); if it cannot be had within
     `LOCK_WAIT_S`, the turn gets a fresh fallback directory, never an
-    unlocked one."""
+    unlocked one (fallback names are tried `FALLBACK_TRIES` times, then
+    OSError). The owner file is only written under the exclusive lock, and
+    the name and owner are checked again once the lock is held; the lock is
+    then turned into the shared one."""
     import fcntl
 
     troot, key = tmp_root(cfg, policy), mesh_key(cfg)
     _ensure_root(troot)
     entries: list = []
-    lock, name = None, ""
-    for _attempt in range(2):          # a homonym of another mesh may claim it meanwhile
+    lock, name, exclusive = None, "", False
+    for _attempt in range(3):          # a homonym of another mesh may claim it meanwhile
         name = tmp_name(troot, agent, key)
-        lock = tmp_lock(troot, name, exclusive=True, timeout=CLEAR_WAIT_S) \
-            if new_session else None
+        # the owner is only written under the exclusive lock: two meshes
+        # starting a homonym at once never both see it free
+        claim = new_session or read_owner(troot, name) is None
+        lock = tmp_lock(troot, name, exclusive=True, timeout=CLEAR_WAIT_S) if claim else None
+        exclusive = lock is not None
         if lock is None:
             lock = tmp_lock(troot, name, exclusive=False, timeout=LOCK_WAIT_S)
-        if lock is None or tmp_name(troot, agent, key) == name:
+        if lock is None:
+            break
+        # checked again under the lock: the name is still ours, and an
+        # unowned one is only taken under the exclusive lock
+        if tmp_name(troot, agent, key) == name \
+                and (exclusive or read_owner(troot, name) is not None):
             break
         lock.close()
         lock = None
     if lock is None:
         import secrets
-        name = "%s%s%s" % (name, FALLBACK_SEP, secrets.token_hex(3))
-        lock = tmp_lock(troot, name, exclusive=True)
+        base = name
+        for _attempt in range(FALLBACK_TRIES):
+            name = "%s%s%s" % (base, FALLBACK_SEP, secrets.token_hex(3))
+            lock = tmp_lock(troot, name, exclusive=True)
+            if lock is not None and read_owner(troot, name) is None:
+                break
+            if lock is not None:
+                lock.close()
+                lock = None
+        if lock is None:
+            raise OSError("L219 : aucun dossier temporaire verrouillable pour %s dans %s"
+                          % (agent, troot))
+        exclusive = True
     mine = os.path.join(troot, name)
     created = not os.path.isdir(mine)
     os.makedirs(mine, mode=0o700, exist_ok=True)
-    owner = read_owner(troot, name)
-    if owner is None:
+    if read_owner(troot, name) is None:            # under the exclusive lock (above)
         _write_owner(troot, name, key, ORIGIN_CREATED if created else ORIGIN_ADOPTED)
-    elif new_session and not created and created_by(troot, name, key) and lock is not None:
-        try:
-            exclusive = fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB) is None
-        except OSError:
-            exclusive = False
-        if exclusive:
-            freed = _clear_dir(mine, troot)
-            if freed:
-                entries.append({"kind": "tmp", "action": "deleted", "path": mine,
-                                "bytes": freed, "agent": agent,
-                                "detail": "session neuve : dossier temporaire vidé"})
-    if lock is not None:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+    elif new_session and not created and exclusive and created_by(troot, name, key):
+        freed = _clear_dir(mine, troot)
+        if freed:
+            entries.append({"kind": "tmp", "action": "deleted", "path": mine,
+                            "bytes": freed, "agent": agent,
+                            "detail": "session neuve : dossier temporaire vidé"})
+    fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
     # a resumed session writes nothing at first: the pass must not see it idle
     try:
         os.utime(mine)
@@ -1419,8 +1454,9 @@ class Turn:
             return self.entries
         policy = self.policy
         try:
-            if self.env and self.tmp:
-                # L219: still under the turn's lock (released just after)
+            if self.env and self.tmp and self.lock is not None and self.lock.exclusive_now():
+                # L219: under the exclusive lock, or no eviction (another
+                # runner holding it shared may be using the directory)
                 root = tmp_root(self.cfg, policy)
                 result = evict_lru([self.tmp], root, policy.tmp_quota,
                                    min_age=EVICT_MIN_AGE_S)
