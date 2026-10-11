@@ -93,6 +93,8 @@ def main() -> int:
         print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
             "unifiedWindows": json.loads(os.environ["AMEESH_TEST_RATE_LIMIT"])}}), flush=True)
     appels = json.loads(os.environ.get("AMEESH_TEST_CLAUDE_CALLS") or "[]")
+    # L221 : le `result` porte l'usage du tour, comme le vrai flux
+    tour = {"input_tokens": 100, "cache_read_input_tokens": 0, "output_tokens": 20}
     for index, appel in enumerate(appels):
         # L105 : un appel au modèle — usage par message (répété sur chaque bloc,
         # comme le vrai flux), puis, s'il appelle un outil, son résultat
@@ -100,6 +102,8 @@ def main() -> int:
         usage = {"input_tokens": relus // 10, "cache_read_input_tokens": relus - relus // 10,
                  "output_tokens": 10}
         message = {"id": "msg-%d" % index, "usage": usage}
+        for cle, valeur in usage.items():
+            tour[cle] += valeur
         # L217 : `parent` = appel d'un sous-agent, lancé par cet outil du fil
         # principal (comme le vrai flux : `parent_tool_use_id`, nul sinon)
         fil = {"parent_tool_use_id": appel.get("parent"), "session_id": session}
@@ -116,7 +120,8 @@ def main() -> int:
     print(json.dumps({"type": "assistant", "message": {"content": [
         {"type": "text", "text": "bonjour du faux claude (session %s)" % session}]}}), flush=True)
     print(json.dumps({"type": "result", "subtype": "success", "result": "fini",
-                      "total_cost_usd": 0.0125, "session_id": session}), flush=True)
+                      "total_cost_usd": 0.0125, "usage": tour, "session_id": session}),
+          flush=True)
     return int(os.environ.get("AMEESH_TEST_EXIT", "0"))
 
 
