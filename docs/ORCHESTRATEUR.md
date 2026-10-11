@@ -49,6 +49,48 @@ l'équipe n'intègre pas sur la branche par défaut), ou `--target`.
 Sans branche, fermer à la main : `ameesh work close <id> --superseded-by`
 ou `ameesh work move <id> …`.
 
+## Le courrier qui réveille (L125)
+
+Chaque message qui réveille un agent lui coûte un tour, et chaque tour relit
+tout son contexte. Le 2026-10-10, sur un projet de 13 agents, 60 % des tours
+duraient moins de 2 min, 87 % des tours de courrier étaient ouverts par un
+seul message, et les copies, accusés et diffusions en ouvraient beaucoup.
+Depuis L125, un agent au repos n'est réveillé qu'au bout d'une fenêtre de
+regroupement (**90 s** par défaut) et son tour emporte tout ce qui est arrivé
+entre-temps ([EXPLOITATION.md](EXPLOITATION.md#courrier-regroupé-avant-le-réveil-l125)).
+Règles, pour l'orchestrateur comme pour les agents (le pied de chaque tour de
+courrier les rappelle) :
+
+* **Pas de copie pour faire relayer : l'orchestrateur lit le fil.** Un agent
+  qui écrit à un pair ne met pas l'orchestrateur en copie pour qu'il relaie.
+  S'il doit être tenu au courant : `--cc orchestrateur`, une copie **sans
+  réveil**, lue à son tour suivant. L'orchestrateur ne relaie pas ce qu'il
+  reçoit en copie ; il lit le fil (`ameesh fil show <projet> [<lot>]`).
+* **Pas d'accusé de réception seul.** « Reçu, merci » n'appelle pas de tour.
+  S'il faut accuser réception : `--ack`, déposé sans réveil. Un message très
+  court qui n'est qu'un accusé est reconnu et traité de même ; « ok », « oui »,
+  « go », « d'accord » restent des réponses, qui réveillent.
+* **`--urgent` seulement quand l'attente bloque** : le destinataire doit agir
+  avant de continuer (build cassé sur la branche commune, fusion à arrêter,
+  question sans laquelle il tourne à vide). D'un expéditeur habilité
+  (`AMEESH_INTERRUPT_SENDERS`), `--urgent` interrompt même un tour en cours :
+  à réserver aux vraies urgences.
+* **Diffusions** : `agent-mail send all "…"` dépose une annonce lue au
+  prochain tour de chacun, sans réveiller personne ; `--urgent` réveille toute
+  l'équipe, rarement.
+* Un message d'un humain réveille toujours tout de suite.
+
+| Je veux… | Commande |
+|---|---|
+| confier, demander, répondre | `ameesh mail send <agent> "…" [--lot …]` — regroupé, au plus 90 s |
+| que le destinataire agisse sans attendre | `… --urgent` |
+| accuser réception | rien ; au besoin `… --ack` |
+| tenir quelqu'un au courant | `… --cc <nom>[,<nom>]` |
+| annoncer à toute l'équipe | `ameesh mail send all "…"` |
+
+L'alerte `turn_churn` (`ameesh alerts`) signale un agent qui fait au moins 12
+tours de moins de 2 min dans l'heure : la mesure de l'effet de ces règles.
+
 ## Le courrier « Capacité au repos »
 
 Quand des agents réveillables restent au repos sans lot pendant que du

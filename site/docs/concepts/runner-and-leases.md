@@ -186,6 +186,13 @@ that a human can still talk to directly.
 
 ## Events and priority interruption
 
+- **Batched mail** (L125). An idle agent is not woken by each message: the
+  runner waits for a batching window (`AMEESH_MAIL_BATCH`, default 90 s,
+  counted from the oldest waiting message), then opens **one** turn with
+  everything that arrived. An `--urgent` message, or a message from a human,
+  wakes the agent at once. Acknowledgements (`--ack`), copies (`--cc`) and
+  `send all` announcements are passive: they never open a turn by themselves,
+  and are read on the next one.
 - **Events** (`ameesh mail send <agent> "…" --kind event`) wake an agent like a
   message, but a burst of events wakes it at most once every
   `AMEESH_EVENT_COALESCE` seconds (default 120). `--urgent` pierces the
@@ -194,7 +201,8 @@ that a human can still talk to directly.
   (`AMEESH_INTERRUPT_SENDERS`) **stops the current turn**: the harness is
   stopped, the turn's prompt is put back in the queue and the urgent message is
   served first, on the same session. An urgent message from a sender who is not
-  authorised is delivered as a normal one. `ameesh interrupt <agent> <message>`
+  authorised does not interrupt anything; it is delivered like a message,
+  without waiting for the batching window. `ameesh interrupt <agent> <message>`
   does the same directly, and refuses a sender who is not authorised.
 
 ## Registering agents by hand

@@ -186,6 +186,21 @@ class TurnResources(interface.TurnResources):
             "   AND started_at < now() - make_interval(secs => %s)" + where +
             " ORDER BY started_at, id", tuple(params))
 
+    def churn(self, since_ts, short_s) -> list[dict]:
+        return self.db.query(
+            """
+            SELECT agent, count(*)::int AS turns,
+                   (count(*) FILTER (WHERE ended_at - started_at
+                                     < make_interval(secs => %s)))::int AS short_turns,
+                   extract(epoch from min(started_at) FILTER (
+                       WHERE ended_at - started_at
+                             < make_interval(secs => %s)))::float8 AS first_short_ts
+              FROM turn_resources
+             WHERE ended_at IS NOT NULL AND started_at >= to_timestamp(%s)
+             GROUP BY agent
+             ORDER BY agent
+            """, (float(short_s), float(short_s), float(since_ts)))
+
 
 class Visibility(interface.Visibility):
 

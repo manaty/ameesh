@@ -804,7 +804,8 @@ class AgentWorker(threading.Thread):
             return False
         if agent.get("pending_prompt"):
             return True
-        if mail.unread(self.db, self.name, limit=1):
+        # L125 : un courrier passif (accusé, copie, diffusion) n'ouvre pas de tour
+        if mail.unread_active(self.db, self.name, limit=1):
             return True
         return self.idle_due()
 
@@ -1896,7 +1897,8 @@ class AgentWorker(threading.Thread):
         if self.agent.get("pending_prompt"):
             return True
         try:
-            return bool(mail.unread(self.db, self.name, limit=1))
+            # L125 : un courrier passif n'attend pas de tour
+            return bool(mail.unread_active(self.db, self.name, limit=1))
         except db_mod.DbError:
             return False
 
@@ -2009,8 +2011,8 @@ class AgentWorker(threading.Thread):
             mid = int(refuse.get("id") or 0)
             if mid and mid not in self._refus_vus:
                 self._refus_vus.add(mid)
-                log("[%s] urgent ignoré : expéditeur %s non habilité à interrompre"
-                    % (self.name, refuse.get("sender") or "?"))
+                log("[%s] urgent de %s sans interruption : expéditeur non habilité "
+                    "à interrompre" % (self.name, refuse.get("sender") or "?"))
         if autorises:
             # Le prioritaire passe devant la consigne en attente : c'est lui qui
             # ouvre le tour, la consigne interrompue suivra (0018).
@@ -2028,10 +2030,18 @@ class AgentWorker(threading.Thread):
             self._reprise_attach = False
             return {"kind": "prompt", "prompt": prompt, "ids": []}
         messages = mail.unread(self.db, self.name)
+        if len(messages) >= mail.UNREAD_LIMIT and all(mail.passive_reason(m) for m in messages):
+            # L125 : boîte pleine de courrier passif — les messages qui
+            # réveillent, plus récents, ne doivent pas y rester invisibles
+            messages = mail.unread_active(self.db, self.name) + messages
         if messages:
-            self.nudged = False
-            self._reprise_attach = False  # le courrier ouvre la même session
-            return self._mail_spec(messages)
+            spec = self._mail_spec(messages)
+            if spec is not None:
+                self.nudged = False
+                self._reprise_attach = False  # le courrier ouvre la même session
+                return spec
+            # L125 : rien de dû (fenêtre de regroupement en cours, courrier
+            # passif) — la reprise et la relance d'inactivité restent possibles
         if self._reprise_attach:
             # L106 : la session interactive est morte sans rendre son bail ;
             # l'exécuteur reprend la MÊME session (registre), une fois.
@@ -2042,32 +2052,97 @@ class AgentWorker(threading.Thread):
         return None
 
     def _mail_spec(self, messages: list[dict]) -> dict | None:
-        """Messages non remis -> un tour. Les événements seuls sont regroupés (C9).
+        """Messages non remis -> un tour, ou None : rien n'est encore dû.
 
-        Le courrier ordinaire réveille immédiatement ; un lot d'événements n'en
-        réveille qu'un par fenêtre `AMEESH_EVENT_COALESCE` (défaut 120 s), sauf
-        si l'un d'eux est `urgent`. L'instant du dernier réveil vit en base
-        (`agent_registry.last_event_at`) : un redémarrage ne remet pas la
-        fenêtre à zéro.
+        L125 : un tour s'ouvre dès qu'un message NON PASSIF est dû, et il
+        emporte tout le courrier non lu — les messages dus d'abord quand la
+        consigne est pleine, les passifs ensuite :
+
+        * courrier ordinaire : dû à la fin de sa fenêtre de regroupement
+          (`mail_batch`, défaut 90 s, comptée depuis l'arrivée du plus
+          ancien), tout de suite s'il est urgent ou d'un humain (`_mail_due`) ;
+        * événements (C9) : un réveil par fenêtre `AMEESH_EVENT_COALESCE`
+          (défaut 120 s), sauf un urgent d'un expéditeur habilité.
+          L'instant du dernier réveil vit en base (`agent_registry.last_event_at`) :
+          un redémarrage ne remet pas la fenêtre à zéro ;
+        * passifs (accusé, copie, diffusion à tous : `mail.passive_reason`) :
+          jamais dus ; lus au tour suivant, ou par le hook pendant un tour.
         """
-        events = [m for m in messages if mail.is_event(m)]
-        autres = [m for m in messages if not mail.is_event(m)]
-        if autres:
-            if events:
-                registry.mark_event_wake(self.db, self.name)
-            return self._courrier_spec("mail", messages)
-        if not events:
-            return None
+        passive = [m for m in messages if mail.passive_reason(m)]
+        active = [m for m in messages if not mail.passive_reason(m)]
+        events = [m for m in active if mail.is_event(m)]
+        others = [m for m in active if not mail.is_event(m)]
+        mail_due = bool(others) and self._mail_due(others)
+        if not mail_due and not (events and self._events_due(events)):
+            return None  # regroupement en cours, ou rien que du courrier passif
+        if events:
+            registry.mark_event_wake(self.db, self.name)
+        rows = active + passive
+        return self._courrier_spec(
+            "event" if all(mail.is_event(m) for m in rows) else "mail", rows)
+
+    def _events_due(self, events: list[dict]) -> bool:
+        """Les événements en attente ouvrent-ils un tour ? (C9)"""
         fenetre = self.runner.event_coalesce
         dernier = float(self.agent.get("last_event_ts") or 0.0)
         # Seul un urgent d'un expéditeur habilité perce la fenêtre : un urgent
         # non habilité reste soumis au regroupement (même règle que la
         # préemption, 0018).
-        if any(mail.is_urgent(m) and self.interrupt_allowed(m) for m in events) \
-                or fenetre <= 0 or (time.time() - dernier) >= fenetre:
-            registry.mark_event_wake(self.db, self.name)
-            return self._courrier_spec("event", events)
-        return None  # fenêtre de regroupement en cours : on attend la suivante
+        return (any(mail.is_urgent(m) and self.interrupt_allowed(m) for m in events)
+                or fenetre <= 0 or (time.time() - dernier) >= fenetre)
+
+    def mail_batch(self) -> float:
+        """L125 : fenêtre de regroupement du courrier, en secondes — réglage de
+        l'agent (`ameesh set <agent> mail_batch=…`, état local de son hôte),
+        sinon défaut de l'exécuteur (`AMEESH_MAIL_BATCH`, 90 s). 0 = réveil
+        immédiat (le comportement d'avant L125)."""
+        local = self._state_read("mail_batch")
+        if local:
+            try:
+                value = float(local)
+            except ValueError:
+                value = -1.0
+            if 0 <= value < float("inf"):
+                return value
+        return float(getattr(self.runner, "mail_batch", self.cfg.mail_batch))
+
+    def _from_human(self, row: dict) -> bool:
+        """L125 : message d'un humain — marqué à l'envoi, ou expéditeur déclaré
+        humain sur cet hôte (`AMEESH_HUMANS`)."""
+        return mail.is_human(row) or (row.get("sender") or "") in self.cfg.human_names
+
+    def _mail_due(self, rows: list[dict]) -> bool:
+        """L125 : le courrier ordinaire en attente ouvre-t-il un tour ?
+
+        Oui si la fenêtre est nulle, si l'un des messages est urgent (réveil
+        sans délai, quel que soit l'expéditeur ; seul un expéditeur habilité
+        INTERROMPT un tour en cours, 0018) ou d'un humain, ou si le plus
+        ancien attend depuis au moins la fenêtre. L'attente se mesure à
+        l'horloge de la base (`created_ts`) et depuis que cet exécuteur a vu
+        le message (horloge monotone) : un décalage d'horloge entre l'hôte et
+        la base ne retarde jamais un message de plus d'une fenêtre.
+        """
+        window = self.mail_batch()
+        if window <= 0 or any(mail.is_urgent(m) or self._from_human(m) for m in rows):
+            return True
+        now, mono = time.time(), time.monotonic()
+        seen = getattr(self, "_batch_seen", {})
+        kept: dict[int, float] = {}
+        waited = 0.0
+        for row in rows:
+            first = seen.get(int(row["id"]), mono)
+            kept[int(row["id"])] = first
+            waited = max(waited, now - float(row.get("created_ts") or now), mono - first)
+        self._batch_seen = kept  # les messages remis entre-temps sont oubliés
+        if waited >= window:
+            return True
+        oldest = min(kept)
+        if getattr(self, "_batch_logged", None) != oldest:
+            self._batch_logged = oldest
+            log_async("[%s] courrier regroupé : %d message(s), tour dans %ds au plus "
+                      "(fenêtre %gs)" % (self.name, len(rows), int(window - waited) + 1,
+                                         window))
+        return False
 
     # -- un tour -----------------------------------------------------------
     def _adapter(self) -> adapters.HarnessAdapter:
@@ -2866,6 +2941,8 @@ class Runner:
         self.idle_nudge = cfg.idle_nudge
         self.poll = max(1.0, cfg.poll)
         self.event_coalesce = max(0.0, cfg.event_coalesce)
+        #: L125 : fenêtre de regroupement du courrier, défaut de l'hôte
+        self.mail_batch = max(0.0, cfg.mail_batch)
         #: plafond (octets UTF-8) de la consigne d'un tour de courrier, résumé de
         #: reprise compris ; borné par l'argument de processus (128 Kio)
         self.prompt_max_bytes = int(min(max(float(mail.PROMPT_MIN_BYTES),
@@ -3076,8 +3153,8 @@ class Runner:
                 if row and mail.is_urgent(row):
                     prioritaire = worker.interrupt_allowed(row)
                     if not prioritaire:
-                        log_async("urgent de %s ignoré : expéditeur non habilité à interrompre"
-                                  % (row.get("sender") or "?"))
+                        log_async("urgent de %s sans interruption : expéditeur non "
+                                  "habilité à interrompre" % (row.get("sender") or "?"))
             if worker and prioritaire:
                 worker.request_preempt()  # le signal d'abord
                 log_async("message prioritaire pour %s : interruption du tour" % target)
@@ -3727,8 +3804,9 @@ class Runner:
             return []
 
     def run(self) -> int:
-        log("démarrage : hôte %s, exécuteur %s, pilote %s, schéma %s"
-            % (self.host, self.runner_id, self.db.name, self.cfg.schema))
+        log("démarrage : hôte %s, exécuteur %s, pilote %s, schéma %s, courrier "
+            "regroupé %ds (L125)" % (self.host, self.runner_id, self.db.name,
+                                     self.cfg.schema, int(self.mail_batch)))
         self.start_canon_sync()
         self.start_balance_poll()
         self.start_resource_poll()

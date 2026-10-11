@@ -1136,9 +1136,10 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 
 #: clés de `ameesh set` (L13 : model, effort ; L26 : tier, session_policy ;
 #: L37 : mode, `execute` | `externe`, décision 0030 ; L60 : context_max_tokens ;
-#: L105 : turn_max_seconds, turn_mail_max)
+#: L105 : turn_max_seconds, turn_mail_max ; L125 : mail_batch, réglage LOCAL
+#: de l'hôte de l'agent, sans migration — comme `effort` et `tier` avant L26)
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
-            "turn_max_seconds", "turn_mail_max")
+            "turn_max_seconds", "turn_mail_max", "mail_batch")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1201,7 +1202,10 @@ def cmd_set(cfg: Config, args) -> int:
     (`context_max_tokens`, L60 : `15M`, `500k`, `0` = désactivé) est écrit en
     base ; vide = défaut de l'exécuteur. Les plafonds du tour (L105) aussi :
     `turn_max_seconds` (`30m`, `2h`, `0` = sans limite) et `turn_mail_max`
-    (messages remis par le hook pendant un tour, `0` = sans borne).
+    (messages remis par le hook pendant un tour, `0` = sans borne). L125 :
+    `mail_batch` (`90s`, `2m`, `0` = réveil immédiat), fenêtre de regroupement
+    du courrier, écrite dans l'état LOCAL — à poser sur l'hôte de l'agent,
+    que son exécuteur lit à chaque sondage (sans migration de la base).
     """
     from . import adapters
     from .config import SESSION_POLICIES
@@ -1220,7 +1224,7 @@ def cmd_set(cfg: Config, args) -> int:
             if not sep or cle not in SET_KEYS:
                 print("usage : ameesh set <agent> model=… effort=… tier=… "
                       "session_policy=%s mode=%s context_max_tokens=N|15M|0 "
-                      "turn_max_seconds=30m|2h|0 turn_mail_max=N|0"
+                      "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 mail_batch=90s|2m|0"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
@@ -1256,9 +1260,16 @@ def cmd_set(cfg: Config, args) -> int:
                     print("turn_mail_max invalide : %r (ex. 5, 0 = sans borne)" % valeur,
                           file=sys.stderr)
                     return 2
+            if cle == "mail_batch" and valeur:
+                try:
+                    valeur = str(parse_duration(valeur))
+                except ValueError:
+                    print("mail_batch invalide : %r (ex. 90s, 2m, 0 = réveil immédiat)"
+                          % valeur, file=sys.stderr)
+                    return 2
             valeurs[cle] = valeur
         for cle, valeur in valeurs.items():
-            if cle in ("model", "effort", "tier"):
+            if cle in ("model", "effort", "tier", "mail_batch"):
                 _ecrit_etat(cfg, args.agent, cle, valeur)
             if cle == "model":
                 if valeur:
@@ -1287,10 +1298,24 @@ def cmd_set(cfg: Config, args) -> int:
                          "sans limite")
         courrier_txt = _txt(effective_turn_mail_max(cfg, agent), "turn_mail_max",
                             "sans borne")
+        # L125 : réglage local de l'hôte de l'agent, sinon défaut de l'hôte
+        regroupement = _lit_etat(cfg, args.agent, "mail_batch")
+        try:
+            secondes = int(float(regroupement)) if regroupement else int(cfg.mail_batch)
+        except (ValueError, OverflowError):  # état illisible : l'exécuteur l'ignore
+            regroupement, secondes = "", int(cfg.mail_batch)
+        regroupement_txt = ("immédiat" if secondes == 0 else "%ds" % secondes) + (
+            "" if regroupement else " (défaut)")
         print("%s : modèle=%s effort=%s tier=%s session=%s mode=%s contexte=%s "
-              "tour_max_s=%s courrier_par_tour=%s (prend effet au prochain tour)"
+              "tour_max_s=%s courrier_par_tour=%s regroupement=%s "
+              "(prend effet au prochain tour)"
               % (args.agent, modele, effort, tier, politique,
-                 agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt))
+                 agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt,
+                 regroupement_txt))
+        if "mail_batch" in valeurs and (agent.get("host") or "") not in ("", cfg.host):
+            print("attention : mail_batch est lu dans l'état local de l'hôte de l'agent "
+                  "(%s), pas dans la base : lancez ce réglage sur %s"
+                  % (agent.get("host"), agent.get("host")), file=sys.stderr)
         if agent.get("mode") == "externe" and not agent.get("responsible"):
             # 0030 : un agent externe a obligatoirement un responsable humain
             print("attention : agent externe sans responsable humain : ses lots et ses "
@@ -1676,6 +1701,7 @@ def build_parser() -> argparse.ArgumentParser:
                        help="model=… effort=… tier=… session_policy=par-lot|taille|jamais "
                             "context_max_tokens=15M|0 "
                             "turn_max_seconds=30m|2h|0 turn_mail_max=5|0 "
+                            "mail_batch=90s|2m|0 (L125, état local de l'hôte) "
                             "mode=execute|externe (valeur vide = défaut)")
     p_set.set_defaults(func=cmd_set)
 

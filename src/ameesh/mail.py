@@ -18,10 +18,13 @@ Le SQL est dans le stockage (`storage.of(db).mailbox`, spec §10).
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 import uuid
 from typing import Any, Sequence
 
 from . import fil, storage
+from .config import NAME_RE
 from .db import Db
 from .storage.postgres import mailbox as _pg
 
@@ -90,9 +93,18 @@ def send(
     return message_id
 
 
-def unread(db: Db, recipient: str, limit: int = 200) -> list[dict]:
+#: nombre de non-lus lus par l'exécuteur à chaque sondage
+UNREAD_LIMIT = 200
+
+
+def unread(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dict]:
     """Messages non remis, du plus ancien au plus récent (comme la v0)."""
     return storage.of(db).mailbox.unread(recipient, limit)
+
+
+def unread_active(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dict]:
+    """L125 : les non-lus qui ouvriront un tour (hors courrier passif)."""
+    return storage.of(db).mailbox.unread_active(recipient, limit)
 
 
 def unread_urgent(db: Db, recipient: str, limit: int = 50) -> list[dict]:
@@ -217,8 +229,7 @@ def _block(db: Db | None, row: dict, limite: int | None = None, note: str | None
            ) -> str:
     """Le rendu d'un message : en-tête (n°, expéditeur, heure, nature,
     autorité, re-livré) puis corps lisible cité ligne à ligne."""
-    nature = " (événement%s)" % (", urgent" if is_urgent(row) else "") \
-        if is_event(row) else ""
+    nature = _nature(row)
     relivre = ("  [re-livré : déjà réservé pour une remise avant une panne, "
                "tu l'as peut-être déjà traité]" if maybe_redelivered(row) else "")
     moment = fil.iso_local(row.get("created_ts") or 0.0)
@@ -331,3 +342,99 @@ def is_event(row: Any) -> bool:
 def is_urgent(row: Any) -> bool:
     """Un événement `urgent` perce le regroupement (C9)."""
     return bool(message_payload(row).get("urgent"))
+
+
+# --------------------------------------------------------------------------
+# L125 : courrier regroupé — ce qui réveille, ce qui attend le tour suivant
+# --------------------------------------------------------------------------
+
+#: clés du payload qui rendent un message PASSIF : déposé sans réveil, il est
+#: lu au tour suivant de son destinataire (dans la consigne du tour, ou par le
+#: hook pendant un tour) — accusé de réception, copie, diffusion à tous. Un
+#: message `urgent` n'est jamais passif.
+PASSIVE_KEYS = ("ack", "cc", "broadcast")
+
+#: un accusé de réception reconnu à l'envoi tient en au plus ce nombre de
+#: caractères…
+ACK_MAX_CHARS = 80
+#: … contient au moins une de ces formules (minuscules, sans accents)…
+ACK_WORDS = frozenset((
+    "recu", "merci", "remercie", "note", "accuse", "reception",
+    "thanks", "thank", "thx", "received", "noted", "ack", "acknowledged"))
+#: … et rien d'autre que ces mots de liaison, de la ponctuation et des émojis.
+#: Jamais « ok », « oui », « non », « pas », « d'accord », « go », « parfait »,
+#: « bon », « fait » : une réponse ou un feu vert que l'expéditeur attend
+#: peut-être pour continuer doit le réveiller.
+ACK_FILLERS = frozenset((
+    "bien", "tres", "beaucoup", "mille", "pour", "le", "la", "les", "l", "ton", "ta",
+    "tes", "votre", "vos", "ce", "cet", "cette", "c", "est", "de", "du", "des", "et",
+    "je", "te", "toi", "vous", "a", "tout", "message", "messages", "retour", "info",
+    "infos", "information", "informations", "precision", "precisions", "copie",
+    "you", "for", "the", "your", "much", "very", "and"))
+
+
+def _payload(row: Any) -> dict:
+    payload = message_payload(row)
+    return payload if isinstance(payload, dict) else {}
+
+
+def passive_reason(row: Any) -> str:
+    """L125 : `ack`, `cc` ou `broadcast` si ce message n'ouvre pas de tour à
+    lui seul ; '' s'il réveille son destinataire."""
+    payload = _payload(row)
+    if payload.get("urgent"):
+        return ""
+    for key in PASSIVE_KEYS:
+        if payload.get(key):
+            return key
+    return ""
+
+
+def is_human(row: Any) -> bool:
+    """L125 : message d'un humain, marqué à l'envoi — il réveille tout de suite."""
+    return bool(_payload(row).get("human"))
+
+
+def passive_label(row: Any) -> str:
+    """Le genre d'un message passif, pour son en-tête ; '' sinon."""
+    reason = passive_reason(row)
+    if reason == "cc":
+        cible = str(_payload(row).get("cc") or "")
+        return "copie d'un message à %s" % (cible if NAME_RE.match(cible) else "?")
+    return {"ack": "accusé de réception", "broadcast": "diffusion à tous"}.get(reason, "")
+
+
+def _nature(row: Any) -> str:
+    """La nature d'un message dans son en-tête : passif (L125), événement,
+    urgent ; '' pour un message ordinaire."""
+    passif = passive_label(row)
+    if passif:
+        return " (%s)" % passif
+    if is_event(row):
+        return " (événement%s)" % (", urgent" if is_urgent(row) else "")
+    return " (urgent)" if is_urgent(row) else ""
+
+
+def looks_like_ack(text: str) -> bool:
+    """L125 : ce texte n'est-il QU'un accusé de réception ?
+
+    Règle prudente — dans le doute, c'est un message ordinaire, qui réveille :
+    au plus `ACK_MAX_CHARS` caractères ; ni chiffre ni point d'interrogation ;
+    au moins une formule d'accusé (`ACK_WORDS` : « reçu », « merci »,
+    « noté », « thanks »…) ; rien d'autre que ces formules, des mots de
+    liaison (`ACK_FILLERS` : « bien », « pour ton retour »…), de la
+    ponctuation et des émojis. « ok », « oui », « d'accord », « parfait »
+    n'en sont jamais : ce sont des réponses, parfois un feu vert.
+    """
+    brut = (text or "").strip()
+    if not brut or len(brut) > ACK_MAX_CHARS or any(ch.isdigit() for ch in brut):
+        return False
+    plat = "".join(ch for ch in unicodedata.normalize("NFKD", brut.casefold())
+                   if not unicodedata.combining(ch))
+    if "?" in plat:
+        return False
+    if any(ch.isalnum() for ch in re.sub(r"[a-z]+", "", plat)):
+        return False  # lettres d'une autre écriture : prudence
+    mots = re.findall(r"[a-z]+", plat)
+    return (any(mot in ACK_WORDS for mot in mots)
+            and all(mot in ACK_WORDS or mot in ACK_FILLERS for mot in mots))

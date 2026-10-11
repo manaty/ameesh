@@ -33,6 +33,15 @@ MAIL_COLUMNS = """
      OR coalesce((meta->>'deja_consigne')::boolean, false)) as deja_consigne
 """
 
+#: L125 : un message PASSIF — accusé, copie, diffusion à tous, jamais urgent —
+#: n'ouvre pas de tour à lui seul (même règle que `mail.passive_reason`).
+#: `{t}` : l'alias de la table `agent_mailbox` (`PASSIVE_SQL.format(t="mb")`).
+PASSIVE_SQL = (
+    "(NOT {t}.payload @> '{{\"urgent\": true}}'::jsonb"
+    " AND ({t}.payload @> '{{\"ack\": true}}'::jsonb"
+    " OR {t}.payload @> '{{\"broadcast\": true}}'::jsonb"
+    " OR coalesce({t}.payload->>'cc', '') <> ''))")
+
 
 class Mailbox(interface.Mailbox):
 
@@ -68,6 +77,19 @@ class Mailbox(interface.Mailbox):
             ORDER BY id
             LIMIT %%s
             """ % MAIL_COLUMNS,
+            (recipient, int(limit)),
+        )
+
+    def unread_active(self, recipient, limit) -> list[dict]:
+        return self.db.query(
+            """
+            SELECT %s
+            FROM agent_mailbox
+            WHERE recipient = %%s AND delivered_at IS NULL
+              AND NOT %s
+            ORDER BY id
+            LIMIT %%s
+            """ % (MAIL_COLUMNS, PASSIVE_SQL.format(t="agent_mailbox")),
             (recipient, int(limit)),
         )
 

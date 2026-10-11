@@ -27,6 +27,29 @@ def _mk(path: str) -> str:
     return path
 
 
+def _send_payload(dest: str, urgent: bool, payload: dict | None) -> dict:
+    """Le payload d'un envoi (L125) : `urgent`, et `broadcast` pour une
+    diffusion à « all » qui ne l'est pas — lue au prochain tour de chacun,
+    sans réveiller personne (`mail.passive_reason`). Le courrier d'un humain
+    (`human`) réveille toujours, diffusion comprise."""
+    out = dict(payload or {})
+    if urgent:
+        out["urgent"] = True
+    if dest == "all" and not out.get("urgent") and not out.get("human"):
+        out["broadcast"] = True
+    return out
+
+
+def _send_thread_meta(thread_meta: dict | None, payload: dict, cc) -> dict | None:
+    """L125 : le fil d'un message dit ses copies et s'il est un accusé."""
+    meta = dict(thread_meta or {})
+    if cc:
+        meta["cc"] = list(cc)
+    if payload.get("ack"):
+        meta["ack"] = True
+    return meta or None
+
+
 class FileBackend:
     """Backend v0 : un fichier JSON par message, un dossier par agent."""
 
@@ -50,10 +73,12 @@ class FileBackend:
     def send(self, sender: str, dest: str, text: str, host: str | None = None,
              signed: dict | None = None, work_item_id: str | None = None,
              allow_structured: bool = False, kind: str = "notify",
-             urgent: bool = False, thread_meta: dict | None = None) -> list[str]:
+             urgent: bool = False, thread_meta: dict | None = None,
+             payload: dict | None = None, cc=()) -> list[str]:
         # Le repli fichier ne stocke pas de signature (format v0 strict) : la
         # CLI prévient l'appelant, le message part quand même.
         fil.ensure_readable(text, allow_structured)
+        payload = _send_payload(dest, urgent, payload)
         if dest == "all":
             targets = [
                 f[:-5]
@@ -68,20 +93,25 @@ class FileBackend:
             targets = [dest]
         now = time.time()
         written: list[tuple[str, str]] = []
-        for target in targets:
+        # L125 : les copies (--cc) partent en événement passif, sans réveil
+        envois = [(target, kind, payload, False) for target in targets]
+        envois += [(name, "event", {"cc": dest}, True) for name in cc or ()]
+        for target, genre, charge, copie in envois:
             filename = "%d-%s-%d.json" % (int(now * 1000), sender, os.getpid())
             tmp = os.path.join(self.inbox_dir(target), "." + filename)
             message = {"from": sender, "to": target, "ts": now, "text": text,
                        "host": host or socket.gethostname()}
-            if kind != "notify" or urgent:
+            if genre != "notify" or charge:
                 # format v0 inchangé pour un message ordinaire ; kind/payload
-                # n'apparaissent que pour un événement ou un urgent (C9).
-                message["kind"] = kind
-                message["payload"] = {"urgent": True} if urgent else {}
+                # n'apparaissent que pour un événement, un urgent (C9) ou un
+                # message passif (L125).
+                message["kind"] = genre
+                message["payload"] = charge
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(message, fh, ensure_ascii=False)
             os.replace(tmp, os.path.join(self.inbox_dir(target), filename))
-            written.append((target, filename))
+            if not copie:
+                written.append((target, filename))
         # Le fil, après le dépôt : une erreur ici ne perd rien (fil.record ne
         # lève pas). `v0` permet à import-v0 de ne pas réécrire ces messages.
         def chantier(name: str) -> str:
@@ -99,7 +129,7 @@ class FileBackend:
             fil.record(
                 self.cfg, None, sender=sender, recipients=[t for t, _ in sent], text=text,
                 ts=now, project=project, lot=work_item_id,
-                meta=dict(thread_meta or {}, repli="fichier",
+                meta=dict(_send_thread_meta(thread_meta, payload, cc) or {}, repli="fichier",
                           host=host or socket.gethostname(),
                           diffusion="all" if dest == "all" else None,
                           v0=["%s/%s" % (t, f) for t, f in sent]))
@@ -230,8 +260,11 @@ class PgBackend:
     def send(self, sender: str, dest: str, text: str, host: str | None = None,
              signed: dict | None = None, work_item_id: str | None = None,
              allow_structured: bool = False, kind: str = "notify",
-             urgent: bool = False, thread_meta: dict | None = None) -> list[str]:
+             urgent: bool = False, thread_meta: dict | None = None,
+             payload: dict | None = None, cc=()) -> list[str]:
         fil.ensure_readable(text, allow_structured)
+        payload = _send_payload(dest, urgent, payload)
+        thread_meta = _send_thread_meta(thread_meta, payload, cc)
         projects: dict[str, str] = {}
         if dest == "all":
             rows = registry.overview(self.db)
@@ -252,7 +285,7 @@ class PgBackend:
             message_id = mail.send(
                 self.db, sender, target, text, host=host, work_item_id=work_item_id,
                 allow_structured=allow_structured, thread=(dest != "all"),
-                kind=kind, payload={"urgent": True} if urgent else None,
+                kind=kind, payload=payload or None,
                 thread_meta=thread_meta, **dict(signed or {}))
             registry.upsert(self.db, target, host=host)
             if dest == "all":
@@ -263,6 +296,13 @@ class PgBackend:
                 self.cfg, self.db, sender=sender, recipients=[t for t, _ in sent], text=text,
                 project=project, lot=work_item_id, mailbox_ids=[i for _, i in sent],
                 meta={"host": host, "diffusion": "all"})
+        for name in cc or ():
+            # L125 : la copie part en événement passif — lue au prochain tour
+            # de son destinataire, sans le réveiller. Sans lot (elle ne change
+            # pas le lot de sa session) ; le fil la cite sur l'entrée du message.
+            mail.send(self.db, sender, name, text, host=host, kind="event",
+                      payload={"cc": dest}, allow_structured=allow_structured,
+                      thread=False)
         return targets
 
     def unread(self, name: str) -> list[dict]:
