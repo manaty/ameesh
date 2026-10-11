@@ -1391,13 +1391,16 @@ def worktree_state(path: str) -> dict:
     Seul `integrated` autorise un retrait : une branche poussée mais pas
     fusionnée est du travail en cours (L73b)."""
     out = {"exists": os.path.isdir(path), "clean": False, "pushed": False,
-           "integrated": False, "locked": False, "head": "", "branch": "", "reason": ""}
+           "integrated": False, "locked": False, "head": "", "branch": "", "reason": "",
+           "gitdir": "", "submodules": ""}
     if not out["exists"]:
         out["reason"] = "dossier disparu"
         return out
     gitdir = _git(["rev-parse", "--absolute-git-dir"], path)
     if gitdir is not None and gitdir.returncode == 0 and gitdir.stdout.strip():
-        out["locked"] = os.path.exists(os.path.join(gitdir.stdout.strip(), "locked"))
+        out["gitdir"] = gitdir.stdout.strip()
+        out["locked"] = os.path.exists(os.path.join(out["gitdir"], "locked"))
+    out["submodules"] = submodules(path, out["gitdir"])
     # L230: never a write in .git (no index refresh), dry run or not
     status = _git(["--no-optional-locks", "status", "--porcelain", "--untracked-files=normal"],
                   path)
@@ -1434,6 +1437,8 @@ def worktree_state(path: str) -> dict:
                 out["integrated"] = (merged.stdout.split()[0] == tree.stdout.strip())
     if out["locked"]:
         out["reason"] = "verrouillé (git worktree lock)"
+    elif out["submodules"]:
+        out["reason"] = "sous-modules (%s)" % out["submodules"]
     elif dirty:
         out["reason"] = "%d fichier(s) modifié(s) ou non suivi(s)" % len(dirty)
     elif not out["integrated"]:
@@ -1441,6 +1446,23 @@ def worktree_state(path: str) -> dict:
             out["head"][:12] or "?", ref or "la branche principale distante",
             "poussé mais non fusionné" if out["pushed"] else "commits non poussés")
     return out
+
+
+def submodules(path: str, gitdir: str) -> str:
+    """L230: why the worktree `path` may hold submodules ('' if it cannot):
+    a `.gitmodules`, or a non-empty `<gitdir>/modules` (their repositories,
+    with possibly unpushed commits, live in the worktree's administrative
+    directory). Unknown gitdir or unreadable `modules`: a doubt, said so."""
+    if os.path.lexists(os.path.join(path, ".gitmodules")):
+        return ".gitmodules"
+    if not gitdir:
+        return "dossier git du worktree inconnu"
+    try:
+        return "%s/modules" % gitdir if os.listdir(os.path.join(gitdir, "modules")) else ""
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        return "%s/modules illisible (%s)" % (gitdir, exc.strerror or exc)
 
 
 def _under(path: str, root: str) -> bool:
@@ -1829,6 +1851,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
         # remote: nothing is lost; its branch stays (not merged into main)
         kept_merged = (state in LOT_MERGED and row["status"] == "kept"
                        and row.get("detail") == detail and st["clean"] and st["pushed"]
+                       and not st["submodules"]
                        and now - float(row.get("checked_ts") or now) >= KEPT_MERGED_GRACE_S)
         if kept_merged:
             leftovers = ignored_leftovers(path, build_artifacts.rules_of(artifacts))
@@ -1852,7 +1875,8 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
                 plan.append(dict(base, action="retrait", bytes=size, detail=why))
                 continue
             outcome, freed, note, built = _remove_kept_merged(
-                path, row.get("repo") or common_dir(path), artifacts=artifacts, allow=allow,
+                path, row.get("repo") or common_dir(path), st["gitdir"], artifacts=artifacts,
+                allow=allow,
                 lock_path=lock_path, journal_path=journal_path, skip_roots=skip_roots)
             entries += [dict(base, kind="artifact", detail="%s ; %s" % (why, b.pop("detail")),
                              **b) for b in built]
@@ -1866,7 +1890,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
                                        "git worktree prune%s" % (why, " ; %s" % note if note
                                                                   else "")))
             continue
-        elif not st["clean"] or not st["integrated"]:
+        elif not st["clean"] or not st["integrated"] or st["submodules"]:
             plan.append(dict(base, action="garde", detail=detail))
             if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
                 store.set_worktree_status(row["id"], "kept", detail)
@@ -1893,17 +1917,18 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
     return entries, plan
 
 
-def _remove_kept_merged(path: str, repo: str, *, artifacts, allow, lock_path, journal_path,
-                        skip_roots=()) -> tuple[str, int, str, list]:
+def _remove_kept_merged(path: str, repo: str, gitdir: str, *, artifacts, allow, lock_path,
+                        journal_path, skip_roots=()) -> tuple[str, int, str, list]:
     """L230: removal of a worktree kept although its lot is merged, under the
     host lock of the deleting passes (`build_artifacts`). Its build output
     goes first like an idle worktree's (descriptors, journal, `.git`,
     filesystem and managed-root protections); then the tree must be fully
     clean, ignored files included (nothing exempt); then the processes are
-    read again right before its directory, still the planned one, is renamed
-    to a trash recorded in the journal and deleted; git forgets it (`git
-    worktree prune`; `git worktree remove` cannot follow a renamed
-    directory, its cleanliness check is the one above, stricter).
+    read again, and the git lock (`<gitdir>/locked`) and submodules checked
+    again (`submodules`), right before its directory, still the planned one,
+    is renamed to a trash recorded in the journal and deleted; git forgets
+    it (`git worktree prune`; `git worktree remove` cannot follow a renamed
+    directory, its checks are the ones above, stricter).
 
     (outcome, bytes freed, note, build output deleted): outcome `removed`,
     `partial` (gone from its path, something left in its trash), or `garde`
@@ -1930,11 +1955,18 @@ def _remove_kept_merged(path: str, repo: str, *, artifacts, allow, lock_path, jo
         parent_id = build_artifacts.identity(os.path.dirname(real))
 
         def check() -> str:
-            # read again right before each rename: a process may have come in
+            # read again right before each rename: a process may have come in,
+            # `git worktree lock` or a submodule may have been done meanwhile
             again = platform.user_paths(allow=allow)
             held = again.holders(path)
-            return again.doubt() or ("processus dedans (%s)" % ", ".join(held[:3])
-                                     if held else "")
+            refusal = again.doubt() or ("processus dedans (%s)" % ", ".join(held[:3])
+                                        if held else "")
+            if refusal or not gitdir:
+                return refusal or "dossier git du worktree inconnu"
+            if os.path.lexists(os.path.join(gitdir, "locked")):
+                return "verrouillé (git worktree lock)"
+            subs = submodules(path, gitdir)
+            return "sous-modules (%s)" % subs if subs else ""
 
         def notes(done: dict) -> str:
             more = done["left"][:3] + done["errors"][:3]

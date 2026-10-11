@@ -696,6 +696,54 @@ class MergedKeptTest(_Repo):
         self.assertEqual(self.journal(), [])
         self.assertIn("lot-12", _git("branch", "--list", "lot-12", cwd=self.main))
 
+    def test_r3_1_submodules_keep_it_and_are_reported(self):
+        # r3 (1): prune would delete <gitdir>/modules (submodule objects)
+        wt = self.add_worktree("lot-13")
+        gitdir = _git("rev-parse", "--absolute-git-dir", cwd=wt).strip()
+        _write(os.path.join(gitdir, "modules", "sub", "HEAD"), text="ref: refs/heads/local\n")
+        old = "lot #13 merged : gardé — HEAD non intégré (poussé mais non fusionné)"
+        store, entries, plan = self.run_pass(
+            [self.row(wt, checked_ago=2 * DAY, lot="13", detail=old)], {13: "merged"})
+        self.assertEqual(plan[0]["action"], "garde")
+        self.assertIn("sous-modules", plan[0]["detail"])
+        self.assertEqual(store.statuses[0][1], "kept")   # reported: worktree_kept
+        self.assertIn("modules", store.statuses[0][2])
+        self.assertEqual(entries[0]["action"], "kept")
+        # the same reason a day later: still kept, nothing deleted
+        store, _e, plan = self.run_pass([self.row(wt, checked_ago=2 * DAY, lot="13")],
+                                        {13: "merged"})
+        self.assertEqual((plan[0]["action"], store.statuses), ("garde", []))
+        self.assertTrue(os.path.exists(os.path.join(gitdir, "modules", "sub", "HEAD")))
+        shutil.rmtree(os.path.join(gitdir, "modules"))
+        _write(os.path.join(wt, ".gitmodules"), text="[submodule \"s\"]\n")
+        _git("add", ".gitmodules", cwd=wt)
+        _git("commit", "-q", "-m", "submodules", cwd=wt)
+        _git("push", "-q", "origin", "lot-13", cwd=wt)
+        plan = self.run_pass([self.row(wt, checked_ago=2 * DAY, lot="13")], {13: "merged"})[2]
+        self.assertIn(".gitmodules", plan[0]["detail"])
+        self.assertTrue(os.path.isdir(wt))
+
+    def test_r3_2_git_lock_checked_again_right_before_the_rename(self):
+        # r3 (2): `git worktree lock` done during the cleanup of the build output
+        wt = self.add_worktree("lot-14")
+        _write(os.path.join(wt, "node_modules", "a.js"))
+        real = platform.user_paths
+
+        def scan(allow=()):
+            if not os.path.exists(os.path.join(wt, "node_modules")) \
+                    and "locked" not in _git("worktree", "list", "--porcelain", cwd=self.main):
+                _git("worktree", "lock", wt, cwd=self.main)
+            return real(allow=allow)
+
+        with mock.patch.object(platform, "user_paths", side_effect=scan):
+            store, _e, plan = self.run_pass([self.row(wt, checked_ago=2 * DAY, lot="14")],
+                                            {14: "merged"})
+        self.assertEqual(plan[0]["action"], "garde")
+        self.assertIn("verrouillé", plan[0]["detail"])
+        self.assertEqual(store.statuses, [])
+        self.assertTrue(os.path.isfile(os.path.join(wt, "f.txt")))
+        self.assertEqual(self.journal(), [])
+
     def test_closed_dirty_unpushed_or_changed_reason_stay_kept(self):
         wt = self.add_worktree("lot-8")
         self.assertEqual(self.run_pass([self.row(wt, checked_ago=2 * DAY, lot="8")],
