@@ -8,8 +8,12 @@ environ quatre fois trop bas, sans un mot. Désormais :
 
 * les tarifs claude officiels (relevés le 2026-10-11) sont au barème ;
 * un modèle claude inconnu prend le majorant de la **famille claude** ;
-* une famille sans aucun tarif connu n'a pas de majorant : la ligne naît
-  écartée (`void_reason`) et l'alerte `turn_unpriced` le dit.
+* une famille sans tarif (ou un harnais sans famille) prend le repli prudent,
+  maximum de tout le barème, marqué `price_fallback` : le tour reste dans la
+  dépense et l'alerte `turn_unpriced` le dit ; seul un tour sans aucun barème
+  est écarté (`void_reason`) ;
+* dans les replis claude, les écritures de cache coûtent ×1,25 (5 min ou
+  durée inconnue) ou ×2 (1 h) le prix d'entrée.
 
 Postgres réel ; journaux factices.
 """
@@ -18,6 +22,7 @@ from __future__ import annotations
 import os
 import time
 import unittest
+from unittest import mock
 
 from ameesh import cost, exploitation, notify
 
@@ -101,59 +106,117 @@ class ReplisClaudeTest(Sandbox, PgTestCase):
         self.assertAlmostEqual(self.book().record(nom).usd, 0.42)
 
 
+class EcrituresDeCacheTest(Sandbox, PgTestCase):
+    """Replis claude : écritures de cache ×1,25 (5 min ou durée inconnue), ×2 (1 h)."""
+
+    def _cout_du_tour(self, usage: dict) -> float:
+        nom = self.agent("a1", "claude", "claude-opus-5-5")
+        self.events(nom, {"type": "system", "subtype": "init", "session_id": "s1"},
+                    {"type": "assistant", "session_id": "s1", "message": {
+                        "id": "m1", "content": [{"type": "text"}], "usage": usage}})
+        return self.book().turn_usage(nom, model="claude-opus-5-5").usd
+
+    def test_duree_inconnue_au_tarif_cinq_minutes(self):
+        self.assertAlmostEqual(
+            self._cout_du_tour({"cache_creation_input_tokens": 1_000_000}), 4.0 * 1.25)
+
+    def test_cache_une_heure_au_double(self):
+        self.assertAlmostEqual(self._cout_du_tour({
+            "cache_creation_input_tokens": 1_000_000,
+            "cache_creation": {"ephemeral_1h_input_tokens": 1_000_000,
+                               "ephemeral_5m_input_tokens": 0}}), 4.0 * 2)
+
+    def test_melange_cinq_minutes_et_une_heure(self):
+        self.assertAlmostEqual(self._cout_du_tour({
+            "input_tokens": 1_000_000, "cache_creation_input_tokens": 1_000_000,
+            "cache_creation": {"ephemeral_1h_input_tokens": 400_000,
+                               "ephemeral_5m_input_tokens": 600_000}}),
+            4.0 + 4.0 * (0.6 * 1.25 + 0.4 * 2))
+
+
 class SansTarifTest(Sandbox, PgTestCase):
-    """Une famille sans aucun tarif connu : ligne écartée, alerte levée."""
+    """Sans tarif du modèle ni de sa famille : repli prudent ET alerte ; seul un
+    tour sans aucun barème est écarté (mesh-design, 2026-10-11)."""
 
     def _tour(self, nom: str) -> None:
         self.events(nom, {"type": "status", "phase": "step_end",
                           "usage": {"inputTokens": 1_000_000, "cacheReadTokens": 0,
                                     "outputTokens": 1_000_000}})
 
-    def test_ligne_ecartee_des_sommes_et_alerte(self):
+    def _alertes(self, **kw) -> list:
+        return [a for a in exploitation.alerts(self.cfg, self.db, **kw)
+                if a["type"] == "turn_unpriced"]
+
+    def test_famille_connue_sans_tarif_prend_le_repli_prudent_marque(self):
+        prix = {"gpt-x": [3, 1, 30], "default-deepseek": [0.2, 0.2, 0.2]}
+        triplet, marque = cost.price_for(prix, "claude", "claude-opus-x")
+        self.assertEqual(triplet, [3.0, 1.0, 30.0])
+        self.assertTrue(marque["price_fallback"].startswith(cost.FALLBACK_REASON))
+        self.assertEqual(cost.price_for(prix, "codex", "gpt-y"), ([3.0, 1.0, 30.0], {}))
+        triplet, marque = cost.price_for({}, "claude", "claude-opus-x")
+        self.assertIsNone(triplet)
+        self.assertTrue(marque["void_reason"].startswith(cost.UNPRICED_REASON))
+
+    def test_harnais_sans_famille_reste_dans_la_depense_avec_alerte(self):
         nom = self.agent("a1", "nouveau-harnais", "modele-x")
         self._tour(nom)
         tour = self.book().record(nom, model="modele-x")
-        self.assertTrue(tour.void_reason.startswith(cost.UNPRICED_REASON), tour.void_reason)
-        self.assertIn("modele-x", tour.void_reason)
-        row = self.db.query("SELECT usd::float8 AS usd, void_reason FROM turn_costs")[0]
-        self.assertEqual(row["usd"], 0.0)
-        self.assertEqual(row["void_reason"], tour.void_reason)
-        self.assertEqual(self.book().spent("all", 3600), 0.0)
+        pire = cost.worst_price_of(cost.DEFAULT_PRICES)
+        self.assertAlmostEqual(tour.usd, pire[0] + pire[2])
+        self.assertIsNone(tour.void_reason)
+        self.assertTrue(tour.price_fallback.startswith(cost.FALLBACK_REASON))
+        self.assertIn("modele-x", tour.price_fallback)
+        row = self.db.query("SELECT void_reason, price_fallback FROM turn_costs")[0]
+        self.assertIsNone(row["void_reason"])
+        self.assertEqual(row["price_fallback"], tour.price_fallback)
+        self.assertAlmostEqual(self.book().spent("all", 3600), round(tour.usd, 6), places=5)
 
-        alertes = [a for a in exploitation.alerts(self.cfg, self.db)
-                   if a["type"] == "turn_unpriced"]
+        alertes = self._alertes()
         self.assertEqual(len(alertes), 1, alertes)
         alerte = alertes[0]
-        self.assertEqual((alerte["agent"], alerte["harness"], alerte["model"], alerte["value"]),
-                         ("a1", "nouveau-harnais", "modele-x", 1))
+        self.assertEqual((alerte["agent"], alerte["harness"], alerte["model"], alerte["value"],
+                          alerte["voided"]), ("a1", "nouveau-harnais", "modele-x", 1, 0))
+        self.assertAlmostEqual(alerte["usd"], round(tour.usd, 6), places=5)
         self.assertEqual(alerte["output_tokens"], 1_000_000)
         self.assertIn("turn_unpriced", notify.DEFAULT_TYPES)
         self.assertIn("turn_unpriced", notify.TYPE_LABELS)
 
-    def test_tour_sans_jeton_n_est_pas_ecarte(self):
+    def test_sans_aucun_bareme_la_ligne_est_ecartee_et_alertee(self):
+        nom = self.agent("a1", "nouveau-harnais", "modele-x")
+        self._tour(nom)
+        with mock.patch.dict(cost.DEFAULT_PRICES, clear=True):
+            tour = self.book().record(nom, model="modele-x")
+        self.assertTrue(tour.void_reason.startswith(cost.UNPRICED_REASON), tour.void_reason)
+        self.assertIsNone(tour.price_fallback)
+        self.assertEqual(self.book().spent("all", 3600), 0.0)
+        alertes = self._alertes()
+        self.assertEqual([(a["value"], a["voided"]) for a in alertes], [(1, 1)])
+
+    def test_tour_sans_jeton_n_est_pas_marque(self):
         nom = self.agent("a1", "nouveau-harnais", "modele-x")
         self.events(nom, {"type": "status", "phase": "step_end", "usage": {}})
-        self.assertIsNone(self.book().record(nom, model="modele-x").void_reason)
-        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db)
-                          if a["type"] == "turn_unpriced"], [])
+        tour = self.book().record(nom, model="modele-x")
+        self.assertIsNone(tour.price_fallback)
+        self.assertIsNone(tour.void_reason)
+        self.assertEqual(self._alertes(), [])
 
-    def test_modele_nomme_au_bareme_local_n_est_pas_ecarte(self):
+    def test_modele_nomme_au_bareme_local_n_est_pas_marque(self):
         chemin = os.path.join(self.tmp_cost, "prices.json")
         with open(chemin, "w", encoding="utf-8") as fh:
             fh.write('{"modele-x": [1, 0.5, 2]}')
         nom = self.agent("a1", "nouveau-harnais", "modele-x")
         self._tour(nom)
         tour = self.book(prices_path=chemin).record(nom, model="modele-x")
-        self.assertIsNone(tour.void_reason)
+        self.assertIsNone(tour.price_fallback)
         self.assertAlmostEqual(tour.usd, 3.0)
+        self.assertEqual(self._alertes(), [])
 
     def test_alerte_limitee_aux_dernieres_24_heures(self):
         nom = self.agent("a1", "nouveau-harnais", "modele-x")
         self._tour(nom)
         self.book().record(nom, model="modele-x")
         plus_tard = time.time() + exploitation.UNPRICED_WINDOW_S + 60
-        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db, now=plus_tard)
-                          if a["type"] == "turn_unpriced"], [])
+        self.assertEqual(self._alertes(now=plus_tard), [])
 
 
 if __name__ == "__main__":

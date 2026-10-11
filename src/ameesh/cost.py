@@ -216,9 +216,12 @@ class TurnUsage:
     output_tokens: int = 0
     turn: str | None = None
     session: str | None = None
-    #: L225 : non None = tour au barème sans tarif connu ni majorant sûr ; la
-    #: ligne est écartée des sommes et l'alerte `turn_unpriced` le dit
+    #: L225 : non None = tour au barème sans aucun barème ; la ligne est
+    #: écartée des sommes et l'alerte `turn_unpriced` le dit
     void_reason: str | None = None
+    #: L225 : non None = tour facturé au repli prudent (maximum du barème),
+    #: faute de tarif du modèle et de sa famille ; alerte `turn_unpriced`
+    price_fallback: str | None = None
 
     def row(self) -> dict:
         return {
@@ -333,10 +336,10 @@ def max_price_of(prices: dict, harness: str) -> list | None:
 
     Un modèle inconnu (ou vide) ne doit jamais être facturé au tarif par défaut,
     qui est le moins cher (0019 §3, repli fail-closed). L225 : si la famille n'a
-    **aucun** tarif connu, il n'y a pas de majorant sûr — None. Le maximum de
-    tout le barème (repli d'avant) n'en est pas un : sans prix claude, il
-    facturait un tour opus aux tarifs codex. L'appelant écarte alors la ligne
-    (`void_reason`) et l'alerte `turn_unpriced` le dit.
+    **aucun** tarif connu, il n'y a pas de majorant sûr — None. L'appelant
+    prend alors le repli prudent (`worst_price_of`) **et** le marque
+    (`price_fallback`, alerte `turn_unpriced`) : sans prix claude, ce repli
+    facturait un tour opus aux tarifs codex, sans un mot.
     """
     prefixes = PRICE_FAMILY.get(harness, ())
     candidats = [triplet for key, value in prices.items()
@@ -348,9 +351,44 @@ def max_price_of(prices: dict, harness: str) -> list | None:
     return [max(triplet[i] for triplet in candidats) for i in range(3)]
 
 
-#: L225 : début du `void_reason` d'un tour sans tarif connu ni majorant sûr
-#: (alerte `turn_unpriced`)
+def worst_price_of(prices: dict) -> list | None:
+    """L225 : le repli prudent, maximum composante par composante de **tout** le
+    barème utilisable (défauts compris) ; None s'il n'y a aucun barème."""
+    candidats = [triplet for value in prices.values()
+                 for triplet in [_valid_triplet(value)] if triplet is not None]
+    if not candidats:
+        return None
+    return [max(triplet[i] for triplet in candidats) for i in range(3)]
+
+
+def price_for(prices: dict, harness: str, model: str | None) -> tuple[list | None, dict]:
+    """L225 : (triplet, marque) du tarif d'un tour compté au barème.
+
+    Tarif du modèle, sinon majorant de sa famille (0019 §3) : marque vide.
+    Famille sans tarif (ou harnais sans famille) : repli prudent sur tout le
+    barème, marqué `price_fallback` — le tour reste dans la dépense et les
+    plafonds. Aucun barème du tout : (None, `void_reason`), la ligne est écartée.
+    Les deux marques lèvent l'alerte `turn_unpriced`."""
+    triplet = known_price(prices, model) or max_price_of(prices, harness)
+    if triplet:
+        return triplet, {}
+    what = "modèle %s (harnais %s)" % (model or "inconnu", harness or "?")
+    worst = worst_price_of(prices)
+    if worst:
+        return worst, {"price_fallback": "%s : %s sans tarif au barème ni dans sa famille, "
+                       "facturé au maximum du barème" % (FALLBACK_REASON, what)}
+    return None, {"void_reason": "%s : %s, aucun barème" % (UNPRICED_REASON, what)}
+
+
+#: L225 : début du `void_reason` d'un tour sans aucun barème, et de la
+#: `price_fallback` d'un tour facturé au repli prudent (alerte `turn_unpriced`)
 UNPRICED_REASON = "prix inconnu"
+FALLBACK_REASON = "repli prudent"
+
+#: L225 : écritures de cache Claude, en multiple du prix d'entrée de base
+#: (barème officiel : 5 min ×1,25, 1 h ×2 ; durée inconnue : ×1,25)
+CACHE_WRITE_5M = 1.25
+CACHE_WRITE_1H = 2.0
 
 
 class CostBook:
@@ -903,14 +941,10 @@ class CostBook:
             # lit dans le journal de session du fil, ou sa configuration.
             model = self.codex_thread_model(session)
         prices = load_prices(self.prices_path)
-        triplet = known_price(prices, model)
-        modele = model if triplet else (model or "inconnu")
-        if triplet is None:
-            triplet = max_price_of(prices, harness or "deepseek")
-        # L225 : sans tarif connu ni majorant sûr, un tour compté au barème est
-        # écarté (`void_reason`), jamais compté à un tarif d'une autre famille.
-        sans_prix = None if triplet else "%s : modèle %s (harnais %s) sans tarif au " \
-            "barème ni tarif connu de sa famille" % (UNPRICED_REASON, modele, harness or "?")
+        modele = model if known_price(prices, model) else (model or "inconnu")
+        # L225 : la marque (`price_fallback` ou `void_reason`) ne vaut que pour
+        # un tour effectivement compté au barème, avec des jetons.
+        triplet, marque = price_for(prices, harness or "deepseek", model)
         pin, pcache, pout = triplet or (0.0, 0.0, 0.0)
         cum = self.baseline(agent, harness, session)
         # L71 : session reprise sans relevé de l'agent — le dernier total CONNU
@@ -943,11 +977,7 @@ class CostBook:
                 # appel, lu sur les messages du modèle (une fois par id), au
                 # barème ; le cumul n'en fait jamais le coût du tour.
                 usage = _claude_call_usages(events)
-                usd = sum(
-                    ((_num(u, "input_tokens") + _num(u, "cache_creation_input_tokens")) * pin
-                     + _num(u, "cache_read_input_tokens") * pcache
-                     + _num(u, "output_tokens") * pout) / 1e6
-                    for u in usage)
+                usd = sum(_claude_usd(u, pin, pcache, pout) for u in usage)
             elif not totals:
                 usd = 0.0
                 au_bareme = False
@@ -955,11 +985,7 @@ class CostBook:
                 # L71 : total d'avant le tour inconnu — estimation par les
                 # jetons du tour (`usage` de `result` est celui du tour), au
                 # barème ; le cumul de la ligne sert de repère au tour suivant.
-                usd = sum(
-                    ((_num(u, "input_tokens") + _num(u, "cache_creation_input_tokens")) * pin
-                     + _num(u, "cache_read_input_tokens") * pcache
-                     + _num(u, "output_tokens") * pout) / 1e6
-                    for u in usage)
+                usd = sum(_claude_usd(u, pin, pcache, pout) for u in usage)
             elif last is None or session != cum.get("session"):
                 au_bareme = False
                 # Session neuve (ou inconnue) : son `total_cost_usd` cumulé part de
@@ -976,8 +1002,7 @@ class CostBook:
                 input_tokens=_sum(usage, "input_tokens"),
                 cached_input_tokens=_sum(usage, "cache_read_input_tokens"),
                 output_tokens=_sum(usage, "output_tokens"),
-                void_reason=sans_prix if au_bareme and any(map(_has_tokens, usage)) else None,
-            )
+                **(marque if au_bareme and any(map(_has_tokens, usage)) else {}))
 
         if harness == "codex":
             completed = [e.get("usage") or {} for e in events if e.get("type") == "turn.completed"]
@@ -1007,7 +1032,7 @@ class CostBook:
             return TurnUsage(agent, harness, modele, usd,
                              input_tokens=delta[0], cached_input_tokens=delta[1],
                              output_tokens=delta[2],
-                             void_reason=sans_prix if any(delta) else None)
+                             **(marque if any(delta) else {}))
 
         # DeepSeek (et tout harnais qui publie un usage par étape).
         steps = [e.get("usage") or {} for e in events
@@ -1018,7 +1043,7 @@ class CostBook:
         usd = (tin * pin + tcache * pcache + tout * pout) / 1e6
         return TurnUsage(agent, harness or "deepseek", modele, usd,
                          input_tokens=tin, cached_input_tokens=tcache, output_tokens=tout,
-                         void_reason=sans_prix if tin or tcache or tout else None)
+                         **(marque if tin or tcache or tout else {}))
 
     def record(self, agent: str, start: int = 0, turn: str | None = None,
                session: str | None = None, model: str | None = None,
@@ -1069,7 +1094,8 @@ class CostBook:
             input_tokens=row["input_tokens"], cached_input_tokens=row["cached_input_tokens"],
             output_tokens=row["output_tokens"], cum_usd=cum_usd, cum_input_tokens=cum_input,
             cum_cached_input_tokens=cum_cached, cum_output_tokens=cum_out,
-            account=account, spend_key=key, void_reason=usage.void_reason)
+            account=account, spend_key=key, void_reason=usage.void_reason,
+            price_fallback=usage.price_fallback)
         return usage
 
     def account_at(self, agent: str, start: int, harness: str | None = None) -> str | None:
@@ -1292,6 +1318,22 @@ def _claude_main_results(events: Sequence[dict], session: str | None) -> list[di
     return [e for e in events
             if e.get("type") == "result" and not e.get("parent_tool_use_id")
             and (not session or e.get("session_id") in (None, "", session))]
+
+
+def _claude_usd(usage: dict, pin: float, pcache: float, pout: float) -> float:
+    """Coût d'un usage Claude au barème (USD), écritures de cache comprises (L225).
+
+    `cache_creation_input_tokens` au prix d'entrée ×1,25 (cache 5 min), sauf la
+    part que `cache_creation.ephemeral_1h_input_tokens` déclare en cache 1 h
+    (×2) ; durée non déclarée : ×1,25."""
+    written = _num(usage, "cache_creation_input_tokens")
+    detail = usage.get("cache_creation") if isinstance(usage, dict) else None
+    hour = min(_num(detail, "ephemeral_1h_input_tokens"), written) \
+        if isinstance(detail, dict) else 0
+    return (_num(usage, "input_tokens") * pin
+            + ((written - hour) * CACHE_WRITE_5M + hour * CACHE_WRITE_1H) * pin
+            + _num(usage, "cache_read_input_tokens") * pcache
+            + _num(usage, "output_tokens") * pout) / 1e6
 
 
 def _has_tokens(usage) -> bool:

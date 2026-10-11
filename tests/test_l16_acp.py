@@ -277,9 +277,9 @@ class AcpTest(unittest.TestCase):
     def test_usage_acp_alimente_le_grand_livre(self):
         """Le grand livre générique compte l'usage d'un harnais ACP (budget L13).
 
-        L225 : un harnais sans famille de prix au barème n'a pas de majorant sûr ;
-        le tour garde ses jetons mais naît écarté (`void_reason`), alerté par
-        `turn_unpriced`, au lieu d'être facturé au pire de tout le barème."""
+        L225 : un harnais sans famille de prix est facturé au repli prudent
+        (maximum du barème) et le tour est marqué (`price_fallback`, alerte
+        `turn_unpriced`) ; il reste dans la dépense."""
         from ameesh import cost as cost_mod
         state = os.path.join(self.tmp, "state")
         agent = os.path.join(state, "a")
@@ -292,7 +292,9 @@ class AcpTest(unittest.TestCase):
         book = cost_mod.CostBook(state_dir=state, db=None, tools={"a": "faux-acp"})
         usage = book.turn_usage("a", 0, session="s1", model="")
         self.assertEqual(usage.input_tokens, 1_000_000)
-        self.assertTrue(usage.void_reason.startswith(cost_mod.UNPRICED_REASON))
+        self.assertGreater(usage.usd, 0.0)
+        self.assertIsNone(usage.void_reason)
+        self.assertTrue(usage.price_fallback.startswith(cost_mod.FALLBACK_REASON))
         prix = os.path.join(self.tmp, "prices.json")
         with open(prix, "w", encoding="utf-8") as fh:
             json.dump({"faux-modele": [1, 0, 0]}, fh)
@@ -300,7 +302,7 @@ class AcpTest(unittest.TestCase):
                                  prices_path=prix)
         usage = book.turn_usage("a", 0, session="s1", model="faux-modele")
         self.assertAlmostEqual(usage.usd, 1.0)
-        self.assertIsNone(usage.void_reason)
+        self.assertIsNone(usage.price_fallback)
 
 
 # ==========================================================================

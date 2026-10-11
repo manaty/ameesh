@@ -125,9 +125,9 @@ def thread_created_ts(thread: str | None) -> float | None:
 # --------------------------------------------------------------------------
 
 def _price(prices: dict, harness: str, model: str) -> list | None:
-    """Le tarif du modèle, sinon le majorant de sa famille ; None sans l'un ni
-    l'autre (L225 : jamais le tarif d'une autre famille)."""
-    return cost_mod.known_price(prices, model) or cost_mod.max_price_of(prices, harness)
+    """Le tarif du modèle, sinon le majorant de sa famille, sinon le repli
+    prudent (maximum du barème) ; None sans aucun barème (L225)."""
+    return cost_mod.price_for(prices, harness, model)[0]
 
 
 def _usd(harness: str, tokens: list, triplet: list) -> float:
@@ -233,7 +233,7 @@ def plan(rows: Iterable[dict], *, prices: dict,
             continue
         triplet = _price(prices, row["harness"], model)
         if triplet is None:
-            fix(row, "modele", "modèle « inconnu » → %s (%s), sans tarif au barème : coût "
+            fix(row, "modele", "modèle « inconnu » → %s (%s), aucun barème : coût "
                 "inchangé" % (model, source), model=model)
             continue
         usd = round(_usd(row["harness"], tokens, triplet), 6)
@@ -281,9 +281,9 @@ def _claude_cumul(first: dict, others: list, prices: dict, fix, repriced: dict) 
             estimate = (tokens[0] + tokens[1]) * spent / read
             how = "coût par jeton relu des %d autres tours de la session" % len(others)
         else:
-            majorant = cost_mod.max_price_of(prices, "claude")
+            majorant = cost_mod.price_for(prices, "claude", None)[0]
             if majorant is None:
-                return                  # L225 : aucun tarif claude, pas d'estimation sûre
+                return                  # L225 : aucun barème, pas d'estimation
             estimate = _usd("claude", tokens, majorant)
             how = "tarif le plus cher connu"
     if usd <= CUMUL_FACTOR * estimate or usd - estimate <= CUMUL_MIN_USD:
@@ -315,8 +315,8 @@ def _codex_cumul(first: dict, prices: dict, fix, repriced: dict,
         triplet = _price(prices, "codex", model)
         if triplet is None:
             fix(first, "cumul", "usage cumulé du fil repris compté pour un tour ; modèle %s "
-                "sans tarif au barème" % (model or "inconnu"),
-                void_reason="%s : usage du fil repris sans tarif" % cost_mod.UNPRICED_REASON)
+                "sans barème" % (model or "inconnu"),
+                void_reason="%s : usage du fil repris, aucun barème" % cost_mod.UNPRICED_REASON)
             return
         usd = round(_usd("codex", delta, triplet), 6)
         repriced[int(first["id"])] = delta
