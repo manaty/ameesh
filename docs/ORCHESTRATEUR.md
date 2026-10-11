@@ -38,6 +38,31 @@ lot**.
 * L'attribution passe par la garde habituelle : un agent non réveillable est
   refusé et rien n'est déposé.
 
+## Un agent au repos prend lui-même un lot de son équipe (L165)
+
+Constat du 11/10 : 9 agents Nexlink sur 13 au repos, dont un sans lot depuis
+1 h 30, alors que 3 lots Nexlink n'avaient pas d'agent. Désormais, `ameesh
+notify` ne laisse plus un lot attendre l'orchestrateur : **un agent
+réveillable au repos sans lot depuis 15 min prend lui-même le lot non
+assigné le plus prioritaire de son équipe qu'il sait faire**, et
+l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
+
+* Lots concernés : `intake`, sans assigné, créés il y a plus de 5 min. Un lot
+  déjà confié par courrier (`build`), en `waiting_human`, de décision (demande
+  de décision en attente, jalon de décision ouvert) n'est jamais pris.
+* Réserver un lot à une attribution explicite : capacité exigée `decision` ou
+  `production`. Exiger un harnais : capacité `harness:<nom>`.
+* Équipe du lot : la sienne, sinon celle de sa fiche (ou de la fiche
+  parente), sinon son application (`--app`). Un lot sans équipe connue
+  attend l'orchestrateur.
+* Ordre : priorité, puis dates prévues (début, fin, livraison), puis
+  ancienneté. Un orchestrateur ne se sert pas lui-même.
+* Réassigner : `ameesh work assign <id> <agent>`, puis le message `--lot <id>`.
+* Réglages : `ameesh notify --take-lot-idle S` (`AMEESH_TAKE_LOT_IDLE`,
+  défaut 900, `0` coupe), `--take-lot-max-per-hour N` (défaut 6 pour tout le
+  mesh). La file d'amélioration (L119) ne passe qu'ensuite, quand aucun lot du
+  projet n'attend.
+
 ## Toute demande d'un humain devient un lot (L130)
 
 Constat du 2026-10-11 : depuis le 07/10, le propriétaire a fait 46 demandes ;

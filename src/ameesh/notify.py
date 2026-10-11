@@ -5,12 +5,17 @@
                 [--long-turn S] [--idle-mail S] [--dead-grace S]
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
                 [--take-idle S] [--take-max-per-hour N] [--take-paid]
+                [--take-lot-idle S] [--take-lot-max-per-hour N]
         suit les alertes d'exploitation (`ameesh alerts --follow`, mêmes
         seuils, mêmes clés de dédoublonnage) et envoie chaque alerte levée
         et chaque résolution à l'humain responsable, sur ses canaux.
         L119 (0037) : à chaque passage, la prise automatique confie un
         élément de la file d'amélioration aux agents au repos
         (`ameesh.backlog.auto_take`) ; `--take-idle 0` la coupe.
+        L165 : avant la file, un agent au repos depuis `--take-lot-idle`
+        (défaut 15 min) prend le lot non assigné le plus prioritaire de son
+        équipe et l'orchestrateur en est prévenu ; `--take-lot-idle 0` la
+        coupe.
         L126 : sur l'hôte que désigne la clé `github` de la configuration,
         chaque passage tient aussi les issues GitHub des lots
         (`ameesh.plan_github.Projector`).
@@ -962,7 +967,9 @@ class Notifier:
             item = take["item"]
             entry = {"alert": {"type": "auto_take", "agent": take["agent"],
                                "lot": int(item["id"]), "title": item.get("title")},
-                     "human": None, "source": "file d'amélioration"}
+                     "human": None,
+                     "source": "lot de l'équipe" if take.get("kind") == "lot"
+                     else "file d'amélioration"}
             self._record("auto_take", entry, "a_blanc" if self.dry_run else "prise", {})
 
     # -- levée ----------------------------------------------------------------
@@ -1358,17 +1365,37 @@ def build_parser() -> argparse.ArgumentParser:
                         default=os.environ.get("AMEESH_TAKE_PAID", "") == "1",
                         help="autoriser la prise par des agents payés au token (après les "
                              "agents au forfait ; jamais pendant balance_low)")
+    # L165 : prise d'un lot non assigné de l'équipe, avant la file
+    parser.add_argument("--take-lot-idle", type=float,
+                        default=exploitation._env_float("AMEESH_TAKE_LOT_IDLE",
+                                                        backlog.DEFAULT_LOT_IDLE_S),
+                        help="un agent réveillable au repos sans lot depuis S secondes prend "
+                             "le lot non assigné le plus prioritaire de son équipe (défaut "
+                             "900 ; 0 coupe cette prise)")
+    parser.add_argument("--take-lot-max-per-hour", type=int,
+                        default=int(exploitation._env_float(
+                            "AMEESH_TAKE_LOT_MAX_PER_HOUR", backlog.DEFAULT_LOT_MAX_PER_HOUR)),
+                        help="lots de l'équipe pris au plus par heure glissante, pour tout le "
+                             "mesh (défaut 6)")
     return parser
 
 
 def take_settings(args) -> dict | None:
-    """Réglages de `backlog.auto_take` lus des options ; None si la prise est coupée."""
+    """Réglages de `backlog.auto_take` lus des options ; None si les deux
+    prises (file d'amélioration, lots de l'équipe) sont coupées."""
     idle = float(getattr(args, "take_idle", 0) or 0)
     most = int(getattr(args, "take_max_per_hour", 0) or 0)
+    lot_idle = float(getattr(args, "take_lot_idle", 0) or 0)
+    lot_most = int(getattr(args, "take_lot_max_per_hour", 0) or 0)
     if idle <= 0 or most <= 0:
+        idle, most = 0.0, 0
+    if lot_idle <= 0 or lot_most <= 0:
+        lot_idle, lot_most = 0.0, 0
+    if not most and not lot_most:
         return None
     return {"idle_s": idle, "max_per_hour": most,
-            "allow_paid": bool(getattr(args, "take_paid", False))}
+            "allow_paid": bool(getattr(args, "take_paid", False)),
+            "lot_idle_s": lot_idle, "lot_max_per_hour": lot_most}
 
 
 def _interval(args, ncfg: NotifyConfig) -> float:

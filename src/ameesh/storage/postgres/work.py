@@ -631,6 +631,32 @@ class WorkItems(interface.WorkItems):
             "   AND starts_with(note, %s)", (float(seconds), note_prefix))
         return int(rows[0]["n"]) if rows else 0
 
+    def unassigned_lots(self, limit) -> list[dict]:
+        return self.db.query(
+            "SELECT w.*,"
+            "       coalesce(nullif(btrim(w.team), ''), nullif(btrim(k.team), ''),"
+            "                nullif(btrim(kp.team), ''), nullif(btrim(w.app), '')) AS lot_team,"
+            "       EXISTS (SELECT 1 FROM agent_mailbox b"
+            "                WHERE b.delivered_at IS NULL AND b.kind = 'request'"
+            "                  AND (b.payload -> 'decision') IS NOT NULL"
+            "                  AND btrim(b.work_item_id) = w.id::text) AS pending_decision,"
+            "       EXISTS (SELECT 1 FROM commitments c"
+            "                WHERE c.work_item_id = w.id AND c.kind = 'decision'"
+            "                  AND c.status IN ('proposed', 'open')) AS decision_milestone"
+            "  FROM (SELECT %s,"
+            "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
+            "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
+            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
+            "          FROM work_items"
+            "         WHERE state = 'intake' AND assignee IS NULL"
+            "           AND type <> 'improvement') w"
+            "  LEFT JOIN work_packages k ON k.id = w.package_id"
+            "  LEFT JOIN work_packages kp ON kp.id = w.package_parent"
+            " ORDER BY coalesce(w.priority, 2), w.planned_start NULLS LAST,"
+            "          w.planned_end NULLS LAST, w.planned_delivery NULLS LAST,"
+            "          w.created_ts, w.id"
+            " LIMIT %%s" % ITEM_COLUMNS, (int(limit),))
+
     # -- issues GitHub des lots (L126) ------------------------------------------
     def issue_feed(self, limit) -> list[dict]:
         """Lots ouverts ou porteurs d'une `issue_ref` (les plus récents d'abord

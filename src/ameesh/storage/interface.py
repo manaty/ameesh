@@ -69,7 +69,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    refresh_package_parents delegate current_delegation
                    mark_delegate_turn due_delegations resolve_delegation
                    overdue_delegations returned_delegations backlog_add backlog
-                   auto_takes_since issue_feed set_issue_ref set_estimate
+                   auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
                    estimates mark_started estimate_history
    packages       all get upsert retire
    actions         get recent attempts events log_event last_event_note
@@ -1016,6 +1016,16 @@ class WorkItems(Domain):
         """Nombre de prises automatiques (lignes de journal dont la note
         commence par `note_prefix`) sur les `seconds` dernières secondes, tous
         hôtes confondus."""
+
+    @abc.abstractmethod
+    def unassigned_lots(self, limit: int) -> list[dict]:
+        """L165 : les lots du projet encore à confier (`intake`, sans assigné,
+        hors file d'amélioration), dans l'ordre de prise : priorité, puis
+        dates prévues (début, fin, livraison ; sans date en dernier), puis
+        ancienneté. Chaque ligne ajoute `lot_team` (équipe du lot, sinon de sa
+        fiche ou de la fiche parente, sinon son application),
+        `pending_decision` (une demande de décision attend sur le lot) et
+        `decision_milestone` (un jalon de décision ouvert y est rattaché)."""
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     @abc.abstractmethod
