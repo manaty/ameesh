@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L50: one orphan notification per agent, reason and responsible human."""
+import contextlib
 import dataclasses
+import json
 import unittest
 from unittest.mock import patch
 
@@ -71,3 +73,85 @@ class GroupOrphanLotsTest(unittest.TestCase):
             records = notifier.run_pass(None, [orphan(1), orphan(2)])
             self.assertEqual({r["human"] for r in records}, {"human:a", "human:b"})
             self.assertEqual(len(sender.sent), 2)
+
+    @contextlib.contextmanager
+    def _notifier(self, state=None, sender=None):
+        cfg = dataclasses.replace(config.Config(), canon=None, github=None)
+        ncfg = notify.parse_config({"default_human": "human:owner", "default": ["desktop"]})
+        notifier = notify.Notifier(cfg, ncfg, state=state, sender=sender or notify.DrySender(),
+                                   clock=lambda: 1000, log=lambda message: None)
+        with patch.object(notify.Router, "resolve", side_effect=lambda a: (
+                a.get("responsible") or "human:owner", "lot")), \
+             patch.object(notify.Notifier, "_brief_orchestrators"), \
+             patch.object(notify.Notifier, "_brief_agents"):
+            yield notifier
+
+    def test_retry_uses_current_group_after_membership_changes(self):
+        sender = notify.DrySender()
+        with self._notifier(sender=sender) as notifier:
+            with patch.object(sender, 'send', side_effect=notify.ChannelError('temporary')):
+                records = notifier.run_pass(None, [orphan(1)])
+                self.assertEqual(records[0]['delivery'], 'echec')
+            # JSON roundtrip models a notifier restart with a pending delivery.
+            notifier.state = json.loads(json.dumps(notifier.state))
+            records = notifier.run_pass(None, [orphan(2)])
+            self.assertEqual(len(records), 1)
+            self.assertIn('#2 "Work 2"', records[0]['text'])
+            self.assertNotIn('#1 "Work 1"', records[0]['text'])
+            self.assertEqual(notifier.run_pass(None, [orphan(2), orphan(3)]), [])
+            records = notifier.run_pass(None, [])
+            self.assertIn('#3 "Work 3"', records[0]['text'])
+
+    def test_upgrade_merges_legacy_deliveries_without_false_events(self):
+        state = notify.empty_state()
+        for lot, delivered in ((1, False), (2, True)):
+            alert = orphan(lot)
+            state['active'][notify.key_of(alert)] = {
+                'alert': alert, 'raised_ts': 500 + lot, 'human': 'human:owner',
+                'source': 'lot', 'status': 'envoi',
+                'channels': {'desktop': {'ok': delivered, 'attempts': 1,
+                                          'error': None if delivered else 'temporary'}}}
+        with self._notifier(state=json.loads(json.dumps(state))) as notifier:
+            self.assertEqual(notifier.run_pass(None, [orphan(1), orphan(2)]), [])
+            self.assertEqual(len(notifier.state['active']), 1)
+            entry = next(iter(notifier.state['active'].values()))
+            self.assertEqual(entry['raised_ts'], 501)
+            self.assertTrue(entry['channels']['desktop']['ok'])
+            self.assertEqual(notifier.sender.sent, [])
+            records = notifier.run_pass(None, [])
+            self.assertEqual([r['event'] for r in records], ['resolved'])
+
+    def test_upgrade_retries_legacy_failure_with_current_payload(self):
+        alert = orphan(1)
+        state = notify.empty_state()
+        state['active'][notify.key_of(alert)] = {
+            'alert': alert, 'raised_ts': 500, 'human': 'human:owner', 'source': 'lot',
+            'status': 'envoi', 'channels': {'desktop': {'ok': False, 'attempts': 1, 'error': 'temporary'}}}
+        with self._notifier(state=state) as notifier:
+            records = notifier.run_pass(None, [orphan(2)])
+            self.assertEqual([r['event'] for r in records], ['raised'])
+            self.assertIn('#2 "Work 2"', records[0]['text'])
+            self.assertNotIn('#1 "Work 1"', records[0]['text'])
+            self.assertEqual(next(iter(state['active'].values()))['channels']['desktop']['attempts'], 2)
+
+    def test_render_preserves_five_long_titles_and_more_suffix(self):
+        alerts = [orphan(i) for i in range(1, 8)]
+        for alert in alerts:
+            alert['title'] = str(alert['lot']) * 60
+        grouped = notify.group_orphan_lots(alerts, lambda a: ('human:owner', 'lot'))[0]
+        message = notify.render(grouped, 'raised', 1000)
+        for alert in alerts[:5]:
+            self.assertIn('#%s "%s"' % (alert['lot'], alert['title']), message.body)
+        self.assertTrue(message.body.endswith('and 2 more'))
+        self.assertLessEqual(len(grouped['detail']), notify.GROUPED_DETAIL_LIMIT)
+
+    def test_upgrade_keeps_changed_recipients_separate(self):
+        alert = orphan(1)
+        state = notify.empty_state()
+        state['active'][notify.key_of(alert)] = {
+            'alert': alert, 'raised_ts': 500, 'human': 'human:old', 'source': 'lot',
+            'status': 'envoi', 'channels': {'desktop': {'ok': True, 'attempts': 1, 'error': None}}}
+        with self._notifier(state=state) as notifier:
+            records = notifier.run_pass(None, [orphan(1, responsible='human:new')])
+            self.assertEqual([(r['event'], r['human']) for r in records],
+                             [('resolved', 'human:old'), ('raised', 'human:new')])

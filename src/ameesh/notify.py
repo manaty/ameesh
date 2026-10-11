@@ -441,7 +441,7 @@ def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
         subject = "agent %s" % _clean(alert.get("agent") or "unknown", 64)
         title = "ameesh: %sorphan lots (%s)" % (
             "resolved — " if event == "resolved" else "", subject)
-        text = "[orphan_lot] %s\n%s" % (subject, _clean(alert.get("detail")))
+        text = "[orphan_lot] %s\n%s" % (subject, _clean(alert.get("detail"), GROUPED_DETAIL_LIMIT))
         return Message(title, text, low=event == "resolved", urgent=event != "resolved")
     label = TYPE_LABELS.get(kind, kind.replace("_", " "))
     subject = _subject(alert)
@@ -863,6 +863,7 @@ def key_of(alert: dict) -> str:
 
 
 GROUPED_LOTS_SHOWN = 5
+GROUPED_DETAIL_LIMIT = 600
 
 
 def group_orphan_lots(alerts: list, resolve) -> list:
@@ -890,7 +891,7 @@ def group_orphan_lots(alerts: list, resolve) -> list:
         grouped = {"type": "orphan_lot", "agent": agent, "reason": reason,
                    "responsible": human, "grouped": True, "value": len(lots),
                    "detail": "%d orphan lot(s) (%s): %s%s" % (
-                       len(lots), reason or "unknown", names, more)}
+                       len(lots), _clean(reason or "unknown", 64), names, more)}
         out.append(grouped)
     return out
 
@@ -946,6 +947,7 @@ class Notifier:
         notifications = group_orphan_lots(current, router.resolve)
         wanted = {key_of(a): a for a in notifications if a.get("type") in self.ncfg.types}
         active = self.state["active"]
+        self._reconcile_orphan_groups(active, wanted, router)
         for key in list(active):
             if key in wanted:
                 continue
@@ -965,11 +967,14 @@ class Notifier:
                 self._raise(entry, router, now)
                 if alert.get("type") not in alert_briefs.BRIEFED_TYPES:
                     self._brief_orchestrators(db, alert, router)
-            elif entry["status"] in ("sans_destinataire", "sans_canal"):
-                # un responsable (ou une route) a pu apparaître depuis
-                self._raise(entry, router, now)
             else:
-                self._retry(entry, "raised", now)
+                if alert.get("type") == "orphan_lot" and alert.get("grouped"):
+                    entry["alert"] = {k: alert.get(k) for k in _KEPT if alert.get(k) is not None}
+                if entry["status"] in ("sans_destinataire", "sans_canal"):
+                    # un responsable (ou une route) a pu apparaître depuis
+                    self._raise(entry, router, now)
+                else:
+                    self._retry(entry, "raised", now)
         self._brief_agents(db, current, router, now)
         for key in list(self.state["resolved"]):
             entry = self.state["resolved"][key]
@@ -988,6 +993,45 @@ class Notifier:
             else:
                 del self.state["rate"][human]
         return records
+
+    def _reconcile_orphan_groups(self, active: dict, wanted: dict, router: Router) -> None:
+        """Adopt persisted per-lot deliveries before checking for resolutions.
+
+        Keep recipient identity and successful channels: upgrading must not
+        resolve/re-raise an unchanged orphan situation or resend delivered alerts.
+        Multiple old alerts share the earliest raise and a single retry budget.
+        """
+        ranks = {"nouvelle": 0, "sans_destinataire": 1, "sans_canal": 2,
+                 "resumee": 3, "envoi": 4}
+        for old_key in list(active):
+            entry = active[old_key]
+            alert = entry["alert"]
+            if alert.get("type") != "orphan_lot" or alert.get("grouped"):
+                continue
+            human = entry.get("human")
+            if human is None:
+                human, _ = router.resolve(alert)
+            identity = {"type": "orphan_lot", "agent": alert.get("agent"),
+                        "reason": alert.get("reason"), "responsible": human, "grouped": True}
+            key = key_of(identity)
+            if key not in wanted:
+                continue
+            active.pop(old_key)
+            target = active.get(key)
+            if target is None:
+                target = active[key] = entry
+            else:
+                target["raised_ts"] = min(target["raised_ts"], entry["raised_ts"])
+                if ranks.get(entry["status"], 0) > ranks.get(target["status"], 0):
+                    target.update(status=entry["status"], human=entry.get("human"),
+                                  source=entry.get("source"))
+                for channel, state in entry.get("channels", {}).items():
+                    previous = target["channels"].get(channel)
+                    if previous is None or (not previous.get("ok") and
+                            (state.get("ok") or state.get("attempts", 0) < previous.get("attempts", 0))):
+                        target["channels"][channel] = dict(state)
+            target["alert"] = {k: wanted[key].get(k) for k in _KEPT
+                               if wanted[key].get(k) is not None}
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     def _github_issues(self, db, now: float) -> None:
