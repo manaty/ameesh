@@ -432,13 +432,13 @@ class AmeeshSetTest(_Base):
         _runner, worker = self._worker("orch-s")
         proc = self.mesh("set", "orch-s", "mail_batch=2m")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("regroupement=120s", proc.stdout)
+        self.assertIn("mail_batch=120s", proc.stdout)
         self.assertEqual(worker.mail_batch(), 120.0)
         proc = self.mesh("set", "orch-s", "mail_batch=0")
-        self.assertIn("regroupement=immédiat", proc.stdout)
+        self.assertIn("mail_batch=immediate", proc.stdout)
         self.assertEqual(worker.mail_batch(), 0.0)
         proc = self.mesh("set", "orch-s", "mail_batch=")
-        self.assertIn("regroupement=immédiat (défaut)", proc.stdout)  # banc : 0
+        self.assertIn("mail_batch=immediate (default)", proc.stdout)  # banc : 0
         self.assertEqual(worker.mail_batch(), worker.runner.mail_batch)
         self.assertEqual(self.mesh("set", "orch-s", "mail_batch=bientot").returncode, 2)
 

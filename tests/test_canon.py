@@ -1341,7 +1341,7 @@ class CanonCliTest(_CanonDbCase):
         proc = self.mesh("review-class", "--diff", "ref-qui-n-existe-pas", env=env)
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("référence", proc.stderr)
-        self.assertNotIn("classe :", proc.stdout)   # aucune classe partielle
+        self.assertNotIn("class:", proc.stdout)   # aucune classe partielle
 
     def test_sans_canon_configure(self):
         proc = self.mesh("canon", "check")
@@ -1364,7 +1364,7 @@ class CanonCliTest(_CanonDbCase):
         self.assertIn("ouvrier", proc.stdout)
         self.assertIn("créé", proc.stdout)
         proc = self.mesh("show", "ouvrier")
-        self.assertIn("responsable : human:bruno", proc.stdout)
+        self.assertIn("responsible: human:bruno", proc.stdout)
         self.assertIn("canon    : canon:agents/ouvrier.md@", proc.stdout)
         rows = {r["name"]: r for r in json.loads(self.mesh("list", "--json").stdout)}
         self.assertTrue(rows["ouvrier"]["responsible_ok"])

@@ -92,7 +92,7 @@ class ReservationTest(PgTestCase):
         # visible dans work show
         proc = self.mesh("work", "show", str(b["id"]))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("migration: %04d réservée" % (self.floor + 1), proc.stdout)
+        self.assertIn("migration: %04d reserved" % (self.floor + 1), proc.stdout)
 
     def test_numero_precis_refuse_s_il_est_pris(self):
         a, b = self._lot("a"), self._lot("b")
@@ -117,9 +117,9 @@ class ReservationTest(PgTestCase):
         a = self._lot()
         proc = self.mesh("work", "migration", str(a["id"]), "--number", "9200")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("migration 9200 réservée", proc.stdout)
+        self.assertIn("migration 9200 reserved", proc.stdout)
         proc = self.mesh("work", "migration", str(a["id"]), "--release")
-        self.assertIn("aucune migration réservée", proc.stdout)
+        self.assertIn("no migration reserved", proc.stdout)
 
 
 if __name__ == "__main__":

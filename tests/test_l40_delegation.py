@@ -93,7 +93,7 @@ class DelegationTest(_Base):
     def test_delegation_acceptee(self):
         proc = self.mesh("work", "delegate", str(self.lot["id"]), "relais", "--within", "30m")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("délégué à relais par orch, échéance dans 30 min", proc.stdout)
+        self.assertIn("delegated to relais by orch, due in 30 min", proc.stdout)
         item = self._item()
         self.assertEqual((item["assignee"], item["delegated_by"]), ("relais", "orch"))
         self.assertAlmostEqual(item["due_ts"] - item["delegated_ts"], 1800.0, delta=1.0)
@@ -284,7 +284,7 @@ class EcheanceTest(_Base):
         self._echoir()
         proc = self.mesh("work", "expire-delegations", "--dry-run")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("[dry-run] lot #%d : rendu à orch" % self.lot["id"], proc.stdout)
+        self.assertIn("[dry-run] lot #%d: returned to orch" % self.lot["id"], proc.stdout)
         self.assertEqual(self._item()["assignee"], "relais")
         self.assertEqual([d["outcome"] for d in self._delegations()], [None])
         self.assertEqual(self._boite("orch"), [])
@@ -293,10 +293,10 @@ class EcheanceTest(_Base):
         self.assertEqual([(l["outcome"], l["dry_run"]) for l in lignes], [("rendue", True)])
         proc = self.mesh("work", "expire-delegations")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("lot #%d : rendu à orch" % self.lot["id"], proc.stdout)
+        self.assertIn("lot #%d: returned to orch" % self.lot["id"], proc.stdout)
         self.assertEqual(self._item()["assignee"], "orch")
         proc = self.mesh("work", "expire-delegations")
-        self.assertIn("aucune délégation échue", proc.stdout)
+        self.assertIn("no expired delegation", proc.stdout)
 
     def test_deux_executeurs_un_seul_retour(self):
         self._echoir()

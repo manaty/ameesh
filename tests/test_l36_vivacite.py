@@ -50,8 +50,8 @@ class L36CliTest(PgTestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
         proc = self.mesh("list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.count("lots     :"), 1, proc.stdout)
-        self.assertIn("lots     : 3 (request 3)", proc.stdout)
+        self.assertEqual(proc.stdout.count("items    :"), 1, proc.stdout)
+        self.assertIn("items    : 3 (request 3)", proc.stdout)
         lines = {line.split()[0]: line for line in proc.stdout.splitlines()
                  if line.startswith(("alpha", "beta"))}
         header = proc.stdout.splitlines()[0]

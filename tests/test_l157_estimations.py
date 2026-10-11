@@ -216,7 +216,7 @@ class EstimatesPgTest(PgTestCase):
         proc = self.mesh("work", "add", "--title", "estimé", "--actor", "orch",
                          "--estimate", "1h30", "--estimate-source", "conception")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("estimé 1 h 30", proc.stdout)
+        self.assertIn("estimated 1 h 30", proc.stdout)
         item = work.list_items(self.db)[0]
         self.assertEqual((item["estimate_minutes"], item["estimate_source"],
                           item["estimate_by"]), (90, "conception", "orch"))

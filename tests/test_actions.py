@@ -1500,7 +1500,7 @@ class ActionsCliTest(ActionsBase):
                          ["proposed", "approved", "launched", "confirmed"])
         self.assertEqual(shown["attempts_detail"][0]["approver"], ALICE)
         proc = self.run_cli("action", "show", action_id)
-        self.assertIn("empreinte : %s" % action["digest"], proc.stdout)
+        self.assertIn("digest    : %s" % action["digest"], proc.stdout)
         proc = self.run_cli("action", "list", "--state", "confirmed", "--json")
         self.assertEqual([r["action_id"] for r in json.loads(proc.stdout)], [action_id])
         other = json.loads(self.run_cli(
@@ -1529,16 +1529,16 @@ class ActionsCliTest(ActionsBase):
         # exécuter une action d'issue inconnue : refus d'état, code 1 (pas 4)
         proc = self.run_cli("action", "execute", action_id)
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("refus [state] : action %s : issue inconnue" % action_id, proc.stderr)
+        self.assertIn("refused [state]: action %s: unknown outcome" % action_id, proc.stderr)
         proc = self.run_cli("action", "reconcile", action_id,
                             env=self.cli_env(AMEESH_FAKE_GH_VIEW="absent"))
         self.assertEqual(proc.returncode, 4, proc.stderr)
-        self.assertIn("introuvable", proc.stdout)
+        self.assertIn("outcome not found", proc.stdout)
         proc = self.run_cli("action", "retry", action_id, "--receipt", self.signed(action_id))
         self.assertEqual(proc.returncode, 1)
         self.assertIn("[dedupe]", proc.stderr)
         proc = self.run_cli("decisions", "--for", ALICE)
-        self.assertIn("issues inconnues à trancher", proc.stdout)
+        self.assertIn("unknown outcomes to settle", proc.stdout)
         self.assertIn(action_id, proc.stdout)
         proc = self.run_cli("action", "replace", action_id, "--receipt", self.signed(action_id))
         self.assertEqual(proc.returncode, 1)
@@ -1582,8 +1582,8 @@ class ActionsCliTest(ActionsBase):
         self.assertEqual(queue["waiting_human"], [])
         proc = self.run_cli("decisions")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        for text in ("actions à approuver", "issues inconnues à trancher",
-                     "lots en attente d'un humain", "choisir le transporteur"):
+        for text in ("actions to approve", "unknown outcomes to settle",
+                     "work items waiting for a human", "choisir le transporteur"):
             self.assertIn(text, proc.stdout)
         proc = self.run_cli("decisions", "--for", "alice")
         self.assertEqual(proc.returncode, 1)

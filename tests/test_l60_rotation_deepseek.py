@@ -246,7 +246,7 @@ class PlafondDeContexteTest(_Base):
         # plafond abaissé pour cet agent : 2 M relus suffisent
         proc = self.mesh("set", "ds-reg", "context_max_tokens=1.5M")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("contexte=1500000", proc.stdout)
+        self.assertIn("context=1500000", proc.stdout)
         worker.agent = registry.get(self.db, "ds-reg")
         self.assertEqual(worker.context_max_tokens(), 1_500_000)
         self.assertTrue(worker.context_rotation_due())

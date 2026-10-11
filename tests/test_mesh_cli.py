@@ -38,16 +38,16 @@ class MeshCliTest(PgTestCase):
         mail.send(self.db, OWNER, AGENT, "un message")
         proc = self.mesh("list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("NOM", proc.stdout)
+        self.assertIn("NAME", proc.stdout)
         self.assertIn(OWNER, proc.stdout)
         self.assertIn(AGENT, proc.stdout)
-        self.assertIn("NON LUS", proc.stdout)
+        self.assertIn("UNREAD", proc.stdout)
         lignes = [l for l in proc.stdout.splitlines() if l.startswith(AGENT)]
         self.assertEqual(len(lignes), 1)
         # La fraîcheur est un âge, pas une valeur figée : sous charge, « 0s »
         # peut être « 2s » (suite complète, 279 s). On borne, on ne fige pas.
         # Le compte de non-lus est vérifié plus haut sur la sortie JSON.
-        age = re.search(r"il y a\s+(\d+)s", lignes[0])
+        age = re.search(r"(\d+)s ago", lignes[0])
         self.assertIsNotNone(age, lignes[0])
         self.assertLessEqual(int(age.group(1)), 60)
         ligne_owner = [l for l in proc.stdout.splitlines() if l.startswith(OWNER)][0]
@@ -63,8 +63,8 @@ class MeshCliTest(PgTestCase):
     def test_show(self):
         proc = self.mesh("show", AGENT)
         self.assertEqual(proc.returncode, 0)
-        self.assertIn("harnais  : deepseek", proc.stdout)
-        self.assertIn("aucune clé publique", proc.stdout)
+        self.assertIn("harness  : deepseek", proc.stdout)
+        self.assertIn("no public key", proc.stdout)
         proc = self.mesh("show", "inconnu")
         self.assertEqual(proc.returncode, 1)
 
@@ -87,7 +87,7 @@ class MeshCliTest(PgTestCase):
         proc = self.mesh("key", "register", OWNER, "--public-key", public_path)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(empreinte, proc.stdout)
-        self.assertIn("rôle agent", proc.stdout)  # moindre privilège par défaut
+        self.assertIn("role agent", proc.stdout)  # moindre privilège par défaut
 
         proc = self.mesh("key", "show", OWNER, "--json")
         self.assertEqual(json.loads(proc.stdout)["public_key_fingerprint"], empreinte)
@@ -101,7 +101,7 @@ class MeshCliTest(PgTestCase):
         proc = self.mesh("key", "register", OWNER, "--public-key", public_path,
                          "--role", "owner")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("autorité du propriétaire", proc.stdout)
+        self.assertIn("owner's authority", proc.stdout)
         self.assertEqual(
             json.loads(self.mesh("key", "show", OWNER, "--json").stdout)["key_role"], "owner")
 
@@ -115,7 +115,7 @@ class MeshCliTest(PgTestCase):
     def test_key_register_cle_privee_refusee(self):
         proc = self.mesh("key", "register", OWNER, "--public-key", self.key_path)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("erreur", proc.stderr)
+        self.assertIn("error", proc.stderr)
 
     # -- approbations ------------------------------------------------------
     def test_approve_verify_consume(self):
@@ -125,7 +125,7 @@ class MeshCliTest(PgTestCase):
                          "--hash", artifact, "--kind", "diff", "--as", OWNER,
                          "--expires", "48h")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("approbation #1", proc.stdout)
+        self.assertIn("approval #1", proc.stdout)
         self.assertIn(self.fingerprint[:16], proc.stdout)
 
         proc = self.mesh("verify", "--action", "merge", "--hash", artifact, "--json")
@@ -136,10 +136,10 @@ class MeshCliTest(PgTestCase):
         proc = self.mesh("verify", "--action", "merge", "--hash", artifact,
                          "--consume", "--by", AGENT)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("consommée", proc.stdout)
+        self.assertIn("consumed", proc.stdout)
         proc = self.mesh("verify", "--action", "merge", "--hash", artifact)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("consommée", proc.stderr)
+        self.assertIn("consumed", proc.stderr)
 
     def test_approve_sans_identite_refuse(self):
         """Signer une approbation ne se déduit pas du dossier (incident mesh-design)."""
@@ -150,7 +150,7 @@ class MeshCliTest(PgTestCase):
         proc = self.mesh("approve", "--key", self.key_path, "--action", "merge",
                          "--hash", artifact, env=env)
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("non lié", proc.stderr)
+        self.assertIn("not bound", proc.stderr)
         self.assertEqual(authority.list_approvals(self.db), [])
 
         # identité explicite : l'approbation passe, sans --as
@@ -168,7 +168,7 @@ class MeshCliTest(PgTestCase):
         proc = self.mesh("approve", "--key", self.key_path, "--action", "merge",
                          "--hash", artifact, "--as", OWNER)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("rôle", proc.stderr)
+        self.assertIn("role", proc.stderr)
         self.assertEqual(authority.list_approvals(self.db), [])
 
     def _public_path(self) -> str:
@@ -182,7 +182,7 @@ class MeshCliTest(PgTestCase):
         proc = self.mesh("approve", "--key", self.key_path, "--action", "merge",
                          "--hash", artifact, "--as", OWNER)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("clé publique", proc.stderr)
+        self.assertIn("public key", proc.stderr)
         self.assertEqual(authority.list_approvals(self.db), [])
 
     def test_approvals_liste(self):
@@ -196,7 +196,7 @@ class MeshCliTest(PgTestCase):
         self.assertEqual(len(rows), 1)
         self.assertTrue(rows[0]["verdict"])
         proc = self.mesh("approvals")
-        self.assertIn("VALIDE", proc.stdout)
+        self.assertIn("VALID", proc.stdout)
 
     # -- work_items --------------------------------------------------------
     def test_work_cycle_cli(self):
@@ -255,13 +255,13 @@ class MeshCliTest(PgTestCase):
 
         proc = self.mesh("import-v0", "--state", state, "--dry-run")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("2 message(s) à importer", proc.stdout)
+        self.assertIn("2 message(s) to import", proc.stdout)
         self.assertEqual(len(os.listdir(inbox)), 2)  # rien n'a bougé
         self.assertIsNone(registry.get(self.db, AGENT)["session_id"])  # registre compris
 
         proc = self.mesh("import-v0", "--state", state)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("2 message(s) importé(s)", proc.stdout)
+        self.assertIn("2 message(s) imported", proc.stdout)
         messages = mail.unread(self.db, AGENT)
         self.assertEqual([m["body"] for m in messages], ["premier", "deuxième"])
         self.assertEqual([m["sender"] for m in messages], ["orchestrateur", "codex3"])
@@ -275,7 +275,7 @@ class MeshCliTest(PgTestCase):
         cible = os.path.join(self.tmp, "v0back")
         proc = self.mesh("export-v0", "--state", cible, "--agents", AGENT)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("2 message(s) exporté(s)", proc.stdout)
+        self.assertIn("2 message(s) exported", proc.stdout)
         fichiers = sorted(os.listdir(os.path.join(cible, "inbox", AGENT)))
         self.assertEqual(len(fichiers), 2)
         with open(os.path.join(cible, "inbox", AGENT, fichiers[0]), encoding="utf-8") as fh:
@@ -287,12 +287,12 @@ class MeshCliTest(PgTestCase):
     def test_migrate_noop_et_doctor(self):
         proc = self.mesh("migrate")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("à jour", proc.stdout)
+        self.assertIn("up to date", proc.stdout)
         proc = self.mesh("doctor")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("verdict    : OK", proc.stdout)
         total = len(migrations.discover())
-        self.assertIn("%d/%d appliquées" % (total, total), proc.stdout)
+        self.assertIn("%d/%d applied" % (total, total), proc.stdout)
 
 
 if __name__ == "__main__":
@@ -310,20 +310,20 @@ class DelaysCliTest(MeshCliTest):
         proc = self.mesh("work", "milestone", "1", "frozen", "--sha", "a" * 40,
                          "--actor", AGENT)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("jalon frozen", proc.stdout)
+        self.assertIn("milestone frozen", proc.stdout)
 
         # un lot gelé : le pied de `list` dit ce qui attend une revue
         proc = self.mesh("list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(": 1 (freeze 1)", proc.stdout)
-        self.assertIn("plus ancien gel", proc.stdout)
+        self.assertIn("oldest freeze", proc.stdout)
 
         proc = self.mesh("work", "milestone", "1", "verdict", "ok", "--sha", "b" * 40)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
         proc = self.mesh("work", "list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("DÉLAI", proc.stdout)
+        self.assertIn("DELAY", proc.stdout)
         self.assertIn("review", proc.stdout)
 
         proc = self.mesh("work", "list", "--json")
@@ -336,8 +336,8 @@ class DelaysCliTest(MeshCliTest):
 
         proc = self.mesh("work", "show", "1")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("jalons", proc.stdout)
-        self.assertIn("délais", proc.stdout)
+        self.assertIn("milestones", proc.stdout)
+        self.assertIn("delays", proc.stdout)
         self.assertIn("request → freeze", proc.stdout)
 
         proc = self.mesh("work", "show", "1", "--json")
@@ -347,7 +347,7 @@ class DelaysCliTest(MeshCliTest):
 
         proc = self.mesh("list")
         self.assertIn(": 1 (review 1)", proc.stdout)
-        self.assertNotIn("plus ancien gel", proc.stdout)
+        self.assertNotIn("oldest freeze", proc.stdout)
 
         # un jalon automatique ne se déclare pas à la main (choix argparse)
         proc = self.mesh("work", "milestone", "1", "requested")

@@ -759,7 +759,7 @@ class SoldesEtCliTest(_Base):
                                    env=env).returncode, 1)
         proc = self.mesh("accounts", "auto", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("automatique", proc.stdout)
+        self.assertIn("automatic", proc.stdout)
         # `ameesh cost` : compte actif et jauges par compte
         os.makedirs(os.path.join(self.cfg.state_dir, "cxa"), exist_ok=True)
         with open(os.path.join(self.cfg.state_dir, "cxa", "tool"), "w",
@@ -768,7 +768,7 @@ class SoldesEtCliTest(_Base):
         proc = self.mesh("cost", "report", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("codex/secondaire", proc.stdout)
-        self.assertIn("comptes (hôte", proc.stdout)
+        self.assertIn("accounts (host", proc.stdout)
         proc = self.mesh("cost", "report", "--json", env=env)
         ligne = json.loads(proc.stdout)[0]
         self.assertEqual(ligne["account"], "secondaire")

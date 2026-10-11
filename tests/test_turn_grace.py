@@ -364,12 +364,12 @@ class ReglagesTest(_Base):
         self._worker("grace-set")
         proc = self.mesh("set", "grace-set", "turn_grace_seconds=45m")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("grace_fond_s=2700", proc.stdout)
+        self.assertIn("background_grace_s=2700", proc.stdout)
         self.assertEqual(registry.get(self.db, "grace-set")["turn_grace_seconds"], 2700)
         self.assertEqual(self.mesh("set", "grace-set", "turn_grace_seconds=bientot")
                          .returncode, 2)
         proc = self.mesh("set", "grace-set", "turn_grace_seconds=")
-        self.assertIn("grace_fond_s=1200 (défaut)", proc.stdout)
+        self.assertIn("background_grace_s=1200 (default)", proc.stdout)
 
 
 @unittest.skipUnless(platform.is_linux(), "sous-moissonneur : Linux")

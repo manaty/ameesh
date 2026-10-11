@@ -1,46 +1,46 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""ameesh action | decisions — actions sous porte (spec §7) et file des décisions (C10, L124).
+"""ameesh action | decisions — gated actions (spec §7) and the decision queue (C10, L124).
 
   ameesh action propose --connector C --operation O --project P --target T
                         [--args JSON | --args-file F] [--class C] [--amount N --currency EUR]
                         [--work-item ID] [--approver human:ID]… [--policy-version V]
                         [--receipt-class C]… [--by agent:ID] [--json]
-  ameesh action show <id> [--json]          action, tentatives, journal
+  ameesh action show <id> [--json]          action, attempts, log
   ameesh action list [--state S] [--project P] [--limit N] [--json]
   ameesh action request <id> --approver human:ID [--assume-duplicate] [--requested-by M]
                         [--json]
-        dépose la demande auprès d'ameesh-approve (POST /requests, jeton de service)
-        et affiche le lien à ouvrir sur le téléphone (écrit aussi dans le fil)
+        files the request with ameesh-approve (POST /requests, service token)
+        and prints the link to open on the phone (also written to the thread)
   ameesh action request <id> --approver human:ID --local [--assume-duplicate] [--ttl S]
-        la demande brute à signer par un authentificateur de test ou un outil
-  ameesh action fetch-receipt <id> [--request-id R] [--wait S] [--out F] [--by NOM]
-        récupère le reçu (GET /receipts/<id>), le VÉRIFIE, puis l'attache à l'action
-        (approve ; retry après failed ; replace pour un doublon assumé)
-  ameesh action approve <id> (--receipt F | --standing) [--by NOM]
-  ameesh action execute <id> [--by NOM] [--timeout S]
-  ameesh action reconcile <id> [--force] [--by NOM]
-  ameesh action retry <id> (--receipt F | --standing) [--by NOM]
-  ameesh action replace <id> --receipt F [--by NOM]   (décision qui assume le doublon)
-  ameesh action cancel <id> [--note TEXTE] [--by NOM]
-  ameesh action recover [--grace S]         lancements interrompus → issue inconnue
+        the raw request to be signed by a test authenticator or a tool
+  ameesh action fetch-receipt <id> [--request-id R] [--wait S] [--out F] [--by NAME]
+        fetches the receipt (GET /receipts/<id>), VERIFIES it, then attaches it to the action
+        (approve; retry after failed; replace for an assumed duplicate)
+  ameesh action approve <id> (--receipt F | --standing) [--by NAME]
+  ameesh action execute <id> [--by NAME] [--timeout S]
+  ameesh action reconcile <id> [--force] [--by NAME]
+  ameesh action retry <id> (--receipt F | --standing) [--by NAME]
+  ameesh action replace <id> --receipt F [--by NAME]   (decision that assumes the duplicate)
+  ameesh action cancel <id> [--note TEXT] [--by NAME]
+  ameesh action recover [--grace S]         interrupted launches → unknown outcome
   ameesh decisions [--for human:ID] [--all] [--json]
-        demandes de décision des agents (L124, `ameesh decide`), actions à
-        approuver, issues inconnues, lots en attente d'un humain
+        decision requests from agents (L124, `ameesh decide`), actions to
+        approve, unknown outcomes, work items waiting for a human
 
-Vérification des reçus : `--rp-id`, `--origin` (défauts AMEESH_APPROVE_RP_ID,
-AMEESH_APPROVE_ORIGINS), `--allow-facade`, `--level`. Connecteurs :
-`shell-noop` écrit sous `--noop-dir` (défaut AMEESH_NOOP_DIR, sinon
-<état>/noop) ; `git-merge` appelle `gh` (AMEESH_GH_BIN, AMEESH_BIN_DIR, PATH).
+Receipt verification: `--rp-id`, `--origin` (defaults AMEESH_APPROVE_RP_ID,
+AMEESH_APPROVE_ORIGINS), `--allow-facade`, `--level`. Connectors:
+`shell-noop` writes under `--noop-dir` (default AMEESH_NOOP_DIR, otherwise
+<state>/noop); `git-merge` calls `gh` (AMEESH_GH_BIN, AMEESH_BIN_DIR, PATH).
 
-ameesh-approve (client) : AMEESH_APPROVE_URL (https, ou http sur la boucle
-locale) et AMEESH_APPROVE_TOKEN_FILE (jeton de service, fichier 0600) ; le
-jeton n'est jamais affiché ni écrit dans le fil.
+ameesh-approve (client): AMEESH_APPROVE_URL (https, or http on the loopback)
+and AMEESH_APPROVE_TOKEN_FILE (service token, file mode 0600); the token is
+never printed nor written to the thread.
 
-Codes de sortie : 0 succès (exécution confirmée) ; 1 refus ou erreur ;
-2 usage ; 3 exécution en échec certain ; 4 issue inconnue (résultat d'une
-exécution ou d'une réconciliation) ; 5 reçu pas encore signé (fetch-receipt).
-Un refus s'écrit `refus [code] : raison` sur stderr ; `execute` sur une
-action dont l'issue est inconnue est un refus d'état : `[state]`.
+Exit codes: 0 success (execution confirmed); 1 refusal or error;
+2 usage; 3 execution definitely failed; 4 unknown outcome (result of an
+execution or a reconciliation); 5 receipt not signed yet (fetch-receipt).
+A refusal is written as `refused [code]: reason` on stderr; `execute` on an
+action whose outcome is unknown is a state refusal: `[state]`.
 """
 from __future__ import annotations
 
@@ -121,7 +121,7 @@ def _line(row: dict) -> str:
 
 def cmd_propose(cfg: Config, args: argparse.Namespace) -> int:
     if args.args and args.args_file:
-        print("erreur : --args ou --args-file, pas les deux", file=sys.stderr)
+        print("error: --args or --args-file, not both", file=sys.stderr)
         return 2
     raw = args.args
     if args.args_file:
@@ -130,13 +130,13 @@ def cmd_propose(cfg: Config, args: argparse.Namespace) -> int:
     try:
         values = jcs.loads(raw) if raw else {}
     except jcs.JcsError as exc:
-        print("erreur : --args illisible : %s" % exc, file=sys.stderr)
+        print("error: unreadable --args: %s" % exc, file=sys.stderr)
         return 2
     proposer = args.by
     if not proposer and os.environ.get("AGENT_MAIL_NAME"):
         proposer = "agent:%s" % os.environ["AGENT_MAIL_NAME"]
     if not proposer:
-        print("erreur : précisez --by agent:<id> (ou human:<id>)", file=sys.stderr)
+        print("error: specify --by agent:<id> (or human:<id>)", file=sys.stderr)
         return 2
     connector = _connector(cfg, args.connector, args)
     db = _open(cfg)
@@ -153,11 +153,11 @@ def cmd_propose(cfg: Config, args: argparse.Namespace) -> int:
     if args.json:
         _dump(action)
         return 0
-    print("action %s proposée : %s %s sur %s (classe %s, %s)" % (
+    print("action %s proposed: %s %s on %s (class %s, %s)" % (
         action["action_id"], action["connector"], action["operation"],
         action.get("target") or "—", action["class"],
-        "reçu requis" if action["requires_receipt"] else "sans reçu"))
-    print("empreinte : %s" % action["digest"])
+        "receipt required" if action["requires_receipt"] else "no receipt"))
+    print("digest: %s" % action["digest"])
     return 0
 
 
@@ -166,7 +166,7 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
     try:
         action = actions.get(db, args.id)
         if action is None:
-            print("erreur : action %s introuvable" % args.id, file=sys.stderr)
+            print("error: action %s not found" % args.id, file=sys.stderr)
             return 1
         action["attempts_detail"] = actions.attempts(db, args.id)
         action["events"] = actions.events(db, args.id)
@@ -176,32 +176,32 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
         _dump(action)
         return 0
     print("action    : %s (%s)" % (action["action_id"], action["state"]))
-    print("projet    : %-16s lot : %s   proposée par %s" % (
+    print("project   : %-16s work item: %s   proposed by %s" % (
         action["project"], action.get("work_item") or "—", action["proposed_by"]))
-    print("opération : %s %s sur %s" % (action["connector"], action["operation"],
+    print("operation : %s %s on %s" % (action["connector"], action["operation"],
                                         action.get("target") or "—"))
     print("args      : %s" % jcs.dumps(action["args"]))
-    print("classe    : %-12s reçu : %-8s déduplication : %s" % (
-        action["class"], "requis" if action["requires_receipt"] else "non", action["dedupe"]))
+    print("class     : %-12s receipt: %-8s deduplication: %s" % (
+        action["class"], "required" if action["requires_receipt"] else "no", action["dedupe"]))
     if action.get("amount") is not None:
-        print("montant   : %s %s" % (action["amount"], action.get("currency")))
-    print("empreinte : %s" % action["digest"])
+        print("amount    : %s %s" % (action["amount"], action.get("currency")))
+    print("digest    : %s" % action["digest"])
     if action.get("approvers"):
-        print("habilités : %s" % ", ".join(action["approvers"]))
+        print("approvers : %s" % ", ".join(action["approvers"]))
     if action.get("replaces"):
-        print("remplace  : %s (doublon assumé par %s)" % (action["replaces"],
+        print("replaces  : %s (duplicate assumed by %s)" % (action["replaces"],
                                                          action.get("replace_approver")))
     if action.get("replaced_by"):
-        print("remplacée : par %s" % action["replaced_by"])
+        print("replaced  : by %s" % action["replaced_by"])
     if action.get("auth_kind"):
-        print("autorisé  : %s %s" % (action["auth_kind"], action.get("auth_approver") or (
+        print("authorized: %s %s" % (action["auth_kind"], action.get("auth_approver") or (
             "grant #%s" % action["auth_grant_id"] if action.get("auth_grant_id") else "")))
     if action.get("last_error"):
-        print("erreur    : %s" % action["last_error"])
-    print("créée     : %s   maj : %s" % (_moment(action.get("created_ts")),
+        print("error     : %s" % action["last_error"])
+    print("created   : %s   updated: %s" % (_moment(action.get("created_ts")),
                                          _moment(action.get("updated_ts"))))
     for attempt in action["attempts_detail"]:
-        print("  tentative %d : %-10s %-9s %s %s" % (
+        print("  attempt %d: %-10s %-9s %s %s" % (
             attempt["attempt_no"], attempt["state"], attempt["auth_kind"],
             attempt.get("approver") or ("grant #%s" % attempt["grant_id"]
                                         if attempt.get("grant_id") else ""),
@@ -222,7 +222,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         _dump(rows)
         return 0
     if not rows:
-        print("aucune action")
+        print("no actions")
         return 0
     for row in rows:
         print(_line(row))
@@ -234,8 +234,8 @@ def _requester(args: argparse.Namespace, action: dict) -> str:
     Une session d'agent ne demande qu'en son propre nom."""
     session = os.environ.get("AGENT_MAIL_NAME")
     if session and args.requested_by and args.requested_by != "agent:%s" % session:
-        raise actions.ActionError(actions.INVALID, "cette session est agent:%s : --requested-by "
-                                  "%s n'est pas son identité" % (session, args.requested_by))
+        raise actions.ActionError(actions.INVALID, "this session is agent:%s: --requested-by "
+                                  "%s is not its identity" % (session, args.requested_by))
     return args.requested_by or ("agent:%s" % session if session else action["proposed_by"])
 
 
@@ -244,7 +244,7 @@ def cmd_request(cfg: Config, args: argparse.Namespace) -> int:
     try:
         action = actions.get(db, args.id)
         if action is None:
-            print("erreur : action %s introuvable" % args.id, file=sys.stderr)
+            print("error: action %s not found" % args.id, file=sys.stderr)
             return 1
         requested_by = _requester(args, action)
         if args.local:
@@ -256,8 +256,8 @@ def cmd_request(cfg: Config, args: argparse.Namespace) -> int:
         expected = (actions.assume_duplicate_digest(action) if args.assume_duplicate
                     else actions.digest(action))
         if actions.digest(action) != action["digest"]:
-            raise actions.ActionError(actions.INVALID, "empreinte stockée de %s incohérente : "
-                                      "aucune demande" % args.id)
+            raise actions.ActionError(actions.INVALID, "stored digest of %s is inconsistent: "
+                                      "no request filed" % args.id)
         reply = approve_client.create_request(
             cfg, action_id=action["action_id"], approver=args.approver,
             requested_by=requested_by, assume_duplicate=args.assume_duplicate)
@@ -267,7 +267,7 @@ def cmd_request(cfg: Config, args: argparse.Namespace) -> int:
             ("action_digest", action["digest"])) if reply.get(key) != value]
         if mismatch:
             raise approve_client.ApproveClientError(
-                "mismatch", "ameesh-approve a répondu pour une autre demande (%s) : ignorée"
+                "mismatch", "ameesh-approve answered for another request (%s): ignored"
                 % ", ".join(mismatch))
         actions.record_approval_request(db, action, reply, by=requested_by)
     finally:
@@ -275,14 +275,14 @@ def cmd_request(cfg: Config, args: argparse.Namespace) -> int:
     if args.json:
         _dump(reply)
         return 0
-    print("demande %s déposée auprès d'ameesh-approve pour %s%s" % (
+    print("request %s filed with ameesh-approve for %s%s" % (
         reply["request_id"], args.approver,
-        " (DÉCISION QUI ASSUME LE DOUBLON)" if args.assume_duplicate else ""))
-    print("lien à ouvrir sur son téléphone (usage unique, jusqu'à %s) :" % _moment(
+        " (DECISION THAT ASSUMES THE DUPLICATE)" if args.assume_duplicate else ""))
+    print("link to open on their phone (single use, until %s):" % _moment(
         reply.get("link_exp")))
     print("  %s" % reply["link"])
-    print("empreinte signée : %s" % reply["digest"])
-    print("ensuite : ameesh action fetch-receipt %s" % action["action_id"])
+    print("signed digest: %s" % reply["digest"])
+    print("next: ameesh action fetch-receipt %s" % action["action_id"])
     return 0
 
 
@@ -292,7 +292,7 @@ def _attach(db: Db, action: dict, raw: bytes, args: argparse.Namespace) -> dict:
     try:
         parsed = receipts.parse_receipt(raw)
     except receipts.ReceiptError as exc:
-        raise actions.ActionError(receipts.FORMAT, "reçu illisible : %s" % exc) from exc
+        raise actions.ActionError(receipts.FORMAT, "unreadable receipt: %s" % exc) from exc
     # l'empreinte attendue est RECALCULÉE depuis l'action : celle de l'action,
     # ou celle de la décision qui assume son doublon (domaine distinct)
     duplicate = parsed.request.get("digest") == actions.assume_duplicate_digest(action)
@@ -305,7 +305,7 @@ def _attach(db: Db, action: dict, raw: bytes, args: argparse.Namespace) -> dict:
         db, raw, actions.policy_for(action, policy), kind="action", expected_digest=expected,
         expected_action_id=action["action_id"], expect_decision=decision, consume_by=None)
     if not verdict.ok:
-        raise actions.ActionError(verdict.code, "reçu refusé : %s" % verdict.reason)
+        raise actions.ActionError(verdict.code, "receipt refused: %s" % verdict.reason)
     by = _actor(args)
     if duplicate:
         return actions.replace(db, action["action_id"], raw, policy=policy, by=by)
@@ -327,11 +327,11 @@ def cmd_fetch_receipt(cfg: Config, args: argparse.Namespace) -> int:
     try:
         action = actions.get(db, args.id)
         if action is None:
-            print("erreur : action %s introuvable" % args.id, file=sys.stderr)
+            print("error: action %s not found" % args.id, file=sys.stderr)
             return 1
         request_id = args.request_id or actions.last_approval_request(db, args.id)
         if not request_id:
-            print("erreur : aucune demande déposée pour %s (ameesh action request), ou "
+            print("error: no request filed for %s (ameesh action request), or "
                   "--request-id req_…" % args.id, file=sys.stderr)
             return 1
         deadline = time.monotonic() + max(0.0, float(args.wait or 0))
@@ -341,11 +341,11 @@ def cmd_fetch_receipt(cfg: Config, args: argparse.Namespace) -> int:
                 break
             time.sleep(min(2.0, max(0.1, deadline - time.monotonic())))
         if status == "pending":
-            print("demande %s : pas encore signée (lien valable jusqu'à %s)" % (
+            print("request %s: not signed yet (link valid until %s)" % (
                 request_id, _moment(payload.get("link_exp"))))
             return 5
         if status == "expired":
-            print("refus [expired] : demande %s échue sans reçu — nouvelle demande "
+            print("refused [expired]: request %s expired without a receipt — file a new request "
                   "(ameesh action request)" % request_id, file=sys.stderr)
             return 1
         result = _attach(db, action, payload, args)
@@ -356,16 +356,16 @@ def cmd_fetch_receipt(cfg: Config, args: argparse.Namespace) -> int:
     if args.json:
         _dump(result)
         return 0
-    print("reçu de la demande %s vérifié et attaché : action %s %s (%s)" % (
+    print("receipt of request %s verified and attached: action %s %s (%s)" % (
         request_id, result["action_id"], result["state"], result.get("last_note") or ""))
     if args.out:
-        print("reçu enregistré : %s" % args.out)
+        print("receipt saved: %s" % args.out)
     return 0
 
 
 def cmd_approve(cfg: Config, args: argparse.Namespace) -> int:
     if bool(args.receipt) == bool(args.standing):
-        print("erreur : --receipt FICHIER ou --standing (exactement un)", file=sys.stderr)
+        print("error: --receipt FILE or --standing (exactly one)", file=sys.stderr)
         return 2
     receipt = _read_receipt(args.receipt) if args.receipt else None
     db = _open(cfg)
@@ -381,7 +381,7 @@ def cmd_approve(cfg: Config, args: argparse.Namespace) -> int:
     if args.json:
         _dump(action)
         return 0
-    print("action %s : %s (%s)" % (action["action_id"], action["state"],
+    print("action %s: %s (%s)" % (action["action_id"], action["state"],
                                    action.get("last_note") or ""))
     return 0
 
@@ -391,7 +391,7 @@ def cmd_execute(cfg: Config, args: argparse.Namespace) -> int:
     try:
         action = actions.get(db, args.id)
         if action is None:
-            print("erreur : action %s introuvable" % args.id, file=sys.stderr)
+            print("error: action %s not found" % args.id, file=sys.stderr)
             return 1
         connector = _connector(cfg, action["connector"], args)
         result = actions.execute(db, args.id, connector, policy=_policy(args), by=_actor(args))
@@ -400,7 +400,7 @@ def cmd_execute(cfg: Config, args: argparse.Namespace) -> int:
     if args.json:
         _dump(result)
     else:
-        print("action %s, tentative %d : %s%s%s" % (
+        print("action %s, attempt %d: %s%s%s" % (
             result["action_id"], result["attempt"], result["state"],
             " (%s)" % result["external_ref"] if result.get("external_ref") else "",
             " — %s" % result["detail"] if result.get("detail") else ""))
@@ -412,7 +412,7 @@ def cmd_reconcile(cfg: Config, args: argparse.Namespace) -> int:
     try:
         action = actions.get(db, args.id)
         if action is None:
-            print("erreur : action %s introuvable" % args.id, file=sys.stderr)
+            print("error: action %s not found" % args.id, file=sys.stderr)
             return 1
         connector = _connector(cfg, action["connector"], args)
         result = actions.reconcile(db, args.id, connector, by=_actor(args), force=args.force)
@@ -421,11 +421,11 @@ def cmd_reconcile(cfg: Config, args: argparse.Namespace) -> int:
     if args.json:
         _dump(result)
     elif result["found"]:
-        print("action %s réconciliée : %s%s" % (
+        print("action %s reconciled: %s%s" % (
             result["action_id"], result["state"],
             " (%s)" % result["external_ref"] if result.get("external_ref") else ""))
     else:
-        print("action %s : issue introuvable (%s) — décision humaine requise "
+        print("action %s: outcome not found (%s) — human decision required "
               "(ameesh decisions)" % (result["action_id"], result["detail"]))
     return {"confirmed": 0, "failed": 3}.get(result["state"], 4)
 
@@ -440,7 +440,7 @@ def cmd_replace(cfg: Config, args: argparse.Namespace) -> int:
     if args.json:
         _dump(action)
         return 0
-    print("action %s créée en remplacement de %s (doublon assumé par %s) : à approuver" % (
+    print("action %s created to replace %s (duplicate assumed by %s): to approve" % (
         action["action_id"], action["replaces"], action.get("replace_approver")))
     return 0
 
@@ -451,7 +451,7 @@ def cmd_cancel(cfg: Config, args: argparse.Namespace) -> int:
         action = actions.cancel(db, args.id, by=_actor(args), note=args.note or "")
     finally:
         db.close()
-    print("action %s annulée" % action["action_id"])
+    print("action %s cancelled" % action["action_id"])
     return 0
 
 
@@ -462,9 +462,9 @@ def cmd_recover(cfg: Config, args: argparse.Namespace) -> int:
     finally:
         db.close()
     for action_id in moved:
-        print("action %s : lancement interrompu → issue inconnue" % action_id)
+        print("action %s: interrupted launch → unknown outcome" % action_id)
     if not moved:
-        print("aucun lancement interrompu")
+        print("no interrupted launch")
     return 0
 
 
@@ -494,13 +494,13 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
     waiting = [item for item in queue["waiting_human"] if item["id"] not in held]
     total = len(queue["requests"]) + len(waiting) + sum(
         len(queue[key]) for key in ("approvals", "unknown", "interrupted"))
-    who = " pour %s" % args.for_human if args.for_human else ""
+    who = " for %s" % args.for_human if args.for_human else ""
     if not total:
-        print("aucune décision en attente%s" % who)
+        print("no pending decision%s" % who)
     else:
-        print("%d décision(s) en attente%s" % (total, who))
+        print("%d pending decision(s)%s" % (total, who))
     if queue["requests"]:
-        print("\ndemandes des agents (la plus ancienne d'abord) :")
+        print("\nrequests from agents (oldest first):")
         for view in queue["requests"]:
             for line in decisions_mod.format_view(view, now):
                 print("  " + line)
@@ -508,17 +508,17 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
         _closed_requests(queue.get("requests_closed") or [], now)
         return 0
     if queue["approvals"]:
-        print("\nactions à approuver :")
+        print("\nactions to approve:")
         for row in queue["approvals"]:
             print("  " + _line(row))
-            print("      empreinte %s — proposée par %s" % (row["digest"], row["proposed_by"]))
+            print("      digest %s — proposed by %s" % (row["digest"], row["proposed_by"]))
     if queue["unknown"] or queue["interrupted"]:
-        print("\nissues inconnues à trancher :")
+        print("\nunknown outcomes to settle:")
         for row in queue["unknown"] + queue["interrupted"]:
             print("  " + _line(row))
             print("      %s" % row["hint"])
     if waiting:
-        print("\nlots en attente d'un humain :")
+        print("\nwork items waiting for a human:")
         for item in waiting:
             print("  #%-5d %-12s %s" % (item["id"], (item.get("assignee") or "—")[:12],
                                         item["title"][:70]))
@@ -531,7 +531,7 @@ def _closed_requests(rows: list[dict], now: float) -> None:
     if not rows:
         return
     from . import decisions as decisions_mod
-    print("\ndemandes répondues ou retirées (les plus récentes d'abord) :")
+    print("\nanswered or withdrawn requests (most recent first):")
     for view in rows:
         for line in decisions_mod.format_view(view, now):
             print("  " + line)
@@ -544,15 +544,15 @@ def _closed_requests(rows: list[dict], now: float) -> None:
 def _verify_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rp-id", default=None)
     parser.add_argument("--origin", action="append", default=[],
-                        help="origine WebAuthn autorisée (répétable)")
+                        help="allowed WebAuthn origin (repeatable)")
     parser.add_argument("--allow-facade", action="append", default=[],
                         choices=list(receipts.FACADES))
     parser.add_argument("--level", choices=list(receipts.LEVELS), default="standard")
 
 
 def _connector_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--noop-dir", default=None, help="dossier du connecteur shell-noop")
-    parser.add_argument("--timeout", type=float, default=None, help="délai de l'appel (s)")
+    parser.add_argument("--noop-dir", default=None, help="directory of the shell-noop connector")
+    parser.add_argument("--timeout", type=float, default=None, help="call timeout (s)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -561,26 +561,26 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command")
 
-    p_action = sub.add_parser("action", help="actions sous porte")
+    p_action = sub.add_parser("action", help="gated actions")
     act = p_action.add_subparsers(dest="action_command")
 
     p = act.add_parser("propose")
     p.add_argument("--connector", required=True, choices=list(connectors.NAMES))
     p.add_argument("--operation", required=True)
     p.add_argument("--project", required=True)
-    p.add_argument("--target", required=True, help="compte ou objet visé")
-    p.add_argument("--args", default=None, help="objet JSON")
+    p.add_argument("--target", required=True, help="targeted account or object")
+    p.add_argument("--args", default=None, help="JSON object")
     p.add_argument("--args-file", default=None)
     p.add_argument("--class", dest="action_class", choices=list(actions.ACTION_CLASSES),
-                   default=None, help="peut relever la classe du connecteur, jamais l'abaisser")
-    p.add_argument("--amount", type=int, default=None, help="unités mineures")
+                   default=None, help="may raise the connector's class, never lower it")
+    p.add_argument("--amount", type=int, default=None, help="minor units")
     p.add_argument("--currency", default=None)
     p.add_argument("--work-item", type=int, default=None)
     p.add_argument("--approver", action="append", default=[])
     p.add_argument("--policy-version", default="1")
     p.add_argument("--receipt-class", action="append", default=[],
                    choices=list(actions.ACTION_CLASSES),
-                   help="classes qui exigent un reçu (défaut irreversible, costly)")
+                   help="classes that require a receipt (default irreversible, costly)")
     p.add_argument("--by", default=None)
     p.add_argument("--json", action="store_true")
     _connector_options(p)
@@ -598,27 +598,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_list)
 
-    p = act.add_parser("request", help="demande d'approbation (ameesh-approve)")
+    p = act.add_parser("request", help="approval request (ameesh-approve)")
     p.add_argument("id")
     p.add_argument("--approver", required=True)
     p.add_argument("--assume-duplicate", action="store_true",
-                   help="décision qui assume le doublon d'une action d'issue inconnue")
+                   help="decision that assumes the duplicate of an action with an unknown outcome")
     p.add_argument("--requested-by", default=None,
-                   help="agent:<id> ou human:<id> (défaut : la session, sinon le proposant)")
+                   help="agent:<id> or human:<id> (default: the session, otherwise the proposer)")
     p.add_argument("--local", action="store_true",
-                   help="sans ameesh-approve : la demande brute à signer (tests, outils)")
+                   help="without ameesh-approve: the raw request to sign (tests, tools)")
     p.add_argument("--ttl", type=int, default=actions.DEFAULT_REQUEST_TTL,
-                   help="durée de la demande brute (--local)")
+                   help="lifetime of the raw request (--local)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_request)
 
-    p = act.add_parser("fetch-receipt", help="récupérer, vérifier et attacher le reçu")
+    p = act.add_parser("fetch-receipt", help="fetch, verify and attach the receipt")
     p.add_argument("id")
     p.add_argument("--request-id", default=None,
-                   help="req_… (défaut : la dernière demande déposée pour l'action)")
+                   help="req_… (default: the last request filed for the action)")
     p.add_argument("--wait", type=float, default=0.0,
-                   help="attendre la signature jusqu'à S secondes")
-    p.add_argument("--out", default=None, help="enregistrer aussi le reçu (0600)")
+                   help="wait up to S seconds for the signature")
+    p.add_argument("--out", default=None, help="also save the receipt (0600)")
     p.add_argument("--by", default=None)
     p.add_argument("--json", action="store_true")
     _verify_options(p)
@@ -629,7 +629,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("id")
         p.add_argument("--receipt", default=None)
         p.add_argument("--standing", action="store_true",
-                       help="couverture par une approbation permanente bornée")
+                       help="coverage by a bounded standing approval")
         p.add_argument("--by", default=None)
         p.add_argument("--json", action="store_true")
         _verify_options(p)
@@ -646,7 +646,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = act.add_parser("reconcile")
     p.add_argument("id")
     p.add_argument("--force", action="store_true",
-                   help="lancement interrompu : ne pas attendre l'échéance")
+                   help="interrupted launch: do not wait for the deadline")
     p.add_argument("--by", default=None)
     p.add_argument("--json", action="store_true")
     _connector_options(p)
@@ -655,7 +655,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = act.add_parser("replace")
     p.add_argument("id")
     p.add_argument("--receipt", required=True,
-                   help="reçu qui assume le doublon (ameesh action request --assume-duplicate)")
+                   help="receipt that assumes the duplicate (ameesh action request --assume-duplicate)")
     p.add_argument("--by", default=None)
     p.add_argument("--json", action="store_true")
     _verify_options(p)
@@ -672,10 +672,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--by", default=None)
     p.set_defaults(func=cmd_recover)
 
-    p_dec = sub.add_parser("decisions", help="file des décisions humaines")
+    p_dec = sub.add_parser("decisions", help="human decision queue")
     p_dec.add_argument("--for", dest="for_human", default=None, metavar="human:ID")
     p_dec.add_argument("--all", action="store_true",
-                       help="aussi les demandes répondues ou retirées (les plus récentes)")
+                       help="also answered or withdrawn requests (most recent)")
     p_dec.add_argument("--json", action="store_true")
     p_dec.set_defaults(func=cmd_decisions)
     return parser
@@ -695,20 +695,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(cfg, args)
     except actions.ActionError as exc:
-        print("refus [%s] : %s" % (exc.code, exc.reason), file=sys.stderr)
+        print("refused [%s]: %s" % (exc.code, exc.reason), file=sys.stderr)
         return 1
     except approve_client.ApproveClientError as exc:
-        print("refus [%s] : ameesh-approve : %s" % (exc.code, exc.message), file=sys.stderr)
+        print("refused [%s]: ameesh-approve: %s" % (exc.code, exc.message), file=sys.stderr)
         return 1
     except db_mod.SchemaMissing as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.Unavailable as exc:
-        print("erreur : base injoignable : %s" % exc, file=sys.stderr)
+        print("error: database unreachable: %s" % exc, file=sys.stderr)
         return 1
     except (db_mod.DbError, receipts.ReceiptError, connectors.ConnectorError, ValueError,
             OSError) as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
 
 

@@ -383,7 +383,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
                                  ["/tmp/preuve-images", "/tmp/jest_rs"])
         proc = self.mesh("hosts")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("/tmp gros  /tmp/preuve-images 4.0 GiB", proc.stdout)
+        self.assertIn("/tmp large /tmp/preuve-images 4.0 GiB", proc.stdout)
 
     def test_le_bilan_releve_les_plus_gros_quand_le_tmpfs_se_remplit(self):
         _write(os.path.join(self.sys, "gros", "f"), 90000)

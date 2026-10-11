@@ -1362,7 +1362,7 @@ class ApproveClientTest(ApproveBase):
         self.assertNotIn(link.rsplit("/", 1)[1], notes[0])      # le lien, pas au journal
 
         proc = self.cli("fetch-receipt", self.action_id, rc=5)
-        self.assertIn("pas encore signée", proc.stdout)
+        self.assertIn("not signed yet", proc.stdout)
         self.assertEqual(actions.get(self.db, self.action_id)["state"], "proposed")
 
         path = urlsplit(link).path
@@ -1371,7 +1371,7 @@ class ApproveClientTest(ApproveBase):
         self.assertEqual(status, 200, result)
         out = os.path.join(self.tmp, "recu.json")
         proc = self.cli("fetch-receipt", self.action_id, "--out", out, "--by", ALICE)
-        self.assertIn("vérifié et attaché", proc.stdout)
+        self.assertIn("verified and attached", proc.stdout)
         self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o600)
         row = actions.get(self.db, self.action_id)
         self.assertEqual((row["state"], row["auth_approver"]), ("approved", ALICE))
@@ -1385,7 +1385,7 @@ class ApproveClientTest(ApproveBase):
     def test_session_d_agent_et_refus_du_service(self):
         proc = self.cli("request", self.action_id, "--approver", ALICE, "--requested-by",
                         "human:alice", rc=1)
-        self.assertIn("n'est pas son identité", proc.stderr)
+        self.assertIn("is not its identity", proc.stderr)
         proc = self.cli("request", self.action_id, "--approver", DAVE, rc=1)
         self.assertIn("[no_authenticator]", proc.stderr)
         other, _token = write_token_file(tempfile.mkdtemp(dir=self.workdir))
@@ -1441,7 +1441,7 @@ class ApproveClientTest(ApproveBase):
                     200, (("Content-Type", "application/json"),), json.dumps(r).encode()))
                 proc = self.cli("fetch-receipt", self.action_id, "--request-id", request_id,
                                 rc=1, AMEESH_APPROVE_URL=fake.url)
-                self.assertIn("reçu refusé", proc.stderr)
+                self.assertIn("receipt refused", proc.stderr)
                 self.assertEqual(fake.seen[0][1], "/receipts/" + request_id)
                 self.assertEqual(actions.get(self.db, self.action_id)["state"], "proposed")
 

@@ -318,7 +318,7 @@ class BoutEnBoutTest(PgTestCase):
         self.assertEqual(self.gh_calls("merge"), 0)              # le monde n'a pas été touché
         self.assertEqual(self.pr()["state"], "OPEN")
         proc = self.run_mesh("decisions", "--for", ALICE)
-        self.assertIn("actions à approuver", proc.stdout)
+        self.assertIn("actions to approve", proc.stdout)
         self.assertIn(action_id, proc.stdout)
         return action_id
 
@@ -369,7 +369,7 @@ class BoutEnBoutTest(PgTestCase):
         self.assertEqual((data["digest"], data["action_digest"], data["approver"]),
                          (self.action["digest"], self.action["digest"], ALICE))
         proc = self.run_mesh("action", "fetch-receipt", action_id, rc=5)
-        self.assertIn("pas encore signée", proc.stdout)           # en attente du téléphone
+        self.assertIn("not signed yet", proc.stdout)           # en attente du téléphone
 
         done = banc_v1.approve(port, data["link"], soft)
         self.assertEqual(done["result"], {"request_id": data["request_id"],
@@ -378,7 +378,7 @@ class BoutEnBoutTest(PgTestCase):
         receipt_path = os.path.join(self.ws, "recu.json")
         proc = self.run_mesh("action", "fetch-receipt", action_id, "--out", receipt_path,
                              "--by", ALICE)
-        self.assertIn("reçu de la demande %s vérifié et attaché : action %s approved"
+        self.assertIn("receipt of request %s verified and attached: action %s approved"
                       % (data["request_id"], action_id), proc.stdout)
         with open(receipt_path, encoding="utf-8") as fh:
             receipt = json.load(fh)
@@ -404,10 +404,10 @@ class BoutEnBoutTest(PgTestCase):
         self.assertEqual(self.pr()["state"], "MERGED")           # l'effet a eu lieu
         self.assertEqual(self.gh_calls("merge"), 1)
         proc = self.run_mesh("decisions", "--for", ALICE)
-        self.assertIn("issues inconnues à trancher", proc.stdout)
+        self.assertIn("unknown outcomes to settle", proc.stdout)
         self.assertIn(action_id, proc.stdout)
         # aucune nouvelle tentative : ni exécution, ni nouvelle liaison du reçu
-        self.assertIn("refus [state] : action %s : issue inconnue" % action_id,
+        self.assertIn("refused [state]: action %s: unknown outcome" % action_id,
                       self.run_mesh("action", "execute", action_id, rc=1).stderr)
         self.run_mesh("action", "approve", action_id, "--receipt", receipt_path, rc=1)
         self.assertEqual(self.gh_calls("merge"), 1)
@@ -416,7 +416,7 @@ class BoutEnBoutTest(PgTestCase):
     def etape_9_reconciliation(self, action_id: str, receipt_path: str) -> None:
         proc = self.run_mesh("action", "reconcile", action_id)
         merged = self.pr()["mergeCommit"]["oid"]
-        self.assertIn("réconciliée : confirmed (%s)" % merged, proc.stdout)
+        self.assertIn("reconciled: confirmed (%s)" % merged, proc.stdout)
         shown = json.loads(self.run_mesh("action", "show", action_id, "--json").stdout)
         self.assertEqual((shown["state"], shown["attempts"]), ("confirmed", 1))
         events = [event["event"] for event in shown["events"]]
@@ -433,7 +433,7 @@ class BoutEnBoutTest(PgTestCase):
         proc = self.run_mesh("receipt", "verify", receipt_path, "--digest",
                              self.action["digest"], "--action-id", action_id, rc=1)
         self.assertIn("[replay]", proc.stderr)
-        self.assertIn("aucune décision en attente",
+        self.assertIn("no pending decision",
                       self.run_mesh("decisions", "--for", ALICE).stdout)
         # chaque transition est lisible dans le fil du projet (§7.1)
         thread = self.run_mesh("fil", "show", PROJECT).stdout

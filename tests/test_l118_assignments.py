@@ -230,7 +230,7 @@ class BranchMergeTest(_Base):
         lot = work.list_items(self.db)[0]
         self.assertEqual((lot["branch"], lot["branch_target"]), ("agent/dev1-cli", "develop"))
         proc = self.mesh("work", "show", str(lot["id"]))
-        self.assertIn("branche  : agent/dev1-cli → develop", proc.stdout)
+        self.assertIn("branch   : agent/dev1-cli → develop", proc.stdout)
         other = work.add(self.db, title="autre", assignee="dev1")
         proc = self.mesh("work", "assign", str(other["id"]), "dev1", "--branch", "agent/y")
         self.assertEqual(proc.returncode, 0, proc.stderr)

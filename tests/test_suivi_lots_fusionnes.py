@@ -110,13 +110,13 @@ class MergedCommandTest(_Base):
         proc = self.mesh("work", "merged", str(lot["id"]), "--sha", SHA, "--note", "à la main",
                          env=self.env(AGENT_MAIL_NAME="claude1"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("lot #%d → merged (commit %s, déclaré par claude1)"
+        self.assertIn("lot #%d → merged (commit %s, declared by claude1)"
                       % (lot["id"], SHA[:12]), proc.stdout)
         self.assertEqual(self.merged_milestone(lot["id"])["actor"], "claude1")
         proc = self.mesh("work", "merged", str(lot["id"]), "--sha", SHA,
                          env=self.env(AGENT_MAIL_NAME="claude1"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("déjà merged", proc.stdout)
+        self.assertIn("already merged", proc.stdout)
         proc = self.mesh("work", "merged", str(lot["id"]))          # --sha obligatoire
         self.assertEqual(proc.returncode, 2)
 
@@ -143,7 +143,7 @@ class CorrectionTest(_Base):
     def test_orchestrateur(self):
         proc = self.correct(AGENT_MAIL_NAME="orch", AMEESH_ALERT_ORCHESTRATORS="orch")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("correction tracée au journal, par orch", proc.stdout)
+        self.assertIn("correction recorded in the log, by orch", proc.stdout)
         item = work.get(self.db, self.lot["id"])
         self.assertEqual(item["state"], "merged")
         self.assertIsNone(item["closed_ts"])
@@ -235,7 +235,7 @@ class ActorTest(_Base):
         proc = self.mesh("work", "close", str(lot["id"]), "--abandoned",
                          env=self.env(AGENT_MAIL_NAME="orch"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertNotIn("avertissement", proc.stderr)
+        self.assertNotIn("warning", proc.stderr)
         self.assertEqual(work.events(self.db, lot["id"])[0]["actor"], "orch")
         self.assertFalse([e for e in work.events(self.db, lot["id"]) if not e["actor"]])
 

@@ -238,8 +238,8 @@ class ProjectsPgTest(PgTestCase):
         out = self.mesh("list")
         self.assertEqual(out.returncode, 0, out.stderr)
         lines = out.stdout.splitlines()
-        self.assertTrue(lines[0].startswith("NOM"))
-        self.assertIn("PROJET", lines[0])
+        self.assertTrue(lines[0].startswith("NAME"))
+        self.assertIn("PROJECT", lines[0])
         names = [l.split()[0] for l in lines[1:4]]
         projs = [l.split()[1] for l in lines[1:4]]
         self.assertEqual(projs, ["alpha", "alpha", "beta"])

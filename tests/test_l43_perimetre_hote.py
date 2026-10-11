@@ -560,7 +560,7 @@ class AffichageParCanonTest(_AvecBase):
         texte = self.mesh("hosts", HOST, env=self.cli_env()).stdout
         self.assertIn("max_agents 3 [%s]" % ID_T, texte)
         self.assertIn("3 admission(s)", texte)
-        self.assertIn("fiches     %s" % ID_A, texte)
+        self.assertIn("cards      %s" % ID_A, texte)
 
 
 if __name__ == "__main__":

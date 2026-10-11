@@ -229,7 +229,7 @@ class AdoptTest(_Base):
         self.assertEqual((out["agent"], out["account"]), ("coord", "secondaire"))
         proc = self.mesh("show", "coord")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("session  : %s (compte secondaire)" % SID, proc.stdout)
+        self.assertIn("session  : %s (account secondaire)" % SID, proc.stdout)
         proc = self.mesh("adopt", "coord", "--session", "absente", "--harness", "codex",
                          env=self.env(AMEESH_CONFIG=config))
         self.assertEqual(proc.returncode, 1)

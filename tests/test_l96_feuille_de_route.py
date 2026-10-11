@@ -282,7 +282,7 @@ class RoadmapPgTest(PgTestCase):
         self.assertIsNone(storage.of(self.db).roadmap.item_plans([lot["id"]])[0]["planned_end"])
         self.assertEqual(work.get(self.db, lot["id"])["updated_ts"], before)
         out = self.mesh("work", "show", str(lot["id"]))
-        self.assertIn("prévu    : début 2026-10-10 · fin — · livraison 2026-10-12", out.stdout)
+        self.assertIn("planned  : start 2026-10-10 · end — · delivery 2026-10-12", out.stdout)
         # ordre : début après fin refusé ; date illisible refusée
         with self.assertRaises(roadmap.RoadmapError):
             roadmap.plan(self.db, lot["id"], start="2026-10-20", end="2026-10-11")

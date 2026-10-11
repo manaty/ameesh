@@ -635,7 +635,7 @@ class MenageDbTest(PgTestCase):
         self.assertEqual(sorted(r["path"] for r in journal if r["kind"] == "container"),
                          ["c-1", "c-3"])
         proc = self.mesh("hosts")
-        self.assertIn("conteneurs 4 lancé(s) par un tour d'ameesh", proc.stdout)
+        self.assertIn("containers 4 started by an ameesh turn", proc.stdout)
         self.assertIn("docker rm -f c-7", proc.stdout)
         # au tour suivant, seul le conteneur de CE tour est regardé
         seul = menage.reap_containers(moteur, self.db, "pc", only_turn="encours")
@@ -657,7 +657,7 @@ class MenageDbTest(PgTestCase):
         proc = self.mesh("hosts")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("/tmp       tmpfs", proc.stdout)
-        self.assertIn("ALERTE", proc.stdout)
+        self.assertIn("ALERT", proc.stdout)
         self._lecture(10.0)
         alertes = {a["type"]: a for a in exploitation.alerts(self.cfg, self.db)}
         self.assertIn("max_tmpfs_used", alertes["host_pressure"]["breaches"])
@@ -700,7 +700,7 @@ class MenageDbTest(PgTestCase):
         journal = storage.of(self.db).housekeeping.recent(None, 3600)
         self.assertEqual({r["actor"] for r in journal}, {"human:test"})
         proc = self.mesh("hosts")
-        self.assertIn("ménage     dossiers temporaires", proc.stdout)
+        self.assertIn("cleanup    temporary directories", proc.stdout)
         self.assertIn("tmp deleted", proc.stdout)
 
     def test_l_executeur_redirige_le_tmpdir_du_tour(self):

@@ -261,7 +261,7 @@ class BudgetBaseTest(PgTestCase):
         proc = self.mesh("cost", "report", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("mesh caps", proc.stdout)
-        self.assertIn("plafond de a1", proc.stdout)
+        self.assertIn("cap of a1", proc.stdout)
         proc = self.mesh("progress", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("caps: 5.00/h (base) · 40.00/day (base)", proc.stdout)

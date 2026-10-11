@@ -207,13 +207,13 @@ class DemandeTest(_Base):
         self.assertEqual(queue["requests"][0]["options"],
                          [{"key": "a", "label": "oui"}, {"key": "b", "label": "non"}])
         texte = self.mesh("decisions", env=self.mesh_env()).stdout
-        for attendu in ("demandes des agents (la plus ancienne d'abord)",
+        for attendu in ("requests from agents (oldest first)",
                         "Fusionner la branche avant la démo ?", "a) oui   ← recommandé",
                         "recommandation : a — la démo en dépend", "[URGENT]",
                         "répondre : ameesh decide 1"):
             self.assertIn(attendu, texte)
         # le lot tenu par la demande n'est pas répété parmi les lots en attente
-        self.assertNotIn("lots en attente d'un humain", texte)
+        self.assertNotIn("work items waiting for a human", texte)
         # sans identité d'agent : refus, rien n'est déposé
         proc = self.mesh("decide", "ask", "--lot", "RT-9", "--question", "x ?",
                          env=self.mesh_env())
@@ -492,7 +492,7 @@ class IdentiteTest(_Base):
         proc = self.mesh("decide", "show", "1", env=self.mesh_env())
         self.assertIn("répondue par human:alice (cli)", proc.stdout)
         proc = self.mesh("decisions", "--all", env=self.mesh_env())
-        self.assertIn("demandes répondues ou retirées", proc.stdout)
+        self.assertIn("answered or withdrawn requests", proc.stdout)
 
 
 # ==========================================================================
