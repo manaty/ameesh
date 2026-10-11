@@ -28,6 +28,18 @@ the [decisions](decisions/)). Open as of 2026-10-05:
   the sleep delay (30 min) and the `attach` maximum duration (2 h); Codex
   `app-server` (experimental) now or later; `!stop`.
 
+- Embeddable interface ([study](etudes/ui-integrable.md), 2026-10-10):
+  licence of the component package (AGPL or more permissive); Lit or zero
+  dependency; a single Nexlink desktop application with Compute and the
+  interface; API host name distinct from ameesh-approve; actions that require
+  a passkey beyond gated actions; gathered view across organisations; first
+  deployment (Manaty's mesh or local mode); conversation thread and harness
+  permission requests; approval in the desktop application or the system
+  browser; priority against L63–L69 and L75–L79. The owner accepted on
+  2026-10-10 the AGPL licence with an exception, a single Nexlink desktop
+  application, the standalone page kept, and Nexlink never imposed, so the
+  licence and single-application questions are closed; the others stay open.
+
 # Awaiting a study or a prototype
 
 - Licenses: drafting the CLA and ownership of contributions produced by
