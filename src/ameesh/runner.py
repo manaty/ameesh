@@ -4620,18 +4620,18 @@ def stop_group_now(proc: subprocess.Popen, reason: str, *, name: str = "",
 
 
 def _attach_permission_mode(cfg: Config, name: str) -> str:
-    """L223 : le mode de permission réglé pour l'agent (`ameesh set <agent>
-    permission_mode=…`, état local de son hôte), '' sans réglage ; un réglage
-    illisible (droits, octets invalides) est ignoré avec un avertissement."""
-    chemin = os.path.join(cfg.agent_dir(name), "permission_mode")
+    """L223: the permission mode set for the agent (`ameesh set <agent>
+    permission_mode=…`, local state of its host), '' when unset; an unreadable
+    setting (permissions, invalid bytes) is ignored with a warning."""
+    path = os.path.join(cfg.agent_dir(name), "permission_mode")
     try:
-        with open(chemin, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             return fh.read().strip()
     except FileNotFoundError:
         return ""
-    except (OSError, ValueError) as exc:  # ValueError : UnicodeDecodeError
-        print("ameesh attach : réglage permission_mode illisible (%s : %s), ignoré"
-              % (chemin, exc), file=sys.stderr)
+    except (OSError, ValueError) as exc:  # ValueError: UnicodeDecodeError
+        print("ameesh attach: unreadable permission_mode setting (%s: %s), ignored"
+              % (path, exc), file=sys.stderr)
         return ""
 
 
@@ -4733,9 +4733,9 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     code = 0
     holds: list = []
     try:
-        # verdict codex #182 (P2) : tout ce qui suit la prise du bail est sous le
-        # `finally` — une erreur ou un Ctrl-C pendant la préparation (réglage
-        # illisible, `claude --help` lent) rend quand même le bail
+        # codex verdict #182 (P2): everything after taking the lease is under the
+        # `finally` — an error or a Ctrl-C while preparing (unreadable setting,
+        # slow `claude --help`) still releases the lease
         thread.start()
         veille.start()
         argv = adapter.interactive_command(agent.get("session_id"),
@@ -4765,14 +4765,14 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
             stop_group_now(proc, "interruption (attach)", name=name)
             code = proc.wait()
         else:
-            code = 130  # interrompu avant le lancement du harnais
+            code = 130  # interrupted before the harness was launched
     finally:
         stop.set()
         for hold in holds:          # L219: the session is over
             hold.release()
-        for fil in (thread, veille):
-            if fil.ident is not None:
-                fil.join(timeout=5)
+        for worker in (thread, veille):
+            if worker.ident is not None:    # started (L223)
+                worker.join(timeout=5)
         try:
             registry.release(db, name, owner, epoch)
         except db_mod.DbError:

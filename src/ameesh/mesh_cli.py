@@ -1281,8 +1281,8 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 #: L37 : mode, `execute` | `externe`, décision 0030 ; L60 : context_max_tokens ;
 #: L105 : turn_max_seconds, turn_mail_max ; travail de fond : turn_grace_seconds ;
 #: L125 : mail_batch, réglage LOCAL de l'hôte de l'agent, sans migration — comme
-#: `effort` et `tier` avant L26) ; L223 : permission_mode, mode de permission des
-#: sessions interactives (`ameesh attach`), local aussi
+#: `effort` et `tier` avant L26) ; L223: permission_mode, permission mode of
+#: interactive sessions (`ameesh attach`), also local
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
             "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch",
             "permission_mode")
@@ -1426,7 +1426,7 @@ def cmd_set(cfg: Config, args) -> int:
                     return 2
             if cle == "permission_mode" and valeur \
                     and not harnesses.PERMISSION_MODE_RE.match(valeur):
-                print("permission_mode invalide : %r (ex. auto, acceptEdits)" % valeur,
+                print("invalid permission_mode: %r (e.g. auto, acceptEdits)" % valeur,
                       file=sys.stderr)
                 return 2
             valeurs[cle] = valeur
@@ -1479,11 +1479,11 @@ def cmd_set(cfg: Config, args) -> int:
                  grace_txt, regroupement_txt))
         for local in ("mail_batch", "permission_mode"):
             if local in valeurs and (agent.get("host") or "") not in ("", cfg.host):
-                print("attention : %s est lu dans l'état local de l'hôte de l'agent "
-                      "(%s), pas dans la base : lancez ce réglage sur %s"
+                print("warning: %s is read from the local state of the agent's host "
+                      "(%s), not from the database: run this setting on %s"
                       % (local, agent.get("host"), agent.get("host")), file=sys.stderr)
         if valeurs.get("permission_mode"):
-            print("mode de permission interactif (attach) : %s"
+            print("interactive permission mode (attach): %s"
                   % valeurs["permission_mode"])
         if agent.get("mode") == "externe" and not agent.get("responsible"):
             # 0030 : un agent externe a obligatoirement un responsable humain

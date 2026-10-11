@@ -65,10 +65,10 @@ AUTH_TYPES = ("agent", "terminal")
 AMEESH_KEYS = ("protocol", "binary", "binary_env", "launcher", "command", "interactive",
                "interactive_permission", "session", "stream", "env", "model", "effort", "tier", "hooks",
                "cost", "permissions", "acp", "accounts", "install")
-#: clés connues de `ameesh.interactive_permission` (L223 : mode de permission
-#: d'une session interactive, `ameesh attach` et `ameesh chat`)
+#: known keys of `ameesh.interactive_permission` (L223: permission mode of an
+#: interactive session, `ameesh attach` and `ameesh chat`)
 INTERACTIVE_PERMISSION_KEYS = ("flag", "default", "env", "fallback", "choices", "explicit_only")
-#: un mode de permission passé au harnais : un identifiant court
+#: a permission mode passed to the harness: a short identifier
 PERMISSION_MODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 #: clés connues de `ameesh.accounts` (L30 : comptes multiples par fournisseur)
 ACCOUNT_KEYS = ("config_env", "default_home", "session_store", "credentials", "key_env")
@@ -143,8 +143,8 @@ class HarnessDescriptor:
     launcher: tuple[str, ...] = ()
     command: tuple[str, ...] = ()
     interactive: tuple[str, ...] | None = None
-    #: L223 : mode de permission de la session interactive (voir
-    #: `INTERACTIVE_PERMISSION_KEYS`) ; vide = aucun mode passé
+    #: L223: permission mode of the interactive session (see
+    #: `INTERACTIVE_PERMISSION_KEYS`); empty = no mode passed
     interactive_permission: Mapping[str, Any] = field(default_factory=dict)
     session_flag: tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
@@ -845,58 +845,58 @@ def _setting(value: Any) -> Setting:
 
 
 def _check_interactive_permission(value: Any, path: str) -> list[Finding]:
-    """`ameesh.interactive_permission` (L223) : drapeau à gabarit `{mode}`,
-    mode par défaut, variables de surcharge, mode de repli, liste blanche des
-    modes (`choices`) et ceux qu'un réglage explicite de l'agent peut seul
-    poser (`explicit_only`)."""
+    """`ameesh.interactive_permission` (L223): flag with a `{mode}` template,
+    default mode, override variables, fallback mode, allowlist of modes
+    (`choices`) and the modes only an explicit agent setting may set
+    (`explicit_only`)."""
     if value is None:
         return []
     if not isinstance(value, dict):
         return [Finding("harness-permission-mode-invalid", ERROR,
-                        "`ameesh.interactive_permission` : objet attendu", path)]
+                        "`ameesh.interactive_permission`: object expected", path)]
     findings = []
     for key in value:
         if key not in INTERACTIVE_PERMISSION_KEYS:
             findings.append(Finding("harness-key-unknown", WARNING,
-                                    "`ameesh.interactive_permission.%s` : clé inconnue (ignorée)"
+                                    "`ameesh.interactive_permission.%s`: unknown key (ignored)"
                                     % key, path))
     flag = _strings(value.get("flag"))
     if not flag or not any("{mode}" in part for part in flag):
         findings.append(Finding("harness-permission-mode-invalid", ERROR,
-                                "`ameesh.interactive_permission.flag` : liste de textes "
-                                "contenant `{mode}` attendue", path))
+                                "`ameesh.interactive_permission.flag`: list of strings "
+                                "containing `{mode}` expected", path))
     for key in ("default", "fallback"):
         mode = value.get(key)
         if mode is not None and not (isinstance(mode, str) and PERMISSION_MODE_RE.match(mode)):
             findings.append(Finding("harness-permission-mode-invalid", ERROR,
-                                    "`ameesh.interactive_permission.%s` : mode attendu "
-                                    "(identifiant court)" % key, path))
+                                    "`ameesh.interactive_permission.%s`: mode expected "
+                                    "(short identifier)" % key, path))
     names = value.get("env")
     if names is not None and not (_strings(names) is not None
                                   and all(ENV_RE.match(n) for n in _strings(names))):
         findings.append(Finding("harness-permission-mode-invalid", ERROR,
-                                "`ameesh.interactive_permission.env` : noms de variables "
-                                "attendus", path))
+                                "`ameesh.interactive_permission.env`: variable names "
+                                "expected", path))
     for key in ("choices", "explicit_only"):
         modes = value.get(key)
         if modes is not None and not (_strings(modes) is not None
                                       and all(PERMISSION_MODE_RE.match(m) for m in _strings(modes))):
             findings.append(Finding("harness-permission-mode-invalid", ERROR,
-                                    "`ameesh.interactive_permission.%s` : liste de modes "
-                                    "attendue" % key, path))
-    choix = [m for m in (_strings(value.get("choices")) or []) if PERMISSION_MODE_RE.match(m)]
-    if choix:
+                                    "`ameesh.interactive_permission.%s`: list of modes "
+                                    "expected" % key, path))
+    choices = [m for m in (_strings(value.get("choices")) or []) if PERMISSION_MODE_RE.match(m)]
+    if choices:
         for key in ("default", "fallback"):
             mode = value.get(key)
-            if isinstance(mode, str) and mode and mode not in choix:
+            if isinstance(mode, str) and mode and mode not in choices:
                 findings.append(Finding("harness-permission-mode-invalid", ERROR,
-                                        "`ameesh.interactive_permission.%s` : %r absent de "
+                                        "`ameesh.interactive_permission.%s`: %r not in "
                                         "`choices`" % (key, mode), path))
     return findings
 
 
 def _interactive_permission(value: Any) -> dict:
-    """La forme normalisée de `ameesh.interactive_permission` ({} si invalide)."""
+    """The normalized form of `ameesh.interactive_permission` ({} if invalid)."""
     if not isinstance(value, dict):
         return {}
     flag = _strings(value.get("flag")) or []
@@ -904,8 +904,9 @@ def _interactive_permission(value: Any) -> dict:
         return {}
 
     def mode(key: str) -> str:
-        texte = value.get(key)
-        return texte if isinstance(texte, str) and PERMISSION_MODE_RE.match(texte) else ""
+        text = value.get(key)
+        return text if isinstance(text, str) and PERMISSION_MODE_RE.match(text) else ""
+
     def modes(key: str) -> tuple[str, ...]:
         return tuple(m for m in (_strings(value.get(key)) or []) if PERMISSION_MODE_RE.match(m))
     return {"flag": tuple(flag), "default": mode("default"), "fallback": mode("fallback"),

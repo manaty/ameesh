@@ -71,7 +71,7 @@ réclamé, et `harness check` explique pourquoi. Les clés inconnues et un
 | `launcher` | arguments du **lanceur**, avant les options (ex. `--profile agent`) |
 | `command` | arguments de l'application (ex. `--json`), après les options |
 | `interactive` | arguments d'`ameesh attach` ; `null` = attachement refusé (défaut en ACP) |
-| `interactive_permission` | L223 : mode de permission de la session interactive, `{"flag": ["--permission-mode", "{mode}"], "default": "auto", "env": ["AMEESH_CLAUDE_PERMISSION_MODE"], "fallback": "acceptEdits", "choices": [...], "explicit_only": ["bypassPermissions"]}` ; inséré après `interactive` ; `choices` = liste blanche (mode hors liste ignoré), `explicit_only` = modes que seul le réglage de l'agent pose ; repli quand le bloc `choices:` de l'option dans l'aide du binaire ne cite pas le mode, ou que l'aide est illisible ; absent = aucun mode passé |
+| `interactive_permission` | L223: permission mode of the interactive session, `{"flag": ["--permission-mode", "{mode}"], "default": "auto", "env": ["AMEESH_CLAUDE_PERMISSION_MODE"], "fallback": "acceptEdits", "choices": [...], "explicit_only": ["bypassPermissions"]}`; inserted after `interactive`; `choices` = allowlist (a mode outside it is ignored), `explicit_only` = modes only the agent setting may set; fallback when the option's `choices:` block in the binary's help does not list the mode, or the help is unreadable; absent = no mode passed |
 | `session` | reprise hors ACP : `{"flag": ["--resume"]}` (inséré juste avant le texte) |
 | `stream` | lecteur de flux : `claude-stream-json`, `codex-json`, `dsh-json`, `acp-json`, `text` |
 | `env` | variables posées au lancement du harnais (`cli`) ou de l'agent (`acp`) |

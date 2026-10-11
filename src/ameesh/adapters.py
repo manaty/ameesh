@@ -1053,7 +1053,7 @@ class HarnessAdapter:
         Elle ne passe ni par `-p`/`exec` ni par `--json` : le harnais garde son
         terminal et sa session, l'humain est devant. Un descripteur qui ne
         déclare pas `ameesh.interactive` (typiquement un agent ACP) refuse.
-        L223 : le mode de permission (`permission_mode()`) suit `interactive`.
+        L223: the permission mode (`permission_mode()`) follows `interactive`.
         """
         if not self.spec.attach:
             raise HarnessMissing(
@@ -1062,58 +1062,57 @@ class HarnessAdapter:
         argv = [self.binary, *self.spec.launcher, *self.spec.interactive]
         mode = self.permission_mode(permission_mode)
         if mode:
-            regle = self.descriptor.interactive_permission
-            argv += [part.replace("{mode}", mode) for part in regle["flag"]]
+            rule = self.descriptor.interactive_permission
+            argv += [part.replace("{mode}", mode) for part in rule["flag"]]
         if session_id:
             argv += [*self.spec.session_flag, session_id]
         return argv
 
     def permission_mode(self, explicit: str | None = None) -> str:
-        """Le mode de permission d'une session interactive (L223), '' sans objet.
+        """The permission mode of an interactive session (L223), '' if none.
 
-        Ordre : la valeur explicite (réglage de l'agent, `ameesh set <agent>
-        permission_mode=…`), puis les variables du descripteur
-        (`AMEESH_CLAUDE_PERMISSION_MODE`), puis son défaut (`auto` pour Claude :
-        le classifieur garde les garde-fous sur les secrets, la configuration
-        persistante et la prod). Seuls les modes de la liste blanche du
-        descripteur (`choices`) sont retenus, et ceux de `explicit_only`
-        (`bypassPermissions`) seulement par le réglage de l'agent : un autre
-        est écarté avec un avertissement. Le mode retenu n'est passé que si
-        l'aide du binaire installé le cite parmi les choix de l'option ; sinon
-        (version trop ancienne, aide illisible ou expirée) il cède la place au
-        repli du descripteur (`acceptEdits`).
+        Order: the explicit value (agent setting, `ameesh set <agent>
+        permission_mode=…`), then the descriptor's variables
+        (`AMEESH_CLAUDE_PERMISSION_MODE`), then its default (`auto` for Claude:
+        the classifier keeps the guardrails on secrets, persistent configuration
+        and production). Only modes in the descriptor's allowlist (`choices`)
+        are kept, and those in `explicit_only` (`bypassPermissions`) only from
+        the agent setting: any other is dropped with a warning. The chosen mode
+        is passed only if the installed binary's help lists it among the
+        option's choices; otherwise (older version, unreadable or timed-out
+        help) the descriptor's fallback (`acceptEdits`) replaces it.
         """
-        regle = self.descriptor.interactive_permission
-        if not regle:
+        rule = self.descriptor.interactive_permission
+        if not rule:
             return ""
-        choix, reserves = regle.get("choices") or (), regle.get("explicit_only") or ()
+        allowed, reserved = rule.get("choices") or (), rule.get("explicit_only") or ()
         mode = ""
-        sources = [("réglage de l'agent", explicit)]
-        sources += [(n, os.environ.get(n)) for n in regle["env"]]
-        for rang, (origine, valeur) in enumerate(sources):
-            valeur = (valeur or "").strip()
-            if not valeur:
+        sources = [("agent setting", explicit)]
+        sources += [(n, os.environ.get(n)) for n in rule["env"]]
+        for rank, (origin, value) in enumerate(sources):
+            value = (value or "").strip()
+            if not value:
                 continue
-            refus = ""
-            if not harnesses.PERMISSION_MODE_RE.match(valeur) \
-                    or (choix and valeur not in choix):
-                refus = "mode inconnu"
-            elif valeur in reserves and rang > 0:
-                refus = "réservé au réglage de l'agent (ameesh set)"
-            if refus:
-                print("ameesh : mode de permission %r ignoré (%s : %s), mode par défaut"
-                      % (valeur, origine, refus), file=sys.stderr)
+            refusal = ""
+            if not harnesses.PERMISSION_MODE_RE.match(value) \
+                    or (allowed and value not in allowed):
+                refusal = "unknown mode"
+            elif value in reserved and rank > 0:
+                refusal = "reserved for the agent setting (ameesh set)"
+            if refusal:
+                print("ameesh: permission mode %r ignored (%s: %s), using the default"
+                      % (value, origin, refusal), file=sys.stderr)
                 continue
-            mode = valeur
+            mode = value
             break
-        mode = mode or regle["default"]
-        if mode and regle["fallback"] and mode != regle["fallback"]:
+        mode = mode or rule["default"]
+        if mode and rule["fallback"] and mode != rule["fallback"]:
             try:
-                connus = _help_choices(self.binary, _flag_name(regle["flag"]))
-            except Exception:  # noqa: BLE001 — l'aide ne doit jamais faire échouer l'attach
-                connus = None
-            if connus is None or mode not in connus:
-                return regle["fallback"]
+                known = _help_choices(self.binary, _flag_name(rule["flag"]))
+            except Exception:  # noqa: BLE001 — reading the help must never fail the attach
+                known = None
+            if known is None or mode not in known:
+                return rule["fallback"]
         return mode
 
     def env(self) -> dict[str, str]:
@@ -1135,55 +1134,56 @@ class HarnessAdapter:
         return self.reader.parse(line)
 
 
-#: choix lus dans l'aide des binaires (L223) : un `--help` par binaire et par
-#: processus ; None = aide illisible, expirée ou sans liste de choix
+#: choices read from the binaries' help (L223): one `--help` per binary and per
+#: process; None = unreadable, timed-out help or no list of choices
 _HELP_CACHE: dict[tuple[str, str], frozenset[str] | None] = {}
 
 
 def _flag_name(flag: Sequence[str]) -> str:
-    """L'option qui porte le mode (`--permission-mode`) dans le gabarit du drapeau."""
+    """The option carrying the mode (`--permission-mode`) in the flag template."""
     for i, part in enumerate(flag):
         if "{mode}" in part:
-            avant = part.split("{mode}")[0].rstrip("=")
-            return avant if avant else (flag[i - 1] if i else "")
+            before = part.split("{mode}")[0].rstrip("=")
+            return before if before else (flag[i - 1] if i else "")
     return ""
 
 
 def _help_choices(binary: str, option: str) -> frozenset[str] | None:
-    """Les choix que l'aide du binaire donne pour `option` (bloc « choices: … »
-    de cette seule option), None si l'aide est illisible, expirée ou muette."""
-    cle = (binary, option)
-    if cle not in _HELP_CACHE:
+    """The choices the binary's help gives for `option` (the "choices: …"
+    block of that option only), None if the help is unreadable, timed out or
+    silent. An interrupted read (Ctrl-C) is not cached."""
+    key = (binary, option)
+    if key not in _HELP_CACHE:
         try:
             proc = subprocess.run([binary, "--help"], capture_output=True,
                                   timeout=10, stdin=subprocess.DEVNULL)
-        except Exception:  # noqa: BLE001 — OSError, expiration, etc.
+        except Exception:  # noqa: BLE001 — OSError, timeout, etc.
             proc = None
-        choix = None
+        choices = None
         if proc is not None and proc.returncode == 0 and option:
-            texte = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
-            choix = _option_choices(texte, option)
-        _HELP_CACHE[cle] = choix
-    return _HELP_CACHE[cle]
+            text = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+            choices = _option_choices(text, option)
+        _HELP_CACHE[key] = choices
+    return _HELP_CACHE[key]
 
 
-def _option_choices(texte: str, option: str) -> frozenset[str] | None:
-    """Les choix entre guillemets du bloc « (choices: …) » de `option`, cherché
-    de la ligne de l'option jusqu'à la suivante (ligne commençant par `-`)."""
-    lignes = texte.splitlines()
-    motif = re.compile(r"^\s*(?:-\w,\s*)?%s(?![A-Za-z0-9_-])" % re.escape(option))
-    for i, ligne in enumerate(lignes):
-        if not motif.match(ligne):
+def _option_choices(text: str, option: str) -> frozenset[str] | None:
+    """The quoted choices of the "(choices: …)" block of `option`, searched
+    from the option's line up to the next one (a line starting with `-`)."""
+    lines = text.splitlines()
+    pattern = re.compile(r"^\s*(?:-\w,\s*)?%s(?![A-Za-z0-9_-])" % re.escape(option))
+    for i, line in enumerate(lines):
+        if not pattern.match(line):
             continue
-        bloc = [ligne]
-        for suite in lignes[i + 1:]:
-            if re.match(r"^\s*-", suite):
+        block = [line]
+        for following in lines[i + 1:]:
+            if re.match(r"^\s*-", following):
                 break
-            bloc.append(suite)
-        trouve = re.search(r"choices:\s*([^)]*)\)", " ".join(bloc))
-        if not trouve:
+            block.append(following)
+        found = re.search(r"choices:\s*([^)]*)\)", " ".join(block))
+        if not found:
             return None
-        return frozenset(re.findall(r'"([^"]+)"', trouve.group(1))) or None
+        return frozenset(re.findall(r'"([^"]+)"', found.group(1))) or None
     return None
 
 

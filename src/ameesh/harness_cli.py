@@ -85,17 +85,17 @@ def _show_text(descriptor: harnesses.HarnessDescriptor) -> None:
     print("commande       : %s" % (" ".join(descriptor.command) or "—"))
     if descriptor.attach:
         print("interactif     : %s" % (" ".join(descriptor.interactive) or "—"))
-        regle = descriptor.interactive_permission
-        if regle:
-            print("permission     : %s (défaut %s%s%s)" % (
-                " ".join(regle["flag"]), regle["default"] or "—",
-                ", env : %s" % ", ".join(regle["env"]) if regle["env"] else "",
-                ", repli : %s" % regle["fallback"] if regle["fallback"] else ""))
-            if regle.get("choices"):
-                print("modes admis    : %s%s" % (
-                    ", ".join(regle["choices"]),
-                    " (%s : réglage de l'agent seulement)" % ", ".join(regle["explicit_only"])
-                    if regle.get("explicit_only") else ""))
+        rule = descriptor.interactive_permission
+        if rule:
+            print("permission     : %s (default %s%s%s)" % (
+                " ".join(rule["flag"]), rule["default"] or "—",
+                ", env: %s" % ", ".join(rule["env"]) if rule["env"] else "",
+                ", fallback: %s" % rule["fallback"] if rule["fallback"] else ""))
+            if rule.get("choices"):
+                print("allowed modes  : %s%s" % (
+                    ", ".join(rule["choices"]),
+                    " (%s: agent setting only)" % ", ".join(rule["explicit_only"])
+                    if rule.get("explicit_only") else ""))
     else:
         print("interactif     : non déclaré (attach indisponible)")
     print("session        : %s" % (" ".join(descriptor.session_flag) or "— (ACP)"))
