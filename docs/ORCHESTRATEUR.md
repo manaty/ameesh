@@ -324,6 +324,21 @@ depuis 2 h et tenue par aucun processus (travail git non poussé gardé) ; et
 l'alerte d'un tmpfs plein dit les plus grosses entrées et l'action attendue.
 Le texte de chaque tour de courrier rappelle cette règle.
 
+## Ajouter plutôt que modifier (L160a)
+
+Le 10/10, la moitié des blocs en conflit à la fusion étaient deux ajouts au
+même endroit d'un fichier commun. Dans les lots que tu confies et que tu
+relis :
+
+* **Aucun journal tenu à la main.** L'historique, ce sont git et les PR
+  fusionnées ; la description de la PR dit ce qui change et pourquoi. On
+  n'ajoute pas d'entrée en tête d'un fichier commun à chaque lot.
+* **On ajoute des fichiers plutôt que de modifier un fichier commun** : un
+  module, un test, une page ou une décision par sujet.
+* **Listes centrales** (`tests/parts/pilote-psql.txt`…) : une entrée par ligne,
+  rangée par ordre alphabétique, sa raison en commentaire sur la même ligne ;
+  jamais d'ajout systématique en fin ou en tête de liste.
+
 ## Livraison et déploiements
 
 Règles du propriétaire (2026-10-10), après qu'une version mineure (1.6.2) est
@@ -355,7 +370,7 @@ restée 4 h fusionnée sans être déployée :
    d'avoir traité les exécuteurs suivants. Une session humaine attachée
    (`ameesh attach`) bloque le redémarrage de son exécuteur jusqu'à sa sortie.
 5. **Réserver les migrations.** Les numéros de migration se réservent dès le
-   début d'un lot, annoncés dans le lot et au journal de conception, pour
+   début d'un lot, annoncés dans le lot et dans la description de la PR, pour
    éviter les renumérotations en cascade quand plusieurs lots fusionnent à la
    suite.
 6. **Essai à blanc avant toute étiquette de release.** Avant de poser une
