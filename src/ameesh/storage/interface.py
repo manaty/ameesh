@@ -820,6 +820,19 @@ class WorkItems(Domain):
         None si le lot n'est plus ouvert."""
 
     @abc.abstractmethod
+    def reserve_migration(self, item_id: int, number: int | None, floor: int, *,
+                          note: str, actor: str, release: bool = False) -> dict | None:
+        """L122 : réserve un numéro de migration au lot ouvert (journalisé) :
+        `number` s'il est donné, sinon le prochain libre, au moins `floor`
+        et au-delà des numéros déjà réservés, sous verrou. `note` peut citer `%(number)04d`. None si le
+        lot n'est plus ouvert ; DbError si le numéro est pris par un autre.
+        `release` libère la réservation."""
+
+    @abc.abstractmethod
+    def migration_holder(self, number: int) -> dict | None:
+        """L122 : le lot (id, titre, état) qui a réservé ce numéro."""
+
+    @abc.abstractmethod
     def set_branch_head(self, item_id: int, branch: str, head: str | None) -> bool:
         """L118 : retient le dernier commit de la branche vu en avance sur sa
         cible, si la branche du lot est toujours `branch`."""

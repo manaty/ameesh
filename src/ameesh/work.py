@@ -243,6 +243,53 @@ def set_branch(db: Db, item_id: int, branch: str, target: str | None = None, *,
     return row
 
 
+# --------------------------------------------------------------------------
+# numéro de migration réservé (L122)
+# --------------------------------------------------------------------------
+
+def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
+                      release: bool = False, repo: str | None = None,
+                      actor: str = "") -> dict:
+    """L122 : réserve au lot le numéro de sa migration, avant d'écrire le
+    fichier. Sans `number` : le prochain libre, au-delà des migrations connues
+    (paquet, dépôt courant et ses branches, voir `migrations.highest_known`)
+    et des numéros déjà réservés par d'autres lots. Un lot qui a déjà sa
+    réservation la garde (idempotent). `release` la libère. Rend le lot."""
+    from . import migrations
+
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s introuvable" % item_id)
+    if item["state"] in ("merged", "promoted", "closed"):
+        raise WorkError("lot %s déjà %s : pas de réservation" % (item_id, item["state"]))
+    current = item.get("migration")
+    if release:
+        if current is None:
+            return item
+        note, number = "migration %04d libérée" % current, None
+    elif number is None:
+        if current is not None:
+            return item
+        note = "migration %(number)04d réservée"
+    else:
+        if not 1 <= int(number) <= 9999:
+            raise WorkError("numéro de migration hors de 0001-9999 : %s" % number)
+        if current == int(number):
+            return item
+        holder = storage.of(db).work.migration_holder(int(number))
+        if holder is not None:
+            raise WorkError("migration %04d déjà réservée par le lot #%s (%s)" % (
+                int(number), holder["id"], holder["title"]))
+        note = "migration %%(number)04d réservée (avant : %s)" % (
+            "%04d" % current if current is not None else "aucune")
+    floor = migrations.highest_known(repo) + 1 if number is None and not release else 0
+    row = storage.of(db).work.reserve_migration(item_id, number, floor, note=note,
+                                                actor=actor, release=release)
+    if row is None:
+        raise WorkError("lot %s n'est plus ouvert : pas de réservation" % item_id)
+    return row
+
+
 def open_lots(db: Db, assignee: str) -> list[dict]:
     """L118 : les lots ouverts d'un assigné (ni livrés, ni fermés)."""
     return storage.of(db).work.open_for(assignee)

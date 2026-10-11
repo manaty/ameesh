@@ -18,7 +18,7 @@ ITEM_COLUMNS = """
     loops, budget_usd, spent_usd, package_id, package_parent, pr_ref, close_reason,
     superseded_by, delegated_by,
     expected_value, value_score, priority, team, required_capabilities,
-    branch, branch_target, branch_head,
+    branch, branch_target, branch_head, migration,
     extract(epoch from created_at)::float8 as created_ts,
     extract(epoch from updated_at)::float8 as updated_ts,
     extract(epoch from closed_at)::float8  as closed_ts,
@@ -461,6 +461,36 @@ class WorkItems(interface.WorkItems):
                 return None
             WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
             return rows[0]
+
+    # -- numéro de migration réservé (L122) ----------------------------------
+    def reserve_migration(self, item_id, number, floor, *, note, actor,
+                          release=False) -> dict | None:
+        """Réserve (ou libère, `release`) le numéro de migration d'un lot
+        ouvert, avec une ligne de journal. Sans `number` : le prochain libre,
+        au moins `floor`, calculé sous verrou consultatif (deux réservations
+        simultanées ne lisent pas le même maximum) ; l'index unique
+        `work_items_migration_idx` reste le dernier garde-fou."""
+        with self.db.transaction() as tx:
+            tx.query("SELECT pg_advisory_xact_lock(hashtext(%s || current_schema())::bigint)",
+                     ("ameesh_migration_reservation:",))
+            if number is None and not release:
+                top = tx.query("SELECT coalesce(max(migration), 0) AS top FROM work_items")
+                number = max(int(floor), int(top[0]["top"]) + 1)
+            rows = tx.query(
+                "UPDATE work_items SET migration = %%s, updated_at = now()"
+                " WHERE id = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
+                " RETURNING %s" % ITEM_COLUMNS,
+                (None if release else int(number), int(item_id)))
+            if not rows:
+                return None
+            WorkItems(tx)._event(int(item_id), rows[0]["state"],
+                                 note % {"number": int(number or 0)}, actor)
+            return rows[0]
+
+    def migration_holder(self, number) -> dict | None:
+        rows = self.db.query(
+            "SELECT id, title, state FROM work_items WHERE migration = %s", (int(number),))
+        return rows[0] if rows else None
 
     def set_branch_head(self, item_id, branch, head) -> bool:
         """Retient le dernier commit de la branche vu en avance sur sa cible

@@ -67,6 +67,52 @@ def discover(directory: str = MIGRATIONS_DIR) -> list[Migration]:
     return [found[v] for v in sorted(found)]
 
 
+# --------------------------------------------------------------------------
+# numéros réservés (L122)
+# --------------------------------------------------------------------------
+
+#: chemin des migrations dans le dépôt ameesh
+REPO_PATH = "src/ameesh/migrations"
+
+
+def numbered(names) -> dict[int, list[str]]:
+    """Numéro → fichiers `NNNN_*.sql` qui le portent (doublons visibles)."""
+    out: dict[int, list[str]] = {}
+    for name in names:
+        match = _FILE_RE.match(os.path.basename(name))
+        if match:
+            out.setdefault(int(match.group(1)), []).append(os.path.basename(name))
+    return out
+
+
+def _git(repo: str, *args: str) -> str:
+    import subprocess
+
+    try:
+        return subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
+                              timeout=30, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def highest_known(repo: str | None = None, directory: str = MIGRATIONS_DIR) -> int:
+    """Le plus haut numéro de migration connu : celles du paquet installé et,
+    dans le dépôt `repo` (défaut : le dépôt git courant s'il contient
+    `src/ameesh/migrations`), celles de l'arbre de travail et de TOUTES les
+    branches locales et distantes — une PR ouverte compte, même sans
+    réservation (lots antérieurs à L122). Rien n'est récupéré (pas de fetch)."""
+    names = [n for n in os.listdir(directory)] if os.path.isdir(directory) else []
+    top = _git(repo or os.getcwd(), "rev-parse", "--show-toplevel").strip()
+    if top and os.path.isdir(os.path.join(top, REPO_PATH)):
+        names += os.listdir(os.path.join(top, REPO_PATH))
+        refs = _git(top, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes")
+        for ref in refs.split():
+            if ref.endswith("/HEAD"):
+                continue
+            names += _git(top, "ls-tree", "--name-only", ref, REPO_PATH + "/").split()
+    return max(numbered(names) or [0])
+
+
 def applied(db: PsqlDriver | PsycopgDriver) -> dict[int, str]:
     db.script(BOOTSTRAP)
     rows = db.query("SELECT version, checksum, name FROM schema_migrations ORDER BY version")

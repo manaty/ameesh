@@ -303,10 +303,21 @@ restée 4 h fusionnée sans être déployée :
    l'agent, et il est tué quand le script redémarre cette unité, avant
    d'avoir traité les exécuteurs suivants. Une session humaine attachée
    (`ameesh attach`) bloque le redémarrage de son exécuteur jusqu'à sa sortie.
-5. **Réserver les migrations.** Les numéros de migration se réservent dès le
-   début d'un lot, annoncés dans le lot et au journal de conception, pour
-   éviter les renumérotations en cascade quand plusieurs lots fusionnent à la
-   suite.
+5. **Réserver les migrations** (L122). Le 2026-10-10, quatre lots
+   développés en parallèle ont pris les mêmes numéros (0048 à 0050) : trois
+   renumérotations en cascade. Un lot qui ajoute une migration réserve son
+   numéro **avant d'écrire le fichier** : `ameesh work migration <lot>` note
+   dans le lot le prochain numéro libre — au-delà des migrations du paquet,
+   de l'arbre courant et de toutes les branches du dépôt (locales et
+   distantes, sans fetch : faire `git fetch` avant), et des numéros déjà
+   réservés par d'autres lots. La commande est idempotente ; `--number N`
+   réserve un numéro précis (refusé s'il est réservé ailleurs), `--release`
+   libère. La réservation se lit dans `ameesh work show <lot>` (ligne
+   `migration`) et au journal du lot. En confiant un lot qui touche au
+   schéma, l'orchestrateur réserve le numéro ou demande à l'agent de le
+   faire en premier. Deux fichiers de même numéro dans
+   `src/ameesh/migrations` sont refusés par la suite unitaire
+   (`tests/test_l122_numeros_de_migration.py`, sans base).
 6. **Essai à blanc avant toute étiquette de release.** Avant de poser une
    étiquette qui publie (application, installeur, image), le workflow de
    release tourne en essai à blanc sur le SHA exact, sur toutes les plateformes

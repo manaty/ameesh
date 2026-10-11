@@ -28,3 +28,5 @@ test_undeliverable
 test_l124_decisions
 # stockage : messages d'humains sans lot (agent_mailbox, jsonb, listes IN) (L130)
 test_l130_demandes_sans_lot
+# stockage : réservation des numéros de migration (verrou consultatif, index unique) (L122)
+test_l122_numeros_de_migration
