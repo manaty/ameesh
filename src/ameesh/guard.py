@@ -58,6 +58,7 @@ import time
 from typing import Any, Callable
 
 from . import resources
+from .platform import host
 
 SCHEMA_HOST_STATE = "ameesh-host-state/1"
 SCHEMA_HOST_ACK = "ameesh-host-ack/1"
@@ -293,16 +294,7 @@ def load_config(path: str | None = None) -> GuardConfig:
 def _psi_file(resource: str, window: str) -> float | None:
     """PSI "some" `window` (avg10, avg60) of a resource, in %, or None. Used
     when `resources.psi` (L159d) is not there."""
-    base = os.environ.get("AMEESH_PSI_DIR") or "/proc/pressure"
-    try:
-        with open(os.path.join(base, resource), encoding="ascii") as fh:
-            for line in fh:
-                if line.startswith("some "):
-                    fields = dict(f.split("=", 1) for f in line.split()[1:] if "=" in f)
-                    return float(fields[window])
-    except (OSError, ValueError, KeyError):
-        return None
-    return None
+    return host.pressure(resource, window, base=os.environ.get("AMEESH_PSI_DIR") or None)
 
 
 def read_psi(window: str) -> dict:

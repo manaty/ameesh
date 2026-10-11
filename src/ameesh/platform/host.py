@@ -65,6 +65,26 @@ def memory(meminfo: str | None = None) -> dict[str, int]:
     return out
 
 
+def pressure(resource: str, window: str = "avg60", base: str | None = None) -> float | None:
+    """PSI « some » de `resource` (cpu, memory, io) sur `window` (avg10, avg60),
+    en %, ou None : noyau sans PSI, autre OS, fichier illisible.
+
+    `base` : un répertoire au format /proc/pressure (tests)."""
+    if base is None:
+        if not _proc_ok():
+            return None
+        base = os.path.join(PROC, "pressure")
+    try:
+        with open(os.path.join(base, resource), encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("some "):
+                    fields = dict(f.split("=", 1) for f in line.split()[1:] if "=" in f)
+                    return float(fields[window])
+    except (OSError, ValueError, KeyError):
+        return None
+    return None
+
+
 def load_average() -> float | None:
     """Charge sur 1 minute ; None sans équivalent fiable (Windows)."""
     getter = getattr(os, "getloadavg", None)
