@@ -438,6 +438,27 @@ vidé (`flush`) *avant* de marquer les messages remis ; si le harnais a fermé s
 entrée (BrokenPipe), la remise n'a pas lieu et le courrier reste pour le tour
 suivant.
 
+**Hooks : jamais dans un sous-agent (L133, 2026-10-11).** Claude Code
+déclenche aussi les hooks ordinaires (`PostToolUse`…) dans les sous-agents
+d'une session (outil Agent/Task, coéquipier en processus), avec le
+`session_id` de la session principale et l'environnement de l'agent ; Codex
+fait de même pour ses sous-agents (`spawn_agent`). Le hook remettait alors au
+sous-agent le courrier de l'agent, que le sous-agent ignorait, et le marquait
+livré : la session principale ne le recevait jamais (au moins cinq messages
+perdus les 10 et 11/10). Ces deux harnais ajoutent `agent_id` à l'entrée d'un
+hook déclenché dans un sous-agent, et seulement là : `agent_id` présent et non
+vide, le hook sort aussitôt, sans rien lire, remettre, marquer ni écrire
+(inscription, titre, compteurs), et sans rien afficher (une ligne « courrier
+en attente » se répéterait à chaque outil du sous-agent et coûterait un
+aller-retour à la base). Le courrier attend le prochain hook de la session
+principale. `agent_type` seul ne compte pas : Claude Code le pose aussi sur
+une session principale lancée avec `--agent`. Limite connue : le pont des
+hooks Claude Code du harnais DeepSeek (`dsh`) ne passe `agent_id` qu'à
+`SubagentStart` et `SubagentStop` ; d'après son code, un sous-agent `dsh`
+déclenche les hooks ordinaires sous son propre `session_id`. Une session liée
+par `bind` ne lui remet donc rien, mais un agent mené par l'exécuteur
+(identité par l'environnement) reste exposé : suite à traiter à part.
+
 **Repli** : si Postgres est injoignable et que `AMEESH_BACKEND=auto`
 (défaut), la CLI écrit dans la boîte fichier v0
 (`~/.local/state/agent-mail`, mêmes noms de fichiers, même JSON) et affiche un
