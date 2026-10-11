@@ -231,15 +231,18 @@ def _db_modules(card: dict) -> set[str]:
 
 
 def _dir_listers(card: dict, path: str, map_commit: str, repo: pathlib.Path) -> tuple[set, str]:
-    """Modules that listed the directory where `path` appeared or vanished:
-    its parent, or the first ancestor that existed at the map commit."""
+    """Modules that listed a directory above `path`, which appeared or
+    vanished: every ancestor, since a directory may appear or vanish with it
+    (the only file of `docs/sub`). The reason names the first ancestor that
+    existed at the map commit."""
     listers: set[str] = set()
-    parent = str(pathlib.PurePosixPath(path).parent)
-    while True:
+    where = None
+    for parent in pathlib.PurePosixPath(path).parents:
+        parent = str(parent)
         listers |= set(card.get("dossiers", {}).get(parent, ()))
-        if parent in ("", ".") or existed(parent, map_commit, repo):
-            return listers, parent
-        parent = str(pathlib.PurePosixPath(parent).parent)
+        if where is None and (parent in ("", ".") or existed(parent, map_commit, repo)):
+            where = parent
+    return listers, where or "."
 
 
 def _python(card: dict, impact: Impact, status: str, path: str, head: str,
@@ -377,6 +380,10 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
                 and stem.name.startswith("test") and stem.suffix == ".py":
             if status != "D" and stem.stem in modules:
                 impact.p0[stem.stem] = path
+            if status in ("A", "D"):  # the listing of tests/ changed
+                listers, where = _dir_listers(card, path, card["commit"], repo)
+                impact.hit(listers, f"{path} ({'added to' if status == 'A' else 'removed from'} "
+                                    f"{where})")
             continue
         if is_foundation(path):
             if path == "pyproject.toml" and _version_line_only(head, card["commit"], repo):

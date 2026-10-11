@@ -310,6 +310,25 @@ class MapTest(unittest.TestCase):
         self.assertEqual(out["classes"]["test_plan"], ["P0", "tests/test_plan.py"])
         self.assertEqual(out["classes"]["test_version"], ["P1", "tests/test_plan.py"])
 
+    def test_test_module_added_or_removed_reaches_the_listers_of_tests(self):
+        # codex, 3rd review (1): the test-module branch skipped the listers of tests/
+        self.repo.write("tests/test_old.py", "x = 1\n")
+        self.repo.base = self.repo.commit()
+        for why, change in (("added", lambda: self.repo.write("tests/test_plan.py", "x = 1\n")),
+                            ("removed", lambda: self.repo.remove("tests/test_old.py"))):
+            with self.subTest(why):
+                change()
+                self.repo.commit()
+                card = self.repo.card()
+                card["dossiers"]["tests"] = ["test_version"]
+                try:
+                    out = self._classify_with(card, ["test_a", "test_plan", "test_version"])
+                    self.assertEqual(out["classes"]["test_version"][0], "P1", why)
+                    self.assertIn(why if why == "removed" else "added",
+                                  out["classes"]["test_version"][1])
+                finally:
+                    _git(self.repo.path, "reset", "-q", "--hard", self.repo.base)
+
     def test_removed_or_renamed_code_file_reaches_the_directory_listers(self):
         # codex (5): a code file removed (or renamed) changes the listing of its directory
         for why, new_name in (("removed", None), ("renamed", "src/ameesh/code2.py")):
@@ -415,6 +434,20 @@ class DocsLaneTest(unittest.TestCase):
         self.assertEqual(sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]),
                          self.MODULES)
         self.assertEqual(plan.outputs(p)["code"], "true")
+
+    def test_vanished_directory_reaches_the_listers_above_it(self):
+        # codex, 3rd review (2): docs/sub, known to the map, vanishes with its only
+        # file; the listing of docs/ changes too
+        self.repo.write("docs/sub/only.md", "# Only\n")
+        self.repo.base = self.card["commit"] = self.repo.commit()
+        self.card["dossiers"]["docs"] = [self.name["test_lister"]]
+        self.card["dossiers"]["docs/sub"] = [self.name["test_c"]]
+        self.repo.remove("docs/sub/only.md")
+        self.repo.commit()
+        p = self._plan(["docs/sub/only.md"])
+        self.assertTrue(p["docs_only"], p["why"])
+        self.assertIn(self.name["test_lister"], p["doc_readers"])
+        self.assertIn(self.name["test_c"], p["doc_readers"])
 
     def test_read_by_a_plain_test_stays_in_the_fast_lane(self):
         self.card["donnees"]["docs/guide.md"] = [self.name["test_c"]]
