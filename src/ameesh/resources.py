@@ -312,17 +312,24 @@ cgroup_cpu_seconds = platform.cgroup_cpu_seconds
 cgroup_memory_bytes = platform.cgroup_memory_bytes
 
 
-def psi(base: str | None = None) -> dict:
-    """PSI of the host, 60 s averages in percent: `psi_cpu_some`,
+#: PSI averages a reading can take
+PSI_WINDOWS = ("avg10", "avg60", "avg300")
+
+
+def psi(base: str | None = None, window: str = "avg60") -> dict:
+    """PSI of the host, averages in percent over `window` (`avg60` by
+    default, `avg10` for a guard that must react fast): `psi_cpu_some`,
     `psi_mem_some`, `psi_mem_full`, `psi_io_some`; None when unreadable
     (no PSI before Linux 4.20, nor outside Linux, nor with `psi=0`)."""
+    if window not in PSI_WINDOWS:
+        raise ValueError("PSI window: %r, expected one of %s" % (window, PSI_WINDOWS))
     base = base or os.environ.get(PSI_ENV) or None
     files: dict = {}
     out: dict = {}
     for column, resource, line in PSI_FIELDS:
         if resource not in files:
             files[resource] = platform.pressure(resource, base)
-        out[column] = files[resource].get(line, {}).get("avg60")
+        out[column] = files[resource].get(line, {}).get(window)
     return out
 
 
@@ -330,9 +337,10 @@ def guest_cgroups(root: str | None = None) -> list[str]:
     """The guest's cgroups that exist on this host.
 
     `AMEESH_GUEST_CGROUP` lists them explicitly (empty: no guest).
-    Otherwise the guest slices are looked up at the top of the hierarchy
-    (system units) and in each user manager (`user@<uid>.service`, user
-    units of the workstation)."""
+    Otherwise the guest slices are looked up where systemd puts them: a
+    slice nests under its dash prefixes (`ameesh-agents.slice` lives in
+    `ameesh.slice/`), at the top of the hierarchy (system units) and in each
+    user manager (`user@<uid>.service`, user units of the workstation)."""
     explicit = os.environ.get(GUEST_CGROUP_ENV)
     if explicit is not None:
         return [path for path in explicit.split(":") if path and os.path.isdir(path)]
@@ -346,8 +354,15 @@ def guest_cgroups(root: str | None = None) -> list[str]:
                     bases.append(os.path.join(users, user, manager))
     except OSError:
         pass
-    return [os.path.join(base, name) for base in bases for name in GUEST_SLICES
-            if os.path.isdir(os.path.join(base, name))]
+    paths = [os.path.join(base, slice_path(name)) for base in bases for name in GUEST_SLICES]
+    return [path for path in paths if os.path.isdir(path)]
+
+
+def slice_path(name: str) -> str:
+    """Path of a slice unit below its root, as systemd nests it:
+    `a-b-c.slice` → `a.slice/a-b.slice/a-b-c.slice`."""
+    parts = name[:-len(".slice")].split("-")
+    return os.path.join(*("-".join(parts[:i]) + ".slice" for i in range(1, len(parts) + 1)))
 
 
 def host_cpu_seconds(path: str | None = None) -> float | None:
@@ -407,10 +422,12 @@ _CPU_METER = CpuMeter()
 
 
 def guest_memory(cgroups: list[str] | None = None) -> int | None:
-    """Memory charged to the guest's cgroups; None without a guest."""
+    """Memory charged to the guest's cgroups: 0 without a guest, None when
+    a guest cgroup cannot be read (the application's memory is then
+    unknown, never taken as zero)."""
     cgroups = guest_cgroups() if cgroups is None else cgroups
     if not cgroups:
-        return None
+        return 0
     values = [cgroup_memory_bytes(path) for path in cgroups]
     return None if any(v is None for v in values) else sum(values)
 
@@ -421,7 +438,8 @@ def lendable(reading: dict, basis: dict | None = None) -> dict:
     `basis` is the history of the host (`HostResources.lend_basis`):
     `min_free_mem_bytes` (lowest `mem_available + guest_mem`, M7),
     `app_cpu_p95` (95th percentile of the application's CPU per 10 min
-    slot, A7) and `span_s` (time covered). The current reading counts too.
+    slot, A7) and `span_s` (time covered by valid application CPU
+    measurements). The current reading counts too.
 
     * memory: `h × M7`;
     * CPU: `h × (cpu_count − A7)`;
@@ -431,8 +449,9 @@ def lendable(reading: dict, basis: dict | None = None) -> dict:
     Values are None when a measure is missing: no guess."""
     basis = basis or {}
     free_now = reading.get("mem_available_bytes")
-    if free_now is not None:
-        free_now += reading.get("guest_mem_bytes") or 0
+    guest_mem = reading.get("guest_mem_bytes")
+    # unknown guest memory (None): the application's free memory is unknown
+    free_now = None if free_now is None or guest_mem is None else free_now + guest_mem
     lows = [v for v in (basis.get("min_free_mem_bytes"), free_now) if v is not None]
     memory = int(LEND_MARGIN * min(lows)) if lows else None
     cpus = reading.get("cpu_count")
@@ -493,12 +512,15 @@ def host_offer(canons, host: str) -> dict | None:
 
 def offered(reading: dict | None, offer: dict | None) -> dict | None:
     """`lendable` of a reading capped by the offer: `{cpu, memory_bytes,
-    disk_bytes}`; None when the reading has no lendable capacity."""
+    disk_bytes}`; None when the reading has no lendable capacity. Without
+    an offer (None) the host lends nothing: zeros. An offer without caps
+    (`{}`) gives the measured capacity as is."""
     reading = reading or {}
     if all(reading.get(k) is None for k in
            ("lendable_cpu", "lendable_memory_bytes", "lendable_disk_bytes")):
         return None
-    offer = offer or {}
+    if offer is None:
+        return {"cpu": 0.0, "memory_bytes": 0, "disk_bytes": 0}
 
     def cap(value, limit):
         if value is None:

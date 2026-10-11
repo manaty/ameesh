@@ -2035,8 +2035,9 @@ class HostResources(Domain):
     def lend_basis(self, host: str, since_s: float, slot_s: float,
                    percentile: float) -> dict:
         """L159d: history behind the lendable capacity, over the last
-        `since_s` seconds: `samples`, `span_s` (time covered),
-        `min_free_mem_bytes` (lowest `mem_available + guest_mem`) and
+        `since_s` seconds: `samples`, `span_s` (time covered by readings
+        with `app_cpu`), `min_free_mem_bytes` (lowest `mem_available +
+        guest_mem`, over readings where both are known) and
         `app_cpu_p95` (the `percentile` of the application's CPU averaged
         per `slot_s` slot); None when not measured."""
 

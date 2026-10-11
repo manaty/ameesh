@@ -127,7 +127,7 @@ class Hosts(interface.HostResources):
             """
             WITH s AS (
                 SELECT sampled_at, app_cpu,
-                       mem_available_bytes + coalesce(guest_mem_bytes, 0) AS free_mem
+                       mem_available_bytes + guest_mem_bytes AS free_mem
                   FROM host_resources
                  WHERE host = %s AND sampled_at >= now() - make_interval(secs => %s)
             ), slots AS (
@@ -135,7 +135,9 @@ class Hosts(interface.HostResources):
                  GROUP BY floor(extract(epoch from sampled_at) / %s)
             )
             SELECT count(*)::int AS samples,
-                   coalesce(extract(epoch from max(sampled_at) - min(sampled_at)),
+                   coalesce(extract(epoch from
+                                max(sampled_at) FILTER (WHERE app_cpu IS NOT NULL)
+                                - min(sampled_at) FILTER (WHERE app_cpu IS NOT NULL)),
                             0)::float8 AS span_s,
                    min(free_mem)::bigint AS min_free_mem_bytes,
                    (SELECT percentile_cont(%s) WITHIN GROUP (ORDER BY cpu)

@@ -75,6 +75,12 @@ class MeasureTest(unittest.TestCase):
         out = resources.psi(base)
         self.assertEqual(out, {"psi_cpu_some": 20.5, "psi_mem_some": 3.0,
                                "psi_mem_full": 1.25, "psi_io_some": None})
+        write(os.path.join(base, "cpu"), "some avg10=7.50 avg60=20.50 avg300=0 total=0\n")
+        fast = resources.psi(base, window="avg10")
+        self.assertEqual(set(fast), set(out))
+        self.assertEqual(fast["psi_cpu_some"], 7.5)
+        with self.assertRaises(ValueError):
+            resources.psi(base, window="avg5")
 
     def test_psi_absent_gives_none(self):
         out = resources.psi(os.path.join(self.dir, "nothing"))
@@ -92,17 +98,26 @@ class MeasureTest(unittest.TestCase):
 
     def test_guest_cgroups_found_in_system_and_user_managers(self):
         root = os.path.join(self.dir, "cg")
-        os.makedirs(os.path.join(root, "ameesh-guest.slice"))
+        os.makedirs(os.path.join(root, "ameesh.slice", "ameesh-guest.slice"))
         os.makedirs(os.path.join(root, "user.slice", "user-1000.slice",
-                                 "user@1000.service", "ameesh-agents.slice"))
+                                 "user@1000.service", "ameesh.slice", "ameesh-agents.slice"))
+        # not where systemd puts them: ignored
+        os.makedirs(os.path.join(root, "ameesh-agents.slice"))
         os.makedirs(os.path.join(root, "user.slice", "user-1000.slice", "session-2.scope"))
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop(resources.GUEST_CGROUP_ENV, None)
             found = resources.guest_cgroups(root)
         self.assertEqual(found, [
-            os.path.join(root, "ameesh-guest.slice"),
+            os.path.join(root, "ameesh.slice", "ameesh-guest.slice"),
             os.path.join(root, "user.slice", "user-1000.slice", "user@1000.service",
-                         "ameesh-agents.slice")])
+                         "ameesh.slice", "ameesh-agents.slice")])
+
+    def test_slice_path(self):
+        self.assertEqual(resources.slice_path("ameesh.slice"), "ameesh.slice")
+        self.assertEqual(resources.slice_path("ameesh-agents.slice"),
+                         os.path.join("ameesh.slice", "ameesh-agents.slice"))
+        self.assertEqual(resources.slice_path("a-b-c.slice"),
+                         os.path.join("a.slice", "a-b.slice", "a-b-c.slice"))
 
     def test_guest_cgroups_explicit(self):
         guest = os.path.join(self.dir, "g")
@@ -167,7 +182,7 @@ class MeasureTest(unittest.TestCase):
         write(os.path.join(a, "memory.current"), "%d\n" % GIB)
         write(os.path.join(b, "memory.current"), "%d\n" % (2 * GIB))
         self.assertEqual(resources.guest_memory([a, b]), 3 * GIB)
-        self.assertIsNone(resources.guest_memory([]))
+        self.assertEqual(resources.guest_memory([]), 0)
         self.assertIsNone(resources.guest_memory([a, os.path.join(self.dir, "c")]))
 
     # -- lendable capacity -------------------------------------------------
@@ -199,6 +214,14 @@ class MeasureTest(unittest.TestCase):
         self.assertEqual(out["lendable_basis"], "warmup")
         self.assertEqual(out["lendable_memory_bytes"], 16 * GIB)  # 25 % of 64 GiB
         self.assertEqual(out["lendable_cpu"], 1.0)
+
+    def test_lendable_unknown_guest_memory_is_not_zero(self):
+        basis = {"span_s": 3 * 86400.0, "app_cpu_p95": 0.0}
+        out = resources.lendable(self.reading(guest_mem_bytes=None), basis)
+        self.assertIsNone(out["lendable_memory_bytes"])
+        out = resources.lendable(self.reading(guest_mem_bytes=None),
+                                 dict(basis, min_free_mem_bytes=8 * GIB))
+        self.assertEqual(out["lendable_memory_bytes"], 4 * GIB)   # history only
 
     def test_lendable_never_guesses(self):
         out = resources.lendable({}, None)
@@ -235,7 +258,10 @@ class MeasureTest(unittest.TestCase):
         row = {"lendable_cpu": 2.5, "lendable_memory_bytes": 20 * GIB,
                "lendable_disk_bytes": 100 * GIB}
         self.assertIsNone(resources.offered({}, None))
+        # no offer: the host lends nothing; an offer without caps: the measure
         self.assertEqual(resources.offered(row, None),
+                         {"cpu": 0.0, "memory_bytes": 0, "disk_bytes": 0})
+        self.assertEqual(resources.offered(row, {}),
                          {"cpu": 2.5, "memory_bytes": 20 * GIB, "disk_bytes": 100 * GIB})
         self.assertEqual(resources.offered(row, {"cpu_max": 2.0, "memory_max": 14 * GIB,
                                                  "disk_max": None}),
@@ -372,6 +398,21 @@ class MeasureDbTest(PgTestCase):
         self.assertGreaterEqual(basis["app_cpu_p95"], 1.0)
         self.assertLessEqual(basis["app_cpu_p95"], 3.0)
 
+    def test_lend_basis_ignores_unmeasured_readings(self):
+        hosts = storage.of(self.db).hosts
+        # legacy readings: no application CPU, no guest memory
+        for _ in range(2):
+            hosts.record({"host": "old-vm", "mem_available_bytes": GIB})
+            time.sleep(0.05)
+        hosts.record({"host": "old-vm", "mem_available_bytes": 9 * GIB,
+                      "guest_mem_bytes": 0, "app_cpu": 0.5})
+        basis = hosts.lend_basis("old-vm", 3600, 600, 0.95)
+        self.assertEqual(basis["span_s"], 0.0)          # one valid reading
+        self.assertEqual(basis["min_free_mem_bytes"], 9 * GIB)
+        # unknown guest memory is not zero
+        hosts.record({"host": "vm2", "mem_available_bytes": GIB, "app_cpu": 0.5})
+        self.assertIsNone(hosts.lend_basis("vm2", 3600, 600, 0.95)["min_free_mem_bytes"])
+
     def test_cli_hosts_shows_the_measure(self):
         storage.of(self.db).hosts.record({
             "host": "vm-test", "mem_available_bytes": 8 * GIB, "cpu_count": 4,
@@ -382,11 +423,12 @@ class MeasureDbTest(PgTestCase):
         objet = json.loads(proc.stdout.splitlines()[0])
         self.assertIsNone(objet["offer"])
         self.assertEqual(objet["measure"]["psi"]["cpu_some"], 12.5)
-        self.assertEqual(objet["measure"]["lendable"]["memory_bytes"], 2 * GIB)
+        self.assertEqual(objet["measure"]["lendable"]["memory_bytes"], 0)  # no offer
         texte = self.mesh("hosts", "vm-test")
         self.assertEqual(texte.returncode, 0, texte.stderr)
         self.assertIn("PSI", texte.stdout)
-        self.assertIn("lendable", texte.stdout)
+        self.assertIn("lendable   CPU 1.00 ; memory 2.0", texte.stdout)
+        self.assertIn("no offer: lends nothing", texte.stdout)
 
 
 if __name__ == "__main__":

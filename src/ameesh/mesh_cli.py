@@ -375,7 +375,8 @@ def _host_measure_lines(latest: dict, offer: dict | None) -> list[str]:
         out.append("  shares     CPU application %s, guest %s of %s ; guest memory %s" % (
             cpus(latest.get("app_cpu")), cpus(latest.get("guest_cpu")),
             latest.get("cpu_count") or "—", _fmt_bytes(latest.get("guest_mem_bytes"))))
-    lent = res.offered(latest, offer)
+    # without an offer the host lends nothing: show what it could lend
+    lent = res.offered(latest, offer if offer is not None else {})
     if lent is not None:
         out.append("  lendable   CPU %s ; memory %s ; disk %s  (%s)" % (
             cpus(lent["cpu"]), _fmt_bytes(lent["memory_bytes"]),
