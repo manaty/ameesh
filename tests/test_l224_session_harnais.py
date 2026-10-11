@@ -13,8 +13,10 @@ rapides et l'arrêt. Postgres réel ; faux harnais `claude`.
 from __future__ import annotations
 
 import dataclasses
+import errno
 import json
 import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -327,6 +329,76 @@ class RechercheIncompleteTest(_Verifie):
         _runner, worker = self._worker("cx-illisible", harness="codex")
         self._avec_session(worker, CodexTest.FIL)
         self.assertTrue(self._tour(worker, CODEX_HOME=home))
+        self.assertEqual(self._reprise("resume"), CodexTest.FIL)
+
+
+class _EntreeEIO:
+    """Un `DirEntry` dont `is_dir()` échoue en EIO (métadonnées illisibles)."""
+
+    def __init__(self, entry) -> None:
+        self._entry = entry
+        self.name, self.path = entry.name, entry.path
+
+    def is_dir(self, **_kw) -> bool:
+        raise OSError(errno.EIO, "Input/output error", self.path)
+
+    def is_symlink(self) -> bool:
+        return self._entry.is_symlink()
+
+
+class _ScandirEIO:
+    """`os.scandir` où l'entrée `cible` lève EIO sur `is_dir()`."""
+
+    def __init__(self, cible: str) -> None:
+        self.cible, self._scandir = cible, os.scandir
+
+    def __call__(self, path):
+        return _ScandirEIOIter(self._scandir(path), self.cible)
+
+
+class _ScandirEIOIter:
+    def __init__(self, it, cible: str) -> None:
+        self._it, self.cible = it, cible
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._it.close()
+
+    def __iter__(self):
+        for entry in self._it:
+            yield _EntreeEIO(entry) if entry.path == self.cible else entry
+
+
+def _eio_sur(chemin: str):
+    return mock.patch.object(reprise.os, "scandir", _ScandirEIO(chemin))
+
+
+class RechercheEIOTest(unittest.TestCase):
+    """Verdict codex #183 (3e relecture, P2) : une erreur de `is_dir()` sur
+    un dossier de date codex qui tient une session valide n'établit pas
+    « introuvable »."""
+
+    def test_codex_eio_sur_dossier_de_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _session_codex(tmp, CodexTest.FIL)
+            self.assertTrue(reprise.find_session("codex", tmp, CodexTest.FIL, strict=True))
+            jour = os.path.join(tmp, "sessions", "2026", "10", "11")
+            with _eio_sur(jour):
+                with self.assertRaises(reprise.SessionSearchIncomplete):
+                    reprise.find_session("codex", tmp, CodexTest.FIL, strict=True)
+                self.assertIsNone(reprise.find_session("codex", tmp, CodexTest.FIL))
+
+
+class CodexEIOSessionGardeeTest(_Verifie):
+    def test_codex_eio_session_gardee(self):
+        home = os.path.join(self.tmp, "codex-tour-eio")
+        _session_codex(home, CodexTest.FIL)
+        _runner, worker = self._worker("cx-eio", harness="codex")
+        self._avec_session(worker, CodexTest.FIL)
+        with _eio_sur(os.path.join(home, "sessions", "2026", "10", "11")):
+            self.assertTrue(self._tour(worker, CODEX_HOME=home))
         self.assertEqual(self._reprise("resume"), CodexTest.FIL)
 
 

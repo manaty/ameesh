@@ -111,15 +111,32 @@ def find_session(harness: str, home: str, session_id: str,
     if harness == "codex":
         suffix = "-%s.jsonl" % session_id
         found = []
-
-        def onerror(exc: OSError) -> None:
-            if strict:
-                raise SessionSearchIncomplete(
-                    "%s : %s" % (exc.filename or root, exc)) from exc
-        for base, _dirs, files in os.walk(root, onerror=onerror):
-            for name in files:
-                if name.startswith("rollout-") and name.endswith(suffix):
-                    found.append(os.path.join(base, name))
+        # Parcours explicite plutôt que os.walk : os.walk avale aussi les
+        # erreurs de `DirEntry.is_dir()` (verdict codex #183, 3e relecture).
+        pending = [root]
+        while pending:
+            base = pending.pop()
+            try:
+                with os.scandir(base) as it:
+                    entries = list(it)
+            except OSError as exc:
+                if strict:
+                    raise SessionSearchIncomplete("%s : %s" % (base, exc)) from exc
+                continue
+            for entry in entries:
+                try:
+                    is_dir = entry.is_dir()
+                    walk_into = is_dir and not entry.is_symlink()
+                except OSError as exc:
+                    if strict:
+                        raise SessionSearchIncomplete(
+                            "%s : %s" % (entry.path, exc)) from exc
+                    is_dir = walk_into = False
+                if walk_into:
+                    pending.append(entry.path)
+                elif not is_dir and entry.name.startswith("rollout-") \
+                        and entry.name.endswith(suffix):
+                    found.append(entry.path)
         return sorted(found)[-1] if found else None
     try:
         entries = sorted(os.listdir(root))
