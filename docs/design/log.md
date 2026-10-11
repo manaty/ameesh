@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-11 (radar de conflits)
+* **Étude** L160 (lot n° 170) : [radar de conflits et résolutions préparées avant la fusion](etudes/l160-radar-de-conflits.md) — mesures du 10/10 (ameesh : 11 PR sur 18 reprises à la main, la moitié des blocs en conflit sont deux ajouts au même endroit ; Nexlink : 39 min en médiane du feu de fusion à develop, 29 fusions de rattrapage) ; git suffit (fusions d'essai `merge-tree`, résolutions partagées par commits et rejouées par `rerere`, file de fusion tenue par ameesh), conventions additives d'abord ; lots L160a–L160h proposés, 28 h estimées.
+
 ## 2026-10-11 (courrier des sous-agents)
 * **Correctif** (L133, sans migration) : `agent-mail hook` remettait le courrier d'un agent à ses sous-agents (Claude Code les déclenche avec la session de l'agent), qui l'ignoraient, et le marquait livré : la session principale ne le recevait jamais (au moins cinq messages perdus les 10 et 11/10, relevé dans l'amendement de [0036](decisions/0036-auditeur-interne.md)). Une entrée de hook qui porte `agent_id` (sous-agent ou coéquipier de Claude Code, sous-agent de Codex) ne lit, ne remet, ne marque et n'écrit plus rien ; le courrier attend le prochain hook de la session principale. Limite : le harnais DeepSeek ne passe pas `agent_id` à ses hooks ordinaires. Voir [V1-MAILBOX-RUNNER.md](../V1-MAILBOX-RUNNER.md), section 6.
 
