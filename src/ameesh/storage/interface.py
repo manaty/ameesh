@@ -2093,6 +2093,12 @@ class TurnResources(Domain):
         exécuteur mort les a laissées derrière lui."""
 
     @abc.abstractmethod
+    def overlapping(self, host: str, since_ts: float, exclude_agent: str) -> list[dict]:
+        """#222 : les tours des autres agents de `host` qui ont pu tourner
+        depuis `since_ts` : encore ouverts, en délai de grâce ou finis après
+        `since_ts`, quel que soit l'état de leur bail."""
+
+    @abc.abstractmethod
     def churn(self, since_ts: float, short_s: float) -> list[dict]:
         """L125 : par agent (ordre du nom), les tours FINIS lancés depuis
         `since_ts` : `agent`, `turns`, `short_turns` (durée sous `short_s`

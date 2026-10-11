@@ -103,6 +103,10 @@ GIT_TIMEOUT = 20.0
 DEFAULT_ORPHAN_IDLE_S = 2 * 3600.0
 #: L162 : horizon des signalements relus par le passage (le journal en garde 30 j)
 ORPHAN_LOOKBACK_S = 7 * 24 * 3600.0
+#: #222 : une entrée de /tmp non attribuée, jamais supprimée, est signalée de
+#: nouveau par le passage périodique dès que sa dernière ligne a cet âge,
+#: pour rester dans la fenêtre de 24 h des alertes tant qu'elle existe
+UNATTRIBUTED_REFRESH_S = 12 * 3600.0
 #: L162 : nombre de plus grosses entrées de /tmp dites quand le tmpfs se remplit
 TMP_TOP = 5
 #: L162 : systèmes de fichiers en mémoire — jamais une racine gérée
@@ -1111,15 +1115,27 @@ def orphan_pass(db, host: str, policy: Policy, *, registered, protected: set,
         if not path or path in seen:
             continue
         seen.add(path)
-        if row.get("action") != "signaled" or not os.path.lexists(path):
+        if row.get("action") != "signaled":
             continue
         data = row.get("data") or {}
         base_item = {"kind": "orphan", "path": path, "agent": row.get("agent"),
                      "lot": row.get("lot")}
+        if not os.path.lexists(path):
+            if not row.get("agent") and not dry_run:
+                # #222 : le suivi d'une entrée non attribuée se clôt à sa disparition
+                entries.append(dict(base_item, action="gone", bytes=0, data=data,
+                                    detail="entrée non attribuée disparue de /tmp"))
+            continue
         action, why = _orphan_verdict(row, policy, base=base, registered=registered,
                                       protected=protected_real, running=running, now=now)
         size = size_of(path)
         plan.append(dict(base_item, action=action, bytes=size, detail=why))
+        if not row.get("agent") and not dry_run \
+                and now - float(row.get("at_ts") or 0) >= UNATTRIBUTED_REFRESH_S:
+            # #222 : jamais supprimée, une entrée non attribuée reste signalée,
+            # taille à jour, tant qu'elle est sur le disque (l'alerte lit 24 h)
+            entries.append(dict(base_item, action="signaled", bytes=size, data=data,
+                                detail=row.get("detail") or UNATTRIBUTED))
         item = {"path": path, "bytes": size, "agent": row.get("agent"),
                 "at_ts": row.get("at_ts"), "status": action, "detail": why,
                 "command": data.get("command") or "rm -rf -- %s" % shlex.quote(path)}
@@ -1512,10 +1528,10 @@ class Turn:
                 else "jamais supprimé automatiquement (orphan_cleanup: false)")
         found_all = new_tmp_entries(self.tmp_before, min_size=policy.orphan_min_size,
                                     exclude=exclude)
-        others, signaled = self._other_turns(db, host) if found_all else (None, set())
+        doubt, signaled = self._attribution(db, host) if found_all else ("", set())
         for found in found_all:
             if (found["path"], str(found["ino"]), str(found["dev"])) in signaled:
-                continue  # #222 : déjà signalée par le tour d'un autre agent
+                continue  # #222 : déjà signalée par un autre tour, son sort ne change plus
             entry = {
                 "kind": "orphan", "action": "signaled", "path": found["path"],
                 "bytes": found["bytes"], "agent": self.agent, "lot": lot,
@@ -1523,37 +1539,58 @@ class Turn:
                           "hors des dossiers gérés : %s" % (turn_id[:8], self.agent, sort),
                 "data": {"command": found["command"], "turn": turn_id,
                          "ino": found["ino"], "dev": found["dev"]}}
-            if others:
-                # #222 : /tmp est commun à l'hôte ; une entrée apparue pendant que
-                # d'autres agents tournaient peut être la leur (comme un worktree
-                # d'un autre agent, L73b) : non attribuée, donc jamais supprimée
+            if doubt:
+                # #222 : /tmp est commun à l'hôte ; une entrée qu'un autre tour a pu
+                # créer n'est pas imputée à celui-ci (comme un worktree d'un autre
+                # agent, L73b) : non attribuée, donc jamais supprimée
                 # (`_orphan_verdict` garde une entrée sans agent).
                 entry.update(agent=None, lot=None, detail=(
-                    "%s : apparu dans /tmp pendant le tour %s de %s, avec %s aussi en tour "
-                    "sur l'hôte ; jamais supprimé automatiquement"
-                    % (UNATTRIBUTED, turn_id[:8], self.agent, ", ".join(sorted(others)))))
+                    "%s : apparu dans /tmp pendant le tour %s de %s, %s ; jamais supprimé "
+                    "automatiquement" % (UNATTRIBUTED, turn_id[:8], self.agent, doubt)))
             self.entries.append(entry)
         return self.entries
 
-    def _other_turns(self, db, host: str) -> tuple[set | None, set]:
-        """#222 : (autres agents en tour sur `host`, entrées de /tmp déjà
-        signalées par le tour d'un autre agent depuis le début de celui-ci).
-        Sans base ou registre illisible : (None, vide), l'imputation d'avant."""
+    def _attribution(self, db, host: str) -> tuple[str, set]:
+        """#222 : (doute, entrées déjà signalées). Le tour ne s'impute ses
+        entrées de /tmp que si aucun autre tour, de ce mesh ou d'un autre, n'a
+        pu tourner sur l'hôte pendant sa fenêtre ; `doute` dit pourquoi ce
+        n'est pas prouvé ('' s'il l'est), et toute erreur en est un. Les
+        entrées déjà signalées par un autre tour, attribuées ou non (dernière
+        ligne de leur chemin, même inode), gardent leur sort."""
         if db is None or not host:
-            return None, set()
+            return "sans base pour savoir qui d'autre tournait", set()
         try:
-            others = {r["name"] for r in storage.of(db).operations.listing()
-                      if r["name"] != self.agent and r.get("host") == host
-                      and r.get("status") == "running" and r.get("lease_live")}
-            rows = storage.of(db).housekeeping.recent(
-                host, max(0.0, time.time() - self.started) + 60, 500, kind="orphan")
+            st = storage.of(db)
+            listing = st.operations.listing()
+            overlap = st.turn_resources.overlapping(host, self.started, self.agent)
+            rows = st.housekeeping.recent(host, ORPHAN_LOOKBACK_S, 500, kind="orphan")
+            root = tmp_root(self.cfg, self.policy)
+            names = os.listdir(root) if os.path.isdir(root) and _managed(root) else []
         except Exception:
-            return None, set()
-        signaled = {(r.get("path"), str((r.get("data") or {}).get("ino")),
-                     str((r.get("data") or {}).get("dev")))
-                    for r in rows
-                    if r.get("action") == "signaled" and r.get("agent") not in (None, self.agent)}
-        return others, signaled
+            return "registre, journal ou dossier temporaire illisible", set()
+        signaled: set = set()
+        seen: set = set()
+        for r in rows:   # la plus récente d'abord : la dernière ligne d'un chemin compte
+            if r.get("path") in seen:
+                continue
+            seen.add(r.get("path"))
+            if r.get("action") == "signaled" and r.get("agent") != self.agent:
+                data = r.get("data") or {}
+                signaled.add((r.get("path"), str(data.get("ino")), str(data.get("dev"))))
+        # un bail expiré ne prouve pas l'arrêt : seul le statut compte
+        others = {r["name"] for r in listing if r["name"] != self.agent
+                  and r.get("host") == host and r.get("status") == "running"}
+        others |= {r["agent"] for r in overlap}
+        if others:
+            return "avec %s aussi en tour sur l'hôte" % ", ".join(sorted(others)), signaled
+        # le registre ne voit pas les autres meshes du poste ; leurs agents
+        # laissent leur dossier sous la racine temporaire commune
+        registered = {r["name"] for r in listing} | {self.agent}
+        foreign = sorted(n for n in names if n != MARKER and n not in registered)
+        if foreign:
+            return ("sur un hôte partagé avec un autre mesh (dossier temporaire %s hors du "
+                    "registre)" % foreign[0]), signaled
+        return "", signaled
 
 
 # --------------------------------------------------------------------------

@@ -208,7 +208,7 @@ class PressionDuTmpfsTest(unittest.TestCase):
 
 class ImputationSansBaseTest(_Systeme, unittest.TestCase):
     """#222 : à qui imputer une entrée de /tmp apparue pendant le tour ;
-    registre et journal du ménage simulés."""
+    registre, tours et journal du ménage simulés."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="l222-")
@@ -217,11 +217,15 @@ class ImputationSansBaseTest(_Systeme, unittest.TestCase):
         self.cfgl = _Cfg(os.path.join(self.tmp, "etat"))
         self.pol = menage.Policy(orphan_min_size=1)
 
-    def _fin(self, listing: list, recent=lambda chemin: []) -> tuple[str, list]:
+    def _fin(self, listing, recent=lambda chemin: [], overlap=()) -> tuple[str, list]:
         """Un tour de a1 pendant lequel une entrée apparaît dans le faux /tmp."""
         chemin = os.path.join(self.sys, "codex3-94a-r2")
         fausse = mock.Mock()
-        fausse.operations.listing.return_value = listing
+        if isinstance(listing, Exception):
+            fausse.operations.listing.side_effect = listing
+        else:
+            fausse.operations.listing.return_value = listing
+        fausse.turn_resources.overlapping.return_value = list(overlap)
         fausse.housekeeping.recent.side_effect = lambda *a, **k: recent(chemin)
         tour = menage.Turn.begin(self.cfgl, self.pol, "a1", None, new_session=False,
                                  base_env={})
@@ -230,21 +234,43 @@ class ImputationSansBaseTest(_Systeme, unittest.TestCase):
             entries = tour.end(lot="9", turn_id="t" * 32, db=object(), host="pc")
         return chemin, [e for e in entries if e["kind"] == "orphan"]
 
-    def test_autre_agent_en_tour_sur_l_hote_entree_non_attribuee(self):
-        chemin, signale = self._fin([
-            {"name": "a2", "host": "pc", "status": "running", "lease_live": True},
-            {"name": "a3", "host": "ailleurs", "status": "running", "lease_live": True},
-            {"name": "a4", "host": "pc", "status": "idle", "lease_live": True}])
+    def _non_attribuee(self, signale: list, chemin: str, raison: str) -> None:
         self.assertEqual([(e["path"], e["agent"], e["lot"]) for e in signale],
                          [(chemin, None, None)])
         self.assertIn(menage.UNATTRIBUTED, signale[0]["detail"])
-        self.assertIn("avec a2 aussi en tour", signale[0]["detail"])
+        self.assertIn(raison, signale[0]["detail"])
 
     def test_seul_en_tour_entree_imputee_comme_avant(self):
         chemin, signale = self._fin([
-            {"name": "a1", "host": "pc", "status": "running", "lease_live": True}])
+            {"name": "a1", "host": "pc", "status": "running", "lease_live": True},
+            {"name": "a3", "host": "ailleurs", "status": "running", "lease_live": True},
+            {"name": "a4", "host": "pc", "status": "idle", "lease_live": True}])
         self.assertEqual([(e["path"], e["agent"], e["lot"]) for e in signale],
                          [(chemin, "a1", "9")])
+
+    def test_autre_agent_en_tour_sur_l_hote_entree_non_attribuee(self):
+        chemin, signale = self._fin([
+            {"name": "a2", "host": "pc", "status": "running", "lease_live": True}])
+        self._non_attribuee(signale, chemin, "avec a2 aussi en tour")
+
+    def test_bail_expire_ne_prouve_pas_l_arret(self):
+        chemin, signale = self._fin([
+            {"name": "a2", "host": "pc", "status": "running", "lease_live": False}])
+        self._non_attribuee(signale, chemin, "avec a2 aussi en tour")
+
+    def test_tour_d_un_autre_agent_dans_la_fenetre_entree_non_attribuee(self):
+        chemin, signale = self._fin([], overlap=[{"agent": "a5"}])
+        self._non_attribuee(signale, chemin, "avec a5 aussi en tour")
+
+    def test_erreur_de_lecture_entree_non_attribuee(self):
+        chemin, signale = self._fin(RuntimeError("base injoignable"))
+        self._non_attribuee(signale, chemin, "illisible")
+
+    def test_hote_partage_avec_un_autre_mesh_entree_non_attribuee(self):
+        os.makedirs(os.path.join(menage.tmp_root(self.cfgl, self.pol), "agent-ailleurs"))
+        chemin, signale = self._fin([
+            {"name": "a1", "host": "pc", "status": "running", "lease_live": True}])
+        self._non_attribuee(signale, chemin, "autre mesh")
 
     def test_deja_signalee_par_le_tour_d_un_autre_agent_pas_reprise(self):
         def recent(chemin):
@@ -252,6 +278,15 @@ class ImputationSansBaseTest(_Systeme, unittest.TestCase):
             return [{"path": chemin, "action": "signaled", "agent": "a2",
                      "data": {"ino": st.st_ino, "dev": st.st_dev}}]
         _chemin, signale = self._fin([], recent)
+        self.assertEqual(signale, [])
+
+    def test_deja_non_attribuee_le_reste(self):
+        def recent(chemin):
+            st = os.lstat(chemin)
+            return [{"path": chemin, "action": "signaled", "agent": None,
+                     "data": {"ino": st.st_ino, "dev": st.st_dev}}]
+        _chemin, signale = self._fin([
+            {"name": "a1", "host": "pc", "status": "running", "lease_live": True}], recent)
         self.assertEqual(signale, [])
 
 
@@ -262,7 +297,8 @@ class ImputationSansBaseTest(_Systeme, unittest.TestCase):
 class AbandonDbTest(_Systeme, PgTestCase):
     def setUp(self) -> None:
         super().setUp()
-        for table in ("housekeeping_log", "managed_worktrees", "host_resources"):
+        for table in ("housekeeping_log", "managed_worktrees", "host_resources",
+                      "turn_resources"):
             self.db.execute("DELETE FROM %s" % table)
         self.cfgl = _Cfg(self.state)
         self.cfgl.host = self.cfg.host
