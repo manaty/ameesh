@@ -648,8 +648,12 @@ class ClaudeStream(StreamReader):
     def parse_event(self, event: dict) -> dict:
         kind = event.get("type")
         out: dict = {}
+        # L166 : un événement de sous-agent (outil Agent/Task) ne donne jamais
+        # la session de l'agent
+        principal = not event.get("parent_tool_use_id")
         if kind == "system" and event.get("subtype") == "init":
-            out["session"] = event.get("session_id")
+            if principal:
+                out["session"] = event.get("session_id")
             if event.get("model"):
                 out["model"] = event["model"]  # modèle effectif annoncé (L13 B4)
         elif kind == "assistant":
@@ -682,7 +686,7 @@ class ClaudeStream(StreamReader):
                 out["cost"] = float(event["total_cost_usd"])
             if isinstance(event.get("usage"), dict):
                 out["usage"] = event["usage"]  # rotation de session (0018)
-            if event.get("session_id"):
+            if event.get("session_id") and principal:
                 out["session"] = event["session_id"]
             if event.get("is_error"):
                 out["error"] = event.get("subtype") or "erreur du harnais"
@@ -717,6 +721,24 @@ class CodexStream(StreamReader):
         return out
 
 
+#: L166 : refus de dsh de reprendre une session fille (`assertAdoptable` du
+#: lanceur sans interface : en-tête `origin: "subagent"` ou `parentSession`)
+CHILD_SESSION_REFUSAL = "is a subagent or forked session"
+
+
+def child_session(event: Mapping) -> bool:
+    """L166 : l'événement de session désigne-t-il une session fille ? (champs
+    de l'en-tête de session de dsh, s'ils sont publiés)"""
+    return (event.get("origin") == "subagent"
+            or bool(event.get("parentSession") or event.get("parentSessionId")
+                    or event.get("parent_session_id")))
+
+
+def child_session_refused(error: str | None) -> bool:
+    """L166 : l'erreur du tour est-elle le refus de reprendre une session fille ?"""
+    return bool(error) and CHILD_SESSION_REFUSAL in str(error)
+
+
 class DshStream(StreamReader):
     """Flux JSON du harnais DeepSeek (dsh).
 
@@ -734,7 +756,10 @@ class DshStream(StreamReader):
                 out["call_usage"] = event["usage"]  # L105 : une étape = un appel
             out["safe_point"] = True  # L105 : fin d'étape, outils compris
         elif kind == "session":
-            out["session"] = event.get("sessionId") or event.get("session_id")
+            # L166 : une session fille (sous-agent, fourche) n'est jamais
+            # retenue ; dsh refuserait de la reprendre
+            if not child_session(event):
+                out["session"] = event.get("sessionId") or event.get("session_id")
             if event.get("model"):
                 out["model"] = event["model"]  # modèle effectif annoncé (L13 B4)
         elif kind == "text":
