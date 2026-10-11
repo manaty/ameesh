@@ -344,7 +344,7 @@ def rotate(worker, harness: str, old, new, session: str) -> bool:
         try:
             if worker.run_turn({"kind": "prompt", "prompt": adapters.SUMMARY_PROMPT,
                                 "ids": []}):
-                resume = (worker.last_output or "").strip()
+                resume = worker.turn_summary()  # L218 : entier, borné
         finally:
             worker._account_override = None
     sans_resume = not resume
