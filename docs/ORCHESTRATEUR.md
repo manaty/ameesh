@@ -168,8 +168,8 @@ ferme l'issue avec un commentaire qui dit pourquoi. L'issue d'un lot est son
 `issue_ref` (`ameesh work show <id>`), utilisable avec `--lot`.
 
 * Ne jamais créer à la main l'issue d'un lot : créer le lot (`--new-lot`,
-  `ameesh work add`). Son issue suit au passage suivant d'`ameesh notify`,
-  en moins d'une minute.
+  `ameesh work add`, avec `--estimate`). Son issue suit au passage suivant
+  d'`ameesh notify`, en moins d'une minute.
 * Une PR qui livre un lot porte ces deux lignes dans sa **description** :
 
   ```
@@ -236,7 +236,7 @@ Quand des agents réveillables restent au repos sans lot pendant que du
 travail attend, `ameesh notify` envoie à l'orchestrateur un courrier `event`
 d'`ameesh` : la liste des agents au repos de son équipe et des lots ouverts
 sans agent. Réponse attendue : leur confier ces lots (`--lot`), ou en créer
-(`--new-lot`). Un même épisode n'est envoyé qu'une fois.
+(`--new-lot … --estimate`). Un même épisode n'est envoyé qu'une fois.
 
 ## Le courrier « Courrier en souffrance »
 

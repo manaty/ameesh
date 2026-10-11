@@ -358,6 +358,7 @@ Un lot de cause suit ce gabarit :
 
 ```sh
 ameesh work add --type bug --source auditeur --assignee auditeur \
+  --estimate <durée, p. ex. 2h> --estimate-source "<historique bug ×…, ou conception>" \
   --title "<la racine, en une ligne>" --branch auditeur/<sujet> --body "$(cat <<'FIN'
 Perte : <durée> sur <période> ; mesure : <requête ou commande, à refaire après le déploiement>
 Chaîne : <les maillons, chacun avec sa preuve>
