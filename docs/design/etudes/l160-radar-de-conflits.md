@@ -192,8 +192,8 @@ GitHub Enterprise Cloud : pas Nexlink, au forfait gratuit, qui fusionne en
 local de toute façon. Équivalents : trains de GitLab, Zuul, Mergify. Une file ne
 résout aucun conflit : elle retire le lot.
 
-**Verdict** : le principe est retenu, mis en œuvre par ameesh, la même pour une
-équipe à PR et une équipe qui fusionne en local.
+**Verdict** : principe retenu ; la file est tenue par ameesh, la même pour une
+équipe à PR et pour une équipe qui fusionne en local.
 
 ## Pilote de fusion syntaxique
 
@@ -201,14 +201,20 @@ Mergiraf fusionne par arbre syntaxique (tree-sitter) : deux ajouts dans un
 ensemble dont l'ordre ne compte pas (imports, membres d'une classe, clés d'un
 objet JSON, selon ce que déclare chaque langage) ne sont plus en conflit. Il
 comprend Python, TypeScript, JSON, YAML et TOML, mais ni SQL ni Markdown, et
-rien à l'intérieur d'une chaîne (`ITEM_COLUMNS` est une chaîne SQL). Il s'installe comme pilote git (`merge.mergiraf.driver "mergiraf merge
---git %O %A %B -s %S -x %X -y %Y -p %P -l %L"`, `*.py merge=mergiraf` dans
-`.gitattributes`) ; ce qu'il ne sait pas fusionner reste en conflit, comme
-avant. GitHub ne lance aucun pilote externe : il ne vaut que pour les fusions
-faites en local, ce qui est le cas des reprises. Le pilote `union` intégré à git
-garde les deux côtés d'un fichier fait de lignes indépendantes, au risque de les
-entremêler. `merge.conflictStyle=zdiff3` montre la base dans les marqueurs et
-aide l'agent qui résout.
+rien à l'intérieur d'une chaîne (`ITEM_COLUMNS` est une chaîne SQL). Il
+s'installe comme pilote git :
+
+```
+git config merge.mergiraf.driver "mergiraf merge --git %O %A %B -s %S -x %X -y %Y -p %P -l %L"
+echo '*.py merge=mergiraf' >> .gitattributes
+```
+
+Ce qu'il ne sait pas fusionner reste en conflit, comme avant. GitHub ne lance
+aucun pilote externe : il ne vaut que pour les fusions faites en local, ce qui
+est le cas des reprises. Le pilote `union` intégré à git garde les deux côtés
+d'un fichier fait de lignes indépendantes, au risque de les entremêler.
+`merge.conflictStyle=zdiff3` montre la base dans les marqueurs et aide l'agent
+qui résout.
 
 **Verdict** : pilote à mesurer sur les 103 fusions en conflit rejouées avant
 de l'adopter ; jamais pour SQL ni Markdown.
