@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
-# Reapply an existing executor role after migrations, as the schema owner.
+# Reapply an existing executor role after migrations, as the migration owner.
 # Usage: role-executor.sh '<owner DSN>' [executor-role]
 # PGOPTIONS must select the mesh schema. Never prints the DSN or creates logins.
 set -euo pipefail

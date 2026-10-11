@@ -1,6 +1,6 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
 -- L56: executor data access, without schema or database administration.
--- Apply as the schema owner, with the mesh schema first in search_path:
+-- Apply as the migration owner, with the mesh schema first in search_path:
 --   PGOPTIONS='-c search_path=<schema>' psql '<owner DSN>' -X \
 --     -v ON_ERROR_STOP=1 [-v role=ameesh_executor] -f deploy/sql/role-executor.sql
 -- NOLOGIN group role; each host uses a separate LOGIN member.
@@ -20,8 +20,13 @@ DO $owner$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_namespace
                     WHERE nspname = current_setting('ameesh.schema')
-                      AND nspowner = current_user::regrole) THEN
-        RAISE EXCEPTION 'Apply role-executor.sql as the schema owner';
+                      AND pg_has_role(current_user, nspowner, 'USAGE')) THEN
+        RAISE EXCEPTION 'Apply role-executor.sql as the migration owner with schema ownership rights';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = current_setting('ameesh.schema')
+                      AND c.relname = 'agent_registry' AND c.relowner = current_user::regrole) THEN
+        RAISE EXCEPTION 'Apply role-executor.sql as the migration owner (agent_registry owner)';
     END IF;
 END
 $owner$;
@@ -50,12 +55,20 @@ DECLARE
     violations text[] := '{}';
     parent record;
     item record;
+    privilege text;
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r AND rolcanlogin) THEN
         violations := array_append(violations, 'executor group must be NOLOGIN');
     END IF;
     -- MEMBER also catches NOINHERIT paths: SET ROLE must not evade the audit.
     FOR parent IN SELECT * FROM pg_roles WHERE pg_has_role(r, oid, 'MEMBER') LOOP
+        -- Predefined roles carry capabilities without administrative attributes.
+        IF parent.rolname IN ('pg_read_server_files', 'pg_write_server_files',
+                             'pg_execute_server_program', 'pg_signal_backend',
+                             'pg_checkpoint', 'pg_maintain', 'pg_create_subscription',
+                             'pg_read_all_data', 'pg_write_all_data') THEN
+            violations := violations || format('privileged predefined role %s', parent.rolname);
+        END IF;
         IF parent.rolsuper OR parent.rolcreatedb OR parent.rolcreaterole
            OR parent.rolbypassrls OR parent.rolreplication THEN
             violations := violations || format('administrative attributes on role %s', parent.rolname);
@@ -78,6 +91,16 @@ BEGIN
             violations := violations || format('TEMP on database %s through %s (including PUBLIC)',
                                                current_database(), parent.rolname);
         END IF;
+        FOR item IN SELECT c.oid, c.relname FROM pg_class c
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = s AND c.relkind IN ('r', 'p', 'v', 'm', 'f') LOOP
+            FOREACH privilege IN ARRAY ARRAY['TRIGGER', 'TRUNCATE', 'REFERENCES', 'MAINTAIN'] LOOP
+                IF has_table_privilege(parent.oid, item.oid, privilege) THEN
+                    violations := violations || format('%s on table %s through %s',
+                                                       privilege, item.relname, parent.rolname);
+                END IF;
+            END LOOP;
+        END LOOP;
         IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname = s AND pg_has_role(parent.oid, c.relowner, 'MEMBER'))
            OR EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -89,10 +112,36 @@ BEGIN
                 WHERE n.nspname = s AND p.prosecdef AND has_function_privilege(r, p.oid, 'EXECUTE')) THEN
         violations := array_append(violations, 'executable SECURITY DEFINER function in mesh schema');
     END IF;
-    -- Comma-separated privilege strings mean ANY, so test every data right.
-    FOR item IN SELECT unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE']) AS privilege LOOP
-        IF NOT has_table_privilege(r, format('%I.agent_registry', s), item.privilege) THEN
-            violations := violations || format('missing %s on agent_registry', item.privilege);
+    -- Both global and schema defaults apply to future objects. Check every
+    -- creator able to create in the mesh, including PUBLIC and SET ROLE paths.
+    FOR item IN SELECT d.defaclrole, acl.privilege_type FROM pg_default_acl d
+                CROSS JOIN LATERAL aclexplode(d.defaclacl) acl
+                WHERE d.defaclobjtype = 'r'
+                  AND d.defaclnamespace IN (0, (SELECT oid FROM pg_namespace WHERE nspname = s))
+                  AND has_schema_privilege(d.defaclrole, s, 'CREATE')
+                  AND acl.privilege_type IN ('TRIGGER', 'TRUNCATE', 'REFERENCES', 'MAINTAIN')
+                  AND (acl.grantee = 0 OR EXISTS (SELECT 1 FROM pg_roles
+                       WHERE oid = acl.grantee AND pg_has_role(r, oid, 'MEMBER'))) LOOP
+        violations := violations || format('unsafe default %s for creator %s',
+                                           item.privilege_type, pg_get_userbyid(item.defaclrole));
+    END LOOP;
+    -- Comma-separated privilege strings mean ANY, so test every data right
+    -- separately for every relation; GRANT can warn and leave objects missing.
+    FOR item IN SELECT c.oid, c.relname, c.relkind FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = s AND c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S') LOOP
+        IF item.relkind = 'S' THEN
+            FOREACH privilege IN ARRAY ARRAY['USAGE', 'SELECT', 'UPDATE'] LOOP
+                IF NOT has_sequence_privilege(r, item.oid, privilege) THEN
+                    violations := violations || format('missing %s on sequence %s', privilege, item.relname);
+                END IF;
+            END LOOP;
+        ELSE
+            FOREACH privilege IN ARRAY ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE'] LOOP
+                IF NOT has_table_privilege(r, item.oid, privilege) THEN
+                    violations := violations || format('missing %s on table %s', privilege, item.relname);
+                END IF;
+            END LOOP;
         END IF;
     END LOOP;
     IF cardinality(violations) > 0 THEN

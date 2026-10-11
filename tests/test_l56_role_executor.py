@@ -84,8 +84,11 @@ class RoleExecutorTest(PgTestCase):
                 cls.db.execute("DROP ROLE %s" % db_mod.quote_ident(name))
 
     @classmethod
-    def run_script(cls, role: str) -> subprocess.CompletedProcess:
-        env = dict(os.environ, PGOPTIONS="-c search_path=%s" % cls.schema)
+    def run_script(cls, role: str, *, schema=None, applying_role=None) -> subprocess.CompletedProcess:
+        options = "-c search_path=%s" % (schema or cls.schema)
+        if applying_role:
+            options += " -c role=%s" % applying_role
+        env = dict(os.environ, PGOPTIONS=options)
         return subprocess.run(["psql", cls.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
                                "-v", "role=%s" % role, "-f", ROLE_SQL],
                               capture_output=True, text=True, timeout=60, env=env)
@@ -168,6 +171,105 @@ class RoleExecutorTest(PgTestCase):
             self.db.execute("ALTER ROLE %s INHERIT" % q(self.role))
             self.db.execute("DROP OWNED BY %s" % q(parent))
             self.db.execute("DROP ROLE %s" % q(parent))
+
+    def test_privileged_predefined_roles_are_rejected(self):
+        q = db_mod.quote_ident
+        for parent in ('pg_execute_server_program', 'pg_read_server_files', 'pg_write_server_files'):
+            with self.subTest(parent=parent):
+                self.db.execute("GRANT %s TO %s" % (q(parent), q(self.role)))
+                try:
+                    result = self.run_script(self.role)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('privileged predefined role ' + parent, result.stderr)
+                finally:
+                    self.db.execute("REVOKE %s FROM %s" % (q(parent), q(self.role)))
+
+    def test_unsafe_table_and_default_privileges_are_rejected(self):
+        q = db_mod.quote_ident
+        parent = 't_acl_parent_' + uuid.uuid4().hex[:8]
+        self.db.execute('CREATE ROLE %s NOLOGIN' % q(parent))
+        self.db.execute('GRANT %s TO %s' % (q(parent), q(self.role)))
+        self.db.execute('ALTER ROLE %s NOINHERIT' % q(self.role))
+        try:
+            for grantee in ('PUBLIC', q(self.role), q(parent)):
+                for privilege in ('TRIGGER', 'TRUNCATE'):
+                    with self.subTest(grantee=grantee, privilege=privilege):
+                        grant = '%s ON TABLE agent_mailbox TO %s' % (privilege, grantee)
+                        self.db.execute('GRANT ' + grant)
+                        try:
+                            result = self.run_script(self.role)
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertIn(privilege + ' on table agent_mailbox', result.stderr)
+                        finally:
+                            self.db.execute('REVOKE ' + grant.replace(' TO ', ' FROM '))
+                        for scope in ('', ' IN SCHEMA ' + q(self.schema)):
+                            grant = '%s ON TABLES TO %s' % (privilege, grantee)
+                            self.db.execute('ALTER DEFAULT PRIVILEGES%s GRANT %s' % (scope, grant))
+                            try:
+                                result = self.run_script(self.role)
+                                self.assertNotEqual(result.returncode, 0)
+                                self.assertIn('unsafe default ' + privilege, result.stderr)
+                            finally:
+                                self.db.execute('ALTER DEFAULT PRIVILEGES%s REVOKE %s' % (
+                                    scope, grant.replace(' TO ', ' FROM ')))
+        finally:
+            self.db.execute('ALTER ROLE %s INHERIT' % q(self.role))
+            self.db.execute('REVOKE %s FROM %s' % (q(parent), q(self.role)))
+            self.db.execute('DROP ROLE %s' % q(parent))
+
+    def test_database_owner_and_incomplete_grants(self):
+        """Real migration creator with pg_database_owner schema ownership.
+
+        Applying without grant options must reject any missing table/sequence
+        rights instead of committing after GRANT warnings.
+        """
+        q = db_mod.quote_ident
+        suffix = uuid.uuid4().hex[:8]
+        creator, other, executor = ('t_creator_' + suffix, 't_other_' + suffix, 't_exec_' + suffix)
+        schema = 't_owned_' + suffix
+        old_owner = self.db.query('SELECT pg_get_userbyid(datdba) AS name FROM pg_database WHERE datname = %s',
+                                  (self.database,))[0]['name']
+        for role in (creator, other, executor):
+            self.db.execute('CREATE ROLE %s NOLOGIN' % q(role))
+        try:
+            self.db.execute('ALTER DATABASE %s OWNER TO %s' % (q(self.database), q(creator)))
+            self.db.execute('CREATE SCHEMA %s AUTHORIZATION pg_database_owner' % q(schema))
+            self.db.execute('SET ROLE %s' % q(creator))
+            try:
+                self.db.execute('CREATE TABLE %s.agent_registry (id serial PRIMARY KEY)' % q(schema))
+                self.db.execute('CREATE TABLE %s.ci_runs (id int)' % q(schema))
+                self.db.execute('CREATE SEQUENCE %s.estimate_references_id_seq' % q(schema))
+            finally:
+                self.db.execute('RESET ROLE')
+            result = self.run_script(executor, schema=schema, applying_role=creator)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = self.db.query('SELECT pg_get_userbyid(defaclrole) AS name FROM pg_default_acl '
+                                 'WHERE defaclnamespace = (SELECT oid FROM pg_namespace WHERE nspname = %s)',
+                                 (schema,))
+            self.assertTrue(rows)
+            self.assertEqual({row['name'] for row in rows}, {creator})
+            for kind, name, privileges in (
+                ('TABLE', 'ci_runs', 'SELECT, INSERT, UPDATE, DELETE'),
+                ('SEQUENCE', 'estimate_references_id_seq', 'USAGE, SELECT, UPDATE')):
+                with self.subTest(kind=kind):
+                    obj = '%s.%s' % (q(schema), q(name))
+                    self.db.execute('ALTER %s %s OWNER TO %s' % (kind, obj, q(other)))
+                    self.db.execute('REVOKE ALL ON %s %s FROM %s' % (kind, obj, q(executor)))
+                    self.db.execute('GRANT %s ON %s %s TO %s' % (privileges, kind, obj, q(creator)))
+                    result = self.run_script(executor, schema=schema, applying_role=creator)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('missing', result.stderr)
+                    self.assertIn(name, result.stderr)
+                    self.db.execute('ALTER %s %s OWNER TO %s' % (kind, obj, q(creator)))
+                    result = self.run_script(executor, schema=schema, applying_role=creator)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            self.db.execute('RESET ROLE')
+            self.db.execute('ALTER DATABASE %s OWNER TO %s' % (q(self.database), q(old_owner)))
+            self.db.execute('DROP SCHEMA IF EXISTS %s CASCADE' % q(schema))
+            for role in (executor, other, creator):
+                self.db.execute('DROP OWNED BY %s' % q(role))
+                self.db.execute('DROP ROLE %s' % q(role))
 
     def test_future_objects_receive_data_grants(self):
         self.db.execute("CREATE TABLE executor_future (id bigserial PRIMARY KEY, body text)")

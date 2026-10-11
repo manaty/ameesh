@@ -197,7 +197,7 @@ migrer_base() {
   ameesh_de "$cible" doctor --probe
 }
 
-# The remote administrator switches to the actual schema owner so future
+# The remote administrator switches to the actual migration owner so future
 # migration objects receive the owner's default privileges, not postgres's.
 reapply_executor_role() {
   local exists
@@ -210,8 +210,9 @@ SQL
     {
       cat <<'SQL'
 \set ON_ERROR_STOP on
-SELECT format('SET ROLE %I', pg_get_userbyid(nspowner))
-FROM pg_namespace WHERE nspname = current_schema() \gexec
+SELECT format('SET ROLE %I', pg_get_userbyid(c.relowner))
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = current_schema() AND c.relname = 'agent_registry' \gexec
 SQL
       cat "$DEPOT/deploy/sql/role-executor.sql"
     } | ssh_vm "runuser -u postgres -- psql -X -q -d ameesh -v ON_ERROR_STOP=1 -v role=$EXECUTOR_ROLE -f -"
