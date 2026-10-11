@@ -228,6 +228,30 @@ def open_fd_count() -> int:
     raise NotAvailable("descripteurs ouverts", "ni psutil (POSIX) ni /proc")
 
 
+#: descriptors of this process, always the real `/proc` (not `PROC`, which
+#: the tests replace by a fake process table)
+SELF_FD = "/proc/self/fd"
+
+
+def fd_path(fd: int) -> str:
+    """The path the kernel gives for the open directory or file `fd` of this
+    process (L230: is a descriptor still where it was planned?). Linux:
+    `/proc/self/fd/N`; macOS: `F_GETPATH`. `NotAvailable` elsewhere, or if
+    the descriptor's file is deleted."""
+    from . import is_linux
+    import fcntl
+    if is_linux() and os.path.isdir(SELF_FD):
+        target = os.readlink(os.path.join(SELF_FD, str(fd)))
+    elif hasattr(fcntl, "F_GETPATH"):
+        raw = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024)
+        target = raw.split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
+    else:
+        raise NotAvailable("chemin d'un descripteur", "ni /proc ni F_GETPATH")
+    if not target.startswith("/") or target.endswith(" (deleted)"):
+        raise NotAvailable("chemin d'un descripteur", "fichier supprimé ou hors arborescence")
+    return target
+
+
 # --------------------------------------------------------------------------
 # table des processus, groupes, sous-moissonneur (travail de fond d'un tour)
 # --------------------------------------------------------------------------
@@ -483,3 +507,117 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False) -> list[dict]:
         if row:
             found.append(row)
     return found
+
+
+# --------------------------------------------------------------------------
+# where the user's processes are (L230)
+# --------------------------------------------------------------------------
+
+#: never readable (not dumpable) and never inside a worktree: the user's
+#: service manager (`systemd --user`, cwd `/`)
+SERVICE_MANAGER = frozenset({"systemd", "(sd-pam)"})
+
+
+class UserPaths:
+    """Snapshot of the user's processes: real paths of their cwd, executable,
+    open and mapped files (`paths`: path -> "pid name"), the processes that
+    could not be read (`unreadable`), those of them let through by name
+    (`allowed`), and whether the table could be read at all (`available`)."""
+
+    def __init__(self, available: bool = True):
+        self.paths: dict = {}
+        self.unreadable: list = []
+        self.allowed: list = []
+        self.available = available
+
+    def doubt(self) -> str:
+        """Why nothing can be judged free of processes, or ''."""
+        if not self.available:
+            return "process table unreadable on this host"
+        if self.unreadable:
+            return "process(es) of the user unreadable: %s" % ", ".join(self.unreadable[:5])
+        return ""
+
+    def holders(self, root: str) -> list:
+        root = os.path.realpath(root).rstrip(os.sep)
+        prefix = root + os.sep
+        return sorted({who for path, who in self.paths.items()
+                       if path == root or path.startswith(prefix)})
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _link(path: str) -> str:
+    target = os.readlink(path)
+    if target.endswith(" (deleted)"):
+        target = target[:-len(" (deleted)")]
+    return target if target.startswith("/") else ""
+
+
+def user_paths(uid: int | None = None, allow=()) -> UserPaths:
+    """Where the processes of `uid` (default: this user) are, from `/proc`.
+
+    A process gone meanwhile is ignored. One that cannot be read (not
+    dumpable: setuid, file capabilities) is a doubt, unless its name (`comm`)
+    AND the base name of its `argv[0]` are both in `allow` or the service
+    manager: its `exe` link is unreadable too, its command line is not.
+    Without `/proc` (other OS), `available` is false."""
+    if not _proc_ok():
+        return UserPaths(available=False)
+    uid = os.getuid() if uid is None else uid
+    allow = SERVICE_MANAGER | set(allow or ())
+    out = UserPaths()
+    try:
+        pids = [p for p in os.listdir(PROC) if p.isdigit()]
+    except OSError:
+        return UserPaths(available=False)
+    for pid in pids:
+        base = os.path.join(PROC, pid)
+        try:
+            if os.lstat(base).st_uid != uid:
+                continue
+        except OSError:
+            continue
+        name = _read_text(os.path.join(base, "comm")).strip() or "?"
+        who = "%s %s" % (pid, name)
+        found = []
+        try:
+            found.append(_link(os.path.join(base, "cwd")))
+            for link in ("exe", "root"):
+                try:
+                    found.append(_link(os.path.join(base, link)))
+                except FileNotFoundError:
+                    pass
+            for fd in os.listdir(os.path.join(base, "fd")):
+                try:
+                    found.append(_link(os.path.join(base, "fd", fd)))
+                except FileNotFoundError:
+                    continue
+            with open(os.path.join(base, "maps"), encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    parts = line.rstrip("\n").split(None, 5)
+                    if len(parts) == 6 and parts[5].startswith("/"):
+                        path = parts[5]
+                        found.append(path[:-len(" (deleted)")] if path.endswith(" (deleted)")
+                                     else path)
+        except (FileNotFoundError, ProcessLookupError):
+            continue   # gone meanwhile
+        except OSError:
+            argv0 = _read_text(os.path.join(base, "cmdline")).split("\0", 1)[0]
+            if name in allow and os.path.basename(argv0) in allow:
+                if name not in SERVICE_MANAGER:
+                    out.allowed.append(who)
+            else:
+                out.unreadable.append(who)
+            continue
+        for path in found:
+            # `root` is `/` for every process: it only tells a chroot apart
+            if path and path != "/":
+                out.paths.setdefault(os.path.realpath(path), who)
+    return out
