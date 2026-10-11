@@ -347,6 +347,12 @@ class AgentWorker(threading.Thread):
         #: plafond pendant le tour) et sous-agents (pour information)
         self.last_turn_main_reread = 0
         self.last_turn_subagent_reread = 0
+        #: L217b : la mesure de la rotation entre deux tours, celle du plafond
+        #: (fil principal relevé dans le flux), et sa session ; None = pas de
+        #: relevé d'appel dans le flux (harnais sans usage par appel, tour de
+        #: résumé, worker relancé) : repli sur le grand livre
+        self.last_turn_context: int | None = None
+        self.last_turn_context_session: str | None = None
         #: plafonds du tour (L105) : le tour suivant reprend le travail d'un
         #: tour clos (raison), et la rotation forcée par le plafond de contexte
         #: atteint pendant un tour (raison) attend le prochain passage entre deux tours
@@ -926,6 +932,7 @@ class AgentWorker(threading.Thread):
         self.session_turns = 0
         self.session_tokens = 0.0
         self.last_turn_reread = 0
+        self.last_turn_context = None
         self.nudged = False
         self.suite = self.rotation_forcee = None  # L105 : la session neuve part du brief
         self.agent = registry.get(self.db, self.name) or self.agent
@@ -1018,11 +1025,23 @@ class AgentWorker(threading.Thread):
             return "durée maximale du tour : %ds (plafond %ds)" % (int(ecoule), duree_max)
         return None
 
+    def last_turn_context_reread(self) -> tuple[int, str | None]:
+        """Jetons relus au dernier tour au sens du plafond de contexte, et leur
+        session (L217b) : le fil principal relevé dans le flux, le compteur
+        même du plafond pendant le tour (les sous-agents n'y sont pas, ni
+        pour un tour clos avant son `result`) ; sans relevé dans le flux, le
+        dernier tour inscrit au grand livre (L60)."""
+        if self.last_turn_context is not None:
+            return self.last_turn_context, self.last_turn_context_session
+        return self.last_turn_reread, self.last_turn_reread_session
+
     def context_rotation_due(self) -> bool:
         """Le dernier tour a-t-il relu plus que le plafond de contexte ? (L60)
 
-        La mesure est celle de l'alerte `session_too_big` : entrée + entrée
-        relue en cache du dernier tour inscrit au grand livre. Chaque étape
+        La mesure est celle du plafond du tour (L217b) : les jetons relus par
+        le fil principal, relevés dans le flux ; à défaut, celle de l'alerte
+        `session_too_big` (entrée + entrée relue en cache du dernier tour
+        inscrit au grand livre). Chaque étape
         d'un tour relit tout le contexte : une session qui grossit coûte de
         plus en plus cher à chaque tour, et l'alerte seule n'y changeait rien.
         Ni minimum de tours, ni rotation pendant un tour ; la politique
@@ -1032,12 +1051,13 @@ class AgentWorker(threading.Thread):
         if self.proc is not None or self.session_policy() == "jamais":
             return False
         plafond = self.context_max_tokens()
-        if plafond <= 0 or self.last_turn_reread < plafond:
+        relus, relus_session = self.last_turn_context_reread()
+        if plafond <= 0 or relus < plafond:
             return False
         session = self.current_session()
         if not session:
             return False
-        return self.last_turn_reread_session in (None, session)
+        return relus_session in (None, session)
 
     def _session_history(self, session_id: str | None, resume: str) -> None:
         """Garde l'ancien id de session et son résumé (audit, 0018) ; le
@@ -1080,7 +1100,7 @@ class AgentWorker(threading.Thread):
                 return self._rotate(raison)
         if self.context_rotation_due():
             return self._rotate("plafond de contexte : %d jetons relus au dernier tour "
-                                "(plafond %d)" % (self.last_turn_reread,
+                                "(plafond %d)" % (self.last_turn_context_reread()[0],
                                                   self.context_max_tokens()))
         if not self.rotation_due():
             return False
@@ -1153,6 +1173,7 @@ class AgentWorker(threading.Thread):
         self.session_tokens = 0.0
         self.last_turn_reread = 0
         self.last_turn_reread_session = None
+        self.last_turn_context = self.last_turn_context_session = None
         self._fil_note(
             "Rotation de session (%s) : l'ancien id (%s) est conservé dans "
             "`session-history.jsonl` ; la session neuve repart du résumé ci-dessous.\n\n%s"
@@ -2758,6 +2779,7 @@ class AgentWorker(threading.Thread):
         #: L217 : jetons relus par les sous-agents, à part et pour information
         #: (jamais comptés au plafond de contexte, qui mesure le fil principal)
         relus_sous_agents = 0
+        relus_mesures = False  # L217b : le flux a relevé au moins un appel
         appels_vus: set = set()
         cloture: str | None = None
         clos = False
@@ -2864,7 +2886,11 @@ class AgentWorker(threading.Thread):
                             self.summary_display.append(text)
                     if "final" in parsed:
                         self.last_final = str(parsed["final"] or "")
-                    if plafonne and not clos:
+                    if plafonne:
+                        # L217b : le flux se lit jusqu'au bout, même après la
+                        # clôture — un appel déjà en tampon compte encore.
+                        relus_mesures = relus_mesures or isinstance(
+                            parsed.get("call_usage") or parsed.get("subagent_call_usage"), dict)
                         appel = parsed.get("call_usage")
                         if isinstance(appel, dict):
                             ident = parsed.get("call_id")
@@ -2879,12 +2905,12 @@ class AgentWorker(threading.Thread):
                                 if ident:
                                     appels_vus.add(ident)
                                 relus_sous_agents += adapters.reread_tokens(harness, appel)
-                        if cloture is None:
+                        if cloture is None and not clos:
                             cloture = self.turn_close_due(started, relus)
                             if cloture:
                                 log_async("[%s] %s : tour clos au prochain point sûr"
                                           % (self.name, cloture))
-                        if cloture and parsed.get("safe_point"):
+                        if cloture and not clos and parsed.get("safe_point"):
                             # Point sûr : l'appel d'outil en cours est fini et son
                             # résultat est dans la session. Aucun harnais mené
                             # n'offre d'interruption propre en mode non
@@ -2952,6 +2978,9 @@ class AgentWorker(threading.Thread):
         # L217 : fil principal et sous-agents, mesurés à part dans le flux
         self.last_turn_main_reread = relus
         self.last_turn_subagent_reread = relus_sous_agents
+        # L217b : la rotation entre deux tours juge sur ce même compteur
+        self.last_turn_context = relus if relus_mesures else None
+        self.last_turn_context_session = session_new or session or None
         if relus_sous_agents:
             log_async("[%s] jetons relus dans le tour : %d fil principal, %d sous-agents "
                       "(hors plafond)" % (self.name, relus, relus_sous_agents))

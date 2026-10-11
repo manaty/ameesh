@@ -64,9 +64,11 @@ class PlafondDuFilPrincipalTest(PgTestCase):
         self.addCleanup(worker.watchdog_stop.set)
         return worker
 
-    def _tour(self, worker, appels) -> bool:
+    def _tour(self, worker, appels, tampon=None) -> bool:
         env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
                "AMEESH_TEST_CLAUDE_CALLS": json.dumps(appels)}
+        if tampon is not None:
+            env["AMEESH_TEST_CLAUDE_ON_TERM"] = json.dumps(tampon)
         with mock.patch.dict(os.environ, env, clear=False):
             return worker.run_turn({"kind": "prompt", "prompt": "travail", "ids": []})
 
@@ -101,6 +103,58 @@ class PlafondDuFilPrincipalTest(PgTestCase):
         self.assertIn('"tool_use_id": "outil-1"', flux)  # le sous-agent n'a pas clos
         self.assertIn('"tool_use_id": "outil-2"', flux)  # clos ici
         self.assertNotIn('"tool_use_id": "outil-3"', flux)
+
+    def test_rotation_entre_deux_tours_sur_le_fil_principal(self):
+        """L217b : un tour clos avant son `result` (ici par sa durée) n'a au
+        grand livre que ses appels, sous-agents compris ; la rotation entre
+        deux tours juge, comme le plafond, sur le fil principal seul."""
+        worker = self._worker("audit-rot")
+        storage.of(self.db).operations.set_settings("audit-rot", {"turn_max_seconds": "1"})
+        worker.agent = registry.get(self.db, "audit-rot")
+        self.assertEqual(worker.turn_max_seconds(), 1)
+        appels = [{"reread": 1200, "tool": True, "parent": "outil-x"},
+                  {"reread": 1200, "tool": True, "parent": "outil-x", "sleep": 1.2},
+                  {"reread": 50, "tool": True},                 # point sûr : clos ici
+                  {"reread": 10, "tool": True, "sleep": 3}]     # jamais fini
+        self.assertTrue(self._tour(worker, appels))
+        self.assertTrue(worker.last_turn_closed.startswith("durée maximale"))
+        self.assertNotIn('"type": "result"', self._flux(worker))
+        # le grand livre compte les sous-agents (au-delà du plafond de 1 000)…
+        self.assertGreaterEqual(worker.last_turn_reread, 2400)
+        self.assertEqual(worker.last_turn_subagent_reread, 2400)
+        # … la rotation, non : 50 jetons relus par le fil principal
+        # (l'appel 4, s'il est émis avant l'arrêt, compte aussi : 60 jetons)
+        self.assertIn(worker.last_turn_context_reread(), ((50, "claude-sess-1"),
+                                                          (60, "claude-sess-1")))
+        self.assertIsNone(worker.rotation_forcee)
+        self.assertFalse(worker.context_rotation_due())
+
+    def test_un_appel_principal_lu_apres_la_cloture_compte(self):
+        """L217b (relecture codex) : clos par sa durée à 50 jetons, le tour lit
+        encore un appel principal de 1 200 jetons, émis avant l'arrêt ; le
+        grand livre le compte, la rotation aussi (plafond 1 000)."""
+        worker = self._worker("audit-tampon")
+        storage.of(self.db).operations.set_settings("audit-tampon", {"turn_max_seconds": "1"})
+        worker.agent = registry.get(self.db, "audit-tampon")
+        appels = [{"reread": 50, "tool": True, "sleep": 1.2},   # point sûr : clos ici
+                  {"reread": 10, "tool": True, "sleep": 3}]     # jamais fini
+        self.assertTrue(self._tour(worker, appels, tampon={"reread": 1200}))
+        self.assertTrue(worker.last_turn_closed.startswith("durée maximale"))
+        self.assertIn('"id": "msg-tampon"', self._flux(worker))
+        # 50 + 1 200, et l'appel 2 (10) s'il est émis avant l'arrêt
+        self.assertIn(worker.last_turn_main_reread, (1250, 1260))
+        self.assertEqual(worker.last_turn_context_reread(),
+                         (worker.last_turn_main_reread, "claude-sess-1"))
+        self.assertGreaterEqual(worker.last_turn_reread, 1250)     # le grand livre aussi
+        self.assertTrue(worker.context_rotation_due())
+
+    def test_rotation_due_quand_le_fil_principal_depasse(self):
+        worker = self._worker("audit-rot2")
+        self.assertTrue(self._tour(worker, [{"reread": 600, "tool": True},
+                                            {"reread": 600}]))
+        self.assertIsNone(worker.last_turn_closed)  # aucun point sûr après le plafond
+        self.assertEqual(worker.last_turn_context_reread(), (1200, "claude-sess-1"))
+        self.assertTrue(worker.context_rotation_due())
 
 
 if __name__ == "__main__":
