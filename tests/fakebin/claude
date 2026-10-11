@@ -5,7 +5,8 @@
 Émet le même flux JSONL que `claude -p --output-format stream-json`, journalise
 son argv dans $AMEESH_TEST_LOG, et obéit à deux variables de banc :
 AMEESH_TEST_SLEEP (secondes de sommeil) et AMEESH_TEST_EXIT (code) ; L105 :
-AMEESH_TEST_CLAUDE_CALLS (JSON : appels au modèle, jetons relus, outil, durée).
+AMEESH_TEST_CLAUDE_CALLS (JSON : appels au modèle, jetons relus, outil, durée ;
+L217 : `parent`, l'outil du fil principal dont l'appel est un sous-agent).
 Travail de fond : AMEESH_TEST_BACKGROUND (commande shell lancée en fond, dans
 le groupe du tour, que le harnais n'attend pas) et AMEESH_TEST_BACKGROUND_PID
 (fichier où écrire son pid).
@@ -99,16 +100,19 @@ def main() -> int:
         usage = {"input_tokens": relus // 10, "cache_read_input_tokens": relus - relus // 10,
                  "output_tokens": 10}
         message = {"id": "msg-%d" % index, "usage": usage}
-        print(json.dumps({"type": "assistant", "message": dict(message, content=[
-            {"type": "text", "text": "appel %d" % index}])}), flush=True)
+        # L217 : `parent` = appel d'un sous-agent, lancé par cet outil du fil
+        # principal (comme le vrai flux : `parent_tool_use_id`, nul sinon)
+        fil = {"parent_tool_use_id": appel.get("parent"), "session_id": session}
+        print(json.dumps(dict(fil, type="assistant", message=dict(message, content=[
+            {"type": "text", "text": "appel %d" % index}]))), flush=True)
         if appel.get("tool"):
-            print(json.dumps({"type": "assistant", "message": dict(message, content=[
-                {"type": "tool_use", "id": "outil-%d" % index, "name": "x", "input": {}}])}),
+            print(json.dumps(dict(fil, type="assistant", message=dict(message, content=[
+                {"type": "tool_use", "id": "outil-%d" % index, "name": "x", "input": {}}]))),
                 flush=True)
             time.sleep(float(appel.get("sleep", 0)))
-            print(json.dumps({"type": "user", "message": {"role": "user", "content": [
+            print(json.dumps(dict(fil, type="user", message={"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "outil-%d" % index,
-                 "content": "ok"}]}}), flush=True)
+                 "content": "ok"}]})), flush=True)
     print(json.dumps({"type": "assistant", "message": {"content": [
         {"type": "text", "text": "bonjour du faux claude (session %s)" % session}]}}), flush=True)
     print(json.dumps({"type": "result", "subtype": "success", "result": "fini",
