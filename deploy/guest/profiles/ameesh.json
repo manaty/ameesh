@@ -1,0 +1,12 @@
+{
+  "description": "ameesh's own suites: scripts/test.sh against a job Postgres, psycopg venv cached by pyproject.toml",
+  "lockfiles": ["pyproject.toml"],
+  "setup": "python3 -m venv \"$OFFLOAD_CACHE/venv\" && \"$OFFLOAD_CACHE/venv/bin/pip\" install --quiet 'psycopg[binary]' cryptography pyyaml",
+  "env": {
+    "AMEESH_TEST_VENV": "${OFFLOAD_CACHE}/venv",
+    "AMEESH_PG_UP": "0",
+    "AMEESH_REQUIRE_DB": "1"
+  },
+  "before": "/usr/local/lib/ameesh-guest/job-postgres up",
+  "after": "/usr/local/lib/ameesh-guest/job-postgres down"
+}

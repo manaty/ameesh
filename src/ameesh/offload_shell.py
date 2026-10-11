@@ -1,0 +1,695 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""ameesh-offload-shell: the VM side of heavy-suite offloading (lot L159b,
+mode b1 of the L159 study, `docs/design/etudes/l159-capacite-des-hotes.md`).
+
+It is the forced command of the `ameesh-guest` SSH key: the key has no shell,
+no port forwarding, only these four verbs (read from SSH_ORIGINAL_COMMAND):
+
+  put <repo> --have        stdin: candidate commit ids, one per line;
+                           stdout: those the mirror already has
+  put <repo> <commit>      stdin: a thin git pack; stores it in the mirror and
+                           keeps <commit> under refs/offload/
+  run <repo> <commit> [--profile P] [--cwd DIR] [--timeout S] [--env K=V]...
+      -- <argv...>         runs argv in a throwaway checkout of <commit>;
+                           stdout and stderr pass through, the exit code too
+  status [<job>]           one JSON object per job (running or waiting)
+  cancel <job>             stops a job
+
+Protocol lines go to stderr, prefixed with `ameesh-offload: `. A `run`
+always ends with `ameesh-offload: result {json}` (outcome `done`, `refused`,
+`stopped`, `timeout`, `cancelled` or `error`); the client strips them.
+
+Each job runs:
+* under a concurrency token (`flock` on `locks/slot-N`; the client sees the
+  wait);
+* in a transient systemd user scope `ameesh-job-<id>.scope` capped by
+  `MemoryMax` (config `agent_memory_max`), when `scope` is true;
+* with a private TMPDIR inside the job directory, removed at the end;
+* with the dependencies of its profile cached by the hash of the profile's
+  lock files (`profiles/<name>.json`, see `deploy/guest/`).
+
+It obeys the host gate (`ameesh-host-state/1`, study section 1.5) when
+`gate.mode` is `file`: no new job unless `available`; a running job is
+killed at `drain_deadline_ts` when `draining`, immediately when `stopped`.
+An unreadable, absent or expired state counts as `stopped`.
+
+Standard library only: `deploy/guest/install.sh` copies this file to the VM,
+where ameesh itself is not installed.
+"""
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+PREFIX = "ameesh-offload: "
+DEFAULT_CONFIG = "/srv/ameesh-guest/offload.json"
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+SHA_RE = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
+ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+#: env variables a job never receives from the client (the VM decides them)
+RESERVED_ENV = ("PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP",
+                "LD_PRELOAD", "LD_LIBRARY_PATH", "XDG_RUNTIME_DIR",
+                "DBUS_SESSION_BUS_ADDRESS", "OFFLOAD_JOB", "OFFLOAD_WORK",
+                "OFFLOAD_CACHE")
+POLL_S = 1.0
+
+
+class Refused(Exception):
+    """The request is invalid, or the host does not take jobs now."""
+
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+
+def load_config(path: str) -> dict:
+    with open(path, encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    root = cfg.get("root") or os.path.dirname(os.path.abspath(path))
+    cfg["root"] = root
+    cfg.setdefault("slots", 3)
+    cfg.setdefault("agent_memory_max", "")
+    cfg.setdefault("max_job_seconds", 3600)
+    cfg.setdefault("scope", True)
+    cfg.setdefault("keep_days", 7)
+    cfg.setdefault("gate", {"mode": "none"})
+    # root-owned on a real VM (install.sh): the guest cannot write a hook
+    cfg.setdefault("profiles", os.path.join(root, "profiles"))
+    return cfg
+
+
+def _dir(cfg: dict, *parts: str) -> str:
+    path = os.path.join(cfg["root"], *parts)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
+def emit(kind: str, payload: object = None) -> None:
+    line = PREFIX + kind
+    if payload is not None:
+        line += " " + (payload if isinstance(payload, str)
+                       else json.dumps(payload, sort_keys=True))
+    try:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+    except OSError:
+        # the SSH session is gone (EPIPE): the job loop sees it by its parent
+        pass
+
+
+# --------------------------------------------------------------------------
+# host gate (ameesh-host-state/1)
+# --------------------------------------------------------------------------
+
+def gate_state(cfg: dict, now: float | None = None) -> tuple[str, float | None, str]:
+    """(state, drain deadline or None, reason). Without a gate, `available`."""
+    gate = cfg.get("gate") or {}
+    if gate.get("mode", "none") != "file":
+        return "available", None, ""
+    now = time.time() if now is None else now
+    path = gate.get("path", "/run/ameesh-gate/state/state.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return "stopped", None, "gate unreadable"
+    if not isinstance(doc, dict) or doc.get("schema") != "ameesh-host-state/1":
+        return "stopped", None, "gate unreadable"
+    expires = doc.get("expires_ts")
+    if isinstance(expires, (int, float)) and expires < now:
+        return "stopped", None, "gate expired"
+    state = doc.get("state")
+    reason = str(doc.get("reason") or "")
+    if state == "available":
+        until = doc.get("until_ts")
+        if isinstance(until, (int, float)) and until < now:
+            return "stopped", None, reason or "window ended"
+        return "available", None, reason
+    if state == "draining":
+        deadline = doc.get("drain_deadline_ts")
+        return "draining", deadline if isinstance(deadline, (int, float)) else now, reason
+    return "stopped", None, reason or str(state)
+
+
+# --------------------------------------------------------------------------
+# put: the repository mirror
+# --------------------------------------------------------------------------
+
+def mirror_path(cfg: dict, repo: str) -> str:
+    if not NAME_RE.match(repo):
+        raise Refused("invalid repository name %r" % repo)
+    path = os.path.join(_dir(cfg, "mirrors"), repo + ".git")
+    if not os.path.isdir(path):
+        subprocess.run(["git", "init", "-q", "--bare", path], check=True)
+        subprocess.run(["git", "-C", path, "config", "gc.auto", "0"], check=True)
+    return path
+
+
+def cmd_put(cfg: dict, args: list[str]) -> int:
+    if len(args) != 2:
+        raise Refused("usage: put <repo> --have | put <repo> <commit>")
+    mirror = mirror_path(cfg, args[0])
+    if args[1] == "--have":
+        wanted = [line.strip() for line in sys.stdin if SHA_RE.match(line.strip())]
+        if not wanted:
+            return 0
+        out = subprocess.run(
+            ["git", "-C", mirror, "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            input="\n".join(wanted) + "\n", capture_output=True, text=True, check=True)
+        for line in out.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == "commit":
+                sys.stdout.write(parts[0] + "\n")
+        return 0
+    commit = args[1]
+    if not SHA_RE.match(commit):
+        raise Refused("invalid commit id %r" % commit)
+    subprocess.run(["git", "-C", mirror, "index-pack", "--stdin", "--fix-thin"],
+                   stdin=sys.stdin.buffer, stdout=subprocess.DEVNULL, check=True)
+    if subprocess.run(["git", "-C", mirror, "cat-file", "-e", commit + "^{commit}"]
+                      ).returncode != 0:
+        raise Refused("commit %s missing after the pack" % commit)
+    subprocess.run(["git", "-C", mirror, "update-ref", "refs/offload/" + commit, commit],
+                   check=True)
+    touch_snapshot(mirror, commit)
+    prune_mirror(cfg, mirror)
+    return 0
+
+
+def touch_snapshot(mirror: str, commit: str) -> None:
+    """Marks a snapshot as used (put or run): pruning goes by last use, since
+    a snapshot carries the date of its HEAD, not of its upload."""
+    stamps = os.path.join(mirror, "offload-stamps")
+    os.makedirs(stamps, exist_ok=True)
+    with open(os.path.join(stamps, commit), "a"):
+        pass
+    os.utime(os.path.join(stamps, commit))
+
+
+def prune_mirror(cfg: dict, mirror: str) -> None:
+    """Drops snapshots unused for `keep_days`, then lets git repack."""
+    limit = time.time() - float(cfg["keep_days"]) * 86400
+    stamps = os.path.join(mirror, "offload-stamps")
+    out = subprocess.run(
+        ["git", "-C", mirror, "for-each-ref", "--format=%(refname)", "refs/offload/"],
+        capture_output=True, text=True, check=True)
+    old = []
+    for ref in out.stdout.split():
+        stamp = os.path.join(stamps, ref.rsplit("/", 1)[-1])
+        if not os.path.exists(stamp) or os.path.getmtime(stamp) < limit:
+            old.append(ref)
+            if os.path.exists(stamp):
+                os.unlink(stamp)
+    if old:
+        subprocess.run(["git", "-C", mirror, "update-ref", "--stdin"],
+                       input="".join("delete %s\n" % ref for ref in old),
+                       text=True, check=True)
+    subprocess.run(["git", "-C", mirror, "-c", "gc.auto=50", "gc", "--auto", "--quiet"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # dependency caches unused for as long (their mtime is touched on use)
+    caches = _dir(cfg, "cache")
+    for profile in os.listdir(caches):
+        pdir = os.path.join(caches, profile)
+        for key in os.listdir(pdir) if os.path.isdir(pdir) else ():
+            path = os.path.join(pdir, key)
+            if os.path.isdir(path) and os.path.getmtime(path) < limit:
+                shutil.rmtree(path, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# jobs
+# --------------------------------------------------------------------------
+
+def _write_meta(path: str, meta: dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _read_meta(job_dir: str) -> dict | None:
+    try:
+        with open(os.path.join(job_dir, "meta.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _alive(pid: object) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def acquire_slot(cfg: dict, job_id: str, should_stop) -> int:
+    """A concurrency token (an open, locked fd). Polls while all are taken,
+    so a cancel or a gate change still ends the wait."""
+    locks = _dir(cfg, "locks")
+    slots = max(1, int(cfg["slots"]))
+    announced = False
+    while True:
+        for n in range(slots):
+            fd = os.open(os.path.join(locks, "slot-%d" % n), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                continue
+            return fd
+        if not announced:
+            emit("waiting", {"job": job_id, "slots": slots})
+            announced = True
+        reason = should_stop()
+        if reason:
+            raise Refused(reason)
+        time.sleep(POLL_S)
+
+
+def _lock_hash(work: str, profile: dict) -> str:
+    digest = hashlib.sha256()
+    digest.update(json.dumps(profile.get("setup", ""), sort_keys=True).encode())
+    for rel in profile.get("lockfiles", []):
+        digest.update(b"\0" + rel.encode() + b"\0")
+        try:
+            with open(os.path.join(work, rel), "rb") as fh:
+                digest.update(fh.read())
+        except OSError:
+            digest.update(b"<absent>")
+    return digest.hexdigest()[:16]
+
+
+def load_profile(cfg: dict, name: str) -> dict:
+    if not NAME_RE.match(name):
+        raise Refused("invalid profile name %r" % name)
+    path = os.path.join(cfg["profiles"], name + ".json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            profile = json.load(fh)
+    except FileNotFoundError:
+        raise Refused("unknown profile %r" % name) from None
+    profile.setdefault("lockfiles", [])
+    profile.setdefault("setup", "")
+    profile.setdefault("before", "")
+    profile.setdefault("after", "")
+    profile.setdefault("env", {})
+    return profile
+
+
+def _expand(value: str, env: dict) -> str:
+    return re.sub(r"\$\{?(OFFLOAD_JOB|OFFLOAD_WORK|OFFLOAD_CACHE|HOME|PATH)\}?",
+                  lambda m: env.get(m.group(1), ""), value)
+
+
+def _hook(script: str, cwd: str, env: dict) -> subprocess.CompletedProcess:
+    """A profile hook: a shell snippet written by the VM's owner, never by the
+    client. Its stdout is captured, its stderr passes through."""
+    return subprocess.run(["/bin/sh", "-ec", script], cwd=cwd, env=env,
+                          stdout=subprocess.PIPE, text=True)
+
+
+def prepare_cache(cfg: dict, profile_name: str, profile: dict, work: str,
+                  env: dict) -> str:
+    """The dependency cache of the profile, built once per lock-file hash."""
+    if not profile["setup"]:
+        return ""
+    base = _dir(cfg, "cache", profile_name)
+    key = _lock_hash(work, profile)
+    final = os.path.join(base, key)
+    fd = os.open(final + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        ready = os.path.join(final, ".ready")
+        if os.path.exists(ready):
+            os.utime(final)
+            return final
+        emit("setup", {"profile": profile_name, "cache": key})
+        # built in place (a venv records its own path); `.ready` marks a
+        # complete cache, so a setup killed halfway is redone
+        shutil.rmtree(final, ignore_errors=True)
+        os.makedirs(final, mode=0o700)
+        env = dict(env, OFFLOAD_CACHE=final)
+        res = subprocess.run(["/bin/sh", "-ec", profile["setup"]], cwd=work, env=env,
+                             stdout=sys.stderr.fileno())
+        if res.returncode != 0:
+            shutil.rmtree(final, ignore_errors=True)
+            raise Refused("profile %s: setup failed (exit %d)" % (profile_name, res.returncode))
+        open(ready, "w").close()
+        return final
+    finally:
+        os.close(fd)
+
+
+def checkout(mirror: str, work: str, commit: str) -> None:
+    """A throwaway work tree of `commit`, borrowing the mirror's objects
+    (a clone of a mirror without branches would warn, and copy refs)."""
+    subprocess.run(["git", "init", "-q", work], check=True)
+    with open(os.path.join(work, ".git", "objects", "info", "alternates"), "w",
+              encoding="utf-8") as fh:
+        fh.write(os.path.join(mirror, "objects") + "\n")
+    subprocess.run(["git", "-C", work, "checkout", "-q", "--detach", commit], check=True)
+
+
+def check_user_manager(env: dict) -> None:
+    """The job's scope needs the guest's systemd user manager (linger). Without
+    it, refuse the job (the client falls back) rather than report the
+    failure of `systemd-run` as the command's own exit code."""
+    if not env.get("XDG_RUNTIME_DIR"):
+        # sshd without pam_systemd does not set it
+        run_dir = "/run/user/%d" % os.getuid()
+        if os.path.isdir(run_dir):
+            env["XDG_RUNTIME_DIR"] = run_dir
+            os.environ["XDG_RUNTIME_DIR"] = run_dir  # for `systemctl --user kill`
+    bus = os.path.join(env.get("XDG_RUNTIME_DIR", ""), "bus")
+    if not env.get("DBUS_SESSION_BUS_ADDRESS") and not os.path.exists(bus):
+        raise Refused("no systemd user manager for the job scope (loginctl enable-linger?)")
+
+
+def _scope_argv(cfg: dict, job_id: str, argv: list[str]) -> list[str]:
+    if not cfg.get("scope"):
+        return argv
+    cmd = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+           "--unit", "ameesh-job-%s" % job_id]
+    if cfg.get("agent_memory_max"):
+        cmd += ["-p", "MemoryMax=%s" % cfg["agent_memory_max"], "-p", "MemorySwapMax=0"]
+    return cmd + ["--"] + argv
+
+
+def _kill(cfg: dict, job_id: str, proc: subprocess.Popen) -> None:
+    if cfg.get("scope"):
+        subprocess.run(["systemctl", "--user", "kill", "--signal=SIGKILL",
+                        "ameesh-job-%s.scope" % job_id],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def parse_run(args: list[str]) -> dict:
+    if "--" not in args:
+        raise Refused("run: missing `--` before the command")
+    cut = args.index("--")
+    head, argv = args[:cut], args[cut + 1:]
+    if len(head) < 2 or not argv:
+        raise Refused("usage: run <repo> <commit> [options] -- <command...>")
+    req = {"repo": head[0], "commit": head[1], "profile": "default", "cwd": "",
+           "timeout": None, "env": {}, "argv": argv}
+    i = 2
+    while i < len(head):
+        opt = head[i]
+        val = head[i + 1] if i + 1 < len(head) else None
+        if val is None:
+            raise Refused("run: %s needs a value" % opt)
+        if opt == "--profile":
+            req["profile"] = val
+        elif opt == "--cwd":
+            norm = os.path.normpath(val)
+            if os.path.isabs(norm) or norm.split(os.sep)[0] == "..":
+                raise Refused("run: --cwd must stay inside the repository")
+            req["cwd"] = "" if norm == "." else norm
+        elif opt == "--timeout":
+            req["timeout"] = int(val)
+        elif opt == "--env":
+            if not ENV_RE.match(val):
+                raise Refused("run: invalid --env %r" % val)
+            key, value = val.split("=", 1)
+            if key in RESERVED_ENV:
+                raise Refused("run: %s is set by the host" % key)
+            req["env"][key] = value
+        else:
+            raise Refused("run: unknown option %s" % opt)
+        i += 2
+    if not SHA_RE.match(req["commit"]):
+        raise Refused("invalid commit id %r" % req["commit"])
+    return req
+
+
+def cmd_run(cfg: dict, args: list[str]) -> int:
+    started = time.time()
+    job_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime(started)) + "-" + secrets.token_hex(3)
+    result = {"job": job_id, "outcome": "error", "exit": None}
+    try:
+        req = parse_run(args)
+    except (Refused, ValueError) as exc:
+        result.update(outcome="refused", reason=str(exc))
+        emit("result", result)
+        return 2
+    state, _, reason = gate_state(cfg)
+    if state != "available":
+        result.update(outcome="refused", reason="host %s%s" % (state, ": " + reason if reason else ""))
+        emit("result", result)
+        return 75
+    mirror = mirror_path(cfg, req["repo"])
+    if subprocess.run(["git", "-C", mirror, "cat-file", "-e", req["commit"] + "^{commit}"],
+                      stderr=subprocess.DEVNULL).returncode != 0:
+        result.update(outcome="refused", reason="unknown commit %s (put it first)" % req["commit"])
+        emit("result", result)
+        return 2
+    touch_snapshot(mirror, req["commit"])
+    prune_orphans(cfg)
+    ssh_parent = os.getppid()
+    job_dir = os.path.join(_dir(cfg, "jobs"), job_id)
+    os.makedirs(job_dir, mode=0o700)
+    meta_path = os.path.join(job_dir, "meta.json")
+    meta = {"job": job_id, "state": "waiting", "repo": req["repo"], "commit": req["commit"],
+            "profile": req["profile"], "argv": req["argv"], "created_ts": int(started),
+            "shell_pid": os.getpid()}
+    _write_meta(meta_path, meta)
+    emit("job", job_id)
+    cancel_flag = os.path.join(job_dir, "cancel")
+    proc: subprocess.Popen | None = None
+    stop: dict = {}
+
+    def on_signal(signum, _frame):
+        # the SSH session went away (SIGHUP), or `cancel` (SIGTERM)
+        stop.setdefault("outcome", "cancelled")
+        stop.setdefault("reason", "signal %d" % signum)
+        if proc is not None and proc.poll() is None:
+            _kill(cfg, job_id, proc)
+
+    for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, on_signal)
+
+    def session_gone() -> bool:
+        # no tty, so no SIGHUP for sure: a dead sshd session reparents us
+        return os.getppid() != ssh_parent
+
+    def should_stop() -> str:
+        if os.path.exists(cancel_flag) or stop or session_gone():
+            return "cancelled"
+        st, _, why = gate_state(cfg)
+        return "" if st == "available" else "host %s%s" % (st, ": " + why if why else "")
+
+    slot_fd = None
+    profile: dict | None = None
+    hook_env: dict | None = None
+    work = os.path.join(job_dir, "work")
+    try:
+        try:
+            slot_fd = acquire_slot(cfg, job_id, should_stop)
+        except Refused as exc:
+            result.update(outcome="cancelled" if str(exc) == "cancelled" else "refused",
+                          reason=str(exc))
+            return 75 if result["outcome"] == "refused" else 130
+        tmp = os.path.join(job_dir, "tmp")
+        os.makedirs(tmp, mode=0o700)
+        checkout(mirror, work, req["commit"])
+        home = os.environ.get("HOME", cfg["root"])
+        env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+               "HOME": home, "USER": os.environ.get("USER", ""),
+               "LOGNAME": os.environ.get("LOGNAME", ""),
+               "LANG": os.environ.get("LANG", "C.UTF-8"),
+               "TMPDIR": tmp, "TMP": tmp, "TEMP": tmp,
+               "OFFLOAD_JOB": job_id, "OFFLOAD_WORK": work}
+        for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+            if os.environ.get(key):
+                env[key] = os.environ[key]
+        if cfg.get("scope"):
+            check_user_manager(env)
+        profile = load_profile(cfg, req["profile"])
+        env["OFFLOAD_CACHE"] = prepare_cache(cfg, req["profile"], profile, work, env)
+        for key, value in profile["env"].items():
+            env[key] = _expand(str(value), env)
+        env.update(req["env"])
+        cwd = os.path.join(work, req["cwd"]) if req["cwd"] else work
+        if not os.path.isdir(cwd):
+            raise Refused("run: --cwd %s does not exist in the snapshot" % req["cwd"])
+        hook_env = env
+        if profile["before"]:
+            res = _hook(profile["before"], work, env)
+            if res.returncode != 0:
+                raise Refused("profile %s: before hook failed (exit %d)"
+                              % (req["profile"], res.returncode))
+            for line in res.stdout.splitlines():
+                if ENV_RE.match(line):
+                    key, value = line.split("=", 1)
+                    env[key] = value
+        limit = min(int(cfg["max_job_seconds"]), req["timeout"] or 10 ** 9)
+        meta.update(state="running", started_ts=int(time.time()), limit_s=limit)
+        _write_meta(meta_path, meta)
+        emit("start", {"job": job_id, "profile": req["profile"], "limit_s": limit})
+        proc = subprocess.Popen(_scope_argv(cfg, job_id, req["argv"]), cwd=cwd, env=env,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+        meta.update(pid=proc.pid)
+        _write_meta(meta_path, meta)
+        deadline = time.time() + limit
+        while True:
+            try:
+                rc = proc.wait(timeout=POLL_S)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.time()
+            if os.path.exists(cancel_flag):
+                stop.setdefault("outcome", "cancelled")
+                stop.setdefault("reason", "cancel requested")
+            elif session_gone():
+                stop.setdefault("outcome", "cancelled")
+                stop.setdefault("reason", "SSH session closed")
+            if not stop:
+                st, drain_at, why = gate_state(cfg, now)
+                if st == "stopped" or (st == "draining" and drain_at is not None
+                                       and now >= drain_at):
+                    stop.update(outcome="stopped", reason="host %s%s" % (st, ": " + why if why else ""))
+                elif now >= deadline:
+                    stop.update(outcome="timeout", reason="over %d s" % limit)
+            if stop:
+                _kill(cfg, job_id, proc)
+                rc = proc.wait()
+                break
+        result["exit"] = rc
+        if stop:
+            result.update(stop)
+            return {"stopped": 75, "timeout": 124}.get(stop["outcome"], 130)
+        result["outcome"] = "done"
+        return rc if 0 <= rc < 256 else 128 + (-rc)
+    except Refused as exc:
+        result.update(outcome="refused", reason=str(exc))
+        return 75
+    except (OSError, subprocess.CalledProcessError) as exc:
+        result.update(outcome="error", reason=str(exc))
+        return 70
+    finally:
+        try:
+            if profile is not None and profile["after"] and hook_env is not None:
+                # teardown (the job's containers), even after a kill
+                _hook(profile["after"], work, hook_env)
+        finally:
+            result["seconds"] = round(time.time() - started, 1)
+            # journal and cleanup first: once the result is out, the client
+            # may move on (and the session may be gone already)
+            _journal(cfg, dict(meta, **result))
+            if slot_fd is not None:
+                os.close(slot_fd)
+            shutil.rmtree(job_dir, ignore_errors=True)
+            emit("result", result)
+
+
+def prune_orphans(cfg: dict) -> None:
+    """Job folders whose shell died without cleaning up (killed, host
+    rebooted): their slot lock went with the process, only files remain."""
+    jobs = _dir(cfg, "jobs")
+    for name in os.listdir(jobs):
+        meta = _read_meta(os.path.join(jobs, name))
+        if meta is not None and not _alive(meta.get("shell_pid")):
+            meta["state"] = "orphan"
+            _journal(cfg, dict(meta, outcome="error", reason="orphan job folder removed"))
+            shutil.rmtree(os.path.join(jobs, name), ignore_errors=True)
+
+
+def _journal(cfg: dict, entry: dict) -> None:
+    """One line per job in `jobs.jsonl`: the usage measure of the study (4.4)."""
+    entry = {k: v for k, v in entry.items() if k not in ("shell_pid", "pid")}
+    entry["ended_ts"] = int(time.time())
+    try:
+        with open(os.path.join(cfg["root"], "jobs.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def cmd_status(cfg: dict, args: list[str]) -> int:
+    jobs = _dir(cfg, "jobs")
+    names = sorted(os.listdir(jobs))
+    if args:
+        if not NAME_RE.match(args[0]):
+            raise Refused("invalid job id %r" % args[0])
+        names = [n for n in names if n == args[0]]
+    gate, _, reason = gate_state(cfg)
+    sys.stdout.write(json.dumps({"host": {"gate": gate, "reason": reason,
+                                          "slots": int(cfg["slots"])}}) + "\n")
+    for name in names:
+        meta = _read_meta(os.path.join(jobs, name))
+        if meta is None:
+            continue
+        if not _alive(meta.get("shell_pid")):
+            meta["state"] = "orphan"
+        meta.pop("shell_pid", None)
+        sys.stdout.write(json.dumps(meta, sort_keys=True) + "\n")
+    return 0
+
+
+def cmd_cancel(cfg: dict, args: list[str]) -> int:
+    if len(args) != 1 or not NAME_RE.match(args[0]):
+        raise Refused("usage: cancel <job>")
+    job_dir = os.path.join(_dir(cfg, "jobs"), args[0])
+    meta = _read_meta(job_dir)
+    if meta is None:
+        raise Refused("no job %s" % args[0])
+    open(os.path.join(job_dir, "cancel"), "w").close()
+    pid = meta.get("shell_pid")
+    if _alive(pid):
+        os.kill(pid, signal.SIGTERM)
+    sys.stdout.write("cancelled %s\n" % args[0])
+    return 0
+
+
+VERBS = {"put": cmd_put, "run": cmd_run, "status": cmd_status, "cancel": cmd_cancel}
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    config = DEFAULT_CONFIG
+    if argv[:1] == ["--config"] and len(argv) >= 2:
+        config = argv[1]
+    request = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    try:
+        words = shlex.split(request)
+    except ValueError:
+        words = []
+    if not words or words[0] not in VERBS:
+        sys.stderr.write(PREFIX + "allowed verbs: put, run, status, cancel\n")
+        return 2
+    try:
+        cfg = load_config(config)
+        return VERBS[words[0]](cfg, words[1:])
+    except Refused as exc:
+        emit("refused", str(exc))
+        return 2
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        emit("error", str(exc))
+        return 70
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -99,6 +99,10 @@
   ameesh deps link|local|unlink|status|entries node_modules shared per lockfile (#248);
   ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);
   ameesh guard check|run|drain          capacity guard of a lending VM (L159e);
+  ameesh offload run [--profile P] [--fallback local|none] -- <command…>
+        | status [<job>] | cancel <job>
+        heavy suites run on a lending VM over SSH (L159b, AMEESH_OFFLOAD_HOST);
+        same output and exit code, local fallback;
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent.
 
 The human approval service (spec §9) is a separate command,
@@ -257,6 +261,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L159e : garde de capacité d'une VM prêteuse (service système, sans base)
         from . import guard
         return guard.main(rest)
+    if command == "offload":
+        # L159b: heavy suites offloaded to a lending VM (mode b1)
+        from . import offload
+        return offload.main(rest)
     if command == "approve-check":
         from . import approve_check
         return approve_check.main(rest)
