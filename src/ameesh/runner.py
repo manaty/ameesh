@@ -1414,6 +1414,51 @@ class AgentWorker(threading.Thread):
         log_async("[%s] session %s enregistrée au registre (différée par une panne)"
                   % (self.name, session))
 
+    def _ecarte_session_fille(self, refusee: str) -> None:
+        """L166 : le harnais refuse de reprendre `refusee`, session fille
+        (sous-agent, fourche) retenue à tort comme session de l'agent. Le tour
+        suivant repart de la dernière session principale connue (le fichier
+        local, écrit seulement depuis le flux du harnais), sinon d'une session
+        neuve ouverte sur le brief de reprise déterministe. Fencé par le bail."""
+        principale = self.read_session_file()
+        if principale == refusee:
+            principale = None
+        if principale:
+            registry.set_session(self.db, self.name, principale, None)
+            if self.agent is not None:
+                self.agent["session_id"] = principale
+                self.agent["session_account"] = None
+            suite = "reprise de la dernière session principale connue (%s)" % principale
+        else:
+            if not registry.clear_session(self.db, self.name, self.runner.runner_id,
+                                          self.epoch):
+                return  # bail perdu : rien n'est touché (L11 B3)
+            try:
+                os.unlink(self._path("session"))  # sinon `current_session` le relirait
+            except OSError:
+                pass
+            try:
+                from . import reprise
+                self.resume_summary = reprise.deterministic_brief(
+                    self.cfg, self.db, registry.get(self.db, self.name) or self.agent,
+                    session=refusee, reason="session fille %s écartée" % refusee,
+                    consigne="La consigne de ce tour suit ce brief : reprends ton "
+                             "travail à partir de là.")
+                self.resume_origin = "ameesh"
+            except Exception as exc:  # un brief manquant n'empêche pas l'oubli
+                log_async("[%s] brief de reprise déterministe indisponible (%s)"
+                          % (self.name, exc))
+            self.agent = registry.get(self.db, self.name) or self.agent
+            self.session_turns = 0
+            self.session_tokens = 0.0
+            suite = "session neuve ouverte sur le brief de reprise"
+        log_async("[%s] session fille %s écartée : %s" % (self.name, refusee, suite))
+        self._fil_note(
+            "Session %s refusée par le harnais (session fille : sous-agent ou "
+            "fourche) ; %s. Pas compté comme échec rapide." % (refusee, suite),
+            meta={"action": "session-fille", "session": refusee,
+                  "reprise": principale or ""})
+
     # -- hôte non prêt (L106) ------------------------------------------------
     #: statut et préfixe d'erreur d'un blocage « hôte non prêt » (levé seulement
     #: s'il porte exactement ces deux marques, comme L35 et L72)
@@ -2934,6 +2979,13 @@ class AgentWorker(threading.Thread):
                 if not self._power_texte:
                     self._host_not_ready(hote)
                 return False
+            if session and adapters.child_session_refused(error):
+                # L166 : la session reprise était une session fille ; la
+                # reprendre encore échouerait de même. Pas un échec rapide :
+                # le tour suivant repart d'une session saine.
+                self.fast_failure = False
+                self._avec_reprise("session fille écartée",
+                                   self._ecarte_session_fille, session)
         if self._session_en_attente is not None:
             self._avec_reprise("session du tour", self._enregistre_session)
         if ok and clos:

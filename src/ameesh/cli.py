@@ -838,12 +838,18 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                   % (binding.name, binding.reason), file=sys.stderr)
         return 0
     name = binding.name
+    # L166 : sous bail, la session de l'agent est celle que l'exécuteur lit
+    # dans le flux du harnais, jamais celle d'un hook. dsh déclenche les hooks
+    # de ses agents enfants (sous-agent, fourche) avec LEUR session et sans
+    # `agent_id` : inscrite ici, elle devenait la session reprise au tour
+    # suivant, que dsh refuse (« is a subagent or forked session »).
+    session_id = None if binding.bound_to_lease else data.get("session_id")
     try:
-        inscription = [tool, data.get("cwd"), data.get("session_id"),
+        inscription = [tool, data.get("cwd"), session_id,
                        binding.runner_id if binding.bound_to_lease else None,
                        binding.epoch if binding.bound_to_lease else None]
         if bk.kind != "pg" or _register_due(cfg, name, inscription):
-            bk.register(name, tool, data.get("cwd"), data.get("session_id"),
+            bk.register(name, tool, data.get("cwd"), session_id,
                         leased=binding.bound_to_lease)
             if bk.kind == "pg":
                 _register_done(cfg, name, inscription)
