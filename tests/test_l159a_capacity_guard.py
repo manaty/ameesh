@@ -208,9 +208,9 @@ class CanonTest(_Canons, unittest.TestCase):
 def reference_lendable(reading: dict, history: dict, offer: dict, k: dict) -> dict | None:
     """The formula of the study (section 1.4), written from the contract,
     independently of `resources`."""
-    free = reading["mem_available_bytes"]
-    if free is not None:
-        free += reading["guest_mem_bytes"] or 0
+    free, guest = reading["mem_available_bytes"], reading["guest_mem_bytes"]
+    # guest memory unreadable (None, unlike 0: no guest): free memory unknown
+    free = None if free is None or guest is None else free + guest
     lows = [v for v in (history["min_free_mem_bytes"], free) if v is not None]
     memory = int(k["margin"] * min(lows)) if lows else None
     a7 = history["app_cpu_p95"] if history["app_cpu_p95"] is not None else reading["app_cpu"]
@@ -227,6 +227,8 @@ def reference_lendable(reading: dict, history: dict, offer: dict, k: dict) -> di
     memory = None if memory is None else max(0, memory)
     if cpu is None and memory is None and disk is None:
         return None
+    if offer is None:  # no `policy.lend`: the host lends nothing
+        return {"cpu": 0.0, "memory_bytes": 0, "disk_bytes": 0}
     return {"cpu": None if cpu is None else min(cpu, offer["cpu_max"]),
             "memory_bytes": None if memory is None else min(memory, offer["memory_max"]),
             "disk_bytes": None if disk is None else min(disk, offer["disk_max"])}

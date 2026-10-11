@@ -193,6 +193,54 @@
    }
   },
   {
+   "why": "guest memory unreadable (null; 0 means no guest): the current free memory is unknown, the history alone counts",
+   "reading": {
+    "cpu_count": 8,
+    "app_cpu": 2.0,
+    "mem_total_bytes": 34359738368,
+    "mem_available_bytes": 10737418240,
+    "guest_mem_bytes": null,
+    "disk_free_bytes": 107374182400
+   },
+   "history": {
+    "min_free_mem_bytes": 21474836480,
+    "app_cpu_p95": 2.0,
+    "span_s": 604800.0
+   },
+   "offer": {
+    "cpu_max": 3.0,
+    "memory_max": 15032385536,
+    "disk_max": 85899345920
+   },
+   "lendable": {
+    "cpu": 3.0,
+    "memory_bytes": 10737418240,
+    "disk_bytes": 85899345920
+   }
+  },
+  {
+   "why": "no offer (no policy.lend): the host lends nothing",
+   "reading": {
+    "cpu_count": 8,
+    "app_cpu": 1.6,
+    "mem_total_bytes": 34359738368,
+    "mem_available_bytes": 19327352832,
+    "guest_mem_bytes": 6442450944,
+    "disk_free_bytes": 107374182400
+   },
+   "history": {
+    "min_free_mem_bytes": 21474836480,
+    "app_cpu_p95": 2.0,
+    "span_s": 604800.0
+   },
+   "offer": null,
+   "lendable": {
+    "cpu": 0.0,
+    "memory_bytes": 0,
+    "disk_bytes": 0
+   }
+  },
+  {
    "why": "every measure missing: no lendable capacity (null), never guessed",
    "reading": {
     "cpu_count": null,

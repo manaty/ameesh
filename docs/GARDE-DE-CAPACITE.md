@@ -133,7 +133,12 @@ replaces them.
 - **disk:** `min(disk_max, disk_free − 2 GiB)`;
 - **warm-up:** under one day of history, the guard lends at most 25 % of
   the memory and 1 CPU;
-- the guard never lends a negative amount: it floors at 0.
+- the guard never lends a negative amount: it floors at 0;
+- `guest_mem_bytes` is 0 when there is no guest and `null` when it cannot
+  be read. In that case the current free memory is unknown, and only the
+  history counts toward M7;
+- without an offer, `lendable` is zero: the host lends nothing. The
+  capacity before any offer stays visible in `ameesh hosts`.
 
 `tests/dore/capacity_guard/lendable.json` gives the inputs (a reading, the
 history `{min_free_mem_bytes, app_cpu_p95, span_s}`, the offer) and the
