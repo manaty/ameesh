@@ -765,11 +765,36 @@ def _register_done(cfg: Config, name: str, key: list) -> None:
         pass
 
 
+def hook_subagent(data: dict) -> str:
+    """L133 : identifiant du sous-agent où ce hook se déclenche ; "" pour la
+    session principale.
+
+    Claude Code (sous-agent lancé par l'outil Agent/Task, coéquipier en
+    processus) et Codex (sous-agent lancé par spawn_agent) déclenchent les
+    hooks ordinaires (PostToolUse…) dans leurs sous-agents avec le
+    `session_id` de la session principale, et y ajoutent `agent_id`, absent
+    sur la session principale. `agent_type` seul ne désigne pas un
+    sous-agent : Claude Code le pose aussi sur une session principale lancée
+    avec `--agent`."""
+    agent_id = data.get("agent_id")
+    if agent_id is None:
+        return ""
+    return str(agent_id).strip()
+
+
 def cmd_hook(cfg: Config, tool: str) -> int:
     """Hook de harnais : lit le JSON sur stdin, ne fait JAMAIS échouer l'agent."""
     try:
         data = json.loads(sys.stdin.read() or "{}")
     except ValueError:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    if hook_subagent(data):
+        # L133 : le courrier de l'agent n'est jamais remis à l'un de ses
+        # sous-agents, qui l'ignorerait alors qu'il serait marqué livré. Rien
+        # n'est lu, remis, marqué ni écrit (inscription, titre, compteurs) :
+        # le courrier attend le prochain hook de la session principale.
         return 0
     event = data.get("hook_event_name") or ""
     try:
