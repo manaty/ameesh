@@ -126,6 +126,9 @@ TYPE_LABELS = {
     "mail_undeliverable": "courrier en souffrance",
     "decision_pending": "décision attendue",
     "decision_overdue": "décision sans réponse à l'échéance",
+    # L125 : mesure de l'effet du regroupement du courrier ; pas poussée par
+    # défaut (à ajouter dans `notify.types` pour la recevoir)
+    "turn_churn": "tours courts en rafale",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",

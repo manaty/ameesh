@@ -680,9 +680,13 @@ jq -r 'select(.urgent == true or (.type | IN(
   "stopped_with_mail","orphan_lot","dead_runner","delegation_expired")))
   | [.type, .agent // "-", .lot // "-"] | join(" ")' "$vu.json" | sort -u > "$vu.neuf"
 nouvelles=$(comm -13 "$vu" "$vu.neuf"); mv "$vu.neuf" "$vu"
-[ -n "$nouvelles" ] && agent-mail send auditeur "Alerte urgente : $nouvelles" --from ameesh
+# --urgent (L125) : réveil sans attendre la fenêtre de regroupement du courrier
+[ -n "$nouvelles" ] && agent-mail send auditeur "Alerte urgente : $nouvelles" --from ameesh --urgent
 exit 0
 ```
+
+Le « Passage horaire », lui, peut attendre la fenêtre de regroupement du
+courrier (90 s par défaut, L125).
 
 Puis :
 

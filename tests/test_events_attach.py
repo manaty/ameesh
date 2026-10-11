@@ -100,9 +100,13 @@ class EventsTest(PgTestCase):
         row = mail.unread(self.db, "evt")[0]
         self.assertTrue(mail.is_event(row))
         self.assertTrue(mail.is_urgent(row))
-        # --urgent n'a de sens qu'avec un événement
+        # L125 : --urgent vaut aussi pour un message ordinaire (réveil sans
+        # délai de regroupement)
         proc = self.cli("send", "evt", "x", "--urgent", env=env)
-        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        row = mail.unread(self.db, "evt")[-1]
+        self.assertFalse(mail.is_event(row))
+        self.assertTrue(mail.is_urgent(row))
         proc = self.cli("send", "evt", "x", "--kind", "inconnu", env=env)
         self.assertEqual(proc.returncode, 2)
 

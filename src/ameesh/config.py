@@ -77,6 +77,14 @@ def _as_count(value, default: int) -> int:
     return int(nombre)
 
 
+def _as_seconds(value, default: float) -> float:
+    """Durée ≥ 0 en secondes (L125) ; illisible, négative ou infinie : défaut."""
+    nombre = _as_float(value, float(default))
+    if nombre != nombre or nombre in (float("inf"), float("-inf")) or nombre < 0:
+        return float(default)
+    return nombre
+
+
 def _as_names(value) -> tuple[str, ...]:
     """Liste de noms séparés par des virgules -> tuple propre (ordre gardé)."""
     return tuple(n.strip() for n in str(value or "").split(",") if n.strip())
@@ -157,6 +165,12 @@ class Config:
     #: regroupement des événements (C9) : au plus un réveil par ce délai,
     #: sauf événement `urgent`. 0 = aucun regroupement.
     event_coalesce: float = 120.0
+    #: L125 : fenêtre de regroupement du courrier ordinaire (secondes) — un
+    #: agent au repos n'est réveillé qu'au bout de ce délai après l'arrivée
+    #: du premier message, et son tour emporte tout ce qui est arrivé entre-
+    #: temps ; un message urgent ou d'un humain réveille tout de suite.
+    #: Réglable par agent (`ameesh set <agent> mail_batch=…`). 0 = réveil immédiat.
+    mail_batch: float = 90.0
     #: plafond (octets UTF-8) de la consigne entière d'un tour de courrier ;
     #: au-delà, les messages les plus récents attendent le tour suivant
     prompt_mail_max: float = 20000.0
@@ -428,6 +442,8 @@ def load(env: dict | None = None) -> Config:
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
         event_coalesce=_as_float(
             pick("AMEESH_EVENT_COALESCE", "AGENT_MESH_EVENT_COALESCE"), cfg.event_coalesce),
+        mail_batch=_as_seconds(pick("AMEESH_MAIL_BATCH"),
+                               _as_seconds(cfg.mail_batch, Config.mail_batch)),
         prompt_mail_max=_as_float(pick("AMEESH_PROMPT_MAIL_MAX"), cfg.prompt_mail_max),
         canon_sync_interval=_as_float(
             pick("AMEESH_CANON_SYNC_INTERVAL", "AGENT_MESH_CANON_SYNC_INTERVAL"),

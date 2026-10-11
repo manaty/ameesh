@@ -74,6 +74,10 @@ os.environ["AMEESH_PRICES"] = EMPTY_PRICES
 #: vrai /tmp de la machine n'est ni mesuré ni balayé par les tests)
 EMPTY_SYSTEM_TMP = tempfile.mkdtemp(prefix="ameesh-test-system-tmp-")
 os.environ["AMEESH_SYSTEM_TMP"] = EMPTY_SYSTEM_TMP
+#: L125 : pas de fenêtre de regroupement du courrier dans le banc — un message
+#: réveille son destinataire tout de suite, comme avant L125 ; les tests du
+#: regroupement (test_l125_courrier_regroupe) posent leur propre fenêtre
+os.environ["AMEESH_MAIL_BATCH"] = "0"
 #: les binaires réels du poste (variables de l'exécuteur) ne fuient pas dans les
 #: tests : le banc pose ses faux harnais par `AMEESH_BIN_DIR` ou explicitement
 #: L106 : ni les emplacements connus des harnais (mise, ~/.local/bin, npx), ni

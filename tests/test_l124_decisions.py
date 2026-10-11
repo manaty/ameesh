@@ -256,6 +256,25 @@ class ReponseTest(_Base):
             self.answer(view["id"], "b")
         self.assertIn("déjà répondue par human:alice", str(ctx.exception))
 
+    def test_demande_et_reponse_restent_reveillantes(self):
+        """L125 : ni la demande (vers human:<id>) ni la réponse au demandeur
+        ne sont du courrier passif ; la réponse, d'un humain, réveille sans
+        attendre la fenêtre de regroupement — même un texte d'accusé."""
+        from ameesh import mail
+        from ameesh.storage.postgres.mailbox import PASSIVE_SQL
+        view = self.ask(urgent=True)
+        self.answer(view["id"], "merci, reçu")
+        rows = self.db.query("SELECT id, kind, sender, recipient, payload, (%s) AS passif "
+                             "FROM agent_mailbox ORDER BY id"
+                             % PASSIVE_SQL.format(t="agent_mailbox"))
+        self.assertEqual([(r["kind"], r["recipient"]) for r in rows],
+                         [("request", ALICE), ("reply", "orch")])
+        for row in rows:
+            self.assertEqual(mail.passive_reason(row), "", row)
+            self.assertFalse(row["passif"], row)
+        self.assertTrue(mail.is_human(rows[1]))
+        self.assertEqual(rows[1]["sender"], ALICE)
+
     def test_texte_libre_garde_tel_quel(self):
         view = self.ask()
         texte = "b, mais pas avant lundi : la revue d'abord"

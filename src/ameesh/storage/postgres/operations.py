@@ -16,9 +16,12 @@ from __future__ import annotations
 from typing import Any
 
 from .. import interface
+from .mailbox import PASSIVE_SQL
 
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = "('merged', 'promoted', 'closed')"   # closed : abandonné ou remplacé (L29)
+#: L125 : un message passif de la boîte `mb`
+_PASSIVE = PASSIVE_SQL.format(t="mb")
 
 
 def _sans_compte_nul(rows: list[dict]) -> list[dict]:
@@ -94,6 +97,7 @@ class Operations(interface.Operations):
                    p.turn AS turn_label,
                    coalesce(m.n, 0)::bigint AS unread,
                    extract(epoch from m.oldest)::float8 AS oldest_unread_ts,
+                   coalesce(m.n_passive, 0)::bigint AS passive_unread,
                    sw.title AS session_lot_title, sw.state AS session_lot_state,
                    aw.id AS assigned_lot_id, aw.title AS assigned_lot_title,
                    aw.state AS assigned_lot_state,
@@ -107,7 +111,11 @@ class Operations(interface.Operations):
               FROM agent_registry r
               LEFT JOIN spend_pending p ON p.agent = r.name
               LEFT JOIN LATERAL (
-                  SELECT count(*) AS n, min(created_at) AS oldest
+                  -- L125 : `unread` = le courrier qui ouvrira un tour ; le
+                  -- courrier passif (accusé, copie, diffusion) est compté à part
+                  SELECT count(*) FILTER (WHERE NOT """ + _PASSIVE + """) AS n,
+                         min(created_at) FILTER (WHERE NOT """ + _PASSIVE + """) AS oldest,
+                         count(*) FILTER (WHERE """ + _PASSIVE + """) AS n_passive
                     FROM agent_mailbox mb
                    WHERE mb.recipient = r.name AND mb.delivered_at IS NULL) m ON true
               LEFT JOIN LATERAL (

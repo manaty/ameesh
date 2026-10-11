@@ -290,8 +290,14 @@ test (trois messages → trois notifications) a attrapé le bug.
   l'agent comme un message ; un lot d'événements n'en réveille qu'un par
   `AMEESH_EVENT_COALESCE` secondes (défaut 120), sauf `payload.urgent`. L'instant
   du dernier réveil vit en base (`agent_registry.last_event_at`) : un
-  redémarrage ne remet pas la fenêtre à zéro. Le courrier ordinaire n'est jamais
-  regroupé.
+  redémarrage ne remet pas la fenêtre à zéro.
+* **Courrier regroupé (L125)** : le courrier ordinaire ne réveille un agent au
+  repos qu'à la fin d'une fenêtre (`AMEESH_MAIL_BATCH`, défaut 90 s, réglable
+  par agent), comptée depuis l'arrivée du plus ancien message ; le tour emporte
+  tout ce qui est arrivé entre-temps. Un message urgent ou d'un humain réveille
+  tout de suite ; un accusé de réception, une copie (`--cc`) ou une diffusion à
+  « all » ne réveille jamais seul : il est lu au tour suivant. Voir
+  [EXPLOITATION.md](EXPLOITATION.md#courrier-regroupé-avant-le-réveil-l125).
 * **`ameesh attach <agent>` (C9)** : prend le bail pour une session interactive
   (`attach:<utilisateur>@<hôte>`), même sur un bail vivant **sans tour en
   cours** — l'ancien exécuteur est fencé par l'epoch à son prochain
@@ -305,8 +311,9 @@ test (trois messages → trois notifications) a attrapé le bug.
   sans canon ; la capacité « interrupt » d'une fiche canon s'ajoutera) arrête le
   tour en cours (SIGTERM bref puis SIGKILL), remet la consigne du tour en
   attente, et `pick()` sert le message prioritaire **en tête** au tour suivant,
-  sur la même session. Un urgent d'un expéditeur non habilité est remis comme un
-  message normal, et l'abus est journalisé ; le fil garde la trace de
+  sur la même session. Un urgent d'un expéditeur non habilité n'interrompt rien
+  (c'est journalisé) : il est remis comme un message — depuis L125, sans
+  attendre la fenêtre de regroupement ; le fil garde la trace de
   l'interruption et de sa raison.
 * **Rotation de session (0018)** : quand la session dépasse
   `AMEESH_SESSION_MAX_TOKENS` (défaut 150 000) ou qu'un tour a duré plus de

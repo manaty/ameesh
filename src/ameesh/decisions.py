@@ -803,7 +803,10 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
         out["message_id"] = mail.send(
             db, human, view["requester"], answer_text(view), host=cfg.host, kind=REPLY_KIND,
             work_item_id=str(view["lot"]) if view.get("lot") is not None else None,
-            payload={"decision_answer": {"decision": view["id"], "lot": view.get("lot"),
+            # L125 : le courrier d'un humain réveille tout de suite (jamais
+            # retenu par la fenêtre de regroupement, jamais passif)
+            payload={"human": True,
+                     "decision_answer": {"decision": view["id"], "lot": view.get("lot"),
                                          "by": human, "channel": channel, "option": option,
                                          "text": text}},
             thread_meta={"decision": view["id"], "channel": channel})
