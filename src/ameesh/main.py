@@ -85,6 +85,7 @@
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
   ameesh migrate | doctor     schéma et diagnostic ;
   ameesh canon check|show|sync          canon OKF : validation, fiches, registre ;
+  ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
   ameesh harness list|show|check        descripteurs de harnais (L16) ;
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
@@ -204,6 +205,9 @@ def _dispatch(argv: list[str] | None) -> int:
         # L96 : feuille de route (engagements, propositions, Gantt)
         from . import roadmap
         return roadmap.main(rest)
+    if command == "memory":
+        from . import persona_memory
+        return persona_memory.main(rest)
     if command == "fil":
         from . import fil
         return fil.main(rest)

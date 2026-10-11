@@ -41,6 +41,7 @@ import time
 import uuid
 
 from . import account_turn, adapters, canon as canon_mod, canon_sync, cost as cost_mod
+from . import persona_memory as memory_mod
 from . import budget as budget_mod, db as db_mod, fil, mail, registry, storage
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
 from .config import load as load_config
@@ -2647,6 +2648,18 @@ class AgentWorker(threading.Thread):
         # `service_tier`) ; sans effet sur un harnais qui n'en déclare pas.
         tier = self._state_read("tier") or self.agent.get("tier") or ""
         patch = self._path("model.patch.yml") if (model or effort) else None
+        # Decision 0029: designate neutral files; the harness manages memory.
+        memory_preface = ""
+        if not session and self.agent.get("memory_repository") and not self.runner.dry_run:
+            try:
+                path = memory_mod.open_copy(self.agent["memory_repository"],
+                                            self.cfg.state_dir, self.name,
+                                            cfg_raw=self.cfg.persona_memory)
+                journal_id = "session-" + uuid.uuid4().hex
+                memory_preface = memory_mod.preface(path, self.name, journal_id)
+            except (memory_mod.MemoryError, OSError, subprocess.SubprocessError) as exc:
+                log("[%s] persona memory unavailable for this turn: %s" % (self.name, exc))
+        resume += memory_preface
         argv = adapter.command(resume + spec["prompt"], session,
                                model=model or None, effort=effort or None, patch=patch,
                                tier=tier or None)
@@ -2686,6 +2699,8 @@ class AgentWorker(threading.Thread):
 
         env = os.environ.copy()
         env.update(adapter.env())
+        # Decision 0029 disables native account memory for managed sessions.
+        env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         # L31 (0028) : identifiant du tour et étiquettes à poser sur les
         # conteneurs lancés par ses outils, pour repérer les orphelins.
         from . import containers as containers_mod
@@ -3080,6 +3095,7 @@ class AgentWorker(threading.Thread):
         self.last_activity = time.monotonic()
         if ok:
             self.session_turns += 1
+        self._sync_memory()
         if spec["kind"] == "idle":
             self.nudged = True
         with self.runner.lock:
@@ -3132,6 +3148,37 @@ class AgentWorker(threading.Thread):
             return base
         return min(self.runner.failure_backoff_max,
                    base * (2 ** (self.fast_failures - 1)))
+
+    def _sync_memory(self) -> None:
+        """Transport the persona session's memory changes at turn end, in the background."""
+        if not self.agent.get("memory_repository") or self.runner.dry_run:
+            return
+        path = memory_mod.copy_dir(self.cfg.state_dir, self.name)
+        if not os.path.isdir(os.path.join(path, ".git")):
+            return
+        lock = self.__dict__.setdefault("_memory_lock", threading.Lock())
+        if not lock.acquire(blocking=False):
+            return
+
+        def push_memory() -> None:
+            try:
+                r = memory_mod.sync(path, "memory for %s: turn end" % self.name,
+                                     cfg_raw=self.cfg.persona_memory)
+                if r["status"] == "pushed":
+                    log_async("[%s] persona memory pushed (%s)" % (self.name, r["commit"]))
+                elif r["status"] == "secret":
+                    log_async("[%s] memory alert: likely secret in %s; commit refused"
+                        % (self.name, ", ".join(r["files"])))
+                elif r["status"] == "push_rejected":
+                    log_async("[%s] memory alert: push rejected; copy kept (%s)"
+                        % (self.name, r["error"]))
+            except Exception as exc:  # noqa: BLE001 - memory failure must not fail a turn
+                log_async("[%s] memory sync failed : %s" % (self.name, exc))
+            finally:
+                lock.release()
+
+        threading.Thread(target=push_memory, daemon=True,
+                         name="%s-memory" % self.name).start()
 
     def stop_after_failures(self) -> None:
         """L48 : trop d'échecs rapides consécutifs (harnais introuvable, qui
@@ -4718,6 +4765,7 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     argv = adapter.interactive_command(agent.get("session_id"))
     env = _attach_env(cfg, name, owner, epoch)
     env.update(adapter.env())
+    env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
     holds: list = []
     env.update(_attach_tmp_env(cfg, name, env, holds))
     cwd = agent.get("cwd") or None

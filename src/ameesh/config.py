@@ -338,6 +338,8 @@ class Config:
     #: configuration de l'HÔTE désigné (`projects` : projet → dépôt et dossier
     #: des migrations), validée par `ameesh.radar`.
     radar: dict = field(default_factory=dict)
+    #: Neutral memory transport settings; ssh_key names a host-managed key file.
+    persona_memory: dict = field(default_factory=dict)
 
     @property
     def responsible_required(self) -> bool:
