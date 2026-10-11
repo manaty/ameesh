@@ -45,7 +45,7 @@ mail, nor report that it had stopped. Full analysis:
 
 # Consequences
 
-- Lots L36 to L41 ([study](../etudes/orchestration-et-vivacite.md#plan-de-lots-proposé));
+- Lots L36 to L41 ([study](../etudes/orchestration-et-vivacite.md#proposed-lot-plan));
   migrations 0030 and 0031 reserved.
 - Order: L36, then L37, then L38, L39 and L41 in parallel, then L40. Each
   lot is merged on the owner's approval.
