@@ -207,8 +207,8 @@ class PressionDuTmpfsTest(unittest.TestCase):
 
 
 class ImputationSansBaseTest(_Systeme, unittest.TestCase):
-    """#222 : à qui imputer une entrée de /tmp apparue pendant le tour ;
-    registre, tours et journal du ménage simulés."""
+    """#222 : une entrée de /tmp apparue pendant un tour n'est jamais imputée
+    à ce tour ; journal du ménage simulé."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.mkdtemp(prefix="l222-")
@@ -217,90 +217,53 @@ class ImputationSansBaseTest(_Systeme, unittest.TestCase):
         self.cfgl = _Cfg(os.path.join(self.tmp, "etat"))
         self.pol = menage.Policy(orphan_min_size=1)
 
-    def _fin(self, listing, recent=lambda chemin: [], overlap=()) -> tuple[str, list]:
-        """Un tour de a1 pendant lequel une entrée apparaît dans le faux /tmp."""
+    def _fin(self, derniers=lambda chemin: []) -> tuple[str, list]:
+        """Un tour de a1 pendant lequel une entrée apparaît dans le faux /tmp ;
+        `derniers(chemin)` : la dernière ligne de chaque chemin du journal."""
         chemin = os.path.join(self.sys, "codex3-94a-r2")
-        fausse = mock.Mock()
-        if isinstance(listing, Exception):
-            fausse.operations.listing.side_effect = listing
+        faux = mock.Mock()
+        if isinstance(derniers, Exception):
+            faux.housekeeping.latest_by_path.side_effect = derniers
         else:
-            fausse.operations.listing.return_value = listing
-        fausse.turn_resources.overlapping.return_value = list(overlap)
-        fausse.housekeeping.recent.side_effect = lambda *a, **k: recent(chemin)
+            faux.housekeeping.latest_by_path.side_effect = lambda *a, **k: derniers(chemin)
         tour = menage.Turn.begin(self.cfgl, self.pol, "a1", None, new_session=False,
                                  base_env={})
         _write(os.path.join(chemin, "f"), 5000)
-        with mock.patch.object(menage.storage, "of", return_value=fausse):
+        with mock.patch.object(menage.storage, "of", return_value=faux):
             entries = tour.end(lot="9", turn_id="t" * 32, db=object(), host="pc")
         return chemin, [e for e in entries if e["kind"] == "orphan"]
 
-    def _non_attribuee(self, signale: list, chemin: str, raison: str) -> None:
+    @staticmethod
+    def _ligne(chemin: str, action: str = "signaled", agent=None) -> list[dict]:
+        st = os.lstat(chemin)
+        return [{"path": chemin, "action": action, "agent": agent,
+                 "data": {"ino": st.st_ino, "dev": st.st_dev}}]
+
+    def test_seul_en_tour_l_entree_n_est_pas_imputee(self):
+        chemin, signale = self._fin()
         self.assertEqual([(e["path"], e["agent"], e["lot"]) for e in signale],
                          [(chemin, None, None)])
         self.assertIn(menage.UNATTRIBUTED, signale[0]["detail"])
-        self.assertIn(raison, signale[0]["detail"])
+        self.assertIn("jamais supprimé automatiquement", signale[0]["detail"])
+        # le tour et l'agent témoins restent dans les données
+        self.assertEqual((signale[0]["data"]["turn"], signale[0]["data"]["witness"],
+                          signale[0]["data"]["lot"]), ("t" * 32, "a1", "9"))
 
-    def test_seul_en_tour_entree_imputee_comme_avant(self):
-        chemin, signale = self._fin([
-            {"name": "a1", "host": "pc", "status": "running", "lease_live": True},
-            {"name": "a3", "host": "ailleurs", "status": "running", "lease_live": True},
-            {"name": "a4", "host": "pc", "status": "idle", "lease_live": True}])
-        self.assertEqual([(e["path"], e["agent"], e["lot"]) for e in signale],
-                         [(chemin, "a1", "9")])
-
-    def test_autre_agent_en_tour_sur_l_hote_entree_non_attribuee(self):
-        chemin, signale = self._fin([
-            {"name": "a2", "host": "pc", "status": "running", "lease_live": True}])
-        self._non_attribuee(signale, chemin, "avec a2 aussi en tour")
-
-    def test_bail_expire_ne_prouve_pas_l_arret(self):
-        chemin, signale = self._fin([
-            {"name": "a2", "host": "pc", "status": "running", "lease_live": False}])
-        self._non_attribuee(signale, chemin, "avec a2 aussi en tour")
-
-    def test_tour_d_un_autre_agent_dans_la_fenetre_entree_non_attribuee(self):
-        chemin, signale = self._fin([], overlap=[{"agent": "a5"}])
-        self._non_attribuee(signale, chemin, "avec a5 aussi en tour")
-
-    def test_erreur_de_lecture_entree_non_attribuee(self):
+    def test_journal_illisible_l_entree_est_signalee_non_attribuee(self):
         chemin, signale = self._fin(RuntimeError("base injoignable"))
-        self._non_attribuee(signale, chemin, "illisible")
+        self.assertEqual([(e["path"], e["agent"]) for e in signale], [(chemin, None)])
 
-    def test_hote_partage_avec_un_autre_mesh_entree_non_attribuee(self):
-        """Le dossier temporaire d'un agent d'un autre mesh (fichier
-        propriétaire d'une autre clé, L219) sous la racine commune."""
-        racine = menage.tmp_root(self.cfgl, self.pol)
-        os.makedirs(os.path.join(racine, "veille"))
-        menage._write_owner(racine, "veille", "0123456789abcdef", menage.ORIGIN_CREATED)
-        chemin, signale = self._fin([
-            {"name": "a1", "host": "pc", "status": "running", "lease_live": True},
-            {"name": "veille", "host": "pc", "status": "idle", "lease_live": False}])
-        self._non_attribuee(signale, chemin, "autre mesh (dossier temporaire veille)")
-
-    def test_dossier_sans_proprietaire_d_un_agent_inconnu_entree_non_attribuee(self):
-        """Un autre mesh d'avant L219 : dossier sans fichier propriétaire,
-        agent absent du registre."""
-        os.makedirs(os.path.join(menage.tmp_root(self.cfgl, self.pol), "agent-ailleurs"))
-        chemin, signale = self._fin([
-            {"name": "a1", "host": "pc", "status": "running", "lease_live": True}])
-        self._non_attribuee(signale, chemin, "autre mesh (dossier temporaire agent-ailleurs)")
-
-    def test_deja_signalee_par_le_tour_d_un_autre_agent_pas_reprise(self):
-        def recent(chemin):
-            st = os.lstat(chemin)
-            return [{"path": chemin, "action": "signaled", "agent": "a2",
-                     "data": {"ino": st.st_ino, "dev": st.st_dev}}]
-        _chemin, signale = self._fin([], recent)
+    def test_deja_signalee_par_un_autre_tour_pas_reprise(self):
+        _chemin, signale = self._fin(lambda c: self._ligne(c, agent="a2"))
         self.assertEqual(signale, [])
 
     def test_deja_non_attribuee_le_reste(self):
-        def recent(chemin):
-            st = os.lstat(chemin)
-            return [{"path": chemin, "action": "signaled", "agent": None,
-                     "data": {"ino": st.st_ino, "dev": st.st_dev}}]
-        _chemin, signale = self._fin([
-            {"name": "a1", "host": "pc", "status": "running", "lease_live": True}], recent)
+        _chemin, signale = self._fin(lambda c: self._ligne(c))
         self.assertEqual(signale, [])
+
+    def test_une_entree_close_puis_recreee_est_signalee(self):
+        chemin, signale = self._fin(lambda c: self._ligne(c, action="deleted", agent="a2"))
+        self.assertEqual([e["path"] for e in signale], [chemin])
 
 
 # ==========================================================================
@@ -319,13 +282,21 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.pol = menage.Policy(orphan_min_size=1)
         registry.upsert(self.db, "a1", harness="claude", host="pc")
 
-    def _tour(self, creer, agent: str = "a1", turn: str = "t" * 32) -> list[dict]:
-        """Un tour de `agent` pendant lequel `creer()` remplit le faux /tmp."""
+    def _tour(self, creer, agent: str = "a1", turn: str = "t" * 32,
+              impute: str | None = None) -> list[dict]:
+        """Un tour de `agent` pendant lequel `creer()` remplit le faux /tmp.
+        `impute` : ensuite, pour chaque entrée, une ligne attribuée à cet
+        agent, comme le ménage en écrivait avant #222 (les suppressions de
+        L162 partent d'un signalement attribué)."""
         tour = menage.Turn.begin(self.cfgl, self.pol, agent, None, new_session=False,
                                  base_env={})
         creer()
         entries = tour.end(lot=None, turn_id=turn, db=self.db, host="pc")
         storage.of(self.db).housekeeping.log("pc", entries, actor="test")
+        if impute:
+            storage.of(self.db).housekeeping.log("pc", [
+                dict(e, agent=impute, detail="signalement attribué (avant #222)")
+                for e in entries if e["kind"] == "orphan"], actor="test")
         return entries
 
     def _passage(self, decalage: float, **kw) -> dict:
@@ -338,19 +309,14 @@ class AbandonDbTest(_Systeme, PgTestCase):
         registry.claim(self.db, agent, "runner-" + agent, 600)
         registry.set_status(self.db, agent, "running")
 
-    def test_entree_pendant_le_tour_d_un_autre_agent_non_attribuee(self):
-        """#222 : une entrée apparue pendant que a2 tournait aussi sur l'hôte
-        peut être la sienne : non attribuée, jamais supprimée (comme les
-        worktrees d'un autre agent, L73b)."""
-        self._en_tour("a2")
+    def test_entree_jamais_imputee_jamais_supprimee(self):
+        """#222 : /tmp est commun à l'hôte ; une entrée apparue pendant le tour
+        de a1, même seul en tour, n'est pas imputée à a1 ni supprimée."""
         autre = os.path.join(self.sys, "codex3-94a-r2")
         entries = self._tour(lambda: _write(os.path.join(autre, "f"), 5000))
         signale = [e for e in entries if e["kind"] == "orphan"]
-        self.assertEqual([e["path"] for e in signale], [autre])
-        self.assertIsNone(signale[0]["agent"])
+        self.assertEqual([(e["path"], e["agent"]) for e in signale], [(autre, None)])
         self.assertIn(menage.UNATTRIBUTED, signale[0]["detail"])
-        self.assertIn("a2", signale[0]["detail"])
-        registry.set_status(self.db, "a2", "idle")
         self._passage(3 * 3600)   # bien au-delà de orphan_idle
         self.assertTrue(os.path.exists(autre))
 
@@ -366,7 +332,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         _write(os.path.join(autre, "f"), 5000)
         entrees_a2 = tour_a2.end(lot=None, turn_id="u" * 32, db=self.db, host="pc")
         storage.of(self.db).housekeeping.log("pc", entrees_a2, actor="test")
-        self.assertEqual([e["agent"] for e in entrees_a2 if e["kind"] == "orphan"], ["a2"])
+        self.assertEqual([e["agent"] for e in entrees_a2 if e["kind"] == "orphan"], [None])
         entrees_a1 = tour_a1.end(lot=None, turn_id="t" * 32, db=self.db, host="pc")
         self.assertEqual([e for e in entrees_a1 if e["kind"] == "orphan"], [])
 
@@ -417,6 +383,49 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertNotIn(entree, {a.get("path") for a in exploitation.alerts(self.cfg, self.db)
                                   if a["type"] == "tmp_orphan"})
 
+    def test_suivi_sans_borne_au_dela_de_500_et_200_entrees(self):
+        """#222 (relecture) : le passage lisait 500 lignes, les alertes 200 ;
+        chaque entrée non attribuée est suivie et alertée, quel qu'en soit le
+        nombre."""
+        chemins = [os.path.join(self.sys, "e%03d" % i) for i in range(600)]
+
+        def creer():
+            for chemin in chemins:
+                _write(os.path.join(chemin, "f"), 10)
+
+        self._tour(creer)
+        self._passage(menage.UNATTRIBUTED_REFRESH_S + 60)
+        derniers = storage.of(self.db).housekeeping.latest_by_path("pc", "orphan")
+        self.assertEqual(len(derniers), 600)
+        recents = storage.of(self.db).housekeeping.recent("pc", 3600, 5000, kind="orphan")
+        self.assertEqual(len(recents), 1200)   # signalement, puis re-signalement
+        alertes = {a.get("path") for a in exploitation.alerts(self.cfg, self.db)
+                   if a["type"] == "tmp_orphan"}
+        self.assertEqual(alertes & set(chemins), set(chemins))
+
+    def test_entree_non_attribuee_vieille_de_30_h_ou_de_8_jours_reste_suivie(self):
+        """#222 (relecture) : une entrée dont la dernière ligne a plus de 24 h
+        (alertes) ou plus de 7 jours (ménage arrêté) reste alertée, et le
+        passage la signale de nouveau."""
+        heures = os.path.join(self.sys, "vieille-30h")
+        jours = os.path.join(self.sys, "vieille-8j")
+
+        def creer():
+            _write(os.path.join(heures, "f"), 5000)
+            _write(os.path.join(jours, "f"), 5000)
+
+        self._tour(creer)
+        for chemin, age in ((heures, "30 hours"), (jours, "8 days")):
+            self.db.execute("UPDATE housekeeping_log SET at = now() - %s::interval"
+                            " WHERE path = %s", (age, chemin))
+        alertes = {a.get("path") for a in exploitation.alerts(self.cfg, self.db)
+                   if a["type"] == "tmp_orphan"}
+        self.assertTrue({heures, jours} <= alertes)
+        self._passage(0.0)
+        recents = {r["path"] for r in storage.of(self.db).housekeeping.recent(
+            "pc", 3600, 50, kind="orphan") if r["action"] == "signaled"}
+        self.assertEqual(recents, {heures, jours})
+
     def test_abandonne_supprime_recent_attend_essai_ne_touche_rien(self):
         abandon = os.path.join(self.sys, "preuve-images")
         self.addCleanup(subprocess.run, ["chmod", "-R", "u+rwx", abandon],
@@ -429,10 +438,10 @@ class AbandonDbTest(_Systeme, PgTestCase):
             os.chmod(os.path.join(abandon, "mod", "lecture-seule"), 0o555)
             os.chmod(os.path.join(abandon, "mod"), 0o555)
 
-        entries = self._tour(creer)
+        entries = self._tour(creer, impute="a1")
         signale = [e for e in entries if e["kind"] == "orphan"]
         self.assertEqual([e["path"] for e in signale], [abandon])
-        self.assertIn("supprimé par le ménage après 2 h", signale[0]["detail"])
+        self.assertIn("jamais supprimé automatiquement", signale[0]["detail"])   # #222
         self.assertIn("ino", signale[0]["data"])
         # 30 min plus tard : il attend
         rapport = self._passage(1800.0)
@@ -471,9 +480,9 @@ class AbandonDbTest(_Systeme, PgTestCase):
             _write(os.path.join(sale, "non-commite.txt"), 5000)
             _write(os.path.join(homonyme, "f"), 5000)
 
-        self._tour(creer)
+        self._tour(creer, impute="a1")
         self._tour(lambda: _write(os.path.join(inconnu, "f"), 5000), agent="parti",
-                   turn="u" * 32)
+                   turn="u" * 32, impute="parti")
         # recréé depuis le signalement : une autre entrée (autre inode ;
         # l'ancienne est gardée à côté pour que son inode ne soit pas réutilisé)
         os.rename(homonyme, homonyme + "-ancien")
@@ -515,7 +524,8 @@ class AbandonDbTest(_Systeme, PgTestCase):
     def test_worktree_de_relecture_propre_supprime_et_elague(self):
         main = _repo(self.tmp)
         relecture = os.path.join(self.sys, "relecture")
-        self._tour(lambda: _git("worktree", "add", "-q", "--detach", relecture, cwd=main))
+        self._tour(lambda: _git("worktree", "add", "-q", "--detach", relecture, cwd=main),
+                   impute="a1")
         self.assertIn(relecture, _git("worktree", "list", cwd=main))
         self._passage(3 * HEURE)
         self.assertFalse(os.path.exists(relecture))
@@ -523,7 +533,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
 
     def test_coupure_par_hote_et_tour_en_cours(self):
         abandon = os.path.join(self.sys, "jest_rs")
-        self._tour(lambda: _write(os.path.join(abandon, "cache"), 5000))
+        self._tour(lambda: _write(os.path.join(abandon, "cache"), 5000), impute="a1")
         coupe = menage.Policy(orphan_min_size=1, orphan_cleanup=False)
         rapport = self._passage(3 * HEURE, policy=coupe)
         self.assertTrue(os.path.exists(abandon))

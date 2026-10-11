@@ -2093,12 +2093,6 @@ class TurnResources(Domain):
         exécuteur mort les a laissées derrière lui."""
 
     @abc.abstractmethod
-    def overlapping(self, host: str, since_ts: float, exclude_agent: str) -> list[dict]:
-        """#222 : les tours des autres agents de `host` qui ont pu tourner
-        depuis `since_ts` : encore ouverts, en délai de grâce ou finis après
-        `since_ts`, quel que soit l'état de leur bail."""
-
-    @abc.abstractmethod
     def churn(self, since_ts: float, short_s: float) -> list[dict]:
         """L125 : par agent (ordre du nom), les tours FINIS lancés depuis
         `since_ts` : `agent`, `turns`, `short_turns` (durée sous `short_s`
@@ -2127,6 +2121,12 @@ class Housekeeping(Domain):
         """Les lignes des `since_s` dernières secondes (de l'hôte si donné, de
         ce `kind` si donné — L162 : les signalements de /tmp ne se noient pas
         dans les bilans), les plus récentes d'abord ; instant en `at_ts`."""
+
+    @abc.abstractmethod
+    def latest_by_path(self, host: str | None, kind: str) -> list[dict]:
+        """#222: the last line of each (host, path) of this `kind` (of the host
+        if given), with no time window nor limit: only the retention of the
+        log bounds it."""
 
     @abc.abstractmethod
     def summary(self, host: str | None, since_s: float) -> list[dict]:

@@ -196,14 +196,6 @@ class TurnResources(interface.TurnResources):
             "   AND coalesce(ended_at, started_at) < now() - make_interval(secs => %s)"
             + where + " ORDER BY started_at, id", tuple(params))
 
-    def overlapping(self, host, since_ts, exclude_agent) -> list[dict]:
-        return self.db.query(
-            "SELECT " + TURN_COLUMNS + " FROM turn_resources"
-            " WHERE host = %s AND agent <> %s"
-            "   AND (status = 'running' OR ended_at IS NULL"
-            "        OR ended_at > to_timestamp(%s))"
-            " ORDER BY started_at, id", (host, exclude_agent, float(since_ts)))
-
     def churn(self, since_ts, short_s) -> list[dict]:
         return self.db.query(
             """

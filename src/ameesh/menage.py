@@ -1106,17 +1106,17 @@ def orphan_pass(db, host: str, policy: Policy, *, registered, protected: set,
     if not host:   # sans nom d'hôte, les signalements des autres hôtes s'y mêleraient
         return entries, plan, present
     try:
-        rows = storage.of(db).housekeeping.recent(host, ORPHAN_LOOKBACK_S, 500, kind="orphan")
+        # #222: the last line of every path, with no window nor limit: an
+        # unattributed entry is followed for as long as it exists
+        rows = storage.of(db).housekeeping.latest_by_path(host, "orphan")
     except Exception:
         return entries, plan, present
-    seen: set = set()
     for row in rows:
         path = row.get("path") or ""
-        if not path or path in seen:
+        if not path or row.get("action") != "signaled":
             continue
-        seen.add(path)
-        if row.get("action") != "signaled":
-            continue
+        if row.get("agent") and now - float(row.get("at_ts") or 0) > ORPHAN_LOOKBACK_S:
+            continue   # an attributed signal (before #222) is read for 7 days, as before
         data = row.get("data") or {}
         base_item = {"kind": "orphan", "path": path, "agent": row.get("agent"),
                      "lot": row.get("lot")}
@@ -1523,81 +1523,42 @@ class Turn:
                     "agent": self.agent, "lot": lot if mine else None, "detail": detail})
         exclude = tuple(v for v in (self.env.get("TMPDIR"), self.env.get("AMEESH_CACHE_DIR"))
                         if v)
-        sort = (("supprimé par le ménage après %s sans changement s'il n'est tenu par aucun "
-                 "processus (L162)" % fmt_idle(policy.orphan_idle)) if policy.orphan_cleanup
-                else "jamais supprimé automatiquement (orphan_cleanup: false)")
         found_all = new_tmp_entries(self.tmp_before, min_size=policy.orphan_min_size,
                                     exclude=exclude)
-        doubt, signaled = self._attribution(db, host) if found_all else ("", set())
+        signaled = self._signaled(db, host) if found_all else set()
         for found in found_all:
             if (found["path"], str(found["ino"]), str(found["dev"])) in signaled:
                 continue  # #222: already signaled by another turn, its fate stays
-            entry = {
+            # #222: /tmp is shared by the whole host (other agents, other meshes
+            # whose state directory is elsewhere, processes outside any turn):
+            # nothing proves that this turn created the entry, so it is never
+            # charged to it. Unattributed, it is never deleted (`_orphan_verdict`
+            # keeps an entry without agent); the `tmp_orphan` alert follows it,
+            # with its size and the command, for as long as it exists.
+            self.entries.append({
                 "kind": "orphan", "action": "signaled", "path": found["path"],
-                "bytes": found["bytes"], "agent": self.agent, "lot": lot,
-                "detail": "apparu dans /tmp pendant le tour %s de %s (attribution probable) ; "
-                          "hors des dossiers gérés : %s" % (turn_id[:8], self.agent, sort),
-                "data": {"command": found["command"], "turn": turn_id,
-                         "ino": found["ino"], "dev": found["dev"]}}
-            if doubt:
-                # #222: /tmp is shared by the host; an entry another turn may have
-                # created is not charged to this one (like another agent's
-                # worktree, L73b): unattributed, hence never deleted
-                # (`_orphan_verdict` keeps an entry without agent).
-                entry.update(agent=None, lot=None, detail=(
-                    "%s : apparu dans /tmp pendant le tour %s de %s, %s ; jamais supprimé "
-                    "automatiquement" % (UNATTRIBUTED, turn_id[:8], self.agent, doubt)))
-            self.entries.append(entry)
+                "bytes": found["bytes"], "agent": None, "lot": None,
+                "detail": "%s : apparu dans /tmp pendant le tour %s de %s ; /tmp est commun "
+                          "à l'hôte (autres tours, autres meshes, processus hors tour) : "
+                          "jamais supprimé automatiquement" % (UNATTRIBUTED, turn_id[:8],
+                                                                 self.agent),
+                "data": {"command": found["command"], "turn": turn_id, "witness": self.agent,
+                         "lot": lot, "ino": found["ino"], "dev": found["dev"]}})
         return self.entries
 
-    def _attribution(self, db, host: str) -> tuple[str, set]:
-        """#222: (doubt, already signaled). The turn charges its new /tmp
-        entries to itself only if no other turn, of this mesh or of another,
-        may have run on the host during its window; `doubt` says why that is
-        not proven ('' if it is), and any error is one. Entries already
-        signaled by another turn, attributed or not (last line of their path,
-        same inode), keep their fate."""
+    def _signaled(self, db, host: str) -> set:
+        """#222: (path, inode, device) of the /tmp entries whose last line is
+        a signal (sticky rule: a later turn does not take it again). Without
+        database, or if the log cannot be read: none."""
         if db is None or not host:
-            return "sans base pour savoir qui d'autre tournait", set()
+            return set()
         try:
-            st = storage.of(db)
-            listing = st.operations.listing()
-            overlap = st.turn_resources.overlapping(host, self.started, self.agent)
-            rows = st.housekeeping.recent(host, ORPHAN_LOOKBACK_S, 500, kind="orphan")
-            troot, key = tmp_root(self.cfg, self.policy), mesh_key(self.cfg)
-            names = (sorted(os.listdir(troot))
-                     if os.path.isdir(troot) and _managed(troot) else [])
-            owners = {n: read_owner(troot, n) for n in names
-                      if n != MARKER and os.path.isdir(os.path.join(troot, n))
-                      and not os.path.islink(os.path.join(troot, n))}
+            rows = storage.of(db).housekeeping.latest_by_path(host, "orphan")
         except Exception:
-            return "registre, journal ou dossier temporaire illisible", set()
-        signaled: set = set()
-        seen: set = set()
-        for r in rows:   # newest first: the last line of a path counts
-            if r.get("path") in seen:
-                continue
-            seen.add(r.get("path"))
-            if r.get("action") == "signaled" and r.get("agent") != self.agent:
-                data = r.get("data") or {}
-                signaled.add((r.get("path"), str(data.get("ino")), str(data.get("dev"))))
-        # an expired lease does not prove the agent stopped: the status counts
-        others = {r["name"] for r in listing if r["name"] != self.agent
-                  and r.get("host") == host and r.get("status") == "running"}
-        others |= {r["agent"] for r in overlap}
-        if others:
-            return "avec %s aussi en tour sur l'hôte" % ", ".join(sorted(others)), signaled
-        # the registry does not see the other meshes of the host: their agents
-        # leave their directory in the shared tmp root (owner file of another
-        # mesh, L219, or no owner file and an agent unknown here)
-        registered = {r["name"] for r in listing} | {self.agent}
-        foreign = [n for n, owner in owners.items()
-                   if (owner is not None and owner != key)
-                   or (owner is None and tmp_agent(n, key) not in registered)]
-        if foreign:
-            return ("sur un hôte partagé avec un autre mesh (dossier temporaire %s)"
-                    % foreign[0]), signaled
-        return "", signaled
+            return set()
+        return {(r.get("path"), str((r.get("data") or {}).get("ino")),
+                 str((r.get("data") or {}).get("dev")))
+                for r in rows if r.get("action") == "signaled"}
 
 
 # --------------------------------------------------------------------------
