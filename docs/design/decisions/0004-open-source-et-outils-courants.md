@@ -1,25 +1,25 @@
 ---
 type: Decision
-title: "Alternatives open source et connecteurs vers les outils courants"
-description: "ameesh doit tourner sur une pile open source (quitte à créer la brique manquante) et se connecter aux outils courants comme Slack."
+title: "Open source alternatives and connectors to common tools"
+description: "ameesh must run on an open source stack (even if that means creating the missing piece) and connect to common tools such as Slack."
 status: stable
 tags: [open-source, connecteurs]
 decided_by: human:smichea
 decision_date: 2026-10-03
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:00:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-Nexlink ne doit pas être obligatoire pour utiliser ameesh.
+Nexlink must not be mandatory to use ameesh.
 
-# Décision
+# Decision
 
-- ameesh doit fonctionner avec des **alternatives open source à Nexlink**, **quitte à les créer** si elles n'existent pas.
-- En plus, des connecteurs vers les **outils les plus courants** pour la communication : **Slack** d'abord ; Teams, Google Chat, e-mail ensuite.
+- ameesh must work with **open source alternatives to Nexlink**, **even if that means creating them** when they do not exist.
+- In addition, connectors to the **most common tools** for communication: **Slack** first; Teams, Google Chat, e-mail next.
 
-# Conséquences
+# Consequences
 
-- Pile open source de référence issue des études : Matrix (messagerie, annuaire), OKF dans git sur Forgejo (canon), ameesh-approve (autorité, à créer), Zammad / Odoo + OCA + Karrio (métiers).
-- Slack : une application interne par organisation (conditions d'API) ; le journal de référence n'est jamais Slack.
+- Reference open source stack from the studies: Matrix (messaging, directory), OKF in git on Forgejo (canon), ameesh-approve (authority, to be created), Zammad / Odoo + OCA + Karrio (trades).
+- Slack: one internal app per organisation (API terms); the reference log is never Slack.

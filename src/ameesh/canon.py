@@ -2228,8 +2228,8 @@ class _Loader:
                              % key, **where, **subject)
                     continue
                 parsed[key] = part
-            elif key in resources_mod.POWER_KEYS:
-                # L106 : seuils de batterie, en pourcentage
+            elif key in resources_mod.POWER_KEYS + resources_mod.PRESSURE_KEYS:
+                # L106 : seuils de batterie, en pourcentage ; L159d : pression CPU
                 percent = resources_mod.parse_percent(value)
                 if percent is None:
                     self.add("host-policy-invalid", ERROR,
