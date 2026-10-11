@@ -15,7 +15,6 @@ example uses one folder per kind:
 ```
 examples/canon/
 ├── index.md                          # type: Index
-├── log.md                            # type: Log
 ├── membres/alice.md                  # type: Member
 ├── membres/bruno.md
 ├── hotes/atelier.md                  # type: Host
@@ -29,8 +28,11 @@ examples/canon/
 └── decisions/0001-placement-du-banc.md   # type: Decision
 ```
 
-`index.md`, `log.md` and the decision are ordinary OKF files of other types:
-ameesh ignores them, so a canon can carry more than ameesh needs. The example
+`index.md` and the decision are ordinary OKF files of other types: ameesh
+ignores them, so a canon can carry more than ameesh needs. A canon needs no
+hand-kept change log: its history is git and the merged pull requests. A
+`log.md` (type `Log`) is optional and, if an older canon still has one,
+ignored like `index.md`. The example
 has no `federation.yaml`; add one when you need federation members or review
 policies (section 6).
 

@@ -3,6 +3,8 @@
 
 Spec §4. ameesh ne lit que le **frontmatter** des fichiers `.md` d'un bundle
 OKF (hors `index.md` et `log.md`) et n'écrit jamais dans le canon.
+`log.md` est facultatif : l'historique d'un canon, ce sont git et les PR
+fusionnées ; un canon qui en garde un n'est pas gêné (il reste ignoré).
 
 Source approuvée (§4.1) : le canon est lu **par les objets git, à la révision
 fusionnée de la branche canonique** — `AMEESH_CANON_REF` si posé, sinon le

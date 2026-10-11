@@ -23,6 +23,9 @@ client réels.
 - [Décisions](decisions/) — un exemple de fiche d'un autre type, ignorée par
   ameesh.
 
+Pas de journal tenu à la main : l'historique du canon, ce sont git et les PR
+fusionnées.
+
 Essai :
 
 ```bash
