@@ -10,8 +10,13 @@ N'appelle jamais GitHub. Utilisé en processus (`FakeGh`, passé à
                                "mergedBy": {"login": "…"}, "mergedAt": "…"}},
      "repos": {"owner/repo": {"labels": [...], "issues": [...],
                               "sub_issues": {"<numéro>": [ids]},
-                              "sub_issues_api": true, "next": 1}},
+                              "sub_issues_api": true, "next": 1,
+                              "visibility": "private",
+                              "comments": {"<numéro>": ["texte", …]}}},
      "calls": [[argv…], …]}
+
+L126 : `gh api repos/<o>/<r>` rend la visibilité du dépôt, `gh api -X POST
+repos/<o>/<r>/issues/<n>/comments` ajoute un commentaire.
 
 Seule l'expression `--jq '.[] | @json'` est comprise (un objet par ligne).
 """
@@ -32,6 +37,8 @@ def _repo(state: dict, name: str) -> dict:
     repo.setdefault("sub_issues", {})
     repo.setdefault("sub_issues_api", True)
     repo.setdefault("next", 1)
+    repo.setdefault("visibility", "private")
+    repo.setdefault("comments", {})
     return repo
 
 
@@ -88,12 +95,27 @@ def handle(state: dict, argv: list, stdin: str | None = None) -> tuple[int, str,
         return 2, "", "faux gh : chemin d'API absent"
     route, _, query = path.partition("?")
     body = json.loads(stdin) if stdin else {}
-    match = re.fullmatch(r"repos/([^/]+/[^/]+)/(labels|issues)(?:/(\d+))?(?:/(sub_issues|sub_issue))?",
-                         route)
+    whole = re.fullmatch(r"repos/([^/]+/[^/]+)", route)
+    if whole and method == "GET":
+        if whole.group(1) in state.get("missing_repos", []):
+            return 1, "", "gh: Not Found (HTTP 404)"
+        repo = _repo(state, whole.group(1))
+        return 0, json.dumps({"full_name": whole.group(1), "visibility": repo["visibility"],
+                              "private": repo["visibility"] != "public"}), ""
+    match = re.fullmatch(r"repos/([^/]+/[^/]+)/(labels|issues)(?:/(\d+))?"
+                         r"(?:/(sub_issues|sub_issue|comments))?", route)
     if not match:
         return 1, "", "gh: Not Found (HTTP 404)"
     repo = _repo(state, match.group(1))
     kind, number, sub = match.group(2), match.group(3), match.group(4)
+    if sub == "comments":
+        if int(number) not in {int(i["number"]) for i in repo["issues"]}:
+            return 1, "", "gh: Not Found (HTTP 404)"
+        if method == "POST":
+            repo["comments"].setdefault(str(number), []).append(body.get("body", ""))
+            return 0, json.dumps({"id": 1, "body": body.get("body", "")}), ""
+        if method == "GET":
+            return 0, _lines({"body": b} for b in repo["comments"].get(str(number), [])), ""
     if kind == "labels":
         if method == "GET":
             return 0, _lines({"name": n} for n in repo["labels"]), ""
@@ -162,10 +184,15 @@ def handle(state: dict, argv: list, stdin: str | None = None) -> tuple[int, str,
 class FakeGh:
     """Le faux `gh` en processus : même contrat que `plan_github.Gh.run`."""
 
-    def __init__(self, state: dict | None = None):
+    def __init__(self, state: dict | None = None, fail=None):
         self.state = state if state is not None else {"prs": {}, "repos": {}}
+        #: L126 : `fail(argv)` vrai → l'appel échoue (panne de GitHub simulée)
+        self.fail = fail
 
     def run(self, argv: list, stdin: str | None = None) -> tuple[int, str, str]:
+        if self.fail is not None and self.fail(list(argv)):
+            self.state.setdefault("calls", []).append(list(argv))
+            return 1, "", "gh: Server Error (HTTP 502)"
         return handle(self.state, list(argv), stdin)
 
     # -- observation -------------------------------------------------------

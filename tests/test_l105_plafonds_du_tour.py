@@ -197,14 +197,14 @@ class DureeMaximaleTest(_Base):
     def test_defaut_et_environnement(self):
         from ameesh import config as config_mod
         self.assertEqual(config_mod.Config().turn_max_seconds, 1800)
-        self.assertEqual(config_mod.Config().turn_mail_max, 5)
+        self.assertEqual(config_mod.Config().turn_mail_max, 20)  # 5 avant le 2026-10-11
         cfg = config_mod.load(env={"AMEESH_TURN_MAX_SECONDS": "600",
                                    "AMEESH_TURN_MAIL_MAX": "2",
                                    "AMEESH_CONFIG": "/nulle-part.json"})
         self.assertEqual((cfg.turn_max_seconds, cfg.turn_mail_max), (600.0, 2))
         cfg = config_mod.load(env={"AMEESH_TURN_MAIL_MAX": "nan",
                                    "AMEESH_CONFIG": "/nulle-part.json"})
-        self.assertEqual(cfg.turn_mail_max, 5)
+        self.assertEqual(cfg.turn_mail_max, 20)
 
 
 class CourrierBorneTest(_Base):
@@ -283,7 +283,7 @@ class ReglagesTest(_Base):
         self.assertEqual(self.mesh("set", "orch-set", "turn_mail_max=-1").returncode, 2)
         proc = self.mesh("set", "orch-set", "turn_max_seconds=", "turn_mail_max=")
         self.assertIn("tour_max_s=1800 (défaut)", proc.stdout)
-        self.assertIn("courrier_par_tour=5 (défaut)", proc.stdout)
+        self.assertIn("courrier_par_tour=20 (défaut)", proc.stdout)
 
     def test_borne_du_courrier_passee_au_harnais(self):
         _runner, worker = self._worker("orch-env", turn_mail_max=2)

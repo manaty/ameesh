@@ -21,3 +21,6 @@ test_l61_allers_retours
 test_l72_panne_de_base
 # notifications : le listener psql persistant (le test force AMEESH_DRIVER=psql)
 test_events_attach
+# courrier en souffrance : renvoi en une transaction (psql persistant), lecture
+# du courrier en souffrance jointe à la vue par projet (une requête)
+test_undeliverable

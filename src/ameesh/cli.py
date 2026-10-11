@@ -2,12 +2,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """agent-mail (mesh v1) — boîte aux lettres des agents, sur Postgres.
 
-  agent-mail send <dest> <texte…> [--from NOM] [--lot ID|RÉF] [--new-lot "titre"]
+  agent-mail send <dest> <texte…> [--from NOM] [--lot ID|RÉF] [--new-lot "titre"] [--queue]
                                                  dépose un message (dest = nom, ou "all")
                                                  et l'écrit dans le fil lisible du projet
                                                  ou du lot (ameesh fil show <projet> [<lot>]) ;
                                                  d'un orchestrateur, --lot rattache le lot
-                                                 au destinataire et --new-lot le crée (L118)
+                                                 au destinataire et --new-lot le crée (L118) ;
+                                                 refusé vers un nom absent du registre (noms
+                                                 proches proposés), vers un agent arrêté
+                                                 (sauf --queue) et depuis une identité arrêtée
                        [--urgent] [--ack] [--cc NOM[,NOM…]]
                                                  L125 : un agent au repos n'est réveillé
                                                  qu'après une fenêtre de regroupement
@@ -16,6 +19,10 @@
                                                  réception) et --cc (copie, en événement)
                                                  ne réveillent pas : lus au tour suivant ;
                                                  « all » sans --urgent non plus
+  agent-mail forward <ancien> <nouveau> [--dry-run] [--json]
+                                                 re-livre le courrier en attente d'un agent
+                                                 arrêté (ou absent du registre) à un agent
+                                                 vivant : expéditeur et date gardés
   agent-mail list                                agents, hôte, bail, non lus
   agent-mail inbox [NOM]                         messages non lus de NOM (sans les marquer lus)
   agent-mail whoami [--session ID --harness H]   identité liée et sa source (runner, explicit,
@@ -151,6 +158,7 @@ def render(msgs: list[dict], verdicts: dict | None = None) -> str:
                 suffixe = "  [⚠ signature NON valide : %s]" % verdict.reason
         if msg.get("deja_consigne"):
             suffixe += "  [re-livré après une panne : peut-être déjà traité]"
+        suffixe += mail.forwarded_note(msg)
         # L125 : un message passif (copie, accusé, diffusion) le dit ; un
         # message ordinaire garde la ligne de la v0, à l'octet près
         passif = mail.passive_label(msg)
@@ -239,6 +247,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     if "--urgent" in args:
         urgent = True
         args = [arg for arg in args if arg != "--urgent"]
+    # dépôt explicite chez un agent arrêté (lu à sa reprise, ou renvoyé)
+    queue = "--queue" in args
+    args = [arg for arg in args if arg != "--queue"]
+    explicit = sender is not None
     if kind not in ("request", "reply", "notify", "event"):
         print("kind invalide : %r (request|reply|notify|event)" % (kind,), file=sys.stderr)
         return 2
@@ -261,7 +273,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     if len(args) < 2:
         print("usage: agent-mail send <dest|all> <texte…> [--from NOM] [--lot ID|RÉF] "
               "[--new-lot \"titre\"] [--kind request|reply|notify|event] [--urgent] "
-              "[--ack] [--cc NOM[,NOM…]] [--sign --key FICHIER] [--expires 24h]",
+              "[--ack] [--cc NOM[,NOM…]] [--sign --key FICHIER] [--expires 24h] [--queue]",
               file=sys.stderr)
         return 2
     if lot is not None and not NAME_RE.match(lot):
@@ -274,11 +286,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--new-lot : titre vide", file=sys.stderr)
         return 2
     dest, text = args[0], " ".join(args[1:]).strip()
+    binding = None
     if not sender:
         binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
         if not binding.ok:
-            print("expéditeur non lié : posez AGENT_MAIL_NAME (le runner le fait) "
-                  "ou passez --from NOM", file=sys.stderr)
+            # la raison quand une identité est annoncée (ex. « agent arrêté »)
+            print("expéditeur non lié%s : posez AGENT_MAIL_NAME (le runner le fait) "
+                  "ou passez --from NOM" % (
+                      " (%s : %s)" % (binding.name, binding.reason)
+                      if binding.name and binding.reason else ""), file=sys.stderr)
             return 2
         sender = binding.name
     if not NAME_RE.match(sender) or not text:
@@ -347,6 +363,20 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             print("attention : en repli fichier, la signature n'est pas conservée",
                   file=sys.stderr)
 
+    # Courrier en souffrance (2026-10-11) : ni agent fantôme, ni boîte morte,
+    # ni réponse vers une identité arrêtée — refusé AVANT tout dépôt (et avant
+    # qu'un lot soit créé ou rattaché). Le repli fichier n'a pas de registre.
+    if bk.kind == "pg":
+        from . import undeliverable
+        try:
+            notes = undeliverable.check_send(cfg, bk.db, sender=sender, dest=dest, queue=queue,
+                                             explicit=explicit, binding=binding)
+        except undeliverable.Refused as exc:
+            print("message non déposé — %s" % exc, file=sys.stderr)
+            return 2
+        for note in notes:
+            print("attention : %s" % note, file=sys.stderr)
+
     # L125 : ce qui réveille le destinataire. Un humain réveille tout de suite
     # (jamais d'accusé reconnu pour lui) ; un accusé de réception — `--ack`, ou
     # un texte très court qui n'est QUE cela (`mail.looks_like_ack`) — attend
@@ -391,10 +421,16 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             print("attention : ce message confie un lot à %s : il le réveille "
                   "(pas un accusé de réception)" % dest, file=sys.stderr)
 
+    skipped: list[str] = []
     targets = bk.send(sender, dest, text, host=cfg.host, signed=signed,
                       work_item_id=lot, allow_structured=allow_structured,
                       kind=kind, urgent=urgent, thread_meta=thread_meta,
-                      payload=payload or None, cc=cc)
+                      payload=payload or None, cc=cc,
+                      include_stopped=queue, skipped=skipped)
+    if skipped:
+        print("attention : non déposé pour %s (%s) — --queue pour déposer quand même" % (
+            ", ".join(sorted(skipped)), "arrêtés : personne ne lit leur boîte"
+            if len(skipped) > 1 else "arrêté : personne ne lit sa boîte"), file=sys.stderr)
     if not targets:
         print("aucun destinataire")
     elif signed:
@@ -457,6 +493,7 @@ def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
                 marque = "  [signé par un agent]"
             else:
                 marque = "  [⚠ signature NON valide : %s]" % verdict.reason
+        marque += mail.forwarded_note(msg)
         print("de %s%s : %s" % (msg.get("from"), marque, msg.get("text")))
     return 0
 
@@ -618,6 +655,36 @@ def avis_borne(attente: int, borne: int) -> str:
             "la suite au tour suivant." % (attente, borne))
 
 
+def avis_borne_travail(attente: int, borne: int, travail: list[str]) -> str:
+    """Borne atteinte, mais un travail lancé pendant le tour tourne encore :
+    le tour n'est pas coupé pour le courrier (le conclure maintenant
+    laisserait ce travail sans personne pour en lire le résultat)."""
+    return ("[ameesh] %d message(s) en attente restent pour ton tour suivant : au plus "
+            "%d message(s) te sont remis pendant un même tour. Un travail lancé pendant "
+            "ce tour tourne encore (%s) : ne conclus pas avant sa fin ; conclus ensuite "
+            "ce tour, l'exécuteur te remettra la suite au tour suivant."
+            % (attente, borne, " ; ".join(travail[:3])
+               + (" ; …" if len(travail) > 3 else "")))
+
+
+#: le travail du tour (processus de fond, conteneurs) est relevé au plus à ce
+#: rythme par le hook, une fois la borne du courrier atteinte (secondes)
+TRAVAIL_RELEVE_S = 30.0
+
+
+def _travail_du_tour(cfg: Config, bk, tour: str, etat: dict) -> list[str]:
+    """Le travail lancé pendant ce tour qui tourne encore : tant qu'il y en a,
+    la borne du courrier ne demande pas de conclure. Relevé espacé (l'état
+    du tour garde le dernier relevé)."""
+    maintenant = time.time()
+    if maintenant - float(etat.get("travail_ts") or 0.0) < TRAVAIL_RELEVE_S:
+        return list(etat.get("travail") or [])
+    from . import background
+    travail = background.hook_jobs(cfg, bk.db if bk.kind == "pg" else None, tour)
+    etat["travail"], etat["travail_ts"] = travail, maintenant
+    return travail
+
+
 def tour_path(cfg: Config, name: str) -> str:
     """État du courrier remis par le hook pendant le tour en cours (L105)."""
     return os.path.join(cfg.state_dir, "hooks", name + ".tour.json")
@@ -631,10 +698,15 @@ def tour_lit(cfg: Config, name: str, turn: str) -> dict:
         if isinstance(etat, dict) and etat.get("turn") == turn:
             return {"turn": turn, "remis": int(etat.get("remis") or 0),
                     "attente": int(etat.get("attente") or 0),
-                    "signale": bool(etat.get("signale"))}
+                    "signale": bool(etat.get("signale")),
+                    # borne atteinte pendant un travail du tour (dit une fois)
+                    "differe": bool(etat.get("differe")),
+                    "travail": [str(t) for t in etat.get("travail") or []],
+                    "travail_ts": float(etat.get("travail_ts") or 0.0)}
     except (OSError, ValueError, TypeError):
         pass
-    return {"turn": turn, "remis": 0, "attente": 0, "signale": False}
+    return {"turn": turn, "remis": 0, "attente": 0, "signale": False, "differe": False,
+            "travail": [], "travail_ts": 0.0}
 
 
 def _tour_ecrit(cfg: Config, name: str, etat: dict) -> None:
@@ -756,7 +828,9 @@ def cmd_hook(cfg: Config, tool: str) -> int:
         # L105 : pendant un tour mené par l'exécuteur, au plus `turn_mail_max`
         # messages remis ; au-delà, rien n'est réservé (ils restent pour le
         # tour suivant), le Stop n'est plus bloqué, et l'agent est invité à
-        # conclure son tour.
+        # conclure son tour — jamais tant qu'un travail lancé pendant le tour
+        # tourne encore (processus de fond, conteneurs du tour) : il le saura,
+        # et l'invitation viendra après.
         tour = os.environ.get("AMEESH_TURN_ID") or ""
         borne = cfg.turn_mail_max if (tour and binding.bound_to_lease) else 0
         etat = tour_lit(cfg, name, tour) if borne else None
@@ -765,10 +839,17 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 return 0
             attente = _attente(bk, name, [])
             etat["attente"] = attente
-            if attente and not etat["signale"] and _emit({
-                    "hookSpecificOutput": {"hookEventName": event,
-                                           "additionalContext": avis_borne(attente, borne)}}):
-                etat["signale"] = True
+            if attente and not etat["signale"]:
+                travail = _travail_du_tour(cfg, bk, tour, etat)
+                if not travail:
+                    if _emit({"hookSpecificOutput": {
+                            "hookEventName": event,
+                            "additionalContext": avis_borne(attente, borne)}}):
+                        etat["signale"] = True
+                elif not etat["differe"] and _emit({"hookSpecificOutput": {
+                        "hookEventName": event,
+                        "additionalContext": avis_borne_travail(attente, borne, travail)}}):
+                    etat["differe"] = True
             _tour_ecrit(cfg, name, etat)
             return 0
         remise = _Remise(bk, name, binding)
@@ -779,8 +860,13 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                 attente = _attente(bk, name, msgs)
                 etat["attente"] = attente
                 if attente:
-                    avis = "\n\n" + avis_borne(attente, borne)
-                    etat["signale"] = True
+                    travail = _travail_du_tour(cfg, bk, tour, etat)
+                    if travail:
+                        avis = "\n\n" + avis_borne_travail(attente, borne, travail)
+                        etat["differe"] = True
+                    else:
+                        avis = "\n\n" + avis_borne(attente, borne)
+                        etat["signale"] = True
             if event == "Stop":
                 # L125 : un courrier passif (accusé, copie, diffusion) ne relance
                 # pas un tour qui se termine : rendu à la boîte, il attend le
@@ -964,6 +1050,60 @@ def cmd_bindings(bk, rest: list[str]) -> int:
         print("%-20s %-8s %-38s %-8s %-12s %-16s %s%s" % (
             row.get("agent"), row.get("harness"), row.get("session_id"),
             row.get("pid") or "-", row.get("host"), quand, row.get("created_by"), etat))
+    return 0
+
+
+_FORWARD_USAGE = "usage: agent-mail forward <ancien> <nouveau> [--dry-run] [--json]"
+
+
+def cmd_forward(bk, cfg: Config, rest: list[str]) -> int:
+    """Vide une boîte morte : re-livre le courrier en attente d'un agent arrêté
+    (ou absent du registre) à un agent vivant (`undeliverable.forward`)."""
+    from . import undeliverable
+    try:
+        opts, positional = _options(rest, (), ("--dry-run", "--json"))
+    except ValueError as exc:
+        print("%s\n%s" % (exc, _FORWARD_USAGE), file=sys.stderr)
+        return 2
+    if len(positional) != 2 or not all(NAME_RE.match(name) for name in positional):
+        print(_FORWARD_USAGE, file=sys.stderr)
+        return 2
+    old, new = positional
+    try:
+        result = undeliverable.forward(cfg, bk.db, old, new, actor=_actor(),
+                                       dry_run=bool(opts.get("--dry-run")))
+    except undeliverable.Refused as exc:
+        print("renvoi refusé — %s" % exc, file=sys.stderr)
+        return 1
+    if opts.get("--json"):
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0
+    if result["dry_run"]:
+        rows = result["messages"]
+        if not rows:
+            print("aucun message en attente pour %s : rien à renvoyer" % old)
+            return 0
+        print("à blanc : %d message(s) en attente pour %s (%s) seraient re-livré(s) à %s :"
+              % (len(rows), old, result["old_state"], new))
+        for row in rows:
+            print("  n°%s de %s, %s%s" % (
+                row["id"], row.get("sender") or "?",
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(row.get("created_ts") or 0)),
+                " (%s)" % row["kind"] if row.get("kind") not in (None, "notify") else ""))
+        return 0
+    moved = result["forwarded"]
+    if not moved:
+        print("aucun message en attente pour %s : rien à renvoyer" % old)
+        return 0
+    senders: dict = {}
+    for row in moved:
+        senders[row.get("sender") or "?"] = senders.get(row.get("sender") or "?", 0) + 1
+    print("%d message(s) re-livré(s) de %s (%s) à %s : %s" % (
+        len(moved), old, result["old_state"], new,
+        ", ".join("n°%s → n°%s" % (r["original_id"], r["new_id"]) for r in moved)))
+    print("expéditeurs : %s ; expéditeur et date d'origine gardés, renvoi noté dans le fil"
+          % ", ".join("%s (%d)" % kv for kv in sorted(senders.items(),
+                                                       key=lambda kv: (-kv[1], kv[0]))))
     return 0
 
 
@@ -1211,6 +1351,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_list(bk)
         if command == "whoami":
             return cmd_whoami(bk, cfg, rest)
+        if command == "forward":
+            if bk.kind != "pg":
+                print("le renvoi exige la base (AMEESH_DSN) : le repli fichier n'a pas de "
+                      "registre", file=sys.stderr)
+                return 1
+            return cmd_forward(bk, cfg, rest)
         if command in ("bind", "unbind", "bindings"):
             if bk.kind != "pg":
                 print("les liaisons de session exigent la base (AMEESH_DSN) : "

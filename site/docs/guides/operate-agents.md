@@ -79,7 +79,7 @@ Each agent row keeps the historical keys and adds:
 | `session_policy`, `session_policy_set` | effective policy; the agent's own setting or `null` |
 | `state` | `working`, `idle`, `paused` or `stopped` (same rules as `ameesh progress`) |
 | `state_since_ts`, `state_for_s` | since when |
-| `lot` | `{id, title, state, source}`: the session's lot (`"session"`), else the most recent open lot assigned (`"assigned"`), or `null` |
+| `lot` | `{id, title, state, source}`: the session's lot (`"session"`) unless it is merged or closed, else the most recent open lot assigned (`"assigned"`), or `null` |
 | `title` | title of the current lot, else the status text |
 | `unread`, `oldest_unread_ts` | mail not delivered yet |
 | `turn_started_ts` | start of the running turn, or `null` |

@@ -46,8 +46,82 @@ avec ou sans PR : fusion directe, avance rapide, squash. La cible par défaut
 est celle du dépôt (`git config ameesh.target develop` dans le clone si
 l'équipe n'intègre pas sur la branche par défaut), ou `--target`.
 
-Sans branche, fermer à la main : `ameesh work close <id> --superseded-by`
-ou `ameesh work move <id> …`.
+## Fusion sans PR ni branche déclarée
+
+Une équipe qui fusionne en local sur sa branche d'intégration (`--no-ff`,
+sans PR) fait fermer ses lots par l'exécuteur en les **désignant dans le
+commit de fusion** :
+
+```
+git merge --no-ff agent/claude1-veille -m "Merge #93 COMPUTE-IDLE" -m "ameesh-work: 93"
+```
+
+* la ligne `ameesh-work: <id>` désigne le lot, toujours ;
+* `#<id>` dans le titre du commit de fusion le désigne aussi, **si le
+  dépôt l'active** (`git config ameesh.lotRef hash`) — à ne faire que si ces
+  numéros sont des lots ameesh : ailleurs « (#45) » est une PR GitHub ;
+* la cible est celle du dépôt : poser une fois dans le clone `git config
+  ameesh.target origin/develop` (fusions poussées puis récupérées) ou
+  `develop` (fusions faites dans ce clone) quand l'équipe n'intègre pas sur
+  la branche par défaut. Une cible introuvable est une erreur du relevé,
+  visible dans `ameesh work sync-branches`.
+
+Le relevé passe toutes les 5 min dans le dossier de travail de l'assigné :
+le lot doit être assigné à un agent de l'hôte. Le lot fermé reçoit le
+commit de fusion et une note qui dit comment la fusion a été constatée.
+
+À la main, quand le relevé ne peut pas la voir (lot sans assigné, autre
+hôte, commit qui ne le désigne pas) :
+
+```
+ameesh work merged <id> --sha <commit de fusion> [--note "…"]
+```
+
+depuis tout état ouvert, en une fois ; l'acteur est votre identité liée.
+L'alerte `stale_lot` rappelle cette commande pour un lot inactif.
+
+Autres fermetures : `ameesh work close <id> --abandoned | --superseded-by
+<id>`. Un lot passé `promoted` par erreur : `ameesh work move <id> merged
+--correct "raison"` (humains, orchestrateurs et agents de conception
+seulement ; tracé au journal).
+
+## Le lot en cours
+
+`ameesh projects` montre comme lot en cours d'un agent le dernier lot
+**ouvert** qu'il cite dans son courrier (`--lot <id|RÉF>`), sinon le lot de
+sa session, sinon son lot assigné le plus récent ; jamais un lot fusionné ou
+fermé. Demandez aux agents de citer leur lot (`--lot`) dans leurs comptes
+rendus, relectures comprises : une référence (`RÉF` du titre) qui désigne un
+seul lot ouvert est enregistrée par son numéro, quel que soit l'expéditeur.
+
+## Chaque lot a son issue GitHub
+
+ameesh crée et tient une issue GitHub par lot, dans le dépôt de son projet
+(L126). Le titre, l'état (étiquette `ameesh:<état>`), le type, la priorité et
+l'assigné suivent le lot. Quand le lot est fusionné, livré ou fermé, ameesh
+ferme l'issue avec un commentaire qui dit pourquoi. L'issue d'un lot est son
+`issue_ref` (`ameesh work show <id>`), utilisable avec `--lot`.
+
+* Ne jamais créer à la main l'issue d'un lot : créer le lot (`--new-lot`,
+  `ameesh work add`). Son issue suit au passage suivant d'`ameesh notify`,
+  en moins d'une minute.
+* Une PR qui livre un lot porte ces deux lignes dans sa **description** :
+
+  ```
+  ameesh-work: <numéro du lot>
+  Closes #<numéro de l'issue>
+  ```
+
+  `ameesh-work` relie la PR au lot. `Closes` ferme l'issue à la fusion, et
+  relie aussi la PR au lot par son issue (`ameesh work sync-github`).
+* Un dépôt public ne reçoit que le titre du lot et sa ligne
+  « Résumé public : … », si le corps en a une. Le reste du corps n'est jamais
+  publié. Un titre qui contient un chemin local, un nom d'hôte, une adresse,
+  un identifiant de compte, un secret ou un terme exclu par l'organisation
+  n'a pas d'issue : le refus est journalisé, corriger le titre.
+* Une modification faite dans GitHub n'est jamais reprise dans ameesh :
+  c'est le lot qu'on change. Garder le marqueur `<!-- ameesh:work=… -->` du
+  corps de l'issue, qui la relie au lot.
 
 ## Le courrier qui réveille (L125)
 
@@ -98,3 +172,57 @@ travail attend, `ameesh notify` envoie à l'orchestrateur un courrier `event`
 d'`ameesh` : la liste des agents au repos de son équipe et des lots ouverts
 sans agent. Réponse attendue : leur confier ces lots (`--lot`), ou en créer
 (`--new-lot`). Un même épisode n'est envoyé qu'une fois.
+
+## Le courrier « Courrier en souffrance »
+
+Un message adressé à un nom absent du registre, ou à un agent arrêté, n'est
+lu par personne. `ameesh mail send` le refuse désormais (noms proches
+proposés ; `--queue` pour déposer quand même chez un agent arrêté), mais du
+courrier peut encore y attendre. Passé 15 min, `ameesh notify` envoie à
+l'orchestrateur de l'équipe un courrier `event` d'`ameesh` : le destinataire,
+le nombre de messages, leurs expéditeurs, et l'agent qui a repris le travail
+s'il est connu. Réponse attendue : re-livrer à l'agent qui porte le travail
+(`ameesh mail forward <ancien> <nouveau>`, expéditeur et date d'origine
+gardés ; à soi-même si le message nous était destiné), ou faire relancer
+l'agent par son responsable (`ameesh resume <agent>`), puis prévenir les
+expéditeurs du bon nom.
+
+## Livraison et déploiements
+
+Règles du propriétaire (2026-10-10), après qu'une version mineure (1.6.2) est
+restée 4 h fusionnée sans être déployée :
+
+1. **Fusionner d'abord.** Une PR à CI verte qui débloque une demande du
+   propriétaire se fusionne avant tout nouveau chantier.
+2. **Une correction de bug se fusionne et se déploie sans attendre** (règle du
+   propriétaire, 2026-10-11) : dès que la CI est verte, avec le déroulé de
+   `deploy/mise-a-jour` (vérifier, sauvegarder, installer, migrer, redémarrer
+   hors tour, contrôler, retour possible). Le propriétaire et les agents
+   touchés sont prévenus après coup.
+3. **Les autres déploiements se préparent entièrement** (nouvelle fonction,
+   version mineure, migration qui change le comportement) : étiquette posée,
+   `deploy/mise-a-jour/poste.sh verifier <REF>` et `deploy/mise-a-jour/vm.sh
+   verifier <REF>` passés, plan de retour connu (étape `retour`). Ils sont
+   proposés au propriétaire dès son retour, en premier point, avec les choix
+   possibles : version seule ou `main` entier, migrations, risques. Une
+   consigne de veille ne se contente jamais d'interdire « tout déploiement »
+   sans le préparer. Les gestes en production d'un projet, les dépenses et les
+   secrets restent des décisions du propriétaire.
+4. **Redémarrer depuis une unité à part.** `poste.sh redemarrer` ne redémarre
+   un exécuteur qu'hors tour. Un agent qui tourne lui-même sous une unité
+   d'exécuteur du poste le lance dans une unité systemd distincte :
+   `systemd-run --user --unit=ameesh-redemarrer-$(date +%s) bash
+   deploy/mise-a-jour/poste.sh redemarrer <REF>`. Un `setsid` ou un `nohup`
+   ne suffit pas : le script reste dans le groupe de contrôle de l'unité de
+   l'agent, et il est tué quand le script redémarre cette unité, avant
+   d'avoir traité les exécuteurs suivants. Une session humaine attachée
+   (`ameesh attach`) bloque le redémarrage de son exécuteur jusqu'à sa sortie.
+5. **Réserver les migrations.** Les numéros de migration se réservent dès le
+   début d'un lot, annoncés dans le lot et au journal de conception, pour
+   éviter les renumérotations en cascade quand plusieurs lots fusionnent à la
+   suite.
+6. **Essai à blanc avant toute étiquette de release.** Avant de poser une
+   étiquette qui publie (application, installeur, image), le workflow de
+   release tourne en essai à blanc sur le SHA exact, sur toutes les plateformes
+   cibles ; l'étiquette n'est posée que s'il est vert. On ne déplace jamais une
+   étiquette publiée : on pose la suivante.

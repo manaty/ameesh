@@ -19,6 +19,10 @@
   agent-mesh work add --title T [--type bug|evolution] [--app A] [--assignee N] …
   agent-mesh work list [--state S] | work show <id> | work move <id> <état> | work note <id> "…"
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   réassigner (attribution gardée)
+  agent-mesh work merged <id> --sha S [--note …]   fusion faite hors PR : tout état ouvert → merged
+  agent-mesh work move <id> merged --correct "raison"   corriger un promoted posé par erreur
+                                                (l'acteur des commandes work : --actor, sinon
+                                                l'identité liée de la session, sinon « inconnu »)
   agent-mesh import-v0 [--agents a,b] [--dry-run]     bascule : boîte fichier v0 → Postgres
   agent-mesh export-v0 [--agents a,b] [--keep]        retour arrière : Postgres → boîte v0
   agent-mesh migrate | doctor [--notify-test | --probe]
@@ -766,10 +770,30 @@ def _print_assignment(check: dict | None) -> None:
         print("avertissement : %s" % check["warning"], file=sys.stderr)
 
 
+#: sous-commandes `work` dont `--actor` a son propre sens (le délégant de
+#: `delegate`) ou son propre défaut non vide (relevés, échéances)
+_OWN_ACTOR = ("delegate", "expire-delegations", "sync-branches")
+
+
+def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
+    """L'acteur des commandes `work` (correctif du 2026-10-11) : `--actor`,
+    sinon l'identité liée de la session, jamais vide (« inconnu », averti).
+    Une correction d'état (`move --correct`) vérifie en plus qui corrige."""
+    if args.work_command == "move" and getattr(args, "correct", None) is not None:
+        args.actor = work.corrector(cfg, db, args.actor)
+        return
+    if args.work_command in _OWN_ACTOR or getattr(args, "actor", None) is None:
+        return
+    args.actor, warning = work.resolve_actor(cfg, db, args.actor)
+    if warning:
+        print("avertissement : %s" % warning, file=sys.stderr)
+
+
 def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
     from . import plan, plan_cli, stagnation  # plan de travail (L29)
     db = _open(cfg)
     try:
+        _work_actor(cfg, db, args)
         if args.work_command in plan_cli.COMMANDS:
             return plan_cli.run(db, args)
         if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
@@ -951,8 +975,21 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     (event.get("actor") or "—")[:12], event["note"]))
             return 0
         if args.work_command == "move":
-            item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor)
-            print("lot #%d → %s (boucles %s)" % (item["id"], item["state"], item["loops"]))
+            item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor,
+                             correct=args.correct)
+            print("lot #%d → %s (boucles %s)%s" % (
+                item["id"], item["state"], item["loops"],
+                " — correction tracée au journal, par %s" % args.actor
+                if args.correct is not None else ""))
+            return 0
+        if args.work_command == "merged":
+            done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
+                               actor=args.actor)
+            if done["result"] == "already":
+                print("lot #%d déjà %s : rien à faire" % (args.id, done["item"]["state"]))
+            else:
+                print("lot #%d → merged (commit %s, déclaré par %s)" % (
+                    args.id, args.sha.strip().lower()[:12], args.actor))
             return 0
         if args.work_command == "note":
             work.note(db, args.id, args.text, actor=args.actor)
@@ -1136,10 +1173,11 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 
 #: clés de `ameesh set` (L13 : model, effort ; L26 : tier, session_policy ;
 #: L37 : mode, `execute` | `externe`, décision 0030 ; L60 : context_max_tokens ;
-#: L105 : turn_max_seconds, turn_mail_max ; L125 : mail_batch, réglage LOCAL
-#: de l'hôte de l'agent, sans migration — comme `effort` et `tier` avant L26)
+#: L105 : turn_max_seconds, turn_mail_max ; travail de fond : turn_grace_seconds ;
+#: L125 : mail_batch, réglage LOCAL de l'hôte de l'agent, sans migration — comme
+#: `effort` et `tier` avant L26)
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
-            "turn_max_seconds", "turn_mail_max", "mail_batch")
+            "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1188,8 +1226,8 @@ _TIER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 def cmd_set(cfg: Config, args) -> int:
     """`ameesh set <agent> model=… effort=… tier=… session_policy=… mode=…
-    context_max_tokens=… turn_max_seconds=… turn_mail_max=…` (L13, L26, L37,
-    L60, L105).
+    context_max_tokens=… turn_max_seconds=… turn_mail_max=… turn_grace_seconds=…`
+    (L13, L26, L37, L60, L105, travail de fond).
 
     Écrit l'état d'exécution : le modèle dans le registre (visible par `list`)
     et dans l'état local ; l'effort et le tier dans l'état local **et** en base
@@ -1202,7 +1240,9 @@ def cmd_set(cfg: Config, args) -> int:
     (`context_max_tokens`, L60 : `15M`, `500k`, `0` = désactivé) est écrit en
     base ; vide = défaut de l'exécuteur. Les plafonds du tour (L105) aussi :
     `turn_max_seconds` (`30m`, `2h`, `0` = sans limite) et `turn_mail_max`
-    (messages remis par le hook pendant un tour, `0` = sans borne). L125 :
+    (messages remis par le hook pendant un tour, `0` = sans borne). Le délai
+    de grâce du travail de fond d'un tour (`turn_grace_seconds`, `20m`, `0` =
+    nettoyage immédiat) aussi. L125 :
     `mail_batch` (`90s`, `2m`, `0` = réveil immédiat), fenêtre de regroupement
     du courrier, écrite dans l'état LOCAL — à poser sur l'hôte de l'agent,
     que son exécuteur lit à chaque sondage (sans migration de la base).
@@ -1224,7 +1264,8 @@ def cmd_set(cfg: Config, args) -> int:
             if not sep or cle not in SET_KEYS:
                 print("usage : ameesh set <agent> model=… effort=… tier=… "
                       "session_policy=%s mode=%s context_max_tokens=N|15M|0 "
-                      "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 mail_batch=90s|2m|0"
+                      "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
+                      "turn_grace_seconds=20m|0 mail_batch=90s|2m|0"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
@@ -1253,11 +1294,18 @@ def cmd_set(cfg: Config, args) -> int:
                     print("turn_max_seconds invalide : %r (ex. 30m, 2h, 0 = sans "
                           "limite)" % valeur, file=sys.stderr)
                     return 2
+            if cle == "turn_grace_seconds" and valeur:
+                try:
+                    valeur = str(parse_duration(valeur))
+                except ValueError:
+                    print("turn_grace_seconds invalide : %r (ex. 20m, 1h, 0 = nettoyage "
+                          "immédiat)" % valeur, file=sys.stderr)
+                    return 2
             if cle == "turn_mail_max" and valeur:
                 try:
                     valeur = str(parse_count(valeur))
                 except ValueError:
-                    print("turn_mail_max invalide : %r (ex. 5, 0 = sans borne)" % valeur,
+                    print("turn_mail_max invalide : %r (ex. 20, 0 = sans borne)" % valeur,
                           file=sys.stderr)
                     return 2
             if cle == "mail_batch" and valeur:
@@ -1286,8 +1334,8 @@ def cmd_set(cfg: Config, args) -> int:
         effort = _lit_etat(cfg, args.agent, "effort") or agent.get("effort") or "défaut"
         tier = _lit_etat(cfg, args.agent, "tier") or agent.get("tier") or "défaut"
         politique = agent.get("session_policy") or "défaut (%s)" % cfg.session_policy
-        from .exploitation import (effective_context_max, effective_turn_mail_max,
-                                   effective_turn_max_seconds)
+        from .exploitation import (effective_context_max, effective_turn_grace_seconds,
+                                   effective_turn_mail_max, effective_turn_max_seconds)
 
         def _txt(valeur: int, cle: str, zero: str) -> str:
             return (zero if valeur == 0 else "%d" % valeur) + (
@@ -1298,6 +1346,8 @@ def cmd_set(cfg: Config, args) -> int:
                          "sans limite")
         courrier_txt = _txt(effective_turn_mail_max(cfg, agent), "turn_mail_max",
                             "sans borne")
+        grace_txt = _txt(effective_turn_grace_seconds(cfg, agent), "turn_grace_seconds",
+                         "aucune")
         # L125 : réglage local de l'hôte de l'agent, sinon défaut de l'hôte
         regroupement = _lit_etat(cfg, args.agent, "mail_batch")
         try:
@@ -1307,11 +1357,11 @@ def cmd_set(cfg: Config, args) -> int:
         regroupement_txt = ("immédiat" if secondes == 0 else "%ds" % secondes) + (
             "" if regroupement else " (défaut)")
         print("%s : modèle=%s effort=%s tier=%s session=%s mode=%s contexte=%s "
-              "tour_max_s=%s courrier_par_tour=%s regroupement=%s "
+              "tour_max_s=%s courrier_par_tour=%s grace_fond_s=%s regroupement=%s "
               "(prend effet au prochain tour)"
               % (args.agent, modele, effort, tier, politique,
                  agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt,
-                 regroupement_txt))
+                 grace_txt, regroupement_txt))
         if "mail_batch" in valeurs and (agent.get("host") or "") not in ("", cfg.host):
             print("attention : mail_batch est lu dans l'état local de l'hôte de l'agent "
                   "(%s), pas dans la base : lancez ce réglage sur %s"
@@ -1575,8 +1625,22 @@ def build_parser() -> argparse.ArgumentParser:
     pw_move.add_argument("id", type=int)
     pw_move.add_argument("state", choices=list(work.STATES))
     pw_move.add_argument("--note", default=None)
-    pw_move.add_argument("--actor", default="")
+    pw_move.add_argument("--actor", default="",
+                         help="défaut : l'identité liée de la session (AGENT_MAIL_NAME)")
+    pw_move.add_argument("--correct", default=None, metavar="RAISON",
+                         help="corriger un état posé par erreur (promoted → merged), hors "
+                              "machine à états, tracé au journal ; réservé aux humains et aux "
+                              "orchestrateurs ou agents de conception")
     pw_move.set_defaults(func=cmd_work)
+    pw_merged = work_sub.add_parser(
+        "merged", help="déclarer la fusion d'un lot faite hors PR et sans gel (fusion locale "
+                       "sur la cible) : tout état ouvert → merged, jalon merged avec le commit")
+    pw_merged.add_argument("id", type=int)
+    pw_merged.add_argument("--sha", required=True, help="le commit de fusion")
+    pw_merged.add_argument("--note", default="")
+    pw_merged.add_argument("--actor", default="",
+                           help="défaut : l'identité liée de la session (AGENT_MAIL_NAME)")
+    pw_merged.set_defaults(func=cmd_work)
     pw_assign = work_sub.add_parser(
         "assign", help="réassigner un lot à un agent réveillable (L37, 0030)")
     pw_assign.add_argument("id", type=int)
@@ -1700,7 +1764,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_set.add_argument("values", nargs="+", metavar="clé=valeur",
                        help="model=… effort=… tier=… session_policy=par-lot|taille|jamais "
                             "context_max_tokens=15M|0 "
-                            "turn_max_seconds=30m|2h|0 turn_mail_max=5|0 "
+                            "turn_max_seconds=30m|2h|0 turn_mail_max=20|0 "
+                            "turn_grace_seconds=20m|0 "
                             "mail_batch=90s|2m|0 (L125, état local de l'hôte) "
                             "mode=execute|externe (valeur vide = défaut)")
     p_set.set_defaults(func=cmd_set)

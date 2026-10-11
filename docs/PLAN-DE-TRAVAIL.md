@@ -93,7 +93,7 @@ Ces règles sont dans un seul module, `ameesh.stagnation`, appelé par
 ## Fusion constatée : fermeture automatique
 
 Une fusion se prouve **par le contenu**, jamais par le nom (une branche se
-renomme, une fusion se fait par rebase, squash ou cherry-pick). Quatre voies,
+renomme, une fusion se fait par rebase, squash ou cherry-pick). Cinq voies,
 toutes idempotentes, qui posent le lot en `merged` avec son jalon `merged`
 (commit et auteur de la fusion) :
 
@@ -139,7 +139,18 @@ toutes idempotentes, qui posent le lot en `merged` avec son jalon `merged`
    avance retrouvé dans la cible (ancêtre, patch-id, squash), ou commit de
    fusion qui cite la branche. L'exécuteur fait ce relevé toutes les 5 min
    dans le dossier de travail de l'assigné ; voir EXPLOITATION.md,
-   « Courrier lié aux lots et fusion des branches ».
+   « Courrier lié aux lots et fusion des branches ». Le même relevé ferme un
+   lot, avec ou sans branche, qu'un commit de **fusion** de la cible désigne
+   par une ligne `ameesh-work: <id>` (ou par `#<id>` dans son titre si le
+   dépôt l'active : `git config ameesh.lotRef hash`) ;
+5. **la déclaration** (correctif du 2026-10-11), pour une fusion que rien
+   d'autre ne voit :
+
+   ```
+   ameesh work merged <id> --sha <commit de fusion> [--note …]
+   ```
+
+   tout état ouvert → `merged`, en une fois, jalon `merged` avec le commit.
 
 Un lot absorbé par un autre se clôt par `--superseded-by`.
 
@@ -166,6 +177,11 @@ ameesh work project-github --repo owner/repo [--dry-run] [--canon-url URL] [--js
   labels ne sont jamais touchés ;
 * `--dry-run` lit GitHub et montre ce qui serait créé ou mis à jour, sans
   rien écrire.
+
+Les **lots** eux-mêmes, rattachés à une fiche ou non, ont chacun leur issue
+(L126) : `ameesh work project-github --app <projet>`, dépôt lu dans la
+configuration de l'hôte, tenue automatique par `ameesh notify` ; voir
+[EXPLOITATION.md](EXPLOITATION.md), « Issues GitHub des lots ».
 
 `gh` est résolu comme pour le connecteur `git-merge` (`AMEESH_GH_BIN`,
 `AMEESH_BIN_DIR/gh`, PATH) ; les tests utilisent un faux `gh`

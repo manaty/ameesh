@@ -423,6 +423,11 @@ ExecStartPre=-%h/.local/share/ameesh/venv/bin/ameesh canon sync --fetch
 ExecStart=%h/.local/share/ameesh/venv/bin/agent-runner --poll 5
 Restart=always
 RestartSec=5
+# arrêt : SIGTERM au seul exécuteur, qui draine (tours en cours et travail
+# de fond finissent, au plus AMEESH_DRAIN_SECONDS = 30 min) — voir
+# EXPLOITATION.md, « Arrêt et redémarrage de l'exécuteur »
+KillMode=mixed
+TimeoutStopSec=35min
 
 [Install]
 WantedBy=default.target

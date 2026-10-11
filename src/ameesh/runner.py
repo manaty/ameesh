@@ -50,6 +50,16 @@ def log(message: str) -> None:
     print("%s %s" % (time.strftime("%H:%M:%S"), message), flush=True)
 
 
+def _duree(secondes: float) -> str:
+    """Une durée lisible : « 45 s », « 7 min 05 s », « 2 h 13 min »."""
+    secondes = int(max(0.0, secondes))
+    if secondes < 60:
+        return "%d s" % secondes
+    if secondes < 3600:
+        return "%d min %02d s" % (secondes // 60, secondes % 60)
+    return "%d h %02d min" % (secondes // 3600, secondes % 3600 // 60)
+
+
 class _AsyncLog:
     """Journal non bloquant pour le fil du battement (sondes codex3 B5a-N).
 
@@ -316,6 +326,10 @@ class AgentWorker(threading.Thread):
         self._courrier_lance = False
         #: rotation de session (0018) : compteurs de la session courante
         self.resume_summary = ""
+        #: auteur du résumé de reprise : `agent` (son propre résumé) ou `ameesh`
+        #: (brief déterministe d'une bascule de compte, L39) ; voir
+        #: `adapters.resume_prompt`
+        self.resume_origin = "agent"
         self.session_turns = 0
         self.session_tokens = 0.0
         self.last_turn_seconds = 0.0
@@ -580,8 +594,29 @@ class AgentWorker(threading.Thread):
         except PermissionError:
             return True
 
-    def terminate(self, grace: float | None = None, hard: bool = False) -> None:
+    def _reap_group(self, pgid: int | None, skip: int | None) -> None:
+        """Zombies adoptés du groupe (l'exécuteur est sous-moissonneur de ses
+        tours) : moissonnés, sinon ils gardent le groupe « vivant » pour
+        `killpg(…, 0)`. Jamais `skip`, le harnais, qu'attend son `Popen`."""
+        tracker = getattr(self.runner, "background", None)
+        if pgid is None or tracker is None or not tracker.subreaper:
+            return
+        from . import platform as os_layer
+        try:
+            table = os_layer.process_table()
+        except os_layer.NotAvailable:
+            return
+        for p in table:
+            if p["pgid"] == pgid and p["zombie"] and p["pid"] != skip:
+                os_layer.reap(p["pid"])
+
+    def terminate(self, grace: float | None = None, hard: bool = False,
+                  group: bool = True) -> None:
         """Arrête le harnais et tout son groupe.
+
+        `group=False` (tour clos à un point sûr, L105) : le harnais SEUL est
+        arrêté (SIGTERM, grâce, puis SIGKILL) ; le travail lancé en fond
+        pendant le tour garde son délai de grâce (fin de `_run_turn`).
 
         Par défaut : SIGTERM, 3 secondes de grâce, puis SIGKILL. `hard=True`
         (perte du bail) envoie SIGKILL **directement, avant tout journal** : le
@@ -602,12 +637,21 @@ class AgentWorker(threading.Thread):
             proc = self.proc
         if proc is None:
             return
-        pgid = self._group(proc)
+        pgid = self._group(proc) if group else None
         if proc.poll() is None and not hard:
             self._signal_group(pgid, proc, signal.SIGTERM)
             deadline = time.monotonic() + max(0.0, self.TERMINATE_GRACE if grace is None else grace)
             while time.monotonic() < deadline and proc.poll() is None:
                 time.sleep(0.05)
+        if not group:
+            if proc.poll() is None:
+                self._signal_group(None, proc, signal.SIGKILL)
+                log_async("[%s] le harnais survit : SIGKILL (harnais seul)" % self.name)
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            return
         if not self._group_alive(pgid) and proc.poll() is not None:
             # Groupe mort **et** enfant direct moissonné : rien à faire. Si le
             # pid n'est pas un chef de groupe (groupe inconnu) mais que l'enfant
@@ -626,13 +670,18 @@ class AgentWorker(threading.Thread):
                 proc.wait(timeout=max(0.0, fin - time.monotonic()))
             except subprocess.TimeoutExpired:
                 pass
+        moisson = 0.0
         while time.monotonic() < fin and self._group_alive(pgid):
+            if time.monotonic() >= moisson:
+                # sous-moissonneur : les membres tués sont nos zombies
+                self._reap_group(pgid, proc.pid)
+                moisson = time.monotonic() + 0.05
             time.sleep(0.005)
         if self._group_alive(pgid):
             log_async("[%s] groupe toujours vivant après SIGKILL (état noyau ?)" % self.name)
 
     def stop_group_now(self, reason: str, *, grace: float | None = None,
-                       hard: bool = False) -> bool:
+                       hard: bool = False, group: bool = True) -> bool:
         """Point de passage **unique** de tout arrêt de harnais (0018, verdicts codex3).
 
         1. Le signal part d'abord (`terminate`, qui n'écrit rien avant) ;
@@ -643,7 +692,8 @@ class AgentWorker(threading.Thread):
 
         Tous les déclencheurs — échéance, bail perdu, arrêt de l'exécuteur,
         préemption, et demain la garde de budget (L13) — passent par ici : un
-        nouveau chemin hérite des sondes paramétrées.
+        nouveau chemin hérite des sondes paramétrées. `group=False` : le
+        harnais seul (tour clos à un point sûr ; voir `terminate`).
         """
         with self.lock:
             proc = self.proc
@@ -656,7 +706,7 @@ class AgentWorker(threading.Thread):
             log_async("[%s] arrêt demandé (%s) : harnais non encore publié"
                       % (self.name, reason))
             return False
-        self.terminate(grace=grace, hard=hard)
+        self.terminate(grace=grace, hard=hard, group=group)
         log_async("[%s] harnais arrêté (%s)" % (self.name, reason))
         return True
 
@@ -919,6 +969,29 @@ class AgentWorker(threading.Thread):
         from .exploitation import effective_turn_mail_max
         return effective_turn_mail_max(self.cfg, self.agent)
 
+    def turn_grace_seconds(self) -> int:
+        """Délai de grâce du travail de fond d'un tour : réglage de l'agent
+        (`ameesh set turn_grace_seconds=…`), sinon défaut de l'hôte
+        (`AMEESH_TURN_GRACE_SECONDS`, 20 min). 0 = nettoyage immédiat."""
+        from .exploitation import effective_turn_grace_seconds
+        return effective_turn_grace_seconds(self.cfg, self.agent)
+
+    def _urgent_end(self) -> str:
+        """Raison d'un arrêt d'urgence du tour qui s'achève, ou '' : fin
+        normale (le harnais a fini, ou il a été clos à un point sûr), dont le
+        travail de fond a son délai de grâce."""
+        if self.lease_lost.is_set() or self.deadline_passed():
+            return "bail perdu"
+        if self.preempting.is_set():
+            return "préemption"
+        if self.restarting.is_set():
+            return "redémarrage demandé"
+        if self._power_texte:
+            return "batterie critique"
+        if self.runner.stop.is_set():
+            return "arrêt de l'exécuteur"
+        return ""
+
     def turn_close_due(self, started: float, reread: int,
                        now: float | None = None) -> str | None:
         """Le tour en cours doit-il se clore au prochain point sûr ? (L105)
@@ -980,7 +1053,17 @@ class AgentWorker(threading.Thread):
 
         L105 : un tour clos par le plafond de contexte force la rotation au
         premier passage (le grand livre d'un tour interrompu peut ne rien dire).
+
+        Sous la pression de l'hôte, une rotation due ATTEND la fin de la
+        pression (le tour de résumé ne partirait pas) : elle n'est ni tentée
+        ni annulée à chaque passage (2026-10-10 : 62 rotations annulées en une
+        soirée), et la ligne de fin de l'épisode de pression la cite.
         """
+        if self.proc is None and (self.rotation_forcee or self.context_rotation_due()
+                                  or self.rotation_due()):
+            if self._held_by_pressure(self.runner.host_pressure()):
+                self.runner.pressure_delayed(self.name, rotation=True)
+                return False
         if self.rotation_forcee and self.proc is None:
             raison, self.rotation_forcee = self.rotation_forcee, None
             if self.session_policy() != "jamais" and self.current_session():
@@ -998,7 +1081,14 @@ class AgentWorker(threading.Thread):
         """Le mécanisme de rotation (L11) : résumé dans la session, puis oubli."""
         ancienne = self.current_session()
         log_async("[%s] rotation de session (%s)" % (self.name, raison))
+        self._refus_pression = False
         ok = self.run_turn({"kind": "prompt", "prompt": adapters.SUMMARY_PROMPT, "ids": []})
+        if not ok and self._refus_pression:
+            # la pression est venue entre le choix et le lancement : la
+            # rotation attend sa fin (ligne de fin de l'épisode), sans trace
+            # au fil à chaque passage
+            self.runner.pressure_delayed(self.name, rotation=True)
+            return False
         if not ok:
             # Résumé partiel, bail perdu pendant le tour, claim remplaçant : on ne
             # touche à rien. Effacer la session ici effacerait celle du remplaçant
@@ -1027,6 +1117,7 @@ class AgentWorker(threading.Thread):
                            meta={"action": "rotation", "etat": "annulee"})
             return False
         self.resume_summary = resume
+        self.resume_origin = "agent"
         try:
             os.unlink(self._path("session"))
         except OSError:
@@ -1863,6 +1954,20 @@ class AgentWorker(threading.Thread):
         self.wake.set()
         return True
 
+    def _held_by_pressure(self, pressure: dict) -> bool:
+        """La pression de l'hôte retient-elle le prochain tour de cet agent ?
+
+        Oui dès qu'un seuil est franchi (L31, 0028) — sauf pour un
+        orchestrateur sous une pression NON critique et hors batterie basse :
+        ses tours sont courts, et c'est lui qui distribue le travail des autres
+        (2026-10-10 : charge jusqu'à 43 pour 12 CPU, plus aucun tour, pas même
+        le sien, et personne pour répartir)."""
+        if not pressure.get("blocked"):
+            return False
+        if pressure.get("critical") or not self.runner.is_orchestrator(self.name):
+            return True
+        return any(b.get("power") for b in pressure.get("breaches") or ())
+
     def _host_pressure_note(self, pressure: dict) -> None:
         """Trace la contre-pression (L31, 0028) ; en critique, met en pause.
 
@@ -1875,6 +1980,8 @@ class AgentWorker(threading.Thread):
                 or int(self.agent.get("priority") or 0) > 0):
             self._host_pressure_hold(raisons)
             return
+        if self._work_waiting():
+            self.runner.pressure_delayed(self.name)
         texte = "pression critique de l'hôte %s : %s" % (self.runner.host, raisons)
         if getattr(self, "_pressure_reason", "") == texte:
             return
@@ -1882,7 +1989,10 @@ class AgentWorker(threading.Thread):
         # expiré) ou un tour en cours est refusé (L31, 0028).
         if not registry.pause(self.db, self.name, self.runner.runner_id, self.epoch,
                               "pause : " + texte):
-            log("[%s] pause refusée : bail perdu, remplacé, ou tour en cours" % self.name)
+            if getattr(self, "_pause_refused", "") != texte:  # dit une fois
+                self._pause_refused = texte
+                log_async("[%s] pause refusée : bail perdu, remplacé, ou tour en cours"
+                          % self.name)
             return
         if not getattr(self, "_pressure_text", ""):
             self._pressure_before = self.agent.get("status_text") or ""
@@ -1908,9 +2018,11 @@ class AgentWorker(threading.Thread):
         Sans elle, un agent retenu restait `queued`, erreur vide, sans raison
         lisible. Le statut ne change pas ; seul le texte dit ce qui retient le
         tour, et seulement quand du travail attend. Fencé par le bail ; ne lève
-        jamais."""
+        jamais. Le journal, lui, ne dit l'attente qu'une fois par épisode de
+        pression, pour tous les agents (`Runner._pressure_episode_update`)."""
         if not self._work_waiting():
             return
+        self.runner.pressure_delayed(self.name)
         texte = "en attente : pression de l'hôte %s — %s" % (self.runner.host, raisons)
         if getattr(self, "_pressure_text", "") == texte:
             return
@@ -1923,13 +2035,13 @@ class AgentWorker(threading.Thread):
         if posee:
             if not getattr(self, "_pressure_text", ""):
                 self._pressure_before = self.agent.get("status_text") or ""
-                log("[%s] %s" % (self.name, texte))
             self._pressure_text = texte
 
     def _host_pressure_release(self) -> None:
         """L31b : la pression est retombée — l'attente ou la pause s'efface,
         si son texte est toujours en place (personne ne l'a remplacé) ; le texte
         d'avant (« reprise : même session »…) revient."""
+        self._pause_refused = ""
         texte = getattr(self, "_pressure_text", "")
         if not texte:
             return
@@ -1943,7 +2055,7 @@ class AgentWorker(threading.Thread):
         self._pressure_text = ""
         self._pressure_reason = ""
         if levee:
-            log("[%s] pression de l'hôte retombée : les tours reprennent" % self.name)
+            # la fin de l'épisode est dite une fois, pour tous les agents
             agent = registry.get(self.db, self.name)
             if agent is not None:
                 self.agent = agent
@@ -1985,9 +2097,10 @@ class AgentWorker(threading.Thread):
         if not self.budget_ok():
             return None  # garde de budget (L13) : aucun tour, état `paused` posé
         # Contre-pression de l'hôte (L31, 0028) : au-dessus d'un seuil, aucun
-        # NOUVEAU tour ne démarre ; la consigne en attente n'est pas consommée.
+        # NOUVEAU tour ne démarre ; la consigne en attente n'est pas consommée
+        # (l'orchestrateur excepté, sous une pression non critique).
         pressure = self.runner.host_pressure()
-        if pressure.get("blocked"):
+        if self._held_by_pressure(pressure):
             if self.maybe_relocate(pressure):
                 return None  # déplacé : le worker s'arrête, le bail sera rendu
             self._host_pressure_note(pressure)
@@ -2166,8 +2279,14 @@ class AgentWorker(threading.Thread):
             log("[%s] harnais %s : %s" % (self.name, descriptor.id, resolution))
         return adapter
 
-    #: préfixe du résumé de reprise (session neuve après rotation, 0018)
-    RESUME_PREFIX = "Reprise de session après rotation — résumé :\n%s\n\n"
+    def _resume_prompt(self) -> str:
+        """Le cadre et le résumé de reprise qui ouvriront la session neuve après
+        une rotation (0018), ou "" sans résumé en attente. Le résumé est
+        délimité et n'a aucune autorité (`adapters.resume_prompt`)."""
+        if not self.resume_summary:
+            return ""
+        return adapters.resume_prompt(self.resume_summary, origin=self.resume_origin)
+
     def _budget_courrier(self) -> int:
         """Octets UTF-8 disponibles pour la consigne d'un tour de courrier.
 
@@ -2177,8 +2296,7 @@ class AgentWorker(threading.Thread):
         `PROMPT_MIN_BYTES` au courrier les lui laisse quand même (la consigne
         dépasse alors le plafond, jamais la borne de l'argument).
         """
-        resume = mail.octets(self.RESUME_PREFIX % self.resume_summary) \
-            if self.resume_summary else 0
+        resume = mail.octets(self._resume_prompt())
         return min(self.runner.prompt_max_bytes, mail.ARG_SAFE_BYTES) - resume
 
     def _courrier_spec(self, kind: str, messages: list[dict]) -> dict:
@@ -2213,12 +2331,23 @@ class AgentWorker(threading.Thread):
         """
         self.fast_failure = False
         candidats = spec.get("candidats")
+        if self.runner.draining.is_set():
+            # Drainage commencé entre le choix du tour et son lancement : rien
+            # ne part ; une consigne déjà prise repart en attente.
+            if registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch):
+                registry.set_status(self.db, self.name, "queued",
+                                    status_text="exécuteur en arrêt : consigne remise en "
+                                                "attente")
+            return False
         # Dernier contrôle avant de consommer quoi que ce soit (L31, 0028) :
         # couvre les tours ouverts directement (résumé de rotation de compte).
         pression = self.runner.host_pressure()
-        if pression.get("blocked"):
+        self._refus_pression = self._held_by_pressure(pression)
+        if self._refus_pression:
             self._host_pressure_note(pression)
             return False
+        if pression.get("blocked"):
+            self.runner.pressure_bypassed(self.name)  # orchestrateur, non critique
         if not candidats or self.runner.dry_run:
             return self._run_turn(spec)
         kind = spec["kind"]
@@ -2361,7 +2490,26 @@ class AgentWorker(threading.Thread):
         except Exception as exc:
             log("[%s] ménage après le tour %s impossible (%s)" % (self.name, turn_id[:8], exc))
 
+    def _with_background_note(self, spec: dict) -> tuple[dict, list[str]]:
+        """Le travail de fond des tours précédents (délai de grâce) : ce qui
+        tourne encore, ce qui a fini (code de sortie), ce qui a été arrêté —
+        dit à l'agent en tête de consigne, jamais dans un tour de résumé. Rend
+        la consigne et les tours clos à noter « dits » une fois le harnais
+        lancé. Une consigne déjà à la borne d'un argument garde sa place : la
+        note attend alors le tour suivant."""
+        tracker = getattr(self.runner, "background", None)
+        if tracker is None or spec.get("prompt") == adapters.SUMMARY_PROMPT:
+            return spec, []
+        note, dits = tracker.note_for(self.name)
+        if not note:
+            return spec, []
+        if mail.octets(self._resume_prompt() + note + spec["prompt"]) > mail.ARG_SAFE_BYTES:
+            return spec, []
+        return dict(spec, prompt=note + spec["prompt"]), dits
+
     def _run_turn(self, spec: dict) -> bool:
+        # Travail de fond des tours précédents : en tête de consigne.
+        spec, fond_dits = self._with_background_note(spec)
         harness = self.agent.get("harness") or "other"
         try:
             adapter = self._adapter()
@@ -2375,8 +2523,9 @@ class AgentWorker(threading.Thread):
         session = self.current_session()
         resume = ""
         if self.resume_summary and not session:
-            # Session neuve après rotation (0018) : le résumé de reprise ouvre le tour.
-            resume = self.RESUME_PREFIX % self.resume_summary
+            # Session neuve après rotation (0018) : le résumé de reprise, encadré
+            # et délimité (il n'a aucune autorité), ouvre le tour.
+            resume = self._resume_prompt()
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
         model = self.agent.get("model") or self._state_read("model")
@@ -2472,9 +2621,13 @@ class AgentWorker(threading.Thread):
         menage_tour = None
         try:
             from . import menage as menage_mod
+            # session neuve : dossier temporaire vidé — jamais sous le travail
+            # de fond d'un tour précédent encore en délai de grâce
+            fond = getattr(self.runner, "background", None)
             menage_tour = menage_mod.Turn.begin(
                 self.cfg, self.runner.housekeeping_policy(), self.name, cwd,
-                new_session=not session, base_env=env)
+                new_session=not session and not (fond and fond.has_jobs(self.name)),
+                base_env=env)
             env.update(menage_tour.env)
         except Exception as exc:
             log("[%s] ménage avant le tour impossible (%s)" % (self.name, exc))
@@ -2544,14 +2697,19 @@ class AgentWorker(threading.Thread):
         #: la résolution, interpréteur absent) — erreur de l'hôte
         echec_lancement = ""
         lignes = 0
+        proc = None
         try:
             with open(stderr_path, "ab") as stderr:
                 try:
-                    proc = subprocess.Popen(
-                        argv, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
-                        text=True, bufsize=1, env=env,
-                        start_new_session=True,  # son groupe : on peut le tuer en entier
-                    )
+                    # Le moissonneur de l'exécuteur ne touche jamais un harnais,
+                    # même pas pendant son lancement (voir `background`).
+                    with self.runner.launch_lock:
+                        proc = subprocess.Popen(
+                            argv, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
+                            text=True, bufsize=1, env=env,
+                            start_new_session=True,  # son groupe : on peut le tuer en entier
+                        )
+                        self.runner.harness_pids.add(proc.pid)
                 except OSError as exc:
                     raise _LancementImpossible("lancement impossible de %s : %s"
                                                % (argv[0], exc.strerror or exc)) from exc
@@ -2564,6 +2722,8 @@ class AgentWorker(threading.Thread):
             # Lancé (et publié, pour que l'arrêt le trouve) : les messages de la
             # consigne sont livrés, et seulement eux.
             self._livre_courrier(spec)
+            if fond_dits:  # la note du travail de fond a été montrée
+                self.runner.background.mark_reported(fond_dits)
             # Course de publication : un déclencheur d'arrêt (bail perdu,
             # préemption, arrêt de l'exécuteur, échéance) a pu conclure pendant
             # que ce Popen n'était pas encore publié (proc=None). Le recontrôle
@@ -2626,9 +2786,11 @@ class AgentWorker(threading.Thread):
                             # Point sûr : l'appel d'outil en cours est fini et son
                             # résultat est dans la session. Aucun harnais mené
                             # n'offre d'interruption propre en mode non
-                            # interactif : arrêt propre habituel (SIGTERM, grâce).
+                            # interactif : arrêt propre habituel (SIGTERM, grâce)
+                            # du harnais SEUL — le travail lancé en fond pendant
+                            # le tour garde son délai de grâce.
                             clos = True
-                            self.stop_group_now("tour clos : %s" % cloture)
+                            self.stop_group_now("tour clos : %s" % cloture, group=False)
                     usage = parsed.get("usage")
                     if isinstance(usage, dict):
                         # Clés de chaque harnais normalisées (L60 : l'usage
@@ -2651,14 +2813,36 @@ class AgentWorker(threading.Thread):
             heartbeat_done.set()
             preempt_done.set()
             pgid = self.pgid
-            # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
-            # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
-            # du veilleur une fois `self.proc` effacé (sonde codex3 B5a-S).
-            self.terminate()
+            # Fin NORMALE (harnais fini et moissonné, aucun arrêt d'urgence) :
+            # ce qui tourne encore — processus du groupe, conteneurs du tour
+            # sans lot — garde un délai de grâce (`background`). Sinon, ou
+            # sans délai, le nettoyage habituel, tout de suite.
+            fond = None
+            try:
+                if (proc is not None and pgid and proc.poll() is not None
+                        and not self.runner.once and self.turn_grace_seconds() > 0
+                        and not self._urgent_end()):
+                    fond = self.runner.background.survivors(turn_id, pgid)
+            except Exception as exc:  # dans le doute, le nettoyage d'avant
+                log_async("[%s] travail de fond du tour %s non examiné (%s)"
+                          % (self.name, turn_id[:8], exc))
+                fond = None
+            if fond is None:
+                # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
+                # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
+                # du veilleur une fois `self.proc` effacé (sonde codex3 B5a-S).
+                self.terminate()
             with self.lock:
                 self.proc = None
                 self.pgid = None
-            self._close_turn_resource(turn_id, pgid)
+            with self.runner.launch_lock:
+                self.runner.harness_pids.discard(pgid)
+            if fond is not None:
+                self.runner.background.start(
+                    agent=self.name, turn_id=turn_id, pgid=pgid, members=fond[0],
+                    containers=fond[1], grace_s=self.turn_grace_seconds())
+            else:
+                self._close_turn_resource(turn_id, pgid)
             self._menage_apres_tour(menage_tour, turn_id, spec)
 
         duration = time.time() - started
@@ -2865,6 +3049,8 @@ class AgentWorker(threading.Thread):
         self.ensure_watchdog()
         try:
             while not self.stopping.is_set() and not self.runner.stop.is_set():
+                if self.runner.draining.is_set():
+                    break  # drainage : le tour d'avant est fini, aucun autre ne part
                 if not self.renew():
                     break
                 # L72 : une base injoignable n'arrête plus le worker (son fil
@@ -2904,8 +3090,8 @@ class AgentWorker(threading.Thread):
                     if self.fast_failures >= self.runner.max_fast_failures:
                         self.stop_after_failures()
                         break
-                if self.stopping.is_set():
-                    break  # arrêt demandé (L106 : batterie) — bail rendu sans attendre
+                if self.stopping.is_set() or self.runner.draining.is_set():
+                    break  # arrêt demandé (L106 : batterie ; drainage) — bail rendu sans attendre
                 # Un message non remis ou un harnais en échec ne doit pas
                 # produire une boucle serrée : on laisse retomber, de plus en
                 # plus longtemps tant que les échecs rapides se suivent (L48).
@@ -2967,6 +3153,14 @@ class Runner:
         self.power_stop_grace = max(0.0, float(getattr(cfg, "power_stop_grace", 120.0)))
         #: arrêt sur batterie en cours : plus aucune réclamation de bail
         self.power_hold = threading.Event()
+        #: arrêt demandé par un signal (SIGTERM de systemd) : drainage — plus
+        #: de nouveau tour, le tour en cours et son travail de fond finissent,
+        #: au plus `drain_seconds` ; un second signal arrête tout de suite
+        self.drain_seconds = max(0.0, float(getattr(cfg, "drain_seconds", 1800.0)))
+        self.draining = threading.Event()
+        self._drain_deadline = 0.0
+        self._drain_since = 0.0
+        self._drain_woken = False
         self._power_state = "unknown"
         self._power_thread: threading.Thread | None = None
         adapters.configure(cfg)
@@ -2996,6 +3190,15 @@ class Runner:
                                 "limits": self._host_limits}
         self._pressure_at = 0.0
         self._all_host_limits: dict = {}
+        #: épisode de pression en cours (une ligne de journal à son début, une
+        #: à sa fin : durée, tours retardés), ou None
+        self._pressure_episode: dict | None = None
+        #: orchestrateurs (rôle `orchestrateur` au canon, relu à chaque `canon
+        #: sync` ; `AMEESH_ALERT_ORCHESTRATORS`) : sous une pression NON
+        #: critique, leurs tours partent quand même
+        from . import sous_utilisation as su
+        self._orchestrators_declared = frozenset(su.declared_orchestrators())
+        self._orchestrators_roles: frozenset = frozenset()
         #: L43 (0031) : `max_agents` physique (le plus strict des canons) et
         #: provenance de chaque limite ; journal « hôte plein » une fois par valeur
         self._host_max_agents: int | None = None
@@ -3011,6 +3214,14 @@ class Runner:
         #: valeurs par défaut tant qu'aucun canon n'est lu
         from . import menage as menage_mod
         self._housekeeping = menage_mod.Policy()
+        #: travail de fond des tours finis, en délai de grâce (suivi par le
+        #: fil `fond` en mode service) ; pids des harnais lancés, que le
+        #: moissonneur des orphelins adoptés ne touche jamais (lancement
+        #: compris : `launch_lock`)
+        from . import background as background_mod
+        self.background = background_mod.Tracker(self, log=log_async)
+        self.launch_lock = threading.Lock()
+        self.harness_pids: set[int] = set()
         self.turns = 0
         self.did_turn = False
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
@@ -3065,6 +3276,8 @@ class Runner:
                     del self.workers[name]
         if self.power_hold.is_set():
             return  # L106 : arrêt sur batterie — aucun bail repris avant le secteur
+        if self.draining.is_set():
+            return  # drainage : aucun nouvel agent, aucun nouveau tour
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
@@ -3230,6 +3443,59 @@ class Runner:
                                         reprise.minimum * 2 ** (reprise.echecs - 1)))
 
     # -- arrêt -------------------------------------------------------------
+    def request_stop(self, signum: int) -> None:
+        """Un signal d'arrêt (SIGTERM de systemd, SIGINT). Appelé depuis le
+        gestionnaire de signal : aucun verrou, des drapeaux et la file du
+        journal seulement.
+
+        Premier signal : DRAINAGE — plus de nouveau tour ; le tour en cours
+        et son travail de fond finissent, au plus `drain_seconds`, puis
+        l'exécuteur rend ses baux et sort (`_drained`). Un redémarrage
+        ordinaire (`systemctl restart`) ne tue donc plus le tour en cours.
+        Second signal, borne nulle, ou passage unique : arrêt immédiat, comme
+        avant (tour arrêté, consigne remise en attente)."""
+        if self.once or self.drain_seconds <= 0 or self.draining.is_set():
+            immediat = self.draining.is_set()
+            self.stop.set()
+            self.wake_all.set()
+            log_async("signal %d reçu : %s" % (
+                signum, "second signal, arrêt immédiat (tour en cours et travail de "
+                        "fond arrêtés)" if immediat else "arrêt propre"))
+            return
+        self._drain_since = time.monotonic()
+        self._drain_deadline = self._drain_since + self.drain_seconds
+        self.draining.set()
+        self.wake_all.set()
+        log_async("signal %d reçu : drainage — plus de nouveau tour ; le tour en cours et "
+                  "son travail de fond finissent (au plus %ds), puis arrêt ; un second "
+                  "signal arrête tout de suite" % (signum, int(self.drain_seconds)))
+
+    def _drained(self) -> bool:
+        """Drainage en cours : vrai quand l'exécuteur peut s'arrêter — plus
+        aucun worker vivant (chacun sort après son tour) ni travail de fond en
+        délai de grâce, ou borne atteinte (l'arrêt arrête alors ce qui reste)."""
+        with self.lock:
+            workers = list(self.workers.items())
+        if not self._drain_woken:
+            # hors du gestionnaire de signal : les workers au repos sortent
+            self._drain_woken = True
+            for _nom, worker in workers:
+                worker.wake.set()
+        en_tour = sorted(nom for nom, worker in workers if worker.is_alive())
+        fond = self.background.running_count()
+        duree = int(time.monotonic() - self._drain_since)
+        if not en_tour and not fond:
+            log_async("drainage terminé en %ds : plus de tour ni de travail de fond, "
+                      "arrêt" % duree)
+            return True
+        if time.monotonic() >= self._drain_deadline:
+            log_async("drainage : borne de %ds atteinte — arrêt de ce qui reste (%s)"
+                      % (int(self.drain_seconds), ", ".join(
+                          (["tour de %s" % ", ".join(en_tour)] if en_tour else [])
+                          + (["travail de fond de %d tour(s)" % fond] if fond else []))))
+            return True
+        return False
+
     def shutdown(self) -> None:
         self.stop.set()
         self.wake_all.set()
@@ -3250,6 +3516,9 @@ class Runner:
             # du bail (sonde codex3 B5a-P).
             worker.stop_group_now("arrêt de l'exécuteur (dur)", grace=0, hard=True)
             worker.release_lease()
+        # Travail de fond encore en délai de grâce : le nettoyage habituel,
+        # tout de suite (rien ne survit à l'exécuteur qui le suit).
+        self.background.stop_all("arrêt de l'exécuteur")
         # L'écouteur (fil démon) ne doit plus écrire quand l'interpréteur se
         # finalise : sa connexion est fermée ci-dessus, on l'attend, borné.
         if self.listener_thread is not None:
@@ -3335,6 +3604,9 @@ class Runner:
             refresh = getattr(self, "refresh_host_limits", None)
             if refresh is not None and synced:
                 refresh(*synced)
+            orchestres = getattr(self, "refresh_orchestrators", None)
+            if orchestres is not None and synced:
+                orchestres(*synced)
             return ok
         except Exception as exc:  # jamais fatal : le canon ferme, il ne tue pas
             log_async("canon sync en échec : %s" % " ".join(str(exc).split())[:200])
@@ -3477,9 +3749,13 @@ class Runner:
         return getattr(self, "_housekeeping", None) or menage_mod.Policy()
 
     def agents_in_turn(self) -> set:
+        """Agents en tour sur cet exécuteur — et ceux dont le travail de fond
+        d'un tour fini tourne encore (délai de grâce) : le ménage les traite
+        de même (dossier temporaire, caches, worktrees)."""
         with self.lock:
-            return {name for name, worker in self.workers.items()
-                    if worker.is_alive() and getattr(worker, "proc", None) is not None}
+            en_tour = {name for name, worker in self.workers.items()
+                       if worker.is_alive() and getattr(worker, "proc", None) is not None}
+        return en_tour | self.background.agents()
 
     def housekeeping_once(self) -> dict | None:
         """Un passage de ménage (L73) ; ne lève jamais.
@@ -3677,7 +3953,76 @@ class Runner:
         with self._pressure_lock:
             self._pressure = verdict
             self._pressure_at = now
+            self._pressure_episode_update(verdict)
         return dict(verdict)
+
+    # -- pression : orchestrateurs et épisodes ------------------------------
+    def is_orchestrator(self, name: str) -> bool:
+        """`name` est-il un orchestrateur ? Rôle au canon (`roles:
+        [orchestrateur]` de sa fiche Agent) ou `AMEESH_ALERT_ORCHESTRATORS`."""
+        return (name in getattr(self, "_orchestrators_declared", ())
+                or name in getattr(self, "_orchestrators_roles", ()))
+
+    def refresh_orchestrators(self, *canons) -> None:
+        """Après chaque `canon sync` : les agents au rôle d'orchestrateur."""
+        from . import sous_utilisation as su
+        self._orchestrators_roles = frozenset(su.role_orchestrators(canons))
+
+    def _pressure_episode_update(self, verdict: dict) -> None:
+        """À chaque verdict FRAIS, sous `_pressure_lock` : une ligne de journal
+        au début d'un épisode de pression, une à sa fin — début, fin, durée,
+        tours retardés —, jamais une par tentative de tour."""
+        from . import resources as resources_mod
+        episode = getattr(self, "_pressure_episode", None)
+        if verdict.get("blocked"):
+            if episode is None:
+                self._pressure_episode = {"since": time.time(),
+                                          "critical": bool(verdict.get("critical")),
+                                          "delayed": set(), "rotations": set(),
+                                          "orchestrator_turns": 0}
+                batterie = any(b.get("power") for b in verdict.get("breaches") or ())
+                log_async("pression de l'hôte %s : début — %s ; plus de nouveau tour%s"
+                          % (self.host, resources_mod.describe(verdict.get("breaches"))
+                             or "seuil",
+                             " (pression critique)" if verdict.get("critical") else
+                             " (batterie basse)" if batterie else
+                             " sauf ceux d'un orchestrateur (pression non critique)"))
+            elif verdict.get("critical"):
+                episode["critical"] = True
+            return
+        if episode is None:
+            return
+        self._pressure_episode = None
+        fin = time.time()
+        retardes = sorted(episode["delayed"])
+        log_async("pression de l'hôte %s : fin — de %s à %s (%s)%s ; %d tour(s) retardé(s)%s"
+                  "%s%s" % (
+                      self.host, time.strftime("%H:%M:%S", time.localtime(episode["since"])),
+                      time.strftime("%H:%M:%S", time.localtime(fin)),
+                      _duree(fin - episode["since"]),
+                      ", critique par moments" if episode["critical"] else "",
+                      len(retardes),
+                      " (%s%s)" % (", ".join(retardes[:12]), ", …" if len(retardes) > 12
+                                   else "") if retardes else "",
+                      " ; rotation de session reportée : %s"
+                      % ", ".join(sorted(episode["rotations"])) if episode["rotations"] else "",
+                      " ; %d tour(s) d'orchestrateur passé(s)" % episode["orchestrator_turns"]
+                      if episode["orchestrator_turns"] else ""))
+
+    def pressure_delayed(self, agent: str, *, rotation: bool = False) -> None:
+        """Un tour (ou une rotation de session) de `agent` attend la fin de
+        l'épisode de pression en cours : compté pour sa ligne de fin."""
+        with self._pressure_lock:
+            episode = getattr(self, "_pressure_episode", None)
+            if episode is not None:
+                episode["rotations" if rotation else "delayed"].add(agent)
+
+    def pressure_bypassed(self, agent: str) -> None:
+        """Un tour d'orchestrateur part malgré la pression (non critique)."""
+        with self._pressure_lock:
+            episode = getattr(self, "_pressure_episode", None)
+            if episode is not None:
+                episode["orchestrator_turns"] += 1
 
     def power_reading(self) -> dict:
         """Alimentation de l'hôte (L106) ; surchargée par les tests."""
@@ -3819,12 +4164,20 @@ class Runner:
             return 0 if self.did_turn else 3
         self.listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
         self.listener_thread.start()
+        # Travail de fond des tours (délai de grâce) : l'exécuteur adopte les
+        # orphelins de ses tours (codes de sortie), et les suit.
+        self.background.start_monitor(self.stop)
+        if not self.background.subreaper:
+            log_async("travail de fond des tours : pas de sous-moissonneur sur cet OS, "
+                      "codes de sortie inconnus")
         # L106 : après l'écoute (un réveil n'attend pas ces vérifications)
         self.log_harnesses()
         self.report_boot_orphans()
         reprise = Reprise(self.db_retry_max)
         try:
             while not self.stop.is_set():
+                if self.draining.is_set() and self._drained():
+                    break  # `shutdown` rend les baux et arrête ce qui resterait
                 try:
                     self.power_guard()
                 except Exception as exc:  # la garde ne fait jamais tomber l'exécuteur
@@ -4287,10 +4640,9 @@ def main(argv: list[str] | None = None) -> int:
         def handler(signum, _frame):
             # Signal d'abord ; le journal part par la file : un `print` dans un
             # gestionnaire de signal peut tomber pendant un autre `print` du
-            # fil principal (écriture réentrante sur le même flux).
-            runner.stop.set()
-            runner.wake_all.set()
-            log_async("signal %d reçu : arrêt propre" % signum)
+            # fil principal (écriture réentrante sur le même flux). Premier
+            # signal : drainage ; second : arrêt immédiat (`request_stop`).
+            runner.request_stop(signum)
 
         signal.signal(signal.SIGTERM, handler)
         signal.signal(signal.SIGINT, handler)

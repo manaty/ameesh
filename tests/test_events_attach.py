@@ -93,6 +93,7 @@ class EventsTest(PgTestCase):
         self.assertEqual(mail.unread(self.db, "evt-run"), [])
 
     def test_cli_send_evenement(self):
+        registry.upsert(self.db, "evt", harness="claude", host=self.cfg.host)
         env = self.env(AGENT_MAIL_NAME="src")
         proc = self.cli("send", "evt", "alerte", "--kind", "event", "--urgent", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)

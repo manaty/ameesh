@@ -74,9 +74,12 @@ class FileBackend:
              signed: dict | None = None, work_item_id: str | None = None,
              allow_structured: bool = False, kind: str = "notify",
              urgent: bool = False, thread_meta: dict | None = None,
+             include_stopped: bool = False, skipped: list | None = None,
              payload: dict | None = None, cc=()) -> list[str]:
         # Le repli fichier ne stocke pas de signature (format v0 strict) : la
-        # CLI prévient l'appelant, le message part quand même.
+        # CLI prévient l'appelant, le message part quand même. Sans registre,
+        # rien ne dit qu'un agent est arrêté : `include_stopped` et `skipped`
+        # sont sans effet ici.
         fil.ensure_readable(text, allow_structured)
         payload = _send_payload(dest, urgent, payload)
         if dest == "all":
@@ -261,7 +264,15 @@ class PgBackend:
              signed: dict | None = None, work_item_id: str | None = None,
              allow_structured: bool = False, kind: str = "notify",
              urgent: bool = False, thread_meta: dict | None = None,
+             include_stopped: bool = False, skipped: list | None = None,
              payload: dict | None = None, cc=()) -> list[str]:
+        """Dépose le message. N'inscrit JAMAIS le destinataire au registre :
+        un envoi à un nom inconnu créait un agent fantôme (et réécrivait
+        l'hôte d'un agent existant) — la CLI refuse désormais ces envois
+        avant d'arriver ici (`undeliverable.check_send`).
+
+        « all » écarte les agents arrêtés, sauf `include_stopped` (`--queue`) ;
+        leurs noms sont ajoutés à `skipped` si l'appelant en passe une liste."""
         fil.ensure_readable(text, allow_structured)
         payload = _send_payload(dest, urgent, payload)
         thread_meta = _send_thread_meta(thread_meta, payload, cc)
@@ -273,8 +284,14 @@ class PgBackend:
             # L36 (0030) : « all » = l'équipe (ou le chantier) de l'expéditeur ;
             # un expéditeur sans équipe ni chantier garde la diffusion globale.
             own = projects.get(sender)
-            targets = [row["name"] for row in rows if row["name"] != sender
-                       and (not own or projects.get(row["name"]) == own)]
+            team = [row for row in rows if row["name"] != sender
+                    and (not own or projects.get(row["name"]) == own)]
+            # un agent arrêté ne lit pas sa boîte : la diffusion ne la remplit pas
+            stopped = [row["name"] for row in team
+                       if row.get("status") == "stopped" and not include_stopped]
+            if skipped is not None:
+                skipped.extend(stopped)
+            targets = [row["name"] for row in team if row["name"] not in stopped]
         else:
             targets = [dest]
         groups: dict[str, list[tuple[str, int]]] = {}
@@ -287,7 +304,6 @@ class PgBackend:
                 allow_structured=allow_structured, thread=(dest != "all"),
                 kind=kind, payload=payload or None,
                 thread_meta=thread_meta, **dict(signed or {}))
-            registry.upsert(self.db, target, host=host)
             if dest == "all":
                 project = fil.project_for(self.cfg, projects.get(sender), projects.get(target))
                 groups.setdefault(project, []).append((target, message_id))

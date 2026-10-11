@@ -137,6 +137,9 @@ def child_env(**extra: str) -> dict:
     # Les relevés de ressources de l'hôte réel (L31) ne fuient pas non plus :
     # les tests de pression posent eux-mêmes leur intervalle et leurs mesures.
     env["AMEESH_RESOURCE_INTERVAL"] = "0"
+    # Un SIGTERM arrête l'exécuteur tout de suite, comme avant le drainage
+    # (2026-10-11) : les tests du drainage posent leur borne eux-mêmes.
+    env["AMEESH_DRAIN_SECONDS"] = "0"
     # Ni passage périodique du ménage (L73) ni /tmp réel : chaque test de
     # ménage pose son intervalle et son dossier temporaire du système.
     env["AMEESH_HOUSEKEEPING_INTERVAL"] = "0"
