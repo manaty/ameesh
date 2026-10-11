@@ -76,12 +76,13 @@ class WorkflowTest(unittest.TestCase):
         self.text = WORKFLOW.read_text(encoding="utf-8")
 
     def test_parts_sautees_pour_la_doc(self):
-        cond = ("if: needs.changes.outputs.version_only != 'true'"
-                " && needs.changes.outputs.docs_only != 'true'")
-        self.assertEqual(self.text.count(cond), 3)
-        self.assertIn("if: needs.changes.outputs.docs_only == 'true'", self.text)
-        self.assertIn("python -m unittest -v ${{ needs.changes.outputs.doc_readers }}", self.text)
-        self.assertIn("needs: [changes, psycopg, psql, platform-macos, doc-readers]", self.text)
+        # L161f : les matrices du plan sont vides pour une PR de documentation
+        self.assertIn("if: needs.plan.outputs.psycopg != '[]'", self.text)
+        self.assertIn("if: needs.plan.outputs.psql != '[]'", self.text)
+        self.assertIn("if: needs.plan.outputs.code == 'true'", self.text)
+        self.assertIn("if: needs.plan.outputs.docs_only == 'true'", self.text)
+        self.assertIn("python -m unittest -v ${{ needs.plan.outputs.doc_readers }}", self.text)
+        self.assertIn("needs: [plan, psycopg, psql, platform-macos, doc-readers]", self.text)
         self.assertIn('test "${{ needs.doc-readers.result }}" = success', self.text)
 
     def test_main_jamais_annulee(self):

@@ -7,6 +7,7 @@
                                    [--durees-sortie F.json] [--depuis REF]
                                    [--flux F.jsonl] [--etiquette "psql 1/6"]
                                    [--mesure DIR] [--carte carte.json.gz]
+    scripts/test-parts.py lancer   --plan plan.json --part K --pilote psql [--flux F.jsonl]
     scripts/test-parts.py durees   --pilote psql F.json [F.json…]
 
 La répartition est **déterministe** et se fait **par module** de test
@@ -50,6 +51,15 @@ carte test → code (`scripts/carte.py`) : couverture par test, contexte
 compris (`CARTE_CONTEXTE` hérité), fichiers lus et tables touchées.
 Avec `--carte F`, les durées des modules viennent de la carte ;
 `tests/parts/durees.json` ne reste qu'en repli.
+
+L161f — **plan**: with `--plan plan.json` (written once per CI run by
+`scripts/test-plan.py plan`), the part takes its modules, their order and
+their classes from the plan: every part reads the same split, computed once
+from the map. `--parts`, `--liste`, `--depuis` and `--carte` are then
+ignored; a plan without a module list for the part (fallback plan) gives
+the L116 split. With `--flux`, the part writes an `impacted` event once its
+P0 and P1 modules are done (`statut`: `vert` or `rouge`): the provisional
+green, when every part says `vert`.
 """
 from __future__ import annotations
 
@@ -223,6 +233,18 @@ def ordonner(part: list[str], pesees: dict[str, float],
     return sorted(part, key=cle)
 
 
+def lire_plan(chemin: str | os.PathLike, pilote: str, part: int) -> dict | None:
+    """L161f: the entry of part `part` for `pilote` in a plan, or None when
+    the plan has no module list for it (fallback plan)."""
+    plan = json.loads(pathlib.Path(chemin).read_text(encoding="utf-8"))
+    for entree in plan.get("parts", {}).get(pilote, []):
+        if entree.get("part") == part:
+            if entree.get("modules") is None:
+                return None
+            return {**entree, "classes": {m: tuple(c) for m, c in plan.get("classes", {}).items()}}
+    raise SystemExit(f"{chemin} : pas de part {part} pour {pilote}")
+
+
 def selection(args) -> tuple[list[str], float, list[str], dict[str, float]]:
     if not 1 <= args.part <= args.parts:
         raise SystemExit(f"part {args.part} hors de 1..{args.parts}")
@@ -296,15 +318,39 @@ class _Resultat(unittest.TextTestResult):
     flux: Flux | None = None
     classes: dict = {}
     mesure = None  # L161e : _Mesure de la part, ou None
+    #: L161f: P0 and P1 modules of the part, for the provisional green
+    #: (None: no `impacted` event, the part does not run from a plan)
+    impactes: tuple | None = None
 
     def startTestRun(self):
         self.durees = collections.Counter()
         self.comptes = collections.Counter()
         self._depuis = time.monotonic()
         self._courant = None
+        self._impactes_restants = set(self.impactes or ())
+        self._impactes_rouges: set[str] = set()
+        self._impactes_dit = False
         super().startTestRun()
 
+    def _dire_impactes(self) -> None:
+        """L161f: one `impacted` event, once no P0 or P1 module is left."""
+        if self._impactes_dit or self.flux is None or self.impactes is None:
+            return
+        self._impactes_dit = True
+        self.flux.ecrire("impacted", statut="rouge" if self._impactes_rouges else "vert",
+                         modules=list(self.impactes), rouges=sorted(self._impactes_rouges))
+
+    def stopTestRun(self):
+        self._dire_impactes()
+        super().stopTestRun()
+
     def startTest(self, test):
+        module = _module_de(test)
+        if module not in self._impactes_restants:
+            # impacted modules run first: the first other module closes them
+            self._impactes_restants.clear()
+        if not self._impactes_restants:
+            self._dire_impactes()
         if self.mesure is not None:
             self.mesure.contexte(test.id())
         super().startTest(test)
@@ -354,6 +400,8 @@ class _Resultat(unittest.TextTestResult):
         if self.flux is None:
             return
         module = _module_de(test)
+        if statut in ("echec", "erreur") and module in (self.impactes or ()):
+            self._impactes_rouges.add(module)
         nom = test.id()
         classe, raison = self.classes.get(module, ("P3", ""))
         ligne = {"module": module, "test": nom, "classe": classe, "raison": raison,
@@ -439,15 +487,32 @@ def _charger(part: list[str], mesure: _Mesure | None) -> unittest.TestSuite:
 
 def lancer(args) -> int:
     signal.signal(signal.SIGINT, signal.default_int_handler)
-    part, estimee, repli, pesees = selection(args)
+    entree = lire_plan(args.plan, args.pilote, args.part) if args.plan else None
+    if args.plan and entree is None:  # fallback plan: the L116 split
+        print(f"plan {args.plan} : pas de modules pour {args.pilote} {args.part} ; "
+              "découpage L116", file=sys.stderr, flush=True)
+        args.parts = args.parts or json.loads(pathlib.Path(args.plan).read_text(
+            encoding="utf-8"))["parts"][args.pilote][0]["of"]
+        if args.pilote == "psql" and not args.liste and _plan_pilote(args.plan):
+            args.liste = str(TESTS / "parts" / "pilote-psql.txt")
+    if entree is not None:
+        part, estimee, repli = entree["modules"], entree.get("estimate_s", 0.0), []
+        args.parts = entree["of"]
+        args.etiquette = args.etiquette or entree.get("label")
+    else:
+        part, estimee, repli, pesees = selection(args)
     print(f"part {args.part}/{args.parts} ({args.pilote}) : {len(part)} module(s), "
           f"~{estimee:.0f} s estimées", flush=True)
     if repli:
         print(f"  pesés par le nombre de tests (absents de {TABLE.relative_to(REPO)}) : "
               f"{', '.join(repli)}", file=sys.stderr, flush=True)
     classes: dict[str, tuple[str, str]] = {}
-    changes = fichiers_changes(args.depuis) if args.depuis else None
-    if changes is not None:
+    changes = fichiers_changes(args.depuis) if args.depuis and entree is None else None
+    if entree is not None:
+        classes = {m: entree["classes"].get(m, ("P3", "")) for m in part}
+        touches = [m for m in part if classes[m][0] != "P3"]
+        print(f"  d'abord, selon le plan : {', '.join(touches) or 'aucun'}", flush=True)
+    elif changes is not None:
         classes = classer(part, changes, ambigus=noms_ambigus())
         part = ordonner(part, pesees, classes)
         touches = [m for m in part if classes[m][0] != "P3"]
@@ -463,8 +528,11 @@ def lancer(args) -> int:
     mesure = _Mesure(args.mesure) if args.mesure else None
     sys.path[:0] = [str(REPO), str(REPO / "src")]
     suite = _charger(part, mesure)
+    impactes = None if entree is None else tuple(
+        m for m in part if classes.get(m, ("P3", ""))[0] in ("P0", "P1"))
     resultat_cls = type("_ResultatPart", (_Resultat,),
-                        {"flux": flux, "classes": classes, "mesure": mesure})
+                        {"flux": flux, "classes": classes, "mesure": mesure,
+                         "impactes": impactes})
     runner = unittest.TextTestRunner(verbosity=2, resultclass=resultat_cls)
     debut, resultat = time.monotonic(), None
     try:
@@ -490,6 +558,11 @@ def lancer(args) -> int:
     return 0 if resultat.wasSuccessful() else 1
 
 
+def _plan_pilote(chemin: str) -> bool:
+    plan = json.loads(pathlib.Path(chemin).read_text(encoding="utf-8"))
+    return any(p.get("pilot_list") for p in plan.get("parts", {}).get("psql", []))
+
+
 def durees(args) -> int:
     table = json.loads(TABLE.read_text(encoding="utf-8")) if TABLE.exists() else {}
     mesures = table.setdefault(args.pilote, {})
@@ -508,7 +581,7 @@ def main(argv: list[str] | None = None) -> int:
     sous = ap.add_subparsers(dest="commande", required=True)
     for nom in ("repartir", "lancer"):
         p = sous.add_parser(nom)
-        p.add_argument("--parts", type=int, required=True)
+        p.add_argument("--parts", type=int, required=(nom == "repartir"))
         p.add_argument("--part", type=int, required=True)
         p.add_argument("--pilote", choices=("psql", "psycopg"), required=True)
         p.add_argument("--liste", help="fichier de modules (ex. tests/parts/pilote-psql.txt)")
@@ -522,10 +595,15 @@ def main(argv: list[str] | None = None) -> int:
                            "(L161e, scripts/carte.py)")
         p.add_argument("--carte", help="carte (carte.json.gz) : durées des modules, "
                        "tests/parts/durees.json en repli (L161e)")
+        if nom == "lancer":
+            p.add_argument("--plan", help="plan.json (scripts/test-plan.py, L161f): "
+                           "modules, order and classes of the part")
     p = sous.add_parser("durees")
     p.add_argument("--pilote", choices=("psql", "psycopg"), required=True)
     p.add_argument("fichiers", nargs="+")
     args = ap.parse_args(argv)
+    if args.commande == "lancer" and not args.parts and not args.plan:
+        ap.error("lancer : --parts ou --plan requis")
     if args.commande == "repartir":
         part, estimee, _, _ = selection(args)
         print("\n".join(f"tests.{m}" for m in part))

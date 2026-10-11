@@ -30,6 +30,19 @@
 # Les modules de test touchés par les fichiers changés (--depuis HEAD^1 : la
 # cible pour une PR, le commit précédent sur main) passent en premier dans
 # chaque part. Rien n'est sauté ; le découpage en parts ne change pas.
+#
+# L161f — the `plan` job reads the measured map (cache `carte-<sha>`, written
+# by .github/workflows/carte.yml) once for the whole run and writes plan.json
+# (scripts/test-plan.py): the class of every module (P0 changed test, P1
+# impacted by changed blocks, files or tables, P2 recent failure, P3 the
+# rest), the parts and their modules. Every part runs from that same plan
+# (`--plan`), impacted first; the matrices come from the plan (fromJSON), and
+# a driver with no part is skipped. Phase 1: nothing is skipped beyond the
+# version-only and documentation-only cases above. Map missing, stale or
+# unusable: the L161b order, full suite. The `bilan` job (never required)
+# counts the leaks (failures of modules the map did not select) and the
+# provisional green (P0 and P1 green in every part), kept as the `leaks`
+# artifact for the two-week review (L161i).
 name: tests
 
 on:
@@ -58,41 +71,56 @@ env:
   PYTHONPATH: src
 
 jobs:
-  # L157, L161a : PR de version seule, de documentation seule ? (commit de
-  # fusion de la PR face à sa cible)
-  changes:
-    name: changements
+  # L157, L161a, L161f : nature of the change (version or documentation only,
+  # merge commit against its target) and the plan of the run, from the map
+  plan:
+    name: plan
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      version_only: ${{ steps.diff.outputs.version_only }}
-      docs_only: ${{ steps.diff.outputs.docs_only }}
-      doc_readers: ${{ steps.diff.outputs.doc_readers }}
+      version_only: ${{ steps.plan.outputs.version_only }}
+      docs_only: ${{ steps.plan.outputs.docs_only }}
+      doc_readers: ${{ steps.plan.outputs.doc_readers }}
+      code: ${{ steps.plan.outputs.code }}
+      psycopg: ${{ steps.plan.outputs.psycopg }}
+      psycopg_parts: ${{ steps.plan.outputs.psycopg_parts }}
+      psql: ${{ steps.plan.outputs.psql }}
+      psql_parts: ${{ steps.plan.outputs.psql_parts }}
     steps:
       - uses: actions/checkout@v4
-        if: github.event_name == 'pull_request'
         with:
-          fetch-depth: 2
-      - id: diff
-        name: PR de version ou de documentation seule ?
+          fetch-depth: 0  # the map commit, and whether it is an ancestor
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # the most recent map of main (a PR reads the caches of its base branch)
+      - uses: actions/cache/restore@v4
+        with:
+          path: carte/carte.json.gz
+          key: carte-${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
+          restore-keys: carte-
+      - id: plan
+        name: plan of the run
         run: |
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "version_only=false" >> "$GITHUB_OUTPUT"
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          python3 scripts/version-only.py HEAD^1 HEAD >> "$GITHUB_OUTPUT"
+          python3 scripts/test-plan.py plan --out plan.json --map carte/carte.json.gz \
+            --event "${{ github.event_name }}" --github-output "$GITHUB_OUTPUT" \
+            --summary "$GITHUB_STEP_SUMMARY" --annotations
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan.json
+          retention-days: 14
 
   psycopg:
-    name: psycopg ${{ matrix.part }}/4
-    needs: changes
-    if: needs.changes.outputs.version_only != 'true' && needs.changes.outputs.docs_only != 'true'
+    name: psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+    needs: plan
+    if: needs.plan.outputs.psycopg != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4]
+        part: ${{ fromJSON(needs.plan.outputs.psycopg) }}
     services:
       postgres:
         image: postgres:17
@@ -111,7 +139,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2  # L161b : HEAD^1, pour l'ordre
       - id: py
         uses: actions/setup-python@v5
         with:
@@ -142,10 +169,15 @@ jobs:
           git config --global user.name "ameesh ci"
           git config --global user.email "ci@ameesh.invalid"
           git config --global init.defaultBranch main
-      - name: part ${{ matrix.part }}/4
+      - &plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: ${{ runner.temp }}
+      - name: part ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
         run: >-
-          .venv-ci/bin/python scripts/test-parts.py lancer --parts 4 --part ${{ matrix.part }}
-          --pilote psycopg --depuis HEAD^1 --flux "$RUNNER_TEMP/flux.jsonl"
+          .venv-ci/bin/python scripts/test-parts.py lancer --plan "$RUNNER_TEMP/plan.json"
+          --part ${{ matrix.part }} --pilote psycopg --flux "$RUNNER_TEMP/flux.jsonl"
       - &resume
         name: résumé du flux
         if: always()
@@ -160,15 +192,16 @@ jobs:
           retention-days: 14
 
   psql:
-    name: psql ${{ matrix.part }}/${{ github.event_name == 'pull_request' && 1 || 6 }}
-    needs: changes
-    if: needs.changes.outputs.version_only != 'true' && needs.changes.outputs.docs_only != 'true'
+    name: psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
+    needs: plan
+    if: needs.plan.outputs.psql != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        part: ${{ fromJSON(github.event_name == 'pull_request' && '[1]' || '[1, 2, 3, 4, 5, 6]') }}
+        # sur une PR : les modules « pilote » seulement (tests/parts/pilote-psql.txt)
+        part: ${{ fromJSON(needs.plan.outputs.psql) }}
     services:
       postgres:
         image: postgres:17
@@ -183,22 +216,18 @@ jobs:
           --health-interval 2s --health-timeout 5s --health-retries 30
     env:
       AMEESH_DRIVER: psql
-      PARTS: ${{ github.event_name == 'pull_request' && 1 || 6 }}
-      # sur une PR : les modules « pilote » seulement
-      LISTE: ${{ github.event_name == 'pull_request' && 'tests/parts/pilote-psql.txt' || '' }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - *base
       - *git
+      - *plan
       - name: part ${{ matrix.part }}
         run: >-
-          python scripts/test-parts.py lancer --parts "$PARTS" --part ${{ matrix.part }}
-          --pilote psql ${LISTE:+--liste "$LISTE"} --depuis HEAD^1 --flux "$RUNNER_TEMP/flux.jsonl"
+          python scripts/test-parts.py lancer --plan "$RUNNER_TEMP/plan.json"
+          --part ${{ matrix.part }} --pilote psql --flux "$RUNNER_TEMP/flux.jsonl"
       - *resume
       - name: flux en artefact
         if: always()
@@ -214,8 +243,8 @@ jobs:
   # parts psql (sans psutil) par le repli /proc.
   platform-macos:
     name: plateforme macOS
-    needs: changes
-    if: needs.changes.outputs.version_only != 'true' && needs.changes.outputs.docs_only != 'true'
+    needs: plan
+    if: needs.plan.outputs.code == 'true'
     runs-on: macos-latest
     timeout-minutes: 10
     env:
@@ -233,8 +262,8 @@ jobs:
   # L161a : PR de documentation seule, ses lecteurs déclarés seulement, sans base
   doc-readers:
     name: lecteurs de la doc
-    needs: changes
-    if: needs.changes.outputs.docs_only == 'true'
+    needs: plan
+    if: needs.plan.outputs.docs_only == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -245,35 +274,68 @@ jobs:
         with:
           python-version: "3.12"
       - name: lecteurs de la doc
-        run: python -m unittest -v ${{ needs.changes.outputs.doc_readers }}
+        run: python -m unittest -v ${{ needs.plan.outputs.doc_readers }}
+
+  # L161f : leaks (failures of modules the map did not select) and the
+  # provisional green, for the two-week review (L161i); never required
+  bilan:
+    name: bilan des impactés
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
+    needs: [plan, psycopg, psql]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: flux-*
+          path: flux
+      - name: leaks and provisional green
+        run: |
+          python3 scripts/test-plan.py leaks plan.json flux/*/flux.jsonl --out leaks.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: leaks
+          path: leaks.json
+          retention-days: 90
 
   # nom de vérification stable : vert seulement si toutes les parts le sont
   # (L157 : ou si la PR ne change que le numéro de version, parts sautées ;
-  # L161a : ou que de la documentation, et ses lecteurs sont verts)
+  # L161a : ou que de la documentation, et ses lecteurs sont verts ;
+  # L161f : une part que le plan n'a pas prévue est sautée)
   tests:
     name: tests
     if: always()
-    needs: [changes, psycopg, psql, platform-macos, doc-readers]
+    needs: [plan, psycopg, psql, platform-macos, doc-readers]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: bilan des parts
         run: |
-          echo "changements : ${{ needs.changes.result }} (version seule : ${{ needs.changes.outputs.version_only }}, doc seule : ${{ needs.changes.outputs.docs_only }})"
+          echo "plan    : ${{ needs.plan.result }} (version seule : ${{ needs.plan.outputs.version_only }}, doc seule : ${{ needs.plan.outputs.docs_only }})"
           echo "doc     : ${{ needs.doc-readers.result }}"
-          echo "psycopg : ${{ needs.psycopg.result }}"
-          echo "psql    : ${{ needs.psql.result }}"
+          echo "psycopg : ${{ needs.psycopg.result }} (parts ${{ needs.plan.outputs.psycopg }})"
+          echo "psql    : ${{ needs.psql.result }} (parts ${{ needs.plan.outputs.psql }})"
           echo "macOS   : ${{ needs.platform-macos.result }}"
-          test "${{ needs.changes.result }}" = success
-          if [ "${{ needs.changes.outputs.version_only }}" = "true" ]; then
+          test "${{ needs.plan.result }}" = success
+          if [ "${{ needs.plan.outputs.version_only }}" = "true" ]; then
             echo "PR de version seule : suite déjà validée sur main, parts sautées"
             exit 0
           fi
-          if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
+          if [ "${{ needs.plan.outputs.docs_only }}" = "true" ]; then
             echo "PR de documentation seule : ses lecteurs seulement, parts sautées"
             test "${{ needs.doc-readers.result }}" = success
             exit 0
           fi
-          test "${{ needs.psycopg.result }}" = success
-          test "${{ needs.psql.result }}" = success
+          # a driver is skipped only when the plan gave it no part
+          test "${{ needs.psycopg.result }}" = success || { test '${{ needs.plan.outputs.psycopg }}' = '[]' && test "${{ needs.psycopg.result }}" = skipped; }
+          test "${{ needs.psql.result }}" = success || { test '${{ needs.plan.outputs.psql }}' = '[]' && test "${{ needs.psql.result }}" = skipped; }
           test "${{ needs.platform-macos.result }}" = success

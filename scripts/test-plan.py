@@ -1,0 +1,831 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""Test plan from the measured test → code map (L161f).
+
+    scripts/test-plan.py plan --out plan.json [--map carte.json.gz] [--event EVENT]
+                              [--github-output F] [--summary F] [--annotations]
+    scripts/test-plan.py leaks plan.json FLUX.jsonl [FLUX.jsonl…] [--out leaks.json]
+                               [--summary F]
+    scripts/test-plan.py tally leaks.json [leaks.json…]
+
+`plan` runs once per CI run (job `plan` of .github/workflows/tests.yml) and
+decides, for every test module, its class and the parts it runs in; every
+part then reads the same `plan.json` (`scripts/test-parts.py lancer --plan`),
+so the split never differs between parts.
+
+**Classes** (docs/design/etudes/l161-tests-par-impact.md, section 2):
+
+* P0 — the test module itself changed, or it is unknown to the map (new);
+* P1 — impacted, from the map (`scripts/carte.py`): a changed or removed
+  code block it executed, a data file it read, a directory it listed (file
+  added or removed there), a table touched by a new migration; plus the
+  "always" list (`tests/parts/toujours.txt`) when a migration, `db.py` or
+  `deploy/sql/` changes;
+* P2 — failed under measure in the last 7 days (map history);
+* P3 — the rest.
+
+**Phase 1: nothing is skipped.** Every part runs P0, P1 (shortest first),
+P2, then P3 (alphabetical); only the order changes. The plan also says
+whether a phase 2 selection ("impacted only", lot L161i) would have been
+safe for this change; it is recorded, never applied.
+
+**The full suite is the fallback.** The changed files are taken from the
+map commit to HEAD, not from the merge base: whatever changed on main since
+the map counts as changed, so the selection widens, never narrows. Map
+missing, unreadable, older than 48 h, or not an ancestor of HEAD: the order
+falls back to the textual heuristic of L161b (`--depuis HEAD^1`) and the
+plan is marked unsure. A file the map cannot judge (Python outside
+`src/ameesh`, a non-documentation file no test reads, a syntax error) uses
+the textual heuristic for that file and marks the plan unsure; test
+infrastructure (`tests/support.py`, `tests/fakebin/`, the CI scripts,
+`.github/`, `pyproject.toml` beyond its version line) marks it unsure too.
+Any error while reading the map gives the fallback plan, never a failure.
+
+**Changed lines without a test**: an existing block whose fingerprint
+changed and that no test executes is listed in the plan, in the job summary,
+and as a GitHub annotation on the PR diff (`--annotations`).
+
+**Provisional green**: each part writes a `impacted` event to its stream
+once its P0 and P1 modules are done (`scripts/test-parts.py`); when every
+part says `green`, P0 and P1 passed. It is a signal for the agent, never a
+merge condition (`tests` stays the required check).
+
+**Leaks** (`leaks`): a failure of a module the map did not select (P2 or
+P3). `leaks` reads the plan and the part streams of a run and writes one
+record (`ameesh-test-leaks/1`), kept as the `leaks` artifact; `tally`
+aggregates records for the two-week review (L161i): phase 2 requires fewer
+than 1 leak per 50 PRs.
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+import collections
+import datetime
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+SCRIPTS = REPO / "scripts"
+PLAN_SCHEMA = "ameesh-test-plan/1"
+LEAKS_SCHEMA = "ameesh-test-leaks/1"
+ALWAYS_FILE = REPO / "tests" / "parts" / "toujours.txt"
+PILOT_FILE = REPO / "tests" / "parts" / "pilote-psql.txt"
+
+#: map older than this: fallback order, plan unsure
+MAX_AGE_H = 48
+#: phase 2 also requires a map younger than this
+PHASE2_MAX_AGE_H = 24
+#: failures under measure younger than this make a module P2
+RECENT_FAILURE_DAYS = 7
+#: parts per driver (pull request, other events)
+PARTS = {"psycopg": (4, 4), "psql": (1, 6)}
+#: entries listed in the job summary, per category
+SUMMARY_LIMIT = 25
+
+MIGRATIONS_DIR = "src/ameesh/migrations/"
+CODE_ROOT = "src/ameesh/"
+#: changes that trigger the "always" list
+ALWAYS_TRIGGERS = (MIGRATIONS_DIR, "src/ameesh/db.py", "deploy/sql/")
+#: test infrastructure: the map cannot judge a change there
+FOUNDATION = ("tests/support.py", "tests/__init__.py", "tests/fakebin/", ".github/",
+              "scripts/test-parts.py", "scripts/test-plan.py", "scripts/carte.py",
+              "scripts/carte_mesure.py", "scripts/ci-flux.py", "scripts/version-only.py")
+#: a migration that is not purely additive impacts every database test
+_NOT_ADDITIVE = re.compile(
+    r"\b(drop\s+(table|column|index|constraint|view|function|trigger|type|schema)"
+    r"|rename\s+(to|column)|alter\s+column\s+[\w\"]+\s+(set\s+data\s+)?type"
+    r"|truncate)\b", re.I)
+
+
+def _load(name: str, filename: str):
+    spec = importlib.util.spec_from_file_location(name, SCRIPTS / filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+parts = _load("test_parts", "test-parts.py")
+version_only = _load("version_only", "version-only.py")
+sys.path.insert(0, str(SCRIPTS))
+import carte  # noqa: E402  scripts/carte.py
+
+
+# -- git ------------------------------------------------------------------
+
+def _git(repo: pathlib.Path, *args: str) -> str:
+    return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True,
+                          text=True).stdout
+
+
+def changed_files(base: str, head: str = "HEAD",
+                  repo: pathlib.Path = REPO) -> list[tuple[str, str]] | None:
+    """[(status, path)] between two commits (A, M, D, T…), None if unreadable."""
+    try:
+        out = _git(repo, "diff", "--name-status", "--no-renames", base, head)
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    result = []
+    for line in out.splitlines():
+        status, _, path = line.partition("\t")
+        if path:
+            result.append((status[:1], path))
+    return result
+
+
+def is_ancestor(commit: str, head: str = "HEAD", repo: pathlib.Path = REPO) -> bool:
+    try:
+        subprocess.run(["git", "merge-base", "--is-ancestor", commit, head], cwd=repo,
+                       check=True, capture_output=True)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
+def show(path: str, rev: str = "HEAD", repo: pathlib.Path = REPO) -> str | None:
+    try:
+        return _git(repo, "show", f"{rev}:{path}")
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def existed(path: str, rev: str, repo: pathlib.Path = REPO) -> bool:
+    try:
+        subprocess.run(["git", "cat-file", "-e", f"{rev}:{path}"], cwd=repo, check=True,
+                       capture_output=True)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
+
+
+# -- the map --------------------------------------------------------------
+
+def map_problem(card: dict | None, now: datetime.datetime, head: str = "HEAD",
+                repo: pathlib.Path = REPO) -> tuple[str, float | None]:
+    """Why the map cannot be used ("" if it can), and its age in hours."""
+    if card is None:
+        return "no map", None
+    try:
+        generated = datetime.datetime.fromisoformat(card["genere"])
+    except (KeyError, TypeError, ValueError):
+        return "map without a generation date", None
+    age = (now - generated).total_seconds() / 3600
+    if age > MAX_AGE_H:
+        return f"map older than {MAX_AGE_H} h ({age:.0f} h)", age
+    if not card.get("commit") or not is_ancestor(card["commit"], head, repo):
+        return f"map commit {str(card.get('commit'))[:12]} is not an ancestor of {head}", age
+    return "", age
+
+
+def is_doc(path: str) -> bool:
+    return version_only.is_doc(path)
+
+
+def is_foundation(path: str) -> bool:
+    return path.startswith(FOUNDATION) or path == "pyproject.toml"
+
+
+def read_list(path: pathlib.Path, known: list[str]) -> list[str]:
+    return parts.lire_liste(path, known) if path.exists() else []
+
+
+class Impact:
+    """What a set of changes impacts, judged against the map."""
+
+    def __init__(self) -> None:
+        self.p0: dict[str, str] = {}
+        self.p1: dict[str, str] = {}
+        self.untested: list[dict] = []       # changed blocks no test executes
+        self.unknown_blocks: list[str] = []  # blocks the map has never seen
+        self.unsure: list[str] = []          # why the map cannot judge everything
+        self.textual: list[str] = []         # files left to the L161b heuristic
+        self.foundation: list[str] = []
+
+    def hit(self, modules, reason: str) -> None:
+        for m in modules:
+            self.p1.setdefault(m, reason)
+
+    def doubt(self, reason: str, path: str | None = None) -> None:
+        if reason not in self.unsure:
+            self.unsure.append(reason)
+        if path and path not in self.textual:
+            self.textual.append(path)
+
+
+def _db_modules(card: dict) -> set[str]:
+    return {m for ms in card.get("tables", {}).values() for m in ms}
+
+
+def _dir_listers(card: dict, path: str, map_commit: str, repo: pathlib.Path) -> tuple[set, str]:
+    """Modules that listed the directory where `path` appeared or vanished:
+    its parent, or the first ancestor that existed at the map commit."""
+    listers: set[str] = set()
+    parent = str(pathlib.PurePosixPath(path).parent)
+    while True:
+        listers |= set(card.get("dossiers", {}).get(parent, ()))
+        if parent in ("", ".") or existed(parent, map_commit, repo):
+            return listers, parent
+        parent = str(pathlib.PurePosixPath(parent).parent)
+
+
+def _python(card: dict, impact: Impact, status: str, path: str, head: str,
+            repo: pathlib.Path) -> None:
+    old = card.get("blocs", {}).get(path)
+    if status == "D":
+        if old is None:
+            return
+        impact.hit({m for b in old.values() for m in b.get("modules", ())}, f"{path} (removed)")
+        return
+    source = show(path, head, repo)
+    if source is None:
+        impact.doubt(f"{path}: unreadable at {head}", path)
+        return
+    try:
+        new, _ = carte.blocs(source)
+    except (SyntaxError, ValueError):
+        impact.doubt(f"{path}: syntax error", path)
+        return
+    if old is None:
+        if status != "A":
+            impact.doubt(f"{path}: code file unknown to the map", path)
+            return
+        impact.unknown_blocks.extend(f"{path}::{b}" for b in sorted(new))
+        listers, where = _dir_listers(card, path, card["commit"], repo)
+        impact.hit(listers, f"{path} (new file in {where})")
+        return
+    added = set(new) - set(old)
+    stripped = _without_new_functions(source, added, _method_names(card)) if added else new
+    for name, info in sorted(old.items()):
+        after = new.get(name)
+        if after is not None and after["empreinte"] == info.get("empreinte"):
+            continue
+        if stripped.get(name, {}).get("empreinte") == info.get("empreinte"):
+            continue  # only new functions were added: their callers changed
+        modules = info.get("modules", ())
+        impact.hit(modules, f"{path}::{name}")
+        if not modules and after is not None:
+            impact.untested.append({"file": path, "block": name, "lines": after["lignes"]})
+    impact.unknown_blocks.extend(f"{path}::{b}" for b in sorted(added))
+
+
+def _method_names(card: dict) -> set[str]:
+    return {b.rsplit(".", 1)[-1] for bs in card.get("blocs", {}).values() for b in bs if "." in b}
+
+
+def _without_new_functions(source: str, added: set[str], methods: set[str]) -> dict:
+    """The blocks of `source` once its new, plain functions are taken out.
+
+    A new function runs only when a caller runs it, and that caller changed:
+    its tests are found there (study, section 1). Taking it out keeps its
+    module or class unchanged for the map. A function stays in (its module
+    or class counts as changed) when it is decorated (a decorator runs at
+    import: registration), a dunder, a method whose name exists elsewhere
+    (it may override a base class method), or a name the module also binds
+    otherwise. New classes always count: their body runs at import.
+    """
+    tree = ast.parse(source)
+    bound = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)
+             and isinstance(n.ctx, ast.Store)}
+    bound |= {(a.asname or a.name).split(".")[0] for n in ast.walk(tree)
+              if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
+
+    def strip(body: list, prefix: str) -> list:
+        kept = []
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                    and prefix + node.name in added and not node.decorator_list \
+                    and not node.name.startswith("__") and node.name not in bound \
+                    and not (prefix and node.name in methods):
+                continue
+            if isinstance(node, ast.ClassDef):
+                node.body = strip(node.body, prefix + node.name + ".") or [ast.Pass()]
+            kept.append(node)
+        return kept
+
+    tree.body = strip(tree.body, "")
+    return carte.blocs(ast.unparse(tree))[0]
+
+
+def _migration(card: dict, impact: Impact, status: str, path: str, head: str,
+               repo: pathlib.Path) -> None:
+    db = _db_modules(card)
+    if status != "A" or path in card.get("migrations", {}):
+        impact.hit(db, f"{path} (existing migration changed)")
+        impact.doubt(f"{path}: an existing migration changed")
+        return
+    listers, _ = _dir_listers(card, path, card["commit"], repo)
+    impact.hit(listers, f"{path} (new migration)")
+    impact.hit({m for f, ms in card.get("donnees", {}).items() if f.startswith("deploy/sql/")
+                for m in ms}, f"{path} (deploy/sql readers)")
+    sql = show(path, head, repo) or ""
+    tables = carte.tables_de_migration(sql)
+    if not tables or _NOT_ADDITIVE.search(re.sub(r"--[^\n]*", "", sql)):
+        impact.hit(db, f"{path} (not additive, or tables unknown)")
+        return
+    for table in tables:
+        impact.hit(card.get("tables", {}).get(table, ()), f"{path} (table {table})")
+
+
+def _data(card: dict, impact: Impact, status: str, path: str, repo: pathlib.Path) -> None:
+    readers = set(card.get("donnees", {}).get(path, ()))
+    impact.hit(readers, path)
+    listers: set[str] = set()
+    if status in ("A", "D"):
+        listers, where = _dir_listers(card, path, card["commit"], repo)
+        impact.hit(listers, f"{path} ({'added to' if status == 'A' else 'removed from'} {where})")
+    if not readers and not listers and not is_doc(path) and status != "D":
+        impact.doubt(f"{path}: read by no measured test", path)
+
+
+def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
+          head: str = "HEAD", repo: pathlib.Path = REPO) -> Impact:
+    """The impact of `changes` (since the map commit) on the test modules."""
+    impact = Impact()
+    known_modules = set(card.get("modules", {}))
+    for m in modules:
+        if m not in known_modules:
+            impact.p0[m] = "unknown to the map"
+    for status, path in changes:
+        stem = pathlib.PurePosixPath(path)
+        if path.startswith("tests/") and stem.parent.as_posix() == "tests" \
+                and stem.name.startswith("test") and stem.suffix == ".py":
+            if status != "D" and stem.stem in modules:
+                impact.p0[stem.stem] = path
+            continue
+        if is_foundation(path):
+            if path == "pyproject.toml" and _version_line_only(head, card["commit"], repo):
+                impact.hit(card.get("donnees", {}).get(path, ()), path)
+                continue
+            impact.foundation.append(path)
+            impact.hit(card.get("donnees", {}).get(path, ()), path)
+            impact.doubt(f"test infrastructure changed: {path}", path)
+            continue
+        if path.startswith(CODE_ROOT) and path.endswith(".py"):
+            _python(card, impact, status, path, head, repo)
+        elif path.endswith(".py"):
+            impact.doubt(f"{path}: Python outside {CODE_ROOT} is not measured", path)
+        elif path.startswith(MIGRATIONS_DIR) and path.endswith(".sql"):
+            _migration(card, impact, status, path, head, repo)
+        else:
+            _data(card, impact, status, path, repo)
+    return impact
+
+
+def _version_line_only(head: str, base: str, repo: pathlib.Path) -> bool:
+    try:
+        patch = _git(repo, "diff", "-U0", base, head, "--", "pyproject.toml")
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    ok, _ = version_only.version_only(["pyproject.toml"], patch)
+    return ok
+
+
+def always_hits(changes: list[tuple[str, str]], always: list[str]) -> dict[str, str]:
+    trigger = next((p for _, p in changes if p.startswith(ALWAYS_TRIGGERS)), None)
+    return {m: f"always list ({trigger})" for m in always} if trigger else {}
+
+
+def recent_failures(card: dict | None, now: datetime.datetime) -> dict[str, str]:
+    if not card:
+        return {}
+    limit = (now - datetime.timedelta(days=RECENT_FAILURE_DAYS)).isoformat()
+    result = {}
+    for module, info in card.get("modules", {}).items():
+        recent = [e for e in info.get("echecs", []) if e.get("ts", "") >= limit]
+        if recent:
+            result[module] = f"failed under measure {recent[-1].get('ts', '')[:10]}"
+    return result
+
+
+def textual(modules: list[str], files: list[str]) -> dict[str, str]:
+    """The L161b heuristic (the test text names the file), P1 only."""
+    if not files:
+        return {}
+    classes = parts.classer(modules, files, ambigus=parts.noms_ambigus())
+    hits = {m: r for m, (c, r) in classes.items() if c == "P1"}
+    for f in files:  # a test helper: `from tests.fake_github import …`
+        p = pathlib.PurePosixPath(f)
+        if p.parts[0] == "tests" and p.suffix == ".py":
+            pattern = re.compile(r"\b" + re.escape(p.stem) + r"\b")
+            for m in modules:
+                if m not in hits and pattern.search(
+                        (parts.TESTS / f"{m}.py").read_text(encoding="utf-8")):
+                    hits[m] = f
+    return hits
+
+
+# -- the plan -------------------------------------------------------------
+
+def classify(modules: list[str], card: dict | None, now: datetime.datetime,
+             base_fallback: str = "HEAD^1", head: str = "HEAD",
+             repo: pathlib.Path = REPO) -> dict:
+    """Classes of every module, and what the plan knows about its own safety."""
+    always = read_list(ALWAYS_FILE, modules)
+    problem, age = map_problem(card, now, head, repo)
+    out = {"map": None, "sure": False, "phase2_safe": False, "unsure": [],
+           "untested": [], "unknown_blocks": [], "foundation": [], "changed": 0}
+    if card is not None:
+        out["map"] = {"commit": card.get("commit"), "generated": card.get("genere"),
+                      "age_h": None if age is None else round(age, 1),
+                      "used": not problem, "problem": problem}
+    impact = None
+    if not problem:
+        changes = changed_files(card["commit"], head, repo)
+        if changes is None:
+            problem = f"diff from map commit {card['commit'][:12]} unreadable"
+            out["map"]["used"], out["map"]["problem"] = False, problem
+        else:
+            try:
+                impact = judge(card, changes, modules, head, repo)
+            except Exception as exc:  # any doubt: fallback, never a failed plan
+                problem = f"map unusable ({type(exc).__name__}: {exc})"
+                out["map"]["used"], out["map"]["problem"] = False, problem
+    if impact is None:
+        changes = changed_files(base_fallback, head, repo)
+        classes = parts.classer(modules, [p for _, p in changes],
+                                ambigus=parts.noms_ambigus()) if changes is not None else {}
+        out["unsure"] = [problem or "no map"]
+    else:
+        classes = {}
+        p1 = dict(impact.p1)
+        for m, r in textual(modules, impact.textual).items():
+            p1.setdefault(m, r)
+        for m in modules:
+            if m in impact.p0:
+                classes[m] = ("P0", impact.p0[m])
+            elif m in p1:
+                classes[m] = ("P1", p1[m])
+        out.update(unsure=impact.unsure, untested=impact.untested,
+                   unknown_blocks=impact.unknown_blocks, foundation=impact.foundation,
+                   sure=not impact.unsure)
+        out["phase2_safe"] = (out["sure"] and age is not None and age <= PHASE2_MAX_AGE_H
+                              and not impact.unknown_blocks and not impact.foundation)
+    changes = changes or []
+    out["changed"] = len(changes)
+    for m, r in always_hits(changes, always).items():
+        if classes.get(m, ("P3",))[0] not in ("P0", "P1"):
+            classes[m] = ("P1", r)
+    for m, r in recent_failures(card, now).items():
+        if m in modules and classes.get(m, ("P3",))[0] == "P3":
+            classes[m] = ("P2", r)
+    out["classes"] = {m: list(classes.get(m, ("P3", ""))) for m in modules}
+    return out
+
+
+def weights(modules: list[str], driver: str, card: dict | None) -> dict[str, float]:
+    table = None
+    if card:
+        table = {}
+        for module, info in card.get("modules", {}).items():
+            for d, s in info.get("durees", {}).items():
+                table.setdefault(d, {})[module] = s
+        if not table.get(driver):
+            table = None
+    weighed, _ = parts.poids(modules, driver, table)
+    return weighed
+
+
+def split(modules: list[str], driver: str, n: int, card: dict | None,
+          classes: dict[str, tuple[str, str]]) -> list[dict]:
+    if not modules:
+        return []
+    weighed = weights(modules, driver, card)
+    result = []
+    for i, part in enumerate(parts.repartir(weighed, n), 1):
+        if part:
+            result.append({"part": i, "of": n, "label": f"{driver} {i}/{n}",
+                           "modules": parts.ordonner(part, weighed, classes),
+                           "estimate_s": round(sum(weighed[m] for m in part), 1)})
+    return result
+
+
+def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
+           repo: pathlib.Path = REPO) -> dict:
+    """Version-only or documentation-only pull request (L157, L161a)."""
+    out = {"version_only": False, "docs_only": False, "why": "not a pull request"}
+    if event != "pull_request":
+        return out
+    try:
+        names = _git(repo, "diff", "--name-only", "--no-renames", base, head).splitlines()
+        patch = _git(repo, "diff", "-U0", base, head, "--", version_only.VERSION_FILE)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        out["why"] = f"diff unreadable ({exc})"
+        return out
+    out["version_only"], why = version_only.version_only(names, patch)
+    out["docs_only"], doc_why = version_only.docs_only(names)
+    out["why"] = why if out["version_only"] else doc_why
+    out["files"] = names
+    return out
+
+
+def make_plan(event: str, card: dict | None, now: datetime.datetime | None = None,
+              head: str = "HEAD", repo: pathlib.Path = REPO) -> dict:
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    modules = parts.modules()
+    plan = {"schema": PLAN_SCHEMA, "event": event, "generated": now.isoformat(timespec="seconds"),
+            "head": os.environ.get("AMEESH_CI_TETE") or _rev(head, repo),
+            "tested": _rev(head, repo), **nature(event, head=head, repo=repo)}
+    plan.update(classify(modules, card, now, head=head, repo=repo))
+    classes = {m: tuple(c) for m, c in plan["classes"].items()}
+    plan["doc_readers"] = []
+    if plan["docs_only"]:
+        readers = {n.split(".", 1)[1] for n in version_only.doc_readers()}
+        if plan["map"] and plan["map"]["used"]:
+            for f in plan.get("files", []):
+                readers |= set(card.get("donnees", {}).get(f, ()))
+        plan["doc_readers"] = sorted(m for m in readers if m in modules)
+    skip = plan["version_only"] or plan["docs_only"]
+    pr = event == "pull_request"
+    plan["parts"] = {}
+    for driver, (n_pr, n_other) in PARTS.items():
+        selected = modules
+        if driver == "psql" and pr:
+            selected = parts.lire_liste(PILOT_FILE, modules)
+        plan["parts"][driver] = [] if skip else split(
+            selected, driver, n_pr if pr else n_other, card, classes)
+    every = [m for m in modules]
+    weighed = weights(every, "psycopg", card)
+    chosen = [m for m in every if classes[m][0] in ("P0", "P1")]
+    plan["selection"] = {"modules": len(every), "impacted": len(chosen),
+                         "impacted_estimate_s": round(sum(weighed[m] for m in chosen), 1),
+                         "total_estimate_s": round(sum(weighed.values()), 1)}
+    return plan
+
+
+def _rev(rev: str, repo: pathlib.Path) -> str:
+    try:
+        return _git(repo, "rev-parse", rev).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+
+
+def fallback_plan(event: str, error: str) -> dict:
+    """The plan when planning itself failed: full suite, alphabetical order."""
+    modules = parts.modules()
+    pr = event == "pull_request"
+    plan = {"schema": PLAN_SCHEMA, "event": event, "head": "", "tested": "",
+            "version_only": False, "docs_only": False, "why": "planning failed",
+            "map": None, "sure": False, "phase2_safe": False,
+            "unsure": [f"planning failed ({error}); full suite"], "untested": [],
+            "unknown_blocks": [], "foundation": [], "changed": 0, "doc_readers": [],
+            "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
+    for driver, (n_pr, n_other) in PARTS.items():
+        n = n_pr if pr else n_other
+        # no module list: scripts/test-parts.py splits the suite itself (L116)
+        plan["parts"][driver] = [
+            {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": None,
+             "pilot_list": driver == "psql" and pr, "estimate_s": 0}
+            for i in range(1, n + 1)]
+    plan["selection"] = {"modules": len(modules), "impacted": 0, "impacted_estimate_s": 0,
+                         "total_estimate_s": 0}
+    return plan
+
+
+def outputs(plan: dict) -> dict[str, str]:
+    """Job outputs (`$GITHUB_OUTPUT`) read by the parts through `fromJSON`."""
+    out = {"version_only": str(plan["version_only"]).lower(),
+           "docs_only": str(plan["docs_only"]).lower(),
+           "doc_readers": " ".join(f"tests.{m}" for m in plan["doc_readers"]),
+           "code": str(not (plan["version_only"] or plan["docs_only"])).lower()}
+    for driver, ps in plan["parts"].items():
+        out[driver] = json.dumps([p["part"] for p in ps])
+        out[f"{driver}_parts"] = str(ps[0]["of"] if ps else 0)
+    return out
+
+
+def annotations(plan: dict) -> list[str]:
+    sha = ((plan.get("map") or {}).get("commit") or "")[:12]
+    return [f"::notice file={u['file']},line={u['lines'][0]},endLine={u['lines'][1]},"
+            f"title=Changed lines without a test::{u['block']} changed and no test "
+            f"executes it (map {sha})" for u in plan.get("untested", [])]
+
+
+def _listing(items: list[str]) -> str:
+    shown = ", ".join(items[:SUMMARY_LIMIT])
+    return shown + (f" … and {len(items) - SUMMARY_LIMIT} more" if len(items) > SUMMARY_LIMIT
+                    else "")
+
+
+def summary(plan: dict) -> str:
+    lines = ["### Test plan", ""]
+    m = plan.get("map")
+    if m is None:
+        lines.append("* map: none (full suite, L161b order)")
+    else:
+        state = "used" if m["used"] else f"not used: {m['problem']}"
+        lines.append(f"* map `{(m['commit'] or '')[:12]}`, {m['age_h']} h old: {state}")
+    if plan["version_only"] or plan["docs_only"]:
+        lines.append(f"* {plan['why']}: parts skipped"
+                     + (f"; doc readers: {', '.join(plan['doc_readers'])}"
+                        if plan["docs_only"] else ""))
+    sel = plan["selection"]
+    lines.append(f"* {plan['changed']} file(s) changed since the "
+                 f"{'map commit' if m and m['used'] else 'parent commit'}; impacted (P0, P1): "
+                 f"{sel['impacted']} of {sel['modules']} modules, ~{sel['impacted_estimate_s']:.0f}"
+                 f" s of ~{sel['total_estimate_s']:.0f} s (psycopg); phase 1: nothing skipped")
+    lines.append(f"* selection sure: {'yes' if plan['sure'] else 'no'}; phase 2 safe: "
+                 f"{'yes' if plan['phase2_safe'] else 'no'}")
+    for reason in plan["unsure"][:SUMMARY_LIMIT]:
+        lines.append(f"  * {reason}")
+    by_class = collections.defaultdict(list)
+    for mod, (cls, reason) in plan["classes"].items():
+        by_class[cls].append(f"`{mod}` ({reason})" if reason else f"`{mod}`")
+    for cls in ("P0", "P1", "P2"):
+        if by_class[cls]:
+            lines.append(f"* {cls}: {_listing(by_class[cls])}")
+    if plan["untested"]:
+        lines.append("* **changed lines without a test**: " + _listing(
+            [f"`{u['file']}::{u['block']}` (lines {u['lines'][0]}-{u['lines'][1]})"
+             for u in plan["untested"]]))
+    if plan["unknown_blocks"]:
+        lines.append("* new blocks, unknown to the map: " + _listing(
+            [f"`{b}`" for b in plan["unknown_blocks"]]))
+    return "\n".join(lines) + "\n"
+
+
+# -- leaks ----------------------------------------------------------------
+
+def _read_stream(path: str) -> list[dict]:
+    events = []
+    try:
+        text = pathlib.Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return events
+    for line in text.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(ev, dict):
+            events.append(ev)
+    return events
+
+
+def _ts(value: str) -> datetime.datetime | None:
+    try:
+        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+
+
+def leaks(plan: dict, streams: list[str]) -> dict:
+    """One run: failures the map did not select, and the provisional green."""
+    classes = {m: c for m, c in plan.get("classes", {}).items()}
+    expected = {p["label"] for ps in plan.get("parts", {}).values() for p in ps}
+    failed, seen, starts, greens = {}, set(), [], {}
+    context = {}
+    for path in streams:
+        for ev in _read_stream(path):
+            part = ev.get("part", "")
+            context = context or {k: ev.get(k) for k in ("depot", "tete", "fusion", "execution")}
+            if ev.get("type") == "debut":
+                seen.add(part)
+                if _ts(ev.get("ts", "")):
+                    starts.append(_ts(ev["ts"]))
+            elif ev.get("type") == "impacted":
+                greens[part] = ev
+            elif ev.get("type") == "test" and ev.get("statut") in ("echec", "erreur"):
+                failed.setdefault(ev.get("module", "?"), {"test": ev.get("test", ""),
+                                                          "part": part})
+    leaked = [{"module": m, "class": classes.get(m, ["P3", ""])[0], **info}
+              for m, info in sorted(failed.items())
+              if classes.get(m, ["P3", ""])[0] not in ("P0", "P1")]
+    missing = sorted(expected - seen)
+    if missing or set(greens) != expected:
+        green = {"status": "incomplete", "missing": sorted(expected - set(greens))}
+    else:
+        status = "green" if all(e.get("statut") == "vert" for e in greens.values()) else "red"
+        at = [_ts(e.get("ts", "")) for e in greens.values()]
+        after = (max(at) - min(starts)).total_seconds() if starts and all(at) else None
+        green = {"status": status, "after_s": None if after is None else round(after, 1)}
+    m = plan.get("map") or {}
+    return {"schema": LEAKS_SCHEMA, "event": plan.get("event"), "head": plan.get("head"),
+            **context, "map_commit": m.get("commit"), "map_used": bool(m.get("used")),
+            "sure": plan.get("sure"), "phase2_safe": plan.get("phase2_safe"),
+            "selection": plan.get("selection"), "parts_missing": missing,
+            "failed": sorted(failed), "leaks": leaked, "provisional_green": green}
+
+
+def leaks_summary(record: dict) -> str:
+    g = record["provisional_green"]
+    lines = ["### Impacted tests: leaks and provisional green", ""]
+    if g["status"] == "incomplete":
+        lines.append(f"* provisional green: incomplete (no `impacted` event from "
+                     f"{', '.join(g['missing']) or 'some parts'})")
+    else:
+        after = f" after {g['after_s']:.0f} s" if g.get("after_s") is not None else ""
+        lines.append(f"* provisional green: P0 and P1 {g['status']}{after}")
+    if not record["map_used"]:
+        lines.append("* map not used: leaks are not counted for this run")
+    elif record["leaks"]:
+        lines.append("* **leaks** (failed, not selected by the map): " + ", ".join(
+            f"`{x['module']}` ({x['class']}, {x['part']})" for x in record["leaks"]))
+    else:
+        lines.append(f"* no leak ({len(record['failed'])} failed module(s), all selected)")
+    return "\n".join(lines) + "\n"
+
+
+def tally(records: list[dict]) -> dict:
+    """Leaks over many runs (lot L161i): phase 2 needs < 1 per 50 PRs."""
+    counted = [r for r in records if r.get("map_used")]
+    out = {}
+    for event in ("pull_request", "push"):
+        rs = [r for r in counted if r.get("event") == event]
+        with_leak = [r for r in rs if r.get("leaks")]
+        out[event] = {"runs": len(rs), "runs_with_leaks": len(with_leak),
+                      "leaks": sum(len(r["leaks"]) for r in rs),
+                      "per_50": round(50 * len(with_leak) / len(rs), 2) if rs else None,
+                      "sure": sum(1 for r in rs if r.get("sure")),
+                      "phase2_safe": sum(1 for r in rs if r.get("phase2_safe"))}
+    out["not_counted"] = len(records) - len(counted)
+    return out
+
+
+# -- command line ---------------------------------------------------------
+
+def _load_map(path: str | None) -> tuple[dict | None, str]:
+    if not path or not os.path.exists(path):
+        return None, f"{path or 'no path'}: absent"
+    try:
+        return carte.lire(path), ""
+    except (OSError, ValueError, EOFError) as exc:
+        return None, f"{path}: {exc}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("plan", help="classes and parts of this run")
+    p.add_argument("--out", required=True)
+    p.add_argument("--map", help="carte.json.gz (scripts/carte.py)")
+    p.add_argument("--event", default=os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch"))
+    p.add_argument("--github-output", help="appends the job outputs to this file")
+    p.add_argument("--summary", help="appends the Markdown summary to this file")
+    p.add_argument("--annotations", action="store_true",
+                   help="prints GitHub annotations for changed lines without a test")
+    p = sub.add_parser("leaks", help="leaks and provisional green of one run")
+    p.add_argument("plan")
+    p.add_argument("streams", nargs="*")
+    p.add_argument("--out")
+    p.add_argument("--summary")
+    p = sub.add_parser("tally", help="leaks over many runs")
+    p.add_argument("records", nargs="+")
+    args = ap.parse_args(argv)
+
+    if args.command == "plan":
+        card, why = _load_map(args.map)
+        if card is None and args.map:
+            print(f"map: {why}", file=sys.stderr)
+        try:
+            plan = make_plan(args.event, card)
+        except Exception as exc:  # planning must never block the suite
+            print(f"plan: {type(exc).__name__}: {exc}; fallback plan", file=sys.stderr)
+            plan = fallback_plan(args.event, f"{type(exc).__name__}: {exc}")
+        pathlib.Path(args.out).write_text(json.dumps(plan, indent=1, ensure_ascii=False)
+                                          + "\n", encoding="utf-8")
+        if args.github_output:
+            with open(args.github_output, "a", encoding="utf-8") as fh:
+                for k, v in outputs(plan).items():
+                    fh.write(f"{k}={v}\n")
+        text = summary(plan)
+        if args.summary:
+            with open(args.summary, "a", encoding="utf-8") as fh:
+                fh.write(text)
+        print(text, end="")
+        if args.annotations:
+            for line in annotations(plan):
+                print(line)
+        return 0
+    if args.command == "leaks":
+        try:
+            plan = json.loads(pathlib.Path(args.plan).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"plan {args.plan} unreadable ({exc}): no leak count", file=sys.stderr)
+            return 0
+        record = leaks(plan, args.streams)
+        if args.out:
+            pathlib.Path(args.out).write_text(json.dumps(record, indent=1) + "\n",
+                                              encoding="utf-8")
+        text = leaks_summary(record)
+        if args.summary:
+            with open(args.summary, "a", encoding="utf-8") as fh:
+                fh.write(text)
+        print(text, end="")
+        return 0
+    records = []
+    for path in args.records:
+        try:
+            records.append(json.loads(pathlib.Path(path).read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            print(f"{path}: unreadable, ignored", file=sys.stderr)
+    print(json.dumps(tally(records), indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
