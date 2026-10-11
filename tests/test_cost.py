@@ -14,6 +14,7 @@ import shutil
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from ameesh import cost
 
@@ -127,6 +128,118 @@ class ClaudeGaugeTest(Sandbox, unittest.TestCase):
         self.assertAlmostEqual(fresh.pace_cap(self.now), 0.10)
 
 
+class AccountTailGaugeTest(Sandbox, unittest.TestCase):
+    """L227: tail truncation must never transfer another account's gauges."""
+
+    def marker(self, account, ts):
+        return {"type": cost.ACCOUNT_MARKER, "harness": "claude",
+                "account": account, "ts": ts}
+
+    def reading(self, used):
+        return {"type": "rate_limit_event", "rate_limit_info": {
+            "unifiedWindows": {"five_hour": {"utilization": used,
+                                             "resetsAt": self.now + 3600}}}}
+
+    def large_stream(self, *tail):
+        self.agent("long", "claude")
+        self.events("long", self.marker("tertiary", self.now - 10),
+                    {"type": "assistant", "text": "x" * (cost.TAIL_BYTES + 70_000)},
+                    *tail)
+        return os.path.join(self.state, "long", "events.jsonl")
+
+    def test_marker_outside_real_four_mb_tail(self):
+        self.large_stream(self.reading(0.89))
+        book = self.book()
+        self.assertEqual(book.claude_gauges("primary", "primary"), [])
+        self.assertAlmostEqual(book.claude_gauges("tertiary", "primary")[0].used, 0.89)
+
+    def test_leading_readings_before_visible_marker_keep_prior_account(self):
+        self.large_stream(self.reading(0.89), self.marker("secondary", self.now),
+                          self.reading(0.42))
+        book = self.book()
+        self.assertEqual(book.claude_gauges("primary", "primary"), [])
+        self.assertAlmostEqual(book.claude_gauges("tertiary", "primary")[0].used, 0.89)
+        self.assertAlmostEqual(book.claude_gauges("secondary", "primary")[0].used, 0.42)
+
+    def test_recovered_marker_timestamp_beats_newer_file_mtime(self):
+        self.large_stream(self.reading(0.89))
+        self.agent("recent", "claude")
+        self.events("recent", self.marker("tertiary", self.now), self.reading(0.12))
+        os.utime(os.path.join(self.state, "long", "events.jsonl"),
+                 (self.now + 100, self.now + 100))
+        self.assertAlmostEqual(self.book().claude_gauges("tertiary", "primary")[0].used,
+                               0.12)
+
+    def test_large_unmarked_legacy_stream_still_belongs_to_primary(self):
+        path = self.large_stream(self.reading(0.25))
+        with open(path, "rb") as fh:
+            fh.readline()
+            remainder = fh.read()
+        with open(path, "wb") as fh:
+            fh.write(remainder)
+        self.assertAlmostEqual(self.book().claude_gauges("primary", "primary")[0].used,
+                               0.25)
+
+    def test_unmarked_prefix_of_marked_stream_is_unknown(self):
+        self.agent("long", "claude")
+        self.events("long", self.reading(0.89), self.marker("secondary", self.now),
+                    self.reading(0.42))
+        self.assertEqual(self.book().claude_gauges("primary", "primary"), [])
+
+    def test_prefix_read_failure_never_credits_primary(self):
+        self.large_stream(self.reading(0.89))
+        with mock.patch.object(cost, "_last_claude_marker", side_effect=OSError("read failed")):
+            self.assertEqual(self.book().claude_gauges("primary", "primary"), [])
+            self.assertEqual(self.book().claude_gauges("tertiary", "primary"), [])
+
+    def test_prefix_read_failure_preserves_later_explicit_account(self):
+        self.large_stream(self.reading(0.89), self.marker("secondary", self.now),
+                          self.reading(0.42))
+        with mock.patch.object(cost, "_last_claude_marker", side_effect=OSError("read failed")):
+            self.assertEqual(self.book().claude_gauges("primary", "primary"), [])
+            self.assertEqual(self.book().claude_gauges("tertiary", "primary"), [])
+            self.assertAlmostEqual(
+                self.book().claude_gauges("secondary", "primary")[0].used, 0.42)
+
+    def test_marker_crossing_tail_boundary_is_recovered(self):
+        self.agent("long", "claude")
+        marker = json.dumps(self.marker("tertiary", self.now)).encode() + b"\n"
+        reading = json.dumps(self.reading(0.31)).encode() + b"\n"
+        path = os.path.join(self.state, "long", "events.jsonl")
+        with open(path, "wb") as fh:
+            fh.write(b"{}\n" + marker + reading)
+        with mock.patch.object(cost, "TAIL_BYTES", len(reading) + len(marker) // 2):
+            self.assertAlmostEqual(
+                self.book().claude_gauges("tertiary", "primary")[0].used, 0.31)
+            self.assertEqual(self.book().claude_gauges("primary", "primary"), [])
+
+    def test_reverse_scan_uses_last_valid_claude_marker_across_blocks(self):
+        self.agent("long", "claude")
+        self.events("long", self.marker("secondary", self.now - 20),
+                    self.marker("tertiary", self.now - 10),
+                    {"type": cost.ACCOUNT_MARKER, "harness": "codex", "account": "other"},
+                    {"type": "assistant", "text": "x" * (cost.TAIL_BYTES + 70_000)},
+                    self.reading(0.31))
+        self.assertAlmostEqual(self.book().claude_gauges("tertiary", "primary")[0].used,
+                               0.31)
+        self.assertEqual(self.book().claude_gauges("secondary", "primary"), [])
+
+    def test_marker_split_across_reverse_blocks(self):
+        self.agent("long", "claude")
+        marker = json.dumps(self.marker("tertiary", self.now)).encode() + b"\n"
+        path = os.path.join(self.state, "long", "events.jsonl")
+        with open(path, "wb") as fh:
+            fh.write(marker + b"x" * 63_960 + b"\n")
+        with open(path, "rb") as fh:
+            self.assertEqual(cost._last_claude_marker(fh, os.path.getsize(path)),
+                             self.marker("tertiary", self.now))
+
+    def test_empty_account_marker_does_not_default_to_primary(self):
+        self.agent("long", "claude")
+        self.events("long", self.marker("", self.now), self.reading(0.89))
+        self.assertEqual(self.book().claude_gauges("primary", "primary"), [])
+
+
 class CodexGaugeTest(Sandbox, unittest.TestCase):
     def test_jauges_primaires_et_secondaires_du_journal_le_plus_recent(self):
         write(os.path.join(self.codex, "2026", "10", "04", "roll.jsonl"),
@@ -160,6 +273,18 @@ class CodexGaugeTest(Sandbox, unittest.TestCase):
         self.assertEqual([g.key for g in gauges], ["codex-300min"])
         self.assertAlmostEqual(gauges[0].used, 0.95)
         self.assertIn("codex", self.book().pace_exceeded("codex"))
+
+    def test_large_sessions_remain_scoped_to_each_account_directory(self):
+        for account, used in (("primary", 12), ("secondary", 89)):
+            root = os.path.join(self.codex, account, "sessions")
+            write(os.path.join(root, "large.jsonl"),
+                  {"type": "session_meta"},
+                  {"type": "message", "text": "x" * 2_100_000},
+                  {"payload": {"rate_limits": {
+                      "primary": {"used_percent": used, "window_minutes": 300,
+                                  "resets_at": self.now + 3600}}}})
+            gauges = self.book().codex_gauges(sessions=root)
+            self.assertAlmostEqual(gauges[0].used, used / 100)
 
     def test_aucune_jauge_sans_journal(self):
         self.assertEqual(self.book().codex_gauges(), [])

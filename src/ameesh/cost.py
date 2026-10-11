@@ -429,14 +429,11 @@ class CostBook:
 
     # -- jauges de forfait --------------------------------------------------
     def claude_gauges(self, account: str | None = None, primary: str | None = None) -> list:
-        """Le dernier `rate_limit_event` vu par un agent Claude.
+        """Read the latest Claude rate-limit gauges, shared across an account.
 
-        Le forfait est partagé par tout le compte : la jauge la plus récente de
-        n'importe quel agent Claude vaut pour les autres.
-
-        `account` (L30) : seulement les événements de ce compte, reconnus par le
-        marqueur qui précède chaque tour ; un événement sans marqueur avant lui
-        appartient au compte `primary`.
+        With `account` (L30), use the marker preceding each turn, including
+        markers outside the read tail. Only a stream with no account marker
+        belongs to `primary`.
         """
         if account is not None:
             return self._claude_gauges_of(account, primary or account)
@@ -462,12 +459,10 @@ class CostBook:
         return newest[1] if newest else []
 
     def _claude_gauges_of(self, account: str, primary: str) -> list:
-        """Les jauges Claude d'UN compte (L30) : le dernier relevé de ce compte.
+        """Read the newest gauges for one Claude account (L30).
 
-        Chaque tour est précédé d'un marqueur daté ; le relevé le plus récent est
-        celui du tour au marqueur le plus récent, tous agents confondus. Dans un
-        flux sans aucun marqueur (agent d'avant L30), les relevés sont du compte
-        primaire et datés par le fichier.
+        Compare turn-marker timestamps across agents. Only a stream without
+        any marker uses the primary account and file modification time.
         """
         best = None
         for agent in self.agents():
@@ -475,19 +470,19 @@ class CostBook:
                 continue
             path = os.path.join(self.agent_dir(agent), "events.jsonl")
             try:
-                mtime = os.stat(path).st_mtime
+                events, mtime = _claude_account_tail(path)
             except OSError:
+                # An unreadable prefix leaves the account unknown, never primary.
                 continue
-            events = self.events(agent, tail=True)
-            marked = any(e.get("type") == ACCOUNT_MARKER for e in events)
-            current, stamp = primary, (0.0 if marked else mtime)
+            marked = any(_is_claude_marker(e) for e in events)
+            current, stamp = (None, 0.0) if marked else (primary, mtime)
             found = None
             for event in events:
                 kind = event.get("type")
                 if kind == ACCOUNT_MARKER:
                     if event.get("harness") not in (None, "", "claude"):
                         continue
-                    current = str(event.get("account") or primary)
+                    current = str(event.get("account") or "") or None
                     try:
                         stamp = float(event.get("ts") or 0.0)
                     except (TypeError, ValueError):
@@ -1375,6 +1370,81 @@ def _read_tail(path: str, limit: int = TAIL_BYTES) -> str:
             return fh.read().decode("utf-8", "ignore")
     except OSError:
         return ""
+
+
+def _is_claude_marker(event: dict) -> bool:
+    return (event.get("type") == ACCOUNT_MARKER
+            and event.get("harness") in (None, "", "claude"))
+
+
+def _last_claude_marker(fh, end: int) -> dict | None:
+    """Find the last complete Claude marker before end by reverse block scan.
+
+    Memory holds one block plus the JSONL line crossing its boundary. Stop at
+    the first matching marker; scan to the beginning to prove a legacy stream.
+    Read failures propagate so callers cannot mistake them for legacy input.
+    """
+    pending: list[bytes] = []
+    while end:
+        start = max(0, end - 64_000)
+        fh.seek(start)
+        block = fh.read(end - start)
+        if len(block) != end - start:
+            raise OSError("Account marker prefix changed during read")
+        lines = block.split(b"\n")
+        if len(lines) > 1:
+            lines[-1] += b"".join(reversed(pending))
+            pending = []
+        if start:
+            pending.append(lines.pop(0))
+        else:
+            lines[0] += b"".join(reversed(pending))
+        for line in reversed(lines):
+            if ACCOUNT_MARKER.encode() not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(event, dict) and _is_claude_marker(event):
+                return event
+        end = start
+    return None
+
+
+def _claude_account_tail(path: str) -> tuple[list, float]:
+    """Read a snapshot tail with its preceding account marker, on one handle."""
+    with open(path, "rb") as fh:
+        stat = os.fstat(fh.fileno())
+        start = max(0, stat.st_size - TAIL_BYTES)
+        if start:
+            # Keep complete lines only; the prefix scan includes a marker that
+            # straddles the raw tail boundary.
+            fh.seek(start - 1)
+            if fh.read(1) != b"\n":
+                fh.readline(stat.st_size - start)
+                start = fh.tell()
+        fh.seek(start)
+        raw = fh.read(stat.st_size - start)
+        if len(raw) != stat.st_size - start:
+            raise OSError("Account marker tail changed during read")
+        events = []
+        for line in raw.splitlines():
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        if start:
+            try:
+                marker = _last_claude_marker(fh, start)
+            except OSError:
+                # Preserve later explicit markers, but ignore the unknown turn.
+                marker = {"type": ACCOUNT_MARKER, "harness": "claude"}
+            if marker is not None:
+                events.insert(0, marker)
+        return events, stat.st_mtime
 
 
 def _num(usage: dict, key: str) -> int:
