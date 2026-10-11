@@ -123,11 +123,13 @@ class TestAllersRetours(PgTestCase):
         self._borne(trace, BORNES["hook"])
         self.assertFalse(any(s.startswith("INSERT INTO agent_registry")
                              for s in trace["statements"]), trace["statements"])
-        # une autre session : réinscrite tout de suite
+        # un autre dossier : réinscrit tout de suite ; la session du hook,
+        # elle, n'est jamais inscrite sous bail (L166 : celle du flux fait foi)
         autre = json.dumps({"hook_event_name": "PostToolUse", "session_id": "s2",
-                            "cwd": "/tmp"})
+                            "cwd": "/ailleurs"})
         trace = self._trace(self.cli, "hook", "claude", stdin=autre, **env)
-        self.assertEqual(registry.get(self.db, "alpha")["session_id"], "s2")
+        row = registry.get(self.db, "alpha")
+        self.assertEqual((row["cwd"], row["session_id"]), ("/ailleurs", None))
 
 
 class TestTrace(unittest.TestCase):

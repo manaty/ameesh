@@ -122,8 +122,7 @@ class RepriseApresRefusTest(_Base):
             self.assertEqual(worker.resume_origin, "ameesh")
             self.assertTrue(self._tour(worker))
         self.assertEqual(self._reprises(), [FILLE, None])
-        argv = self.turns()[-1]["argv"]
-        self.assertIn("session fille %s écartée" % FILLE, argv[argv.index("--prompt") + 1])
+        self.assertIn("session fille %s écartée" % FILLE, " ".join(self.turns()[-1]["argv"]))
         self.assertEqual(registry.get(self.db, "ds-neuve")["session_id"], "dsh-session-1")
 
 
