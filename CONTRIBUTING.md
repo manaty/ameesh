@@ -22,3 +22,19 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   nouveaux fichiers source.
 
 La conception (décisions, exigences, spécification) est dans `docs/design/`.
+
+## Numérotation des versions
+
+Règle du propriétaire (2026-10-11). Le numéro `MAJEUR.MINEUR.CORRECTIF` dit
+ce que la version change, pas quand elle sort :
+
+| Numéro | Quand | Déploiement |
+|---|---|---|
+| **majeur** (2.0.0) | rupture : contrat entre agents changé, commande ou option retirée, migration qui ne fait pas qu'ajouter | proposé au propriétaire |
+| **mineur** (1.7.0) | nouvelle fonction, commande, option ou réglage ; migration qui ne fait qu'ajouter | proposé au propriétaire, préparé entièrement |
+| **correctif** (1.6.6) | corrections de bugs seulement, sans migration ni commande nouvelle | sans attendre le propriétaire, dès que la CI est verte |
+
+Une version porte le numéro de son changement le plus fort. Chaque version est
+étiquetée `v<numéro>` sur le commit de `main` déployé et publiée sur GitHub.
+La CI vérifiera qu'une PR de version porte le bon numéro (lot L158), et
+l'auditeur interne le contrôle à chaque version publiée.
