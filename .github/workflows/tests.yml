@@ -17,6 +17,12 @@
 # validée pour ce contenu. Le job « changements » le détecte
 # (scripts/version-only.py) ; les parts sont alors sautées et « tests » reste
 # vert. Au moindre doute, la suite tourne ; jamais sur un push ni à la main.
+#
+# L161a — même chose pour une PR de documentation seule (docs/, site/, *.md
+# hors src/, tests/, .github/ et examples/) : seuls ses lecteurs déclarés
+# (tests/parts/lecteurs-doc.txt) tournent, sans base, dans « lecteurs de la
+# doc ». Et une exécution de main n'est jamais annulée par la suivante : chaque
+# fusion garde son verdict.
 name: tests
 
 on:
@@ -25,10 +31,12 @@ on:
   pull_request:
   workflow_dispatch:
 
-# une exécution dépassée (nouveau commit sur la même branche ou PR) est annulée
+# une exécution de PR dépassée (nouveau commit sur la PR) est annulée ; hors
+# PR, chaque exécution a son propre groupe : ni annulée, ni écartée en attente
+# (GitHub n'en garde qu'une en attente par groupe), même sans cancel-in-progress
 concurrency:
-  group: tests-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -41,23 +49,27 @@ env:
   PYTHONPATH: src
 
 jobs:
-  # L157 : PR de version seule ? (commit de fusion de la PR face à sa cible)
+  # L157, L161a : PR de version seule, de documentation seule ? (commit de
+  # fusion de la PR face à sa cible)
   changes:
     name: changements
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       version_only: ${{ steps.diff.outputs.version_only }}
+      docs_only: ${{ steps.diff.outputs.docs_only }}
+      doc_readers: ${{ steps.diff.outputs.doc_readers }}
     steps:
       - uses: actions/checkout@v4
         if: github.event_name == 'pull_request'
         with:
           fetch-depth: 2
       - id: diff
-        name: PR de version seule ?
+        name: PR de version ou de documentation seule ?
         run: |
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "version_only=false" >> "$GITHUB_OUTPUT"
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           python3 scripts/version-only.py HEAD^1 HEAD >> "$GITHUB_OUTPUT"
@@ -65,7 +77,7 @@ jobs:
   psycopg:
     name: psycopg ${{ matrix.part }}/4
     needs: changes
-    if: needs.changes.outputs.version_only != 'true'
+    if: needs.changes.outputs.version_only != 'true' && needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -125,7 +137,7 @@ jobs:
   psql:
     name: psql ${{ matrix.part }}/${{ github.event_name == 'pull_request' && 1 || 6 }}
     needs: changes
-    if: needs.changes.outputs.version_only != 'true'
+    if: needs.changes.outputs.version_only != 'true' && needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -165,7 +177,7 @@ jobs:
   platform-macos:
     name: plateforme macOS
     needs: changes
-    if: needs.changes.outputs.version_only != 'true'
+    if: needs.changes.outputs.version_only != 'true' && needs.changes.outputs.docs_only != 'true'
     runs-on: macos-latest
     timeout-minutes: 10
     env:
@@ -180,24 +192,48 @@ jobs:
       - name: couche plateforme et lint
         run: python -m unittest -v tests.test_l63_platform.PlatformTest tests.test_l63_platform.LintTest
 
+  # L161a : PR de documentation seule, ses lecteurs déclarés seulement, sans base
+  doc-readers:
+    name: lecteurs de la doc
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AMEESH_REQUIRE_DB: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: lecteurs de la doc
+        run: python -m unittest -v ${{ needs.changes.outputs.doc_readers }}
+
   # nom de vérification stable : vert seulement si toutes les parts le sont
-  # (L157 : ou si la PR ne change que le numéro de version, parts sautées)
+  # (L157 : ou si la PR ne change que le numéro de version, parts sautées ;
+  # L161a : ou que de la documentation, et ses lecteurs sont verts)
   tests:
     name: tests
     if: always()
-    needs: [changes, psycopg, psql, platform-macos]
+    needs: [changes, psycopg, psql, platform-macos, doc-readers]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: bilan des parts
         run: |
-          echo "changements : ${{ needs.changes.result }} (version seule : ${{ needs.changes.outputs.version_only }})"
+          echo "changements : ${{ needs.changes.result }} (version seule : ${{ needs.changes.outputs.version_only }}, doc seule : ${{ needs.changes.outputs.docs_only }})"
+          echo "doc     : ${{ needs.doc-readers.result }}"
           echo "psycopg : ${{ needs.psycopg.result }}"
           echo "psql    : ${{ needs.psql.result }}"
           echo "macOS   : ${{ needs.platform-macos.result }}"
           test "${{ needs.changes.result }}" = success
           if [ "${{ needs.changes.outputs.version_only }}" = "true" ]; then
             echo "PR de version seule : suite déjà validée sur main, parts sautées"
+            exit 0
+          fi
+          if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
+            echo "PR de documentation seule : ses lecteurs seulement, parts sautées"
+            test "${{ needs.doc-readers.result }}" = success
             exit 0
           fi
           test "${{ needs.psycopg.result }}" = success
