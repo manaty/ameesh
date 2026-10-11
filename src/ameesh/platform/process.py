@@ -228,6 +228,30 @@ def open_fd_count() -> int:
     raise NotAvailable("descripteurs ouverts", "ni psutil (POSIX) ni /proc")
 
 
+#: descriptors of this process, always the real `/proc` (not `PROC`, which
+#: the tests replace by a fake process table)
+SELF_FD = "/proc/self/fd"
+
+
+def fd_path(fd: int) -> str:
+    """The path the kernel gives for the open directory or file `fd` of this
+    process (L230: is a descriptor still where it was planned?). Linux:
+    `/proc/self/fd/N`; macOS: `F_GETPATH`. `NotAvailable` elsewhere, or if
+    the descriptor's file is deleted."""
+    from . import is_linux
+    import fcntl
+    if is_linux() and os.path.isdir(SELF_FD):
+        target = os.readlink(os.path.join(SELF_FD, str(fd)))
+    elif hasattr(fcntl, "F_GETPATH"):
+        raw = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024)
+        target = raw.split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
+    else:
+        raise NotAvailable("chemin d'un descripteur", "ni /proc ni F_GETPATH")
+    if not target.startswith("/") or target.endswith(" (deleted)"):
+        raise NotAvailable("chemin d'un descripteur", "fichier supprimé ou hors arborescence")
+    return target
+
+
 # --------------------------------------------------------------------------
 # table des processus, groupes, sous-moissonneur (travail de fond d'un tour)
 # --------------------------------------------------------------------------

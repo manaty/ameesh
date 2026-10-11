@@ -29,25 +29,35 @@ housekeeping pass frees what a build regenerates:
   another filesystem, one that holds a `.git`, and the managed roots are left
   in place (the deletion is then `partial`).
 * **How**: the artifact is reached through directory file descriptors from
-  the worktree root, never following a link, then renamed atomically to a
-  sibling `.ameesh-trash-…` (a process starting later sees no
-  `node_modules`, not half of one) and deleted through descriptors too; a
-  trash left by an interrupted pass is finished by the next one. One worktree
-  at a time, in a thread at the lowest CPU priority and the idle IO class
-  (`ionice -c 3` when available), within a time budget per pass checked
-  inside every walk (the rest waits for the next pass), one pass at a time on
-  the host (`flock`, runner and CLI). Deleting frees space: under pressure
-  the pass keeps going, serialised. Each deletion is logged
-  (`housekeeping_log`, kind `artifact`: `deleted`, or `partial` with what was
-  left and why) with the bytes freed; the dry run lists what would go and its
-  size, and writes nothing.
+  the worktree root, never following a link; the root itself must still be
+  the surveyed directory (same device and inode, and the kernel's path of the
+  descriptor is the surveyed real path: an ancestor swapped for a link is
+  refused). It is then renamed atomically to a sibling
+  `.ameesh-trash-<pid>-<ts>-<random>` (a process starting later sees no
+  `node_modules`, not half of one), recorded in the host's journal BEFORE
+  the rename, and deleted through descriptors too. A trash left by an
+  interrupted pass is finished by the next one only if the journal records
+  it (same name, same parent, same inode): any other `.ameesh-trash-*` is
+  an ordinary directory, never deleted. One worktree at a time, in a thread
+  at the lowest CPU priority and the idle IO class (`ionice -c 3` when
+  available), within a time budget per pass checked at every entry of every
+  walk, dry-run sizing included (the rest waits for the next pass), one
+  pass at a time on the host (`flock`, runner and CLI, shared with the
+  removal of merged worktrees). Deleting frees space: under pressure the
+  pass keeps going, serialised. Each deletion is logged (`housekeeping_log`,
+  kind `artifact`: `deleted`, or `partial` with what was left and why) with
+  the bytes freed; the dry run lists what would go and its size, and writes
+  nothing.
 * **Out of scope, by design**: processes of other users (an agent host runs
   its agents as one user); `unreadable_ok` matches names only, an explicit
   choice of the host's owner.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -72,6 +82,8 @@ PASS_BUDGET_S = 600.0
 SCAN_EVERY_S = 6 * 3600.0
 #: an artifact renamed before its deletion
 TRASH_PREFIX = ".ameesh-trash-"
+#: the names this module gives (`trash_name`); a trash is ours only if the journal says so
+TRASH_RE = re.compile(r"\A\.ameesh-trash-\d+-\d+-[0-9a-f]{16}\Z")
 GIT_TIMEOUT = 30.0
 
 _last_scan: dict = {}
@@ -142,6 +154,75 @@ class Budget:
         return self.clock() > self.deadline
 
 
+class Journal:
+    """The trash dirs renamed by a deleting pass and not deleted yet: a file
+    of the host next to the lock, one JSON record per line (`trash`, its
+    `parent`, `parent_id` and `id` as (device, inode), `kind`, `origin`).
+    A record is written (fsync) BEFORE the rename and dropped once the trash
+    is gone: only a recorded trash is ever resumed. Written under the lock."""
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def records(self) -> list[dict]:
+        """Recorded trash dirs; OSError if the journal cannot be read."""
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except FileNotFoundError:
+            return []
+        out = []
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and isinstance(rec.get("trash"), str) \
+                    and isinstance(rec.get("parent"), str) \
+                    and TRASH_RE.match(os.path.basename(rec["trash"])) \
+                    and os.path.dirname(rec["trash"]) == rec["parent"]:
+                out.append(rec)
+        return out
+
+    def _write(self, records: list[dict]) -> None:
+        folder = os.path.dirname(self.path) or "."
+        os.makedirs(folder, exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            for rec in records:
+                fh.write(json.dumps(rec, sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.path)
+        dfd = os.open(folder, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+    def add(self, record: dict) -> None:
+        self._write([r for r in self.records() if r["trash"] != record["trash"]] + [record])
+
+    def drop(self, trash: str) -> None:
+        records = self.records()
+        kept = [r for r in records if r["trash"] != trash]
+        if len(kept) != len(records):
+            self._write(kept)
+
+
+def trash_name() -> str:
+    return "%s%d-%d-%s" % (TRASH_PREFIX, os.getpid(), int(time.time()), secrets.token_hex(8))
+
+
+def identity(path: str) -> tuple[int, int] | None:
+    """(device, inode) of the directory `path` itself (not followed), or None."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino) if stat.S_ISDIR(st.st_mode) else None
+
+
 # --------------------------------------------------------------------------
 # one worktree
 # --------------------------------------------------------------------------
@@ -160,21 +241,25 @@ def _gitdir(worktree: str) -> str:
     return os.path.normpath(os.path.join(worktree, line[len("gitdir:"):].strip()))
 
 
-def survey(worktree: str, rules, *, skip_roots=(), limit: int = WALK_LIMIT,
+def survey(worktree: str, rules, *, skip_roots=(), skip_ids=(), limit: int = WALK_LIMIT,
            budget: Budget | None = None) -> dict:
     """Walk of a worktree outside its artifacts: `latest` activity (mtime or
     ctime, git index and HEAD included), `artifacts` (directories matched by
-    the rules, not entered), `trash` (left by an interrupted pass),
-    `complete`, `why`.
+    the rules, not entered), `real` and `identity` (device, inode) of its
+    root, `complete`, `why`.
 
     Not entered: `.git`, a nested checkout (a directory with a `.git`), a
-    symbolic link, another filesystem (incomplete), `skip_roots`."""
-    out: dict = {"latest": None, "artifacts": [], "trash": [], "complete": True, "why": ""}
+    symbolic link, another filesystem (incomplete), `skip_roots`, the trash
+    dirs of the journal (`skip_ids`: (device, inode)). The deadline and the
+    entry limit are checked at every entry."""
+    out: dict = {"latest": None, "artifacts": [], "complete": True, "why": "",
+                 "real": os.path.realpath(worktree), "identity": None}
     try:
-        top = os.lstat(worktree)
+        top = os.lstat(out["real"])
     except OSError as exc:
         out.update(complete=False, why="unreadable (%s)" % (exc.strerror or exc))
         return out
+    out["identity"] = (top.st_dev, top.st_ino)
     latest = max(top.st_mtime, top.st_ctime)
     gitdir = _gitdir(worktree)
     for name in ("index", "HEAD", os.path.join("logs", "HEAD")):
@@ -185,52 +270,54 @@ def survey(worktree: str, rules, *, skip_roots=(), limit: int = WALK_LIMIT,
         if st is not None:
             latest = max(latest, st.st_mtime, st.st_ctime)
     skip = {os.path.realpath(p) for p in skip_roots if p}
+    skip_ids = {tuple(i) for i in skip_ids}
     count = 0
     stack = [worktree]
     while stack:
-        if budget is not None and budget.expired():
-            out.update(complete=False, why="time budget of the pass reached")
-            return out
         current = stack.pop()
         try:
             with os.scandir(current) as it:
-                entries = list(it)
+                for entry in it:
+                    count += 1
+                    if count > limit:
+                        out.update(complete=False, latest=latest,
+                                   why="more than %d entries: activity not verifiable" % limit)
+                        return out
+                    if budget is not None and budget.expired():
+                        out.update(complete=False, why="time budget of the pass reached")
+                        return out
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        out.update(complete=False, why="unreadable entry: %s" % entry.path)
+                        continue
+                    is_dir = stat.S_ISDIR(st.st_mode)
+                    if is_dir and (st.st_dev, st.st_ino) in skip_ids:
+                        continue   # our trash, finished by the journal
+                    if is_dir and entry.name != ".git" and st.st_dev == top.st_dev \
+                            and any(rule.matches(current, entry.name) for rule in rules):
+                        # an install or a build is not work: its times are not activity
+                        if os.path.realpath(entry.path) not in skip:
+                            out["artifacts"].append(entry.path)
+                        continue
+                    latest = max(latest, st.st_mtime, st.st_ctime)
+                    if not is_dir or entry.name == ".git":
+                        continue
+                    if st.st_dev != top.st_dev:
+                        out.update(complete=False, latest=latest,
+                                   why="mount point inside: %s" % entry.path)
+                        return out
+                    if os.path.realpath(entry.path) in skip:
+                        continue
+                    if os.path.lexists(os.path.join(entry.path, ".git")):
+                        continue   # a nested checkout: judged on its own
+                    stack.append(entry.path)
         except OSError:
             out.update(complete=False, why="unreadable directory: %s" % current)
             continue
-        for entry in entries:
-            count += 1
-            if count > limit:
-                out.update(complete=False, latest=latest,
-                           why="more than %d entries: activity not verifiable" % limit)
-                return out
-            try:
-                st = entry.stat(follow_symlinks=False)
-            except OSError:
-                out.update(complete=False, why="unreadable entry: %s" % entry.path)
-                continue
-            is_dir = stat.S_ISDIR(st.st_mode)
-            if is_dir and st.st_dev == top.st_dev and entry.name.startswith(TRASH_PREFIX):
-                out["trash"].append(entry.path)
-                continue
-            if is_dir and entry.name != ".git" and st.st_dev == top.st_dev \
-                    and any(rule.matches(current, entry.name) for rule in rules):
-                # an install or a build is not work: its times are not activity
-                if os.path.realpath(entry.path) not in skip:
-                    out["artifacts"].append(entry.path)
-                continue
-            latest = max(latest, st.st_mtime, st.st_ctime)
-            if not is_dir or entry.name == ".git":
-                continue
-            if st.st_dev != top.st_dev:
-                out.update(complete=False, latest=latest,
-                           why="mount point inside: %s" % entry.path)
-                return out
-            if os.path.realpath(entry.path) in skip:
-                continue
-            if os.path.lexists(os.path.join(entry.path, ".git")):
-                continue   # a nested checkout: judged on its own
-            stack.append(entry.path)
+    if budget is not None and budget.expired():
+        out.update(complete=False, why="time budget of the pass reached")
+        return out
     out["latest"] = latest
     return out
 
@@ -253,28 +340,33 @@ def tracked(worktree: str, artifact: str) -> str:
     return ""
 
 
-def size_of(path: str, limit: int = SIZE_LIMIT) -> int:
-    """Bytes used under `path`, without following links nor leaving the filesystem."""
+def size_of(path: str, limit: int = SIZE_LIMIT,
+            budget: Budget | None = None) -> tuple[int, bool]:
+    """Bytes used under `path`, without following links nor leaving the
+    filesystem; and whether all of it was counted (the entry limit and the
+    deadline are checked at every entry)."""
     try:
         device = os.lstat(path).st_dev
     except OSError:
-        return 0
+        return 0, False
     total, count, stack = 0, 0, [path]
-    while stack and count < limit:
+    while stack:
         try:
             with os.scandir(stack.pop()) as it:
                 for entry in it:
+                    count += 1
+                    if count > limit or (budget is not None and budget.expired()):
+                        return total, False
                     try:
                         st = entry.stat(follow_symlinks=False)
                     except OSError:
                         continue
-                    count += 1
                     total += _blocks(st)
                     if stat.S_ISDIR(st.st_mode) and st.st_dev == device:
                         stack.append(entry.path)
         except OSError:
             continue
-    return total
+    return total, True
 
 
 def _blocks(st) -> int:
@@ -293,15 +385,38 @@ def _open_dir(name: str, dir_fd: int | None = None) -> int:
     return os.open(name, _DIR_FLAGS, dir_fd=dir_fd)
 
 
-def _open_parent(worktree: str, artifact: str) -> tuple[int, str]:
+def open_checked(path: str, ident) -> int:
+    """A descriptor of the directory `path` (a real path), refused
+    (`ValueError`) unless it is still the planned one: same (device, inode)
+    as `ident`, and the kernel's path of the descriptor is `path` (an
+    ancestor swapped for a link after the plan redirects the open)."""
+    fd = _open_dir(path)
+    try:
+        st = os.fstat(fd)
+        if ident is None or (st.st_dev, st.st_ino) != tuple(ident):
+            raise ValueError("%s is no longer the surveyed directory" % path)
+        try:
+            where = platform.fd_path(fd)
+        except (platform.NotAvailable, OSError) as exc:
+            raise ValueError("%s: path of its descriptor unknown (%s)" % (path, exc)) from None
+        if where != path:
+            raise ValueError("%s now resolves to %s" % (path, where))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _open_parent(worktree: str, artifact: str, root: tuple) -> tuple[int, str]:
     """A descriptor of the directory that holds `artifact`, reached from the
     worktree root one component at a time without following any link, on the
-    worktree's filesystem; and the artifact's name in it."""
+    worktree's filesystem; and the artifact's name in it. `root`: (real
+    path, identity) of the worktree as surveyed (`open_checked`)."""
     rel = os.path.relpath(artifact, worktree)
     parts = rel.split(os.sep)
     if os.path.isabs(rel) or any(p in ("", ".", "..") for p in parts):
         raise ValueError("%s is outside %s" % (artifact, worktree))
-    fd = _open_dir(worktree)
+    fd = open_checked(*root)
     try:
         device = os.fstat(fd).st_dev
         for part in parts[:-1]:
@@ -316,11 +431,14 @@ def _open_parent(worktree: str, artifact: str) -> tuple[int, str]:
     return fd, parts[-1]
 
 
-def _delete_tree(parent_fd: int, name: str, *, avoid: set, budget: Budget | None) -> dict:
+def _delete_tree(parent_fd: int, name: str, *, avoid: set, budget: Budget | None,
+                 gitlink: bool = False) -> dict:
     """Deletes the directory `name` of `parent_fd` through descriptors: links
     are unlinked, never followed; a subtree on another filesystem, holding a
     `.git`, or one of `avoid` ((dev, ino) of the managed roots) is left in
     place; a directory of ours without write permission is opened up.
+    `gitlink`: `name` is a removed worktree, whose own `.git` FILE (a link to
+    its repository) goes with it; a `.git` below it still keeps its subtree.
     `bytes` freed, `errors`, `left` (subtrees left on purpose), `stopped`
     (time budget)."""
     out: dict = {"bytes": 0, "errors": [], "left": [], "stopped": False}
@@ -343,7 +461,7 @@ def _delete_tree(parent_fd: int, name: str, *, avoid: set, budget: Budget | None
             out["errors"].append("%s: %s" % (rel, exc.strerror or exc))
         return None
 
-    def remove(pfd: int, entry: str, rel: str) -> bool:
+    def remove(pfd: int, entry: str, rel: str, top: bool = False) -> bool:
         fd = opened(pfd, entry, rel)
         if fd is None:
             return False
@@ -357,7 +475,8 @@ def _delete_tree(parent_fd: int, name: str, *, avoid: set, budget: Budget | None
                 out["left"].append("%s (managed root)" % rel)
                 return False
             names = os.listdir(fd)
-            if ".git" in names:
+            if ".git" in names and not (top and gitlink and stat.S_ISREG(
+                    os.stat(".git", dir_fd=fd, follow_symlinks=False).st_mode)):
                 out["left"].append("%s (holds a .git)" % rel)
                 return False
             if st.st_uid == uid and (st.st_mode & 0o700) != 0o700:
@@ -405,51 +524,135 @@ def _delete_tree(parent_fd: int, name: str, *, avoid: set, budget: Budget | None
             out["errors"].append("%s: %s" % (rel, exc.strerror or exc))
             return False
 
-    remove(parent_fd, name, name)
+    remove(parent_fd, name, name, top=True)
     return out
 
 
-def remove_artifact(artifact: str, worktree: str, *, rules=(), avoid: set = frozenset(),
-                    budget: Budget | None = None, check=lambda: "") -> dict:
-    """Deletes the artifact directory `artifact` of `worktree` (or finishes a
-    trash left by an interrupted pass).
+def _to_trash(pfd: int, name: str, journal: Journal, **about) -> dict:
+    """Renames the directory `name` of `pfd` to a fresh trash name, recorded
+    in the journal first; the record."""
+    st = os.stat(name, dir_fd=pfd, follow_symlinks=False)
+    pst = os.fstat(pfd)
+    try:
+        parent = platform.fd_path(pfd)
+    except (platform.NotAvailable, OSError) as exc:
+        raise ValueError("path of the parent unknown (%s)" % exc) from None
+    trash = trash_name()
+    record = dict(about, trash=os.path.join(parent, trash), parent=parent,
+                  parent_id=[pst.st_dev, pst.st_ino], id=[st.st_dev, st.st_ino],
+                  pid=os.getpid(), ts=time.time())
+    journal.add(record)
+    try:
+        os.rename(name, trash, src_dir_fd=pfd, dst_dir_fd=pfd)
+    except BaseException:
+        journal.drop(record["trash"])
+        raise
+    return record
 
-    Through descriptors from the worktree root (`_open_parent`): refused
-    (`ValueError`) for a link, a non-directory, a path outside the worktree or
-    crossing a filesystem, an artifact whose rule no longer holds (its
-    `Cargo.toml` gone). `check()` is called last, right before the rename,
-    and refuses with its reason (a process came in). The artifact is renamed
-    to a sibling `TRASH_PREFIX…` (atomic) then deleted. Returns the report of
-    `_delete_tree`, plus `trash` (its name)."""
-    pfd, name = _open_parent(worktree, artifact)
+
+def _finish_at(pfd: int, record: dict, journal: Journal, *, avoid, budget) -> dict:
+    name = os.path.basename(record["trash"])
+    empty = {"bytes": 0, "errors": [], "left": [], "stopped": False}
+    try:
+        st = os.stat(name, dir_fd=pfd, follow_symlinks=False)
+    except FileNotFoundError:
+        journal.drop(record["trash"])
+        return dict(empty, trash=record["trash"])
+    if not stat.S_ISDIR(st.st_mode) or [st.st_dev, st.st_ino] != list(record.get("id") or ()):
+        journal.drop(record["trash"])
+        raise ValueError("%s is not the directory renamed by the pass: left alone"
+                         % record["trash"])
+    out = _delete_tree(pfd, name, avoid=avoid, budget=budget,
+                       gitlink=record.get("kind") == "worktree")
+    if not (out["stopped"] or out["errors"]):
+        journal.drop(record["trash"])   # what is left on purpose stays, never resumed
+    out["trash"] = record["trash"]
+    return out
+
+
+def finish_trash(record: dict, journal: Journal, *, avoid: set = frozenset(),
+                 budget: Budget | None = None) -> dict:
+    """Deletes a trash recorded in the journal (an interrupted pass): its
+    parent reached by `open_checked`, the trash still the renamed directory
+    (same inode). Report of `_delete_tree`, plus `trash`. `ValueError` if
+    it is not ours any more (the record is dropped: left alone)."""
+    try:
+        pfd = open_checked(record["parent"], record.get("parent_id"))
+    except FileNotFoundError:
+        journal.drop(record["trash"])
+        return {"bytes": 0, "errors": [], "left": [], "stopped": False,
+                "trash": record["trash"]}
+    except ValueError:
+        journal.drop(record["trash"])
+        raise
+    try:
+        return _finish_at(pfd, record, journal, avoid=avoid, budget=budget)
+    finally:
+        os.close(pfd)
+
+
+def remove_artifact(artifact: str, worktree: str, *, root: tuple, journal: Journal,
+                    rules=(), avoid: set = frozenset(), budget: Budget | None = None,
+                    check=lambda: "") -> dict:
+    """Deletes the artifact directory `artifact` of `worktree`.
+
+    Through descriptors from the worktree root (`_open_parent`, `root`: its
+    real path and identity as surveyed): refused (`ValueError`) for a link,
+    a non-directory, a path outside the worktree or crossing a filesystem,
+    a root that is no longer the surveyed one, an artifact whose rule no
+    longer holds (its `Cargo.toml` gone). `check()` is called last, right
+    before the rename, and refuses with its reason (a process came in). The
+    artifact is renamed to a fresh trash name recorded in the journal
+    (`_to_trash`), then deleted. Returns the report of `_delete_tree`, plus
+    `trash`."""
+    pfd, name = _open_parent(worktree, artifact, root)
     try:
         st = os.stat(name, dir_fd=pfd, follow_symlinks=False)
         if not stat.S_ISDIR(st.st_mode) or st.st_dev != os.fstat(pfd).st_dev:
             raise ValueError("%s is not a directory of the worktree" % artifact)
-        trash = name
-        if not name.startswith(TRASH_PREFIX):
-            rule = next((r for r in rules if r.name == name), None)
-            if rule is None:
-                raise ValueError("%s matches no rule" % artifact)
-            if rule.beside:
-                try:
-                    beside = os.stat(rule.beside, dir_fd=pfd, follow_symlinks=False)
-                except OSError:
-                    beside = None
-                if beside is None or not stat.S_ISREG(beside.st_mode):
-                    raise ValueError("%s: no %s beside it any more" % (artifact, rule.beside))
-            refusal = check()
-            if refusal:
-                raise ValueError(refusal)
-            trash = "%s%s-%d-%d" % (TRASH_PREFIX, name, int(time.time()), os.getpid())
-            os.rename(name, trash, src_dir_fd=pfd, dst_dir_fd=pfd)
-        else:
-            refusal = check()
-            if refusal:
-                raise ValueError(refusal)
-        out = _delete_tree(pfd, trash, avoid=avoid, budget=budget)
-        out["trash"] = trash
-        return out
+        rule = next((r for r in rules if r.name == name), None)
+        if rule is None:
+            raise ValueError("%s matches no rule" % artifact)
+        if rule.beside:
+            try:
+                beside = os.stat(rule.beside, dir_fd=pfd, follow_symlinks=False)
+            except OSError:
+                beside = None
+            if beside is None or not stat.S_ISREG(beside.st_mode):
+                raise ValueError("%s: no %s beside it any more" % (artifact, rule.beside))
+        refusal = check()
+        if refusal:
+            raise ValueError(refusal)
+        record = _to_trash(pfd, name, journal, kind="artifact", origin=artifact,
+                           worktree=worktree)
+        return _finish_at(pfd, record, journal, avoid=avoid, budget=budget)
+    finally:
+        os.close(pfd)
+
+
+def remove_worktree_dir(worktree: str, root: tuple, parent_id, *, journal: Journal,
+                        avoid: set = frozenset(), budget: Budget | None = None,
+                        check=lambda: "") -> dict:
+    """A merged worktree that goes (L230): its directory, `root` (real path,
+    identity) under a parent of identity `parent_id`, both as planned
+    (`open_checked`), is renamed to a fresh trash name recorded in the
+    journal right after `check()` (a process came in), then deleted like an
+    artifact (its own `.git` file included, a nested `.git` left). The
+    caller then lets git forget it (`git worktree prune`). `ValueError` if
+    refused; the report of `_delete_tree`, plus `trash`."""
+    real, ident = root
+    parent, name = os.path.split(real)
+    pfd = open_checked(parent, parent_id)
+    try:
+        st = os.stat(name, dir_fd=pfd, follow_symlinks=False)
+        if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != tuple(ident):
+            raise ValueError("%s is no longer the planned worktree" % worktree)
+        refusal = check()
+        if refusal:
+            raise ValueError(refusal)
+        record = _to_trash(pfd, name, journal, kind="worktree", origin=worktree,
+                           worktree=worktree)
+        return _finish_at(pfd, record, journal, avoid=avoid, budget=budget)
     finally:
         os.close(pfd)
 
@@ -544,22 +747,34 @@ def _identities(paths) -> set:
 def run(candidates: list[dict], rules, *, idle_s: float, protected, skip_roots=(),
         owner_of=lambda path: None, dry_run: bool, now: float, allow=(),
         budget_s: float = PASS_BUDGET_S, clock=time.monotonic,
-        lock_path: str | None = None) -> dict:
-    """Plans, and unless `dry_run` deletes, the artifacts of idle worktrees.
+        lock_path: str | None = None, journal_path: str | None = None) -> dict:
+    """Plans, and unless `dry_run` deletes, the artifacts of idle worktrees,
+    and first finishes the trash dirs of the journal.
 
     `candidates`: from `worktrees()`; `protected`: agents' working
     directories (a worktree that is or contains one is never touched);
     `skip_roots`: managed roots, never entered nor deleted; `owner_of(path)`:
     the agent a worktree is charged to; `allow`: names of unreadable
     processes that do not block (policy `unreadable_ok`); `lock_path`: the
-    host-wide lock of deleting passes. Returns `entries` (to log), `plan`,
-    `skipped` (reasons)."""
+    host-wide lock of deleting passes; `journal_path`: the journal of the
+    trash dirs (`Journal`), without which nothing is deleted. Returns
+    `entries` (to log), `plan`, `skipped` (reasons)."""
     entries: list[dict] = []
     plan: list[dict] = []
     skipped: list[str] = []
     result = {"entries": entries, "plan": plan, "skipped": skipped}
     _last_scan["at"] = now
-    if not rules or not candidates:
+    journal = Journal(journal_path) if journal_path else None
+    try:
+        pending = journal.records() if journal is not None else []
+    except OSError as exc:
+        skipped.append("artifacts: journal unreadable (%s), nothing deleted"
+                       % (exc.strerror or exc))
+        return result
+    if not pending and (not rules or not candidates):
+        return result
+    if not dry_run and journal is None:
+        skipped.append("artifacts: no journal of the trash dirs, nothing deleted")
         return result
     lock = None
     if not dry_run and lock_path:
@@ -568,29 +783,80 @@ def run(candidates: list[dict], rules, *, idle_s: float, protected, skip_roots=(
             skipped.append("artifacts: another pass is deleting on this host, nothing done")
             return result
     try:
-        _run(candidates, rules, result, idle_s=idle_s, protected=protected,
-             skip_roots=skip_roots, owner_of=owner_of, dry_run=dry_run, now=now, allow=allow,
-             budget=Budget(budget_s, clock))
+        budget = Budget(budget_s, clock)
+        scan = platform.user_paths(allow=allow)
+        doubt = scan.doubt()
+        if doubt:
+            skipped.append("artifacts: nothing deleted, %s" % doubt)
+            return result
+        if scan.allowed:
+            skipped.append("artifacts: unreadable process(es) let through by unreadable_ok: %s"
+                           % ", ".join(scan.allowed))
+        avoid = _identities(os.path.realpath(p) for p in skip_roots if p)
+        _resume(pending, journal, result, scan=scan, avoid=avoid, owner_of=owner_of,
+                dry_run=dry_run, budget=budget)
+        if rules and candidates:
+            _run(candidates, rules, result, idle_s=idle_s, protected=protected,
+                 skip_roots=skip_roots, owner_of=owner_of, dry_run=dry_run, now=now,
+                 allow=allow, scan=scan, avoid=avoid, journal=journal,
+                 skip_ids=[tuple(r["id"]) for r in pending if r.get("id")], budget=budget)
     finally:
         if lock is not None:
             lock.close()
     return result
 
 
-def _run(candidates, rules, result, *, idle_s, protected, skip_roots, owner_of, dry_run, now,
-         allow, budget: Budget) -> None:
+def _resume(pending, journal, result, *, scan, avoid, owner_of, dry_run, budget) -> None:
+    """The trash dirs of the journal (an interrupted pass): ours, they go
+    whatever the activity, unless a process is inside."""
     entries, plan, skipped = result["entries"], result["plan"], result["skipped"]
-    scan = platform.user_paths(allow=allow)
-    doubt = scan.doubt()
-    if doubt:
-        skipped.append("artifacts: nothing deleted, %s" % doubt)
-        return
-    if scan.allowed:
-        skipped.append("artifacts: unreadable process(es) let through by unreadable_ok: %s"
-                       % ", ".join(scan.allowed))
+    for record in pending:
+        trash, origin = record["trash"], record.get("origin") or record["trash"]
+        base = {"kind": "artifact", "agent": owner_of(record.get("worktree") or origin)}
+        why = "trash of an interrupted pass (%s)" % trash
+        held = scan.holders(trash)
+        if held:
+            skipped.append("%s kept: process inside (%s)" % (trash, ", ".join(held[:3])))
+            continue
+        if budget.expired():
+            plan.append(dict(base, path=origin, action="remis",
+                             detail="%s ; time budget of the pass reached" % why))
+            continue
+        if dry_run:
+            size, whole = size_of(trash, budget=budget)
+            plan.append(dict(base, path=origin, action="suppression", bytes=size,
+                             detail=why if whole else "%s ; size counted in part" % why))
+            continue
+        try:
+            done = finish_trash(record, journal, avoid=avoid, budget=budget)
+        except (OSError, ValueError) as exc:
+            skipped.append("%s kept: %s" % (trash, exc))
+            continue
+        _log(result, base, origin, why, done, record.get("worktree") or "", "trash",
+             scan.allowed)
+
+
+def _log(result, base, path, why, done, worktree, rule, allowed) -> None:
+    complete = not (done["errors"] or done["left"] or done["stopped"])
+    notes = done["left"][:3] + done["errors"][:3]
+    if done["stopped"]:
+        notes.append("time budget reached, %s finished by the next pass" % done["trash"])
+    detail = "%s ; regenerable build output" % why if complete else \
+        "%s ; partial: %s" % (why, " ; ".join(notes))
+    result["plan"].append(dict(base, path=path, action="suppression" if complete else "partiel",
+                               bytes=done["bytes"], detail=detail))
+    result["entries"].append(dict(base, path=path, action="deleted" if complete else "partial",
+                                  bytes=done["bytes"], detail=detail,
+                                  data={"worktree": worktree, "trash": done["trash"],
+                                        "errors": done["errors"], "left": done["left"],
+                                        "unreadable_allowed": list(allowed), "rule": rule}))
+
+
+def _run(candidates, rules, result, *, idle_s, protected, skip_roots, owner_of, dry_run, now,
+         allow, scan, avoid, journal, skip_ids, budget: Budget) -> None:
+    plan, skipped = result["plan"], result["skipped"]
     protected = [os.path.realpath(p) for p in protected if p]
     roots = [os.path.realpath(p) for p in skip_roots if p]
-    avoid = _identities(roots)
     recent = 0
     for wt in candidates:
         if budget.expired():
@@ -602,12 +868,12 @@ def _run(candidates, rules, result, *, idle_s, protected, skip_roots, owner_of, 
         if wt.get("locked") or any(p == real or p.startswith(real.rstrip(os.sep) + os.sep)
                                    for p in protected):
             continue
-        found = survey(path, rules, skip_roots=skip_roots, budget=budget)
+        found = survey(path, rules, skip_roots=skip_roots, skip_ids=skip_ids, budget=budget)
         if budget.expired():
             skipped.append("artifacts: time budget reached, the remaining worktrees wait for "
                            "the next pass")
             break
-        if not found["artifacts"] and not found["trash"]:
+        if not found["artifacts"]:
             continue
         agent = owner_of(path)
         base = {"kind": "artifact", "agent": agent}
@@ -615,18 +881,15 @@ def _run(candidates, rules, result, *, idle_s, protected, skip_roots, owner_of, 
             skipped.append("artifacts of %s kept: %s" % (path, found["why"]))
             continue
         idle = now - float(found["latest"])
+        if idle < idle_s:
+            recent += 1
+            continue
         held = scan.holders(path)
         if held:
             skipped.append("artifacts of %s kept: process inside (%s)" % (path, ", ".join(held[:3])))
             continue
-        # a trash left by an interrupted pass is ours and goes whatever the activity
-        todo = [(t, "trash of an interrupted pass") for t in found["trash"]]
-        if idle >= idle_s:
-            why = "worktree %s idle for %s" % (path, _fmt_age(idle))
-            todo += [(a, why) for a in found["artifacts"]]
-        elif found["artifacts"]:
-            recent += 1
-        for artifact, why in todo:
+        why = "worktree %s idle for %s" % (path, _fmt_age(idle))
+        for artifact in found["artifacts"]:
             if budget.expired():
                 plan.append(dict(base, path=artifact, action="remis",
                                  detail="%s ; time budget of the pass reached" % why))
@@ -639,8 +902,10 @@ def _run(candidates, rules, result, *, idle_s, protected, skip_roots, owner_of, 
                 skipped.append("artifact %s kept: %s" % (artifact, refusal))
                 continue
             if dry_run:
-                plan.append(dict(base, path=artifact, action="suppression",
-                                 bytes=size_of(artifact), detail=why))
+                size, whole = size_of(artifact, budget=budget)
+                plan.append(dict(base, path=artifact, action="suppression", bytes=size,
+                                 detail=why if whole else "%s ; size counted in part (entry "
+                                                          "limit or time budget)" % why))
                 continue
             seen: dict = {}
 
@@ -653,29 +918,17 @@ def _run(candidates, rules, result, *, idle_s, protected, skip_roots, owner_of, 
                                          if held else "")
 
             try:
-                done = remove_artifact(artifact, path, rules=rules, avoid=avoid, budget=budget,
+                done = remove_artifact(artifact, path, root=(found["real"], found["identity"]),
+                                       journal=journal, rules=rules, avoid=avoid, budget=budget,
                                        check=check)
             except (OSError, ValueError) as exc:
                 skipped.append("artifact %s kept: %s" % (artifact, exc))
                 if "process inside" in str(exc) or "unreadable" in str(exc):
                     break
                 continue
-            complete = not (done["errors"] or done["left"] or done["stopped"])
-            notes = done["left"][:3] + done["errors"][:3]
-            if done["stopped"]:
-                notes.append("time budget reached, %s finished by the next pass" % done["trash"])
-            detail = "%s ; regenerable build output" % why if complete else \
-                "%s ; partial: %s" % (why, " ; ".join(notes))
-            plan.append(dict(base, path=artifact, action="suppression" if complete else "partiel",
-                             bytes=done["bytes"], detail=detail))
-            entries.append(dict(base, path=artifact, action="deleted" if complete else "partial",
-                                bytes=done["bytes"], detail=detail,
-                                data={"worktree": path, "trash": done["trash"],
-                                      "errors": done["errors"], "left": done["left"],
-                                      "unreadable_allowed": seen.get("allowed", []),
-                                      "rule": next((str(r) for r in rules
-                                                    if r.name == os.path.basename(artifact)),
-                                                   "trash")}))
+            _log(result, base, artifact, why, done, path,
+                 next((str(r) for r in rules if r.name == os.path.basename(artifact)), ""),
+                 seen.get("allowed", []))
     if recent:
         skipped.append("artifacts: %d worktree(s) active within %s, kept"
                        % (recent, _fmt_age(idle_s)))

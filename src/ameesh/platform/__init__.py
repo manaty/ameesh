@@ -7,9 +7,9 @@ par ce paquet ; un test de lint (`tests/test_l63_platform.py`) le vérifie sur
 le reste du code. Un sous-module par sujet :
 
 * `process` : ascendance, heure de démarrage (secondes epoch), démarrage de
-  l'hôte, détenteurs d'un fichier, processus vivant, descripteurs ouverts,
-  table des processus (groupes), sous-moissonneur et moisson d'un enfant,
-  environnement initial d'un processus (L124) ;
+  l'hôte, détenteurs d'un fichier, processus vivant, descripteurs ouverts et
+  chemin d'un descripteur, table des processus (groupes), sous-moissonneur et
+  moisson d'un enfant, environnement initial d'un processus (L124) ;
 * `terminal` : le terminal de l'humain ;
 * `host` : mémoire, swap, charge, alimentation, système de fichiers.
 
@@ -80,7 +80,7 @@ def machine() -> str:
 
 
 from .process import (alive, ancestry, become_subreaper, boot_time,  # noqa: E402
-                      command_line, environ, holders, open_fd_count, process_table,
+                      command_line, environ, fd_path, holders, open_fd_count, process_table,
                       reap, start_time, same_start, ticks_to_epoch, user_paths, UserPaths)
 from .terminal import human_tty  # noqa: E402
 from .host import (CGROUP_ROOT, cgroup_cpu_seconds, cgroup_memory_bytes,  # noqa: E402
@@ -89,7 +89,7 @@ from .host import (CGROUP_ROOT, cgroup_cpu_seconds, cgroup_memory_bytes,  # noqa
 
 __all__ = [
     "NotAvailable", "SYSTEM", "is_linux", "is_macos", "is_windows", "has_psutil",
-    "alive", "ancestry", "become_subreaper", "boot_time", "command_line", "environ",
+    "alive", "ancestry", "become_subreaper", "boot_time", "command_line", "environ", "fd_path",
     "holders", "open_fd_count", "process_table", "reap", "start_time", "same_start",
     "ticks_to_epoch", "human_tty", "load_average", "memory", "mount_of", "power",
     "CGROUP_ROOT", "cgroup_cpu_seconds", "cgroup_memory_bytes", "cpu_busy_seconds",

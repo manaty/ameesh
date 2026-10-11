@@ -86,10 +86,28 @@ class _Base(unittest.TestCase):
         _write(os.path.join(wt, "docs", "target", "keep.md"))
         return wt
 
+    @property
+    def journal_path(self) -> str:
+        return os.path.join(self.base, "state", "artifacts.journal")
+
+    def journal(self) -> list[dict]:
+        return ba.Journal(self.journal_path).records()
+
+    def trash(self, wt: str) -> list[str]:
+        return [n for n in os.listdir(wt) if n.startswith(ba.TRASH_PREFIX)]
+
+    def root(self, wt: str) -> tuple:
+        return os.path.realpath(wt), ba.identity(os.path.realpath(wt))
+
+    def remove(self, artifact: str, wt: str, **kw) -> dict:
+        kw.setdefault("rules", ba.rules_of(None))
+        return ba.remove_artifact(artifact, wt, root=self.root(wt),
+                                  journal=ba.Journal(self.journal_path), **kw)
+
     def go(self, wt: str, **kw) -> dict:
         tracked = kw.pop("tracked", "")
         args = dict(rules=ba.rules_of(None), idle_s=DAY, protected=(), dry_run=False,
-                    now=time.time() + LATER)
+                    now=time.time() + LATER, journal_path=self.journal_path)
         args.update(kw)
         with mock.patch.object(ba, "tracked", return_value=tracked):
             return ba.run([{"path": wt}], **args)
@@ -333,8 +351,7 @@ class RunTest(_Base):
         wt = self.worktree()
         os.unlink(os.path.join(wt, "desktop", "host", "Cargo.toml"))
         with self.assertRaises(ValueError):
-            ba.remove_artifact(os.path.join(wt, "desktop", "host", "target"), wt,
-                               rules=ba.rules_of(None))
+            self.remove(os.path.join(wt, "desktop", "host", "target"), wt)
         self.assertTrue(os.path.isdir(os.path.join(wt, "desktop", "host", "target")))
 
     def test_rename_then_delete_and_trash_resumed(self):
@@ -380,20 +397,118 @@ class RunTest(_Base):
         wt = self.worktree()
         os.symlink(os.path.join(wt, "node_modules"), os.path.join(wt, "src", "node_modules"))
         with self.assertRaises(ValueError):
-            ba.remove_artifact(os.path.join(wt, "src", "node_modules"), wt, rules=ba.rules_of(None))
+            self.remove(os.path.join(wt, "src", "node_modules"), wt)
         with self.assertRaises(ValueError):
-            ba.remove_artifact(os.path.join(wt, "node_modules"), os.path.join(wt, "src"),
-                               rules=ba.rules_of(None))
+            self.remove(os.path.join(wt, "node_modules"), os.path.join(wt, "src"))
         # (a) an ancestor swapped for a link after the plan: the descriptor walk refuses it
         outside = os.path.join(self.base, "outside")
         _write(os.path.join(outside, "node_modules", "precious.js"))
         os.rename(os.path.join(wt, "web"), os.path.join(wt, "web.old"))
         os.symlink(outside, os.path.join(wt, "web"))
         with self.assertRaises(OSError):
-            ba.remove_artifact(os.path.join(wt, "web", "node_modules"), wt,
-                               rules=ba.rules_of(None))
+            self.remove(os.path.join(wt, "web", "node_modules"), wt)
         self.assertTrue(os.path.exists(os.path.join(outside, "node_modules", "precious.js")))
         self.assertTrue(os.path.isdir(os.path.join(wt, "node_modules")))
+
+    def test_r2_1_root_reopened_must_be_the_surveyed_one(self):
+        # r2 (1): the root is opened by its path; an ancestor swapped after
+        # the survey must not redirect the deletion
+        anc = os.path.join(self.base, "anc")
+        wt = self.worktree(os.path.join("anc", "wt"))
+        root = self.root(wt)
+        fd = os.open(wt, os.O_RDONLY)
+        self.addCleanup(os.close, fd)
+        self.assertEqual(platform.fd_path(fd), root[0])
+        # same inode, another place: the kernel's path of the descriptor differs
+        os.rename(anc, anc + ".moved")
+        os.symlink(anc + ".moved", anc)
+        with self.assertRaisesRegex(ValueError, "now resolves to"):
+            ba.remove_artifact(os.path.join(wt, "node_modules"), wt, root=root,
+                               journal=ba.Journal(self.journal_path), rules=ba.rules_of(None))
+        # another directory behind the same path: another inode
+        os.unlink(anc)
+        os.makedirs(anc)
+        _write(os.path.join(anc, "wt", "node_modules", "precious.js"))
+        with self.assertRaisesRegex(ValueError, "no longer the surveyed"):
+            ba.remove_artifact(os.path.join(wt, "node_modules"), wt, root=root,
+                               journal=ba.Journal(self.journal_path), rules=ba.rules_of(None))
+        self.assertTrue(os.path.exists(os.path.join(anc, "wt", "node_modules", "precious.js")))
+        self.assertTrue(os.path.isdir(os.path.join(anc + ".moved", "wt", "node_modules")))
+        self.assertEqual(self.journal(), [])
+
+    def test_r2_4_only_a_journaled_trash_is_resumed(self):
+        # r2 (4): a generated name recorded before the rename; anything else
+        # named .ameesh-trash-* is an ordinary directory
+        wt = self.worktree()
+        _write(os.path.join(wt, ".ameesh-trash-backup", "unique.txt"))
+        forged = ".ameesh-trash-1-2-" + "0" * 16
+        _write(os.path.join(wt, forged, "unique.txt"))
+        real_rename = os.rename
+        journaled = []
+
+        def rename(src, dst, **kw):
+            journaled.append([os.path.basename(r["trash"]) for r in self.journal()])
+            self.assertIn(dst, journaled[-1])
+            return real_rename(src, dst, **kw)
+
+        def clock():   # the budget runs out once the first artifact is renamed
+            return 10.0 ** 6 if len(self.trash(wt)) > 2 else 0.0
+
+        with mock.patch.object(ba.os, "rename", side_effect=rename):
+            out = self.go(wt, budget_s=1.0, clock=clock)
+        self.assertEqual(len(journaled), 1)
+        self.assertRegex(journaled[0][0], ba.TRASH_RE)
+        record, = self.journal()
+        self.assertEqual(record["kind"], "artifact")
+        self.assertEqual(out["entries"][0]["action"], "partial")
+        out = self.go(wt, now=time.time())   # active now: only the journaled trash goes
+        self.assertEqual([e["data"]["rule"] for e in out["entries"]], ["trash"])
+        self.assertEqual(self.journal(), [])
+        self.assertEqual(sorted(self.trash(wt)), sorted([".ameesh-trash-backup", forged]))
+        self.assertTrue(os.path.exists(os.path.join(wt, ".ameesh-trash-backup", "unique.txt")))
+        self.assertTrue(os.path.exists(os.path.join(wt, forged, "unique.txt")))
+        # a record whose directory is not the one renamed (another inode): left alone
+        os.rename(os.path.join(wt, forged), os.path.join(wt, forged + "x"))
+        os.makedirs(os.path.join(wt, forged))
+        _write(os.path.join(wt, forged, "unique.txt"))
+        ba.Journal(self.journal_path).add({
+            "trash": os.path.join(os.path.realpath(wt), forged), "parent": os.path.realpath(wt),
+            "parent_id": list(ba.identity(wt)), "id": [0, 0], "kind": "artifact"})
+        out = self.go(wt, now=time.time())
+        self.assertEqual(out["entries"], [])
+        self.assertIn("not the directory renamed", " ".join(out["skipped"]))
+        self.assertTrue(os.path.exists(os.path.join(wt, forged, "unique.txt")))
+        self.assertEqual(self.journal(), [])
+
+    def test_r2_5_deadline_and_limit_inside_one_directory(self):
+        # r2 (5): checked at every entry, dry-run sizing included
+        wt = self.worktree()
+        for i in range(40):
+            _write(os.path.join(wt, "flat", "f%02d" % i), 1)
+            _write(os.path.join(wt, "node_modules", "flat", "f%02d" % i), 4096)
+        calls = []
+
+        def clock():
+            calls.append(1)
+            return 0.0 if len(calls) < 6 else 10.0 ** 6
+
+        found = ba.survey(wt, ba.rules_of(None), budget=ba.Budget(1.0, clock=clock))
+        self.assertFalse(found["complete"])
+        self.assertIn("time budget", found["why"])
+        self.assertLess(len(calls), 10)
+        nm = os.path.join(wt, "node_modules")
+        whole, complete = ba.size_of(nm)
+        self.assertTrue(complete)
+        part, complete = ba.size_of(nm, limit=10)
+        self.assertFalse(complete)
+        self.assertLess(part, whole)
+        calls.clear()
+        part, complete = ba.size_of(nm, budget=ba.Budget(1.0, clock=clock))
+        self.assertFalse(complete)
+        self.assertLess(len(calls), 10)
+        with mock.patch.object(ba.size_of, "__defaults__", (10, None)):
+            out = self.go(wt, dry_run=True)
+        self.assertTrue(any("size counted in part" in p["detail"] for p in out["plan"]))
 
     def test_gently_runs_and_reraises(self):
         self.assertEqual(ba.gently(lambda x: x + 1, 1), 2)
@@ -462,9 +577,11 @@ class MergedKeptTest(_Repo):
         _age(rows[0]["path"], 2 * 3600)
         with mock.patch.object(menage.storage, "of", return_value=store), \
                 mock.patch.object(menage, "worktree_in_use", return_value=False):
-            entries, plan = menage._worktree_pass(None, "pc", dry_run=dry_run,
-                                                  include_lotless=False, protected=set(),
-                                                  now=time.time(), allow=allow)
+            entries, plan = menage._worktree_pass(
+                None, "pc", dry_run=dry_run, include_lotless=False, protected=set(),
+                now=time.time(), allow=allow,
+                lock_path=os.path.join(self.base, "state", "artifacts.lock"),
+                journal_path=self.journal_path)
         return store, entries, plan
 
     def test_pushed_not_merged_removed_after_a_day_branch_kept(self):
@@ -502,6 +619,82 @@ class MergedKeptTest(_Repo):
                                  allow=("btop",))[2]
             self.assertEqual(plan[0]["action"], "retrait")
         self.assertFalse(os.path.exists(wt))
+
+    def test_r2_2_nested_repository_in_build_output_keeps_it(self):
+        # r2 (2): the build output goes through _delete_tree first (a `.git`
+        # inside is left), then nothing ignored may remain
+        wt = self.add_worktree("lot-11")
+        _write(os.path.join(wt, "node_modules", "a.js"))
+        _write(os.path.join(wt, "node_modules", "dep", ".git", "HEAD"), text="unpushed\n")
+        _write(os.path.join(wt, "node_modules", "dep", "work.js"))
+        store, entries, plan = self.run_pass([self.row(wt, checked_ago=2 * DAY, lot="11")],
+                                             {11: "merged"})
+        self.assertEqual(plan[0]["action"], "garde")
+        self.assertIn("holds a .git", plan[0]["detail"])
+        self.assertEqual(store.statuses, [])
+        self.assertTrue(os.path.isdir(wt))
+        trash, = [n for n in os.listdir(wt) if n.startswith(ba.TRASH_PREFIX)]
+        self.assertTrue(os.path.exists(os.path.join(wt, trash, "dep", ".git", "HEAD")))
+        self.assertTrue(os.path.exists(os.path.join(wt, trash, "dep", "work.js")))
+        self.assertFalse(os.path.exists(os.path.join(wt, trash, "a.js")))
+        self.assertEqual([e["action"] for e in entries], ["partial"])
+        # the trash left on purpose makes the tree unclean: kept for good
+        plan = self.run_pass([self.row(wt, checked_ago=2 * DAY, lot="11")], {11: "merged"})[2]
+        self.assertEqual(plan[0]["action"], "garde")
+        self.assertTrue(os.path.isdir(wt))
+
+    def test_r2_3_rechecked_renamed_journaled_and_locked(self):
+        # r2 (3): host lock, processes read again right before the rename,
+        # the worktree renamed to a journaled trash, an interrupted deletion
+        # finished from the journal
+        wt = self.add_worktree("lot-12")
+        _write(os.path.join(wt, "node_modules", "a.js"))
+        rows = lambda: [self.row(wt, checked_ago=2 * DAY, lot="12")]   # noqa: E731
+        held = ba._lock(os.path.join(self.base, "state", "artifacts.lock"))
+        plan = self.run_pass(rows(), {12: "merged"})[2]
+        held.close()
+        self.assertEqual(plan[0]["action"], "attend")
+        self.assertIn("un autre passage", plan[0]["detail"])
+        self.assertTrue(os.path.isdir(os.path.join(wt, "node_modules")))
+        real = platform.user_paths
+        calls = []
+
+        def scan(allow=()):   # a process comes in once the build output is gone
+            calls.append(1)
+            if not os.path.exists(os.path.join(wt, "node_modules")):
+                self.fake_process(60, cwd=wt, comm="claude")
+            return real(allow=allow)
+
+        with mock.patch.object(platform, "user_paths", side_effect=scan):
+            store, _e, plan = self.run_pass(rows(), {12: "merged"})
+        self.assertIn("60 claude", plan[0]["detail"])
+        self.assertTrue(os.path.isfile(os.path.join(wt, "f.txt")))
+        self.assertEqual(store.statuses, [])
+        shutil.rmtree(os.path.join(self.proc, "60"))
+        real_finish = ba._finish_at
+        seen = []
+
+        def interrupted(pfd, record, journal, **kw):   # the pass dies after the rename
+            seen.append([r["trash"] for r in journal.records()])
+            if record["kind"] == "worktree":
+                return dict(real_finish(pfd, record, journal, avoid=kw["avoid"],
+                                        budget=ba.Budget(-1.0)))
+            return real_finish(pfd, record, journal, **kw)
+
+        with mock.patch.object(ba, "_finish_at", side_effect=interrupted):
+            store, entries, _plan = self.run_pass(rows(), {12: "merged"})
+        self.assertFalse(os.path.exists(wt))
+        record, = self.journal()
+        self.assertEqual((record["kind"], record["origin"]), ("worktree", wt))
+        self.assertIn(record["trash"], seen[-1])   # journaled before the rename
+        self.assertEqual(entries[-1]["action"], "partial")
+        self.assertNotIn(os.path.basename(wt), _git("worktree", "list", cwd=self.main))
+        out = ba.run([], ba.rules_of(None), idle_s=DAY, protected=(), dry_run=False,
+                     now=time.time(), journal_path=self.journal_path)
+        self.assertEqual([e["action"] for e in out["entries"]], ["deleted"])
+        self.assertFalse(os.path.exists(record["trash"]))
+        self.assertEqual(self.journal(), [])
+        self.assertIn("lot-12", _git("branch", "--list", "lot-12", cwd=self.main))
 
     def test_closed_dirty_unpushed_or_changed_reason_stay_kept(self):
         wt = self.add_worktree("lot-8")
@@ -564,7 +757,8 @@ class ArtifactPassTest(_Repo):
             out = menage._artifact_pass(None, "pc", menage.Policy(),
                                         cwd_of={"dev2": self.main}, dry_run=False,
                                         now=time.time() + LATER,
-                                        lock_path=os.path.join(self.base, "a.lock"))
+                                        lock_path=os.path.join(self.base, "a.lock"),
+                                        journal_path=self.journal_path)
         self.assertEqual([(os.path.realpath(e["path"]), e["agent"]) for e in out["entries"]],
                          [(os.path.realpath(os.path.join(wt, "node_modules")), None)])
         self.assertTrue(os.path.exists(os.path.join(self.main, "node_modules", "main.js")))
