@@ -18,8 +18,10 @@ after the merge, and stores them in `work_item_measures` (migration 0056):
      cannot be read, that time then stays in `agent`;
   4. `agent`  — the rest: the agent works.
 
-* **Size of the change**: the merged diff (first parent of the merge commit
-  → merge commit, which is also right for a squash or a fast-forward commit):
+* **Size of the change**: the merged diff (`diff_range`: first parent →
+  the real merge commit, found from the recorded commit — merge commit,
+  branch tip, frozen commit, squash commit — or merge-base → commit for a
+  lot merged by rebase):
   files, inserted and deleted lines, and the size class (`s` up to
   `SIZE_S_MAX` changed lines, `m` up to `SIZE_M_MAX`, `l` beyond) compared
   with the size DECLARED at creation (`work add --size`).
@@ -61,6 +63,8 @@ RETRY_DIFF_S = 2 * 86400.0
 PENDING_WINDOW_S = 2 * 86400.0
 #: lots measured at most by one runner pass
 PASS_LIMIT = 50
+#: time budget of one runner pass (s): the backlog never delays the radar
+PASS_BUDGET_S = 60.0
 #: timeout of one git or gh call (s)
 CALL_TIMEOUT_S = 20
 #: CI runs read at most for one branch
@@ -193,15 +197,66 @@ def parse_shortstat(text: str) -> dict:
     return out
 
 
-def diff_stat(repo: str, sha: str) -> dict | None:
-    """The merged diff of `sha` (first parent → sha): `{diff_files,
-    diff_insertions, diff_deletions, measured_size}`, or None when the
-    repository does not hold the commit."""
+def _parents(repo: str, sha: str) -> list[str]:
+    out = _git(repo, "rev-list", "--parents", "-n", "1", sha)
+    return out.split()[1:] if out else []
+
+
+def _is_ancestor(repo: str, a: str, b: str) -> bool:
+    return _git(repo, "merge-base", "--is-ancestor", a, b) is not None
+
+
+def _target(repo: str, target: str | None) -> str | None:
+    from . import plan_git
+
+    for name in (target, plan_git.default_target(repo)):
+        if name and _git(repo, "rev-parse", "--verify", "-q", "%s^{commit}" % name):
+            return name
+    return None
+
+
+def diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str, str] | None:
+    """The (base, head) of the change merged by `sha`, the commit recorded by
+    the `merged` milestone — a merge commit, the tip of the branch (merge by
+    a merge commit), the frozen commit, or a squash commit:
+
+    1. `sha` is a merge commit: first parent → sha;
+    2. `sha` is in the target: the first merge commit of the target that
+       brought it in through a second parent, first parent → that merge;
+       none (squash or single commit on the first-parent chain): sha^1 → sha;
+    3. `sha` is not in the target (merged by rebase, as a patch):
+       merge-base(target, sha) → sha.
+    None when the repository does not hold `sha`."""
     if not has_commit(repo, sha):
         return None
-    parent = "%s^1" % sha if _git(repo, "rev-parse", "--verify", "-q", "%s^1" % sha) \
-        else "4b825dc642cb6eb9a060e54bf8d69288fbee4904"     # the empty tree
-    text = _git(repo, "diff", "--shortstat", "--no-renames", parent, sha)
+    empty = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"      # the empty tree
+    parents = _parents(repo, sha)
+    if len(parents) >= 2:
+        return parents[0], sha
+    tgt = _target(repo, target)
+    if tgt and _is_ancestor(repo, sha, tgt):
+        merges = (_git(repo, "rev-list", "--ancestry-path", "--merges", "--reverse",
+                       "%s..%s" % (sha, tgt)) or "").split()
+        for merge in merges:
+            first = _parents(repo, merge)[:1]
+            if first and not _is_ancestor(repo, sha, first[0]):
+                return first[0], merge
+        return (parents[0] if parents else empty), sha
+    if tgt:
+        base = (_git(repo, "merge-base", tgt, sha) or "").strip()
+        if base:
+            return base, sha
+    return (parents[0] if parents else empty), sha
+
+
+def diff_stat(repo: str, sha: str, target: str | None = None) -> dict | None:
+    """The size of the change merged by `sha` (`diff_range`): `{diff_files,
+    diff_insertions, diff_deletions, measured_size}`, or None when the
+    repository does not hold the commit."""
+    rng = diff_range(repo, sha, target)
+    if rng is None:
+        return None
+    text = _git(repo, "diff", "--shortstat", "--no-renames", rng[0], rng[1])
     if text is None:
         return None
     stat = parse_shortstat(text)
@@ -284,24 +339,39 @@ def measure_one(db, cand: dict, *, repos=(), ci=gh_ci_runs) -> dict:
                merge_sha=cand.get("merge_sha") or None,
                declared_size=cand.get("change_size") or None)
     if repo:
-        out.update(diff_stat(repo, cand["merge_sha"]) or {})
+        out.update(diff_stat(repo, cand["merge_sha"], cand.get("branch_target")) or {})
     return st.save_measure(item_id, out)
 
 
 def measure(db, ids=None, *, repos=(), ci=gh_ci_runs, limit: int = PASS_LIMIT,
-            since_s: float | None = None) -> list[dict]:
+            since_s: float | None = None, budget_s: float | None = None,
+            errors: list | None = None) -> list[dict]:
     """Measures the given delivered lots (`ids`, measured again), or those
     still to measure (`ids` None; merged less than `since_s` ago when
-    given), the most recent first. Returns the stored measures."""
+    given), the most recent first. Returns the stored measures.
+
+    A lot that fails is skipped (`(id, exception)` appended to `errors`)
+    and the next one measured; past `budget_s` seconds, the pass stops (the
+    rest waits for the next pass)."""
+    started = time.monotonic()
     cands = storage.of(db).work.measure_candidates(
         ids=None if ids is None else [int(i) for i in ids], retry_diff_s=RETRY_DIFF_S,
         since_s=since_s, limit=limit)
-    if ids is None:
-        # a lot already measured is only retried for its diff, when a
-        # repository holds the merge commit now
-        cands = [c for c in cands if not c["measured"]
-                 or _repo_for(c.get("merge_sha"), repos)]
-    return [measure_one(db, c, repos=repos, ci=ci) for c in cands]
+    out = []
+    for cand in cands:
+        if budget_s is not None and time.monotonic() - started >= budget_s:
+            break
+        try:
+            # a lot already measured is retried (diff, CI) only when a
+            # repository holds its merge commit now
+            if ids is None and cand["measured"] and not _repo_for(cand.get("merge_sha"),
+                                                                  repos):
+                continue
+            out.append(measure_one(db, cand, repos=repos, ci=ci))
+        except Exception as exc:  # noqa: BLE001 - one lot never blocks the others
+            if errors is not None:
+                errors.append((int(cand["id"]), exc))
+    return out
 
 
 def host_repos(db, host: str | None, agents=None) -> list[str]:
@@ -320,11 +390,12 @@ def host_repos(db, host: str | None, agents=None) -> list[str]:
     return out
 
 
-def measure_pending(db, *, host: str | None = None, agents=None, ci=gh_ci_runs) -> list[dict]:
+def measure_pending(db, *, host: str | None = None, agents=None, ci=gh_ci_runs,
+                    errors: list | None = None) -> list[dict]:
     """The runner pass: measures the lots delivered recently and not
-    measured yet."""
+    measured yet, within `PASS_BUDGET_S`."""
     return measure(db, None, repos=host_repos(db, host, agents), ci=ci,
-                   since_s=PENDING_WINDOW_S)
+                   since_s=PENDING_WINDOW_S, budget_s=PASS_BUDGET_S, errors=errors)
 
 
 # --------------------------------------------------------------------------

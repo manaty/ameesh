@@ -182,7 +182,8 @@ def run(db, args: argparse.Namespace) -> int:
         return 0
     if command == "schedule":
         from . import lot_schedule
-        sched = lot_schedule.build(db, assignee=args.assignee)
+        sched = lot_schedule.build(db, assignee=args.assignee,
+                                   force=bool(args.apply and args.force))
         written = (lot_schedule.apply(db, sched, force=args.force, actor=args.actor)
                    if args.apply else None)
         if args.json:

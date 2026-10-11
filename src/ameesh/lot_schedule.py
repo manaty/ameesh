@@ -21,7 +21,11 @@ queue:
 4. **Dates at the p80**: a lot's planned start is the day its turn comes;
    its planned end is the day of start + p80 (a lot in progress: the day of
    its measured start, and of max(now, start + p80)). The promised date is
-   the cautious one.
+   the cautious one. Days are LOCAL days, as everywhere in the roadmap
+   (`roadmap.today`).
+5. **A lot dated by a person** keeps its date and only takes its place in
+   the queue from that date (no earlier than the queue reaches it): a P1
+   lot set for next month does not push back the lots after it.
 
 Only reads: the published table, the registry and the open lots — no
 analysis of past lots (the owner's rule, L157b). Without `--apply`, nothing
@@ -87,19 +91,47 @@ def duration(lot: dict, body: dict | None, agent: dict | None) -> dict | None:
     return None
 
 
+def pinned_ts(lot: dict, plan: dict | None, force: bool = False) -> float | None:
+    """The start (local midnight) of a lot not started whose planned start
+    was set by a person, None otherwise (or with `force`)."""
+    from . import plan as plan_mod
+
+    plan = plan or {}
+    if force or lot.get("started_ts") is not None or not plan.get("planned_start"):
+        return None
+    if str(plan.get("planned_source") or "").startswith(SOURCE):
+        return None
+    return plan_mod.day_start_ts(str(plan["planned_start"])[:10])
+
+
 def plan_queue(lots: list[dict], plans: dict, body: dict | None, agent: dict | None, *,
-               now: float) -> list[dict]:
-    """The schedule of ONE agent's queue (pure): one entry per lot, in queue
-    order, `{id, title, state, start_ts, end_ts, planned_start, planned_end,
-    median_minutes, p80_minutes, basis, current}` (`current`: the dates
-    already set)."""
+               now: float, force: bool = False) -> list[dict]:
+    """The schedule of ONE agent's queue (pure): one entry per lot, in the
+    order the lots are placed, `{id, title, state, start_ts, end_ts,
+    planned_start, planned_end, median_minutes, p80_minutes, basis, pinned,
+    current}` (`current`: the dates already set).
+
+    A lot dated by a person (`pinned_ts`) keeps its date and only takes its
+    place in the queue from that date: the lots after it in the order go
+    first while the queue has not reached it."""
     now = float(now)
     cursor = now
     out = []
-    for lot in sorted(lots, key=lambda l: queue_order(l, plans.get(int(l["id"])))):
+    ordered = sorted(lots, key=lambda l: queue_order(l, plans.get(int(l["id"]))))
+    pins = {int(l["id"]): pinned_ts(l, plans.get(int(l["id"])), force) for l in ordered}
+    normal = [l for l in ordered if pins[int(l["id"])] is None]
+    pinned = sorted((l for l in ordered if pins[int(l["id"])] is not None),
+                    key=lambda l: pins[int(l["id"])])
+    while normal or pinned:
+        if pinned and (not normal or pins[int(pinned[0]["id"])] <= cursor):
+            lot = pinned.pop(0)
+        else:
+            lot = normal.pop(0)
+        pin = pins[int(lot["id"])]
         plan = plans.get(int(lot["id"])) or {}
         entry = {"id": int(lot["id"]), "title": lot.get("title") or "",
                  "state": lot.get("state"), "assignee": lot.get("assignee"),
+                 "pinned": pin is not None,
                  "current": {"planned_start": plan.get("planned_start"),
                              "planned_end": plan.get("planned_end"),
                              "planned_source": plan.get("planned_source")}}
@@ -117,8 +149,9 @@ def plan_queue(lots: list[dict], plans: dict, body: dict | None, agent: dict | N
             start, end = started, max(now, started + p80_s)
             cursor = max(cursor, started + median_s, now)
         else:
-            start, end = cursor, cursor + p80_s
-            cursor += median_s
+            start = cursor if pin is None else max(cursor, pin)
+            end = start + p80_s
+            cursor = start + median_s
         entry.update(start_ts=round(start, 3), end_ts=round(end, 3),
                      planned_start=_day(start), planned_end=_day(end))
         out.append(entry)
@@ -139,7 +172,8 @@ def _writable(entry: dict, force: bool) -> bool:
         or source.startswith(SOURCE)
 
 
-def build(db, *, assignee: str | None = None, now: float | None = None) -> dict:
+def build(db, *, assignee: str | None = None, now: float | None = None,
+          force: bool = False) -> dict:
     """The schedule of the open assigned lots (of `assignee`, or all):
     `ameesh-schedule/1`. Reads only."""
     from . import registry
@@ -164,7 +198,7 @@ def build(db, *, assignee: str | None = None, now: float | None = None) -> dict:
             agents[name] = {}
     out_queues = []
     for name in sorted(queues):
-        entries = plan_queue(queues[name], plans, body, agents[name], now=now)
+        entries = plan_queue(queues[name], plans, body, agents[name], now=now, force=force)
         out_queues.append({"assignee": name, "lots": entries})
     return {"schema": SCHEMA, "generated_ts": round(now, 3),
             "reference": {"id": ref.get("id"), "published_ts": ref.get("published_ts"),

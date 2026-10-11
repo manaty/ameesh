@@ -3893,11 +3893,15 @@ class Runner:
         merged diff) with the repositories of this host. Never raises."""
         from . import lot_measures
         try:
+            errors: list = []
             for row in lot_measures.measure_pending(
                     db, host=self.host,
-                    agents=set(self.agents_filter) if self.agents_filter else None):
+                    agents=set(self.agents_filter) if self.agents_filter else None,
+                    errors=errors):
                 log_async("lot #%s measured: %s" % (
                     row["work_item_id"], lot_measures.describe_phases(row)))
+            for lot, exc in errors:
+                log_async("lot #%s not measured (%s: %s)" % (lot, type(exc).__name__, exc))
         except Exception as exc:  # never fatal for the runner
             log_async("lot measures impossible (%s: %s)" % (type(exc).__name__, exc))
 

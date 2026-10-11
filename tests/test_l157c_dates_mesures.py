@@ -122,7 +122,67 @@ def make_repo(root: str) -> tuple[str, str]:
     return repo, _git(repo, "rev-parse", "HEAD")
 
 
+def make_branch_repo(root: str) -> tuple[str, str, str]:
+    """A branch of 2 commits (300 lines in a.txt, then 5 in b.txt) merged in
+    --no-ff, then another commit on main: (repo, branch tip, merge commit)."""
+    repo = os.path.join(root, "repo2")
+    os.makedirs(repo)
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.org")
+    _git(repo, "config", "user.name", "t")
+    with open(os.path.join(repo, "base.txt"), "w") as f:
+        f.write("base\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    _git(repo, "checkout", "-q", "-b", "lot")
+    for name, n in (("a.txt", 300), ("b.txt", 5)):
+        with open(os.path.join(repo, name), "w") as f:
+            f.write("".join("line %d\n" % i for i in range(n)))
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-q", "-m", name)
+    tip = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "main")
+    with open(os.path.join(repo, "main.txt"), "w") as f:
+        f.write("on main\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "main moves")
+    _git(repo, "merge", "-q", "--no-ff", "-m", "merge lot", "lot")
+    merge = _git(repo, "rev-parse", "HEAD")
+    with open(os.path.join(repo, "after.txt"), "w") as f:
+        f.write("after\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "after")
+    return repo, tip, merge
+
+
 class DiffStatTest(unittest.TestCase):
+
+    def test_branch_tip_merged_no_ff(self):
+        # the review case: the milestone records the TIP of a 2-commit branch
+        with tempfile.TemporaryDirectory() as root:
+            repo, tip, merge = make_branch_repo(root)
+            want = {"diff_files": 2, "diff_insertions": 305, "diff_deletions": 0,
+                    "measured_size": "m"}
+            self.assertEqual(lot_measures.diff_stat(repo, tip, "main"), want)
+            self.assertEqual(lot_measures.diff_stat(repo, merge, "main"), want)
+            self.assertEqual(lot_measures.diff_range(repo, tip, "main"),
+                             (_git(repo, "rev-parse", merge + "^1"), merge))
+            # a squash-like commit on the first-parent chain: itself
+            after = _git(repo, "rev-parse", "main")
+            self.assertEqual(lot_measures.diff_stat(repo, after, "main")["diff_insertions"],
+                             1)
+
+    def test_not_in_target_rebase(self):
+        with tempfile.TemporaryDirectory() as root:
+            repo, tip, _merge = make_branch_repo(root)
+            _git(repo, "checkout", "-q", "-b", "other", tip + "~2")
+            with open(os.path.join(repo, "c.txt"), "w") as f:
+                f.write("".join("c %d\n" % i for i in range(40)))
+            _git(repo, "add", ".")
+            _git(repo, "commit", "-q", "-m", "c")
+            other = _git(repo, "rev-parse", "HEAD")
+            out = lot_measures.diff_stat(repo, other, "main")
+            self.assertEqual((out["diff_files"], out["diff_insertions"]), (1, 40))
 
     def test_merged_diff(self):
         with tempfile.TemporaryDirectory() as root:
@@ -176,6 +236,33 @@ class QueueTest(unittest.TestCase):
         out = lot_schedule.plan_queue(lots, {}, BODY, {}, now=NOW)
         self.assertEqual(out[0]["end_ts"], NOW)
         self.assertEqual(out[1]["start_ts"], NOW)
+
+    def test_lot_dated_by_hand_enters_at_its_date(self):
+        lots = [{"id": 1, "type": "evolution", "priority": 1, "state": "intake"},
+                {"id": 2, "type": "evolution", "state": "intake"},
+                {"id": 3, "type": "evolution", "state": "intake"}]
+        plans = {1: {"planned_start": "2030-01-01", "planned_source": "orchestrateur"}}
+        out = lot_schedule.plan_queue(lots, plans, BODY, {}, now=NOW)
+        by = {e["id"]: e for e in out}
+        # the P1 lot set for 2030 does not push the others back
+        self.assertEqual([e["id"] for e in out], [2, 3, 1])
+        self.assertEqual((by[2]["start_ts"], by[3]["start_ts"]), (NOW, NOW + 10 * H))
+        self.assertTrue(by[1]["pinned"])
+        self.assertEqual(by[1]["planned_start"], "2030-01-01")
+        # dated today: its date is reached, it goes first (priority 1)
+        plans = {1: {"planned_start": _day(NOW), "planned_source": "orch"}}
+        out = lot_schedule.plan_queue(lots, plans, BODY, {}, now=NOW)
+        self.assertEqual([e["id"] for e in out], [1, 2, 3])
+        # dated tomorrow (midnight = now + 12 h): lot 2 first (until now +
+        # 10 h), then the queue has not reached it yet: lot 3, then lot 1
+        plans = {1: {"planned_start": _day(NOW + 24 * H), "planned_source": "orch"}}
+        out = lot_schedule.plan_queue(lots, plans, BODY, {}, now=NOW)
+        self.assertEqual([(e["id"], e["start_ts"]) for e in out],
+                         [(2, NOW), (3, NOW + 10 * H), (1, NOW + 20 * H)])
+        # --force: chained like the others, in priority order
+        out = lot_schedule.plan_queue(lots, plans, BODY, {}, now=NOW, force=True)
+        self.assertEqual([e["id"] for e in out], [1, 2, 3])
+        self.assertEqual(out[0]["start_ts"], NOW)
 
     def test_writable(self):
         entry = {"planned_start": "2026-10-12", "planned_end": "2026-10-13",
@@ -274,11 +361,14 @@ class MeasurePgTest(PgTestCase):
             self.assertEqual(lot_measures.measure(self.db, None, repos=[repo], ci=ci), [])
             # measured again on demand, without a repository: the diff is kept
             again = lot_measures.measure(self.db, [lid], repos=[], ci=None)
-            self.assertEqual((again[0]["diff_files"], again[0]["ci_minutes"]), (2, None))
+            # ... and the phases measured with a known CI too
+            self.assertEqual((again[0]["diff_files"], again[0]["ci_minutes"],
+                              again[0]["agent_minutes"]), (2, 10.0, 50.0))
 
             proc = self.mesh("work", "show", str(lid))
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn("phases   : agent 1 h · CI unknown · review 40 min · human 0 min", proc.stdout)
+            self.assertIn("phases   : agent 50 min · CI 10 min · review 40 min · human 0 min",
+                          proc.stdout)
             self.assertIn("size     : declared s · measured m (150 lines, 2 files) — differs",
                           proc.stdout)
             proc = self.mesh("work", "show", str(lid), "--json")
@@ -286,6 +376,41 @@ class MeasurePgTest(PgTestCase):
             proc = self.mesh("work", "measure", str(lid), "--repo", repo, "--no-ci", "--json")
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(json.loads(proc.stdout)[0]["id"], lid)
+
+    def _delivered(self, title, *, branch=None, sha="abcdef1"):
+        lot = work.add(self.db, title=title, branch=branch)
+        work.move(self.db, lot["id"], "build")
+        work.merged(self.db, lot["id"], sha=sha)
+        return int(lot["id"])
+
+    def test_ci_unknown_retried_and_one_failure_does_not_block(self):
+        with tempfile.TemporaryDirectory() as root:
+            repo, sha = make_repo(root)
+            a = self._delivered("a", branch="lot/a", sha=sha)
+            b = self._delivered("b", branch="lot/b", sha=sha)
+            # gh fails: CI unknown (None), not 0
+            rows = lot_measures.measure(self.db, None, repos=[repo], ci=lambda r, br: None)
+            self.assertEqual({r["work_item_id"]: r["ci_minutes"] for r in rows},
+                             {a: None, b: None})
+            # next pass: gh answers for b, raises for a — a is noted, b measured
+            errors = []
+
+            def ci(_repo, branch):
+                if branch == "lot/a":
+                    raise RuntimeError("gh broke")
+                return []
+
+            rows = lot_measures.measure(self.db, None, repos=[repo], ci=ci, errors=errors)
+            self.assertEqual([(r["work_item_id"], r["ci_minutes"]) for r in rows], [(b, 0.0)])
+            self.assertEqual([(lot, str(exc)) for lot, exc in errors], [(a, "gh broke")])
+            # b is complete now; a still retried
+            self.assertEqual([r["work_item_id"] for r in lot_measures.measure(
+                self.db, None, repos=[repo], ci=lambda r, br: [])], [a])
+            # an exhausted budget measures nothing
+            c = self._delivered("c", branch="lot/c", sha=sha)
+            self.assertEqual(lot_measures.measure(self.db, None, repos=[repo], ci=None,
+                                                  budget_s=0), [])
+            self.assertIsNone(storage.of(self.db).work.measure(c))
 
     def test_runner_pass_only_recent_lots(self):
         lot = work.add(self.db, title="old")

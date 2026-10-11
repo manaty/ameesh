@@ -841,11 +841,12 @@ class WorkItems(interface.WorkItems):
     # -- actual time by phase and merged diff size (L157c) ------------------------
     def measure_candidates(self, *, ids, retry_diff_s, since_s, limit) -> list[dict]:
         sql = (
-            "SELECT w.id, w.state, w.assignee, w.branch, w.change_size,"
+            "SELECT w.id, w.state, w.assignee, w.branch, w.branch_target, w.change_size,"
             "       extract(epoch from w.started_at)::float8 AS started_ts,"
             "       extract(epoch from fus.at)::float8 AS merged_ts, fus.sha AS merge_sha,"
             "       (m.work_item_id IS NOT NULL) AS measured,"
-            "       (m.diff_files IS NOT NULL) AS has_diff"
+            "       (m.diff_files IS NOT NULL) AS has_diff,"
+            "       (m.ci_minutes IS NOT NULL) AS has_ci"
             "  FROM work_items w"
             "  JOIN LATERAL (SELECT x.at, x.sha FROM work_item_milestones x"
             "                 WHERE x.work_item_id = w.id AND x.kind = 'merged'"
@@ -860,7 +861,10 @@ class WorkItems(interface.WorkItems):
             sql += " AND w.id IN (%s)" % ", ".join(["%s"] * len(ids))
             params += ids
         else:
-            sql += (" AND (m.work_item_id IS NULL OR (m.diff_files IS NULL"
+            # measured without a diff, or without CI though the lot has a
+            # branch: retried while recent
+            sql += (" AND (m.work_item_id IS NULL OR ((m.diff_files IS NULL"
+                    "      OR (m.ci_minutes IS NULL AND w.branch IS NOT NULL))"
                     "      AND fus.at > now() - make_interval(secs => %s)))")
             params.append(float(retry_diff_s))
             if since_s is not None:
@@ -890,9 +894,14 @@ class WorkItems(interface.WorkItems):
             "         %s, %s, %s, %s, %s)"
             " ON CONFLICT (work_item_id) DO UPDATE SET measured_at = now(),"
             "  started_at = excluded.started_at, merged_at = excluded.merged_at,"
-            "  total_minutes = excluded.total_minutes, agent_minutes = excluded.agent_minutes,"
-            "  ci_minutes = excluded.ci_minutes, review_minutes = excluded.review_minutes,"
-            "  human_minutes = excluded.human_minutes, ci_runs = excluded.ci_runs,"
+            + ", ".join(
+                # a measure whose CI could not be read never replaces phases
+                # measured with a known CI
+                "  %s = CASE WHEN excluded.ci_minutes IS NULL"
+                " AND work_item_measures.ci_minutes IS NOT NULL"
+                " THEN work_item_measures.%s ELSE excluded.%s END" % (c, c, c)
+                for c in ("total_minutes", "agent_minutes", "ci_minutes", "review_minutes",
+                          "human_minutes", "ci_runs")) + ","
             "  merge_sha = coalesce(excluded.merge_sha, work_item_measures.merge_sha),"
             "  diff_files = coalesce(excluded.diff_files, work_item_measures.diff_files),"
             "  diff_insertions = coalesce(excluded.diff_insertions,"
