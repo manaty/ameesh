@@ -100,7 +100,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    latest_gauges assigners record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
    budgets         limits put events
-   turn_resources  open_turn close_turn mark_orphan get open_by_agent orphans
+   turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
                    stale_running churn
    housekeeping    log recent summary last_measure register_worktree worktrees
                    set_worktree_status
@@ -2073,6 +2073,11 @@ class TurnResources(Domain):
     def mark_orphan(self, turn_id: str,
                     containers: Sequence[str] | None = None) -> None:
         """Marque `orphan` une ressource qui survit à son tour."""
+
+    @abc.abstractmethod
+    def settle(self, turn_id: str) -> None:
+        """L147 : solde (`done`) la ligne d'un tour dont plus rien ne survit
+        (groupe disparu au redémarrage de l'hôte, aucun conteneur en cours)."""
 
     @abc.abstractmethod
     def get(self, turn_id: str) -> dict | None:

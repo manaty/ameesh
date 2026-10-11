@@ -872,6 +872,13 @@ class AgentWorker(threading.Thread):
     def idle_due(self) -> bool:
         return (not self.nudged) and (time.monotonic() - self.last_activity >= self.runner.idle_nudge)
 
+    def placed_elsewhere(self) -> str:
+        """L147: the host the registry places this agent on, when it is not
+        this runner's host ('' otherwise, or for an agent without a host)."""
+        agent = registry.get(self.db, self.name) or {}
+        host = agent.get("host") or ""
+        return host if host and host != self.runner.host else ""
+
     def peek(self) -> bool:
         agent = registry.get(self.db, self.name)
         if agent is None or agent.get("status") == "stopped":
@@ -3309,6 +3316,14 @@ class AgentWorker(threading.Thread):
                 try:
                     if self._consigne_a_restaurer:
                         self._restaure_consigne()
+                    ailleurs = self.placed_elsewhere()
+                    if ailleurs:
+                        # L147 : the agent was placed on another host (canon)
+                        # while this worker held its lease: between two turns,
+                        # the lease is released so that host can claim it
+                        log("[%s] placed on host %s, not %s: lease released after the "
+                            "current turn" % (self.name, ailleurs, self.runner.host))
+                        break
                     self.apply_restart_if_requested()
                     self.maybe_rotate()
                     spec = self.rotate_for_lot(self.pick())
@@ -4471,11 +4486,13 @@ class Runner:
 
     def report_boot_orphans(self) -> list[dict]:
         """Après une coupure (L106) : les ressources de tour de CET hôte encore
-        `running` mais ouvertes AVANT le démarrage de l'hôte n'ont plus de
-        tour — marquées orphelines et journalisées (alerte `orphan_resource`
-        tout de suite, sans attendre une heure). Rien n'est supprimé : un
-        conteneur relancé par sa politique de redémarrage reste à examiner.
-        Les worktrees orphelins relèveront de L73. Ne lève jamais."""
+        `running` (ou déjà `orphan`) ouvertes AVANT le démarrage de l'hôte n'ont
+        plus de tour. L147 : aucun groupe de processus ne survit à un
+        redémarrage — une ligne sans conteneur encore en cours est soldée
+        (`done`) ; seule une ligne dont un conteneur tourne encore (relancé par
+        sa politique de redémarrage), ou invérifiable faute de moteur, reste
+        orpheline et signalée (alerte `orphan_resource`). Rien n'est supprimé.
+        Rend les lignes restées orphelines. Ne lève jamais."""
         from . import resources as resources_mod
         boot = resources_mod.boot_time()
         if not boot:
@@ -4483,18 +4500,43 @@ class Runner:
         try:
             turns = storage.of(self.db).turn_resources
             rows = turns.stale_running(max(0.0, time.time() - boot), self.host)
+            rows += [r for r in turns.orphans(self.host, 500)
+                     if float(r.get("started_ts") or boot) < boot]
+            runtime = self.container_runtime()
+            kept = []
             for row in rows:
+                alive = self._containers_alive(runtime, row)
+                if alive is not None and not alive:
+                    turns.settle(row["turn_id"])
+                    log("tour %s de %s d'avant le redémarrage de l'hôte : groupe %s "
+                        "disparu, aucun conteneur en cours — soldé"
+                        % (row["turn_id"], row.get("agent"), row.get("pgid") or "?"))
+                    continue
                 turns.mark_orphan(row["turn_id"])
+                kept.append(row)
                 log("ressource orpheline d'avant le redémarrage de l'hôte : tour %s de %s "
                     "(groupe %s%s) — signalée, rien n'est supprimé"
                     % (row["turn_id"], row.get("agent"), row.get("pgid") or "?",
-                       ", conteneurs %s" % ", ".join(row["containers"])
+                       ", conteneurs %s" % ", ".join(alive or row["containers"])
                        if row.get("containers") else ""))
-            return rows
+            return kept
         except db_mod.DbError as exc:
             log_async("ressources d'avant le redémarrage non vérifiées (%s)"
                       % db_mod.explain(exc))
             return []
+
+    @staticmethod
+    def _containers_alive(runtime, row) -> list | None:
+        """L147 : les conteneurs du tour encore en cours ([] : aucun) ; None
+        si la ligne en a et que le moteur ne peut pas le dire."""
+        if not row.get("containers"):
+            return []
+        if runtime is None:
+            return None
+        listed = runtime.turn_containers(row["turn_id"])
+        if listed is None:
+            return None
+        return [c["id"] for c in listed]
 
     def run(self) -> int:
         log("démarrage : hôte %s, exécuteur %s, pilote %s, schéma %s, courrier "

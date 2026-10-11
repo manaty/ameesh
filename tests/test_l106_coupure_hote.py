@@ -643,6 +643,43 @@ class CoupureTest(PgTestCase):
                    if a["type"] == "orphan_resource"]
         self.assertIn(avant, [a["turn"] for a in alertes])
 
+    def test_tour_d_avant_le_redemarrage_sans_conteneur_solde(self):
+        # L147 : aucun groupe de processus ne survit au redémarrage ; sans
+        # conteneur, la ligne est soldée, plus signalée orpheline
+        turns = storage.of(self.db).turn_resources
+        seul = "tour-seul-%s" % uuid.uuid4().hex[:6]
+        deja = "tour-deja-%s" % uuid.uuid4().hex[:6]
+        turns.open_turn(seul, "a1", self.cfg.host, pgid=4242, label="l")
+        turns.open_turn(deja, "a2", self.cfg.host, pgid=4343, label="l")
+        turns.mark_orphan(deja)        # signalée par un démarrage précédent
+        self.db.execute("UPDATE turn_resources SET started_at = now() - interval '2 hours'"
+                        " WHERE turn_id IN (%s, %s)", (seul, deja))
+        runner = Runner(self.cfg, self.db, once=True)
+        with mock.patch.object(resources, "boot_time", return_value=time.time() - 3600), \
+                mock.patch.object(runner_mod, "log"):
+            self.assertEqual(runner.report_boot_orphans(), [])
+        for turn in (seul, deja):
+            self.assertEqual(turns.get(turn)["status"], "done")
+        alertes = [a["turn"] for a in exploitation.alerts(self.cfg, self.db)
+                   if a["type"] == "orphan_resource"]
+        self.assertNotIn(seul, alertes)
+        self.assertNotIn(deja, alertes)
+
+    def test_agent_place_sur_un_autre_hote_rendu_entre_deux_tours(self):
+        # L147 : le canon a placé l'agent ailleurs pendant que ce worker
+        # tenait son bail — il le rend, l'autre hôte peut le réclamer
+        self.register("migrant", "claude", cwd=self._cwd("migrant"))
+        runner = Runner(self.cfg, self.db, once=True)
+        lease = registry.claim(self.db, "migrant", runner.runner_id, 3600)
+        worker = AgentWorker(runner, registry.get(self.db, "migrant"), lease)
+        self.addCleanup(worker.watchdog_stop.set)
+        self.assertEqual(worker.placed_elsewhere(), "")
+        self.db.execute("UPDATE agent_registry SET host = 'autre-hote' WHERE name = 'migrant'")
+        self.assertEqual(worker.placed_elsewhere(), "autre-hote")
+        with mock.patch.object(runner_mod, "log"):
+            worker.run()
+        self.assertIsNone(registry.get(self.db, "migrant").get("lease_owner"))
+
     def test_doctor_signale_un_agent_mene_sans_unite(self):
         self.register("sansunite", "claude", cwd=self._cwd("sansunite"))
         self.register("avecunite", "claude", cwd=self._cwd("avecunite"))

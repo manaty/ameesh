@@ -160,6 +160,11 @@ class TurnResources(interface.TurnResources):
             (_array(containers), turn_id),
         )
 
+    def settle(self, turn_id) -> None:
+        self.db.query(
+            "UPDATE turn_resources SET status = 'done', ended_at = coalesce(ended_at, now())"
+            " WHERE turn_id = %s AND status <> 'done' RETURNING id", (turn_id,))
+
     def get(self, turn_id) -> dict | None:
         rows = self.db.query(
             "SELECT " + TURN_COLUMNS + " FROM turn_resources WHERE turn_id = %s",
