@@ -64,6 +64,7 @@
 --       work_item_events.note
 --       work_item_milestones.note
 --       mesh_approvals.meta (et mesh_approvals_status)
+--       ci_test_failures.excerpt (sortie d'un test en échec, L161c)
 --
 -- Restent lisibles, comme ÉTAT : titres de lots (work_items.title), valeur
 -- attendue des éléments de la file d'amélioration (work_items.expected_value,
@@ -328,6 +329,18 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'created_at', 'revoked_at',
         -- L63 (0048) : heure de démarrage du PID lié, secondes epoch
         'pid_started_at'
+    ]),
+    -- L161c (0055) : exécutions de CI relevées et leurs tests en échec (de
+    -- l'ÉTAT : noms de tests, commandes pour rejouer ; l'extrait de sortie
+    -- est un CONTENU)
+    ('ci_runs', ARRAY[
+        'repo', 'run_id', 'head_sha', 'branch', 'event', 'base', 'work_item_id',
+        'status', 'superseded_by', 'url', 'first_seen_at', 'concluded_at',
+        'urgent_message_id', 'verdict_message_id'
+    ]),
+    ('ci_test_failures', ARRAY[
+        'repo', 'run_id', 'part', 'test', 'module', 'status', 'inherited', 'replay',
+        'duration_s', 'failed_at', 'message_id', 'recorded_at'
     ]),
     ('work_item_events', ARRAY[
         'id', 'work_item_id', 'state', 'actor', 'created_at'

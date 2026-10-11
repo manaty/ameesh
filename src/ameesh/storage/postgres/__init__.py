@@ -17,6 +17,7 @@ from .authenticators import Authenticators
 from .authority import Approvals, Keys, Nonces
 from .canon import Canon, Ephemerals
 from .catalog import Catalog
+from .ci import CiResults
 from .decisions import Decisions
 from .costs import TurnCosts
 from .grants import Grants
@@ -75,3 +76,4 @@ class PostgresStorage(interface.Storage):
         self.visibility = Visibility(db)
         self.housekeeping = Housekeeping(db)
         self.session_bindings = SessionBindings(db)
+        self.ci = CiResults(db)
