@@ -229,6 +229,109 @@ def open_fd_count() -> int:
 
 
 # --------------------------------------------------------------------------
+# table des processus, groupes, sous-moissonneur (travail de fond d'un tour)
+# --------------------------------------------------------------------------
+
+def process_table() -> list[dict]:
+    """Les processus lisibles de l'hôte, en une passe : `pid`, `ppid`, `pgid`
+    (groupe), `name`, `start` (secondes epoch, None si inconnue), `zombie`.
+
+    Sert au travail de fond d'un tour (membres du groupe du tour, zombies
+    adoptés par l'exécuteur). Un processus disparu pendant la lecture est
+    omis. `NotAvailable` si l'OS ne permet pas de lister les processus ou
+    leurs groupes : une liste vide voudrait dire « plus rien ne tourne »."""
+    if not hasattr(os, "getpgid"):
+        raise NotAvailable("table des processus", "pas de groupes de processus (POSIX)")
+    ps = _psutil()
+    if ps is not None:
+        out = []
+        for proc in ps.process_iter(["pid", "ppid", "name", "create_time", "status"]):
+            info = proc.info
+            try:
+                pgid = os.getpgid(int(info["pid"]))
+            except OSError:  # disparu entre la liste et la lecture
+                continue
+            out.append({"pid": int(info["pid"]), "ppid": int(info.get("ppid") or 0),
+                        "pgid": pgid, "name": str(info.get("name") or ""),
+                        "start": info.get("create_time"),
+                        "zombie": info.get("status") == ps.STATUS_ZOMBIE})
+        return out
+    if not _proc_ok():
+        raise NotAvailable("table des processus", "ni psutil ni /proc")
+    try:
+        demarrage = boot_time()
+    except NotAvailable:
+        demarrage = None
+    try:
+        hertz = float(os.sysconf("SC_CLK_TCK") or 100)
+    except (AttributeError, ValueError, OSError):
+        hertz = 100.0
+    out = []
+    for entry in os.listdir(PROC):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(os.path.join(PROC, entry, "stat"), encoding="utf-8",
+                      errors="replace") as fh:
+                data = fh.read()
+            fields = data[data.rindex(")") + 2:].split()
+            out.append({"pid": int(entry), "ppid": int(fields[1]), "pgid": int(fields[2]),
+                        "name": data[data.index("(") + 1:data.rindex(")")],
+                        "start": (demarrage + int(fields[19]) / hertz
+                                  if demarrage is not None else None),
+                        "zombie": fields[0] == "Z"})
+        except (OSError, ValueError, IndexError):
+            continue
+    return out
+
+
+def command_line(pid: int) -> str:
+    """La ligne de commande de `pid` (vide si illisible, disparu, zombie)."""
+    ps = _psutil()
+    if ps is not None:
+        try:
+            return " ".join(str(a) for a in ps.Process(int(pid)).cmdline())
+        except Exception:
+            return ""
+    try:
+        with open(os.path.join(PROC, str(int(pid)), "cmdline"), "rb") as fh:
+            return " ".join(a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a)
+    except OSError:
+        return ""
+
+
+def become_subreaper() -> bool:
+    """Ce processus adopte ses descendants orphelins (Linux,
+    `PR_SET_CHILD_SUBREAPER`) au lieu de les laisser à systemd ou à init :
+    il peut alors lire leur code de sortie. Faux si l'OS ne le permet pas."""
+    from . import is_linux
+    if not is_linux():
+        return False
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        return int(libc.prctl(36, 1, 0, 0, 0)) == 0  # 36 = PR_SET_CHILD_SUBREAPER
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
+def reap(pid: int) -> int | None:
+    """Moissonne `pid` s'il est un enfant TERMINÉ de ce processus : rend son
+    code de sortie (négatif : tué par ce signal). None s'il tourne encore,
+    s'il n'est pas notre enfant, ou si l'OS ne le permet pas. À n'appeler que
+    sur un pid qu'aucun `subprocess.Popen` n'attend (il perdrait le code)."""
+    if not hasattr(os, "WNOHANG"):
+        return None
+    try:
+        fini, statut = os.waitpid(int(pid), os.WNOHANG)
+    except (ChildProcessError, OSError):
+        return None
+    if fini == 0:
+        return None
+    return os.waitstatus_to_exitcode(statut)
+
+
+# --------------------------------------------------------------------------
 # détenteurs d'un fichier
 # --------------------------------------------------------------------------
 

@@ -11,6 +11,9 @@
         L119 (0037) : à chaque passage, la prise automatique confie un
         élément de la file d'amélioration aux agents au repos
         (`ameesh.backlog.auto_take`) ; `--take-idle 0` la coupe.
+        L126 : sur l'hôte que désigne la clé `github` de la configuration,
+        chaque passage tient aussi les issues GitHub des lots
+        (`ameesh.plan_github.Projector`).
   ameesh notify --test human:<id> [--json]
         envoie un message de test sur chacun des canaux de cet humain.
 
@@ -71,7 +74,7 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
-                 "host_not_ready", "host_power_low", "backlog_empty",
+                 "host_not_ready", "host_power_low", "backlog_empty", "mail_undeliverable",
                  # L124 : une demande de décision attend le propriétaire, et sa
                  # relance à l'échéance (urgentes si la demande l'est)
                  "decision_pending", "decision_overdue")
@@ -120,11 +123,13 @@ TYPE_LABELS = {
     "host_not_ready": "hôte non prêt",
     "host_power_low": "batterie faible de l'hôte",
     "backlog_empty": "file d'amélioration vide",
+    "mail_undeliverable": "courrier en souffrance",
     "decision_pending": "décision attendue",
     "decision_overdue": "décision sans réponse à l'échéance",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
-URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired")
+URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
+                "mail_undeliverable")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.
@@ -866,6 +871,8 @@ class Notifier:
         self.emit = emit or (lambda record: None)
         self.log = log or _stderr_log
         self.clock = clock or time.time
+        #: L126 : projection des lots en issues GitHub (créée au premier passage)
+        self._projector = None
 
     # -- passage --------------------------------------------------------------
     def run_pass(self, db, current: list | None = None, thresholds: dict | None = None,
@@ -909,6 +916,7 @@ class Notifier:
         self._summaries(now)
         if self.take:
             self._auto_take(db, current, now)
+        self._github_issues(db, now)
         for human in list(self.state["rate"]):
             window = [t for t in self.state["rate"][human] if now - t < RATE_WINDOW_S]
             if window:
@@ -916,6 +924,23 @@ class Notifier:
             else:
                 del self.state["rate"][human]
         return records
+
+    # -- issues GitHub des lots (L126) ------------------------------------------
+    def _github_issues(self, db, now: float) -> None:
+        """Chaque lot a son issue GitHub, tenue par ameesh : la projection
+        tourne ici, sur l'hôte que désigne la clé `github` de la configuration
+        (`plan_github.Projector`). Sans cette clé, rien ; une erreur (GitHub,
+        `gh`, base) est journalisée et ne touche jamais aux alertes."""
+        if not getattr(self.cfg, "github", None):
+            return
+        from . import plan_github
+        try:
+            if self._projector is None:
+                self._projector = plan_github.Projector(
+                    self.cfg, dry_run=self.dry_run, log=self.log, clock=self.clock)
+            self._projector.tick(db, now)
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au passage des alertes
+            self.log("issues GitHub : passage en échec (%s)" % _clean(exc, 200))
 
     # -- prise automatique (L119, décision 0037) ------------------------------
     def _auto_take(self, db, current: list, now: float) -> None:
@@ -973,16 +998,22 @@ class Notifier:
     def _brief_orchestrators(self, db, alert: dict, router: Router) -> None:
         """`idle_capacity` levée : l'orchestrateur de chaque projet reçoit, par
         courrier `event`, ses agents au repos sans lot et les lots ouverts sans
-        agent — c'est lui qui peut répartir. Une fois par levée (même
-        dédoublonnage que les canaux) ; jamais fatal au passage."""
+        agent — c'est lui qui peut répartir. `mail_undeliverable` levée : les
+        orchestrateurs de l'équipe reçoivent le courrier en souffrance et le
+        geste (`ameesh mail forward`). Une fois par levée (même dédoublonnage
+        que les canaux) ; jamais fatal au passage."""
+        from . import undeliverable
         try:
-            listing = list(router.agents().values())
-            titles = {}
-            for lot in (alert.get("lots") or ())[:12]:
-                item = storage.of(db).work.get(int(lot))
-                if item:
-                    titles[int(lot)] = item.get("title") or ""
-            briefs = sous_utilisation.orchestrator_briefs(alert, listing, titles)
+            if alert.get("type") == "mail_undeliverable":
+                briefs = undeliverable.orchestrator_briefs(alert)
+            else:
+                listing = list(router.agents().values())
+                titles = {}
+                for lot in (alert.get("lots") or ())[:12]:
+                    item = storage.of(db).work.get(int(lot))
+                    if item:
+                        titles[int(lot)] = item.get("title") or ""
+                briefs = sous_utilisation.orchestrator_briefs(alert, listing, titles)
         except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
             self.log("courrier aux orchestrateurs non préparé (%s)" % exc)
             return
@@ -993,10 +1024,13 @@ class Notifier:
                          % (alert.get("type"), orch, text))
                 continue
             try:
-                mail.send(db, work.SYSTEM_SENDER, orch, text, kind="event",
-                          payload={"alert": alert.get("type"),
-                                   "agents": list(alert.get("agents") or ()),
-                                   "lots": list(alert.get("lots") or ())})
+                payload = {"alert": alert.get("type"),
+                           "agents": list(alert.get("agents") or ()),
+                           "lots": list(alert.get("lots") or ())}
+                if alert.get("type") == "mail_undeliverable":
+                    payload.update(recipient=alert.get("agent"), reason=alert.get("reason"),
+                                   count=alert.get("value"))
+                mail.send(db, work.SYSTEM_SENDER, orch, text, kind="event", payload=payload)
                 self.log("[%s] courrier déposé pour l'orchestrateur %s"
                          % (alert.get("type"), orch))
             except Exception as exc:  # noqa: BLE001

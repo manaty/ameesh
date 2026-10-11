@@ -6,6 +6,9 @@
 son argv dans $AMEESH_TEST_LOG, et obéit à deux variables de banc :
 AMEESH_TEST_SLEEP (secondes de sommeil) et AMEESH_TEST_EXIT (code) ; L105 :
 AMEESH_TEST_CLAUDE_CALLS (JSON : appels au modèle, jetons relus, outil, durée).
+Travail de fond : AMEESH_TEST_BACKGROUND (commande shell lancée en fond, dans
+le groupe du tour, que le harnais n'attend pas) et AMEESH_TEST_BACKGROUND_PID
+(fichier où écrire son pid).
 """
 import json
 import os
@@ -53,6 +56,17 @@ def main() -> int:
         os.makedirs(dehors, exist_ok=True)
         with open(os.path.join(dehors, "gros"), "wb") as fh:
             fh.write(b"y" * 200_000)
+    if os.environ.get("AMEESH_TEST_BACKGROUND"):
+        # un travail lancé en fond pendant le tour (comme `cmd &` d'un outil) :
+        # même groupe, sorties détournées (un vrai harnais capture celles de
+        # ses outils), jamais attendu par le harnais
+        import subprocess
+        fond = subprocess.Popen(["sh", "-c", os.environ["AMEESH_TEST_BACKGROUND"]],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        if os.environ.get("AMEESH_TEST_BACKGROUND_PID"):
+            with open(os.environ["AMEESH_TEST_BACKGROUND_PID"], "w", encoding="utf-8") as fh:
+                fh.write(str(fond.pid))
     if os.environ.get("AMEESH_TEST_RUN"):
         # L123 : une commande lancée DANS la session, comme par l'outil Bash
         # du harnais (`ameesh chat` de bout en bout) ; son résultat au journal

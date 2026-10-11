@@ -59,7 +59,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    turn_costs      last_reading insert spent ledger correct
    mailbox         send unread unread_urgent get mark_delivered reserve deliver release
                    unread_counts history pending_recipients
-                   pending_recipients_sorted unread_total
+                   pending_recipients_sorted unread_total dead_letters forward
    wakeups         subscribe notify
    keys            info register revoke registered
    approvals       create recent candidates consume
@@ -69,7 +69,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    refresh_package_parents delegate current_delegation
                    mark_delegate_turn due_delegations resolve_delegation
                    overdue_delegations returned_delegations backlog_add backlog
-                   auto_takes_since
+                   auto_takes_since issue_feed set_issue_ref
    packages       all get upsert retire
    actions         get recent attempts events log_event last_event_note
                    decision_queues covering_grants launched propose bind
@@ -653,6 +653,22 @@ class Mailbox(Domain):
     def unread_total(self) -> int:
         """Nombre de messages non remis, tous destinataires confondus (`doctor`)."""
 
+    @abc.abstractmethod
+    def dead_letters(self) -> list[dict]:
+        """Courrier en souffrance : non remis, dont le destinataire est absent du
+        registre ou arrêté. Une ligne par (destinataire, expéditeur) :
+        `recipient`, `sender`, `n`, `oldest_ts`, `newest_ts`, `unknown`."""
+
+    @abc.abstractmethod
+    def forward(self, old: str, new: str, by: str) -> list[dict]:
+        """Re-livre à `new`, en UNE transaction, les messages non remis de `old`
+        (hors réservation active) : une copie garde expéditeur, corps, nature,
+        charge, lot, hôte et date d'origine (`meta.forwarded_from` : agent,
+        message, auteur du renvoi ; la signature, qui couvre le destinataire,
+        ne suit pas) ; l'original passe remis, renvoi noté (`meta.forwarded`).
+        Rend une ligne par message renvoyé : `original_id`, `new_id`,
+        `sender`, `kind`, `work_item_id`, `created_ts`."""
+
 
 # --------------------------------------------------------------------------
 # réveil des exécuteurs (LISTEN/NOTIFY en Postgres)
@@ -789,8 +805,9 @@ class WorkItems(Domain):
         cible, si la branche du lot est toujours `branch`."""
 
     @abc.abstractmethod
-    def open_with_branch(self, limit: int) -> list[dict]:
-        """L118 : les lots ouverts qui portent une branche."""
+    def open_for_sweep(self, limit: int) -> list[dict]:
+        """L118 : les lots ouverts que le relevé des fusions examine (avec une
+        branche ou un assigné), du plus ancien au plus récent."""
 
     @abc.abstractmethod
     def open_for(self, assignee: str) -> list[dict]:
@@ -951,6 +968,24 @@ class WorkItems(Domain):
         """Nombre de prises automatiques (lignes de journal dont la note
         commence par `note_prefix`) sur les `seconds` dernières secondes, tous
         hôtes confondus."""
+
+    # -- issues GitHub des lots (L126) ------------------------------------------
+    @abc.abstractmethod
+    def issue_feed(self, limit: int) -> list[dict]:
+        """Les lots que la projection en issues examine : ouverts, ou qui
+        portent une `issue_ref` (les `limit` plus récents), par id croissant.
+        Chaque ligne ajoute l'équipe de la fiche du plan (`package_team`) et
+        l'équipe, le chantier et l'hôte de l'assigné au registre
+        (`assignee_team`, `assignee_chantier`, `assignee_host`). Une
+        instruction."""
+
+    @abc.abstractmethod
+    def set_issue_ref(self, item_id: int, issue_ref: str | None, *,
+                      current: str | None) -> bool:
+        """Pose `issue_ref` si le lot porte encore `current` (NULL et chaîne
+        vide confondus) : faux si la valeur a changé entre-temps (un autre
+        projecteur l'a posée). Ni journal ni `updated_at` : une projection
+        n'est pas une activité du lot."""
 
 
 # --------------------------------------------------------------------------
@@ -1507,14 +1542,16 @@ class Projects(Domain):
 
     @abc.abstractmethod
     def board(self, *, max_lots: int) -> dict:
-        """`{"agents": [...], "lots": [...], "decisions": [...]}`.
+        """`{"agents": [...], "lots": [...], "dead_letters": [...], "decisions": [...]}`.
 
         `agents` : un élément par agent du registre — name, chantier, team,
         harness, host, provider, credential_mode, status, status_text, mode,
         stop_reason, responsible, lease_live, turn_started_ts,
         status_since_ts, last_turn_ts, updated_ts, last_seen_ts, unread,
-        lot de session (`session_lot_id` / `_title` / `_state`), lot assigné
-        ouvert le plus récent (`assigned_lot_id` / `_title` / `_state`),
+        lot de session (`session_lot_id` / `_title` / `_state`), dernier lot
+        cité par l'agent dans son courrier (`mail_lot_id` / `_title` /
+        `_state`), lot assigné ouvert le plus récent (`assigned_lot_id` /
+        `_title` / `_state`) — trois lots OUVERTS, ou nuls,
         `open_lots` (lots ouverts assignés), `usd_24h` et `turns_24h`
         (grand livre, horloge de la base).
 
@@ -1522,6 +1559,9 @@ class Projects(Domain):
         au plus `max_lots`, les plus récemment modifiés d'abord — id, title,
         state, app, workstream, package_team, assignee, updated_ts ; chaque
         élément porte `total` (avant la borne).
+
+        `dead_letters` : le courrier en souffrance, comme
+        `mailbox.dead_letters` (une ligne par destinataire et expéditeur).
 
         `decisions` (L124) : les demandes de décision EN ATTENTE, les plus
         anciennes d'abord (au plus 500) — id, owner (destinataire
@@ -1662,7 +1702,8 @@ class Operations(Domain):
     """Ce que l'orchestrateur lit et règle pour exploiter les agents (L26).
 
     Réglages d'agent (`session_policy`, `effort`, `tier`,
-    `context_max_tokens`, `turn_max_seconds`, `turn_mail_max`), lot de la session
+    `context_max_tokens`, `turn_max_seconds`, `turn_mail_max`,
+    `turn_grace_seconds`), lot de la session
     courante, demande de redémarrage, lectures enrichies pour `ameesh list
     --json` et `ameesh alerts`, usage par tour, historique des jauges de
     forfait et soldes d'un fournisseur payé au token. Instants en secondes
@@ -1670,9 +1711,10 @@ class Operations(Domain):
 
     #: colonnes réglables par `set_settings` (liste fermée)
     SETTINGS = ("session_policy", "effort", "tier", "context_max_tokens",
-                "turn_max_seconds", "turn_mail_max")
+                "turn_max_seconds", "turn_mail_max", "turn_grace_seconds")
     #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
-    INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max")
+    INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max",
+                        "turn_grace_seconds")
 
     @abc.abstractmethod
     def set_settings(self, name: str, values: dict) -> bool:
@@ -1871,6 +1913,10 @@ class TurnResources(Domain):
     étiquette de conteneur) et la ferme au retour du tour. Une ressource qui
     survit à son tour est marquée `orphan` — **jamais supprimée** — et
     `ameesh alerts` la signale (`orphan_resource`).
+
+    Délai de grâce (travail de fond d'un tour fini normalement) : la ligne
+    reste `running`, son `ended_at` marque la fin du tour ; elle est fermée
+    à la fin du travail de fond ou à l'échéance de la grâce.
     """
 
     @abc.abstractmethod
@@ -1883,6 +1929,13 @@ class TurnResources(Domain):
     def close_turn(self, turn_id: str, *, orphan: bool,
                    containers: Sequence[str] | None = None) -> None:
         """Ferme la ligne : `done` si la ressource est rendue, `orphan` sinon."""
+
+    @abc.abstractmethod
+    def begin_grace(self, turn_id: str,
+                    containers: Sequence[str] | None = None) -> None:
+        """Le tour est fini mais son travail de fond tourne encore (délai de
+        grâce) : `ended_at` posé, la ligne reste `running` (ses conteneurs ne
+        sont pas supprimés par le ménage tant qu'elle l'est)."""
 
     @abc.abstractmethod
     def mark_orphan(self, turn_id: str,
@@ -1904,7 +1957,8 @@ class TurnResources(Domain):
     @abc.abstractmethod
     def stale_running(self, older_than_s: float, host: str | None = None) -> list[dict]:
         """Les lignes encore `running` ouvertes il y a plus de `older_than_s`
-        secondes : un exécuteur mort les a laissées derrière lui."""
+        secondes (fin du tour, pour une ligne en délai de grâce) : un
+        exécuteur mort les a laissées derrière lui."""
 
 
 class Housekeeping(Domain):

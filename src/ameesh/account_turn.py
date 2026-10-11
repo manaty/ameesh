@@ -371,6 +371,8 @@ def rotate(worker, harness: str, old, new, session: str) -> bool:
         _log("[%s] rotation de bascule annulée : bail perdu avant l'effacement" % worker.name)
         return False
     worker.resume_summary = resume
+    # le cadre de reprise dit qui a écrit le bloc : l'agent, ou ameesh (L39)
+    worker.resume_origin = "ameesh" if sans_resume else "agent"
     try:
         os.unlink(worker._path("session"))
     except OSError:

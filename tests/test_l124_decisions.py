@@ -639,6 +639,16 @@ class VisibiliteTest(_Base):
             self.assertIn(kind, exploitation.ALERT_TYPES)
             self.assertIn(kind, notify.TYPE_LABELS)
 
+    def test_une_demande_n_est_pas_du_courrier_en_souffrance(self):
+        """Le destinataire `human:<id>` n'est pas au registre : la demande
+        n'est pourtant ni une lettre morte ni une alerte `mail_undeliverable`."""
+        self.ask()
+        self.db.execute("UPDATE agent_mailbox SET created_at = now() - interval '2 hours'")
+        self.assertEqual(storage.of(self.db).mailbox.dead_letters(), [])
+        types = {a["type"] for a in exploitation.alerts(self.cfg, self.db)}
+        self.assertNotIn("mail_undeliverable", types)
+        self.assertIn("decision_pending", types)
+
     def test_notification_urgente_et_resolution_silencieuse(self):
         sender = notify.DrySender()
         notifier = notify.Notifier(self.cfg, notify.parse_config({"default": ["desktop"]}),

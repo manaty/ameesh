@@ -63,11 +63,15 @@ Deux points de conception :
   Le `RETURNING` d'un `UPDATE` renvoie la *nouvelle* valeur (donc `NULL`) : la
   consommation passe par un CTE `taken … FOR UPDATE` qui capture l'ancienne
   valeur avant de l'effacer. (Bug attrapé par les tests.)
-* **`upsert` partiel** — un `send`, un hook ou un `status` ne doivent pas
+* **`upsert` partiel** — un hook ou un `status` ne doivent pas
   écraser ce qu'ils ne connaissent pas. Les colonnes `chantier`, `harness`,
   `host` sont donc mises à jour par `coalesce(nullif(%s,''), colonne)`, et non
   par la valeur par défaut de la ligne proposée. (Deuxième bug attrapé par les
-  tests : un `send` remettait `harness` à `'other'`.)
+  tests : un `send` remettait `harness` à `'other'`.) Depuis le 2026-10-11, un
+  `send` ne touche plus du tout le registre : il inscrivait le destinataire,
+  ce qui créait un agent fantôme pour un nom mal tapé et réécrivait l'hôte
+  d'un agent existant avec celui de l'expéditeur (voir §6, « Courrier vers un
+  agent inconnu ou arrêté »).
 
 ### `agent_mailbox` — messages durables
 
@@ -411,6 +415,16 @@ appliqué sous verrou par la réservation elle-même pour toute identité sans
 bail. `ameesh mail bind` refuse un agent `execute` sauf `--force` (« agent
 mené par l'exécuteur ; une session externe lui volerait son courrier ») et
 inscrit un agent inconnu comme `externe`.
+
+**Courrier vers un agent inconnu ou arrêté (2026-10-11).** Avec la base,
+`send` refuse (code 2, rien n'est déposé) un destinataire absent du registre
+— sans créer d'agent, avec les noms proches —, un destinataire arrêté
+(`stopped`) sauf `--queue`, et une identité d'expéditeur arrêtée (avec
+l'identité liée à la session, `whoami`) ; « all » écarte les agents arrêtés.
+Le courrier en souffrance lève l'alerte `mail_undeliverable`, et `ameesh
+mail forward <ancien> <nouveau>` re-livre une boîte morte à un agent vivant,
+expéditeur et date d'origine gardés. Détail :
+[EXPLOITATION.md](EXPLOITATION.md), « Courrier en souffrance ».
 
 **Hooks : écrire d'abord, marquer ensuite.** Le JSON est écrit sur stdout et
 vidé (`flush`) *avant* de marquer les messages remis ; si le harnais a fermé son

@@ -30,7 +30,35 @@ MAIL_COLUMNS = """
     meta->'consigne'->>'jeton' as consigne_jeton,
     (meta->'consigne'->>'epoch')::bigint as consigne_epoch,
     (meta->'consigne' IS NOT NULL
-     OR coalesce((meta->>'deja_consigne')::boolean, false)) as deja_consigne
+     OR coalesce((meta->>'deja_consigne')::boolean, false)) as deja_consigne,
+    meta->'forwarded_from'->>'agent' as forwarded_from
+"""
+
+#: courrier en souffrance : non remis, et dont le destinataire est absent du
+#: registre ou arrêté (`stopped`) — personne ne le lira. Une ligne par
+#: (destinataire, expéditeur) ; partagé avec la vue par projet
+#: (`storage.postgres.projects`), qui le lit dans sa requête unique.
+DEAD_LETTERS_SQL = """
+    SELECT m.recipient, m.sender, count(*)::bigint AS n,
+           extract(epoch from min(m.created_at))::float8 AS oldest_ts,
+           extract(epoch from max(m.created_at))::float8 AS newest_ts,
+           (r.name IS NULL) AS unknown
+      FROM agent_mailbox m
+      LEFT JOIN agent_registry r ON r.name = m.recipient
+     WHERE m.delivered_at IS NULL
+       AND (r.name IS NULL OR r.status = 'stopped')
+       -- L124 : une demande de décision attend un humain (`human:<id>`),
+       -- jamais un agent : elle n'est pas en souffrance
+       AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)
+     GROUP BY m.recipient, m.sender, r.name
+"""
+
+#: une réservation ACTIVE (non échue) : le message est peut-être en train
+#: d'être montré ; un renvoi ne le prend pas
+_RESERVED_SQL = """
+    m.meta->'consigne' IS NOT NULL
+    AND coalesce((m.meta->'consigne'->>'expire')::float8, 0)
+        > extract(epoch from clock_timestamp())
 """
 
 
@@ -272,3 +300,58 @@ class Mailbox(interface.Mailbox):
         return self.db.query(
             "SELECT count(*)::int AS n FROM agent_mailbox WHERE delivered_at IS NULL"
         )[0]["n"]
+
+    # -- courrier en souffrance ----------------------------------------------
+    def dead_letters(self) -> list[dict]:
+        return self.db.query(DEAD_LETTERS_SQL + " ORDER BY m.recipient, m.sender")
+
+    def forward(self, old, new, by) -> list[dict]:
+        # UNE transaction : verrou des messages en attente de `old` (hors
+        # réservation active), copie pour `new` (expéditeur, corps, nature,
+        # charge, lot, hôte et date d'origine ; la signature, qui couvre le
+        # destinataire, ne suit pas), puis l'original remis et noté. Un
+        # message pris entre-temps par une remise (verrou de ligne, WHERE
+        # réévalué) n'est pas renvoyé.
+        with self.db.transaction() as tx:
+            ids = sorted(int(row["id"]) for row in tx.query(
+                "SELECT m.id FROM agent_mailbox m"
+                " WHERE m.recipient = %%s AND m.delivered_at IS NULL"
+                "   AND NOT (%s)"
+                " ORDER BY m.id FOR UPDATE" % _RESERVED_SQL, (old,)))
+            if not ids:
+                return []
+            copies = tx.query(
+                """
+                INSERT INTO agent_mailbox
+                    (sender, recipient, body, kind, payload, work_item_id, host,
+                     created_at, meta)
+                SELECT m.sender, %%s, m.body, m.kind, m.payload, m.work_item_id, m.host,
+                       m.created_at,
+                       (m.meta - 'consigne' - 'deja_consigne' - 'forwarded')
+                       || jsonb_build_object('forwarded_from', jsonb_build_object(
+                              'agent', m.recipient, 'message_id', m.id, 'by', %%s::text,
+                              'ts', extract(epoch from clock_timestamp())::float8,
+                              'signed', m.signature IS NOT NULL))
+                  FROM agent_mailbox m
+                 WHERE m.id IN (%s)
+                 ORDER BY m.id
+                RETURNING id, (meta->'forwarded_from'->>'message_id')::bigint AS original_id
+                """ % ", ".join(str(i) for i in ids),
+                (new, by))
+            pairs = sorted((int(c["original_id"]), int(c["id"])) for c in copies)
+            rows = tx.query(
+                """
+                UPDATE agent_mailbox AS m
+                   SET delivered_at = now(), status = 'delivered',
+                       meta = (m.meta - 'consigne')
+                              || jsonb_build_object('forwarded', jsonb_build_object(
+                                     'to', %%s::text, 'message_id', v.new_id,
+                                     'by', %%s::text,
+                                     'ts', extract(epoch from clock_timestamp())::float8))
+                  FROM (VALUES %s) AS v(original_id, new_id)
+                 WHERE m.id = v.original_id
+                RETURNING m.id AS original_id, v.new_id, m.sender, m.kind, m.work_item_id,
+                          extract(epoch from m.created_at)::float8 AS created_ts
+                """ % ", ".join("(%d, %d)" % pair for pair in pairs),
+                (new, by))
+        return sorted(rows, key=lambda row: int(row["original_id"]))

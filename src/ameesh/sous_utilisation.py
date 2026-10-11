@@ -38,6 +38,7 @@ désactive l'alerte correspondante.
 """
 from __future__ import annotations
 
+import os
 import time
 
 from . import cost as cost_mod
@@ -285,12 +286,37 @@ def _bare(name: str) -> str:
     return name[len("agent:"):] if name.startswith("agent:") else name
 
 
-def orchestrators(cfg, db, listing: list, *, declared=(), canons=None) -> list:
+def role_orchestrators(canons, roles=None) -> set:
+    """Les agents dont la fiche Agent du canon nomme un rôle d'orchestrateur
+    (`roles` ou `role` : `orchestrateur`, `orchestrator`), ou l'un des
+    `roles` donnés."""
+    wanted = {str(r).strip().lower() for r in (roles or ORCHESTRATOR_ROLES)}
+    found = set()
+    for canon in canons or []:
+        for agent in getattr(canon, "agents", None) or []:
+            data = getattr(getattr(agent, "fiche", None), "data", None) or {}
+            fiche_roles = data.get("roles") or data.get("role") or []
+            if isinstance(fiche_roles, str):
+                fiche_roles = [fiche_roles]
+            if any(str(r).strip().lower() in wanted for r in fiche_roles):
+                found.add(agent.title)
+    return found
+
+
+def declared_orchestrators(env=None) -> set:
+    """Les orchestrateurs déclarés par `AMEESH_ALERT_ORCHESTRATORS` (noms
+    séparés par des virgules, `agent:` admis)."""
+    value = (env if env is not None else os.environ).get("AMEESH_ALERT_ORCHESTRATORS") or ""
+    return {_bare(n) for n in value.split(",") if n.strip()}
+
+
+def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
+                  roles=ORCHESTRATOR_ROLES) -> list:
     """Les orchestrateurs connus : déclarés (`--orchestrators`,
     `AMEESH_ALERT_ORCHESTRATORS`), fiche Agent du canon dont `roles` (ou
-    `role`) nomme un orchestrateur, ou agent qui a confié des lots (délégation
-    ou `work assign`) dans les 30 derniers jours. Seulement des agents du
-    registre."""
+    `role`) nomme un orchestrateur (ou l'un des `roles` donnés), ou agent qui
+    a confié des lots (délégation ou `work assign`) dans les 30 derniers
+    jours. Seulement des agents du registre."""
     names = {row["name"] for row in listing}
     found = {_bare(n) for n in declared or () if n}
     if canons is None:
@@ -299,14 +325,7 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None) -> list:
             canons = canon_mod.load_configured(cfg) if cfg is not None else []
         except Exception:
             canons = []
-    for canon in canons or []:
-        for agent in getattr(canon, "agents", None) or []:
-            data = getattr(getattr(agent, "fiche", None), "data", None) or {}
-            roles = data.get("roles") or data.get("role") or []
-            if isinstance(roles, str):
-                roles = [roles]
-            if any(str(r).strip().lower() in ORCHESTRATOR_ROLES for r in roles):
-                found.add(agent.title)
+    found |= role_orchestrators(canons, roles)
     try:
         found |= {_bare(n) for n in storage.of(db).operations.assigners(
             since_s=ASSIGNERS_SINCE_S)}

@@ -233,8 +233,19 @@ def sync_merges(db, repo_dir: str, *, target: str = DEFAULT_TARGET, dry_run: boo
 # 4. branche supprimée : le dernier commit vu (`probe`), sinon un commit de
 #    fusion de la cible dont le message cite la branche (nom entier).
 #
+# Correctif du 2026-10-11 : une équipe fusionne aussi en local, sans PR, des
+# lots SANS branche. Le relevé examine désormais tout lot ouvert assigné à un
+# agent de l'hôte, avec ou sans branche : à défaut de preuve par la branche,
+# un commit de FUSION de la cible, postérieur à la création du lot, le
+# désigne par une ligne `ameesh-work: <id>` (n'importe où dans le message,
+# même forme que dans le corps d'une PR) ou, seulement si le dépôt l'active
+# (`git config ameesh.lotRef hash`), par `#<id>` dans son TITRE. Ailleurs
+# « (#45) » est un numéro de PR GitHub : il fermerait le mauvais lot.
+#
 # Lecture seule du dépôt, aucun `fetch`. La cible : celle du lot, sinon
-# `git config ameesh.target` du dépôt, sinon `origin/HEAD`, sinon main.
+# `git config ameesh.target` du dépôt (une valeur introuvable est une
+# erreur, jamais un repli silencieux sur main), sinon `origin/HEAD`, sinon
+# main.
 
 #: une branche citée dans un message (`agent/…`)
 CITED_BRANCH_RE = re.compile(r"(?<![\w./-])(agent/[A-Za-z0-9._/-]*[A-Za-z0-9_-])")
@@ -249,6 +260,22 @@ MAX_BRANCH_LOTS = 1000
 #: clé de configuration git du dépôt qui nomme la cible par défaut
 TARGET_GIT_KEY = "ameesh.target"
 DEFAULT_TARGETS = ("origin/main", "main", "origin/master", "master")
+#: une ligne `ameesh-work: <id>` désigne un lot précis (message d'un commit de
+#: fusion, ou corps d'une PR : `plan_github`)
+WORK_TRAILER_RE = re.compile(
+    r"(?im)^[ \t>*-]*ameesh-work[ \t]*:[ \t]*#?([1-9][0-9]{0,17})[ \t]*$")
+#: `#<id>` dans le titre d'un commit de fusion (« Merge #93 … », « … (#91) ») ;
+#: ni `PR#9`, ni `depot#9`, ni `##9`, ni `#9a`
+HASH_REF_RE = re.compile(r"(?<![\w/#&])#([1-9][0-9]{0,17})(?!\w)")
+#: clé de configuration git du dépôt : comment ses commits de fusion citent un
+#: lot en plus de `ameesh-work:` — `hash` : `#<id>` dans le titre
+LOT_REF_GIT_KEY = "ameesh.lotRef"
+LOT_REF_HASH = "hash"
+#: commits de fusion lus au plus par dépôt et par relevé (les plus récents)
+MAX_MERGE_SCAN = 500
+#: écart d'horloge admis (s) entre la base (création du lot) et le poste qui
+#: a fait le commit de fusion (date à la seconde)
+CLOCK_SLACK_S = 120.0
 
 
 def check_ref(name: str, what: str = "branche") -> str:
@@ -270,10 +297,18 @@ def cited_branch(text: str) -> str | None:
 
 def default_target(repo: str) -> str | None:
     """La cible par défaut du dépôt : `git config ameesh.target`, sinon la
-    branche par défaut du dépôt distant (`origin/HEAD`), sinon main/master."""
+    branche par défaut du dépôt distant (`origin/HEAD`), sinon main/master.
+
+    Une cible configurée mais introuvable (faute de frappe, `origin/develop`
+    jamais récupérée) lève MergeProbeError : se rabattre sur main ferait
+    chercher les fusions au mauvais endroit, sans le dire."""
     configured = _out(repo, "config", "--get", TARGET_GIT_KEY)
-    if configured and _commit(repo, configured):
-        return configured
+    if configured:
+        if _commit(repo, configured):
+            return configured
+        raise MergeProbeError("%s = %s introuvable dans %s (aucun fetch n'est fait : "
+                              "corrigez la valeur ou récupérez la branche)"
+                              % (TARGET_GIT_KEY, configured, repo))
     head = _out(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
     if head and _commit(repo, head):
         return head
@@ -374,31 +409,120 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
     return dict(out, detail="%s en avance sur %s (%s)" % (branch, target, tip[:12]))
 
 
+def lot_ref_hash(repo: str) -> bool:
+    """`git config ameesh.lotRef hash` : les commits de fusion du dépôt citent
+    leurs lots par `#<id>` dans leur titre (à n'activer que si ces numéros sont
+    des lots ameesh, jamais des PR GitHub)."""
+    return (_out(repo, "config", "--get", LOT_REF_GIT_KEY) or "").strip().lower() == LOT_REF_HASH
+
+
+def merge_commits(repo: str, target: str, since_ts: float | None = None,
+                  limit: int = MAX_MERGE_SCAN) -> list[dict]:
+    """Les commits de FUSION de `target` (au plus `limit`, du plus récent au
+    plus ancien, postérieurs à `since_ts`) : `{sha, ts, message}`."""
+    args = ["log", "--merges", "--format=%H%x00%ct%x00%B%x1e", "--max-count=%d" % int(limit)]
+    if since_ts:
+        args.append("--since=@%d" % int(since_ts))
+    proc = _git(repo, *args, target)
+    if proc.returncode != 0:
+        raise MergeProbeError("git log %s : %s" % (
+            target, proc.stderr.decode("utf-8", "replace").strip()))
+    rows = []
+    for record in proc.stdout.decode("utf-8", "replace").split("\x1e"):
+        sha, _sep, rest = record.strip().partition("\x00")
+        stamp, _sep, message = rest.partition("\x00")
+        if sha:
+            try:
+                ts = float(stamp)
+            except ValueError:
+                ts = 0.0
+            rows.append({"sha": sha, "ts": ts, "message": message.strip()})
+    return rows
+
+
+def cited_lots(message: str, *, hash_refs: bool = False) -> dict[int, str]:
+    """`{lot: forme}` des lots que désigne le message d'un commit de fusion :
+    une ligne `ameesh-work: <id>` (forme `ameesh-work`), et, avec `hash_refs`,
+    `#<id>` dans le titre (forme `#id`) — pas dans le corps, qui peut recopier
+    les titres des commits fusionnés."""
+    found: dict[int, str] = {}
+    for match in WORK_TRAILER_RE.finditer(message or ""):
+        found.setdefault(int(match.group(1)), "ameesh-work")
+    if hash_refs:
+        lines = (message or "").strip().splitlines()
+        for match in HASH_REF_RE.finditer(lines[0] if lines else ""):
+            found.setdefault(int(match.group(1)), "#id")
+    return found
+
+
+def merge_citing(merges: list[dict], lot: int, *, since_ts: float | None = None,
+                 hash_refs: bool = False) -> dict | None:
+    """Le PREMIER commit de fusion postérieur à `since_ts` (création du lot,
+    à `CLOCK_SLACK_S` près) qui désigne le lot `lot` (`cited_lots`), avec
+    `how`, ou None."""
+    found = None
+    for merge in merges:                     # du plus récent au plus ancien
+        if since_ts and merge["ts"] < float(since_ts) - CLOCK_SLACK_S:
+            continue
+        how = cited_lots(merge["message"], hash_refs=hash_refs).get(int(lot))
+        if how:
+            found = dict(merge, how=how)
+    return found
+
+
+def _citation(merge: dict, lot: int, target: str, *, sha: bool = True) -> str:
+    """Comment la fusion a été constatée, en clair (compte rendu ; sans le
+    commit, `sha=False`, pour la note du lot, qui le porte déjà)."""
+    title = (merge["message"].splitlines() or [""])[0].strip()
+    return "commit de fusion %sde %s qui %s (« %s »)" % (
+        "%s " % merge["sha"][:12] if sha else "", target,
+        "porte « ameesh-work: %d »" % lot if merge["how"] == "ameesh-work"
+        else "cite #%d dans son titre (%s %s)" % (lot, LOT_REF_GIT_KEY, LOT_REF_HASH),
+        title[:80] + ("…" if len(title) > 80 else ""))
+
+
 def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = False,
                   actor: str = "", limit: int = MAX_BRANCH_LOTS) -> dict:
-    """L118 : ferme les lots ouverts dont la branche est entrée dans sa cible.
+    """L118 : ferme les lots ouverts dont la fusion dans leur cible est constatée.
 
+    Examinés : les lots ouverts qui portent une branche ou ont un assigné.
     Le dépôt d'un lot est le dossier de travail de son assigné au registre ;
     avec `host`, seuls les assignés de cet hôte sont examinés (les dossiers
-    des autres hôtes n'y sont pas), avec `agents`, seulement ceux-là. La
-    fermeture passe par `work.close_merged` (idempotente, jamais de
-    réouverture) et s'écrit dans le fil du lot. Rend le compte rendu."""
+    des autres hôtes n'y sont pas), avec `agents`, seulement ceux-là. Preuve :
+    la branche du lot (`branch_probe`), sinon un commit de fusion de la cible
+    qui désigne le lot (`ameesh-work: <id>`, ou `#<id>` si le dépôt l'active :
+    `merge_citing`). La fermeture passe par `work.close_merged` (idempotente,
+    jamais de réouverture) avec le commit de fusion et une note qui dit comment
+    elle a été constatée, et s'écrit dans le fil du lot. Rend le compte rendu."""
     import os
 
     from . import fil, registry
 
     st = storage.of(db)
+    rows = st.work.open_for_sweep(limit)
+    # les commits de fusion lus une fois par dépôt et par cible : depuis le
+    # lot ouvert le plus ancien, chaque lot ne retient que les siens
+    since_all = min((float(r["created_ts"]) - CLOCK_SLACK_S for r in rows
+                     if r.get("created_ts")), default=None)
+    targets: dict = {}
+    hashes: dict = {}
+    merges: dict = {}
+    regs: dict = {}                          # une lecture du registre par assigné
     results: list[dict] = []
-    for row in st.work.open_with_branch(limit):
+    for row in rows:
+        lot = int(row["id"])
+        branch = row.get("branch") or None
         assignee = (row.get("assignee") or "").strip()
-        entry = {"work_item": int(row["id"]), "branch": row["branch"],
+        entry = {"work_item": lot, "branch": branch,
                  "target": row.get("branch_target"), "assignee": assignee or None,
                  "result": "skipped", "how": None, "ref": None, "detail": ""}
         if agents is not None and assignee not in agents:
             continue
-        reg = registry.get(db, assignee) if assignee and ":" not in assignee else None
+        if assignee and ":" not in assignee and assignee not in regs:
+            regs[assignee] = registry.get(db, assignee)
+        reg = regs.get(assignee) if assignee and ":" not in assignee else None
         if reg is None:
-            if host is None:
+            if host is None and branch:
                 entry["detail"] = "aucun agent assigné : dépôt inconnu"
                 results.append(entry)
             continue
@@ -411,15 +535,46 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             results.append(entry)
             continue
         try:
-            target = row.get("branch_target") or default_target(repo)
+            if row.get("branch_target"):
+                target = row["branch_target"]
+            else:
+                if repo not in targets:
+                    try:
+                        targets[repo] = default_target(repo)
+                    except MergeProbeError as exc:
+                        targets[repo] = exc
+                if isinstance(targets[repo], MergeProbeError):
+                    raise targets[repo]
+                target = targets[repo]
             if not target:
                 entry.update(result="no-target", detail="aucune cible : `git config %s "
                              "<branche>` dans %s, ou --target" % (TARGET_GIT_KEY, repo))
                 results.append(entry)
                 continue
             entry["target"] = target
-            found = branch_probe(repo, row["branch"], target, seen_head=row.get("branch_head"),
-                                 since_ts=row.get("created_ts"))
+            found = None
+            if branch:
+                found = branch_probe(repo, branch, target, seen_head=row.get("branch_head"),
+                                     since_ts=row.get("created_ts"))
+            if found is None or not found["merged"]:
+                if repo not in hashes:
+                    hashes[repo] = lot_ref_hash(repo)
+                if (repo, target) not in merges:
+                    merges[(repo, target)] = merge_commits(repo, target, since_all)
+                cited = merge_citing(merges[(repo, target)], lot,
+                                     since_ts=row.get("created_ts"), hash_refs=hashes[repo])
+                if cited:
+                    found = dict(found or {"tip": None, "ahead": False}, merged=True,
+                                 how=cited["how"], ref=cited["sha"],
+                                 detail=_citation(cited, lot, target),
+                                 note=_citation(cited, lot, target, sha=False))
+                elif found is None:
+                    found = {"merged": False, "how": None, "ref": None, "tip": None,
+                             "ahead": False,
+                             "detail": "aucun commit de fusion de %s ne désigne le lot "
+                                       "(ligne « ameesh-work: %d »%s)"
+                                       % (target, lot, ", ni « #%d » dans un titre" % lot
+                                          if hashes[repo] else "")}
         except (MergeProbeError, GitError) as exc:
             entry.update(result="error", detail=str(exc))
             results.append(entry)
@@ -427,27 +582,32 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
         entry.update(how=found["how"], ref=found["ref"], detail=found["detail"], result="open",
                      repo=repo)
         if not found["merged"]:
-            if found["ahead"] and found["tip"] and found["tip"] != row.get("branch_head") \
-                    and not dry_run:
-                st.work.set_branch_head(int(row["id"]), row["branch"], found["tip"])
+            if branch and found["ahead"] and found["tip"] \
+                    and found["tip"] != row.get("branch_head") and not dry_run:
+                st.work.set_branch_head(lot, branch, found["tip"])
             results.append(entry)
             continue
         if dry_run:
             entry["result"] = "would-merge"
             results.append(entry)
             continue
+        if found.get("note"):
+            source = "le relevé des fusions, %s" % found["note"]
+        else:
+            source = "branche %s (%s)" % (branch, found["how"])
         done = work_mod.close_merged(
-            db, int(row["id"]), sha=found["ref"] or "", actor=actor or "git:%s" % target,
-            source="branche %s (%s)" % (row["branch"], found["how"]))
+            db, lot, sha=found["ref"] or "", actor=actor or "git:%s" % target, source=source)
         entry.update(result=done["result"], detail="%s — %s" % (found["detail"], done["detail"]))
         if done["result"] == "merged":
-            text = ("Lot #%d « %s » livré : la branche %s est entrée dans %s (%s, commit %s). "
-                    "Fermé par le relevé des branches de l'exécuteur."
-                    % (int(row["id"]), row.get("title") or "", row["branch"], target,
+            text = ("Lot #%d « %s » livré : %s (%s, commit %s). Fermé par le relevé des "
+                    "fusions de l'exécuteur."
+                    % (lot, row.get("title") or "",
+                       "un commit de fusion de %s le désigne" % target if found.get("note")
+                       else "la branche %s est entrée dans %s" % (branch, target),
                        found["how"], (found["ref"] or "?")[:12]))
             fil.record(db.cfg, db, sender=work_mod.SYSTEM_SENDER, recipients=[assignee],
                        text=text, project=fil.project_for(db.cfg, fil.agent_project(reg)),
-                       lot=str(row["id"]), meta={"kind": "event"})
+                       lot=str(lot), meta={"kind": "event"})
         results.append(entry)
     return {"host": host, "dry_run": bool(dry_run), "results": results,
             "merged": sum(1 for r in results if r["result"] == "merged")}

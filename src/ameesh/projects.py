@@ -6,12 +6,17 @@
 Pour chaque projet (l'équipe `team` de l'agent, à défaut son `chantier`) :
 
 * ses agents, avec leur état (au travail, en pause, au repos, arrêté) et la
-  raison d'une pause ou d'un arrêt, le lot en cours (lot de la session, à
-  défaut le lot ouvert assigné le plus récent), les non-lus, la dépense des
-  24 dernières heures et le mode de paiement (forfait ou au token) ;
+  raison d'une pause ou d'un arrêt, le lot en cours (le dernier lot ouvert
+  cité par l'agent dans son courrier, à défaut le lot de sa session, à
+  défaut le lot ouvert assigné le plus récent ; jamais un lot fusionné ou
+  fermé), les non-lus, la dépense des 24 dernières heures et le mode de
+  paiement (forfait ou au token) ;
 * ses lots ouverts SANS agent pour les faire avancer (non assignés, assignés
   à un agent arrêté ou inconnu du registre) ;
-* un signalement quand le projet a du travail ouvert mais aucun agent actif.
+* un signalement quand le projet a du travail ouvert mais aucun agent actif ;
+* son courrier en souffrance : les messages en attente chez un agent arrêté
+  du projet, ou adressés par un agent du projet à un nom absent du registre
+  (`ameesh mail forward <ancien> <nouveau>` les re-livre).
 
 Le projet d'un lot est son `app`, à défaut son `workstream`, l'équipe de sa
 fiche du plan, ou le projet de son assigné. Un projet sans agent actif ni
@@ -66,6 +71,8 @@ _FR_PAYMENT = {"plan": "forfait", "token": "token", None: "?"}
 _FR_WHY = {"unassigned": "non assigné", "stopped": "assigné à %s, arrêté",
            "unknown": "assigné à %s, inconnu du registre",
            "external": "assigné à %s, session externe"}
+#: pourquoi un message est en souffrance : destinataire arrêté, ou inconnu
+_FR_DEAD = {"stopped": "arrêté", "unknown": "inconnu"}
 
 
 def _text(value) -> str:
@@ -110,13 +117,21 @@ def _paid_harnesses():
         return None
 
 
+#: candidats au lot en cours, du plus parlant au moins parlant : le dernier lot
+#: cité par l'agent dans son courrier, celui de sa session, son lot assigné le
+#: plus récent (correctif du 2026-10-11)
+_LOT_SOURCES = (("mail_lot", "mail"), ("session_lot", "session"), ("assigned_lot", "assigned"))
+#: un lot dans ces états n'est jamais « en cours »
+_DONE = ("merged", "promoted", "closed")
+
+
 def _lot_of(row: dict) -> dict | None:
-    if row.get("session_lot_id") is not None:
-        return {"id": int(row["session_lot_id"]), "title": row.get("session_lot_title") or "",
-                "state": row.get("session_lot_state"), "source": "session"}
-    if row.get("assigned_lot_id") is not None:
-        return {"id": int(row["assigned_lot_id"]), "title": row.get("assigned_lot_title") or "",
-                "state": row.get("assigned_lot_state"), "source": "assigned"}
+    """Le lot en cours d'un agent : le premier candidat OUVERT de `_LOT_SOURCES`
+    (la lecture ne rend que des lots ouverts ; l'état est revérifié ici)."""
+    for prefix, source in _LOT_SOURCES:
+        if row.get(prefix + "_id") is not None and row.get(prefix + "_state") not in _DONE:
+            return {"id": int(row[prefix + "_id"]), "title": row.get(prefix + "_title") or "",
+                    "state": row.get(prefix + "_state"), "source": source}
     return None
 
 
@@ -219,8 +234,33 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
             "updated_ts": round(float(lot["updated_ts"]), 3) if lot.get("updated_ts") else None,
         })
 
+    # courrier en souffrance : au projet de l'agent arrêté, ou, pour un nom
+    # absent du registre, au projet de l'expéditeur
+    dead: dict = {}
+    for row in board.get("dead_letters") or []:
+        recipient = row.get("recipient")
+        agent = by_name.get(recipient)
+        sender = row.get("sender") or ""
+        where = agent["project"] if agent is not None else agent_projects.get(sender)
+        group(where)
+        entry = dead.setdefault(where, {}).setdefault(recipient, {
+            "recipient": recipient,
+            "why": "unknown" if agent is None or row.get("unknown") else "stopped",
+            "count": 0, "oldest_ts": None, "senders": []})
+        entry["count"] += int(row.get("n") or 0)
+        if row.get("oldest_ts") is not None:
+            oldest = round(float(row["oldest_ts"]), 3)
+            entry["oldest_ts"] = oldest if entry["oldest_ts"] is None \
+                else min(entry["oldest_ts"], oldest)
+        if sender and sender not in entry["senders"]:
+            entry["senders"].append(sender)
+
     projects = []
     for g in groups.values():
+        letters = sorted(dead.get(g["name"], {}).values(), key=lambda e: e["recipient"])
+        for entry in letters:
+            entry["senders"].sort()
+        undeliverable = sum(e["count"] for e in letters)
         g["agents"].sort(key=lambda a: (_STATE_ORDER.get(a["state"], 9), a["name"]))
         counts = {s: 0 for s in _STATE_ORDER}
         for a in g["agents"]:
@@ -233,11 +273,18 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
             warnings.append("aucun agent actif")
         if g["lots_without_agent"]:
             warnings.append("%d lot(s) ouvert(s) sans agent" % len(g["lots_without_agent"]))
+        if letters:
+            warnings.append("%d message(s) en souffrance : %s — à re-livrer : ameesh mail "
+                            "forward <ancien> <nouveau>" % (undeliverable, ", ".join(
+                                "%s (%s) %d" % (e["recipient"], _FR_DEAD[e["why"]], e["count"])
+                                for e in letters)))
         g.update({
-            "active": bool(active_agents or g["lots_open"]),
+            "active": bool(active_agents or g["lots_open"] or undeliverable),
             "counts": counts,
             "agents_active": active_agents,
             "unread": sum(a["unread"] for a in g["agents"]),
+            "undeliverable": undeliverable,
+            "undeliverable_mail": letters,
             "usd_24h": round(sum(a["usd_24h"] for a in g["agents"]), 6),
             "usd_24h_token": round(sum(a["usd_24h"] for a in g["agents"]
                                        if a["payment"] == "token"), 6),
@@ -257,6 +304,8 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
                            .isoformat(timespec="seconds").replace("+00:00", "Z"),
         "project": project or None,
         "projects": projects,
+        # messages en souffrance des projets montrés (destinataire arrêté ou inconnu)
+        "undeliverable": sum(p["undeliverable"] for p in projects),
         "truncated": ({"lots": {"shown": len(lot_rows), "total": total, "limit": int(max_lots)}}
                       if total > len(lot_rows) else {}),
         # L124 : demandes de décision en attente (en-tête)
@@ -269,7 +318,7 @@ def snapshot(db, *, project: str | None = None, now: float | None = None,
              paid_harnesses=None, max_lots: int = MAX_LOTS, viewer: str | None = None) -> dict:
     """Lit la base (UNE requête) et rend la vue `ameesh-projects/1`."""
     board = storage.of(db).projects.board(max_lots=max_lots)
-    for key in ("agents", "lots", "decisions"):
+    for key in ("agents", "lots", "dead_letters", "decisions"):
         if isinstance(board.get(key), str):      # pilote qui rend le json brut
             board[key] = json.loads(board[key])
     if paid_harnesses is None:
@@ -333,6 +382,8 @@ def _headline(p: dict) -> str:
         extra.append("%d lot(s) ouvert(s)" % p["lots_open"])
     if p["unread"]:
         extra.append("%d non lu(s)" % p["unread"])
+    if p.get("undeliverable"):
+        extra.append("%d en souffrance" % p["undeliverable"])
     if p["usd_24h"]:
         extra.append("24 h %.2f\u00a0$ (token %.2f\u00a0$)" % (p["usd_24h"], p["usd_24h_token"]))
     return head + (" · " + " · ".join(extra) if extra else "")
