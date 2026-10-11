@@ -91,7 +91,7 @@
   ameesh menage [--apply] [--json]      ménage de ce que les agents créent (L73) ;
   ameesh deps link|local|status|entries node_modules shared per lockfile (#248) ;
   ameesh conflicts [--all] [--json]     radar de conflits entre lots (L160b) ;
-  ameesh guard check|run --observe      garde de capacité d'une VM prêteuse (L159e) ;
+  ameesh guard check|run|drain          garde de capacité d'une VM prêteuse (L159e) ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,

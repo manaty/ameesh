@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L159e — `ameesh guard`: offer, levels, state, observation loop (tranche 1);
-caps and freeze enforced through systemd (tranche 2)."""
+caps and freeze enforced through systemd (tranche 2); drain, stop and manual
+drain (tranche 3)."""
 from __future__ import annotations
 
 import dataclasses
@@ -639,6 +640,122 @@ class EnforcerTest(unittest.TestCase):
                 self.assertEqual(self.calls, [])
 
 
+class DrainStopTest(unittest.TestCase):
+    """Tranche 3: jobs stopped at the drain's deadline, guest stopped at level 4,
+    manual drain."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-l159e-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = guard.GuardConfig(
+            host="vm-test", max_agents=2,
+            offer=guard.parse_offer({"cpu_max": 2, "drain_seconds": 100,
+                                     "reclaim": {"memory_available_min": "4GiB"}}),
+            state_path=os.path.join(self.tmp, "state.json"),
+            ack_path=os.path.join(self.tmp, "ack.json"),
+            drain_request_path=os.path.join(self.tmp, "drain.json"))
+        self.calls = []
+        self.reading = {"cpu_count": 4, "mem_total_bytes": 16 * GIB,
+                        "mem_available_bytes": 12 * GIB, "disk_free_bytes": 50 * GIB}
+        self.clock = [1000.0]
+        patcher = mock.patch.multiple(guard.resources, lendable=None, measure=None,
+                                      create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def fake(self, argv, **kw):
+        self.calls.append(argv)
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    def guard(self, observe=False):
+        return guard.Guard(self.cfg, observe=observe, signals=lambda now: dict(self.reading),
+                           clock=lambda: self.clock[0],
+                           enforcer=guard.Enforcer(self.cfg, run=self.fake, log=lambda t: None))
+
+    def stops(self):
+        return [c[1:] for c in self.calls if c[1] in ("stop", "kill")
+                and not c[2].startswith(guard.THAW_UNIT)]
+
+    def test_deadline_stops_jobs_then_level_4_stops_guest(self):
+        g = self.guard()
+        self.assertEqual(g.step()["level"], 0)
+        self.reading["mem_available_bytes"] = 1 * GIB
+        drain = g.step()
+        self.assertEqual((drain["level"], drain["drain_deadline_ts"]), (3, 1100.0))
+        self.assertEqual(self.stops(), [])
+        self.clock[0] = 1100.0                   # the deadline: jobs stopped, once
+        g.step()
+        self.clock[0] = 1105.0
+        g.step()
+        self.assertEqual(self.stops(), [["stop", "ameesh-job-*.scope"]])
+        self.clock[0] = 1130.0                   # 30 s later, no acknowledgement
+        self.assertEqual(g.step()["state"], "stopped")
+        self.clock[0] = 1135.0
+        g.step()
+        self.assertEqual(self.stops(), [
+            ["stop", "ameesh-job-*.scope"],
+            ["kill", "--signal=SIGKILL", "ameesh-guest-runner@*.service", "ameesh-job-*.scope"],
+            ["stop", "ameesh-guest.slice"]])
+
+    def test_acknowledged_drain_never_stops_the_guest(self):
+        g = self.guard()
+        g.step()
+        self.reading["mem_available_bytes"] = 1 * GIB
+        drain = g.step()
+        with open(self.cfg.ack_path, "w") as fh:
+            json.dump({"schema": "ameesh-host-ack/1", "seq": drain["seq"],
+                       "state": "draining", "drained": True, "in_turn": []}, fh)
+        self.clock[0] = 1200.0
+        self.assertEqual(g.step()["state"], "draining")
+        self.assertEqual(self.stops(), [["stop", "ameesh-job-*.scope"]])
+
+    def test_failed_stop_is_retried_and_observe_stops_nothing(self):
+        failing = [True]
+
+        def run(argv, **kw):
+            self.calls.append(argv)
+            bad = failing[0] and argv[1] == "stop" and argv[2] == "ameesh-guest.slice"
+            return mock.Mock(returncode=1 if bad else 0, stdout="", stderr="")
+        enforcer = guard.Enforcer(self.cfg, run=run, log=lambda t: None)
+        state = {"level": 4, "caps": {}, "drain_deadline_ts": None}
+        enforcer.apply(state, 4, 2000.0)
+        failing[0] = False
+        enforcer.apply(state, 4, 2005.0)
+        enforcer.apply(state, 4, 2010.0)
+        self.assertEqual([c[2] for c in self.calls if c[1] == "stop"],
+                         ["ameesh-job-*.scope", "ameesh-guest.slice", "ameesh-guest.slice"])
+        # back to level 0, then a new stop: done again
+        enforcer.apply({"level": 0, "caps": {}}, 4, 3000.0)
+        self.calls.clear()
+        enforcer.apply(state, 4, 4000.0)
+        self.assertEqual(len([c for c in self.calls if c[1] == "stop"]), 2)
+        # observing: the levels are decided, nothing is stopped
+        self.calls.clear()
+        g = self.guard(observe=True)
+        self.reading["mem_available_bytes"] = 1 * GIB
+        g.step()
+        self.clock[0] = 2000.0
+        self.assertEqual(g.step()["state"], "stopped")
+        self.assertEqual(self.calls, [])
+
+    def test_manual_drain(self):
+        path = self.cfg.drain_request_path
+        self.assertFalse(guard.drain_requested(path, 0.0))
+        guard.request_drain(path, 1000.0, 60)
+        self.assertTrue(guard.drain_requested(path, 1059.0))
+        self.assertFalse(guard.drain_requested(path, 1060.0))
+        guard.request_drain(path, 1000.0, None)        # until cancelled
+        self.assertTrue(guard.drain_requested(path, 10 ** 10))
+        g = self.guard()
+        state = g.step()
+        self.assertEqual((state["state"], state["reason"]), ("draining", "manual"))
+        self.assertTrue(guard.cancel_drain(path))
+        self.assertFalse(guard.cancel_drain(path))
+        with open(path, "w") as fh:
+            json.dump({"schema": "other", "until_ts": None}, fh)
+        self.assertFalse(guard.drain_requested(path, 0.0))
+
+
 class CliTest(unittest.TestCase):
     def test_check_and_observe_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -672,6 +789,25 @@ class CliTest(unittest.TestCase):
                               and c[1] in ("set-property", "freeze", "thaw")], [])
             with open(os.path.join(tmp, "s", "state.json")) as fh:
                 self.assertEqual(json.load(fh)["guard"]["kind"], "ameesh-guard")
+            # manual drain: requested, seen by check, withdrawn
+            drain = os.path.join(tmp, "drain.json")
+            with open(config) as fh:
+                raw = json.load(fh)
+            with open(config, "w") as fh:
+                json.dump(dict(raw, drain_request_path=drain), fh)
+            with mock.patch("sys.stdout"):
+                self.assertEqual(guard.main(["drain", "--for", "600", "--config", config]), 0)
+            with open(drain) as fh:
+                self.assertEqual(json.load(fh)["schema"], "ameesh-guard-drain/1")
+            with mock.patch("sys.stdout") as out:
+                guard.main(["check", "--config", config])
+            self.assertIn("reason manual",
+                          "".join(c.args[0] for c in out.write.call_args_list))
+            with mock.patch("sys.stdout"):
+                self.assertEqual(guard.main(["drain", "--cancel", "--config", config]), 0)
+            self.assertFalse(os.path.exists(drain))
+            with mock.patch("sys.stderr"):
+                self.assertEqual(guard.main(["drain", "--for", "0", "--config", config]), 2)
             with open(config, "w") as fh:
                 json.dump({"lend": {"cpu_max": "three"}}, fh)
             with mock.patch("sys.stderr"):
