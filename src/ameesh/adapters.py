@@ -75,6 +75,12 @@ PRIORITY_FOOTER = ("Traite-le en priorité, puis reprends ton travail sans atten
 TMP_NOTE = ("Fichiers temporaires : dans $TMPDIR (ton dossier, sur disque), jamais en dur "
             "dans /tmp ; rien de plus de 500 Mo dans /tmp (en mémoire, partagé par tous "
             "les agents de l'hôte).")
+#: L131 : les suites lourdes passent par `ameesh heavy` (le 2026-10-10, 11
+#: agents ont lancé ensemble jest, suites SQL et builds : charge 43 pour 12 CPU)
+HEAVY_NOTE = ("Suites lourdes (suite de tests complète, jest, suites SQL, build) : "
+              "lance-les par `ameesh heavy -- <commande>` ; l'hôte en limite le nombre "
+              "simultané, la commande attend son tour puis tourne. Les tests ciblés "
+              "et courts n'en ont pas besoin.")
 #: rotation de session : résumé de reprise produit avant d'ouvrir une session
 #: neuve. Chaque contrainte y est attribuée à sa source (incident du
 #: 2026-10-10 : un « hold » propre à un lot, recopié sans source dans un
