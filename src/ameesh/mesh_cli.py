@@ -842,6 +842,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             ref = estimates.proposal(db, type=item.get("type"), size=item.get("change_size"),
                                      assignee=item.get("assignee"))
             print("référence : %s" % estimates.proposal_label(ref))
+            # L157c: planned dates at the p80, in the assignee's queue ordered
+            # at the median (only with a published reference table)
+            from . import lot_schedule
+            scheduled = lot_schedule.schedule_new(db, item, actor=args.actor)
+            if scheduled:
+                print("planned  : %s → %s (%s)" % (
+                    scheduled["planned_start"], scheduled["planned_end"], scheduled["source"]))
             if warn_estimate:
                 print("avertissement : %s" % estimates.missing(item["id"]), file=sys.stderr)
             _print_assignment(check)
@@ -962,6 +969,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             item["estimate_reference"] = estimates.proposal(
                 db, type=item.get("type"), size=item.get("change_size"),
                 assignee=item.get("assignee"))
+            # L157c: actual time by phase and merged diff size, once delivered
+            from . import lot_measures
+            item["measure"] = lot_measures.view(storage.of(db).work.measure(args.id))
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
@@ -995,6 +1005,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 estimates.proposal_label(item["estimate_reference"]),
                 " — taille %s" % estimates.SIZE_LABELS.get(item["change_size"])
                 if item.get("change_size") else ""))
+            if item["measure"]:
+                print("phases   : %s" % lot_measures.describe_phases(item["measure"]))
+                print("size     : %s" % lot_measures.describe_size(item["measure"]))
             if len(item["estimates"]) > 1:
                 print("estimé   : %s" % " → ".join(
                     "%s (%s)" % (estimates.label(e["minutes"]), e.get("estimated_by") or "?")

@@ -67,7 +67,7 @@ le JSON plutôt que le texte.
 | 8 | Sécurité | `ameesh alerts --json`, `ameesh canon check`, `agent-mail bindings` | canon invalide, placement refusé, agent `execute` lié à une session externe, liaison inattendue, secret apparu dans un fil |
 | 9 | Ses propres suites | `ameesh work list --assignee auditeur --json`, `gh pr checks <n>` | correctif qui attend la CI ou un verdict ; fusionné mais pas déployé ; déploiement sans courrier de résultat ; mesure due sept jours après un déploiement |
 | 10 | Demandes d'humains sans lot (L130) | `ameesh work unrecorded --since 2h --json` (`--since 24h` en analyse profonde) | message d'un humain, réponse à une décision ou demande transmise par son chat qui n'est rattachée à aucun lot, n'en cite aucun et dont aucun lot ne reprend la phrase ; le rapport la nomme (numéro du message, expéditeur, destinataire, extrait) à l'orchestrateur du projet, qui l'enregistre ([ORCHESTRATEUR.md](ORCHESTRATEUR.md), « Toute demande d'un humain devient un lot ») |
-| 11 | Estimations (L157, L157b) | `ameesh alerts --json` (`estimate_bias`), `ameesh work estimates --json`, `ameesh projects --json` (`lot_estimate` de chaque agent), `ameesh work list --json` (`estimate_minutes`) | lot ouvert sans durée estimée ; lot en cours au-delà de son estimation (`overrun`) ; médiane réel/estimé d'un type de lot ou d'un auteur hors de ×0,7–×1,5, ou p80 au-delà de ×2 ; estimations tardives (posées après le début) ou ré-estimations nombreuses ; lots livrés sans début mesuré |
+| 11 | Estimations (L157, L157b, L157c) | `ameesh alerts --json` (`estimate_bias`), `ameesh work estimates --json`, `ameesh projects --json` (`lot_estimate` de chaque agent), `ameesh work list --json` (`estimate_minutes`), `ameesh work show <id> --json` (`measure`), `ameesh work schedule --json` | lot ouvert sans durée estimée ; lot en cours au-delà de son estimation (`overrun`) ; médiane réel/estimé d'un type de lot ou d'un auteur hors de ×0,7–×1,5, ou p80 au-delà de ×2 ; estimations tardives (posées après le début) ou ré-estimations nombreuses ; lots livrés sans début mesuré ; L157c: delivered lots without a measure (`measure` null) or with CI unknown; measured size differing from the declared size (`size_match` false) for one estimator again and again; the phase that carries the gap (agent, CI, review, human); open lots left unplanned by `work schedule` |
 
 ### CI et réserve
 
@@ -220,7 +220,10 @@ par lui-même (une lecture, pas un sous-agent) :
    2026-10-11). Un estimateur hors de ×0,5–×2 sur au moins trois lots est
    rangé dans `bias` : l'alerte `estimate_bias` en découle, adressée à
    l'estimateur et aux orchestrateurs de son équipe, jusqu'à la publication
-   suivante qui ne le relève plus.
+   suivante qui ne le relève plus. Then (L157c) `ameesh work schedule
+   --apply --actor auditeur`: the planned dates of the open lots, at the p80
+   of the new table, queues chained at the median (dates set by a person
+   are kept).
 1. **Mesurer** : `ameesh work estimates --json`, puis `--app <projet>` pour
    chaque projet actif. Les groupes `by_type` et `by_author` donnent la
    médiane et le p80 du ratio réel/estimé sur les lots livrés, estimés AVANT

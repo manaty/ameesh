@@ -854,6 +854,25 @@ class WorkItems(Domain):
         (`{id, published_by, published_ts, body}`), ou None."""
 
     @abc.abstractmethod
+    def measure_candidates(self, *, ids: Sequence[int] | None, retry_diff_s: float,
+                           since_s: float | None, limit: int) -> list[dict]:
+        """L157c: delivered lots with a measured start and no measure yet, or
+        measured without a diff and merged less than `retry_diff_s` ago (a
+        repository holding the merge commit may show up); `since_s`: merged
+        less than this ago only (None: any age). `ids`: only these lots,
+        measured or not, of any age. Rows: `{id, state, assignee, branch,
+        change_size, started_ts, merged_ts, merge_sha, measured, has_diff}`."""
+
+    @abc.abstractmethod
+    def save_measure(self, item_id: int, measure: dict) -> dict:
+        """L157c: writes (or replaces) the measure of a delivered lot; a
+        measure without diff keeps the diff already stored. Returns it."""
+
+    @abc.abstractmethod
+    def measure(self, item_id: int) -> dict | None:
+        """L157c: the measure of a lot (phases, diff), or None."""
+
+    @abc.abstractmethod
     def set_branch(self, item_id: int, branch: str | None, target: str | None, *,
                    note: str, actor: str) -> dict | None:
         """L118 : pose la branche et la cible d'un lot ouvert (journalisé) ;
