@@ -234,7 +234,7 @@ class PlacementPolicyTest(unittest.TestCase):
     def test_liste_vide_n_admet_rien(self):
         out = canon.placement_violations(self.AGENT, {"title": "h", "policy": {"harnesses": []}})
         self.assertEqual(len(out), 1)
-        self.assertIn("harnais claude", out[0])
+        self.assertIn("harness claude", out[0])
 
     def test_chaque_cle(self):
         host = {"title": "banc", "policy": {
@@ -250,7 +250,7 @@ class PlacementPolicyTest(unittest.TestCase):
         out = canon.placement_violations({"harness": "codex"},
                                          {"policy": {"providers": ["openai"]}})
         self.assertEqual(len(out), 1)
-        self.assertIn("non déclaré", out[0])
+        self.assertIn("undeclared", out[0])
 
     def test_le_mode_du_placement_prime(self):
         host = {"policy": {"credential_modes": ["api-key"]}}
@@ -356,8 +356,8 @@ class ValidationTest(_TmpMixin, unittest.TestCase):
         matches = self.assertFinding(self.check(root)[1], "placement-policy-violation",
                                      agent="orchestre")
         textes = " ".join(f.message for f in matches)
-        for attendu in ("harnais claude", "fournisseur anthropic",
-                        "mode d'identifiants subscription"):
+        for attendu in ("harness claude", "provider anthropic",
+                        "credential mode subscription"):
             self.assertIn(attendu, textes)
 
     def test_hote_sans_responsable_ou_non_resolu(self):
@@ -1340,7 +1340,7 @@ class CanonCliTest(_CanonDbCase):
         write(self.tmp, "note.md", "non suivi\n")
         proc = self.mesh("review-class", "--diff", "ref-qui-n-existe-pas", env=env)
         self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("référence", proc.stderr)
+        self.assertIn("reference", proc.stderr)
         self.assertNotIn("class:", proc.stdout)   # aucune classe partielle
 
     def test_sans_canon_configure(self):
@@ -1548,7 +1548,7 @@ class AuthenticatorSyncTest(_AuthenticatorCase):
         proc = self.mesh("canon", "sync", "--host", "atelier",
                          env=self.env(AMEESH_CANON=self.clone))
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("GELÉS human:alice", proc.stdout)
+        self.assertIn("FROZEN human:alice", proc.stdout)
 
     def test_une_entree_ne_choisit_pas_sa_provenance(self):
         entry = dict(self.alice.entry(), canon_ref="ailleurs:x.md@" + "f" * 40)
@@ -1562,7 +1562,7 @@ class AuthenticatorSyncTest(_AuthenticatorCase):
         write(root, "membres/alice.md", member_fiche("alice", [self.alice.entry()]))
         done = canon_sync.sync(self.db, canon.load(root, untrusted=True), "atelier").authenticators
         self.assertEqual((done.status, done.errors), ("skipped", []))
-        self.assertIn("NON APPROUVÉ", done.reason)
+        self.assertIn("NOT APPROVED", done.reason)
         self.assertEqual(self.rows(include_revoked=True), [])
         # un registre rempli n'est pas vidé par un canon illisible
         self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
@@ -1587,12 +1587,12 @@ class AuthenticatorSyncTest(_AuthenticatorCase):
                                     push=False, message="non revu")
         done = self.sync(ref=local).authenticators
         self.assertEqual(done.status, "refused")
-        self.assertIn("absent de la branche canonique", done.reason)
+        self.assertIn("not on the canonical branch", done.reason)
         self.assertEqual(self.rows(), before)
         proc = self.mesh("canon", "sync", "--host", "atelier", "--ref", local,
                          env=self.env(AMEESH_CANON=self.clone))
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("authentificateurs : REFUSÉ", proc.stdout)
+        self.assertIn("authenticators : REFUSED", proc.stdout)
         self.assertEqual(self.rows(), before)
         # une branche de PR poussée sur le dépôt, pas fusionnée : refusée aussi
         git(self.clone, "push", "-q", "origin", "HEAD:refs/heads/pr-1")
@@ -1621,7 +1621,7 @@ class AuthenticatorSyncTest(_AuthenticatorCase):
         # l'hôte B, pas encore rafraîchi, lit l'ancien commit : refus, rien réactivé
         done = self.sync(other).authenticators
         self.assertEqual(done.status, "refused")
-        self.assertIn("en retard", done.reason)
+        self.assertIn("canon behind", done.reason)
         self.assertEqual(self.rows(), [])
         # une fois rafraîchi, il suit
         done = self.sync(other, fetch=True).authenticators
@@ -1756,7 +1756,7 @@ class AuthenticatorRaceTest(_AuthenticatorCase):
         # l'ancien canon, rejoué ensuite : refusé (monotonie), rien réactivé
         late = canon_sync.sync_authenticators(self.db, old)
         self.assertEqual(late.status, "refused")
-        self.assertIn("ne descend pas du dernier commit appliqué %s" % second[:12], late.reason)
+        self.assertIn("does not descend from the last applied commit %s" % second[:12], late.reason)
         self.assertEqual(self.rows(), [])
 
     def test_ancien_canon_apres_la_revocation_refuse(self):
@@ -1771,7 +1771,7 @@ class AuthenticatorRaceTest(_AuthenticatorCase):
             lambda db: canon_sync.sync_authenticators(db, fresh),
             lambda db: canon_sync.sync_authenticators(db, old))
         self.assertEqual(stale.status, "refused")
-        self.assertIn("ne descend pas du dernier commit appliqué %s" % second[:12], stale.reason)
+        self.assertIn("does not descend from the last applied commit %s" % second[:12], stale.reason)
         self.assertEqual(revoke.status, "synced")
         self.assertEqual(self.rows(), [])
         self.assertTrue(blocked, "l'ancien canon n'a pas attendu le verrou du registre")
@@ -1832,38 +1832,38 @@ class AuthenticatorTrustTest(_AuthenticatorCase):
             with self.subTest(**kwargs):
                 done = canon_sync.sync_authenticators(self.db, candidate, **kwargs)
                 self.assertEqual(done.status, "refused")
-                self.assertIn("absent de la branche canonique origin/main", done.reason)
+                self.assertIn("not on the canonical branch origin/main", done.reason)
         self.assertEqual((self.rows(include_revoked=True), self.journal()), ([], []))
         # registre amorcé sur main : la PR reste refusée, par la CLI aussi
         self.assertEqual(self.sync(ref="origin/main").authenticators.status, "synced")
         done = canon_sync.sync_authenticators(
             self.db, canon.load(self.clone, ref="origin/pr-unmerged"))
         self.assertEqual(done.status, "refused")
-        self.assertIn("absent de la branche canonique origin/main", done.reason)
+        self.assertIn("not on the canonical branch origin/main", done.reason)
         proc = self.mesh("canon", "sync", "--host", "atelier", "--ref", "origin/pr-unmerged",
                          env=self.env(AMEESH_CANON=self.clone))
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("authentificateurs : REFUSÉ", proc.stdout)
+        self.assertIn("authenticators : REFUSED", proc.stdout)
         self.assertEqual(self.rows(include_revoked=True), [])
 
     def test_premier_amorcage_refuse_sans_bootstrap_ref(self):
         first = self.commit_members(alice=member_fiche("alice", [self.alice.entry()]))
         done = canon_sync.sync(self.db, canon.load(self.clone), "atelier").authenticators
         self.assertEqual(done.status, "refused")
-        self.assertIn("premier amorçage", done.reason)
+        self.assertIn("first bootstrap", done.reason)
         self.assertIn("--bootstrap-ref", done.reason)
         self.assertEqual((self.rows(include_revoked=True), self.journal()), ([], []))
         env = self.env(AMEESH_CANON=self.clone)
         proc = self.mesh("canon", "sync", "--host", "atelier", env=env)
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("authentificateurs : REFUSÉ — premier amorçage", proc.stdout)
+        self.assertIn("authenticators : REFUSED — first bootstrap", proc.stdout)
         self.assertEqual(self.rows(), [])
         # --bootstrap-ref explicite : appliqué, journalisé
         proc = self.mesh("canon", "sync", "--host", "atelier", "--bootstrap-ref", "main",
                          env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("AMORÇAGE", proc.stdout)
-        self.assertIn("branche canonique de confiance origin/main (amorçage --bootstrap-ref)",
+        self.assertIn("BOOTSTRAP", proc.stdout)
+        self.assertIn("trusted canonical branch origin/main (--bootstrap-ref bootstrap)",
                       proc.stdout)
         self.assertEqual(set(self.live()), {("human:alice", self.alice.credential_id)})
         self.assertEqual([(j["root_commit"], j["branch"], j["trust"], j["host"])
@@ -1875,7 +1875,7 @@ class AuthenticatorTrustTest(_AuthenticatorCase):
         done = self.sync(bootstrap_ref="autre").authenticators
         self.assertEqual((done.status, done.trust, done.branch),
                          ("synced", "applied", "origin/main"))
-        self.assertIn("--bootstrap-ref autre ignoré : registre déjà amorcé", done.notes)
+        self.assertIn("--bootstrap-ref autre ignored: registry already bootstrapped", done.notes)
         self.assertEqual(self.journal()[-1]["root_commit"], second)
         # la configuration de l'hôte (AMEESH_CANON_REF) suffit à un premier amorçage
         self.db.execute("TRUNCATE authenticators, authenticator_syncs RESTART IDENTITY CASCADE")
@@ -1898,7 +1898,7 @@ class AuthenticatorTrustTest(_AuthenticatorCase):
         self.assertEqual((done.status, done.result["added"]), ("synced", []))
         done = self.sync(ref="origin/release").authenticators
         self.assertEqual(done.status, "refused")
-        self.assertIn("absent de la branche canonique origin/main", done.reason)
+        self.assertIn("not on the canonical branch origin/main", done.reason)
         self.assertEqual(set(self.live()), {("human:alice", self.alice.credential_id)})
         # fusionnée sur main : lue, et encore vérifiée contre main
         git(self.clone, "push", "-q", "origin", "%s:refs/heads/main" % manifest)
@@ -1925,7 +1925,7 @@ class AuthenticatorTrustTest(_AuthenticatorCase):
         git(self.clone, "fetch", "-q", "origin")
         done = self.sync(ref="origin/main").authenticators
         self.assertEqual(done.status, "refused")
-        self.assertIn("absent de la branche canonique origin/release", done.reason)
+        self.assertIn("not on the canonical branch origin/release", done.reason)
         self.assertEqual(self.journal()[-1]["root_commit"], later)
 
     def test_commit_non_descendant_refuse(self):
@@ -1941,7 +1941,7 @@ class AuthenticatorTrustTest(_AuthenticatorCase):
         # un ancien commit de main, lu par --ref
         done = self.sync(ref=first).authenticators
         self.assertEqual(done.status, "refused")
-        self.assertIn("ne descend pas du dernier commit appliqué %s" % second[:12],
+        self.assertIn("does not descend from the last applied commit %s" % second[:12],
                       done.reason)
         # historique réécrit (poussé en force sur main) qui ajoute bruno
         git(self.clone, "reset", "-q", "--hard", first)
@@ -1951,7 +1951,7 @@ class AuthenticatorTrustTest(_AuthenticatorCase):
         git(self.clone, "fetch", "-q", "origin")
         done = self.sync().authenticators
         self.assertEqual(done.status, "refused")
-        self.assertIn("ne descend pas du dernier commit appliqué %s" % second[:12],
+        self.assertIn("does not descend from the last applied commit %s" % second[:12],
                       done.reason)
         self.assertEqual(self.rows(include_revoked=True), before)
         self.assertEqual(self.journal()[-1]["root_commit"], second)
@@ -2001,7 +2001,7 @@ class AuthenticatorRelayTest(_AuthenticatorCase):
         conn = self.configured(canon_ref="release")
         done = canon_sync.sync(conn, canon.load(self.clone, fetch=True), "atelier").authenticators
         self.assertEqual(done.status, "refused")
-        self.assertIn("absent de la branche canonique origin/release", done.reason)
+        self.assertIn("not on the canonical branch origin/release", done.reason)
         self.assertEqual(set(self.live()), {("human:alice", self.alice.credential_id)})
         # "" explicite : aucune configuration, le dernier commit appliqué fait foi
         done = canon_sync.sync(conn, canon.load(self.clone), "atelier",
@@ -2020,13 +2020,13 @@ class AuthenticatorRelayTest(_AuthenticatorCase):
         self.assertTrue(self.runner_pass())
         state = canon_sync.state(self.db, "atelier")
         self.assertEqual((state["status"], state["auth_status"]), ("ok", "error"))
-        self.assertIn("premier amorçage", state["auth_diagnostic"])
+        self.assertIn("first bootstrap", state["auth_diagnostic"])
         self.assertIsNotNone(state["auth_checked_ts"])
         entries = self.fil_entries()
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0].author, canon_sync.FIL_SENDER)
-        self.assertIn("registre des authentificateurs EN ERREUR", entries[0].text)
-        self.assertIn("premier amorçage", entries[0].text)
+        self.assertIn("authenticator registry IN ERROR", entries[0].text)
+        self.assertIn("first bootstrap", entries[0].text)
         self.assertEqual((entries[0].meta["event"], entries[0].meta["host"]),
                          ("authenticators_error", "atelier"))
         # la même erreur, passe suivante : état rafraîchi, pas de doublon au fil
@@ -2037,19 +2037,19 @@ class AuthenticatorRelayTest(_AuthenticatorCase):
         # une erreur d'une autre nature (membre gelé) : nouvelle entrée
         self.sync()                                          # amorçage sur main
         self.assertEqual(canon_sync.state(self.db, "atelier")["auth_status"], "ok")
-        self.assertIn("de nouveau sans erreur", self.fil_entries()[-1].text)
+        self.assertIn("error-free again", self.fil_entries()[-1].text)
         self.commit_members(alice=member_fiche("alice", raw="{a: 1}"))
         report = self.sync()
         self.assertEqual(report.auth_status, "error")
         state = canon_sync.state(self.db, "atelier")
         self.assertEqual(state["auth_status"], "error")
-        self.assertIn("GELÉS : human:alice", state["auth_diagnostic"])
-        self.assertIn("GELÉS : human:alice", self.fil_entries()[-1].text)
+        self.assertIn("FROZEN: human:alice", state["auth_diagnostic"])
+        self.assertIn("FROZEN: human:alice", self.fil_entries()[-1].text)
         self.assertEqual(len(self.fil_entries()), 3)
         # visible par `canon check`
         proc = self.mesh("canon", "check", "--host", "atelier",
                          env=self.env(AMEESH_CANON=self.clone))
-        self.assertIn("authentificateurs : EN ERREUR — error", proc.stdout)
+        self.assertIn("authenticators : IN ERROR — error", proc.stdout)
 
 
 class AuthenticatorWriteGuardTest(_AuthenticatorCase):

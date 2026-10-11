@@ -173,7 +173,7 @@ class CanonUnreadable(canon_mod.CanonError):
     """Canon illisible : l'état `unreadable` est enregistré, rien d'autre."""
 
     def __init__(self, host: str, diagnostic: str, findings: list[Finding]):
-        super().__init__("canon illisible, registre inchangé : %s" % diagnostic)
+        super().__init__("unreadable canon, registry unchanged: %s" % diagnostic)
         self.host = host
         self.diagnostic = diagnostic
         self.findings = findings
@@ -248,17 +248,17 @@ class AuthenticatorSync:
     def diagnostic(self) -> str:
         """Diagnostic durable (`canon_state.auth_diagnostic`), borné."""
         if self.status == AUTH_REFUSED:
-            text = "REFUSÉ, registre inchangé — %s" % self.reason
+            text = "REFUSED, registry unchanged — %s" % self.reason
         elif self.errors:
             frozen = list((self.result or {}).get("frozen") or [])
-            text = "%d erreur(s)%s : %s" % (
-                len(self.errors), " (GELÉS : %s)" % ", ".join(frozen) if frozen else "",
-                " ; ".join(self.errors))
+            text = "%d error(s)%s: %s" % (
+                len(self.errors), " (FROZEN: %s)" % ", ".join(frozen) if frozen else "",
+                "; ".join(self.errors))
         elif self.status == AUTH_SKIPPED:
             text = self.reason
         else:
-            text = " ; ".join(list(self.notes) + (
-                ["canon lu en partie, aucune révocation pour absence : %s"
+            text = "; ".join(list(self.notes) + (
+                ["canon partially read, no revocation for absence: %s"
                  % ", ".join(self.partial)] if self.partial else []))
         return _clip(text)
 
@@ -320,7 +320,7 @@ def _clip(text: str) -> str:
 
 
 def _describe(findings: list[Finding]) -> str:
-    return _clip(" ; ".join("%s (%s) : %s" % (f.code, f.where(), f.message) for f in findings))
+    return _clip("; ".join("%s (%s): %s" % (f.code, f.where(), f.message) for f in findings))
 
 
 def assess(canon: Canon, host: str,
@@ -335,7 +335,7 @@ def assess(canon: Canon, host: str,
     """
     if not canon.readable:
         reasons = canon_mod.errors(canon.load_findings)
-        return CANON_UNREADABLE, _describe(reasons) if reasons else "aucune source lue"
+        return CANON_UNREADABLE, _describe(reasons) if reasons else "no source read"
     if findings is None:
         findings = canon_mod.validate(canon)
     block = canon_mod.blocking(findings)
@@ -344,7 +344,7 @@ def assess(canon: Canon, host: str,
         return CANON_INVALID, _describe(host_wide)
     others = canon_mod.errors(findings)
     if others:
-        return CANON_OK, ("erreurs propres à des agents (non réclamables) ou au plan : "
+        return CANON_OK, ("errors specific to agents (not claimable) or to the plan: "
                           + _describe(others))
     return CANON_OK, ""
 
@@ -473,19 +473,19 @@ def adopt_default(db: Db, host: str, canons: list[Canon]) -> dict | None:
                 return None
             if not current.get("root"):
                 return None  # aucun canon n'a encore écrit la ligne : rien à protéger
-            refus = ("canon par défaut de %s : l'ancien canon par défaut (racine %s) n'a "
-                     "pas d'identifiant enregistré, et le premier canon configuré (%s, %s) "
-                     "n'est pas celui-là — changement d'ordre refusé, sinon ses lignes "
-                     "seraient données à l'autre canon. Synchronisez d'abord avec l'ancien "
-                     "canon par défaut seul ou en premier (son identifiant est alors "
-                     "enregistré), puis changez l'ordre."
+            refus = ("default canon of %s: the former default canon (root %s) has "
+                     "no recorded identifier, and the first configured canon (%s, %s) "
+                     "is not that one — order change refused, otherwise its rows "
+                     "would be given to the other canon. First sync with the former "
+                     "default canon alone or first (its identifier is then "
+                     "recorded), then change the order."
                      % (host, current.get("root"), new.id, new.root))
         elif previous == new.id or previous not in others:
             return None
         elif new.id_source != canon_mod.ID_FROM_FEDERATION:
-            refus = ("canon par défaut de %s : %s (racine %s) remplacerait %s sans "
-                     "identifiant de fédération (federation.yaml absent ou illisible) — "
-                     "changement d'ordre refusé : corrigez son federation.yaml."
+            refus = ("default canon of %s: %s (root %s) would replace %s without a "
+                     "federation identifier (federation.yaml missing or unreadable) — "
+                     "order change refused: fix its federation.yaml."
                      % (host, new.id, new.root, previous))
         if refus is None:
             moved = store.rebase_default(previous, new.id)
@@ -498,9 +498,9 @@ def adopt_default(db: Db, host: str, canons: list[Canon]) -> dict | None:
         fil.warn(refus)
         raise DefaultCanonError(refus)
     done["authenticators"] = moved
-    fil.warn("canon par défaut de %s : %s remplace %s — %d agent(s) et %d paquet(s) "
-             "rattachés à %s ; authentificateurs : %d rattaché(s) à %s, %d au canon par "
-             "défaut" % (host, new.id, previous, len(done["agents"]),
+    fil.warn("default canon of %s: %s replaces %s — %d agent(s) and %d package(s) "
+             "attached to %s; authenticators: %d attached to %s, %d to the default "
+             "canon" % (host, new.id, previous, len(done["agents"]),
                          len(done["packages"]), previous,
                          moved["authenticators"][0], previous, moved["authenticators"][1]))
     return done
@@ -513,11 +513,11 @@ def close_unconfigured(db: Db, host: str, canons: list[Canon]) -> list[str]:
     pas si l'un d'eux n'a pas pu l'être). Rend les clés fermées."""
     keep = [state_key(db, canon, host) for canon in canons]
     closed = storage.of(db).canon.close_others(
-        host, keep, "canon retiré de la configuration de l'hôte : agents non réclamables "
-                    "(les arrêter : agent-runner stop)")
+        host, keep, "canon removed from the host configuration: agents not claimable "
+                    "(to stop them: agent-runner stop)")
     if closed:
-        fil.warn("canon(s) retiré(s) de la configuration de %s : %s — agents non "
-                 "réclamables" % (host, ", ".join(c or "(défaut)" for c in closed)))
+        fil.warn("canon(s) removed from the configuration of %s: %s — agents not "
+                 "claimable" % (host, ", ".join(c or "(default)" for c in closed)))
     return closed
 
 
@@ -542,13 +542,13 @@ def record_authenticators(db: Db, host: str, done: AuthenticatorSync,
     option = " --canon %s" % key if key else ""
     if status == AUTH_STATE_ERROR and before != (status, diagnostic):
         _post_authenticators(db, host, status, (
-            "canon sync sur %s%s : registre des authentificateurs EN ERREUR — %s. "
-            "Détail : ameesh canon sync --host %s%s ; état durable : ameesh canon check "
+            "canon sync on %s%s: authenticator registry IN ERROR — %s. "
+            "Details: ameesh canon sync --host %s%s; durable state: ameesh canon check "
             "--host %s%s." % (host, which, diagnostic or "?", host, option, host, option)),
             done)
     elif status != AUTH_STATE_ERROR and before[0] == AUTH_STATE_ERROR:
         _post_authenticators(db, host, status, (
-            "canon sync sur %s%s : registre des authentificateurs de nouveau sans erreur "
+            "canon sync on %s%s: authenticator registry error-free again "
             "(%s)%s." % (host, which, status, " — %s" % diagnostic if diagnostic else "")),
             done)
 
@@ -569,7 +569,7 @@ def _post_authenticators(db: Db, host: str, status: str, text: str,
                          "branch": done.branch, "trust": done.trust,
                          "canon": done.canon})
     except Exception as exc:  # noqa: BLE001 - fil.record ne lève pas ; prudence
-        fil.warn("%s (entrée du fil non écrite : %s)" % (text, " ".join(str(exc).split())[:200]))
+        fil.warn("%s (thread entry not written: %s)" % (text, " ".join(str(exc).split())[:200]))
 
 
 # --------------------------------------------------------------------------
@@ -585,23 +585,23 @@ TRUST_CONFIG = "config"          # configuration de l'hôte (AMEESH_CANON_REF / 
 TRUST_APPLIED = "applied"        # manifeste du dernier commit déjà appliqué
 TRUST_BOOTSTRAP = "bootstrap"    # premier amorçage : --bootstrap-ref explicite
 TRUST_LABELS = {
-    TRUST_CONFIG: "configuration de l'hôte",
-    TRUST_APPLIED: "manifeste du dernier commit appliqué",
-    TRUST_BOOTSTRAP: "amorçage --bootstrap-ref",
+    TRUST_CONFIG: "host configuration",
+    TRUST_APPLIED: "manifest of the last applied commit",
+    TRUST_BOOTSTRAP: "--bootstrap-ref bootstrap",
 }
 BOOTSTRAP_REFUSED = (
-    "premier amorçage du registre des authentificateurs refusé : aucune branche "
-    "canonique de confiance (ni AMEESH_CANON_REF / canon_ref dans la configuration de "
-    "l'hôte, ni commit déjà appliqué) ; le commit lu ne décide jamais lui-même de ce "
-    "qui est canonique — registre inchangé, « ameesh canon sync --bootstrap-ref "
-    "<branche> » (journalisé)")
+    "first bootstrap of the authenticator registry refused: no trusted canonical "
+    "branch (neither AMEESH_CANON_REF / canon_ref in the host configuration, "
+    "nor an already applied commit); the commit read never decides by itself what "
+    "is canonical — registry unchanged, \"ameesh canon sync --bootstrap-ref "
+    "<branch>\" (logged)")
 #: L44 (0031) : même refus pour un canon qui n'est pas le canon par défaut
 BOOTSTRAP_REFUSED_OTHER = (
-    "premier amorçage du registre des authentificateurs du canon %s refusé : aucune "
-    "branche canonique de confiance (ni `ref` dans son entrée `canons` de la "
-    "configuration de l'hôte, ni commit déjà appliqué de ce canon) ; le commit lu ne "
-    "décide jamais lui-même de ce qui est canonique — registre de %s inchangé, "
-    "« ameesh canon sync --canon %s --bootstrap-ref <branche> » (journalisé)")
+    "first bootstrap of the authenticator registry of canon %s refused: no "
+    "trusted canonical branch (neither `ref` in its `canons` entry of the "
+    "host configuration, nor an already applied commit of this canon); the commit read "
+    "never decides by itself what is canonical — registry of %s unchanged, "
+    "\"ameesh canon sync --canon %s --bootstrap-ref <branch>\" (logged)")
 
 
 class _Refused(Exception):
@@ -636,8 +636,8 @@ def configured_ref(db: Db, canon: Canon | None = None) -> str:
 def _config_label(canon: Canon | None) -> str:
     """D'où vient la branche de confiance configurée de ce canon (messages)."""
     if canon is None or canon.is_default:
-        return "AMEESH_CANON_REF / canon_ref (configuration de l'hôte)"
-    return "ref de l'entrée `canons` du canon %s (configuration de l'hôte)" % canon.id
+        return "AMEESH_CANON_REF / canon_ref (host configuration)"
+    return "ref of the `canons` entry of canon %s (host configuration)" % canon.id
 
 
 def last_applied(db: Db, canon: str = "") -> dict | None:
@@ -662,8 +662,8 @@ def _applied_branch(root: canon_mod.Source, last: dict) -> str:
     commit = last["root_commit"]
     if not canon_mod.git_commit(root.repo, commit):
         raise _Refused(
-            "canon en retard sur le registre des authentificateurs : le dernier commit "
-            "appliqué %s est inconnu de ce clone — registre inchangé, ameesh canon sync "
+            "canon behind the authenticator registry: the last applied commit "
+            "%s is unknown to this clone — registry unchanged, ameesh canon sync "
             "--fetch" % commit[:12])
     path = (root.prefix + "/" if root.prefix else "") + "federation.yaml"
     raw = canon_mod.git_read(root.repo, commit, path)
@@ -672,11 +672,11 @@ def _applied_branch(root: canon_mod.Source, last: dict) -> str:
     try:
         manifest = canon_mod.load_yaml(raw.decode("utf-8"))
     except (UnicodeDecodeError, canon_mod.YamlError) as exc:
-        raise _Refused("federation.yaml illisible au dernier commit appliqué %s (%s) : "
-                       "branche canonique inconnue, registre inchangé" % (commit[:12], exc))
+        raise _Refused("unreadable federation.yaml at the last applied commit %s (%s): "
+                       "canonical branch unknown, registry unchanged" % (commit[:12], exc))
     if not isinstance(manifest, dict) or not isinstance(manifest.get("members") or [], list):
-        raise _Refused("federation.yaml invalide au dernier commit appliqué %s : branche "
-                       "canonique inconnue, registre inchangé" % commit[:12])
+        raise _Refused("invalid federation.yaml at the last applied commit %s: canonical "
+                       "branch unknown, registry unchanged" % commit[:12])
     root_id = str(manifest.get("root") or "canon")
     entry = next((m for m in manifest.get("members") or []
                   if isinstance(m, dict) and str(m.get("id")) == root_id), None)
@@ -685,8 +685,8 @@ def _applied_branch(root: canon_mod.Source, last: dict) -> str:
         return last["branch"]
     branch = canon_mod.remote_branch(root.repo, ref)
     if branch is None:
-        raise _Refused("ref %r du membre racine %s (manifeste du dernier commit appliqué "
-                       "%s) : pas une branche, registre inchangé" % (ref, root_id, commit[:12]))
+        raise _Refused("ref %r of root member %s (manifest of the last applied commit "
+                       "%s): not a branch, registry unchanged" % (ref, root_id, commit[:12]))
     return branch
 
 
@@ -701,8 +701,8 @@ def _trusted_branch(root: canon_mod.Source, last: dict | None, trusted_ref: str,
     if trusted_ref:
         branch = canon_mod.remote_branch(root.repo, trusted_ref)
         if branch is None:
-            raise _Refused("%r (%s) ne désigne pas une branche : branche canonique de "
-                           "confiance inconnue, registre inchangé"
+            raise _Refused("%r (%s) does not name a branch: trusted canonical branch "
+                           "unknown, registry unchanged"
                            % (trusted_ref, _config_label(canon)))
         trust = TRUST_CONFIG
     elif last is not None:
@@ -710,19 +710,19 @@ def _trusted_branch(root: canon_mod.Source, last: dict | None, trusted_ref: str,
     elif bootstrap_ref:
         branch = canon_mod.remote_branch(root.repo, bootstrap_ref)
         if branch is None:
-            raise _Refused("--bootstrap-ref %r ne désigne pas une branche : registre "
-                           "inchangé" % bootstrap_ref)
+            raise _Refused("--bootstrap-ref %r does not name a branch: registry "
+                           "unchanged" % bootstrap_ref)
         trust = TRUST_BOOTSTRAP
-        notes.append("AMORÇAGE du registre des authentificateurs : branche canonique de "
-                     "confiance %s fixée par --bootstrap-ref (journalisé)" % branch)
+        notes.append("BOOTSTRAP of the authenticator registry: trusted canonical "
+                     "branch %s set by --bootstrap-ref (logged)" % branch)
     else:
         if canon is not None and not canon.is_default:
             raise _Refused(BOOTSTRAP_REFUSED_OTHER % (canon.id, canon.id, canon.id))
         raise _Refused(BOOTSTRAP_REFUSED)
     if bootstrap_ref and trust != TRUST_BOOTSTRAP:
-        notes.append("--bootstrap-ref %s ignoré : %s" % (
-            bootstrap_ref, "registre déjà amorcé" if trust == TRUST_APPLIED
-            else "la configuration de l'hôte fixe la branche canonique"))
+        notes.append("--bootstrap-ref %s ignored: %s" % (
+            bootstrap_ref, "registry already bootstrapped" if trust == TRUST_APPLIED
+            else "the host configuration sets the canonical branch"))
     return branch, trust, notes
 
 
@@ -730,12 +730,12 @@ def _check_on_branch(source: canon_mod.Source, branch: str, why: str) -> None:
     """Le commit lu est-il atteignable depuis la branche canonique de confiance ?"""
     head = canon_mod.git_commit(source.repo, "refs/remotes/" + branch)
     if not head:
-        raise _Refused("%s : branche canonique %s (%s) introuvable dans %s (git fetch ?) — "
-                       "registre des authentificateurs inchangé"
+        raise _Refused("%s: canonical branch %s (%s) not found in %s (git fetch?) — "
+                       "authenticator registry unchanged"
                        % (source.member, branch, why, source.repo))
     if not canon_mod.git_contains(source.repo, source.commit, head):
-        raise _Refused("%s @ %s : commit absent de la branche canonique %s (%s, %s) — "
-                       "révision non canonique, registre des authentificateurs inchangé"
+        raise _Refused("%s @ %s: commit not on the canonical branch %s (%s, %s) — "
+                       "non-canonical revision, authenticator registry unchanged"
                        % (source.member, source.commit[:12], branch, head[:12], why))
 
 
@@ -743,9 +743,9 @@ def _check_descends(source: canon_mod.Source, floor: str | None) -> None:
     """Monotonie : jamais d'écriture d'un commit qui ne descend pas du dernier appliqué."""
     if floor and not canon_mod.git_contains(source.repo, floor, source.commit):
         raise _Refused(
-            "%s @ %s ne descend pas du dernier commit appliqué %s : canon en retard "
-            "(ameesh canon sync --fetch) ou historique réécrit — jamais de retour en "
-            "arrière, registre des authentificateurs inchangé"
+            "%s @ %s does not descend from the last applied commit %s: canon behind "
+            "(ameesh canon sync --fetch) or rewritten history — never going "
+            "backwards, authenticator registry unchanged"
             % (source.member, source.commit[:12], floor[:12]))
 
 
@@ -774,9 +774,9 @@ def _verify(canon: Canon, last: dict | None, trusted_ref: str,
         ref = str((entry or {}).get("ref") or canon_mod.DEFAULT_BRANCH)
         member_branch = canon_mod.remote_branch(source.repo, ref)
         if member_branch is None:
-            raise _Refused("%s : ref %r du manifeste, pas une branche — registre inchangé"
+            raise _Refused("%s: manifest ref %r is not a branch — registry unchanged"
                            % (source.member, ref))
-        _check_on_branch(source, member_branch, "manifeste du commit racine %s"
+        _check_on_branch(source, member_branch, "manifest of root commit %s"
                          % root.commit[:12])
         if last is not None:
             _check_descends(source, last["commits"].get(source.member))
@@ -798,7 +798,7 @@ def _record(db: Db, last: dict | None, canon: Canon, branch: str, trust: str, ho
                                                                       branch):
         head = storage.of(db).authenticators.journal_head(key)
         if head is None or head != expected:
-            raise _Concurrent("journal des synchronisations modifié pendant la transaction")
+            raise _Concurrent("sync journal modified during the transaction")
         return
     summary = {key: len(result.get(key) or []) for key in ("added", "updated", "revoked",
                                                            "frozen", "errors")}
@@ -808,7 +808,7 @@ def _record(db: Db, last: dict | None, canon: Canon, branch: str, trust: str, ho
         host=host or "", summary_json=json.dumps(summary, sort_keys=True),
         expected=expected, canon=key)
     if not appended:
-        raise _Concurrent("journal des synchronisations modifié pendant la transaction")
+        raise _Concurrent("sync journal modified during the transaction")
 
 
 def _lag(db: Db, canon: Canon, key: str = "") -> tuple[list[str], set[str]]:
@@ -853,7 +853,7 @@ def _partial(canon: Canon, unread: set[str]) -> list[str]:
     """Raisons de croire qu'une fiche Member a pu échapper à la lecture."""
     reasons = ["%s (%s)" % (f.code, f.where()) for f in canon.load_findings
                if f.severity == canon_mod.ERROR or f.code == "member-absent"]
-    reasons += ["source %s du registre non lue" % member for member in sorted(unread)]
+    reasons += ["registry source %s not read" % member for member in sorted(unread)]
     return reasons
 
 
@@ -919,26 +919,26 @@ def sync_authenticators(db: Db, canon: Canon, *, trusted_ref: str | None = None,
     if trusted_ref is None:
         trusted_ref = configured_ref(db, canon)
     if not canon.readable:
-        return AuthenticatorSync(AUTH_SKIPPED, "canon illisible : registre inchangé",
+        return AuthenticatorSync(AUTH_SKIPPED, "unreadable canon: registry unchanged",
                                  canon=key)
     if canon.untrusted:
-        return AuthenticatorSync(AUTH_SKIPPED, "canon NON APPROUVÉ (fichiers de travail) : "
-                                               "registre des authentificateurs inchangé",
+        return AuthenticatorSync(AUTH_SKIPPED, "canon NOT APPROVED (working files): "
+                                               "authenticator registry unchanged",
                                  canon=key)
     if not canon.sources:
-        return AuthenticatorSync(AUTH_SKIPPED, "aucune source lue : registre inchangé",
+        return AuthenticatorSync(AUTH_SKIPPED, "no source read: registry unchanged",
                                  canon=key)
     try:
         return storage.of(db).authenticators.under_registry_lock(
             lambda lock: _sync_locked(lock, canon, trusted_ref, bootstrap_ref, host, key))
     except receipts.RegistryLockError as exc:
-        return AuthenticatorSync(AUTH_REFUSED, "%s : transaction annulée" % exc, canon=key)
+        return AuthenticatorSync(AUTH_REFUSED, "%s: transaction rolled back" % exc, canon=key)
     except _Concurrent as exc:
-        return AuthenticatorSync(AUTH_REFUSED, "%s : transaction annulée, registre des "
-                                               "authentificateurs inchangé" % exc, canon=key)
+        return AuthenticatorSync(AUTH_REFUSED, "%s: transaction rolled back, authenticator "
+                                               "registry unchanged" % exc, canon=key)
     except DbError as exc:
-        return AuthenticatorSync(AUTH_REFUSED, "base : %s — transaction annulée, registre "
-                                               "des authentificateurs inchangé" % exc,
+        return AuthenticatorSync(AUTH_REFUSED, "database: %s — transaction rolled back, "
+                                               "authenticator registry unchanged" % exc,
                                  canon=key)
 
 
@@ -956,8 +956,8 @@ def _sync_locked(lock: receipts.RegistryLock, canon: Canon, trusted_ref: str,
     ahead, unread = _lag(tx, canon, key)
     if ahead:
         return AuthenticatorSync(AUTH_REFUSED, (
-            "canon en retard sur le registre des authentificateurs (déjà appliqué : %s) : "
-            "registre inchangé — ameesh canon sync --fetch" % ", ".join(ahead[:5])),
+            "canon behind the authenticator registry (already applied: %s): "
+            "registry unchanged — ameesh canon sync --fetch" % ", ".join(ahead[:5])),
             trust=trust, branch=branch, notes=notes, canon=key)
     partial = _partial(canon, unread)
     # contrôles faits, verrou détenu : la seule écriture du registre (de CE canon)
@@ -987,7 +987,7 @@ def _released(row: dict) -> bool:
 
 
 def _owner_label(value: str | None) -> str:
-    return "le canon %s" % value if value else "le canon par défaut"
+    return "canon %s" % value if value else "the default canon"
 
 
 def _write_declared(db: Db, name: str, values: dict) -> None:
@@ -1011,7 +1011,7 @@ def _set_placement(db: Db, name: str, host: str, verdict: placement_mod.Verdict)
     écrit sans profil évalué (il vaudrait pour n'importe quel profil).
     """
     if verdict.ok and verdict.profile is None:
-        raise ValueError("verdict de placement admis sans profil évalué : %s" % name)
+        raise ValueError("admitted placement verdict without evaluated profile: %s" % name)
     storage.of(db).canon.set_placement(name, host, ok=verdict.ok,
                                        diagnostic=verdict.diagnostic, ref=verdict.ref,
                                        profile=verdict.profile)
@@ -1027,11 +1027,11 @@ def _lineage_root(by_name: dict[str, dict], creator: str | None) -> tuple[dict |
     for _depth in range(registry._LINEAGE_MAX):
         row = by_name.get(name) if name else None
         if row is None:
-            return None, "créateur %s introuvable" % (name or "non déclaré")
+            return None, "creator %s not found" % (name or "undeclared")
         if not row.get("ephemeral") or row.get("canon_ref"):
             return row, ""
         name = row.get("created_by")
-    return None, "lignée de plus de %d créateurs" % registry._LINEAGE_MAX
+    return None, "lineage of more than %d creators" % registry._LINEAGE_MAX
 
 
 def _inherit_placements(db: Db, host: str, canon: Canon | None = None) -> None:
@@ -1055,11 +1055,11 @@ def _inherit_placements(db: Db, host: str, canon: Canon | None = None) -> None:
         if root is None:
             verdict = placement_mod.Verdict(
                 row["name"], host, False,
-                "lignée invérifiable (%s) : placement non hérité" % broken)
+                "unverifiable lineage (%s): placement not inherited" % broken)
         elif root.get("host") != host:
             verdict = placement_mod.Verdict(
                 row["name"], host, False,
-                "créateur %s placé sur %s, pas sur %s" % (
+                "creator %s placed on %s, not on %s" % (
                     root["name"], root.get("host") or "?", host),
                 root.get("placement_ref"))
         elif root.get("placement_ok") \
@@ -1068,9 +1068,9 @@ def _inherit_placements(db: Db, host: str, canon: Canon | None = None) -> None:
             # l'éphémère : rien n'en est hérité
             verdict = placement_mod.Verdict(
                 row["name"], host, False,
-                "profil divergé de celui évalué pour le créateur %s (évalué : %s ; "
-                "éphémère : %s) : placement non hérité" % (
-                    root["name"], root.get("placement_profile") or "aucun",
+                "profile diverged from the one evaluated for creator %s (evaluated: %s; "
+                "ephemeral: %s): placement not inherited" % (
+                    root["name"], root.get("placement_profile") or "none",
                     row.get("profile_now")),
                 root.get("placement_ref"), profile=row.get("profile_now"))
         else:
@@ -1182,9 +1182,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         # à cette fiche, aucune écriture.
         if row is not None and not mine(row) and row.get("canon_ref") \
                 and not row.get("ephemeral") and not _released(row):
-            message = ("agent %s déjà déclaré par %s (%s) : fiche ignorée, le premier "
-                       "canon qui déclare un nom le garde (le libérer : retirer sa fiche "
-                       "de son canon)" % (name, _owner_label(row.get("canon")),
+            message = ("agent %s already declared by %s (%s): card ignored, the first "
+                       "canon that declares a name keeps it (to release it: remove its card "
+                       "from its canon)" % (name, _owner_label(row.get("canon")),
                                           row.get("canon_ref")))
             findings.append(canon_mod.Finding(
                 NAME_CONFLICT, canon_mod.ERROR, message, path=agent.fiche.path,
@@ -1197,7 +1197,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
                 and row.get("host") in other_admitted.get(name, []):
             actions.append(SyncAction(
                 name, "laissé",
-                "tourne sur %s, hôte admis : « canon sync » ne le déplace pas"
+                "running on %s, an admitted host: \"canon sync\" does not move it"
                 % row.get("host")))
             continue
         reasons = block.reasons(name, [host])
@@ -1213,11 +1213,11 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         cwd, cwd_source = canon_mod.work_dir_for(canon.host(host), agent, admission)
         notes: list[str] = []
         if cwd_source == canon_mod.WORK_FROM_PLACEMENT:
-            notes.append("cwd hérité de la fiche Placement (%s), à migrer vers "
-                         "policy.work_dirs / work_roots de l'hôte" % cwd)
+            notes.append("cwd inherited from the Placement card (%s), to migrate to "
+                         "the host's policy.work_dirs / work_roots" % cwd)
         elif cwd is None:
-            notes.append("aucun dossier de travail : déclarer policy.work_dirs / "
-                         "work_roots / work_root dans la fiche de l'hôte")
+            notes.append("no working directory: declare policy.work_dirs / "
+                         "work_roots / work_root in the host card")
         values = {
             "harness": agent.harness or "other",
             "host": host,
@@ -1265,15 +1265,15 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         action.placement = verdict
         if reasons:
             action.blocked = reasons
-            notes.insert(0, "non réclamable : erreur bloquante du canon")
+            notes.insert(0, "not claimable: blocking canon error")
         if not verdict.ok:
-            notes.insert(0, "non réclamable : placement refusé — %s" % verdict.diagnostic)
-        action.detail = " ; ".join(notes)
+            notes.insert(0, "not claimable: placement refused — %s" % verdict.diagnostic)
+        action.detail = "; ".join(notes)
         actions.append(action)
         if row is not None and row.get("status") == "stopped" \
                 and (row.get("status_text") or "").startswith(STOP_MARK):
             if storage.of(db).canon.revive(name, REVIVED_TEXT, STOP_MARK):
-                actions.append(SyncAction(name, "réintégré", "arrêté par sync, de retour au canon"))
+                actions.append(SyncAction(name, "réintégré", "stopped by sync, back in the canon"))
         elif row is not None and (row.get("status_text") or "").startswith(PENDING_MARK):
             storage.of(db).canon.clear_pending_stop(name, PENDING_MARK)
 
@@ -1286,19 +1286,19 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         if not mine(row):
             continue  # L42 : ligne d'un autre canon, jamais touchée
         member = _member_of(row.get("canon_ref"))
-        unverifiable = ("membre %s non lu" % member if member not in loaded
-                        else "canon invalide" if block.global_errors else "")
+        unverifiable = ("member %s not read" % member if member not in loaded
+                        else "invalid canon" if block.global_errors else "")
         if unverifiable:
             # Fiche invérifiable : ni arrêté (le retrait n'est pas constaté), ni
             # réclamable (son responsable n'est plus confirmé par le canon, son
             # placement non plus).
             _clear_responsible(db, name, host, owner)
             verdict = placement_mod.Verdict(
-                name, host, False, "placement invérifiable : %s" % unverifiable,
+                name, host, False, "unverifiable placement: %s" % unverifiable,
                 row.get("placement_ref"))
             _set_placement(db, name, host, verdict)
             actions.append(SyncAction(
-                name, "laissé", "%s : retrait différé, non réclamable" % unverifiable,
+                name, "laissé", "%s: removal deferred, not claimable" % unverifiable,
                 block.reasons(name) if block.global_errors else [], verdict))
             continue
         cibles = other_admitted.get(name)
@@ -1308,14 +1308,14 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             # canon le déplace là (jamais hors d'un hôte admis).
             verdict = placement_mod.Verdict(
                 name, target, None,
-                "déplacé de %s : hôte admis %s, à évaluer par « ameesh canon sync » sur %s"
+                "moved from %s: admitted host %s, to be evaluated by \"ameesh canon sync\" on %s"
                 % (host, target, target), row.get("placement_ref"))
             storage.of(db).canon.move_host(
                 name, host, target=target, canon_ref=canon.agent(name).fiche.ref,
                 diagnostic=verdict.diagnostic, ref=verdict.ref)
             actions.append(SyncAction(
                 name, "déplacé",
-                "admis sur %s : non réclamable avant la synchronisation de cet hôte" % target,
+                "admitted on %s: not claimable until that host is synced" % target,
                 placement=verdict))
             continue
         why = "plus d'admission" if canon.agent(name) is not None else "fiche absente"
@@ -1333,13 +1333,13 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             actions.append(SyncAction(name, "arrêté", why, placement=verdict))
         else:
             actions.append(SyncAction(name, "arrêt demandé",
-                                      "%s : tour en cours, rien n'est tué" % why,
+                                      "%s: turn in progress, nothing is killed" % why,
                                       placement=verdict))
     for name, row in sorted(rows.items()):
         if canon.is_default and row.get("host") == host and not row.get("canon_ref") \
                 and not row.get("ephemeral") and name not in admitted_here:
             actions.append(SyncAction(name, "hors canon",
-                                      "inscrit à la main : non gouverné par sync"))
+                                      "registered by hand: not governed by sync"))
     _inherit_placements(db, host, canon)
     packages = sync_packages(db, canon, findings, ident=ident)
     findings.extend(packages.findings)
@@ -1423,8 +1423,8 @@ def sync_packages(db: Db, canon: Canon, findings: list[Finding], *,
                 continue
             old = before.get(package.id)
             if old is not None and old.get("present") and not mine(old):
-                message = ("WorkPackage %s déjà déclaré par %s (%s) : fiche ignorée, le "
-                           "premier canon qui déclare un identifiant le garde"
+                message = ("WorkPackage %s already declared by %s (%s): card ignored, the "
+                           "first canon that declares an identifier keeps it"
                            % (package.id, _owner_label(old.get("canon")),
                               old.get("canon_ref")))
                 done.conflicts.append(package.id)
@@ -1462,16 +1462,16 @@ def sync_packages(db: Db, canon: Canon, findings: list[Finding], *,
 def parse_ttl(text: str | None) -> float:
     """« 30m », « 2h », « 1d », « 3600 » → secondes, borné à 7 jours. Obligatoire."""
     if not text:
-        raise SpawnError("échéance obligatoire : --ttl 30m, 2h, 1d…")
+        raise SpawnError("deadline required: --ttl 30m, 2h, 1d…")
     match = _TTL_RE.match(text)
     if not match:
-        raise SpawnError("échéance illisible : %r (attendu 30m, 2h, 1d ou des secondes)" % text)
+        raise SpawnError("unreadable deadline: %r (expected 30m, 2h, 1d or seconds)" % text)
     seconds = float(match.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[
         match.group(2).lower()]
     if seconds <= 0:
-        raise SpawnError("échéance nulle")
+        raise SpawnError("zero deadline")
     if seconds > MAX_EPHEMERAL_TTL:
-        raise SpawnError("échéance trop lointaine pour un éphémère (maximum %d jours)"
+        raise SpawnError("deadline too far for an ephemeral (maximum %d days)"
                          % (MAX_EPHEMERAL_TTL // 86400))
     return seconds
 
@@ -1492,31 +1492,31 @@ def spawn(db: Db, name: str, creator: str, ttl_seconds: float, *,
     créateur racine.
     """
     if not NAME_RE.match(name or ""):
-        raise SpawnError("nom d'agent invalide : %r" % (name,))
+        raise SpawnError("invalid agent name: %r" % (name,))
     if not NAME_RE.match(creator or ""):
-        raise SpawnError("créateur invalide : %r" % (creator,))
+        raise SpawnError("invalid creator: %r" % (creator,))
     if name == creator:
-        raise SpawnError("un agent ne se crée pas lui-même")
+        raise SpawnError("an agent cannot create itself")
     # L42 (0031) : le nom ne doit être déclaré par AUCUN des canons configurés
     for one in (canon if isinstance(canon, (list, tuple)) else [canon]):
         if one is not None and one.readable and one.agent(name) is not None:
-            raise SpawnError("%s a une fiche dans le canon%s : ce n'est pas un éphémère"
+            raise SpawnError("%s has a card in the canon%s: it is not an ephemeral"
                              % (name, "" if one.is_default else " %s" % one.id))
     parent = storage.of(db).ephemerals.creator(creator)
     if parent is None:
-        raise SpawnError("créateur inconnu du registre : %s" % creator)
+        raise SpawnError("creator unknown to the registry: %s" % creator)
     if not (parent.get("responsible") or "").strip():
-        raise SpawnError("le créateur %s n'a pas d'humain responsable résolu (R14) : "
-                         "il ne peut pas transmettre de responsabilité" % creator)
+        raise SpawnError("creator %s has no resolved responsible human (R14): "
+                         "it cannot pass on responsibility" % creator)
     if not parent.get("alive"):
-        raise SpawnError("le créateur %s est un éphémère échu" % creator)
+        raise SpawnError("creator %s is an expired ephemeral" % creator)
     if parent.get("status") == "stopped":
-        raise SpawnError("le créateur %s est arrêté" % creator)
+        raise SpawnError("creator %s is stopped" % creator)
     created = storage.of(db).ephemerals.create(
         name, creator, cwd=os.path.abspath(os.path.expanduser(cwd)) if cwd else None,
         ttl_seconds=ttl_seconds)
     if created is None:
         if storage.of(db).ephemerals.exists(name):
-            raise SpawnError("un agent %s existe déjà" % name)
-        raise SpawnError("le créateur %s a changé pendant la création : réessayez" % creator)
+            raise SpawnError("an agent %s already exists" % name)
+        raise SpawnError("creator %s changed during creation: retry" % creator)
     return created

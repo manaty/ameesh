@@ -97,7 +97,7 @@ class DemandeTest(_Base):
                          ("request", ALICE, str(self.lot["id"]), "pending", None))
         self.assertEqual(self.lot_state(), "waiting_human")
         notes = [e["note"] for e in work.events(self.db, self.lot["id"])]
-        self.assertTrue(any(n.startswith("décision #1 demandée à human:alice : Fusionner")
+        self.assertTrue(any(n.startswith("decision #1 requested from human:alice: Fusionner")
                             for n in notes), notes)
         # au fil du projet, sur le lot : la question, les options, comment répondre
         texte = ""
@@ -105,8 +105,8 @@ class DemandeTest(_Base):
             for name in files:
                 with open(os.path.join(root, name), encoding="utf-8") as fh:
                     texte += fh.read()
-        for attendu in ("Décision #1 demandée à human:alice par orch", "a) oui, fusionner",
-                        "← recommandé", "Répondre : ameesh decide 1"):
+        for attendu in ("Decision #1 requested from human:alice by orch", "a) oui, fusionner",
+                        "← recommended", "Answer: ameesh decide 1"):
             self.assertIn(attendu, texte)
 
     def test_destinataire_dans_l_ordre(self):
@@ -159,16 +159,16 @@ class DemandeTest(_Base):
 
     def test_refus(self):
         cas = [
-            (dict(lot=None), "exactement un"),
-            (dict(new_lot="x"), "exactement un"),
-            (dict(lot="9999"), "introuvable"),
-            (dict(options=["a=un", "a=deux"]), "en double"),
-            (dict(options=["a b=un"]), "illisible"),
-            (dict(recommend="c"), "pas une des options"),
-            (dict(options=[], recommend="a"), "sans option"),
-            (dict(why="parce que"), "accompagne --recommend"),
-            (dict(question="  "), "question vide"),
-            (dict(due_ts=time.time() - 10), "déjà passée"),
+            (dict(lot=None), "exactly one"),
+            (dict(new_lot="x"), "exactly one"),
+            (dict(lot="9999"), "not found"),
+            (dict(options=["a=un", "a=deux"]), "duplicate option"),
+            (dict(options=["a b=un"]), "unreadable"),
+            (dict(recommend="c"), "not one of the options"),
+            (dict(options=[], recommend="a"), "without options"),
+            (dict(why="parce que"), "goes with --recommend"),
+            (dict(question="  "), "empty question"),
+            (dict(due_ts=time.time() - 10), "already passed"),
         ]
         for kw, attendu in cas:
             with self.subTest(kw=kw), self.assertRaises(decisions.DecisionError) as ctx:
@@ -177,7 +177,7 @@ class DemandeTest(_Base):
         work.close(self.db, self.lot["id"], abandoned=True)
         with self.assertRaises(decisions.DecisionError) as ctx:
             self.ask()
-        self.assertIn("déjà closed", str(ctx.exception))
+        self.assertIn("already closed", str(ctx.exception))
         self.assertEqual(self.db.query("SELECT count(*)::int AS n FROM agent_mailbox")[0]["n"], 0)
 
     def test_echeances(self):
@@ -208,9 +208,9 @@ class DemandeTest(_Base):
                          [{"key": "a", "label": "oui"}, {"key": "b", "label": "non"}])
         texte = self.mesh("decisions", env=self.mesh_env()).stdout
         for attendu in ("requests from agents (oldest first)",
-                        "Fusionner la branche avant la démo ?", "a) oui   ← recommandé",
-                        "recommandation : a — la démo en dépend", "[URGENT]",
-                        "répondre : ameesh decide 1"):
+                        "Fusionner la branche avant la démo ?", "a) oui   ← recommended",
+                        "recommendation: a — la démo en dépend", "[URGENT]",
+                        "answer: ameesh decide 1"):
             self.assertIn(attendu, texte)
         # le lot tenu par la demande n'est pas répété parmi les lots en attente
         self.assertNotIn("work items waiting for a human", texte)
@@ -218,7 +218,7 @@ class DemandeTest(_Base):
         proc = self.mesh("decide", "ask", "--lot", "RT-9", "--question", "x ?",
                          env=self.mesh_env())
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("demandeur non lié", proc.stderr)
+        self.assertIn("unbound requester", proc.stderr)
         self.assertEqual(len(decisions.pending(self.db)), 2)
 
 
@@ -246,15 +246,15 @@ class ReponseTest(_Base):
         self.assertEqual((rows[0]["sender"], rows[0]["kind"], rows[0]["work_item_id"],
                           rows[0]["delivered_at"]), (ALICE, "reply", str(self.lot["id"]), None))
         self.assertEqual(rows[0]["payload"]["decision_answer"]["option"], "a")
-        self.assertIn("Décision #1 — réponse du propriétaire human:alice (cli)", rows[0]["body"])
-        self.assertIn("Texte exact : « a »", rows[0]["body"])
+        self.assertIn("Decision #1 — answer from owner human:alice (cli)", rows[0]["body"])
+        self.assertIn('Exact text: "a"', rows[0]["body"])
         self.assertEqual(decisions.pending(self.db), [])
         notes = [e["note"] for e in work.events(self.db, self.lot["id"])]
-        self.assertTrue(any("décision #1 répondue par human:alice (cli) : option a" in n
+        self.assertTrue(any("decision #1 answered by human:alice (cli): option a" in n
                             and "le lot revient en build" in n for n in notes), notes)
         with self.assertRaises(decisions.DecisionError) as ctx:
             self.answer(view["id"], "b")
-        self.assertIn("déjà répondue par human:alice", str(ctx.exception))
+        self.assertIn("already answered by human:alice", str(ctx.exception))
 
     def test_demande_et_reponse_restent_reveillantes(self):
         """L125 : ni la demande (vers human:<id>) ni la réponse au demandeur
@@ -287,7 +287,7 @@ class ReponseTest(_Base):
         view = self.ask()
         with self.assertRaises(decisions.DecisionError) as ctx:
             self.answer(view["id"], "a", human=BOB)
-        self.assertIn("adressée à human:alice", str(ctx.exception))
+        self.assertIn("addressed to human:alice", str(ctx.exception))
         # sans destinataire précis : tout humain répond
         self.db.execute("UPDATE agent_registry SET responsible = NULL")
         autre = work.add(self.db, title="sans responsable")
@@ -310,7 +310,7 @@ class ReponseTest(_Base):
         view = self.ask()
         with self.assertRaises(decisions.DecisionError) as ctx:
             decisions.withdraw(self.cfg, self.db, view["id"], requester="dev1")
-        self.assertIn("seul son demandeur (orch)", str(ctx.exception))
+        self.assertIn("only its requester (orch)", str(ctx.exception))
         out = decisions.withdraw(self.cfg, self.db, view["id"], requester="orch",
                                  why="réglé autrement")
         self.assertEqual((out["decision"]["state"], out["decision"]["withdrawn"]["why"]),
@@ -318,7 +318,7 @@ class ReponseTest(_Base):
         self.assertEqual(self.lot_state(), "build")
         with self.assertRaises(decisions.DecisionError) as ctx:
             self.answer(view["id"], "a")
-        self.assertIn("retirée par orch", str(ctx.exception))
+        self.assertIn("withdrawn by orch", str(ctx.exception))
         closed = decisions.history(self.db)
         self.assertEqual([(r["id"], r["state"]) for r in closed], [(1, "withdrawn")])
 
@@ -337,7 +337,7 @@ class SignatureTest(_Base):
             self.answer(view["id"], "a")
         message = str(ctx.exception)
         digest = decisions.answer_digest(view, "a", "a", ALICE)
-        self.assertIn("réponse SIGNÉE exigée", message)
+        self.assertIn("SIGNED answer required", message)
         self.assertIn("--hash %s" % digest, message)
         self.assertIn("ameesh decide 1 a --key", message)
         # une clé d'agent ne porte pas l'autorité du propriétaire
@@ -348,7 +348,7 @@ class SignatureTest(_Base):
         # dans le chat : jamais de signature
         with self.assertRaises(decisions.DecisionError) as ctx:
             self.answer(view["id"], "a", channel="chat", key_path=agent_key)
-        self.assertIn("pas dans le chat", str(ctx.exception))
+        self.assertIn("not in the chat", str(ctx.exception))
         key = self.owner_key()
         out = self.answer(view["id"], "a", key_path=key)
         answer = out["decision"]["answer"]
@@ -360,7 +360,7 @@ class SignatureTest(_Base):
         self.assertEqual(row["consumed_by"], "decision:1")
         ok, detail = decisions.verify_proof(self.db, out["decision"])
         self.assertTrue(ok, detail)
-        self.assertIn("SIGNÉE", self.db.query(
+        self.assertIn("SIGNED", self.db.query(
             "SELECT body FROM agent_mailbox WHERE recipient = 'orch'")[0]["body"])
         # la clé révoquée depuis : la preuve ne vaut plus
         authority.revoke_key(self.db, "alice")
@@ -394,13 +394,13 @@ class IdentiteTest(_Base):
         self.assertEqual((who.human, who.channel), (ALICE, "cli"))
 
     def test_session_d_agent_refusee(self):
-        for env, attendu in (({"AGENT_MAIL_NAME": "orch"}, "celle de l'agent orch"),
-                             ({"AMEESH_RUNNER_ID": "r1"}, "menée par l'exécuteur r1")):
+        for env, attendu in (({"AGENT_MAIL_NAME": "orch"}, "belongs to agent orch"),
+                             ({"AMEESH_RUNNER_ID": "r1"}, "run by runner r1")):
             with self.subTest(env=env), mock.patch.dict(os.environ, env), \
                     self.assertRaises(decisions.DecisionError) as ctx:
                 decisions.answering_human(self.cfg, self.db, **_clean_chain())
             self.assertIn(attendu, str(ctx.exception))
-            self.assertIn("seul un humain répond", str(ctx.exception))
+            self.assertIn("only a human answers", str(ctx.exception))
 
     def test_ancetre_agent_refuse(self):
         """Un agent qui retire AGENT_MAIL_NAME de sa commande reste visible
@@ -409,7 +409,7 @@ class IdentiteTest(_Base):
         with self.assertRaises(decisions.DecisionError) as ctx:
             decisions.human_session(self.cfg, self.db, chain=[101, 102],
                                     environ_of=lambda pid: envs.get(pid))
-        self.assertIn("processus 102 : agent orch mené par runner-1", str(ctx.exception))
+        self.assertIn("process 102: agent orch run by runner-1", str(ctx.exception))
         self.assertIsNone(decisions.agent_in_ancestry(chain=[101], environ_of=lambda p: None))
 
     def test_session_liee_refusee(self):
@@ -421,7 +421,7 @@ class IdentiteTest(_Base):
                         harness="claude", by=ALICE)
         with self.assertRaises(decisions.DecisionError) as ctx:
             decisions.human_session(self.cfg, self.db, **_clean_chain())
-        self.assertIn("liée à l'agent externe1", str(ctx.exception))
+        self.assertIn("bound to agent externe1", str(ctx.exception))
 
     def chat_record(self, **over):
         record = {"schema": chat.STATE_SCHEMA, "name": "chat-alice", "human": ALICE,
@@ -467,13 +467,13 @@ class IdentiteTest(_Base):
             decisions.answering_human(
                 self.cfg, self.db, chain=[os.getpid(), 7],
                 environ_of=lambda pid: {"AGENT_MAIL_NAME": "orch"} if pid == 7 else {})
-        self.assertIn("processus 7 : agent orch", str(ctx.exception))
+        self.assertIn("process 7: agent orch", str(ctx.exception))
 
     def test_cli_un_agent_ne_repond_pas(self):
         self.ask()
         proc = self.mesh("decide", "1", "a", env=self.mesh_env(AGENT_MAIL_NAME="orch"))
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("seul un humain répond", proc.stderr)
+        self.assertIn("only a human answers", proc.stderr)
         proc = self.mesh("decide", "1", "a", env=self.mesh_env(AMEESH_RUNNER_ID="r1"))
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(decisions.get(self.db, 1)["state"], "pending")
@@ -490,7 +490,7 @@ class IdentiteTest(_Base):
                           out["decision"]["answer"]["channel"]),
                          ("b, pas avant lundi", ALICE, "cli"))
         proc = self.mesh("decide", "show", "1", env=self.mesh_env())
-        self.assertIn("répondue par human:alice (cli)", proc.stdout)
+        self.assertIn("answered by human:alice (cli)", proc.stdout)
         proc = self.mesh("decisions", "--all", env=self.mesh_env())
         self.assertIn("answered or withdrawn requests", proc.stdout)
 
@@ -578,7 +578,7 @@ class ChatTest(_Base):
         code, calls = self.run_chat(chain=[5], environ_of=lambda pid: {
             "AGENT_MAIL_NAME": "orch", "AMEESH_RUNNER_ID": "attach:x@h"})
         self.assertEqual((code, calls), (1, []))
-        self.assertIn("processus 5 : agent orch mené par attach:x@h", self.err.getvalue())
+        self.assertIn("process 5: agent orch run by attach:x@h", self.err.getvalue())
         self.assertIsNone(registry.get(self.db, "chat-alice"))
 
     def test_un_agent_mene_du_meme_nom_n_est_jamais_pris(self):
@@ -648,7 +648,7 @@ class VisibiliteTest(_Base):
                           ("decision_pending", 2, "orch", ALICE, False)])
         self.assertNotEqual(exploitation.alert_key(alertes[0]),
                             exploitation.alert_key(alertes[1]))
-        self.assertIn("répondre : ameesh decide 1", alertes[0]["detail"])
+        self.assertIn("answer: ameesh decide 1", alertes[0]["detail"])
         later = [a for a in exploitation.alerts(self.cfg, self.db, now=now + 3700)
                  if a["type"] == "decision_overdue"]
         self.assertEqual([a["decision"] for a in later], [view["id"]])
@@ -695,19 +695,19 @@ class VisibiliteTest(_Base):
                                                              "urgent", "overdue")},
                          {"viewer": ALICE, "pending": 2, "mine": 2, "urgent": 1, "overdue": 0})
         first = projects.format_text(view, 120).splitlines()[0]
-        self.assertTrue(first.startswith("2 décisions t'attendent, la plus ancienne depuis "),
+        self.assertTrue(first.startswith("2 decisions waiting for you, the oldest for "),
                         first)
-        self.assertIn("(dont 1 urgente)", first)
+        self.assertIn("(of which 1 urgent)", first)
         autre = projects.snapshot(self.db, paid_harnesses=(), viewer=BOB)
         self.assertEqual(autre["decisions"]["mine"], 0)
         self.assertTrue(projects.format_text(autre, 120).startswith("projects — "))
         agent = projects.snapshot(self.db, paid_harnesses=())
         self.assertTrue(projects.format_text(agent, 120).startswith(
-            "2 décisions attendent un humain"))
+            "2 decisions waiting for a human"))
         proc = self.mesh("projects", "--json", env=self.mesh_env())
         self.assertEqual(json.loads(proc.stdout)["decisions"]["mine"], 2)
         proc = self.mesh("projects", env=self.mesh_env(AGENT_MAIL_NAME="orch"))
-        self.assertIn("2 décisions attendent un humain", proc.stdout)
+        self.assertIn("2 decisions waiting for a human", proc.stdout)
 
 
 class PlateformeTest(unittest.TestCase):
