@@ -124,10 +124,10 @@ def thread_created_ts(thread: str | None) -> float | None:
 # le plan de correction (pur : aucune écriture)
 # --------------------------------------------------------------------------
 
-def _price(prices: dict, harness: str, model: str) -> list:
-    if model and model in prices:
-        return list(prices[model])
-    return cost_mod.max_price_of(prices, harness)
+def _price(prices: dict, harness: str, model: str) -> list | None:
+    """Le tarif du modèle, sinon le majorant de sa famille ; None sans l'un ni
+    l'autre (L225 : jamais le tarif d'une autre famille)."""
+    return cost_mod.known_price(prices, model) or cost_mod.max_price_of(prices, harness)
 
 
 def _usd(harness: str, tokens: list, triplet: list) -> float:
@@ -231,7 +231,12 @@ def plan(rows: Iterable[dict], *, prices: dict,
         if row["harness"] == "claude" and current is not None:
             fix(row, "modele", "modèle « inconnu » → %s (%s)" % (model, source), model=model)
             continue
-        usd = round(_usd(row["harness"], tokens, _price(prices, row["harness"], model)), 6)
+        triplet = _price(prices, row["harness"], model)
+        if triplet is None:
+            fix(row, "modele", "modèle « inconnu » → %s (%s), sans tarif au barème : coût "
+                "inchangé" % (model, source), model=model)
+            continue
+        usd = round(_usd(row["harness"], tokens, triplet), 6)
         old = float(row.get("usd") or 0.0) if current is None else float(current)
         values = {"model": model}
         if abs(usd - old) >= 1e-6:
@@ -264,8 +269,9 @@ def _claude_cumul(first: dict, others: list, prices: dict, fix, repriced: dict) 
         return
     tokens = _tokens(first)
     model = first.get("model") or ""
-    if model in prices:
-        estimate = _usd("claude", tokens, prices[model])
+    known = cost_mod.known_price(prices, model)
+    if known:
+        estimate = _usd("claude", tokens, known)
         how = "barème %s" % model
     else:
         spent = sum(float(r.get("usd") or 0.0) for r in others)
@@ -275,7 +281,10 @@ def _claude_cumul(first: dict, others: list, prices: dict, fix, repriced: dict) 
             estimate = (tokens[0] + tokens[1]) * spent / read
             how = "coût par jeton relu des %d autres tours de la session" % len(others)
         else:
-            estimate = _usd("claude", tokens, cost_mod.max_price_of(prices, "claude"))
+            majorant = cost_mod.max_price_of(prices, "claude")
+            if majorant is None:
+                return                  # L225 : aucun tarif claude, pas d'estimation sûre
+            estimate = _usd("claude", tokens, majorant)
             how = "tarif le plus cher connu"
     if usd <= CUMUL_FACTOR * estimate or usd - estimate <= CUMUL_MIN_USD:
         return
@@ -303,7 +312,13 @@ def _codex_cumul(first: dict, prices: dict, fix, repriced: dict,
         model = first.get("model") or ""
         if model in UNKNOWN_MODELS and codex_model:
             model = codex_model(first["session"]) or ""
-        usd = round(_usd("codex", delta, _price(prices, "codex", model)), 6)
+        triplet = _price(prices, "codex", model)
+        if triplet is None:
+            fix(first, "cumul", "usage cumulé du fil repris compté pour un tour ; modèle %s "
+                "sans tarif au barème" % (model or "inconnu"),
+                void_reason="%s : usage du fil repris sans tarif" % cost_mod.UNPRICED_REASON)
+            return
+        usd = round(_usd("codex", delta, triplet), 6)
         repriced[int(first["id"])] = delta
         fix(first, "cumul", "usage cumulé du fil repris (%s jetons d'entrée) compté pour un "
             "tour ; total d'avant le tour lu dans le journal du fil" % cumulative[0],

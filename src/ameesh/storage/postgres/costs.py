@@ -50,7 +50,7 @@ class TurnCosts(interface.TurnCosts):
     def insert(self, *, agent, harness, turn, model, session, usd, input_tokens,
                cached_input_tokens, output_tokens, cum_usd, cum_input_tokens,
                cum_cached_input_tokens, cum_output_tokens, account=None,
-               spend_key=None) -> bool:
+               spend_key=None, void_reason=None) -> bool:
         cols = ["agent", "harness", "turn", "model", "session", "usd",
                 "input_tokens", "cached_input_tokens", "output_tokens",
                 "cum_usd", "cum_input_tokens", "cum_cached_input_tokens",
@@ -63,6 +63,10 @@ class TurnCosts(interface.TurnCosts):
             # nommé — un hôte sans comptes déclarés n'en dépend pas.
             cols.append("account")
             values.append(account)
+        if void_reason is not None:
+            # L225 : tour sans tarif connu ni majorant sûr, écarté dès l'écriture
+            cols.append("void_reason")
+            values.append(void_reason)
         suffix = ""
         if spend_key is not None:
             # L60 (migration 0041) : un marqueur comptable n'écrit qu'une ligne,
@@ -106,6 +110,19 @@ class TurnCosts(interface.TurnCosts):
             " and void_reason is null and harness in (" + ", ".join(["%s"] * len(names)) + ")",
             tuple([float(from_ts), float(to_ts)] + names))
         return float(rows[0]["usd"]) if rows else 0.0
+
+    def unpriced(self, since_ts, prefix) -> list[dict]:
+        return self.db.query(
+            "SELECT agent, harness, coalesce(model, '') AS model, count(*) AS turns,"
+            " sum(input_tokens)::bigint AS input_tokens,"
+            " sum(cached_input_tokens)::bigint AS cached_input_tokens,"
+            " sum(output_tokens)::bigint AS output_tokens,"
+            " extract(epoch from min(recorded_at))::float8 AS first_ts,"
+            " extract(epoch from max(recorded_at))::float8 AS last_ts"
+            " FROM turn_costs WHERE recorded_at >= to_timestamp(%s)"
+            " AND starts_with(void_reason, %s)"
+            " GROUP BY agent, harness, coalesce(model, '') ORDER BY agent, harness, model",
+            (float(since_ts), prefix))
 
     # -- corrections tracées (L95, migration 0043) ---------------------------
     def ledger(self, *, since_ts=None) -> list[dict]:
