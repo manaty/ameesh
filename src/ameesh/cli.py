@@ -777,6 +777,53 @@ def _register_done(cfg: Config, name: str, key: list) -> None:
         pass
 
 
+def hook_foreign_harness(tool: str) -> str:
+    """L224 : le harnais du tour (`AMEESH_HARNESS`, posé par l'exécuteur)
+    quand ce hook vient d'un AUTRE harnais ; "" sinon.
+
+    Un processus lancé pendant le tour (`codex exec` de relecture sous un
+    tour claude) hérite de l'environnement du tour : son hook se présentait
+    sous l'identité de l'agent, avec sa propre session (incident mesh-design
+    du 2026-10-11)."""
+    attendu = os.environ.get("AMEESH_HARNESS") or ""
+    return attendu if attendu and tool != attendu else ""
+
+
+def _foreign_hook_refused(cfg: Config, bk, name: str, tool: str, attendu: str,
+                          session_id) -> None:
+    """L224 : refus dit sur stderr à chaque fois, journalisé au fil une seule
+    fois par (harnais, session) — un PostToolUse par appel d'outil sinon."""
+    session = str(session_id or "")
+    print("agent-mail: hook %s refused for %s (harness of the turn: %s; session %s) — "
+          "neither registration nor mail" % (tool, name, attendu, session or "?"),
+          file=sys.stderr)
+    if bk.kind != "pg":
+        return
+    import hashlib
+    marque = os.path.join(cfg.state_dir, "hooks", "%s.refus-%s" % (
+        name, hashlib.sha256(("%s\0%s" % (tool, session)).encode()).hexdigest()[:16]))
+    if os.path.exists(marque):
+        return
+    try:
+        os.makedirs(os.path.dirname(marque), mode=0o700, exist_ok=True)
+        with open(marque, "w", encoding="utf-8") as fh:
+            fh.write("%s %s\n" % (tool, session))
+    except OSError:
+        pass
+    try:
+        row = storage.of(bk.db).agents.get(name)
+    except db_mod.DbError:
+        row = None
+    fil.record(cfg, bk.db, sender="ameesh", recipients=[name],
+               text="Hook %s refused for %s: the turn runs under %s. Session %s "
+                    "is not the agent's (process launched during the turn with "
+                    "its environment): neither registered nor served mail."
+                    % (tool, name, attendu, session or "?"),
+               project=fil.project_for(cfg, fil.agent_project(row)),
+               meta={"action": "hook-refuse", "harness": tool, "attendu": attendu,
+                     "session": session})
+
+
 def hook_subagent(data: dict) -> str:
     """L133 : identifiant du sous-agent où ce hook se déclenche ; "" pour la
     session principale.
@@ -838,6 +885,12 @@ def cmd_hook(cfg: Config, tool: str) -> int:
                   % (binding.name, binding.reason), file=sys.stderr)
         return 0
     name = binding.name
+    attendu = hook_foreign_harness(tool)
+    if attendu:
+        # L224 : un id de session ne vient que du harnais de l'agent ; le
+        # courrier non plus n'est remis qu'à lui.
+        _foreign_hook_refused(cfg, bk, name, tool, attendu, data.get("session_id"))
+        return 0
     # L166 : sous bail, la session de l'agent est celle que l'exécuteur lit
     # dans le flux du harnais, jamais celle d'un hook. dsh déclenche les hooks
     # de ses agents enfants (sous-agent, fourche) avec LEUR session et sans

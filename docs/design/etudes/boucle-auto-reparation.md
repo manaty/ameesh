@@ -1,7 +1,7 @@
 ---
 type: Study
-title: "Étude — boucle de détection et de réparation automatique des bugs"
-description: "Comment un orchestrateur de tickets existant détecte et répare automatiquement les bugs remontés par les interactions, ce qui marche, ses limites, et la transposition générique à ameesh."
+title: "Study — automatic bug detection and repair loop"
+description: "How an existing ticket orchestrator automatically detects and repairs bugs surfaced by interactions, what works, its limits, and the generic transposition to ameesh."
 status: draft
 tags: [auto-reparation, signaux, triage, verification, cloture]
 generated: { by: "mesh-design-etude/claude-opus-5-5", at: "2026-10-04T03:05:00+02:00" }
@@ -10,71 +10,71 @@ stale_after: 2027-04-04
 
 # Source
 
-Étude en lecture seule d'un orchestrateur de tickets existant, en production,
-qui reçoit des signaux d'erreurs et de conversations, ouvre des lots, fait
-implémenter les correctifs par des agents, vérifie, fait relire et livre. Les
-références précises (fichiers, lignes) sont conservées hors de ce dépôt (règle
+Read-only study of an existing ticket orchestrator, in production,
+that receives error and conversation signals, opens lots, has agents
+implement the fixes, verifies, has them reviewed and delivers. The
+precise references (files, lines) are kept outside this repository (rule
 [0015](../decisions/0015-interfaces-des-facades.md)).
 
-# Le circuit observé
+# The observed pipeline
 
-1. **Signaux** : webhooks d'un outil de suivi d'erreurs (avec trace et
-   occurrences), alertes d'audit (rafales d'erreurs serveur, empreinte
-   déterministe, récidive = commentaire), conversations avec un agent (qui trie
-   bug / évolution / question et cherche les doublons), vérificateur de données
-   (audit de lignes de production + second regard contradictoire, verdict
-   « expliqué / correction de données / correction de code », classe active ou
-   historique), outil de tickets externe (routage vers le dépôt avec seuil de
-   confiance). Corrélation avec les déploiements par fenêtre temporelle.
-2. **Déduplication en trois étages** : empreinte structurée (type, zone,
-   observé, attendu, discriminants), préfiltre bon marché, décision finale
-   conservatrice (préférer les faux négatifs). Un seul lot actif par ticket.
-3. **Triage** : bug → réparation automatique ; évolution → jamais
-   automatiquement, attente d'un humain si le demandeur n'est pas de l'équipe ;
-   correction de données → proposition revue par un humain, jamais exécutée
-   seule. Échecs d'exécution → une relance, puis un ticket d'auto-guérison
-   dédupliqué ; blocages d'infrastructure envoyés aux ops, pas au demandeur.
-4. **Réparation** : clone et branche dédiés, reproduire d'abord, plus petit
-   correctif, tests obligatoires, rapport ; exécution lourde isolée ; secrets
-   retirés de l'environnement de l'agent, jeton de push injecté seulement au
-   push. **Gardes sur le diff** : substituts de dépendances, portée autorisée,
-   changements de contrat (DDL, routes, champs de réponse, schémas d'outils)
-   → attente d'un humain avec **approbation liée à l'empreinte du diff** et
-   patch rejouable.
-5. **Vérification** : commandes de vérification locales, puis CI, puis QA
-   automatique (couverture selon le type de fichier, CI verte), correcteur de
-   CI rouge, boucle bornée à deux ; conflits signalés, jamais résolus seuls ;
-   suivi des PR laissées en plan.
-6. **Clôture** : fusion vers la branche d'intégration après QA verte ; la
-   promotion vers la pré-production reste humaine ; notification idempotente du
-   demandeur à chaque étape.
+1. **Signals**: webhooks from an error tracking tool (with stack trace and
+   occurrences), audit alerts (bursts of server errors, deterministic
+   fingerprint, recurrence = comment), conversations with an agent (which sorts
+   bug / enhancement / question and looks for duplicates), data checker
+   (audit of production rows + adversarial second look, verdict
+   "explained / data fix / code fix", active or
+   historical class), external ticket tool (routing to the repository with a
+   confidence threshold). Correlation with deployments by time window.
+2. **Three-stage deduplication**: structured fingerprint (type, area,
+   observed, expected, discriminators), cheap prefilter, conservative final
+   decision (prefer false negatives). Only one active lot per ticket.
+3. **Triage**: bug → automatic repair; enhancement → never
+   automatic, waits for a human if the requester is not on the team;
+   data fix → proposal reviewed by a human, never executed
+   alone. Execution failures → one retry, then a deduplicated self-healing
+   ticket; infrastructure blockers sent to ops, not to the requester.
+4. **Repair**: dedicated clone and branch, reproduce first, smallest
+   fix, mandatory tests, report; heavy execution isolated; secrets
+   removed from the agent's environment, push token injected only at
+   push time. **Guards on the diff**: dependency substitutes, allowed scope,
+   contract changes (DDL, routes, response fields, tool schemas)
+   → wait for a human with **approval bound to the diff's digest** and a
+   replayable patch.
+5. **Verification**: local verification commands, then CI, then automatic
+   QA (coverage according to file type, green CI), red-CI
+   fixer, loop bounded to two; conflicts reported, never resolved alone;
+   tracking of abandoned PRs.
+6. **Closure**: merge into the integration branch after green QA; the
+   promotion to pre-production stays human; idempotent notification of the
+   requester at each step.
 
-# Limites observées (à ne pas reproduire)
+# Observed limits (not to reproduce)
 
-- décisions lues dans du texte libre ou des réactions de messagerie (une
-  réaction sans rapport a démarré une exécution) ;
-- **approbation implicite par le silence** après un délai d'escalade ;
-- une seule réplique, espaces de travail éphémères, état en mémoire → lots
-  orphelins à répétition ; interrupteurs non durables ;
-- transitions déduites par corrélation, sans journal d'événements ;
-- pas de surveillance après déploiement ni de réouverture sur récidive ;
-- fausses alertes de la porte de gouvernance et approbations restées sans
-  réponse ; un agent de support qui créait plus de travail qu'il n'en
-  économisait.
+- decisions read from free text or messaging reactions (an
+  unrelated reaction started an execution);
+- **implicit approval by silence** after an escalation delay;
+- a single replica, ephemeral workspaces, in-memory state → repeatedly
+  orphaned lots; non-durable switches;
+- transitions inferred by correlation, without an event log;
+- no post-deployment monitoring nor reopening on recurrence;
+- false alarms from the governance gate and approvals left
+  unanswered; a support agent that created more work than it
+  saved.
 
-# Transposition à ameesh (capacités génériques)
+# Transposition to ameesh (generic capabilities)
 
-| # | Capacité | ameesh a déjà | Manque |
+| # | Capability | ameesh already has | Missing |
 |---|---|---|---|
-| A1 | entrée des signaux (webhooks authentifiés, e-mail, fil) | fil, boîte | table `signals`, adaptateurs |
-| A2 | classifieur (nature, gravité, confiance ; infra vs décision) | — | tout |
-| A3 | empreinte et déduplication à deux niveaux (occurrence, classe) | — | tout |
-| A4 | corrélation avec une version déployée | — | tout |
-| A5 | **politique d'auto-réparation au canon** (sources, natures, gravités, budgets, chemins sensibles, interrupteur durable) | canon, politiques de revue | le schéma |
-| A6 | exécution de réparation (reproduire d'abord, rapport, gardes de diff) | exécuteur, sessions | gardes de diff |
-| A7 | porte de changement sur l'empreinte du diff, patch rejouable | reçus, porte d'actions | branchement |
-| A8 | preuves de vérification (commande, sortie, empreinte) | états `qa`/`build` | preuves |
-| A9 | demande à un humain (destinataire résolu par le canon, échéance par gravité, remplaçants, escalade) — **jamais d'approbation implicite pour une action irréversible** | `waiting_human`, file des décisions | délais et escalade |
-| A10 | surveillance après livraison, réouverture sur récidive, notification du demandeur | — | tout |
-| A11 | auto-guérison des exécutions (relance, puis lot) | — | tout |
-| A12 | balayage avec chien de garde, lots bloqués, résumé dans le fil | partiel | le reste |
+| A1 | signal intake (authenticated webhooks, email, thread) | thread, inbox | `signals` table, adapters |
+| A2 | classifier (nature, severity, confidence; infra vs decision) | — | everything |
+| A3 | fingerprint and two-level deduplication (occurrence, class) | — | everything |
+| A4 | correlation with a deployed version | — | everything |
+| A5 | **self-repair policy in the canon** (sources, natures, severities, budgets, sensitive paths, durable switch) | canon, review policies | the schema |
+| A6 | repair execution (reproduce first, report, diff guards) | runner, sessions | diff guards |
+| A7 | change gate on the diff's digest, replayable patch | receipts, action gate | wiring |
+| A8 | verification evidence (command, output, digest) | `qa`/`build` states | evidence |
+| A9 | request to a human (recipient resolved by the canon, deadline by severity, substitutes, escalation) — **never implicit approval for an irreversible action** | `waiting_human`, decision queue | deadlines and escalation |
+| A10 | post-delivery monitoring, reopening on recurrence, requester notification | — | everything |
+| A11 | self-healing of executions (retry, then lot) | — | everything |
+| A12 | sweep with watchdog, blocked lots, summary in the thread | partial | the rest |

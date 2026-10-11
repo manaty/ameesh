@@ -2419,13 +2419,13 @@ def load(root: str, *, ref: str = "", untrusted: bool = False, fetch: bool = Fal
     try:
         return loader.load()
     except GitError as exc:
-        loader.add("canon-git-error", ERROR, "lecture du canon : %s" % exc)
+        loader.add("canon-git-error", ERROR, "reading the canon: %s" % exc)
         loader.canon.readable = False
         return loader.canon
     except OSError as exc:
         # Lecture refusée ou impossible (permissions, fichier disparu) : même
         # traitement fail-closed qu'une erreur git.
-        loader.add("canon-io-error", ERROR, "lecture du canon : %s" % (exc.strerror or exc))
+        loader.add("canon-io-error", ERROR, "reading the canon: %s" % (exc.strerror or exc))
         loader.canon.readable = False
         return loader.canon
 

@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
 import time
 
@@ -72,38 +73,85 @@ def session_root(harness: str, home: str) -> str:
     return os.path.join(home, _store(harness))
 
 
-def find_session(harness: str, home: str, session_id: str) -> str | None:
+class SessionSearchIncomplete(OSError):
+    """L224 : le stockage de sessions n'a pas pu être parcouru en entier
+    (dossier illisible, erreur d'E/S) : « introuvable » n'est pas établi."""
+
+
+def _present(path: str, directory: bool, strict: bool) -> bool:
+    """`path` existe (dossier ou fichier) ; une erreur autre que « absent »
+    lève `SessionSearchIncomplete` en mode strict, compte pour absent sinon."""
+    try:
+        st = os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        if strict:
+            raise SessionSearchIncomplete("%s : %s" % (path, exc)) from exc
+        return False
+    return stat.S_ISDIR(st.st_mode) if directory else stat.S_ISREG(st.st_mode)
+
+
+def find_session(harness: str, home: str, session_id: str,
+                 strict: bool = False) -> str | None:
     """Le fichier (ou dossier, DeepSeek) de la session sous `home`, ou None.
 
     * Codex : `<CODEX_HOME>/sessions/AAAA/MM/JJ/rollout-<date>-<id>.jsonl` ;
     * Claude Code : `<CLAUDE_CONFIG_DIR>/projects/<dossier encodé>/<id>.jsonl` ;
     * DeepSeek Harness : `<DSH_HOME>/sessions/<dossier encodé>/session-<id>/`.
+
+    `strict` (L224, verdict codex #183) : une recherche incomplète (dossier
+    illisible) lève `SessionSearchIncomplete` au lieu de répondre None.
     """
     if not SESSION_RE.match(session_id or ""):
         return None
     root = session_root(harness, home)
-    if not os.path.isdir(root):
+    if not _present(root, True, strict):
         return None
     if harness == "codex":
         suffix = "-%s.jsonl" % session_id
         found = []
-        for base, _dirs, files in os.walk(root):
-            for name in files:
-                if name.startswith("rollout-") and name.endswith(suffix):
-                    found.append(os.path.join(base, name))
+        # Parcours explicite plutôt que os.walk : os.walk avale aussi les
+        # erreurs de `DirEntry.is_dir()` (verdict codex #183, 3e relecture).
+        pending = [root]
+        while pending:
+            base = pending.pop()
+            try:
+                with os.scandir(base) as it:
+                    entries = list(it)
+            except OSError as exc:
+                if strict:
+                    raise SessionSearchIncomplete("%s : %s" % (base, exc)) from exc
+                continue
+            for entry in entries:
+                try:
+                    is_dir = entry.is_dir()
+                    walk_into = is_dir and not entry.is_symlink()
+                except OSError as exc:
+                    if strict:
+                        raise SessionSearchIncomplete(
+                            "%s : %s" % (entry.path, exc)) from exc
+                    is_dir = walk_into = False
+                if walk_into:
+                    pending.append(entry.path)
+                elif not is_dir and entry.name.startswith("rollout-") \
+                        and entry.name.endswith(suffix):
+                    found.append(entry.path)
         return sorted(found)[-1] if found else None
     try:
         entries = sorted(os.listdir(root))
-    except OSError:
+    except OSError as exc:
+        if strict:
+            raise SessionSearchIncomplete("%s : %s" % (root, exc)) from exc
         return None
     for entry in entries:
         if harness == "claude":
             candidate = os.path.join(root, entry, session_id + ".jsonl")
-            if os.path.isfile(candidate):
+            if _present(candidate, False, strict):
                 return candidate
         elif harness == "deepseek":
             candidate = os.path.join(root, entry, "session-" + session_id)
-            if os.path.isdir(candidate):
+            if _present(candidate, True, strict):
                 return candidate
     return None
 

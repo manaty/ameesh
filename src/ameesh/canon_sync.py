@@ -1318,7 +1318,7 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
                 "admitted on %s: not claimable until that host is synced" % target,
                 placement=verdict))
             continue
-        why = "plus d'admission" if canon.agent(name) is not None else "fiche absente"
+        why = "no longer admitted" if canon.agent(name) is not None else "sheet missing"
         # Sans admission sur cet hôte, plus réclamable ici, quel que soit son
         # statut (fin de tour comprise) : écrit avant l'arrêt, colonnes
         # déclaratives seulement.
