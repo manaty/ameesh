@@ -11,17 +11,19 @@ L159 study).
 `run`:
 1. takes an exact snapshot of the working tree (tracked and untracked files,
    ignored ones excluded) through a temporary index, `git write-tree` and
-   `git commit-tree`: neither the agent's index nor its refs move;
-2. asks the VM which recent commits it already has, and sends a thin pack of
-   the difference;
+   `git commit-tree`: neither the agent's index nor its refs move. The
+   snapshot has no parent: no history travels;
+2. asks the VM for its recent snapshots, and sends a thin pack of what they
+   lack;
 3. runs the command there, in a throwaway checkout of the snapshot, in the
    same subdirectory. Output and exit code come back unchanged.
 
 The host is `--host` or `AMEESH_OFFLOAD_HOST` (an SSH destination, an alias
 of ~/.ssh/config being the simplest). Without a host, when the VM is
-unreachable, or when it refuses or stops the job (gate not `available`),
-the command runs on the workstation (`--fallback local`, the default). A
-timeout or a cancel is never rerun.
+unreachable before the job starts, or when it refuses or stops the job
+(gate not `available`), the command runs on the workstation (`--fallback
+local`, the default). A timeout, a cancel or a connection lost during the
+job is never rerun: the suite may still be running on the VM.
 
 `AMEESH_OFFLOAD_SSH` replaces the `ssh` command (tests, or extra options).
 The VM side is `ameesh.offload_shell` (forced command of the SSH key).
@@ -42,8 +44,6 @@ from .offload_shell import PREFIX
 
 #: exit code when the VM refused or stopped the job and no fallback is allowed
 EX_TEMPFAIL = 75
-#: recent first-parent commits offered as bases for the thin pack
-HAVE_DEPTH = 64
 #: snapshot identity: fixed, so that the same tree gives the same commit id
 SNAP_ENV = {"GIT_AUTHOR_NAME": "ameesh offload", "GIT_AUTHOR_EMAIL": "offload@ameesh",
             "GIT_COMMITTER_NAME": "ameesh offload", "GIT_COMMITTER_EMAIL": "offload@ameesh"}
@@ -80,31 +80,22 @@ def snapshot(top: str) -> str:
             pass
         _git(top, "add", "-A", env=env)
         tree = _git(top, "write-tree", env=env)
-    head = subprocess.run(["git", "-C", top, "rev-parse", "--verify", "-q", "HEAD"],
-                          capture_output=True, text=True).stdout.strip()
-    parents = ["-p", head] if head else []
-    # fixed dates: an unchanged tree on the same HEAD gives the same snapshot
+    # no parent: the history (a secret deleted since, or now ignored) never
+    # travels; fixed date: the same tree always gives the same snapshot
     env = dict(os.environ, GIT_AUTHOR_DATE="@0 +0000", GIT_COMMITTER_DATE="@0 +0000",
                **SNAP_ENV)
-    if head:
-        when = _git(top, "log", "-1", "--format=%ct", head)
-        env.update(GIT_AUTHOR_DATE="@%s +0000" % when, GIT_COMMITTER_DATE="@%s +0000" % when)
-    return _git(top, "commit-tree", tree, *parents, "-m", "ameesh offload snapshot", env=env)
+    return _git(top, "commit-tree", tree, "-m", "ameesh offload snapshot", env=env)
 
 
-def base_candidates(top: str) -> list[str]:
-    out = subprocess.run(
-        ["git", "-C", top, "rev-list", "--first-parent", "-n", str(HAVE_DEPTH), "HEAD"],
-        capture_output=True, text=True).stdout.split()
-    refs = subprocess.run(
-        ["git", "-C", top, "for-each-ref", "--format=%(objectname)",
-         "refs/remotes/origin/HEAD", "refs/remotes/origin/main",
-         "refs/remotes/origin/master"], capture_output=True, text=True).stdout.split()
-    seen: list[str] = []
-    for sha in out + refs:
-        if sha not in seen:
-            seen.append(sha)
-    return seen
+def known_locally(top: str, shas: list[str]) -> list[str]:
+    """The commits of `shas` this repository has (earlier snapshots stay as
+    loose objects until git prunes them)."""
+    if not shas:
+        return []
+    res = subprocess.run(["git", "-C", top, "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                         input="\n".join(shas) + "\n", capture_output=True, text=True)
+    return [line.split()[0] for line in res.stdout.splitlines()
+            if line.endswith(" commit")]
 
 
 def repo_name(top: str) -> str:
@@ -132,15 +123,16 @@ class Remote:
 
 
 def push(remote: Remote, top: str, repo: str, snap: str) -> None:
-    candidates = base_candidates(top)
-    res = remote.call("put", repo, "--have", input="\n".join(candidates).encode() + b"\n")
+    # the VM lists its recent snapshots: the pack leaves out what they hold
+    res = remote.call("put", repo, "--have", input=b"")
     if res.returncode != 0:
         raise OffloadError("VM unreachable or refused (put --have, exit %d): %s"
                            % (res.returncode, res.stderr.decode(errors="replace").strip()))
-    present = set(res.stdout.decode().split())
+    present = res.stdout.decode().split()
     if snap in present:
         return
-    revs = snap + "\n" + "".join("^%s\n" % sha for sha in candidates if sha in present)
+    bases = known_locally(top, present)
+    revs = snap + "\n" + "".join("^%s\n" % sha for sha in bases)
     pack = subprocess.Popen(["git", "-C", top, "pack-objects", "--revs", "--thin",
                              "--stdout", "-q", "--delta-base-offset"],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
@@ -157,9 +149,10 @@ def push(remote: Remote, top: str, repo: str, snap: str) -> None:
                            % (sent.returncode, sent.stderr.decode(errors="replace").strip()))
 
 
-def run_remote(remote: Remote, words: list[str]) -> tuple[int, dict | None]:
+def run_remote(remote: Remote, words: list[str]) -> tuple[int, dict | None, str | None]:
     """Runs `run …` on the VM: stdout passes through, stderr too except the
-    protocol lines. Returns (ssh exit code, result object or None)."""
+    protocol lines. Returns (ssh exit code, result object or None, job id
+    or None)."""
     proc = subprocess.Popen(remote.argv(*words), stdin=subprocess.DEVNULL,
                             stderr=subprocess.PIPE)
     state: dict = {"job": None, "result": None}
@@ -197,9 +190,9 @@ def run_remote(remote: Remote, words: list[str]) -> tuple[int, dict | None]:
         proc.send_signal(signal.SIGTERM)
         rc = proc.wait()
         reader.join(timeout=5)
-        return rc, state["result"] or {"outcome": "cancelled", "job": state["job"]}
+        return rc, state["result"] or {"outcome": "cancelled", "job": state["job"]}, state["job"]
     reader.join(timeout=5)
-    return rc, state["result"]
+    return rc, state["result"], state["job"]
 
 
 def run_local(argv: list[str]) -> int:
@@ -239,11 +232,17 @@ def cmd_run(opts: dict, argv: list[str]) -> int:
         words += ["--timeout", str(opts["timeout"])]
     for item in opts["env"]:
         words += ["--env", item]
-    rc, result = run_remote(remote, words + ["--"] + argv)
+    rc, result, job = run_remote(remote, words + ["--"] + argv)
     if result is None:
         # no result line: the connection broke (ssh 255) or the shell is not
-        # ours; the command may have run partly, but nothing says it ended
-        return fall_back("lost the connection to %s (ssh exit %d)" % (host, rc))
+        # ours. The suite may still run there: never rerun it here as well
+        # (two heavy suites at once); the VM side cancels a job whose session
+        # is gone, and we ask it too, once.
+        if job:
+            remote.call("cancel", job)
+        _note("lost the connection to %s (ssh exit %d)%s; not rerun on this machine"
+              % (host, rc, ", job %s cancelled" % job if job else ""))
+        return EX_TEMPFAIL
     outcome = result.get("outcome")
     if outcome == "done":
         return rc

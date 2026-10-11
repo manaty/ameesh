@@ -43,9 +43,16 @@ Postgres suites, builds) run on a VM through `ameesh offload run`. Design:
   files, ignored ones excluded), in the same subdirectory as on the
   workstation. Output and exit code come back unchanged.
 * `TMPDIR` inside its job folder, on the volume, removed at the end.
-* A transient scope `ameesh-job-<id>.scope` under the guest's user manager,
-  capped by `agent_memory_max`; the whole guest is capped by its
-  `user-<uid>.slice`.
+* A transient slice `ameesh-job-<id>.slice` under the guest's user manager,
+  capped by `agent_memory_max`. Everything of the job runs in it: dependency
+  setup, hooks, the command (scope `ameesh-job-<id>.scope`) and its Podman
+  containers (`--cgroup-parent $OFFLOAD_SLICE`). The slice is killed when
+  the job ends. The whole guest is capped by its `user-<uid>.slice`.
+* One supervision for every phase: a cancel, the loss of the SSH session,
+  the gate or the job's deadline (counted from its slot) end setup, hooks
+  and command alike. The `after` hook still runs (teardown, 2 min at most).
+* A job whose shell died is cleaned at the next run: its slice is killed and
+  its profile's `after` hook run (containers removed) before any new slot.
 * A slot (`flock`): with all slots busy, the client says it waits.
 * Its profile (`--profile`, default `default`):
   * `default`: the command as is;

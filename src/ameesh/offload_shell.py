@@ -5,8 +5,8 @@ mode b1 of the L159 study, `docs/design/etudes/l159-capacite-des-hotes.md`).
 It is the forced command of the `ameesh-guest` SSH key: the key has no shell,
 no port forwarding, only these four verbs (read from SSH_ORIGINAL_COMMAND):
 
-  put <repo> --have        stdin: candidate commit ids, one per line;
-                           stdout: those the mirror already has
+  put <repo> --have        stdout: the mirror's recent snapshots (bases
+                           for the client's thin pack)
   put <repo> <commit>      stdin: a thin git pack; stores it in the mirror and
                            keeps <commit> under refs/offload/
   run <repo> <commit> [--profile P] [--cwd DIR] [--timeout S] [--env K=V]...
@@ -22,8 +22,13 @@ always ends with `ameesh-offload: result {json}` (outcome `done`, `refused`,
 Each job runs:
 * under a concurrency token (`flock` on `locks/slot-N`; the client sees the
   wait);
-* in a transient systemd user scope `ameesh-job-<id>.scope` capped by
-  `MemoryMax` (config `agent_memory_max`), when `scope` is true;
+* in a transient slice of the guest's user manager, `ameesh-job-<id>.slice`,
+  capped by `MemoryMax` (config `agent_memory_max`) when `scope` is true:
+  setup, hooks (scopes `ameesh-job-<id>-<phase>`), the command (scope
+  `ameesh-job-<id>`) and the job's containers (`--cgroup-parent
+  $OFFLOAD_SLICE`) share that cap, and the slice is killed at the end;
+* supervised in every phase: cancel, SSH session loss, gate and one deadline
+  for the whole job (from its slot) end setup, hooks and command alike;
 * with a private TMPDIR inside the job directory, removed at the end;
 * with the dependencies of its profile cached by the hash of the profile's
   lock files (`profiles/<name>.json`, see `deploy/guest/`).
@@ -49,6 +54,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 PREFIX = "ameesh-offload: "
@@ -62,10 +68,18 @@ RESERVED_ENV = ("PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "TMP", "TEMP",
                 "DBUS_SESSION_BUS_ADDRESS", "OFFLOAD_JOB", "OFFLOAD_WORK",
                 "OFFLOAD_CACHE")
 POLL_S = 1.0
+#: snapshots offered to the client as thin-pack bases
+HAVE_DEPTH = 32
+#: the `after` hook (teardown) runs even after a stop, within this delay
+AFTER_HOOK_S = 120
 
 
 class Refused(Exception):
     """The request is invalid, or the host does not take jobs now."""
+
+
+class Stopped(Exception):
+    """The job was cancelled, timed out or stopped by the gate (`Job.stop`)."""
 
 
 # --------------------------------------------------------------------------
@@ -160,16 +174,15 @@ def cmd_put(cfg: dict, args: list[str]) -> int:
         raise Refused("usage: put <repo> --have | put <repo> <commit>")
     mirror = mirror_path(cfg, args[0])
     if args[1] == "--have":
-        wanted = [line.strip() for line in sys.stdin if SHA_RE.match(line.strip())]
-        if not wanted:
-            return 0
-        out = subprocess.run(
-            ["git", "-C", mirror, "cat-file", "--batch-check=%(objectname) %(objecttype)"],
-            input="\n".join(wanted) + "\n", capture_output=True, text=True, check=True)
-        for line in out.stdout.splitlines():
-            parts = line.split()
-            if len(parts) == 2 and parts[1] == "commit":
-                sys.stdout.write(parts[0] + "\n")
+        # its recent snapshots, last used first: the client's thin-pack bases
+        stamps = os.path.join(mirror, "offload-stamps")
+        names = [n for n in os.listdir(stamps) if SHA_RE.match(n)] \
+            if os.path.isdir(stamps) else []
+        names.sort(key=lambda n: os.path.getmtime(os.path.join(stamps, n)), reverse=True)
+        for name in names[:HAVE_DEPTH]:
+            if subprocess.run(["git", "-C", mirror, "cat-file", "-e", name + "^{commit}"],
+                              stderr=subprocess.DEVNULL).returncode == 0:
+                sys.stdout.write(name + "\n")
         return 0
     commit = args[1]
     if not SHA_RE.match(commit):
@@ -316,24 +329,178 @@ def _expand(value: str, env: dict) -> str:
                   lambda m: env.get(m.group(1), ""), value)
 
 
-def _hook(script: str, cwd: str, env: dict) -> subprocess.CompletedProcess:
+def unit_names(job_id: str) -> tuple[str, str]:
+    """(slice, command scope) of a job. The slice holds every phase (setup,
+    hooks, command) and the job's containers; `-` nests slices in systemd, so
+    the id's dashes become `_`: ameesh.slice/ameesh-job.slice/ameesh-job-<id>.slice."""
+    return ("ameesh-job-%s.slice" % job_id.replace("-", "_"), "ameesh-job-%s" % job_id)
+
+
+def _systemctl(*args: str) -> None:
+    subprocess.run(["systemctl", "--user", *args],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def open_slice(cfg: dict, job_id: str) -> None:
+    """Caps the job's slice before anything runs in it: the per-job
+    `MemoryMax` then covers setup, hooks, command and containers together."""
+    slice_name, _ = unit_names(job_id)
+    props = ["MemoryMax=%s" % cfg["agent_memory_max"], "MemorySwapMax=0"] \
+        if cfg.get("agent_memory_max") else []
+    if props:
+        res = subprocess.run(["systemctl", "--user", "set-property", "--runtime",
+                              slice_name, *props], capture_output=True, text=True)
+        if res.returncode != 0:
+            raise Refused("cannot cap the job slice: %s" % res.stderr.strip())
+
+
+def close_slice(job_id: str) -> None:
+    """Kills whatever is left in the job's slice, then drops its runtime caps."""
+    slice_name, _ = unit_names(job_id)
+    _systemctl("kill", "--signal=SIGKILL", slice_name)
+    _systemctl("stop", slice_name)
+    _systemctl("revert", slice_name)
+
+
+class Job:
+    """Runs the phases of one job under the same supervision: cancel, SSH
+    session loss, host gate and one deadline for the whole job."""
+
+    def __init__(self, cfg: dict, job_id: str, job_dir: str):
+        self.cfg = cfg
+        self.job_id = job_id
+        self.cancel_flag = os.path.join(job_dir, "cancel")
+        self.ssh_parent = os.getppid()
+        # set from the slot on (`set_limit`): waiting in the queue is no timeout
+        self.deadline = float("inf")
+        self.limit = int(cfg["max_job_seconds"])
+        self.stop: dict = {}
+        self.proc: subprocess.Popen | None = None
+        self.scope = bool(cfg.get("scope"))
+
+    def set_limit(self, seconds: int) -> None:
+        self.limit = seconds
+        self.deadline = time.time() + seconds
+
+    def session_gone(self) -> bool:
+        # no tty, so no SIGHUP for sure: a dead sshd session reparents us
+        return os.getppid() != self.ssh_parent
+
+    def check(self, now: float | None = None) -> dict:
+        """Fills and returns `stop` when the job must end."""
+        now = time.time() if now is None else now
+        if os.path.exists(self.cancel_flag):
+            self.stop.setdefault("outcome", "cancelled")
+            self.stop.setdefault("reason", "cancel requested")
+        elif self.session_gone():
+            self.stop.setdefault("outcome", "cancelled")
+            self.stop.setdefault("reason", "SSH session closed")
+        if not self.stop:
+            st, drain_at, why = gate_state(self.cfg, now)
+            if st == "stopped" or (st == "draining" and drain_at is not None
+                                   and now >= drain_at):
+                self.stop.update(outcome="stopped",
+                                 reason="host %s%s" % (st, ": " + why if why else ""))
+            elif now >= self.deadline:
+                self.stop.update(outcome="timeout", reason="over %d s" % self.limit)
+        return self.stop
+
+    def should_stop(self) -> str:
+        """For waits before the job starts (slot): any gate state but
+        `available` ends them."""
+        if self.check():
+            return "cancelled" if self.stop["outcome"] == "cancelled" else self.stop["reason"]
+        st, _, why = gate_state(self.cfg)
+        return "" if st == "available" else "host %s%s" % (st, ": " + why if why else "")
+
+    def argv(self, phase: str, argv: list[str]) -> list[str]:
+        if not self.scope:
+            return argv
+        slice_name, unit = unit_names(self.job_id)
+        if phase != "command":
+            unit += "-" + phase
+        return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                "--slice", slice_name, "--unit", unit, "--"] + argv
+
+    def kill(self) -> None:
+        if self.scope:
+            _systemctl("kill", "--signal=SIGKILL", unit_names(self.job_id)[0])
+        proc = self.proc
+        if proc is None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def run(self, phase: str, argv: list[str], cwd: str, env: dict,
+            capture: bool = False, supervised: bool = True,
+            limit: float | None = None) -> tuple[int, str]:
+        """Runs one phase in the job's slice. stdout passes through, goes to
+        stderr (hooks: the client's stdout is the command's alone), or is
+        captured. Returns (exit code, captured stdout); a supervised phase
+        ends early, killed, when `check` says so."""
+        out = subprocess.PIPE if capture else (None if phase == "command" else sys.stderr.fileno())
+        proc = subprocess.Popen(self.argv(phase, argv), cwd=cwd, env=env, stdout=out,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+        self.proc = proc
+        chunks: list[bytes] = []
+        reader = None
+        if capture:
+            reader = threading.Thread(target=lambda: chunks.append(proc.stdout.read()),
+                                      daemon=True)
+            reader.start()
+        end = None if limit is None else time.time() + limit
+        try:
+            while True:
+                try:
+                    rc = proc.wait(timeout=POLL_S)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if (supervised and self.check()) or (end is not None and time.time() >= end):
+                    self.kill()
+                    rc = proc.wait()
+                    break
+        finally:
+            self.proc = None
+        if reader is not None:
+            reader.join(timeout=5)
+        return rc, b"".join(chunks).decode(errors="replace")
+
+
+def _hook(job: Job, phase: str, script: str, cwd: str, env: dict,
+          supervised: bool = True) -> tuple[int, str]:
     """A profile hook: a shell snippet written by the VM's owner, never by the
-    client. Its stdout is captured, its stderr passes through."""
-    return subprocess.run(["/bin/sh", "-ec", script], cwd=cwd, env=env,
-                          stdout=subprocess.PIPE, text=True)
+    client. Its stdout is captured, its stderr passes through. The `after`
+    hook (teardown) runs even after a stop, within AFTER_HOOK_S."""
+    return job.run(phase, ["/bin/sh", "-ec", script], cwd, env, capture=True,
+                   supervised=supervised, limit=None if supervised else AFTER_HOOK_S)
 
 
-def prepare_cache(cfg: dict, profile_name: str, profile: dict, work: str,
+def prepare_cache(job: Job, profile_name: str, profile: dict, work: str,
                   env: dict) -> str:
     """The dependency cache of the profile, built once per lock-file hash."""
     if not profile["setup"]:
         return ""
-    base = _dir(cfg, "cache", profile_name)
+    base = _dir(job.cfg, "cache", profile_name)
     key = _lock_hash(work, profile)
     final = os.path.join(base, key)
     fd = os.open(final + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        # another job may be building it: wait, still supervised
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if job.check():
+                    raise Stopped() from None
+                time.sleep(POLL_S)
         ready = os.path.join(final, ".ready")
         if os.path.exists(ready):
             os.utime(final)
@@ -343,12 +510,14 @@ def prepare_cache(cfg: dict, profile_name: str, profile: dict, work: str,
         # complete cache, so a setup killed halfway is redone
         shutil.rmtree(final, ignore_errors=True)
         os.makedirs(final, mode=0o700)
-        env = dict(env, OFFLOAD_CACHE=final)
-        res = subprocess.run(["/bin/sh", "-ec", profile["setup"]], cwd=work, env=env,
-                             stdout=sys.stderr.fileno())
-        if res.returncode != 0:
+        rc, _ = job.run("setup", ["/bin/sh", "-ec", profile["setup"]], work,
+                        dict(env, OFFLOAD_CACHE=final))
+        if job.stop:
             shutil.rmtree(final, ignore_errors=True)
-            raise Refused("profile %s: setup failed (exit %d)" % (profile_name, res.returncode))
+            raise Stopped()
+        if rc != 0:
+            shutil.rmtree(final, ignore_errors=True)
+            raise Refused("profile %s: setup failed (exit %d)" % (profile_name, rc))
         open(ready, "w").close()
         return final
     finally:
@@ -378,31 +547,6 @@ def check_user_manager(env: dict) -> None:
     bus = os.path.join(env.get("XDG_RUNTIME_DIR", ""), "bus")
     if not env.get("DBUS_SESSION_BUS_ADDRESS") and not os.path.exists(bus):
         raise Refused("no systemd user manager for the job scope (loginctl enable-linger?)")
-
-
-def _scope_argv(cfg: dict, job_id: str, argv: list[str]) -> list[str]:
-    if not cfg.get("scope"):
-        return argv
-    cmd = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-           "--unit", "ameesh-job-%s" % job_id]
-    if cfg.get("agent_memory_max"):
-        cmd += ["-p", "MemoryMax=%s" % cfg["agent_memory_max"], "-p", "MemorySwapMax=0"]
-    return cmd + ["--"] + argv
-
-
-def _kill(cfg: dict, job_id: str, proc: subprocess.Popen) -> None:
-    if cfg.get("scope"):
-        subprocess.run(["systemctl", "--user", "kill", "--signal=SIGKILL",
-                        "ameesh-job-%s.scope" % job_id],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
 
 
 def parse_run(args: list[str]) -> dict:
@@ -466,8 +610,15 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
         emit("result", result)
         return 2
     touch_snapshot(mirror, req["commit"])
+    env = base_env(cfg)
+    if cfg.get("scope"):
+        try:
+            check_user_manager(env)
+        except Refused as exc:
+            result.update(outcome="refused", reason=str(exc))
+            emit("result", result)
+            return 75
     prune_orphans(cfg)
-    ssh_parent = os.getppid()
     job_dir = os.path.join(_dir(cfg, "jobs"), job_id)
     os.makedirs(job_dir, mode=0o700)
     meta_path = os.path.join(job_dir, "meta.json")
@@ -476,113 +627,68 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
             "shell_pid": os.getpid()}
     _write_meta(meta_path, meta)
     emit("job", job_id)
-    cancel_flag = os.path.join(job_dir, "cancel")
-    proc: subprocess.Popen | None = None
-    stop: dict = {}
+    job = Job(cfg, job_id, job_dir)
 
     def on_signal(signum, _frame):
         # the SSH session went away (SIGHUP), or `cancel` (SIGTERM)
-        stop.setdefault("outcome", "cancelled")
-        stop.setdefault("reason", "signal %d" % signum)
-        if proc is not None and proc.poll() is None:
-            _kill(cfg, job_id, proc)
+        job.stop.setdefault("outcome", "cancelled")
+        job.stop.setdefault("reason", "signal %d" % signum)
+        job.kill()
 
     for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, on_signal)
 
-    def session_gone() -> bool:
-        # no tty, so no SIGHUP for sure: a dead sshd session reparents us
-        return os.getppid() != ssh_parent
-
-    def should_stop() -> str:
-        if os.path.exists(cancel_flag) or stop or session_gone():
-            return "cancelled"
-        st, _, why = gate_state(cfg)
-        return "" if st == "available" else "host %s%s" % (st, ": " + why if why else "")
-
     slot_fd = None
     profile: dict | None = None
-    hook_env: dict | None = None
+    sliced = False
     work = os.path.join(job_dir, "work")
     try:
         try:
-            slot_fd = acquire_slot(cfg, job_id, should_stop)
+            slot_fd = acquire_slot(cfg, job_id, job.should_stop)
         except Refused as exc:
             result.update(outcome="cancelled" if str(exc) == "cancelled" else "refused",
                           reason=str(exc))
             return 75 if result["outcome"] == "refused" else 130
+        # one deadline for the whole job, from its slot: setup, hooks, command
+        job.set_limit(min(int(cfg["max_job_seconds"]), req["timeout"] or 10 ** 9))
         tmp = os.path.join(job_dir, "tmp")
         os.makedirs(tmp, mode=0o700)
         checkout(mirror, work, req["commit"])
-        home = os.environ.get("HOME", cfg["root"])
-        env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-               "HOME": home, "USER": os.environ.get("USER", ""),
-               "LOGNAME": os.environ.get("LOGNAME", ""),
-               "LANG": os.environ.get("LANG", "C.UTF-8"),
-               "TMPDIR": tmp, "TMP": tmp, "TEMP": tmp,
-               "OFFLOAD_JOB": job_id, "OFFLOAD_WORK": work}
-        for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
-            if os.environ.get(key):
-                env[key] = os.environ[key]
-        if cfg.get("scope"):
-            check_user_manager(env)
+        env.update(TMPDIR=tmp, TMP=tmp, TEMP=tmp, OFFLOAD_JOB=job_id, OFFLOAD_WORK=work)
+        if job.scope:
+            env["OFFLOAD_SLICE"] = unit_names(job_id)[0]
+            open_slice(cfg, job_id)
+            sliced = True
         profile = load_profile(cfg, req["profile"])
-        env["OFFLOAD_CACHE"] = prepare_cache(cfg, req["profile"], profile, work, env)
+        env["OFFLOAD_CACHE"] = prepare_cache(job, req["profile"], profile, work, env)
         for key, value in profile["env"].items():
             env[key] = _expand(str(value), env)
         env.update(req["env"])
         cwd = os.path.join(work, req["cwd"]) if req["cwd"] else work
         if not os.path.isdir(cwd):
             raise Refused("run: --cwd %s does not exist in the snapshot" % req["cwd"])
-        hook_env = env
         if profile["before"]:
-            res = _hook(profile["before"], work, env)
-            if res.returncode != 0:
-                raise Refused("profile %s: before hook failed (exit %d)"
-                              % (req["profile"], res.returncode))
-            for line in res.stdout.splitlines():
+            rc, out = _hook(job, "before", profile["before"], work, env)
+            if job.stop:
+                raise Stopped()
+            if rc != 0:
+                raise Refused("profile %s: before hook failed (exit %d)" % (req["profile"], rc))
+            for line in out.splitlines():
                 if ENV_RE.match(line):
                     key, value = line.split("=", 1)
                     env[key] = value
-        limit = min(int(cfg["max_job_seconds"]), req["timeout"] or 10 ** 9)
-        meta.update(state="running", started_ts=int(time.time()), limit_s=limit)
+        meta.update(state="running", started_ts=int(time.time()), limit_s=job.limit)
         _write_meta(meta_path, meta)
-        emit("start", {"job": job_id, "profile": req["profile"], "limit_s": limit})
-        proc = subprocess.Popen(_scope_argv(cfg, job_id, req["argv"]), cwd=cwd, env=env,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
-        meta.update(pid=proc.pid)
-        _write_meta(meta_path, meta)
-        deadline = time.time() + limit
-        while True:
-            try:
-                rc = proc.wait(timeout=POLL_S)
-                break
-            except subprocess.TimeoutExpired:
-                pass
-            now = time.time()
-            if os.path.exists(cancel_flag):
-                stop.setdefault("outcome", "cancelled")
-                stop.setdefault("reason", "cancel requested")
-            elif session_gone():
-                stop.setdefault("outcome", "cancelled")
-                stop.setdefault("reason", "SSH session closed")
-            if not stop:
-                st, drain_at, why = gate_state(cfg, now)
-                if st == "stopped" or (st == "draining" and drain_at is not None
-                                       and now >= drain_at):
-                    stop.update(outcome="stopped", reason="host %s%s" % (st, ": " + why if why else ""))
-                elif now >= deadline:
-                    stop.update(outcome="timeout", reason="over %d s" % limit)
-            if stop:
-                _kill(cfg, job_id, proc)
-                rc = proc.wait()
-                break
+        emit("start", {"job": job_id, "profile": req["profile"], "limit_s": job.limit})
+        rc, _ = job.run("command", req["argv"], cwd, env)
         result["exit"] = rc
-        if stop:
-            result.update(stop)
-            return {"stopped": 75, "timeout": 124}.get(stop["outcome"], 130)
+        if job.stop:
+            raise Stopped()
         result["outcome"] = "done"
         return rc if 0 <= rc < 256 else 128 + (-rc)
+    except Stopped:
+        result.update(job.stop)
+        return {"stopped": 75, "timeout": 124}.get(job.stop["outcome"], 130)
     except Refused as exc:
         result.update(outcome="refused", reason=str(exc))
         return 75
@@ -591,10 +697,12 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
         return 70
     finally:
         try:
-            if profile is not None and profile["after"] and hook_env is not None:
-                # teardown (the job's containers), even after a kill
-                _hook(profile["after"], work, hook_env)
+            if profile is not None and profile["after"]:
+                # teardown (the job's containers), even after a stop
+                _hook(job, "after", profile["after"], work, env, supervised=False)
         finally:
+            if sliced:
+                close_slice(job_id)
             result["seconds"] = round(time.time() - started, 1)
             # journal and cleanup first: once the result is out, the client
             # may move on (and the session may be gone already)
@@ -605,16 +713,51 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
             emit("result", result)
 
 
+def base_env(cfg: dict) -> dict:
+    """What every job and hook gets from the host (never from the client)."""
+    env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+           "HOME": os.environ.get("HOME", cfg["root"]), "USER": os.environ.get("USER", ""),
+           "LOGNAME": os.environ.get("LOGNAME", ""),
+           "LANG": os.environ.get("LANG", "C.UTF-8")}
+    for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    return env
+
+
 def prune_orphans(cfg: dict) -> None:
-    """Job folders whose shell died without cleaning up (killed, host
-    rebooted): their slot lock went with the process, only files remain."""
+    """Jobs whose shell died without cleaning up (killed, host rebooted): the
+    slot lock went with the process, but the suite and its containers may
+    still run. Kill the job's slice, run the profile's teardown, then drop
+    the folder."""
     jobs = _dir(cfg, "jobs")
     for name in os.listdir(jobs):
         meta = _read_meta(os.path.join(jobs, name))
-        if meta is not None and not _alive(meta.get("shell_pid")):
-            meta["state"] = "orphan"
-            _journal(cfg, dict(meta, outcome="error", reason="orphan job folder removed"))
-            shutil.rmtree(os.path.join(jobs, name), ignore_errors=True)
+        if meta is None or _alive(meta.get("shell_pid")):
+            continue
+        job_id = str(meta.get("job") or name)
+        if cfg.get("scope"):
+            _systemctl("kill", "--signal=SIGKILL", unit_names(job_id)[0])
+        try:
+            profile = load_profile(cfg, str(meta.get("profile") or "default"))
+        except Refused:
+            profile = None
+        if profile is not None and profile["after"]:
+            env = dict(base_env(cfg), OFFLOAD_JOB=job_id,
+                       OFFLOAD_WORK=os.path.join(jobs, name, "work"))
+            if cfg.get("scope"):
+                env["OFFLOAD_SLICE"] = unit_names(job_id)[0]
+            try:
+                subprocess.run(["/bin/sh", "-ec", profile["after"]], env=env,
+                               cwd=cfg["root"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=AFTER_HOOK_S)
+            except subprocess.TimeoutExpired:
+                pass
+        if cfg.get("scope"):
+            close_slice(job_id)
+        meta["state"] = "orphan"
+        _journal(cfg, dict(meta, outcome="error", reason="orphan job killed and removed"))
+        shutil.rmtree(os.path.join(jobs, name), ignore_errors=True)
 
 
 def _journal(cfg: dict, entry: dict) -> None:

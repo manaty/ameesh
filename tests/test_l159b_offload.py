@@ -156,25 +156,41 @@ class RunTest(OffloadBase):
                              AMEESH_FAKE_OFFLOAD_CONFIG=self.config_path,
                              PYTHONPATH=os.path.join(REPO, "src")):
             remote = offload.Remote("vm")
-            res = remote.call("put", "acme-widget", "--have",
-                              input=("\n".join(offload.base_candidates(top)) + "\n").encode())
-            self.assertIn(git(top, "rev-parse", "HEAD"), res.stdout.decode())
-            # a new commit: only its objects travel (thin pack against HEAD~)
+            res = remote.call("put", "acme-widget", "--have", input=b"")
+            self.assertEqual(res.stdout.decode().split(), [snap])
+            # a new commit: only its objects travel (thin pack against the
+            # previous snapshot)
             with open(os.path.join(top, "tracked.txt"), "w") as fh:
                 fh.write("v3\n")
             git(top, "commit", "-qam", "two")
             snap2 = offload.snapshot(top)
-            revs = "%s\n^%s\n" % (snap2, git(top, "rev-parse", "HEAD~"))
             pack = subprocess.run(["git", "-C", top, "pack-objects", "--revs", "--thin",
-                                   "--stdout", "-q"], input=revs.encode(),
+                                   "--stdout", "-q"], input=("%s\n^%s\n" % (snap2, snap)).encode(),
                                   capture_output=True).stdout
             full = subprocess.run(["git", "-C", top, "pack-objects", "--revs", "--stdout",
                                    "-q"], input=(snap2 + "\n").encode(),
                                   capture_output=True).stdout
             self.assertLess(len(pack), len(full))
             offload.push(remote, top, "acme-widget", snap2)
-            res = remote.call("put", "acme-widget", "--have", input=(snap2 + "\n").encode())
-            self.assertEqual(res.stdout.decode().split(), [snap2])
+            res = remote.call("put", "acme-widget", "--have", input=b"")
+            self.assertEqual(set(res.stdout.decode().split()), {snap, snap2})
+
+    def test_no_history_travels(self):
+        with open(os.path.join(self.repo, "credentials.txt"), "w") as fh:
+            fh.write("hunter2-secret\n")
+        git(self.repo, "add", "credentials.txt")
+        git(self.repo, "commit", "-qm", "oops")
+        secret = git(self.repo, "rev-parse", "HEAD:credentials.txt")
+        git(self.repo, "rm", "-q", "credentials.txt")
+        git(self.repo, "commit", "-qm", "remove it")
+        res = self.offload("run", "--", "sh", "-c", "test ! -e credentials.txt")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        mirror = os.path.join(self.vm, "mirrors", "acme-widget.git")
+        found = subprocess.run(["git", "-C", mirror, "cat-file", "-e", secret],
+                               capture_output=True)
+        self.assertNotEqual(found.returncode, 0, "a blob of the history reached the VM")
+        self.assertEqual(git(mirror, "rev-list", "--all").split(),
+                         [offload.snapshot(self.repo)])  # one parentless commit
 
     def test_profile_cache_built_once_per_lockfile_and_hooks(self):
         with open(os.path.join(self.repo, "deps.lock"), "w") as fh:
@@ -226,8 +242,48 @@ class RunTest(OffloadBase):
         self.assertIn("timeout", res.stderr)
         self.assertFalse(os.path.exists(marker))
 
+    def test_hooks_and_setup_are_supervised_by_the_job_deadline(self):
+        after = os.path.join(self.tmp, "after.log")
+        self.write_profile("slowdb", {"before": "sleep 30",
+                                      "after": "echo torn-down >> %s" % after})
+        self.write_profile("slowdeps", {"lockfiles": [], "setup": "sleep 30"})
+        for profile in ("slowdb", "slowdeps"):
+            began = time.time()
+            res = self.offload("run", "--profile", profile, "--timeout", "2", "--", "true")
+            self.assertEqual(res.returncode, 124, res.stderr)
+            self.assertLess(time.time() - began, 20, profile)
+        with open(after) as fh:
+            self.assertEqual(fh.read(), "torn-down\n")  # teardown even after the stop
+        # the half-built cache is not kept as ready
+        cache = os.path.join(self.vm, "cache", "slowdeps")
+        self.assertFalse(any(os.path.exists(os.path.join(cache, d, ".ready"))
+                             for d in os.listdir(cache)))
+
 
 class FallbackTest(OffloadBase):
+    def test_lost_connection_during_the_job_is_never_rerun_locally(self):
+        marker = os.path.join(self.tmp, "local-run")
+        client = subprocess.Popen(
+            [AMEESH, "offload", "run", "--", "sh", "-c",
+             'case "$PWD" in %s*) sleep 30;; *) touch %s;; esac' % (self.vm, marker)],
+            cwd=self.repo, env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True)
+        self.addCleanup(client.kill)
+        deadline = time.time() + 30
+        while time.time() < deadline and not self.running_jobs():
+            time.sleep(0.2)
+        self.assertTrue(self.running_jobs())
+        # the "network" drops: the ssh process dies, its remote side with it
+        subprocess.run(["pkill", "-KILL", "-f", "fake-offload-ssh .*run acme-widget"])
+        _out, err = client.communicate(timeout=30)
+        self.assertEqual(client.returncode, offload.EX_TEMPFAIL, err)
+        self.assertIn("not rerun on this machine", err)
+        self.assertFalse(os.path.exists(marker))
+        deadline = time.time() + 15
+        while time.time() < deadline and self.running_jobs():
+            time.sleep(0.2)
+        self.assertEqual(self.running_jobs(), [])  # the VM side cancelled it too
+
     def test_no_user_manager_refuses_the_job_instead_of_failing_it(self):
         self.config["scope"] = True
         self.save_config()
@@ -353,7 +409,7 @@ class ShellTest(OffloadBase):
         self.assertFalse(os.path.exists(orphan))
         self.assertEqual([(e["job"], e["reason"]) for e in self.journal()
                           if e["outcome"] == "error"],
-                         [("20200101-000000-abcdef", "orphan job folder removed")])
+                         [("20200101-000000-abcdef", "orphan job killed and removed")])
 
     def test_emit_survives_a_closed_session(self):
         class Gone:

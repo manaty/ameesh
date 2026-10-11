@@ -19,7 +19,10 @@ DB=${JOB_PG_DB:-agent_mesh}
 case "${1:-}" in
   up)
     password=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    # in the job's slice (OFFLOAD_SLICE): the job's memory cap covers the
+    # database too, and the end of the job kills it
     podman run -d --rm --name "$NAME" --label ameesh-offload-job="$OFFLOAD_JOB" \
+      ${OFFLOAD_SLICE:+--cgroup-parent "$OFFLOAD_SLICE"} \
       -e POSTGRES_USER="$USER" -e POSTGRES_PASSWORD="$password" -e POSTGRES_DB="$DB" \
       -p 127.0.0.1::5432 "$IMAGE" \
       -c fsync=off -c synchronous_commit=off -c full_page_writes=off >/dev/null
