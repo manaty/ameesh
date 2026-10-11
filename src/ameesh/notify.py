@@ -86,7 +86,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # relance à l'échéance (urgentes si la demande l'est)
                  "decision_pending", "decision_overdue",
                  # L161c : la CI de main est rouge (elle bloque les déploiements)
-                 "ci_main_red")
+                 "ci_main_red",
+                 # L226b : un agent attend un compte authentifié sain
+                 "auth_blocked")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -130,6 +132,7 @@ TYPE_LABELS = {
     "host_underused": "hôte sous-employé",
     "balance_low": "solde bas",
     "host_not_ready": "hôte non prêt",
+    "auth_blocked": "authentification en échec",
     "host_power_low": "batterie faible de l'hôte",
     "backlog_empty": "file d'amélioration vide",
     "mail_undeliverable": "courrier en souffrance",
@@ -145,7 +148,7 @@ TYPE_LABELS = {
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
-                "mail_undeliverable", "ci_main_red")
+                "mail_undeliverable", "ci_main_red", "auth_blocked")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.

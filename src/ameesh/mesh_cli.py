@@ -1908,6 +1908,12 @@ def build_parser() -> argparse.ArgumentParser:
     pa_auto.add_argument("harness", nargs="?", default=None,
                          help="harnais (défaut : tous ceux qui ont des comptes)")
     pa_auto.set_defaults(func=cmd_accounts)
+    pa_ok = acc_sub.add_parser(
+        "healthy", help="déclarer sain un compte reconnecté (L226b : lève auth_blocked)")
+    pa_ok.add_argument("harness")
+    pa_ok.add_argument("account", nargs="?", default="",
+                       help="compte déclaré (défaut : identifiant par défaut du harnais)")
+    pa_ok.set_defaults(func=cmd_accounts)
     p_acc.set_defaults(func=cmd_accounts)
 
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
@@ -2084,7 +2090,8 @@ def _cost_report_reads(cfg: Config, db) -> None:
 
 
 def cmd_accounts(cfg: Config, args) -> int:
-    """`ameesh accounts list|use <harnais> <compte>|auto [harnais]` (L30, 0027).
+    """`ameesh accounts list|use <harnais> <compte>|auto [harnais]|healthy
+    <harnais> [<compte>]` (L30, 0027 ; L226b).
 
     Les profils viennent de la configuration de l'hôte ; seul l'état (compte
     actif, forçage, journal des bascules) est en base. Rien n'affiche de secret :
@@ -2126,6 +2133,27 @@ def cmd_accounts(cfg: Config, args) -> int:
                 else:
                     print("comptes %s : déjà en automatique" % nom)
             return 0
+        if what == "healthy":
+            items = declares.get(args.harness) or []
+            if items and not args.account:
+                print("comptes déclarés pour %s : préciser lequel (%s)"
+                      % (args.harness, ", ".join(p.name for p in items)), file=sys.stderr)
+                return 1
+            if args.account and not accounts_mod.by_name(items, args.account):
+                print("compte inconnu pour %s : %r" % (args.harness, args.account),
+                      file=sys.stderr)
+                return 1
+            storage.of(db).credentials.report(
+                cfg.host, args.harness, args.account, "healthy",
+                reason="déclaré sain par %s" % qui, source="manual")
+            texte = ("Compte %s/%s déclaré sain sur %s par %s : les agents en auth_blocked "
+                     "sur ce compte reprennent." % (args.harness, args.account or "(défaut)",
+                                                     cfg.host, qui))
+            fil.record(cfg, db, sender=qui, recipients=[], text=texte,
+                       meta={"action": "compte", "type": "sain", "harnais": args.harness,
+                             "compte": args.account, "audit": "accounts"})
+            print(texte)
+            return 0
         book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
         # L71 : `accounts list` est un affichage — aucun relevé écrit
         rows = accounts_mod.report(cfg, db, book, record=False)
@@ -2134,8 +2162,13 @@ def cmd_accounts(cfg: Config, args) -> int:
         bascules = storage.of(db).accounts.switches(cfg.host, None, max(0, getattr(args, "last", 5))) \
             if declares else []
         if getattr(args, "json", False):
+            try:
+                sante = storage.of(db).credentials.listing(cfg.host)
+            except db_mod.DbError:
+                sante = []  # base sans la migration 0058
             print(json.dumps({"schema": "ameesh-accounts/1", "host": cfg.host,
-                              "accounts": rows, "switches": bascules},
+                              "accounts": rows, "switches": bascules,
+                              "credentials": sante},
                              ensure_ascii=False, indent=2, default=str))
             return 0
         print(accounts_mod.format_rows(rows))

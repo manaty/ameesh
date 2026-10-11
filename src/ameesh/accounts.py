@@ -63,6 +63,14 @@ redevient éligible au premier relevé au-dessus (solde rechargé).
    matin), puis l'ordre déclaré ;
 4. sinon pause : tous les comptes sont au seuil.
 
+**Échec d'authentification** (L226b, table `credential_health`) : un compte
+déclaré `failing` (par la sentinelle L226a ou par un tour en échec
+d'authentification) n'est jamais choisi, ni par la continuité ni par le
+retard sur le rythme ; un compte au forfait en panne n'est jamais remplacé
+par une clé d'API payée au jeton. S'il ne reste aucun compte sain sous son
+seuil, `Choice.auth_blocked` : le compte en panne est rendu, et la garde de
+l'exécuteur tient l'agent en `auth_blocked` jusqu'au retour d'un compte sain.
+
 Le seuil est celui de la garde (0019, inchangé) : `min(90 %, part écoulée +
 10 points)` sur les vraies jauges **du compte**, relues à chaque choix —
 Claude : les `rate_limit_event` du flux des agents, attribués par le marqueur
@@ -89,7 +97,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from . import harnesses, platform, storage
+from . import auth_failure, harnesses, platform, storage
 from .config import NAME_RE
 
 TYPES = ("config_dir", "api_key_env")
@@ -572,6 +580,10 @@ class Choice:
     forced: bool = False
     why: str = ""                        #: raison du choix (journal, 0034 §5)
     kept: bool = False                   #: continuité : la session garde son compte
+    #: L226b : aucun compte sain sous son seuil — `profile` est un compte en
+    #: échec d'authentification, que la garde de l'exécuteur ne lance pas
+    #: (l'agent reste `auth_blocked`)
+    auth_blocked: bool = False
 
 
 def _label(evaluations: dict) -> str:
@@ -711,8 +723,13 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
         row = store.active(host, harness) or {"account": items[0].name, "forced": False}
         active_name = row.get("account") if row.get("account") in names else items[0].name
     active = by_name(items, active_name) or items[0]
+    # L226b : un compte en échec d'authentification n'est jamais choisi
+    sick = auth_failure.failing(db, host, harness)
+    candidates = healthy(items, sick)
 
-    # 1. forçage manuel : il prime, même sur la continuité
+    # 1. forçage manuel : il prime, même sur la continuité (un compte forcé en
+    # échec d'authentification est rendu tel quel : la garde de l'exécuteur
+    # bloque l'agent, elle ne bascule pas contre un geste humain)
     if row.get("forced"):
         current = ev(active)
         if current.ok:
@@ -724,20 +741,34 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     # 2. continuité : la session garde son compte tant qu'il est sous son seuil
     # (les autres comptes ne sont alors pas relus : rien à choisir)
     own = by_name(items, session_account) if session_account else None
-    if own is not None and ev(own).ok:
+    if own is not None and own in candidates and ev(own).ok:
         return Choice(own, active, kept=True,
                       why="continuité : la session reste sur %s, sous son seuil" % own.name)
     for profile in items:
         ev(profile)
     # 3. le compte le plus en retard sur son rythme (amendement 0034, L117)
-    ranked = rank(items, cache, now)
+    ranked = rank(candidates, cache, now)
     if not ranked:
+        blocked = [p for p in items if p.name in sick and cache[p.name].ok]
+        if blocked:
+            # L226b : des comptes sous leur seuil, mais aucun sain — jamais de
+            # repli payé en plus : le compte en panne est rendu, la garde de
+            # l'exécuteur tient l'agent en `auth_blocked` et l'alerte part
+            stuck = active if active in blocked else blocked[0]
+            return Choice(stuck, active, auth_blocked=True,
+                          why="aucun compte %s sain : %s" % (
+                              harness, " ; ".join("%s : %s" % (p.name, sick[p.name].get(
+                                  "reason") or "authentification en échec")
+                                  for p in items if p.name in sick)))
         return Choice(None, active, reason="tous les comptes %s au seuil — %s"
                       % (harness, _label(cache)))
     target = ranked[0]
     why = reason_of(ranked, cache, now)
     left = own if own is not None else (active if target.name != active.name else None)
-    if left is not None and not cache[left.name].ok:
+    if left is not None and left.name in sick:
+        why = "%s en échec d'authentification (%s) ; %s" % (
+            left.name, sick[left.name].get("reason") or "?", why)
+    elif left is not None and not cache[left.name].ok:
         why = "%s au seuil (%s) ; %s" % (left.name, cache[left.name].reason, why)
     if target.name == active.name:
         return Choice(target, active, why=why)
@@ -754,6 +785,19 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     if fresh.get("forced"):
         return _reread(store, host, harness, items, active)
     return Choice(target, by_name(items, fresh.get("account")) or target, why=why)
+
+
+def healthy(items: list[Profile], sick: dict) -> list[Profile]:
+    """Les comptes candidats quand certains sont en échec d'authentification
+    (L226b) : les autres, sauf qu'un compte au forfait en panne n'est jamais
+    remplacé par une clé d'API payée au jeton (« jamais d'overage », n°6810)."""
+    if not sick:
+        return list(items)
+    sains = [p for p in items if p.name not in sick]
+    forfait_en_panne = any(p.kind != "api_key_env" for p in items if p.name in sick)
+    if forfait_en_panne:
+        sains = [p for p in sains if p.kind != "api_key_env"]
+    return sains
 
 
 def _reread(store, host: str, harness: str, items: list[Profile], fallback: Profile) -> Choice:

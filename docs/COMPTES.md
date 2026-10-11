@@ -136,6 +136,7 @@ dans le canon :
 ameesh accounts list [--json]          # comptes, dernier choix, état, jauges, pertes, bascules
 ameesh accounts use claude secondaire  # forçage manuel (plus de choix automatique)
 ameesh accounts auto [claude]          # retour au choix automatique (0034)
+ameesh accounts healthy claude secondaire  # compte reconnecté : déclaré sain (L226b)
 ameesh cost report                     # dépense par agent, compte actif, jauges par compte
 ameesh cost gauges                     # historique des jauges, par compte
 ameesh cost balance --record           # soldes, par compte de clé d'API
@@ -193,3 +194,59 @@ antérieures. Quand ce compte est inutilisable (identifiants retirés, forfait
 saturé) et que la session n'est pas portable, la rotation ne peut pas résumer
 sous l'ancien compte : la session neuve s'ouvre sur un **brief de reprise
 déterministe** (voir `ameesh resume` dans [EXPLOITATION.md](EXPLOITATION.md)).
+
+## 4. Authentification en échec : `auth_blocked` (L226b)
+
+Un identifiant peut cesser de marcher sans prévenir : jeton OAuth expiré ou
+révoqué, « Please run /login », 401 `authentication_error`, gcloud
+« Reauthentication failed ». Avant L226b, le tour échouait, la consigne
+repartait en attente, et l'agent relançait le même tour en boucle jusqu'à
+l'arrêt après échecs rapides (L48).
+
+**Santé des identifiants** (table `credential_health`, migration 0058) : une
+ligne par (hôte, harnais, compte) — `account` est le nom du compte déclaré,
+`''` pour l'identifiant par défaut d'un harnais sans comptes. `state` vaut
+`healthy`, `failing` ou `unknown` ; `source` dit qui l'a écrit : la
+sentinelle (`sentinel`, L226a), un tour en échec (`turn`) ou un humain
+(`manual`). `failing_since` garde le début de la panne.
+
+**Fin de tour.** Un tour en échec dont l'erreur, la réponse courte (au plus
+600 caractères) ou la fin du stderr est un échec d'authentification
+(`ameesh.auth_failure.classify`) n'est ni un échec rapide ni relancé : le
+compte du tour est noté `failing` (source `turn`), la consigne repart en
+attente, l'agent passe `blocked` avec `status_text` « `auth_blocked:
+<harnais>/<compte>` » et `last_error` « `auth_blocked: <raison>` ». Un tour
+qui échoue autrement (429, contexte, code de sortie) suit le chemin habituel.
+
+**Bascule.** Le choix du compte (§ 2, `accounts.choose`) reste celui de L30 et
+L117, restreint aux comptes **sains** : un compte `failing` n'est jamais
+choisi, pas même par la continuité de session ; l'ordre déclaré départage
+comme avant. Il n'y a pas d'ordre propre à la panne. Le tour suivant part donc
+sur un compte sain, avec la reprise ou la rotation de session habituelle, et
+le blocage est levé.
+
+**Jamais de dépense en plus** (décision du 2026-10-11) : un compte au-dessus de
+son seuil reste écarté, et un compte au forfait en panne n'est jamais
+remplacé par une clé d'API payée au jeton (`type: api_key_env`). Entre clés
+d'API d'un même harnais, la bascule reste possible.
+
+**Aucun compte sain sous son seuil** : l'agent reste `auth_blocked`. Il ne
+consomme ni consigne ni courrier, aucun tour n'est tenté, et l'alerte
+`auth_blocked` (poussée par défaut, urgente) part au responsable. Il reprend
+seul dès que son compte, ou un autre, est de nouveau sain. Un compte forcé
+(`ameesh accounts use`) en panne n'est pas remplacé : l'agent reste bloqué
+jusqu'à `ameesh accounts auto` ou la reconnexion. Si les comptes sains sont
+au seuil mais qu'un compte en panne ne l'est pas, c'est `auth_blocked` : se
+reconnecter débloque. Si tous les comptes sont au seuil, en panne ou non,
+c'est la pause budget habituelle.
+
+**Reprise.** Après la reconnexion (`claude /login` dans le dossier du compte,
+`gcloud auth login`…), la sentinelle L226a voit le compte sain et le note
+`healthy`. Sans elle, on le déclare à la main :
+
+```sh
+ameesh accounts healthy claude secondaire   # compte déclaré
+ameesh accounts healthy claude              # harnais sans comptes déclarés
+```
+
+`ameesh accounts list --json` montre la table (`credentials`).

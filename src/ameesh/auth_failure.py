@@ -70,3 +70,51 @@ def stderr_tail(path: str | None, limit: int = STDERR_TAIL_BYTES) -> str:
             return fh.read().decode("utf-8", errors="replace")
     except OSError:
         return ""
+
+
+# --------------------------------------------------------------------------
+# credential health (table `credential_health`, migration 0058)
+# --------------------------------------------------------------------------
+
+#: `status_text` of an agent blocked on authentication (status `blocked`),
+#: followed by `<harness>/<account>`; `last_error` starts with it too
+STATUS_PREFIX = "auth_blocked:"
+
+
+def account_name(profile) -> str:
+    """The health key of a turn's account: the L30 account name, '' for the
+    harness's default credential (no accounts declared)."""
+    return profile.name if profile is not None else ""
+
+
+def status_text(harness: str, account: str) -> str:
+    return "%s %s/%s" % (STATUS_PREFIX, harness, account or "(défaut)")
+
+
+def failing(db, host: str, harness: str) -> dict[str, dict]:
+    """{account: row} of the credentials reported `failing` for a harness.
+
+    A database without migration 0058 has no failing credential (the
+    feature is off until it is migrated); an unreachable database raises
+    (L72: the caller suspends the turns)."""
+    from . import db as db_mod, storage
+    try:
+        rows = storage.of(db).credentials.health(host, harness)
+    except db_mod.Unavailable:
+        raise
+    except db_mod.DbError:
+        return {}
+    return {name: row for name, row in rows.items() if row.get("state") == "failing"}
+
+
+def report(db, host: str, harness: str, account: str, state: str, *, reason: str = "",
+           source: str) -> dict:
+    """Records a credential's health; {} on a database without 0058."""
+    from . import db as db_mod, storage
+    try:
+        return storage.of(db).credentials.report(host, harness, account, state,
+                                                 reason=reason, source=source)
+    except db_mod.Unavailable:
+        raise
+    except db_mod.DbError:
+        return {}
