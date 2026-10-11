@@ -330,9 +330,31 @@ class ReviewAndShimTests(_Base):
         self._npm("ci", cwd=pkg)
         self.assertTrue(os.path.islink(os.path.join(pkg, "node_modules")))
         self.assertEqual(self._npm("rebuild", cwd=pkg), (0, [["rebuild"]]))
-        self.assertFalse(os.path.lexists(os.path.join(pkg, "node_modules")))
+        self.assertFalse(os.path.islink(os.path.join(pkg, "node_modules")))
         self.assertEqual(self._npm("--fetch-retries", "2", "test", cwd=review),
                          (0, [["--fetch-retries", "2", "test"]]))
+
+    def test_r3_review_refuses_any_install_word_anywhere(self):
+        review = _package(os.path.join(self.base, "nexlink-codex2-review-ime"))
+        for args in (["run", "link"], ["--weird", "x", "install"], ["exec", "--", "ci"],
+                     ["--unknown-opt", "dedupe"]):
+            self.assertEqual(self._npm(*args, cwd=review), (1, []), args)
+        self.assertEqual(self._npm("test", cwd=review), (0, [["test"]]))
+        self.assertEqual(self._npm("run", "lint", cwd=review), (0, [["run", "lint"]]))
+
+    def test_r3_tree_commands_get_a_full_local_tree_first(self):
+        pkg = _package(os.path.join(self.base, "w1"))
+        self._npm("ci", cwd=pkg)
+        installer = FakeInstaller()
+        code, calls = self._npm("prune", cwd=pkg, installer=installer)
+        self.assertEqual((code, calls), (0, [["prune"]]))
+        self.assertEqual(installer.calls, [pkg])        # npm ci from the lockfile, here
+        self.assertTrue(os.path.isfile(os.path.join(pkg, "node_modules", "left-pad", "lib",
+                                                    "index.js")))
+        other = _package(os.path.join(self.base, "w2"))
+        self._npm("ci", cwd=other)
+        failing = FakeInstaller(fail_in=(other,))
+        self.assertEqual(self._npm("update", cwd=other, installer=failing), (1, []))
 
     def test_install_shim_and_real_npm(self):
         shim_dir = os.path.join(self.base, ".menage", deps.SHIM_DIR)
@@ -634,6 +656,30 @@ class ReviewR2Tests(_Base):
         lines = deps.gc_node_modules(self.cache, now=later, holders=lambda _p: [])
         self.assertEqual([line["detail"] for line in lines], ["abandoned temporary fill"])
         self.assertFalse(os.path.lexists(stray))
+
+    def test_r3_temp_gc_looks_at_the_whole_tree_within_a_deadline(self):
+        root = deps.nm_root(self.cache)
+        stray = os.path.join(root, "b" * 64 + deps.TMP_SEP + "1-dead")
+        deep = os.path.join(stray, "app", "node_modules", "pkg", "lib")
+        os.makedirs(deep)
+        later = time.time() + deps.GRACE_S + 60
+        old = time.time() - 2 * deps.GRACE_S
+        for current, _dirs, _files in os.walk(stray):
+            os.utime(current, (old, old))
+        with open(os.path.join(deep, "late.js"), "w") as fh:
+            fh.write("still written")                  # a stray script, deep down
+        future = later - 60
+        os.utime(os.path.join(deep, "late.js"), (future, future))
+        for current in (stray, os.path.join(stray, "app")):
+            os.utime(current, (old, old))
+        self.assertEqual(deps.gc_node_modules(self.cache, now=later, holders=lambda _p: []),
+                         [])
+        os.utime(os.path.join(deep, "late.js"), (old, old))
+        with mock.patch.object(deps, "TEMP_WALK_S", -1.0):  # walk cut short: kept
+            self.assertEqual(deps.gc_node_modules(self.cache, now=later,
+                                                  holders=lambda _p: []), [])
+        self.assertEqual(len(deps.gc_node_modules(self.cache, now=later,
+                                                  holders=lambda _p: [])), 1)
 
     def test_3_cheap_filter_refreshes_last_alive_of_linked_entries(self):
         pkg = _package(os.path.join(self.base, "w1"))

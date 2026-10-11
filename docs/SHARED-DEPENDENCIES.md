@@ -85,12 +85,20 @@ keep typing npm:
 |---|---|---|
 | `npm ci`, `npm install` (no package), neutral options only (`--prefer-offline`, `--no-audit`, `--silent`…), lockfile in sync with `package.json` | refused | `ameesh deps link --replace`: links the shared tree (fills it once) |
 | `npm install <pkg>`, `npm ci --omit=dev`, lockfile out of sync | refused | the shared link is removed, then the real npm installs a local tree |
-| `npm update`, `uninstall`, `rebuild`, `link`, `dedupe`, `prune` (and aliases) | refused | the shared link is removed, then the real npm works on a local tree |
+| `npm update`, `uninstall`, `rebuild`, `link`, `dedupe`, `prune` (and aliases) | refused | a local tree is installed first (`npm ci` from the lockfile, never an empty `node_modules`), then the real npm runs the command on it |
 | `npm install -g …`, `npm test`, `npm run …`, anything else | passed through | passed through |
 
 `AMEESH_DEPS=off` passes everything through. `AMEESH_DEPS=allow-review`
 allows installs in a review worktree. With `policy.housekeeping.deps: false`,
 no wrapper is installed.
+
+In a review worktree there is no parsing to get wrong: ANY argument that
+names an install-type command (`ci`, `install`, `i`, `add`, `update`,
+`uninstall`, `rebuild`, `link`, `dedupe`, `prune` and their aliases) refuses
+the call, wherever it sits; `npm run link` is a false positive, accepted
+there. Elsewhere, a form the wrapper does not recognise passes through to
+the real npm: the shared tree is read-only, so a stray install fails with
+EACCES and changes nothing.
 
 The command is the first word that is an npm command name, wherever it sits
 (`npm --fetch-retries 2 ci` is `ci`); the word after `--prefix`, `-C`,
@@ -159,8 +167,9 @@ all of these hold:
 * its lock is free (no fill, no link being made).
 
 Each pass refreshes `.last-alive` of every entry it sees linked. It also
-deletes an abandoned temporary fill (`<key>.tmp-…`) unchanged for 24 h, with
-no process in it and its key's lock free, and an unpublished `<key>`
+deletes an abandoned temporary fill (`<key>.tmp-…`) in which nothing changed
+for 24 h (newest mtime over the whole tree; a walk that doesn't finish
+within 30 s keeps it), with no process in it and its key's lock free, and an unpublished `<key>`
 directory (no marker, lock free, no process) older than an hour. Everything is read again under the entry's lock right before
 deleting. Lock files are never deleted, so two fillers always lock the same
 inode. Without a readable registry, nothing is deleted. Each deletion is

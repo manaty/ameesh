@@ -93,6 +93,9 @@ FILL_ENV = ("PATH", "HOME", "LANG", "LANGUAGE", "TMPDIR", "TMP", "TEMP",
 #: an abandoned temporary fill (`<key>.tmp-<pid>-<random>`) is deleted after
 #: this long, if no process uses it and its key's lock is free
 TMP_SEP = ".tmp-"
+#: longest walk of an abandoned temporary fill for its newest file (seconds);
+#: past it the directory is kept
+TEMP_WALK_S = 30.0
 #: directories never searched for packages
 SKIP_DIRS = (NODE_MODULES, "target", "dist", "build")
 #: search depth for packages under a worktree
@@ -904,25 +907,38 @@ def npm_shim(args: list[str], *, env: dict | None = None, cwd: str | None = None
     if mode in ("off", "0", "no", "none"):
         return passthrough()
     command, positional, options, values = _npm_words(args)
-    if command not in INSTALL_COMMANDS + TREE_COMMANDS or _global(options, values):
-        return passthrough()                      # global: outside any worktree
     where = cwd
     if values.get("--prefix"):
         where = os.path.join(cwd, os.path.expanduser(values["--prefix"]))
-    if mode != "allow-review" and (is_review_worktree(where) or is_review_worktree(cwd)):
+    # in a review worktree, no parsing to get wrong: ANY word that names an
+    # install-type command refuses (`npm run link` too; false positives are
+    # fine there)
+    named = [a for a in args if a in INSTALL_COMMANDS + TREE_COMMANDS]
+    if named and mode != "allow-review" and (is_review_worktree(where)
+                                             or is_review_worktree(cwd)):
         _say("`npm %s` refused in a review worktree (%s): reviews get no dependencies "
              "(#248); run the tests in your main worktree (check out the branch "
              "there). AMEESH_DEPS=allow-review to override."
-             % (command, worktree_root(where) or where))
+             % (named[0], worktree_root(where) or where))
         return 1
+    # elsewhere a form the parser misses passes through: the shared tree is
+    # read-only, a stray install fails (EACCES) and changes nothing
+    if command not in INSTALL_COMMANDS + TREE_COMMANDS or _global(options, values):
+        return passthrough()                      # global: outside any worktree
     pkg = package_dir(where)
     if pkg is None or not os.path.isfile(os.path.join(pkg, LOCKFILE)):
         return passthrough()
     link = os.path.join(pkg, NODE_MODULES)
     if command in TREE_COMMANDS:
         if os.path.islink(link):
-            os.unlink(link)
-            _say("shared node_modules unlinked in %s: `npm %s` works on a local tree"
+            # a local tree from the lockfile first (never an empty one), then
+            # the command on it
+            done = make_local(pkg, installer=installer, env=env)
+            if done["status"] != "local":
+                _say("`npm %s`: no local tree for %s (%s)"
+                     % (command, pkg, done.get("error") or done["status"]))
+                return 1
+            _say("shared node_modules replaced by a local tree in %s for `npm %s`"
                  % (pkg, command))
         return passthrough()
     ci = command in ("ci", "clean-install", "install-clean", "isntall-clean", "ic")
@@ -1068,10 +1084,9 @@ def _gc_temp(item: dict, root: str, *, now: float, holders, dry_run: bool) -> li
     no process uses it (a stray install script) and its key's lock is free
     (a fill in progress)."""
     temp = item["path"]
-    newest = max([item["mtime"]] + [_mtime(os.path.join(temp, n))
-                                    for n in _listdir(temp)])
-    if now - newest < GRACE_S:
-        return []
+    newest = _newest(temp, deadline=time.monotonic() + TEMP_WALK_S)
+    if newest is None or now - newest < GRACE_S:
+        return []                          # walk not finished: kept
     try:
         if holders(temp):
             return []
@@ -1095,11 +1110,29 @@ def _gc_temp(item: dict, root: str, *, now: float, holders, dry_run: bool) -> li
     return [line]
 
 
-def _listdir(path: str) -> list[str]:
-    try:
-        return os.listdir(path)
-    except OSError:
-        return []
+def _newest(top: str, *, deadline: float) -> float | None:
+    """Newest mtime of `top` and everything under it (never through a
+    symlink), or None if the walk did not finish before `deadline`
+    (`time.monotonic`)."""
+    newest = _mtime(top)
+    stack = [top]
+    while stack:
+        if time.monotonic() > deadline:
+            return None
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for item in it:
+                    try:
+                        st = item.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    newest = max(newest, st.st_mtime)
+                    if stat.S_ISDIR(st.st_mode):
+                        stack.append(item.path)
+        except OSError:
+            continue
+    return newest
 
 
 def _holders(entry: str) -> list[dict]:
