@@ -662,7 +662,7 @@ class WorkItems(interface.WorkItems):
                            " AND state NOT IN ('merged', 'promoted', 'closed')", (int(item_id),))
             if not lot:
                 return None
-            tx.query(
+            tx.execute(
                 "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by)"
                 " VALUES (%s, %s, %s, %s)"
                 " ON CONFLICT (work_item_id) DO UPDATE SET target = excluded.target,"
