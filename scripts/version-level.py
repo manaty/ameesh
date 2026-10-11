@@ -17,23 +17,33 @@ before `vX.Y.Z` to `vX.Y.Z`.
 The level found in the range is a floor, from what a script can see:
 
 - major: a migration that existed in the previous version changed or
-  removed; a new migration that drops a table, column, schema or type,
-  renames, changes a column type, adds `NOT NULL`, truncates or deletes rows;
-  a command or a long option removed from the CLI; a commit with the
-  trailer `ameesh-breaking: <why>` (an agent contract changed: no script
-  sees that);
-- minor: a new migration; a new command or long option; a new `AMEESH_*`
-  setting read by the package;
+  removed; a new migration that drops a table, column (`DROP x` included),
+  schema, type or sequence, renames, changes a column type, adds `NOT NULL`,
+  truncates or deletes rows (dropping a view, trigger, index, constraint,
+  default or function to recreate it is not a break); a command or command
+  alias removed, an option string removed from a command (each command has
+  its own: removing `show --json` while `list --json` stays is a break), an
+  `AMEESH_*` setting no longer read; a commit with the trailer
+  `ameesh-breaking: <why>` (an agent contract changed: no script sees that);
+- minor: a new migration; a new command, alias or option of a command; a
+  new `AMEESH_*` setting read by the package;
 - patch: anything else.
+
+The CLI is read from the syntax tree of each module (`add_parser` with its
+`aliases`, every option string of `add_argument`), not from the text:
+reordering the aliases of an option changes nothing.
 
 The number must be the next one at its own level (1.9.0 → 1.9.1, 1.10.0 or
 2.0.0), and that level must not be below the floor. A level above the floor
 passes, with a note: a new function without a new command is minor, and no
 script sees it; the auditor reads the notes. Exit code 0 when it matches (or
-not a version PR), 1 when it does not, 2 on a usage or git error.
+not a version PR), 1 when it does not, 2 on a usage or git error. Git runs
+in the checkout that holds this script, whatever the current directory.
 """
 from __future__ import annotations
 
+import ast
+import pathlib
 import re
 import subprocess
 import sys
@@ -43,15 +53,22 @@ MIGRATIONS = "src/ameesh/migrations/"
 SOURCES = "src/ameesh/"
 LEVELS = ("patch", "minor", "major")
 TRAILER = "ameesh-breaking"
-#: the repository (None: the current directory); the tests point it elsewhere
-REPO = None
+#: the repository: the checkout this script belongs to, whatever the caller's
+#: directory (`python3 ameesh/scripts/version-level.py` from its parent works);
+#: the tests point it elsewhere
+REPO = str(pathlib.Path(__file__).resolve().parent.parent)
 _VERSION = re.compile(r'^version\s*=\s*"(\d+)\.(\d+)\.(\d+)[^"]*"\s*$', re.M)
+#: in a new migration: drops anything but what is recreated or holds no data
+#: (`ALTER TABLE a DROP x` drops a column), renames, changes a column type
+#: (`COLUMN` is optional, the name may be quoted), adds `NOT NULL`, empties
+_IDENT = r'(?:"(?:[^"]|"")+"|\w+)'
 _DESTRUCTIVE = re.compile(
-    r"\b(drop\s+(table|column|schema|type)|rename\b|alter\s+column\s+\w+\s+"
-    r"(set\s+data\s+)?type\b|set\s+not\s+null|truncate|delete\s+from)\b", re.I)
-_COMMAND = re.compile(r"""add_parser\(\s*["']([\w-]+)["']""")
+    r"\bdrop\s+(?!(?:constraint|trigger|view|materialized\s+view|index|default|not\s+null"
+    r"|function|procedure|policy|rule|identity|expression)\b)\S+"
+    r"|\brename\b"
+    r"|\balter\s+(?:column\s+)?%s\s+(?:set\s+data\s+)?type\b"
+    r"|\bset\s+not\s+null\b|\btruncate\b|\bdelete\s+from\b" % _IDENT, re.I)
 _MAIN_COMMAND = re.compile(r"""command\s*(?:==\s*["']([\w-]+)["']|in\s*\(([^)]*)\))""")
-_OPTION = re.compile(r"""add_argument\(\s*(?:["']-\w["']\s*,\s*)?["'](--[\w-]+)["']""")
 _SETTING = re.compile(r"""["'](AMEESH_[A-Z0-9_]+)["']""")
 
 
@@ -87,19 +104,136 @@ def _sql(text: str) -> str:
     return re.sub(r"--[^\n]*", " ", text)
 
 
+def _strings(node) -> list[str]:
+    """The string literals of a list or tuple node (nothing else)."""
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [e.value for e in node.elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+    return []
+
+
+class _Parsers(ast.NodeVisitor):
+    """The argparse tree of one file, statement after statement: a variable
+    bound to `add_parser("x")` is the command path `… x`; `add_subparsers()`
+    and argument groups keep the path of their parser; a local function
+    called with a parser runs with its parameter bound to that path. A
+    variable the file does not bind (a parameter) is the top level. Every
+    option string of `add_argument` is kept with its command, so `show
+    --json` and `list --json` are two entries."""
+
+    def __init__(self, tree: ast.Module):
+        self.commands: set[str] = set()
+        self.options: set[str] = set()
+        self.functions = {n.name: n for n in tree.body
+                          if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        self.env: dict[str, tuple[str, ...]] = {}
+        self.stack: list[str] = []
+
+    def path(self, node) -> tuple[str, ...] | None:
+        """The command path of a parser expression: a known variable, a call
+        that builds a parser, else the top level (an unknown name or
+        attribute); None for anything else."""
+        if isinstance(node, ast.Name):
+            return self.env.get(node.id, ())
+        if isinstance(node, ast.Attribute):
+            return ()
+        return self.parser_of(node)  # `sub.add_parser("x").add_subparsers()`
+
+    def parser_of(self, node) -> tuple[str, ...] | None:
+        """The path a call returns when it builds a parser, None otherwise."""
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            return None
+        base = self.path(node.func.value)
+        if base is None:
+            return None
+        if node.func.attr == "add_parser" and node.args and isinstance(
+                node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+            return base + (node.args[0].value,)
+        if node.func.attr in ("add_subparsers", "add_argument_group",
+                              "add_mutually_exclusive_group"):
+            return base
+        return None
+
+    def visit_Assign(self, node):
+        self.visit(node.value)
+        built = self.parser_of(node.value)
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                if built is None:
+                    self.env.pop(target.id, None)
+                else:
+                    self.env[target.id] = built
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            base = self.path(func.value)
+            if base is None:
+                return
+            if func.attr == "add_parser" and node.args and isinstance(
+                    node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                names = [node.args[0].value]
+                for keyword in node.keywords:
+                    if keyword.arg == "aliases":
+                        names += _strings(keyword.value)
+                self.commands.update(" ".join(base + (n,)) for n in names)
+            elif func.attr == "add_argument":
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str) \
+                            and arg.value.startswith("-"):
+                        self.options.add(" ".join(base + (arg.value,)))
+        elif isinstance(func, ast.Name) and func.id in self.functions \
+                and func.id not in self.stack:
+            bound = {}
+            params = self.functions[func.id].args.args
+            for param, arg in zip(params, node.args):
+                if isinstance(arg, ast.Name) and arg.id in self.env:
+                    bound[param.arg] = self.env[arg.id]
+            if bound:
+                self.run(self.functions[func.id], bound)
+
+    def visit_FunctionDef(self, node):
+        pass  # run from `walk` (top level) or from a call, never in passing
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def run(self, function, bound: dict[str, tuple[str, ...]]):
+        saved = self.env
+        self.env = dict(bound)
+        self.stack.append(function.name)
+        for statement in function.body:
+            self.visit(statement)
+        self.stack.pop()
+        self.env = saved
+
+    def walk(self, tree: ast.Module):
+        for statement in tree.body:
+            self.visit(statement)
+        for function in self.functions.values():
+            self.run(function, {})
+
+
 def surface(ref: str) -> dict[str, set[str]]:
-    """The commands, long options and settings of the package at `ref`."""
+    """The commands (with their aliases), the option strings of each command
+    and the settings of the package at `ref`."""
     out: dict[str, set[str]] = {"command": set(), "option": set(), "setting": set()}
     names = [n for n in git("ls-tree", "-r", "--name-only", ref, "--", SOURCES).split()
              if n.endswith(".py")]
     for name in names:
         text = git("show", "%s:%s" % (ref, name))
-        out["command"].update(_COMMAND.findall(text))
+        try:
+            tree = ast.parse(text, filename=name)
+        except SyntaxError as exc:
+            raise Error("%s at %s: %s" % (name, ref, exc))
+        parsers = _Parsers(tree)
+        parsers.walk(tree)
+        out["command"].update(parsers.commands)
+        out["option"].update(parsers.options)
         if name == SOURCES + "main.py":
             for one, several in _MAIN_COMMAND.findall(text):
                 out["command"].update([one] if one else re.findall(r"""["']([\w-]+)["']""",
                                                                     several))
-        out["option"].update(_OPTION.findall(text))
         out["setting"].update(_SETTING.findall(text))
     return out
 
@@ -123,8 +257,11 @@ def level(base: str, head: str) -> tuple[str, list[str]]:
         else:
             reasons["minor"].append("migration %s added" % name.rsplit("/", 1)[-1])
     before, after = surface(base), surface(head)
-    for kind in ("command", "option"):
+    gone = before["command"] - after["command"]
+    for kind in ("command", "option", "setting"):
         for name in sorted(before[kind] - after[kind]):
+            if kind == "option" and name.rpartition(" ")[0] in gone:
+                continue  # its command is reported
             reasons["major"].append("%s %s removed" % (kind, name))
     for kind in ("command", "option", "setting"):
         for name in sorted(after[kind] - before[kind]):

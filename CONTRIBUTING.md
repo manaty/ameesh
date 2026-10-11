@@ -84,11 +84,16 @@ published version ([AUDITEUR](docs/AUDITEUR.md), check 12). Both run
 the previous `v*` tag. What it sees sets a floor:
 
 - **major**: a migration of an earlier version changed or removed; a new
-  migration that drops a table, column, schema or type, renames, changes a
-  column type, adds `NOT NULL`, truncates or deletes rows; a command or a long
-  option removed; a commit with the trailer `ameesh-breaking: <why>`. No
-  script sees a changed agent contract, so its author writes that trailer;
-- **minor**: a new migration, command, long option or `AMEESH_*` setting;
+  migration that drops a table, column, schema, type or sequence, renames,
+  changes a column type, adds `NOT NULL`, truncates or deletes rows (dropping
+  a view, trigger, index, constraint or function to recreate it is not a
+  break); a command or command alias removed; an option removed from a
+  command (each command counts on its own); an `AMEESH_*` setting no longer
+  read; a commit with the trailer `ameesh-breaking: <why>`. No script sees a
+  changed agent contract, so its author writes that trailer, in a commit that
+  reaches `main` (PRs are merged, not squashed);
+- **minor**: a new migration, command, alias, option of a command or
+  `AMEESH_*` setting;
 - **patch**: anything else.
 
 The number must be the next one at its level (from 1.9.0: 1.9.1, 1.10.0 or

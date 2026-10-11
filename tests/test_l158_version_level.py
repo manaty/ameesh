@@ -91,8 +91,8 @@ class VersionLevelTest(unittest.TestCase):
         self._commit("1.2.3", "feature")
         floor, reasons = vl.level("v1.2.3", "HEAD")
         self.assertEqual(floor, "minor")
-        self.assertEqual(reasons, ["command land added", "option --all added",
-                                   "setting AMEESH_LAND_TTL added"])
+        self.assertEqual(reasons, ["command land added", "option show --all added",
+                                   "option show -a added", "setting AMEESH_LAND_TTL added"])
 
     def test_breaking_changes_need_a_major(self):
         cases = {
@@ -114,6 +114,80 @@ class VersionLevelTest(unittest.TestCase):
                 self.assertEqual(self._pr(), 1)
                 self._commit("2.0.0", "ameesh 2.0.0")
                 self.assertEqual(self._pr(), 0)
+
+    def _floor(self, cli, change, base="v1.2.3"):
+        """The floor of `cli` (tagged) → `change`."""
+        self._git("checkout", "-q", "-B", "case", base)
+        self._write("src/ameesh/cli.py", cli)
+        self._commit("1.2.3", "cli")
+        self._git("tag", "-f", "case-base")
+        self._write("src/ameesh/cli.py", change)
+        self._commit("1.2.3", "change")
+        return vl.level("case-base", "HEAD")
+
+    def test_every_option_string_counts_not_its_order(self):
+        cli = ('def build(sub):\n    p = sub.add_parser("run")\n'
+               '    p.add_argument("--debut", "--start", "-s")\n')
+        floor, reasons = self._floor(cli, cli.replace(', "--start"', ""))
+        self.assertEqual((floor, reasons[0]), ("major", "option run --start removed"))
+        self.assertEqual(self._floor(cli, cli.replace('"--debut", "--start"',
+                                                      '"--start", "--debut"'))[0], "patch")
+
+    def test_command_alias_removed_is_a_break(self):
+        cli = 'def build(sub):\n    p = sub.add_parser("show", aliases=["view"])\n'
+        floor, reasons = self._floor(cli, cli.replace(', aliases=["view"]', ""))
+        self.assertEqual((floor, reasons[0]), ("major", "command view removed"))
+
+    def test_options_belong_to_their_command(self):
+        cli = ('def _json(p):\n    p.add_argument("--json", action="store_true")\n\n\n'
+               'def build(sub):\n    work = sub.add_parser("work").add_subparsers()\n'
+               '    p = work.add_parser("show")\n    _json(p)\n'
+               '    g = p.add_mutually_exclusive_group()\n    g.add_argument("--all")\n'
+               '    p = work.add_parser("list")\n    _json(p)\n')
+        self.assertEqual(self._floor(cli, cli.replace("    _json(p)\n    g", "    g", 1)),
+                         ("major", ["option work show --json removed"]))
+        self.assertEqual(self._floor(cli, cli.replace('    g.add_argument("--all")\n', ""))[1],
+                         ["option work show --all removed"])
+        # a command removed is reported once, not with each of its options
+        self.assertEqual(self._floor(cli, cli.replace('work.add_parser("show")',
+                                                      'work.add_parser("view")'))[1],
+                         ["command work show removed"])
+
+    def test_setting_removed_is_a_break(self):
+        cli = CLI + '    TTL = os.environ.get("AMEESH_LAND_TTL")\n'
+        self.assertEqual(self._floor(cli, CLI),
+                         ("major", ["setting AMEESH_LAND_TTL removed"]))
+
+    def test_destructive_sql(self):
+        major = ("ALTER TABLE a DROP x;", 'ALTER TABLE a ALTER COLUMN "x" TYPE integer;',
+                 "alter table a alter x set data type bigint;",
+                 "alter table a drop if exists x;", "drop sequence s;", "DROP SCHEMA s CASCADE;",
+                 "alter table a alter column x set not null;", "alter table a rename to b;",
+                 "truncate a;", "delete from a where x = 1;")
+        minor = ("drop view if exists v;\ncreate view v as select 1;",
+                 "drop trigger if exists t on a;", "drop index if exists i;",
+                 "alter table a drop constraint if exists c;",
+                 "alter table a alter column x set default 0;",
+                 "alter table a alter column x drop not null;",
+                 "drop function if exists f();", "alter type t add value 'v';")
+        for sql, expected in [(s, "major") for s in major] + [(s, "minor") for s in minor]:
+            with self.subTest(sql):
+                self._git("checkout", "-q", "-B", "case", "v1.2.3")
+                self._write("src/ameesh/migrations/0002_b.sql", sql + "\n")
+                self._commit("1.2.3", "migration")
+                self.assertEqual(vl.level("v1.2.3", "HEAD")[0], expected)
+
+    def test_runs_from_any_directory(self):
+        """The auditor runs it from the checkout's parent: git still runs in
+        the checkout that holds the script."""
+        script = self.repo / "scripts" / "version-level.py"
+        script.parent.mkdir()
+        shutil.copy(ROOT / "scripts" / "version-level.py", script)
+        proc = subprocess.run(["python3", str(script.relative_to(self.repo.parent)),
+                               "level", "v1.2.3", "HEAD"], cwd=self.repo.parent,
+                              capture_output=True, text=True)
+        self.assertEqual((proc.returncode, proc.stderr), (0, ""))
+        self.assertTrue(proc.stdout.startswith("patch"), proc.stdout)
 
     def test_breaking_trailer(self):
         self._write("src/ameesh/cli.py", CLI + "# mail payload v2\n")
