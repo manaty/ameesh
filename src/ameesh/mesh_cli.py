@@ -378,6 +378,10 @@ def _print_host_menage(menage: dict) -> None:
             " — ALERTE : au-delà de %d %% (ameesh menage pour voir ce qui l'occupe)"
             % round(policy["tmpfs_alert"] * 100) if menage.get("tmpfs_alert") else ""))
     m = menage.get("measure")
+    if menage.get("tmpfs_alert") and (m or {}).get("system_tmp_top"):
+        # L162 : les plus grosses entrées relevées par le dernier bilan
+        from .menage import describe_top
+        print("  /tmp gros  %s" % describe_top(m["system_tmp_top"]))
     if m:
         print("  ménage     dossiers temporaires %s (quota %s par agent) ; caches %s / %s"
               "%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
