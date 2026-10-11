@@ -273,6 +273,27 @@ gardés ; à soi-même si le message nous était destiné), ou faire relancer
 l'agent par son responsable (`ameesh resume <agent>`), puis prévenir les
 expéditeurs du bon nom.
 
+## Fichiers temporaires : `$TMPDIR`, jamais `/tmp` en dur
+
+Règle de l'orchestrateur et de chacun de ses agents, à rappeler dans tout
+travail confié qui produit de gros fichiers (images Docker, clones, caches de
+tests) :
+
+* **n'écris jamais en dur dans `/tmp`, utilise `$TMPDIR`** — le dossier de
+  l'agent, sur disque, posé par ameesh à chaque tour (`$AMEESH_TMPDIR` est le
+  même) ; `docker save -o "$TMPDIR/image.tar"`, `git clone … "$TMPDIR/relecture"`,
+  `jest --cacheDirectory "$TMPDIR/jest"` ;
+* **rien de plus de 500 Mo dans `/tmp`** : sur un poste, `/tmp` est souvent en
+  mémoire (tmpfs) et partagé par tous les agents de l'hôte.
+
+Le 2026-10-11 à 03:38, le `/tmp` d'un poste (12 Go en mémoire, douze agents)
+était plein à 83 % : la porte de pression de l'hôte a bloqué tous les nouveaux
+tours, et treize agents sont restés au repos. Depuis (L162), une entrée de
+`/tmp` apparue pendant un tour est supprimée par le ménage une fois inchangée
+depuis 2 h et tenue par aucun processus (travail git non poussé gardé) ; et
+l'alerte d'un tmpfs plein dit les plus grosses entrées et l'action attendue.
+Le texte de chaque tour de courrier rappelle cette règle.
+
 ## Ajouter plutôt que modifier (L160a)
 
 Le 10/10, la moitié des blocs en conflit à la fusion étaient deux ajouts au

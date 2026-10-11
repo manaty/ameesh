@@ -69,6 +69,12 @@ EVENT_FOOTER = ("Ces événements te sont livrés ici : inutile de les chercher 
                 "attendre de confirmation.")
 PRIORITY_FOOTER = ("Traite-le en priorité, puis reprends ton travail sans attendre "
                    "de confirmation. Pour répondre : agent-mail send <nom> \"…\".")
+#: L162 : la règle des fichiers temporaires, dans chaque tour de courrier
+#: (le 2026-10-11, un /tmp en mémoire de 12 Go rempli à la main par des
+#: agents a bloqué tous les tours de l'hôte)
+TMP_NOTE = ("Fichiers temporaires : dans $TMPDIR (ton dossier, sur disque), jamais en dur "
+            "dans /tmp ; rien de plus de 500 Mo dans /tmp (en mémoire, partagé par tous "
+            "les agents de l'hôte).")
 #: rotation de session : résumé de reprise produit avant d'ouvrir une session
 #: neuve. Chaque contrainte y est attribuée à sa source (incident du
 #: 2026-10-10 : un « hold » propre à un lot, recopié sans source dans un
