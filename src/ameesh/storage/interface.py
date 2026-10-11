@@ -902,6 +902,19 @@ class WorkItems(Domain):
         """L122 : le lot (id, titre, état) qui a réservé ce numéro."""
 
     @abc.abstractmethod
+    def record_resolution(self, item_id: int, other_id: int, *, commit: str, lot_tip: str,
+                          other_tip: str, ref: str | None, files: list[str], note: str,
+                          actor: str) -> dict | None:
+        """L160d (0057): records (or replaces) the resolution prepared by lot
+        `item_id` for its conflict with lot `other_id`, with a journal line on
+        `item_id`. None if either lot is unknown."""
+
+    @abc.abstractmethod
+    def resolutions(self, item_ids: list[int]) -> list[dict]:
+        """L160d (0057): the recorded resolutions where either side is one of
+        `item_ids`, newest first."""
+
+    @abc.abstractmethod
     def set_branch_head(self, item_id: int, branch: str, head: str | None) -> bool:
         """L118 : retient le dernier commit de la branche vu en avance sur sa
         cible, si la branche du lot est toujours `branch`."""

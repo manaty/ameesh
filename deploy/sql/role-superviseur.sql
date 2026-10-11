@@ -383,6 +383,12 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('estimate_references', ARRAY[
         'id', 'published_at', 'published_by', 'body'
     ]),
+    -- L160d (0057): prepared conflict resolutions between two lots (commits,
+    -- ref, conflicting paths: STATE, no content)
+    ('work_resolutions', ARRAY[
+        'work_item_id', 'other_item_id', 'commit_sha', 'lot_tip', 'other_tip', 'ref',
+        'files', 'created_by', 'created_at'
+    ]),
     -- L157c (0056): actual time of a delivered lot by phase and size of its
     -- merged diff (durations and line counts: STATE)
     ('work_item_measures', ARRAY[
