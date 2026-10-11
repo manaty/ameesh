@@ -73,7 +73,7 @@ def stderr_tail(path: str | None, limit: int = STDERR_TAIL_BYTES) -> str:
 
 
 # --------------------------------------------------------------------------
-# credential health (table `credential_health`, migration 0058)
+# credential health (table `credential_health`, migration 0060)
 # --------------------------------------------------------------------------
 
 #: `status_text` of an agent blocked on authentication (status `blocked`),
@@ -94,7 +94,7 @@ def status_text(harness: str, account: str) -> str:
 def failing(db, host: str, harness: str) -> dict[str, dict]:
     """{account: row} of the credentials reported `failing` for a harness.
 
-    A database without migration 0058 has no failing credential (the
+    A database without migration 0060 has no failing credential (the
     feature is off until it is migrated); an unreachable database raises
     (L72: the caller suspends the turns)."""
     from . import db as db_mod, storage
@@ -108,12 +108,13 @@ def failing(db, host: str, harness: str) -> dict[str, dict]:
 
 
 def report(db, host: str, harness: str, account: str, state: str, *, reason: str = "",
-           source: str) -> dict:
-    """Records a credential's health; {} on a database without 0058."""
+           source: str, expires_at: float | None = None) -> dict:
+    """Records a credential's health; {} on a database without 0060."""
     from . import db as db_mod, storage
     try:
         return storage.of(db).credentials.report(host, harness, account, state,
-                                                 reason=reason, source=source)
+                                                 reason=reason, source=source,
+                                                 expires_at=expires_at)
     except db_mod.Unavailable:
         raise
     except db_mod.DbError:

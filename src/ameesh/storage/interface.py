@@ -584,7 +584,7 @@ class Accounts(Domain):
 
 
 # --------------------------------------------------------------------------
-# credential health (L226a/L226b, migration 0058)
+# credential health (L226a/L226b, migration 0060)
 # --------------------------------------------------------------------------
 
 class Credentials(Domain):
@@ -594,15 +594,17 @@ class Credentials(Domain):
 
     @abc.abstractmethod
     def report(self, host: str, harness: str, account: str, state: str, *,
-               reason: str = "", source: str) -> dict:
+               reason: str = "", source: str, expires_at: float | None = None) -> dict:
         """Records `state` (healthy | failing | unknown) from `source`
         (sentinel | turn | manual); `failing_since` is kept while failing and
-        cleared otherwise. Returns {state, previous} (previous: None if new)."""
+        cleared otherwise; `expires_at` (epoch, None = unknown) is the
+        credential's forecast expiry, overwritten on each report. Returns
+        {state, previous} (previous: None if new)."""
 
     @abc.abstractmethod
     def health(self, host: str, harness: str) -> dict[str, dict]:
         """{account: row} for a harness on a host: state, reason, source,
-        checked_ts, failing_since_ts."""
+        checked_ts, failing_since_ts, expires_ts."""
 
     @abc.abstractmethod
     def listing(self, host: str | None = None) -> list[dict]:

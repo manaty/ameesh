@@ -63,13 +63,21 @@ redevient éligible au premier relevé au-dessus (solde rechargé).
    matin), puis l'ordre déclaré ;
 4. sinon pause : tous les comptes sont au seuil.
 
-**Échec d'authentification** (L226b, table `credential_health`) : un compte
-déclaré `failing` (par la sentinelle L226a ou par un tour en échec
-d'authentification) n'est jamais choisi, ni par la continuité ni par le
-retard sur le rythme ; un compte au forfait en panne n'est jamais remplacé
-par une clé d'API payée au jeton. S'il ne reste aucun compte sain sous son
-seuil, `Choice.auth_blocked` : le compte en panne est rendu, et la garde de
-l'exécuteur tient l'agent en `auth_blocked` jusqu'au retour d'un compte sain.
+**Failover order and caps** (L226b, owner decision 2026-10-07, "primaries
+last, capped"): step 3 ranks by the account's `priority` first (the harness's
+default account last), the pace only breaking ties. Each window is held to
+the lowest of its pace cap (or `short_window_cap` on the short window), the
+account's fixed `cap` (50 % for the default account) and `overage_cap`
+(80 %) when the account may be billed beyond its plan; an account in overage
+is never chosen. These caps apply to continuity too (`limits`, `evaluate`).
+
+**Authentication failure** (L226b, table `credential_health`): an account
+reported `failing` (by the L226a sentinel or by a turn that failed on
+authentication) is never chosen, neither by continuity nor by rank; a
+harness with a plan account never falls back to a pay-per-token API key. If
+no healthy account is left under its cap, `Choice.auth_blocked`: the failing
+account is returned, and the runner's guard keeps the agent `auth_blocked`
+until a healthy account is back.
 
 Le seuil est celui de la garde (0019, inchangé) : `min(90 %, part écoulée +
 10 points)` sur les vraies jauges **du compte**, relues à chaque choix —
@@ -101,6 +109,16 @@ from . import auth_failure, harnesses, platform, storage
 from .config import NAME_RE
 
 TYPES = ("config_dir", "api_key_env")
+#: L226b (owner decision 2026-10-07, "primaries last, capped"): defaults of the
+#: per-account settings `cap`, `overage_cap` and `priority`
+PRIMARY_CAP = 0.50          #: the harness's default account leaves half of each window to the owner
+OVERAGE_CAP = 0.80          #: an account that may be billed beyond its plan stops early
+PRIMARY_PRIORITY = 100      #: the default account comes last
+OTHER_PRIORITY = 50
+#: `overage` setting: read from the harness's journals, or declared
+OVERAGE_MODES = ("auto", "allowed", "none")
+#: windows up to this length are "short" (`short_window_cap`): 5 h for both plans
+SHORT_WINDOW_S = 6 * 3600.0
 
 
 def _account_key(harness: str, key: str, default: str = "") -> str:
@@ -166,6 +184,14 @@ class Profile:
     hourly_usd: float = 0.0
     min_balance: float | None = None
     check_credentials: bool = True
+    #: L226b settings (see `limits`): rank in the failover order (lower first),
+    #: fixed cap on every window, overage capability and its cap, fixed cap
+    #: replacing the pace cap on the short window
+    priority: int | None = None
+    cap: float | None = None
+    overage: str = "auto"
+    overage_cap: float = OVERAGE_CAP
+    short_window_cap: float | None = None
 
     @property
     def default(self) -> bool:
@@ -255,6 +281,28 @@ def parse(raw) -> dict[str, list[Profile]]:
                     min_balance = float(min_balance)
                 except (TypeError, ValueError):
                     raise AccountError("compte %s/%s : min_balance illisible" % (harness, name))
+            caps = {}
+            for key in ("cap", "overage_cap", "short_window_cap"):
+                value = item.get(key)
+                if value is None:
+                    continue
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    raise AccountError("account %s/%s: unreadable %s" % (harness, name, key))
+                if not 0 < value <= 1:
+                    raise AccountError("account %s/%s: %s must be in ]0, 1]"
+                                       % (harness, name, key))
+                caps[key] = value
+            priority = item.get("priority")
+            if priority is not None and (isinstance(priority, bool)
+                                         or not isinstance(priority, int)):
+                raise AccountError("account %s/%s: priority must be an integer"
+                                   % (harness, name))
+            overage = str(item.get("overage") or "auto")
+            if overage not in OVERAGE_MODES:
+                raise AccountError("account %s/%s: overage must be one of %s"
+                                   % (harness, name, ", ".join(OVERAGE_MODES)))
             path = str(item.get("path") or "")
             key_env = str(item.get("key_env") or "")
             key_file = str(item.get("key_file") or "")
@@ -283,6 +331,7 @@ def parse(raw) -> dict[str, list[Profile]]:
                 key_env=key_env, key_file=_expand(key_file) if key_file else "",
                 hourly_usd=hourly, min_balance=min_balance,
                 check_credentials=bool(item.get("check_credentials", True)),
+                priority=priority, overage=overage, **caps,
             ))
         out[harness] = profiles
     return out
@@ -491,6 +540,8 @@ class Evaluation:
     gauges: list = field(default_factory=list)
     until: float | None = None           #: remise à zéro attendue si au seuil
     problems: list = field(default_factory=list)
+    #: L226b: {gauge key: (cap, label)}, the cap each window is held to
+    limits: dict = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -512,6 +563,55 @@ def gauges_of(book, profile: Profile, items: list[Profile]) -> list:
     return []
 
 
+def account_cap(profile: Profile) -> float | None:
+    """The fixed cap on every window of the account (L226b): its `cap`
+    setting, or `PRIMARY_CAP` for the harness's default account (~/.claude,
+    ~/.codex: the owner's own), none otherwise."""
+    if profile.cap is not None:
+        return profile.cap
+    return PRIMARY_CAP if profile.default else None
+
+
+def priority(profile: Profile) -> int:
+    """The account's rank in the failover order (L226b), lower first: its
+    `priority` setting, or the default account last."""
+    if profile.priority is not None:
+        return profile.priority
+    return PRIMARY_PRIORITY if profile.default else OTHER_PRIORITY
+
+
+def overage_capable(profile: Profile, overage) -> bool:
+    """May the account be billed beyond its plan? Its `overage` setting, or
+    (`auto`) what its harness last reported; unknown counts as no."""
+    if profile.overage != "auto":
+        return profile.overage == "allowed"
+    return bool(overage is not None and overage.capable)
+
+
+def limits(profile: Profile, gauges, now: float) -> dict:
+    """{gauge key: (cap, label)}: the usage each window of the account is held
+    to (L226b), the lowest of
+    * the pace cap of the guard (0019), or on the short window the account's
+      `short_window_cap` when set (it replaces the pace cap there);
+    * the account's fixed cap (`account_cap`: 50 % for the primary);
+    * `overage_cap` (80 %) when the account may be billed beyond its plan.
+    """
+    fixed = []
+    cap = account_cap(profile)
+    if cap is not None:
+        fixed.append((cap, "primary cap" if profile.cap is None else "account cap"))
+    if overage_capable(profile, getattr(gauges, "overage", None)):
+        fixed.append((profile.overage_cap, "overage cap"))
+    out = {}
+    for gauge in gauges:
+        if profile.short_window_cap is not None and gauge.window_s <= SHORT_WINDOW_S:
+            base = (profile.short_window_cap, "short window cap")
+        else:
+            base = (gauge.pace_cap(now), "pace cap")
+        out[gauge.key] = min([base, *fixed], key=lambda pair: pair[0])
+    return out
+
+
 def evaluate(book, profile: Profile, items: list[Profile], now: float,
              environ=None, *, record: bool = True) -> Evaluation:
     """Le compte est-il sous le seuil de la garde (0019) ? Ne lit aucun secret.
@@ -526,18 +626,31 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
     if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)
         book.record_gauges(result.gauges, account=profile.name)
+    overage = getattr(result.gauges, "overage", None)
+    if overage is not None and overage.in_use:
+        # L226b: an account in overage is never chosen (no spending beyond the plan)
+        result.reason = "%s plan: in overage (billed beyond the plan)" % profile.harness
+        resets = [g.resets_at for g in result.gauges if g.resets_at and g.resets_at > now]
+        result.until = max(resets) if resets else None
+        return result
+    result.limits = limits(profile, result.gauges, now)
     depasses = []
     for gauge in result.gauges:
-        # fenêtre remise à zéro depuis le relevé : vierge (L71 : `exceeded`
-        # compte alors 0 %, voir `Gauge.used_at`)
-        if gauge.exceeded(now):
+        # fenêtre remise à zéro depuis le relevé : vierge (L71 : `used_at`
+        # compte alors 0 %)
+        if gauge.used_at(now) >= result.limits[gauge.key][0]:
             depasses.append(gauge)
     if depasses:
         gauge = depasses[0]
-        result.reason = ("forfait %s %s : %.0f%% utilisé pour %.0f%% de la fenêtre écoulée "
-                         "(plafond de rythme %.0f%%)" % (
-                             profile.harness, gauge.key, gauge.used * 100,
-                             gauge.elapsed(now) * 100, gauge.pace_cap(now) * 100))
+        cap, label = result.limits[gauge.key]
+        if label == "pace cap":
+            result.reason = ("forfait %s %s : %.0f%% utilisé pour %.0f%% de la fenêtre écoulée "
+                             "(plafond de rythme %.0f%%)" % (
+                                 profile.harness, gauge.key, gauge.used * 100,
+                                 gauge.elapsed(now) * 100, cap * 100))
+        else:
+            result.reason = "%s plan %s: %.0f%% used (%s %.0f%%)" % (
+                profile.harness, gauge.key, gauge.used * 100, label, cap * 100)
         resets = [g.resets_at for g in depasses if g.resets_at]
         result.until = max(resets) if len(resets) == len(depasses) else None
         return result
@@ -614,7 +727,7 @@ def expiry(gauges, now: float) -> tuple | None:
     return best
 
 
-def lag(gauges, now: float) -> tuple[float, object | None]:
+def lag(gauges, now: float, caps: dict | None = None) -> tuple[float, object | None]:
     """Le retard du compte sur son rythme (L117, amendement 0034 du 2026-10-10) :
     `(rapport, jauge)` de sa fenêtre **la plus contraignante**, où le rapport
     est l'utilisé valable à `now` sur l'autorisé à cet instant de la fenêtre
@@ -628,10 +741,13 @@ def lag(gauges, now: float) -> tuple[float, object | None]:
     est la plus en avance — le cas où un forfait hebdomadaire se perd — c'est
     elle qui décide, et une session neuve n'est pas envoyée sur un compte dont
     la fenêtre de 5 h est presque au seuil.
+
+    L226b: `caps` ({gauge key: (cap, label)}, `Evaluation.limits`) replaces
+    the pace cap by the cap the window is actually held to.
     """
     best: tuple[float, object | None] = (0.0, None)
     for gauge in gauges:
-        cap = gauge.pace_cap(now)
+        cap = caps[gauge.key][0] if caps and gauge.key in caps else gauge.pace_cap(now)
         ratio = gauge.used_at(now) / cap if cap > 0 else 1.0
         if best[1] is None or ratio > best[0]:
             best = (ratio, gauge)
@@ -641,29 +757,33 @@ def lag(gauges, now: float) -> tuple[float, object | None]:
 def explain(result: Evaluation, now: float) -> str:
     """Le retard d'un compte sur son rythme, lisible : « seven_day 35 %
     utilisé (rythme 55 %) », « sans relevé : 0 % utilisé »."""
-    _ratio, gauge = lag(result.gauges, now)
+    _ratio, gauge = lag(result.gauges, now, result.limits)
     if gauge is None:
         return "sans relevé : 0 % utilisé"
     if all(g.reset_passed(now) for g in result.gauges):
         return "relevé échu (fenêtre remise à zéro) : 0 % utilisé"
+    cap, label = result.limits.get(gauge.key) or (gauge.pace_cap(now), "pace cap")
+    bound = ("rythme %.0f %%" % (cap * 100)) if label == "pace cap" \
+        else "%s %.0f %%" % (label, cap * 100)
     if not gauge.resets_at:
-        return "%s %.0f %% utilisé (jauge non datée, rythme %.0f %%)" % (
-            gauge.key, gauge.used_at(now) * 100, gauge.pace_cap(now) * 100)
-    return "%s %.0f %% utilisé (rythme %.0f %%)" % (
-        gauge.key, gauge.used_at(now) * 100, gauge.pace_cap(now) * 100)
+        return "%s %.0f %% utilisé (jauge non datée, %s)" % (
+            gauge.key, gauge.used_at(now) * 100, bound)
+    return "%s %.0f %% utilisé (%s)" % (gauge.key, gauge.used_at(now) * 100, bound)
 
 
 def rank(items: list[Profile], evaluations: dict, now: float) -> list[Profile]:
     """Les comptes utilisables, du premier à consommer au dernier (0034 amendée).
 
-    Clé : le retard sur le rythme (`lag`, le plus petit rapport d'abord), puis
-    l'échéance de la capacité inutilisée (la plus proche d'abord ; sans
-    fenêtre en cours, après), puis l'ordre déclaré."""
+    Clé : L226b, the failover order first (`priority`: the default account
+    last, owner decision 2026-10-07), then le retard sur le rythme (`lag`, le
+    plus petit rapport d'abord), puis l'échéance de la capacité inutilisée (la
+    plus proche d'abord ; sans fenêtre en cours, après), puis l'ordre déclaré."""
     def key(pair):
         index, profile = pair
-        gauges = evaluations[profile.name].gauges
+        result = evaluations[profile.name]
+        gauges = result.gauges
         found = expiry(gauges, now)
-        return (round(lag(gauges, now)[0], 6),
+        return (priority(profile), round(lag(gauges, now, result.limits)[0], 6),
                 found[0] if found is not None else float("inf"), index)
     usable = [(i, p) for i, p in enumerate(items) if evaluations[p.name].ok]
     return [p for _i, p in sorted(usable, key=key)]
@@ -673,7 +793,13 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
     """La raison du choix d'une nouvelle session (journal, `accounts list`) :
     « sans relevé : 0 % utilisé, le plus en retard sur son rythme ; avant :
     primaire seven_day 35 % utilisé (rythme 55 %) »."""
-    why = "%s, le plus en retard sur son rythme" % explain(evaluations[ranked[0].name], now)
+    first = ranked[0]
+    if len(ranked) > 1 and priority(first) < priority(ranked[1]):
+        # L226b: the failover order decided, not the pace
+        why = "%s, first in the failover order (priority %d)" % (
+            explain(evaluations[first.name], now), priority(first))
+    else:
+        why = "%s, le plus en retard sur son rythme" % explain(evaluations[first.name], now)
     if len(ranked) > 1:
         why += " ; avant : %s" % ", ".join(
             "%s %s" % (p.name, explain(evaluations[p.name], now)) for p in ranked[1:])
@@ -788,14 +914,12 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
 
 
 def healthy(items: list[Profile], sick: dict) -> list[Profile]:
-    """Les comptes candidats quand certains sont en échec d'authentification
-    (L226b) : les autres, sauf qu'un compte au forfait en panne n'est jamais
-    remplacé par une clé d'API payée au jeton (« jamais d'overage », n°6810)."""
-    if not sick:
-        return list(items)
+    """The candidate accounts of an automatic choice (L226b): never one in
+    authentication failure, and never a pay-per-token API key for a harness
+    that has a plan account (owner decision 2026-10-07: no spending beyond
+    the plans; an API key stays usable by `ameesh accounts use`)."""
     sains = [p for p in items if p.name not in sick]
-    forfait_en_panne = any(p.kind != "api_key_env" for p in items if p.name in sick)
-    if forfait_en_panne:
+    if any(p.kind != "api_key_env" for p in items):
         sains = [p for p in sains if p.kind != "api_key_env"]
     return sains
 
@@ -884,11 +1008,14 @@ def report(cfg, db, book, *, now: float | None = None,
                 "problems": list(result.problems),
                 "hold_until": hold.get("until_ts"),
                 "hourly_usd": profile.hourly_usd,
+                # L226b: failover order and overage flags
+                "priority": priority(profile),
+                "overage": _overage_row(profile, result.gauges),
                 "gauges": [
                     # L71 : une fenêtre échue compte pour 0 % ; le dernier
                     # relevé reste lisible (`last_used`)
                     {"key": g.key, "used": g.used_at(now), "last_used": g.used,
-                     "cap": g.pace_cap(now),
+                     "cap": (result.limits.get(g.key) or (g.pace_cap(now),))[0],
                      "elapsed": g.elapsed(now), "resets_at": g.resets_at,
                      "reset_passed": g.reset_passed(now)}
                     for g in result.gauges
@@ -897,6 +1024,13 @@ def report(cfg, db, book, *, now: float | None = None,
             })
         _forecast(rows[len(rows) - len(items):], items, now)
     return rows
+
+
+def _overage_row(profile: Profile, gauges) -> dict:
+    """The overage flags of an account, for `ameesh accounts list --json`."""
+    read = getattr(gauges, "overage", None)
+    return {"setting": profile.overage, "capable": overage_capable(profile, read),
+            "in_use": bool(read is not None and read.in_use)}
 
 
 def _forecast(rows: list[dict], items: list[Profile], now: float) -> None:

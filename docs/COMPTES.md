@@ -195,58 +195,95 @@ saturé) et que la session n'est pas portable, la rotation ne peut pas résumer
 sous l'ancien compte : la session neuve s'ouvre sur un **brief de reprise
 déterministe** (voir `ameesh resume` dans [EXPLOITATION.md](EXPLOITATION.md)).
 
-## 4. Authentification en échec : `auth_blocked` (L226b)
+## 4. Failover order and caps (L226b, owner decision 2026-10-07)
 
-Un identifiant peut cesser de marcher sans prévenir : jeton OAuth expiré ou
-révoqué, « Please run /login », 401 `authentication_error`, gcloud
-« Reauthentication failed ». Avant L226b, le tour échouait, la consigne
-repartait en attente, et l'agent relançait le même tour en boucle jusqu'à
-l'arrêt après échecs rapides (L48).
+"Primaries last, capped": the harness's default account (`~/.claude`,
+`~/.codex`, declared without `path`) is the owner's own and only serves as a
+last resort. Each account takes these optional settings in the host's
+`accounts` key (defaults in brackets):
 
-**Santé des identifiants** (table `credential_health`, migration 0058) : une
-ligne par (hôte, harnais, compte) — `account` est le nom du compte déclaré,
-`''` pour l'identifiant par défaut d'un harnais sans comptes. `state` vaut
-`healthy`, `failing` ou `unknown` ; `source` dit qui l'a écrit : la
-sentinelle (`sentinel`, L226a), un tour en échec (`turn`) ou un humain
-(`manual`). `failing_since` garde le début de la panne.
+| setting | meaning |
+|---|---|
+| `priority` [default account 100, others 50] | rank in the failover order, lower first; the pace (L117) only breaks ties |
+| `cap` [0.50 for the default account, none otherwise] | fixed cap on **every** window: above it, the account is ineligible |
+| `overage` [`auto`] | may the account be billed beyond its plan? `auto` reads it from the harness (Claude `overageStatus`, Codex `credits.has_credits`), `allowed` or `none` declare it |
+| `overage_cap` [0.80] | fixed cap on every window of an account that may be billed beyond its plan |
+| `short_window_cap` [none] | fixed cap replacing the pace cap on the short window (5 h) |
 
-**Fin de tour.** Un tour en échec dont l'erreur, la réponse courte (au plus
-600 caractères) ou la fin du stderr est un échec d'authentification
-(`ameesh.auth_failure.classify`) n'est ni un échec rapide ni relancé : le
-compte du tour est noté `failing` (source `turn`), la consigne repart en
-attente, l'agent passe `blocked` avec `status_text` « `auth_blocked:
-<harnais>/<compte>` » et `last_error` « `auth_blocked: <raison>` ». Un tour
-qui échoue autrement (429, contexte, code de sortie) suit le chemin habituel.
+A window is held to the lowest of: its pace cap (0019, or `short_window_cap`
+on the short window), `cap`, and `overage_cap` when the account may be billed.
+An account **in overage** (Claude `isUsingOverage`, Codex a window at 100 %
+with credits) is never chosen. The caps apply to session continuity too: a
+session on the primary leaves it once the primary is above 50 % of a window.
 
-**Bascule.** Le choix du compte (§ 2, `accounts.choose`) reste celui de L30 et
-L117, restreint aux comptes **sains** : un compte `failing` n'est jamais
-choisi, pas même par la continuité de session ; l'ordre déclaré départage
-comme avant. Il n'y a pas d'ordre propre à la panne. Le tour suivant part donc
-sur un compte sain, avec la reprise ou la rotation de session habituelle, et
-le blocage est levé.
+For the order "Claude tertiary > secondary > primary, Codex secondary >
+primary" on a host that declared `primaire, secondaire, tertiaire`:
 
-**Jamais de dépense en plus** (décision du 2026-10-11) : un compte au-dessus de
-son seuil reste écarté, et un compte au forfait en panne n'est jamais
-remplacé par une clé d'API payée au jeton (`type: api_key_env`). Entre clés
-d'API d'un même harnais, la bascule reste possible.
-
-**Aucun compte sain sous son seuil** : l'agent reste `auth_blocked`. Il ne
-consomme ni consigne ni courrier, aucun tour n'est tenté, et l'alerte
-`auth_blocked` (poussée par défaut, urgente) part au responsable. Il reprend
-seul dès que son compte, ou un autre, est de nouveau sain. Un compte forcé
-(`ameesh accounts use`) en panne n'est pas remplacé : l'agent reste bloqué
-jusqu'à `ameesh accounts auto` ou la reconnexion. Si les comptes sains sont
-au seuil mais qu'un compte en panne ne l'est pas, c'est `auth_blocked` : se
-reconnecter débloque. Si tous les comptes sont au seuil, en panne ou non,
-c'est la pause budget habituelle.
-
-**Reprise.** Après la reconnexion (`claude /login` dans le dossier du compte,
-`gcloud auth login`…), la sentinelle L226a voit le compte sain et le note
-`healthy`. Sans elle, on le déclare à la main :
-
-```sh
-ameesh accounts healthy claude secondaire   # compte déclaré
-ameesh accounts healthy claude              # harnais sans comptes déclarés
+```json
+"claude": [
+  {"name": "primaire"},
+  {"name": "secondaire", "path": "/home/me/.claude-secondary", "priority": 20},
+  {"name": "tertiaire", "path": "/home/me/.claude-tertiary", "priority": 10}
+]
 ```
 
-`ameesh accounts list --json` montre la table (`credentials`).
+Bureau's local sprint patch of 2026-10-11 (`~/.config/ameesh/sprint.json`,
+`short_window_cap` 0.80 for the non-default accounts) is the setting
+`"short_window_cap": 0.8` on those accounts.
+
+`ameesh accounts list --json` shows `priority`, `overage` (setting, capable,
+in use) and, per gauge, the `cap` the window is held to.
+
+## 5. Authentication failure: `auth_blocked` (L226b)
+
+A credential can stop working without notice: expired or revoked OAuth token,
+"Please run /login", 401 `authentication_error`, gcloud "Reauthentication
+failed". Before L226b the turn failed, the consigne went back to pending, and
+the agent replayed the same turn until the stop after fast failures (L48).
+
+**Credential health** (table `credential_health`, migration 0060): one row
+per (host, harness, account); `account` is the declared account name, `''`
+for the default credential of a harness without accounts. `state` is
+`healthy`, `failing` or `unknown`; `source` says who wrote it: the sentinel
+(`sentinel`, L226a), a failed turn (`turn`) or a human (`manual`).
+`failing_since` keeps the start of the failure, `expires_at` the forecast
+expiry the sentinel reports.
+
+**End of turn.** A failed turn whose error, short answer (600 characters at
+most) or stderr tail is an authentication failure
+(`ameesh.auth_failure.classify`) is neither a fast failure nor replayed: the
+turn's account is marked `failing` (source `turn`), the consigne goes back to
+pending, the agent goes `blocked` with `status_text` "`auth_blocked:
+<harness>/<account>`" and `last_error` "`auth_blocked: <reason>`". A turn that
+fails otherwise (429, context, exit code) takes the usual path.
+
+**Failover.** The account choice (§ 2 and § 4, `accounts.choose`) is
+restricted to **healthy** accounts: a `failing` account is never chosen, not
+even by session continuity. The next turn starts on a healthy account, with
+the usual session resume or rotation, and the block is lifted.
+
+**Never a paid fallback**: an account above its cap stays out, and a
+harness with a plan account never falls back to a pay-per-token API key
+(`type: api_key_env`) automatically (`ameesh accounts use` still can). Among
+the API keys of a harness without plan accounts, failover stays possible.
+
+**No healthy account under its cap**: the agent stays `auth_blocked`. It
+consumes neither consigne nor mail, no turn is tried, and the `auth_blocked`
+alert (pushed by default, urgent) goes to the responsible human. It resumes on
+its own as soon as its account, or another, is healthy again. A forced account
+(`ameesh accounts use`) that fails is not replaced: the agent stays blocked
+until `ameesh accounts auto` or the reconnection. If the healthy accounts are
+at their cap but a failing one is not, it is `auth_blocked`: reconnecting
+unblocks. If every account is at its cap, failing or not, it is the usual
+budget pause.
+
+**Recovery.** After the reconnection (`claude /login` in the account's
+folder, `gcloud auth login`…), the L226a sentinel sees the account healthy
+and records it. Without it, declare it by hand:
+
+```sh
+ameesh accounts healthy claude secondaire   # declared account
+ameesh accounts healthy claude              # harness without declared accounts
+```
+
+`ameesh accounts list --json` shows the table (`credentials`).

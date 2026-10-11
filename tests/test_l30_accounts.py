@@ -457,7 +457,9 @@ class ExecuteurTest(_Base):
         l'exécuteur (mécanisme de cost.CostBook) ; compte déclaré : le sien."""
         herite = _dossier(os.path.join(self.tmp, "codex-herite"), creds="auth.json")
         secondaire = self._codex_comptes()[1]
-        comptes = {"codex": [{"name": "primaire"}, secondaire]}
+        # L226b: the primary comes last by default; here it is put first to
+        # test the gauges mechanism
+        comptes = {"codex": [{"name": "primaire", "priority": 0}, secondaire]}
         runner, worker = self._worker("cxd", "codex", comptes)
         try:
             with mock.patch.dict(os.environ, {"CODEX_HOME": herite}):

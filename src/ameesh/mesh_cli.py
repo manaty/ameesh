@@ -2165,7 +2165,7 @@ def cmd_accounts(cfg: Config, args) -> int:
             try:
                 sante = storage.of(db).credentials.listing(cfg.host)
             except db_mod.DbError:
-                sante = []  # base sans la migration 0058
+                sante = []  # base sans la migration 0060
             print(json.dumps({"schema": "ameesh-accounts/1", "host": cfg.host,
                               "accounts": rows, "switches": bascules,
                               "credentials": sante},

@@ -61,14 +61,15 @@ class ClassifyTest(unittest.TestCase):
 
 
 class HealthyCandidatesTest(unittest.TestCase):
-    """`accounts.healthy`: never overage (n°6810)."""
+    """`accounts.healthy`: never a pay-per-token fallback (owner, 2026-10-07)."""
 
     def test_plan_account_never_replaced_by_an_api_key(self):
         items = [accounts.Profile(harness="claude", name="primaire"),
                  accounts.Profile(harness="claude", name="secondaire", path="/x"),
                  accounts.Profile(harness="claude", name="cle", kind="api_key_env",
                                   env="ANTHROPIC_API_KEY", key_env="K")]
-        self.assertEqual(accounts.healthy(items, {}), items)
+        # not even when every plan account is healthy
+        self.assertEqual(accounts.healthy(items, {}), items[:2])
         self.assertEqual([p.name for p in accounts.healthy(items, {"primaire": {}})],
                          ["secondaire"])
         self.assertEqual(accounts.healthy(items, {"primaire": {}, "secondaire": {}}), [])
@@ -77,6 +78,175 @@ class HealthyCandidatesTest(unittest.TestCase):
         items = [accounts.Profile(harness="deepseek", name=n, kind="api_key_env",
                                   key_env="K") for n in ("a", "b")]
         self.assertEqual([p.name for p in accounts.healthy(items, {"a": {}})], ["b"])
+
+
+HOUR = 3600.0
+WEEK = 7 * 24 * HOUR
+
+
+class _Book:
+    """A cost book whose gauges are given per account."""
+
+    db = None
+
+    def __init__(self, gauges: dict):
+        self._gauges = gauges
+
+    def claude_gauges(self, account=None, primary=None):
+        return self._gauges.get(account, [])
+
+    def record_gauges(self, gauges, account=None):
+        return 0
+
+
+class CapsAndOrderTest(unittest.TestCase):
+    """L226b, owner decision 2026-10-07: primaries last and capped at 50 %,
+    overage-capable accounts capped at 80 %, never an account in overage."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-l226b-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+
+    def _items(self, **settings):
+        raw = [{"name": "primaire"}]
+        for name in ("secondaire", "tertiaire"):
+            path = os.path.join(self.tmp, name)
+            os.makedirs(path, mode=0o700, exist_ok=True)
+            raw.append({"name": name, "path": path, "check_credentials": False,
+                        **settings.get(name, {})})
+        raw[0].update(settings.get("primaire", {}))
+        return accounts.parse({"claude": raw})["claude"]
+
+    @staticmethod
+    def _gauges(five, seven, now, overage=None, five_elapsed=0.9):
+        return cost.Gauges([
+            cost.Gauge("claude", "five_hour", five, now + (1 - five_elapsed) * 5 * HOUR,
+                       5 * HOUR),
+            cost.Gauge("claude", "seven_day", seven, now + 0.1 * WEEK, WEEK)], overage)
+
+    def _ev(self, items, gauges, now):
+        book = _Book(gauges)
+        return {p.name: accounts.evaluate(book, p, items, now) for p in items}
+
+    def test_settings_parsed_and_checked(self):
+        items = self._items(tertiaire={"priority": 1, "overage": "allowed",
+                                       "overage_cap": 0.7, "short_window_cap": 0.8},
+                            primaire={"cap": 0.4})
+        primary, secondary, tertiary = items
+        self.assertEqual((primary.cap, accounts.account_cap(primary)), (0.4, 0.4))
+        self.assertEqual(accounts.account_cap(secondary), None)
+        self.assertEqual([accounts.priority(p) for p in items], [100, 50, 1])
+        self.assertEqual((tertiary.overage, tertiary.overage_cap, tertiary.short_window_cap),
+                         ("allowed", 0.7, 0.8))
+        self.assertEqual(accounts.account_cap(self._items()[0]), accounts.PRIMARY_CAP)
+        for bad in ({"cap": 0}, {"cap": 1.5}, {"cap": "x"}, {"priority": "1"},
+                    {"priority": True}, {"overage": "maybe"}, {"short_window_cap": -1}):
+            with self.assertRaises(accounts.AccountError, msg=bad):
+                self._items(secondaire=bad)
+
+    def test_primary_ineligible_above_half_of_any_window(self):
+        now = 1_800_000_000.0
+        items = self._items()
+        evs = self._ev(items, {"primaire": self._gauges(0.20, 0.50, now)}, now)
+        self.assertFalse(evs["primaire"].ok)
+        self.assertIn("primary cap 50%", evs["primaire"].reason)
+        self.assertEqual(evs["primaire"].limits["seven_day"], (0.5, "primary cap"))
+        evs = self._ev(items, {"primaire": self._gauges(0.49, 0.30, now)}, now)
+        self.assertTrue(evs["primaire"].ok)
+        # the same reading on a secondary account is under its pace cap
+        evs = self._ev(items, {"secondaire": self._gauges(0.20, 0.50, now)}, now)
+        self.assertTrue(evs["secondaire"].ok)
+
+    def test_overage_capable_capped_at_80_and_never_in_overage(self):
+        now = 1_800_000_000.0
+        items = self._items(secondaire={"short_window_cap": 0.95})
+        capable = cost.Overage(capable=True)
+        evs = self._ev(items, {"secondaire": self._gauges(0.80, 0.10, now, capable)}, now)
+        self.assertFalse(evs["secondaire"].ok)
+        self.assertIn("overage cap 80%", evs["secondaire"].reason)
+        evs = self._ev(items, {"secondaire": self._gauges(0.80, 0.10, now,
+                                                          cost.Overage(capable=False))}, now)
+        self.assertTrue(evs["secondaire"].ok)
+        # declared: `overage: none` ignores the harness, `allowed` caps without a reading
+        none = self._items(secondaire={"short_window_cap": 0.95, "overage": "none"})
+        evs = self._ev(none, {"secondaire": self._gauges(0.80, 0.10, now, capable)}, now)
+        self.assertTrue(evs["secondaire"].ok)
+        allowed = self._items(secondaire={"short_window_cap": 0.95, "overage": "allowed"})
+        evs = self._ev(allowed, {"secondaire": self._gauges(0.80, 0.10, now)}, now)
+        self.assertFalse(evs["secondaire"].ok)
+        # in overage: never chosen, whatever its usage
+        evs = self._ev(items, {"tertiaire": self._gauges(0.10, 0.10, now, cost.Overage(
+            capable=True, in_use=True))}, now)
+        self.assertFalse(evs["tertiaire"].ok)
+        self.assertIn("in overage", evs["tertiaire"].reason)
+
+    def test_short_window_cap_replaces_the_pace_cap(self):
+        # bureau's sprint patch of 2026-10-11 (sprint.json short_window_cap 0.80)
+        now = 1_800_000_000.0
+        items = self._items(secondaire={"short_window_cap": 0.80})
+        early = {"secondaire": self._gauges(0.60, 0.10, now, five_elapsed=0.3),
+                 "tertiaire": self._gauges(0.60, 0.10, now, five_elapsed=0.3)}
+        evs = self._ev(items, early, now)
+        self.assertTrue(evs["secondaire"].ok)          # 60 % < 80 % fixed
+        self.assertFalse(evs["tertiaire"].ok)          # 60 % > pace cap 40 %
+        evs = self._ev(items, {"secondaire": self._gauges(0.80, 0.10, now,
+                                                          five_elapsed=0.3)}, now)
+        self.assertIn("short window cap 80%", evs["secondaire"].reason)
+        # the long window keeps the pace cap
+        self.assertEqual(evs["secondaire"].limits["seven_day"][1], "pace cap")
+
+    def test_failover_order_primary_last(self):
+        now = 1_800_000_000.0
+        items = self._items(tertiaire={"priority": 10})
+        # the primary is the least used, yet comes last
+        gauges = {"primaire": self._gauges(0.05, 0.05, now),
+                  "secondaire": self._gauges(0.30, 0.30, now),
+                  "tertiaire": self._gauges(0.60, 0.60, now)}
+        evs = self._ev(items, gauges, now)
+        ranked = accounts.rank(items, evs, now)
+        self.assertEqual([p.name for p in ranked], ["tertiaire", "secondaire", "primaire"])
+        self.assertIn("first in the failover order", accounts.reason_of(ranked, evs, now))
+        # without priorities, the pace decides among the others; primary still last
+        items = self._items()
+        evs = self._ev(items, gauges, now)
+        self.assertEqual([p.name for p in accounts.rank(items, evs, now)],
+                         ["secondaire", "tertiaire", "primaire"])
+
+
+class OverageReadingTest(unittest.TestCase):
+    def test_claude_rate_limit_event(self):
+        event = {"type": "rate_limit_event", "rate_limit_info": {
+            "status": "allowed", "overageStatus": "rejected",
+            "overageDisabledReason": "out_of_credits", "isUsingOverage": False,
+            "unifiedWindows": {"five_hour": {"utilization": 0.82, "resetsAt": 1791742800}}}}
+        self.assertEqual(cost._claude_overage(event), cost.Overage(False, False))
+        event["rate_limit_info"].update(overageStatus="allowed", isUsingOverage=True)
+        self.assertEqual(cost._claude_overage(event), cost.Overage(True, True))
+        self.assertEqual(cost._claude_overage({"type": "rate_limit_event"}), cost.Overage())
+
+    def test_codex_credits(self):
+        gauges = [cost.Gauge("codex", "codex-300min", 0.5, None, 300 * 60)]
+        self.assertEqual(cost._codex_overage({}, gauges), cost.Overage())
+        limits = {"credits": {"has_credits": True, "unlimited": False, "balance": None}}
+        self.assertEqual(cost._codex_overage(limits, gauges), cost.Overage(True, False))
+        full = [cost.Gauge("codex", "codex-300min", 1.0, None, 300 * 60)]
+        self.assertEqual(cost._codex_overage(limits, full), cost.Overage(True, True))
+
+    def test_codex_journal_carries_the_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = os.path.join(tmp, "sessions", "2026", "10", "11")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "rollout.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "event_msg", "payload": {
+                    "type": "token_count", "rate_limits": {
+                        "primary": {"used_percent": 5.0, "window_minutes": 300,
+                                    "resets_at": time.time() + 3600},
+                        "secondary": None,
+                        "credits": {"has_credits": True}}}}) + "\n")
+            gauges = cost.CostBook(state_dir=tmp).codex_gauges(
+                sessions=os.path.join(tmp, "sessions"))
+            self.assertEqual(len(gauges), 1)
+            self.assertEqual(gauges.overage, cost.Overage(True, False))
 
 
 class _AuthBase(_Base):
@@ -106,7 +276,7 @@ class CredentialsStorageTest(_AuthBase):
 
 
 class ChooseTest(_AuthBase):
-    """L30 `choose` restricted to healthy accounts (decision n°6810)."""
+    """L30 `choose` restricted to healthy accounts."""
 
     def _items(self):
         return accounts.parse({"codex": self._codex_comptes()})["codex"]
@@ -150,6 +320,31 @@ class ChooseTest(_AuthBase):
         choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now)
         self.assertIsNone(choix.profile)
         self.assertIn("au seuil", choix.reason)
+
+
+class ContinuityCapTest(_AuthBase):
+    """The caps apply to continuity too: a session on the primary leaves it
+    above 50 %, for the account first in the order (L226b)."""
+
+    def test_session_leaves_the_primary_above_half(self):
+        secondaire = self._codex_comptes()[1]
+        home = os.path.join(self.tmp, "codex-default")
+        os.makedirs(home, mode=0o700, exist_ok=True)
+        items = accounts.parse({"codex": [{"name": "primaire"}, secondaire]})["codex"]
+        now = time.time()
+        with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+            book = cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
+            _codex_rollout(home, 40, now + 1800)   # under 50 % (and its pace cap, 90 %)
+            choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now,
+                                    session_account="primaire")
+            self.assertTrue(choix.kept)
+            self.assertEqual(choix.profile.name, "primaire")
+            _codex_rollout(home, 55, now + 1800)
+            choix = accounts.choose(self.db, self.cfg.host, "codex", items, book, now=now,
+                                    session_account="primaire")
+        self.assertFalse(choix.kept)
+        self.assertEqual(choix.profile.name, "secondaire")
+        self.assertIn("primary cap 50%", choix.why)
 
 
 class RunnerTest(_AuthBase):

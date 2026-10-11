@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
--- 0058_credential_health — health of each harness credential per host
+-- 0060_credential_health — health of each harness credential per host
 -- (lots L226a and L226b).
 --
 -- One row per (host, harness, account): the last known health of the
@@ -28,5 +28,9 @@ create table if not exists credential_health (
     -- start of the current failure (kept while `failing` is reported again,
     -- cleared on `healthy`)
     failing_since timestamptz,
+    -- forecast expiry of the credential reported by the sentinel (L226a:
+    -- gcloud = last interactive login + session length, Claude = expiresAt
+    -- without refresh), null if unknown; overwritten on each report
+    expires_at    timestamptz,
     primary key (host, harness, account)
 );
