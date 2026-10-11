@@ -189,6 +189,44 @@ class VersionLevelTest(unittest.TestCase):
         self.assertEqual((proc.returncode, proc.stderr), (0, ""))
         self.assertTrue(proc.stdout.startswith("patch"), proc.stdout)
 
+    def test_separately_routed_parsers_keep_their_options(self):
+        cli = ('import argparse\n\n\ndef run_main(argv):\n'
+               '    parser = argparse.ArgumentParser(prog="ameesh run")\n'
+               '    parser.add_argument("--wait")\n\n\n'
+               'def attach_main(argv):\n'
+               '    parser = argparse.ArgumentParser(prog="ameesh attach")\n'
+               '    parser.add_argument("--wait")\n\n\n'
+               'def other_main(argv):\n'
+               '    parser = argparse.ArgumentParser()\n'
+               '    parser.add_argument("--wait")\n')
+        floor, reasons = self._floor(cli, cli.replace('    parser.add_argument("--wait")\n', "", 1))
+        self.assertEqual((floor, reasons), ("major", ["option run --wait removed"]))
+        floor, reasons = self._floor(cli, cli[:cli.rindex('    parser.add_argument')])
+        self.assertEqual((floor, reasons), ("major", ["option cli:other_main --wait removed"]))
+
+    def test_inlining_a_helper_changes_nothing(self):
+        helper = ('def _options(p):\n    p.add_argument("--custom")\n\n\n'
+                  'def build(sub):\n    p = sub.add_parser("show")\n    _options(p)\n')
+        inlined = 'def build(sub):\n    p = sub.add_parser("show")\n    p.add_argument("--custom")\n'
+        self.assertEqual(self._floor(helper, inlined)[0], "patch")
+        self.assertEqual(self._floor(inlined, helper)[0], "patch")
+
+    def test_sql_literals_are_not_statements(self):
+        for sql in ("CREATE TABLE notes (message text DEFAULT 'rename');",
+                    "insert into notes values ('delete from a'), ('it''s; drop table a');",
+                    'create table b ("rename" int);',
+                    "create function f() returns void as $$ delete from a $$ language sql;",
+                    "create function g() returns void as $body$ truncate a; $body$ language sql;"):
+            with self.subTest(sql):
+                self._git("checkout", "-q", "-B", "case", "v1.2.3")
+                self._write("src/ameesh/migrations/0002_b.sql", sql + "\n")
+                self._commit("1.2.3", "migration")
+                self.assertEqual(vl.level("v1.2.3", "HEAD")[0], "minor")
+        self._write("src/ameesh/migrations/0002_b.sql",
+                    "insert into notes values ('x');\nalter table \"a\" rename to b;\n")
+        self._commit("1.2.3", "migration")
+        self.assertEqual(vl.level("v1.2.3", "HEAD")[0], "major")
+
     def test_breaking_trailer(self):
         self._write("src/ameesh/cli.py", CLI + "# mail payload v2\n")
         self._commit("1.2.3", "mail payload v2\n\nameesh-breaking: payload key renamed")
