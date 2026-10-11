@@ -120,8 +120,8 @@ class AdoptTest(_Base):
         self.assertEqual(row["pending_prompt"], reprise.DEFAULT_ADOPT)
         self.assertTrue(registry.wakeable(self.db, self.cfg, "coord")[0])
         fil_txt = self._fil()
-        self.assertIn("Adoption de coord", fil_txt)
-        self.assertIn("du compte secondaire", fil_txt)
+        self.assertIn("Adoption of coord", fil_txt)
+        self.assertIn("of account secondaire", fil_txt)
         self.assertIn('"audit": "adopt"', fil_txt)
 
     def test_brief_donne_et_compte_vise(self):
@@ -212,7 +212,7 @@ class AdoptTest(_Base):
             self.db.execute("UPDATE agent_registry SET status = 'idle' WHERE name = 'cl'")
             out = reprise.adopt(self._cfg(), self.db, "cl", session_id=SID, harness="claude",
                                 cwd=autre)
-            self.assertTrue(any("ne la retrouvera pas" in n for n in out["notes"]))
+            self.assertTrue(any("will not find it" in n for n in out["notes"]))
         self.assertIsNone(registry.get(self.db, "cl")["session_account"])
 
     def test_cli_adopt_json(self):
@@ -260,7 +260,7 @@ class ResumeTest(_Base):
         self.assertEqual((row["status"], row["stop_reason"], row["session_id"],
                           row["session_account"], row["pending_prompt"]),
                          ("queued", None, "sess-a", "primaire", reprise.DEFAULT_RESUME))
-        self.assertIn("Reprise de ouv", self._fil())
+        self.assertIn("Resume of ouv", self._fil())
         # la simulation du choix de compte n'a RIEN écrit
         self.assertEqual(self.db.query("SELECT count(*)::int AS n FROM account_active")[0]["n"],
                          0)
@@ -298,16 +298,16 @@ class ResumeTest(_Base):
         self.assertIsNone(row["session_account"])
         self.assertEqual(row["status"], "queued")
         brief = row["pending_prompt"]
-        for attendu in ("# Brief de reprise de coord", "## Identité et rôle",
-                        "responsable humain : human:proprio",
-                        "## Lots qui te sont assignés",
-                        "#%s [intake] Câbler la reprise — attend : start by coord"
+        for attendu in ("# Resume brief for coord", "## Identity and role",
+                        "human owner: human:proprio",
+                        "## Work items assigned to you",
+                        "#%s [intake] Câbler la reprise — waiting for: start by coord"
                         % lot["id"],
-                        "## Derniers échanges du fil atelier",
+                        "## Latest exchanges in thread atelier",
                         "Le lot de câblage attend ta revue.",
-                        "## Courrier", "2 message(s) non lu(s)",
-                        "## Ancienne session (lecture seule)", "sess-b", "compte secondaire",
-                        transcript, "## Consigne", "Termine la revue."):
+                        "## Mail", "2 unread message(s)",
+                        "## Previous session (read-only)", "sess-b", "account secondaire",
+                        transcript, "## Instructions", "Termine la revue."):
             self.assertIn(attendu, brief)
         self.assertLessEqual(len(brief.encode("utf-8")), reprise.BRIEF_MAX_BYTES)
         # déterministe (aucun appel de modèle) : même état, même brief
@@ -347,7 +347,7 @@ class ResumeTest(_Base):
         row = registry.get(self.db, "fr")
         self.assertIsNone(row["session_id"])
         self.assertEqual(row["status"], "queued")
-        self.assertIn("# Brief de reprise de fr", row["pending_prompt"])
+        self.assertIn("# Resume brief for fr", row["pending_prompt"])
         self.assertIn("--fresh", row["pending_prompt"])
         self.assertFalse(os.path.exists(os.path.join(self.cfg.agent_dir("fr"), "session")))
 
@@ -463,7 +463,7 @@ class SessionAccountTest(_Base):
             worker.watchdog_stop.set()
         dernier = self.turns()[-1]
         self.assertNotIn("resume", dernier["argv"])
-        self.assertIn("# Brief de reprise de rb", dernier["argv"][-1])
+        self.assertIn("# Resume brief for rb", dernier["argv"][-1])
         # encadré comme un brief d'ameesh, jamais comme le résumé de l'agent
         self.assertIn('author="ameesh, deterministic brief" authority="none"',
                       dernier["argv"][-1])

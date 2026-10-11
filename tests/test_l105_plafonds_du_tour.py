@@ -112,10 +112,10 @@ class PlafondDeContexteTest(_Base):
         flux = self._evenements(worker)
         self.assertIn('"tool_use_id": "outil-0"', flux)   # l'outil en cours a fini
         self.assertNotIn('"tool_use_id": "outil-1"', flux)  # le suivant, jamais
-        self.assertTrue(worker.last_turn_closed.startswith("plafond de contexte"))
+        self.assertTrue(worker.last_turn_closed.startswith("context cap"))
         agent = registry.get(self.db, "orch-ctx")
         self.assertEqual(agent["status"], "idle")
-        self.assertIn("clos : plafond de contexte", agent["status_text"])
+        self.assertIn("closed: context cap", agent["status_text"])
         # le grand livre relit l'usage par appel d'un tour sans `result`
         self.assertGreaterEqual(worker.last_turn_reread, 1200)
         self.assertTrue(worker.rotation_forcee)
@@ -173,7 +173,7 @@ class DureeMaximaleTest(_Base):
         flux = self._evenements(worker)
         self.assertIn('"tool_use_id": "outil-0"', flux)   # l'outil en cours a fini
         self.assertNotIn('"tool_use_id": "outil-1"', flux)
-        self.assertTrue(worker.last_turn_closed.startswith("durée maximale du tour"))
+        self.assertTrue(worker.last_turn_closed.startswith("maximum turn duration"))
         self.assertIsNone(worker.rotation_forcee)
         session = worker.current_session()
         self.assertTrue(session)
@@ -184,7 +184,7 @@ class DureeMaximaleTest(_Base):
             self.assertTrue(worker.run_turn(spec))
         argv = self.turns()[-1]["argv"]
         self.assertEqual(argv[argv.index("--resume") + 1], session)
-        self.assertIn("durée maximale du tour", argv[-1])
+        self.assertIn("maximum turn duration", argv[-1])
 
     def test_sans_limite_le_tour_va_au_bout(self):
         _runner, worker = self._worker("orch-libre", turn_max_seconds=0)
@@ -241,7 +241,7 @@ class CourrierBorneTest(_Base):
         mail.release(self.db, "orch-mail", jeton, [int(r["id"]) for r in restants])
         # l'exécuteur le note après le tour
         worker._note_courrier_borne("tour-1", 12.0)
-        self.assertEqual(worker.last_turn_closed, "courrier borné")
+        self.assertEqual(worker.last_turn_closed, "mail cap")
         self.assertIsNone(worker.suite)  # le reste du courrier ouvre le tour suivant
 
     def test_un_nouveau_tour_remet_la_suite(self):

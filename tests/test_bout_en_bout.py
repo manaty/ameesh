@@ -265,7 +265,7 @@ class BoutEnBoutTest(PgTestCase):
             self.assertIn("dropped for: %s" % name, proc.stdout)
         out = self.run_runner()
         for name in ("orchestre", "relecteur"):
-            self.assertIn("bail acquis : %s" % name, out)
+            self.assertIn("lease acquired: %s" % name, out)
         turns = self.turns()
         self.assertEqual(sorted((t["harness"], t["env"]["AGENT_MAIL_NAME"]) for t in turns),
                          [("claude", "orchestre"), ("codex", "relecteur")], out)

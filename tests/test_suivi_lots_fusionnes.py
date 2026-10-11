@@ -363,8 +363,8 @@ class MergeSweepTest(_Base):
             self.db.execute(sql)
         stale = [a for a in exploitation.alerts(self.cfg, self.db) if a["type"] == "stale_lot"]
         self.assertEqual([a["lot"] for a in stale], [lot["id"]])
-        self.assertIn("fusionné ? fermez-le : ameesh work merged %d --sha <commit de fusion> ; "
-                      "sinon relancez claude1" % lot["id"], stale[0]["detail"])
+        self.assertIn("merged? close it: ameesh work merged %d --sha <merge commit>; "
+                      "otherwise nudge claude1" % lot["id"], stale[0]["detail"])
         self.assertEqual(stale[0]["action"], exploitation.stale_action(stale[0] | {
             "id": lot["id"], "assignee": "claude1"}))
         self.merge("feature/z", "Merge #%d\n\nameesh-work: %d" % (lot["id"], lot["id"]))

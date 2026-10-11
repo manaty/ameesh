@@ -520,7 +520,7 @@ class AlimentationExecuteurTest(PgTestCase):
             row = registry.get(self.db, "nomade")
             self.assertIsNone(row["lease_owner"])
             self.assertEqual((row["status"], row["status_text"]), ("blocked", "hôte non prêt"))
-            self.assertIn("batterie 7.0 %", row["last_error"])
+            self.assertIn("battery 7.0 %", row["last_error"])
             self.assertNotEqual(row["status"], "stopped")
             # en attente du secteur : aucun bail repris
             runner.sweep()

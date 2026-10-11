@@ -343,7 +343,7 @@ class AdoptRevoqueLesLiaisonsTest(_BaseL39):
         out = reprise.adopt(self._cfg(comptes), self.db, "coord", session_id=SID,
                             harness="codex", actor="human:proprio")
         self.assertEqual(session_bindings.listing(self.db), [])
-        self.assertTrue(any("liaison(s) de session révoquée(s) : claude:s-ext" in n
+        self.assertTrue(any("session binding(s) revoked: claude:s-ext" in n
                             for n in out["notes"]))
         self.assertIn("révoquée(s) par human:proprio (adoption)", self._fil())
 

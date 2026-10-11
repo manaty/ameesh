@@ -134,7 +134,7 @@ class PlanUnderusedTest(_Base):
         self.assertIn("idle claude agents: claude1", out[0]["detail"])
         self.assertIn("$12.50 paid per token over 24 h", out[0]["detail"])
         self.assertEqual(exploitation._format_alert(out[0])[:33],
-                         "[plan_underused] claude/défaut : ")
+                         "[plan_underused] claude/default: ")
 
     def test_cle_de_dedoublonnage_par_compte(self):
         self.jauge("codex", "codex-10080min", 0.20, 4 * JOUR, 7 * JOUR, account="primaire")

@@ -326,7 +326,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
                    if a["type"] == "tmp_orphan"]
         self.assertIn(sale, {a["path"] for a in alertes})
         self.assertNotIn(ouvert, {a["path"] for a in alertes})
-        self.assertTrue(all("supprimé par le ménage une fois inchangé" in a["detail"]
+        self.assertTrue(all("deleted by cleanup once unchanged" in a["detail"]
                             for a in alertes))
 
     def test_worktree_de_relecture_propre_supprime_et_elague(self):

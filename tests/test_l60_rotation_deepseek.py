@@ -211,7 +211,7 @@ class PlafondDeContexteTest(_Base):
             self.assertLess(worker.session_turns, self.cfg.session_min_turns)
             with mock.patch.object(worker, "_fil_note") as note:
                 self.assertTrue(worker.maybe_rotate())
-        self.assertTrue(any("plafond de contexte" in str(appel) for appel in note.call_args_list),
+        self.assertTrue(any("context cap" in str(appel) for appel in note.call_args_list),
                         "la rotation est tracée dans le fil avec sa raison")
         self.assertIsNone(registry.get(self.db, "ds-cap")["session_id"])
         self.assertTrue(worker.resume_summary)

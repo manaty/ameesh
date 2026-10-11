@@ -254,7 +254,7 @@ class AdoptFailClosedTest(PgTestCase):
         with mock.patch.object(platform, "holders", side_effect=muet):
             with self.assertRaises(reprise.RepriseError) as ctx:
                 reprise.adopt(cfg, self.db, "coord", session_id=SID, harness="codex")
-            self.assertIn("impossible de vérifier", str(ctx.exception))
+            self.assertIn("cannot check", str(ctx.exception))
             self.assertEqual(registry.get(self.db, "coord")["mode"], "externe")
             avert: list[str] = []
             out = reprise.adopt(cfg, self.db, "coord", session_id=SID, harness="codex",
@@ -267,7 +267,7 @@ class AdoptFailClosedTest(PgTestCase):
             for nom in fichiers:
                 with open(os.path.join(racine, nom), encoding="utf-8", errors="ignore") as fh:
                     texte.append(fh.read())
-        self.assertIn("sans vérifier qu'elle est fermée", "\n".join(texte))
+        self.assertIn("without checking that it is closed", "\n".join(texte))
         self.assertEqual(registry.get(self.db, "coord")["mode"], "execute")
 
 

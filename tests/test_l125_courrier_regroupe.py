@@ -409,7 +409,7 @@ class TurnChurnTest(_Base):
         self.assertEqual([(a["agent"], a["value"], a["turns"]) for a in alertes],
                          [("orch", 13, 15)])
         self.assertEqual(alertes[0]["threshold"], exploitation.DEFAULT_TURN_CHURN)
-        self.assertIn("13 tour(s) de moins de 120s", alertes[0]["detail"])
+        self.assertIn("13 turn(s) shorter than 120s", alertes[0]["detail"])
         # seuils réglables ; 0 = désactivée
         self.assertFalse([a for a in exploitation.alerts(self.cfg, self.db, turn_churn=14)
                           if a["type"] == "turn_churn"])
