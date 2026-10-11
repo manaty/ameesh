@@ -71,5 +71,43 @@ class ResultSansUsageTest(Sandbox, PgTestCase):
         self.assertEqual(second.input_tokens, 10)
 
 
+    def test_le_result_principal_final_decide(self):
+        """Un `result` avec usage (sous-agent, ou principal plus tôt) ne fait pas
+        sauter le repli si le `result` principal final n'en a pas."""
+        avant = {"input_tokens": 7, "output_tokens": 3}
+        for n, precedent in enumerate((
+                {"type": "result", "session_id": "s1", "parent_tool_use_id": "outil-1",
+                 "total_cost_usd": 0.20, "usage": avant},
+                {"type": "result", "session_id": "s1", "total_cost_usd": 500.0,
+                 "usage": avant})):
+            with self.subTest(precedent=precedent):
+                self.db.execute("DELETE FROM turn_costs")
+                nom = self.agent("p%d" % n, "claude", "gpt-6.1-sol")
+                tour = self._tour({})
+                self.events(nom, *(tour[:-1] + [precedent, tour[-1]]))
+                usage = self.book().record(nom)
+                self.assertAlmostEqual(usage.usd, self._attendu())
+                self.assertEqual(usage.cached_input_tokens, 8_000_000)
+
+    def test_un_result_de_sous_agent_n_est_ni_repere_ni_session(self):
+        """Un `result` enfant après celui du parent : ni son cumul (0,20) ni sa
+        session ne deviennent ceux du tour."""
+        self.agent("a1", "claude", "gpt-6.1-sol")
+        book = self.book()
+        tour = self._tour({"input_tokens": 4_000, "output_tokens": 2_000})
+        enfant = {"type": "result", "session_id": "s-enfant", "parent_tool_use_id": "outil-1",
+                  "total_cost_usd": 0.20, "usage": {"input_tokens": 5}}
+        self.events("a1", *(tour + [enfant]))
+        premier = book.record("a1")
+        self.assertAlmostEqual(premier.usd, 510.19)       # session neuve : le cumul EST le tour
+        row = self.db.query("SELECT cum_usd, session FROM turn_costs WHERE agent = 'a1'")[0]
+        self.assertAlmostEqual(float(row["cum_usd"]), 510.19)
+        self.assertEqual(row["session"], "s1")
+        self.events("a1", {"type": "result", "session_id": "s1", "total_cost_usd": 512.19,
+                           "usage": {"input_tokens": 10, "output_tokens": 5}})
+        second = book.record("a1", start=len(tour) + 1)
+        self.assertAlmostEqual(second.usd, 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()
