@@ -67,7 +67,8 @@ AMEESH_KEYS = ("protocol", "binary", "binary_env", "launcher", "command", "inter
                "cost", "permissions", "acp", "accounts", "install")
 #: clés connues de `ameesh.interactive_permission` (L223 : mode de permission
 #: d'une session interactive, `ameesh attach` et `ameesh chat`)
-INTERACTIVE_PERMISSION_KEYS = ("flag", "default", "env", "fallback", "choices", "explicit_only")
+INTERACTIVE_PERMISSION_KEYS = ("flag", "default", "env", "fallback", "choices", "explicit_only",
+                               "orchestrator_default")
 #: un mode de permission passé au harnais : un identifiant court
 PERMISSION_MODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 #: clés connues de `ameesh.accounts` (L30 : comptes multiples par fournisseur)
@@ -847,8 +848,9 @@ def _setting(value: Any) -> Setting:
 def _check_interactive_permission(value: Any, path: str) -> list[Finding]:
     """`ameesh.interactive_permission` (L223) : drapeau à gabarit `{mode}`,
     mode par défaut, variables de surcharge, mode de repli, liste blanche des
-    modes (`choices`) et ceux qu'un réglage explicite de l'agent peut seul
-    poser (`explicit_only`)."""
+    modes (`choices`), ceux qu'un réglage explicite de l'agent peut seul
+    poser (`explicit_only`) et le défaut d'un orchestrateur
+    (`orchestrator_default`)."""
     if value is None:
         return []
     if not isinstance(value, dict):
@@ -865,7 +867,7 @@ def _check_interactive_permission(value: Any, path: str) -> list[Finding]:
         findings.append(Finding("harness-permission-mode-invalid", ERROR,
                                 "`ameesh.interactive_permission.flag` : liste de textes "
                                 "contenant `{mode}` attendue", path))
-    for key in ("default", "fallback"):
+    for key in ("default", "fallback", "orchestrator_default"):
         mode = value.get(key)
         if mode is not None and not (isinstance(mode, str) and PERMISSION_MODE_RE.match(mode)):
             findings.append(Finding("harness-permission-mode-invalid", ERROR,
@@ -886,7 +888,7 @@ def _check_interactive_permission(value: Any, path: str) -> list[Finding]:
                                     "attendue" % key, path))
     choix = [m for m in (_strings(value.get("choices")) or []) if PERMISSION_MODE_RE.match(m)]
     if choix:
-        for key in ("default", "fallback"):
+        for key in ("default", "fallback", "orchestrator_default"):
             mode = value.get(key)
             if isinstance(mode, str) and mode and mode not in choix:
                 findings.append(Finding("harness-permission-mode-invalid", ERROR,
@@ -909,6 +911,7 @@ def _interactive_permission(value: Any) -> dict:
     def modes(key: str) -> tuple[str, ...]:
         return tuple(m for m in (_strings(value.get(key)) or []) if PERMISSION_MODE_RE.match(m))
     return {"flag": tuple(flag), "default": mode("default"), "fallback": mode("fallback"),
+            "orchestrator_default": mode("orchestrator_default"),
             "env": tuple(n for n in (_strings(value.get("env")) or []) if ENV_RE.match(n)),
             "choices": modes("choices"), "explicit_only": modes("explicit_only")}
 

@@ -21,7 +21,8 @@
       "env": ["AMEESH_CLAUDE_PERMISSION_MODE"],
       "fallback": "acceptEdits",
       "choices": ["acceptEdits", "auto", "manual", "dontAsk", "plan", "bypassPermissions"],
-      "explicit_only": ["bypassPermissions"]
+      "explicit_only": ["bypassPermissions"],
+      "orchestrator_default": "bypassPermissions"
     },
     "session": {"flag": ["--resume"]},
     "stream": "claude-stream-json",

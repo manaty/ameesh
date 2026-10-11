@@ -96,6 +96,9 @@ def _show_text(descriptor: harnesses.HarnessDescriptor) -> None:
                     ", ".join(regle["choices"]),
                     " (%s : réglage de l'agent seulement)" % ", ".join(regle["explicit_only"])
                     if regle.get("explicit_only") else ""))
+            if regle.get("orchestrator_default"):
+                print("orchestrateur  : %s par défaut (rôle du canon ou %s)"
+                      % (regle["orchestrator_default"], "AMEESH_ATTACH_ORCHESTRATORS"))
     else:
         print("interactif     : non déclaré (attach indisponible)")
     print("session        : %s" % (" ".join(descriptor.session_flag) or "— (ACP)"))

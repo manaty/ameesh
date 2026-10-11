@@ -1047,7 +1047,8 @@ class HarnessAdapter:
         return argv
 
     def interactive_command(self, session_id: str | None = None, *,
-                            permission_mode: str | None = None) -> list[str]:
+                            permission_mode: str | None = None,
+                            orchestrator: bool = False) -> list[str]:
         """Commande d'une session **interactive** sur la même session (attach, C9).
 
         Elle ne passe ni par `-p`/`exec` ni par `--json` : le harnais garde son
@@ -1060,7 +1061,7 @@ class HarnessAdapter:
                 "le descripteur %s ne déclare pas de commande interactive : "
                 "`ameesh attach` n'est pas disponible pour ce harnais" % self.key)
         argv = [self.binary, *self.spec.launcher, *self.spec.interactive]
-        mode = self.permission_mode(permission_mode)
+        mode = self.permission_mode(permission_mode, orchestrator=orchestrator)
         if mode:
             regle = self.descriptor.interactive_permission
             argv += [part.replace("{mode}", mode) for part in regle["flag"]]
@@ -1068,14 +1069,17 @@ class HarnessAdapter:
             argv += [*self.spec.session_flag, session_id]
         return argv
 
-    def permission_mode(self, explicit: str | None = None) -> str:
+    def permission_mode(self, explicit: str | None = None, *,
+                        orchestrator: bool = False) -> str:
         """Le mode de permission d'une session interactive (L223), '' sans objet.
 
         Ordre : la valeur explicite (réglage de l'agent, `ameesh set <agent>
         permission_mode=…`), puis les variables du descripteur
         (`AMEESH_CLAUDE_PERMISSION_MODE`), puis son défaut (`auto` pour Claude :
         le classifieur garde les garde-fous sur les secrets, la configuration
-        persistante et la prod). Seuls les modes de la liste blanche du
+        persistante et la prod) ; un agent de rôle orchestrateur (`orchestrator`,
+        établi par l'appelant) prend `orchestrator_default` avant ce défaut
+        (`bypassPermissions` pour Claude). Seuls les modes de la liste blanche du
         descripteur (`choices`) sont retenus, et ceux de `explicit_only`
         (`bypassPermissions`) seulement par le réglage de l'agent : un autre
         est écarté avec un avertissement. Le mode retenu n'est passé que si
@@ -1106,6 +1110,8 @@ class HarnessAdapter:
                 continue
             mode = valeur
             break
+        if not mode and orchestrator:
+            mode = regle.get("orchestrator_default") or ""
         mode = mode or regle["default"]
         if mode and regle["fallback"] and mode != regle["fallback"]:
             try:

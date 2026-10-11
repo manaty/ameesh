@@ -4600,6 +4600,31 @@ def _attach_permission_mode(cfg: Config, name: str) -> str:
         return ""
 
 
+#: L223 : orchestrateurs déclarés sur l'hôte (noms séparés par des virgules),
+#: qui démarrent leur session interactive dans le mode d'orchestrateur du
+#: descripteur, comme ceux dont la fiche Agent du canon porte ce rôle
+ATTACH_ORCHESTRATORS_ENV = "AMEESH_ATTACH_ORCHESTRATORS"
+
+
+def _attach_is_orchestrator(cfg: Config, name: str) -> bool:
+    """L223 : l'agent est-il de rôle orchestrateur pour son mode interactif ?
+    Seulement la liste de l'hôte (`AMEESH_ATTACH_ORCHESTRATORS`) ou le champ
+    `roles`/`role` de sa fiche Agent du canon ; pas l'heuristique des agents
+    qui ont confié des lots (`assignments.is_orchestrator`), trop large pour
+    lever les demandes d'autorisation. Une lecture du canon en échec : non."""
+    from . import sous_utilisation as su
+
+    declares = {su._bare(n) for n in (os.environ.get(ATTACH_ORCHESTRATORS_ENV) or "")
+                .split(",") if n.strip()}
+    if name in declares:
+        return True
+    try:
+        from . import canon as canon_mod
+        return name in su.role_orchestrators(canon_mod.load_configured(cfg))
+    except Exception:
+        return False
+
+
 def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
                ttl: float | None = None) -> int:
     """`ameesh attach <agent>` : bail interactif sur la même session (C9).
@@ -4703,7 +4728,8 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         thread.start()
         veille.start()
         argv = adapter.interactive_command(agent.get("session_id"),
-                                           permission_mode=_attach_permission_mode(cfg, name))
+                                           permission_mode=_attach_permission_mode(cfg, name),
+                                           orchestrator=_attach_is_orchestrator(cfg, name))
         env = _attach_env(cfg, name, owner, epoch)
         env.update(adapter.env())
         env.update(_attach_tmp_env(cfg, name, env))

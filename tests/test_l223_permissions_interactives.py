@@ -15,9 +15,10 @@ import json
 import os
 import subprocess
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import adapters, harnesses, registry
+from ameesh import adapters, canon, harnesses, registry
 from ameesh.runner import run_attach
 
 from .support import FAKEBIN, PgTestCase
@@ -124,6 +125,16 @@ class ModeDePermissionTest(unittest.TestCase):
         with mock.patch.object(adapters, "_option_choices", side_effect=RuntimeError("x")):
             self.assertEqual(claude.permission_mode(), "acceptEdits")
 
+    def test_orchestrateur_bypass_sauf_reglage_ou_variable(self):
+        # demande du propriétaire relayée par mesh-design (2026-10-11) : ordre
+        # ameesh set > variable > rôle orchestrateur > défaut auto
+        claude = self._claude()
+        self.assertEqual(claude.permission_mode(orchestrator=True), "bypassPermissions")
+        self.assertEqual(claude.permission_mode(), "auto")
+        self.assertEqual(claude.permission_mode("plan", orchestrator=True), "plan")
+        claude = self._claude(**{VARIABLE: "auto"})
+        self.assertEqual(claude.permission_mode(orchestrator=True), "auto")
+
     def test_codex_et_deepseek_inchanges(self):
         self._claude()
         codex = adapters.adapter_for("codex")
@@ -206,6 +217,22 @@ class AttachPermissionTest(PgTestCase):
         self.assertIsNone(registry.get(self.db, "perm")["lease_owner"])
         # l'aide interrompue n'est pas retenue comme illisible
         self.assertEqual(self._attach()[:2], ["--permission-mode", "auto"])
+
+    def test_attach_orchestrateur_en_bypass(self):
+        # liste de l'hôte
+        argv = self._attach(AMEESH_ATTACH_ORCHESTRATORS="autre, agent:perm")
+        self.assertEqual(argv[:2], ["--permission-mode", "bypassPermissions"])
+        # rôle de la fiche Agent du canon
+        fiche = SimpleNamespace(title="perm", fiche=SimpleNamespace(
+            data={"roles": ["Orchestrateur"]}))
+        with mock.patch.object(canon, "load_configured",
+                               return_value=[SimpleNamespace(agents=[fiche])]):
+            self.assertEqual(self._attach()[:2], ["--permission-mode", "bypassPermissions"])
+            self.assertEqual(self._attach(**{VARIABLE: "auto"})[:2],
+                             ["--permission-mode", "auto"])
+        # canon illisible : pas de rôle, défaut auto
+        with mock.patch.object(canon, "load_configured", side_effect=RuntimeError("canon")):
+            self.assertEqual(self._attach()[:2], ["--permission-mode", "auto"])
 
     def test_attach_survit_a_une_aide_en_erreur(self):
         # verdict codex #182 (3) : l'aide est lue avant le try/finally de
