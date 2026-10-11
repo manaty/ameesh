@@ -34,6 +34,13 @@ ITEM_COLUMNS = """
 """
 
 #: L160d (0057): a prepared conflict resolution
+QUEUE_COLUMNS = """
+    q.work_item_id, q.target, q.frozen_sha, q.state, q.rank, q.reason, q.queued_by,
+    extract(epoch from q.queued_at)::float8 as queued_ts,
+    extract(epoch from q.updated_at)::float8 as updated_ts,
+    w.title, w.priority, w.state as item_state, w.branch, w.assignee
+"""
+
 RESOLUTION_COLUMNS = """
     work_item_id, other_item_id, commit_sha, lot_tip, other_tip, ref, files, created_by,
     extract(epoch from created_at)::float8 as created_ts
@@ -641,6 +648,62 @@ class WorkItems(interface.WorkItems):
             "    OR other_item_id IN (SELECT jsonb_array_elements_text(%%s::jsonb)::bigint)"
             " ORDER BY created_at DESC, work_item_id, other_item_id"
             % RESOLUTION_COLUMNS, (ids, ids))
+
+    # -- merge queue (L160e, 0058) ---------------------------------------------
+    def _queue_row(self, db, item_id) -> dict | None:
+        rows = db.query("SELECT %s FROM merge_queue q JOIN work_items w ON w.id = q.work_item_id"
+                        " WHERE q.work_item_id = %%s" % QUEUE_COLUMNS, (int(item_id),))
+        return rows[0] if rows else None
+
+    def queue_add(self, item_id, *, target, frozen_sha, note, actor) -> dict | None:
+        with self.db.transaction() as tx:
+            lot = tx.query("SELECT state FROM work_items WHERE id = %s"
+                           " AND state NOT IN ('merged', 'promoted', 'closed')", (int(item_id),))
+            if not lot:
+                return None
+            tx.query(
+                "INSERT INTO merge_queue (work_item_id, target, frozen_sha, queued_by)"
+                " VALUES (%s, %s, %s, %s)"
+                " ON CONFLICT (work_item_id) DO UPDATE SET target = excluded.target,"
+                "   frozen_sha = excluded.frozen_sha, state = 'queued', rank = NULL,"
+                "   reason = '', queued_by = excluded.queued_by, queued_at = now(),"
+                "   updated_at = now()",
+                (int(item_id), target, frozen_sha, actor or ""))
+            WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
+            return self._queue_row(tx, item_id)
+
+    def queue_update(self, item_id, *, state=None, rank=None, reason=None, note="",
+                     actor="") -> dict | None:
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "UPDATE merge_queue SET state = coalesce(%s, state),"
+                "   rank = CASE WHEN %s THEN NULL ELSE coalesce(%s, rank) END,"
+                "   reason = coalesce(%s, reason), updated_at = now()"
+                " WHERE work_item_id = %s RETURNING work_item_id",
+                (state, state == "ejected", rank, reason, int(item_id)))
+            if not rows:
+                return None
+            if note:
+                lot = tx.query("SELECT state FROM work_items WHERE id = %s", (int(item_id),))
+                WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
+            return self._queue_row(tx, item_id)
+
+    def queue_remove(self, item_id, *, note, actor) -> bool:
+        with self.db.transaction() as tx:
+            rows = tx.query("DELETE FROM merge_queue WHERE work_item_id = %s"
+                            " RETURNING work_item_id", (int(item_id),))
+            if not rows:
+                return False
+            lot = tx.query("SELECT state FROM work_items WHERE id = %s", (int(item_id),))
+            WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
+            return True
+
+    def queue(self, target=None) -> list[dict]:
+        return self.db.query(
+            "SELECT %s FROM merge_queue q JOIN work_items w ON w.id = q.work_item_id"
+            " WHERE (%%s::text IS NULL OR q.target = %%s)"
+            " ORDER BY q.target, q.rank NULLS LAST, q.queued_at, q.work_item_id"
+            % QUEUE_COLUMNS, (target, target))
 
     def set_branch_head(self, item_id, branch, head) -> bool:
         """Retient le dernier commit de la branche vu en avance sur sa cible

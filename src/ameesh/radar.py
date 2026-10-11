@@ -217,9 +217,11 @@ class Cache:
         # L160d: change sizes for the resolver, replays of prepared resolutions
         self.sizes: dict = {}
         self.replays: dict = {}
+        # L160e: stacked replays of the merge queues
+        self.stacks: dict = {}
 
     def trim(self) -> None:
-        for table in (self.merges, self.diffs, self.sizes, self.replays):
+        for table in (self.merges, self.diffs, self.sizes, self.replays, self.stacks):
             while len(table) > MAX_CACHE:
                 table.pop(next(iter(table)))
 
@@ -418,6 +420,7 @@ def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None =
             report, error = {"repo": project.repo}, "%s : %s" % (type(exc).__name__, exc)
         if not error:
             annotate_resolutions(cfg, db, project, report, lots, cache)
+            report["queue"] = run_queue(cfg, db, project, report, cache)
         report.update(schema=SCHEMA, project=project.name, ts=started,
                       duration_s=round(now() - started, 3), error=error)
         line = write_journal(cfg, project.name, report)
@@ -453,6 +456,16 @@ def annotate_resolutions(cfg, db, project: Project, report: dict, lots: list[dic
                              cache=cache)
     except Exception as exc:  # noqa: BLE001 - never fatal for the pass
         report["resolution_error"] = "%s: %s" % (type(exc).__name__, exc)
+
+
+def run_queue(cfg, db, project: Project, report: dict, cache: Cache | None) -> dict:
+    """L160e: order and stacked replay of the merge queues of the project
+    (`ameesh.merge_queue.run_pass`). Never raises."""
+    from . import merge_queue
+    try:
+        return merge_queue.run_pass(cfg, db, project, report, cache=cache)
+    except Exception as exc:  # noqa: BLE001 - never fatal for the pass
+        return {"targets": {}, "mail": [], "error": "%s: %s" % (type(exc).__name__, exc)}
 
 
 # --------------------------------------------------------------------------
@@ -759,6 +772,15 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
                                      for h in dup["lots"]),
             "; already in %s: %s" % (dup["target"], dup["in_target"])
             if dup["in_target"] else ""))
+    queue = report.get("queue") or {}
+    if queue.get("error"):
+        out.append("  file : %s" % queue["error"])
+    for target, listed in sorted((queue.get("targets") or {}).items()):
+        out.append("  file vers %s : %s" % (target, ", ".join(
+            "%d. %s%s" % (one["rank"], _lot(one["lot"]),
+                          " (éjecté)" if one["state"] == "ejected" else
+                          " (rejouée)" if (one.get("stack") or {}).get("state") == "replayed"
+                          else "") for one in listed) or "vide"))
     for one in report.get("skipped") or ():
         out.append("  skipped  %s %s: %s" % (_lot(one["work_item"]), one["branch"],
                                              one["reason"]))
