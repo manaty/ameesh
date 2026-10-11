@@ -373,6 +373,9 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
             if status != "D" and stem.stem in modules:
                 impact.p0[stem.stem] = path
             continue
+        # a file read as data (a .py, a migration as well): its readers, whatever
+        # the kind of file and even when its blocks did not change
+        impact.hit(card.get("donnees", {}).get(path, ()), path)
         if is_foundation(path):
             if path == "pyproject.toml" and _version_line_only(head, card["commit"], repo):
                 impact.hit(card.get("donnees", {}).get(path, ()), path)
@@ -540,19 +543,19 @@ def nature(event: str, base: str = "HEAD^1", head: str = "HEAD",
     return out
 
 
-def doc_readers(files: list[str], card: dict | None,
+def doc_readers(classes: dict, card: dict,
                 modules: list[str]) -> tuple[list[str], list[str]]:
-    """Readers of a documentation-only change: the declared ones
-    (`tests/parts/lecteurs-doc.txt`) plus, with a usable map, the measured
-    ones; and the measured readers that need the database, which the
-    doc-readers job (no Postgres) cannot run."""
-    readers = {n.split(".", 1)[1] for n in version_only.doc_readers()}
-    measured: set[str] = set()
-    if card is not None:
-        for f in files:
-            measured |= set(card.get("donnees", {}).get(f, ()))
-    db = sorted(m for m in measured - readers if m in modules and m in _db_modules(card or {}))
-    return sorted(m for m in readers | measured if m in modules), db
+    """Readers of a documentation-only change, judged with a usable map: the
+    declared ones (`tests/parts/lecteurs-doc.txt`) plus every P0 or P1 module
+    of the plan (data readers, listers of a directory where a document
+    appeared or vanished); and those of them that need the database, which
+    the doc-readers job (no Postgres) cannot run."""
+    declared = {n.split(".", 1)[1] for n in version_only.doc_readers()}
+    measured = {m for m, c in classes.items() if c[0] in ("P0", "P1")}
+    # a P0 module is unknown to the map: whether it needs the database is unknown too
+    db = sorted(m for m in measured - declared if m in modules
+                and (m in _db_modules(card) or classes[m][0] == "P0"))
+    return sorted(m for m in declared | measured if m in modules), db
 
 
 def make_plan(event: str, card: dict | None, now: datetime.datetime | None = None,
@@ -566,17 +569,20 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     classes = {m: tuple(c) for m, c in plan["classes"].items()}
     plan["doc_readers"] = []
     if plan["docs_only"]:
-        used = card if plan["map"] and plan["map"]["used"] else None
-        plan["doc_readers"], db_readers = doc_readers(plan.get("files", []), used, modules)
-        if db_readers:  # doc-readers has no Postgres: the full parts run them
-            plan["docs_only"] = False
-            plan["why"] = (f"documentation read by database tests "
-                           f"({', '.join(db_readers)}): full parts")
-            plan["doc_readers"] = []
-            for m in db_readers:
-                if plan["classes"].get(m, ["P3"])[0] not in ("P0", "P1"):
-                    plan["classes"][m] = ["P1", "reads the changed documentation"]
-            classes = {m: tuple(c) for m, c in plan["classes"].items()}
+        # the fast lane needs a map that judged everything: a missing, stale or
+        # unusable map, or an unsure selection, runs the full suite
+        full = None
+        if not (plan["map"] and plan["map"]["used"]):
+            full = f"documentation, map not usable ({plan['unsure'][0]}): full suite"
+        elif not plan["sure"]:
+            full = f"documentation, selection unsure ({plan['unsure'][0]}): full suite"
+        else:
+            plan["doc_readers"], db_readers = doc_readers(plan["classes"], card, modules)
+            if db_readers:  # doc-readers has no Postgres: the full parts run them
+                full = (f"documentation read by database tests "
+                        f"({', '.join(db_readers)}): full suite")
+        if full:
+            plan["docs_only"], plan["why"], plan["doc_readers"] = False, full, []
     skip = plan["version_only"] or plan["docs_only"]
     pr = event == "pull_request"
     plan["parts"] = {}

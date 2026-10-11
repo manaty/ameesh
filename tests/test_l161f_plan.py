@@ -306,18 +306,6 @@ class MapTest(unittest.TestCase):
             with self.subTest(sql):
                 self.assertFalse(plan._NOT_ADDITIVE.search(sql), sql)
 
-    def test_doc_readers_needing_the_database(self):
-        # L161f review (c): doc-readers has no Postgres
-        card = self.repo.card()
-        card["donnees"]["docs/guide.md"] = ["test_c", "test_db"]
-        declared = {n.split(".", 1)[1] for n in plan.version_only.doc_readers()}
-        mods = ["test_a", "test_c", "test_db", *declared]
-        readers, db = plan.doc_readers(["docs/guide.md"], card, mods)
-        self.assertEqual(db, ["test_db"])
-        self.assertEqual(readers, sorted({"test_c", "test_db", *declared}))
-        readers, db = plan.doc_readers(["docs/guide.md"], None, mods)  # map not used
-        self.assertEqual((readers, db), (sorted(declared), []))
-
     def test_map_problems(self):
         card = self.repo.card()
         self.assertEqual(plan.map_problem(card, NOW, "HEAD", self.repo.path), ("", 0.0))
@@ -350,6 +338,103 @@ class MapTest(unittest.TestCase):
                 return {k: v["empreinte"] for k, v in blocks.items()}
             self.assertEqual(prints(plan._without_new_functions(source, set())),
                              prints(carte.blocs(source)[0]), f)
+
+
+class DocsLaneTest(unittest.TestCase):
+    """make_plan end to end on a throwaway repository (codex review of L161f)."""
+
+    ROLES = ["test_a", "test_b", "test_c", "test_db", "test_lister"]
+
+    def setUp(self):
+        self.repo = _Repo()
+        self.addCleanup(self.repo.close)
+        # real module names: the L161b heuristic reads their text
+        real = [m for m in parts.modules() if m != "test_l161f_plan"][:len(self.ROLES)]
+        self.name = dict(zip(self.ROLES, real))
+        self.MODULES = sorted(real)
+        card = self.repo.card()
+
+        def rename(v):
+            if isinstance(v, dict):
+                return {k: rename(x) for k, x in v.items()}
+            if isinstance(v, list):
+                return [self.name.get(x, x) if isinstance(x, str) else rename(x) for x in v]
+            return v
+        self.card = {k: rename(v) if k in ("blocs", "donnees", "dossiers", "tables") else v
+                     for k, v in card.items()}
+        self.card["modules"] = {m: {"durees": {"psycopg": 1.0}, "echecs": []}
+                                for m in self.MODULES}
+
+    def _plan(self, files: list[str], event: str = "pull_request") -> dict:
+        docs = {"version_only": False, "docs_only": event == "pull_request",
+                "why": "docs", "files": files}
+        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)), \
+                mock.patch.object(plan.parts, "modules", lambda *a: list(self.MODULES)), \
+                mock.patch.object(plan, "read_list", lambda *a, **k: list(self.MODULES)
+                                  if a and a[0] == plan.PILOT_FILE else []):
+            return plan.make_plan(event, self.card, NOW, head="HEAD", repo=self.repo.path)
+
+    def assertFullSuite(self, p: dict, why: str) -> None:
+        self.assertFalse(p["docs_only"], p["why"])
+        self.assertIn(why, p["why"])
+        self.assertEqual(p["doc_readers"], [])
+        self.assertEqual(sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]),
+                         self.MODULES)
+        self.assertEqual(plan.outputs(p)["code"], "true")
+
+    def test_read_by_a_plain_test_stays_in_the_fast_lane(self):
+        self.card["donnees"]["docs/guide.md"] = [self.name["test_c"]]
+        self.repo.write("docs/guide.md", "# Guide, again\n")
+        self.repo.commit()
+        p = self._plan(["docs/guide.md"])
+        self.assertTrue(p["docs_only"])
+        self.assertIn(self.name["test_c"], p["doc_readers"])
+        self.assertEqual(p["parts"]["psycopg"], [])
+
+    def test_read_by_a_database_test_runs_the_full_suite(self):
+        self.card["donnees"]["docs/guide.md"] = [self.name["test_c"], self.name["test_db"]]
+        self.repo.write("docs/guide.md", "# Guide, again\n")
+        self.repo.commit()
+        p = self._plan(["docs/guide.md"])
+        self.assertFullSuite(p, self.name["test_db"])
+        self.assertEqual(p["classes"][self.name["test_db"]][0], "P1")
+
+    def test_stale_map_always_runs_the_full_suite(self):
+        # codex (1): a 49 h map left only the declared readers
+        self.card["donnees"]["docs/guide.md"] = [self.name["test_db"]]
+        self.card["genere"] = (NOW - datetime.timedelta(hours=49)).isoformat()
+        self.repo.write("docs/guide.md", "# Guide, again\n")
+        self.repo.commit()
+        self.assertFullSuite(self._plan(["docs/guide.md"]), "map not usable")
+        self.assertFullSuite(self._plan_without_map(["docs/guide.md"]), "no map")
+
+    def _plan_without_map(self, files):
+        self.card = None
+        return self._plan(files)
+
+    def test_document_added_or_removed_reaches_the_directory_listers(self):
+        # codex (2): only `donnees` was read; a lister of docs/ touching a table ran nowhere
+        self.card["dossiers"]["docs"] = [self.name["test_db"]]
+        for change in ("add", "remove"):
+            with self.subTest(change):
+                if change == "add":
+                    self.repo.write("docs/new.md", "# New\n")
+                    files = ["docs/new.md"]
+                else:
+                    self.repo.remove("docs/guide.md")
+                    files = ["docs/guide.md"]
+                self.repo.commit()
+                p = self._plan(files)
+                self.assertFullSuite(p, self.name["test_db"])
+                self.assertEqual(p["classes"][self.name["test_db"]][0], "P1")
+
+    def test_python_file_read_as_data_selects_its_readers(self):
+        # codex (3): a .py read as data, changed without an AST change, left its reader in P3
+        self.card["donnees"]["src/ameesh/code.py"] = [self.name["test_db"]]
+        self.repo.write("src/ameesh/code.py", CODE_V1 + "# a comment, same AST\n")
+        self.repo.commit()
+        p = self._plan([], event="push")
+        self.assertEqual(p["classes"][self.name["test_db"]], ["P1", "src/ameesh/code.py"])
 
 
 class PlanTest(unittest.TestCase):
@@ -417,30 +502,6 @@ class PlanTest(unittest.TestCase):
             with self.subTest(driver=driver):
                 seen = [m for ps in p["parts"][driver] for m in ps["modules"]]
                 self.assertEqual(sorted(seen), mods)  # every one, none twice
-
-    def test_docs_only_read_by_a_database_test_runs_the_parts(self):
-        mods = parts.modules()
-        db, plain = mods[0], mods[1]
-        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, check=True,
-                              capture_output=True, text=True).stdout.strip()
-        card = {"schema": carte.SCHEMA, "commit": head, "genere": NOW.isoformat(),
-                "modules": {m: {"durees": {"psycopg": 1.0}, "echecs": []} for m in mods},
-                "blocs": {}, "dossiers": {}, "migrations": {},
-                "donnees": {"docs/guide.md": [db, plain]}, "tables": {"things": [db]}}
-        docs = {"version_only": False, "docs_only": True, "why": "docs", "files": ["docs/guide.md"]}
-        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)):
-            p = plan.make_plan("pull_request", card, NOW)
-        self.assertFalse(p["docs_only"])
-        self.assertIn(db, p["why"])
-        self.assertEqual(p["doc_readers"], [])
-        self.assertEqual(p["classes"][db][0], "P1")
-        self.assertTrue(p["parts"]["psycopg"])
-        card["tables"] = {}
-        with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)):
-            p = plan.make_plan("pull_request", card, NOW)
-        self.assertTrue(p["docs_only"])
-        self.assertIn(db, p["doc_readers"])
-        self.assertEqual(p["parts"]["psycopg"], [])
 
     def _main_plan(self) -> dict:
         d = pathlib.Path(tempfile.mkdtemp())
