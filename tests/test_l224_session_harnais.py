@@ -268,7 +268,7 @@ class HomeDuTourTest(_Verifie):
         env_harnais = adapters.HarnessAdapter.env
         with mock.patch.object(adapters.HarnessAdapter, "env",
                                lambda a: dict(env_harnais(a), HOME=tour)), \
-                mock.patch.dict(os.environ, {"HOME": executeur,
+                mock.patch.dict(os.environ, {"HOME": executeur, "AMEESH_BIN_DIR": FAKEBIN,
                                             "AMEESH_SESSION_STORE_CHECK": "1"}):
             os.environ.pop("CLAUDE_CONFIG_DIR", None)
             prédicat = worker._session_connue("claude", None, worker._adapter())
