@@ -129,6 +129,9 @@ TYPE_LABELS = {
     # L125 : mesure de l'effet du regroupement du courrier ; pas poussée par
     # défaut (à ajouter dans `notify.types` pour la recevoir)
     "turn_churn": "tours courts en rafale",
+    # L157b : adressée aux agents (alert_briefs) ; pas poussée aux humains par
+    # défaut (à ajouter dans `notify.types` pour la recevoir)
+    "estimate_bias": "biais d'estimation",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",

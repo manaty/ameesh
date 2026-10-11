@@ -10,6 +10,8 @@ laisse une ligne dans `work_item_events` (qui, quand, pourquoi).
 """
 from __future__ import annotations
 
+import json
+
 from .. import interface
 from . import catalog as _catalog
 
@@ -19,7 +21,7 @@ ITEM_COLUMNS = """
     superseded_by, delegated_by,
     expected_value, value_score, priority, team, required_capabilities,
     branch, branch_target, branch_head, migration,
-    estimate_minutes, estimate_source, estimate_by,
+    estimate_minutes, estimate_source, estimate_by, change_size,
     extract(epoch from estimate_at)::float8 as estimate_ts,
     extract(epoch from started_at)::float8 as started_ts,
     extract(epoch from created_at)::float8 as created_ts,
@@ -121,7 +123,7 @@ class WorkItems(interface.WorkItems):
     def add(self, *, type, source, app, title, body, issue_ref, workstream,  # noqa: A002
             assignee, budget_usd, note, actor, package_id=None, package_parent=None,
             branch=None, branch_target=None, priority=None, estimate_minutes=None,
-            estimate_source=None) -> dict:
+            estimate_source=None, change_size=None) -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
         avec sa durée estimée (et sa ligne d'historique), en UNE transaction."""
         with self.db.transaction() as tx:
@@ -130,16 +132,18 @@ class WorkItems(interface.WorkItems):
                 INSERT INTO work_items
                     (type, source, app, title, body, issue_ref, workstream, assignee,
                      budget_usd, state, package_id, package_parent, branch, branch_target,
-                     priority, estimate_minutes, estimate_source, estimate_by, estimate_at)
+                     priority, estimate_minutes, estimate_source, estimate_by, estimate_at,
+                     change_size)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'intake', %s, %s, %s, %s, %s,
-                        %s, %s, %s, CASE WHEN %s THEN now() END)
+                        %s, %s, %s, CASE WHEN %s THEN now() END, %s)
                 RETURNING __COLUMNS__
                 """.replace("__COLUMNS__", ITEM_COLUMNS),
                 (type, source, app, title, body, issue_ref, workstream, assignee,
                  budget_usd, package_id, package_parent, branch, branch_target,
                  None if priority is None else int(priority),
                  estimate_minutes, estimate_source if estimate_minutes else None,
-                 (actor or "") if estimate_minutes else None, bool(estimate_minutes)),
+                 (actor or "") if estimate_minutes else None, bool(estimate_minutes),
+                 change_size or None),
             )
             item = rows[0]
             if estimate_minutes:
@@ -758,6 +762,7 @@ class WorkItems(interface.WorkItems):
         posée après, `late`), nombre d'estimations posées."""
         sql = (
             "SELECT w.id, w.type, w.app, w.workstream, w.title, w.state, w.assignee,"
+            "       w.change_size,"
             "       extract(epoch from w.started_at)::float8 AS started_ts,"
             "       extract(epoch from fus.at)::float8 AS merged_ts,"
             "       coalesce(b.minutes, f.minutes, w.estimate_minutes) AS estimate_minutes,"
@@ -788,6 +793,24 @@ class WorkItems(interface.WorkItems):
         sql += " ORDER BY fus.at DESC, w.id DESC LIMIT %s"
         params.append(int(limit))
         return self.db.query(sql, tuple(params))
+
+    # -- table de référence des durées (L157b) ----------------------------------
+    def publish_reference(self, body, *, actor) -> dict:
+        """Publie une table de référence (la plus récente est en vigueur)."""
+        rows = self.db.query(
+            "INSERT INTO estimate_references (published_by, body) VALUES (%s, %s::jsonb)"
+            " RETURNING id, published_by, extract(epoch from published_at)::float8"
+            "           AS published_ts",
+            (actor or "", json.dumps(body, ensure_ascii=False)))
+        return rows[0]
+
+    def reference(self) -> dict | None:
+        """La table de référence en vigueur (la dernière publiée), ou None."""
+        rows = self.db.query(
+            "SELECT id, published_by, body,"
+            "       extract(epoch from published_at)::float8 AS published_ts"
+            "  FROM estimate_references ORDER BY id DESC LIMIT 1")
+        return rows[0] if rows else None
 
     def _event(self, item_id, state, note, actor) -> None:
         self.db.execute(
