@@ -1,5 +1,6 @@
 # Conception d'ameesh
 
+* [Historique : les PR fusionnées](https://github.com/manaty/ameesh/pulls?q=is%3Apr+is%3Amerged+sort%3Aupdated-desc) - Ce qui a changé et pourquoi, une description par PR ; le détail est dans `git log`. Aucun journal tenu à la main (L160a).
 * [Spécification d'ameesh v1](specification.md) - Périmètre, architecture, canon, actions, reçus, plan de lots.
 * [Descripteurs de harnais](descripteurs-de-harnais.md) - Manifeste ACP + clés `ameesh`, adaptateur ACP générique, fin de la liste fermée (L16, R22).
 * [Bascule vers ameesh v1 (brouillon)](bascule-v1.md) - Plan réversible : canon d'amorçage, ameesh-approve, orchestrateurs à tours.

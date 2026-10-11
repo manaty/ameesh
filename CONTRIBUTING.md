@@ -31,6 +31,15 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   `tests/test_l142_env_isole.py` vérifie qu'un poste « pollué » voit la même
   chose qu'un poste propre. Tout module de test qui touche à l'environnement
   importe donc `tests.support`.
+- **Historique : git et les PR** (L160a) : la description de la PR dit ce
+  qui change et pourquoi ; aucun journal tenu à la main. Les PR fusionnées
+  sont liées depuis `docs/design/index.md`.
+- **Ajouter plutôt que modifier** (L160a) : on ajoute des fichiers (un module,
+  un test, une page, une décision par sujet) plutôt que de modifier un fichier
+  commun, pour que deux PR ouvertes en même temps ne se gênent pas à la fusion.
+  Les listes centrales (`tests/parts/pilote-psql.txt`…) ont une entrée par
+  ligne, rangée par ordre alphabétique, sa raison en commentaire sur la même
+  ligne ; `scripts/test-parts.py` refuse une liste mal rangée.
 - **En-tête de licence** `SPDX-License-Identifier: AGPL-3.0-only` en tête des
   nouveaux fichiers source.
 

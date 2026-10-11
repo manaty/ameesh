@@ -17,7 +17,9 @@ Un module absent de la table (nouveau) est pesé par son nombre de tests
 repli, signalé sur la sortie d'erreur pour qu'on rafraîchisse la table.
 
 `--liste` restreint la suite aux modules d'un fichier (un nom par ligne, `#`
-pour les commentaires) : `tests/parts/pilote-psql.txt` sur une PR.
+pour les commentaires) : `tests/parts/pilote-psql.txt` sur une PR. La liste
+est additive (L160a) : noms en ordre alphabétique et sans doublon, sinon
+refusée.
 
 `lancer` exécute la part dans ce processus (`unittest`, verbeux) et mesure la
 durée de chaque module ; `durees` fusionne ces mesures dans la table.
@@ -59,7 +61,11 @@ def lire_liste(chemin: str | os.PathLike, connus: list[str]) -> list[str]:
     inconnus = sorted(set(noms) - set(connus))
     if inconnus:
         raise SystemExit(f"{chemin} : module(s) inconnu(s) : {', '.join(inconnus)}")
-    return sorted(set(noms))
+    # L160a: kept sorted and unique so that two additions never touch the same line
+    if noms != sorted(set(noms)):
+        raise SystemExit(f"{chemin} : liste non rangée (ordre alphabétique, sans doublon) ; "
+                         f"attendu : {', '.join(sorted(set(noms)))}")
+    return noms
 
 
 def nombre_de_tests(module: str, tests: pathlib.Path = TESTS) -> int:

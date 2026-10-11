@@ -8,7 +8,7 @@ generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-11T04:15:00+02:00" 
 stale_after: 2027-01-11
 sources:
   - { resource: "../../ORCHESTRATEUR.md", title: "Consigne des orchestrateurs (branche du lot, fusion sans PR, migrations réservées)" }
-  - { resource: "../log.md", title: "Journal de la conception (L118, L125)" }
+  - { resource: "https://github.com/manaty/ameesh/pulls?q=is%3Apr+is%3Amerged", title: "PR fusionnées (L118, L125), qui remplacent le journal de la conception" }
   - { resource: "../decisions/0018-vitesse-des-agents.md", title: "Décision 0018 (vitesse des agents, revue proportionnée)" }
   - { resource: "https://git-scm.com/docs/git-merge-tree", title: "git merge-tree --write-tree" }
   - { resource: "https://git-scm.com/docs/git-rerere", title: "git rerere" }
@@ -392,6 +392,9 @@ consigne d'équipe) :
    (`docs/design/log.d/2026-10-11-l160.md`), assemblé par un script vérifié en
    CI ; on n'écrit plus en tête de `log.md`. De même pour le journal de connaissances et la feuille
    de route de Nexlink.
+   *Décision du propriétaire du 11/10 (lot L160a) : pas de fragments pour
+   ameesh, le journal tenu à la main `docs/design/log.md` est supprimé ;
+   l'historique, ce sont git et les descriptions des PR fusionnées.*
 3. **Index générés** depuis l'en-tête des fiches (index des décisions, des
    études), jamais tenus à la main.
 4. **Listes** : un élément par ligne, virgule finale, rangées par ordre
