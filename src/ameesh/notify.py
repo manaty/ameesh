@@ -86,7 +86,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # relance à l'échéance (urgentes si la demande l'est)
                  "decision_pending", "decision_overdue",
                  # L161c : la CI de main est rouge (elle bloque les déploiements)
-                 "ci_main_red")
+                 "ci_main_red",
+                 # #246 : btrfs presque plein côté allocation (df ne le voit pas)
+                 "host_disk_low")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -142,6 +144,7 @@ TYPE_LABELS = {
     # défaut (à ajouter dans `notify.types` pour la recevoir)
     "estimate_bias": "biais d'estimation",
     "ci_main_red": "CI rouge sur main",
+    "host_disk_low": "disque btrfs presque plein",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",

@@ -3,8 +3,9 @@
 
 Chaque exécuteur relève périodiquement l'état de son hôte — mémoire
 disponible, swap utilisé, charge CPU (1 minute), disque libre du dossier de
-travail, tours en cours — et le publie en base (`host_resources`). `ameesh
-hosts` montre le dernier relevé de chaque hôte et l'historique court.
+travail, allocation btrfs de ce disque (#246), tours en cours — et le publie
+en base (`host_resources`). `ameesh hosts` montre le dernier relevé de
+chaque hôte et l'historique court.
 
 Les MESURES sont de l'état d'exécution (base) ; les SEUILS sont déclaratifs
 (canon, `policy.resources` de la fiche `Host`) et lus par
@@ -14,8 +15,8 @@ Les MESURES sont de l'état d'exécution (base) ; les SEUILS sont déclaratifs
 Unités : mémoire, swap et disque en OCTETS (un entier, ou un texte avec
 unité `KiB`/`MiB`/`GiB`/`TiB` — base 1024 — ou `KB`/`MB`/`GB`/`TB` — base
 1000). `max_load` est une charge système (flottant), comparée à la charge 1
-minute. `min_mem_available` et `min_disk_free` sont des planchers ; les autres
-sont des plafonds.
+minute. `min_mem_available`, `min_disk_free`, `min_btrfs_unallocated` et
+`min_btrfs_metadata_headroom` sont des planchers ; les autres sont des plafonds.
 """
 from __future__ import annotations
 
@@ -37,6 +38,15 @@ DEFAULT_MIN_MEM_AVAILABLE = 1024 ** 3
 DEFAULT_MAX_SWAP_USED = 8 * 1024 ** 3
 DEFAULT_MAX_LOAD_FACTOR = 2.0
 DEFAULT_MIN_DISK_FREE = 2 * 1024 ** 3
+#: #246: btrfs floors. On 2026-10-11 the host's btrfs was fully allocated
+#: (1 MiB unallocated) with its metadata exhausted while `df` still showed
+#: 4.7 then 16 GB free: `min_disk_free` never fired. Unallocated space is what
+#: new metadata chunks are carved from; metadata headroom is what is left in
+#: the chunks already allocated. Only measured on btrfs (None elsewhere).
+DEFAULT_MIN_BTRFS_UNALLOCATED = 10 * 1024 ** 3
+DEFAULT_MIN_BTRFS_METADATA_HEADROOM = 1024 ** 3
+#: the btrfs floors, in their order in readings and messages
+BTRFS_KEYS = ("min_btrfs_unallocated", "min_btrfs_metadata_headroom")
 #: L73 : part maximale d'un /tmp en tmpfs (mémoire et swap) occupée avant la
 #: contre-pression. Ne s'applique qu'à un tmpfs : un /tmp sur disque relève
 #: du disque libre. Critique à mi-chemin entre le seuil et le plein.
@@ -48,6 +58,7 @@ DEFAULT_SYSTEM_TMP = "/tmp"
 #: les moins prioritaires, jamais au milieu d'un tour).
 CRITICAL_MEM_FACTOR = 0.5      # mémoire disponible <= la moitié du plancher
 CRITICAL_DISK_FACTOR = 0.5     # disque libre <= la moitié du plancher
+CRITICAL_BTRFS_FACTOR = 0.5    # #246: btrfs non alloué / marge métadonnées <= la moitié
 CRITICAL_SWAP_FACTOR = 2.0     # swap >= le double du plafond
 CRITICAL_LOAD_FACTOR = 2.0     # charge >= le double du plafond
 
@@ -75,7 +86,8 @@ POWER_KEYS = ("min_battery_percent", "stop_battery_percent")
 PRESSURE_KEYS = ("max_cpu_pressure",)
 #: clés de seuil reconnues dans `policy.resources` (liste fermée)
 THRESHOLD_KEYS = ("min_mem_available", "max_swap_used", "max_load", "min_disk_free",
-                  "max_tmpfs_used", *POWER_KEYS, *PRESSURE_KEYS)
+                  "max_tmpfs_used", *POWER_KEYS, *PRESSURE_KEYS,
+                  *BTRFS_KEYS)
 #: L159c : plafonds mémoire des unités d'agent, dans `policy.resources` aussi.
 #: Ce ne sont pas des seuils de contre-pression : systemd les fait respecter
 #: (`MemoryMax`), `ameesh doctor` vérifie l'écart entre le canon et l'unité.
@@ -219,6 +231,12 @@ def disk_free(path: str | None) -> int | None:
         return int(shutil.disk_usage(path).free)
     except OSError:
         return None
+
+
+def btrfs_usage(path: str | None) -> dict:
+    """#246: unallocated space and metadata headroom of the btrfs holding
+    `path` (bytes), None when not btrfs or unreadable."""
+    return platform.btrfs_allocation(path)
 
 
 def _mount_of(path: str, mounts: str | None = None) -> tuple[str, str] | None:
@@ -587,6 +605,7 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
         "disk_path": path,
         "turns_in_progress": turns_in_progress,
     }
+    out.update(btrfs_usage(path))
     out.update(_meminfo())
     out.update(fs_usage(system_tmp() if tmp is None else tmp))
     out.update(power())
@@ -660,6 +679,8 @@ def thresholds(policy=None) -> dict:
     low = parse_percent(raw.get("min_battery_percent"))
     stop = parse_percent(raw.get("stop_battery_percent"))
     cpu_pressure = parse_percent(raw.get("max_cpu_pressure"))
+    unallocated = parse_bytes(raw.get("min_btrfs_unallocated"))
+    headroom = parse_bytes(raw.get("min_btrfs_metadata_headroom"))
     cpus = cpu_count() or 1
     return {
         "min_mem_available": DEFAULT_MIN_MEM_AVAILABLE if mem is None else mem,
@@ -674,12 +695,16 @@ def thresholds(policy=None) -> dict:
         # L159d: the offer (`policy.lend`) caps the lendable capacity; None:
         # the host lends nothing
         "lend": lend_offer(policy),
+        "min_btrfs_unallocated": (DEFAULT_MIN_BTRFS_UNALLOCATED if unallocated is None
+                                  else unallocated),
+        "min_btrfs_metadata_headroom": (DEFAULT_MIN_BTRFS_METADATA_HEADROOM
+                                        if headroom is None else headroom),
     }
 
 
 #: L43 (0031) : seuils PLANCHERS (plus strict = plus haut) ; les autres sont
 #: des plafonds (plus strict = plus bas)
-FLOOR_KEYS = ("min_mem_available", "min_disk_free", *POWER_KEYS)
+FLOOR_KEYS = ("min_mem_available", "min_disk_free", *POWER_KEYS, *BTRFS_KEYS)
 #: provenance d'une limite qu'aucune fiche Host ne déclare
 DEFAULT_ORIGIN = "défaut"
 
@@ -783,7 +808,7 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
     out: list[dict] = []
 
     def floor(key, label, value, limit, critical_factor):
-        if value is None:
+        if value is None or limit is None:
             return
         if value < limit:
             out.append({"key": key, "label": label, "value": value, "limit": limit,
@@ -804,6 +829,14 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
             limits["max_load"], CRITICAL_LOAD_FACTOR)
     floor("min_disk_free", "disque libre", reading.get("disk_free_bytes"),
           limits["min_disk_free"], CRITICAL_DISK_FACTOR)
+    # #246: btrfs allocation, which `disk_free` (statvfs) does not see; like
+    # the other floors, a breach closes new turns well before the critical level
+    floor("min_btrfs_unallocated", "btrfs non alloué",
+          reading.get("btrfs_unallocated_bytes"), limits.get("min_btrfs_unallocated"),
+          CRITICAL_BTRFS_FACTOR)
+    floor("min_btrfs_metadata_headroom", "marge des métadonnées btrfs",
+          reading.get("btrfs_metadata_headroom_bytes"),
+          limits.get("min_btrfs_metadata_headroom"), CRITICAL_BTRFS_FACTOR)
     # L73 : un /tmp en tmpfs vit en mémoire et en swap ; critique à mi-chemin
     # entre le seuil et le plein.
     part = tmpfs_fraction(reading)
