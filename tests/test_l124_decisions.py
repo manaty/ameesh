@@ -442,9 +442,9 @@ class IdentiteTest(_Base):
         self.assertEqual((who.human, who.channel, who.chat), (ALICE, "chat", "chat-alice"))
 
     def test_chat_contrefait(self):
-        cas = [({}, {}, "session de chat inconnue"),
-               ({"pid": os.getpid()}, {"AMEESH_CHAT_PID": "x"}, "sans processus"),
-               ({"started_at": 12.0}, {}, "PID réutilisé"),
+        cas = [({}, {}, "unknown chat session"),
+               ({"pid": os.getpid()}, {"AMEESH_CHAT_PID": "x"}, "without a process"),
+               ({"started_at": 12.0}, {}, "PID reused"),
                ({"human": BOB}, {}, "celui de human:bob"),
                ({}, {"AMEESH_RUNNER_ID": "r1"}, "incohérente"),
                ({}, {"AGENT_MAIL_NAME": "orch"}, "incohérente")]
@@ -461,7 +461,7 @@ class IdentiteTest(_Base):
         with self.chat_env(), self.assertRaises(decisions.DecisionError) as ctx:
             decisions.answering_human(self.cfg, self.db, chain=[1],
                                       environ_of=lambda pid: {})
-        self.assertIn("ne descend pas de la session de chat", str(ctx.exception))
+        self.assertIn("does not descend from chat session", str(ctx.exception))
         # un agent au-dessus du chat : refus
         with self.chat_env(), self.assertRaises(decisions.DecisionError) as ctx:
             decisions.answering_human(
@@ -574,7 +574,7 @@ class ChatTest(_Base):
         with mock.patch.dict(os.environ, {"AGENT_MAIL_NAME": "orch"}):
             code, calls = self.run_chat()
         self.assertEqual((code, calls), (1, []))
-        self.assertIn("le chat se lance depuis le terminal d'un humain", self.err.getvalue())
+        self.assertIn("the chat is launched from a human's terminal", self.err.getvalue())
         code, calls = self.run_chat(chain=[5], environ_of=lambda pid: {
             "AGENT_MAIL_NAME": "orch", "AMEESH_RUNNER_ID": "attach:x@h"})
         self.assertEqual((code, calls), (1, []))
@@ -591,7 +591,7 @@ class ChatTest(_Base):
     def test_essai_n_ecrit_rien(self):
         code, calls = self.run_chat("--dry-run")
         self.assertEqual((code, calls), (0, []))
-        self.assertIn("aucune variable d'exécuteur", self.out.getvalue())
+        self.assertIn("no runner variable", self.out.getvalue())
         self.assertIsNone(registry.get(self.db, "chat-alice"))
         self.assertFalse(os.path.exists(chat.session_dir(self.cfg)))
 

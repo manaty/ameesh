@@ -105,7 +105,7 @@ def session_account(worker, items) -> str | None:
     name = _session_account(worker)
     if name:
         return name
-    default = accounts.Profile(harness=items[0].harness, name="(défaut)")
+    default = accounts.Profile(harness=items[0].harness, name="(default)")
     for profile in items:
         if profile.home() == default.home():
             return profile.name
@@ -268,7 +268,7 @@ def continuity(worker) -> None:
         return
     if previous is None:
         # session d'avant L30 : ouverte avec le dossier par défaut du harnais
-        old = accounts.Profile(harness=harness, name="(défaut)")
+        old = accounts.Profile(harness=harness, name="(default)")
         if old.home() == new.home():
             return
     else:

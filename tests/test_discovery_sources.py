@@ -107,4 +107,4 @@ class LocalSourcesTest(unittest.TestCase):
         result = harness.listing()
         self.assertTrue(result.complete)
         self.assertEqual(result.models, (), "les harnais ne publient pas de liste de modèles")
-        self.assertIn("rien à retirer", result.detail)
+        self.assertIn("nothing to remove", result.detail)

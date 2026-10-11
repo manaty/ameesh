@@ -419,7 +419,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         for warning in linked["warnings"]:
             print("warning: %s" % warning, file=sys.stderr)
         if linked["warnings"]:
-            thread_meta = {"avertissement": " ; ".join(linked["warnings"])}
+            thread_meta = {"avertissement": "; ".join(linked["warnings"])}
         item = linked["lot"]
         if item is not None and (linked["created"] or linked["assigned"] or linked["branch"]):
             print("lot #%d %s%s%s" % (
@@ -1209,7 +1209,7 @@ def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False)
                 if reasons:
                     refused.append(migration)
                 if dry_run or reasons:
-                    print("%s : %s" % (migration.label, "NOT additive — " + "; ".join(reasons)
+                    print("%s: %s" % (migration.label, "NOT additive — " + "; ".join(reasons)
                                        if reasons else "additive"))
             if refused:
                 print("%d non-additive migration(s): the previous code would break on the "

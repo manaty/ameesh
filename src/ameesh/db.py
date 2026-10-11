@@ -1148,7 +1148,7 @@ def connect(cfg: Config, driver: str | None = None) -> PsqlDriver | PsycopgDrive
             return PsqlDriver(cfg)
         except Unavailable as exc:
             errors.append(str(exc))
-    raise Unavailable(" ; ".join(errors) or "no Postgres driver available")
+    raise Unavailable("; ".join(errors) or "no Postgres driver available")
 
 
 def _schema_message(db) -> str:

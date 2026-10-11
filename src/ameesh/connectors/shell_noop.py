@@ -46,7 +46,7 @@ class ShellNoopConnector:
     def __init__(self, directory: str | None = None, timeout: float = 30.0):
         directory = directory or os.environ.get("AMEESH_NOOP_DIR")
         if not directory:
-            raise ConnectorError("shell-noop : dossier requis (directory= ou AMEESH_NOOP_DIR)")
+            raise ConnectorError("shell-noop: directory required (directory= or AMEESH_NOOP_DIR)")
         self.directory = os.path.abspath(os.path.expanduser(directory))
         self.timeout = float(timeout)
 

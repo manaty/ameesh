@@ -71,7 +71,7 @@ def resolve_gh(override: str | None = None, env: dict | None = None) -> str:
             raise ConnectorError("git-merge: gh binary not found or not executable: %s" % path)
     found = shutil.which("gh", path=env.get("PATH"))
     if not found:
-        raise ConnectorError("git-merge : gh introuvable (AMEESH_GH_BIN, AMEESH_BIN_DIR ou PATH)")
+        raise ConnectorError("git-merge: gh not found (AMEESH_GH_BIN, AMEESH_BIN_DIR or PATH)")
     return found
 
 

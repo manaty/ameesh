@@ -439,7 +439,7 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
     if note:
         warnings.append(note)
     return {"assignee": name, "externe": False, "responsible": responsible,
-            "warning": " ; ".join(warnings) or None}
+            "warning": "; ".join(warnings) or None}
 
 
 def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor: str = "",

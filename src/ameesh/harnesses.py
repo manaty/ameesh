@@ -500,7 +500,7 @@ def _check_distribution(value: Any, findings: list[Finding]) -> None:
         else:
             if not _text(entry.get("package")):
                 findings.append(Finding("harness-distribution-invalid", ERROR,
-                                        "`distribution.%s.package` attendu" % kind))
+                                        "`distribution.%s.package` expected" % kind))
             _check_args_env(entry, "distribution.%s" % kind, findings)
 
 
@@ -548,7 +548,7 @@ def _check_setting(key: str, value: Any, findings: list[Finding]) -> None:
     for _literal, name, _spec, _conv in Formatter().parse(template):
         if name is not None and name not in known:
             findings.append(Finding("harness-option-invalid", ERROR,
-                                    "`ameesh.%s.file.template` : placeholder {%s} inconnu (%s)"
+                                    "`ameesh.%s.file.template`: unknown placeholder {%s} (%s)"
                                     % (key, name, ", ".join(sorted(known)))))
     for name in delivery:
         if name not in ("template",):

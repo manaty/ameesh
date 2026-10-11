@@ -622,7 +622,7 @@ class AcpTurn:
         try:
             self.peer = JsonRpcPeer(argv, cwd=self.cwd, env=self._agent_env())
         except OSError as exc:
-            raise AcpError("agent ACP illisible : %s" % exc)
+            raise AcpError("cannot start the ACP agent: %s" % exc)
         self.peer.set_handlers(self._on_request, self._on_notification)
 
     def _initialize(self) -> None:

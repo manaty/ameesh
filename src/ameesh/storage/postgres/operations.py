@@ -177,7 +177,7 @@ class Operations(interface.Operations):
                                               r.current_prompt, r.pending_prompt),
                    current_prompt = NULL,
                    status = CASE WHEN r.status = 'stopped' THEN r.status ELSE 'queued' END,
-                   status_text = 'redémarrage : session neuve sur brief',
+                   status_text = 'restart: fresh session from brief',
                    restart_brief = NULL,
                    restart_requested_at = NULL,
                    updated_at = now()

@@ -224,7 +224,7 @@ def approval_request(action, approver: str, *, decision: str = "approve",
     try:
         receipts.check_request(request)
     except receipts.ReceiptError as exc:
-        raise ActionError(INVALID, "demande d'approbation invalide : %s" % exc) from exc
+        raise ActionError(INVALID, "invalid approval request: %s" % exc) from exc
     return request
 
 
@@ -442,7 +442,7 @@ def _close_lot_on_merge(db: Db, action_id: str, by: str) -> None:
             actor=action.get("auth_approver") or by or "git-merge",
             source="the gate (action %s)" % action_id, pr_ref=action.get("target"))
         if done["result"] == "refused":
-            fil.warn("lot #%s : %s" % (action["work_item"], done["detail"]))
+            fil.warn("work item #%s: %s" % (action["work_item"], done["detail"]))
     except Exception as exc:  # noqa: BLE001 - conséquence, jamais un obstacle
         fil.warn("lot of action %s not closed after the merge (%s): "
                  "ameesh work sync-github will catch up" % (action_id, _one(exc, 200)))

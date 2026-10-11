@@ -275,7 +275,7 @@ def action_digest(fields: dict | None = None, **kwargs) -> str:
     try:
         canonical = jcs.canonicalize(data)
     except jcs.JcsError as exc:
-        raise ReceiptError("empreinte d'action : %s" % exc) from exc
+        raise ReceiptError("action digest: %s" % exc) from exc
     return "sha256:" + hashlib.sha256(ACTION_DOMAIN + canonical).hexdigest()
 
 
@@ -404,7 +404,7 @@ def _check_standing(standing, iat: int) -> None:
             or len(set(operations)) != len(operations)):
         raise ReceiptError("standing.operations: non-empty list of distinct operations expected")
     if standing["class"] not in ACTION_CLASSES:
-        raise ReceiptError("standing.class inconnue : %r" % (standing["class"],))
+        raise ReceiptError("standing.class unknown: %r" % (standing["class"],))
     if _int(standing["max_amount"], "standing.max_amount") < 0:
         raise ReceiptError("standing.max_amount is negative")
     currency = standing["currency"]
@@ -413,7 +413,7 @@ def _check_standing(standing, iat: int) -> None:
     if standing["max_amount"] > 0 and currency is None:
         raise ReceiptError("standing: a non-zero cap requires a currency")
     if _int(standing["until"], "standing.until") <= iat:
-        raise ReceiptError("standing.until doit suivre iat")
+        raise ReceiptError("standing.until must be after iat")
 
 
 def check_request(request) -> str:
@@ -442,7 +442,7 @@ def check_request(request) -> str:
     iat = _int(request["iat"], "request.iat")
     exp = _int(request["exp"], "request.exp")
     if exp <= iat:
-        raise ReceiptError("request.exp doit suivre iat")
+        raise ReceiptError("request.exp must be after iat")
     if kind == "action":
         if not isinstance(request["action_id"], str) or not _ACTION_ID_RE.fullmatch(request["action_id"]):
             raise ReceiptError("request.action_id: \"act_\" + 26 characters expected")
@@ -481,7 +481,7 @@ def parse_receipt(data) -> Receipt:
     required, optional = _PROOF_FIELDS[facade]
     keys = set(proof)
     if not required <= keys or keys - required - optional:
-        raise ReceiptError("proof (%s) : champs attendus %s" % (facade, sorted(required | optional)))
+        raise ReceiptError("proof (%s): expected fields %s" % (facade, sorted(required | optional)))
     proof_bytes = {name: b64u_decode(proof[name], "proof.%s" % name) for name in sorted(keys)}
     try:
         jcs.dumps(data)  # tout le reçu doit être du JSON canonisable (il est archivé en JCS)
@@ -640,7 +640,7 @@ def _verify_webauthn(parsed: Receipt, key: cose.PublicKey, policy: Policy,
         return CROSS_ORIGIN, "clientDataJSON.topOrigin present: cross-origin context rejected", {}
 
     if len(auth_data) < 37:
-        return AUTH_DATA, "authenticatorData trop court", {}
+        return AUTH_DATA, "authenticatorData too short", {}
     flags = auth_data[32]
     info = {
         "up": bool(flags & FLAG_UP), "uv": bool(flags & FLAG_UV),
@@ -658,9 +658,9 @@ def _verify_webauthn(parsed: Receipt, key: cose.PublicKey, policy: Policy,
         try:
             extensions, _end = cose.decode(auth_data, 37)
         except cose.CborError as exc:
-            return AUTH_DATA, "extensions illisibles : %s" % exc, info
+            return AUTH_DATA, "unreadable extensions: %s" % exc, info
         if not isinstance(extensions, dict):
-            return AUTH_DATA, "extensions : table CBOR attendue", info
+            return AUTH_DATA, "extensions: CBOR map expected", info
     elif len(auth_data) != 37:
         return AUTH_DATA, "authenticatorData: trailing bytes", info
     if not info["up"]:
@@ -734,7 +734,7 @@ def _verify(db: Db, receipt, policy: Policy | None, *, kind: str | None,
         if until <= moment:
             return refuse(EXPIRED, "grant expired (until passed)")
         if until - iat > policy.max_standing:
-            return refuse(TTL, "grant trop long (%d s, maximum %d s)"
+            return refuse(TTL, "grant too long (%d s, maximum %d s)"
                           % (until - iat, policy.max_standing))
 
     # 3. registre de confiance — L44 (0031) : celui du canon de l'objet approuvé

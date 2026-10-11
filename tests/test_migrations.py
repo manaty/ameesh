@@ -86,7 +86,7 @@ class MigrationsTest(PgTestCase):
         try:
             out = self.cli("migrate", "--dry-run")
             self.assertEqual(out.returncode, 0, out.stderr)
-            self.assertIn("%s : additive" % last.label, out.stdout)
+            self.assertIn("%s: additive" % last.label, out.stdout)
             self.assertNotIn(last.version, migrations.applied(self.db))
             out = self.mesh("migrate", "--additive-only")
             self.assertEqual(out.returncode, 0, out.stderr)
