@@ -121,6 +121,14 @@ création**, posée par celui qui le conçoit. Un lot créé par un agent sans
 estimation est refusé (`work add`, `mail send --new-lot`) ; un humain reçoit
 un avertissement.
 
+**Ne jamais répondre « je ne peux pas donner d'heure ».** À une question sur
+une durée ou une date de livraison, répondre toujours par une heure : celle de
+l'estimation du lot, de la table de référence ou de `ameesh work schedule`, et
+à défaut une estimation faite sur-le-champ, avec sa source. Une incertitude se
+dit par une fourchette (médiane, p80) et par ce qui la ferait bouger, jamais
+par un refus. Un lot sans estimation s'estime à ce moment-là
+(`ameesh work plan <id> --estimate …`).
+
 | Situation | Commande |
 |---|---|
 | Créer un lot | `ameesh work add --title "RÉF : titre" --estimate 2h --estimate-source conception` |
