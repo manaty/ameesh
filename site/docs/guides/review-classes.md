@@ -48,7 +48,8 @@ ameesh review-class --json --diff origin/main     # machine-readable
 ```
 
 Example output for the first command, with the policy above (labels are
-printed in French):
+printed in French: `classe` class, `léger` light, `sensible` sensitive,
+`défaut` default rule):
 
 ```
 classe : sensible
