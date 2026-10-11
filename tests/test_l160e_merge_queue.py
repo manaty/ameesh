@@ -145,7 +145,7 @@ class EntryTest(_Base):
     def test_sha_prefixes_are_resolved_and_compared_whole(self):
         tip = self.tip(1)
         self.ready(1, sha=tip[:1])  # "a": any tip starting with that letter would match
-        with self.assertRaisesRegex(merge_queue.QueueError, "not a commit of this repository"):
+        with self.assertRaisesRegex(merge_queue.QueueError, "not a commit id"):
             self.enter(1)
         self.ready(1, sha=tip[:12])  # a unique abbreviation is resolved
         self.assertEqual(self.enter(1)["frozen_sha"], tip)
@@ -196,6 +196,43 @@ class EntryTest(_Base):
         self.fake.queue_rows.clear()
         with self.assertRaisesRegex(merge_queue.QueueError, "not at its freeze"):
             merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None)
+
+    def test_milestones_name_commit_ids_only(self):
+        tip = self.tip(1)
+        for ref in ("HEAD", "lot/1-a", "lot/1-a^0"):
+            with self.subTest(ref):
+                self.ready(1, sha=ref)  # resolves to the tip today, to a later push tomorrow
+                with self.assertRaisesRegex(merge_queue.QueueError, "not a commit id"):
+                    self.enter(1)
+        self.ready(1)
+        self.marks[1][0]["sha"] = "lot/1-a"  # a verdict on the branch, not on a commit
+        with self.assertRaisesRegex(merge_queue.QueueError, "no review verdict ok"):
+            self.enter(1)
+        # a branch named like a commit id is not that commit
+        _git(self.repo, "branch", "deadbeef", tip)
+        self.ready(1, sha="deadbeef")
+        with self.assertRaisesRegex(merge_queue.QueueError, "not a commit of this repository"):
+            self.enter(1)
+        self.ready(1, sha=tip.upper())
+        self.assertEqual(self.enter(1)["frozen_sha"], tip)
+
+    def test_a_failed_fetch_refuses_the_lot(self):
+        agents = os.path.join(self.tmp, "agents")
+        _git(self.tmp, "clone", "-q", self.repo, agents)
+        clone = resolutions.Replayer(agents, os.path.join(self.tmp, "state", "p.clone"))
+        self.ready(1)
+        merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None, clone=clone)
+        # the clone holds the frozen tip; the branch is then deleted on the remote,
+        # or the remote does not answer: the stale tip is never admitted
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "branch", "-q", "-D", "lot/1-a")
+        for url in (self.repo, os.path.join(self.tmp, "nowhere")):
+            with self.subTest(url):
+                _git(agents, "remote", "set-url", "origin", url)
+                self.fake.queue_rows.clear()
+                with self.assertRaisesRegex(merge_queue.QueueError, "cannot fetch branch lot/1-a"):
+                    merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None, clone=clone)
+                self.assertEqual(self.fake.queue_rows, {})
 
     def test_merged_lot_is_refused(self):
         self.ready(1)
@@ -274,9 +311,9 @@ class PassTest(_Base):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def run_pass(self, cache=None):
+    def run_pass(self, cache=None, repo=None):
         lots = [dict(r) for r in self.fake.lots.values()]
-        report = radar.scan(self.repo, lots, migrations=MIG, cache=cache)
+        report = radar.scan(repo or self.repo, lots, migrations=MIG, cache=cache)
         radar.annotate_resolutions(self.cfg, None, self.project, report, lots, cache)
         report["queue"] = radar.run_queue(self.cfg, None, self.project, report, cache)
         return report
@@ -330,6 +367,25 @@ class PassTest(_Base):
         self.assertEqual(self.fake.queue_rows[1]["state"], "ejected")
         self.assertIn("moved past its freeze", self.fake.queue_rows[1]["reason"])
         self.assertEqual([to for to, _, _ in self.sent], ["a1"])
+
+    def test_stale_origin_of_the_agents_does_not_eject(self):
+        agents = os.path.join(self.tmp, "agents")
+        _git(self.tmp, "clone", "-q", self.repo, agents)
+        _commit_on(self.repo, "lot/1-a", "other.py", "z\n", "pushed from another host")
+        self.ready(1)  # frozen on the fresh tip; the agents still see the old one
+        clone = resolutions.Replayer(agents, radar.clone_dir(self.cfg, "p"))
+        merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None, clone=clone)
+        self.project = radar.Project(name="p", repo=agents, migrations=MIG)
+        report = self.run_pass(repo=agents)
+        self.assertEqual(self.fake.queue_rows[1]["state"], "queued")
+        self.assertEqual([(o["lot"], o["state"])
+                          for o in report["queue"]["targets"]["origin/main"]], [(1, "queued")])
+        # the remote does not answer: neither ejected nor ranked, the next pass decides
+        _git(agents, "remote", "set-url", "origin", os.path.join(self.tmp, "nowhere"))
+        report = self.run_pass(repo=agents)
+        self.assertEqual(self.fake.queue_rows[1]["state"], "queued")
+        self.assertEqual([d["lot"] for d in report["queue"]["deferred"]], [1])
+        self.assertEqual(self.sent, [])
 
     def test_merged_lot_lands(self):
         self.queue(4)

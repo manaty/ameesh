@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 
@@ -50,6 +51,9 @@ STATES = ("queued", "landing", "landed", "ejected")
 UNPREPARED = ("conflict", "stale", "error")
 #: lot branches fetched into the radar's clone for `readiness`
 QUEUE_REF = "refs/ameesh/queue/"
+#: a milestone names its commit by its id: a ref or a revision expression
+#: (`HEAD`, the lot branch) moves, and would admit a commit nobody reviewed
+_HEX = re.compile(r"[0-9a-f]{7,64}")
 
 
 class QueueError(RuntimeError):
@@ -65,6 +69,17 @@ def _same(a: str | None, b: str | None) -> bool:
     return bool(a and b) and a == b
 
 
+def pinned(repo: str, sha: str | None) -> str | None:
+    """The full id of the commit `sha` names in `repo`, if `sha` is a
+    hexadecimal commit id (full or abbreviated); None for a ref, a revision
+    expression or an unknown commit."""
+    sha = (sha or "").strip().lower()
+    if not _HEX.fullmatch(sha):
+        return None
+    full = plan_git._commit(repo, sha)
+    return full if full and full.startswith(sha) else None
+
+
 def latest_verdict(rows: list[dict]) -> dict | None:
     verdicts = [r for r in rows if r.get("kind") == "verdict"]
     return max(verdicts, key=lambda r: (r.get("at_ts") or 0, int(r.get("id") or 0))) \
@@ -75,7 +90,8 @@ def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
     """(tip, repository holding it) of a lot branch: local in `repo`, else
     fetched from `origin` into the radar's clone (`clone`, a
     `resolutions.Replayer`: never into the agents' repository), else the
-    `origin/<branch>` already known to `repo`."""
+    `origin/<branch>` already known to `repo`. A failed fetch raises
+    QueueError: the clone may still hold a tip the remote no longer has."""
     from . import resolutions
     tip = plan_git._commit(repo, "refs/heads/" + branch)
     if tip:
@@ -83,11 +99,19 @@ def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
     if clone is not None:
         url = plan_git._out(repo, "remote", "get-url", "origin")
         if url:
-            if not os.path.isdir(os.path.join(clone.path, ".git")):
-                clone.ensure()  # an existing clone is not reset: the radar may be using it
             ref = QUEUE_REF + branch
-            resolutions._run(clone.path, "fetch", "--quiet", url,
-                             "+refs/heads/%s:%s" % (branch, ref), timeout=FETCH_TIMEOUT)
+            try:
+                if not os.path.isdir(os.path.join(clone.path, ".git")):
+                    clone.ensure()  # an existing clone is not reset: the radar may use it
+                proc = resolutions._run(clone.path, "fetch", "--quiet", url,
+                                        "+refs/heads/%s:%s" % (branch, ref),
+                                        timeout=FETCH_TIMEOUT)
+                failed = resolutions._err(proc) if proc.returncode else None
+            except (GitError, OSError) as exc:
+                failed = str(exc)
+            if failed is not None:
+                raise QueueError("cannot fetch branch %s from origin (%s): try again once "
+                                 "the remote answers" % (branch, failed[:300]))
             tip = plan_git._commit(clone.path, ref)
             if tip:
                 return tip, clone.path
@@ -118,15 +142,18 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None) -> dict:
     if not tip:
         raise QueueError("branch %s of lot #%d is neither local nor on origin"
                          % (row["branch"], lot))
-    frozen = plan_git._commit(where, freeze["sha"])
+    frozen = pinned(where, freeze["sha"])
+    if frozen is None and not _HEX.fullmatch(freeze["sha"].strip().lower()):
+        raise QueueError("the freeze of lot #%d names %r, not a commit id: freeze it again "
+                         "(ameesh work milestone %d frozen --sha %s)"
+                         % (lot, freeze["sha"], lot, tip))
     if not _same(tip, frozen):
         raise QueueError("branch %s is at %s, not at its freeze %s%s: freeze it again "
                          "(ameesh work milestone %d frozen --sha %s), then have it reviewed"
                          % (row["branch"], tip[:12], freeze["sha"][:12],
                             "" if frozen else " (not a commit of this repository)", lot, tip))
     verdict = latest_verdict(marks)
-    reviewed = plan_git._commit(where, verdict["sha"]) \
-        if verdict and verdict.get("sha") else None
+    reviewed = pinned(where, verdict["sha"]) if verdict and verdict.get("sha") else None
     if not verdict or verdict.get("verdict") != "ok" or not _same(reviewed, tip):
         raise QueueError("lot #%d has no review verdict ok on its freeze %s%s"
                          % (lot, tip[:12], " (last verdict: %s on %s)"
@@ -371,6 +398,20 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         branch = branches.get(lot)
         if branch is None or branch.get("target") != row["target"]:
             continue  # another repository, or not visible on this host
+        if not _same(branch["tip"], row["frozen_sha"]):
+            # the radar reads the agents' `origin/<branch>`, which may be
+            # stale: the tip fetched into the radar's clone decides
+            if replayer is None:
+                from . import radar
+                replayer = resolutions.Replayer(project.repo,
+                                                radar.clone_dir(cfg, project.name))
+            try:
+                fresh, _ = branch_tip(project.repo, row.get("branch") or "", replayer)
+            except QueueError as exc:
+                out.setdefault("deferred", []).append({"lot": lot, "reason": str(exc)})
+                continue  # neither ejected nor ranked on a guess: the next pass
+            if _same(fresh, row["frozen_sha"]):
+                branch = dict(branch, tip=fresh)
         if not _same(branch["tip"], row["frozen_sha"]):
             reason = "branch moved past its freeze (%s, frozen %s)" % (
                 branch["tip"][:12], row["frozen_sha"][:12])
