@@ -165,7 +165,7 @@ class RunTest(OffloadBase):
             git(top, "commit", "-qam", "two")
             snap2 = offload.snapshot(top)
             pack = subprocess.run(["git", "-C", top, "pack-objects", "--revs", "--thin",
-                                   "--stdout", "-q"], input=("%s\n^%s\n" % (snap2, snap)).encode(),
+                                   "--shallow", "--stdout", "-q"], input=("%s\n^%s\n" % (snap2, snap)).encode(),
                                   capture_output=True).stdout
             full = subprocess.run(["git", "-C", top, "pack-objects", "--revs", "--stdout",
                                    "-q"], input=(snap2 + "\n").encode(),

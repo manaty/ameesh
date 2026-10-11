@@ -133,8 +133,10 @@ def push(remote: Remote, top: str, repo: str, snap: str) -> None:
         return
     bases = known_locally(top, present)
     revs = snap + "\n" + "".join("^%s\n" % sha for sha in bases)
+    # --shallow: the bases share no history with the snapshot, so git must
+    # treat every one of them as an edge to leave out the objects they hold
     pack = subprocess.Popen(["git", "-C", top, "pack-objects", "--revs", "--thin",
-                             "--stdout", "-q", "--delta-base-offset"],
+                             "--shallow", "--stdout", "-q", "--delta-base-offset"],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE)
     writer = threading.Thread(target=lambda: (pack.stdin.write(revs.encode()),
                                               pack.stdin.close()))
