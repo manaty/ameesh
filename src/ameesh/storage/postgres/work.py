@@ -19,6 +19,9 @@ ITEM_COLUMNS = """
     superseded_by, delegated_by,
     expected_value, value_score, priority, team, required_capabilities,
     branch, branch_target, branch_head,
+    estimate_minutes, estimate_source, estimate_by,
+    extract(epoch from estimate_at)::float8 as estimate_ts,
+    extract(epoch from started_at)::float8 as started_ts,
     extract(epoch from created_at)::float8 as created_ts,
     extract(epoch from updated_at)::float8 as updated_ts,
     extract(epoch from closed_at)::float8  as closed_ts,
@@ -117,22 +120,32 @@ class WorkItems(interface.WorkItems):
 
     def add(self, *, type, source, app, title, body, issue_ref, workstream,  # noqa: A002
             assignee, budget_usd, note, actor, package_id=None, package_parent=None,
-            branch=None, branch_target=None) -> dict:
-        """Crée le lot en `intake`, puis sa première ligne de journal."""
-        rows = self.db.query(
-            """
-            INSERT INTO work_items
+            branch=None, branch_target=None, estimate_minutes=None,
+            estimate_source=None) -> dict:
+        """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
+        avec sa durée estimée (et sa ligne d'historique), en UNE transaction."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                INSERT INTO work_items
+                    (type, source, app, title, body, issue_ref, workstream, assignee,
+                     budget_usd, state, package_id, package_parent, branch, branch_target,
+                     estimate_minutes, estimate_source, estimate_by, estimate_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'intake', %s, %s, %s, %s,
+                        %s, %s, %s, CASE WHEN %s THEN now() END)
+                RETURNING __COLUMNS__
+                """.replace("__COLUMNS__", ITEM_COLUMNS),
                 (type, source, app, title, body, issue_ref, workstream, assignee,
-                 budget_usd, state, package_id, package_parent, branch, branch_target)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'intake', %s, %s, %s, %s)
-            RETURNING __COLUMNS__
-            """.replace("__COLUMNS__", ITEM_COLUMNS),
-            (type, source, app, title, body, issue_ref, workstream, assignee,
-             budget_usd, package_id, package_parent, branch, branch_target),
-        )
-        item = rows[0]
-        self._event(int(item["id"]), "intake", note, actor)
-        return item
+                 budget_usd, package_id, package_parent, branch, branch_target,
+                 estimate_minutes, estimate_source if estimate_minutes else None,
+                 (actor or "") if estimate_minutes else None, bool(estimate_minutes)),
+            )
+            item = rows[0]
+            if estimate_minutes:
+                WorkItems(tx)._estimate_row(int(item["id"]), estimate_minutes,
+                                            estimate_source, actor)
+            WorkItems(tx)._event(int(item["id"]), "intake", note, actor)
+            return item
 
     def get(self, item_id) -> dict | None:
         rows = self.db.query(
@@ -155,17 +168,20 @@ class WorkItems(interface.WorkItems):
     def move(self, item_id, state, *, current, loops, note, actor) -> dict | None:
         """Déplace le lot s'il est encore en `current` (sinon None, rien
         d'écrit), puis journalise la transition."""
+        # L157 : le premier passage en build (ou qa) date le début du travail
         rows = self.db.query(
             """
             UPDATE work_items
                SET state = %s,
                    loops = loops + %s,
                    updated_at = now(),
-                   closed_at = CASE WHEN %s = 'promoted' THEN now() ELSE NULL END
+                   closed_at = CASE WHEN %s = 'promoted' THEN now() ELSE NULL END,
+                   started_at = CASE WHEN %s IN ('build', 'qa')
+                                     THEN coalesce(started_at, now()) ELSE started_at END
              WHERE id = %s AND state = %s
             RETURNING __COLUMNS__
             """.replace("__COLUMNS__", ITEM_COLUMNS),
-            (state, loops, state, int(item_id), current),
+            (state, loops, state, state, int(item_id), current),
         )
         if not rows:
             return None
@@ -621,8 +637,15 @@ class WorkItems(interface.WorkItems):
         l'équipe, le chantier et l'hôte de leur assigné."""
         return self.db.query(
             "SELECT w.*, k.team AS package_team, r.team AS assignee_team,"
-            "       r.chantier AS assignee_chantier, r.host AS assignee_host"
-            "  FROM (SELECT %s FROM work_items"
+            "       r.chantier AS assignee_chantier, r.host AS assignee_host,"
+            # L157 : dates prévues et fusion, pour l'en-tête de l'issue
+            "       (SELECT extract(epoch from min(m.at))::float8 FROM work_item_milestones m"
+            "         WHERE m.work_item_id = w.id AND m.kind = 'merged') AS merged_ts"
+            "  FROM (SELECT %s,"
+            "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
+            "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
+            "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
+            "          FROM work_items"
             "         WHERE state NOT IN %s OR coalesce(btrim(issue_ref), '') <> ''"
             "         ORDER BY id DESC LIMIT %%s) w"
             "  LEFT JOIN work_packages k ON k.id = w.package_id"
@@ -635,6 +658,94 @@ class WorkItems(interface.WorkItems):
             " WHERE id = %s AND coalesce(issue_ref, '') = coalesce(%s, '')"
             " RETURNING id", (issue_ref, int(item_id), current))
         return bool(rows)
+
+    # -- durée estimée et durée réelle (L157) ------------------------------------
+    def _estimate_row(self, item_id, minutes, source, actor) -> None:
+        self.db.execute(
+            "INSERT INTO work_item_estimates (work_item_id, minutes, source, estimated_by)"
+            " VALUES (%s, %s, %s, %s)",
+            (int(item_id), int(minutes), source or None, actor or ""))
+
+    def set_estimate(self, item_id, minutes, *, source, actor) -> dict | None:
+        """Pose l'estimation en vigueur d'un lot NON livré (ni fusionné, ni promu,
+        ni fermé), avec sa ligne d'historique, en UNE transaction. Comme une
+        date prévue (L96), ce n'est pas une activité du lot : ni journal ni
+        `updated_at` (une ré-estimation ne masque pas une stagnation) ;
+        l'historique dit qui, quand, combien et d'où. None si le lot est
+        introuvable ou déjà terminé."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "UPDATE work_items SET estimate_minutes = %%s, estimate_source = %%s,"
+                "       estimate_by = %%s, estimate_at = now()"
+                " WHERE id = %%s AND state NOT IN %s RETURNING %s" % (_CLOSED, ITEM_COLUMNS),
+                (int(minutes), source or None, actor or "", int(item_id)))
+            if not rows:
+                return None
+            WorkItems(tx)._estimate_row(int(item_id), minutes, source, actor)
+            return rows[0]
+
+    def estimates(self, item_id) -> list[dict]:
+        """L'historique des estimations d'un lot, de la plus ancienne à la
+        plus récente."""
+        return self.db.query(
+            "SELECT id, work_item_id, minutes, source, estimated_by,"
+            "       extract(epoch from at)::float8 AS at_ts"
+            "  FROM work_item_estimates WHERE work_item_id = %s ORDER BY at, id",
+            (int(item_id),))
+
+    def mark_started(self, agent, item_ids, note) -> list[int]:
+        """Un tour de `agent` commence sur ces lots : ceux qui lui sont
+        assignés, ouverts et sans début mesuré, reçoivent leur début (une
+        seule fois), avec une ligne de journal, en UNE transaction."""
+        ids = sorted({int(i) for i in item_ids})
+        if not ids:
+            return []
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "UPDATE work_items SET started_at = now()"
+                " WHERE started_at IS NULL AND assignee = %%s AND state NOT IN %s"
+                "   AND id IN (%s) RETURNING id, state"
+                % (_CLOSED, ", ".join(["%s"] * len(ids))), tuple([agent] + ids))
+            for row in rows:
+                WorkItems(tx)._event(int(row["id"]), row["state"], note, agent)
+            return sorted(int(r["id"]) for r in rows)
+
+    def estimate_history(self, *, app, limit) -> list[dict]:
+        """Les lots livrés (jalon `merged`), les plus récents d'abord : début
+        mesuré, fusion, estimation en vigueur au début (sinon la première
+        posée après, `late`), nombre d'estimations posées."""
+        sql = (
+            "SELECT w.id, w.type, w.app, w.workstream, w.title, w.state, w.assignee,"
+            "       extract(epoch from w.started_at)::float8 AS started_ts,"
+            "       extract(epoch from fus.at)::float8 AS merged_ts,"
+            "       coalesce(b.minutes, f.minutes, w.estimate_minutes) AS estimate_minutes,"
+            "       coalesce(b.estimated_by, f.estimated_by, w.estimate_by) AS estimate_by,"
+            "       coalesce(b.source, f.source, w.estimate_source) AS estimate_source,"
+            "       (b.minutes IS NULL AND (f.minutes IS NOT NULL"
+            "                               OR w.estimate_minutes IS NOT NULL)) AS late,"
+            "       coalesce(n.n, 0)::int AS revisions"
+            "  FROM work_items w"
+            "  JOIN LATERAL (SELECT min(m.at) AS at FROM work_item_milestones m"
+            "                 WHERE m.work_item_id = w.id AND m.kind = 'merged') fus"
+            "    ON fus.at IS NOT NULL"
+            "  LEFT JOIN LATERAL (SELECT e.minutes, e.estimated_by, e.source"
+            "                       FROM work_item_estimates e"
+            "                      WHERE e.work_item_id = w.id AND w.started_at IS NOT NULL"
+            "                        AND e.at <= w.started_at"
+            "                      ORDER BY e.at DESC, e.id DESC LIMIT 1) b ON true"
+            "  LEFT JOIN LATERAL (SELECT e.minutes, e.estimated_by, e.source"
+            "                       FROM work_item_estimates e WHERE e.work_item_id = w.id"
+            "                      ORDER BY e.at, e.id LIMIT 1) f ON true"
+            "  LEFT JOIN LATERAL (SELECT count(*) AS n FROM work_item_estimates e"
+            "                      WHERE e.work_item_id = w.id) n ON true"
+            " WHERE w.state <> 'closed'")
+        params: list = []
+        if app:
+            sql += " AND (w.app = %s OR w.workstream = %s)"
+            params += [app, app]
+        sql += " ORDER BY fus.at DESC, w.id DESC LIMIT %s"
+        params.append(int(limit))
+        return self.db.query(sql, tuple(params))
 
     def _event(self, item_id, state, note, actor) -> None:
         self.db.execute(

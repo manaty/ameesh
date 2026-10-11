@@ -11,6 +11,12 @@
 #               (tests/parts/pilote-psql.txt) ; la suite complète, en 6 parts,
 #               sur push vers main ou release/*, et à la main (workflow_dispatch).
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
+#
+# L157 — une PR qui ne change QUE le numéro de version (pyproject.toml seul, la
+# seule ligne `version = "…"`) ne relance pas la suite : `main` l'a déjà
+# validée pour ce contenu. Le job « changements » le détecte
+# (scripts/version-only.py) ; les parts sont alors sautées et « tests » reste
+# vert. Au moindre doute, la suite tourne ; jamais sur un push ni à la main.
 name: tests
 
 on:
@@ -35,8 +41,31 @@ env:
   PYTHONPATH: src
 
 jobs:
+  # L157 : PR de version seule ? (commit de fusion de la PR face à sa cible)
+  changes:
+    name: changements
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version_only: ${{ steps.diff.outputs.version_only }}
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 2
+      - id: diff
+        name: PR de version seule ?
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "version_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          python3 scripts/version-only.py HEAD^1 HEAD >> "$GITHUB_OUTPUT"
+
   psycopg:
     name: psycopg ${{ matrix.part }}/4
+    needs: changes
+    if: needs.changes.outputs.version_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -95,6 +124,8 @@ jobs:
 
   psql:
     name: psql ${{ matrix.part }}/${{ github.event_name == 'pull_request' && 1 || 6 }}
+    needs: changes
+    if: needs.changes.outputs.version_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -133,6 +164,8 @@ jobs:
   # parts psql (sans psutil) par le repli /proc.
   platform-macos:
     name: plateforme macOS
+    needs: changes
+    if: needs.changes.outputs.version_only != 'true'
     runs-on: macos-latest
     timeout-minutes: 10
     env:
@@ -148,18 +181,25 @@ jobs:
         run: python -m unittest -v tests.test_l63_platform.PlatformTest tests.test_l63_platform.LintTest
 
   # nom de vérification stable : vert seulement si toutes les parts le sont
+  # (L157 : ou si la PR ne change que le numéro de version, parts sautées)
   tests:
     name: tests
     if: always()
-    needs: [psycopg, psql, platform-macos]
+    needs: [changes, psycopg, psql, platform-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: bilan des parts
         run: |
+          echo "changements : ${{ needs.changes.result }} (version seule : ${{ needs.changes.outputs.version_only }})"
           echo "psycopg : ${{ needs.psycopg.result }}"
           echo "psql    : ${{ needs.psql.result }}"
           echo "macOS   : ${{ needs.platform-macos.result }}"
+          test "${{ needs.changes.result }}" = success
+          if [ "${{ needs.changes.outputs.version_only }}" = "true" ]; then
+            echo "PR de version seule : suite déjà validée sur main, parts sautées"
+            exit 0
+          fi
           test "${{ needs.psycopg.result }}" = success
           test "${{ needs.psql.result }}" = success
           test "${{ needs.platform-macos.result }}" = success

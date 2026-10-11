@@ -166,11 +166,21 @@ def add(
     cfg=None,
     branch: str | None = None,
     branch_target: str | None = None,
+    estimate=None,
+    estimate_source: str | None = None,
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
     L118 : `branch` (et `branch_target`) nomment la branche du lot, dont la
-    fusion le fermera (`plan_git.sync_branches`)."""
+    fusion le fermera (`plan_git.sync_branches`).
+
+    L157 : `estimate` (« 2h », « 90m », ou des minutes) est la durée estimée,
+    posée avec sa source et son auteur (`actor`). La règle « obligatoire pour
+    un agent » est appliquée par les points d'entrée (`estimates.check`)."""
+    minutes = None
+    if estimate not in (None, ""):
+        from . import estimates
+        minutes = estimates.parse(estimate)
     if type not in ("bug", "evolution"):
         raise WorkError("type inconnu : %r (bug ou evolution)" % type)
     if not (title or "").strip():
@@ -185,10 +195,13 @@ def add(
     return storage.of(db).work.add(
         type=type, source=source, app=app, title=title.strip(), body=body,
         issue_ref=issue_ref, workstream=workstream, assignee=assignee,
-        budget_usd=budget_usd, note="création" + (" (plan : %s)" % package if package else ""),
+        budget_usd=budget_usd, note="création" + (" (plan : %s)" % package if package else "")
+        + (" ; estimation : %s" % span(minutes * 60) if minutes else ""),
         actor=actor, package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
-        branch=branch, branch_target=branch_target)
+        branch=branch, branch_target=branch_target, estimate_minutes=minutes,
+        estimate_source=(" ".join(str(estimate_source or "").split()) or None)
+        if minutes else None)
 
 
 # --------------------------------------------------------------------------

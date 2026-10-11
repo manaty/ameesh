@@ -26,3 +26,5 @@ test_events_attach
 test_undeliverable
 # stockage : domaine `decisions` (agent_mailbox, jsonb) et vue par projet (L124)
 test_l124_decisions
+# stockage : estimations (booléens liés, transactions, historique) — L157
+test_l157_estimations

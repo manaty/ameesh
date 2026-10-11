@@ -85,6 +85,9 @@ WITH unread AS (
            coalesce(s.turns_24h, 0)::bigint AS turns_24h,
            lu.body AS last_update_body, lu.ts AS last_update_ts,
            lu.work_item_id AS last_update_lot,
+           -- L157 : durée estimée et début mesuré du lot en cours
+           est.estimate_minutes AS lot_estimate_minutes,
+           est.started_ts AS lot_started_ts,
            (SELECT extract(epoch from least(
                        (SELECT min(e.created_at) FROM work_item_events e
                          WHERE e.work_item_id = coalesce(ml.id, sw.id, a.id)
@@ -114,6 +117,11 @@ WITH unread AS (
             JOIN work_items w ON w.id = __MAIL_REF__ AND w.state NOT IN __CLOSED__
            WHERE coalesce(btrim(c.ref), '') <> ''
            ORDER BY c.id DESC LIMIT 1) ml ON true
+      -- L157 : estimation et début du lot en cours (même choix que _lot_of)
+      LEFT JOIN LATERAL (
+          SELECT w.estimate_minutes,
+                 extract(epoch from w.started_at)::float8 AS started_ts
+            FROM work_items w WHERE w.id = coalesce(ml.id, sw.id, a.id)) est ON true
       -- L96 : la dernière avancée de l'agent, lue dans le fil (son dernier
       -- message, index agent_mailbox_sender_idx de 0044)
       LEFT JOIN LATERAL (

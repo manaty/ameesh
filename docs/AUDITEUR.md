@@ -60,6 +60,7 @@ le JSON plutôt que le texte.
 | 7 | Lots et engagements | `ameesh projects --json`, `ameesh plan list`, `ameesh alerts --json` | lots ouverts sans agent (`orphan_lot`), `delegation_expired`, `engagement_overdue` |
 | 8 | Sécurité | `ameesh alerts --json`, `ameesh canon check`, `agent-mail bindings` | canon invalide, placement refusé, agent `execute` lié à une session externe, liaison inattendue, secret apparu dans un fil |
 | 9 | Ses propres suites | `ameesh work list --assignee auditeur --json`, `gh pr checks <n>` | correctif qui attend la CI ou un verdict ; fusionné mais pas déployé ; déploiement sans courrier de résultat ; mesure due sept jours après un déploiement |
+| 10 | Estimations (L157) | `ameesh work estimates --json`, `ameesh projects --json` (`lot_estimate` de chaque agent), `ameesh work list --json` (`estimate_minutes`) | lot ouvert sans durée estimée ; lot en cours au-delà de son estimation (`overrun`) ; médiane réel/estimé d'un type de lot ou d'un auteur hors de ×0,7–×1,5, ou p80 au-delà de ×2 ; estimations tardives (posées après le début) ou ré-estimations nombreuses ; lots livrés sans début mesuré |
 
 ### CI et réserve
 
@@ -193,6 +194,40 @@ gardés, fichiers évincés), échecs et files d'attente de la CI.
   `gh run list` et `gh run view <id> --log-failed`.
 - *Sortie* : une ligne par incident, avec heure, hôte, agent, effet (tour perdu,
   attente, travail refait), preuve et cause probable.
+
+### Processus d'estimation (L157)
+
+Le propriétaire (2026-10-11) : ameesh estime la durée de chaque lot dès sa
+conception, puis **l'auditeur audite le processus d'estimation, qui dépend de
+l'organisation, et l'ajuste**. Chaque nuit, en plus des quatre angles, et
+par lui-même (une lecture, pas un sous-agent) :
+
+1. **Mesurer** : `ameesh work estimates --json`, puis `--app <projet>` pour
+   chaque projet actif. Les groupes `by_type` et `by_author` donnent la
+   médiane et le p80 du ratio réel/estimé sur les lots livrés, estimés AVANT
+   le début du travail ; `late` compte à part les estimations posées après
+   le début, `revised` les lots ré-estimés, `excluded` les lots livrés sans
+   estimation ou sans début mesuré.
+2. **Comparer** au relevé de la nuit précédente (le sien, dans le fil du
+   projet `ameesh`) : un groupe qui dérive, un auteur nouveau, un type qui
+   n'a jamais été calibré (moins de cinq lots : pas de conclusion).
+3. **Comprendre** les écarts les plus forts (ratio au-delà de ×2 ou en deçà de
+   ×0,5) : `ameesh work show <id> --json` (journal, jalons, historique des
+   estimations), le fil du lot. La cause est-elle l'estimation (découpage trop
+   gros, type mal jugé) ou le cours du lot (attente d'une décision, CI en file,
+   agent arrêté) ? Une attente n'est pas une faute d'estimation : elle relève
+   des quatre angles.
+4. **Ajuster** : le coefficient par type de lot et par auteur que les
+   concepteurs appliquent ensuite (« historique bug ×1,4 », en
+   `--estimate-source`), publié dans le fil du projet et adressé aux
+   orchestrateurs concernés (`ameesh mail send <orchestrateur> … --lot <id>`).
+   Le coefficient est celui de l'organisation : il ne s'écrit ni dans le code
+   ni dans la documentation d'ameesh. Un manquement à la règle (lots créés
+   sans estimation, estimations tardives répétées) est signalé à
+   l'orchestrateur ; un changement de la règle elle-même (seuils, mesure du
+   début) est une proposition au propriétaire (niveau 3).
+5. **Rapport** : une ligne par groupe (lots, médiane, p80, tendance) et le
+   coefficient retenu, dans le compte rendu de la nuit.
 
 ### Journaux et CI
 

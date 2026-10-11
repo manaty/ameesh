@@ -56,6 +56,7 @@ from typing import Iterable
 from . import config as config_mod
 from . import cost as cost_mod
 from . import db as db_mod
+from . import estimates as estimates_mod
 from . import plan as plan_mod
 from . import stagnation
 from . import storage
@@ -324,6 +325,8 @@ def build_lot(item: dict, events: list[dict], actions: list[dict],
         "stale": stagnation.stale(item.get("state") or "", last, now, stale_after),
         # L40 (0030) : délégation à échéance (champ ajouté)
         "delegation": work_mod.delegation_view(item, now),
+        # L157 : durée estimée, réel mesuré (début → fusion), écart (champ ajouté)
+        "estimate": estimates_mod.view(item, merged_ts=jalons.get("merged"), now=now),
     }
 
 
@@ -754,6 +757,9 @@ def format_text(snap: dict, width: int | None = None) -> str:
             line("attend : %s" % lot["waiting_for"]["label"], "    ")
         if lot.get("delegation"):
             line(lot["delegation"]["label"], "    ")
+        est = lot.get("estimate")
+        if est and (est.get("minutes") or est.get("actual_minutes") is not None):
+            line("durée : %s" % est["label"], "    ")
 
     epics = snap.get("epics") or []
     if epics:

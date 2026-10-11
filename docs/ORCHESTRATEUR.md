@@ -22,7 +22,7 @@ lot**.
 
 | Situation | Commande |
 |---|---|
-| Nouveau travail | `ameesh mail send <agent> "…" --new-lot "RÉF : titre"` |
+| Nouveau travail | `ameesh mail send <agent> "…" --new-lot "RÉF : titre" --estimate 2h` |
 | Lot existant, sans agent | `ameesh mail send <agent> "…" --lot <id\|RÉF>` |
 | Reprendre un lot à un autre agent | `ameesh work assign <id> <agent>`, puis le message `--lot <id>` |
 | Message sur un lot (relance, question) | `ameesh mail send <agent> "…" --lot <id>` |
@@ -36,6 +36,38 @@ lot**.
   (sortie d'erreur et fil). Il signale un oubli : rattacher le travail.
 * L'attribution passe par la garde habituelle : un agent non réveillable est
   refusé et rien n'est déposé.
+
+## Tout lot porte une durée estimée dès sa création
+
+Demande du propriétaire (2026-10-11, lot L157) : ameesh prévoit la roadmap
+complète des projets, donc **tout lot porte une durée estimée dès sa
+création**, posée par celui qui le conçoit. Un lot créé par un agent sans
+estimation est refusé (`work add`, `mail send --new-lot`) ; un humain reçoit
+un avertissement.
+
+| Situation | Commande |
+|---|---|
+| Créer un lot | `ameesh work add --title "RÉF : titre" --estimate 2h --estimate-source conception` |
+| Confier un nouveau travail | `ameesh mail send <agent> "…" --new-lot "RÉF : titre" --estimate 90m` |
+| Estimer ou ré-estimer un lot existant | `ameesh work plan <id> --estimate 1h30 --estimate-source "revue du découpage"` |
+| Voir l'estimation, le réel et l'écart | `ameesh work show <id>`, `ameesh projects` (colonne DURÉE) |
+| Écarts passés, pour calibrer | `ameesh work estimates [--app <projet>]` |
+
+* La durée est du temps **écoulé** (horloge murale), du début du travail à
+  la fusion, attentes comprises : `90m`, `2h`, `1h30`, `1,5h`, `2d` (48 h),
+  ou des minutes. Au-delà de quelques jours, découper le lot.
+* Le **début** est mesuré par ameesh : premier passage du lot en `build`, ou
+  premier tour de l'agent assigné sur le lot ; la **fin** est la fusion.
+  Rien à déclarer.
+* Estimer depuis l'historique : `ameesh work estimates` donne, par type de
+  lot et par auteur d'estimation, la médiane et le p80 du ratio réel/estimé
+  sur les lots livrés. Un ratio médian de ×1,4 sur les bugs veut dire :
+  multiplier l'intuition par 1,4. La source dit d'où vient le chiffre
+  (« historique bug ×1,4 »).
+* L'estimation comparée au réel est celle **en vigueur au début** du travail :
+  ré-estimer en cours de route est permis et tracé, mais ne corrige pas
+  l'écart. L'auditeur interne audite ces écarts et ajuste le processus
+  (docs/AUDITEUR.md).
 
 ## Toute décision du propriétaire passe par `ameesh decide ask`
 

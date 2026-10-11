@@ -84,14 +84,19 @@ def resolve_lot(db, ref: str) -> dict | None:
 
 
 def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None,
-                 new_lot: str | None = None, branch: str | None = None) -> dict:
+                 new_lot: str | None = None, branch: str | None = None,
+                 estimate=None) -> dict:
     """Ce que le message `sender` → `recipient` fait aux lots, AVANT son dépôt.
 
     Rend `{lot, work_item_id, assigned, created, branch, warnings, orchestrator}` :
     `work_item_id` est l'étiquette du fil (le numéro du lot s'il est connu,
     sinon `lot` tel quel). `branch` (déduite du message par l'appelant) est
     posée sur le lot qui n'en a pas. Lève AssignmentError si l'attribution
-    gardée refuse (rien n'est alors déposé)."""
+    gardée refuse (rien n'est alors déposé).
+
+    L157 : `estimate` est la durée estimée du lot créé par `new_lot` ; elle
+    est obligatoire quand l'expéditeur est un agent (refus, rien n'est
+    déposé), un avertissement pour un humain."""
     out = {"lot": None, "work_item_id": lot, "assigned": False, "created": False,
            "branch": None, "warnings": [], "orchestrator": False}
     if recipient == "all" or ":" in recipient:
@@ -122,12 +127,18 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
     item = None
     try:
         if new_lot is not None:
+            from . import estimates
             title = new_lot.strip()
             if not title:
                 raise AssignmentError("--new-lot : titre vide")
+            minutes = estimates.parse(estimate) if estimate not in (None, "") else None
+            warn = estimates.check(db, sender, minutes,
+                                   option="--estimate 2h à côté de --new-lot")
             item = work_mod.add(db, title=title, assignee=recipient, actor=sender,
-                                source="mail", cfg=cfg, branch=branch)
+                                source="mail", cfg=cfg, branch=branch, estimate=minutes)
             out.update(created=True, assigned=True, branch=item.get("branch"))
+            if warn:
+                out["warnings"].append(estimates.missing(item["id"]))
         elif lot is not None:
             item = resolve_lot(db, lot)
             if item is None:
