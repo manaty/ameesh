@@ -109,6 +109,25 @@ class Hosts(interface.HostResources):
             """, (host, float(since_s)))
         return rows[0] if rows else {"samples": 0}
 
+    def record_harness_version(self, host, harness, *, path, version, raw) -> None:
+        self.db.execute(
+            """
+            INSERT INTO harness_versions (host, harness, path, version, raw, observed_at)
+            VALUES (%s, %s, %s, %s, %s, now())
+            ON CONFLICT (host, harness) DO UPDATE
+               SET path = EXCLUDED.path, version = EXCLUDED.version,
+                   raw = EXCLUDED.raw, observed_at = EXCLUDED.observed_at
+            """, (host, harness, path, version, raw))
+
+    def harness_versions(self, host=None) -> list[dict]:
+        where, params = "", []
+        if host:
+            where, params = " WHERE host = %s", [host]
+        return self.db.query(
+            "SELECT host, harness, path, version, raw, "
+            "extract(epoch from observed_at)::float8 AS observed_ts "
+            "FROM harness_versions" + where + " ORDER BY harness, host", tuple(params))
+
     def turns_in_progress(self, host) -> int:
         rows = self.db.query(
             "SELECT count(*)::int AS n FROM agent_registry"

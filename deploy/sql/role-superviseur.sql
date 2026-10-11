@@ -250,6 +250,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'provider', 'currency', 'total', 'granted', 'topped_up', 'available',
         'observed_at', 'account'
     ]),
+    -- L120 (0065): harness versions per host, a version line, no content
+    ('harness_versions', ARRAY[
+        'host', 'harness', 'path', 'version', 'raw', 'observed_at'
+    ]),
     -- ressources des hôtes (L31, 0029) : des mesures et l'état des ressources
     -- d'un tour, jamais un contenu
     ('host_resources', ARRAY[

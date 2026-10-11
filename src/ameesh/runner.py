@@ -3884,6 +3884,8 @@ class Runner:
         def boucle() -> None:
             while not self.stop.is_set():
                 self.resource_once()
+                # L120: harness versions, every 6 h (not in `--once`)
+                self.harness_versions_once()
                 if self.stop.wait(max(10.0, interval)):
                     return
 
@@ -4340,16 +4342,45 @@ class Runner:
         log_async("alimentation : %d agent(s) arrêté(s) proprement, baux rendus ; "
                   "reprise au retour du secteur" % len(workers))
 
+    def served_rows(self, db) -> list[dict]:
+        """The agents this runner leads: this host, mode `execute`, not
+        stopped, within `--agents`."""
+        return [r for r in registry.overview(db)
+                if (r.get("host") or "") == self.host
+                and (r.get("mode") or "execute") == "execute"
+                and r.get("status") != "stopped"
+                and (not self.agents_filter or r["name"] in self.agents_filter)]
+
+    def harness_versions_once(self, now: float | None = None) -> list[dict] | None:
+        """L120: read and record the version of the harnesses this runner
+        serves, at most every `PROBE_INTERVAL_S`; never raises. Read only:
+        a harness is never updated here."""
+        from . import harness_versions as versions_mod
+        now = time.monotonic() if now is None else now
+        if now < getattr(self, "_versions_due", 0.0):
+            return None
+        self._versions_due = now + versions_mod.PROBE_INTERVAL_S
+        db = None
+        try:
+            db = db_mod.connect(self.cfg)
+            served = {r.get("harness") for r in self.served_rows(db)} - {None, ""}
+            return versions_mod.probe_and_record(db, self.host, served)
+        except Exception as exc:  # never fatal for the runner
+            log_async("harness versions: not read (%s)" % type(exc).__name__)
+            return None
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+
     def log_harnesses(self) -> None:
         """Au démarrage (L106) : le binaire de chaque harnais servi, résolu et
         journalisé avec son chemin absolu — ou « hôte non prêt » tout de suite,
         sans attendre le premier tour. Ne lève jamais."""
         try:
-            rows = [r for r in registry.overview(self.db)
-                    if (r.get("host") or "") == self.host
-                    and (r.get("mode") or "execute") == "execute"
-                    and r.get("status") != "stopped"
-                    and (not self.agents_filter or r["name"] in self.agents_filter)]
+            rows = self.served_rows(self.db)
         except db_mod.DbError:
             return
         par_harnais: dict[str, list[str]] = {}
