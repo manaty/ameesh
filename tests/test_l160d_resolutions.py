@@ -428,6 +428,81 @@ class ReviewTest(_Base):
         with open(os.path.join(rp.path, "shared.py")) as fh:
             self.assertEqual(fh.read(), other)
 
+    def test_h_ignored_file_refused_and_kept(self):
+        # codex, 2nd review (P1): an ignored file passed the checks, then vanished
+        # with worktree remove --force and rmtree
+        _git(self.repo, "checkout", "-q", "lot/2-b")
+        _write(self.repo, ".gitignore", "*.local\n")
+        _git(self.repo, "add", ".gitignore")
+        _git(self.repo, "commit", "-qm", "b ignores *.local")
+        _git(self.repo, "checkout", "-q", "main")
+        path = self.resolved()
+        _write(path, "notes.local", "kept\n")
+        with self.assertRaises(resolutions.ResolveError) as ctx:
+            resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertIn("notes.local", str(ctx.exception))
+        self.assertTrue(os.path.isfile(os.path.join(path, "notes.local")))
+        # resumed --done: the commit is made, the ignored file is still refused
+        with mock.patch.object(resolutions, "_status", return_value=[]):
+            with mock.patch.object(self.fake, "record_resolution", return_value=None):
+                with self.assertRaises(resolutions.ResolveError):
+                    resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        with self.assertRaises(resolutions.ResolveError):
+            resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertTrue(os.path.isfile(os.path.join(path, "notes.local")))
+        os.unlink(os.path.join(path, "notes.local"))
+        done = resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertTrue(done["commit"])
+        self.assertFalse(os.path.exists(path))
+
+    def modify_delete_resolution(self):
+        """lots 1 and 2 conflict on shared.py and, modify/delete, on other.py."""
+        _commit_on(self.repo, "lot/1-a", "other.py", "x changed\n", "a changes other.py")
+        _git(self.repo, "checkout", "-q", "lot/2-b")
+        _git(self.repo, "rm", "-q", "other.py")
+        _git(self.repo, "commit", "-qm", "b removes other.py")
+        _git(self.repo, "checkout", "-q", "main")
+        wt = os.path.join(self.tmp, "wt-md")
+        _git(self.repo, "worktree", "add", "-q", "--detach", wt, "lot/1-a")
+        resolutions._run(wt, "merge", "-q", "--no-ff", "--no-commit", "lot/2-b")
+        _write(wt, "shared.py", RESOLVED)
+        _git(wt, "add", "shared.py")
+        _git(wt, "rm", "-q", "other.py")
+        _git(wt, "commit", "-qm", "R")
+        sha = _git(wt, "rev-parse", "HEAD")
+        _git(self.repo, "worktree", "remove", "--force", wt)
+        return sha
+
+    def test_i_modify_delete_conflict_still_learnt(self):
+        # codex, 2nd review (P2): checkout -m failed on the modify/delete path
+        sha = self.modify_delete_resolution()
+        rp = resolutions.Replayer(self.repo, os.path.join(self.tmp, "scratch"), script=None)
+        rp.ensure()
+        self.assertEqual(resolutions.train(rp.path, [sha], script=None), [sha])
+        self.assertEqual(resolutions.train(rp.path, [sha], script=None), [sha])  # --overwrite
+        a, b = (_git(self.repo, "rev-parse", x) for x in ("lot/1-a", "lot/2-b"))
+        self.assertEqual(rp.prime([sha]), [])
+        got = rp.replay(a, b, sha)
+        # rerere resolves the content conflict; it never tracks a modify/delete one
+        self.assertNotIn("shared.py", got["remaining"])
+        self.assertIn("other.py", got["files"])
+
+    def test_i_failed_training_is_isolated_to_its_pair(self):
+        # codex, 2nd review (P2): one failed training cut the replay of every pair
+        r1 = _manual_resolution(self.repo)
+        rp = resolutions.Replayer(self.repo, os.path.join(self.tmp, "scratch"), script=None)
+        rp.ensure()
+        real = resolutions.train
+
+        def flaky(cwd, commits, *, script="auto"):
+            if commits == ["f" * 40]:
+                raise resolutions.GitError("git checkout -m: boom")
+            return real(cwd, commits, script=script)
+        with mock.patch.object(resolutions, "train", side_effect=flaky), \
+                mock.patch.object(rp, "has", return_value=True):
+            self.assertEqual(rp.prime(["f" * 40, r1]), ["f" * 40])
+        self.assertEqual(rp.trained(), [r1])
+
     def test_g_work_show_without_table_0057(self):
         store = mock.Mock()
         store.work.resolutions.side_effect = RuntimeError(

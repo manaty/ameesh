@@ -126,6 +126,16 @@ def unmerged(cwd: str) -> list[str]:
     return _paths(_run(cwd, "diff", "--name-only", "--diff-filter=U", "-z"))
 
 
+def _both_sides(cwd: str) -> list[str]:
+    """Unmerged paths with both sides in the index (stages 2 and 3)."""
+    stages: dict = {}
+    for entry in _run(cwd, "ls-files", "-u", "-z").stdout.decode("utf-8", "replace").split("\0"):
+        if "\t" in entry:
+            info, path = entry.split("\t", 1)
+            stages.setdefault(path, set()).add(info.split()[-1])
+    return sorted(p for p, s in stages.items() if {"2", "3"} <= s)
+
+
 def rerere_remaining(cwd: str) -> list[str]:
     """Conflicted paths that `rerere` did not resolve."""
     proc = _run(cwd, "-c", "rerere.enabled=true", "rerere", "remaining")
@@ -202,10 +212,13 @@ def train(cwd: str, commits, *, script: str | None = "auto") -> list[str]:
                 if still:
                     raise GitError("git rerere forget left %s resolved (%s)"
                                    % (", ".join(still), commit[:12]))
-                if conflicted:
+                both = _both_sides(cwd)
+                if both:
                     # forget leaves the old resolution in the files: back to the conflict,
-                    # else the next `rerere` records the old resolution again
-                    _check(_run(cwd, "checkout", "-m", "--", *conflicted), "checkout -m")
+                    # else the next `rerere` records the old resolution again (only paths
+                    # with both sides: a modify/delete conflict has nothing to restore)
+                    _check(_run(cwd, "checkout", "-m", "--", *both), "checkout -m")
+                if conflicted:
                     _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
                     _check(_run(cwd, "checkout", commit, "--", "."), "checkout")
                     _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
@@ -343,8 +356,9 @@ def _ensure_commit(repo: str, row: dict) -> bool:
 
 
 def _status(path: str) -> list[str]:
-    """`git status --porcelain` of the worktree, untracked files included."""
-    proc = _run(path, "status", "--porcelain", "-z", "--untracked-files=all")
+    """`git status --porcelain` of the worktree, untracked and ignored files
+    included (`!!`): removing the worktree would lose them too."""
+    proc = _run(path, "status", "--porcelain", "-z", "--untracked-files=all", "--ignored")
     _check(proc, "status")
     return [e for e in proc.stdout.decode("utf-8", "replace").split("\0") if e[2:3] == " "]
 
@@ -358,8 +372,15 @@ def _remove_worktree(repo: str, path: str, *, force: bool = True) -> None:
             raise ResolveError("worktree %s not removed, it holds changes: %s"
                                % (path, ", ".join(e[3:] for e in dirty[:10])))
     _run(repo, "worktree", "unlock", path)
-    _run(repo, "worktree", "remove", "--force", path)
-    shutil.rmtree(path, ignore_errors=True)
+    if not force:
+        # no --force, no rmtree: git refuses a worktree that changed since the check
+        proc = _run(repo, "worktree", "remove", path)
+        if proc.returncode != 0 and os.path.isdir(path):
+            _run(repo, "worktree", "lock", "--reason", "ameesh work resolve", path)
+            raise ResolveError("worktree %s not removed: %s" % (path, _err(proc)))
+    else:
+        _run(repo, "worktree", "remove", "--force", path)
+        shutil.rmtree(path, ignore_errors=True)
     _run(repo, "worktree", "prune")
     try:
         os.unlink(_meta_path(path))
@@ -509,6 +530,11 @@ def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
             raise ResolveError("untracked files in %s: %s; git add them if the resolution "
                                "needs them, else delete them"
                                % (path, ", ".join(untracked[:10])))
+        ignored = [e[3:] for e in _status(path) if e.startswith("!!")]
+        if ignored:
+            raise ResolveError("ignored files in %s: %s; removing the worktree would lose "
+                               "them: git add -f them if the resolution needs them, else "
+                               "move or delete them" % (path, ", ".join(ignored[:10])))
         _check(_run(path, "add", "-u"), "add")
         present = [f for f in meta["files"] if os.path.lexists(os.path.join(path, f))]
         if present:
@@ -653,7 +679,7 @@ class Replayer:
 
     def prime(self, commits) -> list[str]:
         """Trains a cache of its own for each commit not learnt yet; returns
-        the commits still missing."""
+        the commits still missing, or whose training failed."""
         commits = list(dict.fromkeys(commits))
         missing = [c for c in commits if not self.has(c)]
         if missing:
@@ -664,7 +690,12 @@ class Replayer:
             if commit in done or commit in missing:
                 continue
             self._empty_cache()
-            train(self.path, [commit], script=self.script)
+            try:
+                train(self.path, [commit], script=self.script)
+            except (GitError, OSError, subprocess.SubprocessError):
+                # this pair only: the others are still primed and replayed
+                missing.append(commit)
+                continue
             tmp = self._store("." + commit)
             shutil.rmtree(tmp, ignore_errors=True)
             shutil.copytree(self._rr_cache(), tmp)
