@@ -672,6 +672,8 @@ class CostBook:
         current = ""
         found: dict = {}
         for event in before:
+            if event.get("parent_tool_use_id"):
+                continue             # L221 : ni la session ni le cumul d'un sous-agent
             kind = event.get("type")
             ident = event.get("session_id") or event.get("thread_id")
             if isinstance(ident, str) and ident:
@@ -869,14 +871,22 @@ class CostBook:
                           and self.resumed_session(agent, start) == session)
 
         if harness == "claude":
-            totals = [float(e["total_cost_usd"]) for e in events
-                      if e.get("type") == "result" and isinstance(e.get("total_cost_usd"), (int, float))]
-            usage = [e.get("usage") or {} for e in events if e.get("type") == "result"]
+            # L221 : seuls les `result` du fil principal (pas d'un sous-agent,
+            # session du tour) disent le coût et le cumul du tour.
+            results = _claude_main_results(events, session)
+            totals = [float(e["total_cost_usd"]) for e in results
+                      if isinstance(e.get("total_cost_usd"), (int, float))]
+            usage = [e["usage"] for e in results if _has_tokens(e.get("usage"))]
             last = cum.get("cum_usd")
-            if not usage:
+            # L221 : c'est le `result` principal **final** qui décide. Sans usage,
+            # il ne dit rien des jetons du tour ; le garder (`[{}]`, vrai pour
+            # Python) sautait le repli L105 et faisait du cumul du processus le
+            # coût d'un tour à 0 jeton (tour 2260).
+            if not results or not _has_tokens(results[-1].get("usage")):
                 # L105 : tour clos avant son `result` (plafond du tour, arrêt,
-                # préemption) — l'usage de chaque appel, lu sur les messages du
-                # modèle (une fois par id), au barème ; aucun cumul n'est relevé.
+                # préemption), ou `result` sans usage (L221) — l'usage de chaque
+                # appel, lu sur les messages du modèle (une fois par id), au
+                # barème ; le cumul n'en fait jamais le coût du tour.
                 usage = _claude_call_usages(events)
                 usd = sum(
                     ((_num(u, "input_tokens") + _num(u, "cache_creation_input_tokens")) * pin
@@ -976,8 +986,9 @@ class CostBook:
         account = self.account_at(agent, start, usage.harness)
         cum_usd = cum_input = cum_cached = cum_out = None
         if usage.harness == "claude":
-            totals = [float(e["total_cost_usd"]) for e in events
-                      if e.get("type") == "result" and isinstance(e.get("total_cost_usd"), (int, float))]
+            # L221 : le repère est le cumul du fil principal, jamais d'un sous-agent.
+            totals = [float(e["total_cost_usd"]) for e in _claude_main_results(events, session_id)
+                      if isinstance(e.get("total_cost_usd"), (int, float))]
             if totals:
                 cum_usd = totals[-1]
         elif usage.harness == "codex":
@@ -1212,6 +1223,23 @@ def format_totals(sums: dict) -> list:
     return lines
 
 
+def _claude_main_results(events: Sequence[dict], session: str | None) -> list[dict]:
+    """L221 : les `result` du fil principal d'un tour Claude.
+
+    Ni ceux d'un sous-agent (`parent_tool_use_id`), ni ceux d'une autre session :
+    leur cumul n'est pas celui du processus du tour."""
+    return [e for e in events
+            if e.get("type") == "result" and not e.get("parent_tool_use_id")
+            and (not session or e.get("session_id") in (None, "", session))]
+
+
+def _has_tokens(usage) -> bool:
+    """L221 : un usage Claude qui compte au moins un jeton."""
+    return isinstance(usage, dict) and any(
+        _num(usage, k) > 0 for k in ("input_tokens", "cache_creation_input_tokens",
+                                     "cache_read_input_tokens", "output_tokens"))
+
+
 def _claude_call_usages(events: Sequence[dict]) -> list[dict]:
     """L105 : l'usage de chaque appel au modèle d'un tour Claude sans `result`.
 
@@ -1318,6 +1346,8 @@ def _last_session(events: Iterable[dict]) -> str:
     inscrits au grand livre sans session (L60)."""
     found = None
     for event in events:
+        if event.get("parent_tool_use_id"):
+            continue                 # L221 : la session d'un sous-agent n'est pas celle du tour
         for key in ("session_id", "thread_id", "sessionId"):
             value = event.get(key)
             if isinstance(value, str) and value:

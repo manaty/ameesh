@@ -19,6 +19,10 @@ from ameesh import cost
 
 from .support import PgTestCase
 
+# Un `result` Claude porte toujours l'usage du tour ; sans lui, le coût se lit
+# appel par appel au barème (L221), pas dans le cumul.
+U = {"input_tokens": 1}
+
 
 def write(path: str, *events) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -188,11 +192,11 @@ class TurnAccountingTest(Sandbox, PgTestCase):
     def test_claude_session_neuve_repart_de_zero(self):
         self.agent("a1", "claude")
         book = self.book()
-        self.events("a1", {"type": "result", "session_id": "s1", "total_cost_usd": 3.0})
+        self.events("a1", {"type": "result", "session_id": "s1", "total_cost_usd": 3.0, "usage": U})
         book.record("a1")
         # Le harnais reprend avec une autre session : son cumul ne contient pas
         # le passé, donc il ne faut PAS soustraire le repère de la précédente.
-        self.events("a1", {"type": "result", "session_id": "s2", "total_cost_usd": 0.10})
+        self.events("a1", {"type": "result", "session_id": "s2", "total_cost_usd": 0.10, "usage": U})
         self.assertAlmostEqual(book.turn_usage("a1", start=1).usd, 0.10)
 
     def test_codex_difference_de_l_usage_cumule_du_fil(self):
@@ -330,7 +334,7 @@ class TurnAccountingTest(Sandbox, PgTestCase):
             fh.write("[]\n")
             fh.write("null\n")
             fh.write(json.dumps({"type": "result", "session_id": "s1",
-                                 "total_cost_usd": 0.5}) + "\n")
+                                 "total_cost_usd": 0.5, "usage": U}) + "\n")
         self.assertAlmostEqual(self.book().turn_usage("a1").usd, 0.5)
 
 
@@ -371,7 +375,7 @@ class CostDbTest(Sandbox, PgTestCase):
         with open(os.path.join(book.agent_dir("a1"), "tool"), "w", encoding="utf-8") as fh:
             fh.write("claude")
         self.write_events("a1", {"type": "result", "session_id": "s1",
-                                 "total_cost_usd": 0.50})
+                                 "total_cost_usd": 0.50, "usage": U})
         with self.assertRaises(RuntimeError):
             book.record("a1")
         # La panne n'a rien laissé : aucune ligne, donc aucun repère avancé.
@@ -386,10 +390,10 @@ class CostDbTest(Sandbox, PgTestCase):
         with open(os.path.join(book.agent_dir("a1"), "tool"), "w", encoding="utf-8") as fh:
             fh.write("claude")
         self.write_events("a1", {"type": "result", "session_id": "s1",
-                                 "total_cost_usd": 1.00})
+                                 "total_cost_usd": 1.00, "usage": U})
         self.assertAlmostEqual(book.record("a1").usd, 1.00)
         self.write_events("a1", {"type": "result", "session_id": "s1",
-                                 "total_cost_usd": 1.25})
+                                 "total_cost_usd": 1.25, "usage": U})
         self.assertAlmostEqual(book.record("a1", start=1).usd, 0.25)
 
     def test_un_tour_sans_releve_ne_perd_pas_le_repere_claude(self):
@@ -403,12 +407,12 @@ class CostDbTest(Sandbox, PgTestCase):
         os.makedirs(book.agent_dir("a1"), exist_ok=True)
         with open(os.path.join(book.agent_dir("a1"), "tool"), "w", encoding="utf-8") as fh:
             fh.write("claude")
-        self.write_events("a1", {"type": "result", "session_id": "s1", "total_cost_usd": 0.50})
+        self.write_events("a1", {"type": "result", "session_id": "s1", "total_cost_usd": 0.50, "usage": U})
         self.assertAlmostEqual(book.record("a1").usd, 0.50)
         # Tour interrompu : du flux, mais aucun résultat — donc aucun relevé.
         self.write_events("a1", {"type": "system", "subtype": "init", "session_id": "s1"})
         self.assertAlmostEqual(book.record("a1", start=1).usd, 0.0)
-        self.write_events("a1", {"type": "result", "session_id": "s1", "total_cost_usd": 0.75})
+        self.write_events("a1", {"type": "result", "session_id": "s1", "total_cost_usd": 0.75, "usage": U})
         self.assertAlmostEqual(book.record("a1", start=2).usd, 0.25)
         self.assertAlmostEqual(book.spent("a1", 3600), 0.75)
 
