@@ -1045,10 +1045,11 @@ class WorkItems(Domain):
     def queue_update(self, item_id: int, *, state: str | None = None,
                      rank: int | None = None, reason: str | None = None,
                      landing_sha: str | None = None, note: str = "",
-                     actor: str = "") -> dict | None:
+                     actor: str = "", clear_rank: bool = False) -> dict | None:
         """L160e (0058): changes the state, rank, reason or landing commit of
-        a queued lot (`queued` and `ejected` clear the landing commit); a
-        journal line when `note` is given. None if the lot is not queued."""
+        a queued lot (`queued` and `ejected` clear the landing commit;
+        `ejected` or `clear_rank` clear the rank); a journal line when
+        `note` is given. None if the lot is not queued."""
 
     @abc.abstractmethod
     def queue_remove(self, item_id: int, *, note: str, actor: str) -> bool:

@@ -53,7 +53,7 @@ class FakeQueue(FakeWork):
         return self._row(item_id)
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
-                     note="", actor=""):
+                     note="", actor="", clear_rank=False):
         q = self.queue_rows.get(item_id)
         if q is None:
             return None
@@ -63,7 +63,8 @@ class FakeQueue(FakeWork):
             q["landing_sha"] = None
         elif landing_sha:
             q["landing_sha"] = landing_sha
-        q["rank"] = None if state == "ejected" else (rank if rank is not None else q["rank"])
+        q["rank"] = None if state == "ejected" or clear_rank else (
+            rank if rank is not None else q["rank"])
         if reason is not None:
             q["reason"] = reason
         if note:
@@ -192,10 +193,21 @@ class EntryTest(_Base):
         self.assertNotEqual(subprocess.run(["git", "-C", agents, "cat-file", "-e",
                                             self.tip(1) + "^{commit}"],
                                            capture_output=True).returncode, 0)
-        # without the clone, the stale origin/<branch> is not the freeze: refused
+        # without the clone, origin cannot be fetched: refused, never the cached tip
         self.fake.queue_rows.clear()
-        with self.assertRaisesRegex(merge_queue.QueueError, "not at its freeze"):
+        with self.assertRaisesRegex(merge_queue.QueueError, "without the radar's clone"):
             merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None)
+
+    def test_a_local_branch_is_not_the_tip_when_origin_moved(self):
+        agents = os.path.join(self.tmp, "agents")
+        _git(self.tmp, "clone", "-q", self.repo, agents)
+        _git(agents, "branch", "lot/1-a", "origin/lot/1-a")  # local copy, reviewed at A
+        self.ready(1)
+        _commit_on(self.repo, "lot/1-a", "other.py", "z\n", "B, pushed from another host")
+        clone = resolutions.Replayer(agents, os.path.join(self.tmp, "state", "p.clone"))
+        with self.assertRaisesRegex(merge_queue.QueueError, "not at its freeze"):
+            merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None, clone=clone)
+        self.assertEqual(self.fake.queue_rows, {})
 
     def test_milestones_name_commit_ids_only(self):
         tip = self.tip(1)
@@ -380,12 +392,30 @@ class PassTest(_Base):
         self.assertEqual(self.fake.queue_rows[1]["state"], "queued")
         self.assertEqual([(o["lot"], o["state"])
                           for o in report["queue"]["targets"]["origin/main"]], [(1, "queued")])
-        # the remote does not answer: neither ejected nor ranked, the next pass decides
+        self.assertEqual(self.fake.queue_rows[1]["rank"], 1)
+        # the remote does not answer: neither ejected nor ranked, the next pass
+        # decides; its rank is cleared, so that no other lot shares it
         _git(agents, "remote", "set-url", "origin", os.path.join(self.tmp, "nowhere"))
         report = self.run_pass(repo=agents)
         self.assertEqual(self.fake.queue_rows[1]["state"], "queued")
+        self.assertIsNone(self.fake.queue_rows[1]["rank"])
+        self.assertIn("deferred: cannot fetch", self.fake.queue_rows[1]["reason"])
         self.assertEqual([d["lot"] for d in report["queue"]["deferred"]], [1])
         self.assertEqual(self.sent, [])
+
+    def test_a_push_unseen_by_the_agents_ejects(self):
+        """Queued at A; another host pushes B; the agents' cached origin still
+        says A: the pass fetches, sees B, and ejects."""
+        agents = os.path.join(self.tmp, "agents")
+        _git(self.tmp, "clone", "-q", self.repo, agents)
+        self.ready(1)
+        clone = resolutions.Replayer(agents, radar.clone_dir(self.cfg, "p"))
+        merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None, clone=clone)
+        _commit_on(self.repo, "lot/1-a", "other.py", "z\n", "B, pushed from another host")
+        self.project = radar.Project(name="p", repo=agents, migrations=MIG)
+        self.run_pass(repo=agents)
+        self.assertEqual(self.fake.queue_rows[1]["state"], "ejected")
+        self.assertIn("moved past its freeze", self.fake.queue_rows[1]["reason"])
 
     def test_merged_lot_lands(self):
         self.queue(4)
@@ -421,7 +451,11 @@ class PassTest(_Base):
         trial = {1: {"state": "clean", "files": []},
                  2: {"state": "conflict", "files": ["shared.py"]},
                  3: {"state": "clean", "files": []}}
-        with mock.patch.object(merge_queue, "stack", return_value=trial):
+        by_branch = {self.fake.lots[n]["branch"]: tips[n] for n in (1, 2, 3)}
+        with mock.patch.object(merge_queue, "stack", return_value=trial), \
+                mock.patch.object(merge_queue, "branch_tip",
+                                  side_effect=lambda repo, branch, clone: (by_branch[branch],
+                                                                           repo)):
             out = merge_queue.run_pass(self.cfg, None, self.project, report,
                                        replayer=mock.Mock())
         self.assertEqual([(o["lot"], o["state"]) for o in out["targets"]["main"]],

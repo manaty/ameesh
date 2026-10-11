@@ -675,7 +675,7 @@ class WorkItems(interface.WorkItems):
             return self._queue_row(tx, item_id)
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
-                     note="", actor="") -> dict | None:
+                     note="", actor="", clear_rank=False) -> dict | None:
         with self.db.transaction() as tx:
             rows = tx.query(
                 "UPDATE merge_queue SET state = coalesce(%s, state),"
@@ -684,7 +684,7 @@ class WorkItems(interface.WorkItems):
                 "                      ELSE coalesce(%s, landing_sha) END,"
                 "   reason = coalesce(%s, reason), updated_at = now()"
                 " WHERE work_item_id = %s RETURNING work_item_id",
-                (state, state == "ejected", rank, state or "", landing_sha, reason,
+                (state, state == "ejected" or bool(clear_rank), rank, state or "", landing_sha, reason,
                  int(item_id)))
             if not rows:
                 return None
