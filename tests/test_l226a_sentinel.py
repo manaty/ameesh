@@ -29,41 +29,59 @@ def _claude_dir(root: str, name: str, **oauth) -> str:
 class ProbeClaudeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-l226a-")
+        which = mock.patch.object(sentinel.shutil, "which", return_value="/bin/claude")
+        which.start()
+        self.addCleanup(which.stop)
 
     def _profile(self, name, **oauth):
         return accounts.Profile("claude", name, path=_claude_dir(self.tmp, name, **oauth))
 
-    def test_valid_refresh_token_is_healthy_with_forecast(self):
-        v = sentinel.probe_claude(self._profile(
-            "a", refreshToken="x", expiresAt=(NOW - 60) * 1000,
-            refreshTokenExpiresAt=(NOW + 86400) * 1000), NOW)
+    @staticmethod
+    def _status(logged_in=True, code=0):
+        calls = []
+
+        def run(argv, env=None, whole=False):
+            calls.append((argv, env))
+            return code, json.dumps({"loggedIn": logged_in, "authMethod": "claude.ai"})
+        run.calls = calls
+        return run
+
+    def test_expired_access_token_is_healthy_when_logged_in(self):
+        # bureau 2026-10-11: expiresAt passes after a short idle time; the
+        # access token is refreshed on use — not a failure
+        profile = self._profile("a", refreshToken="x", expiresAt=(NOW - 1800) * 1000,
+                                refreshTokenExpiresAt=(NOW + 86400) * 1000)
+        run = self._status()
+        v = sentinel.probe_claude(profile, NOW, run=run)
         self.assertEqual((v.state, v.account), ("healthy", "a"))
         self.assertAlmostEqual(v.expires_at, NOW + 86400)
+        argv, env = run.calls[0]
+        self.assertEqual(argv, ["claude", "auth", "status"])
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], profile.path)
 
-    def test_expired_refresh_token_fails_with_exact_command(self):
-        profile = self._profile("b", refreshToken="x", refreshTokenExpiresAt=(NOW - 1) * 1000)
-        v = sentinel.probe_claude(profile, NOW)
+    def test_not_logged_in_fails_with_exact_command(self):
+        profile = self._profile("b", refreshToken="x")
+        v = sentinel.probe_claude(profile, NOW, run=self._status(logged_in=False, code=1))
         self.assertEqual(v.state, "failing")
-        self.assertIn("CLAUDE_CONFIG_DIR=%s claude, then /login" % profile.path, v.text())
+        self.assertIn("CLAUDE_CONFIG_DIR=%s claude auth login" % profile.path, v.text())
 
-    def test_declared_account_without_file_fails(self):
-        path = os.path.join(self.tmp, "empty")
-        os.makedirs(path)
-        v = sentinel.probe_claude(accounts.Profile("claude", "c", path=path), NOW)
-        self.assertEqual(v.state, "failing")
+    def test_expired_refresh_token_fails(self):
+        profile = self._profile("c", refreshToken="x", refreshTokenExpiresAt=(NOW - 1) * 1000)
+        self.assertEqual(sentinel.probe_claude(profile, NOW, run=self._status()).state,
+                         "failing")
 
     def test_default_credential_absent_is_skipped(self):
         profile = accounts.Profile("claude", "")
         self.assertIsNone(sentinel.probe_claude(
-            profile, NOW, environ={"CLAUDE_CONFIG_DIR": os.path.join(self.tmp, "none")}))
+            profile, NOW, environ={"CLAUDE_CONFIG_DIR": os.path.join(self.tmp, "none")},
+            run=self._status()))
 
-    def test_unreadable_file_is_unknown_not_a_verdict(self):
-        path = os.path.join(self.tmp, "bad")
-        os.makedirs(path)
-        with open(os.path.join(path, ".credentials.json"), "w") as fh:
-            fh.write("{not json")
-        v = sentinel.probe_claude(accounts.Profile("claude", "d", path=path), NOW)
-        self.assertEqual(v.state, "unknown")
+    def test_timeout_or_garbage_is_unknown_not_a_verdict(self):
+        profile = self._profile("d", refreshToken="x")
+        timeout = mock.Mock(return_value=(None, "TimeoutExpired"))
+        garbage = mock.Mock(return_value=(1, "not json"))
+        self.assertEqual(sentinel.probe_claude(profile, NOW, run=timeout).state, "unknown")
+        self.assertEqual(sentinel.probe_claude(profile, NOW, run=garbage).state, "unknown")
 
 
 class ProbeCodexTest(unittest.TestCase):

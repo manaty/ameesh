@@ -6,9 +6,9 @@ this host, probed every 10 minutes (`ameesh accounts check`, systemd timer
 Each probe reports to `credential_health` (migration 0060, owned by L226b)
 through `storage.of(db).credentials.report(..., source='sentinel')`:
 
-* `claude`, per declared account (or the default config dir): the OAuth file
-  `.credentials.json` has a refresh token that has not expired (the access
-  token refreshes itself); forecast expiry = `refreshTokenExpiresAt`;
+* `claude`, per declared account (or the default config dir): `claude auth
+  status` in its config dir says `loggedIn` (an expired access token is not a
+  failure: it is refreshed on use); forecast expiry = `refreshTokenExpiresAt`;
 * `codex`, per declared account: `auth.json` has a refresh token or an API key;
 * `gcloud`: `gcloud auth print-access-token` succeeds; forecast expiry = last
   interactive login (mtime of `credentials.db`) + the Workspace session length
@@ -70,13 +70,17 @@ def settings(cfg) -> dict:
             "warn_hours": float(raw.get("warn_hours") or DEFAULT_WARN_HOURS)}
 
 
-def _run(argv: list, env: dict | None = None) -> tuple[int | None, str]:
-    """(exit code, last line of output); None on timeout or missing binary."""
+def _run(argv: list, env: dict | None = None,
+         whole: bool = False) -> tuple[int | None, str]:
+    """(exit code, last line of output — or the whole stdout with `whole`);
+    None on timeout or missing binary."""
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S,
                               env=env, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return None, type(exc).__name__
+    if whole:
+        return proc.returncode, proc.stdout
     lines = [l.strip() for l in (proc.stderr + "\n" + proc.stdout).splitlines() if l.strip()]
     return proc.returncode, (lines[-1][:200] if lines else "")
 
@@ -99,36 +103,51 @@ def _env_prefix(harness: str, profile) -> str:
     return ""
 
 
-def probe_claude(profile, now: float, environ=None) -> Verdict | None:
+def probe_claude(profile, now: float, environ=None, run=None) -> Verdict | None:
+    """`claude auth status` in the account's config dir decides; never the
+    access token's `expiresAt` (it expires after a short idle time and is
+    refreshed on use). `refreshTokenExpiresAt` only gives the forecast."""
     environ = os.environ if environ is None else environ
+    run = _run if run is None else run
     name = profile.name if profile.name else ""
     if profile.kind == "api_key_env":
         ok = _key_set(profile, environ)
         return Verdict("claude", name, "healthy" if ok else "failing",
                        "API key present" if ok else "API key missing",
                        fix="" if ok else "set the key of account %s" % (name or "default"))
-    path = os.path.join(profile.home(environ), ".credentials.json")
-    fix = "%sclaude, then /login" % _env_prefix("claude", profile)
-    if not os.path.exists(path):
-        if not profile.name and not profile.path:
-            return None               # no Claude credential here: not used on this host
-        return Verdict("claude", name, "failing", "no credentials file %s" % path, fix=fix)
+    home = profile.home(environ)
+    path = os.path.join(home, ".credentials.json")
+    fix = "CLAUDE_CONFIG_DIR=%s claude auth login" % home
+    if not os.path.exists(path) and not profile.name and not profile.path:
+        return None                   # no Claude credential here: not used on this host
+    expires = None
     try:
         with open(path, encoding="utf-8") as fh:
-            oauth = (json.load(fh) or {}).get("claudeAiOauth") or {}
+            refresh_ms = ((json.load(fh) or {}).get("claudeAiOauth") or {}).get(
+                "refreshTokenExpiresAt")
+        if isinstance(refresh_ms, (int, float)):
+            expires = float(refresh_ms) / 1000
     except (OSError, ValueError, AttributeError):
-        return Verdict("claude", name, "unknown", "unreadable %s" % path)
-    refresh_ms = oauth.get("refreshTokenExpiresAt")
-    expires = float(refresh_ms) / 1000 if isinstance(refresh_ms, (int, float)) else None
-    if not oauth.get("refreshToken"):
-        access_ms = oauth.get("expiresAt")
-        if isinstance(access_ms, (int, float)) and access_ms / 1000 > now:
-            return Verdict("claude", name, "healthy", "access token without refresh token",
-                           expires_at=access_ms / 1000, fix=fix)
-        return Verdict("claude", name, "failing", "no refresh token", fix=fix)
+        pass
+    if not shutil.which("claude", path=environ.get("PATH")):
+        return Verdict("claude", name, "unknown", "claude binary not found", expires)
+    code, out = run(["claude", "auth", "status"],
+                    env=dict(environ, **{accounts_mod.config_env_of("claude") or
+                                         "CLAUDE_CONFIG_DIR": home}), whole=True)
+    if code is None:
+        return Verdict("claude", name, "unknown", "probe failed: %s" % out, expires)
+    try:
+        status = json.loads(out)
+    except ValueError:
+        return Verdict("claude", name, "unknown",
+                       "unreadable auth status (exit %s)" % code, expires)
+    if not isinstance(status, dict) or not status.get("loggedIn"):
+        return Verdict("claude", name, "failing", "claude auth status: not logged in",
+                       expires, fix)
     if expires is not None and expires <= now:
         return Verdict("claude", name, "failing", "refresh token expired", expires, fix)
-    return Verdict("claude", name, "healthy", "refresh token valid", expires, fix)
+    return Verdict("claude", name, "healthy",
+                   "logged in (%s)" % (status.get("authMethod") or "?"), expires, fix)
 
 
 def probe_codex(profile, now: float, environ=None) -> Verdict | None:
@@ -203,7 +222,7 @@ def probe_all(cfg, now: float | None = None, run=_run, environ=None) -> list[Ver
     out: list[Verdict | None] = []
     for harness in conf["probes"]:
         if harness == "claude":
-            out += [probe_claude(p, now, environ) for p in _profiles(cfg, "claude")]
+            out += [probe_claude(p, now, environ, run) for p in _profiles(cfg, "claude")]
         elif harness == "codex":
             out += [probe_codex(p, now, environ) for p in _profiles(cfg, "codex")]
         elif harness == "gcloud":
