@@ -178,7 +178,7 @@ KEPT_MERGED_GRACE_S = 24 * 3600.0
 POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_alert",
                "redirect", "xdg_cache", "worktrees", "orphan_min_size",
                "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
-               "artifact_idle")
+               "artifact_idle", "unreadable_ok")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -212,6 +212,10 @@ class Policy:
     artifacts: tuple | None = None
     #: L230: inactivity (seconds) of a worktree before its artifacts go
     artifact_idle: float = build_artifacts.DEFAULT_IDLE_S
+    #: L230: names of the user's processes whose unreadability (not dumpable:
+    #: capabilities, setuid) does not block a deletion; empty by default, set
+    #: per host in its Host card
+    unreadable_ok: tuple = ()
     #: provenance de chaque clé déclarée (identifiant du canon)
     origin: dict = field(default_factory=dict, compare=False)
 
@@ -274,6 +278,12 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`artifacts` : %s" % problem)
         else:
             parsed["artifacts"] = tuple(str(r) for r in rules)
+    if raw.get("unreadable_ok") is not None:
+        names, problem = build_artifacts.parse_names(raw["unreadable_ok"])
+        if names is None:
+            problems.append("`unreadable_ok` : %s" % problem)
+        else:
+            parsed["unreadable_ok"] = names
     for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup", "deps"):
         if raw.get(key) is None:
             continue
@@ -1265,10 +1275,10 @@ def tmpfs_hint(top, policy: Policy) -> str:
 # worktrees
 # --------------------------------------------------------------------------
 
-def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT):
+def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT, env=None):
     try:
         proc = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True,
-                              timeout=timeout)
+                              timeout=timeout, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     return proc
@@ -1314,6 +1324,46 @@ def common_dir(cwd: str) -> str:
     return os.path.abspath(os.path.join(cwd, proc.stdout.strip()))
 
 
+def _scratch_merge_tree(path: str, ref: str):
+    """`git merge-tree --write-tree ref HEAD` whose new objects go to a
+    scratch directory (the repository's objects as alternates), deleted
+    afterwards: nothing is written in `.git` (L230, like the radar)."""
+    import tempfile
+    objects = _git(["rev-parse", "--path-format=absolute", "--git-path", "objects"], path)
+    if objects is None or objects.returncode != 0 or not objects.stdout.strip():
+        return None
+    scratch = tempfile.mkdtemp(prefix="ameesh-menage-merge-")
+    try:
+        env = dict(os.environ, GIT_OBJECT_DIRECTORY=scratch,
+                   GIT_ALTERNATE_OBJECT_DIRECTORIES=objects.stdout.strip())
+        return _git(["merge-tree", "--write-tree", ref, "HEAD"], path, env=env)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def ignored_leftovers(path: str, rules) -> list[str] | None:
+    """L230: files ignored by git in the worktree that are NOT regenerable
+    build output (`rules`, `.ameesh-trash-…`): an ignored `.env` or dataset
+    that `git worktree remove` would delete. None if git cannot say."""
+    proc = _git(["--no-optional-locks", "status", "--porcelain", "--ignored",
+                 "--untracked-files=normal"], path)
+    if proc is None or proc.returncode != 0:
+        return None
+    out = []
+    for line in proc.stdout.splitlines():
+        if not line.startswith("!! "):
+            continue
+        rel = line[3:].strip().strip('"').rstrip("/")
+        parent, name = os.path.split(os.path.join(path, rel))
+        if name.startswith(build_artifacts.TRASH_PREFIX) or (
+                os.path.isdir(os.path.join(parent, name))
+                and not os.path.islink(os.path.join(parent, name))
+                and any(rule.matches(parent, name) for rule in rules)):
+            continue
+        out.append(rel)
+    return out
+
+
 def _default_remote_ref(path: str) -> str:
     """Branche principale du dépôt distant (`origin/HEAD`, sinon `origin/main`,
     sinon `origin/master`) ; vide si aucune n'existe."""
@@ -1347,7 +1397,9 @@ def worktree_state(path: str) -> dict:
     gitdir = _git(["rev-parse", "--absolute-git-dir"], path)
     if gitdir is not None and gitdir.returncode == 0 and gitdir.stdout.strip():
         out["locked"] = os.path.exists(os.path.join(gitdir.stdout.strip(), "locked"))
-    status = _git(["status", "--porcelain", "--untracked-files=normal"], path)
+    # L230: never a write in .git (no index refresh), dry run or not
+    status = _git(["--no-optional-locks", "status", "--porcelain", "--untracked-files=normal"],
+                  path)
     if status is None or status.returncode != 0:
         out["reason"] = "état git illisible"
         return out
@@ -1374,7 +1426,7 @@ def worktree_state(path: str) -> dict:
         if not out["integrated"]:
             # Fusion par écrasement (squash) : fusionner HEAD dans la branche
             # principale ne changerait rien (`git merge-tree`, git ≥ 2.38).
-            merged = _git(["merge-tree", "--write-tree", ref, "HEAD"], path)
+            merged = _scratch_merge_tree(path, ref)
             tree = _git(["rev-parse", ref + "^{tree}"], path)
             if merged is not None and merged.returncode == 0 and tree is not None \
                     and tree.returncode == 0 and merged.stdout.strip():
@@ -1691,7 +1743,8 @@ def _mtime(path: str) -> float | None:
 
 def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
                    protected: set[str], now: float,
-                   running: set | None = None) -> tuple[list[dict], list[dict]]:
+                   running: set | None = None, artifacts=None,
+                   allow=()) -> tuple[list[dict], list[dict]]:
     """Fin de lot des worktrees suivis : (lignes du journal, plan lisible).
 
     Garde-fous (L73b) avant tout retrait : worktree attribué à l'agent du
@@ -1700,7 +1753,13 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
     en cours (`running`), au moins `WORKTREE_MIN_AGE_S` depuis son
     enregistrement et depuis la dernière modification de son dossier, non
     verrouillé, aucun processus dedans, propre, et HEAD INTÉGRÉ à la branche
-    principale distante (poussé ne suffit pas)."""
+    principale distante (poussé ne suffit pas).
+
+    L230: a worktree kept although its lot is merged (`LOT_MERGED`, state
+    of the lot in ameesh) is removed once kept for more than a day for the
+    same reason, if clean, pushed, without ignored files other than build
+    output (`artifacts` rules), and with no process of the user inside by
+    the strict check of the artifacts (`platform.user_paths`, `allow`)."""
     entries: list[dict] = []
     plan: list[dict] = []
     running = set(running or ())
@@ -1768,6 +1827,20 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
                        and row.get("detail") == detail and st["clean"] and st["pushed"]
                        and now - float(row.get("checked_ts") or now) >= KEPT_MERGED_GRACE_S)
         if kept_merged:
+            leftovers = ignored_leftovers(path, build_artifacts.rules_of(artifacts))
+            if leftovers is None:
+                hold = "fichiers ignorés illisibles (git status --ignored)"
+            elif leftovers:
+                hold = "%d fichier(s) ignoré(s) hors artefacts de build (%s)" % (
+                    len(leftovers), leftovers[0])
+            else:
+                procs = platform.user_paths(allow=allow)
+                held = procs.holders(path)
+                hold = procs.doubt() or (
+                    "processus dedans (%s)" % ", ".join(held[:3]) if held else "")
+            if hold:
+                plan.append(dict(base, action="garde", detail="%s ; %s" % (detail, hold)))
+                continue
             why = "%s ; gardé depuis plus de 24 h, propre et poussé" % why
         elif not st["clean"] or not st["integrated"]:
             plan.append(dict(base, action="garde", detail=detail))
@@ -1798,7 +1871,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
 
 
 def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool,
-                   now: float, skip_roots=()) -> dict:
+                   now: float, skip_roots=(), lock_path: str | None = None) -> dict:
     """L230: the worktrees of the repositories of the registered agents (and
     the tracked ones), their build artifacts deleted once idle; in a thread
     at the lowest priority, one worktree at a time."""
@@ -1820,7 +1893,8 @@ def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool
         lambda: build_artifacts.run(
             build_artifacts.worktrees(seeds, list_worktrees), rules,
             idle_s=policy.artifact_idle, protected=list(cwd_of.values()), skip_roots=skip,
-            owner_of=owner_of, dry_run=dry_run, now=now))
+            owner_of=owner_of, dry_run=dry_run, now=now, allow=policy.unreadable_ok,
+            lock_path=lock_path))
 
 
 def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
@@ -2086,14 +2160,18 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     elif policy.worktrees:
         wt_entries, wt_plan = _worktree_pass(db, host, dry_run=dry_run,
                                              include_lotless=include_lotless,
-                                             protected=protected, now=now, running=running)
+                                             protected=protected, now=now, running=running,
+                                             artifacts=policy.artifacts,
+                                             allow=policy.unreadable_ok)
         entries += wt_entries
         plan += wt_plan
     # 3b. L230: regenerable build dirs of idle worktrees
     if artifact_scan and registered is not None:
         try:
             art = _artifact_pass(db, host, policy, cwd_of=cwd_of, dry_run=dry_run, now=now,
-                                 skip_roots=(troot, croot, cfg.state_dir))
+                                 skip_roots=(troot, croot, cfg.state_dir),
+                                 lock_path=os.path.join(cfg.state_dir, MANAGED_DIR,
+                                                        "artifacts.lock"))
         except Exception as exc:  # jamais fatal pour le passage
             art = {"entries": [], "plan": [], "skipped": [
                 "artifacts: pass impossible (%s)" % type(exc).__name__]}
