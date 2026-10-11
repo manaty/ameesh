@@ -127,7 +127,7 @@ class PlatformTest(unittest.TestCase):
                     found = {h["pid"]: h for h in platform.holders(chemin, "sid-l63-xyz")}
                     self.assertEqual(found[tient.pid]["why"], "open file")
                     self.assertIn(nomme.pid, found)
-                    self.assertIn("ligne de commande", found[nomme.pid]["why"])
+                    self.assertIn("command line", found[nomme.pid]["why"])
                     # les PID exclus (ascendance d'adopt) ne comptent pas par leur
                     # ligne de commande
                     exclus = platform.holders(chemin, "sid-l63-xyz", exclude=[nomme.pid])
@@ -260,8 +260,8 @@ class AdoptFailClosedTest(PgTestCase):
             out = reprise.adopt(cfg, self.db, "coord", session_id=SID, harness="codex",
                                 force=True, warn=avert.append)
         self.assertTrue(out["forced"])
-        self.assertTrue(any("sans vérifier" in a for a in avert))
-        self.assertTrue(any("sans vérifier" in n for n in out["notes"]))
+        self.assertTrue(any("without checking" in a for a in avert))
+        self.assertTrue(any("without checking" in n for n in out["notes"]))
         texte = []
         for racine, _d, fichiers in os.walk(self.cfg.threads_root):
             for nom in fichiers:
