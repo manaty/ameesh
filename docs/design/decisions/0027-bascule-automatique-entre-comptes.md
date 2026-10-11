@@ -1,39 +1,39 @@
 ---
 type: Decision
-title: "Bascule automatique vers un compte secondaire, retour au primaire après la remise à zéro"
-description: "Pour chaque fournisseur, une liste ordonnée de comptes ; quand le compte actif approche sa limite, les tours suivants passent au compte suivant, et reviennent au primaire dès que sa fenêtre est remise à zéro."
+title: "Automatic switch to a secondary account, back to the primary after the reset"
+description: "For each provider, an ordered list of accounts; when the active account nears its limit, the following turns move to the next account, and return to the primary as soon as its window is reset."
 status: stable
 amended_by: ["0034-consommer-d-abord-ce-qui-expire.md"]
 tags: [budgets, forfaits, comptes, routage]
 decided_by: human:smichea
 decision_date: 2026-10-05
-attestation: "demande du propriétaire dans sa conversation avec mesh-design (80 % du forfait Claude sur 7 jours consommés) ; non signée"
+attestation: "owner request in his conversation with mesh-design (80% of the 7-day Claude plan consumed); unsigned"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-05T09:40:00+02:00" }
 ---
 
-# Décision
+# Decision
 
-1. Pour chaque fournisseur (Claude, Codex, DeepSeek, …), un hôte ou une équipe
-   déclare une **liste ordonnée de comptes** (primaire, secondaire, …). Chaque
-   compte a ses identifiants (secrets de l'hôte, jamais dans le canon) et ses
-   jauges.
-2. **Bascule automatique** : quand le compte actif atteint le seuil de la garde
-   de budget ([0019](0019-budgets-et-routage.md) : `min(90 %, part écoulée + 10
-   points)` pour un forfait, plafond ou solde pour un compte payé au token), les
-   **tours suivants** utilisent le compte suivant de la liste au lieu de mettre
-   les agents en pause. La pause ne survient que lorsque tous les comptes sont
-   au seuil.
-3. **Retour automatique** au compte primaire dès que sa fenêtre est remise à
-   zéro (ou son solde rechargé), au tour suivant.
-4. Jamais au milieu d'un tour ; chaque bascule est journalisée (événement, fil
-   de l'équipe) et visible dans `ameesh cost` et `ameesh progress`.
-5. La continuité des sessions est recherchée (même session reprise sous l'autre
-   compte quand le harnais le permet) ; sinon rotation avec résumé de reprise
+1. For each provider (Claude, Codex, DeepSeek, …), a host or a team
+   declares an **ordered list of accounts** (primary, secondary, …). Each
+   account has its credentials (host secrets, never in the canon) and its
+   gauges.
+2. **Automatic switch**: when the active account reaches the threshold of the
+   budget guard ([0019](0019-budgets-et-routage.md):
+   `min(90 %, elapsed share of the window + 10 points)` for a plan, cap or balance for a pay-per-token account), the
+   **following turns** use the next account in the list instead of pausing
+   the agents. The pause only happens when all accounts are
+   at the threshold.
+3. **Automatic return** to the primary account as soon as its window is reset
+   (or its balance topped up), at the next turn.
+4. Never in the middle of a turn; each switch is logged (event, team
+   thread) and visible in `ameesh cost` and `ameesh progress`.
+5. Session continuity is sought (same session resumed under the other
+   account when the harness allows it); otherwise rotation with a resume summary
    ([0025](0025-une-session-par-lot.md)).
 
-# Conséquences
+# Consequences
 
-- Lot L30. Le respect des conditions d'utilisation de chaque fournisseur pour
-  l'usage de plusieurs comptes reste de la responsabilité de l'équipe.
-- Les gestes de connexion à un compte (`/login`, `codex login`) restent
-  humains ; ameesh ne stocke ni ne copie de mot de passe.
+- Lot L30. Compliance with each provider's terms of use regarding the
+  use of several accounts remains the team's responsibility.
+- The account login steps (`/login`, `codex login`) remain
+  human; ameesh neither stores nor copies any password.

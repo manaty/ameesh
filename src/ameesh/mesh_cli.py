@@ -277,6 +277,11 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                                 "admissions": admissions.get(canon.id, 0)}
                                for canon, fiche in fiches],
                     "latest": latest,
+                    # L159d: the offer, and the common measure (study §1.4)
+                    # whose lendable capacity it caps
+                    "offer": limits.get("lend"),
+                    "measure": (res.measure(latest, limits.get("lend"))
+                                if latest is not None else None),
                     "pressure": verdict,
                     "history": history,
                     "housekeeping": menage,
@@ -304,6 +309,10 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                      _fmt_bytes(limits["min_disk_free"]), tag("min_disk_free"),
                      res.fmt_value("max_tmpfs_used", limits.get("max_tmpfs_used")),
                      tag("max_tmpfs_used")))
+            if limits.get("max_cpu_pressure") is not None:
+                print("  thresholds CPU pressure ≤ %s%s"
+                      % (res.fmt_value("max_cpu_pressure", limits["max_cpu_pressure"]),
+                         tag("max_cpu_pressure")))
             print("  état       mémoire %s ; swap %s ; charge %s ; disque %s ; tours %s"
                   % (_fmt_bytes(latest.get("mem_available_bytes")),
                      _fmt_bytes(latest.get("swap_used_bytes")),
@@ -321,6 +330,9 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                           if latest.get("battery_percent") is not None else "",
                           limits.get("min_battery_percent"),
                           limits.get("stop_battery_percent")))
+
+            for line in _host_measure_lines(latest, limits.get("lend")):
+                print(line)
 
             if verdict and verdict["breaches"]:
                 tag = "CRITIQUE" if verdict["critical"] else "PRESSION"
@@ -341,6 +353,36 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
         return 0
     finally:
         db.close()
+
+
+def _host_measure_lines(latest: dict, offer: dict | None) -> list[str]:
+    """`ameesh hosts` (L159d): PSI, application and guest shares, lendable
+    capacity; nothing for a reading without these measures."""
+    from . import resources as res
+
+    def pct(value) -> str:
+        return "—" if value is None else "%.1f %%" % float(value)
+
+    def cpus(value) -> str:
+        return "—" if value is None else "%.2f" % float(value)
+
+    out = []
+    if any(latest.get(column) is not None for column, _r, _l in res.PSI_FIELDS):
+        out.append("  PSI        cpu %s ; memory %s (full %s) ; io %s  (some, 60 s)" % (
+            pct(latest.get("psi_cpu_some")), pct(latest.get("psi_mem_some")),
+            pct(latest.get("psi_mem_full")), pct(latest.get("psi_io_some"))))
+    if latest.get("app_cpu") is not None or latest.get("guest_mem_bytes") is not None:
+        out.append("  shares     CPU application %s, guest %s of %s ; guest memory %s" % (
+            cpus(latest.get("app_cpu")), cpus(latest.get("guest_cpu")),
+            latest.get("cpu_count") or "—", _fmt_bytes(latest.get("guest_mem_bytes"))))
+    # without an offer the host lends nothing: show what it could lend
+    lent = res.offered(latest, offer if offer is not None else {})
+    if lent is not None:
+        out.append("  lendable   CPU %s ; memory %s ; disk %s  (%s)" % (
+            cpus(lent["cpu"]), _fmt_bytes(lent["memory_bytes"]),
+            _fmt_bytes(lent["disk_bytes"]),
+            "capped by the offer" if offer is not None else "no offer: lends nothing"))
+    return out
 
 
 def _host_menage(hk, host: str, policy, measure_row: dict | None,
