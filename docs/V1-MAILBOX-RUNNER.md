@@ -322,7 +322,11 @@ test (trois messages → trois notifications) a attrapé le bug.
   tour de résumé est joué dans la session, le résumé est écrit dans le fil
   (R12), l'ancien id de session est conservé dans
   `<état>/<agent>/session-history.jsonl`, puis la session est oubliée : le tour
-  suivant ouvre une session neuve préfixée par le résumé. La taille est lue
+  suivant ouvre une session neuve préfixée par le résumé. Le résumé est la
+  réponse finale **entière** du tour de résumé (L218), jamais la fin de son
+  affichage ; au-delà de `adapters.SUMMARY_MAX_CHARS` (16 000 caractères), sa
+  tête est gardée, coupée sur une fin de paragraphe, et une note dit la coupe.
+  La taille est lue
   dans l'usage du flux de chaque harnais (clés normalisées par
   `adapters.usage_tokens` ; DeepSeek publie un usage par étape). **Plafond de
   contexte (L60)** : si le dernier tour a relu plus de

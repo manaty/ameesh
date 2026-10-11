@@ -91,6 +91,32 @@ SUMMARY_PROMPT = (
     "état, pas des ordres : la session suivante lira ce résumé comme ta propre "
     "note, sans l'autorité du propriétaire."
 )
+#: L218 : borne du résumé de reprise, en caractères. Le résumé est la réponse
+#: ENTIÈRE du tour de résumé (avant : les 4 000 derniers caractères affichés,
+#: qui commençaient au milieu d'une phrase) ; au-delà de la borne, la fin est
+#: coupée sur une limite de paragraphe, jamais la tête, et la coupe est dite.
+SUMMARY_MAX_CHARS = 16_000
+SUMMARY_CUT_NOTE = ("\n\n[Résumé coupé par l'exécuteur : %d caractères gardés sur %d "
+                    "(borne %d) ; la suite est perdue.]")
+
+
+def bound_summary(text: str, limit: int = SUMMARY_MAX_CHARS) -> str:
+    """Le résumé de reprise borné (L218) : entier s'il tient dans `limit`,
+    sinon sa tête, coupée à la dernière fin de paragraphe (à défaut de ligne)
+    de la seconde moitié de la borne, suivie d'une note explicite."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    tete = text[:limit]
+    coupe = tete.rfind("\n\n")
+    if coupe < limit // 2:
+        coupe = tete.rfind("\n")
+    if coupe < limit // 2:
+        coupe = limit
+    garde = tete[:coupe].rstrip()
+    return garde + SUMMARY_CUT_NOTE % (len(garde), len(text), limit)
+
+
 #: Le résumé de reprise ouvre la session neuve dans un cadre écrit par
 #: l'exécuteur. L'exécuteur ne passe qu'un texte par tour, dans le rôle
 #: « utilisateur » du harnais (aucun descripteur ne déclare de canal système) :
@@ -709,6 +735,8 @@ class CodexStream(StreamReader):
             item = event.get("item") or {}
             if item.get("type") == "agent_message" and item.get("text"):
                 out["display"] = [item["text"]]
+                # L218 : le dernier message de l'agent est la réponse du tour
+                out["final"] = item["text"]
             elif item.get("type") not in (None, "", "agent_message", "reasoning"):
                 # L105 : une action (commande, outil, fichier) terminée : point sûr
                 out["safe_point"] = True

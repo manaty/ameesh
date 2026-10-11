@@ -113,9 +113,12 @@ def main() -> int:
             print(json.dumps(dict(fil, type="user", message={"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "outil-%d" % index,
                  "content": "ok"}]})), flush=True)
+    # L218 : AMEESH_TEST_RESULT, la réponse du tour (message et `result`)
+    reponse = os.environ.get("AMEESH_TEST_RESULT")
     print(json.dumps({"type": "assistant", "message": {"content": [
-        {"type": "text", "text": "bonjour du faux claude (session %s)" % session}]}}), flush=True)
-    print(json.dumps({"type": "result", "subtype": "success", "result": "fini",
+        {"type": "text", "text": reponse or "bonjour du faux claude (session %s)" % session}]}}),
+        flush=True)
+    print(json.dumps({"type": "result", "subtype": "success", "result": reponse or "fini",
                       "total_cost_usd": 0.0125, "session_id": session}), flush=True)
     return int(os.environ.get("AMEESH_TEST_EXIT", "0"))
 

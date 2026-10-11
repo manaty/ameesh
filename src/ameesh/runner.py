@@ -334,6 +334,10 @@ class AgentWorker(threading.Thread):
         self.session_tokens = 0.0
         self.last_turn_seconds = 0.0
         self.last_output = ""
+        #: L218 : réponse finale du dernier tour (`final` du flux), et, pour un
+        #: tour de résumé, tout son affichage (repli d'un flux sans `final`)
+        self.last_final = ""
+        self.summary_display: list[str] = []
         #: plafond de contexte (L60) : jetons d'entrée relus (cache compris) par
         #: le dernier tour inscrit au grand livre, et sa session
         self.last_turn_reread = 0
@@ -1035,11 +1039,12 @@ class AgentWorker(threading.Thread):
         return self.last_turn_reread_session in (None, session)
 
     def _session_history(self, session_id: str | None, resume: str) -> None:
-        """Garde l'ancien id de session et son résumé (audit, 0018)."""
+        """Garde l'ancien id de session et son résumé (audit, 0018) ; le
+        résumé entier, déjà borné par `adapters.bound_summary` (L218)."""
         entry = {
             "ts": time.time(), "session": session_id, "turns": self.session_turns,
             "tokens": self.session_tokens,
-            "last_turn_s": round(self.last_turn_seconds, 1), "resume": resume[:2000],
+            "last_turn_s": round(self.last_turn_seconds, 1), "resume": resume,
         }
         try:
             with open(self._path("session-history.jsonl"), "a", encoding="utf-8") as fh:
@@ -1081,6 +1086,14 @@ class AgentWorker(threading.Thread):
         return self._rotate("tours=%d, tokens=%.0f, dernier tour=%.0fs" % (
             self.session_turns, self.session_tokens, self.last_turn_seconds))
 
+    def turn_summary(self) -> str:
+        """Le résumé rendu par le dernier tour de résumé (L218) : sa réponse
+        finale entière (à défaut, tout son affichage), bornée par
+        `adapters.bound_summary` — jamais la fin de l'affichage, qui perdait
+        la tête du résumé et finissait sur « == fin du tour : »."""
+        texte = (self.last_final or "").strip() or "\n".join(self.summary_display)
+        return adapters.bound_summary(texte)
+
     def _rotate(self, raison: str) -> bool:
         """Le mécanisme de rotation (L11) : résumé dans la session, puis oubli."""
         ancienne = self.current_session()
@@ -1103,7 +1116,7 @@ class AgentWorker(threading.Thread):
                            "tentative plus tard.",
                            meta={"action": "rotation", "etat": "annulee"})
             return False
-        resume = (self.last_output or "").strip()
+        resume = self.turn_summary()
         if not resume:
             log_async("[%s] rotation annulée : résumé vide" % self.name)
             self._fil_note("Rotation de session annulée : résumé vide. L'ancienne "
@@ -2727,6 +2740,8 @@ class AgentWorker(threading.Thread):
         error: str | None = None
         result_code = 0
         self.last_output = ""
+        self.last_final = ""
+        self.summary_display = []
         # L105 : plafonds pendant le tour — jetons relus (une fois par appel)
         # et durée ; jamais sur un tour de résumé (rotation, bascule de compte)
         plafonne = spec.get("prompt") != adapters.SUMMARY_PROMPT
@@ -2836,6 +2851,10 @@ class AgentWorker(threading.Thread):
                     for text in parsed.get("display") or []:
                         log("[%s] %s" % (self.name, text))
                         self.last_output = (self.last_output + "\n" + text)[-4000:]
+                        if not plafonne and len(self.summary_display) < 10_000:
+                            self.summary_display.append(text)
+                    if parsed.get("final"):
+                        self.last_final = str(parsed["final"])
                     if plafonne and not clos:
                         appel = parsed.get("call_usage")
                         if isinstance(appel, dict):
