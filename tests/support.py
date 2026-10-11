@@ -108,6 +108,10 @@ os.environ["AMEESH_MAIL_BATCH"] = "0"
 #: de sources d'alimentation vide (« inconnu »), les tests de L106 posent le leur.
 os.environ["AMEESH_HARNESS_SEARCH"] = ""
 os.environ["AMEESH_SYSTEMCTL"] = ""
+#: L224 : les faux harnais n'écrivent aucune session sur disque ; la reprise
+#: d'un id inconnu du stockage du harnais n'est vérifiée que par les tests de
+#: L224, qui posent leur propre stockage
+os.environ["AMEESH_SESSION_STORE_CHECK"] = "0"
 EMPTY_POWER_SUPPLY = tempfile.mkdtemp(prefix="ameesh-test-power-")
 os.environ["AMEESH_POWER_SUPPLY_DIR"] = EMPTY_POWER_SUPPLY
 for _bin_var in ("AMEESH_CLAUDE_BIN", "AGENT_MESH_CLAUDE_BIN", "AMEESH_CODEX_BIN",

@@ -13,6 +13,8 @@ Aucun test ne touche le vrai /tmp : le « /tmp du système » est un dossier du
 bac à sable (`AMEESH_SYSTEM_TMP`)."""
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import subprocess
 import tempfile
@@ -163,6 +165,14 @@ class ActiviteTest(unittest.TestCase):
         self.assertIn("2 h", texte)
         self.assertIn("ameesh menage", menage.tmpfs_hint([], menage.Policy()))
         self.assertEqual(menage.fmt_idle(5400), "90 min")
+
+    def test_l_action_ne_promet_plus_la_suppression_d_une_entree_nouvelle(self):
+        """#234 : depuis #222, une entrée nouvelle de /tmp n'est jamais imputée
+        ni supprimée par le ménage ; l'action attendue ne le promet plus."""
+        texte = menage.tmpfs_hint([], menage.Policy())
+        self.assertNotIn("supprime seul une entrée laissée par un tour", texte)
+        self.assertIn("d'avant #222", texte)
+        self.assertIn("tmp_orphan", texte)
 
 
 class ConsigneTest(unittest.TestCase):
@@ -589,6 +599,60 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertIn("rm -rf -- ", top[0]["command"])
         dernier = storage.of(self.db).housekeeping.last_measure("pc")[0]["data"]
         self.assertEqual(dernier["system_tmp_top"][0]["path"], os.path.join(self.sys, "gros"))
+
+
+# ==========================================================================
+# #236 : les textes ne promettent plus la suppression (faux depuis #222)
+# ==========================================================================
+
+class TextesApres222Test(_Systeme, unittest.TestCase):
+    """#236 : depuis #222, une entrée de /tmp apparue pendant un tour n'est
+    jamais supprimée par ameesh ; le sort d'une entrée non attribuée, l'en-tête
+    de `ameesh menage` et la consigne de l'orchestrateur ne promettent plus sa
+    suppression."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="l236-")
+        self.addCleanup(subprocess.run, ["rm", "-rf", self.tmp], capture_output=True)
+        self.sys = self.systeme(self.tmp)
+        self.entree = os.path.join(self.sys, "clone-relecture")
+        _write(os.path.join(self.entree, "f"), 5000)
+
+    def test_sort_d_une_entree_non_attribuee(self):
+        st = os.lstat(self.entree)
+        ligne = {"path": self.entree, "action": "signaled", "agent": None,
+                 "data": {"ino": st.st_ino, "dev": st.st_dev}}
+        sort, raison = menage._orphan_verdict(
+            ligne, menage.Policy(), base=self.sys, registered={"a1"}, protected=set(),
+            running=set(), now=time.time() + 3 * HEURE)
+        self.assertEqual(sort, "garde")
+        self.assertIn("jamais supprimé par ameesh : %s" % menage.UNATTRIBUTED, raison)
+        self.assertNotIn("absent du registre", raison)
+
+    def test_l_en_tete_de_ameesh_menage(self):
+        connue = {"path": self.entree, "bytes": 5000, "agent": None, "status": "garde",
+                  "detail": "jamais supprimé par ameesh : %s" % menage.UNATTRIBUTED,
+                  "command": "rm -rf -- %s" % self.entree}
+        rapport = {"host": "pc", "dry_run": True, "entries": [], "plan": [], "skipped": [],
+                   "orphans": [connue],
+                   "measure": {"tmp_bytes": 0, "tmp_root": "t", "tmp_quota": 1,
+                               "cache_bytes": 0, "cache_quota": 1, "cache_root": "c",
+                               "system_tmp_top": [dict(connue, owner="u")]}}
+        sortie = io.StringIO()
+        with contextlib.redirect_stdout(sortie):
+            menage.print_report(rapport)
+        texte = sortie.getvalue()
+        self.assertNotIn("supprimées seules une fois abandonnées", texte)
+        self.assertIn("jamais supprimées par ameesh", texte)
+        self.assertNotIn("hors tour d'agent", texte)
+        self.assertIn("apparue pendant un tour, non attribuée : à décider", texte)
+
+    def test_la_consigne_de_l_orchestrateur(self):
+        racine = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(racine, "docs", "ORCHESTRATEUR.md"), encoding="utf-8") as fh:
+            texte = " ".join(fh.read().split())
+        self.assertNotIn("est supprimée par le ménage une fois inchangée", texte)
+        self.assertIn("jamais supprimée par ameesh", texte)
 
 
 if __name__ == "__main__":

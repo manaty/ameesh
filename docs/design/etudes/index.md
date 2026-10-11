@@ -1,14 +1,14 @@
-# Études
+# Studies
 
-* [Autorité humaine](autorite-humaine.md) - WebAuthn/passkeys, ce qui existe, la brique ameesh-approve à créer.
-* [Messagerie et annuaire](messagerie-annuaire.md) - Matrix, Zulip, Mattermost, Rocket.Chat comparés.
-* [Catalogue du travail](catalogue-du-travail.md) - Vues et propositions sur le canon OKF ; Forgejo ; outillage OKF.
-* [Métiers : SAV et transport](metiers-sav-transport.md) - Piles open source, agents hors code, actions irréversibles.
-* [Standards des harnais](standards-des-harnais.md) - MCP, skills, plugins, ACP ; entrant ; ameesh-gate.
-* [Boucle d'auto-réparation](boucle-auto-reparation.md) - Détection et réparation automatiques des bugs : circuit observé, limites, transposition.
-* [Constats modèles et effort (octobre 2026)](constats-modeles-2026-10.md) - Premières observations de l'orchestrateur Nexlink, base des tâches de référence.
-* [Comptes multiples](comptes-multiples.md) - Isoler un compte et ses sessions par harnais (Claude Code, Codex, DeepSeek Harness) ; reprise sous un autre compte ; base de L30.
-* [Persona et harnais](persona-et-harnais.md) - Identité, consignes et mémoire d'une persona à travers Claude Code, Codex, dsh et ACP ; mémoire intérimaire neutre ; lots proposés.
-* [Orchestration et vivacité](orchestration-et-vivacite.md) - Orchestrateur externe arrêté qui bloque un chantier : mode d'agent, attribution gardée, adoption et reprise, alertes poussées, délégation à échéance, cloisonnement des hooks ; lots L36–L41 proposés.
-* [Plusieurs canons](plusieurs-canons.md) - Ce qui casse quand deux canons partagent un hôte, le modèle par fédération, intérim pour Acme ; lots L42–L45.
-* [Exécuteur médié](executeur-mediee.md) - Exécuteur sur un appareil prêté sans accès à la base : backend de stockage distant (61 opérations, 38 écritures), fencing serveur, enrôlement P-256, inactivité Compute, relais de modèle ; lots L107–L115.
+* [Human authority](autorite-humaine.md) - WebAuthn/passkeys, what exists, the ameesh-approve building block to create.
+* [Messaging and directory](messagerie-annuaire.md) - Matrix, Zulip, Mattermost, Rocket.Chat compared.
+* [Work catalogue](catalogue-du-travail.md) - Views and proposals on the OKF canon; Forgejo; OKF tooling.
+* [Business domains: customer service and transport](metiers-sav-transport.md) - Open source stacks, non-code agents, irreversible actions.
+* [Harness standards](standards-des-harnais.md) - MCP, skills, plugins, ACP; inbound; ameesh-gate.
+* [Self-repair loop](boucle-auto-reparation.md) - Automatic bug detection and repair: observed pipeline, limits, transposition.
+* [Model and effort findings (October 2026)](constats-modeles-2026-10.md) - First observations from the Nexlink orchestrator, basis for the reference tasks.
+* [Multiple accounts](comptes-multiples.md) - Isolating an account and its sessions per harness (Claude Code, Codex, DeepSeek Harness); resuming under another account; basis for L30.
+* [Persona and harness](persona-et-harnais.md) - Identity, prompts and memory of a persona across Claude Code, Codex, dsh and ACP; neutral interim memory; proposed lots.
+* [Orchestration and liveness](orchestration-et-vivacite.md) - A stopped external orchestrator that blocks a project: agent mode, retained assignment, adoption and resumption, pushed alerts, deadline-based delegation, hook isolation; proposed lots L36–L41.
+* [Multiple canons](plusieurs-canons.md) - What breaks when two canons share a host, the federation model, interim for Acme; lots L42–L45.
+* [Mediated executor](executeur-mediee.md) - Executor without database access: remote storage, server fencing, P-256 enrollment, host availability and model relay; L107–L115.

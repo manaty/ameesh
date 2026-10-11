@@ -124,7 +124,7 @@ TYPE_LABELS = {
     "orphan_resource": "ressource orpheline",
     "tmpfs_full": "tmpfs presque plein",
     "worktree_kept": "worktree gardé en fin de lot",
-    "tmp_orphan": "entrée de /tmp laissée par un tour",
+    "tmp_orphan": "entrée de /tmp apparue pendant un tour",
     "plan_underused": "forfait sous-employé",
     "idle_capacity": "capacité au repos",
     "orchestrator_held": "orchestrateur tenu par une session",

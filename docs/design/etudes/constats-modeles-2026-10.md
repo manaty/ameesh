@@ -1,87 +1,87 @@
 ---
 type: Study
-title: "Constats sur les modèles et l'effort par type de lot (nuit du 3 au 4 octobre 2026)"
-description: "Premiers constats de l'orchestrateur Nexlink, à reprendre comme tâches de référence pour l'évaluation des modèles et des harnais."
+title: "Findings on models and effort per lot type (night of 3 to 4 October 2026)"
+description: "First findings from the Nexlink orchestrator, to be reused as reference tasks for evaluating models and harnesses."
 status: draft
 tags: [modeles, effort, evaluation, constats]
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T03:15:00+02:00" }
 sources:
-  - { resource: "message de l'orchestrateur Nexlink, 2026-10-04 02:38", title: "Constats transmis à mesh-design" }
+  - { resource: "message from the Nexlink orchestrator, 2026-10-04 02:38", title: "Findings passed on to mesh-design" }
 stale_after: 2026-11-04
 ---
 
-# Constats (observations, non mesurées)
+# Findings (observations, not measured)
 
-1. **Implémentation, DeepSeek « flash » en effort maximal** : bonne qualité,
-   mais tours longs et sessions qui saturent vite (après 5 ou 6 lots). Passé en
-   effort élevé pour l'implémentation courante ; maximal gardé pour le Rust natif.
-2. **Relecture sensible, Codex en effort moyen** (SQL, sécurité, natif) : très
-   efficace pour trouver de vrais défauts par sondes indépendantes (29 blocages
-   en 24 h, presque tous fondés), mais bloque aussi sur des détails (corrigé par
-   la revue proportionnée, [0018](../decisions/0018-vitesse-des-agents.md)).
-   Effort bas pour les relectures légères (docs, scripts).
-3. **Claude Opus** : revues SQL et sécurité, pilotage de recette ; **Sonnet en
-   effort moyen** pour le design et la relecture visuelle (à évaluer).
-4. **Lots de style ou d'UI** : la plus grosse perte est le relais designer →
-   implémenteur → relecteur ; le designer qui modifie lui-même va plus vite.
-5. **Les erreurs coûteuses viennent surtout des sessions longues** (contexte
-   compacté, consignes ratées), plus que du choix du modèle.
+1. **Implementation, DeepSeek "flash" at maximum effort**: good quality,
+   but long turns and sessions that saturate quickly (after 5 or 6 lots). Switched to
+   high effort for routine implementation; maximum kept for native Rust.
+2. **Sensitive review, Codex at medium effort** (SQL, security, native): very
+   effective at finding real defects through independent probes (29 blocks
+   in 24 h, almost all well-founded), but also blocks on details (fixed by
+   proportionate review, [0018](../decisions/0018-vitesse-des-agents.md)).
+   Low effort for light reviews (docs, scripts).
+3. **Claude Opus**: SQL and security reviews, acceptance testing lead; **Sonnet at
+   medium effort** for design and visual review (to be evaluated).
+4. **Style or UI lots**: the biggest loss is the designer →
+   implementer → reviewer handoff; a designer who makes the changes themselves is faster.
+5. **Costly errors come mostly from long sessions** (compacted
+   context, missed prompts), more than from the choice of model.
 
-# Tâches de référence suggérées
+# Suggested reference tasks
 
-Petites retouches d'UI avec capture ; correctifs SQL avec sondes de privilèges ;
-défauts natifs reproduits sur banc ; relectures avec contre-exemples connus
-(les blocages de revue de la nuit, avec leur sonde, en sont une source prête).
+Small UI tweaks with screenshot; SQL fixes with privilege probes;
+native defects reproduced on a test bench; reviews with known counterexamples
+(the night's review blocks, with their probe, are a ready source).
 
-# Mesures et leçons (03:28)
+# Measurements and lessons (03:28)
 
-- Après les règles de vitesse : délai travail → fusion maximal passé de 100 min
-  (fenêtre 01:25–02:25, 8 fusions) à 21 min (02:25–03:25, 6 fusions) ; petit
-  échantillon. Ce qui a porté : revue proportionnée, rotation des sessions
-  saturées avec résumé, pouls automatique (un tour de 67 min passé à attendre
-  une suite complète), mode rapide des relecteurs.
-- **Rejeu d'évaluation contaminé** : un rejeu en DeepSeek flash effort bas
-  (6,5 min, ≈ 0,15 $, tests verts, note 9/10) avait accès à la solution de
-  référence par le worktree (diff identique). Exigence : rejouer dans un dépôt
-  **isolé** (archive git + init, sans historique ni remote), sans accès au
-  board ni aux autres worktrees.
+- After the speed rules: maximum work → merge delay went from 100 min
+  (window 01:25–02:25, 8 merges) to 21 min (02:25–03:25, 6 merges); small
+  sample. What made the difference: proportionate review, rotation of saturated
+  sessions with summary, automatic pulse (a 67-min turn spent waiting for
+  a full suite), reviewers' fast mode.
+- **Contaminated evaluation replay**: a replay with DeepSeek flash at low effort
+  (6.5 min, ≈ $0.15, green tests, score 9/10) had access to the reference
+  solution through the worktree (identical diff). Requirement: replay in an
+  **isolated** repository (git archive + init, without history or remote), without access to the
+  board or to the other worktrees.
 
-# Premier rejeu isolé (03:46)
+# First isolated replay (03:46)
 
-Lot de référence : correctif mobile JS d'environ 400 lignes avec tests, rejoué
-dans un dépôt isolé.
+Reference lot: JS mobile fix of about 400 lines with tests, replayed
+in an isolated repository.
 
-| Configuration | Durée | Coût | Qualité (relecteur) |
+| Configuration | Duration | Cost | Quality (reviewer) |
 |---|---|---|---|
-| DeepSeek flash, effort bas | 9 min 40 | ≈ 0,32 $ (56k entrée, 3,9M cache, 32k sortie) | 8/10, OK avec détails |
-| DeepSeek flash, effort élevé (référence) | ≈ 9 min | comparable | ≈ 9/10, OK avec un détail |
+| DeepSeek flash, low effort | 9 min 40 | ≈ $0.32 (56k input, 3.9M cache, 32k output) | 8/10, OK with details |
+| DeepSeek flash, high effort (reference) | ≈ 9 min | comparable | ≈ 9/10, OK with one detail |
 
-Conclusion provisoire : sur ce type de lot, **l'effort bas ne fait pas gagner de
-temps réel** (temps dominé par les outils — installation, tests, typage — et la
-lecture du code), coûte à peu près pareil (le cache domine) et perd environ un
-point de qualité. **Effort élevé par défaut pour l'implémentation** ; effort bas
-seulement quand le raisonnement domine (petites tâches sans suite de tests
-lourde). Le levier de vitesse est ailleurs : tests ciblés, sessions courtes,
-revue par risque. À confirmer sur d'autres paires (Rust, SQL). Outil de
-référence : `~/.local/bin/nexlink-rd`.
+Provisional conclusion: on this lot type, **low effort does not save
+real time** (time dominated by tools — installation, tests, type checking — and
+reading the code), costs about the same (cache dominates) and loses about one
+quality point. **High effort by default for implementation**; low effort
+only when reasoning dominates (small tasks without a heavy test
+suite). The speed lever lies elsewhere: targeted tests, short sessions,
+risk-based review. To be confirmed on other pairs (Rust, SQL). Reference
+tool: `~/.local/bin/nexlink-rd`.
 
-# Second rejeu isolé (05:13)
+# Second isolated replay (05:13)
 
-Lot léger (traductions et tests) : DeepSeek flash en effort bas, 14 min, tests
-verts, diff de 850 lignes contre 543 pour la référence (plus verbeux) ; la
-référence en effort élevé avait pris environ 14 min. Aucun gain de délai :
-**l'effort bas est écarté pour l'implémentation** (critère
+Light lot (translations and tests): DeepSeek flash at low effort, 14 min, green
+tests, 850-line diff versus 543 for the reference (more verbose); the
+reference at high effort had taken about 14 min. No gain in lead time:
+**low effort is ruled out for implementation** (criterion
 [0023](../decisions/0023-critere-d-adoption-des-reglages.md)).
 
-# Revue de code par un modèle bon marché (17:40)
+# Code review by a cheap model (17:40)
 
-Rejeu isolé d'une revue réelle (lot bloqué par le relecteur Codex sur 2 défauts),
-avec DeepSeek flash en effort élevé : 6 min 17 s, ≈ 55k tokens en entrée (1,9M en
-cache) et 34k en sortie, une fraction de dollar. **Il retrouve les 2 défauts de
-référence**, avec la même analyse et des sondes exécutables ; il ajoute 1 faux
-positif (dû à une politique du projet qu'il ignorait) et 1 remarque juste non
-bloquante. Conclusion provisoire : **rappel égal, précision un peu moindre** sur
-cet échantillon. Suite : pilote en **double revue** sur des lots de classe
-normale avant tout transfert de responsabilité ; les revues sensibles restent
-aux relecteurs Codex et Claude. Implication pour ameesh : la politique du projet
-doit être fournie au relecteur (canon), pour éviter les faux positifs de ce type.
+Isolated replay of a real review (lot blocked by the Codex reviewer on 2 defects),
+with DeepSeek flash at high effort: 6 min 17 s, ≈ 55k input tokens (1.9M
+cached) and 34k output, a fraction of a dollar. **It finds the 2 reference
+defects**, with the same analysis and executable probes; it adds 1 false
+positive (due to a project policy it was unaware of) and 1 correct non-blocking
+remark. Provisional conclusion: **equal recall, slightly lower precision** on
+this sample. Next: pilot in **double review** on normal-class
+lots before any transfer of responsibility; sensitive reviews remain
+with the Codex and Claude reviewers. Implication for ameesh: the project policy
+must be provided to the reviewer (canon), to avoid false positives of this kind.
