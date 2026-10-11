@@ -23,6 +23,11 @@ forfait, `api-key` = au token) ; à défaut, des descripteurs de harnais
 (`paid_per_token`). La dépense 24 h est celle du grand livre `turn_costs` :
 réelle au token, ESTIMÉE pour un forfait.
 
+En tête (L124) : les demandes de décision qui attendent l'humain qui lit
+(« 3 décisions t'attendent, la plus ancienne depuis 2h05 ») ; pour un agent,
+celles qui attendent un humain. Le chat du propriétaire (L123) n'est pas un
+agent de projet : il n'apparaît pas dans les groupes.
+
 Une seule lecture de base (`storage.of(db).projects.board`, une requête).
 Le JSON suit le schéma `ameesh-projects/1` (docs/EXPLOITATION.md) ; la même
 vue est en tête de `ameesh progress` (clé `projects`).
@@ -167,10 +172,17 @@ def build_agent(row: dict, now: float, paid_harnesses=None) -> dict:
 
 
 def build(board: dict, *, now: float | None = None, project: str | None = None,
-          paid_harnesses=None, max_lots: int = MAX_LOTS) -> dict:
-    """La vue `ameesh-projects/1` depuis la lecture `projects.board`."""
+          paid_harnesses=None, max_lots: int = MAX_LOTS, viewer: str | None = None) -> dict:
+    """La vue `ameesh-projects/1` depuis la lecture `projects.board`.
+
+    `viewer` (L124) : l'humain qui lit (`human:<id>`), pour l'en-tête des
+    décisions qui l'attendent ; None : celles qui attendent un humain."""
+    from . import decisions as decisions_mod
+    from .chat import is_chat_agent
+
     now = time.time() if now is None else float(now)
-    rows = list(board.get("agents") or [])
+    # L123 : le chat du propriétaire n'est l'agent d'aucun projet
+    rows = [r for r in board.get("agents") or [] if not is_chat_agent(r)]
     lot_rows = list(board.get("lots") or [])
     agents = [build_agent(r, now, paid_harnesses) for r in rows]
     by_name = {a["name"]: a for a in agents}
@@ -247,20 +259,37 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
         "projects": projects,
         "truncated": ({"lots": {"shown": len(lot_rows), "total": total, "limit": int(max_lots)}}
                       if total > len(lot_rows) else {}),
+        # L124 : demandes de décision en attente (en-tête)
+        "decisions": decisions_mod.board_summary(board.get("decisions") or [], viewer=viewer,
+                                                 now=now),
     }
 
 
 def snapshot(db, *, project: str | None = None, now: float | None = None,
-             paid_harnesses=None, max_lots: int = MAX_LOTS) -> dict:
+             paid_harnesses=None, max_lots: int = MAX_LOTS, viewer: str | None = None) -> dict:
     """Lit la base (UNE requête) et rend la vue `ameesh-projects/1`."""
     board = storage.of(db).projects.board(max_lots=max_lots)
-    for key in ("agents", "lots"):
+    for key in ("agents", "lots", "decisions"):
         if isinstance(board.get(key), str):      # pilote qui rend le json brut
             board[key] = json.loads(board[key])
     if paid_harnesses is None:
         paid_harnesses = _paid_harnesses()
     return build(board, now=now, project=project, paid_harnesses=paid_harnesses,
-                 max_lots=max_lots)
+                 max_lots=max_lots, viewer=viewer)
+
+
+def viewer_of_session() -> str | None:
+    """L124 : l'humain qui lit la vue — `human:<utilisateur>` hors session
+    d'agent ; None dans la session d'un agent (l'en-tête dit alors les
+    décisions qui attendent un humain). Le chat du propriétaire lit pour lui."""
+    import os
+    from . import decisions as decisions_mod
+    chat = os.environ.get(decisions_mod.CHAT_ENV)
+    if os.environ.get("AGENT_MAIL_NAME") and not chat:
+        return None
+    if any(os.environ.get(key) for key in decisions_mod.RUNNER_ENV):
+        return None
+    return decisions_mod.current_human()
 
 
 # --------------------------------------------------------------------------
@@ -415,7 +444,11 @@ def format_text(view: dict, width: int | None = None, *, show_inactive: bool = F
         agents, lots)
     if width is None:
         width = shutil.get_terminal_size((100, 24)).columns
-    lines = textwrap.wrap(title, max(36, min(int(width), 160)), subsequent_indent="  ")
+    width = max(36, min(int(width), 160))
+    from . import decisions as decisions_mod
+    head = decisions_mod.headline(view.get("decisions"), view["generated_ts"])
+    lines = textwrap.wrap(head, width, subsequent_indent="  ") if head else []
+    lines += textwrap.wrap(title, width, subsequent_indent="  ")
     return "\n".join(lines + [""] + format_lines(view, width, show_inactive=show_inactive))
 
 
@@ -441,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
         db = db_mod.connect(cfg)
         try:
             db_mod.require_schema(db)
-            view = snapshot(db, project=args.project)
+            view = snapshot(db, project=args.project, viewer=viewer_of_session())
         finally:
             db.close()
     except db_mod.SchemaMissing as exc:

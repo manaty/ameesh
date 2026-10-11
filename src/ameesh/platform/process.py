@@ -186,6 +186,38 @@ def alive(pid: int) -> bool:
     return True
 
 
+def environ(pid: int | None = None) -> dict | None:
+    """L124 : l'environnement INITIAL du processus `pid` (défaut : le
+    processus courant), celui qu'il a reçu à son lancement — une variable
+    retirée ensuite par le processus y reste.
+
+    None si le processus n'existe plus ou n'est pas lisible (autre
+    utilisateur, droits refusés) : l'appelant le tient pour inconnu.
+    `NotAvailable` si l'OS ne permet pas de lire l'environnement d'un
+    processus du tout (ni psutil, ni /proc)."""
+    current = os.getpid() if pid is None else int(pid)
+    ps = _psutil()
+    if ps is not None:
+        try:
+            return dict(ps.Process(current).environ())
+        except Exception:  # disparu, refusé, zombie : inconnu, jamais inventé
+            return None
+    if not _proc_ok():
+        raise NotAvailable("environnement d'un processus",
+                           "ni psutil ni /proc pour lire l'environnement d'un processus")
+    try:
+        with open(os.path.join(PROC, str(current), "environ"), "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    out: dict = {}
+    for chunk in data.split(b"\0"):
+        key, sep, value = chunk.partition(b"=")
+        if sep and key:
+            out[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return out
+
+
 def open_fd_count() -> int:
     """Nombre de descripteurs ouverts par ce processus (POSIX)."""
     ps = _psutil()

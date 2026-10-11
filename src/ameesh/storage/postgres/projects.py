@@ -2,13 +2,15 @@
 """Pilote Postgres : lecture de la vue par projet (`ameesh projects`, L62).
 
 Une seule instruction, un seul aller-retour : les agents (état, non-lus, lot
-en cours, dépense 24 h) et les lots ouverts sont agrégés en deux tableaux
-JSON dans une même ligne. Lecture seule, sans migration ; les deux pilotes
-(psql, psycopg) rendent les colonnes `json` déjà décodées.
+en cours, dépense 24 h), les lots ouverts et (L124) les demandes de décision
+en attente sont agrégés en trois tableaux JSON dans une même ligne. Lecture
+seule, sans migration ; les deux pilotes (psql, psycopg) rendent les colonnes
+`json` déjà décodées.
 """
 from __future__ import annotations
 
 from .. import interface
+from .decisions import PENDING_BOARD_SQL
 
 #: états de lot terminés (même liste que `work_items` ailleurs)
 _CLOSED = "('merged', 'promoted', 'closed')"
@@ -90,8 +92,11 @@ WITH unread AS (
 SELECT (SELECT coalesce(json_agg(agents ORDER BY agents.name), '[]'::json) FROM agents)
            AS agents,
        (SELECT coalesce(json_agg(lots ORDER BY lots.updated_ts DESC, lots.id DESC),
-                        '[]'::json) FROM lots) AS lots
-""".replace("__CLOSED__", _CLOSED)
+                        '[]'::json) FROM lots) AS lots,
+       -- L124 : les demandes de décision en attente (ligne d'en-tête de la vue)
+       (SELECT coalesce(json_agg(d ORDER BY d.id), '[]'::json) FROM (__DECISIONS__) d)
+           AS decisions
+""".replace("__CLOSED__", _CLOSED).replace("__DECISIONS__", PENDING_BOARD_SQL)
 
 
 class Projects(interface.Projects):
@@ -99,4 +104,5 @@ class Projects(interface.Projects):
     def board(self, *, max_lots) -> dict:
         rows = self.db.query(_BOARD_SQL, (int(max_lots),))
         row = rows[0] if rows else {}
-        return {"agents": list(row.get("agents") or []), "lots": list(row.get("lots") or [])}
+        return {"agents": list(row.get("agents") or []), "lots": list(row.get("lots") or []),
+                "decisions": list(row.get("decisions") or [])}

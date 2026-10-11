@@ -50,5 +50,6 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-ameesh = ["migrations/*.sql", "progress_page.html", "harness_descriptors/*.json"]
+ameesh = ["migrations/*.sql", "progress_page.html", "harness_descriptors/*.json",
+          "consignes/*.md"]
 "ameesh.approve" = ["static/*.js", "static/*.css"]

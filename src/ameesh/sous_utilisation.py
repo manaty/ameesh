@@ -312,7 +312,10 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None) -> list:
             since_s=ASSIGNERS_SINCE_S)}
     except Exception:
         pass
-    return sorted(n for n in found if n in names)
+    # L123 : le chat du propriétaire transmet, il ne répartit pas
+    from .chat import is_chat_agent
+    chats = {row["name"] for row in listing if is_chat_agent(row)}
+    return sorted(n for n in found if n in names and n not in chats)
 
 
 def orchestrator_held(listing: list, now: float, orchestras: list, *,
@@ -353,6 +356,8 @@ def idle_agents(listing: list, now: float, idle_s: float) -> list:
     `idle_capacity`, `backlog_empty` et la prise automatique (L119)."""
     idle = []
     for row in listing:
+        # un agent `externe` n'est jamais compté — dont le chat du
+        # propriétaire (L123), qui n'a ni exécuteur ni lot
         if (row.get("mode") or "execute") != "execute" or _state(row) != "idle":
             continue
         if not _awake_runner(row) or int(row.get("unread") or 0):

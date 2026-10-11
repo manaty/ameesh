@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""ameesh action | decisions — actions sous porte (spec §7) et file des décisions (C10).
+"""ameesh action | decisions — actions sous porte (spec §7) et file des décisions (C10, L124).
 
   ameesh action propose --connector C --operation O --project P --target T
                         [--args JSON | --args-file F] [--class C] [--amount N --currency EUR]
@@ -23,7 +23,9 @@
   ameesh action replace <id> --receipt F [--by NOM]   (décision qui assume le doublon)
   ameesh action cancel <id> [--note TEXTE] [--by NOM]
   ameesh action recover [--grace S]         lancements interrompus → issue inconnue
-  ameesh decisions [--for human:ID] [--json]
+  ameesh decisions [--for human:ID] [--all] [--json]
+        demandes de décision des agents (L124, `ameesh decide`), actions à
+        approuver, issues inconnues, lots en attente d'un humain
 
 Vérification des reçus : `--rp-id`, `--origin` (défauts AMEESH_APPROVE_RP_ID,
 AMEESH_APPROVE_ORIGINS), `--allow-facade`, `--level`. Connecteurs :
@@ -471,20 +473,40 @@ def cmd_recover(cfg: Config, args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 
 def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
+    from . import decisions as decisions_mod
+    now = time.time()
     db = _open(cfg)
     try:
         queue = actions.decisions(db, human=args.for_human)
+        # L124 : les demandes de décision des agents, tous projets confondus
+        requests = decisions_mod.queue(db, human=args.for_human, include_closed=args.all,
+                                       now=now)
     finally:
         db.close()
+    queue["requests"] = requests["pending"]
+    if args.all:
+        queue["requests_closed"] = requests["closed"]
     if args.json:
         _dump(queue)
         return 0
-    total = sum(len(queue[key]) for key in ("approvals", "unknown", "interrupted", "waiting_human"))
+    # un lot tenu par une demande est montré avec elle, pas deux fois
+    held = {r["lot"] for r in queue["requests"]}
+    waiting = [item for item in queue["waiting_human"] if item["id"] not in held]
+    total = len(queue["requests"]) + len(waiting) + sum(
+        len(queue[key]) for key in ("approvals", "unknown", "interrupted"))
     who = " pour %s" % args.for_human if args.for_human else ""
     if not total:
         print("aucune décision en attente%s" % who)
+    else:
+        print("%d décision(s) en attente%s" % (total, who))
+    if queue["requests"]:
+        print("\ndemandes des agents (la plus ancienne d'abord) :")
+        for view in queue["requests"]:
+            for line in decisions_mod.format_view(view, now):
+                print("  " + line)
+    if not total:
+        _closed_requests(queue.get("requests_closed") or [], now)
         return 0
-    print("%d décision(s) en attente%s" % (total, who))
     if queue["approvals"]:
         print("\nactions à approuver :")
         for row in queue["approvals"]:
@@ -495,12 +517,24 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
         for row in queue["unknown"] + queue["interrupted"]:
             print("  " + _line(row))
             print("      %s" % row["hint"])
-    if queue["waiting_human"]:
+    if waiting:
         print("\nlots en attente d'un humain :")
-        for item in queue["waiting_human"]:
+        for item in waiting:
             print("  #%-5d %-12s %s" % (item["id"], (item.get("assignee") or "—")[:12],
                                         item["title"][:70]))
+    _closed_requests(queue.get("requests_closed") or [], now)
     return 0
+
+
+def _closed_requests(rows: list[dict], now: float) -> None:
+    """`--all` : les demandes répondues ou retirées, les plus récentes d'abord."""
+    if not rows:
+        return
+    from . import decisions as decisions_mod
+    print("\ndemandes répondues ou retirées (les plus récentes d'abord) :")
+    for view in rows:
+        for line in decisions_mod.format_view(view, now):
+            print("  " + line)
 
 
 # --------------------------------------------------------------------------
@@ -640,6 +674,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_dec = sub.add_parser("decisions", help="file des décisions humaines")
     p_dec.add_argument("--for", dest="for_human", default=None, metavar="human:ID")
+    p_dec.add_argument("--all", action="store_true",
+                       help="aussi les demandes répondues ou retirées (les plus récentes)")
     p_dec.add_argument("--json", action="store_true")
     p_dec.set_defaults(func=cmd_decisions)
     return parser

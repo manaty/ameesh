@@ -71,7 +71,10 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_mail",
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
-                 "host_not_ready", "host_power_low", "backlog_empty")
+                 "host_not_ready", "host_power_low", "backlog_empty",
+                 # L124 : une demande de décision attend le propriétaire, et sa
+                 # relance à l'échéance (urgentes si la demande l'est)
+                 "decision_pending", "decision_overdue")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -117,9 +120,15 @@ TYPE_LABELS = {
     "host_not_ready": "hôte non prêt",
     "host_power_low": "batterie faible de l'hôte",
     "backlog_empty": "file d'amélioration vide",
+    "decision_pending": "décision attendue",
+    "decision_overdue": "décision sans réponse à l'échéance",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired")
+#: L124 : types dont la résolution n'est pas envoyée — une décision se résout
+#: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
+#: redire serait du bruit. La résolution est journalisée.
+QUIET_RESOLUTION_TYPES = ("decision_pending", "decision_overdue")
 
 _TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -385,6 +394,8 @@ def _subject(alert: dict) -> str:
             parts.append("fenêtre %s" % _clean(alert["gauge"], 32))
     if alert.get("agent"):
         parts.append("agent %s" % _clean(alert["agent"], 64))
+    if alert.get("decision") is not None:
+        parts.append("décision #%s" % alert["decision"])
     if alert.get("lot") is not None:
         lot = "lot #%s" % alert["lot"]
         if alert.get("title"):
@@ -826,7 +837,9 @@ _KEPT = ("type", "agent", "lot", "title", "host", "since", "detail", "reason", "
          "responsible", "stop_reason", "assignee", "harness", "account", "gauge",
          "provider", "currency", "urgent",
          # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
-         "commitment", "package", "due")
+         "commitment", "package", "due",
+         # L124 : `decision_pending`, `decision_overdue`
+         "decision")
 
 
 # --------------------------------------------------------------------------
@@ -994,6 +1007,10 @@ class Notifier:
     def _resolved(self, key: str, entry: dict, now: float) -> None:
         alert, human = entry["alert"], entry.get("human")
         status = entry.get("status")
+        if alert.get("type") in QUIET_RESOLUTION_TYPES:
+            # L124 : l'humain a répondu (ou la demande est retirée) : rien à envoyer
+            self._record("resolved", entry, "sans_envoi", {})
+            return
         if status in ("sans_destinataire", "sans_canal", "nouvelle"):
             self.log("alerte résolue [%s] %s (jamais envoyée : %s)" % (
                 alert.get("type"), _subject(alert), status.replace("_", " ")))
