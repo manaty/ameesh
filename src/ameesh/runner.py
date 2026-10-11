@@ -1167,9 +1167,8 @@ class AgentWorker(threading.Thread):
         reviendra pas au délégant. L157 : le même tour date le début mesuré
         des lots assignés à cet agent qui n'en ont pas. Jamais bloquant pour
         le tour."""
-        from . import work as work_mod
-
         from . import estimates
+        from . import work as work_mod
 
         lots = {str(spec["lot"])} if spec.get("lot") else set()
         try:
