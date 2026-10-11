@@ -1075,23 +1075,45 @@ class HarnessAdapter:
         permission_mode=…`), puis les variables du descripteur
         (`AMEESH_CLAUDE_PERMISSION_MODE`), puis son défaut (`auto` pour Claude :
         le classifieur garde les garde-fous sur les secrets, la configuration
-        persistante et la prod). Un mode que l'aide du binaire installé ne cite
-        pas (version trop ancienne) cède la place au repli du descripteur
-        (`acceptEdits`). Un mode mal formé est ignoré, jamais passé tel quel.
+        persistante et la prod). Seuls les modes de la liste blanche du
+        descripteur (`choices`) sont retenus, et ceux de `explicit_only`
+        (`bypassPermissions`) seulement par le réglage de l'agent : un autre
+        est écarté avec un avertissement. Le mode retenu n'est passé que si
+        l'aide du binaire installé le cite parmi les choix de l'option ; sinon
+        (version trop ancienne, aide illisible ou expirée) il cède la place au
+        repli du descripteur (`acceptEdits`).
         """
         regle = self.descriptor.interactive_permission
         if not regle:
             return ""
+        choix, reserves = regle.get("choices") or (), regle.get("explicit_only") or ()
         mode = ""
-        for valeur in (explicit, *(os.environ.get(n) for n in regle["env"])):
+        sources = [("réglage de l'agent", explicit)]
+        sources += [(n, os.environ.get(n)) for n in regle["env"]]
+        for rang, (origine, valeur) in enumerate(sources):
             valeur = (valeur or "").strip()
-            if valeur and harnesses.PERMISSION_MODE_RE.match(valeur):
-                mode = valeur
-                break
+            if not valeur:
+                continue
+            refus = ""
+            if not harnesses.PERMISSION_MODE_RE.match(valeur) \
+                    or (choix and valeur not in choix):
+                refus = "mode inconnu"
+            elif valeur in reserves and rang > 0:
+                refus = "réservé au réglage de l'agent (ameesh set)"
+            if refus:
+                print("ameesh : mode de permission %r ignoré (%s : %s), mode par défaut"
+                      % (valeur, origine, refus), file=sys.stderr)
+                continue
+            mode = valeur
+            break
         mode = mode or regle["default"]
-        if mode and regle["fallback"] and mode != regle["fallback"] \
-                and not _help_mentions(self.binary, mode):
-            return regle["fallback"]
+        if mode and regle["fallback"] and mode != regle["fallback"]:
+            try:
+                connus = _help_choices(self.binary, _flag_name(regle["flag"]))
+            except Exception:  # noqa: BLE001 — l'aide ne doit jamais faire échouer l'attach
+                connus = None
+            if connus is None or mode not in connus:
+                return regle["fallback"]
         return mode
 
     def env(self) -> dict[str, str]:
@@ -1113,26 +1135,56 @@ class HarnessAdapter:
         return self.reader.parse(line)
 
 
-#: aide des binaires déjà lue (L223) : un `--help` par binaire et par processus
-_HELP_CACHE: dict[str, str | None] = {}
+#: choix lus dans l'aide des binaires (L223) : un `--help` par binaire et par
+#: processus ; None = aide illisible, expirée ou sans liste de choix
+_HELP_CACHE: dict[tuple[str, str], frozenset[str] | None] = {}
 
 
-def _help_mentions(binary: str, mode: str) -> bool:
-    """L'aide du binaire cite-t-elle ce mode (`"auto"`) ? Vrai si elle est
-    illisible : on ne rabat pas un mode sur la foi d'une aide absente, le
-    harnais refusera lui-même un mode inconnu au lancement."""
-    if binary not in _HELP_CACHE:
+def _flag_name(flag: Sequence[str]) -> str:
+    """L'option qui porte le mode (`--permission-mode`) dans le gabarit du drapeau."""
+    for i, part in enumerate(flag):
+        if "{mode}" in part:
+            avant = part.split("{mode}")[0].rstrip("=")
+            return avant if avant else (flag[i - 1] if i else "")
+    return ""
+
+
+def _help_choices(binary: str, option: str) -> frozenset[str] | None:
+    """Les choix que l'aide du binaire donne pour `option` (bloc « choices: … »
+    de cette seule option), None si l'aide est illisible, expirée ou muette."""
+    cle = (binary, option)
+    if cle not in _HELP_CACHE:
+        _HELP_CACHE[cle] = None
         try:
-            proc = subprocess.run([binary, "--help"], capture_output=True, text=True,
+            proc = subprocess.run([binary, "--help"], capture_output=True,
                                   timeout=10, stdin=subprocess.DEVNULL)
-            _HELP_CACHE[binary] = proc.stdout + proc.stderr if proc.returncode == 0 else None
-        except (OSError, subprocess.SubprocessError):
-            _HELP_CACHE[binary] = None
-    texte = _HELP_CACHE[binary]
-    if not texte:
-        return True
-    return re.search(r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])" % re.escape(mode), texte) \
-        is not None
+        except Exception:  # noqa: BLE001 — OSError, expiration, etc.
+            return None
+        if proc.returncode != 0 or not option:
+            return None
+        texte = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+        _HELP_CACHE[cle] = _option_choices(texte, option)
+    return _HELP_CACHE[cle]
+
+
+def _option_choices(texte: str, option: str) -> frozenset[str] | None:
+    """Les choix entre guillemets du bloc « (choices: …) » de `option`, cherché
+    de la ligne de l'option jusqu'à la suivante (ligne commençant par `-`)."""
+    lignes = texte.splitlines()
+    motif = re.compile(r"^\s*(?:-\w,\s*)?%s(?![A-Za-z0-9_-])" % re.escape(option))
+    for i, ligne in enumerate(lignes):
+        if not motif.match(ligne):
+            continue
+        bloc = [ligne]
+        for suite in lignes[i + 1:]:
+            if re.match(r"^\s*-", suite):
+                break
+            bloc.append(suite)
+        trouve = re.search(r"choices:\s*([^)]*)\)", " ".join(bloc))
+        if not trouve:
+            return None
+        return frozenset(re.findall(r'"([^"]+)"', trouve.group(1))) or None
+    return None
 
 
 def supports_tier(harness: str, host_dir: str | None = None) -> bool:

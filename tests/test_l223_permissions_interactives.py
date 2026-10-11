@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import unittest
 from unittest import mock
 
@@ -75,8 +76,53 @@ class ModeDePermissionTest(unittest.TestCase):
             '"bypassPermissions", "default", "plan")'))
         self.assertEqual(claude.interactive_command()[1:], ["--permission-mode", "acceptEdits"])
 
-    def test_aide_illisible_garde_le_mode(self):
-        self.assertTrue(adapters._help_mentions("/chemin/absent/claude", "auto"))
+    def test_liste_blanche_des_modes(self):
+        # verdict codex #182 (1) : un mode bien formé mais inconnu est écarté,
+        # même quand l'aide est illisible ; bypassPermissions seulement par
+        # le réglage explicite de l'agent
+        claude = self._claude(**{VARIABLE: "notAMode"})
+        self.assertEqual(claude.interactive_command()[1:], ["--permission-mode", "auto"])
+        adapters._HELP_CACHE.clear()
+        with mock.patch.object(adapters.subprocess, "run", side_effect=OSError("absent")):
+            self.assertEqual(claude.permission_mode(), "acceptEdits")
+            self.assertEqual(claude.permission_mode("notAMode"), "acceptEdits")
+        adapters._HELP_CACHE.clear()
+        claude = self._claude(**{VARIABLE: "bypassPermissions"})
+        self.assertEqual(claude.permission_mode(), "auto")
+        self.assertEqual(claude.permission_mode("bypassPermissions"), "bypassPermissions")
+
+    def test_auto_cherche_dans_les_choix_de_l_option_seulement(self):
+        # verdict codex #182 (2) : « auto » ailleurs dans l'aide ne compte pas
+        claude = self._claude(AMEESH_TEST_CLAUDE_HELP=(
+            '  --auto-update             Enable auto updates\n'
+            '  --permission-mode <mode>  Permission mode\n'
+            '                            (choices: "acceptEdits", "plan")\n'
+            '  --model <model>           e.g. "auto"'))
+        self.assertEqual(claude.permission_mode(), "acceptEdits")
+        adapters._HELP_CACHE.clear()
+        claude = self._claude(AMEESH_TEST_CLAUDE_HELP=(
+            '  --permission-mode <mode>  Permission mode to use\n'
+            '                            (choices: "acceptEdits", "auto",\n'
+            '                            "plan")\n'
+            '  --plugin-dir <path>'))
+        self.assertEqual(claude.permission_mode(), "auto")
+
+    def test_aide_octets_invalides_ou_expiree(self):
+        # verdict codex #182 (3) : ni UnicodeDecodeError ni expiration ne
+        # remontent ; l'aide expirée cède au repli
+        claude = self._claude()
+        sortie = subprocess.CompletedProcess(
+            [], 0, b'Usage: claude \xff\xfe\n  --permission-mode <mode> (choices: "auto", "plan") \xc3\n',
+            b"\xe9")
+        with mock.patch.object(adapters.subprocess, "run", return_value=sortie):
+            self.assertEqual(claude.permission_mode(), "auto")
+        adapters._HELP_CACHE.clear()
+        expire = subprocess.TimeoutExpired(["claude", "--help"], 10)
+        with mock.patch.object(adapters.subprocess, "run", side_effect=expire):
+            self.assertEqual(claude.permission_mode(), "acceptEdits")
+        adapters._HELP_CACHE.clear()
+        with mock.patch.object(adapters, "_option_choices", side_effect=RuntimeError("x")):
+            self.assertEqual(claude.permission_mode(), "acceptEdits")
 
     def test_codex_et_deepseek_inchanges(self):
         self._claude()
@@ -135,6 +181,14 @@ class AttachPermissionTest(PgTestCase):
         self.assertEqual(self._attach()[:2], ["--permission-mode", "auto"])
         self.assertEqual(self.mesh("set", "perm", "permission_mode=a b").returncode, 2)
         self.assertIsNotNone(registry.get(self.db, "perm"))
+
+    def test_attach_survit_a_une_aide_en_erreur(self):
+        # verdict codex #182 (3) : l'aide est lue avant le try/finally de
+        # l'attach ; une erreur ne doit ni l'interrompre ni garder le bail
+        with mock.patch.object(adapters, "_option_choices", side_effect=UnicodeDecodeError(
+                "utf-8", b"\xff", 0, 1, "invalid start byte")):
+            self.assertEqual(self._attach()[:2], ["--permission-mode", "acceptEdits"])
+        self.assertIsNone(registry.get(self.db, "perm")["lease_owner"])
 
 
 if __name__ == "__main__":
