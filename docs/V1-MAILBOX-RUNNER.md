@@ -1,538 +1,538 @@
-# agent-mesh v1 — boîte aux lettres Postgres et exécuteur par machine
+# agent-mesh v1 — Postgres mailbox and per-machine runner
 
-Ce document couvre les points 1 et 2 de la spec (§5) : ce qui a été construit,
-les décisions prises, et ce qui reste volontairement dehors. Il est écrit pour
-être relu par un autre agent (relecture croisée) et pour servir de base au
-portage vers un orchestrateur de tickets existant (M1 : paquet autonome
-`agent-mesh`).
-
----
-
-## 1. Langage : Python 3 stdlib + `psycopg` si présent, sinon `psql`
-
-**Décision : Python 3**, avec une couche `db.py` qui parle à Postgres par
-`psycopg` (v3) quand il est importable, et par le binaire `psql` sinon.
-
-Pourquoi Python plutôt que Node :
-
-1. **La v0 est en Python.** `agent-mail.v0.py` définit l'identité (alias,
-   `AGENT_MAIL_NAME`, assainissement du dossier), le rendu des hooks et le
-   format de la boîte fichier. Réimplémenter ces règles dans un second langage
-   aurait créé deux sources de vérité pour la compatibilité ; en Python, la
-   logique est portée à l'identique et testée contre le script v0 lui-même
-   (même JSON, à l'octet près).
-2. **Zéro dépendance possible.** La stdlib couvre JSON, sous-processus,
-   sockets, threads, `pty`, `argparse`, `unittest`. Avec le pilote `psql`, le
-   paquet tourne sans **aucune** dépendance Python — ce qui compte sur un PC
-   d'agent où l'on n'installe pas de venv à la légère. Node n'a pas de client
-   Postgres dans sa stdlib : il aurait fallu `pg`, donc un `node_modules` à
-   maintenir.
-3. **Un seul runtime pour les trois harnais.** Le runner est un service local :
-   Python est déjà présent partout où `agent-mail` v0 tourne (c'est le même
-   interpréteur), et `psql` est présent partout où Postgres est utilisé.
-4. **`psycopg` reste le chemin nominal** quand il est là (installé par
-   l'orchestrateur ou par un venv) : connexions directes, LISTEN/NOTIFY natif,
-   pas de processus par requête. C'est un accélérateur, pas un prérequis.
-
-L'alternative Node avait un avantage réel (le harnais Codex et `jq` sont déjà
-dans l'écosystème npm), mais elle perd sur la compatibilité v0 et sur
-l'absence de client Postgres stdlib.
+This document covers items 1 and 2 of the spec (§5): what was built,
+the decisions made, and what is deliberately left out. It is written to
+be reviewed by another agent (cross-review) and to serve as the basis for
+porting to an existing ticket orchestrator (M1: standalone
+`agent-mesh` package).
 
 ---
 
-## 2. Modèle de données (`0001_init.sql`, `0002_overview.sql`)
+## 1. Language: Python 3 stdlib + `psycopg` if present, otherwise `psql`
 
-Migrations versionnées `NNNN_nom.sql`, appliquées une fois, empreinte SHA-256
-enregistrée dans `schema_migrations`, verrou consultatif
-(`pg_advisory_xact_lock`) pour que deux exécuteurs qui démarrent ensemble ne se
-marchent pas dessus, et **immuabilité** : modifier une migration déjà appliquée
-est une erreur, pas une mise à jour silencieuse (il faut en ajouter une).
+**Decision: Python 3**, with a `db.py` layer that talks to Postgres through
+`psycopg` (v3) when it can be imported, and through the `psql` binary otherwise.
 
-### `agent_registry` — présence et bail
+Why Python rather than Node:
 
-`name` (clé, même grammaire qu'`agent-mail` v0 : `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`),
+1. **v0 is in Python.** `agent-mail.v0.py` defines identity (aliases,
+   `AGENT_MAIL_NAME`, directory sanitization), hook rendering and the
+   file mailbox format. Reimplementing these rules in a second language
+   would have created two sources of truth for compatibility; in Python, the
+   logic is carried over identically and tested against the v0 script itself
+   (same JSON, byte for byte).
+2. **Zero dependencies possible.** The stdlib covers JSON, subprocesses,
+   sockets, threads, `pty`, `argparse`, `unittest`. With the `psql` driver, the
+   package runs with **no** Python dependency at all — which matters on an agent
+   PC where you don't install a venv lightly. Node has no Postgres client
+   in its stdlib: it would have needed `pg`, hence a `node_modules` to
+   maintain.
+3. **A single runtime for the three harnesses.** The runner is a local service:
+   Python is already present wherever `agent-mail` v0 runs (it is the same
+   interpreter), and `psql` is present wherever Postgres is used.
+4. **`psycopg` remains the nominal path** when it is there (installed by
+   the orchestrator or by a venv): direct connections, native LISTEN/NOTIFY,
+   no process per query. It is an accelerator, not a prerequisite.
+
+The Node alternative had a real advantage (the Codex harness and `jq` are already
+in the npm ecosystem), but it loses on v0 compatibility and on
+the lack of a stdlib Postgres client.
+
+---
+
+## 2. Data model (`0001_init.sql`, `0002_overview.sql`)
+
+Versioned migrations `NNNN_nom.sql`, applied once, SHA-256 fingerprint
+recorded in `schema_migrations`, advisory lock
+(`pg_advisory_xact_lock`) so that two runners starting together don't
+step on each other, and **immutability**: modifying an already-applied migration
+is an error, not a silent update (you must add a new one).
+
+### `agent_registry` — presence and lease
+
+`name` (key, same grammar as `agent-mail` v0: `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`),
 `chantier`, `harness`, `host`, `cwd`, `session_id`, `status`
 (`idle|queued|running|blocked|stopped|dead`), `status_text`, `model`,
 `budget_usd`, `spent_usd`, `turns`, `pending_prompt`, `last_error`,
 `lease_owner`, `lease_expires_at`, `lease_epoch`, `last_turn_at`, `last_seen`.
 
-Deux points de conception :
+Two design points:
 
-* **`pending_prompt`** — l'équivalent v1 de `nexlink-agent start <nom> … "consigne"` :
-  la consigne attend dans le registre, l'exécuteur la consomme atomiquement.
-  Le `RETURNING` d'un `UPDATE` renvoie la *nouvelle* valeur (donc `NULL`) : la
-  consommation passe par un CTE `taken … FOR UPDATE` qui capture l'ancienne
-  valeur avant de l'effacer. (Bug attrapé par les tests.)
-* **`upsert` partiel** — un hook ou un `status` ne doivent pas
-  écraser ce qu'ils ne connaissent pas. Les colonnes `chantier`, `harness`,
-  `host` sont donc mises à jour par `coalesce(nullif(%s,''), colonne)`, et non
-  par la valeur par défaut de la ligne proposée. (Deuxième bug attrapé par les
-  tests : un `send` remettait `harness` à `'other'`.) Depuis le 2026-10-11, un
-  `send` ne touche plus du tout le registre : il inscrivait le destinataire,
-  ce qui créait un agent fantôme pour un nom mal tapé et réécrivait l'hôte
-  d'un agent existant avec celui de l'expéditeur (voir §6, « Courrier vers un
-  agent inconnu ou arrêté »).
+* **`pending_prompt`** — the v1 equivalent of `nexlink-agent start <nom> … "consigne"`:
+  the prompt waits in the registry, and the runner consumes it atomically.
+  The `RETURNING` of an `UPDATE` returns the *new* value (hence `NULL`): the
+  consumption goes through a `taken … FOR UPDATE` CTE that captures the old
+  value before clearing it. (Bug caught by the tests.)
+* **Partial `upsert`** — a hook or a `status` must not
+  overwrite what they don't know. The `chantier`, `harness`,
+  `host` columns are therefore updated with `coalesce(nullif(%s,''), colonne)`, and not
+  with the default value of the proposed row. (Second bug caught by the
+  tests: a `send` reset `harness` to `'other'`.) Since 2026-10-11, a
+  `send` no longer touches the registry at all: it used to register the recipient,
+  which created a phantom agent for a mistyped name and overwrote the host
+  of an existing agent with the sender's (see §6, "Mail to an
+  unknown or stopped agent").
 
-### `agent_mailbox` — messages durables
+### `agent_mailbox` — durable messages
 
 `sender`, `recipient`, `body`, `kind` (`request|reply|notify`), `payload jsonb`,
 `work_item_id`, `status` (`pending|delivered|answered`), `created_at`,
 `delivered_at`, `signature`, `signature_key`, `slack_ts`, `host`, `meta`.
 
-C'est la liste de la spec §5.1 (`from, to, body, created, delivered,
-signature`) enrichie des colonnes d'un orchestrateur de tickets existant
-(`kind`, `payload`, `work_item_id`, `slack_ts`) pour que la même table serve aux
-transports suivants (R6 : Nexlink, Slack). `sender`/`recipient` portent
-`from`/`to`, mots réservés SQL.
+This is the list from spec §5.1 (`from, to, body, created, delivered,
+signature`) enriched with the columns of an existing ticket orchestrator
+(`kind`, `payload`, `work_item_id`, `slack_ts`) so that the same table serves the
+following transports (R6: Nexlink, Slack). `sender`/`recipient` carry
+`from`/`to`, which are SQL reserved words.
 
-Un message **non remis** est `delivered_at IS NULL` ; l'index partiel
-`agent_mailbox_unread_idx (recipient, id) WHERE delivered_at IS NULL` sert la
-requête chaude. La remise est faite par le hook du harnais (comme en v0) ou par
-l'exécuteur à la fin d'un tour de messages réussi : un message n'est jamais
-perdu si le tour échoue.
+An **undelivered** message is `delivered_at IS NULL`; the partial index
+`agent_mailbox_unread_idx (recipient, id) WHERE delivered_at IS NULL` serves the
+hot query. Delivery is done by the harness hook (as in v0) or by
+the runner at the end of a successful message turn: a message is never
+lost if the turn fails.
 
-### Vue `agent_mesh_overview`
+### `agent_mesh_overview` view
 
-Une ligne par agent avec bail, non-lus et budget : c'est la base de
-`agent-mail list` aujourd'hui et de `mesh list` (point 5) demain.
+One row per agent with lease, unread count and budget: this is the basis of
+`agent-mail list` today and of `mesh list` (item 5) tomorrow.
 
 ---
 
-## 3. Baux d'agents (R3, R5)
+## 3. Agent leases (R3, R5)
 
-Un agent est **épinglé à un hôte** (v1 : les sessions des harnais sont des
-fichiers locaux). Le bail est la seule autorisation de tourner.
+An agent is **pinned to a host** (v1: harness sessions are
+local files). The lease is the only authorization to run.
 
-* **Prise** — `UPDATE agent_registry SET lease_owner=%s, lease_expires_at=now()+ttl,
+* **Claim** — `UPDATE agent_registry SET lease_owner=%s, lease_expires_at=now()+ttl,
   lease_epoch=lease_epoch+1 WHERE name=%s AND (lease_owner IS NULL OR
-  lease_owner=%s OR lease_expires_at < now()) RETURNING …`. Sous READ COMMITTED,
-  un `UPDATE … WHERE` réévalue la condition après le verrou de ligne : deux
-  exécuteurs concurrents ne peuvent pas gagner le même agent. Testé avec 2 et 4
-  connexions simultanées, puis avec **deux processus `agent-runner`**.
-* **Fence temporel** — `renew`, `begin_turn` et `take_pending_prompt` exigent
-  tous `lease_expires_at > now()` : un bail expiré ne se prolonge pas, ne
-  démarre pas de tour et ne consomme pas de consigne. L'exécuteur doit
-  re-`claim` (nouvel epoch) pour continuer ; `end_turn` reste fencé par
-  `lease_owner` + `lease_epoch`, pour qu'un tour commencé sous bail valide
-  puisse être enregistré.
-* **Verrou d'abord, recontrôle ensuite** — les opérations de bail (`claim`,
-  `attach_claim`, `renew`, `take_pending_prompt`, `begin_turn`) prennent le
-  verrou de la ligne (`SELECT … FOR UPDATE`) puis recontrôlent l'échéance avec
-  `clock_timestamp()` **dans l'instruction qui écrit** : un verrou attendu
-  au-delà de l'expiration refuse l'opération, même si le détenteur n'a fait
-  qu'un `SELECT … FOR UPDATE` sans modifier la ligne (EvalPlanQual ne réévalue
-  pas un `WHERE` sans nouvelle version). `claim` applique les mêmes règles que
-  `claimable` — éphémère échu, responsable résolu quand il est requis, prédicat
-  du canon — dans la même instruction, ce qui ferme la course `claimable` →
-  `claim`. Le marqueur d'un tour vivant est `status = 'running'` avec un bail
-  vivant, pas `current_prompt` (qu'un tour de courrier ou d'événement ne
-  remplit pas) : `ameesh attach` ne reprend jamais un tour en cours, ni une
-  session attach déjà ouverte, et son propre **veilleur d'échéance** tue le
-  harnais interactif si le renouvellement échoue (erreur SQL réelle) et que le
-  bail expire.
-* **Renouvellement borné par l'échéance, pas par un délai fixe** — si
-  l'échéance est déjà atteinte au réveil, le harnais est arrêté **sans même
-  appeler la base** ; sinon l'appel `renew` tourne dans un fil et est abandonné
-  au plus tard à `lease_deadline` (budget = temps restant exact, **aucun
-  plancher** : entré 20 ms avant l'échéance, l'appel ne dispose que de 20 ms).
-  L'attente du battement entre deux renouvellements est bornée de la même façon
-  (`wait_timeout` = temps restant exact, **aucun plancher positif** non plus) :
-  un bail à +20 ms réveille le battement à l'échéance, qui coupe alors le
-  harnais, au lieu de dormir 50 ms de plus pendant qu'un remplaçant réclame
-  l'agent.
-  À la perte du bail, le groupe reçoit SIGKILL **directement** (pas de SIGTERM
-  préalable) et **avant tout journal** : un print+flush sur ce chemin critique
-  laissait, sous charge, un remplaçant réclamer pendant que l'ancien harnais
-  vivait encore (sonde codex3 b731f4f). L'enfant direct est ensuite moissonné :
-  un zombie reste compté vivant par `killpg(pid, 0)`, ce qui faisait durer
-  l'attente 2 s et journalisait un faux « groupe toujours vivant ».
-  Même si la base ne répond plus du tout (réponse retenue par un proxy, par
-  exemple), le battement conclut à la perte du bail et arrête le harnais à
-  l'heure où un remplaçant peut réclamer l'agent. Le `statement_timeout` reste
-  la borne serveur, le délai client `psql` la borne du sous-processus.
-* **Veilleur d'échéance indépendant, journal non bloquant** — un fil dédié
-  (`_deadline_watchdog`) ne fait que lire `lease_deadline` et `time.time`, puis
-  poser `lease_lost` et envoyer le SIGKILL dès que l'échéance connue est
-  atteinte. Il n'écrit rien, n'appelle ni la base ni un fichier et n'attend
-  aucun autre fil : même si le battement est bloqué dans un journal plein, une
-  requête ou une écriture, l'arrêt part à l'échéance (sonde codex3 B5a-N,
-  classe des E/S bloquantes sur ce chemin). Les journaux du chemin de perte de
-  bail (battement, `terminate`) passent par une file bornée écrite par un fil
-  dédié : si le puits sature, le message est abandonné et la perte comptée et
-  signalée, jamais attendue.
-  **Inventaire des E/S restantes sur le chemin du bail, avec leur borne :**
-  l'appel `renew` tourne dans un fil séparé, rejoint au plus tard au temps
-  restant du bail (`call_budget`, plancher 0), avec `statement_timeout` serveur
-  (30 s par défaut) et délai client `psql` (+5 s) ; les diagnostics du battement
-  passent par la file bornée (aucune attente) ; sur perte du bail, `terminate`
-  envoie le SIGKILL avant tout journal, moissonne l'enfant direct et borne
-  l'attente du groupe à 2 s ; le veilleur lui-même n'a aucune E/S. Le seul fil
-  qui peut rester bloqué est l'écrivain de journal, qui ne perd alors que des
+  lease_owner=%s OR lease_expires_at < now()) RETURNING …`. Under READ COMMITTED,
+  an `UPDATE … WHERE` re-evaluates the condition after the row lock: two
+  concurrent runners cannot win the same agent. Tested with 2 and 4
+  simultaneous connections, then with **two `agent-runner` processes**.
+* **Time fence** — `renew`, `begin_turn` and `take_pending_prompt` all
+  require `lease_expires_at > now()`: an expired lease is not extended, does not
+  start a turn and does not consume a prompt. The runner must
+  re-`claim` (new epoch) to continue; `end_turn` remains fenced by
+  `lease_owner` + `lease_epoch`, so that a turn started under a valid lease
+  can be recorded.
+* **Lock first, recheck after** — lease operations (`claim`,
+  `attach_claim`, `renew`, `take_pending_prompt`, `begin_turn`) take the
+  row lock (`SELECT … FOR UPDATE`) then recheck the deadline with
+  `clock_timestamp()` **in the statement that writes**: a lock waited for
+  past expiry refuses the operation, even if the holder only did
+  a `SELECT … FOR UPDATE` without modifying the row (EvalPlanQual does not re-evaluate
+  a `WHERE` without a new row version). `claim` applies the same rules as
+  `claimable` — expired ephemeral, lead resolved when required, canon
+  predicate — in the same statement, which closes the `claimable` →
+  `claim` race. The marker of a live turn is `status = 'running'` with a live
+  lease, not `current_prompt` (which a mail or event turn does not
+  fill): `ameesh attach` never takes over a running turn, nor an
+  already open attach session, and its own **deadline watchdog** kills the
+  interactive harness if renewal fails (real SQL error) and the
+  lease expires.
+* **Renewal bounded by the deadline, not by a fixed delay** — if
+  the deadline has already been reached on wake-up, the harness is stopped **without even
+  calling the database**; otherwise the `renew` call runs in a thread and is abandoned
+  at the latest at `lease_deadline` (budget = exact remaining time, **no
+  floor**: entered 20 ms before the deadline, the call only has 20 ms).
+  The heartbeat wait between two renewals is bounded the same way
+  (`wait_timeout` = exact remaining time, **no positive floor** either):
+  a lease at +20 ms wakes the heartbeat at the deadline, which then cuts the
+  harness, instead of sleeping 50 ms more while a replacement claims
+  the agent.
+  On lease loss, the group receives SIGKILL **directly** (no prior
+  SIGTERM) and **before any logging**: a print+flush on this critical path
+  let, under load, a replacement claim while the old harness was
+  still alive (codex3 probe b731f4f). The direct child is then reaped:
+  a zombie still counts as alive for `killpg(pid, 0)`, which made the
+  wait last 2 s and logged a false "groupe toujours vivant" (group still alive).
+  Even if the database no longer responds at all (response held by a proxy, for
+  example), the heartbeat concludes the lease is lost and stops the harness at
+  the time a replacement can claim the agent. `statement_timeout` remains
+  the server bound, the `psql` client delay the subprocess bound.
+* **Independent deadline watchdog, non-blocking logging** — a dedicated thread
+  (`_deadline_watchdog`) only reads `lease_deadline` and `time.time`, then
+  sets `lease_lost` and sends the SIGKILL as soon as the known deadline is
+  reached. It writes nothing, calls neither the database nor a file and waits for
+  no other thread: even if the heartbeat is blocked in a full log, a
+  query or a write, the stop fires at the deadline (codex3 probe B5a-N,
+  class of blocking I/O on this path). Logs on the lease-loss path
+  (heartbeat, `terminate`) go through a bounded queue written by a dedicated
+  thread: if the sink saturates, the message is dropped and the loss counted and
+  reported, never waited for.
+  **Inventory of the remaining I/O on the lease path, with their bound:**
+  the `renew` call runs in a separate thread, joined at the latest at the remaining
+  lease time (`call_budget`, floor 0), with server `statement_timeout`
+  (30 s by default) and `psql` client delay (+5 s); heartbeat diagnostics
+  go through the bounded queue (no waiting); on lease loss, `terminate`
+  sends the SIGKILL before any logging, reaps the direct child and bounds
+  the group wait to 2 s; the watchdog itself has no I/O. The only thread
+  that can remain blocked is the log writer, which then only loses
   messages.
-  **Inventaire des E/S du chemin `attach` (mêmes règles, sonde codex3 du
-  2026-10-04-0442) :** la revendication du bail (`attach_claim`) et le
-  renouvellement (`renew`) sont des appels base bornés par `statement_timeout`
-  et par le budget client ; le renouvellement tourne dans le fil de battement,
-  jamais dans la décision d'arrêt ; le fil principal tue le groupe
-  (`os.killpg`) **avant** tout journal ; le veilleur d'échéance ne fait que lire
-  `etat["deadline"]` et `time.time`, pose `perdu` (le signal d'arrêt) puis
-  journalise ; tous les journaux d'attach — bail pris, session interactive,
-  renouvellement en échec, bail perdu, échéance atteinte, harnais coupé, bail
-  rendu — passent par la file bornée `log_async` (aucune attente) ; la
-  publication du `Popen` est recontrôlée après coup (le veilleur a pu conclure
-  entre-temps) ; `release` n'intervient qu'après la coupe. Les seules sorties
-  synchrones d'`attach` sont les messages CLI (`print` sur stderr) émis avant
-  toute prise de bail (agent inconnu, tour en cours, non réclamable) ou par la
-  boucle `--wait` sans bail détenu.
-  Le veilleur **reste actif pendant un arrêt gracieux** (`stopping`, grâce
-  SIGTERM de 3 s) : il ne s'arrête qu'au relâchement du bail (`release_lease`)
-  ou une fois la perte consommée, sinon un harnais qui ignore SIGTERM
-  survivrait à l'échéance pendant la grâce (sonde codex3 B5a-S). La fin de tour
-  passe par l'arrêt escaladé (SIGTERM puis SIGKILL), plus par un
-  `Popen.terminate()` sec ; et le bail perdu en cours de lecture est un SIGKILL
-  direct. Enfin, **la publication du `Popen` est recontrôlée** : le veilleur
-  peut conclure entre la création du processus et l'affectation de `self.proc`
-  (il voit alors `proc=None`) ; sans ce recontrôle, un harnais sans stdout
-  survivrait au bail jusqu'à la fin du tour (sonde codex3 B5a-P). Le recontrôle
-  couvre aussi la fermeture du worker (`stopping`) et le relâchement du bail
-  (`watchdog_stop`) : une publication tardive après un `shutdown()` qui a rendu
-  le bail est tuée, même si l'ancienne échéance n'est pas atteinte (sonde
-  codex3 B5a-Q).
-* **Requêtes bornées** — chaque connexion pose un `statement_timeout`
-  (`AMEESH_STATEMENT_TIMEOUT_MS`, défaut 30 s) : un renouvellement de bail
-  qui pend (verrou, requête lente) est annulé par le serveur ; le pilote `psql`
-  ajoute un délai client (le même + 5 s) qui abandonne le sous-processus si le
-  serveur ne répond plus du tout. Les migrations, elles, lèvent le délai le
-  temps de leur transaction (`SET LOCAL statement_timeout = 0`).
-* **Battement robuste** — une panne de base pendant un tour ne laisse pas le
-  harnais tourner sans bail : le battement compte les échecs
-  (`max(3, ttl/3)` secondes d'intervalle), et arrête le processus dès que la
-  base reste injoignable ou que l'échéance connue du bail est atteinte. Il ne
-  dort **jamais au-delà de l'échéance** (le réveil est borné par
-  `lease_deadline`), même si l'intervalle nominal est plus long.
-* **Arrêt du harnais** — `terminate` signale le **groupe de processus** (le
-  harnais est lancé dans sa propre session, le pgid est mémorisé au lancement) :
-  ses descendants ne survivent pas. SIGTERM, 3 secondes de grâce pour un arrêt
-  propre, puis SIGKILL — sauf à la perte du bail, où la grâce est nulle : le
-  remplaçant peut réclamer l'agent immédiatement, l'ancien enfant ne doit plus
-  tourner. L'escalade ne dépend pas de la survie du **parent** : si le parent
-  meurt sur SIGTERM en laissant un descendant qui l'ignore, le groupe restant
-  est tué quand même. `terminate` attend que le noyau ait pris le SIGKILL,
-  pour que « arrêté » veuille dire arrêté.
-* **Consigne durable (R5)** — `pick` ne vide plus `pending_prompt` : la
-  consigne est *déplacée* dans `current_prompt` quand le tour démarre, effacée
-  par `end_turn` **uniquement si le tour a abouti**, et restaurée en attente
-  dans tous les autres cas : tour en échec (y compris harnais tué), harnais
-  absent, dossier disparu, changement de main — y compris quand le même
-  `--runner-id` reprend un bail expiré — et **bail perdu en cours de tour**
-  (la clôture ne passe plus par `end_turn`, qui aurait effacé la consigne ; et
-  elle ne touche pas au statut d'un agent qu'un remplaçant a pu reprendre). Si
-  une consigne était déjà en attente pendant un tour interrompu, **les deux
-  sont conservées** (l'ancienne puis la nouvelle, séparées par une ligne vide).
-  Au pire un tour est rejoué, jamais une consigne perdue.
-* **Expiration** — si l'exécuteur meurt (SIGKILL, coupure), le bail expire ;
-  n'importe quel exécuteur du même hôte le reprend (`lease_expires_at < now()`).
-  `reap()` marque `dead` les agents dont le bail a expiré en plein tour.
-* **Perte en cours de tour** — le battement détecte la perte, termine le
-  processus du harnais, et le tour n'est pas compté. Testé : vol de bail
-  pendant un faux tour de 12 s, interruption en moins de 7 s.
+  **Inventory of the I/O on the `attach` path (same rules, codex3 probe of
+  2026-10-04-0442):** the lease claim (`attach_claim`) and the
+  renewal (`renew`) are database calls bounded by `statement_timeout`
+  and by the client budget; renewal runs in the heartbeat thread,
+  never in the stop decision; the main thread kills the group
+  (`os.killpg`) **before** any logging; the deadline watchdog only reads
+  `etat["deadline"]` and `time.time`, sets `perdu` (the stop signal) then
+  logs; all attach logs — lease taken, interactive session,
+  renewal failure, lease lost, deadline reached, harness cut, lease
+  returned — go through the bounded `log_async` queue (no waiting); the
+  publication of the `Popen` is rechecked afterwards (the watchdog may have concluded
+  in the meantime); `release` only happens after the cut. The only synchronous
+  outputs of `attach` are the CLI messages (`print` on stderr) emitted before
+  any lease is taken (unknown agent, turn in progress, not claimable) or by the
+  `--wait` loop without a held lease.
+  The watchdog **remains active during a graceful stop** (`stopping`, 3 s
+  SIGTERM grace): it only stops when the lease is released (`release_lease`)
+  or once the loss has been consumed, otherwise a harness that ignores SIGTERM
+  would survive past the deadline during the grace period (codex3 probe B5a-S). End of turn
+  goes through the escalated stop (SIGTERM then SIGKILL), no longer through a bare
+  `Popen.terminate()`; and a lease lost while reading is a direct
+  SIGKILL. Finally, **the publication of the `Popen` is rechecked**: the watchdog
+  may conclude between process creation and the assignment of `self.proc`
+  (it then sees `proc=None`); without this recheck, a harness with no stdout
+  would survive the lease until the end of the turn (codex3 probe B5a-P). The recheck
+  also covers worker shutdown (`stopping`) and lease release
+  (`watchdog_stop`): a late publication after a `shutdown()` that has returned
+  the lease is killed, even if the old deadline has not been reached (codex3
+  probe B5a-Q).
+* **Bounded queries** — each connection sets a `statement_timeout`
+  (`AMEESH_STATEMENT_TIMEOUT_MS`, default 30 s): a lease renewal
+  that hangs (lock, slow query) is cancelled by the server; the `psql` driver
+  adds a client delay (the same + 5 s) that abandons the subprocess if the
+  server no longer responds at all. Migrations, for their part, lift the timeout for
+  the duration of their transaction (`SET LOCAL statement_timeout = 0`).
+* **Robust heartbeat** — a database outage during a turn does not leave the
+  harness running without a lease: the heartbeat counts failures
+  (`max(3, ttl/3)` second interval), and stops the process as soon as the
+  database stays unreachable or the known lease deadline is reached. It
+  **never sleeps past the deadline** (wake-up is bounded by
+  `lease_deadline`), even if the nominal interval is longer.
+* **Harness stop** — `terminate` signals the **process group** (the
+  harness is launched in its own session, the pgid is recorded at launch):
+  its descendants do not survive. SIGTERM, 3 seconds of grace for a clean
+  stop, then SIGKILL — except on lease loss, where the grace is zero: the
+  replacement may claim the agent immediately, the old child must no longer
+  run. Escalation does not depend on the **parent** surviving: if the parent
+  dies on SIGTERM leaving a descendant that ignores it, the remaining group
+  is killed anyway. `terminate` waits until the kernel has taken the SIGKILL,
+  so that "stopped" means stopped.
+* **Durable prompt (R5)** — `pick` no longer empties `pending_prompt`: the
+  prompt is *moved* into `current_prompt` when the turn starts, cleared
+  by `end_turn` **only if the turn succeeded**, and restored as pending
+  in all other cases: failed turn (including killed harness), missing
+  harness, vanished directory, change of hands — including when the same
+  `--runner-id` takes back an expired lease — and **lease lost mid-turn**
+  (closing no longer goes through `end_turn`, which would have cleared the prompt; and
+  it does not touch the status of an agent a replacement may have taken over). If
+  a prompt was already pending during an interrupted turn, **both
+  are kept** (the old one then the new one, separated by a blank line).
+  At worst a turn is replayed, never a prompt lost.
+* **Expiry** — if the runner dies (SIGKILL, power cut), the lease expires;
+  any runner on the same host takes it back (`lease_expires_at < now()`).
+  `reap()` marks `dead` the agents whose lease expired mid-turn.
+* **Loss mid-turn** — the heartbeat detects the loss, terminates the
+  harness process, and the turn is not counted. Tested: lease stolen
+  during a fake 12 s turn, interruption in under 7 s.
 
 ---
 
-## 4. LISTEN/NOTIFY : ce que `psql` impose
+## 4. LISTEN/NOTIFY: what `psql` imposes
 
-Le déclencheur `agent_mailbox_notify` émet
-`pg_notify('agent_mail', {"to": …, "id": …})` à chaque insertion ;
-`agent_registry_notify` fait de même sur les changements de bail/statut
-(`agent_lease`). L'exécuteur écoute les deux canaux et réveille le worker
-concerné ; le sondage (`--poll`, défaut 5 s) reste un filet de sécurité.
+The `agent_mailbox_notify` trigger emits
+`pg_notify('agent_mail', {"to": …, "id": …})` on every insert;
+`agent_registry_notify` does the same on lease/status changes
+(`agent_lease`). The runner listens on both channels and wakes the relevant
+worker; polling (`--poll`, default 5 s) remains a safety net.
 
-Avec `psycopg`, tout est direct. Avec `psql`, trois comportements de psql ont
-été découverts **en test** et dictent l'implémentation :
+With `psycopg`, everything is direct. With `psql`, three psql behaviors were
+discovered **in testing** and dictate the implementation:
 
-1. `psql -c …` **ne lit jamais stdin** — un écouteur lancé avec `-c "LISTEN …"`
-   puis `-c "SELECT pg_sleep(…)` ne peut pas rester interactif ; il faut une
-   invocation sans `-c`, avec le `SET search_path` et les `LISTEN` envoyés sur
+1. `psql -c …` **never reads stdin** — a listener launched with `-c "LISTEN …"`
+   then `-c "SELECT pg_sleep(…)` cannot stay interactive; it needs an
+   invocation without `-c`, with the `SET search_path` and the `LISTEN`s sent on
    stdin.
-2. bloqué dans une requête (`pg_sleep`), psql **ne vide pas** les notifications :
-   elles ne sortent qu'à la fin de la requête — un `pg_sleep` d'une heure ne
-   réveille donc rien.
-3. sur un pipe, psql ne traite pas les notifications du tout ; il faut un
-   **pty**, et il n'imprime les notifications qu'au tour de boucle suivant.
+2. blocked in a query (`pg_sleep`), psql **does not flush** notifications:
+   they only come out at the end of the query — a one-hour `pg_sleep` therefore
+   wakes nothing.
+3. on a pipe, psql does not process notifications at all; it needs a
+   **pty**, and it only prints notifications on the next loop iteration.
 
-L'écouteur `psql` est donc : un `psql` interactif sur un pty, un battement
-`SELECT 1` deux fois par seconde, et un filtre sur la ligne
-`Asynchronous notification "canal" with payload "…"`. Latence de réveil
-≈ 0,5 s. Le détail est commenté dans `db._PsqlListener`, et un test
-`doctor --notify-test` fait le tour complet.
+The `psql` listener is therefore: an interactive `psql` on a pty, a
+`SELECT 1` heartbeat twice per second, and a filter on the line
+`Asynchronous notification "canal" with payload "…"`. Wake-up latency
+≈ 0.5 s. The details are commented in `db._PsqlListener`, and a
+`doctor --notify-test` test goes through the full loop.
 
-Avec `psycopg`, `Connection.notifies(stop_after=1)` **jette** les notifications
-non consommées à la fermeture du générateur : l'écouteur draine la connexion
-dans un tampon (`notifies(timeout=0)`) et les rend une à une. Là encore, un
-test (trois messages → trois notifications) a attrapé le bug.
+With `psycopg`, `Connection.notifies(stop_after=1)` **discards** unconsumed
+notifications when the generator is closed: the listener drains the connection
+into a buffer (`notifies(timeout=0)`) and returns them one by one. Here again, a
+test (three messages → three notifications) caught the bug.
 
 ---
 
-## 5. Exécuteur (`agent-runner`)
+## 5. Runner (`agent-runner`)
 
-* **Un par machine**, il réclame les agents `host = <hôte>`, renouvelle leurs
-  baux et lance les tours. Mode service, ou `--once` pour le banc.
-* **Adaptateurs** : lignes de commande reprises de `nexlink-agent.v0.sh`
+* **One per machine**, it claims the agents with `host = <hôte>`, renews their
+  leases and launches the turns. Service mode, or `--once` for the test bench.
+* **Adapters**: command lines taken from `nexlink-agent.v0.sh`
   (`claude -p --output-format stream-json … --resume`, `codex exec --json
-  resume`, `dsh --profile agent --json --session-id`), lecture JSONL,
-  capture de la session et du coût quand le harnais le donne
-  (`total_cost_usd` pour Claude, `cost_usd` pour DeepSeek).
-* **Tours** : consigne en attente → messages non lus → événements → relance
-  d'inactivité (mêmes textes que la v0). Le flux brut est journalisé dans
-  `~/.local/state/agent-mesh/<nom>/events.jsonl`, la session en base **et** sur
-  disque (reprise après crash), stderr dans `stderr.log`.
-* **Événements (C9, `0012_events.sql`)** : un message `kind = 'event'` réveille
-  l'agent comme un message ; un lot d'événements n'en réveille qu'un par
-  `AMEESH_EVENT_COALESCE` secondes (défaut 120), sauf `payload.urgent`. L'instant
-  du dernier réveil vit en base (`agent_registry.last_event_at`) : un
-  redémarrage ne remet pas la fenêtre à zéro.
-* **Courrier regroupé (L125)** : le courrier ordinaire ne réveille un agent au
-  repos qu'à la fin d'une fenêtre (`AMEESH_MAIL_BATCH`, défaut 90 s, réglable
-  par agent), comptée depuis l'arrivée du plus ancien message ; le tour emporte
-  tout ce qui est arrivé entre-temps. Un message urgent ou d'un humain réveille
-  tout de suite ; un accusé de réception, une copie (`--cc`) ou une diffusion à
-  « all » ne réveille jamais seul : il est lu au tour suivant. Voir
+  resume`, `dsh --profile agent --json --session-id`), JSONL reading,
+  capture of the session and the cost when the harness provides it
+  (`total_cost_usd` for Claude, `cost_usd` for DeepSeek).
+* **Turns**: pending prompt → unread messages → events → idle
+  nudge (same texts as v0). The raw stream is logged to
+  `~/.local/state/agent-mesh/<nom>/events.jsonl`, the session in the database **and** on
+  disk (recovery after crash), stderr in `stderr.log`.
+* **Events (C9, `0012_events.sql`)**: a `kind = 'event'` message wakes
+  the agent like a message; a batch of events only wakes it once per
+  `AMEESH_EVENT_COALESCE` seconds (default 120), except `payload.urgent`. The time
+  of the last wake-up lives in the database (`agent_registry.last_event_at`): a
+  restart does not reset the window.
+* **Batched mail (L125)**: ordinary mail only wakes an idle agent
+  at the end of a window (`AMEESH_MAIL_BATCH`, default 90 s, adjustable
+  per agent), counted from the arrival of the oldest message; the turn takes
+  everything that arrived in the meantime. An urgent message or one from a human wakes
+  immediately; an acknowledgement, a copy (`--cc`) or a broadcast to
+  "all" never wakes on its own: it is read on the next turn. See
   [EXPLOITATION.md](EXPLOITATION.md#courrier-regroupé-avant-le-réveil-l125).
-* **`ameesh attach <agent>` (C9)** : prend le bail pour une session interactive
-  (`attach:<utilisateur>@<hôte>`), même sur un bail vivant **sans tour en
-  cours** — l'ancien exécuteur est fencé par l'epoch à son prochain
-  renouvellement, ce qui suspend la réclamation automatique. Un tour en cours
-  n'est jamais interrompu (`--wait` pour attendre). Le harnais est lancé en
-  interactif sur la **même session** (sans `-p`/`exec`/`--json`), le bail est
-  renouvelé tant que la session vit, le harnais est tué si le bail est perdu, et
-  le bail est rendu à la sortie.
-* **Interruption prioritaire (0018, R19)** : un message non remis marqué
-  `payload.urgent` venu d'un **expéditeur habilité** (`AMEESH_INTERRUPT_SENDERS`
-  sans canon ; la capacité « interrupt » d'une fiche canon s'ajoutera) arrête le
-  tour en cours (SIGTERM bref puis SIGKILL), remet la consigne du tour en
-  attente, et `pick()` sert le message prioritaire **en tête** au tour suivant,
-  sur la même session. Un urgent d'un expéditeur non habilité n'interrompt rien
-  (c'est journalisé) : il est remis comme un message — depuis L125, sans
-  attendre la fenêtre de regroupement ; le fil garde la trace de
-  l'interruption et de sa raison.
-* **Rotation de session (0018)** : quand la session dépasse
-  `AMEESH_SESSION_MAX_TOKENS` (défaut 150 000) ou qu'un tour a duré plus de
-  `AMEESH_SESSION_MAX_TURN_SECONDS` (défaut 900 s), après au moins
-  `AMEESH_SESSION_MIN_TURNS` tours (défaut 3) et **jamais pendant un tour**, un
-  tour de résumé est joué dans la session, le résumé est écrit dans le fil
-  (R12), l'ancien id de session est conservé dans
-  `<état>/<agent>/session-history.jsonl`, puis la session est oubliée : le tour
-  suivant ouvre une session neuve préfixée par le résumé. Le résumé est la
-  réponse finale **entière** du tour de résumé (L218), jamais la fin de son
-  affichage ; au-delà de `adapters.SUMMARY_MAX_CHARS` (16 000 caractères), sa
-  tête est gardée, coupée sur une fin de paragraphe, et une note, comprise
-  dans la borne, dit la coupe. Une réponse finale vide (pour Codex : le
-  dernier message de l'agent vide) n'est pas un résumé : la rotation est
-  annulée, la bascule de compte prend le brief déterministe (L39).
-  La taille est lue
-  dans l'usage du flux de chaque harnais (clés normalisées par
-  `adapters.usage_tokens` ; DeepSeek publie un usage par étape). **Plafond de
-  contexte (L60)** : si le dernier tour a relu plus de
-  `AMEESH_CONTEXT_MAX_TOKENS` jetons (défaut 15 M, entrée + cache, réglable par
-  agent avec `ameesh set <agent> context_max_tokens=…`), la même rotation a
-  lieu avant le tour suivant, sans minimum de tours (voir
+* **`ameesh attach <agent>` (C9)**: takes the lease for an interactive session
+  (`attach:<utilisateur>@<hôte>`), even on a live lease **with no turn in
+  progress** — the old runner is fenced by the epoch at its next
+  renewal, which suspends automatic claiming. A turn in progress
+  is never interrupted (`--wait` to wait). The harness is launched
+  interactively on the **same session** (without `-p`/`exec`/`--json`), the lease is
+  renewed as long as the session lives, the harness is killed if the lease is lost, and
+  the lease is returned on exit.
+* **Priority interrupt (0018, R19)**: an undelivered message marked
+  `payload.urgent` from an **authorized sender** (`AMEESH_INTERRUPT_SENDERS`
+  without canon; the "interrupt" capability of a canon card will be added) stops the
+  running turn (brief SIGTERM then SIGKILL), puts the turn's prompt back as
+  pending, and `pick()` serves the priority message **first** on the next turn,
+  on the same session. An urgent message from an unauthorized sender interrupts nothing
+  (this is logged): it is delivered like a message — since L125, without
+  waiting for the batching window; the thread keeps a record of
+  the interruption and its reason.
+* **Session rotation (0018)**: when the session exceeds
+  `AMEESH_SESSION_MAX_TOKENS` (default 150,000) or a turn lasted more than
+  `AMEESH_SESSION_MAX_TURN_SECONDS` (default 900 s), after at least
+  `AMEESH_SESSION_MIN_TURNS` turns (default 3) and **never during a turn**, a
+  summary turn is played in the session, the summary is written to the thread
+  (R12), the old session id is kept in
+  `<état>/<agent>/session-history.jsonl`, then the session is forgotten: the next
+  turn opens a fresh session prefixed with the summary. The summary is the
+  **entire** final answer of the summary turn (L218), never the end of its
+  display; beyond `adapters.SUMMARY_MAX_CHARS` (16,000 characters), its
+  head is kept, cut at a paragraph end, and a note, included
+  within the bound, states the cut. An empty final answer (for Codex: the
+  agent's last message empty) is not a summary: the rotation is
+  cancelled, and the account cutover uses the deterministic brief (L39).
+  The size is read
+  from the usage in each harness's stream (keys normalized by
+  `adapters.usage_tokens`; DeepSeek publishes usage per step). **Context
+  ceiling (L60)**: if the last turn re-read more than
+  `AMEESH_CONTEXT_MAX_TOKENS` tokens (default 15 M, input + cache, adjustable per
+  agent with `ameesh set <agent> context_max_tokens=…`), the same rotation takes
+  place before the next turn, with no minimum number of turns (see
   [EXPLOITATION.md](EXPLOITATION.md#plafond-de-contexte-l60)).
-* **Dossier de travail déplacé (0018)** : à l'inscription, l'identité git du
-  dossier (dépôt commun + branche) est écrite dans
-  `<état>/<agent>/worktree.json`. Si le cwd a disparu, un candidat **unique**
-  est cherché sous `AMEESH_WORKTREE_ROOTS` (défaut `~/development`), en
-  profondeur bornée — les worktrees imbriqués (`.claude/worktrees/<nom>`) sont
-  traversés, les dépendances et `.git` non — ; il est adopté (registre mis à
-  jour, fil prévenu) s'il n'est pas déjà le cwd d'un autre agent.
-* **Point de passage unique d'arrêt** — tout arrêt de harnais (échéance du
-  bail, bail perdu, arrêt de l'exécuteur, préemption prioritaire, et demain
-  garde de budget L13) passe par `stop_group_now(raison)` : le signal part
-  **avant** tout journal, la journalisation passe par la file bornée, et une
-  publication tardive du `Popen` est rattrapée par un recontrôle unique
-  (`kill_if_stop_requested`). Un nouveau chemin d'arrêt hérite donc des mêmes
-  sondes ; la suite de tests **paramétrée** (`StopTriggersTest`) rejoue pour
-  chaque déclencheur les trois scénarios — harnais publié, journal saturé,
-  `Popen` publié en retard.
-* **`canon sync` par l'exécuteur (spec §4.4)** : quand un canon est configuré,
-  l'exécuteur lance `canon sync` pour son hôte **au démarrage**, puis
-  périodiquement (`AMEESH_CANON_SYNC_INTERVAL`, défaut 300 s ; 0 = seulement au
-  démarrage). Le sync tourne dans son propre fil avec sa propre connexion ; un
-  échec (canon illisible, git, base) est journalisé par la file bornée et
-  **n'arrête jamais l'exécuteur ni un tour** : un canon illisible ferme la
-  réclamation via `canon_state`, ce que L2 fait déjà. Sans canon configuré,
-  rien n'est lancé.
-* **Chemin de reprise** : la session est relue depuis le registre, sinon depuis
-  le fichier `session`.
-* **Binaire des harnais** : `AMEESH_<HARNAIS>_BIN`, puis
-  `AMEESH_BIN_DIR/<nom>`, puis le PATH. C'est ce qui permet au banc
-  d'utiliser de faux harnais sans jamais appeler les vrais.
-* **Arrêt** : SIGTERM/SIGINT → les baux sont rendus (l'agent repart aussitôt
-  ailleurs) ; SIGKILL → expiration naturelle.
+* **Moved working directory (0018)**: at registration, the git identity of the
+  directory (common repository + branch) is written to
+  `<état>/<agent>/worktree.json`. If the cwd has disappeared, a **unique** candidate
+  is searched for under `AMEESH_WORKTREE_ROOTS` (default `~/development`), at bounded
+  depth — nested worktrees (`.claude/worktrees/<nom>`) are
+  traversed, dependencies and `.git` are not —; it is adopted (registry
+  updated, thread notified) if it is not already the cwd of another agent.
+* **Single stop chokepoint** — every harness stop (lease
+  deadline, lease lost, runner stop, priority preemption, and tomorrow
+  the L13 budget guard) goes through `stop_group_now(raison)`: the signal fires
+  **before** any logging, logging goes through the bounded queue, and a
+  late `Popen` publication is caught by a single recheck
+  (`kill_if_stop_requested`). A new stop path therefore inherits the same
+  probes; the **parameterized** test suite (`StopTriggersTest`) replays for
+  each trigger the three scenarios — published harness, saturated log,
+  late-published `Popen`.
+* **`canon sync` by the runner (spec §4.4)**: when a canon is configured,
+  the runner launches `canon sync` for its host **at startup**, then
+  periodically (`AMEESH_CANON_SYNC_INTERVAL`, default 300 s; 0 = only at
+  startup). The sync runs in its own thread with its own connection; a
+  failure (unreadable canon, git, database) is logged through the bounded queue and
+  **never stops the runner or a turn**: an unreadable canon closes
+  claiming via `canon_state`, which L2 already does. With no canon configured,
+  nothing is launched.
+* **Resume path**: the session is re-read from the registry, otherwise from
+  the `session` file.
+* **Harness binaries**: `AMEESH_<HARNAIS>_BIN`, then
+  `AMEESH_BIN_DIR/<nom>`, then the PATH. This is what lets the test bench
+  use fake harnesses without ever calling the real ones.
+* **Stop**: SIGTERM/SIGINT → the leases are returned (the agent restarts right away
+  elsewhere); SIGKILL → natural expiry.
 
 ---
 
-## 6. CLI `agent-mail` compatible v0 et repli
+## 6. v0-compatible `agent-mail` CLI and fallback
 
-Mêmes commandes, mêmes textes : `send`, `inbox`, `list`, `status`, `alias`,
-`whoami`, `statusline`, `hook`, plus `migrate` et `doctor`. Les alias et
-l'identité sont **partagés** avec la v0 (`~/.config/agent-mail/aliases.tsv`,
-écriture atomique par `os.replace`).
+Same commands, same texts: `send`, `inbox`, `list`, `status`, `alias`,
+`whoami`, `statusline`, `hook`, plus `migrate` and `doctor`. Aliases and
+identity are **shared** with v0 (`~/.config/agent-mail/aliases.tsv`,
+atomic write via `os.replace`).
 
-Les hooks produisent le **même JSON** que la v0 (y compris la décision `Stop`
-et le plafond de 3 relances, compté localement dans
-`~/.local/state/agent-mesh/hooks/<nom>.stops`) : un test compare la sortie du
-script v0 et celle de la v1 pour les quatre événements.
+Hooks produce the **same JSON** as v0 (including the `Stop` decision
+and the cap of 3 nudges, counted locally in
+`~/.local/state/agent-mesh/hooks/<nom>.stops`): a test compares the output of the
+v0 script and that of v1 for the four events.
 
-**Identité liée au bail, jamais au dossier (incident mesh-design du 2026-10-09).**
-Une session n'a d'identité que si `AGENT_MAIL_NAME` est posée ; si
-`AMEESH_RUNNER_ID` et `AMEESH_LEASE_EPOCH` le sont aussi (c'est le
-runner qui les pose pour le harnais qu'il lance), le bail doit être **vivant et
-détenu par ce runner à cet epoch** — sinon le hook ne consomme rien et rien
-n'est livré. Sans ces variables, une session qui lit dans le worktree d'un
-autre agent ne prend plus son courrier : le dossier ne donne aucune identité,
-seulement un nom d'affichage pour la barre d'état et `whoami --cwd`
-(explicitement marqué « diagnostic, non autoritaire »). `send` exige alors
-`--from`, `status` et `whoami` refusent, et `inbox <nom>` reste une lecture
-sans consommation.
+**Identity tied to the lease, never to the directory (mesh-design incident of 2026-10-09).**
+A session only has an identity if `AGENT_MAIL_NAME` is set; if
+`AMEESH_RUNNER_ID` and `AMEESH_LEASE_EPOCH` are set too (it is the
+runner that sets them for the harness it launches), the lease must be **live and
+held by this runner at this epoch** — otherwise the hook consumes nothing and nothing
+is delivered. Without these variables, a session reading in another
+agent's worktree no longer takes its mail: the directory gives no identity,
+only a display name for the status bar and `whoami --cwd`
+(explicitly marked "diagnostic, non autoritaire" (diagnostic, not authoritative)). `send` then requires
+`--from`, `status` and `whoami` refuse, and `inbox <nom>` remains a read
+without consumption.
 
-**Sessions externes : liaison explicite (L41, décision 0030).** Une session
-interactive lancée par un humain n'a ni bail ni `AGENT_MAIL_NAME`. Elle n'a
-une identité que si elle est **liée** : `ameesh mail bind <agent> --session
-<id> --harness claude|codex|deepseek [--pid N]` (table `session_bindings`,
-migration 0034 ; une liaison active au plus par hôte, harnais et session).
-Le hook la retrouve par l'identifiant de session que le harnais lui passe en
-JSON ; si la liaison porte un PID, celui-ci doit être un ancêtre du processus
-du hook — et, L46 (migration 0036, `pid_start`), le MÊME processus : son heure
-de démarrage, relevée à la liaison, est recontrôlée ; un PID recyclé ne
-donne rien (re-lier avec `--pid`). L63 (migration 0048, `pid_started_at`) :
-cette heure est en secondes epoch, lue par la couche plateforme
-(`ameesh.platform`) sur tous les OS ; une ancienne `pid_start` (tops
-d'horloge Linux) reste lue par conversion, sous Linux seulement. Si l'OS ne
-donne ni l'ascendance ni l'heure de démarrage, `bind --pid` est refusé et le
-hook ne remet rien (jamais de contrôle muet). Source `session` : jamais liée à un bail, donc soumise à la règle L36
-(elle ne remplace pas la session enregistrée d'un agent), et sans effet dès
-que l'agent détient un bail vivant (il est alors mené par l'exécuteur ; `bind`
-le refuse d'emblée). `whoami`, `send` et `inbox`, lancés dans la session, la
-retrouvent par leur ascendance ; `whoami` affiche la source et la liaison.
-Sans liaison, le hook ne remet rien et n'écrit rien. `bind --import` reprend
-le fichier du pont local (`external-session-bindings.json`), `unbind` révoque,
-`bindings` liste ; chaque liaison et révocation est écrite dans le fil.
+**External sessions: explicit binding (L41, decision 0030).** An interactive
+session launched by a human has neither a lease nor `AGENT_MAIL_NAME`. It only has
+an identity if it is **bound**: `ameesh mail bind <agent> --session
+<id> --harness claude|codex|deepseek [--pid N]` (`session_bindings` table,
+migration 0034; at most one active binding per host, harness and session).
+The hook finds it through the session identifier the harness passes it in
+JSON; if the binding carries a PID, it must be an ancestor of the hook
+process — and, L46 (migration 0036, `pid_start`), the SAME process: its start
+time, recorded at binding, is rechecked; a recycled PID
+yields nothing (re-bind with `--pid`). L63 (migration 0048, `pid_started_at`):
+this time is in epoch seconds, read by the platform layer
+(`ameesh.platform`) on all OSes; an old `pid_start` (Linux clock
+ticks) is still read by conversion, on Linux only. If the OS
+provides neither ancestry nor start time, `bind --pid` is refused and the
+hook delivers nothing (never a silent check). Source `session`: never tied to a lease, hence subject to rule L36
+(it does not replace an agent's recorded session), and with no effect as soon
+as the agent holds a live lease (it is then driven by the runner; `bind`
+refuses it outright). `whoami`, `send` and `inbox`, run within the session,
+find it through their ancestry; `whoami` shows the source and the binding.
+Without a binding, the hook delivers nothing and writes nothing. `bind --import` takes over
+the local bridge file (`external-session-bindings.json`), `unbind` revokes,
+`bindings` lists; every binding and revocation is written to the thread.
 
-**Sans bail, jamais sur la ligne d'un agent `execute` (L46).** Un hook sans
-bail (source `explicit` ou `session`) ne fait avancer que `last_seen` sur la
-ligne d'un agent `execute` : ni hôte, ni harnais, ni session, ni dossier, ni
-chantier (une seule instruction, `registry.upsert_unleased`). Un agent inconnu
-naît `externe` ; la ligne d'un agent `externe` suit sa session (règle L36).
-La source `explicit` (`AGENT_MAIL_NAME` sans `AMEESH_RUNNER_ID`) ne reçoit
-rien tant que l'agent détient un bail vivant — refus dit par le hook, et
-appliqué sous verrou par la réservation elle-même pour toute identité sans
-bail. `ameesh mail bind` refuse un agent `execute` sauf `--force` (« agent
-mené par l'exécuteur ; une session externe lui volerait son courrier ») et
-inscrit un agent inconnu comme `externe`.
+**Without a lease, never on the row of an `execute` agent (L46).** A hook without
+a lease (source `explicit` or `session`) only advances `last_seen` on the
+row of an `execute` agent: no host, harness, session, directory or
+chantier (a single statement, `registry.upsert_unleased`). An unknown agent
+is born `externe`; the row of an `externe` agent follows its session (rule L36).
+Source `explicit` (`AGENT_MAIL_NAME` without `AMEESH_RUNNER_ID`) receives
+nothing while the agent holds a live lease — refusal stated by the hook, and
+enforced under lock by the reservation itself for any identity without a
+lease. `ameesh mail bind` refuses an `execute` agent unless `--force` ("agent
+mené par l'exécuteur ; une session externe lui volerait son courrier" (agent driven by the runner; an external session would steal its mail)) and
+registers an unknown agent as `externe`.
 
-**Courrier vers un agent inconnu ou arrêté (2026-10-11).** Avec la base,
-`send` refuse (code 2, rien n'est déposé) un destinataire absent du registre
-— sans créer d'agent, avec les noms proches —, un destinataire arrêté
-(`stopped`) sauf `--queue`, et une identité d'expéditeur arrêtée (avec
-l'identité liée à la session, `whoami`) ; « all » écarte les agents arrêtés.
-Le courrier en souffrance lève l'alerte `mail_undeliverable`, et `ameesh
-mail forward <ancien> <nouveau>` re-livre une boîte morte à un agent vivant,
-expéditeur et date d'origine gardés. Détail :
-[EXPLOITATION.md](EXPLOITATION.md), « Courrier en souffrance ».
+**Mail to an unknown or stopped agent (2026-10-11).** With the database,
+`send` refuses (code 2, nothing is deposited) a recipient absent from the registry
+— without creating an agent, listing close names —, a stopped recipient
+(`stopped`) unless `--queue`, and a stopped sender identity (with
+the identity bound to the session, `whoami`); "all" skips stopped agents.
+Undeliverable mail raises the `mail_undeliverable` alert, and `ameesh
+mail forward <ancien> <nouveau>` re-delivers a dead mailbox to a live agent,
+keeping the original sender and date. Details:
+[EXPLOITATION.md](EXPLOITATION.md), "Courrier en souffrance" (undeliverable mail).
 
-**Hooks : écrire d'abord, marquer ensuite.** Le JSON est écrit sur stdout et
-vidé (`flush`) *avant* de marquer les messages remis ; si le harnais a fermé son
-entrée (BrokenPipe), la remise n'a pas lieu et le courrier reste pour le tour
-suivant.
+**Hooks: write first, mark after.** The JSON is written to stdout and
+flushed (`flush`) *before* marking the messages delivered; if the harness has closed its
+input (BrokenPipe), delivery does not happen and the mail remains for the next
+turn.
 
-**Hooks : jamais dans un sous-agent (L133, 2026-10-11).** Claude Code
-déclenche aussi les hooks ordinaires (`PostToolUse`…) dans les sous-agents
-d'une session (outil Agent/Task, coéquipier en processus), avec le
-`session_id` de la session principale et l'environnement de l'agent ; Codex
-fait de même pour ses sous-agents (`spawn_agent`). Le hook remettait alors au
-sous-agent le courrier de l'agent, que le sous-agent ignorait, et le marquait
-livré : la session principale ne le recevait jamais (au moins cinq messages
-perdus les 10 et 11/10). Ces deux harnais ajoutent `agent_id` à l'entrée d'un
-hook déclenché dans un sous-agent, et seulement là : `agent_id` présent et non
-vide, le hook sort aussitôt, sans rien lire, remettre, marquer ni écrire
-(inscription, titre, compteurs), et sans rien afficher (une ligne « courrier
-en attente » se répéterait à chaque outil du sous-agent et coûterait un
-aller-retour à la base). Le courrier attend le prochain hook de la session
-principale. `agent_type` seul ne compte pas : Claude Code le pose aussi sur
-une session principale lancée avec `--agent`. Limite connue : le pont des
-hooks Claude Code du harnais DeepSeek (`dsh`) ne passe `agent_id` qu'à
-`SubagentStart` et `SubagentStop` ; d'après son code, un sous-agent `dsh`
-déclenche les hooks ordinaires sous son propre `session_id`. Une session liée
-par `bind` ne lui remet donc rien, mais un agent mené par l'exécuteur
-(identité par l'environnement) reste exposé : suite à traiter à part.
+**Hooks: never in a subagent (L133, 2026-10-11).** Claude Code
+also fires ordinary hooks (`PostToolUse`…) in a session's subagents
+(Agent/Task tool, in-process teammate), with the
+`session_id` of the main session and the agent's environment; Codex
+does the same for its subagents (`spawn_agent`). The hook then delivered the
+agent's mail to the subagent, which ignored it, and marked it
+delivered: the main session never received it (at least five messages
+lost on 10/10 and 11/10). These two harnesses add `agent_id` to the input of a
+hook fired in a subagent, and only there: with `agent_id` present and
+non-empty, the hook exits immediately, without reading, delivering, marking or writing anything
+(registration, title, counters), and without displaying anything (a "courrier
+en attente" (mail waiting) line would repeat on every subagent tool call and would cost a
+database round trip). The mail waits for the next hook of the main
+session. `agent_type` alone does not count: Claude Code also sets it on
+a main session launched with `--agent`. Known limitation: the DeepSeek harness's (`dsh`)
+Claude Code hook bridge only passes `agent_id` to
+`SubagentStart` and `SubagentStop`; according to its code, a `dsh` subagent
+fires ordinary hooks under its own `session_id`. A session bound
+with `bind` therefore delivers nothing to it, but an agent driven by the runner
+(identity through the environment) remains exposed: follow-up to handle separately.
 
-**Repli** : si Postgres est injoignable et que `AMEESH_BACKEND=auto`
-(défaut), la CLI écrit dans la boîte fichier v0
-(`~/.local/state/agent-mail`, mêmes noms de fichiers, même JSON) et affiche un
-avertissement lisible sur stderr. En mode `pg`, elle échoue franchement. Un
-schéma présent mais non migré n'est **pas** un repli silencieux : le message
-dit de lancer `agent-mesh migrate`. Les hooks, eux, ne font jamais échouer
-l'agent : toute erreur → sortie 0 sans rien.
-
----
-
-## 7. Banc de test
-
-`scripts/pg-up.sh` démarre `agent-mesh-pg` (`postgres:17`, port publié
-uniquement sur `127.0.0.1:55432`, volume nommé). `scripts/test.sh` lance la
-suite deux fois : pilote `psql`, puis pilote `psycopg` dans un venv local si
-l'installation est possible.
-
-63 tests `unittest` (stdlib), un schéma Postgres jetable et un état disque
-jetable par classe : migrations, mailbox, notifications, baux (courses à 2 et
-4 connexions, expiration, fencing), **deux exécuteurs concurrents qui se
-disputent un bail** (processus réels, un seul tour, codes 0 et 3), réveil sur
-NOTIFY en mode service avec sondage à 60 s (donc NOTIFY obligatoire), reprise
-de session des trois harnais, égalité du JSON des hooks avec la v0, et repli
-fichier.
-
-Aucun test ne lance un vrai harnais : les binaires de `tests/fakebin/`
-émettent les mêmes flux JSONL et journalisent leur argv. Aucun test ne touche
-`~/.local/bin`, `~/.local/state/agent-mail` (hors répertoires temporaires) ni
-les sessions réelles.
+**Fallback**: if Postgres is unreachable and `AMEESH_BACKEND=auto`
+(default), the CLI writes to the v0 file mailbox
+(`~/.local/state/agent-mail`, same file names, same JSON) and prints a
+readable warning on stderr. In `pg` mode, it fails outright. A
+schema that is present but not migrated is **not** a silent fallback: the message
+says to run `agent-mesh migrate`. Hooks, for their part, never make the
+agent fail: any error → exit 0 with nothing.
 
 ---
 
-## 8. Limites assumées et suites
+## 7. Test bench
 
-* **Aucun branchement sur les agents réels** cette nuit : c'est un banc. Le
-  passage en production sur ce PC se fera en installant le paquet dans un venv
-  (ou en lançant des wrappers `bin/`), en migrant le schéma `public`, puis en
-  remplaçant `nexlink-agent` par `agent-runner` — outil par outil.
-* **Un agent reste épinglé à son hôte** (v1) : déplacer une session est un
-  chantier séparé (R1/R5).
-* **L'autorité du propriétaire (R4)** et **`mesh list`** sont traités dans
-  [`V1-AUTORITE-MESH.md`](V1-AUTORITE-MESH.md) (points 3 à 5), avec
-  `signing.py`, `authority.py` et `mesh_cli.py`.
-* **Budget (L13, 0019)** : chaque tour écrit une ligne `turn_costs`
-  (comptabilité par tour, L12). Le travail comptable d'un tour est marqué
-  **en base** (`spend_pending`, migration 0025) avant le lancement : une ligne
-  présente, illisible ou incohérente au redémarrage = **pause comptable**
-  (fail-closed), la ligne n'étant effacée qu'après une écriture réussie ; si le
-  marqueur ne peut pas être posé, le tour ne démarre pas. Le modèle facturé est
-  la **source du tour** : le modèle annoncé par le flux du harnais, sinon celui
-  figé au lancement dans le marqueur ; s'il est inconnu, on facture le tarif le
-  plus cher connu de la famille (`deepseek-pro` pour DeepSeek), jamais le défaut.
-  DeepSeek n'annonce pas son modèle dans le flux : sans réglage, l'exécuteur
-  lui passe le modèle par défaut du descripteur (L60), qui devient le modèle
-  figé du tour.
-  Avant chaque tour, la garde interroge `CostBook.over` : plafond horaire
-  glissant de l'usage **payé au token** (`AMEESH_BUDGET_USD_PER_HOUR`, défaut
-  10 $/h ; le forfait Claude/Codex n'entre pas dans cette somme) et garde de
-  rythme des forfaits (`min(90 %, part écoulée + 10 points)`, jauges lues à la
-  source). La décision est fraîche à chaque tour ; seuls le statut et la trace
-  sont cadencés (`AMEESH_BUDGET_CHECK_INTERVAL`, défaut 30 s). Un agent en pause
-  est `blocked` avec la raison dans `status_text` (visible dans `ameesh list`)
-  et le fil en garde la trace. `budget_usd` / `spent_usd` restent les compteurs
-  historiques par agent ; `ameesh set <agent> model=… effort=…` règle le modèle
-  et l'effort, appliqués au tour suivant (options déclarées par harnais, patch
-  YAML pour DeepSeek).
-* **Portage (M1)** : le paquet est autonome (`pyproject.toml`, aucun import
-  d'un orchestrateur existant). Les tables et les colonnes
-  `kind`/`payload`/`work_item_id` sont prêtes pour une reprise côté
-  orchestrateur ; il restera à décider qui possède `work_items`.
+`scripts/pg-up.sh` starts `agent-mesh-pg` (`postgres:17`, port published
+only on `127.0.0.1:55432`, named volume). `scripts/test.sh` runs the
+suite twice: `psql` driver, then `psycopg` driver in a local venv if
+installation is possible.
+
+63 `unittest` tests (stdlib), a throwaway Postgres schema and a throwaway disk
+state per class: migrations, mailbox, notifications, leases (races with 2 and
+4 connections, expiry, fencing), **two concurrent runners competing
+for a lease** (real processes, a single turn, codes 0 and 3), wake-up on
+NOTIFY in service mode with 60 s polling (so NOTIFY is mandatory), session
+resume for the three harnesses, equality of the hook JSON with v0, and file
+fallback.
+
+No test launches a real harness: the binaries in `tests/fakebin/`
+emit the same JSONL streams and log their argv. No test touches
+`~/.local/bin`, `~/.local/state/agent-mail` (outside temporary directories) or
+real sessions.
+
+---
+
+## 8. Accepted limitations and follow-ups
+
+* **No hookup to the real agents** tonight: this is a test bench. Going
+  to production on this PC will be done by installing the package in a venv
+  (or by launching `bin/` wrappers), migrating the `public` schema, then
+  replacing `nexlink-agent` with `agent-runner` — tool by tool.
+* **An agent stays pinned to its host** (v1): moving a session is a
+  separate workstream (R1/R5).
+* **Owner authority (R4)** and **`mesh list`** are covered in
+  [`V1-AUTORITE-MESH.md`](V1-AUTORITE-MESH.md) (items 3 to 5), with
+  `signing.py`, `authority.py` and `mesh_cli.py`.
+* **Budget (L13, 0019)**: each turn writes a `turn_costs` row
+  (per-turn accounting, L12). A turn's accounting work is marked
+  **in the database** (`spend_pending`, migration 0025) before launch: a row
+  that is present, unreadable or inconsistent at restart = **accounting pause**
+  (fail-closed), the row only being cleared after a successful write; if the
+  marker cannot be set, the turn does not start. The billed model is
+  the **turn's source**: the model announced by the harness stream, otherwise the one
+  frozen at launch in the marker; if it is unknown, the most expensive known rate
+  of the family is billed (`deepseek-pro` for DeepSeek), never the default.
+  DeepSeek does not announce its model in the stream: without a setting, the runner
+  passes it the descriptor's default model (L60), which becomes the turn's
+  frozen model.
+  Before each turn, the guard queries `CostBook.over`: sliding hourly cap
+  on **pay-per-token** usage (`AMEESH_BUDGET_USD_PER_HOUR`, default
+  $10/h; the Claude/Codex plan does not count toward this sum) and the plans'
+  pacing guard (`min(90 %, part écoulée + 10 points)`, gauges read at the
+  source). The decision is fresh on every turn; only the status and the trace
+  are rate-limited (`AMEESH_BUDGET_CHECK_INTERVAL`, default 30 s). A paused agent
+  is `blocked` with the reason in `status_text` (visible in `ameesh list`)
+  and the thread keeps a record of it. `budget_usd` / `spent_usd` remain the historical
+  per-agent counters; `ameesh set <agent> model=… effort=…` sets the model
+  and effort, applied on the next turn (options declared per harness, YAML
+  patch for DeepSeek).
+* **Porting (M1)**: the package is standalone (`pyproject.toml`, no import
+  from an existing orchestrator). The tables and the
+  `kind`/`payload`/`work_item_id` columns are ready for a takeover on the
+  orchestrator side; it remains to decide who owns `work_items`.
