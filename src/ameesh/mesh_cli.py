@@ -2038,6 +2038,11 @@ def build_parser() -> argparse.ArgumentParser:
     pa_ok.add_argument("account", nargs="?", default="",
                        help="declared account (default: the harness's default credential)")
     pa_ok.set_defaults(func=cmd_accounts)
+    pa_check = acc_sub.add_parser(
+        "check", help="probe every credential of this host and report its health (L226a)")
+    pa_check.add_argument("--json", action="store_true")
+    pa_check.add_argument("--dry-run", action="store_true", help="probe only, write nothing")
+    pa_check.set_defaults(func=cmd_accounts)
     p_acc.set_defaults(func=cmd_accounts)
 
     # L70 : plafonds de budget du mesh, en base (`ameesh budget [set|unset]`)
@@ -2259,6 +2264,17 @@ def cmd_accounts(cfg: Config, args) -> int:
                     print(texte)
                 else:
                     print("accounts %s: already automatic" % nom)
+            return 0
+        if what == "check":
+            from . import sentinel
+            rows = sentinel.check(cfg, db, dry_run=args.dry_run)
+            if args.json:
+                print(json.dumps({"schema": "ameesh-credentials-check/1", "host": cfg.host,
+                                  "credentials": rows}, ensure_ascii=False, indent=2))
+            else:
+                for row in rows:
+                    print("%-8s %-12s %-8s %s" % (row["harness"], row["account"] or "(default)",
+                                                  row["state"], row["reason"]))
             return 0
         if what == "healthy":
             items = declares.get(args.harness) or []

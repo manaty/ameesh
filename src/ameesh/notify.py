@@ -90,7 +90,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # L225 : des tours sans tarif au barème échappent à la dépense
                  "turn_unpriced",
                  # L226b : un agent attend un compte authentifié sain
-                 "auth_blocked")
+                 "auth_blocked",
+                 # L226a : un identifiant est en échec, ou expire bientôt
+                 "credential_failing", "credential_expiring")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -135,6 +137,8 @@ TYPE_LABELS = {
     "balance_low": "low balance",
     "host_not_ready": "host not ready",
     "auth_blocked": "authentication failing",
+    "credential_failing": "credential failing",
+    "credential_expiring": "credential expiring soon",
     "host_power_low": "host battery low",
     "backlog_empty": "improvement backlog empty",
     "mail_undeliverable": "undeliverable mail",
@@ -155,7 +159,8 @@ TYPE_LABELS = {
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
-                "mail_undeliverable", "ci_main_red", "auth_blocked")
+                "mail_undeliverable", "ci_main_red", "auth_blocked",
+                "credential_failing")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.

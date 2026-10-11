@@ -331,6 +331,9 @@ class Config:
     #: L131: heavy suites run at once on this host (`ameesh heavy`); 0 = a
     #: quarter of the CPUs, at least 1
     max_heavy_suites: int = 0
+    #: L226a: the `credential_sentinel` key of the host configuration
+    #: (`probes`, `gcloud_session_hours`, `warn_hours`), read by `ameesh.sentinel`
+    credential_sentinel: dict = field(default_factory=dict)
     #: issues GitHub des lots (L126) : la clé `github` du fichier de
     #: configuration de l'HÔTE, telle quelle (`projects` : projet → dépôt,
     #: `host` : hôte désigné pour la projection automatique, `interval`,

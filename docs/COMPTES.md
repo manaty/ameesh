@@ -312,3 +312,52 @@ ameesh accounts healthy claude              # harness without declared accounts
 ```
 
 `ameesh accounts list --json` shows the table (`credentials`).
+
+## 6. Credential sentinel (L226a)
+
+Every 10 minutes, each host probes every credential its agents use and
+writes the result to `credential_health` (`source = 'sentinel'`):
+
+| harness | probe | forecast expiry | fix command in the alert |
+|---|---|---|---|
+| `claude` | per declared account (or default dir): `.credentials.json` has a refresh token not expired | `refreshTokenExpiresAt` | `CLAUDE_CONFIG_DIR=<dir> claude, then /login` |
+| `codex` | per declared account: `auth.json` has a refresh token or an API key | — | `CODEX_HOME=<dir> codex login` |
+| `gcloud` | `gcloud auth print-access-token` | last interactive login (mtime of `credentials.db`) + Workspace session length | `gcloud auth login --update-adc` |
+| `gh` | `gh auth status` | — | `gh auth login -h github.com` |
+| `scw` | `scw account project list` | — | `scw init` |
+
+A harness whose binary is missing, or whose default credential file is
+absent without declared accounts, is not used on the host: it is skipped. A
+probe that cannot conclude (timeout, unreadable file) writes `unknown`,
+which is never a verdict. The sentinel reads names, paths and dates only and
+never prints a secret. An `api_key_env` account is checked for the presence
+of its key.
+
+Alerts, computed by `ameesh notify` from the table (all hosts):
+
+* `credential_failing` (pushed by default, urgent): a credential is
+  `failing`, from a probe or from a refused turn (L226b). Its detail ends with
+  the exact fix command. There is one alert per (host, harness, account,
+  start of failure), and it resolves when the credential is `healthy` again;
+* `credential_expiring` (pushed by default): a healthy credential's forecast
+  expiry is less than `warn_hours` away (default 24 h). This warns before
+  gcloud asks to log in again in the middle of a release.
+
+Setup on each host (systemd user units, same environment as the runner):
+
+```sh
+cp deploy/systemd/ameesh-credentials.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ameesh-credentials.timer
+ameesh accounts check --dry-run      # probe now, write nothing
+```
+
+Optional host configuration, key `credential_sentinel`:
+
+```json
+"credential_sentinel": {"probes": ["claude", "codex", "gcloud", "gh", "scw"],
+                        "gcloud_session_hours": 16, "warn_hours": 24}
+```
+
+`gcloud_session_hours` must match the Workspace admin setting
+(*Security > Google Cloud session control*). The default is 16 h.
