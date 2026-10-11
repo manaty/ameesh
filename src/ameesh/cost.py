@@ -871,12 +871,17 @@ class CostBook:
         if harness == "claude":
             totals = [float(e["total_cost_usd"]) for e in events
                       if e.get("type") == "result" and isinstance(e.get("total_cost_usd"), (int, float))]
-            usage = [e.get("usage") or {} for e in events if e.get("type") == "result"]
+            # L221 : un `result` sans usage ne dit rien des jetons du tour ; le
+            # garder (`[{}]`, vrai pour Python) sautait le repli L105 et faisait
+            # du cumul du processus le coût d'un tour à 0 jeton (tour 2260).
+            usage = [e["usage"] for e in events
+                     if e.get("type") == "result" and _has_tokens(e.get("usage"))]
             last = cum.get("cum_usd")
             if not usage:
                 # L105 : tour clos avant son `result` (plafond du tour, arrêt,
-                # préemption) — l'usage de chaque appel, lu sur les messages du
-                # modèle (une fois par id), au barème ; aucun cumul n'est relevé.
+                # préemption), ou `result` sans usage (L221) — l'usage de chaque
+                # appel, lu sur les messages du modèle (une fois par id), au
+                # barème ; le cumul n'en fait jamais le coût du tour.
                 usage = _claude_call_usages(events)
                 usd = sum(
                     ((_num(u, "input_tokens") + _num(u, "cache_creation_input_tokens")) * pin
@@ -1210,6 +1215,13 @@ def format_totals(sums: dict) -> list:
         lines.append("mode de paiement inconnu          : 1 h %.4f $ · 24 h %.4f $" % (
             sums["unknown"]["1h"], sums["unknown"]["24h"]))
     return lines
+
+
+def _has_tokens(usage) -> bool:
+    """L221 : un usage Claude qui compte au moins un jeton."""
+    return isinstance(usage, dict) and any(
+        _num(usage, k) > 0 for k in ("input_tokens", "cache_creation_input_tokens",
+                                     "cache_read_input_tokens", "output_tokens"))
 
 
 def _claude_call_usages(events: Sequence[dict]) -> list[dict]:
