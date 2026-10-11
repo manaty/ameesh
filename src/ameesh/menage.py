@@ -37,15 +37,18 @@ l'humain. Quatre familles, quatre règles :
   `git cherry`, `git merge-tree`) ; sinon GARDÉS et signalés (`worktree_kept`) au
   responsable.
 
-* **Entrées de `/tmp` laissées par un tour** (L162 : clone de relecture,
-  `--cacheDirectory` explicite, image `docker save`) : apparues pendant le
-  tour d'un agent, elles sont signalées (`tmp_orphan`) avec la commande à
-  lancer ; une entrée signalée est SUPPRIMÉE par le passage périodique si
-  elle est un enfant direct du `/tmp` du système, à l'utilisateur, la même
-  que celle signalée (inode), attribuée à un agent du registre sans tour en
-  cours, rien dedans n'a changé depuis `orphan_idle` (2 h, mtime ET ctime),
-  aucun processus ne la tient, et aucune copie git dedans n'a de travail non
-  commité ou non poussé (`orphan_cleanup: false` : jamais, par hôte).
+* **Entrées de `/tmp` apparues pendant un tour** (L162 : clone de relecture,
+  `--cacheDirectory` explicite, image `docker save`) : elles sont signalées
+  (`tmp_orphan`) avec la commande à lancer, NON ATTRIBUÉES (#222 : `/tmp` est
+  commun à l'hôte, rien ne prouve quel tour les a créées), donc JAMAIS
+  supprimées par ameesh ; l'alerte les suit, taille à jour, tant qu'elles
+  existent. Seul un signalement attribué d'avant #222 est encore SUPPRIMÉ par
+  le passage périodique si l'entrée est un enfant direct du `/tmp` du
+  système, à l'utilisateur, la même que celle signalée (inode), attribuée à
+  un agent du registre sans tour en cours, rien dedans n'a changé depuis
+  `orphan_idle` (2 h, mtime ET ctime), aucun processus ne la tient, et aucune
+  copie git dedans n'a de travail non commité ou non poussé
+  (`orphan_cleanup: false` : jamais, par hôte).
 
 Ce qu'ameesh n'a pas créé ni vu apparaître pendant un tour n'est JAMAIS
 supprimé automatiquement. Toute suppression dans un dossier géré passe par
@@ -98,8 +101,8 @@ UNATTRIBUTED = "non attribué"
 WALK_LIMIT = 300_000
 #: délai maximal d'une commande git (secondes)
 GIT_TIMEOUT = 20.0
-#: L162 : inactivité (secondes) au-delà de laquelle une entrée de /tmp laissée
-#: par un tour est supprimée (`policy.housekeeping.orphan_idle`)
+#: L162: idle time (seconds) after which a /tmp entry signaled with an agent
+#: (before #222) is deleted (`policy.housekeeping.orphan_idle`)
 DEFAULT_ORPHAN_IDLE_S = 2 * 3600.0
 #: L162 : horizon des signalements relus par le passage (le journal en garde 30 j)
 ORPHAN_LOOKBACK_S = 7 * 24 * 3600.0
@@ -879,9 +882,10 @@ def new_tmp_entries(before: set[str] | None, *, path: str | None = None,
 
 
 # --------------------------------------------------------------------------
-# /tmp du système : entrées laissées par un tour, supprimées si abandonnées
-# (L162 ; incident du 2026-10-11 à 03:38 : tmpfs de 12 Go plein à 83 %,
-# porte de pression fermée, treize agents au repos)
+# system /tmp: entries that appeared during a turn, signaled and never deleted
+# since #222; a signal attributed before #222 is deleted once abandoned (L162;
+# incident of 2026-10-11 at 03:38: 12 GB tmpfs 83 % full, pressure gate
+# closed, thirteen agents idle)
 # --------------------------------------------------------------------------
 
 def _blocks(st) -> int:
@@ -1067,10 +1071,12 @@ def _orphan_verdict(row: dict, policy: Policy, *, base: str, registered, protect
     if problem:
         return "garde", problem
     agent = row.get("agent")
+    if not agent:   # #222: unattributed, hence never deleted
+        return "garde", "jamais supprimé par ameesh : %s" % UNATTRIBUTED
     if registered is None:
         return "garde", "registre illisible"
-    if not agent or agent not in registered:
-        return "garde", "agent %s absent du registre" % (agent or "?")
+    if agent not in registered:
+        return "garde", "agent %s absent du registre" % agent
     if agent in running:
         return "attend", "tour en cours de %s" % agent
     target = _real(path)
@@ -1821,8 +1827,10 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
       tourne (`busy` faux) ;
     * worktrees suivis dont le lot est fini : retirés s'ils sont propres et
       intégrés (garde-fous de `_worktree_pass`), sinon gardés et signalés ;
-    * entrées de /tmp signalées pendant un tour : supprimées si abandonnées
-      (garde-fous de `_orphan_verdict`, L162), sinon dites avec la raison ;
+    * entrées de /tmp signalées pendant un tour : jamais supprimées si non
+      attribuées (#222) ; un signalement attribué d'avant #222, supprimé si
+      abandonné (garde-fous de `_orphan_verdict`, L162) ; sinon dites avec la
+      raison ;
     * bilan (`mesure`), avec les plus grosses entrées de /tmp si le tmpfs
       atteint l'alerte.
 
@@ -1958,8 +1966,9 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     conteneurs = reap_containers(runtime, db, host, dry_run=dry_run)
     entries += conteneurs["entries"]
     plan += conteneurs["plan"]
-    # 5. entrées de /tmp laissées par un tour (L162) : supprimées si
-    #    abandonnées (garde-fous de `_orphan_verdict`), sinon signalées
+    # 5. /tmp entries signaled during a turn (L162): unattributed ones are
+    #    never deleted (#222), an attributed one (before #222) is deleted once
+    #    abandoned (`_orphan_verdict` guards), the others are told
     gardes = protected | {troot, croot, cfg.state_dir}
     try:
         orphan_entries, orphan_plan, orphans = orphan_pass(
@@ -2059,7 +2068,8 @@ def print_report(report: dict) -> None:
                                               c.get("status") or "?", c["command"]))
     orphans = report.get("orphans") or []
     if orphans:
-        print("  entrées de /tmp laissées par un tour (supprimées seules une fois abandonnées) :")
+        print("  entrées de /tmp apparues pendant un tour (jamais supprimées par ameesh, sauf un "
+              "signalement attribué d'avant #222 une fois abandonné) :")
         for o in orphans:
             print("    %s  %s  (agent %s)  %s%s  →  %s" % (
                 _fmt(o["bytes"]), o["path"], o.get("agent") or "?", o.get("status") or "",
@@ -2069,10 +2079,14 @@ def print_report(report: dict) -> None:
         print("  plus grosses entrées de %s :" % ((m.get("system_tmp") or {}).get("tmp_path")
                                                    or "/tmp"))
         for e in top:
+            if e.get("agent"):
+                sort = ", laissée par %s : %s" % (e["agent"], e.get("status") or "?")
+            elif e.get("status"):   # #222: signaled during a turn, never charged to it
+                sort = ", apparue pendant un tour, non attribuée : à décider"
+            else:
+                sort = ", hors tour d'agent : à décider"
             print("    %s  %s  (%s%s)  →  %s" % (
-                _fmt(e.get("bytes")), e["path"], e.get("owner") or "?",
-                ", laissée par %s : %s" % (e["agent"], e.get("status") or "?")
-                if e.get("agent") else ", hors tour d'agent : à décider",
+                _fmt(e.get("bytes")), e["path"], e.get("owner") or "?", sort,
                 e.get("command") or ""))
 
 
