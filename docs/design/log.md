@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-11 (issues GitHub des lots)
+* **L126**, accord du propriétaire : chaque lot a son issue GitHub, créée et tenue par ameesh (`ameesh work project-github --app <projet>`, tenue par `ameesh notify` sur l'hôte désigné), dans le dépôt que la configuration de l'hôte associe au projet (`github.projects`) ; un dépôt public ne reçoit que le titre et un résumé public contrôlés (secrets, termes exclus, adresses, chemins, noms d'hôte, identifiants refusés) ; fermeture commentée, `issue_ref` posée, « Closes #n » relie la PR au lot. Sans migration. Consigne : [ORCHESTRATEUR.md](../ORCHESTRATEUR.md).
+
 ## 2026-10-11 (courrier en souffrance)
 * **Correctif** : 42 messages entre agents jamais livrés, sans qu'aucun expéditeur le sache (27 à « orchestrator », un fantôme créé par l'envoi ; 15 à un agent arrêté dont l'ancienne session écrivait encore sous son nom). Désormais `ameesh mail send` refuse un nom absent du registre sans rien créer (noms proches : distance d'édition, préfixe, orchestrateurs de l'équipe pour un nom de rôle), un destinataire arrêté sauf `--queue` (depuis quand, raison, responsable, agent qui a repris) et une identité d'expéditeur arrêtée (avec `whoami`) ; « all » écarte les agents arrêtés ; un envoi ne touche plus le registre. Alerte `mail_undeliverable` (15 min, urgente : responsable humain et orchestrateurs de l'équipe), messages en souffrance dans `ameesh projects`, et `ameesh mail forward <ancien> <nouveau>` pour vider une boîte morte. Sans migration. Voir [EXPLOITATION.md](../EXPLOITATION.md), « Courrier en souffrance ».
 

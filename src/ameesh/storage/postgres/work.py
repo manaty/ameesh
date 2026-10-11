@@ -614,6 +614,28 @@ class WorkItems(interface.WorkItems):
             "   AND starts_with(note, %s)", (float(seconds), note_prefix))
         return int(rows[0]["n"]) if rows else 0
 
+    # -- issues GitHub des lots (L126) ------------------------------------------
+    def issue_feed(self, limit) -> list[dict]:
+        """Lots ouverts ou porteurs d'une `issue_ref` (les plus récents d'abord
+        pour la borne), rendus par id croissant, avec l'équipe de leur fiche et
+        l'équipe, le chantier et l'hôte de leur assigné."""
+        return self.db.query(
+            "SELECT w.*, k.team AS package_team, r.team AS assignee_team,"
+            "       r.chantier AS assignee_chantier, r.host AS assignee_host"
+            "  FROM (SELECT %s FROM work_items"
+            "         WHERE state NOT IN %s OR coalesce(btrim(issue_ref), '') <> ''"
+            "         ORDER BY id DESC LIMIT %%s) w"
+            "  LEFT JOIN work_packages k ON k.id = w.package_id"
+            "  LEFT JOIN agent_registry r ON r.name = w.assignee"
+            " ORDER BY w.id" % (ITEM_COLUMNS, _CLOSED), (int(limit),))
+
+    def set_issue_ref(self, item_id, issue_ref, *, current) -> bool:
+        rows = self.db.query(
+            "UPDATE work_items SET issue_ref = %s"
+            " WHERE id = %s AND coalesce(issue_ref, '') = coalesce(%s, '')"
+            " RETURNING id", (issue_ref, int(item_id), current))
+        return bool(rows)
+
     def _event(self, item_id, state, note, actor) -> None:
         self.db.execute(
             "INSERT INTO work_item_events (work_item_id, state, note, actor) "
