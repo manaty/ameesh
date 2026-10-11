@@ -27,6 +27,11 @@ Le résultat est un journal de l'hôte, pas une table : le dernier passage dans
 passage dans `<projet>.jsonl` avec les changements d'état, pour calibrer.
 Pendant cette phase d'observation, le radar n'envoie AUCUN courrier (L160c).
 
+L160d: each pair in conflict gets its resolver, and a pair whose resolution
+was prepared (`ameesh work resolve`, `ameesh.resolutions`) is replayed in the
+radar's private clone (`<projet>.clone`): `prepared` if `rerere` resolves
+every conflicted path, `stale` otherwise.
+
 Configuration de l'hôte (clé `radar`) :
 
     "radar": {"projects": {"ameesh": {"repo": "~/work/ameesh",
@@ -209,9 +214,12 @@ class Cache:
     def __init__(self) -> None:
         self.merges: dict = {}
         self.diffs: dict = {}
+        # L160d: change sizes for the resolver, replays of prepared resolutions
+        self.sizes: dict = {}
+        self.replays: dict = {}
 
     def trim(self) -> None:
-        for table in (self.merges, self.diffs):
+        for table in (self.merges, self.diffs, self.sizes, self.replays):
             while len(table) > MAX_CACHE:
                 table.pop(next(iter(table)))
 
@@ -355,6 +363,8 @@ def summary(report: dict) -> dict:
             "pairs_checked": report.get("pairs_checked", 0),
             "overlap": sum(1 for p in pairs if p["state"] == "overlap"),
             "conflict": sum(1 for p in pairs if p["state"] == "conflict"),
+            "prepared": sum(1 for p in pairs if p["state"] == "prepared"),
+            "stale": sum(1 for p in pairs if p["state"] == "stale"),
             "target_conflict": sum(1 for a in report.get("against_target") or ()
                                    if a["state"] == "conflict"),
             "migration_duplicates": len(report.get("migrations") or ())}
@@ -406,12 +416,43 @@ def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None =
             error = None
         except (GitError, plan_git.MergeProbeError, OSError) as exc:
             report, error = {"repo": project.repo}, "%s : %s" % (type(exc).__name__, exc)
+        if not error:
+            annotate_resolutions(cfg, db, project, report, lots, cache)
         report.update(schema=SCHEMA, project=project.name, ts=started,
                       duration_s=round(now() - started, 3), error=error)
         line = write_journal(cfg, project.name, report)
         sent = [] if error else send_mail(cfg, db, project, report, ci=ci)
         lines.append(dict(line, project=project.name, mail=sent))
     return lines
+
+
+def clone_dir(cfg, project: str) -> str:
+    """The radar's private clone of a project (L160d)."""
+    return os.path.join(journal_dir(cfg), project + ".clone")
+
+
+def annotate_resolutions(cfg, db, project: Project, report: dict, lots: list[dict],
+                         cache: Cache | None) -> None:
+    """L160d: resolver of each pair in conflict, replay of the prepared
+    resolutions (`ameesh.resolutions.annotate`). Never raises: an error is
+    noted in the report and the pairs stay `conflict`."""
+    from . import resolutions, storage
+    conflicted = sorted({n for p in report.get("pairs") or () if p["state"] == "conflict"
+                         for n in p["lots"]})
+    if not conflicted:
+        return
+    try:
+        rows = storage.of(db).work.resolutions(conflicted)
+    except Exception as exc:  # noqa: BLE001 - e.g. database not yet migrated (0057)
+        rows = []
+        report["resolution_error"] = "%s: %s" % (type(exc).__name__, exc)
+    try:
+        resolutions.annotate(report, rows, {int(r["id"]): r for r in lots},
+                             replayer=resolutions.Replayer(project.repo,
+                                                           clone_dir(cfg, project.name)),
+                             cache=cache)
+    except Exception as exc:  # noqa: BLE001 - never fatal for the pass
+        report["resolution_error"] = "%s: %s" % (type(exc).__name__, exc)
 
 
 # --------------------------------------------------------------------------
@@ -476,7 +517,14 @@ def conflicts_of(report: dict) -> dict:
         if pair["state"] == "conflict":
             out["pair:%d-%d" % tuple(pair["lots"])] = {
                 "kind": "pair", "lots": list(pair["lots"]), "files": pair["files"],
-                "target": pair["target"]}
+                "target": pair["target"], "resolver": pair.get("resolver")}
+        elif pair["state"] == "stale":
+            # L160d: only the lot that prepared the resolution is told
+            resolution = pair["resolution"]
+            out["stale:%d-%d" % tuple(pair["lots"])] = {
+                "kind": "stale", "lots": [resolution["by"]], "pair": list(pair["lots"]),
+                "files": resolution.get("remaining") or pair["files"],
+                "target": pair["target"], "commit": resolution["commit"]}
     for one in report.get("against_target") or ():
         if one["state"] == "conflict":
             out["target:%d" % one["work_item"]] = {
@@ -515,11 +563,31 @@ def message_text(conflict: dict, lot: int, branches: dict, *, ci=None,
                               if merged else "", conflict["target"]))
     if conflict["kind"] == "pair":
         other = [n for n in conflict["lots"] if n != lot][0]
+        resolver = conflict.get("resolver") or {}
+        if resolver.get("lot") == lot:
+            todo = ("C'est à toi de préparer la résolution (%s), au fil du travail : "
+                    "`ameesh work resolve %d --with %d` ; ta branche ne change pas."
+                    % (RESOLVER_REASONS.get(resolver.get("reason"), resolver.get("reason")),
+                       lot, other))
+        elif resolver.get("lot") == other:
+            todo = ("Le lot #%d prépare la résolution (%s) : rien à faire pour toi."
+                    % (other, RESOLVER_REASONS.get(resolver.get("reason"),
+                                                   resolver.get("reason"))))
+        else:
+            todo = ("Le second des deux à entrer dans %s devra résoudre."
+                    % conflict["target"])
         return ("%s : ta branche et celle du lot %s se fusionnent en conflit sur %s. Rien "
-                "ne bloque encore : le second des deux à entrer dans %s devra résoudre ; "
-                "tu seras réveillé si c'est toi et que ta PR est verte."
-                % (head, _who(branches, other), _files(conflict["files"]),
+                "ne bloque encore. %s Tu seras réveillé si l'autre lot entre dans %s avant "
+                "toi et que ta PR est verte."
+                % (head, _who(branches, other), _files(conflict["files"]), todo,
                    conflict["target"]))
+    if conflict["kind"] == "stale":
+        other = [n for n in conflict["pair"] if n != lot][0]
+        return ("%s : ta résolution préparée avec le lot %s (%s) ne couvre plus le conflit, "
+                "qui a changé sur %s. Refais-la : `ameesh work resolve %d --with %d` (les "
+                "blocs inchangés reviennent résolus)."
+                % (head, _who(branches, other), conflict["commit"][:12],
+                   _files(conflict["files"]), lot, other))
     if conflict["kind"] == "target":
         return ("%s : ta branche %s ne fusionne plus proprement dans %s (conflit sur %s). "
                 "Intègre %s dans ta branche avant ta demande de fusion ; tu seras réveillé "
@@ -533,6 +601,15 @@ def message_text(conflict: dict, lot: int, branches: dict, *, ci=None,
                " ; aussi pris par le lot %s" % ", ".join(others) if others else "",
                " ; déjà dans %s : %s" % (conflict["target"], conflict["in_target"])
                if conflict.get("in_target") else "", conflict["target"]))
+
+
+#: why a lot is the resolver of a pair (L160d), for the mail
+RESOLVER_REASONS = {
+    "priority": "l'autre lot est plus prioritaire et fusionnera d'abord",
+    "state": "l'autre lot est plus avancé et fusionnera d'abord",
+    "smaller change": "ton changement est le plus petit dans les fichiers en conflit",
+    "newer lot": "ton lot est le plus récent",
+}
 
 
 def _notified_path(cfg, project: str) -> str:
@@ -643,20 +720,34 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
     s = summary(report)
     when = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(report.get("ts") or 0))
     out = ["%s : passage du %s UTC (%.1f s), %d branche(s), %d paire(s) de même cible, "
-           "%d qui se recouvrent, %d en conflit, %d lot(s) en conflit avec leur cible, "
-           "%d numéro(s) de migration en double"
+           "%d qui se recouvrent, %d en conflit (%d préparée(s), %d périmée(s)), "
+           "%d lot(s) en conflit avec leur cible, %d numéro(s) de migration en double"
            % (report.get("project"), when, report.get("duration_s") or 0, s["branches"],
-              s["pairs_checked"], s["overlap"] + s["conflict"], s["conflict"],
+              s["pairs_checked"], s["overlap"] + s["conflict"] + s["prepared"] + s["stale"],
+              s["conflict"] + s["prepared"] + s["stale"], s["prepared"], s["stale"],
               s["target_conflict"], s["migration_duplicates"])]
     if report.get("error"):
         out.append("  erreur : %s" % report["error"])
+    if report.get("resolution_error"):
+        out.append("  résolutions : %s" % report["resolution_error"])
     for pair in report.get("pairs") or ():
         if pair["state"] == "overlap" and not everything:
             continue
-        files = pair["files"] if pair["state"] == "conflict" else pair["shared"]
-        out.append("  %-8s %s %s  %s" % (pair["state"], _lot(pair["lots"][0]),
-                                         _lot(pair["lots"][1]), ", ".join(files[:6])
-                                         + (" …" if len(files) > 6 else "")))
+        files = pair["shared"] if pair["state"] == "overlap" else pair["files"]
+        resolver = pair.get("resolver") or {}
+        resolution = pair.get("resolution") or {}
+        out.append("  %-8s %s %s  %s%s%s" % (
+            pair["state"], _lot(pair["lots"][0]), _lot(pair["lots"][1]),
+            ", ".join(files[:6]) + (" …" if len(files) > 6 else ""),
+            "  [résolveur %s : %s]" % (_lot(resolver["lot"]), resolver["reason"])
+            if resolver else "",
+            "  [résolution %s par %s%s]" % (
+                resolution["commit"][:12], _lot(resolution["by"]),
+                ", reste : %s" % ", ".join(resolution["remaining"][:6])
+                if resolution.get("remaining") else
+                ", rejeu %s" % resolution["replay"]
+                if resolution.get("replay") not in ("prepared", "stale") else "")
+            if resolution else ""))
     for one in report.get("against_target") or ():
         if one["state"] == "clean" and not everything:
             continue

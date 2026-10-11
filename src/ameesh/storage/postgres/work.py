@@ -31,6 +31,12 @@ ITEM_COLUMNS = """
     extract(epoch from due_at)::float8 as due_ts
 """
 
+#: L160d (0057): a prepared conflict resolution
+RESOLUTION_COLUMNS = """
+    work_item_id, other_item_id, commit_sha, lot_tip, other_tip, ref, files, created_by,
+    extract(epoch from created_at)::float8 as created_ts
+"""
+
 #: états de lot terminés (une délégation n'y a plus d'objet)
 _CLOSED = "('merged', 'promoted', 'closed')"
 
@@ -510,6 +516,43 @@ class WorkItems(interface.WorkItems):
         rows = self.db.query(
             "SELECT id, title, state FROM work_items WHERE migration = %s", (int(number),))
         return rows[0] if rows else None
+
+    # -- prepared conflict resolutions (L160d, 0057) ---------------------------
+    def record_resolution(self, item_id, other_id, *, commit, lot_tip, other_tip, ref,
+                          files, note, actor) -> dict | None:
+        """Upsert of the pair's resolution and its journal line, in one
+        transaction. `files` goes through JSON: the psql driver binds no
+        arrays."""
+        with self.db.transaction() as tx:
+            lots = tx.query("SELECT id, state FROM work_items WHERE id IN (%s, %s)",
+                            (int(item_id), int(other_id)))
+            states = {int(r["id"]): r["state"] for r in lots}
+            if len(states) != 2:
+                return None
+            rows = tx.query(
+                "INSERT INTO work_resolutions (work_item_id, other_item_id, commit_sha,"
+                "                              lot_tip, other_tip, ref, files, created_by)"
+                " VALUES (%%s, %%s, %%s, %%s, %%s, %%s,"
+                "         ARRAY(SELECT jsonb_array_elements_text(%%s::jsonb)), %%s)"
+                " ON CONFLICT (work_item_id, other_item_id) DO UPDATE SET"
+                "   commit_sha = excluded.commit_sha, lot_tip = excluded.lot_tip,"
+                "   other_tip = excluded.other_tip, ref = excluded.ref,"
+                "   files = excluded.files, created_by = excluded.created_by,"
+                "   created_at = now()"
+                " RETURNING %s" % RESOLUTION_COLUMNS,
+                (int(item_id), int(other_id), commit, lot_tip, other_tip, ref,
+                 json.dumps(list(files or ())), actor or ""))
+            WorkItems(tx)._event(int(item_id), states[int(item_id)], note, actor)
+            return rows[0]
+
+    def resolutions(self, item_ids) -> list[dict]:
+        ids = json.dumps(sorted({int(i) for i in item_ids or ()}))
+        return self.db.query(
+            "SELECT %s FROM work_resolutions"
+            " WHERE work_item_id IN (SELECT jsonb_array_elements_text(%%s::jsonb)::bigint)"
+            "    OR other_item_id IN (SELECT jsonb_array_elements_text(%%s::jsonb)::bigint)"
+            " ORDER BY created_at DESC, work_item_id, other_item_id"
+            % RESOLUTION_COLUMNS, (ids, ids))
 
     def set_branch_head(self, item_id, branch, head) -> bool:
         """Retient le dernier commit de la branche vu en avance sur sa cible

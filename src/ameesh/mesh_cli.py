@@ -21,6 +21,7 @@
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   réassigner (attribution gardée)
   agent-mesh work merged <id> --sha S [--note …]   fusion faite hors PR : tout état ouvert → merged
   agent-mesh work migration <id> [--number N | --release]   réserver le numéro de migration du lot (L122)
+  agent-mesh work resolve <id> --with <autre> [--done | --abort]   résolution préparée d'un conflit (L160d)
   agent-mesh work move <id> merged --correct "raison"   corriger un promoted posé par erreur
                                                 (l'acteur des commandes work : --actor, sinon
                                                 l'identité liée de la session, sinon « inconnu »)
@@ -815,6 +816,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "unrecorded":   # demandes d'humains sans lot (L130)
             from . import unrecorded
             return unrecorded.run(cfg, db, args)
+        if args.work_command == "resolve":   # prepared conflict resolutions (L160d)
+            from . import resolutions
+            return resolutions.run(cfg, db, args)
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
@@ -962,6 +966,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             item["estimate_reference"] = estimates.proposal(
                 db, type=item.get("type"), size=item.get("change_size"),
                 assignee=item.get("assignee"))
+            # L160d : résolutions préparées où le lot est l'un des deux côtés
+            from . import resolutions
+            item["resolutions"] = resolutions.of_lot(db, args.id)
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
@@ -1011,6 +1018,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     if item.get("branch_head") else ""))
             if item.get("migration"):
                 print("migration: %04d réservée (L122)" % item["migration"])
+            for line in resolutions.show_lines(item["resolutions"], args.id):
+                print("résolut. : %s" % line)
             if item.get("waiting_for"):
                 print("attend   : %s" % item["waiting_for"]["label"])
             if item.get("delegation"):
@@ -1806,6 +1815,8 @@ def build_parser() -> argparse.ArgumentParser:
     backlog.add_parsers(work_sub, cmd_work)  # file d'amélioration (L119, 0037)
     from . import unrecorded
     unrecorded.add_parser(work_sub, cmd_work)  # demandes d'humains sans lot (L130)
+    from . import resolutions
+    resolutions.add_parser(work_sub, cmd_work)  # prepared conflict resolutions (L160d)
 
     p_cost = sub.add_parser("cost", help="coût des tours et jauges de forfait (L12)")
     cost_sub = p_cost.add_subparsers(dest="cost_command")
