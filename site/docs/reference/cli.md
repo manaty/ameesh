@@ -30,7 +30,7 @@ on its first line.
 ## Mailbox: `ameesh mail` / `agent-mail`
 
 ```
-agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"]
+agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title" [--estimate 2h]]
                 [--kind request|reply|notify|event] [--urgent] [--ack] [--cc NAME[,NAME…]]
                 [--sign --key FILE] [--expires 24h] [--queue]
 agent-mail forward <OLD> <NEW> [--dry-run] [--json]   # redeliver a dead mailbox
@@ -242,7 +242,9 @@ record, or an agent that assigned lots in the last 30 days):
   owned by **another agent** is never taken over: warning with the
   `ameesh work assign` command. An unknown reference stays a free thread label;
 * `--new-lot "title"` (any sender) creates the lot, assigned to the recipient,
-  and attaches the message to it;
+  and attaches the message to it; `--estimate 2h` gives its estimated duration,
+  **mandatory when the sender is an agent** (refused otherwise, nothing is
+  delivered, exit 2; a warning for a human, L157);
 * a single `agent/…` branch quoted in the message is set on the attached lot
   when it has none.
 
@@ -258,6 +260,10 @@ ameesh work add --title TITLE [--type bug|evolution] [--source S] [--app APP]
                 [--body BODY] [--issue-ref REF] [--workstream W]
                 [--assignee A] [--budget USD] [--actor ACTOR] [--externe]
                 [--branch agent/…] [--target BRANCH] [--priority 1|2|3]
+                [--estimate 90m|2h|1h30|1,5h|2d|MINUTES] [--estimate-source S]
+ameesh work plan <id|record> [--debut DAY] [--fin DAY] [--livraison DAY] [--source S]
+                [--estimate DURATION] [--estimate-source S]
+ameesh work estimates [--app PROJECT] [--json]   # actual/estimated ratios (ameesh-estimates/1)
 ameesh work list [--state S] [--assignee A] [--limit N] [--json]
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
@@ -279,13 +285,30 @@ ameesh work unrecorded [--since 24h|2h|7d|ISO-DATE] [--limit N] [--json]
 **Every human request becomes a lot** (L130). Orchestrators, design agents and
 the owner's chat record every request from a human as a lot right away, with
 the human's exact words as `--source`, a `--priority` (1 high, 2 normal,
-3 low) and an estimate, and quote the lot number in their answer.
+3 low) and an `--estimate` (L157), and quote the lot number in their answer.
 `work unrecorded` (read-only) lists the human messages of the period (mail
 from a human, answers to decision requests, requests relayed by the chat) that
 are attached to no lot, cite no lot (`L142`, `lot #142`, `ameesh-work: 142`)
 and whose words no recent lot quotes in its source or body; acknowledgements
 and `--cc` copies are skipped, a broadcast counts once. JSON schema
 `ameesh-unrecorded/1`. See `docs/ORCHESTRATEUR.md` and `docs/EXPLOITATION.md`.
+
+**Estimated and actual duration** (L157, migration 0052). Every lot carries an
+estimated duration from its creation: minutes with its source and author
+(`--estimate`, `--estimate-source`; `work plan <id> --estimate` sets or
+revises it, keeping the history in `work_item_estimates`). It is **mandatory
+when an agent of the registry creates the lot** (`work add`, `mail send
+--new-lot`): refused otherwise, nothing is created; a human gets a warning.
+ameesh measures the actual duration itself: start = first move to `build`
+(or `qa`), or the assignee's first turn on the lot (noted by the runner);
+end = the `merged` milestone. `work show` (line « durée »), `ameesh projects`
+(short **DURÉE** column: `1h10/2h` elapsed/estimated, `2h` not started,
+`2h40/2h!` overrun), `ameesh progress`, the roadmap and the header of the
+lots' GitHub issues (L126) show the estimate, the actual duration and the
+gap. `work estimates` gives, over delivered lots, the actual/estimated ratio
+(median, p80) per lot type and per estimate author, using the estimate in
+force when work started: the internal auditor audits it and adjusts the
+estimation process (`docs/AUDITEUR.md`).
 
 **Continuous-improvement backlog** (L119, decision 0037). `work backlog add`
 queues a lot of type `improvement` (in `intake`, unassigned); the expected
