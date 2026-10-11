@@ -1,125 +1,121 @@
 ---
 type: Study
-title: "Étude — capacité des hôtes prêtée au mesh, contrat commun avec Nexlink Compute"
-description: "Prêter aux agents d'ameesh la capacité inutilisée des VM de l'organisation sans gêner leurs applications. Un contrat de « garde de capacité » commun à ameesh et à Nexlink Compute : offre, mesure commune, ameesh-host-state/1 étendu sans nouvelle version, paliers pour céder la place, plafonds posés par le noyau. Deux modes sur une VM (exécuteur complet sous slice plafonnée, déport des suites lourdes) ; sécurité ; mise en service sur la VM de tests ; lots estimés (L159a–L159i, N1–N3)."
+title: "Study — host capacity lent to the mesh, common contract with Nexlink Compute"
+description: "Lend the unused capacity of the organisation's VMs to ameesh's agents without disturbing their applications. A \"capacity guard\" contract common to ameesh and Nexlink Compute: offer, common measure, ameesh-host-state/1 extended without a new version, tiers for giving way, caps set by the kernel. Two modes on a VM (full runner under a capped slice, offloading of heavy suites); security; rollout on the test VM; estimated lots (L159a–L159i, N1–N3)."
 status: draft
 tags: [capacite, hotes, garde, porte-d-hote, cgroups, systemd, compute, deport, placement]
 generated: { by: "claude3/claude-opus-5-5", at: "2026-10-11T04:09:00+02:00" }
 sources:
-  - { resource: "decisions/0028-ressources-des-hotes-et-repartition.md", title: "Décision 0028 (ressources des hôtes, contre-pression, déplacement)" }
-  - { resource: "decisions/0031-plusieurs-canons.md", title: "Décision 0031 (limites physiques : la fiche la plus stricte)" }
-  - { resource: "../../../src/ameesh/resources.py", title: "Mesure et pression de l'hôte (L31, L73, L106)" }
-  - { resource: "../../../src/ameesh/hostcheck.py", title: "Hôte prêt à mener ses agents (L106)" }
-  - { resource: "../../../src/ameesh/placement.py", title: "Placement gouverné (C4, R18, L31)" }
-  - { resource: "../../../src/ameesh/canon.py", title: "Fiches Host, HostPolicy, Placement" }
-  - { resource: "../../../src/ameesh/relocation.py", title: "Déplacement entre hôtes admis (L31)" }
-  - { resource: "branche lot/v170-voie-b : docs/IMAGE-EXECUTEUR.md, docs/EXECUTEUR-MEDIEE.md, src/ameesh/mediated_executor/", title: "Exécuteur médié, porte d'hôte, enrôlement, image (L107–L115, non fusionnés)" }
-  - { resource: "nexlink:desktop/src/compute/ (develop)", title: "Garde d'inactivité (#93), offre, PROV-2, PROV-3, D13, mode natif (#115–#117)" }
-  - { resource: "nexlink:docs/specs/compute-agent-turn.md (branche 94b)", title: "Contrat Nexlink du tour d'agent, v0.2 (#94, non fusionné)" }
+  - { resource: "decisions/0028-ressources-des-hotes-et-repartition.md", title: "Decision 0028 (host resources, back-pressure, relocation)" }
+  - { resource: "decisions/0031-plusieurs-canons.md", title: "Decision 0031 (physical limits: the strictest card)" }
+  - { resource: "../../../src/ameesh/resources.py", title: "Host measurement and pressure (L31, L73, L106)" }
+  - { resource: "../../../src/ameesh/hostcheck.py", title: "Host ready to run its agents (L106)" }
+  - { resource: "../../../src/ameesh/placement.py", title: "Governed placement (C4, R18, L31)" }
+  - { resource: "../../../src/ameesh/canon.py", title: "Host, HostPolicy, Placement cards" }
+  - { resource: "../../../src/ameesh/relocation.py", title: "Relocation between admitted hosts (L31)" }
+  - { resource: "branche lot/v170-voie-b : docs/IMAGE-EXECUTEUR.md, docs/EXECUTEUR-MEDIEE.md, src/ameesh/mediated_executor/", title: "Mediated runner, host gate, enrolment, image (L107–L115, not merged)" }
+  - { resource: "nexlink:desktop/src/compute/ (develop)", title: "Idle guard (#93), offer, PROV-2, PROV-3, D13, native mode (#115–#117)" }
+  - { resource: "nexlink:docs/specs/compute-agent-turn.md (branche 94b)", title: "Nexlink agent turn contract, v0.2 (#94, not merged)" }
 ---
 
-# Contexte
+# Context
 
-## Le besoin
+## The need
 
-Le propriétaire, les 10 et 11 octobre : utiliser la capacité inutilisée des VM
-de l'organisation pour les agents d'ameesh, **sans déranger les applications**
-qu'elles servent. Et : « on chevauche Nexlink Compute, il faudra s'assurer que
-ce qu'on fait dans ameesh est réutilisable par Nexlink Compute ».
+The owner, on 10 and 11 October: use the unused capacity of the
+organisation's VMs for ameesh's agents, **without disturbing the applications**
+they serve. And: "we overlap with Nexlink Compute, we will have to make sure
+that what we do in ameesh is reusable by Nexlink Compute".
 
-Nexlink Compute prête l'inactivité d'appareils personnels : des builds
-aujourd'hui, des tours d'agent ameesh en cours d'intégration. Une VM
-d'application qui prête ses creux pose le même problème, côté serveur.
+Nexlink Compute lends the idle time of personal devices: builds today, ameesh
+agent turns currently being integrated. An application VM that lends its
+quiet periods poses the same problem, on the server side.
 
-## Le constat
+## The observation
 
-Le poste du propriétaire est le seul hôte de onze agents.
+The owner's workstation is the only host of eleven agents.
 
-* **2026-10-10** : la charge a atteint 43 pour 12 CPU, pour un seuil de 24
-  fixé par 0028. Plus aucun tour ne partait, orchestrateur compris. Les tours
-  retardés ont cumulé environ 80 minutes.
-* **2026-10-11** : le `/tmp` du poste, un tmpfs de 12 Go, a franchi 80 % à
-  02:58 et s'est rempli vers 03:38. Tous les tours se sont bloqués.
-* **2026-10-10, VM du mesh** (4 vCPU, 8 Go, sans swap) : le processus `node`
-  d'un harnais a atteint 4,1 Go de mémoire résidente, et l'OOM du noyau l'a
-  tué. L'unité de l'exécuteur n'avait aucun plafond.
+* **2026-10-10**: the load reached 43 for 12 CPUs, against a threshold of 24
+  set by 0028. No turn started any more, orchestrator included. The delayed
+  turns added up to about 80 minutes.
+* **2026-10-11**: the workstation's `/tmp`, a 12 GB tmpfs, crossed 80 % at
+  02:58 and filled up around 03:38. All turns were blocked.
+* **2026-10-10, mesh VM** (4 vCPU, 8 GB, no swap): the `node` process of a
+  harness reached 4.1 GB of resident memory, and the kernel OOM killed it.
+  The runner's unit had no cap at all.
 
-Les suites de tests lourdes (Postgres en conteneur, jest, e2e) font
-l'essentiel de la charge CPU et de `/tmp`. Les harnais font l'essentiel de
-la mémoire : 2 à 4 Go par agent actif.
+The heavy test suites (Postgres in a container, jest, e2e) account for most
+of the CPU load and of `/tmp`. The harnesses account for most of the memory:
+2 to 4 GB per active agent.
 
-## La capacité disponible
+## The available capacity
 
-Inventaire en lecture seule du 2026-10-11. On n'en garde ici que des
-agrégats. Méthode :
+Read-only inventory of 2026-10-11. Only aggregates are kept here. Method:
 
-* marge mémoire : 50 % du plus bas `MemAvailable` sur 7 jours (sysstat) ;
-* marge CPU : 50 % de la part inactive, soit au créneau de 10 min le plus
-  chargé (« aux pics »), soit en moyenne (« hors pics »).
+* memory margin: 50 % of the lowest `MemAvailable` over 7 days (sysstat);
+* CPU margin: 50 % of the idle share, either over the busiest 10-min slot
+  ("at peaks"), or on average ("off peaks").
 
-Résultats :
+Results:
 
-* 23 VM allumées : 73 vCPU, 182 Go de mémoire.
-* **Environ 31 Go réutilisables, sur deux VM seulement** :
-  - une **VM de tests** : 8 vCPU dédiés, 32 Go. Elle prête ≈ 14 Go, ≈ 1 vCPU
-    aux pics et ≈ 3 vCPU hors pics. Elle sert nos suites de tests, rien
-    d'autre, mais son disque racine de 10 Go n'a que 1,9 Go libres ;
-  - une **VM de CI** : 16 vCPU, 64 Go. Elle prête ≈ 18 Go, ≈ 2 vCPU aux pics
-    et ≈ 7 vCPU hors pics. Ses jobs se concentrent sur quatre heures de
-    l'après-midi. Son utilisateur `runner` est membre du groupe `docker`.
-* Au total : ≈ 3 vCPU garantis aux pics, ≈ 10 hors pics, jusqu'à 12 la nuit.
-  À 4 Go par agent, cela fait **environ 7 agents**.
-* Les douze petites VM accessibles offrent ensemble ≈ 6,5 Go, **éparpillés
-  par tranches de 0,2 à 1,3 Go**, soit moins qu'un agent par VM. Presque
-  toutes servent de la production : elles sont **inutilisables pour des
-  agents**.
-* La VM du mesh n'a aucune marge.
+* 23 running VMs: 73 vCPU, 182 GB of memory.
+* **About 31 GB reusable, on two VMs only**:
+  - a **test VM**: 8 dedicated vCPU, 32 GB. It lends ≈ 14 GB, ≈ 1 vCPU
+    at peaks and ≈ 3 vCPU off peaks. It serves our test suites, nothing
+    else, but its 10 GB root disk has only 1.9 GB free;
+  - a **CI VM**: 16 vCPU, 64 GB. It lends ≈ 18 GB, ≈ 2 vCPU at peaks
+    and ≈ 7 vCPU off peaks. Its jobs are concentrated in four hours of the
+    afternoon. Its `runner` user is a member of the `docker` group.
+* In total: ≈ 3 vCPU guaranteed at peaks, ≈ 10 off peaks, up to 12 at night.
+  At 4 GB per agent, that makes **about 7 agents**.
+* The twelve small accessible VMs together offer ≈ 6.5 GB, **scattered
+  in slices of 0.2 to 1.3 GB**, i.e. less than one agent per VM. Almost
+  all of them serve production: they are **unusable for agents**.
+* The mesh VM has no margin.
 
-Le contrat doit donc valoir pour n'importe quel hôte. Le pilote, lui, se
-joue sur une ou deux grosses VM, en commençant par la VM de tests.
+The contract must therefore hold for any host. The pilot, however, plays out
+on one or two large VMs, starting with the test VM.
 
-# Ce qui existe
+# What exists
 
-## Dans ameesh (`main`)
+## In ameesh (`main`)
 
-* **Mesure et contre-pression** (L31, décision 0028, L73, L106 ;
-  `resources.py`) :
-  - Chaque exécuteur relève son hôte : mémoire disponible, swap, charge sur
-    1 min, CPU, disque libre du dossier de travail, tmpfs de `/tmp`,
-    alimentation et tours en cours. Les relevés vont dans `host_resources`,
-    gardés 7 jours.
-  - Les seuils sont au canon (`policy.resources` de la fiche `Host`), avec
-    des défauts prudents.
-  - Un seuil franchi bloque les **nouveaux** tours. En pression critique, les
-    agents de plus faible priorité sont mis en pause, **jamais au milieu d'un
-    tour**.
-  - L31b rend l'attente visible ; un orchestrateur passe sous une pression
-    non critique ; un épisode tient en deux lignes de journal.
-* **Hôte prêt** (L106, `hostcheck.py`) : `ameesh doctor --harness` vérifie
-  les binaires des harnais et les unités d'exécuteur activées. Il mesure la
-  disponibilité de l'outillage, pas celle de la capacité.
-* **Fiches et placement** (`canon.py`, `placement.py`, décisions 0014, 0029,
-  0031) :
-  - La fiche `Host` porte un responsable, des administrateurs, des étiquettes
-    et une politique : harnais, fournisseurs, modes d'identifiants,
-    `max_agents`, seuils, dossiers de travail, ménage.
-  - Une admission (`Placement`) nomme les hôtes admis d'un agent.
-  - Avec plusieurs canons, les limites physiques retenues sont les plus
-    strictes des fiches.
-* **Déplacement** (0028 §5, `relocation.py`) : entre deux tours, un agent
-  quitte un hôte sous pression pour un hôte admis disponible. Le choix va au
-  plus de mémoire, puis à la plus faible charge. La session suit si son
-  stockage est partagé ; sinon, rotation avec résumé.
+* **Measurement and back-pressure** (L31, decision 0028, L73, L106;
+  `resources.py`):
+  - Each runner samples its host: available memory, swap, 1-min load, CPU,
+    free disk of the work directory, `/tmp` tmpfs, power supply and turns
+    in progress. The samples go into `host_resources`, kept for 7 days.
+  - The thresholds are in the canon (`policy.resources` of the `Host` card),
+    with prudent defaults.
+  - A crossed threshold blocks **new** turns. Under critical pressure, the
+    lowest-priority agents are paused, **never in the middle of a turn**.
+  - L31b makes the wait visible; an orchestrator gets through under
+    non-critical pressure; an episode fits in two log lines.
+* **Ready host** (L106, `hostcheck.py`): `ameesh doctor --harness` checks
+  the harness binaries and the enabled runner units. It measures the
+  availability of the tooling, not that of the capacity.
+* **Cards and placement** (`canon.py`, `placement.py`, decisions 0014, 0029,
+  0031):
+  - The `Host` card carries a responsible person, administrators, labels
+    and a policy: harnesses, providers, credential modes, `max_agents`,
+    thresholds, work directories, cleanup.
+  - An admission (`Placement`) names an agent's admitted hosts.
+  - With several canons, the physical limits retained are the strictest
+    of the cards.
+* **Relocation** (0028 §5, `relocation.py`): between two turns, an agent
+  leaves a host under pressure for an available admitted host. The choice
+  goes to the most memory, then to the lowest load. The session follows if
+  its storage is shared; otherwise, rotation with a summary.
 
-## Dans ameesh (voie B, branche `lot/v170-voie-b`, non fusionnée)
+## In ameesh (track B, branch `lot/v170-voie-b`, not merged)
 
-L'exécuteur médié (L107–L115) a été conçu pour les appareils de Nexlink
-Compute. Trois de ses pièces servent ici telles quelles.
+The mediated runner (L107–L115) was designed for Nexlink Compute devices.
+Three of its pieces serve here as they are.
 
-* **La porte d'hôte** (L112, `mediated_executor/gate.py` et `host_gate.py`).
-  Un processus extérieur, le runner Compute, écrit l'état
-  `ameesh-host-state/1` dans un fichier (fichier temporaire puis `rename`)
-  ou le pousse sur une socket. L'exécuteur répond par `ameesh-host-ack/1`.
+* **The host gate** (L112, `mediated_executor/gate.py` and `host_gate.py`).
+  An external process, the Compute runner, writes the
+  `ameesh-host-state/1` state to a file (temporary file then `rename`)
+  or pushes it on a socket. The ameesh runner answers with `ameesh-host-ack/1`.
 
   ```json
   {"schema": "ameesh-host-state/1", "state": "draining", "seq": 8,
@@ -130,179 +126,180 @@ Compute. Trois de ses pièces servent ici telles quelles.
    "in_turn": [], "held": [], "drained": true, "ts": 1791640040.12}
   ```
 
-  Selon l'état, l'exécuteur :
-  - en `available`, réclame dans la limite `min(caps.max_concurrent,
-    max_agents)` ;
-  - en `draining`, ne réclame plus. Chaque tour s'arrête au point sûr, avec
-    préemption à l'échéance (90 s par défaut). Les baux sont rendus, puis
-    l'acquittement dit `drained: true` ;
-  - en `stopped`, arrête tout immédiatement.
+  Depending on the state, the runner:
+  - in `available`, claims within the limit `min(caps.max_concurrent,
+    max_agents)`;
+  - in `draining`, no longer claims. Each turn stops at the safe point, with
+    preemption at the deadline (90 s by default). The leases are returned,
+    then the acknowledgement says `drained: true`;
+  - in `stopped`, stops everything immediately.
 
-  Le retour à `available` relance la réclamation sans geste humain.
+  The return to `available` restarts claiming without human action.
 
-  Un état illisible vaut `stopped` pour un hôte médié et `available` pour un
-  hôte classique (`host_gate_fallback`). Un hôte classique peut déjà avoir
-  une porte (`AMEESH_HOST_GATE=file`). L'exécuteur n'applique que
-  `caps.max_concurrent` : `cpu_share` et `memory_mb` circulent, mais
-  personne ne les fait respecter côté ameesh.
-* **L'hôte volatil** : `policy.volatile: true` donne un bail de 90 s,
-  renouvelé toutes les 30 s ; `policy.lease_ttl` le règle.
-* **L'enrôlement** (L110) :
-  - un humain habilité émet un code à usage unique, lié au mesh, à l'hôte et
-    à une liste d'agents (`ameesh host enroll`) ;
-  - l'appareil s'enrôle avec une clé P-256 (`ameesh device enroll
-    --code-file`) et obtient des jetons courts ;
-  - la révocation relâche les baux.
+  An unreadable state counts as `stopped` for a mediated host and `available`
+  for a classic host (`host_gate_fallback`). A classic host can already have
+  a gate (`AMEESH_HOST_GATE=file`). The runner only applies
+  `caps.max_concurrent`: `cpu_share` and `memory_mb` circulate, but
+  nobody enforces them on the ameesh side.
+* **The volatile host**: `policy.volatile: true` gives a 90 s lease,
+  renewed every 30 s; `policy.lease_ttl` sets it.
+* **Enrolment** (L110):
+  - an authorised human issues a single-use code, bound to the mesh, the host
+    and a list of agents (`ameesh host enroll`);
+  - the device enrols with a P-256 key (`ameesh device enroll
+    --code-file`) and obtains short-lived tokens;
+  - revocation releases the leases.
 
-  S'y ajoutent l'image `ameesh-executor/1` (L114 : uid 10001, aucun secret de
-  fournisseur, sorties 0 à 6) et l'essai de bout en bout (L115 : sept étapes
-  vertes en conteneur). Ensemble, ils forment le mode « appareil sans accès
-  à la base ».
+  Added to these are the `ameesh-executor/1` image (L114: uid 10001, no
+  provider secret, exit codes 0 to 6) and the end-to-end trial (L115: seven
+  green steps in a container). Together, they form the "device without
+  database access" mode.
 
-## Dans Nexlink Compute (`develop`, 2026-10-11)
+## In Nexlink Compute (`develop`, 2026-10-11)
 
-Les numéros (#93, #94, #115 à #117) sont ceux des tâches du mesh Nexlink,
-pas des issues GitHub.
+The numbers (#93, #94, #115 to #117) are those of the Nexlink mesh tasks,
+not GitHub issues.
 
-* **Garde d'inactivité** (#93, fusionnée ; `desktop/src/compute/state.ts`,
-  `idle-guard.ts`, `resources.ts`, `conditions.ts`). Elle écrit
-  `ameesh-host-state/1` « exactement » ; le format propre du plan initial
-  (`status.json`, cinq états) a été abandonné au gel.
-  - **Signaux** : cinq minutes sans saisie, secteur, réseau non mesuré,
-    fenêtre horaire de l'offre. Avant la réclamation seulement, s'y ajoutent
-    un CPU occupé à 30 % au plus et 2 Gio de mémoire libre. Pendant le
-    travail, rien n'est mesuré (« la VM est la charge »). Il n'y a pas de
-    runner sous Linux.
-  - **Écriture** : une sonde toutes les 2 s, et l'état n'est réécrit que
-    s'il change. `seq` part de l'horloge. Les `caps` valent
-    `max_concurrent: 1` ; `cpu_share` et `memory_mb` viennent de l'offre
-    (mémoire libre au moment de l'offre, multipliée par la part consentie).
-  - **Raisons** : `idle`, `user_active`, `battery`, `window_end`,
-    `metered`. La pause du propriétaire, le bail perdu et l'arrêt deviennent
-    tous `revoked`.
-  - **Actions** : sans travail en cours, préemption immédiate. Avec du
-    travail, `draining`, puis arrêt de la VM. La pause du propriétaire donne
-    `stopped`. Ni gel, ni pause-reprise, ni baisse de priorité.
-  - **Acquittement** : le lecteur, durci, n'admet que les clés `schema`,
-    `seq`, `drained` et `agents_in_turn`. **Il refuse donc l'acquittement
-    réel d'ameesh** (`state`, `in_turn`, `held`, `ts`). L'exécuteur n'est
-    jamais reconnu, et le retrait tombe à 15 s au lieu de 90 s. La branche
-    de #94 corrige ce lecteur.
-* **Tour d'agent** (#94 ; branches `agent/compute-agent-turn` et `…-94b`,
-  non fusionnées). Le contrat `compute-agent-turn` v0.2 a convergé avec la
-  voie B. Le drapeau `COMPUTE_AGENT_TURN_ENABLED` est éteint, et `develop`
-  n'admet que la classe `build`.
-  - Un job de classe `agent` réserve le bac à sable de l'appareil pour une
-    fenêtre (4 h proposées).
-  - Il y lance l'image `ameesh-executor/1` d'un seul mesh, qui s'enrôle
-    (L110).
-  - Le bail Compute, de 120 s (renouvelé toutes les 40 s), couvre le bail
-    ameesh de 90 s.
-  - `window.json` fait le compte de la fenêtre à sa fin.
-* **PROV-2 et PROV-3** (fusionnés, activation fermée) :
-  - réseau du Mac (vzNAT) ;
-  - une VM par couple (appareil, mesh) : Lima sur Mac, WSL sur Windows ;
-  - l'exécuteur tourne dans un conteneur Podman sans root (`--cpus=2
+* **Idle guard** (#93, merged; `desktop/src/compute/state.ts`,
+  `idle-guard.ts`, `resources.ts`, `conditions.ts`). It writes
+  `ameesh-host-state/1` "exactly"; the initial plan's own format
+  (`status.json`, five states) was abandoned at the freeze.
+  - **Signals**: five minutes without input, mains power, unmetered network,
+    time window of the offer. Before claiming only, these are joined by a
+    CPU at most 30 % busy and 2 GiB of free memory. During the work,
+    nothing is measured ("the VM is the load"). There is no runner under
+    Linux.
+  - **Writing**: a probe every 2 s, and the state is only rewritten if it
+    changes. `seq` starts from the clock. The `caps` are
+    `max_concurrent: 1`; `cpu_share` and `memory_mb` come from the offer
+    (free memory at the time of the offer, multiplied by the consented share).
+  - **Reasons**: `idle`, `user_active`, `battery`, `window_end`,
+    `metered`. The owner's pause, the lost lease and the shutdown all
+    become `revoked`.
+  - **Actions**: without work in progress, immediate preemption. With
+    work, `draining`, then shutdown of the VM. The owner's pause gives
+    `stopped`. No freeze, no pause-resume, no priority lowering.
+  - **Acknowledgement**: the hardened reader only admits the keys `schema`,
+    `seq`, `drained` and `agents_in_turn`. **It therefore rejects ameesh's
+    real acknowledgement** (`state`, `in_turn`, `held`, `ts`). The runner is
+    never recognised, and the withdrawal falls to 15 s instead of 90 s. The
+    #94 branch fixes this reader.
+* **Agent turn** (#94; branches `agent/compute-agent-turn` and `…-94b`,
+  not merged). The `compute-agent-turn` v0.2 contract has converged with
+  track B. The `COMPUTE_AGENT_TURN_ENABLED` flag is off, and `develop`
+  only admits the `build` class.
+  - An `agent` class job reserves the device's sandbox for a window
+    (4 h proposed).
+  - It launches there the `ameesh-executor/1` image of a single mesh, which
+    enrols (L110).
+  - The Compute lease, of 120 s (renewed every 40 s), covers the 90 s ameesh
+    lease.
+  - `window.json` accounts for the window at its end.
+* **PROV-2 and PROV-3** (merged, activation closed):
+  - Mac networking (vzNAT);
+  - one VM per (device, mesh) pair: Lima on Mac, WSL on Windows;
+  - the runner runs in a rootless Podman container (`--cpus=2
     --memory=3g --pids-limit=512 --read-only --cap-drop=ALL
-    --stop-timeout=100`), et ne sort que vers le serveur du mesh, par un
-    mandataire.
-  - **La taille de la VM d'agent est fixe** (2 vCPU, 4 Gio, 40 Gio) et ne
-    dépend pas de l'offre. D13 dimensionne, elle, la VM de build selon
-    l'offre (`nexlink-compute-sizing/1`), comme une allocation et non comme
-    un plafond d'usage.
-* **Mode natif** (#115 à #117 : admission, consentement et effacement
-  écrits en fonctions pures, sans câblage de production) : des builds de
-  bureau hors VM, sous un compte standard, sur macOS et
-  Windows x64. **Aucun agent n'y est admis.** Ses plafonds (`cpuPercent`,
-  `memoryBytes`, `outputBytes`, `durationSeconds`) passent par un port
-  `enforceResources` qu'aucun OS n'implémente encore.
-* **Offre** : `ComputeOffer` v1, signée, envoyée au hub et non au mesh. Elle
-  porte les cœurs, la mémoire, le disque, des conditions (`idle`, `ac`,
-  `wifi`), une fenêtre en heure locale, les parts consenties et l'egress par
-  jour. Défauts : de 22 h à 7 h, 25 % du CPU et de la mémoire, 20 % du
-  disque.
-  La spécification mère prévoit davantage, sans que rien n'en soit
-  construit : un profil `when` / `caps` / `on_context_change` (`pause`,
-  `finish_current` ou `return`), l'adaptation continue et un budget
-  partagé.
+    --stop-timeout=100`), and only goes out to the mesh server, through a
+    proxy.
+  - **The size of the agent VM is fixed** (2 vCPU, 4 GiB, 40 GiB) and does
+    not depend on the offer. D13, on the other hand, sizes the build VM
+    according to the offer (`nexlink-compute-sizing/1`), as an allocation
+    and not as a usage cap.
+* **Native mode** (#115 to #117: admission, consent and erasure written as
+  pure functions, with no production wiring): desktop builds outside a VM,
+  under a standard account, on macOS and Windows x64. **No agent is
+  admitted there.** Its caps (`cpuPercent`, `memoryBytes`, `outputBytes`,
+  `durationSeconds`) go through an `enforceResources` port that no OS
+  implements yet.
+* **Offer**: `ComputeOffer` v1, signed, sent to the hub and not to the mesh.
+  It carries the cores, the memory, the disk, conditions (`idle`, `ac`,
+  `wifi`), a window in local time, the consented shares and the egress per
+  day. Defaults: from 22:00 to 07:00, 25 % of CPU and memory, 20 % of
+  disk.
+  The parent specification plans more, none of which is built: a
+  `when` / `caps` / `on_context_change` profile (`pause`, `finish_current`
+  or `return`), continuous adaptation and a shared budget.
 
-## Ce qui manque
+## What is missing
 
-1. **La mesure ne distingue pas l'application de l'invité.** Sur une VM
-   prêtée, la charge et la mémoire relevées par ameesh comptent celles des
-   agents eux-mêmes. Côté Nexlink, rien n'est mesuré pendant le travail.
-2. **Rien ne plafonne un agent d'ameesh.** L'unité `ameesh-runner-agent@`
-   n'a ni `MemoryMax`, ni `CPUWeight`, ni slice : c'est la cause de l'OOM de
-   la VM du mesh.
-3. **Céder la place est trop lent.**
-   - La contre-pression n'arrête que les nouveaux tours.
-   - Un tour en cours dure jusqu'à 15 min, et le travail lancé en fond garde
-     20 min de grâce.
-   - L'arrêt par signal draine jusqu'à 30 min.
-4. **Les `caps` ne disent pas l'enveloppe réelle.** Côté ameesh, rien ne les
-   fait respecter. Côté Nexlink, ils viennent de l'offre, alors que la VM
-   d'agent est fixe (2 vCPU, 4 Gio) : ils peuvent dépasser la réalité ou
-   rester en dessous. Disque, E/S et durée n'y figurent pas.
-5. **Les fenêtres sont pauvres.** `until_ts` ignore la durée maximale du
-   job, et rien ne dit quand la prochaine fenêtre s'ouvre.
-6. **L'acquittement réel est refusé** par le lecteur de Nexlink sur
+1. **The measurement does not distinguish the application from the guest.**
+   On a lent VM, the load and memory sampled by ameesh include those of the
+   agents themselves. On the Nexlink side, nothing is measured during work.
+2. **Nothing caps an ameesh agent.** The `ameesh-runner-agent@` unit has
+   no `MemoryMax`, no `CPUWeight`, no slice: this is the cause of the OOM on
+   the mesh VM.
+3. **Giving way is too slow.**
+   - Back-pressure only stops new turns.
+   - A turn in progress lasts up to 15 min, and work launched in the
+     background keeps 20 min of grace.
+   - Stopping by signal drains for up to 30 min.
+4. **The `caps` do not state the real envelope.** On the ameesh side,
+   nothing enforces them. On the Nexlink side, they come from the offer,
+   whereas the agent VM is fixed (2 vCPU, 4 GiB): they can exceed reality
+   or fall short of it. Disk, I/O and duration do not appear in them.
+5. **The windows are poor.** `until_ts` ignores the job's maximum duration,
+   and nothing says when the next window opens.
+6. **The real acknowledgement is rejected** by the Nexlink reader on
    `develop`.
-7. **Les chemins divergent dans la documentation d'ameesh** (voie B).
-   `EXECUTEUR-MEDIEE.md` et le défaut de `gate.py` disent
-   `/run/ameesh-gate/state.json`. `IMAGE-EXECUTEUR.md` et Nexlink disent
-   `/run/ameesh-gate/state/state.json`. La forme par dossier est la bonne :
-   un `rename` n'est visible à travers un montage que si l'on monte le
-   dossier.
-8. **Nexlink a trois vocabulaires de plafonds** (offre, dimensionnement,
-   mode natif), sans lien avec les `caps` de la porte.
+7. **The paths diverge in the ameesh documentation** (track B).
+   `EXECUTEUR-MEDIEE.md` and the `gate.py` default say
+   `/run/ameesh-gate/state.json`. `IMAGE-EXECUTEUR.md` and Nexlink say
+   `/run/ameesh-gate/state/state.json`. The directory form is the right one:
+   a `rename` is only visible through a mount if the directory is
+   mounted.
+8. **Nexlink has three cap vocabularies** (offer, sizing, native mode),
+   unrelated to the gate's `caps`.
 
-# 1. Le contrat commun : la garde de capacité
+# 1. The common contract: the capacity guard
 
-## 1.1 Rôles
+## 1.1 Roles
 
-| Rôle | Sur une VM de l'organisation | Sur un appareil prêté |
+| Role | On an organisation VM | On a lent device |
 |---|---|---|
-| **Hôte prêteur** | VM d'application, VM de CI, VM de tests | portable, poste fixe |
-| **Garde** (privilégiée, côté hôte) | `ameesh guard`, service système (à créer, L159e) | le runner Nexlink Compute (macOS, Windows) ; sous Linux, `ameesh guard` pourra servir |
-| **Invité** (sans privilège) | exécuteur ameesh classique ou médié, ou job déporté | exécuteur médié dans la VM d'agent (PROV-3) |
-| **Mesh** | voit l'offre, l'état et la mesure (`ameesh hosts`), place et déplace | idem, par `PUT /host/availability` |
+| **Lending host** | application VM, CI VM, test VM | laptop, desktop |
+| **Guard** (privileged, host side) | `ameesh guard`, system service (to be created, L159e) | the Nexlink Compute runner (macOS, Windows); under Linux, `ameesh guard` could serve |
+| **Guest** (unprivileged) | classic or mediated ameesh runner, or offloaded job | mediated runner in the agent VM (PROV-3) |
+| **Mesh** | sees the offer, the state and the measure (`ameesh hosts`), places and relocates | same, via `PUT /host/availability` |
 
-La garde mesure, décide et **fait respecter**. Les plafonds sont posés par le
-noyau (cgroups) ou par l'hyperviseur (taille de la VM), jamais laissés à la
-bonne volonté de l'invité. L'invité obéit à l'état, rend ses baux et
-acquitte. C'est déjà le partage de Nexlink : le runner écrit l'état et tient
-la VM, l'exécuteur obéit.
+The guard measures, decides and **enforces**. The caps are set by the
+kernel (cgroups) or by the hypervisor (VM size), never left to the guest's
+goodwill. The guest obeys the state, returns its leases and acknowledges.
+This is already Nexlink's split: the Compute runner writes the state and
+holds the VM, the ameesh runner obeys.
 
-## 1.2 Principes
+## 1.2 Principles
 
-1. **L'application gagne toujours.** L'invité vit dans une slice de faible
-   priorité, sous des plafonds durs. Quand l'application reprend, il cède
-   la place **sans attendre la fin de son tour**.
-2. **Un seul format.** On étend `ameesh-host-state/1` par des champs
-   **facultatifs**, que le lecteur d'ameesh ignore s'il ne les connaît pas
-   (`GateState.from_json`).
-   - **Aucune valeur d'état n'est ajoutée** en version 1 : un état inconnu
-     est illisible, et un hôte classique retomberait alors sur `available`.
-   - **L'acquittement ne change pas**, car le lecteur de Nexlink n'admet
-     qu'une liste fermée de clés, et c'est voulu.
-   - Un changement incompatible ouvre une version 2.
-3. **Une seule mesure.** Les définitions sont les mêmes sur une VM et sur
-   un appareil. La capacité prêtable se calcule sur la consommation de
-   l'application, **jamais sur celle de l'invité** : sinon, l'invité se
-   chasserait lui-même.
-4. **Fermé par défaut.** Sur un hôte prêteur, une porte illisible, absente
-   ou périmée vaut `stopped`, même pour un exécuteur classique
+1. **The application always wins.** The guest lives in a low-priority
+   slice, under hard caps. When the application picks up again, it gives way
+   **without waiting for the end of its turn**.
+2. **A single format.** `ameesh-host-state/1` is extended with
+   **optional** fields, which the ameesh reader ignores if it does not know
+   them (`GateState.from_json`).
+   - **No state value is added** in version 1: an unknown state is
+     unreadable, and a classic host would then fall back to `available`.
+   - **The acknowledgement does not change**, because the Nexlink reader
+     only admits a closed list of keys, and that is intended.
+   - An incompatible change opens a version 2.
+3. **A single measure.** The definitions are the same on a VM and on
+   a device. The lendable capacity is computed on the application's
+   consumption, **never on the guest's**: otherwise, the guest would chase
+   itself away.
+4. **Closed by default.** On a lending host, an unreadable, missing or
+   stale gate counts as `stopped`, even for a classic runner
    (`host_gate_fallback: stopped`).
-5. **Trois niveaux, toujours décroissants** : offre déclarée ≥ plafonds
-   accordés (`caps`) ≥ consommation.
-   - Sur une VM, l'offre est revue par le responsable de l'hôte, au canon.
-   - Sur un appareil, elle est consentie par son titulaire, dans Nexlink.
+5. **Three levels, always decreasing**: declared offer ≥ granted caps
+   (`caps`) ≥ consumption.
+   - On a VM, the offer is reviewed by the person responsible for the host,
+     in the canon.
+   - On a device, it is consented by its holder, in Nexlink.
 
-## 1.3 L'offre : ce que l'hôte prête
+## 1.3 The offer: what the host lends
 
-Sur une VM, l'offre est **déclarative**. Elle vit dans la fiche `Host` du
-canon et se revoit par PR, comme les seuils de 0028. La garde la lit dans sa
-configuration locale ; `ameesh hosts` signale tout écart entre les deux.
+On a VM, the offer is **declarative**. It lives in the `Host` card of the
+canon and is reviewed by PR, like the thresholds of 0028. The guard reads it
+from its local configuration; `ameesh hosts` flags any discrepancy between
+the two.
 
 ```yaml
 ---
@@ -311,524 +308,524 @@ title: vm-exemple
 responsible: human:…
 tags: [pret]
 policy:
-  volatile: true            # bail de 90 s : un invité tué est vite repris ailleurs
+  volatile: true            # 90 s lease: a killed guest is quickly picked up elsewhere
   max_agents: 3
   credential_modes: [api-key]
   work_root: /srv/ameesh-guest/work
-  lend:                     # nouveau (L159a) ; absent = l'hôte ne prête rien
-    cpu_max: 3              # vCPU au plus (quota)
-    cpu_weight: 10          # poids face à l'application (100 par défaut)
-    memory_max: 14GiB       # plafond dur de tout l'invité
-    agent_memory_max: 4.5GiB  # plafond dur par agent ou par job
-    disk_max: 80GiB         # volume dédié de l'invité
-    windows: ["mon-fri 18:00-14:00 UTC", "sat-sun"]   # absent = toujours
-    reclaim:                # quand l'application reprend (seuils de L'APPLICATION)
+  lend:                     # new (L159a); absent = the host lends nothing
+    cpu_max: 3              # vCPU at most (quota)
+    cpu_weight: 10          # weight against the application (100 by default)
+    memory_max: 14GiB       # hard cap for the whole guest
+    agent_memory_max: 4.5GiB  # hard cap per agent or per job
+    disk_max: 80GiB         # dedicated volume of the guest
+    windows: ["mon-fri 18:00-14:00 UTC", "sat-sun"]   # absent = always
+    reclaim:                # when the application picks up again (thresholds of THE APPLICATION)
       memory_available_min: 6GiB
-      cpu_pressure_max: 20%       # PSI cpu « some », moyenne 60 s, hors invité
-      memory_pressure_max: 2%     # PSI mémoire « some », moyenne 60 s
-      busy_units: ["actions.runner.*"]   # VM de CI : jobs en cours
+      cpu_pressure_max: 20%       # PSI cpu "some", 60 s average, excluding guest
+      memory_pressure_max: 2%     # PSI memory "some", 60 s average
+      busy_units: ["actions.runner.*"]   # CI VM: jobs in progress
       busy_max: 4
-    drain_seconds: 90       # échéance du retrait
-    calm_seconds: 600       # hystérésis avant de prêter de nouveau
+    drain_seconds: 90       # withdrawal deadline
+    calm_seconds: 600       # hysteresis before lending again
 ---
 ```
 
-Sur un appareil, l'offre est la `ComputeOffer` que le titulaire a
-consentie. La fiche `Host` de l'appareil garde `policy.volatile` et
-`max_agents` (souvent 1), et le mesh refuse toute réclamation au-delà.
-Il faut aussi une table de correspondance de l'offre vers les `caps`, et
-des `caps` vers la VM et le conteneur. Elle remplacerait les trois
-vocabulaires actuels de Nexlink (N2).
+On a device, the offer is the `ComputeOffer` that the holder has
+consented to. The device's `Host` card keeps `policy.volatile` and
+`max_agents` (often 1), and the mesh refuses any claim beyond that.
+A mapping table is also needed from the offer to the `caps`, and
+from the `caps` to the VM and the container. It would replace Nexlink's
+three current vocabularies (N2).
 
-## 1.4 La mesure commune
+## 1.4 The common measure
 
-La garde publie dans l'état un objet `measure`, défini de la même façon
-partout. Les champs que `resources.sample()` relève déjà gardent leur nom ;
-les autres sont nouveaux.
+The guard publishes in the state a `measure` object, defined the same way
+everywhere. The fields that `resources.sample()` already samples keep their
+name; the others are new.
 
-| Champ | Définition |
+| Field | Definition |
 |---|---|
-| `ts`, `window_s` | instant du relevé ; fenêtre des moyennes (60 s) |
-| `cpu_count` | CPU logiques de l'hôte (sur un appareil : ceux de la machine, pas ceux de la VM) |
-| `app_cpu` | CPU consommés **hors invité**, en moyenne sur la fenêtre : le total moins l'invité (`cpu.stat` de sa slice, ou processus de la VM sur un appareil) |
-| `guest_cpu` | CPU consommés par l'invité |
-| `mem_total_bytes`, `mem_available_bytes`, `swap_used_bytes` | `/proc/meminfo` de l'hôte, comme aujourd'hui |
-| `guest_mem_bytes` | `memory.current` de la slice de l'invité, ou mémoire de la VM |
-| `psi` | `{cpu_some, mem_some, mem_full, io_some}` en %, moyenne sur 60 s, pour l'hôte ; `app_psi`, mêmes clés pour le groupe de l'application quand il est lisible |
-| `disk_free_bytes` | volume de l'invité ; `app_disk_free_bytes` : le plus bas des systèmes de fichiers de l'application |
-| `tmp_*` | occupation de `/tmp` s'il est en tmpfs (L73) |
-| `on_ac`, `battery_percent`, `metered` | alimentation (L106) et réseau mesuré ; `null` sur une VM |
-| `user_idle_s` | secondes depuis la dernière saisie ; `null` sur une VM |
-| `busy` | nombre d'unités d'activité de l'application en cours (jobs de CI) ; `null` sans `busy_units` |
-| `lendable` | `{cpu, memory_bytes, disk_bytes}` : capacité prêtable, selon la formule ci-dessous |
+| `ts`, `window_s` | time of the sample; window of the averages (60 s) |
+| `cpu_count` | logical CPUs of the host (on a device: those of the machine, not those of the VM) |
+| `app_cpu` | CPUs consumed **outside the guest**, averaged over the window: the total minus the guest (`cpu.stat` of its slice, or VM processes on a device) |
+| `guest_cpu` | CPUs consumed by the guest |
+| `mem_total_bytes`, `mem_available_bytes`, `swap_used_bytes` | the host's `/proc/meminfo`, as today |
+| `guest_mem_bytes` | `memory.current` of the guest's slice, or memory of the VM |
+| `psi` | `{cpu_some, mem_some, mem_full, io_some}` in %, 60 s average, for the host; `app_psi`, same keys for the application's group when it is readable |
+| `disk_free_bytes` | guest volume; `app_disk_free_bytes`: the lowest of the application's file systems |
+| `tmp_*` | occupancy of `/tmp` if it is a tmpfs (L73) |
+| `on_ac`, `battery_percent`, `metered` | power supply (L106) and metered network; `null` on a VM |
+| `user_idle_s` | seconds since the last input; `null` on a VM |
+| `busy` | number of application activity units in progress (CI jobs); `null` without `busy_units` |
+| `lendable` | `{cpu, memory_bytes, disk_bytes}`: lendable capacity, according to the formula below |
 
-**Formule.** C'est celle de l'inventaire, rendue continue.
+**Formula.** It is the inventory's formula, made continuous.
 
-* **Historique.** La garde garde 7 jours d'historique local, à pas de
-  10 min. Au premier démarrage, elle part de sysstat s'il existe, sinon
-  d'une valeur prudente (25 % de la mémoire, 1 CPU).
-* **Mémoire.** `lendable.memory_bytes = min(memory_max, h × M7)`. M7 est le
-  plus bas, sur 7 jours, de `mem_available + guest_mem` : la mémoire que
-  l'application a laissée libre à son pire moment. La marge `h` vaut 0,5.
-* **CPU.** `lendable.cpu = min(cpu_max, h × (cpu_count − A7))`. A7 est le
-  95e centile de `app_cpu` par créneau de 10 min, sur 7 jours.
-* **Disque.** `lendable.disk_bytes = min(disk_max, disk_free − 2 Gio)`.
+* **History.** The guard keeps 7 days of local history, in 10-min steps.
+  On first start, it starts from sysstat if it exists, otherwise from a
+  prudent value (25 % of memory, 1 CPU).
+* **Memory.** `lendable.memory_bytes = min(memory_max, h × M7)`. M7 is the
+  lowest, over 7 days, of `mem_available + guest_mem`: the memory that
+  the application left free at its worst moment. The margin `h` is 0.5.
+* **CPU.** `lendable.cpu = min(cpu_max, h × (cpu_count − A7))`. A7 is the
+  95th percentile of `app_cpu` per 10-min slot, over 7 days.
+* **Disk.** `lendable.disk_bytes = min(disk_max, disk_free − 2 GiB)`.
 
-La même mesure alimente `ameesh hosts` et le déplacement (0028 §5). Un hôte
-prêteur s'y classe par `lendable.memory_bytes`, et non par sa mémoire libre
-brute. Sur le poste aussi, la PSI apporte ce que la charge ne dit pas : une
-charge de 43 n'indique pas combien souffre l'utilisateur, la PSI si (L159d).
+The same measure feeds `ameesh hosts` and relocation (0028 §5). A lending
+host is ranked there by `lendable.memory_bytes`, and not by its raw free
+memory. On the workstation too, PSI provides what the load does not say: a
+load of 43 does not indicate how much the user suffers, PSI does (L159d).
 
-## 1.5 L'état : `ameesh-host-state/1` étendu
+## 1.5 The state: `ameesh-host-state/1` extended
 
-Les champs actuels ne changent pas : `schema`, `state`, `seq`, `until_ts`,
-`drain_deadline_ts`, `caps` et `reason`. L'état est écrit par la garde et
-lu par l'invité, dont le lecteur ignore les champs inconnus. Tous les
-champs ajoutés sont donc facultatifs.
+The current fields do not change: `schema`, `state`, `seq`, `until_ts`,
+`drain_deadline_ts`, `caps` and `reason`. The state is written by the guard
+and read by the guest, whose reader ignores unknown fields. All added fields
+are therefore optional.
 
-| Champ | Sens | Lecteur ancien |
+| Field | Meaning | Old reader |
 |---|---|---|
-| `expires_ts` | l'état n'est plus valable après cet instant. La garde le réécrit au tiers de sa durée (30 s par défaut). Un état périmé vaut illisible, donc `stopped` | l'ignore et garde le dernier état ; les plafonds du noyau restent posés |
-| `until_ts` | précisé : la plus proche des deux fins, celle de la fenêtre et celle du job (`max_seconds`) | inchangé |
-| `caps.cpu_share` | précisé : part des CPU **de l'hôte** (quota `cpu_share × cpu_count`) | inchangé |
-| `caps.memory_mb` | précisé : plafond dur de **tout** l'invité, c'est-à-dire l'enveloppe réelle et non l'offre | inchangé |
-| `caps.cpu_weight`, `caps.io_weight` | poids face à l'application (1 à 10 000) | ignorés |
-| `caps.memory_high_mb` | plafond doux : au-delà, le noyau récupère d'abord la mémoire de l'invité | ignoré |
-| `caps.agent_memory_mb` | plafond dur par agent ou par job déporté | ignoré |
-| `caps.disk_mb`, `caps.tmp_mb`, `caps.max_job_s` | disque, `/tmp` et durée de l'invité | ignorés |
-| `caps.enforced` | les plafonds que la garde fait respecter elle-même (noyau, hyperviseur) ; les autres sont indicatifs | ignoré |
-| `freeze` | `{since_ts, until_ts}` : tours gelés par la garde (palier 2). L'exécuteur ne compte pas ce temps dans ses délais de tour | ignoré ; le gel est borné à 60 s, sous les délais |
-| `windows` | prochaines fenêtres `[{start_ts, end_ts}]`, pour planifier | ignoré |
-| `offer` | l'offre en vigueur (section 1.3), pour l'affichage et le contrôle d'écart | ignorée |
-| `measure` | la mesure commune (section 1.4) | ignorée |
-| `guard` | `{kind: "ameesh-guard" ou "nexlink-compute", version, host_kind: "vm" ou "device"}` | ignoré |
+| `expires_ts` | the state is no longer valid after this instant. The guard rewrites it at a third of its lifetime (30 s by default). A stale state counts as unreadable, hence `stopped` | ignores it and keeps the last state; the kernel caps remain in place |
+| `until_ts` | clarified: the nearer of the two ends, that of the window and that of the job (`max_seconds`) | unchanged |
+| `caps.cpu_share` | clarified: share of the CPUs **of the host** (quota `cpu_share × cpu_count`) | unchanged |
+| `caps.memory_mb` | clarified: hard cap of the **whole** guest, i.e. the real envelope and not the offer | unchanged |
+| `caps.cpu_weight`, `caps.io_weight` | weight against the application (1 to 10,000) | ignored |
+| `caps.memory_high_mb` | soft cap: beyond it, the kernel reclaims the guest's memory first | ignored |
+| `caps.agent_memory_mb` | hard cap per agent or per offloaded job | ignored |
+| `caps.disk_mb`, `caps.tmp_mb`, `caps.max_job_s` | disk, `/tmp` and duration of the guest | ignored |
+| `caps.enforced` | the caps that the guard enforces itself (kernel, hypervisor); the others are indicative | ignored |
+| `freeze` | `{since_ts, until_ts}`: turns frozen by the guard (tier 2). The runner does not count this time in its turn timeouts | ignored; the freeze is bounded to 60 s, below the timeouts |
+| `windows` | next windows `[{start_ts, end_ts}]`, for planning | ignored |
+| `offer` | the offer in force (section 1.3), for display and discrepancy checking | ignored |
+| `measure` | the common measure (section 1.4) | ignored |
+| `guard` | `{kind: "ameesh-guard" or "nexlink-compute", version, host_kind: "vm" or "device"}` | ignored |
 
-**Raisons.** Le texte libre est déjà admis. On fixe les valeurs suivantes :
+**Reasons.** Free text is already admitted. The following values are fixed:
 
-* de Nexlink, les raisons existantes et `metered`, plus trois qui
-  remplacent un `revoked` trompeur : `owner_pause`, `lease_lost`,
-  `shutdown` ;
-* des VM : `app_memory`, `app_cpu`, `app_busy` (jobs de CI), `disk_low`,
+* from Nexlink, the existing reasons and `metered`, plus three that
+  replace a misleading `revoked`: `owner_pause`, `lease_lost`,
+  `shutdown`;
+* from the VMs: `app_memory`, `app_cpu`, `app_busy` (CI jobs), `disk_low`,
   `maintenance`, `guard_stopping`.
 
-**Chemins.** On garde ceux de l'image et de Nexlink :
+**Paths.** Those of the image and of Nexlink are kept:
 
-* `/run/ameesh-gate/state/state.json`, dossier en lecture seule pour
-  l'invité ;
-* `/run/ameesh-gate/ack/ack.json`, dossier inscriptible par l'invité.
+* `/run/ameesh-gate/state/state.json`, directory read-only for
+  the guest;
+* `/run/ameesh-gate/ack/ack.json`, directory writable by the guest.
 
-Le défaut de `gate.py` et `EXECUTEUR-MEDIEE.md` (voie B) s'y alignent à
-la fusion (L159f).
+The `gate.py` default and `EXECUTEUR-MEDIEE.md` (track B) align with them at
+the merge (L159f).
 
-**Relais au mesh.** `ameesh-exec-availability/1` relaie au serveur les mêmes
-ajouts. C'est un ajout de contrat (1.2), sans rupture : le serveur normalise
-déjà le corps en écartant les champs inconnus.
+**Relay to the mesh.** `ameesh-exec-availability/1` relays the same
+additions to the server. It is a contract addition (1.2), without breakage:
+the server already normalises the body by discarding unknown fields.
 
-## 1.6 Céder la place : les paliers
+## 1.6 Giving way: the tiers
 
-La garde évalue ses signaux toutes les 5 s, avec des moyennes sur 10 s pour
-réagir et sur 60 s pour décider. Elle monte d'un palier dès qu'un seuil de
-reprise est franchi. Elle ne redescend qu'après `calm_seconds` passées sous
-tous les seuils (hystérésis), en incrémentant `seq`.
+The guard evaluates its signals every 5 s, with averages over 10 s to
+react and over 60 s to decide. It moves up a tier as soon as a reclaim
+threshold is crossed. It only comes back down after `calm_seconds` spent
+below all thresholds (hysteresis), incrementing `seq`.
 
-| Palier | État écrit | Ce que fait la garde | Ce que fait l'invité |
+| Tier | State written | What the guard does | What the guest does |
 |---|---|---|---|
-| **0 — prêt** | `available`, `caps` = prêtable | slice à poids faible (`CPUWeight=10`, `IOWeight=10`), `CPUQuota`, `MemoryHigh`, `MemoryMax` ; `MemoryMax` par agent | réclame dans la limite de `max_concurrent` |
-| **1 — réduit** | `available`, `caps` abaissés | ramène `max_concurrent` au nombre de tours en cours ; réduit le quota CPU ; ramène `MemoryHigh` à l'usage, et le noyau récupère le cache de l'invité | ne lance plus de tour au-delà |
-| **2 — gel** (CPU ou E/S seulement) | `available` + `freeze` | gèle les unités des agents, exécuteur compris, et les jobs (`systemctl freeze`), 60 s au plus. Un gel ne libère pas de mémoire : il ne sert jamais pour elle | rien pendant le gel ; le bail de 90 s, renouvelé toutes les 30 s, y survit ; au dégel, le temps gelé ne compte pas dans les délais du tour |
-| **3 — retrait** | `draining`, échéance à `drain_seconds` | dégèle, attend l'acquittement | arrête son tour au point sûr, travail de fond compris ; rend ses baux ; acquitte `drained: true` |
-| **4 — arrêt** | `stopped` | 30 s après l'échéance sans `drained` : `systemctl kill`, puis arrêt de la slice | arrêt immédiat |
+| **0 — ready** | `available`, `caps` = lendable | low-weight slice (`CPUWeight=10`, `IOWeight=10`), `CPUQuota`, `MemoryHigh`, `MemoryMax`; `MemoryMax` per agent | claims within the limit of `max_concurrent` |
+| **1 — reduced** | `available`, `caps` lowered | brings `max_concurrent` down to the number of turns in progress; reduces the CPU quota; brings `MemoryHigh` down to usage, and the kernel reclaims the guest's cache | no longer starts a turn beyond that |
+| **2 — freeze** (CPU or I/O only) | `available` + `freeze` | freezes the agents' units, runner included, and the jobs (`systemctl freeze`), 60 s at most. A freeze frees no memory: it is never used for memory | nothing during the freeze; the 90 s lease, renewed every 30 s, survives it; on thaw, the frozen time does not count in the turn timeouts |
+| **3 — withdrawal** | `draining`, deadline at `drain_seconds` | thaws, waits for the acknowledgement | stops its turn at the safe point, background work included; returns its leases; acknowledges `drained: true` |
+| **4 — stop** | `stopped` | 30 s after the deadline without `drained`: `systemctl kill`, then stop of the slice | immediate stop |
 
-Ces paliers donnent un sens précis au `on_context_change` de la
-spécification Nexlink :
+These tiers give a precise meaning to the `on_context_change` of the
+Nexlink specification:
 
-* `pause` correspond au palier 2 ;
-* `finish_current` au palier 3, avec une échéance longue ;
-* `return` au palier 4.
+* `pause` corresponds to tier 2;
+* `finish_current` to tier 3, with a long deadline;
+* `return` to tier 4.
 
-**Filets indépendants de la garde** :
+**Safety nets independent of the guard**:
 
-* le `MemoryMax` de la slice borne l'OOM à l'invité ;
-* `OOMScoreAdjust=500` sur les processus de l'invité : l'OOM global les
-  choisit en premier ;
-* systemd-oomd surveille la slice, s'il est présent.
+* the slice's `MemoryMax` confines the OOM to the guest;
+* `OOMScoreAdjust=500` on the guest's processes: the global OOM picks
+  them first;
+* systemd-oomd watches the slice, if present.
 
-Une garde arrêtée laisse ses derniers plafonds en place (ce sont des
-propriétés de la slice), et son état périme à `expires_ts`.
+A stopped guard leaves its last caps in place (they are properties of the
+slice), and its state goes stale at `expires_ts`.
 
-**Signaux de reprise** :
+**Reclaim signals**:
 
-* sur une VM : mémoire disponible de l'application, PSI hors invité,
-  `busy_units` (jobs de CI), disque de l'application, fin de fenêtre ;
-* sur un appareil : retour de l'utilisateur, batterie, réseau mesuré, fin
-  de fenêtre (#93). Pendant le travail, la mesure par ressource (N1)
-  permettra de réduire avant de tout arrêter.
+* on a VM: available memory of the application, PSI excluding the guest,
+  `busy_units` (CI jobs), application disk, end of window;
+* on a device: return of the user, battery, metered network, end of
+  window (#93). During work, per-resource measurement (N1) will make it
+  possible to reduce before stopping everything.
 
-La réaction se compte en secondes aux paliers 0 à 2, puis en
-`drain_seconds` au palier 3. L'application ne voit jamais l'invité prendre
-plus que ses `caps`.
+The reaction is counted in seconds at tiers 0 to 2, then in
+`drain_seconds` at tier 3. The application never sees the guest take
+more than its `caps`.
 
-## 1.7 Plafonds : correspondances
+## 1.7 Caps: mappings
 
-| Plafond | Linux, cgroups v2 | systemd | Appareil (VM d'agent, PROV-3) |
+| Cap | Linux, cgroups v2 | systemd | Device (agent VM, PROV-3) |
 |---|---|---|---|
-| `cpu_share` | `cpu.max` | `CPUQuota=` (part × CPU × 100 %) | vCPU de la VM et `--cpus` du conteneur (aujourd'hui fixes : 2) |
-| `cpu_weight` | `cpu.weight` (ou `cpu.idle` si le noyau et systemd le permettent) | `CPUWeight=` | priorité du processus de la VM (à étudier) |
-| `memory_mb` | `memory.max` de la slice | `MemoryMax=` | mémoire de la VM et `--memory` du conteneur (aujourd'hui 4 Gio et 3 Gio) |
+| `cpu_share` | `cpu.max` | `CPUQuota=` (share × CPU × 100 %) | vCPUs of the VM and `--cpus` of the container (fixed today: 2) |
+| `cpu_weight` | `cpu.weight` (or `cpu.idle` if the kernel and systemd allow it) | `CPUWeight=` | priority of the VM process (to be studied) |
+| `memory_mb` | `memory.max` of the slice | `MemoryMax=` | memory of the VM and `--memory` of the container (today 4 GiB and 3 GiB) |
 | `memory_high_mb` | `memory.high` | `MemoryHigh=` | — |
-| `agent_memory_mb` | `memory.max` de l'unité de l'agent | `MemoryMax=` sur `ameesh-guest-runner@` | `--memory` du conteneur (un agent à la fois) |
+| `agent_memory_mb` | `memory.max` of the agent's unit | `MemoryMax=` on `ameesh-guest-runner@` | `--memory` of the container (one agent at a time) |
 | `io_weight` | `io.weight` | `IOWeight=` | — |
-| `disk_mb` | taille du volume dédié | `ReadWritePaths=` limité au volume | disque de la VM (aujourd'hui 40 Gio) |
-| `tmp_mb` | `/tmp` privé sur le volume | `PrivateTmp=yes`, `TMPDIR` | tmpfs du conteneur (256 Mio) |
-| gel | `cgroup.freeze` | `systemctl freeze` / `thaw` | pause de la VM si l'hyperviseur la permet (facultatif) |
-| retrait forcé | `cgroup.kill` | `systemctl kill`, `stop` | arrêt de la VM (`limactl stop`, `wsl --terminate`) |
+| `disk_mb` | size of the dedicated volume | `ReadWritePaths=` limited to the volume | disk of the VM (today 40 GiB) |
+| `tmp_mb` | private `/tmp` on the volume | `PrivateTmp=yes`, `TMPDIR` | container tmpfs (256 MiB) |
+| freeze | `cgroup.freeze` | `systemctl freeze` / `thaw` | pause of the VM if the hypervisor allows it (optional) |
+| forced withdrawal | `cgroup.kill` | `systemctl kill`, `stop` | stop of the VM (`limactl stop`, `wsl --terminate`) |
 
-## 1.8 L'acquittement
+## 1.8 The acknowledgement
 
-`ameesh-host-ack/1` ne change pas : `seq`, `state`, `in_turn`, `held`,
-`drained` et `ts`. Le lecteur de Nexlink doit simplement admettre ces clés
+`ameesh-host-ack/1` does not change: `seq`, `state`, `in_turn`, `held`,
+`drained` and `ts`. The Nexlink reader simply has to admit these keys
 (N2).
 
-Les jobs déportés (mode b) n'acquittent pas. La garde les voit comme des
-scopes (`ameesh-job-*.scope`) dans la slice de l'invité, et les arrête
-elle-même à l'échéance.
+Offloaded jobs (mode b) do not acknowledge. The guard sees them as
+scopes (`ameesh-job-*.scope`) in the guest's slice, and stops them
+itself at the deadline.
 
-## 1.9 Qui implémente quoi, et comment rester d'accord
+## 1.9 Who implements what, and how to stay in agreement
 
-* **ameesh publie le contrat** : `docs/GARDE-DE-CAPACITE.md`, les schémas
-  JSON des deux messages et des **jeux dorés** (L159a). Un jeu doré associe
-  des entrées brutes (`/proc/meminfo`, PSI, `cpu.stat`, offre, historique)
-  aux sorties attendues : `lendable`, palier, état écrit. Ils vivent sous
-  `tests/dore/capacity_guard/`, comme ceux de l'exécuteur médié.
-* **ameesh fournit** la garde des VM Linux (`ameesh guard`, L159e) et
-  l'invité : exécuteur classique ou médié, et le côté VM du déport. Comme
-  Nexlink n'a pas de runner sous Linux, la même garde pourra servir un
-  appareil Linux.
-* **Nexlink garde son runner** comme garde des appareils. Il écrit les
-  champs ajoutés et fait passer les mêmes jeux dorés dans ses tests (N1).
-  Il fait aussi correspondre les `caps` à l'enveloppe réelle de la VM
-  d'agent (N2).
-* **En (a2), une VM réutilise la recette de lancement de PROV-3** : même
-  conteneur, mêmes options, mêmes montages de la porte. Le conteneur se
-  comporte alors de la même façon sur un appareil et sur une VM.
-* **Un champ nouveau** se propose par PR sur le contrat d'ameesh, avec son
-  jeu doré. Le lecteur d'ameesh l'ignore tant qu'il ne le connaît pas.
+* **ameesh publishes the contract**: `docs/GARDE-DE-CAPACITE.md`, the JSON
+  schemas of the two messages and **golden sets** (L159a). A golden set
+  associates raw inputs (`/proc/meminfo`, PSI, `cpu.stat`, offer, history)
+  with the expected outputs: `lendable`, tier, state written. They live under
+  `tests/dore/capacity_guard/`, like those of the mediated runner.
+* **ameesh provides** the guard for Linux VMs (`ameesh guard`, L159e) and
+  the guest: classic or mediated runner, and the VM side of offloading. As
+  Nexlink has no runner under Linux, the same guard could serve a
+  Linux device.
+* **Nexlink keeps its runner** as the guard of devices. It writes the
+  added fields and runs the same golden sets in its tests (N1).
+  It also maps the `caps` to the real envelope of the agent
+  VM (N2).
+* **In (a2), a VM reuses PROV-3's launch recipe**: same
+  container, same options, same gate mounts. The container then
+  behaves the same way on a device and on a VM.
+* **A new field** is proposed by PR on the ameesh contract, with its
+  golden set. The ameesh reader ignores it as long as it does not know it.
 
-# 2. Deux modes sur une VM
+# 2. Two modes on a VM
 
-## 2.1 Mode (a) : un exécuteur ameesh complet sous une slice plafonnée
+## 2.1 Mode (a): a full ameesh runner under a capped slice
 
-L'hôte prêteur devient un hôte du mesh comme un autre, admis pour quelques
-agents. Le déplacement de 0028 y envoie un agent quand le poste est sous
-pression et que la VM est `available`.
+The lending host becomes a mesh host like any other, admitted for a few
+agents. The relocation of 0028 sends an agent there when the workstation is
+under pressure and the VM is `available`.
 
-* **Unités** : `ameesh-guest-runner@<agent>.service`. Ce sont des unités
-  **système**, ce qui évite de dépendre de la délégation des cgroups au
-  gestionnaire utilisateur.
-  - Identité et plafonds : `User=ameesh-guest`, `Slice=ameesh-guest.slice`,
-    `MemoryHigh` et `MemoryMax` par agent, `OOMScoreAdjust=500`, plus le
-    durcissement de la section 3.
-  - Porte : `AMEESH_HOST_GATE=file`, `AMEESH_HOST_GATE_FALLBACK=stopped`,
-    avec les chemins de la section 1.5.
-  - Arrêt : `AMEESH_DRAIN_SECONDS=120`, `turn_grace_seconds` court,
+* **Units**: `ameesh-guest-runner@<agent>.service`. These are **system**
+  units, which avoids depending on delegation of cgroups to the user
+  manager.
+  - Identity and caps: `User=ameesh-guest`, `Slice=ameesh-guest.slice`,
+    `MemoryHigh` and `MemoryMax` per agent, `OOMScoreAdjust=500`, plus the
+    hardening of section 3.
+  - Gate: `AMEESH_HOST_GATE=file`, `AMEESH_HOST_GATE_FALLBACK=stopped`,
+    with the paths of section 1.5.
+  - Stop: `AMEESH_DRAIN_SECONDS=120`, short `turn_grace_seconds`,
     `TimeoutStopSec=180`.
-* **Deux variantes** :
-  - **(a1) classique** : accès direct à la base du mesh. Il faut un pair
-    WireGuard, un rôle Postgres limité (L56) et les secrets de l'agent sur
-    la VM (compte du harnais, jeton de forge). Possible sur `main` dès que
-    la porte y est (L159f).
-  - **(a2) médié** (voie B) : aucun accès à la base, aucune clé de
-    fournisseur (relais de modèle), un enrôlement révocable. C'est l'image
-    `ameesh-executor/1`, lancée comme PROV-3, et la garde écrit la porte. Il
-    faut que la voie B soit fusionnée et que le serveur du mesh soit
-    joignable en HTTPS. Les harnais au forfait n'y vont pas.
-* **Fiche et admission** :
-  - fiche `Host` avec `policy.lend`, `volatile`, `max_agents`, et un
-    `work_root` sur le volume de l'invité ;
-  - admission `hosts: [poste, vm]` pour les agents choisis ;
-  - le déplacement doit aussi consulter l'état de la porte de l'hôte
-    d'arrivée (L159f).
+* **Two variants**:
+  - **(a1) classic**: direct access to the mesh database. It requires a
+    WireGuard peer, a limited Postgres role (L56) and the agent's secrets on
+    the VM (harness account, forge token). Possible on `main` as soon as
+    the gate is there (L159f).
+  - **(a2) mediated** (track B): no database access, no provider key
+    (model relay), a revocable enrolment. It is the `ameesh-executor/1`
+    image, launched like PROV-3, and the guard writes the gate. It
+    requires track B to be merged and the mesh server to be reachable over
+    HTTPS. Plan-based harnesses do not go there.
+* **Card and admission**:
+  - `Host` card with `policy.lend`, `volatile`, `max_agents`, and a
+    `work_root` on the guest's volume;
+  - admission `hosts: [poste, vm]` for the chosen agents;
+  - relocation must also consult the gate state of the destination
+    host (L159f).
 
-## 2.2 Mode (b) : déporter seulement les suites lourdes
+## 2.2 Mode (b): offload only the heavy suites
 
-L'agent reste sur le poste. Ses commandes lourdes (suite complète, e2e,
-tests SQL avec Postgres en conteneur, constructions) partent sur la VM. Ce
-mode règle la part CPU et `/tmp` du problème, sans mettre aucun secret de
-l'agent sur la VM.
+The agent stays on the workstation. Its heavy commands (full suite, e2e,
+SQL tests with Postgres in a container, builds) go to the VM. This
+mode settles the CPU and `/tmp` part of the problem, without putting any of
+the agent's secrets on the VM.
 
-**(b1) par SSH**, faisable tout de suite sur la VM de tests :
+**(b1) over SSH**, feasible right away on the test VM:
 
-* **Côté poste**, `ameesh offload run [--profile …] -- <commande>` :
-  - prend un **instantané exact de l'arbre de travail**, par un index
-    temporaire, `git write-tree` et `git commit-tree`. Ni l'index ni les
-    références de l'agent ne bougent. Les fichiers non suivis sont compris,
-    les ignorés exclus ;
-  - l'envoie en **paquet git différentiel** vers un miroir du dépôt sur la
-    VM ;
-  - y lance la commande dans un dossier de job jetable. La sortie et le
-    code de retour reviennent tels quels.
-* **Côté VM**, un utilisateur `ameesh-guest`, sans sudo ni groupe `docker` :
-  - sa clé SSH est restreinte (`restrict`, commande forcée
-    `ameesh-offload-shell`) à quatre verbes : `put`, `run`, `status` et
-    `cancel`. Ni shell, ni transfert de port ;
-  - les conteneurs de test passent par **Podman sans root**, dans la slice
-    de l'utilisateur ;
-  - les dépendances sont mises en cache, par empreinte du fichier de
-    verrouillage ;
-  - chaque job est un scope (`systemd-run --user --scope`) plafonné à
-    `agent_memory_mb` ;
-  - des jetons de concurrence (`flock` ; trois sur la VM de tests) font la
-    file, et le client affiche l'attente.
-* **Obéissance à la porte** :
-  - aucun nouveau job hors `available` ;
-  - en `draining`, les jobs finissent jusqu'à l'échéance, puis la garde les
-    tue ;
-  - en `stopped`, ils sont tués tout de suite.
-* **Repli** : quand la VM refuse ou arrête un job, le client relance la
-  commande sur le poste (`--fallback local`). Sans `AMEESH_OFFLOAD_HOST`,
-  ou si la VM est injoignable, la commande tourne aussi sur le poste. La
-  consigne des agents dit quelles commandes passent par `ameesh offload`.
+* **Workstation side**, `ameesh offload run [--profile …] -- <command>`:
+  - takes an **exact snapshot of the working tree**, via a temporary
+    index, `git write-tree` and `git commit-tree`. Neither the agent's index
+    nor its references move. Untracked files are included, ignored ones
+    excluded;
+  - sends it as a **differential git bundle** to a mirror of the repository
+    on the VM;
+  - runs the command there in a disposable job directory. The output and
+    the exit code come back as is.
+* **VM side**, an `ameesh-guest` user, without sudo or `docker` group:
+  - its SSH key is restricted (`restrict`, forced command
+    `ameesh-offload-shell`) to four verbs: `put`, `run`, `status` and
+    `cancel`. No shell, no port forwarding;
+  - test containers go through **rootless Podman**, in the user's
+    slice;
+  - dependencies are cached, by hash of the lock file;
+  - each job is a scope (`systemd-run --user --scope`) capped at
+    `agent_memory_mb`;
+  - concurrency tokens (`flock`; three on the test VM) form the
+    queue, and the client displays the wait.
+* **Obeying the gate**:
+  - no new job outside `available`;
+  - in `draining`, jobs finish until the deadline, then the guard kills
+    them;
+  - in `stopped`, they are killed immediately.
+* **Fallback**: when the VM refuses or stops a job, the client reruns the
+  command on the workstation (`--fallback local`). Without
+  `AMEESH_OFFLOAD_HOST`, or if the VM is unreachable, the command also runs
+  on the workstation. The agents' prompt says which commands go through
+  `ameesh offload`.
 
-**(b2) par un runner** : un runner GitHub Actions étiqueté sur la VM. L'agent
-le déclenche (`workflow_dispatch`) sur sa branche poussée, puis suit le run
-avec `gh run watch`.
+**(b2) via a runner**: a labelled GitHub Actions runner on the VM. The agent
+triggers it (`workflow_dispatch`) on its pushed branch, then follows the run
+with `gh run watch`.
 
-* Avantages : les journaux restent dans la forge, et il n'y a pas de clé SSH
-  à gérer.
-* Prix : une poussée et 20 à 60 s de latence.
-* Sur un **dépôt public**, il faut un groupe de runners limité aux workflows
-  choisis, et l'approbation des contributions extérieures.
+* Advantages: the logs stay in the forge, and there is no SSH key
+  to manage.
+* Cost: a push and 20 to 60 s of latency.
+* On a **public repository**, a runner group limited to the chosen workflows
+  is needed, as well as approval of outside contributions.
 
-On le garde pour les dépôts dont la CI tourne déjà sur nos VM.
+It is kept for repositories whose CI already runs on our VMs.
 
-## 2.3 Choix
+## 2.3 Choice
 
-| | (b1) déport SSH | (a1) exécuteur classique | (a2) exécuteur médié |
+| | (b1) SSH offload | (a1) classic runner | (a2) mediated runner |
 |---|---|---|---|
-| Ce qui quitte le poste | CPU et `/tmp` des suites | des agents entiers (mémoire et CPU) | des agents entiers |
-| Secrets de l'agent sur la VM | aucun | compte du harnais, jeton de forge, accès à la base | une clé d'exécuteur révocable |
-| Dépend de | rien de nouveau | porte sur `main` (L159f), L56, WireGuard | voie B fusionnée, serveur HTTPS |
-| Délai | 1 à 2 jours | environ une semaine | après la voie B |
-| VM admissibles | VM de tests ; VM de CI après décision | VM de tests | toutes, VM de CI comprise |
+| What leaves the workstation | CPU and `/tmp` of the suites | whole agents (memory and CPU) | whole agents |
+| Agent secrets on the VM | none | harness account, forge token, database access | a revocable runner key |
+| Depends on | nothing new | gate on `main` (L159f), L56, WireGuard | track B merged, HTTPS server |
+| Lead time | 1 to 2 days | about a week | after track B |
+| Eligible VMs | test VM; CI VM after decision | test VM | all, CI VM included |
 
-**Recommandation** :
+**Recommendation**:
 
-1. (b1) d'abord, sur la VM de tests, pour soulager le poste cette semaine ;
-2. puis (a1) sur la même VM, pour deux ou trois agents ;
-3. (a2) enfin, pour les VM qu'on ne contrôle pas entièrement, à commencer
-   par la VM de CI.
+1. (b1) first, on the test VM, to relieve the workstation this week;
+2. then (a1) on the same VM, for two or three agents;
+3. (a2) last, for the VMs we do not fully control, starting
+   with the CI VM.
 
-Si la VM dédiée aux agents de L163 est créée, elle reçoit (a1) avant la VM
-de tests. Elle n'a aucune application à protéger, et la VM de tests garde le
-déport (b1). Le contrat s'y applique quand même : plafonds par agent
-(L159c), mesure (L159d), et une garde réduite aux planchers de l'hôte.
+If the VM dedicated to agents of L163 is created, it receives (a1) before the
+test VM. It has no application to protect, and the test VM keeps the
+offload (b1). The contract applies there all the same: per-agent caps
+(L159c), measure (L159d), and a guard reduced to the host's floors.
 
-# 3. Sécurité et isolement
+# 3. Security and isolation
 
-* **Utilisateur dédié** `ameesh-guest` : pas de sudo, aucun groupe de
-  l'application, pas de `docker`. Son home et son travail sont sur un volume
-  dédié (`/srv/ameesh-guest`, `0700`).
-  - Les unités système posent `NoNewPrivileges`, `ProtectSystem=strict`,
+* **Dedicated user** `ameesh-guest`: no sudo, no group of the
+  application, no `docker`. Its home and its work are on a dedicated volume
+  (`/srv/ameesh-guest`, `0700`).
+  - The system units set `NoNewPrivileges`, `ProtectSystem=strict`,
     `ReadWritePaths=/srv/ameesh-guest`, `ProtectHome=tmpfs`, `PrivateTmp`,
-    `PrivateDevices`, `ProtectKernelTunables` et `RestrictSUIDSGID`.
-  - `ProtectProc=invisible` cache les processus des autres utilisateurs,
-    dont les lignes de commande portent parfois des secrets.
-  - `ProtectControlGroups` empêche l'invité de relever ses propres
-    plafonds.
-  - Le mode (b) laisse les espaces de noms utilisateur ouverts, car Podman
-    en a besoin.
-* **Secrets de l'application** : l'invité ne lit ni ses fichiers ni son
-  environnement. `InaccessiblePaths=` couvre ses dossiers de configuration
-  et de données, ainsi que `/run/docker.sock`. Un contrôle d'installation,
-  `ameesh guard check`, cherche sous l'identité de l'invité tout fichier de
-  l'application qu'il pourrait lire.
-* **Secrets de l'agent** (a1) : home `0700`, ou `LoadCredential=` de
-  systemd. La frontière de confiance reste le root de la VM : tout ce qui
-  est root, ou équivalent, lit ces secrets. Une VM n'accueille donc un agent
-  à secrets que si tous ceux qui y ont un accès root sont dignes de ces
+    `PrivateDevices`, `ProtectKernelTunables` and `RestrictSUIDSGID`.
+  - `ProtectProc=invisible` hides the processes of other users, whose
+    command lines sometimes carry secrets.
+  - `ProtectControlGroups` prevents the guest from raising its own
+    caps.
+  - Mode (b) leaves user namespaces open, because Podman needs
+    them.
+* **Application secrets**: the guest reads neither its files nor its
+  environment. `InaccessiblePaths=` covers its configuration and data
+  directories, as well as `/run/docker.sock`. An installation check,
+  `ameesh guard check`, looks under the guest's identity for any file of
+  the application that it could read.
+* **Agent secrets** (a1): home `0700`, or systemd's `LoadCredential=`.
+  The trust boundary remains the VM's root: anything that is root, or
+  equivalent, reads these secrets. A VM therefore only hosts an agent
+  with secrets if everyone who has root access there is worthy of those
   secrets.
-* **VM de CI : `runner` dans le groupe `docker`.** Ce groupe vaut root, car
-  `docker run -v /:/h` lit tout le disque.
-  - N'importe quel job de CI, y compris le code d'une PR, lirait les comptes
-    des harnais, les jetons de forge et le mot de passe de base d'un agent
-    (a1). Il pourrait aussi tuer l'invité ou relever ses plafonds.
-  - **Aucun agent à secrets (a1) sur la VM de CI** tant que ce groupe est
-    donné aux jobs.
-  - Pour y prêter quand même, deux voies :
-    1. le mode (a2), qui n'y laisse qu'une clé d'exécuteur révocable. Le
-       pire cas devient l'usurpation de cet exécuteur, bornée à ses agents
-       admis et à ses plafonds de relais ;
-    2. une CI en Docker sans root, avec un utilisateur par runner. C'est un
-       chantier des mainteneurs de la CI.
-  - Le mode (b1) y reste possible : les jobs déportés n'emportent aucun
-    secret, et ne rapportent que des journaux de tests.
-* **Rôle Postgres limité** :
-  - (a1) : le rôle `ameesh_executeur` de L56 (PR #23 : données oui, schéma
-    non) et un rôle de connexion par hôte, que `pg_hba` n'admet que depuis
-    l'adresse WireGuard de la VM. Limite connue : tous les exécuteurs
-    partagent les mêmes droits sur les données ;
-  - (a2) : aucun rôle Postgres ;
-  - (b) : des bases jetables, propres au job (Podman, socket locale), jamais
-    la base de l'application ni celle du mesh.
-* **Réseau** :
-  - entrant : rien en mode (a). En mode (b), SSH seulement, depuis le poste
-    et la VM du mesh (groupe de sécurité ou WireGuard) ;
-  - sortant : des règles nftables par uid de l'invité (`meta skuid`)
-    refusent les ports locaux de l'application (base, cache, API sur la
-    boucle locale) et le réseau interne, sauf la base du mesh en (a1). Le
-    HTTPS sortant reste permis pour les fournisseurs et la forge. En (a2),
-    seul le serveur du mesh est joignable, comme dans PROV-3.
-* **Ce qui reste** : l'invité partage le noyau de l'application.
-  L'isolement est celui de Linux entre utilisateurs, pas celui d'une VM.
-  Prêter une VM de production d'un client demanderait une micro-VM, ou de ne
-  pas prêter. L'inventaire a déjà tranché : ces VM sont trop petites.
+* **CI VM: `runner` in the `docker` group.** This group is equivalent to
+  root, because `docker run -v /:/h` reads the whole disk.
+  - Any CI job, including the code of a PR, could read the harness
+    accounts, the forge tokens and the database password of an agent
+    (a1). It could also kill the guest or raise its caps.
+  - **No agent with secrets (a1) on the CI VM** as long as this group is
+    given to the jobs.
+  - To lend there anyway, two ways:
+    1. mode (a2), which leaves only a revocable runner key there. The
+       worst case becomes impersonation of that runner, bounded to its
+       admitted agents and its relay caps;
+    2. a CI in rootless Docker, with one user per runner. This is a
+       project for the CI maintainers.
+  - Mode (b1) remains possible there: offloaded jobs carry no
+    secret, and only bring back test logs.
+* **Limited Postgres role**:
+  - (a1): the `ameesh_executeur` role of L56 (PR #23: data yes, schema
+    no) and one login role per host, which `pg_hba` only admits from
+    the VM's WireGuard address. Known limit: all runners
+    share the same rights on the data;
+  - (a2): no Postgres role;
+  - (b): disposable databases, specific to the job (Podman, local socket),
+    never the application's database nor the mesh's.
+* **Network**:
+  - inbound: nothing in mode (a). In mode (b), SSH only, from the
+    workstation and the mesh VM (security group or WireGuard);
+  - outbound: nftables rules per guest uid (`meta skuid`)
+    refuse the application's local ports (database, cache, API on the
+    loopback) and the internal network, except the mesh database in (a1).
+    Outbound HTTPS remains allowed for the providers and the forge. In
+    (a2), only the mesh server is reachable, as in PROV-3.
+* **What remains**: the guest shares the application's kernel.
+  The isolation is that of Linux between users, not that of a VM.
+  Lending a customer's production VM would require a micro-VM, or not
+  lending. The inventory has already settled it: these VMs are too small.
 
-# 4. Mise en service
+# 4. Rollout
 
-## 4.1 VM pilote : la VM de tests
+## 4.1 Pilot VM: the test VM
 
-* **Pourquoi elle** :
-  - elle appartient à notre projet : aucune donnée de client, aucune
-    production, et seule la clé du propriétaire y est installée ;
-  - elle garde plus de 28 Go libres pendant les suites, et elle est
-    inactive le reste du temps ;
-  - son « application », ce sont nos suites de tests. Y déporter celles des
-    agents prolonge son usage, en mieux encadré : un utilisateur dédié
-    plutôt que root, des plafonds, une file.
-* **Condition** : un volume dédié de 100 Go, monté sur `/srv/ameesh-guest`,
-  plutôt qu'une racine agrandie. Un invité qui remplit son volume n'atteint
-  pas le système. Porter aussi la racine à 20 Go donnerait de l'air à
-  Docker, déjà serré.
+* **Why this one**:
+  - it belongs to our project: no customer data, no
+    production, and only the owner's key is installed on it;
+  - it keeps more than 28 GB free during the suites, and it is
+    idle the rest of the time;
+  - its "application" is our test suites. Offloading the agents' suites
+    there extends its use, under better control: a dedicated user
+    rather than root, caps, a queue.
+* **Condition**: a dedicated 100 GB volume, mounted on `/srv/ameesh-guest`,
+  rather than an enlarged root. A guest that fills its volume does not reach
+  the system. Also growing the root to 20 GB would give Docker some air,
+  already tight.
 
-## 4.2 Étapes
+## 4.2 Steps
 
-1. **Préparation** (propriétaire) : volume, accès SSH depuis le poste,
-   choix des modes.
-   - Un script d'installation versionné et relu (`deploy/guest/install.sh`,
-     L159b) prépare la VM : utilisateur, volume, plafonds de la slice
-     utilisateur, Podman sans root, clé restreinte, règles nftables.
-   - Le propriétaire le lance lui-même sur la VM : aucun agent ne modifie la
-     configuration persistante d'une VM.
-2. **Déport (b1)** : `ameesh offload` sur le poste, et une consigne des
-   agents qui déporte les suites complètes et e2e. Une semaine de mesure.
-3. **Plafonds partout** (L159c) : `MemoryMax` par agent, sur le poste et la
-   VM du mesh, avec la slice `ameesh-agents.slice`. Cette étape ne dépend de
-   rien d'autre, et elle corrige l'OOM de la VM du mesh.
-4. **Garde** (L159e) sur la VM de tests, d'abord en observation : elle écrit
-   l'état et la mesure, sans plafond dynamique.
-5. **Exécuteur (a1)** sur la VM de tests, ou d'abord sur la VM dédiée de
-   L163 si elle existe :
-   - deux agents d'abord, sous DeepSeek par `dsh` (sans compte au
-     forfait), avec des admissions `[poste, vm]` ;
-   - une semaine de mesure ;
-   - puis trois agents.
-6. **VM de CI** : seulement après la décision sur l'isolement (section 3).
-   On n'y prête qu'en dehors des heures de CI, en (b1) ou en (a2).
+1. **Preparation** (owner): volume, SSH access from the workstation,
+   choice of modes.
+   - A versioned and reviewed installation script (`deploy/guest/install.sh`,
+     L159b) prepares the VM: user, volume, caps of the user slice,
+     rootless Podman, restricted key, nftables rules.
+   - The owner runs it himself on the VM: no agent modifies the
+     persistent configuration of a VM.
+2. **Offload (b1)**: `ameesh offload` on the workstation, and an agent
+   prompt that offloads the full and e2e suites. One week of measurement.
+3. **Caps everywhere** (L159c): `MemoryMax` per agent, on the workstation and
+   the mesh VM, with the `ameesh-agents.slice` slice. This step depends on
+   nothing else, and it fixes the OOM on the mesh VM.
+4. **Guard** (L159e) on the test VM, first in observation: it writes
+   the state and the measure, without dynamic caps.
+5. **Runner (a1)** on the test VM, or first on the dedicated VM of
+   L163 if it exists:
+   - two agents first, under DeepSeek via `dsh` (no plan-based
+     account), with `[poste, vm]` admissions;
+   - one week of measurement;
+   - then three agents.
+6. **CI VM**: only after the decision on isolation (section 3).
+   It is lent only outside CI hours, in (b1) or in (a2).
 
-## 4.3 Retour arrière
+## 4.3 Rollback
 
-* **(b1)** : retirer `AMEESH_OFFLOAD_HOST`, et les agents testent de nouveau
-  sur le poste. Puis retirer la clé de `authorized_keys`, supprimer
-  l'utilisateur et détacher le volume. L'application n'a jamais été touchée.
-* **(a)** :
-  1. `ameesh guard drain` (ou écrire `stopped`) : les agents rendent leurs
-     baux ;
-  2. une PR sur le canon retire l'admission : les agents repartent sur le
-     poste au tour suivant ;
-  3. désactiver les unités ;
-  4. supprimer le rôle de connexion de l'hôte (a1), ou lancer `ameesh host
-     revoke` (a2) ;
-  5. supprimer l'utilisateur et la slice.
-* **La garde** : `systemctl disable --now ameesh-guard`, puis remettre les
-  propriétés de la slice. Rien d'autre n'a changé sur la VM.
+* **(b1)**: remove `AMEESH_OFFLOAD_HOST`, and the agents test again
+  on the workstation. Then remove the key from `authorized_keys`, delete
+  the user and detach the volume. The application was never touched.
+* **(a)**:
+  1. `ameesh guard drain` (or write `stopped`): the agents return their
+     leases;
+  2. a PR on the canon removes the admission: the agents go back to the
+     workstation at the next turn;
+  3. disable the units;
+  4. delete the host's login role (a1), or run `ameesh host
+     revoke` (a2);
+  5. delete the user and the slice.
+* **The guard**: `systemctl disable --now ameesh-guard`, then reset the
+  slice's properties. Nothing else has changed on the VM.
 
-## 4.4 Mesures de succès
+## 4.4 Success measures
 
-Chaque étape se mesure une semaine avant et une semaine après. Les sources
-sont les journaux de l'exécuteur (lignes de début et de fin d'épisode de
-pression, L31b) et `host_resources` (7 jours).
+Each step is measured one week before and one week after. The sources
+are the runner's logs (start and end lines of pressure episodes,
+L31b) and `host_resources` (7 days).
 
-| Mesure | Avant (10 et 11 octobre) | Cible |
+| Measure | Before (10 and 11 October) | Target |
 |---|---|---|
-| Tours retardés par la pression du poste | ≈ 80 min dans la journée du 10 | moins de 10 min par jour |
-| Charge du poste | jusqu'à 43 pour 12 CPU | 95e centile sous 18, aucun épisode critique |
-| `/tmp` du poste | plein le 11 vers 03:38 | jamais au-dessus de 80 % |
-| Durée médiane d'un tour avec suite de tests | à relever (étape 2) | −30 % |
-| Suites propres de la VM prêtée | à relever | 90e centile dégradé de 10 % au plus |
-| Application de la VM prêtée | — | aucun OOM ; PSI mémoire hors invité sous 1 % hors retraits |
-| Retraits | — | 99 % acquittés `drained` avant l'échéance |
-| Usage | 0 | heures de tours ou de jobs hébergés par jour |
+| Turns delayed by workstation pressure | ≈ 80 min over the day of the 10th | less than 10 min per day |
+| Workstation load | up to 43 for 12 CPUs | 95th percentile below 18, no critical episode |
+| Workstation `/tmp` | full on the 11th around 03:38 | never above 80 % |
+| Median duration of a turn with a test suite | to be sampled (step 2) | −30 % |
+| Lent VM's own suites | to be sampled | 90th percentile degraded by 10 % at most |
+| Lent VM's application | — | no OOM; memory PSI excluding guest below 1 % outside withdrawals |
+| Withdrawals | — | 99 % acknowledged `drained` before the deadline |
+| Usage | 0 | hours of turns or jobs hosted per day |
 
 # 5. Lots
 
-Les durées sont en heures de travail d'agent, revue comprise. Les dates
-partent du lundi 12 octobre. La garde (L159e) attend le contrat (L159a) ;
-le reste avance en parallèle.
+Durations are in agent work hours, review included. Dates
+start from Monday 12 October. The guard (L159e) waits for the contract
+(L159a); the rest proceeds in parallel.
 
 ## 5.1 ameesh
 
-| Lot | Contenu | Dépend de | Durée | Date |
+| Lot | Content | Depends on | Duration | Date |
 |---|---|---|---|---|
-| **L159a** — contrat | `docs/GARDE-DE-CAPACITE.md` ; schémas JSON de l'état étendu et de l'acquittement ; `policy.lend` au canon (`canon check`) ; jeux dorés `tests/dore/capacity_guard/` ; chemins `state/` et `ack/` | cette étude | 5 h | 12/10 |
-| **L159b** — déport (b1) | `deploy/guest/install.sh` (lancé par le propriétaire) ; `ameesh-offload-shell` (`put`, `run`, `status`, `cancel`) ; `ameesh offload run` (instantané, paquet différentiel, jetons de concurrence, repli local) ; consigne des agents | — | 8 h | 12–13/10 |
-| **L159c** — plafonds par agent | `ameesh-agents.slice` ; `MemoryHigh` et `MemoryMax` par unité d'agent, sur le poste et la VM du mesh ; `OOMScoreAdjust` ; contrôle dans `ameesh doctor` | — | 3 h | 12/10 |
-| **L159d** — mesure commune | dans `resources.py` : PSI, parts de l'application et de l'invité, `lendable` ; colonnes de `host_resources` (migration) ; `ameesh hosts` ; seuil `max_cpu_pressure` au poste ; déplacement classé par `lendable` | L159a | 6 h | 13/10 |
-| **L159e** — `ameesh guard` | service système des VM Linux : offre, historique, paliers 0 à 4, plafonds par `systemctl set-property --runtime`, gel, `expires_ts`, attente de l'acquittement, `guard check`, `guard drain` ; jeux dorés | L159a, L159d | 12 h | 14–15/10 |
-| **L159f** — porte sur `main` | porte de L112 pour l'exécuteur classique (fusion de la voie B, ou extraction de la seule porte) ; chemins par dossier ; `expires_ts`, `freeze` ; un retrait arrête aussi le travail de fond (grâce de fin de tour) ; défauts d'un hôte prêteur ; déplacement qui consulte la porte d'arrivée | décision sur la voie B | 6 h | 15/10 |
-| **L159g** — pilote (a1) | unités `ameesh-guest-runner@` ; PR sur le canon (`Host` avec `lend`, admissions) ; deux agents, puis trois ; rapport de mesures | L159c, L159e, L159f, L56 | 4 h + 7 jours | du 16/10 au rapport du 23/10 |
-| **L159h** — VM de CI | selon la décision : fenêtre et `busy_units` pour (b1), ou image (a2) avec la garde | décision du propriétaire, rapport de L159g | 6 h | à partir du 26/10 |
-| **L159i** — (a2) sur une VM | conteneur `ameesh-executor/1` lancé par la garde comme PROV-3 (volume, porte, code d'enrôlement, arrêt en 100 s, codes de sortie) | voie B fusionnée, serveur du mesh en HTTPS | 4 h | à partir du 28/10 |
+| **L159a** — contract | `docs/GARDE-DE-CAPACITE.md`; JSON schemas of the extended state and of the acknowledgement; `policy.lend` in the canon (`canon check`); golden sets `tests/dore/capacity_guard/`; `state/` and `ack/` paths | this study | 5 h | 12/10 |
+| **L159b** — offload (b1) | `deploy/guest/install.sh` (run by the owner); `ameesh-offload-shell` (`put`, `run`, `status`, `cancel`); `ameesh offload run` (snapshot, differential bundle, concurrency tokens, local fallback); agents' prompt | — | 8 h | 12–13/10 |
+| **L159c** — per-agent caps | `ameesh-agents.slice`; `MemoryHigh` and `MemoryMax` per agent unit, on the workstation and the mesh VM; `OOMScoreAdjust`; check in `ameesh doctor` | — | 3 h | 12/10 |
+| **L159d** — common measure | in `resources.py`: PSI, application and guest shares, `lendable`; `host_resources` columns (migration); `ameesh hosts`; `max_cpu_pressure` threshold on the workstation; relocation ranked by `lendable` | L159a | 6 h | 13/10 |
+| **L159e** — `ameesh guard` | system service for Linux VMs: offer, history, tiers 0 to 4, caps via `systemctl set-property --runtime`, freeze, `expires_ts`, waiting for the acknowledgement, `guard check`, `guard drain`; golden sets | L159a, L159d | 12 h | 14–15/10 |
+| **L159f** — gate on `main` | L112 gate for the classic runner (merge of track B, or extraction of the gate alone); directory paths; `expires_ts`, `freeze`; a withdrawal also stops background work (end-of-turn grace); defaults for a lending host; relocation that consults the destination gate | decision on track B | 6 h | 15/10 |
+| **L159g** — pilot (a1) | `ameesh-guest-runner@` units; PR on the canon (`Host` with `lend`, admissions); two agents, then three; measurement report | L159c, L159e, L159f, L56 | 4 h + 7 days | from 16/10 to the report of 23/10 |
+| **L159h** — CI VM | depending on the decision: window and `busy_units` for (b1), or (a2) image with the guard | owner's decision, L159g report | 6 h | from 26/10 |
+| **L159i** — (a2) on a VM | `ameesh-executor/1` container launched by the guard like PROV-3 (volume, gate, enrolment code, stop in 100 s, exit codes) | track B merged, mesh server over HTTPS | 4 h | from 28/10 |
 
-Total côté ameesh : environ 54 h, plus une semaine d'observation.
+Total on the ameesh side: about 54 h, plus one week of observation.
 
-**Lots voisins**, déjà ouverts :
+**Neighbouring lots**, already open:
 
-* **L161** : tests choisis selon l'impact, erreurs remontées en temps réel.
-  Moins de suites lourdes à déporter, et le client de L159b peut relayer
-  les erreurs au fil de l'eau.
-* **L162** : rien de lourd en tmpfs, nettoyage des `/tmp` abandonnés. C'est
-  le complément, sur le poste, du `/tmp` privé de l'invité.
-* **L163** : une VM dédiée aux agents. C'est le premier hôte de (a1) si elle
-  existe (section 2.3).
+* **L161**: tests chosen according to impact, errors reported in real time.
+  Fewer heavy suites to offload, and the L159b client can relay
+  errors as they come.
+* **L162**: nothing heavy in tmpfs, cleanup of abandoned `/tmp`s. It is
+  the complement, on the workstation, of the guest's private `/tmp`.
+* **L163**: a VM dedicated to agents. It is the first host of (a1) if it
+  exists (section 2.3).
 
-## 5.2 Nexlink : ce qui revient aux auteurs de #93 (claude1) et de #94 (claude2)
+## 5.2 Nexlink: what falls to the authors of #93 (claude1) and #94 (claude2)
 
-| Lot | Qui | Contenu | Dépend de | Durée | Date |
+| Lot | Who | Content | Depends on | Duration | Date |
 |---|---|---|---|---|---|
-| **N1** — garde d'inactivité | auteur de #93 | écrire `expires_ts` et réécrire l'état au tiers de sa durée ; raisons distinctes (`owner_pause`, `lease_lost`, `shutdown`) ; `windows` ; `measure` selon les définitions communes, CPU et mémoire de l'hôte hors VM **pendant** le travail ; `guard` ; jeux dorés d'ameesh dans ses tests | L159a | 6 h | 14–15/10 |
-| **N2** — tour d'agent | auteur de #94 | fusionner le lecteur d'acquittement de 94b (clés réelles `state`, `in_turn`, `held`, `ts`), sans quoi le retrait reste à 15 s ; `until_ts` = la plus proche de la fin de fenêtre et de `max_seconds` ; `caps` égaux à l'enveloppe réelle (VM d'agent et conteneur), ou VM dimensionnée selon l'offre comme D13 ; `caps.enforced` ; une seule table offre → `caps` → VM | N1 | 8 h | 16–17/10 |
-| **N3** — contrat écrit | auteur de #94 | `compute-agent-turn` : `in_turn` et `held` (et non `agents_in_turn`) ; chemins `state/` et `ack/` ; renvoi au contrat de la garde | L159a | 0,5 h | 14/10 |
+| **N1** — idle guard | author of #93 | write `expires_ts` and rewrite the state at a third of its lifetime; distinct reasons (`owner_pause`, `lease_lost`, `shutdown`); `windows`; `measure` according to the common definitions, host CPU and memory excluding the VM **during** work; `guard`; ameesh golden sets in its tests | L159a | 6 h | 14–15/10 |
+| **N2** — agent turn | author of #94 | merge the acknowledgement reader of 94b (real keys `state`, `in_turn`, `held`, `ts`), without which the withdrawal stays at 15 s; `until_ts` = the nearer of the window end and `max_seconds`; `caps` equal to the real envelope (agent VM and container), or VM sized according to the offer like D13; `caps.enforced`; a single table offer → `caps` → VM | N1 | 8 h | 16–17/10 |
+| **N3** — written contract | author of #94 | `compute-agent-turn`: `in_turn` and `held` (and not `agents_in_turn`); `state/` and `ack/` paths; reference to the guard contract | L159a | 0.5 h | 14/10 |
 
-Aucun de ces lots ne bloque le pilote sur une VM. Ils rendent le même
-contrat vrai sur les appareils.
+None of these lots blocks the pilot on a VM. They make the same
+contract true on devices.
 
-## 5.3 Gestes du propriétaire
+## 5.3 Owner actions
 
-| Geste | Pour | Durée | Quand |
+| Action | For | Duration | When |
 |---|---|---|---|
-| Décider : VM pilote ; ordre (b1), puis (a1), puis (a2) | tout | 10 min | 11 ou 12/10 |
-| Ajouter un volume de 100 Go à la VM de tests (et porter la racine à 20 Go) | L159b | 15 min | 12/10 |
-| Ouvrir SSH vers la VM de tests depuis le poste et la VM du mesh | L159b | 10 min | 12/10 |
-| Lancer `deploy/guest/install.sh` sur la VM (avec `!`) | L159b, L159e | 15 min | 12–13/10 |
-| Trancher la fusion de la voie B (ou l'extraction de la porte) | L159f, L159i | 10 min | 14/10 |
-| Pair WireGuard de la VM et rôle Postgres (fusion de L56, PR #23) | L159g | 20 min | 15/10 |
-| Comptes admis sur une VM (DeepSeek seul d'abord ; forfaits ensuite ?) | L159g | 10 min | 15/10 |
-| Relire la PR du canon (`Host` avec `lend`, admissions) | L159g | 10 min | 16/10 |
-| VM de CI : vitesse de la CI ou prêt ; isolement du groupe `docker` (avec les mainteneurs de la CI) | L159h | 20 min | 24/10 |
+| Decide: pilot VM; order (b1), then (a1), then (a2) | everything | 10 min | 11 or 12/10 |
+| Add a 100 GB volume to the test VM (and grow the root to 20 GB) | L159b | 15 min | 12/10 |
+| Open SSH to the test VM from the workstation and the mesh VM | L159b | 10 min | 12/10 |
+| Run `deploy/guest/install.sh` on the VM (with `!`) | L159b, L159e | 15 min | 12–13/10 |
+| Decide on the merge of track B (or the extraction of the gate) | L159f, L159i | 10 min | 14/10 |
+| WireGuard peer of the VM and Postgres role (merge of L56, PR #23) | L159g | 20 min | 15/10 |
+| Accounts admitted on a VM (DeepSeek alone first; plans afterwards?) | L159g | 10 min | 15/10 |
+| Review the canon PR (`Host` with `lend`, admissions) | L159g | 10 min | 16/10 |
+| CI VM: CI speed or lending; isolation of the `docker` group (with the CI maintainers) | L159h | 20 min | 24/10 |
 
-# 6. Questions au propriétaire
+# 6. Questions for the owner
 
-1. **Ordre des modes** : (b1) cette semaine sur la VM de tests, puis (a1) ?
-   Recommandation : oui.
-2. **Volume** : 100 Go dédiés à l'invité plutôt qu'une racine agrandie ?
-   Recommandation : le volume, plus 10 Go de racine pour Docker.
-3. **VM de CI** : prêter seulement hors des heures de CI, en (b1) ou en
-   (a2), et jamais en (a1) tant que `runner` est dans `docker` ?
-   Recommandation : oui. La vitesse de la CI reste prioritaire ; les
-   paliers 1 à 3 se déclenchent sur `busy_units`.
-4. **Forfaits sur une VM** : un compte Claude ou Codex au forfait peut-il
-   servir un agent (a1) sur la VM de tests ? Recommandation : DeepSeek
-   d'abord, les forfaits après la séparation des comptes par organisation.
-5. **Nom du champ** : `policy.lend` dans la fiche `Host` ?
-6. **Premier hôte de (a1)** : la VM dédiée de L163, si elle est créée, ou la
-   VM de tests ? Recommandation : la VM dédiée.
+1. **Order of the modes**: (b1) this week on the test VM, then (a1)?
+   Recommendation: yes.
+2. **Volume**: 100 GB dedicated to the guest rather than an enlarged root?
+   Recommendation: the volume, plus 10 GB of root for Docker.
+3. **CI VM**: lend only outside CI hours, in (b1) or in
+   (a2), and never in (a1) as long as `runner` is in `docker`?
+   Recommendation: yes. CI speed remains the priority; tiers 1 to 3 are
+   triggered on `busy_units`.
+4. **Plans on a VM**: can a plan-based Claude or Codex account
+   serve an (a1) agent on the test VM? Recommendation: DeepSeek
+   first, plans after accounts are separated by organisation.
+5. **Field name**: `policy.lend` in the `Host` card?
+6. **First host of (a1)**: the dedicated VM of L163, if it is created, or the
+   test VM? Recommendation: the dedicated VM.

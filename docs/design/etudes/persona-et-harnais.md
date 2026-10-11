@@ -1,582 +1,581 @@
 ---
 type: Study
-title: "Étude — la persona à travers les harnais : identité, consignes et mémoire d'une session à l'autre"
-description: "Ce que Claude Code, Codex, DeepSeek Harness et un agent ACP offrent pour désigner une persona et lui garder sa mémoire entre sessions, au relais et en parallèle ; spécification de la fiche Persona, des sessions, de la désignation au harnais et d'une mémoire par persona dans son propre dépôt git, neutre, remplaçable et peut-être durable ; règle de visibilité vérifiée au placement."
+title: "Study — the persona across harnesses: identity, prompts and memory from one session to the next"
+description: "What Claude Code, Codex, DeepSeek Harness and an ACP agent offer to designate a persona and keep its memory across sessions, through relay and in parallel; specification of the Persona card, of sessions, of designation to the harness and of a per-persona memory in its own git repository, neutral, replaceable and possibly lasting; visibility rule checked at placement."
 status: draft
 tags: [persona, session, memoire, harnais, visibilite, double-numerique, mcp, acp]
 generated: { by: "etude-persona/claude-opus-5-5", at: "2026-10-05T21:00:00+02:00" }
 stale_after: 2027-01-05
 sources:
-  - { resource: "../decisions/0029-persona-et-session.md", title: "Décision 0029 (persona et session)" }
-  - { resource: "../decisions/0025-une-session-par-lot.md", title: "Décision 0025 (une session par lot)" }
-  - { resource: "../decisions/0027-bascule-automatique-entre-comptes.md", title: "Décision 0027 (comptes, relais)" }
-  - { resource: "../decisions/0028-ressources-des-hotes-et-repartition.md", title: "Décision 0028 (placement dynamique)" }
-  - { resource: "../decisions/0007-standards-des-harnais.md", title: "Décision 0007 (MCP, skills, AGENTS.md)" }
-  - { resource: "../decisions/0021-catalogue-des-harnais.md", title: "Décision 0021 (descripteurs de harnais)" }
-  - { resource: "comptes-multiples.md", title: "Étude des comptes multiples" }
-  - { resource: "standards-des-harnais.md", title: "Étude des standards des harnais" }
-  - { resource: "https://code.claude.com/docs/en/memory", title: "Claude Code : CLAUDE.md et mémoire automatique" }
-  - { resource: "https://code.claude.com/docs/en/cli-reference", title: "Claude Code : options, consignes système à la reprise" }
-  - { resource: "https://code.claude.com/docs/en/hooks", title: "Claude Code : hooks (SessionStart, compaction)" }
-  - { resource: "https://learn.chatgpt.com/docs/agent-configuration/agents-md", title: "Codex : AGENTS.md" }
-  - { resource: "https://learn.chatgpt.com/docs/customization/memories.md", title: "Codex : mémoires" }
-  - { resource: "https://developers.openai.com/codex/config-reference", title: "Codex : référence de configuration" }
-  - { resource: "https://developers.openai.com/codex/hooks", title: "Codex : hooks" }
-  - { resource: "https://agentclientprotocol.com/protocol/session-setup", title: "ACP : session/new, session/load" }
-  - { resource: "https://agentclientprotocol.com/protocol/extensibility", title: "ACP : _meta et extensions" }
+  - { resource: "../decisions/0029-persona-et-session.md", title: "Decision 0029 (persona and session)" }
+  - { resource: "../decisions/0025-une-session-par-lot.md", title: "Decision 0025 (one session per lot)" }
+  - { resource: "../decisions/0027-bascule-automatique-entre-comptes.md", title: "Decision 0027 (accounts, relay)" }
+  - { resource: "../decisions/0028-ressources-des-hotes-et-repartition.md", title: "Decision 0028 (dynamic placement)" }
+  - { resource: "../decisions/0007-standards-des-harnais.md", title: "Decision 0007 (MCP, skills, AGENTS.md)" }
+  - { resource: "../decisions/0021-catalogue-des-harnais.md", title: "Decision 0021 (harness descriptors)" }
+  - { resource: "comptes-multiples.md", title: "Study of multiple accounts" }
+  - { resource: "standards-des-harnais.md", title: "Study of harness standards" }
+  - { resource: "https://code.claude.com/docs/en/memory", title: "Claude Code: CLAUDE.md and auto memory" }
+  - { resource: "https://code.claude.com/docs/en/cli-reference", title: "Claude Code: options, system prompts on resume" }
+  - { resource: "https://code.claude.com/docs/en/hooks", title: "Claude Code: hooks (SessionStart, compaction)" }
+  - { resource: "https://learn.chatgpt.com/docs/agent-configuration/agents-md", title: "Codex: AGENTS.md" }
+  - { resource: "https://learn.chatgpt.com/docs/customization/memories.md", title: "Codex: memories" }
+  - { resource: "https://developers.openai.com/codex/config-reference", title: "Codex: configuration reference" }
+  - { resource: "https://developers.openai.com/codex/hooks", title: "Codex: hooks" }
+  - { resource: "https://agentclientprotocol.com/protocol/session-setup", title: "ACP: session/new, session/load" }
+  - { resource: "https://agentclientprotocol.com/protocol/extensibility", title: "ACP: _meta and extensions" }
 ---
 
 # Question
 
-La décision [0029](../decisions/0029-persona-et-session.md) sépare la
-**persona** (identité durable, sans position) de la **session** (exécution
-éphémère dans un harnais). Elle confie la mémoire au futur harnais maison et
-ne laisse à ameesh que la désignation de la persona. En attendant ce harnais —
-et peut-être à sa place — il faut savoir :
+Decision [0029](../decisions/0029-persona-et-session.md) separates the
+**persona** (durable identity, without position) from the **session**
+(ephemeral execution in a harness). It entrusts memory to the future in-house
+harness and leaves ameesh only the designation of the persona. Until that
+harness exists — and perhaps instead of it — we need to know:
 
-1. comment une persona garde **sa** mémoire et son identité d'une session à
-   l'autre avec les harnais actuels (Claude Code, Codex, DeepSeek Harness
-   `dsh`, et tout agent ACP par le pont du lot L16) ;
-2. ce qui survit au **relais** (changement de compte ou de harnais,
-   [0027](../decisions/0027-bascule-automatique-entre-comptes.md)) et au
-   **déplacement** d'hôte ([0028](../decisions/0028-ressources-des-hotes-et-repartition.md)) ;
-3. ce qui se passe quand **plusieurs sessions de la même persona** tournent
-   en parallèle (une par lot, [0025](../decisions/0025-une-session-par-lot.md)) ;
-4. critère ajouté par le propriétaire : une solution intérimaire **neutre
-   vis-à-vis du harnais** peut-elle être assez souple pour **durer**, au point
-   de se passer d'un harnais maison ?
+1. how a persona keeps **its** memory and its identity from one session to
+   the next with the current harnesses (Claude Code, Codex, DeepSeek Harness
+   `dsh`, and any ACP agent through the bridge of lot L16);
+2. what survives the **relay** (change of account or harness,
+   [0027](../decisions/0027-bascule-automatique-entre-comptes.md)) and the
+   host **move** ([0028](../decisions/0028-ressources-des-hotes-et-repartition.md));
+3. what happens when **several sessions of the same persona** run in
+   parallel (one per lot, [0025](../decisions/0025-une-session-par-lot.md));
+4. criterion added by the owner: can an interim solution that is **neutral
+   with respect to the harness** be flexible enough to **last**, to the point
+   of doing without an in-house harness?
 
-# Méthode
+# Method
 
-Comme pour l'[étude des comptes multiples](comptes-multiples.md), sans aucun
-appel payant, sans connexion à un compte, sans lire ni afficher de secret :
+As for the [study of multiple accounts](comptes-multiples.md), without any
+paid call, without logging into an account, without reading or displaying any
+secret:
 
-* `--help` des harnais, `codex features list` ;
-* chaînes des binaires (Claude Code, Codex) pour les **noms** de réglages et
-  de variables ;
-* documentation installée de DeepSeek Harness (README des paquets
-  `@deepseek-ai/dsh-*`) et documentation en ligne (voir les sources) ;
-* inventaire de la **structure** des dossiers de configuration d'un poste
-  (`~/.claude`, `~/.codex`, `~/.dsh`) : noms de fichiers et de dossiers
-  seulement, jamais le contenu des identifiants, des conversations ni des
-  mémoires ;
-* lecture du code d'ameesh (`canon.py`, `adapters.py`, `runner.py`) et de la
-  branche du lot L16 (descripteurs, pont ACP), en relecture.
+* `--help` of the harnesses, `codex features list`;
+* strings of the binaries (Claude Code, Codex) for the **names** of settings
+  and variables;
+* installed documentation of DeepSeek Harness (READMEs of the
+  `@deepseek-ai/dsh-*` packages) and online documentation (see the sources);
+* inventory of the **structure** of a workstation's configuration directories
+  (`~/.claude`, `~/.codex`, `~/.dsh`): file and directory names only, never
+  the content of credentials, conversations or memories;
+* reading of ameesh's code (`canon.py`, `adapters.py`, `runner.py`) and of the
+  branch of lot L16 (descriptors, ACP bridge), under review.
 
-Versions observées : Claude Code 2.1.286, Codex CLI 0.159.3, DeepSeek Harness
+Versions observed: Claude Code 2.1.286, Codex CLI 0.159.3, DeepSeek Harness
 0.1.5-rc.2.
 
-**Niveaux de certitude** utilisés dans les tableaux :
+**Levels of certainty** used in the tables:
 
-* **vérifié** : constaté sur le poste (aide, chaîne du binaire, structure de
-  dossier, README installé) ;
-* **documenté** : écrit dans la documentation officielle, non éprouvé ici ;
-* **supposé** : déduit, à vérifier dans un lot (banc de conformité L17).
+* **verified**: observed on the workstation (help, binary string, directory
+  structure, installed README);
+* **documented**: written in the official documentation, not tested here;
+* **assumed**: inferred, to be checked in a lot (conformance test bench L17).
 
-Légende des colonnes : **compte** = l'emplacement change quand on change de
-compte (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) ; **dossier** = il dépend du
-dossier de travail ; **L / É / I / R** = ameesh peut le **l**ire, l'**é**crire,
-l'**i**njecter au lancement, le **r**écupérer après la session.
+Column legend: **account** = the location changes when the account changes
+(`CLAUDE_CONFIG_DIR`, `CODEX_HOME`); **directory** = it depends on the
+working directory; **R / W / I / G** = ameesh can **r**ead it, **w**rite it,
+**i**nject it at launch, **g**et it back after the session.
 
 # Claude Code
 
-## Mécanismes
+## Mechanisms
 
-| Mécanisme | Emplacement | Compte ? | Dossier ? | L / É / I / R | Certitude |
+| Mechanism | Location | Account? | Directory? | R / W / I / G | Certainty |
 |---|---|---|---|---|---|
-| CLAUDE.md utilisateur, `rules/` utilisateur | `<config>/CLAUDE.md`, `<config>/rules/` (`<config>` = `~/.claude` ou `CLAUDE_CONFIG_DIR`) | **oui** | non | oui / oui / oui / — | documenté ; lien au dossier de configuration supposé (tout y est rangé, voir l'étude des comptes) |
-| CLAUDE.md de projet, `.claude/rules/` | `./CLAUDE.md`, `./.claude/CLAUDE.md`, ancêtres ; sous-dossiers à la demande | non | **oui** | oui / oui (mais versionné dans le dépôt) / — / — | documenté |
-| CLAUDE.local.md | racine du projet, non versionné | non | **oui** | oui / oui / — / — | documenté ; **sa présence empêche la lecture d'AGENTS.md** par défaut |
-| AGENTS.md | dossier de travail et ancêtres, si aucun CLAUDE.md | non | oui | oui / oui / — / — | documenté (≥ 2.1.277) |
-| Imports `@chemin` | dans un CLAUDE.md, quatre niveaux | — | — | — | documenté ; un import hors du dossier demande une approbation interactive la première fois (**inutilisable sans humain**) |
-| Dossier additionnel | `--add-dir D` + `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` charge `D/CLAUDE.md`, `D/.claude/rules/` | non | non | oui / oui / **oui** / — | documenté ; variable vérifiée dans le binaire |
-| Consigne système ajoutée | `--append-system-prompt[-file]` | non | non | — / — / **oui** / — | vérifié (`--help`) ; **figée au premier tour** et réutilisée à la reprise jusqu'à la compaction (`--system-prompt-snapshot`, documenté) |
-| Consigne système remplacée | `--system-prompt[-file]` | non | non | — / — / oui / — | documenté ; perd les consignes d'outils et de sécurité par défaut : déconseillé |
-| Mémoire automatique | `<config>/projects/<projet>/memory/MEMORY.md` + un fichier par souvenir | **oui** | **oui** (clé = dépôt git, partagée entre worktrees) | oui / oui / — / oui | documenté ; structure vérifiée (`memory/MEMORY.md` présent dans plusieurs projets) |
-| Emplacement de la mémoire automatique | réglage `autoMemoryDirectory`, accepté **depuis `--settings`** | non | non | — / — / **oui** / — | documenté ; nom vérifié dans le binaire |
-| Désactivation | `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, `autoMemoryEnabled: false`, `--bare` | — | — | — / — / oui / — | documenté ; variable vérifiée |
-| Nom du dossier de projet | `CLAUDE_CODE_PROJECT_DIR_NAME` (avec `CLAUDE_CONFIG_DIR`) | oui | non | — / — / oui / — | documenté (≥ 2.1.234) ; vérifié dans le binaire |
-| Mémoire d'un sous-agent | champ `memory: user/project/local` → `agent-memory/<nom>/` | user : oui ; project/local : oui (dossier) | selon portée | oui / oui / — / oui | documenté ; chaînes vérifiées |
-| Hook `SessionStart` | réglages (`<config>/settings.json`, projet, ou `--settings`) | selon le fichier | selon le fichier | — / — / **oui** (`additionalContext`, 10 000 caractères, au-delà : fichier + aperçu) / — | documenté ; déclencheurs `startup`, `resume`, `clear`, `compact`, `fork` |
-| Hooks `PreCompact` / `PostCompact`, `Stop`, `SessionEnd` | idem | — | — | — / — / oui (`Stop` peut relancer avec contexte) / — | documenté ; noms vérifiés |
-| Skills | `<config>/skills/`, `.claude/skills/`, `--plugin-dir` | selon | selon | oui / oui / oui / — | documenté ; `--plugin-dir` vérifié |
-| Serveurs MCP | `--mcp-config` (+ `--strict-mcp-config`) | non | non | — / — / **oui** / — | vérifié (`--help`) ; les `instructions` d'un serveur MCP sont montrées au modèle (constaté dans une session de ce poste) |
-| Transcription de session | `<config>/projects/<projet>/<session>.jsonl` | oui | oui | oui / — / — / oui | vérifié (étude des comptes) |
+| User CLAUDE.md, user `rules/` | `<config>/CLAUDE.md`, `<config>/rules/` (`<config>` = `~/.claude` or `CLAUDE_CONFIG_DIR`) | **yes** | no | yes / yes / yes / — | documented; tie to the configuration directory assumed (everything is stored there, see the accounts study) |
+| Project CLAUDE.md, `.claude/rules/` | `./CLAUDE.md`, `./.claude/CLAUDE.md`, ancestors; subdirectories on demand | no | **yes** | yes / yes (but versioned in the repository) / — / — | documented |
+| CLAUDE.local.md | project root, not versioned | no | **yes** | yes / yes / — / — | documented; **its presence prevents AGENTS.md from being read** by default |
+| AGENTS.md | working directory and ancestors, if there is no CLAUDE.md | no | yes | yes / yes / — / — | documented (≥ 2.1.277) |
+| `@path` imports | in a CLAUDE.md, four levels | — | — | — | documented; an import outside the directory requires interactive approval the first time (**unusable without a human**) |
+| Additional directory | `--add-dir D` + `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` loads `D/CLAUDE.md`, `D/.claude/rules/` | no | no | yes / yes / **yes** / — | documented; variable verified in the binary |
+| Appended system prompt | `--append-system-prompt[-file]` | no | no | — / — / **yes** / — | verified (`--help`); **frozen at the first turn** and reused on resume until compaction (`--system-prompt-snapshot`, documented) |
+| Replaced system prompt | `--system-prompt[-file]` | no | no | — / — / yes / — | documented; loses the default tool and safety prompts: not recommended |
+| Auto memory | `<config>/projects/<project>/memory/MEMORY.md` + one file per memory | **yes** | **yes** (key = git repository, shared between worktrees) | yes / yes / — / yes | documented; structure verified (`memory/MEMORY.md` present in several projects) |
+| Auto memory location | `autoMemoryDirectory` setting, accepted **from `--settings`** | no | no | — / — / **yes** / — | documented; name verified in the binary |
+| Disabling | `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, `autoMemoryEnabled: false`, `--bare` | — | — | — / — / yes / — | documented; variable verified |
+| Project directory name | `CLAUDE_CODE_PROJECT_DIR_NAME` (with `CLAUDE_CONFIG_DIR`) | yes | no | — / — / yes / — | documented (≥ 2.1.234); verified in the binary |
+| Subagent memory | `memory: user/project/local` field → `agent-memory/<name>/` | user: yes; project/local: yes (directory) | depending on scope | yes / yes / — / yes | documented; strings verified |
+| `SessionStart` hook | settings (`<config>/settings.json`, project, or `--settings`) | depending on the file | depending on the file | — / — / **yes** (`additionalContext`, 10,000 characters, beyond that: file + preview) / — | documented; triggers `startup`, `resume`, `clear`, `compact`, `fork` |
+| `PreCompact` / `PostCompact`, `Stop`, `SessionEnd` hooks | same | — | — | — / — / yes (`Stop` can restart with context) / — | documented; names verified |
+| Skills | `<config>/skills/`, `.claude/skills/`, `--plugin-dir` | depends | depends | yes / yes / yes / — | documented; `--plugin-dir` verified |
+| MCP servers | `--mcp-config` (+ `--strict-mcp-config`) | no | no | — / — / **yes** / — | verified (`--help`); the `instructions` of an MCP server are shown to the model (observed in a session on this workstation) |
+| Session transcript | `<config>/projects/<project>/<session>.jsonl` | yes | yes | yes / — / — / yes | verified (accounts study) |
 
-## Conclusions pour Claude Code
+## Conclusions for Claude Code
 
-* **La mémoire native est rangée par compte et par dépôt, pas par persona.**
-  Deux personas qui travaillent dans le même dépôt partagent une mémoire ; une
-  persona qui change de dépôt en retrouve une autre ; un changement de compte
-  (autre `CLAUDE_CONFIG_DIR`) la perd, sauf si `projects/` est partagé par
-  lien, comme le fait déjà L30 pour reprendre les sessions — ce lien partage
-  alors aussi la mémoire, pour tout le monde.
-* **ameesh peut la rediriger** sans toucher aux fichiers du compte :
-  `--settings '{"autoMemoryDirectory": "<dossier de la persona>"}'`. Il peut
-  aussi la couper (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`).
-* **Désignation sans écrire dans le dépôt** : `--append-system-prompt-file`
-  (identité, rôle, règles), `--add-dir` sur un dossier de persona contenant un
-  `CLAUDE.md` généré (avec la variable ci-dessus), hook `SessionStart` passé
-  par `--settings` pour injecter l'index de mémoire, y compris **après une
-  compaction** (`matcher: compact`).
-* La consigne système est **figée à la création de la session** : c'est
-  compatible avec une session par lot ; une persona modifiée au canon ne
-  touche que les sessions suivantes.
-* `--bare` coupe d'un coup CLAUDE.md, hooks, skills et mémoire : utile pour
-  un harnais entièrement piloté, mais il coupe aussi les hooks agent-mail.
+* **Native memory is stored per account and per repository, not per persona.**
+  Two personas working in the same repository share a memory; a persona that
+  changes repository finds another one; a change of account (another
+  `CLAUDE_CONFIG_DIR`) loses it, unless `projects/` is shared through a link,
+  as L30 already does to resume sessions — that link then also shares the
+  memory, for everyone.
+* **ameesh can redirect it** without touching the account's files:
+  `--settings '{"autoMemoryDirectory": "<persona directory>"}'`. It can also
+  turn it off (`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`).
+* **Designation without writing to the repository**:
+  `--append-system-prompt-file` (identity, role, rules), `--add-dir` on a
+  persona directory containing a generated `CLAUDE.md` (with the variable
+  above), `SessionStart` hook passed through `--settings` to inject the memory
+  index, including **after a compaction** (`matcher: compact`).
+* The system prompt is **frozen when the session is created**: this is
+  compatible with one session per lot; a persona modified in the canon only
+  affects subsequent sessions.
+* `--bare` turns off CLAUDE.md, hooks, skills and memory all at once: useful
+  for a fully driven harness, but it also turns off the agent-mail hooks.
 
 # Codex
 
-| Mécanisme | Emplacement | Compte ? | Dossier ? | L / É / I / R | Certitude |
+| Mechanism | Location | Account? | Directory? | R / W / I / G | Certainty |
 |---|---|---|---|---|---|
-| AGENTS.md global | `$CODEX_HOME/AGENTS.override.md`, puis `$CODEX_HOME/AGENTS.md` | **oui** | non | oui / oui / oui / — | documenté ; `AGENTS.override.md` vérifié dans le binaire |
-| AGENTS.md de projet | de la racine du dépôt au dossier courant (`AGENTS.override.md`, `AGENTS.md`, noms de repli) | non | **oui** | oui / oui (versionné) / — / — | documenté ; limite `project_doc_max_bytes` (32 Kio) |
-| Instructions de développeur | clé `developer_instructions` (injectée avant AGENTS.md), passable par `-c` | non | non | — / — / **oui** / — | documenté ; clé vérifiée dans le binaire ; `-c` vérifié (`--help`) ; **effet à la reprise (`exec resume`) supposé** |
-| Instructions de base remplacées | `model_instructions_file` | non | non | — / — / oui / — | documenté ; déconseillé (perd les consignes du harnais) |
-| Profils | `-p <nom>` → `$CODEX_HOME/<nom>.config.toml` | **oui** | non | oui / oui / oui / — | vérifié (`codex exec --help`) |
-| Mémoires | `$CODEX_HOME/memories/` (`memory_summary.md`, `MEMORY.md`, `raw_memories.md`, `rollout_summaries/`) ; réglages `[memories]` : `generate_memories`, `use_memories`, `disable_on_external_context`, `min_rate_limit_remaining_percent` | **oui** | non (globale au `CODEX_HOME`) | oui / risqué / — / oui | fonction `memories` **stable mais désactivée** sur ce poste (vérifié) ; noms de fichiers vérifiés dans le binaire ; une base `memories_1.sqlite` existe (vérifié) ; génération **en arrière-plan, après inactivité**, par le harnais (documenté) ; indisponible dans certaines régions au lancement (documenté) |
-| Hooks | `$CODEX_HOME/hooks.json`, `config.toml` `[hooks]`, `<dépôt>/.codex/hooks.json` | oui (global) / oui (projet) | — | — / — / **oui** (`SessionStart` → `additionalContext`, message de développeur) / — | documenté ; `SessionStart`, `PreCompact`, `PostCompact` vérifiés dans le binaire ; ameesh lance déjà avec `--dangerously-bypass-hook-trust` |
-| `notify` | commande appelée en fin de tour | oui | — | — / — / — / oui | nom vérifié ; détail supposé |
-| Serveurs MCP | `config.toml` `[mcp_servers]`, passables par `-c` | oui (fichier) / non (`-c`) | — | — / — / oui / — | documenté ; `codex mcp` vérifié |
-| Skills | `$CODEX_HOME/skills/` | oui | — | oui / oui / oui / — | structure vérifiée |
-| Sessions | `$CODEX_HOME/sessions/…`, base d'état SQLite, rattachées au compte créateur | oui | — | oui / — / — / oui | vérifié (étude des comptes) |
+| Global AGENTS.md | `$CODEX_HOME/AGENTS.override.md`, then `$CODEX_HOME/AGENTS.md` | **yes** | no | yes / yes / yes / — | documented; `AGENTS.override.md` verified in the binary |
+| Project AGENTS.md | from the repository root to the current directory (`AGENTS.override.md`, `AGENTS.md`, fallback names) | no | **yes** | yes / yes (versioned) / — / — | documented; `project_doc_max_bytes` limit (32 KiB) |
+| Developer instructions | `developer_instructions` key (injected before AGENTS.md), can be passed with `-c` | no | no | — / — / **yes** / — | documented; key verified in the binary; `-c` verified (`--help`); **effect on resume (`exec resume`) assumed** |
+| Replaced base instructions | `model_instructions_file` | no | no | — / — / yes / — | documented; not recommended (loses the harness's prompts) |
+| Profiles | `-p <name>` → `$CODEX_HOME/<name>.config.toml` | **yes** | no | yes / yes / yes / — | verified (`codex exec --help`) |
+| Memories | `$CODEX_HOME/memories/` (`memory_summary.md`, `MEMORY.md`, `raw_memories.md`, `rollout_summaries/`); `[memories]` settings: `generate_memories`, `use_memories`, `disable_on_external_context`, `min_rate_limit_remaining_percent` | **yes** | no (global to the `CODEX_HOME`) | yes / risky / — / yes | `memories` feature **stable but disabled** on this workstation (verified); file names verified in the binary; a `memories_1.sqlite` database exists (verified); generation **in the background, after inactivity**, by the harness (documented); unavailable in some regions at launch (documented) |
+| Hooks | `$CODEX_HOME/hooks.json`, `config.toml` `[hooks]`, `<repository>/.codex/hooks.json` | yes (global) / yes (project) | — | — / — / **yes** (`SessionStart` → `additionalContext`, developer message) / — | documented; `SessionStart`, `PreCompact`, `PostCompact` verified in the binary; ameesh already launches with `--dangerously-bypass-hook-trust` |
+| `notify` | command called at the end of a turn | yes | — | — / — / — / yes | name verified; details assumed |
+| MCP servers | `config.toml` `[mcp_servers]`, can be passed with `-c` | yes (file) / no (`-c`) | — | — / — / yes / — | documented; `codex mcp` verified |
+| Skills | `$CODEX_HOME/skills/` | yes | — | yes / yes / yes / — | structure verified |
+| Sessions | `$CODEX_HOME/sessions/…`, SQLite state database, tied to the creating account | yes | — | yes / — / — / yes | verified (accounts study) |
 
-## Conclusions pour Codex
+## Conclusions for Codex
 
-* **La mémoire native est globale au `CODEX_HOME`, donc au compte** — et L30
-  fait du `CODEX_HOME` le compte. Une persona qui passe au compte secondaire
-  perd sa mémoire native ; deux personas sur le même compte la partagent. Elle
-  est produite en arrière-plan par le harnais, sur ses propres critères : ni
-  sa date ni son contenu ne sont maîtrisés. **À laisser désactivée** pour les
-  sessions lancées par ameesh.
-* **Désignation** : `-c developer_instructions="…"` à chaque tour (texte
-  généré depuis la fiche, borné), hook `SessionStart` pour l'index de mémoire,
-  `-c mcp_servers.…` pour un serveur MCP. Ne rien écrire dans `CODEX_HOME`
-  (dossier d'un compte, partagé entre personas).
-* À vérifier : que `developer_instructions` passé par `-c` s'applique bien
-  après `exec resume`, et la taille admise sur la ligne de commande (sinon un
-  fichier de profil propre à la session).
+* **Native memory is global to the `CODEX_HOME`, hence to the account** — and
+  L30 makes the `CODEX_HOME` the account. A persona that moves to the
+  secondary account loses its native memory; two personas on the same account
+  share it. It is produced in the background by the harness, on its own
+  criteria: neither its timing nor its content is under control. **Leave it
+  disabled** for sessions launched by ameesh.
+* **Designation**: `-c developer_instructions="…"` at each turn (text
+  generated from the card, bounded), `SessionStart` hook for the memory index,
+  `-c mcp_servers.…` for an MCP server. Write nothing into `CODEX_HOME` (an
+  account's directory, shared between personas).
+* To check: that `developer_instructions` passed with `-c` does apply after
+  `exec resume`, and the size allowed on the command line (otherwise a
+  session-specific profile file).
 
 # DeepSeek Harness (`dsh`)
 
-| Mécanisme | Emplacement | Compte ? | Dossier ? | L / É / I / R | Certitude |
+| Mechanism | Location | Account? | Directory? | R / W / I / G | Certainty |
 |---|---|---|---|---|---|
-| Instructions d'espace de travail | `$DSH_HOME/AGENTS.md` puis la chaîne du projet (`AGENTS.md`, `CLAUDE.md`, et `*.local.md`), budget `maxBytes` (65 536 par défaut) | non (le compte est une clé) | oui (projet) | oui / oui / oui / — | vérifié (README `dsh-agent-instructions`) |
-| Persona du déploiement | `dsh-system-prompt` : `personaPrefix`, `personaSuffix` (gabarits) | non | non | — / — / **oui** par `--patch` | vérifié (README) ; ameesh écrit déjà un `--patch` pour le modèle |
-| Persona d'un agent | rangée `dsh-persona` (`prefix`, `suffix`, `complete`) dans un préréglage | non | non | — / — / oui | vérifié (README) ; à monter dans un préréglage, pas globalement |
-| Profils, patches | `$DSH_HOME/profiles/<nom>/` (`cordis.patch.yml`), `$DSH_HOME/cordis.patch.yml`, `--patch` | non | non | oui / oui / oui / — | vérifié (README, structure) |
-| Hooks | `$DSH_HOME/hooks.json` relu par les ponts `dsh-hooks-claude-code` / `dsh-hooks-codex` ; `SessionStart` ajoute du contexte ; commandes seulement | non | — | — / — / oui / — | vérifié (README, structure) |
-| Mémoire native | **aucun** paquet de mémoire ; la documentation renvoie à des serveurs MCP de mémoire tiers | — | — | — | vérifié (liste des paquets) |
-| Serveurs MCP | `dsh-mcp-client` : **outils seulement** (ni ressources ni prompts MCP) | non | — | — / — / oui / — | vérifié (README) |
-| Sessions | `$DSH_HOME/sessions`, indépendantes de la clé | non | — | oui / — / — / oui | vérifié (étude des comptes) |
+| Workspace instructions | `$DSH_HOME/AGENTS.md` then the project chain (`AGENTS.md`, `CLAUDE.md`, and `*.local.md`), `maxBytes` budget (65,536 by default) | no (the account is a key) | yes (project) | yes / yes / yes / — | verified (`dsh-agent-instructions` README) |
+| Deployment persona | `dsh-system-prompt`: `personaPrefix`, `personaSuffix` (templates) | no | no | — / — / **yes** through `--patch` | verified (README); ameesh already writes a `--patch` for the model |
+| Agent persona | `dsh-persona` row (`prefix`, `suffix`, `complete`) in a preset | no | no | — / — / yes | verified (README); to be mounted in a preset, not globally |
+| Profiles, patches | `$DSH_HOME/profiles/<name>/` (`cordis.patch.yml`), `$DSH_HOME/cordis.patch.yml`, `--patch` | no | no | yes / yes / yes / — | verified (README, structure) |
+| Hooks | `$DSH_HOME/hooks.json` read by the `dsh-hooks-claude-code` / `dsh-hooks-codex` bridges; `SessionStart` adds context; commands only | no | — | — / — / yes / — | verified (README, structure) |
+| Native memory | **no** memory package; the documentation points to third-party memory MCP servers | — | — | — | verified (package list) |
+| MCP servers | `dsh-mcp-client`: **tools only** (neither MCP resources nor prompts) | no | — | — / — / yes / — | verified (README) |
+| Sessions | `$DSH_HOME/sessions`, independent of the key | no | — | yes / — / — / yes | verified (accounts study) |
 
-## Conclusions pour dsh
+## Conclusions for dsh
 
-* Pas de mémoire native : rien à perdre au relais, tout à fournir.
-* C'est le harnais le plus **ouvert** : la consigne système se compose par
-  patch (préfixe et suffixe de persona, contexte d'exécution, ordre des
-  outils), la compaction est un greffon configurable. ameesh peut y désigner
-  la persona proprement (`personaSuffix` par patch de session) — **supposé**,
-  à éprouver.
-* Un serveur MCP de mémoire n'y est vu qu'à travers ses **outils** : ne pas
-  compter sur les ressources ni les prompts MCP.
+* No native memory: nothing to lose on relay, everything to provide.
+* It is the most **open** harness: the system prompt is composed by patch
+  (persona prefix and suffix, execution context, tool order), compaction is a
+  configurable plugin. ameesh can designate the persona there cleanly
+  (`personaSuffix` through a session patch) — **assumed**, to be tested.
+* A memory MCP server is seen there only through its **tools**: do not count
+  on MCP resources or prompts.
 
-# ACP (pont ameesh, lot L16)
+# ACP (ameesh bridge, lot L16)
 
-| Élément | Ce que le protocole transporte | Ce que le pont ameesh peut fournir | Certitude |
+| Element | What the protocol carries | What the ameesh bridge can provide | Certainty |
 |---|---|---|---|
-| `session/new` | `cwd`, `mcpServers` | dossier de la session ; **serveurs MCP** (ameesh-fil, mémoire) — le pont envoie aujourd'hui `mcpServers: []` | documenté ; code L16 lu |
-| `session/load` / `session/resume` | `sessionId`, `cwd`, `mcpServers`, `additionalDirectories` (si annoncé) ; `load` **rejoue** l'historique | mêmes serveurs MCP **redéclarés** à chaque reprise | documenté |
-| Consigne système, persona | **aucun champ standard** | seulement le **premier message** (`session/prompt`) et les fichiers d'instructions du `cwd` (AGENTS.md, si l'agent les lit) | documenté |
-| `_meta` | extension libre (`traceparent` etc. réservés) | `_meta` portant l'identité de persona et de session — **informatif** : un agent peut l'ignorer (dsh déclare n'en lire aucun) | documenté ; README dsh vérifié |
-| `fs/*` côté client | lecture/écriture de fichiers dans le `cwd` | bornées au dossier de la session par le pont | code L16 lu |
+| `session/new` | `cwd`, `mcpServers` | session directory; **MCP servers** (ameesh-fil, memory) — the bridge currently sends `mcpServers: []` | documented; L16 code read |
+| `session/load` / `session/resume` | `sessionId`, `cwd`, `mcpServers`, `additionalDirectories` (if advertised); `load` **replays** the history | same MCP servers **redeclared** at each resume | documented |
+| System prompt, persona | **no standard field** | only the **first message** (`session/prompt`) and the instruction files of the `cwd` (AGENTS.md, if the agent reads them) | documented |
+| `_meta` | free extension (`traceparent` etc. reserved) | `_meta` carrying the persona and session identity — **informative**: an agent may ignore it (dsh states it reads none) | documented; dsh README verified |
+| Client-side `fs/*` | reading/writing files in the `cwd` | bounded to the session directory by the bridge | L16 code read |
 
-## Conclusions pour ACP
+## Conclusions for ACP
 
-Le seul canal **portable** pour la persona est le contenu : le **brief** du
-premier message (identité, consignes, index de mémoire) et les **serveurs
-MCP** déclarés à `session/new` et à chaque reprise. Tout le reste (consigne
-système, hooks, compaction) appartient à l'agent. La persona d'un agent ACP
-est donc « au mieux » : énoncée, pas imposée.
+The only **portable** channel for the persona is content: the **brief** of the
+first message (identity, prompts, memory index) and the **MCP servers**
+declared at `session/new` and at each resume. Everything else (system prompt,
+hooks, compaction) belongs to the agent. The persona of an ACP agent is
+therefore "best effort": stated, not enforced.
 
-# MCP, voie commune
+# MCP, the common path
 
-Les quatre harnais parlent MCP ; un serveur **« mémoire de persona »** fourni
-par ameesh est donc atteignable partout :
+All four harnesses speak MCP; a **"persona memory"** server provided by
+ameesh is therefore reachable everywhere:
 
-| Harnais | Déclaration par session sans toucher au compte | Instructions du serveur vues par le modèle | Outils | Certitude |
+| Harness | Per-session declaration without touching the account | Server instructions seen by the model | Tools | Certainty |
 |---|---|---|---|---|
-| Claude Code | `--mcp-config` | oui | oui | vérifié |
-| Codex | `-c mcp_servers.<nom>…` | supposé | oui | documenté / supposé |
-| dsh | `--patch` (`dsh-mcp-client`) ou ACP `mcpServers` | non (outils seulement) | oui | vérifié (README) |
-| ACP | `mcpServers` de `session/new`/`resume`/`load` | selon l'agent | oui | documenté |
+| Claude Code | `--mcp-config` | yes | yes | verified |
+| Codex | `-c mcp_servers.<name>…` | assumed | yes | documented / assumed |
+| dsh | `--patch` (`dsh-mcp-client`) or ACP `mcpServers` | no (tools only) | yes | verified (README) |
+| ACP | `mcpServers` of `session/new`/`resume`/`load` | depends on the agent | yes | documented |
 
-Limites : MCP **n'injecte rien au démarrage** — le modèle doit appeler un
-outil pour lire ; la lecture initiale passe donc encore par la consigne ou un
-hook. Chaque outil coûte des jetons à chaque requête. Et la révision
-MCP 2026-07-28, sans état, oblige à servir deux versions un temps
-([étude des standards](standards-des-harnais.md)).
+Limits: MCP **injects nothing at startup** — the model must call a tool to
+read; the initial read therefore still goes through the prompt or a hook.
+Each tool costs tokens on every request. And the stateless MCP 2026-07-28
+revision forces serving two versions for a while
+([study of standards](standards-des-harnais.md)).
 
-# Synthèse par harnais
+# Summary by harness
 
 | | Claude Code | Codex | dsh | ACP |
 |---|---|---|---|---|
-| Mémoire native | par compte × dépôt, redirigeable | par compte, arrière-plan, non maîtrisée | aucune | celle de l'agent, opaque |
-| Perdue au changement de compte | oui (sauf `projects/` partagé) | oui | — | selon l'agent |
-| Perdue au changement de harnais | oui | oui | — | oui |
-| Consigne système de persona | ajout par option, figée au 1er tour | `developer_instructions` par `-c` | patch (préfixe/suffixe) | aucune : premier message |
-| Injection au démarrage | hook `SessionStart` (aussi après compaction) | hook `SessionStart` | hook `SessionStart` (pont) | premier message |
-| MCP par session | oui | oui | oui (outils) | oui |
-| Sessions parallèles | oui (une transcription par session) | oui (verrous d'écriture) | oui | selon l'agent |
+| Native memory | per account × repository, redirectable | per account, background, not under control | none | the agent's, opaque |
+| Lost on account change | yes (unless `projects/` shared) | yes | — | depends on the agent |
+| Lost on harness change | yes | yes | — | yes |
+| Persona system prompt | appended by option, frozen at the 1st turn | `developer_instructions` through `-c` | patch (prefix/suffix) | none: first message |
+| Injection at startup | `SessionStart` hook (also after compaction) | `SessionStart` hook | `SessionStart` hook (bridge) | first message |
+| MCP per session | yes | yes | yes (tools) | yes |
+| Parallel sessions | yes (one transcript per session) | yes (write locks) | yes | depends on the agent |
 
-**Constat principal** : aucune mémoire native n'est rangée **par persona** ;
-toutes sont attachées au compte, au dépôt ou à l'agent, et aucune ne passe
-d'un harnais à l'autre. Une persona qui doit survivre au relais ne peut donc
-pas confier sa mémoire au harnais du moment.
+**Main finding**: no native memory is stored **per persona**; all are tied to
+the account, the repository or the agent, and none passes from one harness to
+another. A persona that must survive the relay therefore cannot entrust its
+memory to the harness of the moment.
 
-# Spécification proposée
+# Proposed specification
 
-## 1. Fiche `Persona` au canon (remplace `Agent`)
+## 1. `Persona` card in the canon (replaces `Agent`)
 
 ```yaml
 type: Persona
-title: redacteur                 # nom (grammaire du registre), identité stable
-responsible: human:alice         # REQUIS (R14)
+title: redacteur                 # name (registry grammar), stable identity
+responsible: human:alice         # REQUIRED (R14)
 team: acme-web
-description: "Rédige et tient la documentation du produit."
-capabilities: [read, report-drift, propose]   # `approve` interdit (R8)
+description: "Writes and maintains the product documentation."
+capabilities: [read, report-drift, propose]   # `approve` forbidden (R8)
 tools: [git, mcp:ameesh-fil]
 reviewers: [relecteur]
 budget_usd_per_day: 20
 session_policy: par-lot          # par-lot | taille | jamais (0025)
-harnesses:                       # préférences ordonnées, pas une position
+harnesses:                       # ordered preferences, not a position
   - { harness: claude, model: opus, effort: high }
   - { harness: codex, model: "gpt-…", effort: high }
   - { harness: deepseek }
 credential_modes: [subscription, api-key]
 memory:
   mode: neutral                  # neutral | native | none (§4)
-  repository: "git@forge.example:equipe/persona-redacteur.git"   # SEUL renseignement : l'emplacement
-  path: ""                       # sous-dossier si le dépôt est partagé par un groupe de personas
-instructions: []                 # autres fiches du canon à joindre (facultatif)
+  repository: "git@forge.example:equipe/persona-redacteur.git"   # ONLY piece of information: the location
+  path: ""                       # subdirectory if the repository is shared by a group of personas
+instructions: []                 # other canon cards to attach (optional)
 ---
-Corps Markdown : la voix et les règles propres de la persona.
+Markdown body: the persona's own voice and rules.
 ```
 
-* Le **corps** de la fiche devient la source des consignes de la persona
-  (ameesh ne lisait jusqu'ici que le frontmatter) ; il est revu comme le reste
-  du canon.
-* Aucune position : ni hôte, ni dossier, ni compte, ni identifiant de
-  session. Les hôtes admis relèvent de l'**admission** (ex-`Placement`, sans
-  `cwd`), déjà prévue au lot L31.
-* `harness`/`model`/`provider` au singulier deviennent la liste ordonnée
-  `harnesses` : c'est elle que le relais parcourt.
-* `memory.repository` ne donne que l'**emplacement** du dépôt de la persona
-  (§4) ; ni droits, ni identifiants, ni contenu au canon. Ce même dépôt sert
-  à la **règle de visibilité** (§1 bis).
-* Pas de champ propre au double numérique : un double est une persona dont le
-  dépôt est privé à son humain (§5).
+* The **body** of the card becomes the source of the persona's prompts
+  (ameesh so far only read the frontmatter); it is reviewed like the rest of
+  the canon.
+* No position: no host, no directory, no account, no session identifier.
+  Allowed hosts fall under **admission** (formerly `Placement`, without
+  `cwd`), already planned in lot L31.
+* The singular `harness`/`model`/`provider` become the ordered list
+  `harnesses`: it is the list the relay walks through.
+* `memory.repository` only gives the **location** of the persona's repository
+  (§4); no permissions, no credentials, no content in the canon. That same
+  repository serves the **visibility rule** (§1 bis).
+* No field specific to the digital twin: a twin is a persona whose
+  repository is private to its human (§5).
 
-**Migration.** Un temps, le chargeur lit les deux formes :
+**Migration.** For a while, the loader reads both forms:
 
-* `type: Agent` est lu comme `Persona` (`kind: agent`), avec un constat
-  `persona-legacy-agent` (avertissement) ; `harness`/`model`/`provider`
-  donnent une liste `harnesses` d'un élément ;
-* `type: Placement` est lu comme admission ; un `cwd` présent est **ignoré**
-  avec un constat `admission-cwd-ignored`, puis refusé à la fin de la
-  période ;
-* le registre (`agent_registry`, clé `name`) reste indexé par le nom de la
-  persona ; l'état de session en sort (§2).
+* `type: Agent` is read as `Persona` (`kind: agent`), with a
+  `persona-legacy-agent` finding (warning); `harness`/`model`/`provider`
+  yield a one-element `harnesses` list;
+* `type: Placement` is read as admission; a `cwd` present is **ignored**
+  with an `admission-cwd-ignored` finding, then refused at the end of the
+  period;
+* the registry (`agent_registry`, key `name`) remains indexed by the persona's
+  name; session state moves out of it (§2).
 
-## 1 bis. Visibilité : la règle unique, vérifiée au placement
+## 1 bis. Visibility: the single rule, checked at placement
 
-Règle de [0029](../decisions/0029-persona-et-session.md) : **une persona ne
-tourne sur la machine d'un humain que si cet humain a accès au dépôt de la
-persona** ; pour un serveur ou un hôte de cluster, la règle porte sur son
-responsable (`responsible` de la fiche `Host`) et sur ses administrateurs.
+Rule of [0029](../decisions/0029-persona-et-session.md): **a persona runs on a
+human's machine only if that human has access to the persona's repository**;
+for a server or a cluster host, the rule applies to its responsible person
+(`responsible` of the `Host` card) and to its administrators.
 
-Proposition de mise en œuvre, dans le prédicat de placement (L31) :
+Proposed implementation, in the placement predicate (L31):
 
-* **Qui doit avoir accès** : l'ensemble `H(hôte)` = responsable de l'hôte +
-  administrateurs déclarés dans la fiche `Host` (nouvelle clé `admins`, liste
-  de `human:<id>`).
-* **Comment le vérifier**, au choix de la configuration de l'hôte :
-  1. **par l'hébergeur git** : l'API de la forge dit, pour chaque humain de
-     `H(hôte)` lié à son compte de forge (liaison `human:<id>` → compte de
-     forge, à porter par la fiche `Member`), s'il a au moins la lecture sur le
-     dépôt ; l'appel se fait avec un jeton d'ameesh limité à la lecture des
-     droits ;
-  2. **par une copie d'essai** faite avec les identifiants de l'humain
-     responsable de l'hôte (`git ls-remote` suffit) : si elle échoue, l'accès
-     n'est pas établi. Cette voie ne prouve rien pour les administrateurs ;
-     elle convient à un poste personnel (un seul humain).
-* **Résultat** : hôte admis, ou **écarté** avec un constat lisible
-  (`persona-hidden-from-host`) ; jamais d'admission par défaut quand la
-  vérification échoue (fail closed). Le résultat est mis en cache avec une
-  durée courte et revérifié à chaque ouverture de session et à chaque
-  déplacement (0028).
-* **Révocation** : un accès retiré au dépôt écarte l'hôte pour les sessions
-  suivantes ; la session en cours finit son tour puis est arrêtée, et sa
-  copie locale est poussée puis effacée (§4).
+* **Who must have access**: the set `H(host)` = the host's responsible person
+  + administrators declared in the `Host` card (new `admins` key, list of
+  `human:<id>`).
+* **How to check it**, as chosen in the host's configuration:
+  1. **through the git hosting service**: the forge's API tells, for each
+     human of `H(host)` linked to their forge account (link `human:<id>` →
+     forge account, to be carried by the `Member` card), whether they have at
+     least read access to the repository; the call is made with an ameesh
+     token limited to reading permissions;
+  2. **through a trial clone** made with the credentials of the human
+     responsible for the host (`git ls-remote` is enough): if it fails,
+     access is not established. This path proves nothing for administrators;
+     it suits a personal workstation (a single human).
+* **Result**: host admitted, or **excluded** with a readable finding
+  (`persona-hidden-from-host`); never admitted by default when the check
+  fails (fail closed). The result is cached for a short duration and
+  rechecked at each session opening and at each move (0028).
+* **Revocation**: access removed from the repository excludes the host for
+  subsequent sessions; the running session finishes its turn and is then
+  stopped, and its local copy is pushed then erased (§4).
 
-## 2. Enregistrement d'une session
+## 2. Recording a session
 
-Une table de sessions (migration à numéroter le moment venu), une ligne par
-exécution :
+A sessions table (migration to be numbered when the time comes), one row per
+execution:
 
-| Champ | Contenu |
+| Field | Content |
 |---|---|
-| `id` | identifiant ameesh (UUID), distinct de celui du harnais |
-| `persona` | nom de la persona |
-| `work_item` | le lot (0025) ; `NULL` pour une session longue d'orchestrateur |
-| `harness`, `harness_version` | descripteur L16 et version épinglée |
-| `model`, `effort`, `tier` | réglages effectifs |
-| `account` | **nom** du profil de compte (L30), jamais un secret |
-| `host`, `runner_id`, `lease_epoch` | où et sous quel bail |
-| `cwd` | dossier de travail (état d'exécution, 0029) |
-| `harness_session_id` | identifiant natif (`--resume`, `exec resume`, `--session-id`, ACP) |
-| `parent_session` | session précédente de la chaîne (rotation L11, relais, déplacement) |
+| `id` | ameesh identifier (UUID), distinct from the harness's |
+| `persona` | persona name |
+| `work_item` | the lot (0025); `NULL` for a long-running orchestrator session |
+| `harness`, `harness_version` | L16 descriptor and pinned version |
+| `model`, `effort`, `tier` | effective settings |
+| `account` | **name** of the account profile (L30), never a secret |
+| `host`, `runner_id`, `lease_epoch` | where and under which lease |
+| `cwd` | working directory (execution state, 0029) |
+| `harness_session_id` | native identifier (`--resume`, `exec resume`, `--session-id`, ACP) |
+| `parent_session` | previous session in the chain (L11 rotation, relay, move) |
 | `relay_reason` | `rotation`, `compte`, `harnais`, `hôte`, `restart` |
-| `started_at`, `ended_at`, `status`, `end_reason` | cycle de vie (fusion du lot, abandon…) |
-| `memory_journal` | chemin du journal de mémoire de la session, dans la copie éphémère (§4) |
-| `memory_commit` | commit du dépôt de la persona à l'ouverture, puis commit poussé à la fermeture |
+| `started_at`, `ended_at`, `status`, `end_reason` | life cycle (lot merge, abandonment…) |
+| `memory_journal` | path of the session's memory journal, in the ephemeral copy (§4) |
+| `memory_commit` | commit of the persona's repository at opening, then commit pushed at closing |
 
-* **Sessions parallèles** : au plus une session **active** par
-  `(persona, work_item)` ; plusieurs lots, plusieurs sessions. Le bail passe
-  de la persona à la session. L'identité posée dans l'environnement du
-  harnais reste `AGENT_MAIL_NAME=<persona>` (les outils existants continuent
-  de marcher), complétée de `AMEESH_SESSION=<id>`.
-* **Courrier** : un message adressé à la persona et porteur d'un lot va à la
-  session de ce lot ; sans lot, à la session longue si elle existe, sinon il
-  attend (décision d'acheminement à préciser dans le lot).
-* Le relais et le déplacement **ferment** une session et en ouvrent une
-  autre liée par `parent_session` ; la reprise native n'est qu'un cas où
-  `harness_session_id` est conservé.
+* **Parallel sessions**: at most one **active** session per
+  `(persona, work_item)`; several lots, several sessions. The lease moves
+  from the persona to the session. The identity set in the harness's
+  environment remains `AGENT_MAIL_NAME=<persona>` (existing tools keep
+  working), complemented by `AMEESH_SESSION=<id>`.
+* **Mail**: a message addressed to the persona and carrying a lot goes to
+  that lot's session; without a lot, to the long-running session if it
+  exists, otherwise it waits (routing decision to be specified in the lot).
+* The relay and the move **close** a session and open another one linked by
+  `parent_session`; native resume is only a case where `harness_session_id`
+  is kept.
 
-## 3. Désignation de la persona au harnais
+## 3. Designating the persona to the harness
 
-ameesh **génère** depuis la fiche un texte de persona (identité, rôle,
-responsable, règles, interdits, outils, lot) et un **index de mémoire**
-(§4), puis les transmet par le canal le plus fort de chaque harnais, **sans
-jamais écrire dans le dépôt de travail ni dans le dossier d'un compte** :
+ameesh **generates** from the card a persona text (identity, role,
+responsible person, rules, prohibitions, tools, lot) and a **memory index**
+(§4), then passes them through the strongest channel of each harness,
+**without ever writing to the working repository or to an account's
+directory**:
 
-| Harnais | Identité et consignes | Index de mémoire au démarrage | Après compaction | Outils |
+| Harness | Identity and prompts | Memory index at startup | After compaction | Tools |
 |---|---|---|---|---|
-| Claude Code | `--append-system-prompt-file <session>/persona.md` | hook `SessionStart` (`startup`, `resume`) passé par `--settings` | même hook, `matcher: compact` | `--mcp-config` |
-| Codex | `-c developer_instructions=…` (ou profil propre à la session) | hook `SessionStart` | hook `PostCompact` ou rappel au tour suivant (à éprouver) | `-c mcp_servers…` |
-| dsh | `--patch` de session : `personaSuffix` de `dsh-system-prompt` | hook `SessionStart` (pont de hooks) | supposé : greffon de compaction | `--patch` (`dsh-mcp-client`) |
-| ACP | en tête du **premier message** ; `_meta` informatif | dans le premier message | rien de garanti : rappel par ameesh au tour suivant | `mcpServers` à chaque `new`/`resume`/`load` |
+| Claude Code | `--append-system-prompt-file <session>/persona.md` | `SessionStart` hook (`startup`, `resume`) passed through `--settings` | same hook, `matcher: compact` | `--mcp-config` |
+| Codex | `-c developer_instructions=…` (or session-specific profile) | `SessionStart` hook | `PostCompact` hook or reminder at the next turn (to be tested) | `-c mcp_servers…` |
+| dsh | session `--patch`: `personaSuffix` of `dsh-system-prompt` | `SessionStart` hook (hooks bridge) | assumed: compaction plugin | `--patch` (`dsh-mcp-client`) |
+| ACP | at the head of the **first message**; informative `_meta` | in the first message | nothing guaranteed: reminder by ameesh at the next turn | `mcpServers` at each `new`/`resume`/`load` |
 
-Le texte généré est le même pour tous les harnais ; seuls les canaux
-diffèrent (champ du descripteur L16, par exemple `ameesh.persona`). Les
-fichiers de session vivent dans le dossier d'état d'ameesh
-(`~/.local/state/ameesh/sessions/<id>/`), pas dans le worktree.
+The generated text is the same for all harnesses; only the channels differ
+(field of the L16 descriptor, for example `ameesh.persona`). The session
+files live in ameesh's state directory
+(`~/.local/state/ameesh/sessions/<id>/`), not in the worktree.
 
-## 4. Mémoire en attendant le harnais maison
+## 4. Memory while waiting for the in-house harness
 
-### Trois voies comparées
+### Three paths compared
 
-| | (a) Mémoire native de chaque harnais | (b) Dossier de mémoire par persona, neutre | (c) Serveur MCP de mémoire |
+| | (a) Native memory of each harness | (b) Per-persona memory directory, neutral | (c) Memory MCP server |
 |---|---|---|---|
-| Portée | compte × dépôt (Claude), compte (Codex), rien (dsh), opaque (ACP) | **la persona**, où qu'elle tourne | la persona |
-| Relais de compte ou de harnais | **perdue** (sauf Claude avec `projects/` partagé) | conservée | conservée |
-| Sessions parallèles | écritures concurrentes non maîtrisées | règle explicite (journal par session) | règle explicite (côté serveur) |
-| Lecture au démarrage | automatique | injectée par hook ou consigne | **non** : il faut un outil appelé, ou une injection en plus |
-| Écriture | décidée par le modèle et le harnais | convention + tour de mémoire en fin de lot | outil appelé par le modèle |
-| Lisible et relisible par un humain | oui (Markdown), mais éparpillée | oui (Markdown, git) | selon le stockage |
-| Coût d'exploitation | nul | un dossier (git) par dépôt de mémoire | un service à faire tourner sur chaque hôte ou en réseau |
-| Remplaçable par le harnais maison | non | **oui** : le format est le contrat | oui, si le stockage est (b) |
+| Scope | account × repository (Claude), account (Codex), nothing (dsh), opaque (ACP) | **the persona**, wherever it runs | the persona |
+| Account or harness relay | **lost** (except Claude with shared `projects/`) | kept | kept |
+| Parallel sessions | uncontrolled concurrent writes | explicit rule (one journal per session) | explicit rule (server side) |
+| Read at startup | automatic | injected by hook or prompt | **no**: a tool call is needed, or an extra injection |
+| Writing | decided by the model and the harness | convention + memory turn at the end of the lot | tool called by the model |
+| Readable and reviewable by a human | yes (Markdown), but scattered | yes (Markdown, git) | depends on the storage |
+| Operating cost | none | one directory (git) per memory repository | a service to run on each host or over the network |
+| Replaceable by the in-house harness | no | **yes**: the format is the contract | yes, if the storage is (b) |
 
-### Format neutre proposé (b)
+### Proposed neutral format (b)
 
 ```
-<dépôt de la persona>/[<path>/]
-├── MEMORY.md            # index : une ligne par souvenir, ≤ 200 lignes
-├── souvenirs/<sujet>.md # un souvenir ou un sujet ; frontmatter : type, modified, source
-└── journal/<session>.md # ajouts d'UNE session, en ajout seul
+<persona repository>/[<path>/]
+├── MEMORY.md            # index: one line per memory, ≤ 200 lines
+├── souvenirs/<sujet>.md # one memory or one topic; frontmatter: type, modified, source
+└── journal/<session>.md # additions from ONE session, append-only
 ```
 
-* Mêmes conventions que la mémoire automatique de Claude Code (index court,
-  un fichier par sujet, `type` dans le frontmatter : `user`, `feedback`,
-  `project`, `reference`) : la plus aboutie des mémoires observées, et
-  lisible par les autres harnais comme simple Markdown. Le frontmatter suit
-  OKF, ce qui laisse le canon et l'outillage existants le lire.
-* **Un dépôt git par persona** (ou par groupe de personas qui peuvent se
-  voir, chacune dans son sous-dossier `path`). La fiche n'indique que son
-  emplacement (`memory.repository`).
-* **Accès limité** : une session ne reçoit qu'un **identifiant d'accès limité
-  à ce dépôt** (clé de déploiement ou jeton à portée d'un seul dépôt, en
-  écriture), fourni par l'hôte au lancement et jamais au canon ; elle ne voit
-  aucune autre mémoire.
-* **Copie locale éphémère** : à l'ouverture, clonage dans le dossier d'état
-  de la session (`~/.local/state/ameesh/sessions/<id>/memoire/`, droits 0700,
-  privé pendant la session) ; à la fermeture (fin de lot, relais,
-  déplacement, arrêt), commit, **push**, puis **effacement** de la copie. Un
-  push refusé garde la copie et lève une alerte au lieu d'effacer. Ainsi la
-  mémoire suit la persona d'un hôte à l'autre (0028) sans rester sur aucun.
+* Same conventions as Claude Code's auto memory (short index, one file per
+  topic, `type` in the frontmatter: `user`, `feedback`, `project`,
+  `reference`): the most mature of the memories observed, and readable by the
+  other harnesses as plain Markdown. The frontmatter follows OKF, which lets
+  the canon and the existing tooling read it.
+* **One git repository per persona** (or per group of personas that can see
+  each other, each in its `path` subdirectory). The card only gives its
+  location (`memory.repository`).
+* **Limited access**: a session receives only an **access credential limited
+  to that repository** (deploy key or token scoped to a single repository,
+  with write access), supplied by the host at launch and never in the canon;
+  it sees no other memory.
+* **Ephemeral local copy**: at opening, clone into the session's state
+  directory (`~/.local/state/ameesh/sessions/<id>/memoire/`, permissions
+  0700, private during the session); at closing (end of lot, relay, move,
+  stop), commit, **push**, then **erasure** of the copy. A refused push keeps
+  the copy and raises an alert instead of erasing. Thus the memory follows
+  the persona from one host to another (0028) without staying on any.
 
-### Règle d'écriture concurrente
+### Concurrent writing rule
 
-1. **Une session n'écrit que son journal** `journal/<session>.md`, en ajout
-   seul : deux sessions parallèles n'écrivent jamais le même fichier.
-2. **Consolidation par un seul écrivain** : en fin de lot (ou au relais),
-   ameesh lance un **tour de mémoire** dans la session — comme le tour de
-   résumé de la rotation L11 — qui propose les changements de `souvenirs/` et
-   de `MEMORY.md` ; l'écriture se fait par commit sur la copie puis push :
-   le dépôt distant sert de verrou (un push refusé oblige à reprendre sur le
-   dernier commit). Un conflit sur `souvenirs/` est un signal, jamais résolu
-   en silence ; les journaux, un fichier par session, ne se heurtent pas.
-3. Les journaux consolidés sont archivés (pas effacés) : on peut refaire une
-   consolidation.
-4. Aucun secret : la consolidation passe un filtre de secrets et refuse le
-   commit en cas de doute.
+1. **A session writes only its journal** `journal/<session>.md`,
+   append-only: two parallel sessions never write the same file.
+2. **Consolidation by a single writer**: at the end of the lot (or on
+   relay), ameesh runs a **memory turn** in the session — like the summary
+   turn of the L11 rotation — which proposes the changes to `souvenirs/` and
+   to `MEMORY.md`; writing is done by commit on the copy then push: the
+   remote repository serves as a lock (a refused push forces starting over
+   from the latest commit). A conflict on `souvenirs/` is a signal, never
+   resolved silently; the journals, one file per session, do not collide.
+3. Consolidated journals are archived (not erased): a consolidation can be
+   redone.
+4. No secrets: consolidation goes through a secrets filter and refuses the
+   commit when in doubt.
 
-Pour Claude Code, une variante à éprouver : `autoMemoryDirectory` pointé sur
-un dossier **propre à la session**, pré-rempli d'une copie de l'index ; la
-mémoire automatique écrit alors là, et la consolidation compare. Elle garde
-le comportement natif d'écriture du modèle sans concurrence sur l'index.
+For Claude Code, a variant to be tested: `autoMemoryDirectory` pointed at a
+**session-specific** directory, pre-filled with a copy of the index; auto
+memory then writes there, and the consolidation compares. It keeps the
+model's native writing behaviour without concurrency on the index.
 
-### Ce que le relais doit transférer
+### What the relay must transfer
 
-| Élément | De Claude Code à Codex (exemple) |
+| Element | From Claude Code to Codex (example) |
 |---|---|
-| Identité et consignes | régénérées depuis la fiche, canal du nouveau harnais |
-| Mémoire de la persona | poussée par l'ancienne session, reclonée par la nouvelle (même dépôt), index réinjecté |
-| Journal de la session en cours | fichier déjà neutre ; repris dans la nouvelle session |
-| Résumé de reprise du lot (L11) | produit sous l'ancien harnais/compte, placé dans le brief |
-| Transcription native | **non transférable** entre harnais ; conservée pour l'audit |
-| Mémoire native du harnais quitté | ignorée (désactivée en mode `neutral`) |
+| Identity and prompts | regenerated from the card, through the new harness's channel |
+| Persona memory | pushed by the old session, recloned by the new one (same repository), index reinjected |
+| Journal of the current session | file already neutral; picked up in the new session |
+| Lot resume summary (L11) | produced under the old harness/account, placed in the brief |
+| Native transcript | **not transferable** between harnesses; kept for audit |
+| Native memory of the harness left | ignored (disabled in `neutral` mode) |
 
-### Recommandation pour l'intérim
+### Recommendation for the interim
 
-* **(b) comme stockage et contrat**, mémoire native **désactivée** pour les
-  sessions lancées par ameesh en mode `neutral` (Claude :
-  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` ou redirection ; Codex : `memories`
-  laissée désactivée), pour n'avoir qu'une mémoire par persona et ne pas en
-  laisser une seconde diverger dans un compte.
-* **(c) plus tard, comme façade** sur les mêmes fichiers (outils
-  `memoire.lire`, `memoire.chercher`, `memoire.noter`) quand un harnais n'a
-  pas de hook ; il travaille sur la copie éphémère de la session, avec le
-  même identifiant limité.
-* **ameesh ne devient pas propriétaire de la mémoire** : ni table, ni format
-  propre en base. La gestion du dossier (injection, journal, consolidation)
-  vit dans un **composant séparé** (« mémoire de persona »), appelé par le
-  runner aux trois points fixes (ouverture, relais, fin de lot) ; le cœur
-  d'ameesh ne fait que **désigner** la persona et l'emplacement de son
-  dépôt, comme le veut [0029](../decisions/0029-persona-et-session.md). Le
-  harnais maison, s'il vient, lit le même format et remplace ce composant.
+* **(b) as storage and contract**, native memory **disabled** for sessions
+  launched by ameesh in `neutral` mode (Claude:
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` or redirection; Codex: `memories` left
+  disabled), so as to have only one memory per persona and not let a second
+  one diverge in an account.
+* **(c) later, as a facade** over the same files (tools `memoire.lire`,
+  `memoire.chercher`, `memoire.noter`) when a harness has no hook; it works
+  on the session's ephemeral copy, with the same limited credential.
+* **ameesh does not become the owner of the memory**: no table, no format of
+  its own in the database. Management of the directory (injection, journal,
+  consolidation) lives in a **separate component** ("persona memory"),
+  called by the runner at the three fixed points (opening, relay, end of
+  lot); the core of ameesh only **designates** the persona and the location
+  of its repository, as [0029](../decisions/0029-persona-et-session.md)
+  requires. The in-house harness, if it comes, reads the same format and
+  replaces this component.
 
-## 4 bis. La solution intérimaire peut-elle durer ?
+## 4 bis. Can the interim solution last?
 
-### Ce qu'elle couvre durablement
+### What it covers durably
 
-* L'**identité** d'une persona dans n'importe quel harnais (texte généré
-  depuis le canon, canal le plus fort de chacun).
-* Une **mémoire par persona**, indépendante du compte, du dépôt, du harnais et
-  de l'hôte, relisible et versionnée.
-* Le **relais** et le **déplacement** : la persona survit, seule la
-  transcription native se perd, compensée par le résumé de reprise.
-* Les **sessions parallèles** par la règle « un journal par session, un seul
-  consolidateur ».
-* Les **abonnements** utilisables seulement par les outils de leur
-  fournisseur : rien n'oblige à quitter Claude Code ou Codex.
+* The **identity** of a persona in any harness (text generated from the
+  canon, through each one's strongest channel).
+* A **per-persona memory**, independent of the account, the repository, the
+  harness and the host, reviewable and versioned.
+* The **relay** and the **move**: the persona survives, only the native
+  transcript is lost, compensated by the resume summary.
+* **Parallel sessions** through the rule "one journal per session, a single
+  consolidator".
+* **Subscriptions** usable only through their provider's tools: nothing
+  forces leaving Claude Code or Codex.
 
-### Ce qui manquerait par rapport à un harnais maison
+### What would be missing compared with an in-house harness
 
-| Besoin | Claude Code | Codex | dsh | ACP |
+| Need | Claude Code | Codex | dsh | ACP |
 |---|---|---|---|---|
-| Contrôle de la consigne système | ajout seulement (remplacer coûte les consignes d'outils) ; figée au 1er tour | ajout (`developer_instructions`) ou remplacement complet | **complet** (patch) | aucun |
-| Compaction, contexte | décidée par le harnais ; fenêtre réglable (`--autocompact`) ; réinjection par hook `compact` | décidée par le harnais ; hooks de compaction (à éprouver) | greffon configurable | opaque |
-| Garantie d'écriture de la mémoire | aucune pendant la session ; garantie aux points fixes d'ameesh (tour de mémoire) | idem | idem | idem |
-| Récupération en cours de session | hooks, lecture de fichiers, MCP : à l'initiative du modèle | idem | idem | MCP seulement |
-| Observabilité | flux `stream-json`, hooks (`InstructionsLoaded`) | JSONL, journaux de session | JSON, télémétrie OTel | `session/update` |
-| Sessions parallèles | oui | oui | oui | selon l'agent |
-| Relais | par résumé (reprise native seulement entre comptes Claude à `projects/` partagé) | par résumé | même session (même `DSH_HOME`) | selon l'agent |
+| Control of the system prompt | append only (replacing costs the tool prompts); frozen at the 1st turn | append (`developer_instructions`) or full replacement | **full** (patch) | none |
+| Compaction, context | decided by the harness; adjustable window (`--autocompact`); reinjection by `compact` hook | decided by the harness; compaction hooks (to be tested) | configurable plugin | opaque |
+| Guarantee that memory is written | none during the session; guaranteed at ameesh's fixed points (memory turn) | same | same | same |
+| Retrieval during the session | hooks, file reading, MCP: on the model's initiative | same | same | MCP only |
+| Observability | `stream-json` stream, hooks (`InstructionsLoaded`) | JSONL, session logs | JSON, OTel telemetry | `session/update` |
+| Parallel sessions | yes | yes | yes | depends on the agent |
+| Relay | by summary (native resume only between Claude accounts with shared `projects/`) | by summary | same session (same `DSH_HOME`) | depends on the agent |
 
-### Conditions pour que ce manque reste acceptable
+### Conditions for this gap to remain acceptable
 
-1. **Sessions courtes** (une par lot, 0025) : la compaction devient rare, et
-   avec elle le principal angle mort.
-2. **Écritures de mémoire aux points fixes** d'ameesh (ouverture, relais, fin
-   de lot), pas seulement à l'initiative du modèle.
-3. **Banc de conformité** (L17) qui vérifie, par harnais et par version, que
-   la persona est bien désignée, que l'index est bien injecté (y compris après
-   compaction) et que le journal est bien écrit ; versions de harnais
-   épinglées.
-4. **Budgets d'injection** respectés : index ≤ 200 lignes, contexte de hook
-   ≤ 10 000 caractères chez Claude, instructions ≤ 32 Kio chez Codex, 64 Kio
-   chez dsh.
-5. **Aucune dépendance aux internes non documentés** des harnais (variables
-   d'expérimentation, bases SQLite, formats de transcription).
-6. Accepter qu'un agent ACP ne reçoive la persona qu'**énoncée**.
+1. **Short sessions** (one per lot, 0025): compaction becomes rare, and with
+   it the main blind spot.
+2. **Memory writes at ameesh's fixed points** (opening, relay, end of lot),
+   not only on the model's initiative.
+3. **Conformance test bench** (L17) that checks, per harness and per
+   version, that the persona is indeed designated, that the index is indeed
+   injected (including after compaction) and that the journal is indeed
+   written; harness versions pinned.
+4. **Injection budgets** respected: index ≤ 200 lines, hook context
+   ≤ 10,000 characters for Claude, instructions ≤ 32 KiB for Codex, 64 KiB
+   for dsh.
+5. **No dependency on undocumented internals** of the harnesses
+   (experimentation variables, SQLite databases, transcript formats).
+6. Accept that an ACP agent receives the persona only **stated**.
 
-**Conclusion.** Pour des agents de construction, de relecture et des doubles
-numériques (des personas comme les autres), dont les besoins sont « une identité, des notes durables, une
-session par lot », la solution intérimaire **peut durer** sans harnais
-maison. Un harnais maison ne se justifierait que pour un contrôle fin du
-contexte en cours de session (politique de rappel, compaction pilotée par la
-persona, écriture transactionnelle de la mémoire à chaque tour), ou si les
-harnais tiers fermaient les canaux utilisés ici. Recommandation : **construire
-l'intérim comme une solution permanente mais remplaçable** — le format de
-mémoire et le texte de persona sont le contrat ; le harnais maison devient un
-harnais de plus qui lit ce contrat, non un prérequis.
+**Conclusion.** For build agents, review agents and digital twins (personas
+like any other), whose needs are "an identity, durable notes, one
+session per lot", the interim solution **can last** without an in-house
+harness. An in-house harness would only be justified for fine-grained control
+of context during the session (reminder policy, compaction driven by the
+persona, transactional writing of memory at every turn), or if the
+third-party harnesses closed the channels used here. Recommendation: **build
+the interim as a permanent but replaceable solution** — the memory format and
+the persona text are the contract; the in-house harness becomes one more
+harness that reads this contract, not a prerequisite.
 
-## 5. Double numérique
+## 5. Digital twin
 
-Plus de règle particulière : **un double numérique est une persona dont le
-dépôt est privé à son humain**. La règle de visibilité (§1 bis) le fait donc
-tourner seulement sur les machines de cet humain (ou sur un hôte dont il est
-le seul responsable et administrateur) ; sa mémoire, dans ce dépôt, n'est
-vue que de lui. Il n'approuve jamais, comme toute persona
-([0012](../decisions/0012-autorite-par-ameesh-approve.md)) : `approve` est
-refusé au chargement et ameesh-gate n'accepte que la passkey de l'humain.
-Restent à décider ses pouvoirs (0029). Un import de la mémoire native
-existante de l'humain (par exemple sa mémoire automatique Claude Code) dans
-le dépôt du double se fait seulement à sa demande, en copie.
+No more special rule: **a digital twin is a persona whose repository is
+private to its human**. The visibility rule (§1 bis) therefore makes it run
+only on that human's machines (or on a host of which they are the sole
+responsible person and administrator); its memory, in that repository, is
+seen only by them. It never approves, like any persona
+([0012](../decisions/0012-autorite-par-ameesh-approve.md)): `approve` is
+refused at load time and ameesh-gate accepts only the human's passkey.
+Its powers remain to be decided (0029). An import of the human's existing
+native memory (for example their Claude Code auto memory) into the twin's
+repository is done only at their request, as a copy.
 
-## 6. Lots proposés
+## 6. Proposed lots
 
-Numéros de lot et de migration à attribuer par l'orchestrateur ; aucun n'est
-réservé ici.
+Lot and migration numbers to be assigned by the orchestrator; none is
+reserved here.
 
-| Lot | Contenu | Dépend de | Risques |
+| Lot | Content | Depends on | Risks |
 |---|---|---|---|
-| P1 — fiche Persona et visibilité | type `Persona` (+ corps), `harnesses` ordonnés, `memory.repository`, lecture transitoire d'`Agent` et `Placement`, constats ; clé `admins` des fiches `Host` ; liaison humain → compte de forge ; **contrôle de visibilité dans le prédicat de placement** (forge ou copie d'essai, hôte écarté sinon, cache court, révocation) | L2 ; à fondre dans L31 (0029 l'y place) | double lecture prolongée ; L31 déjà chargé ; dépendance à l'API de la forge (indisponible = hôte écarté) |
-| P2 — sessions multiples | table des sessions, bail par session, `AMEESH_SESSION`, acheminement du courrier par lot, `ameesh sessions` ; visibilité revérifiée à chaque ouverture de session | L26, L30, L31 | refonte du runner (un worker par nom aujourd'hui) ; le plus risqué |
-| P3 — désignation au harnais | générateur « persona.md » depuis le canon ; champ de descripteur `ameesh.persona` (canaux par harnais) ; hooks `SessionStart` par `--settings`/config de session ; serveurs MCP par session dans le pont ACP | L16, P1 | effet de `-c` à la reprise (Codex) ; patch dsh non éprouvé |
-| P4 — mémoire de persona (composant séparé) | format neutre, dépôt par persona, identifiant d'accès limité au dépôt fourni par l'hôte, copie éphémère (clone, push, effacement), journal par session, injection de l'index, tour de mémoire en fin de lot et au relais, consolidation sous verrou, filtre de secrets, désactivation des mémoires natives en mode `neutral` | P2, P3, L11 | conflits de push entre sessions parallèles ; copie non effacée après un push refusé ; qualité des consolidations |
-| P5 — façade MCP de mémoire (facultatif) | serveur MCP sur les mêmes fichiers, deux versions de MCP | P4 | coût en jetons ; outils seulement chez dsh |
-| P6 — conformité mémoire et persona | cas du banc L17 : désignation, injection après compaction, journal écrit, relais Claude → Codex | L17, P4 | appels payants sous la porte |
-| P7 — pouvoirs du double numérique | seulement si la décision sur ses pouvoirs ajoute des règles ; sinon rien à faire (un double = une persona à dépôt privé) | P1, P4 ; décision du propriétaire | données personnelles |
+| P1 — Persona card and visibility | `Persona` type (+ body), ordered `harnesses`, `memory.repository`, transitional reading of `Agent` and `Placement`, findings; `admins` key of `Host` cards; human → forge account link; **visibility check in the placement predicate** (forge or trial clone, host excluded otherwise, short cache, revocation) | L2; to be merged into L31 (0029 puts it there) | prolonged dual reading; L31 already loaded; dependency on the forge API (unavailable = host excluded) |
+| P2 — multiple sessions | sessions table, lease per session, `AMEESH_SESSION`, mail routing by lot, `ameesh sessions`; visibility rechecked at each session opening | L26, L30, L31 | overhaul of the runner (one worker per name today); the riskiest |
+| P3 — designation to the harness | "persona.md" generator from the canon; descriptor field `ameesh.persona` (channels per harness); `SessionStart` hooks through `--settings`/session config; per-session MCP servers in the ACP bridge | L16, P1 | effect of `-c` on resume (Codex); dsh patch not tested |
+| P4 — persona memory (separate component) | neutral format, repository per persona, access credential limited to the repository supplied by the host, ephemeral copy (clone, push, erasure), journal per session, injection of the index, memory turn at the end of the lot and on relay, consolidation under lock, secrets filter, disabling of native memories in `neutral` mode | P2, P3, L11 | push conflicts between parallel sessions; copy not erased after a refused push; quality of consolidations |
+| P5 — memory MCP facade (optional) | MCP server over the same files, two versions of MCP | P4 | token cost; tools only in dsh |
+| P6 — memory and persona conformance | L17 test bench cases: designation, injection after compaction, journal written, Claude → Codex relay | L17, P4 | paid calls behind the gate |
+| P7 — powers of the digital twin | only if the decision on its powers adds rules; otherwise nothing to do (a twin = a persona with a private repository) | P1, P4; owner's decision | personal data |
 
-Ordre : P1 avec L31, puis P3 (utile dès une seule session par persona), P2,
-P4 ; P5 et P6 ensuite ; P7 seulement si une décision l'exige.
+Order: P1 with L31, then P3 (useful as soon as there is a single session per
+persona), P2, P4; P5 and P6 afterwards; P7 only if a decision requires it.
 
-# Points à trancher par le propriétaire
+# Points for the owner to decide
 
-Tranchés le 2026-10-05 : un dépôt git par persona (ou par groupe de personas
-qui peuvent se voir), seul son emplacement au canon, accès limité à ce dépôt,
-copie locale éphémère ; règle de visibilité unique (0029), double numérique
-sans règle particulière.
+Decided on 2026-10-05: one git repository per persona (or per group of
+personas that can see each other), only its location in the canon, access
+limited to that repository, ephemeral local copy; single visibility rule
+(0029), digital twin without a special rule.
 
-Restent :
+Remaining:
 
-1. **Amender 0029 ?** L'intérim recommandé fait du format de mémoire et du
-   texte de persona un **contrat neutre**, géré par un composant séparé, et
-   rend le harnais maison facultatif. À confirmer, ou à garder strictement
-   comme pont temporaire.
-2. **Mémoires natives** désactivées par défaut pour les sessions lancées par
-   ameesh (proposé), ou laissées actives à côté ?
-3. **Vérification de la visibilité** : par l'API de la forge (proposé pour
-   les serveurs et le cluster, couvre les administrateurs) ou par copie
-   d'essai avec les identifiants du responsable (suffisant pour un poste
-   personnel) ; et où déclarer les administrateurs d'un hôte (clé `admins`
-   de la fiche `Host`, proposé).
-4. **Identifiant limité au dépôt** : qui le crée et le renouvelle (l'humain
-   responsable de la persona, une application de forge d'ameesh), et où
-   l'hôte le garde.
-5. **Qui consolide** : la session elle-même (tour de mémoire, proposé), un
-   relecteur, ou l'humain responsable pour certains types de souvenirs
-   (`feedback` par exemple) ?
-6. **P1 dans L31** comme le dit 0029, ou lot à part pour ne pas alourdir L31 ?
-7. **Pouvoirs du double numérique** (déjà ouvert par 0029).
+1. **Amend 0029?** The recommended interim makes the memory format and the
+   persona text a **neutral contract**, managed by a separate component, and
+   makes the in-house harness optional. To be confirmed, or kept strictly as
+   a temporary bridge.
+2. **Native memories** disabled by default for sessions launched by ameesh
+   (proposed), or left active alongside?
+3. **Visibility check**: through the forge API (proposed for servers and the
+   cluster, covers administrators) or by trial clone with the responsible
+   person's credentials (sufficient for a personal workstation); and where to
+   declare a host's administrators (`admins` key of the `Host` card,
+   proposed).
+4. **Credential limited to the repository**: who creates and renews it (the
+   human responsible for the persona, an ameesh forge application), and
+   where the host keeps it.
+5. **Who consolidates**: the session itself (memory turn, proposed), a
+   reviewer, or the responsible human for certain types of memories
+   (`feedback` for example)?
+6. **P1 in L31** as 0029 says, or a separate lot so as not to weigh down L31?
+7. **Powers of the digital twin** (already opened by 0029).
