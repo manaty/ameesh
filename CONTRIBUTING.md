@@ -77,5 +77,23 @@ ce que la version change, pas quand elle sort :
 
 Une version porte le numéro de son changement le plus fort. Chaque version est
 étiquetée `v<numéro>` sur le commit de `main` déployé et publiée sur GitHub.
-La CI vérifiera qu'une PR de version porte le bon numéro (lot L158), et
-l'auditeur interne le contrôle à chaque version publiée.
+The CI checks the number of every PR that changes it (job `version number`,
+required through `tests`; lot L158), and the internal auditor checks each
+published version ([AUDITEUR](docs/AUDITEUR.md), check 12). Both run
+`scripts/version-level.py`, which compares the number with the content since
+the previous `v*` tag. What it sees sets a floor:
+
+- **major**: a migration of an earlier version changed or removed; a new
+  migration that drops a table, column, schema or type, renames, changes a
+  column type, adds `NOT NULL`, truncates or deletes rows; a command or a long
+  option removed; a commit with the trailer `ameesh-breaking: <why>`. No
+  script sees a changed agent contract, so its author writes that trailer;
+- **minor**: a new migration, command, long option or `AMEESH_*` setting;
+- **patch**: anything else.
+
+The number must be the next one at its level (from 1.9.0: 1.9.1, 1.10.0 or
+2.0.0), and that level must not be below the floor. A level above the floor
+passes: a new function without a new command or setting is a minor that no
+script sees. The release notes then say why. To see the level of what is on
+`main` before preparing a version:
+`python3 scripts/version-level.py level $(git describe --tags --abbrev=0) origin/main`.

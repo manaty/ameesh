@@ -1,0 +1,165 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""L158 — a version number matches its content (scripts/version-level.py).
+
+The CI job `version number` runs it on every PR; the auditor runs `release`
+on each published version. Throwaway repositories: a tag, then commits that
+add a migration, a command, an option, a setting, a destructive migration or
+a breaking trailer, and the number the PR declares.
+"""
+from __future__ import annotations
+
+import contextlib
+import importlib.util
+import io
+import pathlib
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+_spec = importlib.util.spec_from_file_location("version_level_l158",
+                                               ROOT / "scripts" / "version-level.py")
+vl = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(vl)
+
+CLI = '''def build(sub):
+    p = sub.add_parser("show")
+    p.add_argument("--json", action="store_true")
+'''
+
+
+class VersionLevelTest(unittest.TestCase):
+    def setUp(self):
+        self.repo = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.repo)
+        self.addCleanup(setattr, vl, "REPO", None)
+        vl.REPO = str(self.repo)
+        self._git("init", "-q", "-b", "main")
+        self._git("config", "user.email", "t@example.com")
+        self._git("config", "user.name", "t")
+        self._write("src/ameesh/migrations/0001_init.sql", "create table a (x int);\n")
+        self._write("src/ameesh/cli.py", CLI)
+        self._commit("1.2.3", "init")
+        self._git("tag", "v1.2.3")
+
+    def _git(self, *args):
+        subprocess.run(["git", *args], cwd=self.repo, check=True, capture_output=True)
+
+    def _write(self, name, text):
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def _commit(self, version, message):
+        self._write("pyproject.toml", '[project]\nname = "ameesh"\nversion = "%s"\n' % version)
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", message)
+
+    def _pr(self):
+        """The release PR: its version commit, checked against main's tag."""
+        return self._main(["pr", "HEAD^1", "HEAD"])
+
+    def _main(self, argv):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return vl.main(argv)
+
+    def test_bug_fix_is_a_patch(self):
+        self._write("src/ameesh/cli.py", CLI + "# fixed\n")
+        self._commit("1.2.3", "fix")
+        self.assertEqual(vl.level("v1.2.3", "HEAD"), ("patch", ["package code changed"]))
+        self._commit("1.2.4", "ameesh 1.2.4")
+        self.assertEqual(self._pr(), 0)
+
+    def test_new_migration_needs_a_minor(self):
+        self._write("src/ameesh/migrations/0002_b.sql",
+                    "-- drop table a; in a comment\nalter table a drop constraint c;\n"
+                    "create table b (y int);\n")
+        self._commit("1.2.3", "feature")
+        floor, reasons = vl.level("v1.2.3", "HEAD")
+        self.assertEqual((floor, reasons), ("minor", ["migration 0002_b.sql added"]))
+        self._commit("1.2.4", "ameesh 1.2.4")
+        self.assertEqual(self._pr(), 1)
+        self._commit("1.3.0", "ameesh 1.3.0")
+        self.assertEqual(self._pr(), 0)
+
+    def test_new_command_option_or_setting_needs_a_minor(self):
+        self._write("src/ameesh/cli.py", CLI + '''    p.add_argument("-a", "--all")
+    q = sub.add_parser("land")
+    TTL = os.environ.get("AMEESH_LAND_TTL")
+''')
+        self._commit("1.2.3", "feature")
+        floor, reasons = vl.level("v1.2.3", "HEAD")
+        self.assertEqual(floor, "minor")
+        self.assertEqual(reasons, ["command land added", "option --all added",
+                                   "setting AMEESH_LAND_TTL added"])
+
+    def test_breaking_changes_need_a_major(self):
+        cases = {
+            "destructive migration": lambda: self._write(
+                "src/ameesh/migrations/0002_b.sql", "ALTER TABLE a\n  DROP COLUMN x;\n"),
+            "changed migration": lambda: self._write(
+                "src/ameesh/migrations/0001_init.sql", "create table a (x bigint);\n"),
+            "option removed": lambda: self._write(
+                "src/ameesh/cli.py", CLI.replace('    p.add_argument("--json", '
+                                                 'action="store_true")\n', "")),
+        }
+        for name, change in cases.items():
+            with self.subTest(name):
+                self._git("checkout", "-q", "-B", "case", "v1.2.3")
+                change()
+                self._commit("1.2.3", "change")
+                self.assertEqual(vl.level("v1.2.3", "HEAD")[0], "major")
+                self._commit("1.3.0", "ameesh 1.3.0")
+                self.assertEqual(self._pr(), 1)
+                self._commit("2.0.0", "ameesh 2.0.0")
+                self.assertEqual(self._pr(), 0)
+
+    def test_breaking_trailer(self):
+        self._write("src/ameesh/cli.py", CLI + "# mail payload v2\n")
+        self._commit("1.2.3", "mail payload v2\n\nameesh-breaking: payload key renamed")
+        floor, reasons = vl.level("v1.2.3", "HEAD")
+        self.assertEqual(floor, "major")
+        self.assertIn("ameesh-breaking: payload key renamed", reasons[0])
+
+    def test_number_must_be_the_next_one(self):
+        old = (1, 9, 0)
+        for new, level in (((1, 9, 1), "patch"), ((1, 10, 0), "minor"), ((2, 0, 0), "major"),
+                           ((1, 11, 0), None), ((1, 10, 1), None), ((1, 8, 9), None)):
+            self.assertEqual(vl.bump_level(old, new), level, new)
+        ok, message = vl.verdict(old, (1, 11, 0), "patch", [])
+        self.assertFalse(ok)
+        self.assertIn("1.9.1, 1.10.0 or 2.0.0", message)
+
+    def test_above_the_floor_passes_with_a_note(self):
+        ok, message = vl.verdict((1, 9, 0), (1, 10, 0), "patch", ["package code changed"])
+        self.assertTrue(ok)
+        self.assertIn("above the patch found", message)
+
+    def test_not_a_version_pr(self):
+        self._write("src/ameesh/migrations/0002_b.sql", "create table b (y int);\n")
+        self._commit("1.2.3", "feature")
+        self.assertEqual(self._pr(), 0)
+
+    def test_release_checks_against_the_previous_tag(self):
+        for version, code in (("1.2.4", 1), ("1.3.0", 0)):
+            with self.subTest(version):
+                self._git("checkout", "-q", "-B", "release", "v1.2.3")
+                self._write("src/ameesh/migrations/0002_b.sql", "create table b (y int);\n")
+                self._commit(version, "ameesh " + version)
+                self._git("tag", "v" + version)
+                self.assertEqual(self._main(["release", "v" + version]), code)
+
+
+class WorkflowTest(unittest.TestCase):
+    def test_version_job_gates_the_required_check(self):
+        text = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+        self.assertIn("python3 scripts/version-level.py pr HEAD^1 HEAD", text)
+        self.assertIn("needs: [plan, version, psycopg, psql, platform-macos, doc-readers]", text)
+        # checked before the early exits of version-only and documentation-only PRs
+        self.assertLess(text.index('test "${{ needs.version.result }}" = success'),
+                        text.index("PR de version seule"))
+
+
+if __name__ == "__main__":
+    unittest.main()
