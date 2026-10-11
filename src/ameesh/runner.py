@@ -1164,7 +1164,10 @@ class AgentWorker(threading.Thread):
         """L40 (0030) : le tour qui commence compte pour les lots délégués à
         cet agent — le lot du tour et ceux de ses messages. Noté une fois par
         délégation (registre et journal du lot) : à l'échéance, le lot ne
-        reviendra pas au délégant. Jamais bloquant pour le tour."""
+        reviendra pas au délégant. L157 : le même tour date le début mesuré
+        des lots assignés à cet agent qui n'en ont pas. Jamais bloquant pour
+        le tour."""
+        from . import estimates
         from . import work as work_mod
 
         lots = {str(spec["lot"])} if spec.get("lot") else set()
@@ -1179,6 +1182,16 @@ class AgentWorker(threading.Thread):
         if marques:
             log_async("[%s] tour sur lot(s) délégué(s) : %s"
                       % (self.name, ", ".join("#%d" % i for i in marques)))
+        # L157 : le premier tour de l'assigné sur un lot date le début du
+        # travail (durée réelle = fusion − début), une seule fois
+        try:
+            debuts = estimates.mark_started(self.db, self.name, lots)
+        except (db_mod.DbError, ValueError) as exc:
+            log_async("[%s] début de lot non noté (%s)" % (self.name, exc))
+            return
+        if debuts:
+            log_async("[%s] début mesuré : %s"
+                      % (self.name, ", ".join("#%d" % i for i in debuts)))
 
     def lot_rotation_due(self, lot: str | None) -> bool:
         """Rotation au changement de lot due ? (politique `par-lot`)
@@ -2483,10 +2496,12 @@ class AgentWorker(threading.Thread):
                     self.runner.host, entries, actor="runner:%s" % self.runner.runner_id)
                 for entry in entries:
                     if entry["kind"] == "orphan":
-                        log("[%s] /tmp : %s (%s) apparu pendant le tour — signalé, jamais "
-                            "supprimé : %s" % (self.name, entry["path"],
-                                               entry.get("bytes"),
-                                               (entry.get("data") or {}).get("command")))
+                        # L162 : le sort de l'entrée est dans le détail
+                        # (supprimée une fois abandonnée, ou jamais)
+                        log("[%s] /tmp : %s (%s) apparu pendant le tour — signalé (%s) : %s"
+                            % (self.name, entry["path"], entry.get("bytes"),
+                               entry.get("detail", "").rpartition(" : ")[2],
+                               (entry.get("data") or {}).get("command")))
         except Exception as exc:
             log("[%s] ménage après le tour %s impossible (%s)" % (self.name, turn_id[:8], exc))
 
@@ -3214,6 +3229,9 @@ class Runner:
         #: valeurs par défaut tant qu'aucun canon n'est lu
         from . import menage as menage_mod
         self._housekeeping = menage_mod.Policy()
+        #: L162 : jamais deux passages de ménage à la fois (le périodique, et
+        #: celui qu'une pression du tmpfs déclenche tout de suite)
+        self._housekeeping_lock = threading.Lock()
         #: travail de fond des tours finis, en délai de grâce (suivi par le
         #: fil `fond` en mode service) ; pids des harnais lancés, que le
         #: moissonneur des orphelins adoptés ne touche jamais (lancement
@@ -3761,8 +3779,51 @@ class Runner:
         """Un passage de ménage (L73) ; ne lève jamais.
 
         Les caches partagés ne sont évincés que si aucun tour de cet hôte ne
-        tourne (d'après la base : les autres exécuteurs de l'hôte comptent)."""
+        tourne (d'après la base : les autres exécuteurs de l'hôte comptent).
+        L162 : un passage déjà en cours rend None (jamais deux à la fois)."""
+        lock = getattr(self, "_housekeeping_lock", None)
+        if lock is None:
+            lock = self._housekeeping_lock = threading.Lock()
+        if not lock.acquire(blocking=False):
+            return None
+        try:
+            return self._housekeeping_pass()
+        finally:
+            lock.release()
+
+    def tmpfs_pressure_pass(self) -> bool:
+        """L162 : une pression qui vient du tmpfs déclenche TOUT DE SUITE un
+        passage de ménage (entrées de /tmp abandonnées par un tour), sans
+        attendre le passage périodique ; le journal dit ensuite les plus
+        grosses entrées de /tmp et l'action attendue. Rien sans passage
+        périodique (`AMEESH_HOUSEKEEPING_INTERVAL=0`, `--once`). Rend vrai si
+        le passage est lancé."""
+        interval = float(getattr(self.cfg, "housekeeping_interval", 0) or 0)
+        if interval <= 0 or self.once:
+            return False
+
+        def passage() -> None:
+            from . import menage as menage_mod
+            report = self.housekeeping_once()
+            if not report:
+                return
+            mesure = report.get("measure") or {}
+            supprimes = [e for e in report.get("entries") or ()
+                         if e.get("kind") == "orphan" and e.get("action") == "deleted"]
+            log_async("pression du tmpfs : ménage immédiat, %d entrée(s) de /tmp abandonnée(s) "
+                      "supprimée(s)%s ; %s" % (
+                          len(supprimes),
+                          " (%s)" % ", ".join(e["path"] for e in supprimes[:5])
+                          if supprimes else "",
+                          menage_mod.tmpfs_hint(mesure.get("system_tmp_top") or [],
+                                                self.housekeeping_policy())))
+
+        threading.Thread(target=passage, daemon=True, name="menage-tmpfs").start()
+        return True
+
+    def _housekeeping_pass(self) -> dict | None:
         from . import menage as menage_mod
+        from . import resources as resources_mod
         db = None
         try:
             db = db_mod.connect(self.cfg)
@@ -3778,7 +3839,9 @@ class Runner:
             faits = [e for e in report["entries"] if e["kind"] != "mesure"]
             if faits:
                 log_async("ménage : %s" % " ; ".join(
-                    "%s %s %s" % (e["kind"], e["action"], e.get("path") or "")
+                    "%s %s %s%s" % (e["kind"], e["action"], e.get("path") or "",
+                                    " (%s)" % resources_mod.fmt_value("bytes", e["bytes"])
+                                    if e.get("bytes") else "")
                     for e in faits[:10]))
             return report
         except Exception as exc:  # jamais fatal pour l'exécuteur
@@ -3808,6 +3871,7 @@ class Runner:
                     log_async("lot #%s livré : %s%s" % (
                         entry["work_item"], entry["detail"],
                         " [dry-run]" if entry["result"] == "would-merge" else ""))
+            self.radar_once(db)
             return report
         except Exception as exc:  # jamais fatal pour l'exécuteur
             message = "relevé des branches impossible (%s : %s)" % (type(exc).__name__, exc)
@@ -3821,6 +3885,26 @@ class Runner:
                     db.close()
                 except Exception:
                     pass
+
+    def radar_once(self, db) -> None:
+        """L160b : un passage du radar de conflits, après le relevé des
+        branches, sur l'hôte qui déclare `radar.projects` ; journal seulement,
+        aucun courrier. Ne lève jamais."""
+        from . import radar
+        try:
+            if getattr(self, "_radar_cache", None) is None:
+                self._radar_cache = radar.Cache()
+            for line in radar.run_pass(self.cfg, db, cache=self._radar_cache):
+                if line["changes"] or line.get("error"):
+                    log_async("radar %s : %s" % (line["project"], line.get("error") or (
+                        "%d changement(s), %d paire(s) en conflit (%.1f s)" % (
+                            len(line["changes"]), line["summary"]["conflict"],
+                            line["duration_s"]))))
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            message = "radar impossible (%s : %s)" % (type(exc).__name__, exc)
+            if message != getattr(self, "_radar_error", None):
+                log_async(message)
+            self._radar_error = message
 
     def start_branch_sweep_poll(self) -> None:
         """Relevé périodique des branches (`AMEESH_BRANCH_SWEEP_INTERVAL`,
@@ -3975,11 +4059,12 @@ class Runner:
         from . import resources as resources_mod
         episode = getattr(self, "_pressure_episode", None)
         if verdict.get("blocked"):
+            tmpfs = any(b.get("key") == "max_tmpfs_used" for b in verdict.get("breaches") or ())
             if episode is None:
-                self._pressure_episode = {"since": time.time(),
-                                          "critical": bool(verdict.get("critical")),
-                                          "delayed": set(), "rotations": set(),
-                                          "orchestrator_turns": 0}
+                self._pressure_episode = episode = {
+                    "since": time.time(), "critical": bool(verdict.get("critical")),
+                    "delayed": set(), "rotations": set(), "orchestrator_turns": 0,
+                    "tmpfs": False}
                 batterie = any(b.get("power") for b in verdict.get("breaches") or ())
                 log_async("pression de l'hôte %s : début — %s ; plus de nouveau tour%s"
                           % (self.host, resources_mod.describe(verdict.get("breaches"))
@@ -3989,6 +4074,11 @@ class Runner:
                              " sauf ceux d'un orchestrateur (pression non critique)"))
             elif verdict.get("critical"):
                 episode["critical"] = True
+            if tmpfs and not episode.get("tmpfs"):
+                # L162 : la pression vient du tmpfs — ménage tout de suite (une
+                # fois par épisode), puis les plus grosses entrées au journal
+                episode["tmpfs"] = True
+                self.tmpfs_pressure_pass()
             return
         if episode is None:
             return
@@ -4317,6 +4407,26 @@ def _attach_env(cfg: Config, name: str, owner: str, epoch: int) -> dict:
     return env
 
 
+def _attach_tmp_env(cfg: Config, name: str, base_env: dict) -> dict:
+    """L162 : le dossier temporaire de l'agent (sur disque) et les caches gérés
+    pour une session `attach`, comme pour un tour de l'exécuteur — sans vider
+    le dossier (la session est celle de l'agent). Politique de la fiche Host
+    (canons lus sur place) ; jamais bloquant : sans ménage possible, la
+    session part avec l'environnement d'origine."""
+    try:
+        from . import canon as canon_mod
+        from . import menage as menage_mod
+        try:
+            canons = canon_mod.load_configured(cfg)
+        except Exception:
+            canons = []
+        return menage_mod.turn_env(cfg, menage_mod.effective(canons, cfg.host or ""), name,
+                                   base_env)
+    except Exception as exc:
+        log_async("[%s] attach : dossier temporaire non redirigé (%s)" % (name, exc))
+        return {}
+
+
 def _kill_group(proc: subprocess.Popen) -> None:
     """SIGKILL du groupe du harnais (il est lancé dans sa propre session)."""
     try:
@@ -4450,6 +4560,7 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     argv = adapter.interactive_command(agent.get("session_id"))
     env = _attach_env(cfg, name, owner, epoch)
     env.update(adapter.env())
+    env.update(_attach_tmp_env(cfg, name, env))
     cwd = agent.get("cwd") or None
     if cwd and not os.path.isdir(cwd):
         cwd = None

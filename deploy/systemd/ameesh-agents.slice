@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# ameesh — slice qui regroupe les exécuteurs d'agent de l'hôte (L159c).
+# Service UTILISATEUR, installée avec ameesh-runner-agent@.service :
+#   install -m 0644 deploy/systemd/ameesh-agents.slice ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user status ameesh-agents.slice      # mémoire de tous les agents
+#
+# Chaque agent a son plafond (MemoryMax de son unité) ; la slice borne leur
+# somme, en part de la mémoire de l'hôte : ce qui reste est au système, au
+# bureau et aux applications. Un hôte qui veut d'autres parts :
+#   systemctl --user set-property ameesh-agents.slice MemoryMax=… MemoryHigh=…
+
+[Unit]
+Description=ameesh — exécuteurs d'agent
+Before=slices.target
+
+[Slice]
+MemoryHigh=80%
+MemoryMax=85%

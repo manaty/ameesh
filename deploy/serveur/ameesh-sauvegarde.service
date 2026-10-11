@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=ameesh — sauvegarde de la base du mesh
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=ameesh
+ExecStart=/usr/local/sbin/ameesh-sauvegarder-base

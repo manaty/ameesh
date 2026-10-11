@@ -2229,7 +2229,32 @@ class _Loader:
                              % key, **where, **subject)
                     continue
                 parsed[key] = octets
-        for unknown in sorted(set(raw) - set(resources_mod.THRESHOLD_KEYS)):
+        # L159c : plafonds mémoire des unités d'agent (tailles, > 0)
+        for key in resources_mod.AGENT_MEMORY_KEYS:
+            value = raw.get(key)
+            if value is None:
+                continue
+            if key == "agent_memory_max":
+                octets = resources_mod.parse_bytes(value)
+                if not octets:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.resources.agent_memory_max` : taille attendue (ex. 6G)",
+                             **where, **subject)
+                    continue
+                parsed[key] = octets
+                continue
+            caps = {}
+            if isinstance(value, dict):
+                caps = {str(agent): resources_mod.parse_bytes(size)
+                        for agent, size in value.items()}
+            if not isinstance(value, dict) or not all(caps.values()):
+                self.add("host-policy-invalid", ERROR,
+                         "`policy.resources.agent_memory_max_by_agent` : mapping "
+                         "{agent: taille} attendu (ex. mesh-design: 8G)", **where, **subject)
+                continue
+            parsed[key] = caps
+        for unknown in sorted(set(raw) - set(resources_mod.THRESHOLD_KEYS)
+                              - set(resources_mod.AGENT_MEMORY_KEYS)):
             self.add("host-resources-unknown", WARNING,
                      "`policy.resources.%s` : clé inconnue (ignorée)" % unknown,
                      **where, **subject)

@@ -351,8 +351,17 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'required_capabilities',
         -- L118 (0050) : branche du lot, sa cible, dernier commit vu en avance
         'branch', 'branch_target', 'branch_head',
+        -- L157 (0052) : durée estimée (minutes, source courte, auteur,
+        -- instant) et début mesuré du travail — de l'ÉTAT, comme les dates
+        -- prévues
+        'estimate_minutes', 'estimate_source', 'estimate_by', 'estimate_at',
+        'started_at',
         -- L122 (0053) : numéro de migration réservé par le lot
         'migration'
+    ]),
+    -- L157 (0052) : historique des estimations d'un lot (de l'ÉTAT)
+    ('work_item_estimates', ARRAY[
+        'id', 'work_item_id', 'minutes', 'source', 'estimated_by', 'at'
     ]),
     -- L40 (0031) : registre des délégations et de leur issue (de l'ÉTAT)
     ('work_item_delegations', ARRAY[

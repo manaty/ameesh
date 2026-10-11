@@ -60,7 +60,7 @@ from dataclasses import dataclass, field
 
 from . import config as config_mod
 from . import db as db_mod
-from . import exploitation, fil, sous_utilisation, storage
+from . import alert_briefs, exploitation, fil, sous_utilisation, storage
 from .config import Config
 
 NOTIFY_SCHEMA = "ameesh-notify/1"
@@ -792,7 +792,7 @@ def state_path(cfg: Config) -> str:
 
 def empty_state() -> dict:
     return {"schema": STATE_SCHEMA, "active": {}, "resolved": {}, "rate": {},
-            "summary": {}, "last_summary": {}}
+            "summary": {}, "last_summary": {}, "briefs": {}}
 
 
 def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
@@ -905,12 +905,14 @@ class Notifier:
                     "raised_ts": now, "human": None, "source": None, "status": "nouvelle",
                     "channels": {}}
                 self._raise(entry, router, now)
-                self._brief_orchestrators(db, alert, router)
+                if alert.get("type") not in alert_briefs.BRIEFED_TYPES:
+                    self._brief_orchestrators(db, alert, router)
             elif entry["status"] in ("sans_destinataire", "sans_canal"):
                 # un responsable (ou une route) a pu apparaître depuis
                 self._raise(entry, router, now)
             else:
                 self._retry(entry, "raised", now)
+        self._brief_agents(db, current, router, now)
         for key in list(self.state["resolved"]):
             entry = self.state["resolved"][key]
             self._retry(entry, "resolved", now)
@@ -1039,6 +1041,81 @@ class Notifier:
             except Exception as exc:  # noqa: BLE001
                 self.log("[%s] courrier à l'orchestrateur %s non déposé (%s)"
                          % (alert.get("type"), orch, exc))
+
+    # -- agents qui peuvent agir (L132) ---------------------------------------
+    def _brief_agents(self, db, current: list, router: Router, now: float) -> None:
+        """`idle_capacity`, `stale_lot`, `plan_underused` : courrier `event` aux
+        orchestrateurs et à l'auditeur, avec l'action attendue
+        (`alert_briefs`). Une fois à la levée, une relance si l'alerte dure
+        `REMIND_AFTER_S` ; indépendant de `notify.types` (qui ne règle que
+        l'humain). Jamais fatal au passage."""
+        sent = self.state["briefs"]
+        alive = {key_of(a): a for a in current if a.get("type") in alert_briefs.BRIEFED_TYPES}
+        for key in list(sent):
+            if key not in alive:
+                del sent[key]
+        due = []
+        for key, alert in alive.items():
+            entry = sent.get(key)
+            if entry is None:
+                due.append((key, alert, None))
+            elif not entry.get("reminded") and now - float(entry["sent_ts"]) \
+                    >= alert_briefs.REMIND_AFTER_S:
+                due.append((key, alert, entry))
+        if not due:
+            return
+        from . import mail, work
+        try:
+            listing = list(router.agents().values())
+            from . import canon as canon_mod
+            try:
+                canons = canon_mod.load_configured(self.cfg) if self.cfg.canon else []
+            except Exception:  # noqa: BLE001 - sans canon : l'agent `auditeur` seul
+                canons = []
+            auditors = alert_briefs.auditors(listing, canons)
+        except Exception as exc:  # noqa: BLE001
+            self.log("courrier aux agents non préparé (%s)" % exc)
+            return
+        for key, alert, entry in due:
+            kind = alert.get("type")
+            try:
+                titles = {}
+                for lot in (alert.get("lots") or ())[:12]:
+                    item = storage.of(db).work.get(int(lot))
+                    if item:
+                        titles[int(lot)] = item.get("title") or ""
+                briefs = alert_briefs.briefs(alert, listing, titles, auditors)
+            except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
+                self.log("[%s] courrier aux agents non préparé (%s)" % (kind, exc))
+                continue
+            if not briefs:
+                continue        # personne à prévenir : on réessaie au passage suivant
+            if entry is not None:
+                raised = float(entry["sent_ts"])
+                briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
+            payload = {"alert": kind, "reminder": entry is not None}
+            for field_ in ("lot", "agents", "lots", "harness", "account", "gauge",
+                           "idle_agents"):
+                if alert.get(field_) is not None:
+                    payload[field_] = alert[field_]
+            # pas de `work_item_id` : un message lié au lot compterait comme
+            # son activité (stagnation) et effacerait l'alerte qu'il signale
+            for name, text in sorted(briefs.items()):
+                if self.dry_run:
+                    self.log("[%s] courrier à %s (essai) : %s" % (kind, name, text))
+                    continue
+                try:
+                    mail.send(db, work.SYSTEM_SENDER, name, text, kind="event",
+                              payload=payload)
+                    self.log("[%s] %s déposé pour %s" % (
+                        kind, "relance" if entry is not None else "courrier", name))
+                except Exception as exc:  # noqa: BLE001
+                    self.log("[%s] courrier à %s non déposé (%s)" % (kind, name, exc))
+            if entry is None:
+                sent[key] = {"type": kind, "sent_ts": now, "reminded": False,
+                             "to": sorted(briefs)}
+            else:
+                entry["reminded"] = True
 
     # -- résolution -----------------------------------------------------------
     def _resolved(self, key: str, entry: dict, now: float) -> None:

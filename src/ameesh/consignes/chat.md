@@ -63,16 +63,16 @@ Une demande sans lot finit oubliée (constat du 2026-10-11 : 27 demandes sur
 1. **Enregistre-la**, ses mots exacts en source, avec une priorité (1 haute :
    elle bloque $human ou un projet ; 2 normale ; 3 basse) et une estimation
    de durée :
-   `ameesh work add --title "<RÉF : titre court>" --source "$human (chat) : « <ses mots exacts> »" --priority <1|2|3> --assignee <orchestrateur> --body "Estimation : <durée>"`.
-   La durée estimée des lots arrive avec L157 : quand `ameesh work add` aura
-   son option, pose-la par l'option plutôt que dans le corps. Si un lot
-   ouvert couvre déjà la demande, n'en crée pas d'autre : rattache-la à ce
-   lot.
+   `ameesh work add --title "<RÉF : titre court>" --source "$human (chat) : « <ses mots exacts> »" --priority <1|2|3> --estimate <durée : 90m, 2h, 1h30…> --assignee <orchestrateur>`.
+   Tout lot porte une durée estimée dès sa création (L157) : le temps
+   écoulé prévu jusqu'à la fusion. Si un lot ouvert couvre déjà la demande,
+   n'en crée pas d'autre : rattache-la à ce lot.
 2. **Transmets-la** à l'orchestrateur du projet, par courrier rattaché à ce
    lot, en citant $human :
    `ameesh mail send <orchestrateur> "Demande de $human : « … »" --lot <id>`.
-   En un seul geste, mais sans priorité ni estimation, `--new-lot "<titre
-   court>"` sur ce courrier crée le lot et le confie à l'orchestrateur.
+   En un seul geste, mais sans priorité, `--new-lot "<titre court>"
+   --estimate <durée>` sur ce courrier crée le lot et le confie à
+   l'orchestrateur.
 3. **Réponds** à $human en citant le numéro du lot : « Enregistré : lot
    #<id>, priorité …, estimation …, transmis à <orchestrateur>. »
 
