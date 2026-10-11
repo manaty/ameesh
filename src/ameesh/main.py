@@ -55,6 +55,10 @@
         feuille de route : engagements datés, propositions tirées des décisions,
         Gantt texte (schéma ameesh-roadmap/1, L96) ; dates prévues d'une
         tâche ou d'une fiche : `ameesh work plan <id> --debut J --fin J --livraison J` ;
+  ameesh work estimates [--app P] [--json]
+        L157 : écarts réel/estimé des lots livrés (médiane, p80) par type de
+        lot et par auteur d'estimation ; tout lot porte une durée estimée dès
+        sa création (`work add --estimate 2h`, `work plan <id> --estimate 90m`) ;
   ameesh fil list | show <projet> [<lot>] [--last N] | tail <projet> [<lot>]
         les fils lisibles : tout message passé par ameesh, en clair (R12) ;
   ameesh receipt verify | authenticator list   reçus d'approbation (spec §8) ;
@@ -85,6 +89,7 @@
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
   ameesh menage [--apply] [--json]      ménage de ce que les agents créent (L73) ;
+  ameesh conflicts [--all] [--json]     radar de conflits entre lots (L160b) ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -108,6 +113,8 @@ MESH_COMMANDS = (
     "hosts",
     # L73 : ménage de ce que les agents créent (`ameesh menage [--apply]`)
     "menage",
+    # L160b : radar de conflits entre lots (`ameesh conflicts [--json]`)
+    "conflicts",
     # L14 : le catalogue des modèles a son point d'entrée public, comme les autres
     # (`ameesh models list|show|discover`) — sans cette ligne, la commande sortait en
     # code 2 « sous-commande inconnue » AVANT toute base (revue B5).

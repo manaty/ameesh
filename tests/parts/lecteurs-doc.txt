@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Lecteurs de la documentation (L161a) : les seuls modules que la CI passe sur
+# une PR de documentation seule (docs/, site/, *.md hors src/, tests/,
+# .github/ et examples/ ; scripts/version-only.py). Ils tournent sans base : leurs tests
+# Postgres sont sautés. Un module qui lit un fichier de docs/ ou site/ doit
+# figurer ici (tests/test_l161a_ci_sans_code.py le vérifie).
+#
+# Un module par ligne, dans l'ordre alphabétique, sa raison en commentaire.
+
+test_l162_tmpfs  # docs/ORCHESTRATEUR.md (consigne $TMPDIR)
+test_l33_chatbot  # docs/design et site/docs (index du chatbot), site/landing
+test_site_art  # site/landing/index.html

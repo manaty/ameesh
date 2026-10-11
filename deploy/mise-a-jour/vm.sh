@@ -10,9 +10,10 @@
 #
 #   verifier     contrôles, rien n'est modifié
 #   installer    code REF dans /opt/ameesh/src (détaché), installé dans
-#                /opt/ameesh/venv (dépendance psycopg comprise)
+#                /opt/ameesh/venv (dépendance psycopg comprise) ; refuse tant
+#                que la base du mesh n'a pas toutes les migrations de REF
 #   redemarrer   ameesh-runner@<persona>, une par une, chacune hors tour ;
-#                refuse tant que 0041 à 0047 ne sont pas passées (1.6.0)
+#                refuse tant que les migrations du code installé manquent
 #   controler    unités actives, journal récent, ameesh doctor sur le serveur
 #   retour       réinstalle le commit d'avant et redémarre
 #
@@ -45,20 +46,39 @@ mkdir -p "$TRAVAIL"; chmod 700 "$TRAVAIL"
 
 etape() { printf '\n== %s\n' "$*"; }
 ssh_vm() { ssh -o BatchMode=yes -o ConnectTimeout=10 "root@$VM" "$@"; }
+# Versions de migration du commit $1 (clone du serveur) absentes de la base
+# du mesh, une par ligne ; rien si toutes sont passées.
+migrations_absentes() {
+  local connues faites
+  connues=$(ssh_vm "git -C $SRC ls-tree --name-only '$1' src/ameesh/migrations/" \
+    | sed -nE 's#.*/0*([0-9]+)_[^/]*\.sql$#\1#p' | sort -n)
+  [ -n "$connues" ] || { echo "aucune migration lue dans $1" >&2; exit 1; }
+  faites=$(ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c 'SELECT version FROM schema_migrations'" | sort -n)
+  comm -23 <(sort <<<"$connues") <(sort <<<"$faites") | sort -n
+}
+exiger_migrations() {  # $1 : commit, $2 : ce qu'on s'apprête à faire
+  local absentes
+  absentes=$(migrations_absentes "$1" | tr '\n' ' ') || exit 1
+  [ -z "$absentes" ] && return 0
+  echo "migrations ${absentes}absentes de la base du mesh : lancer d'abord « poste.sh migrer » ($2 refusé)" >&2
+  exit 1
+}
 statut() {
   "$AMEESH" show "$1" --json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status") or "")'
 }
 
 verifier() {
+  local absentes
   etape "serveur"
   ssh_vm "hostname; echo \"code : \$(git -C $SRC rev-parse --short HEAD) ; installé : \$($VENV/bin/pip show ameesh | sed -n 's/^Version: //p')\""
   etape "exécuteurs du serveur"
   for p in $PERSONAS_VM; do
     echo "$p : $(ssh_vm "systemctl is-active ameesh-runner@$p" || true), statut $(statut "$p")"
   done
-  etape "migrations de la base du mesh (0041 à 0047 attendues après poste.sh migrer)"
-  ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c 'SELECT version FROM schema_migrations WHERE version >= 37 ORDER BY version'" | tr '\n' ' '; echo
+  etape "migrations du code installé absentes de la base du mesh"
+  absentes=$(migrations_absentes HEAD | tr '\n' ' ') || exit 1
+  echo "${absentes:-aucune}"
 }
 
 installer() {
@@ -77,6 +97,10 @@ installer() {
     ssh_vm "set -e; git -C $SRC fetch -q /tmp/ameesh.bundle refs/mise-a-jour/vm; rm -f /tmp/ameesh.bundle"
     rm -f "$TRAVAIL/ameesh.bundle"
   fi
+  # Le venv du serveur sert aussi les commandes des agents (mail send…) : le
+  # nouveau code n'y entre qu'une fois la base migrée (10/10, L151)
+  etape "migrations de ${sha:0:9} passées sur la base du mesh"
+  exiger_migrations "$sha" installer
   etape "extraction et installation dans $VENV"
   ssh_vm "set -e
     git -C $SRC checkout -q --detach '$sha'
@@ -88,11 +112,10 @@ installer() {
 }
 
 redemarrer() {
-  local n restantes suivantes debut=$SECONDS st
-  # 1.6.0 : le code écrit les colonnes de 0045 et 0047 à chaque relevé de
-  # l'hôte ; sans elles, l'exécuteur redémarré échouerait
-  n=$(ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c 'SELECT count(*) FROM schema_migrations WHERE version BETWEEN 41 AND 47'")
-  [ "$n" = 7 ] || { echo "migrations 0041 à 0047 incomplètes dans la base du mesh : lancer d'abord « poste.sh migrer »" >&2; exit 1; }
+  local restantes suivantes debut=$SECONDS st
+  # le code écrit ses nouvelles colonnes (relevé de l'hôte, tours) : sans
+  # elles, l'exécuteur redémarré échouerait
+  exiger_migrations "$(ssh_vm "git -C $SRC rev-parse HEAD")" redemarrer
   # shellcheck disable=SC2206
   restantes=($PERSONAS_VM)
   etape "exécuteurs du serveur (${#restantes[@]}), un par un hors tour"
@@ -135,7 +158,7 @@ retour() {
     git -C $SRC checkout -q --detach \"\$(cat $PRECEDENT)\"
     $VENV/bin/pip install -q --force-reinstall --no-deps $SRC
     echo \"code : \$(git -C $SRC rev-parse --short HEAD)\""
-  echo "base inchangée : 0041 à 0047 n'ajoutent que des colonnes et des tables, que l'ancien code ignore"
+  echo "base inchangée : les migrations passées avant l'installation sont additives, l'ancien code les ignore"
   redemarrer
 }
 

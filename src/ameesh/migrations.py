@@ -131,11 +131,7 @@ def check(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
     après application, versions appliquées inconnues de ce code — base plus
     récente que l'image, par exemple après un retour arrière).
     """
-    row = db.query("SELECT to_regclass('schema_migrations') IS NOT NULL AS ok")[0]
-    done: dict[int, str] = {}
-    if row.get("ok"):
-        done = {int(r["version"]): r["checksum"]
-                for r in db.query("SELECT version, checksum FROM schema_migrations")}
+    done = _applied_readonly(db)
     known = discover(directory)
     missing = [m for m in known if m.version not in done]
     modified = [m for m in known if m.version in done and done[m.version] != m.checksum]
@@ -144,6 +140,67 @@ def check(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
     return missing, modified, unknown
 
 
+#: Gestes qui cassent le code d'avant sur une base migrée (L151) : il lit ou
+#: écrit encore ce qui disparaît, change de type ou devient obligatoire. Une
+#: migration qui n'en contient aucun est « additive » : on peut l'appliquer
+#: AVANT d'installer le code qui l'apporte. Remplacer une contrainte (drop puis
+#: add) reste additif : les migrations du dépôt ne le font que pour l'élargir.
+_NON_ADDITIVE = (
+    (re.compile(r"\bdrop\s+(table|column|schema|type)\b"), "suppression (drop %s)"),
+    (re.compile(r"\brename\b"), "renommage"),
+    (re.compile(r"\balter\s+column\s+\S+\s+(set\s+data\s+)?type\b"),
+     "changement de type d'une colonne"),
+    (re.compile(r"\bset\s+not\s+null\b"), "colonne rendue obligatoire (set not null)"),
+    (re.compile(r"\btruncate\b"), "vidage (truncate)"),
+    (re.compile(r"\bdelete\s+from\b"), "suppression de lignes (delete)"),
+    (re.compile(r"\badd\s+column\s+(if\s+not\s+exists\s+)?[^,;]*?\bnot\s+null\b(?![^,;]*\bdefault\b)"),
+     "colonne obligatoire sans défaut (add column … not null)"),
+)
+#: une vue ou une fonction supprimée puis recréée dans la même migration
+#: (`r.*` figé à la création d'une vue) reste additive
+_DROP_RECREATED = re.compile(
+    r"\bdrop\s+(view|materialized\s+view|function)\s+(?:if\s+exists\s+)?([\w.\"]+)")
+#: marqueur explicite, pour ce que l'examen du texte ne voit pas (une
+#: contrainte resserrée, une fonction réécrite) : `-- ameesh: non additive`
+_MARKER = re.compile(r"--\s*ameesh\s*:\s*non[- ]additive", re.IGNORECASE)
+
+
+def non_additive(migration: Migration) -> list[str]:
+    """Raisons pour lesquelles `migration` casserait le code d'avant ; vide si
+    elle ne fait qu'ajouter (tables, colonnes nullables ou avec défaut, index,
+    contraintes remplacées)."""
+    reasons = []
+    if _MARKER.search(migration.sql):
+        reasons.append("marquée non additive")
+    # commentaires retirés : une explication qui cite « drop » ne compte pas
+    text = re.sub(r"--[^\n]*", " ", migration.sql)
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
+    text = re.sub(r"\s+", " ", text.lower())
+    for pattern, label in _NON_ADDITIVE:
+        match = pattern.search(text)
+        if match:
+            reasons.append(label % match.group(1) if "%s" in label else label)
+    for match in _DROP_RECREATED.finditer(text):
+        kind, name = match.group(1), match.group(2)
+        recreated = re.compile(r"\bcreate\s+(?:or\s+replace\s+)?%s\s+%s\b"
+                               % (r"\s+".join(kind.split()), re.escape(name)))
+        if not recreated.search(text, match.end()):
+            reasons.append("suppression (drop %s %s)" % (kind, name))
+    return reasons
+
+def _applied_readonly(db: PsqlDriver | PsycopgDriver) -> dict[int, str]:
+    """Versions appliquées et leur empreinte, sans `create table` : vide si
+    `schema_migrations` n'existe pas encore."""
+    row = db.query("SELECT to_regclass('schema_migrations') IS NOT NULL AS ok")[0]
+    if not row.get("ok"):
+        return {}
+    return {int(r["version"]): r["checksum"]
+            for r in db.query("SELECT version, checksum FROM schema_migrations")}
+
+
 def status(db: PsqlDriver | PsycopgDriver) -> tuple[list[Migration], set[int]]:
-    """(migrations connues, versions appliquées) — pour `agent-mesh doctor`."""
-    return discover(), set(applied(db))
+    """(migrations connues, versions appliquées) — pour `agent-mesh doctor`.
+
+    Lecture seule (L146) : `doctor` n'écrit rien, pas même la table du
+    registre des migrations (`applied()` la crée au besoin)."""
+    return discover(), set(_applied_readonly(db))

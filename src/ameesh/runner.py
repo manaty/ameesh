@@ -1164,7 +1164,10 @@ class AgentWorker(threading.Thread):
         """L40 (0030) : le tour qui commence compte pour les lots délégués à
         cet agent — le lot du tour et ceux de ses messages. Noté une fois par
         délégation (registre et journal du lot) : à l'échéance, le lot ne
-        reviendra pas au délégant. Jamais bloquant pour le tour."""
+        reviendra pas au délégant. L157 : le même tour date le début mesuré
+        des lots assignés à cet agent qui n'en ont pas. Jamais bloquant pour
+        le tour."""
+        from . import estimates
         from . import work as work_mod
 
         lots = {str(spec["lot"])} if spec.get("lot") else set()
@@ -1179,6 +1182,16 @@ class AgentWorker(threading.Thread):
         if marques:
             log_async("[%s] tour sur lot(s) délégué(s) : %s"
                       % (self.name, ", ".join("#%d" % i for i in marques)))
+        # L157 : le premier tour de l'assigné sur un lot date le début du
+        # travail (durée réelle = fusion − début), une seule fois
+        try:
+            debuts = estimates.mark_started(self.db, self.name, lots)
+        except (db_mod.DbError, ValueError) as exc:
+            log_async("[%s] début de lot non noté (%s)" % (self.name, exc))
+            return
+        if debuts:
+            log_async("[%s] début mesuré : %s"
+                      % (self.name, ", ".join("#%d" % i for i in debuts)))
 
     def lot_rotation_due(self, lot: str | None) -> bool:
         """Rotation au changement de lot due ? (politique `par-lot`)
@@ -3858,6 +3871,7 @@ class Runner:
                     log_async("lot #%s livré : %s%s" % (
                         entry["work_item"], entry["detail"],
                         " [dry-run]" if entry["result"] == "would-merge" else ""))
+            self.radar_once(db)
             return report
         except Exception as exc:  # jamais fatal pour l'exécuteur
             message = "relevé des branches impossible (%s : %s)" % (type(exc).__name__, exc)
@@ -3871,6 +3885,26 @@ class Runner:
                     db.close()
                 except Exception:
                     pass
+
+    def radar_once(self, db) -> None:
+        """L160b : un passage du radar de conflits, après le relevé des
+        branches, sur l'hôte qui déclare `radar.projects` ; journal seulement,
+        aucun courrier. Ne lève jamais."""
+        from . import radar
+        try:
+            if getattr(self, "_radar_cache", None) is None:
+                self._radar_cache = radar.Cache()
+            for line in radar.run_pass(self.cfg, db, cache=self._radar_cache):
+                if line["changes"] or line.get("error"):
+                    log_async("radar %s : %s" % (line["project"], line.get("error") or (
+                        "%d changement(s), %d paire(s) en conflit (%.1f s)" % (
+                            len(line["changes"]), line["summary"]["conflict"],
+                            line["duration_s"]))))
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            message = "radar impossible (%s : %s)" % (type(exc).__name__, exc)
+            if message != getattr(self, "_radar_error", None):
+                log_async(message)
+            self._radar_error = message
 
     def start_branch_sweep_poll(self) -> None:
         """Relevé périodique des branches (`AMEESH_BRANCH_SWEEP_INTERVAL`,

@@ -25,11 +25,13 @@
                                                 l'identité liée de la session, sinon « inconnu »)
   agent-mesh import-v0 [--agents a,b] [--dry-run]     bascule : boîte fichier v0 → Postgres
   agent-mesh export-v0 [--agents a,b] [--keep]        retour arrière : Postgres → boîte v0
-  agent-mesh migrate | doctor [--notify-test | --probe]
+  agent-mesh migrate [--dry-run | --additive-only]   --additive-only : rien si une migration n'est pas additive (L151)
+  agent-mesh doctor [--notify-test | --probe]
   agent-mesh canon check|show|sync [--json] [--host H]   canon OKF (spec §4)
   agent-mesh placement check [--agent A] [--json]        admissions et hôtes admissibles (C4)
   agent-mesh hosts [--json] [HÔTE] [--history N]         ressources des hôtes (L31)
   agent-mesh menage [--dry-run | --apply] [--json]       ménage des agents (L73)
+  agent-mesh conflicts [--project P] [--all] [--json]   radar de conflits entre lots (L160b)
   agent-mesh agent spawn <nom> --by <créateur> --ttl 2h   agent éphémère (R14)
 
 L'autorité du propriétaire ne se déduit jamais d'un texte : elle se prouve par
@@ -412,6 +414,12 @@ def _print_host_menage(menage: dict) -> None:
             wt.get("active", 0), len(wt.get("kept") or []),
             " : " + " ; ".join("%s (%s)" % (k["path"], k["detail"]) for k in wt["kept"][:5])
             if wt.get("kept") else ""))
+
+
+def cmd_conflicts(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh conflicts` (L160b) : voir `ameesh.radar.cmd_conflicts`."""
+    from . import radar
+    return radar.cmd_conflicts(cfg, args)
 
 
 def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
@@ -809,6 +817,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
+            # L157 : durée estimée, obligatoire pour un agent (refus AVANT la
+            # création), avertissement pour un humain
+            from . import estimates
+            minutes = estimates.parse(args.estimate) if args.estimate else None
+            warn_estimate = estimates.check(db, args.actor, minutes)
             check = (work.check_assignee(db, args.assignee, externe=args.externe, cfg=cfg)
                      if args.assignee else None)
             item = work.add(
@@ -816,12 +829,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 body=args.body or "", issue_ref=args.issue_ref, workstream=args.workstream,
                 assignee=args.assignee, budget_usd=args.budget, actor=args.actor,
                 package=args.package, externe=args.externe, cfg=cfg,
-                branch=args.branch, branch_target=args.target, priority=args.priority)
-            print("lot #%d créé en %s : %s%s%s" % (
+                branch=args.branch, branch_target=args.target, priority=args.priority,
+                estimate=minutes, estimate_source=args.estimate_source)
+            print("lot #%d créé en %s : %s%s%s%s" % (
                 item["id"], item["state"], item["title"],
                 " (plan : %s)" % item["package_id"] if item.get("package_id") else "",
                 " (priorité %s)" % work.PRIORITY_LABELS.get(item.get("priority"))
-                if item.get("priority") else ""))
+                if item.get("priority") else "",
+                " — estimé %s" % estimates.label(minutes) if minutes else ""))
+            if warn_estimate:
+                print("avertissement : %s" % estimates.missing(item["id"]), file=sys.stderr)
             _print_assignment(check)
             return 0
         if args.work_command == "assign":
@@ -931,6 +948,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             planned = (storage.of(db).roadmap.item_plans([args.id]) or [{}])[0]
             item["planned"] = {k: planned.get("planned_" + k)
                                for k in ("start", "end", "delivery", "source", "by")}
+            # L157 : durée estimée, réel mesuré, écart ; historique des estimations
+            from . import estimates
+            item["estimate"] = estimates.view(
+                item, merged_ts=(item["delays"] or {}).get("merged_ts"))
+            item["estimates"] = storage.of(db).work.estimates(args.id)
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
@@ -953,6 +975,17 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     item["planned"]["delivery"] or "—",
                     " (source : %s)" % item["planned"]["source"]
                     if item["planned"].get("source") else ""))
+            est = item["estimate"]
+            print("durée    : %s%s" % (est["label"], "".join([
+                " (source : %s)" % est["source"] if est.get("source") else "",
+                " — par %s, le %s" % (est["by"] or "?", _fmt_moment(est["at_ts"]))
+                if est.get("minutes") else "",
+                "" if est.get("started_ts") is None
+                else " — début mesuré %s" % _fmt_moment(est["started_ts"])])))
+            if len(item["estimates"]) > 1:
+                print("estimé   : %s" % " → ".join(
+                    "%s (%s)" % (estimates.label(e["minutes"]), e.get("estimated_by") or "?")
+                    for e in item["estimates"]))
             if item.get("state") == "closed":
                 print("fermé    : %s" % ("abandonné" if item.get("close_reason") == "abandoned"
                                          else "remplacé par #%s" % item.get("superseded_by")))
@@ -1142,9 +1175,9 @@ def cmd_export_v0(cfg: Config, args: argparse.Namespace) -> int:
 # migrations / diagnostic (délégués à la CLI agent-mail)
 # --------------------------------------------------------------------------
 
-def cmd_migrate(cfg: Config, _args: argparse.Namespace) -> int:
+def cmd_migrate(cfg: Config, args: argparse.Namespace) -> int:
     from . import cli
-    return cli.cmd_migrate(cfg)
+    return cli.cmd_migrate(cfg, dry_run=args.dry_run, additive_only=args.additive_only)
 
 
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
@@ -1524,6 +1557,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_menage.add_argument("--json", action="store_true", help="rapport `ameesh-menage/1`")
     p_menage.set_defaults(func=cmd_menage)
 
+    p_conflicts = sub.add_parser(
+        "conflicts", help="radar de conflits entre lots, dernier passage de cet hôte (L160b)")
+    p_conflicts.add_argument("--project", default="", help="un seul projet")
+    p_conflicts.add_argument("--all", action="store_true",
+                             help="aussi les paires qui se recouvrent sans conflit")
+    p_conflicts.add_argument("--json", action="store_true", help="rapport `ameesh-radar/1`")
+    p_conflicts.set_defaults(func=cmd_conflicts)
+
     p_models = sub.add_parser("models", help="catalogue des modèles (L14)")
     models_sub = p_models.add_subparsers(dest="models_command")
 
@@ -1623,6 +1664,11 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--priority", type=int, choices=list(work.PRIORITIES), default=None,
                         help="1 haute, 2 normale, 3 basse (L130 : toute demande d'un "
                              "humain devient un lot, avec sa priorité)")
+    pw_add.add_argument("--estimate", default=None, metavar="DURÉE",
+                        help="durée estimée du lot : 90m, 2h, 1h30, 1,5h, 2d (ou des "
+                             "minutes) — obligatoire pour un agent (L157)")
+    pw_add.add_argument("--estimate-source", default=None, metavar="SOURCE",
+                        help="d'où vient l'estimation (conception, historique bug ×1,3…)")
     pw_add.set_defaults(func=cmd_work)
     pw_list = work_sub.add_parser("list")
     pw_list.add_argument("--state", default=None)
@@ -1800,6 +1846,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.set_defaults(func=cmd_export_v0)
 
     p_mig = sub.add_parser("migrate")
+    p_mig.add_argument("--dry-run", action="store_true",
+                       help="migrations manquantes, additives ou non ; rien n'est écrit")
+    p_mig.add_argument("--additive-only", action="store_true",
+                       help="n'applique rien si une migration manquante n'est pas additive (L151)")
     p_mig.set_defaults(func=cmd_migrate)
     p_doc = sub.add_parser("doctor")
     p_doc.add_argument("--notify-test", action="store_true")
