@@ -265,6 +265,29 @@ class AlimentationTest(unittest.TestCase):
                          {"a": "agent-runner.service"})
         self.assertIsNone(hostcheck.runner_coverage(["a"], run=lambda *a: None))
 
+    def test_couverture_des_unites_systeme_du_serveur(self):
+        """L146 : sur le serveur du mesh, les personas tournent sous l'unité
+        SYSTÈME `ameesh-runner@<p>` ; sans gestionnaire utilisateur (None),
+        seules les unités système comptent."""
+        S = hostcheck.SYSTEM
+        unites = {
+            (S, "list-unit-files", "--type=service", "--no-legend", "--plain"):
+                "ameesh-runner@.service indirect enabled\n"
+                "ameesh-runner@ima.service enabled enabled\n",
+            (S, "show", "ameesh-runner@ima.service", "-p", "ExecStart", "--value"):
+                "argv[]=/opt/ameesh/venv/bin/agent-runner --foreground",
+            (S, "is-enabled", "ameesh-runner@mesh-design.service"): "enabled\n",
+            (S, "is-enabled", "ameesh-runner@deepseek7.service"): "disabled\n",
+        }
+        run = lambda *a: unites.get(a, "") if a[:1] == (S,) else None  # noqa: E731
+        self.assertEqual(
+            hostcheck.runner_coverage(["ima", "mesh-design", "deepseek7"], run=run),
+            {"ima": "ameesh-runner@ima.service",
+             "mesh-design": "ameesh-runner@mesh-design.service",
+             "deepseek7": None})
+        # une instance sans --agents ne mène que son agent, pas tous
+        self.assertEqual(hostcheck.runner_coverage(["autre"], run=run), {"autre": None})
+
 
 # --------------------------------------------------------------------------
 # exécuteur (base réelle)
@@ -631,6 +654,18 @@ class CoupureTest(PgTestCase):
         self.assertNotIn("avecunite", texte.split("systemctl")[0])
         self.assertIn("systemctl --user enable --now ameesh-runner-agent@sansunite.service",
                       texte)
+        # L146 : serveur du mesh — unité système, commande système
+        S = hostcheck.SYSTEM
+        unites = {
+            (S, "list-unit-files", "--type=service", "--no-legend", "--plain"):
+                "ameesh-runner@.service indirect enabled\n",
+            (S, "is-enabled", "ameesh-runner@avecunite.service"): "enabled\n",
+        }
+        lignes = hostcheck.missing_runner_lines(
+            self.cfg, self.db, run=lambda *a: unites.get(a, "") if a[:1] == (S,) else None)
+        texte = "\n".join(lignes)
+        self.assertNotIn("avecunite", texte.split("systemctl")[0])
+        self.assertIn("systemctl enable --now ameesh-runner@sansunite.service", texte)
 
     def test_doctor_harness(self):
         self.register("dsh1", "deepseek", cwd=self._cwd("dsh1"))
