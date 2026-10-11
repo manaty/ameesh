@@ -346,20 +346,22 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("coord", out)
         # contrat 1.1 : le fil est indexé depuis la session, auteur `agent:<nom>`
-        self.assertEqual(self.server.ops(), ["leases.state", "mailbox.send", "threads.index"])
+        self.assertEqual(self.server.ops(), ["leases.state", "agents.overview",
+                                             "mailbox.send", "threads.index"])
         index = [r for r in self.session_requests() if r["body"]["op"] == "threads.index"][0]
         self.assertEqual(index["body"]["kwargs"]["author"], "agent:inge-front")
         self.assertEqual(index["body"]["fence"]["epoch"], 42)
         req = [r for r in self.session_requests() if r["body"]["op"] == "mailbox.send"][-1]
         self.assertEqual(req["body"]["args"][:2], ["inge-front", "coord"])
         self.assertTrue(req["headers"].get(C.IDEMPOTENCY_HEADER))
+        self.assert_session_only()
 
     def test_new_work_item_refused_before_mail_is_sent(self):
         code, _out, err = self.ameesh("mail", "send", "coord", "Review the change.",
                                      "--new-lot", "Review", "--estimate", "1h")
         self.assertEqual(code, 2)
         self.assertIn("mediated contract 1.1", err)
-        self.assertEqual(self.server.ops(), ["leases.state"])
+        self.assertEqual(self.server.ops(), ["leases.state", "agents.overview"])
         self.assert_session_only()
 
     def test_hook_remet_par_la_session(self):
@@ -376,6 +378,18 @@ class SessionTest(unittest.TestCase):
         reserve = [r for r in self.session_requests() if r["body"]["op"] == "mailbox.reserve"]
         self.assertEqual(reserve[0]["body"]["fence"],
                          {"agent": "inge-front", "owner": OWNER, "epoch": 42})
+        self.assert_session_only()
+
+    def test_foreign_harness_hook_leaves_mediated_mail_pending(self):
+        self.responder.script["mailbox.reserve"] = []
+        with mock.patch.dict(os.environ, {"AMEESH_HARNESS": "claude"}):
+            code, out, err = self.ameesh("mail", "hook", "codex", stdin=json.dumps({
+                "hook_event_name": "Stop", "session_id": "foreign-session"}))
+        self.assertEqual((code, out), (0, ""))
+        self.assertIn("codex", err)
+        self.assertNotIn("mailbox.reserve", self.server.ops())
+        self.assertNotIn("mailbox.deliver", self.server.ops())
+        self.assertNotIn("agents.upsert", self.server.ops())
         self.assert_session_only()
 
     def test_hook_bail_invalide_ne_touche_a_rien(self):
