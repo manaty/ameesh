@@ -18,6 +18,7 @@ de session) est un numéro, ou une étiquette qui désigne UN SEUL lot ouvert
 from __future__ import annotations
 
 from .. import interface
+from .mailbox import DEAD_LETTERS_SQL
 
 #: états de lot terminés (même liste que `work_items` ailleurs)
 _CLOSED = "('merged', 'promoted', 'closed')"
@@ -129,15 +130,21 @@ WITH unread AS (
      WHERE w.state NOT IN __CLOSED__
      ORDER BY w.updated_at DESC, w.id DESC
      LIMIT %s
+), dead AS (
+    -- courrier en souffrance : destinataire inconnu du registre ou arrêté
+    __DEAD__
 )
 SELECT (SELECT coalesce(json_agg(agents ORDER BY agents.name), '[]'::json) FROM agents)
            AS agents,
        (SELECT coalesce(json_agg(lots ORDER BY lots.updated_ts DESC, lots.id DESC),
-                        '[]'::json) FROM lots) AS lots
+                        '[]'::json) FROM lots) AS lots,
+       (SELECT coalesce(json_agg(dead ORDER BY dead.recipient, dead.sender), '[]'::json)
+          FROM dead) AS dead_letters
 """.replace("__SESSION_REF__", _lot_ref("r.session_work_item")) \
   .replace("__MAIL_REF__", _lot_ref("c.ref")) \
   .replace("__CITED_SCAN__", str(CITED_SCAN)) \
-  .replace("__CLOSED__", _CLOSED)
+  .replace("__CLOSED__", _CLOSED) \
+  .replace("__DEAD__", DEAD_LETTERS_SQL.strip())
 
 
 class Projects(interface.Projects):
@@ -145,4 +152,5 @@ class Projects(interface.Projects):
     def board(self, *, max_lots) -> dict:
         rows = self.db.query(_BOARD_SQL, (int(max_lots),))
         row = rows[0] if rows else {}
-        return {"agents": list(row.get("agents") or []), "lots": list(row.get("lots") or [])}
+        return {"agents": list(row.get("agents") or []), "lots": list(row.get("lots") or []),
+                "dead_letters": list(row.get("dead_letters") or [])}

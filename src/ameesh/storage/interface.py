@@ -59,7 +59,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    turn_costs      last_reading insert spent ledger correct
    mailbox         send unread unread_urgent get mark_delivered reserve deliver release
                    unread_counts history pending_recipients
-                   pending_recipients_sorted unread_total
+                   pending_recipients_sorted unread_total dead_letters forward
    wakeups         subscribe notify
    keys            info register revoke registered
    approvals       create recent candidates consume
@@ -651,6 +651,22 @@ class Mailbox(Domain):
     @abc.abstractmethod
     def unread_total(self) -> int:
         """Nombre de messages non remis, tous destinataires confondus (`doctor`)."""
+
+    @abc.abstractmethod
+    def dead_letters(self) -> list[dict]:
+        """Courrier en souffrance : non remis, dont le destinataire est absent du
+        registre ou arrêté. Une ligne par (destinataire, expéditeur) :
+        `recipient`, `sender`, `n`, `oldest_ts`, `newest_ts`, `unknown`."""
+
+    @abc.abstractmethod
+    def forward(self, old: str, new: str, by: str) -> list[dict]:
+        """Re-livre à `new`, en UNE transaction, les messages non remis de `old`
+        (hors réservation active) : une copie garde expéditeur, corps, nature,
+        charge, lot, hôte et date d'origine (`meta.forwarded_from` : agent,
+        message, auteur du renvoi ; la signature, qui couvre le destinataire,
+        ne suit pas) ; l'original passe remis, renvoi noté (`meta.forwarded`).
+        Rend une ligne par message renvoyé : `original_id`, `new_id`,
+        `sender`, `kind`, `work_item_id`, `created_ts`."""
 
 
 # --------------------------------------------------------------------------
@@ -1507,7 +1523,7 @@ class Projects(Domain):
 
     @abc.abstractmethod
     def board(self, *, max_lots: int) -> dict:
-        """`{"agents": [...], "lots": [...]}`.
+        """`{"agents": [...], "lots": [...], "dead_letters": [...]}`.
 
         `agents` : un élément par agent du registre — name, chantier, team,
         harness, host, provider, credential_mode, status, status_text, mode,
@@ -1523,7 +1539,10 @@ class Projects(Domain):
         `lots` : les lots OUVERTS (ni `merged`, ni `promoted`, ni `closed`),
         au plus `max_lots`, les plus récemment modifiés d'abord — id, title,
         state, app, workstream, package_team, assignee, updated_ts ; chaque
-        élément porte `total` (avant la borne)."""
+        élément porte `total` (avant la borne).
+
+        `dead_letters` : le courrier en souffrance, comme
+        `mailbox.dead_letters` (une ligne par destinataire et expéditeur)."""
 
 
 # --------------------------------------------------------------------------

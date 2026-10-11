@@ -302,6 +302,7 @@ class L41LiaisonsTest(PgTestCase):
 
     def test_agent_mail_name_reste_prioritaire(self):
         self.bind("alpha", "--session", "s-1", "--harness", "claude")
+        registry.upsert(self.db, "gamma", harness="claude", host=self.cfg.host)
         self.send("gamma", "Pour gamma.")
         self.send("alpha", "Pour alpha.")
         proc = self.hook("s-1", env=self.env(AGENT_MAIL_NAME="gamma"))
@@ -331,6 +332,7 @@ class L41LiaisonsTest(PgTestCase):
         proc = self.cli("whoami", "--cwd", self.tmp, env=env)
         self.assertIn("non autoritaire", proc.stdout)
         # une commande lancée dans la session liée parle en son nom
+        registry.upsert(self.db, "beta", harness="codex", host=self.cfg.host)
         proc = self.cli("send", "beta", "Réponse d'alpha.", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         [row] = self.db.query("SELECT sender FROM agent_mailbox WHERE recipient = 'beta'")
