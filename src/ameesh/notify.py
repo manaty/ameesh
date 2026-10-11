@@ -104,7 +104,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # #411: Docker storage needs an explicit owner cleanup decision.
                  "docker_orphan_volumes", "docker_build_cache", "docker_storage_unavailable",
                  # L242b : un agent critique est en pause budget
-                 "critical_budget_pause")
+                 "critical_budget_pause",
+                 # L160e2: a merge queue no longer moves
+                 "merge_blocked")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -176,6 +178,7 @@ TYPE_LABELS = {
     "waiting_without_question": "lot waiting for the owner with no question asked",
     # L159e6: not pushed by default (add it to `notify.types`)
     "guard_restart": "agents started again by the capacity guard",
+    "merge_blocked": "merge queue blocked",
 
     "module_deviation": "module procedure deviation",
     "critical_budget_pause": "critical agent paused on budget",

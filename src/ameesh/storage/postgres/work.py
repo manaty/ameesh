@@ -737,6 +737,30 @@ class WorkItems(interface.WorkItems):
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
             return True
 
+    def land_lock(self, key, owner, ttl_s, *, epoch=None) -> int | None:
+        if epoch is not None:  # renewal: only the holder, at its epoch
+            rows = self.db.query(
+                "UPDATE merge_locks SET expires_at = now() + %s * interval '1 second'"
+                " WHERE target = %s AND owner = %s AND epoch = %s RETURNING epoch",
+                (float(ttl_s), key, owner, int(epoch)))
+            return int(rows[0]["epoch"]) if rows else None
+        rows = self.db.query(
+            "INSERT INTO merge_locks (target, owner, epoch, expires_at)"
+            " VALUES (%s, %s, 1, now() + %s * interval '1 second')"
+            " ON CONFLICT (target) DO UPDATE SET owner = excluded.owner,"
+            "   epoch = merge_locks.epoch + 1, expires_at = excluded.expires_at"
+            " WHERE merge_locks.owner IS NULL OR merge_locks.expires_at < now()"
+            "    OR merge_locks.owner = excluded.owner"
+            " RETURNING epoch", (key, owner, float(ttl_s)))
+        return int(rows[0]["epoch"]) if rows else None
+
+    def land_unlock(self, key, owner, epoch) -> bool:
+        rows = self.db.query(
+            "UPDATE merge_locks SET owner = NULL, expires_at = NULL"
+            " WHERE target = %s AND owner = %s AND epoch = %s RETURNING target",
+            (key, owner, int(epoch)))
+        return bool(rows)
+
     def queue(self, target=None) -> list[dict]:
         return self.db.query(
             "SELECT %s FROM merge_queue q JOIN work_items w ON w.id = q.work_item_id"

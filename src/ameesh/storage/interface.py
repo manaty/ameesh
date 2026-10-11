@@ -1072,6 +1072,18 @@ class WorkItems(Domain):
         """L160e (0058): takes the lot out of the queue, with a journal line."""
 
     @abc.abstractmethod
+    def land_lock(self, key: str, owner: str, ttl_s: float, *,
+                  epoch: int | None = None) -> int | None:
+        """L160e2 (0058): takes (or, with its `epoch`, renews) the merge lease
+        of `key` (project and target) for `owner`; returns its epoch, None if
+        another owner holds a lease that has not expired. Its own owner takes it
+        again at a new epoch (an executor restarted mid-landing)."""
+
+    @abc.abstractmethod
+    def land_unlock(self, key: str, owner: str, epoch: int) -> bool:
+        """L160e2 (0058): frees the lease, if still held at that epoch."""
+
+    @abc.abstractmethod
     def queue(self, target: str | None = None) -> list[dict]:
         """L160e (0058): the queue rows (of `target`, else every target),
         ranked first, then by arrival."""

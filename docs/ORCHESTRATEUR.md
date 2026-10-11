@@ -336,8 +336,16 @@ précèdent, plus celui-ci) et en sort un lot dont un conflit n'est couvert par
 aucune résolution, ou dont la branche a bougé après le gel ; son agent est
 prévenu. On fusionne le lot de rang 1 (`ameesh work queue show`), puis le
 suivant. Un lot en file ne reçoit plus de commit : `ameesh work queue remove
-<id>` d'abord. La fusion par ameesh elle-même (`ameesh work land`) vient
-avec L160e2.
+<id>` d'abord.
+
+Un projet qui déclare `land` dans `radar.projects` (`local` ou `pr`, avec
+ses portes) est fusionné par ameesh : l'exécuteur prend la tête de file,
+fusionne dans son clone avec les résolutions préparées, lance les portes,
+pousse sans forcer (ou fusionne la PR une fois la CI verte) et prévient
+dans le fil du lot. Un échec sort le lot de la file et réveille son agent ;
+l'alerte `merge_blocked` dit qu'une tête de file n'avance plus depuis
+30 min. Sans `land` (réglage par défaut), on fusionne soi-même le lot de
+rang 1.
 
 ## Le lot en cours
 

@@ -474,6 +474,7 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
     ejected: set = set()
     by_target: dict = {}
     live = []
+    landing: dict = {}
     for row in mine:
         if row.get("item_state") in work.MERGED_STATES:
             storage.of(db).work.queue_update(int(row["work_item_id"]), state="landed",
@@ -522,6 +523,11 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         if head is None:
             defer(row, "target %s not found on %s" % (row["target"], place))
             continue
+        if row["state"] == "landing" and (_same(tip, row["frozen_sha"])
+                                          or _same(tip, row.get("landing_sha"))):
+            # being merged by ameesh (L160e2): its branch may hold the merge commit
+            landing.setdefault(row["target"], []).append(row)
+            continue
         if not _same(tip, row["frozen_sha"]):
             reason = "branch moved past its freeze (%s, frozen %s)" % (
                 tip[:12], row["frozen_sha"][:12])
@@ -558,14 +564,22 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         by_target.setdefault(row["target"], []).append(dict(row, tip=tip, target_head=head))
     try:
         resolution_rows = storage.of(db).work.resolutions(
-            [int(r["work_item_id"]) for rs in by_target.values() for r in rs]) \
+            [int(r["work_item_id"]) for rs in list(by_target.values()) + list(landing.values())
+             for r in rs]) \
             if by_target else []
     except Exception:  # noqa: BLE001 - database without 0057: no replay
         resolution_rows = []
     stacks = getattr(cache, "stacks", None) if cache is not None else None
     stacks = {} if stacks is None else stacks
+    for target in sorted(set(landing) - set(by_target)):
+        out["targets"][target] = [{"lot": int(r["work_item_id"]), "rank": 1, "state": "landing",
+                                   "reason": r.get("reason") or "", "stack": None}
+                                  for r in landing[target]]
     for target, entries in sorted(by_target.items()):
         ranked = order(entries, pairs)
+        first = len(landing.get(target) or ())
+        for one in ranked:
+            one["rank"] += first
         rows_by_id = {int(e["work_item_id"]): e for e in entries}
         for one in ranked:
             row = rows_by_id[one["work_item"]]
@@ -576,19 +590,22 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
         result: dict = {}
         if len(heads) == 1:
             commits = tuple(sorted(r["commit_sha"] for r in resolution_rows))
-            key = (heads.pop(), tuple((o["work_item"], rows_by_id[o["work_item"]]["tip"])
-                                      for o in ranked), commits)
+            # a lot being landed goes first: the lots behind it merge after it
+            stacked = [{"work_item": int(r["work_item_id"]), "tip": r["frozen_sha"]}
+                       for r in landing.get(target) or ()] + \
+                [{"work_item": o["work_item"], "tip": rows_by_id[o["work_item"]]["tip"]}
+                 for o in ranked]
+            key = (heads.pop(), tuple((o["work_item"], o["tip"]) for o in stacked), commits)
             if key not in stacks:
                 try:
                     replayer.ensure()
-                    stacks[key] = stack(replayer, key[0],
-                                        [{"work_item": o["work_item"],
-                                          "tip": rows_by_id[o["work_item"]]["tip"]}
-                                         for o in ranked], resolution_rows)
+                    stacks[key] = stack(replayer, key[0], stacked, resolution_rows)
                 except (GitError, OSError) as exc:
                     stacks[key] = {"error": "%s: %s" % (type(exc).__name__, exc)}
             result = stacks[key]
-        listed = []
+        listed = [{"lot": int(r["work_item_id"]), "rank": 1, "state": "landing",
+                   "reason": r.get("reason") or "", "stack": None}
+                  for r in landing.get(target) or ()]
         for one in ranked:
             row = rows_by_id[one["work_item"]]
             trial = result.get(one["work_item"]) if isinstance(result, dict) else None

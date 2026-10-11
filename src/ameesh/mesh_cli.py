@@ -23,6 +23,7 @@
   agent-mesh work migration <id> [--number N | --release]   reserve the work item's migration number (L122)
   agent-mesh work resolve <id> --with <other> [--done | --abort]   prepared conflict resolution (L160d)
   agent-mesh work queue add|remove <id> | show [--target T]   merge queue per target (L160e)
+  agent-mesh work land <id> [--project P]   land the queue head now (L160e2)
   agent-mesh work move <id> merged --correct "reason"   correct a promoted state set by mistake
                                                 (the actor of work commands: --actor, otherwise
                                                 the session's bound identity, otherwise "inconnu")
@@ -1137,6 +1138,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "queue":   # merge queue per target (L160e)
             from . import merge_queue
             return merge_queue.run(cfg, db, args)
+        if args.work_command == "land":   # merge of the head of the queue (L160e2)
+            from . import land
+            return land.run(cfg, db, args)
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
@@ -2215,6 +2219,8 @@ def build_parser() -> argparse.ArgumentParser:
     resolutions.add_parser(work_sub, cmd_work)  # prepared conflict resolutions (L160d)
     from . import merge_queue
     merge_queue.add_parser(work_sub, cmd_work)  # merge queue per target (L160e)
+    from . import land
+    land.add_parser(work_sub, cmd_work)  # merge of the head of the queue (L160e2)
 
     p_cost = sub.add_parser("cost", help="turn costs and plan gauges (L12)")
     cost_sub = p_cost.add_subparsers(dest="cost_command")

@@ -47,6 +47,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -57,7 +58,12 @@ from .canon import GIT_TIMEOUT, GitError, _git, _git_env
 
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
-PROJECT_KEYS = ("repo", "migrations", "target", "github")
+PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method")
+#: L160e2: who merges the head of the queue — nobody (`off`: the agent or the
+#: orchestrator), ameesh by a local merge pushed to the target, or ameesh
+#: through the PR (target merged into the lot branch, CI, PR merged by the API)
+LAND_MODES = ("off", "local", "pr")
+MERGE_METHODS = ("merge", "squash", "rebase")
 #: une migration numérotée : `NNNN_nom.sql`
 MIGRATION_RE = re.compile(r"^([0-9]{4})_[^/]+$")
 #: paires gardées au plus dans le cache d'un exécuteur
@@ -81,6 +87,11 @@ class Project:
     migrations: str = ""
     target: str = ""
     github: str = ""
+    #: L160e2: `off` (default), `local` or `pr`; the commands run on the merged
+    #: tree before it is pushed; how a PR is merged
+    land: str = "off"
+    gates: tuple = ()
+    merge_method: str = "merge"
 
 
 @dataclass
@@ -129,9 +140,26 @@ def parse_settings(raw) -> Settings:
             plan_git.check_ref(texts["target"], "cible")
         if texts["github"] and not _GITHUB_RE.match(texts["github"]):
             raise SettingsError("%s.github: \"owner/repo\" repository expected" % where)
+        land = value.get("land") or "off"
+        if land not in LAND_MODES:
+            raise SettingsError("%s.land: %s expected" % (where, " | ".join(LAND_MODES)))
+        method = value.get("merge_method") or "merge"
+        if method not in MERGE_METHODS:
+            raise SettingsError("%s.merge_method: %s expected"
+                                % (where, " | ".join(MERGE_METHODS)))
+        gates = value.get("gates") or ()
+        if isinstance(gates, str):
+            gates = (gates,)
+        if not isinstance(gates, (list, tuple)) or not all(
+                isinstance(g, str) and g.strip() for g in gates):
+            raise SettingsError("%s.gates: a list of commands expected" % where)
+        if land != "off" and not gates:
+            raise SettingsError("%s.gates: a project that ameesh lands (land %s) declares "
+                                "its gates, run on the merged tree" % (where, land))
         projects[name] = Project(name=name, repo=os.path.expanduser(repo.strip()),
                                  migrations=texts["migrations"], target=texts["target"],
-                                 github=texts["github"])
+                                 github=texts["github"], land=land,
+                                 gates=tuple(g.strip() for g in gates), merge_method=method)
     return Settings(projects=projects)
 
 
@@ -217,8 +245,9 @@ class Cache:
         # L160d: change sizes for the resolver, replays of prepared resolutions
         self.sizes: dict = {}
         self.replays: dict = {}
-        # L160e: stacked replays of the merge queues
+        # L160e: stacked replays of the merge queues; merge leases held (L160e2)
         self.stacks: dict = {}
+        self.locks: dict = {}
 
     def trim(self) -> None:
         for table in (self.merges, self.diffs, self.sizes, self.replays, self.stacks):
@@ -399,7 +428,7 @@ def write_journal(cfg, project: str, report: dict) -> dict:
 
 
 def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None = None,
-             now=time.time, ci="github") -> list[dict]:
+             now=time.time, ci="github", owner: str | None = None) -> list[dict]:
     """Un passage du radar sur les projets déclarés par l'hôte ; rend la ligne
     de journal de chacun, avec ses envois (`mail`, L160c). `ci` : la fonction
     `branche -> {number, green} | None`, par défaut lue sur GitHub."""
@@ -421,11 +450,13 @@ def run_pass(cfg, db, *, cache: Cache | None = None, settings: Settings | None =
         if not error:
             annotate_resolutions(cfg, db, project, report, lots, cache)
             report["queue"] = run_queue(cfg, db, project, report, cache)
+            if project.land != "off":
+                report["land"] = run_land(cfg, db, project, report, cache, owner)
         report.update(schema=SCHEMA, project=project.name, ts=started,
                       duration_s=round(now() - started, 3), error=error)
         line = write_journal(cfg, project.name, report)
         sent = [] if error else send_mail(cfg, db, project, report, ci=ci)
-        lines.append(dict(line, project=project.name, mail=sent))
+        lines.append(dict(line, project=project.name, mail=sent, land=report.get("land") or []))
     return lines
 
 
@@ -466,6 +497,19 @@ def run_queue(cfg, db, project: Project, report: dict, cache: Cache | None) -> d
         return merge_queue.run_pass(cfg, db, project, report, cache=cache)
     except Exception as exc:  # noqa: BLE001 - never fatal for the pass
         return {"targets": {}, "mail": [], "error": "%s: %s" % (type(exc).__name__, exc)}
+
+
+def run_land(cfg, db, project: Project, report: dict, cache: Cache | None,
+             owner: str | None) -> list[dict]:
+    """L160e2: ameesh merges the head of each queue (`ameesh.land.run_pass`).
+    Never raises."""
+    from . import land
+    owner = owner or "%s:%d" % (socket.gethostname(), os.getpid())
+    try:
+        return land.run_pass(cfg, db, project, report, owner=owner,
+                             locks=cache.locks if cache is not None else None)
+    except Exception as exc:  # noqa: BLE001 - never fatal for the pass
+        return [{"result": "error", "error": "%s: %s" % (type(exc).__name__, exc)}]
 
 
 # --------------------------------------------------------------------------
@@ -787,6 +831,10 @@ def render(report: dict, *, everything: bool = False) -> list[str]:
                           " (éjecté)" if one["state"] == "ejected" else
                           " (rejouée)" if (one.get("stack") or {}).get("state") == "replayed"
                           else "") for one in listed) or "vide"))
+    for one in report.get("land") or ():
+        out.append("  fusion   %s : %s%s" % (_lot(one["lot"]) if one.get("lot") else "—",
+                                             one["result"], " (%s)" % one["error"]
+                                             if one.get("error") else ""))
     for one in report.get("skipped") or ():
         out.append("  skipped  %s %s: %s" % (_lot(one["work_item"]), one["branch"],
                                              one["reason"]))
