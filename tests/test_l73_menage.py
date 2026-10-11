@@ -4,12 +4,16 @@ agent, caches partagés bornés, worktrees retirés en fin de lot, /tmp signalé
 (jamais supprimé), mesure du tmpfs et contre-pression, `ameesh menage`."""
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import json
 import os
 import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from ameesh import canon, containers, exploitation, menage, registry, resources, storage, work
 
@@ -582,7 +586,8 @@ class MenageDbTest(PgTestCase):
         os.utime(menage.agent_tmp(self.cfgl, pol, "parti"), (ancien, ancien))
         pnpm = os.path.join(menage.cache_root(self.cfgl, pol), "pnpm", "v3", "f")
         _write(pnpm, 5000, age_s=7200)
-        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", busy=True)
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", busy=True,
+                                  now=time.time() + 3 * 3600)
         self.assertFalse(os.path.exists(menage.agent_tmp(self.cfgl, pol, "parti")))
         self.assertTrue(os.path.exists(menage.agent_tmp(self.cfgl, pol, "a1")))
         self.assertTrue(os.path.exists(pnpm))
@@ -665,11 +670,9 @@ class MenageDbTest(PgTestCase):
     def test_cli_essai_par_defaut_apply_refuse_a_un_agent(self):
         pol = menage.Policy()
         cfg_state = self.cfgl
-        # L219: same mesh as the CLI (owner file), idle for 3 h
+        # L219: same mesh as the CLI (owner file)
         cfg_state.dsn, cfg_state.schema = self.cfg.dsn, self.cfg.schema
-        parti = menage.turn_env(cfg_state, pol, "parti", {})["TMPDIR"]
-        ancien = time.time() - 3 * 3600
-        os.utime(parti, (ancien, ancien))
+        menage.turn_env(cfg_state, pol, "parti", {})
         proc = self.mesh("menage")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("ESSAI", proc.stdout)
@@ -678,9 +681,20 @@ class MenageDbTest(PgTestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("refus", proc.stderr)
         self.assertTrue(os.path.exists(menage.agent_tmp(cfg_state, pol, "parti")))
-        proc = self.mesh("menage", "--apply", "--json", "--by", "human:test")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        rapport = json.loads(proc.stdout)
+        # L219: the CLI's pass, 3 h later (an orphan directory is judged on
+        # its mtimes AND ctimes, which no test can set back)
+        class _Plus3h:
+            def __getattr__(self, name):
+                return getattr(time, name)
+
+            def time(self):
+                return time.time() + 3 * 3600
+        args = argparse.Namespace(apply=True, dry_run=False, json=True, by="human:test")
+        out = io.StringIO()
+        with mock.patch.object(menage, "time", _Plus3h()), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(menage.cmd_menage(self.cfg, args), 0)
+        rapport = json.loads(out.getvalue())
         self.assertEqual(rapport["schema"], "ameesh-menage/1")
         self.assertFalse(os.path.exists(menage.agent_tmp(cfg_state, pol, "parti")))
         journal = storage.of(self.db).housekeeping.recent(None, 3600)

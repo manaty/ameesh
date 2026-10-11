@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import time
 import unittest
+from unittest import mock
 
 from ameesh import menage, registry
 
@@ -37,8 +38,8 @@ def _write(path: str, age_s: float = 0.0) -> None:
 
 def _age(directory: str, age_s: float) -> None:
     at = time.time() - age_s
-    for root, dirs, files in os.walk(directory):
-        for name in files:
+    for root, dirs, files in os.walk(directory, topdown=False):
+        for name in files + dirs:
             os.utime(os.path.join(root, name), (at, at))
     os.utime(directory, (at, at))
 
@@ -94,8 +95,7 @@ class OrphanTmpTest(PgTestCase):
         report = self._pass()
         self.assertTrue(os.path.isdir(legacy))
         self.assertTrue(any("sans propriétaire" in s for s in report["skipped"]))
-        _age(legacy, 25 * HOUR)
-        self._pass()
+        self._pass(later=25 * HOUR)
         self.assertFalse(os.path.exists(legacy))
 
     def test_unowned_directory_of_a_registered_name_is_not_evicted(self):
@@ -123,8 +123,7 @@ class OrphanTmpTest(PgTestCase):
         report = self._pass()
         self.assertTrue(os.path.isdir(gone))                 # written just now
         self.assertTrue(any("actif il y a" in s for s in report["skipped"]))
-        _age(gone, 3 * HOUR)
-        report = self._pass()
+        report = self._pass(later=3 * HOUR)
         self.assertFalse(os.path.exists(gone))
         self.assertFalse(os.path.exists(menage.owner_file(
             menage.tmp_root(self.mine, self.pol), "parti")))
@@ -171,12 +170,12 @@ class OrphanTmpTest(PgTestCase):
         mine = turn.env["TMPDIR"]
         _write(os.path.join(mine, "f"))
         _age(mine, 3 * HOUR)
-        report = self._pass()
+        report = self._pass(later=3 * HOUR)
         self.assertTrue(os.path.isdir(mine))
         self.assertTrue(any("verrou" in s for s in report["skipped"]))
         turn.end(lot=None, turn_id="t")
         _age(mine, 3 * HOUR)
-        self._pass()
+        self._pass(later=3 * HOUR)
         self.assertFalse(os.path.exists(mine))
 
     def test_quota_spares_an_agent_with_a_live_lease(self):
@@ -217,6 +216,102 @@ class OrphanTmpTest(PgTestCase):
         self.assertTrue(os.path.isdir(gone))
 
 
+    # -- second review of #176 ------------------------------------------------
+
+    def _hold_exclusive(self, cfg, agent):
+        troot = menage.tmp_root(cfg, self.pol)
+        return menage.tmp_lock(troot, menage.tmp_name(troot, agent, menage.mesh_key(cfg)),
+                               exclusive=True)
+
+    def test_turn_without_its_lock_gets_a_fallback_directory(self):
+        # point 1: a pass holds the lock beyond the wait
+        own = self._tmp(self.mine, "a1")
+        _write(os.path.join(own, "f"))
+        held = self._hold_exclusive(self.mine, "a1")
+        with mock.patch.object(menage, "LOCK_WAIT_S", 0.1), \
+                mock.patch.object(menage, "CLEAR_WAIT_S", 0.1):
+            turn = menage.Turn.begin(self.mine, self.pol, "a1", None, new_session=True,
+                                     base_env={})
+        held.close()
+        try:
+            other = turn.env["TMPDIR"]
+            self.assertNotEqual(other, own)
+            self.assertTrue(os.path.basename(other).startswith("a1" + menage.FALLBACK_SEP))
+            self.assertTrue(os.path.exists(os.path.join(own, "f")))
+            # the fallback directory is locked too
+            report = self._pass(later=3 * HOUR)
+            self.assertTrue(os.path.isdir(other))
+            self.assertTrue(any("verrou" in s for s in report["skipped"]))
+        finally:
+            turn.end(lot=None, turn_id="t")
+        self._pass(later=3 * HOUR)                       # used once: deleted once idle
+        self.assertFalse(os.path.exists(other))
+        self.assertTrue(os.path.isdir(own))
+
+    def test_attach_session_holds_the_lock(self):
+        # point 1: `ameesh attach` (runner._attach_tmp_env)
+        from ameesh import runner
+        holds: list = []
+        env = runner._attach_tmp_env(self.mine, "parti", {}, holds)
+        try:
+            _write(os.path.join(env["TMPDIR"], "f"))
+            report = self._pass(later=3 * HOUR)
+            self.assertTrue(os.path.isdir(env["TMPDIR"]))
+            self.assertTrue(any("verrou" in s for s in report["skipped"]))
+        finally:
+            for hold in holds:
+                hold.release()
+        self._pass(later=3 * HOUR)
+        self.assertFalse(os.path.exists(env["TMPDIR"]))
+
+    def test_turn_end_evicts_under_its_lock(self):
+        # point 2: nobody may take the directory between release and eviction
+        turn = menage.Turn.begin(self.mine, self.pol, "a1", None, new_session=False,
+                                 base_env={})
+        seen = []
+        real = menage.evict_lru
+
+        def evict(directories, root, *a, **kw):
+            lock = self._hold_exclusive(self.mine, "a1")
+            seen.append(lock is None)
+            if lock is not None:
+                lock.close()
+            return real(directories, root, *a, **kw)
+        with mock.patch.object(menage, "evict_lru", evict):
+            turn.end(lot=None, turn_id="t")
+        self.assertEqual(seen, [True])
+        self.assertIsNotNone(self._hold_exclusive(self.mine, "a1"))   # released after
+
+    def test_recent_extraction_with_old_mtimes_is_active(self):
+        # point 3: mtimes kept by an extraction, ctime of now
+        gone = self._tmp(self.mine, "parti")
+        _write(os.path.join(gone, "archive", "f"))
+        _age(gone, 3 * HOUR)
+        report = self._pass()
+        self.assertTrue(os.path.isdir(gone))
+        self.assertTrue(any("actif il y a" in s for s in report["skipped"]))
+
+    def test_adopted_directory_is_never_emptied(self):
+        # point 5: found without owner file (another mesh's, older version)
+        troot = menage.tmp_root(self.mine, self.pol)
+        self._tmp(self.mine, "b")
+        legacy = os.path.join(troot, "a1")
+        _write(os.path.join(legacy, "theirs.txt"))
+        for _session in range(2):
+            turn = menage.Turn.begin(self.mine, self.pol, "a1", None, new_session=True,
+                                     base_env={})
+            turn.end(lot=None, turn_id="t")
+            self.assertTrue(os.path.exists(os.path.join(legacy, "theirs.txt")))
+        self.assertFalse(menage.created_by(troot, "a1", menage.mesh_key(self.mine)))
+        # ours, created by us: emptied by a new session
+        mine = self._tmp(self.mine, "c")
+        _write(os.path.join(mine, "f"))
+        turn = menage.Turn.begin(self.mine, self.pol, "c", None, new_session=True,
+                                 base_env={})
+        turn.end(lot=None, turn_id="t")
+        self.assertFalse(os.path.exists(os.path.join(mine, "f")))
+
+
 class MeshKeyParamsTest(unittest.TestCase):
 
     def test_host_given_as_a_parameter(self):
@@ -226,6 +321,8 @@ class MeshKeyParamsTest(unittest.TestCase):
         self.assertNotEqual(key("postgresql:///d?host=a"), key("postgresql:///d?host=b"))
         self.assertEqual(key("postgresql:///d?host=a"), key("postgresql://a/d"))
         self.assertNotEqual(key("postgresql://h/d?port=5433"), key("postgresql://h/d"))
+        # second review, point 4
+        self.assertNotEqual(key("hostaddr=10.0.0.1 dbname=d"), key("hostaddr=10.0.0.2 dbname=d"))
 
 
 if __name__ == "__main__":
