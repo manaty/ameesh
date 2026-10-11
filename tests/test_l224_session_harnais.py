@@ -18,7 +18,7 @@ import os
 import unittest
 from unittest import mock
 
-from ameesh import accounts, adapters, cli, mail, registry
+from ameesh import accounts, adapters, cli, mail, registry, reprise
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
@@ -254,6 +254,82 @@ class DossierDuTourTest(_Verifie):
         self.assertEqual(self._reprise(), CODEX)
 
 
+class HomeDuTourTest(_Verifie):
+    def test_tilde_resolu_avec_le_home_du_tour(self):
+        # verdict codex #183 (2e relecture, P1) : le descripteur pose HOME sans
+        # CLAUDE_CONFIG_DIR ; `~/.claude` se lit sous ce HOME, pas sous celui de
+        # l'exécuteur — même si ce dernier a un stockage (vide)
+        executeur = os.path.join(self.tmp, "home-executeur")
+        os.makedirs(os.path.join(executeur, ".claude", "projects"))
+        tour = os.path.join(self.tmp, "home-tour")
+        _session_claude(os.path.join(tour, ".claude"), CLAUDE)
+        _runner, worker = self._worker("md-home")
+        self._avec_session(worker, CLAUDE)
+        env_harnais = adapters.HarnessAdapter.env
+        with mock.patch.object(adapters.HarnessAdapter, "env",
+                               lambda a: dict(env_harnais(a), HOME=tour)), \
+                mock.patch.dict(os.environ, {"HOME": executeur,
+                                            "AMEESH_SESSION_STORE_CHECK": "1"}):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            prédicat = worker._session_connue("claude", None, worker._adapter())
+            self.assertTrue(prédicat(CLAUDE))
+            self.assertFalse(prédicat(CODEX))
+
+    def test_expanduser_du_tour(self):
+        from ameesh.runner import _expanduser_in
+        self.assertEqual(_expanduser_in("~/.claude", {"HOME": "/tour"}), "/tour/.claude")
+        self.assertEqual(_expanduser_in("~", {"HOME": "/tour/"}), "/tour")
+        self.assertEqual(_expanduser_in("~/.dsh", {"HOME": "/"}), "/.dsh")
+        self.assertEqual(_expanduser_in("/abs/.codex", {"HOME": "/tour"}), "/abs/.codex")
+
+
+@unittest.skipIf(os.geteuid() == 0, "root lit un dossier 000")
+class RechercheIncompleteTest(_Verifie):
+    """Verdict codex #183 (2e relecture, P2) : un stockage illisible n'établit
+    pas « introuvable » ; la session est gardée."""
+
+    def _illisible(self, chemin: str) -> None:
+        os.chmod(chemin, 0)
+        self.addCleanup(os.chmod, chemin, 0o700)
+
+    def test_find_session_strict(self):
+        claude = os.path.join(self.tmp, "claude-illisible")
+        _session_claude(claude, CLAUDE)
+        self._illisible(os.path.join(claude, "projects", "-work"))
+        self.assertIsNone(reprise.find_session("claude", claude, CLAUDE))
+        with self.assertRaises(reprise.SessionSearchIncomplete):
+            reprise.find_session("claude", claude, CLAUDE, strict=True)
+        codex = os.path.join(self.tmp, "codex-illisible")
+        _session_codex(codex, CodexTest.FIL)
+        self._illisible(os.path.join(codex, "sessions", "2026"))
+        self.assertIsNone(reprise.find_session("codex", codex, CodexTest.FIL))
+        with self.assertRaises(reprise.SessionSearchIncomplete):
+            reprise.find_session("codex", codex, CodexTest.FIL, strict=True)
+        racine = os.path.join(self.tmp, "dsh-illisible")
+        os.makedirs(os.path.join(racine, "sessions"))
+        self._illisible(os.path.join(racine, "sessions"))
+        with self.assertRaises(reprise.SessionSearchIncomplete):
+            reprise.find_session("deepseek", racine, "abc", strict=True)
+
+    def test_claude_illisible_session_gardee(self):
+        home = os.path.join(self.tmp, "claude-tour-illisible")
+        _session_claude(home, CLAUDE)
+        self._illisible(os.path.join(home, "projects", "-work"))
+        _runner, worker = self._worker("md-illisible")
+        self._avec_session(worker, CLAUDE)
+        self.assertTrue(self._tour(worker, CLAUDE_CONFIG_DIR=home))
+        self.assertEqual(self._reprise(), CLAUDE)
+
+    def test_codex_illisible_session_gardee(self):
+        home = os.path.join(self.tmp, "codex-tour-illisible")
+        _session_codex(home, CodexTest.FIL)
+        self._illisible(os.path.join(home, "sessions", "2026"))
+        _runner, worker = self._worker("cx-illisible", harness="codex")
+        self._avec_session(worker, CodexTest.FIL)
+        self.assertTrue(self._tour(worker, CODEX_HOME=home))
+        self.assertEqual(self._reprise("resume"), CodexTest.FIL)
+
+
 class ComptesClaudeTest(_Verifie):
     def setUp(self) -> None:
         super().setUp()
@@ -326,6 +402,30 @@ class CodexTest(_Verifie):
         self.assertTrue(self._tour(worker, "secondaire"))
         self.assertEqual(self._reprise("resume"), self.FIL)
         self.assertEqual(registry.get(self.db, "cx-sec")["session_id"], self.FIL)
+
+
+def _session_dsh(home: str, session: str) -> None:
+    os.makedirs(os.path.join(home, "sessions", "-work", "session-" + session))
+
+
+class DeepSeekTest(_Verifie):
+    SESSION = "dsh-0a1b2c3d"
+
+    def test_session_dsh_connue_reprise(self):
+        home = os.path.join(self.tmp, "dsh-home")
+        _session_dsh(home, self.SESSION)
+        _runner, worker = self._worker("ds-ok", harness="deepseek")
+        self._avec_session(worker, self.SESSION)
+        self.assertTrue(self._tour(worker, DSH_HOME=home))
+        self.assertEqual(self._reprise("--session-id"), self.SESSION)
+
+    def test_session_dsh_inconnue_jamais_reprise(self):
+        home = os.path.join(self.tmp, "dsh-home-2")
+        _session_dsh(home, self.SESSION)
+        _runner, worker = self._worker("ds-x", harness="deepseek")
+        self._avec_session(worker, CLAUDE)  # un id claude retenu à tort
+        self.assertTrue(self._tour(worker, DSH_HOME=home))
+        self.assertIsNone(self._reprise("--session-id"))
 
 
 if __name__ == "__main__":

@@ -220,6 +220,15 @@ class Reprise:
         return bilan
 
 
+def _expanduser_in(path: str, env: dict) -> str:
+    """`~` résolu avec le HOME de `env` (l'environnement du tour), pas celui
+    de l'exécuteur (L224, verdict codex #183) ; `~autre` reste à `expanduser`."""
+    home = env.get("HOME")
+    if home and (path == "~" or path.startswith("~/")):
+        return home.rstrip("/") + path[1:] if home != "/" else "/" + path[2:]
+    return os.path.expanduser(path)
+
+
 def worktree_marker(cwd: str | None) -> dict:
     """Identité git d'un dossier de travail (0018 : suivre un renommage).
 
@@ -1515,10 +1524,12 @@ class AgentWorker(threading.Thread):
         Le dossier du harnais se résout comme au lancement : environnement de
         l'exécuteur, puis `adapter.env()` (un descripteur peut poser
         `CLAUDE_CONFIG_DIR` ou `CODEX_HOME`), puis le compte du tour
-        (`accounts.launch_env`). Le prédicat ne dit « inconnue » que si la
-        session n'est ni là, ni sous un autre compte déclaré du harnais : dans
-        le doute, la session est gardée (verdict codex #183) — une reprise
-        ratée est rattrapée, un faux négatif efface une vraie session."""
+        (`accounts.launch_env`) ; `~` se lit avec le HOME de cet environnement.
+        Le prédicat ne dit « inconnue » que si la session n'est ni là, ni sous
+        un autre compte déclaré du harnais : dans le doute (stockage
+        introuvable, recherche incomplète), la session est gardée (verdict
+        codex #183) — une reprise ratée est rattrapée, un faux négatif efface
+        une vraie session."""
         if (harness not in self.SESSION_STORES or compte is account_turn.INVALID
                 or os.environ.get("AMEESH_SESSION_STORE_CHECK") == "0"):
             return None
@@ -1530,9 +1541,9 @@ class AgentWorker(threading.Thread):
             if declared:
                 accounts.launch_env(env, declared, compte)
             variable = accounts.config_env_of(harness)
-            home = os.path.abspath(os.path.expanduser(
+            home = os.path.abspath(_expanduser_in(
                 (env.get(variable) if variable else "")
-                or accounts.default_home_of(harness)))
+                or accounts.default_home_of(harness), env))
             autres = [h for _nom, h in reprise.search_homes(self.cfg, harness)
                       if os.path.abspath(h) != home]
         except Exception as exc:  # configuration illisible : on ne sait pas
@@ -1544,14 +1555,20 @@ class AgentWorker(threading.Thread):
             return None
 
         def connue(session: str) -> bool:
-            if reprise.find_session(harness, home, session):
-                return True
-            for autre in autres:
-                if reprise.find_session(harness, autre, session):
-                    self._avertit_session(
-                        "session %s trouvée sous %s, pas sous %s (dossier du tour) : "
-                        "gardée" % (session, autre, home))
+            try:
+                if reprise.find_session(harness, home, session, strict=True):
                     return True
+                for autre in autres:
+                    if reprise.find_session(harness, autre, session, strict=True):
+                        self._avertit_session(
+                            "session %s trouvée sous %s, pas sous %s (dossier du tour) : "
+                            "gardée" % (session, autre, home))
+                        return True
+            except reprise.SessionSearchIncomplete as exc:
+                # stockage momentanément illisible : introuvable n'est pas établi
+                self._avertit_session("recherche de la session %s incomplète (%s) : "
+                                      "gardée" % (session, exc))
+                return True
             return False
         return connue
 
