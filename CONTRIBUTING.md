@@ -18,6 +18,19 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   sur les modules de `tests/parts/pilote-psql.txt` ; le psql complet tourne
   sur `main` et `release/*`. Un module de test qui touche la couche base ou un
   comportement propre à un pilote s'ajoute à cette liste.
+- **Tests indépendants du poste** (L142) : le poste et la CI donnent le même
+  verdict. À l'import, `tests/support.py` retire toutes les variables
+  `AMEESH_*`, `AGENT_MESH_*` et `AGENT_MAIL_*` de la session (identité
+  d'agent, schéma, état, DSN, canon…), sauf les réglages du banc
+  (`AMEESH_TEST_DSN`, `AMEESH_REQUIRE_DB`, `AMEESH_DRIVER`, `AMEESH_DB_TRACE`
+  et leurs alias `AGENT_MESH_*`), et pointe `AMEESH_CONFIG` et
+  `AGENT_MESH_CONFIG` vers un fichier absent : ni
+  `~/.config/ameesh/config.json` ni l'ancienne config agent-mesh ne sont lus.
+  `HOME` reste celui du poste (le banc lit `~/.pgpass`). Un test qui a besoin
+  d'une config, d'un canon ou d'une variable la pose lui-même ;
+  `tests/test_l142_env_isole.py` vérifie qu'un poste « pollué » voit la même
+  chose qu'un poste propre. Tout module de test qui touche à l'environnement
+  importe donc `tests.support`.
 - **En-tête de licence** `SPDX-License-Identifier: AGPL-3.0-only` en tête des
   nouveaux fichiers source.
 
