@@ -153,19 +153,19 @@ class ReplayTest(_Base):
         rp.ensure()
         self.assertEqual(rp.prime([sha]), [])
         a, b = (_git(self.repo, "rev-parse", x) for x in ("lot/1-a", "lot/2-b"))
-        self.assertEqual(rp.replay(a, b)["state"], "prepared")
+        self.assertEqual(rp.replay(a, b, sha)["state"], "prepared")
         # order does not matter: rerere sorts the two sides
-        self.assertEqual(rp.replay(b, a)["state"], "prepared")
+        self.assertEqual(rp.replay(b, a, sha)["state"], "prepared")
         # a push outside the conflicting hunk keeps the resolution valid
         _commit_on(self.repo, "lot/1-a", "shared.py",
                    "UN\ndeux\ntrois\nquatre\ncinq\nsix\nSept\n", "a elsewhere")
         a2 = _git(self.repo, "rev-parse", "lot/1-a")
-        self.assertEqual(rp.replay(a2, b)["state"], "prepared")
+        self.assertEqual(rp.replay(a2, b, sha)["state"], "prepared")
         # a push that changes the hunk makes it stale
         _commit_on(self.repo, "lot/1-a", "shared.py",
                    "UNO\ndeux\ntrois\nquatre\ncinq\nsix\nSept\n", "a changes the hunk")
         a3 = _git(self.repo, "rev-parse", "lot/1-a")
-        got = rp.replay(a3, b)
+        got = rp.replay(a3, b, sha)
         self.assertEqual((got["state"], got["remaining"]), ("stale", ["shared.py"]))
         # nothing left behind in the agents' repository
         self.assertEqual(_git(self.repo, "status", "--porcelain"), "")
@@ -297,6 +297,145 @@ class AgentFlowTest(_Base):
         self.assertTrue(os.path.isdir(path))      # commit kept in the worktree
         done = resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
         self.assertEqual(self.fake.rows[(2, 1)]["commit_sha"], done["commit"])
+
+
+class ReviewTest(_Base):
+    """Codex review of #177: one test per defect, red without its fix."""
+
+    def resolved(self, text=RESOLVED):
+        path = resolutions.open_resolution(None, 2, 1, repo=self.repo)["path"]
+        _write(path, "shared.py", text)
+        return path
+
+    def test_a_branch_fallback_never_forced_over_a_foreign_branch(self):
+        bare = self.origin(heads_only=True)
+        _git(self.repo, "push", "-q", "origin", "main:refs/heads/ameesh/resolve/2-1")
+        foreign = _git(bare, "rev-parse", "ameesh/resolve/2-1")
+        self.resolved()
+        done = resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertIsNone(done["ref"])
+        self.assertTrue(done["push_error"])
+        self.assertEqual(_git(bare, "rev-parse", "ameesh/resolve/2-1"), foreign)
+
+    def test_a_branch_fallback_replaces_its_own_push(self):
+        bare = self.origin(heads_only=True)
+        self.resolved()
+        first = resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertEqual(first["ref"], "refs/heads/ameesh/resolve/2-1")
+        _commit_on(self.repo, "lot/2-b", "other.py", "z\n", "b elsewhere")
+        resolutions.open_resolution(None, 2, 1, repo=self.repo)
+        second = resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertEqual(second["ref"], "refs/heads/ameesh/resolve/2-1")
+        self.assertEqual(_git(bare, "rev-parse", "ameesh/resolve/2-1"), second["commit"])
+
+    def test_b_untracked_file_refused_and_kept(self):
+        path = self.resolved()
+        _write(path, "new_helper.py", "x = 1\n")
+        with self.assertRaises(resolutions.ResolveError) as ctx:
+            resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertIn("new_helper.py", str(ctx.exception))
+        self.assertTrue(os.path.isfile(os.path.join(path, "new_helper.py")))
+        _git(path, "add", "new_helper.py")
+        done = resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertEqual(_git(self.repo, "show", "%s:new_helper.py" % done["commit"]), "x = 1")
+
+    def test_b_resumed_done_keeps_later_changes(self):
+        path = self.resolved()
+        with mock.patch.object(self.fake, "record_resolution", return_value=None):
+            with self.assertRaises(resolutions.ResolveError):
+                resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        _write(path, "shared.py", RESOLVED + "huit\n")  # edited after the commit
+        with self.assertRaises(resolutions.ResolveError) as ctx:
+            resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertIn("since the resolution commit", str(ctx.exception))
+        with open(os.path.join(path, "shared.py")) as fh:
+            self.assertTrue(fh.read().endswith("huit\n"))
+        self.assertEqual(self.fake.rows, {})
+
+    def test_c_unreadable_metadata_never_removes_the_worktree(self):
+        for broken in ("truncated", "missing"):
+            with self.subTest(broken):
+                path = self.resolved()
+                meta = path + ".json"
+                if broken == "missing":
+                    os.unlink(meta)
+                else:
+                    with open(meta, "w") as fh:
+                        fh.write('{"lot": 2, "oth')
+                with self.assertRaises(resolutions.ResolveError) as ctx:
+                    resolutions.open_resolution(None, 2, 1, repo=self.repo)
+                self.assertIn("--abort", str(ctx.exception))
+                with self.assertRaises(resolutions.ResolveError):
+                    resolutions.finish_resolution(None, 2, 1, repo=self.repo)
+                with open(os.path.join(path, "shared.py")) as fh:
+                    self.assertEqual(fh.read(), RESOLVED)
+                self.assertTrue(resolutions.abort_resolution(2, 1, repo=self.repo))
+                self.assertFalse(os.path.exists(path))
+
+    def test_d_replay_sees_the_pair_resolution_only(self):
+        r1 = _manual_resolution(self.repo)
+        hunk = "UN\ndeux\ntrois\nquatre\ncinq\nsix\nsept\n"
+        old_a = _git(self.repo, "rev-parse", "lot/1-a")
+        _commit_on(self.repo, "lot/1-a", "shared.py", hunk.replace("UN", "UNO"), "a changes")
+        r2 = _manual_resolution(self.repo, text=RESOLVED.replace("UN-One", "UNO-One"))
+        rp = resolutions.Replayer(self.repo, os.path.join(self.tmp, "state", "p.clone"))
+        rp.ensure()
+        self.assertEqual(rp.prime([r1, r2]), [])
+        b = _git(self.repo, "rev-parse", "lot/2-b")
+        # lot 1 back to its first hunk: R2, the recorded one, does not cover it
+        self.assertEqual(rp.replay(old_a, b, r2)["state"], "stale")
+        self.assertEqual(rp.replay(old_a, b, r1)["state"], "prepared")
+        new_a = _git(self.repo, "rev-parse", "lot/1-a")
+        self.assertEqual(rp.replay(new_a, b, r2)["state"], "prepared")
+        self.assertEqual(rp.replay(new_a, b, r1)["state"], "stale")
+
+    def rr_cache(self):
+        return os.path.join(self.repo, ".git", "rr-cache")
+
+    def test_e_no_rr_cache_left_in_the_agents_repository(self):
+        self.resolved()
+        resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        _commit_on(self.repo, "lot/2-b", "other.py", "z\n", "b elsewhere")
+        out = resolutions.open_resolution(None, 2, 1, repo=self.repo)
+        self.assertEqual(out["replayed"], ["shared.py"])
+        resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertFalse(os.path.exists(self.rr_cache()))
+
+    def test_e_rerere_autoupdate_of_the_agent_does_not_close_the_reopening(self):
+        _git(self.repo, "config", "rerere.enabled", "true")
+        _git(self.repo, "config", "rerere.autoUpdate", "true")
+        self.resolved()
+        resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        _commit_on(self.repo, "lot/2-b", "other.py", "z\n", "b elsewhere")
+        out = resolutions.open_resolution(None, 2, 1, repo=self.repo)
+        self.assertEqual((out["state"], out["replayed"]), ("open", ["shared.py"]))
+        self.assertTrue(os.path.isdir(out["path"]))
+        with open(os.path.join(out["path"], "shared.py")) as fh:
+            self.assertEqual(fh.read(), RESOLVED)
+
+    def test_f_python_port_overwrites_even_with_rerere_off(self):
+        r1 = _manual_resolution(self.repo)
+        other = RESOLVED.replace("UN-One", "One-UN")
+        r1b = _manual_resolution(self.repo, text=other)
+        rp = resolutions.Replayer(self.repo, os.path.join(self.tmp, "scratch"))
+        rp.ensure()
+        _git(rp.path, "config", "rerere.enabled", "false")
+        resolutions.train(rp.path, [r1], script=None)
+        resolutions.train(rp.path, [r1b], script=None)  # replaces r1
+        _git(rp.path, "checkout", "-q", "-f", "--detach", _git(self.repo, "rev-parse", "lot/1-a"))
+        resolutions._run(rp.path, "-c", "rerere.enabled=true", "merge", "-q", "--no-ff",
+                         "--no-commit", _git(self.repo, "rev-parse", "lot/2-b"))
+        with open(os.path.join(rp.path, "shared.py")) as fh:
+            self.assertEqual(fh.read(), other)
+
+    def test_g_work_show_without_table_0057(self):
+        store = mock.Mock()
+        store.work.resolutions.side_effect = RuntimeError(
+            'relation "work_resolutions" does not exist')
+        with mock.patch.object(storage, "of", return_value=store):
+            rows, error = resolutions.of_lot_or_error(None, 2)
+        self.assertEqual(rows, [])
+        self.assertIn("work_resolutions", error)
 
 
 class RadarTest(_Base):
@@ -451,6 +590,20 @@ class ResolutionsDbTest(PgTestCase):
         snapshot = radar.read_snapshot(cfg, "p")
         pair = [p for p in snapshot["pairs"] if sorted(p["lots"]) == [a, b]][0]
         self.assertEqual((pair["state"], pair["resolution"]["by"]), ("prepared", b))
+
+
+class ResolutionsWithoutTableDbTest(PgTestCase):
+    """`work show` on a database without migration 0057 (codex review, g)."""
+
+    def test_work_show_falls_back(self):
+        lot = work.add(self.db, title="a", branch="lot/1-a")["id"]
+        self.db.execute("DROP TABLE work_resolutions")
+        shown = self.mesh("work", "show", str(lot))
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertIn("résolut. : indisponible", shown.stdout)
+        data = json.loads(self.mesh("work", "show", str(lot), "--json").stdout)
+        self.assertEqual(data["resolutions"], [])
+        self.assertIn("work_resolutions", data["resolutions_error"])
 
 
 if __name__ == "__main__":

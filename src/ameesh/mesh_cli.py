@@ -982,7 +982,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 assignee=item.get("assignee"))
             # L160d : résolutions préparées où le lot est l'un des deux côtés
             from . import resolutions
-            item["resolutions"] = resolutions.of_lot(db, args.id)
+            item["resolutions"], error = resolutions.of_lot_or_error(db, args.id)
+            if error:  # e.g. a database without migration 0057
+                item["resolutions_error"] = error
             # L157c: actual time by phase and merged diff size, once delivered
             from . import lot_measures
             item["measure"] = lot_measures.view(storage.of(db).work.measure(args.id))
@@ -1040,6 +1042,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("migration: %04d réservée (L122)" % item["migration"])
             for line in resolutions.show_lines(item["resolutions"], args.id):
                 print("résolut. : %s" % line)
+            if item.get("resolutions_error"):
+                print("résolut. : indisponible (%s)" % item["resolutions_error"])
             if item.get("waiting_for"):
                 print("attend   : %s" % item["waiting_for"]["label"])
             if item.get("delegation"):

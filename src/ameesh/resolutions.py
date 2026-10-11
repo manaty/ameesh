@@ -11,26 +11,34 @@ one of them, the RESOLVER, prepares the resolution while it still knows its
 code, long before either lot merges:
 
 1. `resolve` adds a throwaway worktree of the lot branch (detached, locked,
-   under `<git common dir>/ameesh-resolve/<lot>-<other>`), primes `rerere`
-   with any earlier resolution of the pair, and merges the other branch into
-   it with `rerere` on: hunks already resolved come back resolved;
-2. the agent resolves the remaining conflicts in that worktree;
+   under `<git common dir>/ameesh-resolve/<lot>-<other>`) and merges the
+   other branch into it, `rerere` off. When the pair was resolved before,
+   that merge is replayed in a scratch clone whose empty `rr-cache` is
+   primed with that one resolution, and the files `rerere` resolved there are
+   copied into the worktree: hunks already resolved come back resolved. The
+   agents' repository never gets an `rr-cache` (one would turn `rerere` on
+   for their own merges);
+2. the agent resolves the remaining conflicts in that worktree (a new file
+   is `git add`-ed: `--done` refuses untracked files);
 3. `resolve --done` checks that no conflict marker is left, commits the
    merge (trailer `ameesh-resolution: <lot> <other>`), points
    `refs/ameesh/resolutions/<lot>/<other>` at it, pushes it there on
    `origin` (or to the branch `ameesh/resolve/<lot>-<other>` when the host
-   refuses refs outside `refs/heads`), records it (table `work_resolutions`,
-   migration 0057) and removes the worktree.
+   refuses refs outside `refs/heads`; never forced over a branch it did
+   not push), records it (table `work_resolutions`, migration 0057) and
+   removes the worktree, only when clean.
 
 The lot branch never changes: it stays the version WITHOUT the other lot;
 the resolution commit R(lot, other) is the version WITH it.
 
 Validity, at each radar pass: in its private clone of the project
 (`<state_dir>/radar/<project>.clone`, `git clone --shared`: objects read
-from the agents' repository, nothing written to it), the radar primes its
-own `rr-cache` from the resolution commits with git's `rerere-train.sh`
-(contrib; a port of the same loop when the script is not installed), then
-replays the merge of the two current tips. If `rerere` resolves every
+from the agents' repository, nothing written to it), the radar replays the
+merge of the two current tips with an `rr-cache` holding the pair's own
+resolution only (trained once per resolution commit with git's
+`rerere-train.sh`, contrib, or a port of the same loop when the script is
+not installed, then kept aside: another pair's resolution, or a replaced
+one, never resolves this pair). If `rerere` resolves every
 conflicted path, the pair is `prepared`; otherwise it is `stale`, and the
 lot that prepared it is told (passive mail, L160c). A rebase or a new push
 that leaves the conflicting hunks as they were keeps the pair `prepared`:
@@ -49,6 +57,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 
 from . import plan_git, storage, work
 from .canon import FETCH_TIMEOUT, GIT_TIMEOUT, GitError, _git, _git_env
@@ -119,7 +128,7 @@ def unmerged(cwd: str) -> list[str]:
 
 def rerere_remaining(cwd: str) -> list[str]:
     """Conflicted paths that `rerere` did not resolve."""
-    proc = _run(cwd, "rerere", "remaining")
+    proc = _run(cwd, "-c", "rerere.enabled=true", "rerere", "remaining")
     return sorted({p for p in _text(proc).splitlines() if p}) if proc.returncode == 0 \
         else unmerged(cwd)
 
@@ -184,13 +193,22 @@ def train(cwd: str, commits, *, script: str | None = "auto") -> list[str]:
             if len(parents) < 2:
                 continue
             _check(_run(cwd, "checkout", "-q", "-f", "--detach", parents[0]), "checkout")
-            if _run(cwd, "-c", "rerere.enabled=true", "merge", "-q", "--no-ff",
-                    "--no-commit", *parents[1:]).returncode != 0:
-                _run(cwd, "rerere", "forget", ".")
-                if unmerged(cwd):
-                    _run(cwd, "-c", "rerere.enabled=true", "rerere")
-                    _run(cwd, "checkout", commit, "--", ".")
-                    _run(cwd, "-c", "rerere.enabled=true", "rerere")
+            if _run(cwd, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
+                    "merge", "-q", "--no-ff", "--no-commit", *parents[1:]).returncode != 0:
+                conflicted = unmerged(cwd)
+                # `forget` exits 0 even when it did nothing (rerere off): check it
+                _run(cwd, "-c", "rerere.enabled=true", "rerere", "forget", ".")
+                still = sorted(set(conflicted) - set(rerere_remaining(cwd)))
+                if still:
+                    raise GitError("git rerere forget left %s resolved (%s)"
+                                   % (", ".join(still), commit[:12]))
+                if conflicted:
+                    # forget leaves the old resolution in the files: back to the conflict,
+                    # else the next `rerere` records the old resolution again
+                    _check(_run(cwd, "checkout", "-m", "--", *conflicted), "checkout -m")
+                    _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
+                    _check(_run(cwd, "checkout", commit, "--", "."), "checkout")
+                    _check(_run(cwd, "-c", "rerere.enabled=true", "rerere"), "rerere")
                     learnt.append(commit)
             _run(cwd, "reset", "-q", "--hard")
     finally:
@@ -324,7 +342,21 @@ def _ensure_commit(repo: str, row: dict) -> bool:
     return _run(repo, "cat-file", "-e", sha + "^{commit}").returncode == 0
 
 
-def _remove_worktree(repo: str, path: str) -> None:
+def _status(path: str) -> list[str]:
+    """`git status --porcelain` of the worktree, untracked files included."""
+    proc = _run(path, "status", "--porcelain", "-z", "--untracked-files=all")
+    _check(proc, "status")
+    return [e for e in proc.stdout.decode("utf-8", "replace").split("\0") if e[2:3] == " "]
+
+
+def _remove_worktree(repo: str, path: str, *, force: bool = True) -> None:
+    """Removes the worktree and its metadata. `force=False` (after `--done`):
+    only a clean worktree, else ResolveError and nothing removed."""
+    if not force and os.path.isdir(path):
+        dirty = _status(path)
+        if dirty:
+            raise ResolveError("worktree %s not removed, it holds changes: %s"
+                               % (path, ", ".join(e[3:] for e in dirty[:10])))
     _run(repo, "worktree", "unlock", path)
     _run(repo, "worktree", "remove", "--force", path)
     shutil.rmtree(path, ignore_errors=True)
@@ -354,8 +386,10 @@ def open_resolution(db, lot: int, other: int, *, repo: str | None = None) -> dic
         remaining = unmerged(path)
         return dict(meta, state="open", path=path, remaining=remaining,
                     markers=with_markers(path, meta["files"]), already=True)
-    if os.path.exists(path):
-        _remove_worktree(repo, path)
+    if os.path.exists(path):  # never removed without being asked: it may hold work
+        raise ResolveError("%s exists without readable metadata (%s): look at it, then "
+                           "ameesh work resolve %d --with %d --abort to drop it"
+                           % (path, _meta_path(path), lot, other))
     ctx = pair(db, lot, other, repo)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     _check(_run(repo, "worktree", "add", "--quiet", "--detach", path, ctx["lot_tip"]),
@@ -363,10 +397,8 @@ def open_resolution(db, lot: int, other: int, *, repo: str | None = None) -> dic
     try:
         _run(repo, "worktree", "lock", "--reason",
              "ameesh work resolve %d --with %d" % (lot, other), path)
-        primed = [r["commit_sha"] for r in _recorded(db, lot, other)
-                  if _ensure_commit(repo, r)]
-        train(path, primed[:1])
-        merge = _run(path, "-c", "rerere.enabled=true", "-c", "merge.conflictStyle=zdiff3",
+        # rerere off: neither the agents' rr-cache nor rerere.autoUpdate decide
+        merge = _run(path, "-c", "rerere.enabled=false", "-c", "merge.conflictStyle=zdiff3",
                      "merge", "--no-ff", "--no-commit", "--quiet", ctx["other_tip"])
         files = unmerged(path)
         if merge.returncode == 0 or not files:
@@ -377,20 +409,46 @@ def open_resolution(db, lot: int, other: int, *, repo: str | None = None) -> dic
                                       _err(merge)))
             return {"state": "clean", "lot": lot, "other": other, "path": None, "files": [],
                     "lot_tip": ctx["lot_tip"], "other_tip": ctx["other_tip"]}
-        remaining = rerere_remaining(path)
+        primed = [r["commit_sha"] for r in _recorded(db, lot, other)
+                  if _ensure_commit(repo, r)][:1]
+        replayed = _replay_into(repo, path, primed[0], ctx["lot_tip"], ctx["other_tip"],
+                                files) if primed else []
         meta = {"lot": lot, "other": other, "lot_branch": ctx["lot"]["branch"],
                 "other_branch": ctx["other"]["branch"], "target": ctx["target"],
                 "lot_tip": ctx["lot_tip"], "other_tip": ctx["other_tip"], "files": files,
-                "replayed": sorted(set(files) - set(remaining)),
-                "primed": primed[:1]}
+                "replayed": replayed, "primed": primed}
         with open(_meta_path(path), "w", encoding="utf-8") as fh:
             json.dump(meta, fh, indent=1)
     except BaseException:
         if _read_meta(path) is None:
             _remove_worktree(repo, path)
         raise
-    return dict(meta, state="open", path=path, remaining=remaining,
+    return dict(meta, state="open", path=path, remaining=unmerged(path),
                 markers=with_markers(path, files), already=False)
+
+
+def _replay_into(repo: str, path: str, commit: str, lot_tip: str, other_tip: str,
+                 files) -> list[str]:
+    """Replays the merge in a scratch clone primed with `commit` only, and
+    copies into the worktree `path` the files `rerere` resolved there (left
+    unmerged in its index, for the agent to check). Returns them."""
+    scratch = tempfile.mkdtemp(prefix="ameesh-resolve-")
+    try:
+        replayer = Replayer(repo, os.path.join(scratch, "clone"))
+        replayer.ensure()
+        if replayer.prime([commit]):
+            return []
+        resolved = []
+
+        def export(clone: str, paths) -> None:
+            for f in paths:
+                if f in files and os.path.isfile(os.path.join(clone, f)):
+                    shutil.copyfile(os.path.join(clone, f), os.path.join(path, f))
+                    resolved.append(f)
+        replayer.replay(lot_tip, other_tip, commit, export=export)
+        return sorted(resolved)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _message(meta: dict, note: str) -> str:
@@ -405,14 +463,20 @@ def _message(meta: dict, note: str) -> str:
                TRAILER, meta["lot"], meta["other"]))
 
 
-def push(repo: str, sha: str, lot: int, other: int) -> tuple[str | None, str | None]:
-    """Pushes the resolution commit to `origin`, under its dedicated ref,
-    else as a branch. Returns (ref pushed, error)."""
+def push(repo: str, sha: str, lot: int, other: int, *,
+         previous: str | None = None) -> tuple[str | None, str | None]:
+    """Pushes the resolution commit to `origin`, under its dedicated ref
+    (forced: one ref per pair, written by L160d only), else as a branch,
+    never forced over a branch L160d did not push: `--force-with-lease` on
+    `previous`, the commit recorded there for the pair (none: the branch
+    must not exist). Returns (ref pushed, error)."""
     if not plan_git._out(repo, "remote", "get-url", "origin"):
         return None, "no origin remote"
     error = None
-    for ref in (ref_name(lot, other), "refs/heads/" + branch_name(lot, other)):
-        proc = _run(repo, "push", "--quiet", "--force", "--no-verify", "origin",
+    branch = "refs/heads/" + branch_name(lot, other)
+    for ref, force in ((ref_name(lot, other), "--force"),
+                       (branch, "--force-with-lease=%s:%s" % (branch, previous or ""))):
+        proc = _run(repo, "push", "--quiet", force, "--no-verify", "origin",
                     "%s:%s" % (sha, ref), timeout=FETCH_TIMEOUT)
         if proc.returncode == 0:
             return ref, None
@@ -429,6 +493,10 @@ def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
     path = worktree_path(repo, lot, other)
     meta = _read_meta(path)
     if meta is None:
+        if os.path.exists(path):
+            raise ResolveError("%s exists without readable metadata: look at it, then "
+                               "ameesh work resolve %d --with %d --abort"
+                               % (path, lot, other))
         raise ResolveError("no resolution of #%d with #%d is open here: "
                            "ameesh work resolve %d --with %d" % (lot, other, lot, other))
     merging = _run(path, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0
@@ -436,6 +504,11 @@ def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
         left = with_markers(path, meta["files"])
         if left:
             raise ResolveError("conflict markers left in %s (%s)" % (", ".join(left), path))
+        untracked = [e[3:] for e in _status(path) if e.startswith("??")]
+        if untracked:
+            raise ResolveError("untracked files in %s: %s; git add them if the resolution "
+                               "needs them, else delete them"
+                               % (path, ", ".join(untracked[:10])))
         _check(_run(path, "add", "-u"), "add")
         present = [f for f in meta["files"] if os.path.lexists(os.path.join(path, f))]
         if present:
@@ -443,16 +516,28 @@ def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
         still = unmerged(path)
         if still:
             raise ResolveError("still unmerged: %s (%s)" % (", ".join(still), path))
-        _check(_run(path, "-c", "rerere.enabled=true", "commit", "--quiet", "--no-verify",
+        _check(_run(path, "-c", "rerere.enabled=false", "commit", "--quiet", "--no-verify",
                     "-F", "-", stdin=_message(meta, note).encode()), "commit")
+    else:
+        dirty = _status(path)
+        if dirty:  # a resumed --done: the commit is made, later changes are not in it
+            raise ResolveError("changes in %s since the resolution commit: %s; they would "
+                               "be lost: undo them, or --abort and start again"
+                               % (path, ", ".join(e[3:] for e in dirty[:10])))
     sha = _check(_run(path, "rev-parse", "HEAD"), "rev-parse")
     parents = _text(_run(path, "rev-parse", sha + "^@")).split()
     if parents != [meta["lot_tip"], meta["other_tip"]]:
         raise ResolveError("HEAD of %s is not the merge of %s and %s: ameesh work resolve "
                            "%d --with %d --abort, then start again"
                            % (path, meta["lot_tip"][:12], meta["other_tip"][:12], lot, other))
+    if _status(path):
+        raise ResolveError("%s is not clean after the resolution commit: %s"
+                           % (path, ", ".join(e[3:] for e in _status(path)[:10])))
     _check(_run(repo, "update-ref", ref_name(lot, other), sha), "update-ref")
-    pushed, error = push_fn(repo, sha, lot, other)
+    branch = "refs/heads/" + branch_name(lot, other)
+    previous = next((r["commit_sha"] for r in _recorded(db, lot, other)
+                     if int(r["work_item_id"]) == lot and r.get("ref") == branch), None)
+    pushed, error = push_fn(repo, sha, lot, other, previous=previous)
     row = storage.of(db).work.record_resolution(
         lot, other, commit=sha, lot_tip=meta["lot_tip"], other_tip=meta["other_tip"],
         ref=pushed, files=meta["files"],
@@ -462,7 +547,7 @@ def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
     if row is None:
         raise ResolveError("lot #%d or #%d no longer exists: nothing recorded (commit %s "
                            "kept in %s)" % (lot, other, sha[:12], path))
-    _remove_worktree(repo, path)
+    _remove_worktree(repo, path, force=False)
     return {"lot": lot, "other": other, "commit": sha, "ref": pushed, "push_error": error,
             "local_ref": ref_name(lot, other), "files": meta["files"]}
 
@@ -478,6 +563,16 @@ def abort_resolution(lot: int, other: int, *, repo: str | None = None) -> bool:
 def of_lot(db, lot: int) -> list[dict]:
     """Recorded resolutions where `lot` is either side."""
     return storage.of(db).work.resolutions([lot])
+
+
+def of_lot_or_error(db, lot: int) -> tuple[list[dict], str | None]:
+    """`of_lot`, and the error instead of raising (`work show` on a database
+    without migration 0057)."""
+    try:
+        return of_lot(db, lot), None
+    except Exception as exc:  # noqa: BLE001 - e.g. table work_resolutions missing
+        return [], "%s: %s" % (type(exc).__name__, str(exc).splitlines()[0] if str(exc)
+                               else "")
 
 
 def show_lines(rows: list[dict], lot: int) -> list[str]:
@@ -499,9 +594,11 @@ def show_lines(rows: list[dict], lot: int) -> list[str]:
 # --------------------------------------------------------------------------
 
 class Replayer:
-    """The radar's private clone of a project, with its own `rr-cache`,
-    primed from the resolution commits. Objects come from the agents'
-    repository (`--shared`); merges are replayed in the clone's worktree."""
+    """The radar's private clone of a project. Objects come from the agents'
+    repository (`--shared`); merges are replayed in the clone's worktree.
+    Each resolution commit gets its own `rr-cache`, trained once and kept
+    under `.git/ameesh-rr/<commit>`: a replay sees the pair's resolution
+    only, never another pair's nor a replaced one."""
 
     def __init__(self, repo: str, path: str, *, script: str | None = "auto") -> None:
         self.repo, self.path, self.script = repo, path, script
@@ -524,16 +621,18 @@ class Replayer:
         else:
             _run(self.path, "reset", "-q", "--hard")
 
-    def _trained_path(self) -> str:
-        return os.path.join(self.path, ".git", "ameesh-trained.json")
+    def _rr_cache(self) -> str:
+        return os.path.join(self.path, ".git", "rr-cache")
+
+    def _store(self, sha: str = "") -> str:
+        return os.path.join(self.path, ".git", "ameesh-rr", sha)
 
     def trained(self) -> list[str]:
         try:
-            with open(self._trained_path(), encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
+            return sorted(n for n in os.listdir(self._store())
+                          if os.path.isdir(self._store(n)) and not n.startswith("."))
+        except FileNotFoundError:
             return []
-        return data if isinstance(data, list) else []
 
     def has(self, sha: str) -> bool:
         return _run(self.path, "cat-file", "-e", sha + "^{commit}").returncode == 0
@@ -548,27 +647,42 @@ class Replayer:
         if url:
             _run(self.path, "fetch", "--quiet", url, *specs, timeout=FETCH_TIMEOUT)
 
+    def _empty_cache(self) -> None:
+        shutil.rmtree(self._rr_cache(), ignore_errors=True)
+        os.makedirs(self._rr_cache())
+
     def prime(self, commits) -> list[str]:
-        """Trains on the commits not learnt yet; returns those still missing."""
+        """Trains a cache of its own for each commit not learnt yet; returns
+        the commits still missing."""
         commits = list(dict.fromkeys(commits))
         missing = [c for c in commits if not self.has(c)]
         if missing:
             self.fetch()
             missing = [c for c in commits if not self.has(c)]
-        done = self.trained()
-        new = [c for c in commits if c not in done and c not in missing]
-        if new:
-            train(self.path, new, script=self.script)
-            with open(self._trained_path(), "w", encoding="utf-8") as fh:
-                json.dump(done + new, fh)
+        done = set(self.trained())
+        for commit in commits:
+            if commit in done or commit in missing:
+                continue
+            self._empty_cache()
+            train(self.path, [commit], script=self.script)
+            tmp = self._store("." + commit)
+            shutil.rmtree(tmp, ignore_errors=True)
+            shutil.copytree(self._rr_cache(), tmp)
+            os.replace(tmp, self._store(commit))
         return missing
 
-    def replay(self, a: str, b: str) -> dict:
-        """Merges `b` into `a` with `rerere`: `{state: prepared|stale|clean|error,
-        remaining, files}`."""
+    def replay(self, a: str, b: str, commit: str, *, export=None) -> dict:
+        """Merges `b` into `a` with `rerere` and the cache of `commit` only:
+        `{state: prepared|stale|clean|error, remaining, files}`. `export(clone,
+        resolved paths)` runs before the clone is reset."""
+        self._empty_cache()
+        if commit in self.trained():
+            shutil.rmtree(self._rr_cache())
+            shutil.copytree(self._store(commit), self._rr_cache())
         try:
             _check(_run(self.path, "checkout", "-q", "-f", "--detach", a), "checkout")
-            merge = _run(self.path, "merge", "--no-ff", "--no-commit", "--quiet", b)
+            merge = _run(self.path, "-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=false",
+                         "merge", "--no-ff", "--no-commit", "--quiet", b)
             if merge.returncode == 0:
                 return {"state": "clean", "files": [], "remaining": []}
             files = unmerged(self.path)
@@ -576,11 +690,14 @@ class Replayer:
                 return {"state": "error", "files": [], "remaining": [],
                         "error": _err(merge)[:300]}
             remaining = rerere_remaining(self.path)
+            if export is not None:
+                export(self.path, sorted(set(files) - set(remaining)))
             return {"state": "stale" if remaining else "prepared", "files": files,
                     "remaining": remaining}
         finally:
             _run(self.path, "reset", "-q", "--hard")
             _run(self.path, "clean", "-q", "-f", "-d")
+            self._empty_cache()  # rerere never learns from what is left here
 
 
 def annotate(report: dict, rows: list[dict], lots: dict, *, replayer: Replayer | None,
@@ -627,7 +744,7 @@ def annotate(report: dict, rows: list[dict], lots: dict, *, replayer: Replayer |
         key = (p["tips"][0], p["tips"][1], row["commit_sha"])
         if key not in replays:
             try:
-                replays[key] = replayer.replay(*p["tips"])
+                replays[key] = replayer.replay(*p["tips"], row["commit_sha"])
             except (GitError, OSError) as exc:
                 replays[key] = {"state": "error", "error": str(exc)[:300]}
         result = replays[key]
