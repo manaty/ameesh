@@ -71,6 +71,7 @@ réclamé, et `harness check` explique pourquoi. Les clés inconnues et un
 | `launcher` | arguments du **lanceur**, avant les options (ex. `--profile agent`) |
 | `command` | arguments de l'application (ex. `--json`), après les options |
 | `interactive` | arguments d'`ameesh attach` ; `null` = attachement refusé (défaut en ACP) |
+| `interactive_permission` | L223 : mode de permission de la session interactive, `{"flag": ["--permission-mode", "{mode}"], "default": "auto", "env": ["AMEESH_CLAUDE_PERMISSION_MODE"], "fallback": "acceptEdits"}` ; inséré après `interactive` ; repli quand l'aide du binaire ne cite pas le mode ; absent = aucun mode passé |
 | `session` | reprise hors ACP : `{"flag": ["--resume"]}` (inséré juste avant le texte) |
 | `stream` | lecteur de flux : `claude-stream-json`, `codex-json`, `dsh-json`, `acp-json`, `text` |
 | `env` | variables posées au lancement du harnais (`cli`) ou de l'agent (`acp`) |

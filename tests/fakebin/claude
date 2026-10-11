@@ -4,7 +4,8 @@
 
 Émet le même flux JSONL que `claude -p --output-format stream-json`, journalise
 son argv dans $AMEESH_TEST_LOG, et obéit à deux variables de banc :
-AMEESH_TEST_SLEEP (secondes de sommeil) et AMEESH_TEST_EXIT (code) ; L105 :
+AMEESH_TEST_SLEEP (secondes de sommeil) et AMEESH_TEST_EXIT (code) ; L223 :
+AMEESH_TEST_CLAUDE_HELP (texte rendu par `--help`) ; L105 :
 AMEESH_TEST_CLAUDE_CALLS (JSON : appels au modèle, jetons relus, outil, durée ;
 L217 : `parent`, l'outil du fil principal dont l'appel est un sous-agent).
 Travail de fond : AMEESH_TEST_BACKGROUND (commande shell lancée en fond, dans
@@ -35,6 +36,14 @@ def _compte() -> dict:
 
 def main() -> int:
     args = sys.argv[1:]
+    if args == ["--help"]:
+        # L223 : l'aide lue pour le mode de permission interactif, avant tout
+        # journal (ce n'est pas un tour) ; AMEESH_TEST_CLAUDE_HELP simule une
+        # version plus ancienne
+        print(os.environ.get("AMEESH_TEST_CLAUDE_HELP", '  --permission-mode <mode>  '
+              '(choices: "acceptEdits", "auto", "bypassPermissions", "manual", '
+              '"dontAsk", "plan")'))
+        return 0
     log = os.environ.get("AMEESH_TEST_LOG")
     if log:
         with open(log, "a", encoding="utf-8") as fh:

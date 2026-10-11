@@ -1046,21 +1046,53 @@ class HarnessAdapter:
         argv += ["--prompt", text]
         return argv
 
-    def interactive_command(self, session_id: str | None = None) -> list[str]:
+    def interactive_command(self, session_id: str | None = None, *,
+                            permission_mode: str | None = None) -> list[str]:
         """Commande d'une session **interactive** sur la même session (attach, C9).
 
         Elle ne passe ni par `-p`/`exec` ni par `--json` : le harnais garde son
         terminal et sa session, l'humain est devant. Un descripteur qui ne
         déclare pas `ameesh.interactive` (typiquement un agent ACP) refuse.
+        L223 : le mode de permission (`permission_mode()`) suit `interactive`.
         """
         if not self.spec.attach:
             raise HarnessMissing(
                 "le descripteur %s ne déclare pas de commande interactive : "
                 "`ameesh attach` n'est pas disponible pour ce harnais" % self.key)
         argv = [self.binary, *self.spec.launcher, *self.spec.interactive]
+        mode = self.permission_mode(permission_mode)
+        if mode:
+            regle = self.descriptor.interactive_permission
+            argv += [part.replace("{mode}", mode) for part in regle["flag"]]
         if session_id:
             argv += [*self.spec.session_flag, session_id]
         return argv
+
+    def permission_mode(self, explicit: str | None = None) -> str:
+        """Le mode de permission d'une session interactive (L223), '' sans objet.
+
+        Ordre : la valeur explicite (réglage de l'agent, `ameesh set <agent>
+        permission_mode=…`), puis les variables du descripteur
+        (`AMEESH_CLAUDE_PERMISSION_MODE`), puis son défaut (`auto` pour Claude :
+        le classifieur garde les garde-fous sur les secrets, la configuration
+        persistante et la prod). Un mode que l'aide du binaire installé ne cite
+        pas (version trop ancienne) cède la place au repli du descripteur
+        (`acceptEdits`). Un mode mal formé est ignoré, jamais passé tel quel.
+        """
+        regle = self.descriptor.interactive_permission
+        if not regle:
+            return ""
+        mode = ""
+        for valeur in (explicit, *(os.environ.get(n) for n in regle["env"])):
+            valeur = (valeur or "").strip()
+            if valeur and harnesses.PERMISSION_MODE_RE.match(valeur):
+                mode = valeur
+                break
+        mode = mode or regle["default"]
+        if mode and regle["fallback"] and mode != regle["fallback"] \
+                and not _help_mentions(self.binary, mode):
+            return regle["fallback"]
+        return mode
 
     def env(self) -> dict[str, str]:
         """Environnement du harnais (l'agent ACP le reçoit du pont, pas d'ici)."""
@@ -1079,6 +1111,28 @@ class HarnessAdapter:
     def parse(self, line: str) -> dict:
         """Renvoie {session, display:[…], cost, final, usage, error} pour une ligne."""
         return self.reader.parse(line)
+
+
+#: aide des binaires déjà lue (L223) : un `--help` par binaire et par processus
+_HELP_CACHE: dict[str, str | None] = {}
+
+
+def _help_mentions(binary: str, mode: str) -> bool:
+    """L'aide du binaire cite-t-elle ce mode (`"auto"`) ? Vrai si elle est
+    illisible : on ne rabat pas un mode sur la foi d'une aide absente, le
+    harnais refusera lui-même un mode inconnu au lancement."""
+    if binary not in _HELP_CACHE:
+        try:
+            proc = subprocess.run([binary, "--help"], capture_output=True, text=True,
+                                  timeout=10, stdin=subprocess.DEVNULL)
+            _HELP_CACHE[binary] = proc.stdout + proc.stderr if proc.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            _HELP_CACHE[binary] = None
+    texte = _HELP_CACHE[binary]
+    if not texte:
+        return True
+    return re.search(r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])" % re.escape(mode), texte) \
+        is not None
 
 
 def supports_tier(harness: str, host_dir: str | None = None) -> bool:

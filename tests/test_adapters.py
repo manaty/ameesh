@@ -137,8 +137,9 @@ class AdapterTest(unittest.TestCase):
                     self.assertEqual(argv[-2], "s-1")
 
             claude = adapters.adapter_for("claude")
+            # L223 : la session interactive de Claude passe son mode de permission
             self.assertEqual(claude.interactive_command("s1"),
-                             [claude.binary, "--resume", "s1"])
+                             [claude.binary, "--permission-mode", "auto", "--resume", "s1"])
             codex = adapters.adapter_for("codex")
             self.assertEqual(codex.interactive_command("t1"), [codex.binary, "resume", "t1"])
             dsh = adapters.adapter_for("deepseek")
