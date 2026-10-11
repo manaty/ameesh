@@ -554,12 +554,21 @@ def link_package(pkg_dir: str, cache_root: str, *, fill_missing: bool = True,
                 return dict(result, status="local-failed", reason=str(exc),
                             error=str(local_exc))
             return dict(result, status="local", reason=str(exc))
-    old = None
-    if os.path.lexists(link) and not os.path.islink(link):
-        old = os.path.join(pkg_dir, ".node_modules.ameesh-old-%d" % os.getpid())
-        os.rename(link, old)
-    _symlink(target, link)
-    _record_link(entry_of(root, key), link)
+    # shared lock: the GC (exclusive, never waits) cannot delete the entry
+    # between the check of its marker and the record of this link
+    lock = _lock(os.path.join(root, key + ".lock"), wait=wait, exclusive=False)
+    try:
+        if not read_marker(entry_of(root, key)):
+            return dict(result, status="not-cached")
+        old = None
+        if os.path.lexists(link) and not os.path.islink(link):
+            old = os.path.join(pkg_dir, ".node_modules.ameesh-old-%d" % os.getpid())
+            os.rename(link, old)
+        _symlink(target, link)
+        _record_link(entry_of(root, key), link)
+    finally:
+        if lock is not None:
+            lock.close()
     if old is not None:
         shutil.rmtree(old, ignore_errors=True)
     result.update(status="linked", filled=filled, already=False,
