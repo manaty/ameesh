@@ -164,6 +164,14 @@ class ActiviteTest(unittest.TestCase):
         self.assertIn("ameesh menage", menage.tmpfs_hint([], menage.Policy()))
         self.assertEqual(menage.fmt_idle(5400), "90 min")
 
+    def test_l_action_ne_promet_plus_la_suppression_d_une_entree_nouvelle(self):
+        """#234 : depuis #222, une entrée nouvelle de /tmp n'est jamais imputée
+        ni supprimée par le ménage ; l'action attendue ne le promet plus."""
+        texte = menage.tmpfs_hint([], menage.Policy())
+        self.assertNotIn("supprime seul une entrée laissée par un tour", texte)
+        self.assertIn("d'avant #222", texte)
+        self.assertIn("tmp_orphan", texte)
+
 
 class ConsigneTest(unittest.TestCase):
     def test_le_tour_de_courrier_porte_la_regle(self):
