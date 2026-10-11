@@ -86,12 +86,13 @@ INSTALL_ARGS = ("ci", "--include=dev", "--include=optional", "--include=peer",
                 "--ignore-scripts=false")
 #: performance-only options of the fill (not in the key)
 FILL_OPTIONS = ("--prefer-offline", "--no-audit", "--no-fund")
-#: npm settings that change the installed tree, dropped from a fill's
-#: environment (`npm_config_<name>`, any case, `-` or `_`)
-TREE_SETTINGS = ("production", "omit", "include", "only", "also", "dev", "ignore_scripts",
-                 "global", "location", "prefix", "workspace", "workspaces",
-                 "install_strategy", "legacy_peer_deps", "strict_peer_deps", "force",
-                 "os", "cpu", "libc", "install_links", "save", "package_lock_only")
+#: the only variables a fill sees (plus `LC_*`): no NODE_ENV, no other
+#: npm setting than its download cache, nothing a postinstall could read
+FILL_ENV = ("PATH", "HOME", "LANG", "LANGUAGE", "TMPDIR", "TMP", "TEMP",
+            "npm_config_cache", "NPM_CONFIG_CACHE")
+#: an abandoned temporary fill (`<key>.tmp-<pid>-<random>`) is deleted after
+#: this long, if no process uses it and its key's lock is free
+TMP_SEP = ".tmp-"
 #: directories never searched for packages
 SKIP_DIRS = (NODE_MODULES, "target", "dist", "build")
 #: search depth for packages under a worktree
@@ -115,6 +116,24 @@ NEUTRAL_OPTIONS = ("--prefer-offline", "--offline", "--no-audit", "--no-fund",
                    "--silent", "--quiet", "-q", "-s", "--no-progress", "--progress=false",
                    "--audit=false", "--fund=false", "--no-update-notifier",
                    "--include=dev")
+#: npm command names and aliases (npm 11): the first of them on the command
+#: line is the command
+NPM_COMMANDS = frozenset(INSTALL_COMMANDS + (
+    "access", "adduser", "audit", "bugs", "cache", "completion", "config", "c", "dedupe",
+    "ddp", "deprecate", "diff", "dist-tag", "dist-tags", "docs", "home", "doctor", "edit",
+    "exec", "x", "explain", "why", "explore", "find-dupes", "fund", "get", "help",
+    "hlep", "help-search", "init", "create", "innit", "issues", "link", "ln", "ll", "la",
+    "login", "logout", "ls", "list", "org", "outdated", "owner", "author", "pack", "ping",
+    "pkg", "prefix", "profile", "prune", "publish", "query", "rebuild", "rb", "repo",
+    "restart", "root", "run", "run-script", "rum", "urn", "sbom", "search", "find", "s",
+    "se", "set", "shrinkwrap", "star", "stars", "start", "stop", "team", "test", "t",
+    "tst", "token", "undeprecate", "uninstall", "unlink", "remove", "rm", "r", "un",
+    "unpublish", "unstar", "update", "up", "upgrade", "udpate", "version", "verison",
+    "view", "info", "show", "v", "whoami"))
+#: commands that write into node_modules besides the installs: in a review
+#: worktree refused, elsewhere run by the real npm on a local tree
+TREE_COMMANDS = ("dedupe", "ddp", "link", "ln", "prune", "rebuild", "rb", "uninstall",
+                 "unlink", "remove", "rm", "r", "un", "update", "up", "upgrade", "udpate")
 #: npm options that take a value when written without `=` (`--prefix DIR`)
 VALUE_OPTIONS = ("--prefix", "-C", "--location", "-w", "--workspace", "--omit",
                  "--include", "--cache", "--registry", "--userconfig", "--globalconfig",
@@ -425,15 +444,13 @@ def real_npm(env: dict | None = None) -> str | None:
 
 
 def fill_env(env: dict | None = None) -> dict:
-    """The environment of an install: without NODE_ENV nor any npm setting
-    that changes the tree (TREE_SETTINGS); INSTALL_ARGS say it all."""
+    """The environment of a fill: a WHITELIST only (FILL_ENV, `LC_*`), so
+    that nothing outside the key (NODE_ENV, `npm_config_*`, a variable a
+    postinstall reads) can change the tree; INSTALL_ARGS say the mode."""
     out = {}
     for name, value in (os.environ if env is None else env).items():
-        lowered = name.lower().replace("-", "_")
-        if lowered == "node_env" or (lowered.startswith("npm_config_")
-                                     and lowered[len("npm_config_"):] in TREE_SETTINGS):
-            continue
-        out[name] = value
+        if name in FILL_ENV or name.startswith("LC_"):
+            out[name] = value
     return out
 
 
@@ -473,12 +490,18 @@ def fill(pkg_dir: str, root: str, key: str, *, installer=npm_ci, env: dict | Non
         marker = read_marker(entry)
         if marker:
             return marker
-        if os.path.lexists(entry):          # a partial fill, under our lock
+        if os.path.lexists(entry):          # an unpublished entry, under our lock
             remove_tree(entry, root)
+        # a unique temporary directory, renamed into place once complete: a
+        # stray writer left by a dead fill (an install script still running)
+        # only ever writes into ITS temporary directory, never into a
+        # published entry; the GC deletes abandoned ones (`gc_node_modules`)
+        work = "%s%s%d-%s" % (key, TMP_SEP, os.getpid(), os.urandom(4).hex())
+        temp = os.path.join(root, work)
         name = package_label(pkg_dir)
-        stage = os.path.join(entry, name)
+        stage = os.path.join(temp, name)
         os.makedirs(stage, mode=0o755)
-        os.makedirs(os.path.join(entry, LINKS), mode=0o755)
+        os.makedirs(os.path.join(temp, LINKS), mode=0o755)
         copied = key_files(pkg_dir)
         for rel in copied:
             dest = os.path.join(stage, rel)
@@ -500,21 +523,34 @@ def fill(pkg_dir: str, root: str, key: str, *, installer=npm_ci, env: dict | Non
                         not current.startswith(modules):
                     os.rmdir(current)
             files, size = _seal(modules)
+            marker = {"schema": SCHEMA, "key": key, "package": name, "label": name,
+                      "source": os.path.abspath(pkg_dir), "node": node_version(),
+                      "npm": npm_version(), "mode": " ".join(INSTALL_ARGS),
+                      "created": time.time(),
+                      "install_s": round(time.time() - started, 1),
+                      "files": files, "bytes": size}
+            with open(os.path.join(temp, COMPLETE), "w", encoding="utf-8") as fh:
+                json.dump(marker, fh, sort_keys=True)
+            published = False
+            if not os.path.lexists(entry):
+                try:
+                    os.rename(temp, entry)    # atomic; refused if entry not empty
+                    published = True
+                except OSError:
+                    pass
+            if not published:
+                marker = read_marker(entry)
+                if not marker:
+                    raise FillError("entry %s appeared unpublished during the fill"
+                                    % key[:12])
+                remove_tree(temp, root)       # someone else published first
         except BaseException:
             try:
-                remove_tree(entry, root)
+                if os.path.lexists(temp):
+                    remove_tree(temp, root)
             except OSError:
                 pass
             raise
-        marker = {"schema": SCHEMA, "key": key, "package": name, "label": name,
-                  "source": os.path.abspath(pkg_dir), "node": node_version(),
-                  "npm": npm_version(), "mode": " ".join(INSTALL_ARGS),
-                  "created": time.time(), "install_s": round(time.time() - started, 1),
-                  "files": files, "bytes": size}
-        tmp = os.path.join(entry, COMPLETE + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(marker, fh, sort_keys=True)
-        os.replace(tmp, os.path.join(entry, COMPLETE))
         return marker
     finally:
         lock.close()
@@ -756,8 +792,11 @@ def lock_in_sync(pkg_dir: str) -> bool:
 
 def _npm_words(args: list[str]) -> tuple[str | None, list[str], list[str], dict]:
     """(command, positional arguments, options, option values) of an npm
-    command line. An option of VALUE_OPTIONS written without `=` takes the
-    next word (`--prefix DIR`); values are also read from `--name=value`."""
+    command line. The command is the first word that is an npm command name
+    (NPM_COMMANDS), wherever it sits (`npm --fetch-retries 2 ci`): the
+    parser never needs to know which options take a value. The word after
+    an option of VALUE_OPTIONS written without `=` is that option's value,
+    never the command (`npm --prefix test ci`)."""
     command, positional, options, values = None, [], [], {}
     words = list(args)
     index = 0
@@ -765,7 +804,8 @@ def _npm_words(args: list[str]) -> tuple[str | None, list[str], list[str], dict]
         arg = words[index]
         index += 1
         if arg == "--":
-            positional.extend(words[index:])
+            if command is not None:
+                positional.extend(words[index:])
             break
         if arg.startswith("-"):
             name, eq, value = arg.partition("=")
@@ -776,7 +816,8 @@ def _npm_words(args: list[str]) -> tuple[str | None, list[str], list[str], dict]
             options.append(arg)
             values[{"-C": "--prefix", "-w": "--workspace"}.get(name, name)] = value
         elif command is None:
-            command = arg
+            if arg in NPM_COMMANDS:
+                command = arg
         else:
             positional.append(arg)
     return command, positional, options, values
@@ -863,7 +904,7 @@ def npm_shim(args: list[str], *, env: dict | None = None, cwd: str | None = None
     if mode in ("off", "0", "no", "none"):
         return passthrough()
     command, positional, options, values = _npm_words(args)
-    if command not in INSTALL_COMMANDS or _global(options, values):
+    if command not in INSTALL_COMMANDS + TREE_COMMANDS or _global(options, values):
         return passthrough()                      # global: outside any worktree
     where = cwd
     if values.get("--prefix"):
@@ -878,6 +919,12 @@ def npm_shim(args: list[str], *, env: dict | None = None, cwd: str | None = None
     if pkg is None or not os.path.isfile(os.path.join(pkg, LOCKFILE)):
         return passthrough()
     link = os.path.join(pkg, NODE_MODULES)
+    if command in TREE_COMMANDS:
+        if os.path.islink(link):
+            os.unlink(link)
+            _say("shared node_modules unlinked in %s: `npm %s` works on a local tree"
+                 % (pkg, command))
+        return passthrough()
     ci = command in ("ci", "clean-install", "install-clean", "isntall-clean", "ic")
     plain = ci or (command not in ("install-test", "it", "install-ci-test", "cit")
                    and not positional)
@@ -1016,6 +1063,45 @@ def _gc_reason(entry: str, *, now: float, idle: float, worktrees, holders,
     return why
 
 
+def _gc_temp(item: dict, root: str, *, now: float, holders, dry_run: bool) -> list[dict]:
+    """An abandoned temporary fill: deleted after GRACE_S without change, if
+    no process uses it (a stray install script) and its key's lock is free
+    (a fill in progress)."""
+    temp = item["path"]
+    newest = max([item["mtime"]] + [_mtime(os.path.join(temp, n))
+                                    for n in _listdir(temp)])
+    if now - newest < GRACE_S:
+        return []
+    try:
+        if holders(temp):
+            return []
+    except platform.NotAvailable:
+        return []
+    line = {"kind": "deps", "action": "deleted", "path": temp,
+            "bytes": int(item["marker"].get("bytes") or 0),
+            "detail": "abandoned temporary fill"}
+    if dry_run:
+        return [dict(line, action="would-delete")]
+    lock = _lock(os.path.join(root, item["key"] + ".lock"), wait=0)
+    if lock is None:
+        return []
+    try:
+        remove_tree(temp, root)
+    except OSError as exc:
+        return [dict(line, action="kept", detail="abandoned temporary fill ; deletion "
+                                                 "failed: %s" % exc)]
+    finally:
+        lock.close()
+    return [line]
+
+
+def _listdir(path: str) -> list[str]:
+    try:
+        return os.listdir(path)
+    except OSError:
+        return []
+
+
 def _holders(entry: str) -> list[dict]:
     return platform.holders(entry, mapped=True)
 
@@ -1043,7 +1129,9 @@ def entries(cache_root: str) -> list[dict]:
                              for n in os.listdir(links_dir)] or [0.0])
         except OSError:
             last_link = 0.0
-        out.append({"key": name, "path": full, "complete": marker is not None,
+        temp = TMP_SEP in name
+        out.append({"key": name.split(TMP_SEP)[0], "path": full, "temp": temp,
+                    "complete": marker is not None and not temp,
                     "marker": marker or {}, "mtime": mtime, "last_link": last_link})
     return out
 
@@ -1078,9 +1166,13 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
 
     for item in entries(cache_root):
         entry = item["path"]
-        # cheap filter first, without writing (no worktree scan unless needed)
+        if item["temp"]:
+            out += _gc_temp(item, root, now=now, holders=holders, dry_run=dry_run)
+            continue
+        # cheap filter first (no worktree scan unless needed); it refreshes
+        # `.last-alive` of the entries it sees linked
         if not dry_run and _gc_reason(entry, now=now, idle=idle, worktrees=(),
-                                      holders=lambda _p: [], write=False) is None:
+                                      holders=lambda _p: [], write=True) is None:
             continue
         # links found by the scan are recorded (kept entries only; no dry run)
         why = _gc_reason(entry, now=now, idle=idle, worktrees=tops(), holders=holders,

@@ -33,21 +33,26 @@ point worktrees to it.
   a new entry. The link target depends only on the key.
 * **One install mode**: a fill is always a full development install,
   `npm ci --include=dev --include=optional --include=peer
-  --ignore-scripts=false`. `NODE_ENV` and the npm settings that change the
-  tree (`npm_config_omit`, `production`, `only`…) are removed from its
-  environment, and the explicit flags win over an npmrc. A turn that asks
+  --ignore-scripts=false`. Its environment is a whitelist: `PATH`, `HOME`,
+  `LANG`, `LANGUAGE`, `LC_*`, `TMPDIR`/`TMP`/`TEMP` and the npm download
+  cache (`npm_config_cache`); no `NODE_ENV`, no other `npm_config_*`, nothing
+  an install script could read, so the key needs no environment. The
+  explicit flags win over an npmrc. A turn that asks
   for another tree (`NODE_ENV=production`, `npm ci --omit=dev`) gets a local
   install from the real npm, never the shared tree.
-* **Filling**: `npm ci` runs once, IN the entry (absolute paths written by
-  install scripts stay valid). It runs under `<cache_root>/nm/<key>.lock`,
-  so a second agent waits for the first one (up to 30 min) instead of
-  installing again. The lock's descriptor is inherited by npm and its
-  install scripts: if the filling process dies, the lock is held until the
-  last of them exits, and nobody rebuilds the entry under them. Only the key files are copied
-  beside the lockfile for the install, and only `package.json` and the
-  lockfile are kept. The tree is then made read-only: directories 0555, files
-  without write bits. The marker is published last, by an atomic rename. If
-  the fill fails, the partial entry is deleted.
+* **Filling**: `npm ci` runs once, in a unique temporary directory
+  `<cache_root>/nm/<key>.tmp-<pid>-<random>`, under
+  `<cache_root>/nm/<key>.lock`, so a second agent waits for the first one
+  (up to 30 min) instead of installing again. The lock's descriptor is passed
+  to npm. Only the key files are copied beside the lockfile for the install,
+  and only `package.json` and the lockfile are kept. The tree is then made
+  read-only (directories 0555, files without write bits) and the marker is
+  written. Finally the directory is renamed to `<key>`, atomically, only if
+  `<key>` doesn't exist yet; otherwise it is discarded. A stray install
+  script left by a dead fill can only write into ITS temporary directory,
+  never into a published entry. If the fill fails, its temporary directory
+  is deleted. An install script that writes absolute paths sees the
+  temporary path.
 * **Read-only on purpose**: nothing can change the shared tree through a link.
   That includes `npm install <pkg>`, a postinstall run again, and
   `rm -rf node_modules/` with a trailing slash, which follows the link.
@@ -80,12 +85,16 @@ keep typing npm:
 |---|---|---|
 | `npm ci`, `npm install` (no package), neutral options only (`--prefer-offline`, `--no-audit`, `--silent`…), lockfile in sync with `package.json` | refused | `ameesh deps link --replace`: links the shared tree (fills it once) |
 | `npm install <pkg>`, `npm ci --omit=dev`, lockfile out of sync | refused | the shared link is removed, then the real npm installs a local tree |
+| `npm update`, `uninstall`, `rebuild`, `link`, `dedupe`, `prune` (and aliases) | refused | the shared link is removed, then the real npm works on a local tree |
 | `npm install -g …`, `npm test`, `npm run …`, anything else | passed through | passed through |
 
 `AMEESH_DEPS=off` passes everything through. `AMEESH_DEPS=allow-review`
 allows installs in a review worktree. With `policy.housekeeping.deps: false`,
 no wrapper is installed.
 
+The command is the first word that is an npm command name, wherever it sits
+(`npm --fetch-retries 2 ci` is `ci`); the word after `--prefix`, `-C`,
+`--location`, `--workspace`… written without `=` is never taken for it.
 `--prefix DIR` (`-C DIR`) is followed: the review check and the link apply to
 DIR. `--location=project` or `user` is not global. Nothing marks the real
 npm as "already wrapped" (the wrapper never finds itself as the real npm),
@@ -149,8 +158,10 @@ all of these hold:
   entry is kept;
 * its lock is free (no fill, no link being made).
 
-It also deletes a partial entry (no marker, lock free, no process) older
-than an hour. Everything is read again under the entry's lock right before
+Each pass refreshes `.last-alive` of every entry it sees linked. It also
+deletes an abandoned temporary fill (`<key>.tmp-…`) unchanged for 24 h, with
+no process in it and its key's lock free, and an unpublished `<key>`
+directory (no marker, lock free, no process) older than an hour. Everything is read again under the entry's lock right before
 deleting. Lock files are never deleted, so two fillers always lock the same
 inode. Without a readable registry, nothing is deleted. Each deletion is
 logged (`kind` `deps`).

@@ -123,7 +123,9 @@ class LinkTests(_Base):
         self.assertEqual((two["status"], two["filled"]), ("linked", False))
         self.assertEqual(len(installer.calls), 1)          # npm ci once per lockfile
         target = deps.entry_modules(deps.nm_root(self.cache), one["key"], "app")
-        self.assertTrue(installer.calls[0].endswith(os.path.join(one["key"], "app")))
+        # filled in a temporary directory of the key, renamed into place
+        self.assertTrue(os.path.basename(os.path.dirname(installer.calls[0])).startswith(
+            one["key"] + deps.TMP_SEP))
         for pkg in (first, second):
             link = os.path.join(pkg, "node_modules")
             self.assertTrue(os.path.islink(link))
@@ -319,6 +321,18 @@ class ReviewAndShimTests(_Base):
         code, calls = self._npm("-C", pkg, "install", "is-odd", cwd=self.base)
         self.assertEqual((code, calls), (0, [["-C", pkg, "install", "is-odd"]]))
         self.assertFalse(os.path.lexists(os.path.join(pkg, "node_modules")))
+
+    def test_unknown_value_options_and_tree_commands(self):
+        review = _package(os.path.join(self.base, "nexlink-codex2-review-ime"))
+        self.assertEqual(self._npm("--fetch-retries", "2", "ci", cwd=review), (1, []))
+        self.assertEqual(self._npm("update", cwd=review), (1, []))
+        pkg = _package(os.path.join(self.base, "w1"))
+        self._npm("ci", cwd=pkg)
+        self.assertTrue(os.path.islink(os.path.join(pkg, "node_modules")))
+        self.assertEqual(self._npm("rebuild", cwd=pkg), (0, [["rebuild"]]))
+        self.assertFalse(os.path.lexists(os.path.join(pkg, "node_modules")))
+        self.assertEqual(self._npm("--fetch-retries", "2", "test", cwd=review),
+                         (0, [["--fetch-retries", "2", "test"]]))
 
     def test_install_shim_and_real_npm(self):
         shim_dir = os.path.join(self.base, ".menage", deps.SHIM_DIR)
@@ -550,6 +564,109 @@ class ReviewFixesTests(_Base):
             self.assertTrue(deps._global(w[2], w[3]), args)
         w = deps._npm_words(["--global=false", "install"])
         self.assertFalse(deps._global(w[2], w[3]))
+
+
+class ReviewR2Tests(_Base):
+    """Review r2 of #234 (codex, 2026-10-12): one test per fix."""
+
+    def test_1_fill_sees_a_whitelisted_environment_only(self):
+        env = {"PATH": "/bin", "HOME": "/h", "LANG": "C.UTF-8", "LC_ALL": "C",
+               "TMPDIR": "/t", "npm_config_cache": "/c", "PATCH_MODE": "x",
+               "npm_config_script_shell": "/bin/zsh", "NODE_ENV": "production",
+               "npm_config_omit": "dev", "AMEESH_CACHE_DIR": "/a"}
+        self.assertEqual(deps.fill_env(env), {"PATH": "/bin", "HOME": "/h",
+                                              "LANG": "C.UTF-8", "LC_ALL": "C",
+                                              "TMPDIR": "/t", "npm_config_cache": "/c"})
+
+    def test_2_fill_works_in_a_temporary_directory_renamed_into_place(self):
+        pkg = _package(os.path.join(self.base, "w1"))
+        root = deps.nm_root(self.cache)
+        key = deps.cache_key(pkg)
+        seen = []
+
+        def installer(directory, env=None, *, lock_fd=None):
+            seen.append(directory)
+            FakeInstaller()(directory, env)
+        # a dead fill left its temporary directory, a stray script writes there
+        stray = os.path.join(root, key + deps.TMP_SEP + "1-dead")
+        os.makedirs(os.path.join(stray, "app", "node_modules"))
+        deps.fill(pkg, root, key, installer=installer)
+        self.assertIn(deps.TMP_SEP, seen[0])          # never the entry's own path
+        self.assertFalse(seen[0].startswith(deps.entry_of(root, key) + "/"))
+        with open(os.path.join(stray, "app", "node_modules", "late.js"), "w") as fh:
+            fh.write("stray")
+        self.assertFalse(os.path.exists(os.path.join(deps.entry_of(root, key), "app",
+                                                     "node_modules", "late.js")))
+        self.assertEqual(sorted(n for n in os.listdir(root) if deps.TMP_SEP in n),
+                         [os.path.basename(stray)])   # ours renamed, the stray one left
+        # another publisher first: our temporary directory is discarded
+        other = _package(os.path.join(self.base, "w2"))
+
+        def racing(directory, env=None, *, lock_fd=None):
+            FakeInstaller()(directory, env)
+        os.rename(deps.entry_of(root, key), os.path.join(self.base, "moved"))
+        with mock.patch.object(deps, "read_marker", side_effect=lambda e: (
+                {"key": key} if os.path.isdir(e) and e == deps.entry_of(root, key)
+                and os.path.exists(os.path.join(e, "x")) else None)):
+            os.makedirs(os.path.join(deps.entry_of(root, key), "x"))
+            self.assertEqual(deps.fill(other, root, key, installer=racing), {"key": key})
+        self.assertEqual(sorted(n for n in os.listdir(root) if deps.TMP_SEP in n),
+                         [os.path.basename(stray)])
+
+    def test_2_gc_deletes_abandoned_temporary_fills_after_the_grace(self):
+        root = deps.nm_root(self.cache)
+        stray = os.path.join(root, "a" * 64 + deps.TMP_SEP + "1-dead")
+        os.makedirs(os.path.join(stray, "app", "node_modules"))
+        os.chmod(os.path.join(stray, "app"), 0o555)
+        soon = time.time() + 3600
+        later = time.time() + deps.GRACE_S + 60
+        self.assertEqual(deps.gc_node_modules(self.cache, now=soon, holders=lambda _p: []),
+                         [])
+        busy = [{"pid": 1, "why": "dossier courant", "cmd": "node postinstall"}]
+        self.assertEqual(deps.gc_node_modules(self.cache, now=later, holders=lambda _p: busy),
+                         [])
+        held = deps._lock(os.path.join(root, "a" * 64 + ".lock"), wait=0)
+        try:
+            self.assertEqual(deps.gc_node_modules(self.cache, now=later,
+                                                  holders=lambda _p: []), [])
+        finally:
+            held.close()
+        lines = deps.gc_node_modules(self.cache, now=later, holders=lambda _p: [])
+        self.assertEqual([line["detail"] for line in lines], ["abandoned temporary fill"])
+        self.assertFalse(os.path.lexists(stray))
+
+    def test_3_cheap_filter_refreshes_last_alive_of_linked_entries(self):
+        pkg = _package(os.path.join(self.base, "w1"))
+        done = deps.link_package(pkg, self.cache, installer=FakeInstaller())
+        entry = deps.entry_of(deps.nm_root(self.cache), done["key"])
+        old = time.time() - 30 * 24 * 3600            # created and linked a month ago
+        for name in os.listdir(os.path.join(entry, deps.LINKS)):
+            os.utime(os.path.join(entry, deps.LINKS, name), (old, old))
+        marker_path = os.path.join(entry, deps.COMPLETE)
+        os.chmod(entry, 0o755)
+        with open(marker_path) as fh:
+            marker = json.load(fh)
+        marker["created"] = old
+        with open(marker_path, "w") as fh:
+            json.dump(marker, fh)
+        now = time.time()
+        self.assertEqual(deps.gc_node_modules(self.cache, now=now, idle=0,
+                                              holders=lambda _p: []), [])
+        self.assertTrue(os.path.isfile(os.path.join(entry, deps.ALIVE)))
+        # the link is replaced; a running server may still lazy-load from it
+        os.unlink(os.path.join(pkg, "node_modules"))
+        os.utime(os.path.join(entry, deps.ALIVE), (now, now))
+        self.assertEqual(deps.gc_node_modules(self.cache, now=now + 3600, idle=0,
+                                              holders=lambda _p: []), [])
+        self.assertTrue(os.path.isdir(entry))
+
+    def test_4_command_is_the_first_npm_command_name(self):
+        for args, command in ((["--fetch-retries", "2", "ci"], "ci"),
+                              (["--prefix", "test", "ci"], "ci"),
+                              (["--loglevel", "warn", "install", "x"], "install"),
+                              (["-C", "app", "--foo", "bar", "update"], "update"),
+                              (["--fetch-retries", "2"], None)):
+            self.assertEqual(deps._npm_words(args)[0], command, args)
 
 
 class _Cfg:
