@@ -70,7 +70,6 @@ class ResultSansUsageTest(Sandbox, PgTestCase):
         self.assertAlmostEqual(second.usd, 2.0)
         self.assertEqual(second.input_tokens, 10)
 
-
     def test_le_result_principal_final_decide(self):
         """Un `result` avec usage (sous-agent, ou principal plus tôt) ne fait pas
         sauter le repli si le `result` principal final n'en a pas."""
