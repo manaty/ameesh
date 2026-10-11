@@ -4,6 +4,7 @@ prioritaire de son équipe (extension de la prise automatique de L119)."""
 from __future__ import annotations
 
 import json
+import time
 import unittest
 
 from ameesh import backlog, notify, storage, work
@@ -81,9 +82,10 @@ class PriseDeLotTest(_Lots):
         sans_date = self.lot("sans date", priority=2)
         urgent = self.lot("urgent", priority=1)
         self.lot("basse", priority=3)
-        self.db.execute("UPDATE work_items SET planned_start = '2026-10-20' WHERE id = %s",
+        # dates passées : un début prévu après aujourd'hui attend (test suivant)
+        self.db.execute("UPDATE work_items SET planned_start = '2020-01-20' WHERE id = %s",
                         (tard["id"],))
-        self.db.execute("UPDATE work_items SET planned_start = '2026-10-12' WHERE id = %s",
+        self.db.execute("UPDATE work_items SET planned_start = '2020-01-12' WHERE id = %s",
                         (tot["id"],))
         self.assertEqual(
             [i["id"] for i in storage.of(self.db).work.unassigned_lots(10)][:4],
@@ -91,6 +93,31 @@ class PriseDeLotTest(_Lots):
         out = self.take()
         self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
                          [("a1", urgent["id"]), ("a2", tot["id"]), ("a3", tard["id"])])
+
+    def test_debut_prevu_apres_aujourd_hui(self):
+        self.agent("claude1", team="nexlink")
+        demain = self.lot("prévu demain", priority=1)
+        aujourd_hui = self.lot("prévu aujourd'hui", priority=2)
+        self.db.execute("UPDATE work_items SET planned_start = %s WHERE id = %s",
+                        (time.strftime("%Y-%m-%d", time.localtime(self.now + 86400)),
+                         demain["id"]))
+        self.db.execute("UPDATE work_items SET planned_start = %s WHERE id = %s",
+                        (time.strftime("%Y-%m-%d", time.localtime(self.now)),
+                         aujourd_hui["id"]))
+        out = self.take()
+        self.assertEqual([t["item"]["id"] for t in out], [aujourd_hui["id"]])
+        self.assertIsNone(work.get(self.db, demain["id"])["assignee"])
+        # le lendemain, il est pris
+        self.agent("claude2", team="nexlink")
+        out = self.take(now=self.now + 86400)
+        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
+                         [("claude2", demain["id"])])
+        self.assertFalse(backlog.lot_takeable(
+            {"state": "intake", "lot_team": "web", "planned_start": "2026-10-12"},
+            "2026-10-11"))
+        self.assertTrue(backlog.lot_takeable(
+            {"state": "intake", "lot_team": "web", "planned_start": "2026-10-11"},
+            "2026-10-11"))
 
     def test_equipe_du_lot_fiche_puis_application(self):
         self.agent("web1", team="web")

@@ -49,7 +49,9 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
 
 * Lots concernés : `intake`, sans assigné, créés il y a plus de 5 min. Un lot
   déjà confié par courrier (`build`), en `waiting_human`, de décision (demande
-  de décision en attente, jalon de décision ouvert) n'est jamais pris.
+  de décision en attente, jalon de décision ouvert) n'est jamais pris. Un
+  lot dont le début prévu (`ameesh work plan <id> --debut …`) est après
+  aujourd'hui attend sa date (exemple : un bilan à deux semaines).
 * Réserver un lot à une attribution explicite : capacité exigée `decision` ou
   `production`. Exiger un harnais : capacité `harness:<nom>`.
 * Équipe du lot : la sienne, sinon celle de sa fiche (ou de la fiche

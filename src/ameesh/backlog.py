@@ -55,6 +55,8 @@ l'attend, forfait d'abord, budget, hôte), et en plus :
   sans équipe connue n'est pas pris ;
 * l'agent sait le faire : les capacités exigées sont les siennes, et
   `harness:<nom>` désigne son harnais ;
+* un lot dont le début prévu (`planned_start`) est après aujourd'hui attend
+  sa date ;
 * ordre : priorité, puis dates prévues (début, fin, livraison), puis
   ancienneté ; un lot créé il y a moins de 5 min est laissé à qui l'a créé
   (il le confie sans doute dans la foulée) ;
@@ -236,13 +238,17 @@ def lot_notice(item: dict, agent: str, idle_for_s: float) -> str:
                 item["title"], int(item["id"])))
 
 
-def lot_takeable(item: dict) -> bool:
+def lot_takeable(item: dict, today: str | None = None) -> bool:
     """Un lot du projet peut-il être pris sans qu'on le confie ? Jamais un lot
     qui attend un humain (seuls les lots `intake` sans assigné arrivent ici),
     de décision (demande de décision en attente, jalon de décision ouvert,
     capacité `decision` exigée) ni de production (capacité `production`
-    exigée) ; jamais un lot sans équipe connue."""
+    exigée) ; jamais un lot sans équipe connue, ni un lot dont le début prévu
+    est après `today` (« AAAA-MM-JJ »)."""
     if item.get("state") != "intake" or (item.get("assignee") or "").strip():
+        return False
+    start = str(item.get("planned_start") or "")[:10]
+    if today and start and start > today:
         return False
     if item.get("pending_decision") or item.get("decision_milestone"):
         return False
@@ -297,7 +303,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                                                                     LOT_TAKE_NOTE)
     lots = st.work.unassigned_lots(200) if lot_room > 0 else []
     # un lot tout juste créé va sans doute être confié : on lui laisse le temps
-    lots = [item for item in lots if lot_takeable(item)
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
+    lots = [item for item in lots if lot_takeable(item, today)
             and now - float(item.get("created_ts") or now) >= LOT_MIN_AGE_S]
     room = 0
     if idle_s > 0 and max_per_hour > 0:
