@@ -13,3 +13,4 @@
 * [Multiple canons](plusieurs-canons.md) - What breaks when two canons share a host, the federation model, interim for Acme; lots L42–L45.
 * [Resident agent](agent-resident.md) - The human talks to the agent instead of taking it: tests of the harnesses (stream-json, app-server, ACP), resident process under a lease, inputs and authority, shared conversation, rotation, costs; decision 0035 accepted, lots L75–L83.
 * [Embeddable interface](ui-integrable.md) - Human actors and screens; v1 API (read, actions, SSE over LISTEN/NOTIFY, OpenAPI); web components; Electron and Nexlink page; OIDC and roles, approval by passkey; link with Nexlink Compute; lots L84–L93.
+* [macOS and Windows portability](portabilite-mac-windows.md) - What breaks or stops protecting outside Linux, Rust set aside for now, an `ameesh.plateforme` layer that refuses when a guarantee is missing; lots L63–L69.
