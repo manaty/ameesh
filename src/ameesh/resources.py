@@ -71,6 +71,17 @@ POWER_KEYS = ("min_battery_percent", "stop_battery_percent")
 #: clés de seuil reconnues dans `policy.resources` (liste fermée)
 THRESHOLD_KEYS = ("min_mem_available", "max_swap_used", "max_load", "min_disk_free",
                   "max_tmpfs_used", *POWER_KEYS)
+#: L159c : plafonds mémoire des unités d'agent, dans `policy.resources` aussi.
+#: Ce ne sont pas des seuils de contre-pression : systemd les fait respecter
+#: (`MemoryMax`), `ameesh doctor` vérifie l'écart entre le canon et l'unité.
+#: `agent_memory_max` : plafond de chaque agent de l'hôte ;
+#: `agent_memory_max_by_agent` : {agent: plafond}, qui l'emporte pour cet agent.
+AGENT_MEMORY_KEYS = ("agent_memory_max", "agent_memory_max_by_agent")
+#: plafond dur par agent quand aucune fiche n'en déclare : 2 à 4 Go par harnais
+#: actif (étude L159), 4,1 Go le 10/10 sur la VM du mesh avant l'OOM
+DEFAULT_AGENT_MEMORY_MAX = 6 * 1024 ** 3
+#: `MemoryHigh` (reprise de mémoire, ralentissement) à cette part du plafond dur
+AGENT_MEMORY_HIGH_RATIO = 0.9
 #: seuils exprimés en PART (0 < x <= 1, ou texte « 80% ») et non en octets
 FRACTION_KEYS = ("max_tmpfs_used",)
 #: dossier des sources d'alimentation (Linux) ; surchargé par les tests
@@ -86,6 +97,8 @@ _UNITS = {
     "b": 1,
     "kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4,
     "kb": 1000, "mb": 1000 ** 2, "gb": 1000 ** 3, "tb": 1000 ** 4,
+    # L159c : suffixes de systemd (`MemoryMax=6G`), en base 1024 comme lui
+    "k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4,
 }
 _BYTES_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)\s*$")
 
@@ -356,6 +369,32 @@ def declared(policy) -> dict:
         if value is not None:
             out[key] = value
     return out
+
+
+def agent_memory_cap(canons, host: str, agent: str) -> dict:
+    """L159c : plafond mémoire de l'unité d'exécuteur de `agent` sur `host`.
+
+    Le plus strict des plafonds déclarés par les fiches Host de l'hôte (L43) :
+    `agent_memory_max_by_agent[agent]` s'il existe dans au moins une fiche,
+    sinon `agent_memory_max`, sinon le défaut (6 Gio). Rend `max` et `high`
+    (octets ; `high` = 90 % de `max`) et `origin` (canon, ou « défaut »)."""
+    by_agent, by_host = [], []
+    for canon in canons or ():
+        fiche = canon.host(host) if hasattr(canon, "host") else None
+        if fiche is None:
+            continue
+        raw = getattr(getattr(fiche, "policy", None), "resources", None)
+        if not isinstance(raw, dict):
+            continue
+        label = getattr(canon, "id", "") or "?"
+        per_agent = raw.get("agent_memory_max_by_agent")
+        if isinstance(per_agent, dict) and parse_bytes(per_agent.get(agent)):
+            by_agent.append((parse_bytes(per_agent.get(agent)), label))
+        if parse_bytes(raw.get("agent_memory_max")):
+            by_host.append((parse_bytes(raw.get("agent_memory_max")), label))
+    chosen = min(by_agent or by_host or [(DEFAULT_AGENT_MEMORY_MAX, DEFAULT_ORIGIN)])
+    return {"max": chosen[0], "high": int(chosen[0] * AGENT_MEMORY_HIGH_RATIO),
+            "origin": chosen[1]}
 
 
 def host_limits(canons, host: str) -> dict:
