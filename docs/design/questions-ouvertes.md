@@ -40,6 +40,14 @@ the [decisions](decisions/)). Open as of 2026-10-05:
   application, the standalone page kept, and Nexlink never imposed, so the
   licence and single-application questions are closed; the others stay open.
 
+- macOS and Windows portability ([study](etudes/portabilite-mac-windows.md),
+  2026-10-10): native Windows or WSL2 first; psutil as a required or optional
+  dependency; logged `--force` or no bypass when a guarantee is missing; local
+  or remote database on macOS and Windows; signed executable (accounts and
+  certificates) or `uv tool install`; Rust "not now" to confirm after the
+  Nexlink Compute study; place of L63 (security fix for `adopt`) relative to
+  the lots in flight.
+
 # Awaiting a study or a prototype
 
 - Licenses: drafting the CLA and ownership of contributions produced by
