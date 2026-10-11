@@ -398,10 +398,12 @@ tests) :
 
 Le 2026-10-11 à 03:38, le `/tmp` d'un poste (12 Go en mémoire, douze agents)
 était plein à 83 % : la porte de pression de l'hôte a bloqué tous les nouveaux
-tours, et treize agents sont restés au repos. Depuis (L162), une entrée de
-`/tmp` apparue pendant un tour est supprimée par le ménage une fois inchangée
-depuis 2 h et tenue par aucun processus (travail git non poussé gardé) ; et
-l'alerte d'un tmpfs plein dit les plus grosses entrées et l'action attendue.
+tours, et treize agents sont restés au repos. Depuis (L162, #222), une entrée
+de `/tmp` apparue pendant un tour est signalée (`tmp_orphan`), mais jamais
+supprimée par ameesh : `/tmp` est commun à l'hôte, et rien ne prouve quel tour
+l'a créée. L'alerte la suit, taille à jour, avec la commande qui la supprime
+quand elle ne sert plus ; et l'alerte d'un tmpfs plein dit les plus grosses
+entrées et l'action attendue.
 Le texte de chaque tour de courrier rappelle cette règle.
 
 ## Ajouter plutôt que modifier (L160a)
