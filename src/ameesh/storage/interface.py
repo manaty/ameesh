@@ -69,7 +69,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    refresh_package_parents delegate current_delegation
                    mark_delegate_turn due_delegations resolve_delegation
                    overdue_delegations returned_delegations backlog_add backlog
-                   auto_takes_since issue_feed set_issue_ref
+                   auto_takes_since issue_feed set_issue_ref set_estimate
+                   estimates mark_started estimate_history
    packages       all get upsert retire
    actions         get recent attempts events log_event last_event_note
                    decision_queues covering_grants launched propose bind
@@ -794,10 +795,36 @@ class WorkItems(Domain):
             issue_ref: str | None, workstream: str | None, assignee: str | None,
             budget_usd: float | None, note: str, actor: str,
             package_id: str | None = None, package_parent: str | None = None,
-            branch: str | None = None, branch_target: str | None = None) -> dict:
+            branch: str | None = None, branch_target: str | None = None,
+            estimate_minutes: int | None = None, estimate_source: str | None = None) -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
-        `package_id`, L29 ; avec sa branche si `branch`, L118) et sa première
-        ligne de journal ; rend le lot."""
+        `package_id`, L29 ; avec sa branche si `branch`, L118 ; avec sa durée
+        estimée et sa ligne d'historique si `estimate_minutes`, L157) et sa
+        première ligne de journal ; rend le lot."""
+
+    @abc.abstractmethod
+    def set_estimate(self, item_id: int, minutes: int, *, source: str | None,
+                     actor: str) -> dict | None:
+        """L157 : pose l'estimation en vigueur d'un lot non terminé, avec sa
+        ligne d'historique (sans journal ni `updated_at`, comme une date
+        prévue) ; None si introuvable ou terminé."""
+
+    @abc.abstractmethod
+    def estimates(self, item_id: int) -> list[dict]:
+        """L157 : l'historique des estimations d'un lot (`minutes`, `source`,
+        `estimated_by`, `at_ts`), de la plus ancienne à la plus récente."""
+
+    @abc.abstractmethod
+    def mark_started(self, agent: str, item_ids, note: str) -> list[int]:
+        """L157 : premier tour de `agent` sur ces lots — ceux qui lui sont
+        assignés, ouverts et sans début mesuré, reçoivent `started_at`
+        (journalisé) ; rend leurs ids."""
+
+    @abc.abstractmethod
+    def estimate_history(self, *, app: str | None, limit: int) -> list[dict]:
+        """L157 : les lots livrés, les plus récents d'abord, avec début mesuré,
+        fusion, estimation en vigueur au début (`late` si posée après),
+        auteur, source et nombre d'estimations."""
 
     @abc.abstractmethod
     def set_branch(self, item_id: int, branch: str | None, target: str | None, *,

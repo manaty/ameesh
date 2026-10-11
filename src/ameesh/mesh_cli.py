@@ -802,6 +802,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
+            # L157 : durée estimée, obligatoire pour un agent (refus AVANT la
+            # création), avertissement pour un humain
+            from . import estimates
+            minutes = estimates.parse(args.estimate) if args.estimate else None
+            warn_estimate = estimates.check(db, args.actor, minutes)
             check = (work.check_assignee(db, args.assignee, externe=args.externe, cfg=cfg)
                      if args.assignee else None)
             item = work.add(
@@ -809,10 +814,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 body=args.body or "", issue_ref=args.issue_ref, workstream=args.workstream,
                 assignee=args.assignee, budget_usd=args.budget, actor=args.actor,
                 package=args.package, externe=args.externe, cfg=cfg,
-                branch=args.branch, branch_target=args.target)
-            print("lot #%d créé en %s : %s%s" % (
+                branch=args.branch, branch_target=args.target, estimate=minutes,
+                estimate_source=args.estimate_source)
+            print("lot #%d créé en %s : %s%s%s" % (
                 item["id"], item["state"], item["title"],
-                " (plan : %s)" % item["package_id"] if item.get("package_id") else ""))
+                " (plan : %s)" % item["package_id"] if item.get("package_id") else "",
+                " — estimé %s" % estimates.label(minutes) if minutes else ""))
+            if warn_estimate:
+                print("avertissement : %s" % estimates.missing(item["id"]), file=sys.stderr)
             _print_assignment(check)
             return 0
         if args.work_command == "assign":
@@ -922,6 +931,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             planned = (storage.of(db).roadmap.item_plans([args.id]) or [{}])[0]
             item["planned"] = {k: planned.get("planned_" + k)
                                for k in ("start", "end", "delivery", "source", "by")}
+            # L157 : durée estimée, réel mesuré, écart ; historique des estimations
+            from . import estimates
+            item["estimate"] = estimates.view(
+                item, merged_ts=(item["delays"] or {}).get("merged_ts"))
+            item["estimates"] = storage.of(db).work.estimates(args.id)
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
@@ -941,6 +955,17 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     item["planned"]["delivery"] or "—",
                     " (source : %s)" % item["planned"]["source"]
                     if item["planned"].get("source") else ""))
+            est = item["estimate"]
+            print("durée    : %s%s" % (est["label"], "".join([
+                " (source : %s)" % est["source"] if est.get("source") else "",
+                " — par %s, le %s" % (est["by"] or "?", _fmt_moment(est["at_ts"]))
+                if est.get("minutes") else "",
+                "" if est.get("started_ts") is None
+                else " — début mesuré %s" % _fmt_moment(est["started_ts"])])))
+            if len(item["estimates"]) > 1:
+                print("estimé   : %s" % " → ".join(
+                    "%s (%s)" % (estimates.label(e["minutes"]), e.get("estimated_by") or "?")
+                    for e in item["estimates"]))
             if item.get("state") == "closed":
                 print("fermé    : %s" % ("abandonné" if item.get("close_reason") == "abandoned"
                                          else "remplacé par #%s" % item.get("superseded_by")))
@@ -1608,6 +1633,11 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--target", default=None,
                         help="branche cible (défaut : git config ameesh.target du dépôt, "
                              "sinon origin/HEAD)")
+    pw_add.add_argument("--estimate", default=None, metavar="DURÉE",
+                        help="durée estimée du lot : 90m, 2h, 1h30, 1,5h, 2d (ou des "
+                             "minutes) — obligatoire pour un agent (L157)")
+    pw_add.add_argument("--estimate-source", default=None, metavar="SOURCE",
+                        help="d'où vient l'estimation (conception, historique bug ×1,3…)")
     pw_add.set_defaults(func=cmd_work)
     pw_list = work_sub.add_parser("list")
     pw_list.add_argument("--state", default=None)

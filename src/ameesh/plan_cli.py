@@ -10,6 +10,8 @@
   ameesh work project-github --repo R [--dry-run] [--canon-url URL] [--json]
   ameesh work project-github --app P [--repo R] [--dry-run] [--json]   (L126)
   ameesh work plan <id|fiche> [--debut J] [--fin J] [--livraison J] [--source S]  (L96)
+                  [--estimate 90m] [--estimate-source S]                (L157, une tâche)
+  ameesh work estimates [--app P] [--json]   (L157 : écarts réel/estimé, pour l'auditeur)
 
 Gardées hors de `mesh_cli` (qui les branche) pour que leurs évolutions n'y
 touchent pas. Voir `plan_github` pour les règles de GitHub (vue, jamais
@@ -24,7 +26,7 @@ import sys
 from . import plan_git, plan_github, work
 
 COMMANDS = ("link", "close", "sync-merges", "sync-branches", "sync-github", "project-github",
-            "plan")
+            "plan", "estimates")
 
 
 def add_parsers(work_sub, func) -> None:
@@ -89,10 +91,22 @@ def add_parsers(work_sub, func) -> None:
     p_plan.add_argument("--livraison", "--deploiement", "--delivery", dest="livraison",
                         default=None, help="livraison ou déploiement prévu")
     p_plan.add_argument("--source", default=None,
-                        help="d'où vient la date (conversation, décision, message…)")
+                        help="d'où vient la date (conversation, décision, message…) ; "
+                             "aussi celle de l'estimation, à défaut de --estimate-source")
+    p_plan.add_argument("--estimate", default=None, metavar="DURÉE",
+                        help="durée estimée d'une tâche : 90m, 2h, 1h30, 1,5h, 2d (L157)")
+    p_plan.add_argument("--estimate-source", default=None, metavar="SOURCE",
+                        help="d'où vient l'estimation (conception, historique…)")
     p_plan.add_argument("--actor", default="")
     p_plan.add_argument("--json", action="store_true")
     p_plan.set_defaults(func=func)
+
+    p_est = work_sub.add_parser(
+        "estimates", help="écarts réel/estimé des lots livrés, par type de lot et par auteur "
+                          "d'estimation (médiane, p80) — L157, pour l'auditeur")
+    p_est.add_argument("--app", default=None, metavar="PROJET", help="un projet seulement")
+    p_est.add_argument("--json", action="store_true", help="schéma ameesh-estimates/1")
+    p_est.set_defaults(func=func)
 
     p_proj = work_sub.add_parser(
         "project-github", help="une issue GitHub par lot d'un projet (--app, L126), ou le "
@@ -116,6 +130,14 @@ def run(db, args: argparse.Namespace) -> int:
     command = args.work_command
     if command == "plan":
         return _plan(db, args)
+    if command == "estimates":
+        from . import estimates
+        report = estimates.report(db, app=args.app)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print(estimates.format_report(report))
+        return 0
     if command == "link":
         if args.none == bool(args.package):
             print("erreur : une fiche OU --none", file=sys.stderr)
@@ -142,21 +164,49 @@ def run(db, args: argparse.Namespace) -> int:
 
 
 def _plan(db, args: argparse.Namespace) -> int:
-    """L96 : dates prévues d'une tâche ou d'une fiche WorkPackage."""
-    from . import roadmap
+    """L96 : dates prévues d'une tâche ou d'une fiche WorkPackage ; L157 :
+    durée estimée d'une tâche (`--estimate`)."""
+    from . import estimates, roadmap
 
     kwargs = {k: v for k, v in (("start", args.debut), ("end", args.fin),
                                 ("delivery", args.livraison)) if v is not None}
-    out = roadmap.plan(db, args.target, source=args.source, actor=args.actor, **kwargs)
+    if args.estimate is not None:
+        text = str(args.target).strip().lstrip("#")
+        if not text.isdigit():
+            raise estimates.EstimateError(
+                "--estimate se pose sur une tâche (son numéro), pas sur la fiche %s"
+                % args.target)
+        estimates.parse(args.estimate)          # illisible : rien n'est écrit
+        out = None
+        if kwargs:
+            out = roadmap.plan(db, args.target, source=args.source, actor=args.actor,
+                               **kwargs)
+        estimated = estimates.set_estimate(
+            db, int(text), args.estimate, source=args.estimate_source or args.source,
+            actor=args.actor)
+        if out is None:             # l'estimation seule : aucune date touchée
+            out = {"target": int(text), "kind": "task", "plan": None,
+                   "estimate": estimates.view(estimated)}
+            if args.json:
+                print(json.dumps(out, ensure_ascii=False, indent=2))
+            else:
+                print("tâche #%s : %s%s" % (text, out["estimate"]["label"],
+                                            " (source : %s)" % out["estimate"]["source"]
+                                            if out["estimate"].get("source") else ""))
+            return 0
+        out["estimate"] = estimates.view(estimated)
+    else:
+        out = roadmap.plan(db, args.target, source=args.source, actor=args.actor, **kwargs)
     if args.json:
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
     row = out["plan"]
     label = "tâche #%s" % out["target"] if out["kind"] == "task" else "fiche %s" % out["target"]
-    print("%s : début %s · fin %s · livraison %s%s" % (
+    print("%s : début %s · fin %s · livraison %s%s%s" % (
         label, row.get("planned_start") or "—", row.get("planned_end") or "—",
         row.get("planned_delivery") or "—",
-        " (source : %s)" % row["planned_source"] if row.get("planned_source") else ""))
+        " (source : %s)" % row["planned_source"] if row.get("planned_source") else "",
+        " · %s" % out["estimate"]["label"] if out.get("estimate") else ""))
     return 0
 
 

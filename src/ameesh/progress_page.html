@@ -366,6 +366,7 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
     add("état du lot", lot.work_state);
     if (lot.waiting_for) add("attend", lot.waiting_for.label);
     if (lot.delegation) add("délégation", lot.delegation.label);
+    if (lot.estimate && (lot.estimate.minutes || lot.estimate.actual_minutes !== null)) add("durée", lot.estimate.label);
     if (lot.stale) add("stagnant depuis", hm(lot.stale.since_ts) + " (" + dur(lot.stale.idle_s) + ")");
     add("epic", lot.epic); add("fiche", lot.package); add("PR", lot.pr_ref);
     add("auteur", lot.assignee); add("revue", lot.reviewer);
@@ -695,7 +696,7 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
       var reached = ["demandee", "debut", "soumise", "verdict", "livree"].filter(function (k) { return x.real[k]; })
         .map(function (k) { return LBL[k] + " " + dmTs(x.real[k]); });
       var det = el("div", "rm-detail", [planned(x.planned), reached.length ? "réel : " + reached.join(", ") : "",
-        x.assignee || ""].filter(Boolean).join(" · "));
+        x.estimate && x.estimate.minutes ? x.estimate.label : "", x.assignee || ""].filter(Boolean).join(" · "));
       source(det, x.source);
       if (x.commitments.length) det.appendChild(document.createTextNode(" · engagement(s) "
         + x.commitments.map(function (i) { return "e" + i; }).join(", ")));

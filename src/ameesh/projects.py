@@ -150,6 +150,13 @@ def build_agent(row: dict, now: float, paid_harnesses=None) -> dict:
     elif state == "paused":
         reason = _text(row.get("status_text")) or None
     lot = _lot_of(row)
+    lot_estimate = None
+    if lot is not None:
+        # L157 : durée estimée du lot en cours et temps écoulé depuis son début
+        from . import estimates
+        lot_estimate = estimates.view(
+            {"estimate_minutes": row.get("lot_estimate_minutes"),
+             "started_ts": row.get("lot_started_ts"), "state": lot.get("state")}, now=now)
     # L96 : la dernière avancée lue dans le fil (première ligne non vide de son
     # dernier message) et depuis quand il est sur sa tâche
     last_update = None
@@ -175,6 +182,8 @@ def build_agent(row: dict, now: float, paid_harnesses=None) -> dict:
         "host": row.get("host") or None,
         "payment": payment(row, paid_harnesses),
         "lot": lot,
+        # L157 (champ ajouté) : estimation et écoulé du lot en cours
+        "lot_estimate": lot_estimate,
         "task": task,
         "open_lots": int(row.get("open_lots") or 0),
         "unread": int(row.get("unread") or 0),
@@ -399,6 +408,13 @@ def _last_update(a: dict, now: float) -> str:
     return "avancée il y a %s : %s" % (_span(now - last["ts"]), last["text"])
 
 
+def _duration_cell(a: dict) -> str:
+    """L157 : la colonne courte DURÉE — écoulé/estimé du lot en cours
+    (« 1h10/2h », « 2h » pas commencé, « 2h40/2h! » dépassé, « — »)."""
+    from . import estimates
+    return estimates.cell(a.get("lot_estimate")) if a.get("lot") else "—"
+
+
 def _doing(a: dict, now: float | None = None) -> str:
     if a["lot"]:
         doing = "#%s %s" % (a["lot"]["id"], a["lot"]["title"])
@@ -442,8 +458,8 @@ def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = 
         for warning in p["warnings"]:
             wrap("! " + warning, indent + "  ")
         if p["agents"] and not narrow:
-            out.append(indent + "  %-*s %-19s %-7s %8s %4s  %s" % (
-                name_w, "AGENT", "ÉTAT", "PAIE", "24H $", "NL", "LOT EN COURS"))
+            out.append(indent + "  %-*s %-19s %-7s %8s %4s %-9s %s" % (
+                name_w, "AGENT", "ÉTAT", "PAIE", "24H $", "NL", "DURÉE", "LOT EN COURS"))
         for a in p["agents"]:
             pay = _FR_PAYMENT.get(a["payment"], "?")
             if narrow:
@@ -452,15 +468,17 @@ def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = 
                     a["name"], state_label(a, now), pay, a["usd_24h"], a["unread"]),
                     indent + "  ")
                 if _doing(a) != "—":
-                    wrap(_doing(a, now), indent + "    ")
+                    cell = _duration_cell(a)
+                    wrap(_doing(a, now) + (" · durée %s" % cell if cell != "—" else ""),
+                         indent + "    ")
                 if a.get("last_update"):
                     wrap(_last_update(a, now), indent + "    ")
                 if a["reason"]:
                     wrap("raison : " + a["reason"], indent + "    ")
                 continue
-            head = indent + "  %-*s %-19s %-7s %8.2f %4d  " % (
+            head = indent + "  %-*s %-19s %-7s %8.2f %4d %-9s " % (
                 name_w, a["name"][:name_w], state_label(a, now)[:19], pay, a["usd_24h"],
-                a["unread"])
+                a["unread"], _duration_cell(a)[:9])
             out.append(head + _short(_doing(a, now), max(12, width - len(head))))
             if a.get("last_update"):
                 pad = indent + "  " + " " * (name_w + 1)

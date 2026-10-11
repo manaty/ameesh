@@ -50,6 +50,7 @@ import time
 
 from . import config as config_mod
 from . import db as db_mod
+from . import estimates as estimates_mod
 from . import plan as plan_mod
 from . import roadmap_dev as dev
 from . import storage
@@ -170,7 +171,8 @@ def plan(db, target, *, start=_UNSET, end=_UNSET, delivery=_UNSET, source: str |
         if value is not _UNSET:
             dates[key] = parse_day(value, now=now, allow_clear=True)
     if not dates and source is None:
-        raise RoadmapError("rien à planifier : --debut, --fin ou --livraison (ou --source)")
+        raise RoadmapError("rien à planifier : --debut, --fin ou --livraison (ou --source ; "
+                           "--estimate pour la durée d'une tâche)")
     text = str(target).strip().lstrip("#")
     st = storage.of(db)
     if text.isdigit():
@@ -339,7 +341,8 @@ def _late(target: _dt.date | None, done_day: _dt.date | None, base: _dt.date,
 
 
 def build_task(item: dict, real: dict, *, base: _dt.date, epic: str | None,
-               commitments: list[dict], shown_state: str | None) -> dict:
+               commitments: list[dict], shown_state: str | None,
+               now: float | None = None) -> dict:
     state = item.get("state")
     delivered = dev.livree(state)
     abandoned = dev.abandonnee(state)
@@ -370,6 +373,9 @@ def build_task(item: dict, real: dict, *, base: _dt.date, epic: str | None,
                         by=item.get("planned_by") or None),
         "real": real, "late": late, "source": source,
         "commitments": [c["id"] for c in commitments],
+        # L157 : durée estimée, réel mesuré (début → livraison), écart
+        "estimate": estimates_mod.view(item, merged_ts=real.get("livree") if delivered
+                                       else None, now=now),
     }
 
 
@@ -474,7 +480,7 @@ def build(db, *, now: float | None = None, project: str | None = None,
                                 epic=plan_mod.epic_of(item.get("package_id"), by_pkg),
                                 commitments=[c for c in by_item.get(iid, [])
                                              if c["kind"] == "commitment"],
-                                shown_state=shown))
+                                shown_state=shown, now=now))
 
     # epics et jalons du plan : prévu (fiche) face au réel (ses tâches)
     spans: dict = {}
@@ -798,6 +804,8 @@ def format_gantt(view: dict, width: int | None = None, *, who: dict | None = Non
             t["assignee"] or "",
             planned_text(t["planned"]),
             ("réel : " + ", ".join(reached)) if reached else "",
+            (t.get("estimate") or {}).get("label") if (t.get("estimate") or {}).get("minutes")
+            else "",
             _flag(t),
             "source : %s" % src["label"] if src.get("label") else "",
             "engagement(s) %s" % ", ".join("e%d" % i for i in t["commitments"])

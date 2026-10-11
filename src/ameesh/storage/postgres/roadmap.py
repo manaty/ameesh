@@ -34,6 +34,10 @@ _ITEM_COLUMNS = ", ".join([
     _day("w.planned_start"), _day("w.planned_end"), _day("w.planned_delivery"),
     "w.planned_source", "w.planned_by",
     "extract(epoch from w.planned_at)::float8 AS planned_ts",
+    # L157 : durée estimée et début mesuré
+    "w.estimate_minutes", "w.estimate_source", "w.estimate_by",
+    "extract(epoch from w.estimate_at)::float8 AS estimate_ts",
+    "extract(epoch from w.started_at)::float8 AS started_ts",
 ])
 
 _COMMITMENT_COLUMNS = ", ".join([

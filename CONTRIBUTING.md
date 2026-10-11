@@ -17,7 +17,10 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   parallèles), l'intégration continue sur chaque PR : psycopg complet et psql
   sur les modules de `tests/parts/pilote-psql.txt` ; le psql complet tourne
   sur `main` et `release/*`. Un module de test qui touche la couche base ou un
-  comportement propre à un pilote s'ajoute à cette liste.
+  comportement propre à un pilote s'ajoute à cette liste. Une PR qui ne change
+  **que le numéro de version** (`pyproject.toml` seul, la seule ligne
+  `version = "…"`) ne relance pas la suite : `main` l'a déjà validée pour ce
+  contenu ; le contrôle « tests » reste vert (`scripts/version-only.py`, L157).
 - **En-tête de licence** `SPDX-License-Identifier: AGPL-3.0-only` en tête des
   nouveaux fichiers source.
 
