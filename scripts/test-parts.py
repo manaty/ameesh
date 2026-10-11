@@ -4,7 +4,8 @@
 
     scripts/test-parts.py repartir --parts N --part K --pilote psql [--liste F]
     scripts/test-parts.py lancer   --parts N --part K --pilote psql [--liste F]
-                                   [--durees-sortie F.json]
+                                   [--durees-sortie F.json] [--depuis REF]
+                                   [--flux F.jsonl] [--etiquette "psql 1/6"]
     scripts/test-parts.py durees   --pilote psql F.json [F.json…]
 
 La répartition est **déterministe** et se fait **par module** de test
@@ -24,16 +25,32 @@ durée de chaque module ; `durees` fusionne ces mesures dans la table.
 Le signal SIGINT est remis à son traitement par défaut avant les tests : lancé
 en arrière-plan par un shell, il serait sinon ignoré, et hérité ignoré par
 les sous-processus des tests (exécuteur, CLI) qui s'arrêtent sur SIGINT.
+
+L161b — **ordre simple** : avec `--depuis REF`, les fichiers changés entre
+REF et HEAD (`git diff --name-only`) classent les modules de la part :
+P0, le module de test lui-même a changé ; P1, son texte nomme un fichier
+changé (module Python `ameesh.x`, chemin ou nom de fichier) ; P3, le reste.
+Chaque part passe P0, puis P1 (les plus courts d'abord), puis le reste dans
+l'ordre alphabétique. Rien n'est sauté, et le découpage en parts ne change
+pas : seul l'ordre dans la part. C'est une heuristique textuelle, en
+attendant la carte mesurée (L161e) ; diff illisible : ordre alphabétique.
+
+L161b — **flux** : avec `--flux F.jsonl`, une ligne JSON par test terminé
+(schéma `ameesh-test-event/1`, écrite et vidée aussitôt), plus une ligne
+`debut` et une ligne `fin` par part. `scripts/ci-flux.py` en fait le résumé
+du job ; L161c le suivra en direct pour le courrier de l'agent.
 """
 from __future__ import annotations
 
 import argparse
 import collections
+import datetime
 import json
 import os
 import pathlib
 import re
 import signal
+import subprocess
 import sys
 import time
 import unittest
@@ -43,6 +60,10 @@ TESTS = REPO / "tests"
 TABLE = TESTS / "parts" / "durees.json"
 #: durée par test quand la table n'a rien pour le pilote (repli du repli)
 DEFAUT_PAR_TEST = 0.5
+#: schéma des lignes du flux (docs/design/etudes/l161-tests-par-impact.md)
+SCHEMA_FLUX = "ameesh-test-event/1"
+#: lignes de trace gardées dans l'extrait d'un échec
+EXTRAIT_LIGNES = 40
 
 
 def modules(tests: pathlib.Path = TESTS) -> list[str]:
@@ -98,6 +119,77 @@ def repartir(pesees: dict[str, float], parts: int) -> list[list[str]]:
     return [sorted(c) for c in contenu]
 
 
+def fichiers_changes(depuis: str, repo: pathlib.Path = REPO) -> list[str] | None:
+    """Fichiers changés entre `depuis` et HEAD, ou None si le diff est
+    illisible (historique trop court, référence inconnue)."""
+    try:
+        sortie = subprocess.run(
+            ["git", "diff", "--name-only", "--no-renames", depuis, "HEAD"], cwd=repo,
+            check=True, capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"ordre : diff depuis {depuis} illisible ({exc}) ; ordre alphabétique",
+              file=sys.stderr, flush=True)
+        return None
+    return [n for n in sortie.splitlines() if n.strip()]
+
+
+def noms_ambigus(repo: pathlib.Path = REPO) -> set[str]:
+    """Noms de fichier portés par plusieurs fichiers suivis (README.md…) :
+    un test qui les nomme ne désigne aucun d'eux en particulier."""
+    try:
+        suivis = subprocess.run(["git", "ls-files"], cwd=repo, check=True,
+                                capture_output=True, text=True).stdout.splitlines()
+    except (OSError, subprocess.CalledProcessError):
+        return set()
+    comptes = collections.Counter(pathlib.PurePosixPath(f).name for f in suivis)
+    return {nom for nom, n in comptes.items() if n > 1}
+
+
+def _motifs(chemin: str, ambigus: set[str] = frozenset()) -> list[re.Pattern]:
+    """Ce qui, dans le texte d'un module de test, désigne le fichier changé :
+    son chemin, son nom s'il est seul à le porter, son module Python."""
+    p = pathlib.PurePosixPath(chemin)
+    motifs = [re.compile(re.escape(chemin))]
+    if p.name not in ambigus and p.name != "__init__.py" and "." in p.name:
+        motifs.append(re.compile(r"(?<![\w.-])" + re.escape(p.name) + r"(?![\w-])"))
+    if p.suffix == ".py" and p.parts[0] == "src" and p.name != "__init__.py":
+        pointe = ".".join(p.with_suffix("").parts[1:])
+        parent, _, nom = pointe.rpartition(".")
+        motifs.append(re.compile(r"\b" + re.escape(pointe) + r"\b"))
+        if parent:
+            motifs.append(re.compile(
+                r"from\s+" + re.escape(parent) + r"\s+import\s+(?:\([^)]*|[^\n]*)\b"
+                + re.escape(nom) + r"\b"))
+    return motifs
+
+
+def classer(mods: list[str], changes: list[str], tests: pathlib.Path = TESTS,
+            ambigus: set[str] = frozenset()) -> dict[str, tuple[str, str]]:
+    """Classe et raison de chaque module : P0 (module changé), P1 (nomme un
+    fichier changé), P3 (le reste, raison vide)."""
+    prefixe = tests.relative_to(REPO).as_posix() + "/" if tests.is_relative_to(REPO) else "tests/"
+    motifs = [(c, _motifs(c, ambigus)) for c in changes]
+    classes = {}
+    for m in mods:
+        propre = f"{prefixe}{m}.py"
+        if propre in changes:
+            classes[m] = ("P0", propre)
+            continue
+        texte = (tests / f"{m}.py").read_text(encoding="utf-8")
+        raison = next((c for c, ms in motifs if c != propre and any(x.search(texte) for x in ms)), "")
+        classes[m] = ("P1", raison) if raison else ("P3", "")
+    return classes
+
+
+def ordonner(part: list[str], pesees: dict[str, float],
+             classes: dict[str, tuple[str, str]]) -> list[str]:
+    """P0 puis P1, les plus courts d'abord ; le reste dans l'ordre alphabétique."""
+    def cle(m):
+        classe = classes.get(m, ("P3", ""))[0]
+        return (classe, pesees.get(m, 0.0) if classe != "P3" else 0.0, m)
+    return sorted(part, key=cle)
+
+
 def selection(args) -> tuple[list[str], float, list[str]]:
     if not 1 <= args.part <= args.parts:
         raise SystemExit(f"part {args.part} hors de 1..{args.parts}")
@@ -109,25 +201,136 @@ def selection(args) -> tuple[list[str], float, list[str]]:
     return part, sum(pesees[m] for m in part), [m for m in repli if m in part]
 
 
+def _module_de(test) -> str:
+    module = type(test).__module__
+    if module.startswith("unittest"):  # _ErrorHolder (setUpClass en échec)
+        module = getattr(test, "description", "?").split("(")[-1].split(".")[0]
+    return module.rsplit(".", 1)[-1]
+
+
+def _horodatage() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds") \
+        .replace("+00:00", "Z")
+
+
+class Flux:
+    """Le fichier JSON lignes du flux : une ligne complète par événement,
+    vidée aussitôt (un lecteur qui suit le fichier ne voit jamais de ligne
+    coupée en deux écritures)."""
+
+    def __init__(self, chemin: str | os.PathLike, contexte: dict):
+        self._f = open(chemin, "w", encoding="utf-8")
+        self.contexte = contexte
+
+    def ecrire(self, type_: str, **champs) -> None:
+        ligne = {"v": 1, "schema": SCHEMA_FLUX, "type": type_, **self.contexte, **champs,
+                 "ts": _horodatage()}
+        self._f.write(json.dumps(ligne, ensure_ascii=False) + "\n")
+        self._f.flush()
+
+    def fermer(self) -> None:
+        self._f.close()
+
+
+def contexte_ci(etiquette: str) -> dict:
+    """Où tourne la part : dépôt, commit poussé (`AMEESH_CI_TETE`, la tête
+    de la PR) et commit testé, numéro d'exécution GitHub, s'ils sont connus."""
+    env = os.environ
+    execution = env.get("GITHUB_RUN_ID", "")
+    return {"depot": env.get("GITHUB_REPOSITORY", ""),
+            "tete": env.get("AMEESH_CI_TETE") or env.get("GITHUB_SHA", ""),
+            "fusion": env.get("GITHUB_SHA", ""),
+            "execution": int(execution) if execution.isdigit() else None,
+            "part": etiquette}
+
+
+#: du moins grave au plus grave : un test garde le pire de ses issues
+#: (sous-tests compris)
+_GRAVITE = ("succes", "saute", "echec_attendu", "succes_inattendu", "echec", "erreur")
+
+
 class _Resultat(unittest.TextTestResult):
     """Chronomètre par module : le temps écoulé depuis la fin du test précédent
-    est compté au module du test qui se termine (setUpClass compris)."""
+    est compté au module du test qui se termine (setUpClass compris).
+    Avec un flux (L161b), une ligne par test à sa fin."""
 
     durees: collections.Counter
+    flux: Flux | None = None
+    classes: dict = {}
 
     def startTestRun(self):
         self.durees = collections.Counter()
+        self.comptes = collections.Counter()
         self._depuis = time.monotonic()
+        self._courant = None
         super().startTestRun()
+
+    def startTest(self, test):
+        super().startTest(test)
+        self._courant, self._debut = test, time.monotonic()
+        self._statut, self._extrait = "succes", ""
+
+    def _noter(self, test, statut: str, err=None) -> None:
+        extrait = ""
+        if err is not None:
+            lignes = self._exc_info_to_string(err, test).rstrip().splitlines()
+            extrait = "\n".join(lignes[-EXTRAIT_LIGNES:])
+        if test is not self._courant:
+            # erreur hors d'un test : setUpClass, setUpModule, tearDownClass
+            self._emettre(test, statut, 0.0, extrait)
+            return
+        if _GRAVITE.index(statut) >= _GRAVITE.index(self._statut):
+            self._statut, self._extrait = statut, extrait or self._extrait
+
+    def addError(self, test, err):
+        super().addError(test, err)
+        self._noter(test, "erreur", err)
+
+    def addFailure(self, test, err):
+        super().addFailure(test, err)
+        self._noter(test, "echec", err)
+
+    def addSkip(self, test, reason):
+        super().addSkip(test, reason)
+        self._noter(test, "saute")
+
+    def addExpectedFailure(self, test, err):
+        super().addExpectedFailure(test, err)
+        self._noter(test, "echec_attendu")
+
+    def addUnexpectedSuccess(self, test):
+        super().addUnexpectedSuccess(test)
+        self._noter(test, "succes_inattendu")
+
+    def addSubTest(self, test, subtest, err):
+        super().addSubTest(test, subtest, err)
+        if err is not None:
+            echec = issubclass(err[0], test.failureException)
+            self._noter(test, "echec" if echec else "erreur", err)
+
+    def _emettre(self, test, statut: str, duree: float, extrait: str) -> None:
+        self.comptes[statut] += 1
+        if self.flux is None:
+            return
+        module = _module_de(test)
+        nom = test.id()
+        classe, raison = self.classes.get(module, ("P3", ""))
+        ligne = {"module": module, "test": nom, "classe": classe, "raison": raison,
+                 "statut": statut, "duree_s": round(duree, 3)}
+        if extrait:
+            ligne["extrait"] = extrait
+        if statut in ("echec", "erreur") and not nom.startswith(("setUp", "tearDown")):
+            ligne["rejouer"] = f"python -m unittest {nom}"
+        self.flux.ecrire("test", **ligne)
 
     def stopTest(self, test):
         super().stopTest(test)
         maintenant = time.monotonic()
-        module = type(test).__module__
-        if module.startswith("unittest"):  # _ErrorHolder (setUpClass en échec)
-            module = getattr(test, "description", "?").split("(")[-1].split(".")[0]
-        self.durees[module.rsplit(".", 1)[-1]] += maintenant - self._depuis
+        self.durees[_module_de(test)] += maintenant - self._depuis
         self._depuis = maintenant
+        if test is self._courant:
+            self._emettre(test, self._statut, maintenant - self._debut, self._extrait)
+            self._courant = None
 
 
 def lancer(args) -> int:
@@ -138,11 +341,38 @@ def lancer(args) -> int:
     if repli:
         print(f"  pesés par le nombre de tests (absents de {TABLE.relative_to(REPO)}) : "
               f"{', '.join(repli)}", file=sys.stderr, flush=True)
+    classes: dict[str, tuple[str, str]] = {}
+    changes = fichiers_changes(args.depuis) if args.depuis else None
+    if changes is not None:
+        classes = classer(part, changes, ambigus=noms_ambigus())
+        part = ordonner(part, poids(part, args.pilote)[0], classes)
+        touches = [m for m in part if classes[m][0] != "P3"]
+        print(f"  d'abord, touchés par les {len(changes)} fichier(s) changé(s) depuis "
+              f"{args.depuis} : {', '.join(touches) or 'aucun'}", flush=True)
+    etiquette = args.etiquette or f"{args.pilote} {args.part}/{args.parts}"
+    flux = Flux(args.flux, contexte_ci(etiquette)) if args.flux else None
+    if flux:
+        flux.ecrire("debut", pilote=args.pilote, modules=part,
+                    classes={m: classes.get(m, ("P3", ""))[0] for m in part},
+                    estimee_s=round(estimee, 1))
     os.chdir(REPO)
     sys.path[:0] = [str(REPO), str(REPO / "src")]
     suite = unittest.TestLoader().loadTestsFromNames([f"tests.{m}" for m in part])
-    runner = unittest.TextTestRunner(verbosity=2, resultclass=_Resultat)
-    resultat = runner.run(suite)
+    resultat_cls = type("_ResultatPart", (_Resultat,), {"flux": flux, "classes": classes})
+    runner = unittest.TextTestRunner(verbosity=2, resultclass=resultat_cls)
+    debut, resultat = time.monotonic(), None
+    try:
+        resultat = runner.run(suite)
+    finally:
+        if flux:
+            if resultat is None:  # interrompu (SIGINT, délai du job)
+                statut, comptes = "interrompu", {}
+            else:
+                statut = "succes" if resultat.wasSuccessful() else "echec"
+                comptes = dict(resultat.comptes)
+            flux.ecrire("fin", statut=statut, comptes=comptes,
+                        duree_s=round(time.monotonic() - debut, 1))
+            flux.fermer()
     durees = {m: round(t, 1) for m, t in sorted(resultat.durees.items())}
     if args.durees_sortie:
         pathlib.Path(args.durees_sortie).write_text(
@@ -176,6 +406,10 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--liste", help="fichier de modules (ex. tests/parts/pilote-psql.txt)")
         if nom == "lancer":
             p.add_argument("--durees-sortie", help="écrit les durées mesurées (JSON)")
+            p.add_argument("--depuis", help="référence git : les modules touchés par les "
+                           "fichiers changés depuis passent d'abord (ex. HEAD^1)")
+            p.add_argument("--flux", help="écrit un événement JSON par test (JSON lignes)")
+            p.add_argument("--etiquette", help="nom de la part dans le flux (ex. « psql 1/6 »)")
     p = sous.add_parser("durees")
     p.add_argument("--pilote", choices=("psql", "psycopg"), required=True)
     p.add_argument("fichiers", nargs="+")
