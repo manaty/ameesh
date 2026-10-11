@@ -489,7 +489,7 @@ class GithubTest(_PlanDb):
         epic = self.issue("[catalogue]")
         children = self.gh.repo(REPO)["sub_issues"][str(epic["number"])]
         self.assertEqual(sorted(children), sorted([rech["id"], export["id"]]))
-        self.assertIn("1/2 lots fusionnés", epic["body"])
+        self.assertIn("1/2 work items merged", epic["body"])
         # seconde projection : rien à écrire
         self.gh.reset_calls()
         again = plan_github.project_github(self.db, self.gh, REPO,
@@ -756,13 +756,13 @@ class PlanCliTest(_PlanDb):
         env = self.gh_env()
         out = self.mesh("work", "project-github", "--repo", REPO, "--dry-run", env=env)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("[essai]", out.stdout)
-        self.assertIn("à créer", out.stdout)
+        self.assertIn("[dry run]", out.stdout)
+        self.assertIn("to create", out.stdout)
         with open(self.gh_state, encoding="utf-8") as fh:
             self.assertEqual(json.load(fh)["repos"][REPO]["issues"], [])
         out = self.mesh("work", "sync-github", "--repo", REPO, env=env)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("1 lot(s) fermé(s)", out.stdout)
+        self.assertIn("1 work item(s) closed", out.stdout)
         self.assertEqual(work.get(self.db, 1)["state"], "merged")
         out = self.mesh("work", "project-github", "--repo", REPO, "--json", env=env)
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -1053,8 +1053,8 @@ class ContentMergeTest(_PlanDb):
         out = self.mesh("work", "sync-merges", "--git-dir", self.repo, "--target", "main",
                         "--repo", REPO, env=env)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("1 lot(s) fermé(s) par le contenu", out.stdout)
-        self.assertIn("1 lot(s) fermé(s) par leur PR fusionnée", out.stdout)
+        self.assertIn("1 work item(s) closed by content", out.stdout)
+        self.assertIn("1 work item(s) closed by their merged PR", out.stdout)
         self.assertEqual(work.get(self.db, by_content["id"])["state"], "merged")
         self.assertEqual(work.get(self.db, by_pr["id"])["state"], "merged")
         out = self.mesh("work", "sync-merges", "--git-dir", self.repo, "--target", "absente")
