@@ -117,18 +117,20 @@ class WorkItems(interface.WorkItems):
 
     def add(self, *, type, source, app, title, body, issue_ref, workstream,  # noqa: A002
             assignee, budget_usd, note, actor, package_id=None, package_parent=None,
-            branch=None, branch_target=None) -> dict:
+            branch=None, branch_target=None, priority=None) -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal."""
         rows = self.db.query(
             """
             INSERT INTO work_items
                 (type, source, app, title, body, issue_ref, workstream, assignee,
-                 budget_usd, state, package_id, package_parent, branch, branch_target)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'intake', %s, %s, %s, %s)
+                 budget_usd, state, package_id, package_parent, branch, branch_target,
+                 priority)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'intake', %s, %s, %s, %s, %s)
             RETURNING __COLUMNS__
             """.replace("__COLUMNS__", ITEM_COLUMNS),
             (type, source, app, title, body, issue_ref, workstream, assignee,
-             budget_usd, package_id, package_parent, branch, branch_target),
+             budget_usd, package_id, package_parent, branch, branch_target,
+             None if priority is None else int(priority)),
         )
         item = rows[0]
         self._event(int(item["id"]), "intake", note, actor)
@@ -635,6 +637,17 @@ class WorkItems(interface.WorkItems):
             " WHERE id = %s AND coalesce(issue_ref, '') = coalesce(%s, '')"
             " RETURNING id", (issue_ref, int(item_id), current))
         return bool(rows)
+
+    # -- demandes d'humains sans lot (L130) --------------------------------------
+    def recent_or_cited(self, *, since_ts, ids) -> list[dict]:
+        cited = sorted({int(i) for i in ids or ()})
+        extra = (" OR id IN (%s)" % ", ".join(["%s"] * len(cited))) if cited else ""
+        return self.db.query(
+            "SELECT id, title, source, body,"
+            "       extract(epoch from created_at)::float8 AS created_ts"
+            "  FROM work_items"
+            " WHERE created_at >= to_timestamp(%s)" + extra +
+            " ORDER BY id", (float(since_ts), *cited))
 
     def _event(self, item_id, state, note, actor) -> None:
         self.db.execute(

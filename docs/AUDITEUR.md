@@ -60,6 +60,7 @@ le JSON plutôt que le texte.
 | 7 | Lots et engagements | `ameesh projects --json`, `ameesh plan list`, `ameesh alerts --json` | lots ouverts sans agent (`orphan_lot`), `delegation_expired`, `engagement_overdue` |
 | 8 | Sécurité | `ameesh alerts --json`, `ameesh canon check`, `agent-mail bindings` | canon invalide, placement refusé, agent `execute` lié à une session externe, liaison inattendue, secret apparu dans un fil |
 | 9 | Ses propres suites | `ameesh work list --assignee auditeur --json`, `gh pr checks <n>` | correctif qui attend la CI ou un verdict ; fusionné mais pas déployé ; déploiement sans courrier de résultat ; mesure due sept jours après un déploiement |
+| 10 | Demandes d'humains sans lot (L130) | `ameesh work unrecorded --since 2h --json` (`--since 24h` en analyse profonde) | message d'un humain, réponse à une décision ou demande transmise par son chat qui n'est rattachée à aucun lot, n'en cite aucun et dont aucun lot ne reprend la phrase ; le rapport la nomme (numéro du message, expéditeur, destinataire, extrait) à l'orchestrateur du projet, qui l'enregistre ([ORCHESTRATEUR.md](ORCHESTRATEUR.md), « Toute demande d'un humain devient un lot ») |
 
 ### CI et réserve
 

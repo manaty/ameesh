@@ -675,6 +675,19 @@ class Mailbox(Domain):
         Rend une ligne par message renvoyé : `original_id`, `new_id`,
         `sender`, `kind`, `work_item_id`, `created_ts`."""
 
+    @abc.abstractmethod
+    def human_messages(self, *, since_ts: float, humans: Sequence[str],
+                       limit: int) -> list[dict]:
+        """L130 : les messages d'humains déposés depuis `since_ts`, du plus
+        ancien au plus récent (les `limit` plus récents) : expéditeur
+        `human:<id>`, marqué humain à l'envoi (`payload.human`), nommé dans
+        `humans` (humains déclarés), ou chat du propriétaire (`chat-…` inscrit
+        `externe`). Sans les accusés (`payload.ack`), les copies
+        (`payload.cc`) ni les demandes de décision. Colonnes : `id`, `sender`,
+        `recipient`, `body`, `kind`, `payload`, `work_item_id`, `lot_id` (le
+        lot existant que désigne `work_item_id`, sinon NULL), `created_ts`.
+        Lecture seule."""
+
 
 # --------------------------------------------------------------------------
 # réveil des exécuteurs (LISTEN/NOTIFY en Postgres)
@@ -794,10 +807,11 @@ class WorkItems(Domain):
             issue_ref: str | None, workstream: str | None, assignee: str | None,
             budget_usd: float | None, note: str, actor: str,
             package_id: str | None = None, package_parent: str | None = None,
-            branch: str | None = None, branch_target: str | None = None) -> dict:
+            branch: str | None = None, branch_target: str | None = None,
+            priority: int | None = None) -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
-        `package_id`, L29 ; avec sa branche si `branch`, L118) et sa première
-        ligne de journal ; rend le lot."""
+        `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
+        si `priority`, L130) et sa première ligne de journal ; rend le lot."""
 
     @abc.abstractmethod
     def set_branch(self, item_id: int, branch: str | None, target: str | None, *,
@@ -992,6 +1006,12 @@ class WorkItems(Domain):
         vide confondus) : faux si la valeur a changé entre-temps (un autre
         projecteur l'a posée). Ni journal ni `updated_at` : une projection
         n'est pas une activité du lot."""
+
+    @abc.abstractmethod
+    def recent_or_cited(self, *, since_ts: float, ids: Sequence[int]) -> list[dict]:
+        """L130 : les lots créés depuis `since_ts`, et ceux dont le numéro est
+        dans `ids` (cités par un message), quel que soit leur âge : `id`,
+        `title`, `source`, `body`, `created_ts`. Lecture seule."""
 
 
 # --------------------------------------------------------------------------

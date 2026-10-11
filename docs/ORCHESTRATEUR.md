@@ -23,6 +23,7 @@ lot**.
 | Situation | Commande |
 |---|---|
 | Nouveau travail | `ameesh mail send <agent> "…" --new-lot "RÉF : titre"` |
+| Demande d'un humain (L130) | `ameesh work add --title "RÉF : titre" --source "… « phrase exacte »" --priority N`, puis le message `--lot <id>` |
 | Lot existant, sans agent | `ameesh mail send <agent> "…" --lot <id\|RÉF>` |
 | Reprendre un lot à un autre agent | `ameesh work assign <id> <agent>`, puis le message `--lot <id>` |
 | Message sur un lot (relance, question) | `ameesh mail send <agent> "…" --lot <id>` |
@@ -36,6 +37,56 @@ lot**.
   (sortie d'erreur et fil). Il signale un oubli : rattacher le travail.
 * L'attribution passe par la garde habituelle : un agent non réveillable est
   refusé et rien n'est déposé.
+
+## Toute demande d'un humain devient un lot (L130)
+
+Constat du 2026-10-11 : depuis le 07/10, le propriétaire a fait 46 demandes ;
+27 n'ont eu aucun lot (15 ont pourtant été livrées, sans trace) et une
+promesse (« … je le mets juste derrière ») a été oubliée. Ces demandes
+arrivent surtout là où rien ne les retient : les conversations avec l'agent
+de conception, `ameesh chat` et la session de l'orchestrateur. Règle, pour
+l'orchestrateur, l'agent de conception (rôle `conception` de sa fiche au
+canon), le chat du propriétaire et tout agent à qui un humain demande
+quelque chose : **toute demande d'un humain (évolution, correctif, étude,
+geste) est enregistrée sur-le-champ comme lot, et la réponse à l'humain cite
+le numéro du lot.**
+
+* **Sur-le-champ** : avant de répondre et avant de commencer, même pour une
+  demande de cinq minutes, même pour « je le mets juste derrière ». Si un lot
+  ouvert couvre déjà la demande, on y rattache l'échange (`--lot`) et on cite
+  ce lot.
+* **La phrase exacte en source**, entre guillemets, avec son auteur et son
+  canal ; une **priorité** ; une **estimation** de durée :
+
+  ```
+  ameesh work add --title "RÉF : titre court" \
+      --source "human:<id> (chat|courrier|session) : « <phrase exacte> »" \
+      --priority 1|2|3 [--type bug] [--assignee <agent>] \
+      --body "Estimation : 2 h"
+  ```
+
+  Priorité : 1 haute (bloque l'humain ou un projet), 2 normale, 3 basse.
+  Estimation : la durée prévue jusqu'à la PR verte. Le lot L157 (#166) ajoute
+  aux lots une durée estimée : une fois livrée, elle se pose par son option de
+  `work add` ; d'ici là, une ligne « Estimation : … » dans le corps.
+* **Confier** : `ameesh mail send <agent> "…" --lot <id>` sur le lot créé.
+  `--new-lot "titre"` confie en un seul geste, et rattache le courrier (qui
+  porte la phrase de l'humain) au lot créé, mais sans priorité ni estimation :
+  `work add` reste préférable.
+* **Répondre** en citant le lot : « Enregistré : lot #142, priorité haute,
+  estimation 2 h. »
+* Une demande refusée ou remise à plus tard s'enregistre aussi : le lot se
+  ferme ensuite, avec sa raison (`ameesh work close <id> --abandoned`). Une
+  demande ne disparaît jamais sans trace.
+
+Contrôle : `ameesh work unrecorded [--since 24h] [--json]` liste, en lecture
+seule, les messages d'humains de la période (leur courrier, leurs réponses aux
+décisions, ce que transmet leur chat) qui ne sont rattachés à aucun lot, n'en
+citent aucun (`L142`, `lot #142`) et dont aucun lot ne reprend la phrase en
+source ([EXPLOITATION.md](EXPLOITATION.md#demandes-dhumains-sans-lot--ameesh-work-unrecorded-l130)).
+L'auditeur le passe à chaque passage court. Ce qu'un humain dit directement
+dans une session n'est pas en base : seul l'agent qui l'entend peut
+l'enregistrer.
 
 ## Toute décision du propriétaire passe par `ameesh decide ask`
 
@@ -67,8 +118,10 @@ ameesh decide ask --lot <id|RÉF> --question "Fusionner avant la démo ?" \
   rien : seule la file fait foi.
 * Une demande devenue sans objet : `ameesh decide withdraw <id>`.
 * Le propriétaire peut aussi te transmettre une demande par son chat
-  (`ameesh chat`, expéditeur `chat-<humain>`) : c'est une demande à traiter
-  comme un lot (`--lot`), pas une décision.
+  (`ameesh chat`, expéditeur `chat-<humain>`) : c'est une demande, pas une
+  décision. Elle t'arrive rattachée au lot que le chat a enregistré (L130) ;
+  sinon, enregistre-la toi-même (« Toute demande d'un humain devient un
+  lot »).
 
 ## Nommer la branche
 
