@@ -131,11 +131,7 @@ def check(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
     après application, versions appliquées inconnues de ce code — base plus
     récente que l'image, par exemple après un retour arrière).
     """
-    row = db.query("SELECT to_regclass('schema_migrations') IS NOT NULL AS ok")[0]
-    done: dict[int, str] = {}
-    if row.get("ok"):
-        done = {int(r["version"]): r["checksum"]
-                for r in db.query("SELECT version, checksum FROM schema_migrations")}
+    done = _applied_readonly(db)
     known = discover(directory)
     missing = [m for m in known if m.version not in done]
     modified = [m for m in known if m.version in done and done[m.version] != m.checksum]
@@ -144,6 +140,19 @@ def check(db: PsqlDriver | PsycopgDriver, directory: str = MIGRATIONS_DIR,
     return missing, modified, unknown
 
 
+def _applied_readonly(db: PsqlDriver | PsycopgDriver) -> dict[int, str]:
+    """Versions appliquées et leur empreinte, sans `create table` : vide si
+    `schema_migrations` n'existe pas encore."""
+    row = db.query("SELECT to_regclass('schema_migrations') IS NOT NULL AS ok")[0]
+    if not row.get("ok"):
+        return {}
+    return {int(r["version"]): r["checksum"]
+            for r in db.query("SELECT version, checksum FROM schema_migrations")}
+
+
 def status(db: PsqlDriver | PsycopgDriver) -> tuple[list[Migration], set[int]]:
-    """(migrations connues, versions appliquées) — pour `agent-mesh doctor`."""
-    return discover(), set(applied(db))
+    """(migrations connues, versions appliquées) — pour `agent-mesh doctor`.
+
+    Lecture seule (L146) : `doctor` n'écrit rien, pas même la table du
+    registre des migrations (`applied()` la crée au besoin)."""
+    return discover(), set(_applied_readonly(db))

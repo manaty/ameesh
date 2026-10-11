@@ -76,6 +76,22 @@ class MigrationsTest(PgTestCase):
                 "UPDATE schema_migrations SET checksum = %s WHERE version = 1", (connue,)
             )
 
+    def test_doctor_n_ecrit_rien(self):
+        """L146 : sur un schéma sans `schema_migrations`, `status()` (doctor)
+        lit sans créer la table."""
+        schema = "t_lecture_%s" % uuid.uuid4().hex[:8]
+        self.db.execute('CREATE SCHEMA "%s"' % schema)
+        db = self.connect(schema)
+        try:
+            known, done = migrations.status(db)
+            self.assertEqual(done, set())
+            self.assertTrue(known)
+            self.assertFalse(db.query(
+                "SELECT to_regclass('schema_migrations') IS NOT NULL AS ok")[0]["ok"])
+        finally:
+            db.close()
+            self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
+
     def test_version_en_double_refusee(self):
         with tempfile.TemporaryDirectory() as directory:
             for filename in ("0007_a.sql", "0007_b.sql"):

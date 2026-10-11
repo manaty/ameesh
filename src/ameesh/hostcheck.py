@@ -25,6 +25,11 @@ from . import adapters, harnesses, platform, registry
 
 #: modèle d'unité d'exécuteur par agent (docs/BASCULE.md, deploy/systemd)
 RUNNER_TEMPLATE = "ameesh-runner-agent@%s.service"
+#: unité SYSTÈME d'un serveur du mesh (profil L55, utilisateur `ameesh`) :
+#: `ameesh-runner@<persona>` (L146)
+SYSTEM_RUNNER_TEMPLATE = "ameesh-runner@%s.service"
+#: premier argument de `run` : la commande vise le gestionnaire système
+SYSTEM = "--system"
 #: états `systemctl is-enabled` qui démarrent l'unité au boot
 ENABLED_STATES = ("enabled", "enabled-runtime", "linked", "linked-runtime", "alias")
 _AGENTS_RE = re.compile(r"--agents[= ]([^\s;]+)")
@@ -35,17 +40,25 @@ SYSTEMCTL_ENV = "AMEESH_SYSTEMCTL"
 
 
 def _systemctl(*args: str) -> str | None:
-    """Sortie de `systemctl --user …`, ou None (pas de systemd, erreur)."""
+    """Sortie de `systemctl --user …` (`systemctl …` si le premier argument est
+    `SYSTEM`), ou None (pas de systemd, erreur)."""
     choisi = os.environ.get(SYSTEMCTL_ENV)
     if choisi == "":
         return None
     binary = choisi or shutil.which("systemctl")
     if not binary or not platform.is_linux():
         return None
+    scope = ["--user"]
+    if args[:1] == (SYSTEM,):
+        scope, args = [], args[1:]
     try:
-        proc = subprocess.run([binary, "--user", *args], capture_output=True, text=True,
+        proc = subprocess.run([binary, *scope, *args], capture_output=True, text=True,
                               timeout=5.0, check=False)
     except (OSError, subprocess.SubprocessError):
+        return None
+    if scope and proc.returncode != 0 and not proc.stdout:
+        # pas de gestionnaire utilisateur (session sans bus : `runuser -l
+        # ameesh` sur un serveur) : rien à lire, pas « aucune unité »
         return None
     return proc.stdout
 
@@ -90,32 +103,43 @@ def runner_coverage(names: list[str], run=_systemctl) -> dict | None:
     """L'unité d'exécuteur ACTIVÉE (démarrée au boot) qui mène chaque agent,
     ou None pour un agent qu'aucune ne mène. None en entier sans systemd.
 
-    Couvre : `ameesh-runner-agent@<agent>.service` activée ; toute autre unité
-    utilisateur activée dont le nom contient `runner` et qui lance ameesh —
-    `--agents a,b` la limite à ces agents, sans `--agents` elle les mène tous
+    Couvre, unités utilisateur puis unités système (L146) :
+    `ameesh-runner-agent@<agent>.service` (poste) ou
+    `ameesh-runner@<agent>.service` (serveur du mesh) activée ; toute autre
+    unité activée dont le nom contient `runner` et qui lance ameesh —
+    `--agents a,b` la limite à ces agents ; sans `--agents`, une instance
+    `x@<agent>` mène son agent, une unité simple les mène tous
     (l'`agent-runner.service` de BASCULE.md)."""
-    listing = run("list-unit-files", "--type=service", "--no-legend", "--plain")
-    if listing is None:
+    scopes = []
+    for scope in ((), (SYSTEM,)):
+        listing = run(*scope, "list-unit-files", "--type=service", "--no-legend", "--plain")
+        if listing is not None:
+            scopes.append((scope, listing))
+    if not scopes:
         return None
     covered: dict[str, str] = {}
     generic: list[str] = []
-    for line in listing.splitlines():
-        parts = line.split()
-        if len(parts) < 2:
-            continue
-        unit, state = parts[0], parts[1]
-        if "runner" not in unit or unit.endswith("@.service") or state not in ENABLED_STATES:
-            continue
-        exec_start = run("show", unit, "-p", "ExecStart", "--value") or ""
-        if "ameesh" not in exec_start and "agent-runner" not in exec_start:
-            continue
-        match = _AGENTS_RE.search(exec_start)
-        if match:
-            for name in match.group(1).split(","):
-                if name:
-                    covered.setdefault(name, unit)
-        else:
-            generic.append(unit)
+    for scope, listing in scopes:
+        for line in listing.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            unit, state = parts[0], parts[1]
+            if ("runner" not in unit or unit.endswith("@.service")
+                    or state not in ENABLED_STATES):
+                continue
+            exec_start = run(*scope, "show", unit, "-p", "ExecStart", "--value") or ""
+            if "ameesh" not in exec_start and "agent-runner" not in exec_start:
+                continue
+            match = _AGENTS_RE.search(exec_start)
+            if match:
+                for name in match.group(1).split(","):
+                    if name:
+                        covered.setdefault(name, unit)
+            elif "@" in unit:
+                covered.setdefault(unit.split("@", 1)[1].rsplit(".service", 1)[0], unit)
+            else:
+                generic.append(unit)
     out: dict[str, str | None] = {}
     for name in names:
         if name in covered:
@@ -124,9 +148,15 @@ def runner_coverage(names: list[str], run=_systemctl) -> dict | None:
         if generic:
             out[name] = generic[0]
             continue
-        unit = RUNNER_TEMPLATE % name
-        state = (run("is-enabled", unit) or "").strip().splitlines()
-        out[name] = unit if state and state[0] in ENABLED_STATES else None
+        out[name] = None
+        for scope, template in (((), RUNNER_TEMPLATE), ((SYSTEM,), SYSTEM_RUNNER_TEMPLATE)):
+            if scope not in [s for s, _listing in scopes]:
+                continue
+            unit = template % name
+            state = (run(*scope, "is-enabled", unit) or "").strip().splitlines()
+            if state and state[0] in ENABLED_STATES:
+                out[name] = unit
+                break
     return out
 
 
@@ -137,7 +167,7 @@ def missing_runner_lines(cfg, db, run=_systemctl) -> list[str]:
         return []
     coverage = runner_coverage([row["name"] for row in agents], run=run)
     if coverage is None:
-        return ["exécuteurs : systemd utilisateur indisponible — unités non vérifiées"]
+        return ["exécuteurs : systemd indisponible — unités non vérifiées"]
     manquants = sorted(name for name, unit in coverage.items() if unit is None)
     if not manquants:
         return ["exécuteurs : %d agent(s) mené(s), tous avec une unité activée"
@@ -145,8 +175,13 @@ def missing_runner_lines(cfg, db, run=_systemctl) -> list[str]:
     lines = ["attention  : %d agent(s) mené(s) sans unité d'exécuteur activée sur %s "
              "(ne repart pas au redémarrage ; une session attach morte n'est reprise "
              "par personne) : %s" % (len(manquants), cfg.host, ", ".join(manquants))]
+    # serveur du mesh (modèle système installé) : la commande système
+    serveur = (SYSTEM_RUNNER_TEMPLATE % "") in (
+        run(SYSTEM, "list-unit-files", "--type=service", "--no-legend", "--plain") or "")
     for name in manquants:
-        lines.append("             systemctl --user enable --now %s" % (RUNNER_TEMPLATE % name))
+        lines.append("             systemctl enable --now %s" % (SYSTEM_RUNNER_TEMPLATE % name)
+                     if serveur else
+                     "             systemctl --user enable --now %s" % (RUNNER_TEMPLATE % name))
     return lines
 
 
