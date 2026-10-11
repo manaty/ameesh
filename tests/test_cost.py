@@ -239,6 +239,84 @@ class AccountTailGaugeTest(Sandbox, unittest.TestCase):
         self.events("long", self.marker("", self.now), self.reading(0.89))
         self.assertEqual(self.book().claude_gauges("primary", "primary"), [])
 
+    def test_visible_marker_before_readings_skips_prefix_scan(self):
+        self.large_stream(self.marker("secondary", self.now), self.reading(0.42))
+        with mock.patch.object(cost, '_last_claude_marker') as scan:
+            self.assertAlmostEqual(self.book().claude_gauges('secondary', 'primary')[0].used, 0.42)
+            scan.assert_not_called()
+
+    def test_unchanged_journal_is_read_and_attributed_once_for_all_accounts(self):
+        self.large_stream(self.reading(0.89), self.marker('secondary', self.now), self.reading(0.42))
+        book = self.book()
+        with mock.patch.object(cost, '_claude_account_tail', wraps=cost._claude_account_tail) as read, \
+             mock.patch.object(cost, '_last_claude_marker', wraps=cost._last_claude_marker) as scan, \
+             mock.patch.object(cost, '_claude_account_readings', wraps=cost._claude_account_readings) as attribute:
+            for _ in range(3):
+                self.assertEqual(book.claude_gauges('primary', 'primary'), [])
+                self.assertAlmostEqual(book.claude_gauges('tertiary', 'primary')[0].used, 0.89)
+                self.assertAlmostEqual(book.claude_gauges('secondary', 'primary')[0].used, 0.42)
+            self.assertEqual(read.call_count, 1)
+            self.assertEqual(scan.call_count, 1)
+            self.assertEqual(attribute.call_count, 1)
+
+    def test_append_invalidates_cached_account_readings(self):
+        self.large_stream(self.reading(0.89))
+        book = self.book()
+        self.assertAlmostEqual(book.claude_gauges('tertiary', 'primary')[0].used, 0.89)
+        self.events('long', self.marker('secondary', self.now), self.reading(0.42))
+        self.assertAlmostEqual(book.claude_gauges('secondary', 'primary')[0].used, 0.42)
+        self.assertEqual(book.claude_gauges('primary', 'primary'), [])
+
+    def test_rewrite_same_size_and_mtime_invalidates_cache(self):
+        self.agent('long', 'claude')
+        self.events('long', self.marker('tertiary', self.now), self.reading(0.89))
+        path = os.path.join(self.state, 'long', 'events.jsonl')
+        book = self.book()
+        self.assertAlmostEqual(book.claude_gauges('tertiary', 'primary')[0].used, 0.89)
+        before = os.stat(path)
+        with open(path, 'r+b') as fh:
+            content = fh.read().replace(b'0.89', b'0.42')
+            fh.seek(0)
+            fh.write(content)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(os.stat(path).st_size, before.st_size)
+        self.assertAlmostEqual(book.claude_gauges('tertiary', 'primary')[0].used, 0.42)
+
+    def test_replacement_and_truncation_invalidate_cache(self):
+        self.agent('long', 'claude')
+        self.events('long', self.marker('tertiary', self.now), self.reading(0.89))
+        path = os.path.join(self.state, 'long', 'events.jsonl')
+        book = self.book()
+        self.assertAlmostEqual(book.claude_gauges('tertiary', 'primary')[0].used, 0.89)
+        before = os.stat(path)
+        with open(path, 'rb') as fh:
+            content = fh.read().replace(b'0.89', b'0.42')
+        with open(path + '.new', 'wb') as fh:
+            fh.write(content)
+        os.utime(path + '.new', ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.replace(path + '.new', path)
+        self.assertAlmostEqual(book.claude_gauges('tertiary', 'primary')[0].used, 0.42)
+        with open(path, 'wb'):
+            pass
+        self.assertEqual(book.claude_gauges('tertiary', 'primary'), [])
+
+    def test_prefix_failure_is_retried_on_unchanged_journal(self):
+        self.large_stream(self.reading(0.89))
+        book = self.book()
+        with mock.patch.object(cost, '_last_claude_marker', side_effect=OSError('temporary')):
+            self.assertEqual(book.claude_gauges('tertiary', 'primary'), [])
+        self.assertAlmostEqual(book.claude_gauges('tertiary', 'primary')[0].used, 0.89)
+
+    def test_legacy_cache_does_not_bind_to_first_requested_primary(self):
+        self.agent('long', 'claude')
+        self.events('long', self.reading(0.25))
+        book = self.book()
+        with mock.patch.object(cost, '_claude_account_tail', wraps=cost._claude_account_tail) as read:
+            self.assertAlmostEqual(book.claude_gauges('first', 'first')[0].used, 0.25)
+            self.assertAlmostEqual(book.claude_gauges('second', 'second')[0].used, 0.25)
+            self.assertEqual(book.claude_gauges('first', 'second'), [])
+            self.assertEqual(read.call_count, 1)
+
 
 class CodexGaugeTest(Sandbox, unittest.TestCase):
     def test_jauges_primaires_et_secondaires_du_journal_le_plus_recent(self):

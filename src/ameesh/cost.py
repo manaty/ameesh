@@ -342,6 +342,8 @@ class CostBook:
         #: L95 : dossiers Codex des comptes déclarés (`CODEX_HOME`), où chercher
         #: le journal d'un fil (modèle, total avant le tour) en plus du défaut
         self.codex_homes = [h for h in (codex_homes or []) if h]
+        # One compact reading map per journal, shared by all account lookups.
+        self._claude_gauge_cache: dict = {}
 
     # -- état local ---------------------------------------------------------
     def agent_dir(self, agent: str) -> str:
@@ -433,7 +435,8 @@ class CostBook:
 
         With `account` (L30), use the marker preceding each turn, including
         markers outside the read tail. Only a stream with no account marker
-        belongs to `primary`.
+        belongs to `primary`. Leading readings before any established marker
+        in a marked stream stay unknown, never primary.
         """
         if account is not None:
             return self._claude_gauges_of(account, primary or account)
@@ -470,29 +473,23 @@ class CostBook:
                 continue
             path = os.path.join(self.agent_dir(agent), "events.jsonl")
             try:
-                events, mtime = _claude_account_tail(path)
+                signature = _journal_signature(os.stat(path))
+                cached = self._claude_gauge_cache.get(path)
+                if cached is not None and cached[0] == signature:
+                    readings = cached[1]
+                else:
+                    events, stat, complete = _claude_account_tail(path)
+                    readings = _claude_account_readings(events, stat.st_mtime)
+                    if complete:
+                        self._claude_gauge_cache[path] = (_journal_signature(stat), readings)
+                    else:
+                        self._claude_gauge_cache.pop(path, None)
             except OSError:
-                # An unreadable prefix leaves the account unknown, never primary.
+                self._claude_gauge_cache.pop(path, None)
                 continue
-            marked = any(_is_claude_marker(e) for e in events)
-            current, stamp = (None, 0.0) if marked else (primary, mtime)
-            found = None
-            for event in events:
-                kind = event.get("type")
-                if kind == ACCOUNT_MARKER:
-                    if event.get("harness") not in (None, "", "claude"):
-                        continue
-                    current = str(event.get("account") or "") or None
-                    try:
-                        stamp = float(event.get("ts") or 0.0)
-                    except (TypeError, ValueError):
-                        stamp = 0.0
-                    continue
-                if kind != "rate_limit_event" or current != account:
-                    continue
-                gauges = _claude_windows(event)
-                if gauges is not None:
-                    found = (stamp, gauges)
+            found = readings.get(account)
+            if found is None and account == primary:
+                found = readings.get(None)  # fully verified, unmarked legacy stream
             if found and (best is None or found[0] >= best[0]):
                 best = found
         return best[1] if best else []
@@ -1412,8 +1409,38 @@ def _last_claude_marker(fh, end: int) -> dict | None:
     return None
 
 
-def _claude_account_tail(path: str) -> tuple[list, float]:
-    """Read a snapshot tail with its preceding account marker, on one handle."""
+def _journal_signature(stat) -> tuple:
+    # Inode/device cover replacement; nanosecond ctime covers in-place writes
+    # even when a producer restores mtime. Size detects append/truncation.
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _claude_account_readings(events: list, mtime: float) -> dict:
+    """Attribute all accounts in one pass; None is a verified legacy stream."""
+    marked = any(_is_claude_marker(e) for e in events)
+    current, stamp = None, 0.0 if marked else mtime
+    readings = {}
+    for event in events:
+        if _is_claude_marker(event):
+            current = str(event.get("account") or "") or None
+            try:
+                stamp = float(event.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                stamp = 0.0
+        elif event.get("type") == "rate_limit_event" and (current is not None or not marked):
+            gauges = _claude_windows(event)
+            if gauges is not None:
+                readings[current] = (stamp, gauges)
+    return readings
+
+
+def _claude_account_tail(path: str) -> tuple[list, os.stat_result, bool]:
+    """Read a snapshot tail and recover a preceding marker only if needed.
+
+    A visible marker before every tail reading makes prefix recovery redundant.
+    The final flag allows caching only complete, stable snapshots. Leading
+    readings in a marked stream without a preceding marker stay unknown.
+    """
     with open(path, "rb") as fh:
         stat = os.fstat(fh.fileno())
         start = max(0, stat.st_size - TAIL_BYTES)
@@ -1436,15 +1463,26 @@ def _claude_account_tail(path: str) -> tuple[list, float]:
                 continue
             if isinstance(event, dict):
                 events.append(event)
-        if start:
+        need_prefix = False
+        for event in events:
+            if _is_claude_marker(event):
+                break
+            if event.get("type") == "rate_limit_event":
+                need_prefix = True
+                break
+        complete = True
+        if start and need_prefix:
             try:
                 marker = _last_claude_marker(fh, start)
             except OSError:
                 # Preserve later explicit markers, but ignore the unknown turn.
                 marker = {"type": ACCOUNT_MARKER, "harness": "claude"}
+                complete = False
             if marker is not None:
                 events.insert(0, marker)
-        return events, stat.st_mtime
+        if _journal_signature(os.fstat(fh.fileno())) != _journal_signature(stat):
+            raise OSError("Account marker snapshot changed during read")
+        return events, stat, complete
 
 
 def _num(usage: dict, key: str) -> int:
