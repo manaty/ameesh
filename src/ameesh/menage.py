@@ -103,6 +103,10 @@ GIT_TIMEOUT = 20.0
 DEFAULT_ORPHAN_IDLE_S = 2 * 3600.0
 #: L162 : horizon des signalements relus par le passage (le journal en garde 30 j)
 ORPHAN_LOOKBACK_S = 7 * 24 * 3600.0
+#: #222: an unattributed /tmp entry, never deleted, is signaled again by the
+#: periodic pass once its last line is this old, so that it stays in the 24 h
+#: window of the alerts for as long as it exists
+UNATTRIBUTED_REFRESH_S = 12 * 3600.0
 #: L162 : nombre de plus grosses entrées de /tmp dites quand le tmpfs se remplit
 TMP_TOP = 5
 #: L162 : systèmes de fichiers en mémoire — jamais une racine gérée
@@ -1102,24 +1106,36 @@ def orphan_pass(db, host: str, policy: Policy, *, registered, protected: set,
     if not host:   # sans nom d'hôte, les signalements des autres hôtes s'y mêleraient
         return entries, plan, present
     try:
-        rows = storage.of(db).housekeeping.recent(host, ORPHAN_LOOKBACK_S, 500, kind="orphan")
+        # #222: the last line of every path, with no window nor limit: an
+        # unattributed entry is followed for as long as it exists
+        rows = storage.of(db).housekeeping.latest_by_path(host, "orphan")
     except Exception:
         return entries, plan, present
-    seen: set = set()
     for row in rows:
         path = row.get("path") or ""
-        if not path or path in seen:
+        if not path or row.get("action") != "signaled":
             continue
-        seen.add(path)
-        if row.get("action") != "signaled" or not os.path.lexists(path):
-            continue
+        if row.get("agent") and now - float(row.get("at_ts") or 0) > ORPHAN_LOOKBACK_S:
+            continue   # an attributed signal (before #222) is read for 7 days, as before
         data = row.get("data") or {}
         base_item = {"kind": "orphan", "path": path, "agent": row.get("agent"),
                      "lot": row.get("lot")}
+        if not os.path.lexists(path):
+            if not row.get("agent") and not dry_run:
+                # #222: the tracking of an unattributed entry ends when it is gone
+                entries.append(dict(base_item, action="gone", bytes=0, data=data,
+                                    detail="entrée non attribuée disparue de /tmp"))
+            continue
         action, why = _orphan_verdict(row, policy, base=base, registered=registered,
                                       protected=protected_real, running=running, now=now)
         size = size_of(path)
         plan.append(dict(base_item, action=action, bytes=size, detail=why))
+        if not row.get("agent") and not dry_run \
+                and now - float(row.get("at_ts") or 0) >= UNATTRIBUTED_REFRESH_S:
+            # #222: never deleted, an unattributed entry stays signaled, with
+            # its current size, for as long as it is on disk (alerts read 24 h)
+            entries.append(dict(base_item, action="signaled", bytes=size, data=data,
+                                detail=row.get("detail") or UNATTRIBUTED))
         item = {"path": path, "bytes": size, "agent": row.get("agent"),
                 "at_ts": row.get("at_ts"), "status": action, "detail": why,
                 "command": data.get("command") or "rm -rf -- %s" % shlex.quote(path)}
@@ -1507,19 +1523,42 @@ class Turn:
                     "agent": self.agent, "lot": lot if mine else None, "detail": detail})
         exclude = tuple(v for v in (self.env.get("TMPDIR"), self.env.get("AMEESH_CACHE_DIR"))
                         if v)
-        sort = (("supprimé par le ménage après %s sans changement s'il n'est tenu par aucun "
-                 "processus (L162)" % fmt_idle(policy.orphan_idle)) if policy.orphan_cleanup
-                else "jamais supprimé automatiquement (orphan_cleanup: false)")
-        for found in new_tmp_entries(self.tmp_before, min_size=policy.orphan_min_size,
-                                     exclude=exclude):
+        found_all = new_tmp_entries(self.tmp_before, min_size=policy.orphan_min_size,
+                                    exclude=exclude)
+        signaled = self._signaled(db, host) if found_all else set()
+        for found in found_all:
+            if (found["path"], str(found["ino"]), str(found["dev"])) in signaled:
+                continue  # #222: already signaled by another turn, its fate stays
+            # #222: /tmp is shared by the whole host (other agents, other meshes
+            # whose state directory is elsewhere, processes outside any turn):
+            # nothing proves that this turn created the entry, so it is never
+            # charged to it. Unattributed, it is never deleted (`_orphan_verdict`
+            # keeps an entry without agent); the `tmp_orphan` alert follows it,
+            # with its size and the command, for as long as it exists.
             self.entries.append({
                 "kind": "orphan", "action": "signaled", "path": found["path"],
-                "bytes": found["bytes"], "agent": self.agent, "lot": lot,
-                "detail": "apparu dans /tmp pendant le tour %s de %s (attribution probable) ; "
-                          "hors des dossiers gérés : %s" % (turn_id[:8], self.agent, sort),
-                "data": {"command": found["command"], "turn": turn_id,
-                         "ino": found["ino"], "dev": found["dev"]}})
+                "bytes": found["bytes"], "agent": None, "lot": None,
+                "detail": "%s : apparu dans /tmp pendant le tour %s de %s ; /tmp est commun "
+                          "à l'hôte (autres tours, autres meshes, processus hors tour) : "
+                          "jamais supprimé automatiquement" % (UNATTRIBUTED, turn_id[:8],
+                                                                 self.agent),
+                "data": {"command": found["command"], "turn": turn_id, "witness": self.agent,
+                         "lot": lot, "ino": found["ino"], "dev": found["dev"]}})
         return self.entries
+
+    def _signaled(self, db, host: str) -> set:
+        """#222: (path, inode, device) of the /tmp entries whose last line is
+        a signal (sticky rule: a later turn does not take it again). Without
+        database, or if the log cannot be read: none."""
+        if db is None or not host:
+            return set()
+        try:
+            rows = storage.of(db).housekeeping.latest_by_path(host, "orphan")
+        except Exception:
+            return set()
+        return {(r.get("path"), str((r.get("data") or {}).get("ino")),
+                 str((r.get("data") or {}).get("dev")))
+                for r in rows if r.get("action") == "signaled"}
 
 
 # --------------------------------------------------------------------------

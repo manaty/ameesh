@@ -2123,6 +2123,12 @@ class Housekeeping(Domain):
         dans les bilans), les plus récentes d'abord ; instant en `at_ts`."""
 
     @abc.abstractmethod
+    def latest_by_path(self, host: str | None, kind: str) -> list[dict]:
+        """#222: the last line of each (host, path) of this `kind` (of the host
+        if given), with no time window nor limit: only the retention of the
+        log bounds it."""
+
+    @abc.abstractmethod
     def summary(self, host: str | None, since_s: float) -> list[dict]:
         """Par (hôte, kind, action) : nombre de lignes et octets, sur les
         `since_s` dernières secondes (les bilans `mesure` exclus)."""
