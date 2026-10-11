@@ -12,12 +12,13 @@ rapides et l'arrêt. Postgres réel ; faux harnais `claude`.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import unittest
 from unittest import mock
 
-from ameesh import cli, mail, registry
+from ameesh import accounts, adapters, cli, mail, registry
 from ameesh.runner import AgentWorker, Runner
 
 from .support import FAKEBIN, PgTestCase
@@ -37,11 +38,13 @@ class HarnaisDuHookTest(unittest.TestCase):
 
 
 class _Base(PgTestCase):
-    def _worker(self, name: str):
-        runner = Runner(self.cfg, self.db, once=True)
+    def _worker(self, name: str, harness: str = "claude", comptes: dict | None = None):
+        cfg = (dataclasses.replace(self.cfg, accounts=comptes) if comptes is not None
+               else self.cfg)
+        runner = Runner(cfg, self.db, once=True)
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
-        self.register(name, "claude", cwd=cwd)
+        self.register(name, harness, cwd=cwd)
         lease = registry.claim(self.db, name, runner.runner_id, 3600)
         self.assertIsNotNone(lease)
         worker = AgentWorker(runner, registry.get(self.db, name), lease)
@@ -172,6 +175,157 @@ class RepriseVerifieeTest(_Base):
         with self._env():
             self.assertTrue(self._tour(worker))
         self.assertEqual(self.turns()[-1]["env"].get("AMEESH_HARNESS"), "claude")
+
+
+def _dossier(chemin: str, creds: str) -> str:
+    """Dossier de compte (L30) : fichier d'identifiants vide, seule sa
+    présence est vérifiée."""
+    os.makedirs(chemin, mode=0o700, exist_ok=True)
+    os.chmod(chemin, 0o700)
+    with open(os.path.join(chemin, creds), "w", encoding="utf-8"):
+        pass
+    os.chmod(os.path.join(chemin, creds), 0o600)
+    return chemin
+
+
+def _session_claude(home: str, session: str) -> None:
+    os.makedirs(os.path.join(home, "projects", "-work"), exist_ok=True)
+    with open(os.path.join(home, "projects", "-work", session + ".jsonl"), "w",
+              encoding="utf-8") as fh:
+        fh.write("{}\n")
+
+
+def _session_codex(home: str, session: str) -> None:
+    jour = os.path.join(home, "sessions", "2026", "10", "11")
+    os.makedirs(jour, exist_ok=True)
+    with open(os.path.join(jour, "rollout-2026-10-11T03-00-00-%s.jsonl" % session), "w",
+              encoding="utf-8") as fh:
+        fh.write("{}\n")
+
+
+class _Verifie(_Base):
+    """Contrôle actif (verdict codex #183, P2) : comptes, bascule, codex,
+    dossier posé par le descripteur, stockage introuvable."""
+
+    def _tour(self, worker, compte: str | None = None, **env) -> bool:
+        if compte is not None:
+            harness = worker.agent["harness"]
+            worker._account_override = accounts.by_name(
+                accounts.profiles(worker.cfg, harness), compte)
+        base = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log,
+                "AMEESH_SESSION_STORE_CHECK": "1"}
+        base.update(env)
+        with mock.patch.dict(os.environ, base):
+            return worker.run_turn({"kind": "prompt", "prompt": "travail", "ids": []})
+
+    def _reprise(self, flag: str = "--resume") -> str | None:
+        argv = self.turns()[-1]["argv"]
+        return argv[argv.index(flag) + 1] if flag in argv else None
+
+    def _avec_session(self, worker, session: str) -> None:
+        registry.set_session(self.db, worker.name, session)
+        worker.agent = registry.get(self.db, worker.name)
+
+
+class DossierDuTourTest(_Verifie):
+    def test_dossier_pose_par_le_descripteur(self):
+        # P1 : sans compte déclaré, le descripteur pose CLAUDE_CONFIG_DIR ; les
+        # sessions sont là, pas dans le dossier de l'exécuteur
+        vide = os.path.join(self.tmp, "claude-executeur")
+        os.makedirs(os.path.join(vide, "projects"))
+        descripteur = os.path.join(self.tmp, "claude-descripteur")
+        _session_claude(descripteur, CLAUDE)
+        _runner, worker = self._worker("md-desc")
+        self._avec_session(worker, CLAUDE)
+        env_harnais = adapters.HarnessAdapter.env
+        with mock.patch.object(adapters.HarnessAdapter, "env", lambda a: dict(
+                env_harnais(a), CLAUDE_CONFIG_DIR=descripteur)):
+            self.assertTrue(self._tour(worker, CLAUDE_CONFIG_DIR=vide))
+        self.assertEqual(self._reprise(), CLAUDE)
+        self.assertEqual(self.turns()[-1]["compte"]["CLAUDE_CONFIG_DIR"], descripteur)
+
+    def test_stockage_introuvable_session_gardee(self):
+        # dans le doute, la session est gardée (reprise ratée rattrapée)
+        sans_projets = os.path.join(self.tmp, "claude-sans-projets")
+        os.makedirs(sans_projets)
+        _runner, worker = self._worker("md-doute")
+        self._avec_session(worker, CODEX)
+        self.assertTrue(self._tour(worker, CLAUDE_CONFIG_DIR=sans_projets))
+        self.assertEqual(self._reprise(), CODEX)
+
+
+class ComptesClaudeTest(_Verifie):
+    def setUp(self) -> None:
+        super().setUp()
+        self.a = _dossier(os.path.join(self.tmp, "comptes", "claude-1"), ".credentials.json")
+        self.b = _dossier(os.path.join(self.tmp, "comptes", "claude-2"), ".credentials.json")
+        for home in (self.a, self.b):
+            os.makedirs(os.path.join(home, "projects"), exist_ok=True)
+        self.comptes = {"claude": [{"name": "primaire", "path": self.a},
+                                   {"name": "secondaire", "path": self.b}]}
+
+    def test_compte_secondaire_session_connue(self):
+        _session_claude(self.b, CLAUDE)
+        _runner, worker = self._worker("md-sec", comptes=self.comptes)
+        self._avec_session(worker, CLAUDE)
+        self.assertTrue(self._tour(worker, "secondaire"))
+        self.assertEqual(self._reprise(), CLAUDE)
+        self.assertEqual(self.turns()[-1]["compte"]["CLAUDE_CONFIG_DIR"], self.b)
+
+    def test_compte_secondaire_session_inconnue_partout(self):
+        _session_claude(self.a, CLAUDE)
+        _runner, worker = self._worker("md-sec-x", comptes=self.comptes)
+        self._avec_session(worker, CODEX)
+        self.assertTrue(self._tour(worker, "secondaire"))
+        self.assertIsNone(self._reprise())
+        self.assertEqual(registry.get(self.db, "md-sec-x")["session_id"], "claude-sess-1")
+
+    def test_bascule_de_compte_session_de_l_autre_compte_gardee(self):
+        # session ouverte sous le primaire, tour sous le secondaire : elle
+        # existe sous un compte déclaré — jamais effacée (doute)
+        _session_claude(self.a, CLAUDE)
+        _runner, worker = self._worker("md-bascule", comptes=self.comptes)
+        self._avec_session(worker, CLAUDE)
+        self.assertTrue(self._tour(worker, "secondaire"))
+        self.assertEqual(self._reprise(), CLAUDE)
+
+
+class CodexTest(_Verifie):
+    FIL = "019a0000-1111-7222-8333-444455556666"
+
+    def test_fil_codex_connu_repris(self):
+        home = os.path.join(self.tmp, "codex-home")
+        _session_codex(home, self.FIL)
+        _runner, worker = self._worker("cx-ok", harness="codex")
+        self._avec_session(worker, self.FIL)
+        self.assertTrue(self._tour(worker, CODEX_HOME=home))
+        self.assertEqual(self._reprise("resume"), self.FIL)
+
+    def test_fil_codex_inconnu_jamais_repris(self):
+        home = os.path.join(self.tmp, "codex-home-2")
+        _session_codex(home, self.FIL)
+        _runner, worker = self._worker("cx-x", harness="codex")
+        self._avec_session(worker, CLAUDE)  # un id claude retenu à tort
+        self.assertTrue(self._tour(worker, CODEX_HOME=home))
+        self.assertIsNone(self._reprise("resume"))
+
+    def test_compte_codex_secondaire(self):
+        a = _dossier(os.path.join(self.tmp, "comptes", "codex-1"), "auth.json")
+        b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), "auth.json")
+        os.makedirs(os.path.join(a, "sessions"))
+        _session_codex(b, self.FIL)
+        comptes = {"codex": [{"name": "primaire", "path": a},
+                             {"name": "secondaire", "path": b}]}
+        _runner, worker = self._worker("cx-sec", harness="codex", comptes=comptes)
+        self._avec_session(worker, self.FIL)
+        self.assertTrue(self._tour(worker, "secondaire"))
+        self.assertEqual(self._reprise("resume"), self.FIL)
+        # un id claude retenu à tort : écarté, retour au dernier fil principal
+        # du flux (fichier local), qui existe sous le compte du tour
+        self._avec_session(worker, CLAUDE)
+        self.assertTrue(self._tour(worker, "secondaire"))
+        self.assertEqual(self._reprise("resume"), self.FIL)
+        self.assertEqual(registry.get(self.db, "cx-sec")["session_id"], self.FIL)
 
 
 if __name__ == "__main__":

@@ -1506,19 +1506,62 @@ class AgentWorker(threading.Thread):
     #: L224 : harnais dont le stockage de sessions est connu (`reprise.find_session`)
     SESSION_STORES = ("claude", "codex", "deepseek")
 
-    def _session_connue(self, harness: str, compte):
+    def _session_connue(self, harness: str, compte, adapter):
         """L224 : prédicat « cette session existe dans le stockage de sessions
-        du harnais, sous le dossier du compte du tour » ; None quand on ne
-        sait pas le vérifier (autre harnais, compte invalide) ou que
-        `AMEESH_SESSION_STORE_CHECK=0` (banc de test : sessions factices)."""
+        du harnais, tel que le tour le verra » ; None quand on ne sait pas le
+        vérifier (autre harnais, compte invalide, `AMEESH_SESSION_STORE_CHECK=0`
+        du banc de test, stockage introuvable).
+
+        Le dossier du harnais se résout comme au lancement : environnement de
+        l'exécuteur, puis `adapter.env()` (un descripteur peut poser
+        `CLAUDE_CONFIG_DIR` ou `CODEX_HOME`), puis le compte du tour
+        (`accounts.launch_env`). Le prédicat ne dit « inconnue » que si la
+        session n'est ni là, ni sous un autre compte déclaré du harnais : dans
+        le doute, la session est gardée (verdict codex #183) — une reprise
+        ratée est rattrapée, un faux négatif efface une vraie session."""
         if (harness not in self.SESSION_STORES or compte is account_turn.INVALID
                 or os.environ.get("AMEESH_SESSION_STORE_CHECK") == "0"):
             return None
         from . import accounts, reprise
-        profil = compte if compte is not None else accounts.Profile(
-            harness=harness, name="(défaut)")
-        home = profil.home()
-        return lambda session: reprise.find_session(harness, home, session) is not None
+        try:
+            env = os.environ.copy()
+            env.update(adapter.env())  # même ordre que le lancement du tour
+            declared = accounts.parse(getattr(self.cfg, "accounts", None) or {})
+            if declared:
+                accounts.launch_env(env, declared, compte)
+            variable = accounts.config_env_of(harness)
+            home = os.path.abspath(os.path.expanduser(
+                (env.get(variable) if variable else "")
+                or accounts.default_home_of(harness)))
+            autres = [h for _nom, h in reprise.search_homes(self.cfg, harness)
+                      if os.path.abspath(h) != home]
+        except Exception as exc:  # configuration illisible : on ne sait pas
+            self._avertit_session("dossier du harnais %s non résolu (%s)" % (harness, exc))
+            return None
+        if not os.path.isdir(reprise.session_root(harness, home)):
+            self._avertit_session("stockage de sessions %s introuvable"
+                                  % reprise.session_root(harness, home))
+            return None
+
+        def connue(session: str) -> bool:
+            if reprise.find_session(harness, home, session):
+                return True
+            for autre in autres:
+                if reprise.find_session(harness, autre, session):
+                    self._avertit_session(
+                        "session %s trouvée sous %s, pas sous %s (dossier du tour) : "
+                        "gardée" % (session, autre, home))
+                    return True
+            return False
+        return connue
+
+    def _avertit_session(self, texte: str) -> None:
+        """L224 : un doute sur la session est dit une fois par texte (pas à
+        chaque tour), et la session est gardée."""
+        dits = self.__dict__.setdefault("_avertissements_session", set())
+        if texte not in dits:
+            dits.add(texte)
+            log_async("[%s] vérification de session impossible : %s" % (self.name, texte))
 
     # -- hôte non prêt (L106) ------------------------------------------------
     #: statut et préfixe d'erreur d'un blocage « hôte non prêt » (levé seulement
@@ -2642,7 +2685,7 @@ class AgentWorker(threading.Thread):
 
         compte = account_turn.for_turn(self)  # L30 : compte de ce tour (ou None)
         session = self.current_session()
-        connue = (self._session_connue(harness, compte)
+        connue = (self._session_connue(harness, compte, adapter)
                   if session and not self.runner.dry_run else None)
         if connue is not None and not connue(session):
             # L224 : jamais de --resume sur un id inconnu du harnais et du
