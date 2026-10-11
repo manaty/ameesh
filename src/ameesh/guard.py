@@ -23,18 +23,23 @@ threshold (hysteresis); `seq` grows on every change. The state expires
 (`expires_ts`, `state_ttl_s`, rewritten every third of it): a guard that
 stops leaves a state that soon reads as `stopped`.
 
-Tranche 1 (this module) **observes**: it decides and publishes, it enforces
-nothing (`--observe`). Kernel caps (`systemctl set-property --runtime`) and
-the freeze come with tranche 2, the drain and the stop with tranche 3.
+Levels 0 to 2 are enforced (tranche 2): the state's caps become properties
+of the guest's slice and of its agents' units (`systemctl set-property
+--runtime`: CPUWeight, IOWeight, CPUQuota, MemoryHigh, MemoryMax; MemoryMax per
+agent), and level 2 freezes the slice (`systemctl freeze`, thawed when the
+level drops, when the guard stops and when it starts). `caps.enforced` lists
+what is actually in force. `--observe` decides and publishes only. The wait
+for the drain and the stop come with tranche 3.
 
     ameesh guard check [--config F] [--json]       one measure, the decision, the state
-    ameesh guard run --observe [--config F]        the loop; writes the state file
+    ameesh guard run [--observe] [--config F]      the loop; writes the state file
 
 Configuration (`/etc/ameesh/guard.json`, `--config`, `AMEESH_GUARD_CONFIG`):
 
     {"host": "vm-example", "max_agents": 3,
      "state_path": "/run/ameesh-gate/state/state.json",
      "ack_path": "/run/ameesh-gate/ack/ack.json",
+     "slice": "ameesh-guest.slice", "agent_units": "ameesh-guest-runner@*.service",
      "lend": {"cpu_max": 3, "cpu_weight": 10, "memory_max": "14GiB",
               "agent_memory_max": "4.5GiB", "disk_max": "80GiB",
               "windows": ["mon-fri 18:00-14:00 UTC", "sat-sun"],
@@ -52,6 +57,7 @@ import datetime as dt
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -67,6 +73,9 @@ GUARD_KIND = "ameesh-guard"
 DEFAULT_CONFIG = "/etc/ameesh/guard.json"
 DEFAULT_STATE_PATH = "/run/ameesh-gate/state/state.json"
 DEFAULT_ACK_PATH = "/run/ameesh-gate/ack/ack.json"
+#: the guest's slice and its agents' units (study §2.1)
+DEFAULT_SLICE = "ameesh-guest.slice"
+DEFAULT_AGENT_UNITS = "ameesh-guest-runner@*.service"
 
 #: evaluation period, state lifetime, longest freeze, grace after the drain
 #: deadline before the stop (seconds, study §1.5 and §1.6)
@@ -266,6 +275,8 @@ class GuardConfig:
     max_agents: int = 1
     state_path: str = DEFAULT_STATE_PATH
     ack_path: str = DEFAULT_ACK_PATH
+    slice: str = DEFAULT_SLICE
+    agent_units: str = DEFAULT_AGENT_UNITS
 
 
 def load_config(path: str | None = None) -> GuardConfig:
@@ -285,7 +296,9 @@ def load_config(path: str | None = None) -> GuardConfig:
         raise GuardError("max_agents: integer >= 0 expected")
     return GuardConfig(host=str(host), offer=parse_offer(raw.get("lend")), max_agents=agents,
                        state_path=str(raw.get("state_path") or DEFAULT_STATE_PATH),
-                       ack_path=str(raw.get("ack_path") or DEFAULT_ACK_PATH))
+                       ack_path=str(raw.get("ack_path") or DEFAULT_ACK_PATH),
+                       slice=str(raw.get("slice") or DEFAULT_SLICE),
+                       agent_units=str(raw.get("agent_units") or DEFAULT_AGENT_UNITS))
 
 
 # --------------------------------------------------------------------------
@@ -661,6 +674,128 @@ def restore_decision(previous: dict, now: float) -> tuple[Decision, int | None]:
 
 
 # --------------------------------------------------------------------------
+# enforcement (tranche 2): kernel caps and freeze through systemd
+# --------------------------------------------------------------------------
+
+def slice_properties(caps: dict, cpu_count: int | None) -> dict:
+    """systemd properties of the guest's slice for `caps` (study §1.7)."""
+    props: dict = {}
+    if caps.get("cpu_weight") is not None:
+        props["CPUWeight"] = str(int(caps["cpu_weight"]))
+    if caps.get("io_weight") is not None:
+        props["IOWeight"] = str(int(caps["io_weight"]))
+    if caps.get("cpu_share") is not None and cpu_count:
+        # CPUQuota is a share of ONE CPU: 150 % = one and a half CPU
+        props["CPUQuota"] = "%d%%" % max(1, round(caps["cpu_share"] * cpu_count * 100))
+    if caps.get("memory_high_mb") is not None:
+        props["MemoryHigh"] = "%dM" % int(caps["memory_high_mb"])
+    if caps.get("memory_mb") is not None:
+        props["MemoryMax"] = "%dM" % int(caps["memory_mb"])
+    return props
+
+
+#: which `caps` key each property enforces
+PROPERTY_CAPS = {"CPUWeight": "cpu_weight", "IOWeight": "io_weight", "CPUQuota": "cpu_share",
+                 "MemoryHigh": "memory_high_mb", "MemoryMax": "memory_mb"}
+
+
+class Enforcer:
+    """Applies the state's caps with `systemctl set-property --runtime` (the
+    caps live as long as the boot, and stay in place if the guard stops) and
+    the level 2 freeze with `systemctl freeze` / `thaw`. Never raises: a
+    failed command is reported on stderr, and its caps are left out of
+    `caps.enforced`."""
+
+    def __init__(self, cfg: GuardConfig, run: Callable | None = None,
+                 log: Callable | None = None):
+        self.cfg = cfg
+        self.run = run or subprocess.run
+        self.log = log or (lambda text: print("ameesh guard: %s" % text, file=sys.stderr))
+        self.applied: dict = {}          # unit -> {property: value} last applied
+        self.frozen = False
+
+    def _systemctl(self, *args: str) -> bool:
+        try:
+            proc = self.run(["systemctl", *args], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.log("systemctl %s: %s" % (" ".join(args), exc))
+            return False
+        if proc.returncode != 0:
+            self.log("systemctl %s: code %s %s" % (" ".join(args), proc.returncode,
+                                                  (proc.stderr or "").strip()[:200]))
+            return False
+        return True
+
+    def agent_units(self) -> list[str]:
+        """The loaded agent units of the guest."""
+        try:
+            proc = self.run(["systemctl", "list-units", "--all", "--plain", "--no-legend",
+                             "--no-pager", self.cfg.agent_units],
+                            capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if proc.returncode != 0:
+            return []
+        # the first word that is a unit name (some systemd versions prefix a
+        # failed unit with "●", even with --plain)
+        units = []
+        for line in proc.stdout.splitlines():
+            name = next((w for w in line.split() if "." in w), None)
+            if name:
+                units.append(name)
+        return units
+
+    def _set(self, unit: str, props: dict) -> set:
+        """Applies the properties that changed; the set of those in force."""
+        last = self.applied.setdefault(unit, {})
+        changed = {k: v for k, v in props.items() if last.get(k) != v}
+        if changed:
+            if not self._systemctl("set-property", "--runtime", unit,
+                                   *("%s=%s" % kv for kv in sorted(changed.items()))):
+                for key in changed:
+                    last.pop(key, None)
+                return {k for k in props if k not in changed}
+            last.update(changed)
+        return set(props)
+
+    def freeze(self, on: bool) -> bool:
+        """Freezes or thaws the guest's slice; True if the slice is as asked."""
+        if on == self.frozen:
+            return True
+        if self._systemctl("freeze" if on else "thaw", self.cfg.slice):
+            self.frozen = on
+            return True
+        return False
+
+    def thaw_at_start(self) -> None:
+        """A guard that died during a freeze must not leave the guest frozen
+        (thawing a slice that is not frozen is harmless: the result is not
+        reported)."""
+        try:
+            self.run(["systemctl", "thaw", self.cfg.slice], capture_output=True, text=True,
+                     timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        self.frozen = False
+
+    def apply(self, state: dict, cpu_count: int | None) -> list[str]:
+        """Enforces `state` (levels 0 to 2; a drain or a stop thaws and keeps
+        the caps); the `caps` keys actually enforced."""
+        caps = state.get("caps") or {}
+        done = self._set(self.cfg.slice, slice_properties(caps, cpu_count))
+        enforced = {PROPERTY_CAPS[p] for p in done}
+        if caps.get("agent_memory_mb") is not None:
+            units = self.agent_units()
+            per_agent = {"MemoryMax": "%dM" % int(caps["agent_memory_mb"])}
+            if units and all("MemoryMax" in self._set(u, per_agent) for u in units):
+                enforced.add("agent_memory_mb")
+        if self.freeze("freeze" in state):
+            if "freeze" in state:
+                enforced.add("freeze")
+        return sorted(enforced)
+
+
+# --------------------------------------------------------------------------
 # the loop
 # --------------------------------------------------------------------------
 
@@ -668,9 +803,13 @@ class Guard:
     """The guard's state between two evaluations."""
 
     def __init__(self, cfg: GuardConfig, *, observe: bool = True,
-                 signals: Callable | None = None, clock: Callable = time.time):
+                 signals: Callable | None = None, clock: Callable = time.time,
+                 enforcer: Enforcer | None = None):
         self.cfg = cfg
         self.observe = observe
+        self.enforcer = None if observe else (enforcer or Enforcer(cfg))
+        if self.enforcer is not None:
+            self.enforcer.thaw_at_start()
         self.clock = clock
         self.signals = signals or (lambda now: read_signals(cfg, now))
         previous = read_json(cfg.state_path) or {}
@@ -682,6 +821,11 @@ class Guard:
         self.written_ts = 0.0
         self.last_key = None
         self.written_decision = None
+
+    def stop(self) -> None:
+        """Leaving: thaw the guest; the caps stay (slice properties)."""
+        if self.enforcer is not None:
+            self.enforcer.freeze(False)
 
     def step(self) -> dict:
         """One evaluation: measure, decide, write when changed or due."""
@@ -698,6 +842,8 @@ class Guard:
         self.decision = decide(self.cfg.offer, reading, previous, now, drained=drained)
         state = build_state(self.cfg, self.decision, self.seq, now, reading=reading,
                             in_turn=in_turn, observe=self.observe)
+        if self.enforcer is not None:
+            state["caps"]["enforced"] = self.enforcer.apply(state, reading.get("cpu_count"))
         key = _key(state)
         if key != self.last_key:
             self.seq += 1
@@ -719,6 +865,11 @@ class Guard:
         return state
 
 
+def _terminate(*_args) -> None:
+    """SIGTERM (systemctl stop): leave through `Guard.stop` (thaw)."""
+    raise KeyboardInterrupt
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ameesh guard",
                                      description="capacity guard of a lending VM (L159e)")
@@ -726,7 +877,7 @@ def _parser() -> argparse.ArgumentParser:
     check = sub.add_parser("check", help="one measure, the decision and the state")
     check.add_argument("--config")
     check.add_argument("--json", action="store_true")
-    run = sub.add_parser("run", help="the guard loop (tranche 1: --observe only)")
+    run = sub.add_parser("run", help="the guard loop")
     run.add_argument("--config")
     run.add_argument("--observe", action="store_true",
                      help="decide and publish the state, enforce nothing")
@@ -754,13 +905,15 @@ def main(argv: list[str] | None = None) -> int:
                      state["reason"]))
             print("caps: %s" % json.dumps(state["caps"], sort_keys=True))
         return 0
-    if not args.observe:
-        print("ameesh guard: enforcing caps comes with tranche 2 of L159e; "
-              "use --observe", file=sys.stderr)
-        return 2
-    guard = Guard(cfg, observe=True)
-    while True:
-        guard.step()
-        if args.once:
-            return 0
-        time.sleep(EVAL_S)
+    guard = Guard(cfg, observe=args.observe)
+    signal.signal(signal.SIGTERM, _terminate)
+    try:
+        while True:
+            guard.step()
+            if args.once:
+                return 0
+            time.sleep(EVAL_S)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        guard.stop()

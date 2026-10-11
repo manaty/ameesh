@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""L159e — `ameesh guard`, tranche 1: offer, levels, state, observation loop."""
+"""L159e — `ameesh guard`: offer, levels, state, observation loop (tranche 1);
+caps and freeze enforced through systemd (tranche 2)."""
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import os
@@ -403,6 +405,121 @@ class SignalsTest(unittest.TestCase):
             OSError("no systemctl"))))
 
 
+class EnforcerTest(unittest.TestCase):
+    """Tranche 2: the caps become slice and unit properties, level 2 freezes."""
+
+    def setUp(self):
+        self.cfg = guard.GuardConfig(host="vm-test", offer=guard.parse_offer({"cpu_max": 1}))
+        self.calls = []
+        self.fail = set()
+        self.units = "ameesh-guest-runner@a.service loaded active running a\n" \
+                     "\u25cf ameesh-guest-runner@b.service loaded failed failed b\n"
+        self.logged = []
+        self.enforcer = guard.Enforcer(self.cfg, run=self.fake, log=self.logged.append)
+
+    def fake(self, argv, **kw):
+        self.calls.append(argv)
+        failed = argv[1] in self.fail
+        out = self.units if argv[1] == "list-units" else ""
+        return mock.Mock(returncode=1 if failed else 0, stdout=out,
+                         stderr="denied" if failed else "")
+
+    def sets(self):
+        return [c[3:] for c in self.calls if c[1] == "set-property"]
+
+    def test_slice_properties(self):
+        self.assertEqual(
+            guard.slice_properties({"cpu_weight": 10, "io_weight": 10, "cpu_share": 0.125,
+                                    "memory_high_mb": 2048, "memory_mb": 8192}, 8),
+            {"CPUWeight": "10", "IOWeight": "10", "CPUQuota": "100%",
+             "MemoryHigh": "2048M", "MemoryMax": "8192M"})
+        # no CPU count: no quota (a share of nothing)
+        self.assertNotIn("CPUQuota", guard.slice_properties({"cpu_share": 0.5}, None))
+        self.assertEqual(guard.slice_properties({}, 8), {})
+
+    def test_apply_changes_only_and_freeze(self):
+        caps = {"cpu_weight": 10, "io_weight": 10, "cpu_share": 0.25, "memory_mb": 4096,
+                "memory_high_mb": 4096, "agent_memory_mb": 1024, "max_concurrent": 2}
+        done = self.enforcer.apply({"caps": dict(caps)}, 4)
+        self.assertEqual(done, ["agent_memory_mb", "cpu_share", "cpu_weight", "io_weight",
+                                "memory_high_mb", "memory_mb"])
+        self.assertEqual(self.sets(), [
+            ["ameesh-guest.slice", "CPUQuota=100%", "CPUWeight=10", "IOWeight=10",
+             "MemoryHigh=4096M", "MemoryMax=4096M"],
+            ["ameesh-guest-runner@a.service", "MemoryMax=1024M"],
+            ["ameesh-guest-runner@b.service", "MemoryMax=1024M"]])
+        # level 1: only the changed properties are sent
+        self.calls.clear()
+        reduced = dict(caps, cpu_share=0.125, memory_high_mb=1024)
+        self.enforcer.apply({"caps": reduced}, 4)
+        self.assertEqual(self.sets(), [["ameesh-guest.slice", "CPUQuota=50%",
+                                        "MemoryHigh=1024M"]])
+        # level 2: freeze, once
+        self.calls.clear()
+        frozen = {"caps": reduced, "freeze": {"since_ts": 1.0, "until_ts": 61.0}}
+        self.assertIn("freeze", self.enforcer.apply(frozen, 4))
+        self.enforcer.apply(frozen, 4)
+        self.assertEqual([c for c in self.calls if c[1] in ("freeze", "thaw")],
+                         [["systemctl", "freeze", "ameesh-guest.slice"]])
+        # the level drops: thawed
+        self.calls.clear()
+        self.assertNotIn("freeze", self.enforcer.apply({"caps": reduced}, 4))
+        self.assertEqual([c for c in self.calls if c[1] in ("freeze", "thaw")],
+                         [["systemctl", "thaw", "ameesh-guest.slice"]])
+
+    def test_failures_are_not_enforced(self):
+        self.fail = {"set-property", "freeze"}
+        caps = {"cpu_weight": 10, "agent_memory_mb": 1024}
+        state = {"caps": caps, "freeze": {"since_ts": 1.0, "until_ts": 61.0}}
+        self.assertEqual(self.enforcer.apply(state, 4), [])
+        self.assertTrue(any("denied" in line for line in self.logged))
+        # retried at the next evaluation, and in force once it works
+        self.fail = set()
+        self.calls.clear()
+        self.assertEqual(self.enforcer.apply(state, 4),
+                         ["agent_memory_mb", "cpu_weight", "freeze"])
+        self.assertIn(["ameesh-guest.slice", "CPUWeight=10"], self.sets())
+        # no agent unit loaded: the per-agent cap is not in force
+        self.units = ""
+        self.assertNotIn("agent_memory_mb", self.enforcer.apply({"caps": caps}, 4))
+        # systemctl missing: nothing in force, nothing raised
+        broken = guard.Enforcer(self.cfg, log=self.logged.append,
+                                run=lambda *a, **k: (_ for _ in ()).throw(OSError("none")))
+        self.assertEqual(broken.apply(state, 4), [])
+
+    def test_guard_thaws_at_start_and_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = dataclasses.replace(
+                self.cfg, offer=guard.parse_offer({"cpu_max": 2}),
+                state_path=os.path.join(tmp, "state.json"),
+                ack_path=os.path.join(tmp, "ack.json"))
+            reading = {"cpu_count": 4, "mem_total_bytes": 16 * GIB,
+                       "mem_available_bytes": 12 * GIB, "disk_free_bytes": 50 * GIB}
+            with mock.patch.object(guard.resources, "lendable", None, create=True), \
+                    mock.patch.object(guard.resources, "measure", None, create=True):
+                g = guard.Guard(cfg, observe=False, signals=lambda now: dict(reading),
+                                clock=lambda: 1000.0,
+                                enforcer=guard.Enforcer(cfg, run=self.fake,
+                                                        log=self.logged.append))
+                self.assertEqual(self.calls[0], ["systemctl", "thaw", "ameesh-guest.slice"])
+                state = g.step()
+                self.assertEqual(state["guard"]["mode"], "enforce")
+                self.assertIn("cpu_share", state["caps"]["enforced"])
+                with open(cfg.state_path) as fh:
+                    self.assertEqual(json.load(fh)["caps"]["enforced"],
+                                     state["caps"]["enforced"])
+                g.enforcer.frozen = True
+                g.stop()
+                self.assertEqual(self.calls[-1], ["systemctl", "thaw", "ameesh-guest.slice"])
+                # observing: no enforcer, no systemctl
+                self.calls.clear()
+                observer = guard.Guard(cfg, signals=lambda now: dict(reading),
+                                       clock=lambda: 1000.0)
+                self.assertEqual(observer.step()["caps"]["enforced"], [])
+                observer.stop()
+                self.assertEqual(self.calls, [])
+
+
 class CliTest(unittest.TestCase):
     def test_check_and_observe_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -416,9 +533,24 @@ class CliTest(unittest.TestCase):
                 self.assertEqual(guard.main(["check", "--config", config, "--json"]), 0)
             printed = "".join(c.args[0] for c in out.write.call_args_list)
             self.assertEqual(json.loads(printed)["schema"], "ameesh-host-state/1")
-            with mock.patch("sys.stderr"):
-                self.assertEqual(guard.main(["run", "--config", config]), 2)
-            self.assertEqual(guard.main(["run", "--observe", "--once", "--config", config]), 0)
+            calls = []
+
+            def run(argv, **kw):
+                calls.append(argv)
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            with mock.patch.object(guard.subprocess, "run", run), \
+                    mock.patch.object(guard.signal, "signal"):
+                self.assertEqual(guard.main(["run", "--once", "--config", config]), 0)
+            with open(os.path.join(tmp, "s", "state.json")) as fh:
+                self.assertEqual(json.load(fh)["guard"]["mode"], "enforce")
+            self.assertEqual(calls[0], ["systemctl", "thaw", "ameesh-guest.slice"])
+            self.assertTrue(any(c[1:3] == ["set-property", "--runtime"] for c in calls))
+            calls.clear()
+            with mock.patch.object(guard.subprocess, "run", run):
+                self.assertEqual(
+                    guard.main(["run", "--observe", "--once", "--config", config]), 0)
+            self.assertEqual([c for c in calls if c[0] == "systemctl"
+                              and c[1] in ("set-property", "freeze", "thaw")], [])
             with open(os.path.join(tmp, "s", "state.json")) as fh:
                 self.assertEqual(json.load(fh)["guard"]["kind"], "ameesh-guard")
             with open(config, "w") as fh:
