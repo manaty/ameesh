@@ -267,10 +267,23 @@ class ImputationSansBaseTest(_Systeme, unittest.TestCase):
         self._non_attribuee(signale, chemin, "illisible")
 
     def test_hote_partage_avec_un_autre_mesh_entree_non_attribuee(self):
+        """Le dossier temporaire d'un agent d'un autre mesh (fichier
+        propriétaire d'une autre clé, L219) sous la racine commune."""
+        racine = menage.tmp_root(self.cfgl, self.pol)
+        os.makedirs(os.path.join(racine, "veille"))
+        menage._write_owner(racine, "veille", "0123456789abcdef", menage.ORIGIN_CREATED)
+        chemin, signale = self._fin([
+            {"name": "a1", "host": "pc", "status": "running", "lease_live": True},
+            {"name": "veille", "host": "pc", "status": "idle", "lease_live": False}])
+        self._non_attribuee(signale, chemin, "autre mesh (dossier temporaire veille)")
+
+    def test_dossier_sans_proprietaire_d_un_agent_inconnu_entree_non_attribuee(self):
+        """Un autre mesh d'avant L219 : dossier sans fichier propriétaire,
+        agent absent du registre."""
         os.makedirs(os.path.join(menage.tmp_root(self.cfgl, self.pol), "agent-ailleurs"))
         chemin, signale = self._fin([
             {"name": "a1", "host": "pc", "status": "running", "lease_live": True}])
-        self._non_attribuee(signale, chemin, "autre mesh")
+        self._non_attribuee(signale, chemin, "autre mesh (dossier temporaire agent-ailleurs)")
 
     def test_deja_signalee_par_le_tour_d_un_autre_agent_pas_reprise(self):
         def recent(chemin):
@@ -356,6 +369,53 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertEqual([e["agent"] for e in entrees_a2 if e["kind"] == "orphan"], ["a2"])
         entrees_a1 = tour_a1.end(lot=None, turn_id="t" * 32, db=self.db, host="pc")
         self.assertEqual([e for e in entrees_a1 if e["kind"] == "orphan"], [])
+
+    def test_deux_fins_de_tour_successives_l_entree_reste_non_attribuee(self):
+        """#222 (relecture) : a1 et a2 tournent ensemble, a1 crée une entrée et
+        finit le premier (non attribuée : a2 tourne) ; a2 finit ensuite, seul :
+        il ne se l'attribue pas, et elle n'est jamais supprimée."""
+        self._en_tour("a2")
+        tour_a1 = menage.Turn.begin(self.cfgl, self.pol, "a1", None, new_session=False,
+                                    base_env={})
+        tour_a2 = menage.Turn.begin(self.cfgl, self.pol, "a2", None, new_session=False,
+                                    base_env={})
+        entree = os.path.join(self.sys, "build-a1")
+        _write(os.path.join(entree, "f"), 5000)
+        fin_a1 = tour_a1.end(lot=None, turn_id="t" * 32, db=self.db, host="pc")
+        storage.of(self.db).housekeeping.log("pc", fin_a1, actor="test")
+        self.assertEqual([e["agent"] for e in fin_a1 if e["kind"] == "orphan"], [None])
+        registry.set_status(self.db, "a2", "idle")
+        fin_a2 = tour_a2.end(lot=None, turn_id="u" * 32, db=self.db, host="pc")
+        self.assertEqual([e for e in fin_a2 if e["kind"] == "orphan"], [])
+        self._passage(3 * 3600)
+        self.assertTrue(os.path.exists(entree))
+
+    def test_entree_non_attribuee_suivie_tant_qu_elle_existe(self):
+        """#222 (relecture) : jamais supprimée, une entrée non attribuée est
+        signalée de nouveau, taille à jour, tant qu'elle existe (l'alerte la
+        garde), puis notée disparue (l'alerte s'arrête)."""
+        self._en_tour("a2")
+        entree = os.path.join(self.sys, "cache-a2")
+        self._tour(lambda: _write(os.path.join(entree, "f"), 5000))
+        registry.set_status(self.db, "a2", "idle")
+        _write(os.path.join(entree, "g"), 7000)
+        taille = menage.size_of(entree)
+        self._passage(menage.UNATTRIBUTED_REFRESH_S + 60)
+        hk = storage.of(self.db).housekeeping
+        lignes = [r for r in hk.recent("pc", 3600, 50, kind="orphan") if r["path"] == entree]
+        self.assertEqual([(r["action"], r["agent"]) for r in lignes],
+                         [("signaled", None), ("signaled", None)])
+        self.assertEqual(lignes[0]["bytes"], taille)
+        alertes = [a for a in exploitation.alerts(self.cfg, self.db)
+                   if a["type"] == "tmp_orphan" and a.get("path") == entree]
+        self.assertEqual(len(alertes), 1)
+        self.assertIn("jamais supprimé par ameesh : non attribué", alertes[0]["detail"])
+        subprocess.run(["rm", "-rf", entree], check=True)
+        self._passage(menage.UNATTRIBUTED_REFRESH_S + 120)
+        lignes = [r for r in hk.recent("pc", 3600, 50, kind="orphan") if r["path"] == entree]
+        self.assertEqual(lignes[0]["action"], "gone")
+        self.assertNotIn(entree, {a.get("path") for a in exploitation.alerts(self.cfg, self.db)
+                                  if a["type"] == "tmp_orphan"})
 
     def test_abandonne_supprime_recent_attend_essai_ne_touche_rien(self):
         abandon = os.path.join(self.sys, "preuve-images")
