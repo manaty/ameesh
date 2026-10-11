@@ -57,11 +57,14 @@ class Housekeeping(interface.Housekeeping):
                 "DELETE FROM housekeeping_log WHERE at < now() - interval '30 days'", ())
         return count
 
-    def recent(self, host, since_s, limit=50) -> list[dict]:
+    def recent(self, host, since_s, limit=50, kind=None) -> list[dict]:
         where, params = "", [float(since_s)]
         if host:
-            where = " AND host = %s"
+            where += " AND host = %s"
             params.append(host)
+        if kind:
+            where += " AND kind = %s"
+            params.append(kind)
         params.append(int(limit))
         rows = self.db.query(
             "SELECT " + LOG_COLUMNS + " FROM housekeeping_log"

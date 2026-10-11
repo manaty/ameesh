@@ -25,6 +25,27 @@ from ameesh import migrations
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(REPO, "src")
 FAKEBIN = os.path.join(REPO, "tests", "fakebin")
+
+#: L142 : la suite ne dépend pas de l'état du poste. Toute variable ameesh de
+#: la session (AMEESH_*, AGENT_MESH_*, AGENT_MAIL_* : identité, état, schéma,
+#: DSN de production…) est retirée, sauf les réglages du banc lui-même.
+BENCH_ENV_VARS = frozenset((
+    "AMEESH_TEST_DSN", "AGENT_MESH_TEST_DSN",
+    "AMEESH_REQUIRE_DB", "AGENT_MESH_REQUIRE_DB",
+    "AMEESH_DRIVER", "AGENT_MESH_DRIVER",
+    "AMEESH_DB_TRACE",
+))
+for _name in list(os.environ):
+    if (_name.startswith(("AMEESH_", "AGENT_MESH_", "AGENT_MAIL_"))
+            and _name not in BENCH_ENV_VARS):
+        del os.environ[_name]
+#: et la configuration de l'hôte (~/.config/ameesh/config.json, ou l'ancienne
+#: ~/.config/agent-mesh/config.json) n'est jamais lue : ses canons imposent un
+#: responsable humain, fixent fils et hôte. Les tests de configuration posent
+#: leur propre AMEESH_CONFIG. HOME reste celui du poste (~/.pgpass du banc).
+ABSENT_CONFIG = os.path.join(tempfile.mkdtemp(prefix="ameesh-test-config-"), "absent.json")
+os.environ["AMEESH_CONFIG"] = ABSENT_CONFIG
+os.environ["AGENT_MESH_CONFIG"] = ABSENT_CONFIG
 # la surcharge AMEESH_CODEX_SESSIONS prime sur CODEX_HOME : jamais héritée
 os.environ.pop("AMEESH_CODEX_SESSIONS", None)
 TEST_DSN = os.environ.get(
