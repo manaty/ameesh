@@ -352,7 +352,11 @@ CI splits the suite the same way (`scripts/test-parts.py`, by module, balanced
 on the measured durations of `tests/parts/durees.json`): on a pull request,
 `psycopg` runs the full suite in 4 parts and `psql` only the driver modules of
 `tests/parts/pilote-psql.txt`; the full `psql` suite (6 parts) runs on pushes
-to `main` and `release/*`. The `tests` job aggregates the parts.
+to `main` and `release/*`. The `tests` job aggregates the parts. Each part
+streams its results, one JSON line per test (`--flux`, schema
+`ameesh-test-event/1`), published as the `flux-<driver>-<part>` artifact and in
+the job summary (`scripts/ci-flux.py resume`); test modules touched by the
+changed files run first in each part (`--depuis HEAD^1`), nothing is skipped.
 
 158 tests against the local container, run twice (`psql`, then `psycopg` with
 `cryptography`): migrations and immutability, mailbox and LISTEN/NOTIFY round
