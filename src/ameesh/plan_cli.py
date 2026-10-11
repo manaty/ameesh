@@ -4,10 +4,14 @@
   ameesh work link <id> <fiche>|--none
   ameesh work close <id> --abandoned | --superseded-by <id> [--note …]
   ameesh work sync-merges --git-dir D [--target origin/main] [--repo R] [--dry-run] [--json]
-  ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]  (L118)
+  ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]  (L118 : branche
+                            ou commit de fusion qui désigne le lot)
   ameesh work sync-github --repo R [--limit N] [--dry-run] [--json]
   ameesh work project-github --repo R [--dry-run] [--canon-url URL] [--json]
+  ameesh work project-github --app P [--repo R] [--dry-run] [--json]   (L126)
   ameesh work plan <id|fiche> [--debut J] [--fin J] [--livraison J] [--source S]  (L96)
+                  [--estimate 90m] [--estimate-source S]                (L157, une tâche)
+  ameesh work estimates [--app P] [--json]   (L157 : écarts réel/estimé, pour l'auditeur)
 
 Gardées hors de `mesh_cli` (qui les branche) pour que leurs évolutions n'y
 touchent pas. Voir `plan_github` pour les règles de GitHub (vue, jamais
@@ -22,7 +26,7 @@ import sys
 from . import plan_git, plan_github, work
 
 COMMANDS = ("link", "close", "sync-merges", "sync-branches", "sync-github", "project-github",
-            "plan")
+            "plan", "estimates", "schedule", "measure")
 
 
 def add_parsers(work_sub, func) -> None:
@@ -57,8 +61,10 @@ def add_parsers(work_sub, func) -> None:
     p_merges.set_defaults(func=func)
 
     p_branches = work_sub.add_parser(
-        "sync-branches", help="fermer les lots dont la branche est fusionnée dans sa cible, "
-                              "avec ou sans PR (L118 ; fait aussi par l'exécuteur)")
+        "sync-branches", help="fermer les lots dont la fusion dans leur cible est constatée, "
+                              "avec ou sans PR : branche du lot, ou commit de fusion qui "
+                              "porte « ameesh-work: <id> » (ou #<id> si git config "
+                              "ameesh.lotRef hash) — L118 ; fait aussi par l'exécuteur")
     p_branches.add_argument("--host", default=None,
                             help="hôte dont les assignés sont examinés (défaut : cet hôte)")
     p_branches.add_argument("--all-hosts", action="store_true",
@@ -85,17 +91,67 @@ def add_parsers(work_sub, func) -> None:
     p_plan.add_argument("--livraison", "--deploiement", "--delivery", dest="livraison",
                         default=None, help="livraison ou déploiement prévu")
     p_plan.add_argument("--source", default=None,
-                        help="d'où vient la date (conversation, décision, message…)")
+                        help="d'où vient la date (conversation, décision, message…) ; "
+                             "aussi celle de l'estimation, à défaut de --estimate-source")
+    p_plan.add_argument("--estimate", default=None, metavar="DURÉE",
+                        help="durée estimée d'une tâche : 90m, 2h, 1h30, 1,5h, 2d (L157)")
+    p_plan.add_argument("--estimate-source", default=None, metavar="SOURCE",
+                        help="d'où vient l'estimation (conception, historique…)")
     p_plan.add_argument("--actor", default="")
     p_plan.add_argument("--json", action="store_true")
     p_plan.set_defaults(func=func)
 
+    p_est = work_sub.add_parser(
+        "estimates", help="écarts réel/estimé des lots livrés, par type de lot et par auteur "
+                          "d'estimation (médiane, p80) — L157, pour l'auditeur")
+    p_est.add_argument("--app", default=None, metavar="PROJET", help="un projet seulement")
+    p_est.add_argument("--json", action="store_true", help="schéma ameesh-estimates/1")
+    p_est.add_argument("--publish", action="store_true",
+                       help="passage de l'auditeur (L157b) : calcule et publie la table de "
+                            "référence des durées (schéma ameesh-estimate-reference/1), que "
+                            "work add et work show lisent ; lève estimate_bias")
+    p_est.add_argument("--actor", default="", help="qui publie (--publish)")
+    p_est.set_defaults(func=func)
+
+    p_sched = work_sub.add_parser(
+        "schedule", help="planned dates of the open assigned lots at the p80 of the reference "
+                         "table, queues ordered at the median (L157c); shows, --apply writes")
+    p_sched.add_argument("--assignee", default=None, help="one agent's queue only")
+    p_sched.add_argument("--apply", action="store_true",
+                         help="write the dates (lots without dates, or dated by the schedule)")
+    p_sched.add_argument("--force", action="store_true",
+                         help="with --apply: also overwrite dates set by a person")
+    p_sched.add_argument("--actor", default="")
+    p_sched.add_argument("--json", action="store_true", help="schema ameesh-schedule/1")
+    p_sched.set_defaults(func=func)
+
+    p_meas = work_sub.add_parser(
+        "measure", help="actual time of delivered lots by phase (agent, CI, review, human) "
+                        "and size of the merged diff (L157c); the runner does it after each "
+                        "branch sweep")
+    p_meas.add_argument("ids", nargs="*", type=int,
+                        help="these lots (measured again); default: the lots not measured yet")
+    p_meas.add_argument("--repo", action="append", default=None, metavar="DIR",
+                        help="repository holding the merge commits (repeatable; default: the "
+                             "current one)")
+    p_meas.add_argument("--no-ci", action="store_true",
+                        help="do not read the CI runs (gh): CI time stays unknown")
+    p_meas.add_argument("--json", action="store_true")
+    p_meas.set_defaults(func=func)
+
     p_proj = work_sub.add_parser(
-        "project-github", help="projeter le plan en issues GitHub (vue, jamais source)")
-    p_proj.add_argument("--repo", required=True, help="owner/repo")
-    p_proj.add_argument("--dry-run", action="store_true", help="montrer sans rien écrire")
+        "project-github", help="une issue GitHub par lot d'un projet (--app, L126), ou le "
+                               "plan en issues (--repo seul) — vue, jamais source")
+    p_proj.add_argument("--app", default=None, metavar="PROJET",
+                        help="projet dont chaque lot a son issue ; dépôt lu dans "
+                             "github.projects (configuration de l'hôte)")
+    p_proj.add_argument("--repo", default=None,
+                        help="owner/repo : le dépôt du plan ; avec --app, remplace le dépôt "
+                             "configuré")
+    p_proj.add_argument("--dry-run", action="store_true",
+                        help="lire GitHub et montrer sans rien écrire")
     p_proj.add_argument("--canon-url", default=None,
-                        help="base des liens vers les fiches (ex. https://…/blob/{commit})")
+                        help="plan : base des liens vers les fiches (ex. https://…/blob/{commit})")
     p_proj.add_argument("--json", action="store_true")
     p_proj.set_defaults(func=func)
 
@@ -105,6 +161,49 @@ def run(db, args: argparse.Namespace) -> int:
     command = args.work_command
     if command == "plan":
         return _plan(db, args)
+    if command == "estimates":
+        from . import estimates
+        if args.publish:
+            if args.app:
+                print("erreur : --publish couvre tous les projets (sans --app)",
+                      file=sys.stderr)
+                return 2
+            row = estimates.publish(db, actor=args.actor)
+            if args.json:
+                print(json.dumps(row, ensure_ascii=False, indent=2))
+            else:
+                print(estimates.format_published(row))
+            return 0
+        report = estimates.report(db, app=args.app)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print(estimates.format_report(report))
+        return 0
+    if command == "schedule":
+        from . import lot_schedule
+        sched = lot_schedule.build(db, assignee=args.assignee,
+                                   force=bool(args.apply and args.force))
+        written = (lot_schedule.apply(db, sched, force=args.force, actor=args.actor)
+                   if args.apply else None)
+        if args.json:
+            print(json.dumps(dict(sched, written=[e["id"] for e in written or ()]),
+                             ensure_ascii=False, indent=2))
+        else:
+            print(lot_schedule.format_schedule(sched, written))
+        return 0
+    if command == "measure":
+        import os
+        from . import lot_measures
+        repos = [os.path.abspath(os.path.expanduser(r)) for r in args.repo or [os.getcwd()]]
+        rows = lot_measures.measure(db, args.ids or None, repos=repos,
+                                    ci=None if args.no_ci else lot_measures.gh_ci_runs)
+        if args.json:
+            print(json.dumps([lot_measures.view(r) | {"id": int(r["work_item_id"])}
+                              for r in rows], ensure_ascii=False, indent=2))
+        else:
+            print(lot_measures.format_measures(rows))
+        return 0
     if command == "link":
         if args.none == bool(args.package):
             print("erreur : une fiche OU --none", file=sys.stderr)
@@ -131,21 +230,49 @@ def run(db, args: argparse.Namespace) -> int:
 
 
 def _plan(db, args: argparse.Namespace) -> int:
-    """L96 : dates prévues d'une tâche ou d'une fiche WorkPackage."""
-    from . import roadmap
+    """L96 : dates prévues d'une tâche ou d'une fiche WorkPackage ; L157 :
+    durée estimée d'une tâche (`--estimate`)."""
+    from . import estimates, roadmap
 
     kwargs = {k: v for k, v in (("start", args.debut), ("end", args.fin),
                                 ("delivery", args.livraison)) if v is not None}
-    out = roadmap.plan(db, args.target, source=args.source, actor=args.actor, **kwargs)
+    if args.estimate is not None:
+        text = str(args.target).strip().lstrip("#")
+        if not text.isdigit():
+            raise estimates.EstimateError(
+                "--estimate se pose sur une tâche (son numéro), pas sur la fiche %s"
+                % args.target)
+        estimates.parse(args.estimate)          # illisible : rien n'est écrit
+        out = None
+        if kwargs:
+            out = roadmap.plan(db, args.target, source=args.source, actor=args.actor,
+                               **kwargs)
+        estimated = estimates.set_estimate(
+            db, int(text), args.estimate, source=args.estimate_source or args.source,
+            actor=args.actor)
+        if out is None:             # l'estimation seule : aucune date touchée
+            out = {"target": int(text), "kind": "task", "plan": None,
+                   "estimate": estimates.view(estimated)}
+            if args.json:
+                print(json.dumps(out, ensure_ascii=False, indent=2))
+            else:
+                print("tâche #%s : %s%s" % (text, out["estimate"]["label"],
+                                            " (source : %s)" % out["estimate"]["source"]
+                                            if out["estimate"].get("source") else ""))
+            return 0
+        out["estimate"] = estimates.view(estimated)
+    else:
+        out = roadmap.plan(db, args.target, source=args.source, actor=args.actor, **kwargs)
     if args.json:
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
     row = out["plan"]
     label = "tâche #%s" % out["target"] if out["kind"] == "task" else "fiche %s" % out["target"]
-    print("%s : début %s · fin %s · livraison %s%s" % (
+    print("%s : début %s · fin %s · livraison %s%s%s" % (
         label, row.get("planned_start") or "—", row.get("planned_end") or "—",
         row.get("planned_delivery") or "—",
-        " (source : %s)" % row["planned_source"] if row.get("planned_source") else ""))
+        " (source : %s)" % row["planned_source"] if row.get("planned_source") else "",
+        " · %s" % out["estimate"]["label"] if out.get("estimate") else ""))
     return 0
 
 
@@ -163,13 +290,12 @@ def _sync_branches(db, args: argparse.Namespace) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     if not report["results"]:
-        print("aucun lot ouvert avec une branche%s" % (" sur %s" % host if host else ""))
+        print("aucun lot ouvert à examiner%s" % (" sur %s" % host if host else ""))
         return 0
     for entry in report["results"]:
         print("lot #%-5d %-36s %-14s %s" % (
-            entry["work_item"], entry["branch"], _BRANCH_RESULTS.get(entry["result"],
-                                                                    entry["result"]),
-            entry["detail"]))
+            entry["work_item"], entry["branch"] or "(sans branche)",
+            _BRANCH_RESULTS.get(entry["result"], entry["result"]), entry["detail"]))
     print("%d lot(s) fermé(s)%s" % (report["merged"], " (essai)" if args.dry_run else ""))
     return 0
 
@@ -232,6 +358,12 @@ def _github(db, args: argparse.Namespace) -> int:
                   % (row["work_item"], row["pr"], row["work_item"]), file=sys.stderr)
         return 1 if report["refused"] else 0
     if command == "project-github":
+        if args.app:
+            return _project_lots(db, gh, args)
+        if not args.repo:
+            print("erreur : --app <projet> (une issue par lot, L126) ou --repo owner/repo "
+                  "(le plan)", file=sys.stderr)
+            return 2
         report = plan_github.project_github(db, gh, args.repo, dry_run=args.dry_run,
                                             canon_url=args.canon_url)
         if args.json:
@@ -241,6 +373,96 @@ def _github(db, args: argparse.Namespace) -> int:
         return 0
     print("erreur : sous-commande inconnue : %s" % command, file=sys.stderr)
     return 2
+
+
+def _project_lots(db, gh, args: argparse.Namespace) -> int:
+    """L126 : une issue par lot du projet `--app`, dans le dépôt configuré."""
+    cfg = getattr(db, "cfg", None)
+    settings = plan_github.settings_of(cfg)
+    project = settings.project_name(args.app) or args.app.strip()
+    repo = args.repo or settings.repo_for(args.app)
+    if not repo:
+        print("erreur : projet %s absent de `github.projects` (configuration de l'hôte) : "
+              "ajoutez-le, ou précisez --repo owner/repo" % args.app, file=sys.stderr)
+        return 2
+    report = plan_github.project_lots(
+        db, gh, project, repo, dry_run=args.dry_run, settings=settings,
+        forge_hosts=getattr(cfg, "forge_hosts", None) or (),
+        local_host=getattr(cfg, "host", None))
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
+    _print_lot_issues(report)
+    return 0
+
+
+#: libellés des actions sur une issue de lot (essai, réel)
+_LOT_ACTIONS = {"create": ("à créer", "créée"), "update": ("à mettre à jour", "mise à jour"),
+                "close": ("à fermer", "fermée"), "unchanged": ("inchangée", "inchangée"),
+                "refused": ("REFUSÉE", "REFUSÉE"),
+                "deferred": ("reportée", "reportée au passage suivant")}
+
+
+def _print_lot_issues(report: dict) -> None:
+    dry = report["dry_run"]
+    print("%sissues des lots du projet %s sur %s (%s) : %d lot(s)" % (
+        "[essai] " if dry else "", report["project"], report["repo"],
+        "dépôt public : titre et résumé public seulement" if report["public"]
+        else "dépôt privé : corps du lot publié, sans secret", len(report["issues"])))
+    if report["visibility"] not in ("public", "private"):
+        print("  visibilité du dépôt : %s — traité comme public" % report["visibility"])
+    for name in report["labels_created"]:
+        print("  étiquette %s %s" % (name, "à créer" if dry else "créée"))
+    quiet = 0
+    for row in report["issues"]:
+        if row["action"] == "unchanged":
+            quiet += 1
+            continue
+        verb = _LOT_ACTIONS.get(row["action"], (row["action"],) * 2)[0 if dry else 1]
+        print("  lot %-5s %-6s %-16s %s%s%s" % (
+            row["work_item"], "#%s" % row["number"] if row.get("number") else "", verb,
+            row.get("title") or "", " [%s]" % " ".join(row["labels"])
+            if row["action"] == "create" else "",
+            " (%s)" % ", ".join(row["changes"]) if row.get("changes") else ""))
+        if row.get("comment"):
+            print("        commentaire : %s" % row["comment"])
+        if row.get("error"):
+            print("        ERREUR : %s" % row["error"])
+    if quiet:
+        print("  %d issue(s) inchangée(s)" % quiet)
+    for row in report["refused"]:
+        print("REFUSÉ : lot %s — %s : %s ; %s tant que le titre du lot n'est pas corrigé" % (
+            row["work_item"], row["field"], ", ".join(row["reasons"]),
+            "titre de #%s gardé tel quel" % row["number"] if row.get("number")
+            else "rien n'est publié"))
+    for row in report["withheld"]:
+        print("  retenu : lot %s — %s non publié (%s)" % (row["work_item"], row["field"],
+                                                         ", ".join(row["reasons"])))
+    for row in report["human_edits"]:
+        if row["kept"]:
+            print("  modifiée dans GitHub : #%s (lot %s), %s gardé(s) tel(s) quel(s) — jamais "
+                  "repris dans ameesh" % (row["number"], row["work_item"],
+                                          ", ".join(row["kept"])))
+        if row["replaced"]:
+            print("  modifiée dans GitHub : #%s (lot %s), %s réécrit(s) : le lot a changé" % (
+                row["number"], row["work_item"], ", ".join(row["replaced"])))
+    for row in report["issue_refs"]:
+        if row["result"] != "set":
+            print("  issue_ref du lot %s : %s" % (row["work_item"], row.get("detail")))
+    for row in report["duplicates"]:
+        print("  doublon : #%s du lot %s (gardée : #%s)%s" % (
+            row["number"], row["work_item"], row["kept"], " — fermée" if row.get("closed")
+            else ""))
+    for row in report["orphans"]:
+        print("  issue(s) %s : %s (lot %s)" % (", ".join("#%s" % n for n in row["numbers"]),
+                                               row["detail"], row["work_item"]))
+    counts = report["counts"]
+    print("%d %s, %d %s, %d %s, %d refusée(s)%s%s" % (
+        counts["created"], "à créer" if dry else "créée(s)",
+        counts["updated"], "à mettre à jour" if dry else "mise(s) à jour",
+        counts["closed"], "à fermer" if dry else "fermée(s)", counts["refused"],
+        ", %d reportée(s)" % counts["deferred"] if counts["deferred"] else "",
+        ", %d erreur(s)" % counts["errors"] if counts["errors"] else ""))
 
 
 def _print_projection(report: dict) -> None:

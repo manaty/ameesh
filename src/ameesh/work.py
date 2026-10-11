@@ -17,10 +17,18 @@ du canon (`package_id`, et son parent `package_parent`) ; une fusion
 constatée (porte `git-merge`, ou `ameesh work sync-github`) le ferme par
 `close_merged`, idempotent et sans jamais rouvrir un lot fermé.
 
+Correctif du suivi des lots (2026-10-11) : une fusion faite hors PR se
+déclare en une fois (`merged`, depuis tout état ouvert) ; un `promoted` posé
+par erreur se corrige (`move(..., correct=…)`, tracé, réservé aux humains et
+aux orchestrateurs ou agents de conception, `corrector`) ; l'acteur d'une
+commande `work` est l'identité liée de la session, jamais vide
+(`resolve_actor`).
+
 Le SQL est dans le stockage (`storage.of(db).work`, spec §10).
 """
 from __future__ import annotations
 
+import re
 import time
 from typing import Sequence
 
@@ -57,6 +65,22 @@ TRANSITIONS = {
     "waiting_human": {"intake", "build", "qa", "merged", "blocked"},
 }
 WAITING = {"blocked", "waiting_human"}
+#: corrections d'un état posé par erreur (`move(..., correct=…)`) : (depuis,
+#: vers). Un `promoted` à tort revient en `merged` ; ensuite, les transitions
+#: habituelles (merged → blocked → …) s'appliquent.
+CORRECTIONS = {("promoted", "merged")}
+#: rôles d'une fiche Agent du canon admis à corriger un état (avec les humains)
+CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
+#: acteur d'un geste dont l'auteur n'est pas connu : jamais un acteur vide
+UNKNOWN_ACTOR = "inconnu"
+#: un commit de fusion déclaré (`merged --sha`)
+_SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
+#: priorités d'un lot (L130, comme la file d'amélioration L119) : 1 haute,
+#: 2 normale, 3 basse ; sans priorité, le lot n'en a pas (NULL)
+PRIORITIES = (1, 2, 3)
+PRIORITY_LABELS = {1: "haute", 2: "normale", 3: "basse"}
+#: L157b : taille déclarée du changement d'un lot (petit, moyen, gros)
+SIZES = ("s", "m", "l")
 
 #: colonnes rendues pour un lot (pilote Postgres ; alias de compatibilité)
 ITEM_COLUMNS = _pg.ITEM_COLUMNS
@@ -64,6 +88,70 @@ ITEM_COLUMNS = _pg.ITEM_COLUMNS
 
 class WorkError(RuntimeError):
     """Transition ou donnée refusée — message toujours actionnable."""
+
+
+# --------------------------------------------------------------------------
+# acteur d'une commande `work` (correctif du 2026-10-11)
+# --------------------------------------------------------------------------
+
+def resolve_actor(cfg, db, explicit: str | None = None) -> tuple[str, str | None]:
+    """L'acteur d'une commande `work`, jamais vide : `--actor` s'il est donné,
+    sinon l'identité liée de la session (`AGENT_MAIL_NAME`, posée par
+    l'exécuteur, ou liaison de session : `identity.resolve_binding`), sinon
+    « inconnu ». Rend `(acteur, avertissement ou None)`."""
+    from . import identity
+
+    text = (explicit or "").strip()
+    if text:
+        return text, None
+    binding = identity.resolve_binding(cfg, db)
+    if binding.name:
+        if binding.ok:
+            return binding.name, None
+        return binding.name, ("identité %s non liée (%s) : retenue comme acteur"
+                              % (binding.name, binding.reason or "raison inconnue"))
+    return UNKNOWN_ACTOR, ("acteur inconnu : aucune identité liée à cette session "
+                           "(AGENT_MAIL_NAME, ameesh mail bind) — le journal du lot dira "
+                           "« %s » ; précisez --actor <agent|human:id>" % UNKNOWN_ACTOR)
+
+
+def corrector(cfg, db, explicit: str | None = None) -> str:
+    """Qui corrige un état posé par erreur (`work move … --correct`) ; WorkError
+    si la correction lui est refusée.
+
+    Réservée aux humains et aux orchestrateurs ou agents de conception. Une
+    session qui porte une identité d'agent (`identity.resolve_binding`) corrige
+    en son nom, et seulement si cet agent est orchestrateur ou de conception
+    (`assignments.is_orchestrator` avec les rôles `CORRECTOR_ROLES` : rôle de sa
+    fiche Agent au canon, `AMEESH_ALERT_ORCHESTRATORS`, ou lots confiés
+    récemment) ; elle ne peut pas corriger au nom d'un autre. Une session sans
+    identité d'agent (un humain à son terminal) dit qui corrige : `--actor
+    human:<id>`, un humain connu, ou un orchestrateur."""
+    from . import assignments, identity, registry
+
+    text = (explicit or "").strip()
+    binding = identity.resolve_binding(cfg, db)
+    refus = ("correction refusée : %s n'est ni un humain, ni un orchestrateur, ni un agent "
+             "de conception (rôle orchestrateur ou conception de sa fiche Agent au canon, "
+             "AMEESH_ALERT_ORCHESTRATORS) — demandez-la à l'orchestrateur ou au responsable")
+    if binding.name:
+        if text and text != binding.name:
+            raise WorkError("correction refusée : cette session est celle de %s, elle ne "
+                            "corrige pas au nom de %s" % (binding.name, text))
+        if assignments.is_orchestrator(cfg, db, binding.name, roles=CORRECTOR_ROLES):
+            return binding.name
+        raise WorkError(refus % binding.name)
+    if not text:
+        raise WorkError("correction : dites qui corrige (--actor human:<id>)")
+    if text.startswith(HUMAN_PREFIX):
+        return text
+    human = known_human(db, text, cfg)
+    if human:
+        return human
+    if registry.get(db, text) is not None \
+            and assignments.is_orchestrator(cfg, db, text, roles=CORRECTOR_ROLES):
+        return text
+    raise WorkError(refus % text)
 
 
 def add(
@@ -84,15 +172,35 @@ def add(
     cfg=None,
     branch: str | None = None,
     branch_target: str | None = None,
+    priority: int | None = None,
+    estimate=None,
+    estimate_source: str | None = None,
+    size: str | None = None,
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
     L118 : `branch` (et `branch_target`) nomment la branche du lot, dont la
-    fusion le fermera (`plan_git.sync_branches`)."""
+    fusion le fermera (`plan_git.sync_branches`). L130 : `priority` (1 haute,
+    2 normale, 3 basse, comme la file d'amélioration), pour enregistrer une
+    demande d'humain avec sa priorité.
+
+    L157 : `estimate` (« 2h », « 90m », ou des minutes) est la durée estimée,
+    posée avec sa source et son auteur (`actor`). La règle « obligatoire pour
+    un agent » est appliquée par les points d'entrée (`estimates.check`).
+    L157b : `size` (`s`, `m`, `l`) est la taille déclarée du changement, une
+    clé de la table de référence des durées."""
+    minutes = None
+    if estimate not in (None, ""):
+        from . import estimates
+        minutes = estimates.parse(estimate)
     if type not in ("bug", "evolution"):
         raise WorkError("type inconnu : %r (bug ou evolution)" % type)
+    if size not in (None, "") and size not in SIZES:
+        raise WorkError("taille inconnue : %r (s, m ou l)" % (size,))
     if not (title or "").strip():
         raise WorkError("titre obligatoire")
+    if priority is not None and priority not in PRIORITIES:
+        raise WorkError("priorité 1 (haute), 2 (normale) ou 3 (basse) : %r" % (priority,))
     if assignee:
         # L46 : l'assigné enregistré est celui que la garde a normalisé
         assignee = check_assignee(db, assignee, externe=externe, cfg=cfg)["assignee"]
@@ -103,10 +211,14 @@ def add(
     return storage.of(db).work.add(
         type=type, source=source, app=app, title=title.strip(), body=body,
         issue_ref=issue_ref, workstream=workstream, assignee=assignee,
-        budget_usd=budget_usd, note="création" + (" (plan : %s)" % package if package else ""),
+        budget_usd=budget_usd, note="création" + (" (plan : %s)" % package if package else "")
+        + (" ; estimation : %s" % span(minutes * 60) if minutes else ""),
         actor=actor, package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
-        branch=branch, branch_target=branch_target)
+        branch=branch, branch_target=branch_target, priority=priority,
+        estimate_minutes=minutes,
+        estimate_source=(" ".join(str(estimate_source or "").split()) or None)
+        if minutes else None, change_size=size or None)
 
 
 # --------------------------------------------------------------------------
@@ -149,6 +261,53 @@ def set_branch(db: Db, item_id: int, branch: str, target: str | None = None, *,
     row = storage.of(db).work.set_branch(item_id, branch, target, note=note, actor=actor)
     if row is None:
         raise WorkError("lot %s déjà %s : branche non posée" % (item_id, item["state"]))
+    return row
+
+
+# --------------------------------------------------------------------------
+# numéro de migration réservé (L122)
+# --------------------------------------------------------------------------
+
+def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
+                      release: bool = False, repo: str | None = None,
+                      actor: str = "") -> dict:
+    """L122 : réserve au lot le numéro de sa migration, avant d'écrire le
+    fichier. Sans `number` : le prochain libre, au-delà des migrations connues
+    (paquet, dépôt courant et ses branches, voir `migrations.highest_known`)
+    et des numéros déjà réservés par d'autres lots. Un lot qui a déjà sa
+    réservation la garde (idempotent). `release` la libère. Rend le lot."""
+    from . import migrations
+
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s introuvable" % item_id)
+    if item["state"] in ("merged", "promoted", "closed"):
+        raise WorkError("lot %s déjà %s : pas de réservation" % (item_id, item["state"]))
+    current = item.get("migration")
+    if release:
+        if current is None:
+            return item
+        note, number = "migration %04d libérée" % current, None
+    elif number is None:
+        if current is not None:
+            return item
+        note = "migration %(number)04d réservée"
+    else:
+        if not 1 <= int(number) <= 9999:
+            raise WorkError("numéro de migration hors de 0001-9999 : %s" % number)
+        if current == int(number):
+            return item
+        holder = storage.of(db).work.migration_holder(int(number))
+        if holder is not None:
+            raise WorkError("migration %04d déjà réservée par le lot #%s (%s)" % (
+                int(number), holder["id"], holder["title"]))
+        note = "migration %%(number)04d réservée (avant : %s)" % (
+            "%04d" % current if current is not None else "aucune")
+    floor = migrations.highest_known(repo) + 1 if number is None and not release else 0
+    row = storage.of(db).work.reserve_migration(item_id, number, floor, note=note,
+                                                actor=actor, release=release)
+    if row is None:
+        raise WorkError("lot %s n'est plus ouvert : pas de réservation" % item_id)
     return row
 
 
@@ -565,7 +724,8 @@ def link(db: Db, item_id: int, package: str | None, *, actor: str = "") -> dict:
 
 
 def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source: str = "",
-                 pr_ref: str | None = None, frozen_id: int | None = None) -> dict:
+                 pr_ref: str | None = None, frozen_id: int | None = None,
+                 declared: bool = False, extra: str = "") -> dict:
     """Fusion constatée : le lot passe `merged` et son jalon `merged` est posé.
 
     Idempotent : un lot déjà fusionné reste tel quel (`already`). Jamais de
@@ -576,6 +736,10 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
     `frozen_id` (preuve par le contenu) : le jalon `frozen` examiné ; si ce
     n'est plus le dernier gel du lot au moment d'écrire, rien n'est fermé
     (`refrozen`) — le nouveau gel n'a pas été examiné.
+
+    La note du journal et du jalon dit comment la fusion est connue :
+    « fusion constatée par <source> », ou « fusion déclarée par … »
+    (`declared`, `ameesh work merged`), suivie de `extra`.
     """
     for _attempt in range(3):
         item = get(db, item_id)
@@ -589,9 +753,10 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             return {"id": int(item_id), "result": "refused", "item": item,
                     "detail": "lot fermé (%s) : fusion constatée%s, aucune réouverture"
                               % (item.get("close_reason"), " (%s)" % pr_ref if pr_ref else "")}
-        note = "fusion constatée%s%s%s" % (
+        note = "fusion %s%s%s%s%s" % (
+            "déclarée" if declared else "constatée",
             " par %s" % source if source else "", " — %s" % pr_ref if pr_ref else "",
-            " (commit %s)" % sha[:12] if sha else "")
+            " (commit %s)" % sha[:12] if sha else "", " — %s" % extra if extra else "")
         row = storage.of(db).work.close_merged(
             item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
             frozen_id=frozen_id)
@@ -604,6 +769,30 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                 return {"id": int(item_id), "result": "refrozen", "item": get(db, item_id),
                         "detail": "nouveau gel déclaré entre-temps : non fermé, à réexaminer"}
     raise WorkError("lot %s déplacé entre-temps : réessayez" % item_id)
+
+
+def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "") -> dict:
+    """`ameesh work merged <id> --sha S` : une fusion faite hors PR et sans gel
+    (fusion locale sur la branche cible) se déclare en une fois.
+
+    Le lot passe `merged` depuis tout état ouvert (intake, build, qa,
+    blocked, waiting_human) ; son jalon `merged` reçoit le commit de fusion et
+    l'acteur ; le journal dit « fusion déclarée par <acteur> (commit …) ».
+    Idempotent (`already`, rien n'est réécrit) ; un lot fermé (abandonné,
+    remplacé) n'est jamais rouvert : WorkError. Rend le constat de
+    `close_merged`."""
+    text = (sha or "").strip().lower()
+    if not _SHA_RE.match(text):
+        raise WorkError("--sha : le commit de fusion (7 à 64 caractères hexadécimaux), pas %r"
+                        % (sha,))
+    done = close_merged(db, item_id, sha=text, actor=actor, source=actor or UNKNOWN_ACTOR,
+                        declared=True, extra=(note or "").strip())
+    if done["result"] == "refused":
+        item = done["item"]
+        raise WorkError("lot %s fermé (%s) : aucune réouverture — voir ameesh work show %s"
+                        % (item_id, "abandonné" if item.get("close_reason") == "abandoned"
+                           else "remplacé par #%s" % item.get("superseded_by"), item_id))
+    return done
 
 
 def close(db: Db, item_id: int, *, abandoned: bool = False, superseded_by: int | None = None,
@@ -646,8 +835,14 @@ def list_items(db: Db, *, state: str | None = None, assignee: str | None = None,
     return storage.of(db).work.items(state=state, assignee=assignee, limit=limit)
 
 
-def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "") -> dict:
-    """Déplace un lot en vérifiant la transition, la boucle QA et le terminal."""
+def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
+         correct: str | None = None) -> dict:
+    """Déplace un lot en vérifiant la transition, la boucle QA et le terminal.
+
+    `correct` (la raison) : correction d'un état posé par erreur, hors machine
+    à états, limitée à `CORRECTIONS` (un `promoted` à tort revient en
+    `merged`) ; le journal la dit (« correction : promoted → merged — raison »).
+    L'appelant a vérifié qui corrige (`corrector`)."""
     if state not in STATES:
         raise WorkError("état inconnu : %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
@@ -659,10 +854,29 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "") -
     current = item["state"]
     if current == state:
         raise WorkError("lot %s déjà en %s" % (item_id, state))
+    if correct is not None:
+        reason = (correct or "").strip()
+        if not reason:
+            raise WorkError("--correct : la raison de la correction est obligatoire")
+        if (current, state) not in CORRECTIONS:
+            raise WorkError(
+                "correction refusée : %s → %s (corrections possibles : %s ; sinon les "
+                "transitions autorisées depuis %s : %s)"
+                % (current, state, ", ".join("%s → %s" % c for c in sorted(CORRECTIONS)),
+                   current, ", ".join(sorted(TRANSITIONS[current])) or "aucune"))
+        text = "correction : %s → %s — %s%s" % (
+            current, state, reason, " (%s)" % note.strip() if note and note.strip() else "")
+        row = storage.of(db).work.move(item_id, state, current=current, loops=0, note=text,
+                                       actor=actor)
+        if row is None:
+            raise WorkError("lot %s déplacé entre-temps : réessayez" % item_id)
+        return row
     if state not in TRANSITIONS[current]:
         raise WorkError(
-            "transition refusée : %s → %s (autorisées depuis %s : %s)"
-            % (current, state, current, ", ".join(sorted(TRANSITIONS[current])) or "aucune"))
+            "transition refusée : %s → %s (autorisées depuis %s : %s)%s"
+            % (current, state, current, ", ".join(sorted(TRANSITIONS[current])) or "aucune",
+               " — état posé par erreur : ameesh work move %s %s --correct \"raison\""
+               % (item_id, state) if (current, state) in CORRECTIONS else ""))
     returning_loop = current == "qa" and state == "build"
     if returning_loop and int(item["loops"]) >= MAX_QA_LOOPS:
         raise WorkError(

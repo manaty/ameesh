@@ -3,7 +3,7 @@
 de base #1, cycle de vie des worktrees).
 
 ameesh fait le ménage de ce que SES agents créent, au lieu de le laisser à
-l'humain. Trois familles, trois règles :
+l'humain. Quatre familles, quatre règles :
 
 * **Dossier temporaire d'un agent** (jetable) : `TMPDIR`/`TMP`/`TEMP` d'un
   tour pointent vers `<tmp_root>/<agent>` (par défaut
@@ -12,7 +12,10 @@ l'humain. Trois familles, trois règles :
   fichiers (bloc-notes du harnais, sorties de tests) d'un tour à l'autre. Il
   est vidé au premier tour d'une session neuve (rotation, changement de lot,
   `restart`), borné par un quota (éviction des fichiers les plus anciens à la
-  fin de chaque tour) et supprimé quand l'agent n'existe plus au registre.
+  fin de chaque tour) et supprimé quand l'agent n'existe plus au registre —
+  L219 : seulement s'il appartient à CE mesh (fichier `.<agent>.owner`),
+  sans tour en cours (verrou `.<agent>.lock`, bail vivant) ni activité depuis
+  `orphan_idle` ; un homonyme d'un autre mesh a son propre dossier.
 * **Caches partagés de l'hôte** (réutilisables) : `npm_config_cache`, store
   pnpm (`npm_config_store_dir`/`pnpm_config_store_dir`), `YARN_CACHE_FOLDER`
   — et, sur demande de la politique, `XDG_CACHE_HOME` — pointent vers
@@ -34,12 +37,24 @@ l'humain. Trois familles, trois règles :
   `git cherry`, `git merge-tree`) ; sinon GARDÉS et signalés (`worktree_kept`) au
   responsable.
 
-Ce qu'ameesh n'a pas créé n'est JAMAIS supprimé automatiquement : une entrée
-de `/tmp` apparue pendant un tour (clone de relecture, `--cacheDirectory`
-explicite, venv) est signalée (`tmp_orphan`) avec la commande à lancer, et
-rien de plus. Toute suppression passe par [`_safe_rmtree`], qui refuse un
-chemin hors des dossiers gérés, un lien symbolique, ou une racine sans
-marqueur `.ameesh-menage`.
+* **Entrées de `/tmp` laissées par un tour** (L162 : clone de relecture,
+  `--cacheDirectory` explicite, image `docker save`) : apparues pendant le
+  tour d'un agent, elles sont signalées (`tmp_orphan`) avec la commande à
+  lancer ; une entrée signalée est SUPPRIMÉE par le passage périodique si
+  elle est un enfant direct du `/tmp` du système, à l'utilisateur, la même
+  que celle signalée (inode), attribuée à un agent du registre sans tour en
+  cours, rien dedans n'a changé depuis `orphan_idle` (2 h, mtime ET ctime),
+  aucun processus ne la tient, et aucune copie git dedans n'a de travail non
+  commité ou non poussé (`orphan_cleanup: false` : jamais, par hôte).
+
+Ce qu'ameesh n'a pas créé ni vu apparaître pendant un tour n'est JAMAIS
+supprimé automatiquement. Toute suppression dans un dossier géré passe par
+[`_safe_rmtree`], qui refuse un chemin hors des dossiers gérés, un lien
+symbolique, ou une racine sans marqueur `.ameesh-menage` ; dans `/tmp`, par
+[`_remove_tmp_entry`], qui revérifie l'entrée juste avant.
+
+Les dossiers gérés ne sont jamais en mémoire (L162) : une racine déclarée sur
+un tmpfs est écartée au profit de `<état>/.menage/…`.
 
 Tout est journalisé (`housekeeping_log`, migration 0045) et visible dans
 `ameesh hosts` ; `ameesh menage [--apply]` montre ou déclenche un passage.
@@ -50,6 +65,7 @@ import getpass
 import json
 import os
 import shlex
+import re
 import shutil
 import stat
 import subprocess
@@ -82,12 +98,55 @@ UNATTRIBUTED = "non attribué"
 WALK_LIMIT = 300_000
 #: délai maximal d'une commande git (secondes)
 GIT_TIMEOUT = 20.0
+#: L162 : inactivité (secondes) au-delà de laquelle une entrée de /tmp laissée
+#: par un tour est supprimée (`policy.housekeeping.orphan_idle`)
+DEFAULT_ORPHAN_IDLE_S = 2 * 3600.0
+#: L162 : horizon des signalements relus par le passage (le journal en garde 30 j)
+ORPHAN_LOOKBACK_S = 7 * 24 * 3600.0
+#: #222: an unattributed /tmp entry, never deleted, is signaled again by the
+#: periodic pass once its last line is this old, so that it stays in the 24 h
+#: window of the alerts for as long as it exists
+UNATTRIBUTED_REFRESH_S = 12 * 3600.0
+#: L162 : nombre de plus grosses entrées de /tmp dites quand le tmpfs se remplit
+TMP_TOP = 5
+#: L162 : systèmes de fichiers en mémoire — jamais une racine gérée
+MEMORY_FS = ("tmpfs", "ramfs")
+#: L162 : l'action attendue quand le tmpfs se remplit (alertes, journal)
+TMPFS_ACTION = ("action attendue : supprimer ce qui ne sert plus (commande par entrée "
+                "dans `ameesh menage`) ; le ménage supprime seul une entrée laissée par "
+                "un tour, inchangée depuis %s et tenue par aucun processus ; les agents "
+                "écrivent dans $TMPDIR, jamais en dur dans /tmp")
 
 #: dossier géré sous l'état d'ameesh (un nom d'agent ne commence jamais par
 #: un point : pas de collision avec `<état>/<agent>`)
 MANAGED_DIR = ".menage"
 #: marqueur posé par ameesh à la racine d'un dossier qu'il gère
 MARKER = ".ameesh-menage"
+#: L219: owner file of an agent's temporary directory, next to it in the tmp
+#: root (`.<agent>.owner`, never inside: the start of a session empties the
+#: directory and the quota evicts its oldest files). It names the mesh that
+#: created the directory (`mesh_key`).
+OWNER_SUFFIX = ".owner"
+#: L219: lock file of an agent's temporary directory, next to it (`flock`)
+LOCK_SUFFIX = ".lock"
+#: L219: directory of an agent whose homonym of another mesh owns
+#: `<agent>`: `<agent>~<first ALT_LEN characters of the mesh key>`
+ALT_SEP, ALT_LEN = "~", 8
+#: L219: a directory without owner file (another mesh, or before L219) is
+#: only touched after this long without any activity
+UNOWNED_IDLE_S = 24 * 3600.0
+#: L219: origin written in the owner file (after the key)
+ORIGIN_CREATED, ORIGIN_ADOPTED = "created", "adopted"
+#: L219: fallback directory of a turn that could not lock its own:
+#: `<name>+<random>`, used once, deleted by the pass once idle
+FALLBACK_SEP = "+"
+#: L219: longest wait for the lock of a temporary directory at a turn start
+#: (a pass holds it while deleting); past it the turn gets a fallback
+#: directory. Emptying (exclusive) waits less: a live session of the agent
+#: (`attach`) holds it shared, and then the directory is not emptied
+LOCK_WAIT_S, CLEAR_WAIT_S = 30.0, 5.0
+#: L219: fallback names tried before giving up
+FALLBACK_TRIES = 5
 
 #: caches partagés : nom du sous-dossier → variables d'environnement
 CACHES = (
@@ -101,7 +160,8 @@ XDG_CACHE = ("xdg", ("XDG_CACHE_HOME",))
 LOT_ENDED = ("merged", "promoted", "closed")
 
 POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_alert",
-               "redirect", "xdg_cache", "worktrees", "orphan_min_size")
+               "redirect", "xdg_cache", "worktrees", "orphan_min_size",
+               "orphan_cleanup", "orphan_idle")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -122,6 +182,10 @@ class Policy:
     xdg_cache: bool = False
     worktrees: bool = True
     orphan_min_size: int = DEFAULT_ORPHAN_MIN_SIZE
+    #: L162 : supprimer les entrées de /tmp abandonnées par un tour
+    orphan_cleanup: bool = True
+    #: L162 : inactivité (secondes) avant cette suppression
+    orphan_idle: float = DEFAULT_ORPHAN_IDLE_S
     #: provenance de chaque clé déclarée (identifiant du canon)
     origin: dict = field(default_factory=dict, compare=False)
 
@@ -170,7 +234,13 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`tmpfs_alert` : part attendue (0 < x <= 1, ou « 60% »)")
         else:
             parsed["tmpfs_alert"] = part
-    for key in ("redirect", "xdg_cache", "worktrees"):
+    if raw.get("orphan_idle") is not None:
+        seconds = parse_idle(raw["orphan_idle"])
+        if seconds is None:
+            problems.append("`orphan_idle` : durée attendue (ex. 2h, 90m, 7200)")
+        else:
+            parsed["orphan_idle"] = seconds
+    for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup"):
         if raw.get(key) is None:
             continue
         if not isinstance(raw[key], bool):
@@ -181,12 +251,28 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
     return parsed, problems, unknown
 
 
+def parse_idle(value) -> float | None:
+    """Durée d'inactivité (L162) : secondes (nombre), ou texte « 2h », « 90m »,
+    « 1d » ; None si illisible ou non positive."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else None
+    from . import stagnation  # import tardif : pas de cycle
+    try:
+        return stagnation.parse_duration(str(value))
+    except ValueError:
+        return None
+
+
 def effective(canons, host: str) -> Policy:
     """Politique de ménage de `host` d'après toutes les fiches Host des canons.
 
     Chemins et booléens : la première fiche qui les déclare (canon par défaut
     d'abord). Quotas, taille de signalement et seuil d'alerte : le plus strict
-    (le plus bas), comme les limites physiques de L43."""
+    (le plus bas), comme les limites physiques de L43. L162 : la suppression
+    des entrées de /tmp abandonnées est coupée dès qu'UNE fiche la coupe, et
+    l'inactivité exigée est la plus longue."""
     values: dict = {}
     origin: dict = {}
     for canon in canons or ():
@@ -200,6 +286,9 @@ def effective(canons, host: str) -> Policy:
                 values[key], origin[key] = value, label
             elif key in ("tmp_quota", "cache_quota", "orphan_min_size", "tmpfs_alert") \
                     and value < values[key]:
+                values[key], origin[key] = value, label
+            elif (key == "orphan_idle" and value > values[key]) or \
+                    (key == "orphan_cleanup" and value is False and values[key] is not False):
                 values[key], origin[key] = value, label
     return Policy(origin=origin, **values)
 
@@ -218,22 +307,228 @@ def _expand(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
+def in_memory(path: str) -> bool:
+    """`path` (existant ou non) est-il sur un système de fichiers en mémoire
+    (tmpfs) ? Faux si on ne sait pas le dire (L162)."""
+    try:
+        mount = platform.mount_of(path)
+    except Exception:  # lecture des montages impossible : on ne devine pas
+        return False
+    return bool(mount) and mount[1] in MEMORY_FS
+
+
+def _disk_root(declared: str | None, default: str) -> str:
+    """La racine déclarée, sauf si elle est en mémoire alors que le défaut
+    (sous l'état d'ameesh) ne l'est pas : un dossier géré vit sur disque (L162,
+    le /tmp en tmpfs de 12 Go plein le 2026-10-11 a bloqué tous les tours)."""
+    if not declared:
+        return default
+    chosen = _expand(declared)
+    if in_memory(chosen) and not in_memory(default):
+        return default
+    return chosen
+
+
+def declared_root_refused(cfg, policy: Policy) -> list[str]:
+    """Les racines déclarées écartées parce qu'en mémoire (pour le rapport)."""
+    out = []
+    for key, effective_root in (("tmp_root", tmp_root(cfg, policy)),
+                                ("cache_root", cache_root(cfg, policy))):
+        declared = getattr(policy, key)
+        if declared and _expand(declared) != effective_root:
+            out.append("%s %s en mémoire (tmpfs) : écarté, %s utilisé"
+                       % (key, declared, effective_root))
+    return out
+
+
 def tmp_root(cfg, policy: Policy) -> str:
-    return _expand(policy.tmp_root) if policy.tmp_root else \
-        os.path.join(cfg.state_dir, MANAGED_DIR, "tmp")
+    return _disk_root(policy.tmp_root, os.path.join(cfg.state_dir, MANAGED_DIR, "tmp"))
 
 
 def cache_root(cfg, policy: Policy) -> str:
-    return _expand(policy.cache_root) if policy.cache_root else \
-        os.path.join(cfg.state_dir, MANAGED_DIR, "cache")
+    return _disk_root(policy.cache_root, os.path.join(cfg.state_dir, MANAGED_DIR, "cache"))
 
 
 def agent_tmp(cfg, policy: Policy, agent: str) -> str:
-    return os.path.join(tmp_root(cfg, policy), agent)
+    """The agent's temporary directory for THIS mesh (L219: `tmp_name`)."""
+    troot = tmp_root(cfg, policy)
+    return os.path.join(troot, tmp_name(troot, agent, mesh_key(cfg)))
 
 
 def cache_names(policy: Policy) -> list[tuple[str, tuple[str, ...]]]:
     return list(CACHES) + ([XDG_CACHE] if policy.xdg_cache else [])
+
+
+def _conninfo_fields(dsn: str) -> dict[str, str]:
+    """The fields of a DSN, URI or key=value, following libpq's rules (quotes
+    and backslashes, percent-encoding, query parameters, several hosts). Pure
+    Python: the psql driver runs without psycopg, and the key must not depend
+    on the driver."""
+    from urllib.parse import parse_qsl, unquote
+
+    fields: dict[str, str] = {}
+    if re.match(r"postgres(?:ql)?://", dsn):
+        rest = dsn.split("://", 1)[1]
+        rest, _, query = rest.partition("?")
+        netloc, _, path = rest.partition("/")
+        netloc = netloc.rpartition("@")[2]
+        hosts, ports = [], []
+        for item in netloc.split(","):
+            m = re.fullmatch(r"(\[[^\]]*\]|[^:]*)(?::(.*))?", item)
+            hosts.append(unquote(m.group(1).strip("[]")))
+            ports.append(unquote(m.group(2) or ""))
+        if any(hosts):
+            fields["host"] = ",".join(hosts)
+        if any(ports):
+            fields["port"] = ",".join(ports)
+        if path:
+            fields["dbname"] = unquote(path)
+        fields.update(parse_qsl(query, keep_blank_values=True))
+        return fields
+    pos, n = 0, len(dsn)
+    while True:
+        while pos < n and dsn[pos].isspace():
+            pos += 1
+        if pos >= n:
+            return fields
+        m = re.compile(r"([^=\s]+)\s*=\s*").match(dsn, pos)
+        if not m:
+            return fields
+        pos, value, quoted = m.end(), [], False
+        if pos < n and dsn[pos] == "'":
+            pos, quoted = pos + 1, True
+        while pos < n:
+            ch = dsn[pos]
+            if ch == "\\" and pos + 1 < n:
+                value.append(dsn[pos + 1])
+                pos += 2
+                continue
+            if (quoted and ch == "'") or (not quoted and ch.isspace()):
+                pos += 1
+                break
+            value.append(ch)
+            pos += 1
+        fields[m.group(1)] = "".join(value)
+
+
+def _dsn_where(dsn: str) -> str:
+    """Where a DSN points (host, hostaddr, port, dbname), whatever its form
+    (URI, key=value, query parameters)."""
+    fields = _conninfo_fields(dsn)
+    # host names are case-insensitive, socket paths are not
+    host = ",".join(h if h.startswith(("/", "@")) else h.lower()
+                    for h in (fields.get("host") or "").split(","))
+    return "%s|%s|%s|%s" % (host, fields.get("hostaddr") or "",
+                            fields.get("port") or "5432", fields.get("dbname") or "")
+
+
+def mesh_key(cfg) -> str:
+    """L219: identity of the mesh (database and schema) shared by its runners:
+    a hash of host, hostaddr, port and database of the DSN (never user,
+    password or options) and of the schema. Two meshes of one host that share the state
+    directory have two keys."""
+    import hashlib
+
+    where = _dsn_where(str(getattr(cfg, "dsn", "") or ""))
+    text = "%s|%s" % (where, getattr(cfg, "schema", "") or "public")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def owner_file(troot: str, agent: str) -> str:
+    return os.path.join(troot, ".%s%s" % (agent, OWNER_SUFFIX))
+
+
+def lock_file(troot: str, name: str) -> str:
+    return os.path.join(troot, ".%s%s" % (name, LOCK_SUFFIX))
+
+
+def _owner_lines(troot: str, name: str) -> list[str]:
+    try:
+        with open(owner_file(troot, name), encoding="utf-8") as fh:
+            return fh.read().split()
+    except OSError:
+        return []
+
+
+def read_owner(troot: str, name: str) -> str | None:
+    """The mesh key written for the temporary directory `name`, or None."""
+    lines = _owner_lines(troot, name)
+    return lines[0] if lines else None
+
+
+def created_by(troot: str, name: str, key: str) -> bool:
+    """L219: true if the mesh `key` CREATED the directory `name` (owner file
+    `<key> created`). One it adopted (found without owner file) is never
+    emptied by a new session: it may hold another mesh's files."""
+    return _owner_lines(troot, name)[:2] == [key, ORIGIN_CREATED]
+
+
+def _write_owner(troot: str, name: str, key: str, origin: str) -> None:
+    path = owner_file(troot, name)
+    tmp = "%s.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("%s %s\n" % (key, origin))
+    os.replace(tmp, path)
+
+
+def tmp_name(troot: str, agent: str, key: str) -> str:
+    """L219: name of `agent`'s temporary directory in `troot` for the mesh
+    `key`: the agent's name, unless a homonymous agent of another mesh owns
+    it — then `<agent>~<key prefix>` (never shared, never taken over)."""
+    owner = read_owner(troot, agent)
+    if owner is None or owner == key:
+        return agent
+    return "%s%s%s" % (agent, ALT_SEP, key[:ALT_LEN])
+
+
+def tmp_agent(name: str, key: str) -> str:
+    """The agent of a directory name of this mesh (`tmp_name` reversed,
+    fallback suffix included)."""
+    name = name.split(FALLBACK_SEP, 1)[0]
+    suffix = "%s%s" % (ALT_SEP, key[:ALT_LEN])
+    return name[:-len(suffix)] if name.endswith(suffix) else name
+
+
+def tmp_lock(troot: str, name: str, *, exclusive: bool, timeout: float = 0.0):
+    """L219: lock of the temporary directory `name` (flock on a file NEXT to
+    it), shared during a turn, exclusive to empty, evict or delete it.
+    Returns the open file (closing it releases the lock), None if not obtained within
+    `timeout` seconds. The lock file is checked to be still the one at its
+    path once locked (a deletion may have unlinked it meanwhile)."""
+    import fcntl
+
+    path = lock_file(troot, name)
+    deadline = time.monotonic() + max(0.0, timeout)
+    mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    while True:
+        try:
+            fh = open(path, "a+")
+        except OSError:
+            return None
+        try:
+            fcntl.flock(fh.fileno(), mode | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.05)
+            continue
+        try:
+            same = os.fstat(fh.fileno()).st_ino == os.stat(path).st_ino
+        except OSError:
+            same = False
+        if same:
+            return fh
+        fh.close()
+
+
+def last_activity(path: str) -> float | None:
+    """Latest mtime or ctime (an extraction keeps old mtimes) of `path` and
+    of everything under it, at any depth; None if the walk is incomplete
+    (unreadable entry, mount point, too many entries): what was not seen is
+    never judged idle."""
+    scan = scan_activity(path)
+    return float(scan["latest"]) if scan["complete"] and scan["latest"] is not None else None
 
 
 def _ensure_root(root: str) -> None:
@@ -255,18 +550,127 @@ def _shims_wanted(cfg) -> bool:
         is not None
 
 
-def turn_env(cfg, policy: Policy, agent: str, base_env: dict) -> dict:
+@dataclass
+class TmpHold:
+    """L219: an agent's temporary directory held for a turn or a session:
+    its path, and the shared lock (`tmp_lock`) to close at the end."""
+
+    path: str
+    lock: object
+    entries: list = field(default_factory=list)
+
+    def release(self) -> None:
+        if self.lock is not None:
+            self.lock.close()
+            self.lock = None
+
+    def exclusive_now(self) -> bool:
+        """Turn the shared lock into the exclusive one without waiting: false
+        if another holder of the shared lock remains (a runner taking over
+        the lease). On failure the lock may be lost (flock converts by
+        releasing first): only for the end of the hold."""
+        import fcntl
+
+        if self.lock is None:
+            return False
+        try:
+            fcntl.flock(self.lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        return True
+
+
+def hold_tmp(cfg, policy: Policy, agent: str, *, new_session: bool) -> TmpHold:
+    """L219: the agent's temporary directory, locked (shared) for a turn.
+
+    A new session empties it under the exclusive lock, and only if THIS mesh
+    created it (never a homonym's of another mesh, never one adopted without
+    owner file). The shared lock only waits for a pass deleting or evicting
+    (exclusive, the time of an rm); if it cannot be had within
+    `LOCK_WAIT_S`, the turn gets a fresh fallback directory, never an
+    unlocked one (fallback names are tried `FALLBACK_TRIES` times, then
+    OSError). The owner file is only written under the exclusive lock, and
+    the name and owner are checked again once the lock is held; the lock is
+    then turned into the shared one."""
+    import fcntl
+
+    troot, key = tmp_root(cfg, policy), mesh_key(cfg)
+    _ensure_root(troot)
+    entries: list = []
+    lock, name, exclusive = None, "", False
+    for _attempt in range(3):          # a homonym of another mesh may claim it meanwhile
+        name = tmp_name(troot, agent, key)
+        # the owner is only written under the exclusive lock: two meshes
+        # starting a homonym at once never both see it free
+        claim = new_session or read_owner(troot, name) is None
+        lock = tmp_lock(troot, name, exclusive=True, timeout=CLEAR_WAIT_S) if claim else None
+        exclusive = lock is not None
+        if lock is None:
+            lock = tmp_lock(troot, name, exclusive=False, timeout=LOCK_WAIT_S)
+        if lock is None:
+            break
+        # checked again under the lock: the name is still ours, and an
+        # unowned one is only taken under the exclusive lock
+        if tmp_name(troot, agent, key) == name \
+                and (exclusive or read_owner(troot, name) is not None):
+            break
+        lock.close()
+        lock = None
+    if lock is None:
+        import secrets
+        base = name
+        for _attempt in range(FALLBACK_TRIES):
+            name = "%s%s%s" % (base, FALLBACK_SEP, secrets.token_hex(3))
+            lock = tmp_lock(troot, name, exclusive=True)
+            if lock is not None and read_owner(troot, name) is None:
+                break
+            if lock is not None:
+                lock.close()
+                lock = None
+        if lock is None:
+            raise OSError("L219 : aucun dossier temporaire verrouillable pour %s dans %s"
+                          % (agent, troot))
+        exclusive = True
+    mine = os.path.join(troot, name)
+    created = not os.path.isdir(mine)
+    os.makedirs(mine, mode=0o700, exist_ok=True)
+    if read_owner(troot, name) is None:            # under the exclusive lock (above)
+        _write_owner(troot, name, key, ORIGIN_CREATED if created else ORIGIN_ADOPTED)
+    elif new_session and not created and exclusive and created_by(troot, name, key):
+        freed = _clear_dir(mine, troot)
+        if freed:
+            entries.append({"kind": "tmp", "action": "deleted", "path": mine,
+                            "bytes": freed, "agent": agent,
+                            "detail": "session neuve : dossier temporaire vidé"})
+    fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
+    # a resumed session writes nothing at first: the pass must not see it idle
+    try:
+        os.utime(mine)
+    except OSError:
+        pass
+    return TmpHold(path=mine, lock=lock, entries=entries)
+
+
+def turn_env(cfg, policy: Policy, agent: str, base_env: dict, *,
+             hold: TmpHold | None = None) -> dict:
     """Variables à poser dans l'environnement d'un tour (crée les dossiers).
 
-    `TMPDIR`/`TMP`/`TEMP` sont toujours redirigés (c'est l'objet du lot) ;
-    une variable de cache déjà posée dans `base_env` est respectée."""
+    `TMPDIR`/`TMP`/`TEMP` sont toujours redirigés (c'est l'objet du lot) vers
+    le dossier de l'agent, SUR DISQUE (L162 : une racine déclarée en tmpfs est
+    écartée) : le harnais et tous ses enfants en héritent — Node
+    (`os.tmpdir()`, donc le cache de Jest), Python, Go, Rust, et le client
+    docker/podman (podman y copie ses images). Une variable de cache déjà
+    posée dans `base_env` est respectée. L219 : le dossier est celui de
+    `hold` (verrouillé pour le tour) ; sans `hold`, il est pris puis relâché
+    aussitôt (préparation, tests)."""
     if not policy.redirect or disabled(base_env):
         return {}
-    troot, croot = tmp_root(cfg, policy), cache_root(cfg, policy)
-    _ensure_root(troot)
+    if hold is None:
+        hold = hold_tmp(cfg, policy, agent, new_session=False)
+        hold.release()
+    croot = cache_root(cfg, policy)
     _ensure_root(croot)
-    mine = os.path.join(troot, agent)
-    os.makedirs(mine, mode=0o700, exist_ok=True)
+    mine = hold.path
     out = {"TMPDIR": mine, "TMP": mine, "TEMP": mine,
            "AMEESH_TMPDIR": mine, "AMEESH_CACHE_DIR": croot}
     for name, variables in cache_names(policy):
@@ -442,7 +846,9 @@ def new_tmp_entries(before: set[str] | None, *, path: str | None = None,
                     min_size: int = DEFAULT_ORPHAN_MIN_SIZE,
                     exclude: tuple[str, ...] = ()) -> list[dict]:
     """Entrées de /tmp apparues depuis `before`, à nous, d'au moins
-    `min_size` octets : chemin, taille, commande proposée."""
+    `min_size` octets : chemin, taille, commande proposée, et l'identité de
+    l'entrée (`ino`, `dev`) — le ménage ne supprime que CETTE entrée-là, pas
+    une homonyme recréée depuis (L162)."""
     if before is None:
         return []
     base = path or resources_mod.system_tmp()
@@ -463,8 +869,350 @@ def new_tmp_entries(before: set[str] | None, *, path: str | None = None,
         size = size_of(full)
         if size < min_size:
             continue
-        out.append({"path": full, "bytes": size, "command": "rm -rf -- %s" % shlex.quote(full)})
+        out.append({"path": full, "bytes": size, "command": "rm -rf -- %s" % shlex.quote(full),
+                    "ino": st.st_ino, "dev": st.st_dev})
     return out
+
+
+# --------------------------------------------------------------------------
+# /tmp du système : entrées laissées par un tour, supprimées si abandonnées
+# (L162 ; incident du 2026-10-11 à 03:38 : tmpfs de 12 Go plein à 83 %,
+# porte de pression fermée, treize agents au repos)
+# --------------------------------------------------------------------------
+
+def _blocks(st) -> int:
+    return st.st_blocks * 512 if getattr(st, "st_blocks", None) else st.st_size
+
+
+def fmt_idle(seconds: float) -> str:
+    """« 2 h », « 90 min », « 45 s »."""
+    seconds = max(0, int(round(float(seconds))))
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return "%d h" % (seconds // 3600)
+    if seconds >= 60:
+        return "%d min" % (seconds // 60)
+    return "%d s" % seconds
+
+
+def scan_activity(path: str, limit: int = WALK_LIMIT) -> dict:
+    """Parcours d'une entrée pour juger de son abandon : `bytes`, `latest` (la
+    plus récente des dates de modification ET de changement d'état de
+    l'entrée et de tout ce qu'elle contient — le ctime parce qu'une archive
+    extraite garde les mtimes de l'archive), `complete`, `why`.
+
+    Sans suivre les liens ni changer de système de fichiers. Un point de
+    montage dedans, une entrée illisible ou plus de `limit` entrées rendent le
+    parcours incomplet : on ne juge pas ce qu'on n'a pas vu."""
+    out: dict = {"bytes": 0, "latest": None, "complete": True, "why": ""}
+    try:
+        top = os.lstat(path)
+    except OSError as exc:
+        out.update(complete=False, why="illisible (%s)" % (exc.strerror or exc))
+        return out
+    latest = max(top.st_mtime, top.st_ctime)
+    if not stat.S_ISDIR(top.st_mode):
+        out.update(bytes=_blocks(top), latest=latest)
+        return out
+    count = 0
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        out.update(complete=False, why="entrée illisible : %s" % entry.path)
+                        continue
+                    count += 1
+                    latest = max(latest, st.st_mtime, st.st_ctime)
+                    if stat.S_ISDIR(st.st_mode):
+                        if st.st_dev != top.st_dev:
+                            out.update(complete=False, latest=latest,
+                                       why="point de montage dedans : %s" % entry.path)
+                            return out
+                        stack.append(entry.path)
+                    else:
+                        out["bytes"] += _blocks(st)
+                    if count >= limit:
+                        out.update(complete=False, latest=latest,
+                                   why="plus de %d entrées : activité non vérifiable" % limit)
+                        return out
+        except OSError:
+            out.update(complete=False, why="dossier illisible : %s" % current)
+    out["latest"] = latest
+    return out
+
+
+def _git_copies(path: str) -> list[str]:
+    """L'entrée et ses sous-dossiers directs qui sont des copies git (`.git`
+    dossier, ou fichier d'un worktree) : clone, worktree de relecture."""
+    if os.path.islink(path) or not os.path.isdir(path):
+        return []
+    candidates = [path]
+    try:
+        with os.scandir(path) as it:
+            candidates += [e.path for e in it if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        pass
+    return [c for c in candidates if os.path.lexists(os.path.join(c, ".git"))]
+
+
+def unsaved_git_work(path: str) -> str:
+    """Pourquoi une copie git de l'entrée porte du travail à garder, vide
+    sinon : verrouillée, modifications non commitées (ou état illisible),
+    HEAD sur aucune branche distante (commits jamais poussés)."""
+    for copy in _git_copies(path):
+        st = worktree_state(copy)
+        if st["locked"]:
+            return "%s verrouillé (git worktree lock)" % copy
+        if not st["clean"]:
+            return "%s : %s" % (copy, st["reason"] or "modifications non commitées")
+        if not (st["pushed"] or st["integrated"]):
+            return "%s : HEAD %s sur aucune branche distante" % (copy, st["head"][:12] or "?")
+    return ""
+
+
+def tmp_holder(path: str) -> str:
+    """Le processus qui tient `path` (fichier ouvert dedans, dossier courant,
+    chemin sur sa ligne de commande), en clair ; vide si aucun. Si l'OS ne
+    permet pas de le savoir, une raison : l'entrée est gardée (fail-closed)."""
+    try:
+        found = platform.holders(_real(path), needle=os.path.abspath(path))
+    except platform.NotAvailable as exc:
+        return "détenteurs illisibles (%s)" % exc
+    if not found:
+        return ""
+    first = found[0]
+    why = first.get("why") or ""
+    if "ligne de commande" in why:
+        why = "chemin sur la ligne de commande"
+    return "tenu par le processus %s (%s : %s)" % (first.get("pid"), why,
+                                                   (first.get("cmd") or "")[:80])
+
+
+def _tmp_entry_problem(path: str, base: str, ino=None, dev=None) -> str:
+    """Pourquoi `path` n'est pas une entrée de /tmp que le ménage peut
+    supprimer, vide si elle l'est : enfant direct de `base` (le /tmp du
+    système, jamais ailleurs), dossier ou fichier ordinaire (pas un lien), à
+    l'utilisateur, et — si connue — la MÊME entrée que celle signalée (inode)."""
+    name = os.path.basename(path)
+    if not name or name in (".", "..") or \
+            os.path.realpath(os.path.dirname(os.path.abspath(path))) != os.path.realpath(base):
+        return "hors du /tmp du système (%s)" % base
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return "illisible"
+    if stat.S_ISLNK(st.st_mode) or not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
+        return "ni dossier ni fichier ordinaire"
+    if st.st_uid != os.getuid():
+        return "appartient à un autre utilisateur"
+    if ino is not None and (st.st_ino, st.st_dev) != (ino, dev):
+        return "recréée depuis le signalement (autre inode)"
+    return ""
+
+
+def _remove_tmp_entry(path: str, base: str, ino=None, dev=None) -> int:
+    """Supprime une entrée de /tmp, revérifiée juste avant
+    (`_tmp_entry_problem`) ; rend les octets libérés."""
+    problem = _tmp_entry_problem(path, base, ino, dev)
+    if problem:
+        raise RefusedDeletion("%s : %s" % (path, problem))
+    before = size_of(path)
+    if stat.S_ISDIR(os.lstat(path).st_mode):
+        _make_owned_dirs_writable(path)
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        os.unlink(path)
+    left = size_of(path) if os.path.lexists(path) else 0
+    return max(0, before - left)
+
+
+def _make_owned_dirs_writable(top: str) -> None:
+    """Rend lecture, écriture et traversée à NOS dossiers sous `top` (un cache
+    de modules Go est en lecture seule) : sans cela, la suppression resterait
+    partielle. Aucun lien suivi, aucun dossier d'un autre utilisateur touché."""
+    uid = os.getuid()
+
+    def ouvrir(full: str) -> None:
+        try:
+            st = os.lstat(full)
+            if stat.S_ISDIR(st.st_mode) and st.st_uid == uid and (st.st_mode & 0o700) != 0o700:
+                os.chmod(full, stat.S_IMODE(st.st_mode) | 0o700)
+        except OSError:
+            pass
+
+    ouvrir(top)
+    for current, dirs, _files in os.walk(top):   # followlinks=False
+        for name in dirs:   # avant que os.walk n'y descende
+            ouvrir(os.path.join(current, name))
+
+
+def _orphan_verdict(row: dict, policy: Policy, *, base: str, registered, protected: set,
+                    running: set, now: float) -> tuple[str, str]:
+    """(`suppression` | `attend` | `garde`, raison) pour une entrée signalée
+    encore présente. Toutes les conditions de la suppression, la moins chère
+    d'abord ; le moindre doute garde l'entrée."""
+    path = row["path"]
+    data = row.get("data") or {}
+    if not policy.orphan_cleanup:
+        return "garde", "suppression coupée sur cet hôte (orphan_cleanup: false)"
+    problem = _tmp_entry_problem(path, base, data.get("ino"), data.get("dev"))
+    if problem:
+        return "garde", problem
+    agent = row.get("agent")
+    if registered is None:
+        return "garde", "registre illisible"
+    if not agent or agent not in registered:
+        return "garde", "agent %s absent du registre" % (agent or "?")
+    if agent in running:
+        return "attend", "tour en cours de %s" % agent
+    target = _real(path)
+    if any(_under(p, target) for p in protected):
+        return "garde", "contient un dossier de travail d'agent ou un dossier géré"
+    scan = scan_activity(path)
+    if not scan["complete"]:
+        return "garde", scan["why"]
+    idle = now - float(scan["latest"])
+    if idle < policy.orphan_idle:
+        return "attend", "modifié il y a %s (supprimé après %s sans changement)" % (
+            fmt_idle(max(0.0, idle)), fmt_idle(policy.orphan_idle))
+    work = unsaved_git_work(path)
+    if work:
+        return "garde", "travail git à garder — %s" % work
+    holder = tmp_holder(path)
+    if holder:
+        return "attend", holder
+    return "suppression", "laissé par le tour %s de %s, inchangé depuis %s, tenu par aucun " \
+        "processus" % (str(data.get("turn") or "?")[:8], agent, fmt_idle(idle))
+
+
+def orphan_pass(db, host: str, policy: Policy, *, registered, protected: set,
+                running: set, dry_run: bool, now: float) -> tuple[list, list, list]:
+    """Entrées de /tmp signalées pendant un tour (L162) : (lignes du journal,
+    plan lisible, entrées encore présentes avec leur sort).
+
+    La dernière ligne de chaque chemin compte : `signaled` est candidate,
+    `deleted` est close (une homonyme recréée hors d'un tour n'est pas à
+    nous). Suppression seulement si `_orphan_verdict` le permet ; sinon
+    l'entrée reste signalée, avec la raison. Rien n'est écrit en base ici."""
+    base = resources_mod.system_tmp()
+    protected_real = {_real(p) for p in protected if p}
+    entries: list[dict] = []
+    plan: list[dict] = []
+    present: list[dict] = []
+    if not host:   # sans nom d'hôte, les signalements des autres hôtes s'y mêleraient
+        return entries, plan, present
+    try:
+        # #222: the last line of every path, with no window nor limit: an
+        # unattributed entry is followed for as long as it exists
+        rows = storage.of(db).housekeeping.latest_by_path(host, "orphan")
+    except Exception:
+        return entries, plan, present
+    for row in rows:
+        path = row.get("path") or ""
+        if not path or row.get("action") != "signaled":
+            continue
+        if row.get("agent") and now - float(row.get("at_ts") or 0) > ORPHAN_LOOKBACK_S:
+            continue   # an attributed signal (before #222) is read for 7 days, as before
+        data = row.get("data") or {}
+        base_item = {"kind": "orphan", "path": path, "agent": row.get("agent"),
+                     "lot": row.get("lot")}
+        if not os.path.lexists(path):
+            if not row.get("agent") and not dry_run:
+                # #222: the tracking of an unattributed entry ends when it is gone
+                entries.append(dict(base_item, action="gone", bytes=0, data=data,
+                                    detail="entrée non attribuée disparue de /tmp"))
+            continue
+        action, why = _orphan_verdict(row, policy, base=base, registered=registered,
+                                      protected=protected_real, running=running, now=now)
+        size = size_of(path)
+        plan.append(dict(base_item, action=action, bytes=size, detail=why))
+        if not row.get("agent") and not dry_run \
+                and now - float(row.get("at_ts") or 0) >= UNATTRIBUTED_REFRESH_S:
+            # #222: never deleted, an unattributed entry stays signaled, with
+            # its current size, for as long as it is on disk (alerts read 24 h)
+            entries.append(dict(base_item, action="signaled", bytes=size, data=data,
+                                detail=row.get("detail") or UNATTRIBUTED))
+        item = {"path": path, "bytes": size, "agent": row.get("agent"),
+                "at_ts": row.get("at_ts"), "status": action, "detail": why,
+                "command": data.get("command") or "rm -rf -- %s" % shlex.quote(path)}
+        if action != "suppression" or dry_run:
+            present.append(item)
+            continue
+        worktrees = [common_dir(c) for c in _git_copies(path)
+                     if os.path.isfile(os.path.join(c, ".git"))]
+        try:
+            freed = _remove_tmp_entry(path, base, data.get("ino"), data.get("dev"))
+        except (OSError, RefusedDeletion) as exc:
+            item.update(status="garde", detail="suppression refusée : %s" % exc)
+            present.append(item)
+            continue
+        for repo in worktrees:
+            prune_worktrees(repo)
+        entries.append(dict(base_item, action="deleted", bytes=freed,
+                            detail="entrée de /tmp abandonnée : %s" % why,
+                            data={"turn": data.get("turn"), "command": item["command"]}))
+        if os.path.lexists(path):  # suppression partielle : ce qui reste est dit
+            present.append(dict(item, bytes=size_of(path), status="garde",
+                                detail="suppression partielle (fichiers d'un autre "
+                                       "utilisateur ?)"))
+    return entries, plan, present
+
+
+def _owner(uid: int) -> str:
+    try:
+        import pwd  # Unix seulement
+        return pwd.getpwuid(uid).pw_name
+    except (ImportError, KeyError):
+        return str(uid)
+
+
+def tmp_top(base: str | None = None, n: int = TMP_TOP) -> list[dict]:
+    """Les `n` plus grosses entrées de premier niveau du /tmp du système
+    (lecture seule ; taille bornée à `WALK_LIMIT` fichiers par entrée) :
+    `path`, `bytes`, `owner`, `mtime`."""
+    base = base or resources_mod.system_tmp()
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        full = os.path.join(base, name)
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            continue
+        out.append({"path": full, "bytes": size_of(full), "owner": _owner(st.st_uid),
+                    "mtime": st.st_mtime})
+    out.sort(key=lambda e: (-e["bytes"], e["path"]))
+    return out[:n]
+
+
+def describe_top(top) -> str:
+    """« /tmp/a 2.2 GiB (smichea, laissé par b1 : attend — …) ; … »."""
+    parts = []
+    for e in top or ():
+        who = e.get("owner") or "?"
+        if e.get("agent"):
+            who += ", laissé par %s" % e["agent"]
+            if e.get("status"):
+                who += " : %s" % e["status"]
+        parts.append("%s %s (%s)" % (e.get("path"), _fmt(e.get("bytes")), who))
+    return " ; ".join(parts)
+
+
+def tmpfs_hint(top, policy: Policy) -> str:
+    """Le complément d'une alerte de tmpfs plein : les plus grosses entrées
+    (si un bilan les a relevées) et l'action attendue."""
+    plus_gros = ("plus gros dans /tmp : %s" % describe_top(top)) if top else \
+        "plus gros dans /tmp : `ameesh menage` sur l'hôte"
+    return "%s — %s" % (plus_gros, TMPFS_ACTION % fmt_idle(policy.orphan_idle))
 
 
 # --------------------------------------------------------------------------
@@ -690,6 +1438,9 @@ class Turn:
     started: float = 0.0
     #: `AMEESH_HOUSEKEEPING=off` : rien n'est fait autour du tour
     off: bool = False
+    #: L219: the temporary directory, locked (`TmpHold`) until `end`
+    lock: object = None
+    tmp: str = ""
 
     @classmethod
     def begin(cls, cfg, policy: Policy, agent: str, cwd: str | None, *,
@@ -698,14 +1449,17 @@ class Turn:
         if disabled(base_env):
             turn.off = True
             return turn
-        mine = agent_tmp(cfg, policy, agent)
-        if new_session and policy.redirect and os.path.isdir(mine):
-            freed = _clear_dir(mine, tmp_root(cfg, policy))
-            if freed:
-                turn.entries.append({"kind": "tmp", "action": "deleted", "path": mine,
-                                     "bytes": freed, "agent": agent,
-                                     "detail": "session neuve : dossier temporaire vidé"})
-        turn.env = turn_env(cfg, policy, agent, base_env)
+        if policy.redirect:
+            # L219: locked (shared) until `end`, so that no pass deletes or
+            # evicts it meanwhile
+            hold = hold_tmp(cfg, policy, agent, new_session=new_session)
+            turn.lock, turn.tmp = hold, hold.path
+            turn.entries.extend(hold.entries)
+            try:
+                turn.env = turn_env(cfg, policy, agent, base_env, hold=hold)
+            except Exception:
+                hold.release()
+                raise
         if policy.worktrees:
             turn.worktrees_before = {w["path"] for w in list_worktrees(cwd)}
         turn.tmp_before = tmp_names()
@@ -715,18 +1469,25 @@ class Turn:
         if self.off:
             return self.entries
         policy = self.policy
-        if self.env:
-            root = tmp_root(self.cfg, policy)
-            result = evict_lru([agent_tmp(self.cfg, policy, self.agent)], root,
-                               policy.tmp_quota, min_age=EVICT_MIN_AGE_S)
-            if result["files"]:
-                self.entries.append({
-                    "kind": "tmp", "action": "evicted",
-                    "path": agent_tmp(self.cfg, policy, self.agent),
-                    "bytes": result["evicted"], "agent": self.agent, "lot": lot,
-                    "detail": "quota %s : %d fichier(s) les plus anciens évincés"
-                              % (resources_mod.fmt_value("q", policy.tmp_quota),
-                                 result["files"])})
+        try:
+            if self.env and self.tmp and self.lock is not None and self.lock.exclusive_now():
+                # L219: under the exclusive lock, or no eviction (another
+                # runner holding it shared may be using the directory)
+                root = tmp_root(self.cfg, policy)
+                result = evict_lru([self.tmp], root, policy.tmp_quota,
+                                   min_age=EVICT_MIN_AGE_S)
+                if result["files"]:
+                    self.entries.append({
+                        "kind": "tmp", "action": "evicted",
+                        "path": self.tmp,
+                        "bytes": result["evicted"], "agent": self.agent, "lot": lot,
+                        "detail": "quota %s : %d fichier(s) les plus anciens évincés"
+                                  % (resources_mod.fmt_value("q", policy.tmp_quota),
+                                     result["files"])})
+        finally:
+            if self.lock is not None:      # L219: the turn is over
+                self.lock.release()
+                self.lock = None
         if policy.worktrees and self.cwd and db is not None:
             known_cwd = os.path.abspath(self.cwd)
             repo = ""
@@ -762,16 +1523,42 @@ class Turn:
                     "agent": self.agent, "lot": lot if mine else None, "detail": detail})
         exclude = tuple(v for v in (self.env.get("TMPDIR"), self.env.get("AMEESH_CACHE_DIR"))
                         if v)
-        for found in new_tmp_entries(self.tmp_before, min_size=policy.orphan_min_size,
-                                     exclude=exclude):
+        found_all = new_tmp_entries(self.tmp_before, min_size=policy.orphan_min_size,
+                                    exclude=exclude)
+        signaled = self._signaled(db, host) if found_all else set()
+        for found in found_all:
+            if (found["path"], str(found["ino"]), str(found["dev"])) in signaled:
+                continue  # #222: already signaled by another turn, its fate stays
+            # #222: /tmp is shared by the whole host (other agents, other meshes
+            # whose state directory is elsewhere, processes outside any turn):
+            # nothing proves that this turn created the entry, so it is never
+            # charged to it. Unattributed, it is never deleted (`_orphan_verdict`
+            # keeps an entry without agent); the `tmp_orphan` alert follows it,
+            # with its size and the command, for as long as it exists.
             self.entries.append({
                 "kind": "orphan", "action": "signaled", "path": found["path"],
-                "bytes": found["bytes"], "agent": self.agent, "lot": lot,
-                "detail": "apparu dans /tmp pendant le tour %s de %s (attribution probable) ; "
-                          "hors des dossiers gérés : jamais supprimé automatiquement"
-                          % (turn_id[:8], self.agent),
-                "data": {"command": found["command"], "turn": turn_id}})
+                "bytes": found["bytes"], "agent": None, "lot": None,
+                "detail": "%s : apparu dans /tmp pendant le tour %s de %s ; /tmp est commun "
+                          "à l'hôte (autres tours, autres meshes, processus hors tour) : "
+                          "jamais supprimé automatiquement" % (UNATTRIBUTED, turn_id[:8],
+                                                                 self.agent),
+                "data": {"command": found["command"], "turn": turn_id, "witness": self.agent,
+                         "lot": lot, "ino": found["ino"], "dev": found["dev"]}})
         return self.entries
+
+    def _signaled(self, db, host: str) -> set:
+        """#222: (path, inode, device) of the /tmp entries whose last line is
+        a signal (sticky rule: a later turn does not take it again). Without
+        database, or if the log cannot be read: none."""
+        if db is None or not host:
+            return set()
+        try:
+            rows = storage.of(db).housekeeping.latest_by_path(host, "orphan")
+        except Exception:
+            return set()
+        return {(r.get("path"), str((r.get("data") or {}).get("ino")),
+                 str((r.get("data") or {}).get("dev")))
+                for r in rows if r.get("action") == "signaled"}
 
 
 # --------------------------------------------------------------------------
@@ -779,7 +1566,11 @@ class Turn:
 # --------------------------------------------------------------------------
 
 def measure(cfg, policy: Policy) -> dict:
-    """Occupation des dossiers gérés et du /tmp du système (lecture seule)."""
+    """Occupation des dossiers gérés et du /tmp du système (lecture seule).
+
+    L162 : dès que le /tmp en tmpfs atteint l'alerte (ou le seuil de pression
+    par défaut, s'il est plus bas), ses `TMP_TOP` plus grosses entrées
+    (`system_tmp_top`), que les alertes reprennent."""
     troot, croot = tmp_root(cfg, policy), cache_root(cfg, policy)
     agents: dict = {}
     if os.path.isdir(troot):
@@ -793,6 +1584,8 @@ def measure(cfg, policy: Policy) -> dict:
         if os.path.isdir(full):
             caches[name] = size_of(full)
     system = resources_mod.fs_usage(resources_mod.system_tmp())
+    fraction = resources_mod.tmpfs_fraction(system)
+    seuil = min(policy.tmpfs_alert, resources_mod.DEFAULT_MAX_TMPFS_USED)
     return {
         "tmp_root": troot, "tmp_bytes": sum(agents.values()), "tmp_by_agent": agents,
         "tmp_quota": policy.tmp_quota,
@@ -801,7 +1594,8 @@ def measure(cfg, policy: Policy) -> dict:
         "cache_root": croot, "cache_bytes": sum(caches.values()), "cache_by_name": caches,
         "cache_quota": policy.cache_quota,
         "system_tmp": system,
-        "system_tmp_fraction": resources_mod.tmpfs_fraction(system),
+        "system_tmp_fraction": fraction,
+        "system_tmp_top": tmp_top() if fraction is not None and fraction >= seuil else [],
         "tmpfs_alert": policy.tmpfs_alert,
     }
 
@@ -987,6 +1781,30 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
     return out
 
 
+def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
+                idle_after: float, now: float) -> str:
+    """L219: why the pass keeps the temporary directory `path` of an agent
+    not in turn, empty if it may evict (`registered`) or delete it. Another
+    mesh's is never touched; one without owner file (another mesh sharing
+    the state directory, or before L219) only after `UNOWNED_IDLE_S`
+    without any activity; this mesh's of an agent ABSENT from the registry
+    after `idle_after` (a turn writes in it)."""
+    if owner is not None and owner != key:
+        return "appartient à un autre mesh"
+    if owner is not None and registered:
+        return ""
+    latest = last_activity(path)
+    if latest is None:
+        return "activité illisible (parcours incomplet)"
+    idle = now - latest
+    if owner is None and idle < UNOWNED_IDLE_S:
+        return "sans propriétaire (autre mesh du poste, ou antérieur à L219), " \
+               "actif il y a %d h (moins de %d h)" % (idle // 3600, UNOWNED_IDLE_S // 3600)
+    if not registered and idle < idle_after:
+        return "actif il y a %d min (moins de %d min)" % (idle // 60, idle_after // 60)
+    return ""
+
+
 def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
              busy: bool = False, agents_in_turn: set | None = None,
              include_lotless: bool = False, now: float | None = None,
@@ -999,7 +1817,10 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
       tourne (`busy` faux) ;
     * worktrees suivis dont le lot est fini : retirés s'ils sont propres et
       intégrés (garde-fous de `_worktree_pass`), sinon gardés et signalés ;
-    * bilan (`mesure`) et signalements de /tmp récents (rien n'y est touché).
+    * entrées de /tmp signalées pendant un tour : supprimées si abandonnées
+      (garde-fous de `_orphan_verdict`, L162), sinon dites avec la raison ;
+    * bilan (`mesure`), avec les plus grosses entrées de /tmp si le tmpfs
+      atteint l'alerte.
 
     `dry_run` : rien n'est supprimé ni écrit en base ; le plan est rendu."""
     now = time.time() if now is None else float(now)
@@ -1024,36 +1845,82 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     except Exception:  # registre illisible : on ne supprime aucun dossier d'agent
         registered = None  # type: ignore[assignment]
     # 1. dossiers temporaires des agents
+    key = mesh_key(cfg)
     if os.path.isdir(troot) and _managed(troot):
         for name in sorted(os.listdir(troot)):
             full = os.path.join(troot, name)
             if name == MARKER or not os.path.isdir(full) or os.path.islink(full):
                 continue
-            if registered is not None and name not in registered:
-                size = size_of(full)
-                plan.append({"kind": "tmp", "path": full, "agent": name, "action": "suppression",
-                             "bytes": size, "detail": "agent absent du registre"})
-                if not dry_run:
-                    freed = _safe_rmtree(full, troot)
-                    entries.append({"kind": "tmp", "action": "deleted", "path": full,
-                                    "bytes": freed, "agent": name,
-                                    "detail": "agent absent du registre"})
+            owner = read_owner(troot, name)
+            if owner is not None and owner != key:
+                # L219: another mesh of this host (same state directory)
+                # manages it: never deleted nor evicted here
                 continue
-            if name in agents_in_turn:
+            agent = tmp_agent(name, key)
+            if registered is None and owner is None:
                 continue
-            result = evict_lru([full], troot, policy.tmp_quota, now=now, dry_run=dry_run)
-            if result["files"]:
-                plan.append({"kind": "tmp", "path": full, "agent": name, "action": "éviction",
-                             "bytes": result["evicted"],
-                             "detail": "%d fichier(s), quota %s" % (
-                                 result["files"],
-                                 resources_mod.fmt_value("q", policy.tmp_quota))})
-                if not dry_run:
-                    entries.append({"kind": "tmp", "action": "evicted", "path": full,
-                                    "bytes": result["evicted"], "agent": name,
-                                    "detail": "quota %s : %d fichier(s) évincés" % (
-                                        resources_mod.fmt_value("q", policy.tmp_quota),
-                                        result["files"])})
+            # L219: an agent in turn here (`agents_in_turn`) or with a live
+            # lease (another runner, a CLI) keeps its directory, registered
+            # or not
+            if agent in running:
+                if registered is not None and agent not in registered:
+                    skipped.append("tmp %s gardé : en tour" % full)
+                continue
+            # a fallback directory (`hold_tmp`) served one turn: deleted once
+            # idle, like the directory of an agent absent from the registry
+            orphan = FALLBACK_SEP in name or (registered is not None
+                                              and agent not in registered)
+            why = tmp_problem(full, owner, key, registered=not orphan,
+                              idle_after=policy.orphan_idle, now=now)
+            if why:
+                skipped.append("tmp %s gardé : %s" % (full, why))
+                continue
+            # L219: a turn holds the lock (shared) from its start to its end;
+            # everything is checked again under the exclusive lock, right
+            # before deleting or evicting
+            lock = None if dry_run else tmp_lock(troot, name, exclusive=True)
+            if not dry_run and lock is None:
+                skipped.append("tmp %s gardé : en tour (verrou pris)" % full)
+                continue
+            try:
+                if not dry_run and (read_owner(troot, name) != owner or tmp_problem(
+                        full, owner, key, registered=not orphan,
+                        idle_after=policy.orphan_idle, now=now)):
+                    skipped.append("tmp %s gardé : changé pendant le passage" % full)
+                    continue
+                if orphan:
+                    size = size_of(full)
+                    plan.append({"kind": "tmp", "path": full, "agent": agent,
+                                 "action": "suppression", "bytes": size,
+                                 "detail": "agent absent du registre"})
+                    if not dry_run:
+                        freed = _safe_rmtree(full, troot)
+                        for leftover in (owner_file(troot, name), lock_file(troot, name)):
+                            try:
+                                os.unlink(leftover)
+                            except OSError:
+                                pass
+                        entries.append({"kind": "tmp", "action": "deleted", "path": full,
+                                        "bytes": freed, "agent": agent,
+                                        "detail": "agent absent du registre"})
+                    continue
+                result = evict_lru([full], troot, policy.tmp_quota, now=now,
+                                   dry_run=dry_run)
+                if result["files"]:
+                    plan.append({"kind": "tmp", "path": full, "agent": agent,
+                                 "action": "éviction", "bytes": result["evicted"],
+                                 "detail": "%d fichier(s), quota %s" % (
+                                     result["files"],
+                                     resources_mod.fmt_value("q", policy.tmp_quota))})
+                    if not dry_run:
+                        entries.append({"kind": "tmp", "action": "evicted", "path": full,
+                                        "bytes": result["evicted"], "agent": agent,
+                                        "detail": "quota %s : %d fichier(s) évincés" % (
+                                            resources_mod.fmt_value("q", policy.tmp_quota),
+                                            result["files"])})
+            finally:
+                if lock is not None:
+                    lock.close()
     # 2. caches partagés
     directories = [os.path.join(croot, name) for name, _v in cache_names(policy)]
     if busy:
@@ -1087,22 +1954,28 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     conteneurs = reap_containers(runtime, db, host, dry_run=dry_run)
     entries += conteneurs["entries"]
     plan += conteneurs["plan"]
-    # 5. signalements récents encore présents (lecture seule)
-    orphans = []
+    # 5. entrées de /tmp laissées par un tour (L162) : supprimées si
+    #    abandonnées (garde-fous de `_orphan_verdict`), sinon signalées
+    gardes = protected | {troot, croot, cfg.state_dir}
     try:
-        seen = set()
-        for row in storage.of(db).housekeeping.recent(host, 7 * 24 * 3600.0, 500):
-            if row["kind"] != "orphan" or row["path"] in seen:
-                continue
-            seen.add(row["path"])
-            if os.path.lexists(row["path"]):
-                orphans.append({"path": row["path"], "bytes": size_of(row["path"]),
-                                "agent": row.get("agent"), "at_ts": row.get("at_ts"),
-                                "command": (row.get("data") or {}).get("command")
-                                or "rm -rf -- %s" % shlex.quote(row["path"])})
-    except Exception:
-        orphans = []
+        orphan_entries, orphan_plan, orphans = orphan_pass(
+            db, host, policy, registered=registered, protected=gardes, running=running,
+            dry_run=dry_run, now=now)
+    except Exception as exc:  # jamais fatal pour le passage
+        orphan_entries, orphan_plan, orphans = [], [], []
+        skipped.append("/tmp : passage impossible (%s)" % type(exc).__name__)
+    entries += orphan_entries
+    plan += orphan_plan
+    skipped += declared_root_refused(cfg, policy)
     report_measure = measure(cfg, policy)
+    # les plus grosses entrées de /tmp, avec ce que le ménage en fera
+    sorts = {o["path"]: o for o in orphans}
+    for top in report_measure.get("system_tmp_top") or ():
+        known = sorts.get(top["path"])
+        if known is not None:
+            top.update(agent=known.get("agent"), status=known.get("status"),
+                       detail=known.get("detail"))
+        top["command"] = "rm -rf -- %s" % shlex.quote(top["path"])
     report_measure["containers"] = {
         "ameesh": conteneurs["ameesh"], "others": conteneurs["others"]}
     if not dry_run:
@@ -1158,8 +2031,9 @@ def print_report(report: dict) -> None:
                 _fmt(sys_tmp.get("tmp_size_bytes")), sys_tmp.get("tmp_fstype") or "?",
                 " — ALERTE : au-delà de %d %%" % round(m["tmpfs_alert"] * 100)
                 if (m.get("system_tmp_fraction") or 0) >= m["tmpfs_alert"] else ""))
-    rows = report["plan"] if report["dry_run"] else [
-        e for e in report["entries"] if e["kind"] != "mesure"]
+    # en essai, les entrées de /tmp ont leur propre section (avec la commande)
+    rows = [p for p in report["plan"] if p.get("kind") != "orphan"] if report["dry_run"] \
+        else [e for e in report["entries"] if e["kind"] != "mesure"]
     if not rows:
         print("  rien à faire")
     for row in rows:
@@ -1181,10 +2055,21 @@ def print_report(report: dict) -> None:
                                               c.get("status") or "?", c["command"]))
     orphans = report.get("orphans") or []
     if orphans:
-        print("  hors dossiers gérés (jamais supprimé par ameesh ; à décider par un humain) :")
+        print("  entrées de /tmp laissées par un tour (supprimées seules une fois abandonnées) :")
         for o in orphans:
-            print("    %s  %s  (agent %s)  →  %s" % (_fmt(o["bytes"]), o["path"],
-                                                  o.get("agent") or "?", o["command"]))
+            print("    %s  %s  (agent %s)  %s%s  →  %s" % (
+                _fmt(o["bytes"]), o["path"], o.get("agent") or "?", o.get("status") or "",
+                " — %s" % o["detail"] if o.get("detail") else "", o["command"]))
+    top = (report.get("measure") or {}).get("system_tmp_top") or []
+    if top:
+        print("  plus grosses entrées de %s :" % ((m.get("system_tmp") or {}).get("tmp_path")
+                                                   or "/tmp"))
+        for e in top:
+            print("    %s  %s  (%s%s)  →  %s" % (
+                _fmt(e.get("bytes")), e["path"], e.get("owner") or "?",
+                ", laissée par %s : %s" % (e["agent"], e.get("status") or "?")
+                if e.get("agent") else ", hors tour d'agent : à décider",
+                e.get("command") or ""))
 
 
 def cmd_menage(cfg, args) -> int:
@@ -1233,6 +2118,6 @@ def cmd_menage(cfg, args) -> int:
         db.close()
 
 
-__all__ = ["Policy", "parse_policy", "effective", "turn_env", "Turn", "run_pass",
+__all__ = ["Policy", "parse_policy", "effective", "turn_env", "hold_tmp", "Turn", "run_pass",
            "measure", "evict_lru", "worktree_state", "list_worktrees", "cmd_menage",
-           "caller_refusal"]
+           "caller_refusal", "orphan_pass", "tmp_top", "tmpfs_hint", "in_memory"]

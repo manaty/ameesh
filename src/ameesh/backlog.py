@@ -39,6 +39,33 @@ annoncé par un courrier lié au lot (`--lot`), qui le réveille. Garde-fous :
 * l'attribution est conditionnelle (assigné encore vide) : deux preneurs
   concurrents ne prennent pas le même élément.
 
+**Lots de l'équipe** (L165, avant la file) : un agent réveillable au repos
+sans lot depuis `lot_idle_s` (15 min par défaut) prend lui-même le lot non
+assigné le plus prioritaire de SON équipe qu'il sait faire, sans attendre
+qu'on le lui confie (constat du 11/10 : 9 agents Nexlink sur 13 au repos, 3
+lots Nexlink sans agent). Mêmes garde-fous que la file (repos, rien ne
+l'attend, forfait d'abord, budget, hôte), et en plus :
+
+* seuls les lots `intake` sans assigné, hors file : jamais un lot qui attend
+  un humain (`waiting_human`), déjà confié (`build`), de décision (demande de
+  décision en attente, jalon de décision ouvert, capacité `decision` exigée)
+  ni de production (capacité `production` exigée) ;
+* l'équipe du lot est la sienne, sinon celle de sa fiche (ou de la fiche
+  parente), sinon son application ; elle doit être celle de l'agent. Un lot
+  sans équipe connue n'est pas pris ;
+* l'agent sait le faire : les capacités exigées sont les siennes, et
+  `harness:<nom>` désigne son harnais ;
+* un lot dont le début prévu (`planned_start`) est après aujourd'hui attend
+  sa date ;
+* ordre : priorité, puis dates prévues (début, fin, livraison), puis
+  ancienneté ; un lot créé il y a moins de 5 min est laissé à qui l'a créé
+  (il le confie sans doute dans la foulée) ;
+* un orchestrateur ne se sert pas lui-même ; ceux de l'équipe (sinon tous)
+  reçoivent un courrier `event` lié au lot et peuvent le réassigner (`ameesh
+  work assign`) ;
+* au plus `lot_max_per_hour` prises par heure glissante, comptées à part de
+  la file.
+
 Le cœur reste générique : rien ici ne nomme un métier. La source d'un élément
 est un texte libre ; le circuit (relecture, vérifications, intégration) est
 celui du projet de l'agent.
@@ -59,6 +86,17 @@ DEFAULT_TAKE_IDLE_S = 1800.0
 DEFAULT_TAKE_MAX_PER_HOUR = 2
 #: préfixe de la note de journal d'une prise automatique (compte du débit)
 AUTO_TAKE_NOTE = "prise automatique"
+#: L165 : un lot non assigné de l'équipe est pris après 15 min de repos, au
+#: plus 6 par heure pour tout le mesh ; débit compté à part de la file
+DEFAULT_LOT_IDLE_S = 900.0
+DEFAULT_LOT_MAX_PER_HOUR = 6
+LOT_TAKE_NOTE = "lot de l'équipe pris de lui-même"
+#: âge minimal d'un lot pris : l'orchestrateur qui vient de le créer le confie
+LOT_MIN_AGE_S = 300.0
+#: capacités exigées qui réservent un lot à une attribution explicite
+RESERVED_CAPABILITIES = ("decision", "production")
+#: capacité exigée qui désigne un harnais (`harness:codex`)
+HARNESS_PREFIX = "harness:"
 TAKE_WINDOW_S = 3600.0
 #: alertes qui empêchent une prise sur l'hôte de l'agent
 HOST_BLOCKING_ALERTS = ("host_pressure", "host_power_low", "host_not_ready")
@@ -176,37 +214,109 @@ def _default_budget_check(cfg, db):
     return lambda agent: book.over(agent, pace=False)
 
 
+def lot_take_message(item: dict, orchestras: list) -> str:
+    return ("Lot #%d, pris de toi-même (L165) : tu étais au repos et ce lot de ton équipe "
+            "n'avait pas de preneur : %s%s\n"
+            "%s peut le réassigner ; s'il te confie autre chose, cela passe avant. "
+            "Suis le circuit normal de ton projet (relecture, vérifications, intégration "
+            "par qui en a le droit). Interdit dans ce lot : tout geste irréversible ou de "
+            "production (déploiement, fusion, suppression de données, serveur de "
+            "production, dépense engagée) — propose-le à un humain et arrête-toi là. "
+            "Si le lot n'est pas pour toi (capacité, contexte), dis-le tout de suite "
+            "(ameesh work note %d, et un message à %s) plutôt que de le garder." % (
+                int(item["id"]), item["title"],
+                "\n%s" % item["body"] if (item.get("body") or "").strip() else "",
+                ", ".join(orchestras) if orchestras else "L'orchestrateur",
+                int(item["id"]), ", ".join(orchestras) if orchestras else "l'orchestrateur"))
+
+
+def lot_notice(item: dict, agent: str, idle_for_s: float) -> str:
+    return ("Prise automatique (L165) : %s, au repos depuis %d min, a pris le lot #%d de "
+            "l'équipe %s, sans assigné jusque-là : %s. Pour le confier à un autre : "
+            "ameesh work assign %d <agent>." % (
+                agent, int(idle_for_s // 60), int(item["id"]), item.get("lot_team"),
+                item["title"], int(item["id"])))
+
+
+def lot_takeable(item: dict, today: str | None = None) -> bool:
+    """Un lot du projet peut-il être pris sans qu'on le confie ? Jamais un lot
+    qui attend un humain (seuls les lots `intake` sans assigné arrivent ici),
+    de décision (demande de décision en attente, jalon de décision ouvert,
+    capacité `decision` exigée) ni de production (capacité `production`
+    exigée) ; jamais un lot sans équipe connue, ni un lot dont le début prévu
+    est après `today` (« AAAA-MM-JJ »)."""
+    if item.get("state") != "intake" or (item.get("assignee") or "").strip():
+        return False
+    start = str(item.get("planned_start") or "")[:10]
+    if today and start and start > today:
+        return False
+    if item.get("pending_decision") or item.get("decision_milestone"):
+        return False
+    if set(item.get("required_capabilities") or ()) & set(RESERVED_CAPABILITIES):
+        return False
+    return bool((item.get("lot_team") or "").strip())
+
+
+def lot_fits(item: dict, agent: dict) -> bool:
+    """Le lot est-il de l'équipe de l'agent, et l'agent sait-il le faire ?
+    Une capacité exigée `harness:<nom>` désigne le harnais de l'agent."""
+    team = (agent.get("team") or "").strip()
+    if not team or (item.get("lot_team") or "").strip() != team:
+        return False
+    have = set(agent.get("capabilities") or ())
+    if agent.get("harness"):
+        have.add("%s%s" % (HARNESS_PREFIX, agent["harness"]))
+    return set(item.get("required_capabilities") or ()) <= have
+
+
+def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> list:
+    """Les orchestrateurs du registre à prévenir d'une prise : ceux de
+    l'équipe, sinon tous."""
+    from . import sous_utilisation
+    if orchestras is None:
+        orchestras = sous_utilisation.orchestrators(cfg, db, listing)
+    teams = {row["name"]: (row.get("team") or "").strip() for row in listing}
+    known = [name for name in orchestras if name in teams]
+    return sorted([name for name in known if teams[name] == team] or known)
+
+
 def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE_IDLE_S,
               max_per_hour: int = DEFAULT_TAKE_MAX_PER_HOUR, allow_paid: bool = False,
               alerts: list | None = None, listing: list | None = None, paid=None,
-              budget_check=None, dry_run: bool = False) -> list:
+              budget_check=None, dry_run: bool = False,
+              lot_idle_s: float = DEFAULT_LOT_IDLE_S,
+              lot_max_per_hour: int = DEFAULT_LOT_MAX_PER_HOUR, orchestras=None) -> list:
     """Un passage de prise automatique ; rend les prises faites (ou prévues
-    en `dry_run`) : `[{item, agent, message_id}]`. Un seuil nul désactive."""
+    en `dry_run`) : `[{item, agent, message_id, kind, notified}]`, `kind`
+    valant `lot` (lot non assigné de l'équipe, L165) ou `backlog` (file
+    d'amélioration, L119). Les lots de l'équipe passent d'abord ; tant qu'un
+    lot du projet attend, personne ne prend d'amélioration. Un seuil nul
+    désactive la prise correspondante."""
     from . import budget as budget_mod
     from . import mail, registry, sous_utilisation, work
 
-    if idle_s <= 0 or max_per_hour <= 0:
-        return []
     now = time.time() if now is None else float(now)
     st = storage.of(db)
-    room = int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S, AUTO_TAKE_NOTE)
-    if room <= 0:
-        return []
-    queue = items(db, open_only=True, limit=200)
-    if not queue:
-        return []
-    # un lot du projet attend un preneur : il passe avant toute amélioration
-    if sous_utilisation.waiting_project_lots(st.operations.open_lots_activity(500)):
+    lot_room = 0
+    if lot_idle_s > 0 and lot_max_per_hour > 0:
+        lot_room = int(lot_max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S,
+                                                                    LOT_TAKE_NOTE)
+    lots = st.work.unassigned_lots(200) if lot_room > 0 else []
+    # un lot tout juste créé va sans doute être confié : on lui laisse le temps
+    today = time.strftime("%Y-%m-%d", time.localtime(now))
+    lots = [item for item in lots if lot_takeable(item, today)
+            and now - float(item.get("created_ts") or now) >= LOT_MIN_AGE_S]
+    room = 0
+    if idle_s > 0 and max_per_hour > 0:
+        room = int(max_per_hour) - st.work.auto_takes_since(TAKE_WINDOW_S, AUTO_TAKE_NOTE)
+    queue = items(db, open_only=True, limit=200) if room > 0 else []
+    if not lots and not queue:
         return []
     listing = st.operations.listing() if listing is None else listing
     # un agent du mesh en pause budget : le plafond est atteint, on ne charge pas
     if any(row.get("status") == "blocked"
            and (row.get("status_text") or "").startswith(budget_mod.PAUSE_PREFIX)
            for row in listing):
-        return []
-    idle = [row for row in sous_utilisation.idle_agents(listing, now, idle_s)
-            if not _awaited(row)]
-    if not idle:
         return []
     alerts = alerts or []
     blocked = _blocked_hosts(alerts)
@@ -223,23 +333,83 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         # harnais inconnus (descripteurs illisibles) : traité comme payé
         return paid is None or row.get("harness") in paid
 
-    candidates = []
-    for row in idle:
-        if row.get("host") in blocked:
-            continue
-        if is_paid(row) and (not allow_paid or balance_low):
-            continue
-        candidates.append(row)
-    # forfaits d'abord, puis le repos le plus long
-    candidates.sort(key=lambda r: (is_paid(r), sous_utilisation.idle_since(r), r["name"]))
+    def candidates(threshold: float, skip=()) -> list:
+        out = []
+        for row in sous_utilisation.idle_agents(listing, now, threshold):
+            if row["name"] in skip or _awaited(row) or row.get("host") in blocked:
+                continue
+            if is_paid(row) and (not allow_paid or balance_low):
+                continue
+            out.append(row)
+        # forfaits d'abord, puis le repos le plus long
+        out.sort(key=lambda r: (is_paid(r), sous_utilisation.idle_since(r), r["name"]))
+        return out
+
+    def within_budget(row) -> bool:
+        try:
+            return not budget_check(row["name"])
+        except Exception:
+            return False
+
     taken: list = []
-    for row in candidates:
+    if lots:
+        # un orchestrateur répartit : il ne se sert pas lui-même
+        if orchestras is None:
+            try:
+                orchestras = sous_utilisation.orchestrators(cfg, db, listing)
+            except Exception:
+                orchestras = []
+        for row in candidates(lot_idle_s, skip=set(orchestras)):
+            if len(taken) >= lot_room or not lots:
+                break
+            if not within_budget(row):
+                continue
+            agent = registry.get(db, row["name"]) or {}
+            agent = dict(row, capabilities=agent.get("capabilities"))
+            for item in list(lots):
+                if not lot_fits(item, agent):
+                    continue
+                notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
+                                               orchestras)
+                if dry_run:
+                    taken.append({"item": item, "agent": row["name"], "message_id": None,
+                                  "kind": "lot", "notified": notified})
+                    lots.remove(item)
+                    break
+                try:
+                    check = work.check_assignee(db, row["name"], cfg=cfg)
+                except work.WorkError:
+                    break                   # agent non réveillable : au suivant
+                done = st.work.assign(int(item["id"]), check["assignee"], current=None,
+                                      note="%s par %s, au repos" % (LOT_TAKE_NOTE,
+                                                                    check["assignee"]),
+                                      actor=SENDER)
+                lots.remove(item)
+                if done is None:
+                    continue                # pris entre-temps : lot suivant
+                done = dict(done, lot_team=item["lot_team"])
+                payload = {"lot_take": {"lot": int(done["id"]), "agent": check["assignee"],
+                                        "team": item["lot_team"]}}
+                message_id = mail.send(db, SENDER, check["assignee"],
+                                       lot_take_message(done, notified), kind="event",
+                                       work_item_id=str(done["id"]), payload=payload)
+                idle_for = now - sous_utilisation.idle_since(row)
+                for name in notified:
+                    mail.send(db, SENDER, name, lot_notice(done, check["assignee"], idle_for),
+                              kind="event", work_item_id=str(done["id"]), payload=payload)
+                taken.append({"item": done, "agent": check["assignee"],
+                              "message_id": message_id, "kind": "lot", "notified": notified})
+                break
+    if not queue:
+        return taken
+    # un lot du projet attend un preneur (ou vient d'être pris) : il passe
+    # avant toute amélioration
+    if taken or sous_utilisation.waiting_project_lots(st.operations.open_lots_activity(500)):
+        return taken
+    for row in candidates(idle_s):
         if len(taken) >= room or not queue:
             break
-        try:
-            if budget_check(row["name"]):
-                continue
-        except Exception:
+        if not within_budget(row):
             continue
         agent = registry.get(db, row["name"]) or {}
         agent = dict(row, capabilities=agent.get("capabilities"))
@@ -247,7 +417,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if not fits(item, agent):
                 continue
             if dry_run:
-                taken.append({"item": item, "agent": row["name"], "message_id": None})
+                taken.append({"item": item, "agent": row["name"], "message_id": None,
+                              "kind": "backlog", "notified": []})
                 queue.remove(item)
                 break
             try:
@@ -267,7 +438,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                                    payload={"backlog": {"lot": int(done["id"]),
                                                         "value_score": done.get("value_score")}})
             taken.append({"item": done, "agent": check["assignee"],
-                          "message_id": message_id})
+                          "message_id": message_id, "kind": "backlog", "notified": []})
             break
     return taken
 

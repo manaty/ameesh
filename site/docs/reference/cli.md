@@ -30,9 +30,10 @@ on its first line.
 ## Mailbox: `ameesh mail` / `agent-mail`
 
 ```
-agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"]
-                [--kind request|reply|notify|event] [--urgent]
-                [--sign --key FILE] [--expires 24h]
+agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title" [--estimate 2h]]
+                [--kind request|reply|notify|event] [--urgent] [--ack] [--cc NAME[,NAME…]]
+                [--sign --key FILE] [--expires 24h] [--queue]
+agent-mail forward <OLD> <NEW> [--dry-run] [--json]   # redeliver a dead mailbox
 agent-mail list                       # agents, host, lease, unread
 agent-mail inbox [NAME]               # unread messages of NAME, without marking them read
 agent-mail whoami [--session ID --harness H]   # bound identity and its source (runner, explicit,
@@ -52,7 +53,10 @@ agent-mail doctor [--notify-test | --probe]
 The session identity is `$AGENT_MAIL_NAME` (set by the runner). If
 `$AMEESH_RUNNER_ID` and `$AMEESH_LEASE_EPOCH` are also set, the lease must be
 alive and held by that runner. The working directory never gives an identity.
-Hooks never fail the agent: any error exits 0 silently. A message from an agent
+Hooks never fail the agent: any error exits 0 silently. A hook fired inside a
+subagent (its input carries `agent_id`: a Claude Code subagent or in-process
+teammate, a Codex subagent) delivers nothing, marks nothing and writes nothing:
+the agent's mail waits for the main session's next hook. A message from an agent
 never carries the owner's authority; the sender is shown.
 
 **Session bindings** (v1.4.0). A session started by a human (an *external*
@@ -67,11 +71,35 @@ steal its mail; an agent holding a live lease never binds. `unbind` revokes the
 binding of one session.
 
 `send all` reaches only the sender's **team** (or project); a sender with
-neither keeps the global broadcast.
+neither keeps the global broadcast, and stopped agents are left out (`--queue`
+includes them).
+
+**Undeliverable mail** (2026-10-11). With the database, `send` deposits
+nothing (exit code 2) when the recipient is not in the registry — no agent is
+created, and close names are suggested (edit distance, prefix, and for a role
+name such as `orchestrator` the orchestrators of the sender's team) —, when the
+recipient is **stopped** (unless `--queue`; the message says since when, why,
+who is responsible and which agent took over its work, when known), or when
+the sender identity is a stopped agent (the session's bound identity,
+`whoami`, is shown). A send never writes the recipient into the registry.
+Mail left more than 15 minutes in a stopped or unknown mailbox raises the
+`mail_undeliverable` alert. `forward` redelivers the pending mail of a stopped
+(or unknown) agent to a live one, keeping the original sender and date; the
+original is no longer pending.
 
 `--kind event` wakes the agent like a message, coalesced (see
 `AMEESH_EVENT_COALESCE`); `--urgent` pierces the coalescing and, from an
 authorised sender, interrupts the current turn.
+
+**Batched mail** (L125). An idle agent is woken only when the batching window
+(`AMEESH_MAIL_BATCH`, default 90 s, per agent `ameesh set <agent>
+mail_batch=…`) has elapsed since its oldest waiting message; that one turn
+carries everything that arrived meanwhile. A message sent with `--urgent`, or
+by a human, wakes it at once. Passive mail never opens a turn by itself and is
+read on the next turn: an acknowledgement (`--ack`, or a very short message
+that is only a thank-you or a receipt), a copy (`--cc NAME`: the person in copy
+gets an `event`, without being woken) and a `send all` announcement without
+`--urgent`. `send B,C` is refused: use `--cc C`.
 
 ## Runner: `ameesh run` / `agent-runner`
 
@@ -131,10 +159,12 @@ ameesh cost balance [--provider deepseek] [--record] [--since SINCE] [--json]
 --record` reads the balance now (read-only, free).
 
 `ameesh list` shows a **PROJECT** column (the agent's team, else its
-chantier) and groups agents by project, a **LOTS** column (open lots assigned
+chantier, the `--chantier` of `register` and `adopt`) and groups agents by project, a **LOTS** column (open lots assigned
 to each agent) and prefixes the status of an external agent with `ext/`.
 `ameesh projects` shows, per project, each agent's state (working, paused,
-idle, stopped, with the reason), its current lot, unread mail, 24 h spend and
+idle, stopped, with the reason), its current lot (the last open lot the agent
+quoted in its own mail, else its session's lot, else its most recent open
+assigned lot; never a merged or closed lot), unread mail, 24 h spend and
 whether it runs on a plan or pays per token, plus the open lots nobody can
 move forward; it flags projects with open work and no active agent. The same
 view heads `ameesh progress` (text, HTML page, `projects` key in JSON). `ameesh hosts` shows,
@@ -152,7 +182,7 @@ ameesh set <agent> key=value [key=value …]   # model=… effort=… tier=… s
                                              # (empty value = default; effect at the next turn)
 ameesh alerts [--json] [--follow] [--interval S] [--long-turn S] [--idle-mail S]
               [--dead-grace S] [--session-tokens N] [--stale-lot S]
-              [--orphan-lot S] [--delegation-grace S]
+              [--orphan-lot S] [--delegation-grace S] [--mail-undeliverable S]
 ameesh notify [--once] [--dry-run] [--json] [--interval S] [alert thresholds…]
 ameesh notify --test human:ID [--json]
 ameesh restart <agent> --brief FILE|- [--wait S] [--json]
@@ -173,6 +203,7 @@ ameesh interrupt <agent> <message…> [--from SENDER]
 | `--stale-lot` | lot without activity for S seconds (default 21600 = 6 h) |
 | `--orphan-lot` | `intake`/`build` lot without activity nor a turn of its assignee for S seconds (default 1800) |
 | `--delegation-grace` | grace period after a delegation's deadline before `delegation_expired` is raised (default 300) |
+| `--mail-undeliverable` | mail pending for S seconds in the mailbox of a stopped agent or of a name absent from the registry (default 900; 0 disables `mail_undeliverable`) |
 | `set … mode=` | `execute` (default: run by a runner under a lease) or `externe` (a human's session, mailbox only, never woken by ameesh) |
 | `notify --once` | a single pass, then exit |
 | `notify --dry-run` | print what would be sent; send nothing, write no state |
@@ -211,11 +242,15 @@ record, or an agent that assigned lots in the last 30 days):
   owned by **another agent** is never taken over: warning with the
   `ameesh work assign` command. An unknown reference stays a free thread label;
 * `--new-lot "title"` (any sender) creates the lot, assigned to the recipient,
-  and attaches the message to it;
+  and attaches the message to it; `--estimate 2h` gives its estimated duration,
+  **mandatory when the sender is an agent** (refused otherwise, nothing is
+  delivered, exit 2; a warning for a human, L157);
 * a single `agent/…` branch quoted in the message is set on the attached lot
   when it has none.
 
-From any other sender, `--lot` stays a plain thread label. See
+From any other sender, `--lot` assigns nothing; when it designates an open
+lot (number, or a reference matching a single open lot) the message is tied
+to the lot's number, otherwise it stays a plain thread label. See
 `docs/ORCHESTRATEUR.md`.
 
 ## Work items: `ameesh work`
@@ -224,10 +259,16 @@ From any other sender, `--lot` stays a plain thread label. See
 ameesh work add --title TITLE [--type bug|evolution] [--source S] [--app APP]
                 [--body BODY] [--issue-ref REF] [--workstream W]
                 [--assignee A] [--budget USD] [--actor ACTOR] [--externe]
-                [--branch agent/…] [--target BRANCH]
+                [--branch agent/…] [--target BRANCH] [--priority 1|2|3]
+                [--estimate 90m|2h|1h30|1,5h|2d|MINUTES] [--estimate-source S]
+ameesh work plan <id|record> [--debut DAY] [--fin DAY] [--livraison DAY] [--source S]
+                [--estimate DURATION] [--estimate-source S]
+ameesh work estimates [--app PROJECT] [--json]   # actual/estimated ratios (ameesh-estimates/1)
 ameesh work list [--state S] [--assignee A] [--limit N] [--json]
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
+ameesh work move <id> merged --correct REASON [--actor A]
+ameesh work merged <id> --sha SHA [--note N] [--actor A]
 ameesh work assign <id> <agent> [--externe] [--actor A] [--branch agent/…] [--target BRANCH]
 ameesh work sync-branches [--host H | --all-hosts] [--dry-run] [--json]
 ameesh work delegate <id> <agent> --within 30m|2h|1d|SECONDS [--actor A]
@@ -236,9 +277,38 @@ ameesh work note <id> <text> [--actor A]
 ameesh work milestone <id> <frozen|verdict> [ok|blocked] [--sha SHA] [--note N] [--actor A]
 ameesh work backlog add --title T --value "expected value" --score 1-100
                         [--priority 1|2|3] [--source S] [--team T] [--requires CAP …]
-                        [--body B] [--package FICHE] [--json]
+                        [--body B] [--package CARD] [--json]
 ameesh work backlog list [--all] [--limit N] [--json]
+ameesh work unrecorded [--since 24h|2h|7d|ISO-DATE] [--limit N] [--json]
 ```
+
+**Every human request becomes a lot** (L130). Orchestrators, design agents and
+the owner's chat record every request from a human as a lot right away, with
+the human's exact words as `--source`, a `--priority` (1 high, 2 normal,
+3 low) and an `--estimate` (L157), and quote the lot number in their answer.
+`work unrecorded` (read-only) lists the human messages of the period (mail
+from a human, answers to decision requests, requests relayed by the chat) that
+are attached to no lot, cite no lot (`L142`, `lot #142`, `ameesh-work: 142`)
+and whose words no recent lot quotes in its source or body; acknowledgements
+and `--cc` copies are skipped, a broadcast counts once. JSON schema
+`ameesh-unrecorded/1`. See `docs/ORCHESTRATEUR.md` and `docs/EXPLOITATION.md`.
+
+**Estimated and actual duration** (L157, migration 0052). Every lot carries an
+estimated duration from its creation: minutes with its source and author
+(`--estimate`, `--estimate-source`; `work plan <id> --estimate` sets or
+revises it, keeping the history in `work_item_estimates`). It is **mandatory
+when an agent of the registry creates the lot** (`work add`, `mail send
+--new-lot`): refused otherwise, nothing is created; a human gets a warning.
+ameesh measures the actual duration itself: start = first move to `build`
+(or `qa`), or the assignee's first turn on the lot (noted by the runner);
+end = the `merged` milestone. `work show` (line « durée », duration), `ameesh projects`
+(short **DURÉE** column, duration: `1h10/2h` elapsed/estimated, `2h` not started,
+`2h40/2h!` overrun), `ameesh progress`, the roadmap and the header of the
+lots' GitHub issues (L126) show the estimate, the actual duration and the
+gap. `work estimates` gives, over delivered lots, the actual/estimated ratio
+(median, p80) per lot type and per estimate author, using the estimate in
+force when work started: the internal auditor audits it and adjusts the
+estimation process (`docs/AUDITEUR.md`).
 
 **Continuous-improvement backlog** (L119, decision 0037). `work backlog add`
 queues a lot of type `improvement` (in `intake`, unassigned); the expected
@@ -279,6 +349,25 @@ the target (ancestor, patch-id, squash — also after the branch was deleted),
 or a merge commit of the target quoting the full branch name. A freshly
 created branch, already an ancestor of its target, is not a merge.
 `work sync-branches` runs the same check by hand (`--dry-run`: close nothing).
+A configured `ameesh.target` that does not resolve is reported as an error,
+never silently replaced by `main`.
+
+**Merges without a PR or a branch.** The same check also covers open lots
+without a branch whose assignee is on the host: a merge commit of the target,
+made after the lot was created, designates the lot with an `ameesh-work: <id>`
+line, or with `#<id>` in its subject when the repository opts in
+(`git config ameesh.lotRef hash`; elsewhere `(#45)` is a GitHub PR number).
+The closed lot records the merge commit and a note saying how the merge was
+found. By hand, `work merged <id> --sha SHA` moves a lot from any open state
+(`intake`, `build`, `qa`, `blocked`, `waiting_human`) to `merged` at once,
+with its `merged` milestone; a closed lot is never reopened. A lot set to
+`promoted` by mistake goes back with `work move <id> merged --correct
+"reason"`, logged, for humans and orchestrator or design agents only.
+
+**Actor.** Without `--actor`, `work` commands record the session's bound
+identity (`AGENT_MAIL_NAME`, or a session binding), else `inconnu` with a
+warning — never an empty actor. `work delegate` keeps its meaning (`--actor`
+is the delegator).
 
 ## Canon and placement
 

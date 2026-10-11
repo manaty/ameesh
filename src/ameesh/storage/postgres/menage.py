@@ -57,16 +57,30 @@ class Housekeeping(interface.Housekeeping):
                 "DELETE FROM housekeeping_log WHERE at < now() - interval '30 days'", ())
         return count
 
-    def recent(self, host, since_s, limit=50) -> list[dict]:
+    def recent(self, host, since_s, limit=50, kind=None) -> list[dict]:
         where, params = "", [float(since_s)]
         if host:
-            where = " AND host = %s"
+            where += " AND host = %s"
             params.append(host)
+        if kind:
+            where += " AND kind = %s"
+            params.append(kind)
         params.append(int(limit))
         rows = self.db.query(
             "SELECT " + LOG_COLUMNS + " FROM housekeeping_log"
             " WHERE at >= now() - make_interval(secs => %s)" + where +
             " ORDER BY at DESC, id DESC LIMIT %s", tuple(params))
+        return [_data(dict(r)) for r in rows]
+
+    def latest_by_path(self, host, kind) -> list[dict]:
+        where, params = "", [kind]
+        if host:
+            where = " AND host = %s"
+            params.append(host)
+        rows = self.db.query(
+            "SELECT DISTINCT ON (host, path) " + LOG_COLUMNS + " FROM housekeeping_log"
+            " WHERE kind = %s" + where +
+            " ORDER BY host, path, at DESC, id DESC", tuple(params))
         return [_data(dict(r)) for r in rows]
 
     def summary(self, host, since_s) -> list[dict]:

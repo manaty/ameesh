@@ -50,6 +50,16 @@ def log(message: str) -> None:
     print("%s %s" % (time.strftime("%H:%M:%S"), message), flush=True)
 
 
+def _duree(secondes: float) -> str:
+    """Une durée lisible : « 45 s », « 7 min 05 s », « 2 h 13 min »."""
+    secondes = int(max(0.0, secondes))
+    if secondes < 60:
+        return "%d s" % secondes
+    if secondes < 3600:
+        return "%d min %02d s" % (secondes // 60, secondes % 60)
+    return "%d h %02d min" % (secondes // 3600, secondes % 3600 // 60)
+
+
 class _AsyncLog:
     """Journal non bloquant pour le fil du battement (sondes codex3 B5a-N).
 
@@ -318,14 +328,33 @@ class AgentWorker(threading.Thread):
         self._courrier_lance = False
         #: rotation de session (0018) : compteurs de la session courante
         self.resume_summary = ""
+        #: auteur du résumé de reprise : `agent` (son propre résumé) ou `ameesh`
+        #: (brief déterministe d'une bascule de compte, L39) ; voir
+        #: `adapters.resume_prompt`
+        self.resume_origin = "agent"
         self.session_turns = 0
         self.session_tokens = 0.0
         self.last_turn_seconds = 0.0
         self.last_output = ""
+        #: L218 : réponse finale du dernier tour (`final` du flux, None si le
+        #: flux n'en donne pas), et, pour un tour de résumé, tout son affichage
+        #: (repli d'un flux sans `final`, texte brut)
+        self.last_final: str | None = None
+        self.summary_display: list[str] = []
         #: plafond de contexte (L60) : jetons d'entrée relus (cache compris) par
         #: le dernier tour inscrit au grand livre, et sa session
         self.last_turn_reread = 0
         self.last_turn_reread_session: str | None = None
+        #: L217 : relevé du flux du dernier tour, fil principal (la mesure du
+        #: plafond pendant le tour) et sous-agents (pour information)
+        self.last_turn_main_reread = 0
+        self.last_turn_subagent_reread = 0
+        #: L217b : la mesure de la rotation entre deux tours, celle du plafond
+        #: (fil principal relevé dans le flux), et sa session ; None = pas de
+        #: relevé d'appel dans le flux (harnais sans usage par appel, tour de
+        #: résumé, worker relancé) : repli sur le grand livre
+        self.last_turn_context: int | None = None
+        self.last_turn_context_session: str | None = None
         #: plafonds du tour (L105) : le tour suivant reprend le travail d'un
         #: tour clos (raison), et la rotation forcée par le plafond de contexte
         #: atteint pendant un tour (raison) attend le prochain passage entre deux tours
@@ -588,8 +617,29 @@ class AgentWorker(threading.Thread):
         except PermissionError:
             return True
 
-    def terminate(self, grace: float | None = None, hard: bool = False) -> None:
+    def _reap_group(self, pgid: int | None, skip: int | None) -> None:
+        """Zombies adoptés du groupe (l'exécuteur est sous-moissonneur de ses
+        tours) : moissonnés, sinon ils gardent le groupe « vivant » pour
+        `killpg(…, 0)`. Jamais `skip`, le harnais, qu'attend son `Popen`."""
+        tracker = getattr(self.runner, "background", None)
+        if pgid is None or tracker is None or not tracker.subreaper:
+            return
+        from . import platform as os_layer
+        try:
+            table = os_layer.process_table()
+        except os_layer.NotAvailable:
+            return
+        for p in table:
+            if p["pgid"] == pgid and p["zombie"] and p["pid"] != skip:
+                os_layer.reap(p["pid"])
+
+    def terminate(self, grace: float | None = None, hard: bool = False,
+                  group: bool = True) -> None:
         """Arrête le harnais et tout son groupe.
+
+        `group=False` (tour clos à un point sûr, L105) : le harnais SEUL est
+        arrêté (SIGTERM, grâce, puis SIGKILL) ; le travail lancé en fond
+        pendant le tour garde son délai de grâce (fin de `_run_turn`).
 
         Par défaut : SIGTERM, 3 secondes de grâce, puis SIGKILL. `hard=True`
         (perte du bail) envoie SIGKILL **directement, avant tout journal** : le
@@ -610,12 +660,21 @@ class AgentWorker(threading.Thread):
             proc = self.proc
         if proc is None:
             return
-        pgid = self._group(proc)
+        pgid = self._group(proc) if group else None
         if proc.poll() is None and not hard:
             self._signal_group(pgid, proc, signal.SIGTERM)
             deadline = time.monotonic() + max(0.0, self.TERMINATE_GRACE if grace is None else grace)
             while time.monotonic() < deadline and proc.poll() is None:
                 time.sleep(0.05)
+        if not group:
+            if proc.poll() is None:
+                self._signal_group(None, proc, signal.SIGKILL)
+                log_async("[%s] le harnais survit : SIGKILL (harnais seul)" % self.name)
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            return
         if not self._group_alive(pgid) and proc.poll() is not None:
             # Groupe mort **et** enfant direct moissonné : rien à faire. Si le
             # pid n'est pas un chef de groupe (groupe inconnu) mais que l'enfant
@@ -634,13 +693,18 @@ class AgentWorker(threading.Thread):
                 proc.wait(timeout=max(0.0, fin - time.monotonic()))
             except subprocess.TimeoutExpired:
                 pass
+        moisson = 0.0
         while time.monotonic() < fin and self._group_alive(pgid):
+            if time.monotonic() >= moisson:
+                # sous-moissonneur : les membres tués sont nos zombies
+                self._reap_group(pgid, proc.pid)
+                moisson = time.monotonic() + 0.05
             time.sleep(0.005)
         if self._group_alive(pgid):
             log_async("[%s] groupe toujours vivant après SIGKILL (état noyau ?)" % self.name)
 
     def stop_group_now(self, reason: str, *, grace: float | None = None,
-                       hard: bool = False) -> bool:
+                       hard: bool = False, group: bool = True) -> bool:
         """Point de passage **unique** de tout arrêt de harnais (0018, verdicts codex3).
 
         1. Le signal part d'abord (`terminate`, qui n'écrit rien avant) ;
@@ -651,7 +715,8 @@ class AgentWorker(threading.Thread):
 
         Tous les déclencheurs — échéance, bail perdu, arrêt de l'exécuteur,
         préemption, et demain la garde de budget (L13) — passent par ici : un
-        nouveau chemin hérite des sondes paramétrées.
+        nouveau chemin hérite des sondes paramétrées. `group=False` : le
+        harnais seul (tour clos à un point sûr ; voir `terminate`).
         """
         with self.lock:
             proc = self.proc
@@ -664,7 +729,7 @@ class AgentWorker(threading.Thread):
             log_async("[%s] arrêt demandé (%s) : harnais non encore publié"
                       % (self.name, reason))
             return False
-        self.terminate(grace=grace, hard=hard)
+        self.terminate(grace=grace, hard=hard, group=group)
         log_async("[%s] harnais arrêté (%s)" % (self.name, reason))
         return True
 
@@ -812,7 +877,8 @@ class AgentWorker(threading.Thread):
             return False
         if agent.get("pending_prompt"):
             return True
-        if mail.unread(self.db, self.name, limit=1):
+        # L125 : un courrier passif (accusé, copie, diffusion) n'ouvre pas de tour
+        if mail.unread_active(self.db, self.name, limit=1):
             return True
         return self.idle_due()
 
@@ -907,6 +973,7 @@ class AgentWorker(threading.Thread):
         self.session_turns = 0
         self.session_tokens = 0.0
         self.last_turn_reread = 0
+        self.last_turn_context = None
         self.nudged = False
         self.suite = self.rotation_forcee = None  # L105 : la session neuve part du brief
         self.agent = registry.get(self.db, self.name) or self.agent
@@ -959,6 +1026,29 @@ class AgentWorker(threading.Thread):
         from .exploitation import effective_turn_mail_max
         return effective_turn_mail_max(self.cfg, self.agent)
 
+    def turn_grace_seconds(self) -> int:
+        """Délai de grâce du travail de fond d'un tour : réglage de l'agent
+        (`ameesh set turn_grace_seconds=…`), sinon défaut de l'hôte
+        (`AMEESH_TURN_GRACE_SECONDS`, 20 min). 0 = nettoyage immédiat."""
+        from .exploitation import effective_turn_grace_seconds
+        return effective_turn_grace_seconds(self.cfg, self.agent)
+
+    def _urgent_end(self) -> str:
+        """Raison d'un arrêt d'urgence du tour qui s'achève, ou '' : fin
+        normale (le harnais a fini, ou il a été clos à un point sûr), dont le
+        travail de fond a son délai de grâce."""
+        if self.lease_lost.is_set() or self.deadline_passed():
+            return "bail perdu"
+        if self.preempting.is_set():
+            return "préemption"
+        if self.restarting.is_set():
+            return "redémarrage demandé"
+        if self._power_texte:
+            return "batterie critique"
+        if self.runner.stop.is_set():
+            return "arrêt de l'exécuteur"
+        return ""
+
     def turn_close_due(self, started: float, reread: int,
                        now: float | None = None) -> str | None:
         """Le tour en cours doit-il se clore au prochain point sûr ? (L105)
@@ -976,11 +1066,23 @@ class AgentWorker(threading.Thread):
             return "durée maximale du tour : %ds (plafond %ds)" % (int(ecoule), duree_max)
         return None
 
+    def last_turn_context_reread(self) -> tuple[int, str | None]:
+        """Jetons relus au dernier tour au sens du plafond de contexte, et leur
+        session (L217b) : le fil principal relevé dans le flux, le compteur
+        même du plafond pendant le tour (les sous-agents n'y sont pas, ni
+        pour un tour clos avant son `result`) ; sans relevé dans le flux, le
+        dernier tour inscrit au grand livre (L60)."""
+        if self.last_turn_context is not None:
+            return self.last_turn_context, self.last_turn_context_session
+        return self.last_turn_reread, self.last_turn_reread_session
+
     def context_rotation_due(self) -> bool:
         """Le dernier tour a-t-il relu plus que le plafond de contexte ? (L60)
 
-        La mesure est celle de l'alerte `session_too_big` : entrée + entrée
-        relue en cache du dernier tour inscrit au grand livre. Chaque étape
+        La mesure est celle du plafond du tour (L217b) : les jetons relus par
+        le fil principal, relevés dans le flux ; à défaut, celle de l'alerte
+        `session_too_big` (entrée + entrée relue en cache du dernier tour
+        inscrit au grand livre). Chaque étape
         d'un tour relit tout le contexte : une session qui grossit coûte de
         plus en plus cher à chaque tour, et l'alerte seule n'y changeait rien.
         Ni minimum de tours, ni rotation pendant un tour ; la politique
@@ -990,19 +1092,21 @@ class AgentWorker(threading.Thread):
         if self.proc is not None or self.session_policy() == "jamais":
             return False
         plafond = self.context_max_tokens()
-        if plafond <= 0 or self.last_turn_reread < plafond:
+        relus, relus_session = self.last_turn_context_reread()
+        if plafond <= 0 or relus < plafond:
             return False
         session = self.current_session()
         if not session:
             return False
-        return self.last_turn_reread_session in (None, session)
+        return relus_session in (None, session)
 
     def _session_history(self, session_id: str | None, resume: str) -> None:
-        """Garde l'ancien id de session et son résumé (audit, 0018)."""
+        """Garde l'ancien id de session et son résumé (audit, 0018) ; le
+        résumé entier, déjà borné par `adapters.bound_summary` (L218)."""
         entry = {
             "ts": time.time(), "session": session_id, "turns": self.session_turns,
             "tokens": self.session_tokens,
-            "last_turn_s": round(self.last_turn_seconds, 1), "resume": resume[:2000],
+            "last_turn_s": round(self.last_turn_seconds, 1), "resume": resume,
         }
         try:
             with open(self._path("session-history.jsonl"), "a", encoding="utf-8") as fh:
@@ -1020,25 +1124,58 @@ class AgentWorker(threading.Thread):
 
         L105 : un tour clos par le plafond de contexte force la rotation au
         premier passage (le grand livre d'un tour interrompu peut ne rien dire).
+
+        Sous la pression de l'hôte, une rotation due ATTEND la fin de la
+        pression (le tour de résumé ne partirait pas) : elle n'est ni tentée
+        ni annulée à chaque passage (2026-10-10 : 62 rotations annulées en une
+        soirée), et la ligne de fin de l'épisode de pression la cite.
         """
+        if self.proc is None and (self.rotation_forcee or self.context_rotation_due()
+                                  or self.rotation_due()):
+            if self._held_by_pressure(self.runner.host_pressure()):
+                self.runner.pressure_delayed(self.name, rotation=True)
+                return False
         if self.rotation_forcee and self.proc is None:
             raison, self.rotation_forcee = self.rotation_forcee, None
             if self.session_policy() != "jamais" and self.current_session():
                 return self._rotate(raison)
         if self.context_rotation_due():
             return self._rotate("plafond de contexte : %d jetons relus au dernier tour "
-                                "(plafond %d)" % (self.last_turn_reread,
+                                "(plafond %d)" % (self.last_turn_context_reread()[0],
                                                   self.context_max_tokens()))
         if not self.rotation_due():
             return False
         return self._rotate("tours=%d, tokens=%.0f, dernier tour=%.0fs" % (
             self.session_turns, self.session_tokens, self.last_turn_seconds))
 
+    def turn_summary(self) -> str:
+        """Le résumé rendu par le dernier tour de résumé (L218) : sa réponse
+        finale entière (à défaut, tout son affichage), bornée par
+        `adapters.bound_summary` — jamais la fin de l'affichage, qui perdait
+        la tête du résumé et finissait sur « == fin du tour : ».
+
+        Une réponse finale vide n'a pas de résumé (verdict codex #178) : la
+        rotation est annulée, la bascule de compte prend le brief L39. Le
+        repli sur l'affichage ne vaut que pour un flux qui ne donne jamais de
+        `final`, et les marqueurs de fin de tour de l'exécuteur en sont ôtés."""
+        if self.last_final is not None:
+            return adapters.bound_summary(self.last_final)
+        texte = "\n".join(ligne for ligne in self.summary_display
+                          if not ligne.startswith(adapters.END_OF_TURN_MARK))
+        return adapters.bound_summary(texte)
+
     def _rotate(self, raison: str) -> bool:
         """Le mécanisme de rotation (L11) : résumé dans la session, puis oubli."""
         ancienne = self.current_session()
         log_async("[%s] rotation de session (%s)" % (self.name, raison))
+        self._refus_pression = False
         ok = self.run_turn({"kind": "prompt", "prompt": adapters.SUMMARY_PROMPT, "ids": []})
+        if not ok and self._refus_pression:
+            # la pression est venue entre le choix et le lancement : la
+            # rotation attend sa fin (ligne de fin de l'épisode), sans trace
+            # au fil à chaque passage
+            self.runner.pressure_delayed(self.name, rotation=True)
+            return False
         if not ok:
             # Résumé partiel, bail perdu pendant le tour, claim remplaçant : on ne
             # touche à rien. Effacer la session ici effacerait celle du remplaçant
@@ -1049,7 +1186,7 @@ class AgentWorker(threading.Thread):
                            "tentative plus tard.",
                            meta={"action": "rotation", "etat": "annulee"})
             return False
-        resume = (self.last_output or "").strip()
+        resume = self.turn_summary()
         if not resume:
             log_async("[%s] rotation annulée : résumé vide" % self.name)
             self._fil_note("Rotation de session annulée : résumé vide. L'ancienne "
@@ -1067,6 +1204,7 @@ class AgentWorker(threading.Thread):
                            meta={"action": "rotation", "etat": "annulee"})
             return False
         self.resume_summary = resume
+        self.resume_origin = "agent"
         try:
             os.unlink(self._path("session"))
         except OSError:
@@ -1076,6 +1214,7 @@ class AgentWorker(threading.Thread):
         self.session_tokens = 0.0
         self.last_turn_reread = 0
         self.last_turn_reread_session = None
+        self.last_turn_context = self.last_turn_context_session = None
         self._fil_note(
             "Rotation de session (%s) : l'ancien id (%s) est conservé dans "
             "`session-history.jsonl` ; la session neuve repart du résumé ci-dessous.\n\n%s"
@@ -1113,7 +1252,10 @@ class AgentWorker(threading.Thread):
         """L40 (0030) : le tour qui commence compte pour les lots délégués à
         cet agent — le lot du tour et ceux de ses messages. Noté une fois par
         délégation (registre et journal du lot) : à l'échéance, le lot ne
-        reviendra pas au délégant. Jamais bloquant pour le tour."""
+        reviendra pas au délégant. L157 : le même tour date le début mesuré
+        des lots assignés à cet agent qui n'en ont pas. Jamais bloquant pour
+        le tour."""
+        from . import estimates
         from . import work as work_mod
 
         lots = {str(spec["lot"])} if spec.get("lot") else set()
@@ -1128,6 +1270,16 @@ class AgentWorker(threading.Thread):
         if marques:
             log_async("[%s] tour sur lot(s) délégué(s) : %s"
                       % (self.name, ", ".join("#%d" % i for i in marques)))
+        # L157 : le premier tour de l'assigné sur un lot date le début du
+        # travail (durée réelle = fusion − début), une seule fois
+        try:
+            debuts = estimates.mark_started(self.db, self.name, lots)
+        except (db_mod.DbError, ValueError) as exc:
+            log_async("[%s] début de lot non noté (%s)" % (self.name, exc))
+            return
+        if debuts:
+            log_async("[%s] début mesuré : %s"
+                      % (self.name, ", ".join("#%d" % i for i in debuts)))
 
     def lot_rotation_due(self, lot: str | None) -> bool:
         """Rotation au changement de lot due ? (politique `par-lot`)
@@ -1349,6 +1501,51 @@ class AgentWorker(threading.Thread):
             self.agent["session_account"] = compte
         log_async("[%s] session %s enregistrée au registre (différée par une panne)"
                   % (self.name, session))
+
+    def _ecarte_session_fille(self, refusee: str) -> None:
+        """L166 : le harnais refuse de reprendre `refusee`, session fille
+        (sous-agent, fourche) retenue à tort comme session de l'agent. Le tour
+        suivant repart de la dernière session principale connue (le fichier
+        local, écrit seulement depuis le flux du harnais), sinon d'une session
+        neuve ouverte sur le brief de reprise déterministe. Fencé par le bail."""
+        principale = self.read_session_file()
+        if principale == refusee:
+            principale = None
+        if principale:
+            registry.set_session(self.db, self.name, principale, None)
+            if self.agent is not None:
+                self.agent["session_id"] = principale
+                self.agent["session_account"] = None
+            suite = "reprise de la dernière session principale connue (%s)" % principale
+        else:
+            if not registry.clear_session(self.db, self.name, self.runner.runner_id,
+                                          self.epoch):
+                return  # bail perdu : rien n'est touché (L11 B3)
+            try:
+                os.unlink(self._path("session"))  # sinon `current_session` le relirait
+            except OSError:
+                pass
+            try:
+                from . import reprise
+                self.resume_summary = reprise.deterministic_brief(
+                    self.cfg, self.db, registry.get(self.db, self.name) or self.agent,
+                    session=refusee, reason="session fille %s écartée" % refusee,
+                    consigne="La consigne de ce tour suit ce brief : reprends ton "
+                             "travail à partir de là.")
+                self.resume_origin = "ameesh"
+            except Exception as exc:  # un brief manquant n'empêche pas l'oubli
+                log_async("[%s] brief de reprise déterministe indisponible (%s)"
+                          % (self.name, exc))
+            self.agent = registry.get(self.db, self.name) or self.agent
+            self.session_turns = 0
+            self.session_tokens = 0.0
+            suite = "session neuve ouverte sur le brief de reprise"
+        log_async("[%s] session fille %s écartée : %s" % (self.name, refusee, suite))
+        self._fil_note(
+            "Session %s refusée par le harnais (session fille : sous-agent ou "
+            "fourche) ; %s. Pas compté comme échec rapide." % (refusee, suite),
+            meta={"action": "session-fille", "session": refusee,
+                  "reprise": principale or ""})
 
     # -- hôte non prêt (L106) ------------------------------------------------
     #: statut et préfixe d'erreur d'un blocage « hôte non prêt » (levé seulement
@@ -1980,6 +2177,20 @@ class AgentWorker(threading.Thread):
         self.wake.set()
         return True
 
+    def _held_by_pressure(self, pressure: dict) -> bool:
+        """La pression de l'hôte retient-elle le prochain tour de cet agent ?
+
+        Oui dès qu'un seuil est franchi (L31, 0028) — sauf pour un
+        orchestrateur sous une pression NON critique et hors batterie basse :
+        ses tours sont courts, et c'est lui qui distribue le travail des autres
+        (2026-10-10 : charge jusqu'à 43 pour 12 CPU, plus aucun tour, pas même
+        le sien, et personne pour répartir)."""
+        if not pressure.get("blocked"):
+            return False
+        if pressure.get("critical") or not self.runner.is_orchestrator(self.name):
+            return True
+        return any(b.get("power") for b in pressure.get("breaches") or ())
+
     def _host_pressure_note(self, pressure: dict) -> None:
         """Trace la contre-pression (L31, 0028) ; en critique, met en pause.
 
@@ -1992,6 +2203,8 @@ class AgentWorker(threading.Thread):
                 or int(self.agent.get("priority") or 0) > 0):
             self._host_pressure_hold(raisons)
             return
+        if self._work_waiting():
+            self.runner.pressure_delayed(self.name)
         texte = "pression critique de l'hôte %s : %s" % (self.runner.host, raisons)
         if getattr(self, "_pressure_reason", "") == texte:
             return
@@ -1999,7 +2212,10 @@ class AgentWorker(threading.Thread):
         # expiré) ou un tour en cours est refusé (L31, 0028).
         if not registry.pause(self.db, self.name, self.runner.runner_id, self.epoch,
                               "pause : " + texte):
-            log("[%s] pause refusée : bail perdu, remplacé, ou tour en cours" % self.name)
+            if getattr(self, "_pause_refused", "") != texte:  # dit une fois
+                self._pause_refused = texte
+                log_async("[%s] pause refusée : bail perdu, remplacé, ou tour en cours"
+                          % self.name)
             return
         if not getattr(self, "_pressure_text", ""):
             self._pressure_before = self.agent.get("status_text") or ""
@@ -2014,7 +2230,8 @@ class AgentWorker(threading.Thread):
         if self.agent.get("pending_prompt"):
             return True
         try:
-            return bool(mail.unread(self.db, self.name, limit=1))
+            # L125 : un courrier passif n'attend pas de tour
+            return bool(mail.unread_active(self.db, self.name, limit=1))
         except db_mod.DbError:
             return False
 
@@ -2024,12 +2241,15 @@ class AgentWorker(threading.Thread):
         Sans elle, un agent retenu restait `queued`, erreur vide, sans raison
         lisible. Le statut ne change pas ; seul le texte dit ce qui retient le
         tour, et seulement quand du travail attend. Fencé par le bail ; ne lève
-        jamais. Pas sur un exécuteur médié : `leases.hold_note` n'est pas au
-        contrat 1.1 (l'attente y reste muette, comme en 1.6.x)."""
+        jamais. Le journal, lui, ne dit l'attente qu'une fois par épisode de
+        pression, pour tous les agents (`Runner._pressure_episode_update`).
+        Not on a mediated executor: `leases.hold_note` is not in contract 1.1
+        (the wait stays silent there, as in 1.6.x)."""
         if getattr(self.runner, "mediated", False):
             return
         if not self._work_waiting():
             return
+        self.runner.pressure_delayed(self.name)
         texte = "en attente : pression de l'hôte %s — %s" % (self.runner.host, raisons)
         if getattr(self, "_pressure_text", "") == texte:
             return
@@ -2042,13 +2262,13 @@ class AgentWorker(threading.Thread):
         if posee:
             if not getattr(self, "_pressure_text", ""):
                 self._pressure_before = self.agent.get("status_text") or ""
-                log("[%s] %s" % (self.name, texte))
             self._pressure_text = texte
 
     def _host_pressure_release(self) -> None:
         """L31b : la pression est retombée — l'attente ou la pause s'efface,
         si son texte est toujours en place (personne ne l'a remplacé) ; le texte
         d'avant (« reprise : même session »…) revient."""
+        self._pause_refused = ""
         texte = getattr(self, "_pressure_text", "")
         if not texte:
             return
@@ -2066,7 +2286,7 @@ class AgentWorker(threading.Thread):
         self._pressure_text = ""
         self._pressure_reason = ""
         if levee:
-            log("[%s] pression de l'hôte retombée : les tours reprennent" % self.name)
+            # la fin de l'épisode est dite une fois, pour tous les agents
             agent = registry.get(self.db, self.name)
             if agent is not None:
                 self.agent = agent
@@ -2110,9 +2330,10 @@ class AgentWorker(threading.Thread):
         if self.runner.gate_holds():
             return None  # porte d'hôte fermée (L112) : rien n'est consommé
         # Contre-pression de l'hôte (L31, 0028) : au-dessus d'un seuil, aucun
-        # NOUVEAU tour ne démarre ; la consigne en attente n'est pas consommée.
+        # NOUVEAU tour ne démarre ; la consigne en attente n'est pas consommée
+        # (l'orchestrateur excepté, sous une pression non critique).
         pressure = self.runner.host_pressure()
-        if pressure.get("blocked"):
+        if self._held_by_pressure(pressure):
             if self.maybe_relocate(pressure):
                 return None  # déplacé : le worker s'arrête, le bail sera rendu
             self._host_pressure_note(pressure)
@@ -2136,8 +2357,8 @@ class AgentWorker(threading.Thread):
             mid = int(refuse.get("id") or 0)
             if mid and mid not in self._refus_vus:
                 self._refus_vus.add(mid)
-                log("[%s] urgent ignoré : expéditeur %s non habilité à interrompre"
-                    % (self.name, refuse.get("sender") or "?"))
+                log("[%s] urgent de %s sans interruption : expéditeur non habilité "
+                    "à interrompre" % (self.name, refuse.get("sender") or "?"))
         if autorises:
             # Le prioritaire passe devant la consigne en attente : c'est lui qui
             # ouvre le tour, la consigne interrompue suivra (0018).
@@ -2155,10 +2376,18 @@ class AgentWorker(threading.Thread):
             self._reprise_attach = False
             return {"kind": "prompt", "prompt": prompt, "ids": []}
         messages = mail.unread(self.db, self.name)
+        if len(messages) >= mail.UNREAD_LIMIT and all(mail.passive_reason(m) for m in messages):
+            # L125 : boîte pleine de courrier passif — les messages qui
+            # réveillent, plus récents, ne doivent pas y rester invisibles
+            messages = mail.unread_active(self.db, self.name) + messages
         if messages:
-            self.nudged = False
-            self._reprise_attach = False  # le courrier ouvre la même session
-            return self._mail_spec(messages)
+            spec = self._mail_spec(messages)
+            if spec is not None:
+                self.nudged = False
+                self._reprise_attach = False  # le courrier ouvre la même session
+                return spec
+            # L125 : rien de dû (fenêtre de regroupement en cours, courrier
+            # passif) — la reprise et la relance d'inactivité restent possibles
         if self._reprise_attach:
             # L106 : la session interactive est morte sans rendre son bail ;
             # l'exécuteur reprend la MÊME session (registre), une fois.
@@ -2169,32 +2398,97 @@ class AgentWorker(threading.Thread):
         return None
 
     def _mail_spec(self, messages: list[dict]) -> dict | None:
-        """Messages non remis -> un tour. Les événements seuls sont regroupés (C9).
+        """Messages non remis -> un tour, ou None : rien n'est encore dû.
 
-        Le courrier ordinaire réveille immédiatement ; un lot d'événements n'en
-        réveille qu'un par fenêtre `AMEESH_EVENT_COALESCE` (défaut 120 s), sauf
-        si l'un d'eux est `urgent`. L'instant du dernier réveil vit en base
-        (`agent_registry.last_event_at`) : un redémarrage ne remet pas la
-        fenêtre à zéro.
+        L125 : un tour s'ouvre dès qu'un message NON PASSIF est dû, et il
+        emporte tout le courrier non lu — les messages dus d'abord quand la
+        consigne est pleine, les passifs ensuite :
+
+        * courrier ordinaire : dû à la fin de sa fenêtre de regroupement
+          (`mail_batch`, défaut 90 s, comptée depuis l'arrivée du plus
+          ancien), tout de suite s'il est urgent ou d'un humain (`_mail_due`) ;
+        * événements (C9) : un réveil par fenêtre `AMEESH_EVENT_COALESCE`
+          (défaut 120 s), sauf un urgent d'un expéditeur habilité.
+          L'instant du dernier réveil vit en base (`agent_registry.last_event_at`) :
+          un redémarrage ne remet pas la fenêtre à zéro ;
+        * passifs (accusé, copie, diffusion à tous : `mail.passive_reason`) :
+          jamais dus ; lus au tour suivant, ou par le hook pendant un tour.
         """
-        events = [m for m in messages if mail.is_event(m)]
-        autres = [m for m in messages if not mail.is_event(m)]
-        if autres:
-            if events:
-                registry.mark_event_wake(self.db, self.name)
-            return self._courrier_spec("mail", messages)
-        if not events:
-            return None
+        passive = [m for m in messages if mail.passive_reason(m)]
+        active = [m for m in messages if not mail.passive_reason(m)]
+        events = [m for m in active if mail.is_event(m)]
+        others = [m for m in active if not mail.is_event(m)]
+        mail_due = bool(others) and self._mail_due(others)
+        if not mail_due and not (events and self._events_due(events)):
+            return None  # regroupement en cours, ou rien que du courrier passif
+        if events:
+            registry.mark_event_wake(self.db, self.name)
+        rows = active + passive
+        return self._courrier_spec(
+            "event" if all(mail.is_event(m) for m in rows) else "mail", rows)
+
+    def _events_due(self, events: list[dict]) -> bool:
+        """Les événements en attente ouvrent-ils un tour ? (C9)"""
         fenetre = self.runner.event_coalesce
         dernier = float(self.agent.get("last_event_ts") or 0.0)
         # Seul un urgent d'un expéditeur habilité perce la fenêtre : un urgent
         # non habilité reste soumis au regroupement (même règle que la
         # préemption, 0018).
-        if any(mail.is_urgent(m) and self.interrupt_allowed(m) for m in events) \
-                or fenetre <= 0 or (time.time() - dernier) >= fenetre:
-            registry.mark_event_wake(self.db, self.name)
-            return self._courrier_spec("event", events)
-        return None  # fenêtre de regroupement en cours : on attend la suivante
+        return (any(mail.is_urgent(m) and self.interrupt_allowed(m) for m in events)
+                or fenetre <= 0 or (time.time() - dernier) >= fenetre)
+
+    def mail_batch(self) -> float:
+        """L125 : fenêtre de regroupement du courrier, en secondes — réglage de
+        l'agent (`ameesh set <agent> mail_batch=…`, état local de son hôte),
+        sinon défaut de l'exécuteur (`AMEESH_MAIL_BATCH`, 90 s). 0 = réveil
+        immédiat (le comportement d'avant L125)."""
+        local = self._state_read("mail_batch")
+        if local:
+            try:
+                value = float(local)
+            except ValueError:
+                value = -1.0
+            if 0 <= value < float("inf"):
+                return value
+        return float(getattr(self.runner, "mail_batch", self.cfg.mail_batch))
+
+    def _from_human(self, row: dict) -> bool:
+        """L125 : message d'un humain — marqué à l'envoi, ou expéditeur déclaré
+        humain sur cet hôte (`AMEESH_HUMANS`)."""
+        return mail.is_human(row) or (row.get("sender") or "") in self.cfg.human_names
+
+    def _mail_due(self, rows: list[dict]) -> bool:
+        """L125 : le courrier ordinaire en attente ouvre-t-il un tour ?
+
+        Oui si la fenêtre est nulle, si l'un des messages est urgent (réveil
+        sans délai, quel que soit l'expéditeur ; seul un expéditeur habilité
+        INTERROMPT un tour en cours, 0018) ou d'un humain, ou si le plus
+        ancien attend depuis au moins la fenêtre. L'attente se mesure à
+        l'horloge de la base (`created_ts`) et depuis que cet exécuteur a vu
+        le message (horloge monotone) : un décalage d'horloge entre l'hôte et
+        la base ne retarde jamais un message de plus d'une fenêtre.
+        """
+        window = self.mail_batch()
+        if window <= 0 or any(mail.is_urgent(m) or self._from_human(m) for m in rows):
+            return True
+        now, mono = time.time(), time.monotonic()
+        seen = getattr(self, "_batch_seen", {})
+        kept: dict[int, float] = {}
+        waited = 0.0
+        for row in rows:
+            first = seen.get(int(row["id"]), mono)
+            kept[int(row["id"])] = first
+            waited = max(waited, now - float(row.get("created_ts") or now), mono - first)
+        self._batch_seen = kept  # les messages remis entre-temps sont oubliés
+        if waited >= window:
+            return True
+        oldest = min(kept)
+        if getattr(self, "_batch_logged", None) != oldest:
+            self._batch_logged = oldest
+            log_async("[%s] courrier regroupé : %d message(s), tour dans %ds au plus "
+                      "(fenêtre %gs)" % (self.name, len(rows), int(window - waited) + 1,
+                                         window))
+        return False
 
     # -- un tour -----------------------------------------------------------
     def _adapter(self) -> adapters.HarnessAdapter:
@@ -2218,8 +2512,14 @@ class AgentWorker(threading.Thread):
             log("[%s] harnais %s : %s" % (self.name, descriptor.id, resolution))
         return adapter
 
-    #: préfixe du résumé de reprise (session neuve après rotation, 0018)
-    RESUME_PREFIX = "Reprise de session après rotation — résumé :\n%s\n\n"
+    def _resume_prompt(self) -> str:
+        """Le cadre et le résumé de reprise qui ouvriront la session neuve après
+        une rotation (0018), ou "" sans résumé en attente. Le résumé est
+        délimité et n'a aucune autorité (`adapters.resume_prompt`)."""
+        if not self.resume_summary:
+            return ""
+        return adapters.resume_prompt(self.resume_summary, origin=self.resume_origin)
+
     def _budget_courrier(self) -> int:
         """Octets UTF-8 disponibles pour la consigne d'un tour de courrier.
 
@@ -2229,8 +2529,7 @@ class AgentWorker(threading.Thread):
         `PROMPT_MIN_BYTES` au courrier les lui laisse quand même (la consigne
         dépasse alors le plafond, jamais la borne de l'argument).
         """
-        resume = mail.octets(self.RESUME_PREFIX % self.resume_summary) \
-            if self.resume_summary else 0
+        resume = mail.octets(self._resume_prompt())
         return min(self.runner.prompt_max_bytes, mail.ARG_SAFE_BYTES) - resume
 
     def _courrier_spec(self, kind: str, messages: list[dict]) -> dict:
@@ -2265,10 +2564,19 @@ class AgentWorker(threading.Thread):
         """
         self.fast_failure = False
         candidats = spec.get("candidats")
+        if self.runner.draining.is_set():
+            # Drainage commencé entre le choix du tour et son lancement : rien
+            # ne part ; une consigne déjà prise repart en attente.
+            if registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch):
+                registry.set_status(self.db, self.name, "queued",
+                                    status_text="exécuteur en arrêt : consigne remise en "
+                                                "attente")
+            return False
         # Dernier contrôle avant de consommer quoi que ce soit (L31, 0028) :
         # couvre les tours ouverts directement (résumé de rotation de compte).
         pression = self.runner.host_pressure()
-        if pression.get("blocked"):
+        self._refus_pression = self._held_by_pressure(pression)
+        if self._refus_pression:
             self._host_pressure_note(pression)
             return False
         if self.runner.gate_holds():
@@ -2279,6 +2587,8 @@ class AgentWorker(threading.Thread):
             except db_mod.DbError:
                 pass
             return False
+        if pression.get("blocked"):
+            self.runner.pressure_bypassed(self.name)  # orchestrateur, non critique
         if not candidats or self.runner.dry_run:
             return self._run_turn(spec)
         kind = spec["kind"]
@@ -2433,14 +2743,35 @@ class AgentWorker(threading.Thread):
                     self.runner.host, entries, actor="runner:%s" % self.runner.runner_id)
                 for entry in entries:
                     if entry["kind"] == "orphan":
-                        log("[%s] /tmp : %s (%s) apparu pendant le tour — signalé, jamais "
-                            "supprimé : %s" % (self.name, entry["path"],
-                                               entry.get("bytes"),
-                                               (entry.get("data") or {}).get("command")))
+                        # L162 : le sort de l'entrée est dans le détail
+                        # (supprimée une fois abandonnée, ou jamais)
+                        log("[%s] /tmp : %s (%s) apparu pendant le tour — signalé (%s) : %s"
+                            % (self.name, entry["path"], entry.get("bytes"),
+                               entry.get("detail", "").rpartition(" : ")[2],
+                               (entry.get("data") or {}).get("command")))
         except Exception as exc:
             log("[%s] ménage après le tour %s impossible (%s)" % (self.name, turn_id[:8], exc))
 
+    def _with_background_note(self, spec: dict) -> tuple[dict, list[str]]:
+        """Le travail de fond des tours précédents (délai de grâce) : ce qui
+        tourne encore, ce qui a fini (code de sortie), ce qui a été arrêté —
+        dit à l'agent en tête de consigne, jamais dans un tour de résumé. Rend
+        la consigne et les tours clos à noter « dits » une fois le harnais
+        lancé. Une consigne déjà à la borne d'un argument garde sa place : la
+        note attend alors le tour suivant."""
+        tracker = getattr(self.runner, "background", None)
+        if tracker is None or spec.get("prompt") == adapters.SUMMARY_PROMPT:
+            return spec, []
+        note, dits = tracker.note_for(self.name)
+        if not note:
+            return spec, []
+        if mail.octets(self._resume_prompt() + note + spec["prompt"]) > mail.ARG_SAFE_BYTES:
+            return spec, []
+        return dict(spec, prompt=note + spec["prompt"]), dits
+
     def _run_turn(self, spec: dict) -> bool:
+        # Travail de fond des tours précédents : en tête de consigne.
+        spec, fond_dits = self._with_background_note(spec)
         harness = self.agent.get("harness") or "other"
         try:
             adapter = self._adapter()
@@ -2454,8 +2785,9 @@ class AgentWorker(threading.Thread):
         session = self.current_session()
         resume = ""
         if self.resume_summary and not session:
-            # Session neuve après rotation (0018) : le résumé de reprise ouvre le tour.
-            resume = self.RESUME_PREFIX % self.resume_summary
+            # Session neuve après rotation (0018) : le résumé de reprise, encadré
+            # et délimité (il n'a aucune autorité), ouvre le tour.
+            resume = self._resume_prompt()
         # Modèle et effort par agent (0019) : lus à chaque tour, donc un
         # `ameesh set` prend effet au tour suivant. DeepSeek reçoit un patch YAML.
         model = self.agent.get("model") or self._state_read("model")
@@ -2574,9 +2906,13 @@ class AgentWorker(threading.Thread):
         if not getattr(self.runner, "mediated", False):
             try:
                 from . import menage as menage_mod
+                # session neuve : dossier temporaire vidé — jamais sous le travail
+                # de fond d'un tour précédent encore en délai de grâce
+                fond = getattr(self.runner, "background", None)
                 menage_tour = menage_mod.Turn.begin(
                     self.cfg, self.runner.housekeeping_policy(), self.name, cwd,
-                    new_session=not session, base_env=env)
+                    new_session=not session and not (fond and fond.has_jobs(self.name)),
+                    base_env=env)
                 env.update(menage_tour.env)
             except Exception as exc:
                 log("[%s] ménage avant le tour impossible (%s)" % (self.name, exc))
@@ -2613,10 +2949,16 @@ class AgentWorker(threading.Thread):
         result_code = 0
         self.last_output = ""
         self.host_yield = None
+        self.last_final = None
+        self.summary_display = []
         # L105 : plafonds pendant le tour — jetons relus (une fois par appel)
         # et durée ; jamais sur un tour de résumé (rotation, bascule de compte)
         plafonne = spec.get("prompt") != adapters.SUMMARY_PROMPT
         relus = 0
+        #: L217 : jetons relus par les sous-agents, à part et pour information
+        #: (jamais comptés au plafond de contexte, qui mesure le fil principal)
+        relus_sous_agents = 0
+        relus_mesures = False  # L217b : le flux a relevé au moins un appel
         appels_vus: set = set()
         cloture: str | None = None
         clos = False
@@ -2647,14 +2989,19 @@ class AgentWorker(threading.Thread):
         #: la résolution, interpréteur absent) — erreur de l'hôte
         echec_lancement = ""
         lignes = 0
+        proc = None
         try:
             with open(stderr_path, "ab") as stderr:
                 try:
-                    proc = subprocess.Popen(
-                        argv, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
-                        text=True, bufsize=1, env=env,
-                        start_new_session=True,  # son groupe : on peut le tuer en entier
-                    )
+                    # Le moissonneur de l'exécuteur ne touche jamais un harnais,
+                    # même pas pendant son lancement (voir `background`).
+                    with self.runner.launch_lock:
+                        proc = subprocess.Popen(
+                            argv, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
+                            text=True, bufsize=1, env=env,
+                            start_new_session=True,  # son groupe : on peut le tuer en entier
+                        )
+                        self.runner.harness_pids.add(proc.pid)
                 except OSError as exc:
                     raise _LancementImpossible("lancement impossible de %s : %s"
                                                % (argv[0], exc.strerror or exc)) from exc
@@ -2667,6 +3014,8 @@ class AgentWorker(threading.Thread):
             # Lancé (et publié, pour que l'arrêt le trouve) : les messages de la
             # consigne sont livrés, et seulement eux.
             self._livre_courrier(spec)
+            if fond_dits:  # la note du travail de fond a été montrée
+                self.runner.background.mark_reported(fond_dits)
             # Course de publication : un déclencheur d'arrêt (bail perdu,
             # préemption, arrêt de l'exécuteur, échéance) a pu conclure pendant
             # que ce Popen n'était pas encore publié (proc=None). Le recontrôle
@@ -2712,6 +3061,10 @@ class AgentWorker(threading.Thread):
                     for text in parsed.get("display") or []:
                         log("[%s] %s" % (self.name, text))
                         self.last_output = (self.last_output + "\n" + text)[-4000:]
+                        if not plafonne and len(self.summary_display) < 10_000:
+                            self.summary_display.append(text)
+                    if "final" in parsed:
+                        self.last_final = str(parsed["final"] or "")
                     if parsed.get("safe_point") and self.host_yield is None \
                             and self.runner.gate_holds():
                         # L112 : l'hôte se retire — point sûr, l'appel d'outil en
@@ -2719,7 +3072,11 @@ class AgentWorker(threading.Thread):
                         self.host_yield = "point sûr"
                         self.stop_group_now("l'hôte se retire : tour arrêté au point sûr",
                                             grace=1.0)
-                    if plafonne and not clos:
+                    if plafonne:
+                        # L217b : le flux se lit jusqu'au bout, même après la
+                        # clôture — un appel déjà en tampon compte encore.
+                        relus_mesures = relus_mesures or isinstance(
+                            parsed.get("call_usage") or parsed.get("subagent_call_usage"), dict)
                         appel = parsed.get("call_usage")
                         if isinstance(appel, dict):
                             ident = parsed.get("call_id")
@@ -2727,18 +3084,28 @@ class AgentWorker(threading.Thread):
                                 if ident:
                                     appels_vus.add(ident)
                                 relus += adapters.reread_tokens(harness, appel)
-                        if cloture is None:
+                        appel = parsed.get("subagent_call_usage")
+                        if isinstance(appel, dict):
+                            ident = parsed.get("call_id")
+                            if not ident or ident not in appels_vus:
+                                if ident:
+                                    appels_vus.add(ident)
+                                relus_sous_agents += adapters.reread_tokens(harness, appel)
+                        if cloture is None and not clos:
                             cloture = self.turn_close_due(started, relus)
                             if cloture:
                                 log_async("[%s] %s : tour clos au prochain point sûr"
                                           % (self.name, cloture))
-                        if cloture and parsed.get("safe_point") and self.host_yield is None:
+                        if cloture and not clos and parsed.get("safe_point") \
+                                and self.host_yield is None:
                             # Point sûr : l'appel d'outil en cours est fini et son
                             # résultat est dans la session. Aucun harnais mené
                             # n'offre d'interruption propre en mode non
-                            # interactif : arrêt propre habituel (SIGTERM, grâce).
+                            # interactif : arrêt propre habituel (SIGTERM, grâce)
+                            # du harnais SEUL — le travail lancé en fond pendant
+                            # le tour garde son délai de grâce.
                             clos = True
-                            self.stop_group_now("tour clos : %s" % cloture)
+                            self.stop_group_now("tour clos : %s" % cloture, group=False)
                     usage = parsed.get("usage")
                     if isinstance(usage, dict):
                         # Clés de chaque harnais normalisées (L60 : l'usage
@@ -2761,18 +3128,49 @@ class AgentWorker(threading.Thread):
             heartbeat_done.set()
             preempt_done.set()
             pgid = self.pgid
-            # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
-            # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
-            # du veilleur une fois `self.proc` effacé (sonde codex3 B5a-S).
-            self.terminate()
+            # Fin NORMALE (harnais fini et moissonné, aucun arrêt d'urgence) :
+            # ce qui tourne encore — processus du groupe, conteneurs du tour
+            # sans lot — garde un délai de grâce (`background`). Sinon, ou
+            # sans délai, le nettoyage habituel, tout de suite.
+            fond = None
+            try:
+                if (proc is not None and pgid and proc.poll() is not None
+                        and not self.runner.once and self.turn_grace_seconds() > 0
+                        and not self._urgent_end()):
+                    fond = self.runner.background.survivors(turn_id, pgid)
+            except Exception as exc:  # dans le doute, le nettoyage d'avant
+                log_async("[%s] travail de fond du tour %s non examiné (%s)"
+                          % (self.name, turn_id[:8], exc))
+                fond = None
+            if fond is None:
+                # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
+                # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
+                # du veilleur une fois `self.proc` effacé (sonde codex3 B5a-S).
+                self.terminate()
             with self.lock:
                 self.proc = None
                 self.pgid = None
-            self._close_turn_resource(turn_id, pgid)
+            with self.runner.launch_lock:
+                self.runner.harness_pids.discard(pgid)
+            if fond is not None:
+                self.runner.background.start(
+                    agent=self.name, turn_id=turn_id, pgid=pgid, members=fond[0],
+                    containers=fond[1], grace_s=self.turn_grace_seconds())
+            else:
+                self._close_turn_resource(turn_id, pgid)
             self._menage_apres_tour(menage_tour, turn_id, spec)
 
         duration = time.time() - started
         self.last_turn_seconds = duration
+        # L217 : fil principal et sous-agents, mesurés à part dans le flux
+        self.last_turn_main_reread = relus
+        self.last_turn_subagent_reread = relus_sous_agents
+        # L217b : la rotation entre deux tours juge sur ce même compteur
+        self.last_turn_context = relus if relus_mesures else None
+        self.last_turn_context_session = session_new or session or None
+        if relus_sous_agents:
+            log_async("[%s] jetons relus dans le tour : %d fil principal, %d sous-agents "
+                      "(hors plafond)" % (self.name, relus, relus_sous_agents))
         lost = self.lease_lost.is_set()
         preempte = self.preempting.is_set()
         # Comptabilité **avant** toute sortie anticipée : la dépense a eu lieu,
@@ -2862,6 +3260,13 @@ class AgentWorker(threading.Thread):
                 if not self._power_texte:
                     self._host_not_ready(hote)
                 return False
+            if session and adapters.child_session_refused(error):
+                # L166 : la session reprise était une session fille ; la
+                # reprendre encore échouerait de même. Pas un échec rapide :
+                # le tour suivant repart d'une session saine.
+                self.fast_failure = False
+                self._avec_reprise("session fille écartée",
+                                   self._ecarte_session_fille, session)
         if self._session_en_attente is not None:
             self._avec_reprise("session du tour", self._enregistre_session)
         if ok and clos:
@@ -2996,6 +3401,8 @@ class AgentWorker(threading.Thread):
                     # L112 : porte d'hôte fermée — le bail est rendu (finally)
                     self._leave_for_host()
                     break
+                if self.runner.draining.is_set():
+                    break  # drainage : le tour d'avant est fini, aucun autre ne part
                 if not self.renew():
                     break
                 # L72 : une base injoignable n'arrête plus le worker (son fil
@@ -3038,8 +3445,8 @@ class AgentWorker(threading.Thread):
                     if self.fast_failures >= self.runner.max_fast_failures:
                         self.stop_after_failures()
                         break
-                if self.stopping.is_set():
-                    break  # arrêt demandé (L106 : batterie) — bail rendu sans attendre
+                if self.stopping.is_set() or self.runner.draining.is_set():
+                    break  # arrêt demandé (L106 : batterie ; drainage) — bail rendu sans attendre
                 # Un message non remis ou un harnais en échec ne doit pas
                 # produire une boucle serrée : on laisse retomber, de plus en
                 # plus longtemps tant que les échecs rapides se suivent (L48).
@@ -3075,6 +3482,8 @@ class Runner:
         self.idle_nudge = cfg.idle_nudge
         self.poll = max(1.0, cfg.poll)
         self.event_coalesce = max(0.0, cfg.event_coalesce)
+        #: L125 : fenêtre de regroupement du courrier, défaut de l'hôte
+        self.mail_batch = max(0.0, cfg.mail_batch)
         #: plafond (octets UTF-8) de la consigne d'un tour de courrier, résumé de
         #: reprise compris ; borné par l'argument de processus (128 Kio)
         self.prompt_max_bytes = int(min(max(float(mail.PROMPT_MIN_BYTES),
@@ -3099,6 +3508,14 @@ class Runner:
         self.power_stop_grace = max(0.0, float(getattr(cfg, "power_stop_grace", 120.0)))
         #: arrêt sur batterie en cours : plus aucune réclamation de bail
         self.power_hold = threading.Event()
+        #: arrêt demandé par un signal (SIGTERM de systemd) : drainage — plus
+        #: de nouveau tour, le tour en cours et son travail de fond finissent,
+        #: au plus `drain_seconds` ; un second signal arrête tout de suite
+        self.drain_seconds = max(0.0, float(getattr(cfg, "drain_seconds", 1800.0)))
+        self.draining = threading.Event()
+        self._drain_deadline = 0.0
+        self._drain_since = 0.0
+        self._drain_woken = False
         self._power_state = "unknown"
         self._power_thread: threading.Thread | None = None
         adapters.configure(cfg)
@@ -3128,6 +3545,15 @@ class Runner:
                                 "limits": self._host_limits}
         self._pressure_at = 0.0
         self._all_host_limits: dict = {}
+        #: épisode de pression en cours (une ligne de journal à son début, une
+        #: à sa fin : durée, tours retardés), ou None
+        self._pressure_episode: dict | None = None
+        #: orchestrateurs (rôle `orchestrateur` au canon, relu à chaque `canon
+        #: sync` ; `AMEESH_ALERT_ORCHESTRATORS`) : sous une pression NON
+        #: critique, leurs tours partent quand même
+        from . import sous_utilisation as su
+        self._orchestrators_declared = frozenset(su.declared_orchestrators())
+        self._orchestrators_roles: frozenset = frozenset()
         #: L43 (0031) : `max_agents` physique (le plus strict des canons) et
         #: provenance de chaque limite ; journal « hôte plein » une fois par valeur
         self._host_max_agents: int | None = None
@@ -3143,6 +3569,17 @@ class Runner:
         #: valeurs par défaut tant qu'aucun canon n'est lu
         from . import menage as menage_mod
         self._housekeeping = menage_mod.Policy()
+        #: L162 : jamais deux passages de ménage à la fois (le périodique, et
+        #: celui qu'une pression du tmpfs déclenche tout de suite)
+        self._housekeeping_lock = threading.Lock()
+        #: travail de fond des tours finis, en délai de grâce (suivi par le
+        #: fil `fond` en mode service) ; pids des harnais lancés, que le
+        #: moissonneur des orphelins adoptés ne touche jamais (lancement
+        #: compris : `launch_lock`)
+        from . import background as background_mod
+        self.background = background_mod.Tracker(self, log=log_async)
+        self.launch_lock = threading.Lock()
+        self.harness_pids: set[int] = set()
         self.turns = 0
         self.did_turn = False
         #: L109 : exécuteur médié — pas de base, le serveur du mesh par
@@ -3292,6 +3729,8 @@ class Runner:
             return  # L106 : arrêt sur batterie — aucun bail repris avant le secteur
         if self.gate_holds():
             return  # L112 : porte d'hôte fermée — aucune réclamation
+        if self.draining.is_set():
+            return  # drainage : aucun nouvel agent, aucun nouveau tour
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
@@ -3388,8 +3827,8 @@ class Runner:
                 if row and mail.is_urgent(row):
                     prioritaire = worker.interrupt_allowed(row)
                     if not prioritaire:
-                        log_async("urgent de %s ignoré : expéditeur non habilité à interrompre"
-                                  % (row.get("sender") or "?"))
+                        log_async("urgent de %s sans interruption : expéditeur non "
+                                  "habilité à interrompre" % (row.get("sender") or "?"))
             if worker and prioritaire:
                 worker.request_preempt()  # le signal d'abord
                 log_async("message prioritaire pour %s : interruption du tour" % target)
@@ -3465,6 +3904,59 @@ class Runner:
                                         reprise.minimum * 2 ** (reprise.echecs - 1)))
 
     # -- arrêt -------------------------------------------------------------
+    def request_stop(self, signum: int) -> None:
+        """Un signal d'arrêt (SIGTERM de systemd, SIGINT). Appelé depuis le
+        gestionnaire de signal : aucun verrou, des drapeaux et la file du
+        journal seulement.
+
+        Premier signal : DRAINAGE — plus de nouveau tour ; le tour en cours
+        et son travail de fond finissent, au plus `drain_seconds`, puis
+        l'exécuteur rend ses baux et sort (`_drained`). Un redémarrage
+        ordinaire (`systemctl restart`) ne tue donc plus le tour en cours.
+        Second signal, borne nulle, ou passage unique : arrêt immédiat, comme
+        avant (tour arrêté, consigne remise en attente)."""
+        if self.once or self.drain_seconds <= 0 or self.draining.is_set():
+            immediat = self.draining.is_set()
+            self.stop.set()
+            self.wake_all.set()
+            log_async("signal %d reçu : %s" % (
+                signum, "second signal, arrêt immédiat (tour en cours et travail de "
+                        "fond arrêtés)" if immediat else "arrêt propre"))
+            return
+        self._drain_since = time.monotonic()
+        self._drain_deadline = self._drain_since + self.drain_seconds
+        self.draining.set()
+        self.wake_all.set()
+        log_async("signal %d reçu : drainage — plus de nouveau tour ; le tour en cours et "
+                  "son travail de fond finissent (au plus %ds), puis arrêt ; un second "
+                  "signal arrête tout de suite" % (signum, int(self.drain_seconds)))
+
+    def _drained(self) -> bool:
+        """Drainage en cours : vrai quand l'exécuteur peut s'arrêter — plus
+        aucun worker vivant (chacun sort après son tour) ni travail de fond en
+        délai de grâce, ou borne atteinte (l'arrêt arrête alors ce qui reste)."""
+        with self.lock:
+            workers = list(self.workers.items())
+        if not self._drain_woken:
+            # hors du gestionnaire de signal : les workers au repos sortent
+            self._drain_woken = True
+            for _nom, worker in workers:
+                worker.wake.set()
+        en_tour = sorted(nom for nom, worker in workers if worker.is_alive())
+        fond = self.background.running_count()
+        duree = int(time.monotonic() - self._drain_since)
+        if not en_tour and not fond:
+            log_async("drainage terminé en %ds : plus de tour ni de travail de fond, "
+                      "arrêt" % duree)
+            return True
+        if time.monotonic() >= self._drain_deadline:
+            log_async("drainage : borne de %ds atteinte — arrêt de ce qui reste (%s)"
+                      % (int(self.drain_seconds), ", ".join(
+                          (["tour de %s" % ", ".join(en_tour)] if en_tour else [])
+                          + (["travail de fond de %d tour(s)" % fond] if fond else []))))
+            return True
+        return False
+
     def shutdown(self) -> None:
         self.stop.set()
         self.wake_all.set()
@@ -3485,6 +3977,9 @@ class Runner:
             # du bail (sonde codex3 B5a-P).
             worker.stop_group_now("arrêt de l'exécuteur (dur)", grace=0, hard=True)
             worker.release_lease()
+        # Travail de fond encore en délai de grâce : le nettoyage habituel,
+        # tout de suite (rien ne survit à l'exécuteur qui le suit).
+        self.background.stop_all("arrêt de l'exécuteur")
         # L'écouteur (fil démon) ne doit plus écrire quand l'interpréteur se
         # finalise : sa connexion est fermée ci-dessus, on l'attend, borné.
         if self.listener_thread is not None:
@@ -3575,6 +4070,9 @@ class Runner:
             refresh = getattr(self, "refresh_host_limits", None)
             if refresh is not None and synced:
                 refresh(*synced)
+            orchestres = getattr(self, "refresh_orchestrators", None)
+            if orchestres is not None and synced:
+                orchestres(*synced)
             return ok
         except Exception as exc:  # jamais fatal : le canon ferme, il ne tue pas
             log_async("canon sync en échec : %s" % " ".join(str(exc).split())[:200])
@@ -3728,16 +4226,63 @@ class Runner:
         return getattr(self, "_housekeeping", None) or menage_mod.Policy()
 
     def agents_in_turn(self) -> set:
+        """Agents en tour sur cet exécuteur — et ceux dont le travail de fond
+        d'un tour fini tourne encore (délai de grâce) : le ménage les traite
+        de même (dossier temporaire, caches, worktrees)."""
         with self.lock:
-            return {name for name, worker in self.workers.items()
-                    if worker.is_alive() and getattr(worker, "proc", None) is not None}
+            en_tour = {name for name, worker in self.workers.items()
+                       if worker.is_alive() and getattr(worker, "proc", None) is not None}
+        return en_tour | self.background.agents()
 
     def housekeeping_once(self) -> dict | None:
         """Un passage de ménage (L73) ; ne lève jamais.
 
         Les caches partagés ne sont évincés que si aucun tour de cet hôte ne
-        tourne (d'après la base : les autres exécuteurs de l'hôte comptent)."""
+        tourne (d'après la base : les autres exécuteurs de l'hôte comptent).
+        L162 : un passage déjà en cours rend None (jamais deux à la fois)."""
+        lock = getattr(self, "_housekeeping_lock", None)
+        if lock is None:
+            lock = self._housekeeping_lock = threading.Lock()
+        if not lock.acquire(blocking=False):
+            return None
+        try:
+            return self._housekeeping_pass()
+        finally:
+            lock.release()
+
+    def tmpfs_pressure_pass(self) -> bool:
+        """L162 : une pression qui vient du tmpfs déclenche TOUT DE SUITE un
+        passage de ménage (entrées de /tmp abandonnées par un tour), sans
+        attendre le passage périodique ; le journal dit ensuite les plus
+        grosses entrées de /tmp et l'action attendue. Rien sans passage
+        périodique (`AMEESH_HOUSEKEEPING_INTERVAL=0`, `--once`). Rend vrai si
+        le passage est lancé."""
+        interval = float(getattr(self.cfg, "housekeeping_interval", 0) or 0)
+        if interval <= 0 or self.once:
+            return False
+
+        def passage() -> None:
+            from . import menage as menage_mod
+            report = self.housekeeping_once()
+            if not report:
+                return
+            mesure = report.get("measure") or {}
+            supprimes = [e for e in report.get("entries") or ()
+                         if e.get("kind") == "orphan" and e.get("action") == "deleted"]
+            log_async("pression du tmpfs : ménage immédiat, %d entrée(s) de /tmp abandonnée(s) "
+                      "supprimée(s)%s ; %s" % (
+                          len(supprimes),
+                          " (%s)" % ", ".join(e["path"] for e in supprimes[:5])
+                          if supprimes else "",
+                          menage_mod.tmpfs_hint(mesure.get("system_tmp_top") or [],
+                                                self.housekeeping_policy())))
+
+        threading.Thread(target=passage, daemon=True, name="menage-tmpfs").start()
+        return True
+
+    def _housekeeping_pass(self) -> dict | None:
         from . import menage as menage_mod
+        from . import resources as resources_mod
         db = None
         try:
             db = db_mod.connect(self.cfg)
@@ -3753,7 +4298,9 @@ class Runner:
             faits = [e for e in report["entries"] if e["kind"] != "mesure"]
             if faits:
                 log_async("ménage : %s" % " ; ".join(
-                    "%s %s %s" % (e["kind"], e["action"], e.get("path") or "")
+                    "%s %s %s%s" % (e["kind"], e["action"], e.get("path") or "",
+                                    " (%s)" % resources_mod.fmt_value("bytes", e["bytes"])
+                                    if e.get("bytes") else "")
                     for e in faits[:10]))
             return report
         except Exception as exc:  # jamais fatal pour l'exécuteur
@@ -3783,6 +4330,9 @@ class Runner:
                     log_async("lot #%s livré : %s%s" % (
                         entry["work_item"], entry["detail"],
                         " [dry-run]" if entry["result"] == "would-merge" else ""))
+            if not self.dry_run:
+                self.measure_once(db)
+            self.radar_once(db)
             return report
         except Exception as exc:  # jamais fatal pour l'exécuteur
             message = "relevé des branches impossible (%s : %s)" % (type(exc).__name__, exc)
@@ -3796,6 +4346,47 @@ class Runner:
                     db.close()
                 except Exception:
                     pass
+
+    def measure_once(self, db) -> None:
+        """L157c: measures the lots delivered since the last sweep (phases,
+        merged diff) with the repositories of this host. Never raises."""
+        from . import lot_measures
+        try:
+            errors: list = []
+            for row in lot_measures.measure_pending(
+                    db, host=self.host,
+                    agents=set(self.agents_filter) if self.agents_filter else None,
+                    errors=errors):
+                log_async("lot #%s measured: %s" % (
+                    row["work_item_id"], lot_measures.describe_phases(row)))
+            for lot, exc in errors:
+                log_async("lot #%s not measured (%s: %s)" % (lot, type(exc).__name__, exc))
+        except Exception as exc:  # never fatal for the runner
+            log_async("lot measures impossible (%s: %s)" % (type(exc).__name__, exc))
+
+    def radar_once(self, db) -> None:
+        """L160b : un passage du radar de conflits, après le relevé des
+        branches, sur l'hôte qui déclare `radar.projects` : journal, et
+        courrier aux assignés sur conflit nouveau (L160c). Ne lève jamais."""
+        from . import radar
+        try:
+            if getattr(self, "_radar_cache", None) is None:
+                self._radar_cache = radar.Cache()
+            for line in radar.run_pass(self.cfg, db, cache=self._radar_cache):
+                if line.get("mail"):
+                    log_async("radar %s : %d courrier(s), dont %d réveil(s)" % (
+                        line["project"], len(line["mail"]),
+                        sum(1 for m in line["mail"] if m["level"] == "blocking")))
+                if line["changes"] or line.get("error"):
+                    log_async("radar %s : %s" % (line["project"], line.get("error") or (
+                        "%d changement(s), %d paire(s) en conflit (%.1f s)" % (
+                            len(line["changes"]), line["summary"]["conflict"],
+                            line["duration_s"]))))
+        except Exception as exc:  # jamais fatal pour l'exécuteur
+            message = "radar impossible (%s : %s)" % (type(exc).__name__, exc)
+            if message != getattr(self, "_radar_error", None):
+                log_async(message)
+            self._radar_error = message
 
     def start_branch_sweep_poll(self) -> None:
         """Relevé périodique des branches (`AMEESH_BRANCH_SWEEP_INTERVAL`,
@@ -3977,7 +4568,82 @@ class Runner:
         with self._pressure_lock:
             self._pressure = verdict
             self._pressure_at = now
+            self._pressure_episode_update(verdict)
         return dict(verdict)
+
+    # -- pression : orchestrateurs et épisodes ------------------------------
+    def is_orchestrator(self, name: str) -> bool:
+        """`name` est-il un orchestrateur ? Rôle au canon (`roles:
+        [orchestrateur]` de sa fiche Agent) ou `AMEESH_ALERT_ORCHESTRATORS`."""
+        return (name in getattr(self, "_orchestrators_declared", ())
+                or name in getattr(self, "_orchestrators_roles", ()))
+
+    def refresh_orchestrators(self, *canons) -> None:
+        """Après chaque `canon sync` : les agents au rôle d'orchestrateur."""
+        from . import sous_utilisation as su
+        self._orchestrators_roles = frozenset(su.role_orchestrators(canons))
+
+    def _pressure_episode_update(self, verdict: dict) -> None:
+        """À chaque verdict FRAIS, sous `_pressure_lock` : une ligne de journal
+        au début d'un épisode de pression, une à sa fin — début, fin, durée,
+        tours retardés —, jamais une par tentative de tour."""
+        from . import resources as resources_mod
+        episode = getattr(self, "_pressure_episode", None)
+        if verdict.get("blocked"):
+            tmpfs = any(b.get("key") == "max_tmpfs_used" for b in verdict.get("breaches") or ())
+            if episode is None:
+                self._pressure_episode = episode = {
+                    "since": time.time(), "critical": bool(verdict.get("critical")),
+                    "delayed": set(), "rotations": set(), "orchestrator_turns": 0,
+                    "tmpfs": False}
+                batterie = any(b.get("power") for b in verdict.get("breaches") or ())
+                log_async("pression de l'hôte %s : début — %s ; plus de nouveau tour%s"
+                          % (self.host, resources_mod.describe(verdict.get("breaches"))
+                             or "seuil",
+                             " (pression critique)" if verdict.get("critical") else
+                             " (batterie basse)" if batterie else
+                             " sauf ceux d'un orchestrateur (pression non critique)"))
+            elif verdict.get("critical"):
+                episode["critical"] = True
+            if tmpfs and not episode.get("tmpfs"):
+                # L162 : la pression vient du tmpfs — ménage tout de suite (une
+                # fois par épisode), puis les plus grosses entrées au journal
+                episode["tmpfs"] = True
+                self.tmpfs_pressure_pass()
+            return
+        if episode is None:
+            return
+        self._pressure_episode = None
+        fin = time.time()
+        retardes = sorted(episode["delayed"])
+        log_async("pression de l'hôte %s : fin — de %s à %s (%s)%s ; %d tour(s) retardé(s)%s"
+                  "%s%s" % (
+                      self.host, time.strftime("%H:%M:%S", time.localtime(episode["since"])),
+                      time.strftime("%H:%M:%S", time.localtime(fin)),
+                      _duree(fin - episode["since"]),
+                      ", critique par moments" if episode["critical"] else "",
+                      len(retardes),
+                      " (%s%s)" % (", ".join(retardes[:12]), ", …" if len(retardes) > 12
+                                   else "") if retardes else "",
+                      " ; rotation de session reportée : %s"
+                      % ", ".join(sorted(episode["rotations"])) if episode["rotations"] else "",
+                      " ; %d tour(s) d'orchestrateur passé(s)" % episode["orchestrator_turns"]
+                      if episode["orchestrator_turns"] else ""))
+
+    def pressure_delayed(self, agent: str, *, rotation: bool = False) -> None:
+        """Un tour (ou une rotation de session) de `agent` attend la fin de
+        l'épisode de pression en cours : compté pour sa ligne de fin."""
+        with self._pressure_lock:
+            episode = getattr(self, "_pressure_episode", None)
+            if episode is not None:
+                episode["rotations" if rotation else "delayed"].add(agent)
+
+    def pressure_bypassed(self, agent: str) -> None:
+        """Un tour d'orchestrateur part malgré la pression (non critique)."""
+        with self._pressure_lock:
+            episode = getattr(self, "_pressure_episode", None)
+            if episode is not None:
+                episode["orchestrator_turns"] += 1
 
     def power_reading(self) -> dict:
         """Alimentation de l'hôte (L106) ; surchargée par les tests."""
@@ -4104,8 +4770,9 @@ class Runner:
             return []
 
     def run(self) -> int:
-        log("démarrage : hôte %s, exécuteur %s, pilote %s, schéma %s"
-            % (self.host, self.runner_id, self.db.name, self.cfg.schema))
+        log("démarrage : hôte %s, exécuteur %s, pilote %s, schéma %s, courrier "
+            "regroupé %ds (L125)" % (self.host, self.runner_id, self.db.name,
+                                     self.cfg.schema, int(self.mail_batch)))
         self.start_canon_sync()
         self.start_balance_poll()
         self.start_resource_poll()
@@ -4124,6 +4791,12 @@ class Runner:
             return 0 if self.did_turn else 3
         self.listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
         self.listener_thread.start()
+        # Travail de fond des tours (délai de grâce) : l'exécuteur adopte les
+        # orphelins de ses tours (codes de sortie), et les suit.
+        self.background.start_monitor(self.stop)
+        if not self.background.subreaper:
+            log_async("travail de fond des tours : pas de sous-moissonneur sur cet OS, "
+                      "codes de sortie inconnus")
         # L106 : après l'écoute (un réveil n'attend pas ces vérifications)
         self.log_harnesses()
         self.report_boot_orphans()
@@ -4133,6 +4806,8 @@ class Runner:
                 if self._sigterm_drained():
                     log_async("retrait terminé après SIGTERM : arrêt")
                     break
+                if self.draining.is_set() and self._drained():
+                    break  # `shutdown` rend les baux et arrête ce qui resterait
                 try:
                     self.power_guard()
                 except Exception as exc:  # la garde ne fait jamais tomber l'exécuteur
@@ -4282,6 +4957,32 @@ def _attach_env(cfg: Config, name: str, owner: str, epoch: int) -> dict:
     return env
 
 
+def _attach_tmp_env(cfg: Config, name: str, base_env: dict, holds: list) -> dict:
+    """L162 : le dossier temporaire de l'agent (sur disque) et les caches gérés
+    pour une session `attach`, comme pour un tour de l'exécuteur — sans vider
+    le dossier (la session est celle de l'agent). Politique de la fiche Host
+    (canons lus sur place) ; jamais bloquant : sans ménage possible, la
+    session part avec l'environnement d'origine. L219 : le dossier reste
+    verrouillé jusqu'à la fin de la session (le verrou est ajouté à `holds`,
+    que l'appelant relâche)."""
+    try:
+        from . import canon as canon_mod
+        from . import menage as menage_mod
+        try:
+            canons = canon_mod.load_configured(cfg)
+        except Exception:
+            canons = []
+        policy = menage_mod.effective(canons, cfg.host or "")
+        if not policy.redirect or menage_mod.disabled(base_env):
+            return {}
+        hold = menage_mod.hold_tmp(cfg, policy, name, new_session=False)
+        holds.append(hold)
+        return menage_mod.turn_env(cfg, policy, name, base_env, hold=hold)
+    except Exception as exc:
+        log_async("[%s] attach : dossier temporaire non redirigé (%s)" % (name, exc))
+        return {}
+
+
 def _kill_group(proc: subprocess.Popen) -> None:
     """SIGKILL du groupe du harnais (il est lancé dans sa propre session)."""
     try:
@@ -4415,6 +5116,8 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     argv = adapter.interactive_command(agent.get("session_id"))
     env = _attach_env(cfg, name, owner, epoch)
     env.update(adapter.env())
+    holds: list = []
+    env.update(_attach_tmp_env(cfg, name, env, holds))
     cwd = agent.get("cwd") or None
     if cwd and not os.path.isdir(cwd):
         cwd = None
@@ -4441,6 +5144,8 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
             code = proc.wait()
     finally:
         stop.set()
+        for hold in holds:          # L219: the session is over
+            hold.release()
         thread.join(timeout=5)
         veille.join(timeout=5)
         try:
@@ -4632,19 +5337,25 @@ def main(argv: list[str] | None = None) -> int:
             # gestionnaire de signal peut tomber pendant un autre `print` du
             # fil principal (écriture réentrante sur le même flux).
             if (signum in (signal.SIGTERM, signal.SIGINT) and runner.can_drain_on_sigterm()
-                    and not runner.sigterm_requested and not runner.stop.is_set()):
-                # L114b : premier SIGTERM d'un exécuteur médié — retrait au
-                # point sûr (90 s au plus), puis baux rendus ; un second
-                # signal arrête tout de suite. Le retrait est engagé par la
-                # boucle principale (aucun verrou pris ici).
-                runner.sigterm_requested = True
+                    and not runner.stop.is_set()):
+                if not runner.sigterm_requested:
+                    # L114b : premier SIGTERM d'un exécuteur médié — retrait au
+                    # point sûr (90 s au plus), puis baux rendus ; un second
+                    # signal arrête tout de suite. Le retrait est engagé par la
+                    # boucle principale (aucun verrou pris ici).
+                    runner.sigterm_requested = True
+                    runner.wake_all.set()
+                    log_async("signal %d reçu : retrait de l'hôte (%ds au plus), puis arrêt"
+                              % (signum, int(runner.host_gate.drain_s)))
+                    return
+                # Second signal during the host withdrawal: immediate stop.
+                runner.stop.set()
                 runner.wake_all.set()
-                log_async("signal %d reçu : retrait de l'hôte (%ds au plus), puis arrêt"
-                          % (signum, int(runner.host_gate.drain_s)))
+                log_async("signal %d received: second signal, immediate stop" % signum)
                 return
-            runner.stop.set()
-            runner.wake_all.set()
-            log_async("signal %d reçu : arrêt propre" % signum)
+            # Classic executor: first signal drains, second stops immediately
+            # (`request_stop`).
+            runner.request_stop(signum)
 
         signal.signal(signal.SIGTERM, handler)
         signal.signal(signal.SIGINT, handler)

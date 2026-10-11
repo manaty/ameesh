@@ -35,6 +35,13 @@ def main() -> int:
     session = "dsh-session-1"
     if "--session-id" in args:
         session = args[args.index("--session-id") + 1]
+        # L166 : session fille refusée, comme `assertAdoptable` du vrai dsh
+        if session in os.environ.get("AMEESH_TEST_DSH_CHILD_SESSIONS", "").split(","):
+            message = ('session "%s" is a subagent or forked session and cannot be '
+                       'driven directly' % session)
+            print(json.dumps({"type": "error", "message": message}), flush=True)
+            print("dsh: %s" % message, file=sys.stderr, flush=True)
+            return 1
     print(json.dumps({"type": "session", "sessionId": session}), flush=True)
     print(json.dumps({"type": "text", "text": "bonjour du faux dsh (session %s)" % session}),
           flush=True)

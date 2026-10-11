@@ -143,6 +143,14 @@ class TurnResources(interface.TurnResources):
             (bool(orphan), _array(containers), turn_id),
         )
 
+    def begin_grace(self, turn_id, containers=None) -> None:
+        self.db.query(
+            "UPDATE turn_resources SET ended_at = now(),"
+            " containers = coalesce(nullif(" + _ARRAY_SQL + ", '{}'), containers)"
+            " WHERE turn_id = %s AND status = 'running' RETURNING id",
+            (_array(containers), turn_id),
+        )
+
     def mark_orphan(self, turn_id, containers=None) -> None:
         self.db.query(
             "UPDATE turn_resources SET status = 'orphan',"
@@ -180,11 +188,28 @@ class TurnResources(interface.TurnResources):
         if host:
             where = " AND host = %s"
             params.append(host)
+        # une ligne en délai de grâce (`ended_at` posé, toujours `running`)
+        # se juge sur la fin de son tour, pas sur son début
         return self.db.query(
             "SELECT " + TURN_COLUMNS + " FROM turn_resources"
             " WHERE status = 'running'"
-            "   AND started_at < now() - make_interval(secs => %s)" + where +
-            " ORDER BY started_at, id", tuple(params))
+            "   AND coalesce(ended_at, started_at) < now() - make_interval(secs => %s)"
+            + where + " ORDER BY started_at, id", tuple(params))
+
+    def churn(self, since_ts, short_s) -> list[dict]:
+        return self.db.query(
+            """
+            SELECT agent, count(*)::int AS turns,
+                   (count(*) FILTER (WHERE ended_at - started_at
+                                     < make_interval(secs => %s)))::int AS short_turns,
+                   extract(epoch from min(started_at) FILTER (
+                       WHERE ended_at - started_at
+                             < make_interval(secs => %s)))::float8 AS first_short_ts
+              FROM turn_resources
+             WHERE ended_at IS NOT NULL AND started_at >= to_timestamp(%s)
+             GROUP BY agent
+             ORDER BY agent
+            """, (float(short_s), float(short_s), float(since_ts)))
 
 
 class Visibility(interface.Visibility):

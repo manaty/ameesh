@@ -77,6 +77,14 @@ def _as_count(value, default: int) -> int:
     return int(nombre)
 
 
+def _as_seconds(value, default: float) -> float:
+    """Durée ≥ 0 en secondes (L125) ; illisible, négative ou infinie : défaut."""
+    nombre = _as_float(value, float(default))
+    if nombre != nombre or nombre in (float("inf"), float("-inf")) or nombre < 0:
+        return float(default)
+    return nombre
+
+
 def _as_names(value) -> tuple[str, ...]:
     """Liste de noms séparés par des virgules -> tuple propre (ordre gardé)."""
     return tuple(n.strip() for n in str(value or "").split(",") if n.strip())
@@ -157,6 +165,12 @@ class Config:
     #: regroupement des événements (C9) : au plus un réveil par ce délai,
     #: sauf événement `urgent`. 0 = aucun regroupement.
     event_coalesce: float = 120.0
+    #: L125 : fenêtre de regroupement du courrier ordinaire (secondes) — un
+    #: agent au repos n'est réveillé qu'au bout de ce délai après l'arrivée
+    #: du premier message, et son tour emporte tout ce qui est arrivé entre-
+    #: temps ; un message urgent ou d'un humain réveille tout de suite.
+    #: Réglable par agent (`ameesh set <agent> mail_batch=…`). 0 = réveil immédiat.
+    mail_batch: float = 90.0
     #: plafond (octets UTF-8) de la consigne entière d'un tour de courrier ;
     #: au-delà, les messages les plus récents attendent le tour suivant
     prompt_mail_max: float = 20000.0
@@ -193,8 +207,16 @@ class Config:
     turn_max_seconds: float = 1800.0
     #: L105 : messages remis par le hook de courrier pendant un même tour ;
     #: les suivants attendent le tour suivant, et l'agent est invité à
-    #: conclure. Réglable par agent (`ameesh set turn_mail_max=…`). 0 = sans borne.
-    turn_mail_max: int = 5
+    #: conclure (jamais tant qu'un travail lancé pendant le tour tourne encore).
+    #: Réglable par agent (`ameesh set turn_mail_max=…`). 0 = sans borne.
+    #: 20 depuis le 2026-10-11 (5 coupait un tour sur deux sous un fort courrier).
+    turn_mail_max: int = 20
+    #: travail de fond d'un tour (correctif du 2026-10-11) : à la fin d'un tour
+    #: normal, ce qui tourne encore (processus du groupe du tour, conteneurs du
+    #: tour sans lot) a ce délai (secondes) avant le nettoyage habituel ;
+    #: réglable par agent (`ameesh set turn_grace_seconds=…`). 0 = nettoyage
+    #: immédiat (comportement d'avant).
+    turn_grace_seconds: float = 1200.0
     #: L48 : échecs de tour — attente maximale entre deux tours en échec, durée
     #: sous laquelle un échec est « rapide », série d'échecs rapides qui arrête l'agent
     failure_backoff_max: float = 300.0
@@ -209,6 +231,12 @@ class Config:
     #: L106 : arrêt propre sur batterie critique — délai laissé aux tours en
     #: cours pour finir avant d'être arrêtés (SIGTERM, consigne remise en attente)
     power_stop_grace: float = 120.0
+    #: arrêt de l'exécuteur (SIGTERM de systemd, SIGINT) : drainage — plus de
+    #: nouveau tour, le tour en cours et son travail de fond finissent dans
+    #: cette borne (secondes), puis arrêt ; 0 = arrêt immédiat (le tour en
+    #: cours est arrêté, sa consigne remise en attente). Un second signal
+    #: arrête tout de suite. L'unité systemd garde TimeoutStopSec au-dessus.
+    drain_seconds: float = 1800.0
     #: politique de session par défaut d'un agent sans réglage (0025, L26) :
     #: `par-lot` (rotation au changement de lot, plus la rotation sur la
     #: taille), `taille` (rotation sur la taille seulement), `jamais`
@@ -321,6 +349,16 @@ class Config:
     host_mediated: bool = False
     #: délai de retrait quand l'état `draining` ne donne pas d'échéance (s)
     host_gate_drain: float = 90.0
+    #: issues GitHub des lots (L126) : la clé `github` du fichier de
+    #: configuration de l'HÔTE, telle quelle (`projects` : projet → dépôt,
+    #: `host` : hôte désigné pour la projection automatique, `interval`,
+    #: `exclude_terms`), validée par `ameesh.plan_github`. Jamais de secret
+    #: ici : le jeton de `gh` reste dans son environnement.
+    github: dict = field(default_factory=dict)
+    #: radar de conflits entre lots (L160b) : la clé `radar` du fichier de
+    #: configuration de l'HÔTE désigné (`projects` : projet → dépôt et dossier
+    #: des migrations), validée par `ameesh.radar`.
+    radar: dict = field(default_factory=dict)
 
     @property
     def responsible_required(self) -> bool:
@@ -430,6 +468,8 @@ def load(env: dict | None = None) -> Config:
         poll=_as_float(pick("AMEESH_POLL", "AGENT_MESH_POLL"), cfg.poll),
         event_coalesce=_as_float(
             pick("AMEESH_EVENT_COALESCE", "AGENT_MESH_EVENT_COALESCE"), cfg.event_coalesce),
+        mail_batch=_as_seconds(pick("AMEESH_MAIL_BATCH"),
+                               _as_seconds(cfg.mail_batch, Config.mail_batch)),
         prompt_mail_max=_as_float(pick("AMEESH_PROMPT_MAIL_MAX"), cfg.prompt_mail_max),
         canon_sync_interval=_as_float(
             pick("AMEESH_CANON_SYNC_INTERVAL", "AGENT_MESH_CANON_SYNC_INTERVAL"),
@@ -465,6 +505,8 @@ def load(env: dict | None = None) -> Config:
         turn_max_seconds=max(0.0, _as_float(pick("AMEESH_TURN_MAX_SECONDS"),
                                             cfg.turn_max_seconds)),
         turn_mail_max=_as_count(pick("AMEESH_TURN_MAIL_MAX"), cfg.turn_mail_max),
+        turn_grace_seconds=float(_as_count(pick("AMEESH_TURN_GRACE_SECONDS"),
+                                           int(cfg.turn_grace_seconds))),
         failure_backoff_max=_as_float(pick("AMEESH_FAILURE_BACKOFF_MAX"),
                                       cfg.failure_backoff_max),
         fast_failure_s=_as_float(pick("AMEESH_FAST_FAILURE_S"), cfg.fast_failure_s),
@@ -472,6 +514,7 @@ def load(env: dict | None = None) -> Config:
                                         cfg.max_fast_failures)),
         host_retry_max=_as_float(pick("AMEESH_HOST_RETRY_MAX"), cfg.host_retry_max),
         power_stop_grace=_as_float(pick("AMEESH_POWER_STOP_GRACE"), cfg.power_stop_grace),
+        drain_seconds=float(_as_count(pick("AMEESH_DRAIN_SECONDS"), int(cfg.drain_seconds))),
         session_policy=str(pick("AMEESH_SESSION_POLICY", default=cfg.session_policy)
                            or "par-lot").strip(),
         balance_interval=_as_float(pick("AMEESH_BALANCE_INTERVAL"), cfg.balance_interval),

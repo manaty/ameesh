@@ -144,8 +144,12 @@ class CourrierDansLaConsigneTest(PgTestCase):
         self.assertEqual(mail.unread(self.db, "plafond"), [])
 
     def test_plafond_compte_le_resume_de_reprise(self):
-        _runner, worker = self._worker("resume", prompt_max_bytes=3000)
-        worker.resume_summary = "état du lot : " + "décision prise. " * 30
+        resume = "état du lot : " + "décision prise. " * 30
+        # le plafond laisse au courrier un peu plus que son minimum, cadre de
+        # reprise et résumé compris (le cadre est compté, quelle que soit sa taille)
+        plafond = mail.octets(adapters.resume_prompt(resume)) + mail.PROMPT_MIN_BYTES + 500
+        _runner, worker = self._worker("resume", prompt_max_bytes=plafond)
+        worker.resume_summary = resume
         for i in range(10):
             mail.send(self.db, "orch", "resume", "note %d " % i + "à relire " * 30)
         spec = worker.pick()
@@ -153,8 +157,11 @@ class CourrierDansLaConsigneTest(PgTestCase):
             self.assertTrue(worker.run_turn(spec))
         consigne = self._consigne()
         self.assertTrue(consigne.startswith("Reprise de session après rotation"))
-        self.assertLessEqual(mail.octets(consigne), 3000)
+        self.assertLessEqual(mail.octets(consigne), plafond)
         self.assertIn("note 0 ", consigne)
+        # le courrier suit le bloc du résumé, jamais dedans
+        self.assertLess(consigne.index("</resume-de-session>"), consigne.index("note 0 "))
+        self.assertLess(len(spec["ids"]), 10, "le plafond a bien retenu du courrier")
 
     def test_message_trop_long_tronque_mais_jamais_bloquant(self):
         _runner, worker = self._worker("long", prompt_max_bytes=2000)

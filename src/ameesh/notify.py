@@ -5,12 +5,22 @@
                 [--long-turn S] [--idle-mail S] [--dead-grace S]
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
                 [--take-idle S] [--take-max-per-hour N] [--take-paid]
+                [--take-lot-idle S] [--take-lot-max-per-hour N]
         suit les alertes d'exploitation (`ameesh alerts --follow`, mêmes
         seuils, mêmes clés de dédoublonnage) et envoie chaque alerte levée
         et chaque résolution à l'humain responsable, sur ses canaux.
         L119 (0037) : à chaque passage, la prise automatique confie un
         élément de la file d'amélioration aux agents au repos
         (`ameesh.backlog.auto_take`) ; `--take-idle 0` la coupe.
+        L165 : avant la file, un agent au repos depuis `--take-lot-idle`
+        (défaut 15 min) prend le lot non assigné le plus prioritaire de son
+        équipe et l'orchestrateur en est prévenu ; `--take-lot-idle 0` la
+        coupe.
+        L126 : sur l'hôte que désigne la clé `github` de la configuration,
+        chaque passage tient aussi les issues GitHub des lots
+        (`ameesh.plan_github.Projector`) et relève la CI en cours : chaque
+        test en échec part au courrier de l'agent du lot (L161c,
+        `ameesh.ci.Watcher`).
   ameesh notify --test human:<id> [--json]
         envoie un message de test sur chacun des canaux de cet humain.
 
@@ -57,7 +67,7 @@ from dataclasses import dataclass, field
 
 from . import config as config_mod
 from . import db as db_mod
-from . import exploitation, fil, sous_utilisation, storage
+from . import alert_briefs, exploitation, fil, sous_utilisation, storage
 from .config import Config
 
 NOTIFY_SCHEMA = "ameesh-notify/1"
@@ -72,7 +82,12 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "delegation_expired", "engagement_overdue", "plan_underused",
                  "idle_capacity", "orchestrator_held", "host_underused", "balance_low",
                  "host_not_ready", "host_power_low",
-                 "host_unavailable", "host_drain_overdue", "backlog_empty")
+                 "host_unavailable", "host_drain_overdue", "backlog_empty", "mail_undeliverable",
+                 # L124 : une demande de décision attend le propriétaire, et sa
+                 # relance à l'échéance (urgentes si la demande l'est)
+                 "decision_pending", "decision_overdue",
+                 # L161c : la CI de main est rouge (elle bloque les déploiements)
+                 "ci_main_red")
 CHANNEL_KINDS = ("desktop", "ntfy", "slack")
 DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
@@ -120,9 +135,24 @@ TYPE_LABELS = {
     "host_unavailable": "hôte indisponible",
     "host_drain_overdue": "retrait d'hôte en retard",
     "backlog_empty": "file d'amélioration vide",
+    "mail_undeliverable": "courrier en souffrance",
+    "decision_pending": "décision attendue",
+    "decision_overdue": "décision sans réponse à l'échéance",
+    # L125 : mesure de l'effet du regroupement du courrier ; pas poussée par
+    # défaut (à ajouter dans `notify.types` pour la recevoir)
+    "turn_churn": "tours courts en rafale",
+    # L157b : adressée aux agents (alert_briefs) ; pas poussée aux humains par
+    # défaut (à ajouter dans `notify.types` pour la recevoir)
+    "estimate_bias": "biais d'estimation",
+    "ci_main_red": "CI rouge sur main",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
-URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired")
+URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",
+                "mail_undeliverable", "ci_main_red")
+#: L124 : types dont la résolution n'est pas envoyée — une décision se résout
+#: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
+#: redire serait du bruit. La résolution est journalisée.
+QUIET_RESOLUTION_TYPES = ("decision_pending", "decision_overdue")
 
 _TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -388,6 +418,8 @@ def _subject(alert: dict) -> str:
             parts.append("fenêtre %s" % _clean(alert["gauge"], 32))
     if alert.get("agent"):
         parts.append("agent %s" % _clean(alert["agent"], 64))
+    if alert.get("decision") is not None:
+        parts.append("décision #%s" % alert["decision"])
     if alert.get("lot") is not None:
         lot = "lot #%s" % alert["lot"]
         if alert.get("title"):
@@ -776,7 +808,7 @@ def state_path(cfg: Config) -> str:
 
 def empty_state() -> dict:
     return {"schema": STATE_SCHEMA, "active": {}, "resolved": {}, "rate": {},
-            "summary": {}, "last_summary": {}}
+            "summary": {}, "last_summary": {}, "briefs": {}}
 
 
 def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
@@ -829,7 +861,9 @@ _KEPT = ("type", "agent", "lot", "title", "host", "since", "detail", "reason", "
          "responsible", "stop_reason", "assignee", "harness", "account", "gauge",
          "provider", "currency", "urgent",
          # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
-         "commitment", "package", "due")
+         "commitment", "package", "due",
+         # L124 : `decision_pending`, `decision_overdue`
+         "decision")
 
 
 # --------------------------------------------------------------------------
@@ -856,6 +890,10 @@ class Notifier:
         self.emit = emit or (lambda record: None)
         self.log = log or _stderr_log
         self.clock = clock or time.time
+        #: L126 : projection des lots en issues GitHub (créée au premier passage)
+        self._projector = None
+        #: L161c : relevé de la CI, échecs au courrier de l'agent du lot
+        self._ci_watcher = None
 
     # -- passage --------------------------------------------------------------
     def run_pass(self, db, current: list | None = None, thresholds: dict | None = None,
@@ -885,12 +923,14 @@ class Notifier:
                     "raised_ts": now, "human": None, "source": None, "status": "nouvelle",
                     "channels": {}}
                 self._raise(entry, router, now)
-                self._brief_orchestrators(db, alert, router)
+                if alert.get("type") not in alert_briefs.BRIEFED_TYPES:
+                    self._brief_orchestrators(db, alert, router)
             elif entry["status"] in ("sans_destinataire", "sans_canal"):
                 # un responsable (ou une route) a pu apparaître depuis
                 self._raise(entry, router, now)
             else:
                 self._retry(entry, "raised", now)
+        self._brief_agents(db, current, router, now)
         for key in list(self.state["resolved"]):
             entry = self.state["resolved"][key]
             self._retry(entry, "resolved", now)
@@ -899,6 +939,8 @@ class Notifier:
         self._summaries(now)
         if self.take:
             self._auto_take(db, current, now)
+        self._github_issues(db, now)
+        self._ci_failures(db)
         for human in list(self.state["rate"]):
             window = [t for t in self.state["rate"][human] if now - t < RATE_WINDOW_S]
             if window:
@@ -906,6 +948,39 @@ class Notifier:
             else:
                 del self.state["rate"][human]
         return records
+
+    # -- issues GitHub des lots (L126) ------------------------------------------
+    def _github_issues(self, db, now: float) -> None:
+        """Chaque lot a son issue GitHub, tenue par ameesh : la projection
+        tourne ici, sur l'hôte que désigne la clé `github` de la configuration
+        (`plan_github.Projector`). Sans cette clé, rien ; une erreur (GitHub,
+        `gh`, base) est journalisée et ne touche jamais aux alertes."""
+        if not getattr(self.cfg, "github", None):
+            return
+        from . import plan_github
+        try:
+            if self._projector is None:
+                self._projector = plan_github.Projector(
+                    self.cfg, dry_run=self.dry_run, log=self.log, clock=self.clock)
+            self._projector.tick(db, now)
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au passage des alertes
+            self.log("issues GitHub : passage en échec (%s)" % _clean(exc, 200))
+
+    # -- échecs de CI au courrier de l'agent du lot (L161c) ----------------------
+    def _ci_failures(self, db) -> None:
+        """Le relevé de la CI (`ci.Watcher`), sur le même hôte désigné que les
+        issues (`github.host`). Une erreur est journalisée, jamais fatale."""
+        if not getattr(self.cfg, "github", None):
+            return
+        from . import ci
+        try:
+            if self._ci_watcher is None:
+                self._ci_watcher = ci.Watcher(self.cfg, dry_run=self.dry_run, log=self.log,
+                                              clock=self.clock)
+            for record in self._ci_watcher.tick(db):
+                self.log(ci.describe(record))
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au passage des alertes
+            self.log("CI : relevé en échec (%s)" % _clean(exc, 200))
 
     # -- prise automatique (L119, décision 0037) ------------------------------
     def _auto_take(self, db, current: list, now: float) -> None:
@@ -922,7 +997,9 @@ class Notifier:
             item = take["item"]
             entry = {"alert": {"type": "auto_take", "agent": take["agent"],
                                "lot": int(item["id"]), "title": item.get("title")},
-                     "human": None, "source": "file d'amélioration"}
+                     "human": None,
+                     "source": "lot de l'équipe" if take.get("kind") == "lot"
+                     else "file d'amélioration"}
             self._record("auto_take", entry, "a_blanc" if self.dry_run else "prise", {})
 
     # -- levée ----------------------------------------------------------------
@@ -963,16 +1040,22 @@ class Notifier:
     def _brief_orchestrators(self, db, alert: dict, router: Router) -> None:
         """`idle_capacity` levée : l'orchestrateur de chaque projet reçoit, par
         courrier `event`, ses agents au repos sans lot et les lots ouverts sans
-        agent — c'est lui qui peut répartir. Une fois par levée (même
-        dédoublonnage que les canaux) ; jamais fatal au passage."""
+        agent — c'est lui qui peut répartir. `mail_undeliverable` levée : les
+        orchestrateurs de l'équipe reçoivent le courrier en souffrance et le
+        geste (`ameesh mail forward`). Une fois par levée (même dédoublonnage
+        que les canaux) ; jamais fatal au passage."""
+        from . import undeliverable
         try:
-            listing = list(router.agents().values())
-            titles = {}
-            for lot in (alert.get("lots") or ())[:12]:
-                item = storage.of(db).work.get(int(lot))
-                if item:
-                    titles[int(lot)] = item.get("title") or ""
-            briefs = sous_utilisation.orchestrator_briefs(alert, listing, titles)
+            if alert.get("type") == "mail_undeliverable":
+                briefs = undeliverable.orchestrator_briefs(alert)
+            else:
+                listing = list(router.agents().values())
+                titles = {}
+                for lot in (alert.get("lots") or ())[:12]:
+                    item = storage.of(db).work.get(int(lot))
+                    if item:
+                        titles[int(lot)] = item.get("title") or ""
+                briefs = sous_utilisation.orchestrator_briefs(alert, listing, titles)
         except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
             self.log("courrier aux orchestrateurs non préparé (%s)" % exc)
             return
@@ -983,20 +1066,102 @@ class Notifier:
                          % (alert.get("type"), orch, text))
                 continue
             try:
-                mail.send(db, work.SYSTEM_SENDER, orch, text, kind="event",
-                          payload={"alert": alert.get("type"),
-                                   "agents": list(alert.get("agents") or ()),
-                                   "lots": list(alert.get("lots") or ())})
+                payload = {"alert": alert.get("type"),
+                           "agents": list(alert.get("agents") or ()),
+                           "lots": list(alert.get("lots") or ())}
+                if alert.get("type") == "mail_undeliverable":
+                    payload.update(recipient=alert.get("agent"), reason=alert.get("reason"),
+                                   count=alert.get("value"))
+                mail.send(db, work.SYSTEM_SENDER, orch, text, kind="event", payload=payload)
                 self.log("[%s] courrier déposé pour l'orchestrateur %s"
                          % (alert.get("type"), orch))
             except Exception as exc:  # noqa: BLE001
                 self.log("[%s] courrier à l'orchestrateur %s non déposé (%s)"
                          % (alert.get("type"), orch, exc))
 
+    # -- agents qui peuvent agir (L132) ---------------------------------------
+    def _brief_agents(self, db, current: list, router: Router, now: float) -> None:
+        """`idle_capacity`, `stale_lot`, `plan_underused` : courrier `event` aux
+        orchestrateurs et à l'auditeur, avec l'action attendue
+        (`alert_briefs`). Une fois à la levée, une relance si l'alerte dure
+        `REMIND_AFTER_S` ; indépendant de `notify.types` (qui ne règle que
+        l'humain). Jamais fatal au passage."""
+        sent = self.state["briefs"]
+        alive = {key_of(a): a for a in current if a.get("type") in alert_briefs.BRIEFED_TYPES}
+        for key in list(sent):
+            if key not in alive:
+                del sent[key]
+        due = []
+        for key, alert in alive.items():
+            entry = sent.get(key)
+            if entry is None:
+                due.append((key, alert, None))
+            elif not entry.get("reminded") and now - float(entry["sent_ts"]) \
+                    >= alert_briefs.REMIND_AFTER_S:
+                due.append((key, alert, entry))
+        if not due:
+            return
+        from . import mail, work
+        try:
+            listing = list(router.agents().values())
+            from . import canon as canon_mod
+            try:
+                canons = canon_mod.load_configured(self.cfg) if self.cfg.canon else []
+            except Exception:  # noqa: BLE001 - sans canon : l'agent `auditeur` seul
+                canons = []
+            auditors = alert_briefs.auditors(listing, canons)
+        except Exception as exc:  # noqa: BLE001
+            self.log("courrier aux agents non préparé (%s)" % exc)
+            return
+        for key, alert, entry in due:
+            kind = alert.get("type")
+            try:
+                titles = {}
+                for lot in (alert.get("lots") or ())[:12]:
+                    item = storage.of(db).work.get(int(lot))
+                    if item:
+                        titles[int(lot)] = item.get("title") or ""
+                briefs = alert_briefs.briefs(alert, listing, titles, auditors)
+            except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
+                self.log("[%s] courrier aux agents non préparé (%s)" % (kind, exc))
+                continue
+            if not briefs:
+                continue        # personne à prévenir : on réessaie au passage suivant
+            if entry is not None:
+                raised = float(entry["sent_ts"])
+                briefs = {n: alert_briefs.reminder(t, raised, now) for n, t in briefs.items()}
+            payload = {"alert": kind, "reminder": entry is not None}
+            for field_ in ("lot", "agents", "lots", "harness", "account", "gauge",
+                           "idle_agents"):
+                if alert.get(field_) is not None:
+                    payload[field_] = alert[field_]
+            # pas de `work_item_id` : un message lié au lot compterait comme
+            # son activité (stagnation) et effacerait l'alerte qu'il signale
+            for name, text in sorted(briefs.items()):
+                if self.dry_run:
+                    self.log("[%s] courrier à %s (essai) : %s" % (kind, name, text))
+                    continue
+                try:
+                    mail.send(db, work.SYSTEM_SENDER, name, text, kind="event",
+                              payload=payload)
+                    self.log("[%s] %s déposé pour %s" % (
+                        kind, "relance" if entry is not None else "courrier", name))
+                except Exception as exc:  # noqa: BLE001
+                    self.log("[%s] courrier à %s non déposé (%s)" % (kind, name, exc))
+            if entry is None:
+                sent[key] = {"type": kind, "sent_ts": now, "reminded": False,
+                             "to": sorted(briefs)}
+            else:
+                entry["reminded"] = True
+
     # -- résolution -----------------------------------------------------------
     def _resolved(self, key: str, entry: dict, now: float) -> None:
         alert, human = entry["alert"], entry.get("human")
         status = entry.get("status")
+        if alert.get("type") in QUIET_RESOLUTION_TYPES:
+            # L124 : l'humain a répondu (ou la demande est retirée) : rien à envoyer
+            self._record("resolved", entry, "sans_envoi", {})
+            return
         if status in ("sans_destinataire", "sans_canal", "nouvelle"):
             self.log("alerte résolue [%s] %s (jamais envoyée : %s)" % (
                 alert.get("type"), _subject(alert), status.replace("_", " ")))
@@ -1230,17 +1395,37 @@ def build_parser() -> argparse.ArgumentParser:
                         default=os.environ.get("AMEESH_TAKE_PAID", "") == "1",
                         help="autoriser la prise par des agents payés au token (après les "
                              "agents au forfait ; jamais pendant balance_low)")
+    # L165 : prise d'un lot non assigné de l'équipe, avant la file
+    parser.add_argument("--take-lot-idle", type=float,
+                        default=exploitation._env_float("AMEESH_TAKE_LOT_IDLE",
+                                                        backlog.DEFAULT_LOT_IDLE_S),
+                        help="un agent réveillable au repos sans lot depuis S secondes prend "
+                             "le lot non assigné le plus prioritaire de son équipe (défaut "
+                             "900 ; 0 coupe cette prise)")
+    parser.add_argument("--take-lot-max-per-hour", type=int,
+                        default=int(exploitation._env_float(
+                            "AMEESH_TAKE_LOT_MAX_PER_HOUR", backlog.DEFAULT_LOT_MAX_PER_HOUR)),
+                        help="lots de l'équipe pris au plus par heure glissante, pour tout le "
+                             "mesh (défaut 6)")
     return parser
 
 
 def take_settings(args) -> dict | None:
-    """Réglages de `backlog.auto_take` lus des options ; None si la prise est coupée."""
+    """Réglages de `backlog.auto_take` lus des options ; None si les deux
+    prises (file d'amélioration, lots de l'équipe) sont coupées."""
     idle = float(getattr(args, "take_idle", 0) or 0)
     most = int(getattr(args, "take_max_per_hour", 0) or 0)
+    lot_idle = float(getattr(args, "take_lot_idle", 0) or 0)
+    lot_most = int(getattr(args, "take_lot_max_per_hour", 0) or 0)
     if idle <= 0 or most <= 0:
+        idle, most = 0.0, 0
+    if lot_idle <= 0 or lot_most <= 0:
+        lot_idle, lot_most = 0.0, 0
+    if not most and not lot_most:
         return None
     return {"idle_s": idle, "max_per_hour": most,
-            "allow_paid": bool(getattr(args, "take_paid", False))}
+            "allow_paid": bool(getattr(args, "take_paid", False)),
+            "lot_idle_s": lot_idle, "lot_max_per_hour": lot_most}
 
 
 def _interval(args, ncfg: NotifyConfig) -> float:

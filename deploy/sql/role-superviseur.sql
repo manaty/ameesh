@@ -46,7 +46,7 @@
 --     inutiles à la supervision ; l'empreinte suffit :
 --       agent_registry.public_key (et la vue agent_mesh_overview)
 --       authenticators.public_key, .credential_id
---   * exécuteurs médiés (voie B, 0051 et 0052) — empreintes de jetons et de
+--   * exécuteurs médiés (voie B, 0062 et 0063) — empreintes de jetons et de
 --     codes, identifiants d'assertions, clé et attestation d'appareil,
 --     réponses rejouables du cache d'idempotence :
 --       executor_tokens.token_sha256, executor_invitations.code_sha256,
@@ -70,6 +70,7 @@
 --       work_item_events.note
 --       work_item_milestones.note
 --       mesh_approvals.meta (et mesh_approvals_status)
+--       ci_test_failures.excerpt (sortie d'un test en échec, L161c)
 --
 -- Restent lisibles, comme ÉTAT : titres de lots (work_items.title), valeur
 -- attendue des éléments de la file d'amélioration (work_items.expected_value,
@@ -178,6 +179,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'context_max_tokens',
         -- L105 (0046) : plafonds du tour (des nombres, pas de contenu)
         'turn_max_seconds', 'turn_mail_max',
+        -- 0051 : délai de grâce du travail de fond d'un tour (un nombre)
+        'turn_grace_seconds',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
         'canon'
     ]),
@@ -291,7 +294,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'spend_key',
         -- L95 (0043) : raison d'une ligne écartée des sommes
         'void_reason',
-        -- L111 (0053) : provenance (harness, relay, device) et bail
+        -- L111 (0064) : provenance (harness, relay, device) et bail
         'source', 'executor', 'lease_owner', 'lease_epoch'
     ]),
     -- corrections du grand livre (L95, 0043) : copie d'une ligne de
@@ -300,7 +303,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'run_id', 'turn_cost_id', 'kind', 'reason', 'old_row', 'new_values',
         'actor', 'at'
     ]),
-    -- exécuteurs médiés (voie B : 0051, 0052) : de l'ÉTAT, jamais une
+    -- exécuteurs médiés (voie B : 0062, 0063) : de l'ÉTAT, jamais une
     -- empreinte de jeton ou de code, ni une réponse rejouable
     ('exec_idempotency', ARRAY[
         'executor_id', 'key', 'op', 'request_sha256', 'status', 'at'
@@ -366,6 +369,18 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L63 (0048) : heure de démarrage du PID lié, secondes epoch
         'pid_started_at'
     ]),
+    -- L161c (0055) : exécutions de CI relevées et leurs tests en échec (de
+    -- l'ÉTAT : noms de tests, commandes pour rejouer ; l'extrait de sortie
+    -- est un CONTENU)
+    ('ci_runs', ARRAY[
+        'repo', 'run_id', 'head_sha', 'branch', 'event', 'base', 'work_item_id',
+        'status', 'superseded_by', 'url', 'first_seen_at', 'concluded_at',
+        'urgent_message_id', 'verdict_message_id'
+    ]),
+    ('ci_test_failures', ARRAY[
+        'repo', 'run_id', 'part', 'test', 'module', 'status', 'inherited', 'replay',
+        'duration_s', 'failed_at', 'message_id', 'recorded_at'
+    ]),
     ('work_item_events', ARRAY[
         'id', 'work_item_id', 'state', 'actor', 'created_at'
     ]),
@@ -387,7 +402,39 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'expected_value', 'value_score', 'priority', 'team',
         'required_capabilities',
         -- L118 (0050) : branche du lot, sa cible, dernier commit vu en avance
-        'branch', 'branch_target', 'branch_head'
+        'branch', 'branch_target', 'branch_head',
+        -- L157 (0052) : durée estimée (minutes, source courte, auteur,
+        -- instant) et début mesuré du travail — de l'ÉTAT, comme les dates
+        -- prévues
+        'estimate_minutes', 'estimate_source', 'estimate_by', 'estimate_at',
+        'started_at',
+        -- L122 (0053) : numéro de migration réservé par le lot
+        'migration',
+        -- L157b (0054) : taille déclarée du changement
+        'change_size'
+    ]),
+    -- L157 (0052) : historique des estimations d'un lot (de l'ÉTAT)
+    ('work_item_estimates', ARRAY[
+        'id', 'work_item_id', 'minutes', 'source', 'estimated_by', 'at'
+    ]),
+    -- L157b (0054) : tables de référence des durées publiées par l'auditeur
+    -- (des nombres par type, taille, hôte, harnais et estimateur : de l'ÉTAT)
+    ('estimate_references', ARRAY[
+        'id', 'published_at', 'published_by', 'body'
+    ]),
+    -- L160d (0057): prepared conflict resolutions between two lots (commits,
+    -- ref, conflicting paths: STATE, no content)
+    ('work_resolutions', ARRAY[
+        'work_item_id', 'other_item_id', 'commit_sha', 'lot_tip', 'other_tip', 'ref',
+        'files', 'created_by', 'created_at'
+    ]),
+    -- L157c (0056): actual time of a delivered lot by phase and size of its
+    -- merged diff (durations and line counts: STATE)
+    ('work_item_measures', ARRAY[
+        'work_item_id', 'measured_at', 'started_at', 'merged_at', 'total_minutes',
+        'agent_minutes', 'ci_minutes', 'review_minutes', 'human_minutes', 'ci_runs',
+        'merge_sha', 'diff_files', 'diff_insertions', 'diff_deletions',
+        'measured_size', 'declared_size'
     ]),
     -- L40 (0031) : registre des délégations et de leur issue (de l'ÉTAT)
     ('work_item_delegations', ARRAY[

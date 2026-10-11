@@ -57,9 +57,9 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    restore_prompt end_turn
    pending_spend   put set_model get clear
    turn_costs      last_reading insert spent ledger correct
-   mailbox         send unread unread_urgent get mark_delivered reserve deliver release
-                   unread_counts history pending_recipients
-                   pending_recipients_sorted unread_total
+   mailbox         send unread unread_active unread_urgent get mark_delivered reserve
+                   deliver release unread_counts history pending_recipients
+                   pending_recipients_sorted unread_total dead_letters forward
    wakeups         subscribe notify
    keys            info register revoke registered
    approvals       create recent candidates consume
@@ -69,7 +69,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    refresh_package_parents delegate current_delegation
                    mark_delegate_turn due_delegations resolve_delegation
                    overdue_delegations returned_delegations backlog_add backlog
-                   auto_takes_since
+                   auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
+                   estimates mark_started estimate_history
    packages       all get upsert retire
    actions         get recent attempts events log_event last_event_note
                    decision_queues covering_grants launched propose bind
@@ -90,6 +91,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    progress        lots lot_events lot_milestones lot_actions actions agents costs
                    packages package_items lot_messages
    projects        board
+   decisions       create get pending history pending_for_lot close register_chat
    roadmap         plan_item item_plans plan_package items commitments
                    add_commitment record_proposal set_commitment
    operations      set_settings set_session_work_item listing request_restart
@@ -99,7 +101,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    session_bindings active bind set_pid revoke listing with_pids
    budgets         limits put events
    turn_resources  open_turn close_turn mark_orphan get open_by_agent orphans
-                   stale_running
+                   stale_running churn
    housekeeping    log recent summary last_measure register_worktree worktrees
                    set_worktree_status
 
@@ -470,7 +472,7 @@ class TurnCosts(Domain):
         (L60, migration 0041) : clé du marqueur comptable ; une ligne portant
         déjà cette clé n'est pas réécrite (faux). Vrai si la ligne est écrite.
         `source`, `executor`, `lease_owner`, `lease_epoch` (L111, migration
-        0053) : `relay` pour la mesure du relais de modèle, `device` pour la
+        0064) : `relay` pour la mesure du relais de modèle, `device` pour la
         déclaration d'un appareil médié (hors plafond) ; None = colonnes non
         écrites (`source` vaut alors `harness`)."""
 
@@ -610,6 +612,12 @@ class Mailbox(Domain):
         """Messages non remis, du plus ancien au plus récent."""
 
     @abc.abstractmethod
+    def unread_active(self, recipient: str, limit: int) -> list[dict]:
+        """L125 : messages non remis qui ouvriront un tour — ni accusé, ni
+        copie, ni diffusion non urgents (`mail.passive_reason`) —, du plus
+        ancien au plus récent."""
+
+    @abc.abstractmethod
     def unread_urgent(self, recipient: str, limit: int) -> list[dict]:
         """Messages non remis marqués `payload.urgent`."""
 
@@ -620,6 +628,13 @@ class Mailbox(Domain):
     @abc.abstractmethod
     def mark_delivered(self, ids: Sequence[int]) -> int:
         """Marque remis ; rend le nombre de messages passés remis."""
+
+    @abc.abstractmethod
+    def withdraw(self, ids: Sequence[int], note: dict) -> list[int]:
+        """L161c : retire des messages NON REMIS et sans réservation active
+        (marqués remis sans être montrés, `note` dans `meta.retire`) ; rend
+        les ids retirés. Un message déjà remis ou en cours de remise reste ;
+        seuls les messages de CI d'`ameesh` (`payload.ci`) peuvent l'être."""
 
     @abc.abstractmethod
     def reserve(self, recipient: str, owner: str | None, epoch: int | None,
@@ -659,6 +674,35 @@ class Mailbox(Domain):
     @abc.abstractmethod
     def unread_total(self) -> int:
         """Nombre de messages non remis, tous destinataires confondus (`doctor`)."""
+
+    @abc.abstractmethod
+    def dead_letters(self) -> list[dict]:
+        """Courrier en souffrance : non remis, dont le destinataire est absent du
+        registre ou arrêté. Une ligne par (destinataire, expéditeur) :
+        `recipient`, `sender`, `n`, `oldest_ts`, `newest_ts`, `unknown`."""
+
+    @abc.abstractmethod
+    def forward(self, old: str, new: str, by: str) -> list[dict]:
+        """Re-livre à `new`, en UNE transaction, les messages non remis de `old`
+        (hors réservation active) : une copie garde expéditeur, corps, nature,
+        charge, lot, hôte et date d'origine (`meta.forwarded_from` : agent,
+        message, auteur du renvoi ; la signature, qui couvre le destinataire,
+        ne suit pas) ; l'original passe remis, renvoi noté (`meta.forwarded`).
+        Rend une ligne par message renvoyé : `original_id`, `new_id`,
+        `sender`, `kind`, `work_item_id`, `created_ts`."""
+
+    @abc.abstractmethod
+    def human_messages(self, *, since_ts: float, humans: Sequence[str],
+                       limit: int) -> list[dict]:
+        """L130 : les messages d'humains déposés depuis `since_ts`, du plus
+        ancien au plus récent (les `limit` plus récents) : expéditeur
+        `human:<id>`, marqué humain à l'envoi (`payload.human`), nommé dans
+        `humans` (humains déclarés), ou chat du propriétaire (`chat-…` inscrit
+        `externe`). Sans les accusés (`payload.ack`), les copies
+        (`payload.cc`) ni les demandes de décision. Colonnes : `id`, `sender`,
+        `recipient`, `body`, `kind`, `payload`, `work_item_id`, `lot_id` (le
+        lot existant que désigne `work_item_id`, sinon NULL), `created_ts`.
+        Lecture seule."""
 
 
 # --------------------------------------------------------------------------
@@ -779,10 +823,72 @@ class WorkItems(Domain):
             issue_ref: str | None, workstream: str | None, assignee: str | None,
             budget_usd: float | None, note: str, actor: str,
             package_id: str | None = None, package_parent: str | None = None,
-            branch: str | None = None, branch_target: str | None = None) -> dict:
+            branch: str | None = None, branch_target: str | None = None,
+            priority: int | None = None, estimate_minutes: int | None = None,
+            estimate_source: str | None = None, change_size: str | None = None) -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
-        `package_id`, L29 ; avec sa branche si `branch`, L118) et sa première
-        ligne de journal ; rend le lot."""
+        `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
+        si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
+        si `estimate_minutes`, L157 ; avec la taille déclarée du changement
+        si `change_size`, L157b) et sa première ligne de journal ; rend le
+        lot."""
+
+    @abc.abstractmethod
+    def set_estimate(self, item_id: int, minutes: int, *, source: str | None,
+                     actor: str) -> dict | None:
+        """L157 : pose l'estimation en vigueur d'un lot non terminé, avec sa
+        ligne d'historique (sans journal ni `updated_at`, comme une date
+        prévue) ; None si introuvable ou terminé."""
+
+    @abc.abstractmethod
+    def estimates(self, item_id: int) -> list[dict]:
+        """L157 : l'historique des estimations d'un lot (`minutes`, `source`,
+        `estimated_by`, `at_ts`), de la plus ancienne à la plus récente."""
+
+    @abc.abstractmethod
+    def mark_started(self, agent: str, item_ids, note: str) -> list[int]:
+        """L157 : premier tour de `agent` sur ces lots — ceux qui lui sont
+        assignés, ouverts et sans début mesuré, reçoivent `started_at`
+        (journalisé) ; rend leurs ids."""
+
+    @abc.abstractmethod
+    def estimate_history(self, *, app: str | None, limit: int) -> list[dict]:
+        """L157 : les lots livrés, les plus récents d'abord, avec début mesuré,
+        fusion, estimation en vigueur au début (`late` si posée après),
+        auteur, source et nombre d'estimations."""
+
+    @abc.abstractmethod
+    def publish_reference(self, body: dict, *, actor: str) -> dict:
+        """L157b : publie une table de référence des durées (schéma
+        `ameesh-estimate-reference/1`) ; rend `{id, published_by,
+        published_ts}`."""
+
+    @abc.abstractmethod
+    def reference(self) -> dict | None:
+        """L157b : la table de référence en vigueur, la dernière publiée
+        (`{id, published_by, published_ts, body}`), ou None."""
+
+    @abc.abstractmethod
+    def measure_candidates(self, *, ids: Sequence[int] | None, retry_diff_s: float,
+                           since_s: float | None, limit: int) -> list[dict]:
+        """L157c: delivered lots with a measured start and no measure yet, or
+        measured without a diff (or without CI though the lot has a branch)
+        and merged less than `retry_diff_s` ago (a repository holding the
+        merge commit may show up, `gh` may answer); `since_s`: merged
+        less than this ago only (None: any age). `ids`: only these lots,
+        measured or not, of any age. Rows: `{id, state, assignee, branch,
+        branch_target, change_size, started_ts, merged_ts, merge_sha, measured,
+        has_diff, has_ci}`."""
+
+    @abc.abstractmethod
+    def save_measure(self, item_id: int, measure: dict) -> dict:
+        """L157c: writes (or replaces) the measure of a delivered lot; a
+        measure without diff keeps the diff already stored, one without CI
+        keeps the phases already stored with a known CI. Returns it."""
+
+    @abc.abstractmethod
+    def measure(self, item_id: int) -> dict | None:
+        """L157c: the measure of a lot (phases, diff), or None."""
 
     @abc.abstractmethod
     def set_branch(self, item_id: int, branch: str | None, target: str | None, *,
@@ -791,13 +897,40 @@ class WorkItems(Domain):
         None si le lot n'est plus ouvert."""
 
     @abc.abstractmethod
+    def reserve_migration(self, item_id: int, number: int | None, floor: int, *,
+                          note: str, actor: str, release: bool = False) -> dict | None:
+        """L122 : réserve un numéro de migration au lot ouvert (journalisé) :
+        `number` s'il est donné, sinon le prochain libre, au moins `floor`
+        et au-delà des numéros déjà réservés, sous verrou. `note` peut citer `%(number)04d`. None si le
+        lot n'est plus ouvert ; DbError si le numéro est pris par un autre.
+        `release` libère la réservation."""
+
+    @abc.abstractmethod
+    def migration_holder(self, number: int) -> dict | None:
+        """L122 : le lot (id, titre, état) qui a réservé ce numéro."""
+
+    @abc.abstractmethod
+    def record_resolution(self, item_id: int, other_id: int, *, commit: str, lot_tip: str,
+                          other_tip: str, ref: str | None, files: list[str], note: str,
+                          actor: str) -> dict | None:
+        """L160d (0057): records (or replaces) the resolution prepared by lot
+        `item_id` for its conflict with lot `other_id`, with a journal line on
+        `item_id`. None if either lot is unknown."""
+
+    @abc.abstractmethod
+    def resolutions(self, item_ids: list[int]) -> list[dict]:
+        """L160d (0057): the recorded resolutions where either side is one of
+        `item_ids`, newest first."""
+
+    @abc.abstractmethod
     def set_branch_head(self, item_id: int, branch: str, head: str | None) -> bool:
         """L118 : retient le dernier commit de la branche vu en avance sur sa
         cible, si la branche du lot est toujours `branch`."""
 
     @abc.abstractmethod
-    def open_with_branch(self, limit: int) -> list[dict]:
-        """L118 : les lots ouverts qui portent une branche."""
+    def open_for_sweep(self, limit: int) -> list[dict]:
+        """L118 : les lots ouverts que le relevé des fusions examine (avec une
+        branche ou un assigné), du plus ancien au plus récent."""
 
     @abc.abstractmethod
     def open_for(self, assignee: str) -> list[dict]:
@@ -958,6 +1091,40 @@ class WorkItems(Domain):
         """Nombre de prises automatiques (lignes de journal dont la note
         commence par `note_prefix`) sur les `seconds` dernières secondes, tous
         hôtes confondus."""
+
+    @abc.abstractmethod
+    def unassigned_lots(self, limit: int) -> list[dict]:
+        """L165 : les lots du projet encore à confier (`intake`, sans assigné,
+        hors file d'amélioration), dans l'ordre de prise : priorité, puis
+        dates prévues (début, fin, livraison ; sans date en dernier), puis
+        ancienneté. Chaque ligne ajoute `lot_team` (équipe du lot, sinon de sa
+        fiche ou de la fiche parente, sinon son application),
+        `pending_decision` (une demande de décision attend sur le lot) et
+        `decision_milestone` (un jalon de décision ouvert y est rattaché)."""
+
+    # -- issues GitHub des lots (L126) ------------------------------------------
+    @abc.abstractmethod
+    def issue_feed(self, limit: int) -> list[dict]:
+        """Les lots que la projection en issues examine : ouverts, ou qui
+        portent une `issue_ref` (les `limit` plus récents), par id croissant.
+        Chaque ligne ajoute l'équipe de la fiche du plan (`package_team`) et
+        l'équipe, le chantier et l'hôte de l'assigné au registre
+        (`assignee_team`, `assignee_chantier`, `assignee_host`). Une
+        instruction."""
+
+    @abc.abstractmethod
+    def set_issue_ref(self, item_id: int, issue_ref: str | None, *,
+                      current: str | None) -> bool:
+        """Pose `issue_ref` si le lot porte encore `current` (NULL et chaîne
+        vide confondus) : faux si la valeur a changé entre-temps (un autre
+        projecteur l'a posée). Ni journal ni `updated_at` : une projection
+        n'est pas une activité du lot."""
+
+    @abc.abstractmethod
+    def recent_or_cited(self, *, since_ts: float, ids: Sequence[int]) -> list[dict]:
+        """L130 : les lots créés depuis `since_ts`, et ceux dont le numéro est
+        dans `ids` (cités par un message), quel que soit leur âge : `id`,
+        `title`, `source`, `body`, `created_ts`. Lecture seule."""
 
 
 # --------------------------------------------------------------------------
@@ -1514,21 +1681,89 @@ class Projects(Domain):
 
     @abc.abstractmethod
     def board(self, *, max_lots: int) -> dict:
-        """`{"agents": [...], "lots": [...]}`.
+        """`{"agents": [...], "lots": [...], "dead_letters": [...], "decisions": [...]}`.
 
         `agents` : un élément par agent du registre — name, chantier, team,
         harness, host, provider, credential_mode, status, status_text, mode,
         stop_reason, responsible, lease_live, turn_started_ts,
         status_since_ts, last_turn_ts, updated_ts, last_seen_ts, unread,
-        lot de session (`session_lot_id` / `_title` / `_state`), lot assigné
-        ouvert le plus récent (`assigned_lot_id` / `_title` / `_state`),
+        lot de session (`session_lot_id` / `_title` / `_state`), dernier lot
+        cité par l'agent dans son courrier (`mail_lot_id` / `_title` /
+        `_state`), lot assigné ouvert le plus récent (`assigned_lot_id` /
+        `_title` / `_state`) — trois lots OUVERTS, ou nuls,
         `open_lots` (lots ouverts assignés), `usd_24h` et `turns_24h`
         (grand livre, horloge de la base).
 
         `lots` : les lots OUVERTS (ni `merged`, ni `promoted`, ni `closed`),
         au plus `max_lots`, les plus récemment modifiés d'abord — id, title,
         state, app, workstream, package_team, assignee, updated_ts ; chaque
-        élément porte `total` (avant la borne)."""
+        élément porte `total` (avant la borne).
+
+        `dead_letters` : le courrier en souffrance, comme
+        `mailbox.dead_letters` (une ligne par destinataire et expéditeur).
+
+        `decisions` (L124) : les demandes de décision EN ATTENTE, les plus
+        anciennes d'abord (au plus 500) — id, owner (destinataire
+        `human:<id>`, ou `human:*`), requester, created_ts, urgent, due_ts ;
+        dans la même instruction (la vue reste à un aller-retour)."""
+
+
+# --------------------------------------------------------------------------
+# demandes de décision au propriétaire (lot L124) : sans migration, dans
+# `agent_mailbox` (kind `request`, `payload.decision`)
+# --------------------------------------------------------------------------
+
+class Decisions(Domain):
+    """Demandes de décision déposées par les agents pour un humain (L124).
+
+    Une demande est une ligne de `agent_mailbox` : `kind = 'request'`,
+    destinataire `human:<id>` (ou `human:*` sans responsable connu), objet
+    `payload.decision` (question, options, recommandation, échéance, état,
+    réponse). En attente tant que `delivered_at` est NULL ; répondue ou
+    retirée, elle est close (`delivered_at` posé) en UNE écriture
+    conditionnelle : deux réponses simultanées, un seul gagnant. Les lignes
+    rendues portent id, sender, recipient, body, payload (dict), work_item_id,
+    status, host, created_ts et closed_ts (`delivered_at`).
+
+    `register_chat` inscrit l'agent de conversation du propriétaire (L123) :
+    mode `externe` (jamais réclamé par un exécuteur), responsable humain."""
+
+    @abc.abstractmethod
+    def create(self, *, sender: str, recipient: str, body: str, payload: dict,
+               work_item_id: str | None, host: str | None) -> dict:
+        """Dépose la demande (le dépôt réveille, comme tout courrier) ; rend
+        id, created_ts et `sender_project` (projet du fil de l'expéditeur)."""
+
+    @abc.abstractmethod
+    def get(self, decision_id: int) -> dict | None:
+        """La demande `decision_id` (en attente ou close), ou None."""
+
+    @abc.abstractmethod
+    def pending(self, *, limit: int) -> list[dict]:
+        """Les demandes en attente, les plus anciennes d'abord."""
+
+    @abc.abstractmethod
+    def history(self, *, limit: int) -> list[dict]:
+        """Les demandes closes (répondues, retirées), les plus récentes d'abord."""
+
+    @abc.abstractmethod
+    def pending_for_lot(self, lot: str) -> list[dict]:
+        """Les demandes en attente rattachées au lot `lot` (`work_item_id`)."""
+
+    @abc.abstractmethod
+    def close(self, decision_id: int, *, status: str, record: dict) -> dict | None:
+        """Clôt la demande si elle est encore en attente : `status`
+        (`answered` | `delivered`), `record` fusionné dans `payload.decision`
+        (état, réponse ou retrait). Rend la ligne close, ou None (déjà close,
+        inconnue) — rien n'est écrit."""
+
+    @abc.abstractmethod
+    def register_chat(self, name: str, *, human: str, host: str, harness: str,
+                      cwd: str | None, status_text: str) -> dict | None:
+        """Inscrit (ou rafraîchit) l'agent de conversation `name` : mode
+        `externe`, responsable `human`, session oubliée (le hook inscrit la
+        nouvelle). None si `name` est un agent `execute` ou détient un bail
+        vivant : rien n'est écrit."""
 
 
 # --------------------------------------------------------------------------
@@ -1606,7 +1841,8 @@ class Operations(Domain):
     """Ce que l'orchestrateur lit et règle pour exploiter les agents (L26).
 
     Réglages d'agent (`session_policy`, `effort`, `tier`,
-    `context_max_tokens`, `turn_max_seconds`, `turn_mail_max`), lot de la session
+    `context_max_tokens`, `turn_max_seconds`, `turn_mail_max`,
+    `turn_grace_seconds`), lot de la session
     courante, demande de redémarrage, lectures enrichies pour `ameesh list
     --json` et `ameesh alerts`, usage par tour, historique des jauges de
     forfait et soldes d'un fournisseur payé au token. Instants en secondes
@@ -1614,9 +1850,10 @@ class Operations(Domain):
 
     #: colonnes réglables par `set_settings` (liste fermée)
     SETTINGS = ("session_policy", "effort", "tier", "context_max_tokens",
-                "turn_max_seconds", "turn_mail_max")
+                "turn_max_seconds", "turn_mail_max", "turn_grace_seconds")
     #: réglages entiers (colonne `bigint`) : la valeur texte est convertie
-    INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max")
+    INTEGER_SETTINGS = ("context_max_tokens", "turn_max_seconds", "turn_mail_max",
+                        "turn_grace_seconds")
 
     @abc.abstractmethod
     def set_settings(self, name: str, values: dict) -> bool:
@@ -1634,8 +1871,9 @@ class Operations(Domain):
         """Une ligne par agent : réglages, dossier de travail (`cwd`), statut et
         `status_since_ts`, bail
         (`lease_live`, `lease_expires_ts`), tour en cours (`turn_started_ts`,
-        `turn_label` du marqueur comptable), non-lus (`unread`,
-        `oldest_unread_ts`), lot de session (`session_work_item`,
+        `turn_label` du marqueur comptable), non-lus qui ouvriront un tour
+        (`unread`, `oldest_unread_ts` ; L125 : hors courrier passif, compté à
+        part dans `passive_unread`), lot de session (`session_work_item`,
         `session_lot_title`, `session_lot_state`), lot assigné ouvert le plus
         récent (`assigned_lot_id`, `assigned_lot_title`, `assigned_lot_state`),
         dernier tour du grand livre (`last_turn_reread_tokens` = entrée +
@@ -1815,6 +2053,10 @@ class TurnResources(Domain):
     étiquette de conteneur) et la ferme au retour du tour. Une ressource qui
     survit à son tour est marquée `orphan` — **jamais supprimée** — et
     `ameesh alerts` la signale (`orphan_resource`).
+
+    Délai de grâce (travail de fond d'un tour fini normalement) : la ligne
+    reste `running`, son `ended_at` marque la fin du tour ; elle est fermée
+    à la fin du travail de fond ou à l'échéance de la grâce.
     """
 
     @abc.abstractmethod
@@ -1827,6 +2069,13 @@ class TurnResources(Domain):
     def close_turn(self, turn_id: str, *, orphan: bool,
                    containers: Sequence[str] | None = None) -> None:
         """Ferme la ligne : `done` si la ressource est rendue, `orphan` sinon."""
+
+    @abc.abstractmethod
+    def begin_grace(self, turn_id: str,
+                    containers: Sequence[str] | None = None) -> None:
+        """Le tour est fini mais son travail de fond tourne encore (délai de
+        grâce) : `ended_at` posé, la ligne reste `running` (ses conteneurs ne
+        sont pas supprimés par le ménage tant qu'elle l'est)."""
 
     @abc.abstractmethod
     def mark_orphan(self, turn_id: str,
@@ -1848,7 +2097,14 @@ class TurnResources(Domain):
     @abc.abstractmethod
     def stale_running(self, older_than_s: float, host: str | None = None) -> list[dict]:
         """Les lignes encore `running` ouvertes il y a plus de `older_than_s`
-        secondes : un exécuteur mort les a laissées derrière lui."""
+        secondes (fin du tour, pour une ligne en délai de grâce) : un
+        exécuteur mort les a laissées derrière lui."""
+
+    @abc.abstractmethod
+    def churn(self, since_ts: float, short_s: float) -> list[dict]:
+        """L125 : par agent (ordre du nom), les tours FINIS lancés depuis
+        `since_ts` : `agent`, `turns`, `short_turns` (durée sous `short_s`
+        secondes), `first_short_ts` (début du premier tour court, ou None)."""
 
 
 class Housekeeping(Domain):
@@ -1868,9 +2124,17 @@ class Housekeeping(Domain):
         les lignes de plus de 30 jours."""
 
     @abc.abstractmethod
-    def recent(self, host: str | None, since_s: float, limit: int = 50) -> list[dict]:
-        """Les lignes des `since_s` dernières secondes (de l'hôte si donné),
-        les plus récentes d'abord ; instant en `at_ts`."""
+    def recent(self, host: str | None, since_s: float, limit: int = 50,
+               kind: str | None = None) -> list[dict]:
+        """Les lignes des `since_s` dernières secondes (de l'hôte si donné, de
+        ce `kind` si donné — L162 : les signalements de /tmp ne se noient pas
+        dans les bilans), les plus récentes d'abord ; instant en `at_ts`."""
+
+    @abc.abstractmethod
+    def latest_by_path(self, host: str | None, kind: str) -> list[dict]:
+        """#222: the last line of each (host, path) of this `kind` (of the host
+        if given), with no time window nor limit: only the retention of the
+        log bounds it."""
 
     @abc.abstractmethod
     def summary(self, host: str | None, since_s: float) -> list[dict]:
@@ -1968,6 +2232,74 @@ class SessionBindings(Domain):
 
 
 # --------------------------------------------------------------------------
+# résultats de CI relevés en direct (`ci_runs`, `ci_test_failures`, L161c)
+# --------------------------------------------------------------------------
+
+class CiResults(Domain):
+    """Exécutions de CI suivies et leurs tests en échec (jamais les réussites)."""
+
+    @abc.abstractmethod
+    def run(self, repo: str, run_id: int) -> dict | None:
+        """L'exécution suivie, ou None."""
+
+    @abc.abstractmethod
+    def open_run(self, repo: str, run_id: int, *, head_sha: str, branch: str, event: str,
+                 base: str, work_item_id: int | None, url: str | None) -> dict:
+        """Enregistre l'exécution (`running`) si elle est nouvelle ; la rend."""
+
+    @abc.abstractmethod
+    def running(self, repo: str) -> list[dict]:
+        """Les exécutions encore `running` du dépôt."""
+
+    @abc.abstractmethod
+    def conclude(self, repo: str, run_id: int, status: str) -> bool:
+        """`running` → `status` ; False si elle était déjà conclue."""
+
+    @abc.abstractmethod
+    def supersede(self, repo: str, branch: str, head_sha: str, run_id: int) -> list[dict]:
+        """Les exécutions `running` ou `cancelled` de la branche, plus
+        anciennes que `run_id` et sur une autre tête, passent `superseded` ;
+        rend celles qui ont changé."""
+
+    @abc.abstractmethod
+    def set_message(self, repo: str, run_id: int, which: str, message_id: int) -> None:
+        """Note le message `urgent` ou `verdict` envoyé pour l'exécution."""
+
+    @abc.abstractmethod
+    def failures(self, repo: str, run_id: int) -> list[dict]:
+        """Les tests en échec de l'exécution, dans l'ordre où ils ont échoué."""
+
+    @abc.abstractmethod
+    def add_failure(self, repo: str, run_id: int, *, part: str, test: str, module: str,
+                    status: str, inherited: bool, excerpt: str, replay: str,
+                    duration_s: float | None, failed_at: str | None) -> bool:
+        """Enregistre un échec ; False s'il l'était déjà (même part, même test)."""
+
+    @abc.abstractmethod
+    def set_failure_message(self, repo: str, run_id: int, tests: Sequence[tuple],
+                            message_id: int) -> None:
+        """Note le message qui a signalé ces échecs (`(part, test)`)."""
+
+    @abc.abstractmethod
+    def base_failures(self, repo: str, branch: str) -> dict:
+        """Dernière exécution conclue (verte ou rouge) de `branch` :
+        `{run_id, head_sha, tests}` (tests en échec), ou {} sans exécution."""
+
+    @abc.abstractmethod
+    def message_ids(self, repo: str, run_ids: Sequence[int]) -> list[int]:
+        """Les messages envoyés pour ces exécutions (urgent et échecs)."""
+
+    @abc.abstractmethod
+    def for_lot(self, work_item_id: int, limit: int) -> list[dict]:
+        """Les exécutions d'un lot, de la plus récente à la plus ancienne."""
+
+    @abc.abstractmethod
+    def latest_concluded(self, branches: Sequence[str]) -> list[dict]:
+        """Par dépôt et par branche parmi `branches`, la dernière exécution
+        conclue verte ou rouge."""
+
+
+# --------------------------------------------------------------------------
 # le stockage d'une connexion
 # --------------------------------------------------------------------------
 
@@ -2004,6 +2336,7 @@ class Storage(abc.ABC):
     placements: Placements
     progress: Progress
     projects: Projects
+    decisions: Decisions
     roadmap: Roadmap
     operations: Operations
     hosts: HostResources
@@ -2011,3 +2344,4 @@ class Storage(abc.ABC):
     visibility: Visibility
     housekeeping: Housekeeping
     session_bindings: SessionBindings
+    ci: CiResults

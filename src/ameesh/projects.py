@@ -6,12 +6,17 @@
 Pour chaque projet (l'équipe `team` de l'agent, à défaut son `chantier`) :
 
 * ses agents, avec leur état (au travail, en pause, au repos, arrêté) et la
-  raison d'une pause ou d'un arrêt, le lot en cours (lot de la session, à
-  défaut le lot ouvert assigné le plus récent), les non-lus, la dépense des
-  24 dernières heures et le mode de paiement (forfait ou au token) ;
+  raison d'une pause ou d'un arrêt, le lot en cours (le dernier lot ouvert
+  cité par l'agent dans son courrier, à défaut le lot de sa session, à
+  défaut le lot ouvert assigné le plus récent ; jamais un lot fusionné ou
+  fermé), les non-lus, la dépense des 24 dernières heures et le mode de
+  paiement (forfait ou au token) ;
 * ses lots ouverts SANS agent pour les faire avancer (non assignés, assignés
   à un agent arrêté ou inconnu du registre) ;
-* un signalement quand le projet a du travail ouvert mais aucun agent actif.
+* un signalement quand le projet a du travail ouvert mais aucun agent actif ;
+* son courrier en souffrance : les messages en attente chez un agent arrêté
+  du projet, ou adressés par un agent du projet à un nom absent du registre
+  (`ameesh mail forward <ancien> <nouveau>` les re-livre).
 
 Le projet d'un lot est son `app`, à défaut son `workstream`, l'équipe de sa
 fiche du plan, ou le projet de son assigné. Un projet sans agent actif ni
@@ -22,6 +27,11 @@ Le mode de paiement vient du `credential_mode` du canon (`subscription` =
 forfait, `api-key` = au token) ; à défaut, des descripteurs de harnais
 (`paid_per_token`). La dépense 24 h est celle du grand livre `turn_costs` :
 réelle au token, ESTIMÉE pour un forfait.
+
+En tête (L124) : les demandes de décision qui attendent l'humain qui lit
+(« 3 décisions t'attendent, la plus ancienne depuis 2h05 ») ; pour un agent,
+celles qui attendent un humain. Le chat du propriétaire (L123) n'est pas un
+agent de projet : il n'apparaît pas dans les groupes.
 
 Une seule lecture de base (`storage.of(db).projects.board`, une requête).
 Le JSON suit le schéma `ameesh-projects/1` (docs/EXPLOITATION.md) ; la même
@@ -61,6 +71,8 @@ _FR_PAYMENT = {"plan": "forfait", "token": "token", None: "?"}
 _FR_WHY = {"unassigned": "non assigné", "stopped": "assigné à %s, arrêté",
            "unknown": "assigné à %s, inconnu du registre",
            "external": "assigné à %s, session externe"}
+#: pourquoi un message est en souffrance : destinataire arrêté, ou inconnu
+_FR_DEAD = {"stopped": "arrêté", "unknown": "inconnu"}
 
 
 def _text(value) -> str:
@@ -105,13 +117,21 @@ def _paid_harnesses():
         return None
 
 
+#: candidats au lot en cours, du plus parlant au moins parlant : le dernier lot
+#: cité par l'agent dans son courrier, celui de sa session, son lot assigné le
+#: plus récent (correctif du 2026-10-11)
+_LOT_SOURCES = (("mail_lot", "mail"), ("session_lot", "session"), ("assigned_lot", "assigned"))
+#: un lot dans ces états n'est jamais « en cours »
+_DONE = ("merged", "promoted", "closed")
+
+
 def _lot_of(row: dict) -> dict | None:
-    if row.get("session_lot_id") is not None:
-        return {"id": int(row["session_lot_id"]), "title": row.get("session_lot_title") or "",
-                "state": row.get("session_lot_state"), "source": "session"}
-    if row.get("assigned_lot_id") is not None:
-        return {"id": int(row["assigned_lot_id"]), "title": row.get("assigned_lot_title") or "",
-                "state": row.get("assigned_lot_state"), "source": "assigned"}
+    """Le lot en cours d'un agent : le premier candidat OUVERT de `_LOT_SOURCES`
+    (la lecture ne rend que des lots ouverts ; l'état est revérifié ici)."""
+    for prefix, source in _LOT_SOURCES:
+        if row.get(prefix + "_id") is not None and row.get(prefix + "_state") not in _DONE:
+            return {"id": int(row[prefix + "_id"]), "title": row.get(prefix + "_title") or "",
+                    "state": row.get(prefix + "_state"), "source": source}
     return None
 
 
@@ -130,6 +150,13 @@ def build_agent(row: dict, now: float, paid_harnesses=None) -> dict:
     elif state == "paused":
         reason = _text(row.get("status_text")) or None
     lot = _lot_of(row)
+    lot_estimate = None
+    if lot is not None:
+        # L157 : durée estimée du lot en cours et temps écoulé depuis son début
+        from . import estimates
+        lot_estimate = estimates.view(
+            {"estimate_minutes": row.get("lot_estimate_minutes"),
+             "started_ts": row.get("lot_started_ts"), "state": lot.get("state")}, now=now)
     # L96 : la dernière avancée lue dans le fil (première ligne non vide de son
     # dernier message) et depuis quand il est sur sa tâche
     last_update = None
@@ -155,6 +182,8 @@ def build_agent(row: dict, now: float, paid_harnesses=None) -> dict:
         "host": row.get("host") or None,
         "payment": payment(row, paid_harnesses),
         "lot": lot,
+        # L157 (champ ajouté) : estimation et écoulé du lot en cours
+        "lot_estimate": lot_estimate,
         "task": task,
         "open_lots": int(row.get("open_lots") or 0),
         "unread": int(row.get("unread") or 0),
@@ -167,10 +196,17 @@ def build_agent(row: dict, now: float, paid_harnesses=None) -> dict:
 
 
 def build(board: dict, *, now: float | None = None, project: str | None = None,
-          paid_harnesses=None, max_lots: int = MAX_LOTS) -> dict:
-    """La vue `ameesh-projects/1` depuis la lecture `projects.board`."""
+          paid_harnesses=None, max_lots: int = MAX_LOTS, viewer: str | None = None) -> dict:
+    """La vue `ameesh-projects/1` depuis la lecture `projects.board`.
+
+    `viewer` (L124) : l'humain qui lit (`human:<id>`), pour l'en-tête des
+    décisions qui l'attendent ; None : celles qui attendent un humain."""
+    from . import decisions as decisions_mod
+    from .chat import is_chat_agent
+
     now = time.time() if now is None else float(now)
-    rows = list(board.get("agents") or [])
+    # L123 : le chat du propriétaire n'est l'agent d'aucun projet
+    rows = [r for r in board.get("agents") or [] if not is_chat_agent(r)]
     lot_rows = list(board.get("lots") or [])
     agents = [build_agent(r, now, paid_harnesses) for r in rows]
     by_name = {a["name"]: a for a in agents}
@@ -207,8 +243,33 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
             "updated_ts": round(float(lot["updated_ts"]), 3) if lot.get("updated_ts") else None,
         })
 
+    # courrier en souffrance : au projet de l'agent arrêté, ou, pour un nom
+    # absent du registre, au projet de l'expéditeur
+    dead: dict = {}
+    for row in board.get("dead_letters") or []:
+        recipient = row.get("recipient")
+        agent = by_name.get(recipient)
+        sender = row.get("sender") or ""
+        where = agent["project"] if agent is not None else agent_projects.get(sender)
+        group(where)
+        entry = dead.setdefault(where, {}).setdefault(recipient, {
+            "recipient": recipient,
+            "why": "unknown" if agent is None or row.get("unknown") else "stopped",
+            "count": 0, "oldest_ts": None, "senders": []})
+        entry["count"] += int(row.get("n") or 0)
+        if row.get("oldest_ts") is not None:
+            oldest = round(float(row["oldest_ts"]), 3)
+            entry["oldest_ts"] = oldest if entry["oldest_ts"] is None \
+                else min(entry["oldest_ts"], oldest)
+        if sender and sender not in entry["senders"]:
+            entry["senders"].append(sender)
+
     projects = []
     for g in groups.values():
+        letters = sorted(dead.get(g["name"], {}).values(), key=lambda e: e["recipient"])
+        for entry in letters:
+            entry["senders"].sort()
+        undeliverable = sum(e["count"] for e in letters)
         g["agents"].sort(key=lambda a: (_STATE_ORDER.get(a["state"], 9), a["name"]))
         counts = {s: 0 for s in _STATE_ORDER}
         for a in g["agents"]:
@@ -221,11 +282,18 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
             warnings.append("aucun agent actif")
         if g["lots_without_agent"]:
             warnings.append("%d lot(s) ouvert(s) sans agent" % len(g["lots_without_agent"]))
+        if letters:
+            warnings.append("%d message(s) en souffrance : %s — à re-livrer : ameesh mail "
+                            "forward <ancien> <nouveau>" % (undeliverable, ", ".join(
+                                "%s (%s) %d" % (e["recipient"], _FR_DEAD[e["why"]], e["count"])
+                                for e in letters)))
         g.update({
-            "active": bool(active_agents or g["lots_open"]),
+            "active": bool(active_agents or g["lots_open"] or undeliverable),
             "counts": counts,
             "agents_active": active_agents,
             "unread": sum(a["unread"] for a in g["agents"]),
+            "undeliverable": undeliverable,
+            "undeliverable_mail": letters,
             "usd_24h": round(sum(a["usd_24h"] for a in g["agents"]), 6),
             "usd_24h_token": round(sum(a["usd_24h"] for a in g["agents"]
                                        if a["payment"] == "token"), 6),
@@ -245,22 +313,41 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
                            .isoformat(timespec="seconds").replace("+00:00", "Z"),
         "project": project or None,
         "projects": projects,
+        # messages en souffrance des projets montrés (destinataire arrêté ou inconnu)
+        "undeliverable": sum(p["undeliverable"] for p in projects),
         "truncated": ({"lots": {"shown": len(lot_rows), "total": total, "limit": int(max_lots)}}
                       if total > len(lot_rows) else {}),
+        # L124 : demandes de décision en attente (en-tête)
+        "decisions": decisions_mod.board_summary(board.get("decisions") or [], viewer=viewer,
+                                                 now=now),
     }
 
 
 def snapshot(db, *, project: str | None = None, now: float | None = None,
-             paid_harnesses=None, max_lots: int = MAX_LOTS) -> dict:
+             paid_harnesses=None, max_lots: int = MAX_LOTS, viewer: str | None = None) -> dict:
     """Lit la base (UNE requête) et rend la vue `ameesh-projects/1`."""
     board = storage.of(db).projects.board(max_lots=max_lots)
-    for key in ("agents", "lots"):
+    for key in ("agents", "lots", "dead_letters", "decisions"):
         if isinstance(board.get(key), str):      # pilote qui rend le json brut
             board[key] = json.loads(board[key])
     if paid_harnesses is None:
         paid_harnesses = _paid_harnesses()
     return build(board, now=now, project=project, paid_harnesses=paid_harnesses,
-                 max_lots=max_lots)
+                 max_lots=max_lots, viewer=viewer)
+
+
+def viewer_of_session() -> str | None:
+    """L124 : l'humain qui lit la vue — `human:<utilisateur>` hors session
+    d'agent ; None dans la session d'un agent (l'en-tête dit alors les
+    décisions qui attendent un humain). Le chat du propriétaire lit pour lui."""
+    import os
+    from . import decisions as decisions_mod
+    chat = os.environ.get(decisions_mod.CHAT_ENV)
+    if os.environ.get("AGENT_MAIL_NAME") and not chat:
+        return None
+    if any(os.environ.get(key) for key in decisions_mod.RUNNER_ENV):
+        return None
+    return decisions_mod.current_human()
 
 
 # --------------------------------------------------------------------------
@@ -304,6 +391,8 @@ def _headline(p: dict) -> str:
         extra.append("%d lot(s) ouvert(s)" % p["lots_open"])
     if p["unread"]:
         extra.append("%d non lu(s)" % p["unread"])
+    if p.get("undeliverable"):
+        extra.append("%d en souffrance" % p["undeliverable"])
     if p["usd_24h"]:
         extra.append("24 h %.2f\u00a0$ (token %.2f\u00a0$)" % (p["usd_24h"], p["usd_24h_token"]))
     return head + (" · " + " · ".join(extra) if extra else "")
@@ -317,6 +406,13 @@ def _last_update(a: dict, now: float) -> str:
     """« dernière avancée il y a 12m : … » (L96)."""
     last = a["last_update"]
     return "avancée il y a %s : %s" % (_span(now - last["ts"]), last["text"])
+
+
+def _duration_cell(a: dict) -> str:
+    """L157 : la colonne courte DURÉE — écoulé/estimé du lot en cours
+    (« 1h10/2h », « 2h » pas commencé, « 2h40/2h! » dépassé, « — »)."""
+    from . import estimates
+    return estimates.cell(a.get("lot_estimate")) if a.get("lot") else "—"
 
 
 def _doing(a: dict, now: float | None = None) -> str:
@@ -362,8 +458,8 @@ def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = 
         for warning in p["warnings"]:
             wrap("! " + warning, indent + "  ")
         if p["agents"] and not narrow:
-            out.append(indent + "  %-*s %-19s %-7s %8s %4s  %s" % (
-                name_w, "AGENT", "ÉTAT", "PAIE", "24H $", "NL", "LOT EN COURS"))
+            out.append(indent + "  %-*s %-19s %-7s %8s %4s %-9s %s" % (
+                name_w, "AGENT", "ÉTAT", "PAIE", "24H $", "NL", "DURÉE", "LOT EN COURS"))
         for a in p["agents"]:
             pay = _FR_PAYMENT.get(a["payment"], "?")
             if narrow:
@@ -372,15 +468,17 @@ def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = 
                     a["name"], state_label(a, now), pay, a["usd_24h"], a["unread"]),
                     indent + "  ")
                 if _doing(a) != "—":
-                    wrap(_doing(a, now), indent + "    ")
+                    cell = _duration_cell(a)
+                    wrap(_doing(a, now) + (" · durée %s" % cell if cell != "—" else ""),
+                         indent + "    ")
                 if a.get("last_update"):
                     wrap(_last_update(a, now), indent + "    ")
                 if a["reason"]:
                     wrap("raison : " + a["reason"], indent + "    ")
                 continue
-            head = indent + "  %-*s %-19s %-7s %8.2f %4d  " % (
+            head = indent + "  %-*s %-19s %-7s %8.2f %4d %-9s " % (
                 name_w, a["name"][:name_w], state_label(a, now)[:19], pay, a["usd_24h"],
-                a["unread"])
+                a["unread"], _duration_cell(a)[:9])
             out.append(head + _short(_doing(a, now), max(12, width - len(head))))
             if a.get("last_update"):
                 pad = indent + "  " + " " * (name_w + 1)
@@ -415,7 +513,11 @@ def format_text(view: dict, width: int | None = None, *, show_inactive: bool = F
         agents, lots)
     if width is None:
         width = shutil.get_terminal_size((100, 24)).columns
-    lines = textwrap.wrap(title, max(36, min(int(width), 160)), subsequent_indent="  ")
+    width = max(36, min(int(width), 160))
+    from . import decisions as decisions_mod
+    head = decisions_mod.headline(view.get("decisions"), view["generated_ts"])
+    lines = textwrap.wrap(head, width, subsequent_indent="  ") if head else []
+    lines += textwrap.wrap(title, width, subsequent_indent="  ")
     return "\n".join(lines + [""] + format_lines(view, width, show_inactive=show_inactive))
 
 
@@ -441,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
         db = db_mod.connect(cfg)
         try:
             db_mod.require_schema(db)
-            view = snapshot(db, project=args.project)
+            view = snapshot(db, project=args.project, viewer=viewer_of_session())
         finally:
             db.close()
     except db_mod.SchemaMissing as exc:

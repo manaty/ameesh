@@ -6,7 +6,8 @@
 # c'est cette unité qui reprend la même session (L106).
 #
 # Installation :
-#   install -m 0644 'deploy/systemd/ameesh-runner-agent@.service' ~/.config/systemd/user/
+#   install -m 0644 'deploy/systemd/ameesh-runner-agent@.service' \
+#     deploy/systemd/ameesh-agents.slice ~/.config/systemd/user/
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now ameesh-runner-agent@<agent>
 #   journalctl --user -u ameesh-runner-agent@<agent> -f
@@ -37,10 +38,34 @@ ExecStart=%h/.local/share/ameesh/venv/bin/ameesh run --agents %i --runner-id run
 # attente croissante) ; une sortie anormale relance l'exécuteur.
 Restart=on-failure
 RestartSec=30
-# arrêt propre : SIGTERM, tours arrêtés au point sûr, consignes remises en
-# attente, baux rendus (l'exécuteur s'en charge en moins de 15 s)
-TimeoutStopSec=30
+# Arrêt et redémarrage (2026-10-11) : le SIGTERM va au SEUL exécuteur
+# (KillMode=mixed), qui DRAINE — plus de nouveau tour ; le tour en cours et
+# son travail de fond finissent, dans la borne AMEESH_DRAIN_SECONDS (30 min
+# par défaut) ; au-delà, tour arrêté et consigne remise en attente. Puis baux
+# rendus et sortie ; systemd tue (SIGKILL) ce qui resterait dans le groupe de
+# contrôle. Avant, le SIGTERM allait à tout le groupe, harnais compris : un
+# `systemctl restart` tuait le tour en cours et son travail.
+# `systemctl --user restart` attend donc la fin du tour (au plus la borne).
+# Arrêt immédiat : un second SIGTERM à l'exécuteur,
+#   kill -TERM "$(systemctl --user show -p MainPID --value ameesh-runner-agent@<agent>)"
+# TimeoutStopSec couvre la borne et le nettoyage : le garder au-dessus de
+# AMEESH_DRAIN_SECONDS + 5 min.
+KillMode=mixed
+TimeoutStopSec=35min
 NoNewPrivileges=yes
+# Plafond mémoire (L159c). 2026-10-10, VM du mesh : le `node` d'un harnais a
+# atteint 4,1 Go, et l'OOM du noyau l'a tué ; l'unité n'avait aucun plafond.
+# MemoryMax borne l'agent (harnais, tests, travail de fond) : l'OOM ne tue
+# que dans son groupe. MemoryHigh, à 90 %, fait reprendre la mémoire avant.
+# Défaut 6 Gio ; un hôte ou un agent qui veut autre chose le déclare au canon
+# (policy.resources.agent_memory_max, agent_memory_max_by_agent de la fiche
+# Host), et `ameesh doctor` donne la commande qui l'applique :
+#   systemctl --user set-property ameesh-runner-agent@<agent> MemoryMax=8192M MemoryHigh=7372M
+# OOMScoreAdjust : sous une pression globale, l'agent part avant le reste.
+Slice=ameesh-agents.slice
+MemoryHigh=5.4G
+MemoryMax=6G
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=default.target

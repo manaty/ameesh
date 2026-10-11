@@ -423,6 +423,11 @@ ExecStartPre=-%h/.local/share/ameesh/venv/bin/ameesh canon sync --fetch
 ExecStart=%h/.local/share/ameesh/venv/bin/agent-runner --poll 5
 Restart=always
 RestartSec=5
+# arrêt : SIGTERM au seul exécuteur, qui draine (tours en cours et travail
+# de fond finissent, au plus AMEESH_DRAIN_SECONDS = 30 min) — voir
+# EXPLOITATION.md, « Arrêt et redémarrage de l'exécuteur »
+KillMode=mixed
+TimeoutStopSec=35min
 
 [Install]
 WantedBy=default.target
@@ -1044,7 +1049,9 @@ L'étape `installer` suit le même usage.
 Sur le serveur (profil L55), ameesh est un clone détaché dans
 `/opt/ameesh/src`, installé non éditable dans `/opt/ameesh/venv`. Les
 personas tournent sous `ameesh-runner@<p>` (service système, utilisateur
-`ameesh`). **Pas de migration ici** : la base du serveur est celle que
+`ameesh`), hors dépôt ; leur plafond mémoire et leur slice viennent du
+complément `deploy/systemd/systeme/` (L159c, docs/EXPLOITATION.md,
+« Plafonds mémoire des agents »). **Pas de migration ici** : la base du serveur est celle que
 `poste.sh migrer` vient de migrer.
 
 1. `vm.sh verifier` : commit et version installés, unités, migrations
@@ -1058,12 +1065,11 @@ personas tournent sous `ameesh-runner@<p>` (service système, utilisateur
 4. `vm.sh controler` : unités actives, quinze lignes de journal par persona,
    `ameesh show`, `ameesh doctor` sur le serveur.
 
-Attention : `/opt/ameesh/src` ne garde que les fichiers du commit installé.
-Si ce commit ne contient pas encore `deploy/serveur/` (L55, L57), ces
-fichiers disparaissent du clone. Les copies installées (gabarit systemd,
-script de sauvegarde) restent en place, mais `installer-serveur.sh` n'est
-plus rejouable depuis ce clone tant que L55 et L57 ne sont pas dans la
-version installée.
+`/opt/ameesh/src` ne garde que les fichiers du commit installé. Depuis
+L135, `deploy/serveur/` (L55, L57) est dans main : un commit de main garde
+`installer-serveur.sh` rejouable depuis ce clone. Un commit plus ancien
+(avant L135) fait disparaître ces fichiers du clone ; les copies installées
+(gabarit systemd, script de sauvegarde) restent alors en place.
 
 ### Retour arrière
 
@@ -1212,36 +1218,99 @@ mise à jour, que les identifiants des comptes jamais utilisés sont présents
 installée : vérifier « ameesh 1.6.2 » sur chaque hôte après la mise à jour.
 Retour arrière : l'ancien code, sans autre geste.
 
-## Mise à jour vers 1.7.0
+## Migrer avant d'installer (L151)
 
-La 1.7.0 apporte la voie B, l'exécuteur médié (L107 à L115,
-[EXECUTEUR-MEDIEE.md](EXECUTEUR-MEDIEE.md)) : un appareil prêté, sans accès
-à la base, fait tourner des agents en parlant au serveur du mesh par
-`/api/exec/v1`. Trois migrations suivent 0048 (L63, `pid_started_at`),
-0049 (L119) et 0050 (L118) :
+**Constat du 10/10.** Un `agent-mail send` a échoué sur une colonne absente,
+entre `poste.sh installer` et `poste.sh migrer`. Les exécuteurs gardent
+l'ancien code en mémoire jusqu'à leur redémarrage, mais le venv sert aussi
+chaque commande que lancent les agents (`agent-mail send`, `ameesh work`…) :
+dès l'installation, ces commandes prennent le nouveau code, qui lit des
+colonnes que la base n'a pas encore.
 
-| Migration | Lot | Contenu |
+**Choix : inverser l'ordre, plutôt que rendre le code tolérant.** Un code
+tolérant devrait vérifier la présence de chaque nouvelle colonne à chaque
+requête, dans chaque lot à venir : un oubli suffit pour retrouver la panne,
+et ces gardes ne seraient jamais retirées. Les migrations du dépôt sont,
+elles, additives presque toujours (colonnes nullables ou avec défaut, tables
+neuves, contraintes remplacées) : le code d'avant tourne sans erreur sur une
+base migrée, ce que chaque mise à jour depuis L60 vérifie déjà. On migre
+donc **d'abord**, puis on installe, puis on redémarre.
+
+**Ordre des étapes, côté poste** (les sections précédentes restent valables
+pour le contenu de chaque version) :
+
+1. `poste.sh verifier`, `poste.sh sauvegarder`.
+2. `poste.sh migrer [REF]` : extrait l'instantané `src-<sha>` de REF et lance
+   **son** `ameesh migrate --additive-only`, sans l'installer
+   (`PYTHONPATH=<instantané>/src`, avec le Python du venv). Base du mesh, une
+   seule fois, puis ancienne base. `migrate --dry-run` affiche d'abord chaque
+   migration manquante, « additive » ou « NON additive » avec la raison.
+3. `poste.sh installer [REF]` : refuse tant que `doctor --probe` du nouveau
+   code signale une migration manquante, sur la base du mesh ou l'ancienne.
+4. `poste.sh role`, `poste.sh redemarrer`, puis `vm.sh installer [REF]` et
+   `vm.sh redemarrer`. **`vm.sh installer` refuse aussi** tant que la base du
+   mesh n'a pas toutes les migrations de REF (lues dans le clone du serveur,
+   `src/ameesh/migrations/`, comparées à `schema_migrations`) ;
+   `vm.sh redemarrer` fait le même contrôle pour le code installé (il
+   remplace le contrôle figé « 0041 à 0047 »).
+5. `poste.sh controler`, `vm.sh controler`.
+
+**Ce qui est additif.** `ameesh migrate --additive-only` n'applique rien
+(code 3) si une migration manquante contient un geste qui casse le code
+d'avant : `drop table`, `drop column`, `drop schema|type`, une vue ou une
+fonction supprimée sans être recréée dans la même migration, un renommage,
+un changement de type, `set not null`, `add column … not null` sans défaut,
+`truncate`, `delete from`. Ce que l'examen du texte ne voit pas (une
+contrainte resserrée, une fonction réécrite qui change de comportement), la
+migration le déclare par un commentaire `-- ameesh: non additive`. Toutes
+les migrations livrées jusqu'à 0051 sont additives (vérifié par
+`tests/test_migrations_additives.py`).
+
+**Migration non additive : procédure à part.** `poste.sh migrer` s'arrête
+avant d'écrire. On revient alors à l'ancien ordre, d'affilée et sans tarder,
+en connaissant la fenêtre où les commandes des agents échouent :
+`MIGRER_APRES=1 poste.sh installer REF`, `poste.sh migrer REF` (REF installé :
+toutes ses migrations passent), `poste.sh redemarrer`. Une telle migration
+se prépare et se propose au propriétaire (consigne de l'orchestrateur,
+« Livraison et déploiements ») ; le retour arrière demande alors la
+sauvegarde de la base.
+
+**Dépendance nouvelle.** Le nouveau code est lancé avec les paquets du venv
+en place. Si REF ajoute une dépendance dont `ameesh migrate` a besoin,
+`migrer` échoue à l'import : installer d'abord cette dépendance dans le venv
+(`pip install <paquet>`), puis reprendre à `migrer`.
+
+## Update to 1.10.0 (path B, mediated executor)
+
+1.10.0 brings path B, the mediated executor (L107 to L115,
+[EXECUTEUR-MEDIEE.md](EXECUTEUR-MEDIEE.md)): a lent device, without database
+access, runs agents by talking to the mesh server through `/api/exec/v1`
+(contract 1.1). Three migrations follow main's 0057 (0058 to 0061 belong to
+other lots):
+
+| Migration | Lot | Content |
 |---|---|---|
-| **0051** `mediated_executor` | L108 | tables `exec_idempotency`, `exec_host_availability`, `exec_audit` |
-| **0052** `executor_identity` | L110 | tables `executor_invitations`, `executors`, `executor_tokens`, `executor_assertion_jti`, `executor_events` |
-| **0053** `model_relay` | L111 | `turn_costs.source` (`harness` par défaut), `executor`, `lease_owner`, `lease_epoch` |
+| **0062** `mediated_executor` | L108 | tables `exec_idempotency`, `exec_host_availability`, `exec_audit` |
+| **0063** `executor_identity` | L110 | tables `executor_invitations`, `executors`, `executor_tokens`, `executor_assertion_jti`, `executor_events` |
+| **0064** `model_relay` | L111 | `turn_costs.source` (`harness` by default), `executor`, `lease_owner`, `lease_epoch` |
 
-**Rien ne change pour un hôte classique.** Les tables sont neuves, la
-colonne `source` a un défaut, et un exécuteur 1.6.x tourne sans erreur sur
-une base migrée. Le plafond de dépense ignore les lignes `source = 'device'`,
-qu'aucun hôte classique n'écrit. Sans porte d'hôte configurée
-(`AMEESH_HOST_GATE`), l'exécuteur se comporte comme en 1.6.2. On migre, puis
-on redémarre les exécuteurs, comme pour la 1.6.0.
+**Nothing changes for a classic host.** The tables are new, the `source`
+column has a default, and a 1.9.x executor runs without error on a migrated
+database: the three migrations are additive, so the L151 order below
+applies unchanged (migrate, install, restart). The spending cap ignores rows
+with `source = 'device'`, which no classic host writes. Without a host gate
+configured (`AMEESH_HOST_GATE`), the executor behaves as in 1.9.0.
 
-**Rien n'est activé.** Le serveur `ameesh serve --exec-only`, un rôle
-Postgres propre au serveur (`ameesh_exec`, à créer), la clé de release de
-l'image (IMAGE-EXECUTEUR.md §9), l'image signée et l'enrôlement d'un premier
-appareil (`ameesh host enroll`) sont des gestes de déploiement à part, chacun
-soumis au propriétaire.
+**Nothing is switched on.** The `ameesh serve --exec-only` server, a
+Postgres role of its own for the server (`ameesh_exec`, to be created), the
+image release key (IMAGE-EXECUTEUR.md §9), the signed image and the
+enrolment of a first device (`ameesh host enroll`) are separate deployment
+steps, each submitted to the owner.
 
-Retour arrière : l'ancien code. La base reste migrée ; l'ancien code ignore
-les tables de 0051 et 0052, et la colonne `source` de 0053 (il compte alors
-aussi les lignes `device`, qui n'existent que si un appareil a été enrôlé).
+Rollback: the previous code. The database stays migrated; the previous code
+ignores the tables of 0062 and 0063 and the `source` column of 0064 (it then
+also counts `device` rows, which only exist once a device has been
+enrolled).
 
 ---
 

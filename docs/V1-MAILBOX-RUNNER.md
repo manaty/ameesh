@@ -63,11 +63,15 @@ Deux points de conception :
   Le `RETURNING` d'un `UPDATE` renvoie la *nouvelle* valeur (donc `NULL`) : la
   consommation passe par un CTE `taken … FOR UPDATE` qui capture l'ancienne
   valeur avant de l'effacer. (Bug attrapé par les tests.)
-* **`upsert` partiel** — un `send`, un hook ou un `status` ne doivent pas
+* **`upsert` partiel** — un hook ou un `status` ne doivent pas
   écraser ce qu'ils ne connaissent pas. Les colonnes `chantier`, `harness`,
   `host` sont donc mises à jour par `coalesce(nullif(%s,''), colonne)`, et non
   par la valeur par défaut de la ligne proposée. (Deuxième bug attrapé par les
-  tests : un `send` remettait `harness` à `'other'`.)
+  tests : un `send` remettait `harness` à `'other'`.) Depuis le 2026-10-11, un
+  `send` ne touche plus du tout le registre : il inscrivait le destinataire,
+  ce qui créait un agent fantôme pour un nom mal tapé et réécrivait l'hôte
+  d'un agent existant avec celui de l'expéditeur (voir §6, « Courrier vers un
+  agent inconnu ou arrêté »).
 
 ### `agent_mailbox` — messages durables
 
@@ -286,8 +290,14 @@ test (trois messages → trois notifications) a attrapé le bug.
   l'agent comme un message ; un lot d'événements n'en réveille qu'un par
   `AMEESH_EVENT_COALESCE` secondes (défaut 120), sauf `payload.urgent`. L'instant
   du dernier réveil vit en base (`agent_registry.last_event_at`) : un
-  redémarrage ne remet pas la fenêtre à zéro. Le courrier ordinaire n'est jamais
-  regroupé.
+  redémarrage ne remet pas la fenêtre à zéro.
+* **Courrier regroupé (L125)** : le courrier ordinaire ne réveille un agent au
+  repos qu'à la fin d'une fenêtre (`AMEESH_MAIL_BATCH`, défaut 90 s, réglable
+  par agent), comptée depuis l'arrivée du plus ancien message ; le tour emporte
+  tout ce qui est arrivé entre-temps. Un message urgent ou d'un humain réveille
+  tout de suite ; un accusé de réception, une copie (`--cc`) ou une diffusion à
+  « all » ne réveille jamais seul : il est lu au tour suivant. Voir
+  [EXPLOITATION.md](EXPLOITATION.md#courrier-regroupé-avant-le-réveil-l125).
 * **`ameesh attach <agent>` (C9)** : prend le bail pour une session interactive
   (`attach:<utilisateur>@<hôte>`), même sur un bail vivant **sans tour en
   cours** — l'ancien exécuteur est fencé par l'epoch à son prochain
@@ -301,8 +311,9 @@ test (trois messages → trois notifications) a attrapé le bug.
   sans canon ; la capacité « interrupt » d'une fiche canon s'ajoutera) arrête le
   tour en cours (SIGTERM bref puis SIGKILL), remet la consigne du tour en
   attente, et `pick()` sert le message prioritaire **en tête** au tour suivant,
-  sur la même session. Un urgent d'un expéditeur non habilité est remis comme un
-  message normal, et l'abus est journalisé ; le fil garde la trace de
+  sur la même session. Un urgent d'un expéditeur non habilité n'interrompt rien
+  (c'est journalisé) : il est remis comme un message — depuis L125, sans
+  attendre la fenêtre de regroupement ; le fil garde la trace de
   l'interruption et de sa raison.
 * **Rotation de session (0018)** : quand la session dépasse
   `AMEESH_SESSION_MAX_TOKENS` (défaut 150 000) ou qu'un tour a duré plus de
@@ -311,7 +322,14 @@ test (trois messages → trois notifications) a attrapé le bug.
   tour de résumé est joué dans la session, le résumé est écrit dans le fil
   (R12), l'ancien id de session est conservé dans
   `<état>/<agent>/session-history.jsonl`, puis la session est oubliée : le tour
-  suivant ouvre une session neuve préfixée par le résumé. La taille est lue
+  suivant ouvre une session neuve préfixée par le résumé. Le résumé est la
+  réponse finale **entière** du tour de résumé (L218), jamais la fin de son
+  affichage ; au-delà de `adapters.SUMMARY_MAX_CHARS` (16 000 caractères), sa
+  tête est gardée, coupée sur une fin de paragraphe, et une note, comprise
+  dans la borne, dit la coupe. Une réponse finale vide (pour Codex : le
+  dernier message de l'agent vide) n'est pas un résumé : la rotation est
+  annulée, la bascule de compte prend le brief déterministe (L39).
+  La taille est lue
   dans l'usage du flux de chaque harnais (clés normalisées par
   `adapters.usage_tokens` ; DeepSeek publie un usage par étape). **Plafond de
   contexte (L60)** : si le dernier tour a relu plus de
@@ -412,10 +430,41 @@ bail. `ameesh mail bind` refuse un agent `execute` sauf `--force` (« agent
 mené par l'exécuteur ; une session externe lui volerait son courrier ») et
 inscrit un agent inconnu comme `externe`.
 
+**Courrier vers un agent inconnu ou arrêté (2026-10-11).** Avec la base,
+`send` refuse (code 2, rien n'est déposé) un destinataire absent du registre
+— sans créer d'agent, avec les noms proches —, un destinataire arrêté
+(`stopped`) sauf `--queue`, et une identité d'expéditeur arrêtée (avec
+l'identité liée à la session, `whoami`) ; « all » écarte les agents arrêtés.
+Le courrier en souffrance lève l'alerte `mail_undeliverable`, et `ameesh
+mail forward <ancien> <nouveau>` re-livre une boîte morte à un agent vivant,
+expéditeur et date d'origine gardés. Détail :
+[EXPLOITATION.md](EXPLOITATION.md), « Courrier en souffrance ».
+
 **Hooks : écrire d'abord, marquer ensuite.** Le JSON est écrit sur stdout et
 vidé (`flush`) *avant* de marquer les messages remis ; si le harnais a fermé son
 entrée (BrokenPipe), la remise n'a pas lieu et le courrier reste pour le tour
 suivant.
+
+**Hooks : jamais dans un sous-agent (L133, 2026-10-11).** Claude Code
+déclenche aussi les hooks ordinaires (`PostToolUse`…) dans les sous-agents
+d'une session (outil Agent/Task, coéquipier en processus), avec le
+`session_id` de la session principale et l'environnement de l'agent ; Codex
+fait de même pour ses sous-agents (`spawn_agent`). Le hook remettait alors au
+sous-agent le courrier de l'agent, que le sous-agent ignorait, et le marquait
+livré : la session principale ne le recevait jamais (au moins cinq messages
+perdus les 10 et 11/10). Ces deux harnais ajoutent `agent_id` à l'entrée d'un
+hook déclenché dans un sous-agent, et seulement là : `agent_id` présent et non
+vide, le hook sort aussitôt, sans rien lire, remettre, marquer ni écrire
+(inscription, titre, compteurs), et sans rien afficher (une ligne « courrier
+en attente » se répéterait à chaque outil du sous-agent et coûterait un
+aller-retour à la base). Le courrier attend le prochain hook de la session
+principale. `agent_type` seul ne compte pas : Claude Code le pose aussi sur
+une session principale lancée avec `--agent`. Limite connue : le pont des
+hooks Claude Code du harnais DeepSeek (`dsh`) ne passe `agent_id` qu'à
+`SubagentStart` et `SubagentStop` ; d'après son code, un sous-agent `dsh`
+déclenche les hooks ordinaires sous son propre `session_id`. Une session liée
+par `bind` ne lui remet donc rien, mais un agent mené par l'exécuteur
+(identité par l'environnement) reste exposé : suite à traiter à part.
 
 **Repli** : si Postgres est injoignable et que `AMEESH_BACKEND=auto`
 (défaut), la CLI écrit dans la boîte fichier v0

@@ -25,6 +25,27 @@ from ameesh import migrations
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(REPO, "src")
 FAKEBIN = os.path.join(REPO, "tests", "fakebin")
+
+#: L142 : la suite ne dépend pas de l'état du poste. Toute variable ameesh de
+#: la session (AMEESH_*, AGENT_MESH_*, AGENT_MAIL_* : identité, état, schéma,
+#: DSN de production…) est retirée, sauf les réglages du banc lui-même.
+BENCH_ENV_VARS = frozenset((
+    "AMEESH_TEST_DSN", "AGENT_MESH_TEST_DSN",
+    "AMEESH_REQUIRE_DB", "AGENT_MESH_REQUIRE_DB",
+    "AMEESH_DRIVER", "AGENT_MESH_DRIVER",
+    "AMEESH_DB_TRACE",
+))
+for _name in list(os.environ):
+    if (_name.startswith(("AMEESH_", "AGENT_MESH_", "AGENT_MAIL_"))
+            and _name not in BENCH_ENV_VARS):
+        del os.environ[_name]
+#: et la configuration de l'hôte (~/.config/ameesh/config.json, ou l'ancienne
+#: ~/.config/agent-mesh/config.json) n'est jamais lue : ses canons imposent un
+#: responsable humain, fixent fils et hôte. Les tests de configuration posent
+#: leur propre AMEESH_CONFIG. HOME reste celui du poste (~/.pgpass du banc).
+ABSENT_CONFIG = os.path.join(tempfile.mkdtemp(prefix="ameesh-test-config-"), "absent.json")
+os.environ["AMEESH_CONFIG"] = ABSENT_CONFIG
+os.environ["AGENT_MESH_CONFIG"] = ABSENT_CONFIG
 # la surcharge AMEESH_CODEX_SESSIONS prime sur CODEX_HOME : jamais héritée
 os.environ.pop("AMEESH_CODEX_SESSIONS", None)
 TEST_DSN = os.environ.get(
@@ -74,6 +95,10 @@ os.environ["AMEESH_PRICES"] = EMPTY_PRICES
 #: vrai /tmp de la machine n'est ni mesuré ni balayé par les tests)
 EMPTY_SYSTEM_TMP = tempfile.mkdtemp(prefix="ameesh-test-system-tmp-")
 os.environ["AMEESH_SYSTEM_TMP"] = EMPTY_SYSTEM_TMP
+#: L125 : pas de fenêtre de regroupement du courrier dans le banc — un message
+#: réveille son destinataire tout de suite, comme avant L125 ; les tests du
+#: regroupement (test_l125_courrier_regroupe) posent leur propre fenêtre
+os.environ["AMEESH_MAIL_BATCH"] = "0"
 #: les binaires réels du poste (variables de l'exécuteur) ne fuient pas dans les
 #: tests : le banc pose ses faux harnais par `AMEESH_BIN_DIR` ou explicitement
 #: L106 : ni les emplacements connus des harnais (mise, ~/.local/bin, npx), ni
@@ -135,6 +160,9 @@ def child_env(**extra: str) -> dict:
     # Les relevés de ressources de l'hôte réel (L31) ne fuient pas non plus :
     # les tests de pression posent eux-mêmes leur intervalle et leurs mesures.
     env["AMEESH_RESOURCE_INTERVAL"] = "0"
+    # Un SIGTERM arrête l'exécuteur tout de suite, comme avant le drainage
+    # (2026-10-11) : les tests du drainage posent leur borne eux-mêmes.
+    env["AMEESH_DRAIN_SECONDS"] = "0"
     # Ni passage périodique du ménage (L73) ni /tmp réel : chaque test de
     # ménage pose son intervalle et son dossier temporaire du système.
     env["AMEESH_HOUSEKEEPING_INTERVAL"] = "0"
@@ -155,6 +183,51 @@ def child_env(**extra: str) -> dict:
     env.pop("AMEESH_CODEX_SESSIONS", None)   # isolement par CODEX_HOME (ci-dessus)
     env.update({k: str(v) for k, v in extra.items() if v is not None})
     return env
+
+
+#: L161e : dossier de mesure de la carte test → code (vide : pas de mesure)
+CARTE = os.environ.get("CARTE_MESURE", "")
+
+
+def table_stats(db, schema: str) -> dict:
+    """L161e : compteurs d'activité des tables d'un schéma (lectures,
+    écritures), après avoir vidé ceux de cette connexion ; les
+    sous-processus vident les leurs en se fermant."""
+    db.query("select pg_stat_force_next_flush()")
+    rows = db.query(
+        "select relname, coalesce(seq_scan, 0) + coalesce(idx_scan, 0) as lectures, "
+        "n_tup_ins + n_tup_upd + n_tup_del as ecritures "
+        "from pg_stat_user_tables where schemaname = %s", (schema,))
+    return {r["relname"]: (int(r["lectures"]), int(r["ecritures"])) for r in rows}
+
+
+def tables_touchees(avant: dict, apres: dict) -> dict:
+    """Tables dont un compteur a bougé : {table: {"l": lectures, "e": écritures}}."""
+    touchees = {}
+    for table, (lectures, ecritures) in sorted(apres.items()):
+        l0, e0 = avant.get(table, (0, 0))
+        if lectures > l0 or ecritures > e0:
+            touchees[table] = {"l": lectures - l0, "e": ecritures - e0}
+    return touchees
+
+
+def noter_tables(cls) -> None:
+    """L161e : les tables touchées par une classe de test, dans le dossier de
+    mesure de la carte. Jamais bloquant."""
+    avant = getattr(cls, "_carte_tables", None)
+    if not CARTE or avant is None:
+        return
+    try:
+        touchees = tables_touchees(avant, table_stats(cls.db, cls.schema))
+        dossier = os.path.join(CARTE, "tables")
+        os.makedirs(dossier, exist_ok=True)
+        ligne = json.dumps({"classe": "%s.%s" % (cls.__module__, cls.__qualname__),
+                            "tables": touchees}, ensure_ascii=False)
+        with open(os.path.join(dossier, "%d.jsonl" % os.getpid()), "a", encoding="utf-8") as fh:
+            fh.write(ligne + "\n")
+    except Exception as exc:  # la mesure ne casse jamais un test
+        print("carte : tables de %s non relevées (%s)" % (cls.__qualname__, exc),
+              file=sys.stderr)
 
 
 class PgTestCase(unittest.TestCase):
@@ -192,9 +265,15 @@ class PgTestCase(unittest.TestCase):
                 raise AssertionError(message) from exc
             raise unittest.SkipTest(message) from exc
         migrations.migrate(cls.db, log=None)
+        if CARTE:
+            try:
+                cls._carte_tables = table_stats(cls.db, cls.schema)
+            except Exception:
+                cls._carte_tables = None
 
     @classmethod
     def tearDownClass(cls) -> None:
+        noter_tables(cls)
         try:
             cls.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % cls.schema)
             cls.db.close()

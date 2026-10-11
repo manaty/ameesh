@@ -17,6 +17,8 @@ sous-utilisation se trompaient et la frise restait vide.
 
 Sans option, rien ne change, hors l'avertissement. Un `--lot` qui ne
 désigne aucun lot connu reste une simple étiquette du fil, comme avant.
+Correctif du 2026-10-11 : pour tout expéditeur, un `--lot` qui désigne un
+lot ouvert (numéro ou étiquette unique) est enregistré par son numéro.
 """
 from __future__ import annotations
 
@@ -33,11 +35,13 @@ class AssignmentError(RuntimeError):
     """Rattachement refusé : rien n'est déposé, le message dit quoi faire."""
 
 
-def is_orchestrator(cfg, db, name: str) -> bool:
+def is_orchestrator(cfg, db, name: str, *, roles=None) -> bool:
     """`name` est-il un orchestrateur ? Déclaré (`AMEESH_ALERT_ORCHESTRATORS`),
     agent qui a confié des lots dans les 30 derniers jours, ou fiche Agent du
     canon dont `roles` nomme un orchestrateur (`sous_utilisation.orchestrators`,
-    lu en dernier : le canon coûte une lecture du dépôt)."""
+    lu en dernier : le canon coûte une lecture du dépôt). `roles` : les rôles
+    du canon qui comptent (défaut : orchestrateur ; `work.CORRECTOR_ROLES`
+    ajoute les agents de conception)."""
     from . import sous_utilisation as su
 
     declared = {su._bare(n) for n in (os.environ.get(ORCHESTRATORS_ENV) or "").split(",")
@@ -51,7 +55,8 @@ def is_orchestrator(cfg, db, name: str) -> bool:
     except Exception:
         pass
     try:
-        return name in su.orchestrators(cfg, db, [{"name": name}], declared=())
+        return name in su.orchestrators(cfg, db, [{"name": name}], declared=(),
+                                        roles=roles or su.ORCHESTRATOR_ROLES)
     except Exception:
         return False
 
@@ -79,14 +84,19 @@ def resolve_lot(db, ref: str) -> dict | None:
 
 
 def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None,
-                 new_lot: str | None = None, branch: str | None = None) -> dict:
+                 new_lot: str | None = None, branch: str | None = None,
+                 estimate=None) -> dict:
     """Ce que le message `sender` → `recipient` fait aux lots, AVANT son dépôt.
 
     Rend `{lot, work_item_id, assigned, created, branch, warnings, orchestrator}` :
     `work_item_id` est l'étiquette du fil (le numéro du lot s'il est connu,
     sinon `lot` tel quel). `branch` (déduite du message par l'appelant) est
     posée sur le lot qui n'en a pas. Lève AssignmentError si l'attribution
-    gardée refuse (rien n'est alors déposé)."""
+    gardée refuse (rien n'est alors déposé).
+
+    L157 : `estimate` est la durée estimée du lot créé par `new_lot` ; elle
+    est obligatoire quand l'expéditeur est un agent (refus, rien n'est
+    déposé), un avertissement pour un humain."""
     out = {"lot": None, "work_item_id": lot, "assigned": False, "created": False,
            "branch": None, "warnings": [], "orchestrator": False}
     if recipient == "all" or ":" in recipient:
@@ -98,7 +108,17 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         if lot is None and has_open:
             return out
         if not is_orchestrator(cfg, db, sender):
-            # un `--lot` d'un autre agent reste une étiquette du fil (inchangé)
+            # un `--lot` d'un autre agent n'assigne rien ; mais une étiquette
+            # qui désigne un lot ouvert est rendue par son numéro, pour tout
+            # expéditeur : le fil, l'activité du lot et le lot en cours
+            # (`ameesh projects`) la lisent. Sinon, étiquette libre (inchangé).
+            if lot is not None:
+                try:
+                    item = resolve_lot(db, lot)
+                except AssignmentError:
+                    item = None
+                if item is not None:
+                    out.update(lot=item, work_item_id=str(item["id"]))
             return out
         out["orchestrator"] = True
     else:
@@ -107,12 +127,18 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
     item = None
     try:
         if new_lot is not None:
+            from . import estimates
             title = new_lot.strip()
             if not title:
                 raise AssignmentError("--new-lot : titre vide")
+            minutes = estimates.parse(estimate) if estimate not in (None, "") else None
+            warn = estimates.check(db, sender, minutes,
+                                   option="--estimate 2h à côté de --new-lot")
             item = work_mod.add(db, title=title, assignee=recipient, actor=sender,
-                                source="mail", cfg=cfg, branch=branch)
+                                source="mail", cfg=cfg, branch=branch, estimate=minutes)
             out.update(created=True, assigned=True, branch=item.get("branch"))
+            if warn:
+                out["warnings"].append(estimates.missing(item["id"]))
         elif lot is not None:
             item = resolve_lot(db, lot)
             if item is None:
@@ -145,9 +171,17 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
         raise AssignmentError(str(exc)) from exc
     if item is not None:
         out.update(lot=item, work_item_id=str(item["id"]))
-    if not has_open and not out["assigned"]:
+    if not has_open and not out["assigned"] and not _is_chat(db, recipient):
         out["warnings"].append(
             "%s n'a aucun lot ouvert : ce travail n'apparaîtra ni dans ameesh projects "
             "ni dans les alertes — rattachez-le (--lot <id|réf>) ou créez-le "
             "(--new-lot \"titre\")" % recipient)
     return out
+
+
+def _is_chat(db, name: str) -> bool:
+    """L123 : le chat du propriétaire n'a jamais de lot ; lui écrire (réponse
+    d'un orchestrateur) ne confie pas de travail."""
+    from . import registry
+    from .chat import CHAT_PREFIX, is_chat_agent
+    return name.startswith(CHAT_PREFIX) and is_chat_agent(registry.get(db, name))

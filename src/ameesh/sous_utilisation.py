@@ -38,6 +38,7 @@ désactive l'alerte correspondante.
 """
 from __future__ import annotations
 
+import os
 import time
 
 from . import cost as cost_mod
@@ -285,12 +286,37 @@ def _bare(name: str) -> str:
     return name[len("agent:"):] if name.startswith("agent:") else name
 
 
-def orchestrators(cfg, db, listing: list, *, declared=(), canons=None) -> list:
+def role_orchestrators(canons, roles=None) -> set:
+    """Les agents dont la fiche Agent du canon nomme un rôle d'orchestrateur
+    (`roles` ou `role` : `orchestrateur`, `orchestrator`), ou l'un des
+    `roles` donnés."""
+    wanted = {str(r).strip().lower() for r in (roles or ORCHESTRATOR_ROLES)}
+    found = set()
+    for canon in canons or []:
+        for agent in getattr(canon, "agents", None) or []:
+            data = getattr(getattr(agent, "fiche", None), "data", None) or {}
+            fiche_roles = data.get("roles") or data.get("role") or []
+            if isinstance(fiche_roles, str):
+                fiche_roles = [fiche_roles]
+            if any(str(r).strip().lower() in wanted for r in fiche_roles):
+                found.add(agent.title)
+    return found
+
+
+def declared_orchestrators(env=None) -> set:
+    """Les orchestrateurs déclarés par `AMEESH_ALERT_ORCHESTRATORS` (noms
+    séparés par des virgules, `agent:` admis)."""
+    value = (env if env is not None else os.environ).get("AMEESH_ALERT_ORCHESTRATORS") or ""
+    return {_bare(n) for n in value.split(",") if n.strip()}
+
+
+def orchestrators(cfg, db, listing: list, *, declared=(), canons=None,
+                  roles=ORCHESTRATOR_ROLES) -> list:
     """Les orchestrateurs connus : déclarés (`--orchestrators`,
     `AMEESH_ALERT_ORCHESTRATORS`), fiche Agent du canon dont `roles` (ou
-    `role`) nomme un orchestrateur, ou agent qui a confié des lots (délégation
-    ou `work assign`) dans les 30 derniers jours. Seulement des agents du
-    registre."""
+    `role`) nomme un orchestrateur (ou l'un des `roles` donnés), ou agent qui
+    a confié des lots (délégation ou `work assign`) dans les 30 derniers
+    jours. Seulement des agents du registre."""
     names = {row["name"] for row in listing}
     found = {_bare(n) for n in declared or () if n}
     if canons is None:
@@ -299,20 +325,16 @@ def orchestrators(cfg, db, listing: list, *, declared=(), canons=None) -> list:
             canons = canon_mod.load_configured(cfg) if cfg is not None else []
         except Exception:
             canons = []
-    for canon in canons or []:
-        for agent in getattr(canon, "agents", None) or []:
-            data = getattr(getattr(agent, "fiche", None), "data", None) or {}
-            roles = data.get("roles") or data.get("role") or []
-            if isinstance(roles, str):
-                roles = [roles]
-            if any(str(r).strip().lower() in ORCHESTRATOR_ROLES for r in roles):
-                found.add(agent.title)
+    found |= role_orchestrators(canons, roles)
     try:
         found |= {_bare(n) for n in storage.of(db).operations.assigners(
             since_s=ASSIGNERS_SINCE_S)}
     except Exception:
         pass
-    return sorted(n for n in found if n in names)
+    # L123 : le chat du propriétaire transmet, il ne répartit pas
+    from .chat import is_chat_agent
+    chats = {row["name"] for row in listing if is_chat_agent(row)}
+    return sorted(n for n in found if n in names and n not in chats)
 
 
 def orchestrator_held(listing: list, now: float, orchestras: list, *,
@@ -353,6 +375,8 @@ def idle_agents(listing: list, now: float, idle_s: float) -> list:
     `idle_capacity`, `backlog_empty` et la prise automatique (L119)."""
     idle = []
     for row in listing:
+        # un agent `externe` n'est jamais compté — dont le chat du
+        # propriétaire (L123), qui n'a ni exécuteur ni lot
         if (row.get("mode") or "execute") != "execute" or _state(row) != "idle":
             continue
         if not _awake_runner(row) or int(row.get("unread") or 0):
@@ -696,6 +720,9 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
                          pace_gap_pct=plan_pace_gap_pct, paid=paid)
     orchestras = orchestrators(cfg, db, listing, declared=orchestrators_declared,
                                canons=canons)
+    for alert in out:
+        # L132 : `plan_underused` part aussi aux orchestrateurs (alert_briefs)
+        alert["orchestrators"] = list(orchestras)
     out += orchestrator_held(listing, now, orchestras, held_s=orchestrator_held_s)
     out += idle_capacity(db, listing, now, orchestras, idle_s=idle_capacity_s, paid=paid)
     out += host_underused(cfg, db, listing, now, window_s=host_underused_s,

@@ -11,6 +11,44 @@
 #               (tests/parts/pilote-psql.txt) ; la suite complète, en 6 parts,
 #               sur push vers main ou release/*, et à la main (workflow_dispatch).
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable.
+#
+# L157 — une PR qui ne change QUE le numéro de version (pyproject.toml seul, la
+# seule ligne `version = "…"`) ne relance pas la suite : `main` l'a déjà
+# validée pour ce contenu. Le job « changements » le détecte
+# (scripts/version-only.py) ; les parts sont alors sautées et « tests » reste
+# vert. Au moindre doute, la suite tourne ; jamais sur un push ni à la main.
+#
+# L161a — même chose pour une PR de documentation seule (docs/, site/, *.md
+# hors src/, tests/, .github/ et examples/) : seuls ses lecteurs déclarés
+# (tests/parts/lecteurs-doc.txt) tournent, sans base, dans « lecteurs de la
+# doc ». Et une exécution de main n'est jamais annulée par la suivante : chaque
+# fusion garde son verdict.
+#
+# L161b — chaque part écrit ses résultats au fil de l'eau (--flux, JSON lignes,
+# un test par ligne, schéma ameesh-test-event/1), publiés en artefact
+# (flux-<pilote>-<part>) et résumés dans le résumé du job (scripts/ci-flux.py).
+# Les modules de test touchés par les fichiers changés (--depuis HEAD^1 : la
+# cible pour une PR, le commit précédent sur main) passent en premier dans
+# chaque part. Rien n'est sauté ; le découpage en parts ne change pas.
+#
+# L161f — the `plan` job reads the measured map (cache `carte-<sha>`, written
+# by .github/workflows/carte.yml) once for the whole run and writes plan.json
+# (scripts/test-plan.py): the class of every module (P0 changed test, P1
+# impacted by changed blocks, files or tables, P2 recent failure, P3 the
+# rest), the parts and their modules. Every part runs from that same plan
+# (`--plan`), impacted first; the matrices come from the plan (fromJSON), and
+# a driver with no part is skipped. Phase 1: nothing is skipped beyond the
+# version-only and documentation-only cases above. Map missing, stale or
+# unusable: the L161b order, full suite. The `bilan` job (never required)
+# counts the leaks (failures of modules the map did not select) and the
+# provisional green (P0 and P1 green in every part), kept as the `leaks`
+# artifact for the two-week review (L161i).
+#
+# L161c — pendant la part, `ci-flux.py publier` (arrière-plan) tient le check
+# run « tests (flux) <part> » de la tête poussée : chaque échec y entre dès
+# qu'il est écrit. `ameesh notify` le relève et l'envoie aussitôt à l'agent du
+# lot (ameesh.ci). D'où `checks: write` sur les parts ; sans ce droit (PR d'une
+# fourche), rien n'est publié et la part n'en est pas affectée.
 name: tests
 
 on:
@@ -19,15 +57,19 @@ on:
   pull_request:
   workflow_dispatch:
 
-# une exécution dépassée (nouveau commit sur la même branche ou PR) est annulée
+# une exécution de PR dépassée (nouveau commit sur la PR) est annulée ; hors
+# PR, chaque exécution a son propre groupe : ni annulée, ni écartée en attente
+# (GitHub n'en garde qu'une en attente par groupe), même sans cancel-in-progress
 concurrency:
-  group: tests-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 env:
+  # L161b : commit poussé (tête de la PR), à côté du commit de fusion testé
+  AMEESH_CI_TETE: ${{ github.event.pull_request.head.sha || github.sha }}
   AMEESH_TEST_DSN: postgresql://ameesh@127.0.0.1:5432/ameesh
   PGPASSWORD: ameesh-ci
   AMEESH_REQUIRE_DB: "1"
@@ -35,14 +77,56 @@ env:
   PYTHONPATH: src
 
 jobs:
+  # L157, L161a, L161f : nature of the change (version or documentation only,
+  # merge commit against its target) and the plan of the run, from the map
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version_only: ${{ steps.plan.outputs.version_only }}
+      docs_only: ${{ steps.plan.outputs.docs_only }}
+      doc_readers: ${{ steps.plan.outputs.doc_readers }}
+      code: ${{ steps.plan.outputs.code }}
+      psycopg: ${{ steps.plan.outputs.psycopg }}
+      psycopg_parts: ${{ steps.plan.outputs.psycopg_parts }}
+      psql: ${{ steps.plan.outputs.psql }}
+      psql_parts: ${{ steps.plan.outputs.psql_parts }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the map commit, and whether it is an ancestor
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # the most recent map of main (a PR reads the caches of its base branch)
+      - uses: actions/cache/restore@v4
+        with:
+          path: carte/carte.json.gz
+          key: carte-${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
+          restore-keys: carte-
+      - id: plan
+        name: plan of the run
+        run: |
+          python3 scripts/test-plan.py plan --out plan.json --map carte/carte.json.gz \
+            --event "${{ github.event_name }}" --github-output "$GITHUB_OUTPUT" \
+            --summary "$GITHUB_STEP_SUMMARY" --annotations
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan.json
+          retention-days: 14
+
   psycopg:
-    name: psycopg ${{ matrix.part }}/4
+    name: psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+    needs: plan
+    if: needs.plan.outputs.psycopg != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4]
+        part: ${{ fromJSON(needs.plan.outputs.psycopg) }}
     services:
       postgres:
         image: postgres:17
@@ -56,8 +140,12 @@ jobs:
           --tmpfs /var/lib/postgresql/data
           --health-cmd "pg_isready -U ameesh"
           --health-interval 2s --health-timeout 5s --health-retries 30
+    permissions:
+      contents: read
+      checks: write  # L161c : check run « tests (flux) »
     env:
       AMEESH_DRIVER: psycopg
+      FLUX_NOM: tests (flux) psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
     steps:
       - uses: actions/checkout@v4
       - id: py
@@ -90,17 +178,54 @@ jobs:
           git config --global user.name "ameesh ci"
           git config --global user.email "ci@ameesh.invalid"
           git config --global init.defaultBranch main
-      - name: part ${{ matrix.part }}/4
-        run: .venv-ci/bin/python scripts/test-parts.py lancer --parts 4 --part ${{ matrix.part }} --pilote psycopg
+      - &plan
+        uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: ${{ runner.temp }}
+      - &publier
+        name: publication du flux en direct (check run)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          nohup python3 scripts/ci-flux.py publier "$RUNNER_TEMP/flux.jsonl" --nom "$FLUX_NOM"
+          > "$RUNNER_TEMP/publier.log" 2>&1 &
+      - name: part ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+        run: >-
+          .venv-ci/bin/python scripts/test-parts.py lancer --plan "$RUNNER_TEMP/plan.json"
+          --part ${{ matrix.part }} --pilote psycopg --flux "$RUNNER_TEMP/flux.jsonl"
+      - &fermer
+        name: fin du check run du flux
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci-flux.py fermer "$RUNNER_TEMP/flux.jsonl" --nom "$FLUX_NOM"
+          cat "$RUNNER_TEMP/publier.log" 2>/dev/null || true
+      - &resume
+        name: résumé du flux
+        if: always()
+        run: python scripts/ci-flux.py resume "$RUNNER_TEMP/flux.jsonl" >> "$GITHUB_STEP_SUMMARY"
+      - name: flux en artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flux-psycopg-${{ matrix.part }}
+          path: ${{ runner.temp }}/flux.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
 
   psql:
-    name: psql ${{ matrix.part }}/${{ github.event_name == 'pull_request' && 1 || 6 }}
+    name: psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
+    needs: plan
+    if: needs.plan.outputs.psql != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        part: ${{ fromJSON(github.event_name == 'pull_request' && '[1]' || '[1, 2, 3, 4, 5, 6]') }}
+        # sur une PR : les modules « pilote » seulement (tests/parts/pilote-psql.txt)
+        part: ${{ fromJSON(needs.plan.outputs.psql) }}
     services:
       postgres:
         image: postgres:17
@@ -113,11 +238,12 @@ jobs:
           --tmpfs /var/lib/postgresql/data
           --health-cmd "pg_isready -U ameesh"
           --health-interval 2s --health-timeout 5s --health-retries 30
+    permissions:
+      contents: read
+      checks: write  # L161c
     env:
       AMEESH_DRIVER: psql
-      PARTS: ${{ github.event_name == 'pull_request' && 1 || 6 }}
-      # sur une PR : les modules « pilote » seulement
-      LISTE: ${{ github.event_name == 'pull_request' && 'tests/parts/pilote-psql.txt' || '' }}
+      FLUX_NOM: tests (flux) psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -125,14 +251,30 @@ jobs:
           python-version: "3.12"
       - *base
       - *git
+      - *plan
+      - *publier
       - name: part ${{ matrix.part }}
-        run: python scripts/test-parts.py lancer --parts "$PARTS" --part ${{ matrix.part }} --pilote psql ${LISTE:+--liste "$LISTE"}
+        run: >-
+          python scripts/test-parts.py lancer --plan "$RUNNER_TEMP/plan.json"
+          --part ${{ matrix.part }} --pilote psql --flux "$RUNNER_TEMP/flux.jsonl"
+      - *fermer
+      - *resume
+      - name: flux en artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flux-psql-${{ matrix.part }}
+          path: ${{ runner.temp }}/flux.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
 
   # L63 : la couche plateforme (ameesh.platform) et son lint, sans base, sous
   # macOS avec psutil. Sous Linux, les parts psycopg passent par psutil et les
   # parts psql (sans psutil) par le repli /proc.
   platform-macos:
     name: plateforme macOS
+    needs: plan
+    if: needs.plan.outputs.code == 'true'
     runs-on: macos-latest
     timeout-minutes: 10
     env:
@@ -147,19 +289,84 @@ jobs:
       - name: couche plateforme et lint
         run: python -m unittest -v tests.test_l63_platform.PlatformTest tests.test_l63_platform.LintTest
 
+  # L161a : PR de documentation seule, ses lecteurs déclarés seulement, sans base
+  doc-readers:
+    name: lecteurs de la doc
+    needs: plan
+    if: needs.plan.outputs.docs_only == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AMEESH_REQUIRE_DB: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: lecteurs de la doc
+        run: python -m unittest -v ${{ needs.plan.outputs.doc_readers }}
+
+  # L161f : leaks (failures of modules the map did not select) and the
+  # provisional green, for the two-week review (L161i); never required
+  bilan:
+    name: bilan des impactés
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
+    needs: [plan, psycopg, psql]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: flux-*
+          path: flux
+      - name: leaks and provisional green
+        run: |
+          python3 scripts/test-plan.py leaks plan.json flux/*/flux.jsonl --out leaks.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: leaks
+          path: leaks.json
+          retention-days: 90
+
   # nom de vérification stable : vert seulement si toutes les parts le sont
+  # (L157 : ou si la PR ne change que le numéro de version, parts sautées ;
+  # L161a : ou que de la documentation, et ses lecteurs sont verts ;
+  # L161f : une part que le plan n'a pas prévue est sautée)
   tests:
     name: tests
     if: always()
-    needs: [psycopg, psql, platform-macos]
+    needs: [plan, psycopg, psql, platform-macos, doc-readers]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: bilan des parts
         run: |
-          echo "psycopg : ${{ needs.psycopg.result }}"
-          echo "psql    : ${{ needs.psql.result }}"
+          echo "plan    : ${{ needs.plan.result }} (version seule : ${{ needs.plan.outputs.version_only }}, doc seule : ${{ needs.plan.outputs.docs_only }})"
+          echo "doc     : ${{ needs.doc-readers.result }}"
+          echo "psycopg : ${{ needs.psycopg.result }} (parts ${{ needs.plan.outputs.psycopg }})"
+          echo "psql    : ${{ needs.psql.result }} (parts ${{ needs.plan.outputs.psql }})"
           echo "macOS   : ${{ needs.platform-macos.result }}"
+          test "${{ needs.plan.result }}" = success
+          if [ "${{ needs.plan.outputs.version_only }}" = "true" ]; then
+            echo "PR de version seule : suite déjà validée sur main, parts sautées"
+            exit 0
+          fi
+          if [ "${{ needs.plan.outputs.docs_only }}" = "true" ]; then
+            echo "PR de documentation seule : ses lecteurs seulement, parts sautées"
+            test "${{ needs.doc-readers.result }}" = success
+            exit 0
+          fi
+          # code changed: psycopg always runs (an empty matrix, e.g. tests moved to
+          # a subfolder, is an error); psql may be skipped when the plan gave it no part
           test "${{ needs.psycopg.result }}" = success
-          test "${{ needs.psql.result }}" = success
+          test "${{ needs.psql.result }}" = success || { test '${{ needs.plan.outputs.psql }}' = '[]' && test "${{ needs.psql.result }}" = skipped; }
           test "${{ needs.platform-macos.result }}" = success

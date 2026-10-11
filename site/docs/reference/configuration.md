@@ -36,6 +36,7 @@ No secret is stored in the repository. The database password comes from
 | `AMEESH_POLL` | `poll` | 5 s | fallback poll interval |
 | `AMEESH_IDLE_NUDGE` | `idle_nudge` | 1200 s | nudge after inactivity |
 | `AMEESH_EVENT_COALESCE` | `event_coalesce` | 120 s | at most one wake-up per window for events |
+| `AMEESH_MAIL_BATCH` | `mail_batch` | 90 s | batching window: an idle agent is woken this long after its oldest waiting message, in one turn for all of them; `--urgent` and human mail wake at once; per agent (local state of its host): `ameesh set <agent> mail_batch=…`; 0 = wake at once |
 | `AMEESH_INTERRUPT_SENDERS` | `interrupt_senders` | — | senders whose `--urgent` messages interrupt a turn |
 | `AMEESH_SESSION_MAX_TOKENS` | `session_max_tokens` | 150000 | rotate the session above this size |
 | `AMEESH_SESSION_MAX_TURN_SECONDS` | `session_max_turn_seconds` | 900 | rotate after a turn longer than this |

@@ -40,7 +40,7 @@ SIGNATURES = {
     "agent_registry": {"public_key"},
     "agent_mesh_overview": {"public_key"},
     "authenticators": {"public_key", "credential_id"},
-    # exécuteurs médiés (voie B, 0051 et 0052)
+    # exécuteurs médiés (voie B, 0062 et 0063)
     "executor_tokens": {"token_sha256"},
     "executor_invitations": {"code_sha256"},
     "executor_assertion_jti": {"jti"},
@@ -62,6 +62,8 @@ CONTENUS = {
     "work_item_milestones": {"note"},
     "mesh_approvals": {"meta"},
     "mesh_approvals_status": {"meta"},
+    # L161c (0055) : sortie d'un test en échec
+    "ci_test_failures": {"excerpt"},
 }
 #: colonnes refusées au rôle de base. Une colonne nouvelle, ni accordée ni
 #: listée ici, fait échouer le test : une migration oblige à trancher.

@@ -43,6 +43,9 @@ export AMEESH_GH_BIN="$REPO/tests/fakebin/gh"
 export AMEESH_FAKE_GH_STATE="$WORK/gh-etat.json" AMEESH_FAKE_GH_LOG="$WORK/gh-journal.jsonl"
 export AMEESH_CANON="$WORK/canon/acme" AMEESH_HOST=atelier
 export AMEESH_HUMANS=alice,bruno
+# L125 : la démo réveille tout de suite (`agent-runner --once` n'attend pas la
+# fenêtre de regroupement du courrier, 90 s par défaut)
+export AMEESH_MAIL_BATCH=0
 # jauges de forfait isolées, comme dans les tests : la garde de budget reste
 # active, mais elle lit un CODEX_HOME vide (effacé avec le dossier de travail),
 # jamais les journaux réels du poste (~/.codex) — un forfait réel avancé

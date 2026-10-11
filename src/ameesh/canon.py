@@ -3,6 +3,8 @@
 
 Spec §4. ameesh ne lit que le **frontmatter** des fichiers `.md` d'un bundle
 OKF (hors `index.md` et `log.md`) et n'écrit jamais dans le canon.
+`log.md` est facultatif : l'historique d'un canon, ce sont git et les PR
+fusionnées ; un canon qui en garde un n'est pas gêné (il reste ignoré).
 
 Source approuvée (§4.1) : le canon est lu **par les objets git, à la révision
 fusionnée de la branche canonique** — `AMEESH_CANON_REF` si posé, sinon le
@@ -2261,7 +2263,32 @@ class _Loader:
                              % key, **where, **subject)
                     continue
                 parsed[key] = octets
-        for unknown in sorted(set(raw) - set(resources_mod.THRESHOLD_KEYS)):
+        # L159c : plafonds mémoire des unités d'agent (tailles, > 0)
+        for key in resources_mod.AGENT_MEMORY_KEYS:
+            value = raw.get(key)
+            if value is None:
+                continue
+            if key == "agent_memory_max":
+                octets = resources_mod.parse_bytes(value)
+                if not octets:
+                    self.add("host-policy-invalid", ERROR,
+                             "`policy.resources.agent_memory_max` : taille attendue (ex. 6G)",
+                             **where, **subject)
+                    continue
+                parsed[key] = octets
+                continue
+            caps = {}
+            if isinstance(value, dict):
+                caps = {str(agent): resources_mod.parse_bytes(size)
+                        for agent, size in value.items()}
+            if not isinstance(value, dict) or not all(caps.values()):
+                self.add("host-policy-invalid", ERROR,
+                         "`policy.resources.agent_memory_max_by_agent` : mapping "
+                         "{agent: taille} attendu (ex. mesh-design: 8G)", **where, **subject)
+                continue
+            parsed[key] = caps
+        for unknown in sorted(set(raw) - set(resources_mod.THRESHOLD_KEYS)
+                              - set(resources_mod.AGENT_MEMORY_KEYS)):
             self.add("host-resources-unknown", WARNING,
                      "`policy.resources.%s` : clé inconnue (ignorée)" % unknown,
                      **where, **subject)

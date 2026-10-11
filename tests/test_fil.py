@@ -850,6 +850,7 @@ class FilPgTest(PgTestCase):
         self.assertEqual(self.unread_count("beta"), 3)
 
     def test_cli_send_avec_fil_casse(self):
+        registry.upsert(self.db, "beta", harness="codex", host=self.cfg.host)
         env = self.env(AGENT_MAIL_NAME="alpha", AMEESH_THREADS=self.broken_threads())
         proc = self.cli("send", "beta", "toujours livré", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -906,6 +907,7 @@ class FilPgTest(PgTestCase):
 
     # -- refus des corps illisibles -----------------------------------------
     def test_cli_refuse_les_corps_illisibles(self):
+        registry.upsert(self.db, "beta", harness="codex", host=self.cfg.host)
         env = self.env(AGENT_MAIL_NAME="alpha")
         for corps, motif in (('{"etat": "ok"}', "JSON"), ("\x1b[31mrouge", "contrôle"),
                              ("ab12" * 60, "encodé")):
@@ -970,6 +972,7 @@ class FilPgTest(PgTestCase):
 
     def test_hook_livre_un_message_dont_le_fil_a_echoue(self):
         casse = self.broken_threads()
+        registry.upsert(self.db, "lima", harness="claude", host=self.cfg.host)
         envoi = self.cli("send", "lima", "livré malgré le fil",
                          env=self.env(AGENT_MAIL_NAME="beta", AMEESH_THREADS=casse))
         self.assertEqual(envoi.returncode, 0, envoi.stderr)
@@ -985,6 +988,7 @@ class FilPgTest(PgTestCase):
     # -- CLI ameesh fil -----------------------------------------------------
     def test_cli_fil_list_et_show(self):
         registry.upsert(self.db, "alpha", chantier="nexlink")
+        registry.upsert(self.db, "beta", harness="codex", host=self.cfg.host)
         env = self.env(AGENT_MAIL_NAME="alpha")
         for n in range(3):
             self.assertEqual(self.cli("send", "beta", "message %d" % n, env=env).returncode, 0)
@@ -1017,6 +1021,7 @@ class FilPgTest(PgTestCase):
         self.assertEqual(proc.returncode, 2)
 
     def test_cli_fil_tail_suit_puis_sort_au_ctrl_c(self):
+        registry.upsert(self.db, "beta", harness="codex", host=self.cfg.host)
         env = self.env(AGENT_MAIL_NAME="alpha")
         self.cli("send", "beta", "avant le suivi", env=env)
         tail = subprocess.Popen(
@@ -1057,6 +1062,7 @@ class FilPgTest(PgTestCase):
 
     def test_envois_concurrents_index_coherent(self):
         registry.upsert(self.db, "alpha", chantier="nexlink")
+        registry.upsert(self.db, "beta", harness="codex", host=self.cfg.host)
         procs = [subprocess.Popen(
             [sys.executable, "-m", "ameesh.cli", "send", "beta", "envoi parallèle %d" % n],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,

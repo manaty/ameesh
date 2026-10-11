@@ -11,7 +11,7 @@ import sys
 import unittest
 from unittest import mock
 
-from ameesh import cli
+from ameesh import cli, registry
 
 from .support import REPO, PgTestCase
 
@@ -166,6 +166,8 @@ class CliCompatTest(PgTestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("identité non liée", proc.stderr)
 
+        # un destinataire inscrit : un nom absent du registre est refusé
+        registry.upsert(self.db, "beta", harness="codex", host=self.cfg.host)
         proc = self.cli("send", "beta", "sans expéditeur", env=env)
         self.assertEqual(proc.returncode, 2)
         self.assertIn("--from", proc.stderr)
@@ -256,6 +258,7 @@ class CliCompatTest(PgTestCase):
         self.assertEqual(row["status_text"], "banc v1")
 
     def test_send_inbox_list(self):
+        registry.upsert(self.db, "alpha", harness="claude", host=self.cfg.host)
         proc = self.cli("send", "alpha", "bonjour alpha", env=self.env(AGENT_MAIL_NAME="beta"))
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout.strip(), "déposé pour : alpha")
@@ -282,6 +285,7 @@ class CliCompatTest(PgTestCase):
         dossier = os.path.join(self.tmp, "sl")
         os.makedirs(dossier, exist_ok=True)
         self.cli("alias", "india", dossier, "chantier")
+        registry.upsert(self.db, "india", harness="claude", host=self.cfg.host)
         self.cli("send", "india", "un message", env=self.env(AGENT_MAIL_NAME="beta"))
         payload = json.dumps({"workspace": {"current_dir": dossier}})
         proc = self.cli("statusline", stdin=payload)

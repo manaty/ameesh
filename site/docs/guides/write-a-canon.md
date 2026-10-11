@@ -10,12 +10,14 @@ Card types are described in
 ## 1. Layout
 
 Any layout works; ameesh reads the `type` in each file's frontmatter. The
-example uses one folder per kind:
+example uses one folder per kind. Folder, file and member names are those of
+the example canon shipped in `examples/canon/` (in French: `membres` members,
+`hotes` hosts, `orchestre` orchestrator, `relecteur` reviewer, `ouvrier`
+worker, `atelier` workshop, `banc` test bench); they are plain identifiers:
 
 ```
 examples/canon/
 ├── index.md                          # type: Index
-├── log.md                            # type: Log
 ├── membres/alice.md                  # type: Member
 ├── membres/bruno.md
 ├── hotes/atelier.md                  # type: Host
@@ -29,8 +31,11 @@ examples/canon/
 └── decisions/0001-placement-du-banc.md   # type: Decision
 ```
 
-`index.md`, `log.md` and the decision are ordinary OKF files of other types:
-ameesh ignores them, so a canon can carry more than ameesh needs. The example
+`index.md` and the decision are ordinary OKF files of other types: ameesh
+ignores them, so a canon can carry more than ameesh needs. A canon needs no
+hand-kept change log: its history is git and the merged pull requests. A
+`log.md` (type `Log`) is optional and, if an older canon still has one,
+ignored like `index.md`. The example
 has no `federation.yaml`; add one when you need federation members or review
 policies (section 6).
 
@@ -56,7 +61,7 @@ request.
 ---
 type: Host
 title: banc
-description: "Serveur de test : DeepSeek et Codex seulement, clé d'API seulement."
+description: "Test server: DeepSeek and Codex only, API key only."
 responsible: human:alice
 policy:
   harnesses:

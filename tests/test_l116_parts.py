@@ -59,6 +59,25 @@ class RepartitionTest(unittest.TestCase):
         finally:
             pathlib.Path(f.name).unlink()
 
+    def test_liste_pilote_rangee(self):
+        """L160a : liste additive, un module par ligne, rangée, sans doublon."""
+        mods = parts.modules()
+        for contenu in ("test_migrations\ntest_catalog_store\n",
+                        "test_catalog_store\ntest_catalog_store\n"):
+            with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+                f.write(contenu)
+            try:
+                with self.assertRaises(SystemExit):
+                    parts.lire_liste(f.name, mods)
+            finally:
+                pathlib.Path(f.name).unlink()
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+            f.write("# en-tête\ntest_catalog_store  # raison\ntest_migrations  # raison\n")
+        try:
+            self.assertEqual(parts.lire_liste(f.name, mods), ["test_catalog_store", "test_migrations"])
+        finally:
+            pathlib.Path(f.name).unlink()
+
 
 if __name__ == "__main__":
     unittest.main()

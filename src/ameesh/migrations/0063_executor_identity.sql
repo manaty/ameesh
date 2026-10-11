@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
--- 0052_executor_identity — enrôlement et identité des exécuteurs
+-- 0063_executor_identity — enrôlement et identité des exécuteurs
 -- médiés (lot L110, étude de l'exécuteur médié §3).
 --
 -- Un appareil prêté (VM Compute) n'a aucun accès à la base : il parle au
@@ -29,8 +29,8 @@
 -- `mesh_approvals`, ni nonces, ni autorisations permanentes, ni
 -- authentificateurs.
 --
--- Numérotation de la voie B : 0051 (L108), 0052 (L110), 0053 (L111), après
--- 0043 à 0047 (lots de la 1.6.0), 0048 (L63), 0049 (L119) et 0050 (L118).
+-- Path B numbering: 0062 (L108), 0063 (L110), 0064 (L111), after main's
+-- 0051 to 0057; 0058 to 0061 belong to other lots (lot #100 reservation).
 
 create table if not exists executor_invitations (
     code_sha256      text primary key,

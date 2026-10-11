@@ -247,7 +247,7 @@ class AlerteEtNotifyTest(_Base):
         self.assertEqual([(r["agent"], r["lot"]) for r in prises], [("claude1", item["id"])])
         self.assertIn("prise automatique", notify._format(prises[0]))
         self.assertEqual(work.get(self.db, item["id"])["assignee"], "claude1")
-        args = notify.build_parser().parse_args(["--take-idle", "0"])
+        args = notify.build_parser().parse_args(["--take-idle", "0", "--take-lot-idle", "0"])
         self.assertIsNone(notify.take_settings(args))
 
 

@@ -36,7 +36,10 @@ ameesh mail send <agent> "<text>"                 # agent-mail, unchanged for th
 ameesh fil list | show <project> [<lot>]          # readable threads
 ameesh action propose | execute | reconcile …     # the gate
 ameesh action request | fetch-receipt <id>        # ask ameesh-approve, attach the receipt
-ameesh decisions [--for human:ID]                 # what waits for a human
+ameesh decisions [--all] [--for human:ID]         # what waits for a human, all projects
+ameesh decide ask --lot <id> --question … --option a=…   # an agent asks the owner (L124)
+ameesh decide <id> <option|"text"> [--key F]      # the owner answers (humans only)
+ameesh chat                                       # the owner's own chat agent (L123)
 ameesh receipt verify | authenticator list        # receipts, trust registry
 ameesh review-class <files…|--diff REF>           # review class of a change (canon policy)
 ameesh-approve serve | enroll-link | gen-token    # the approval service (own user)
@@ -130,7 +133,8 @@ Repo-local wrappers: `bin/ameesh`, `bin/agent-mail`, `bin/agent-runner`, `bin/am
 
 ```
 agent-mail send <dest> <texte…> [--from NOM] [--lot ID] [--kind request|reply|notify|event] [--urgent]
-                                               # dest = nom ou "all" ; --urgent : événement (C9)
+               [--ack] [--cc NOM[,NOM…]]       # dest = nom ou "all" ; L125 : courrier regroupé
+                                               # (90 s), --urgent sans délai, --ack et --cc sans réveil
 agent-mail list                                # nom, outil, âge, non lus, dossier, hôte, bail
 agent-mail inbox [NOM]                         # non lus, sans les marquer lus
 agent-mail whoami                              # identité liée (nom + source : runner, explicit,
@@ -148,7 +152,13 @@ agent-mail migrate                             # migrations versionnées
 agent-mail doctor [--notify-test]              # pilote, schéma, migrations, LISTEN/NOTIFY
 ```
 
-Les **événements** (`--kind event`) réveillent l'agent comme un message, mais un
+Le **courrier est regroupé** (L125) : un agent au repos n'est réveillé qu'au
+bout de `AMEESH_MAIL_BATCH` secondes (défaut 90, `ameesh set <agent>
+mail_batch=…`) après l'arrivée du premier message, en un seul tour pour tout
+ce qui est arrivé ; un message `--urgent` ou d'un humain réveille tout de
+suite ; un accusé de réception (`--ack`, ou reconnu), une copie (`--cc`) et
+une diffusion à « all » sont lus au tour suivant, sans réveil. Les
+**événements** (`--kind event`) réveillent l'agent comme un message, mais un
 lot d'événements n'en réveille qu'un par `AMEESH_EVENT_COALESCE` secondes
 (défaut 120) ; `--urgent` perce le regroupement. Un `--urgent` venu d'un
 expéditeur habilité (`AMEESH_INTERRUPT_SENDERS`, demain une capacité du canon)
@@ -342,7 +352,15 @@ CI splits the suite the same way (`scripts/test-parts.py`, by module, balanced
 on the measured durations of `tests/parts/durees.json`): on a pull request,
 `psycopg` runs the full suite in 4 parts and `psql` only the driver modules of
 `tests/parts/pilote-psql.txt`; the full `psql` suite (6 parts) runs on pushes
-to `main` and `release/*`. The `tests` job aggregates the parts.
+to `main` and `release/*`. The `tests` job aggregates the parts. Each part
+streams its results, one JSON line per test (`--flux`, schema
+`ameesh-test-event/1`), published as the `flux-<driver>-<part>` artifact and in
+the job summary (`scripts/ci-flux.py resume`). A `plan` job reads the measured
+test → code map once per run (`scripts/test-plan.py`, L161f) and every part
+runs from that plan: the test modules impacted by the change (changed code
+blocks, data files, directories, tables) run first, nothing is skipped; map
+missing or stale, the order falls back to the modules whose text names a
+changed file.
 
 158 tests against the local container, run twice (`psql`, then `psycopg` with
 `cryptography`): migrations and immutability, mailbox and LISTEN/NOTIFY round

@@ -107,6 +107,24 @@ class Runtime:
             self._labels[turn_id] = self._ids("ameesh.turn=%s" % turn_id)
         return list(self._labels[turn_id])
 
+    def turn_containers(self, turn_id: str) -> list[dict] | None:
+        """Les conteneurs EN COURS qui portent l'étiquette du tour, relevé
+        frais : `id`, `name`, `image`, `lot` (étiquette `ameesh.lot`, ou None).
+        Un conteneur sans lot est un travail de fond du tour ; un conteneur de
+        lot (base de test réutilisée d'un tour à l'autre) vit jusqu'à la fin
+        du lot (L73). Met à jour le cache de `running_for_turn`. None si le
+        moteur ne répond pas."""
+        if not turn_id:
+            return []
+        rows = self.list_all()
+        if rows is None:
+            return None
+        out = [{"id": row["id"], "name": row["name"], "image": row["image"],
+                "lot": row["labels"].get("ameesh.lot") or None}
+               for row in rows if row["labels"].get("ameesh.turn") == turn_id]
+        self._labels[turn_id] = [c["id"] for c in out]
+        return out
+
     def list_all(self) -> list[dict] | None:
         """Tous les conteneurs EN COURS (L73, lecture seule) : `id`, `name`,
         `image`, `created`, `labels` ; None si le moteur ne répond pas."""

@@ -5,7 +5,13 @@
 Émet le même flux JSONL que `claude -p --output-format stream-json`, journalise
 son argv dans $AMEESH_TEST_LOG, et obéit à deux variables de banc :
 AMEESH_TEST_SLEEP (secondes de sommeil) et AMEESH_TEST_EXIT (code) ; L105 :
-AMEESH_TEST_CLAUDE_CALLS (JSON : appels au modèle, jetons relus, outil, durée).
+AMEESH_TEST_CLAUDE_CALLS (JSON : appels au modèle, jetons relus, outil, durée ;
+L217 : `parent`, l'outil du fil principal dont l'appel est un sous-agent).
+Travail de fond : AMEESH_TEST_BACKGROUND (commande shell lancée en fond, dans
+le groupe du tour, que le harnais n'attend pas) et AMEESH_TEST_BACKGROUND_PID
+(fichier où écrire son pid). L217b : AMEESH_TEST_CLAUDE_ON_TERM (JSON : un
+appel du fil principal émis à la réception de SIGTERM, donc lu après la
+clôture du tour, comme un appel encore en tampon).
 """
 import json
 import os
@@ -53,6 +59,28 @@ def main() -> int:
         os.makedirs(dehors, exist_ok=True)
         with open(os.path.join(dehors, "gros"), "wb") as fh:
             fh.write(b"y" * 200_000)
+    if os.environ.get("AMEESH_TEST_BACKGROUND"):
+        # un travail lancé en fond pendant le tour (comme `cmd &` d'un outil) :
+        # même groupe, sorties détournées (un vrai harnais capture celles de
+        # ses outils), jamais attendu par le harnais
+        import subprocess
+        fond = subprocess.Popen(["sh", "-c", os.environ["AMEESH_TEST_BACKGROUND"]],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        if os.environ.get("AMEESH_TEST_BACKGROUND_PID"):
+            with open(os.environ["AMEESH_TEST_BACKGROUND_PID"], "w", encoding="utf-8") as fh:
+                fh.write(str(fond.pid))
+    if os.environ.get("AMEESH_TEST_RUN"):
+        # L123 : une commande lancée DANS la session, comme par l'outil Bash
+        # du harnais (`ameesh chat` de bout en bout) ; son résultat au journal
+        import subprocess
+        proc = subprocess.run(os.environ["AMEESH_TEST_RUN"], shell=True,
+                              capture_output=True, text=True)
+        if log:
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"harness": "claude", "run": {
+                    "code": proc.returncode, "stdout": proc.stdout,
+                    "stderr": proc.stderr}}) + "\n")
     if os.environ.get("AMEESH_TEST_SLEEP"):
         time.sleep(float(os.environ["AMEESH_TEST_SLEEP"]))
     if os.environ.get("AMEESH_TEST_KILL_SELF"):
@@ -62,11 +90,27 @@ def main() -> int:
         session = args[args.index("--resume") + 1]
     print(json.dumps({"type": "system", "subtype": "init", "session_id": session,
                       "cwd": os.getcwd()}), flush=True)
+    if os.environ.get("AMEESH_TEST_CLAUDE_ON_TERM"):
+        tampon = json.loads(os.environ["AMEESH_TEST_CLAUDE_ON_TERM"])
+
+        def _sur_term(_signum, _frame):
+            relus = int(tampon.get("reread", 0))
+            print(json.dumps({"type": "assistant", "parent_tool_use_id": None,
+                              "session_id": session, "message": {
+                                  "id": "msg-tampon", "content": [{"type": "text", "text": "tampon"}],
+                                  "usage": {"input_tokens": relus // 10,
+                                            "cache_read_input_tokens": relus - relus // 10,
+                                            "output_tokens": 10}}}), flush=True)
+            sys.exit(143)
+
+        signal.signal(signal.SIGTERM, _sur_term)
     if os.environ.get("AMEESH_TEST_RATE_LIMIT"):
         # relevé de jauge enregistré (L30) : rejoué tel quel dans le flux
         print(json.dumps({"type": "rate_limit_event", "rate_limit_info": {
             "unifiedWindows": json.loads(os.environ["AMEESH_TEST_RATE_LIMIT"])}}), flush=True)
     appels = json.loads(os.environ.get("AMEESH_TEST_CLAUDE_CALLS") or "[]")
+    # L221 : le `result` porte l'usage du tour, comme le vrai flux
+    tour = {"input_tokens": 100, "cache_read_input_tokens": 0, "output_tokens": 20}
     for index, appel in enumerate(appels):
         # L105 : un appel au modèle — usage par message (répété sur chaque bloc,
         # comme le vrai flux), puis, s'il appelle un outil, son résultat
@@ -74,20 +118,32 @@ def main() -> int:
         usage = {"input_tokens": relus // 10, "cache_read_input_tokens": relus - relus // 10,
                  "output_tokens": 10}
         message = {"id": "msg-%d" % index, "usage": usage}
-        print(json.dumps({"type": "assistant", "message": dict(message, content=[
-            {"type": "text", "text": "appel %d" % index}])}), flush=True)
+        for cle, valeur in usage.items():
+            tour[cle] += valeur
+        # L217 : `parent` = appel d'un sous-agent, lancé par cet outil du fil
+        # principal (comme le vrai flux : `parent_tool_use_id`, nul sinon)
+        fil = {"parent_tool_use_id": appel.get("parent"), "session_id": session}
+        print(json.dumps(dict(fil, type="assistant", message=dict(message, content=[
+            {"type": "text", "text": "appel %d" % index}]))), flush=True)
         if appel.get("tool"):
-            print(json.dumps({"type": "assistant", "message": dict(message, content=[
-                {"type": "tool_use", "id": "outil-%d" % index, "name": "x", "input": {}}])}),
+            print(json.dumps(dict(fil, type="assistant", message=dict(message, content=[
+                {"type": "tool_use", "id": "outil-%d" % index, "name": "x", "input": {}}]))),
                 flush=True)
             time.sleep(float(appel.get("sleep", 0)))
-            print(json.dumps({"type": "user", "message": {"role": "user", "content": [
+            print(json.dumps(dict(fil, type="user", message={"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "outil-%d" % index,
-                 "content": "ok"}]}}), flush=True)
+                 "content": "ok"}]})), flush=True)
+    # L218 : AMEESH_TEST_RESULT, la réponse du tour (message et `result`)
+    reponse = os.environ.get("AMEESH_TEST_RESULT")
+    if reponse is None:
+        reponse_texte, reponse = "bonjour du faux claude (session %s)" % session, "fini"
+    else:
+        reponse_texte = reponse  # vide compris : un tour sans réponse
     print(json.dumps({"type": "assistant", "message": {"content": [
-        {"type": "text", "text": "bonjour du faux claude (session %s)" % session}]}}), flush=True)
-    print(json.dumps({"type": "result", "subtype": "success", "result": "fini",
-                      "total_cost_usd": 0.0125, "session_id": session}), flush=True)
+        {"type": "text", "text": reponse_texte}]}}), flush=True)
+    print(json.dumps({"type": "result", "subtype": "success", "result": reponse,
+                      "total_cost_usd": 0.0125, "usage": tour, "session_id": session}),
+          flush=True)
     return int(os.environ.get("AMEESH_TEST_EXIT", "0"))
 
 

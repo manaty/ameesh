@@ -19,13 +19,22 @@
   agent-mesh work add --title T [--type bug|evolution] [--app A] [--assignee N] …
   agent-mesh work list [--state S] | work show <id> | work move <id> <état> | work note <id> "…"
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   réassigner (attribution gardée)
+  agent-mesh work merged <id> --sha S [--note …]   fusion faite hors PR : tout état ouvert → merged
+  agent-mesh work migration <id> [--number N | --release]   réserver le numéro de migration du lot (L122)
+  agent-mesh work resolve <id> --with <autre> [--done | --abort]   résolution préparée d'un conflit (L160d)
+  agent-mesh work move <id> merged --correct "raison"   corriger un promoted posé par erreur
+                                                (l'acteur des commandes work : --actor, sinon
+                                                l'identité liée de la session, sinon « inconnu »)
   agent-mesh import-v0 [--agents a,b] [--dry-run]     bascule : boîte fichier v0 → Postgres
   agent-mesh export-v0 [--agents a,b] [--keep]        retour arrière : Postgres → boîte v0
-  agent-mesh migrate | doctor [--notify-test | --probe]
+  agent-mesh migrate [--dry-run | --additive-only]   --additive-only : rien si une migration n'est pas additive (L151)
+  agent-mesh doctor [--notify-test | --probe]
   agent-mesh canon check|show|sync [--json] [--host H]   canon OKF (spec §4)
   agent-mesh placement check [--agent A] [--json]        admissions et hôtes admissibles (C4)
   agent-mesh hosts [--json] [HÔTE] [--history N]         ressources des hôtes (L31)
   agent-mesh menage [--dry-run | --apply] [--json]       ménage des agents (L73)
+  agent-mesh conflicts [--project P] [--all] [--json]   radar de conflits entre lots (L160b)
+  agent-mesh ci status <lot> [--limit N] [--json]       CI relevée en direct, échecs (L161c)
   agent-mesh agent spawn <nom> --by <créateur> --ttl 2h   agent éphémère (R14)
 
 L'autorité du propriétaire ne se déduit jamais d'un texte : elle se prouve par
@@ -374,6 +383,10 @@ def _print_host_menage(menage: dict) -> None:
             " — ALERTE : au-delà de %d %% (ameesh menage pour voir ce qui l'occupe)"
             % round(policy["tmpfs_alert"] * 100) if menage.get("tmpfs_alert") else ""))
     m = menage.get("measure")
+    if menage.get("tmpfs_alert") and (m or {}).get("system_tmp_top"):
+        # L162 : les plus grosses entrées relevées par le dernier bilan
+        from .menage import describe_top
+        print("  /tmp gros  %s" % describe_top(m["system_tmp_top"]))
     if m:
         print("  ménage     dossiers temporaires %s (quota %s par agent) ; caches %s / %s"
               "%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
@@ -404,6 +417,18 @@ def _print_host_menage(menage: dict) -> None:
             wt.get("active", 0), len(wt.get("kept") or []),
             " : " + " ; ".join("%s (%s)" % (k["path"], k["detail"]) for k in wt["kept"][:5])
             if wt.get("kept") else ""))
+
+
+def cmd_conflicts(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh conflicts` (L160b) : voir `ameesh.radar.cmd_conflicts`."""
+    from . import radar
+    return radar.cmd_conflicts(cfg, args)
+
+
+def cmd_ci(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh ci status` (L161c) : voir `ameesh.ci.cmd_ci`."""
+    from . import ci
+    return ci.cmd_ci(cfg, args)
 
 
 def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
@@ -766,18 +791,49 @@ def _print_assignment(check: dict | None) -> None:
         print("avertissement : %s" % check["warning"], file=sys.stderr)
 
 
+#: sous-commandes `work` dont `--actor` a son propre sens (le délégant de
+#: `delegate`) ou son propre défaut non vide (relevés, échéances)
+_OWN_ACTOR = ("delegate", "expire-delegations", "sync-branches")
+
+
+def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
+    """L'acteur des commandes `work` (correctif du 2026-10-11) : `--actor`,
+    sinon l'identité liée de la session, jamais vide (« inconnu », averti).
+    Une correction d'état (`move --correct`) vérifie en plus qui corrige."""
+    if args.work_command == "move" and getattr(args, "correct", None) is not None:
+        args.actor = work.corrector(cfg, db, args.actor)
+        return
+    if args.work_command in _OWN_ACTOR or getattr(args, "actor", None) is None:
+        return
+    args.actor, warning = work.resolve_actor(cfg, db, args.actor)
+    if warning:
+        print("avertissement : %s" % warning, file=sys.stderr)
+
+
 def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
     from . import plan, plan_cli, stagnation  # plan de travail (L29)
     db = _open(cfg)
     try:
+        _work_actor(cfg, db, args)
         if args.work_command in plan_cli.COMMANDS:
             return plan_cli.run(db, args)
         if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
             from . import backlog
             return backlog.run(db, args)
+        if args.work_command == "unrecorded":   # demandes d'humains sans lot (L130)
+            from . import unrecorded
+            return unrecorded.run(cfg, db, args)
+        if args.work_command == "resolve":   # prepared conflict resolutions (L160d)
+            from . import resolutions
+            return resolutions.run(cfg, db, args)
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
+            # L157 : durée estimée, obligatoire pour un agent (refus AVANT la
+            # création), avertissement pour un humain
+            from . import estimates
+            minutes = estimates.parse(args.estimate) if args.estimate else None
+            warn_estimate = estimates.check(db, args.actor, minutes)
             check = (work.check_assignee(db, args.assignee, externe=args.externe, cfg=cfg)
                      if args.assignee else None)
             item = work.add(
@@ -785,10 +841,27 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 body=args.body or "", issue_ref=args.issue_ref, workstream=args.workstream,
                 assignee=args.assignee, budget_usd=args.budget, actor=args.actor,
                 package=args.package, externe=args.externe, cfg=cfg,
-                branch=args.branch, branch_target=args.target)
-            print("lot #%d créé en %s : %s%s" % (
+                branch=args.branch, branch_target=args.target, priority=args.priority,
+                estimate=minutes, estimate_source=args.estimate_source, size=args.size)
+            print("lot #%d créé en %s : %s%s%s%s" % (
                 item["id"], item["state"], item["title"],
-                " (plan : %s)" % item["package_id"] if item.get("package_id") else ""))
+                " (plan : %s)" % item["package_id"] if item.get("package_id") else "",
+                " (priorité %s)" % work.PRIORITY_LABELS.get(item.get("priority"))
+                if item.get("priority") else "",
+                " — estimé %s" % estimates.label(minutes) if minutes else ""))
+            # L157b : l'estimation de référence, LUE dans la table de l'auditeur
+            ref = estimates.proposal(db, type=item.get("type"), size=item.get("change_size"),
+                                     assignee=item.get("assignee"))
+            print("référence : %s" % estimates.proposal_label(ref))
+            # L157c: planned dates at the p80, in the assignee's queue ordered
+            # at the median (only with a published reference table)
+            from . import lot_schedule
+            scheduled = lot_schedule.schedule_new(db, item, actor=args.actor)
+            if scheduled:
+                print("planned  : %s → %s (%s)" % (
+                    scheduled["planned_start"], scheduled["planned_end"], scheduled["source"]))
+            if warn_estimate:
+                print("avertissement : %s" % estimates.missing(item["id"]), file=sys.stderr)
             _print_assignment(check)
             return 0
         if args.work_command == "assign":
@@ -898,6 +971,23 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             planned = (storage.of(db).roadmap.item_plans([args.id]) or [{}])[0]
             item["planned"] = {k: planned.get("planned_" + k)
                                for k in ("start", "end", "delivery", "source", "by")}
+            # L157 : durée estimée, réel mesuré, écart ; historique des estimations
+            from . import estimates
+            item["estimate"] = estimates.view(
+                item, merged_ts=(item["delays"] or {}).get("merged_ts"))
+            item["estimates"] = storage.of(db).work.estimates(args.id)
+            # L157b : estimation de référence (lecture de la table publiée)
+            item["estimate_reference"] = estimates.proposal(
+                db, type=item.get("type"), size=item.get("change_size"),
+                assignee=item.get("assignee"))
+            # L160d : résolutions préparées où le lot est l'un des deux côtés
+            from . import resolutions
+            item["resolutions"], error = resolutions.of_lot_or_error(db, args.id)
+            if error:  # e.g. a database without migration 0057
+                item["resolutions_error"] = error
+            # L157c: actual time by phase and merged diff size, once delivered
+            from . import lot_measures
+            item["measure"] = lot_measures.view(storage.of(db).work.measure(args.id))
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
@@ -908,6 +998,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s boucles : %-3s budget : %s" % (
                 item.get("issue_ref") or "—", item.get("loops"), _budget(item)))
+            if item.get("priority"):
+                print("priorité : %s (%s)" % (
+                    item["priority"], work.PRIORITY_LABELS.get(item["priority"], "?")))
             if item.get("package_id") or item.get("epic"):
                 print("plan     : fiche %-12s epic : %s" % (
                     item.get("package_id") or "—", item.get("epic") or "—"))
@@ -917,6 +1010,24 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     item["planned"]["delivery"] or "—",
                     " (source : %s)" % item["planned"]["source"]
                     if item["planned"].get("source") else ""))
+            est = item["estimate"]
+            print("durée    : %s%s" % (est["label"], "".join([
+                " (source : %s)" % est["source"] if est.get("source") else "",
+                " — par %s, le %s" % (est["by"] or "?", _fmt_moment(est["at_ts"]))
+                if est.get("minutes") else "",
+                "" if est.get("started_ts") is None
+                else " — début mesuré %s" % _fmt_moment(est["started_ts"])])))
+            print("référence: %s%s" % (
+                estimates.proposal_label(item["estimate_reference"]),
+                " — taille %s" % estimates.SIZE_LABELS.get(item["change_size"])
+                if item.get("change_size") else ""))
+            if item["measure"]:
+                print("phases   : %s" % lot_measures.describe_phases(item["measure"]))
+                print("size     : %s" % lot_measures.describe_size(item["measure"]))
+            if len(item["estimates"]) > 1:
+                print("estimé   : %s" % " → ".join(
+                    "%s (%s)" % (estimates.label(e["minutes"]), e.get("estimated_by") or "?")
+                    for e in item["estimates"]))
             if item.get("state") == "closed":
                 print("fermé    : %s" % ("abandonné" if item.get("close_reason") == "abandoned"
                                          else "remplacé par #%s" % item.get("superseded_by")))
@@ -927,6 +1038,12 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     item["branch"], item.get("branch_target") or "cible par défaut du dépôt",
                     " (dernier commit vu en avance : %s)" % item["branch_head"][:12]
                     if item.get("branch_head") else ""))
+            if item.get("migration"):
+                print("migration: %04d réservée (L122)" % item["migration"])
+            for line in resolutions.show_lines(item["resolutions"], args.id):
+                print("résolut. : %s" % line)
+            if item.get("resolutions_error"):
+                print("résolut. : indisponible (%s)" % item["resolutions_error"])
             if item.get("waiting_for"):
                 print("attend   : %s" % item["waiting_for"]["label"])
             if item.get("delegation"):
@@ -950,9 +1067,35 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     _fmt_moment(event.get("created_ts")), event["state"],
                     (event.get("actor") or "—")[:12], event["note"]))
             return 0
+        if args.work_command == "migration":
+            # L122 : numéro de migration réservé au lot, avant d'écrire le fichier
+            item = work.reserve_migration(db, args.id, args.number, release=args.release,
+                                          repo=args.repo, actor=args.actor)
+            if args.json:
+                print(json.dumps(item, ensure_ascii=False, indent=2))
+            elif item.get("migration") is None:
+                print("lot #%d : aucune migration réservée" % item["id"])
+            else:
+                print("lot #%d : migration %04d réservée — fichier "
+                      "src/ameesh/migrations/%04d_<nom>.sql" % (
+                          item["id"], item["migration"], item["migration"]))
+            return 0
         if args.work_command == "move":
-            item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor)
-            print("lot #%d → %s (boucles %s)" % (item["id"], item["state"], item["loops"]))
+            item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor,
+                             correct=args.correct)
+            print("lot #%d → %s (boucles %s)%s" % (
+                item["id"], item["state"], item["loops"],
+                " — correction tracée au journal, par %s" % args.actor
+                if args.correct is not None else ""))
+            return 0
+        if args.work_command == "merged":
+            done = work.merged(db, args.id, sha=args.sha, note=args.note or "",
+                               actor=args.actor)
+            if done["result"] == "already":
+                print("lot #%d déjà %s : rien à faire" % (args.id, done["item"]["state"]))
+            else:
+                print("lot #%d → merged (commit %s, déclaré par %s)" % (
+                    args.id, args.sha.strip().lower()[:12], args.actor))
             return 0
         if args.work_command == "note":
             work.note(db, args.id, args.text, actor=args.actor)
@@ -1093,9 +1236,9 @@ def cmd_export_v0(cfg: Config, args: argparse.Namespace) -> int:
 # migrations / diagnostic (délégués à la CLI agent-mail)
 # --------------------------------------------------------------------------
 
-def cmd_migrate(cfg: Config, _args: argparse.Namespace) -> int:
+def cmd_migrate(cfg: Config, args: argparse.Namespace) -> int:
     from . import cli
-    return cli.cmd_migrate(cfg)
+    return cli.cmd_migrate(cfg, dry_run=args.dry_run, additive_only=args.additive_only)
 
 
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
@@ -1136,9 +1279,11 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 
 #: clés de `ameesh set` (L13 : model, effort ; L26 : tier, session_policy ;
 #: L37 : mode, `execute` | `externe`, décision 0030 ; L60 : context_max_tokens ;
-#: L105 : turn_max_seconds, turn_mail_max)
+#: L105 : turn_max_seconds, turn_mail_max ; travail de fond : turn_grace_seconds ;
+#: L125 : mail_batch, réglage LOCAL de l'hôte de l'agent, sans migration — comme
+#: `effort` et `tier` avant L26)
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
-            "turn_max_seconds", "turn_mail_max")
+            "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1187,8 +1332,8 @@ _TIER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 def cmd_set(cfg: Config, args) -> int:
     """`ameesh set <agent> model=… effort=… tier=… session_policy=… mode=…
-    context_max_tokens=… turn_max_seconds=… turn_mail_max=…` (L13, L26, L37,
-    L60, L105).
+    context_max_tokens=… turn_max_seconds=… turn_mail_max=… turn_grace_seconds=…`
+    (L13, L26, L37, L60, L105, travail de fond).
 
     Écrit l'état d'exécution : le modèle dans le registre (visible par `list`)
     et dans l'état local ; l'effort et le tier dans l'état local **et** en base
@@ -1201,7 +1346,12 @@ def cmd_set(cfg: Config, args) -> int:
     (`context_max_tokens`, L60 : `15M`, `500k`, `0` = désactivé) est écrit en
     base ; vide = défaut de l'exécuteur. Les plafonds du tour (L105) aussi :
     `turn_max_seconds` (`30m`, `2h`, `0` = sans limite) et `turn_mail_max`
-    (messages remis par le hook pendant un tour, `0` = sans borne).
+    (messages remis par le hook pendant un tour, `0` = sans borne). Le délai
+    de grâce du travail de fond d'un tour (`turn_grace_seconds`, `20m`, `0` =
+    nettoyage immédiat) aussi. L125 :
+    `mail_batch` (`90s`, `2m`, `0` = réveil immédiat), fenêtre de regroupement
+    du courrier, écrite dans l'état LOCAL — à poser sur l'hôte de l'agent,
+    que son exécuteur lit à chaque sondage (sans migration de la base).
     """
     from . import adapters
     from .config import SESSION_POLICIES
@@ -1220,7 +1370,8 @@ def cmd_set(cfg: Config, args) -> int:
             if not sep or cle not in SET_KEYS:
                 print("usage : ameesh set <agent> model=… effort=… tier=… "
                       "session_policy=%s mode=%s context_max_tokens=N|15M|0 "
-                      "turn_max_seconds=30m|2h|0 turn_mail_max=N|0"
+                      "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
+                      "turn_grace_seconds=20m|0 mail_batch=90s|2m|0"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
@@ -1249,16 +1400,30 @@ def cmd_set(cfg: Config, args) -> int:
                     print("turn_max_seconds invalide : %r (ex. 30m, 2h, 0 = sans "
                           "limite)" % valeur, file=sys.stderr)
                     return 2
+            if cle == "turn_grace_seconds" and valeur:
+                try:
+                    valeur = str(parse_duration(valeur))
+                except ValueError:
+                    print("turn_grace_seconds invalide : %r (ex. 20m, 1h, 0 = nettoyage "
+                          "immédiat)" % valeur, file=sys.stderr)
+                    return 2
             if cle == "turn_mail_max" and valeur:
                 try:
                     valeur = str(parse_count(valeur))
                 except ValueError:
-                    print("turn_mail_max invalide : %r (ex. 5, 0 = sans borne)" % valeur,
+                    print("turn_mail_max invalide : %r (ex. 20, 0 = sans borne)" % valeur,
                           file=sys.stderr)
+                    return 2
+            if cle == "mail_batch" and valeur:
+                try:
+                    valeur = str(parse_duration(valeur))
+                except ValueError:
+                    print("mail_batch invalide : %r (ex. 90s, 2m, 0 = réveil immédiat)"
+                          % valeur, file=sys.stderr)
                     return 2
             valeurs[cle] = valeur
         for cle, valeur in valeurs.items():
-            if cle in ("model", "effort", "tier"):
+            if cle in ("model", "effort", "tier", "mail_batch"):
                 _ecrit_etat(cfg, args.agent, cle, valeur)
             if cle == "model":
                 if valeur:
@@ -1275,8 +1440,8 @@ def cmd_set(cfg: Config, args) -> int:
         effort = _lit_etat(cfg, args.agent, "effort") or agent.get("effort") or "défaut"
         tier = _lit_etat(cfg, args.agent, "tier") or agent.get("tier") or "défaut"
         politique = agent.get("session_policy") or "défaut (%s)" % cfg.session_policy
-        from .exploitation import (effective_context_max, effective_turn_mail_max,
-                                   effective_turn_max_seconds)
+        from .exploitation import (effective_context_max, effective_turn_grace_seconds,
+                                   effective_turn_mail_max, effective_turn_max_seconds)
 
         def _txt(valeur: int, cle: str, zero: str) -> str:
             return (zero if valeur == 0 else "%d" % valeur) + (
@@ -1287,10 +1452,26 @@ def cmd_set(cfg: Config, args) -> int:
                          "sans limite")
         courrier_txt = _txt(effective_turn_mail_max(cfg, agent), "turn_mail_max",
                             "sans borne")
+        grace_txt = _txt(effective_turn_grace_seconds(cfg, agent), "turn_grace_seconds",
+                         "aucune")
+        # L125 : réglage local de l'hôte de l'agent, sinon défaut de l'hôte
+        regroupement = _lit_etat(cfg, args.agent, "mail_batch")
+        try:
+            secondes = int(float(regroupement)) if regroupement else int(cfg.mail_batch)
+        except (ValueError, OverflowError):  # état illisible : l'exécuteur l'ignore
+            regroupement, secondes = "", int(cfg.mail_batch)
+        regroupement_txt = ("immédiat" if secondes == 0 else "%ds" % secondes) + (
+            "" if regroupement else " (défaut)")
         print("%s : modèle=%s effort=%s tier=%s session=%s mode=%s contexte=%s "
-              "tour_max_s=%s courrier_par_tour=%s (prend effet au prochain tour)"
+              "tour_max_s=%s courrier_par_tour=%s grace_fond_s=%s regroupement=%s "
+              "(prend effet au prochain tour)"
               % (args.agent, modele, effort, tier, politique,
-                 agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt))
+                 agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt,
+                 grace_txt, regroupement_txt))
+        if "mail_batch" in valeurs and (agent.get("host") or "") not in ("", cfg.host):
+            print("attention : mail_batch est lu dans l'état local de l'hôte de l'agent "
+                  "(%s), pas dans la base : lancez ce réglage sur %s"
+                  % (agent.get("host"), agent.get("host")), file=sys.stderr)
         if agent.get("mode") == "externe" and not agent.get("responsible"):
             # 0030 : un agent externe a obligatoirement un responsable humain
             print("attention : agent externe sans responsable humain : ses lots et ses "
@@ -1437,6 +1618,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_menage.add_argument("--json", action="store_true", help="rapport `ameesh-menage/1`")
     p_menage.set_defaults(func=cmd_menage)
 
+    p_conflicts = sub.add_parser(
+        "conflicts", help="radar de conflits entre lots, dernier passage de cet hôte (L160b)")
+    p_conflicts.add_argument("--project", default="", help="un seul projet")
+    p_conflicts.add_argument("--all", action="store_true",
+                             help="aussi les paires qui se recouvrent sans conflit")
+    p_conflicts.add_argument("--json", action="store_true", help="rapport `ameesh-radar/1`")
+    p_conflicts.set_defaults(func=cmd_conflicts)
+
+    p_ci = sub.add_parser("ci", help="CI relevée en direct par ameesh notify (L161c)")
+    ci_sub = p_ci.add_subparsers(dest="ci_command", required=True)
+    p_ci_status = ci_sub.add_parser(
+        "status", help="dernières exécutions de CI d'un lot et leurs tests en échec")
+    p_ci_status.add_argument("id", type=int, help="numéro du lot")
+    p_ci_status.add_argument("--limit", type=int, default=5,
+                             help="exécutions montrées au plus (défaut 5)")
+    p_ci_status.add_argument("--json", action="store_true", help="rapport `ameesh-ci-status/1`")
+    p_ci_status.set_defaults(func=cmd_ci)
+
     p_models = sub.add_parser("models", help="catalogue des modèles (L14)")
     models_sub = p_models.add_subparsers(dest="models_command")
 
@@ -1533,6 +1732,17 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--target", default=None,
                         help="branche cible (défaut : git config ameesh.target du dépôt, "
                              "sinon origin/HEAD)")
+    pw_add.add_argument("--priority", type=int, choices=list(work.PRIORITIES), default=None,
+                        help="1 haute, 2 normale, 3 basse (L130 : toute demande d'un "
+                             "humain devient un lot, avec sa priorité)")
+    pw_add.add_argument("--estimate", default=None, metavar="DURÉE",
+                        help="durée estimée du lot : 90m, 2h, 1h30, 1,5h, 2d (ou des "
+                             "minutes) — obligatoire pour un agent (L157)")
+    pw_add.add_argument("--estimate-source", default=None, metavar="SOURCE",
+                        help="d'où vient l'estimation (conception, historique bug ×1,3…)")
+    pw_add.add_argument("--size", default=None, choices=list(work.SIZES),
+                        help="taille du changement : s petit, m moyen, l gros — une clé de "
+                             "l'estimation de référence (L157b)")
     pw_add.set_defaults(func=cmd_work)
     pw_list = work_sub.add_parser("list")
     pw_list.add_argument("--state", default=None)
@@ -1546,12 +1756,42 @@ def build_parser() -> argparse.ArgumentParser:
     pw_show.add_argument("id", type=int)
     pw_show.add_argument("--json", action="store_true")
     pw_show.set_defaults(func=cmd_work)
+    pw_mig = work_sub.add_parser(
+        "migration", help="réserver au lot le prochain numéro de migration libre (L122), "
+                          "avant d'écrire le fichier ; idempotent, visible dans work show")
+    pw_mig.add_argument("id", type=int)
+    pw_mig.add_argument("--number", type=int, default=None,
+                        help="réserver ce numéro précis (refusé s'il est réservé par un "
+                             "autre lot)")
+    pw_mig.add_argument("--release", action="store_true",
+                        help="libérer la réservation (le lot n'ajoute plus de migration)")
+    pw_mig.add_argument("--repo", default=None,
+                        help="dépôt ameesh dont les branches comptent (défaut : le dépôt "
+                             "git courant)")
+    pw_mig.add_argument("--json", action="store_true")
+    pw_mig.add_argument("--actor", default="",
+                        help="défaut : l'identité liée de la session (AGENT_MAIL_NAME)")
+    pw_mig.set_defaults(func=cmd_work)
     pw_move = work_sub.add_parser("move")
     pw_move.add_argument("id", type=int)
     pw_move.add_argument("state", choices=list(work.STATES))
     pw_move.add_argument("--note", default=None)
-    pw_move.add_argument("--actor", default="")
+    pw_move.add_argument("--actor", default="",
+                         help="défaut : l'identité liée de la session (AGENT_MAIL_NAME)")
+    pw_move.add_argument("--correct", default=None, metavar="RAISON",
+                         help="corriger un état posé par erreur (promoted → merged), hors "
+                              "machine à états, tracé au journal ; réservé aux humains et aux "
+                              "orchestrateurs ou agents de conception")
     pw_move.set_defaults(func=cmd_work)
+    pw_merged = work_sub.add_parser(
+        "merged", help="déclarer la fusion d'un lot faite hors PR et sans gel (fusion locale "
+                       "sur la cible) : tout état ouvert → merged, jalon merged avec le commit")
+    pw_merged.add_argument("id", type=int)
+    pw_merged.add_argument("--sha", required=True, help="le commit de fusion")
+    pw_merged.add_argument("--note", default="")
+    pw_merged.add_argument("--actor", default="",
+                           help="défaut : l'identité liée de la session (AGENT_MAIL_NAME)")
+    pw_merged.set_defaults(func=cmd_work)
     pw_assign = work_sub.add_parser(
         "assign", help="réassigner un lot à un agent réveillable (L37, 0030)")
     pw_assign.add_argument("id", type=int)
@@ -1607,6 +1847,10 @@ def build_parser() -> argparse.ArgumentParser:
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)
     from . import backlog
     backlog.add_parsers(work_sub, cmd_work)  # file d'amélioration (L119, 0037)
+    from . import unrecorded
+    unrecorded.add_parser(work_sub, cmd_work)  # demandes d'humains sans lot (L130)
+    from . import resolutions
+    resolutions.add_parser(work_sub, cmd_work)  # prepared conflict resolutions (L160d)
 
     p_cost = sub.add_parser("cost", help="coût des tours et jauges de forfait (L12)")
     cost_sub = p_cost.add_subparsers(dest="cost_command")
@@ -1675,7 +1919,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_set.add_argument("values", nargs="+", metavar="clé=valeur",
                        help="model=… effort=… tier=… session_policy=par-lot|taille|jamais "
                             "context_max_tokens=15M|0 "
-                            "turn_max_seconds=30m|2h|0 turn_mail_max=5|0 "
+                            "turn_max_seconds=30m|2h|0 turn_mail_max=20|0 "
+                            "turn_grace_seconds=20m|0 "
+                            "mail_batch=90s|2m|0 (L125, état local de l'hôte) "
                             "mode=execute|externe (valeur vide = défaut)")
     p_set.set_defaults(func=cmd_set)
 
@@ -1692,6 +1938,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.set_defaults(func=cmd_export_v0)
 
     p_mig = sub.add_parser("migrate")
+    p_mig.add_argument("--dry-run", action="store_true",
+                       help="migrations manquantes, additives ou non ; rien n'est écrit")
+    p_mig.add_argument("--additive-only", action="store_true",
+                       help="n'applique rien si une migration manquante n'est pas additive (L151)")
     p_mig.set_defaults(func=cmd_migrate)
     p_doc = sub.add_parser("doctor")
     p_doc.add_argument("--notify-test", action="store_true")

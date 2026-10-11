@@ -5,7 +5,10 @@
   ameesh --version | version  la version du paquet installé ;
   ameesh mail <send|inbox|list|status|alias|hook|statusline|whoami>
         la boîte aux lettres ; `agent-mail` reste un alias (les hooks des
-        harnais l'appellent) ;
+        harnais l'appellent) ; `send` refuse un destinataire inconnu (noms
+        proches proposés) ou arrêté (sauf --queue) ;
+  ameesh mail forward <ancien> <nouveau> [--dry-run]
+        re-livre le courrier en attente d'un agent arrêté à un agent vivant ;
   ameesh mail <bind|unbind|bindings>
         liaison explicite d'une session externe à un agent (L41, 0030) ;
   ameesh run [options]        l'exécuteur de la machine ; `agent-runner` reste
@@ -17,6 +20,8 @@
   ameesh approve | approvals | verify   approbations signées ;
   ameesh work …               lots (work_items) ; `work backlog add|list` : file
         d'amélioration continue, prise par les agents au repos (L119, 0037) ;
+        `work unrecorded [--since 24h] [--json]` : demandes d'humains (courrier,
+        réponses aux décisions, chat) rattachées à aucun lot (L130) ;
   ameesh cost …               coût des tours, usage par tour, jauges et leur
         historique, solde du fournisseur payé au token (`cost turns|gauges|balance`) ;
   ameesh accounts list | use <harnais> <compte> | auto [harnais]
@@ -25,7 +30,8 @@
         | unset [--per-hour] [--per-day] [--agent A]
         plafonds de budget du mesh, en base, relus à chaud (L70) ;
   ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais
-        context_max_tokens=15M|0 turn_max_seconds=30m|2h|0 turn_mail_max=5|0
+        context_max_tokens=15M|0 turn_max_seconds=30m|2h|0 turn_mail_max=20|0
+        turn_grace_seconds=20m|0
         réglages d'exécution, effet au prochain tour ;
   ameesh alerts [--follow] [--json]     alertes d'exploitation (un objet par ligne) ;
   ameesh notify [--once] [--dry-run] [--interval S] [--json] | --test human:ID
@@ -49,12 +55,31 @@
         feuille de route : engagements datés, propositions tirées des décisions,
         Gantt texte (schéma ameesh-roadmap/1, L96) ; dates prévues d'une
         tâche ou d'une fiche : `ameesh work plan <id> --debut J --fin J --livraison J` ;
+  ameesh work estimates [--app P] [--json]
+        L157 : écarts réel/estimé des lots livrés (médiane, p80) par type de
+        lot et par auteur d'estimation ; tout lot porte une durée estimée dès
+        sa création (`work add --estimate 2h`, `work plan <id> --estimate 90m`) ;
   ameesh fil list | show <projet> [<lot>] [--last N] | tail <projet> [<lot>]
         les fils lisibles : tout message passé par ameesh, en clair (R12) ;
   ameesh receipt verify | authenticator list   reçus d'approbation (spec §8) ;
   ameesh action propose|show|list|request|approve|execute|reconcile|retry|replace|cancel
         actions sous porte (spec §7) ;
-  ameesh decisions [--for human:ID]     décisions qui attendent un humain (C10) ;
+  ameesh decisions [--all] [--for human:ID] [--json]
+        décisions qui attendent un humain, tous projets confondus : demandes
+        des agents (L124, la plus ancienne d'abord), actions sous porte, lots
+        en attente (C10) ;
+  ameesh decide ask (--lot <id|réf> | --new-lot "titre") --question "…"
+        --option a="…" [--option b="…"] [--recommend a --why "…"] [--urgent]
+        [--by 2h] [--needs-signature]
+        un agent demande une décision au propriétaire (lot en waiting_human) ;
+  ameesh decide <id> <option | "texte libre"> [--key FICHIER | --signed]
+        | withdraw <id> | show <id>
+        réponse de l'humain (jamais d'un agent), renvoyée au demandeur par
+        courrier ; retrait par le demandeur ; détail et preuve (L124) ;
+  ameesh chat [--harness claude|codex] [--consigne] [--dry-run]
+        l'agent de conversation du propriétaire : décisions de tous les
+        projets, réponses, demandes transmises aux orchestrateurs ; ne prend
+        jamais la session d'un autre agent (L123) ;
   ameesh approve-check [--url U] [--json]
         concordance RP ID/origines entre ameesh-approve et ce vérificateur ;
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
@@ -64,10 +89,11 @@
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
   ameesh menage [--apply] [--json]      ménage de ce que les agents créent (L73) ;
+  ameesh conflicts [--all] [--json]     radar de conflits entre lots (L160b) ;
+  ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère ;
   ameesh host enroll|revoke|list|show   enrôlement des appareils prêtés (L110,
         humain habilité seulement) ;
   ameesh device enroll|challenge|show   côté appareil, dans la VM (L110) ;
-  ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère ;
   ameesh serve --exec-only --auth-file FICHIER [--listen HÔTE:PORT] …
         l'API d'exécuteur médiée (/api/exec/v1, L108) : un exécuteur sur un
         appareil sans accès à la base (docs/EXECUTEUR-MEDIEE.md).
@@ -93,6 +119,8 @@ MESH_COMMANDS = (
     "hosts",
     # L73 : ménage de ce que les agents créent (`ameesh menage [--apply]`)
     "menage",
+    # L160b : radar de conflits entre lots (`ameesh conflicts [--json]`)
+    "conflicts",
     # L14 : le catalogue des modèles a son point d'entrée public, comme les autres
     # (`ameesh models list|show|discover`) — sans cette ligne, la commande sortait en
     # code 2 « sous-commande inconnue » AVANT toute base (revue B5).
@@ -189,6 +217,14 @@ def _dispatch(argv: list[str] | None) -> int:
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
         return notify.main(rest)
+    if command == "decide":
+        # L124 : demandes de décision au propriétaire, et ses réponses
+        from . import decisions
+        return decisions.main(rest)
+    if command == "chat":
+        # L123 : l'agent de conversation du propriétaire
+        from . import chat
+        return chat.main(rest)
     if command in EXPLOITATION_COMMANDS:
         from . import exploitation
         return exploitation.main(argv)
