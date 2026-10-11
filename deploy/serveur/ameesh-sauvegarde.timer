@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+[Unit]
+Description=ameesh — sauvegarde quotidienne de la base du mesh
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
