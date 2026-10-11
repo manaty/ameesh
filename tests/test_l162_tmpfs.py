@@ -120,12 +120,15 @@ class RacineSurDisqueTest(unittest.TestCase):
 
     def test_attach_redirige_aussi(self):
         self.cfg.container_runtime = "none"
-        env = runner_mod._attach_tmp_env(self.cfg, "a1", {})
+        holds: list = []                # L219: the session's lock
+        env = runner_mod._attach_tmp_env(self.cfg, "a1", {}, holds)
+        for hold in holds:
+            hold.release()
         self.assertEqual(env["TMPDIR"], os.path.join(self.cfg.state_dir, ".menage", "tmp",
                                                      "a1"))
         self.assertEqual(env["AMEESH_TMPDIR"], env["TMPDIR"])
         self.assertEqual(runner_mod._attach_tmp_env(
-            self.cfg, "a1", {"AMEESH_HOUSEKEEPING": "off"}), {})
+            self.cfg, "a1", {"AMEESH_HOUSEKEEPING": "off"}, []), {})
 
 
 class ActiviteTest(unittest.TestCase):

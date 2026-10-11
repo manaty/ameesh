@@ -4559,12 +4559,14 @@ def _attach_env(cfg: Config, name: str, owner: str, epoch: int) -> dict:
     return env
 
 
-def _attach_tmp_env(cfg: Config, name: str, base_env: dict) -> dict:
+def _attach_tmp_env(cfg: Config, name: str, base_env: dict, holds: list) -> dict:
     """L162 : le dossier temporaire de l'agent (sur disque) et les caches gérés
     pour une session `attach`, comme pour un tour de l'exécuteur — sans vider
     le dossier (la session est celle de l'agent). Politique de la fiche Host
     (canons lus sur place) ; jamais bloquant : sans ménage possible, la
-    session part avec l'environnement d'origine."""
+    session part avec l'environnement d'origine. L219 : le dossier reste
+    verrouillé jusqu'à la fin de la session (le verrou est ajouté à `holds`,
+    que l'appelant relâche)."""
     try:
         from . import canon as canon_mod
         from . import menage as menage_mod
@@ -4572,8 +4574,12 @@ def _attach_tmp_env(cfg: Config, name: str, base_env: dict) -> dict:
             canons = canon_mod.load_configured(cfg)
         except Exception:
             canons = []
-        return menage_mod.turn_env(cfg, menage_mod.effective(canons, cfg.host or ""), name,
-                                   base_env)
+        policy = menage_mod.effective(canons, cfg.host or "")
+        if not policy.redirect or menage_mod.disabled(base_env):
+            return {}
+        hold = menage_mod.hold_tmp(cfg, policy, name, new_session=False)
+        holds.append(hold)
+        return menage_mod.turn_env(cfg, policy, name, base_env, hold=hold)
     except Exception as exc:
         log_async("[%s] attach : dossier temporaire non redirigé (%s)" % (name, exc))
         return {}
@@ -4712,7 +4718,8 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     argv = adapter.interactive_command(agent.get("session_id"))
     env = _attach_env(cfg, name, owner, epoch)
     env.update(adapter.env())
-    env.update(_attach_tmp_env(cfg, name, env))
+    holds: list = []
+    env.update(_attach_tmp_env(cfg, name, env, holds))
     cwd = agent.get("cwd") or None
     if cwd and not os.path.isdir(cwd):
         cwd = None
@@ -4739,6 +4746,8 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
             code = proc.wait()
     finally:
         stop.set()
+        for hold in holds:          # L219: the session is over
+            hold.release()
         thread.join(timeout=5)
         veille.join(timeout=5)
         try:
