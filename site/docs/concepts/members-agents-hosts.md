@@ -65,6 +65,7 @@ policy:
     min_disk_free: 2GiB
     min_battery_percent: 25             # on battery: no new turn below (laptop host)
     stop_battery_percent: 10            # on battery: clean stop below
+    max_cpu_pressure: 20%               # CPU pressure (PSI some, 60 s): no new turn above
   work_roots: {acme-web: /srv/acme/acme-web}   # working directory per team (v1.3.0)
   work_root: /srv                               # default: work_root/<team>
   work_dirs: {ouvrier: /srv/acme/ouvrier}       # per agent, wins over the above (v1.3.1)

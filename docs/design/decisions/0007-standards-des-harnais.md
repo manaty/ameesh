@@ -1,25 +1,25 @@
 ---
 type: Decision
-title: "Les intégrations reprennent les standards des outils d'agents"
-description: "Pas de format de connecteur propre à ameesh : MCP, skills, plugins des harnais."
+title: "Integrations reuse the standards of agent tools"
+description: "No ameesh-specific connector format: MCP, skills, harness plugins."
 status: stable
 tags: [mcp, skills, integration]
 decided_by: human:smichea
 decision_date: 2026-10-03
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:00:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-Claude Code, Codex et DeepSeek Harness parlent tous MCP (vérifié localement : `codex mcp`, `codex plugin`, dsh embarque les SDK MCP et ACP).
+Claude Code, Codex and DeepSeek Harness all speak MCP (checked locally: `codex mcp`, `codex plugin`, dsh embeds the MCP and ACP SDKs).
 
-# Décision
+# Decision
 
-Les intégrations avec les **systèmes métier** et la **communication** (Slack, Teams…) reprennent **les standards des outils et plugins des agents** (Codex, Claude, DeepSeek…) ; ameesh n'invente pas son propre format.
+Integrations with **business systems** and **communication** (Slack, Teams…) reuse **the standards of the agents' tools and plugins** (Codex, Claude, DeepSeek…); ameesh does not invent its own format.
 
-# Conséquences
+# Consequences
 
-- Sortant : serveurs MCP standard (officiels quand ils existent : Slack, Microsoft, Google, GitHub).
-- Entrant : aucun standard portable ; le runner d'ameesh reçoit l'événement et réveille l'agent (Claude `-p --resume`, Codex app-server, ACP pour les autres).
-- ameesh fournit un serveur MCP « ameesh-fil », une porte MCP « ameesh-gate » (approbation signée liée à l'empreinte des arguments), et un générateur canon OKF → skills, AGENTS.md, politique d'outils, plugin par harnais. Voir [l'étude](../etudes/standards-des-harnais.md).
+- Outbound: standard MCP servers (official ones when they exist: Slack, Microsoft, Google, GitHub).
+- Inbound: no portable standard; the ameesh runner receives the event and wakes the agent (Claude `-p --resume`, Codex app-server, ACP for the others).
+- ameesh provides an MCP server "ameesh-fil" (thread), an MCP gate "ameesh-gate" (signed approval bound to the fingerprint of the arguments), and a generator from the OKF canon → skills, AGENTS.md, tool policy, plugin per harness. See [the study](../etudes/standards-des-harnais.md).
