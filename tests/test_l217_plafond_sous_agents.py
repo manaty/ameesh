@@ -102,6 +102,37 @@ class PlafondDuFilPrincipalTest(PgTestCase):
         self.assertIn('"tool_use_id": "outil-2"', flux)  # clos ici
         self.assertNotIn('"tool_use_id": "outil-3"', flux)
 
+    def test_rotation_entre_deux_tours_sur_le_fil_principal(self):
+        """L217b : un tour clos avant son `result` (ici par sa durée) n'a au
+        grand livre que ses appels, sous-agents compris ; la rotation entre
+        deux tours juge, comme le plafond, sur le fil principal seul."""
+        worker = self._worker("audit-rot")
+        storage.of(self.db).operations.set_settings("audit-rot", {"turn_max_seconds": "1"})
+        worker.agent = registry.get(self.db, "audit-rot")
+        self.assertEqual(worker.turn_max_seconds(), 1)
+        appels = [{"reread": 1200, "tool": True, "parent": "outil-x"},
+                  {"reread": 1200, "tool": True, "parent": "outil-x", "sleep": 1.2},
+                  {"reread": 50, "tool": True},                 # point sûr : clos ici
+                  {"reread": 10, "tool": True, "sleep": 3}]     # jamais fini
+        self.assertTrue(self._tour(worker, appels))
+        self.assertTrue(worker.last_turn_closed.startswith("durée maximale"))
+        self.assertNotIn('"type": "result"', self._flux(worker))
+        # le grand livre compte les sous-agents (au-delà du plafond de 1 000)…
+        self.assertGreaterEqual(worker.last_turn_reread, 2400)
+        self.assertEqual(worker.last_turn_subagent_reread, 2400)
+        # … la rotation, non : 50 jetons relus par le fil principal
+        self.assertEqual(worker.last_turn_context_reread(), (50, "claude-sess-1"))
+        self.assertIsNone(worker.rotation_forcee)
+        self.assertFalse(worker.context_rotation_due())
+
+    def test_rotation_due_quand_le_fil_principal_depasse(self):
+        worker = self._worker("audit-rot2")
+        self.assertTrue(self._tour(worker, [{"reread": 600, "tool": True},
+                                            {"reread": 600}]))
+        self.assertIsNone(worker.last_turn_closed)  # aucun point sûr après le plafond
+        self.assertEqual(worker.last_turn_context_reread(), (1200, "claude-sess-1"))
+        self.assertTrue(worker.context_rotation_due())
+
 
 if __name__ == "__main__":
     unittest.main()
