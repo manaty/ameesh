@@ -130,7 +130,8 @@ Repo-local wrappers: `bin/ameesh`, `bin/agent-mail`, `bin/agent-runner`, `bin/am
 
 ```
 agent-mail send <dest> <texte…> [--from NOM] [--lot ID] [--kind request|reply|notify|event] [--urgent]
-                                               # dest = nom ou "all" ; --urgent : événement (C9)
+               [--ack] [--cc NOM[,NOM…]]       # dest = nom ou "all" ; L125 : courrier regroupé
+                                               # (90 s), --urgent sans délai, --ack et --cc sans réveil
 agent-mail list                                # nom, outil, âge, non lus, dossier, hôte, bail
 agent-mail inbox [NOM]                         # non lus, sans les marquer lus
 agent-mail whoami                              # identité liée (nom + source : runner, explicit,
@@ -148,7 +149,13 @@ agent-mail migrate                             # migrations versionnées
 agent-mail doctor [--notify-test]              # pilote, schéma, migrations, LISTEN/NOTIFY
 ```
 
-Les **événements** (`--kind event`) réveillent l'agent comme un message, mais un
+Le **courrier est regroupé** (L125) : un agent au repos n'est réveillé qu'au
+bout de `AMEESH_MAIL_BATCH` secondes (défaut 90, `ameesh set <agent>
+mail_batch=…`) après l'arrivée du premier message, en un seul tour pour tout
+ce qui est arrivé ; un message `--urgent` ou d'un humain réveille tout de
+suite ; un accusé de réception (`--ack`, ou reconnu), une copie (`--cc`) et
+une diffusion à « all » sont lus au tour suivant, sans réveil. Les
+**événements** (`--kind event`) réveillent l'agent comme un message, mais un
 lot d'événements n'en réveille qu'un par `AMEESH_EVENT_COALESCE` secondes
 (défaut 120) ; `--urgent` perce le regroupement. Un `--urgent` venu d'un
 expéditeur habilité (`AMEESH_INTERRUPT_SENDERS`, demain une capacité du canon)

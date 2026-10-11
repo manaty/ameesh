@@ -57,8 +57,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    restore_prompt end_turn
    pending_spend   put set_model get clear
    turn_costs      last_reading insert spent ledger correct
-   mailbox         send unread unread_urgent get mark_delivered reserve deliver release
-                   unread_counts history pending_recipients
+   mailbox         send unread unread_active unread_urgent get mark_delivered reserve
+                   deliver release unread_counts history pending_recipients
                    pending_recipients_sorted unread_total dead_letters forward
    wakeups         subscribe notify
    keys            info register revoke registered
@@ -99,7 +99,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    session_bindings active bind set_pid revoke listing with_pids
    budgets         limits put events
    turn_resources  open_turn close_turn mark_orphan get open_by_agent orphans
-                   stale_running
+                   stale_running churn
    housekeeping    log recent summary last_measure register_worktree worktrees
                    set_worktree_status
 
@@ -600,6 +600,12 @@ class Mailbox(Domain):
     @abc.abstractmethod
     def unread(self, recipient: str, limit: int) -> list[dict]:
         """Messages non remis, du plus ancien au plus récent."""
+
+    @abc.abstractmethod
+    def unread_active(self, recipient: str, limit: int) -> list[dict]:
+        """L125 : messages non remis qui ouvriront un tour — ni accusé, ni
+        copie, ni diffusion non urgents (`mail.passive_reason`) —, du plus
+        ancien au plus récent."""
 
     @abc.abstractmethod
     def unread_urgent(self, recipient: str, limit: int) -> list[dict]:
@@ -1668,8 +1674,9 @@ class Operations(Domain):
         """Une ligne par agent : réglages, dossier de travail (`cwd`), statut et
         `status_since_ts`, bail
         (`lease_live`, `lease_expires_ts`), tour en cours (`turn_started_ts`,
-        `turn_label` du marqueur comptable), non-lus (`unread`,
-        `oldest_unread_ts`), lot de session (`session_work_item`,
+        `turn_label` du marqueur comptable), non-lus qui ouvriront un tour
+        (`unread`, `oldest_unread_ts` ; L125 : hors courrier passif, compté à
+        part dans `passive_unread`), lot de session (`session_work_item`,
         `session_lot_title`, `session_lot_state`), lot assigné ouvert le plus
         récent (`assigned_lot_id`, `assigned_lot_title`, `assigned_lot_state`),
         dernier tour du grand livre (`last_turn_reread_tokens` = entrée +
@@ -1895,6 +1902,12 @@ class TurnResources(Domain):
         """Les lignes encore `running` ouvertes il y a plus de `older_than_s`
         secondes (fin du tour, pour une ligne en délai de grâce) : un
         exécuteur mort les a laissées derrière lui."""
+
+    @abc.abstractmethod
+    def churn(self, since_ts: float, short_s: float) -> list[dict]:
+        """L125 : par agent (ordre du nom), les tours FINIS lancés depuis
+        `since_ts` : `agent`, `turns`, `short_turns` (durée sous `short_s`
+        secondes), `first_short_ts` (début du premier tour court, ou None)."""
 
 
 class Housekeeping(Domain):

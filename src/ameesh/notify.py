@@ -121,6 +121,9 @@ TYPE_LABELS = {
     "host_power_low": "batterie faible de l'hôte",
     "backlog_empty": "file d'amélioration vide",
     "mail_undeliverable": "courrier en souffrance",
+    # L125 : mesure de l'effet du regroupement du courrier ; pas poussée par
+    # défaut (à ajouter dans `notify.types` pour la recevoir)
+    "turn_churn": "tours courts en rafale",
 }
 #: types urgents : notification critique (bureau), priorité haute (ntfy)
 URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_expired",

@@ -31,7 +31,7 @@ on its first line.
 
 ```
 agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF] [--new-lot "title"]
-                [--kind request|reply|notify|event] [--urgent]
+                [--kind request|reply|notify|event] [--urgent] [--ack] [--cc NAME[,NAME…]]
                 [--sign --key FILE] [--expires 24h] [--queue]
 agent-mail forward <OLD> <NEW> [--dry-run] [--json]   # redeliver a dead mailbox
 agent-mail list                       # agents, host, lease, unread
@@ -87,6 +87,16 @@ original is no longer pending.
 `--kind event` wakes the agent like a message, coalesced (see
 `AMEESH_EVENT_COALESCE`); `--urgent` pierces the coalescing and, from an
 authorised sender, interrupts the current turn.
+
+**Batched mail** (L125). An idle agent is woken only when the batching window
+(`AMEESH_MAIL_BATCH`, default 90 s, per agent `ameesh set <agent>
+mail_batch=…`) has elapsed since its oldest waiting message; that one turn
+carries everything that arrived meanwhile. A message sent with `--urgent`, or
+by a human, wakes it at once. Passive mail never opens a turn by itself and is
+read on the next turn: an acknowledgement (`--ack`, or a very short message
+that is only a thank-you or a receipt), a copy (`--cc NAME`: the person in copy
+gets an `event`, without being woken) and a `send all` announcement without
+`--urgent`. `send B,C` is refused: use `--cc C`.
 
 ## Runner: `ameesh run` / `agent-runner`
 
