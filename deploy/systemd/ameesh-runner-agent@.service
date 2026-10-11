@@ -6,7 +6,8 @@
 # c'est cette unité qui reprend la même session (L106).
 #
 # Installation :
-#   install -m 0644 'deploy/systemd/ameesh-runner-agent@.service' ~/.config/systemd/user/
+#   install -m 0644 'deploy/systemd/ameesh-runner-agent@.service' \
+#     deploy/systemd/ameesh-agents.slice ~/.config/systemd/user/
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now ameesh-runner-agent@<agent>
 #   journalctl --user -u ameesh-runner-agent@<agent> -f
@@ -52,6 +53,19 @@ RestartSec=30
 KillMode=mixed
 TimeoutStopSec=35min
 NoNewPrivileges=yes
+# Plafond mémoire (L159c). 2026-10-10, VM du mesh : le `node` d'un harnais a
+# atteint 4,1 Go, et l'OOM du noyau l'a tué ; l'unité n'avait aucun plafond.
+# MemoryMax borne l'agent (harnais, tests, travail de fond) : l'OOM ne tue
+# que dans son groupe. MemoryHigh, à 90 %, fait reprendre la mémoire avant.
+# Défaut 6 Gio ; un hôte ou un agent qui veut autre chose le déclare au canon
+# (policy.resources.agent_memory_max, agent_memory_max_by_agent de la fiche
+# Host), et `ameesh doctor` donne la commande qui l'applique :
+#   systemctl --user set-property ameesh-runner-agent@<agent> MemoryMax=8192M MemoryHigh=7372M
+# OOMScoreAdjust : sous une pression globale, l'agent part avant le reste.
+Slice=ameesh-agents.slice
+MemoryHigh=5.4G
+MemoryMax=6G
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=default.target

@@ -12,6 +12,11 @@
 ne repart pas après un redémarrage de l'hôte, et une session `attach` qui
 meurt n'est reprise par personne.
 
+L159c : les deux signalent aussi une unité d'exécuteur sans plafond mémoire,
+hors de `ameesh-agents.slice`, ou dont `MemoryMax` s'écarte du plafond du
+canon (`policy.resources.agent_memory_max` de la fiche Host, 6 Gio par
+défaut), avec la commande qui corrige.
+
 Lecture seule : rien n'est écrit, ni en base ni dans systemd.
 """
 from __future__ import annotations
@@ -29,6 +34,11 @@ RUNNER_TEMPLATE = "ameesh-runner-agent@%s.service"
 ENABLED_STATES = ("enabled", "enabled-runtime", "linked", "linked-runtime", "alias")
 _AGENTS_RE = re.compile(r"--agents[= ]([^\s;]+)")
 
+
+#: L159c : slice qui regroupe les exécuteurs d'agent (deploy/systemd)
+AGENTS_SLICE = "ameesh-agents.slice"
+#: écart toléré entre `MemoryMax` de l'unité et le plafond du canon (arrondis)
+CAP_TOLERANCE = 0.02
 
 #: `systemctl` à utiliser ; VIDE, les unités ne sont pas vérifiées (tests)
 SYSTEMCTL_ENV = "AMEESH_SYSTEMCTL"
@@ -150,6 +160,82 @@ def missing_runner_lines(cfg, db, run=_systemctl) -> list[str]:
     return lines
 
 
+def _size(octets: int) -> str:
+    """Une taille pour systemd : en M (base 1024), sans décimale."""
+    return "%dM" % (octets // 1024 ** 2)
+
+
+def user_manager_controllers() -> set[str] | None:
+    """Contrôleurs cgroup délégués au gestionnaire systemd de l'utilisateur,
+    ou None (pas de cgroup v2, autre système)."""
+    if not platform.is_linux():
+        return None
+    uid = os.getuid()
+    path = "/sys/fs/cgroup/user.slice/user-%d.slice/user@%d.service/cgroup.controllers" % (uid, uid)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return set(fh.read().split())
+    except OSError:
+        return None
+
+
+def memory_cap_lines(cfg, db, canons=None, run=_systemctl,
+                     controllers=user_manager_controllers) -> list[str]:
+    """L159c : lignes de `ameesh doctor` sur les plafonds mémoire des unités
+    `ameesh-runner-agent@<agent>` des agents menés par l'hôte."""
+    agents = served_agents(cfg, db)
+    if not agents:
+        return []
+    if canons is None:
+        from . import canon as canon_mod
+        try:
+            canons = canon_mod.load_configured(cfg)
+        except Exception:
+            canons = []
+    from . import resources as resources_mod
+    lines, ok = [], 0
+    for name in sorted(row["name"] for row in agents):
+        unit = RUNNER_TEMPLATE % name
+        shown = run("show", unit, "-p", "LoadState", "-p", "MemoryMax", "-p", "Slice")
+        if shown is None:
+            return ["plafonds   : systemd utilisateur indisponible — non vérifiés"]
+        props = dict(line.split("=", 1) for line in shown.splitlines() if "=" in line)
+        if props.get("LoadState") != "loaded":
+            continue  # pas d'unité du modèle : signalé par missing_runner_lines
+        cap = resources_mod.agent_memory_cap(canons, cfg.host or "", name)
+        problems = []
+        if props.get("Slice") != AGENTS_SLICE:
+            problems.append("slice %s (attendue : %s)" % (props.get("Slice") or "?", AGENTS_SLICE))
+        try:
+            current = int(props.get("MemoryMax") or "")
+        except ValueError:
+            current = None  # « infinity » : aucun plafond
+        if current is None:
+            problems.append("aucun plafond mémoire")
+        elif abs(current - cap["max"]) > cap["max"] * CAP_TOLERANCE:
+            problems.append("MemoryMax %s, le canon dit %s (%s)"
+                            % (_size(current), _size(cap["max"]), cap["origin"]))
+        if not problems:
+            ok += 1
+            continue
+        lines.append("attention  : %s : %s" % (unit, " ; ".join(problems)))
+        if props.get("Slice") != AGENTS_SLICE:
+            lines.append("             réinstallez deploy/systemd (unité et %s), puis "
+                         "systemctl --user daemon-reload" % AGENTS_SLICE)
+        if current is None or abs(current - cap["max"]) > cap["max"] * CAP_TOLERANCE:
+            lines.append("             systemctl --user set-property %s MemoryMax=%s MemoryHigh=%s"
+                         % (unit, _size(cap["max"]), _size(cap["high"])))
+    delegated = controllers()
+    if delegated is not None and "memory" not in delegated:
+        # sans délégation, systemd accepte MemoryMax mais ne l'applique pas
+        lines.append("attention  : contrôleur mémoire non délégué au systemd utilisateur : "
+                     "les plafonds ne s'appliquent pas (docs/EXPLOITATION.md, L159c)")
+    if ok and not lines:
+        lines.append("plafonds   : %d unité(s) d'agent dans %s, MemoryMax conforme au canon"
+                     % (ok, AGENTS_SLICE))
+    return lines
+
+
 def cmd_harness(cfg, db=None) -> int:
     """`ameesh doctor --harness` : 0 si chaque harnais servi est trouvé."""
     adapters.configure(cfg)
@@ -177,7 +263,7 @@ def cmd_harness(cfg, db=None) -> int:
             verdict = 1
             print("harnais    : %s%s KO — %s" % (item["harness"], qui, item["detail"]))
     if db is not None and agents is not None:
-        for line in missing_runner_lines(cfg, db):
+        for line in missing_runner_lines(cfg, db) + memory_cap_lines(cfg, db):
             print(line)
     print("verdict    : %s" % ("OK" if verdict == 0 else "KO"))
     return verdict

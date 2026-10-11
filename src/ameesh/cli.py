@@ -1323,6 +1323,9 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     try:
         for line in hostcheck.missing_runner_lines(cfg, db):
             print(line)
+        # L159c : plafond mémoire et slice des unités d'agent
+        for line in hostcheck.memory_cap_lines(cfg, db):
+            print(line)
     except db_mod.DbError:
         pass
     verdict = 0

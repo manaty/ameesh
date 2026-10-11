@@ -1049,7 +1049,9 @@ L'étape `installer` suit le même usage.
 Sur le serveur (profil L55), ameesh est un clone détaché dans
 `/opt/ameesh/src`, installé non éditable dans `/opt/ameesh/venv`. Les
 personas tournent sous `ameesh-runner@<p>` (service système, utilisateur
-`ameesh`). **Pas de migration ici** : la base du serveur est celle que
+`ameesh`), hors dépôt ; leur plafond mémoire et leur slice viennent du
+complément `deploy/systemd/systeme/` (L159c, docs/EXPLOITATION.md,
+« Plafonds mémoire des agents »). **Pas de migration ici** : la base du serveur est celle que
 `poste.sh migrer` vient de migrer.
 
 1. `vm.sh verifier` : commit et version installés, unités, migrations
