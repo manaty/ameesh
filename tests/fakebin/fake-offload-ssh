@@ -24,11 +24,34 @@ if host == "unreachable":
 env = dict(os.environ, SSH_ORIGINAL_COMMAND=command)
 src = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src")
 env["PYTHONPATH"] = src
-# a child, not exec: the shell sees its SSH "session" (this process) die
+# a child, not exec: the shell sees its SSH "session" (this process) die.
+# Its stdout and stderr go through this process, as through ssh: killing it
+# closes the client's pipes (the "network" drops) while the shell lives on.
 import subprocess
+import threading
+
 proc = subprocess.Popen([sys.executable, "-m", "ameesh.offload_shell", "--config",
-                         os.environ["AMEESH_FAKE_OFFLOAD_CONFIG"]], env=env)
+                         os.environ["AMEESH_FAKE_OFFLOAD_CONFIG"]], env=env,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def relay(src, dst):
+    for chunk in iter(lambda: src.read1(65536), b""):
+        try:
+            dst.write(chunk)
+            dst.flush()
+        except OSError:
+            return
+
+
+threads = [threading.Thread(target=relay, args=(proc.stdout, sys.stdout.buffer)),
+           threading.Thread(target=relay, args=(proc.stderr, sys.stderr.buffer))]
+for thread in threads:
+    thread.start()
 try:
-    sys.exit(proc.wait())
+    rc = proc.wait()
 except KeyboardInterrupt:
-    sys.exit(proc.wait())
+    rc = proc.wait()
+for thread in threads:
+    thread.join()
+sys.exit(rc)
