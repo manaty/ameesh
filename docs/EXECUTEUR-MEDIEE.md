@@ -63,8 +63,8 @@ Comptes : 62 opérations, dont 24 lectures et 38 écritures. 52 passent par
 lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
 servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (253
-opérations depuis la 1.6.x et L118, L119) est classée, admise ou refusée. Toute opération ajoutée à
+signature et les mêmes types. Il vérifie aussi que l'interface entière (298
+opérations depuis main 1.9.0) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
 Les 22 opérations ajoutées à l'interface par la 1.6.x sont refusées à
@@ -87,6 +87,33 @@ lots : `open_by_ref`, `open_for`, `set_branch`, `open_with_branch`,
 `backlog_add`, `auto_takes_since`) sont refusées aussi. Un exécuteur médié
 ne fait pas de relevé des branches : c'est l'affaire des hôtes classiques et
 du serveur ; `mail send --lot` n'est pas disponible depuis un appareil.
+(L118's `work.open_with_branch` has since become `work.open_for_sweep` on
+main; it stays refused.)
+
+The 46 operations added to the interface by main up to 1.9.0 are refused
+as well, so contract 1.1 is unchanged: `ci.*` (CI results, L161),
+`decisions.*` (owner decision requests, L124), `mailbox.unread_active`,
+`dead_letters`, `forward`, `withdraw`, `human_messages` (L125, undeliverable
+mail, unrecorded decisions), `turn_resources.begin_grace` and `churn`
+(background work of a turn, turn churn), `housekeeping.latest_by_path`
+(L222), and the `work.*` operations of estimates, measures, migration
+reservations, prepared resolutions and GitHub issues (L122, L126, L157,
+L160). On a mediated executor this means:
+
+* the wake-up check reads `mailbox.unread` (admitted) and drops passive mail
+  on the device (`mail.unread_active`), with the same rule as the server
+  query, over the first 200 unread messages;
+* the first turn on a lot does not record its measured start
+  (`work.mark_started`): the lot's actual duration is not measured from a
+  device;
+* background work left by a turn keeps its grace period on the device, but
+  the grace is not marked in the base (`begin_grace`), and container
+  cleanup is not logged (`housekeeping.log`);
+* no housekeeping pass on tmpfs pressure, as for the periodic pass;
+* `agent-mail send` from a harness session checks the recipient (unknown,
+  stopped) and the copies against the reduced directory (`agents.overview`)
+  instead of `agents.get`; the refusal texts then lack the stop date,
+  reason and responsible.
 
 ## Requête et réponse
 

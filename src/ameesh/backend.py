@@ -411,20 +411,39 @@ class MediatedBackend(PgBackend):
     def send(self, sender: str, dest: str, text: str, host: str | None = None,
              signed: dict | None = None, work_item_id: str | None = None,
              allow_structured: bool = False, kind: str = "notify",
-             urgent: bool = False) -> list[str]:
+             urgent: bool = False, thread_meta: dict | None = None,
+             include_stopped: bool = False, skipped: list | None = None,
+             payload: dict | None = None, cc=()) -> list[str]:
+        """Same signature and payload rules as `PgBackend.send` (L125: ack,
+        copies, broadcast; « all » skips stopped agents unless
+        `include_stopped`). Each message is written with its own thread
+        entry: the grouped thread entry of a broadcast (`fil.record`) is not
+        written from a mediated session."""
         fil.ensure_readable(text, allow_structured)
+        payload = _send_payload(dest, urgent, payload)
+        thread_meta = _send_thread_meta(thread_meta, payload, cc)
         if dest == "all":
             rows = registry.overview(self.db)
             projects = {row["name"]: fil.agent_project(row) for row in rows}
             own = projects.get(sender)
-            targets = [row["name"] for row in rows if row["name"] != sender
-                       and (not own or projects.get(row["name"]) == own)]
+            team = [row for row in rows if row["name"] != sender
+                    and (not own or projects.get(row["name"]) == own)]
+            stopped = [row["name"] for row in team
+                       if row.get("status") == "stopped" and not include_stopped]
+            if skipped is not None:
+                skipped.extend(stopped)
+            targets = [row["name"] for row in team if row["name"] not in stopped]
         else:
             targets = [dest]
         for target in targets:
             mail.send(self.db, sender, target, text, host=host, work_item_id=work_item_id,
                       allow_structured=allow_structured, thread=True, kind=kind,
-                      payload={"urgent": True} if urgent else None, **dict(signed or {}))
+                      payload=payload or None, thread_meta=thread_meta,
+                      **dict(signed or {}))
+        for name in cc or ():
+            mail.send(self.db, sender, name, text, host=host, kind="event",
+                      payload={"cc": dest}, allow_structured=allow_structured,
+                      thread=False)
         return targets
 
     def register(self, name: str, tool: str, cwd: str | None, session_id: str | None,

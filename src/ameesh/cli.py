@@ -331,8 +331,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             print("copie : nom d'agent invalide %r" % name, file=sys.stderr)
             return 2
         if bk.kind == "pg":
-            from . import registry
-            if registry.get(bk.db, name) is None:
+            from . import undeliverable
+            if undeliverable.registry_rows(bk.db, [name])[name] is None:
                 print("copie refusée : agent inconnu : %s (rien n'est déposé)" % name,
                       file=sys.stderr)
                 return 2

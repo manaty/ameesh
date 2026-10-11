@@ -1271,7 +1271,10 @@ class AgentWorker(threading.Thread):
             log_async("[%s] tour sur lot(s) délégué(s) : %s"
                       % (self.name, ", ".join("#%d" % i for i in marques)))
         # L157 : le premier tour de l'assigné sur un lot date le début du
-        # travail (durée réelle = fusion − début), une seule fois
+        # travail (durée réelle = fusion − début), une seule fois. Not on a
+        # mediated executor: `work.mark_started` is not in contract 1.1.
+        if getattr(self.runner, "mediated", False):
+            return
         try:
             debuts = estimates.mark_started(self.db, self.name, lots)
         except (db_mod.DbError, ValueError) as exc:
@@ -4258,8 +4261,8 @@ class Runner:
         périodique (`AMEESH_HOUSEKEEPING_INTERVAL=0`, `--once`). Rend vrai si
         le passage est lancé."""
         interval = float(getattr(self.cfg, "housekeeping_interval", 0) or 0)
-        if interval <= 0 or self.once:
-            return False
+        if interval <= 0 or self.once or getattr(self, "mediated", False):
+            return False  # mediated executor: no local housekeeping (contract 1.1)
 
         def passage() -> None:
             from . import menage as menage_mod
