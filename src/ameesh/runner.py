@@ -3888,13 +3888,17 @@ class Runner:
 
     def radar_once(self, db) -> None:
         """L160b : un passage du radar de conflits, après le relevé des
-        branches, sur l'hôte qui déclare `radar.projects` ; journal seulement,
-        aucun courrier. Ne lève jamais."""
+        branches, sur l'hôte qui déclare `radar.projects` : journal, et
+        courrier aux assignés sur conflit nouveau (L160c). Ne lève jamais."""
         from . import radar
         try:
             if getattr(self, "_radar_cache", None) is None:
                 self._radar_cache = radar.Cache()
             for line in radar.run_pass(self.cfg, db, cache=self._radar_cache):
+                if line.get("mail"):
+                    log_async("radar %s : %d courrier(s), dont %d réveil(s)" % (
+                        line["project"], len(line["mail"]),
+                        sum(1 for m in line["mail"] if m["level"] == "blocking")))
                 if line["changes"] or line.get("error"):
                     log_async("radar %s : %s" % (line["project"], line.get("error") or (
                         "%d changement(s), %d paire(s) en conflit (%.1f s)" % (
