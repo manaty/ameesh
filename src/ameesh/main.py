@@ -80,6 +80,7 @@
         l'agent de conversation du propriétaire : décisions de tous les
         projets, réponses, demandes transmises aux orchestrateurs ; ne prend
         jamais la session d'un autre agent (L123) ;
+  ameesh session list|backup|restore <agent>   off-device session backups (L53);
   ameesh approve-check [--url U] [--json]
         concordance RP ID/origines entre ameesh-approve et ce vérificateur ;
   ameesh import-v0 | export-v0          bascule depuis/vers la boîte fichier v0 ;
@@ -90,7 +91,6 @@
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
   ameesh menage [--apply] [--json]      ménage de ce que les agents créent (L73) ;
   ameesh conflicts [--all] [--json]     radar de conflits entre lots (L160b) ;
-  ameesh session list|backup|restore <agent>   off-device session backups (L53);
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -208,9 +208,6 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "fil":
         from . import fil
         return fil.main(rest)
-    if command == "session":
-        from . import session_backup
-        return session_backup.main(rest)
     if command == "notify":
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
@@ -219,6 +216,9 @@ def _dispatch(argv: list[str] | None) -> int:
         # L124 : demandes de décision au propriétaire, et ses réponses
         from . import decisions
         return decisions.main(rest)
+    if command == "session":
+        from . import session_backup
+        return session_backup.main(rest)
     if command == "chat":
         # L123 : l'agent de conversation du propriétaire
         from . import chat
