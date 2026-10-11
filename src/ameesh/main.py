@@ -89,6 +89,7 @@
   ameesh placement check [--agent A]    placements admis ou refusés, et admissibles ;
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
   ameesh menage [--apply] [--json]      ménage de ce que les agents créent (L73) ;
+  ameesh conflicts [--all] [--json]     radar de conflits entre lots (L160b) ;
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -112,6 +113,8 @@ MESH_COMMANDS = (
     "hosts",
     # L73 : ménage de ce que les agents créent (`ameesh menage [--apply]`)
     "menage",
+    # L160b : radar de conflits entre lots (`ameesh conflicts [--json]`)
+    "conflicts",
     # L14 : le catalogue des modèles a son point d'entrée public, comme les autres
     # (`ameesh models list|show|discover`) — sans cette ligne, la commande sortait en
     # code 2 « sous-commande inconnue » AVANT toute base (revue B5).

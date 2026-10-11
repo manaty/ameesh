@@ -334,6 +334,10 @@ class Config:
     #: `exclude_terms`), validée par `ameesh.plan_github`. Jamais de secret
     #: ici : le jeton de `gh` reste dans son environnement.
     github: dict = field(default_factory=dict)
+    #: radar de conflits entre lots (L160b) : la clé `radar` du fichier de
+    #: configuration de l'HÔTE désigné (`projects` : projet → dépôt et dossier
+    #: des migrations), validée par `ameesh.radar`.
+    radar: dict = field(default_factory=dict)
 
     @property
     def responsible_required(self) -> bool:

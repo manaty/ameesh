@@ -31,6 +31,7 @@
   agent-mesh placement check [--agent A] [--json]        admissions et hôtes admissibles (C4)
   agent-mesh hosts [--json] [HÔTE] [--history N]         ressources des hôtes (L31)
   agent-mesh menage [--dry-run | --apply] [--json]       ménage des agents (L73)
+  agent-mesh conflicts [--project P] [--all] [--json]   radar de conflits entre lots (L160b)
   agent-mesh agent spawn <nom> --by <créateur> --ttl 2h   agent éphémère (R14)
 
 L'autorité du propriétaire ne se déduit jamais d'un texte : elle se prouve par
@@ -413,6 +414,12 @@ def _print_host_menage(menage: dict) -> None:
             wt.get("active", 0), len(wt.get("kept") or []),
             " : " + " ; ".join("%s (%s)" % (k["path"], k["detail"]) for k in wt["kept"][:5])
             if wt.get("kept") else ""))
+
+
+def cmd_conflicts(cfg: Config, args: argparse.Namespace) -> int:
+    """`ameesh conflicts` (L160b) : voir `ameesh.radar.cmd_conflicts`."""
+    from . import radar
+    return radar.cmd_conflicts(cfg, args)
 
 
 def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
@@ -1549,6 +1556,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_menage.add_argument("--by", default="", help="qui déclenche (journal), ex. human:alice")
     p_menage.add_argument("--json", action="store_true", help="rapport `ameesh-menage/1`")
     p_menage.set_defaults(func=cmd_menage)
+
+    p_conflicts = sub.add_parser(
+        "conflicts", help="radar de conflits entre lots, dernier passage de cet hôte (L160b)")
+    p_conflicts.add_argument("--project", default="", help="un seul projet")
+    p_conflicts.add_argument("--all", action="store_true",
+                             help="aussi les paires qui se recouvrent sans conflit")
+    p_conflicts.add_argument("--json", action="store_true", help="rapport `ameesh-radar/1`")
+    p_conflicts.set_defaults(func=cmd_conflicts)
 
     p_models = sub.add_parser("models", help="catalogue des modèles (L14)")
     models_sub = p_models.add_subparsers(dest="models_command")
