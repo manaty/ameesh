@@ -720,6 +720,9 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
                          pace_gap_pct=plan_pace_gap_pct, paid=paid)
     orchestras = orchestrators(cfg, db, listing, declared=orchestrators_declared,
                                canons=canons)
+    for alert in out:
+        # L132 : `plan_underused` part aussi aux orchestrateurs (alert_briefs)
+        alert["orchestrators"] = list(orchestras)
     out += orchestrator_held(listing, now, orchestras, held_s=orchestrator_held_s)
     out += idle_capacity(db, listing, now, orchestras, idle_s=idle_capacity_s, paid=paid)
     out += host_underused(cfg, db, listing, now, window_s=host_underused_s,
