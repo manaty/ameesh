@@ -70,7 +70,7 @@ PASSIVE_SQL = (
     " AND ({t}.payload @> '{{\"ack\": true}}'::jsonb"
     " OR {t}.payload @> '{{\"broadcast\": true}}'::jsonb"
     " OR coalesce({t}.payload->>'cc', '') <> ''"
-    " OR jsonb_typeof({t}.payload->'radar') = 'object'))")
+    " OR coalesce(jsonb_typeof({t}.payload->'radar'), '') = 'object'))")
 
 
 class Mailbox(interface.Mailbox):
