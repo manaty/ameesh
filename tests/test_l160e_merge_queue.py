@@ -12,11 +12,12 @@ import dataclasses
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import mail, merge_queue, radar, resolutions, storage, work
+from ameesh import mail, merge_queue, plan_github, radar, resolutions, storage, work
 
 from .support import PgTestCase
 from .test_l160b_radar import LOTS, MIG, _git, make_repo
@@ -130,14 +131,71 @@ class EntryTest(_Base):
             self.enter(1)
         self.ready(1)
         with self.assertRaisesRegex(merge_queue.QueueError, "CI of PR #7 is not green"):
-            self.enter(1, ci=lambda branch: {"number": 7, "green": False})
-        row = self.enter(1, ci=lambda branch: {"number": 7, "green": True})
+            self.enter(1, ci=lambda branch: {"number": 7, "green": False,
+                                             "head": self.tip(1)})
+        row = self.enter(1, ci=lambda branch: {"number": 7, "green": True,
+                                               "head": self.tip(1)})
         self.assertEqual((row["target"], row["frozen_sha"], row["state"]),
                          ("main", self.tip(1), "queued"))
         self.assertIn("PR #7 green", self.fake.notes[-1][1])
         # a team that merges locally has no PR: nothing to check
         self.ready(2)
         self.assertEqual(self.enter(2, ci=lambda branch: None)["state"], "queued")
+
+    def test_sha_prefixes_are_resolved_and_compared_whole(self):
+        tip = self.tip(1)
+        self.ready(1, sha=tip[:1])  # "a": any tip starting with that letter would match
+        with self.assertRaisesRegex(merge_queue.QueueError, "not a commit of this repository"):
+            self.enter(1)
+        self.ready(1, sha=tip[:12])  # a unique abbreviation is resolved
+        self.assertEqual(self.enter(1)["frozen_sha"], tip)
+        self.assertFalse(merge_queue._same(tip, tip[:12]))
+
+    def test_green_ci_on_another_commit_is_refused(self):
+        self.ready(1)
+        other = self.tip(2)
+        with self.assertRaisesRegex(merge_queue.QueueError,
+                                    "PR #7 is at %s, not at the freeze" % other[:12]):
+            self.enter(1, ci=lambda branch: {"number": 7, "green": True, "head": other})
+
+    def test_github_error_refuses_the_lot(self):
+        self.ready(1)
+
+        def broken(branch):
+            raise plan_github.GithubError("gh pr list : code 4 : authentication required")
+        with self.assertRaisesRegex(merge_queue.QueueError, "cannot read the CI"):
+            self.enter(1, ci=broken)
+        self.assertEqual(self.fake.queue_rows, {})
+        # radar.github_ci: strict for the queue, passive (None) for the mail
+        gh = mock.Mock(run=mock.Mock(return_value=(4, "", "authentication required")))
+        project = radar.Project(name="p", repo=self.repo, github="o/r")
+        self.assertIsNone(radar.github_ci(project, gh=gh)("lot/1-a"))
+        with self.assertRaises(plan_github.GithubError):
+            radar.github_ci(project, gh=gh, strict=True)("lot/1-a")
+        gh.run.return_value = (0, json.dumps([{"number": 7, "url": "u", "headRefOid": "abc",
+                                               "statusCheckRollup": []}]), "")
+        self.assertEqual(radar.github_ci(project, gh=gh, strict=True)("lot/1-a")["head"], "abc")
+        self.assertIn("headRefOid", gh.run.call_args[0][0][-1])
+
+    def test_remote_branch_is_fetched_into_the_radar_clone_only(self):
+        agents = os.path.join(self.tmp, "agents")
+        _git(self.tmp, "clone", "-q", self.repo, agents)
+        stale = _git(agents, "rev-parse", "refs/remotes/origin/lot/1-a")
+        _commit_on(self.repo, "lot/1-a", "other.py", "z\n", "pushed from another host")
+        self.ready(1)  # frozen and reviewed on the fresh tip, unknown to `agents`
+        clone = resolutions.Replayer(agents, os.path.join(self.tmp, "state", "p.clone"))
+        row = merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None, clone=clone)
+        self.assertEqual(row["frozen_sha"], self.tip(1))
+        # the agents' repository is untouched: no object, no FETCH_HEAD, same remote ref
+        self.assertEqual(_git(agents, "rev-parse", "refs/remotes/origin/lot/1-a"), stale)
+        self.assertFalse(os.path.exists(os.path.join(agents, ".git", "FETCH_HEAD")))
+        self.assertNotEqual(subprocess.run(["git", "-C", agents, "cat-file", "-e",
+                                            self.tip(1) + "^{commit}"],
+                                           capture_output=True).returncode, 0)
+        # without the clone, the stale origin/<branch> is not the freeze: refused
+        self.fake.queue_rows.clear()
+        with self.assertRaisesRegex(merge_queue.QueueError, "not at its freeze"):
+            merge_queue.enter(None, 1, repo=agents, actor="orch", ci=None)
 
     def test_merged_lot_is_refused(self):
         self.ready(1)
@@ -278,6 +336,42 @@ class PassTest(_Base):
         self.fake.lots[4]["state"] = "merged"
         self.run_pass()
         self.assertEqual(self.fake.queue_rows[4]["state"], "landed")
+
+    def test_conflict_with_the_target_ejects(self):
+        self.queue(4, 1)
+        _commit_on(self.repo, "main", "shared.py",
+                   "Uno\ndeux\ntrois\nquatre\ncinq\nsix\nsept\n", "main moves")
+        report = self.run_pass()
+        self.assertEqual([(o["lot"], o["state"]) for o in report["queue"]["targets"]["main"]],
+                         [(4, "queued")])
+        self.assertEqual(self.fake.queue_rows[1]["state"], "ejected")
+        self.assertIn("conflict with main on shared.py", self.fake.queue_rows[1]["reason"])
+        self.assertEqual([(to, kw["payload"]["merge_queue"]["kind"]) for to, _, kw in self.sent],
+                         [("a1", "ejected")])
+        self.assertIn("Integrate main", self.sent[0][1])
+
+    def test_ejected_resolver_gets_no_wait_mail(self):
+        """Pairs 1–2 and 2–3, both resolved by 2; 2 is ejected after 1: one
+        mail to 2 (its ejection), none saying that 3 waits on it."""
+        tips = {n: str(n) * 40 for n in (1, 2, 3)}
+        for n in (1, 2, 3):
+            self.fake.queue_add(n, target="main", frozen_sha=tips[n], note="", actor="o")
+        report = {
+            "branches": [{"work_item": n, "tip": tips[n], "target": "main",
+                          "target_head": "f" * 40, "branch": "lot/%d" % n} for n in (1, 2, 3)],
+            "pairs": [{"lots": [1, 2], "state": "conflict", "resolver": {"lot": 2}},
+                      {"lots": [2, 3], "state": "conflict", "resolver": {"lot": 2}}],
+            "against_target": []}
+        trial = {1: {"state": "clean", "files": []},
+                 2: {"state": "conflict", "files": ["shared.py"]},
+                 3: {"state": "clean", "files": []}}
+        with mock.patch.object(merge_queue, "stack", return_value=trial):
+            out = merge_queue.run_pass(self.cfg, None, self.project, report,
+                                       replayer=mock.Mock())
+        self.assertEqual([(o["lot"], o["state"]) for o in out["targets"]["main"]],
+                         [(1, "queued"), (2, "ejected"), (3, "queued")])
+        self.assertEqual([(m["lot"], m["kind"]) for m in out["mail"]], [(2, "ejected")])
+        self.assertEqual([to for to, _, _ in self.sent], ["a2"])
 
     def test_database_without_the_table(self):
         with mock.patch.object(self.fake, "queue", side_effect=RuntimeError(

@@ -497,10 +497,13 @@ def ci_green(rollup) -> bool:
     return True
 
 
-def github_ci(project: Project, gh=None):
-    """La fonction `branche -> {number, url, green} | None` du projet (PR
-    ouverte de la branche), lue avec `gh` ; None si le dépôt GitHub est inconnu.
-    Une erreur de `gh` vaut « pas verte » : le courrier reste passif."""
+def github_ci(project: Project, gh=None, *, strict: bool = False):
+    """La fonction `branche -> {number, url, head, green} | None` du projet
+    (PR ouverte de la branche, `head` : son commit de tête), lue avec `gh` ;
+    None si le dépôt GitHub est inconnu. Une erreur de `gh` vaut « pas
+    verte » : le courrier reste passif. `strict` (entrée en file, L160e) :
+    l'erreur est levée (`plan_github.GithubError`), jamais prise pour « pas
+    de PR »."""
     slug = github_slug(project)
     if not slug:
         return None
@@ -512,12 +515,15 @@ def github_ci(project: Project, gh=None):
             gh = gh or plan_github.Gh()
             rows = plan_github._json(gh, ["pr", "list", "--repo", slug, "--head", branch,
                                           "--state", "open", "--json",
-                                          "number,url,statusCheckRollup"]) or []
+                                          "number,url,headRefOid,statusCheckRollup"]) or []
         except plan_github.GithubError:
+            if strict:
+                raise
             return None
         if not rows:
             return None
         return {"number": rows[0].get("number"), "url": rows[0].get("url"),
+                "head": rows[0].get("headRefOid"),
                 "green": ci_green(rows[0].get("statusCheckRollup"))}
     return status
 

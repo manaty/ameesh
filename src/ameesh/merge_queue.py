@@ -43,11 +43,13 @@ import shutil
 import tempfile
 
 from . import plan_git, storage, work
-from .canon import GitError
+from .canon import FETCH_TIMEOUT, GitError
 
 STATES = ("queued", "landing", "landed", "ejected")
 #: pair states where the conflict between two queued lots is not covered
 UNPREPARED = ("conflict", "stale", "error")
+#: lot branches fetched into the radar's clone for `readiness`
+QUEUE_REF = "refs/ameesh/queue/"
 
 
 class QueueError(RuntimeError):
@@ -59,7 +61,8 @@ class QueueError(RuntimeError):
 # --------------------------------------------------------------------------
 
 def _same(a: str | None, b: str | None) -> bool:
-    return bool(a and b) and (a.startswith(b) or b.startswith(a))
+    """Two full commit ids, equal (never a prefix: `readiness` resolves them)."""
+    return bool(a and b) and a == b
 
 
 def latest_verdict(rows: list[dict]) -> dict | None:
@@ -68,10 +71,36 @@ def latest_verdict(rows: list[dict]) -> dict | None:
         if verdicts else None
 
 
-def readiness(db, lot: int, repo: str, *, ci=None, fetch: bool = True) -> dict:
-    """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
-    pr}`; QueueError says what is missing."""
+def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
+    """(tip, repository holding it) of a lot branch: local in `repo`, else
+    fetched from `origin` into the radar's clone (`clone`, a
+    `resolutions.Replayer`: never into the agents' repository), else the
+    `origin/<branch>` already known to `repo`."""
     from . import resolutions
+    tip = plan_git._commit(repo, "refs/heads/" + branch)
+    if tip:
+        return tip, repo
+    if clone is not None:
+        url = plan_git._out(repo, "remote", "get-url", "origin")
+        if url:
+            if not os.path.isdir(os.path.join(clone.path, ".git")):
+                clone.ensure()  # an existing clone is not reset: the radar may be using it
+            ref = QUEUE_REF + branch
+            resolutions._run(clone.path, "fetch", "--quiet", url,
+                             "+refs/heads/%s:%s" % (branch, ref), timeout=FETCH_TIMEOUT)
+            tip = plan_git._commit(clone.path, ref)
+            if tip:
+                return tip, clone.path
+    return plan_git._commit(repo, "refs/remotes/origin/" + branch), repo
+
+
+def readiness(db, lot: int, repo: str, *, ci=None, clone=None) -> dict:
+    """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
+    pr}`; QueueError says what is missing. Commit ids are resolved to full
+    ones before being compared; `ci` (`radar.github_ci(..., strict=True)`)
+    must report the PR green on the frozen commit itself, and an error
+    reading it refuses the lot."""
+    from . import plan_github
     row = work.get(db, lot)
     if row is None:
         raise QueueError("lot #%d not found" % lot)
@@ -85,33 +114,48 @@ def readiness(db, lot: int, repo: str, *, ci=None, fetch: bool = True) -> dict:
     if not freeze or not freeze.get("sha"):
         raise QueueError("lot #%d is not frozen: ameesh work milestone %d frozen --sha <commit>"
                          % (lot, lot))
-    tip = resolutions._branch_tip(repo, row["branch"], fetch=fetch)
+    tip, where = branch_tip(repo, row["branch"], clone)
     if not tip:
         raise QueueError("branch %s of lot #%d is neither local nor on origin"
                          % (row["branch"], lot))
-    if not _same(tip, freeze["sha"]):
-        raise QueueError("branch %s is at %s, not at its freeze %s: freeze it again "
+    frozen = plan_git._commit(where, freeze["sha"])
+    if not _same(tip, frozen):
+        raise QueueError("branch %s is at %s, not at its freeze %s%s: freeze it again "
                          "(ameesh work milestone %d frozen --sha %s), then have it reviewed"
-                         % (row["branch"], tip[:12], freeze["sha"][:12], lot, tip[:12]))
+                         % (row["branch"], tip[:12], freeze["sha"][:12],
+                            "" if frozen else " (not a commit of this repository)", lot, tip))
     verdict = latest_verdict(marks)
-    if not verdict or verdict.get("verdict") != "ok" or not _same(verdict.get("sha"), tip):
+    reviewed = plan_git._commit(where, verdict["sha"]) \
+        if verdict and verdict.get("sha") else None
+    if not verdict or verdict.get("verdict") != "ok" or not _same(reviewed, tip):
         raise QueueError("lot #%d has no review verdict ok on its freeze %s%s"
                          % (lot, tip[:12], " (last verdict: %s on %s)"
                             % (verdict.get("verdict"), (verdict.get("sha") or "—")[:12])
                             if verdict else ""))
-    status = ci(row["branch"]) if ci else None
-    if status and not status.get("green"):
-        raise QueueError("the CI of PR #%s is not green" % status.get("number"))
+    try:
+        status = ci(row["branch"]) if ci else None
+    except plan_github.GithubError as exc:
+        raise QueueError("cannot read the CI of branch %s on GitHub (%s): try again once "
+                         "gh works" % (row["branch"], exc)) from exc
+    if status:
+        if not _same(status.get("head"), tip):
+            raise QueueError("PR #%s is at %s, not at the freeze %s: its CI does not "
+                             "vouch for the frozen commit" % (status.get("number"),
+                                                             (status.get("head") or "?")[:12],
+                                                             tip[:12]))
+        if not status.get("green"):
+            raise QueueError("the CI of PR #%s is not green" % status.get("number"))
     target = row.get("branch_target") or plan_git.default_target(repo)
     return {"target": target, "frozen_sha": tip, "pr": (status or {}).get("number")}
 
 
-def enter(db, lot: int, *, repo: str, actor: str = "", ci="github") -> dict:
+def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None,
+          clone=None) -> dict:
     """Puts `lot` into the queue of its target, once `readiness` passes."""
     if ci == "github":
         from . import radar
-        ci = radar.github_ci(radar.Project(name="", repo=repo))
-    ready = readiness(db, lot, repo, ci=ci)
+        ci = radar.github_ci(project or radar.Project(name="", repo=repo), strict=True)
+    ready = readiness(db, lot, repo, ci=ci, clone=clone)
     row = storage.of(db).work.queue_add(
         lot, target=ready["target"], frozen_sha=ready["frozen_sha"],
         note="merge queue of %s: queued at %s%s" % (
@@ -313,6 +357,9 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
     notified = _read_notified(cfg, project.name)
     keys = set()
     pairs = pair_states(report)
+    against = {int(a["work_item"]): a for a in report.get("against_target") or ()
+               if a.get("state") == "conflict"}
+    ejected: set = set()
     by_target: dict = {}
     for row in mine:
         lot = int(row["work_item_id"])
@@ -334,6 +381,22 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
                 % (row["target"], lot, row.get("title") or "", row.get("branch") or "?",
                    branch["tip"][:12], row["frozen_sha"][:12], lot)),
                 {"project": project.name, "target": row["target"], "kind": "ejected"}))
+            continue
+        clash = against.get(lot)
+        if clash and _same(clash.get("tip"), row["frozen_sha"]):
+            # no resolution is prepared against the target: the agent integrates it
+            reason = "conflict with %s on %s" % (row["target"], ", ".join(
+                clash["files"][:6] or ["?"]))
+            out["mail"].append(_eject(db, row, reason, (
+                "Merge queue of %s, lot #%d « %s »: out of the queue, its frozen commit "
+                "conflicts with %s on %s. Integrate %s into %s, freeze again, have it "
+                "reviewed, then ameesh work queue add %d."
+                % (row["target"], lot, row.get("title") or "", row["target"],
+                   ", ".join(clash["files"][:6]), row["target"], row.get("branch") or "?",
+                   lot)),
+                {"project": project.name, "target": row["target"], "kind": "ejected",
+                 "files": clash["files"]}))
+            ejected.add(lot)
             continue
         by_target.setdefault(row["target"], []).append(dict(row, tip=branch["tip"],
                                                             target_head=branch["target_head"]))
@@ -391,19 +454,20 @@ def run_pass(cfg, db, project, report: dict, *, replayer=None, cache=None) -> di
                     {"project": project.name, "target": target, "kind": "ejected",
                      "files": trial["files"]}))
                 state = "ejected"
+                ejected.add(lot)
             listed.append({"lot": one["work_item"], "rank": one["rank"], "state": state,
                            "reason": one["reason"], "stack": trial})
         for one in ranked:
-            ejected = (result.get(one["work_item"]) or {}).get("state") == "conflict" \
-                if isinstance(result, dict) else False
             for other, resolver in one["waits"]:
+                who = resolver or one["work_item"]
+                if ejected & {one["work_item"], other, who}:
+                    # out of the queue in this pass: nobody waits on it, and an
+                    # ejected resolver already has its ejection mail
+                    continue
                 key = "wait:%d-%d" % (other, one["work_item"])
                 keys.add(key)
                 if key in notified:
                     continue
-                who = resolver or one["work_item"]
-                if ejected and who == one["work_item"]:
-                    continue  # its ejection mail already says to prepare it
                 holder = rows_by_id.get(who) or {}
                 to = holder.get("assignee") or (branches.get(who) or {}).get("assignee")
                 sent = _wake(db, to, who, (
@@ -462,13 +526,28 @@ def show_lines(rows: list[dict]) -> list[str]:
     return out
 
 
+def radar_project(cfg, repo: str):
+    """The radar project (`radar.projects`) of the repository `repo`, if any:
+    its private clone receives the fetches of `readiness`."""
+    from . import radar
+    try:
+        projects = radar.settings_of(cfg).projects.values()
+    except radar.SettingsError:
+        return None
+    real = os.path.realpath(repo)
+    return next((p for p in projects if os.path.realpath(p.repo) == real), None)
+
+
 def run(cfg, db, args) -> int:
     import sys
-    from . import resolutions
+    from . import radar, resolutions
     try:
         if args.queue_command == "add":
             repo = resolutions.repo_root(args.repo)
-            row = enter(db, args.id, repo=repo, actor=args.actor)
+            project = radar_project(cfg, repo)
+            clone = resolutions.Replayer(repo, radar.clone_dir(cfg, project.name)) \
+                if project else None
+            row = enter(db, args.id, repo=repo, actor=args.actor, project=project, clone=clone)
             print(json.dumps(row, ensure_ascii=False, indent=2, default=str) if args.json else
                   "lot #%d queued for %s at %s; the radar orders the queue at its next pass"
                   % (args.id, row["target"], row["frozen_sha"][:12]))
