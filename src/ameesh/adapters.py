@@ -1085,7 +1085,8 @@ class HarnessAdapter:
         rule = self.descriptor.interactive_permission
         if not rule:
             return ""
-        allowed, reserved = rule.get("choices") or (), rule.get("explicit_only") or ()
+        allowed = rule.get("choices") or ()
+        reserved = (*(rule.get("explicit_only") or ()), *harnesses.ALWAYS_EXPLICIT_PERMISSION_MODES)
         mode, by_agent = "", False
         sources = [("agent setting", explicit)]
         sources += [(n, os.environ.get(n)) for n in rule["env"]]

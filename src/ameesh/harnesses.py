@@ -70,6 +70,10 @@ AMEESH_KEYS = ("protocol", "binary", "binary_env", "launcher", "command", "inter
 INTERACTIVE_PERMISSION_KEYS = ("flag", "default", "env", "fallback", "choices", "explicit_only")
 #: a permission mode passed to the harness: a short identifier
 PERMISSION_MODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+#: modes that switch every permission check off: reserved for the agent setting
+#: whatever the descriptor declares (codex r4, #182: a descriptor omitting
+#: `explicit_only` must not make them a default nor a fallback)
+ALWAYS_EXPLICIT_PERMISSION_MODES = ("bypassPermissions",)
 #: clés connues de `ameesh.accounts` (L30 : comptes multiples par fournisseur)
 ACCOUNT_KEYS = ("config_env", "default_home", "session_store", "credentials", "key_env")
 #: clés connues au premier niveau du manifeste
@@ -894,6 +898,7 @@ def _check_interactive_permission(value: Any, path: str) -> list[Finding]:
                                         "`choices`" % (key, mode), path))
     # codex r3 (#182): a reserved mode is never a default nor a fallback
     reserved = set(m for m in (_strings(value.get("explicit_only")) or []))
+    reserved.update(ALWAYS_EXPLICIT_PERMISSION_MODES)
     for key in ("default", "fallback"):
         mode = value.get(key)
         if isinstance(mode, str) and mode in reserved:
@@ -919,6 +924,7 @@ def _interactive_permission(value: Any) -> dict:
     def modes(key: str) -> tuple[str, ...]:
         return tuple(m for m in (_strings(value.get(key)) or []) if PERMISSION_MODE_RE.match(m))
     reserved = modes("explicit_only")
+    reserved += tuple(m for m in ALWAYS_EXPLICIT_PERMISSION_MODES if m not in reserved)
 
     def unreserved(key: str) -> str:
         return "" if mode(key) in reserved else mode(key)

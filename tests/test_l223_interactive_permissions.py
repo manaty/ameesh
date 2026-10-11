@@ -92,6 +92,35 @@ class PermissionModeTest(unittest.TestCase):
         self.assertEqual(claude.permission_mode(), "auto")
         self.assertEqual(claude.permission_mode("bypassPermissions"), "bypassPermissions")
 
+    def test_bypass_reserved_without_explicit_only(self):
+        # codex r4 (#182) P1: a descriptor omitting `explicit_only` does not
+        # make bypassPermissions a default, a fallback nor a variable value
+        for key in ("default", "fallback"):
+            raw = {"flag": ["--permission-mode", "{mode}"], "default": "auto",
+                   "fallback": "acceptEdits", key: "bypassPermissions"}
+            messages = [f.message for f in harnesses._check_interactive_permission(raw, "")]
+            self.assertTrue(any("reserved" in m and key in m for m in messages), messages)
+            normalized = harnesses._interactive_permission(raw)
+            self.assertEqual(normalized[key], "")
+            self.assertIn("bypassPermissions", normalized["explicit_only"])
+        claude = self._claude()
+        rule = {k: v for k, v in harnesses.get("claude").interactive_permission.items()
+                if k != "explicit_only"}
+        for key in ("default", "fallback"):
+            adapters._HELP_CACHE.clear()
+            raw = dict(rule, **{key: "bypassPermissions"})
+            claude.descriptor = dataclasses.replace(claude.descriptor,
+                                                    interactive_permission=raw)
+            with mock.patch.object(adapters.subprocess, "run", side_effect=OSError("no help")):
+                self.assertNotEqual(claude.permission_mode(), "bypassPermissions", key)
+                self.assertNotIn("bypassPermissions", claude.interactive_command("s1"), key)
+        claude.descriptor = dataclasses.replace(claude.descriptor, interactive_permission=rule)
+        adapters._HELP_CACHE.clear()
+        with mock.patch.dict(os.environ, {VARIABLE: "bypassPermissions"}):
+            self.assertNotEqual(claude.permission_mode(), "bypassPermissions")
+        adapters._HELP_CACHE.clear()
+        self.assertEqual(claude.permission_mode("bypassPermissions"), "bypassPermissions")
+
     def test_auto_looked_up_in_the_option_choices_only(self):
         # codex verdict #182 (2): "auto" elsewhere in the help does not count
         claude = self._claude(AMEESH_TEST_CLAUDE_HELP=(
