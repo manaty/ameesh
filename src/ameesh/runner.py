@@ -4068,6 +4068,7 @@ class Runner:
 
     def _housekeeping_pass(self) -> dict | None:
         from . import menage as menage_mod
+        from . import build_artifacts
         from . import resources as resources_mod
         db = None
         try:
@@ -4080,7 +4081,9 @@ class Runner:
             report = menage_mod.run_pass(
                 self.cfg, db, self.housekeeping_policy(), host=self.host,
                 actor="runner:%s" % self.runner_id, busy=busy, agents_in_turn=en_tour,
-                runtime=self.container_runtime())
+                runtime=self.container_runtime(),
+                # L230: the worktrees are walked at most every few hours
+                artifact_scan=build_artifacts.due(time.time()))
             faits = [e for e in report["entries"] if e["kind"] != "mesure"]
             if faits:
                 log_async("cleanup: %s" % "; ".join(
