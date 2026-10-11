@@ -141,6 +141,7 @@ class CheckReportsTest(unittest.TestCase):
         cfg = SimpleNamespace(host="h1", accounts={}, credential_sentinel={"probes": ["gh"]})
         creds = mock.Mock()
         creds.report.return_value = {"state": "failing", "previous": "healthy"}
+        creds.health.return_value = {}
         run = mock.Mock(return_value=(1, "not logged in"))
         with mock.patch.object(sentinel.shutil, "which", return_value="/bin/gh"), \
                 mock.patch("ameesh.storage.of", return_value=SimpleNamespace(credentials=creds)):
@@ -151,6 +152,136 @@ class CheckReportsTest(unittest.TestCase):
         self.assertEqual(kw["source"], "sentinel")
         self.assertIn("gh auth login -h github.com", kw["reason"])
         self.assertEqual(rows[0]["previous"], "healthy")
+
+
+class ReviewR1Test(unittest.TestCase):
+    """#210 review r1 (codex, head 053a307): one test per finding."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-l226a-r1-")
+
+    def _codex(self, auth, mtime=None, name="a"):
+        path = os.path.join(self.tmp, name)
+        os.makedirs(path)
+        auth_file = os.path.join(path, "auth.json")
+        with open(auth_file, "w", encoding="utf-8") as fh:
+            json.dump(auth, fh)
+        if mtime is not None:
+            os.utime(auth_file, (mtime, mtime))
+        return accounts.Profile("codex", name, path=path)
+
+    def _check(self, current, verdicts):
+        cfg = SimpleNamespace(host="h1", accounts={}, credential_sentinel={})
+        creds = mock.Mock()
+        creds.health.return_value = current
+        creds.report.return_value = {"state": "x", "previous": "failing"}
+        with mock.patch.object(sentinel, "probe_all", return_value=verdicts), \
+                mock.patch("ameesh.storage.of", return_value=SimpleNamespace(credentials=creds)):
+            return sentinel.check(cfg, object(), now=NOW), creds
+
+    def test_p2_failure_cleared_only_by_a_fresh_login(self):
+        # a turn found the Codex refresh token revoked at NOW - 600; the token
+        # is still in auth.json (written before): the probe reads healthy
+        failing = {"a": {"state": "failing", "source": "turn",
+                         "failing_since_ts": NOW - 600, "checked_ts": NOW - 600}}
+        stale = sentinel.probe_codex(self._codex({"tokens": {"refresh_token": "x"}},
+                                                 mtime=NOW - 3600), NOW)
+        self.assertEqual(stale.state, "healthy")
+        rows, creds = self._check(failing, [stale])
+        creds.report.assert_not_called()
+        self.assertEqual(rows[0]["state"], "failing")
+        self.assertIn("no fresh login", rows[0]["kept"])
+        self.assertIn("ameesh accounts healthy codex a", rows[0]["kept"])
+        # a timeout (unknown) does not clear it either
+        rows, creds = self._check(failing, [sentinel.Verdict("codex", "a", "unknown",
+                                                             "probe failed: Timeout")])
+        creds.report.assert_not_called()
+        # `codex login` rewrote auth.json after the failure: cleared
+        fresh = sentinel.probe_codex(self._codex({"tokens": {"refresh_token": "y"}},
+                                                 mtime=NOW - 60, name="b"), NOW)
+        rows, creds = self._check({"b": failing["a"]}, [fresh])
+        creds.report.assert_called_once()
+        self.assertEqual(creds.report.call_args[0][3], "healthy")
+        # a new failure, and a healthy credential that was not failing, are written
+        rows, creds = self._check({}, [stale])
+        creds.report.assert_called_once()
+
+    def test_p2_named_claude_probe_sheds_inherited_auth_variables(self):
+        path = _claude_dir(self.tmp, "acct", refreshToken="x")
+        profile = accounts.Profile("claude", "acct", path=path)
+        declared = {"claude": [profile]}
+        calls = []
+
+        def run(argv, env=None, whole=False):
+            calls.append(env)
+            return 0, json.dumps({"loggedIn": True})
+        environ = {"PATH": "/bin", "ANTHROPIC_API_KEY": "sk-inherited",
+                   "CLAUDE_CONFIG_DIR": "/elsewhere"}
+        with mock.patch.object(sentinel.shutil, "which", return_value="/bin/claude"):
+            sentinel.probe_claude(profile, NOW, environ, run, declared)
+        self.assertNotIn("ANTHROPIC_API_KEY", calls[0])
+        self.assertEqual(calls[0]["CLAUDE_CONFIG_DIR"], path)
+        # the default credential (no accounts declared) keeps them, as the runner does
+        default = accounts.Profile("claude", "", path=path)
+        with mock.patch.object(sentinel.shutil, "which", return_value="/bin/claude"):
+            sentinel.probe_claude(default, NOW, environ, run, {})
+        self.assertEqual(calls[1]["ANTHROPIC_API_KEY"], "sk-inherited")
+
+    def test_p2_expiring_healthy_credential_keeps_the_fix_command(self):
+        profile = accounts.Profile("claude", "e", path=_claude_dir(
+            self.tmp, "e", refreshToken="x", refreshTokenExpiresAt=(NOW + 3600) * 1000))
+        run = mock.Mock(return_value=(0, json.dumps({"loggedIn": True})))
+        with mock.patch.object(sentinel.shutil, "which", return_value="/bin/claude"):
+            v = sentinel.probe_claude(profile, NOW, run=run)
+        self.assertEqual(v.state, "healthy")
+        self.assertIn("fix: CLAUDE_CONFIG_DIR=%s claude auth login" % profile.path, v.text())
+        creds = mock.Mock()
+        creds.listing.return_value = [{
+            "host": "h1", "harness": "claude", "account": "e", "state": "healthy",
+            "reason": v.text(), "source": "sentinel", "checked_ts": NOW,
+            "failing_since_ts": None, "expires_ts": v.expires_at}]
+        with mock.patch.object(exploitation.storage, "of",
+                               return_value=SimpleNamespace(credentials=creds)):
+            [alert] = exploitation._credentials(object(), NOW)
+        self.assertEqual(alert["type"], "credential_expiring")
+        self.assertIn("claude auth login", alert["detail"])
+
+    def test_p2_fix_commands_quote_paths(self):
+        home = os.path.join(self.tmp, "account a")
+        os.makedirs(home)
+        claude = accounts.Profile("claude", "q", path=home)
+        run = mock.Mock(return_value=(0, json.dumps({"loggedIn": False})))
+        with mock.patch.object(sentinel.shutil, "which", return_value="/bin/claude"):
+            v = sentinel.probe_claude(claude, NOW, run=run)
+        self.assertIn("CLAUDE_CONFIG_DIR='%s' claude auth login" % home, v.text())
+        codex = sentinel.probe_codex(accounts.Profile("codex", "q", path=home), NOW)
+        self.assertIn("CODEX_HOME='%s' codex login" % home, codex.text())
+
+    def test_p2_non_object_auth_json_is_unknown_and_later_probes_run(self):
+        profile = self._codex([1])
+        v = sentinel.probe_codex(profile, NOW)
+        self.assertEqual(v.state, "unknown")
+        cfg = SimpleNamespace(host="h1", credential_sentinel={"probes": ["codex", "gh"]},
+                              accounts={"codex": [{"name": "a", "path": profile.path}]})
+        run = mock.Mock(return_value=(0, ""))
+        with mock.patch.object(sentinel.shutil, "which", return_value="/bin/x"):
+            verdicts = sentinel.probe_all(cfg, NOW, run, environ={})
+        self.assertEqual([(x.harness, x.state) for x in verdicts],
+                         [("codex", "unknown"), ("gh", "healthy")])
+
+    def test_p3_configured_warn_hours_is_used(self):
+        cfg = SimpleNamespace(credential_sentinel={"warn_hours": 2})
+        self.assertEqual(exploitation._credential_warn_s(cfg), 7200)
+        creds = mock.Mock()
+        creds.listing.return_value = [{
+            "host": "h1", "harness": "gcloud", "account": "", "state": "healthy",
+            "reason": "", "source": "sentinel", "checked_ts": NOW,
+            "failing_since_ts": None, "expires_ts": NOW + 12 * 3600}]
+        with mock.patch.object(exploitation.storage, "of",
+                               return_value=SimpleNamespace(credentials=creds)):
+            self.assertEqual(exploitation._credentials(object(), NOW,
+                                                       exploitation._credential_warn_s(cfg)),
+                             [])
 
 
 class AlertsTest(unittest.TestCase):

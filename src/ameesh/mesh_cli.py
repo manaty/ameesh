@@ -2274,7 +2274,8 @@ def cmd_accounts(cfg: Config, args) -> int:
             else:
                 for row in rows:
                     print("%-8s %-12s %-8s %s" % (row["harness"], row["account"] or "(default)",
-                                                  row["state"], row["reason"]))
+                                                  row["state"],
+                                                  row.get("kept") or row["reason"]))
             return 0
         if what == "healthy":
             items = declares.get(args.harness) or []
