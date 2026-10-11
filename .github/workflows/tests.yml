@@ -138,7 +138,6 @@ jobs:
       AMEESH_DRIVER: psycopg
     steps:
       - uses: actions/checkout@v4
-        with:
       - id: py
         uses: actions/setup-python@v5
         with:
