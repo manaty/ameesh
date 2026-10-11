@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-11 (capacité des hôtes)
+* **Étude** (L159, lot n° 169 du suivi) : [capacité des hôtes prêtée au mesh, contrat commun avec Nexlink Compute](etudes/l159-capacite-des-hotes.md). Besoin du propriétaire : prêter aux agents la capacité inutilisée des VM de l'organisation sans gêner leurs applications, de façon réutilisable par Nexlink Compute, après la saturation du poste (charge 43 pour 12 CPU le 10, `/tmp` plein le 11). Contrat de « garde de capacité » : offre au canon (`policy.lend`), mesure commune (parts de l'application et de l'invité, PSI, capacité prêtable), `ameesh-host-state/1` étendu par des champs facultatifs, acquittement inchangé, paliers prêt, réduit, gel, retrait et arrêt, plafonds posés par le noyau. Deux modes sur une VM : exécuteur complet sous une slice plafonnée, ou déport des suites lourdes par SSH, d'abord sur la VM de tests. Lots L159a à L159i, N1 à N3 côté Nexlink, gestes du propriétaire.
+
 ## 2026-10-11 (courrier des sous-agents)
 * **Correctif** (L133, sans migration) : `agent-mail hook` remettait le courrier d'un agent à ses sous-agents (Claude Code les déclenche avec la session de l'agent), qui l'ignoraient, et le marquait livré : la session principale ne le recevait jamais (au moins cinq messages perdus les 10 et 11/10, relevé dans l'amendement de [0036](decisions/0036-auditeur-interne.md)). Une entrée de hook qui porte `agent_id` (sous-agent ou coéquipier de Claude Code, sous-agent de Codex) ne lit, ne remet, ne marque et n'écrit plus rien ; le courrier attend le prochain hook de la session principale. Limite : le harnais DeepSeek ne passe pas `agent_id` à ses hooks ordinaires. Voir [V1-MAILBOX-RUNNER.md](../V1-MAILBOX-RUNNER.md), section 6.
 
