@@ -23,6 +23,9 @@ create table if not exists merge_queue (
                  check (state in ('queued', 'landing', 'landed', 'ejected')),
     -- 1 = head of the queue; NULL until the radar's first pass, or once ejected
     rank         integer,
+    -- L160e2 (`land`, team with PRs): the merge commit pushed to the lot
+    -- branch, whose CI is awaited before the PR is merged
+    landing_sha  text check (landing_sha ~ '^[0-9a-f]{40}([0-9a-f]{24})?$'),
     -- why the lot is where it is (order, ejection)
     reason       text not null default '',
     queued_by    text not null,

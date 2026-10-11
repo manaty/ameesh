@@ -1044,8 +1044,10 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def queue_update(self, item_id: int, *, state: str | None = None,
                      rank: int | None = None, reason: str | None = None,
-                     note: str = "", actor: str = "") -> dict | None:
-        """L160e (0058): changes the state, rank or reason of a queued lot; a
+                     landing_sha: str | None = None, note: str = "",
+                     actor: str = "") -> dict | None:
+        """L160e (0058): changes the state, rank, reason or landing commit of
+        a queued lot (`queued` and `ejected` clear the landing commit); a
         journal line when `note` is given. None if the lot is not queued."""
 
     @abc.abstractmethod

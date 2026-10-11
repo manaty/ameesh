@@ -451,8 +451,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- L160e (0058): merge queue per target (lot, frozen commit, rank, state:
     -- STATE, no content) and the per-target merge lease
     ('merge_queue', ARRAY[
-        'work_item_id', 'target', 'frozen_sha', 'state', 'rank', 'reason', 'queued_by',
-        'queued_at', 'updated_at'
+        'work_item_id', 'target', 'frozen_sha', 'state', 'rank', 'landing_sha', 'reason',
+        'queued_by', 'queued_at', 'updated_at'
     ]),
     ('merge_locks', ARRAY[
         'target', 'owner', 'epoch', 'expires_at'

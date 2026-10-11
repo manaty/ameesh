@@ -46,16 +46,22 @@ class FakeQueue(FakeWork):
         self.clock += 1
         self.queue_rows[item_id] = {"work_item_id": item_id, "target": target,
                                     "frozen_sha": frozen_sha, "state": "queued", "rank": None,
+                                    "landing_sha": None,
                                     "reason": "", "queued_by": actor, "queued_ts": self.clock}
         self.notes.append((item_id, note, actor))
         return self._row(item_id)
 
-    def queue_update(self, item_id, *, state=None, rank=None, reason=None, note="", actor=""):
+    def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
+                     note="", actor=""):
         q = self.queue_rows.get(item_id)
         if q is None:
             return None
         if state:
             q["state"] = state
+        if state in ("queued", "ejected"):
+            q["landing_sha"] = None
+        elif landing_sha:
+            q["landing_sha"] = landing_sha
         q["rank"] = None if state == "ejected" else (rank if rank is not None else q["rank"])
         if reason is not None:
             q["reason"] = reason
@@ -296,9 +302,13 @@ class QueueDbTest(PgTestCase):
         ops.queue_update(a, rank=2, reason="second")
         self.assertEqual([r["work_item_id"] for r in ops.queue("main")], [b, a])
         self.assertEqual(ops.queue("develop"), [])
+        landing = ops.queue_update(b, state="landing", landing_sha="5" * 40)
+        self.assertEqual((landing["state"], landing["landing_sha"], landing["rank"]),
+                         ("landing", "5" * 40, 1))
         ejected = ops.queue_update(b, state="ejected", reason="conflict", note="ejected",
                                    actor="ameesh")
-        self.assertEqual((ejected["state"], ejected["rank"]), ("ejected", None))
+        self.assertEqual((ejected["state"], ejected["rank"], ejected["landing_sha"]),
+                         ("ejected", None, None))
         again = ops.queue_add(b, target="main", frozen_sha="3" * 40, note="again", actor="o")
         self.assertEqual((again["state"], again["frozen_sha"], again["reason"]),
                          ("queued", "3" * 40, ""))

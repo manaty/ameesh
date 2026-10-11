@@ -35,7 +35,8 @@ ITEM_COLUMNS = """
 
 #: L160d (0057): a prepared conflict resolution
 QUEUE_COLUMNS = """
-    q.work_item_id, q.target, q.frozen_sha, q.state, q.rank, q.reason, q.queued_by,
+    q.work_item_id, q.target, q.frozen_sha, q.state, q.rank, q.landing_sha, q.reason,
+    q.queued_by,
     extract(epoch from q.queued_at)::float8 as queued_ts,
     extract(epoch from q.updated_at)::float8 as updated_ts,
     w.title, w.priority, w.state as item_state, w.branch, w.assignee
@@ -666,21 +667,25 @@ class WorkItems(interface.WorkItems):
                 " VALUES (%s, %s, %s, %s)"
                 " ON CONFLICT (work_item_id) DO UPDATE SET target = excluded.target,"
                 "   frozen_sha = excluded.frozen_sha, state = 'queued', rank = NULL,"
+                "   landing_sha = NULL,"
                 "   reason = '', queued_by = excluded.queued_by, queued_at = now(),"
                 "   updated_at = now()",
                 (int(item_id), target, frozen_sha, actor or ""))
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
             return self._queue_row(tx, item_id)
 
-    def queue_update(self, item_id, *, state=None, rank=None, reason=None, note="",
-                     actor="") -> dict | None:
+    def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
+                     note="", actor="") -> dict | None:
         with self.db.transaction() as tx:
             rows = tx.query(
                 "UPDATE merge_queue SET state = coalesce(%s, state),"
                 "   rank = CASE WHEN %s THEN NULL ELSE coalesce(%s, rank) END,"
+                "   landing_sha = CASE WHEN %s IN ('queued', 'ejected') THEN NULL"
+                "                      ELSE coalesce(%s, landing_sha) END,"
                 "   reason = coalesce(%s, reason), updated_at = now()"
                 " WHERE work_item_id = %s RETURNING work_item_id",
-                (state, state == "ejected", rank, reason, int(item_id)))
+                (state, state == "ejected", rank, state or "", landing_sha, reason,
+                 int(item_id)))
             if not rows:
                 return None
             if note:
