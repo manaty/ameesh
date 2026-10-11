@@ -443,14 +443,18 @@ court=$(git -C ameesh rev-parse --short=7 HEAD)
 maj="$PWD/ameesh/deploy/mise-a-jour"
 "$maj/poste.sh" verifier
 "$maj/poste.sh" sauvegarder
+"$maj/poste.sh" migrer "$court"      # avant installer (L151) ; sans migration, rien
 "$maj/poste.sh" installer "$court"
 "$maj/vm.sh" verifier && "$maj/vm.sh" installer "$court"   # si le mesh a un serveur
 ```
 
 Une correction qui porte une migration n'est déployée par lui que si la
 migration est additive et ne change aucun comportement : `"$maj/poste.sh"
-migrer` après `installer`, une fois pour tout le mesh. `retour` reste alors
-possible sans toucher à la base. Toute autre migration : il propose.
+migrer` **avant** `installer`, une fois pour tout le mesh ; `migrer` refuse
+d'appliquer une migration non additive, et `installer` refuse tant que les
+migrations manquent ([BASCULE](BASCULE.md), « Migrer avant d'installer »).
+`retour` reste alors possible sans toucher à la base. Toute autre
+migration : il propose.
 
 Le redémarrage se fait **hors de son tour** : `redemarrer` attend que chaque
 persona soit hors tour, la sienne comprise, et attendrait sans fin s'il le

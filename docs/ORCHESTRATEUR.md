@@ -282,7 +282,7 @@ restée 4 h fusionnée sans être déployée :
    propriétaire se fusionne avant tout nouveau chantier.
 2. **Une correction de bug se fusionne et se déploie sans attendre** (règle du
    propriétaire, 2026-10-11) : dès que la CI est verte, avec le déroulé de
-   `deploy/mise-a-jour` (vérifier, sauvegarder, installer, migrer, redémarrer
+   `deploy/mise-a-jour` (vérifier, sauvegarder, migrer, installer, redémarrer
    hors tour, contrôler, retour possible). Le propriétaire et les agents
    touchés sont prévenus après coup.
 3. **Les autres déploiements se préparent entièrement** (nouvelle fonction,

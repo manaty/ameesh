@@ -39,7 +39,7 @@
   agent-mail status "<travail en cours>"         état de l'agent (registre + titre du terminal)
   agent-mail hook <claude|codex|deepseek>        hook : lit le JSON sur stdin, livre les non-lus
   agent-mail statusline                          barre d'état Claude Code : [chantier/nom] travail · dossier
-  agent-mail migrate                             applique les migrations versionnées
+  agent-mail migrate [--dry-run | --additive-only]  applique les migrations versionnées
   agent-mail doctor [--notify-test | --probe | --harness]  diagnostic : pilote, schéma, migrations, LISTEN/NOTIFY ; harnais de l'hôte (L106)
                                                  (--probe : sonde légère de conteneur)
 
@@ -1169,13 +1169,40 @@ def cmd_whoami(bk, cfg: Config, rest: list[str]) -> int:
     return 0
 
 
-def cmd_migrate(cfg: Config) -> int:
+def cmd_migrate(cfg: Config, dry_run: bool = False, additive_only: bool = False) -> int:
+    """`--dry-run` : migrations manquantes, additives ou non, sans rien écrire.
+    `--additive-only` : n'applique rien (code 3) si l'une d'elles n'est pas
+    additive — c'est le garde de « migrer avant d'installer » (L151)."""
     try:
         db = db_mod.connect(cfg)
     except db_mod.Unavailable as exc:
         print("migration impossible : %s" % exc, file=sys.stderr)
         return 1
     try:
+        if dry_run or additive_only:
+            missing, modified, _unknown = migrations.check(db)
+            if modified:
+                print("migration en échec : %s modifiée(s) après application"
+                      % ",".join(m.label for m in modified), file=sys.stderr)
+                return 1
+            refused = []
+            for migration in missing:
+                reasons = migrations.non_additive(migration)
+                if reasons:
+                    refused.append(migration)
+                if dry_run or reasons:
+                    print("%s : %s" % (migration.label, "NON additive — " + " ; ".join(reasons)
+                                       if reasons else "additive"))
+            if refused:
+                print("%d migration(s) non additive(s) : le code d'avant casserait sur la "
+                      "base migrée" % len(refused), file=sys.stderr)
+            if dry_run:
+                if not missing:
+                    print("schéma à jour : aucune migration à appliquer")
+                return 0
+            if refused:
+                print("rien n'est appliqué (--additive-only)", file=sys.stderr)
+                return 3
         done = migrations.migrate(db, log=lambda line: print(line))
     except db_mod.DbError as exc:
         print("migration en échec : %s" % exc, file=sys.stderr)
@@ -1357,7 +1384,8 @@ def main(argv: list[str] | None = None) -> int:
         if command == "hook":
             return cmd_hook(cfg, rest[0] if rest else "?")
         if command == "migrate":
-            return cmd_migrate(cfg)
+            return cmd_migrate(cfg, dry_run="--dry-run" in rest,
+                               additive_only="--additive-only" in rest)
         if command == "doctor":
             return cmd_doctor(cfg, notify_test="--notify-test" in rest,
                               probe="--probe" in rest, harness="--harness" in rest)

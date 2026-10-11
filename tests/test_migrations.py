@@ -76,6 +76,25 @@ class MigrationsTest(PgTestCase):
                 "UPDATE schema_migrations SET checksum = %s WHERE version = 1", (connue,)
             )
 
+    def test_migrate_essai_puis_additive_seulement(self):
+        """L151 : `migrate --dry-run` n'écrit rien ; `--additive-only` applique
+        une migration additive manquante (la dernière, retirée du registre)."""
+        # 0051 : un ajout de colonne « if not exists », réapplicable sans effet
+        last = next(m for m in migrations.discover() if m.version == 51)
+        self.assertEqual(migrations.non_additive(last), [])
+        self.db.execute("DELETE FROM schema_migrations WHERE version = %s", (last.version,))
+        try:
+            out = self.cli("migrate", "--dry-run")
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("%s : additive" % last.label, out.stdout)
+            self.assertNotIn(last.version, migrations.applied(self.db))
+            out = self.mesh("migrate", "--additive-only")
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("%s appliquée" % last.label, out.stdout)
+        finally:
+            migrations.migrate(self.db)
+        self.assertIn(last.version, migrations.applied(self.db))
+
     def test_version_en_double_refusee(self):
         with tempfile.TemporaryDirectory() as directory:
             for filename in ("0007_a.sql", "0007_b.sql"):
