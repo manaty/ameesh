@@ -261,7 +261,7 @@ class GraceTest(_Base):
         self._tour(worker, AMEESH_TEST_CLAUDE_CALLS=json.dumps(appels),
                    AMEESH_TEST_BACKGROUND="sleep 60", AMEESH_TEST_BACKGROUND_PID=pidfile)
         self.assertLess(time.monotonic() - debut, 20)
-        self.assertTrue(worker.last_turn_closed.startswith("durée maximale du tour"))
+        self.assertTrue(worker.last_turn_closed.startswith("maximum turn duration"))
         pid = self._pid(pidfile)
         self.assertTrue(platform.alive(pid), "la clôture au point sûr a tué le travail")
         self.assertTrue(runner.background.has_jobs("fond-clos"))
@@ -273,14 +273,14 @@ class GraceTest(_Base):
     def test_arret_d_urgence_sans_grace(self):
         _runner, worker = self._worker("fond-urgence")
         self.assertEqual(worker._urgent_end(), "")
-        for drapeau, raison in ((worker.preempting, "préemption"),
-                                (worker.restarting, "redémarrage demandé"),
-                                (worker.lease_lost, "bail perdu")):
+        for drapeau, raison in ((worker.preempting, "preemption"),
+                                (worker.restarting, "restart requested"),
+                                (worker.lease_lost, "lease lost")):
             drapeau.set()
             self.assertEqual(worker._urgent_end(), raison)
             drapeau.clear()
         worker.runner.stop.set()
-        self.assertEqual(worker._urgent_end(), "arrêt de l'exécuteur")
+        self.assertEqual(worker._urgent_end(), "runner shutdown")
 
     def test_ressource_en_grace_jugee_sur_la_fin_du_tour(self):
         tours = storage.of(self.db).turn_resources

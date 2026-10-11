@@ -362,7 +362,7 @@ class ExecuteurTest(_Base):
         work.delegate(self.db, self.lot["id"], "relais", within="30m")
         self._echoir()
         proc = self.runner("--once", "--agents", "personne")
-        self.assertIn("délégation échue : lot #%d rendu à orch" % self.lot["id"],
+        self.assertIn("delegation expired: work item #%d returned to orch" % self.lot["id"],
                       proc.stdout + proc.stderr)
         self.assertEqual(self._item()["assignee"], "orch")
 

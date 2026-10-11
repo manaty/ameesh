@@ -143,7 +143,7 @@ class PressureDbTest(test_canon._CanonDbCase):
         self.assertEqual(self.turns(), [])
         row = registry.get(self.db, "orchestre")
         self.assertEqual(row["status"], "queued")  # pas de pause : priorité 4
-        self.assertIn("en attente : pression de l'hôte atelier", row["status_text"])
+        self.assertIn("waiting: pressure on host atelier", row["status_text"])
         self.assertIn("available memory", row["status_text"])
         self.assertIn("threshold 100.0 TiB", row["status_text"])
         self.assertTrue(row.get("pending_prompt"))

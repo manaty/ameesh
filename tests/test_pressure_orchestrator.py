@@ -99,7 +99,7 @@ class PressionTest(PgTestCase):
         self.assertEqual(spec["kind"], "prompt")
         self.assertEqual(spec["prompt"], "travail")
         texte = registry.get(self.db, "ouvrier")["status_text"]
-        self.assertIn("en attente : pression de l'hôte", texte)
+        self.assertIn("waiting: pressure on host", texte)
         self.assertTrue(registry.get(self.db, "ouvrier")["pending_prompt"])
 
     def test_jamais_sous_pression_critique_ni_sur_batterie(self):
@@ -146,12 +146,12 @@ class PressionTest(PgTestCase):
             self.assertFalse(self.executeur.host_pressure(
                 now=self.executeur._pressure_at + 11.0)["blocked"])
             self.executeur.host_pressure(now=self.executeur._pressure_at + 11.0)
-        pression = [l for l in lignes if "pression de l'hôte" in l]
+        pression = [l for l in lignes if "pressure on host" in l]
         self.assertEqual(len(pression), 2, lignes)
         self.assertIn("available memory", pression[0])
-        self.assertIn("sauf ceux d'un orchestrateur", pression[0])
-        self.assertRegex(pression[1], r"fin — de \d\d:\d\d:\d\d à \d\d:\d\d:\d\d \(\d+ s\)")
-        self.assertIn("2 tour(s) retardé(s) (a, b)", pression[1])
+        self.assertIn("except an orchestrator's", pression[0])
+        self.assertRegex(pression[1], r"end — from \d\d:\d\d:\d\d to \d\d:\d\d:\d\d \(\d+ s\)")
+        self.assertIn("2 turn(s) delayed (a, b)", pression[1])
 
 
 if __name__ == "__main__":

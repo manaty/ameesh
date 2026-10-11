@@ -1,21 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Adoption et reprise d'agents (lot L39, décision 0030 point 3).
+"""Adopting and resuming agents (work item L39, decision 0030 point 3).
 
   ameesh adopt <agent> --session ID --harness claude|codex|deepseek
-               [--account COMPTE] [--cwd D] [--brief FICHIER|-] [--chantier C]
+               [--account ACCOUNT] [--cwd D] [--brief FILE|-] [--chantier C]
                [--force] [--json]
-        fait passer une session interactive EXISTANTE (fermée) sous
-        l'exécuteur : mode `execute`, session et compte d'origine en registre,
-        consigne de reprise en attente, trace d'audit dans le fil.
-  ameesh resume <agent> [--brief FICHIER|-] [--fresh] [--json]
-        relance un agent arrêté, mort ou au repos : sur sa session quand le
-        prochain compte peut la reprendre, sinon (ou avec --fresh) sur une
-        session neuve ouverte par un brief de reprise DÉTERMINISTE.
+        moves an EXISTING (closed) interactive session under the runner:
+        `execute` mode, session and original account in the registry,
+        resume instruction queued, audit trail in the thread.
+  ameesh resume <agent> [--brief FILE|-] [--fresh] [--json]
+        restarts a stopped, dead or idle agent: on its session when the
+        next account can resume it, otherwise (or with --fresh) on a new
+        session opened by a DETERMINISTIC resume brief.
 
-Adoption et reprise sont des opérations d'ameesh, jamais des prompts : on ne
-demande plus à une session de « reprendre la session X » en fouillant
-`~/.codex*/sessions`. Les écritures de base passent par
-`storage.of(db).operations` (`adopt`, `resume`) ; aucun SQL ici.
+Adopting and resuming are ameesh operations, never prompts: a session is no
+longer asked to "resume session X" by digging through
+`~/.codex*/sessions`. Database writes go through
+`storage.of(db).operations` (`adopt`, `resume`); no SQL here.
 """
 from __future__ import annotations
 
@@ -40,11 +40,11 @@ HARNESSES = ("claude", "codex", "deepseek")
 SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 
 #: consigne posée par `adopt` sans --brief
-DEFAULT_ADOPT = ("Reprise sous l'exécuteur : lis ton courrier, reprends l'état de ton "
-                 "travail, termine chaque tour par un état clair.")
+DEFAULT_ADOPT = ("Resuming under the runner: read your mail, pick up the state of your "
+                 "work, end each turn with a clear status.")
 #: consigne posée par `resume` sans --brief
-DEFAULT_RESUME = ("Reprise (ameesh resume) : lis ton courrier, reprends l'état de ton "
-                  "travail, termine chaque tour par un état clair.")
+DEFAULT_RESUME = ("Resuming (ameesh resume): read your mail, pick up the state of your "
+                  "work, end each turn with a clear status.")
 
 #: bornes du brief de reprise déterministe (octets UTF-8)
 BRIEF_MAX_BYTES = 16000
@@ -120,8 +120,8 @@ def search_homes(cfg: Config, harness: str, account: str | None = None) -> list[
         profile = accounts.by_name(items, account)
         if profile is None:
             raise RepriseError(
-                "compte %s inconnu pour %s (déclarés sur cet hôte : %s)"
-                % (account, harness, ", ".join(p.name for p in items) or "aucun"))
+                "unknown account %s for %s (declared on this host: %s)"
+                % (account, harness, ", ".join(p.name for p in items) or "none"))
         return [(profile.name, profile.home())]
     if items:
         return [(p.name, p.home()) for p in items]
@@ -228,9 +228,9 @@ def _role(cfg: Config, name: str) -> list[str]:
     for key in ("role", "description"):
         value = data.get(key)
         if isinstance(value, str) and value.strip():
-            out.append("- %s (canon) : %s" % (key, fil.excerpt(value, 300)))
+            out.append("- %s (canon): %s" % (key, fil.excerpt(value, 300)))
     if agent.capabilities:
-        out.append("- capacités (canon) : %s" % ", ".join(map(str, agent.capabilities)))
+        out.append("- capabilities (canon): %s" % ", ".join(map(str, agent.capabilities)))
     return out
 
 
@@ -238,7 +238,7 @@ def _lots(db, name: str) -> list[str]:
     rows = [r for r in work_mod.list_items(db, assignee=name, limit=200)
             if (r.get("state") or "") not in stagnation.DONE_STATES]
     if not rows:
-        return ["Aucun lot ouvert ne t'est assigné."]
+        return ["No open work item is assigned to you."]
     try:
         described = stagnation.describe(db, rows)
     except Exception:
@@ -248,9 +248,9 @@ def _lots(db, name: str) -> list[str]:
         attente = ((described.get(int(row["id"])) or {}).get("waiting") or {}).get("label")
         out.append("- #%s [%s] %s%s" % (row["id"], row.get("state") or "?",
                                         fil.excerpt(row.get("title") or "", 120),
-                                        " — attend : %s" % attente if attente else ""))
+                                        " — waiting for: %s" % attente if attente else ""))
     if len(rows) > LOTS_MAX:
-        out.append("- … et %d autre(s) : `ameesh work list --assignee %s`"
+        out.append("- … and %d more: `ameesh work list --assignee %s`"
                    % (len(rows) - LOTS_MAX, name))
     return out
 
@@ -262,19 +262,19 @@ def _fil(cfg: Config, project: str) -> tuple[list[str], int]:
         thread = fil.ThreadRef(project)
         entries = transport.read(thread) if transport.exists(thread) else []
     except Exception:
-        return ["(fil du projet illisible)"], 0
+        return ["(project thread unreadable)"], 0
     total = len(entries)
     lines: list[str] = []
     budget = FIL_MAX_BYTES
     for entry in reversed(entries[-FIL_ENTRIES:]):
-        line = "- %s %s → %s : %s" % (entry.when, entry.author, entry.recipient or "—",
+        line = "- %s %s → %s: %s" % (entry.when, entry.author, entry.recipient or "—",
                                       fil.excerpt(entry.text, FIL_ENTRY_CHARS))
         if _octets(line) + 1 > budget:
             break
         budget -= _octets(line) + 1
         lines.append(line)
     lines.reverse()
-    return lines or ["(fil vide)"], total
+    return lines or ["(empty thread)"], total
 
 
 def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | None = None,
@@ -292,36 +292,36 @@ def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | Non
     name = row.get("name") or "?"
     harness = row.get("harness") or "?"
     project = fil.project_for(cfg, row.get("team") or row.get("chantier"))
-    head = ["# Brief de reprise de %s (ameesh, déterministe)" % name, "",
-            "Construit par ameesh sans appel de modèle%s. Ta session précédente n'est "
-            "pas reprise : ce brief te donne l'état connu du mesh ; vérifie-le avant "
-            "d'agir." % (" — %s" % reason if reason else ""), ""]
-    ident = ["## Identité et rôle",
-             "- agent : %s (harnais %s%s), hôte %s" % (
-                 name, harness, ", modèle %s" % row["model"] if row.get("model") else "",
+    head = ["# Resume brief for %s (ameesh, deterministic)" % name, "",
+            "Built by ameesh without a model call%s. Your previous session is not "
+            "resumed: this brief gives you the known state of the mesh; check it before "
+            "acting." % (" — %s" % reason if reason else ""), ""]
+    ident = ["## Identity and role",
+             "- agent: %s (harness %s%s), host %s" % (
+                 name, harness, ", model %s" % row["model"] if row.get("model") else "",
                  row.get("host") or "?"),
-             "- dossier de travail : %s" % (row.get("cwd") or "non renseigné"),
-             "- projet : %s%s" % (project, " (équipe %s)" % row["team"]
+             "- working directory: %s" % (row.get("cwd") or "not set"),
+             "- project: %s%s" % (project, " (team %s)" % row["team"]
                                   if row.get("team") else ""),
-             "- responsable humain : %s" % (row.get("responsible") or "aucun")]
+             "- human owner: %s" % (row.get("responsible") or "none")]
     if row.get("capabilities"):
         caps = row["capabilities"]
-        ident.append("- capacités : %s" % (", ".join(map(str, caps))
+        ident.append("- capabilities: %s" % (", ".join(map(str, caps))
                                            if isinstance(caps, (list, tuple)) else caps))
     ident += _role(cfg, name)
     try:
         lots = _lots(db, name)
     except Exception as exc:
-        lots = ["(lots illisibles : %s)" % fil.excerpt(str(exc), 120)]
+        lots = ["(work items unreadable: %s)" % fil.excerpt(str(exc), 120)]
     try:
         non_lus = len(mail.unread(db, name, limit=1000))
     except Exception:
         non_lus = -1
-    courrier = ["## Courrier",
-                ("%d message(s) non lu(s) : ils te sont remis par l'exécuteur à tes "
-                 "prochains tours (`ameesh mail inbox %s` pour les relire)." % (non_lus, name))
-                if non_lus > 0 else ("Aucun message non lu." if non_lus == 0
-                                     else "(boîte illisible)")]
+    courrier = ["## Mail",
+                ("%d unread message(s): the runner delivers them to you in your "
+                 "next turns (`ameesh mail inbox %s` to reread them)." % (non_lus, name))
+                if non_lus > 0 else ("No unread message." if non_lus == 0
+                                     else "(mailbox unreadable)")]
     ancienne = []
     if session:
         compte = getattr(account, "name", account)
@@ -337,18 +337,18 @@ def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | Non
                 chemin = find_session(harness, home, session)
                 if chemin:
                     break
-        ancienne = ["## Ancienne session (lecture seule)",
-                    "- id : %s (harnais %s%s)" % (session, harness,
-                                                  ", compte %s" % compte if compte else ""),
-                    "- transcript : %s" % (chemin or "introuvable sur cet hôte"),
-                    "Tu peux LIRE ce transcript pour retrouver un détail ; ne le reprends "
-                    "pas et ne l'écris pas.", ""]
-    fin = ["## Consigne", (consigne or DEFAULT_RESUME).strip()]
-    lots_sec = ["## Lots qui te sont assignés"] + lots + [""]
+        ancienne = ["## Previous session (read-only)",
+                    "- id: %s (harness %s%s)" % (session, harness,
+                                                 ", account %s" % compte if compte else ""),
+                    "- transcript: %s" % (chemin or "not found on this host"),
+                    "You may READ this transcript to recover a detail; do not resume "
+                    "it and do not write to it.", ""]
+    fin = ["## Instructions", (consigne or DEFAULT_RESUME).strip()]
+    lots_sec = ["## Work items assigned to you"] + lots + [""]
     fixe = "\n".join(head + ident + [""] + lots_sec + courrier + [""] + ancienne + fin)
     reste = BRIEF_MAX_BYTES - _octets(fixe) - 200
     fil_lines, total = _fil(cfg, project)
-    fil_sec = ["## Derniers échanges du fil %s (%d sur %d)" % (
+    fil_sec = ["## Latest exchanges in thread %s (%d of %d)" % (
         project, sum(1 for l in fil_lines if l.startswith("- ")), total)]
     for line in fil_lines:
         if _octets(line) + 1 > reste:
@@ -394,25 +394,25 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
     """
     warn = warn or (lambda text: None)
     if not NAME_RE.match(name or ""):
-        raise RepriseError("nom d'agent invalide : %r" % (name,))
+        raise RepriseError("invalid agent name: %r" % (name,))
     if harness not in HARNESSES:
-        raise RepriseError("harnais %r : adopt sait reprendre %s" % (harness, ", ".join(HARNESSES)))
+        raise RepriseError("harness %r: adopt can resume %s" % (harness, ", ".join(HARNESSES)))
     if not SESSION_RE.match(session_id or ""):
-        raise RepriseError("identifiant de session invalide : %r" % (session_id,))
+        raise RepriseError("invalid session id: %r" % (session_id,))
     row = registry.get(db, name)
     if row and row.get("host") and row["host"] != cfg.host:
-        raise RepriseError("%s est épinglé à l'hôte %s (ici : %s) : les sessions sont des "
-                           "fichiers locaux, lancez « ameesh adopt » sur %s"
+        raise RepriseError("%s is pinned to host %s (here: %s): sessions are local "
+                           "files, run \"ameesh adopt\" on %s"
                            % (name, row["host"], cfg.host, row["host"]))
     if _lease_live(row):
-        raise RepriseError("%s détient un bail vivant (%s) : un exécuteur ou une session "
-                           "attachée le mène déjà ; « agent-runner stop %s » puis attendez la "
-                           "fin du bail, ou utilisez « ameesh resume »"
+        raise RepriseError("%s holds a live lease (%s): a runner or an attached session "
+                           "is already driving it; \"agent-runner stop %s\" then wait for the "
+                           "lease to end, or use \"ameesh resume\""
                            % (name, row.get("lease_owner"), name))
     try:
         compte, path, searched = locate(cfg, harness, session_id, account)
     except accounts.AccountError as exc:
-        raise RepriseError("configuration des comptes invalide : %s" % exc)
+        raise RepriseError("invalid account configuration: %s" % exc)
     constats: list[str] = []
     if path is None:
         ailleurs = None
@@ -422,26 +422,26 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
             except (accounts.AccountError, RepriseError):
                 ailleurs = None
         if ailleurs and ailleurs[1]:
-            raise RepriseError("session %s introuvable sous le compte %s (%s) ; elle est sous "
-                               "le compte %s (%s) : relancez avec --account %s"
+            raise RepriseError("session %s not found under account %s (%s); it is under "
+                               "account %s (%s): rerun with --account %s"
                                % (session_id, account, ", ".join(searched), ailleurs[0],
                                   ailleurs[1], ailleurs[0]))
         if harness == "deepseek" and not any(os.path.isdir(r) for r in searched):
             # dsh sans dossier de sessions connu : on ne peut pas vérifier
-            constats.append("dossier de sessions dsh absent (%s) : session acceptée sans "
-                            "contrôle de fichier" % ", ".join(searched))
+            constats.append("dsh sessions directory missing (%s): session accepted without "
+                            "a file check" % ", ".join(searched))
             compte = account or next((n for n, _h in search_homes(cfg, harness, None)
                                       if n), None)
         else:
             declares = [p.name for p in accounts.profiles(cfg, harness)]
             raise RepriseError(
-                "session %s introuvable pour %s : cherchée dans %s%s"
+                "session %s not found for %s: searched in %s%s"
                 % (session_id, harness, ", ".join(searched),
-                   " (comptes déclarés : %s ; --account COMPTE pour viser l'un d'eux)"
+                   " (declared accounts: %s; --account ACCOUNT to target one of them)"
                    % ", ".join(declares) if declares else
-                   " (aucun compte déclaré : ajoutez le dossier du harnais dans `accounts` "
-                   "de la configuration de l'hôte, ou posez sa variable CODEX_HOME / "
-                   "CLAUDE_CONFIG_DIR / DSH_HOME)"))
+                   " (no declared account: add the harness directory to `accounts` "
+                   "in the host configuration, or set its CODEX_HOME / "
+                   "CLAUDE_CONFIG_DIR / DSH_HOME variable)"))
     # L63 : si l'OS ne permet pas de vérifier que la session est fermée,
     # refus (fail-closed), sauf --force — journalisé comme un forçage
     unverified = ""
@@ -451,22 +451,22 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
         tenants, unverified = [], str(exc)
     if unverified and not force:
         raise RepriseError(
-            "impossible de vérifier que la session %s est fermée sur cet hôte (%s) : "
-            "adoption refusée (ou --force, à vos risques : si elle est encore ouverte, "
-            "deux harnais écriraient la même session)" % (session_id, unverified))
+            "cannot check that session %s is closed on this host (%s): "
+            "adoption refused (or --force, at your own risk: if it is still open, "
+            "two harnesses would write the same session)" % (session_id, unverified))
     if unverified:
-        avert = ("--force : session %s adoptée sans vérifier qu'elle est fermée (%s)"
+        avert = ("--force: session %s adopted without checking that it is closed (%s)"
                  % (session_id, unverified))
         warn(avert)
         constats.append(avert)
     if tenants and not force:
         raise RepriseError(
-            "la session %s est encore ouverte (%s) : fermez d'abord la session interactive "
-            "(ou --force, à vos risques : deux harnais écriraient la même session)"
-            % (session_id, "; ".join("pid %d, %s : %s" % (t["pid"], t["why"], t["cmd"])
+            "session %s is still open (%s): close the interactive session first "
+            "(or --force, at your own risk: two harnesses would write the same session)"
+            % (session_id, "; ".join("pid %d, %s: %s" % (t["pid"], t["why"], t["cmd"])
                                      for t in tenants)))
     if tenants:
-        avert = ("--force : session %s adoptée alors qu'elle est encore ouverte (%s)"
+        avert = ("--force: session %s adopted while it is still open (%s)"
                  % (session_id, ", ".join("pid %d" % t["pid"] for t in tenants)))
         warn(avert)
         constats.append(avert)
@@ -478,13 +478,13 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
         cwd = noted
     effectif = cwd or (row or {}).get("cwd")
     if effectif and not os.path.isdir(effectif):
-        constats.append("dossier de travail %s absent : l'exécuteur attendra qu'il existe"
+        constats.append("working directory %s missing: the runner will wait until it exists"
                         % effectif)
     if harness == "claude" and path and effectif \
             and os.path.basename(os.path.dirname(path)) != claude_project_key(effectif):
-        constats.append("Claude Code range cette session sous %s : lancé dans %s, il ne la "
-                        "retrouvera pas (--cwd %s ?)"
-                        % (os.path.dirname(path), effectif, noted or "<dossier d'origine>"))
+        constats.append("Claude Code stores this session under %s: started in %s, it will "
+                        "not find it (--cwd %s?)"
+                        % (os.path.dirname(path), effectif, noted or "<original directory>"))
     for constat in constats:
         warn(constat)
     prompt = (brief or "").strip() or DEFAULT_ADOPT
@@ -493,13 +493,13 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
                         cwd=cwd, mode="execute")
     elif chantier:
         registry.upsert(db, name, chantier=chantier)
-    status_text = "adopté : session %s (%s%s)" % (session_id, harness,
-                                                  ", compte %s" % compte if compte else "")
+    status_text = "adopted: session %s (%s%s)" % (session_id, harness,
+                                                  ", account %s" % compte if compte else "")
     result = storage.of(db).operations.adopt(
         name, harness=harness, host=cfg.host, cwd=cwd, session_id=session_id,
         session_account=compte, prompt=prompt, status_text=status_text)
     if result is None:
-        raise RepriseError("%s : un bail a été pris entre-temps ; réessayez" % name)
+        raise RepriseError("%s: a lease was taken in the meantime; try again" % name)
     _forget_local(cfg, name)
     # L46 : l'agent adopté est mené par l'exécuteur — ses liaisons de session
     # externes (L41) sont révoquées, sinon une session externe lui volerait
@@ -509,10 +509,10 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
         revoked = sb.revoke_agent(cfg, db, name, by=actor or "ameesh", why="adoption")
     except Exception as exc:  # table absente (0034 non appliquée), base en panne
         revoked = []
-        warn("liaisons de session de %s non révoquées : %s"
+        warn("session bindings of %s not revoked: %s"
              % (name, " ".join(str(exc).split())[:160]))
     if revoked:
-        constats.append("liaison(s) de session révoquée(s) : %s" % ", ".join(
+        constats.append("session binding(s) revoked: %s" % ", ".join(
             "%s:%s" % (r["harness"], r["session_id"]) for r in revoked))
     if cwd:
         try:
@@ -522,15 +522,15 @@ def adopt(cfg: Config, db, name: str, *, session_id: str, harness: str,
             pass
     ok, why = registry.wakeable(db, cfg, name)
     if not ok:
-        warn("adopté, mais pas encore réveillable : %s" % why)
-        constats.append("pas encore réveillable : %s" % why)
+        warn("adopted, but not wakeable yet: %s" % why)
+        constats.append("not wakeable yet: %s" % why)
     after = registry.get(db, name) or {}
     fil.record(cfg, db, sender=actor or "ameesh", recipients=[name],
-               text="Adoption de %s (L39) : la session %s %s%s passe sous l'exécuteur "
-                    "(mode execute%s). Consigne de reprise de %d caractère(s) en attente.%s"
+               text="Adoption of %s (L39): session %s %s%s moves under the runner "
+                    "(execute mode%s). Resume instruction of %d character(s) queued.%s"
                     % (name, harness, session_id,
-                       " du compte %s" % compte if compte else "",
-                       ", ancien mode %s" % result.get("previous_mode")
+                       " of account %s" % compte if compte else "",
+                       ", previous mode %s" % result.get("previous_mode")
                        if result.get("previous_mode") not in (None, "execute") else "",
                        len(prompt),
                        "".join("\n- %s" % c for c in constats)),
@@ -581,19 +581,19 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
     out = {"session": session, "keep": False, "deterministic": True, "previous": None,
            "next": None, "old": None, "why": "", "warnings": []}
     if fresh:
-        out["why"] = "--fresh : session oubliée, brief de reprise déterministe"
+        out["why"] = "--fresh: session forgotten, deterministic resume brief"
         out["previous"] = account_turn.recorded_session_account(cfg, row) if session else None
         return out
     if not session:
-        out["why"] = "aucune session enregistrée : session neuve sur un brief déterministe"
+        out["why"] = "no recorded session: new session on a deterministic brief"
         return out
     try:
         items = accounts.profiles(cfg, harness)
     except accounts.AccountError as exc:
-        raise RepriseError("configuration des comptes invalide : %s" % exc)
+        raise RepriseError("invalid account configuration: %s" % exc)
     if not items:
         out.update(keep=True, deterministic=False,
-                   why="aucun compte déclaré pour %s : la session %s est reprise"
+                   why="no declared account for %s: session %s is resumed"
                    % (harness or "?", session))
         return out
     previous = account_turn.recorded_session_account(cfg, row)
@@ -606,31 +606,31 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
                              simulate=True, session_account=origine)
     nxt = choice.profile or choice.active or items[0]
     if choice.profile is None:
-        out["warnings"].append("tous les comptes %s sont au seuil (%s) : l'agent reprendra "
-                               "à la remise à zéro" % (harness, choice.reason))
+        out["warnings"].append("all %s accounts are at their threshold (%s): the agent will "
+                               "resume at the reset" % (harness, choice.reason))
     old = accounts.by_name(items, previous) if previous else \
         accounts.Profile(harness=harness, name="(défaut)")
     out.update(previous=previous, next=nxt.name, old=old)
     if previous == nxt.name or (previous is None and old.home() == nxt.home()):
         out.update(keep=True, deterministic=False,
-                   why="la session %s est reprise sous son compte %s" % (session, nxt.name))
+                   why="session %s is resumed under its account %s" % (session, nxt.name))
         return out
     if accounts.session_portable(harness, old, nxt):
         out.update(keep=True, deterministic=False,
-                   why="la session %s (compte %s) est portable vers le compte %s : reprise"
-                   % (session, previous or "(défaut)", nxt.name))
+                   why="session %s (account %s) is portable to account %s: resumed"
+                   % (session, previous or "(default)", nxt.name))
         return out
     usable, raison = account_turn.summary_possible(old, book, items)
     if usable:
         out.update(keep=True, deterministic=False,
-                   why="la session %s (compte %s) n'est pas portable vers %s ; l'ancien "
-                       "compte reste utilisable : l'exécuteur la résumera sous %s puis "
-                       "tournera (rotation 0027)" % (session, previous or "(défaut)",
-                                                     nxt.name, previous or "(défaut)"))
+                   why="session %s (account %s) is not portable to %s; the old "
+                       "account is still usable: the runner will summarize it under %s then "
+                       "rotate (rotation 0027)" % (session, previous or "(default)",
+                                                   nxt.name, previous or "(default)"))
         return out
-    out["why"] = ("compte d'origine %s inutilisable (%s) et session %s non portable vers %s : "
-                  "session oubliée, brief de reprise déterministe"
-                  % (previous or "(retiré)", raison, session, nxt.name))
+    out["why"] = ("original account %s unusable (%s) and session %s not portable to %s: "
+                  "session forgotten, deterministic resume brief"
+                  % (previous or "(removed)", raison, session, nxt.name))
     return out
 
 
@@ -639,24 +639,24 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
     """Relance un agent arrêté, mort ou au repos (voir `plan`)."""
     warn = warn or (lambda text: None)
     if not NAME_RE.match(name or ""):
-        raise RepriseError("nom d'agent invalide : %r" % (name,))
+        raise RepriseError("invalid agent name: %r" % (name,))
     row = registry.get(db, name)
     if row is None:
-        raise RepriseError("agent inconnu : %s" % name)
+        raise RepriseError("unknown agent: %s" % name)
     if (row.get("mode") or "execute") == "externe":
-        raise RepriseError("%s est un agent externe (session humaine) : ameesh ne le relance "
-                           "pas ; utilisez « ameesh adopt %s --session <id> --harness <h> » "
-                           "pour faire passer sa session sous l'exécuteur" % (name, name))
+        raise RepriseError("%s is an external agent (human session): ameesh does not restart "
+                           "it; use \"ameesh adopt %s --session <id> --harness <h>\" "
+                           "to move its session under the runner" % (name, name))
     ok, why = registry.wakeable(db, cfg, name)
     if not ok:
-        raise RepriseError("%s n'est pas réveillable : %s" % (name, why))
+        raise RepriseError("%s is not wakeable: %s" % (name, why))
     if registry.turn_in_progress(db, name):
-        raise RepriseError("%s a un tour en cours : rien à reprendre (« ameesh restart » "
-                           "pour une session neuve)" % name)
+        raise RepriseError("%s has a turn in progress: nothing to resume (\"ameesh restart\" "
+                           "for a new session)" % name)
     live = _lease_live(row)
     if live and row.get("status") == "stopped":
-        raise RepriseError("%s est arrêté mais son bail vit encore (l'exécuteur ne l'a pas "
-                           "encore rendu) : réessayez dans quelques secondes" % name)
+        raise RepriseError("%s is stopped but its lease is still live (the runner has not "
+                           "returned it yet): try again in a few seconds" % name)
     decision = plan(cfg, db, row, fresh=fresh)
     for text in decision["warnings"]:
         warn(text)
@@ -675,7 +675,7 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
         # Un exécuteur tient le bail (agent au repos) : l'oubli passe par lui,
         # comme `ameesh restart` (appliqué hors tour, fencé par son bail).
         if ops.request_restart(name, prompt) is None:
-            raise RepriseError("%s : état changé entre-temps ; réessayez" % name)
+            raise RepriseError("%s: state changed in the meantime; try again" % name)
         applied = bool(ops.apply_restart(name))
         if not applied:
             try:
@@ -687,20 +687,20 @@ def resume(cfg: Config, db, name: str, *, brief: str = "", fresh: bool = False,
         result = {"previous_session": decision["session"], "previous_status": row.get("status")}
     else:
         result = ops.resume(name, prompt=prompt, forget=forget,
-                            status_text="reprise : %s" % ("session neuve sur brief"
-                                                          if forget or decision["deterministic"]
-                                                          else "même session"))
+                            status_text="resumed: %s" % ("new session on a brief"
+                                                         if forget or decision["deterministic"]
+                                                         else "same session"))
         if result is None:
-            raise RepriseError("%s : état changé entre-temps (bail pris, tour lancé ou arrêt) ; "
-                               "réessayez" % name)
+            raise RepriseError("%s: state changed in the meantime (lease taken, turn started or "
+                               "stopped); try again" % name)
     if forget and applied and (row.get("host") or "") == (cfg.host or ""):
         _forget_local(cfg, name)
     fil.record(cfg, db, sender=actor or "ameesh", recipients=[name],
-               text="Reprise de %s (L39, ameesh resume) depuis l'état %s : %s. Consigne de "
-                    "%d caractère(s) en attente%s."
+               text="Resume of %s (L39, ameesh resume) from status %s: %s. Instruction of "
+                    "%d character(s) queued%s."
                     % (name, row.get("status") or "?", decision["why"], len(prompt),
-                       "" if applied else " (oubli de session appliqué par l'exécuteur qui "
-                       "tient le bail)"),
+                       "" if applied else " (session forgetting applied by the runner holding "
+                       "the lease)"),
                project=_project(cfg, row),
                meta={"audit": "resume", "session": decision["session"] or "",
                      "kept": decision["keep"], "deterministic": decision["deterministic"],
@@ -729,7 +729,7 @@ def _read_brief(source: str | None) -> str:
 
 def _warn(command: str):
     def say(text: str) -> None:
-        print("ameesh %s : attention : %s" % (command, text), file=sys.stderr)
+        print("ameesh %s: warning: %s" % (command, text), file=sys.stderr)
     return say
 
 
@@ -745,7 +745,7 @@ def cmd_adopt(cfg: Config, args) -> int:
     try:
         brief = _read_brief(args.brief)
     except OSError as exc:
-        print("ameesh adopt : brief illisible : %s" % exc, file=sys.stderr)
+        print("ameesh adopt: unreadable brief: %s" % exc, file=sys.stderr)
         return 1
     db = db_mod.connect(cfg)
     try:
@@ -756,17 +756,17 @@ def cmd_adopt(cfg: Config, args) -> int:
                         chantier=args.chantier, force=args.force, actor=_actor(cfg, db),
                         warn=_warn("adopt"))
         except RepriseError as exc:
-            print("ameesh adopt : %s" % exc, file=sys.stderr)
+            print("ameesh adopt: %s" % exc, file=sys.stderr)
             return 1
         if args.json:
             print(json.dumps(out, ensure_ascii=False))
         else:
-            print("%s adopté : session %s %s%s (%s) sous l'exécuteur, consigne de reprise en "
-                  "attente%s" % (out["agent"], out["harness"], out["session"],
-                                 ", compte %s" % out["account"] if out["account"] else "",
-                                 out["path"] or "fichier non vérifié",
-                                 "" if out["wakeable"] else " — pas encore réveillable"))
-            print("pour y revenir à la main : ameesh attach %s" % out["agent"])
+            print("%s adopted: session %s %s%s (%s) under the runner, resume instruction "
+                  "queued%s" % (out["agent"], out["harness"], out["session"],
+                                ", account %s" % out["account"] if out["account"] else "",
+                                out["path"] or "file not checked",
+                                "" if out["wakeable"] else " — not wakeable yet"))
+            print("to take it back by hand: ameesh attach %s" % out["agent"])
         return 0
     finally:
         db.close()
@@ -776,7 +776,7 @@ def cmd_resume(cfg: Config, args) -> int:
     try:
         brief = _read_brief(args.brief)
     except OSError as exc:
-        print("ameesh resume : brief illisible : %s" % exc, file=sys.stderr)
+        print("ameesh resume: unreadable brief: %s" % exc, file=sys.stderr)
         return 1
     db = db_mod.connect(cfg)
     try:
@@ -785,16 +785,16 @@ def cmd_resume(cfg: Config, args) -> int:
             out = resume(cfg, db, args.agent, brief=brief, fresh=args.fresh,
                          actor=_actor(cfg, db), warn=_warn("resume"))
         except RepriseError as exc:
-            print("ameesh resume : %s" % exc, file=sys.stderr)
+            print("ameesh resume: %s" % exc, file=sys.stderr)
             return 1
         if args.json:
             print(json.dumps(out, ensure_ascii=False))
         else:
-            print("%s : %s" % (out["agent"], out["why"]))
-            print("%s repris (était %s) : consigne de %d octet(s) en attente%s"
+            print("%s: %s" % (out["agent"], out["why"]))
+            print("%s resumed (was %s): instruction of %d byte(s) queued%s"
                   % (out["agent"], out["previous_status"], out["prompt_bytes"],
-                     "" if out["applied"] else " ; oubli de session appliqué par "
-                     "l'exécuteur qui tient le bail"))
+                     "" if out["applied"] else "; session forgetting applied by "
+                     "the runner holding the lease"))
         return 0
     finally:
         db.close()
@@ -804,30 +804,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ameesh", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command")
-    p_ad = sub.add_parser("adopt", help="session interactive existante → exécuteur (L39)")
+    p_ad = sub.add_parser("adopt", help="existing interactive session → runner (L39)")
     p_ad.add_argument("agent")
-    p_ad.add_argument("--session", required=True, help="identifiant de session du harnais")
+    p_ad.add_argument("--session", required=True, help="harness session id")
     p_ad.add_argument("--harness", required=True, choices=HARNESSES)
     p_ad.add_argument("--account", default=None,
-                      help="compte (déclaré dans `accounts`) sous lequel chercher la session ; "
-                           "défaut : tous les comptes du harnais, dans l'ordre")
+                      help="account (declared in `accounts`) under which to look for the session; "
+                           "default: all accounts of the harness, in order")
     p_ad.add_argument("--cwd", default=None,
-                      help="dossier de travail ; défaut : celui du journal de session")
-    p_ad.add_argument("--brief", default=None, metavar="FICHIER|-",
-                      help="première consigne sous l'exécuteur (défaut : reprise standard)")
-    p_ad.add_argument("--chantier", default=None, help="chantier (agent nouveau)")
+                      help="working directory; default: the one in the session log")
+    p_ad.add_argument("--brief", default=None, metavar="FILE|-",
+                      help="first instruction under the runner (default: standard resume)")
+    p_ad.add_argument("--chantier", default=None, help="workspace (new agent)")
     p_ad.add_argument("--force", action="store_true",
-                      help="adopter même si un processus tient encore la session, ou si "
-                           "cet hôte ne permet pas de le vérifier (journalisé)")
+                      help="adopt even if a process still holds the session, or if "
+                           "this host cannot check it (logged)")
     p_ad.add_argument("--json", action="store_true")
     p_ad.set_defaults(func=cmd_adopt)
 
-    p_re = sub.add_parser("resume", help="relancer un agent arrêté, mort ou au repos (L39)")
+    p_re = sub.add_parser("resume", help="restart a stopped, dead or idle agent (L39)")
     p_re.add_argument("agent")
-    p_re.add_argument("--brief", default=None, metavar="FICHIER|-",
-                      help="consigne de reprise (défaut : reprise standard)")
+    p_re.add_argument("--brief", default=None, metavar="FILE|-",
+                      help="resume instruction (default: standard resume)")
     p_re.add_argument("--fresh", action="store_true",
-                      help="oublier la session : session neuve sur un brief déterministe")
+                      help="forget the session: new session on a deterministic brief")
     p_re.add_argument("--json", action="store_true")
     p_re.set_defaults(func=cmd_resume)
     return parser
@@ -847,13 +847,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(cfg, args)
     except db_mod.SchemaMissing as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.Unavailable as exc:
-        print("erreur : base injoignable : %s" % exc, file=sys.stderr)
+        print("error: database unreachable: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.DbError as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
 
 

@@ -303,7 +303,7 @@ class BoucleTest(PgTestCase):
         self.assert_rien_consomme(w)
         self.assertTrue(w._wd_blocked)                       # rien de confirmé localement
         self.assertTrue(w.lease_lost.is_set())
-        self.assertFalse(any("— reprise" in m for m in self.logs))
+        self.assertFalse(any("— resuming" in m for m in self.logs))
 
     def test_levee_refusee_bail_echu(self):
         w = self.bloque("l35-echu")
@@ -392,7 +392,7 @@ class BoucleTest(PgTestCase):
         self.assertEqual((row["status"], row["status_text"]), (statut, texte))
         self.assert_rien_consomme(w)
         self.assertEqual(len(mail.unread(self.db, w.name)), 1)
-        self.assertFalse(any("— reprise" in m for m in self.logs))
+        self.assertFalse(any("— resuming" in m for m in self.logs))
         self.assertFalse(w._wd_blocked)              # calé sur le statut conservé
         return w
 

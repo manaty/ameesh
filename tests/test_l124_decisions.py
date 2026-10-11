@@ -652,7 +652,7 @@ class VisibiliteTest(_Base):
         later = [a for a in exploitation.alerts(self.cfg, self.db, now=now + 3700)
                  if a["type"] == "decision_overdue"]
         self.assertEqual([a["decision"] for a in later], [view["id"]])
-        self.assertTrue(later[0]["detail"].startswith("RELANCE : sans réponse"))
+        self.assertTrue(later[0]["detail"].startswith("REMINDER: no answer"))
         for kind in ("decision_pending", "decision_overdue"):
             self.assertIn(kind, notify.DEFAULT_TYPES)
             self.assertIn(kind, exploitation.ALERT_TYPES)
