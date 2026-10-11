@@ -1,0 +1,208 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""L56: executor data access without schema administration."""
+from __future__ import annotations
+
+import dataclasses
+import os
+import secrets
+import subprocess
+import uuid
+import urllib.parse
+import unittest
+
+from ameesh import migrations
+
+from ameesh import db as db_mod, mail, registry
+
+from .support import REPO, PgTestCase
+from .test_cluster import TEST_DSN, _dsn_for
+
+ROLE_SQL = os.path.join(REPO, "deploy", "sql", "role-executor.sql")
+
+
+class RoleExecutorTest(PgTestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        # Database ACL tests must not change PUBLIC privileges in the shared bench.
+        cls.admin_db = cls.db
+        cls.database = "t_executor_db_" + uuid.uuid4().hex[:8]
+        cls.admin_db.execute("CREATE DATABASE %s TEMPLATE template0" % db_mod.quote_ident(cls.database))
+        cls.addClassCleanup(cls.drop_database)
+        parts = urllib.parse.urlsplit(TEST_DSN)
+        if not parts.scheme.startswith("postgres"):
+            raise AssertionError("Executor tests require a PostgreSQL URL DSN")
+        cls.owner_dsn = urllib.parse.urlunsplit(parts._replace(path="/" + cls.database))
+        cls.admin_db.execute("DROP SCHEMA %s CASCADE" % db_mod.quote_ident(cls.schema))
+        cls.cfg = dataclasses.replace(cls.cfg, dsn=cls.owner_dsn)
+        cls.db = db_mod.connect(cls.cfg)
+        migrations.migrate(cls.db, log=None)
+        cls.db.execute("REVOKE TEMP ON DATABASE %s FROM PUBLIC" % db_mod.quote_ident(cls.database))
+        suffix = uuid.uuid4().hex[:8]
+        cls.role = "t_executor_%s" % suffix
+        cls.login = "t_executor_host_%s" % suffix
+        cls.password = secrets.token_hex(16)
+        try:
+            for _ in range(2):          # Verify idempotence
+                proc = cls.run_script(cls.role)
+                if proc.returncode != 0:
+                    raise AssertionError("role-executor.sql : %s" % proc.stderr)
+            cls.db.execute("CREATE ROLE %s LOGIN PASSWORD '%s' IN ROLE %s" % (
+                db_mod.quote_ident(cls.login), cls.password, db_mod.quote_ident(cls.role)))
+            cls.db.execute("ALTER ROLE %s SET search_path = %s" % (
+                db_mod.quote_ident(cls.login), db_mod.quote_ident(cls.schema)))
+        except Exception:
+            cls.drop_roles()
+            raise
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            cls.drop_roles()
+        finally:
+            super().tearDownClass()
+
+    @classmethod
+    def drop_database(cls):
+        if cls.db is not cls.admin_db:
+            cls.db.close()
+        try:
+            cls.admin_db.execute("DROP DATABASE %s" % db_mod.quote_ident(cls.database))
+        finally:
+            cls.admin_db.close()
+
+    @classmethod
+    def host_dsn(cls):
+        parts = urllib.parse.urlsplit(_dsn_for(cls.login, cls.password))
+        return urllib.parse.urlunsplit(parts._replace(path="/" + cls.database))
+
+    @classmethod
+    def drop_roles(cls) -> None:
+        for name in (cls.login, cls.role):
+            if cls.db.query("SELECT 1 FROM pg_roles WHERE rolname = %s", (name,)):
+                cls.db.execute("DROP OWNED BY %s" % db_mod.quote_ident(name))
+                cls.db.execute("DROP ROLE %s" % db_mod.quote_ident(name))
+
+    @classmethod
+    def run_script(cls, role: str) -> subprocess.CompletedProcess:
+        env = dict(os.environ, PGOPTIONS="-c search_path=%s" % cls.schema)
+        return subprocess.run(["psql", cls.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
+                               "-v", "role=%s" % role, "-f", ROLE_SQL],
+                              capture_output=True, text=True, timeout=60, env=env)
+
+    def as_host(self, sql: str) -> subprocess.CompletedProcess:
+        env = dict(os.environ)
+        env.pop("PGPASSWORD", None)
+        env.pop("PGOPTIONS", None)
+        return subprocess.run(["psql", self.host_dsn(), "-X", "-At",
+                               "-v", "ON_ERROR_STOP=1", "-c", sql],
+                              capture_output=True, text=True, timeout=30, env=env)
+
+    def test_host_reads_and_writes_data(self):
+        cfg = dataclasses.replace(self.cfg, dsn=self.host_dsn())
+        db = db_mod.connect(cfg)
+        try:
+            registry.upsert(db, "verif-a", harness="claude", host="pc", mode="execute")
+            ident = mail.send(db, "coord", "verif-a", "review the migration")
+            self.assertTrue(ident > 0)
+            self.assertEqual(db.query("SELECT name FROM agent_registry WHERE name = 'verif-a'"),
+                             [{"name": "verif-a"}])
+        finally:
+            db.close()
+
+    def test_host_cannot_change_schema(self):
+        for sql in ("CREATE TABLE intruder (x int)",
+                    "CREATE SCHEMA intruder",
+                    "CREATE TEMP TABLE intruder (x int)",
+                    "ALTER TABLE agent_registry ADD COLUMN intruder int",
+                    "DROP TABLE agent_mailbox",
+                    "TRUNCATE agent_mailbox"):
+            proc = self.as_host(sql)
+            self.assertNotEqual(proc.returncode, 0, sql)
+            error = proc.stderr.lower()
+            self.assertTrue("permission denied" in error or "must be owner" in error,
+                            (sql, proc.stderr))
+
+    def test_public_schema_create_rolls_back(self):
+        """PUBLIC schema CREATE makes the script roll back the new role."""
+        q = db_mod.quote_ident
+        self.db.execute("GRANT CREATE ON SCHEMA %s TO PUBLIC" % q(self.schema))
+        new_role = "t_executor_new_role_%s" % uuid.uuid4().hex[:8]
+        try:
+            proc = self.run_script(new_role)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("ROLE CONTRACT FAILED", proc.stderr)
+            self.assertIn("CREATE or ownership on schema", proc.stderr)
+            self.assertFalse(self.db.query("SELECT 1 FROM pg_roles WHERE rolname = %s", (new_role,)))
+        finally:
+            self.db.execute("REVOKE CREATE ON SCHEMA %s FROM PUBLIC" % q(self.schema))
+
+    def test_database_privileges_roll_back(self):
+        q = db_mod.quote_ident
+        for privilege in ("CREATE", "TEMP"):
+            for grant_to in ("PUBLIC", q(self.role)):
+                with self.subTest(privilege=privilege, grant_to=grant_to):
+                    self.db.execute("GRANT %s ON DATABASE %s TO %s" % (
+                        privilege, q(self.database), grant_to))
+                    try:
+                        result = self.run_script(self.role)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(privilege + " on database", result.stderr)
+                    finally:
+                        self.db.execute("REVOKE %s ON DATABASE %s FROM %s" % (
+                            privilege, q(self.database), grant_to))
+
+    def test_noinherit_membership_cannot_bypass_database_audit(self):
+        q = db_mod.quote_ident
+        parent = "t_executor_parent_" + uuid.uuid4().hex[:8]
+        self.db.execute("CREATE ROLE %s NOLOGIN" % q(parent))
+        try:
+            self.db.execute("GRANT CREATE ON DATABASE %s TO %s" % (q(self.database), q(parent)))
+            self.db.execute("ALTER ROLE %s NOINHERIT" % q(self.role))
+            self.db.execute("GRANT %s TO %s" % (q(parent), q(self.role)))
+            result = self.run_script(self.role)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("CREATE on database", result.stderr)
+        finally:
+            self.db.execute("REVOKE %s FROM %s" % (q(parent), q(self.role)))
+            self.db.execute("ALTER ROLE %s INHERIT" % q(self.role))
+            self.db.execute("DROP OWNED BY %s" % q(parent))
+            self.db.execute("DROP ROLE %s" % q(parent))
+
+    def test_future_objects_receive_data_grants(self):
+        self.db.execute("CREATE TABLE executor_future (id bigserial PRIMARY KEY, body text)")
+        try:
+            result = self.as_host("INSERT INTO executor_future(body) VALUES ('hello'); "
+                                  "UPDATE executor_future SET body = 'updated'; "
+                                  "SELECT body FROM executor_future; DELETE FROM executor_future")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("updated", result.stdout)
+        finally:
+            self.db.execute("DROP TABLE executor_future")
+
+
+class ExecutorUpdateScriptTest(unittest.TestCase):
+    def test_reapply_only_existing_role(self):
+        import pathlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            fake = root / 'psql'
+            fake.write_text('#!/bin/sh\n'
+                            'printf "%s\\n" "$*" >> "$CALLS"\n'
+                            'case " $* " in *" -At "*) printf "%s" "$EXISTS" ;; esac\n')
+            fake.chmod(0o755)
+            for exists, expected_calls in (("", 1), ("1", 2)):
+                calls = root / 'calls'
+                calls.write_text('')
+                result = subprocess.run(
+                    [os.path.join(REPO, 'deploy/mise-a-jour/role-executor.sh'),
+                     'postgresql://owner@invalid/mesh'],
+                    env=dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'],
+                             CALLS=str(calls), EXISTS=exists),
+                    capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(calls.read_text().splitlines()), expected_calls)
+                self.assertNotIn('postgresql://', result.stdout + result.stderr)
+                if exists:
+                    self.assertIn('role-executor.sql', calls.read_text())
