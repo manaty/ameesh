@@ -115,10 +115,13 @@ def main() -> int:
                  "content": "ok"}]})), flush=True)
     # L218 : AMEESH_TEST_RESULT, la réponse du tour (message et `result`)
     reponse = os.environ.get("AMEESH_TEST_RESULT")
+    if reponse is None:
+        reponse_texte, reponse = "bonjour du faux claude (session %s)" % session, "fini"
+    else:
+        reponse_texte = reponse  # vide compris : un tour sans réponse
     print(json.dumps({"type": "assistant", "message": {"content": [
-        {"type": "text", "text": reponse or "bonjour du faux claude (session %s)" % session}]}}),
-        flush=True)
-    print(json.dumps({"type": "result", "subtype": "success", "result": reponse or "fini",
+        {"type": "text", "text": reponse_texte}]}}), flush=True)
+    print(json.dumps({"type": "result", "subtype": "success", "result": reponse,
                       "total_cost_usd": 0.0125, "session_id": session}), flush=True)
     return int(os.environ.get("AMEESH_TEST_EXIT", "0"))
 

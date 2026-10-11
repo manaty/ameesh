@@ -96,6 +96,8 @@ SUMMARY_PROMPT = (
 #: qui commençaient au milieu d'une phrase) ; au-delà de la borne, la fin est
 #: coupée sur une limite de paragraphe, jamais la tête, et la coupe est dite.
 SUMMARY_MAX_CHARS = 16_000
+#: le marqueur de fin de tour affiché par l'exécuteur : jamais un résumé (L218)
+END_OF_TURN_MARK = "== fin du tour"
 SUMMARY_CUT_NOTE = ("\n\n[Résumé coupé par l'exécuteur : %d caractères gardés sur %d "
                     "(borne %d) ; la suite est perdue.]")
 
@@ -103,16 +105,19 @@ SUMMARY_CUT_NOTE = ("\n\n[Résumé coupé par l'exécuteur : %d caractères gard
 def bound_summary(text: str, limit: int = SUMMARY_MAX_CHARS) -> str:
     """Le résumé de reprise borné (L218) : entier s'il tient dans `limit`,
     sinon sa tête, coupée à la dernière fin de paragraphe (à défaut de ligne)
-    de la seconde moitié de la borne, suivie d'une note explicite."""
+    de la seconde moitié de la place restante, suivie d'une note explicite.
+    La note est comprise dans la borne : sa place est réservée d'abord."""
     text = (text or "").strip()
     if len(text) <= limit:
         return text
-    tete = text[:limit]
+    # la note la plus longue possible : `limit` caractères gardés, au plus
+    place = max(0, limit - len(SUMMARY_CUT_NOTE % (limit, len(text), limit)))
+    tete = text[:place]
     coupe = tete.rfind("\n\n")
-    if coupe < limit // 2:
+    if coupe < place // 2:
         coupe = tete.rfind("\n")
-    if coupe < limit // 2:
-        coupe = limit
+    if coupe < place // 2:
+        coupe = place
     garde = tete[:coupe].rstrip()
     return garde + SUMMARY_CUT_NOTE % (len(garde), len(text), limit)
 
@@ -709,7 +714,8 @@ class ClaudeStream(StreamReader):
                 out["safe_point"] = True
         elif kind == "result":
             out["final"] = event.get("result") or ""
-            out["display"] = ["== fin du tour : %s" % (event.get("result") or "")[:300]]
+            out["display"] = ["%s : %s" % (END_OF_TURN_MARK,
+                                           (event.get("result") or "")[:300])]
             if isinstance(event.get("total_cost_usd"), (int, float)):
                 out["cost"] = float(event["total_cost_usd"])
             if isinstance(event.get("usage"), dict):
@@ -733,15 +739,17 @@ class CodexStream(StreamReader):
                 out["model"] = event["model"]  # modèle effectif annoncé (L13 B4)
         elif kind == "item.completed":
             item = event.get("item") or {}
-            if item.get("type") == "agent_message" and item.get("text"):
-                out["display"] = [item["text"]]
-                # L218 : le dernier message de l'agent est la réponse du tour
-                out["final"] = item["text"]
+            if item.get("type") == "agent_message":
+                if item.get("text"):
+                    out["display"] = [item["text"]]
+                # L218 : le dernier message de l'agent est la réponse du tour,
+                # même vide (un commentaire antérieur n'en tient pas lieu)
+                out["final"] = item.get("text") or ""
             elif item.get("type") not in (None, "", "agent_message", "reasoning"):
                 # L105 : une action (commande, outil, fichier) terminée : point sûr
                 out["safe_point"] = True
         elif kind == "turn.completed":
-            out["display"] = ["== fin du tour"]
+            out["display"] = [END_OF_TURN_MARK]
             if isinstance(event.get("usage"), dict):
                 out["usage"] = event["usage"]
         elif kind in ("turn.failed", "error"):
@@ -798,7 +806,7 @@ class DshStream(StreamReader):
         elif kind == "final":
             text = event.get("text") or ""
             out["final"] = text
-            out["display"] = ["== fin du tour : %s" % text[:300]]
+            out["display"] = ["%s : %s" % (END_OF_TURN_MARK, text[:300])]
             if isinstance(event.get("cost_usd"), (int, float)):
                 out["cost"] = float(event["cost_usd"])
         elif kind == "error":
@@ -881,8 +889,8 @@ class AcpStream(StreamReader):
             text = event.get("text") or ""
             out["final"] = text
             stop = event.get("stopReason") or "?"
-            out["display"] = ["== fin du tour (%s)%s" % (
-                stop, " : %s" % text[:300] if text else "")]
+            out["display"] = ["%s (%s)%s" % (
+                END_OF_TURN_MARK, stop, " : %s" % text[:300] if text else "")]
             if isinstance(event.get("usage"), dict):
                 out["usage"] = event["usage"]
             if isinstance(event.get("costUsd"), (int, float)):

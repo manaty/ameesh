@@ -334,9 +334,10 @@ class AgentWorker(threading.Thread):
         self.session_tokens = 0.0
         self.last_turn_seconds = 0.0
         self.last_output = ""
-        #: L218 : réponse finale du dernier tour (`final` du flux), et, pour un
-        #: tour de résumé, tout son affichage (repli d'un flux sans `final`)
-        self.last_final = ""
+        #: L218 : réponse finale du dernier tour (`final` du flux, None si le
+        #: flux n'en donne pas), et, pour un tour de résumé, tout son affichage
+        #: (repli d'un flux sans `final`, texte brut)
+        self.last_final: str | None = None
         self.summary_display: list[str] = []
         #: plafond de contexte (L60) : jetons d'entrée relus (cache compris) par
         #: le dernier tour inscrit au grand livre, et sa session
@@ -1090,8 +1091,16 @@ class AgentWorker(threading.Thread):
         """Le résumé rendu par le dernier tour de résumé (L218) : sa réponse
         finale entière (à défaut, tout son affichage), bornée par
         `adapters.bound_summary` — jamais la fin de l'affichage, qui perdait
-        la tête du résumé et finissait sur « == fin du tour : »."""
-        texte = (self.last_final or "").strip() or "\n".join(self.summary_display)
+        la tête du résumé et finissait sur « == fin du tour : ».
+
+        Une réponse finale vide n'a pas de résumé (verdict codex #178) : la
+        rotation est annulée, la bascule de compte prend le brief L39. Le
+        repli sur l'affichage ne vaut que pour un flux qui ne donne jamais de
+        `final`, et les marqueurs de fin de tour de l'exécuteur en sont ôtés."""
+        if self.last_final is not None:
+            return adapters.bound_summary(self.last_final)
+        texte = "\n".join(ligne for ligne in self.summary_display
+                          if not ligne.startswith(adapters.END_OF_TURN_MARK))
         return adapters.bound_summary(texte)
 
     def _rotate(self, raison: str) -> bool:
@@ -2740,7 +2749,7 @@ class AgentWorker(threading.Thread):
         error: str | None = None
         result_code = 0
         self.last_output = ""
-        self.last_final = ""
+        self.last_final = None
         self.summary_display = []
         # L105 : plafonds pendant le tour — jetons relus (une fois par appel)
         # et durée ; jamais sur un tour de résumé (rotation, bascule de compte)
@@ -2853,8 +2862,8 @@ class AgentWorker(threading.Thread):
                         self.last_output = (self.last_output + "\n" + text)[-4000:]
                         if not plafonne and len(self.summary_display) < 10_000:
                             self.summary_display.append(text)
-                    if parsed.get("final"):
-                        self.last_final = str(parsed["final"])
+                    if "final" in parsed:
+                        self.last_final = str(parsed["final"] or "")
                     if plafonne and not clos:
                         appel = parsed.get("call_usage")
                         if isinstance(appel, dict):

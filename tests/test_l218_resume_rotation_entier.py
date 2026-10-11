@@ -47,7 +47,11 @@ class BorneTest(unittest.TestCase):
         tete = borne.split("\n\n[Résumé coupé")[0]
         self.assertTrue(lignes[len(tete):].startswith("\n"))
         bloc = "x" * 500
-        self.assertTrue(adapters.bound_summary(bloc, limit=200).startswith("x" * 200 + "\n\n["))
+        net = adapters.bound_summary(bloc, limit=200)
+        tete = net.split("\n\n[")[0]
+        self.assertEqual(tete, "x" * len(tete))
+        self.assertGreater(len(tete), 50)
+        self.assertLessEqual(len(net), 200)
 
     def test_codex_rend_son_dernier_message_comme_reponse(self):
         with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN}):
@@ -56,15 +60,36 @@ class BorneTest(unittest.TestCase):
             "type": "agent_message", "text": "le résumé"}}))
         self.assertEqual(item["final"], "le résumé")
 
+    def test_codex_message_vide_compte_comme_reponse(self):
+        """Verdict codex #178 (2) : un dernier agent_message vide est la
+        réponse du tour ; le commentaire qui le précède n'en tient pas lieu."""
+        with mock.patch.dict(os.environ, {"AMEESH_BIN_DIR": FAKEBIN}):
+            adapter = adapters.adapter_for("codex")
+        item = adapter.parse(json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": ""}}))
+        self.assertEqual(item.get("final"), "")
+        self.assertNotIn("display", item)
+
+    def test_note_de_coupe_comprise_dans_la_borne(self):
+        """Verdict codex #178 (3) : la note tient dans la borne (16 001
+        caractères donnaient 16 105)."""
+        for texte in ("x" * (adapters.SUMMARY_MAX_CHARS + 1), long_resume(200),
+                      "\n".join("ligne %05d" % i for i in range(5000))):
+            borne = adapters.bound_summary(texte)
+            self.assertLessEqual(len(borne), adapters.SUMMARY_MAX_CHARS)
+            self.assertIn("[Résumé coupé par l'exécuteur : ", borne)
+        for limit in (200, 300):
+            self.assertLessEqual(len(adapters.bound_summary("y" * 1000, limit=limit)), limit)
+
 
 class RotationResumeEntierTest(PgTestCase):
-    def _worker(self, name: str = "rot218"):
+    def _worker(self, name: str = "rot218", harness: str = "claude"):
         cfg = dataclasses.replace(self.cfg, session_min_turns=1,
                                   session_max_turn_seconds=0.0, session_max_tokens=0.0)
         runner = Runner(cfg, self.db, once=True)
         cwd = os.path.join(self.tmp, "work", name)
         os.makedirs(cwd, exist_ok=True)
-        self.register(name, "claude", cwd=cwd)
+        self.register(name, harness, cwd=cwd)
         lease = registry.claim(self.db, name, runner.runner_id, 3600)
         return AgentWorker(runner, registry.get(self.db, name), lease)
 
@@ -91,6 +116,39 @@ class RotationResumeEntierTest(PgTestCase):
             self.assertIn(resume, argv)
         finally:
             worker.watchdog_stop.set()
+
+    def _rotation_sans_resume(self, worker, env_resume: dict):
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log}
+        try:
+            with mock.patch.dict(os.environ, env, clear=False):
+                self.assertTrue(worker.run_turn(
+                    {"kind": "prompt", "prompt": "premier tour", "ids": []}))
+                ancienne = worker.current_session()
+                self.assertTrue(ancienne)
+                with mock.patch.dict(os.environ, env_resume):
+                    self.assertFalse(worker.maybe_rotate())
+                    # la bascule de compte (account_turn) lit le même résumé :
+                    # vide, elle prend le brief déterministe L39
+                    self.assertTrue(worker.run_turn({
+                        "kind": "prompt", "prompt": adapters.SUMMARY_PROMPT, "ids": []}))
+                    self.assertEqual(worker.turn_summary(), "")
+                self.assertEqual(worker.current_session(), ancienne)
+                self.assertEqual(worker.resume_summary, "")
+                self.assertFalse(os.path.exists(
+                    os.path.join(worker.state_dir, "session-history.jsonl")))
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_finale_vide_pas_de_resume(self):
+        """Verdict codex #178 (1) : un tour de résumé réussi à réponse vide
+        n'a pas de résumé ; « == fin du tour » n'en tient jamais lieu."""
+        self._rotation_sans_resume(self._worker("rot218v"), {"AMEESH_TEST_RESULT": ""})
+
+    def test_codex_commentaire_puis_finale_vide_pas_de_resume(self):
+        """Verdict codex #178 (2) : commentaire initial puis réponse vide."""
+        worker = self._worker("rot218c", harness="codex")
+        self._rotation_sans_resume(worker, {"AMEESH_TEST_MESSAGES": json.dumps(
+            ["Je rédige le résumé de reprise.", ""])})
 
 
 if __name__ == "__main__":
