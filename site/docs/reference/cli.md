@@ -53,7 +53,10 @@ agent-mail doctor [--notify-test | --probe]
 The session identity is `$AGENT_MAIL_NAME` (set by the runner). If
 `$AMEESH_RUNNER_ID` and `$AMEESH_LEASE_EPOCH` are also set, the lease must be
 alive and held by that runner. The working directory never gives an identity.
-Hooks never fail the agent: any error exits 0 silently. A message from an agent
+Hooks never fail the agent: any error exits 0 silently. A hook fired inside a
+subagent (its input carries `agent_id`: a Claude Code subagent or in-process
+teammate, a Codex subagent) delivers nothing, marks nothing and writes nothing:
+the agent's mail waits for the main session's next hook. A message from an agent
 never carries the owner's authority; the sender is shown.
 
 **Session bindings** (v1.4.0). A session started by a human (an *external*
