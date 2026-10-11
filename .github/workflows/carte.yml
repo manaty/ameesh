@@ -1,0 +1,159 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# L161e — carte test → code mesurée (scripts/carte.py), régénérée à chaque
+# fusion sur main, hors du chemin critique : ce workflow n'est jamais une
+# vérification requise, et un test en échec sous mesure est noté dans la
+# carte, pas reporté.
+#
+# La suite passe sous mesure (couverture par test, sous-processus compris,
+# fichiers lus, tables touchées) : psycopg en 4 parts, plus les modules
+# « pilote » en psql (le code propre au pilote psql n'est exécuté que là).
+# Le job « carte » fusionne les mesures en carte.json.gz (ameesh-carte/1) :
+#   - cache GitHub Actions `carte-<sha>` (une PR lit les caches de sa branche
+#     de base ; clé de repli `carte-`), sur main et à la main seulement ;
+#   - artefact `carte` de l'exécution (30 jours), pour ameesh et les agents.
+# Jamais dans le dépôt : elle changerait à chaque fusion.
+#
+# Sur une PR qui touche la mesure elle-même, la carte est produite pour
+# contrôle (artefact seulement, pas de cache).
+name: carte
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - scripts/carte.py
+      - scripts/carte_mesure.py
+      - scripts/test-parts.py
+      - tests/support.py
+      - .github/workflows/carte.yml
+  workflow_dispatch:
+
+# dernier commit seulement : une carte plus récente rend la précédente inutile
+concurrency:
+  group: carte-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  AMEESH_TEST_DSN: postgresql://ameesh@127.0.0.1:5432/ameesh
+  PGPASSWORD: ameesh-ci
+  AMEESH_REQUIRE_DB: "1"
+  AMEESH_BALANCE_INTERVAL: "0"
+  PYTHONPATH: src
+
+jobs:
+  mesure:
+    name: mesure ${{ matrix.pilote }} ${{ matrix.part }}/${{ matrix.parts }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { pilote: psycopg, part: 1, parts: 4 }
+          - { pilote: psycopg, part: 2, parts: 4 }
+          - { pilote: psycopg, part: 3, parts: 4 }
+          - { pilote: psycopg, part: 4, parts: 4 }
+          - { pilote: psql, part: 1, parts: 1, liste: tests/parts/pilote-psql.txt }
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ameesh
+          POSTGRES_PASSWORD: ameesh-ci
+          POSTGRES_DB: ameesh
+        ports: ["5432:5432"]
+        options: >-
+          --tmpfs /var/lib/postgresql/data
+          --health-cmd "pg_isready -U ameesh"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      AMEESH_DRIVER: ${{ matrix.pilote }}
+      LISTE: ${{ matrix.liste }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: environnement de mesure
+        run: |
+          python -m venv .venv-carte
+          if [ "$AMEESH_DRIVER" = psycopg ]; then
+            .venv-carte/bin/pip install -q 'coverage>=7.10' 'psycopg[binary]>=3.1' 'cryptography>=41' 'psutil>=5.9'
+          else
+            .venv-carte/bin/pip install -q 'coverage>=7.10'
+          fi
+          .venv-carte/bin/python scripts/carte.py installer
+      - name: base jetable (sans fsync) et client psql
+        run: |
+          command -v psql >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q postgresql-client; }
+          psql "$AMEESH_TEST_DSN" -q -c "ALTER SYSTEM SET fsync = off" \
+            -c "ALTER SYSTEM SET synchronous_commit = off" \
+            -c "ALTER SYSTEM SET full_page_writes = off" -c "SELECT pg_reload_conf()"
+      - name: identité git des tests (dépôts temporaires)
+        run: |
+          git config --global user.name "ameesh ci"
+          git config --global user.email "ci@ameesh.invalid"
+          git config --global init.defaultBranch main
+      - name: part sous mesure
+        run: |
+          M="$RUNNER_TEMP/mesure"
+          mkdir -p "$M"
+          debut=$(date +%s)
+          # jamais bloquant : un échec sous mesure est noté dans la carte
+          .venv-carte/bin/python scripts/test-parts.py lancer --parts ${{ matrix.parts }} \
+            --part ${{ matrix.part }} --pilote "$AMEESH_DRIVER" ${LISTE:+--liste "$LISTE"} \
+            --mesure "$M" --durees-sortie "$M/durees.json" --flux "$M/flux.jsonl" \
+            || echo "::warning::tests en échec sous mesure (notés dans la carte)"
+          echo "durée sous mesure : $(( $(date +%s) - debut )) s" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mesure-${{ matrix.pilote }}-${{ matrix.part }}
+          path: ${{ runner.temp }}/mesure
+          include-hidden-files: true  # cov/.coverage.*
+          if-no-files-found: ignore
+          retention-days: 3
+
+  carte:
+    name: carte
+    needs: mesure
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -q 'coverage>=7.10'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mesure-*
+          path: mesures
+      # carte précédente : historique des échecs sous mesure (14 jours)
+      - uses: actions/cache/restore@v4
+        with:
+          path: carte/carte.json.gz
+          key: carte-${{ github.sha }}
+          restore-keys: carte-
+      - name: fusion des mesures
+        run: |
+          if [ -f carte/carte.json.gz ]; then mv carte/carte.json.gz carte/precedente.json.gz; fi
+          mkdir -p carte
+          python scripts/carte.py fusionner --sortie carte/carte.json.gz \
+            --precedente carte/precedente.json.gz --resume "$GITHUB_STEP_SUMMARY" mesures/*
+          rm -f carte/precedente.json.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carte
+          path: carte/carte.json.gz
+          retention-days: 30
+      - uses: actions/cache/save@v4
+        if: github.event_name != 'pull_request'
+        with:
+          path: carte/carte.json.gz
+          key: carte-${{ github.sha }}

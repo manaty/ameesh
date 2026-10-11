@@ -6,6 +6,7 @@
     scripts/test-parts.py lancer   --parts N --part K --pilote psql [--liste F]
                                    [--durees-sortie F.json] [--depuis REF]
                                    [--flux F.jsonl] [--etiquette "psql 1/6"]
+                                   [--mesure DIR] [--carte carte.json.gz]
     scripts/test-parts.py durees   --pilote psql F.json [F.json…]
 
 La répartition est **déterministe** et se fait **par module** de test
@@ -41,6 +42,14 @@ L161b — **flux** : avec `--flux F.jsonl`, une ligne JSON par test terminé
 (schéma `ameesh-test-event/1`, écrite et vidée aussitôt), plus une ligne
 `debut` et une ligne `fin` par part. `scripts/ci-flux.py` en fait le résumé
 du job ; L161c le suivra en direct pour le courrier de l'agent.
+
+L161e — **mesure** : avec `--mesure DIR`, la part passe sous mesure pour la
+carte test → code (`scripts/carte.py`) : couverture par test, contexte
+`tests.<module>.<Classe>.<test>` (la classe seule pendant `setUpClass` et
+`tearDownClass`, le module seul pendant son chargement), sous-processus
+compris (`CARTE_CONTEXTE` hérité), fichiers lus et tables touchées.
+Avec `--carte F`, les durées des modules viennent de la carte ;
+`tests/parts/durees.json` ne reste qu'en repli.
 """
 from __future__ import annotations
 
@@ -92,6 +101,24 @@ def lire_liste(chemin: str | os.PathLike, connus: list[str]) -> list[str]:
 def nombre_de_tests(module: str, tests: pathlib.Path = TESTS) -> int:
     texte = (tests / f"{module}.py").read_text(encoding="utf-8")
     return max(1, len(re.findall(r"^\s*def test", texte, re.M)))
+
+
+def durees_de_la_carte(chemin: str | os.PathLike) -> dict:
+    """La table des durées (même forme que durees.json) tirée d'une carte
+    (L161e) ; vide si la carte est illisible."""
+    import gzip
+    try:
+        with gzip.open(chemin, "rt", encoding="utf-8") as f:
+            carte = json.load(f)
+    except (OSError, ValueError) as exc:
+        print(f"carte {chemin} illisible ({exc}) : durées de {TABLE.relative_to(REPO)}",
+              file=sys.stderr, flush=True)
+        return {}
+    table: dict = {}
+    for module, infos in carte.get("modules", {}).items():
+        for pilote, duree in infos.get("durees", {}).items():
+            table.setdefault(pilote, {})[module] = duree
+    return table
 
 
 def poids(mods: list[str], pilote: str, table: dict | None = None,
@@ -196,15 +223,20 @@ def ordonner(part: list[str], pesees: dict[str, float],
     return sorted(part, key=cle)
 
 
-def selection(args) -> tuple[list[str], float, list[str]]:
+def selection(args) -> tuple[list[str], float, list[str], dict[str, float]]:
     if not 1 <= args.part <= args.parts:
         raise SystemExit(f"part {args.part} hors de 1..{args.parts}")
     mods = modules()
     if args.liste:
         mods = lire_liste(args.liste, mods)
-    pesees, repli = poids(mods, args.pilote)
+    table = None
+    if getattr(args, "carte", None):
+        table = durees_de_la_carte(args.carte)
+        if not table.get(args.pilote):
+            table = None
+    pesees, repli = poids(mods, args.pilote, table)
     part = repartir(pesees, args.parts)[args.part - 1]
-    return part, sum(pesees[m] for m in part), [m for m in repli if m in part]
+    return part, sum(pesees[m] for m in part), [m for m in repli if m in part], pesees
 
 
 def _module_de(test) -> str:
@@ -263,6 +295,7 @@ class _Resultat(unittest.TextTestResult):
     durees: collections.Counter
     flux: Flux | None = None
     classes: dict = {}
+    mesure = None  # L161e : _Mesure de la part, ou None
 
     def startTestRun(self):
         self.durees = collections.Counter()
@@ -272,6 +305,8 @@ class _Resultat(unittest.TextTestResult):
         super().startTestRun()
 
     def startTest(self, test):
+        if self.mesure is not None:
+            self.mesure.contexte(test.id())
         super().startTest(test)
         self._courant, self._debut = test, time.monotonic()
         self._statut, self._extrait = "succes", ""
@@ -339,9 +374,72 @@ class _Resultat(unittest.TextTestResult):
             self._courant = None
 
 
+class _Mesure:
+    """L161e : la part sous mesure. Couverture de ce processus avec un
+    contexte par test, posé aussi dans `CARTE_CONTEXTE` pour les
+    sous-processus (qui démarrent la leur par le fichier `.pth`), et relevé
+    des fichiers lus (scripts/carte_mesure.py)."""
+
+    def __init__(self, dossier: str):
+        sys.path.insert(0, str(REPO / "scripts"))
+        import carte  # scripts/carte.py
+        import carte_mesure
+        import coverage
+        self.dossier = os.path.abspath(dossier)
+        os.makedirs(self.dossier, exist_ok=True)
+        rc = carte.ecrire_rc(self.dossier)
+        os.environ["COVERAGE_PROCESS_START"] = rc
+        os.environ[carte_mesure.ENV_DOSSIER] = self.dossier
+        os.environ[carte_mesure.ENV_CONTEXTE] = ""
+        if not carte.pth_installe():
+            print("mesure : fichier .pth absent (scripts/carte.py installer) ; "
+                  "les sous-processus ne seront pas mesurés", file=sys.stderr, flush=True)
+        self.cov = coverage.Coverage(config_file=rc)
+        self.cov.start()
+        carte_mesure.demarrer(couverture=False)
+        self._env = carte_mesure.ENV_CONTEXTE
+
+    def contexte(self, nom: str) -> None:
+        os.environ[self._env] = nom
+        self.cov.switch_context(nom)
+
+    def arreter(self) -> None:
+        self.cov.stop()
+        self.cov.save()
+
+
+def _suite_mesuree(mesure: _Mesure) -> type:
+    """Suite unittest qui pose le contexte de la classe pendant ses
+    `setUpClass` et `tearDownClass` (hors de tout test)."""
+    class _Suite(unittest.TestSuite):
+        def _handleClassSetUp(self, test, result):
+            if test.__class__ != getattr(result, "_previousTestClass", None):
+                mesure.contexte(f"{test.__class__.__module__}.{test.__class__.__qualname__}")
+            super()._handleClassSetUp(test, result)
+
+        def _tearDownPreviousClass(self, test, result):
+            precedente = getattr(result, "_previousTestClass", None)
+            if precedente is not None and precedente != test.__class__:
+                mesure.contexte(f"{precedente.__module__}.{precedente.__qualname__}")
+            super()._tearDownPreviousClass(test, result)
+    return _Suite
+
+
+def _charger(part: list[str], mesure: _Mesure | None) -> unittest.TestSuite:
+    if mesure is None:
+        return unittest.TestLoader().loadTestsFromNames([f"tests.{m}" for m in part])
+    chargeur = unittest.TestLoader()
+    chargeur.suiteClass = _suite_mesuree(mesure)
+    suites = []
+    for m in part:  # ce qu'importe un module de test lui est compté
+        mesure.contexte(f"tests.{m}")
+        suites.append(chargeur.loadTestsFromName(f"tests.{m}"))
+    return chargeur.suiteClass(suites)
+
+
 def lancer(args) -> int:
     signal.signal(signal.SIGINT, signal.default_int_handler)
-    part, estimee, repli = selection(args)
+    part, estimee, repli, pesees = selection(args)
     print(f"part {args.part}/{args.parts} ({args.pilote}) : {len(part)} module(s), "
           f"~{estimee:.0f} s estimées", flush=True)
     if repli:
@@ -351,7 +449,7 @@ def lancer(args) -> int:
     changes = fichiers_changes(args.depuis) if args.depuis else None
     if changes is not None:
         classes = classer(part, changes, ambigus=noms_ambigus())
-        part = ordonner(part, poids(part, args.pilote)[0], classes)
+        part = ordonner(part, pesees, classes)
         touches = [m for m in part if classes[m][0] != "P3"]
         print(f"  d'abord, touchés par les {len(changes)} fichier(s) changé(s) depuis "
               f"{args.depuis} : {', '.join(touches) or 'aucun'}", flush=True)
@@ -362,14 +460,18 @@ def lancer(args) -> int:
                     classes={m: classes.get(m, ("P3", ""))[0] for m in part},
                     estimee_s=round(estimee, 1))
     os.chdir(REPO)
+    mesure = _Mesure(args.mesure) if args.mesure else None
     sys.path[:0] = [str(REPO), str(REPO / "src")]
-    suite = unittest.TestLoader().loadTestsFromNames([f"tests.{m}" for m in part])
-    resultat_cls = type("_ResultatPart", (_Resultat,), {"flux": flux, "classes": classes})
+    suite = _charger(part, mesure)
+    resultat_cls = type("_ResultatPart", (_Resultat,),
+                        {"flux": flux, "classes": classes, "mesure": mesure})
     runner = unittest.TextTestRunner(verbosity=2, resultclass=resultat_cls)
     debut, resultat = time.monotonic(), None
     try:
         resultat = runner.run(suite)
     finally:
+        if mesure is not None:
+            mesure.arreter()
         if flux:
             if resultat is None:  # interrompu (SIGINT, délai du job)
                 statut, comptes = "interrompu", {}
@@ -416,12 +518,16 @@ def main(argv: list[str] | None = None) -> int:
                            "fichiers changés depuis passent d'abord (ex. HEAD^1)")
             p.add_argument("--flux", help="écrit un événement JSON par test (JSON lignes)")
             p.add_argument("--etiquette", help="nom de la part dans le flux (ex. « psql 1/6 »)")
+            p.add_argument("--mesure", help="dossier de mesure pour la carte test → code "
+                           "(L161e, scripts/carte.py)")
+        p.add_argument("--carte", help="carte (carte.json.gz) : durées des modules, "
+                       "tests/parts/durees.json en repli (L161e)")
     p = sous.add_parser("durees")
     p.add_argument("--pilote", choices=("psql", "psycopg"), required=True)
     p.add_argument("fichiers", nargs="+")
     args = ap.parse_args(argv)
     if args.commande == "repartir":
-        part, estimee, _ = selection(args)
+        part, estimee, _, _ = selection(args)
         print("\n".join(f"tests.{m}" for m in part))
         print(f"~{estimee:.0f} s estimées", file=sys.stderr)
         return 0
