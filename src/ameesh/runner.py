@@ -338,6 +338,10 @@ class AgentWorker(threading.Thread):
         #: le dernier tour inscrit au grand livre, et sa session
         self.last_turn_reread = 0
         self.last_turn_reread_session: str | None = None
+        #: L217 : relevé du flux du dernier tour, fil principal (la mesure du
+        #: plafond pendant le tour) et sous-agents (pour information)
+        self.last_turn_main_reread = 0
+        self.last_turn_subagent_reread = 0
         #: plafonds du tour (L105) : le tour suivant reprend le travail d'un
         #: tour clos (raison), et la rotation forcée par le plafond de contexte
         #: atteint pendant un tour (raison) attend le prochain passage entre deux tours
@@ -2727,6 +2731,9 @@ class AgentWorker(threading.Thread):
         # et durée ; jamais sur un tour de résumé (rotation, bascule de compte)
         plafonne = spec.get("prompt") != adapters.SUMMARY_PROMPT
         relus = 0
+        #: L217 : jetons relus par les sous-agents, à part et pour information
+        #: (jamais comptés au plafond de contexte, qui mesure le fil principal)
+        relus_sous_agents = 0
         appels_vus: set = set()
         cloture: str | None = None
         clos = False
@@ -2837,6 +2844,13 @@ class AgentWorker(threading.Thread):
                                 if ident:
                                     appels_vus.add(ident)
                                 relus += adapters.reread_tokens(harness, appel)
+                        appel = parsed.get("subagent_call_usage")
+                        if isinstance(appel, dict):
+                            ident = parsed.get("call_id")
+                            if not ident or ident not in appels_vus:
+                                if ident:
+                                    appels_vus.add(ident)
+                                relus_sous_agents += adapters.reread_tokens(harness, appel)
                         if cloture is None:
                             cloture = self.turn_close_due(started, relus)
                             if cloture:
@@ -2907,6 +2921,12 @@ class AgentWorker(threading.Thread):
 
         duration = time.time() - started
         self.last_turn_seconds = duration
+        # L217 : fil principal et sous-agents, mesurés à part dans le flux
+        self.last_turn_main_reread = relus
+        self.last_turn_subagent_reread = relus_sous_agents
+        if relus_sous_agents:
+            log_async("[%s] jetons relus dans le tour : %d fil principal, %d sous-agents "
+                      "(hors plafond)" % (self.name, relus, relus_sous_agents))
         lost = self.lease_lost.is_set()
         preempte = self.preempting.is_set()
         # Comptabilité **avant** toute sortie anticipée : la dépense a eu lieu,

@@ -649,7 +649,9 @@ class ClaudeStream(StreamReader):
         kind = event.get("type")
         out: dict = {}
         # L166 : un événement de sous-agent (outil Agent/Task) ne donne jamais
-        # la session de l'agent
+        # la session de l'agent ; L217 : ni l'usage compté au plafond de
+        # contexte du tour, ni un point sûr (le clore là tuerait les
+        # sous-agents en cours)
         principal = not event.get("parent_tool_use_id")
         if kind == "system" and event.get("subtype") == "init":
             if principal:
@@ -668,14 +670,14 @@ class ClaudeStream(StreamReader):
             if isinstance(message.get("usage"), dict):
                 # L105 : usage d'UN appel au modèle (répété sur chaque bloc du
                 # même message : l'id sert à ne le compter qu'une fois)
-                out["call_usage"] = message["usage"]
+                out["call_usage" if principal else "subagent_call_usage"] = message["usage"]
                 if message.get("id"):
                     out["call_id"] = str(message["id"])
         elif kind == "user":
             # L105 : un résultat d'outil rendu au modèle — l'appel d'outil est
             # fini, c'est un point sûr pour clore le tour
             contenu = (event.get("message") or {}).get("content")
-            if isinstance(contenu, list) and any(
+            if principal and isinstance(contenu, list) and any(
                     isinstance(chunk, dict) and chunk.get("type") == "tool_result"
                     for chunk in contenu):
                 out["safe_point"] = True
