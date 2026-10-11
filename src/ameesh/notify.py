@@ -437,6 +437,12 @@ def _readable(title: str, body: str, detail_line: str | None) -> tuple:
 def render(alert: dict, event: str, now: float, *, raised_ts=None) -> Message:
     """Le message d'une alerte levée (`raised`) ou résolue (`resolved`)."""
     kind = str(alert.get("type") or "?")
+    if kind == "orphan_lot" and alert.get("grouped"):
+        subject = "agent %s" % _clean(alert.get("agent") or "unknown", 64)
+        title = "ameesh: %sorphan lots (%s)" % (
+            "resolved — " if event == "resolved" else "", subject)
+        text = "[orphan_lot] %s\n%s" % (subject, _clean(alert.get("detail")))
+        return Message(title, text, low=event == "resolved", urgent=event != "resolved")
     label = TYPE_LABELS.get(kind, kind.replace("_", " "))
     subject = _subject(alert)
     since = alert.get("since")
@@ -850,7 +856,43 @@ def save_state(path: str, state: dict) -> None:
 
 def key_of(alert: dict) -> str:
     """Clé de dédoublonnage : celle d'`ameesh alerts --follow`, en texte."""
-    return json.dumps(list(exploitation.alert_key(alert)), ensure_ascii=False)
+    key = list(exploitation.alert_key(alert))
+    if alert.get("type") == "orphan_lot" and alert.get("grouped"):
+        key.append(alert.get("responsible"))
+    return json.dumps(key, ensure_ascii=False)
+
+
+GROUPED_LOTS_SHOWN = 5
+
+
+def group_orphan_lots(alerts: list, resolve) -> list:
+    """Group orphan notifications by agent, reason and resolved human.
+
+    Resolve each lot before grouping so different humans keep separate alerts.
+    Omit lot, host and since from the group identity: changing its membership
+    must not resend a notification while the orphaned-agent situation persists.
+    The original alerts remain available to automatic assignment and briefs.
+    """
+    out, groups = [], {}
+    for alert in alerts:
+        if alert.get("type") != "orphan_lot":
+            out.append(alert)
+            continue
+        human, _ = resolve(alert)
+        groups.setdefault((alert.get("agent"), alert.get("reason"), human), []).append(alert)
+    for (agent, reason, human), lots in groups.items():
+        ordered = sorted(lots, key=lambda alert: int(alert["lot"]))
+        names = ", ".join("#%s%s" % (
+            alert["lot"], ' "%s"' % _clean(alert.get("title"), 60) if alert.get("title") else "")
+            for alert in ordered[:GROUPED_LOTS_SHOWN])
+        more = (" and %d more" % (len(lots) - GROUPED_LOTS_SHOWN)
+                if len(lots) > GROUPED_LOTS_SHOWN else "")
+        grouped = {"type": "orphan_lot", "agent": agent, "reason": reason,
+                   "responsible": human, "grouped": True, "value": len(lots),
+                   "detail": "%d orphan lot(s) (%s): %s%s" % (
+                       len(lots), reason or "unknown", names, more)}
+        out.append(grouped)
+    return out
 
 
 #: champs d'une alerte gardés dans l'état (de quoi écrire la résolution)
@@ -860,7 +902,7 @@ _KEPT = ("type", "agent", "lot", "title", "host", "since", "detail", "reason", "
          # L96 : `engagement_overdue` (la clé de dédoublonnage les lit)
          "commitment", "package", "due",
          # L124 : `decision_pending`, `decision_overdue`
-         "decision")
+         "decision", "grouped")
 
 
 # --------------------------------------------------------------------------
@@ -901,7 +943,8 @@ class Notifier:
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
-        wanted = {key_of(a): a for a in current if a.get("type") in self.ncfg.types}
+        notifications = group_orphan_lots(current, router.resolve)
+        wanted = {key_of(a): a for a in notifications if a.get("type") in self.ncfg.types}
         active = self.state["active"]
         for key in list(active):
             if key in wanted:
