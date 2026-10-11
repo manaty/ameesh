@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-11 (tests par impact)
+* **Étude** L161 (lot n° 171 du suivi) : [tests choisis selon l'impact, échecs remontés en temps réel](etudes/l161-tests-par-impact.md). CI mesurée : ameesh depuis L116 (PR 3,5 min, main 5,9 min ; premier échec connu 2 à 5 min avant la fin ; 18 % des PR, de documentation ou de version seule, passent toute la suite) ; Nexlink (Backend suite lancée à 81 % sur `develop` par des poussées de documentation ; 9 étiquettes desktop sur 17 en échec sur des tests Windows ou macOS jamais lancés avant). Proposé : carte test → code mesurée (couverture par test, sous-processus compris, fichiers lus, tables touchées), impactés d'abord, flux routé au courrier de l'agent du lot (un urgent par version poussée, rouge hérité jamais imputé à l'auteur), rien sauté pour du code sur la branche d'intégration ; lots L161a–L161i (38 h).
+
 ## 2026-10-11 (courrier des sous-agents)
 * **Correctif** (L133, sans migration) : `agent-mail hook` remettait le courrier d'un agent à ses sous-agents (Claude Code les déclenche avec la session de l'agent), qui l'ignoraient, et le marquait livré : la session principale ne le recevait jamais (au moins cinq messages perdus les 10 et 11/10, relevé dans l'amendement de [0036](decisions/0036-auditeur-interne.md)). Une entrée de hook qui porte `agent_id` (sous-agent ou coéquipier de Claude Code, sous-agent de Codex) ne lit, ne remet, ne marque et n'écrit plus rien ; le courrier attend le prochain hook de la session principale. Limite : le harnais DeepSeek ne passe pas `agent_id` à ses hooks ordinaires. Voir [V1-MAILBOX-RUNNER.md](../V1-MAILBOX-RUNNER.md), section 6.
 
