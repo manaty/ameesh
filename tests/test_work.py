@@ -160,7 +160,7 @@ class DelaysTest(PgTestCase):
         item = self._add("Frise")
         rows = work.milestones(self.db, item["id"])
         self.assertEqual([row["kind"] for row in rows], ["requested"])
-        self.assertEqual(rows[0]["note"], "created")
+        self.assertEqual(rows[0]["note"], "création")
         # gel, verdict bloqué, nouveau gel, verdict ok, puis fusion
         work.milestone(self.db, item["id"], "frozen", sha="a" * 40, actor="deepseek7")
         work.milestone(self.db, item["id"], "verdict", verdict="blocked",

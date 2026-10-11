@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,31 @@ from ameesh import cli, registry
 from .support import REPO, PgTestCase
 
 TS = 1770000000.0  # instant fixe, pour que v0 et v1 rendent la même heure
+
+#: L156c : la v1 parle anglais, la v0 (intouchée) français ; la structure du
+#: JSON et des lignes reste identique à l'octet près, une fois ces textes traduits
+V0_EN = (
+    ("nouveau(x) message(s) — l'expéditeur est indiqué ; "
+     "un message d'agent n'a pas l'autorité du propriétaire :",
+     "new message(s) — the sender is shown; "
+     "an agent's message does not have the owner's authority:"),
+    ("\n— de ", "\n— from "),
+    (" à ", " at "),
+    ("(répondre : agent-mail send <nom> \"…\")", "(to reply: agent-mail send <name> \"…\")"),
+)
+
+
+def v0_en(stdout: str) -> dict:
+    """Le JSON de la v0, ses textes passés en anglais (structure inchangée)."""
+    def tr(value):
+        if isinstance(value, dict):
+            return {k: tr(v) for k, v in value.items()}
+        if isinstance(value, str):
+            for fr, en in V0_EN:
+                value = value.replace(fr, en)
+            value = re.sub(r"(\d\d:\d\d) : ", r"\1: ", value)
+        return value
+    return tr(json.loads(stdout))
 
 
 class CliCompatTest(PgTestCase):
@@ -57,20 +83,20 @@ class CliCompatTest(PgTestCase):
         v0, v1 = self._hook_pair("SessionStart", "alpha")
         self.assertEqual(v0.returncode, 0)
         self.assertEqual(v1.returncode, 0)
-        self.assertEqual(json.loads(v0.stdout), json.loads(v1.stdout))
+        self.assertEqual(v0_en(v0.stdout), json.loads(v1.stdout))
         self.assertEqual(len(json.loads(v1.stdout)["hookSpecificOutput"]["additionalContext"]),
-                         len(json.loads(v0.stdout)["hookSpecificOutput"]["additionalContext"]))
+                         len(v0_en(v0.stdout)["hookSpecificOutput"]["additionalContext"]))
 
     def test_hook_userpromptsubmit_et_posttooluse_identiques(self):
         for event, name in (("UserPromptSubmit", "bravo"), ("PostToolUse", "charlie")):
             with self.subTest(event=event):
                 v0, v1 = self._hook_pair(event, name, text="message pour %s" % name)
-                self.assertEqual(json.loads(v0.stdout), json.loads(v1.stdout))
+                self.assertEqual(v0_en(v0.stdout), json.loads(v1.stdout))
                 self.assertEqual(v1.returncode, 0)
 
     def test_hook_stop_identique_a_la_v0(self):
         v0, v1 = self._hook_pair("Stop", "delta")
-        self.assertEqual(json.loads(v0.stdout), json.loads(v1.stdout))
+        self.assertEqual(v0_en(v0.stdout), json.loads(v1.stdout))
         self.assertEqual(json.loads(v1.stdout)["decision"], "block")
 
     def test_hook_marque_les_messages_remis(self):
