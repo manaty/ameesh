@@ -12,23 +12,38 @@ point worktrees to it.
 <cache_root>/nm/<key>/                        one entry per key
     .complete.json                            written last: the entry is complete
     .links/<sha1 of a link path>              one small file per worktree link
-    <package>/package.json, package-lock.json
-    <package>/node_modules/                   read-only, except .cache/ and .vite/
-<worktree>/<package>/node_modules -> <cache_root>/nm/<key>/<package>/node_modules
+    .last-alive                               last time the GC saw a live link
+    <label>/package.json, package-lock.json
+    <label>/node_modules/                     read-only, except .cache/ and .vite/
+<cache_root>/nm/<key>.lock                    the entry's lock (never deleted)
+<worktree>/<label>/node_modules -> <cache_root>/nm/<key>/<label>/node_modules
 ```
 
 * `<cache_root>` is the housekeeping cache root (`$AMEESH_CACHE_DIR` in a
   turn; default `<state>/.menage/cache`, on disk).
+* `<label>` is the package's path in its repository (`mobile`,
+  `shared/remote-help`, `_root` for a package at the top), the same in every
+  worktree of the repository whatever the worktree's directory is called.
 * `<key>` is a sha256 of what decides the installed tree: `package-lock.json`,
   `package.json`'s lifecycle scripts (`preinstall`, `install`,
   `postinstall`, `prepare`), the package files these scripts name
-  (`node scripts/patch-ios-webrtc.cjs`), `patches/**`, `.npmrc`, the node
-  major version, the OS and the CPU. A source change doesn't change the key.
-  A lockfile, patch or node major change gives a new entry.
-* **Filling**: `npm ci --prefer-offline` runs once, IN the entry (absolute
-  paths written by install scripts stay valid). It runs under
-  `<cache_root>/nm/<key>.lock`, so a second agent waits for the first one
-  (up to 30 min) instead of installing again. Only the key files are copied
+  (`node scripts/patch-ios-webrtc.cjs`), `patches/**`, `.npmrc`, the label,
+  the install mode, the node and npm versions, the OS and the CPU. A source
+  change doesn't change the key. A lockfile, patch, node or npm change gives
+  a new entry. The link target depends only on the key.
+* **One install mode**: a fill is always a full development install,
+  `npm ci --include=dev --include=optional --include=peer
+  --ignore-scripts=false`. `NODE_ENV` and the npm settings that change the
+  tree (`npm_config_omit`, `production`, `only`…) are removed from its
+  environment, and the explicit flags win over an npmrc. A turn that asks
+  for another tree (`NODE_ENV=production`, `npm ci --omit=dev`) gets a local
+  install from the real npm, never the shared tree.
+* **Filling**: `npm ci` runs once, IN the entry (absolute paths written by
+  install scripts stay valid). It runs under `<cache_root>/nm/<key>.lock`,
+  so a second agent waits for the first one (up to 30 min) instead of
+  installing again. The lock's descriptor is inherited by npm and its
+  install scripts: if the filling process dies, the lock is held until the
+  last of them exits, and nobody rebuilds the entry under them. Only the key files are copied
   beside the lockfile for the install, and only `package.json` and the
   lockfile are kept. The tree is then made read-only: directories 0555, files
   without write bits. The marker is published last, by an atomic rename. If
@@ -70,6 +85,12 @@ keep typing npm:
 `AMEESH_DEPS=off` passes everything through. `AMEESH_DEPS=allow-review`
 allows installs in a review worktree. With `policy.housekeeping.deps: false`,
 no wrapper is installed.
+
+`--prefix DIR` (`-C DIR`) is followed: the review check and the link apply to
+DIR. `--location=project` or `user` is not global. Nothing marks the real
+npm as "already wrapped" (the wrapper never finds itself as the real npm),
+so an `npm ci` run by a script of `npm run …` comes back through the
+wrapper.
 
 At the start of each turn, the runner also links the packages of the agent's
 main worktree that have no `node_modules` yet, when their entry is already in
@@ -113,11 +134,26 @@ the tool as before.
 
 ### Garbage collection
 
-The periodic housekeeping pass (`ameesh menage`) deletes an entry when no
-recorded link still points into it and none was made for `deps_idle`
-(default 3 days). It also deletes a partial entry (no marker, lock free) older
-than an hour. Each deletion runs under the entry's lock and is logged
-(`kind` `deps`).
+The periodic housekeeping pass (`ameesh menage`) deletes an entry only when
+all of these hold:
+
+* no link points into it: neither a recorded one nor one found in the known
+  worktrees (every worktree of the agents' repositories, checked at
+  `<worktree>/<label>/node_modules`). Links are recorded BEFORE they are
+  created, so a crash leaves a stale record, never a link the GC cannot see;
+* `deps_idle` (default 3 days, never less than 24 h) has passed since its
+  creation, its last link, and the last time the GC saw a link to it alive;
+* no process uses a file in it: current directory, open file, executable or
+  mapped file such as a native `.node` module or the electron binary
+  (`platform.holders(…, mapped=True)`). If the processes can't be read, the
+  entry is kept;
+* its lock is free (no fill, no link being made).
+
+It also deletes a partial entry (no marker, lock free, no process) older
+than an hour. Everything is read again under the entry's lock right before
+deleting. Lock files are never deleted, so two fillers always lock the same
+inode. Without a readable registry, nothing is deleted. Each deletion is
+logged (`kind` `deps`).
 
 The housekeeping of idle worktrees (#247) never follows a symlink. It skips a
 symlinked `node_modules` and never enters `<cache_root>/nm`.

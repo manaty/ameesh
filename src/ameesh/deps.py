@@ -67,7 +67,7 @@ WRITABLE = (".cache", ".vite")
 #: npm lifecycle scripts run by `npm ci` (their files are part of the key)
 LIFECYCLE = ("preinstall", "install", "postinstall", "prepare")
 #: bump when the key or the entry layout changes
-KEY_VERSION = "ameesh-nm/1"
+KEY_VERSION = "ameesh-nm/2"
 SCHEMA = "ameesh-deps/1"
 #: longest wait for another agent filling the same entry (seconds)
 FILL_WAIT_S = 1800.0
@@ -75,6 +75,23 @@ FILL_WAIT_S = 1800.0
 PARTIAL_MIN_AGE_S = 3600.0
 #: an unreferenced entry is deleted after this long without a new link
 DEFAULT_DEPS_IDLE_S = 3 * 24 * 3600.0
+#: and never sooner than this after a link to it was last seen alive
+GRACE_S = 24 * 3600.0
+#: touched by the GC each time it sees a live link to the entry
+ALIVE = ".last-alive"
+#: the one install mode of a fill (part of the key): a full development tree,
+#: whatever NODE_ENV, `omit` or `ignore-scripts` say in the environment or an
+#: npmrc; a production turn never gets a tree it did not ask for (see npm_shim)
+INSTALL_ARGS = ("ci", "--include=dev", "--include=optional", "--include=peer",
+                "--ignore-scripts=false")
+#: performance-only options of the fill (not in the key)
+FILL_OPTIONS = ("--prefer-offline", "--no-audit", "--no-fund")
+#: npm settings that change the installed tree, dropped from a fill's
+#: environment (`npm_config_<name>`, any case, `-` or `_`)
+TREE_SETTINGS = ("production", "omit", "include", "only", "also", "dev", "ignore_scripts",
+                 "global", "location", "prefix", "workspace", "workspaces",
+                 "install_strategy", "legacy_peer_deps", "strict_peer_deps", "force",
+                 "os", "cpu", "libc", "install_links", "save", "package_lock_only")
 #: directories never searched for packages
 SKIP_DIRS = (NODE_MODULES, "target", "dist", "build")
 #: search depth for packages under a worktree
@@ -88,8 +105,6 @@ REVIEW_WORDS = ("review", "relecture", "revue")
 #: `AMEESH_DEPS=off`: the npm wrapper passes everything through;
 #: `AMEESH_DEPS=allow-review`: installs allowed in a review worktree
 DEPS_ENV = "AMEESH_DEPS"
-#: set by the wrapper for the real npm it runs (no recursion)
-PASSTHROUGH_ENV = "AMEESH_DEPS_PASSTHROUGH"
 #: npm commands that install into node_modules
 INSTALL_COMMANDS = ("ci", "clean-install", "install-clean", "isntall-clean", "ic",
                     "install", "i", "in", "ins", "inst", "insta", "instal", "isnt",
@@ -98,7 +113,13 @@ INSTALL_COMMANDS = ("ci", "clean-install", "install-clean", "isntall-clean", "ic
 #: options of `npm ci` that do not change the installed tree
 NEUTRAL_OPTIONS = ("--prefer-offline", "--offline", "--no-audit", "--no-fund",
                    "--silent", "--quiet", "-q", "-s", "--no-progress", "--progress=false",
-                   "--audit=false", "--fund=false", "--no-update-notifier")
+                   "--audit=false", "--fund=false", "--no-update-notifier",
+                   "--include=dev")
+#: npm options that take a value when written without `=` (`--prefix DIR`)
+VALUE_OPTIONS = ("--prefix", "-C", "--location", "-w", "--workspace", "--omit",
+                 "--include", "--cache", "--registry", "--userconfig", "--globalconfig",
+                 "--loglevel", "--tag", "--install-strategy", "--script-shell",
+                 "--node-options", "--os", "--cpu", "--libc", "--before")
 #: name of the wrapper's directory under the housekeeping state
 SHIM_DIR = "bin-deps"
 
@@ -115,16 +136,27 @@ def nm_root(cache_root: str) -> str:
     return os.path.join(cache_root, NM_DIR)
 
 
-@functools.lru_cache(maxsize=1)
-def node_version() -> str:
-    """Major version of the `node` on PATH (`v26`), or "" without node.
-    Native modules are built for it: a new major is a new entry."""
+def _version(command: list[str]) -> str:
     try:
-        out = subprocess.run(["node", "--version"], capture_output=True, text=True,
-                             timeout=10).stdout.strip()
+        return subprocess.run(command, capture_output=True, text=True,
+                              timeout=20).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ""
-    return out.split(".")[0]
+
+
+@functools.lru_cache(maxsize=1)
+def node_version() -> str:
+    """Version of the `node` on PATH (`v26.8.1`), "" without node. Native
+    modules are built for it."""
+    return _version(["node", "--version"])
+
+
+@functools.lru_cache(maxsize=1)
+def npm_version() -> str:
+    """Version of the real npm (`11.19.0`), "" without npm: it decides the
+    layout of the tree."""
+    real = real_npm()
+    return _version([real, "--version"]) if real else ""
 
 
 def _lifecycle(pkg_dir: str) -> dict:
@@ -172,10 +204,38 @@ def key_files(pkg_dir: str) -> list[str]:
     return sorted(out)
 
 
-def cache_key(pkg_dir: str, *, node: str | None = None) -> str:
+def package_label(pkg_dir: str) -> str:
+    """The `<package>` level of the entry: the package's path relative to its
+    git worktree (`mobile`, `shared/remote-help`, `_root` for the top), so
+    that every worktree of a repository names it the same; outside git, the
+    directory's name. Part of the key: the link target depends on nothing
+    else than the key."""
+    pkg_dir = os.path.abspath(pkg_dir)
+    top = _git(pkg_dir, "rev-parse", "--show-toplevel")
+    if top is not None and top.returncode == 0 and top.stdout.strip():
+        rel = os.path.relpath(pkg_dir, os.path.realpath(top.stdout.strip()))
+        if rel.startswith(".."):
+            rel = os.path.relpath(os.path.realpath(pkg_dir),
+                                  os.path.realpath(top.stdout.strip()))
+        if rel == ".":
+            return "_root"
+        if not rel.startswith(".."):
+            return "/".join(_safe_name(part) for part in rel.split(os.sep))
+    return _safe_name(os.path.basename(pkg_dir))
+
+
+def _safe_name(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name).lstrip(".") \
+        or "package"
+
+
+def cache_key(pkg_dir: str, *, node: str | None = None, npm: str | None = None,
+              label: str | None = None) -> str:
     """sha256 of what decides the content of `node_modules`: the key files
-    (`key_files`), the lifecycle scripts, the node major version, the OS and
-    the CPU (native modules, platform-specific packages)."""
+    (`key_files`), the lifecycle scripts, the package's path in its
+    repository (`package_label`), the install mode (INSTALL_ARGS), the node
+    and npm versions, the OS and the CPU (native modules,
+    platform-specific packages)."""
     digest = hashlib.sha256()
 
     def feed(label: str, data: bytes) -> None:
@@ -183,7 +243,10 @@ def cache_key(pkg_dir: str, *, node: str | None = None) -> str:
 
     feed("version", KEY_VERSION.encode())
     feed("node", (node_version() if node is None else node).encode())
+    feed("npm", (npm_version() if npm is None else npm).encode())
     feed("platform", ("%s/%s" % (platform.SYSTEM, platform.machine())).encode())
+    feed("label", (package_label(pkg_dir) if label is None else label).encode())
+    feed("mode", " ".join(INSTALL_ARGS).encode())
     feed("lifecycle", json.dumps(_lifecycle(pkg_dir), sort_keys=True).encode())
     for rel in key_files(pkg_dir):
         with open(os.path.join(pkg_dir, rel), "rb") as fh:
@@ -191,19 +254,12 @@ def cache_key(pkg_dir: str, *, node: str | None = None) -> str:
     return digest.hexdigest()
 
 
-def package_name(pkg_dir: str) -> str:
-    """The `<package>` level of the entry: the package directory's name."""
-    name = os.path.basename(os.path.abspath(pkg_dir)) or "package"
-    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name).lstrip(".") \
-        or "package"
-
-
 def entry_of(root: str, key: str) -> str:
     return os.path.join(root, key)
 
 
-def entry_modules(root: str, key: str, pkg_name: str) -> str:
-    return os.path.join(root, key, pkg_name, NODE_MODULES)
+def entry_modules(root: str, key: str, label: str) -> str:
+    return os.path.join(root, key, label, NODE_MODULES)
 
 
 def read_marker(entry: str) -> dict | None:
@@ -368,16 +424,32 @@ def real_npm(env: dict | None = None) -> str | None:
     return None
 
 
-def npm_ci(directory: str, env: dict | None = None) -> None:
-    """The default installer: the real `npm ci`, gently (nice), cache first."""
-    env = dict(os.environ if env is None else env)
-    env[PASSTHROUGH_ENV] = "1"
-    command = [real_npm(env) or "npm", "ci", "--prefer-offline", "--no-audit", "--no-fund"]
-    if shutil.which("nice"):
-        command = ["nice", "-n", "10"] + command
+def fill_env(env: dict | None = None) -> dict:
+    """The environment of an install: without NODE_ENV nor any npm setting
+    that changes the tree (TREE_SETTINGS); INSTALL_ARGS say it all."""
+    out = {}
+    for name, value in (os.environ if env is None else env).items():
+        lowered = name.lower().replace("-", "_")
+        if lowered == "node_env" or (lowered.startswith("npm_config_")
+                                     and lowered[len("npm_config_"):] in TREE_SETTINGS):
+            continue
+        out[name] = value
+    return out
+
+
+def npm_ci(directory: str, env: dict | None = None, *, lock_fd: int | None = None) -> None:
+    """The default installer: the real `npm ci` in the one install mode
+    (INSTALL_ARGS), gently (nice), cache first. `lock_fd`, the fill lock, is
+    inherited by npm and its install scripts: the lock outlives this process
+    until the last of them exits."""
+    env = fill_env(env)
+    command = [real_npm(env) or "npm", *INSTALL_ARGS, *FILL_OPTIONS]
+    nice = shutil.which("nice")
+    if nice:
+        command = [nice, "-n", "10"] + command
     try:
         done = subprocess.run(command, cwd=directory, env=env, capture_output=True,
-                              text=True)
+                              text=True, pass_fds=(lock_fd,) if lock_fd is not None else ())
     except OSError as exc:
         raise FillError("npm ci could not start: %s" % exc)
     if done.returncode != 0:
@@ -403,7 +475,7 @@ def fill(pkg_dir: str, root: str, key: str, *, installer=npm_ci, env: dict | Non
             return marker
         if os.path.lexists(entry):          # a partial fill, under our lock
             remove_tree(entry, root)
-        name = package_name(pkg_dir)
+        name = package_label(pkg_dir)
         stage = os.path.join(entry, name)
         os.makedirs(stage, mode=0o755)
         os.makedirs(os.path.join(entry, LINKS), mode=0o755)
@@ -414,7 +486,7 @@ def fill(pkg_dir: str, root: str, key: str, *, installer=npm_ci, env: dict | Non
             shutil.copy2(os.path.join(pkg_dir, rel), dest)
         started = time.time()
         try:
-            installer(stage, env)
+            installer(stage, env, lock_fd=lock.fileno())
             modules = os.path.join(stage, NODE_MODULES)
             if os.path.islink(modules) or not os.path.isdir(modules):
                 raise FillError("the installer left no node_modules directory")
@@ -434,8 +506,9 @@ def fill(pkg_dir: str, root: str, key: str, *, installer=npm_ci, env: dict | Non
             except OSError:
                 pass
             raise
-        marker = {"schema": SCHEMA, "key": key, "package": name,
+        marker = {"schema": SCHEMA, "key": key, "package": name, "label": name,
                   "source": os.path.abspath(pkg_dir), "node": node_version(),
+                  "npm": npm_version(), "mode": " ".join(INSTALL_ARGS),
                   "created": time.time(), "install_s": round(time.time() - started, 1),
                   "files": files, "bytes": size}
         tmp = os.path.join(entry, COMPLETE + ".tmp")
@@ -527,8 +600,9 @@ def link_package(pkg_dir: str, cache_root: str, *, fill_missing: bool = True,
     if not os.path.isfile(os.path.join(pkg_dir, LOCKFILE)):
         return dict(result, status="no-lockfile")
     root = nm_root(cache_root)
-    key = cache_key(pkg_dir)
-    target = entry_modules(root, key, package_name(pkg_dir))
+    label = package_label(pkg_dir)
+    key = cache_key(pkg_dir, label=label)
+    target = entry_modules(root, key, label)
     link = os.path.join(pkg_dir, NODE_MODULES)
     result.update(key=key, target=target)
     if os.path.lexists(link) and not os.path.islink(link):
@@ -564,8 +638,10 @@ def link_package(pkg_dir: str, cache_root: str, *, fill_missing: bool = True,
         if os.path.lexists(link) and not os.path.islink(link):
             old = os.path.join(pkg_dir, ".node_modules.ameesh-old-%d" % os.getpid())
             os.rename(link, old)
-        _symlink(target, link)
+        # write-ahead: recorded before it exists, so a crash between the two
+        # leaves a stale record (pruned), never a live link the GC cannot see
         _record_link(entry_of(root, key), link)
+        _symlink(target, link)
     finally:
         if lock is not None:
             lock.close()
@@ -678,17 +754,56 @@ def lock_in_sync(pkg_dir: str) -> bool:
                              "peerDependencies"))
 
 
-def _npm_words(args: list[str]) -> tuple[str | None, list[str], list[str]]:
-    """(command, positional arguments, options) of an npm command line."""
-    command, positional, options = None, [], []
-    for arg in args:
+def _npm_words(args: list[str]) -> tuple[str | None, list[str], list[str], dict]:
+    """(command, positional arguments, options, option values) of an npm
+    command line. An option of VALUE_OPTIONS written without `=` takes the
+    next word (`--prefix DIR`); values are also read from `--name=value`."""
+    command, positional, options, values = None, [], [], {}
+    words = list(args)
+    index = 0
+    while index < len(words):
+        arg = words[index]
+        index += 1
+        if arg == "--":
+            positional.extend(words[index:])
+            break
         if arg.startswith("-"):
+            name, eq, value = arg.partition("=")
+            if not eq and name in VALUE_OPTIONS and index < len(words):
+                value = words[index]
+                index += 1
+                arg = "%s=%s" % (name, value)
             options.append(arg)
+            values[{"-C": "--prefix", "-w": "--workspace"}.get(name, name)] = value
         elif command is None:
             command = arg
         else:
             positional.append(arg)
-    return command, positional, options
+    return command, positional, options, values
+
+
+def _global(options: list[str], values: dict) -> bool:
+    """`-g`, `--global` (not `--global=false`), `--location=global`."""
+    for option in options:
+        name, _eq, value = option.partition("=")
+        if name in ("-g", "--global") and value.lower() not in ("false", "0"):
+            return True
+    return values.get("--location", "").lower() == "global"
+
+
+def _wants_other_tree(env: dict) -> bool:
+    """The environment asks npm for a tree that is not the full development
+    one of the cache (NODE_ENV=production, `omit`, `production`, `only`)."""
+    for name, value in env.items():
+        lowered = name.lower().replace("-", "_")
+        if lowered == "node_env" and value.strip().lower() == "production":
+            return True
+        if lowered in ("npm_config_omit", "npm_config_only") and value.strip():
+            return True
+        if lowered == "npm_config_production" and value.strip().lower() not in \
+                ("", "false", "0"):
+            return True
+    return False
 
 
 SHIM_TEXT = """#!/bin/sh
@@ -728,7 +843,11 @@ def _say(text: str) -> None:
 def npm_shim(args: list[str], *, env: dict | None = None, cwd: str | None = None,
              execute=None, installer=npm_ci) -> int:
     """The `npm` of a turn. Returns an exit code, or replaces the process by
-    the real npm (`execute`, `os.execve` by default) when it lets it run."""
+    the real npm (`execute`, `os.execve` by default) when it lets it run.
+
+    Nothing marks the real npm as "already wrapped": `real_npm` never returns
+    the wrapper, so there is no recursion, and an `npm ci` run by a script of
+    `npm run …` comes back through the wrapper like any other."""
     env = dict(os.environ if env is None else env)
     cwd = os.getcwd() if cwd is None else cwd
     real = real_npm(env)
@@ -738,38 +857,39 @@ def npm_shim(args: list[str], *, env: dict | None = None, cwd: str | None = None
             _say("no npm found on PATH")
             return 127
         run = execute or os.execve
-        return run(real, [real] + list(args), dict(env, **{PASSTHROUGH_ENV: "1"})) or 0
+        return run(real, [real] + list(args), env) or 0
 
     mode = (env.get(DEPS_ENV) or "").strip().lower()
-    if env.get(PASSTHROUGH_ENV) or mode in ("off", "0", "no", "none"):
+    if mode in ("off", "0", "no", "none"):
         return passthrough()
-    command, positional, options = _npm_words(args)
-    if command not in INSTALL_COMMANDS:
-        return passthrough()
-    if any(o.split("=")[0] in ("-g", "--global", "--location") for o in options):
-        return passthrough()                      # outside any worktree
-    if mode != "allow-review" and is_review_worktree(cwd):
+    command, positional, options, values = _npm_words(args)
+    if command not in INSTALL_COMMANDS or _global(options, values):
+        return passthrough()                      # global: outside any worktree
+    where = cwd
+    if values.get("--prefix"):
+        where = os.path.join(cwd, os.path.expanduser(values["--prefix"]))
+    if mode != "allow-review" and (is_review_worktree(where) or is_review_worktree(cwd)):
         _say("`npm %s` refused in a review worktree (%s): reviews get no dependencies "
              "(#248); run the tests in your main worktree (check out the branch "
              "there). AMEESH_DEPS=allow-review to override."
-             % (command, worktree_root(cwd) or cwd))
+             % (command, worktree_root(where) or where))
         return 1
-    if any(o.split("=")[0] in ("--prefix", "-C", "-w", "--workspace", "--workspaces")
-           for o in options):
-        return passthrough()
-    pkg = package_dir(cwd)
+    pkg = package_dir(where)
     if pkg is None or not os.path.isfile(os.path.join(pkg, LOCKFILE)):
         return passthrough()
     link = os.path.join(pkg, NODE_MODULES)
     ci = command in ("ci", "clean-install", "install-clean", "isntall-clean", "ic")
     plain = ci or (command not in ("install-test", "it", "install-ci-test", "cit")
                    and not positional)
-    neutral = all(o in NEUTRAL_OPTIONS or o.startswith("--loglevel") for o in options)
-    if plain and neutral and lock_in_sync(pkg):
+    other = [o for o in options if o.partition("=")[0] not in ("--prefix", "-C")]
+    neutral = all(o in NEUTRAL_OPTIONS or o.startswith("--loglevel") for o in other)
+    if plain and neutral and not _wants_other_tree(env) and lock_in_sync(pkg):
         try:
             cache_root = resolve_cache_root(env)
         except Exception as exc:
             _say("cache root unknown (%s): plain npm" % exc)
+            if os.path.islink(link):
+                os.unlink(link)
             return passthrough()
         if not read_marker(entry_of(nm_root(cache_root), cache_key(pkg))):
             _say("filling the shared node_modules of %s once for this lockfile "
@@ -791,8 +911,17 @@ def npm_shim(args: list[str], *, env: dict | None = None, cwd: str | None = None
 # status and garbage collection
 # --------------------------------------------------------------------------
 
-def live_links(entry: str) -> list[str]:
-    """Recorded links that still point into `entry` (stale records pruned)."""
+def _points_into(link: str, entry: str) -> bool:
+    try:
+        target = os.path.normpath(os.path.join(os.path.dirname(link), os.readlink(link)))
+    except OSError:
+        return False
+    return target.startswith(os.path.normpath(entry) + "/")
+
+
+def live_links(entry: str, *, prune: bool = True) -> list[str]:
+    """Recorded links that still point into `entry`; stale records are
+    pruned unless `prune` is false (a dry run writes nothing)."""
     links = os.path.join(entry, LINKS)
     out = []
     try:
@@ -806,18 +935,89 @@ def live_links(entry: str) -> list[str]:
                 link = fh.read().strip()
         except OSError:
             continue
-        alive = False
-        if link and os.path.islink(link):
-            target = os.path.normpath(os.path.join(os.path.dirname(link), os.readlink(link)))
-            alive = target.startswith(os.path.normpath(entry) + "/")
-        if alive:
+        if link and os.path.islink(link) and _points_into(link, entry):
             out.append(link)
-        else:
+        elif prune:
             try:
                 os.unlink(record)
             except OSError:
                 pass
     return out
+
+
+def _label_of(entry: str, marker: dict | None) -> str | None:
+    if marker and marker.get("label"):
+        return marker["label"]
+    for current, dirs, _files in os.walk(entry):
+        if NODE_MODULES in dirs:
+            return os.path.relpath(current, entry)
+        dirs[:] = [d for d in dirs if d != LINKS and not d.startswith(".")]
+    return None
+
+
+def scan_worktrees(entry: str, label: str | None, worktrees) -> list[str]:
+    """Links into `entry` found in the known worktrees (`<wt>/<label>/
+    node_modules`): what a crash, a copy or a hand-made link left unrecorded."""
+    if not label:
+        return []
+    rel = "" if label == "_root" else label
+    found = []
+    for top in worktrees or ():
+        link = os.path.join(top, rel, NODE_MODULES)
+        if os.path.islink(link) and _points_into(link, entry):
+            found.append(link)
+    return found
+
+
+def _mtime(path: str) -> float:
+    try:
+        return os.lstat(path).st_mtime
+    except OSError:
+        return 0.0
+
+
+def _gc_reason(entry: str, *, now: float, idle: float, worktrees, holders,
+               write: bool) -> str | None:
+    """Why `entry` can go, or None to keep it. Read again under the lock
+    before any deletion: never trusts an earlier listing."""
+    marker = read_marker(entry)
+    label = _label_of(entry, marker)
+    links = live_links(entry, prune=write) + scan_worktrees(entry, label, worktrees)
+    if links:
+        if write:
+            for link in links:
+                _record_link(entry, link)
+            with open(os.path.join(entry, ALIVE), "w", encoding="utf-8") as fh:
+                fh.write(str(now))
+        return None
+    if marker:
+        links_dir = os.path.join(entry, LINKS)
+        try:
+            last_link = max([_mtime(os.path.join(links_dir, n))
+                             for n in os.listdir(links_dir)] or [0.0])
+        except OSError:
+            last_link = 0.0
+        since = max(float(marker.get("created") or 0), last_link,
+                    _mtime(os.path.join(entry, ALIVE)))
+        if now - since < max(idle, GRACE_S):
+            return None
+        why = "no worktree links to it since %s" % time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(since))
+    else:
+        if now - _mtime(entry) < PARTIAL_MIN_AGE_S:
+            return None
+        why = "partial fill (no %s)" % COMPLETE
+    try:
+        users = holders(entry)
+    except platform.NotAvailable:
+        return None                        # cannot tell: kept (fail-closed)
+    if users:
+        return None                        # a dev server, a test run…
+    return why
+
+
+def _holders(entry: str) -> list[dict]:
+    return platform.holders(entry, mapped=True)
 
 
 def entries(cache_root: str) -> list[dict]:
@@ -849,28 +1049,44 @@ def entries(cache_root: str) -> list[dict]:
 
 
 def gc_node_modules(cache_root: str, *, now: float | None = None,
-                    idle: float = DEFAULT_DEPS_IDLE_S, dry_run: bool = False) -> list[dict]:
-    """Delete the entries no worktree links to any more, idle for `idle`
-    seconds (since their creation and their last link), and partial ones left
-    by a dead fill; each under the entry's lock, never while it is filled.
-    Returns housekeeping log lines (`kind` "deps")."""
+                    idle: float = DEFAULT_DEPS_IDLE_S, dry_run: bool = False,
+                    worktrees=None, holders=None) -> list[dict]:
+    """Delete the entries no worktree links to any more and partial ones left
+    by a dead fill. A complete entry goes only after `idle` (at least GRACE_S)
+    since its creation, its last link and the last time a link to it was seen
+    alive; never while a process uses a file in it (cwd, open file,
+    executable, mapped file: `platform.holders`), never while its lock is
+    held (a fill, through npm and its scripts, or a link being made). Links
+    are the recorded ones plus those found in `worktrees` (an iterable of
+    worktree tops, or a callable returning one, called only if an entry is a
+    candidate). Lock files are never deleted: two fillers always lock the same
+    inode. Returns housekeeping log lines (`kind` "deps")."""
     now = time.time() if now is None else float(now)
+    holders = holders or _holders
     root = nm_root(cache_root)
     out = []
+    known = None
+
+    def tops():
+        nonlocal known
+        if known is None:
+            try:
+                known = list(worktrees() if callable(worktrees) else (worktrees or ()))
+            except Exception:
+                known = []
+        return known
+
     for item in entries(cache_root):
         entry = item["path"]
-        if item["complete"]:
-            if live_links(entry):
-                continue
-            since = max(float(item["marker"].get("created") or 0), item["last_link"])
-            if now - since < idle:
-                continue
-            why = "no worktree links to it since %s" % time.strftime(
-                "%Y-%m-%d %H:%M", time.localtime(since))
-        else:
-            if now - item["mtime"] < PARTIAL_MIN_AGE_S:
-                continue
-            why = "partial fill (no %s)" % COMPLETE
+        # cheap filter first, without writing (no worktree scan unless needed)
+        if not dry_run and _gc_reason(entry, now=now, idle=idle, worktrees=(),
+                                      holders=lambda _p: [], write=False) is None:
+            continue
+        # links found by the scan are recorded (kept entries only; no dry run)
+        why = _gc_reason(entry, now=now, idle=idle, worktrees=tops(), holders=holders,
+                         write=not dry_run)
+        if why is None:
+            continue
         size = int(item["marker"].get("bytes") or 0)
         line = {"kind": "deps", "action": "deleted", "path": entry, "bytes": size,
                 "detail": why}
@@ -881,20 +1097,18 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
         if lock is None:
             continue                       # being filled or linked right now
         try:
-            if item["complete"] and live_links(entry):
+            why = _gc_reason(entry, now=now, idle=idle, worktrees=tops(), holders=holders,
+                             write=True)
+            if why is None:
                 continue
             remove_tree(entry, root)
-            try:
-                os.unlink(os.path.join(root, item["key"] + ".lock"))
-            except OSError:
-                pass
         except OSError as exc:
             out.append(dict(line, action="kept", detail="%s ; deletion failed: %s"
                             % (why, exc)))
             continue
         finally:
             lock.close()
-        out.append(line)
+        out.append(dict(line, detail=why))
     return out
 
 
@@ -949,9 +1163,10 @@ def _status(top: str, cache_root: str) -> list[dict]:
     out = []
     root = nm_root(cache_root)
     for pkg in find_packages(top):
-        key = cache_key(pkg)
+        label = package_label(pkg)
+        key = cache_key(pkg, label=label)
         link = os.path.join(pkg, NODE_MODULES)
-        target = entry_modules(root, key, package_name(pkg))
+        target = entry_modules(root, key, label)
         if os.path.islink(link):
             state = "linked" if os.readlink(link) == target else "stale-link"
         elif os.path.lexists(link):

@@ -1978,10 +1978,20 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
         if result["over_quota"]:
             skipped.append("caches : quota encore dépassé (fichiers de moins d'une heure)")
     # 2b. #248: node_modules shared per lockfile, entries no worktree links to
-    if policy.deps and os.path.isdir(croot) and _managed(croot):
+    if policy.deps and registered is None:
+        skipped.append("deps : registre illisible, worktrees inconnus, aucune suppression")
+    elif policy.deps and os.path.isdir(croot) and _managed(croot):
         from . import deps as deps_mod
+        def known_worktrees() -> list[str]:
+            # every worktree of the agents' repositories: links nobody
+            # recorded are found there before an entry is deleted
+            tops: set = set()
+            for cwd in sorted(protected):
+                tops.update(w["path"] for w in list_worktrees(cwd) if not w.get("bare"))
+            return sorted(tops | protected)
+
         for line in deps_mod.gc_node_modules(croot, now=now, idle=policy.deps_idle,
-                                             dry_run=dry_run):
+                                             dry_run=dry_run, worktrees=known_worktrees):
             if line["action"] == "would-delete":
                 plan.append({"kind": "deps", "path": line["path"], "action": "suppression",
                              "bytes": line["bytes"], "detail": line["detail"]})
