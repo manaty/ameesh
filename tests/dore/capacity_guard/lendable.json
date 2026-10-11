@@ -1,0 +1,218 @@
+{
+ "schema": "ameesh-capacity-golden/1",
+ "family": "lendable",
+ "constants": {
+  "margin": 0.5,
+  "warmup_s": 86400,
+  "warmup_memory_fraction": 0.25,
+  "warmup_cpu": 1.0,
+  "disk_reserve_bytes": 2147483648,
+  "cpu_decimals": 2
+ },
+ "cases": [
+  {
+   "why": "a week of history, every cap of the offer above or at the formula",
+   "reading": {
+    "cpu_count": 8,
+    "app_cpu": 1.6,
+    "mem_total_bytes": 34359738368,
+    "mem_available_bytes": 19327352832,
+    "guest_mem_bytes": 6442450944,
+    "disk_free_bytes": 107374182400
+   },
+   "history": {
+    "min_free_mem_bytes": 21474836480,
+    "app_cpu_p95": 2.0,
+    "span_s": 604800.0
+   },
+   "offer": {
+    "cpu_max": 3.0,
+    "memory_max": 15032385536,
+    "disk_max": 85899345920
+   },
+   "lendable": {
+    "cpu": 3.0,
+    "memory_bytes": 10737418240,
+    "disk_bytes": 85899345920
+   }
+  },
+  {
+   "why": "the offer binds memory and CPU",
+   "reading": {
+    "cpu_count": 16,
+    "app_cpu": 1.0,
+    "mem_total_bytes": 68719476736,
+    "mem_available_bytes": 53687091200,
+    "guest_mem_bytes": 0,
+    "disk_free_bytes": 53687091200
+   },
+   "history": {
+    "min_free_mem_bytes": 42949672960,
+    "app_cpu_p95": 1.3,
+    "span_s": 604800.0
+   },
+   "offer": {
+    "cpu_max": 3.0,
+    "memory_max": 15032385536,
+    "disk_max": 85899345920
+   },
+   "lendable": {
+    "cpu": 3.0,
+    "memory_bytes": 15032385536,
+    "disk_bytes": 51539607552
+   }
+  },
+  {
+   "why": "CPU from the 95th percentile, below the cap",
+   "reading": {
+    "cpu_count": 6,
+    "app_cpu": 0.5,
+    "mem_total_bytes": 17179869184,
+    "mem_available_bytes": 10737418240,
+    "guest_mem_bytes": 0,
+    "disk_free_bytes": 32212254720
+   },
+   "history": {
+    "min_free_mem_bytes": 8589934592,
+    "app_cpu_p95": 1.3,
+    "span_s": 604800.0
+   },
+   "offer": {
+    "cpu_max": 3.0,
+    "memory_max": 15032385536,
+    "disk_max": 85899345920
+   },
+   "lendable": {
+    "cpu": 2.35,
+    "memory_bytes": 4294967296,
+    "disk_bytes": 30064771072
+   }
+  },
+  {
+   "why": "the current reading is the lowest free memory",
+   "reading": {
+    "cpu_count": 8,
+    "app_cpu": 2.0,
+    "mem_total_bytes": 34359738368,
+    "mem_available_bytes": 5368709120,
+    "guest_mem_bytes": 1073741824,
+    "disk_free_bytes": 107374182400
+   },
+   "history": {
+    "min_free_mem_bytes": 21474836480,
+    "app_cpu_p95": 2.0,
+    "span_s": 604800.0
+   },
+   "offer": {
+    "cpu_max": 3.0,
+    "memory_max": 15032385536,
+    "disk_max": 85899345920
+   },
+   "lendable": {
+    "cpu": 3.0,
+    "memory_bytes": 3221225472,
+    "disk_bytes": 85899345920
+   }
+  },
+  {
+   "why": "under a day of history: one CPU and a quarter of the memory at most",
+   "reading": {
+    "cpu_count": 8,
+    "app_cpu": 1.0,
+    "mem_total_bytes": 34359738368,
+    "mem_available_bytes": 32212254720,
+    "guest_mem_bytes": 0,
+    "disk_free_bytes": 107374182400
+   },
+   "history": {
+    "min_free_mem_bytes": 30064771072,
+    "app_cpu_p95": 1.0,
+    "span_s": 3600.0
+   },
+   "offer": {
+    "cpu_max": 3.0,
+    "memory_max": 15032385536,
+    "disk_max": 85899345920
+   },
+   "lendable": {
+    "cpu": 1.0,
+    "memory_bytes": 8589934592,
+    "disk_bytes": 85899345920
+   }
+  },
+  {
+   "why": "the application uses more than the host: nothing, never negative",
+   "reading": {
+    "cpu_count": 4,
+    "app_cpu": 4.5,
+    "mem_total_bytes": 8589934592,
+    "mem_available_bytes": 0,
+    "guest_mem_bytes": 0,
+    "disk_free_bytes": 1073741824
+   },
+   "history": {
+    "min_free_mem_bytes": 0,
+    "app_cpu_p95": 4.5,
+    "span_s": 604800.0
+   },
+   "offer": {
+    "cpu_max": 3.0,
+    "memory_max": 15032385536,
+    "disk_max": 85899345920
+   },
+   "lendable": {
+    "cpu": 0.0,
+    "memory_bytes": 0,
+    "disk_bytes": 0
+   }
+  },
+  {
+   "why": "no percentile yet: the current application CPU",
+   "reading": {
+    "cpu_count": 4,
+    "app_cpu": 1.0,
+    "mem_total_bytes": 8589934592,
+    "mem_available_bytes": 6442450944,
+    "guest_mem_bytes": 0,
+    "disk_free_bytes": 10737418240
+   },
+   "history": {
+    "min_free_mem_bytes": null,
+    "app_cpu_p95": null,
+    "span_s": 172800.0
+   },
+   "offer": {
+    "cpu_max": 2.0,
+    "memory_max": 2147483648,
+    "disk_max": 21474836480
+   },
+   "lendable": {
+    "cpu": 1.5,
+    "memory_bytes": 2147483648,
+    "disk_bytes": 8589934592
+   }
+  },
+  {
+   "why": "every measure missing: no lendable capacity (null), never guessed",
+   "reading": {
+    "cpu_count": null,
+    "app_cpu": null,
+    "mem_total_bytes": 8589934592,
+    "mem_available_bytes": null,
+    "guest_mem_bytes": null,
+    "disk_free_bytes": null
+   },
+   "history": {
+    "min_free_mem_bytes": null,
+    "app_cpu_p95": null,
+    "span_s": 604800.0
+   },
+   "offer": {
+    "cpu_max": 3.0,
+    "memory_max": 15032385536,
+    "disk_max": 85899345920
+   },
+   "lendable": null
+  }
+ ]
+}

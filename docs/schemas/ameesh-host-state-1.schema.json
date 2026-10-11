@@ -1,0 +1,470 @@
+{
+ "$schema": "https://json-schema.org/draft/2020-12/schema",
+ "$id": "https://github.com/manaty/ameesh/blob/main/docs/schemas/ameesh-host-state-1.schema.json",
+ "title": "ameesh-host-state/1",
+ "description": "The state a capacity guard writes for its guest (docs/GARDE-DE-CAPACITE.md). Every field after `seq` is optional; a reader ignores the fields it does not know, so the object stays open. An unreadable or expired state is `stopped` on a lending host.",
+ "type": "object",
+ "required": [
+  "schema",
+  "state",
+  "seq"
+ ],
+ "additionalProperties": true,
+ "properties": {
+  "schema": {
+   "const": "ameesh-host-state/1"
+  },
+  "state": {
+   "enum": [
+    "available",
+    "draining",
+    "stopped"
+   ]
+  },
+  "seq": {
+   "type": "integer",
+   "minimum": 0,
+   "description": "grows at each write"
+  },
+  "until_ts": {
+   "type": [
+    "number",
+    "null"
+   ],
+   "description": "epoch s: the nearer of the end of the window and the end of the job"
+  },
+  "drain_deadline_ts": {
+   "type": [
+    "number",
+    "null"
+   ],
+   "description": "epoch s: in `draining`, turns are preempted past it"
+  },
+  "expires_ts": {
+   "type": [
+    "number",
+    "null"
+   ],
+   "description": "epoch s: past it the state is unreadable, so `stopped`; rewritten every third of its life"
+  },
+  "reason": {
+   "type": [
+    "string",
+    "null"
+   ],
+   "description": "free text; the values of docs/GARDE-DE-CAPACITE.md have a fixed meaning"
+  },
+  "caps": {
+   "type": "object",
+   "additionalProperties": true,
+   "properties": {
+    "max_concurrent": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "cpu_share": {
+     "type": "number",
+     "exclusiveMinimum": 0,
+     "maximum": 1,
+     "description": "share of the host's CPUs: quota cpu_share x cpu_count"
+    },
+    "memory_mb": {
+     "type": "integer",
+     "minimum": 0,
+     "description": "hard cap of the whole guest"
+    },
+    "cpu_weight": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 10000
+    },
+    "io_weight": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 10000
+    },
+    "memory_high_mb": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "agent_memory_mb": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "disk_mb": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "tmp_mb": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "max_job_s": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "enforced": {
+     "type": "array",
+     "uniqueItems": true,
+     "items": {
+      "enum": [
+       "max_concurrent",
+       "cpu_share",
+       "memory_mb",
+       "cpu_weight",
+       "io_weight",
+       "memory_high_mb",
+       "agent_memory_mb",
+       "disk_mb",
+       "tmp_mb",
+       "max_job_s"
+      ]
+     },
+     "description": "the caps the guard enforces itself (kernel, hypervisor); the others are indicative"
+    }
+   }
+  },
+  "freeze": {
+   "type": [
+    "object",
+    "null"
+   ],
+   "required": [
+    "since_ts",
+    "until_ts"
+   ],
+   "additionalProperties": true,
+   "properties": {
+    "since_ts": {
+     "type": "number"
+    },
+    "until_ts": {
+     "type": "number"
+    }
+   },
+   "description": "turns frozen by the guard (tier 2), 60 s at most; not counted in turn deadlines"
+  },
+  "windows": {
+   "type": "array",
+   "items": {
+    "type": "object",
+    "required": [
+     "start_ts",
+     "end_ts"
+    ],
+    "additionalProperties": true,
+    "properties": {
+     "start_ts": {
+      "type": "number"
+     },
+     "end_ts": {
+      "type": "number"
+     }
+    }
+   }
+  },
+  "offer": {
+   "type": [
+    "object",
+    "null"
+   ],
+   "additionalProperties": true,
+   "description": "the offer in force (policy.lend on a VM, the consented ComputeOffer on a device)",
+   "properties": {
+    "cpu_max": {
+     "type": "number",
+     "exclusiveMinimum": 0
+    },
+    "memory_max": {
+     "type": "integer",
+     "minimum": 1
+    },
+    "disk_max": {
+     "type": "integer",
+     "minimum": 1
+    }
+   }
+  },
+  "measure": {
+   "type": [
+    "object",
+    "null"
+   ],
+   "additionalProperties": true,
+   "description": "the common measure; every key present, null when not measured, never guessed",
+   "properties": {
+    "ts": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "window_s": {
+     "type": [
+      "number",
+      "null"
+     ]
+    },
+    "cpu_count": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "app_cpu": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "guest_cpu": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "mem_total_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "mem_available_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "swap_used_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "guest_mem_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "psi": {
+     "type": [
+      "object",
+      "null"
+     ],
+     "additionalProperties": true,
+     "properties": {
+      "cpu_some": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 100
+      },
+      "mem_some": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 100
+      },
+      "mem_full": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 100
+      },
+      "io_some": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 100
+      }
+     }
+    },
+    "app_psi": {
+     "type": [
+      "object",
+      "null"
+     ],
+     "additionalProperties": true,
+     "properties": {
+      "cpu_some": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 100
+      },
+      "mem_some": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 100
+      },
+      "mem_full": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 100
+      },
+      "io_some": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0,
+       "maximum": 100
+      }
+     }
+    },
+    "disk_free_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "app_disk_free_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "tmp_path": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "tmp_fstype": {
+     "type": [
+      "string",
+      "null"
+     ]
+    },
+    "tmp_size_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "tmp_used_bytes": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "on_ac": {
+     "type": [
+      "boolean",
+      "null"
+     ]
+    },
+    "battery_percent": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0,
+     "maximum": 100
+    },
+    "metered": {
+     "type": [
+      "boolean",
+      "null"
+     ]
+    },
+    "user_idle_s": {
+     "type": [
+      "number",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "busy": {
+     "type": [
+      "integer",
+      "null"
+     ],
+     "minimum": 0
+    },
+    "lendable": {
+     "type": [
+      "object",
+      "null"
+     ],
+     "additionalProperties": true,
+     "properties": {
+      "cpu": {
+       "type": [
+        "number",
+        "null"
+       ],
+       "minimum": 0
+      },
+      "memory_bytes": {
+       "type": [
+        "integer",
+        "null"
+       ],
+       "minimum": 0
+      },
+      "disk_bytes": {
+       "type": [
+        "integer",
+        "null"
+       ],
+       "minimum": 0
+      }
+     }
+    }
+   }
+  },
+  "guard": {
+   "type": [
+    "object",
+    "null"
+   ],
+   "additionalProperties": true,
+   "properties": {
+    "kind": {
+     "enum": [
+      "ameesh-guard",
+      "nexlink-compute"
+     ]
+    },
+    "version": {
+     "type": "string"
+    },
+    "host_kind": {
+     "enum": [
+      "vm",
+      "device"
+     ]
+    }
+   }
+  }
+ }
+}

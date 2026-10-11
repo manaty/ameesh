@@ -78,7 +78,12 @@ the `{agent}` template (`/srv/acme/acme-web-{agent}`: one worktree per agent).
 See [Runner and leases](runner-and-leases.md#working-directory) for the
 transitional fallback and what the runner does when the directory is missing,
 and [host resources](runner-and-leases.md#host-resources-and-back-pressure) for
-`policy.resources`.
+`policy.resources`. A host that lends its unused capacity to agents declares
+its offer in `policy.lend` (CPUs, memory and disk at most, windows, the
+application's thresholds at which agents give way); `canon check` validates
+it, and an unreadable offer lends nothing. The contract shared with the
+device runners is
+[docs/GARDE-DE-CAPACITE.md](https://github.com/manaty/ameesh/blob/main/docs/GARDE-DE-CAPACITE.md).
 
 ## `Placement`: which agent may run where
 
