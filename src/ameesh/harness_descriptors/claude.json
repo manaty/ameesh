@@ -19,7 +19,9 @@
       "flag": ["--permission-mode", "{mode}"],
       "default": "auto",
       "env": ["AMEESH_CLAUDE_PERMISSION_MODE"],
-      "fallback": "acceptEdits"
+      "fallback": "acceptEdits",
+      "choices": ["acceptEdits", "auto", "manual", "dontAsk", "plan", "bypassPermissions"],
+      "explicit_only": ["bypassPermissions"]
     },
     "session": {"flag": ["--resume"]},
     "stream": "claude-stream-json",

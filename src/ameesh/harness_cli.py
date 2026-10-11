@@ -91,6 +91,11 @@ def _show_text(descriptor: harnesses.HarnessDescriptor) -> None:
                 " ".join(regle["flag"]), regle["default"] or "—",
                 ", env : %s" % ", ".join(regle["env"]) if regle["env"] else "",
                 ", repli : %s" % regle["fallback"] if regle["fallback"] else ""))
+            if regle.get("choices"):
+                print("modes admis    : %s%s" % (
+                    ", ".join(regle["choices"]),
+                    " (%s : réglage de l'agent seulement)" % ", ".join(regle["explicit_only"])
+                    if regle.get("explicit_only") else ""))
     else:
         print("interactif     : non déclaré (attach indisponible)")
     print("session        : %s" % (" ".join(descriptor.session_flag) or "— (ACP)"))
