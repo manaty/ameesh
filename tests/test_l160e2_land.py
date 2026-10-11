@@ -17,7 +17,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import land, mail, merge_queue, radar, storage, work
+from ameesh import land, mail, merge_queue, radar, resolutions, storage, work
 
 from .support import PgTestCase
 from .test_l160b_radar import MIG, _git
@@ -71,6 +71,11 @@ class _Land(_Base):
                                   self.sent.append((to, body, kw)) or len(self.sent))
         patch.start()
         self.addCleanup(patch.stop)
+
+    def enter(self, lot, ci=None):
+        """Admission fetches origin into the radar's clone (L160e1)."""
+        clone = resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p"))
+        return merge_queue.enter(None, lot, repo=self.repo, actor="orch", ci=ci, clone=clone)
 
     def queued(self, lot):
         self.ready(lot)
