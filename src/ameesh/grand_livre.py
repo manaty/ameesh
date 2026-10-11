@@ -262,13 +262,24 @@ def plan(rows: Iterable[dict], *, prices: dict,
 
 
 def _claude_cumul(first: dict, others: list, prices: dict, fix, repriced: dict) -> None:
-    """Claude : le premier relevé de la session vaut-il tout son cumul ?"""
+    """Claude : le premier relevé de la session vaut-il tout son cumul ?
+
+    Le grand livre ne garde pas les écritures de cache (facturées au tour, L225) :
+    le coût par les jetons n'en est qu'un minorant. Une écriture de cache est
+    relue par la suite, d'où sa borne : la plus forte relecture de la session,
+    au prix d'écriture le plus cher (×2). Seul relevé de sa session : rien ne
+    borne ses écritures, son total est gardé."""
     cum = first.get("cum_usd")
     usd = float(first.get("usd") or 0.0)
-    if cum is None or usd <= 0 or abs(usd - float(cum)) > 1e-6:
+    if cum is None or usd <= 0 or abs(usd - float(cum)) > 1e-6 or not others:
         return
     tokens = _tokens(first)
     model = first.get("model") or ""
+    triplet = cost_mod.price_for(prices, "claude", model)[0]
+    if triplet is None:
+        return                          # L225 : aucun barème, pas d'estimation
+    written = max(int(r.get("cached_input_tokens") or 0) for r in [first, *others])
+    allowance = written * triplet[0] * cost_mod.CACHE_WRITE_1H / 1e6
     known = cost_mod.known_price(prices, model)
     if known:
         estimate = _usd("claude", tokens, known)
@@ -281,12 +292,10 @@ def _claude_cumul(first: dict, others: list, prices: dict, fix, repriced: dict) 
             estimate = (tokens[0] + tokens[1]) * spent / read
             how = "coût par jeton relu des %d autres tours de la session" % len(others)
         else:
-            majorant = cost_mod.price_for(prices, "claude", None)[0]
-            if majorant is None:
-                return                  # L225 : aucun barème, pas d'estimation
-            estimate = _usd("claude", tokens, majorant)
+            estimate = _usd("claude", tokens, triplet)
             how = "tarif le plus cher connu"
-    if usd <= CUMUL_FACTOR * estimate or usd - estimate <= CUMUL_MIN_USD:
+    if usd <= CUMUL_FACTOR * estimate + allowance \
+            or usd - estimate - allowance <= CUMUL_MIN_USD:
         return
     fix(first, "cumul", "coût cumulé de la session reprise (%.2f $) compté pour un tour ; "
         "ré-estimé par ses jetons (%s)" % (usd, how), usd=round(estimate, 6))

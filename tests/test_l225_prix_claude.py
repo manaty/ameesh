@@ -24,7 +24,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import cost, exploitation, notify
+from ameesh import cost, exploitation, grand_livre, notify
 
 from .support import PgTestCase
 from .test_cost import Sandbox
@@ -217,6 +217,64 @@ class SansTarifTest(Sandbox, PgTestCase):
         self.book().record(nom, model="modele-x")
         plus_tard = time.time() + exploitation.UNPRICED_WINDOW_S + 60
         self.assertEqual(self._alertes(now=plus_tard), [])
+
+
+def _ligne(ident, usd, ts, **extra):
+    row = {"id": ident, "agent": "c1", "harness": "claude", "turn": "messages",
+           "model": "claude-opus-5-5", "session": "s1", "account": None, "usd": usd,
+           "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
+           "cum_usd": None, "cum_input_tokens": None, "cum_cached_input_tokens": None,
+           "cum_output_tokens": None, "recorded_ts": ts, "void_reason": None}
+    row.update(extra)
+    return row
+
+
+class CumulEtEcrituresDeCacheTest(unittest.TestCase):
+    """`cost correct` ne ramène pas un premier tour à ses seuls jetons : le
+    grand livre ne garde pas ses écritures de cache (relecture codex P1)."""
+
+    def _plan(self, rows):
+        return grand_livre.plan(rows, prices=cost.DEFAULT_PRICES)
+
+    def test_premier_tour_seul_garde_ses_ecritures_de_cache(self):
+        # 600 000 jetons écrits en cache (×1,25 de 4 $/M) + 1 entrée + 1 sortie
+        usd = 3.000024
+        self.assertEqual(self._plan([_ligne(1, usd, 1000.0, input_tokens=1,
+                                            output_tokens=1, cum_usd=usd)]), [])
+
+    def test_ecritures_relues_par_la_suite_bornent_le_premier_tour(self):
+        usd = 3.000024
+        rows = [_ligne(1, usd, 1000.0, input_tokens=1, output_tokens=1, cum_usd=usd),
+                _ligne(2, 0.13, 1060.0, input_tokens=2, cached_input_tokens=600_000,
+                       output_tokens=500, cum_usd=usd + 0.13)]
+        self.assertEqual(self._plan(rows), [])
+
+    def test_cumul_d_une_session_reprise_reste_corrige(self):
+        rows = [_ligne(1, 66.98, 1000.0, input_tokens=6, cached_input_tokens=100_000,
+                       output_tokens=892, cum_usd=66.98),
+                _ligne(2, 0.05, 1060.0, input_tokens=2, cached_input_tokens=100_000,
+                       output_tokens=300, cum_usd=67.03)]
+        plan = self._plan(rows)
+        self.assertEqual([(c["id"], c["kind"]) for c in plan], [(1, "cumul")])
+        self.assertAlmostEqual(plan[0]["after"]["usd"],
+                               _cout(cost.DEFAULT_PRICES["claude-opus-5-5"], 6, 100_000, 892),
+                               places=6)
+
+
+class CleDeTurnUnpricedTest(unittest.TestCase):
+    """Deux groupes du même agent, premiers dans la même seconde : deux
+    alertes (relecture codex P2)."""
+
+    def test_harnais_et_modele_entrent_dans_la_cle(self):
+        def alerte(harness, model):
+            return exploitation._alert("turn_unpriced", "a1", 1000.2, 1, 0, "",
+                                       harness=harness, model=model)
+        cles = {exploitation.alert_key(alerte("h1", "m1")),
+                exploitation.alert_key(alerte("h1", "m2")),
+                exploitation.alert_key(alerte("h2", "m1"))}
+        self.assertEqual(len(cles), 3)
+        self.assertEqual(exploitation.alert_key(alerte("h1", "m1")),
+                         exploitation.alert_key(alerte("h1", "m1")))
 
 
 if __name__ == "__main__":
