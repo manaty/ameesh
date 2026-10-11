@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: AGPL-3.0-only
--- 0054_ci_test_results — résultats de CI relevés en direct (L161c, étude L161).
+-- 0055_ci_test_results — résultats de CI relevés en direct (L161c, étude L161).
 --
 -- `ameesh notify`, sur l'hôte désigné (`github.host`), relève pendant les
 -- tests le check run « tests (flux) » de chaque exécution (scripts/ci-flux.py

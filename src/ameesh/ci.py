@@ -19,7 +19,7 @@ chaque passage un relevé (`Watcher.tick`) :
    pas encore reçus sont retirés sans être montrés ; un message déjà remis
    reste, car l'agent a pu agir ;
 3. pour chaque exécution suivie, les check runs « tests (flux) » de sa tête :
-   chaque échec nouveau est enregistré (`ci_test_failures`, 0054) ;
+   chaque échec nouveau est enregistré (`ci_test_failures`, 0055) ;
 4. une exécution qui n'est plus en cours est conclue : verdict.
 
 Courrier, de `ameesh` à l'assigné du lot, rangé dans le fil du lot, selon

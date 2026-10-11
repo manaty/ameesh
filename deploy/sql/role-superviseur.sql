@@ -330,7 +330,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L63 (0048) : heure de démarrage du PID lié, secondes epoch
         'pid_started_at'
     ]),
-    -- L161c (0054) : exécutions de CI relevées et leurs tests en échec (de
+    -- L161c (0055) : exécutions de CI relevées et leurs tests en échec (de
     -- l'ÉTAT : noms de tests, commandes pour rejouer ; l'extrait de sortie
     -- est un CONTENU)
     ('ci_runs', ARRAY[
@@ -370,11 +370,18 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'estimate_minutes', 'estimate_source', 'estimate_by', 'estimate_at',
         'started_at',
         -- L122 (0053) : numéro de migration réservé par le lot
-        'migration'
+        'migration',
+        -- L157b (0054) : taille déclarée du changement
+        'change_size'
     ]),
     -- L157 (0052) : historique des estimations d'un lot (de l'ÉTAT)
     ('work_item_estimates', ARRAY[
         'id', 'work_item_id', 'minutes', 'source', 'estimated_by', 'at'
+    ]),
+    -- L157b (0054) : tables de référence des durées publiées par l'auditeur
+    -- (des nombres par type, taille, hôte, harnais et estimateur : de l'ÉTAT)
+    ('estimate_references', ARRAY[
+        'id', 'published_at', 'published_by', 'body'
     ]),
     -- L40 (0031) : registre des délégations et de leur issue (de l'ÉTAT)
     ('work_item_delegations', ARRAY[

@@ -75,7 +75,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('commitments', ARRAY[
         'note'
     ]),
-    -- L161c (0054) : extrait de la sortie d'un test en échec
+    -- L161c (0055) : extrait de la sortie d'un test en échec
     ('ci_test_failures', ARRAY[
         'excerpt'
     ]),

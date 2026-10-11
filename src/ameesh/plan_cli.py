@@ -106,6 +106,11 @@ def add_parsers(work_sub, func) -> None:
                           "d'estimation (médiane, p80) — L157, pour l'auditeur")
     p_est.add_argument("--app", default=None, metavar="PROJET", help="un projet seulement")
     p_est.add_argument("--json", action="store_true", help="schéma ameesh-estimates/1")
+    p_est.add_argument("--publish", action="store_true",
+                       help="passage de l'auditeur (L157b) : calcule et publie la table de "
+                            "référence des durées (schéma ameesh-estimate-reference/1), que "
+                            "work add et work show lisent ; lève estimate_bias")
+    p_est.add_argument("--actor", default="", help="qui publie (--publish)")
     p_est.set_defaults(func=func)
 
     p_proj = work_sub.add_parser(
@@ -132,6 +137,17 @@ def run(db, args: argparse.Namespace) -> int:
         return _plan(db, args)
     if command == "estimates":
         from . import estimates
+        if args.publish:
+            if args.app:
+                print("erreur : --publish couvre tous les projets (sans --app)",
+                      file=sys.stderr)
+                return 2
+            row = estimates.publish(db, actor=args.actor)
+            if args.json:
+                print(json.dumps(row, ensure_ascii=False, indent=2))
+            else:
+                print(estimates.format_published(row))
+            return 0
         report = estimates.report(db, app=args.app)
         if args.json:
             print(json.dumps(report, ensure_ascii=False, indent=2))

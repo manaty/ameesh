@@ -56,7 +56,7 @@ CONTENUS = {
     "work_item_milestones": {"note"},
     "mesh_approvals": {"meta"},
     "mesh_approvals_status": {"meta"},
-    # L161c (0054) : sortie d'un test en échec
+    # L161c (0055) : sortie d'un test en échec
     "ci_test_failures": {"excerpt"},
 }
 #: colonnes refusées au rôle de base. Une colonne nouvelle, ni accordée ni

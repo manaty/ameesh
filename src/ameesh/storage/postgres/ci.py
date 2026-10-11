@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Pilote Postgres : résultats de CI relevés en direct (`ci_runs`,
-`ci_test_failures`, 0054, L161c)."""
+`ci_test_failures`, 0055, L161c)."""
 from __future__ import annotations
 
 import json

@@ -101,6 +101,7 @@ un avertissement.
 | Estimer ou ré-estimer un lot existant | `ameesh work plan <id> --estimate 1h30 --estimate-source "revue du découpage"` |
 | Voir l'estimation, le réel et l'écart | `ameesh work show <id>`, `ameesh projects` (colonne DURÉE) |
 | Écarts passés, pour calibrer | `ameesh work estimates [--app <projet>]` |
+| Estimation de référence (table de l'auditeur) | affichée par `ameesh work add` et `ameesh work show` ; `--size s\|m\|l` à la création |
 
 * La durée est du temps **écoulé** (horloge murale), du début du travail à
   la fusion, attentes comprises : `90m`, `2h`, `1h30`, `1,5h`, `2d` (48 h),
@@ -108,11 +109,36 @@ un avertissement.
 * Le **début** est mesuré par ameesh : premier passage du lot en `build`, ou
   premier tour de l'agent assigné sur le lot ; la **fin** est la fusion.
   Rien à déclarer.
-* Estimer depuis l'historique : `ameesh work estimates` donne, par type de
-  lot et par auteur d'estimation, la médiane et le p80 du ratio réel/estimé
-  sur les lots livrés. Un ratio médian de ×1,4 sur les bugs veut dire :
-  multiplier l'intuition par 1,4. La source dit d'où vient le chiffre
-  (« historique bug ×1,4 »).
+* **Partir de l'estimation de référence** (L157b). Constat du propriétaire
+  (2026-10-11) : « tu estimes 10 fois trop les tâches d'agents ». À son
+  passage quotidien, l'auditeur publie une table de référence tirée des lots
+  livrés : par type de lot, taille du changement, hôte et harnais de
+  l'assigné, la médiane et le p80 de la durée réelle. `ameesh work add`
+  l'affiche à la création (« référence : médiane 25 min · p80 40 min
+  (evolution, moyen, 12 lots ; table du … par auditeur) ») et `ameesh work
+  show` la rappelle ; ameesh la lit, sans rien recalculer. Déclarer la taille
+  du changement (`--size s|m|l` : petit, moyen, gros) et l'assigné affine le
+  groupe ; faute de trois lots semblables, ameesh remonte au groupe
+  plus large (type et taille, puis type, puis tous les lots). On s'écarte
+  de la référence **en le justifiant** dans la source
+  (`--estimate-source "référence ×2 : migration de données"`).
+* **Estimer par phases.** Une estimation additionne, et sa source détaille,
+  les phases jusqu'à la fusion : **agent** (travail de l'agent), **CI**
+  (passages de la CI, file d'attente comprise), **relecture** (attente de la
+  relecture et de la fusion), **humain** (gestes humains : décision,
+  signature, déploiement). Exemple : `--estimate 45m --estimate-source
+  "agent 25 min + CI 2×8 min + relecture 5 min"`. Le travail d'un agent est
+  court ; ce sont les attentes qui allongent un lot.
+* **Le biais de chaque estimateur est suivi.** Le passage de l'auditeur range
+  dans la table, pour chaque auteur d'estimation, le ratio réel/estimé
+  (médiane, p80) ; hors de ×0,5–×2 sur au moins trois lots, l'alerte
+  `estimate_bias` part à l'estimateur et aux orchestrateurs de son équipe
+  (courrier `event`). Elle dure jusqu'à la publication suivante qui ne le
+  relève plus. `ameesh work estimates` donne aussi les écarts par type de
+  lot et par auteur.
+* **La consigne d'un lot** demande, dans le message de fin, la durée réelle
+  et, si elle s'écarte de l'estimation, la phase qui l'explique (agent, CI,
+  relecture, humain).
 * L'estimation comparée au réel est celle **en vigueur au début** du travail :
   ré-estimer en cours de route est permis et tracé, mais ne corrige pas
   l'écart. L'auditeur interne audite ces écarts et ajuste le processus
