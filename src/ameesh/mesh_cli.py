@@ -799,6 +799,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "backlog":   # file d'amélioration (L119, 0037)
             from . import backlog
             return backlog.run(db, args)
+        if args.work_command == "unrecorded":   # demandes d'humains sans lot (L130)
+            from . import unrecorded
+            return unrecorded.run(cfg, db, args)
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
@@ -809,10 +812,12 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 body=args.body or "", issue_ref=args.issue_ref, workstream=args.workstream,
                 assignee=args.assignee, budget_usd=args.budget, actor=args.actor,
                 package=args.package, externe=args.externe, cfg=cfg,
-                branch=args.branch, branch_target=args.target)
-            print("lot #%d créé en %s : %s%s" % (
+                branch=args.branch, branch_target=args.target, priority=args.priority)
+            print("lot #%d créé en %s : %s%s%s" % (
                 item["id"], item["state"], item["title"],
-                " (plan : %s)" % item["package_id"] if item.get("package_id") else ""))
+                " (plan : %s)" % item["package_id"] if item.get("package_id") else "",
+                " (priorité %s)" % work.PRIORITY_LABELS.get(item.get("priority"))
+                if item.get("priority") else ""))
             _print_assignment(check)
             return 0
         if args.work_command == "assign":
@@ -932,6 +937,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s boucles : %-3s budget : %s" % (
                 item.get("issue_ref") or "—", item.get("loops"), _budget(item)))
+            if item.get("priority"):
+                print("priorité : %s (%s)" % (
+                    item["priority"], work.PRIORITY_LABELS.get(item["priority"], "?")))
             if item.get("package_id") or item.get("epic"):
                 print("plan     : fiche %-12s epic : %s" % (
                     item.get("package_id") or "—", item.get("epic") or "—"))
@@ -1608,6 +1616,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--target", default=None,
                         help="branche cible (défaut : git config ameesh.target du dépôt, "
                              "sinon origin/HEAD)")
+    pw_add.add_argument("--priority", type=int, choices=list(work.PRIORITIES), default=None,
+                        help="1 haute, 2 normale, 3 basse (L130 : toute demande d'un "
+                             "humain devient un lot, avec sa priorité)")
     pw_add.set_defaults(func=cmd_work)
     pw_list = work_sub.add_parser("list")
     pw_list.add_argument("--state", default=None)
@@ -1696,6 +1707,8 @@ def build_parser() -> argparse.ArgumentParser:
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)
     from . import backlog
     backlog.add_parsers(work_sub, cmd_work)  # file d'amélioration (L119, 0037)
+    from . import unrecorded
+    unrecorded.add_parser(work_sub, cmd_work)  # demandes d'humains sans lot (L130)
 
     p_cost = sub.add_parser("cost", help="coût des tours et jauges de forfait (L12)")
     cost_sub = p_cost.add_subparsers(dest="cost_command")

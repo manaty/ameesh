@@ -323,6 +323,35 @@ class Mailbox(interface.Mailbox):
             "SELECT count(*)::int AS n FROM agent_mailbox WHERE delivered_at IS NULL"
         )[0]["n"]
 
+    # -- demandes d'humains sans lot (L130) -----------------------------------
+    def human_messages(self, *, since_ts, humans, limit) -> list[dict]:
+        names = sorted({str(n) for n in humans or () if str(n).strip()})
+        declared = (" OR m.sender IN (%s)" % ", ".join(["%s"] * len(names))) if names else ""
+        rows = self.db.query(
+            """
+            SELECT m.id, m.sender, m.recipient, m.body, m.kind, m.payload,
+                   m.work_item_id, w.id AS lot_id,
+                   extract(epoch from m.created_at)::float8 AS created_ts
+              FROM agent_mailbox m
+              LEFT JOIN work_items w
+                ON w.id = CASE WHEN btrim(coalesce(m.work_item_id, '')) ~ '^[0-9]{1,18}$'
+                               THEN btrim(m.work_item_id)::bigint END
+              LEFT JOIN agent_registry r ON r.name = m.sender
+             WHERE m.created_at >= to_timestamp(%s)
+               AND (starts_with(m.sender, 'human:')
+                    OR m.payload @> '{"human": true}'::jsonb
+                    OR (starts_with(m.sender, 'chat-')
+                        AND coalesce(r.mode, 'execute') = 'externe')__DECLARED__)
+               AND NOT m.payload @> '{"ack": true}'::jsonb
+               AND coalesce(m.payload ->> 'cc', '') = ''
+               AND NOT (m.kind = 'request' AND (m.payload -> 'decision') IS NOT NULL)
+             ORDER BY m.id DESC
+             LIMIT %s
+            """.replace("__DECLARED__", declared),
+            (float(since_ts), *names, int(limit)),
+        )
+        return list(reversed(rows))
+
     # -- courrier en souffrance ----------------------------------------------
     def dead_letters(self) -> list[dict]:
         return self.db.query(DEAD_LETTERS_SQL + " ORDER BY m.recipient, m.sender")

@@ -257,7 +257,7 @@ to the lot's number, otherwise it stays a plain thread label. See
 ameesh work add --title TITLE [--type bug|evolution] [--source S] [--app APP]
                 [--body BODY] [--issue-ref REF] [--workstream W]
                 [--assignee A] [--budget USD] [--actor ACTOR] [--externe]
-                [--branch agent/…] [--target BRANCH]
+                [--branch agent/…] [--target BRANCH] [--priority 1|2|3]
 ameesh work list [--state S] [--assignee A] [--limit N] [--json]
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
@@ -273,7 +273,19 @@ ameesh work backlog add --title T --value "expected value" --score 1-100
                         [--priority 1|2|3] [--source S] [--team T] [--requires CAP …]
                         [--body B] [--package FICHE] [--json]
 ameesh work backlog list [--all] [--limit N] [--json]
+ameesh work unrecorded [--since 24h|2h|7d|ISO-DATE] [--limit N] [--json]
 ```
+
+**Every human request becomes a lot** (L130). Orchestrators, design agents and
+the owner's chat record every request from a human as a lot right away, with
+the human's exact words as `--source`, a `--priority` (1 high, 2 normal,
+3 low) and an estimate, and quote the lot number in their answer.
+`work unrecorded` (read-only) lists the human messages of the period (mail
+from a human, answers to decision requests, requests relayed by the chat) that
+are attached to no lot, cite no lot (`L142`, `lot #142`, `ameesh-work: 142`)
+and whose words no recent lot quotes in its source or body; acknowledgements
+and `--cc` copies are skipped, a broadcast counts once. JSON schema
+`ameesh-unrecorded/1`. See `docs/ORCHESTRATEUR.md` and `docs/EXPLOITATION.md`.
 
 **Continuous-improvement backlog** (L119, decision 0037). `work backlog add`
 queues a lot of type `improvement` (in `intake`, unassigned); the expected

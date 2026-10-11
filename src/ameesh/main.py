@@ -20,6 +20,8 @@
   ameesh approve | approvals | verify   approbations signées ;
   ameesh work …               lots (work_items) ; `work backlog add|list` : file
         d'amélioration continue, prise par les agents au repos (L119, 0037) ;
+        `work unrecorded [--since 24h] [--json]` : demandes d'humains (courrier,
+        réponses aux décisions, chat) rattachées à aucun lot (L130) ;
   ameesh cost …               coût des tours, usage par tour, jauges et leur
         historique, solde du fournisseur payé au token (`cost turns|gauges|balance`) ;
   ameesh accounts list | use <harnais> <compte> | auto [harnais]

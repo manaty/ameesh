@@ -75,6 +75,10 @@ CORRECTOR_ROLES = ("orchestrateur", "orchestrator", "conception", "design")
 UNKNOWN_ACTOR = "inconnu"
 #: un commit de fusion déclaré (`merged --sha`)
 _SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
+#: priorités d'un lot (L130, comme la file d'amélioration L119) : 1 haute,
+#: 2 normale, 3 basse ; sans priorité, le lot n'en a pas (NULL)
+PRIORITIES = (1, 2, 3)
+PRIORITY_LABELS = {1: "haute", 2: "normale", 3: "basse"}
 
 #: colonnes rendues pour un lot (pilote Postgres ; alias de compatibilité)
 ITEM_COLUMNS = _pg.ITEM_COLUMNS
@@ -166,15 +170,20 @@ def add(
     cfg=None,
     branch: str | None = None,
     branch_target: str | None = None,
+    priority: int | None = None,
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
     L118 : `branch` (et `branch_target`) nomment la branche du lot, dont la
-    fusion le fermera (`plan_git.sync_branches`)."""
+    fusion le fermera (`plan_git.sync_branches`). L130 : `priority` (1 haute,
+    2 normale, 3 basse, comme la file d'amélioration), pour enregistrer une
+    demande d'humain avec sa priorité."""
     if type not in ("bug", "evolution"):
         raise WorkError("type inconnu : %r (bug ou evolution)" % type)
     if not (title or "").strip():
         raise WorkError("titre obligatoire")
+    if priority is not None and priority not in PRIORITIES:
+        raise WorkError("priorité 1 (haute), 2 (normale) ou 3 (basse) : %r" % (priority,))
     if assignee:
         # L46 : l'assigné enregistré est celui que la garde a normalisé
         assignee = check_assignee(db, assignee, externe=externe, cfg=cfg)["assignee"]
@@ -188,7 +197,7 @@ def add(
         budget_usd=budget_usd, note="création" + (" (plan : %s)" % package if package else ""),
         actor=actor, package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
-        branch=branch, branch_target=branch_target)
+        branch=branch, branch_target=branch_target, priority=priority)
 
 
 # --------------------------------------------------------------------------
