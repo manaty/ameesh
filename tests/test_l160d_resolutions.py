@@ -423,12 +423,12 @@ class ResolutionsDbTest(PgTestCase):
                                                 ref=None, files=[], note="", actor=""))
         notes = [e["note"] for e in work.events(self.db, b)]
         self.assertIn("resolution prepared with #%d" % a, notes)
-        shown = self.cli("work", "show", str(a))
+        shown = self.mesh("work", "show", str(a))
         self.assertEqual(shown.returncode, 0, shown.stderr)
         self.assertIn("résolut. : resolved by #%d: 444444444444" % b, shown.stdout)
-        data = json.loads(self.cli("work", "show", str(b), "--json").stdout)
+        data = json.loads(self.mesh("work", "show", str(b), "--json").stdout)
         self.assertEqual(data["resolutions"][0]["commit_sha"], "4" * 40)
-        listed = self.cli("work", "resolve", str(b))
+        listed = self.mesh("work", "resolve", str(b))
         self.assertIn("resolution with #%d" % a, listed.stdout)
 
     def test_cli_and_radar_pass(self):
@@ -436,12 +436,12 @@ class ResolutionsDbTest(PgTestCase):
         _identity(repo)
         a, b = self.lots()
         env = self.env(AGENT_MAIL_NAME="a2")
-        opened = self.cli("work", "resolve", str(b), "--with", str(a), "--repo", repo,
+        opened = self.mesh("work", "resolve", str(b), "--with", str(a), "--repo", repo,
                           env=env)
         self.assertEqual(opened.returncode, 0, opened.stderr)
         self.assertIn("conflicts: shared.py", opened.stdout)
         _write(resolutions.worktree_path(repo, b, a), "shared.py", RESOLVED)
-        done = self.cli("work", "resolve", str(b), "--with", str(a), "--repo", repo,
+        done = self.mesh("work", "resolve", str(b), "--with", str(a), "--repo", repo,
                         "--json", env=env)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(json.loads(done.stdout)["ref"], None)
