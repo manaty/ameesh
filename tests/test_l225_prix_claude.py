@@ -230,35 +230,77 @@ def _ligne(ident, usd, ts, **extra):
 
 
 class CumulEtEcrituresDeCacheTest(unittest.TestCase):
-    """`cost correct` ne ramène pas un premier tour à ses seuls jetons : le
-    grand livre ne garde pas ses écritures de cache (relecture codex P1)."""
+    """`cost correct` ne ramène jamais un premier tour sous son coût réel : ses
+    écritures de cache comptent (`cache_write_tokens`, 0059), et une ligne qui
+    ne les garde pas est laissée telle quelle (relectures codex P1)."""
 
     def _plan(self, rows):
         return grand_livre.plan(rows, prices=cost.DEFAULT_PRICES)
 
-    def test_premier_tour_seul_garde_ses_ecritures_de_cache(self):
-        # 600 000 jetons écrits en cache (×1,25 de 4 $/M) + 1 entrée + 1 sortie
-        usd = 3.000024
-        self.assertEqual(self._plan([_ligne(1, usd, 1000.0, input_tokens=1,
-                                            output_tokens=1, cum_usd=usd)]), [])
+    # 600 000 jetons écrits en cache (×1,25 de 4 $/M) + 1 entrée + 1 sortie
+    USD = 3.000024
 
-    def test_ecritures_relues_par_la_suite_bornent_le_premier_tour(self):
-        usd = 3.000024
-        rows = [_ligne(1, usd, 1000.0, input_tokens=1, output_tokens=1, cum_usd=usd),
-                _ligne(2, 0.13, 1060.0, input_tokens=2, cached_input_tokens=600_000,
-                       output_tokens=500, cum_usd=usd + 0.13)]
+    def test_premier_tour_seul_garde_ses_ecritures_de_cache(self):
+        self.assertEqual(self._plan([_ligne(1, self.USD, 1000.0, input_tokens=1,
+                                            output_tokens=1, cum_usd=self.USD,
+                                            cache_write_tokens=600_000)]), [])
+
+    def test_tour_suivant_apres_expiration_du_cache(self):
+        # le tour suivant ne relit rien (cache expiré) : rien ne borne les
+        # écritures par les relectures, seules les écritures gardées comptent
+        rows = [_ligne(1, self.USD, 1000.0, input_tokens=1, output_tokens=1,
+                       cum_usd=self.USD, cache_write_tokens=600_000),
+                _ligne(2, 0.01, 9000.0, input_tokens=500, output_tokens=300,
+                       cum_usd=self.USD + 0.01, cache_write_tokens=0)]
+        self.assertEqual(self._plan(rows), [])
+
+    def test_ligne_sans_ecritures_connues_gardee(self):
+        rows = [_ligne(1, self.USD, 1000.0, input_tokens=1, output_tokens=1,
+                       cum_usd=self.USD),
+                _ligne(2, 0.01, 9000.0, input_tokens=500, output_tokens=300,
+                       cum_usd=self.USD + 0.01)]
         self.assertEqual(self._plan(rows), [])
 
     def test_cumul_d_une_session_reprise_reste_corrige(self):
         rows = [_ligne(1, 66.98, 1000.0, input_tokens=6, cached_input_tokens=100_000,
-                       output_tokens=892, cum_usd=66.98),
+                       output_tokens=892, cum_usd=66.98, cache_write_tokens=2_000),
                 _ligne(2, 0.05, 1060.0, input_tokens=2, cached_input_tokens=100_000,
-                       output_tokens=300, cum_usd=67.03)]
+                       output_tokens=300, cum_usd=67.03, cache_write_tokens=0)]
         plan = self._plan(rows)
         self.assertEqual([(c["id"], c["kind"]) for c in plan], [(1, "cumul")])
-        self.assertAlmostEqual(plan[0]["after"]["usd"],
-                               _cout(cost.DEFAULT_PRICES["claude-opus-5-5"], 6, 100_000, 892),
-                               places=6)
+        attendu = (_cout(cost.DEFAULT_PRICES["claude-opus-5-5"], 6, 100_000, 892)
+                   + 2_000 * 4.0 * cost.CACHE_WRITE_1H / 1e6)
+        self.assertAlmostEqual(plan[0]["after"]["usd"], attendu, places=6)
+
+
+class PalierHaikuTest(unittest.TestCase):
+    """Haiku 5.5 : chaque requête est facturée au palier de son invite
+    (relecture codex P2)."""
+    PRIX = cost.DEFAULT_PRICES["claude-haiku-5-5"]
+
+    def _usd(self, usage, model="claude-haiku-5-5"):
+        tier = cost.prompt_tier(cost.DEFAULT_PRICES, model)
+        return cost._claude_usd(usage, *self.PRIX, tier)
+
+    def test_petite_invite_au_palier_bas(self):
+        usage = {"input_tokens": 10_000, "output_tokens": 1_000}
+        self.assertAlmostEqual(self._usd(usage), 0.0015, places=9)
+
+    def test_invite_au_dela_du_seuil_au_palier_haut(self):
+        # le cache relu et écrit compte dans la longueur de l'invite
+        usage = {"input_tokens": 10, "cache_read_input_tokens": 99_000,
+                 "cache_creation_input_tokens": 1_000, "output_tokens": 100}
+        attendu = (10 * 0.50 + 99_000 * 0.05 + 1_000 * 0.50 * 1.25 + 100 * 2.50) / 1e6
+        self.assertAlmostEqual(self._usd(usage), attendu, places=9)
+
+    def test_seuil_inclus_et_suffixes(self):
+        usage = {"input_tokens": 100_000, "output_tokens": 0}
+        self.assertAlmostEqual(self._usd(usage, "claude-haiku-5-5-20261001"), 0.01, places=9)
+
+    def test_bareme_local_renomme_sans_palier(self):
+        prix = dict(cost.DEFAULT_PRICES, **{"claude-haiku-5-5": [0.9, 0.09, 4.5]})
+        self.assertIsNone(cost.prompt_tier(prix, "claude-haiku-5-5"))
+        self.assertIsNone(cost.prompt_tier(cost.DEFAULT_PRICES, "claude-opus-5-5"))
 
 
 class CleDeTurnUnpricedTest(unittest.TestCase):

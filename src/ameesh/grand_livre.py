@@ -264,38 +264,40 @@ def plan(rows: Iterable[dict], *, prices: dict,
 def _claude_cumul(first: dict, others: list, prices: dict, fix, repriced: dict) -> None:
     """Claude : le premier relevé de la session vaut-il tout son cumul ?
 
-    Le grand livre ne garde pas les écritures de cache (facturées au tour, L225) :
-    le coût par les jetons n'en est qu'un minorant. Une écriture de cache est
-    relue par la suite, d'où sa borne : la plus forte relecture de la session,
-    au prix d'écriture le plus cher (×2). Seul relevé de sa session : rien ne
-    borne ses écritures, son total est gardé."""
+    Un tour Claude paie aussi ses écritures de cache (L225), que seules les
+    lignes depuis la migration 0059 gardent (`cache_write_tokens`). Sans elles,
+    rien ne distingue un cumul d'un tour qui a beaucoup écrit en cache : le
+    total est gardé (jamais ramené sous son coût réel). Avec elles, elles
+    comptent dans l'estimation au prix d'écriture le plus cher (×2, cache 1 h :
+    la durée n'est pas gardée), ce qui n'abaisse jamais un total juste."""
     cum = first.get("cum_usd")
     usd = float(first.get("usd") or 0.0)
-    if cum is None or usd <= 0 or abs(usd - float(cum)) > 1e-6 or not others:
+    if cum is None or usd <= 0 or abs(usd - float(cum)) > 1e-6:
         return
+    if first.get("cache_write_tokens") is None:
+        return                          # L225 : écritures de cache inconnues
+    written = int(first["cache_write_tokens"] or 0)
     tokens = _tokens(first)
     model = first.get("model") or ""
     triplet = cost_mod.price_for(prices, "claude", model)[0]
     if triplet is None:
         return                          # L225 : aucun barème, pas d'estimation
-    written = max(int(r.get("cached_input_tokens") or 0) for r in [first, *others])
-    allowance = written * triplet[0] * cost_mod.CACHE_WRITE_1H / 1e6
+    writes = written * triplet[0] * cost_mod.CACHE_WRITE_1H / 1e6
     known = cost_mod.known_price(prices, model)
     if known:
-        estimate = _usd("claude", tokens, known)
-        how = "barème %s" % model
+        estimate = _usd("claude", tokens, known) + writes
+        how = "barème %s, écritures de cache comprises" % model
     else:
         spent = sum(float(r.get("usd") or 0.0) for r in others)
         read = sum(int(r.get("input_tokens") or 0) + int(r.get("cached_input_tokens") or 0)
                    for r in others)
         if spent > 0 and read > 0:
-            estimate = (tokens[0] + tokens[1]) * spent / read
+            estimate = (tokens[0] + tokens[1]) * spent / read + writes
             how = "coût par jeton relu des %d autres tours de la session" % len(others)
         else:
-            estimate = _usd("claude", tokens, triplet)
+            estimate = _usd("claude", tokens, triplet) + writes
             how = "tarif le plus cher connu"
-    if usd <= CUMUL_FACTOR * estimate + allowance \
-            or usd - estimate - allowance <= CUMUL_MIN_USD:
+    if usd <= CUMUL_FACTOR * estimate or usd - estimate <= CUMUL_MIN_USD:
         return
     fix(first, "cumul", "coût cumulé de la session reprise (%.2f $) compté pour un tour ; "
         "ré-estimé par ses jetons (%s)" % (usd, how), usd=round(estimate, 6))

@@ -82,10 +82,20 @@ DEFAULT_PRICES = {
     "claude-sonnet-4-6": [3.0, 0.30, 15.0],
     "claude-sonnet-4-5": [3.0, 0.30, 15.0],
     "claude-sonnet-4": [3.0, 0.30, 15.0],
-    # Haiku 5.5 : tarif des invites de plus de 100 000 jetons (le plus cher des
-    # deux paliers), un tour d'agent les dépasse presque toujours
+    # Haiku 5.5 : tarif des invites de plus de 100 000 jetons, le plus cher des
+    # deux paliers (majorant) ; chaque requête Claude est facturée à son palier
+    # (`PROMPT_TIERS`)
     "claude-haiku-5-5": [0.50, 0.05, 2.50],
     "claude-haiku-4-5": [1.0, 0.10, 5.0],
+}
+
+#: L225 : modèles facturés selon la longueur de l'invite de CHAQUE requête
+#: (entrée + cache relu + cache écrit) : jusqu'au seuil, le palier bas ;
+#: au-delà, le tarif de `DEFAULT_PRICES`. Un usage agrégé sur plusieurs
+#: requêtes n'a le palier bas que si son total reste sous le seuil (exact :
+#: chaque requête y est alors aussi).
+PROMPT_TIERS = {
+    "claude-haiku-5-5": (100_000, [0.10, 0.01, 0.50]),
 }
 
 #: Fenêtres nommées par les jauges, en secondes.
@@ -222,6 +232,8 @@ class TurnUsage:
     #: L225 : non None = tour facturé au repli prudent (maximum du barème),
     #: faute de tarif du modèle et de sa famille ; alerte `turn_unpriced`
     price_fallback: str | None = None
+    #: L225 : écritures de cache Claude du tour (None : harnais sans)
+    cache_write_tokens: int | None = None
 
     def row(self) -> dict:
         return {
@@ -302,19 +314,36 @@ PRICE_FAMILY = {
 _MODEL_SUFFIX = re.compile(r"(\[[^\]]*\]|-\d{8})$")
 
 
-def known_price(prices: dict, model: str | None) -> list | None:
-    """Le triplet de prix **nommé** d'un modèle au barème, ou None (L225).
+def priced_name(prices: dict, model: str | None) -> str | None:
+    """Le nom sous lequel un modèle est **nommé** au barème, ou None (L225).
 
     L'identifiant exact d'abord, puis sans ses suffixes de variante ou de date."""
     name = str(model or "")
     while name:
         if name in prices and not name.startswith("default-"):
-            return list(prices[name])
+            return name
         stripped = _MODEL_SUFFIX.sub("", name)
         if stripped == name:
             return None
         name = stripped
     return None
+
+
+def known_price(prices: dict, model: str | None) -> list | None:
+    """Le triplet de prix **nommé** d'un modèle au barème, ou None (L225)."""
+    name = priced_name(prices, model)
+    return list(prices[name]) if name else None
+
+
+def prompt_tier(prices: dict, model: str | None) -> tuple | None:
+    """L225 : (seuil, triplet du palier bas) d'un modèle facturé selon la
+    longueur de l'invite, ou None. Seulement au tarif officiel : un barème
+    local qui renomme le prix du modèle n'a pas de palier."""
+    name = priced_name(prices, model)
+    tier = PROMPT_TIERS.get(name or "")
+    if tier is None or list(prices[name]) != DEFAULT_PRICES.get(name):
+        return None
+    return tier
 
 
 def price_of(prices: dict, harness: str, model: str | None) -> list:
@@ -946,6 +975,7 @@ class CostBook:
         # un tour effectivement compté au barème, avec des jetons.
         triplet, marque = price_for(prices, harness or "deepseek", model)
         pin, pcache, pout = triplet or (0.0, 0.0, 0.0)
+        tier = prompt_tier(prices, model) if not marque else None
         cum = self.baseline(agent, harness, session)
         # L71 : session reprise sans relevé de l'agent — le dernier total CONNU
         # de la session (autre agent, ou flux local d'avant le tour) sert de repère.
@@ -977,7 +1007,7 @@ class CostBook:
                 # appel, lu sur les messages du modèle (une fois par id), au
                 # barème ; le cumul n'en fait jamais le coût du tour.
                 usage = _claude_call_usages(events)
-                usd = sum(_claude_usd(u, pin, pcache, pout) for u in usage)
+                usd = sum(_claude_usd(u, pin, pcache, pout, tier) for u in usage)
             elif not totals:
                 usd = 0.0
                 au_bareme = False
@@ -985,7 +1015,7 @@ class CostBook:
                 # L71 : total d'avant le tour inconnu — estimation par les
                 # jetons du tour (`usage` de `result` est celui du tour), au
                 # barème ; le cumul de la ligne sert de repère au tour suivant.
-                usd = sum(_claude_usd(u, pin, pcache, pout) for u in usage)
+                usd = sum(_claude_usd(u, pin, pcache, pout, tier) for u in usage)
             elif last is None or session != cum.get("session"):
                 au_bareme = False
                 # Session neuve (ou inconnue) : son `total_cost_usd` cumulé part de
@@ -1002,6 +1032,7 @@ class CostBook:
                 input_tokens=_sum(usage, "input_tokens"),
                 cached_input_tokens=_sum(usage, "cache_read_input_tokens"),
                 output_tokens=_sum(usage, "output_tokens"),
+                cache_write_tokens=_sum(usage, "cache_creation_input_tokens"),
                 **(marque if au_bareme and any(map(_has_tokens, usage)) else {}))
 
         if harness == "codex":
@@ -1095,7 +1126,8 @@ class CostBook:
             output_tokens=row["output_tokens"], cum_usd=cum_usd, cum_input_tokens=cum_input,
             cum_cached_input_tokens=cum_cached, cum_output_tokens=cum_out,
             account=account, spend_key=key, void_reason=usage.void_reason,
-            price_fallback=usage.price_fallback)
+            price_fallback=usage.price_fallback,
+            cache_write_tokens=usage.cache_write_tokens)
         return usage
 
     def account_at(self, agent: str, start: int, harness: str | None = None) -> str | None:
@@ -1320,13 +1352,18 @@ def _claude_main_results(events: Sequence[dict], session: str | None) -> list[di
             and (not session or e.get("session_id") in (None, "", session))]
 
 
-def _claude_usd(usage: dict, pin: float, pcache: float, pout: float) -> float:
+def _claude_usd(usage: dict, pin: float, pcache: float, pout: float,
+                tier: tuple | None = None) -> float:
     """Coût d'un usage Claude au barème (USD), écritures de cache comprises (L225).
 
     `cache_creation_input_tokens` au prix d'entrée ×1,25 (cache 5 min), sauf la
     part que `cache_creation.ephemeral_1h_input_tokens` déclare en cache 1 h
-    (×2) ; durée non déclarée : ×1,25."""
+    (×2) ; durée non déclarée : ×1,25. `tier` (`prompt_tier`) : invite d'au
+    plus le seuil (entrée + cache relu + cache écrit) au palier bas."""
     written = _num(usage, "cache_creation_input_tokens")
+    if tier is not None and (_num(usage, "input_tokens") + written
+                             + _num(usage, "cache_read_input_tokens")) <= tier[0]:
+        pin, pcache, pout = tier[1]
     detail = usage.get("cache_creation") if isinstance(usage, dict) else None
     hour = min(_num(detail, "ephemeral_1h_input_tokens"), written) \
         if isinstance(detail, dict) else 0

@@ -464,15 +464,17 @@ class TurnCosts(Domain):
                cum_input_tokens: int | None, cum_cached_input_tokens: int | None,
                cum_output_tokens: int | None, account: str | None = None,
                spend_key: str | None = None, void_reason: str | None = None,
-               price_fallback: str | None = None) -> bool:
+               price_fallback: str | None = None,
+               cache_write_tokens: int | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
         telle quelle et n'a rien écrit. `account` (L30, migration 0028) : le
         compte qui a porté le tour ; None = colonne non écrite. `spend_key`
         (L60, migration 0041) : clé du marqueur comptable ; une ligne portant
         déjà cette clé n'est pas réécrite (faux). `void_reason` (L225,
         migration 0043) : la ligne naît écartée des sommes ; `price_fallback`
-        (L225, migration 0059) : tour facturé au repli prudent ; None = colonne
-        non écrite. Vrai si la ligne est écrite."""
+        (L225, migration 0059) : tour facturé au repli prudent ;
+        `cache_write_tokens` (L225, 0059) : écritures de cache Claude du tour ;
+        None = colonne non écrite. Vrai si la ligne est écrite."""
 
     @abc.abstractmethod
     def spent(self, seconds: float, *, agent: str,

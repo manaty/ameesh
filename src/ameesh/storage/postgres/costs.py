@@ -50,7 +50,8 @@ class TurnCosts(interface.TurnCosts):
     def insert(self, *, agent, harness, turn, model, session, usd, input_tokens,
                cached_input_tokens, output_tokens, cum_usd, cum_input_tokens,
                cum_cached_input_tokens, cum_output_tokens, account=None,
-               spend_key=None, void_reason=None, price_fallback=None) -> bool:
+               spend_key=None, void_reason=None, price_fallback=None,
+               cache_write_tokens=None) -> bool:
         cols = ["agent", "harness", "turn", "model", "session", "usd",
                 "input_tokens", "cached_input_tokens", "output_tokens",
                 "cum_usd", "cum_input_tokens", "cum_cached_input_tokens",
@@ -71,6 +72,10 @@ class TurnCosts(interface.TurnCosts):
             # L225 (migration 0059) : tour facturé au repli prudent, gardé
             cols.append("price_fallback")
             values.append(price_fallback)
+        if cache_write_tokens is not None:
+            # L225 (0059) : écritures de cache Claude, pour `cost correct`
+            cols.append("cache_write_tokens")
+            values.append(int(cache_write_tokens))
         suffix = ""
         if spend_key is not None:
             # L60 (migration 0041) : un marqueur comptable n'écrit qu'une ligne,
@@ -139,6 +144,7 @@ class TurnCosts(interface.TurnCosts):
                " t.output_tokens, t.cum_usd::float8 AS cum_usd, t.cum_input_tokens,"
                " t.cum_cached_input_tokens, t.cum_output_tokens,"
                " to_jsonb(t)->>'void_reason' AS void_reason,"
+               " (to_jsonb(t)->>'cache_write_tokens')::bigint AS cache_write_tokens,"
                " extract(epoch from t.recorded_at)::float8 AS recorded_ts"
                " FROM turn_costs t")
         params: tuple = ()
