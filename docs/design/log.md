@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-11 (radar de conflits)
+* **Étude** L160 (lot n° 170) : [radar de conflits et résolutions préparées avant la fusion](etudes/l160-radar-de-conflits.md) — mesures du 10/10 (ameesh : 11 PR sur 18 reprises à la main, la moitié des blocs en conflit sont deux ajouts au même endroit ; Nexlink : 39 min en médiane du feu de fusion à develop, 29 fusions de rattrapage) ; git suffit (fusions d'essai `merge-tree`, résolutions partagées par commits et rejouées par `rerere`, file de fusion tenue par ameesh), conventions additives d'abord ; lots L160a–L160h proposés, 28 h estimées.
+
 ## 2026-10-11 (tests par impact)
 * **Étude** L161 (lot n° 171 du suivi) : [tests choisis selon l'impact, échecs remontés en temps réel](etudes/l161-tests-par-impact.md). CI mesurée : ameesh depuis L116 (PR 3,5 min, main 5,9 min ; premier échec connu 2 à 5 min avant la fin ; 18 % des PR, de documentation ou de version seule, passent toute la suite) ; Nexlink (Backend suite lancée à 81 % sur `develop` par des poussées de documentation ; 9 étiquettes desktop sur 17 en échec sur des tests Windows ou macOS jamais lancés avant). Proposé : carte test → code mesurée (couverture par test, sous-processus compris, fichiers lus, tables touchées), impactés d'abord, flux routé au courrier de l'agent du lot (un urgent par version poussée, rouge hérité jamais imputé à l'auteur), rien sauté pour du code sur la branche d'intégration ; lots L161a–L161i (38 h).
 
