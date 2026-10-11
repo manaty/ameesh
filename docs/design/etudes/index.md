@@ -11,3 +11,4 @@
 * [Persona and harness](persona-et-harnais.md) - Identity, prompts and memory of a persona across Claude Code, Codex, dsh and ACP; neutral interim memory; proposed lots.
 * [Orchestration and liveness](orchestration-et-vivacite.md) - A stopped external orchestrator that blocks a project: agent mode, retained assignment, adoption and resumption, pushed alerts, deadline-based delegation, hook isolation; proposed lots L36–L41.
 * [Multiple canons](plusieurs-canons.md) - What breaks when two canons share a host, the federation model, interim for Acme; lots L42–L45.
+* [Governing an organisation's mesh: a local authority](l155-governance-of-a-local-authority.md) - OIDC identity, approver role, deputies and absences, isolation between personas, visibility by relation, memory rights and retention, a page for staff; reuses the parked D1, D2, E1, E2; lots L155a–L155i.
