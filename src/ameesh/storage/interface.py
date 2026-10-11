@@ -2011,9 +2011,11 @@ class Housekeeping(Domain):
         les lignes de plus de 30 jours."""
 
     @abc.abstractmethod
-    def recent(self, host: str | None, since_s: float, limit: int = 50) -> list[dict]:
-        """Les lignes des `since_s` dernières secondes (de l'hôte si donné),
-        les plus récentes d'abord ; instant en `at_ts`."""
+    def recent(self, host: str | None, since_s: float, limit: int = 50,
+               kind: str | None = None) -> list[dict]:
+        """Les lignes des `since_s` dernières secondes (de l'hôte si donné, de
+        ce `kind` si donné — L162 : les signalements de /tmp ne se noient pas
+        dans les bilans), les plus récentes d'abord ; instant en `at_ts`."""
 
     @abc.abstractmethod
     def summary(self, host: str | None, since_s: float) -> list[dict]:
