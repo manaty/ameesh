@@ -25,7 +25,8 @@
                                                 l'identité liée de la session, sinon « inconnu »)
   agent-mesh import-v0 [--agents a,b] [--dry-run]     bascule : boîte fichier v0 → Postgres
   agent-mesh export-v0 [--agents a,b] [--keep]        retour arrière : Postgres → boîte v0
-  agent-mesh migrate | doctor [--notify-test | --probe]
+  agent-mesh migrate [--dry-run | --additive-only]   --additive-only : rien si une migration n'est pas additive (L151)
+  agent-mesh doctor [--notify-test | --probe]
   agent-mesh canon check|show|sync [--json] [--host H]   canon OKF (spec §4)
   agent-mesh placement check [--agent A] [--json]        admissions et hôtes admissibles (C4)
   agent-mesh hosts [--json] [HÔTE] [--history N]         ressources des hôtes (L31)
@@ -1167,9 +1168,9 @@ def cmd_export_v0(cfg: Config, args: argparse.Namespace) -> int:
 # migrations / diagnostic (délégués à la CLI agent-mail)
 # --------------------------------------------------------------------------
 
-def cmd_migrate(cfg: Config, _args: argparse.Namespace) -> int:
+def cmd_migrate(cfg: Config, args: argparse.Namespace) -> int:
     from . import cli
-    return cli.cmd_migrate(cfg)
+    return cli.cmd_migrate(cfg, dry_run=args.dry_run, additive_only=args.additive_only)
 
 
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
@@ -1830,6 +1831,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_exp.set_defaults(func=cmd_export_v0)
 
     p_mig = sub.add_parser("migrate")
+    p_mig.add_argument("--dry-run", action="store_true",
+                       help="migrations manquantes, additives ou non ; rien n'est écrit")
+    p_mig.add_argument("--additive-only", action="store_true",
+                       help="n'applique rien si une migration manquante n'est pas additive (L151)")
     p_mig.set_defaults(func=cmd_migrate)
     p_doc = sub.add_parser("doctor")
     p_doc.add_argument("--notify-test", action="store_true")
