@@ -117,15 +117,18 @@ class ReferencePgTest(PgTestCase):
     def _deliver(self, lot_id, *, started_min_ago):
         work.move(self.db, lot_id, "build")
         work.merged(self.db, lot_id, sha="abcdef1")
+        # un seul instant pour les trois dates : avec le pilote psql, chaque
+        # requête a sa transaction, donc son propre now()
+        at = float(self.db.query("SELECT extract(epoch from now())::float8 AS t")[0]["t"])
         self.db.execute(
-            "UPDATE work_items SET started_at = now() - make_interval(mins => %s)"
-            " WHERE id = %s", (int(started_min_ago), int(lot_id)))
+            "UPDATE work_items SET started_at = to_timestamp(%s) - make_interval(mins => %s)"
+            " WHERE id = %s", (at, int(started_min_ago), int(lot_id)))
         self.db.execute(
-            "UPDATE work_item_estimates SET at = now() - make_interval(mins => %s)"
-            " WHERE work_item_id = %s", (int(started_min_ago) + 5, int(lot_id)))
+            "UPDATE work_item_estimates SET at = to_timestamp(%s) - make_interval(mins => %s)"
+            " WHERE work_item_id = %s", (at, int(started_min_ago) + 5, int(lot_id)))
         self.db.execute(
-            "UPDATE work_item_milestones SET at = now() WHERE work_item_id = %s"
-            " AND kind = 'merged'", (int(lot_id),))
+            "UPDATE work_item_milestones SET at = to_timestamp(%s) WHERE work_item_id = %s"
+            " AND kind = 'merged'", (at, int(lot_id)))
 
     def test_publication_lecture_et_alerte(self):
         # sans table publiée : pas de référence, pas d'alerte
