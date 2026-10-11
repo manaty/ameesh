@@ -399,7 +399,8 @@ def _sync_one(db, cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
         for reason in action.blocked:
             print("%s  %-16s   blocked by %s" % (tag, "", reason))
     refused = [a.agent for a in report.actions
-               if a.action in ("créé", "mis à jour", "inchangé")
+               if a.action in ("created", "updated", "unchanged",
+                               "créé", "mis à jour", "inchangé")  # canon_sync, either language
                and a.placement is not None and not a.placement.ok]
     if refused:
         print("%splacement refused on %s: %s — not claimable; admissible hosts: "

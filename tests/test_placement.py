@@ -208,7 +208,7 @@ class PlacementTest(_PlacementDbCase):
                                     "WHERE name = 'ouvrier'")[0]["placement_ok"], True)
         ouvrier = placement.recorded(self.db)["ouvrier"]
         self.assertIs(ouvrier["placement_profile_ok"], False)
-        self.assertIn("profil divergé depuis l'évaluation", ouvrier["placement_diagnostic"])
+        self.assertIn("profile diverged since the placement was evaluated", ouvrier["placement_diagnostic"])
         self.assertIn("host='banc'", ouvrier["placement_profile"])
         self.assertIn("host='atelier'", ouvrier["placement_profile_current"])
         self.assertEqual(self.claimable(), ["orchestre", "relecteur"])     # canon ok sur atelier
@@ -414,13 +414,13 @@ class ProfilEvalueTest(_PlacementDbCase):
                 self.assertIn("harness='claude'", verdict["placement_profile"])
                 recorded = placement.recorded(self.db, "atelier")[name]
                 self.assertIs(recorded["placement_profile_ok"], False)
-                self.assertIn("profil divergé depuis l'évaluation",
+                self.assertIn("profile diverged since the placement was evaluated",
                               recorded["placement_diagnostic"])
                 self.assertIn("harness='codex'", recorded["placement_diagnostic"])
         # un éphémère créé par le créateur divergé naît refusé, et le dit
         row = canon_sync.spawn(self.db, "tardif", "orchestre", 3600)
         self.assertIs(row["placement_ok"], False)
-        self.assertIn("profil de orchestre divergé depuis l'évaluation",
+        self.assertIn("profile of orchestre diverged since the placement was evaluated",
                       row["placement_diagnostic"])
         self.assert_closed("tardif")
         # le sync suivant réévalue : le canon remet orchestre sur claude (admis) ;
@@ -472,7 +472,7 @@ class ProfilEvalueTest(_PlacementDbCase):
                 self.db.execute(sql)
                 self.assert_closed(name, host)
                 self.assertIs(self.verdict(name)["placement_ok"], True)   # écrit, mais caduc
-                self.assertIn("profil divergé depuis l'évaluation",
+                self.assertIn("profile diverged since the placement was evaluated",
                               placement.recorded(self.db)[name]["placement_diagnostic"])
                 report = self.sync()
                 self.assertEqual(self.actions(report)[name], "mis à jour")
@@ -642,7 +642,7 @@ class PlacementCliTest(test_canon._CanonDbCase):
         orchestre = rows["orchestre"]
         self.assertEqual((orchestre["placement_ok"], orchestre["placement_profile_ok"],
                           orchestre["canon_claim_ok"]), (True, False, False))
-        self.assertIn("profil divergé depuis l'évaluation", orchestre["placement_diagnostic"])
+        self.assertIn("profile diverged since the placement was evaluated", orchestre["placement_diagnostic"])
         self.assertIn("harness='claude'", orchestre["placement_profile"])
         self.assertIn("harness='codex'", orchestre["placement_profile_current"])
         self.assertEqual((rows["relecteur"]["placement_profile_ok"],
@@ -651,11 +651,11 @@ class PlacementCliTest(test_canon._CanonDbCase):
         proc = self.mesh("canon", "check", "--host", "atelier", env=self.cli_env())
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         line = [ligne for ligne in proc.stdout.splitlines()
-                if ligne.startswith("registre  : orchestre")]
+                if ligne.startswith("registry  : orchestre")]
         self.assertEqual(len(line), 1, proc.stdout)
-        self.assertIn("profil divergé depuis l'évaluation", line[0])
-        self.assertIn("« ameesh canon sync »", line[0])
-        self.assertNotIn("registre  : relecteur", proc.stdout)
+        self.assertIn("profile diverged since the placement was evaluated", line[0])
+        self.assertIn('"ameesh canon sync"', line[0])
+        self.assertNotIn("registry  : relecteur", proc.stdout)
         data = json.loads(self.mesh("canon", "check", "--host", "atelier", "--json",
                                     env=self.cli_env()).stdout)
         recorded = {p["agent"]: p for p in data["registry_placements"]}
@@ -664,7 +664,7 @@ class PlacementCliTest(test_canon._CanonDbCase):
         # le sync suivant réévalue : plus de divergence
         self.sync()
         proc = self.mesh("canon", "check", "--host", "atelier", env=self.cli_env())
-        self.assertNotIn("profil divergé", proc.stdout)
+        self.assertNotIn("profile diverged", proc.stdout)
 
 
 if __name__ == "__main__":

@@ -291,7 +291,7 @@ def cmd_harness(cfg, db=None) -> int:
         qui = " [%s]" % ", ".join(item["agents"]) if item["agents"] else ""
         if item["ok"]:
             print("harness    : %s%s → %s" % (item["harness"], qui, item["detail"]))
-            if item.get("source") in ("PATH du gestionnaire systemd", "emplacement connu"):
+            if item.get("source") in ("systemd manager PATH", "known location"):
                 print("             hint: found outside PATH — set PATH in the unit "
                       "(deploy/systemd) or `harness_bins` in the config")
         else:

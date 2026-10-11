@@ -80,7 +80,7 @@ def cmd_verify(cfg: Config, args: argparse.Namespace) -> int:
             verdict.standing, ensure_ascii=False)))
         if verdict.digest:
             print("digest   : %s" % verdict.digest)
-        print("expires  : %s   nonce : %s" % (
+        print("expires  : %s   nonce: %s" % (
             _moment(verdict.exp), "consumed" if verdict.consumed else "available"))
     else:
         print("receipt REFUSED [%s]: %s" % (verdict.code, verdict.reason), file=sys.stderr)
@@ -116,7 +116,7 @@ def cmd_authenticator_list(cfg: Config, args: argparse.Namespace) -> int:
         print("%-22s %-13s %-24s %-9s %-17s %-16s %s" % (
             row["approver"][:22], row["facade"], row["credential_id"][:24], row["level"],
             row["key_fingerprint"][:16] + "…", _moment(row.get("enrolled_ts")), state))
-        print("%22s canon : %s%s" % ("", row.get("canon_ref") or "—",
+        print("%22s canon: %s%s" % ("", row.get("canon_ref") or "—",
                                      " (declared by canon %s)" % row["canon"]
                                      if row.get("canon") else ""))
     return 1 if off else 0

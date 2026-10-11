@@ -251,7 +251,7 @@ def plan(rows: Iterable[dict], *, prices: dict,
                  "void": "void_reason" in entry["set"]}
         out.append({"id": ident, "agent": entry["agent"], "harness": entry["harness"],
                     "session": entry["session"], "kind": "+".join(entry["kinds"]),
-                    "reason": " ; ".join(entry["reasons"]), "set": entry["set"],
+                    "reason": "; ".join(entry["reasons"]), "set": entry["set"],
                     "before": before, "after": after})
     return out
 

@@ -535,10 +535,10 @@ def _find(name: str, env: Mapping[str, str], *, exclude_path: bool = False
     if systemd_path:
         found = _scan(name, systemd_path.split(os.pathsep), env)
         if found:
-            return found[0], "PATH du gestionnaire systemd", hors_path(found[1])
+            return found[0], "systemd manager PATH", hors_path(found[1])
     found = _scan(name, search_dirs(env), env)
     if found:
-        return found[0], "emplacement connu", hors_path(found[1])
+        return found[0], "known location", hors_path(found[1])
     return None
 
 

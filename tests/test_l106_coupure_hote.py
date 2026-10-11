@@ -81,7 +81,7 @@ class ResolutionTest(unittest.TestCase):
         with mock.patch.object(adapters, "systemd_manager_path", return_value=""):
             res = adapters.resolve_harness(self.claude, env=self.env(), bins={})
         self.assertEqual(res.path, os.path.join(self.connu, "claude"))
-        self.assertEqual(res.source, "emplacement connu")
+        self.assertEqual(res.source, "known location")
         self.assertEqual(res.path_prepend, (self.connu,))
 
     def test_path_du_gestionnaire_systemd_relu(self):
@@ -91,7 +91,7 @@ class ResolutionTest(unittest.TestCase):
         _script(os.path.join(session, "claude"), "#!/bin/sh\nexit 0\n")
         with mock.patch.object(adapters, "systemd_manager_path", return_value=session):
             res = adapters.resolve_harness(self.claude, env=self.env(), bins={})
-        self.assertEqual(res.source, "PATH du gestionnaire systemd")
+        self.assertEqual(res.source, "systemd manager PATH")
         self.assertEqual(res.path, os.path.join(session, "claude"))
 
     def test_ordre_variable_puis_configuration_puis_path(self):
