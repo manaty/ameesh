@@ -10,7 +10,7 @@ sources:
   - { resource: "0012-autorite-par-ameesh-approve.md", title: "Décision 0012" }
   - { resource: "0028-ressources-des-hotes-et-repartition.md", title: "Décision 0028" }
   - { resource: "0029-persona-et-session.md", title: "Décision 0029" }
-  - { resource: "0033-meshes-etanches-hebergement-et-identite.md", title: "Décision 0033 (branche, PR #15)" }
+  - { resource: "0033-isolated-meshes-hosting-and-identity.md", title: "Decision 0033 (isolated meshes, hosting and identity)" }
 ---
 
 Numéro à attribuer à la fusion (« 00xx » : plusieurs numéros à partir de

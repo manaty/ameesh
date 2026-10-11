@@ -8,11 +8,11 @@ generated: { by: "claude3/claude-opus-5-5", at: "2026-10-10T16:00:00+02:00" }
 sources:
   - { resource: "../../../src/ameesh/storage/interface.py", title: "Interface de stockage (221 opérations, 29 domaines)" }
   - { resource: "../../../src/ameesh/runner.py", title: "Exécuteur" }
-  - { resource: "decisions/0012-autorite-par-ameesh-approve.md", title: "Décision 0012 (autorité par ameesh-approve)" }
-  - { resource: "decisions/0014-orchestrateurs-a-tours-et-placement.md", title: "Décision 0014 (hôtes, placement, secrets)" }
-  - { resource: "decisions/0028-ressources-des-hotes-et-repartition.md", title: "Décision 0028 (ressources, contre-pression)" }
-  - { resource: "decisions/0029-persona-et-session.md", title: "Décision 0029 (persona, visibilité)" }
-  - { resource: "decisions/0033-meshes-etanches-hebergement-et-identite.md", title: "Décision 0033 (branche, PR #15 : meshes étanches, OIDC)" }
+  - { resource: "../decisions/0012-autorite-par-ameesh-approve.md", title: "Decision 0012 (authority through ameesh-approve)" }
+  - { resource: "../decisions/0014-orchestrateurs-a-tours-et-placement.md", title: "Decision 0014 (hosts, placement, secrets)" }
+  - { resource: "../decisions/0028-ressources-des-hotes-et-repartition.md", title: "Decision 0028 (resources, backpressure)" }
+  - { resource: "../decisions/0029-persona-et-session.md", title: "Decision 0029 (persona, visibility)" }
+  - { resource: "../decisions/0033-isolated-meshes-hosting-and-identity.md", title: "Decision 0033 (isolated meshes, OIDC)" }
   - { resource: "ui-integrable.md", title: "Étude UI intégrable (branche design/claude3-ui-integrable : ameesh serve, /api/v1, SSE, L84–L93)" }
   - { resource: "agent-resident.md", title: "Étude agent résident (branche design/claude3-agent-resident, L75–L83)" }
   - { resource: "nexlink:docs/specs/nexlink-compute.md", title: "Spécification Nexlink Compute, §3.2, §4.4–4.10, §5.4–5.6, lot 1c-iii" }
