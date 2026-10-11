@@ -1173,9 +1173,9 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 
 #: clés de `ameesh set` (L13 : model, effort ; L26 : tier, session_policy ;
 #: L37 : mode, `execute` | `externe`, décision 0030 ; L60 : context_max_tokens ;
-#: L105 : turn_max_seconds, turn_mail_max)
+#: L105 : turn_max_seconds, turn_mail_max ; travail de fond : turn_grace_seconds)
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
-            "turn_max_seconds", "turn_mail_max")
+            "turn_max_seconds", "turn_mail_max", "turn_grace_seconds")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1224,8 +1224,8 @@ _TIER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 def cmd_set(cfg: Config, args) -> int:
     """`ameesh set <agent> model=… effort=… tier=… session_policy=… mode=…
-    context_max_tokens=… turn_max_seconds=… turn_mail_max=…` (L13, L26, L37,
-    L60, L105).
+    context_max_tokens=… turn_max_seconds=… turn_mail_max=… turn_grace_seconds=…`
+    (L13, L26, L37, L60, L105, travail de fond).
 
     Écrit l'état d'exécution : le modèle dans le registre (visible par `list`)
     et dans l'état local ; l'effort et le tier dans l'état local **et** en base
@@ -1238,7 +1238,9 @@ def cmd_set(cfg: Config, args) -> int:
     (`context_max_tokens`, L60 : `15M`, `500k`, `0` = désactivé) est écrit en
     base ; vide = défaut de l'exécuteur. Les plafonds du tour (L105) aussi :
     `turn_max_seconds` (`30m`, `2h`, `0` = sans limite) et `turn_mail_max`
-    (messages remis par le hook pendant un tour, `0` = sans borne).
+    (messages remis par le hook pendant un tour, `0` = sans borne). Le délai
+    de grâce du travail de fond d'un tour (`turn_grace_seconds`, `20m`, `0` =
+    nettoyage immédiat) aussi.
     """
     from . import adapters
     from .config import SESSION_POLICIES
@@ -1257,7 +1259,8 @@ def cmd_set(cfg: Config, args) -> int:
             if not sep or cle not in SET_KEYS:
                 print("usage : ameesh set <agent> model=… effort=… tier=… "
                       "session_policy=%s mode=%s context_max_tokens=N|15M|0 "
-                      "turn_max_seconds=30m|2h|0 turn_mail_max=N|0"
+                      "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
+                      "turn_grace_seconds=20m|0"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
@@ -1286,11 +1289,18 @@ def cmd_set(cfg: Config, args) -> int:
                     print("turn_max_seconds invalide : %r (ex. 30m, 2h, 0 = sans "
                           "limite)" % valeur, file=sys.stderr)
                     return 2
+            if cle == "turn_grace_seconds" and valeur:
+                try:
+                    valeur = str(parse_duration(valeur))
+                except ValueError:
+                    print("turn_grace_seconds invalide : %r (ex. 20m, 1h, 0 = nettoyage "
+                          "immédiat)" % valeur, file=sys.stderr)
+                    return 2
             if cle == "turn_mail_max" and valeur:
                 try:
                     valeur = str(parse_count(valeur))
                 except ValueError:
-                    print("turn_mail_max invalide : %r (ex. 5, 0 = sans borne)" % valeur,
+                    print("turn_mail_max invalide : %r (ex. 20, 0 = sans borne)" % valeur,
                           file=sys.stderr)
                     return 2
             valeurs[cle] = valeur
@@ -1312,8 +1322,8 @@ def cmd_set(cfg: Config, args) -> int:
         effort = _lit_etat(cfg, args.agent, "effort") or agent.get("effort") or "défaut"
         tier = _lit_etat(cfg, args.agent, "tier") or agent.get("tier") or "défaut"
         politique = agent.get("session_policy") or "défaut (%s)" % cfg.session_policy
-        from .exploitation import (effective_context_max, effective_turn_mail_max,
-                                   effective_turn_max_seconds)
+        from .exploitation import (effective_context_max, effective_turn_grace_seconds,
+                                   effective_turn_mail_max, effective_turn_max_seconds)
 
         def _txt(valeur: int, cle: str, zero: str) -> str:
             return (zero if valeur == 0 else "%d" % valeur) + (
@@ -1324,10 +1334,14 @@ def cmd_set(cfg: Config, args) -> int:
                          "sans limite")
         courrier_txt = _txt(effective_turn_mail_max(cfg, agent), "turn_mail_max",
                             "sans borne")
+        grace_txt = _txt(effective_turn_grace_seconds(cfg, agent), "turn_grace_seconds",
+                         "aucune")
         print("%s : modèle=%s effort=%s tier=%s session=%s mode=%s contexte=%s "
-              "tour_max_s=%s courrier_par_tour=%s (prend effet au prochain tour)"
+              "tour_max_s=%s courrier_par_tour=%s grace_fond_s=%s "
+              "(prend effet au prochain tour)"
               % (args.agent, modele, effort, tier, politique,
-                 agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt))
+                 agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt,
+                 grace_txt))
         if agent.get("mode") == "externe" and not agent.get("responsible"):
             # 0030 : un agent externe a obligatoirement un responsable humain
             print("attention : agent externe sans responsable humain : ses lots et ses "
@@ -1726,7 +1740,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_set.add_argument("values", nargs="+", metavar="clé=valeur",
                        help="model=… effort=… tier=… session_policy=par-lot|taille|jamais "
                             "context_max_tokens=15M|0 "
-                            "turn_max_seconds=30m|2h|0 turn_mail_max=5|0 "
+                            "turn_max_seconds=30m|2h|0 turn_mail_max=20|0 "
+                            "turn_grace_seconds=20m|0 "
                             "mode=execute|externe (valeur vide = défaut)")
     p_set.set_defaults(func=cmd_set)
 

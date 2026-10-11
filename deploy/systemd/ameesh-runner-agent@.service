@@ -37,9 +37,20 @@ ExecStart=%h/.local/share/ameesh/venv/bin/ameesh run --agents %i --runner-id run
 # attente croissante) ; une sortie anormale relance l'exécuteur.
 Restart=on-failure
 RestartSec=30
-# arrêt propre : SIGTERM, tours arrêtés au point sûr, consignes remises en
-# attente, baux rendus (l'exécuteur s'en charge en moins de 15 s)
-TimeoutStopSec=30
+# Arrêt et redémarrage (2026-10-11) : le SIGTERM va au SEUL exécuteur
+# (KillMode=mixed), qui DRAINE — plus de nouveau tour ; le tour en cours et
+# son travail de fond finissent, dans la borne AMEESH_DRAIN_SECONDS (30 min
+# par défaut) ; au-delà, tour arrêté et consigne remise en attente. Puis baux
+# rendus et sortie ; systemd tue (SIGKILL) ce qui resterait dans le groupe de
+# contrôle. Avant, le SIGTERM allait à tout le groupe, harnais compris : un
+# `systemctl restart` tuait le tour en cours et son travail.
+# `systemctl --user restart` attend donc la fin du tour (au plus la borne).
+# Arrêt immédiat : un second SIGTERM à l'exécuteur,
+#   kill -TERM "$(systemctl --user show -p MainPID --value ameesh-runner-agent@<agent>)"
+# TimeoutStopSec couvre la borne et le nettoyage : le garder au-dessus de
+# AMEESH_DRAIN_SECONDS + 5 min.
+KillMode=mixed
+TimeoutStopSec=35min
 NoNewPrivileges=yes
 
 [Install]

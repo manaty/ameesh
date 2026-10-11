@@ -172,6 +172,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'context_max_tokens',
         -- L105 (0046) : plafonds du tour (des nombres, pas de contenu)
         'turn_max_seconds', 'turn_mail_max',
+        -- 0051 : délai de grâce du travail de fond d'un tour (un nombre)
+        'turn_grace_seconds',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
         'canon'
     ]),
