@@ -68,7 +68,7 @@ def resolve_gh(override: str | None = None, env: dict | None = None) -> str:
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
         if os.path.sep in path:
-            raise ConnectorError("git-merge : binaire gh introuvable ou non exécutable : %s" % path)
+            raise ConnectorError("git-merge: gh binary not found or not executable: %s" % path)
     found = shutil.which("gh", path=env.get("PATH"))
     if not found:
         raise ConnectorError("git-merge : gh introuvable (AMEESH_GH_BIN, AMEESH_BIN_DIR ou PATH)")
@@ -78,7 +78,7 @@ def resolve_gh(override: str | None = None, env: dict | None = None) -> str:
 def parse_target(target: str) -> tuple[str, int]:
     match = _TARGET_RE.fullmatch(target or "")
     if not match:
-        raise ConnectorError("git-merge : cible « owner/repo#<numéro> » attendue, pas %r" % (target,))
+        raise ConnectorError("git-merge: expected target \"owner/repo#<number>\", not %r" % (target,))
     return "%s/%s" % (match.group(1), match.group(2)), int(match.group(3))
 
 
@@ -137,14 +137,14 @@ class GitMergeConnector:
     @staticmethod
     def _seen(view: dict | None) -> str:
         if view is None:
-            return "illisible"
-        return {"OPEN": "ouverte", "CLOSED": "fermée sans fusion",
-                "MERGED": "MERGED sans commit de fusion lisible"}[view["state"]]
+            return "unreadable"
+        return {"OPEN": "open", "CLOSED": "closed without merge",
+                "MERGED": "MERGED without a readable merge commit"}[view["state"]]
 
     # -- protocole ---------------------------------------------------------
     def execute(self, action: Action, idempotency_key: str) -> Outcome:
         if action.operation != "merge":
-            return Outcome.failed("git-merge : opération %r non prise en charge" % action.operation)
+            return Outcome.failed("git-merge: operation %r not supported" % action.operation)
         args = action.args if isinstance(action.args, dict) else {}
         try:
             repo, number = parse_target(action.target)
@@ -152,12 +152,12 @@ class GitMergeConnector:
             return Outcome.failed(str(exc))
         method = args.get("method", "merge")
         if method not in METHODS:
-            return Outcome.failed("git-merge : méthode %r (%s)" % (method, ", ".join(METHODS)))
+            return Outcome.failed("git-merge: method %r (%s)" % (method, ", ".join(METHODS)))
         argv = ["pr", "merge", str(number), "--repo", repo, "--" + method]
         head = args.get("match_head_commit")
         if head is not None:
             if not isinstance(head, str) or not _SHA_RE.fullmatch(head):
-                return Outcome.failed("git-merge : match_head_commit doit être un SHA de 40 hex")
+                return Outcome.failed("git-merge: match_head_commit must be a 40-hex SHA")
             argv += ["--match-head-commit", head]
         if args.get("delete_branch") is True:
             argv.append("--delete-branch")
@@ -170,33 +170,33 @@ class GitMergeConnector:
                 [gh, *argv], capture_output=True, text=True, timeout=self.timeout,
                 env=self.env, stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
-            return Outcome.unknown("gh pr merge : délai dépassé (%ss)" % self.timeout)
+            return Outcome.unknown("gh pr merge: timed out (%ss)" % self.timeout)
         except FileNotFoundError as exc:
-            return Outcome.failed("gh n'a pas pu démarrer : %s" % exc)
+            return Outcome.failed("gh could not start: %s" % exc)
         except OSError as exc:
-            return Outcome.unknown("gh pr merge : %s" % exc)
+            return Outcome.unknown("gh pr merge: %s" % exc)
         view = self.view(repo, number)
         pr = "PR %s#%d" % (repo, number)
         merged = self._merge_ref(view)
         if merged:
-            return Outcome.confirmed(merged, "%s fusionnée (commit %s)%s" % (
+            return Outcome.confirmed(merged, "%s merged (commit %s)%s" % (
                 pr, merged[:12],
-                " malgré le code %d" % proc.returncode if proc.returncode else ""))
+                " despite exit code %d" % proc.returncode if proc.returncode else ""))
         output = " ".join((proc.stderr or proc.stdout or "").split())[:500] or "—"
         if proc.returncode == 0:
             # file de fusion, fusion automatique : gh a répondu, la fusion n'a pas
             # (encore) eu lieu et peut encore avoir lieu
-            return Outcome.unknown("gh pr merge : code 0 mais %s %s, fusion non constatée "
-                                   "(file de fusion ?) : issue inconnue, la réconciliation "
-                                   "tranchera — %s" % (pr, self._seen(view), output))
+            return Outcome.unknown("gh pr merge: code 0 but %s %s, merge not seen "
+                                   "(merge queue?): outcome unknown, reconciliation "
+                                   "will decide — %s" % (pr, self._seen(view), output))
         if any(pattern.search(proc.stderr or "") for pattern in REFUSALS):
-            return Outcome.failed("gh pr merge : refus explicite (code %d) : %s"
+            return Outcome.failed("gh pr merge: explicit refusal (code %d): %s"
                                   % (proc.returncode, output))
         if view is not None and view["state"] == "CLOSED":
-            return Outcome.failed("%s fermée sans fusion (gh pr merge : code %d : %s)"
+            return Outcome.failed("%s closed without merge (gh pr merge: code %d: %s)"
                                   % (pr, proc.returncode, output))
-        return Outcome.unknown("gh pr merge : code %d, %s %s : issue inconnue, la "
-                               "réconciliation tranchera — %s"
+        return Outcome.unknown("gh pr merge: code %d, %s %s: outcome unknown, "
+                               "reconciliation will decide — %s"
                                % (proc.returncode, pr, self._seen(view), output))
 
     def reconcile(self, action: Action) -> Outcome | None:
@@ -210,9 +210,9 @@ class GitMergeConnector:
         pr = "PR %s#%d" % (repo, number)
         merged = self._merge_ref(view)
         if merged:
-            return Outcome.confirmed(merged, "%s fusionnée (commit %s)" % (pr, merged[:12]))
+            return Outcome.confirmed(merged, "%s merged (commit %s)" % (pr, merged[:12]))
         if view["state"] == "CLOSED":
-            return Outcome.failed("%s fermée sans fusion : la fusion n'a pas eu lieu" % pr)
+            return Outcome.failed("%s closed without merge: the merge did not happen" % pr)
         # OPEN : peut-être en file de fusion, la fusion peut encore avoir lieu
-        return Outcome.unknown("%s %s : fusion non constatée (file de fusion ?), issue "
-                               "toujours inconnue" % (pr, self._seen(view)))
+        return Outcome.unknown("%s %s: merge not seen (merge queue?), outcome "
+                               "still unknown" % (pr, self._seen(view)))

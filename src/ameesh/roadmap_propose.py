@@ -118,13 +118,17 @@ def _command(p: dict) -> str:
 
 def _proposal(kind: str, what: str, *, due, source_kind: str, source_ref: str,
               source_label: str, origin: str, project=None, lot=None, owner=None,
-              depends_on=(), lots=(), plan_task: bool = False) -> dict:
+              depends_on=(), lots=(), plan_task: bool = False, key_what=None) -> dict:
     what = what if len(what) <= WHAT_CHARS else what[:WHAT_CHARS - 1] + "…"
+    # `key_what`: the text the dedupe key was computed from before the
+    # English labels (L232), so already recorded proposals keep their key.
+    if key_what is not None and len(key_what) > WHAT_CHARS:
+        key_what = key_what[:WHAT_CHARS - 1] + "…"
     p = {"kind": kind, "what": what, "due": due, "project": project, "lot": lot,
          "owner": owner, "source_kind": source_kind, "source_ref": source_ref,
          "source_label": source_label, "depends_on": list(depends_on), "lots": list(lots),
          "plan_task": plan_task,
-         "key": _key(origin, kind, what, due, lot)}
+         "key": _key(origin, kind, what if key_what is None else key_what, due, lot)}
     p["command"] = _command(p)
     return p
 
@@ -137,7 +141,7 @@ def from_decision(data: dict, body: str, *, ref: str, origin: str, base: _dt.dat
     dédoublonnage."""
     title = " ".join(str(data.get("title") or os.path.basename(origin)).split())
     stem = os.path.basename(origin)[:-3] if origin.endswith(".md") else os.path.basename(origin)
-    label = "décision %s" % stem
+    label = "decision %s" % stem
     project = data.get("project") or data.get("team") or None
     when = _ref_date(data, base)
     out: list[dict] = []
@@ -150,9 +154,10 @@ def from_decision(data: dict, body: str, *, ref: str, origin: str, base: _dt.dat
                     due = _dt.date.fromisoformat(str(data[key]).strip()[:10]).isoformat()
                 except ValueError:
                     pass
-        out.append(_proposal("decision", "Décider : %s" % title, due=due,
+        out.append(_proposal("decision", "Decide: %s" % title, due=due,
                              source_kind="decision", source_ref=ref, source_label=label,
-                             origin=origin, project=project))
+                             origin=origin, project=project,
+                             key_what="Décider : %s" % title))
     lots: list[str] = []
     depends: list[str] = []
     for sentence in _sentences(body):
@@ -186,9 +191,10 @@ def from_decision(data: dict, body: str, *, ref: str, origin: str, base: _dt.dat
     lots = [l for l in lots if l not in depends]
     if lots:
         out.append(_proposal(
-            "commitment", "Lots %s (%s : %s)" % (", ".join(lots), label, title), due=None,
+            "commitment", "Lots %s (%s: %s)" % (", ".join(lots), label, title), due=None,
             source_kind="decision", source_ref=ref, source_label=label, origin=origin,
-            project=project, depends_on=depends, lots=lots))
+            project=project, depends_on=depends, lots=lots,
+            key_what="Lots %s (décision %s : %s)" % (", ".join(lots), stem, title)))
     return out
 
 
@@ -216,7 +222,7 @@ def from_task(item: dict, *, base: _dt.date, has_due: set) -> list[dict]:
             out.append(_proposal(
                 "commitment", "#%d %s" % (int(item["id"]), item.get("title") or ""),
                 due=day.isoformat(), source_kind="task", source_ref="#%d" % int(item["id"]),
-                source_label="corps de la tâche #%d" % int(item["id"]),
+                source_label="body of task #%d" % int(item["id"]),
                 origin="task:%d" % int(item["id"]), lot=int(item["id"]),
                 project=item.get("app") or item.get("workstream") or None,
                 owner=item.get("assignee") or None, plan_task=True))
@@ -275,7 +281,7 @@ def propose(db, *, cfg=None, dirs=(), canon: bool = True, tasks: bool = True,
     existing = st.roadmap.commitments()
     keys = {c["proposal_key"]: c for c in existing if c.get("proposal_key")}
     if tasks:
-        sources.append("corps des tâches ouvertes")
+        sources.append("open task bodies")
         has_due = {(c["work_item_id"], c["due_on"]) for c in existing
                    if c.get("work_item_id") and c["status"] != "cancelled"}
         done = dev.CORRESPONDANCES["etats_livres"] + dev.CORRESPONDANCES["etats_abandonnes"]
@@ -308,7 +314,7 @@ def record(db, proposals: list[dict], *, actor: str = "") -> list[dict]:
             "project": p["project"], "work_item_id": p["lot"], "source_kind": p["source_kind"],
             "source_ref": p["source_ref"], "depends_on": p["depends_on"] + [
                 "lot %s" % l for l in p["lots"]] if p["lots"] else p["depends_on"],
-            "note": "proposition tirée de %s" % p["source_label"], "created_by": actor or "",
+            "note": "proposal drawn from %s" % p["source_label"], "created_by": actor or "",
             "proposal_key": p["key"]})
         if row is not None:
             p["recorded"] = {"id": row["id"], "status": row["status"], "new": True}
@@ -324,24 +330,24 @@ def run(db, args, *, cfg=None, now: float | None = None) -> int:
         print(json.dumps(dict(view, recorded=[c["id"] for c in created]), ensure_ascii=False,
                          indent=2))
         return 0
-    print("propositions de feuille de route (%s) : %d" % (
-        ", ".join(view["sources"]) or "aucune source", len(view["proposals"])))
+    print("roadmap proposals (%s): %d" % (
+        ", ".join(view["sources"]) or "no source", len(view["proposals"])))
     for p in view["proposals"]:
         state = ""
         if p.get("recorded"):
             state = " [%s e%d%s]" % (
-                "enregistrée" if p["recorded"].get("new") else "déjà enregistrée",
+                "recorded" if p["recorded"].get("new") else "already recorded",
                 p["recorded"]["id"], ", %s" % p["recorded"]["status"]
                 if not p["recorded"].get("new") else "")
         print("- %s %s%s — %s%s" % (
-            {"decision": "jalon de décision", "commitment": "engagement"}[p["kind"]],
-            "pour %s" % p["due"] if p["due"] else "sans date", state, p["what"],
-            " (dépend de %s)" % ", ".join(p["depends_on"]) if p["depends_on"] else ""))
-        print("    source : %s" % (p["source_ref"] or p["source_label"]))
-        print("    pour valider : %s" % (
+            {"decision": "decision milestone", "commitment": "commitment"}[p["kind"]],
+            "due %s" % p["due"] if p["due"] else "undated", state, p["what"],
+            " (depends on %s)" % ", ".join(p["depends_on"]) if p["depends_on"] else ""))
+        print("    source: %s" % (p["source_ref"] or p["source_label"]))
+        print("    to accept: %s" % (
             "ameesh plan accept %d%s" % (p["recorded"]["id"], "" if p["due"] else
-                                         " --pour AAAA-MM-JJ")
+                                         " --pour YYYY-MM-DD")
             if p.get("recorded") else p["command"]))
     if not args.record and view["proposals"]:
-        print("(rien n'est enregistré : --record pour garder ces propositions, à valider)")
+        print("(nothing recorded: use --record to keep these proposals for review)")
     return 0

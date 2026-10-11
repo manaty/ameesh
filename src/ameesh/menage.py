@@ -93,7 +93,9 @@ LOTLESS_TTL_S = 7 * 24 * 3600.0
 WORKTREE_MIN_AGE_S = 3600.0
 #: préfixe du détail d'un worktree apparu pendant un tour mais pas créé par
 #: l'agent du tour (L73b) : suivi pour être vu, jamais retiré automatiquement
-UNATTRIBUTED = "non attribué"
+UNATTRIBUTED = "unattributed"
+#: the same prefix as written before L232 (rows already stored)
+UNATTRIBUTED_LEGACY = "non attribué"
 #: borne d'un parcours de taille (fichiers) : au-delà, la taille est un minimum
 WALK_LIMIT = 300_000
 #: délai maximal d'une commande git (secondes)
@@ -108,10 +110,10 @@ TMP_TOP = 5
 #: L162 : systèmes de fichiers en mémoire — jamais une racine gérée
 MEMORY_FS = ("tmpfs", "ramfs")
 #: L162 : l'action attendue quand le tmpfs se remplit (alertes, journal)
-TMPFS_ACTION = ("action attendue : supprimer ce qui ne sert plus (commande par entrée "
-                "dans `ameesh menage`) ; le ménage supprime seul une entrée laissée par "
-                "un tour, inchangée depuis %s et tenue par aucun processus ; les agents "
-                "écrivent dans $TMPDIR, jamais en dur dans /tmp")
+TMPFS_ACTION = ("expected action: delete what is no longer needed (one command per entry "
+                "in `ameesh menage`); housekeeping deletes on its own an entry left by "
+                "a turn, unchanged for %s and held by no process; agents "
+                "write in $TMPDIR, never directly in /tmp")
 
 #: dossier géré sous l'état d'ameesh (un nom d'agent ne commence jamais par
 #: un point : pas de collision avec `<état>/<agent>`)
@@ -191,21 +193,21 @@ class Policy:
 
 def _path_problem(value) -> str | None:
     if not isinstance(value, str) or not value.strip():
-        return "chemin vide"
+        return "empty path"
     text = value.strip()
     if "{" in text or "}" in text:
-        return "gabarit non admis"
+        return "templates not allowed"
     if not (text.startswith("/") or text.startswith("~")):
-        return "chemin absolu (ou ~) attendu"
+        return "absolute path (or ~) expected"
     if os.path.normpath(text) in FORBIDDEN_ROOTS or text.rstrip("/") in FORBIDDEN_ROOTS:
-        return "dossier partagé par le système (%s) : choisir un sous-dossier dédié" % text
+        return "directory shared by the system (%s): choose a dedicated subdirectory" % text
     return None
 
 
 def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
     """(clés valides, problèmes, clés inconnues) de `policy.housekeeping`."""
     if not isinstance(raw, dict):
-        return {}, ["mapping attendu"], []
+        return {}, ["mapping expected"], []
     parsed: dict = {}
     problems: list[str] = []
     for key in ("tmp_root", "cache_root"):
@@ -213,7 +215,7 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             continue
         problem = _path_problem(raw[key])
         if problem:
-            problems.append("`%s` : %s" % (key, problem))
+            problems.append("`%s`: %s" % (key, problem))
         else:
             parsed[key] = raw[key].strip()
     for key in ("tmp_quota", "cache_quota", "orphan_min_size"):
@@ -221,26 +223,26 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             continue
         octets = resources_mod.parse_bytes(raw[key])
         if octets is None:
-            problems.append("`%s` : taille en octets attendue (ex. 4GiB)" % key)
+            problems.append("`%s`: size in bytes expected (e.g. 4GiB)" % key)
         else:
             parsed[key] = octets
     if raw.get("tmpfs_alert") is not None:
         part = resources_mod.parse_fraction(raw["tmpfs_alert"])
         if part is None:
-            problems.append("`tmpfs_alert` : part attendue (0 < x <= 1, ou « 60% »)")
+            problems.append("`tmpfs_alert`: fraction expected (0 < x <= 1, or \"60%\")")
         else:
             parsed["tmpfs_alert"] = part
     if raw.get("orphan_idle") is not None:
         seconds = parse_idle(raw["orphan_idle"])
         if seconds is None:
-            problems.append("`orphan_idle` : durée attendue (ex. 2h, 90m, 7200)")
+            problems.append("`orphan_idle`: duration expected (e.g. 2h, 90m, 7200)")
         else:
             parsed["orphan_idle"] = seconds
     for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup"):
         if raw.get(key) is None:
             continue
         if not isinstance(raw[key], bool):
-            problems.append("`%s` : booléen attendu" % key)
+            problems.append("`%s`: boolean expected" % key)
         else:
             parsed[key] = raw[key]
     unknown = sorted(str(k) for k in set(raw) - set(POLICY_KEYS))
@@ -332,7 +334,7 @@ def declared_root_refused(cfg, policy: Policy) -> list[str]:
                                 ("cache_root", cache_root(cfg, policy))):
         declared = getattr(policy, key)
         if declared and _expand(declared) != effective_root:
-            out.append("%s %s en mémoire (tmpfs) : écarté, %s utilisé"
+            out.append("%s %s in memory (tmpfs): set aside, %s used"
                        % (key, declared, effective_root))
     return out
 
@@ -532,8 +534,8 @@ def _ensure_root(root: str) -> None:
     marker = os.path.join(root, MARKER)
     if not os.path.exists(marker):
         with open(marker, "w", encoding="utf-8") as fh:
-            fh.write("dossier géré par ameesh (L73) : son contenu peut être supprimé "
-                     "par le ménage\n")
+            fh.write("directory managed by ameesh (L73): its content may be deleted "
+                     "by housekeeping\n")
 
 
 def _managed(root: str) -> bool:
@@ -624,7 +626,7 @@ def hold_tmp(cfg, policy: Policy, agent: str, *, new_session: bool) -> TmpHold:
                 lock.close()
                 lock = None
         if lock is None:
-            raise OSError("L219 : aucun dossier temporaire verrouillable pour %s dans %s"
+            raise OSError("L219: no lockable temporary directory for %s in %s"
                           % (agent, troot))
         exclusive = True
     mine = os.path.join(troot, name)
@@ -637,7 +639,7 @@ def hold_tmp(cfg, policy: Policy, agent: str, *, new_session: bool) -> TmpHold:
         if freed:
             entries.append({"kind": "tmp", "action": "deleted", "path": mine,
                             "bytes": freed, "agent": agent,
-                            "detail": "session neuve : dossier temporaire vidé"})
+                            "detail": "new session: temporary directory emptied"})
     fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
     # a resumed session writes nothing at first: the pass must not see it idle
     try:
@@ -752,9 +754,9 @@ def _safe_rmtree(path: str, root: str) -> int:
     rend les octets libérés. Un lien symbolique est retiré, jamais suivi ;
     jamais la racine elle-même ni son marqueur, jamais un chemin hors d'elle."""
     if not _managed(root):
-        raise RefusedDeletion("%s n'est pas un dossier géré par ameesh" % root)
+        raise RefusedDeletion("%s is not a directory managed by ameesh" % root)
     if not _located_in(path, root):
-        raise RefusedDeletion("%s est hors de %s" % (path, root))
+        raise RefusedDeletion("%s is outside %s" % (path, root))
     size = size_of(path)
     if os.path.islink(path) or not os.path.isdir(path):
         os.unlink(path)
@@ -803,7 +805,7 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
     total, evicted, files = before, 0, 0
     if before > quota:
         if not dry_run and not _managed(root):
-            raise RefusedDeletion("%s n'est pas un dossier géré par ameesh" % root)
+            raise RefusedDeletion("%s is not a directory managed by ameesh" % root)
         for path, size, mtime in sorted(found, key=lambda item: item[2]):
             if total <= quota:
                 break
@@ -903,7 +905,7 @@ def scan_activity(path: str, limit: int = WALK_LIMIT) -> dict:
     try:
         top = os.lstat(path)
     except OSError as exc:
-        out.update(complete=False, why="illisible (%s)" % (exc.strerror or exc))
+        out.update(complete=False, why="unreadable (%s)" % (exc.strerror or exc))
         return out
     latest = max(top.st_mtime, top.st_ctime)
     if not stat.S_ISDIR(top.st_mode):
@@ -919,24 +921,24 @@ def scan_activity(path: str, limit: int = WALK_LIMIT) -> dict:
                     try:
                         st = entry.stat(follow_symlinks=False)
                     except OSError:
-                        out.update(complete=False, why="entrée illisible : %s" % entry.path)
+                        out.update(complete=False, why="unreadable entry: %s" % entry.path)
                         continue
                     count += 1
                     latest = max(latest, st.st_mtime, st.st_ctime)
                     if stat.S_ISDIR(st.st_mode):
                         if st.st_dev != top.st_dev:
                             out.update(complete=False, latest=latest,
-                                       why="point de montage dedans : %s" % entry.path)
+                                       why="mount point inside: %s" % entry.path)
                             return out
                         stack.append(entry.path)
                     else:
                         out["bytes"] += _blocks(st)
                     if count >= limit:
                         out.update(complete=False, latest=latest,
-                                   why="plus de %d entrées : activité non vérifiable" % limit)
+                                   why="more than %d entries: activity not verifiable" % limit)
                         return out
         except OSError:
-            out.update(complete=False, why="dossier illisible : %s" % current)
+            out.update(complete=False, why="unreadable directory: %s" % current)
     out["latest"] = latest
     return out
 
@@ -962,11 +964,11 @@ def unsaved_git_work(path: str) -> str:
     for copy in _git_copies(path):
         st = worktree_state(copy)
         if st["locked"]:
-            return "%s verrouillé (git worktree lock)" % copy
+            return "%s locked (git worktree lock)" % copy
         if not st["clean"]:
-            return "%s : %s" % (copy, st["reason"] or "modifications non commitées")
+            return "%s: %s" % (copy, st["reason"] or "uncommitted changes")
         if not (st["pushed"] or st["integrated"]):
-            return "%s : HEAD %s sur aucune branche distante" % (copy, st["head"][:12] or "?")
+            return "%s: HEAD %s on no remote branch" % (copy, st["head"][:12] or "?")
     return ""
 
 
@@ -977,15 +979,15 @@ def tmp_holder(path: str) -> str:
     try:
         found = platform.holders(_real(path), needle=os.path.abspath(path))
     except platform.NotAvailable as exc:
-        return "détenteurs illisibles (%s)" % exc
+        return "holders unreadable (%s)" % exc
     if not found:
         return ""
     first = found[0]
     why = first.get("why") or ""
-    if "ligne de commande" in why:
-        why = "chemin sur la ligne de commande"
-    return "tenu par le processus %s (%s : %s)" % (first.get("pid"), why,
-                                                   (first.get("cmd") or "")[:80])
+    if "command line" in why or "ligne de commande" in why:
+        why = "path on the command line"
+    return "held by process %s (%s: %s)" % (first.get("pid"), why,
+                                           (first.get("cmd") or "")[:80])
 
 
 def _tmp_entry_problem(path: str, base: str, ino=None, dev=None) -> str:
@@ -996,17 +998,17 @@ def _tmp_entry_problem(path: str, base: str, ino=None, dev=None) -> str:
     name = os.path.basename(path)
     if not name or name in (".", "..") or \
             os.path.realpath(os.path.dirname(os.path.abspath(path))) != os.path.realpath(base):
-        return "hors du /tmp du système (%s)" % base
+        return "outside the system /tmp (%s)" % base
     try:
         st = os.lstat(path)
     except OSError:
-        return "illisible"
+        return "unreadable"
     if stat.S_ISLNK(st.st_mode) or not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
-        return "ni dossier ni fichier ordinaire"
+        return "neither a directory nor a regular file"
     if st.st_uid != os.getuid():
-        return "appartient à un autre utilisateur"
+        return "belongs to another user"
     if ino is not None and (st.st_ino, st.st_dev) != (ino, dev):
-        return "recréée depuis le signalement (autre inode)"
+        return "recreated since it was flagged (different inode)"
     return ""
 
 
@@ -1015,7 +1017,7 @@ def _remove_tmp_entry(path: str, base: str, ino=None, dev=None) -> int:
     (`_tmp_entry_problem`) ; rend les octets libérés."""
     problem = _tmp_entry_problem(path, base, ino, dev)
     if problem:
-        raise RefusedDeletion("%s : %s" % (path, problem))
+        raise RefusedDeletion("%s: %s" % (path, problem))
     before = size_of(path)
     if stat.S_ISDIR(os.lstat(path).st_mode):
         _make_owned_dirs_writable(path)
@@ -1054,35 +1056,35 @@ def _orphan_verdict(row: dict, policy: Policy, *, base: str, registered, protect
     path = row["path"]
     data = row.get("data") or {}
     if not policy.orphan_cleanup:
-        return "garde", "suppression coupée sur cet hôte (orphan_cleanup: false)"
+        return "garde", "deletion disabled on this host (orphan_cleanup: false)"
     problem = _tmp_entry_problem(path, base, data.get("ino"), data.get("dev"))
     if problem:
         return "garde", problem
     agent = row.get("agent")
     if registered is None:
-        return "garde", "registre illisible"
+        return "garde", "registry unreadable"
     if not agent or agent not in registered:
-        return "garde", "agent %s absent du registre" % (agent or "?")
+        return "garde", "agent %s not in the registry" % (agent or "?")
     if agent in running:
-        return "attend", "tour en cours de %s" % agent
+        return "attend", "turn in progress for %s" % agent
     target = _real(path)
     if any(_under(p, target) for p in protected):
-        return "garde", "contient un dossier de travail d'agent ou un dossier géré"
+        return "garde", "contains an agent's working directory or a managed directory"
     scan = scan_activity(path)
     if not scan["complete"]:
         return "garde", scan["why"]
     idle = now - float(scan["latest"])
     if idle < policy.orphan_idle:
-        return "attend", "modifié il y a %s (supprimé après %s sans changement)" % (
+        return "attend", "modified %s ago (deleted after %s without change)" % (
             fmt_idle(max(0.0, idle)), fmt_idle(policy.orphan_idle))
     work = unsaved_git_work(path)
     if work:
-        return "garde", "travail git à garder — %s" % work
+        return "garde", "git work to keep — %s" % work
     holder = tmp_holder(path)
     if holder:
         return "attend", holder
-    return "suppression", "laissé par le tour %s de %s, inchangé depuis %s, tenu par aucun " \
-        "processus" % (str(data.get("turn") or "?")[:8], agent, fmt_idle(idle))
+    return "suppression", "left by turn %s of %s, unchanged for %s, held by no " \
+        "process" % (str(data.get("turn") or "?")[:8], agent, fmt_idle(idle))
 
 
 def orphan_pass(db, host: str, policy: Policy, *, registered, protected: set,
@@ -1131,18 +1133,18 @@ def orphan_pass(db, host: str, policy: Policy, *, registered, protected: set,
         try:
             freed = _remove_tmp_entry(path, base, data.get("ino"), data.get("dev"))
         except (OSError, RefusedDeletion) as exc:
-            item.update(status="garde", detail="suppression refusée : %s" % exc)
+            item.update(status="garde", detail="deletion refused: %s" % exc)
             present.append(item)
             continue
         for repo in worktrees:
             prune_worktrees(repo)
         entries.append(dict(base_item, action="deleted", bytes=freed,
-                            detail="entrée de /tmp abandonnée : %s" % why,
+                            detail="abandoned /tmp entry: %s" % why,
                             data={"turn": data.get("turn"), "command": item["command"]}))
         if os.path.lexists(path):  # suppression partielle : ce qui reste est dit
             present.append(dict(item, bytes=size_of(path), status="garde",
-                                detail="suppression partielle (fichiers d'un autre "
-                                       "utilisateur ?)"))
+                                detail="partial deletion (files of another "
+                                       "user?)"))
     return entries, plan, present
 
 
@@ -1184,18 +1186,18 @@ def describe_top(top) -> str:
     for e in top or ():
         who = e.get("owner") or "?"
         if e.get("agent"):
-            who += ", laissé par %s" % e["agent"]
+            who += ", left by %s" % e["agent"]
             if e.get("status"):
-                who += " : %s" % e["status"]
+                who += ": %s" % action_label(e["status"])
         parts.append("%s %s (%s)" % (e.get("path"), _fmt(e.get("bytes")), who))
-    return " ; ".join(parts)
+    return "; ".join(parts)
 
 
 def tmpfs_hint(top, policy: Policy) -> str:
     """Le complément d'une alerte de tmpfs plein : les plus grosses entrées
     (si un bilan les a relevées) et l'action attendue."""
-    plus_gros = ("plus gros dans /tmp : %s" % describe_top(top)) if top else \
-        "plus gros dans /tmp : `ameesh menage` sur l'hôte"
+    plus_gros = ("largest in /tmp: %s" % describe_top(top)) if top else \
+        "largest in /tmp: `ameesh menage` on the host"
     return "%s — %s" % (plus_gros, TMPFS_ACTION % fmt_idle(policy.orphan_idle))
 
 
@@ -1280,14 +1282,14 @@ def worktree_state(path: str) -> dict:
     out = {"exists": os.path.isdir(path), "clean": False, "pushed": False,
            "integrated": False, "locked": False, "head": "", "reason": ""}
     if not out["exists"]:
-        out["reason"] = "dossier disparu"
+        out["reason"] = "directory gone"
         return out
     gitdir = _git(["rev-parse", "--absolute-git-dir"], path)
     if gitdir is not None and gitdir.returncode == 0 and gitdir.stdout.strip():
         out["locked"] = os.path.exists(os.path.join(gitdir.stdout.strip(), "locked"))
     status = _git(["status", "--porcelain", "--untracked-files=normal"], path)
     if status is None or status.returncode != 0:
-        out["reason"] = "état git illisible"
+        out["reason"] = "git status unreadable"
         return out
     dirty = [line for line in status.stdout.splitlines() if line.strip()]
     out["clean"] = not dirty
@@ -1316,13 +1318,13 @@ def worktree_state(path: str) -> dict:
                     and tree.returncode == 0 and merged.stdout.strip():
                 out["integrated"] = (merged.stdout.split()[0] == tree.stdout.strip())
     if out["locked"]:
-        out["reason"] = "verrouillé (git worktree lock)"
+        out["reason"] = "locked (git worktree lock)"
     elif dirty:
-        out["reason"] = "%d fichier(s) modifié(s) ou non suivi(s)" % len(dirty)
+        out["reason"] = "%d file(s) modified or untracked" % len(dirty)
     elif not out["integrated"]:
-        out["reason"] = "HEAD %s non intégré à %s (%s)" % (
-            out["head"][:12] or "?", ref or "la branche principale distante",
-            "poussé mais non fusionné" if out["pushed"] else "commits non poussés")
+        out["reason"] = "HEAD %s not integrated into %s (%s)" % (
+            out["head"][:12] or "?", ref or "the remote main branch",
+            "pushed but not merged" if out["pushed"] else "commits not pushed")
     return out
 
 
@@ -1376,9 +1378,9 @@ def remove_worktree(path: str, repo: str) -> tuple[bool, str]:
     base = repo if repo and os.path.isdir(repo) else path
     proc = _git(["worktree", "remove", path], base)
     if proc is None:
-        return False, "git indisponible"
+        return False, "git unavailable"
     if proc.returncode != 0:
-        return False, (proc.stderr or proc.stdout).strip()[:300] or "refusé par git"
+        return False, (proc.stderr or proc.stdout).strip()[:300] or "refused by git"
     return True, ""
 
 
@@ -1465,7 +1467,7 @@ class Turn:
                         "kind": "tmp", "action": "evicted",
                         "path": self.tmp,
                         "bytes": result["evicted"], "agent": self.agent, "lot": lot,
-                        "detail": "quota %s : %d fichier(s) les plus anciens évincés"
+                        "detail": "quota %s: %d oldest file(s) evicted"
                                   % (resources_mod.fmt_value("q", policy.tmp_quota),
                                      result["files"])})
         finally:
@@ -1494,29 +1496,29 @@ class Turn:
                 if row is None:
                     continue
                 if mine:
-                    detail = ("apparu pendant le tour %s (%s) ; retiré à la fin du lot s'il "
-                              "est propre et intégré à la branche principale"
-                              % (turn_id[:8], wt.get("branch") or "détaché"))
+                    detail = ("appeared during turn %s (%s); removed at the end of the lot if "
+                              "clean and integrated into the main branch"
+                              % (turn_id[:8], wt.get("branch") or "detached"))
                 else:
-                    detail = ("%s : apparu pendant le tour %s (%s) hors du dossier de "
-                              "l'agent ; jamais retiré automatiquement"
-                              % (UNATTRIBUTED, turn_id[:8], wt.get("branch") or "détaché"))
+                    detail = ("%s: appeared during turn %s (%s) outside the agent's "
+                              "directory; never removed automatically"
+                              % (UNATTRIBUTED, turn_id[:8], wt.get("branch") or "detached"))
                     hk.set_worktree_status(row["id"], "active", detail)
                 self.entries.append({
                     "kind": "worktree", "action": "registered", "path": wt["path"],
                     "agent": self.agent, "lot": lot if mine else None, "detail": detail})
         exclude = tuple(v for v in (self.env.get("TMPDIR"), self.env.get("AMEESH_CACHE_DIR"))
                         if v)
-        sort = (("supprimé par le ménage après %s sans changement s'il n'est tenu par aucun "
-                 "processus (L162)" % fmt_idle(policy.orphan_idle)) if policy.orphan_cleanup
-                else "jamais supprimé automatiquement (orphan_cleanup: false)")
+        sort = (("deleted by housekeeping after %s without change if held by no "
+                 "process (L162)" % fmt_idle(policy.orphan_idle)) if policy.orphan_cleanup
+                else "never deleted automatically (orphan_cleanup: false)")
         for found in new_tmp_entries(self.tmp_before, min_size=policy.orphan_min_size,
                                      exclude=exclude):
             self.entries.append({
                 "kind": "orphan", "action": "signaled", "path": found["path"],
                 "bytes": found["bytes"], "agent": self.agent, "lot": lot,
-                "detail": "apparu dans /tmp pendant le tour %s de %s (attribution probable) ; "
-                          "hors des dossiers gérés : %s" % (turn_id[:8], self.agent, sort),
+                "detail": "appeared in /tmp during turn %s of %s (probable attribution); "
+                          "outside managed directories: %s" % (turn_id[:8], self.agent, sort),
                 "data": {"command": found["command"], "turn": turn_id,
                          "ino": found["ino"], "dev": found["dev"]}})
         return self.entries
@@ -1596,14 +1598,14 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
     for row in store.worktrees(host, ("active", "kept")):
         path, lot = row["path"], row.get("lot")
         base = {"kind": "worktree", "path": path, "agent": row["agent"], "lot": lot}
-        if (row.get("detail") or "").startswith(UNATTRIBUTED):
+        if (row.get("detail") or "").startswith((UNATTRIBUTED, UNATTRIBUTED_LEGACY)):
             if not os.path.isdir(path):
                 plan.append(dict(base, action="disparu", detail=UNATTRIBUTED))
                 if not dry_run:
                     prune_worktrees(row.get("repo") or "")
                     store.set_worktree_status(row["id"], "gone",
-                                              "dossier disparu (%s)" % UNATTRIBUTED)
-                    entries.append(dict(base, action="gone", detail="dossier disparu ; "
+                                              "directory gone (%s)" % UNATTRIBUTED)
+                    entries.append(dict(base, action="gone", detail="directory gone; "
                                         "git worktree prune (%s)" % UNATTRIBUTED))
             else:
                 plan.append(dict(base, action="garde", detail=row.get("detail")))
@@ -1614,42 +1616,42 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
                        and now - float(row.get("created_ts") or now) >= LOTLESS_TTL_S)
         if not ended and not lotless_due:
             plan.append({"path": path, "agent": row["agent"], "lot": lot,
-                         "action": "attend", "detail": "lot %s" % (state or "inconnu")
-                         if lot else "sans lot"})
+                         "action": "attend", "detail": "lot %s" % (state or "unknown")
+                         if lot else "no lot"})
             continue
-        why = ("lot #%s %s" % (lot, state)) if ended else "sans lot depuis plus de 7 j"
+        why = ("lot #%s %s" % (lot, state)) if ended else "no lot for more than 7 d"
         target = _real(path)
         if any(_under(_real(cwd), target) for cwd in protected):
-            plan.append(dict(base, action="garde", detail="dossier de travail d'un agent"))
+            plan.append(dict(base, action="garde", detail="an agent's working directory"))
             continue
         if row["agent"] in running:
             plan.append(dict(base, action="attend",
-                             detail="%s ; tour en cours de %s" % (why, row["agent"])))
+                             detail="%s; turn in progress for %s" % (why, row["agent"])))
             continue
         moments = [float(row.get("created_ts") or now), _mtime(path)]
         youngest = max(m for m in moments if m is not None)
         if now - youngest < WORKTREE_MIN_AGE_S:
             plan.append(dict(base, action="attend",
-                             detail="%s ; créé ou modifié il y a moins d'une heure" % why))
+                             detail="%s; created or modified less than an hour ago" % why))
             continue
         st = worktree_state(path)
         if not st["exists"]:
             plan.append(dict(base, action="disparu", detail=why))
             if not dry_run:
                 prune_worktrees(row.get("repo") or "")
-                store.set_worktree_status(row["id"], "gone", "dossier disparu (%s)" % why)
-                entries.append(dict(base, action="gone", detail="dossier disparu ; "
+                store.set_worktree_status(row["id"], "gone", "directory gone (%s)" % why)
+                entries.append(dict(base, action="gone", detail="directory gone; "
                                     "git worktree prune (%s)" % why))
             continue
         if st["locked"]:
-            plan.append(dict(base, action="garde", detail="%s ; %s" % (why, st["reason"])))
+            plan.append(dict(base, action="garde", detail="%s; %s" % (why, st["reason"])))
             continue
         if worktree_in_use(path):
             plan.append(dict(base, action="attend",
-                             detail="%s ; un processus travaille dedans" % why))
+                             detail="%s; a process is working in it" % why))
             continue
         if not st["clean"] or not st["integrated"]:
-            detail = "%s : gardé — %s" % (why, st["reason"])
+            detail = "%s: kept — %s" % (why, st["reason"])
             plan.append(dict(base, action="garde", detail=detail))
             if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
                 store.set_worktree_status(row["id"], "kept", detail)
@@ -1665,9 +1667,9 @@ def _worktree_pass(db, host: str, *, dry_run: bool, include_lotless: bool,
         if ok:
             store.set_worktree_status(row["id"], "removed", why)
             entries.append(dict(base, action="removed", bytes=size,
-                                detail="%s : propre et intégré, git worktree remove" % why))
+                                detail="%s: clean and integrated, git worktree remove" % why))
         else:
-            detail = "%s : retrait refusé par git — %s" % (why, error)
+            detail = "%s: removal refused by git — %s" % (why, error)
             store.set_worktree_status(row["id"], "kept", detail)
             entries.append(dict(base, action="kept", detail=detail))
     return entries, plan
@@ -1708,31 +1710,31 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
         base = {"kind": "container", "path": ref, "agent": agent, "lot": lot}
         row = turns.get(turn)
         if row is None or (row.get("host") or "") != (host or ""):
-            why = "tour %s inconnu sur cet hôte : signalé seulement" % turn[:8]
+            why = "turn %s unknown on this host: flagged only" % turn[:8]
             ours.append(dict(base, action="signalé", detail=why))
             out["plan"].append(dict(base, action="signalé", detail=why))
             continue
         if row.get("status") == "running":
-            ours.append(dict(base, action="attend", detail="tour %s en cours" % turn[:8]))
+            ours.append(dict(base, action="attend", detail="turn %s in progress" % turn[:8]))
             continue
         if lot:
             state = _lot_state(db, lot)
             if state not in LOT_ENDED:
-                detail = "lot #%s %s" % (lot, state or "inconnu")
+                detail = "lot #%s %s" % (lot, state or "unknown")
                 ours.append(dict(base, action="attend", detail=detail))
                 out["plan"].append(dict(base, action="attend", detail=detail))
                 continue
             why = "lot #%s %s" % (lot, state)
         else:
-            why = "tour %s fini" % turn[:8]
+            why = "turn %s finished" % turn[:8]
         out["plan"].append(dict(base, action="suppression", detail=why))
         if dry_run:
             ours.append(dict(base, action="suppression", detail=why))
             continue
         ok, error = runtime.remove(c.get("id") or ref)
         entry = dict(base, action="removed" if ok else "kept",
-                     detail=("%s : %s rm -f -v" % (why, binary)) if ok
-                     else "%s : suppression refusée — %s" % (why, error),
+                     detail=("%s: %s rm -f -v" % (why, binary)) if ok
+                     else "%s: deletion refused — %s" % (why, error),
                      data={"id": c.get("id"), "image": c.get("image"), "turn": turn})
         out["entries"].append(entry)
         if not ok:
@@ -1751,18 +1753,18 @@ def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
     without any activity; this mesh's of an agent ABSENT from the registry
     after `idle_after` (a turn writes in it)."""
     if owner is not None and owner != key:
-        return "appartient à un autre mesh"
+        return "belongs to another mesh"
     if owner is not None and registered:
         return ""
     latest = last_activity(path)
     if latest is None:
-        return "activité illisible (parcours incomplet)"
+        return "activity unreadable (incomplete walk)"
     idle = now - latest
     if owner is None and idle < UNOWNED_IDLE_S:
-        return "sans propriétaire (autre mesh du poste, ou antérieur à L219), " \
-               "actif il y a %d h (moins de %d h)" % (idle // 3600, UNOWNED_IDLE_S // 3600)
+        return "no owner (another mesh on this machine, or older than L219), " \
+               "active %d h ago (less than %d h)" % (idle // 3600, UNOWNED_IDLE_S // 3600)
     if not registered and idle < idle_after:
-        return "actif il y a %d min (moins de %d min)" % (idle // 60, idle_after // 60)
+        return "active %d min ago (less than %d min)" % (idle // 60, idle_after // 60)
     return ""
 
 
@@ -1825,7 +1827,7 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
             # or not
             if agent in running:
                 if registered is not None and agent not in registered:
-                    skipped.append("tmp %s gardé : en tour" % full)
+                    skipped.append("tmp %s kept: in turn" % full)
                 continue
             # a fallback directory (`hold_tmp`) served one turn: deleted once
             # idle, like the directory of an agent absent from the registry
@@ -1834,26 +1836,26 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
             why = tmp_problem(full, owner, key, registered=not orphan,
                               idle_after=policy.orphan_idle, now=now)
             if why:
-                skipped.append("tmp %s gardé : %s" % (full, why))
+                skipped.append("tmp %s kept: %s" % (full, why))
                 continue
             # L219: a turn holds the lock (shared) from its start to its end;
             # everything is checked again under the exclusive lock, right
             # before deleting or evicting
             lock = None if dry_run else tmp_lock(troot, name, exclusive=True)
             if not dry_run and lock is None:
-                skipped.append("tmp %s gardé : en tour (verrou pris)" % full)
+                skipped.append("tmp %s kept: in turn (lock held)" % full)
                 continue
             try:
                 if not dry_run and (read_owner(troot, name) != owner or tmp_problem(
                         full, owner, key, registered=not orphan,
                         idle_after=policy.orphan_idle, now=now)):
-                    skipped.append("tmp %s gardé : changé pendant le passage" % full)
+                    skipped.append("tmp %s kept: changed during the pass" % full)
                     continue
                 if orphan:
                     size = size_of(full)
                     plan.append({"kind": "tmp", "path": full, "agent": agent,
                                  "action": "suppression", "bytes": size,
-                                 "detail": "agent absent du registre"})
+                                 "detail": "agent not in the registry"})
                     if not dry_run:
                         freed = _safe_rmtree(full, troot)
                         for leftover in (owner_file(troot, name), lock_file(troot, name)):
@@ -1863,20 +1865,20 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                 pass
                         entries.append({"kind": "tmp", "action": "deleted", "path": full,
                                         "bytes": freed, "agent": agent,
-                                        "detail": "agent absent du registre"})
+                                        "detail": "agent not in the registry"})
                     continue
                 result = evict_lru([full], troot, policy.tmp_quota, now=now,
                                    dry_run=dry_run)
                 if result["files"]:
                     plan.append({"kind": "tmp", "path": full, "agent": agent,
                                  "action": "éviction", "bytes": result["evicted"],
-                                 "detail": "%d fichier(s), quota %s" % (
+                                 "detail": "%d file(s), quota %s" % (
                                      result["files"],
                                      resources_mod.fmt_value("q", policy.tmp_quota))})
                     if not dry_run:
                         entries.append({"kind": "tmp", "action": "evicted", "path": full,
                                         "bytes": result["evicted"], "agent": agent,
-                                        "detail": "quota %s : %d fichier(s) évincés" % (
+                                        "detail": "quota %s: %d file(s) evicted" % (
                                             resources_mod.fmt_value("q", policy.tmp_quota),
                                             result["files"])})
             finally:
@@ -1885,26 +1887,26 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     # 2. caches partagés
     directories = [os.path.join(croot, name) for name, _v in cache_names(policy)]
     if busy:
-        skipped.append("caches : un tour est en cours sur l'hôte, éviction remise")
+        skipped.append("caches: a turn is in progress on the host, eviction postponed")
     elif os.path.isdir(croot) and _managed(croot):
         result = evict_lru(directories, croot, policy.cache_quota, now=now, dry_run=dry_run)
         if result["files"]:
             plan.append({"kind": "cache", "path": croot, "action": "éviction",
                          "bytes": result["evicted"],
-                         "detail": "%d fichier(s), quota %s" % (
+                         "detail": "%d file(s), quota %s" % (
                              result["files"], resources_mod.fmt_value("q", policy.cache_quota))})
             if not dry_run:
                 entries.append({"kind": "cache", "action": "evicted", "path": croot,
                                 "bytes": result["evicted"],
-                                "detail": "quota %s : %d fichier(s) les plus anciens évincés"
+                                "detail": "quota %s: %d oldest file(s) evicted"
                                           % (resources_mod.fmt_value("q", policy.cache_quota),
                                              result["files"])})
         if result["over_quota"]:
-            skipped.append("caches : quota encore dépassé (fichiers de moins d'une heure)")
+            skipped.append("caches: quota still exceeded (files less than an hour old)")
     # 3. worktrees
     if policy.worktrees and registered is None:
         # sans registre, ni dossiers d'agents ni tours en cours connus
-        skipped.append("worktrees : registre illisible, aucun retrait")
+        skipped.append("worktrees: registry unreadable, no removal")
     elif policy.worktrees:
         wt_entries, wt_plan = _worktree_pass(db, host, dry_run=dry_run,
                                              include_lotless=include_lotless,
@@ -1924,7 +1926,7 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
             dry_run=dry_run, now=now)
     except Exception as exc:  # jamais fatal pour le passage
         orphan_entries, orphan_plan, orphans = [], [], []
-        skipped.append("/tmp : passage impossible (%s)" % type(exc).__name__)
+        skipped.append("/tmp: pass failed (%s)" % type(exc).__name__)
     entries += orphan_entries
     plan += orphan_plan
     skipped += declared_root_refused(cfg, policy)
@@ -1942,7 +1944,7 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     if not dry_run:
         entries.append({"kind": "mesure", "action": "measured", "path": troot,
                         "bytes": report_measure["tmp_bytes"] + report_measure["cache_bytes"],
-                        "detail": "bilan du ménage",
+                        "detail": "housekeeping summary",
                         "data": dict(report_measure, orphans=len(orphans),
                                      orphan_bytes=sum(o["bytes"] for o in orphans))})
         storage.of(db).housekeeping.log(host, entries, actor=actor)
@@ -1966,9 +1968,20 @@ def caller_refusal(env=None) -> str | None:
     env = env if env is not None else os.environ
     for name in ("AMEESH_TURN_ID", "AGENT_MAIL_NAME"):
         if env.get(name):
-            return ("session d'agent (%s posé) : le ménage est réservé à un humain ou à "
-                    "l'exécuteur" % name)
+            return ("agent session (%s set): housekeeping is reserved to a human or "
+                    "the runner" % name)
     return None
+
+
+#: L232: English labels of the plan actions and verdicts, for display only
+#: (the values themselves stay as stored and as in `--json`)
+ACTION_LABELS = {"attend": "waiting", "garde": "kept", "suppression": "delete",
+                 "retrait": "remove", "disparu": "gone", "signalé": "flagged",
+                 "éviction": "evict"}
+
+
+def action_label(action) -> str:
+    return ACTION_LABELS.get(action, action)
 
 
 def _fmt(value) -> str:
@@ -1976,60 +1989,61 @@ def _fmt(value) -> str:
 
 
 def print_report(report: dict) -> None:
-    mode = "ESSAI (rien n'est supprimé ; --apply pour exécuter)" if report["dry_run"] \
-        else "exécuté"
-    print("ménage de %s — %s" % (report["host"] or "?", mode))
+    mode = "DRY RUN (nothing is deleted; --apply to execute)" if report["dry_run"] \
+        else "executed"
+    print("housekeeping of %s — %s" % (report["host"] or "?", mode))
     m = report.get("measure") or {}
     if m:
-        print("  dossiers temporaires  %s (%s) ; quota %s par agent"
+        print("  temporary dirs        %s (%s); quota %s per agent"
               % (_fmt(m["tmp_bytes"]), m["tmp_root"], _fmt(m["tmp_quota"])))
-        print("  caches partagés       %s / %s (%s)"
+        print("  shared caches         %s / %s (%s)"
               % (_fmt(m["cache_bytes"]), _fmt(m["cache_quota"]), m["cache_root"]))
         sys_tmp = m.get("system_tmp") or {}
         if sys_tmp.get("tmp_size_bytes"):
             print("  %-21s %s / %s (%s)%s" % (
                 sys_tmp.get("tmp_path"), _fmt(sys_tmp.get("tmp_used_bytes")),
                 _fmt(sys_tmp.get("tmp_size_bytes")), sys_tmp.get("tmp_fstype") or "?",
-                " — ALERTE : au-delà de %d %%" % round(m["tmpfs_alert"] * 100)
+                " — ALERT: above %d %%" % round(m["tmpfs_alert"] * 100)
                 if (m.get("system_tmp_fraction") or 0) >= m["tmpfs_alert"] else ""))
     # en essai, les entrées de /tmp ont leur propre section (avec la commande)
     rows = [p for p in report["plan"] if p.get("kind") != "orphan"] if report["dry_run"] \
         else [e for e in report["entries"] if e["kind"] != "mesure"]
     if not rows:
-        print("  rien à faire")
+        print("  nothing to do")
     for row in rows:
         print("  %-9s %-12s %-10s %s%s" % (
-            row.get("kind", ""), row.get("action", ""),
+            row.get("kind", ""), action_label(row.get("action", "")),
             _fmt(row["bytes"]) if row.get("bytes") is not None else "",
             row.get("path", ""), " — %s" % row["detail"] if row.get("detail") else ""))
     for note in report.get("skipped") or ():
-        print("  remis     %s" % note)
+        print("  skipped   %s" % note)
     conteneurs = report.get("containers") or {}
     for c in conteneurs.get("ameesh") or ():
         if c["action"] != "suppression":
-            print("  conteneur %-12s %s — %s" % (c["action"], c["path"], c.get("detail") or ""))
+            print("  container %-12s %s — %s" % (action_label(c["action"]), c["path"],
+                                                 c.get("detail") or ""))
     autres = conteneurs.get("others") or []
     if autres:
-        print("  conteneurs non lancés par un tour d'ameesh (jamais supprimés par ameesh) :")
+        print("  containers not started by an ameesh turn (never deleted by ameesh):")
         for c in autres:
             print("    %s  %s  (%s)  →  %s" % (c.get("name") or c.get("id"), c.get("image"),
                                               c.get("status") or "?", c["command"]))
     orphans = report.get("orphans") or []
     if orphans:
-        print("  entrées de /tmp laissées par un tour (supprimées seules une fois abandonnées) :")
+        print("  /tmp entries left by a turn (deleted on their own once abandoned):")
         for o in orphans:
             print("    %s  %s  (agent %s)  %s%s  →  %s" % (
-                _fmt(o["bytes"]), o["path"], o.get("agent") or "?", o.get("status") or "",
+                _fmt(o["bytes"]), o["path"], o.get("agent") or "?", action_label(o.get("status") or ""),
                 " — %s" % o["detail"] if o.get("detail") else "", o["command"]))
     top = (report.get("measure") or {}).get("system_tmp_top") or []
     if top:
-        print("  plus grosses entrées de %s :" % ((m.get("system_tmp") or {}).get("tmp_path")
-                                                   or "/tmp"))
+        print("  largest entries of %s:" % ((m.get("system_tmp") or {}).get("tmp_path")
+                                             or "/tmp"))
         for e in top:
             print("    %s  %s  (%s%s)  →  %s" % (
                 _fmt(e.get("bytes")), e["path"], e.get("owner") or "?",
-                ", laissée par %s : %s" % (e["agent"], e.get("status") or "?")
-                if e.get("agent") else ", hors tour d'agent : à décider",
+                ", left by %s: %s" % (e["agent"], action_label(e.get("status") or "?"))
+                if e.get("agent") else ", outside any agent turn: to decide",
                 e.get("command") or ""))
 
 
@@ -2047,7 +2061,7 @@ def cmd_menage(cfg, args) -> int:
     if apply:
         refusal = caller_refusal()
         if refusal:
-            print("ameesh menage : refus — %s" % refusal, file=sys.stderr)
+            print("ameesh menage: refused — %s" % refusal, file=sys.stderr)
             return 1
     db = db_mod.connect(cfg)
     try:

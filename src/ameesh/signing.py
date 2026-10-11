@@ -125,7 +125,7 @@ _BASE = (_BX, _BY, 1, _BX * _BY % _P)
 
 def expand_seed(seed: bytes) -> tuple[int, bytes]:
     if len(seed) != 32:
-        raise ValueError("germe Ed25519 : 32 octets attendus, %d reçus" % len(seed))
+        raise ValueError("Ed25519 seed: 32 bytes expected, got %d" % len(seed))
     hashed = _sha512(seed)
     scalar = int.from_bytes(hashed[:32], "little")
     # Élagage RFC 8032 §5.1.5 : bas 3 bits à zéro, bit 255 à zéro, bit 254 à un.
@@ -169,9 +169,9 @@ def public_key_error(public: bytes) -> str | None:
         return "32 octets attendus"
     point = _point_decompress(bytes(public))
     if point is None:
-        return "encodage non canonique ou point hors de la courbe"
+        return "non-canonical encoding or point not on the curve"
     if _is_small_order(point):
-        return "point de petit ordre (sous-groupe de torsion)"
+        return "small-order point (torsion subgroup)"
     return None
 
 
@@ -179,7 +179,7 @@ def check_public_key(public: bytes) -> bytes:
     """Clé publique Ed25519 admissible, ou ValueError (voir `public_key_error`)."""
     error = public_key_error(public)
     if error:
-        raise ValueError("clé publique Ed25519 refusée : %s" % error)
+        raise ValueError("Ed25519 public key rejected: %s" % error)
     return bytes(public)
 
 
@@ -193,17 +193,17 @@ def signature_error(public: bytes, signature: bytes) -> str | None:
     """
     error = public_key_error(public)
     if error:
-        return "clé publique : %s" % error
+        return "public key: %s" % error
     if not isinstance(signature, (bytes, bytearray)) or len(signature) != 64:
-        return "signature : 64 octets attendus"
+        return "signature: 64 bytes expected"
     signature = bytes(signature)
     r_point = _point_decompress(signature[:32])
     if r_point is None:
-        return "R : encodage non canonique ou point hors de la courbe"
+        return "R: non-canonical encoding or point not on the curve"
     if _is_small_order(r_point):
-        return "R de petit ordre"
+        return "small-order R"
     if int.from_bytes(signature[32:], "little") >= _L:
-        return "S non réduit (S >= L)"
+        return "S not reduced (S >= L)"
     return None
 
 
@@ -334,9 +334,9 @@ def backend(name: str | None = None):
         try:
             instance = _BACKENDS[wanted]()
         except KeyError:
-            raise ValueError("backend de signature inconnu : %r (pure, cryptography, nacl)" % wanted)
+            raise ValueError("unknown signing backend: %r (pure, cryptography, nacl)" % wanted)
         except ImportError as exc:
-            raise ValueError("backend %s indisponible : %s" % (wanted, exc))
+            raise ValueError("backend %s unavailable: %s" % (wanted, exc))
     _CACHE[wanted] = instance
     return instance
 
@@ -376,22 +376,22 @@ def encode_private(seed: bytes) -> str:
 def _decode(text: str, header: str, footer: str, what: str) -> bytes:
     lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
     if len(lines) != 3 or lines[0] != header or lines[2] != footer:
-        raise ValueError("%s : format attendu « %s … %s »" % (what, header, footer))
+        raise ValueError("%s: expected format \"%s … %s\"" % (what, header, footer))
     try:
         raw = base64.b64decode(lines[1], validate=True)
     except Exception as exc:
-        raise ValueError("%s : base64 illisible (%s)" % (what, exc)) from exc
+        raise ValueError("%s: unreadable base64 (%s)" % (what, exc)) from exc
     if len(raw) != 32:
-        raise ValueError("%s : 32 octets attendus, %d reçus" % (what, len(raw)))
+        raise ValueError("%s: 32 bytes expected, got %d" % (what, len(raw)))
     return raw
 
 
 def decode_public(text: str) -> bytes:
-    return check_public_key(_decode(text, PUBLIC_HEADER, PUBLIC_FOOTER, "clé publique"))
+    return check_public_key(_decode(text, PUBLIC_HEADER, PUBLIC_FOOTER, "public key"))
 
 
 def decode_private(text: str) -> bytes:
-    return _decode(text, PRIVATE_HEADER, PRIVATE_FOOTER, "clé privée")
+    return _decode(text, PRIVATE_HEADER, PRIVATE_FOOTER, "private key")
 
 
 def read_public(path: str) -> bytes:
@@ -403,7 +403,7 @@ def read_private(path: str) -> bytes:
     mode = os.stat(path).st_mode & 0o777
     if mode & 0o077:
         raise ValueError(
-            "clé privée %s lisible par d'autres (mode %o) : chmod 600" % (path, mode))
+            "private key %s readable by others (mode %o): chmod 600" % (path, mode))
     with open(path, encoding="utf-8") as fh:
         return decode_private(fh.read())
 
@@ -418,7 +418,7 @@ def write_keypair(directory: str, name: str = "owner") -> tuple[str, str, str]:
     public_path = os.path.join(directory, name + ".pub")
     for path in (private_path, public_path):
         if os.path.exists(path):
-            raise FileExistsError("refus d'écraser %s" % path)
+            raise FileExistsError("refusing to overwrite %s" % path)
     fd = os.open(private_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(encode_private(seed))

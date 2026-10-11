@@ -144,8 +144,8 @@ class PressureDbTest(test_canon._CanonDbCase):
         row = registry.get(self.db, "orchestre")
         self.assertEqual(row["status"], "queued")  # pas de pause : priorité 4
         self.assertIn("en attente : pression de l'hôte atelier", row["status_text"])
-        self.assertIn("mémoire disponible", row["status_text"])
-        self.assertIn("seuil 100.0 TiB", row["status_text"])
+        self.assertIn("available memory", row["status_text"])
+        self.assertIn("threshold 100.0 TiB", row["status_text"])
         self.assertTrue(row.get("pending_prompt"))
 
     def test_pas_d_attente_affichee_sans_travail(self):
@@ -225,6 +225,6 @@ class DescribeTest(unittest.TestCase):
              "limit": 16 * 1024 ** 3, "critical": False},
             {"key": "max_load", "label": "charge 1 min", "value": 30.0, "limit": 24.0,
              "critical": False}])
-        self.assertEqual(texte, "swap utilisé 17.5 GiB (seuil 16.0 GiB) ; "
-                                "charge 1 min 30.00 (seuil 24.00)")
+        self.assertEqual(texte, "swap utilisé 17.5 GiB (threshold 16.0 GiB); "
+                                "charge 1 min 30.00 (threshold 24.00)")
         self.assertEqual(resources.describe([]), "")

@@ -715,7 +715,7 @@ class SmallOrderEndToEndTest(ReceiptsBase):
         )]
         result = apply_authenticators(self.db, members)
         self.assertEqual(len(result["errors"]), 4, result["errors"])
-        self.assertEqual(sum("petit ordre" in e for e in result["errors"]), 3, result["errors"])
+        self.assertEqual(sum("small-order" in e for e in result["errors"]), 3, result["errors"])
         self.assertEqual(result["added"], [])
         self.assertEqual(receipts.list_authenticators(self.db, approver="human:mallory"), [])
 
@@ -1625,7 +1625,7 @@ class SyncTest(ReceiptsBase):
         before = receipts.list_authenticators(self.db, approver=ALICE)
         result = apply_authenticators(self.db, members)
         self.assertEqual(len(result["errors"]), 3, result["errors"])
-        self.assertTrue(all("référence de commit" in e for e in result["errors"]))
+        self.assertTrue(all("commit reference" in e for e in result["errors"]))
         self.assertEqual(result["added"], [])
         # liste invalide : alice est gelée — ses lignes restent telles quelles,
         # l'outil ed25519 absent de CETTE liste n'est pas révoqué pour autant
@@ -1706,7 +1706,7 @@ class SyncTest(ReceiptsBase):
         members = self.members[1:] + [{"title": "Alice Martin", "authenticators": []}]
         result = apply_authenticators(self.db, members)
         self.assertEqual(result["revoked"], [])
-        self.assertTrue(any("illisible" in e for e in result["errors"]), result["errors"])
+        self.assertTrue(any("unreadable" in e for e in result["errors"]), result["errors"])
         self.assertEqual(receipts.list_authenticators(self.db), before)
         # sans entrée illisible, le membre retiré du canon est révoqué
         result = apply_authenticators(self.db, self.members[1:])
@@ -1757,10 +1757,10 @@ class SyncTest(ReceiptsBase):
         result = apply_authenticators(self.db, members)
         joined = "\n".join(result["errors"])
         self.assertIn("COSE", joined)
-        self.assertIn("PRIVÉE", joined)
-        self.assertIn("niveau inconnu", joined)
-        self.assertIn("façade ou credential_id invalide", joined)
-        self.assertIn("déclaré 2 fois", joined)
+        self.assertIn("PRIVATE", joined)
+        self.assertIn("unknown level", joined)
+        self.assertIn("invalid facade or credential_id", joined)
+        self.assertIn("declared 2 times", joined)
         self.assertIn("titre invalide", joined)
         self.assertEqual(result["added"], [])
         self.assertEqual(receipts.list_authenticators(self.db, approver="human:dave"), [])
@@ -1812,8 +1812,8 @@ class ReceiptsCliTest(ReceiptsBase):
         args = ["receipt", "verify", path, "--rp-id", RP_ID, "--origin", ORIGIN]
         proc = self.mesh(*args)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("reçu VALIDE", proc.stdout)
-        self.assertIn("disponible", proc.stdout)
+        self.assertIn("receipt VALID", proc.stdout)
+        self.assertIn("available", proc.stdout)
         proc = self.mesh(*args, "--json", "--digest", request["digest"])
         self.assertEqual(json.loads(proc.stdout)["code"], "ok")
         proc = self.mesh(*args, "--consume", "--by", "cli")
@@ -1856,7 +1856,7 @@ class ReceiptsCliTest(ReceiptsBase):
         self.assertEqual([row["credential_id"] for row in rows], [self.bob.credential_id])
         proc = self.mesh("authenticator", "list", "--expect-commit", NEXT_COMMIT)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("HORS CANON ATTENDU", proc.stdout)
+        self.assertIn("NOT FROM EXPECTED CANON", proc.stdout)
 
 
 if __name__ == "__main__":

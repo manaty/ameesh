@@ -53,11 +53,18 @@ from .config import Config
 WINDOWS = {"per_hour": 3600, "per_day": 86400}
 #: clé de configuration de l'hôte de chaque fenêtre (plafonds du mesh)
 CONFIG_KEYS = {3600: "budget_usd_per_hour", 86400: "budget_usd_per_day"}
-LABELS = {3600: "par heure", 86400: "par jour"}
+LABELS = {3600: "per hour", 86400: "per day"}
 
 SOURCE_DB = "base"
 SOURCE_CONFIG = "config"
 SOURCE_DEFAULT = "défaut"
+#: display label of each source (the values above are stored/emitted as is)
+SOURCE_LABELS = {SOURCE_DB: "database", SOURCE_CONFIG: "config", SOURCE_DEFAULT: "default"}
+
+
+def source_label(source: str) -> str:
+    """The English label of a cap source, for display only."""
+    return SOURCE_LABELS.get(source, source)
 
 #: durée de vie du cache des exécuteurs (secondes)
 DEFAULT_TTL = 15.0
@@ -191,12 +198,12 @@ def authorize(cfg: Config, db, agent: str | None = None) -> str:
     """
     name = os.environ.get("AGENT_MAIL_NAME") or ""
     if name:
-        raise BudgetError("refus : cette session est celle de l'agent %s (AGENT_MAIL_NAME) ; "
-                          "seul un humain habilité règle le budget" % name)
+        raise BudgetError("refused: this session belongs to agent %s (AGENT_MAIL_NAME); "
+                          "only an authorized human sets the budget" % name)
     binding = identity.resolve_binding(cfg, db)
     if binding.name:
-        raise BudgetError("refus : cette session est liée à l'agent %s (ameesh mail bind) ; "
-                          "seul un humain habilité règle le budget" % binding.name)
+        raise BudgetError("refused: this session is bound to agent %s (ameesh mail bind); "
+                          "only an authorized human sets the budget" % binding.name)
     user = unix_user()
     actor = "human:%s" % user
     humans = cfg.human_names
@@ -205,17 +212,17 @@ def authorize(cfg: Config, db, agent: str | None = None) -> str:
     if agent:
         row = registry.get(db, agent)
         if row is None:
-            raise BudgetError("agent inconnu : %s" % agent)
+            raise BudgetError("unknown agent: %s" % agent)
         responsible = (row.get("responsible") or "").strip()
         if responsible == actor:
             return actor
         if responsible or humans:
             raise BudgetError(
-                "refus : %s n'est ni membre humain du mesh (humans) ni responsable de %s (%s)"
-                % (actor, agent, responsible or "aucun"))
+                "refused: %s is neither a human member of the mesh (humans) nor responsible "
+                "for %s (%s)" % (actor, agent, responsible or "none"))
         return actor
     if humans:
-        raise BudgetError("refus : %s n'est pas membre humain du mesh (humans : %s)"
+        raise BudgetError("refused: %s is not a human member of the mesh (humans: %s)"
                           % (actor, ", ".join(sorted(humans))))
     return actor
 
@@ -225,7 +232,7 @@ def authorize(cfg: Config, db, agent: str | None = None) -> str:
 # --------------------------------------------------------------------------
 
 def _fmt_usd(value) -> str:
-    return "aucun" if value is None else "%.2f $" % float(value)
+    return "none" if value is None else "%.2f $" % float(value)
 
 
 def change(cfg: Config, db, *, agent: str | None, window: int, usd: float | None,
@@ -234,10 +241,10 @@ def change(cfg: Config, db, *, agent: str | None, window: int, usd: float | None
     scope = agent or ""
     changed, old = storage.of(db).budgets.put(scope, window, usd, actor=actor)
     if changed:
-        portee = "de l'agent %s" % agent if agent else "du mesh"
+        portee = "of agent %s" % agent if agent else "of the mesh"
         suite = "" if usd is not None else (
-            " (retour à la configuration de l'hôte)" if not agent else "")
-        texte = ("Budget %s %s : %s → %s, par %s%s." % (
+            " (back to the host configuration)" if not agent else "")
+        texte = ("Budget %s %s: %s → %s, by %s%s." % (
             portee, LABELS[window], _fmt_usd(old), _fmt_usd(usd), actor, suite))
         fil.record(cfg, db, sender=actor, recipients=[agent] if agent else [], text=texte,
                    meta={"action": "budget", "audit": "budget", "scope": scope or "mesh",
@@ -287,48 +294,48 @@ def _moment(epoch) -> str:
 def summary_line(limits: Limits) -> str:
     """Une ligne : les plafonds du mesh en vigueur et leur source."""
     def one(value: float, source: str) -> str:
-        return "%s (%s)" % ("%.2f $" % value if value > 0 else "aucun", source)
-    text = "plafonds du mesh (payé au token) : %s %s · %s %s" % (
+        return "%s (%s)" % ("%.2f $" % value if value > 0 else "none", source_label(source))
+    text = "mesh caps (pay-per-token): %s %s · %s %s" % (
         LABELS[3600], one(limits.per_hour, limits.per_hour_source),
         LABELS[86400], one(limits.per_day, limits.per_day_source))
     if limits.agents:
-        text += " · %d agent(s) à plafond propre" % len(limits.agents)
+        text += " · %d agent(s) with their own cap" % len(limits.agents)
     return text
 
 
 def format_status(data: dict) -> str:
     lim = data["limits"]
     by = {(r.get("scope") or "", int(r["window_s"])): r for r in data["rows"]}
-    out = ["plafonds du mesh (payé au token, fenêtres glissantes) :"]
+    out = ["mesh caps (pay-per-token, sliding windows):"]
     for window, key in ((3600, "per_hour"), (86400, "per_day")):
         value = lim["%s_usd" % key]
-        source = lim["%s_source" % key]
+        source = source_label(lim["%s_source" % key])
         row = by.get(("", window))
         qui = " — %s, %s" % (row["set_by"], _moment(row.get("updated_ts"))) if row else ""
-        out.append("  %-9s : %-10s (%s%s)" % (LABELS[window], _fmt_usd(value), source, qui))
+        out.append("  %-9s: %-10s (%s%s)" % (LABELS[window], _fmt_usd(value), source, qui))
     if lim["agents"]:
-        out.append("plafonds par agent (base) :")
+        out.append("per-agent caps (database):")
         for agent, caps in lim["agents"].items():
             dep = data["spend"]["agents"].get(agent) or {}
-            out.append("  %-16s %s %s · %s %s   dépense 1 h %s · 24 h %s" % (
+            out.append("  %-16s %s %s · %s %s   spend 1 h %s · 24 h %s" % (
                 agent, LABELS[3600], _fmt_usd(caps["per_hour_usd"]),
                 LABELS[86400], _fmt_usd(caps["per_day_usd"]),
                 _fmt_usd(dep.get("1h_usd")), _fmt_usd(dep.get("24h_usd"))))
     sp = data["spend"]
     if sp.get("error"):
-        out.append("dépense payée au token : illisible (%s)" % sp["error"])
+        out.append("pay-per-token spend: unreadable (%s)" % sp["error"])
     else:
-        out.append("dépense payée au token (%s) : 1 h %s · 24 h %s" % (
-            ", ".join(sp["paid_harnesses"] or []) or "aucun harnais",
+        out.append("pay-per-token spend (%s): 1 h %s · 24 h %s" % (
+            ", ".join(sp["paid_harnesses"] or []) or "no harness",
             _fmt_usd(sp["1h_usd"]), _fmt_usd(sp["24h_usd"])))
     if data["paused"]:
-        out.append("en pause budget :")
+        out.append("paused for budget:")
         for p in data["paused"]:
             out.append("  %-16s %s" % (p["agent"], p["reason"]))
     else:
-        out.append("en pause budget : aucun agent")
+        out.append("paused for budget: no agent")
     if data["events"]:
-        out.append("derniers changements :")
+        out.append("recent changes:")
         for ev in data["events"]:
             out.append("  %s  %-14s %-9s %s → %s  %s" % (
                 _moment(ev.get("at_ts")), ev["scope"] or "mesh", LABELS.get(
@@ -343,19 +350,19 @@ def format_status(data: dict) -> str:
 
 def add_parsers(sub) -> None:
     """`ameesh budget [set|unset]` dans le parseur de `mesh_cli`."""
-    p = sub.add_parser("budget", help="plafonds de budget du mesh, en base (L70)")
+    p = sub.add_parser("budget", help="mesh budget caps, stored in the database (L70)")
     p.add_argument("--json", action="store_true")
-    p.add_argument("--last", type=int, default=5, help="derniers changements montrés")
+    p.add_argument("--last", type=int, default=5, help="number of recent changes shown")
     bsub = p.add_subparsers(dest="budget_command")
-    ps = bsub.add_parser("set", help="poser un plafond (mesh, ou --agent)")
+    ps = bsub.add_parser("set", help="set a cap (mesh, or --agent)")
     ps.add_argument("--per-hour", type=float, default=None, metavar="USD")
     ps.add_argument("--per-day", type=float, default=None, metavar="USD")
     ps.add_argument("--agent", default=None)
-    pu = bsub.add_parser("unset", help="retirer un plafond réglé en base")
+    pu = bsub.add_parser("unset", help="remove a cap set in the database")
     pu.add_argument("--per-hour", action="store_true")
     pu.add_argument("--per-day", action="store_true")
     pu.add_argument("--agent", default=None)
-    pshow = bsub.add_parser("show", help="plafonds en vigueur (défaut)")
+    pshow = bsub.add_parser("show", help="caps in force (default)")
     pshow.add_argument("--json", action="store_true")
     pshow.add_argument("--last", type=int, default=5)
     p.set_defaults(func=cmd_budget)
@@ -377,24 +384,24 @@ def cmd_budget(cfg: Config, args: argparse.Namespace) -> int:
             demandes = {w: v for w, v in ((3600, args.per_hour), (86400, args.per_day))
                         if v is not None}
             if not demandes:
-                print("usage : ameesh budget set --per-hour X [--per-day Y] [--agent A]",
+                print("usage: ameesh budget set --per-hour X [--per-day Y] [--agent A]",
                       file=sys.stderr)
                 return 2
             for window, value in demandes.items():
                 if not value > 0 or value != value or value == float("inf"):
-                    print("plafond %s invalide : %r (strictement positif ; pour revenir à "
-                          "la configuration : ameesh budget unset)" % (LABELS[window], value),
+                    print("invalid %s cap: %r (must be strictly positive; to go back to "
+                          "the configuration: ameesh budget unset)" % (LABELS[window], value),
                           file=sys.stderr)
                     return 2
         else:
             demandes = {w: None for w, flag in ((3600, args.per_hour), (86400, args.per_day))
                         if flag}
             if not demandes:
-                print("usage : ameesh budget unset [--per-hour] [--per-day] [--agent A]",
+                print("usage: ameesh budget unset [--per-hour] [--per-day] [--agent A]",
                       file=sys.stderr)
                 return 2
         if what == "set" and args.agent and registry.get(db, args.agent) is None:
-            print("agent inconnu : %s" % args.agent, file=sys.stderr)
+            print("unknown agent: %s" % args.agent, file=sys.stderr)
             return 1
         try:
             actor = authorize(cfg, db, args.agent)
@@ -406,10 +413,10 @@ def cmd_budget(cfg: Config, args: argparse.Namespace) -> int:
                                   actor=actor)
             portee = args.agent or "mesh"
             if changed:
-                print("budget %s %s : %s → %s (par %s ; effet immédiat sur tous les exécuteurs)"
+                print("budget %s %s: %s → %s (by %s; effective immediately on all runners)"
                       % (portee, LABELS[window], _fmt_usd(old), _fmt_usd(value), actor))
             else:
-                print("budget %s %s : inchangé (%s)" % (portee, LABELS[window], _fmt_usd(old)))
+                print("budget %s %s: unchanged (%s)" % (portee, LABELS[window], _fmt_usd(old)))
         print(summary_line(current(cfg, db)))
         return 0
     finally:

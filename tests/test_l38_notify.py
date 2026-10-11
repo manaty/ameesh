@@ -157,24 +157,24 @@ class TexteTest(unittest.TestCase):
         alerte = _alert("orphan_lot", agent="coord", since=None, lot=12, title="refonte",
                         detail="lot #12 (build) orphelin : assigné à coord, arrêté (manuel)")
         msg = notify.render(alerte, "raised", 5000.0, raised_ts=4000.0)
-        self.assertIn("lot orphelin", msg.title)
-        self.assertIn("[orphan_lot] agent coord · lot #12 « refonte »", msg.body)
+        self.assertIn("orphan lot", msg.title)
+        self.assertIn('[orphan_lot] agent coord · lot #12 "refonte"', msg.body)
         self.assertIn("orphelin : assigné à coord", msg.body)
-        self.assertIn("constatée le", msg.body)
+        self.assertIn("observed on", msg.body)
         self.assertTrue(msg.urgent)
         self.assertIsNone(fil.unreadable_reason(msg.text))
         msg = notify.render(_alert(since=1000.0), "raised", 1000.0 + 25 * 60)
         self.assertIn("(25 min)", msg.body)
         msg = notify.render(_alert(since=1000.0), "resolved", 1000.0 + 3 * 3600)
-        self.assertIn("résolue", msg.title)
-        self.assertIn("résolue après 3 h 00", msg.body)
+        self.assertIn("resolved", msg.title)
+        self.assertIn("resolved after 3 h 00", msg.body)
         self.assertTrue(msg.low)
 
     def test_detail_illisible_retire(self):
         blob = "QUJD" * 80
         msg = notify.render(_alert(detail="session " + blob), "raised", 2000.0)
         self.assertNotIn(blob[:250], msg.body)
-        self.assertIn("détail retiré", msg.body)
+        self.assertIn("detail removed", msg.body)
         self.assertIsNone(fil.unreadable_reason(msg.text))
         # caractères de contrôle retirés (couleurs de terminal)
         msg = notify.render(_alert(detail="\x1b[31mrouge\x1b[0m"), "raised", 2000.0)
@@ -185,7 +185,7 @@ class CanauxTest(_Http, unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-l38-")
         self.log = os.path.join(self.tmp, "desktop.log")
-        self.msg = notify.Message("ameesh : agent arrêté avec du courrier (ouvrier)",
+        self.msg = notify.Message("ameesh: agent stopped with mail (ouvrier)",
                                   "[stopped_with_mail] agent ouvrier\ndétail", urgent=True)
 
     def tearDown(self):
@@ -210,7 +210,7 @@ class CanauxTest(_Http, unittest.TestCase):
         env = _sender_env(self.log, AMEESH_NOTIFY_SEND_BIN=os.path.join(self.tmp, "absent"))
         with self.assertRaises(notify.ChannelError) as ctx:
             notify.Sender(env=env).send(notify.Channel("desktop", "desktop"), self.msg)
-        self.assertIn("notify-send introuvable", str(ctx.exception))
+        self.assertIn("notify-send not found", str(ctx.exception))
         self.assertTrue(ctx.exception.permanent)
         self.assertEqual(_desktop_log(self.log), [])
 
@@ -251,7 +251,7 @@ class CanauxTest(_Http, unittest.TestCase):
         url = server.url + "/services/T000/B000/XXXX"
         notify.Sender(env={"AMEESH_SLACK_WEBHOOK": url}).send(canal, self.msg)
         payload = json.loads(server.requests[0]["body"])
-        self.assertTrue(payload["text"].startswith("*ameesh : agent arrêté"))
+        self.assertTrue(payload["text"].startswith("*ameesh: agent stopped"))
         with self.assertRaises(notify.ChannelError) as ctx:
             notify.Sender(env={}).send(canal, self.msg)
         self.assertIn("AMEESH_SLACK_WEBHOOK", str(ctx.exception))
@@ -270,7 +270,7 @@ class CanauxTest(_Http, unittest.TestCase):
         results = notify.send_test(ncfg, "human:proprio", "atelier",
                                    sender=notify.Sender(env=_sender_env(self.log)))
         self.assertEqual(results, [("desktop", None), ("ntfy", None)])
-        self.assertIn("message de test", _desktop_log(self.log)[0][-2])
+        self.assertIn("test message", _desktop_log(self.log)[0][-2])
         self.assertIn("human:proprio", ntfy.requests[0]["body"])
 
 
@@ -356,9 +356,9 @@ class AcheminementTest(_Base):
         notifier = self.notifier(self.ncfg())
         records = self.passe(notifier, [_alert(agent="fantome")])
         self.assertEqual([r["delivery"] for r in records], ["sans_destinataire"])
-        self.assertEqual(len([l for l in self.logs if "SANS DESTINATAIRE" in l]), 1)
+        self.assertEqual(len([l for l in self.logs if "WITHOUT RECIPIENT" in l]), 1)
         self.assertEqual(self.passe(notifier, [_alert(agent="fantome")]), [])
-        self.assertEqual(len([l for l in self.logs if "SANS DESTINATAIRE" in l]), 1)
+        self.assertEqual(len([l for l in self.logs if "WITHOUT RECIPIENT" in l]), 1)
         self.assertEqual(_desktop_log(self.desk), [])
         # un responsable apparaît : l'alerte en cours part enfin
         notifier.ncfg = self.ncfg(default_human="human:proprio")
@@ -398,14 +398,14 @@ class AlertesReellesTest(_Base):
                            "envoyee")])
         argv = _desktop_log(self.desk)
         self.assertEqual(len(argv), 1)
-        self.assertIn("agent arrêté avec du courrier", argv[0][-2])
+        self.assertIn("agent stopped with mail", argv[0][-2])
         self.assertIn("bail_expire", argv[0][-1])
         self.assertEqual(self.passe(notifier), [])     # une alerte qui dure : rien
         self.db.execute("UPDATE agent_mailbox SET delivered_at = now()")
         records = self.passe(notifier)
         self.assertEqual([(r["event"], r["delivery"]) for r in records],
                          [("resolved", "envoyee")])
-        self.assertIn("résolue", _desktop_log(self.desk)[-1][-2])
+        self.assertIn("resolved", _desktop_log(self.desk)[-1][-2])
 
     def test_types_filtres(self):
         alertes = [_alert("long_turn", responsible="human:p"),
@@ -440,7 +440,7 @@ class FiabiliteTest(_Base):
         records = self.passe(notifier, [a2])
         self.assertEqual([(r["event"], r["type"]) for r in records],
                          [("resolved", "stopped_with_mail")])
-        self.assertIn("résolue après", records[0]["text"])
+        self.assertIn("resolved after", records[0]["text"])
         # une nouvelle occurrence (autre `since`) est une nouvelle alerte
         records = self.passe(notifier, [a2, _alert(since=5000.0)])
         self.assertEqual([(r["event"], r["type"]) for r in records],
@@ -457,7 +457,7 @@ class FiabiliteTest(_Base):
         self.assertTrue(os.path.exists(path))
         state = notify.load_state(path, log=self.logs.append)
         self.assertEqual(state["active"], {})
-        self.assertTrue(any("illisible" in l for l in self.logs))
+        self.assertTrue(any("unreadable" in l for l in self.logs))
         self.assertFalse(os.path.exists(path))
 
     def test_limite_de_debit_et_resume(self):
@@ -469,7 +469,7 @@ class FiabiliteTest(_Base):
                          ["envoyee"] * 3 + ["resumee"] * 2)
         resumes = [r for r in records if r["event"] == "summary"]
         self.assertEqual(len(resumes), 1)
-        self.assertIn("2 alerte(s) non détaillée(s)", resumes[0]["title"])
+        self.assertIn("2 alert(s) not detailed", resumes[0]["title"])
         self.assertIn("2 stopped_with_mail", resumes[0]["text"])
         self.assertEqual(len(_desktop_log(self.desk)), 4)
         # un autre humain n'est pas freiné
@@ -488,7 +488,7 @@ class FiabiliteTest(_Base):
         records = self.passe(notifier, restantes + [autre])
         self.assertEqual([r["event"] for r in records], ["summary"])
         self.assertIn("1 stopped_with_mail", records[0]["text"])
-        self.assertIn("résolues : 2", records[0]["text"])
+        self.assertIn("resolved: 2", records[0]["text"])
         self.assertEqual(notifier.state["summary"], {})
 
     def test_canal_en_echec_isole_et_retente(self):
@@ -504,7 +504,7 @@ class FiabiliteTest(_Base):
         self.assertEqual(records[0]["channels"]["desktop"], "ok")
         self.assertEqual(records[0]["channels"]["slack"], "ok")
         self.assertIn("HTTP 500", records[0]["channels"]["ntfy"])
-        self.assertTrue(any("canal ntfy" in l and "retenté" in l for l in self.logs))
+        self.assertTrue(any("channel ntfy" in l and "retried" in l for l in self.logs))
         # passage suivant : seul ntfy est retenté
         records = self.passe(notifier, [_alert()])
         self.assertEqual(list(records[0]["channels"]), ["ntfy"])
@@ -524,7 +524,7 @@ class FiabiliteTest(_Base):
         for _ in range(4):
             self.passe(notifier, [_alert()])
         self.assertEqual(len(ntfy.requests), 2)
-        self.assertTrue(any("ABANDON" in l for l in self.logs))
+        self.assertTrue(any("GIVING UP" in l for l in self.logs))
         # résolue sans aucun envoi réussi : pas de résolution envoyée
         records = self.passe(notifier, [])
         self.assertEqual([r["delivery"] for r in records], ["abandonnee"])
@@ -535,8 +535,8 @@ class FiabiliteTest(_Base):
             self.desk, AMEESH_NOTIFY_SEND_BIN=os.path.join(self.tmp, "absent")))
         notifier = self.notifier(self.ncfg(default_human="human:proprio"), sender=sender)
         records = self.passe(notifier, [_alert()])
-        self.assertIn("notify-send introuvable", records[0]["channels"]["desktop"])
-        self.assertTrue(any("ABANDON" in l for l in self.logs))
+        self.assertIn("notify-send not found", records[0]["channels"]["desktop"])
+        self.assertTrue(any("GIVING UP" in l for l in self.logs))
         self.assertEqual(self.passe(notifier, [_alert()]), [])
 
     def test_dry_run_n_envoie_rien(self):
@@ -544,7 +544,7 @@ class FiabiliteTest(_Base):
                                  sender=notify.DrySender())
         records = self.passe(notifier, [_alert()])
         self.assertEqual(records[0]["delivery"], "a_blanc")
-        self.assertIn("agent arrêté avec du courrier", records[0]["title"])
+        self.assertIn("agent stopped with mail", records[0]["title"])
         self.assertEqual(_desktop_log(self.desk), [])
 
 
@@ -586,9 +586,9 @@ class CliTest(_Base):
         proc = self.mesh("notify", "--once", "--dry-run",
                          env=self.env_cli({"default": ["desktop"]}))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("levée [stopped_with_mail] agent ouvrier → human:proprio : a blanc",
+        self.assertIn("raised [stopped_with_mail] agent ouvrier → human:proprio: dry run",
                       proc.stdout)
-        self.assertIn("agent arrêté avec du courrier", proc.stdout)
+        self.assertIn("agent stopped with mail", proc.stdout)
         self.assertEqual(_desktop_log(self.desk), [])
         self.assertFalse(os.path.exists(os.path.join(self.state, "notify", "state.json")))
 
@@ -599,16 +599,16 @@ class CliTest(_Base):
         proc = self.mesh("notify", "--test", "human:proprio",
                          env=self.env_cli(raw, AMEESH_SLACK_WEBHOOK=slack.url + "/h"))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertEqual(proc.stdout.count("envoyé"), 3)
+        self.assertEqual(proc.stdout.count(": sent"), 3)
         self.assertEqual(len(_desktop_log(self.desk)), 1)
         self.assertEqual(ntfy.requests[0]["path"], "/ameesh-proprio")
-        self.assertIn("message de test", json.loads(slack.requests[0]["body"])["text"])
+        self.assertIn("test message", json.loads(slack.requests[0]["body"])["text"])
         # Slack sans webhook : échec lisible, les autres canaux passent
         env = self.env_cli(raw)
         env.pop("AMEESH_SLACK_WEBHOOK", None)
         proc = self.mesh("notify", "--test", "human:proprio", env=env)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("slack → human:proprio : ÉCHEC", proc.stdout)
+        self.assertIn("slack → human:proprio: FAILED", proc.stdout)
         self.assertEqual(len(ntfy.requests), 2)
         proc = self.mesh("notify", "--test", "proprio", env=env)
         self.assertEqual(proc.returncode, 2)

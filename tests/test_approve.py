@@ -1080,17 +1080,17 @@ class ApproveConfigTest(unittest.TestCase):
             with self.subTest(mode=oct(mode)):
                 os.chmod(path, mode)
                 with self.assertRaisesRegex(approve_config.ApproveConfigError,
-                                            "permissions trop ouvertes"):
+                                            "permissions too open"):
                     approve_config.read_service_token(path)
         os.chmod(path, 0o600)
         link = os.path.join(self.tmp, "lien")
         os.symlink(path, link)
         with self.assertRaises(approve_config.ApproveConfigError):
             approve_config.read_service_token(link)
-        with self.assertRaisesRegex(approve_config.ApproveConfigError, "introuvable"):
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "not found"):
             approve_config.read_service_token(os.path.join(self.tmp, "absent"))
         short, _t = write_token_file(os.path.join(self.tmp), token="court")
-        with self.assertRaisesRegex(approve_config.ApproveConfigError, "au moins"):
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "at least"):
             approve_config.read_service_token(short)
 
     def test_gen_token(self):
@@ -1101,7 +1101,7 @@ class ApproveConfigTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
         self.assertGreaterEqual(len(approve_config.read_service_token(path)), 43)
-        with self.assertRaisesRegex(approve_config.ApproveConfigError, "existe déjà"):
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "already exists"):
             approve_config.write_service_token(path)
 
     def test_le_service_refuse_un_jeton_trop_ouvert(self):
@@ -1113,13 +1113,13 @@ class ApproveConfigTest(unittest.TestCase):
             capture_output=True, text=True, timeout=60,
             env=child_env(AMEESH_APPROVE_CONFIG=os.path.join(self.tmp, "absent.json")))
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("permissions trop ouvertes", proc.stderr)
+        self.assertIn("permissions too open", proc.stderr)
 
     def test_dossier_d_etat_prive(self):
         open_dir = os.path.join(self.tmp, "ouvert")
         os.makedirs(open_dir)
         os.chmod(open_dir, 0o755)
-        with self.assertRaisesRegex(approve_config.ApproveConfigError, "trop ouvertes"):
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "too open"):
             Store(open_dir)
         store = Store(os.path.join(self.tmp, "neuf"))
         self.assertEqual(stat.S_IMODE(os.stat(store.root).st_mode), 0o700)
@@ -1159,7 +1159,7 @@ class ApproveConfigTest(unittest.TestCase):
         for overrides in (dict(origins=("https://approve.example.test",
                                         "https://m.approve.example.test:8443")),
                           dict(public_url=ORIGIN + "/approve/")):
-            with self.assertRaisesRegex(approve_config.ApproveConfigError, "profil strict"):
+            with self.assertRaisesRegex(approve_config.ApproveConfigError, "strict profile"):
                 self.config(**overrides)
 
     def test_resume_stable_et_visible(self):
@@ -1398,13 +1398,13 @@ class ApproveClientTest(ApproveBase):
         os.chmod(self.token_file, 0o644)
         proc = self.cli("request", self.action_id, "--approver", ALICE, rc=1)
         self.assertIn("[config]", proc.stderr)
-        self.assertIn("permissions trop ouvertes", proc.stderr)
+        self.assertIn("permissions too open", proc.stderr)
         proc = self.cli("request", self.action_id, "--approver", ALICE, rc=1,
                         AMEESH_APPROVE_TOKEN_FILE="")
         self.assertIn("AMEESH_APPROVE_TOKEN_FILE", proc.stderr)
         proc = self.cli("request", self.action_id, "--approver", ALICE, rc=1,
                         AMEESH_APPROVE_URL="http://approve.example.test")
-        self.assertIn("boucle locale", proc.stderr)
+        self.assertIn("http only on loopback", proc.stderr)
         self.assertNotIn("demande req_", self.log.getvalue())
         # sans service : la demande brute reste disponible (--local)
         proc = self.cli("request", self.action_id, "--approver", ALICE, "--local")

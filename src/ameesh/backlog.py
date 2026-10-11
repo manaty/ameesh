@@ -129,19 +129,19 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
     file ne reçoit pas de travail pour occuper."""
     title = (title or "").strip()
     if not title:
-        raise BacklogError("titre obligatoire")
+        raise BacklogError("title required")
     expected_value = " ".join((expected_value or "").split())
     if not expected_value:
-        raise BacklogError("valeur attendue obligatoire (--value) : pas de travail pour "
-                           "occuper un agent")
+        raise BacklogError("expected value required (--value): no work just to keep "
+                           "an agent busy")
     try:
         value_score = int(value_score)
     except (TypeError, ValueError):
-        raise BacklogError("score de valeur entier attendu (1 à 100)") from None
+        raise BacklogError("value score must be an integer (1 to 100)") from None
     if not 1 <= value_score <= 100:
-        raise BacklogError("score de valeur hors bornes : %d (1 à 100)" % value_score)
+        raise BacklogError("value score out of range: %d (1 to 100)" % value_score)
     if int(priority) not in PRIORITIES:
-        raise BacklogError("priorité 1 (haute), 2 (normale) ou 3 (basse) : %r" % priority)
+        raise BacklogError("priority 1 (high), 2 (normal) or 3 (low): %r" % priority)
     fiche = None
     if package:
         from . import work
@@ -152,7 +152,7 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         required_capabilities=_capabilities(required_capabilities) or None,
         package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
-        note="file d'amélioration (valeur %d) : %s" % (value_score, expected_value),
+        note="improvement backlog (value %d): %s" % (value_score, expected_value),
         actor=actor)
 
 
@@ -175,15 +175,15 @@ def fits(item: dict, agent: dict) -> bool:
 # --------------------------------------------------------------------------
 
 def take_message(item: dict) -> str:
-    return ("Lot #%d, pris dans la file d'amélioration (aucune demande humaine ni lot du "
-            "projet ne t'attendait) : %s\nValeur attendue : %s%s\n"
-            "Suis le circuit normal de ton projet (relecture, vérifications, intégration "
-            "par qui en a le droit). Interdit dans ce lot : tout geste irréversible ou de "
-            "production (déploiement, fusion, suppression de données, serveur de "
-            "production, dépense engagée) — propose-le à un humain et arrête-toi là. "
-            "Si un lot ou un courrier t'arrive, il passe avant celui-ci. Si l'élément n'a plus "
-            "de valeur, dis-le et rends-le (ameesh work note, puis ameesh work close "
-            "--abandoned) plutôt que de travailler pour occuper." % (
+    return ("Lot #%d, taken from the improvement backlog (no human request or project "
+            "lot was waiting for you): %s\nExpected value: %s%s\n"
+            "Follow your project's normal flow (review, checks, integration "
+            "by whoever has the right). Forbidden in this lot: any irreversible or "
+            "production action (deployment, merge, data deletion, production "
+            "server, committed spending): propose it to a human and stop there. "
+            "If a lot or a message reaches you, it comes before this one. If the item no "
+            "longer has value, say so and hand it back (ameesh work note, then ameesh work "
+            "close --abandoned) rather than working just to keep busy." % (
                 int(item["id"]), item["title"], item.get("expected_value") or "",
                 "\n%s" % item["body"] if (item.get("body") or "").strip() else ""))
 
@@ -215,24 +215,24 @@ def _default_budget_check(cfg, db):
 
 
 def lot_take_message(item: dict, orchestras: list) -> str:
-    return ("Lot #%d, pris de toi-même (L165) : tu étais au repos et ce lot de ton équipe "
-            "n'avait pas de preneur : %s%s\n"
-            "%s peut le réassigner ; s'il te confie autre chose, cela passe avant. "
-            "Suis le circuit normal de ton projet (relecture, vérifications, intégration "
-            "par qui en a le droit). Interdit dans ce lot : tout geste irréversible ou de "
-            "production (déploiement, fusion, suppression de données, serveur de "
-            "production, dépense engagée) — propose-le à un humain et arrête-toi là. "
-            "Si le lot n'est pas pour toi (capacité, contexte), dis-le tout de suite "
-            "(ameesh work note %d, et un message à %s) plutôt que de le garder." % (
+    return ("Lot #%d, taken on your own (L165): you were idle and this lot of your team "
+            "had no taker: %s%s\n"
+            "%s can reassign it; if they give you something else, that comes first. "
+            "Follow your project's normal flow (review, checks, integration "
+            "by whoever has the right). Forbidden in this lot: any irreversible or "
+            "production action (deployment, merge, data deletion, production "
+            "server, committed spending): propose it to a human and stop there. "
+            "If the lot is not for you (capability, context), say so right away "
+            "(ameesh work note %d, and a message to %s) rather than keeping it." % (
                 int(item["id"]), item["title"],
                 "\n%s" % item["body"] if (item.get("body") or "").strip() else "",
-                ", ".join(orchestras) if orchestras else "L'orchestrateur",
-                int(item["id"]), ", ".join(orchestras) if orchestras else "l'orchestrateur"))
+                ", ".join(orchestras) if orchestras else "The orchestrator",
+                int(item["id"]), ", ".join(orchestras) if orchestras else "the orchestrator"))
 
 
 def lot_notice(item: dict, agent: str, idle_for_s: float) -> str:
-    return ("Prise automatique (L165) : %s, au repos depuis %d min, a pris le lot #%d de "
-            "l'équipe %s, sans assigné jusque-là : %s. Pour le confier à un autre : "
+    return ("Automatic take (L165): %s, idle for %d min, took lot #%d of "
+            "team %s, which had no assignee: %s. To give it to someone else: "
             "ameesh work assign %d <agent>." % (
                 agent, int(idle_for_s // 60), int(item["id"]), item.get("lot_team"),
                 item["title"], int(item["id"])))
@@ -448,29 +448,29 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
 # --------------------------------------------------------------------------
 
 def add_parsers(work_sub, func) -> None:
-    p = work_sub.add_parser("backlog", help="file d'amélioration continue (L119, 0037)")
+    p = work_sub.add_parser("backlog", help="continuous improvement backlog (L119, 0037)")
     sub = p.add_subparsers(dest="backlog_command")
-    p_add = sub.add_parser("add", help="ajouter un élément à valeur attendue")
+    p_add = sub.add_parser("add", help="add an item with an expected value")
     p_add.add_argument("--title", required=True)
     p_add.add_argument("--value", required=True, dest="expected_value",
-                       help="valeur attendue, en une phrase")
+                       help="expected value, in one sentence")
     p_add.add_argument("--score", required=True, type=int, dest="value_score",
-                       help="valeur chiffrée de 1 à 100 (la plus forte est prise d'abord)")
+                       help="value score from 1 to 100 (highest is taken first)")
     p_add.add_argument("--priority", type=int, default=DEFAULT_PRIORITY,
-                       choices=list(PRIORITIES), help="1 haute, 2 normale (défaut), 3 basse")
+                       choices=list(PRIORITIES), help="1 high, 2 normal (default), 3 low")
     p_add.add_argument("--source", default="",
-                       help="d'où vient l'élément (constat, alerte, décision, dette…)")
-    p_add.add_argument("--team", default=None, help="équipe qui peut le prendre")
+                       help="where the item comes from (finding, alert, decision, debt...)")
+    p_add.add_argument("--team", default=None, help="team that can take it")
     p_add.add_argument("--requires", action="append", default=[],
-                       help="capacité exigée (répétable, ou liste à virgules)")
+                       help="required capability (repeatable, or comma-separated list)")
     p_add.add_argument("--body", default="")
-    p_add.add_argument("--package", default=None, help="fiche WorkPackage (L29)")
+    p_add.add_argument("--package", default=None, help="WorkPackage sheet (L29)")
     p_add.add_argument("--actor", default="")
     p_add.add_argument("--json", action="store_true")
     p_add.set_defaults(func=func)
-    p_list = sub.add_parser("list", help="la file, dans l'ordre de prise")
+    p_list = sub.add_parser("list", help="the backlog, in take order")
     p_list.add_argument("--all", action="store_true",
-                        help="aussi les éléments déjà pris et non terminés")
+                        help="also items already taken and not finished")
     p_list.add_argument("--limit", type=int, default=100)
     p_list.add_argument("--json", action="store_true")
     p_list.set_defaults(func=func)
@@ -479,14 +479,14 @@ def add_parsers(work_sub, func) -> None:
 def _line(item: dict) -> str:
     extra = []
     if item.get("team"):
-        extra.append("équipe %s" % item["team"])
+        extra.append("team %s" % item["team"])
     if item.get("required_capabilities"):
-        extra.append("exige %s" % ", ".join(item["required_capabilities"]))
+        extra.append("requires %s" % ", ".join(item["required_capabilities"]))
     if item.get("assignee"):
         extra.append("%s, %s" % (item["state"], item["assignee"]))
-    return "#%d  P%s  valeur %3s  %s%s\n      → %s" % (
+    return "#%d  P%s  value %3s  %s%s\n      → %s" % (
         int(item["id"]), item.get("priority") or DEFAULT_PRIORITY, item.get("value_score"),
-        item["title"], "  [%s]" % " ; ".join(extra) if extra else "",
+        item["title"], "  [%s]" % "; ".join(extra) if extra else "",
         item.get("expected_value") or "")
 
 
@@ -501,12 +501,12 @@ def run(db: Db, args) -> int:
                        required_capabilities=args.requires, body=args.body,
                        package=args.package, actor=args.actor)
         except BacklogError as exc:
-            print("erreur : %s" % exc, file=sys.stderr)
+            print("error: %s" % exc, file=sys.stderr)
             return 2
         if args.json:
             print(json.dumps(item, ensure_ascii=False, default=str))
         else:
-            print("élément #%d ajouté à la file (valeur %d, priorité %d) : %s" % (
+            print("item #%d added to the backlog (value %d, priority %d): %s" % (
                 item["id"], item["value_score"], item["priority"], item["title"]))
         return 0
     if command == "list":
@@ -515,10 +515,10 @@ def run(db: Db, args) -> int:
             print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
             return 0
         if not rows:
-            print("file d'amélioration vide")
+            print("improvement backlog empty")
             return 0
         for row in rows:
             print(_line(row))
         return 0
-    print("usage : ameesh work backlog add|list", file=sys.stderr)
+    print("usage: ameesh work backlog add|list", file=sys.stderr)
     return 2

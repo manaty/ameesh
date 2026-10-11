@@ -89,7 +89,7 @@ class AdapterTest(unittest.TestCase):
         result = adapter.parse(json.dumps(
             {"type": "result", "result": "fini", "total_cost_usd": 0.5}))
         self.assertEqual(result["cost"], 0.5)
-        self.assertIn("fin du tour", result["display"][0])
+        self.assertIn("end of turn", result["display"][0])
         self.assertEqual(adapter.parse("pas du json"), {})
 
     def test_lecture_flux_codex(self):
@@ -103,7 +103,7 @@ class AdapterTest(unittest.TestCase):
             "type": "agent_message", "text": "coucou"}}))
         self.assertEqual(item["display"], ["coucou"])
         fin = adapter.parse(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 3}}))
-        self.assertEqual(fin["display"], ["== fin du tour"])
+        self.assertEqual(fin["display"], ["== end of turn"])
         self.assertEqual(fin["usage"], {"input_tokens": 3})
         erreur = adapter.parse(json.dumps({"type": "turn.failed", "error": {"message": "boom"}}))
         self.assertEqual(erreur["error"], "boom")
@@ -117,7 +117,7 @@ class AdapterTest(unittest.TestCase):
             adapter.parse(json.dumps({"type": "text", "text": "salut"}))["display"], ["salut"])
         final = adapter.parse(json.dumps({"type": "final", "text": "fini", "cost_usd": 0.01}))
         self.assertEqual(final["cost"], 0.01)
-        self.assertIn("fin du tour", final["display"][0])
+        self.assertIn("end of turn", final["display"][0])
 
     def test_descripteurs_de_harnais(self):
         """Les lignes de commande viennent d'une table déclarative (base L16)."""

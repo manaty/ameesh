@@ -40,27 +40,27 @@ def _argument(data: bytes, index: int, info: int) -> tuple[int, int]:
     sizes = {24: 1, 25: 2, 26: 4, 27: 8}
     size = sizes.get(info)
     if size is None:
-        raise CborError("CBOR : longueur indéfinie ou réservée (info %d)" % info)
+        raise CborError("CBOR: indefinite or reserved length (info %d)" % info)
     if index + size > len(data):
-        raise CborError("CBOR : en-tête tronqué")
+        raise CborError("CBOR: truncated header")
     return int.from_bytes(data[index:index + size], "big"), index + size
 
 
 def _item(data: bytes, index: int, depth: int):
     if depth > MAX_DEPTH:
-        raise CborError("CBOR : imbrication trop profonde")
+        raise CborError("CBOR: nesting too deep")
     if index >= len(data):
-        raise CborError("CBOR : donnée tronquée")
+        raise CborError("CBOR: truncated data")
     initial = data[index]
     major, info = initial >> 5, initial & 0x1F
     index += 1
     if major == 7:
         simple = {20: False, 21: True, 22: None}
         if info not in simple:
-            raise CborError("CBOR : valeur simple ou flottant non pris en charge (%d)" % info)
+            raise CborError("CBOR: simple value or float not supported (%d)" % info)
         return simple[info], index
     if major == 6:
-        raise CborError("CBOR : étiquettes non prises en charge")
+        raise CborError("CBOR: tags not supported")
     arg, index = _argument(data, index, info)
     remaining = len(data) - index
     if major == 0:
@@ -69,7 +69,7 @@ def _item(data: bytes, index: int, depth: int):
         return -1 - arg, index
     if major in (2, 3):
         if arg > remaining:
-            raise CborError("CBOR : chaîne plus longue que les données")
+            raise CborError("CBOR: string longer than the data")
         raw = bytes(data[index:index + arg])
         index += arg
         if major == 2:
@@ -77,10 +77,10 @@ def _item(data: bytes, index: int, depth: int):
         try:
             return raw.decode("utf-8"), index
         except UnicodeDecodeError as exc:
-            raise CborError("CBOR : texte non UTF-8") from exc
+            raise CborError("CBOR: text is not UTF-8") from exc
     if major == 4:
         if arg > remaining:
-            raise CborError("CBOR : tableau plus long que les données")
+            raise CborError("CBOR: array longer than the data")
         items = []
         for _ in range(arg):
             value, index = _item(data, index, depth + 1)
@@ -88,14 +88,14 @@ def _item(data: bytes, index: int, depth: int):
         return items, index
     # major == 5 : table
     if arg * 2 > remaining:
-        raise CborError("CBOR : table plus longue que les données")
+        raise CborError("CBOR: map longer than the data")
     table: dict = {}
     for _ in range(arg):
         key, index = _item(data, index, depth + 1)
         if not isinstance(key, (int, str)) or isinstance(key, bool):
-            raise CborError("CBOR : clé de table ni entière ni textuelle")
+            raise CborError("CBOR: map key is neither integer nor text")
         if key in table:
-            raise CborError("CBOR : clé de table en double : %r" % (key,))
+            raise CborError("CBOR: duplicate map key: %r" % (key,))
         value, index = _item(data, index, depth + 1)
         table[key] = value
     return table, index
@@ -108,7 +108,7 @@ def decode(data: bytes, index: int = 0, *, allow_trailing: bool = False):
     """
     value, end = _item(bytes(data), index, 0)
     if not allow_trailing and end != len(data):
-        raise CborError("CBOR : %d octet(s) en trop" % (len(data) - end))
+        raise CborError("CBOR: %d trailing byte(s)" % (len(data) - end))
     return value, end
 
 
@@ -138,7 +138,7 @@ class PublicKey:
 
 def es256_key(point: tuple[int, int]) -> PublicKey:
     if not p256.is_on_curve(point[0], point[1]):
-        raise CborError("clé ES256 : point hors de la courbe P-256")
+        raise CborError("ES256 key: point not on the P-256 curve")
     return PublicKey("ES256", point=(point[0], point[1]))
 
 
@@ -152,7 +152,7 @@ def ed25519_key(raw: bytes) -> PublicKey:
     raw = bytes(raw)
     error = signing.public_key_error(raw)
     if error:
-        raise CborError("clé Ed25519 refusée : %s" % error)
+        raise CborError("Ed25519 key rejected: %s" % error)
     return PublicKey("EdDSA", raw=raw)
 
 
@@ -161,26 +161,26 @@ def parse_cose_key(blob: bytes) -> PublicKey:
     try:
         table, _end = decode(blob)
     except CborError as exc:
-        raise CborError("clé COSE illisible : %s" % exc) from exc
+        raise CborError("unreadable COSE key: %s" % exc) from exc
     if not isinstance(table, dict):
-        raise CborError("clé COSE : table CBOR attendue")
+        raise CborError("COSE key: CBOR map expected")
     if D in table:
-        raise CborError("clé COSE contenant une partie PRIVÉE (d) : refus")
+        raise CborError("COSE key contains a PRIVATE part (d): rejected")
     kty, alg, crv = table.get(KTY), table.get(ALG), table.get(CRV)
     if kty == KTY_EC2:
         if alg != ALG_ES256 or crv != CRV_P256:
-            raise CborError("clé COSE EC2 : seul ES256 sur P-256 est admis (alg %r, crv %r)"
+            raise CborError("COSE EC2 key: only ES256 on P-256 is accepted (alg %r, crv %r)"
                             % (alg, crv))
         x, y = table.get(X), table.get(Y)
         if not isinstance(x, bytes) or not isinstance(y, bytes) or len(x) != 32 or len(y) != 32:
-            raise CborError("clé COSE EC2 : x et y de 32 octets attendus (point non compressé)")
+            raise CborError("COSE EC2 key: 32-byte x and y expected (uncompressed point)")
         return es256_key((int.from_bytes(x, "big"), int.from_bytes(y, "big")))
     if kty == KTY_OKP:
         if alg != ALG_EDDSA or crv != CRV_ED25519:
-            raise CborError("clé COSE OKP : seul EdDSA sur Ed25519 est admis (alg %r, crv %r)"
+            raise CborError("COSE OKP key: only EdDSA on Ed25519 is accepted (alg %r, crv %r)"
                             % (alg, crv))
         x = table.get(X)
         if not isinstance(x, bytes):
-            raise CborError("clé COSE OKP : x attendu")
+            raise CborError("COSE OKP key: x expected")
         return ed25519_key(x)
-    raise CborError("clé COSE : type de clé non pris en charge (kty %r)" % (kty,))
+    raise CborError("COSE key: unsupported key type (kty %r)" % (kty,))

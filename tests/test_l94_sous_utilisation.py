@@ -77,8 +77,8 @@ class PlanUnderusedTest(_Base):
         self.assertAlmostEqual(alerte["pace_cap"], 3 / 7 + 0.10, places=2)
         # la projection au rythme actuel : 20 % en 3/7 → 47 % à l'échéance
         self.assertAlmostEqual(alerte["lost_at_pace"], 1 - 0.2 * 7 / 3, places=2)
-        self.assertIn("perte estimée", alerte["detail"])
-        self.assertIn("rythme permis de 53 %", alerte["detail"])
+        self.assertIn("estimated loss", alerte["detail"])
+        self.assertIn("allowed pace of 53 %", alerte["detail"])
         # `since` : le début de la fenêtre — stable tant qu'elle dure
         self.assertAlmostEqual(alerte["since"], self.now + 4 * JOUR - 7 * JOUR, places=0)
         # seuil réglable, et 0 désactive
@@ -98,7 +98,7 @@ class PlanUnderusedTest(_Base):
         out = self.alertes()
         self.assertEqual([(a["gauge"], a["reason"]) for a in out],
                          [("five_hour", "fin_de_fenetre")])
-        self.assertIn("remise à zéro dans 30 min", out[0]["detail"])
+        self.assertIn("resets in 30 min", out[0]["detail"])
         self.assertEqual(out[0]["value"], 90)
         # au-dessus du seuil d'utilisation, ou réglage plus court : rien
         self.assertEqual(self.alertes(plan_used_pct=10), [])
@@ -131,8 +131,8 @@ class PlanUnderusedTest(_Base):
         self.assertIsNone(out[0]["account"])
         self.assertEqual(out[0]["idle_agents"], ["claude1"])
         self.assertEqual(out[0]["responsible"], "human:proprio")
-        self.assertIn("agents claude au repos : claude1", out[0]["detail"])
-        self.assertIn("12.50 $ payés au token sur 24 h", out[0]["detail"])
+        self.assertIn("idle claude agents: claude1", out[0]["detail"])
+        self.assertIn("$12.50 paid per token over 24 h", out[0]["detail"])
         self.assertEqual(exploitation._format_alert(out[0])[:33],
                          "[plan_underused] claude/défaut : ")
 
@@ -163,7 +163,7 @@ class IdleCapacityTest(_Base):
         alerte = out[0]
         self.assertEqual((alerte["reason"], alerte["agents"], alerte["lots"]),
                          ("travail_en_attente", ["claude1", "codex2"], [lot["id"]]))
-        self.assertIn("Action : répartir", alerte["detail"])
+        self.assertIn("Action: dispatch", alerte["detail"])
         self.assertEqual(alerte["responsible"], "human:proprio")
         # un agent avec un lot assigné ou du courrier n'est pas « au repos sans lot »
         work.assign(self.db, lot["id"], "claude1")
@@ -176,7 +176,7 @@ class IdleCapacityTest(_Base):
         out = self.alertes()
         self.assertEqual([(a["reason"], a["paid_working"]) for a in out],
                          [("forfait_au_repos", ["deepseek1"])])
-        self.assertIn("payés au token travaillent (deepseek1)", out[0]["detail"])
+        self.assertIn("per-token agents are working (deepseek1)", out[0]["detail"])
 
     def test_courrier_en_souffrance_chez_un_agent_occupe(self):
         self.agent("claude1")
@@ -186,7 +186,7 @@ class IdleCapacityTest(_Base):
         out = self.alertes()
         self.assertEqual([a["reason"] for a in out if a["type"] == "idle_capacity"],
                          ["travail_en_attente"])
-        self.assertIn("courrier en souffrance chez claude2", out[0]["detail"])
+        self.assertIn("mail waiting at claude2", out[0]["detail"])
 
     def test_orchestrateur_tenu_par_attach(self):
         self.agent("claude1")
@@ -199,9 +199,9 @@ class IdleCapacityTest(_Base):
         tenu = _types(out, "orchestrator_held")
         self.assertEqual([(a["agent"], a["value"], a["owner"]) for a in tenu],
                          [("orch", 1, "attach:proprio@poste")])
-        self.assertIn("il ne répartit plus", tenu[0]["detail"])
+        self.assertIn("it no longer dispatches", tenu[0]["detail"])
         repos = _types(out, "idle_capacity")[0]
-        self.assertIn("réveiller l'orchestrateur : orch est tenu", repos["detail"])
+        self.assertIn("wake the orchestrator: orch is held", repos["detail"])
         # seuil plus long que la tenue : rien
         self.assertEqual(_types(self.alertes(orchestrators_declared=("orch",),
                                              orchestrator_held_s=4 * HEURE),
@@ -244,7 +244,7 @@ class HostUnderusedTest(_Base):
         out = self.alertes()
         self.assertEqual([(a["host"], a["reason"], a["pressured"]) for a in out],
                          [("vm", "pression_ailleurs", ["poste"])])
-        self.assertIn("aucun déplacement automatique", out[0]["detail"])
+        self.assertIn("nothing is moved automatically", out[0]["detail"])
         self.assertIn("ameesh placement check", out[0]["detail"])
         # une seule pointe au-dessus du seuil de charge : pas à vide
         self.releve("vm", load=2.0, ago_s=600)
@@ -296,7 +296,7 @@ class BalanceLowTest(_Base):
         self.assertAlmostEqual(alerte["autonomy_h"], 56.0, places=1)
         self.assertAlmostEqual(alerte["empty_ts"], self.now + 56 * HEURE, delta=120)
         self.assertEqual(alerte["responsible"], "human:proprio")
-        for texte in ("84.00 USD", "1.50 USD/h", "autonomie ≈ 2 j 8 h", "épuisement prévu"):
+        for texte in ("84.00 USD", "1.50 USD/h", "runway ≈ 2 d 8 h", "expected to run out"):
             self.assertIn(texte, alerte["detail"])
         self.assertEqual(self.alertes(balance_hours=50), [])
 
@@ -307,7 +307,7 @@ class BalanceLowTest(_Base):
         self.assertEqual((out[0]["causes"], out[0]["urgent"]), (["autonomie", "solde"], True))
         message = notify.render(out[0], "raised", self.now)
         self.assertTrue(message.urgent)
-        self.assertEqual(message.title, "ameesh : solde bas (deepseek)")
+        self.assertEqual(message.title, "ameesh: low balance (deepseek)")
         # seuils réglables, 0 désactive
         self.assertEqual(self.alertes(balance_hours=0, balance_min_usd=0), [])
         out = self.alertes(balance_hours=0)
@@ -318,7 +318,7 @@ class BalanceLowTest(_Base):
         out = self.alertes()
         self.assertEqual((out[0]["causes"], out[0]["urgent"], out[0]["rate_per_h"]),
                          (["solde"], False, None))
-        self.assertIn("rythme réel inconnu", out[0]["detail"])
+        self.assertIn("actual rate unknown", out[0]["detail"])
         # autre devise : pas de plancher en USD, et sans dépense pas d'autonomie
         self.db.execute("TRUNCATE provider_balances")
         self.solde(10, 2 * HEURE, currency="CNY")
@@ -335,13 +335,13 @@ class NotifyTest(_Base):
                   "account": "secondaire", "gauge": "codex-10080min", "since": self.now - JOUR,
                   "detail": "perte estimée : 86 %"}
         message = notify.render(alerte, "raised", self.now)
-        self.assertEqual(message.title, "ameesh : forfait sous-employé (codex/secondaire)")
-        self.assertIn("compte codex/secondaire · fenêtre codex-10080min", message.body)
+        self.assertEqual(message.title, "ameesh: underused plan (codex/secondaire)")
+        self.assertIn("account codex/secondaire · window codex-10080min", message.body)
         self.assertFalse(message.urgent)
         resume = notify.render_summary({"raised": {"plan_underused": 2, "idle_capacity": 1,
                                                    "orphan_lot": 1}, "resolved": 0},
                                        "poste")
-        self.assertIn("sous-utilisation : 3 (1 capacité au repos, 2 forfait sous-employé)",
+        self.assertIn("underuse: 3 (1 idle capacity, 2 underused plan)",
                       resume.body)
 
     def test_envoi_puis_resolution(self):
@@ -366,7 +366,7 @@ class NotifyTest(_Base):
         records = notifier.run_pass(self.db, thresholds=_seuils())
         self.assertEqual([(r["type"], r["event"]) for r in records],
                          [("plan_underused", "resolved")])
-        self.assertIn("résolue", envois[-1].title)
+        self.assertIn("resolved", envois[-1].title)
 
 
 class OptionsTest(unittest.TestCase):

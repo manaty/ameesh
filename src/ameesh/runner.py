@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""agent-runner — un exécuteur par machine : baux, tours, réveil sur NOTIFY.
+"""agent-runner — one runner per machine: leases, turns, wake-up on NOTIFY.
 
   agent-runner [--host H] [--runner-id ID] [--agents a,b] [--once [--wait S]]
                [--dry-run] [--max-turns N] [--migrate]
-        réclame les agents de cet hôte, renouvelle leurs baux, lance un tour
-        quand un message arrive (LISTEN/NOTIFY) ou après inactivité.
-  agent-runner register <nom> <claude|codex|deepseek> [--cwd DIR] [--prompt TEXTE]
+        claims this host's agents, renews their leases, starts a turn
+        when a message arrives (LISTEN/NOTIFY) or after inactivity.
+  agent-runner register <name> <claude|codex|deepseek> [--cwd DIR] [--prompt TEXT]
                [--session ID] [--chantier C] [--model M] [--budget USD]
-        inscrit un agent dans le registre (l'équivalent v1 de « nexlink-agent start »).
-  agent-runner stop <nom>
-        marque l'agent arrêté : plus de nouveau bail, le tour en cours se termine.
+        registers an agent (the v1 equivalent of "nexlink-agent start").
+  agent-runner stop <name>
+        marks the agent stopped: no new lease, the current turn finishes.
 
-Garanties (R3, R5) :
-* un agent n'a qu'un bail vivant : `claim` est un UPDATE conditionnel atomique ;
-* le bail est renouvelé par un battement pendant les tours ; s'il est perdu, le
-  processus du harnais est terminé et le tour n'est pas compté ;
-* si l'exécuteur meurt (SIGKILL, coupure), le bail expire et un autre exécuteur
-  de la même machine reprend l'agent ;
-* le flux JSONL du harnais est journalisé dans
-  ~/.local/state/agent-mesh/<nom>/events.jsonl, la session est mémorisée en base
-  et sur disque : un tour peut être repris.
+Guarantees (R3, R5):
+* an agent has only one live lease: `claim` is an atomic conditional UPDATE;
+* the lease is renewed by a heartbeat during turns; if it is lost, the
+  harness process is terminated and the turn is not counted;
+* if the runner dies (SIGKILL, power cut), the lease expires and another runner
+  on the same machine takes the agent over;
+* the harness JSONL stream is logged to
+  ~/.local/state/agent-mesh/<name>/events.jsonl, the session is stored in the
+  database and on disk: a turn can be resumed.
 
-Aucun harnais réel n'est lancé par les tests : AGENT_MESH_BIN_DIR ou
-AGENT_MESH_<HARNAIS>_BIN pointent vers de faux binaires.
+Tests never launch a real harness: AGENT_MESH_BIN_DIR or
+AGENT_MESH_<HARNESS>_BIN point to fake binaries.
 """
 from __future__ import annotations
 
@@ -85,7 +85,7 @@ class _AsyncLog:
                 return
             if self.perdus:
                 perdus, self.perdus = self.perdus, 0
-                log("[journal] %d message(s) abandonné(s) : puits saturé" % perdus)
+                log("[journal] %d message(s) dropped: sink saturated" % perdus)
             log(message)
 
     def write(self, message: str) -> None:
@@ -171,8 +171,8 @@ def _sortie_sure(code: int, fils: "list[threading.Thread] | tuple" = ()) -> int:
     if journal_arrete and not vivants:
         return code
     noms = ", ".join(t.name for t in vivants) or "journal"
-    _ecrire_sans_attendre(2, ("agent-runner : fil(s) encore actif(s) à l'arrêt (%s) : "
-                              "sortie immédiate\n" % noms).encode("utf-8", "replace"))
+    _ecrire_sans_attendre(2, ("agent-runner: thread(s) still active at shutdown (%s): "
+                              "exiting immediately\n" % noms).encode("utf-8", "replace"))
     os._exit(code)
 
 
@@ -456,7 +456,7 @@ class AgentWorker(threading.Thread):
                        ts=time.time(), project=project,
                        meta=dict(meta or {}, audit="runner"))
         except Exception as exc:  # une trace ne casse jamais un tour
-            log("[%s] fil indisponible : %s" % (self.name, exc))
+            log("[%s] thread unavailable: %s" % (self.name, exc))
 
     # -- bail --------------------------------------------------------------
     def deadline_passed(self) -> bool:
@@ -510,12 +510,12 @@ class AgentWorker(threading.Thread):
             # Échéance déjà atteinte (réveil tardif, horloge, bail raccourci) :
             # on ne tente même pas le renouvellement, on arrête tout de suite.
             self.lease_lost.set()
-            self.stop_group_now("échéance du bail atteinte", grace=0, hard=True)
+            self.stop_group_now("lease deadline reached", grace=0, hard=True)
             return False
         answered, expires, error = self._renew_call()
         if not answered:
             self.lease_lost.set()
-            self.stop_group_now("renouvellement sans réponse au-delà du bail",
+            self.stop_group_now("renewal unanswered past the lease",
                                 grace=0, hard=True)
             return False
         if error is not None:
@@ -526,13 +526,13 @@ class AgentWorker(threading.Thread):
                 # veilleur qui n'attend personne) l'arrête. Le compte d'échecs
                 # n'a plus de sens : le battement réessaie vite (2 s, 4 s…).
                 reste = self.lease_deadline - time.time()
-                echec = ("[%s] battement : %s — échec %d, bail valable encore %ds : "
-                         "le tour continue, nouvel essai bientôt"
+                echec = ("[%s] heartbeat: %s — failure %d, lease still valid for %ds: "
+                         "the turn continues, retrying soon"
                          % (self.name, db_mod.explain(error), self.renew_failures,
                             max(0, int(reste))))
                 definitive = reste <= 0
             else:
-                echec = ("[%s] battement : base injoignable (%s) — échec %d/%d"
+                echec = ("[%s] heartbeat: database unreachable (%s) — failure %d/%d"
                          % (self.name, error, self.renew_failures,
                             self.MAX_RENEW_FAILURES))
                 definitive = (self.renew_failures >= self.MAX_RENEW_FAILURES
@@ -548,16 +548,16 @@ class AgentWorker(threading.Thread):
             # autres chemins de perte — revue codex3 de 852c8da). Le diagnostic
             # part après le signal, par la file bornée.
             self.lease_lost.set()
-            self.stop_group_now("base injoignable", grace=0, hard=True)
+            self.stop_group_now("database unreachable", grace=0, hard=True)
             log_async(echec)
             return False
         if expires is None:
             self.lease_lost.set()
-            self.stop_group_now("bail perdu (epoch %d)" % self.epoch, grace=0, hard=True)
+            self.stop_group_now("lease lost (epoch %d)" % self.epoch, grace=0, hard=True)
             return False
         if self.renew_failures:
-            log_async("[%s] battement : base de nouveau joignable, bail renouvelé après "
-                      "%d échec(s)" % (self.name, self.renew_failures))
+            log_async("[%s] heartbeat: database reachable again, lease renewed after "
+                      "%d failure(s)" % (self.name, self.renew_failures))
         self.renew_failures = 0
         self.lease_deadline = float(expires)
         return True
@@ -661,7 +661,7 @@ class AgentWorker(threading.Thread):
         if not group:
             if proc.poll() is None:
                 self._signal_group(None, proc, signal.SIGKILL)
-                log_async("[%s] le harnais survit : SIGKILL (harnais seul)" % self.name)
+                log_async("[%s] harness still alive: SIGKILL (harness only)" % self.name)
                 try:
                     proc.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:
@@ -675,7 +675,7 @@ class AgentWorker(threading.Thread):
         # Le signal part avant le journal : un print+flush sur le chemin
         # critique laissait le temps à un remplaçant de réclamer sous charge.
         self._signal_group(pgid, proc, signal.SIGKILL)
-        log_async("[%s] le groupe du harnais survit : SIGKILL" % self.name)
+        log_async("[%s] harness group still alive: SIGKILL" % self.name)
         # SIGKILL est asynchrone. On moissonne d'abord l'enfant direct (sinon
         # son zombie garde le groupe « vivant »), puis on attend la disparition
         # du groupe entier, dans le même budget de 2 s.
@@ -693,7 +693,7 @@ class AgentWorker(threading.Thread):
                 moisson = time.monotonic() + 0.05
             time.sleep(0.005)
         if self._group_alive(pgid):
-            log_async("[%s] groupe toujours vivant après SIGKILL (état noyau ?)" % self.name)
+            log_async("[%s] group still alive after SIGKILL (kernel state?)" % self.name)
 
     def stop_group_now(self, reason: str, *, grace: float | None = None,
                        hard: bool = False, group: bool = True) -> bool:
@@ -718,11 +718,11 @@ class AgentWorker(threading.Thread):
             # consommé par le recontrôle, puis remis à zéro au tour suivant
             # (verdict codex3 L11 B5 : un latch permanent tuerait la reprise).
             self.stop_requested.set()
-            log_async("[%s] arrêt demandé (%s) : harnais non encore publié"
+            log_async("[%s] stop requested (%s): harness not yet published"
                       % (self.name, reason))
             return False
         self.terminate(grace=grace, hard=hard, group=group)
-        log_async("[%s] harnais arrêté (%s)" % (self.name, reason))
+        log_async("[%s] harness stopped (%s)" % (self.name, reason))
         return True
 
     def kill_if_stop_requested(self) -> bool:
@@ -748,7 +748,7 @@ class AgentWorker(threading.Thread):
         if proc is None:
             self.stop_requested.set()
             return False
-        self.stop_group_now(self._stop_reason or "arrêt", grace=0, hard=True)
+        self.stop_group_now(self._stop_reason or "stop", grace=0, hard=True)
         # Le latch de publication est consommé : le prochain tour doit pouvoir
         # tourner (verdict codex3 L11 B5).
         self.stop_requested.clear()
@@ -769,7 +769,7 @@ class AgentWorker(threading.Thread):
                 or self.stopping.is_set() or self.watchdog_stop.is_set()):
             return False
         self.lease_lost.set()
-        return self.stop_group_now("bail perdu", grace=0, hard=True)
+        return self.stop_group_now("lease lost", grace=0, hard=True)
 
     def kill_if_preempted(self) -> bool:
         """Rattrape une préemption arrivée avant la publication du `Popen` (0018).
@@ -782,7 +782,7 @@ class AgentWorker(threading.Thread):
         """
         if not self.preempting.is_set():
             return False
-        return self.stop_group_now("préemption", grace=0, hard=True)
+        return self.stop_group_now("preemption", grace=0, hard=True)
 
     def wait_timeout(self, cap: float) -> float:
         """Attente bornée par l'échéance du bail, **sans plancher positif**.
@@ -839,7 +839,7 @@ class AgentWorker(threading.Thread):
             if self.lease_deadline > time.time():
                 continue  # bail renouvelé entre-temps : rien à faire
             self.lease_lost.set()
-            self.stop_group_now("échéance du bail atteinte", grace=0, hard=True)
+            self.stop_group_now("lease deadline reached", grace=0, hard=True)
             return
 
     def _heartbeat(self, stop_event: threading.Event) -> None:
@@ -893,11 +893,11 @@ class AgentWorker(threading.Thread):
         """
         while not done.wait(0.1):
             if self.preempting.is_set():
-                self.stop_group_now("préemption", grace=1.0)
+                self.stop_group_now("preemption", grace=1.0)
                 return
             if self.restarting.is_set():
                 # `ameesh restart` (L26) : même point de passage, même grâce
-                self.stop_group_now("redémarrage demandé", grace=1.0)
+                self.stop_group_now("restart requested", grace=1.0)
                 return
 
     def request_restart(self) -> None:
@@ -936,10 +936,10 @@ class AgentWorker(threading.Thread):
         self.nudged = False
         self.suite = self.rotation_forcee = None  # L105 : la session neuve part du brief
         self.agent = registry.get(self.db, self.name) or self.agent
-        log_async("[%s] redémarrage appliqué : session oubliée, brief en tête" % self.name)
+        log_async("[%s] restart applied: session forgotten, brief first" % self.name)
         self._fil_note(
-            "Redémarrage appliqué : l'ancienne session (%s) est oubliée ; la session "
-            "neuve s'ouvre sur le brief déposé." % (row.get("forgotten_session") or "aucune"),
+            "Restart applied: the old session (%s) is forgotten; the new "
+            "session opens on the stored brief." % (row.get("forgotten_session") or "none"),
             meta={"action": "restart", "session": row.get("forgotten_session") or ""})
         return True
 
@@ -997,15 +997,15 @@ class AgentWorker(threading.Thread):
         normale (le harnais a fini, ou il a été clos à un point sûr), dont le
         travail de fond a son délai de grâce."""
         if self.lease_lost.is_set() or self.deadline_passed():
-            return "bail perdu"
+            return "lease lost"
         if self.preempting.is_set():
-            return "préemption"
+            return "preemption"
         if self.restarting.is_set():
-            return "redémarrage demandé"
+            return "restart requested"
         if self._power_texte:
-            return "batterie critique"
+            return "critical battery"
         if self.runner.stop.is_set():
-            return "arrêt de l'exécuteur"
+            return "runner shutdown"
         return ""
 
     def turn_close_due(self, started: float, reread: int,
@@ -1017,12 +1017,12 @@ class AgentWorker(threading.Thread):
         Rend la raison, ou None."""
         plafond = self.context_max_tokens()
         if plafond > 0 and reread >= plafond and self.session_policy() != "jamais":
-            return "plafond de contexte : %d jetons relus dans le tour (plafond %d)" % (
+            return "context cap: %d tokens reread in the turn (cap %d)" % (
                 reread, plafond)
         duree_max = self.turn_max_seconds()
         ecoule = (time.time() if now is None else now) - started
         if duree_max > 0 and ecoule >= duree_max:
-            return "durée maximale du tour : %ds (plafond %ds)" % (int(ecoule), duree_max)
+            return "maximum turn duration: %ds (cap %ds)" % (int(ecoule), duree_max)
         return None
 
     def last_turn_context_reread(self) -> tuple[int, str | None]:
@@ -1099,12 +1099,12 @@ class AgentWorker(threading.Thread):
             if self.session_policy() != "jamais" and self.current_session():
                 return self._rotate(raison)
         if self.context_rotation_due():
-            return self._rotate("plafond de contexte : %d jetons relus au dernier tour "
-                                "(plafond %d)" % (self.last_turn_context_reread()[0],
+            return self._rotate("context cap: %d tokens reread in the last turn "
+                                "(cap %d)" % (self.last_turn_context_reread()[0],
                                                   self.context_max_tokens()))
         if not self.rotation_due():
             return False
-        return self._rotate("tours=%d, tokens=%.0f, dernier tour=%.0fs" % (
+        return self._rotate("turns=%d, tokens=%.0f, last turn=%.0fs" % (
             self.session_turns, self.session_tokens, self.last_turn_seconds))
 
     def turn_summary(self) -> str:
@@ -1126,7 +1126,7 @@ class AgentWorker(threading.Thread):
     def _rotate(self, raison: str) -> bool:
         """Le mécanisme de rotation (L11) : résumé dans la session, puis oubli."""
         ancienne = self.current_session()
-        log_async("[%s] rotation de session (%s)" % (self.name, raison))
+        log_async("[%s] session rotation (%s)" % (self.name, raison))
         self._refus_pression = False
         ok = self.run_turn({"kind": "prompt", "prompt": adapters.SUMMARY_PROMPT, "ids": []})
         if not ok and self._refus_pression:
@@ -1139,27 +1139,27 @@ class AgentWorker(threading.Thread):
             # Résumé partiel, bail perdu pendant le tour, claim remplaçant : on ne
             # touche à rien. Effacer la session ici effacerait celle du remplaçant
             # (verdict codex3 L11 B3).
-            log_async("[%s] rotation annulée : le tour de résumé n'a pas abouti" % self.name)
-            self._fil_note("Rotation de session annulée : le tour de résumé n'a pas "
-                           "abouti. L'ancienne session est conservée ; nouvelle "
-                           "tentative plus tard.",
+            log_async("[%s] rotation cancelled: the summary turn did not complete" % self.name)
+            self._fil_note("Session rotation cancelled: the summary turn did not "
+                           "complete. The old session is kept; will try "
+                           "again later.",
                            meta={"action": "rotation", "etat": "annulee"})
             return False
         resume = self.turn_summary()
         if not resume:
-            log_async("[%s] rotation annulée : résumé vide" % self.name)
-            self._fil_note("Rotation de session annulée : résumé vide. L'ancienne "
-                           "session est conservée.",
+            log_async("[%s] rotation cancelled: empty summary" % self.name)
+            self._fil_note("Session rotation cancelled: empty summary. The old "
+                           "session is kept.",
                            meta={"action": "rotation", "etat": "annulee"})
             return False
         self._session_history(ancienne, resume)
         # L'effacement est fencé par le bail : si un remplaçant a réclamé l'agent
         # entre-temps, sa session n'est pas touchée.
         if not registry.clear_session(self.db, self.name, self.runner.runner_id, self.epoch):
-            log_async("[%s] rotation annulée : bail perdu avant l'effacement de la session"
+            log_async("[%s] rotation cancelled: lease lost before the session was cleared"
                       % self.name)
-            self._fil_note("Rotation de session annulée : le bail a changé de main "
-                           "avant l'effacement ; rien n'a été touché.",
+            self._fil_note("Session rotation cancelled: the lease changed hands "
+                           "before clearing; nothing was touched.",
                            meta={"action": "rotation", "etat": "annulee"})
             return False
         self.resume_summary = resume
@@ -1175,9 +1175,9 @@ class AgentWorker(threading.Thread):
         self.last_turn_reread_session = None
         self.last_turn_context = self.last_turn_context_session = None
         self._fil_note(
-            "Rotation de session (%s) : l'ancien id (%s) est conservé dans "
-            "`session-history.jsonl` ; la session neuve repart du résumé ci-dessous.\n\n%s"
-            % (raison, ancienne or "neuve", resume),
+            "Session rotation (%s): the old id (%s) is kept in "
+            "`session-history.jsonl`; the new session starts from the summary below.\n\n%s"
+            % (raison, ancienne or "new", resume),
             meta={"action": "rotation", "session": ancienne or "", "raison": raison})
         return True
 
@@ -1201,7 +1201,7 @@ class AgentWorker(threading.Thread):
                     return None
             assignes = ops.assigned_open_lots(self.name)
         except db_mod.DbError as exc:
-            log_async("[%s] lot du tour illisible (%s)" % (self.name, exc))
+            log_async("[%s] turn lot unreadable (%s)" % (self.name, exc))
             return None
         if len(assignes) == 1:
             return str(assignes[0]["id"])
@@ -1224,20 +1224,20 @@ class AgentWorker(threading.Thread):
                 lots.update(storage.of(self.db).operations.message_lots(ids))
             marques = work_mod.mark_delegate_turn(self.db, self.name, lots)
         except (db_mod.DbError, ValueError) as exc:
-            log_async("[%s] tour sur lot délégué non noté (%s)" % (self.name, exc))
+            log_async("[%s] turn on delegated lot not recorded (%s)" % (self.name, exc))
             return
         if marques:
-            log_async("[%s] tour sur lot(s) délégué(s) : %s"
+            log_async("[%s] turn on delegated lot(s): %s"
                       % (self.name, ", ".join("#%d" % i for i in marques)))
         # L157 : le premier tour de l'assigné sur un lot date le début du
         # travail (durée réelle = fusion − début), une seule fois
         try:
             debuts = estimates.mark_started(self.db, self.name, lots)
         except (db_mod.DbError, ValueError) as exc:
-            log_async("[%s] début de lot non noté (%s)" % (self.name, exc))
+            log_async("[%s] lot start not recorded (%s)" % (self.name, exc))
             return
         if debuts:
-            log_async("[%s] début mesuré : %s"
+            log_async("[%s] start measured: %s"
                       % (self.name, ", ".join("#%d" % i for i in debuts)))
 
     def lot_rotation_due(self, lot: str | None) -> bool:
@@ -1272,7 +1272,7 @@ class AgentWorker(threading.Thread):
         courant = (self.agent or {}).get("session_work_item")
         if spec.get("kind") == "prompt":
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
-        ok = self._rotate("changement de lot %s → %s" % (courant, lot))
+        ok = self._rotate("lot change %s → %s" % (courant, lot))
         if not ok:
             if storage.of(self.db).operations.set_session_work_item(
                     self.name, self.runner.runner_id, self.epoch, str(lot)):
@@ -1341,17 +1341,17 @@ class AgentWorker(threading.Thread):
                 candidats.append(chemin)
         if len(candidats) != 1:
             if len(candidats) > 1:
-                log("[%s] dossier déplacé ambigu : %s" % (self.name, ", ".join(candidats)))
+                log("[%s] moved directory ambiguous: %s" % (self.name, ", ".join(candidats)))
             return None
         candidat = candidats[0]
         if registry.cwd_used(self.db, candidat, self.name):
-            log("[%s] dossier déplacé %s déjà utilisé par un autre agent"
+            log("[%s] moved directory %s already used by another agent"
                 % (self.name, candidat))
             return None
         registry.upsert(self.db, self.name, cwd=candidat)
         self.agent["cwd"] = candidat
-        log("[%s] dossier de travail déplacé adopté : %s" % (self.name, candidat))
-        self._fil_note("Dossier de travail déplacé adopté : %s" % candidat,
+        log("[%s] moved working directory adopted: %s" % (self.name, candidat))
+        self._fil_note("Moved working directory adopted: %s" % candidat,
                        meta={"action": "deplacement", "cwd": candidat})
         return candidat
 
@@ -1372,8 +1372,8 @@ class AgentWorker(threading.Thread):
         attente croissante. Aucun tour ne part ; le bail reste défendu par
         `renew()` à chaque passage de la boucle et par le veilleur."""
         attente = self._reprise.echec()
-        log_async("[%s] %s pendant %s — tours suspendus, nouvel essai dans %ds "
-                  "(échec %d, panne depuis %ds)"
+        log_async("[%s] %s during %s — turns suspended, retrying in %ds "
+                  "(failure %d, down for %ds)"
                   % (self.name, db_mod.explain(exc), ou, int(attente),
                      self._reprise.echecs, int(self._reprise.duree())))
         if not self._base_marquee:
@@ -1397,7 +1397,7 @@ class AgentWorker(threading.Thread):
     def _base_retablie(self) -> None:
         bilan = self._reprise.retablie()
         if bilan:
-            log_async("[%s] base de nouveau joignable après %ds (%d échec(s)) : reprise"
+            log_async("[%s] database reachable again after %ds (%d failure(s)): resuming"
                       % (self.name, int(bilan[1]), bilan[0]))
 
     def _avec_reprise(self, quoi: str, fn, *args, **kwargs):
@@ -1417,7 +1417,7 @@ class AgentWorker(threading.Thread):
                 if (self.lease_lost.is_set() or self.deadline_passed()
                         or self.runner.stop.is_set()):
                     raise
-                log_async("[%s] %s : %s — nouvel essai dans %ds (échec %d)"
+                log_async("[%s] %s: %s — retrying in %ds (failure %d)"
                           % (self.name, quoi, db_mod.explain(exc), int(attente),
                              reprise.echecs))
                 self.runner.stop.wait(self.wait_timeout(attente))
@@ -1426,7 +1426,7 @@ class AgentWorker(threading.Thread):
                 continue
             bilan = reprise.retablie()
             if bilan:
-                log_async("[%s] %s : base de nouveau joignable après %d échec(s)"
+                log_async("[%s] %s: database reachable again after %d failure(s)"
                           % (self.name, quoi, bilan[0]))
             return resultat
 
@@ -1458,7 +1458,7 @@ class AgentWorker(threading.Thread):
         if self.agent is not None:
             self.agent["session_id"] = session
             self.agent["session_account"] = compte
-        log_async("[%s] session %s enregistrée au registre (différée par une panne)"
+        log_async("[%s] session %s recorded in the registry (delayed by an outage)"
                   % (self.name, session))
 
     def _ecarte_session_fille(self, refusee: str) -> None:
@@ -1475,7 +1475,7 @@ class AgentWorker(threading.Thread):
             if self.agent is not None:
                 self.agent["session_id"] = principale
                 self.agent["session_account"] = None
-            suite = "reprise de la dernière session principale connue (%s)" % principale
+            suite = "resuming the last known main session (%s)" % principale
         else:
             if not registry.clear_session(self.db, self.name, self.runner.runner_id,
                                           self.epoch):
@@ -1488,21 +1488,21 @@ class AgentWorker(threading.Thread):
                 from . import reprise
                 self.resume_summary = reprise.deterministic_brief(
                     self.cfg, self.db, registry.get(self.db, self.name) or self.agent,
-                    session=refusee, reason="session fille %s écartée" % refusee,
-                    consigne="La consigne de ce tour suit ce brief : reprends ton "
-                             "travail à partir de là.")
+                    session=refusee, reason="child session %s discarded" % refusee,
+                    consigne="This turn's instruction follows this brief: resume your "
+                             "work from there.")
                 self.resume_origin = "ameesh"
             except Exception as exc:  # un brief manquant n'empêche pas l'oubli
-                log_async("[%s] brief de reprise déterministe indisponible (%s)"
+                log_async("[%s] deterministic resume brief unavailable (%s)"
                           % (self.name, exc))
             self.agent = registry.get(self.db, self.name) or self.agent
             self.session_turns = 0
             self.session_tokens = 0.0
-            suite = "session neuve ouverte sur le brief de reprise"
-        log_async("[%s] session fille %s écartée : %s" % (self.name, refusee, suite))
+            suite = "new session opened on the resume brief"
+        log_async("[%s] child session %s discarded: %s" % (self.name, refusee, suite))
         self._fil_note(
-            "Session %s refusée par le harnais (session fille : sous-agent ou "
-            "fourche) ; %s. Pas compté comme échec rapide." % (refusee, suite),
+            "Session %s refused by the harness (child session: subagent or "
+            "fork); %s. Not counted as a fast failure." % (refusee, suite),
             meta={"action": "session-fille", "session": refusee,
                   "reprise": principale or ""})
 
@@ -1523,8 +1523,8 @@ class AgentWorker(threading.Thread):
         un arrêt, jamais sous un bail perdu. Pas d'échec rapide."""
         registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
         if not registry.begin_turn(self.db, self.name, self.runner.runner_id, self.epoch,
-                                   "vérification de l'hôte"):
-            log("[%s] hôte non prêt (%s) — bail perdu ou agent arrêté" % (self.name, raison))
+                                   "checking the host"):
+            log("[%s] host not ready (%s) — lease lost or agent stopped" % (self.name, raison))
             return
         self._host_not_ready(raison, force_status=True)
 
@@ -1543,7 +1543,7 @@ class AgentWorker(threading.Thread):
                 self.db, self.name, self.runner.runner_id, self.epoch,
                 self.HOST_STATUS, "%s : %s" % (self.HOST_ERROR, raison), self.HOST_ERROR)
             if issue == "lease":
-                log("[%s] hôte non prêt (%s) — statut non posé : bail perdu ou remplacé"
+                log("[%s] host not ready (%s) — status not set: lease lost or replaced"
                     % (self.name, raison))
                 self.lease_lost.set()
                 return False
@@ -1551,11 +1551,11 @@ class AgentWorker(threading.Thread):
                                                             300.0)))
         if nouveau:
             self._host_delay = self.HOST_BACKOFF_MIN
-            log("[%s] hôte non prêt : %s — erreur de l'hôte, pas de l'agent : tours "
-                "suspendus, nouvel essai dans %ds (attente croissante, %ds au plus), "
-                "reprise automatique%s"
+            log("[%s] host not ready: %s — a host error, not the agent's: turns "
+                "suspended, retrying in %ds (increasing backoff, at most %ds), "
+                "automatic resume%s"
                 % (self.name, raison, self.HOST_BACKOFF_MIN, maximum,
-                   "" if issue == "done" else " (statut concurrent préservé)"))
+                   "" if issue == "done" else " (concurrent status kept)"))
         else:
             self._host_delay = min(maximum, max(self.HOST_BACKOFF_MIN, self._host_delay * 2))
         self._host_blocked = True
@@ -1595,8 +1595,8 @@ class AgentWorker(threading.Thread):
             if row is not None:
                 self.agent = row
             return False
-        log("[%s] hôte prêt : harnais %s — reprise"
-            % (self.name, self.resolution_seen or "trouvé"))
+        log("[%s] host ready: harness %s — resuming"
+            % (self.name, self.resolution_seen or "found"))
         return True
 
     @staticmethod
@@ -1616,8 +1616,8 @@ class AgentWorker(threading.Thread):
                 fin = fin[0] if fin else ""
         except OSError:
             fin = ""
-        return "le harnais n'a pas pu s'exécuter (code %d%s)" % (
-            code, " : %s" % fin.strip()[:200] if fin else "")
+        return "the harness could not run (code %d%s)" % (
+            code, ": %s" % fin.strip()[:200] if fin else "")
 
     def stop_for_power(self, texte: str) -> None:
         """Arrêt propre demandé par la garde d'alimentation (L106) : plus de
@@ -1637,7 +1637,7 @@ class AgentWorker(threading.Thread):
                 self.HOST_STATUS, "%s : %s" % (self.HOST_ERROR, self._power_texte),
                 self.HOST_ERROR)
         except db_mod.DbError as exc:
-            log_async("[%s] statut d'arrêt sur batterie non écrit (%s)"
+            log_async("[%s] battery stop status not written (%s)"
                       % (self.name, db_mod.explain(exc)))
 
     # -- dossier de travail absent (L35) -------------------------------------
@@ -1678,16 +1678,16 @@ class AgentWorker(threading.Thread):
                 self.db, self.name, self.runner.runner_id, self.epoch,
                 self.WORKDIR_STATUS, message, self.WORKDIR_ERROR)
             if issue == "lease":
-                log("[%s] %s — blocage non posé : bail perdu ou remplacé"
+                log("[%s] %s — block not set: lease lost or replaced"
                     % (self.name, message))
                 self.lease_lost.set()
                 return False
         if nouveau:
             self._wd_delay = self.WORKDIR_BACKOFF_MIN
-            log("[%s] %s — tours suspendus ; nouvel essai dans %ds au plus tôt (attente "
-                "croissante, %ds au plus), immédiat si le registre change%s"
+            log("[%s] %s — turns suspended; retrying in %ds at the earliest (increasing "
+                "backoff, at most %ds), immediately if the registry changes%s"
                 % (self.name, message, self.WORKDIR_BACKOFF_MIN, self.WORKDIR_BACKOFF_MAX,
-                   "" if issue == "done" else " (statut concurrent préservé)"))
+                   "" if issue == "done" else " (concurrent status kept)"))
         else:
             self._wd_delay = min(self.WORKDIR_BACKOFF_MAX,
                                  max(self.WORKDIR_BACKOFF_MIN, self._wd_delay * 2))
@@ -1707,8 +1707,8 @@ class AgentWorker(threading.Thread):
             self.WORKDIR_STATUS, self.WORKDIR_ERROR)
         if issue == "lease":
             if not self.lease_lost.is_set():
-                log("[%s] dossier de travail retrouvé (%s) mais bail perdu ou remplacé : "
-                    "pas de reprise ici" % (self.name, cwd))
+                log("[%s] working directory found again (%s) but lease lost or replaced: "
+                    "no resume here" % (self.name, cwd))
             self.lease_lost.set()
             return False
         self._wd_blocked = False
@@ -1725,12 +1725,12 @@ class AgentWorker(threading.Thread):
             row = registry.get(self.db, self.name)
             if row is not None:
                 self.agent = row
-            log("[%s] dossier de travail retrouvé : %s — statut concurrent conservé "
-                "(%s%s), pas de reprise dans ce sondage"
+            log("[%s] working directory found again: %s — concurrent status kept "
+                "(%s%s), no resume in this poll"
                 % (self.name, cwd, (row or {}).get("status") or "?",
-                   " : %s" % row["status_text"] if row and row.get("status_text") else ""))
+                   ": %s" % row["status_text"] if row and row.get("status_text") else ""))
             return False
-        log("[%s] dossier de travail retrouvé : %s — reprise" % (self.name, cwd))
+        log("[%s] working directory found again: %s — resuming" % (self.name, cwd))
         return True
 
     def workdir_ready(self) -> bool:

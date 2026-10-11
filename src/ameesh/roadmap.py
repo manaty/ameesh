@@ -1,41 +1,38 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Feuille de route : dates prévues, engagements datés, Gantt (lot L96).
+"""Roadmap: planned dates, dated commitments, Gantt (lot L96).
 
-  ameesh work plan <tâche|fiche> [--debut J] [--fin J] [--livraison J] [--source S]
-  ameesh plan add "quoi" --pour J [--projet P] [--porteur X] [--lot N] [--fiche F]
+  ameesh work plan <task|package> [--debut D] [--fin D] [--livraison D] [--source S]
+  ameesh plan add "what" --pour D [--projet P] [--porteur X] [--lot N] [--fiche F]
                   [--source-type conversation|decision|thread|task|other] [--source S]
-                  [--depend-de REF …] [--decision]
+                  [--depend-de REF ...] [--decision]
   ameesh plan list [--all] [--json]
-  ameesh plan accept <id> [--pour J] | done <id> | cancel <id> [--note …]
-  ameesh plan propose [--from DOSSIER] [--no-canon] [--no-tasks] [--record] [--json]
+  ameesh plan accept <id> [--pour D] | done <id> | cancel <id> [--note ...]
+  ameesh plan propose [--from DIR] [--no-canon] [--no-tasks] [--record] [--json]
   ameesh plan show [--json] [--project P] [--width N]
 
-Demande du propriétaire (2026-10-10) : « voir sur quel sujet les agents
-avancent, et un Gantt avec la roadmap, les dates de déploiement prévues » ;
-« ameesh doit se servir de ce genre de décision [« on fera ça lundi »] pour
-établir la roadmap ».
+D is a day: YYYY-MM-DD, today, tomorrow, or a weekday (monday or lundi =
+the NEXT one).
 
-* **Dates prévues** : une tâche (`work_items`) et une fiche du plan (epic,
-  jalon) portent un début, une fin et une livraison (ou un déploiement)
-  prévus. Pour une fiche, les dates posées dans ameesh priment sur celles du
-  canon (clés `start`, `end`, `delivery`, ou `date` d'un jalon).
-* **Engagements** : quoi, pour quand, porteur, projet, tâche ou fiche
-  rattachée, et la source (conversation, décision du canon, message du fil,
-  tâche) avec son identifiant. `--decision` : un **jalon de décision**, une
-  question ouverte qui attend un humain (sa date peut manquer).
-* **Propositions** (`plan propose`) : lues dans les décisions du canon (et
-  leurs conséquences : « lots Lxx », « même vague que… », « lundi ») et dans
-  le corps des tâches ouvertes (une date écrite seulement là). Ce sont des
-  PROPOSITIONS : rien n'est créé sans `--record`, et une proposition
-  enregistrée reste `proposed` jusqu'à `plan accept`.
-* **Gantt** (`plan show`, et la section `roadmap` de `ameesh progress`) :
-  epics, tâches, jalons et engagements sur une frise, le prévu face au réel
-  (jalons réels déjà mesurés : demandée, en cours, soumise, verdict,
-  livrée), la ligne du jour, les retards, et la source de chaque élément.
+* **Planned dates**: a task (`work_items`) and a plan package (epic,
+  milestone) carry a planned start, end and delivery (or deployment). For a
+  package, dates set in ameesh take precedence over the canon ones (keys
+  `start`, `end`, `delivery`, or a milestone's `date`).
+* **Commitments**: what, by when, owner, project, attached task or
+  package, and the source (conversation, canon decision, thread message,
+  task) with its identifier. `--decision`: a **decision milestone**, an
+  open question waiting for a human (its date may be missing).
+* **Proposals** (`plan propose`): read from canon decisions (and their
+  consequences: lots Lxx, their dependencies, weekdays) and from open task
+  bodies (a date written only there). They are PROPOSALS: nothing is created
+  without `--record`, and a recorded proposal stays `proposed` until
+  `plan accept`.
+* **Gantt** (`plan show`, and the `roadmap` section of `ameesh progress`):
+  epics, tasks, milestones and commitments on a timeline, planned versus
+  actual (actual milestones already measured: requested, in progress,
+  submitted, verdict, delivered), the today line, delays, and the source of
+  each item.
 
-Ce module appartient au cœur générique : il ne nomme aucun état ni jalon de
-métier ; la traduction du cycle actuel tient dans `roadmap_dev.CORRESPONDANCES`.
-Le JSON suit le schéma `ameesh-roadmap/1` (docs/PROGRESS.md).
+JSON follows the `ameesh-roadmap/1` schema (docs/PROGRESS.md).
 """
 from __future__ import annotations
 
@@ -74,16 +71,18 @@ DATE_KEYS = ("start", "end", "delivery")
 
 #: jalons génériques réels d'une tâche, dans l'ordre de la frise
 REAL_MILESTONES = ("demandee", "debut", "soumise", "verdict", "livree")
-LABELS = {"demandee": "demandée", "debut": "en cours", "soumise": "soumise",
-          "verdict": "verdict", "livree": "livrée", "abandonnee": "abandonnée",
-          "start": "début", "end": "fin", "delivery": "livraison"}
-_FR_STATE = {"en_cours": "en cours", "a_valider": "à valider", "validee": "validée",
-             "bloquee": "bloquée", "livree": "livrée", "abandonnee": "abandonnée",
-             "demandee": "demandée"}
-_FR_SOURCE = {"conversation": "conversation", "decision": "décision", "thread": "fil",
-              "task": "tâche", "other": "autre", "canon": "canon", "ameesh": "ameesh",
-              "mixte": "canon et ameesh"}
+LABELS = {"demandee": "requested", "debut": "in progress", "soumise": "submitted",
+          "verdict": "verdict", "livree": "delivered", "abandonnee": "abandoned",
+          "start": "start", "end": "end", "delivery": "delivery"}
+_FR_STATE = {"en_cours": "in progress", "a_valider": "to review", "validee": "accepted",
+             "bloquee": "blocked", "livree": "delivered", "abandonnee": "abandoned",
+             "demandee": "requested"}
+_FR_SOURCE = {"conversation": "conversation", "decision": "decision", "thread": "thread",
+              "task": "task", "other": "other", "canon": "canon", "ameesh": "ameesh",
+              "mixte": "canon and ameesh"}
+#: weekdays read in decisions and accepted as input (French, then English)
 _WEEKDAYS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+_WEEKDAYS_EN = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 #: une valeur d'option qui EFFACE une date
 CLEAR = ("-", "aucune", "none")
@@ -117,13 +116,15 @@ def parse_day(text, *, now: float | None = None, allow_clear: bool = False) -> s
         return (base + _dt.timedelta(days=1)).isoformat()
     if low in _WEEKDAYS:
         return next_weekday(base, _WEEKDAYS.index(low)).isoformat()
+    if low in _WEEKDAYS_EN:
+        return next_weekday(base, _WEEKDAYS_EN.index(low)).isoformat()
     try:
         if not re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
             raise ValueError(raw)
         return _dt.date.fromisoformat(raw).isoformat()
     except ValueError:
-        raise RoadmapError("date illisible : %r (AAAA-MM-JJ, aujourd'hui, demain, lundi…%s)"
-                           % (raw, ", ou - pour effacer" if allow_clear else ""))
+        raise RoadmapError("unreadable date: %r (YYYY-MM-DD, today, tomorrow, monday…%s)"
+                           % (raw, ", or - to clear" if allow_clear else ""))
 
 
 def next_weekday(base: _dt.date, weekday: int) -> _dt.date:
@@ -171,35 +172,35 @@ def plan(db, target, *, start=_UNSET, end=_UNSET, delivery=_UNSET, source: str |
         if value is not _UNSET:
             dates[key] = parse_day(value, now=now, allow_clear=True)
     if not dates and source is None:
-        raise RoadmapError("rien à planifier : --debut, --fin ou --livraison (ou --source ; "
-                           "--estimate pour la durée d'une tâche)")
+        raise RoadmapError("nothing to plan: --debut, --fin or --livraison (or --source; "
+                           "--estimate for a task's duration)")
     text = str(target).strip().lstrip("#")
     st = storage.of(db)
     if text.isdigit():
         current = (st.roadmap.item_plans([int(text)]) or [None])[0]
         if current is None:
-            raise RoadmapError("tâche %s introuvable" % text)
+            raise RoadmapError("task %s not found" % text)
         _check_order(dict(current, **{"planned_" + k: v for k, v in dates.items()}))
         row = st.roadmap.plan_item(int(text), dates, source=source, actor=actor)
         if row is None:
-            raise RoadmapError("tâche %s introuvable" % text)
+            raise RoadmapError("task %s not found" % text)
         return {"target": int(text), "kind": "task", "plan": row}
     package = st.packages.get(text)
     if package is None:
-        raise RoadmapError("ni tâche ni fiche WorkPackage : %r (une tâche : son numéro ; une "
-                           "fiche : son identifiant, synchronisée par « ameesh canon sync »)"
+        raise RoadmapError("neither a task nor a WorkPackage: %r (a task: its number; a "
+                           "package: its identifier, synced by \"ameesh canon sync\")"
                            % text)
     _check_order(dict(package, **{"planned_" + k: v for k, v in dates.items()}))
     row = st.roadmap.plan_package(text, dates, source=source, actor=actor)
     if row is None:
-        raise RoadmapError("fiche %s introuvable" % text)
+        raise RoadmapError("package %s not found" % text)
     return {"target": text, "kind": "package", "plan": row}
 
 
 def _check_order(row: dict) -> None:
     start, end = _date(row.get("planned_start")), _date(row.get("planned_end"))
     if start and end and start > end:
-        raise RoadmapError("début prévu (%s) après la fin prévue (%s)" % (start, end))
+        raise RoadmapError("planned start (%s) is after the planned end (%s)" % (start, end))
 
 
 # --------------------------------------------------------------------------
@@ -217,26 +218,26 @@ def add_commitment(db, what: str, *, due=None, decision: bool = False, owner: st
     il est tenu quand la tâche est livrée."""
     what = " ".join(str(what or "").split())
     if not what:
-        raise RoadmapError("engagement vide : dites quoi")
+        raise RoadmapError("empty commitment: say what")
     if source_kind not in SOURCE_KINDS:
-        raise RoadmapError("type de source inconnu : %r (%s)" % (source_kind,
+        raise RoadmapError("unknown source type: %r (%s)" % (source_kind,
                                                                  ", ".join(SOURCE_KINDS)))
     day = parse_day(due, now=now) if due not in (None, "") else None
     if day is None and not decision:
-        raise RoadmapError("un engagement a une date : --pour AAAA-MM-JJ (ou lundi, demain…)")
+        raise RoadmapError("a commitment needs a date: --pour YYYY-MM-DD (or monday, tomorrow…)")
     st = storage.of(db)
     item_id = None
     if lot not in (None, ""):
         text = str(lot).strip().lstrip("#")
         item = work_mod.get(db, int(text)) if text.isdigit() else None
         if item is None:
-            raise RoadmapError("tâche %s introuvable" % lot)
+            raise RoadmapError("task %s not found" % lot)
         item_id = int(item["id"])
         project = project or item.get("app") or item.get("workstream") or None
         owner = owner or item.get("assignee") or None
     if package:
         if st.packages.get(package) is None:
-            raise RoadmapError("fiche WorkPackage inconnue : %r" % package)
+            raise RoadmapError("unknown WorkPackage: %r" % package)
     return st.roadmap.add_commitment({
         "what": what, "due_on": day, "kind": "decision" if decision else "commitment",
         "status": "open", "owner": owner or None, "project": project or None,
@@ -248,7 +249,7 @@ def add_commitment(db, what: str, *, due=None, decision: bool = False, owner: st
 def _commitment(db, ident) -> dict:
     rows = storage.of(db).roadmap.commitments(ids=[int(ident)])
     if not rows:
-        raise RoadmapError("engagement %s introuvable" % ident)
+        raise RoadmapError("commitment %s not found" % ident)
     return rows[0]
 
 
@@ -257,35 +258,35 @@ def accept(db, ident, *, due=None, actor: str = "", now: float | None = None) ->
     (proposition tirée d'une décision sans échéance), `--pour` la fixe."""
     row = _commitment(db, ident)
     if row["status"] != "proposed":
-        raise RoadmapError("engagement %s : %s, pas une proposition" % (ident, row["status"]))
+        raise RoadmapError("commitment %s: %s, not a proposal" % (ident, row["status"]))
     values: dict = {"status": "open"}
     if due not in (None, ""):
         values["due_on"] = parse_day(due, now=now)
     if not values.get("due_on") and not row.get("due_on") and row["kind"] != "decision":
-        raise RoadmapError("proposition %s sans date : --pour AAAA-MM-JJ" % ident)
+        raise RoadmapError("proposal %s is undated: --pour YYYY-MM-DD" % ident)
     if actor:
-        values["note"] = (row.get("note") + " ; " if row.get("note") else "") + \
-            "validée par %s" % actor
+        values["note"] = (row.get("note") + "; " if row.get("note") else "") + \
+            "accepted by %s" % actor
     out = storage.of(db).roadmap.set_commitment(int(ident), current=("proposed",),
                                                 values=values)
     if out is None:
-        raise RoadmapError("engagement %s modifié entre-temps : réessayez" % ident)
+        raise RoadmapError("commitment %s changed meanwhile: retry" % ident)
     return out
 
 
 def settle(db, ident, status: str, *, note: str = "", actor: str = "") -> dict:
     """`done` (tenu) ou `cancelled` (abandonné, ou proposition rejetée)."""
     if status not in ("done", "cancelled"):
-        raise RoadmapError("statut %r refusé" % status)
+        raise RoadmapError("status %r refused" % status)
     row = _commitment(db, ident)
     if row["status"] not in LIVE_STATUSES:
-        raise RoadmapError("engagement %s déjà %s" % (ident, row["status"]))
-    text = " ; ".join(t for t in (row.get("note"), note.strip() if note else "",
-                                  "par %s" % actor if actor else "") if t)
+        raise RoadmapError("commitment %s already %s" % (ident, row["status"]))
+    text = "; ".join(t for t in (row.get("note"), note.strip() if note else "",
+                                 "by %s" % actor if actor else "") if t)
     out = storage.of(db).roadmap.set_commitment(
         int(ident), current=LIVE_STATUSES, values={"status": status, "note": text})
     if out is None:
-        raise RoadmapError("engagement %s modifié entre-temps : réessayez" % ident)
+        raise RoadmapError("commitment %s changed meanwhile: retry" % ident)
     return out
 
 
@@ -358,7 +359,7 @@ def build_task(item: dict, real: dict, *, base: _dt.date, epic: str | None,
                 "days": (base - _date(planned["start"])).days, "open": True}
     for c in commitments:
         if late is None and c.get("late"):
-            late = dict(c["late"], what="engagement #%d" % c["id"])
+            late = dict(c["late"], what="commitment #%d" % c["id"])
     generic = "abandonnee" if abandoned else ("livree" if delivered else
                                                dev.etat_generique(shown_state))
     source = _source_view("plan", item.get("planned_source"),
@@ -386,7 +387,7 @@ def _commitment_view(row: dict, base: _dt.date, items: dict) -> dict:
     late = None
     if row["status"] == "open" and row["kind"] == "commitment" and not fulfilled \
             and due and base > due:
-        late = {"what": "engagement", "due": due.isoformat(), "days": (base - due).days,
+        late = {"what": "commitment", "due": due.isoformat(), "days": (base - due).days,
                 "open": True}
     return {
         "kind": row["kind"], "id": row["id"], "what": row["what"], "due": row.get("due_on"),
@@ -600,7 +601,7 @@ def overdue(db, *, now: float | None = None) -> list[dict]:
         due = _date(item.get(key)) if key else None
         if not due or base <= due:
             continue
-        out.append({"reason": "date_prevue", "what": "%s de la tâche #%d « %s »" % (
+        out.append({"reason": "date_prevue", "what": "%s of task #%d \"%s\"" % (
             LABELS["delivery" if key == "planned_delivery" else "end"], int(item["id"]),
             item.get("title") or ""), "due": due.isoformat(), "days": (base - due).days,
             "commitment": None, "lot": int(item["id"]), "package": item.get("package_id"),
@@ -614,7 +615,7 @@ def overdue(db, *, now: float | None = None) -> list[dict]:
         due = _date(dates["delivery"] or dates["end"])
         if not due or base <= due or not (entry.get("lots_open") or entry.get("lots_pending")):
             continue
-        out.append({"reason": "date_prevue", "what": "%s de %s « %s »" % (
+        out.append({"reason": "date_prevue", "what": "%s of %s \"%s\"" % (
             LABELS["delivery"] if dates["delivery"] else LABELS["end"], entry["id"],
             entry.get("title") or ""), "due": due.isoformat(), "days": (base - due).days,
             "commitment": None, "lot": None, "package": entry["id"],
@@ -631,8 +632,8 @@ def overdue(db, *, now: float | None = None) -> list[dict]:
 #: caractères de la frise (légende de `format_gantt`)
 GLYPHS = {"planned": "░", "real": "█", "late": "▓", "delivery": "◆", "delivered": "●",
           "due": "◇", "decision": "?", "today": "│"}
-LEGEND = ("░ prévu · █ réel (en cours → livrée) · ▓ réel après la date prévue · "
-          "◆ livraison prévue · ● livrée · ◇ échéance · ? décision attendue · │ aujourd'hui")
+LEGEND = ("░ planned · █ actual (in progress → delivered) · ▓ actual past the planned date · "
+          "◆ planned delivery · ● delivered · ◇ due date · ? decision awaited · │ today")
 
 
 def _short(text, limit: int) -> str:
@@ -712,9 +713,9 @@ def _package_bar(bar: _Bar, p: dict, base: _dt.date) -> None:
 def _flag(e: dict) -> str:
     late = e.get("late")
     if late and late.get("open"):
-        return "RETARD %d j (%s %s)" % (late["days"], late["what"], _dm(late["due"]))
+        return "LATE %d d (%s %s)" % (late["days"], late["what"], _dm(late["due"]))
     if late:
-        return "livrée avec %d j de retard" % late["days"]
+        return "delivered %d d late" % late["days"]
     return ""
 
 
@@ -737,8 +738,8 @@ def format_gantt(view: dict, width: int | None = None, *, who: dict | None = Non
         out.extend(textwrap.wrap(text, width, initial_indent=indent,
                                  subsequent_indent=indent + "  ") or [indent])
 
-    wrap("FEUILLE DE ROUTE%s — aujourd'hui %s · 1 colonne = %d jour%s" % (
-        " de %s" % view["project"] if view.get("project") else "", _dm(base), step,
+    wrap("ROADMAP%s — today %s · 1 column = %d day%s" % (
+        " of %s" % view["project"] if view.get("project") else "", _dm(base), step,
         "s" if step > 1 else ""))
     wrap(LEGEND)
     if who is not None:
@@ -768,10 +769,10 @@ def format_gantt(view: dict, width: int | None = None, *, who: dict | None = Non
 
     def planned_text(p: dict) -> str:
         parts = ["%s %s" % (LABELS[k], _dm(p.get(k))) for k in DATE_KEYS if p.get(k)]
-        return ("prévu : " + ", ".join(parts)) if parts else "sans date prévue"
+        return ("planned: " + ", ".join(parts)) if parts else "no planned date"
 
     sections = (
-        ("JALONS", view["milestones"]),
+        ("MILESTONES", view["milestones"]),
         ("EPICS", view["epics"]),
     )
     for title, rows in sections:
@@ -785,13 +786,13 @@ def format_gantt(view: dict, width: int | None = None, *, who: dict | None = Non
             src = p.get("source") or {}
             row("%s %s" % (p["id"], p["title"]), bar, [
                 planned_text(p["planned"]),
-                "%d/%d livrée(s)" % (p["units_delivered"], p["units_total"])
+                "%d/%d delivered" % (p["units_delivered"], p["units_total"])
                 if p["units_total"] else "",
-                _flag(p), "source : %s" % src["label"] if src.get("label") else ""])
+                _flag(p), "source: %s" % src["label"] if src.get("label") else ""])
     out.append("")
-    out.append("TÂCHES (%d)" % len(view["tasks"]))
+    out.append("TASKS (%d)" % len(view["tasks"]))
     if not view["tasks"]:
-        out.append("  aucune tâche ouverte ni datée")
+        out.append("  no open or dated task")
     for t in view["tasks"]:
         bar = _Bar(lo, cols, step)
         _task_bar(bar, t, base)
@@ -803,52 +804,52 @@ def format_gantt(view: dict, width: int | None = None, *, who: dict | None = Non
             _FR_STATE.get(t["state"], t["state"]),
             t["assignee"] or "",
             planned_text(t["planned"]),
-            ("réel : " + ", ".join(reached)) if reached else "",
+            ("actual: " + ", ".join(reached)) if reached else "",
             (t.get("estimate") or {}).get("label") if (t.get("estimate") or {}).get("minutes")
             else "",
             _flag(t),
-            "source : %s" % src["label"] if src.get("label") else "",
-            "engagement(s) %s" % ", ".join("e%d" % i for i in t["commitments"])
+            "source: %s" % src["label"] if src.get("label") else "",
+            "commitment(s) %s" % ", ".join("e%d" % i for i in t["commitments"])
             if t["commitments"] else ""])
     if view["commitments"]:
         out.append("")
-        out.append("ENGAGEMENTS (%d)" % len(view["commitments"]))
+        out.append("COMMITMENTS (%d)" % len(view["commitments"]))
         for c in view["commitments"]:
             bar = _Bar(lo, cols, step)
             bar.mark(_date(c["due"]), GLYPHS["delivered"] if c["fulfilled"] else GLYPHS["due"])
             src = c.get("source") or {}
-            status = {"proposed": "PROPOSÉ (à valider)", "open": "ouvert",
-                      "done": "tenu", "cancelled": "annulé"}[c["status"]]
+            status = {"proposed": "PROPOSED (to review)", "open": "open",
+                      "done": "kept", "cancelled": "cancelled"}[c["status"]]
             if c["fulfilled"] and c["status"] == "open":
-                status = "tenu (tâche livrée)"
+                status = "kept (task delivered)"
             row("e%d %s" % (c["id"], c["what"]), bar, [
-                "pour %s" % _dm(c["due"]) if c["due"] else "sans date", status,
-                c.get("owner") or "", "projet %s" % c["project"] if c.get("project") else "",
-                "tâche #%d" % c["lot"] if c.get("lot") else "",
-                "dépend de %s" % ", ".join(c["depends_on"]) if c["depends_on"] else "",
-                _flag(c), "source : %s" % src["label"] if src.get("label") else ""])
+                "due %s" % _dm(c["due"]) if c["due"] else "undated", status,
+                c.get("owner") or "", "project %s" % c["project"] if c.get("project") else "",
+                "task #%d" % c["lot"] if c.get("lot") else "",
+                "depends on %s" % ", ".join(c["depends_on"]) if c["depends_on"] else "",
+                _flag(c), "source: %s" % src["label"] if src.get("label") else ""])
     if view["decisions"]:
         out.append("")
-        out.append("DÉCISIONS ATTENDUES (%d)" % len(view["decisions"]))
+        out.append("AWAITED DECISIONS (%d)" % len(view["decisions"]))
         for d in view["decisions"]:
             bar = _Bar(lo, cols, step)
             bar.mark(_date(d.get("due")) or base, GLYPHS["decision"])
             src = d.get("source") or {}
             label = ("e%d " % d["id"]) if d.get("id") else ("#%d " % d["lot"])
             row(label + d["what"], bar, [
-                "pour %s" % _dm(d["due"]) if d.get("due") else "sans date",
-                "PROPOSÉ (à valider)" if d.get("status") == "proposed" else "",
+                "due %s" % _dm(d["due"]) if d.get("due") else "undated",
+                "PROPOSED (to review)" if d.get("status") == "proposed" else "",
                 d.get("owner") or "",
-                "source : %s" % src["label"] if src.get("label") else ""])
+                "source: %s" % src["label"] if src.get("label") else ""])
     cut = (view.get("truncated") or {}).get("tasks")
     if cut:
         out.append("")
-        wrap("TRONQUÉ : %d tâches lues sur %d (borne %d)" % (cut["shown"], cut["total"],
-                                                             cut["limit"]))
+        wrap("TRUNCATED: %d of %d tasks read (limit %d)" % (cut["shown"], cut["total"],
+                                                            cut["limit"]))
     if view["late"]:
         out.append("")
-        wrap("EN RETARD (%d) : %s" % (len(view["late"]), " ; ".join(
-            "%s %s (%d j)" % ({"task": "#%s" % l["id"], "commitment": "e%s" % l["id"]}
+        wrap("LATE (%d): %s" % (len(view["late"]), "; ".join(
+            "%s %s (%d d)" % ({"task": "#%s" % l["id"], "commitment": "e%s" % l["id"]}
                              .get(l["kind"], str(l["id"])), _short(l["title"], 40), l["days"])
             for l in view["late"])))
     return "\n".join(out)
@@ -867,24 +868,24 @@ def who(db, *, now: float | None = None, project: str | None = None) -> dict:
 
 def format_who(view: dict, width: int) -> list[str]:
     now = view["generated_ts"]
-    out = ["QUI AVANCE SUR QUOI"]
+    out = ["WHO IS WORKING ON WHAT"]
     agents = [a for p in view["projects"] for a in p["agents"] if a["active"]]
     if not agents:
-        out.append("  aucun agent actif")
+        out.append("  no active agent")
     for a in agents:
         doing = ("#%s %s" % (a["lot"]["id"], a["lot"]["title"])) if a.get("lot") else (
             a.get("task") or "—")
         since = a.get("on_task_since_ts") or a.get("since_ts")
         head = "%s [%s] %s — %s%s" % (
-            a["name"], a["project"] or "sans projet", {"working": "au travail",
-                                                       "paused": "en pause",
-                                                       "idle": "au repos"}.get(a["state"],
-                                                                               a["state"]),
-            doing, " (depuis %s)" % work_mod.span(now - since) if since else "")
+            a["name"], a["project"] or "no project", {"working": "working",
+                                                      "paused": "paused",
+                                                      "idle": "idle"}.get(a["state"],
+                                                                          a["state"]),
+            doing, " (for %s)" % work_mod.span(now - since) if since else "")
         out.extend(textwrap.wrap(head, width, initial_indent="  ", subsequent_indent="    "))
         last = a.get("last_update")
         if last:
-            out.extend(textwrap.wrap("dernière avancée (il y a %s) : %s" % (
+            out.extend(textwrap.wrap("last progress (%s ago): %s" % (
                 work_mod.span(now - last["ts"]), last["text"]), width,
                 initial_indent="    ", subsequent_indent="      "))
     return out
@@ -900,66 +901,67 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="plan_command", required=True)
 
-    p_add = sub.add_parser("add", help="enregistrer un engagement daté (ou --decision)")
-    p_add.add_argument("what", help="quoi (une phrase)")
-    p_add.add_argument("--pour", dest="due", default=None,
-                       help="pour quand : AAAA-MM-JJ, aujourd'hui, demain, lundi…")
+    p_add = sub.add_parser("add", help="record a dated commitment (or --decision)")
+    p_add.add_argument("what", help="what (one sentence)")
+    p_add.add_argument("--pour", dest="due", default=None, metavar="DAY",
+                       help="by when: YYYY-MM-DD, today, tomorrow, monday…")
     p_add.add_argument("--projet", "--project", dest="project", default=None)
     p_add.add_argument("--porteur", "--owner", dest="owner", default=None,
-                       help="qui le porte (agent ou human:<id>)")
+                       help="who owns it (agent or human:<id>)")
     p_add.add_argument("--lot", "--tache", dest="lot", default=None,
-                       help="tâche existante à laquelle il se rattache")
-    p_add.add_argument("--fiche", dest="package", default=None, help="fiche WorkPackage")
+                       help="existing task it is attached to")
+    p_add.add_argument("--fiche", dest="package", default=None, help="WorkPackage")
     p_add.add_argument("--source-type", dest="source_kind", default="conversation",
                        choices=SOURCE_KINDS)
     p_add.add_argument("--source", dest="source_ref", default=None,
-                       help="identifiant ou lien de la source (conversation, décision, message)")
+                       help="source identifier or link (conversation, decision, message)")
     p_add.add_argument("--depend-de", dest="depends_on", action="append", default=[],
-                       help="dépendance (tâche #N, engagement eN, lot Lxx) ; répétable")
+                       help="dependency (task #N, commitment eN, lot Lxx); repeatable")
     p_add.add_argument("--decision", action="store_true",
-                       help="jalon de décision : une question ouverte qui attend un humain")
+                       help="decision milestone: an open question waiting for a human")
     p_add.add_argument("--note", default="")
     p_add.add_argument("--actor", default="")
     p_add.add_argument("--json", action="store_true")
 
-    p_list = sub.add_parser("list", help="engagements ouverts et propositions")
-    p_list.add_argument("--all", action="store_true", help="aussi les tenus et annulés")
+    p_list = sub.add_parser("list", help="open commitments and proposals")
+    p_list.add_argument("--all", action="store_true", help="also kept and cancelled ones")
     p_list.add_argument("--json", action="store_true")
 
-    p_acc = sub.add_parser("accept", help="valider une proposition")
+    p_acc = sub.add_parser("accept", help="accept a proposal")
     p_acc.add_argument("id", type=int)
-    p_acc.add_argument("--pour", dest="due", default=None)
+    p_acc.add_argument("--pour", dest="due", default=None, metavar="DAY")
     p_acc.add_argument("--actor", default="")
-    for name, help_ in (("done", "engagement tenu"),
-                        ("cancel", "engagement abandonné, ou proposition rejetée")):
+    for name, help_ in (("done", "commitment kept"),
+                        ("cancel", "commitment dropped, or proposal rejected")):
         p = sub.add_parser(name, help=help_)
         p.add_argument("id", type=int)
         p.add_argument("--note", default="")
         p.add_argument("--actor", default="")
 
-    p_prop = sub.add_parser("propose", help="propositions tirées des décisions et des tâches")
+    p_prop = sub.add_parser("propose", help="proposals drawn from decisions and tasks")
     p_prop.add_argument("--from", dest="from_dir", action="append", default=[],
-                        help="dossier de fiches Decision (Markdown) à lire en plus du canon")
-    p_prop.add_argument("--no-canon", action="store_true", help="ne pas lire le canon")
+                        metavar="DIR",
+                        help="folder of Decision notes (Markdown) to read besides the canon")
+    p_prop.add_argument("--no-canon", action="store_true", help="do not read the canon")
     p_prop.add_argument("--no-tasks", action="store_true",
-                        help="ne pas lire le corps des tâches ouvertes")
+                        help="do not read open task bodies")
     p_prop.add_argument("--record", action="store_true",
-                        help="enregistrer les propositions (statut proposed, à valider)")
+                        help="record the proposals (status proposed, to review)")
     p_prop.add_argument("--json", action="store_true")
 
-    p_show = sub.add_parser("show", help="la feuille de route en Gantt texte")
+    p_show = sub.add_parser("show", help="the roadmap as a text Gantt")
     p_show.add_argument("--project", default=None)
     p_show.add_argument("--width", type=int, default=None)
-    p_show.add_argument("--json", action="store_true", help="schéma ameesh-roadmap/1")
+    p_show.add_argument("--json", action="store_true", help="ameesh-roadmap/1 schema")
     return parser
 
 
 def _print_commitment(c: dict) -> None:
     print("e%-4d %-10s %-9s %-10s %s%s%s" % (
-        c["id"], c.get("due_on") or "sans date", c["status"],
-        "décision" if c["kind"] == "decision" else "engagement", c["what"],
-        " [tâche #%d]" % c["work_item_id"] if c.get("work_item_id") else "",
-        " (source : %s %s)" % (_FR_SOURCE.get(c["source_kind"], c["source_kind"]),
+        c["id"], c.get("due_on") or "undated", c["status"],
+        "decision" if c["kind"] == "decision" else "commitment", c["what"],
+        " [task #%d]" % c["work_item_id"] if c.get("work_item_id") else "",
+        " (source: %s %s)" % (_FR_SOURCE.get(c["source_kind"], c["source_kind"]),
                                c["source_ref"]) if c.get("source_ref") else ""))
 
 
@@ -974,8 +976,8 @@ def run(db, args, *, cfg=None, now: float | None = None) -> int:
         if args.json:
             print(json.dumps(row, ensure_ascii=False, indent=2))
         else:
-            print("engagement e%d enregistré : %s%s" % (
-                row["id"], row["what"], " pour le %s" % row["due_on"] if row["due_on"] else ""))
+            print("commitment e%d recorded: %s%s" % (
+                row["id"], row["what"], " due %s" % row["due_on"] if row["due_on"] else ""))
         return 0
     if command == "list":
         rows = storage.of(db).roadmap.commitments(statuses=None if args.all else LIVE_STATUSES)
@@ -983,20 +985,20 @@ def run(db, args, *, cfg=None, now: float | None = None) -> int:
             print(json.dumps(rows, ensure_ascii=False, indent=2))
             return 0
         if not rows:
-            print("aucun engagement")
+            print("no commitment")
         for row in rows:
             _print_commitment(row)
         return 0
     if command == "accept":
         row = accept(db, args.id, due=args.due, actor=args.actor, now=now)
-        print("proposition e%d validée : %s%s" % (row["id"], row["what"], " pour le %s"
-                                                  % row["due_on"] if row["due_on"] else ""))
+        print("proposal e%d accepted: %s%s" % (row["id"], row["what"], " due %s"
+                                               % row["due_on"] if row["due_on"] else ""))
         return 0
     if command in ("done", "cancel"):
         row = settle(db, args.id, "done" if command == "done" else "cancelled",
                      note=args.note, actor=args.actor)
-        print("engagement e%d %s" % (row["id"], "tenu" if row["status"] == "done"
-                                     else "annulé"))
+        print("commitment e%d %s" % (row["id"], "kept" if row["status"] == "done"
+                                     else "cancelled"))
         return 0
     if command == "propose":
         from . import roadmap_propose
@@ -1009,7 +1011,7 @@ def run(db, args, *, cfg=None, now: float | None = None) -> int:
             return 0
         print(format_gantt(view, args.width, who=who(db, now=now, project=args.project)))
         return 0
-    print("erreur : sous-commande inconnue : %s" % command, file=sys.stderr)
+    print("error: unknown subcommand: %s" % command, file=sys.stderr)
     return 2
 
 
@@ -1024,16 +1026,16 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             db.close()
     except work_mod.WorkError as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.SchemaMissing as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.Unavailable as exc:
-        print("erreur : base injoignable : %s" % exc, file=sys.stderr)
+        print("error: database unreachable: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.DbError as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
 
 

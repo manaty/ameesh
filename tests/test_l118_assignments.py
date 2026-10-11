@@ -53,7 +53,7 @@ class MailLinksLotsTest(_Base):
         proc = self.send("dev1", "Prends la relecture du module de facturation.", "--from",
                          "orch")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("dev1 n'a aucun lot ouvert", proc.stderr)
+        self.assertIn("dev1 has no open lot", proc.stderr)
         self.assertEqual(len(self.unread("dev1")), 1)      # le message part quand même
         # un autre expéditeur n'est pas averti ; un destinataire avec un lot non plus
         proc = self.send("dev1", "Une question sur ta revue.", "--from", "dev2")
@@ -68,7 +68,7 @@ class MailLinksLotsTest(_Base):
                          "orch", "--lot", "RT-9")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("aucun lot ouvert", proc.stderr)
-        self.assertIn("lot #%d assigné à dev1" % lot["id"], proc.stdout)
+        self.assertIn("lot #%d assigned to dev1" % lot["id"], proc.stdout)
         item = work.get(self.db, lot["id"])
         self.assertEqual((item["assignee"], item["branch"]), ("dev1", "agent/dev1-rt-9"))
         self.assertEqual(self.unread("dev1")[0]["work_item_id"], str(lot["id"]))
@@ -82,7 +82,7 @@ class MailLinksLotsTest(_Base):
         proc = self.send("dev2", "Relis le lot de dev1.", "--from", "orch", "--lot",
                          str(lot["id"]))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("appartient à dev1 : non réassigné", proc.stderr)
+        self.assertIn("belongs to dev1: not reassigned", proc.stderr)
         self.assertEqual(work.get(self.db, lot["id"])["assignee"], "dev1")
 
     def test_new_lot_cree_et_assigne(self):
@@ -93,13 +93,13 @@ class MailLinksLotsTest(_Base):
         self.assertEqual([(r["title"], r["branch"]) for r in rows],
                          [("CI plus rapide", "agent/dev2-ci")])
         self.assertEqual(self.unread("dev2")[0]["work_item_id"], str(rows[0]["id"]))
-        self.assertIn("créé et assigné à dev2", proc.stdout)
+        self.assertIn("created and assigned to dev2", proc.stdout)
 
     def test_garde_d_attribution_rien_n_est_depose(self):
         proc = self.send("inconnu", "Travail pour toi.", "--from", "orch", "--new-lot", "x",
                          "--estimate", "1h")
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("message non déposé", proc.stderr)
+        self.assertIn("message not dropped", proc.stderr)
         self.assertEqual(self.unread("inconnu"), [])
         self.assertEqual(work.list_items(self.db), [])
 
@@ -113,7 +113,7 @@ class MailLinksLotsTest(_Base):
         proc = self.send("dev1", "Sur le sujet libre.", "--from", "orch", "--lot",
                          "SUJET-LIBRE")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("ne désigne aucun lot ouvert", proc.stderr)
+        self.assertIn("matches no open lot", proc.stderr)
         self.assertEqual(self.unread("dev1")[-1]["work_item_id"], "SUJET-LIBRE")
 
     def test_reference_ambigue_refusee(self):
@@ -172,7 +172,7 @@ class BranchMergeTest(_Base):
         item = work.get(self.db, lot["id"])
         self.assertEqual(item["state"], "merged")
         notes = [e["note"] for e in work.events(self.db, lot["id"])]
-        self.assertTrue(any("branche agent/dev1-a" in n for n in notes), notes)
+        self.assertTrue(any("branch agent/dev1-a" in n for n in notes), notes)
         self.assertEqual(self.sync()["results"], [])          # lot livré : plus examiné
 
     def test_branche_sans_travail_n_est_pas_une_fusion(self):
@@ -276,7 +276,7 @@ class IdleCapacityToOrchestratorTest(_Base):
         self.assertEqual(list(briefs), ["orch"])
         self.assertIn("dev1, dev2", briefs["orch"])
         self.assertNotIn("orch,", briefs["orch"])
-        self.assertIn("#%d « à prendre »" % lot["id"], briefs["orch"])
+        self.assertIn("#%d \"à prendre\"" % lot["id"], briefs["orch"])
 
         args = exploitation.build_parser().parse_args(["alerts"])
         seuils = exploitation.thresholds(args)

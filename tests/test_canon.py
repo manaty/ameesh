@@ -1273,8 +1273,8 @@ class CanonCliTest(_CanonDbCase):
         env = self.cli_env()
         proc = self.mesh("review-class", "db/x.sql", "docs/a.md", env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("sensible", proc.stdout)
-        self.assertIn("léger", proc.stdout)
+        self.assertIn("sensitive", proc.stdout)
+        self.assertIn("light", proc.stdout)
         proc = self.mesh("review-class", "--json", "docs/a.md", env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         data = json.loads(proc.stdout)
@@ -1299,7 +1299,7 @@ class CanonCliTest(_CanonDbCase):
         write(self.tmp, "docs/a.md", "note\n")         # non suivi
         proc = self.mesh("review-class", "--diff", "HEAD", env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("sensible", proc.stdout)
+        self.assertIn("sensitive", proc.stdout)
         self.assertIn("docs/a.md", proc.stdout)
         # une déclaration invalide refuse de classer
         write(self.root, "federation.yaml",
@@ -1323,7 +1323,7 @@ class CanonCliTest(_CanonDbCase):
         write(self.tmp, "db/line\nbreak/new.sql", "select 1;\n")   # non suivi
         proc = self.mesh("review-class", "--diff", "HEAD", env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("sensible", proc.stdout)
+        self.assertIn("sensitive", proc.stdout)
         self.assertIn("new.sql", proc.stdout)
 
     def test_review_class_diff_reference_inconnue(self):

@@ -1,41 +1,41 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Vue par projet : quels projets sont en cours, quel agent travaille sur quoi (L62).
+"""Per-project view: which projects are active, which agent works on what (L62).
 
   ameesh projects [--json] [--project P] [--all]
 
-Pour chaque projet (l'équipe `team` de l'agent, à défaut son `chantier`) :
+For each project (the agent's `team`, otherwise its `chantier`):
 
-* ses agents, avec leur état (au travail, en pause, au repos, arrêté) et la
-  raison d'une pause ou d'un arrêt, le lot en cours (le dernier lot ouvert
-  cité par l'agent dans son courrier, à défaut le lot de sa session, à
-  défaut le lot ouvert assigné le plus récent ; jamais un lot fusionné ou
-  fermé), les non-lus, la dépense des 24 dernières heures et le mode de
-  paiement (forfait ou au token) ;
-* ses lots ouverts SANS agent pour les faire avancer (non assignés, assignés
-  à un agent arrêté ou inconnu du registre) ;
-* un signalement quand le projet a du travail ouvert mais aucun agent actif ;
-* son courrier en souffrance : les messages en attente chez un agent arrêté
-  du projet, ou adressés par un agent du projet à un nom absent du registre
-  (`ameesh mail forward <ancien> <nouveau>` les re-livre).
+* its agents, with their state (working, paused, idle, stopped) and the
+  reason for a pause or a stop, the current lot (the last open lot the
+  agent cited in its mail, otherwise its session's lot, otherwise the most
+  recent open lot assigned to it; never a merged or closed lot), unread
+  messages, spend over the last 24 hours and the payment mode (plan or
+  per token);
+* its open lots WITHOUT an agent to move them forward (unassigned, or
+  assigned to a stopped agent or one unknown to the registry);
+* a warning when the project has open work but no active agent;
+* its undeliverable mail: messages waiting for a stopped agent of the
+  project, or sent by an agent of the project to a name missing from the
+  registry (`ameesh mail forward <old> <new>` redelivers them).
 
-Le projet d'un lot est son `app`, à défaut son `workstream`, l'équipe de sa
-fiche du plan, ou le projet de son assigné. Un projet sans agent actif ni
-lot ouvert n'est montré qu'avec `--all` (le JSON le porte toujours, avec
+A lot's project is its `app`, otherwise its `workstream`, the team of its
+plan card, or its assignee's project. A project with no active agent and no
+open lot is shown only with `--all` (the JSON always includes it, with
 `active: false`).
 
-Le mode de paiement vient du `credential_mode` du canon (`subscription` =
-forfait, `api-key` = au token) ; à défaut, des descripteurs de harnais
-(`paid_per_token`). La dépense 24 h est celle du grand livre `turn_costs` :
-réelle au token, ESTIMÉE pour un forfait.
+The payment mode comes from the canon's `credential_mode` (`subscription` =
+plan, `api-key` = per token); otherwise from the harness descriptors
+(`paid_per_token`). The 24 h spend comes from the `turn_costs` ledger:
+actual for tokens, ESTIMATED for a plan.
 
-En tête (L124) : les demandes de décision qui attendent l'humain qui lit
-(« 3 décisions t'attendent, la plus ancienne depuis 2h05 ») ; pour un agent,
-celles qui attendent un humain. Le chat du propriétaire (L123) n'est pas un
-agent de projet : il n'apparaît pas dans les groupes.
+Header (L124): the decision requests waiting for the human reading
+("3 decisions are waiting for you, the oldest for 2h05"); for an agent,
+those waiting for a human. The owner's chat (L123) is not a project agent:
+it does not appear in the groups.
 
-Une seule lecture de base (`storage.of(db).projects.board`, une requête).
-Le JSON suit le schéma `ameesh-projects/1` (docs/EXPLOITATION.md) ; la même
-vue est en tête de `ameesh progress` (clé `projects`).
+A single database read (`storage.of(db).projects.board`, one query).
+The JSON follows the `ameesh-projects/1` schema (docs/EXPLOITATION.md); the
+same view heads `ameesh progress` (key `projects`).
 """
 from __future__ import annotations
 
@@ -59,20 +59,20 @@ TITLE_CHARS = 48
 #: longueur de la dernière avancée affichée (une ligne, L96)
 LAST_UPDATE_CHARS = 120
 #: libellé du projet d'un agent ou d'un lot qui n'en déclare aucun
-NO_PROJECT = "(sans projet)"
+NO_PROJECT = "(no project)"
 
 #: états d'agent (mêmes valeurs que `ameesh progress`)
-_FR_STATE = {"working": "au travail", "paused": "en pause", "idle": "au repos",
-             "stopped": "arrêté"}
+_FR_STATE = {"working": "working", "paused": "paused", "idle": "idle",
+             "stopped": "stopped"}
 _STATE_ORDER = {"working": 0, "paused": 1, "idle": 2, "stopped": 3}
 #: modes de paiement
-_FR_PAYMENT = {"plan": "forfait", "token": "token", None: "?"}
+_FR_PAYMENT = {"plan": "plan", "token": "token", None: "?"}
 #: pourquoi un lot ouvert n'a pas d'agent
-_FR_WHY = {"unassigned": "non assigné", "stopped": "assigné à %s, arrêté",
-           "unknown": "assigné à %s, inconnu du registre",
-           "external": "assigné à %s, session externe"}
+_FR_WHY = {"unassigned": "unassigned", "stopped": "assigned to %s, stopped",
+           "unknown": "assigned to %s, unknown to the registry",
+           "external": "assigned to %s, external session"}
 #: pourquoi un message est en souffrance : destinataire arrêté, ou inconnu
-_FR_DEAD = {"stopped": "arrêté", "unknown": "inconnu"}
+_FR_DEAD = {"stopped": "stopped", "unknown": "unknown"}
 
 
 def _text(value) -> str:
@@ -277,14 +277,14 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
         active_agents = sum(1 for a in g["agents"] if a["active"])
         warnings = []
         if g["lots_open"] and not active_agents:
-            warnings.append("aucun agent actif pour %d lot(s) ouvert(s)" % g["lots_open"])
+            warnings.append("no active agent for %d open lot(s)" % g["lots_open"])
         elif g["agents"] and not active_agents:
-            warnings.append("aucun agent actif")
+            warnings.append("no active agent")
         if g["lots_without_agent"]:
-            warnings.append("%d lot(s) ouvert(s) sans agent" % len(g["lots_without_agent"]))
+            warnings.append("%d open lot(s) without an agent" % len(g["lots_without_agent"]))
         if letters:
-            warnings.append("%d message(s) en souffrance : %s — à re-livrer : ameesh mail "
-                            "forward <ancien> <nouveau>" % (undeliverable, ", ".join(
+            warnings.append("%d undeliverable message(s): %s — to redeliver: ameesh mail "
+                            "forward <old> <new>" % (undeliverable, ", ".join(
                                 "%s (%s) %d" % (e["recipient"], _FR_DEAD[e["why"]], e["count"])
                                 for e in letters)))
         g.update({
@@ -364,7 +364,7 @@ def _span(seconds) -> str:
         return "%dm" % (seconds // 60)
     if seconds < 86400:
         return "%dh%02d" % (seconds // 3600, (seconds % 3600) // 60)
-    return "%dj" % (seconds // 86400)
+    return "%dd" % (seconds // 86400)
 
 
 def project_label(name: str | None) -> str:
@@ -388,11 +388,11 @@ def _headline(p: dict) -> str:
                                    " : " + ", ".join(parts) if parts else "")
     extra = []
     if p["lots_open"]:
-        extra.append("%d lot(s) ouvert(s)" % p["lots_open"])
+        extra.append("%d open lot(s)" % p["lots_open"])
     if p["unread"]:
-        extra.append("%d non lu(s)" % p["unread"])
+        extra.append("%d unread" % p["unread"])
     if p.get("undeliverable"):
-        extra.append("%d en souffrance" % p["undeliverable"])
+        extra.append("%d undeliverable" % p["undeliverable"])
     if p["usd_24h"]:
         extra.append("24 h %.2f\u00a0$ (token %.2f\u00a0$)" % (p["usd_24h"], p["usd_24h_token"]))
     return head + (" · " + " · ".join(extra) if extra else "")
@@ -405,7 +405,7 @@ NARROW_WIDTH = 90
 def _last_update(a: dict, now: float) -> str:
     """« dernière avancée il y a 12m : … » (L96)."""
     last = a["last_update"]
-    return "avancée il y a %s : %s" % (_span(now - last["ts"]), last["text"])
+    return "progress %s ago: %s" % (_span(now - last["ts"]), last["text"])
 
 
 def _duration_cell(a: dict) -> str:
@@ -421,10 +421,10 @@ def _doing(a: dict, now: float | None = None) -> str:
         if a["open_lots"] > 1:
             doing += " (+%d)" % (a["open_lots"] - 1)
         if a.get("on_task_since_ts") and now is not None:
-            doing += " (depuis %s)" % _span(now - a["on_task_since_ts"])
+            doing += " (for %s)" % _span(now - a["on_task_since_ts"])
         return doing
     if a["task"]:
-        return "tour : " + a["task"]
+        return "turn: " + a["task"]
     return "—"
 
 
@@ -449,7 +449,7 @@ def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = 
     shown = [p for p in view["projects"] if p["active"] or show_inactive]
     hidden = [p for p in view["projects"] if not (p["active"] or show_inactive)]
     if not shown:
-        out.append(indent + "aucun projet en cours")
+        out.append(indent + "no active project")
     name_w = min(max([len(a["name"]) for p in shown for a in p["agents"]] + [6]), 20)
     for p in shown:
         if out:
@@ -459,22 +459,22 @@ def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = 
             wrap("! " + warning, indent + "  ")
         if p["agents"] and not narrow:
             out.append(indent + "  %-*s %-19s %-7s %8s %4s %-9s %s" % (
-                name_w, "AGENT", "ÉTAT", "PAIE", "24H $", "NL", "DURÉE", "LOT EN COURS"))
+                name_w, "AGENT", "STATE", "PAY", "24H $", "UNRD", "DURATION", "CURRENT LOT"))
         for a in p["agents"]:
             pay = _FR_PAYMENT.get(a["payment"], "?")
             if narrow:
                 # espace insécable avant « $ » : la coupure ne l'isole jamais
-                wrap("%s — %s · %s · %.2f\u00a0$ · %d non lu(s)" % (
+                wrap("%s — %s · %s · %.2f\u00a0$ · %d unread" % (
                     a["name"], state_label(a, now), pay, a["usd_24h"], a["unread"]),
                     indent + "  ")
                 if _doing(a) != "—":
                     cell = _duration_cell(a)
-                    wrap(_doing(a, now) + (" · durée %s" % cell if cell != "—" else ""),
+                    wrap(_doing(a, now) + (" · duration %s" % cell if cell != "—" else ""),
                          indent + "    ")
                 if a.get("last_update"):
                     wrap(_last_update(a, now), indent + "    ")
                 if a["reason"]:
-                    wrap("raison : " + a["reason"], indent + "    ")
+                    wrap("reason: " + a["reason"], indent + "    ")
                 continue
             head = indent + "  %-*s %-19s %-7s %8.2f %4d %-9s " % (
                 name_w, a["name"][:name_w], state_label(a, now)[:19], pay, a["usd_24h"],
@@ -485,21 +485,21 @@ def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = 
                 out.append(pad + _short(_last_update(a, now), max(20, width - len(pad))))
             if a["reason"]:
                 pad = indent + "  " + " " * (name_w + 1)
-                out.append(pad + _short("raison : " + a["reason"], max(20, width - len(pad))))
+                out.append(pad + _short("reason: " + a["reason"], max(20, width - len(pad))))
         for lot in p["lots_without_agent"]:
             why = _FR_WHY.get(lot["why"], lot["why"])
             if "%s" in why:
                 why = why % lot["assignee"]
-            wrap("sans agent : #%s %s — %s (%s)" % (
+            wrap("no agent: #%s %s — %s (%s)" % (
                 lot["id"], lot["state"], _short(lot["title"], 40), why), indent + "  ")
     if hidden:
         out.append("")
-        wrap("à l'arrêt (sans agent actif ni lot ouvert) : " + ", ".join(
+        wrap("dormant (no active agent, no open lot): " + ", ".join(
             "%s (%s)" % (project_label(p["name"]), ", ".join(a["name"] for a in p["agents"]))
             for p in hidden), indent)
     cut = (view.get("truncated") or {}).get("lots")
     if cut:
-        wrap("TRONQUÉ : %d lots ouverts lus sur %d (borne %d)" % (
+        wrap("TRUNCATED: read %d of %d open lots (limit %d)" % (
             cut["shown"], cut["total"], cut["limit"]), indent)
     return out
 
@@ -508,7 +508,7 @@ def format_text(view: dict, width: int | None = None, *, show_inactive: bool = F
     projects = [p for p in view["projects"] if p["active"]]
     agents = sum(len(p["agents"]) for p in view["projects"])
     lots = sum(p["lots_open"] for p in view["projects"])
-    title = "projets — %s (%d en cours, %d agent(s), %d lot(s) ouvert(s))" % (
+    title = "projects — %s (%d active, %d agent(s), %d open lot(s))" % (
         time.strftime("%H:%M", time.localtime(view["generated_ts"])), len(projects),
         agents, lots)
     if width is None:
@@ -529,10 +529,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ameesh projects", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--json", action="store_true", help="schéma ameesh-projects/1")
-    parser.add_argument("--project", default=None, help="un seul projet (équipe)")
+    parser.add_argument("--json", action="store_true", help="ameesh-projects/1 schema")
+    parser.add_argument("--project", default=None, help="a single project (team)")
     parser.add_argument("--all", action="store_true",
-                        help="montre aussi les projets à l'arrêt (sans agent actif ni lot)")
+                        help="also show dormant projects (no active agent, no lot)")
     return parser
 
 
@@ -547,13 +547,13 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             db.close()
     except db_mod.SchemaMissing as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.Unavailable as exc:
-        print("erreur : base injoignable : %s" % exc, file=sys.stderr)
+        print("error: database unreachable: %s" % exc, file=sys.stderr)
         return 1
     except db_mod.DbError as exc:
-        print("erreur : %s" % exc, file=sys.stderr)
+        print("error: %s" % exc, file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(view, ensure_ascii=False, indent=2, sort_keys=True))

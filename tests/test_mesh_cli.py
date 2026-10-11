@@ -218,7 +218,7 @@ class MeshCliTest(PgTestCase):
         self.assertEqual(proc.returncode, 0)
         proc = self.mesh("work", "move", "1", "build")  # 3e retour : refusé
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("épuisée", proc.stderr)
+        self.assertIn("exhausted", proc.stderr)
 
         proc = self.mesh("work", "move", "1", "blocked", "--note", "attente humaine")
         self.assertEqual(proc.returncode, 0)
@@ -229,7 +229,7 @@ class MeshCliTest(PgTestCase):
         item = json.loads(proc.stdout)
         self.assertEqual(item["state"], "blocked")
         self.assertEqual(item["events"][0]["note"], "relance demain")
-        self.assertEqual(item["events"][-1]["note"], "création")
+        self.assertEqual(item["events"][-1]["note"], "created")
 
     def test_work_etat_inconnu(self):
         proc = self.mesh("work", "add", "--title", "x")
@@ -315,7 +315,7 @@ class DelaysCliTest(MeshCliTest):
         # un lot gelé : le pied de `list` dit ce qui attend une revue
         proc = self.mesh("list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("lots     : 1 (gel 1)", proc.stdout)
+        self.assertIn(": 1 (freeze 1)", proc.stdout)
         self.assertIn("plus ancien gel", proc.stdout)
 
         proc = self.mesh("work", "milestone", "1", "verdict", "ok", "--sha", "b" * 40)
@@ -324,7 +324,7 @@ class DelaysCliTest(MeshCliTest):
         proc = self.mesh("work", "list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("DÉLAI", proc.stdout)
-        self.assertIn("revue", proc.stdout)
+        self.assertIn("review", proc.stdout)
 
         proc = self.mesh("work", "list", "--json")
         lot = json.loads(proc.stdout)[0]
@@ -338,7 +338,7 @@ class DelaysCliTest(MeshCliTest):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("jalons", proc.stdout)
         self.assertIn("délais", proc.stdout)
-        self.assertIn("demande → gel", proc.stdout)
+        self.assertIn("request → freeze", proc.stdout)
 
         proc = self.mesh("work", "show", "1", "--json")
         item = json.loads(proc.stdout)
@@ -346,7 +346,7 @@ class DelaysCliTest(MeshCliTest):
         self.assertEqual([m["kind"] for m in item["milestones"]].count("verdict"), 1)
 
         proc = self.mesh("list")
-        self.assertIn("lots     : 1 (revue 1)", proc.stdout)
+        self.assertIn(": 1 (review 1)", proc.stdout)
         self.assertNotIn("plus ancien gel", proc.stdout)
 
         # un jalon automatique ne se déclare pas à la main (choix argparse)
@@ -384,7 +384,7 @@ class DelaysCliTest(MeshCliTest):
         # la sortie lisible porte aussi la phase courante
         proc = self.mesh("work", "list", "--assignee", AGENT)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("gel", proc.stdout)
+        self.assertIn("freeze", proc.stdout)
 
 
 class AideSansEffetTest(unittest.TestCase):

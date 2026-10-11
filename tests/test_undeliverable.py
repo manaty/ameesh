@@ -106,10 +106,10 @@ class FonctionsTest(unittest.TestCase):
         row = {"id": 7, "sender": "claude1", "created_ts": NOW, "body": "SHA abc123 fusionné",
                "kind": "notify", "payload": {}, "forwarded_from": "claude3"}
         texte, _retenus, _reste = mail.prompt_for(None, [row], kind="mail")
-        self.assertIn("[renvoyé : d'abord adressé à claude3", texte)
+        self.assertIn("[forwarded: first addressed to claude3", texte)
         from ameesh import cli
         rendu = cli.render([mail.normalize(row)])
-        self.assertIn("[renvoyé : d'abord adressé à claude3", rendu)
+        self.assertIn("[forwarded: first addressed to claude3", rendu)
         # un message ordinaire : rendu inchangé (JSON des hooks identique à la v0)
         self.assertNotIn("renvoyé", cli.render([mail.normalize(dict(row, forwarded_from=None))]))
 
@@ -138,9 +138,9 @@ class FonctionsTest(unittest.TestCase):
         self.assertEqual(view["undeliverable"], 44)
         self.assertTrue(by["autre"]["active"])
         text = projects.format_text(view, 120)
-        self.assertIn("42 en souffrance", text)
-        self.assertIn("! 42 message(s) en souffrance : claude3 (arrêté) 15, orchestrator "
-                      "(inconnu) 27", text)
+        self.assertIn("42 undeliverable", text)
+        self.assertIn("! 42 undeliverable message(s): claude3 (stopped) 15, orchestrator "
+                      "(unknown) 27", text)
         # sans courrier en souffrance : rien ne change
         view = projects.build(dict(board, dead_letters=[]), now=NOW, paid_harnesses=())
         self.assertEqual(view["undeliverable"], 0)
@@ -393,7 +393,7 @@ class AlerteTest(_Base):
                          {"claude3": "stopped", "orchestrator": "unknown"})
         out = self.mesh("projects")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("2 message(s) en souffrance", out.stdout)
+        self.assertIn("2 undeliverable message(s)", out.stdout)
 
 
 class RenvoiTest(_Base):
@@ -450,7 +450,7 @@ class RenvoiTest(_Base):
                                           "cwd": self.tmp}))
         contexte = json.loads(hook.stdout)["hookSpecificOutput"]["additionalContext"]
         self.assertIn("— de claude1 à ", contexte)
-        self.assertIn("[renvoyé : d'abord adressé à claude3", contexte)
+        self.assertIn("[forwarded: first addressed to claude3", contexte)
         fil = self.mesh("fil", "show", "manaty")
         self.assertIn("Renvoi de 2 message(s) en souffrance : la boîte de claude3", fil.stdout)
         # plus rien à renvoyer

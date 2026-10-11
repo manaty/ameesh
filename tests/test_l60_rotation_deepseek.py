@@ -228,7 +228,7 @@ class PlafondDeContexteTest(_Base):
             self.assertTrue(self._tour(worker, "tour suivant"))
         argv = self.turns()[-1]["argv"]
         self.assertNotIn("--session-id", argv, "session neuve")
-        self.assertIn("Reprise de session après rotation", " ".join(argv))
+        self.assertIn("Session resumed after rotation", " ".join(argv))
 
     def test_sous_le_plafond_rien_ne_tourne(self):
         runner, worker = self._worker("ds-sous")

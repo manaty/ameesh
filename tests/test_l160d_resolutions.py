@@ -552,10 +552,10 @@ class RadarTest(_Base):
         branches = {b["work_item"]: b for b in report["branches"]}
         mine = radar.message_text(conflict, 2, branches)
         self.assertIn("`ameesh work resolve 2 --with 1`", mine)
-        self.assertIn("ton lot est le plus récent", mine)
-        self.assertIn("Le lot #2 prépare la résolution", radar.message_text(conflict, 1,
-                                                                           branches))
-        self.assertIn("[résolveur #2 : newer lot]", "\n".join(radar.render(report)))
+        self.assertIn("your lot is the most recent", mine)
+        self.assertIn("Lot #2 prepares the resolution", radar.message_text(conflict, 1,
+                                                                          branches))
+        self.assertIn("[resolver #2: newer lot]", "\n".join(radar.render(report)))
 
     def test_prepared_then_stale(self):
         cache = radar.Cache()
@@ -584,7 +584,7 @@ class RadarTest(_Base):
         self.assertEqual((stale["lots"], stale["files"]), ([2], ["shared.py"]))
         branches = {b["work_item"]: b for b in report["branches"]}
         text = radar.message_text(stale, 2, branches)
-        self.assertIn("ne couvre plus le conflit", text)
+        self.assertIn("no longer covers the", text)
         self.assertIn("`ameesh work resolve 2 --with 1`", text)
         self.assertIn(sha[:12], text)
         self.assertIn({"key": "pair:1-2", "from": "prepared", "to": "stale"},

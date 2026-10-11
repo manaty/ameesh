@@ -301,7 +301,7 @@ class ResumeTest(_Base):
         for attendu in ("# Brief de reprise de coord", "## Identité et rôle",
                         "responsable humain : human:proprio",
                         "## Lots qui te sont assignés",
-                        "#%s [intake] Câbler la reprise — attend : démarrage par coord"
+                        "#%s [intake] Câbler la reprise — attend : start by coord"
                         % lot["id"],
                         "## Derniers échanges du fil atelier",
                         "Le lot de câblage attend ta revue.",
@@ -465,9 +465,9 @@ class SessionAccountTest(_Base):
         self.assertNotIn("resume", dernier["argv"])
         self.assertIn("# Brief de reprise de rb", dernier["argv"][-1])
         # encadré comme un brief d'ameesh, jamais comme le résumé de l'agent
-        self.assertIn('auteur="ameesh, brief déterministe" autorite="aucune"',
+        self.assertIn('author="ameesh, deterministic brief" authority="none"',
                       dernier["argv"][-1])
-        self.assertNotIn("que tu as écrit toi-même", dernier["argv"][-1])
+        self.assertNotIn("you wrote yourself", dernier["argv"][-1])
         self.assertIn("brief déterministe (L39)", self._fil())
 
 

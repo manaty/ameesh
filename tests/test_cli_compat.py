@@ -148,7 +148,7 @@ class CliCompatTest(PgTestCase):
                           AMEESH_LEASE_EPOCH=str(epoch + 1))
         proc = self.cli("hook", "claude", env=perime, stdin=payload)
         self.assertEqual(proc.stdout, "")
-        self.assertIn("non liée", proc.stderr)
+        self.assertIn("unbound", proc.stderr)
         restant = self.db.query(
             "SELECT count(*)::int AS n FROM agent_mailbox "
             "WHERE recipient = %s AND delivered_at IS NULL", (name,))[0]["n"]
@@ -164,7 +164,7 @@ class CliCompatTest(PgTestCase):
         env.pop("AGENT_MAIL_NAME", None)
         proc = self.cli("whoami", env=env)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("identité non liée", proc.stderr)
+        self.assertIn("unbound identity", proc.stderr)
 
         # un destinataire inscrit : un nom absent du registre est refusé
         registry.upsert(self.db, "beta", harness="codex", host=self.cfg.host)
@@ -174,12 +174,12 @@ class CliCompatTest(PgTestCase):
 
         proc = self.cli("send", "beta", "avec expéditeur", "--from", "gamma", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "déposé pour : beta")
+        self.assertEqual(proc.stdout.strip(), "dropped for: beta")
 
         # diagnostic de dossier : explicitement non autoritaire
         proc = self.cli("whoami", "--cwd", self.tmp, env=env)
         self.assertEqual(proc.returncode, 0)
-        self.assertIn("non autoritaire", proc.stdout)
+        self.assertIn("not authoritative", proc.stdout)
 
     def test_hook_ne_consomme_pas_si_l_ecriture_echoue(self):
         """Sonde codex3 (7) : un harnais qui ferme son entrée ne perd pas le message."""
@@ -246,7 +246,7 @@ class CliCompatTest(PgTestCase):
 
         # le dossier ne donne plus d'identité : diagnostic explicitement non autoritaire
         proc = self.cli("whoami", "--cwd", dossier)
-        self.assertEqual(proc.stdout.strip(), "legacy deepseek7 (diagnostic, non autoritaire)")
+        self.assertEqual(proc.stdout.strip(), "legacy deepseek7 (diagnostic, not authoritative)")
         proc = self.cli("whoami", env=self.env(AGENT_MAIL_NAME="deepseek7"))
         self.assertEqual(proc.stdout.strip(), "deepseek7")
 
@@ -261,14 +261,14 @@ class CliCompatTest(PgTestCase):
         registry.upsert(self.db, "alpha", harness="claude", host=self.cfg.host)
         proc = self.cli("send", "alpha", "bonjour alpha", env=self.env(AGENT_MAIL_NAME="beta"))
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual(proc.stdout.strip(), "déposé pour : alpha")
+        self.assertEqual(proc.stdout.strip(), "dropped for: alpha")
 
         proc = self.cli("inbox", "alpha")
-        self.assertEqual(proc.stdout.strip(), "de beta : bonjour alpha")
+        self.assertEqual(proc.stdout.strip(), "from beta: bonjour alpha")
 
         proc = self.cli("list")
         ligne = [l for l in proc.stdout.splitlines() if l.startswith("alpha")][0]
-        self.assertIn("non lus:1", ligne)
+        self.assertIn("unread:1", ligne)
         self.assertIn("@", ligne)
 
         # inbox ne marque pas lu (comme la v0)

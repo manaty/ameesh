@@ -227,13 +227,13 @@ class ProfilStrictTest(unittest.TestCase):
 
     def test_rp_id_exactement_l_hote(self):
         # RP ID parent de l'origine : admis par WebAuthn, refusé par le profil
-        self.refused("l'origine doit être exactement 'https://%s'" % PARENT,
+        self.refused("the origin must be exactly 'https://%s'" % PARENT,
                      rp_id=PARENT, origins=(ORIGIN_A,))
-        self.refused("exactement UNE origine", origins=(ORIGIN_A, "https://m." + H_A))
-        self.refused("sans port", origins=(ORIGIN_A + ":8443",))
-        self.refused("pas d'hôte partagé par chemin", public_url=ORIGIN_A + "/equipe-a")
-        self.refused("ni localhost", rp_id="localhost", origins=("http://localhost:8765",))
-        self.refused("ni localhost", rp_id="127.0.0.1", origins=("https://127.0.0.1",))
+        self.refused("exactly ONE origin", origins=(ORIGIN_A, "https://m." + H_A))
+        self.refused("no port", origins=(ORIGIN_A + ":8443",))
+        self.refused("no host shared by path", public_url=ORIGIN_A + "/equipe-a")
+        self.refused("neither localhost", rp_id="localhost", origins=("http://localhost:8765",))
+        self.refused("neither localhost", rp_id="127.0.0.1", origins=("https://127.0.0.1",))
         # formes IPv4 historiques (inet_aton, règle WHATWG du dernier segment)
         for host in ("127.1", "0x7f.1", "0177.0.0.1", "10.0.0.010", "a.b.0x10", "a.b.123",
                      "2130706433.0"):
@@ -250,14 +250,14 @@ class ProfilStrictTest(unittest.TestCase):
         cfg = self.config(rp_id=PARENT, origins=(ORIGIN_A, ORIGIN_B), profile="compatible",
                           public_url=ORIGIN_A + "/x")
         self.assertEqual(cfg.base_url, ORIGIN_A + "/x")
-        self.refused("profil inconnu", profile="souple")
+        self.refused("unknown profile", profile="souple")
 
     def test_zones_et_hotes_reserves(self):
         values = dict(reserved_zones=("pages.example.test",),
                       reserved_hosts=("approve.pages.example.test",))
-        for rp_id, fragment in (("pages.example.test", "une zone réservée"),
-                                ("approve.pages.example.test", "un hôte réservé"),
-                                ("example.test", "parent du nom réservé")):
+        for rp_id, fragment in (("pages.example.test", "a reserved zone"),
+                                ("approve.pages.example.test", "a reserved host"),
+                                ("example.test", "parent of the reserved name")):
             for profile in ("strict", "compatible"):
                 with self.subTest(rp_id=rp_id, profile=profile):
                     self.refused(fragment, rp_id=rp_id, origins=("https://" + rp_id,),
@@ -268,25 +268,25 @@ class ProfilStrictTest(unittest.TestCase):
                                          **values).rp_id, rp_id)
         # réservés par la décision 0026, sans configuration
         for rp_id in ("nexlink.ph", "ameesh.nexlink.ph"):
-            self.refused("réservé", rp_id=rp_id, origins=("https://" + rp_id,))
+            self.refused("reserved", rp_id=rp_id, origins=("https://" + rp_id,))
         self.assertEqual(self.config(rp_id="equipe-a.nexlink.ph",
                                      origins=("https://equipe-a.nexlink.ph",)).rp_id,
                          "equipe-a.nexlink.ph")
-        self.refused("nom réservé illisible", reserved_zones=("Zone Invalide",))
+        self.refused("unreadable reserved name", reserved_zones=("Zone Invalide",))
 
     def test_chargement_json_et_environnement(self):
         path = os.path.join(self.tmp, "config.json")
         with open(path, "w") as fh:
             json.dump({"rp_id": "zone.example.test", "origins": ["https://zone.example.test"],
                        "reserved_zones": ["zone.example.test"]}, fh)
-        with self.assertRaisesRegex(approve_config.ApproveConfigError, "zone réservée"):
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "reserved zone"):
             approve_config.load({}, path=path)
         env = {"AMEESH_APPROVE_RP_ID": H_A, "AMEESH_APPROVE_ORIGINS": ORIGIN_A,
                "AMEESH_APPROVE_RESERVED_ZONES": "approve.example.test, autre.test",
                "AMEESH_APPROVE_CONFIG": os.path.join(self.tmp, "absent.json")}
         cfg = approve_config.load(env)
         self.assertEqual(cfg.reserved_zones, ("approve.example.test", "autre.test"))
-        with self.assertRaisesRegex(approve_config.ApproveConfigError, "parent du nom"):
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "parent of the reserved name"):
             approve_config.load(dict(env, AMEESH_APPROVE_RP_ID="example.test",
                                      AMEESH_APPROVE_ORIGINS="https://example.test"))
         cfg = approve_config.load(dict(env, AMEESH_APPROVE_PROFILE="compatible",
@@ -307,7 +307,7 @@ class ProfilStrictTest(unittest.TestCase):
                     self.assertIs(approve_config.load({}, path=path).api_via_public, value)
                 else:
                     with self.assertRaisesRegex(approve_config.ApproveConfigError,
-                                                "booléen JSON"):
+                                                "JSON boolean"):
                         approve_config.load({}, path=path)
 
     def test_cli_refuse_un_rp_id_parent(self):
@@ -321,8 +321,8 @@ class ProfilStrictTest(unittest.TestCase):
             capture_output=True, text=True, timeout=60,
             env=child_env(AMEESH_APPROVE_CONFIG=os.path.join(self.tmp, "absent.json")))
         self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertIn("profil strict", proc.stderr)
-        self.assertIn("RP ID = hôte de l'origine", proc.stderr)
+        self.assertIn("strict profile", proc.stderr)
+        self.assertIn("RP ID = origin host", proc.stderr)
         proc = subprocess.run(
             [sys.executable, "-m", "ameesh.approve", "enroll-link", "--approver", ALICE,
              "--rp-id", "nexlink.ph", "--origin", "https://nexlink.ph",
@@ -330,7 +330,7 @@ class ProfilStrictTest(unittest.TestCase):
             capture_output=True, text=True, timeout=60,
             env=child_env(AMEESH_APPROVE_CONFIG=os.path.join(self.tmp, "absent.json")))
         self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertIn("zone réservée", proc.stderr)
+        self.assertIn("reserved zone", proc.stderr)
 
 
 # --------------------------------------------------------------------------
@@ -468,9 +468,9 @@ class EquipesTest(PgTestCase):
 
     # -- RP ID parent, site frère ------------------------------------------------
     def test_rp_id_parent_refuse(self):
-        with self.assertRaisesRegex(approve_config.ApproveConfigError, "profil strict"):
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "strict profile"):
             approve_config.ApproveConfig(rp_id=PARENT, origins=(ORIGIN_A,)).validate()
-        with self.assertRaisesRegex(approve_config.ApproveConfigError, "zone réservée"):
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "reserved zone"):
             approve_config.ApproveConfig(rp_id=PARENT, origins=(ORIGIN_A,),
                                          profile="compatible",
                                          reserved_zones=(PARENT,)).validate()
@@ -648,21 +648,21 @@ class EquipesTest(PgTestCase):
     def test_approve_check_concordance(self):
         proc = self.check(self.a)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("politique concordante", proc.stdout)
-        self.assertIn("boucle locale", proc.stdout)
+        self.assertIn("policies match", proc.stdout)
+        self.assertIn("loopback", proc.stdout)
         # écarts : RP ID, origine en trop, origine manquante, politique absente
         cases = (
-            (dict(AMEESH_APPROVE_RP_ID=H_B), "RP ID : service"),
+            (dict(AMEESH_APPROVE_RP_ID=H_B), "RP ID: service"),
             (dict(AMEESH_APPROVE_ORIGINS=ORIGIN_A + "," + ORIGIN_B),
-             "admise par le vérificateur mais pas par le service : " + ORIGIN_B),
-            (dict(AMEESH_APPROVE_ORIGINS=ORIGIN_B), "origine du service refusée"),
-            (dict(AMEESH_APPROVE_RP_ID=""), "AMEESH_APPROVE_RP_ID absent"),
+             "allowed by the verifier but not by the service: " + ORIGIN_B),
+            (dict(AMEESH_APPROVE_ORIGINS=ORIGIN_B), "service origin refused"),
+            (dict(AMEESH_APPROVE_RP_ID=""), "AMEESH_APPROVE_RP_ID missing"),
         )
         for env, fragment in cases:
             with self.subTest(fragment=fragment):
                 proc = self.check(self.a, **env)
                 self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-                self.assertIn("ÉCART", proc.stdout)
+                self.assertIn("MISMATCH", proc.stdout)
                 self.assertIn(fragment, proc.stdout)
         # la politique de B ne concorde pas avec le service de A
         proc = self.check(self.a, AMEESH_APPROVE_RP_ID=H_B, AMEESH_APPROVE_ORIGINS=ORIGIN_B)
@@ -762,7 +762,7 @@ class TlsLocalTest(PgTestCase):
             with self.subTest(mode=oct(mode)):
                 os.chmod(self.key, mode)
                 with self.assertRaisesRegex(approve_config.ApproveConfigError,
-                                            "permissions trop ouvertes"):
+                                            "permissions too open"):
                     TlsReloader(self.cert, self.key)
         os.chmod(self.key, 0o600)
         os.chmod(self.cert, 0o644)
@@ -777,7 +777,7 @@ class TlsLocalTest(PgTestCase):
         with self.assertRaisesRegex(approve_config.ApproveConfigError, "inutilisable"):
             TlsReloader(self.cert, other_key)
         self.assertEqual(TlsReloader(other_cert, other_key).loads, 1)
-        with self.assertRaisesRegex(approve_config.ApproveConfigError, "vont ensemble"):
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "go together"):
             approve_config.ApproveConfig(rp_id=H_A, origins=(ORIGIN_A,),
                                          tls_cert=self.cert).validate()
 
@@ -840,7 +840,7 @@ class TlsLocalTest(PgTestCase):
             capture_output=True, text=True, timeout=60,
             env=child_env(AMEESH_APPROVE_CONFIG=os.path.join(self.work, "absent.json")))
         self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertIn("permissions trop ouvertes", proc.stderr)
+        self.assertIn("permissions too open", proc.stderr)
 
     def peer(self, inst: Instance) -> bytes:
         """Le certificat servi maintenant (sans vérification : on le compare)."""
@@ -898,10 +898,10 @@ class TlsLocalTest(PgTestCase):
                        AMEESH_APPROVE_RP_ID=H_A, AMEESH_APPROVE_ORIGINS=ORIGIN_A)
         proc = self.mesh("approve-check", env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("TLS local", proc.stdout)
+        self.assertIn("local TLS", proc.stdout)
         proc = self.mesh("approve-check", env=dict(env, AMEESH_APPROVE_TLS_NAME=H_B))
         self.assertEqual(proc.returncode, 2, proc.stdout)
-        self.assertIn("injoignable", proc.stderr)
+        self.assertIn("unreachable", proc.stderr)
 
 
 # --------------------------------------------------------------------------

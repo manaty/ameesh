@@ -262,7 +262,7 @@ class BoutEnBoutTest(PgTestCase):
             proc = self.run_mesh("mail", "send", name,
                                  "Bonjour %s, le lot 7 d'acme-web est à préparer." % name,
                                  "--from", "alice")
-            self.assertIn("déposé pour : %s" % name, proc.stdout)
+            self.assertIn("dropped for: %s" % name, proc.stdout)
         out = self.run_runner()
         for name in ("orchestre", "relecteur"):
             self.assertIn("bail acquis : %s" % name, out)
@@ -286,7 +286,7 @@ class BoutEnBoutTest(PgTestCase):
     def etape_4_message_et_fil(self) -> None:
         text = ("Relecteur, le lot 7 est prêt : relis la PR %s avant la fusion." % PR)
         proc = self.run_mesh("mail", "send", "relecteur", text, AGENT_MAIL_NAME="orchestre")
-        self.assertIn("déposé pour : relecteur", proc.stdout)
+        self.assertIn("dropped for: relecteur", proc.stdout)
 
         proc = self.run_mesh("fil", "show", PROJECT)
         self.assertRegex(proc.stdout, r"(?m)^### \S+ — human:alice → agent:orchestre$")
@@ -387,7 +387,7 @@ class BoutEnBoutTest(PgTestCase):
                          ("ameesh-receipt/1", "webauthn", ALICE, action_id, ORCHESTRE))
         proc = self.run_mesh("receipt", "verify", receipt_path, "--digest",
                              self.action["digest"], "--action-id", action_id)
-        self.assertIn("reçu VALIDE : approve par %s (webauthn" % ALICE, proc.stdout)
+        self.assertIn("receipt VALID: approve by %s (webauthn" % ALICE, proc.stdout)
         # le lien est dans le fil du projet ; le jeton de service nulle part
         thread = self.run_mesh("fil", "show", PROJECT).stdout
         self.assertIn("Demande d'approbation de l'action %s" % action_id, thread)

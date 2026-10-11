@@ -17,10 +17,10 @@ class LabelExterneTest(unittest.TestCase):
         detail = stagnation._waiting("build", "coord")
         out = stagnation.with_availability(detail, {"coord": "idle"},
                                            {"coord": "human:proprio"})
-        self.assertEqual(out["label"], "travail de coord (session externe, human:proprio)")
+        self.assertEqual(out["label"], "work by coord (external session, human:proprio)")
         self.assertEqual((out["who_state"], out["responsible"]), ("externe", "human:proprio"))
         out = stagnation.with_availability(detail, {"coord": "idle"}, {"coord": None})
-        self.assertEqual(out["label"], "travail de coord (session externe, sans responsable)")
+        self.assertEqual(out["label"], "work by coord (external session, no responsible)")
         # sans table des externes : comportement de L36 inchangé
         self.assertIs(stagnation.with_availability(detail, {"coord": "idle"}), detail)
 
@@ -160,7 +160,7 @@ class AttributionGardeeTest(_Base):
     def test_work_add_refuse_accepte_et_externe(self):
         proc = self.mesh("work", "add", "--title", "a", "--assignee", "fantome")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("agent inconnu", proc.stderr)
+        self.assertIn("unknown agent", proc.stderr)
         self._externe("coord", "human:proprio")
         self._externe("orphelin")
         proc = self.mesh("work", "add", "--title", "b", "--assignee", "coord")
@@ -182,7 +182,7 @@ class AttributionGardeeTest(_Base):
         rows = {r["title"]: r for r in json.loads(self.mesh("work", "list", "--json").stdout)}
         self.assertEqual(set(rows), {"e", "f", "g"})
         self.assertEqual(rows["f"]["waiting_for"]["label"],
-                         "démarrage par coord (session externe, human:proprio)")
+                         "start by coord (external session, human:proprio)")
 
     def test_work_assign(self):
         lot = work.add(self.db, title="à confier", assignee="ouvrier")
@@ -194,20 +194,20 @@ class AttributionGardeeTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(work.get(self.db, lot["id"])["assignee"], "second")
         events = work.events(self.db, lot["id"])
-        self.assertTrue(any("assigné à second (avant : ouvrier)" in e["note"]
+        self.assertTrue(any("assigned to second (before: ouvrier)" in e["note"]
                             and e["actor"] == "orch" for e in events))
         self.assertEqual(self.mesh("work", "assign", str(lot["id"]), "second").returncode, 1)
         self._externe("coord", "human:proprio")
         self.assertEqual(self.mesh("work", "assign", str(lot["id"]), "coord").returncode, 1)
         proc = self.mesh("work", "assign", str(lot["id"]), "coord", "--externe")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertTrue(any("session externe, responsable human:proprio" in e["note"]
+        self.assertTrue(any("external session, owner human:proprio" in e["note"]
                             for e in work.events(self.db, lot["id"])))
         # lot fermé : plus de réassignation
         work.close(self.db, lot["id"], abandoned=True)
         proc = self.mesh("work", "assign", str(lot["id"]), "ouvrier")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("rien à réassigner", proc.stderr)
+        self.assertIn("nothing to reassign", proc.stderr)
 
 
 class AlertesVivaciteTest(_Base):

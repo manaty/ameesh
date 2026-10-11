@@ -56,16 +56,16 @@ class ShellNoopConnector:
 
     def path(self, idempotency_key: str) -> str:
         if not isinstance(idempotency_key, str) or not _KEY_RE.fullmatch(idempotency_key):
-            raise ConnectorError("shell-noop : clé d'idempotence invalide %r" % (idempotency_key,))
+            raise ConnectorError("shell-noop: invalid idempotency key %r" % (idempotency_key,))
         return os.path.join(self.directory, idempotency_key + ".json")
 
     def execute(self, action: Action, idempotency_key: str) -> Outcome:
         path = self.path(idempotency_key)
         if os.path.exists(path):
-            return Outcome.confirmed(path, "déjà fait : même clé d'idempotence, aucun nouvel effet")
+            return Outcome.confirmed(path, "already done: same idempotency key, no new effect")
         simulate = action.args.get("simulate") if isinstance(action.args, dict) else None
         if simulate == "fail":
-            return Outcome.failed("échec simulé : aucun effet")
+            return Outcome.failed("simulated failure: no effect")
         os.makedirs(self.directory, exist_ok=True)
         payload = jcs.dumps({
             "idempotency_key": idempotency_key, "action_id": action.action_id,
@@ -89,9 +89,9 @@ class ShellNoopConnector:
         finally:
             os.unlink(tmp)
         if not created:
-            return Outcome.confirmed(path, "déjà fait : même clé d'idempotence, aucun nouvel effet")
+            return Outcome.confirmed(path, "already done: same idempotency key, no new effect")
         if simulate == "lose-response":
-            raise ConnectionError("shell-noop : réponse perdue après l'effet (simulé)")
+            raise ConnectionError("shell-noop: response lost after the effect (simulated)")
         if simulate == "hang":
             time.sleep(float(action.args.get("hang_seconds", 3600)))
         return Outcome.confirmed(path)
@@ -107,4 +107,4 @@ class ShellNoopConnector:
             return None
         if not isinstance(written, dict) or written.get("action_id") != action.action_id:
             return None
-        return Outcome.confirmed(path, "fichier présent : l'effet a eu lieu")
+        return Outcome.confirmed(path, "file present: the effect happened")

@@ -463,27 +463,27 @@ def breaches(reading: dict, limits: dict) -> list[dict]:
             out.append({"key": key, "label": label, "value": value, "limit": limit,
                         "critical": value >= limit * critical_factor})
 
-    floor("min_mem_available", "mémoire disponible", reading.get("mem_available_bytes"),
+    floor("min_mem_available", "available memory", reading.get("mem_available_bytes"),
           limits["min_mem_available"], CRITICAL_MEM_FACTOR)
-    ceiling("max_swap_used", "swap utilisé", reading.get("swap_used_bytes"),
+    ceiling("max_swap_used", "swap used", reading.get("swap_used_bytes"),
             limits["max_swap_used"], CRITICAL_SWAP_FACTOR)
-    ceiling("max_load", "charge 1 min", reading.get("load1"),
+    ceiling("max_load", "1-min load", reading.get("load1"),
             limits["max_load"], CRITICAL_LOAD_FACTOR)
-    floor("min_disk_free", "disque libre", reading.get("disk_free_bytes"),
+    floor("min_disk_free", "free disk", reading.get("disk_free_bytes"),
           limits["min_disk_free"], CRITICAL_DISK_FACTOR)
     # L73 : un /tmp en tmpfs vit en mémoire et en swap ; critique à mi-chemin
     # entre le seuil et le plein.
     part = tmpfs_fraction(reading)
     limit = limits.get("max_tmpfs_used")
     if part is not None and limit is not None and part > limit:
-        out.append({"key": "max_tmpfs_used", "label": "tmpfs %s occupé"
+        out.append({"key": "max_tmpfs_used", "label": "tmpfs %s used"
                     % (reading.get("tmp_path") or "/tmp"), "value": part, "limit": limit,
                     "critical": part >= limit + (1.0 - limit) / 2.0})
     etat = power_state(reading, limits)
     if etat["state"] in ("low", "stop"):
         # L106 : jamais `critical` — la pause des agents peu prioritaires ne
         # sert à rien ici ; l'arrêt propre (`stop`) est l'affaire de l'exécuteur
-        out.append({"key": "min_battery_percent", "label": "batterie (sur batterie)",
+        out.append({"key": "min_battery_percent", "label": "battery (on battery power)",
                     "value": etat["battery_percent"], "limit": etat["min"],
                     "critical": False, "power": etat["state"]})
     out.sort(key=lambda b: (not b["critical"], b["key"]))
@@ -549,7 +549,7 @@ def fmt_value(key: str, value) -> str:
 
 def describe(found: list[dict]) -> str:
     """Les franchissements en clair : « swap utilisé 17.5 GiB (seuil 16.0 GiB) »."""
-    return " ; ".join("%s %s (seuil %s)" % (b["label"], fmt_value(b["key"], b["value"]),
+    return "; ".join("%s %s (threshold %s)" % (b["label"], fmt_value(b["key"], b["value"]),
                                             fmt_value(b["key"], b["limit"]))
                       for b in found or [])
 

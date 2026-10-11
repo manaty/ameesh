@@ -82,7 +82,7 @@ class HookSansBailTest(PgTestCase):
         proc = self._hook("ouvrier", event="UserPromptSubmit")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "")
-        self.assertIn("mené par l'exécuteur", proc.stderr)
+        self.assertIn("driven by the runner", proc.stderr)
         # et la réservation sans bail le refuse elle-même, sous verrou
         self.assertEqual(mail.reserve(self.db, "ouvrier", None, None, mail.new_token(),
                                       porteur="hook"), [])
@@ -222,7 +222,7 @@ class AttributionTest(PgTestCase):
         lot = work.add(self.db, title="pour alice", assignee="alice", cfg=cfg)
         self.assertEqual(lot["assignee"], "human:alice")
         check = work.check_assignee(self.db, "alice", cfg=cfg)
-        self.assertIn("humain connu", check["warning"])
+        self.assertIn("known human", check["warning"])
         # humain déjà résolu par le canon (responsable d'un agent)
         self.db.execute("UPDATE agent_registry SET responsible = 'human:bob' "
                         "WHERE name = 'ouvrier'")
@@ -230,7 +230,7 @@ class AttributionTest(PgTestCase):
                          "human:bob")
         proc = self.mesh("work", "assign", str(lot["id"]), "bob")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("humain connu", proc.stderr)
+        self.assertIn("known human", proc.stderr)
         self.assertEqual(work.get(self.db, lot["id"])["assignee"], "human:bob")
         # mais jamais un délégué
         with self.assertRaises(work.WorkError):
@@ -257,7 +257,7 @@ class AttributionTest(PgTestCase):
         self.assertEqual(registry.wakeable(self.db, self.cfg, "ouvrier"), (True, ""))
         check = work.check_assignee(self.db, "ouvrier", cfg=self.cfg)
         self.assertEqual(check["assignee"], "ouvrier")
-        self.assertIn("momentanément invalid", check["warning"])
+        self.assertIn("temporarily invalid", check["warning"])
         # la réclamation, elle, reste fermée
         self.assertIsNone(registry.claim(self.db, "ouvrier", "r1", 60))
         # un placement refusé, lui, bloque toujours
@@ -290,7 +290,7 @@ class WebhookSecretTest(unittest.TestCase):
                       "https://hooks.slack.com/serv ices/%s" % self.SECRET):
             with self.assertRaises(notify.ChannelError) as ctx:
                 notify.Sender(env={"AMEESH_SLACK_WEBHOOK": piege}).send(self.canal, self.msg)
-            self.assertIn("URL du webhook invalide", str(ctx.exception))
+            self.assertIn("invalid webhook URL", str(ctx.exception))
             self.assertTrue(ctx.exception.permanent)
             self._assert_propre(str(ctx.exception))
 
@@ -309,7 +309,7 @@ class WebhookSecretTest(unittest.TestCase):
         with self.assertRaises(notify.ChannelError) as ctx:
             notify.Sender(env={"TOK": "tk_SECRET\nX-Injecte: 1"}).send(canal, self.msg)
         self._assert_propre(str(ctx.exception))
-        self.assertIn("jeton ntfy invalide", str(ctx.exception))
+        self.assertIn("ntfy token invalid", str(ctx.exception))
 
     def test_erreur_inattendue_nettoyee(self):
         notify = self.notify
@@ -324,7 +324,7 @@ class WebhookSecretTest(unittest.TestCase):
         ncfg = notify.parse_config({"routes": {"human:p": ["slack"]}})
         [(nom, erreur)] = notify.send_test(ncfg, "human:p", "hote", sender=Panne())
         self.assertEqual(nom, "slack")
-        self.assertIn("erreur inattendue", erreur)
+        self.assertIn("unexpected error", erreur)
         self._assert_propre(erreur)
 
 
@@ -432,7 +432,7 @@ class PidRecycleTest(PgTestCase):
         # même PID, autre processus (PID recyclé) : rien
         self.db.execute("UPDATE session_bindings SET pid_started_at = pid_started_at + 5")
         row, why = sb.for_hook(self.cfg, self.db, "claude", "s-1", chaine)
-        self.assertIn("réutilisé", why)
+        self.assertIn("reused", why)
         self.assertIsNone(sb.by_ancestry(self.cfg, self.db, chaine))
         binding = identity._session_binding(self.cfg, self.db, "claude", "s-1")
         self.assertFalse(binding.ok)
@@ -461,11 +461,11 @@ class PidRecycleTest(PgTestCase):
         self.assertEqual(sb.for_hook(self.cfg, self.db, "claude", "s-1", chaine)[1], "")
         # une autre heure (PID recyclé) : refusée
         self.db.execute("UPDATE session_bindings SET pid_start = %s", (tops + 10 * hertz,))
-        self.assertIn("réutilisé", sb.for_hook(self.cfg, self.db, "claude", "s-1", chaine)[1])
+        self.assertIn("reused", sb.for_hook(self.cfg, self.db, "claude", "s-1", chaine)[1])
         # hors Linux, des tops ne se convertissent pas : refus (fail-closed)
         self.db.execute("UPDATE session_bindings SET pid_start = %s", (tops,))
         with mock.patch.object(platform, "SYSTEM", "macos"):
-            self.assertIn("réutilisé",
+            self.assertIn("reused",
                           sb.for_hook(self.cfg, self.db, "claude", "s-1", chaine)[1])
         # une re-liaison écrit pid_started_at et efface pid_start
         out = sb.bind(self.cfg, self.db, "alpha", session_id="s-1", harness="claude",
@@ -489,13 +489,13 @@ class PidRecycleTest(PgTestCase):
             with self.assertRaises(sb.BindError) as ctx:
                 sb.bind(self.cfg, self.db, "alpha", session_id="s-2", harness="claude",
                         pid=moi, by="human:proprio")
-            self.assertIn("invérifiable", str(ctx.exception))
-            self.assertIn("réutilisé", sb.for_hook(self.cfg, self.db, "claude", "s-1",
+            self.assertIn("cannot be verified", str(ctx.exception))
+            self.assertIn("reused", sb.for_hook(self.cfg, self.db, "claude", "s-1",
                                                    chaine)[1])
             self.assertIsNone(sb.by_ancestry(self.cfg, self.db, chaine))
         with mock.patch.object(platform, "ancestry",
                                side_effect=platform.NotAvailable("ascendance", "test")):
-            self.assertIn("invérifiable",
+            self.assertIn("cannot be verified",
                           sb.for_hook(self.cfg, self.db, "claude", "s-1")[1])
             self.assertIsNone(sb.by_ancestry(self.cfg, self.db))
 

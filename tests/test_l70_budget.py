@@ -109,10 +109,10 @@ class BudgetBaseTest(PgTestCase):
         self.assertEqual(book.over("a1", paid_harnesses=PAID, pace=False), "")
         book = self._book(hourly_usd=5.0, daily_usd=6.0)
         raison = book.over("a1", paid_harnesses=PAID, pace=False)
-        self.assertIn("budget journalier", raison)
-        self.assertIn("24 dernières heures", raison)
+        self.assertIn("daily budget", raison)
+        self.assertIn("last 24 hours", raison)
         book = self._book(hourly_usd=2.0, daily_usd=6.0)
-        self.assertIn("budget horaire", book.over("a2", paid_harnesses=PAID, pace=False))
+        self.assertIn("hourly budget", book.over("a2", paid_harnesses=PAID, pace=False))
         # L49 : l'agent au forfait n'est soumis à aucun de ces plafonds
         self.assertEqual(book.over("orch", paid_harnesses=PAID, pace=False), "")
 
@@ -122,11 +122,11 @@ class BudgetBaseTest(PgTestCase):
         book = self._book(hourly_usd=100.0, agent_limits={"a1": {3600: 2.0},
                                                           "a2": {86400: 1.0}})
         raison = book.over("a1", paid_harnesses=PAID, pace=False)
-        self.assertIn("de l'agent a1", raison)
+        self.assertIn("of agent a1", raison)
         self.assertEqual(book.over("a2", paid_harnesses=PAID, pace=False), "")
         self.assertEqual(book.over("all", paid_harnesses=PAID, pace=False), "")
         self._depense("a2", 0.6, il_y_a="5 hours")
-        self.assertIn("budget journalier de l'agent a2",
+        self.assertIn("daily budget of agent a2",
                       book.over("a2", paid_harnesses=PAID, pace=False))
 
     def test_precedence_base_config_defaut(self):
@@ -191,7 +191,7 @@ class BudgetBaseTest(PgTestCase):
             runner.dispatch({"channel": CHANNEL_BUDGET, "payload": "{}"})
             self.assertFalse(worker.budget_ok())              # réveil : relu
             ligne = registry.get(self.db, "b70")
-            self.assertIn("plafond 10.00", ligne["status_text"])
+            self.assertIn("cap 10.00", ligne["status_text"])
             # au délai, sans réveil : retrait du plafond en base → config
             storage.of(self.db).budgets.put("", 3600, None, actor="human:t")
             runner.budget_cache.ttl = 0.0
@@ -199,7 +199,7 @@ class BudgetBaseTest(PgTestCase):
             # plafond propre à l'agent, par jour
             storage.of(self.db).budgets.put("b70", 86400, 5.0, actor="human:t")
             raison = worker.budget_reason()
-            self.assertIn("budget journalier de l'agent b70", raison)
+            self.assertIn("daily budget of agent b70", raison)
         finally:
             worker.watchdog_stop.set()
 
@@ -218,7 +218,7 @@ class BudgetBaseTest(PgTestCase):
         proc = self.mesh("budget", "set", "--per-hour", "5",
                          env=self.env(AGENT_MAIL_NAME="malin"))
         self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn("refus", proc.stderr)
+        self.assertIn("refused", proc.stderr)
         self.assertEqual(storage.of(self.db).budgets.limits(), [])
         self.assertEqual(storage.of(self.db).budgets.events(5), [])
 
@@ -226,14 +226,14 @@ class BudgetBaseTest(PgTestCase):
         proc = self.mesh("budget", "set", "--per-hour", "5",
                          env=self.env(AMEESH_HUMANS="quelqu-un-d-autre", USER="intrus"))
         self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn("n'est pas membre humain", proc.stderr)
+        self.assertIn("is not a human member", proc.stderr)
 
     def test_cli_set_show_unset(self):
         env = self.env(AMEESH_HUMANS="chef", USER="chef")
         self._depense("a1", 1.25)
         proc = self.mesh("budget", "set", "--per-hour", "5", "--per-day", "40", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("aucun → 5.00 $", proc.stdout)
+        self.assertIn("none → 5.00 $", proc.stdout)
         lignes = {(r["scope"], r["window_s"]): r for r in storage.of(self.db).budgets.limits()}
         self.assertEqual(lignes[("", 3600)]["usd"], 5.0)
         self.assertEqual(lignes[("", 86400)]["set_by"], "human:chef")
@@ -250,7 +250,7 @@ class BudgetBaseTest(PgTestCase):
         proc = self.mesh("budget", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("5.00 $", proc.stdout)
-        self.assertIn("(base — human:chef", proc.stdout)
+        self.assertIn("(database — human:chef", proc.stdout)
         self.assertIn("a1", proc.stdout)
         proc = self.mesh("budget", "--json", env=env)
         data = json.loads(proc.stdout)
@@ -260,11 +260,11 @@ class BudgetBaseTest(PgTestCase):
         self.assertEqual(len(data["events"]), 3)
         proc = self.mesh("cost", "report", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("plafonds du mesh", proc.stdout)
+        self.assertIn("mesh caps", proc.stdout)
         self.assertIn("plafond de a1", proc.stdout)
         proc = self.mesh("progress", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("plafonds : 5.00/h (base) · 40.00/jour (base)", proc.stdout)
+        self.assertIn("caps: 5.00/h (base) · 40.00/day (base)", proc.stdout)
         proc = self.mesh("budget", "unset", "--per-hour", "--per-day", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual([r["scope"] for r in storage.of(self.db).budgets.limits()], ["a1"])

@@ -20,11 +20,11 @@ class StagnationAvailabilityTest(unittest.TestCase):
     def test_agent_inconnu_ou_arrete(self):
         detail = stagnation._waiting("start", "fantome")
         out = stagnation.with_availability(detail, {"vivant": "idle"})
-        self.assertEqual(out["label"], "démarrage par fantome (agent inconnu)")
+        self.assertEqual(out["label"], "start by fantome (agent unknown)")
         self.assertEqual(out["who_state"], "inconnu")
         out = stagnation.with_availability(stagnation._waiting("build", "dort"),
                                            {"dort": "stopped"})
-        self.assertEqual(out["label"], "travail de dort (agent arrêté)")
+        self.assertEqual(out["label"], "work by dort (agent stopped)")
 
     def test_agent_disponible_humain_et_sans_registre_inchanges(self):
         detail = stagnation._waiting("build", "vivant")
@@ -37,7 +37,7 @@ class StagnationAvailabilityTest(unittest.TestCase):
     def test_plusieurs_relecteurs(self):
         detail = stagnation._waiting("verdict", ["a", "b", "c"])
         out = stagnation.with_availability(detail, {"a": "idle", "b": "stopped"})
-        self.assertEqual(out["label"], "verdict de a, b, c (b arrêté, c inconnu)")
+        self.assertEqual(out["label"], "verdict by a, b, c (b stopped, c unknown)")
         self.assertEqual(out["who_state"], {"b": "arrêté", "c": "inconnu"})
 
 
@@ -51,7 +51,7 @@ class L36CliTest(PgTestCase):
         proc = self.mesh("list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.count("lots     :"), 1, proc.stdout)
-        self.assertIn("lots     : 3 (demande 3)", proc.stdout)
+        self.assertIn("lots     : 3 (request 3)", proc.stdout)
         lines = {line.split()[0]: line for line in proc.stdout.splitlines()
                  if line.startswith(("alpha", "beta"))}
         header = proc.stdout.splitlines()[0]
@@ -63,28 +63,28 @@ class L36CliTest(PgTestCase):
         # L37 (0030) : l'avertissement de L36 est devenu un refus
         proc = self.mesh("work", "add", "--title", "orphelin", "--assignee", "fantome")
         self.assertEqual(proc.returncode, 1, proc.stderr)
-        self.assertIn("fantome n'est pas dans le registre", proc.stderr)
+        self.assertIn("fantome is not in the registry", proc.stderr)
         self.assertEqual(work.list_items(self.db), [])
         # un lot hérité d'avant la garde (assigné disparu du registre) : l'attente le dit
         self.register("fantome", "claude", cwd=self.tmp)
         work.add(self.db, title="orphelin", assignee="fantome")
         self.db.execute("DELETE FROM agent_registry WHERE name = 'fantome'")
         proc = self.mesh("work", "list")
-        self.assertIn("démarrage par fantome (agent inconnu)", proc.stdout)
+        self.assertIn("start by fantome (agent unknown)", proc.stdout)
 
         self.register("dort", "claude", cwd=self.tmp)
         registry.set_status(self.db, "dort", "stopped", status_text="arrêté à la main",
                             stop_reason="manuel")
         proc = self.mesh("work", "add", "--title", "en panne", "--assignee", "dort")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("dort est arrêté (manuel)", proc.stderr)
+        self.assertIn("dort is stopped (manuel)", proc.stderr)
         proc = self.mesh("work", "list", "--json")
         rows = {r["title"]: r for r in json.loads(proc.stdout)}
         self.assertEqual(rows["en panne"]["waiting_for"]["who_state"], "arrêté")
         proc = self.mesh("progress", "--json")
         lots = {lot["title"]: lot for lot in json.loads(proc.stdout)["lots"]}
         self.assertEqual(lots["orphelin"]["waiting_for"]["label"],
-                         "démarrage par fantome (agent inconnu)")
+                         "start by fantome (agent unknown)")
 
     def test_hook_sans_bail_n_ecrase_pas_la_session(self):
         self.register("alpha", "claude", cwd=self.tmp, session="session-du-runner")

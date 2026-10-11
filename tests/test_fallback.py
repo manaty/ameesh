@@ -25,8 +25,8 @@ class FallbackTest(PgTestCase):
         proc = self.cli("send", "beta", "via les fichiers",
                         env=self.env_bad(AGENT_MAIL_NAME="alpha"))
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual(proc.stdout.strip(), "déposé pour : beta")
-        self.assertIn("repli sur les fichiers", proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "dropped for: beta")
+        self.assertIn("falling back to files", proc.stderr)
         self.assertIn(UNREACHABLE.split("@")[1], proc.stderr)  # le DSN est montré
         fichiers = os.listdir(os.path.join(self.v0state, "inbox", "beta"))
         self.assertEqual(len(fichiers), 1)
@@ -40,7 +40,7 @@ class FallbackTest(PgTestCase):
         # un message déposé pendant que la base est absente
         self.cli("send", "beta", "coucou", env=self.env_bad(AGENT_MAIL_NAME="alpha"))
         proc = self.cli("inbox", "beta", env=self.env_bad())
-        self.assertEqual(proc.stdout.strip(), "de alpha : coucou")
+        self.assertEqual(proc.stdout.strip(), "from alpha: coucou")
 
         # le hook enregistre l'agent dans l'état fichier v0
         payload = json.dumps({"hook_event_name": "SessionStart", "cwd": self.tmp,
@@ -105,7 +105,7 @@ class FallbackTest(PgTestCase):
         proc = self.cli("send", "beta", "message signé", "--sign", "--key", private,
                         env=self.env_bad(AGENT_MAIL_NAME="proprietaire"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("déposé pour : beta", proc.stdout)
+        self.assertIn("dropped for: beta", proc.stdout)
         self.assertIn("signature n'est pas conservée", proc.stderr)
         fichiers = os.listdir(os.path.join(self.v0state, "inbox", "beta"))
         self.assertEqual(len(fichiers), 1)

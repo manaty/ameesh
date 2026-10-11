@@ -55,20 +55,20 @@ def _read_private(path: str, what: str) -> tuple[bytes, tuple]:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
                      | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError as exc:
-        raise ApproveConfigError("TLS local : %s introuvable : %s" % (what, path)) from exc
+        raise ApproveConfigError("local TLS: %s not found: %s" % (what, path)) from exc
     except OSError as exc:
         # ELOOP : le chemin est un lien symbolique
-        raise ApproveConfigError("TLS local : %s %s illisible ou lien symbolique (fichier "
-                                 "régulier attendu, pas un lien) : %s"
+        raise ApproveConfigError("local TLS: %s %s unreadable or a symbolic link (regular "
+                                 "file expected, not a link): %s"
                                  % (what, path, exc.strerror)) from exc
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            raise ApproveConfigError("TLS local : %s %s : fichier régulier attendu (pas un "
-                                     "lien ; déposer par renommage atomique)" % (what, path))
-        _check_private(st, "TLS local : " + what, path)
+            raise ApproveConfigError("local TLS: %s %s: regular file expected (not a "
+                                     "link; deploy by atomic rename)" % (what, path))
+        _check_private(st, "local TLS: " + what, path)
         if st.st_size > MAX_PEM:
-            raise ApproveConfigError("TLS local : %s %s : fichier trop gros" % (what, path))
+            raise ApproveConfigError("local TLS: %s %s: file too large" % (what, path))
         chunks, total = [], 0
         while True:
             chunk = os.read(fd, 65536)
@@ -76,7 +76,7 @@ def _read_private(path: str, what: str) -> tuple[bytes, tuple]:
                 break
             total += len(chunk)
             if total > MAX_PEM:
-                raise ApproveConfigError("TLS local : %s %s : fichier trop gros" % (what, path))
+                raise ApproveConfigError("local TLS: %s %s: file too large" % (what, path))
             chunks.append(chunk)
     finally:
         os.close(fd)
@@ -106,7 +106,7 @@ def _context_from_bytes(cert: bytes, key: bytes, workdir: str | None = None
         try:
             context.load_cert_chain(paths[0], paths[1])
         except (ssl.SSLError, OSError, ValueError) as exc:
-            raise ApproveConfigError("TLS local : certificat ou clé inutilisable (%s)"
+            raise ApproveConfigError("local TLS: unusable certificate or key (%s)"
                                      % type(exc).__name__) from exc
     finally:
         shutil.rmtree(directory, ignore_errors=True)
@@ -118,13 +118,13 @@ def _identity(path: str, what: str) -> tuple:
     try:
         st = os.lstat(path)
     except FileNotFoundError as exc:
-        raise ApproveConfigError("TLS local : %s introuvable : %s" % (what, path)) from exc
+        raise ApproveConfigError("local TLS: %s not found: %s" % (what, path)) from exc
     except OSError as exc:
-        raise ApproveConfigError("TLS local : %s illisible %s : %s" % (what, path, exc)) from exc
+        raise ApproveConfigError("local TLS: %s unreadable %s: %s" % (what, path, exc)) from exc
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-        raise ApproveConfigError("TLS local : %s %s : fichier régulier attendu (pas un lien ; "
-                                 "déposer par renommage atomique)" % (what, path))
-    _check_private(st, "TLS local : " + what, path)
+        raise ApproveConfigError("local TLS: %s %s: regular file expected (not a link; "
+                                 "deploy by atomic rename)" % (what, path))
+    _check_private(st, "local TLS: " + what, path)
     return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
 
 
@@ -143,11 +143,11 @@ class TlsReloader:
         self._load()            # au démarrage, tout refus est fatal
 
     def _identities(self) -> tuple:
-        return (_identity(self.cert, "certificat"), _identity(self.key, "clé privée"))
+        return (_identity(self.cert, "certificate"), _identity(self.key, "private key"))
 
     def _load(self) -> None:
-        cert, cert_id = _read_private(self.cert, "certificat")
-        key, key_id = _read_private(self.key, "clé privée")
+        cert, cert_id = _read_private(self.cert, "certificate")
+        key, key_id = _read_private(self.key, "private key")
         context = _context_from_bytes(cert, key, self.workdir)
         self._context = context
         # identité des fichiers EFFECTIVEMENT lus : un fichier remplacé après
@@ -164,15 +164,15 @@ class TlsReloader:
             try:
                 changed = self._force or self._identities() != self._signature
             except ApproveConfigError as exc:
-                log.warning("%s — certificat précédent conservé", exc)
+                log.warning("%s; previous certificate kept", exc)
                 return self._context
             if changed:
                 self._force = False
                 try:
                     self._load()
-                    log.info("TLS local : certificat rechargé")
+                    log.info("local TLS: certificate reloaded")
                 except ApproveConfigError as exc:
-                    log.warning("%s — certificat précédent conservé", exc)
+                    log.warning("%s; previous certificate kept", exc)
             return self._context
 
     def wrap(self, sock):

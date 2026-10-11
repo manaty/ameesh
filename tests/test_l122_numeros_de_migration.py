@@ -88,7 +88,7 @@ class ReservationTest(PgTestCase):
         rb = work.reserve_migration(self.db, b["id"], repo=self.tmp, actor="dev2")
         self.assertEqual(rb["migration"], self.floor + 1)
         notes = [e["note"] for e in work.events(self.db, a["id"])]
-        self.assertIn("migration %04d réservée" % self.floor, notes)
+        self.assertIn("migration %04d reserved" % self.floor, notes)
         # visible dans work show
         proc = self.mesh("work", "show", str(b["id"]))
         self.assertEqual(proc.returncode, 0, proc.stderr)

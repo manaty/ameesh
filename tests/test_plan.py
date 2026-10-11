@@ -309,7 +309,7 @@ class PackageSyncTest(_PlanDb):
         self.assertEqual((row["package_id"], row["package_parent"]), ("catalogue", "v1"))
         row = work.link(self.db, item["id"], None)
         self.assertIsNone(row["package_id"])
-        self.assertEqual(work.events(self.db, item["id"])[0]["note"], "plan : détaché")
+        self.assertEqual(work.events(self.db, item["id"])[0]["note"], "plan: unlinked")
 
 
 class CloseTest(_PlanDb):
@@ -331,7 +331,7 @@ class CloseTest(_PlanDb):
         self.assertIsNotNone(row["closed_ts"])
         ms = work.milestones(self.db, a["id"])
         self.assertEqual(ms[0]["kind"], "closed")
-        self.assertEqual(ms[0]["note"], "remplacé par #%d — refait" % b["id"])
+        self.assertEqual(ms[0]["note"], "superseded by #%d — refait" % b["id"])
         with self.assertRaises(work.WorkError):
             work.close(self.db, a["id"], abandoned=True)         # déjà fermé
         with self.assertRaises(work.WorkError):
@@ -357,7 +357,7 @@ class CloseTest(_PlanDb):
         work.close(self.db, b["id"], abandoned=True)
         refused = work.close_merged(self.db, b["id"], sha=SHA, pr_ref="acme/web#4")
         self.assertEqual(refused["result"], "refused")
-        self.assertIn("aucune réouverture", refused["detail"])
+        self.assertIn("not reopened", refused["detail"])
         self.assertEqual(work.get(self.db, b["id"])["state"], "closed")
 
 
@@ -625,11 +625,11 @@ class ProgressPlanTest(_PlanDb):
                                   stale_after=12 * 3600)
         self.assertIsNone({l["id"]: l for l in loose["lots"]}[c["id"]]["stale"])
         text = progress.format_text(snap, width=100)
-        self.assertIn("STAGNANT", text)
-        self.assertIn("attend : verdict", text)
+        self.assertIn("STALE", text)
+        self.assertIn("waiting for: verdict", text)
         self.assertIn("EPICS (2)", text)
-        self.assertIn("catalogue — Catalogue des produits : 1/2 lots fusionnés", text)
-        self.assertIn("abandonné", text)
+        self.assertIn("catalogue — Catalogue des produits: 1/2 lots merged", text)
+        self.assertIn("abandoned", text)
         html = progress.render_html(snap)
         self.assertIn('"epics"', html)
         self.assertIn("stagnant", html)
@@ -729,13 +729,13 @@ class PlanCliTest(_PlanDb):
         self.assertIn("(plan : cat-export)", out.stdout)
         out = self.mesh("work", "add", "--title", "x", "--package", "inconnue")
         self.assertEqual(out.returncode, 1)
-        self.assertIn("fiche WorkPackage inconnue", out.stderr)
+        self.assertIn("unknown WorkPackage card", out.stderr)
         out = self.mesh("work", "add", "--title", "autre")
         out = self.mesh("work", "list")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("EPIC", out.stdout)
         self.assertIn("catalogue", out.stdout)
-        self.assertIn("attend : attribution (lot non assigné)", out.stdout)
+        self.assertIn("assignment (lot unassigned)", out.stdout)
         for table, column in (("work_items", "updated_at"), ("work_items", "created_at"),
                               ("work_item_events", "created_at"),
                               ("work_item_milestones", "at")):
@@ -857,7 +857,7 @@ class ContentMergeTest(_PlanDb):
         self.assertEqual((results[b["id"]]["result"], results[b["id"]]["how"]),
                          ("open", None))   # squash + autre fichier : diff différent
         self.assertEqual(results[never["id"]]["result"], "open")
-        self.assertIn("absents", results[never["id"]]["detail"])
+        self.assertIn("missing from", results[never["id"]]["detail"])
         self.assertEqual(work.get(self.db, never["id"])["state"], "qa")
         # un squash exact (même diff) est reconnu
         git(self.repo, "reset", "-q", "--hard", "main~1")
@@ -1031,7 +1031,7 @@ class ContentMergeTest(_PlanDb):
         bare = work.add(self.db, title="sans gel")
         self.assertEqual(self.run_sync()[bare["id"]]["result"], "no-commit")
         absent = self.frozen("commit inconnu", "c" * 40)
-        self.assertIn("absent du dépôt", self.run_sync()[absent["id"]]["detail"])
+        self.assertIn("not in the repository", self.run_sync()[absent["id"]]["detail"])
         with self.assertRaises(plan_git.MergeProbeError):
             plan_git.sync_merges(self.db, self.repo, target="origin/nulle-part")
 
@@ -1059,7 +1059,7 @@ class ContentMergeTest(_PlanDb):
         self.assertEqual(work.get(self.db, by_pr["id"])["state"], "merged")
         out = self.mesh("work", "sync-merges", "--git-dir", self.repo, "--target", "absente")
         self.assertEqual(out.returncode, 1)
-        self.assertIn("introuvable", out.stderr)
+        self.assertIn("not found", out.stderr)
 
 
 if __name__ == "__main__":

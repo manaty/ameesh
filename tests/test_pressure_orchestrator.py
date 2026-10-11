@@ -148,7 +148,7 @@ class PressionTest(PgTestCase):
             self.executeur.host_pressure(now=self.executeur._pressure_at + 11.0)
         pression = [l for l in lignes if "pression de l'hôte" in l]
         self.assertEqual(len(pression), 2, lignes)
-        self.assertIn("début — mémoire disponible", pression[0])
+        self.assertIn("available memory", pression[0])
         self.assertIn("sauf ceux d'un orchestrateur", pression[0])
         self.assertRegex(pression[1], r"fin — de \d\d:\d\d:\d\d à \d\d:\d\d:\d\d \(\d+ s\)")
         self.assertIn("2 tour(s) retardé(s) (a, b)", pression[1])

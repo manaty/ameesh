@@ -86,9 +86,9 @@ class L41LiaisonsTest(PgTestCase):
         pid = str(os.getpid())
         proc = self.bind("alpha", "--session", "s-1", "--harness", "claude", "--pid", pid)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("session claude s-1 liée à alpha", proc.stdout)
+        self.assertIn("session claude s-1 bound to alpha", proc.stdout)
         # L46 : un agent inconnu est inscrit à la liaison, comme externe
-        self.assertIn("inscrit comme agent externe", proc.stderr)
+        self.assertIn("registered as an external", proc.stderr)
         self.assertEqual(registry.get(self.db, "alpha")["mode"], "externe")
 
         proc = self.cli("bindings", "--json", env=self.unbound_env())
@@ -104,22 +104,22 @@ class L41LiaisonsTest(PgTestCase):
 
         # idempotent pour le même agent ; le PID se met à jour
         proc = self.bind("alpha", "--session", "s-1", "--harness", "claude", "--pid", pid)
-        self.assertIn("déjà liée", proc.stdout)
+        self.assertIn("already bound", proc.stdout)
         proc = self.bind("alpha", "--session", "s-1", "--harness", "claude", "--pid", "4242")
-        self.assertIn("re-liée", proc.stdout)
+        self.assertIn("re-bound", proc.stdout)
         self.assertEqual([r["pid"] for r in self.active()], [4242])
 
         # journalisé dans le fil
         excerpts = " ".join(r["last_excerpt"] for r in self.db.query(
             "SELECT last_excerpt FROM thread_index"))
-        self.assertIn("liée à alpha", excerpts)
+        self.assertIn("bound to alpha", excerpts)
 
         proc = self.cli("unbind", "--session", "s-1", "--harness", "claude",
                         env=self.unbound_env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("liaison révoquée", proc.stdout)
+        self.assertIn("binding revoked", proc.stdout)
         self.assertEqual(self.active(), [])
-        self.assertIn("aucune liaison", self.cli("bindings", env=self.unbound_env()).stdout)
+        self.assertIn("no session binding", self.cli("bindings", env=self.unbound_env()).stdout)
         proc = self.cli("bindings", "--all", "--json", env=self.unbound_env())
         [row] = json.loads(proc.stdout)
         self.assertIsNotNone(row["revoked_ts"])
@@ -129,7 +129,7 @@ class L41LiaisonsTest(PgTestCase):
         # révoquée, la session se relie (à un autre agent, même)
         proc = self.bind("beta", "--session", "s-1", "--harness", "claude")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("pid non contrôlé", proc.stdout)
+        self.assertIn("pid not checked", proc.stdout)
 
     def test_bind_par_ameesh_mail(self):
         proc = self.mesh("mail", "bind", "alpha", "--session", "s-9", "--harness", "codex",
@@ -139,13 +139,13 @@ class L41LiaisonsTest(PgTestCase):
                          [("alpha", "codex")])
         proc = self.mesh("mail", "bind", "--help", env=self.unbound_env())
         self.assertEqual(proc.returncode, 0)
-        self.assertIn("agent-mail bind <NOM> --session ID", proc.stdout)
+        self.assertIn("agent-mail bind <NAME> --session ID", proc.stdout)
 
     def test_refus_bail_vivant(self):
         self.give_lease("mene")
         proc = self.bind("mene", "--session", "s-2", "--harness", "codex")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("bail vivant", proc.stderr)
+        self.assertIn("live lease", proc.stderr)
         self.assertEqual(self.active(), [])
 
     def test_refus_session_deja_liee_a_un_autre(self):
@@ -153,7 +153,7 @@ class L41LiaisonsTest(PgTestCase):
                                    "claude").returncode, 0)
         proc = self.bind("beta", "--session", "s-3", "--harness", "claude")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("déjà liée à alpha", proc.stderr)
+        self.assertIn("already bound to alpha", proc.stderr)
         # même identifiant, autre harnais : autre session
         self.assertEqual(self.bind("beta", "--session", "s-3", "--harness",
                                    "codex").returncode, 0)
@@ -187,15 +187,15 @@ class L41LiaisonsTest(PgTestCase):
             }}, fh)
         proc = self.bind("--import", path)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("liaisons importées : 2 ; ignorées : 5", proc.stdout)
-        self.assertIn("importée : s-ok → auteur-externe (claude, pid 329470)", proc.stdout)
-        self.assertIn("importée : s-sans-pid → acme-docs (claude, pid non contrôlé)",
+        self.assertIn("bindings imported: 2; skipped: 5", proc.stdout)
+        self.assertIn("imported: s-ok → auteur-externe (claude, pid 329470)", proc.stdout)
+        self.assertIn("imported: s-sans-pid → acme-docs (claude, pid not checked)",
                       proc.stdout)
-        self.assertRegex(proc.stdout, r"ignorée  : s-codex — .*bail vivant")
-        self.assertRegex(proc.stdout, r"ignorée  : s-pris — .*déjà liée à autre")
-        self.assertRegex(proc.stdout, r"ignorée  : s-vim — harnais invalide")
-        self.assertRegex(proc.stdout, r"ignorée  : s-nom — nom d'agent invalide")
-        self.assertRegex(proc.stdout, r"ignorée  : s-texte — entrée illisible")
+        self.assertRegex(proc.stdout, r"skipped : s-codex — .*live lease")
+        self.assertRegex(proc.stdout, r"skipped : s-pris — .*already bound to autre")
+        self.assertRegex(proc.stdout, r"skipped : s-vim — invalid harness")
+        self.assertRegex(proc.stdout, r"skipped : s-nom — invalid agent name")
+        self.assertRegex(proc.stdout, r"skipped : s-texte — unreadable entry")
         actives = {r["session_id"]: r for r in self.active()}
         self.assertEqual(sorted(actives), ["s-ok", "s-pris", "s-sans-pid"])
         self.assertEqual(actives["s-ok"]["pid"], 329470)
@@ -203,8 +203,8 @@ class L41LiaisonsTest(PgTestCase):
 
         # un second import ne change rien
         proc = self.bind("--import", path)
-        self.assertIn("liaisons importées : 0 ; ignorées : 7", proc.stdout)
-        self.assertIn("déjà liée à auteur-externe (identique)", proc.stdout)
+        self.assertIn("bindings imported: 0; skipped: 7", proc.stdout)
+        self.assertIn("already bound to auteur-externe (identical)", proc.stdout)
 
         self.assertEqual(self.bind("--import", os.path.join(self.tmp, "absent.json"))
                          .returncode, 1)
@@ -235,8 +235,8 @@ class L41LiaisonsTest(PgTestCase):
         # L46 : un agent `execute` ne se lie que de force
         proc = self.bind("alpha", "--session", "s-ext", "--harness", "claude")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("agent mené par l'exécuteur ; une session externe lui volerait "
-                      "son courrier", proc.stderr)
+        self.assertIn("agent driven by the runner; an external session would steal "
+                      "its mail", proc.stderr)
         proc = self.bind("alpha", "--session", "s-ext", "--harness", "claude", "--force")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.send("alpha", "Bonjour.")
@@ -279,7 +279,7 @@ class L41LiaisonsTest(PgTestCase):
             proc = self.hook("s-1")
             self.assertEqual(proc.returncode, 0)
             self.assertEqual(proc.stdout, "")
-            self.assertIn("ascendance", proc.stderr)
+            self.assertIn("ancestry", proc.stderr)
             self.assertEqual(self.undelivered("alpha"), 1)
             # inscrit par la liaison (L46 : externe) : le hook n'a rien enregistré
             row = registry.get(self.db, "alpha")
@@ -297,7 +297,7 @@ class L41LiaisonsTest(PgTestCase):
         self.give_lease("alpha")
         proc = self.hook("s-1")
         self.assertEqual(proc.stdout, "")
-        self.assertIn("mené par l'exécuteur", proc.stderr)
+        self.assertIn("driven by the runner", proc.stderr)
         self.assertEqual(self.undelivered("alpha"), 1)
 
     def test_agent_mail_name_reste_prioritaire(self):
@@ -314,23 +314,23 @@ class L41LiaisonsTest(PgTestCase):
         env = self.unbound_env()
         proc = self.cli("whoami", env=env)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("identité non liée", proc.stderr)
+        self.assertIn("unbound identity", proc.stderr)
 
         self.bind("alpha", "--session", "s-1", "--harness", "claude",
                   "--pid", str(os.getpid()))
         proc = self.cli("whoami", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(),
-                         "alpha [session] liaison claude s-1 sur %s, pid %d, par %s"
+                         "alpha [session] binding claude s-1 on %s, pid %d, by %s"
                          % (self.cfg.host, os.getpid(), self.active()[0]["created_by"]))
         proc = self.cli("whoami", "--session", "s-1", "--harness", "claude", env=env)
-        self.assertTrue(proc.stdout.startswith("alpha [session] liaison claude s-1"))
+        self.assertTrue(proc.stdout.startswith("alpha [session] binding claude s-1"))
         proc = self.cli("whoami", "--session", "s-2", "--harness", "claude", env=env)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("non liée", proc.stderr)
+        self.assertIn("unbound", proc.stderr)
         # le diagnostic de dossier reste un diagnostic
         proc = self.cli("whoami", "--cwd", self.tmp, env=env)
-        self.assertIn("non autoritaire", proc.stdout)
+        self.assertIn("not authoritative", proc.stdout)
         # une commande lancée dans la session liée parle en son nom
         registry.upsert(self.db, "beta", harness="codex", host=self.cfg.host)
         proc = self.cli("send", "beta", "Réponse d'alpha.", env=env)

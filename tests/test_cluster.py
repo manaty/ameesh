@@ -88,7 +88,7 @@ class ProbeTest(PgTestCase):
         for via in ("main", "cli"):
             proc = self.probe(self.schema, via)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertIn("sonde : OK", proc.stdout)
+            self.assertIn("probe: OK", proc.stdout)
             # sonde légère : ni comptage, ni NOTIFY
             self.assertNotIn("agents", proc.stdout)
             self.assertNotIn("notify", proc.stdout)

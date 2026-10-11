@@ -609,7 +609,7 @@ class ProjectorTest(_Base):
 
         notifier._projector = Boom()
         notifier.run_pass(self.db, current=[])               # jamais fatal au passage
-        self.assertIn("issues GitHub : passage en échec (boum)", logs)
+        self.assertIn("GitHub issues: pass failed (boum)", logs)
         plain = notify.Notifier(self.cfg, notify.parse_config({}), log=logs.append)
         plain.run_pass(self.db, current=[])
         self.assertIsNone(plain._projector)

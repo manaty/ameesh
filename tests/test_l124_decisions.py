@@ -679,8 +679,8 @@ class VisibiliteTest(_Base):
                          [(ALICE, "alerte", "envoyee")])
         (_canal, message), = sender.sent
         self.assertTrue(message.urgent)
-        self.assertIn("décision attendue", message.title)
-        self.assertIn("décision #1", message.body)
+        self.assertIn("decision pending", message.title)
+        self.assertIn("decision #1", message.body)
         self.answer(view["id"], "a")
         records = notifier.run_pass(self.db)
         self.assertEqual([(r["event"], r["type"], r["delivery"]) for r in records],
@@ -700,7 +700,7 @@ class VisibiliteTest(_Base):
         self.assertIn("(dont 1 urgente)", first)
         autre = projects.snapshot(self.db, paid_harnesses=(), viewer=BOB)
         self.assertEqual(autre["decisions"]["mine"], 0)
-        self.assertTrue(projects.format_text(autre, 120).startswith("projets — "))
+        self.assertTrue(projects.format_text(autre, 120).startswith("projects — "))
         agent = projects.snapshot(self.db, paid_harnesses=())
         self.assertTrue(projects.format_text(agent, 120).startswith(
             "2 décisions attendent un humain"))

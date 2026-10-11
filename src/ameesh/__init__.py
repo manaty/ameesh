@@ -29,6 +29,6 @@ def version() -> str:
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
     except OSError:
-        return "inconnue"
+        return "unknown"
     found = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
-    return found.group(1) if found else "inconnue"
+    return found.group(1) if found else "unknown"

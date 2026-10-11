@@ -124,13 +124,13 @@ class DoctorTest(unittest.TestCase):
         lines = self._lines({"ameesh-runner-agent@a.service": self._show(6 * GIB),
                              "ameesh-runner-agent@b.service": self._show(6 * GIB)})
         self.assertEqual(len(lines), 1)
-        self.assertIn("2 unité(s)", lines[0])
+        self.assertIn("2 agent unit(s)", lines[0])
 
     def test_sans_plafond_hors_slice(self):
         lines = self._lines({"ameesh-runner-agent@a.service":
                              self._show("infinity", "app.slice")})
         texte = "\n".join(lines)
-        self.assertIn("aucun plafond mémoire", texte)
+        self.assertIn("no memory cap", texte)
         self.assertIn("slice app.slice", texte)
         self.assertIn("systemctl --user set-property ameesh-runner-agent@a.service "
                       "MemoryMax=6144M MemoryHigh=5529M", texte)
@@ -138,19 +138,19 @@ class DoctorTest(unittest.TestCase):
     def test_ecart_au_canon(self):
         canons = [_canon("ameesh", "vm", agent_memory_max_by_agent={"a": 8 * GIB})]
         lines = self._lines({"ameesh-runner-agent@a.service": self._show(6 * GIB)}, canons)
-        self.assertIn("MemoryMax 6144M, le canon dit 8192M (ameesh)", lines[0])
+        self.assertIn("MemoryMax 6144M, the canon says 8192M (ameesh)", lines[0])
         self.assertIn("MemoryMax=8192M MemoryHigh=7372M", lines[1])
 
     def test_memoire_non_deleguee(self):
         lines = self._lines({"ameesh-runner-agent@a.service": self._show(6 * GIB)},
                             controllers=lambda: {"cpu", "pids"})
-        self.assertTrue(any("non délégué" in line for line in lines))
+        self.assertTrue(any("not delegated" in line for line in lines))
 
     def test_sans_systemd(self):
         with mock.patch.object(hostcheck, "served_agents", return_value=[{"name": "a"}]):
             lines = hostcheck.memory_cap_lines(SimpleNamespace(host="vm"), None, canons=[],
                                                run=lambda *a: None)
-        self.assertIn("non vérifiés", lines[0])
+        self.assertIn("not checked", lines[0])
 
 
 if __name__ == "__main__":

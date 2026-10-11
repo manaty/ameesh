@@ -32,9 +32,9 @@ INVALID = object()
 
 #: reprise quand le résumé n'a pas pu être produit sous l'ancien compte
 FALLBACK_RESUME = (
-    "Reprise après une bascule de compte : la session précédente (%s), ouverte sous "
-    "le compte %s, ne peut pas être reprise sous le compte %s et n'a pas pu être "
-    "résumée. Relis le fil de ton projet et l'état de ton lot avant de continuer."
+    "Resuming after an account switch: the previous session (%s), opened under "
+    "account %s, cannot be resumed under account %s and could not be "
+    "summarized. Reread your project thread and the state of your lot before continuing."
 )
 
 
@@ -59,7 +59,7 @@ def choose(worker, book=None, *, pause: bool = True) -> str | None:
     try:
         items = accounts.profiles(worker.cfg, harness)
     except accounts.AccountError as exc:
-        return "configuration des comptes invalide : %s" % exc if pause else None
+        return "invalid account configuration: %s" % exc if pause else None
     if not items:
         return None
     if book is None:
@@ -76,7 +76,7 @@ def choose(worker, book=None, *, pause: bool = True) -> str | None:
         raise
     except db_mod.DbError as exc:
         # sans état des comptes, on ne sait pas quel compte est sous le seuil
-        return ("état des comptes indisponible (%s)" % db_mod.explain(exc)
+        return ("account state unavailable (%s)" % db_mod.explain(exc)
                 if pause else None)
     if choice.switched:
         journal(worker, harness, choice.switched)
@@ -125,8 +125,8 @@ def log_choice(worker, harness: str, choice) -> None:
     if getattr(worker, "_account_choice_logged", None) == cle:
         return
     worker._account_choice_logged = cle
-    _log("[%s] compte %s : %s — %s" % (worker.name, harness, choice.profile.name,
-                                      choice.why or "seul compte utilisable"))
+    _log("[%s] account %s: %s — %s" % (worker.name, harness, choice.profile.name,
+                                      choice.why or "only usable account"))
 
 
 def journal(worker, harness: str, switched: dict) -> None:
@@ -135,9 +135,9 @@ def journal(worker, harness: str, switched: dict) -> None:
     La ligne `account_switches` est déjà écrite (même transaction que le
     changement de compte) ; ici, la trace lisible.
     """
-    texte = ("Bascule de compte %s : %s → %s (%s). Les nouvelles sessions vont au "
-             "compte %s ; une session en cours garde son compte tant qu'il est sous "
-             "son seuil (0034)." % (harness, switched["from"], switched["to"],
+    texte = ("Account switch %s: %s → %s (%s). New sessions go to "
+             "account %s; a running session keeps its account while it is under "
+             "its threshold (0034)." % (harness, switched["from"], switched["to"],
                                     switched["reason"], switched["to"]))
     _log("[%s] %s" % (worker.name, texte))
     worker._fil_note(texte, meta={"action": "compte", "type": switched["kind"],
@@ -157,7 +157,7 @@ def for_turn(worker):
     try:
         items = accounts.profiles(worker.cfg, harness)
     except accounts.AccountError as exc:
-        worker._account_error = "configuration des comptes invalide : %s" % exc
+        worker._account_error = "invalid account configuration: %s" % exc
         return INVALID
     if not items:
         return None
@@ -168,7 +168,7 @@ def for_turn(worker):
     except db_mod.Unavailable:
         raise  # panne de base (L72) : la consigne est remise, pas d'échec de tour
     except db_mod.DbError as exc:
-        worker._account_error = "état des comptes indisponible : %s" % db_mod.explain(exc)
+        worker._account_error = "account state unavailable: %s" % db_mod.explain(exc)
         return INVALID
 
 
@@ -181,17 +181,17 @@ def apply(worker, env: dict, compte) -> bool:
     l'hôte, rien ne change.
     """
     if compte is INVALID:
-        message = getattr(worker, "_account_error", "") or "compte indisponible"
-        _log("[%s] %s : tour non lancé" % (worker.name, message))
-        worker.fail_turn("compte indisponible", message)
+        message = getattr(worker, "_account_error", "") or "account unavailable"
+        _log("[%s] %s: turn not started" % (worker.name, message))
+        worker.fail_turn("account unavailable", message)
         return False
     try:
         declared = accounts.parse(getattr(worker.cfg, "accounts", None) or {})
         if declared:
             accounts.launch_env(env, declared, compte)
     except accounts.AccountError as exc:
-        _log("[%s] %s : tour non lancé" % (worker.name, exc))
-        worker.fail_turn("compte inutilisable", str(exc))
+        _log("[%s] %s: turn not started" % (worker.name, exc))
+        worker.fail_turn("account unusable", str(exc))
         return False
     return True
 
@@ -204,7 +204,7 @@ def mark(worker, events_path: str, compte) -> None:
         with open(events_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(ligne, ensure_ascii=False) + "\n")
     except OSError as exc:
-        _log("[%s] marqueur de compte non écrit (%s)" % (worker.name, exc))
+        _log("[%s] account marker not written (%s)" % (worker.name, exc))
     worker._compte_session = compte.name
 
 
@@ -274,8 +274,8 @@ def continuity(worker) -> None:
     else:
         old = accounts.by_name(items, previous)
     if accounts.session_portable(harness, old, new):
-        texte = ("Bascule de compte %s : la session %s, ouverte sous le compte %s, est "
-                 "reprise telle quelle sous le compte %s (stockage de sessions partagé)."
+        texte = ("Account switch %s: session %s, opened under account %s, is "
+                 "resumed as is under account %s (shared session storage)."
                  % (harness, session, old.name, new.name))
         _log("[%s] %s" % (worker.name, texte))
         worker._fil_note(texte, meta={"action": "compte", "session": session,
@@ -288,7 +288,7 @@ def continuity(worker) -> None:
             if worker.agent is not None:
                 worker.agent["session_account"] = new.name
         except db_mod.DbError as exc:
-            _log("[%s] compte de session non noté (%s)" % (worker.name, exc))
+            _log("[%s] session account not recorded (%s)" % (worker.name, exc))
         return
     if not worker.peek():
         return
@@ -306,7 +306,7 @@ def summary_possible(old, book, items, now: float | None = None) -> tuple[bool, 
     utilisable pour un résumé — c'est la règle de 0027.
     """
     if old is None:
-        return False, "compte retiré de la configuration"
+        return False, "account removed from the configuration"
     problems = accounts.check(old)
     if problems:
         return False, "; ".join(problems)
@@ -317,16 +317,16 @@ def summary_possible(old, book, items, now: float | None = None) -> tuple[bool, 
         gauges = []
     for gauge in gauges:
         if float(gauge.used_at(now) or 0.0) >= 1.0:  # échue : 0 % (L71)
-            return False, "forfait %s %s saturé (%.0f %%)" % (
+            return False, "plan %s %s saturated (%.0f %%)" % (
                 old.harness, gauge.key, float(gauge.used) * 100)
     return True, ""
 
 
 def rotate(worker, harness: str, old, new, session: str) -> bool:
     """Rotation avec résumé de reprise (mécanisme L11) pour une bascule de compte."""
-    nom_ancien = old.name if old is not None else "(retiré)"
-    _log("[%s] bascule de compte %s : session %s (compte %s) non reprenable sous %s — "
-         "rotation avec résumé" % (worker.name, harness, session, nom_ancien, new.name))
+    nom_ancien = old.name if old is not None else "(removed)"
+    _log("[%s] account switch %s: session %s (account %s) cannot be resumed under %s — "
+         "rotation with summary" % (worker.name, harness, session, nom_ancien, new.name))
     resume = ""
     possible = old is not None and not accounts.check(old)
     if possible:
@@ -360,15 +360,15 @@ def rotate(worker, harness: str, old, new, session: str) -> bool:
             resume = note + "\n\n" + reprise.deterministic_brief(
                 worker.cfg, worker.db, registry.get(worker.db, worker.name) or worker.agent,
                 session=session, account=old,
-                reason="bascule de compte %s : %s → %s" % (harness, nom_ancien, new.name),
-                consigne="La consigne de ce tour suit ce brief : reprends ton travail à "
-                         "partir de là, et termine chaque tour par un état clair.")
+                reason="account switch %s: %s → %s" % (harness, nom_ancien, new.name),
+                consigne="This turn's instruction follows this brief: resume your work "
+                         "from there, and end each turn with a clear status.")
         except Exception as exc:  # un brief manquant ne bloque jamais la rotation
-            _log("[%s] brief de reprise déterministe indisponible (%s)" % (worker.name, exc))
+            _log("[%s] deterministic resume brief unavailable (%s)" % (worker.name, exc))
     worker._session_history(session, note)
     if not registry.clear_session(worker.db, worker.name, worker.runner.runner_id,
                                   worker.epoch):
-        _log("[%s] rotation de bascule annulée : bail perdu avant l'effacement" % worker.name)
+        _log("[%s] switch rotation cancelled: lease lost before clearing" % worker.name)
         return False
     worker.resume_summary = resume
     # le cadre de reprise dit qui a écrit le bloc : l'agent, ou ameesh (L39)
@@ -382,11 +382,11 @@ def rotate(worker, harness: str, old, new, session: str) -> bool:
     worker.session_tokens = 0.0
     worker._compte_session = None
     worker._fil_note(
-        "Bascule de compte %s : la session %s, ouverte sous le compte %s, ne peut pas être "
-        "reprise sous le compte %s (stockage de sessions distinct). Rotation avec résumé "
-        "de reprise (L11)%s ; l'ancien id est conservé dans `session-history.jsonl`.\n\n%s"
+        "Account switch %s: session %s, opened under account %s, cannot be "
+        "resumed under account %s (separate session storage). Rotation with resume "
+        "summary (L11)%s; the old id is kept in `session-history.jsonl`.\n\n%s"
         % (harness, session, nom_ancien, new.name,
-           " — résumé indisponible, reprise sur un brief déterministe (L39)"
+           " — summary unavailable, resuming from a deterministic brief (L39)"
            if sans_resume else "", note),
         meta={"action": "compte", "session": session, "continuite": "rotation"})
     return True
@@ -401,19 +401,19 @@ def attach_profile(cfg, db, harness: str):
     try:
         items = accounts.profiles(cfg, harness)
     except accounts.AccountError as exc:
-        print("attach : configuration des comptes invalide : %s" % exc, file=sys.stderr)
+        print("attach: invalid account configuration: %s" % exc, file=sys.stderr)
         return False, None
     if not items:
         return True, None
     try:
         profile = accounts.current(db, cfg.host, harness, items)
     except db_mod.DbError as exc:
-        print("attach : état des comptes indisponible : %s" % db_mod.explain(exc),
+        print("attach: account state unavailable: %s" % db_mod.explain(exc),
               file=sys.stderr)
         return False, None
     problems = accounts.check(profile)
     if problems:
-        print("attach : compte %s/%s inutilisable : %s"
+        print("attach: account %s/%s unusable: %s"
               % (harness, profile.name, "; ".join(problems)), file=sys.stderr)
         return False, None
     return True, profile
@@ -429,5 +429,5 @@ def apply_env_attach(env: dict, profile, cfg=None) -> bool:
             accounts.apply_env(env, profile)
         return True
     except accounts.AccountError as exc:
-        print("attach : %s" % exc, file=sys.stderr)
+        print("attach: %s" % exc, file=sys.stderr)
         return False

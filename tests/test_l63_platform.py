@@ -125,7 +125,7 @@ class PlatformTest(unittest.TestCase):
             for nom, ctx in self.variants:
                 with self.subTest(nom), ctx():
                     found = {h["pid"]: h for h in platform.holders(chemin, "sid-l63-xyz")}
-                    self.assertEqual(found[tient.pid]["why"], "fichier ouvert")
+                    self.assertEqual(found[tient.pid]["why"], "open file")
                     self.assertIn(nomme.pid, found)
                     self.assertIn("ligne de commande", found[nomme.pid]["why"])
                     # les PID exclus (ascendance d'adopt) ne comptent pas par leur
@@ -149,7 +149,7 @@ class PlatformTest(unittest.TestCase):
             for nom, ctx in self.variants:
                 with self.subTest(nom), ctx():
                     found = {h["pid"]: h for h in platform.holders(dossier)}
-                    self.assertEqual(found[enfant.pid]["why"], "dossier courant")
+                    self.assertEqual(found[enfant.pid]["why"], "working directory")
 
     def test_os_muet_leve_not_available(self):
         """Ni psutil ni /proc : jamais de liste vide, jamais de None muet."""

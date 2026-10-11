@@ -360,7 +360,7 @@ class Canon(interface.Canon):
             """,
             (name, target, canon_ref, diagnostic, ref, bool(keep_session),
              bool(keep_session), bool(keep_session), bool(keep_session), summary, summary,
-             bool(keep_session), "déplacé vers %s" % target,
+             bool(keep_session), "moved to %s" % target,
              host, owner, int(epoch), target),
         )
         return rows[0] if rows else None

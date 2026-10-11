@@ -135,8 +135,8 @@ class PlafondDeContexteTest(_Base):
             self.assertTrue(worker.run_turn(spec))
         argv = self.turns()[-1]["argv"]
         self.assertNotIn("--resume", argv)
-        self.assertIn("Reprise de session après rotation", argv[-1])
-        self.assertIn("Suite : ton tour précédent a été clos", argv[-1])
+        self.assertIn("Session resumed after rotation", argv[-1])
+        self.assertIn("Continuation: your previous turn was closed", argv[-1])
         self.assertIsNone(worker.suite)
 
     def test_politique_jamais_suite_sans_rotation(self):
@@ -227,7 +227,7 @@ class CourrierBorneTest(_Base):
         self.assertIn("message n°4", sortie)
         self.assertNotIn("message n°5", sortie)
         self.assertIn("2 message(s) en attente", sortie)
-        self.assertIn("Conclus ce tour", sortie)
+        self.assertIn("Wrap up this turn", sortie)
         self.assertEqual(self._livres(ids), 5)
         # borne atteinte : plus rien de remis ni de réservé, et le Stop ne
         # relance plus le tour

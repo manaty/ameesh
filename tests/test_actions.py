@@ -1438,7 +1438,7 @@ class ActionsThreadTest(ActionsBase):
         finally:
             db.close()
         self.assertEqual(self.get(action)["state"], "cancelled")
-        self.assertIn("écriture du fil impossible", err.getvalue())
+        self.assertIn("thread write failed", err.getvalue())
 
     def test_resume_des_arguments(self):
         self.assertEqual(actions.args_summary({}), "aucun")

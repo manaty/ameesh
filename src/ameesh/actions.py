@@ -207,7 +207,7 @@ def approval_request(action, approver: str, *, decision: str = "approve",
     """La demande à signer (spec §8.1) pour approuver `action` — ou, avec
     `assume_duplicate`, pour assumer le doublon et la remplacer."""
     if not _HUMAN_RE.fullmatch(approver or ""):
-        raise ActionError(INVALID, "approbateur « human:<id> » attendu, pas %r" % (approver,))
+        raise ActionError(INVALID, "approver \"human:<id>\" expected, not %r" % (approver,))
     moment = int(time.time()) if now is None else int(now)
     request = {
         "v": receipts.REQUEST_VERSION,
@@ -262,14 +262,14 @@ def get(db: Db, action_id: str, *, with_receipts: bool = False) -> dict | None:
 def _require(db: Db, action_id: str, *, with_receipts: bool = False) -> dict:
     action = get(db, action_id, with_receipts=with_receipts)
     if action is None:
-        raise ActionError(UNKNOWN_ACTION, "action %s introuvable" % (action_id,))
+        raise ActionError(UNKNOWN_ACTION, "action %s not found" % (action_id,))
     return action
 
 
 def list_actions(db: Db, *, state: str | None = None, project: str | None = None,
                  limit: int = 50) -> list[dict]:
     if state and state not in STATES:
-        raise ActionError(INVALID, "état inconnu : %r (%s)" % (state, ", ".join(STATES)))
+        raise ActionError(INVALID, "unknown state: %r (%s)" % (state, ", ".join(STATES)))
     return storage.of(db).actions.recent(state=state, project=project, limit=limit)
 
 
@@ -297,9 +297,9 @@ def _event(db: Db, action: dict, event: str, actor: str, note: str) -> None:
 
 #: transitions écrites dans le fil, et leur libellé
 THREAD_EVENTS = {
-    "proposed": "proposée", "approved": "approuvée", "launched": "lancée",
-    "confirmed": "confirmée", "failed": "échouée", "unknown": "— issue INCONNUE",
-    "cancelled": "annulée", "replaced": "remplacée",
+    "proposed": "proposed", "approved": "approved", "launched": "launched",
+    "confirmed": "confirmed", "failed": "failed", "unknown": "— outcome UNKNOWN",
+    "cancelled": "cancelled", "replaced": "replaced",
 }
 #: une clé d'argument qui ressemble à un secret : valeur jamais recopiée
 _SECRET_KEY_RE = re.compile(r"secret|token|passw|key|auth|credential|cookie|signature|bearer",
@@ -316,20 +316,20 @@ def args_summary(args, limit: int = 200) -> str:
     opaque (jeton, clé, signature) : masquée ; objet ou liste : sa taille
     seulement ; texte : 40 caractères au plus."""
     if not isinstance(args, dict) or not args:
-        return "aucun"
+        return "none"
     parts = []
     for key in sorted(args):
         value = args[key]
         if _SECRET_KEY_RE.search(str(key)):
-            shown = "<masqué>"
+            shown = "<masked>"
         elif isinstance(value, dict):
-            shown = "{%d clé(s)}" % len(value)
+            shown = "{%d key(s)}" % len(value)
         elif isinstance(value, list):
-            shown = "[%d élément(s)]" % len(value)
+            shown = "[%d item(s)]" % len(value)
         elif isinstance(value, str):
             text = " ".join(value.split())
             if _OPAQUE_RE.search(text):
-                shown = "<masqué, %d caractères>" % len(text)
+                shown = "<masked, %d characters>" % len(text)
             else:
                 shown = text if len(text) <= 40 else text[:39] + "…"
         else:
@@ -347,50 +347,50 @@ def _one(text, limit: int = _THREAD_DETAIL_MAX) -> str:
 def transition_text(action: dict, event: str, *, detail: str = "") -> str:
     """Texte lisible (autosuffisant) d'une transition, pour le fil."""
     action_id = action["action_id"]
-    what = "%s %s sur %s" % (action["connector"], action["operation"],
-                             action.get("target") or "—")
+    what = "%s %s on %s" % (action["connector"], action["operation"],
+                            action.get("target") or "—")
     attempt = int(action.get("attempts") or 0)
     label = THREAD_EVENTS.get(event, event)
     if event == "proposed":
         money = ("" if action.get("amount") is None
-                 else ", montant %s %s" % (action["amount"], action.get("currency")))
+                 else ", amount %s %s" % (action["amount"], action.get("currency")))
         approvers = action.get("approvers") or []
-        text = "Action %s proposée par %s : %s (projet %s, classe %s%s) — %s%s." % (
+        text = "Action %s proposed by %s: %s (project %s, class %s%s) — %s%s." % (
             action_id, action["proposed_by"], what, action["project"], action["class"], money,
-            "approbation humaine (reçu) requise" if action["requires_receipt"] else "sans reçu",
-            " ; approbateurs : %s" % ", ".join(approvers) if approvers else "")
+            "human approval (receipt) required" if action["requires_receipt"] else "no receipt",
+            "; approvers: %s" % ", ".join(approvers) if approvers else "")
         if action.get("replaces"):
-            text += " Elle remplace %s (doublon assumé par %s)." % (
+            text += " It replaces %s (duplicate assumed by %s)." % (
                 action["replaces"], action.get("replace_approver") or "?")
-        text += " Arguments : %s. Empreinte %s." % (args_summary(action.get("args")),
-                                                   action["digest"])
+        text += " Arguments: %s. Digest %s." % (args_summary(action.get("args")),
+                                              action["digest"])
         return text
     head = "Action %s %s (%s" % (action_id, label, what)
-    head += ", tentative %d)" % attempt if attempt and event != "approved" else ")"
+    head += ", attempt %d)" % attempt if attempt and event != "approved" else ")"
     if event == "approved":
-        tail = _one(detail or action.get("last_note")) or "approuvée"
-        return "%s : %s. Exécution : ameesh action execute %s." % (head, tail, action_id)
+        tail = _one(detail or action.get("last_note")) or "approved"
+        return "%s: %s. Execute: ameesh action execute %s." % (head, tail, action_id)
     if event == "launched":
-        return "%s : appel du connecteur, clé d'idempotence %s." % (head, action_id)
+        return "%s: connector call, idempotency key %s." % (head, action_id)
     if event == "confirmed":
         ref = action.get("external_ref")
-        return "%s%s%s." % (head, " : réf. %s" % ref if ref else "",
+        return "%s%s%s." % (head, ": ref. %s" % ref if ref else "",
                             " — %s" % _one(detail) if detail else "")
     if event == "failed":
-        return "%s : %s. Nouvelle tentative : ameesh action retry %s (nouveau reçu)." % (
-            head, _one(detail or action.get("last_error")) or "échec certain", action_id)
+        return "%s: %s. Retry: ameesh action retry %s (new receipt)." % (
+            head, _one(detail or action.get("last_error")) or "certain failure", action_id)
     if event == "unknown":
-        return ("%s : %s. Aucune nouvelle tentative automatique : ameesh action reconcile %s, "
-                "puis décision humaine (ameesh decisions)." % (
-                    head, _one(detail or action.get("last_error")) or "issue inconnue",
+        return ("%s: %s. No automatic retry: ameesh action reconcile %s, "
+                "then a human decision (ameesh decisions)." % (
+                    head, _one(detail or action.get("last_error")) or "unknown outcome",
                     action_id))
     if event == "cancelled":
-        return "%s : %s." % (head, _one(detail or action.get("last_note")) or "annulée")
+        return "%s: %s." % (head, _one(detail or action.get("last_note")) or "cancelled")
     if event == "replaced":
-        return "%s : remplacée par %s (doublon assumé par %s), à approuver." % (
+        return "%s: replaced by %s (duplicate assumed by %s), to approve." % (
             head, action.get("replaced_by") or "?", action.get("replace_approver")
             or _one(detail) or "?")
-    return "%s : %s." % (head, _one(detail or action.get("last_note")))
+    return "%s: %s." % (head, _one(detail or action.get("last_note")))
 
 
 def _author(actor: str) -> str:
@@ -422,7 +422,7 @@ def _publish(db: Db, action_id: str, event: str, actor: str, *, detail: str = ""
             meta={"action_id": action_id, "event": event, "state": action["state"],
                   "attempt": int(action.get("attempts") or 0) or None})
     except Exception as exc:  # noqa: BLE001 - le fil est un plus, jamais un obstacle
-        fil.warn("transition %s de %s non écrite dans le fil (%s)"
+        fil.warn("transition %s of %s not written to the thread (%s)"
                  % (event, action_id, _one(exc, 200)))
 
 
@@ -440,12 +440,12 @@ def _close_lot_on_merge(db: Db, action_id: str, by: str) -> None:
         done = work_mod.close_merged(
             db, int(action["work_item"]), sha=action.get("external_ref") or "",
             actor=action.get("auth_approver") or by or "git-merge",
-            source="la porte (action %s)" % action_id, pr_ref=action.get("target"))
+            source="the gate (action %s)" % action_id, pr_ref=action.get("target"))
         if done["result"] == "refused":
             fil.warn("lot #%s : %s" % (action["work_item"], done["detail"]))
     except Exception as exc:  # noqa: BLE001 - conséquence, jamais un obstacle
-        fil.warn("lot de l'action %s non fermé après la fusion (%s) : "
-                 "ameesh work sync-github le rattrapera" % (action_id, _one(exc, 200)))
+        fil.warn("lot of action %s not closed after the merge (%s): "
+                 "ameesh work sync-github will catch up" % (action_id, _one(exc, 200)))
 
 
 # --------------------------------------------------------------------------
@@ -467,22 +467,22 @@ def record_approval_request(db: Db, action: dict, reply: dict, *, by: str) -> No
     duplicate = reply.get("assume_duplicate") is True
     until = reply.get("link_exp") or reply.get("exp")
     moment = time.strftime("%H:%M", time.localtime(float(until))) if until else "?"
-    note = "%s envoyée à %s (ameesh-approve)%s, lien valable jusqu'à %s" % (
-        request_id, approver, " — DOUBLON À ASSUMER" if duplicate else "", moment)
+    note = "%s sent to %s (ameesh-approve)%s, link valid until %s" % (
+        request_id, approver, " — DUPLICATE TO ASSUME" if duplicate else "", moment)
     _event(db, action, APPROVAL_REQUESTED, by, note)
     cfg = getattr(db, "cfg", None)
     if cfg is None:
         return
-    what = "%s %s sur %s" % (action["connector"], action["operation"],
-                             action.get("target") or "—")
+    what = "%s %s on %s" % (action["connector"], action["operation"],
+                            action.get("target") or "—")
     if duplicate:
-        ask = ("Décision demandée à %s : ASSUMER LE DOUBLON de l'action %s (%s, issue "
-               "inconnue) et la remplacer" % (approver, action["action_id"], what))
+        ask = ("Decision requested from %s: ASSUME THE DUPLICATE of action %s (%s, outcome "
+               "unknown) and replace it" % (approver, action["action_id"], what))
     else:
-        ask = "Demande d'approbation de l'action %s (%s) envoyée à %s" % (
+        ask = "Approval request for action %s (%s) sent to %s" % (
             action["action_id"], what, approver)
-    text = ("%s : ouvrir %s sur son téléphone (lien à usage unique, valable jusqu'à %s ; "
-            "empreinte signée %s). Reçu : ameesh action fetch-receipt %s." % (
+    text = ("%s: open %s on their phone (single-use link, valid until %s; "
+            "signed digest %s). Receipt: ameesh action fetch-receipt %s." % (
                 ask, reply.get("link") or "?", moment, reply.get("digest") or "?",
                 action["action_id"]))
     try:
@@ -491,7 +491,7 @@ def record_approval_request(db: Db, action: dict, reply: dict, *, by: str) -> No
                    meta={"action_id": action["action_id"], "event": APPROVAL_REQUESTED,
                          "request_id": request_id})
     except Exception as exc:  # noqa: BLE001 - fil.record ne lève pas ; prudence
-        fil.warn("demande %s non écrite dans le fil (%s)" % (request_id, _one(exc, 200)))
+        fil.warn("request %s not written to the thread (%s)" % (request_id, _one(exc, 200)))
 
 
 def last_approval_request(db: Db, action_id: str) -> str | None:
@@ -533,58 +533,58 @@ def propose(db: Db, connector, *, project: str, operation: str, target: str,
     """
     connectors_mod.check(connector)
     if not isinstance(project, str) or not _IDENT_RE.fullmatch(project):
-        raise ActionError(INVALID, "projet invalide : %r" % (project,))
+        raise ActionError(INVALID, "invalid project: %r" % (project,))
     if not isinstance(operation, str) or not _IDENT_RE.fullmatch(operation):
-        raise ActionError(INVALID, "opération invalide : %r" % (operation,))
+        raise ActionError(INVALID, "invalid operation: %r" % (operation,))
     if not isinstance(target, str) or not 1 <= len(target) <= 1024:
-        raise ActionError(INVALID, "cible (compte ou objet visé) : texte de 1 à 1024 "
-                          "caractères attendu")
+        raise ActionError(INVALID, "target (account or object): text of 1 to 1024 "
+                          "characters expected")
     if not isinstance(proposed_by, str) or not _MEMBER_RE.fullmatch(proposed_by):
-        raise ActionError(INVALID, "proposant « agent:<id> » ou « human:<id> » attendu, pas %r"
+        raise ActionError(INVALID, "proposer \"agent:<id>\" or \"human:<id>\" expected, not %r"
                           % (proposed_by,))
     approvers = list(approvers or ())
     for approver in approvers:
         if not isinstance(approver, str) or not _HUMAN_RE.fullmatch(approver):
-            raise ActionError(INVALID, "approbateur « human:<id> » attendu, pas %r" % (approver,))
+            raise ActionError(INVALID, "approver \"human:<id>\" expected, not %r" % (approver,))
     if args is None:
         args = {}
     if not isinstance(args, dict):
-        raise ActionError(INVALID, "args : objet JSON attendu")
+        raise ActionError(INVALID, "args: JSON object expected")
     try:
         canonical_args = jcs.dumps(args)
         args = jcs.loads(canonical_args)
     except jcs.JcsError as exc:
-        raise ActionError(INVALID, "args non canonisables (JCS) : %s" % exc) from exc
+        raise ActionError(INVALID, "args cannot be canonicalized (JCS): %s" % exc) from exc
     if amount is not None:
         if type(amount) is not int or amount < 0 or amount > jcs.MAX_SAFE_INTEGER:
-            raise ActionError(INVALID, "montant : entier >= 0 en unités mineures attendu")
+            raise ActionError(INVALID, "amount: integer >= 0 in minor units expected")
         if currency is None:
-            raise ActionError(INVALID, "un montant exige une devise")
+            raise ActionError(INVALID, "an amount requires a currency")
     if currency is not None and (not isinstance(currency, str) or not _CURRENCY_RE.fullmatch(currency)):
-        raise ActionError(INVALID, "devise : code ISO 4217 (3 majuscules) attendu")
+        raise ActionError(INVALID, "currency: ISO 4217 code (3 capitals) expected")
     if not isinstance(policy_version, str) or not 1 <= len(policy_version) <= 128:
-        raise ActionError(INVALID, "policy_version : texte de 1 à 128 caractères")
+        raise ActionError(INVALID, "policy_version: text of 1 to 128 characters")
 
     default = connector.classify(operation, args)
     if default not in ACTION_CLASSES:
-        raise ActionError(CLASS, "connecteur %s : classe %r inconnue" % (connector.name, default))
+        raise ActionError(CLASS, "connector %s: unknown class %r" % (connector.name, default))
     if canon_class is not None:
         if canon_class not in ACTION_CLASSES:
-            raise ActionError(CLASS, "classe du canon inconnue : %r" % (canon_class,))
+            raise ActionError(CLASS, "unknown canon class: %r" % (canon_class,))
         chosen = canon_class
     elif action_class is not None:
         if action_class not in ACTION_CLASSES:
-            raise ActionError(CLASS, "classe inconnue : %r (%s)" % (action_class, ", ".join(ACTION_CLASSES)))
+            raise ActionError(CLASS, "unknown class: %r (%s)" % (action_class, ", ".join(ACTION_CLASSES)))
         if SEVERITY[action_class] < SEVERITY[default]:
-            raise ActionError(CLASS, "classe %s refusée : %s %s est classée %s par le connecteur ; "
-                              "seul le canon peut l'abaisser" % (action_class, connector.name,
+            raise ActionError(CLASS, "class %s refused: %s %s is classed %s by the connector; "
+                              "only the canon can lower it" % (action_class, connector.name,
                                                                  operation, default))
         chosen = action_class
     else:
         chosen = default
     unknown = set(receipt_classes or ()) - set(ACTION_CLASSES)
     if unknown:
-        raise ActionError(CLASS, "classes inconnues : %s" % sorted(unknown))
+        raise ActionError(CLASS, "unknown classes: %s" % sorted(unknown))
     requires = chosen in (set(receipt_classes or ()) | GATED_CLASSES)
 
     action_id = new_action_id()
@@ -601,10 +601,10 @@ def propose(db: Db, connector, *, project: str, operation: str, target: str,
         args_json=canonical_args, action_class=chosen, amount=amount, currency=currency,
         policy_version=policy_version, digest=action_digest, dedupe=connector.dedupe,
         requires_receipt=requires, approvers_json=jcs.dumps(approvers),
-        note="proposée (%s, %s)" % (chosen, "reçu requis" if requires else "sans reçu"))
+        note="proposed (%s, %s)" % (chosen, "receipt required" if requires else "no receipt"))
     action = _require(db, action_id)
     if digest(action) != action_digest:  # l'aller-retour jsonb ne doit rien changer
-        raise ActionError(INVALID, "empreinte instable après enregistrement (%s)" % action_id)
+        raise ActionError(INVALID, "digest unstable after recording (%s)" % action_id)
     _publish(db, action_id, "proposed", proposed_by)
     return action
 
@@ -646,10 +646,10 @@ def _verify(db: Db, action: dict, receipt, policy, *, expected_digest: str,
         expected_digest=expected_digest, expected_action_id=action["action_id"],
         expect_decision=expect_decision, consume_by=None, now=now)
     if not verdict.ok:
-        raise ActionError(verdict.code, "reçu refusé : %s" % verdict.reason)
+        raise ActionError(verdict.code, "receipt refused: %s" % verdict.reason)
     allowed = action.get("approvers") or []
     if allowed and verdict.approver not in allowed:
-        raise ActionError(APPROVER, "%s n'est pas habilité à approuver %s (habilités : %s)"
+        raise ActionError(APPROVER, "%s is not allowed to approve %s (allowed: %s)"
                           % (verdict.approver, action["action_id"], ", ".join(allowed)))
     return verdict
 
@@ -669,31 +669,31 @@ def _authorize(db: Db, action: dict, receipt, *, standing: bool, policy, now,
             "auth_challenge": verdict.challenge,
             "auth_authenticator_id": verdict.authenticator_id, "auth_expires": verdict.exp,
             "auth_grant_id": None,
-            "note": "approuvée par %s (%s, reçu %s…)" % (
+            "note": "approved by %s (%s, receipt %s…)" % (
                 verdict.approver, verdict.facade, verdict.challenge[:12]),
         }
     if standing:
         grant = _covering_grant(db, action)
         if grant is None:
-            raise ActionError(NO_COVER, "aucune approbation permanente ne couvre %s (%s %s, "
-                              "classe %s, montant %s)" % (
+            raise ActionError(NO_COVER, "no standing approval covers %s (%s %s, "
+                              "class %s, amount %s)" % (
                                   action["action_id"], action["connector"], action["operation"],
                                   action["class"], action.get("amount")))
         return "approve", {
             "auth_kind": "standing", "auth_receipt": None, "auth_approver": None,
             "auth_nonce": None, "auth_challenge": None, "auth_authenticator_id": None,
             "auth_expires": None, "auth_grant_id": grant,
-            "note": "couverte par le grant #%d (réservation au lancement)" % grant,
+            "note": "covered by grant #%d (reserved at launch)" % grant,
         }
     if not action["requires_receipt"]:
         return "approve", {
             "auth_kind": "none", "auth_receipt": None, "auth_approver": None,
             "auth_nonce": None, "auth_challenge": None, "auth_authenticator_id": None,
             "auth_expires": None, "auth_grant_id": None,
-            "note": "classe %s : sans reçu" % action["class"],
+            "note": "class %s: no receipt" % action["class"],
         }
-    raise ActionError(RECEIPT_REQUIRED, "action %s (classe %s) : reçu d'approbation humaine "
-                      "ou approbation permanente requis" % (action["action_id"], action["class"]))
+    raise ActionError(RECEIPT_REQUIRED, "action %s (class %s): human approval receipt "
+                      "or standing approval required" % (action["action_id"], action["class"]))
 
 
 def _bind(db: Db, action: dict, auth: dict, *, from_states: tuple, by: str) -> dict:
@@ -701,7 +701,7 @@ def _bind(db: Db, action: dict, auth: dict, *, from_states: tuple, by: str) -> d
                                         digest=digest(action), auth=auth, by=by)
     if not bound:
         current = _require(db, action["action_id"])
-        raise ActionError(STATE, "action %s modifiée entre-temps (état %s)"
+        raise ActionError(STATE, "action %s changed in the meantime (state %s)"
                           % (action["action_id"], current["state"]))
     _publish(db, action["action_id"], "approved", by)
     return _require(db, action["action_id"])
@@ -721,9 +721,9 @@ def approve(db: Db, action_id: str, receipt=None, *, standing: bool = False, pol
     """
     action = _require(db, action_id)
     if action["state"] not in ("proposed", "approved"):
-        hint = {"failed": " : utiliser retry (nouveau reçu, même action)",
-                "unknown": " : issue inconnue, voir reconcile / retry / replace"}
-        raise ActionError(STATE, "action %s en %s, approbation impossible%s"
+        hint = {"failed": ": use retry (new receipt, same action)",
+                "unknown": ": unknown outcome, see reconcile / retry / replace"}
+        raise ActionError(STATE, "action %s is %s, cannot approve%s"
                           % (action_id, action["state"], hint.get(action["state"], "")))
     policy = policy if policy is not None else policy_from_env()
     kind, auth = _authorize(db, action, receipt, standing=standing, policy=policy, now=now,
@@ -733,18 +733,18 @@ def approve(db: Db, action_id: str, receipt=None, *, standing: bool = False, pol
         try:
             consumed = receipts.consume_nonce(
                 db, verdict.approver, verdict.nonce,
-                by="%s (refus de %s)" % (by or "porte", action_id), exp=verdict.exp,
+                by="%s (refusal of %s)" % (by or "gate", action_id), exp=verdict.exp,
                 iat=verdict.iat, clock_skew=policy.clock_skew, challenge=verdict.challenge,
                 authenticator_id=verdict.authenticator_id)
         except receipts.DeadlineError as exc:
-            raise ActionError(exc.code, "refus signé non consommé : %s" % exc) from exc
+            raise ActionError(exc.code, "signed refusal not consumed: %s" % exc) from exc
         if not consumed:
             state = authority.nonce_state(db, verdict.approver, verdict.nonce)
             if state:
-                raise ActionError(receipts.REPLAY, "refus signé : nonce déjà consommé (%s)" % state)
-            raise ActionError(receipts.REVOKED, "refus signé : authentificateur révoqué avant "
-                              "la consommation du nonce")
-        return cancel(db, action_id, by=by, note="refusée par %s (reçu deny)" % verdict.approver)
+                raise ActionError(receipts.REPLAY, "signed refusal: nonce already consumed (%s)" % state)
+            raise ActionError(receipts.REVOKED, "signed refusal: authenticator revoked before "
+                              "the nonce was consumed")
+        return cancel(db, action_id, by=by, note="refused by %s (deny receipt)" % verdict.approver)
     return _bind(db, action, auth, from_states=("proposed", "approved"), by=by)
 
 
@@ -795,11 +795,11 @@ def _call(connector, action: Action, timeout: float, late=None) -> Outcome:
     done, value, error = _guarded(lambda: connector.execute(action, action.action_id),
                                   timeout, "ameesh-action-%s" % action.action_id, late=late)
     if not done:
-        return Outcome.unknown("délai dépassé (%gs) : issue inconnue" % timeout)
+        return Outcome.unknown("timeout exceeded (%gs): outcome unknown" % timeout)
     if error is not None:
-        return Outcome.unknown("%s pendant l'appel : %s" % (type(error).__name__, _one_line(error)))
+        return Outcome.unknown("%s during the call: %s" % (type(error).__name__, _one_line(error)))
     if not isinstance(value, Outcome):
-        return Outcome.unknown("réponse du connecteur illisible : %r" % (value,))
+        return Outcome.unknown("unreadable connector response: %r" % (value,))
     return value
 
 
@@ -810,11 +810,11 @@ def _settle(db: Db, action_id: str, attempt: int, from_state: str, outcome: Outc
         action_id, attempt, from_state=from_state, state=outcome.state,
         external_ref=outcome.external_ref, error=error, by=by, note=note,
         settled_by=settled_by, stale_after=stale_after)
-    return row if row is not None else {"result": STATE, "detail": "aucune réponse"}
+    return row if row is not None else {"result": STATE, "detail": "no response"}
 
 
 def _note(outcome: Outcome, prefix: str) -> str:
-    text = "%s : %s" % (prefix, outcome.state)
+    text = "%s: %s" % (prefix, outcome.state)
     if outcome.external_ref:
         text += " (%s)" % outcome.external_ref
     if outcome.detail:
@@ -846,13 +846,13 @@ def _record_late(db: Db, action_id: str, attempt: int, value, error, *, by: str)
     (`late_unknown`), rien ne change.
     """
     if error is not None:
-        outcome = Outcome.unknown("%s après le délai : %s" % (type(error).__name__,
+        outcome = Outcome.unknown("%s after the timeout: %s" % (type(error).__name__,
                                                                _one_line(error)))
     elif not isinstance(value, Outcome):
-        outcome = Outcome.unknown("réponse tardive du connecteur illisible : %r" % (value,))
+        outcome = Outcome.unknown("unreadable late connector response: %r" % (value,))
     else:
         outcome = value
-    note = _note(outcome, "tentative %d, issue tardive (après le délai)" % attempt)
+    note = _note(outcome, "attempt %d, late outcome (after the timeout)" % attempt)
     target = _late_db(db)
     try:
         event = "late_unknown"
@@ -861,7 +861,7 @@ def _record_late(db: Db, action_id: str, attempt: int, value, error, *, by: str)
                               settled_by="connector-late", note=note)
             if settled.get("result") == "ok":
                 _publish(target, action_id, outcome.state, by or "connector-late",
-                         detail="issue tardive, après le délai%s" % (
+                         detail="late outcome, after the timeout%s" % (
                              " — %s" % outcome.detail if outcome.detail else ""))
                 if outcome.state == "confirmed":
                     _close_lot_on_merge(target, action_id, by or "connector-late")
@@ -871,7 +871,7 @@ def _record_late(db: Db, action_id: str, attempt: int, value, error, *, by: str)
         if current is None:
             return
         if event == "late_ignored":
-            note += " — ignorée : action déjà %s (tentative %s), rien n'est écrasé" % (
+            note += " — ignored: action already %s (attempt %s), nothing overwritten" % (
                 current["state"], current["attempts"])
         _event(target, dict(current, attempts=attempt), event, by, note)
     except DbError:
@@ -885,19 +885,19 @@ def _refuse_state(action: dict) -> ActionError:
     state = action["state"]
     action_id = action["action_id"]
     if state == "launched":
-        return ActionError(LAUNCHED, "action %s déjà lancée (tentative %s) : jamais de second "
-                           "appel ; attendre l'issue, ou l'échéance puis reconcile"
+        return ActionError(LAUNCHED, "action %s already launched (attempt %s): never a second "
+                           "call; wait for the outcome, or the deadline then reconcile"
                            % (action_id, action["attempts"]))
     if state == "unknown":
-        return ActionError(STATE, "action %s : issue inconnue, aucune nouvelle "
-                           "tentative automatique (reconcile, retry si déduplication garantie, "
-                           "ou décision humaine)" % action_id)
+        return ActionError(STATE, "action %s: unknown outcome, no automatic "
+                           "retry (reconcile, retry if deduplication is guaranteed, "
+                           "or a human decision)" % action_id)
     if state == "proposed":
-        return ActionError(RECEIPT_REQUIRED, "action %s non approuvée (classe %s) : reçu requis"
+        return ActionError(RECEIPT_REQUIRED, "action %s not approved (class %s): receipt required"
                            % (action_id, action["class"]))
     if state == "failed":
-        return ActionError(STATE, "action %s en échec : retry avec un nouveau reçu" % action_id)
-    return ActionError(STATE, "action %s en %s : rien à exécuter" % (action_id, state))
+        return ActionError(STATE, "action %s failed: retry with a new receipt" % action_id)
+    return ActionError(STATE, "action %s is %s: nothing to execute" % (action_id, state))
 
 
 def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
@@ -924,7 +924,7 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
     recover(db, action_id=action_id)
     action = _require(db, action_id, with_receipts=True)
     if action["connector"] != connector.name:
-        raise ActionError(CONNECTOR, "action %s : connecteur %s, pas %s"
+        raise ActionError(CONNECTOR, "action %s: connector %s, not %s"
                           % (action_id, action["connector"], connector.name))
     if action["state"] == "proposed" and not action["requires_receipt"]:
         try:
@@ -947,26 +947,26 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
             if current is not None and current["state"] != "approved":
                 # une exécution concurrente a lancé (et consommé le reçu) entre-temps
                 raise _refuse_state(current) from exc
-            _event(db, action, "refused", by, "lancement refusé : %s" % exc)
+            _event(db, action, "refused", by, "launch refused: %s" % exc)
             raise
         if (verdict.nonce, verdict.approver) != (action["auth_nonce"], action["auth_approver"]):
-            raise ActionError(STATE, "action %s : reçu lié incohérent" % action_id)
+            raise ActionError(STATE, "action %s: inconsistent bound receipt" % action_id)
     timeout = connectors_mod.timeout_of(connector)
     launch = storage.of(db).actions.launch(
         action_id, digest=expected, auth_kind=action["auth_kind"],
         auth_nonce=action["auth_nonce"], auth_grant_id=action["auth_grant_id"], by=by,
         timeout=timeout, clock_skew=policy.clock_skew)
     if launch is None:
-        launch = {"result": STATE, "detail": "aucune réponse"}
+        launch = {"result": STATE, "detail": "no response"}
     if launch.get("result") != "ok":
         code = launch.get("result") or STATE
-        reason = launch.get("detail") or "lancement refusé"
+        reason = launch.get("detail") or "launch refused"
         if code == STATE:
             current = get(db, action_id)
             if current is not None and current["state"] != "approved":
                 raise _refuse_state(current)
-        _event(db, action, "refused", by, "lancement refusé [%s] : %s" % (code, reason))
-        raise ActionError(code, "action %s : %s" % (action_id, reason))
+        _event(db, action, "refused", by, "launch refused [%s]: %s" % (code, reason))
+        raise ActionError(code, "action %s: %s" % (action_id, reason))
     attempt = int(launch["attempt"])
     _publish(db, action_id, "launched", by)
     recorded = threading.Event()
@@ -979,7 +979,7 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
 
     # --- l'état `launched` est validé en base : l'appel externe peut partir ---
     outcome = _call(connector, to_action(action, attempt), timeout, late=late)
-    note = _note(outcome, "tentative %d" % attempt)
+    note = _note(outcome, "attempt %d" % attempt)
     try:
         settled = _settle(db, action_id, attempt, "launched", outcome, by=by,
                           settled_by="connector", note=note)
@@ -987,15 +987,15 @@ def execute(db: Db, action_id: str, connector, *, policy=None, by: str = "",
             # `recover` est passé entre-temps (échéance dépassée) : l'issue apprise
             # du connecteur reste certaine, elle règle l'inconnue.
             settled = _settle(db, action_id, attempt, "unknown", outcome, by=by,
-                              settled_by="connector-late", note=note + " (tardive)")
+                              settled_by="connector-late", note=note + " (late)")
     except DbError as exc:
-        raise ActionError(UNRECORDED, "action %s : issue %s NON enregistrée (%s) ; l'action "
-                          "reste launched et sera traitée comme inconnue"
+        raise ActionError(UNRECORDED, "action %s: outcome %s NOT recorded (%s); the action "
+                          "stays launched and will be treated as unknown"
                           % (action_id, outcome.state, _one_line(exc))) from exc
     finally:
         recorded.set()
     if settled.get("result") != "ok":
-        raise ActionError(UNRECORDED, "action %s : issue %s non enregistrée (%s)"
+        raise ActionError(UNRECORDED, "action %s: outcome %s not recorded (%s)"
                           % (action_id, outcome.state, settled.get("detail")))
     _publish(db, action_id, outcome.state, by, detail=outcome.detail or "")
     if outcome.state == "confirmed":
@@ -1020,8 +1020,8 @@ def recover(db: Db, *, action_id: str | None = None, grace: float = RECOVER_GRAC
     """
     moved = []
     for row in storage.of(db).actions.launched(action_id=action_id, grace=grace, force=force):
-        outcome = Outcome.unknown("interrompue après le lancement (processus arrêté ?) : "
-                                  "issue inconnue, aucun nouvel appel automatique")
+        outcome = Outcome.unknown("interrupted after launch (process stopped?): "
+                                  "outcome unknown, no automatic new call")
         settled = _settle(db, row["action_id"], int(row["attempts"]), "launched", outcome,
                           by=by, settled_by="recover", note=outcome.detail,
                           stale_after=None if force else float(grace))
@@ -1040,16 +1040,16 @@ def reconcile(db: Db, action_id: str, connector, *, by: str = "", force: bool = 
     connectors_mod.check(connector)
     action = _require(db, action_id)
     if action["connector"] != connector.name:
-        raise ActionError(CONNECTOR, "action %s : connecteur %s, pas %s"
+        raise ActionError(CONNECTOR, "action %s: connector %s, not %s"
                           % (action_id, action["connector"], connector.name))
     if action["state"] == "launched":
         recover(db, action_id=action_id, force=force, by=by or "reconcile")
         action = _require(db, action_id)
         if action["state"] == "launched":
-            raise ActionError(LAUNCHED, "action %s lancée, échéance non atteinte : attendre "
-                              "(ou --force si le processus est mort)" % action_id)
+            raise ActionError(LAUNCHED, "action %s launched, deadline not reached: wait "
+                              "(or --force if the process is dead)" % action_id)
     if action["state"] != "unknown":
-        raise ActionError(STATE, "action %s en %s : rien à réconcilier"
+        raise ActionError(STATE, "action %s is %s: nothing to reconcile"
                           % (action_id, action["state"]))
     timeout = connectors_mod.timeout_of(connector)
     done, value, error = _guarded(lambda: connector.reconcile(to_action(action)), timeout,
@@ -1057,22 +1057,22 @@ def reconcile(db: Db, action_id: str, connector, *, by: str = "", force: bool = 
     found = value if (done and error is None and isinstance(value, Outcome)
                       and value.state in ("confirmed", "failed")) else None
     if found is None:
-        why = ("délai dépassé" if not done else
-               "%s : %s" % (type(error).__name__, _one_line(error)) if error is not None else
+        why = ("timeout exceeded" if not done else
+               "%s: %s" % (type(error).__name__, _one_line(error)) if error is not None else
                value.detail if isinstance(value, Outcome) and value.detail else
-               "introuvable")
+               "not found")
         _event(db, action, "reconcile_none", by,
-               "réconciliation sans résultat (%s) : décision humaine requise" % why)
+               "reconciliation without result (%s): human decision required" % why)
         return {"action_id": action_id, "state": "unknown", "found": False, "detail": why,
                 "external_ref": None}
     settled = _settle(db, action_id, int(action["attempts"]), "unknown", found, by=by,
-                      settled_by="reconcile", note=_note(found, "réconciliation"))
+                      settled_by="reconcile", note=_note(found, "reconciliation"))
     if settled.get("result") != "ok":
         current = _require(db, action_id)
-        raise ActionError(STATE, "action %s réglée entre-temps (état %s)"
+        raise ActionError(STATE, "action %s settled in the meantime (state %s)"
                           % (action_id, current["state"]))
     _publish(db, action_id, found.state, by or "reconcile",
-             detail="réconciliation%s" % (" — %s" % found.detail if found.detail else ""))
+             detail="reconciliation%s" % (" — %s" % found.detail if found.detail else ""))
     if found.state == "confirmed":
         _close_lot_on_merge(db, action_id, by or "reconcile")
     return {"action_id": action_id, "state": found.state, "found": True,
@@ -1094,27 +1094,27 @@ def retry(db: Db, action_id: str, receipt=None, *, connector=None, standing: boo
     if connector is not None:
         connectors_mod.check(connector)
         if action["connector"] != connector.name:
-            raise ActionError(CONNECTOR, "action %s : connecteur %s, pas %s"
+            raise ActionError(CONNECTOR, "action %s: connector %s, not %s"
                               % (action_id, action["connector"], connector.name))
     if action.get("replaced_by"):
-        raise ActionError(REPLACED, "action %s remplacée par %s : plus de tentative"
+        raise ActionError(REPLACED, "action %s replaced by %s: no more attempts"
                           % (action_id, action["replaced_by"]))
     state = action["state"]
     if state == "unknown":
         declared = action["dedupe"] == "guaranteed" and (
             connector is None or connector.dedupe == "guaranteed")
         if not declared:
-            raise ActionError(DEDUPE, "action %s : issue inconnue et déduplication non garantie "
-                              "par %s — reconcile, puis décision humaine qui assume le doublon "
+            raise ActionError(DEDUPE, "action %s: unknown outcome and deduplication not guaranteed "
+                              "by %s — reconcile, then a human decision that assumes the duplicate "
                               "(replace)" % (action_id, action["connector"]))
     elif state == "launched":
         raise _refuse_state(action)
     elif state != "failed":
-        raise ActionError(STATE, "action %s en %s : retry seulement après failed, ou unknown "
-                          "avec déduplication garantie" % (action_id, state))
+        raise ActionError(STATE, "action %s is %s: retry only after failed, or unknown "
+                          "with guaranteed deduplication" % (action_id, state))
     _kind, auth = _authorize(db, action, receipt, standing=standing, policy=policy, now=now,
                              allow_deny=False)
-    auth["note"] = "nouvelle tentative autorisée après %s — %s" % (state, auth["note"])
+    auth["note"] = "retry authorized after %s — %s" % (state, auth["note"])
     return _bind(db, action, auth, from_states=(state,), by=by)
 
 
@@ -1131,17 +1131,17 @@ def replace(db: Db, action_id: str, receipt, *, policy=None, by: str = "",
     naît `proposed` : elle exige sa propre approbation.
     """
     if receipt is None:
-        raise ActionError(DECISION_REQUIRED, "remplacer %s exige une décision humaine signée "
-                          "qui assume le doublon" % action_id)
+        raise ActionError(DECISION_REQUIRED, "replacing %s requires a signed human decision "
+                          "that assumes the duplicate" % action_id)
     policy = policy if policy is not None else policy_from_env()
     recover(db, action_id=action_id)
     action = _require(db, action_id)
     if action.get("replaced_by"):
-        raise ActionError(REPLACED, "action %s déjà remplacée par %s"
+        raise ActionError(REPLACED, "action %s already replaced by %s"
                           % (action_id, action["replaced_by"]))
     if action["state"] != "unknown":
-        raise ActionError(STATE, "action %s en %s : seul une action d'issue inconnue se "
-                          "remplace" % (action_id, action["state"]))
+        raise ActionError(STATE, "action %s is %s: only an action with an unknown outcome "
+                          "can be replaced" % (action_id, action["state"]))
     verdict = _verify(db, action, receipt, policy,
                       expected_digest=assume_duplicate_digest(action),
                       expect_decision="approve", now=now)
@@ -1154,9 +1154,9 @@ def replace(db: Db, action_id: str, receipt, *, policy=None, by: str = "",
         challenge=verdict.challenge, authenticator_id=verdict.authenticator_id, by=by,
         clock_skew=policy.clock_skew)
     if result is None:
-        result = {"result": STATE, "detail": "aucune réponse"}
+        result = {"result": STATE, "detail": "no response"}
     if result.get("result") != "ok":
-        raise ActionError(result.get("result") or STATE, "remplacement de %s refusé : %s"
+        raise ActionError(result.get("result") or STATE, "replacement of %s refused: %s"
                           % (action_id, result.get("detail")))
     _publish(db, action_id, "replaced", by, detail=verdict.approver)
     _publish(db, new_id, "proposed", by)
@@ -1170,11 +1170,11 @@ def cancel(db: Db, action_id: str, *, by: str = "", note: str = "") -> dict:
     if not cancelled:
         action = _require(db, action_id)
         if action["state"] in ("launched", "unknown"):
-            raise ActionError(STATE, "action %s en %s : l'effet a peut-être eu lieu, "
-                              "annulation impossible (reconcile)" % (action_id, action["state"]))
-        raise ActionError(STATE, "action %s en %s : annulation impossible"
+            raise ActionError(STATE, "action %s is %s: the effect may have happened, "
+                              "cannot cancel (reconcile)" % (action_id, action["state"]))
+        raise ActionError(STATE, "action %s is %s: cannot cancel"
                           % (action_id, action["state"]))
-    _publish(db, action_id, "cancelled", by, detail=note or "annulée")
+    _publish(db, action_id, "cancelled", by, detail=note or "cancelled")
     return _require(db, action_id)
 
 
@@ -1196,15 +1196,15 @@ def decisions(db: Db, *, human: str | None = None) -> dict:
     assignés ou sans assignation.
     """
     if human is not None and not _HUMAN_RE.fullmatch(human):
-        raise ActionError(INVALID, "« human:<id> » attendu, pas %r" % (human,))
+        raise ActionError(INVALID, "\"human:<id>\" expected, not %r" % (human,))
     approvals, unknown, interrupted = storage.of(db).actions.decision_queues()
     for row in unknown + interrupted:
         if row["state"] == "launched":
-            row["hint"] = "interrompue : sera traitée comme inconnue (reconcile)"
+            row["hint"] = "interrupted: will be treated as unknown (reconcile)"
         elif row["dedupe"] == "guaranteed":
-            row["hint"] = "déduplication garantie : retry (nouveau reçu, même action) ou reconcile"
+            row["hint"] = "deduplication guaranteed: retry (new receipt, same action) or reconcile"
         else:
-            row["hint"] = "reconcile ; introuvable → décision qui assume le doublon (replace)"
+            row["hint"] = "reconcile; not found → decision that assumes the duplicate (replace)"
     waiting = work.list_items(db, state="waiting_human", limit=500)
     if human:
         short = human.split(":", 1)[1]

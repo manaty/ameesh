@@ -31,14 +31,14 @@ class VueTest(unittest.TestCase):
         item = {"state": "build", "assignee": "relais", "delegated_by": "orch",
                 "delegated_ts": 1000.0, "due_ts": 1000.0 + 1800}
         vue = work.delegation_view(item, now=1000.0 + 18 * 60)
-        self.assertEqual(vue["label"], "délégué par orch, échéance dans 12 min")
+        self.assertEqual(vue["label"], "delegated by orch, due in 12 min")
         self.assertEqual((vue["due_in_s"], vue["overdue"], vue["settled"]), (720, False, False))
         self.assertEqual(vue["delegate"], "relais")
         vue = work.delegation_view(item, now=1000.0 + 1800 + 5 * 60 + 3)
-        self.assertEqual(vue["label"], "délégué par orch, en retard de 5 min")
+        self.assertEqual(vue["label"], "delegated by orch, overdue by 5 min")
         self.assertTrue(vue["overdue"])
         vue = work.delegation_view(dict(item, due_ts=None), now=5000.0)
-        self.assertEqual(vue["label"], "délégué par orch, échéance soldée (travail constaté)")
+        self.assertEqual(vue["label"], "delegated by orch, deadline settled (work seen)")
         self.assertTrue(vue["settled"])
         self.assertIsNone(work.delegation_view(dict(item, delegated_by=None)))
         self.assertIsNone(work.delegation_view(dict(item, state="closed")))
@@ -98,7 +98,7 @@ class DelegationTest(_Base):
         self.assertEqual((item["assignee"], item["delegated_by"]), ("relais", "orch"))
         self.assertAlmostEqual(item["due_ts"] - item["delegated_ts"], 1800.0, delta=1.0)
         notes = [(e["note"], e["actor"]) for e in work.events(self.db, self.lot["id"])]
-        self.assertIn(("délégué à relais par orch, échéance dans 30 min (avant : orch)",
+        self.assertIn(("delegated to relais by orch, due in 30 min (before: orch)",
                        "orch"), notes)
         # l'événement qui réveille le délégué, lié au lot
         boite = self._boite("relais")
@@ -138,7 +138,7 @@ class DelegationTest(_Base):
             self.assertIn(attendu, proc.stderr, extra)
         proc = self.mesh("work", "delegate", ident, "relais", "--within", "bientôt")
         self.assertEqual(proc.returncode, 1, proc.stderr)
-        self.assertIn("durée illisible", proc.stderr)
+        self.assertIn("unreadable duration", proc.stderr)
         # rien n'a bougé
         item = self._item()
         self.assertEqual((item["assignee"], item["delegated_by"]), ("orch", None))
@@ -148,7 +148,7 @@ class DelegationTest(_Base):
         work.close(self.db, self.lot["id"], abandoned=True)
         proc = self.mesh("work", "delegate", ident, "relais", "--within", "30m")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("rien à déléguer", proc.stderr)
+        self.assertIn("nothing to delegate", proc.stderr)
 
     def test_agent_arrete_accepte_avec_avertissement(self):
         registry.set_status(self.db, "relais", "stopped", status_text="arrêté à la main",
@@ -206,14 +206,14 @@ class EcheanceTest(_Base):
         self.assertEqual([(d["outcome"], d["resolved_by"]) for d in self._delegations()],
                          [("rendue", "exécuteur r1")])
         notes = [e["note"] for e in work.events(self.db, self.lot["id"])]
-        self.assertIn("délégation échue : retour à orch (aucun tour de relais sur le lot "
-                      "depuis la délégation)", notes)
+        self.assertIn("delegation expired: back to orch (no turn from relais on the lot "
+                      "since the delegation)", notes)
         # l'événement réveille le délégant
         boite = self._boite("orch")
         self.assertEqual(len(boite), 1)
         self.assertEqual((boite[0]["sender"], boite[0]["kind"], boite[0]["work_item_id"]),
                          (work.SYSTEM_SENDER, "event", str(self.lot["id"])))
-        self.assertIn("délégation échue", boite[0]["body"])
+        self.assertIn("delegation expired", boite[0]["body"])
         self.assertEqual(out[0]["message_id"], int(_lignes(
             self.db, "SELECT max(id) AS id FROM agent_mailbox")[0]["id"]))
         # traitée une fois pour toutes
@@ -244,7 +244,7 @@ class EcheanceTest(_Base):
         self.assertEqual((item["assignee"], item["delegated_by"], item["due_ts"]),
                          ("relais", "orch", None))
         self.assertEqual(work.delegation_view(item)["label"],
-                         "délégué par orch, échéance soldée (travail constaté)")
+                         "delegated by orch, deadline settled (work seen)")
         self.assertEqual(self._boite("orch"), [])
         self.assertEqual([(d["outcome"], d["tour"]) for d in self._delegations()],
                          [("soldee", True)])
@@ -428,8 +428,8 @@ class AffichageTest(_Base):
     def test_work_list_et_show(self):
         proc = self.mesh("work", "list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("délégué par orch, échéance dans", proc.stdout)
-        rows = json.loads(self.mesh("work", "list", "--json").stdout)
+        self.assertIn("delegated by orch, due in", proc.stdout)
+        rows =json.loads(self.mesh("work", "list", "--json").stdout)
         self.assertEqual(rows[0]["delegated_by"], "orch")
         self.assertIsNotNone(rows[0]["due_ts"])
         self.assertEqual(rows[0]["delegation"]["delegate"], "relais")
@@ -437,21 +437,21 @@ class AffichageTest(_Base):
         # les clés d'avant restent
         self.assertTrue({"assignee", "waiting_for", "stale", "delays"} <= set(rows[0]))
         proc = self.mesh("work", "show", str(self.lot["id"]))
-        self.assertIn("délégué  : délégué par orch, échéance dans", proc.stdout)
+        self.assertIn(": delegated by orch, due in", proc.stdout)
         item = json.loads(self.mesh("work", "show", str(self.lot["id"]), "--json").stdout)
         self.assertEqual(item["delegation"]["delegated_by"], "orch")
         self._echoir(minutes=7)
         proc = self.mesh("work", "list")
-        self.assertIn("délégué par orch, en retard de 7 min", proc.stdout)
+        self.assertIn("delegated by orch, overdue by 7 min", proc.stdout)
 
     def test_progress(self):
         snap = progress.snapshot(self.db, self.cfg)
         lot = next(l for l in snap["lots"] if l["id"] == self.lot["id"])
         self.assertEqual(lot["delegation"]["delegated_by"], "orch")
-        self.assertIn("délégué par orch, échéance dans", progress.format_text(snap, 100))
+        self.assertIn("delegated by orch, due in", progress.format_text(snap, 100))
         self._echoir(minutes=3)
         snap = progress.snapshot(self.db, self.cfg)
-        self.assertIn("en retard de 3 min", progress.format_text(snap, 100))
+        self.assertIn("overdue by 3 min", progress.format_text(snap, 100))
         proc = self.mesh("progress", "--json")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         lots = json.loads(proc.stdout)["lots"]

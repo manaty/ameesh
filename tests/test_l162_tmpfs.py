@@ -147,7 +147,7 @@ class ActiviteTest(unittest.TestCase):
         _write(os.path.join(entree, "g"), 10)
         borne = menage.scan_activity(entree, limit=2)
         self.assertFalse(borne["complete"])
-        self.assertIn("entrées", borne["why"])
+        self.assertIn("entries", borne["why"])
         self.assertFalse(menage.scan_activity(os.path.join(self.base, "absent"))["complete"])
 
     def test_plus_grosses_entrees(self):
@@ -159,7 +159,7 @@ class ActiviteTest(unittest.TestCase):
         self.assertTrue(top[0]["owner"])
         texte = menage.tmpfs_hint(top, menage.Policy())
         self.assertIn("gros", texte)
-        self.assertIn("action attendue", texte)
+        self.assertIn("expected action", texte)
         self.assertIn("2 h", texte)
         self.assertIn("ameesh menage", menage.tmpfs_hint([], menage.Policy()))
         self.assertEqual(menage.fmt_idle(5400), "90 min")
@@ -172,7 +172,7 @@ class ConsigneTest(unittest.TestCase):
                 texte = mail._assemble(kind, ["— message n°1 de a :\n> x"], 0)
                 self.assertIn(adapters.TMP_NOTE, texte)
         self.assertIn("$TMPDIR", adapters.TMP_NOTE)
-        self.assertIn("500 Mo", adapters.TMP_NOTE)
+        self.assertIn("500 MB", adapters.TMP_NOTE)
         racine = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(racine, "docs", "ORCHESTRATEUR.md"), encoding="utf-8") as fh:
             orchestrateur = fh.read()
@@ -249,13 +249,13 @@ class AbandonDbTest(_Systeme, PgTestCase):
         entries = self._tour(creer)
         signale = [e for e in entries if e["kind"] == "orphan"]
         self.assertEqual([e["path"] for e in signale], [abandon])
-        self.assertIn("supprimé par le ménage après 2 h", signale[0]["detail"])
+        self.assertIn("deleted by housekeeping after 2 h", signale[0]["detail"])
         self.assertIn("ino", signale[0]["data"])
         # 30 min plus tard : il attend
         rapport = self._passage(1800.0)
         self.assertTrue(os.path.exists(abandon))
         self.assertEqual(rapport["orphans"][0]["status"], "attend")
-        self.assertIn("supprimé après 2 h", rapport["orphans"][0]["detail"])
+        self.assertIn("deleted after 2 h", rapport["orphans"][0]["detail"])
         # essai, 3 h plus tard : prévu, rien de supprimé
         essai = self._passage(3 * HEURE, dry_run=True)
         self.assertTrue(os.path.exists(abandon))
@@ -306,12 +306,12 @@ class AbandonDbTest(_Systeme, PgTestCase):
         rapport = self._passage(3 * HEURE)
         sorts = {o["path"]: (o["status"], o["detail"]) for o in rapport["orphans"]}
         self.assertEqual(sorts[ouvert][0], "attend")
-        self.assertIn("tenu par le processus %d" % occupant.pid, sorts[ouvert][1])
+        self.assertIn("held by process %d" % occupant.pid, sorts[ouvert][1])
         self.assertEqual(sorts[sale][0], "garde")
-        self.assertIn("travail git", sorts[sale][1])
-        self.assertIn("autre inode", sorts[homonyme][1])
-        self.assertIn("absent du registre", sorts[inconnu][1])
-        self.assertIn("hors du /tmp du système", sorts[dehors][1])
+        self.assertIn("git work",sorts[sale][1])
+        self.assertIn("different inode",sorts[homonyme][1])
+        self.assertIn("not in the registry", sorts[inconnu][1])
+        self.assertIn("outside the system /tmp",sorts[dehors][1])
         for chemin in (ouvert, sale, homonyme, inconnu, dehors):
             self.assertTrue(os.path.exists(chemin), chemin)
         self.assertEqual([e for e in rapport["entries"] if e["kind"] == "orphan"], [])
@@ -347,7 +347,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertIn("orphan_cleanup: false", rapport["orphans"][0]["detail"])
         rapport = self._passage(3 * HEURE, agents_in_turn={"a1"})
         self.assertTrue(os.path.exists(abandon))
-        self.assertIn("tour en cours", rapport["orphans"][0]["detail"])
+        self.assertIn("turn in progress", rapport["orphans"][0]["detail"])
         with mock.patch.dict(os.environ, {"AMEESH_HOUSEKEEPING": "off"}):
             self._passage(3 * HEURE)
         self.assertTrue(os.path.exists(abandon))
@@ -364,7 +364,7 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self._lecture(10.0)   # 83 % : pression (80 %) et alerte (60 %)
         alertes = {a["type"]: a for a in exploitation.alerts(self.cfg, self.db)}
         self.assertIn("ameesh menage", alertes["host_pressure"]["detail"])   # sans bilan
-        self.assertIn("action attendue", alertes["host_pressure"]["detail"])
+        self.assertIn("expected action", alertes["host_pressure"]["detail"])
         top = [{"path": "/tmp/preuve-images", "bytes": 4 * 1024 ** 3, "owner": "u",
                 "agent": "a1", "status": "attend"},
                {"path": "/tmp/jest_rs", "bytes": 1536 * 1024 ** 2, "owner": "u"}]
@@ -375,9 +375,9 @@ class AbandonDbTest(_Systeme, PgTestCase):
         for type_ in ("host_pressure", "tmpfs_full"):
             with self.subTest(type=type_):
                 detail = alertes[type_]["detail"]
-                self.assertIn("/tmp/preuve-images 4.0 GiB (u, laissé par a1 : attend)", detail)
+                self.assertIn("/tmp/preuve-images 4.0 GiB (u, left by a1: waiting)", detail)
                 self.assertIn("/tmp/jest_rs 1.5 GiB", detail)
-                self.assertIn("action attendue", detail)
+                self.assertIn("expected action", detail)
                 self.assertIn("$TMPDIR", detail)
                 self.assertEqual([e["path"] for e in alertes[type_]["tmp_top"]],
                                  ["/tmp/preuve-images", "/tmp/jest_rs"])

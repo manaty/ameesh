@@ -53,7 +53,7 @@ AGENT_COLUMNS = """
 def check_name(name: str) -> str:
     """Nom d'agent sûr (NAME_RE) : seul un nom contrôlé entre dans un littéral."""
     if not NAME_RE.match(name or ""):
-        raise ValueError("nom d'agent invalide : %r" % (name,))
+        raise ValueError("invalid agent name: %r" % (name,))
     return name
 
 
@@ -68,7 +68,7 @@ def name_list(names: Sequence[str]) -> str:
 
 def _alias(alias: str) -> str:
     if not _ALIAS_RE.match(alias or ""):
-        raise ValueError("alias SQL invalide : %r" % (alias,))
+        raise ValueError("invalid SQL alias: %r" % (alias,))
     return alias
 
 

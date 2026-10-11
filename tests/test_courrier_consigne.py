@@ -87,7 +87,7 @@ class CourrierDansLaConsigneTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         consigne = self._consigne()
         self.assertIn("> ligne une\n> ligne deux du message v1", consigne)
-        self.assertIn("message n°%d de orch" % mid, consigne)
+        self.assertIn("message #%d from orch" % mid, consigne)
         ligne = self._ligne(mid)
         # horodatage lisible (ISO local, à la seconde)
         import datetime
@@ -107,7 +107,7 @@ class CourrierDansLaConsigneTest(PgTestCase):
                         allow_structured=True)
         spec = worker.pick()
         self.assertEqual(spec["ids"], [mid])
-        self.assertIn("corps non lisible", spec["prompt"])
+        self.assertIn("unreadable body", spec["prompt"])
         self.assertNotIn("zzz-payload", spec["prompt"])
         self.assertNotIn("yyy-payload", spec["prompt"])
 
@@ -130,14 +130,14 @@ class CourrierDansLaConsigneTest(PgTestCase):
             tours += 1
             consigne = self._consigne()
             self.assertLessEqual(mail.octets(consigne), plafond)
-            inclus = [i for i in ids if "message n°%d de" % i in consigne]
+            inclus = [i for i in ids if "message #%d from" % i in consigne]
             self.assertTrue(inclus)
             self.assertEqual(inclus, avant[:len(inclus)])        # plus anciens d'abord
             reste = len(avant) - len(inclus)
             if reste:
                 self.assertIn(adapters.MAIL_REMAINING % reste, consigne)
             else:
-                self.assertNotIn("autre(s) message(s)", consigne)
+                self.assertNotIn("more recent message(s)", consigne)
             vus += inclus
         self.assertGreater(tours, 1)
         self.assertEqual(vus, ids)                                # ni perte ni doublon
@@ -156,11 +156,11 @@ class CourrierDansLaConsigneTest(PgTestCase):
         with self._env_harnais():
             self.assertTrue(worker.run_turn(spec))
         consigne = self._consigne()
-        self.assertTrue(consigne.startswith("Reprise de session après rotation"))
+        self.assertTrue(consigne.startswith("Session resumed after rotation"))
         self.assertLessEqual(mail.octets(consigne), plafond)
         self.assertIn("note 0 ", consigne)
         # le courrier suit le bloc du résumé, jamais dedans
-        self.assertLess(consigne.index("</resume-de-session>"), consigne.index("note 0 "))
+        self.assertLess(consigne.index("</session-resume>"), consigne.index("note 0 "))
         self.assertLess(len(spec["ids"]), 10, "le plafond a bien retenu du courrier")
 
     def test_message_trop_long_tronque_mais_jamais_bloquant(self):
@@ -168,8 +168,8 @@ class CourrierDansLaConsigneTest(PgTestCase):
         mid = mail.send(self.db, "orch", "long", "phrase longue àéè\n" * 400)
         spec = worker.pick()
         self.assertEqual(spec["ids"], [mid])
-        self.assertIn("tronqué", spec["prompt"])
-        self.assertIn("message n°%d" % mid, spec["prompt"])
+        self.assertIn("truncated", spec["prompt"])
+        self.assertIn("message #%d" % mid, spec["prompt"])
         self.assertLessEqual(mail.octets(spec["prompt"]), 2000)
 
     def test_prompt_for_unitaire(self):
@@ -224,7 +224,7 @@ class CourrierDansLaConsigneTest(PgTestCase):
         with self._env_harnais():
             worker._host_next = 0.0
             spec = worker.pick()
-        self.assertNotIn("re-livré", spec["prompt"])
+        self.assertNotIn("re-delivered", spec["prompt"])
         with self._env_harnais():
             self.assertTrue(worker.run_turn(spec))
         self.assertIn("jamais vu", self._consigne())
@@ -388,13 +388,13 @@ class CourrierDansLaConsigneTest(PgTestCase):
         self.assertGreater(worker2.epoch, worker.epoch)
         spec = worker2.pick()
         self.assertEqual(spec["ids"], [mid])            # aucune perte
-        self.assertIn("re-livré", spec["prompt"])        # doublon signalé
+        self.assertIn("re-delivered", spec["prompt"])        # doublon signalé
         with self._env_harnais():
             self.assertTrue(worker2.run_turn(spec))
         self.assertIsNotNone(self._ligne(mid)["delivered_ts"])
         consigne = self._consigne()
         self.assertIn("peut-être déjà vu", consigne)
-        self.assertIn("re-livré", consigne)
+        self.assertIn("re-delivered", consigne)
 
     def test_reservation_expiree_reprise_et_signalee(self):
         _runner, worker = self._worker("expire")
@@ -415,7 +415,7 @@ class CourrierDansLaConsigneTest(PgTestCase):
                         "WHERE name = 'orphelin'")
         sortie = self._hook("orphelin", worker.runner.runner_id, worker.epoch + 1)
         self.assertIn("réservation orpheline", sortie)
-        self.assertIn("re-livré", sortie)
+        self.assertIn("re-delivered", sortie)
         self.assertIsNotNone(self._ligne(mid)["delivered_ts"])
 
     # -- hook ---------------------------------------------------------------
@@ -520,7 +520,7 @@ class CourrierDansLaConsigneTest(PgTestCase):
         self.assertIn(adapters.EVENT_HEADER % 2, consigne)
         self.assertIn("build 41 vert", consigne)
         self.assertIn("build 42 rouge", consigne)
-        self.assertIn("(événement)", consigne)
+        self.assertIn("(event)", consigne)
         self.assertIn(adapters.AUTHORITY_NOTE, consigne)
         for mid in (e1, e2):
             self.assertIsNotNone(self._ligne(mid)["delivered_ts"])
