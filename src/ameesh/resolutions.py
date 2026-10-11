@@ -472,6 +472,15 @@ def _replay_into(repo: str, path: str, commit: str, lot_tip: str, other_tip: str
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def _merged_paths(path: str, meta: dict) -> set[str]:
+    """Staged paths that differ from both the lot tip and the other tip: the
+    content the merge or the agent made, where a marker may hide."""
+    def changed(rev: str) -> set[str]:
+        return set(_paths(_run(path, "diff", "--cached", "--name-only", "--no-renames",
+                               "-z", rev)))
+    return changed(meta["lot_tip"]) & changed(meta["other_tip"])
+
+
 def _message(meta: dict, note: str) -> str:
     files = meta["files"]
     return ("Resolution: #%d with #%d\n\n"
@@ -542,6 +551,11 @@ def finish_resolution(db, lot: int, other: int, *, repo: str | None = None,
         still = unmerged(path)
         if still:
             raise ResolveError("still unmerged: %s (%s)" % (", ".join(still), path))
+        # a conflicted file renamed then `git add -A`-ed is not in meta["files"]:
+        # check every staged path that is neither side's version
+        left = with_markers(path, sorted(set(meta["files"]) | _merged_paths(path, meta)))
+        if left:
+            raise ResolveError("conflict markers left in %s (%s)" % (", ".join(left), path))
         _check(_run(path, "-c", "rerere.enabled=false", "commit", "--quiet", "--no-verify",
                     "-F", "-", stdin=_message(meta, note).encode()), "commit")
     else:

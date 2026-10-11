@@ -503,6 +503,20 @@ class ReviewTest(_Base):
             self.assertEqual(rp.prime(["f" * 40, r1]), ["f" * 40])
         self.assertEqual(rp.trained(), [r1])
 
+    def test_j_renamed_conflicted_file_keeps_its_markers_out(self):
+        # codex, 3rd review: shared.py, still conflicted, renamed then git add -A
+        path = resolutions.open_resolution(None, 2, 1, repo=self.repo)["path"]
+        os.rename(os.path.join(path, "shared.py"), os.path.join(path, "renamed.py"))
+        _git(path, "add", "-A")
+        with self.assertRaises(resolutions.ResolveError) as ctx:
+            resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertIn("renamed.py", str(ctx.exception))
+        self.assertEqual(self.fake.rows, {})
+        _write(path, "renamed.py", RESOLVED)
+        done = resolutions.finish_resolution(None, 2, 1, repo=self.repo, actor="a2")
+        self.assertEqual(_git(self.repo, "show", "%s:renamed.py" % done["commit"]),
+                         RESOLVED.strip())
+
     def test_g_work_show_without_table_0057(self):
         store = mock.Mock()
         store.work.resolutions.side_effect = RuntimeError(
