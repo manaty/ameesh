@@ -383,6 +383,14 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('estimate_references', ARRAY[
         'id', 'published_at', 'published_by', 'body'
     ]),
+    -- L157c (0056): actual time of a delivered lot by phase and size of its
+    -- merged diff (durations and line counts: STATE)
+    ('work_item_measures', ARRAY[
+        'work_item_id', 'measured_at', 'started_at', 'merged_at', 'total_minutes',
+        'agent_minutes', 'ci_minutes', 'review_minutes', 'human_minutes', 'ci_runs',
+        'merge_sha', 'diff_files', 'diff_insertions', 'diff_deletions',
+        'measured_size', 'declared_size'
+    ]),
     -- L40 (0031) : registre des délégations et de leur issue (de l'ÉTAT)
     ('work_item_delegations', ARRAY[
         'id', 'work_item_id', 'delegate', 'delegated_by', 'delegated_at', 'due_at',

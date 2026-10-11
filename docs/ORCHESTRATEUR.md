@@ -166,6 +166,19 @@ un avertissement.
 * **La consigne d'un lot** demande, dans le message de fin, la durée réelle
   et, si elle s'écarte de l'estimation, la phase qui l'explique (agent, CI,
   relecture, humain).
+* **Planned dates at the p80, order at the median** (L157c). `ameesh work
+  schedule` shows, for each agent, its queue of open lots with their
+  planned dates: lots chained at the median of their reference group (or
+  of their estimate), each dated at its p80; `--apply` writes them, keeping
+  the dates you set yourself (`--force` to overwrite). `ameesh work add
+  --assignee` dates the new lot this way when a reference table is
+  published. Declaring the size and the assignee makes the dates closer.
+* **The actual time is measured by phase** (L157c). After the merge, the
+  runner stores the time spent in each phase (agent, CI, review, human) and
+  the size of the merged diff against the declared size: `ameesh work show
+  <id>` (lines « phases » and « size »). Compare them with your estimate by
+  phase; a declared size that keeps differing from the measured one is a
+  sign to declare differently.
 * L'estimation comparée au réel est celle **en vigueur au début** du travail :
   ré-estimer en cours de route est permis et tracé, mais ne corrige pas
   l'écart. L'auditeur interne audite ces écarts et ajuste le processus

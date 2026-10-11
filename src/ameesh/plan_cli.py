@@ -26,7 +26,7 @@ import sys
 from . import plan_git, plan_github, work
 
 COMMANDS = ("link", "close", "sync-merges", "sync-branches", "sync-github", "project-github",
-            "plan", "estimates")
+            "plan", "estimates", "schedule", "measure")
 
 
 def add_parsers(work_sub, func) -> None:
@@ -113,6 +113,32 @@ def add_parsers(work_sub, func) -> None:
     p_est.add_argument("--actor", default="", help="qui publie (--publish)")
     p_est.set_defaults(func=func)
 
+    p_sched = work_sub.add_parser(
+        "schedule", help="planned dates of the open assigned lots at the p80 of the reference "
+                         "table, queues ordered at the median (L157c); shows, --apply writes")
+    p_sched.add_argument("--assignee", default=None, help="one agent's queue only")
+    p_sched.add_argument("--apply", action="store_true",
+                         help="write the dates (lots without dates, or dated by the schedule)")
+    p_sched.add_argument("--force", action="store_true",
+                         help="with --apply: also overwrite dates set by a person")
+    p_sched.add_argument("--actor", default="")
+    p_sched.add_argument("--json", action="store_true", help="schema ameesh-schedule/1")
+    p_sched.set_defaults(func=func)
+
+    p_meas = work_sub.add_parser(
+        "measure", help="actual time of delivered lots by phase (agent, CI, review, human) "
+                        "and size of the merged diff (L157c); the runner does it after each "
+                        "branch sweep")
+    p_meas.add_argument("ids", nargs="*", type=int,
+                        help="these lots (measured again); default: the lots not measured yet")
+    p_meas.add_argument("--repo", action="append", default=None, metavar="DIR",
+                        help="repository holding the merge commits (repeatable; default: the "
+                             "current one)")
+    p_meas.add_argument("--no-ci", action="store_true",
+                        help="do not read the CI runs (gh): CI time stays unknown")
+    p_meas.add_argument("--json", action="store_true")
+    p_meas.set_defaults(func=func)
+
     p_proj = work_sub.add_parser(
         "project-github", help="une issue GitHub par lot d'un projet (--app, L126), ou le "
                                "plan en issues (--repo seul) — vue, jamais source")
@@ -153,6 +179,30 @@ def run(db, args: argparse.Namespace) -> int:
             print(json.dumps(report, ensure_ascii=False, indent=2))
         else:
             print(estimates.format_report(report))
+        return 0
+    if command == "schedule":
+        from . import lot_schedule
+        sched = lot_schedule.build(db, assignee=args.assignee,
+                                   force=bool(args.apply and args.force))
+        written = (lot_schedule.apply(db, sched, force=args.force, actor=args.actor)
+                   if args.apply else None)
+        if args.json:
+            print(json.dumps(dict(sched, written=[e["id"] for e in written or ()]),
+                             ensure_ascii=False, indent=2))
+        else:
+            print(lot_schedule.format_schedule(sched, written))
+        return 0
+    if command == "measure":
+        import os
+        from . import lot_measures
+        repos = [os.path.abspath(os.path.expanduser(r)) for r in args.repo or [os.getcwd()]]
+        rows = lot_measures.measure(db, args.ids or None, repos=repos,
+                                    ci=None if args.no_ci else lot_measures.gh_ci_runs)
+        if args.json:
+            print(json.dumps([lot_measures.view(r) | {"id": int(r["work_item_id"])}
+                              for r in rows], ensure_ascii=False, indent=2))
+        else:
+            print(lot_measures.format_measures(rows))
         return 0
     if command == "link":
         if args.none == bool(args.package):
