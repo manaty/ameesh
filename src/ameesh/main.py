@@ -90,6 +90,7 @@
   ameesh hosts [--json] [HÔTE]          ressources des hôtes (L31) ;
   ameesh menage [--apply] [--json]      ménage de ce que les agents créent (L73) ;
   ameesh conflicts [--all] [--json]     radar de conflits entre lots (L160b) ;
+  ameesh session list|backup|restore <agent>   off-device session backups (L53);
   ameesh agent spawn <nom> --by <créateur> --ttl <durée>   agent éphémère.
 
 Le service d'approbation humaine (spec §9) est une commande séparée,
@@ -207,6 +208,9 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "fil":
         from . import fil
         return fil.main(rest)
+    if command == "session":
+        from . import session_backup
+        return session_backup.main(rest)
     if command == "notify":
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify

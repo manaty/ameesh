@@ -328,6 +328,8 @@ class Config:
     #: secret ici : jetons et webhooks viennent de l'environnement ou d'un
     #: fichier 0600 nommés par cette clé.
     notify: dict = field(default_factory=dict)
+    #: Off-device session backup; storage credentials come from the environment.
+    session_backup: dict = field(default_factory=dict)
     #: issues GitHub des lots (L126) : la clé `github` du fichier de
     #: configuration de l'HÔTE, telle quelle (`projects` : projet → dépôt,
     #: `host` : hôte désigné pour la projection automatique, `interval`,

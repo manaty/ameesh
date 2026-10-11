@@ -43,6 +43,7 @@ import uuid
 from . import account_turn, adapters, canon as canon_mod, canon_sync, cost as cost_mod
 from . import budget as budget_mod, db as db_mod, fil, mail, registry, storage
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
+from . import accounts as accounts_mod, session_backup as session_backup_mod
 from .config import load as load_config
 
 
@@ -3078,6 +3079,7 @@ class AgentWorker(threading.Thread):
             error=error, cost_usd=cost,
         )
         self.last_activity = time.monotonic()
+        self._backup_session(adapter, compte, session_new or session)
         if ok:
             self.session_turns += 1
         if spec["kind"] == "idle":
@@ -3123,6 +3125,48 @@ class AgentWorker(threading.Thread):
             % (int(duration), etat["remis"], etat["attente"]),
             meta={"action": "courrier-borne", "remis": etat["remis"],
                   "attente": etat["attente"], "tour_s": round(duration, 1)})
+
+    def _backup_session(self, adapter, account, session) -> None:
+        """Back up the completed session in a nonblocking background worker."""
+        if not session or self.runner.dry_run or not self.cfg.session_backup:
+            return
+        try:
+            conf = session_backup_mod.parse(self.cfg.session_backup)
+        except session_backup_mod.BackupError as exc:
+            if not getattr(self, "_backup_config_reported", False):
+                log("[%s] session backup disabled : %s" % (self.name, exc))
+                self._backup_config_reported = True
+            return
+        descriptor = getattr(adapter, "descriptor", None)
+        patterns = getattr(descriptor, "session_files", ()) if descriptor else ()
+        if conf is None or not patterns:
+            return
+        harness = self.agent.get("harness") or ""
+        home = (account.home() if account is not None else os.path.abspath(os.path.expanduser(
+            os.environ.get(accounts_mod.config_env_of(harness))
+            or accounts_mod.default_home_of(harness))))
+        lock = self.__dict__.setdefault("_backup_lock", threading.Lock())
+        if not lock.acquire(blocking=False):
+            return          # A backup for this agent is already running.
+
+        def copy_session() -> None:
+            try:
+                r = session_backup_mod.backup(
+                    conf, host=self.cfg.host, agent=self.name, home=home, patterns=patterns,
+                    session=session, state_dir=self.cfg.state_dir)
+                if r["status"] == "copied":
+                    log_async("[%s] session %s backed up off device (%d file(s), %d bytes)"
+                        % (self.name, session, r["files"], r["bytes"]))
+                elif r["status"] == "not_found":
+                    log_async("[%s] backup: session %s files not found under %s"
+                        % (self.name, session, home))
+            except Exception as exc:  # noqa: BLE001 - backup failure must not fail a turn
+                log_async("[%s] session %s backup failed : %s" % (self.name, session, exc))
+            finally:
+                lock.release()
+
+        threading.Thread(target=copy_session, daemon=True,
+                         name="%s-session-backup" % self.name).start()
 
     def failure_wait(self) -> float:
         """Attente avant le tour suivant après un échec : doublée à chaque échec

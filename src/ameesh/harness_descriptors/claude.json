@@ -34,6 +34,7 @@
       "credentials": ".credentials.json",
       "key_env": "ANTHROPIC_API_KEY"
     },
+    "backup": {"session_files": ["projects/*/{session}.jsonl", "projects/*/{session}"]},
     "install": {"note": "binaire `claude` installé par l'hôte ; distribution signée en L17"}
   }
 }

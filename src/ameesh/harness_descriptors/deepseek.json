@@ -39,6 +39,7 @@
       "session_store": "sessions",
       "key_env": "DEEPSEEK_API_KEY"
     },
+    "backup": {"session_files": ["sessions/*/{session}"]},
     "install": {"note": "binaire `dsh` installé par l'hôte ; distribution signée en L17"}
   }
 }
