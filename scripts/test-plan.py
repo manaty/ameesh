@@ -246,9 +246,11 @@ def _python(card: dict, impact: Impact, status: str, path: str, head: str,
             repo: pathlib.Path) -> None:
     old = card.get("blocs", {}).get(path)
     if status == "D":
-        if old is None:
-            return
-        impact.hit({m for b in old.values() for m in b.get("modules", ())}, f"{path} (removed)")
+        listers, where = _dir_listers(card, path, card["commit"], repo)
+        impact.hit(listers, f"{path} (removed from {where})")
+        if old is not None:
+            impact.hit({m for b in old.values() for m in b.get("modules", ())},
+                       f"{path} (removed)")
         return
     source = show(path, head, repo)
     if source is None:
@@ -367,15 +369,15 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
         if m not in known_modules:
             impact.p0[m] = "unknown to the map"
     for status, path in changes:
+        # a file read as data (a .py, a test module, a migration as well): its
+        # readers, whatever the kind of file and even when its blocks did not change
+        impact.hit(card.get("donnees", {}).get(path, ()), path)
         stem = pathlib.PurePosixPath(path)
         if path.startswith("tests/") and stem.parent.as_posix() == "tests" \
                 and stem.name.startswith("test") and stem.suffix == ".py":
             if status != "D" and stem.stem in modules:
                 impact.p0[stem.stem] = path
             continue
-        # a file read as data (a .py, a migration as well): its readers, whatever
-        # the kind of file and even when its blocks did not change
-        impact.hit(card.get("donnees", {}).get(path, ()), path)
         if is_foundation(path):
             if path == "pyproject.toml" and _version_line_only(head, card["commit"], repo):
                 impact.hit(card.get("donnees", {}).get(path, ()), path)

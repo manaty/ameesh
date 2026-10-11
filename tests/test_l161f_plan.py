@@ -292,6 +292,40 @@ class MapTest(unittest.TestCase):
         self.repo.commit()
         self.assertTrue(self._classify()["phase2_safe"])
 
+    def _classify_with(self, card: dict, modules: list[str]) -> dict:
+        for m in modules:
+            card["modules"].setdefault(m, {"durees": {"psycopg": 1.0}, "echecs": []})
+        with mock.patch.object(plan, "ALWAYS_FILE", self.repo.path / "none.txt"):
+            return plan.classify(modules, card, NOW, head="HEAD", repo=self.repo.path)
+
+    def test_test_module_read_as_data_selects_its_readers(self):
+        # codex (4): the test-module branch skipped the readers of the file
+        self.repo.write("tests/test_plan.py", "x = 1\n")
+        self.repo.base = self.repo.commit()
+        self.repo.write("tests/test_plan.py", "x = 2\n")
+        self.repo.commit()
+        card = self.repo.card()
+        card["donnees"]["tests/test_plan.py"] = ["test_version"]
+        out = self._classify_with(card, ["test_a", "test_plan", "test_version"])
+        self.assertEqual(out["classes"]["test_plan"], ["P0", "tests/test_plan.py"])
+        self.assertEqual(out["classes"]["test_version"], ["P1", "tests/test_plan.py"])
+
+    def test_removed_or_renamed_code_file_reaches_the_directory_listers(self):
+        # codex (5): a code file removed (or renamed) changes the listing of its directory
+        for why, new_name in (("removed", None), ("renamed", "src/ameesh/code2.py")):
+            with self.subTest(why):
+                self.repo.remove("src/ameesh/code.py")
+                if new_name:
+                    self.repo.write(new_name, CODE_V1)
+                self.repo.commit()
+                card = self.repo.card()
+                card["dossiers"]["src/ameesh"] = ["test_lister"]
+                try:
+                    out = self._classify_with(card, ["test_a", "test_lister"])
+                    self.assertEqual(out["classes"]["test_lister"][0], "P1", why)
+                finally:
+                    _git(self.repo.path, "reset", "-q", "--hard", self.repo.base)
+
     def test_rewrites_and_bare_drops_are_not_additive(self):
         # L161f review (4)
         for sql in ("create or replace function f() returns int as $$ select 1 $$ language sql;",
