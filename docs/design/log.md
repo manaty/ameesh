@@ -1,5 +1,8 @@
 # Journal de la conception
 
+## 2026-10-11 (radar de conflits)
+* **Étude** L160 (lot n° 170) : [radar de conflits et résolutions préparées avant la fusion](etudes/l160-radar-de-conflits.md) — mesures du 10/10 (ameesh : 11 PR sur 18 reprises à la main, la moitié des blocs en conflit sont deux ajouts au même endroit ; Nexlink : 39 min en médiane du feu de fusion à develop, 29 fusions de rattrapage) ; git suffit (fusions d'essai `merge-tree`, résolutions partagées par commits et rejouées par `rerere`, file de fusion tenue par ameesh), conventions additives d'abord ; lots L160a–L160h proposés, 28 h estimées.
+
 ## 2026-10-11 (capacité des hôtes)
 * **Étude** (L159, lot n° 169 du suivi) : [capacité des hôtes prêtée au mesh, contrat commun avec Nexlink Compute](etudes/l159-capacite-des-hotes.md). Besoin du propriétaire : prêter aux agents la capacité inutilisée des VM de l'organisation sans gêner leurs applications, de façon réutilisable par Nexlink Compute, après la saturation du poste (charge 43 pour 12 CPU le 10, `/tmp` plein le 11). Contrat de « garde de capacité » : offre au canon (`policy.lend`), mesure commune (parts de l'application et de l'invité, PSI, capacité prêtable), `ameesh-host-state/1` étendu par des champs facultatifs, acquittement inchangé, paliers prêt, réduit, gel, retrait et arrêt, plafonds posés par le noyau. Deux modes sur une VM : exécuteur complet sous une slice plafonnée, ou déport des suites lourdes par SSH, d'abord sur la VM de tests. Lots L159a à L159i, N1 à N3 côté Nexlink, gestes du propriétaire.
 
