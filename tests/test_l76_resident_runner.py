@@ -488,6 +488,27 @@ class ResidentRunnerTest(PgTestCase):
         worker._note_dormant("asleep")
         self.assertEqual(registry.get(self.db, "res1")["status_text"], "turn failed")
 
+    def test_dormant_never_resumes_a_stopped_agent_nor_without_the_lease(self):
+        # codex r1 (#422): one conditional write, no read-then-write window
+        _runner, worker = self._worker()
+        registry.set_status(self.db, "res1", "stopped", status_text="stopped by owner",
+                            stop_reason=registry.STOP_REASONS[0])
+        worker._note_dormant("asleep")
+        agent = registry.get(self.db, "res1")
+        self.assertEqual((agent["status"], agent["status_text"]),
+                         ("stopped", "stopped by owner"))
+        registry.set_status(self.db, "res1", "idle", status_text="")
+        worker.epoch += 1                          # no longer our lease
+        worker._note_dormant("asleep")
+        self.assertEqual(registry.get(self.db, "res1")["status_text"] or "", "")
+
+    def test_many_failures_never_overflow(self):
+        _runner, worker = self._worker()
+        worker._resident_failures = 5000           # codex r1 (#422), P3
+        worker._resident_failed("test")
+        self.assertLessEqual(worker._resident_refused_until - time.monotonic(),
+                             runner_mod.RESIDENT_RETRY_MAX_S)
+
     def test_resident_off_stops_it_between_turns(self):
         _runner, worker = self._worker()
         self.assertTrue(self._turn(worker, "un"))
