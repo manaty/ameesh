@@ -46,7 +46,8 @@ and no load was generated on purpose.
 
 Not audited: **pc-smichea** and the mesh server. Neither is reachable from this
 host (no `~/.ssh`, `pc-smichea` does not resolve), so the findings below cover
-the guest host only.
+the guest host only. The exact read-only commands to fill that gap are at the
+end of this study ("Rerunning it on pc-smichea and the mesh server").
 
 # 1. The hierarchy actually in place
 
@@ -313,3 +314,100 @@ to watch if weights are ever enabled, because it shares the DB/I/O path.
 - `ameesh-guard.service` runs in `system.slice` without a weight; its own
   helper slice and its runtime `set-property` calls on the guest were not
   exercised during this read-only audit.
+
+## Rerunning it on pc-smichea and the mesh server
+
+Read-only: nothing below writes a property, a cgroup or a scheduler, and no
+load is generated. Run it on the target host, note the UTC time, and paste the
+output here or in a comment. No root is needed: `/sys/fs/cgroup` and
+`/proc/<pid>/cgroup` are world-readable. Run it while the host is under load —
+PSI and lease jitter say nothing on an idle host.
+
+```bash
+# 0 — host, kernel, systemd
+hostname; uname -r; systemd --version | head -1
+```
+
+```bash
+# 1 — live cgroup of each ameesh slice: controllers, subtree, weights
+#     (system manager and, on pc-smichea, the user manager)
+for mgr in "" "--user"; do
+  for u in ameesh.slice ameesh-guest.slice ameesh-agents.slice; do
+    cg=$(systemctl $mgr show "$u" -p ControlGroup --value 2>/dev/null); [ -n "$cg" ] || continue
+    echo "== systemctl $mgr show $u -> /sys/fs/cgroup$cg"
+    cat "/sys/fs/cgroup$cg/cgroup.controllers" "/sys/fs/cgroup$cg/cgroup.subtree_control" \
+        "/sys/fs/cgroup$cg/cpu.weight" "/sys/fs/cgroup$cg/io.weight" 2>&1
+  done
+done
+```
+
+```bash
+# 2 — runner units and their caps. On pc-smichea the runners are user units:
+#     run this block as the user that owns them (its XDG_RUNTIME_DIR is needed);
+#     on the mesh server they are system units (second command, no --user).
+systemctl --user show 'ameesh-runner-agent@*.service' \
+  -p Id -p Slice -p CPUWeight -p IOWeight -p MemoryHigh -p MemoryMax 2>&1
+systemctl show 'ameesh-runner@*.service' \
+  -p Id -p Slice -p CPUWeight -p IOWeight -p MemoryHigh -p MemoryMax 2>&1
+# controllers delegated to the user manager (pc-smichea)
+U=$(id -u)
+for d in "/sys/fs/cgroup/user.slice/user-$U.slice" \
+         "/sys/fs/cgroup/user.slice/user-$U.slice/user@$U.service"; do
+  echo "== $d"; cat "$d/cgroup.controllers" "$d/cgroup.subtree_control" 2>&1
+done
+```
+
+```bash
+# 3 — I/O backend: iocost, BFQ, scheduler, backing devices
+wc -c /sys/fs/cgroup/io.cost.qos /sys/fs/cgroup/io.cost.model 2>&1
+for f in /sys/block/*/queue/scheduler; do printf '%s: ' "$f"; cat "$f"; done
+lsmod | grep -w bfq || echo 'bfq: not loaded'
+findmnt -rno TARGET,SOURCE,FSTYPE
+lsblk -o NAME,TYPE,FSTYPE,MOUNTPOINTS
+```
+
+```bash
+# 4 — where the harness's tool commands really run (§4)
+systemctl --user list-units --type=scope --all --no-legend 'dsh-subprocess-*.scope' 2>&1
+systemctl --user show 'dsh-subprocess-*.scope' \
+  -p Id -p Slice -p CPUWeight -p IOWeight -p MemoryMax 2>&1
+ps -eo pid,user,cgroup:90,args --sort=pid |
+  grep -E 'dsh-subprocess|runner\.js|unittest|pytest|cargo' | cut -c1-240
+# Claude runners: are the tool processes inside the unit's cgroup.procs?
+for u in $(systemctl --user list-units --all --no-legend --plain \
+             'ameesh-runner-agent@*.service' | awk '{print $1}'); do
+  cg=$(systemctl --user show "$u" -p ControlGroup --value)
+  echo "== $u -> /sys/fs/cgroup$cg"
+  for p in $(cat "/sys/fs/cgroup$cg/cgroup.procs" 2>/dev/null); do
+    printf '%s ' "$p"; tr '\0' ' ' < "/proc/$p/cmdline" | cut -c1-100; echo
+  done
+done
+```
+
+```bash
+# 5 — database containers and other docker scopes
+docker ps --format '{{.Names}}' 2>&1
+systemctl show 'docker-*.scope' -p Id -p Slice -p CPUWeight -p IOWeight 2>&1
+```
+
+```bash
+# 6 — pressure, heavy slots and leases, sampled as in §7
+cat /proc/pressure/cpu /proc/pressure/io /proc/pressure/memory
+ameesh heavy --status 2>&1
+for i in $(seq 1 40); do
+  date -u +%T
+  ameesh list --json | python3 -c '
+import json, sys, time
+now = time.time()
+for a in json.load(sys.stdin):
+    if a["lease_owner"]:
+        print("  %-18s ttl=%6.1fs last_seen=%5.1fs" % (
+            a["name"], a["lease_expires_ts"] - now, now - a["last_seen_ts"]))'
+  sleep 5
+done
+```
+
+The comparison frame is the table in §1: a host whose `io.cost.qos`/`io.cost.model`
+are non-empty, whose scheduler shows `[bfq]`, or whose `dsh-subprocess-*.scope`
+sits inside the runner cgroup needs its row corrected before any weight policy
+is decided for it.
