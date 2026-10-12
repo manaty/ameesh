@@ -154,7 +154,10 @@ ordinary runners, including guard heartbeat validation, lending defaults,
 shared acknowledgments/slots and freeze accounting. The mediated controller
 keeps its remote availability sink, socket support and session-token source;
 it implements synchronous refresh before claim and counts the foreground
-worker. The common `host_gate_drain=0` configuration means the normal 90 s
+worker through lease release even though its Thread is never started.
+Withdrawal deadlines also stop the remaining process group after a safe
+point, so a child retaining stdout cannot keep the turn and lease open.
+The common `host_gate_drain=0` configuration means the normal 90 s
 fallback for mediated devices. Mail recipient locking remains server-only.
 
 ## Validation of the branch

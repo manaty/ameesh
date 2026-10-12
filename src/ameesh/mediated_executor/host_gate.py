@@ -44,6 +44,8 @@ from .gate import (ACK_FILE, DEFAULT_DRAIN_S, FILE_POLL_S, SOCKET_PATH, STATE_FI
                     STATES, GateAck, GateState, HostGate, availability_body)
 
 GATE_KINDS = ("file", "socket")
+#: Same safe-point marker as AgentWorker and the classic controller.
+SAFE_POINT = "safe point"
 #: bail d'un hôte volatil (fiche Host `policy.volatile`), en secondes
 VOLATILE_LEASE_TTL_S = 90.0
 #: au-delà de l'échéance du retrait, délai avant de dire le retrait en retard
@@ -656,10 +658,12 @@ class GateController:
         lock = getattr(self.runner, "lock", None)
         workers = getattr(self.runner, "workers", {}) or {}
         if lock is None:
-            result = list(workers.values())
+            result = [w for w in workers.values() if w.is_alive()]
         else:
             with lock:
-                result = list(workers.values())
+                result = [w for w in workers.values() if w.is_alive()]
+        # --once runs on the runner thread, so is_alive() is always false.
+        # This reference remains set until the lease has been released.
         foreground = getattr(self.runner, "gate_foreground", None)
         if foreground is not None and foreground not in result:
             result.append(foreground)
@@ -728,13 +732,13 @@ class GateController:
         """Échéance du retrait, retard, acquittement ; rend l'acquittement."""
         now = self._clock()
         state = self.current
-        workers = [w for w in self._workers() if w.is_alive()]
+        workers = self._workers()
         if not state.may_claim and self.deadline is not None and now >= self.deadline:
             # à chaque passage : un tour publié juste après l'échéance est
             # rattrapé au suivant
             for worker in workers:
                 if getattr(worker, "proc", None) is not None \
-                        and getattr(worker, "host_yield", None) is None:
+                        and getattr(worker, "host_yield", None) in (None, SAFE_POINT):
                     self._interrupted = True
                     worker.yield_to_host(
                         "échéance du retrait de l'hôte" if state.state == "draining"

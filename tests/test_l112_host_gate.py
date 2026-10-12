@@ -18,6 +18,7 @@ import dataclasses
 import json
 import os
 import socket
+import signal
 import subprocess
 import sys
 import tempfile
@@ -30,7 +31,7 @@ from ameesh import canon, config as config_mod, db as db_mod, exploitation, noti
 from ameesh.mediated_executor import availability as D
 from ameesh.mediated_executor import gate as P
 from ameesh.mediated_executor import host_gate as H
-from ameesh.runner import Runner
+from ameesh.runner import AgentWorker, Runner
 
 from .support import PgTestCase, child_env
 from .test_l43_perimetre_hote import HOST, _Canons, host
@@ -274,13 +275,103 @@ class ControleurTest(unittest.TestCase):
         self.assertFalse(self.ctl.refresh().may_claim)
         self.assertTrue(self.ctl.holds_turns())
 
-    def test_foreground_once_worker_is_held_until_lease_release(self):
-        worker = _FauxWorker("foreground")
+    def foreground_worker(self):
+        # A real, unstarted Thread, as used by the runner's --once path.
+        worker = AgentWorker.__new__(AgentWorker)
+        threading.Thread.__init__(worker, name="foreground", daemon=True)
+        worker.runner = self.runner
+        worker.db = object()
+        worker.epoch = 7
+        worker.proc = None
+        worker.pgid = None
+        worker.lock = threading.Lock()
+        worker.wake = threading.Event()
+        worker.watchdog_stop = threading.Event()
+        worker.lease_lost = threading.Event()
+        worker.stop_requested = threading.Event()
+        worker.host_yield = None
+        worker._depot_push = mock.Mock()
+        self.runner.runner_id = "once-runner"
         self.runner.gate_foreground = worker
+        return worker
+
+    def test_foreground_once_worker_is_held_until_lease_release(self):
+        worker = self.foreground_worker()
+        self.assertFalse(worker.is_alive())
+        worker.proc = object()
+        self.ctl.apply(P.GateState("draining", 2, drain_deadline_ts=1010.0))
         ack = self.ctl.tick()
-        self.assertIn("foreground", ack.held)
+        self.assertEqual((ack.held, ack.in_turn, ack.drained),
+                         (("foreground",), ("foreground",), False))
+        with mock.patch.object(worker, "yield_to_host") as withdraw:
+            self.now = 1010.0
+            self.ctl.tick()
+            withdraw.assert_called_once_with("échéance du retrait de l'hôte")
+        worker.proc = None  # turn finished, lease still held
+        self.assertFalse(self.ctl.tick().drained)
+        with mock.patch("ameesh.runner.registry.release") as release:
+            worker.release_lease()
+            release.assert_called_once_with(worker.db, worker.name, "once-runner", 7)
         self.runner.gate_foreground = None
-        self.assertNotIn("foreground", self.ctl.tick().held)
+        self.assertTrue(self.ctl.tick().drained)
+
+    @unittest.skipUnless(os.name == "posix", "isolated POSIX process group")
+    def test_deadline_kills_child_holding_stdout_after_safe_point_and_releases_lease(self):
+        self.assertEqual(H.SAFE_POINT, AgentWorker.HOST_SAFE_POINT)
+        worker = self.foreground_worker()
+        # The child ignores TERM and keeps the harness's stdout open after
+        # its parent stops. No Docker, database or provider is involved.
+        code = """import os,signal,time
+child = os.fork()
+if child == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    print('child-ready', flush=True)
+    time.sleep(60)
+else:
+    time.sleep(60)
+"""
+        proc = subprocess.Popen([sys.executable, "-c", code],
+                                start_new_session=True, stdout=subprocess.PIPE,
+                                text=True)
+        def cleanup():
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=3)
+            proc.stdout.close()
+        self.addCleanup(cleanup)
+        worker.proc, worker.pgid = proc, proc.pid
+        self.assertEqual(proc.stdout.readline().strip(), "child-ready")
+        self.ctl.apply(P.GateState("draining", 2, drain_deadline_ts=1010.0))
+        worker.host_yield = AgentWorker.HOST_SAFE_POINT
+        worker.stop_group_now("safe point", grace=0, group=False)
+        self.assertIsNotNone(proc.poll())  # leader gone; child still owns stdout
+        done = threading.Event()
+        errors = []
+        with mock.patch("ameesh.runner.registry.release") as release:
+            def finish_turn():
+                try:
+                    proc.stdout.read()  # blocked until the deadline kills child
+                    worker.proc = None
+                    worker.release_lease()
+                    self.runner.gate_foreground = None
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    done.set()
+            reader = threading.Thread(target=finish_turn, daemon=True)
+            reader.start()
+            self.assertFalse(done.wait(0.05))
+            self.assertFalse(self.ctl.tick().drained)
+            self.now = 1010.0
+            self.ctl.tick()
+            self.assertTrue(done.wait(5), "child held stdout beyond withdrawal deadline")
+            reader.join(timeout=1)
+            self.assertEqual(errors, [])
+            release.assert_called_once_with(worker.db, worker.name, "once-runner", 7)
+            self.assertNotEqual(worker.host_yield, AgentWorker.HOST_SAFE_POINT)
+            self.assertTrue(self.ctl.tick().drained)
 
     def test_transitions_et_acquittements(self):
         a = _FauxWorker("a")
@@ -567,6 +658,15 @@ class ExecuteurTest(PgTestCase):
         conf = dataclasses.replace(self.base(), host_gate=gate, host_gate_path=self.state_path,
                                    host_mediated=mediated, **cfg)
         runner = Runner(conf, self.base_db(conf))
+        # These L112 fixtures use PostgreSQL directly for storage, but exercise
+        # the mediated gate/controller. Since main extracted the classic
+        # guard, a direct DB selects that guard (with shared /run acks).
+        # Install the controller under test explicitly; real remote transport
+        # is covered by L109, and the classic guard by L159f.
+        if runner.host_gate is not None:
+            runner.host_gate.stop()
+        runner.host_gate = H.controller_from_config(runner)
+        runner.gate_frozen_between = lambda start, end: 0.0
         fil = threading.Thread(target=runner.run, daemon=True)
         fil.start()
 
