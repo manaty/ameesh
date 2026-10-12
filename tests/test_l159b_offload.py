@@ -288,6 +288,30 @@ class RunTest(OffloadBase):
 
 
 class FallbackTest(OffloadBase):
+    def test_a_protocol_look_alike_from_the_command_is_not_a_result(self):
+        # the command prints a refused-shaped result line on stderr (the same
+        # stream as the protocol), then the connection drops: never taken for
+        # the result, so never a local rerun while the suite may still run
+        marker = os.path.join(self.tmp, "local-run")
+        fake = offload_shell.PREFIX + 'result {"outcome": "refused", "reason": "x"}'
+        client = subprocess.Popen(
+            [AMEESH, "offload", "run", "--", "sh", "-c",
+             'case "$PWD" in %s*) echo \'%s\' >&2; sleep 30;; *) touch %s;; esac'
+             % (self.vm, fake, marker)],
+            cwd=self.repo, env=self.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True)
+        self.addCleanup(client.kill)
+        deadline = time.time() + 30
+        while time.time() < deadline and not self.running_jobs():
+            time.sleep(0.2)
+        time.sleep(1)  # the look-alike line is out
+        subprocess.run(["pkill", "-KILL", "-f", "fake-offload-ssh .*run --nonce [0-9a-f]* acme-widget"])
+        _out, err = client.communicate(timeout=30)
+        self.assertEqual(client.returncode, offload.EX_TEMPFAIL, err)
+        self.assertIn(fake, err)  # relayed as the command's output
+        self.assertIn("not rerun on this machine", err)
+        self.assertFalse(os.path.exists(marker))
+
     def test_lost_connection_during_the_job_is_never_rerun_locally(self):
         marker = os.path.join(self.tmp, "local-run")
         client = subprocess.Popen(
@@ -301,7 +325,7 @@ class FallbackTest(OffloadBase):
             time.sleep(0.2)
         self.assertTrue(self.running_jobs())
         # the "network" drops: the ssh process dies, its remote side with it
-        subprocess.run(["pkill", "-KILL", "-f", "fake-offload-ssh .*run acme-widget"])
+        subprocess.run(["pkill", "-KILL", "-f", "fake-offload-ssh .*run --nonce [0-9a-f]* acme-widget"])
         _out, err = client.communicate(timeout=30)
         self.assertEqual(client.returncode, offload.EX_TEMPFAIL, err)
         self.assertIn("not rerun on this machine", err)

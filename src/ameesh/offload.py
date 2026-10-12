@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shlex
 import signal
 import subprocess
@@ -167,18 +168,23 @@ def run_remote(remote: Remote, words: list[str]) -> tuple[int, dict | None, str 
     """Runs `run …` on the VM: stdout passes through, stderr too except the
     protocol lines. Returns (ssh exit code, result object or None, job id
     or None)."""
-    proc = subprocess.Popen(remote.argv(*words), stdin=subprocess.DEVNULL,
-                            stderr=subprocess.PIPE)
+    # the command's stderr shares the stream: only lines tagged with this
+    # session's nonce are protocol, a look-alike printed by the command is
+    # relayed as output and never taken for a result
+    nonce = secrets.token_hex(16)
+    tag = "%s%s " % (PREFIX, nonce)
+    proc = subprocess.Popen(remote.argv(words[0], "--nonce", nonce, *words[1:]),
+                            stdin=subprocess.DEVNULL, stderr=subprocess.PIPE)
     state: dict = {"job": None, "result": None}
 
     def relay() -> None:
         for raw in iter(proc.stderr.readline, b""):
             line = raw.decode(errors="replace")
-            if not line.startswith(PREFIX):
+            if not line.startswith(tag):
                 sys.stderr.write(line)
                 sys.stderr.flush()
                 continue
-            kind, _, rest = line[len(PREFIX):].rstrip("\n").partition(" ")
+            kind, _, rest = line[len(tag):].rstrip("\n").partition(" ")
             if kind == "job":
                 state["job"] = rest
             elif kind == "result":

@@ -15,9 +15,12 @@ no port forwarding, only these four verbs (read from SSH_ORIGINAL_COMMAND):
   status [<job>]           one JSON object per job (running or waiting)
   cancel <job>             stops a job
 
-Protocol lines go to stderr, prefixed with `ameesh-offload: `. A `run`
-always ends with `ameesh-offload: result {json}` (outcome `done`, `refused`,
-`stopped`, `timeout`, `cancelled` or `error`); the client strips them.
+Protocol lines go to stderr, prefixed with `ameesh-offload: ` and, when the
+client gives one (`<verb> --nonce N …`, 32 hex digits, per session), with
+that nonce: the command's own stderr shares the stream, and the client
+takes only lines carrying its nonce for protocol. A `run` always ends with
+`ameesh-offload: N result {json}` (outcome `done`, `refused`, `stopped`,
+`timeout`, `cancelled` or `error`); the client strips them.
 
 Each job runs:
 * under a concurrency token (`flock` on `locks/slot-N`; the client sees the
@@ -108,8 +111,16 @@ def _dir(cfg: dict, *parts: str) -> str:
     return path
 
 
+#: the client's per-session nonce (`<verb> --nonce N …`): every protocol line
+#: carries it, so a command printing a line shaped like the protocol (a fake
+#: `result`, `refused`…) on the same stderr is never taken for one; the job
+#: never receives it (its environment comes from `base_env`)
+NONCE = ""
+NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
 def emit(kind: str, payload: object = None) -> None:
-    line = PREFIX + kind
+    line = PREFIX + (NONCE + " " if NONCE else "") + kind
     if payload is not None:
         line += " " + (payload if isinstance(payload, str)
                        else json.dumps(payload, sort_keys=True))
@@ -847,6 +858,13 @@ def main(argv: list[str] | None = None) -> int:
     if not words or words[0] not in VERBS:
         sys.stderr.write(PREFIX + "allowed verbs: put, run, status, cancel\n")
         return 2
+    if words[1:2] == ["--nonce"]:
+        if len(words) < 3 or not NONCE_RE.match(words[2]):
+            sys.stderr.write(PREFIX + "invalid --nonce\n")
+            return 2
+        global NONCE
+        NONCE = words[2]
+        words = words[:1] + words[3:]
     try:
         cfg = load_config(config)
         return VERBS[words[0]](cfg, words[1:])
