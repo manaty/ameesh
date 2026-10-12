@@ -6,9 +6,10 @@
 -- 4.7 then 16 GB free: no disk floor fired. Two columns, null when the work
 -- root is not on btrfs or sysfs is unreadable — no guessing:
 --   * `btrfs_unallocated_bytes`: device sizes minus the space carved into
---     data, metadata and system block groups;
+--     block groups (every group kind the kernel lists);
 --   * `btrfs_metadata_headroom_bytes`: metadata total minus used minus
 --     reserved (`bytes_may_use`), floored at 0.
+-- The supervisor role reads both (deploy/sql/role-superviseur.sql).
 -- The floors stay declarative (`policy.resources.min_btrfs_unallocated`,
 -- `min_btrfs_metadata_headroom` of the Host card, defaults otherwise).
 

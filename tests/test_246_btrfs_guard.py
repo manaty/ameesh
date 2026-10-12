@@ -5,7 +5,9 @@ fake /sys tree with the golden values of the 2026-10-11 outage."""
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import struct
 import tempfile
 import unittest
 from unittest import mock
@@ -26,22 +28,29 @@ class FakeHost:
 
     def __init__(self, root: str):
         self.root = root
+        #: what the filesystem ioctls answer (None: unavailable, block sizes)
+        self.fs_sizes: tuple[str, list[int]] | None = None
         self.sysfs = os.path.join(root, "sys")
         self.mountinfo = os.path.join(root, "mountinfo")
         self.work = os.path.join(root, "home", "work")
         os.makedirs(self.work)
 
-    def mount(self, source: str, fstype: str = "btrfs", point: str | None = None) -> None:
-        point = point or os.path.join(self.root, "home")
+    def mount(self, source: str, fstype: str = "btrfs", point: str | None = None,
+              over: tuple[str, str] | None = None) -> None:
+        """`over`: (fstype, source) of a second mount on the same point."""
+        point = (point or os.path.join(self.root, "home")).replace(" ", "\\040")
         with open(self.mountinfo, "w", encoding="utf-8") as fh:
             fh.write("22 1 0:21 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n")
             fh.write("35 22 0:31 /@home %s rw,noatime shared:2 - %s %s rw,ssd\n"
-                     % (point.replace(" ", "\\040"), fstype, source))
+                     % (point, fstype, source))
+            if over:
+                fh.write("41 35 8:17 / %s rw,relatime shared:3 - %s %s rw\n"
+                         % ((point,) + over))
 
     def btrfs(self, devices: dict[str, int], disk_total: dict[str, int],
-              metadata: tuple[int, int, int]) -> None:
+              metadata: tuple[int, int, int], meta_kind: str = "metadata") -> None:
         """`devices`: name -> size in bytes; `disk_total`: kind -> bytes;
-        `metadata`: (total_bytes, bytes_used, bytes_may_use)."""
+        `metadata`: (total_bytes, bytes_used, bytes_may_use) of `meta_kind`."""
         fs = os.path.join(self.sysfs, "fs", "btrfs", UUID)
         os.makedirs(os.path.join(fs, "devices"))
         for name, size in devices.items():
@@ -53,7 +62,8 @@ class FakeHost:
             os.makedirs(os.path.join(fs, "allocation", kind), exist_ok=True)
             self.write(os.path.join(fs, "allocation", kind, "disk_total"), value)
         for name, value in zip(("total_bytes", "bytes_used", "bytes_may_use"), metadata):
-            self.write(os.path.join(fs, "allocation", "metadata", name), value)
+            os.makedirs(os.path.join(fs, "allocation", meta_kind), exist_ok=True)
+            self.write(os.path.join(fs, "allocation", meta_kind, name), value)
 
     @staticmethod
     def write(path: str, value) -> None:
@@ -62,7 +72,8 @@ class FakeHost:
 
     def read(self) -> dict:
         return platform.btrfs_allocation(self.work, mountinfo=self.mountinfo,
-                                         sysfs=self.sysfs)
+                                         sysfs=self.sysfs,
+                                         device_sizes=lambda path: self.fs_sizes)
 
 
 def outage(host: FakeHost) -> None:
@@ -130,8 +141,81 @@ class ReaderTest(_Tmp):
         self.host.mount("/dev/dm-0")
         self.host.btrfs({"dm-0": 10 * GIB}, {"data": GIB, "metadata": GIB},
                         (GIB, 0, 0))
+        # a group directory without its `disk_total`
+        os.makedirs(os.path.join(self.host.sysfs, "fs", "btrfs", UUID, "allocation", "system"))
         self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": None,
                                             "btrfs_metadata_headroom_bytes": GIB})
+
+    def test_every_allocation_group_is_counted(self):
+        # codex r1 (1): recent kernels add data-reloc and metadata-treelog
+        # (zoned); a fully allocated 100 GiB volume must read 0, not 21 GiB
+        self.host.mount("/dev/dm-0")
+        self.host.btrfs({"dm-0": 100 * GIB},
+                        {"data": 70 * GIB, "metadata": 8 * GIB, "system": GIB,
+                         "data-reloc": 20 * GIB, "metadata-treelog": GIB},
+                        (4 * GIB, 3 * GIB, 0))
+        self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": 0,
+                                            "btrfs_metadata_headroom_bytes": GIB})
+
+    def test_mixed_groups_are_read(self):
+        # codex r1 (1): a mixed-group filesystem has `mixed` instead of data
+        # and metadata; its headroom is the metadata headroom
+        self.host.mount("/dev/dm-0")
+        self.host.btrfs({"dm-0": 16 * GIB}, {"mixed": 15 * GIB, "system": 32 * MIB},
+                        (15 * GIB, 14 * GIB, 512 * MIB), meta_kind="mixed")
+        fs = os.path.join(self.host.sysfs, "fs", "btrfs", UUID, "allocation")
+        self.host.write(os.path.join(fs, "global_rsv_size"), 512 * MIB)  # a file, not a group
+        self.assertEqual(self.host.read(), {
+            "btrfs_unallocated_bytes": GIB - 32 * MIB,
+            "btrfs_metadata_headroom_bytes": 512 * MIB})
+
+    def test_the_filesystem_device_size_wins(self):
+        # codex r1 (2): a 200 GiB block device holding a 100 GiB filesystem
+        # (shrunk, or device grown without resize), fully allocated
+        self.host.mount("/dev/dm-0")
+        self.host.btrfs({"dm-0": 200 * GIB},
+                        {"data": 90 * GIB, "metadata": 9 * GIB, "system": GIB},
+                        (4 * GIB, 3 * GIB, 0))
+        self.assertEqual(self.host.read()["btrfs_unallocated_bytes"], 100 * GIB)
+        self.host.fs_sizes = (UUID.replace("-", ""), [100 * GIB])
+        self.assertEqual(self.host.read()["btrfs_unallocated_bytes"], 0)
+        # sizes of another filesystem (fsid mismatch): back to the block size
+        self.host.fs_sizes = ("0" * 32, [100 * GIB])
+        self.assertEqual(self.host.read()["btrfs_unallocated_bytes"], 100 * GIB)
+
+    def test_device_sizes_from_the_ioctls(self):
+        # the unprivileged ioctls, faked: device 2 was removed (ENODEV)
+        fsid = bytes.fromhex(UUID.replace("-", ""))
+        sizes = {1: 509943480320, 3: 4089446400}
+
+        def ioctl(fd, request, buf):
+            if request == platform.host.BTRFS_IOC_FS_INFO:
+                self.assertEqual(len(buf), 1024)
+                struct.pack_into("=QQ16s", buf, 0, 3, 2, fsid)
+                return 0
+            self.assertEqual((request, len(buf)), (platform.host.BTRFS_IOC_DEV_INFO, 4096))
+            devid = struct.unpack_from("=Q", buf)[0]
+            if devid not in sizes:
+                raise OSError(19, "No such device")
+            struct.pack_into("=QQ", buf, 24, sizes[devid] // 2, sizes[devid])
+            return 0
+
+        with mock.patch("fcntl.ioctl", ioctl):
+            self.assertEqual(platform.host.btrfs_device_sizes(self.tmp),
+                             (fsid.hex(), [509943480320, 4089446400]))
+        self.assertEqual(platform.host.BTRFS_IOC_FS_INFO, 0x8400941F)
+        self.assertEqual(platform.host.BTRFS_IOC_DEV_INFO, 0xD000941E)
+        with mock.patch("fcntl.ioctl", side_effect=OSError(25, "Not a typewriter")):
+            self.assertIsNone(platform.host.btrfs_device_sizes(self.tmp))
+
+    def test_the_visible_mount_wins(self):
+        # codex r1 (3): ext4 mounted over the btrfs point hides it
+        outage(self.host)
+        self.host.mount("/dev/dm-0", over=("ext4", "/dev/sdb1"))
+        self.assertEqual(self.host.read(), {"btrfs_unallocated_bytes": None,
+                                            "btrfs_metadata_headroom_bytes": None})
+        self.host.mount("/dev/sdb1", fstype="ext4", over=("btrfs", "/dev/dm-0"))
+        self.assertEqual(self.host.read()["btrfs_unallocated_bytes"], MIB)
 
     def test_sample_publishes_the_btrfs_reading(self):
         with mock.patch.object(resources.platform, "btrfs_allocation",
@@ -237,15 +321,16 @@ class AlertTest(unittest.TestCase):
         self.assertEqual([a["type"] for a in warning], ["host_disk_low"])
         self.assertFalse(warning[0]["urgent"])
         self.assertIn("btrfs non alloué 8.0 GiB (seuil 10.0 GiB)", warning[0]["detail"])
-        # the same episode keeps its key; entering the critical level changes it
+        # one episode, one key, whatever the level (codex r1 (4))
         again = self.alerts({"btrfs_unallocated_bytes": 7 * GIB})
         self.assertEqual(exploitation.alert_key(warning[0]), exploitation.alert_key(again[0]))
         critical = self.alerts({"btrfs_unallocated_bytes": MIB,
                                 "btrfs_metadata_headroom_bytes": 0})
         self.assertEqual([a["type"] for a in critical], ["host_disk_low"])
         self.assertTrue(critical[0]["urgent"])
-        self.assertNotEqual(exploitation.alert_key(warning[0]),
-                            exploitation.alert_key(critical[0]))
+        self.assertEqual(critical[0]["reason"], "critique")
+        self.assertEqual(exploitation.alert_key(warning[0]),
+                         exploitation.alert_key(critical[0]))
         self.assertEqual(sorted(critical[0]["breaches"]),
                          ["min_btrfs_metadata_headroom", "min_btrfs_unallocated"])
 
@@ -254,6 +339,61 @@ class AlertTest(unittest.TestCase):
         by_type = {a["type"]: a for a in found}
         self.assertEqual(set(by_type), {"host_disk_low", "host_pressure"})
         self.assertEqual(by_type["host_pressure"]["breaches"], ["min_mem_available"])
+
+    def test_warning_critical_flips_stay_one_episode(self):
+        # codex r1 (4): warning -> critical -> warning -> critical while still
+        # under the floor: one push, one escalation, no resolution until the
+        # reading is back above the floor
+        sent: list = []
+        sender = mock.Mock(send=lambda channel, message: sent.append(message))
+        notifier = notify.Notifier(None, notify.parse_config({"default": ["desktop"]}),
+                                   sender=sender, log=lambda text: None,
+                                   clock=lambda: 1000.0)
+        readings = [{"btrfs_unallocated_bytes": 8 * GIB},
+                    {"btrfs_unallocated_bytes": MIB},
+                    {"btrfs_unallocated_bytes": 8 * GIB},
+                    {"btrfs_unallocated_bytes": MIB},
+                    {"btrfs_unallocated_bytes": 20 * GIB}]
+        events = []
+        with mock.patch.multiple(notify.Notifier, _brief_orchestrators=mock.DEFAULT,
+                                 _brief_agents=mock.DEFAULT, _github_issues=mock.DEFAULT,
+                                 _ci_failures=mock.DEFAULT):
+            for reading in readings:
+                current = [dict(a, responsible="human:proprio")
+                           for a in self.alerts(reading)]
+                events.append([r["event"] for r in notifier.run_pass(None, current=current)])
+        self.assertEqual(events, [["raised"], ["raised"], [], [], ["resolved"]])
+        # the warning, the escalation (urgent), then the resolution
+        self.assertEqual([m.urgent for m in sent], [False, True, False])
+        self.assertIn("plus aucun nouveau tour", sent[1].body)
+
+    def test_raised_critical_is_not_escalated_again(self):
+        sent: list = []
+        notifier = notify.Notifier(None, notify.parse_config({"default": ["desktop"]}),
+                                   sender=mock.Mock(send=lambda c, m: sent.append(m)),
+                                   log=lambda text: None, clock=lambda: 1000.0)
+        with mock.patch.multiple(notify.Notifier, _brief_orchestrators=mock.DEFAULT,
+                                 _brief_agents=mock.DEFAULT, _github_issues=mock.DEFAULT,
+                                 _ci_failures=mock.DEFAULT):
+            for reading in ({"btrfs_unallocated_bytes": MIB},
+                            {"btrfs_unallocated_bytes": 8 * GIB},
+                            {"btrfs_unallocated_bytes": MIB}):
+                current = [dict(a, responsible="human:proprio")
+                           for a in self.alerts(reading)]
+                notifier.run_pass(None, current=current)
+        self.assertEqual([m.urgent for m in sent], [True])
+
+    def test_supervisor_grants_cover_the_new_columns(self):
+        # codex r1 (5): the supervisor contract lists every column it reads
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(repo, "deploy", "sql", "role-superviseur.sql"),
+                  encoding="utf-8") as fh:
+            sql = re.sub(r"--[^\n]*", "", fh.read())
+        block = re.search(r"\('host_resources', ARRAY\[(.*?)\]\)", sql, re.S).group(1)
+        granted = set(re.findall(r"'(\w+)'", block))
+        self.assertLessEqual({"btrfs_unallocated_bytes", "btrfs_metadata_headroom_bytes"},
+                             granted)
+        self.assertLessEqual(set(storage.postgres.hosts.MEASURE_COLUMNS), granted)
 
     def test_pushed_to_the_owner_and_blocks_backlog_takes(self):
         self.assertIn("host_disk_low", notify.DEFAULT_TYPES)

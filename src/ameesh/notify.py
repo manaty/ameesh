@@ -922,9 +922,19 @@ class Notifier:
                     "alert": {k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
                     "raised_ts": now, "human": None, "source": None, "status": "nouvelle",
                     "channels": {}}
+                if alert.get("type") in exploitation.ESCALATING:
+                    entry["escalated"] = bool(alert.get("critical"))
                 self._raise(entry, router, now)
                 if alert.get("type") not in alert_briefs.BRIEFED_TYPES:
                     self._brief_orchestrators(db, alert, router)
+            elif (alert.get("type") in exploitation.ESCALATING and alert.get("critical")
+                  and not entry.get("escalated")):
+                # #246 : même épisode, niveau critique atteint — poussée une
+                # seconde fois, sur place (une seule fois par épisode ; le
+                # retour au seuil puis au critique ne la relève pas)
+                entry.update(alert={k: alert.get(k) for k in _KEPT if alert.get(k) is not None},
+                             escalated=True, status="nouvelle", channels={})
+                self._raise(entry, router, now)
             elif entry["status"] in ("sans_destinataire", "sans_canal"):
                 # un responsable (ou une route) a pu apparaître depuis
                 self._raise(entry, router, now)
