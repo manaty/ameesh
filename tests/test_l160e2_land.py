@@ -468,9 +468,8 @@ class EpochFenceTest(_Land):
         epoch = self.locks.held[key][1]
         if lease_ref:
             clone = resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p")).path
-            mine = land.lease_commit(clone, key, epoch, "runner-2")
-            _git(clone, "push", "-q", "--force", self.origin,
-                 "%s:%s" % (mine, land.LEASE_REF + "main"))
+            land.take_remote_lease(clone, self.origin, land.LEASE_REF + "main", key, epoch,
+                                   "runner-2")
 
     def test_local_stale_push_refused_target_unmoved(self):
         self.queued(4)
@@ -540,7 +539,7 @@ class EpochFenceTest(_Land):
         gh.head, gh.ci, gh.base_on_merge = out["sha"], "green", "develop"
         done = self.land(4, gh=gh, locks=locks)
         self.assertEqual((done["result"], done["wrong_base"]), ("landed", "develop"))
-        self.assertIn("NOT main", self.fake.queue_rows[4]["reason"])
+        self.assertTrue(self.fake.queue_rows[4]["reason"].startswith(land.WRONG_BASE))
         self.assertTrue(any("merged into develop, not main" in body for _, body, _ in self.sent))
 
     def test_lease_ref_as_a_branch_prefix(self):
@@ -565,13 +564,130 @@ class EpochFenceTest(_Land):
             fh.write("#!/bin/sh\ngrep -q refs/ameesh/ && exit 1\nexit 0\n")
         os.chmod(hook, 0o755)
         before = _git(self.origin, "rev-parse", "main")
+        notes, reason = len(self.fake.notes), self.fake.queue_rows[4]["reason"]
         out = self.land(4)
         self.assertEqual(out["result"], "error", out)
         self.assertIn("lease ref", out["error"])
+        # #194 r6: nothing written at all
+        self.assertEqual(len(self.fake.notes), notes)
+        self.assertEqual(self.fake.queue_rows[4]["reason"], reason)
         self.assertIn("radar.projects.p.lease_ref", out["error"])
         self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
         self.assertEqual(self.fake.queue_rows[4]["state"], "queued")
         self.assertIsNone(self.locks.held["p:main"][0])        # lease released
+
+
+class RemoteLockTest(_Land):
+    """#194 r6: the remote lease ref is the lock; the landing push changes it,
+    so the server checks it; the queue writes lock the lease row."""
+
+    pause_after_renewal = StaleExecutorTest.pause_after_renewal
+
+    def clone(self):
+        return resolutions.Replayer(self.repo, radar.clone_dir(self.cfg, "p")).path
+
+    def test_lease_ref_moved_by_the_server_during_the_push(self):
+        # what runner-2 does between the advertisement and runner-1's update:
+        # a pre-receive hook takes the remote lease for a newer epoch
+        self.queued(4)
+        mark = os.path.join(self.tmp, "steal")
+        hook = os.path.join(self.origin, "hooks", "pre-receive")
+        with open(hook, "w") as fh:
+            fh.write("#!/bin/sh\ncat >/dev/null\nif [ -f %s ]; then rm -f %s\n"
+                     "export GIT_AUTHOR_NAME=r2 GIT_AUTHOR_EMAIL=r2@x GIT_COMMITTER_NAME=r2"
+                     " GIT_COMMITTER_EMAIL=r2@x\n"
+                     "t=$(git mktree </dev/null)\n"
+                     "c=$(git commit-tree $t -m 'ameesh land lease p:main epoch 99 (runner-2)')\n"
+                     "env -u GIT_QUARANTINE_PATH git update-ref %smain $c\nfi\nexit 0\n"
+                     % (mark, mark, land.LEASE_REF))
+        os.chmod(hook, 0o755)
+        before = _git(self.origin, "rev-parse", "main")
+
+        def arm():
+            open(mark, "w").close()
+        self.pause_after_renewal(lambda: (arm(), self.locks.land_lock("p:main", "runner-2", 600)))
+        out = self.land(4)
+        self.assertNotEqual(out["result"], "landed", out)
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+        self.assertIn("epoch 99", _git(self.origin, "log", "-1", "--format=%s",
+                                       land.LEASE_REF + "main"))
+
+    def test_a_late_stale_publisher_never_rolls_the_epoch_back(self):
+        clone = self.clone()
+        os.makedirs(os.path.dirname(clone), exist_ok=True)
+        resolutions.Replayer(self.repo, clone).ensure()
+        ref = land.LEASE_REF + "main"
+        land.take_remote_lease(clone, self.origin, ref, "p:main", 2, "runner-2")
+        two = _git(self.origin, "rev-parse", ref)
+        with self.assertRaises(land.LandError):
+            land.take_remote_lease(clone, self.origin, ref, "p:main", 1, "runner-1")
+        self.assertEqual(_git(self.origin, "rev-parse", ref), two)
+
+    def test_first_to_the_server_wins_the_next_epoch_agrees(self):
+        # runner-2 takes the database lease but has not published yet: the
+        # remote lock is still runner-1's, whose landing is then the valid one
+        self.queued(4)
+        self.pause_after_renewal(lambda: self.locks.land_lock("p:main", "runner-2", 600))
+        out = self.land(4)
+        self.assertEqual(out["result"], "busy", out)          # its writes are stale
+        self.assertIn("ameesh-work: 4", self.origin_log())
+        self.fake.land_lock = self.locks.land_lock
+        cfg2 = dataclasses.make_dataclass("Cfg", ["state_dir"])(self.tmp + "/state2")
+        again = land.land_head(cfg2, None, self.project, self.fake._row(4), owner="runner-2")
+        self.assertEqual(again["result"], "landed", again)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "landed")
+
+    def test_unreadable_base_after_the_merge_is_uncertain(self):
+        self.project = dataclasses.replace(self.project, land="pr")
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        locks: dict = {}
+        out = self.land(4, gh=gh, locks=locks)
+        gh.head, gh.ci = out["sha"], "green"
+        real = gh.__call__
+        merged = []
+
+        def flaky(args, timeout=60.0):
+            if args[:2] == ["pr", "merge"]:
+                merged.append(True)
+            elif args[:2] == ["pr", "view"] and merged:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 502")
+            return real(args, timeout=timeout)
+        done = self.land(4, gh=flaky, locks=locks)
+        self.assertEqual(done["result"], "uncertain", done)
+        self.assertTrue(self.fake.queue_rows[4]["reason"].startswith(land.UNCERTAIN))
+        self.assertTrue(any("base unreadable after the merge" in body
+                            for _, body, _ in self.sent))
+        store = mock.Mock()
+        store.work.queue.return_value = [dict(self.fake.queue_rows[4], assignee="a4",
+                                              updated_ts=1.0)]
+        with mock.patch.object(storage, "of", return_value=store):
+            from ameesh import exploitation, notify
+            alerts = exploitation._land_uncertain(None)
+        self.assertEqual([(a["type"], a["lot"]) for a in alerts], [("land_uncertain", 4)])
+        self.assertIn("land_uncertain", notify.URGENT_TYPES)
+
+    def test_wrong_base_warned_even_with_the_lease_lost(self):
+        self.project = dataclasses.replace(self.project, land="pr")
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        locks: dict = {}
+        out = self.land(4, gh=gh, locks=locks)
+        gh.head, gh.ci, gh.base_on_merge = out["sha"], "green", "develop"
+        real = gh.__call__
+
+        def expire_on_merge(args, timeout=60.0):
+            if args[:2] == ["pr", "merge"]:
+                held = self.locks.held["p:main"]
+                self.locks.held["p:main"] = (held[0], held[1], 0)
+                self.locks.land_lock("p:main", "runner-2", 600)
+            return real(args, timeout=timeout)
+        done = self.land(4, gh=expire_on_merge, locks=locks)
+        self.assertEqual(done["wrong_base"], "develop", done)
+        self.assertTrue(any("merged into develop, not main" in body for _, body, _ in self.sent))
+        self.assertTrue(self.fake.queue_rows[4]["reason"].startswith(land.WRONG_BASE))
 
 
 class SettingsAndAlertTest(unittest.TestCase):
@@ -646,6 +762,35 @@ class LeaseDbTest(PgTestCase):
         self.assertIsNotNone(ops.queue_update(lot, state="landed", lease=("q:main", "r2", two)))
         self.assertEqual(ops.queue()[0]["state"], "landed")
         self.assertIsNotNone(ops.queue_update(lot, reason="radar"))   # no lease: unchanged
+
+
+    def test_queue_write_waits_for_the_lease_row(self):
+        """#194 r6: the guarded write locks the lease row: an acquisition in
+        progress makes it wait, then it sees the new epoch and writes nothing."""
+        import threading
+        ops = storage.of(self.db).work
+        lot = work.add(self.db, title="row lock")["id"]
+        ops.queue_add(lot, target="main", frozen_sha="b" * 40, note="queued", actor="t")
+        one = ops.land_lock("s:main", "r1", 60)
+        other = self.connect()
+        result = {}
+
+        def stale_write():
+            result["row"] = ops.queue_update(lot, state="ejected", lease=("s:main", "r1", one))
+        try:
+            with other.transaction() as tx:
+                tx.query("UPDATE merge_locks SET owner = 'r2', epoch = epoch + 1"
+                         " WHERE target = 's:main' RETURNING epoch")
+                writer = threading.Thread(target=stale_write)
+                writer.start()
+                writer.join(timeout=1.5)
+                self.assertTrue(writer.is_alive(), "the write did not wait for the lease row")
+            writer.join(timeout=30)
+        finally:
+            other.close()
+        self.assertIsNone(result.get("row"))
+        self.assertEqual([r["state"] for r in ops.queue() if r["work_item_id"] == lot],
+                         ["queued"])
 
 
 if __name__ == "__main__":

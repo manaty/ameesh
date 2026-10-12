@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -199,27 +200,78 @@ def pr_merge(slug: str, number, sha: str, method: str, gh=_gh) -> str | None:
 #: #194 r5: the lease of a target, on the remote itself (local mode): moved by
 #: each new holder before anything else, checked by every landing push
 LEASE_REF = "refs/ameesh/land/"
-#: a fixed identity and date: the lease commit of (key, epoch, owner) is the
-#: same commit whoever computes it, on any pass
 _LEASE_ENV = {"GIT_AUTHOR_NAME": "ameesh", "GIT_AUTHOR_EMAIL": "ameesh@localhost",
-              "GIT_COMMITTER_NAME": "ameesh", "GIT_COMMITTER_EMAIL": "ameesh@localhost",
-              "GIT_AUTHOR_DATE": "1970-01-01T00:00:00Z",
-              "GIT_COMMITTER_DATE": "1970-01-01T00:00:00Z"}
+              "GIT_COMMITTER_NAME": "ameesh", "GIT_COMMITTER_EMAIL": "ameesh@localhost"}
+_LEASE_RE = re.compile(r"^ameesh land lease (\S+) epoch ([0-9]+) \((.*?)\)")
+#: where the clone keeps the remote lease ref it last read
+_SEEN_LEASE = "refs/ameesh/seen-lease"
 
 
-def lease_commit(path: str, key: str, epoch: int, owner: str) -> str:
-    """The commit that stands for the lease `key` at `epoch` (empty tree)."""
+class _LeaseRefused(LandError):
+    """#194 r6: the remote lease ref could not be taken: nothing is written."""
+
+
+def lease_commit(path: str, key: str, epoch: int, owner: str, *, parent: str | None = None,
+                 landed: int | None = None) -> str:
+    """A commit (empty tree) that stands for the lease `key` at `epoch`, held
+    by `owner`; child of `parent` (the ref's value it replaces); `landed`:
+    the commit that a landing push writes over the holder's own."""
     env = dict(os.environ, **_LEASE_ENV)
     tree = subprocess.run(["git", "-C", path, "mktree"], input=b"", capture_output=True,
                           env=env, check=False)
     if tree.returncode != 0:
         raise GitError("git mktree: %s" % tree.stderr.decode("utf-8", "replace")[:200])
+    message = "ameesh land lease %s epoch %d (%s)%s" % (
+        key, epoch, owner, ": landed lot %d" % landed if landed is not None else "")
     proc = subprocess.run(["git", "-C", path, "commit-tree", tree.stdout.decode().strip(),
-                           "-m", "ameesh land lease %s epoch %d (%s)" % (key, epoch, owner)],
+                           *(["-p", parent] if parent else []), "-m", message],
                           capture_output=True, env=env, check=False)
     if proc.returncode != 0:
         raise GitError("git commit-tree: %s" % proc.stderr.decode("utf-8", "replace")[:200])
     return proc.stdout.decode().strip()
+
+
+def remote_lease(path: str, url: str, ref: str) -> tuple:
+    """The remote lease ref, fetched into the clone: `(sha or None, epoch or
+    None, owner or None)`. Raises when the remote cannot be read."""
+    from . import resolutions
+    proc = resolutions._run(path, "ls-remote", url, ref, timeout=FETCH_TIMEOUT)
+    if proc.returncode != 0:
+        raise _LeaseRefused("git ls-remote %s: %s" % (ref, resolutions._err(proc)[-200:]))
+    found = resolutions._text(proc).split()
+    if not found:
+        return None, None, None
+    sha = found[0]
+    proc = resolutions._run(path, "fetch", "--quiet", url, "+%s:%s" % (ref, _SEEN_LEASE),
+                            timeout=FETCH_TIMEOUT)
+    if proc.returncode != 0:
+        raise _LeaseRefused("git fetch %s: %s" % (ref, resolutions._err(proc)[-200:]))
+    text = resolutions._text(resolutions._run(path, "log", "-1", "--format=%s", sha))
+    match = _LEASE_RE.match(text)
+    return (sha, int(match.group(2)), match.group(3)) if match else (sha, None, None)
+
+
+def take_remote_lease(path: str, url: str, ref: str, key: str, epoch: int,
+                      owner: str) -> str:
+    """#194 r6: the remote lease ref IS the lock. Taken by a compare-and-swap
+    from the value read to this holder's epoch commit (never `--force`: a late
+    stale publisher cannot roll the epoch back). Kept as is when it already
+    stands for this holder at this epoch. Returns the value this holder now
+    expects; `_LeaseRefused` if a newer epoch holds it or the push is refused."""
+    from . import resolutions
+    sha, held_epoch, held_by = remote_lease(path, url, ref)
+    if held_epoch == epoch and held_by == owner:
+        return sha
+    if held_epoch is not None and held_epoch > epoch:
+        raise _LeaseRefused("the remote lease %s is at epoch %d (%s), newer than ours (%d)"
+                            % (ref, held_epoch, held_by, epoch))
+    mine = lease_commit(path, key, epoch, owner, parent=sha)
+    proc = resolutions._run(path, "push", "--quiet", "--no-verify",
+                            "--force-with-lease=%s:%s" % (ref, sha or ""), url,
+                            "%s:%s" % (mine, ref), timeout=FETCH_TIMEOUT)
+    if proc.returncode != 0:
+        raise _LeaseRefused("lease ref %s not taken (%s)" % (ref, resolutions._err(proc)[-200:]))
+    return mine
 
 
 class _Landing:
@@ -269,25 +321,15 @@ class _Landing:
         return dict({"lot": self.lot, "to": row.get("assignee"), "kind": "ejected",
                      "message_id": sent, "result": "ejected"}, **extra)
 
-    def landed(self, merged: dict, base, *, pr=None, wrong_base=None) -> dict:
+    def landed(self, merged: dict, base, *, pr=None) -> dict:
         self.release = True
         row, project = self.row, self.project
         reason = "merged by ameesh (%s)" % merged["sha"][:12]
-        if wrong_base:
-            reason = "merged by ameesh (%s) into %s, NOT %s: check it by hand" % (
-                merged["sha"][:12], wrong_base, _branch_of(row["target"]))
         if not self.write(state="landed", reason=reason,
                           note="merge queue of %s: landed by ameesh, %s%s" % (
                               row["target"], merged["sha"][:12],
                               ", PR #%s" % pr if pr else ""), actor=work.SYSTEM_SENDER):
             return self.busy("lease on %s lost: landing not written" % self.key)
-        if wrong_base:
-            merge_queue._wake(self.db, row.get("assignee"), self.lot, (
-                "Merge queue of %s, lot #%d: PR #%s was merged into %s, not %s (retargeted "
-                "between the last read and the merge). Check it by hand."
-                % (row["target"], self.lot, pr, wrong_base, _branch_of(row["target"]))),
-                {"project": project.name, "target": row["target"], "kind": "land",
-                 "lot": self.lot, "reason": "wrong base"})
         gates_text = ", ".join("`%s`" % g for g in project.gates)
         _passive(self.db, row.get("assignee"), self.lot, (
             "Merge queue of %s, lot #%d « %s »: merged by ameesh (%s%s)%s. Gates passed on "
@@ -297,8 +339,7 @@ class _Landing:
                "; resolutions replayed by rerere on %s" % ", ".join(merged["files"][:6])
                if merged.get("state") == "replayed" else "", gates_text)),
             {"project": project.name, "target": row["target"], "commit": merged["sha"]})
-        return {"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr,
-                "wrong_base": wrong_base}
+        return {"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr}
 
 
 def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=None,
@@ -351,18 +392,18 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     lease_ref = (getattr(project, "lease_ref", "") or LEASE_REF) + branch
     mine = None
     if project.land == "local":
-        # #194 r5: the lease on the remote, moved BEFORE any write of this
-        # holder: from then on a stale holder's landing push is refused
-        mine = lease_commit(replayer.path, landing.key, landing.epoch, landing.owner)
-        proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify", "--force",
-                                url, "%s:%s" % (mine, lease_ref), timeout=FETCH_TIMEOUT)
-        if proc.returncode != 0:
+        # #194 r6: the remote lease ref is the lock itself, taken (compare and
+        # swap) BEFORE any write of this holder; the database expiry only
+        # allows trying. Refused: nothing written, the lease released
+        try:
+            mine = take_remote_lease(replayer.path, url, lease_ref, landing.key,
+                                     landing.epoch, landing.owner)
+        except _LeaseRefused as exc:
             landing.release = True
-            # fail closed: no lease on the remote, no landing
-            raise LandError("lease ref %s not moved (%s): nothing written, retried; if the "
-                            "remote refuses this namespace, set radar.projects.%s.lease_ref "
-                            "to a branch prefix (e.g. ameesh-land/)"
-                            % (lease_ref, resolutions._err(proc)[-200:], project.name))
+            return {"lot": lot, "result": "error", "error": (
+                "%s: nothing written, retried; if the remote refuses this namespace, set "
+                "radar.projects.%s.lease_ref to a branch prefix (e.g. ameesh-land/)"
+                % (exc, project.name))}
     # land: local — a lot left `landing` (lease lost or runner gone) is
     # landed again from the start: the push to the target is never forced
     if not landing.write(state="landing", note="merge queue of %s: landing (%s)"
@@ -389,15 +430,18 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     if project.land == "local":
         if not landing.held():
             return landing.busy("lease on %s lost before pushing" % landing.key)
-        # #194 r4/r5: one atomic push, two compare-and-swaps: the target on
-        # the base seen, the remote lease on this holder's epoch — a stale
-        # holder is refused by the server once the next one moved the lease
+        # #194 r6: one atomic push, two compare-and-swaps that the server
+        # checks: the target on the base seen, the lease ref on the value this
+        # holder wrote — moved to a child commit, so git sends that update
+        # and receive-pack checks its old value (an unchanged ref is skipped)
         target_ref = "refs/heads/%s" % branch
+        after = lease_commit(replayer.path, landing.key, landing.epoch, landing.owner,
+                             parent=mine, landed=lot)
         proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify", "--atomic",
                                 "--force-with-lease=%s:%s" % (target_ref, base),
                                 "--force-with-lease=%s:%s" % (lease_ref, mine), url,
                                 "%s:%s" % (merged["sha"], target_ref),
-                                "%s:%s" % (mine, lease_ref), timeout=FETCH_TIMEOUT)
+                                "%s:%s" % (after, lease_ref), timeout=FETCH_TIMEOUT)
         if proc.returncode != 0:
             if not landing.held():
                 return landing.busy("lease on %s lost: push refused" % landing.key)
@@ -542,11 +586,50 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
         landing.write(reason="PR merge refused (%s): retried" % error[:200])
         return {"lot": lot, "result": "retry", "error": error}
     try:
-        after = pr_view(slug, status["number"], gh=gh)["base"]
-    except LandError:
-        after = branch          # unread: the merge itself is not in doubt
+        after, unread = pr_view(slug, status["number"], gh=gh)["base"], None
+    except LandError as exc:
+        after, unread = None, str(exc)[:200]
+    if after != branch:
+        return _merged_in_doubt(landing, status["number"], after, unread)
     return landing.landed({"sha": row["landing_sha"], "state": "pr", "files": []}, None,
-                          pr=status["number"], wrong_base=after if after != branch else None)
+                          pr=status["number"])
+
+
+#: #194 r6: reasons of a PR merged where it should not have been, or that
+#: cannot be checked — the urgent alert `land_uncertain` reads them
+WRONG_BASE = "WRONG BASE: "
+UNCERTAIN = "UNCERTAIN: "
+
+
+def _merged_in_doubt(landing: _Landing, pr, after, unread) -> dict:
+    """The PR is merged, but into another base (retargeted inside the last
+    window) or its base cannot be read back. The warning goes first, whatever
+    happens to the lease; the merge is a fact, written even by a stale holder
+    (`land_uncertain` alerts on it)."""
+    row, lot, branch = landing.row, landing.lot, _branch_of(landing.row["target"])
+    reason = (WRONG_BASE + "PR #%s merged into %s, not %s: check it by hand"
+              % (pr, after, branch)) if after else (
+        UNCERTAIN + "PR #%s merged, base unreadable after the merge (%s): check it by hand"
+        % (pr, unread))
+    merge_queue._wake(landing.db, row.get("assignee"), lot, (
+        "Merge queue of %s, lot #%d: %s." % (row["target"], lot, reason)),
+        {"project": landing.project.name, "target": row["target"], "kind": "land",
+         "lot": lot, "reason": reason})
+    landing.release = True
+    landing.ops.queue_update(lot, state="landed", reason=reason,
+                             note="merge queue of %s: %s" % (row["target"], reason),
+                             actor=work.SYSTEM_SENDER)
+    return {"lot": lot, "result": "uncertain" if after is None else "landed",
+            "wrong_base": after, "pr": pr, "reason": reason}
+
+
+def uncertain(db) -> list[dict]:
+    """#194 r6: lots merged by ameesh into a wrong base, or not checked."""
+    try:
+        rows = storage.of(db).work.queue()
+    except Exception:  # noqa: BLE001 - database without 0058
+        return []
+    return [r for r in rows if (r.get("reason") or "").startswith((WRONG_BASE, UNCERTAIN))]
 
 
 def run_pass(cfg, db, project, report: dict, *, owner: str, locks=None, gh=_gh) -> list[dict]:

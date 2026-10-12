@@ -712,19 +712,23 @@ class WorkItems(interface.WorkItems):
                      note="", actor="", clear_rank=False, lease=None) -> dict | None:
         key, owner, epoch = lease if lease is not None else (None, None, None)
         with self.db.transaction() as tx:
+            # #194 r6: the lease row is locked by the same statement (an
+            # acquisition waits for this write, or this write sees its new
+            # epoch), its expiry read on the wall clock, not the transaction's
             rows = tx.query(
-                "UPDATE merge_queue SET state = coalesce(%s, state),"
+                "WITH lease AS (SELECT 1 FROM merge_locks l"
+                "    WHERE l.target = %s AND l.owner = %s AND l.epoch = %s"
+                "      AND l.expires_at > clock_timestamp() FOR UPDATE)"
+                " UPDATE merge_queue SET state = coalesce(%s, state),"
                 "   rank = CASE WHEN %s THEN NULL ELSE coalesce(%s, rank) END,"
                 "   landing_sha = CASE WHEN %s IN ('queued', 'ejected') THEN NULL"
                 "                      ELSE coalesce(%s, landing_sha) END,"
                 "   reason = coalesce(%s, reason), updated_at = now()"
                 " WHERE work_item_id = %s"
-                "   AND (%s::text IS NULL OR EXISTS (SELECT 1 FROM merge_locks l"
-                "        WHERE l.target = %s AND l.owner = %s AND l.epoch = %s"
-                "          AND l.expires_at > now()))"
+                "   AND (%s::text IS NULL OR EXISTS (SELECT 1 FROM lease))"
                 " RETURNING work_item_id",
-                (state, state == "ejected" or bool(clear_rank), rank, state or "", landing_sha, reason,
-                 int(item_id), key, key, owner, epoch))
+                (key, owner, epoch, state, state == "ejected" or bool(clear_rank), rank,
+                 state or "", landing_sha, reason, int(item_id), key))
             if not rows:
                 return None
             if note:
@@ -745,16 +749,17 @@ class WorkItems(interface.WorkItems):
     def land_lock(self, key, owner, ttl_s, *, epoch=None) -> int | None:
         if epoch is not None:  # renewal: only the holder, at its epoch
             rows = self.db.query(
-                "UPDATE merge_locks SET expires_at = now() + %s * interval '1 second'"
+                "UPDATE merge_locks SET expires_at = clock_timestamp()"
+                " + %s * interval '1 second'"
                 " WHERE target = %s AND owner = %s AND epoch = %s RETURNING epoch",
                 (float(ttl_s), key, owner, int(epoch)))
             return int(rows[0]["epoch"]) if rows else None
         rows = self.db.query(
             "INSERT INTO merge_locks (target, owner, epoch, expires_at)"
-            " VALUES (%s, %s, 1, now() + %s * interval '1 second')"
+            " VALUES (%s, %s, 1, clock_timestamp() + %s * interval '1 second')"
             " ON CONFLICT (target) DO UPDATE SET owner = excluded.owner,"
             "   epoch = merge_locks.epoch + 1, expires_at = excluded.expires_at"
-            " WHERE merge_locks.owner IS NULL OR merge_locks.expires_at < now()"
+            " WHERE merge_locks.owner IS NULL OR merge_locks.expires_at < clock_timestamp()"
             "    OR merge_locks.owner = excluded.owner"
             " RETURNING epoch", (key, owner, float(ttl_s)))
         return int(rows[0]["epoch"]) if rows else None
