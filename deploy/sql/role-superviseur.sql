@@ -408,6 +408,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'required_capabilities',
         -- L118 (0050) : branche du lot, sa cible, dernier commit vu en avance
         'branch', 'branch_target', 'branch_head',
+        -- L118d (0372) : quand le relevé a vu branch_head, et la dernière
+        -- fusion partielle (vue la première fois quand)
+        'branch_head_at', 'partial_merge', 'partial_seen_at',
         -- L157 (0052) : durée estimée (minutes, source courte, auteur,
         -- instant) et début mesuré du travail — de l'ÉTAT, comme les dates
         -- prévues

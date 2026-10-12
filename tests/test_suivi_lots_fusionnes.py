@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 import unittest
 from unittest import mock
 
@@ -527,8 +528,105 @@ class MergeSweepTest(_Base):
         _git(self.repo, "merge", "-q", "--ff-only", "develop")
         self.commit("la-suite")
         _git(self.repo, "checkout", "-q", "develop")
+        self.assertEqual(self.sync()["results"][0]["how"], "partial")   # vue en avance
         _git(self.repo, "merge", "-q", "--ff-only", branch)
         self.assertEqual(self.sync()["merged"], 1)
+
+    def pointe_puis_fusion_partielle(self, *, antidate=None):
+        """S vu en avance, la branche ramenée à P (poussée forcée) et fusionnée
+        partiellement (M, sa date de committer `antidate`), puis S fusionné
+        dans la cible par une autre branche, et la branche du lot avancée
+        jusqu'à la cible. Le numéro du lot."""
+        n = self.lot("parapluie")["id"]
+        self.db.execute("UPDATE work_items SET created_at = now() - interval '1 hour'"
+                        " WHERE id = %s", (n,))
+        branch = "lot/%d-un" % n
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        self.commit("p")
+        p = _git(self.repo, "rev-parse", "HEAD")
+        self.commit("s")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.sync()                                               # S vu en avance
+        s = work.get(self.db, n)["branch_head"]
+        _git(self.repo, "branch", "-q", "-f", "autre", s)
+        _git(self.repo, "branch", "-q", "-f", branch, p)          # poussée forcée à P
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Merge branch '%s'\n\nameesh-work-partial: %d" % (branch, n), branch,
+             env={"GIT_COMMITTER_DATE": antidate} if antidate else None)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge branch 'autre'", "autre")
+        _git(self.repo, "branch", "-q", "-f", branch, "develop")  # avance rapide
+        return n
+
+    def test_l118d_r1_pointe_vue_avant_la_fusion_partielle(self):
+        # #346 r1 P1 : la pointe S, vue avant la fusion partielle, ne la lève pas
+        n = self.pointe_puis_fusion_partielle()
+        for _ in range(2):
+            report = self.sync()
+            self.assertEqual((report["merged"], report["results"][0]["how"]), (0, "partial"))
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
+
+    def test_l118d_r2_fusion_partielle_antidatee(self):
+        # #346 r2 P1 : la date de committer de M, antidatée de 10 minutes
+        # (au-delà de CLOCK_SLACK_S), ne compte pas : seul l'instant où le
+        # relevé a vu M, horloge de la base, compte
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 600))
+        n = self.pointe_puis_fusion_partielle(antidate=stamp)
+        for _ in range(2):                   # M vue, puis relevé suivant
+            report = self.sync()
+            self.assertEqual((report["merged"], report["results"][0]["how"]), (0, "partial"))
+        row = work.get(self.db, n)
+        self.assertLess(row["branch_head_ts"], row["partial_seen_ts"])
+
+    def test_l118d_r2_pointe_inchangee_relevee_apres_la_fusion(self):
+        # #346 r2 (suite) : S vu en avance, P seul fusionné partiellement, la
+        # branche toujours à S : S est relevée de nouveau après M, puis entre
+        # dans la cible en avance rapide : le lot est fermé
+        n = self.lot("parapluie")["id"]
+        branch = "lot/%d-un" % n
+        _git(self.repo, "checkout", "-q", "-b", branch, "develop")
+        self.commit("p")
+        p = _git(self.repo, "rev-parse", "HEAD")
+        self.commit("s")
+        _git(self.repo, "checkout", "-q", "develop")
+        self.sync()                                               # S vu en avance
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "Merge branch '%s'\n\nameesh-work-partial: %d" % (branch, n), p)
+        self.assertEqual(self.sync()["results"][0]["how"], "partial")   # S relevée après M
+        row = work.get(self.db, n)
+        self.assertGreater(row["branch_head_ts"], row["partial_seen_ts"])
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge branch 'autre'", branch)
+        self.assertEqual(self.sync()["merged"], 1)
+
+    def test_l118d_r1_erreur_git_garde_le_lot_ouvert(self):
+        # #346 r1 P2 : une ascendance illisible (code 128) n'est pas une preuve
+        merge = {"sha": "m" * 40, "ts": 0.0, "parents": ["a" * 40, "b" * 40]}
+        codes = iter([128, 128, 0])
+        with mock.patch.object(plan_git, "_git", side_effect=lambda *a: subprocess.
+                               CompletedProcess(a, next(codes))):
+            self.assertFalse(plan_git._moved_past(self.repo, "s" * 40, 10_000.0, "s" * 40,
+                                                  merge, 0.0))
+
+    def test_l118d_avance_jusqu_a_la_cible_sans_travail_nouveau(self):
+        # #312 r3 : après une fusion partielle, la branche est avancée jusqu'à
+        # develop sans travail nouveau (et develop a avancé entre-temps) : le
+        # lot reste ouvert
+        lot = self.lot("parapluie")
+        n = lot["id"]
+        branch = "lot/%d-un" % n
+        self.merge(branch, "Merge branch '%s'\n\nameesh-work-partial: %d" % (branch, n))
+        self.assertEqual(self.sync()["results"][0]["how"], "partial")
+        _git(self.repo, "checkout", "-q", branch)
+        _git(self.repo, "merge", "-q", "--ff-only", "develop")      # la fusion elle-même
+        _git(self.repo, "checkout", "-q", "develop")
+        report = self.sync()
+        self.assertEqual((report["merged"], report["results"][0]["how"]), (0, "partial"))
+        self.commit("travail-d-un-autre")                         # develop avance
+        _git(self.repo, "checkout", "-q", branch)
+        _git(self.repo, "merge", "-q", "--ff-only", "develop")
+        _git(self.repo, "checkout", "-q", "develop")
+        report = self.sync()
+        self.assertEqual((report["merged"], report["results"][0]["how"]), (0, "partial"))
+        self.assertEqual(work.get(self.db, n)["state"], "intake")
 
     def test_cited_lots(self):
         cas = {

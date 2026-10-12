@@ -1028,7 +1028,12 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def set_branch_head(self, item_id: int, branch: str, head: str | None) -> bool:
         """L118 : retient le dernier commit de la branche vu en avance sur sa
-        cible, si la branche du lot est toujours `branch`."""
+        cible, si la branche du lot est toujours `branch` (et quand, L118d)."""
+
+    @abc.abstractmethod
+    def set_partial_seen(self, item_id: int, sha: str) -> bool:
+        """#346 r2 : retient la dernière fusion partielle `sha` du lot et
+        l'instant où le relevé l'a vue la première fois."""
 
     @abc.abstractmethod
     def open_for_sweep(self, limit: int) -> list[dict]:
