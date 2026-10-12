@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { finished } from 'node:stream/promises';
+import { Worker, SHARE_ENV } from 'node:worker_threads';
 const require = createRequire(path.join(process.argv[2], 'package.json'));
 const { Context } = await import(require.resolve('@deepseek-ai/cordis'));
 let runtime;
@@ -33,7 +34,25 @@ const report = output => {
     nodeOptions: process.env.NODE_OPTIONS };
 };
 try {
-  if (mode === 'terminal') {
+  if (mode.startsWith('worker-')) {
+    const workerFile = path.join(path.dirname(fileURLToPath(import.meta.url)), 'worker.cjs');
+    const workerData = { providerRoot: process.argv[2],
+      providerEntry: require.resolve('@deepseek-ai/dsh-subprocess-local'),
+      workerFile, nested: mode.startsWith('worker-nested') };
+    const options = { workerData };
+    if (mode !== 'worker-default') options.execArgv = [];
+    if (mode.startsWith('worker-share')) options.env = SHARE_ENV;
+    if (mode === 'worker-eval' || mode === 'worker-foreign') options.eval = true;
+    const input = mode === 'worker-eval' ? readFileSync(workerFile, 'utf8') :
+      mode === 'worker-foreign' ? 'require("node:worker_threads").parentPort.postMessage({value:42});' : workerFile;
+    const messages = [];
+    const worker = new Worker(input, options);
+    worker.on('message', message => messages.push(message));
+    const code = await new Promise((resolve, reject) => {
+      worker.on('exit', resolve); worker.on('error', reject);
+    });
+    console.log(JSON.stringify({ code, messages, nodeOptions: process.env.NODE_OPTIONS }));
+  } else if (mode === 'terminal') {
     const handle = await runtime.spawnTerminal({ argv: ['/bin/sh', '-c', command],
       cwd: process.cwd(), rows: 24, cols: 80, graceMs: 200 });
     let output = '';

@@ -7,7 +7,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { fileURLToPath } = require('node:url');
-const { createRequire, registerHooks } = require('node:module');
+const { createRequire, registerHooks, syncBuiltinESMExports } = require('node:module');
+const threads = require('node:worker_threads');
 
 const PROVIDER = '@deepseek-ai/dsh-subprocess-local';
 const VERSION = '0.1.5-rc.2';
@@ -35,6 +36,108 @@ function packageOf(filename) {
     if (parent === directory) return null;
     directory = parent;
   }
+}
+
+function providerFile(filename) {
+  const info = packageOf(filename);
+  if (!info) return false;
+  return info.pkg.name === PROVIDER ||
+    (path.basename(path.dirname(info.file)) === 'dsh-subprocess-local' &&
+     path.basename(path.dirname(path.dirname(info.file))) === '@deepseek-ai');
+}
+
+function optionTokens(text) {
+  // NODE_OPTIONS uses double quotes and escapes, not shell expansion.
+  const tokens = [];
+  let token = '', quoted = false, started = false;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (char === '"') { quoted = !quoted; started = true; }
+    else if (char === '\\' && quoted) {
+      if (++i === text.length) throw new Error('invalid escape in NODE_OPTIONS');
+      token += text[i]; started = true;
+    } else if (/\s/.test(char) && !quoted) {
+      if (started) tokens.push(token);
+      token = ''; started = false;
+    } else { token += char; started = true; }
+  }
+  if (quoted) throw new Error('unclosed quote in NODE_OPTIONS');
+  if (started) tokens.push(token);
+  return tokens;
+}
+
+function preloadTargets(tokens, includeImports = true) {
+  const targets = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const flag = tokens[i];
+    if (flag === '--require' || flag === '--import' || flag === '-r') {
+      if (!tokens[++i]) throw new Error('missing Node preload target');
+      if (includeImports || flag !== '--import') targets.push(tokens[i]);
+    } else if (flag.startsWith('--require=') || flag.startsWith('--import=')) {
+      if (includeImports || !flag.startsWith('--import=')) targets.push(flag.slice(flag.indexOf('=') + 1));
+    } else if (flag.startsWith('-r') && flag.length > 2) {
+      targets.push(flag.slice(2));
+    }
+  }
+  return targets;
+}
+
+function resolvePreload(target) {
+  if (target.startsWith('file:')) return fs.realpathSync(fileURLToPath(target));
+  return createRequire(path.join(process.cwd(), '__ameesh_preloads__.cjs')).resolve(target);
+}
+
+function assertNoProviderPreloads(nodeOptions = process.env.NODE_OPTIONS || '', argv = process.execArgv, checkCache = true) {
+  if (checkCache) for (const filename of Object.keys(require.cache)) {
+    if (providerFile(filename)) throw new Error(`provider already loaded before the cgroup guard: ${filename}`);
+  }
+  for (const target of preloadTargets([...optionTokens(nodeOptions), ...argv])) {
+    // Bare names and unresolved profile paths also fail closed; no cached
+    // provider is repaired or granted permission after its evaluation.
+    if (target === PROVIDER || target.startsWith(PROVIDER + '/') ||
+        target.includes('/@deepseek-ai/dsh-subprocess-local/')) {
+      throw new Error(`provider declared as a Node preload: ${target}`);
+    }
+    let filename;
+    try { filename = resolvePreload(target); } catch { continue; }
+    if (providerFile(filename)) throw new Error(`provider declared as a Node preload: ${target}`);
+  }
+}
+
+function assertGuardFirst() {
+  const targets = preloadTargets([...optionTokens(process.env.NODE_OPTIONS || ''), ...process.execArgv], false);
+  const own = targets.findIndex(target => {
+    try { return resolvePreload(target) === __filename; } catch { return false; }
+  });
+  if (own > 0) throw new Error('cgroup guard must be the first --require preload; earlier modules can retain unguarded Worker references');
+}
+
+function protectWorkers() {
+  const OriginalWorker = threads.Worker;
+  threads.Worker = class CgroupGuardedWorker extends OriginalWorker {
+    constructor(filename, options = {}) {
+      const argv = options.execArgv === undefined ? process.execArgv : options.execArgv;
+      const env = options.env && options.env !== threads.SHARE_ENV ? options.env : process.env;
+      const nodeOptions = env.NODE_OPTIONS || '';
+      try {
+        assertNoProviderPreloads(nodeOptions, argv, false);
+        // NODE_OPTIONS requires run before execArgv requires. With a private
+        // env put the guard first there too. SHARE_ENV cannot be changed just
+        // for one worker, so refuse ambient require preloads in that case.
+        if (options.env === threads.SHARE_ENV && preloadTargets(optionTokens(nodeOptions), false).length) {
+          throw new Error('SHARE_ENV workers with ambient --require preloads are unsupported by the cgroup guard');
+        }
+      }
+      catch (error) { fail(error); }
+      // Explicit execArgv: [] cannot discard the thread-local guard. Install
+      // it first; every guarded worker also wraps nested Worker creation.
+      const guardedEnv = options.env === threads.SHARE_ENV ? threads.SHARE_ENV :
+        { ...env, NODE_OPTIONS: '--require=' + JSON.stringify(__filename) + ' ' + nodeOptions };
+      super(filename, { ...options, env: guardedEnv, execArgv: ['--require', __filename, ...argv] });
+    }
+  };
+  // Update named ESM Worker imports; child_process bindings remain untouched.
+  syncBuiltinESMExports();
 }
 
 function verifySource(info, source) {
@@ -71,7 +174,9 @@ const spawn = (command, args, ...rest) => {
 };`;
 }
 
-function installLoader() {
+function installLoader(rejectProvider = false) {
+  assertNoProviderPreloads();
+  assertGuardFirst();
   if (typeof registerHooks !== 'function') {
     throw new Error('Node synchronous module hooks are unavailable (requires Node >=22.15)');
   }
@@ -96,9 +201,8 @@ function installLoader() {
       try {
         const info = packageOf(fileURLToPath(url));
         if (!info) return loaded;
-        const providerPath = path.basename(path.dirname(info.file)) === 'dsh-subprocess-local' &&
-          path.basename(path.dirname(path.dirname(info.file))) === '@deepseek-ai';
-        if (info.pkg.name !== PROVIDER && !providerPath) return loaded;
+        if (!providerFile(fileURLToPath(url))) return loaded;
+        if (rejectProvider) throw new Error('dsh provider is not allowed in a worker thread');
         if (loaded.format !== 'module') throw new Error('unexpected provider module format');
         if (loaded.source === null || loaded.source === undefined) throw new Error('provider source is unavailable for verification');
         const source = typeof loaded.source === 'string' ? loaded.source : Buffer.from(loaded.source).toString('utf8');
@@ -113,6 +217,8 @@ function installLoader() {
 }
 
 function activate() {
+  assertNoProviderPreloads();
+  assertGuardFirst();
   // Early check uses Node's entry resolution (exports, not pkg.main). Actual
   // imports are independently checked by the loader, wherever the profile
   // resolves them. This check is not used as permission to load an override.
@@ -137,12 +243,27 @@ function activate() {
     throw new Error('CLI provider export does not select the reviewed runtime entry');
   }
   installLoader();
+  protectWorkers();
   // Preserve other options for Node tools without propagating this dsh policy.
   const option = '--require=' + JSON.stringify(__filename);
   process.env.NODE_OPTIONS = (process.env.NODE_OPTIONS || '').replace(option, '').trim();
 }
 
 module.exports = { verifySource, installLoader, scopedBindings };
-if (process.platform === 'linux' && (process.env.NODE_OPTIONS || '').includes('--require=' + JSON.stringify(__filename))) {
-  try { activate(); } catch (error) { fail(error); }
+if (process.platform === 'linux') {
+  try {
+    const targets = preloadTargets([...optionTokens(process.env.NODE_OPTIONS || ''), ...process.execArgv]);
+    const ownPreload = targets.some(target => {
+      try { return resolvePreload(target) === __filename; } catch { return false; }
+    });
+    if (ownPreload) {
+      if (threads.isMainThread) activate();
+      else {
+        installLoader(true);
+        protectWorkers();
+        const option = '--require=' + JSON.stringify(__filename);
+        process.env.NODE_OPTIONS = (process.env.NODE_OPTIONS || '').replace(option, '').trim();
+      }
+    }
+  } catch (error) { fail(error); }
 }

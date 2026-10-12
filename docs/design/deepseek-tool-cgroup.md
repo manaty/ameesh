@@ -10,7 +10,7 @@ do not cover its tool work. See [the read-only study #477](https://github.com/ma
 ## Adapter behavior
 
 On Linux, the DeepSeek adapter adds the packaged `deepseek_cgroup.cjs` preload
-to `NODE_OPTIONS`, preserving existing options. This covers headless and attach
+first in `NODE_OPTIONS`, preserving other options. This covers headless and attach
 launches; the resident ACP driver also uses the adapter environment.
 
 The preload uses Node's synchronous module hooks (**Node >=22.15**). An early
@@ -45,6 +45,31 @@ subprocesses, `systemd-run` invocations, the user bus and installed npm files
 are unaffected, even with an executable named `systemd-run` and identical
 arguments. The preload removes its own option before tool children start,
 preserving other Node options in ordinary and PTY Node tool processes.
+
+Before installation, the guard refuses any provider file already present in
+`require.cache`, and any `NODE_OPTIONS`/`execArgv` `--require`, `-r` or `--import`
+resolving to the provider. It does not try to patch an evaluated module. The
+guard must precede other `--require` preloads, so those cannot retain an
+unguarded `Worker` constructor before interception. The adapter puts it first,
+including when repositioning an existing guard option.
+
+Node's synchronous module hooks belong to one thread. The guard therefore
+wraps `worker_threads.Worker`, updates its ESM binding, and injects its preload
+explicitly into worker `execArgv`, even for **`execArgv: []`**, file workers,
+**`eval: true`**, and nested workers. A worker installs a thread-local hook
+that **refuses every provider load before evaluation**, with a warning and
+worker exit 127. It also refuses provider caches and declared provider preloads.
+Workers without a provider remain usable.
+
+For a private worker environment, the guard is first in `NODE_OPTIONS` too,
+because Node processes those requires before `execArgv`. This keeps a foreign
+preload from retaining an unguarded constructor for nested workers.
+**`env: SHARE_ENV` is supported without ambient `--require` preloads**; that
+combination is refused explicitly because installing the guard first there
+would change the shared parent's environment. Existing memory options remain
+shared. No temporary shared-environment mutation or after-the-fact repair is
+used. Ordinary child Node **processes** still lose the guard: that accepted
+residual is separate from same-process worker threads.
 
 A missing, changed or unreviewed provider, unavailable source or unsupported
 Node module-hook API logs a warning and exits 127 before provider execution.
@@ -109,6 +134,10 @@ uses **dsh's actual profile loader**, accepts a reviewed profile-local provider,
 and refuses version/source/export drift with the CLI provider unchanged.
 Standard CI runs the module-local binding, actual-source/exports rejection,
 incompatible-provider and read-only-check tests without this optional dependency.
+Real-provider regressions also reproduce refusal of a previously cached reviewed
+provider and declared require/import preloads, and thread-local refusal with
+default/empty `execArgv`, `SHARE_ENV`, eval, nested and retained-constructor
+workers. Native probes in those worker witnesses are stubbed, never executed.
 The PTY fixture waits for `setsid --wait` and the output stream's end before
 evaluating placement. VM behavior remains to be measured after authorized deployment.
 

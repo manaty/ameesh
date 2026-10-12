@@ -26,13 +26,18 @@ class EnvironmentTest(unittest.TestCase):
         options = deepseek_cgroup.node_options("--max-old-space-size=2048")
         self.assertEqual(deepseek_cgroup.node_options(options), options)
 
+    def test_existing_guard_is_moved_before_other_requires(self):
+        options = '--require="other.cjs" ' + deepseek_cgroup.node_options()
+        self.assertEqual(deepseek_cgroup.node_options(options),
+                         deepseek_cgroup.node_options('--require="other.cjs"'))
+
     def test_linux_deepseek_preserves_existing_node_options(self):
         with mock.patch.dict(os.environ, {"NODE_OPTIONS": "--max-old-space-size=2048"}), \
                 mock.patch("ameesh.platform.is_linux", return_value=True):
             adapter = adapters.adapter_for("deepseek", resolve=False)
             env = adapter.env()
             self.assertEqual(env["DSH_PERMISSION_MODE"], "danger-full-access")
-            self.assertTrue(env["NODE_OPTIONS"].startswith("--max-old-space-size=2048 "))
+            self.assertTrue(env["NODE_OPTIONS"].endswith(" --max-old-space-size=2048"))
             self.assertIn(str(deepseek_cgroup.PRELOAD), env["NODE_OPTIONS"])
 
     def test_other_harnesses_and_platforms_keep_environment(self):
@@ -160,6 +165,66 @@ assert.equal(ordinary.stdout.trim(),'ordinary');
             self.assertEqual(result.stdout, "")
             self.assertIn("WARNING: DeepSeek cgroup protection unavailable", result.stderr)
 
+    def test_preloaded_cache_and_declared_preloads_are_refused(self):
+        with tempfile.TemporaryDirectory(prefix='l490-preloads-') as tmp:
+            root = Path(tmp)
+            provider = root / "node_modules/@deepseek-ai/dsh-subprocess-local"
+            provider.mkdir(parents=True)
+            (root / "package.json").write_text('{"name":"@deepseek-ai/dsh"}')
+            (provider / "package.json").write_text(json.dumps({
+                "name": "@deepseek-ai/dsh-subprocess-local", "main": "index.js"}))
+            module = provider / "index.js"
+            module.write_text('module.exports = {};')
+            entry = root / "entry.cjs"
+            entry.write_text('console.log("COMMAND RAN");')
+            guard = deepseek_cgroup.node_options()
+            cases = [
+                ("--require=" + json.dumps(str(module)) + " " + guard, []),
+                (guard + " --require=" + json.dumps(str(module)), []),
+                (guard + " --import=" + json.dumps(module.as_uri()), []),
+                (guard, ["--require", str(module)]),
+                (guard, ["--import", module.as_uri()]),
+                (guard, ["-r", str(module)]),
+            ]
+            for options, argv in cases:
+                with self.subTest(options=options, argv=argv):
+                    result = subprocess.run([NODE, *argv, str(entry)],
+                        env=dict(os.environ, NODE_OPTIONS=options), capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 127, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertRegex(result.stderr, r"provider (already loaded|declared as a Node preload)")
+
+    def test_explicit_worker_guard_refuses_provider_without_vendor_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = Path(tmp) / "node_modules/@deepseek-ai/dsh-subprocess-local"
+            provider.mkdir(parents=True)
+            (provider / "package.json").write_text('{"name":"@deepseek-ai/dsh-subprocess-local"}')
+            module = provider / "index.js"
+            module.write_text('console.log("UNGUARDED WORKER RAN");')
+            code = """
+import {Worker} from 'node:worker_threads';
+import assert from 'node:assert/strict';
+const worker = new Worker('require(' + JSON.stringify(MODULE) + ')', {
+  eval: true, execArgv: ['--require', GUARD]
+});
+const code = await new Promise((resolve,reject) => {worker.on('error',reject);worker.on('exit',resolve);});
+assert.equal(code,127);
+""".replace("MODULE", json.dumps(str(module))).replace("GUARD", json.dumps(str(deepseek_cgroup.PRELOAD)))
+            result = self.run_node(code)
+            self.assertNotIn("UNGUARDED WORKER RAN", result.stdout)
+            self.assertIn("dsh provider is not allowed in a worker thread", result.stderr)
+
+    def test_guard_refuses_earlier_foreign_require_that_can_capture_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            earlier = Path(tmp) / "earlier.cjs"
+            earlier.write_text('globalThis.retainedWorker = require("node:worker_threads").Worker;')
+            options = "--require=" + json.dumps(str(earlier)) + " " + deepseek_cgroup.node_options()
+            result = subprocess.run([NODE, "-e", 'console.log("COMMAND RAN");'],
+                env=dict(os.environ, NODE_OPTIONS=options), capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 127)
+            self.assertEqual(result.stdout, "")
+            self.assertIn("cgroup guard must be the first --require preload", result.stderr)
+
 
 class PlacementCheckTest(unittest.TestCase):
     def test_outside_scope_and_reparented_scope_member_are_reported(self):
@@ -193,7 +258,7 @@ class PlacementCheckTest(unittest.TestCase):
 
 @unittest.skipUnless(NODE and PROVIDER and os.name == "posix", "optional installed dsh provider")
 class RealProviderTest(unittest.TestCase):
-    def invoke(self, mode, preload, profile=None, success=True):
+    def invoke(self, mode, preload, profile=None, success=True, provider_preload=None):
         with tempfile.TemporaryDirectory(prefix="l490-") as tmp:
             root = Path(tmp)
             (root / "package.json").write_text('{"name":"@deepseek-ai/dsh"}')
@@ -218,10 +283,21 @@ class RealProviderTest(unittest.TestCase):
             entry = entry_root / "entry.mjs"
             (entry_root / "provider.yml").write_text("- name: '@deepseek-ai/dsh-subprocess-local'\n")
             shutil.copy(Path(__file__).with_name("l490_provider.mjs"), entry)
+            shutil.copy(Path(__file__).with_name("l490_worker.cjs"), entry_root / "worker.cjs")
             env = os.environ.copy()
             env.pop("NODE_OPTIONS", None)
             if preload:
-                env["NODE_OPTIONS"] = deepseek_cgroup.node_options("--max-old-space-size=256")
+                existing = "--max-old-space-size=256"
+                if mode.endswith("-preload"):
+                    earlier = root / "earlier.cjs"
+                    earlier.write_text('globalThis.retainedWorker = require("node:worker_threads").Worker;')
+                    existing += " --require=" + json.dumps(str(earlier))
+                env["NODE_OPTIONS"] = deepseek_cgroup.node_options(existing)
+            if provider_preload:
+                target = Path(PROVIDER).resolve() / "lib/index.js"
+                flag = "--import=" + json.dumps(target.as_uri()) if provider_preload == "import" else "--require=" + json.dumps(str(target))
+                env["NODE_OPTIONS"] = (flag + " " + env["NODE_OPTIONS"] if provider_preload == "cache"
+                                       else env["NODE_OPTIONS"] + " " + flag)
             result = subprocess.run([NODE, str(entry), PROVIDER, mode], env=env,
                                     capture_output=True, text=True, timeout=20)
             if not success:
@@ -232,6 +308,46 @@ class RealProviderTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(result.stdout.strip(), "provider returned no report: " + result.stderr)
             return json.loads(result.stdout.splitlines()[-1]), result.stderr
+
+    def test_reviewed_provider_in_cache_or_preload_options_is_refused(self):
+        for kind in ("cache", "require", "import"):
+            with self.subTest(kind=kind):
+                result = self.invoke("ordinary", True, success=False, provider_preload=kind)
+                self.assertRegex(result.stderr, r"provider (already loaded|declared as a Node preload)")
+
+    def test_workers_default_and_empty_execargv_refuse_provider(self):
+        for mode in ("worker-default", "worker-empty"):
+            with self.subTest(mode=mode):
+                report, stderr = self.invoke(mode, True)
+                self.assertEqual(report["code"], 127)
+                self.assertEqual(report["messages"], [])
+                self.assertIn("dsh provider is not allowed in a worker thread", stderr)
+
+    def test_workers_share_env_and_eval_refuse_provider(self):
+        for mode in ("worker-share", "worker-eval"):
+            with self.subTest(mode=mode):
+                report, stderr = self.invoke(mode, True)
+                self.assertEqual(report["code"], 127)
+                self.assertEqual(report["messages"], [])
+                self.assertEqual(report["nodeOptions"], "--max-old-space-size=256")
+                self.assertIn("dsh provider is not allowed in a worker thread", stderr)
+
+    def test_nested_worker_refuses_provider_and_foreign_worker_runs(self):
+        report, stderr = self.invoke("worker-nested", True)
+        self.assertEqual(report["code"], 0)
+        self.assertEqual(report["messages"], [{"nestedExit": 127}])
+        self.assertIn("dsh provider is not allowed in a worker thread", stderr)
+        report, stderr = self.invoke("worker-foreign", True)
+        self.assertEqual(report["code"], 0)
+        self.assertEqual(report["messages"], [{"value": 42}])
+
+    def test_worker_preload_cannot_retain_unguarded_nested_constructor(self):
+        report, stderr = self.invoke("worker-nested-preload", True)
+        self.assertEqual(report["code"], 0)
+        self.assertEqual(report["messages"], [{"nestedExit": 127}])
+        self.assertIn("dsh provider is not allowed in a worker thread", stderr)
+        result = self.invoke("worker-share-preload", True, success=False)
+        self.assertIn("SHARE_ENV workers with ambient --require preloads are unsupported", result.stderr)
 
     def test_actual_dsh_loader_checks_profile_override_and_keeps_cgroup(self):
         fixed, _ = self.invoke("boot-ordinary", True, "reviewed")

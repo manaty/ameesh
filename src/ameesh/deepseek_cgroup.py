@@ -16,9 +16,9 @@ PRELOAD = Path(__file__).with_name("deepseek_cgroup.cjs").resolve()
 def node_options(existing: str = "") -> str:
     """Node parses double-quoted option values, rather than shell quoting."""
     option = "--require=" + json.dumps(str(PRELOAD), ensure_ascii=False)
-    if option in existing:
-        return existing
-    return (existing + " " + option).strip()
+    existing = existing.replace(option, "").strip()
+    # Run the guard before other require preloads can capture unwrapped APIs.
+    return (option + " " + existing).strip()
 
 
 def main() -> int:
