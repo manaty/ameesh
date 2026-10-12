@@ -441,6 +441,33 @@ class ClaudeStreamJsonTest(DriverCase):
                          (resident.COMPLETED, ("a", "b"), "ECHO:late"))
         self.assertNotIn({"control": "interrupt"}, self.trace())
 
+    def test_a_refused_interrupt_is_undone_before_any_result(self):
+        # codex r3 (#387): the result of "a" read between the refusal and the
+        # rollback must not end the turn — the rollback happens before the
+        # lock is released. The refusal waits here until that result is read.
+        driver = self.driver(env={"FAKE_CLAUDE_QUEUE": "1"})
+        driver.start()
+        turn = driver.send("SLOW first", input_id="a")
+        driver.steer("late", input_id="b")
+        control = driver._control
+
+        def refused_then_result_read(*args, **kwargs):
+            try:
+                return control(*args, **kwargs)
+            except resident.InputRefused:
+                deadline = time.monotonic() + 10
+                while not driver._final.startswith("ECHO:"):   # a result was read
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                raise
+
+        with mock.patch.object(driver, "_control", refused_then_result_read), \
+                mock.patch.object(resident, "MAX_OUTBOX_BYTES", 0):
+            self.assertFalse(driver.interrupt())
+        result = self.wait(turn)
+        self.assertEqual((result.status, result.inputs, result.final),
+                         (resident.COMPLETED, ("a", "b"), "ECHO:late"))
+
     def test_an_interrupt_leaves_unread_inputs_unserved(self):
         # codex r1 (#325): a steer the harness had not read when the turn was
         # interrupted is not reported as served

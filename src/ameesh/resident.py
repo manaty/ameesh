@@ -369,15 +369,20 @@ class ResidentDriver:
             previous = (self._interrupting, turn.interrupted)
             self._interrupting = True
             turn.interrupted = True
-        try:
-            return self._interrupt(turn)
-        except InputRefused as exc:
+
+        def undo() -> None:
             # never written: the turn goes on, or its next result would end it
-            # before the steers still unread (codex r2, #387)
-            log("interrupt: %s" % exc)
+            # before the steers still unread (codex r2, #387); called with the
+            # lock still held from the refusal, so that no result is read in
+            # between (codex r3)
             with self._lock:
                 if self._turn is turn:
                     self._interrupting, turn.interrupted = previous
+
+        try:
+            return self._interrupt(turn, undo)
+        except InputRefused as exc:
+            log("interrupt: %s" % exc)
             return False
 
     def probe(self, timeout: float = PROBE_TIMEOUT) -> bool:
@@ -494,8 +499,10 @@ class ResidentDriver:
         """Serve the input in `turn`; another turn if it serves it instead."""
         raise NotImplementedError
 
-    def _interrupt(self, turn: Turn) -> bool:
-        """Interrupt `turn`, never the turn after it."""
+    def _interrupt(self, turn: Turn, undo=None) -> bool:
+        """Interrupt `turn`, never the turn after it. `undo` puts the turn back
+        as it was if the request was never written (InputRefused), before the
+        lock is released."""
         raise NotImplementedError
 
 
@@ -673,9 +680,10 @@ class ClaudeStreamJson(ResidentDriver):
             self._release_input(writer=True)
 
     def _control(self, request: dict, timeout: float, *,
-                 turn: Turn | None = None) -> dict | None:
+                 turn: Turn | None = None, refused=None) -> dict | None:
         """Send a control request and wait for its answer; with `turn`, only
-        if it is still the running turn (None otherwise)."""
+        if it is still the running turn (None otherwise). `refused` is called
+        under the lock when the request is never written (InputRefused)."""
         with self._lock:
             if turn is not None and self._turn is not turn:
                 return None
@@ -686,8 +694,10 @@ class ClaudeStreamJson(ResidentDriver):
             try:
                 self._write({"type": "control_request", "request_id": request_id,
                              "request": request})
-            except ResidentError:
+            except ResidentError as exc:
                 self._controls.pop(request_id, None)
+                if refused is not None and isinstance(exc, InputRefused):
+                    refused()
                 raise
         try:
             deadline = time.monotonic() + timeout
@@ -736,10 +746,10 @@ class ClaudeStreamJson(ResidentDriver):
         # once by the writer: the harness reads it at the next safe point
         self._user(text, new_id(), input_id)
 
-    def _interrupt(self, turn: Turn) -> bool:
+    def _interrupt(self, turn: Turn, undo=None) -> bool:
         try:
             return self._control({"subtype": "interrupt"}, CONTROL_TIMEOUT,
-                                 turn=turn) is not None
+                                 turn=turn, refused=undo) is not None
         except InputRefused:
             raise  # never written: `interrupt` puts the turn back as it was
         except ResidentError as exc:
@@ -1020,7 +1030,7 @@ class CodexAppServer(ResidentDriver):
         # the turn ended without it (left out of its inputs): a new turn
         return self.send(text, input_id)
 
-    def _interrupt(self, turn: Turn) -> bool:
+    def _interrupt(self, turn: Turn, undo=None) -> bool:
         assert self.peer is not None
         deadline = time.monotonic() + CONTROL_TIMEOUT
         while True:
@@ -1356,7 +1366,7 @@ class AcpResident(ResidentDriver):
         self._followups.append((input_id, text))
         self._cancel()
 
-    def _interrupt(self, turn: Turn) -> bool:
+    def _interrupt(self, turn: Turn, undo=None) -> bool:
         with self._lock:
             if self._turn is not turn:
                 return False  # ended meanwhile: the next turn is not touched
