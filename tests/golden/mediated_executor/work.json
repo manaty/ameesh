@@ -103,7 +103,8 @@
       "current": "build",
       "loops": 0,
       "note": "PR ouverte",
-      "actor": "inge-front"
+      "actor": "inge-front",
+      "held": false
      }
     }
    },

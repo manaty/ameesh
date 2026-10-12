@@ -297,6 +297,7 @@ class SessionTest(unittest.TestCase):
             "AMEESH_BACKEND": "mediated", "AMEESH_EXEC_URL": self.server.url,
             "AMEESH_EXEC_TOKEN": SESSION, "AGENT_MAIL_NAME": "inge-front",
             "AMEESH_RUNNER_ID": OWNER, "AMEESH_LEASE_EPOCH": "42",
+            "AMEESH_HARNESS": "claude",  # fixture, never inherit the developer's harness
         }
         patch = mock.patch.dict(os.environ, env)
         patch.start()

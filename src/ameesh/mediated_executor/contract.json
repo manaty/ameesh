@@ -3374,6 +3374,15 @@
       "type": "string"
      },
      "required": true
+    },
+    {
+     "name": "held",
+     "kind": "keyword",
+     "schema": {
+      "type": "boolean"
+     },
+     "required": false,
+     "default": false
     }
    ],
    "result": {
@@ -3667,7 +3676,7 @@
   }
  ],
  "refused": {
-  "interface_total": 306,
+  "interface_total": 310,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3819,7 +3828,9 @@
     "history",
     "pending",
     "pending_for_lot",
-    "register_chat"
+    "prose_candidates",
+    "register_chat",
+    "source_mail"
    ],
    "ephemerals": [
     "create",
@@ -3840,6 +3851,7 @@
     "history",
     "lend_basis",
     "record_harness_version",
+    "since",
     "usage"
    ],
    "housekeeping": [
@@ -4009,7 +4021,8 @@
     "set_estimate",
     "set_issue_ref",
     "timeline",
-    "unassigned_lots"
+    "unassigned_lots",
+    "waiting_episodes"
    ]
   }
  },

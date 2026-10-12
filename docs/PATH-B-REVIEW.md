@@ -44,6 +44,11 @@ operations from main remain explicitly refused by the remote contract.
 The 2026-10-12 merge adds main's three optional cost metadata parameters to
 the mediated insert (null defaults) while keeping `source=device` forced.
 Host version polling and boot orphan review stay on classic hosts/server.
+The final main merge retains the optional `held=false` parameter of
+`work.move` and its open-decision-request check. Decision-source/prose reads,
+waiting-episode reads and host-history reads stay refused remotely; the
+310-operation interface is fully classified without increasing the 62
+admitted operations.
 
 ## Migrations
 

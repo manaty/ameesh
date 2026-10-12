@@ -15,7 +15,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 62 opérations et la liste des 244 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 62 opérations et la liste des 248 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -63,7 +63,7 @@ Comptes : 62 opérations, dont 24 lectures et 38 écritures. 52 passent par
 lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
 servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (306
+signature et les mêmes types. Il vérifie aussi que l'interface entière (310
 opérations après intégration de main le 12/10) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -122,6 +122,10 @@ the harness version poll and the boot orphan review. `turn_costs.insert`
 accepts main's optional `void_reason`, `price_fallback` and
 `cache_write_tokens` metadata, defaulting to null for older callers; its
 forced `source=device` and lease provenance remain unchanged.
+The latest main merge also refuses host-history reads, waiting-episode
+reads and decision-source/prose reads. `work.move` accepts the optional
+`held=false` argument added by main; it adds a database-side open-request
+check for a move, without exposing the decision operations to the device.
 
 ## Requête et réponse
 
