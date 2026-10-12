@@ -303,6 +303,64 @@ class PalierHaikuTest(unittest.TestCase):
         self.assertIsNone(cost.prompt_tier(cost.DEFAULT_PRICES, "claude-opus-5-5"))
 
 
+class PalierHaikuRepriseTest(Sandbox, PgTestCase):
+    """Session reprise sans repère : l'usage agrégé du `result` ne dit pas le
+    palier de chaque requête (relecture codex r2, P2 `cost.py:1018`)."""
+
+    def _tour_repris(self, nom: str, *appels) -> cost.TurnUsage:
+        self.events(nom, {"type": cost.TURN_MARKER, "resume": "s1", "ts": self.now},
+                    {"type": "system", "subtype": "init", "session_id": "s1"}, *appels,
+                    {"type": "result", "session_id": "s1", "total_cost_usd": 42.0,
+                     "usage": {"input_tokens": 120_000, "output_tokens": 2_000}})
+        return self.book().record(nom, start=1)
+
+    def _alertes(self) -> list:
+        return [a for a in exploitation.alerts(self.cfg, self.db)
+                if a["type"] == "turn_unpriced"]
+
+    def test_deux_requetes_sous_le_seuil_au_palier_bas(self):
+        nom = self.agent("a1", "claude", "claude-haiku-5-5")
+        tour = self._tour_repris(nom, _appel("m1", 60_000, 0, 1_000),
+                                 _appel("m2", 60_000, 0, 1_000))
+        # 2 × (60 000 × 0,10 + 1 000 × 0,50) / 1e6, pas 0,065 $ au palier haut
+        self.assertAlmostEqual(tour.usd, 0.013, places=9)
+        self.assertEqual((tour.input_tokens, tour.output_tokens), (120_000, 2_000))
+        self.assertIsNone(tour.price_fallback)
+        self.assertEqual(self._alertes(), [])
+
+    def test_requetes_de_part_et_d_autre_du_seuil(self):
+        nom = self.agent("a1", "claude", "claude-haiku-5-5")
+        tour = self._tour_repris(nom, _appel("m1", 10_000, 0, 1_000),
+                                 _appel("m2", 110_000, 0, 1_000))
+        attendu = (10_000 * 0.10 + 1_000 * 0.50 + 110_000 * 0.50 + 1_000 * 2.50) / 1e6
+        self.assertAlmostEqual(tour.usd, attendu, places=9)
+        self.assertIsNone(tour.price_fallback)
+
+    def test_sortie_sous_declaree_par_le_flux_au_palier_haut(self):
+        nom = self.agent("a1", "claude", "claude-haiku-5-5")
+        tour = self._tour_repris(nom, _appel("m1", 60_000, 0, 10),
+                                 _appel("m2", 60_000, 0, 10))
+        attendu = (120_000 * 0.10 + 20 * 0.50 + 1_980 * 2.50) / 1e6
+        self.assertAlmostEqual(tour.usd, attendu, places=9)
+        self.assertIsNone(tour.price_fallback)
+
+    def test_sans_usage_par_requete_palier_haut_marque_et_alerte(self):
+        nom = self.agent("a1", "claude", "claude-haiku-5-5")
+        tour = self._tour_repris(nom)
+        self.assertAlmostEqual(tour.usd, (120_000 * 0.50 + 2_000 * 2.50) / 1e6, places=9)
+        self.assertTrue(tour.price_fallback.startswith(cost.FALLBACK_REASON))
+        self.assertIn("palier", tour.price_fallback)
+        alertes = self._alertes()
+        self.assertEqual([(a["agent"], a["model"]) for a in alertes],
+                         [("a1", "claude-haiku-5-5")])
+
+    def test_appels_qui_ne_couvrent_pas_l_invite_palier_haut_marque(self):
+        nom = self.agent("a1", "claude", "claude-haiku-5-5")
+        tour = self._tour_repris(nom, _appel("m1", 60_000, 0, 1_000))
+        self.assertAlmostEqual(tour.usd, (120_000 * 0.50 + 2_000 * 2.50) / 1e6, places=9)
+        self.assertTrue(tour.price_fallback.startswith(cost.FALLBACK_REASON))
+
+
 class CleDeTurnUnpricedTest(unittest.TestCase):
     """Deux groupes du même agent, premiers dans la même seconde : deux
     alertes (relecture codex P2)."""

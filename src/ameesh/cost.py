@@ -1016,6 +1016,17 @@ class CostBook:
                 # jetons du tour (`usage` de `result` est celui du tour), au
                 # barème ; le cumul de la ligne sert de repère au tour suivant.
                 usd = sum(_claude_usd(u, pin, pcache, pout, tier) for u in usage)
+                if tier is not None and any(_prompt_tokens(u) > tier[0] for u in usage):
+                    # L225 : un usage agrégé au-delà du seuil ne dit pas le
+                    # palier de chaque requête — il se lit appel par appel ;
+                    # sans appels qui couvrent l'invite, palier haut marqué.
+                    par_appel = _claude_tiered_usd(usage, _claude_call_usages(events),
+                                                   pin, pcache, pout, tier)
+                    if par_appel is not None:
+                        usd = par_appel
+                    else:
+                        marque = {"price_fallback": "%s : %s, palier de chaque requête "
+                                  "inconnu, facturé au palier haut" % (FALLBACK_REASON, modele)}
             elif last is None or session != cum.get("session"):
                 au_bareme = False
                 # Session neuve (ou inconnue) : son `total_cost_usd` cumulé part de
@@ -1371,6 +1382,30 @@ def _claude_usd(usage: dict, pin: float, pcache: float, pout: float,
             + ((written - hour) * CACHE_WRITE_5M + hour * CACHE_WRITE_1H) * pin
             + _num(usage, "cache_read_input_tokens") * pcache
             + _num(usage, "output_tokens") * pout) / 1e6
+
+
+#: L225 : les jetons d'une invite Claude (entrée, cache écrit, cache relu)
+PROMPT_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+
+
+def _prompt_tokens(usage) -> int:
+    """L225 : la longueur d'une invite Claude, celle qui fixe le palier."""
+    return sum(_num(usage, k) for k in PROMPT_KEYS)
+
+
+def _claude_tiered_usd(totals: Sequence[dict], calls: Sequence[dict], pin: float,
+                       pcache: float, pout: float, tier: tuple) -> float | None:
+    """L225 : le coût d'un usage agrégé, chaque requête à son palier.
+
+    `calls` (`_claude_call_usages`) doit couvrir exactement l'invite de
+    `totals` ; sinon None (l'appelant facture au palier haut, marqué). Le flux
+    peut sous-déclarer la sortie d'un appel : le reste de la sortie agrégée va
+    au palier haut."""
+    calls = [u for u in calls if _has_tokens(u)]
+    if not calls or any(_sum(calls, k) != _sum(totals, k) for k in PROMPT_KEYS):
+        return None
+    reste = max(_sum(totals, "output_tokens") - _sum(calls, "output_tokens"), 0)
+    return sum(_claude_usd(u, pin, pcache, pout, tier) for u in calls) + reste * pout / 1e6
 
 
 def _has_tokens(usage) -> bool:
