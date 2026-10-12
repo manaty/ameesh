@@ -160,6 +160,54 @@ class ZombieTest(unittest.TestCase):
 
 
 @unittest.skipUnless(hasattr(os, "WNOHANG"), "POSIX")
+class PgidRecycleTest(unittest.TestCase):
+    """#458 r2 (test de mty-amh-qa-01) : le passage de suivi voit le groupe du
+    tour vide, puis son numéro est recyclé avant la fermeture de la
+    ressource. Le verdict du passage fait foi : la ressource se ferme `done`
+    (orphan=False), rien n'est signalé au groupe étranger. Sans Postgres."""
+
+    PGID = 4242       # pid du harnais du tour == pgid de son groupe
+    JOB = 4243        # tâche de fond du tour, vue dans la lignée
+
+    @staticmethod
+    def _p(pid, ppid, pgid, name="x", zombie=False) -> dict:
+        return {"pid": pid, "ppid": ppid, "pgid": pgid, "name": name,
+                "start": 0.0, "zombie": zombie}
+
+    def _tick_with_recycled_group(self, now: float, recycled: list):
+        runner = mock.Mock()
+        runner.container_runtime.return_value = None
+        tracker = background.Tracker(runner, log=lambda *a: None)
+        entry = background.Entry(agent="a", turn_id="t" * 32, pgid=self.PGID,
+                                 ended=now - 30.0, deadline=now + 1200.0,
+                                 grace_s=1200, lineage={self.PGID, self.JOB})
+        entry.jobs[self.JOB] = background.Job(self.JOB, 'pid %d "pytest"' % self.JOB)
+        tracker.entries = [entry]
+        # 1re lecture (le passage) : groupe vide ; ensuite : un groupe étranger
+        reads = [[]]
+        signaux: list = []
+        with mock.patch.object(background.platform, "process_table",
+                               side_effect=lambda: reads.pop(0) if reads else list(recycled)), \
+                mock.patch.object(background, "_group_alive", side_effect=bool), \
+                mock.patch.object(background.os, "killpg",
+                                  side_effect=lambda p, s: signaux.append((p, s))), \
+                mock.patch.object(background.storage, "of") as of:
+            tracker.tick(now=now)
+        self.assertEqual(entry.state, "done")
+        of.return_value.turn_resources.close_turn.assert_called_once_with(
+            entry.turn_id, orphan=False, containers=None)
+        self.assertEqual(signaux, [], "nothing may be signalled")
+
+    def test_numero_recycle_ferme_done(self):
+        """Un membre étranger du groupe recyclé (pid != pgid, hors lignée)."""
+        self._tick_with_recycled_group(10000.0, [self._p(99999, 1, self.PGID, "unrelated")])
+
+    def test_numero_recycle_chef_du_nouveau_groupe(self):
+        """Le chef du nouveau groupe a pour pid l'ancien pgid, donc un pid de
+        la lignée apprise : seul le verdict du passage tranche."""
+        self._tick_with_recycled_group(10000.0, [self._p(self.PGID, 1, self.PGID, "unrelated")])
+
+
 class PlatformTest(unittest.TestCase):
     def test_moisson_d_un_enfant_et_table_des_processus(self):
         proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(3)"])

@@ -364,7 +364,9 @@ class Tracker:
         if not vivants or now - entry.containers_at >= self.CONTAINERS_EVERY_S:
             self._containers(entry, now)
         if not vivants and not entry.containers:
-            self._close(entry, "done", now)
+            # le verdict de CE passage fait foi jusqu'à la fermeture : une
+            # nouvelle sonde verrait un groupe au numéro recyclé (#458 r2)
+            self._close(entry, "done", now, survives=False)
         elif now >= entry.deadline:
             self._expire(entry, now)
 
@@ -386,45 +388,50 @@ class Tracker:
 
     def _expire(self, entry: Entry, now: float) -> None:
         """Échéance de la grâce : le nettoyage habituel."""
-        self._kill(entry)
-        self._close(entry, "expired", now)
+        self._close(entry, "expired", now, survives=self._kill(entry))
 
-    def _kill(self, entry: Entry) -> None:
+    def _kill(self, entry: Entry) -> bool:
         """SIGTERM au groupe, `TERM_GRACE_S`, puis SIGKILL ; zombies adoptés
-        moissonnés (sinon ils gardent le groupe « vivant »)."""
+        moissonnés (sinon ils gardent le groupe « vivant »). Rend True si un
+        membre vivant survit au SIGKILL : le verdict que `_close` reprend."""
         if not entry.pgid:
-            return
+            return False
         for sig, delai in ((signal.SIGTERM, self.TERM_GRACE_S), (signal.SIGKILL, 2.0)):
             try:
                 os.killpg(entry.pgid, sig)
             except OSError:
-                return  # groupe disparu
+                return False  # groupe disparu
             fin = time.monotonic() + delai
             while time.monotonic() < fin:
                 try:
                     if not self._members(entry.pgid, platform.process_table(), entry):
-                        return
+                        return False
                 except platform.NotAvailable:
                     if not _group_alive(entry.pgid):
-                        return
+                        return False
                 time.sleep(0.1)
+        return True
 
-    def _close(self, entry: Entry, state: str, now: float) -> None:
+    def _close(self, entry: Entry, state: str, now: float, *, survives: bool) -> None:
         """Fin du suivi : ressource du tour fermée (orpheline si quelque chose
         survit), conteneurs du tour sans lot supprimés par le ménage, issue
         journalisée — et SEULEMENT ENSUITE l'entrée close : le drainage de
-        l'exécuteur, qui attend `running_count() == 0`, ne sort pas au milieu."""
+        l'exécuteur, qui attend `running_count() == 0`, ne sort pas au milieu.
+
+        `survives` : le verdict sur le groupe du passage qui ferme (groupe
+        vide, ou survivant au SIGKILL) — jamais une nouvelle sonde de l'OS, qui
+        peut tomber sur un numéro de groupe déjà réattribué (#458 r2)."""
         entry.closed = now
         for job in entry.jobs.values():
             if job.ended is None:
                 job.code, job.ended = platform.reap(job.pid), now
-        self._release_resource(entry)
+        self._release_resource(entry, survives)
         self.log("[%s] background work of turn %s: %s" % (
             entry.agent, entry.turn_id[:8], self._outcome(entry, now, state)))
         with self.lock:
             entry.state = state
 
-    def _release_resource(self, entry: Entry) -> None:
+    def _release_resource(self, entry: Entry, survives: bool) -> None:
         from . import menage as menage_mod
         db, runtime = self.runner.db, self.runner.container_runtime()
         restants: list[str] = []
@@ -433,7 +440,7 @@ class Tracker:
                 restants = [c["id"] for c in runtime.turn_containers(entry.turn_id) or ()]
             except Exception:
                 restants = []
-        orphelin = bool(restants) or _group_running(entry.pgid)
+        orphelin = bool(restants) or survives
         try:
             storage.of(db).turn_resources.close_turn(entry.turn_id, orphan=orphelin,
                                                      containers=restants or None)
@@ -545,8 +552,7 @@ class Tracker:
             suivis = [e for e in self.entries if e.state == "running"]
         for entry in suivis:
             try:
-                self._kill(entry)
-                self._close(entry, "stopped", time.time())
+                self._close(entry, "stopped", time.time(), survives=self._kill(entry))
             except Exception as exc:
                 self.log("[%s] cannot stop the background work of turn %s (%s)"
                          % (entry.agent, entry.turn_id[:8], exc))
@@ -599,20 +605,6 @@ class Tracker:
             return "stopped when the grace period (%s) ran out — %s" % (
                 _minutes(entry.grace_s), self._what(entry, state=state))
         return "stopped with the runner — %s" % self._what(entry, state=state)
-
-
-def _group_running(pgid: int | None) -> bool:
-    """Un membre VIVANT du groupe tourne-t-il encore ? Les zombies ne comptent
-    pas, comme dans `_members` : celui d'un autre parent (un sous-moissonneur
-    au-dessus de l'exécuteur, #458) répond au signal 0 sans rien faire tourner.
-    Sans table des processus : le signal 0."""
-    if not pgid:
-        return False
-    try:
-        table = platform.process_table()
-    except platform.NotAvailable:
-        return _group_alive(pgid)
-    return any(p["pgid"] == pgid and not p["zombie"] for p in table)
 
 
 def _group_alive(pgid: int | None) -> bool:
