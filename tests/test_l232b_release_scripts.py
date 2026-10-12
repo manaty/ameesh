@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -40,8 +41,10 @@ class MigrationPinningTest(unittest.TestCase):
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
         (bin_dir / "python3").symlink_to(sys.executable)
-        (bin_dir / "pg_dump").write_text("#!/bin/sh\nexit 0\n")
+        (bin_dir / "pg_dump").write_text('#!/bin/sh\nwhile [ "$1" != --file ]; do shift; done\nprintf archive > "$2"\n')
         (bin_dir / "pg_dump").chmod(0o755)
+        (bin_dir / "pg_restore").write_text("#!/bin/sh\nexit 0\n")
+        (bin_dir / "pg_restore").chmod(0o755)
         (bin_dir / "ssh").write_text(
             '#!/bin/sh\nfor arg do command=$arg; done\n'
             '/bin/sh -c "$command"\n')
@@ -62,6 +65,7 @@ class MigrationPinningTest(unittest.TestCase):
         self.script = self.repo / "deploy/mise-a-jour/poste.sh"
         self.script.parent.mkdir(parents=True)
         shutil.copy(ROOT / "deploy/mise-a-jour/poste.sh", self.script)
+        shutil.copy(ROOT / "deploy/mise-a-jour/sauvegarder-prive.py", self.script.with_name("sauvegarder-prive.py"))
         self.module = self.repo / "src/ameesh"
         self.module.mkdir(parents=True)
         (self.module / "__init__.py").write_text("")
@@ -72,7 +76,8 @@ class MigrationPinningTest(unittest.TestCase):
         self.share = Path(self.env["HOME"]) / ".local/share/ameesh"
         venv = self.share / "venv/bin"
         venv.mkdir(parents=True)
-        (venv / "python").symlink_to(sys.executable)
+        (venv / "python").write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' "$@"\n')
+        (venv / "python").chmod(0o755)
         config = Path(self.env["HOME"]) / ".config/ameesh/config.json"
         config.parent.mkdir(parents=True)
         config.write_text(json.dumps({"dsn": "postgresql://simulation"}))

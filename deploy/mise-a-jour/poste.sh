@@ -125,7 +125,8 @@ verifier() {
 sauvegarder() {
   local jour; jour=$(date +%F-%H%M)
   etape "base du mesh, vidée depuis le poste"
-  pg_dump -Fc "$(dsn_de "$CONFIG")" -f "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
+  "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG" \
+    --output "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   ls -l "$SAUVEGARDES/mesh-$jour-avant-l60-l74.dump"
   etape "base du mesh, sauvegarde du serveur (copie gardée sur la VM)"
   # Une oneshot réussie est inactive : vérifier le résultat, pas is-active.
@@ -136,7 +137,8 @@ sauvegarder() {
     test "$(systemctl show ameesh-sauvegarde.service -p ExecMainStatus --value)" = 0'
   if ancienne; then
     etape "ancienne base"
-    pg_dump -Fc "$(dsn_de "$CONFIG_RESTE")" -f "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
+    "$VENV/bin/python" "$ICI/sauvegarder-prive.py" dump --config "$CONFIG_RESTE" \
+      --output "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
     ls -l "$SAUVEGARDES/ancienne-$jour-avant-l60-l74.dump"
   fi
 }
