@@ -8,7 +8,7 @@ capacity, each advising to wake, resume or reassign. A hold is recorded
 lifted by `--release`, and always ends: `until` is required, 24 h at most on
 database time (whatever the caller's clock); past it the hold is ignored and
 the alerts come back by themselves. Every hold and release is kept in
-`host_hold_events`, written in the same transaction.
+`host_hold_events` (0398), written in the same transaction.
 
 While it lasts, `exploitation.alerts` — the one source of `ameesh alerts`,
 the notifier, the briefs and their reminders — leaves out the nudges about

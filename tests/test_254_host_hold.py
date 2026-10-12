@@ -302,3 +302,44 @@ class HeldHostIntakeTest(test_l119_backlog._Base):
         self.assertEqual(self.take(dry_run=True), [])
         hosts.release("pc", author="human:proprio")
         self.assertEqual([t["agent"] for t in self.take(dry_run=True)], ["pc1"])
+
+
+class HeldHostAttachTest(_MoveCase):
+    def test_no_interactive_lease_on_a_held_host(self):
+        # r3 (P2): `ameesh attach` takes no new lease on a held host either
+        self._prepare()
+        hosts = storage.of(self.db).hosts
+        hosts.hold("atelier", seconds=HEURE, reason="r", author="human:proprio")
+        self.assertIsNone(registry.attach_claim(self.db, "ouvrier", "attach-a", 600))
+        hosts.release("atelier", author="human:proprio")
+        self.assertIsNotNone(registry.attach_claim(self.db, "ouvrier", "attach-a", 600))
+
+
+class HoldMigrationTest(_Base):
+    #: 0392 as applied by r1: an applied migration is immutable
+    R1_0392 = "83939c7cd42cbd0347ca12c8a4c3265ec7ee2bc65067494c2fd527e44ddf4c56"
+
+    def test_a_base_that_applied_r1_upgrades(self):
+        # r3 (P2): 0392 is r1's, byte for byte; 0398 upgrades it, repeatably
+        from ameesh import migrations
+        found = {m.version: m for m in migrations.discover()}
+        self.assertEqual(found[392].checksum, self.R1_0392)
+        # a base in r1's state: no history, no bound, one hold set by r1
+        self.db.execute("DROP TABLE host_hold_events")
+        self.db.execute("ALTER TABLE host_holds DROP CONSTRAINT host_holds_until_bounded")
+        self.db.execute("TRUNCATE host_holds")
+        self.db.execute("INSERT INTO host_holds (host, reason, author, until) VALUES "
+                        "('pc', 'r1', 'human:x', now() + interval '30 hours'), "
+                        "('vm', 'r1', 'human:x', now() + interval '2 hours')")
+        for _ in range(2):
+            self.db.script(found[398].sql)
+        holds = host_holds.live(self.db)
+        self.assertAlmostEqual(holds["pc"]["until_ts"] - holds["pc"]["created_ts"],
+                               24 * HEURE, delta=1)
+        self.assertAlmostEqual(holds["vm"]["until_ts"] - holds["vm"]["created_ts"],
+                               2 * HEURE, delta=1)
+        with self.assertRaises(Exception):
+            self.db.execute("UPDATE host_holds SET until = created_at + interval '25 hours'")
+        hosts = storage.of(self.db).hosts
+        self.assertTrue(hosts.release("pc", author="human:proprio"))
+        self.assertEqual([e["action"] for e in hosts.hold_events()], ["release"])

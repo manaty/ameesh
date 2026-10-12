@@ -5893,6 +5893,16 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
         lease = registry.attach_claim(db, name, owner, ttl)
         if lease:
             break
+        from . import host_holds
+        hold = host_holds.live(db).get(agent.get("host") or "")
+        if hold:
+            # #254 : un hôte en pause ne prend aucun bail, interactif compris
+            print("agent %s not claimable: host %s on hold until %s (%s); lift it: "
+                  "ameesh hosts %s --release" % (
+                      name, hold["host"],
+                      time.strftime("%Y-%m-%d %H:%M", time.localtime(float(hold["until_ts"]))),
+                      hold["reason"], hold["host"]), file=sys.stderr)
+            return 1
         print("agent %s not claimable (owner unresolved, ephemeral expired, or status)"
               % name, file=sys.stderr)
         return 1

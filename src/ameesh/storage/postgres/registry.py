@@ -513,6 +513,12 @@ class Leases(interface.Leases):
                AND NOT (r.status = 'running' AND r.lease_owner IS NOT NULL
                         AND r.lease_expires_at > clock_timestamp())
                AND (NOT r.ephemeral OR r.ephemeral_expires_at > clock_timestamp())
+               -- #254 : sur un hôte en pause, aucun nouveau bail, interactif
+               -- compris (le sien, encore vivant, se reprend)
+               AND ((r.lease_owner = %s AND r.lease_expires_at >= clock_timestamp())
+                    OR NOT EXISTS (SELECT 1 FROM host_holds hh
+                                    WHERE hh.host = r.host
+                                      AND hh.until > clock_timestamp()))
                __RESPONSABLE__
                AND __CANON__
             RETURNING r.name, r.lease_owner, r.lease_epoch,
@@ -521,7 +527,7 @@ class Leases(interface.Leases):
         sql = sql.replace("__RESPONSABLE__",
                           "AND coalesce(r.responsible, '') <> ''" if require_responsible else "")
         sql = sql.replace("__CANON__", canon_claim_predicate_sql("r"))
-        rows = self.db.query(sql, (name, owner, ttl_seconds))
+        rows = self.db.query(sql, (name, owner, ttl_seconds, owner))
         return rows[0] if rows else None
 
     def state(self, name) -> dict | None:
