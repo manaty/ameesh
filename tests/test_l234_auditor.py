@@ -3,23 +3,48 @@
 
 Ces tests n'ouvrent ni base ni harnais.
 """
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
 import threading
 import types
 import unittest
 from unittest import mock
 
-from ameesh import backlog
+from ameesh import auditor, backlog, canon as canon_mod
 from ameesh.runner import AgentWorker, Runner
+from ameesh.platform import audit_guard
 
 
-def agent(name, **data):
-    return types.SimpleNamespace(title=name, fiche=types.SimpleNamespace(data=data))
+def agent(name, *, path=None, **data):
+    path = path or "agents/" + name + ".md"
+    return types.SimpleNamespace(title=name, fiche=types.SimpleNamespace(
+        data=data, path=path, ref="owner:" + path + "@abcd"))
+
+
+def canon(agents, *, ident="default", default=True, readable=True):
+    return canon_mod.Canon(root="/test", id=ident, is_default=default,
+                           readable=readable, agents=agents)
 
 
 class AuditorTest(unittest.TestCase):
     def setUp(self):
         self.runner = Runner.__new__(Runner)
-        self.runner.refresh_orchestrators(types.SimpleNamespace(agents=[
+        self.runner.db = object()
+        self.rows = {name: {"name": name, "canon": None} for name in
+                     ("controle", "controle-fr", "chef", "dev", "auditeur")}
+        self.getter = mock.patch("ameesh.registry.get",
+                                 side_effect=lambda db, name: self.rows.get(name))
+        self.getter.start()
+        self.addCleanup(self.getter.stop)
+        available = mock.patch("ameesh.platform.audit_guard.available", return_value=True)
+        available.start()
+        self.addCleanup(available.stop)
+        self.runner.refresh_orchestrators(canon([
             agent("controle", roles=["auditor"]), agent("controle-fr", role="Auditeur"),
             agent("chef", roles=["orchestrateur"]), agent("dev", roles=["read"])]))
 
@@ -27,11 +52,11 @@ class AuditorTest(unittest.TestCase):
         for name in ("auditeur", "controle", "controle-fr"):
             self.assertTrue(self.runner.is_auditor(name))
         self.assertFalse(self.runner.is_auditor("dev"))
-        self.runner.refresh_orchestrators(types.SimpleNamespace(agents=[]))
+        self.runner.refresh_orchestrators(canon([]))
         self.assertFalse(self.runner.is_auditor("controle"))
 
     def held(self, name, **pressure):
-        worker = types.SimpleNamespace(name=name, runner=self.runner)
+        worker = types.SimpleNamespace(name=name, runner=self.runner, agent=self.rows[name])
         return AgentWorker._held_by_pressure(worker, pressure)
 
     def test_auditor_passes_even_critical_and_power_pressure(self):
@@ -68,18 +93,21 @@ class AuditorTest(unittest.TestCase):
         self.assertEqual(self.runner._pressure_episode["auditor_turns"], 2)
         self.assertEqual(self.runner._pressure_episode["orchestrator_turns"], 1)
 
-    def take(self, item, name="auditeur", queue=False):
-        row = {"name": name, "team": "ameesh", "host": "test", "harness": "codex"}
+    def take(self, item, name="auditeur", queue=False, *, canons=None, owner=None,
+             load_error=None):
+        row = {"name": name, "team": "ameesh", "host": "test", "harness": "codex",
+               "canon": owner}
         work = types.SimpleNamespace(auto_takes_since=lambda *a: 0,
                                      unassigned_lots=lambda *a: [] if queue else [item],
                                      backlog=lambda **kw: [item] if queue else [])
         st = types.SimpleNamespace(work=work, operations=types.SimpleNamespace(
             open_lots_activity=lambda *a: []))
         cfg = types.SimpleNamespace(host=None)
-        canon = types.SimpleNamespace(agents=[agent("controle", roles=["auditor"])])
+        loaded = canon([agent("controle", roles=["auditor"])])
         with mock.patch("ameesh.backlog.storage.of", return_value=st), \
-                mock.patch("ameesh.registry.get", return_value={"capabilities": []}), \
-                mock.patch("ameesh.canon.load_configured", return_value=[canon]), \
+                mock.patch("ameesh.registry.get", return_value=dict(row, capabilities=[])), \
+                mock.patch("ameesh.auditor.load_all", return_value=canons or [loaded],
+                           side_effect=load_error), \
                 mock.patch("ameesh.sous_utilisation.idle_agents", return_value=[row]):
             return backlog.auto_take(cfg, object(), now=10000, listing=[row],
                                      paid=set(), budget_check=lambda n: "", dry_run=True,
@@ -103,3 +131,93 @@ class AuditorTest(unittest.TestCase):
         self.assertEqual(self.take(item, queue=True), [])
         self.assertEqual(self.take(item, "controle", queue=True), [])
         self.assertEqual(len(self.take(item, "dev", queue=True)), 1)
+
+
+    def test_r1_ownership_conflicting_canon_cannot_grant_auditor_role(self):
+        a = canon([agent("dev", roles=["read"])], ident="A")
+        b = canon([agent("dev", roles=["auditor"])], ident="B", default=False)
+        self.runner.refresh_orchestrators(a, b)
+        self.assertFalse(self.runner.is_auditor("dev"))
+        self.assertTrue(self.held("dev", blocked=True, critical=True, breaches=[]))
+        lot = {"id": 1, "type": "evolution", "title": "Evolution", "state": "intake",
+               "created_ts": 100, "lot_team": "ameesh"}
+        self.assertEqual(len(self.take(lot, "dev", canons=[a, b])), 1)
+        self.rows["dev"]["canon"] = "B"
+        self.assertTrue(self.runner.is_auditor("dev"))
+        self.assertEqual(self.take(lot, "dev", canons=[a, b], owner="B"), [])
+
+    def test_r1_unreadable_canon_never_allows_automatic_take(self):
+        cfg = types.SimpleNamespace(canon_entries=[types.SimpleNamespace(path="bad")])
+        for result in (canon([], readable=False), canon([])):
+            if result.readable:
+                result.scope_unread = {"owner"}
+            with mock.patch("ameesh.canon.from_config", return_value=result):
+                with self.assertRaises(canon_mod.CanonError):
+                    auditor.load_all(cfg)
+        with mock.patch("ameesh.canon.from_config", side_effect=canon_mod.CanonError("missing")):
+            with self.assertRaises(canon_mod.CanonError):
+                auditor.load_all(cfg)
+        lot = {"id": 1, "type": "evolution", "title": "Evolution", "state": "intake",
+               "created_ts": 100, "lot_team": "ameesh"}
+        self.assertEqual(self.take(lot, "controle", load_error=canon_mod.CanonError("missing")), [])
+
+    def test_r1_real_card_path_is_protected_without_matching_agent_name(self):
+        loaded = canon([agent("controle", path="personas/sentinel-safety.md", roles=["auditor"])])
+        lot = {"id": 1, "type": "bug", "title": "Bug", "state": "intake",
+               "created_ts": 100, "lot_team": "ameesh"}
+        self.assertEqual(len(self.take(lot, "controle", canons=[loaded])), 1)
+        for value in ("personas/sentinel-safety.md", "owner:personas/sentinel-safety.md@efgh"):
+            self.assertEqual(self.take(dict(lot, body=value), "controle", canons=[loaded]), [])
+            self.assertEqual(len(self.take(dict(lot, body=value), "dev", canons=[loaded])), 1)
+
+    def test_r1_hard_ceiling_for_exempt_turns(self):
+        with mock.patch("ameesh.platform.audit_guard.shutil.which", return_value="/bin/systemd-run"):
+            argv = audit_guard.command(["harness", "argument with spaces"], 30)
+        self.assertIn("--property=MemoryMax=%d" % audit_guard.MEMORY_MAX, argv)
+        self.assertIn("--property=MemorySwapMax=0", argv)
+        self.assertIn("--property=RuntimeMaxSec=30", argv)
+        self.assertIn("--property=KillMode=control-group", argv)
+        self.assertEqual(argv[-2:], ["harness", "argument with spaces"])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "cgroup"
+            scope = root / "test.scope"
+            scope.mkdir(parents=True)
+            proc = Path(tmp) / "proc"
+            proc.write_text("0::/test.scope\n")
+            (scope / "memory.swap.max").write_text("0")
+            for maximum, valid in ((str(audit_guard.MEMORY_MAX), True),
+                                   (str(audit_guard.MEMORY_MAX * 2), False), ("max", False)):
+                (scope / "memory.max").write_text(maximum)
+                self.assertEqual(audit_guard.memory_enforced(audit_guard.MEMORY_MAX,
+                                                            proc=proc, root=root), valid)
+        with mock.patch.object(audit_guard, "memory_enforced", return_value=False), \
+                mock.patch.object(audit_guard.os, "execvpe") as execute, \
+                mock.patch("builtins.print"):
+            self.assertEqual(audit_guard.main(["100", "--", "harness"]), 125)
+            execute.assert_not_called()
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "POSIX groups")
+    def test_hard_timer_stops_silent_process_without_reading_output(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"],
+                                start_new_session=True, stdout=subprocess.PIPE)
+        def cleanup():
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate(timeout=3)
+        self.addCleanup(cleanup)
+        def stop(reason, **kwargs):
+            self.assertTrue(kwargs["hard"])
+            os.killpg(proc.pid, signal.SIGKILL)
+        worker = types.SimpleNamespace(stop_group_now=stop)
+        AgentWorker._audit_deadline_monitor(worker, threading.Event(), time.monotonic() + 0.05)
+        self.assertNotEqual(proc.wait(timeout=3), 0)
+        self.assertIn("plafond dur", worker._audit_guard_error)
+
+    def test_no_exemption_without_scope_and_timer_cancellation(self):
+        with mock.patch.object(audit_guard, "available", return_value=False):
+            self.assertTrue(self.held("auditeur", blocked=True, critical=True, breaches=[]))
+        worker = types.SimpleNamespace(stop_group_now=mock.Mock())
+        done = threading.Event()
+        done.set()
+        AgentWorker._audit_deadline_monitor(worker, done, time.monotonic())
+        worker.stop_group_now.assert_not_called()

@@ -123,19 +123,36 @@ Il ne suspend pas les autres agents pour obtenir cette conformité.
 
 Le passage court reste possible sous pression de l'hôte, même critique ou
 sur batterie basse : l'exécuteur exempte la persona `auditeur` et les fiches
-Agent au rôle `auditeur`/`auditor` des attentes et pauses de charge (L234).
+Agent au rôle `auditeur`/`auditor` **dans le canon propriétaire de la ligne du
+registre**, pas dans un autre canon qui déclare le même nom (L234).
 Il lance leurs harnais à faible priorité CPU (`nice -n 10`) et I/O
-(`ionice -t -c 3`) quand ces outils sont disponibles ; les sous-processus
-héritent de ces priorités. Sans ces outils, le tour reste possible. Les
-plafonds de budget, les comptes au seuil et les gardes de sécurité restent
-applicables. Sous pression critique, le passage court rapporte et agit dans
-sa marge ; l'analyse profonde attend comme prévu ci-dessous.
+(`ionice -t -c 3`) quand ces outils sont disponibles.
+
+Un tour exempté est borné par un scope systemd : **2 Gio de mémoire pour le
+groupe, sans swap, et 300 secondes au maximum**, ou le plafond de durée de
+l'agent s'il est plus court. Le scope inclut les descendants ; son échéance
+arrête aussi ceux qui changent de groupe POSIX. Un minuteur indépendant du
+flux arrête le harnais au plafond, même sans sortie. Avant toute exécution
+et remise du courrier, un trampoline vérifie `memory.max` et
+`memory.swap.max` dans le cgroup courant : accepter la propriété systemd ne
+suffit pas si le contrôleur mémoire n'est pas délégué. Sans systemd sur Linux,
+le tour attend la fin de la pression ; si la création ou la validation du
+scope échoue, le harnais n'est pas exécuté et la consigne reste en attente
+avec le diagnostic d'hôte non prêt. Sous charge normale, les priorités
+réduites restent applicables sans ce scope temporaire.
+
+Les plafonds de budget, les comptes au seuil et les gardes de sécurité
+restent applicables. Sous pression critique, le passage court rapporte et
+agit dans sa marge ; l'analyse profonde attend comme prévu ci-dessous.
 
 La prise automatique (L165 et file L119) ne confie à un auditeur que des bugs
 dans son périmètre. Elle écarte les évolutions, les améliorations et les lots
 qui mentionnent sa consigne, la décision 0036 ou sa fiche de canon, ses
 capacités ou permissions dans leur titre, corps, branche ou référence de
-fiche. Cette garde est conservatrice : un lot ne fournit pas une liste de
+fiche. Le chemin et la référence réels de sa fiche sont lus dans le canon
+propriétaire ; le nom du fichier n'a pas à correspondre au nom de l'agent.
+Si un canon configuré est illisible, incomplet ou omis, aucune prise
+automatique n'est faite. Cette garde est conservatrice : un lot ne fournit pas une liste de
 fichiers à modifier. Si le périmètre protégé apparaît après la prise ou par
 une attribution explicite, l'auditeur rend le lot à l'orchestrateur avec
 l'explication ; un autre agent le traite. L'attribution ne donne jamais le

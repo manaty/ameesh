@@ -325,8 +325,12 @@ permettre cette remontée vers la cause racine.
 
 Le passage court est exempt des pauses et attentes de charge de l'hôte,
 y compris sous pression critique et batterie basse. Le harnais tourne à
-faible priorité CPU et I/O quand les outils du poste le permettent ; les
-gardes de budget et de sécurité restent inchangées. L'analyse profonde
+faible priorité CPU et I/O quand les outils du poste le permettent. Le rôle
+est résolu dans le canon propriétaire au registre. Le tour exempté est borné
+par un scope systemd (2 Gio pour le groupe, sans swap, 300 s au maximum) et
+un minuteur indépendant de la sortie ; il ne démarre qu'après vérification
+du plafond mémoire effectif. Sans cette garantie, il attend ou signale un
+hôte non prêt. Les gardes de budget et de sécurité restent inchangées. L'analyse profonde
 attend toujours sous pression critique.
 
 La prise automatique ne confie à l'auditeur que des bugs dans son périmètre,
@@ -334,3 +338,5 @@ jamais des évolutions ou améliorations, ni un lot qui mentionne ses
 instructions protégées (consigne, décision 0036, fiche, capacités,
 permissions). Une attribution explicite ne l'autorise pas davantage à les
 modifier : le lot est rendu à l'orchestrateur pour un autre agent.
+La protection utilise le chemin et la référence réels de sa fiche ; un
+canon illisible ou incomplet ferme toute prise automatique.
