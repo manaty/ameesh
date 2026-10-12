@@ -156,6 +156,10 @@ BOOT_REVIEW_EVERY_S = 60.0
 BOOT_REVIEW_MAX_ROWS = 2000
 #: L147b : le curseur de la revue — (phase `running` puis `orphan`, dernier id)
 BOOT_REVIEW_START = ("running", 0)
+#: L76 : après un démarrage résident raté, un tour par événement pendant ce délai
+RESIDENT_RETRY_S = 600.0
+#: L76 : attente de la fin d'un tour résident après son flux (harnais tué)
+RESIDENT_END_WAIT_S = 5.0
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -322,6 +326,12 @@ class AgentWorker(threading.Thread):
         self.lease_lost = threading.Event()
         self.proc: subprocess.Popen | None = None
         self.lock = threading.Lock()
+        #: L76 : le processus résident de l'agent, entre ses tours (publié
+        #: dans `proc`/`pgid` le temps d'un tour seulement), ou None
+        self.resident = None
+        #: L76 : après un démarrage résident raté, un tour par événement
+        #: jusqu'à cette échéance (monotone)
+        self._resident_refused_until = 0.0
         self.nudged = False
         #: L48 : le dernier tour a échoué vite (harnais absent, introuvable,
         #: sorti en erreur en moins de FAST_FAILURE_S) ; et leur série
@@ -638,6 +648,8 @@ class AgentWorker(threading.Thread):
         à nous. Le retour est tenté même `lease_lost` posé (r1) : des pannes
         au renouvellement le posent sans que la base ait repris le bail ; le
         retour, gardé par l'epoch, ne touche pas celui d'un autre."""
+        # L76 : rien ne survit au bail, pas même un processus résident inactif
+        self._close_resident("lease released")
         self.watchdog_stop.set()  # le veilleur n'a plus de bail à défendre
         try:
             registry.release(self.db, self.name, self.runner.runner_id, self.epoch)
@@ -786,7 +798,12 @@ class AgentWorker(threading.Thread):
         """
         with self.lock:
             proc = self.proc
+            resident = self.resident if proc is None and hard else None
         self._stop_reason = reason
+        if resident is not None:
+            # L76 : un processus résident entre deux tours meurt avec le bail,
+            # même inactif — le signal d'abord, sans E/S
+            resident.kill_now()
         if proc is None:
             # Le latch ne sert qu'à la course de publication en cours : il est
             # consommé par le recontrôle, puis remis à zéro au tour suivant
@@ -2925,15 +2942,21 @@ class AgentWorker(threading.Thread):
     def _open_turn_resource(self, turn_id: str, pgid: int | None) -> None:
         """Rattache le groupe du tour (L31, 0028) ; ne casse jamais le tour."""
         self._turn_open = False
+        self._turn_open = self._attach_resource(turn_id, pgid)
+
+    def _attach_resource(self, turn_id: str, pgid: int | None) -> bool:
+        """La ligne de ressource d'un tour, ou d'une vie de processus résident
+        (L76) ; False si elle n'a pas pu être ouverte."""
         try:
             from . import containers as containers_mod
             storage.of(self.db).turn_resources.open_turn(
                 turn_id, self.name, self.runner.host, pgid=pgid,
                 label=containers_mod.turn_labels(turn_id, self.name))
-            self._turn_open = True
+            return True
         except Exception as exc:  # ne casse jamais un tour
             log("[%s] could not attach the resources of turn %s (%s)"
                 % (self.name, turn_id[:8], exc))
+            return False
 
     def _close_turn_resource(self, turn_id: str, pgid: int | None) -> None:
         """Ferme la ressource du tour ; `orphan` si elle survit (L31, 0028).
@@ -2944,6 +2967,9 @@ class AgentWorker(threading.Thread):
         if not getattr(self, "_turn_open", False):
             return
         self._turn_open = False
+        self._release_resource(turn_id, pgid)
+
+    def _release_resource(self, turn_id: str, pgid: int | None) -> None:
         conteneurs: list[str] = []
         runtime = self.runner.container_runtime()
         if runtime is not None:
@@ -2963,6 +2989,172 @@ class AgentWorker(threading.Thread):
             log("[%s] orphan resource of turn %s: %s"
                 % (self.name, turn_id[:8],
                    ", ".join(conteneurs) if conteneurs else "surviving process group"))
+
+    # -- L76 : processus résident -----------------------------------------
+    def _resident_refusal(self, adapter, audit_exempt: bool) -> str:
+        """'' si ce tour peut être servi par le processus résident de
+        l'agent, sinon pourquoi un tour par événement."""
+        from . import resident_runner
+        if not resident_runner.enabled(self._state_read(resident_runner.SETTING)):
+            return "resident=off"
+        if self.runner.once:
+            return "one turn only (--once)"
+        if self.runner.is_auditor(self.name, self.agent):
+            return "auditor (its turns keep their own bounds)"
+        if time.monotonic() < self._resident_refused_until:
+            return "resident start failed recently"
+        return resident_runner.refusal(adapter)
+
+    def _spawn_resident(self, argv, **kwargs) -> subprocess.Popen:
+        """Lance le harnais résident comme un harnais de tour : sous le verrou
+        de lancement, compté parmi les harnais, publié tout de suite (un arrêt
+        pendant la poignée de main le trouve)."""
+        with self.runner.launch_lock:
+            proc = subprocess.Popen(argv, **kwargs)
+            self.runner.harness_pids.add(proc.pid)
+        with self.lock:
+            self.proc = proc
+            self.pgid = proc.pid
+        return proc
+
+    def _resident_for_turn(self, adapter, *, key: tuple, session: str | None, cwd: str,
+                           env: dict, model, effort, tier, lot, stderr_path: str):
+        """Le processus résident qui sert ce tour : celui qui tourne si sa clé
+        de lancement et sa session sont celles du tour, sinon un neuf (repris
+        sur la session). None si le démarrage échoue : ce tour, et les
+        suivants pendant RESIDENT_RETRY_S, sont servis un par événement."""
+        from . import containers as containers_mod, resident, resident_runner
+        with self.lock:
+            rp = self.resident
+        if rp is not None:
+            pourquoi = ("exited" if not rp.alive else
+                        "launch settings changed" if rp.key != key else
+                        "session changed" if (rp.session or None) != (session or None) else
+                        "a turn still running" if rp.driver.busy else "")
+            if not pourquoi:
+                return rp
+            self._close_resident("restarted: %s" % pourquoi)
+        life_id = resident_runner.ResidentProcess.new_life_id()
+        env = dict(env)
+        env.update({
+            "AMEESH_TURN_ID": life_id,
+            containers_mod.LABELS_ENV: containers_mod.turn_labels(
+                life_id, self.name, str(lot) if lot else None),
+            resident_runner.TURN_FILE_ENV: self._path(resident_runner.TURN_FILE),
+        })
+        stderr = open(stderr_path, "ab")
+        driver = resident.driver_for(
+            adapter, cwd=cwd, session=session, model=model or None, effort=effort or None,
+            tier=tier or None, env=env, stderr=stderr, spawn=self._spawn_resident)
+        rp = resident_runner.ResidentProcess(driver, key=key, life_id=life_id, stderr=stderr)
+        driver.on_event = rp.on_event
+        try:
+            driver.start()
+        except resident.ResidentError as exc:
+            rp.close(0)
+            with self.lock:
+                self.proc = None
+                self.pgid = None
+            with self.runner.launch_lock:
+                self.runner.harness_pids.discard(rp.pgid)
+            self._resident_refused_until = time.monotonic() + RESIDENT_RETRY_S
+            log("[%s] resident start failed (%s): one turn per event for %ds"
+                % (self.name, exc, int(RESIDENT_RETRY_S)))
+            return None
+        rp.resource_open = self._attach_resource(life_id, rp.pgid)
+        with self.lock:
+            self.resident = rp
+        log("[%s] resident process started (pid %s, session %s)"
+            % (self.name, rp.pgid, driver.session_id or "new"))
+        return rp
+
+    def _close_resident(self, reason: str) -> None:
+        """Arrête le processus résident (son groupe entier) et ferme sa ligne
+        de ressource. Jamais pendant un tour : le tour l'a dépublié avant."""
+        with self.lock:
+            rp, self.resident = self.resident, None
+        if rp is None:
+            return
+        try:
+            rp.close(rp.CLOSE_GRACE)
+        except Exception as exc:  # le groupe est tué quoi qu'il arrive
+            rp.kill_now()
+            log_async("[%s] resident close failed (%s): group killed" % (self.name, exc))
+        with self.runner.launch_lock:
+            self.runner.harness_pids.discard(rp.pgid)
+        if rp.resource_open:
+            rp.resource_open = False
+            self._release_resource(rp.life_id, rp.pgid)
+        log_async("[%s] resident process stopped (%s) after %d turn(s)"
+                  % (self.name, reason, rp.turns))
+
+    def _close_turn_now(self, rp, raison: str) -> None:
+        """Clôt le tour à un point sûr (plafond L105, retrait de l'hôte) : le
+        harnais seul pour un tour par événement ; pour le résident, son
+        interruption native, sans le tuer — à défaut, comme un tour."""
+        if rp is not None:
+            tour = rp.driver.current
+            # un tour fini entre-temps n'a plus rien à interrompre
+            if tour is None or rp.driver.interrupt() or tour.done:
+                log_async("[%s] %s: resident turn interrupted" % (self.name, raison))
+                return
+        self.stop_group_now(raison, group=False)
+
+    def _resident_result(self, rp, tour, voulu: bool) -> tuple[int, str | None]:
+        """Code et erreur d'un tour résident fini (`voulu` : clos par
+        l'exécuteur, une interruption n'est pas un échec)."""
+        from . import resident
+        if tour is None:
+            return 1, None              # pas lancé : l'erreur est déjà notée
+        fin = tour.wait(RESIDENT_END_WAIT_S)
+        if fin is None:
+            return 1, "resident turn did not end"
+        if fin.status == resident.COMPLETED:
+            return 0, None
+        if fin.status == resident.INTERRUPTED:
+            return (0, None) if voulu else (1, "resident turn interrupted")
+        return 1, fin.error or "resident turn failed"
+
+    def _resident_turn_end(self, rp) -> None:
+        """Fin d'un tour résident : dépublié ; le processus reste pour le tour
+        suivant, sauf s'il est mort, si son tour n'a pas fini, ou si le tour
+        s'arrête en urgence (bail, préemption, relance, retrait de l'hôte)."""
+        from . import resident_runner
+        with self.lock:
+            self.proc = None
+            self.pgid = None
+        try:
+            resident_runner.write_turn(self._path(resident_runner.TURN_FILE), "")
+        except OSError:
+            pass
+        rp.turns += 1
+        rp.last_used = time.monotonic()
+        raison = ("exited" if not rp.alive else
+                  "its turn did not end" if rp.driver.busy else
+                  self._urgent_end() or (
+                      "the host is withdrawing" if self.host_yield is not None else
+                      "stopping" if self.stopping.is_set() else ""))
+        if raison:
+            self._close_resident(raison)
+
+    def _resident_between_turns(self) -> None:
+        """Entre deux tours : un résident mort est fermé ; un résident
+        inactif depuis `resident_sleep` est endormi (bail gardé, réveil au
+        prochain tour sur sa session) ; `resident=off` l'arrête."""
+        from . import resident_runner
+        with self.lock:
+            rp = self.resident
+        if rp is None:
+            return
+        if not rp.alive:
+            self._close_resident("exited")
+        elif not resident_runner.enabled(self._state_read(resident_runner.SETTING)):
+            self._close_resident("resident=off")
+        else:
+            sommeil = resident_runner.sleep_seconds(
+                self._state_read(resident_runner.SLEEP_SETTING))
+            if sommeil and time.monotonic() - rp.last_used >= sommeil:
+                self._close_resident("asleep after %ds without a turn" % int(sommeil))
 
     def _menage_apres_tour(self, menage_tour, turn_id: str, spec: dict) -> None:
         """L73 : quota du dossier temporaire, worktrees apparus, /tmp signalé ;
@@ -3144,7 +3336,8 @@ class AgentWorker(threading.Thread):
             fond = getattr(self.runner, "background", None)
             menage_tour = menage_mod.Turn.begin(
                 self.cfg, self.runner.housekeeping_policy(), self.name, cwd,
-                new_session=not session and not (fond and fond.has_jobs(self.name)),
+                new_session=not session and not (fond and fond.has_jobs(self.name))
+                and self.resident is None,
                 base_env=env)
             env.update(menage_tour.env)
         except Exception as exc:
@@ -3230,6 +3423,16 @@ class AgentWorker(threading.Thread):
             threading.Thread(target=self._audit_deadline_monitor,
                              args=(preempt_done, time.monotonic() + audit_seconds),
                              daemon=True).start()
+        # L76 : servi par le processus résident de l'agent, ou un par événement
+        from . import resident as resident_mod, resident_runner
+        refus_resident = self._resident_refusal(adapter, audit_exempt)
+        if refus_resident and self.resident is not None:
+            self._close_resident("one turn per event: %s" % refus_resident)
+        cle_resident = None if refus_resident else resident_runner.launch_key(
+            adapter, model=model, effort=effort, tier=tier,
+            account=compte.name if compte is not None else None, cwd=cwd)
+        rp = None
+        tour_resident = None
         #: #210 : l'empreinte du jeton qui part avec le tour, lue au lancement —
         #: le propriétaire peut se reconnecter sur un autre jeton pendant le tour
         empreinte = sentinel.launch_fingerprint(self.agent.get("harness") or "", compte, env)
@@ -3246,29 +3449,50 @@ class AgentWorker(threading.Thread):
         try:
             with open(stderr_path, "ab") as stderr:
                 stderr_debut = stderr.tell()
+                if cle_resident is not None:
+                    # L76 : le processus résident (démarré, ou relancé sur la
+                    # session) ; un démarrage raté : un tour par événement
+                    rp = self._resident_for_turn(
+                        adapter, key=cle_resident, session=session, cwd=cwd, env=env,
+                        model=model, effort=effort, tier=tier, lot=lot_du_tour,
+                        stderr_path=stderr_path)
+                if rp is None:
+                    try:
+                        # Le moissonneur de l'exécuteur ne touche jamais un harnais,
+                        # même pas pendant son lancement (voir `background`).
+                        with self.runner.launch_lock:
+                            proc = subprocess.Popen(
+                                self.runner.audit_command(self.name, argv, self.agent,
+                                                          exempt=audit_exempt,
+                                                          seconds=audit_seconds),
+                                cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
+                                text=True, bufsize=1, env=env,
+                                start_new_session=True,  # son groupe : on peut le tuer en entier
+                            )
+                            self.runner.harness_pids.add(proc.pid)
+                    except RuntimeError as exc:
+                        raise _LancementImpossible(str(exc)) from exc
+                    except OSError as exc:
+                        raise _LancementImpossible("could not launch %s: %s"
+                                                   % (argv[0], exc.strerror or exc)) from exc
+            if rp is not None:
+                # publié le temps du tour : le veilleur, la perte du bail, la
+                # préemption et l'arrêt le tuent comme un harnais de tour
+                proc = rp.proc
+                with self.lock:
+                    self.proc = proc
+                    self.pgid = rp.pgid
                 try:
-                    # Le moissonneur de l'exécuteur ne touche jamais un harnais,
-                    # même pas pendant son lancement (voir `background`).
-                    with self.runner.launch_lock:
-                        proc = subprocess.Popen(
-                            self.runner.audit_command(self.name, argv, self.agent,
-                                                      exempt=audit_exempt, seconds=audit_seconds),
-                            cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
-                            text=True, bufsize=1, env=env,
-                            start_new_session=True,  # son groupe : on peut le tuer en entier
-                        )
-                        self.runner.harness_pids.add(proc.pid)
-                except RuntimeError as exc:
-                    raise _LancementImpossible(str(exc)) from exc
+                    resident_runner.write_turn(self._path(resident_runner.TURN_FILE), turn_id)
                 except OSError as exc:
-                    raise _LancementImpossible("could not launch %s: %s"
-                                               % (argv[0], exc.strerror or exc)) from exc
-            with self.lock:
-                self.proc = proc
-                self.pgid = proc.pid  # start_new_session : le groupe porte son pid
-            # L31 (0028) : rattache le groupe (et l'étiquette des conteneurs) au
-            # tour, pour repérer ce qui survivrait à sa fin.
-            self._open_turn_resource(turn_id, proc.pid)
+                    log("[%s] resident turn file not written (%s)" % (self.name, exc))
+            else:
+                with self.lock:
+                    self.proc = proc
+                    self.pgid = proc.pid  # start_new_session : le groupe porte son pid
+                # L31 (0028) : rattache le groupe (et l'étiquette des conteneurs) au
+                # tour, pour repérer ce qui survivrait à sa fin.
+                self._open_turn_resource(turn_id, proc.pid)
             # Le trampoline valide le cgroup AVANT de lancer le harnais.
             # L'attente de ce signal est bornée par le minuteur indépendant.
             # Un scope refusé ne consomme aucun courrier.
@@ -3288,7 +3512,20 @@ class AgentWorker(threading.Thread):
             tue = self.kill_if_stop_requested()
             if resume and not tue:
                 self.resume_summary = ""  # le résumé a ouvert la session neuve
-            log("[%s] %s turn: %s" % (self.name, shown, " ".join(argv[:6]) + " …"))
+            if rp is not None:
+                log("[%s] %s turn, resident process %s (%d turn(s) served)"
+                    % (self.name, shown, rp.pgid, rp.turns))
+                rp.drain()  # rien d'un tour précédent
+                try:
+                    tour_resident = rp.driver.send(resume + spec["prompt"])
+                    flux = (json.dumps(raw, ensure_ascii=False)
+                            for raw, _parsed in rp.stream(tour_resident))
+                except resident_mod.ResidentError as exc:
+                    error = "resident turn not started: %s" % exc
+                    flux = ()
+            else:
+                log("[%s] %s turn: %s" % (self.name, shown, " ".join(argv[:6]) + " …"))
+                flux = proc.stdout or ()
             # L78: the writer owns its connection; harness output never waits
             # for SQL or the readable thread. ResidentWorker uses the same sink.
             if getattr(self.db, "driver", "") != "mediated":
@@ -3300,7 +3537,7 @@ class AgentWorker(threading.Thread):
                 conversation_recorder.append("input", spec.get("prompt") or "",
                                              author="ameesh:runner")
             with open(events_path, "a", encoding="utf-8") as events:
-                for line in proc.stdout or ():
+                for line in flux:
                     line = line.rstrip("\n")
                     if not line:
                         continue
@@ -3352,8 +3589,8 @@ class AgentWorker(threading.Thread):
                         # une clôture : le travail de fond garde sa grâce,
                         # bornée par l'échéance du retrait.
                         self.host_yield = self.HOST_SAFE_POINT
-                        self.stop_group_now("the host is withdrawing: turn stopped at a safe point",
-                                            group=False)
+                        self._close_turn_now(
+                            rp, "the host is withdrawing: turn stopped at a safe point")
                     if plafonne:
                         # L217b : le flux se lit jusqu'au bout, même après la
                         # clôture — un appel déjà en tampon compte encore.
@@ -3387,7 +3624,7 @@ class AgentWorker(threading.Thread):
                             # du harnais SEUL — le travail lancé en fond pendant
                             # le tour garde son délai de grâce.
                             clos = True
-                            self.stop_group_now("turn closed: %s" % cloture, group=False)
+                            self._close_turn_now(rp, "turn closed: %s" % cloture)
                     usage = parsed.get("usage")
                     if isinstance(usage, dict):
                         # Clés de chaque harnais normalisées (L60 : l'usage
@@ -3402,7 +3639,12 @@ class AgentWorker(threading.Thread):
                         error = "lease lost during the turn"
                         self.stop_group_now("lease lost during the turn", grace=0, hard=True)
                         break
-            result_code = proc.wait()
+            if rp is None:
+                result_code = proc.wait()
+            else:
+                result_code, erreur_resident = self._resident_result(
+                    rp, tour_resident, clos or self.host_yield is not None)
+                error = error or erreur_resident
         except _LancementImpossible as exc:
             echec_lancement = str(exc)
             result_code = 127
@@ -3410,13 +3652,15 @@ class AgentWorker(threading.Thread):
             heartbeat_done.set()
             preempt_done.set()
             pgid = self.pgid
+            if rp is not None:
+                self._resident_turn_end(rp)
             # Fin NORMALE (harnais fini et moissonné, aucun arrêt d'urgence) :
             # ce qui tourne encore — processus du groupe, conteneurs du tour
             # sans lot — garde un délai de grâce (`background`). Sinon, ou
             # sans délai, le nettoyage habituel, tout de suite.
             fond = None
             try:
-                if (proc is not None and pgid and proc.poll() is not None
+                if (rp is None and proc is not None and pgid and proc.poll() is not None
                         and not self.runner.once and self.turn_grace_seconds() > 0
                         and not self._urgent_end()):
                     fond = self.runner.background.survivors(turn_id, pgid)
@@ -3424,7 +3668,7 @@ class AgentWorker(threading.Thread):
                 log_async("[%s] background work of turn %s not examined (%s)"
                           % (self.name, turn_id[:8], exc))
                 fond = None
-            if fond is None:
+            if fond is None and rp is None:
                 # Arrêt escaladé (SIGTERM puis SIGKILL) : un `Popen.terminate()`
                 # sec laisserait vivre un harnais qui ignore SIGTERM, hors de portée
                 # du veilleur une fois `self.proc` effacé (sonde codex3 B5a-S).
@@ -3432,8 +3676,9 @@ class AgentWorker(threading.Thread):
             with self.lock:
                 self.proc = None
                 self.pgid = None
-            with self.runner.launch_lock:
-                self.runner.harness_pids.discard(pgid)
+            if rp is None:
+                with self.runner.launch_lock:
+                    self.runner.harness_pids.discard(pgid)
             if fond is not None:
                 self.runner.background.start(
                     agent=self.name, turn_id=turn_id, pgid=pgid, members=fond[0],
@@ -3756,6 +4001,7 @@ class AgentWorker(threading.Thread):
                     continue
                 self._base_retablie()
                 if spec is None:
+                    self._resident_between_turns()  # L76 : mort, sommeil
                     self.wake.wait(timeout=self.wait_timeout(
                         min(self.runner.poll, max(1.0, self.runner.lease_ttl / 3.0))))
                     self.wake.clear()

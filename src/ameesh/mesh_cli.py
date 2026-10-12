@@ -1482,10 +1482,13 @@ def _ecrit_etat(cfg: Config, agent: str, cle: str, valeur: str) -> None:
 #: L105 : turn_max_seconds, turn_mail_max ; travail de fond : turn_grace_seconds ;
 #: L125 : mail_batch, réglage LOCAL de l'hôte de l'agent, sans migration — comme
 #: `effort` et `tier` avant L26) ; L223: permission_mode, permission mode of
-#: interactive sessions (`ameesh attach`), also local
+#: interactive sessions (`ameesh attach`), also local; L76: resident (`on` |
+#: `off`) and resident_sleep, the resident process of the agent, also local
 SET_KEYS = ("model", "effort", "tier", "session_policy", "mode", "context_max_tokens",
             "turn_max_seconds", "turn_mail_max", "turn_grace_seconds", "mail_batch",
-            "permission_mode")
+            "permission_mode", "resident", "resident_sleep")
+#: L76: settings written in the local state of the agent's host only
+LOCAL_SET_KEYS = ("mail_batch", "permission_mode", "resident", "resident_sleep")
 #: suffixes acceptés par `context_max_tokens` (`15M`, `500k`)
 _TOKEN_SUFFIXES = {"k": 1_000, "m": 1_000_000}
 
@@ -1574,7 +1577,8 @@ def cmd_set(cfg: Config, args) -> int:
                       "session_policy=%s mode=%s context_max_tokens=N|15M|0 "
                       "turn_max_seconds=30m|2h|0 turn_mail_max=N|0 "
                       "turn_grace_seconds=20m|0 mail_batch=90s|2m|0 "
-                      "permission_mode=auto|acceptEdits|…"
+                      "permission_mode=auto|acceptEdits|… resident=on|off "
+                      "resident_sleep=30m|0"
                       % ("|".join(SESSION_POLICIES), "|".join(registry.MODES)),
                       file=sys.stderr)
                 return 2
@@ -1624,6 +1628,16 @@ def cmd_set(cfg: Config, args) -> int:
                     print("invalid mail_batch: %r (e.g. 90s, 2m, 0 = immediate wake-up)"
                           % valeur, file=sys.stderr)
                     return 2
+            if cle == "resident" and valeur and valeur.lower() not in ("on", "off"):
+                print("invalid resident: %r (on | off)" % valeur, file=sys.stderr)
+                return 2
+            if cle == "resident_sleep" and valeur:
+                try:
+                    valeur = str(parse_duration(valeur))
+                except ValueError:
+                    print("invalid resident_sleep: %r (e.g. 30m, 1h, 0 = never asleep)"
+                          % valeur, file=sys.stderr)
+                    return 2
             if cle == "permission_mode" and valeur:
                 # codex r3 (#182): checked against the agent harness's allowlist
                 harness = agent.get("harness") or ""
@@ -1642,8 +1656,8 @@ def cmd_set(cfg: Config, args) -> int:
                     return 2
             valeurs[cle] = valeur
         for cle, valeur in valeurs.items():
-            if cle in ("model", "effort", "tier", "mail_batch", "permission_mode"):
-                _ecrit_etat(cfg, args.agent, cle, valeur)
+            if cle in ("model", "effort", "tier") or cle in LOCAL_SET_KEYS:
+                _ecrit_etat(cfg, args.agent, cle, valeur.lower() if cle == "resident" else valeur)
             if cle == "model":
                 if valeur:
                     registry.upsert(db, args.agent, model=valeur)
@@ -1688,7 +1702,7 @@ def cmd_set(cfg: Config, args) -> int:
               % (args.agent, modele, effort, tier, politique,
                  agent.get("mode") or "execute", plafond_txt, duree_txt, courrier_txt,
                  grace_txt, regroupement_txt))
-        for local in ("mail_batch", "permission_mode"):
+        for local in LOCAL_SET_KEYS:
             if local in valeurs and (agent.get("host") or "") not in ("", cfg.host):
                 print("warning: %s is read from the local state of the agent's host "
                       "(%s), not from the database: run this setting on %s"

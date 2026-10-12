@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import queue
+import signal
 import threading
 import time
 import uuid
@@ -52,6 +53,28 @@ TURN_FILE = "resident-turn"
 TURN_FILE_ENV = "AMEESH_TURN_ID_FILE"
 
 ON = ("on", "1", "true", "yes")
+
+
+def current_turn(env=None) -> str:
+    """The turn a hook runs in: the content of `TURN_FILE` for a resident
+    process (empty between its turns), else `AMEESH_TURN_ID`."""
+    env = os.environ if env is None else env
+    path = env.get(TURN_FILE_ENV) or ""
+    if path:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            pass
+    return env.get("AMEESH_TURN_ID") or ""
+
+
+def write_turn(path: str, turn_id: str) -> None:
+    """Names the turn in progress for the hook ('' between turns)."""
+    tmp = "%s.tmp-%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(turn_id)
+    os.replace(tmp, path)
 
 
 def enabled(value: str | None) -> bool:
@@ -115,6 +138,9 @@ def refusal(adapter) -> str:
 class ResidentProcess:
     """One started driver and its events, for the turns it serves."""
 
+    #: grace of a clean stop (SIGTERM to the group, then SIGKILL)
+    CLOSE_GRACE = resident.CLOSE_GRACE
+
     def __init__(self, driver: resident.ResidentDriver, *, key: tuple, life_id: str,
                  stderr=None):
         self.driver = driver
@@ -125,6 +151,8 @@ class ResidentProcess:
         self.started = time.monotonic()
         self.last_used = self.started
         self.turns = 0
+        #: its `turn_resources` row (under `life_id`) is open
+        self.resource_open = False
 
     @staticmethod
     def new_life_id() -> str:
@@ -172,6 +200,15 @@ class ResidentProcess:
             if turn.done:
                 break
         yield from self.drain()
+
+    def kill_now(self) -> None:
+        """SIGKILL to the whole group, nothing written before (lost lease)."""
+        pgid = self.pgid
+        if pgid:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except OSError:
+                pass
 
     def close(self, grace: float) -> None:
         try:

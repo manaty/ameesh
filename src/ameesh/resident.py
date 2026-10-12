@@ -233,7 +233,8 @@ class ResidentDriver:
                  tier: str | None = None,
                  on_event: Callable[[dict, dict], None] | None = None,
                  env: Mapping[str, str] | None = None, stderr: Any = None,
-                 init_timeout: float = INIT_TIMEOUT, cost_base: float | None = None):
+                 init_timeout: float = INIT_TIMEOUT, cost_base: float | None = None,
+                 spawn: Callable[..., subprocess.Popen] | None = None):
         self.adapter = adapter
         self.descriptor = adapter.descriptor
         self.block = dict(self.descriptor.resident)
@@ -250,6 +251,9 @@ class ResidentDriver:
         self.extra_env = dict(env or {})
         self.stderr = stderr
         self.init_timeout = max(init_timeout, 0.1)
+        #: L76: starts the harness (`subprocess.Popen` by default); the runner
+        #: passes its own, under its launch lock
+        self.spawn = spawn or subprocess.Popen
         #: cumulative session cost before this process (resumed session)
         self.cost_base = cost_base if cost_base is not None else (None if session else 0.0)
         self.last_activity = time.monotonic()
@@ -531,7 +535,7 @@ class ClaudeStreamJson(ResidentDriver):
     def start(self) -> str:
         argv = self.argv()
         try:
-            self._proc = subprocess.Popen(
+            self._proc = self.spawn(
                 argv, cwd=self.cwd, env=self._env(), stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=self.stderr, text=True, bufsize=1,
                 start_new_session=True)
