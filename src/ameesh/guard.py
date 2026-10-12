@@ -1026,8 +1026,12 @@ class Enforcer:
         killed = self._systemctl("kill", "--signal=SIGKILL", self.cfg.agent_units,
                                  self.cfg.job_units)
         stopped = self._systemctl("stop", self.cfg.slice)
-        record = self.stopped or {"units": {}, "boot_id": self.boot_id(),
-                                  "manual": False, "low_since": None}
+        boot = self.boot_id()
+        # a record of an earlier boot is moot (systemd started what it
+        # enables): a stop in this boot starts its own, else its units
+        # would be skipped as `reboot` (codex #267 r2)
+        record = self.stopped if self.stopped and self.stopped["boot_id"] == boot else \
+            {"units": {}, "boot_id": boot, "manual": False, "low_since": None}
         # each unit keeps the instant of the stop that stopped it, after the
         # stop: a unit inactive since a later instant was started and stopped
         # again by someone else; a later stop (retry, new drain) that finds it
@@ -1038,14 +1042,18 @@ class Enforcer:
         return killed and stopped
 
     def restore_stopped(self, record: Any) -> None:
-        """The units a previous guard stopped (`guard.stopped`)."""
+        """The units a previous guard stopped (`guard.stopped`). The format
+        before codex #267 r1 ({units: [unit…], mono}) is read too: every unit
+        gets the one instant, an upgrade keeps a pending restart (codex #267 r2)."""
         units = record.get("units") if isinstance(record, dict) else None
+        if isinstance(units, list) and all(isinstance(u, str) for u in units) \
+                and _number(record.get("mono")):
+            units = {u: record["mono"] for u in units}
         if isinstance(units, dict) and all(_number(m) for m in units.values()) \
                 and isinstance(record.get("boot_id"), str) \
                 and isinstance(record.get("manual"), bool) \
                 and (record.get("low_since") is None or _number(record.get("low_since"))):
-            self.stopped = {k: record[k] for k in
-                            ("units", "boot_id", "manual", "low_since")}
+            self.stopped = {k: record[k] for k in ("boot_id", "manual", "low_since")}
             self.stopped["units"] = dict(units)
 
     def _unit_show(self, unit: str) -> dict:
