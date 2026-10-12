@@ -262,12 +262,12 @@ class WorkingCopyTest(_Repository):
         self.assertFalse(os.path.exists(marker))
 
     def test_push_instead_of_local_and_global_cannot_redirect_transport(self):
-        other = os.path.join(self.tmp, "other.git")
-        subprocess.run(["git", "clone", "-q", "--bare", self.bare, other], check=True)
-        before = git(other, "rev-parse", "main")
         for mode in ("local-push", "local-fetch", "global"):
             with self.subTest(mode=mode):
-                path = self.open_copy()
+                other = os.path.join(self.tmp, "other-" + mode + ".git")
+                subprocess.run(["git", "clone", "-q", "--bare", self.bare, other], check=True)
+                before = git(other, "rev-parse", "main")
+                path = pm.open_copy(self.bare, self.state + "-" + mode, "verif-a")
                 env = {}
                 rule = "url." + other + (".insteadOf" if mode == "local-fetch" else ".pushInsteadOf")
                 if mode == "global":
@@ -280,10 +280,10 @@ class WorkingCopyTest(_Repository):
                     stream.write("durable fact")
                 with mock.patch.dict(os.environ, env), mock.patch.object(pm, "_git", wraps=pm._git) as calls:
                     self.assertEqual(pm.sync(path, "turn", repository=self.bare)["status"], "pushed")
-                self.assertFalse(any(call.args[0] == path and call.args[1] in ("push", "fetch")
-                                     for call in calls.call_args_list))
                 self.assertEqual(git(other, "rev-parse", "main"), before)
                 self.assertIn("note-" + mode + ".md", git(self.bare, "ls-tree", "-r", "--name-only", "main"))
+                self.assertFalse(any(call.args[0] == path and call.args[1] in ("push", "fetch")
+                                     for call in calls.call_args_list))
 
     def test_push_ignores_pushurl_and_pushremote(self):
         path = self.open_copy()
