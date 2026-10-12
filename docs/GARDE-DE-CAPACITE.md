@@ -110,13 +110,16 @@ policy:
   (`//srv`), un `//` interne, un composant `.` (`/srv/.`), un slash final,
   le même chemin deux fois, une liste vide (lue `["/"]`, son ancien
   défaut). Chacune est signalée en `host-lend-legacy` : l'offre est gardée,
-  la garde démarre, et l'opérateur corrige la fiche. Ce qui reste refusé
-  doit être corrigé **avant** la mise à jour, sinon la garde sort au
-  démarrage : un chemin relatif (il serait sondé depuis le dossier de la
-  garde), un `..` (à travers un lien symbolique, `/srv/../etc` n'est pas
-  `/etc`), un NUL, et une taille qui n'est pas un entier d'octets > 0
-  (`0`, `"0.001KiB"`, un flottant fractionnaire : le lecteur précédent les
-  tronquait, ou lisait `0` comme « pas de reclaim disque »).
+  la garde démarre, et l'opérateur corrige la fiche. Une taille que le
+  lecteur précédent tronquait est tronquée de la même façon et signalée
+  aussi (`"0.001KiB"` vaut 1 octet, `6442450944.5` vaut 6442450944) :
+  l'offre que main acceptait reste valide. Ce qui reste refusé doit être
+  corrigé **avant** la mise à jour, sinon la garde sort au démarrage : un
+  chemin relatif (il serait sondé depuis le dossier de la garde), un `..`
+  (à travers un lien symbolique, `/srv/../etc` n'est pas `/etc`), un NUL,
+  et une taille qui n'est pas > 0 (`0`, `"0.5B"`, ou ce qui tronque à
+  0 octet : le lecteur précédent lisait `0` comme « pas de reclaim
+  disque », ce qui désactivait le seuil en silence).
 - With several fiches for one host (several canons), the lowest cap of
   each key applies.
 

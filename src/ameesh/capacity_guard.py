@@ -277,6 +277,23 @@ def _reclaim_path(value, warnings: list[str] | None = None) -> str | None:
     return normalized
 
 
+def _reclaim_bytes(value) -> tuple[int | None, bool]:
+    """(octets, tronqué) of a size threshold.
+
+    An exact whole number of bytes passes as is. Otherwise the value is the
+    one the previous reader returned by truncating, and `truncated` is true:
+    main accepted these sizes, an update must not invalidate an existing
+    offer (mesh-design, #459 r4b). Only a result <= 0 is still refused:
+    zero bytes watches nothing."""
+    exact = resources_mod.parse_bytes(value, decimal_ok=False)
+    if exact is not None:
+        return exact, False
+    truncated = resources_mod.parse_bytes(value, decimal_ok=True)
+    if truncated is None:
+        return None, False
+    return truncated, True
+
+
 def _parse_reclaim(raw, warnings: list[str] | None = None) -> tuple[dict, list[str], list[str]]:
     """The thresholds of the application at which the guest gives way."""
     if not isinstance(raw, dict):
@@ -291,12 +308,18 @@ def _parse_reclaim(raw, warnings: list[str] | None = None) -> tuple[dict, list[s
     for key in ("memory_available_min", "disk_free_min"):
         if raw.get(key) is None:
             continue
-        octets = resources_mod.parse_bytes(raw[key], decimal_ok=False)
+        octets, truncated = _reclaim_bytes(raw[key])
         if octets is None or octets <= 0:
             problems.append("`%s`: size in bytes > 0 expected (e.g. %s)"
                             % (key, "6GiB" if key == "memory_available_min" else "10GiB"))
         else:
             out[key] = octets
+            if truncated and warnings is not None:
+                # main truncated it; the offer stays valid, the operator is
+                # told to write a whole number of bytes (codex #459 r4b)
+                warnings.append("`%s`: %r truncated to %d bytes (the previous reader "
+                                "truncated it too; write a whole number of bytes)"
+                                % (key, raw[key], octets))
     for key in ("cpu_pressure_max", "memory_pressure_max", "io_pressure_max"):
         if raw.get(key) is None:
             continue

@@ -299,10 +299,11 @@ class OfferTest(unittest.TestCase):
     def test_reclaim_sizes_are_positive_whole_bytes(self):
         # codex #459 r1: `disk_free_min: 0` and `"0.5B"` were accepted as 0,
         # and 0 free bytes were still above it: disk reclaim was disabled; a
-        # threshold is a size > 0, with a whole number of bytes
+        # threshold is a size > 0. r4b: "1.5B" (main truncated it to 1) is
+        # accepted truncated, with a warning
         base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
         for key in ("disk_free_min", "memory_available_min"):
-            for value in (0, 0.0, "0B", "0.5B", "1.5B", -1):
+            for value in (0, 0.0, "0B", "0.5B", "0.0001KiB", -1):
                 with self.subTest(key=key, value=value):
                     offer, problems, _ = capacity_guard.parse_lend(
                         dict(base, reclaim={key: value}))
@@ -312,6 +313,12 @@ class OfferTest(unittest.TestCase):
                 dict(base, reclaim={key: "4.5GiB"}))
             self.assertEqual(problems, [])
             self.assertEqual(offer["reclaim"][key], int(4.5 * GIB))
+            warnings: list[str] = []
+            offer, problems, _ = capacity_guard.parse_lend(
+                dict(base, reclaim={key: "1.5B"}), warnings)
+            self.assertEqual(problems, [])
+            self.assertEqual(offer["reclaim"][key], 1)
+            self.assertTrue(any(key in w and "truncated" in w for w in warnings), warnings)
 
     def test_disk_paths_accept_a_trailing_slash(self):
         # codex #459 r2: a trailing slash names the same filesystem; it is
@@ -335,67 +342,91 @@ class OfferTest(unittest.TestCase):
 
     def test_reclaim_sizes_accept_integral_numbers(self):
         # codex #459 r2: `memory_available_min: 6442450944.0` (exactly 6 GiB)
-        # was valid at r1 and refused although it is a whole number of bytes;
-        # a fractional float is still refused
+        # was valid at r1 and refused although it is a whole number of bytes.
+        # r4b: `6442450944.5` is main's truncated value, with a warning
         base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
         for key in ("disk_free_min", "memory_available_min"):
             for value, expected in ((6442450944.0, 6442450944),
                                     (4.5 * GIB, int(4.5 * GIB))):
                 with self.subTest(key=key, value=value):
+                    warnings: list[str] = []
                     offer, problems, _ = capacity_guard.parse_lend(
-                        dict(base, reclaim={key: value}))
+                        dict(base, reclaim={key: value}), warnings)
                     self.assertEqual(problems, [])
                     self.assertEqual(offer["reclaim"][key], expected)
-            for value in (6442450944.5, -1.0, float("nan"), float("inf")):
+                    self.assertEqual(warnings, [])
+            warnings = []
+            offer, problems, _ = capacity_guard.parse_lend(
+                dict(base, reclaim={key: 6442450944.5}), warnings)
+            self.assertEqual(problems, [])
+            self.assertEqual(offer["reclaim"][key], 6442450944)
+            self.assertTrue(any("truncated" in w for w in warnings), warnings)
+            for value in (-1.0, float("nan"), float("inf")):
                 with self.subTest(key=key, value=value):
                     offer, problems, _ = capacity_guard.parse_lend(
                         dict(base, reclaim={key: value}))
                     self.assertIsNone(offer)
                     self.assertTrue(any(key in p for p in problems), problems)
 
-    def test_reclaim_sizes_refuse_a_fractional_byte_count(self):
-        # codex #459 r2: with a unit, a fractional byte count was truncated
-        # ("0.001KiB" -> 1); only exact byte counts pass, "4.5GiB" included
+    def test_reclaim_sizes_truncate_like_main_with_a_warning(self):
+        # codex #459 r2 refused a fractional byte count ("0.001KiB" -> 1);
+        # mesh-design #459 r4b: main truncated it, an update must not
+        # invalidate the offer — truncate the same way, warn, and let the
+        # canon report it as host-lend-legacy
         base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
         for key in ("disk_free_min", "memory_available_min"):
-            for value in ("0.001KiB", "0.1KiB", "1.5B", "1.0000000000000001GiB"):
+            for value, expected in (("0.001KiB", 1), ("0.1KiB", 102),
+                                    ("1.5B", 1), ("1.0000000000000001GiB", GIB)):
                 with self.subTest(key=key, value=value):
+                    warnings: list[str] = []
                     offer, problems, _ = capacity_guard.parse_lend(
-                        dict(base, reclaim={key: value}))
-                    self.assertIsNone(offer)
-                    self.assertTrue(any(key in p for p in problems), problems)
-            for value, expected in (("4.5GiB", int(4.5 * GIB)), ("1.5KiB", 1536)):
-                with self.subTest(key=key, value=value):
-                    offer, problems, _ = capacity_guard.parse_lend(
-                        dict(base, reclaim={key: value}))
+                        dict(base, reclaim={key: value}), warnings)
                     self.assertEqual(problems, [])
                     self.assertEqual(offer["reclaim"][key], expected)
+                    self.assertTrue(any(key in w and "truncated" in w for w in warnings),
+                                    warnings)
+            for value, expected in (("4.5GiB", int(4.5 * GIB)), ("1.5KiB", 1536)):
+                with self.subTest(key=key, value=value):
+                    warnings = []
+                    offer, problems, _ = capacity_guard.parse_lend(
+                        dict(base, reclaim={key: value}), warnings)
+                    self.assertEqual(problems, [])
+                    self.assertEqual(offer["reclaim"][key], expected)
+                    self.assertEqual(warnings, [], "exact byte count, nothing truncated")
 
     def test_reclaim_sizes_keep_every_input_digit(self):
         # codex #459 r3: the whole-byte check went through `Decimal` under the
-        # default 28-digit context, which rounds: a 29-digit value such as
-        # "1.0000000000000000000000000001GiB" passed as 1 GiB. Every input
-        # digit must count, however long the fraction is.
+        # default 28-digit context, which rounds. r4b: such a value is
+        # truncated to main's value, with a warning — every input digit counts
         base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
-        refuse = ("1.0000000000000000000000000001GiB",
-                  "1.0000000000000000000000000001KiB",
-                  "0." + "0" * 27 + "1GiB")
         for key in ("disk_free_min", "memory_available_min"):
-            for value in refuse:
+            for value, expected in (("1.0000000000000000000000000001GiB", GIB),
+                                    ("1.0000000000000000000000000001KiB", 1024)):
+                with self.subTest(key=key, value=value):
+                    warnings: list[str] = []
+                    offer, problems, _ = capacity_guard.parse_lend(
+                        dict(base, reclaim={key: value}), warnings)
+                    self.assertEqual(problems, [])
+                    self.assertEqual(offer["reclaim"][key], expected)
+                    self.assertTrue(any("truncated" in w for w in warnings), warnings)
+            # a value that truncates to 0 bytes is still refused
+            for value in ("0." + "0" * 27 + "1GiB",):
                 with self.subTest(key=key, value=value):
                     offer, problems, _ = capacity_guard.parse_lend(
                         dict(base, reclaim={key: value}))
                     self.assertIsNone(offer)
                     self.assertTrue(any(key in p for p in problems), problems)
             # the same values padded with zeros after the point are exact and
-            # must keep passing
+            # must keep passing, without a warning
             for value, expected in (("1." + "0" * 28 + "GiB", GIB),
                                     ("4.5" + "0" * 26 + "GiB", int(4.5 * GIB))):
                 with self.subTest(key=key, value=value):
+                    warnings = []
                     offer, problems, _ = capacity_guard.parse_lend(
-                        dict(base, reclaim={key: value}))
+                        dict(base, reclaim={key: value}), warnings)
                     self.assertEqual(problems, [])
                     self.assertEqual(offer["reclaim"][key], expected)
+                    self.assertEqual(warnings, [])
 
     def test_reclaim_explicit_nulls_are_refused(self):
         # codex #459 r1: an explicit null is not an absent key: a null
