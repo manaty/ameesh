@@ -2255,6 +2255,53 @@ class Operations(Domain):
 # ressources des hôtes (lot L31, décision 0028, migration 0029)
 # --------------------------------------------------------------------------
 
+class HostLifecycle(Domain):
+    """Durable withdrawal and return intent for admitted hosts (L232e)."""
+
+    @abc.abstractmethod
+    def get(self, host: str) -> dict | None:
+        """Current host mode/generation and scheduled return."""
+
+    @abc.abstractmethod
+    def listing(self) -> list[dict]:
+        """Persistent host controls, including withdrawn hosts."""
+
+    @abc.abstractmethod
+    def drain(self, host: str, *, actor: str, duration: int | None = None,
+              critical: Sequence[str] = ()) -> dict:
+        """Close claims/enable atomically and retain agents' original host."""
+
+    @abc.abstractmethod
+    def undrain(self, host: str, *, actor: str) -> dict | None:
+        """Request agents' return; retained origin rows survive this request."""
+
+    @abc.abstractmethod
+    def agents(self, host: str, generation: int) -> list[dict]:
+        """Agent origins ordered critical first, with progress/refusals."""
+
+    @abc.abstractmethod
+    def demand(self, agent: str, current_host: str) -> dict | None:
+        """Current withdrawal or return request applicable to this agent."""
+
+    @abc.abstractmethod
+    def progress(self, host: str, generation: int, agent: str, *, operation: str | None,
+                 missing: Sequence[str]) -> bool:
+        """CAS progress against the current host generation."""
+
+    @abc.abstractmethod
+    def expire_returns(self) -> list[dict]:
+        """Convert elapsed planned withdrawals to durable return requests."""
+
+    @abc.abstractmethod
+    def complete_return(self, host: str, generation: int) -> bool:
+        """Finish a return only when all remaining origins are home and unfenced."""
+
+    @abc.abstractmethod
+    def detect_losses(self, *, actor: str, older_than: int,
+                      critical: Sequence[str] = ()) -> list[dict]:
+        """Close stale known hosts atomically; loss is not a quiescence proof."""
+
+
 class HostResources(Domain):
     """Relevés des ressources d'un hôte (état d'exécution, jamais canon).
 
@@ -2744,6 +2791,18 @@ class Handoffs(Domain):
     def drain(self, operation: str) -> dict | None: ...
 
     @abc.abstractmethod
+    def recover_source(self, operation: str, *, proof: dict) -> dict | None:
+        """Fence the expired source epoch after scoped quiescence and publication proof."""
+
+    @abc.abstractmethod
+    def promote_loss(self, operation: str) -> dict | None:
+        """Convert a pre-switch handoff after loss, preserving its capacity reservation."""
+
+    @abc.abstractmethod
+    def cancellation_guard(self, operation: str):
+        """Yield a journal API whose completion/fence writes share the source gate transaction."""
+
+    @abc.abstractmethod
     def switch(self, operation: str, *, cwd: str, brief: str) -> dict | None: ...
 
     @abc.abstractmethod
@@ -2795,6 +2854,7 @@ class Storage(abc.ABC):
     roadmap: Roadmap
     operations: Operations
     hosts: HostResources
+    host_lifecycle: HostLifecycle
     turn_resources: TurnResources
     visibility: Visibility
     housekeeping: Housekeeping
