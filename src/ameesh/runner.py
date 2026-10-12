@@ -3884,12 +3884,31 @@ class Runner:
         def boucle() -> None:
             while not self.stop.is_set():
                 self.resource_once()
-                # L120: harness versions, every 6 h (not in `--once`)
-                self.harness_versions_once()
                 if self.stop.wait(max(10.0, interval)):
                     return
 
         threading.Thread(target=boucle, daemon=True, name="ressources").start()
+
+    #: L120: how often the version thread wakes; the probe itself runs at
+    #: most every `harness_versions.PROBE_INTERVAL_S`
+    VERSIONS_WAKE_S = 600.0
+
+    def start_version_poll(self) -> threading.Thread | None:
+        """L120: harness versions read at startup, then every 6 h — on their
+        own thread, whatever `AMEESH_RESOURCE_INTERVAL` says (0 disables the
+        resource poll, not this). Not in `--once` mode."""
+        if self.once:
+            return None
+
+        def boucle() -> None:
+            while not self.stop.is_set():
+                self.harness_versions_once()
+                if self.stop.wait(self.VERSIONS_WAKE_S):
+                    return
+
+        thread = threading.Thread(target=boucle, daemon=True, name="versions")
+        thread.start()
+        return thread
 
     # -- ménage (L73) -----------------------------------------------------
     def housekeeping_policy(self):
@@ -4428,6 +4447,7 @@ class Runner:
         self.start_canon_sync()
         self.start_balance_poll()
         self.start_resource_poll()
+        self.start_version_poll()
         self.start_housekeeping_poll()
         self.start_branch_sweep_poll()
         if self.once:

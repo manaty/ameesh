@@ -4,9 +4,11 @@ by `ameesh harness versions` with the differences between hosts and the
 latest release. Read only: nothing is updated."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import subprocess
+import threading
 import unittest
 from unittest import mock
 
@@ -27,6 +29,9 @@ class VersionTest(unittest.TestCase):
                                ("codex-cli 0.159.3", "0.159.3"),
                                ("0.2.0-rc.2", "0.2.0-rc.2"),
                                ("dsh v1.4", "1.4"),
+                               # r2: hyphens inside pre-release identifiers
+                               ("tool 1.4.0-alpha-1 (beta)", "1.4.0-alpha-1"),
+                               ("1.4.0-x-y.2-z", "1.4.0-x-y.2-z"),
                                ("no version here", None), ("", None), (None, None)):
             with self.subTest(text=text):
                 self.assertEqual(hv.parse_version(text), expected)
@@ -40,6 +45,7 @@ class VersionTest(unittest.TestCase):
         self.assertEqual(hv.version_key("1.4"), hv.version_key("1.4.0"))
         self.assertEqual(hv.version_key("1"), hv.version_key("1.0.0"))
         self.assertLess(hv.version_key("1.4.0"), hv.version_key("1.4.1-rc.1"))
+        self.assertLess(hv.version_key("1.4.0-alpha-1"), hv.version_key("1.4.0-alpha-2"))
 
     def test_probe_fake_harnesses(self):
         with mock.patch.dict(os.environ, FAKE_ENV):
@@ -120,6 +126,13 @@ class VersionTest(unittest.TestCase):
                 for h, v in (("pc", "1.4"), ("vm", "1.4.0"))]
         self.assertFalse(hv.matrix(same)[0]["differs"])
         self.assertEqual(hv.matrix(same)[0]["behind"], [])
+        # r2: alpha-1 and alpha-2 differ (hyphen kept in the identifier)
+        hyphen = [{"harness": "dsh", "host": h, "version": hv.parse_version(raw),
+                   "observed_ts": None}
+                  for h, raw in (("pc", "dsh 1.4.0-alpha-1"), ("vm", "dsh 1.4.0-alpha-2"))]
+        table = hv.matrix(hyphen)[0]
+        self.assertTrue(table["differs"])
+        self.assertEqual(table["behind"], ["pc"])
 
 
 class VersionDbTest(PgTestCase):
@@ -150,6 +163,27 @@ class VersionDbTest(PgTestCase):
         rows = storage.of(self.db).hosts.harness_versions(self.cfg.host)
         self.assertEqual({(r["harness"], r["version"]) for r in rows},
                          {("claude", "9.9.9"), ("deepseek", "9.9.9")})
+
+    def test_version_poll_runs_without_resource_poll(self):
+        # r2: AMEESH_RESOURCE_INTERVAL=0 turns off the resource poll, not the
+        # version probe — read at startup on its own thread
+        runner = Runner(self.cfg, self.db, once=False)
+        runner.cfg = dataclasses.replace(self.cfg, resource_interval=0.0)
+        called = threading.Event()
+        with mock.patch.object(runner, "resource_once") as resources, \
+                mock.patch.object(runner, "harness_versions_once",
+                                  side_effect=lambda: called.set()):
+            runner.start_resource_poll()
+            thread = runner.start_version_poll()
+            try:
+                self.assertTrue(called.wait(10.0))
+            finally:
+                runner.stop.set()
+                thread.join(10.0)
+            resources.assert_not_called()
+        self.assertFalse(thread.is_alive())
+        # `--once`: no thread
+        self.assertIsNone(Runner(self.cfg, self.db, once=True).start_version_poll())
 
     def test_cli(self):
         storage.of(self.db).hosts.record_harness_version(

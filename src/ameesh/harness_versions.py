@@ -35,7 +35,9 @@ NPM_PACKAGES = {"claude": "@anthropic-ai/claude-code", "codex": "@openai/codex"}
 NPM_REGISTRY = "https://registry.npmjs.org"
 LATEST_TIMEOUT_S = 5.0
 
-_VERSION_RE = re.compile(r"(?<![\w.])v?(\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.]+)?)")
+#: semver pre-release: dot-separated identifiers of [0-9A-Za-z-] (`alpha-1`)
+_VERSION_RE = re.compile(
+    r"(?<![\w.])v?(\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)")
 
 
 def parse_version(text: str | None) -> str | None:
