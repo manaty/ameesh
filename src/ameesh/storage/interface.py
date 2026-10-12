@@ -2730,6 +2730,10 @@ class Handoffs(Domain):
         """Convert a pre-switch handoff after loss, preserving its capacity reservation."""
 
     @abc.abstractmethod
+    def cancellation_guard(self, operation: str):
+        """Yield a journal API whose completion/fence writes share the source gate transaction."""
+
+    @abc.abstractmethod
     def switch(self, operation: str, *, cwd: str, brief: str) -> dict | None: ...
 
     @abc.abstractmethod

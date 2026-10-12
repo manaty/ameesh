@@ -350,7 +350,7 @@ def _serialized(function):
     return step
 
 
-def _effect(api, adapter, step, op, *, enable_slot=None):
+def _effect(api, adapter, step, op, *, enable_slot=None, completion_api=None):
     if step not in ("revalidate", "restore_source"):
         # The domain API is bound to the same controller DB; host readings
         # come through storage, not through an adapter's cached admission.
@@ -382,7 +382,7 @@ def _effect(api, adapter, step, op, *, enable_slot=None):
         result = _adapter_call(adapter, step, intent)
     # An exception or lock loss leaves the durable intent in place: nobody
     # can overtake an external effect whose completion is unknown.
-    api.finish_effect(op["id"], intent["controller_epoch"])
+    (completion_api or api).finish_effect(op["id"], intent["controller_epoch"])
     return result
 
 
@@ -471,13 +471,13 @@ def cancel(db, operation, adapter):
         raise HandoffError("destination may have new work; recovery requires reconciliation")
     # Loss publication uses this same gate lock. Keep the current lifecycle
     # check, restoration and fence release within one boundary.
-    with storage.of(db).hosts.gate_guard(op["source"]) as hosts:
-        control = storage.of(hosts.db).host_lifecycle.get(op["source"])
+    with api.cancellation_guard(operation) as guarded:
+        control = storage.of(guarded.db).host_lifecycle.get(op["source"])
         if control and control["mode"] == "lost":
             raise HandoffError("lost source cannot be restored by ordinary cancellation")
-        if _effect(api, adapter, "restore_source", op) is not True:
+        if _effect(api, adapter, "restore_source", op, completion_api=guarded) is not True:
             raise HandoffError("source recovery not verified")
-        return api.unfence(operation, op["state"], "cancelled") or api.get(operation)
+        return guarded.unfence(operation, op["state"], "cancelled") or guarded.get(operation)
 
 
 @_serialized

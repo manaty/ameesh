@@ -3676,7 +3676,7 @@
   }
  ],
  "refused": {
-  "interface_total": 366,
+  "interface_total": 367,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -4063,6 +4063,7 @@
    "handoffs": [
     "active",
     "begin_effect",
+    "cancellation_guard",
     "controller",
     "cooling",
     "drain",

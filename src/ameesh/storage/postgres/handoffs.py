@@ -45,6 +45,22 @@ class ControllerDb:
 
 class Handoffs(interface.Handoffs):
     @contextmanager
+    def cancellation_guard(self, operation):
+        if not isinstance(self.db, ControllerDb) or self.db.operation != operation:
+            raise ControllerLost("cancellation requires the operation's controller epoch")
+        op = self.get(operation)
+        if not op:
+            raise ControllerLost("unknown cancellation operation")
+        from .hosts import Hosts
+        with Hosts(self.db).gate_guard(op["source"]) as hosts:
+            # Intent is committed separately before the host call. Completion
+            # and fence release commit here, on the backend holding the gate.
+            # Losing that backend rolls back both, even if the original
+            # journal connection survives and loss publication now proceeds.
+            guarded = ControllerDb(hosts.db, operation, self.db.epoch, self.db.pid)
+            yield Handoffs(guarded)
+
+    @contextmanager
     def controller(self, operation, *, reconcile=False):
         # Independent lock connection: each journal/fence change must commit
         # before the next external effect, especially before enabling a turn.

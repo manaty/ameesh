@@ -173,6 +173,11 @@ proofs and obtains the scoped recovery proof before proceeding. An unknown
 effect must first be explicitly reconciled. Restoration checks the source's
 current lifecycle under its gate lock, so a planned drain cannot restore a
 source that has since become lost.
+Restoration intent stays committed on the independent journal connection.
+Its completion and the cancellation fence release use the transaction owning
+the source gate lock. If that backend disconnects during restoration or before
+commit, both writes roll back and the pending intent still requires explicit
+quiescence reconciliation.
 
 All L232e host effects are currently tested with simulated adapters. The
 runner records `helper:L232b` when no enrolled implementation is supplied;

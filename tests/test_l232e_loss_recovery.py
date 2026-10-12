@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Lost-host recovery needs scoped quiescence and a published checkpoint."""
 from unittest import mock
+from contextlib import contextmanager
 
 from ameesh import handoffs, host_lifecycle, registry
 from . import test_l232e_drain_handoffs as drain_fixtures
@@ -20,6 +21,57 @@ class RecoveryAdapter(drain_fixtures.Adapter):
 
 
 class LossRecoveryTest(drain_fixtures.DrainHandoffTest):
+    def gate_failure_cancel(self, phase):
+        from ameesh.storage.postgres.hosts import Hosts
+        self.adapter = RecoveryAdapter()
+        self.api.host_lifecycle.drain("source", actor="orch", critical=("dev",))
+        for _ in range(3):
+            op = self.step()[0]["operation"]
+        self.assertEqual(op["state"], "drained")
+        self.assertTrue(op["fenced"])
+        self.db.execute("UPDATE agent_registry SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE name='dev'")
+        self.db.execute("UPDATE host_resources SET sampled_at=clock_timestamp()-interval '20 minutes' WHERE host='source'")
+        original_guard = Hosts.gate_guard
+        pids = []
+
+        @contextmanager
+        def record_gate(hosts, host):
+            with original_guard(hosts, host) as locked:
+                pids.append(locked.db.query("SELECT pg_backend_pid() AS pid")[0]["pid"])
+                yield locked
+                if phase == "commit":
+                    disconnect()
+
+        def disconnect():
+            self.db.query("SELECT pg_terminate_backend(%s)", (pids[-1],))
+            changed = self.api.host_lifecycle.detect_losses(actor="remote", older_than=180, critical=("dev",))
+            self.assertEqual(changed[0]["mode"], "lost")
+
+        def restore(intent):
+            self.assertEqual(intent["evidence"]["pending_effect"]["name"], "restore_source")
+            if phase == "restore":
+                disconnect()
+            return True
+
+        with mock.patch.object(Hosts, "gate_guard", record_gate), \
+                mock.patch.object(self.adapter, "restore_source", side_effect=restore):
+            with self.assertRaises(handoffs.HandoffError):
+                handoffs.cancel(self.db, op["id"], self.adapter)
+        uncertain = self.api.handoffs.get(op["id"])
+        self.assertEqual(uncertain["state"], "drained")
+        self.assertTrue(uncertain["fenced"])
+        self.assertTrue(registry.get(self.db, "dev")["handoff_fenced"])
+        self.assertEqual(uncertain["evidence"]["pending_effect"]["name"], "restore_source")
+        result = self.step()[0]
+        self.assertEqual(result["missing"], ["handoff_requires_reconciliation"])
+        self.assertNotIn("enable", self.adapter.calls)
+
+    def test_gate_disconnect_during_restore_keeps_cancellation_uncertain_and_fenced(self):
+        self.gate_failure_cancel("restore")
+
+    def test_gate_disconnect_before_commit_rolls_back_completion_and_fence_release(self):
+        self.gate_failure_cancel("commit")
+
     def lose_prepared_drain(self):
         self.adapter = RecoveryAdapter()
         self.api.host_lifecycle.drain("source", actor="orch", critical=("dev",))
