@@ -60,7 +60,14 @@ Configuration (`/etc/ameesh/guard.json`, `--config`, `AMEESH_GUARD_CONFIG`):
                           "memory_pressure_max": "2%", "io_pressure_max": "20%",
                           "busy_units": ["actions.runner.*"], "busy_max": 4,
                           "disk_free_min": "2GiB", "disk_paths": ["/"]},
-              "drain_seconds": 90, "calm_seconds": 600}}
+              "drain_seconds": 90, "calm_seconds": 600, "restart_after_seconds": 600}}
+
+The restart (L159e4): the agent units a stop found running are written in
+the state (`guard.stopped`). Once the level stays at 1 or below for
+`restart_after_seconds`, the guard starts them again, once, on the same
+boot only, and never one that is running again, nor one stopped since by
+someone else, nor after a drain the owner asked (`manual`). Each restart is
+logged and published (`guard.restart`).
 """
 from __future__ import annotations
 
@@ -109,6 +116,9 @@ WARN_SHARE = 0.5
 #: defaults of the offer
 DEFAULT_DRAIN_S = 90.0
 DEFAULT_CALM_S = 600.0
+#: how long the level stays at 1 or below before the units a stop stopped
+#: are started again (L159e4)
+DEFAULT_RESTART_AFTER_S = 600.0
 DEFAULT_DISK_FREE_MIN = 2 * 1024 ** 3
 #: with no history, what the guard lends (study §1.4: 25 % of the memory, 1 CPU)
 WARMUP_MEMORY_SHARE = 0.25
@@ -201,6 +211,7 @@ class Offer:
     disk_paths: tuple = ("/",)
     drain_seconds: float = DEFAULT_DRAIN_S
     calm_seconds: float = DEFAULT_CALM_S
+    restart_after_seconds: float = DEFAULT_RESTART_AFTER_S
     #: the offer as published in the state (`offer`): sizes in bytes
     published: dict = dataclasses.field(default_factory=dict, compare=False)
 
@@ -244,6 +255,13 @@ def parse_offer(lend: Any) -> Offer:
     io = _percent(extra.get("io_pressure_max"), "io_pressure_max")
     disk_min = _bytes(extra.get("disk_free_min"), "reclaim.disk_free_min")
     published = dict(parsed)
+    restart = lend.get("restart_after_seconds")
+    if restart is not None:
+        # the guard's own key, as the reclaim keys above: whole seconds >= 0
+        restart = capacity_guard._positive_int(restart, 0)
+        if restart is None:
+            raise GuardError("lend.restart_after_seconds: whole number of seconds expected")
+        published["restart_after_seconds"] = restart
     guard_keys = {"io_pressure_max": io, "disk_free_min": disk_min,
                   "disk_paths": paths if "disk_paths" in extra else None}
     guard_keys = {k: v for k, v in guard_keys.items() if v is not None}
@@ -263,6 +281,7 @@ def parse_offer(lend: Any) -> Offer:
         disk_paths=tuple(paths),
         drain_seconds=float(parsed["drain_seconds"]),
         calm_seconds=float(parsed["calm_seconds"]),
+        restart_after_seconds=DEFAULT_RESTART_AFTER_S if restart is None else float(restart),
         published=published)
 
 
@@ -821,11 +840,13 @@ class Enforcer:
     def __init__(self, cfg: GuardConfig, run: Callable | None = None,
                  log: Callable | None = None, clock: Callable = time.time, *,
                  cgroup: str | None = None, boottime: Callable = host.boottime,
-                 boot_id: Callable = host.boot_id, sleep: Callable = time.sleep):
+                 boot_id: Callable = host.boot_id, sleep: Callable = time.sleep,
+                 monotonic: Callable = time.monotonic):
         self.cfg = cfg
         self.run = run or subprocess.run
         self.clock = clock
         self.boottime, self.boot_id, self.sleep = boottime, boot_id, sleep
+        self.monotonic = monotonic
         self.log = log or (lambda text: print("ameesh guard: %s" % text, file=sys.stderr))
         self.applied: dict = {}          # unit -> {property: value} last applied
         self.frozen = False              # possibly frozen: a thaw is owed
@@ -838,6 +859,12 @@ class Enforcer:
         #: the freeze episode: its since_ts, the boot, and its bound on the
         #: boot clock, kept across retries and restarts (codex #237 r5)
         self.episode: dict | None = None
+        #: the agent units a stop found running, to start again (L159e4):
+        #: {units: {unit: systemd's monotonic clock once stopped}, boot_id,
+        #: manual, low_since}; published as `guard.stopped`
+        self.stopped: dict | None = None
+        #: the last restart: {ts, started, skipped}; published as `guard.restart`
+        self.restarted: dict | None = None
 
     def _command(self, argv: list[str]) -> bool:
         try:
@@ -854,10 +881,12 @@ class Enforcer:
     def _systemctl(self, *args: str) -> bool:
         return self._command(["systemctl", *args])
 
-    def agent_units(self) -> list[str]:
-        """The loaded agent units of the guest."""
+    def agent_units(self, running: bool = False) -> list[str]:
+        """The loaded agent units of the guest (`running`: only those active
+        or starting)."""
+        which = ["--state=active,activating,reloading"] if running else ["--all"]
         try:
-            proc = self.run(["systemctl", "list-units", "--all", "--plain", "--no-legend",
+            proc = self.run(["systemctl", "list-units", *which, "--plain", "--no-legend",
                              "--no-pager", self.cfg.agent_units],
                             capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
@@ -993,13 +1022,77 @@ class Enforcer:
         aimed at the units: not every systemd kills a slice), then stops the
         slice, its units with it. Done once both succeeded (a unit pattern
         that matches nothing is not a failure)."""
+        running = self.agent_units(running=True)
         killed = self._systemctl("kill", "--signal=SIGKILL", self.cfg.agent_units,
                                  self.cfg.job_units)
         stopped = self._systemctl("stop", self.cfg.slice)
+        record = self.stopped or {"units": {}, "boot_id": self.boot_id(),
+                                  "manual": False, "low_since": None}
+        # each unit keeps the instant of the stop that stopped it, after the
+        # stop: a unit inactive since a later instant was started and stopped
+        # again by someone else; a later stop (retry, new drain) that finds it
+        # stopped never moves it (codex #267 r1)
+        mono = self.monotonic()
+        record["units"] = dict(record["units"], **{u: mono for u in running})
+        self.stopped = record
         return killed and stopped
 
+    def restore_stopped(self, record: Any) -> None:
+        """The units a previous guard stopped (`guard.stopped`)."""
+        units = record.get("units") if isinstance(record, dict) else None
+        if isinstance(units, dict) and all(_number(m) for m in units.values()) \
+                and isinstance(record.get("boot_id"), str) \
+                and isinstance(record.get("manual"), bool) \
+                and (record.get("low_since") is None or _number(record.get("low_since"))):
+            self.stopped = {k: record[k] for k in
+                            ("units", "boot_id", "manual", "low_since")}
+            self.stopped["units"] = dict(units)
+
+    def _unit_show(self, unit: str) -> dict:
+        try:
+            proc = self.run(["systemctl", "show", "--property=ActiveState",
+                             "--property=InactiveEnterTimestampMonotonic", unit],
+                            capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return {}
+        if proc.returncode != 0:
+            return {}
+        return dict(line.partition("=")[::2] for line in proc.stdout.splitlines() if "=" in line)
+
+    def restart_stopped(self, now: float) -> dict:
+        """Starts again, once, the agent units the guard stopped itself: not
+        after a reboot (systemd started what it enables), nor a unit running
+        again, nor one stopped since by someone else (its inactive instant
+        is later than the stop), nor after a manual drain. The record is
+        dropped whatever happens: never a second try."""
+        record, self.stopped = self.stopped, None
+        started, skipped = [], {}
+        same_boot = record["boot_id"] == self.boot_id()
+        for unit, stopped_at in sorted(record["units"].items()):
+            if record["manual"]:
+                skipped[unit] = "manual"
+                continue
+            if not same_boot:
+                skipped[unit] = "reboot"
+                continue
+            shown = self._unit_show(unit)
+            inactive = resources.finite_float(shown.get("InactiveEnterTimestampMonotonic"))
+            if shown.get("ActiveState") not in ("inactive", "failed") or inactive is None:
+                skipped[unit] = "running" if shown.get("ActiveState") else "unknown"
+            elif inactive / 1e6 > stopped_at:
+                skipped[unit] = "stopped_by_owner"
+            elif self._systemctl("start", "--no-block", unit):
+                started.append(unit)
+            else:
+                skipped[unit] = "start_failed"
+        self.restarted = {"ts": now, "started": started, "skipped": skipped}
+        self.log("restart after the stop: started %s; left stopped %s"
+                 % (", ".join(started) or "none",
+                    ", ".join("%s (%s)" % kv for kv in sorted(skipped.items())) or "none"))
+        return self.restarted
+
     def apply(self, state: dict, cpu_count: int | None,
-              now: float | None = None) -> list[str]:
+              now: float | None = None, *, manual: bool = False) -> list[str]:
         """Enforces `state`: caps at every level, freeze at level 2; a drain
         thaws, and stops the jobs at its deadline; a stop kills and stops the
         guest's slice. Each is done once, retried while it fails. The `caps`
@@ -1008,7 +1101,8 @@ class Enforcer:
 
         `now` is the instant `state` was decided at: the deadline is judged
         on the same clock as the decision (a manual request's expiry
-        included), never on a later one (codex #238 r4)."""
+        included), never on a later one (codex #238 r4). `manual`: a drain the
+        owner asked is in force; nothing stopped is started again."""
         if self.refused:
             self.log("slice %s refused: %s; nothing enforced" % (self.cfg.slice, self.refused))
             return []
@@ -1016,6 +1110,16 @@ class Enforcer:
         caps = state.get("caps") or {}
         level = state.get("level", 0)
         deadline = state.get("drain_deadline_ts")
+        if manual and self.stopped is not None:
+            # a drain the owner asked, at any level, even cancelled since:
+            # what was stopped stays stopped (codex #267 r1)
+            self.stopped["manual"] = True
+        if self.stopped is not None:
+            # the level at 1 or below for restart_after_seconds: start again
+            low = self.stopped["low_since"] = None if level >= 2 else (
+                now if self.stopped["low_since"] is None else self.stopped["low_since"])
+            if low is not None and now - low >= self.cfg.offer.restart_after_seconds:
+                self.restart_stopped(now)
         if level < 3:
             self.jobs_stopped = self.guest_stopped = False
         elif not self.jobs_stopped and (level == 4 or (
@@ -1023,6 +1127,7 @@ class Enforcer:
             self.jobs_stopped = self.stop_jobs()
         if level == 4 and not self.guest_stopped:
             self.guest_stopped = self.stop_guest()
+            self.stopped["manual"] = self.stopped["manual"] or manual
         done = self._set(self.cfg.slice, slice_properties(caps, cpu_count))
         enforced = {PROPERTY_CAPS[p] for p in done}
         if caps.get("agent_memory_mb") is not None:
@@ -1108,6 +1213,7 @@ class Guard:
         if self.enforcer is not None and isinstance(previous.get("guard"), dict):
             # a freeze retried after a restart gets only what its episode has left
             self.enforcer.restore_episode(previous["guard"].get("freeze"))
+            self.enforcer.restore_stopped(previous["guard"].get("stopped"))
         # seq keeps growing across restarts: a reader ignores a seq it saw
         self.seq = previous.get("seq") if isinstance(previous.get("seq"), int) else 0
         # so do the level, the freeze bound and the drain deadline
@@ -1142,13 +1248,18 @@ class Guard:
         state = build_state(self.cfg, self.decision, self.seq, now, reading=reading,
                             in_turn=in_turn, observe=self.observe)
         if self.enforcer is not None:
-            enforced = self.enforcer.apply(state, reading.get("cpu_count"), now)
+            enforced = self.enforcer.apply(state, reading.get("cpu_count"), now,
+                                           manual=reading["drain_requested"])
             # the schema's caps.enforced lists caps only: the freeze says it itself
             state["caps"]["enforced"] = [k for k in enforced if k != "freeze"]
             if state.get("freeze") is not None:
                 state["freeze"]["enforced"] = "freeze" in enforced
             if self.enforcer.episode is not None:
                 state["guard"]["freeze"] = dict(self.enforcer.episode)
+            if self.enforcer.stopped is not None:
+                state["guard"]["stopped"] = dict(self.enforcer.stopped)
+            if self.enforcer.restarted is not None:
+                state["guard"]["restart"] = dict(self.enforcer.restarted)
         key = _key(state)
         if key != self.last_key:
             self.seq += 1
@@ -1158,10 +1269,12 @@ class Guard:
         elif self.drain_seq is None or previous.level != 3 \
                 or previous.since_ts != self.decision.since_ts:
             self.drain_seq = self.seq
-        decision = dict(dataclasses.asdict(self.decision), drain_seq=self.drain_seq)
-        state["guard"]["decision"] = decision
-        # a decision that changed (a calm timer started or reset) is written
-        # at once: a restart must not take back a stale one
+        state["guard"]["decision"] = dict(dataclasses.asdict(self.decision),
+                                          drain_seq=self.drain_seq)
+        # a decision that changed (a calm timer started or reset), or the
+        # units to start again, are written at once: a restart must not take
+        # back a stale one
+        decision = {k: state["guard"].get(k) for k in ("decision", "stopped", "restart")}
         due = now - self.written_ts >= STATE_TTL_S / 3
         if key != self.last_key or due or decision != self.written_decision:
             write_state(self.cfg.state_path, state)
