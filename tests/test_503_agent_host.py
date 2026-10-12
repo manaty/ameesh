@@ -23,6 +23,7 @@ command = sys.argv[-1]
 with (state / 'ssh.log').open('a') as f:
     f.write(command + '\n')
 command = command.replace('/home/ameesh/.local/share/ameesh/venv/bin/ameesh', os.environ['FAKE_AMEESH'])
+command = command.replace('$HOME/.config/ameesh/env', str(state / 'runner.env'))
 env = dict(os.environ, FAKE_REMOTE='1')
 sys.exit(subprocess.call(['bash', '-c', command], env=env))
 '''
@@ -39,6 +40,8 @@ assert os.environ.get('FAKE_REMOTE') == '1', 'registry must be read on the host'
 assert os.environ.get('HOME') == '/home/ameesh'
 assert os.environ.get('XDG_RUNTIME_DIR') == '/run/user/1001'
 assert os.environ.get('DBUS_SESSION_BUS_ADDRESS') == 'unix:path=/run/user/1001/bus'
+assert os.environ.get('AMEESH_DSN') == 'test-runner-dsn'
+assert os.environ.get('AMEESH_SCHEMA') == 'test_runner_schema'
 scenario = (state / 'scenario').read_text()
 if sys.argv[1:] == ['list', '--json']:
     if scenario == 'list-error': sys.exit(1)
@@ -86,6 +89,7 @@ class AgentHostTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.state = self.root / 'state'; self.state.mkdir()
+        (self.state / 'runner.env').write_text('AMEESH_DSN=test-runner-dsn\nAMEESH_SCHEMA=test_runner_schema\n')
         self.bin = self.root / 'bin'; self.bin.mkdir()
         (self.bin / 'python3').symlink_to(sys.executable)
         self.home = self.root / 'home'; self.home.mkdir()
@@ -200,6 +204,22 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotEqual(p.returncode, 0)
         self.assertEqual(self.units(), '')
         self.assertIn('invalide', p.stderr)
+
+    def test_all_valid_registry_names_restart(self):
+        names = ['dev_1', 'Dev1', 'dev.1', 'd' * 64]
+        p = self.run_vm(agents=[dict(name=n, host='host-agents', mode='execute', status='idle')
+                                for n in names])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        for name in names:
+            self.assertIn('restart ameesh-runner-agent@' + name + '.service', self.units())
+
+    def test_invalid_name_is_named_and_skipped_without_blocking_valid_agents(self):
+        bad = dict(name='bad;touch injected', host='host-agents', mode='execute', status='idle')
+        p = self.run_vm(agents=self.agents + [bad])
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("agent 'bad;touch injected' : nom invalide", p.stderr)
+        self.assertIn('restart ameesh-runner-agent@dev9.service', self.units())
+        self.assertNotIn('injected', self.units())
 
     def test_mode_refuses_unsupported_action(self):
         p = self.run_vm('installer')
