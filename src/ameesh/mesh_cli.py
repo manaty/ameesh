@@ -958,6 +958,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "resolve":   # prepared conflict resolutions (L160d)
             from . import resolutions
             return resolutions.run(cfg, db, args)
+        if args.work_command == "dependencies":
+            from . import work_dependencies
+            return work_dependencies.run(db, args)
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
@@ -1088,6 +1091,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 notes = []
                 if row.get("stale"):
                     notes.append("STALE for %s" % plan.describe_age(row["stale"]["idle_s"]))
+                if row.get("planned_wait"):
+                    from .work_dependencies import wait_label
+                    notes.append(wait_label(row["planned_wait"]))
                 if row.get("waiting_for"):
                     notes.append("waiting: %s" % row["waiting_for"]["label"])
                 if row.get("delegation"):
@@ -1191,6 +1197,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("resolut. : unavailable (%s)" % item["resolutions_error"])
             if item["deep_analysis"]:
                 print("analysis : %s" % _deep_analysis_line(item["deep_analysis"]))
+            if item.get("planned_wait"):
+                from .work_dependencies import wait_label
+                print("planned  : %s" % wait_label(item["planned_wait"]))
+            for edge in item.get("dependencies", []):
+                print("depends  : #%d (%s, %s)" % (
+                    edge["blocker_id"], edge["blocker_state"],
+                    "blocking" if edge["blocking"] else "satisfied"))
             if item.get("waiting_for"):
                 print("waiting  : %s" % item["waiting_for"]["label"])
             if item.get("delegation"):
@@ -1945,6 +1958,8 @@ def build_parser() -> argparse.ArgumentParser:
     pw_show.add_argument("id", type=int)
     pw_show.add_argument("--json", action="store_true")
     pw_show.set_defaults(func=cmd_work)
+    from . import work_dependencies
+    work_dependencies.add_parser(work_sub, cmd_work)
     pw_mig = work_sub.add_parser(
         "migration", help="reserve the next free migration number for the work item (L122), "
                           "before writing the file; idempotent, visible in work show")

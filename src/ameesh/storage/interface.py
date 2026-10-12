@@ -153,6 +153,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
 from __future__ import annotations
 
 from .conversations import Conversations
+from .work_dependencies import WorkDependencies
 
 import abc
 from typing import Any, Callable, Protocol, Sequence
@@ -2539,6 +2540,7 @@ class Storage(abc.ABC):
     approvals: Approvals
     nonces: Nonces
     work: WorkItems
+    work_dependencies: WorkDependencies
     packages: WorkPackages
     actions: Actions
     action_source: ActionSource

@@ -28,6 +28,7 @@ test_l165_prise_lots  # stockage : lots à confier, équipe de la fiche, EXISTS 
 test_l165b_agents_libres  # stockage : `active_lots` du listing des agents, comptage et date prévue (L165b)
 test_l317_project_modules  # storage: transactional module guards, structured evidence and project isolation (L317a)
 test_l368_planned_waits  # storage: unbounded activity, item plans and commitment dependencies (L368)
+test_l385_work_dependencies  # storage: serialized dependency graph, rollback, audit and blocker states (L385)
 test_l52_persona_sessions  # storage: session history SQL, resume and lease-fenced rotation (L52)
 test_l56_role_executor  # driver: the creator role is set for several statements, which needs one session (psql: transaction) (L56)
 test_l61_allers_retours  # allers-retours comptés par le pilote lui-même (AMEESH_DB_TRACE)

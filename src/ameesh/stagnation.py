@@ -299,7 +299,10 @@ def describe(db, rows: list[dict], *, now: float | None = None,
     states, externals = agent_availability(db)
     events, milestones, actions, messages = _grouped(st, ids)
     from . import planned_waits
-    holds = planned_waits.read(db, rows, now=now, packages=packages, open_items=open_items)
+    from . import work_dependencies
+    dependencies = work_dependencies.grouped(db, ids)
+    holds = planned_waits.read(db, rows, now=now, packages=packages, open_items=open_items,
+                              dependencies=[e for edges in dependencies.values() for e in edges])
     out: dict[int, dict] = {}
     for row in rows:
         rid = int(row["id"])
@@ -315,6 +318,7 @@ def describe(db, rows: list[dict], *, now: float | None = None,
         out[rid] = {"waiting": detail, "waiting_for": legacy(detail),
                     "last_activity_ts": round(last, 3) if last is not None else None,
                     "planned_wait": holds.get(rid),
+                    "dependencies": dependencies.get(rid, []),
                     "stale": None if rid in holds else
                              stale(row.get("state") or "", last, now, threshold)}
     return out
