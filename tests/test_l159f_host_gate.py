@@ -192,12 +192,17 @@ class FakeGate:
         self.st = state
         self.acks: list = []
         self.path, self.fallback = "/fake", "stopped"
+        self.fail_acks = 0
 
     def state(self):
         return self.st
 
     def acknowledge(self, ack):
+        if self.fail_acks:
+            self.fail_acks -= 1
+            return False
         self.acks.append(ack)
+        return True
 
     def close(self):
         pass
@@ -238,6 +243,17 @@ class ControllerTest(unittest.TestCase):
         ack = self.ctl.tick()
         self.assertTrue(ack.drained)
         self.assertEqual(self.gate.acks[-1].seq, 2)
+
+    def test_a_failed_ack_is_written_again(self):
+        # a transient write failure: the same ack (here `drained`) is retried at
+        # the next tick, not taken for published
+        self.state("stopped", 3, reason="host_memory")
+        self.gate.fail_acks = 1
+        ack = self.ctl.tick()
+        self.assertTrue(ack.drained)
+        self.assertEqual([a.seq for a in self.gate.acks if a.drained], [])
+        self.ctl.tick()
+        self.assertEqual([(a.seq, a.drained) for a in self.gate.acks][-1], (3, True))
 
     def test_stopped_yields_at_once_and_a_deadline_never_moves_back(self):
         worker = FakeWorker("a", in_turn=True)

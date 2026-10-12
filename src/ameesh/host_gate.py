@@ -341,13 +341,16 @@ class FileGate:
                 return current
             self._sleep(min(left, self.poll))
 
-    def acknowledge(self, ack: GateAck) -> None:
-        """Writes the ack; never raises (the next one replaces a failed one)."""
+    def acknowledge(self, ack: GateAck) -> bool:
+        """Writes the ack; never raises. False when it was not written: the
+        controller tries again at its next tick."""
         body = dataclasses.replace(ack, ts=ack.ts or self._clock()).to_json()
         try:
             _atomic_write(self.ack_path, body)
         except OSError as exc:
             self._log("host gate: ack not written (%s)" % exc)
+            return False
+        return True
 
     def close(self) -> None:
         if self._closed.is_set():
@@ -617,9 +620,10 @@ class GateController:
         ack = GateAck(seq=state.seq, state=state.state, in_turn=tuple(in_turn),
                       held=tuple(held), drained=drained, ts=now)
         key = (ack.seq, ack.state, ack.in_turn, ack.held, ack.drained)
-        if key != self._ack_key:
+        # published only once written: a failed write (full disk, folder
+        # briefly missing) is retried at the next tick, `drained` included
+        if key != self._ack_key and self.gate.acknowledge(ack):
             self._ack_key = key
-            self.gate.acknowledge(ack)
             self.acks = (self.acks + [ack])[-20:]
             if drained:
                 self._log("host gate: drained (seq %d), no lease held, no background work"
