@@ -858,6 +858,38 @@ class ShellTest(OffloadBase):
         me = {"shell_pid": os.getpid(), "shell_start": offload_shell._proc_identity(os.getpid())}
         self.assertTrue(offload_shell._shell_alive(me))
 
+    def test_cancel_signals_through_a_pidfd(self):
+        # #312: the identity check and the signal were two steps; a PID
+        # reused in between got the SIGTERM. The pidfd opened before the
+        # check holds the original shell: here it has died, and the process
+        # now at its PID (identity matching) is never signalled
+        other = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        gone = subprocess.Popen(["sleep", "60"])
+        pidfd = os.pidfd_open(gone.pid)
+        gone.kill()
+        gone.wait()
+        name = "20200101-000000-abcdef"
+        job_dir = os.path.join(self.vm, "jobs", name)
+        os.makedirs(job_dir)
+        with open(os.path.join(job_dir, "meta.json"), "w") as fh:
+            json.dump({"job": name, "state": "running", "shell_pid": other.pid,
+                       "shell_start": offload_shell._proc_identity(other.pid)}, fh)
+        cfg = offload_shell.load_config(self.config_path)
+        with mock.patch.object(offload_shell.os, "pidfd_open", return_value=pidfd), \
+                mock.patch.object(sys, "stdout", new=mock.Mock()):
+            self.assertEqual(offload_shell.cmd_cancel(cfg, [name]), 0)
+        time.sleep(0.2)
+        self.assertIsNone(other.poll())  # not signalled
+        self.assertTrue(os.path.exists(os.path.join(job_dir, "cancel")))
+        # without pidfd support, the checked PID is still signalled
+        with mock.patch.object(offload_shell.os, "pidfd_open",
+                               side_effect=OSError(38, "ENOSYS")), \
+                mock.patch.object(sys, "stdout", new=mock.Mock()):
+            offload_shell.cmd_cancel(cfg, [name])
+        self.assertEqual(other.wait(timeout=5), -signal.SIGTERM)
+
     def test_emit_survives_a_closed_session(self):
         class Gone:
             def write(self, _text):
