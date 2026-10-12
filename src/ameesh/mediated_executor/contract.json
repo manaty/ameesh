@@ -1967,6 +1967,42 @@
      },
      "required": false,
      "default": null
+    },
+    {
+     "name": "void_reason",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
+    },
+    {
+     "name": "price_fallback",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
+    },
+    {
+     "name": "cache_write_tokens",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
     }
    ],
    "result": {
@@ -3631,7 +3667,7 @@
   }
  ],
  "refused": {
-  "interface_total": 298,
+  "interface_total": 306,
   "reasons": {
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
@@ -3800,7 +3836,10 @@
     "revoke"
    ],
    "hosts": [
+    "harness_versions",
     "history",
+    "lend_basis",
+    "record_harness_version",
     "usage"
    ],
    "housekeeping": [
@@ -3902,15 +3941,20 @@
    "turn_costs": [
     "correct",
     "ledger",
-    "spent_between"
+    "spent_between",
+    "unpriced"
    ],
    "turn_resources": [
     "begin_grace",
     "churn",
     "get",
     "mark_orphan",
+    "mark_orphan_many",
     "open_by_agent",
     "orphans",
+    "orphans_started_before",
+    "settle",
+    "settle_many",
     "stale_running"
    ],
    "visibility": [

@@ -1,27 +1,27 @@
 ---
 type: Decision
-title: "Le canon est en OKF dans git, fédéré selon OKF Federation"
-description: "Équipes, responsabilités, structure des projets sont décrites en OKF ; Nexlink et les outils n'en sont que des vues ou des interfaces de proposition."
+title: "The canon is in OKF in git, federated according to OKF Federation"
+description: "Teams, responsibilities, project structure are described in OKF; Nexlink and the tools are only views of it or proposal interfaces."
 status: stable
 tags: [okf, canon, gouvernance]
 decided_by: human:smichea
 decision_date: 2026-10-03
-attestation: "rapportée par mesh-design depuis sa conversation avec le propriétaire ; non signée (R13 pas encore en service)"
+attestation: "reported by mesh-design from its conversation with the owner; unsigned (R13 not yet in service)"
 generated: { by: "mesh-design/claude-opus-5-5", at: "2026-10-04T00:00:00+02:00" }
 ---
 
-# Contexte
+# Context
 
-Le propriétaire maintient déjà la spécification OKF Federation (manaty/okf-federation) et des fédérations qui l'appliquent.
+The owner already maintains the OKF Federation specification (manaty/okf-federation) and federations that apply it.
 
-# Décision
+# Decision
 
-- Les **équipes avec leurs responsabilités**, la **structure des projets** (modules, lots), les procédures et les décisions sont décrites dans des **dépôts git au format OKF v0.2**, fédérés selon **OKF Federation**.
-- Les **pages Nexlink sont une vue rendue du canon OKF** ; une modification faite dans Nexlink devient une **proposition** (PR revue selon la politique de la fédération), jamais une seconde source éditable. Même règle pour tout outil open source (Plane, Forgejo issues…).
-- Accord de principe pour une racine de fédération **manaty/home** (création non encore planifiée).
+- The **teams with their responsibilities**, the **project structure** (modules, lots), the procedures and the decisions are described in **git repositories in OKF v0.2 format**, federated according to **OKF Federation**.
+- **Nexlink pages are a rendered view of the OKF canon**; a change made in Nexlink becomes a **proposal** (a PR reviewed according to the federation's policy), never a second editable source. Same rule for any open source tool (Plane, Forgejo issues…).
+- Agreement in principle for a federation root **manaty/home** (creation not yet scheduled).
 
-# Conséquences
+# Consequences
 
-- ameesh lit rôles, portées canoniques et `review_policies` dans `federation.yaml` et les fait respecter à l'exécution ; il n'écrit dans le canon que par proposition.
-- L'état d'exécution (en cours, bloqué, attente d'un humain) reste dans ameesh et se projette sur une vue (issue par lot, page Nexlink).
-- Il faut un **profil ameesh** d'OKF Federation (types Agent, Team, WorkPackage, Pipeline ; liaison identité → clé).
+- ameesh reads roles, canonical scopes and `review_policies` in `federation.yaml` and enforces them at execution time; it writes to the canon only by proposal.
+- Execution state (in progress, blocked, waiting for a human) stays in ameesh and is projected onto a view (issue per lot, Nexlink page).
+- An **ameesh profile** of OKF Federation is needed (types Agent, Team, WorkPackage, Pipeline; identity → key binding).

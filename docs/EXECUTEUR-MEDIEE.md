@@ -15,7 +15,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 62 opérations et la liste des 159 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 62 opérations et la liste des 244 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -63,8 +63,8 @@ Comptes : 62 opérations, dont 24 lectures et 38 écritures. 52 passent par
 lignes de `op` sont marquées `session: true` (contrat 1.1) : elles sont
 servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (298
-opérations depuis main 1.9.0) est classée, admise ou refusée. Toute opération ajoutée à
+signature et les mêmes types. Il vérifie aussi que l'interface entière (306
+opérations après intégration de main le 12/10) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
 Les 22 opérations ajoutées à l'interface par la 1.6.x sont refusées à
@@ -114,6 +114,14 @@ L160). On a mediated executor this means:
   stopped) and the copies against the reduced directory (`agents.overview`)
   instead of `agents.get`; the refusal texts then lack the stop date,
   reason and responsible.
+
+The eight additional host-maintenance operations from main on 2026-10-12
+remain refused: harness version records and reads, lending history,
+unpriced-cost reports, and bulk orphan review/settlement. The device skips
+the harness version poll and the boot orphan review. `turn_costs.insert`
+accepts main's optional `void_reason`, `price_fallback` and
+`cache_write_tokens` metadata, defaulting to null for older callers; its
+forced `source=device` and lease provenance remain unchanged.
 
 ## Requête et réponse
 

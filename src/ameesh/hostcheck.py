@@ -26,7 +26,7 @@ import re
 import shutil
 import subprocess
 
-from . import adapters, harnesses, platform, registry
+from . import adapters, harness_versions, harnesses, platform, registry
 
 #: modèle d'unité d'exécuteur par agent (docs/BASCULE.md, deploy/systemd)
 RUNNER_TEMPLATE = "ameesh-runner-agent@%s.service"
@@ -291,6 +291,10 @@ def cmd_harness(cfg, db=None) -> int:
         qui = " [%s]" % ", ".join(item["agents"]) if item["agents"] else ""
         if item["ok"]:
             print("harnais    : %s%s → %s" % (item["harness"], qui, item["detail"]))
+            # L120: the version, read now (doctor records nothing)
+            version = harness_versions.probe(item["harness"])
+            print("             version %s" % (version["version"] or "unknown (%s)"
+                                               % (version["error"] or "?")))
             if item.get("source") in ("PATH du gestionnaire systemd", "emplacement connu"):
                 print("             conseil : trouvé hors du PATH — posez PATH dans l'unité "
                       "(deploy/systemd) ou `harness_bins` dans la configuration")

@@ -151,6 +151,8 @@ policy:
     max_swap_used: 8GiB
     max_load: 24
     min_disk_free: 2GiB
+    min_btrfs_unallocated: 10GiB         # #246 : btrfs seulement
+    min_btrfs_metadata_headroom: 1GiB
   work_dirs: {deepseek7: ~/wt/deepseek7-lot12}   # dossier par agent (L35), prioritaire
   work_roots: {acme-web: ~/acme/acme-web, nexlink: "~/dev/nexlink-{agent}"}   # par projet (L31)
   work_root: ~/src               # défaut : work_root/<projet>

@@ -196,6 +196,19 @@ class SearchTest(unittest.TestCase):
     def test_ecritures_sans_espaces(self):
         self.assertIn("什么", search.tokens("ameesh是什么"))
 
+    def test_glossaire_un_seul_terme(self):
+        # « reçu » et sa traduction « receipt » comptent une fois : un passage
+        # bilingue ne double pas son score face à la page anglaise du sujet
+        idx = search.Index([
+            {"id": "en", "title": "Receipts", "section": "", "url": "https://ameesh.org/docs/receipts/",
+             "text": "A receipt is signed by a passkey."},
+            {"id": "mix", "title": "Spécification", "section": "", "url": "https://example.org/spec",
+             "text": "Un reçu (receipt) est signé par une passkey."},
+            {"id": "autre", "title": "Gate", "section": "", "url": "https://ameesh.org/docs/gate/",
+             "text": "The gate checks actions."}])
+        self.assertEqual(search.term_groups("reçu", expand=True), [("recu", "receip")])
+        self.assertEqual(idx.search("reçu passkey")[0].passage.id, "en")
+
     def test_budget_de_contexte(self):
         passages = [{"id": str(i), "title": "T", "section": "S", "url": f"https://ameesh.org/docs/p{i}/",
                      "text": "gate receipt " * 300} for i in range(20)]

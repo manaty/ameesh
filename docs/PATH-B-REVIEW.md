@@ -27,6 +27,13 @@ the end of its lease. The container entry point and image signing helper are
 included. Building, signing and deploying a production image are separate
 operations.
 
+An interrupted model stream without final usage is charged at its requested
+output-token cap, retaining any higher observed count. Git publication is
+revalidated after preparation under executor and agent row locks, held until
+the push and receipt are saved. Per-lease upload receipts survive response
+loss and route restarts; retained commit mappings let subsequent uploads
+reuse a published prefix from an unacknowledged base without duplicating it.
+
 The merge retains main's ordinary database behavior, including assignment
 from mail, undeliverable-mail checks, harness-specific hooks, session
 validation, housekeeping, resource pressure, work estimates and CI tracking.
@@ -34,6 +41,9 @@ For mediated sessions, undeliverable-mail checks use the reduced directory.
 `--lot` remains a thread label; `--new-lot` is rejected before mail is sent
 because contract 1.1 does not permit creating or assigning work. Other new
 operations from main remain explicitly refused by the remote contract.
+The 2026-10-12 merge adds main's three optional cost metadata parameters to
+the mediated insert (null defaults) while keeping `source=device` forced.
+Host version polling and boot orphan review stay on classic hosts/server.
 
 ## Migrations
 

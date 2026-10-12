@@ -184,5 +184,33 @@ class GateAckTest(unittest.TestCase):
         self.assertEqual(P.GateState("available", 1).max_concurrent, 1)
 
 
+class MainIntegrationTest(unittest.TestCase):
+    def test_host_maintenance_stays_off_the_device(self):
+        from ameesh.runner import Runner
+        runner = types.SimpleNamespace(mediated=True, once=False)
+        with mock.patch("ameesh.db.connect", side_effect=AssertionError("host maintenance")):
+            self.assertIsNone(Runner.start_version_poll(runner))
+            self.assertIsNone(Runner.harness_versions_once(runner))
+            self.assertEqual(Runner.report_boot_orphans(runner), [])
+        self.assertIsNone(runner.boot_review_at)
+
+    def test_cost_insert_keeps_relay_and_main_metadata(self):
+        from ameesh.storage.postgres.costs import TurnCosts
+        db = mock.Mock()
+        TurnCosts(db).insert(
+            agent="a", harness="dsh", turn="t", model="m", session=None, usd=0.01,
+            input_tokens=1, cached_input_tokens=0, output_tokens=2, cum_usd=None,
+            cum_input_tokens=None, cum_cached_input_tokens=None, cum_output_tokens=None,
+            source="relay", executor="e", lease_owner="o", lease_epoch=3,
+            void_reason="no price", price_fallback="family", cache_write_tokens=4)
+        sql, params = db.execute.call_args.args
+        columns = sql.split("(", 1)[1].split(")", 1)[0].split(", ")
+        written = dict(zip(columns, params))
+        self.assertEqual({k: written[k] for k in ("source", "executor", "lease_owner", "lease_epoch",
+                                                "void_reason", "price_fallback", "cache_write_tokens")},
+                         {"source": "relay", "executor": "e", "lease_owner": "o", "lease_epoch": 3,
+                          "void_reason": "no price", "price_fallback": "family", "cache_write_tokens": 4})
+
+
 if __name__ == "__main__":
     unittest.main()

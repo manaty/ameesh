@@ -349,6 +349,9 @@ class Config:
     host_mediated: bool = False
     #: délai de retrait quand l'état `draining` ne donne pas d'échéance (s)
     host_gate_drain: float = 90.0
+    #: L131: heavy suites run at once on this host (`ameesh heavy`); 0 = a
+    #: quarter of the CPUs, at least 1
+    max_heavy_suites: int = 0
     #: issues GitHub des lots (L126) : la clé `github` du fichier de
     #: configuration de l'HÔTE, telle quelle (`projects` : projet → dépôt,
     #: `host` : hôte désigné pour la projection automatique, `interval`,

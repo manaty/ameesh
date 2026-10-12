@@ -1,93 +1,93 @@
-# Bascule vers ameesh v1 — pas à pas, réversible
+# Cutover to ameesh v1 — step by step, reversible
 
-Ce plan fait passer le chantier des scripts v0 (`agent-mail.v0.py`,
-`nexlink-agent.v0.sh`, boîtes fichiers) à ameesh v1, **sans jamais casser un
-agent en cours**. Il remplace l'ancien plan du banc et part du brouillon
-[`design/bascule-v1.md`](design/bascule-v1.md). Changements de fond :
+This plan moves the project from the v0 scripts (`agent-mail.v0.py`,
+`nexlink-agent.v0.sh`, file mailboxes) to ameesh v1, **without ever breaking a
+running agent**. It replaces the old bench plan and starts from the draft
+[`design/bascule-v1.md`](design/bascule-v1.md). Substantive changes:
 
-* **plus de cérémonie de clé Ed25519 sur le PC** : l'autorité d'un humain se
-  prouve par un reçu signé hors de portée des agents, sur son téléphone, par
+* **no more Ed25519 key ceremony on the PC**: a human's authority is
+  proven by a signed receipt out of the agents' reach, on their phone, through
   ameesh-approve ([0012](design/decisions/0012-autorite-par-ameesh-approve.md)).
-  La clé Ed25519 d'agent reste pour la provenance (R13) et les tests, jamais
-  comme autorité humaine ;
-* un **canon d'amorçage** décrit membres, hôte, agents et placements
-  (spec §4) ; `ameesh canon sync` est passé **sur chaque hôte avant toute
-  réclamation** : sans état « ok » du canon, aucun agent du canon n'est
-  réclamable ;
-* les **orchestrateurs deviennent des agents à tours**, avec `ameesh attach`
-  pour leur parler en direct
+  The agent Ed25519 key remains for provenance (R13) and tests, never
+  as human authority;
+* a **bootstrap canon** describes members, host, agents and placements
+  (spec §4); `ameesh canon sync` is run **on each host before any
+  claim**: without an "ok" canon status, no canon agent is
+  claimable;
+* **orchestrators become turn-based agents**, with `ameesh attach`
+  to talk to them directly
   ([0014](design/decisions/0014-orchestrateurs-a-tours-et-placement.md)).
 
-Règles de la bascule :
+Cutover rules:
 
-* **un changement à la fois**, et **chaque étape a son retour arrière**,
-  symétrique, écrit dans cette page ;
-* **la v0 reste intacte** jusqu'à l'étape 8 : `~/.local/bin/agent-mail`,
-  `nexlink-agent`, `~/.local/state/agent-mail` et
-  `~/.local/state/nexlink-agents` ne sont ni modifiés ni supprimés ;
-* **jamais deux boucles sur la même session** : la boucle v0 ne connaît pas le
-  bail v1. Une boucle v0 est arrêtée, et **tout son groupe de processus est
-  mort**, avant qu'un exécuteur v1 ne démarre pour cet agent (et inversement
-  au retour arrière). Le fonctionnement en double est réservé aux agents
-  factices ;
-* **l'autorité se prouve** : aucune décision n'est reconnue sur son texte ;
-* en cas de doute : `ameesh export-v0 --agents <nom>` remet le courrier dans la
-  boîte fichier et la v0 reprend la main.
+* **one change at a time**, and **each step has its rollback**,
+  symmetrical, written on this page;
+* **v0 stays intact** until step 8: `~/.local/bin/agent-mail`,
+  `nexlink-agent`, `~/.local/state/agent-mail` and
+  `~/.local/state/nexlink-agents` are neither modified nor deleted;
+* **never two loops on the same session**: the v0 loop does not know the
+  v1 lease. A v0 loop is stopped, and **its whole process group is
+  dead**, before a v1 runner starts for that agent (and conversely
+  on rollback). Running both in parallel is reserved for dummy
+  agents;
+* **authority is proven**: no decision is recognized from its text;
+* when in doubt: `ameesh export-v0 --agents <nom>` puts the mail back into the
+  file mailbox and v0 takes over again.
 
-Actes réservés au propriétaire, marqués **[P]** : création de dépôts et
-d'utilisateurs système, enrôlement de sa passkey, toute dépense, toute
-exposition réseau.
+Acts reserved to the owner, marked **[P]**: creating repositories and
+system users, enrolling their passkey, any spending, any
+network exposure.
 
 ---
 
-## Prérequis — v1 terminée et essai de bout en bout vert
+## Prerequisites — v1 finished and end-to-end test green
 
-1. Tous les lots v1 fusionnés avec un OK de relecture (spec §13), dont L3
-   (placement dans le prédicat de réclamation).
-2. Sur le banc, l'essai de bout en bout et la démonstration passent, sur les
-   deux pilotes :
+1. All v1 lots merged with a review OK (spec §13), including L3
+   (placement in the claim predicate).
+2. On the bench, the end-to-end test and the demo pass, on both
+   pilots:
 
    ```bash
-   scripts/test.sh tests.test_bout_en_bout   # canon → exécuteur → fil → porte → reçu → réconciliation
-   scripts/demo-v1.sh                        # le même scénario, commenté, base temporaire effacée
+   scripts/test.sh tests.test_bout_en_bout   # canon → runner → thread → gate → receipt → reconciliation
+   scripts/demo-v1.sh                        # the same scenario, commented, temporary database erased
    ```
 
-3. Les écarts d'intégration relevés par l'essai (lot L9) sont fermés (lot
-   L9b) et l'essai passe **sans contournement** : `canon sync` remplit le
-   registre des authentificateurs, `ameesh action request` / `fetch-receipt`
-   parlent à ameesh-approve, les transitions d'actions sont dans le fil, le
-   fil d'un agent du canon suit son équipe. `tests/banc_v1.py` ne joue plus
-   que le téléphone (passkey LOGICIELLE de test — **jamais** en production)
-   et la PR du canon.
+3. The integration gaps found by the test (lot L9) are closed (lot
+   L9b) and the test passes **without workarounds**: `canon sync` fills the
+   authenticator registry, `ameesh action request` / `fetch-receipt`
+   talk to ameesh-approve, action transitions are in the thread, the
+   thread of a canon agent follows its team. `tests/banc_v1.py` now only
+   plays the phone (SOFTWARE test passkey — **never** in production)
+   and the canon PR.
 
-**Retour arrière :** rien n'a changé.
+**Rollback:** nothing has changed.
 
 ---
 
-## Étape 0 — sauvegardes et gel (15 min, aucun changement)
+## Step 0 — backups and freeze (15 min, no change)
 
 ```bash
 mkdir -p ~/backups
 tar czf ~/backups/v0-$(date +%F-%H%M).tgz -C ~ \
     .local/state/agent-mail .config/agent-mail .local/state/nexlink-agents
 sha256sum ~/.local/bin/agent-mail ~/.local/bin/nexlink-agent | tee ~/backups/v0-shas.txt
-nexlink-agent list > ~/backups/v0-agents.txt     # agent, outil, état, session
+nexlink-agent list > ~/backups/v0-agents.txt     # agent, tool, state, session
 ```
 
-Noter pour chaque agent son outil et sa session
-(`~/.local/state/nexlink-agents/<nom>/{tool,session}`) : c'est la carte de la
-bascule. Aucun agent ne doit être au milieu d'un tour long.
+Note for each agent its tool and its session
+(`~/.local/state/nexlink-agents/<nom>/{tool,session}`): this is the cutover
+map. No agent should be in the middle of a long turn.
 
-**Retour arrière :** rien n'a changé ; la sauvegarde sert à toutes les étapes.
+**Rollback:** nothing has changed; the backup serves all steps.
 
 ---
 
-## Étape 1 — base et paquet
+## Step 1 — database and package
 
-**Postgres durable** (profil « local »,
-[0016](design/decisions/0016-stockage.md)) : conteneur avec redémarrage
-automatique et `pg_dump` quotidien copié hors du PC, ou paquet système. Le
-conteneur du banc n'est pas une base de production.
+**Durable Postgres** ("local" profile,
+[0016](design/decisions/0016-stockage.md)): container with automatic
+restart and daily `pg_dump` copied off the PC, or system package. The
+bench container is not a production database.
 
 ```bash
 python3 -m venv ~/.local/share/ameesh/venv
@@ -95,168 +95,168 @@ python3 -m venv ~/.local/share/ameesh/venv
 for c in ameesh agent-runner ameesh-approve; do
   ln -s ~/.local/share/ameesh/venv/bin/$c ~/.local/bin/$c
 done
-# ~/.local/bin/agent-mail RESTE la v0 jusqu'à l'étape 8
+# ~/.local/bin/agent-mail STAYS v0 until step 8
 
 install -m 700 -d ~/.config/ameesh
 cat > ~/.config/ameesh/config.json <<'JSON'
 { "dsn": "postgresql://ameesh@127.0.0.1:5432/ameesh", "host": "pc-smichea",
   "project": "ameesh", "humans": ["smichea"] }
 JSON
-chmod 600 ~/.config/ameesh/config.json      # le mot de passe : ~/.pgpass (0600)
+chmod 600 ~/.config/ameesh/config.json      # the password: ~/.pgpass (0600)
 ameesh migrate
 ameesh doctor --notify-test
-ameesh import-v0 --dry-run                  # ce qui serait importé, sans rien toucher
+ameesh import-v0 --dry-run                  # what would be imported, without touching anything
 ```
 
-Exercice de restauration obligatoire : `pg_dump`, restauration dans une base
-jetable, `ameesh doctor` dessus, suppression.
+Mandatory restore drill: `pg_dump`, restore into a throwaway
+database, `ameesh doctor` on it, deletion.
 
-**Retour arrière :** supprimer les liens de `~/.local/bin` (sauf
-`agent-mail`, resté v0) ; arrêter la base. Rien ne dépend encore d'elle.
+**Rollback:** remove the links from `~/.local/bin` (except
+`agent-mail`, still v0); stop the database. Nothing depends on it yet.
 
 ---
 
-## Étape 2 — canon d'amorçage **[P] pour la création du dépôt**
+## Step 2 — bootstrap canon **[P] for creating the repository**
 
-Dépôt de canon du projet (`manaty/home` selon
-[0005](design/decisions/0005-canon-okf.md), ou un dossier du dépôt du
-projet), sur le modèle de [`examples/canon/`](../examples/canon/) :
+Project canon repository (`manaty/home` per
+[0005](design/decisions/0005-canon-okf.md), or a folder of the project
+repository), modeled on [`examples/canon/`](../examples/canon/):
 
-* `federation.yaml` (rôles : responsable du projet = `human:smichea`) ;
-* un `Member` par humain (`membres/smichea.md`, `authenticators: []` pour
-  l'instant) ;
-* un `Host` `pc-smichea` (responsable `human:smichea` ; politique : harnais
-  claude, codex, deepseek ; modes `subscription` pour claude/codex, `api-key`
-  pour deepseek ; **dossiers de travail** : `work_roots` par équipe, avec le
-  gabarit `{agent}` pour un worktree par agent, et `work_dirs` pour les
-  exceptions — voir [EXPLOITATION](EXPLOITATION.md#dossier-de-travail-des-agents-l31-l35)) ;
-* un `Agent` (avec `responsible`, sans capacité `approve`) et un `Placement`
-  (admission : `hosts: [pc-smichea]`, **sans** `cwd`) par agent : claude1–2, codex1–3,
-  deepseek1–7 et les deux orchestrateurs. La liste et les outils viennent de
-  la carte de l'étape 0. Un générateur `ameesh canon init --from-v0` n'existe
-  pas encore : les fiches sont écrites à la main (ou par un agent, en
-  brouillon) et le propriétaire relit la PR.
+* `federation.yaml` (roles: project lead = `human:smichea`);
+* one `Member` per human (`membres/smichea.md`, `authenticators: []` for
+  now);
+* one `Host` `pc-smichea` (lead `human:smichea`; policy: harnesses
+  claude, codex, deepseek; `subscription` modes for claude/codex, `api-key`
+  for deepseek; **working directories**: `work_roots` per team, with the
+  `{agent}` template for one worktree per agent, and `work_dirs` for
+  exceptions — see [EXPLOITATION](EXPLOITATION.md#dossier-de-travail-des-agents-l31-l35));
+* one `Agent` (with `responsible`, without the `approve` capability) and one `Placement`
+  (admission: `hosts: [pc-smichea]`, **without** `cwd`) per agent: claude1–2, codex1–3,
+  deepseek1–7 and the two orchestrators. The list and the tools come from
+  the step 0 map. A generator `ameesh canon init --from-v0` does not exist
+  yet: the cards are written by hand (or by an agent, as a
+  draft) and the owner reviews the PR.
 
-Puis, sur l'hôte :
+Then, on the host:
 
 ```bash
-git clone <dépôt du canon> ~/canon && echo "AMEESH_CANON=~/canon"   # ou "canon" dans config.json
-ameesh canon check --fetch        # 0 erreur ; lu au commit fusionné d'origin/main
-ameesh canon sync --fetch --bootstrap-ref main   # 1re fois seulement (voir ci-dessous)
-ameesh list                       # agents du canon : hôte, responsable, aucun bail
+git clone <dépôt du canon> ~/canon && echo "AMEESH_CANON=~/canon"   # or "canon" in config.json
+ameesh canon check --fetch        # 0 errors; read at the merged commit of origin/main
+ameesh canon sync --fetch --bootstrap-ref main   # first time only (see below)
+ameesh list                       # canon agents: host, lead, no lease
 
-# tous les agents tournent encore en v0 : les tenir hors de portée de tout
-# exécuteur v1 (relance d'inactivité, courrier v1) jusqu'à leur propre bascule
+# all agents still run on v0: keep them out of reach of any
+# v1 runner (idle restart, v1 mail) until their own cutover
 for a in claude1 claude2 codex1 codex2 codex3 deepseek1 deepseek2 deepseek3 \
          deepseek4 deepseek5 deepseek6 deepseek7 <orchestrateurs>; do
   agent-runner stop "$a"
 done
 ```
 
-Aucun exécuteur ne tourne encore : rien ne démarre. `canon sync` n'écrit que
-les colonnes déclaratives (harnais, hôte, dossier, responsable…), jamais bail,
-session ni statut, et **ne lève jamais** un arrêt posé par `agent-runner stop`.
+No runner is running yet: nothing starts. `canon sync` only writes
+the declarative columns (harness, host, folder, lead…), never lease,
+session or status, and **never lifts** a stop set by `agent-runner stop`.
 
-Registre des authentificateurs (spec §8.2) : la branche canonique qui fait foi
-ne vient **jamais** du commit lu (son propre `federation.yaml` pourrait
-s'autoriser). Elle vient de la configuration de l'hôte (`AMEESH_CANON_REF` /
-`canon_ref`, posée par son responsable), sinon du manifeste du dernier commit
-déjà appliqué (journal `authenticator_syncs` en base), sinon — premier
-amorçage du registre — de `--bootstrap-ref <branche>` (journalisé, ignoré
-ensuite) ; sans rien de cela, la synchronisation des authentificateurs est
-refusée. `--ref` choisit ce qui est lu, jamais ce qui est canonique : le
-commit lu doit être atteignable depuis la branche de suivi distant de
-confiance, et descendre du dernier commit appliqué (jamais de retour en
-arrière ; contrôle et écritures sont sérialisés par un verrou du registre).
-Un changement de `ref` dans le manifeste ne prend effet qu'une fois fusionné
-sur la branche canonique actuelle. Limite connue (spec §11) : un agent qui
-partage l'utilisateur Unix d'ameesh peut réécrire `refs/remotes/…` du clone
-(ou la configuration de l'hôte) ; seule la monotonie en base l'empêche alors
-de revenir en arrière. Après une réécriture **légitime** de l'historique de la
-branche canonique, tout est refusé (« ne descend pas du dernier commit
-appliqué ») jusqu'à ce que le propriétaire vide le journal
-(`DELETE FROM authenticator_syncs`) et réamorce avec `--bootstrap-ref`.
+Authenticator registry (spec §8.2): the authoritative canonical branch
+**never** comes from the commit being read (its own `federation.yaml` could
+authorize itself). It comes from the host configuration (`AMEESH_CANON_REF` /
+`canon_ref`, set by its lead), otherwise from the manifest of the last commit
+already applied (`authenticator_syncs` log in the database), otherwise — first
+bootstrap of the registry — from `--bootstrap-ref <branche>` (logged, ignored
+afterwards); without any of these, authenticator synchronization is
+refused. `--ref` chooses what is read, never what is canonical: the
+commit read must be reachable from the trusted remote-tracking
+branch, and descend from the last applied commit (never going
+backwards; check and writes are serialized by a registry lock).
+A change of `ref` in the manifest only takes effect once merged
+into the current canonical branch. Known limitation (spec §11): an agent that
+shares ameesh's Unix user can rewrite the clone's `refs/remotes/…`
+(or the host configuration); only the monotonicity in the database then prevents it
+from going backwards. After a **legitimate** rewrite of the canonical branch's
+history, everything is refused ("ne descend pas du dernier commit
+appliqué" (does not descend from the last applied commit)) until the owner empties the log
+(`DELETE FROM authenticator_syncs`) and re-bootstraps with `--bootstrap-ref`.
 
-**Retour arrière :** retirer `AMEESH_CANON` (ou `canon` de la configuration).
-Le registre garde ses colonnes et ses arrêts, sans effet tant qu'aucun
-exécuteur ne tourne.
+**Rollback:** remove `AMEESH_CANON` (or `canon` from the configuration).
+The registry keeps its columns and its stops, with no effect as long as no
+runner is running.
 
-**Plusieurs canons** (manaty + Acme, L42) : `canons` dans
-`config.json` ou `AMEESH_CANONS` — voir
-[EXPLOITATION](EXPLOITATION.md#plusieurs-canons-l42-decision-0031). Le premier
-reste le canon par défaut ; un hôte à un seul canon ne change rien. Depuis
-L44 (migration 0035), chaque canon synchronise les passkeys de ses humains
-dans son propre registre : donner une `ref` à chaque entrée de `canons`, ou
-amorcer une fois chaque canon suivant (`ameesh canon sync --canon <id>
---bootstrap-ref main`, journalisé) ; puis relancer `deploy/sql/role-approve.sql`
-(ameesh-approve lit `actions.canon` et `authenticators.canon`).
+**Several canons** (manaty + Acme, L42): `canons` in
+`config.json` or `AMEESH_CANONS` — see
+[EXPLOITATION](EXPLOITATION.md#plusieurs-canons-l42-decision-0031). The first
+remains the default canon; a host with a single canon changes nothing. Since
+L44 (migration 0035), each canon synchronizes its humans' passkeys
+into its own registry: give a `ref` to each entry of `canons`, or
+bootstrap each subsequent canon once (`ameesh canon sync --canon <id>
+--bootstrap-ref main`, logged); then rerun `deploy/sql/role-approve.sql`
+(ameesh-approve reads `actions.canon` and `authenticators.canon`).
 
 ---
 
-## Étape 3 — ameesh-approve **[P]**
+## Step 3 — ameesh-approve **[P]**
 
-1. **Utilisateur système dédié** `ameesh-approve`, distinct de celui des
-   agents ; son dossier d'état en `0700`, son jeton de service en `0600` :
+1. **Dedicated system user** `ameesh-approve`, distinct from the agents'
+   user; its state directory in `0700`, its service token in `0600`:
 
    ```bash
    sudo useradd --system --create-home ameesh-approve
    sudo -u ameesh-approve ameesh-approve gen-token
    ```
 
-   ameesh, côté agents, lit une copie de ce jeton : il permet de **demander**
-   une approbation, jamais d'en signer une. Copie en `0600` à l'utilisateur
-   des agents (refusée sinon), puis dans `~/.config/ameesh/env` :
-   `AMEESH_APPROVE_URL=http://127.0.0.1:8765` (https, ou http sur la boucle
-   locale seulement) et `AMEESH_APPROVE_TOKEN_FILE=<copie>`. ameesh ne
-   l'affiche ni ne l'écrit jamais (ni fil, ni journal), ne passe par aucun
-   mandataire et ne suit aucune redirection.
-2. **Exposition au téléphone — une page Nexlink**
-   ([0017](design/decisions/0017-approbation-via-page-nexlink.md)). Le service
-   n'écoute que sur la boucle locale (`--bind 127.0.0.1 --port 8765`) ; la page
-   Nexlink le relaie en HTTPS. Le RP ID est le domaine de la page, l'origine
-   `https://<domaine>` (`AMEESH_APPROVE_RP_ID`, `AMEESH_APPROVE_ORIGINS`, les
-   mêmes côté ameesh pour vérifier les reçus). **La mise en ligne est un acte du
-   propriétaire**, après le OK de revue de sécurité de L7 ; un changement de
-   domaine oblige à réenrôler les passkeys.
-3. **Enrôlement de la passkey du propriétaire, par le canon** :
+   ameesh, on the agents' side, reads a copy of this token: it allows **requesting**
+   an approval, never signing one. Copy in `0600` owned by the agents' user
+   (refused otherwise), then in `~/.config/ameesh/env`:
+   `AMEESH_APPROVE_URL=http://127.0.0.1:8765` (https, or http on the
+   loopback only) and `AMEESH_APPROVE_TOKEN_FILE=<copie>`. ameesh never
+   displays or writes it (neither thread nor log), goes through no
+   proxy and follows no redirect.
+2. **Exposure to the phone — a Nexlink page**
+   ([0017](design/decisions/0017-approbation-via-page-nexlink.md)). The service
+   only listens on the loopback (`--bind 127.0.0.1 --port 8765`); the Nexlink
+   page relays it over HTTPS. The RP ID is the page's domain, the origin
+   `https://<domaine>` (`AMEESH_APPROVE_RP_ID`, `AMEESH_APPROVE_ORIGINS`, the
+   same on the ameesh side to verify receipts). **Going live is an act of the
+   owner**, after the L7 security review OK; a change of
+   domain requires re-enrolling the passkeys.
+3. **Enrolling the owner's passkey, through the canon**:
 
    ```bash
    sudo -u ameesh-approve ameesh-approve enroll-link --approver human:smichea
-   #   → lien à usage unique, à ouvrir SUR LE TÉLÉPHONE ; la passkey créée devient
-   #     une PROPOSITION (fichier sous <état>/proposals/), rien n'est actif
+   #   → single-use link, to open ON THE PHONE; the created passkey becomes
+   #     a PROPOSAL (file under <état>/proposals/), nothing is active
    ```
 
-   Le propriétaire vérifie l'empreinte hors bande, reporte l'entrée proposée
-   dans `authenticators` de `membres/smichea.md` **par PR**, la fusionne, puis
-   `ameesh canon sync --fetch` sur chaque hôte : il recopie
-   `Member.authenticators` dans le registre de confiance (spec §8.2), depuis le
-   commit fusionné de la branche canonique seulement ; `ameesh authenticator
-   list` montre la passkey active, avec le commit du canon. Un hôte dont le
-   clone est en retard sur le registre (retrait déjà appliqué par un autre
-   hôte) refuse d'y écrire (`authentificateurs : REFUSÉ … --fetch`) : il ne
-   réactive jamais une passkey retirée.
-4. **Essai réel** : une action `shell-noop` de classe `irreversible` reste
-   bloquée sans reçu (`ameesh action execute` → `[receipt_required]`) ;
-   `ameesh action request <id> --approver human:smichea` dépose la demande et
-   écrit le lien dans le fil ; une fois signé sur le téléphone,
-   `ameesh action fetch-receipt <id>` récupère le reçu, le vérifie et
-   l'attache ; l'exécution passe, et le rejeu du reçu échoue
+   The owner checks the fingerprint out of band, copies the proposed entry
+   into `authenticators` of `membres/smichea.md` **by PR**, merges it, then
+   `ameesh canon sync --fetch` on each host: it copies
+   `Member.authenticators` into the trust registry (spec §8.2), from the
+   merged commit of the canonical branch only; `ameesh authenticator
+   list` shows the active passkey, with the canon commit. A host whose
+   clone lags behind the registry (removal already applied by another
+   host) refuses to write to it (`authentificateurs : REFUSÉ … --fetch`): it never
+   reactivates a removed passkey.
+4. **Real test**: a `shell-noop` action of class `irreversible` stays
+   blocked without a receipt (`ameesh action execute` → `[receipt_required]`);
+   `ameesh action request <id> --approver human:smichea` files the request and
+   writes the link in the thread; once signed on the phone,
+   `ameesh action fetch-receipt <id>` retrieves the receipt, verifies it and
+   attaches it; execution goes through, and replaying the receipt fails
    (`ameesh receipt verify` → `[replay]`).
 
-**Retour arrière :** arrêter le service (`systemctl stop ameesh-approve`) et
-retirer la page Nexlink. Les actions irréversibles restent bloquées — le
-comportement sûr. Retirer une passkey : PR qui la supprime du canon, puis
+**Rollback:** stop the service (`systemctl stop ameesh-approve`) and
+remove the Nexlink page. Irreversible actions stay blocked — the
+safe behavior. Removing a passkey: a PR that deletes it from the canon, then
 `canon sync`.
 
 ---
 
-## Étape 4 — un agent pilote (`deepseek7`)
+## Step 4 — a pilot agent (`deepseek7`)
 
-Dans cet ordre, sans raccourci :
+In this order, with no shortcut:
 
-1. attendre la fin de son tour en cours (`nexlink-agent list`, fenêtre de
-   l'agent) ;
-2. arrêter la boucle v0 et **attendre la mort de tout son groupe** :
+1. wait for its current turn to end (`nexlink-agent list`, the agent's
+   window);
+2. stop the v0 loop and **wait for its whole group to die**:
 
    ```bash
    PID=$(cat ~/.local/state/nexlink-agents/deepseek7/pid)
@@ -266,147 +266,147 @@ Dans cet ordre, sans raccourci :
    while pgrep -g "$PGID" >/dev/null || pgrep -f -- "$SESSION" >/dev/null; do sleep 2; done
    ```
 
-   Si un harnais survit au-delà d'un tour, `kill -TERM -- -"$PGID"` puis
-   `kill -KILL -- -"$PGID"` : aucun processus ne doit encore tenir la session ;
-3. reprendre courrier et session sur cet état stable, puis lever l'arrêt posé
-   à l'étape 2 (la consigne remet l'agent en file, sur la session de la v0) :
+   If a harness survives beyond a turn, `kill -TERM -- -"$PGID"` then
+   `kill -KILL -- -"$PGID"`: no process must still hold the session;
+3. take over mail and session on this stable state, then lift the stop set
+   in step 2 (the prompt puts the agent back in the queue, on the v0 session):
 
    ```bash
    ameesh import-v0 --agents deepseek7
    agent-runner register deepseek7 deepseek --session "$SESSION" \
        --prompt "Reprise sous ameesh v1 : continue ton lot en cours."
-   ameesh canon sync              # rétablit les colonnes du canon ; état « ok » requis
-   ameesh show deepseek7          # session = $SESSION, statut queued, aucun bail
+   ameesh canon sync              # restores the canon columns; "ok" status required
+   ameesh show deepseek7          # session = $SESSION, status queued, no lease
    ```
 
-4. démarrer l'exécuteur v1 pour ce seul agent, puis un aller-retour :
+4. start the v1 runner for this agent only, then a round trip:
 
    ```bash
    agent-runner --agents deepseek7 --poll 5
-   #   → « bail acquis : deepseek7 », « LISTEN agent_mail, agent_lease »
+   #   → "bail acquis : deepseek7" (lease acquired), "LISTEN agent_mail, agent_lease"
    ameesh mail send deepseek7 "aller-retour de bascule" --from smichea
-   ameesh fil show ameesh         # le message est dans le fil, en clair
-   ameesh list                    # bail, non-lus, budget
+   ameesh fil show ameesh         # the message is in the thread, in plain text
+   ameesh list                    # lease, unread, budget
    ```
 
-   **Hooks** : la ligne de commande des hooks ne change pas
-   (`agent-mail hook <harnais>`). Un agent lancé par l'exécuteur reçoit
-   `AGENT_MAIL_NAME`, `AMEESH_RUNNER_ID` et `AMEESH_LEASE_EPOCH` : le hook ne
-   livre que si le bail est vivant et détenu par cet exécuteur. Le dossier ne
-   donne jamais d'identité. Une session externe n'en a une que si elle est
-   liée (`ameesh mail bind`, L41) : voir
-   [Passer les hooks à la v1](#passer-les-hooks-à-la-v1-avance-de-létape-8-pour-les-hooks-décision-0030).
+   **Hooks**: the hooks' command line does not change
+   (`agent-mail hook <harnais>`). An agent launched by the runner receives
+   `AGENT_MAIL_NAME`, `AMEESH_RUNNER_ID` and `AMEESH_LEASE_EPOCH`: the hook only
+   delivers if the lease is alive and held by this runner. The folder never
+   gives an identity. An external session only has one if it is
+   bound (`ameesh mail bind`, L41): see
+   [Switching the hooks to v1](#switching-the-hooks-to-v1-step-8-brought-forward-for-the-hooks-decision-0030).
 
-   **Courrier pendant la coexistence (jusqu'à l'étape 8)** : la commande
-   `agent-mail` installée (`~/.local/bin/agent-mail`, celle qu'appellent les
-   hooks par leur chemin absolu) est encore la v0 : `agent-mail inbox` y lit la
-   boîte **fichier**, jamais la base. L'exécuteur v1 ne renvoie donc plus
-   l'agent vers `agent-mail inbox` : un tour déclenché par du courrier, des
-   événements (regroupés) ou un message prioritaire porte le **contenu** des
-   messages v1 dans sa consigne (expéditeur, horodatage, corps lisible comme
-   dans le fil, rappel qu'un message d'agent n'a jamais l'autorité du
-   propriétaire). Plafond sur la consigne **entière**, en octets UTF-8
-   (`AMEESH_PROMPT_MAIL_MAX`, 20 000 par défaut, résumé de reprise compris) :
-   les plus anciens d'abord, le nombre restant est indiqué, et ces
-   messages-là restent non livrés pour le tour suivant.
+   **Mail during coexistence (until step 8)**: the installed
+   `agent-mail` command (`~/.local/bin/agent-mail`, the one the hooks call
+   by its absolute path) is still v0: `agent-mail inbox` reads the
+   **file** mailbox there, never the database. The v1 runner therefore no longer sends
+   the agent to `agent-mail inbox`: a turn triggered by mail,
+   events (grouped) or a priority message carries the **content** of the
+   v1 messages in its prompt (sender, timestamp, body readable as
+   in the thread, reminder that an agent message never has the owner's
+   authority). Cap on the **whole** prompt, in UTF-8 bytes
+   (`AMEESH_PROMPT_MAIL_MAX`, 20,000 by default, resume summary included):
+   oldest first, the remaining count is indicated, and those
+   messages stay undelivered for the next turn.
 
-   Une seule règle de remise, pour l'exécuteur comme pour le hook v1 :
-   **réserver** sous un jeton (la ligne de l'agent est verrouillée dans le
-   registre et le bail `owner`/`epoch` contrôlé dans la même instruction ; un
-   message déjà réservé ne l'est jamais deux fois), **montrer**, puis
-   **solder** cette réservation-là seulement, bail toujours vivant. L'exécuteur
-   solde juste après le lancement du harnais et annule si le tour ne démarre
-   pas (harnais absent, dossier absent, échec du lancement) ; le hook ne voit
-   donc jamais ce qui est dans la consigne, et livre ce qui arrive pendant le
-   tour. Bail perdu entre réservation et remise : rien n'est soldé, la remise
-   est signalée « incertaine » (journal et fil) ; panne : la réservation expire
-   ou change d'epoch, et le message est remis de nouveau, marqué « re-livré »
-   — un doublon signalé, jamais une perte.
+   A single delivery rule, for the runner as for the v1 hook:
+   **reserve** under a token (the agent's row is locked in the
+   registry and the `owner`/`epoch` lease checked in the same statement; a
+   message already reserved is never reserved twice), **show**, then
+   **settle** that reservation only, lease still alive. The runner
+   settles right after launching the harness and cancels if the turn does not start
+   (harness missing, folder missing, launch failure); the hook therefore never
+   sees what is in the prompt, and delivers what arrives during the
+   turn. Lease lost between reservation and delivery: nothing is settled, the delivery
+   is flagged "incertaine" (uncertain) (log and thread); crash: the reservation expires
+   or changes epoch, and the message is delivered again, marked "re-livré" (re-delivered)
+   — a flagged duplicate, never a loss.
 
-   L'agent **répond par `agent-mail send` (v0)** jusqu'à l'étape 8 : la
-   réponse part dans la boîte fichier v0 et l'opérateur la voit comme avant.
-   Pour vérifier qu'un message v1 a bien été vu : `ameesh fil show <projet>`
-   et le journal de l'exécuteur (le tour « messages » cite la consigne), plutôt
-   que `agent-mail inbox`.
+   The agent **replies with `agent-mail send` (v0)** until step 8: the
+   reply goes to the v0 file mailbox and the operator sees it as before.
+   To check that a v1 message was indeed seen: `ameesh fil show <projet>`
+   and the runner's log (the "messages" turn quotes the prompt), rather
+   than `agent-mail inbox`.
 
-**Retour arrière, symétrique :**
+**Rollback, symmetrical:**
 
 ```bash
-# 1. plus aucun tour v1 pour cet agent, puis arrêt de son exécuteur (Ctrl-C ou
-#    SIGTERM : bail rendu, harnais tué avec son groupe) ; vérifier qu'il ne reste rien
+# 1. no more v1 turns for this agent, then stop its runner (Ctrl-C or
+#    SIGTERM: lease returned, harness killed with its group); check nothing remains
 agent-runner stop deepseek7
 pkill -TERM -f "ameesh.runner.*--agents deepseek7|agent-runner --agents deepseek7"
-ameesh show deepseek7                       # bail : —
+ameesh show deepseek7                       # lease: —
 while pgrep -f -- "$SESSION" >/dev/null; do sleep 2; done
-# 2. le courrier retourne dans la boîte fichier
+# 2. the mail goes back into the file mailbox
 ameesh export-v0 --agents deepseek7
-# 3. la boucle v0 reprend la MÊME session
+# 3. the v0 loop resumes the SAME session
 nexlink-agent start deepseek7 deepseek "<consigne>" "$SESSION"
 ```
 
-Les messages arrivés entre-temps en base sont réécrits dans la boîte v0 ; aucun
-n'est perdu.
+Messages that arrived in the database in the meantime are rewritten into the v0 mailbox; none
+is lost.
 
 ---
 
-## Étape 5 — les autres agents, par vagues de 1 ou 2
+## Step 5 — the other agents, in waves of 1 or 2
 
-Même procédure que l'étape 4, agent par agent : fin du tour, arrêt v0 et mort
-du groupe, `import-v0`, `agent-runner register … --session … --prompt …` (qui
-lève l'arrêt de l'étape 2), `ameesh canon sync`. Dès que deux agents ou plus
-sont basculés, un seul exécuteur par hôte les sert (`agent-runner` sans
-`--agents`) : les agents encore en v0 restent arrêtés au registre, il ne les
-réclame pas.
+Same procedure as step 4, agent by agent: end of turn, v0 stop and death
+of the group, `import-v0`, `agent-runner register … --session … --prompt …` (which
+lifts the step 2 stop), `ameesh canon sync`. As soon as two or more agents
+are cut over, a single runner per host serves them (`agent-runner` without
+`--agents`): agents still on v0 remain stopped in the registry, it does not
+claim them.
 
-Après chaque vague :
+After each wave:
 
 ```bash
-ameesh list                 # aucun agent basculé sans bail ; aucun agent v0 avec bail
-ameesh canon check          # canon valide, état « ok » enregistré pour l'hôte
-ameesh fil list             # les fils avancent
+ameesh list                 # no cut-over agent without a lease; no v0 agent with a lease
+ameesh canon check          # valid canon, "ok" status recorded for the host
+ameesh fil list             # the threads progress
 ameesh doctor --notify-test
 ```
 
-**Retour arrière (par agent), symétrique :** `agent-runner stop <nom>` (plus
-de nouveau tour ; `canon sync` ne lève jamais cet arrêt), attendre que son bail
-soit rendu et que son groupe soit mort (`ameesh show <nom>`, `pgrep -f` sur sa
-session), `ameesh export-v0 --agents <nom>`, puis `nexlink-agent start` sur la
-même session. Pour le rebasculer plus tard : la procédure de l'étape 4.
+**Rollback (per agent), symmetrical:** `agent-runner stop <nom>` (no more
+new turns; `canon sync` never lifts this stop), wait until its lease
+is returned and its group is dead (`ameesh show <nom>`, `pgrep -f` on its
+session), `ameesh export-v0 --agents <nom>`, then `nexlink-agent start` on the
+same session. To cut it over again later: the step 4 procedure.
 
 ---
 
-## Étape 6 — les orchestrateurs, agents à tours
+## Step 6 — the orchestrators, turn-based agents
 
-Pour chaque orchestrateur (déclaré au canon comme les autres agents) :
+For each orchestrator (declared in the canon like the other agents):
 
-1. le **service de surveillance** qui nourrissait le `Monitor` de la session
-   dépose désormais ses constats dans la boîte de l'orchestrateur, en
-   événements : `ameesh mail send <orchestrateur> "<constat lisible>" --kind
-   event [--urgent] --from surveillance`. Les événements sont regroupés (au plus
-   un réveil par `AMEESH_EVENT_COALESCE` secondes, 120 par défaut) sauf
-   `--urgent` ;
-2. fin de la session interactive (fin de tour, sortie du harnais, **mort du
-   groupe** comme à l'étape 4), `import-v0`, `agent-runner register …
-   --session … --prompt …`, `ameesh canon sync` : l'exécuteur le réclame et le
-   réveille par des tours (messages, événements regroupés), sur la même
-   session ;
-3. pour lui parler en direct : `ameesh attach <orchestrateur>` (refusé pendant
-   un tour, sauf `--wait`). Attach prend le bail sous `attach:<utilisateur>@<hôte>`,
-   suspend la réclamation automatique, lance le harnais en interactif sur la
-   même session ; à la sortie, le bail revient à l'exécuteur.
+1. the **monitoring service** that fed the session's `Monitor`
+   now drops its findings into the orchestrator's mailbox, as
+   events: `ameesh mail send <orchestrateur> "<constat lisible>" --kind
+   event [--urgent] --from surveillance`. Events are grouped (at most
+   one wake-up every `AMEESH_EVENT_COALESCE` seconds, 120 by default) except
+   `--urgent`;
+2. end of the interactive session (end of turn, harness exit, **death of the
+   group** as in step 4), `import-v0`, `agent-runner register …
+   --session … --prompt …`, `ameesh canon sync`: the runner claims it and
+   wakes it up with turns (messages, grouped events), on the same
+   session;
+3. to talk to it directly: `ameesh attach <orchestrateur>` (refused during
+   a turn, unless `--wait`). Attach takes the lease as `attach:<utilisateur>@<hôte>`,
+   suspends automatic claiming, launches the harness interactively on the
+   same session; on exit, the lease goes back to the runner.
 
-**Retour arrière, symétrique :** `agent-runner stop <orchestrateur>`, bail
-rendu et groupe mort ; arrêter le dépôt d'événements par la surveillance ;
-`ameesh export-v0 --agents <orchestrateur>` ; relancer la session interactive
-sur la même session, avec la surveillance en `Monitor` dans la session.
+**Rollback, symmetrical:** `agent-runner stop <orchestrateur>`, lease
+returned and group dead; stop the monitoring's event drops;
+`ameesh export-v0 --agents <orchestrateur>`; restart the interactive session
+on the same session, with monitoring as `Monitor` in the session.
 
 ---
 
-## Étape 7 — supervision (systemd)
+## Step 7 — supervision (systemd)
 
-**L'exécuteur**, service utilisateur ; le canon est synchronisé avant toute
-réclamation (un canon illisible ou invalide n'empêche pas le démarrage : il
-ferme la réclamation des agents du canon, fail closed) :
+**The runner**, a user service; the canon is synchronized before any
+claim (an unreadable or invalid canon does not prevent startup: it
+closes claiming of canon agents, fail closed):
 
 ```ini
 # ~/.config/systemd/user/agent-runner.service
@@ -415,17 +415,17 @@ Description=ameesh — exécuteur de l'hôte (un par machine)
 After=network-online.target
 
 [Service]
-# L106 : PATH explicite — l'unité peut démarrer avant que la session n'importe
-# le sien (shims et installations mise, node pour dsh)
+# L106: explicit PATH — the unit may start before the session imports
+# its own (mise shims and installs, node for dsh)
 Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=%h/.config/ameesh/env        # AMEESH_HOST, AMEESH_CANON, AMEESH_APPROVE_* (PATH=… possible)
 ExecStartPre=-%h/.local/share/ameesh/venv/bin/ameesh canon sync --fetch
 ExecStart=%h/.local/share/ameesh/venv/bin/agent-runner --poll 5
 Restart=always
 RestartSec=5
-# arrêt : SIGTERM au seul exécuteur, qui draine (tours en cours et travail
-# de fond finissent, au plus AMEESH_DRAIN_SECONDS = 30 min) — voir
-# EXPLOITATION.md, « Arrêt et redémarrage de l'exécuteur »
+# stop: SIGTERM to the runner only, which drains (running turns and background
+# work finish, at most AMEESH_DRAIN_SECONDS = 30 min) — see
+# EXPLOITATION.md, "Arrêt et redémarrage de l'exécuteur" (Stopping and restarting the runner)
 KillMode=mixed
 TimeoutStopSec=35min
 
@@ -436,14 +436,14 @@ WantedBy=default.target
 ```bash
 systemctl --user daemon-reload && systemctl --user enable --now agent-runner
 journalctl --user -u agent-runner -f
-ameesh doctor --harness     # L106 : binaires résolus (chemin, provenance), unités manquantes
+ameesh doctor --harness     # L106: resolved binaries (path, origin), missing units
 ```
 
-**Un exécuteur par agent** (la forme retenue sur le poste) : le modèle
-`deploy/systemd/ameesh-runner-agent@.service` (même PATH explicite), une
-instance par agent mené — **y compris un agent tenu en `ameesh attach`** :
-si la session interactive meurt, c'est son exécuteur qui reprend la même
-session (L106). `ameesh doctor` signale un agent mené sans unité activée.
+**One runner per agent** (the form adopted on the workstation): the template
+`deploy/systemd/ameesh-runner-agent@.service` (same explicit PATH), one
+instance per driven agent — **including an agent held in `ameesh attach`**:
+if the interactive session dies, its runner resumes the same
+session (L106). `ameesh doctor` flags a driven agent without an enabled unit.
 
 ```bash
 install -m 0644 'deploy/systemd/ameesh-runner-agent@.service' ~/.config/systemd/user/
@@ -451,18 +451,18 @@ systemctl --user daemon-reload
 systemctl --user enable --now ameesh-runner-agent@<agent>
 ```
 
-Après chaque PR fusionnée au canon : `ameesh canon sync --fetch` sur chaque
-hôte (à la main ou par un minuteur).
+After each PR merged into the canon: `ameesh canon sync --fetch` on each
+host (by hand or with a timer).
 
-**Le service de surveillance** des orchestrateurs, service utilisateur à côté
-de l'exécuteur.
+**The monitoring service** of the orchestrators, a user service alongside
+the runner.
 
-**Les alertes poussées** (L38) : `ameesh notify`, service utilisateur à côté
-de l'exécuteur — unité d'exemple `deploy/systemd/ameesh-notify.service`,
-configuration et secrets dans [EXPLOITATION.md](EXPLOITATION.md#alertes-poussées--ameesh-notify).
+**Push alerts** (L38): `ameesh notify`, a user service alongside
+the runner — example unit `deploy/systemd/ameesh-notify.service`,
+configuration and secrets in [EXPLOITATION.md](EXPLOITATION.md#alertes-poussées--ameesh-notify).
 
-**ameesh-approve [P]**, service système sous son utilisateur, jamais celui des
-agents :
+**ameesh-approve [P]**, a system service under its own user, never the
+agents' user:
 
 ```ini
 # /etc/systemd/system/ameesh-approve.service
@@ -482,97 +482,97 @@ ProtectHome=read-only
 WantedBy=multi-user.target
 ```
 
-**Base distante (VPN, WireGuard)** : depuis L72, l'exécuteur traverse une
-panne passagère de la base sans s'arrêter (voir
-[EXPLOITATION.md](EXPLOITATION.md#panne-passagère-de-la-base-l72)). Deux
-réglages du DSN complètent : des *keepalives* TCP pour qu'une connexion morte
-(LISTEN, pilote psycopg) soit détectée en une minute plutôt qu'au délai TCP du
-noyau (un quart d'heure et plus), et un délai de connexion adapté au lien :
+**Remote database (VPN, WireGuard)**: since L72, the runner rides out a
+transient database outage without stopping (see
+[EXPLOITATION.md](EXPLOITATION.md#panne-passagère-de-la-base-l72)). Two
+DSN settings complement this: TCP *keepalives* so that a dead connection
+(LISTEN, psycopg driver) is detected within a minute rather than at the kernel's TCP
+timeout (a quarter of an hour or more), and a connection timeout suited to the link:
 
 ```bash
-# ~/.config/ameesh/env (ou AMEESH_DSN de l'unité)
+# ~/.config/ameesh/env (or AMEESH_DSN of the unit)
 AMEESH_DSN='postgresql://ameesh@10.77.0.1:5432/ameesh?keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=3&tcp_user_timeout=60000'
-AMEESH_CONNECT_TIMEOUT=10   # défaut depuis L72 (3 s avant)
+AMEESH_CONNECT_TIMEOUT=10   # default since L72 (3 s before)
 ```
 
-Côté serveur, `tcp_keepalives_idle = 60` dans `postgresql.conf` libère de même
-les sessions d'un client disparu.
+On the server side, `tcp_keepalives_idle = 60` in `postgresql.conf` likewise frees
+the sessions of a vanished client.
 
-À surveiller : agents basculés sans bail vivant, non-lus de plus de 15 min,
-baux expirés, `ameesh decisions` (approbations en attente, issues inconnues à
-trancher), état du canon par hôte (`ameesh canon check`).
+To watch: cut-over agents without a live lease, unread messages older than 15 min,
+expired leases, `ameesh decisions` (pending approvals, unknown outcomes to
+settle), canon status per host (`ameesh canon check`).
 
-**Retour arrière :** `systemctl --user disable --now agent-runner` (baux rendus,
-harnais tués avec leur groupe), puis, agent par agent, le retour arrière de
-l'étape 4 ; `systemctl disable --now ameesh-approve`.
-
----
-
-## Étape 8 — fin de vie de la v0 (après une à deux semaines)
-
-* `~/.local/bin/agent-mail` pointe enfin vers la v1 (lien vers le venv) ;
-* garder `nexlink-agent`, `nexlink-agents` et l'état fichier **en lecture
-  seule** un mois de plus ;
-* `nexlink-agents` (relance après redémarrage) est remplacé par les services
-  systemd ;
-* archiver la sauvegarde de l'étape 0 avec la date de bascule ; ne supprimer
-  les scripts v0 qu'après une restauration testée.
-
-**Retour arrière :** réinstaller les scripts depuis la sauvegarde, remettre
-`~/.local/bin/agent-mail` sur la v0, `ameesh export-v0` pour le courrier, puis
-les boucles v0 (étape 4, retour arrière).
+**Rollback:** `systemctl --user disable --now agent-runner` (leases returned,
+harnesses killed with their group), then, agent by agent, the step 4
+rollback; `systemctl disable --now ameesh-approve`.
 
 ---
 
-## Passer les hooks à la v1 (avance de l'étape 8 pour les hooks, décision 0030)
+## Step 8 — end of life of v0 (after one to two weeks)
 
-**Geste du propriétaire [P].** Cette section remplace une commande de
-`~/.local/bin` et modifie les configurations des harnais
-(`~/.claude*/settings.json`, `~/.codex*/hooks.json`). Aucun agent ne le fait
-à sa place : un agent peut préparer les commandes, mais c'est le propriétaire
-qui les lance et qui vérifie. Elle avance l'étape 8 **pour les hooks
-seulement** (décision 0030 « Pas de travail sans réveil possible », point 6,
-lot L41) : `nexlink-agent` et l'état fichier v0 restent en place.
+* `~/.local/bin/agent-mail` finally points to v1 (link to the venv);
+* keep `nexlink-agent`, `nexlink-agents` and the file state **read-only**
+  for one more month;
+* `nexlink-agents` (restart after reboot) is replaced by the systemd
+  services;
+* archive the step 0 backup with the cutover date; only delete
+  the v0 scripts after a tested restore.
 
-### Constat
+**Rollback:** reinstall the scripts from the backup, point
+`~/.local/bin/agent-mail` back to v0, `ameesh export-v0` for the mail, then
+the v0 loops (step 4, rollback).
 
-* Les hooks du poste appellent `~/.local/bin/agent-mail`, qui est encore la
-  **v0**, directement ou par le pont local `~/.local/bin/ameesh-session-mail-hook`
-  (configurations Claude secondaire et tertiaire), qui pose `AGENT_MAIL_NAME`
-  puis appelle la v0.
-* La v0 **tire l'identité du dossier** (`AGENT_MAIL_NAME`, sinon alias de
-  `~/.config/agent-mail/aliases.tsv` par préfixe, sinon nom du dossier) : une
-  session sous `~/Work` prenait l'identité `orchestrateur` d'une autre équipe.
-* La v0 lit la boîte **fichier** : une session externe ne voit jamais son
-  courrier v1 (Postgres). Même liée par le pont, elle ne reçoit que la boîte
-  fichier.
-* La v1 (`agent-mail hook <harnais>`, L41) ne tire jamais l'identité du
-  dossier : `AGENT_MAIL_NAME` (et le bail si l'exécuteur l'a posé), sinon la
-  **liaison de session** (`ameesh mail bind`, source `session`) retrouvée par
-  l'identifiant de session que le harnais passe au hook, avec contrôle du PID
-  ancêtre s'il est lié. Sans l'un ni l'autre : **rien n'est remis, rien n'est
-  écrit**, sortie 0.
+---
 
-### Avant de commencer
+## Switching the hooks to v1 (step 8 brought forward for the hooks, decision 0030)
 
-1. ameesh installé avec L41 dans le venv, schéma migré : `ameesh migrate`
-   (applique `0034_liaisons_de_session`), puis `ameesh mail bindings` répond
-   « aucune liaison de session ».
-2. **Plus aucun agent sous boucle v0** (`nexlink-agent list` : aucun agent
-   actif) : après le remplacement, `agent-mail send` et `agent-mail inbox`
-   parlent à la base, plus à la boîte fichier. Un agent encore mené par la v0
-   le serait sans courrier : le rendre d'abord à l'exécuteur (étapes 4 à 6),
-   ou reporter cette section.
-3. Courrier v0 en attente pour les sessions externes : `ameesh import-v0
-   --dry-run`, puis `ameesh import-v0 --agents <noms>` pour le passer en base.
-4. Noter, pour chaque session interactive à garder joignable, son harnais, son
-   identifiant de session et le PID du harnais (`ps -o pid,args -C claude`,
-   `-C codex`). L'identifiant est celui que le harnais passe au hook :
-   Claude le montre dans `/status` et dans le nom du transcript
-   (`~/.claude*/projects/…/<id>.jsonl`), Codex dans le nom du fichier de
-   session (`~/.codex*/sessions/…/rollout-…-<id>.jsonl`).
+**Owner's action [P].** This section replaces a command in
+`~/.local/bin` and modifies the harness configurations
+(`~/.claude*/settings.json`, `~/.codex*/hooks.json`). No agent does it
+in their place: an agent can prepare the commands, but it is the owner
+who runs them and who checks. It brings step 8 forward **for the hooks
+only** (decision 0030 "No work without a possible wake-up", point 6,
+lot L41): `nexlink-agent` and the v0 file state stay in place.
 
-### Sauvegarde
+### Findings
+
+* The workstation's hooks call `~/.local/bin/agent-mail`, which is still
+  **v0**, directly or through the local bridge `~/.local/bin/ameesh-session-mail-hook`
+  (secondary and tertiary Claude configurations), which sets `AGENT_MAIL_NAME`
+  then calls v0.
+* v0 **derives the identity from the folder** (`AGENT_MAIL_NAME`, otherwise an alias from
+  `~/.config/agent-mail/aliases.tsv` by prefix, otherwise the folder name): a
+  session under `~/Work` took on the `orchestrateur` identity of another team.
+* v0 reads the **file** mailbox: an external session never sees its
+  v1 mail (Postgres). Even bound through the bridge, it only receives the file
+  mailbox.
+* v1 (`agent-mail hook <harnais>`, L41) never derives the identity from the
+  folder: `AGENT_MAIL_NAME` (and the lease if the runner set it), otherwise the
+  **session binding** (`ameesh mail bind`, source `session`) found through
+  the session identifier that the harness passes to the hook, with a check of the ancestor
+  PID if it is bound. With neither: **nothing is delivered, nothing is
+  written**, exit 0.
+
+### Before starting
+
+1. ameesh installed with L41 in the venv, schema migrated: `ameesh migrate`
+   (applies `0034_liaisons_de_session`), then `ameesh mail bindings` answers
+   "aucune liaison de session" (no session binding).
+2. **No agent left under a v0 loop** (`nexlink-agent list`: no active
+   agent): after the replacement, `agent-mail send` and `agent-mail inbox`
+   talk to the database, no longer to the file mailbox. An agent still driven by v0
+   would be so without mail: hand it back to the runner first (steps 4 to 6),
+   or postpone this section.
+3. Pending v0 mail for external sessions: `ameesh import-v0
+   --dry-run`, then `ameesh import-v0 --agents <noms>` to move it into the database.
+4. Note, for each interactive session to keep reachable, its harness, its
+   session identifier and the harness PID (`ps -o pid,args -C claude`,
+   `-C codex`). The identifier is the one the harness passes to the hook:
+   Claude shows it in `/status` and in the transcript name
+   (`~/.claude*/projects/…/<id>.jsonl`), Codex in the session file
+   name (`~/.codex*/sessions/…/rollout-…-<id>.jsonl`).
+
+### Backup
 
 ```bash
 mkdir -p ~/backups/hooks-v1-$(date +%F-%H%M) && cd "$_"
@@ -585,700 +585,700 @@ done
 sha256sum * > SHA256SUMS
 ```
 
-### Bascule
+### Cutover
 
-L'ordre compte (L46). Le pont local pose `AGENT_MAIL_NAME` (source
-`explicit`) : tant qu'il appelle `agent-mail`, une v1 derrière lui
-remettrait à la session externe le courrier d'un agent nommé dans le pont —
-y compris d'un agent que l'exécuteur mène déjà (`coordinateur`), et
-écrirait sur sa ligne. Le pont est donc **retiré d'abord**, pendant que
-`agent-mail` est encore la v0 (qui ne lit que la boîte fichier et ne touche
-pas à la base) ; la v1 n'arrive qu'ensuite. Depuis L46, la v1 refuse de
-toute façon la remise `explicit` à un agent qui détient un bail vivant, et
-un hook sans bail ne change plus que `last_seen` sur la ligne d'un agent
-`execute` ; l'ordre ci-dessous reste la règle (il protège aussi un agent
-entre deux tours, sans bail vivant à l'instant).
+Order matters (L46). The local bridge sets `AGENT_MAIL_NAME` (source
+`explicit`): as long as it calls `agent-mail`, a v1 behind it
+would deliver to the external session the mail of an agent named in the bridge —
+including an agent the runner already drives (`coordinateur`), and
+would write on its row. The bridge is therefore **removed first**, while
+`agent-mail` is still v0 (which only reads the file mailbox and does not touch
+the database); v1 only comes afterwards. Since L46, v1 refuses
+`explicit` delivery anyway to an agent holding a live lease, and
+a hook without a lease now only changes `last_seen` on the row of an
+`execute` agent; the order below remains the rule (it also protects an agent
+between two turns, without a live lease at that moment).
 
-1. **Remplacer, dans les configurations des harnais, les hooks qui appellent
-   le pont** par l'appel direct à `agent-mail` (mêmes événements, même
-   harnais) :
+1. **Replace, in the harness configurations, the hooks that call
+   the bridge** with a direct call to `agent-mail` (same events, same
+   harness):
 
    ```text
    /home/smichea/.local/bin/ameesh-session-mail-hook claude   →   /home/smichea/.local/bin/agent-mail hook claude
    ```
 
    (`~/.claude-secondary/settings.json`, `~/.claude-tertiary/settings.json`.)
-   Jusqu'au point 3, ces hooks appellent encore la v0, comme ceux de
-   `~/.claude`, `~/.codex` et `~/.codex-secondary` aujourd'hui : rien n'est lu
-   en base. Le pont `ameesh-session-mail-hook` et son fichier restent en
-   place, inutilisés, jusqu'à la fin de vie de la v0 (étape 8).
+   Until point 3, these hooks still call v0, like those of
+   `~/.claude`, `~/.codex` and `~/.codex-secondary` today: nothing is read
+   from the database. The bridge `ameesh-session-mail-hook` and its file stay in
+   place, unused, until the end of life of v0 (step 8).
 
    ```bash
-   grep -c ameesh-session-mail-hook ~/.claude*/settings.json ~/.codex*/hooks.json   # 0 partout
+   grep -c ameesh-session-mail-hook ~/.claude*/settings.json ~/.codex*/hooks.json   # 0 everywhere
    ```
 
-2. **Importer les liaisons du pont** (inertes pour la v0 ; le dossier `cwd`
-   du pont n'est pas repris : il ne donne jamais d'identité) :
+2. **Import the bridge's bindings** (inert for v0; the bridge's `cwd`
+   folder is not carried over: it never gives an identity):
 
    ```bash
    ameesh mail bind --import ~/.config/ameesh/external-session-bindings.json
    ameesh mail bindings
    ```
 
-   Le rapport dit, entrée par entrée, ce qui est importé et ce qui est ignoré
-   avec la raison : agent `execute` (mené par l'exécuteur, qui lui remet son
-   courrier : c'est le cas attendu d'un agent comme `coordinateur` après sa reprise par
-   l'exécuteur — L46 : l'import ne force jamais), agent qui détient un bail
-   vivant, session déjà liée à un autre agent, harnais ou nom invalide. Un
-   agent encore inconnu du registre y est inscrit comme **externe**. Une
-   session reprise depuis l'écriture du pont a un **nouveau PID** : la
-   relier avec le PID courant, sinon le hook la refusera (« pid … absent de
-   l'ascendance ») :
+   The report states, entry by entry, what is imported and what is ignored
+   with the reason: `execute` agent (driven by the runner, which delivers its
+   mail: this is the expected case for an agent like `coordinateur` after being taken over by
+   the runner — L46: the import never forces), agent holding a live
+   lease, session already bound to another agent, invalid harness or name. An
+   agent not yet known to the registry is registered there as **external**. A
+   session resumed since the bridge was written has a **new PID**: re-bind
+   it with the current PID, otherwise the hook will refuse it ("pid … absent de
+   l'ascendance" (pid … not among the ancestors)):
 
    ```bash
    ameesh mail bind <agent> --session <id> --harness claude|codex|deepseek --pid <PID du harnais>
    ```
 
-   `--pid` est recommandé : sans lui, quiconque connaît l'identifiant de
-   session sur cet hôte reçoit le courrier de l'agent. Un agent `execute` est
-   refusé (« agent mené par l'exécuteur ; une session externe lui volerait son
-   courrier ») : le reclasser d'abord (`ameesh set <agent> mode=externe`) s'il
-   est en réalité une session humaine ; `--force` n'est qu'un dernier recours.
+   `--pid` is recommended: without it, anyone who knows the session
+   identifier on this host receives the agent's mail. An `execute` agent is
+   refused ("agent mené par l'exécuteur ; une session externe lui volerait son
+   courrier" (agent driven by the runner; an external session would steal its mail)): reclassify it first (`ameesh set <agent> mode=externe`) if it
+   is actually a human session; `--force` is only a last resort.
 
-3. **Remplacer `agent-mail` par la v1** (le lien vers le venv, comme les
-   autres commandes de l'étape 1) — en dernier, une fois le pont retiré des
-   configurations :
+3. **Replace `agent-mail` with v1** (the link to the venv, like the
+   other commands of step 1) — last, once the bridge is removed from the
+   configurations:
 
    ```bash
    ln -sfn ~/.local/share/ameesh/venv/bin/agent-mail ~/.local/bin/agent-mail
-   agent-mail --help | head -3          # « agent-mail (mesh v1) »
+   agent-mail --help | head -3          # "agent-mail (mesh v1)"
    ```
 
-   Les hooks qui appellent `agent-mail hook <harnais>` et la barre d'état
-   (`agent-mail statusline`) passent à la v1 par ce lien.
+   The hooks that call `agent-mail hook <harnais>` and the status bar
+   (`agent-mail statusline`) switch to v1 through this link.
 
-### Vérification
+### Verification
 
 ```bash
-grep -c ameesh-session-mail-hook ~/.claude*/settings.json ~/.codex*/hooks.json   # 0 partout
+grep -c ameesh-session-mail-hook ~/.claude*/settings.json ~/.codex*/hooks.json   # 0 everywhere
 ameesh mail bindings
 ```
 
-* **Dans une session liée** (demander à l'agent de lancer la commande, ou
-  depuis un shell lancé par la session) : `agent-mail whoami` affiche
+* **In a bound session** (ask the agent to run the command, or
+  from a shell launched by the session): `agent-mail whoami` displays
   `<agent> [session] liaison <harnais> <id> sur <hôte>, pid <N>, par <qui>`.
-  Puis `ameesh mail send <agent> "essai de remise v1" --from smichea`
-  depuis un terminal : le message apparaît au prochain prompt de la session,
-  et `ameesh fil show <projet>` le montre remis.
-* **Dans une session non liée** : `agent-mail whoami` répond « identité non
-  liée » (code 1) ; un message envoyé à un agent dont le dossier porterait le
-  nom **n'apparaît pas** dans la session, et reste non lu en base
+  Then `ameesh mail send <agent> "essai de remise v1" --from smichea`
+  from a terminal: the message appears at the session's next prompt,
+  and `ameesh fil show <projet>` shows it as delivered.
+* **In an unbound session**: `agent-mail whoami` answers "identité non
+  liée" (identity not bound) (code 1); a message sent to an agent whose name the folder
+  would carry **does not appear** in the session, and stays unread in the database
   (`ameesh mail inbox <agent>`).
-* Un agent de l'exécuteur : son tour suivant se passe comme avant
-  (`ameesh list`, journal de l'exécuteur), son hook remet sous son bail.
+* A runner agent: its next turn goes as before
+  (`ameesh list`, runner log), its hook delivers under its lease.
 
-### Retour arrière, symétrique
+### Rollback, symmetrical
 
-1. Remettre la v0 : `cp -a ~/backups/hooks-v1-<date>/agent-mail.v0
-   ~/.local/bin/agent-mail` (le fichier, pas un lien), puis `agent-mail
-   --help | head -3` (« boîte aux lettres locale »).
-2. Remettre les configurations des harnais depuis la sauvegarde (les hooks
-   des configurations Claude secondaire et tertiaire rappellent
-   `ameesh-session-mail-hook`), et vérifier les empreintes
-   (`sha256sum -c SHA256SUMS` dans le dossier de sauvegarde, pour les
-   fichiers remis).
-3. Courrier v1 arrivé entre-temps pour les sessions externes :
-   `ameesh export-v0 --agents <noms>` le réécrit dans la boîte fichier, que la
-   v0 relit.
-4. Les liaisons en base sont inertes pour la v0 ; les révoquer si on renonce
-   à la bascule : `ameesh mail unbind --session <id> --harness <h>` pour
-   chacune (`ameesh mail bindings`).
+1. Restore v0: `cp -a ~/backups/hooks-v1-<date>/agent-mail.v0
+   ~/.local/bin/agent-mail` (the file, not a link), then `agent-mail
+   --help | head -3` ("boîte aux lettres locale" (local mailbox)).
+2. Restore the harness configurations from the backup (the hooks
+   of the secondary and tertiary Claude configurations call
+   `ameesh-session-mail-hook` again), and check the checksums
+   (`sha256sum -c SHA256SUMS` in the backup folder, for the
+   restored files).
+3. v1 mail that arrived in the meantime for external sessions:
+   `ameesh export-v0 --agents <noms>` rewrites it into the file mailbox, which
+   v0 reads again.
+4. The bindings in the database are inert for v0; revoke them if the
+   cutover is abandoned: `ameesh mail unbind --session <id> --harness <h>` for
+   each (`ameesh mail bindings`).
 
 ---
 
-## Mise à jour d'ameesh vers L35 — dossiers de travail
+## Updating ameesh to L35 — working directories
 
-Depuis L31 (v1.3.0), le dossier de travail vient de la fiche `Host`, plus du
-`cwd` des fiches `Placement`. Un hôte qui n'avait rien déclaré a vu ses agents
-recevoir un `cwd` vide et rester bloqués (« dossier de travail absent :
-None »). L35 ajoute `policy.work_dirs`, le gabarit `{agent}` et un repli
-transitoire sur l'ancien `cwd`.
+Since L31 (v1.3.0), the working directory comes from the `Host` card, no longer from the
+`cwd` of the `Placement` cards. A host that had declared nothing saw its agents
+receive an empty `cwd` and stay blocked ("dossier de travail absent :
+None" (working directory missing: None)). L35 adds `policy.work_dirs`, the `{agent}` template and a transitional
+fallback to the old `cwd`.
 
-**Ce que v1.3.0 fait des réglages L35** (recette locale ci-dessous) :
-`canon check` 1.3.0 ne dit **rien** ; `work_dirs` est ignoré ; `{agent}` dans
-`work_roots` est recopié **littéralement** (`/wt/acme-{agent}` pour tous les
-agents de l'équipe). Un `canon check` 1.3.0 ne valide donc jamais un canon
-L35, et un exécuteur 1.3.0 encore actif (sync au démarrage et toutes les
-`AMEESH_CANON_SYNC_INTERVAL`, 300 s) écrirait ces chemins faux au registre.
-D'où l'ordre : **arrêter l'ancien, installer L35, valider avec L35, puis
-seulement publier**.
+**What v1.3.0 does with the L35 settings** (local acceptance test below):
+`canon check` 1.3.0 says **nothing**; `work_dirs` is ignored; `{agent}` in
+`work_roots` is copied **literally** (`/wt/acme-{agent}` for all
+agents of the team). A 1.3.0 `canon check` therefore never validates an L35
+canon, and a 1.3.0 runner still active (sync at startup and every
+`AMEESH_CANON_SYNC_INTERVAL`, 300 s) would write these wrong paths to the registry.
+Hence the order: **stop the old one, install L35, validate with L35, then
+only publish**.
 
-1. **Préparer sans publier.** Écrire les réglages sur une branche du canon
-   (PR **non fusionnée**) : `policy.work_roots` par équipe, avec `{agent}`
-   pour un worktree par agent (ex. `nexlink:
-   "~/development/manaty/nexlink-{agent}"`), et `policy.work_dirs: {<agent>:
-   <chemin>}` pour les exceptions. Recette locale avec le binaire L35, hors
-   de l'installation de l'hôte et sans base :
+1. **Prepare without publishing.** Write the settings on a canon branch
+   (PR **not merged**): `policy.work_roots` per team, with `{agent}`
+   for one worktree per agent (e.g. `nexlink:
+   "~/development/manaty/nexlink-{agent}"`), and `policy.work_dirs: {<agent>:
+   <chemin>}` for exceptions. Local acceptance test with the L35 binary, outside
+   the host's installation and without a database:
 
    ```bash
    python3 -m venv /tmp/ameesh-l35 && /tmp/ameesh-l35/bin/pip install -q <dépôt ameesh au gel L35>
-   git clone -q <url du dépôt du canon> /tmp/canon-l35     # copie jetable, ~/canon intact
+   git clone -q <url du dépôt du canon> /tmp/canon-l35     # throwaway copy, ~/canon intact
    AMEESH_CONFIG=/tmp/aucune-config.json /tmp/ameesh-l35/bin/ameesh canon check \
        --canon /tmp/canon-l35 --ref origin/<branche-PR> --host pc-smichea
-   #   attendu : 0 erreur, aucun host-policy-invalid, admission-cwd-inherited
-   #   ni host-work-dir-missing
+   #   expected: 0 errors, no host-policy-invalid, admission-cwd-inherited
+   #   or host-work-dir-missing
    ```
 
-2. **Arrêter l'ancien exécuteur, et avec lui son sync périodique** :
-   `systemctl --user stop agent-runner` (baux rendus, tours en cours tués avec
-   leur groupe). Ne lancer **aucun** `ameesh canon sync` 1.3.0 à partir d'ici.
-3. **Installer L35** (dépôt installé en éditable : `git -C
-   ~/development/manaty/ameesh checkout <gel L35>`), puis `ameesh --version`
-   et `ameesh canon check --fetch` avec CE binaire sur le canon actuel
-   (encore sans les nouveaux réglages) : le repli `admission-cwd-inherited`
-   y apparaît là où les anciens `cwd` servent encore.
-4. **Publier** : fusionner la PR du canon, puis `ameesh canon check --fetch`
-   (binaire L35) : 0 erreur, aucun `admission-cwd-inherited` ni
+2. **Stop the old runner, and with it its periodic sync**:
+   `systemctl --user stop agent-runner` (leases returned, running turns killed with
+   their group). Do not run **any** 1.3.0 `ameesh canon sync` from here on.
+3. **Install L35** (repository installed as editable: `git -C
+   ~/development/manaty/ameesh checkout <gel L35>`), then `ameesh --version`
+   and `ameesh canon check --fetch` with THIS binary on the current canon
+   (still without the new settings): the `admission-cwd-inherited` fallback
+   appears there wherever the old `cwd` values are still in use.
+4. **Publish**: merge the canon PR, then `ameesh canon check --fetch`
+   (L35 binary): 0 errors, no `admission-cwd-inherited` or
    `host-work-dir-missing`.
-5. `ameesh canon sync --fetch` : aucune ligne « cwd hérité » ni « aucun
-   dossier de travail » ; `ameesh list --json` montre un `cwd` distinct et
-   existant pour chaque agent.
-6. `systemctl --user start agent-runner`. Un agent resté `blocked`
-   (« dossier absent ») repart seul dès que le `cwd` du registre est bon.
-7. Plus tard, retirer le `cwd` des fiches `Placement` (ignoré :
+5. `ameesh canon sync --fetch`: no "cwd hérité" (inherited cwd) or "aucun
+   dossier de travail" (no working directory) line; `ameesh list --json` shows a distinct and
+   existing `cwd` for each agent.
+6. `systemctl --user start agent-runner`. An agent left `blocked`
+   ("dossier absent" (folder missing)) restarts on its own as soon as the registry's `cwd` is right.
+7. Later, remove the `cwd` from the `Placement` cards (ignored:
    `admission-cwd-ignored`).
 
-**Retour arrière vers v1.3.0 — le paquet seul ne suffit pas.** Un canon L35
-lu par 1.3.0 donne des chemins littéraux (`…-{agent}`) et ignore `work_dirs`.
-Dans l'ordre :
+**Rollback to v1.3.0 — the package alone is not enough.** An L35 canon
+read by 1.3.0 gives literal paths (`…-{agent}`) and ignores `work_dirs`.
+In order:
 
-1. `systemctl --user stop agent-runner` (binaire L35).
-2. **Rendre le canon compatible 1.3.0 avant tout sync** : PR qui retire
-   `work_dirs` et tout `{agent}`, et ne garde que `work_roots: {<équipe>:
-   <chemin>}` / `work_root` ; `canon check` du binaire **L35** sur cette
-   branche (il valide un sous-ensemble que 1.3.0 lit à l'identique), puis
-   fusion.
-3. **Limite de 1.3.0** : un seul dossier par équipe et par hôte
-   (`work_roots[équipe]` ou `work_root/<équipe>`) ; le `cwd` des fiches
-   `Placement` est ignoré. Plusieurs agents d'une même équipe avec des
-   worktrees distincts (cas nexlink) **ne peuvent pas** tourner chacun dans le
-   sien en 1.3.0. Pour chacun de ces agents, avant de relancer : soit
-   l'arrêter (`agent-runner stop <agent>`), soit accepter le dossier commun de
-   l'équipe s'il n'y a qu'un agent actif à la fois, soit le rendre à la v0
-   (`ameesh export-v0 --agents <agent>`, étape 4).
-4. Réinstaller 1.3.0 (`git -C ~/development/manaty/ameesh checkout v1.3.0`),
-   `ameesh canon check --fetch`, `ameesh canon sync --fetch`, vérifier
-   `ameesh list --json` (aucun `cwd` contenant `{`, aucun agent actif sans
-   dossier), puis `systemctl --user start agent-runner`.
+1. `systemctl --user stop agent-runner` (L35 binary).
+2. **Make the canon 1.3.0-compatible before any sync**: a PR that removes
+   `work_dirs` and every `{agent}`, and keeps only `work_roots: {<équipe>:
+   <chemin>}` / `work_root`; `canon check` of the **L35** binary on this
+   branch (it validates a subset that 1.3.0 reads identically), then
+   merge.
+3. **Limitation of 1.3.0**: a single folder per team and per host
+   (`work_roots[équipe]` or `work_root/<équipe>`); the `cwd` of the
+   `Placement` cards is ignored. Several agents of the same team with
+   distinct worktrees (the nexlink case) **cannot** each run in their
+   own in 1.3.0. For each of these agents, before restarting: either
+   stop it (`agent-runner stop <agent>`), or accept the team's shared folder
+   if only one agent is active at a time, or hand it back to v0
+   (`ameesh export-v0 --agents <agent>`, step 4).
+4. Reinstall 1.3.0 (`git -C ~/development/manaty/ameesh checkout v1.3.0`),
+   `ameesh canon check --fetch`, `ameesh canon sync --fetch`, check
+   `ameesh list --json` (no `cwd` containing `{`, no active agent without a
+   folder), then `systemctl --user start agent-runner`.
 
-**Recette locale de compatibilité** (faite pour L35 sur le canon d'exemple,
-sans base ni exécuteur, en lisant le même canon avec les deux versions) :
+**Local compatibility acceptance test** (done for L35 on the example canon,
+without database or runner, reading the same canon with both versions):
 
-| Canon d'essai (`atelier`) | L35 : orchestre / relecteur | 1.3.0 : orchestre / relecteur | `canon check` 1.3.0 |
+| Test canon (`atelier`) | L35: orchestre / relecteur | 1.3.0: orchestre / relecteur | `canon check` 1.3.0 |
 |---|---|---|---|
-| `work_roots: {acme-web: '/wt/acme-{agent}'}`, `work_dirs: {relecteur: /wt/relecture}` | `/wt/acme-orchestre` / `/wt/relecture` | `/wt/acme-{agent}` / `/wt/acme-{agent}` | aucun constat |
-| `work_roots: {acme-web: /wt/acme-web}` | `/wt/acme-web` / `/wt/acme-web` | `/wt/acme-web` / `/wt/acme-web` | aucun constat |
+| `work_roots: {acme-web: '/wt/acme-{agent}'}`, `work_dirs: {relecteur: /wt/relecture}` | `/wt/acme-orchestre` / `/wt/relecture` | `/wt/acme-{agent}` / `/wt/acme-{agent}` | no findings |
+| `work_roots: {acme-web: /wt/acme-web}` | `/wt/acme-web` / `/wt/acme-web` | `/wt/acme-web` / `/wt/acme-web` | no findings |
 
 ---
 
-## Mise à jour vers L36–L46 — décisions 0030 et 0031
+## Updating to L36–L46 — decisions 0030 and 0031
 
-Les lots L36 à L46 apportent les migrations **0030 à 0036** : mode d'agent et
-raison d'arrêt (0030), délégation à échéance (0031), plusieurs canons (0032),
-compte de la session (0033), liaisons de session (0034), authentificateurs par
-canon (0035), puis les corrections de relecture de L46 (0036 : `actions.canon`
-immuable hors rebase du canon par défaut, heure de démarrage du PID lié). Les
-gestes marqués [P] sont ceux du propriétaire.
+Lots L36 to L46 bring migrations **0030 to 0036**: agent mode and
+stop reason (0030), delegation with a deadline (0031), several canons (0032),
+session account (0033), session bindings (0034), authenticators per
+canon (0035), then the L46 review fixes (0036: `actions.canon`
+immutable except for a rebase of the default canon, start time of the bound PID). The
+actions marked [P] are the owner's.
 
-**Ce qui casse l'ancien code — tout se met à jour ENSEMBLE.**
+**What breaks the old code — everything is updated TOGETHER.**
 
-* **0032** : la clé de `canon_state` devient `(host, canon)`. L'ancien code
-  écrit l'état du canon par `ON CONFLICT (host)` : après la migration, chacune
-  de ses synchronisations échoue (plus de contrainte unique sur `host` seul).
-* **0035** : l'index unique des authentificateurs devient `(canon, facade,
-  credential_id)`. L'ancien code inscrit par `ON CONFLICT (facade,
-  credential_id)` : sa synchronisation des passkeys échoue.
-* **0036** : un code L42–L45 qui changerait l'ordre des canons verrait son
-  rebase refusé (`actions.canon` immuable) — fermé, mais bloqué.
+* **0032**: the key of `canon_state` becomes `(host, canon)`. The old code
+  writes the canon status via `ON CONFLICT (host)`: after the migration, each
+  of its synchronizations fails (no more unique constraint on `host` alone).
+* **0035**: the unique index of authenticators becomes `(canon, facade,
+  credential_id)`. The old code inserts via `ON CONFLICT (facade,
+  credential_id)`: its passkey synchronization fails.
+* **0036**: L42–L45 code that changed the order of the canons would see its
+  rebase refused (`actions.canon` immutable) — closed, but blocked.
 
-Donc **tous les hôtes et tous les services qui partagent la base** —
-exécuteurs (`agent-runner`) de chaque hôte, `ameesh-approve`, `ameesh notify`,
-minuteurs de `canon sync`, hooks `agent-mail` v1 — sont arrêtés, puis mis à
-jour **ensemble**, avant d'être relancés. Pas d'hôte « en retard ».
+So **all hosts and all services sharing the database** —
+runners (`agent-runner`) of each host, `ameesh-approve`, `ameesh notify`,
+`canon sync` timers, v1 `agent-mail` hooks — are stopped, then updated
+**together**, before being restarted. No host "lagging behind".
 
-**Pas de retour arrière du code sans restauration de la base.** Les
-migrations ne se défont pas : remettre l'ancien code sur une base migrée, c'est
-le casser (ci-dessus). La sauvegarde prise **avant** `ameesh migrate` est le
-seul retour arrière.
+**No code rollback without restoring the database.** The
+migrations cannot be undone: putting the old code back on a migrated database
+breaks it (see above). The backup taken **before** `ameesh migrate` is the
+only rollback.
 
-### Procédure
+### Procedure
 
-1. **Arrêt partout** (chaque hôte, puis [P] le service système) :
+1. **Stop everywhere** (each host, then [P] the system service):
 
    ```bash
-   systemctl --user stop agent-runner ameesh-notify      # sur CHAQUE hôte
+   systemctl --user stop agent-runner ameesh-notify      # on EACH host
    sudo systemctl stop ameesh-approve                    # [P]
    ```
 
-   Vérifier qu'aucun bail ne reste vivant : `ameesh list` (aucun `bail:`), ou
-   attendre leur échéance.
+   Check that no lease remains alive: `ameesh list` (no `bail:`), or
+   wait for them to expire.
 
-2. **Sauvegarde de la base, avant toute migration** :
+2. **Database backup, before any migration**:
 
    ```bash
    pg_dump --format=custom --file ~/backups/ameesh-avant-L46-$(date +%F-%H%M).dump "$AMEESH_DSN"
    ```
 
-   (L'exercice de restauration de l'étape 1 vaut aussi ici.)
+   (The step 1 restore drill applies here too.)
 
-3. **Code et migrations** : installer ameesh L46 dans le venv de chaque hôte
-   (et `/opt/ameesh/venv` pour ameesh-approve [P]), puis, **une seule fois** :
+3. **Code and migrations**: install ameesh L46 in each host's venv
+   (and `/opt/ameesh/venv` for ameesh-approve [P]), then, **only once**:
 
    ```bash
-   ameesh migrate            # applique 0030 … 0036
+   ameesh migrate            # applies 0030 … 0036
    ```
 
-4. **[P] Rôles SQL relancés** (idempotents, ils échouent sans rien changer si
-   le contrat n'est pas tenu) : ameesh-approve lit désormais `actions.canon` et
-   `authenticators.canon` (sans quoi il répond 503), le superviseur lit les
-   nouvelles colonnes (`mode`, `stop_reason`, `canon`, `canon_id`,
-   `session_bindings.pid_start`…) :
+4. **[P] SQL roles rerun** (idempotent, they fail without changing anything if
+   the contract is not met): ameesh-approve now reads `actions.canon` and
+   `authenticators.canon` (otherwise it answers 503), the supervisor reads the
+   new columns (`mode`, `stop_reason`, `canon`, `canon_id`,
+   `session_bindings.pid_start`…):
 
    ```bash
    PGOPTIONS='-c search_path=<schéma>' psql "<DSN admin>" -v ON_ERROR_STOP=1 -f deploy/sql/role-approve.sql
    PGOPTIONS='-c search_path=<schéma>' psql "<DSN admin>" -v ON_ERROR_STOP=1 -f deploy/sql/role-superviseur.sql
    ```
 
-5. **Reclasser à la main les agents externes existants.** 0030 donne
-   `mode = execute` à toute ligne existante ; seul un agent NÉ d'un hook sans
-   bail naît `externe`. Chaque session humaine déjà au registre (orchestrateur
-   interactif, session Codex ou Claude d'un humain) doit être reclassée, sans
-   quoi l'exécuteur pourrait la réclamer et reprendre sa session :
+5. **Reclassify existing external agents by hand.** 0030 gives
+   `mode = execute` to every existing row; only an agent BORN from a hook without
+   a lease is born `externe`. Every human session already in the registry (interactive
+   orchestrator, a human's Codex or Claude session) must be reclassified,
+   otherwise the runner could claim it and take over its session:
 
    ```bash
-   ameesh set <agent> mode=externe       # un agent externe exige un responsable humain
+   ameesh set <agent> mode=externe       # an external agent requires a human lead
    ```
 
-   (Depuis L46, l'exécuteur ne réclame jamais un agent `externe`, et un hook
-   sans bail ne touche plus que `last_seen` sur la ligne d'un agent `execute`.)
+   (Since L46, the runner never claims an `externe` agent, and a hook
+   without a lease now only touches `last_seen` on the row of an `execute` agent.)
 
-6. **Relance partout** (`systemctl --user start agent-runner ameesh-notify` ;
-   [P] `sudo systemctl start ameesh-approve`), puis la **vérification**
-   ci-dessous.
+6. **Restart everywhere** (`systemctl --user start agent-runner ameesh-notify`;
+   [P] `sudo systemctl start ameesh-approve`), then the **verification**
+   below.
 
-### Changements visibles
+### Visible changes
 
-* **`send all`** ne va plus qu'à l'**équipe** (ou au chantier) de
-  l'expéditeur (L36) ; un expéditeur sans équipe ni chantier garde la
-  diffusion globale.
-* **`work add --assignee` / `work assign`** refusent un nom **inconnu** du
-  registre et un agent `externe` sans `--externe` (L37, règle 2 de 0030) ;
-  L46 : un nom nu d'humain connu est normalisé en `human:<id>`, un canon
-  momentanément invalide ne bloque plus, et le refus dit quoi faire
+* **`send all`** now only goes to the sender's **team** (or project)
+  (L36); a sender with neither team nor project keeps the
+  global broadcast.
+* **`work add --assignee` / `work assign`** refuse a name **unknown** to the
+  registry and an `externe` agent without `--externe` (L37, rule 2 of 0030);
+  L46: a bare name of a known human is normalized to `human:<id>`, a
+  temporarily invalid canon no longer blocks, and the refusal says what to do
   (`agent-runner register …`, `human:<id>`, `--externe`).
-* **`max_agents` physique** (le plus strict des fiches `Host` des canons de
-  l'hôte, L43) **plafonne l'exécuteur** : au-delà, les agents restent en
-  attente (journal de l'exécuteur), rien n'est arrêté.
-* `ameesh mail bind` refuse un agent `execute` sauf `--force` ; `ameesh adopt`
-  révoque les liaisons de session de l'agent adopté (L46).
-* Hooks `agent-mail` v1 et pont local : voir la section « Passer les hooks à
-  la v1 » ci-dessus — le pont est retiré **avant** que `agent-mail` ne passe
-  à la v1.
+* **Physical `max_agents`** (the strictest of the `Host` cards of the host's
+  canons, L43) **caps the runner**: beyond it, agents stay
+  waiting (runner log), nothing is stopped.
+* `ameesh mail bind` refuses an `execute` agent unless `--force`; `ameesh adopt`
+  revokes the session bindings of the adopted agent (L46).
+* v1 `agent-mail` hooks and local bridge: see the section "Switching the hooks to
+  v1" above — the bridge is removed **before** `agent-mail` switches
+  to v1.
 
-### Vérification après migration
+### Verification after migration
 
 ```sql
 select mode, status, stop_reason, count(*) from agent_registry group by 1, 2, 3 order by 1, 2, 3;
 ```
 
-* aucune session humaine en `execute` (sinon : étape 5) ;
-* `stop_reason` : NULL pour tout agent qui tourne ; pour les `stopped` /
-  `dead` déjà en base, la raison que disait leur texte libre (`manuel`,
-  `bail_expire`, `retire_du_canon`), NULL sinon — un ancien arrêt sans raison
-  lève `stopped_with_mail` s'il a du courrier : le relancer ou l'arrêter de
-  nouveau (`agent-runner stop`, raison `manuel`) ;
-* `ameesh canon check` puis `ameesh list` : agents du canon `idle`, canon `ok`
-  sur chaque hôte ; `ameesh alerts` : pas de `dead_runner` ni d'`orphan_lot`
-  inattendu ;
-* ameesh-approve répond (pas de 503) ; `ameesh notify --once --dry-run`.
+* no human session in `execute` (otherwise: step 5);
+* `stop_reason`: NULL for every running agent; for `stopped` /
+  `dead` ones already in the database, the reason their free text gave (`manuel`,
+  `bail_expire`, `retire_du_canon`), NULL otherwise — an old stop without a reason
+  raises `stopped_with_mail` if it has mail: restart it or stop it
+  again (`agent-runner stop`, reason `manuel`);
+* `ameesh canon check` then `ameesh list`: canon agents `idle`, canon `ok`
+  on each host; `ameesh alerts`: no unexpected `dead_runner` or
+  `orphan_lot`;
+* ameesh-approve answers (no 503); `ameesh notify --once --dry-run`.
 
-**Retour arrière** : arrêter de nouveau tous les services, **restaurer la
-sauvegarde de l'étape 2** (`pg_restore --clean --if-exists -d "$AMEESH_DSN"
-<fichier>`), remettre l'ancien code sur chaque hôte, relancer. Jamais l'ancien
-code sur la base migrée.
+**Rollback**: stop all services again, **restore the
+step 2 backup** (`pg_restore --clean --if-exists -d "$AMEESH_DSN"
+<fichier>`), put the old code back on each host, restart. Never the old
+code on the migrated database.
 
 ---
 
-## Accueillir un second canon (Acme) — L45, décision 0031
+## Hosting a second canon (Acme) — L45, decision 0031
 
-Pour faire tourner sur `pc-smichea` des agents déclarés dans le canon
-Acme (`~/development/acme/home`, fédération
-`acme-ingenierie`), à côté de ceux du canon manaty. Les étapes
-marquées [P] sont des gestes du propriétaire.
+To run on `pc-smichea` agents declared in the Acme
+canon (`~/development/acme/home`, federation
+`acme-ingenierie`), alongside those of the manaty canon. The steps
+marked [P] are owner actions.
 
-**Prérequis.** ameesh avec les lots L42 à L44 installé ; `ameesh migrate`
-appliqué (migrations 0030 à 0035) ; **rôles SQL relancés** :
-`deploy/sql/role-approve.sql` et `deploy/sql/role-superviseur.sql` (sans quoi
-ameesh-approve répond 503 : il ne peut plus lire `actions.canon`).
+**Prerequisites.** ameesh with lots L42 to L44 installed; `ameesh migrate`
+applied (migrations 0030 to 0035); **SQL roles rerun**:
+`deploy/sql/role-approve.sql` and `deploy/sql/role-superviseur.sql` (otherwise
+ameesh-approve answers 503: it can no longer read `actions.canon`).
 
-1. **[P] Fiches ameesh dans le canon Acme**, par une PR sur
-   acme/home, revue et fusionnée :
-   - `federation.yaml` : `extensions: {ameesh: {scope: ameesh}}` (seule clé
-     libre du schéma OKF Federation) — ameesh ne lit que
-     `ameesh/` ; les `type: Agent` de `org/agent-harness/` (sous-agents Claude
-     Code) sont ignorés au lieu de rendre le canon invalide ;
+1. **[P] ameesh cards in the Acme canon**, through a PR on
+   acme/home, reviewed and merged:
+   - `federation.yaml`: `extensions: {ameesh: {scope: ameesh}}` (the only free
+     key of the OKF Federation schema) — ameesh only reads
+     `ameesh/`; the `type: Agent` entries of `org/agent-harness/` (Claude
+     Code sub-agents) are ignored instead of making the canon invalid;
    - `ameesh/membres/smichea.md` (Member), `ameesh/hotes/pc-smichea.md`
-     (Host : harnais, fournisseurs, modes, `work_dirs` des agents d'Acme ;
-     **même `max_agents` que la fiche manaty** — le plus petit des deux
-     plafonne tout l'exécuteur) ;
-   - `ameesh/agents/<agent>.md` et `ameesh/placements/<agent>-pc-smichea.md`
-     pour chaque agent d'Acme (p. ex. `acme-docs`, `acme-securite-docs`).
-   Contrôle avant fusion, sur la branche de la PR :
-   `ameesh canon check --canon <copie de la branche> --ref HEAD` → 0 erreur.
-2. **[P] Configuration de l'hôte** (`~/.config/ameesh/config.json`) : passer
-   de `canon`/`canon_ref` à une liste, le canon manaty restant **le premier**
-   (canon par défaut : ne pas réordonner dans le même geste) :
+     (Host: harnesses, providers, modes, `work_dirs` of Acme's agents;
+     **same `max_agents` as the manaty card** — the smaller of the two
+     caps the whole runner);
+   - `ameesh/agents/<agent>.md` and `ameesh/placements/<agent>-pc-smichea.md`
+     for each Acme agent (e.g. `acme-docs`, `acme-securite-docs`).
+   Check before merging, on the PR branch:
+   `ameesh canon check --canon <copie de la branche> --ref HEAD` → 0 errors.
+2. **[P] Host configuration** (`~/.config/ameesh/config.json`): switch
+   from `canon`/`canon_ref` to a list, with the manaty canon remaining **first**
+   (default canon: do not reorder in the same action):
    ```json
    "canons": [
      {"path": "/home/smichea/canon", "ref": "origin/main"},
      {"path": "/home/smichea/development/acme/home", "ref": "origin/main"}
    ]
    ```
-   La `ref` du second canon est sa branche de confiance pour les
-   authentificateurs (L44) ; sans elle, l'amorcer une fois :
+   The `ref` of the second canon is its trusted branch for
+   authenticators (L44); without it, bootstrap it once:
    `ameesh canon sync --canon acme-ingenierie --bootstrap-ref main`.
-3. **Vérifier**, sans rien lancer :
-   - `ameesh canon check` : un bloc par canon, les deux valides ;
-   - `ameesh canon sync --fetch` : chaque canon ne touche que ses lignes ;
-     aucun agent manaty arrêté ;
-   - `ameesh placement check --canon acme-ingenierie` : les agents
-     d'Acme admis sur `pc-smichea` ;
-   - `ameesh hosts` : origine de chaque limite (`[manaty]`,
+3. **Check**, without launching anything:
+   - `ameesh canon check`: one block per canon, both valid;
+   - `ameesh canon sync --fetch`: each canon only touches its own rows;
+     no manaty agent stopped;
+   - `ameesh placement check --canon acme-ingenierie`: Acme's agents
+     admitted on `pc-smichea`;
+   - `ameesh hosts`: origin of each limit (`[manaty]`,
      `[acme-ingenierie]`).
-4. **Changer un agent de canon** (p. ex. un agent d'Acme déclaré à titre
-   provisoire dans le canon manaty, ou `coordinateur`) : [P] retirer sa
-   fiche du canon manaty (PR fusionnée, l'agent est arrêté « retiré du
-   canon », son nom est libéré), puis [P] la déclarer dans le canon
-   Acme : à la synchronisation suivante, la ligne change de canon et
-   repart, **avec sa boîte et son historique**. Dans l'autre ordre, le second
-   canon reçoit `canon-name-conflict` (local à la fiche) et n'écrit rien.
-5. **Agents** : `ameesh resume <agent>` (ou `ameesh adopt` pour une session
-   interactive existante) pour les mettre en route sous l'exécuteur.
+4. **Move an agent to another canon** (e.g. an Acme agent declared
+   provisionally in the manaty canon, or `coordinateur`): [P] remove its
+   card from the manaty canon (PR merged, the agent is stopped "retiré du
+   canon" (removed from the canon), its name is freed), then [P] declare it in the Acme
+   canon: at the next synchronization, the row changes canon and
+   restarts, **with its mailbox and its history**. In the other order, the second
+   canon gets `canon-name-conflict` (local to the card) and writes nothing.
+5. **Agents**: `ameesh resume <agent>` (or `ameesh adopt` for an existing
+   interactive session) to start them under the runner.
 
-**Retour arrière.** Retirer le second canon de `canons` (ou revenir à
-`canon`/`canon_ref`) : l'exécuteur passe son état à `invalid`
-(`close_unconfigured`), ses agents ne sont plus réclamables, **rien n'est
-arrêté ni effacé** ; le canon manaty n'est pas touché. Les lignes du second
-canon restent dans le registre avec leur colonne `canon`, prêtes pour un
-nouvel essai.
+**Rollback.** Remove the second canon from `canons` (or go back to
+`canon`/`canon_ref`): the runner sets its status to `invalid`
+(`close_unconfigured`), its agents are no longer claimable, **nothing is
+stopped or erased**; the manaty canon is not touched. The rows of the second
+canon stay in the registry with their `canon` column, ready for a
+new attempt.
 
-## Mise à jour vers L60–L74
+## Updating to L60–L74
 
-Les lots L60, L61, L62, L70, L71, L72 et L74 apportent deux migrations,
-**0041** (L60 : `agent_registry.context_max_tokens`, `turn_costs.spend_key`
-et son index unique) et **0042** (L70 : `budget_limits`, `budget_events`,
-déclencheur `NOTIFY ameesh_budget`). Le paquet dépend désormais de psycopg
-(L61). Deux scripts, lancés par le propriétaire depuis le poste, font chaque
-geste en étapes séparées, s'arrêtent à la première erreur et n'affichent
-aucun secret : [`deploy/mise-a-jour/poste.sh`](../deploy/mise-a-jour/poste.sh)
-et [`deploy/mise-a-jour/vm.sh`](../deploy/mise-a-jour/vm.sh). Ils lisent
-leurs paramètres (adresse du serveur, personas du serveur, exécuteurs de
-l'ancienne base) dans `~/.config/ameesh/bascule.env`, celui de la bascule
-L57, hors du dépôt.
+Lots L60, L61, L62, L70, L71, L72 and L74 bring two migrations,
+**0041** (L60: `agent_registry.context_max_tokens`, `turn_costs.spend_key`
+and its unique index) and **0042** (L70: `budget_limits`, `budget_events`,
+`NOTIFY ameesh_budget` trigger). The package now depends on psycopg
+(L61). Two scripts, run by the owner from the workstation, perform each
+action in separate steps, stop at the first error and display
+no secret: [`deploy/mise-a-jour/poste.sh`](../deploy/mise-a-jour/poste.sh)
+and [`deploy/mise-a-jour/vm.sh`](../deploy/mise-a-jour/vm.sh). They read
+their parameters (server address, server personas, runners of the
+old database) from `~/.config/ameesh/bascule.env`, the one from the L57
+cutover, outside the repository.
 
-**Contrairement à L36–L46, rien ne casse l'ancien code.** 0041 et 0042
-n'ajoutent que des colonnes nullables, un index unique sur une colonne que
-l'ancien code n'écrit pas (NULL partout), et des tables neuves. Un exécuteur
-encore à l'ancienne version tourne donc sans erreur sur une base migrée :
-on migre une fois, puis on redémarre chaque exécuteur **à son premier instant
-hors tour**, sans arrêt général. Le retour arrière du code ne demande pas de
-restaurer la base.
+**Unlike L36–L46, nothing breaks the old code.** 0041 and 0042
+only add nullable columns, a unique index on a column that
+the old code does not write (NULL everywhere), and new tables. A runner
+still on the old version therefore runs without error on a migrated database:
+we migrate once, then restart each runner **at its first moment
+outside a turn**, without a general stop. Rolling back the code does not require
+restoring the database.
 
-**Ce que verra l'exploitation après le redémarrage.**
+**What operations will see after the restart.**
 
-* **L60** : une session DeepSeek qui a relu plus de 15 M jetons à son dernier
-  tour est tournée avec résumé de reprise **avant le tour suivant**. Les
-  sessions longues des DeepSeek tourneront donc au premier tour qui suit la
-  mise à jour : c'est attendu. Réglage par agent :
-  `ameesh set <agent> context_max_tokens=…` (0 = désactivé).
-* **L74** (décision 0034) : le choix du compte au forfait change de règle
-  (capacité qui expire le plus tôt, continuité de session). Une bascule de
-  compte au premier tour est possible, journalisée avec sa raison.
-* **L70** : `ameesh budget` montre les plafonds en vigueur. Base vide : la
-  configuration de l'hôte et les défauts s'appliquent comme avant.
-* **L72** : un exécuteur survit à une coupure passagère de la base (statut
-  « base injoignable », reprise seule).
+* **L60**: a DeepSeek session that re-read more than 15 M tokens in its last
+  turn is rotated with a resume summary **before the next turn**. The
+  long DeepSeek sessions will therefore rotate at the first turn following the
+  update: this is expected. Per-agent setting:
+  `ameesh set <agent> context_max_tokens=…` (0 = disabled).
+* **L74** (decision 0034): the choice of the plan account changes rule
+  (capacity that expires earliest, session continuity). An account
+  switch at the first turn is possible, logged with its reason.
+* **L70**: `ameesh budget` shows the caps in force. Empty database: the
+  host configuration and the defaults apply as before.
+* **L72**: a runner survives a transient database outage (status
+  "base injoignable" (database unreachable), resumes on its own).
 
-### Poste — `deploy/mise-a-jour/poste.sh`
+### Workstation — `deploy/mise-a-jour/poste.sh`
 
-Le venv `~/.local/share/ameesh/venv` est installé **non éditable**, depuis
-un instantané `~/.local/share/ameesh/src-<sha>` (lien `src-current`).
-L'étape `installer` suit le même usage.
+The venv `~/.local/share/ameesh/venv` is installed **non-editable**, from
+a snapshot `~/.local/share/ameesh/src-<sha>` (link `src-current`).
+The `installer` step follows the same practice.
 
-1. `poste.sh verifier` : bases visées (sans mot de passe), exécuteurs, accès
-   SSH au serveur. Rien n'est modifié.
-2. `poste.sh sauvegarder` : `pg_dump -Fc` de la base du mesh (celle du
-   serveur) depuis le poste, sauvegarde du serveur (`ameesh-sauvegarde`), et
-   `pg_dump` de l'ancienne base, dans `~/backups/ameesh/`.
-3. `poste.sh installer [REF]` : instantané du commit REF, installé avec ses
-   dépendances (psycopg). La version précédente est notée pour le retour.
-   Les exécuteurs en cours gardent l'ancien code en mémoire : enchaîner sans
-   attendre.
-4. `poste.sh migrer` : `ameesh migrate` **une seule fois** pour la base du
-   mesh, partagée par le poste et le serveur. Puis l'ancienne base, avec sa
-   propre configuration (`config-ancienne-base.json`) : **oui, elle aussi**.
-   Le démarrage de l'exécuteur ne vérifie que la présence du schéma, mais le
-   nouveau code écrit `turn_costs.spend_key` à chaque tour et lit
-   `context_max_tokens` : sans 0041, ses tours échoueraient.
-5. `poste.sh role` : `deploy/sql/role-superviseur.sql` (colonnes de 0041 et
-   tables de 0042 au contrat) réappliqué sur chaque base **où le rôle existe
-   déjà**. Sur le serveur, en superutilisateur local, par SSH. Un rôle
-   absent n'est pas créé : c'est une décision à part.
-6. `poste.sh redemarrer` : chaque `ameesh-runner-agent@<p>` actif est
-   redémarré **un par un**, dès que `ameesh show <p>` ne dit plus `running`.
-   Une persona longue en tour ne bloque pas les autres : le script repasse
-   sur la liste (au plus `ATTENTE_MAX`, 2 h). Puis `ameesh-notify`, puis les
-   exécuteurs de l'ancienne base (`UNITES_RESTE`), lus avec sa configuration.
-   Une unité qui ne reste pas active arrête le script.
-7. `poste.sh controler` : `ameesh doctor`, `ameesh budget`,
-   `ameesh accounts list`, `ameesh projects`, `ameesh alerts`, unités en
-   échec, `doctor` de l'ancienne base.
+1. `poste.sh verifier`: target databases (without password), runners, SSH
+   access to the server. Nothing is modified.
+2. `poste.sh sauvegarder`: `pg_dump -Fc` of the mesh database (the
+   server's) from the workstation, server backup (`ameesh-sauvegarde`), and
+   `pg_dump` of the old database, into `~/backups/ameesh/`.
+3. `poste.sh installer [REF]`: snapshot of commit REF, installed with its
+   dependencies (psycopg). The previous version is recorded for rollback.
+   Running runners keep the old code in memory: continue without
+   waiting.
+4. `poste.sh migrer`: `ameesh migrate` **only once** for the mesh
+   database, shared by the workstation and the server. Then the old database, with its
+   own configuration (`config-ancienne-base.json`): **yes, it too**.
+   Runner startup only checks that the schema is present, but the
+   new code writes `turn_costs.spend_key` at each turn and reads
+   `context_max_tokens`: without 0041, its turns would fail.
+5. `poste.sh role`: `deploy/sql/role-superviseur.sql` (0041 columns and
+   0042 tables in the contract) reapplied on each database **where the role already
+   exists**. On the server, as local superuser, over SSH. A missing
+   role is not created: that is a separate decision.
+6. `poste.sh redemarrer`: each active `ameesh-runner-agent@<p>` is
+   restarted **one by one**, as soon as `ameesh show <p>` no longer says `running`.
+   A persona in a long turn does not block the others: the script goes back
+   over the list (at most `ATTENTE_MAX`, 2 h). Then `ameesh-notify`, then the
+   runners of the old database (`UNITES_RESTE`), read with its configuration.
+   A unit that does not stay active stops the script.
+7. `poste.sh controler`: `ameesh doctor`, `ameesh budget`,
+   `ameesh accounts list`, `ameesh projects`, `ameesh alerts`, failed
+   units, `doctor` of the old database.
 
-### Serveur — `deploy/mise-a-jour/vm.sh` (depuis le poste)
+### Server — `deploy/mise-a-jour/vm.sh` (from the workstation)
 
-Sur le serveur (profil L55), ameesh est un clone détaché dans
-`/opt/ameesh/src`, installé non éditable dans `/opt/ameesh/venv`. Les
-personas tournent sous `ameesh-runner@<p>` (service système, utilisateur
-`ameesh`), hors dépôt ; leur plafond mémoire et leur slice viennent du
-complément `deploy/systemd/systeme/` (L159c, docs/EXPLOITATION.md,
-« Plafonds mémoire des agents »). **Pas de migration ici** : la base du serveur est celle que
-`poste.sh migrer` vient de migrer.
+On the server (L55 profile), ameesh is a detached clone in
+`/opt/ameesh/src`, installed non-editable in `/opt/ameesh/venv`. The
+personas run under `ameesh-runner@<p>` (system service, user
+`ameesh`), outside the repository; their memory cap and their slice come from the
+`deploy/systemd/systeme/` add-on (L159c, docs/EXPLOITATION.md,
+"Plafonds mémoire des agents" (Agent memory caps)). **No migration here**: the server's database is the one that
+`poste.sh migrer` has just migrated.
 
-1. `vm.sh verifier` : commit et version installés, unités, migrations
-   passées.
-2. `vm.sh installer [REF]` : le serveur récupère REF chez l'origine ; s'il ne
-   le trouve pas (branche non poussée), il le reçoit en paquet git par SSH.
-   Extraction détachée, installation avec psycopg. Le commit d'avant est
-   noté dans `/opt/ameesh/precedent`.
-3. `vm.sh redemarrer` : refuse tant que 0041 et 0042 ne sont pas passées,
-   puis redémarre chaque persona du serveur hors tour, une par une.
-4. `vm.sh controler` : unités actives, quinze lignes de journal par persona,
-   `ameesh show`, `ameesh doctor` sur le serveur.
+1. `vm.sh verifier`: installed commit and version, units, applied
+   migrations.
+2. `vm.sh installer [REF]`: the server fetches REF from origin; if it does not
+   find it (unpushed branch), it receives it as a git bundle over SSH.
+   Detached checkout, installation with psycopg. The previous commit is
+   recorded in `/opt/ameesh/precedent`.
+3. `vm.sh redemarrer`: refuses as long as 0041 and 0042 are not applied,
+   then restarts each server persona outside a turn, one by one.
+4. `vm.sh controler`: active units, fifteen log lines per persona,
+   `ameesh show`, `ameesh doctor` on the server.
 
-`/opt/ameesh/src` ne garde que les fichiers du commit installé. Depuis
-L135, `deploy/serveur/` (L55, L57) est dans main : un commit de main garde
-`installer-serveur.sh` rejouable depuis ce clone. Un commit plus ancien
-(avant L135) fait disparaître ces fichiers du clone ; les copies installées
-(gabarit systemd, script de sauvegarde) restent alors en place.
+`/opt/ameesh/src` only keeps the files of the installed commit. Since
+L135, `deploy/serveur/` (L55, L57) is in main: a main commit keeps
+`installer-serveur.sh` replayable from this clone. An older commit
+(before L135) makes these files disappear from the clone; the installed copies
+(systemd template, backup script) then stay in place.
 
-### Retour arrière
+### Rollback
 
-* **Code, poste** : `poste.sh retour` réinstalle l'instantané précédent
-  (`src-<sha>` d'avant), puis redémarre comme à l'étape 6.
-* **Code, serveur** : `vm.sh retour` remet le commit de
-  `/opt/ameesh/precedent`, puis redémarre.
-* **Base** : rien à défaire. L'ancien code ignore les colonnes et les tables
-  de 0041 et 0042. Les plafonds posés par `ameesh budget` ne sont plus
-  appliqués par l'ancien code : il reprend ceux de la configuration.
-  Restaurer une sauvegarde de l'étape 2 (`pg_restore --clean`, exécuteurs
-  arrêtés) n'est utile qu'en cas de données abîmées. Ce retour perd tout ce
-  qui a été écrit depuis.
+* **Code, workstation**: `poste.sh retour` reinstalls the previous snapshot
+  (the earlier `src-<sha>`), then restarts as in step 6.
+* **Code, server**: `vm.sh retour` puts back the commit from
+  `/opt/ameesh/precedent`, then restarts.
+* **Database**: nothing to undo. The old code ignores the columns and tables
+  of 0041 and 0042. The caps set by `ameesh budget` are no longer
+  applied by the old code: it falls back to those of the configuration.
+  Restoring a step 2 backup (`pg_restore --clean`, runners
+  stopped) is only useful in case of damaged data. This rollback loses everything
+  written since.
 
-## Mise à jour vers 1.6.0
+## Updating to 1.6.0
 
-La 1.6.0 réunit L73 (ménage automatique), L94 (sous-utilisation et
-`balance_low`), L95 (budget juste, `ameesh cost correct`), L96 (feuille de
-route, `ameesh plan`, `ameesh work plan`), L105 (plafonds en cours de tour)
-et L106 (coupure de l'hôte). Elle apporte cinq migrations, qui suivent 0042 :
+1.6.0 brings together L73 (automatic housekeeping), L94 (under-utilization and
+`balance_low`), L95 (accurate budget, `ameesh cost correct`), L96 (road
+map, `ameesh plan`, `ameesh work plan`), L105 (mid-turn caps)
+and L106 (host shutdown). It brings five migrations, which follow 0042:
 
-| Migration | Lot | Contenu |
+| Migration | Lot | Content |
 |---|---|---|
-| **0043** `grand_livre_corrige` | L95 | `turn_costs.void_reason`, table `turn_cost_corrections` (journal append-only) |
-| **0044** `feuille_de_route` | L96 | dates prévues de `work_items` et `work_packages`, table `commitments`, index du fil par expéditeur |
-| **0045** `menage` | L73 | colonnes du `/tmp` dans `host_resources`, tables `managed_worktrees` et `housekeeping_log` |
+| **0043** `grand_livre_corrige` | L95 | `turn_costs.void_reason`, `turn_cost_corrections` table (append-only log) |
+| **0044** `feuille_de_route` | L96 | planned dates of `work_items` and `work_packages`, `commitments` table, thread index by sender |
+| **0045** `menage` | L73 | `/tmp` columns in `host_resources`, `managed_worktrees` and `housekeeping_log` tables |
 | **0046** `plafonds_du_tour` | L105 | `agent_registry.turn_max_seconds`, `turn_mail_max` |
-| **0047** `alimentation_hote` | L106 | `host_resources.on_ac`, `battery_percent` (développée sous le numéro 0106) |
+| **0047** `alimentation_hote` | L106 | `host_resources.on_ac`, `battery_percent` (developed under number 0106) |
 
-**Comme pour L60–L74, rien ne casse l'ancien code** : des colonnes
-nullables ou avec défaut, et des tables neuves. Un exécuteur 1.5.x tourne
-sans erreur sur une base migrée. **L'inverse est faux** : un exécuteur 1.6.0
-écrit les colonnes de 0045 et 0047 à chaque relevé de l'hôte, et lit celles
-de 0046 à chaque tour. On migre donc **avant** de redémarrer, jamais après.
+**As for L60–L74, nothing breaks the old code**: nullable columns
+or columns with a default, and new tables. A 1.5.x runner runs
+without error on a migrated database. **The reverse is false**: a 1.6.0 runner
+writes the 0045 and 0047 columns at each host reading, and reads those
+of 0046 at each turn. So we migrate **before** restarting, never after.
 
-Les scripts sont ceux de L60–L74, dans le même ordre ; seul le contrôle des
-migrations de `vm.sh redemarrer` change (0041 à 0047).
+The scripts are those of L60–L74, in the same order; only the migration
+check of `vm.sh redemarrer` changes (0041 to 0047).
 
-1. **Poste** : `poste.sh verifier`, `sauvegarder`, `installer [REF]`.
-2. **Migrations** : `poste.sh migrer` applique 0043 à 0047 sur la base du
-   mesh, une seule fois, puis sur l'ancienne base. Contrôle :
-   `ameesh doctor` ne signale plus de migration manquante.
-3. **Rôle superviseur** : `poste.sh role` réapplique
-   `deploy/sql/role-superviseur.sql` sur chaque base où le rôle existe. Le
-   contrat lit désormais `turn_costs.void_reason` et `turn_cost_corrections`
-   (0043), les dates prévues et `commitments` sans sa note (0044),
-   `managed_worktrees`, `housekeeping_log` et les colonnes du `/tmp` (0045),
-   les plafonds du tour (0046) et l'alimentation de l'hôte (0047).
-   `commitments.note` est un contenu : il n'est lu qu'avec
-   `role-superviseur-contenus.sql`, appliqué à part, sur décision. Sans
-   cette étape, un superviseur échoue sur les nouvelles colonnes, sans rien
-   casser d'autre.
-4. **Arrêter l'agent fantôme `orchestrator`**, avant le redémarrage. Ce nom
-   est inscrit au registre sans exécuteur qui le mène. Après la mise à jour,
-   `ameesh doctor` le signalerait comme agent mené sans unité (L106), et les
-   alertes de vivacité et de sous-utilisation le compteraient :
+1. **Workstation**: `poste.sh verifier`, `sauvegarder`, `installer [REF]`.
+2. **Migrations**: `poste.sh migrer` applies 0043 to 0047 on the mesh
+   database, only once, then on the old database. Check:
+   `ameesh doctor` no longer reports a missing migration.
+3. **Supervisor role**: `poste.sh role` reapplies
+   `deploy/sql/role-superviseur.sql` on each database where the role exists. The
+   contract now reads `turn_costs.void_reason` and `turn_cost_corrections`
+   (0043), the planned dates and `commitments` without its note (0044),
+   `managed_worktrees`, `housekeeping_log` and the `/tmp` columns (0045),
+   the turn caps (0046) and the host power supply (0047).
+   `commitments.note` is content: it is only read with
+   `role-superviseur-contenus.sql`, applied separately, by decision. Without
+   this step, a supervisor fails on the new columns, without breaking
+   anything else.
+4. **Stop the ghost agent `orchestrator`**, before the restart. This name
+   is registered without a runner driving it. After the update,
+   `ameesh doctor` would flag it as a driven agent without a unit (L106), and the
+   liveness and under-utilization alerts would count it:
 
    ```bash
-   ameesh show orchestrator            # vérifier : aucun tour, aucun lot ouvert
-   agent-runner stop orchestrator      # raison d'arrêt `manuel`, jamais relancé seul
+   ameesh show orchestrator            # check: no turn, no open lot
+   agent-runner stop orchestrator      # stop reason `manuel`, never restarted on its own
    ```
 
-   Un lot encore assigné à `orchestrator` est réassigné d'abord
+   A lot still assigned to `orchestrator` is reassigned first
    (`ameesh work assign <lot> <agent>`).
-5. **Drop-in PATH pour l'exécuteur de l'ancienne base.** Les unités
-   `ameesh-runner-agent@` et `ameesh-notify` du dépôt portent un PATH
-   explicite depuis L106 : au démarrage de l'hôte, elles partent avant que
-   la session n'importe le sien (harnais introuvable, `node` absent pour
-   `dsh`). L'unité de l'ancienne base (celle de `UNITES_RESTE`) a été écrite
-   à la main, sans ce PATH. On lui ajoute un drop-in, sans réécrire l'unité :
+5. **PATH drop-in for the old database's runner.** The repository's
+   `ameesh-runner-agent@` and `ameesh-notify` units carry an explicit PATH
+   since L106: at host startup, they start before
+   the session imports its own (harness not found, `node` missing for
+   `dsh`). The old database's unit (the one in `UNITES_RESTE`) was written
+   by hand, without this PATH. We add a drop-in to it, without rewriting the unit:
 
    ```bash
-   u=<unité de l'ancienne base>        # ex. ameesh-runner-<base>
+   u=<unité de l'ancienne base>        # e.g. ameesh-runner-<base>
    mkdir -p ~/.config/systemd/user/$u.service.d
    cat > ~/.config/systemd/user/$u.service.d/path.conf <<'INI'
    [Service]
    Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
    INI
    systemctl --user daemon-reload
-   systemctl --user show $u -p Environment    # le PATH y figure
+   systemctl --user show $u -p Environment    # the PATH appears there
    ```
 
-   Le redémarrage de l'étape suivante le prend en compte.
-6. **Redémarrage des exécuteurs** : `poste.sh redemarrer` (un par un, hors
-   tour, puis `ameesh-notify`, puis l'ancienne base), puis, depuis le poste,
-   `vm.sh installer [REF]` et `vm.sh redemarrer`, qui refuse tant que 0041 à
-   0047 ne sont pas toutes passées.
-7. **Contrôle** : `poste.sh controler`, `vm.sh controler`, puis sur chaque
-   hôte :
+   The restart in the next step takes it into account.
+6. **Restarting the runners**: `poste.sh redemarrer` (one by one, outside a
+   turn, then `ameesh-notify`, then the old database), then, from the workstation,
+   `vm.sh installer [REF]` and `vm.sh redemarrer`, which refuses as long as 0041 to
+   0047 are not all applied.
+7. **Check**: `poste.sh controler`, `vm.sh controler`, then on each
+   host:
 
    ```bash
-   ameesh doctor --harness     # binaires des harnais résolus, chemin et provenance
-   ameesh doctor               # aucun agent mené sans unité d'exécuteur activée
-   ameesh hosts                # /tmp et alimentation dans le relevé
+   ameesh doctor --harness     # harness binaries resolved, path and origin
+   ameesh doctor               # no driven agent without an enabled runner unit
+   ameesh hosts                # /tmp and power supply in the reading
    ameesh alerts
    ```
 
-   `doctor --harness` doit trouver chaque harnais **par le PATH de l'unité**
-   ou ses emplacements connus, pas par celui d'un terminal ouvert.
+   `doctor --harness` must find each harness **through the unit's PATH**
+   or its known locations, not through that of an open terminal.
 
-**Ce que verra l'exploitation après le redémarrage.**
+**What operations will see after the restart.**
 
-* **L105** : un tour d'agent mené est clos au point sûr après 30 min
-  (`AMEESH_TURN_MAX_SECONDS`), et le hook de courrier remet au plus
-  5 messages par tour (`AMEESH_TURN_MAIL_MAX`). Les tours longs habituels
-  seront coupés et reprendront au tour suivant, dans la même session. Par
-  agent : `ameesh set <agent> turn_max_seconds=… turn_mail_max=…` (0 =
-  sans borne).
-* **L73** : les tours reçoivent un `TMPDIR` par agent et par session, sous
-  `<état>/.menage/tmp`. Les worktrees créés pendant un tour sont retirés à
-  la fin de leur lot s'ils sont propres et poussés. `ameesh menage` est en
-  essai par défaut ; rien hors des dossiers marqués n'est supprimé.
-* **L94** : de nouvelles alertes (`plan_underused`, `idle_capacity`,
-  `orchestrator_held`, `host_underused`, `balance_low`), poussées par
-  `ameesh notify` par défaut. Une première vague est attendue.
-* **L95** : la page d'avancement sépare la dépense payée au token de la
-  valeur consommée sur les forfaits. `ameesh cost correct` est un essai en
-  lecture seule ; `--apply` corrige le grand livre en une transaction,
-  après relecture de l'essai.
-* **L96** : le Gantt en tête de `ameesh progress`, les engagements datés
-  (`ameesh plan`) et l'alerte `engagement_overdue`.
-* **L106** : un hôte qui n'est pas prêt (harnais introuvable, base
-  injoignable) met ses agents en « hôte non prêt » sans les arrêter
-  (`host_not_ready`). Sur batterie, plus de nouveau tour sous 25 %, arrêt
-  propre sous 10 % (`host_power_low`).
+* **L105**: a driven agent's turn is closed at the safe point after 30 min
+  (`AMEESH_TURN_MAX_SECONDS`), and the mail hook delivers at most
+  5 messages per turn (`AMEESH_TURN_MAIL_MAX`). The usual long turns
+  will be cut and resume at the next turn, in the same session. Per
+  agent: `ameesh set <agent> turn_max_seconds=… turn_mail_max=…` (0 =
+  unbounded).
+* **L73**: turns receive a `TMPDIR` per agent and per session, under
+  `<état>/.menage/tmp`. Worktrees created during a turn are removed at
+  the end of their lot if they are clean and pushed. `ameesh menage` is a
+  dry run by default; nothing outside the marked folders is deleted.
+* **L94**: new alerts (`plan_underused`, `idle_capacity`,
+  `orchestrator_held`, `host_underused`, `balance_low`), pushed by
+  `ameesh notify` by default. A first wave is expected.
+* **L95**: the progress page separates spending paid per token from the
+  value consumed on plans. `ameesh cost correct` is a read-only
+  dry run; `--apply` corrects the ledger in one transaction,
+  after reviewing the dry run.
+* **L96**: the Gantt chart at the top of `ameesh progress`, dated commitments
+  (`ameesh plan`) and the `engagement_overdue` alert.
+* **L106**: a host that is not ready (harness not found, database
+  unreachable) puts its agents in "hôte non prêt" (host not ready) without stopping them
+  (`host_not_ready`). On battery, no new turn below 25 %, clean
+  stop below 10 % (`host_power_low`).
 
-**Retour arrière** : comme pour L60–L74 (`poste.sh retour`, `vm.sh
-retour`). La base reste migrée : l'ancien code ignore les colonnes et les
-tables de 0043 à 0047. Les corrections de `ameesh cost correct --apply`
-restent écrites ; l'ancien code ne lit pas `void_reason` et recompte donc les
-lignes écartées.
+**Rollback**: as for L60–L74 (`poste.sh retour`, `vm.sh
+retour`). The database stays migrated: the old code ignores the columns and
+tables of 0043 to 0047. The corrections from `ameesh cost correct --apply`
+remain written; the old code does not read `void_reason` and therefore recounts the
+discarded rows.
 
-## Mise à jour vers 1.6.2
+## Updating to 1.6.2
 
-La 1.6.2 apporte L117 (amendement de 0034) : sans migration, un simple
-redémarrage des exécuteurs. **Ce que verra l'exploitation** : la prochaine
-nouvelle session d'un agent au forfait ira au compte le plus en retard sur
-son rythme, en premier à un compte jamais utilisé. Une bascule
-(`account_switches`, type `bascule`) est donc attendue vers le secondaire,
-puis le tertiaire, journalisée avec sa raison (« sans relevé : 0 % utilisé,
-le plus en retard sur son rythme ; avant : … »). Les sessions en cours
-restent sur leur compte tant qu'il est sous son seuil. Vérifier, avant la
-mise à jour, que les identifiants des comptes jamais utilisés sont présents
-(`ameesh accounts list`, état `ok`) : c'est la première fois qu'ils serviront.
-`ameesh --version` (et la première ligne de `ameesh doctor`) dit la version
-installée : vérifier « ameesh 1.6.2 » sur chaque hôte après la mise à jour.
-Retour arrière : l'ancien code, sans autre geste.
+1.6.2 brings L117 (amendment of 0034): no migration, a simple
+restart of the runners. **What operations will see**: the next
+new session of a plan agent will go to the account furthest behind
+its pace, first to a never-used account. A switch
+(`account_switches`, type `bascule`) is therefore expected to the secondary,
+then the tertiary, logged with its reason ("sans relevé : 0 % utilisé,
+le plus en retard sur son rythme ; avant : …" (no reading: 0 % used, furthest behind its pace; before: …)). Running sessions
+stay on their account as long as it is below its threshold. Before the
+update, check that the credentials of never-used accounts are present
+(`ameesh accounts list`, status `ok`): this is the first time they will be used.
+`ameesh --version` (and the first line of `ameesh doctor`) states the installed
+version: check for "ameesh 1.6.2" on each host after the update.
+Rollback: the old code, with no other action.
 
-## Migrer avant d'installer (L151)
+## Migrate before installing (L151)
 
-**Constat du 10/10.** Un `agent-mail send` a échoué sur une colonne absente,
-entre `poste.sh installer` et `poste.sh migrer`. Les exécuteurs gardent
-l'ancien code en mémoire jusqu'à leur redémarrage, mais le venv sert aussi
-chaque commande que lancent les agents (`agent-mail send`, `ameesh work`…) :
-dès l'installation, ces commandes prennent le nouveau code, qui lit des
-colonnes que la base n'a pas encore.
+**Finding of 10/10.** An `agent-mail send` failed on a missing column,
+between `poste.sh installer` and `poste.sh migrer`. Runners keep
+the old code in memory until they restart, but the venv also serves
+every command the agents run (`agent-mail send`, `ameesh work`…):
+as soon as it is installed, these commands pick up the new code, which reads
+columns the database does not have yet.
 
-**Choix : inverser l'ordre, plutôt que rendre le code tolérant.** Un code
-tolérant devrait vérifier la présence de chaque nouvelle colonne à chaque
-requête, dans chaque lot à venir : un oubli suffit pour retrouver la panne,
-et ces gardes ne seraient jamais retirées. Les migrations du dépôt sont,
-elles, additives presque toujours (colonnes nullables ou avec défaut, tables
-neuves, contraintes remplacées) : le code d'avant tourne sans erreur sur une
-base migrée, ce que chaque mise à jour depuis L60 vérifie déjà. On migre
-donc **d'abord**, puis on installe, puis on redémarre.
+**Choice: reverse the order, rather than make the code tolerant.** Tolerant
+code would have to check for the presence of each new column on every
+query, in every future lot: a single omission is enough to bring the outage back,
+and these guards would never be removed. The repository's migrations, for
+their part, are almost always additive (nullable columns or with a default, new
+tables, replaced constraints): the previous code runs without error on a
+migrated database, which every update since L60 already verifies. So we migrate
+**first**, then install, then restart.
 
-**Ordre des étapes, côté poste** (les sections précédentes restent valables
-pour le contenu de chaque version) :
+**Order of steps, workstation side** (the previous sections remain valid
+for the content of each version):
 
 1. `poste.sh verifier`, `poste.sh sauvegarder`.
-2. `poste.sh migrer [REF]` : extrait l'instantané `src-<sha>` de REF et lance
-   **son** `ameesh migrate --additive-only`, sans l'installer
-   (`PYTHONPATH=<instantané>/src`, avec le Python du venv). Base du mesh, une
-   seule fois, puis ancienne base. `migrate --dry-run` affiche d'abord chaque
-   migration manquante, « additive » ou « NON additive » avec la raison.
-3. `poste.sh installer [REF]` : refuse tant que `doctor --probe` du nouveau
-   code signale une migration manquante, sur la base du mesh ou l'ancienne.
-4. `poste.sh role`, `poste.sh redemarrer`, puis `vm.sh installer [REF]` et
-   `vm.sh redemarrer`. **`vm.sh installer` refuse aussi** tant que la base du
-   mesh n'a pas toutes les migrations de REF (lues dans le clone du serveur,
-   `src/ameesh/migrations/`, comparées à `schema_migrations`) ;
-   `vm.sh redemarrer` fait le même contrôle pour le code installé (il
-   remplace le contrôle figé « 0041 à 0047 »).
+2. `poste.sh migrer [REF]`: extracts the `src-<sha>` snapshot of REF and runs
+   **its** `ameesh migrate --additive-only`, without installing it
+   (`PYTHONPATH=<instantané>/src`, with the venv's Python). Mesh database, only
+   once, then the old database. `migrate --dry-run` first displays each
+   missing migration, "additive" or "NON additive" (NOT additive) with the reason.
+3. `poste.sh installer [REF]`: refuses as long as `doctor --probe` of the new
+   code reports a missing migration, on the mesh database or the old one.
+4. `poste.sh role`, `poste.sh redemarrer`, then `vm.sh installer [REF]` and
+   `vm.sh redemarrer`. **`vm.sh installer` also refuses** as long as the mesh
+   database does not have all of REF's migrations (read from the server's clone,
+   `src/ameesh/migrations/`, compared with `schema_migrations`);
+   `vm.sh redemarrer` does the same check for the installed code (it
+   replaces the hard-coded "0041 to 0047" check).
 5. `poste.sh controler`, `vm.sh controler`.
 
-**Ce qui est additif.** `ameesh migrate --additive-only` n'applique rien
-(code 3) si une migration manquante contient un geste qui casse le code
-d'avant : `drop table`, `drop column`, `drop schema|type`, une vue ou une
-fonction supprimée sans être recréée dans la même migration, un renommage,
-un changement de type, `set not null`, `add column … not null` sans défaut,
-`truncate`, `delete from`. Ce que l'examen du texte ne voit pas (une
-contrainte resserrée, une fonction réécrite qui change de comportement), la
-migration le déclare par un commentaire `-- ameesh: non additive`. Toutes
-les migrations livrées jusqu'à 0051 sont additives (vérifié par
+**What is additive.** `ameesh migrate --additive-only` applies nothing
+(code 3) if a missing migration contains an action that breaks the previous
+code: `drop table`, `drop column`, `drop schema|type`, a view or a
+function deleted without being recreated in the same migration, a rename,
+a type change, `set not null`, `add column … not null` without a default,
+`truncate`, `delete from`. What examining the text cannot see (a
+tightened constraint, a rewritten function that changes behavior), the
+migration declares with a `-- ameesh: non additive` comment. All
+migrations delivered up to 0051 are additive (verified by
 `tests/test_migrations_additives.py`).
 
-**Migration non additive : procédure à part.** `poste.sh migrer` s'arrête
-avant d'écrire. On revient alors à l'ancien ordre, d'affilée et sans tarder,
-en connaissant la fenêtre où les commandes des agents échouent :
-`MIGRER_APRES=1 poste.sh installer REF`, `poste.sh migrer REF` (REF installé :
-toutes ses migrations passent), `poste.sh redemarrer`. Une telle migration
-se prépare et se propose au propriétaire (consigne de l'orchestrateur,
-« Livraison et déploiements ») ; le retour arrière demande alors la
-sauvegarde de la base.
+**Non-additive migration: separate procedure.** `poste.sh migrer` stops
+before writing. We then go back to the old order, in one go and without delay,
+knowing the window during which the agents' commands fail:
+`MIGRER_APRES=1 poste.sh installer REF`, `poste.sh migrer REF` (REF installed:
+all its migrations apply), `poste.sh redemarrer`. Such a migration
+is prepared and proposed to the owner (orchestrator prompt,
+"Livraison et déploiements" (Delivery and deployments)); rollback then requires
+the database backup.
 
-**Dépendance nouvelle.** Le nouveau code est lancé avec les paquets du venv
-en place. Si REF ajoute une dépendance dont `ameesh migrate` a besoin,
-`migrer` échoue à l'import : installer d'abord cette dépendance dans le venv
-(`pip install <paquet>`), puis reprendre à `migrer`.
+**New dependency.** The new code is run with the packages of the venv
+in place. If REF adds a dependency that `ameesh migrate` needs,
+`migrer` fails at import: first install that dependency in the venv
+(`pip install <paquet>`), then resume at `migrer`.
 
 ## Update to 1.10.0 (path B, mediated executor)
 
@@ -1314,22 +1314,22 @@ enrolled).
 
 ---
 
-## Risques et parades
+## Risks and mitigations
 
-| Risque | Parade |
+| Risk | Mitigation |
 |---|---|
-| deux boucles sur une même session | arrêt v0 **et mort du groupe** avant tout démarrage v1 (et l'inverse) ; bail exclusif côté v1 ; `ameesh list` après chaque étape |
-| la base tombe pendant la bascule | la CLI repasse sur les fichiers v0 avec un avertissement ; les hooks restent silencieux |
-| un message importé deux fois | `import-v0` déplace les fichiers dans `imported/` et ne réécrit pas un message déjà au fil |
-| canon invalide ou illisible | aucune nouvelle réclamation des agents du canon (fail closed) ; baux et tours en cours intacts ; `ameesh canon check` dit pourquoi |
-| un agent mal placé ou sans responsable | non réclamable (R14, C4) ; raison dans `status_text` |
-| mise à jour d'un hôte sans dossiers de travail déclarés (L31) | repli transitoire sur l'ancien `cwd` (L35) ; arrêter l'exécuteur ancien, installer L35 et valider avec lui **avant** de publier `work_dirs` / `{agent}` ; `canon check` avertit `admission-cwd-inherited` / `host-work-dir-missing` |
-| retour à 1.3.0 avec un canon L35 | chemins `{agent}` littéraux, `work_dirs` ignoré : rendre le canon compatible (un dossier par équipe) et arrêter les agents qui ont besoin d'un worktree propre **avant** tout sync 1.3.0 |
-| une session externe prend l'identité d'un autre agent par son dossier (hooks v0) | hooks passés à la v1 (décision 0030, L41) : identité par `AGENT_MAIL_NAME` ou liaison de session explicite, PID ancêtre contrôlé ; sans liaison, rien n'est remis |
-| une action irréversible sans humain | la porte exige un reçu lié à l'empreinte, à usage unique, avec échéance ; issue inconnue → `reconcile`, jamais de nouvelle tentative automatique |
-| ameesh-approve exposé trop tôt | rien n'est mis en ligne avant la revue de L7 ; exposition = acte du propriétaire ; service sur la boucle locale seulement |
-| faux enrôlement de passkey | l'enrôlement n'est qu'une proposition ; confirmation hors bande et PR revue du canon avant toute activation |
-| PR non fusionnée qui se déclare canonique (`federation.yaml`) | la branche de confiance vient de l'hôte, du dernier commit appliqué ou de l'amorçage, jamais du commit lu : refus |
-| deux `canon sync` concurrents (deux hôtes, un ancien canon) | verrou du registre pris avant le contrôle, monotonie : un ancien commit ne réactive jamais une passkey retirée |
-| reçu rejoué | nonce consommé au lancement, en base (`mesh_consumed_nonces`) |
-| le disque du PC meurt | `pg_dump` quotidien hors du PC, exercice de restauration de l'étape 1 |
+| two loops on the same session | v0 stop **and death of the group** before any v1 start (and the reverse); exclusive lease on the v1 side; `ameesh list` after each step |
+| the database goes down during the cutover | the CLI falls back to the v0 files with a warning; the hooks stay silent |
+| a message imported twice | `import-v0` moves the files into `imported/` and does not rewrite a message already in the thread |
+| invalid or unreadable canon | no new claim of canon agents (fail closed); leases and running turns intact; `ameesh canon check` says why |
+| a misplaced agent or one without a lead | not claimable (R14, C4); reason in `status_text` |
+| update of a host without declared working directories (L31) | transitional fallback to the old `cwd` (L35); stop the old runner, install L35 and validate with it **before** publishing `work_dirs` / `{agent}`; `canon check` warns `admission-cwd-inherited` / `host-work-dir-missing` |
+| rollback to 1.3.0 with an L35 canon | literal `{agent}` paths, `work_dirs` ignored: make the canon compatible (one folder per team) and stop the agents that need their own worktree **before** any 1.3.0 sync |
+| an external session takes another agent's identity through its folder (v0 hooks) | hooks switched to v1 (decision 0030, L41): identity through `AGENT_MAIL_NAME` or explicit session binding, ancestor PID checked; without a binding, nothing is delivered |
+| an irreversible action without a human | the gate requires a receipt bound to the fingerprint, single-use, with an expiry; unknown outcome → `reconcile`, never an automatic retry |
+| ameesh-approve exposed too early | nothing goes live before the L7 review; exposure = owner's act; service on the loopback only |
+| fake passkey enrollment | enrollment is only a proposal; out-of-band confirmation and reviewed canon PR before any activation |
+| unmerged PR declaring itself canonical (`federation.yaml`) | the trusted branch comes from the host, the last applied commit or the bootstrap, never from the commit read: refusal |
+| two concurrent `canon sync` runs (two hosts, an old canon) | registry lock taken before the check, monotonicity: an old commit never reactivates a removed passkey |
+| replayed receipt | nonce consumed at launch, in the database (`mesh_consumed_nonces`) |
+| the PC's disk dies | daily `pg_dump` off the PC, step 1 restore drill |

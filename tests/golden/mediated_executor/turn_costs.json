@@ -31,7 +31,10 @@
       "cum_input_tokens": 50000,
       "cum_cached_input_tokens": 30000,
       "cum_output_tokens": 4000,
-      "spend_key": "turn-77"
+      "spend_key": "turn-77",
+      "void_reason": null,
+      "price_fallback": null,
+      "cache_write_tokens": 0
      },
      "fence": {
       "agent": "inge-front",

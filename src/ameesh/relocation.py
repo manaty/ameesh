@@ -25,10 +25,17 @@ FALLBACK_SUMMARY = (
 )
 
 
-def _score(reading: dict) -> tuple:
+def _score(reading: dict, offer: dict | None = None) -> tuple:
     """Classement d'un hôte disponible : le plus de mémoire, puis le moins de
-    charge, puis le nom (stable)."""
+    charge, puis le nom (stable).
+
+    L159d: a lending host (an offer `policy.lend` in its Host fiche) ranks by
+    its lendable memory, capped by the offer, and not by its raw free memory:
+    what its application leaves free is not all ours to take."""
     mem = reading.get("mem_available_bytes")
+    if offer is not None:
+        lent = resources.offered(reading, offer)
+        mem = lent["memory_bytes"] if lent is not None else None
     load = reading.get("load1")
     return (-(mem if mem is not None else -1),
             load if load is not None else float("inf"))
@@ -67,7 +74,8 @@ def plan(admitted_hosts, current_host: str, *, db, current_limits=None,
              if not c["pressure"]["blocked"]]
     if not dispo:
         return None
-    meilleur = min(dispo, key=lambda c: _score(c["reading"]) + (c["host"],))
+    meilleur = min(dispo, key=lambda c: _score(
+        c["reading"], ((c["pressure"].get("limits") or {}).get("lend"))) + (c["host"],))
     return {
         "target": meilleur["host"],
         "keep_session": bool(shared_sessions),

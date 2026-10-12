@@ -100,7 +100,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    latest_gauges assigners record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
    budgets         limits put events
-   turn_resources  open_turn close_turn mark_orphan get open_by_agent orphans
+   turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
                    stale_running churn
    housekeeping    log recent summary last_measure register_worktree worktrees
                    set_worktree_status
@@ -465,12 +465,18 @@ class TurnCosts(Domain):
                cum_output_tokens: int | None, account: str | None = None,
                spend_key: str | None = None, source: str | None = None,
                executor: str | None = None, lease_owner: str | None = None,
-               lease_epoch: int | None = None) -> bool:
+               lease_epoch: int | None = None, void_reason: str | None = None,
+               price_fallback: str | None = None,
+               cache_write_tokens: int | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
         telle quelle et n'a rien écrit. `account` (L30, migration 0028) : le
         compte qui a porté le tour ; None = colonne non écrite. `spend_key`
         (L60, migration 0041) : clé du marqueur comptable ; une ligne portant
-        déjà cette clé n'est pas réécrite (faux). Vrai si la ligne est écrite.
+        déjà cette clé n'est pas réécrite (faux). `void_reason` (L225,
+        migration 0043) : la ligne naît écartée des sommes ; `price_fallback`
+        (L225, migration 0059) : tour facturé au repli prudent ;
+        `cache_write_tokens` (L225, 0059) : écritures de cache Claude du tour ;
+        None = colonne non écrite. Vrai si la ligne est écrite.
         `source`, `executor`, `lease_owner`, `lease_epoch` (L111, migration
         0064) : `relay` pour la mesure du relais de modèle, `device` pour la
         déclaration d'un appareil médié (hors plafond) ; None = colonnes non
@@ -492,6 +498,15 @@ class TurnCosts(Domain):
         ]from_ts, to_ts] (epoch) ; les lignes écartées (0043) ne comptent pas.
         Sert à comparer l'estimation à la baisse réelle d'un solde sur le même
         intervalle."""
+
+    @abc.abstractmethod
+    def unpriced(self, since_ts: float, prefix: str) -> list[dict]:
+        """L225 : tours écrits depuis `since_ts` (epoch) facturés au repli
+        prudent (`price_fallback`) ou écartés faute de barème (`void_reason`
+        commençant par `prefix`), regroupés par agent, harnais et modèle :
+        agent, harness, model, turns, voided (tours écartés), usd (des tours
+        gardés), input_tokens, cached_input_tokens, output_tokens, first_ts,
+        last_ts. Lecture seule."""
 
     @abc.abstractmethod
     def ledger(self, *, since_ts: float | None = None) -> list[dict]:
@@ -2012,7 +2027,8 @@ class HostResources(Domain):
 
     Un relevé porte : hôte, instant, mémoire disponible, swap utilisé, charge
     1 minute, nombre de CPU, disque libre (et le dossier mesuré), nombre de
-    tours en cours. Les mesures illisibles sont NULL : on ne devine pas.
+    tours en cours ; L159d: PSI, application and guest shares, lendable
+    capacity. Les mesures illisibles sont NULL : on ne devine pas.
     Instants rendus en secondes epoch (`sampled_ts`).
     """
 
@@ -2037,6 +2053,27 @@ class HostResources(Domain):
     @abc.abstractmethod
     def turns_in_progress(self, host: str) -> int:
         """Nombre d'agents de l'hôte en tour (statut `running`, bail vivant)."""
+
+    @abc.abstractmethod
+    def record_harness_version(self, host: str, harness: str, *, path: str | None,
+                               version: str | None, raw: str | None) -> None:
+        """L120: the last version read of `harness` on `host` (one row per
+        pair, replaced)."""
+
+    @abc.abstractmethod
+    def harness_versions(self, host: str | None = None) -> list[dict]:
+        """L120: the versions read, by harness then host: `host`, `harness`,
+        `path`, `version`, `raw`, `observed_ts` (epoch seconds)."""
+
+    @abc.abstractmethod
+    def lend_basis(self, host: str, since_s: float, slot_s: float,
+                   percentile: float) -> dict:
+        """L159d: history behind the lendable capacity, over the last
+        `since_s` seconds: `samples`, `span_s` (time covered by readings
+        with `app_cpu`), `min_free_mem_bytes` (lowest `mem_available +
+        guest_mem`, over readings where both are known) and
+        `app_cpu_p95` (the `percentile` of the application's CPU averaged
+        per `slot_s` slot); None when not measured."""
 
     @abc.abstractmethod
     def usage(self, host: str, since_s: float) -> dict:
@@ -2083,6 +2120,21 @@ class TurnResources(Domain):
         """Marque `orphan` une ressource qui survit à son tour."""
 
     @abc.abstractmethod
+    def settle(self, turn_id: str) -> None:
+        """L147 : solde (`done`) la ligne d'un tour dont plus rien ne survit
+        (groupe disparu au redémarrage de l'hôte, aucun conteneur en cours)."""
+
+    @abc.abstractmethod
+    def settle_many(self, turn_ids: Sequence[str]) -> int:
+        """#220 r3 : `settle` de plusieurs lignes en une écriture ; le nombre
+        de lignes soldées."""
+
+    @abc.abstractmethod
+    def mark_orphan_many(self, turn_ids: Sequence[str]) -> int:
+        """#220 r3 : `mark_orphan` (sans conteneurs) de plusieurs lignes en une
+        écriture ; seules celles qui n'étaient pas encore `orphan` changent."""
+
+    @abc.abstractmethod
     def get(self, turn_id: str) -> dict | None:
         """La ligne d'un tour (L73 : un conteneur étiqueté par ce tour), ou None."""
 
@@ -2093,6 +2145,13 @@ class TurnResources(Domain):
     @abc.abstractmethod
     def orphans(self, host: str | None = None, limit: int = 50) -> list[dict]:
         """Les lignes `orphan` (de l'hôte si donné), les plus récentes d'abord."""
+
+    @abc.abstractmethod
+    def orphans_started_before(self, host: str, before_ts: float, after_id: int = 0,
+                               limit: int = 500) -> list[dict]:
+        """L147 : les lignes `orphan` de l'hôte ouvertes avant `before_ts`
+        (epoch), d'`id` supérieur à `after_id`, par `id` croissant : une page
+        de `limit` lignes au plus (pagination par `id`)."""
 
     @abc.abstractmethod
     def stale_running(self, older_than_s: float, host: str | None = None) -> list[dict]:

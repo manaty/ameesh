@@ -51,7 +51,8 @@ class TurnCosts(interface.TurnCosts):
                cached_input_tokens, output_tokens, cum_usd, cum_input_tokens,
                cum_cached_input_tokens, cum_output_tokens, account=None,
                spend_key=None, source=None, executor=None, lease_owner=None,
-               lease_epoch=None) -> bool:
+               lease_epoch=None, void_reason=None, price_fallback=None,
+               cache_write_tokens=None) -> bool:
         cols = ["agent", "harness", "turn", "model", "session", "usd",
                 "input_tokens", "cached_input_tokens", "output_tokens",
                 "cum_usd", "cum_input_tokens", "cum_cached_input_tokens",
@@ -71,6 +72,18 @@ class TurnCosts(interface.TurnCosts):
             if value is not None:
                 cols.append(column)
                 values.append(value)
+        if void_reason is not None:
+            # L225 : tour sans tarif connu ni majorant sûr, écarté dès l'écriture
+            cols.append("void_reason")
+            values.append(void_reason)
+        if price_fallback is not None:
+            # L225 (migration 0059) : tour facturé au repli prudent, gardé
+            cols.append("price_fallback")
+            values.append(price_fallback)
+        if cache_write_tokens is not None:
+            # L225 (0059) : écritures de cache Claude, pour `cost correct`
+            cols.append("cache_write_tokens")
+            values.append(int(cache_write_tokens))
         suffix = ""
         if spend_key is not None:
             # L60 (migration 0041) : un marqueur comptable n'écrit qu'une ligne,
@@ -118,6 +131,21 @@ class TurnCosts(interface.TurnCosts):
             tuple([float(from_ts), float(to_ts)] + names))
         return float(rows[0]["usd"]) if rows else 0.0
 
+    def unpriced(self, since_ts, prefix) -> list[dict]:
+        return self.db.query(
+            "SELECT agent, harness, coalesce(model, '') AS model, count(*) AS turns,"
+            " count(*) FILTER (WHERE void_reason IS NOT NULL) AS voided,"
+            " coalesce(sum(usd) FILTER (WHERE void_reason IS NULL), 0)::float8 AS usd,"
+            " sum(input_tokens)::bigint AS input_tokens,"
+            " sum(cached_input_tokens)::bigint AS cached_input_tokens,"
+            " sum(output_tokens)::bigint AS output_tokens,"
+            " extract(epoch from min(recorded_at))::float8 AS first_ts,"
+            " extract(epoch from max(recorded_at))::float8 AS last_ts"
+            " FROM turn_costs WHERE recorded_at >= to_timestamp(%s)"
+            " AND (price_fallback IS NOT NULL OR starts_with(void_reason, %s))"
+            " GROUP BY agent, harness, coalesce(model, '') ORDER BY agent, harness, model",
+            (float(since_ts), prefix))
+
     # -- corrections tracées (L95, migration 0043) ---------------------------
     def ledger(self, *, since_ts=None) -> list[dict]:
         # `to_jsonb(t)->>'void_reason'` : la colonne n'existe qu'après 0043,
@@ -127,6 +155,7 @@ class TurnCosts(interface.TurnCosts):
                " t.output_tokens, t.cum_usd::float8 AS cum_usd, t.cum_input_tokens,"
                " t.cum_cached_input_tokens, t.cum_output_tokens,"
                " to_jsonb(t)->>'void_reason' AS void_reason,"
+               " (to_jsonb(t)->>'cache_write_tokens')::bigint AS cache_write_tokens,"
                " extract(epoch from t.recorded_at)::float8 AS recorded_ts"
                " FROM turn_costs t")
         params: tuple = ()
