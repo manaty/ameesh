@@ -82,18 +82,18 @@ class ActivityDatabaseTest(PgTestCase):
         env = self.env(AGENT_MAIL_NAME="worker", AMEESH_RUNNER_ID="test-runner",
                        AMEESH_LEASE_EPOCH="7")
         for suffix in ([], ["--json"]):
-            allowed = self.cli("activity", "worker", *suffix, env=env)
+            allowed = self.mesh("activity", "worker", *suffix, env=env)
             self.assertEqual(allowed.returncode, 0, allowed.stderr)
             self.assertNotIn("TEST_PRIVATE_VALUE", allowed.stdout)
             self.assertIn("[redacted]", allowed.stdout)
-            denied = self.cli("activity", "coord", *suffix, env=env)
+            denied = self.mesh("activity", "coord", *suffix, env=env)
             self.assertEqual(denied.returncode, 2)
             self.assertEqual(denied.stdout, "")
-        expired = self.cli("activity", "worker", "--json", env=self.env(
+        expired = self.mesh("activity", "worker", "--json", env=self.env(
             AGENT_MAIL_NAME="worker", AMEESH_RUNNER_ID="test-runner", AMEESH_LEASE_EPOCH="6"))
         self.assertEqual(expired.returncode, 2)
         self.assertEqual(expired.stdout, "")
-        explicit = self.cli("activity", "worker", "--json", env=self.env(AGENT_MAIL_NAME="worker"))
+        explicit = self.mesh("activity", "worker", "--json", env=self.env(AGENT_MAIL_NAME="worker"))
         self.assertEqual(explicit.returncode, 2)
         self.assertEqual(explicit.stdout, "")
 
