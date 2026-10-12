@@ -26,14 +26,19 @@ class ReaderTest(unittest.TestCase):
             if content is not None:
                 with open(path, "w", encoding="utf-8") as fh:
                     fh.write(content if isinstance(content, str) else json.dumps(content))
-            return resources.guard_restart(path)
+            return resources.guard_restart(path, now=1060.0)
 
     def test_the_last_restart_of_the_state(self):
+        # with its age on the host's clock (codex #288 r1)
         self.assertEqual(self.read({"schema": "ameesh-host-state/1",
-                                    "guard": {"restart": RESTART}}), RESTART)
+                                    "guard": {"restart": RESTART}}),
+                         dict(RESTART, age_s=60.0))
 
     def test_none_without_a_readable_well_typed_record(self):
-        for content in (None, "{", [], {"guard": None}, {"guard": {}},
+        # codex #288 r1: a `guard` that is not an object never raises (the
+        # whole reading of the host would be lost)
+        for content in (None, "{", [], {"guard": None}, {"guard": {}}, {"guard": "invalid"},
+                        {"guard": [1]}, {"guard": {"restart": [1]}},
                         {"guard": {"restart": dict(RESTART, ts=True)}},
                         {"guard": {"restart": dict(RESTART, ts="1000")}},
                         {"guard": {"restart": dict(RESTART, ts=float("inf"))}},
@@ -64,6 +69,19 @@ class AlertTest(unittest.TestCase):
                 mock.patch.object(exploitation, "_housekeeping_alerts", return_value=[]):
             return [a for a in exploitation._host_alerts(None, None, now=now)
                     if a["type"] == "guard_restart"]
+
+    def test_the_day_is_counted_on_the_host_clock(self):
+        # codex #288 r1: a host 5 min ahead, or 2 days behind, of the
+        # supervisor: a fresh restart (10 s old on the host when collected,
+        # 5 s ago) is raised; one a day old on the host is not
+        for skew in (300.0, -2 * 86400.0):
+            fresh = dict(RESTART, ts=10000.0 + skew - 10, age_s=10.0)
+            found = self.alerts({"guard_restart": fresh, "sampled_ts": 9995.0}, 10000.0)
+            self.assertEqual(len(found), 1, skew)
+            self.assertEqual(found[0]["since"], round(fresh["ts"], 3))
+            old = dict(fresh, age_s=86400.0 - 4)
+            self.assertEqual(self.alerts({"guard_restart": old, "sampled_ts": 9995.0},
+                                         10000.0), [], skew)
 
     def test_raised_for_a_day_one_alert_per_restart(self):
         [alert] = self.alerts({"guard_restart": RESTART}, 1060.0)

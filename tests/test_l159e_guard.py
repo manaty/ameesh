@@ -1319,6 +1319,23 @@ class RestartTest(unittest.TestCase):
         self.at(g, 5000.0)
         self.assertEqual(len(self.starts), 2)
 
+    def test_a_restarted_guard_keeps_the_last_restart(self):
+        # codex #288 r1: the guard restarted after a restart of units keeps
+        # publishing it (the source of the `guard_restart` alert)
+        g = self.stop_then_clear(self.guard())
+        restart = self.at(g, 1100.0)["guard"]["restart"]
+        g = self.guard()
+        self.assertEqual(self.at(g, 1105.0)["guard"]["restart"], restart)
+        with open(self.cfg.state_path) as fh:
+            self.assertEqual(json.load(fh)["guard"]["restart"], restart)
+        # an ill-typed record is not taken back
+        with open(self.cfg.state_path) as fh:
+            saved = json.load(fh)
+        saved["guard"]["restart"] = {"ts": "soon", "started": [], "skipped": {}}
+        with open(self.cfg.state_path, "w") as fh:
+            json.dump(saved, fh)
+        self.assertNotIn("restart", self.at(self.guard(), 1110.0)["guard"])
+
     def test_never_a_unit_stopped_since_by_someone_else(self):
         g = self.stop_then_clear(self.guard())
         # the owner started @2 and stopped it again; @1 is running again

@@ -1222,6 +1222,10 @@ class Guard:
             # a freeze retried after a restart gets only what its episode has left
             self.enforcer.restore_episode(previous["guard"].get("freeze"))
             self.enforcer.restore_stopped(previous["guard"].get("stopped"))
+            # the last restart stays published: a restarted guard never
+            # erases the source of the `guard_restart` alert (codex #288 r1)
+            self.enforcer.restarted = resources.restart_record(
+                previous["guard"].get("restart"))
         # seq keeps growing across restarts: a reader ignores a seq it saw
         self.seq = previous.get("seq") if isinstance(previous.get("seq"), int) else 0
         # so do the level, the freeze bound and the drain deadline
