@@ -254,7 +254,9 @@ class InstallPilotTest(unittest.TestCase):
         func = text[text.index("mounts_under() {"):]
         func = func[:func.index("\n}\n") + 3]
         def under(path):
-            return subprocess.run(["bash", "-c", func + 'mounts_under "$1"', "-", path]).returncode
+            return subprocess.run(["bash", "-c", "MOUNTINFO=/proc/self/mountinfo\n" + func
+                                   + 'mounts_under "$1"', "-", path],
+                                  stdin=subprocess.DEVNULL, timeout=30).returncode
         self.assertEqual(under("/proc"), 0)          # /proc itself
         if os.path.ismount("/dev/shm"):
             self.assertEqual(under("/dev"), 0)       # /dev/shm beneath
@@ -274,6 +276,96 @@ class InstallPilotTest(unittest.TestCase):
                        stdin=lend)
         self.assertNotIn("refused", res.stderr)
         self.assertIn("(accepted)", res.stderr)
+
+    @staticmethod
+    def mountinfo(tmp, *points):
+        # a mountinfo of the test's own: "/" and the given mount points
+        path = os.path.join(tmp, "mountinfo")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n")
+            for i, point in enumerate(points):
+                fh.write("%d 22 8:1 /data/x %s rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+                         % (40 + i, point))
+        return path
+
+    def test_a_root_through_a_symbolic_link_is_refused(self):
+        # codex #383 r3 P1: mounts and records are compared as resolved paths
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            os.makedirs(os.path.join(tmp, "data"))
+            os.symlink(os.path.join(tmp, "data"), os.path.join(tmp, "link"))
+            res = self.dry("--allow-rootfs", "--root", os.path.join(tmp, "link", "guest"))
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("goes through a symbolic link: give %s/data/guest" % tmp, res.stderr)
+
+    def test_purge_keeps_a_tree_with_a_bind_mount_beneath(self):
+        # codex #383 r3 P1: a bind of the same filesystem, from mountinfo;
+        # what stays keeps its record
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            work = os.path.join(tmp, "guest", "work")
+            os.makedirs(os.path.join(work, "shared"))
+            os.makedirs(os.path.join(tmp, "data"))
+            os.symlink(os.path.join(tmp, "data"), os.path.join(tmp, "link"))
+            linked = os.path.join(tmp, "link")
+            state = os.path.join(tmp, "state")
+            with open(state, "w", encoding="utf-8") as fh:
+                fh.write("guest-tree %s\nguest-tree %s\n" % (work, linked))
+            env = dict(os.environ, PILOT_TEST_STATE=state,
+                       PILOT_TEST_MOUNTINFO=self.mountinfo(tmp, work + "/shared"))
+            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--uninstall", "--purge"],
+                                 capture_output=True, text=True, env=env)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            out = res.stdout
+            self.assertNotIn("rm -rf --one-file-system %s" % work, out)
+            self.assertNotIn("rm -rf --one-file-system %s" % linked, out)
+            self.assertIn("kept %s: a mount point is there or beneath" % work, out)
+            self.assertIn("kept %s: it goes through a symbolic link" % linked, out)
+            self.assertIn("kept in %s: guest-tree %s guest-tree %s" % (state, linked, work), out)
+            self.assertNotIn("+ rm -f %s" % state, out)
+
+    def test_a_failed_userdel_keeps_its_record(self):
+        # codex #383 r3 P3: the guest still has processes; a later purge retries
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "state")
+            with open(state, "w", encoding="utf-8") as fh:
+                fh.write("user\n")
+            env = dict(os.environ, PILOT_TEST_STATE=state, PILOT_TEST_FAIL="userdel",
+                       PILOT_TEST_MOUNTINFO=self.mountinfo(tmp))
+            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--uninstall", "--purge"],
+                                 capture_output=True, text=True, env=env)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("+ userdel ameesh-guest", res.stdout)
+            self.assertIn("kept user ameesh-guest: userdel failed", res.stdout)
+            self.assertIn("kept in %s: user" % state, res.stdout)
+            self.assertNotIn("+ rm -f %s" % state, res.stdout)
+            env.pop("PILOT_TEST_FAIL")
+            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--uninstall", "--purge"],
+                                 capture_output=True, text=True, env=env)
+            self.assertIn("+ rm -f %s" % state, res.stdout)
+
+    def test_a_bind_mounted_root_is_held_to_disk_max(self):
+        # codex #383 r3 P2: a directory bind is a mount (mountinfo), and its
+        # filesystem's size is held to disk_max
+        lend = json.dumps({"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1MiB"})
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            root = os.path.join(tmp, "pilot")
+            os.makedirs(root)
+            env = dict(os.environ, PILOT_TEST_MOUNTINFO=self.mountinfo(tmp, root))
+            run = lambda *a: subprocess.run(
+                ["bash", self.SCRIPT, "--dry-run", "--host", "vm-test", "--root", root,
+                 "--lend", "/dev/stdin", *a], capture_output=True, text=True, input=lend, env=env)
+            res = run()
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertNotIn("not a mount point", res.stdout)
+            self.assertIn("refused for real", res.stderr)
+            self.assertIn("(accepted)", run("--accept-larger-volume").stderr)
+            # not in mountinfo: not a volume, whatever the directory
+            env["PILOT_TEST_MOUNTINFO"] = self.mountinfo(tmp)
+            res = run()
+            self.assertIn("is not a mount point", res.stdout)
+            self.assertIn("not a volume of its own", res.stderr)
 
     def test_observe_takes_the_caps_off(self):
         # codex #383 r1 P2: a stopped guard leaves its caps; observe removes them

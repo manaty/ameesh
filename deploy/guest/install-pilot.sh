@@ -126,10 +126,27 @@ case "$ROOT" in /|/home|/tmp|/srv|/root|/opt|/usr|/etc|/var|/run|/mnt) die "--ro
 [ "$PURGE" = 0 ] || [ "$MODE" = uninstall ] || die "--purge goes with --uninstall"
 # the tests' dry runs read a state of their own; a real run reads only $STATE
 [ "$DRY" = 1 ] && [ -n "${PILOT_TEST_STATE:-}" ] && STATE=$PILOT_TEST_STATE
+# the mounts, binds included: read in mountinfo, never guessed (a dry run of
+# the tests may read a mountinfo of its own)
+MOUNTINFO=/proc/self/mountinfo
+[ "$DRY" = 1 ] && [ -n "${PILOT_TEST_MOUNTINFO:-}" ] && MOUNTINFO=$PILOT_TEST_MOUNTINFO
+# a path through a symbolic link is refused: mounts and records are compared
+# as resolved paths, so the paths themselves must be resolved
+resolved() { [ "$(realpath -m -- "$1")" = "$1" ]; }
+if [ "$MODE" = install ]; then
+  resolved "$ROOT" || die "--root $ROOT goes through a symbolic link: give $(realpath -m -- "$ROOT")"
+  resolved "$VENV" || die "$VENV goes through a symbolic link"
+fi
 
-# run CMD…: executes, or prints it under --dry-run
+# run CMD…: executes, or prints it under --dry-run (where the tests may
+# make one command fail: PILOT_TEST_FAIL=<its name>)
 run() {
-  if [ "$DRY" = 1 ]; then echo "+ $*"; else "$@"; fi
+  if [ "$DRY" = 1 ]; then
+    echo "+ $*"
+    [ "$1" != "${PILOT_TEST_FAIL:-}" ]
+  else
+    "$@"
+  fi
 }
 
 # put PATH MODE OWNER < content: writes a file atomically, or prints it
@@ -166,10 +183,15 @@ created() { grep -qxF "$1" "$STATE" 2>/dev/null; }
 absent() { [ ! -e "$1" ] && [ ! -L "$1" ]; }
 
 # mounts_under PATH: a mount point at PATH or beneath it (a bind mount of
-# the same filesystem included, which rm --one-file-system would cross)
+# the same filesystem included, which rm --one-file-system would cross);
+# PATH is a resolved path, like mountinfo's
 mounts_under() {
   awk -v p="$1" '{ if ($5 == p || index($5, p "/") == 1) found = 1 } END { exit !found }' \
-    /proc/self/mountinfo
+    "$MOUNTINFO"
+}
+# is_mount PATH: PATH is a mount point (a bind mount of a directory included)
+is_mount() {
+  awk -v p="$1" '$5 == p { found = 1 } END { exit !found }' "$MOUNTINFO"
 }
 
 # purgeable PATH: a directory of its own, two levels deep at least, never
@@ -386,6 +408,9 @@ if [ "$MODE" = uninstall ]; then
           kept+=("$kind $path")
         elif ! purgeable "$path"; then
           echo "not removed: $path (recorded, but not a path of its own)"
+        elif ! resolved "$path"; then
+          echo "kept $path: it goes through a symbolic link now (resolve it, then --purge again)"
+          kept+=("$kind $path")
         elif mounts_under "$path"; then
           echo "kept $path: a mount point is there or beneath (unmount it, then --purge again)"
           kept+=("$kind $path")
@@ -399,7 +424,13 @@ if [ "$MODE" = uninstall ]; then
       done < <(tac "$STATE")
     fi
     if created user; then
-      if [ "$offload" = 0 ]; then run userdel "$GUEST" || true; else kept+=("user"); fi
+      if [ "$offload" = 1 ]; then
+        kept+=("user")
+      elif ! run userdel "$GUEST"; then
+        # processes left, for instance: kept, a later purge tries again
+        echo "kept user $GUEST: userdel failed (its processes?), --purge again later"
+        kept+=("user")
+      fi
     fi
     if [ ${#kept[@]} -gt 0 ]; then
       echo "kept in $STATE: ${kept[*]}"
@@ -429,7 +460,8 @@ for cmd in python3 systemctl useradd systemd-tmpfiles; do
   command -v "$cmd" >/dev/null || [ "$DRY" = 1 ] || die "missing $cmd"
 done
 [ -f /sys/fs/cgroup/cgroup.controllers ] || [ "$DRY" = 1 ] || die "cgroups v2 required"
-if [ "$ALLOW_ROOTFS" = 0 ] && ! mountpoint -q "$ROOT" 2>/dev/null; then
+if is_mount "$ROOT"; then ROOT_MOUNTED=1; else ROOT_MOUNTED=0; fi
+if [ "$ALLOW_ROOTFS" = 0 ] && [ "$ROOT_MOUNTED" = 0 ]; then
   [ "$DRY" = 1 ] && echo "warning: $ROOT is not a mount point (--allow-rootfs needed for real)" \
     || die "$ROOT is not a mount point: attach a volume (study §4.1), or --allow-rootfs"
 fi
@@ -454,10 +486,15 @@ offer, problems, unknown = capacity_guard.parse_lend(lend)
 if problems:
     sys.exit("invalid offer: " + "; ".join(problems))
 # disk_max: only the size of the guest volume holds it (no quota); a bigger
-# volume is refused, unless accepted (argv[6]); a dry run says so (argv[7])
+# volume is refused, unless accepted (argv[6]); a dry run says so (argv[7]);
+# a mount point, binds included, read in mountinfo by the shell (argv[8])
 root, disk_max = sys.argv[5], offer["disk_max"]
-if os.path.ismount(root):
-    st = os.statvfs(root)
+if sys.argv[8] == "1":
+    # the filesystem under it (a dry run may name a root not made yet)
+    probe = root
+    while not os.path.exists(probe):
+        probe = os.path.dirname(probe)
+    st = os.statvfs(probe)
     size = st.f_blocks * st.f_frsize
     if size > disk_max * 1.05 and sys.argv[6] != "1":
         msg = ("%s holds %.0f GiB, above disk_max %.0f GiB: nothing would hold disk_max "
@@ -474,7 +511,7 @@ else:
           file=sys.stderr)
 print(json.dumps({"host": sys.argv[2], "max_agents": int(sys.argv[3]),
                   "work_path": sys.argv[5], "lend": lend}, indent=2))
-' "$lend_json" "$HOST" "$MAX_AGENTS" "$CHECKOUT/src" "$ROOT" "$ACCEPT_LARGER" "$DRY") \
+' "$lend_json" "$HOST" "$MAX_AGENTS" "$CHECKOUT/src" "$ROOT" "$ACCEPT_LARGER" "$DRY" "$ROOT_MOUNTED") \
   || die "offer or volume refused"
 
 # PATH of the runners: the directory of the DeepSeek harness (`dsh`)

@@ -136,8 +136,10 @@ venv and the guest's directories, only those the script created: it
 records each one, by its absolute path, before creating it
 (`/etc/ameesh/pilot-install.state`); a directory or a secrets file that
 was there before, a tree with a mount point in it, or anything outside them
-stays. What stays keeps its record, so a later `--purge` can still remove
-it. The install refuses a volume bigger than `disk_max` (nothing else
+stays (a mount point is read in `/proc/self/mountinfo`, binds included).
+What stays keeps its record, so a later `--purge` can still remove it,
+the user too when `userdel` fails (its processes still running). A `--root`
+through a symbolic link is refused: give the resolved path. The install refuses a volume bigger than `disk_max` (nothing else
 holds it); `--accept-larger-volume` overrides. Then, outside the host: a canon PR puts
 deepseek5 and deepseek6 back on manaty-mesh-1 and removes `policy.lend`, and
 the host's login role (L56) is dropped. A mounted volume is unmounted and
