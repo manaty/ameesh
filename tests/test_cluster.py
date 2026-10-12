@@ -56,6 +56,8 @@ CONTENUS = {
     "commitments": {"note"},
     "work_item_events": {"note"},
     "work_item_milestones": {"note"},
+    "project_modules": {"schemas", "rules"},
+    "work_module_milestones": {"payload"},
     "mesh_approvals": {"meta"},
     "mesh_approvals_status": {"meta"},
     # L161c (0055) : sortie d'un test en échec

@@ -206,7 +206,10 @@ def add(
         from . import estimates
         minutes = estimates.parse(estimate)
     if type not in ("bug", "evolution"):
-        raise WorkError("unknown type: %r (bug or evolution)" % type)
+        from .modules.storage import ModuleStore
+        if not ModuleStore(db).admits(app or workstream or "", type):
+            raise WorkError("unknown type %r for project %r: enable its module in the canon"
+                            % (type, app or workstream or ""))
     if size not in (None, "") and size not in SIZES:
         raise WorkError("unknown size: %r (s, m or l)" % (size,))
     if not (title or "").strip():
