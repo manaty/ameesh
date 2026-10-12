@@ -3,6 +3,37 @@
 from . import projects, registry, storage, work
 
 
+def agent_project(cfg, db, name):
+    """Registry first, then an unambiguous project in the agent's own canon."""
+    row = registry.get(db, name)
+    if row is None:
+        return ""
+    value = projects.agent_project(row)
+    if value:
+        return value
+    values = set()
+    for canon in work.configured_canons(cfg):
+        if canon.owns(row.get("canon")):
+            agent = canon.agent(name)
+            if agent and agent.team and agent.team.strip():
+                values.add(agent.team.strip())
+    if len(values) > 1:
+        raise work.WorkError("ambiguous project for %s" % name)
+    return next(iter(values), "")
+
+
+def creation_project(cfg, db, creator, explicit=None, *, parent=None):
+    """Omitted project inherits; an explicit blank cannot discard a known project."""
+    if explicit is not None and explicit.strip():
+        return explicit.strip()
+    inherited = agent_project(cfg, db, creator)
+    if not inherited and parent:
+        inherited = (parent.get("app") or "").strip()
+    if explicit is not None and inherited:
+        raise work.WorkError("--app: empty project; creator belongs to %s" % inherited)
+    return inherited if explicit is None else ""
+
+
 def mail_project(cfg, db, sender, recipient, explicit=None):
     """Explicit project, otherwise the sender's project, then the recipient's."""
     if explicit is not None:
@@ -10,22 +41,10 @@ def mail_project(cfg, db, sender, recipient, explicit=None):
         if not value:
             raise work.WorkError("--app: empty project")
         return value
-    canons = None
     for name in (sender, recipient):
-        row = registry.get(db, name)
-        if row is None:
-            continue
-        value = projects.agent_project(row)
+        value = agent_project(cfg, db, name)
         if value:
             return value
-        if canons is None:
-            canons = work.configured_canons(cfg)
-        for canon in canons:
-            if not canon.owns(row.get("canon")):
-                continue
-            agent = canon.agent(name)
-            if agent and agent.team and agent.team.strip():
-                return agent.team.strip()
     raise work.WorkError("--new-lot: no project known for sender %s or recipient %s; "
                          "pass --app <project>" % (sender, recipient))
 
@@ -50,3 +69,31 @@ def alerts(db):
                    % (row["id"], row["id"]), lot=row["id"], title=row["title"],
                    lot_state=row["state"])
             for row in storage.of(db).work.without_project()]
+
+
+def backfill_app(cfg, db, *, actor="", dry_run=False):
+    """Journal only uniquely inferred projects; never replace a concurrent correction."""
+    actor = work.corrector(cfg, db, actor)
+    results = []
+    for row in storage.of(db).work.without_project():
+        project = ""
+        try:
+            if row.get("assignee"):
+                project = agent_project(cfg, db, row["assignee"])
+            if not project:
+                creator = storage.of(db).work.creator(row["id"])
+                if creator:
+                    project = agent_project(cfg, db, creator)
+        except work.WorkError as exc:
+            results.append({"id": row["id"], "status": "skipped", "reason": str(exc)})
+            continue
+        if not project:
+            results.append({"id": row["id"], "status": "skipped", "reason": "no known project"})
+            continue
+        status = "planned"
+        if not dry_run:
+            item = storage.of(db).work.set_app(row["id"], project, actor=actor,
+                                               if_empty=True, assignee=row.get("assignee"))
+            status = "updated" if item else "skipped"
+        results.append({"id": row["id"], "project": project, "status": status})
+    return results

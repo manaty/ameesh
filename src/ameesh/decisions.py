@@ -492,7 +492,8 @@ def _hold_lot(db, item: dict, *, note: str, actor: str) -> str:
 def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str | None = None,
         new_lot: str | None = None, recommend: str | None = None, why: str | None = None,
         urgent: bool = False, due_ts: float | None = None, needs_signature: bool = False,
-        source_mail: int | None = None, now: float | None = None) -> dict:
+        source_mail: int | None = None, parent_lot: str | None = None,
+        now: float | None = None) -> dict:
     """Dépose une demande de décision de `requester` (un agent) ; rend la
     demande (`ameesh-decision/1`) avec `lot_state`. DecisionError si refusée
     (rien n'est déposé).
@@ -501,6 +502,7 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
     prose; it must be theirs. Its lot is the default `lot`, and once the
     request names it, the mail is no longer shown as a prose decision."""
     now = time.time() if now is None else float(now)
+    mail_lot = None
     if source_mail is not None:
         mail_row = storage.of(db).decisions.source_mail(int(source_mail))
         if mail_row is None:
@@ -542,15 +544,25 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
     elif float(due_ts) <= now:
         raise DecisionError("deadline already passed (%s)" % _local(due_ts))
     requester_row = registry.get(db, requester)
+    if parent_lot is not None and new_lot is None:
+        raise DecisionError("--parent-lot goes with --new-lot")
     if new_lot is not None:
         title = " ".join(new_lot.split())
         if not title:
             raise DecisionError("--new-lot: empty title")
         try:
+            from . import assignments, work_projects
+            parent_ref = parent_lot or mail_lot
+            parent = assignments.resolve_lot(db, parent_ref) if parent_ref else None
+            if parent_ref and parent is None:
+                raise DecisionError("parent work item %s not found" % parent_ref)
+            project = work_projects.creation_project(cfg, db, requester, parent=parent)
             item = work.add(db, title=title, assignee=requester, actor=requester,
-                            source="decision", cfg=cfg)
+                            source="decision", app=project, cfg=cfg)
         except work.WorkError as exc:
             raise DecisionError("work item not created — %s" % exc) from exc
+        except assignments.AssignmentError as exc:
+            raise DecisionError(str(exc)) from exc
     else:
         from . import assignments
         try:
@@ -1109,6 +1121,8 @@ def cmd_ask(cfg: Config, argv: list[str]) -> int:
     target = parser.add_mutually_exclusive_group()
     target.add_argument("--lot", default=None, help="open work item: number or unique reference")
     target.add_argument("--new-lot", default=None, help="create the work item (assigned to the requester)")
+    parser.add_argument("--parent-lot", default=None,
+                        help="project fallback for --new-lot; default: the source mail's lot")
     parser.add_argument("--from-mail", type=int, default=None, metavar="ID",
                         help="L233: the mail in which you wrote this decision in prose "
                              "(its lot is the default --lot)")
@@ -1139,7 +1153,8 @@ def cmd_ask(cfg: Config, argv: list[str]) -> int:
         view = ask(cfg, db, requester=binding.name, question=args.question,
                    options=args.option, lot=args.lot, new_lot=args.new_lot,
                    recommend=args.recommend, why=args.why, urgent=args.urgent, due_ts=due,
-                   needs_signature=args.needs_signature, source_mail=args.from_mail)
+                   needs_signature=args.needs_signature, source_mail=args.from_mail,
+                   parent_lot=args.parent_lot)
     finally:
         db.close()
     if args.json:
