@@ -94,10 +94,12 @@ utilisateur_agents() {
       DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus $commande"
 }
 commande_agents() {
-  # Même EnvironmentFile que deploy/systemd/ameesh-runner-agent@.service.
-  utilisateur_agents bash -c 'set -euo pipefail; set -a
-    if [ -r "$HOME/.config/ameesh/env" ]; then . "$HOME/.config/ameesh/env"; fi
-    set +a; exec "$@"' -- "$@"
+  # Use the runner's systemd EnvironmentFile parser, including literal $/#.
+  utilisateur_agents bash -c 'set -euo pipefail
+    test -r "$HOME/.config/ameesh/env" \
+      || { echo "runner environment file unreadable: $HOME/.config/ameesh/env" >&2; exit 1; }
+    exec systemd-run --user --pipe --wait --quiet \
+      -p EnvironmentFile=%h/.config/ameesh/env -- "$@"' -- "$@"
 }
 ameesh_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/ameesh "$@"; }
 python_agents() { commande_agents /home/ameesh/.local/share/ameesh/venv/bin/python "$@"; }

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -41,7 +42,7 @@ assert os.environ.get('FAKE_REMOTE') == '1', 'registry must be read on the host'
 assert os.environ.get('HOME') == '/home/ameesh'
 assert os.environ.get('XDG_RUNTIME_DIR') == '/run/user/1001'
 assert os.environ.get('DBUS_SESSION_BUS_ADDRESS') == 'unix:path=/run/user/1001/bus'
-assert os.environ.get('AMEESH_DSN') == 'test-runner-dsn'
+assert os.environ.get('AMEESH_DSN') == json.loads((state / 'expected-env.json').read_text())['AMEESH_DSN']
 assert os.environ.get('AMEESH_SCHEMA') == 'test_runner_schema'
 scenario = (state / 'scenario').read_text()
 if sys.argv[1:] == ['list', '--json']:
@@ -98,11 +99,25 @@ elif 'is-active' in args:
     print('active')
 '''
 
+SYSTEMD_RUN = r'''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+state = Path(os.environ['FAKE_STATE'])
+args = sys.argv[1:]
+assert args[:7] == ['--user', '--pipe', '--wait', '--quiet', '-p',
+                    'EnvironmentFile=%h/.config/ameesh/env', '--'], args
+with (state / 'systemd-run.log').open('a') as f: f.write(' '.join(args) + '\n')
+# The manager supplies these values; this stub deliberately does not source
+# or reimplement EnvironmentFile. A separate test exercises the real parser.
+env = dict(os.environ, **json.loads((state / 'expected-env.json').read_text()))
+os.execvpe(args[7], args[7:], env)
+'''
+
 DB_PYTHON = r'''#!/usr/bin/env python3
 import os, sys, time
 from pathlib import Path
 assert os.environ.get('FAKE_REMOTE') == '1'
-assert os.environ.get('AMEESH_DSN') == 'test-runner-dsn'
+assert os.environ.get('AMEESH_DSN') == __import__('json').loads((Path(os.environ['FAKE_STATE']) / 'expected-env.json').read_text())['AMEESH_DSN']
 assert os.environ.get('AMEESH_SCHEMA') == 'test_runner_schema'
 assert sys.argv[1] == '-c' and 'db.connect(config.load())' in sys.argv[2]
 assert 'clock_timestamp()' in sys.argv[2]
@@ -118,13 +133,14 @@ class AgentHostTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.state = self.root / 'state'; self.state.mkdir()
         (self.state / 'runner.env').write_text('AMEESH_DSN=test-runner-dsn\nAMEESH_SCHEMA=test_runner_schema\n')
+        (self.state / 'expected-env.json').write_text(json.dumps(dict(AMEESH_DSN='test-runner-dsn', AMEESH_SCHEMA='test_runner_schema')))
         self.bin = self.root / 'bin'; self.bin.mkdir()
         (self.bin / 'python3').symlink_to(sys.executable)
         self.home = self.root / 'home'; self.home.mkdir()
         self.config = self.root / 'bascule.env'
         self.config.write_text('AGENTS_SSH=root@vm.invalid\nHOTE_AGENTS=host-agents\nPERSONAS_VM=obsolete\n')
         for name, source in [('ssh', SSH), ('runuser', RUNUSER), ('ameesh', AMEESH),
-                             ('systemctl', SYSTEMCTL), ('db-python', DB_PYTHON), ('sleep', '#!/bin/sh\nexit 0\n'),
+                             ('systemctl', SYSTEMCTL), ('systemd-run', SYSTEMD_RUN), ('db-python', DB_PYTHON), ('sleep', '#!/bin/sh\nexit 0\n'),
                              ('id', '#!/bin/sh\necho 1001\n'),
                              ('journalctl', '#!/bin/sh\nexit 0\n')]:
             path = self.bin / name; path.write_text(source); path.chmod(0o755)
@@ -148,6 +164,26 @@ class AgentHostTest(unittest.TestCase):
     def units(self):
         path = self.state / 'units.log'
         return path.read_text() if path.exists() else ''
+
+    def test_missing_runner_env_fails_before_any_execution(self):
+        (self.state / 'runner.env').unlink()
+        p = self.run_vm()
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('runner environment file unreadable', p.stderr)
+        self.assertEqual(self.units(), '')
+        self.assertFalse((self.state / 'systemd-run.log').exists())
+
+    def test_systemd_supplies_literal_environment(self):
+        expected = 'postgresql://test@invalid/mesh_$USER"quoted"#fragment'
+        (self.state / 'runner.env').write_text(
+            'AMEESH_DSN=postgresql://test@invalid/mesh_$USER"quoted"#fragment\n'
+            'AMEESH_SCHEMA=test_runner_schema\n')
+        (self.state / 'expected-env.json').write_text(json.dumps(dict(
+            AMEESH_DSN=expected, AMEESH_SCHEMA='test_runner_schema')))
+        p = self.run_vm('controler')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('EnvironmentFile=%h/.config/ameesh/env',
+                      (self.state / 'systemd-run.log').read_text())
 
     def test_restart_uses_remote_registry_and_user_units(self):
         p = self.run_vm()
@@ -284,6 +320,29 @@ class AgentHostTest(unittest.TestCase):
         p = self.run_vm('installer')
         self.assertNotEqual(p.returncode, 0)
         self.assertFalse((self.state / 'ssh.log').exists())
+
+
+class SystemdEnvironmentFileTest(unittest.TestCase):
+    def test_real_manager_keeps_literal_values(self):
+        manager = shutil.which('systemd-run')
+        ctl = shutil.which('systemctl')
+        if not manager or not ctl:
+            self.skipTest('systemd user manager unavailable')
+        available = subprocess.run([ctl, '--user', 'show-environment'],
+                                   capture_output=True, timeout=10)
+        if available.returncode:
+            self.skipTest('systemd user manager unavailable')
+        with tempfile.TemporaryDirectory(prefix='ameesh-503-systemd-') as tmp:
+            path = Path(tmp) / 'runner.env'
+            expected = 'postgresql://test@invalid/mesh_$USER"quoted"#fragment'
+            path.write_text('AMEESH_DSN=' + expected + '\n')
+            result = subprocess.run([
+                manager, '--user', '--pipe', '--wait', '--quiet', '-p',
+                'EnvironmentFile=' + str(path), '--', sys.executable, '-c',
+                'import os; print(os.environ["AMEESH_DSN"])'],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), expected)
 
 
 class SharedLeasePredicateTest(unittest.TestCase):
