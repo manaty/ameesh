@@ -448,7 +448,7 @@ class HarnessCliTest(_Tmp):
         proc = self.cli("harness", "show", "deepseek")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("--patch", proc.stdout)
-        self.assertIn("empreinte", proc.stdout)
+        self.assertIn("fingerprint", proc.stdout)
         proc = self.cli("harness", "show", "deepseek", "--json")
         data = json.loads(proc.stdout)
         self.assertEqual(data["descriptor"]["id"], "deepseek")
@@ -462,7 +462,7 @@ class HarnessCliTest(_Tmp):
         path = self.write_host("faux")
         proc = self.cli("harness", "check", path)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("descripteur valide", proc.stdout)
+        self.assertIn("valid descriptor", proc.stdout)
         proc = self.cli("harness", "check", path, "--json")
         data = json.loads(proc.stdout)
         self.assertTrue(data["valid"])
@@ -482,7 +482,7 @@ class HarnessCliTest(_Tmp):
         doc["name"] = "Claude local"
         self.write_host("claude", doc)
         proc = self.cli("harness", "list")
-        self.assertIn("masque", proc.stderr)
+        self.assertIn("shadows", proc.stderr)
 
     def test_list_signale_un_dossier_non_prive(self):
         os.chmod(self.hosts, 0o755)

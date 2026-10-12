@@ -176,7 +176,7 @@ class GanttTextTest(unittest.TestCase):
                        "real": {"demandee": ts("2026-10-04"), "debut": ts("2026-10-05"),
                                 "soumise": None, "verdict": None, "verdict_kind": None,
                                 "livree": None},
-                       "late": {"what": "livraison", "due": "2026-10-09", "days": 1,
+                       "late": {"what": "delivery", "due": "2026-10-09", "days": 1,
                                 "open": True},
                        "source": {"label": "plan conversation", "url": None},
                        "commitments": [3]}],
@@ -188,7 +188,7 @@ class GanttTextTest(unittest.TestCase):
             "decisions": [{"kind": "decision", "id": 4, "what": "Mot par défaut",
                            "due": None, "status": "open", "owner": "human:o",
                            "source": {"label": "décision 0035", "url": None}}],
-            "late": [{"kind": "task", "id": 65, "title": "Comptes séparés", "what": "livraison",
+            "late": [{"kind": "task", "id": 65, "title": "Comptes séparés", "what": "delivery",
                       "due": "2026-10-09", "days": 1, "open": True}],
             "truncated": {},
         }
@@ -202,12 +202,12 @@ class GanttTextTest(unittest.TestCase):
         self.assertIn(roadmap.GLYPHS["late"], bar)            # après la livraison prévue
         self.assertIn(roadmap.GLYPHS["delivery"], bar)
         self.assertIn(roadmap.GLYPHS["today"], next(l for l in lines if l.startswith("v1 ")))
-        self.assertIn("RETARD 1 j (livraison 09/10)", text)
-        self.assertIn("source : plan conversation", text)
-        self.assertIn("engagement(s) e3", text)
-        self.assertIn("DÉCISIONS ATTENDUES (1)", text)
-        self.assertIn("dépend de L95", text)
-        self.assertIn("EN RETARD (1)", text)
+        self.assertIn("LATE 1 d (delivery 09/10)", text)
+        self.assertIn("source: plan conversation", text)
+        self.assertIn("commitment(s) e3", text)
+        self.assertIn("AWAITED DECISIONS (1)", text)
+        self.assertIn("depends on L95", text)
+        self.assertIn("LATE (1)", text)
         e3 = next(l for l in lines if l.startswith("e3 "))
         self.assertIn(roadmap.GLYPHS["due"], e3)
         for width in (60, 40):
@@ -270,7 +270,7 @@ class RoadmapPgTest(PgTestCase):
                         "2026-10-11", "--livraison", "2026-10-12", "--source",
                         "conversation du 2026-10-10")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("livraison 2026-10-12", out.stdout)
+        self.assertIn("delivery 2026-10-12", out.stdout)
         row = storage.of(self.db).roadmap.item_plans([lot["id"]])[0]
         self.assertEqual((row["planned_start"], row["planned_end"], row["planned_delivery"],
                           row["planned_source"]),
@@ -282,13 +282,13 @@ class RoadmapPgTest(PgTestCase):
         self.assertIsNone(storage.of(self.db).roadmap.item_plans([lot["id"]])[0]["planned_end"])
         self.assertEqual(work.get(self.db, lot["id"])["updated_ts"], before)
         out = self.mesh("work", "show", str(lot["id"]))
-        self.assertIn("prévu    : début 2026-10-10 · fin — · livraison 2026-10-12", out.stdout)
+        self.assertIn("planned  : start 2026-10-10 · end — · delivery 2026-10-12", out.stdout)
         # ordre : début après fin refusé ; date illisible refusée
         with self.assertRaises(roadmap.RoadmapError):
             roadmap.plan(self.db, lot["id"], start="2026-10-20", end="2026-10-11")
         out = self.mesh("work", "plan", str(lot["id"]), "--fin", "12/10")
         self.assertNotEqual(out.returncode, 0)
-        self.assertIn("date illisible", out.stderr)
+        self.assertIn("unreadable date", out.stderr)
         # une fiche : dates posées dans ameesh, à côté de celles du canon
         st = storage.of(self.db)
         st.packages.upsert({"id": "v1", "kind": "milestone", "title": "Mise en service",
@@ -301,7 +301,7 @@ class RoadmapPgTest(PgTestCase):
         self.assertEqual((pkg["planned_start"], pkg["delivery_on"]), ("2026-10-13", "2026-10-20"))
         out = self.mesh("work", "plan", "inconnue", "--fin", "2026-10-13")
         self.assertEqual(out.returncode, 1)
-        self.assertIn("ni tâche ni fiche", out.stderr)
+        self.assertIn("neither a task nor a WorkPackage", out.stderr)
 
     def test_canon_sync_recopie_les_dates(self):
         import tempfile
@@ -331,23 +331,23 @@ class RoadmapPgTest(PgTestCase):
                         "2026-10-12", "--lot", str(lot["id"]), "--source",
                         "conversation 2026-10-10", "--depend-de", "L95")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("engagement e1 enregistré", out.stdout)
+        self.assertIn("commitment e1 recorded", out.stdout)
         c = storage.of(self.db).roadmap.commitments()[0]
         self.assertEqual((c["due_on"], c["work_item_id"], c["project"], c["source_kind"],
                           c["depends_on"]),
                          ("2026-10-12", lot["id"], "ameesh", "conversation", ["L95"]))
         out = self.mesh("plan", "add", "sans date")
         self.assertEqual(out.returncode, 1)
-        self.assertIn("un engagement a une date", out.stderr)
+        self.assertIn("a commitment needs a date", out.stderr)
         out = self.mesh("plan", "add", "Mot par défaut du cœur", "--decision", "--source-type",
                         "decision", "--source", "étude cœur générique, question 1")
         self.assertEqual(out.returncode, 0, out.stderr)
         out = self.mesh("plan", "list")
-        self.assertIn("e1    2026-10-12 open      engagement Comptes séparés", out.stdout)
-        self.assertIn("sans date  open      décision   Mot par défaut", out.stdout)
+        self.assertIn("e1    2026-10-12 open      commitment Comptes séparés", out.stdout)
+        self.assertIn("undated    open      decision   Mot par défaut", out.stdout)
         self.assertEqual(self.mesh("plan", "done", "1").returncode, 0)
         out = self.mesh("plan", "done", "1")
-        self.assertIn("déjà done", out.stderr)
+        self.assertIn("already done", out.stderr)
         self.assertNotIn("e1 ", self.mesh("plan", "list").stdout)
         self.assertIn("e1 ", self.mesh("plan", "list", "--all").stdout)
 
@@ -378,9 +378,9 @@ class RoadmapPgTest(PgTestCase):
             fh.write(DECISION)
         out = self.mesh("plan", "propose", "--no-canon", "--from", folder)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("jalon de décision sans date — Décider : Comptes séparés", out.stdout)
-        self.assertIn("pour valider : ameesh plan add", out.stdout)
-        self.assertIn("rien n'est enregistré", out.stdout)
+        self.assertIn("decision milestone undated — Decide: Comptes séparés", out.stdout)
+        self.assertIn("to accept: ameesh plan add", out.stdout)
+        self.assertIn("nothing recorded", out.stdout)
         out = self.mesh("plan", "propose", "--no-canon", "--from", folder, "--record", "--json")
         self.assertEqual(out.returncode, 0, out.stderr)
         recorded = json.loads(out.stdout)["recorded"]
@@ -389,7 +389,7 @@ class RoadmapPgTest(PgTestCase):
                     if c["due_on"] is None and c["kind"] == "commitment")
         out = self.mesh("plan", "accept", str(lots["id"]))
         self.assertEqual(out.returncode, 1)
-        self.assertIn("sans date", out.stderr)
+        self.assertIn("undated", out.stderr)
         out = self.mesh("plan", "accept", str(lots["id"]), "--pour", "2026-10-30")
         self.assertEqual(out.returncode, 0, out.stderr)
 
@@ -428,7 +428,7 @@ class RoadmapPgTest(PgTestCase):
         lt = tasks[late["id"]]
         self.assertEqual(lt["planned"]["delivery"], "2026-10-05")
         self.assertTrue(lt["late"]["open"])
-        self.assertEqual(lt["late"]["what"], "livraison")
+        self.assertEqual(lt["late"]["what"], "delivery")
         self.assertEqual(len(lt["commitments"]), 1)
         self.assertTrue(tasks[waiting["id"]]["waiting_decision"])
         self.assertIn(waiting["id"], [x.get("lot") for x in view["decisions"]])
@@ -445,10 +445,10 @@ class RoadmapPgTest(PgTestCase):
 
         out = self.mesh("plan", "show", "--width", "110")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("FEUILLE DE ROUTE", out.stdout)
-        self.assertIn("QUI AVANCE SUR QUOI", out.stdout)
+        self.assertIn("ROADMAP", out.stdout)
+        self.assertIn("WHO IS WORKING ON WHAT", out.stdout)
         self.assertIn("#%d Lot en retard" % late["id"], out.stdout)
-        self.assertIn("RETARD", out.stdout)
+        self.assertIn("LATE", out.stdout)
         shown = json.loads(self.mesh("plan", "show", "--json").stdout)
         self.assertEqual(shown["schema"], "ameesh-roadmap/1")
         self.assertIn("who", shown)
@@ -461,10 +461,10 @@ class RoadmapPgTest(PgTestCase):
         self.assertEqual(snap["milestones"][0]["date"], "2026-10-20")
         self.assertIsNone(json.loads(self.mesh("progress", "--json", "--no-gantt").stdout)
                           ["roadmap"])
-        self.assertIn("FEUILLE DE ROUTE", self.mesh("progress").stdout)
-        self.assertNotIn("FEUILLE DE ROUTE", self.mesh("progress", "--no-gantt").stdout)
+        self.assertIn("ROADMAP", self.mesh("progress").stdout)
+        self.assertNotIn("ROADMAP", self.mesh("progress", "--no-gantt").stdout)
         html = progress.render_html(snap)
-        self.assertIn('id="roadmap-section"', html)
+        self.assertIn('id="panel-gantt"', html)  # L304 : la frise est l'onglet Gantt
         self.assertIn('"ameesh-roadmap/1"', html)
         self.assertNotIn("<script src", html)
 
@@ -517,12 +517,13 @@ class RoadmapPgTest(PgTestCase):
         self.assertEqual(a["last_update"]["lot"], lot["id"])
         self.assertIsNotNone(a["on_task_since_ts"])
         text = projects.format_text(view, 120)
-        self.assertIn("avancée il y a", text)
+        self.assertIn("progress ", text)
+        self.assertIn(" ago: ", text)
         self.assertIn("migration écrite", text)
         text = roadmap.format_gantt(roadmap.build(self.db), 100,
                                     who=roadmap.who(self.db))
-        self.assertIn("w1 [ameesh] au repos — #%d" % lot["id"], text)
-        self.assertIn("dernière avancée (il y a", text)
+        self.assertIn("w1 [ameesh] idle — #%d" % lot["id"], text)
+        self.assertIn("last progress (", text)
 
 
 if __name__ == "__main__":

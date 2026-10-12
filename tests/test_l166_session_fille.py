@@ -49,7 +49,7 @@ class LectureDuFluxTest(unittest.TestCase):
         self.assertTrue(adapters.child_session_refused(
             'session "%s" is a subagent or forked session and cannot be driven directly'
             % FILLE))
-        for autre in (None, "", "le harnais a rendu le code 1",
+        for autre in (None, "", "the harness returned code 1",
                       'session "x" does not exist; omit --session-id'):
             self.assertFalse(adapters.child_session_refused(autre))
 
@@ -122,7 +122,7 @@ class RepriseApresRefusTest(_Base):
             self.assertEqual(worker.resume_origin, "ameesh")
             self.assertTrue(self._tour(worker))
         self.assertEqual(self._reprises(), [FILLE, None])
-        self.assertIn("session fille %s écartée" % FILLE, " ".join(self.turns()[-1]["argv"]))
+        self.assertIn("child session %s discarded" % FILLE, " ".join(self.turns()[-1]["argv"]))
         self.assertEqual(registry.get(self.db, "ds-neuve")["session_id"], "dsh-session-1")
 
 

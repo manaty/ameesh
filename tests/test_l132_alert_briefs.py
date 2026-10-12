@@ -37,7 +37,7 @@ class BriefsTest(unittest.TestCase):
         briefs = alert_briefs.briefs(STALE, self.listing, auditor_names=["auditeur"])
         self.assertEqual(sorted(briefs), ["auditeur", "orch"])   # équipe de l'assigné
         text = briefs["orch"]
-        self.assertIn("#42 « export »", text)
+        self.assertIn('#42 "export"', text)
         self.assertIn('ameesh mail send dev1 "…" --lot 42', text)
         self.assertIn("ameesh work merged 42 --sha", text)
         self.assertIn("ameesh work close 42 --abandoned", text)
@@ -52,7 +52,7 @@ class BriefsTest(unittest.TestCase):
     def test_plan_underused(self):
         briefs = alert_briefs.briefs(PLAN, self.listing, auditor_names=["auditeur"])
         self.assertEqual(sorted(briefs), ["auditeur", "orch-b"])
-        self.assertIn("au repos (dev2)", briefs["orch-b"])
+        self.assertIn("idle agents (dev2)", briefs["orch-b"])
         self.assertIn("--lot <id>", briefs["orch-b"])
         no_idle = alert_briefs.briefs(dict(PLAN, idle_agents=[]), self.listing)
         self.assertIn("ameesh resume <agent>", no_idle["orch"])
@@ -76,8 +76,8 @@ class BriefsTest(unittest.TestCase):
         self.assertEqual(alert_briefs.auditors(_listing(("x", ""))), [])
 
     def test_relance(self):
-        text = alert_briefs.reminder("Lot stagnant", 0.0, 6 * HEURE)
-        self.assertTrue(text.startswith("Relance, alerte toujours en cours depuis 6 h"))
+        text = alert_briefs.reminder("Stale lot", 0.0, 6 * HEURE)
+        self.assertTrue(text.startswith("Reminder, alert still active for 6 h"))
 
 
 class NotifierBriefsTest(PgTestCase):
@@ -113,7 +113,7 @@ class NotifierBriefsTest(PgTestCase):
         notifier.run_pass(self.db, current=[alert])
         rows = self.mails("orch")
         self.assertEqual(len(rows), 2)
-        self.assertTrue(rows[1]["body"].startswith("Relance"))
+        self.assertTrue(rows[1]["body"].startswith("Reminder"))
         clock[0] += 6 * HEURE
         notifier.run_pass(self.db, current=[alert])
         self.assertEqual(len(self.mails("orch")), 2)               # une seule relance

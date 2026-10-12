@@ -98,7 +98,7 @@ class PlafondDuFilPrincipalTest(PgTestCase):
                   {"reread": 10, "tool": True},                # point sûr principal
                   {"reread": 10, "tool": True, "sleep": 3}]    # jamais fini
         self.assertTrue(self._tour(worker, appels))
-        self.assertTrue(worker.last_turn_closed.startswith("plafond de contexte"))
+        self.assertTrue(worker.last_turn_closed.startswith("context cap"))
         flux = self._flux(worker)
         self.assertIn('"tool_use_id": "outil-1"', flux)  # le sous-agent n'a pas clos
         self.assertIn('"tool_use_id": "outil-2"', flux)  # clos ici
@@ -117,7 +117,7 @@ class PlafondDuFilPrincipalTest(PgTestCase):
                   {"reread": 50, "tool": True},                 # point sûr : clos ici
                   {"reread": 10, "tool": True, "sleep": 3}]     # jamais fini
         self.assertTrue(self._tour(worker, appels))
-        self.assertTrue(worker.last_turn_closed.startswith("durée maximale"))
+        self.assertTrue(worker.last_turn_closed.startswith("maximum turn duration"))
         self.assertNotIn('"type": "result"', self._flux(worker))
         # le grand livre compte les sous-agents (au-delà du plafond de 1 000)…
         self.assertGreaterEqual(worker.last_turn_reread, 2400)
@@ -139,7 +139,7 @@ class PlafondDuFilPrincipalTest(PgTestCase):
         appels = [{"reread": 50, "tool": True, "sleep": 1.2},   # point sûr : clos ici
                   {"reread": 10, "tool": True, "sleep": 3}]     # jamais fini
         self.assertTrue(self._tour(worker, appels, tampon={"reread": 1200}))
-        self.assertTrue(worker.last_turn_closed.startswith("durée maximale"))
+        self.assertTrue(worker.last_turn_closed.startswith("maximum turn duration"))
         self.assertIn('"id": "msg-tampon"', self._flux(worker))
         # 50 + 1 200, et l'appel 2 (10) s'il est émis avant l'arrêt
         self.assertIn(worker.last_turn_main_reread, (1250, 1260))

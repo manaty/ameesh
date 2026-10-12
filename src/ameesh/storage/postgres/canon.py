@@ -360,7 +360,7 @@ class Canon(interface.Canon):
             """,
             (name, target, canon_ref, diagnostic, ref, bool(keep_session),
              bool(keep_session), bool(keep_session), bool(keep_session), summary, summary,
-             bool(keep_session), "déplacé vers %s" % target,
+             bool(keep_session), "moved to %s" % target,
              host, owner, int(epoch), target),
         )
         return rows[0] if rows else None
@@ -427,10 +427,10 @@ class Ephemerals(interface.Ephemerals):
                    CASE WHEN c.placement_ok AND c.placement_profile IS DISTINCT FROM __NOW__
                         THEN false ELSE c.placement_ok END,
                    CASE WHEN c.placement_ok AND c.placement_profile IS DISTINCT FROM __NOW__
-                        THEN 'profil de ' || c.name || ' divergé depuis l''évaluation de son '
-                             || 'placement (évalué : ' || coalesce(c.placement_profile, 'aucun')
-                             || ' ; actuel : ' || __NOW__ || ') : placement non hérité, à '
-                             || 'réévaluer par « ameesh canon sync »'
+                        THEN 'profile of ' || c.name || ' diverged since the placement was '
+                             || 'evaluated (evaluated: ' || coalesce(c.placement_profile, 'none')
+                             || '; current: ' || __NOW__ || '): placement not inherited, '
+                             || 're-evaluate with "ameesh canon sync"'
                         ELSE c.placement_diagnostic END,
                    c.placement_ref, c.placement_profile,
                    -- L42 (0031) : l'éphémère appartient au canon de son créateur

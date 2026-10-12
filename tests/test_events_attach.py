@@ -232,7 +232,7 @@ class AttachTest(PgTestCase):
         env = dict(self._env(), AMEESH_TEST_SLEEP="8")
 
         def faux_log(message, *args, **kwargs):
-            if "échéance" in str(message) or "bail perdu" in str(message):
+            if "deadline" in str(message) or "lease lost" in str(message):
                 time.sleep(30)  # simule un tube saturé
 
         resultat: list = []

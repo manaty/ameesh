@@ -40,6 +40,8 @@ SIGNATURES = {
     "agent_registry": {"public_key"},
     "agent_mesh_overview": {"public_key"},
     "authenticators": {"public_key", "credential_id"},
+    # #210: fingerprint of a refresh token or key
+    "credential_health": {"failing_fingerprint"},
 }
 #: contenus (texte libre) : refusés au rôle de base, seuls lisibles par le rôle
 #: « contenus » (role-superviseur-contenus.sql)
@@ -48,12 +50,15 @@ CONTENUS = {
     "agent_registry": {"pending_prompt", "current_prompt", "restart_brief"},
     "agent_mesh_overview": {"pending_prompt", "current_prompt", "restart_brief"},
     "thread_index": {"last_excerpt"},
+    "conversation_log": {"text", "meta", "thread_text"},
     "actions": {"args", "last_note"},
     "action_events": {"note"},
     "work_items": {"body"},
     "commitments": {"note"},
     "work_item_events": {"note"},
     "work_item_milestones": {"note"},
+    "project_modules": {"schemas", "rules"},
+    "work_module_milestones": {"payload"},
     "mesh_approvals": {"meta"},
     "mesh_approvals_status": {"meta"},
     # L161c (0055) : sortie d'un test en échec
@@ -88,7 +93,7 @@ class ProbeTest(PgTestCase):
         for via in ("main", "cli"):
             proc = self.probe(self.schema, via)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertIn("sonde : OK", proc.stdout)
+            self.assertIn("probe: OK", proc.stdout)
             # sonde légère : ni comptage, ni NOTIFY
             self.assertNotIn("agents", proc.stdout)
             self.assertNotIn("notify", proc.stdout)
@@ -96,7 +101,7 @@ class ProbeTest(PgTestCase):
     def test_schema_absent(self):
         proc = self.probe("t_probe_absent_%s" % uuid.uuid4().hex[:6])
         self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn("schéma absent", proc.stdout)
+        self.assertIn("schema missing", proc.stdout)
 
     def test_schema_absent_n_est_pas_cree(self):
         schema = "t_probe_rien_%s" % uuid.uuid4().hex[:6]
@@ -110,7 +115,7 @@ class ProbeTest(PgTestCase):
                        AMEESH_CONNECT_TIMEOUT="1")
         proc = self.mesh("doctor", "--probe", env=env)
         self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn("base injoignable", proc.stdout)
+        self.assertIn("database unreachable", proc.stdout)
 
     def test_migration_manquante(self):
         schema = self.scratch_schema()
@@ -119,7 +124,7 @@ class ProbeTest(PgTestCase):
             "DELETE FROM schema_migrations WHERE version = %s", (derniere.version,))
         proc = self.probe(schema)
         self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn("manquantes %s" % derniere.label, proc.stdout)
+        self.assertIn("missing %s" % derniere.label, proc.stdout)
         # la sonde n'a rien réappliqué
         self.assertIn(derniere.version, [m.version for m in migrations.check(self.scratch_db)[0]])
 
@@ -131,7 +136,7 @@ class ProbeTest(PgTestCase):
             (premiere.version,))
         proc = self.probe(schema)
         self.assertEqual(proc.returncode, 1, proc.stdout)
-        self.assertIn("modifiées %s" % premiere.label, proc.stdout)
+        self.assertIn("modified %s" % premiere.label, proc.stdout)
 
     def test_base_plus_recente_reste_ok(self):
         schema = self.scratch_schema()
@@ -140,7 +145,7 @@ class ProbeTest(PgTestCase):
             "VALUES (9999, 'future', 'x')")
         proc = self.probe(schema)
         self.assertEqual(proc.returncode, 0, proc.stdout)
-        self.assertIn("plus récente", proc.stdout)
+        self.assertIn("newer than this code", proc.stdout)
         self.assertIn("9999", proc.stdout)
 
 

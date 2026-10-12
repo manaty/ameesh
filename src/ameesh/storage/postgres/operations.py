@@ -20,6 +20,8 @@ from .mailbox import PASSIVE_SQL
 
 #: états de lot terminés (le reste est « ouvert »)
 _CLOSED = "('merged', 'promoted', 'closed')"   # closed : abandonné ou remplacé (L29)
+#: L165b : un lot dans ces états attend quelqu'un d'autre que son assigné
+_WAITING_ON_OTHERS = "('qa', 'waiting_human', 'blocked')"
 #: L125 : un message passif de la boîte `mb`
 _PASSIVE = PASSIVE_SQL.format(t="mb")
 
@@ -74,7 +76,9 @@ class Operations(interface.Operations):
         return bool(rows)
 
     # -- lectures d'exploitation --------------------------------------------
-    def listing(self) -> list[dict]:
+    def listing(self, *, today: str | None = None) -> list[dict]:
+        import datetime as _dt
+        today = today or _dt.date.today().isoformat()
         return self.db.query(
             """
             SELECT r.name, r.chantier, r.team, r.harness, r.host, r.model, r.effort, r.tier,
@@ -99,8 +103,10 @@ class Operations(interface.Operations):
                    extract(epoch from m.oldest)::float8 AS oldest_unread_ts,
                    coalesce(m.n_passive, 0)::bigint AS passive_unread,
                    sw.title AS session_lot_title, sw.state AS session_lot_state,
+                   coalesce(sw.planned_start > j.today, false) AS session_lot_later,
                    aw.id AS assigned_lot_id, aw.title AS assigned_lot_title,
                    aw.state AS assigned_lot_state,
+                   coalesce(al.n, 0)::bigint AS active_lots,
                    -- L60 : Codex compte déjà le cache dans input_tokens
                    (CASE WHEN t.harness = 'codex'
                          THEN greatest(t.input_tokens, t.cached_input_tokens)
@@ -109,6 +115,8 @@ class Operations(interface.Operations):
                    t.session AS last_turn_session,
                    extract(epoch from t.recorded_at)::float8 AS last_turn_recorded_ts
               FROM agent_registry r
+              -- #318 r2 : le jour local de l'hôte, pas celui du fuseau de la base
+              CROSS JOIN (SELECT %s::date AS today) j
               LEFT JOIN spend_pending p ON p.agent = r.name
               LEFT JOIN LATERAL (
                   -- L125 : `unread` = le courrier qui ouvrira un tour ; le
@@ -119,7 +127,7 @@ class Operations(interface.Operations):
                     FROM agent_mailbox mb
                    WHERE mb.recipient = r.name AND mb.delivered_at IS NULL) m ON true
               LEFT JOIN LATERAL (
-                  SELECT w.title, w.state FROM work_items w
+                  SELECT w.title, w.state, w.planned_start FROM work_items w
                    WHERE w.id = CASE WHEN r.session_work_item ~ '^[0-9]{1,18}$'
                                      THEN r.session_work_item::bigint END) sw ON true
               LEFT JOIN LATERAL (
@@ -127,12 +135,19 @@ class Operations(interface.Operations):
                    WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
                    ORDER BY w.updated_at DESC, w.id DESC LIMIT 1) aw ON true
               LEFT JOIN LATERAL (
+                  -- L165b : les lots qui occupent l'agent (ni en attente d'un
+                  -- autre, ni prévus pour plus tard)
+                  SELECT count(*) AS n FROM work_items w
+                   WHERE w.assignee = r.name AND w.state NOT IN """ + _CLOSED + """
+                     AND w.state NOT IN """ + _WAITING_ON_OTHERS + """
+                     AND (w.planned_start IS NULL OR w.planned_start <= j.today)) al ON true
+              LEFT JOIN LATERAL (
                   SELECT c.harness, c.input_tokens, c.cached_input_tokens, c.session, c.recorded_at
                     FROM turn_costs c
                    WHERE c.agent = r.name
                    ORDER BY c.recorded_at DESC, c.id DESC LIMIT 1) t ON true
              ORDER BY r.name
-            """)
+            """, (today,))
 
     # -- redémarrage ---------------------------------------------------------
     def request_restart(self, name, brief) -> dict | None:
@@ -177,7 +192,7 @@ class Operations(interface.Operations):
                                               r.current_prompt, r.pending_prompt),
                    current_prompt = NULL,
                    status = CASE WHEN r.status = 'stopped' THEN r.status ELSE 'queued' END,
-                   status_text = 'redémarrage : session neuve sur brief',
+                   status_text = 'restart: fresh session from brief',
                    restart_brief = NULL,
                    restart_requested_at = NULL,
                    updated_at = now()
@@ -313,7 +328,7 @@ class Operations(interface.Operations):
              ORDER BY last_activity_ts ASC, w.id
              LIMIT %s
             """,
-            (int(limit),))
+            (int(limit) if limit is not None else None,))
 
     # -- usage par tour ------------------------------------------------------
     def turns(self, *, agent, since_s, limit) -> list[dict]:
@@ -398,12 +413,12 @@ class Operations(interface.Operations):
                 SELECT e.actor FROM work_item_events e
                   JOIN work_items w ON w.id = e.work_item_id
                  WHERE e.created_at >= now() - make_interval(secs => %s)
-                   AND e.note LIKE %s
+                   AND (e.note LIKE %s OR e.note LIKE %s)
                    AND e.actor <> ''
                    AND e.actor IS DISTINCT FROM w.assignee
             ) a WHERE coalesce(who, '') <> '' ORDER BY who
             """,
-            (float(since_s), float(since_s), "assigné à %"))
+            (float(since_s), float(since_s), "assigné à %", "assigned to %"))
         return [row["who"] for row in rows]
 
     # -- soldes --------------------------------------------------------------

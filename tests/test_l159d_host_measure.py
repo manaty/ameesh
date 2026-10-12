@@ -427,7 +427,7 @@ class MeasureDbTest(PgTestCase):
         texte = self.mesh("hosts", "vm-test")
         self.assertEqual(texte.returncode, 0, texte.stderr)
         self.assertIn("PSI", texte.stdout)
-        self.assertIn("lendable   CPU 1.00 ; memory 2.0", texte.stdout)
+        self.assertIn("lendable   CPU 1.00; memory 2.0", texte.stdout)
         self.assertIn("no offer: lends nothing", texte.stdout)
 
 

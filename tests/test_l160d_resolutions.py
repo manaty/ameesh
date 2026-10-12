@@ -552,10 +552,10 @@ class RadarTest(_Base):
         branches = {b["work_item"]: b for b in report["branches"]}
         mine = radar.message_text(conflict, 2, branches)
         self.assertIn("`ameesh work resolve 2 --with 1`", mine)
-        self.assertIn("ton lot est le plus récent", mine)
-        self.assertIn("Le lot #2 prépare la résolution", radar.message_text(conflict, 1,
-                                                                           branches))
-        self.assertIn("[résolveur #2 : newer lot]", "\n".join(radar.render(report)))
+        self.assertIn("your lot is the most recent", mine)
+        self.assertIn("Lot #2 prepares the resolution", radar.message_text(conflict, 1,
+                                                                          branches))
+        self.assertIn("[resolver #2: newer lot]", "\n".join(radar.render(report)))
 
     def test_prepared_then_stale(self):
         cache = radar.Cache()
@@ -584,7 +584,7 @@ class RadarTest(_Base):
         self.assertEqual((stale["lots"], stale["files"]), ([2], ["shared.py"]))
         branches = {b["work_item"]: b for b in report["branches"]}
         text = radar.message_text(stale, 2, branches)
-        self.assertIn("ne couvre plus le conflit", text)
+        self.assertIn("no longer covers the", text)
         self.assertIn("`ameesh work resolve 2 --with 1`", text)
         self.assertIn(sha[:12], text)
         self.assertIn({"key": "pair:1-2", "from": "prepared", "to": "stale"},
@@ -653,7 +653,7 @@ class ResolutionsDbTest(PgTestCase):
         self.assertIn("resolution prepared with #%d" % a, notes)
         shown = self.mesh("work", "show", str(a))
         self.assertEqual(shown.returncode, 0, shown.stderr)
-        self.assertIn("résolut. : resolved by #%d: 444444444444" % b, shown.stdout)
+        self.assertIn("resolut. : resolved by #%d: 444444444444" % b, shown.stdout)
         data = json.loads(self.mesh("work", "show", str(b), "--json").stdout)
         self.assertEqual(data["resolutions"][0]["commit_sha"], "4" * 40)
         listed = self.mesh("work", "resolve", str(b))
@@ -689,7 +689,7 @@ class ResolutionsWithoutTableDbTest(PgTestCase):
         self.db.execute("DROP TABLE work_resolutions")
         shown = self.mesh("work", "show", str(lot))
         self.assertEqual(shown.returncode, 0, shown.stderr)
-        self.assertIn("résolut. : indisponible", shown.stdout)
+        self.assertIn("resolut. : unavailable", shown.stdout)
         data = json.loads(self.mesh("work", "show", str(lot), "--json").stdout)
         self.assertEqual(data["resolutions"], [])
         self.assertIn("work_resolutions", data["resolutions_error"])

@@ -8,7 +8,7 @@ import subprocess
 import sys
 import unittest
 
-from .support import REPO, PgTestCase
+from .support import REPO, PgTestCase, v0_in_english
 
 #: port fermé sur la boucle locale : la base est « absente »
 UNREACHABLE = "postgresql://ameesh:ameesh@127.0.0.1:5599/ameesh"
@@ -25,8 +25,8 @@ class FallbackTest(PgTestCase):
         proc = self.cli("send", "beta", "via les fichiers",
                         env=self.env_bad(AGENT_MAIL_NAME="alpha"))
         self.assertEqual(proc.returncode, 0)
-        self.assertEqual(proc.stdout.strip(), "déposé pour : beta")
-        self.assertIn("repli sur les fichiers", proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "dropped for: beta")
+        self.assertIn("falling back to files", proc.stderr)
         self.assertIn(UNREACHABLE.split("@")[1], proc.stderr)  # le DSN est montré
         fichiers = os.listdir(os.path.join(self.v0state, "inbox", "beta"))
         self.assertEqual(len(fichiers), 1)
@@ -40,7 +40,7 @@ class FallbackTest(PgTestCase):
         # un message déposé pendant que la base est absente
         self.cli("send", "beta", "coucou", env=self.env_bad(AGENT_MAIL_NAME="alpha"))
         proc = self.cli("inbox", "beta", env=self.env_bad())
-        self.assertEqual(proc.stdout.strip(), "de alpha : coucou")
+        self.assertEqual(proc.stdout.strip(), "from alpha: coucou")
 
         # le hook enregistre l'agent dans l'état fichier v0
         payload = json.dumps({"hook_event_name": "SessionStart", "cwd": self.tmp,
@@ -59,7 +59,7 @@ class FallbackTest(PgTestCase):
         self.assertNotIn("repli", hook.stdout)
 
     def test_hook_json_identique_v0_en_repli(self):
-        """Le repli fichier de la v1 rend exactement le JSON de la v0."""
+        """Le repli fichier de la v1 rend le JSON de la v0 (en anglais, L156c)."""
         name = "delta"
         v0state = os.path.join(self.tmp, "v0-only")
         v1state = os.path.join(self.tmp, "v1-only")
@@ -80,7 +80,7 @@ class FallbackTest(PgTestCase):
                       env=self.env_bad(AGENT_MAIL_NAME=name, AGENT_MAIL_STATE=v1state))
         self.assertEqual(v0.returncode, 0)
         self.assertEqual(v1.returncode, 0)
-        self.assertEqual(json.loads(v0.stdout), json.loads(v1.stdout))
+        self.assertEqual(json.loads(v0_in_english(v0.stdout)), json.loads(v1.stdout))
 
         # idem pour le Stop (décision de blocage)
         payload = json.dumps({"hook_event_name": "Stop", "cwd": self.tmp})
@@ -97,7 +97,7 @@ class FallbackTest(PgTestCase):
         )
         v1 = self.cli("hook", "claude", stdin=payload,
                       env=self.env_bad(AGENT_MAIL_NAME=name, AGENT_MAIL_STATE=v1state))
-        self.assertEqual(json.loads(v0.stdout), json.loads(v1.stdout))
+        self.assertEqual(json.loads(v0_in_english(v0.stdout)), json.loads(v1.stdout))
 
     def test_send_signe_en_repli_avertit(self):
         """Le repli fichier ne peut pas porter de signature : il le dit."""
@@ -105,16 +105,16 @@ class FallbackTest(PgTestCase):
         proc = self.cli("send", "beta", "message signé", "--sign", "--key", private,
                         env=self.env_bad(AGENT_MAIL_NAME="proprietaire"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("déposé pour : beta", proc.stdout)
-        self.assertIn("signature n'est pas conservée", proc.stderr)
+        self.assertIn("dropped for: beta", proc.stdout)
+        self.assertIn("the signature is not kept", proc.stderr)
         fichiers = os.listdir(os.path.join(self.v0state, "inbox", "beta"))
         self.assertEqual(len(fichiers), 1)
 
     def test_backend_pg_force_echoue_sans_repli(self):
         proc = self.cli("send", "beta", "non", env=self.env_bad(AMEESH_BACKEND="pg"))
         self.assertEqual(proc.returncode, 1)
-        self.assertNotIn("déposé", proc.stdout)
-        self.assertIn("erreur", proc.stderr)
+        self.assertNotIn("dropped for", proc.stdout)
+        self.assertIn("error", proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.v0state, "inbox", "beta")))
 
     def test_schema_non_migre_dit_de_migrer(self):
@@ -124,7 +124,7 @@ class FallbackTest(PgTestCase):
             proc = self.cli("send", "beta", "non", env=self.env(AMEESH_SCHEMA=schema))
             self.assertEqual(proc.returncode, 1)
             self.assertIn("migrate", proc.stderr)
-            self.assertNotIn("déposé", proc.stdout)
+            self.assertNotIn("dropped for", proc.stdout)
         finally:
             self.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % schema)
 
@@ -132,7 +132,7 @@ class FallbackTest(PgTestCase):
         proc = self.cli("doctor", env=self.env_bad())
         self.assertEqual(proc.returncode, 1)
         self.assertIn("verdict    : KO", proc.stdout)
-        self.assertIn("fichiers", proc.stdout)
+        self.assertIn("files", proc.stdout)
 
 
 if __name__ == "__main__":

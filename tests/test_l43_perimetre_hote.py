@@ -155,7 +155,7 @@ class PerimetreTest(_Canons, unittest.TestCase):
         info = [f for f in found if f.code == "ameesh-scope-ignored"]
         self.assertEqual(len(info), 1)
         self.assertEqual(info[0].severity, canon.INFO)
-        self.assertIn("3 fiche(s)", info[0].message)
+        self.assertIn("3 typed", info[0].message)
         self.assertEqual(loaded.out_of_scope, {"home": 3})
         self.assertIn("home", loaded.loaded_members())
         # références qualifiées (canon non par défaut), chemin complet
@@ -428,7 +428,7 @@ class AdmissionParCanonTest(_AvecBase):
         canon_sync.sync(self.db, canon.load(self.manaty()), HOST)
         report = canon_sync.sync(self.db, t, HOST, found)
         self.assertFalse(self.row("t1")["placement_ok"])
-        self.assertIn("non admis par l'hôte", self.row("t1")["placement_diagnostic"])
+        self.assertIn("not allowed by host", self.row("t1")["placement_diagnostic"])
         self.assertEqual(self.claimable(), ["a1"])
         self.assertEqual(report.status, canon_sync.CANON_OK)
 
@@ -513,13 +513,13 @@ class AffichageParCanonTest(_AvecBase):
         self.assertEqual(blocs[ID_T]["errors"], 0)
         texte = self.mesh("canon", "check", "--host", HOST, env=self.cli_env()).stdout
         bloc_a, bloc_t = texte.split("== canon %s" % ID_T)
-        self.assertRegex(bloc_a, r"\n  a1 +admis")
-        self.assertIn("registre  : a1", bloc_a)
-        self.assertNotRegex(bloc_a, r"\n  t1 +|registre  : t1")
-        self.assertNotRegex(bloc_t, r"\n  a[12] +|registre  : a[12]")
-        self.assertIn("registre  : t1", bloc_t)
+        self.assertRegex(bloc_a, r"\n  a1 +admitted")
+        self.assertIn("registry  : a1", bloc_a)
+        self.assertNotRegex(bloc_a, r"\n  t1 +|registry  : t1")
+        self.assertNotRegex(bloc_t, r"\n  a[12] +|registry  : a[12]")
+        self.assertIn("registry  : t1", bloc_t)
         self.assertIn("ameesh-scope-ignored", bloc_t)
-        self.assertIn("1 information(s)", bloc_t)
+        self.assertIn("1 info(s)", bloc_t)
 
     def test_placement_check_par_canon(self):
         data = json.loads(self.mesh("placement", "check", "--json", env=self.cli_env()).stdout)
@@ -545,7 +545,7 @@ class AffichageParCanonTest(_AvecBase):
     def test_canon_show_perimetre(self):
         proc = self.mesh("canon", "show", "--canon", ID_T, env=self.cli_env())
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("périmètre  : home → ameesh (3 fiche(s)", proc.stdout)
+        self.assertIn("scope      : home → ameesh (3 typed card(s)", proc.stdout)
         data = json.loads(self.mesh("canon", "show", "--canon", ID_T, "--json",
                                     env=self.cli_env()).stdout)
         self.assertEqual(data["ameesh_scope"], {"home": ["ameesh"]})
@@ -569,7 +569,7 @@ class AffichageParCanonTest(_AvecBase):
         texte = self.mesh("hosts", HOST, env=self.cli_env()).stdout
         self.assertIn("max_agents 3 [%s]" % ID_T, texte)
         self.assertIn("3 admission(s)", texte)
-        self.assertIn("fiches     %s" % ID_A, texte)
+        self.assertIn("cards      %s" % ID_A, texte)
 
 
 if __name__ == "__main__":

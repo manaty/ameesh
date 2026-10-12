@@ -91,8 +91,14 @@ DEFAULT_HOST_UNDERUSED_TURNS = 1.0
 HOST_FRESH_S = 600.0
 #: états de lot qui attendent un preneur (`idle_capacity`)
 WAITING_LOT_STATES = ("intake", "build")
+#: L165b : un lot dans ces états attend un autre que son assigné (relecture,
+#: humain, autre lot) ; l'agent qui n'a que ceux-là est libre pour un lot
+#: d'équipe et compte dans `idle_capacity`
+LOTS_WAITING_ON_OTHERS = ("qa", "waiting_human", "blocked")
 #: mots qui désignent un orchestrateur dans `roles`/`role` d'une fiche Agent
 ORCHESTRATOR_ROLES = ("orchestrateur", "orchestrator")
+#: L165b : rôles de l'agent de conception, prévenu aussi d'`idle_capacity`
+DESIGN_ROLES = ("conception", "design")
 
 PLAN_REASONS = ("fin_de_fenetre", "sous_rythme")
 IDLE_REASONS = ("forfait_au_repos", "travail_en_attente")
@@ -108,7 +114,7 @@ def _duration(seconds) -> str:
     if hours < 24:
         return "%d h %02d" % (hours, minutes) if minutes else "%d h" % hours
     days, hours = divmod(hours, 24)
-    return "%d j %d h" % (days, hours) if hours else "%d j" % days
+    return "%d d %d h" % (days, hours) if hours else "%d d" % days
 
 
 def _alert(kind, agent, since, value, threshold, detail, **extra) -> dict:
@@ -141,14 +147,27 @@ def paid_harnesses(host: str | None = None) -> tuple | None:
         return None
 
 
-def _paid_spend(db, paid, seconds: float = 86400.0) -> float | None:
+def _paid_spend(db, paid, seconds: float = 86400.0) -> tuple | None:
+    """`(paid, estimated)` per token over `seconds` (#325): `paid`, the fall of
+    the provider balances in USD (`balance.compare`, L95) for the paid harnesses
+    that have readings, else None; `estimated`, ameesh's ledger for the others."""
     if not paid:
         return None
+    from . import balance
+    now = time.time()
     try:
-        return float(storage.of(db).turn_costs.spent(seconds, agent="all",
-                                                     harnesses=list(paid)))
+        real = [entry for entry in balance.compare(db, paid, now - seconds, now)
+                if entry["provider"] in paid and entry["currency"] == "USD"]
+    except Exception:
+        real = []                       # balances unreadable: the estimate for all
+    try:
+        rest = [h for h in paid if h not in {entry["provider"] for entry in real}]
+        estimated = (float(storage.of(db).turn_costs.spent(seconds, agent="all",
+                                                           harnesses=rest))
+                     if rest else 0.0)
     except Exception:
         return None
+    return (sum(entry["real_spent"] for entry in real) if real else None), estimated
 
 
 def _common_responsible(rows) -> str | None:
@@ -242,27 +261,34 @@ def plan_underused(db, listing: list, now: float, *,
             lost_at_pace = max(0.0, 1.0 - at_pace)
             who = "%s/%s" % (harness, account) if account else harness
             if reason == "fin_de_fenetre":
-                head = ("compte %s, fenêtre %s : %.0f %% utilisés et remise à zéro dans %s"
+                head = ("account %s, window %s: %.0f %% used, resets in %s"
                         % (who, gauge.key, used * 100, _duration(remaining)))
             else:
-                head = ("compte %s, fenêtre %s : %.0f %% utilisés pour un rythme permis de "
-                        "%.0f %% (écart %.0f points), remise à zéro dans %s"
+                head = ("account %s, window %s: %.0f %% used against an allowed pace of "
+                        "%.0f %% (gap %.0f points), resets in %s"
                         % (who, gauge.key, used * 100, cap * 100, (cap - used) * 100,
                            _duration(remaining)))
-            detail = ("%s ; perte estimée à la remise à zéro : %.0f %% de la fenêtre si rien "
-                      "ne change (%.0f %% au rythme actuel)"
+            detail = ("%s; estimated loss at reset: %.0f %% of the window if nothing "
+                      "changes (%.0f %% at the current pace)"
                       % (head, unused * 100, lost_at_pace * 100))
             idle = sorted(row["name"] for row in listing
                           if row.get("harness") == harness
                           and (row.get("mode") or "execute") == "execute"
                           and _state(row) == "idle" and _awake_runner(row))
             if idle:
-                detail += " ; agents %s au repos : %s" % (harness, ", ".join(idle))
+                detail += "; idle %s agents: %s" % (harness, ", ".join(idle))
             if paid and harness not in paid:
                 if not spend_read:
                     spend, spend_read = _paid_spend(db, paid), True
-                if spend:
-                    detail += " ; pendant ce temps, %.2f $ payés au token sur 24 h" % spend
+                real, estimated = spend or (None, 0.0)
+                parts = []
+                if real:
+                    parts.append("$%.2f paid per token over 24 h (provider balances)" % real)
+                if estimated:
+                    parts.append("about $%.2f estimated per token over 24 h (no usable "
+                                 "balance reading)" % estimated)
+                if parts:
+                    detail += "; meanwhile, " + ", plus ".join(parts)
             responsible = _common_responsible(
                 [row for row in listing if row.get("harness") == harness])
             out.append(_alert(
@@ -351,9 +377,9 @@ def orchestrator_held(listing: list, now: float, orchestras: list, *,
             continue
         out.append(_alert(
             "orchestrator_held", row["name"], since, unread, held_s,
-            "orchestrateur tenu par une session interactive (%s) depuis %s, %d message(s) "
-            "non lu(s) : il ne répartit plus. Rendre la main (quitter la session : "
-            "l'exécuteur reprend le bail), ou traiter le courrier dans la session"
+            "orchestrator held by an interactive session (%s) for %s, %d unread "
+            "message(s): it no longer dispatches. Hand it back (quit the session: "
+            "the runner takes the lease back), or handle the mail in the session"
             % (row.get("lease_owner"), _duration(now - float(since)), unread),
             owner=row.get("lease_owner"), responsible=row.get("responsible") or None))
     return out
@@ -368,11 +394,39 @@ def idle_since(row: dict) -> float:
     return max(float(row.get("status_since_ts") or 0.0), float(row.get("last_turn_ts") or 0.0))
 
 
-def idle_agents(listing: list, now: float, idle_s: float) -> list:
+def free_of_lots(row: dict, *, waiting_free: bool = False) -> bool:
+    """L'agent n'a-t-il aucun lot qui l'occupe ? Strict : aucun lot assigné
+    ouvert. `waiting_free` (L165b) : chacun de ses lots attend un autre que lui
+    (`LOTS_WAITING_ON_OTHERS`) ou commence après aujourd'hui (`active_lots`
+    nul)."""
+    if not waiting_free or "active_lots" not in row:
+        return row.get("assigned_lot_id") is None
+    return not int(row.get("active_lots") or 0)
+
+
+def session_lot_busy(row: dict, *, waiting_free: bool = False) -> bool:
+    """Le lot de session de l'agent (assigné à lui ou à un autre) est-il
+    encore ouvert et l'occupe-t-il ? `waiting_free` (L165b) : pas s'il attend
+    un autre (`LOTS_WAITING_ON_OTHERS`) ou commence après aujourd'hui
+    (`session_lot_later`). Partagé par la prise (`backlog._awaited`) et
+    `idle_agents` (#318 r2)."""
+    from . import stagnation
+    state = row.get("session_lot_state")
+    if not state or state in stagnation.DONE_STATES:
+        return False
+    return not (waiting_free and (state in LOTS_WAITING_ON_OTHERS
+                                  or row.get("session_lot_later")))
+
+
+def idle_agents(listing: list, now: float, idle_s: float, *,
+                waiting_free: bool = False) -> list:
     """Les agents réveillables au repos sans lot ni courrier depuis au moins
     `idle_s` : mode `execute`, exécuteur vivant (pas une session attachée),
     au repos (ni en tour, ni en pause de budget, ni arrêtés). Partagé par
-    `idle_capacity`, `backlog_empty` et la prise automatique (L119)."""
+    `idle_capacity`, `backlog_empty` et la prise automatique (L119) ;
+    `waiting_free` : voir `free_of_lots` (L165b) ; une consigne en attente
+    et un lot de session qui l'occupe (`session_lot_busy`) occupent l'agent,
+    comme pour la prise (`backlog._awaited`)."""
     idle = []
     for row in listing:
         # un agent `externe` n'est jamais compté — dont le chat du
@@ -381,7 +435,10 @@ def idle_agents(listing: list, now: float, idle_s: float) -> list:
             continue
         if not _awake_runner(row) or int(row.get("unread") or 0):
             continue
-        if row.get("assigned_lot_id") is not None:
+        if not free_of_lots(row, waiting_free=waiting_free):
+            continue
+        if waiting_free and (row.get("has_pending_prompt")
+                             or session_lot_busy(row, waiting_free=True)):
             continue
         since = idle_since(row)
         if not since or now - since < idle_s:
@@ -408,10 +465,11 @@ def waiting_project_lots(lots: list) -> list:
 
 def idle_capacity(db, listing: list, now: float, orchestras: list, *,
                   idle_s: float = DEFAULT_IDLE_CAPACITY_S, paid=None,
-                  lots: list | None = None) -> list:
+                  lots: list | None = None, designers=()) -> list:
     if idle_s <= 0:
         return []
-    idle = idle_agents(listing, now, idle_s)
+    # L165b : un agent dont tous les lots attendent un autre est au repos
+    idle = idle_agents(listing, now, idle_s, waiting_free=True)
     if not idle:
         return []
     if lots is None:
@@ -429,33 +487,33 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     if not (waiting_lots or backlog or aggravating):
         return []
     names = sorted(row["name"] for row in idle)
-    parts = ["%d agent(s) réveillable(s) au repos sans lot depuis plus de %s : %s"
+    parts = ["%d wakeable agent(s) idle without a lot in progress for more than %s: %s"
              % (len(names), _duration(idle_s), ", ".join(names))]
     if waiting_lots:
-        parts.append("%d lot(s) ouvert(s) sans assigné (%s)" % (
+        parts.append("%d open lot(s) without an assignee (%s)" % (
             len(waiting_lots), ", ".join("#%d" % int(l["id"]) for l in waiting_lots[:8])
             + (", …" if len(waiting_lots) > 8 else "")))
     if backlog:
-        parts.append("courrier en souffrance chez %s" % ", ".join(
+        parts.append("mail waiting at %s" % ", ".join(
             sorted(row["name"] for row in backlog)))
     if aggravating:
-        parts.append("agents au forfait au repos (%s) pendant que des agents payés au token "
-                     "travaillent (%s)" % (", ".join(sorted(r["name"] for r in plan_idle)),
+        parts.append("plan agents idle (%s) while per-token agents "
+                     "are working (%s)" % (", ".join(sorted(r["name"] for r in plan_idle)),
                                           ", ".join(paid_working)))
     by_name = {row["name"]: row for row in listing}
     held = [n for n in orchestras if _attached(by_name.get(n) or {})]
     asleep = [n for n in orchestras if n not in held
               and _state(by_name.get(n) or {}) in ("stopped", "paused")]
     if held:
-        action = ("réveiller l'orchestrateur : %s est tenu par une session interactive "
-                  "(attach), rendez-lui la main ; ou répartir à la main "
+        action = ("wake the orchestrator: %s is held by an interactive session "
+                  "(attach), hand it back; or dispatch by hand "
                   "(ameesh work assign <lot> <agent>)" % ", ".join(held))
     elif asleep:
-        action = ("réveiller l'orchestrateur %s (arrêté ou en pause), ou répartir à la main "
+        action = ("wake the orchestrator %s (stopped or paused), or dispatch by hand "
                   "(ameesh work assign <lot> <agent>)" % ", ".join(asleep))
     else:
-        action = "répartir : ameesh work assign <lot> <agent>, ou écrire à l'orchestrateur"
-    detail = " ; ".join(parts) + ". Action : " + action
+        action = "dispatch: ameesh work assign <lot> <agent>, or write to the orchestrator"
+    detail = "; ".join(parts) + ". Action: " + action
     responsible = None
     for name in held + asleep + list(orchestras):
         responsible = (by_name.get(name) or {}).get("responsible")
@@ -467,11 +525,13 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         reason="forfait_au_repos" if aggravating else "travail_en_attente",
         agents=names, lots=[int(l["id"]) for l in waiting_lots[:50]],
         paid_working=paid_working, orchestrators=list(orchestras),
+        designers=[n for n in designers if n not in orchestras],
         responsible=responsible)]
 
 
 def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = None) -> dict:
-    """L118 : `idle_capacity` part aussi aux orchestrateurs, qui peuvent agir.
+    """L118 : `idle_capacity` part aussi aux orchestrateurs, qui peuvent agir,
+    et (L165b) aux agents de conception.
 
     Rend `{orchestrateur: texte}` : à chacun, les agents au repos sans lot de
     SON équipe (tous s'il n'en a pas) et les lots ouverts sans agent (un lot
@@ -483,22 +543,22 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
     titles = lot_titles or {}
     lots = [int(l) for l in alert.get("lots") or ()]
     out = {}
-    for orch in alert.get("orchestrators") or ():
+    for orch in list(alert.get("orchestrators") or ()) + list(alert.get("designers") or ()):
         team = ((by_name.get(orch) or {}).get("team") or "").strip()
         names = [n for n in alert.get("agents") or () if n != orch and (
             not team or ((by_name.get(n) or {}).get("team") or "").strip() == team)]
         if not names:
             continue
-        parts = ["Capacité au repos : %d agent(s) réveillable(s) sans lot depuis plus de %s : "
-                 "%s." % (len(names), _duration(alert.get("threshold") or 0), ", ".join(names))]
+        parts = ["Idle capacity: %d wakeable agent(s) without a lot in progress for more "
+                 "than %s: %s." % (len(names), _duration(alert.get("threshold") or 0), ", ".join(names))]
         if lots:
-            parts.append("Lots ouverts sans agent : %s." % ", ".join(
-                "#%d%s" % (i, " « %s »" % titles[i] if titles.get(i) else "")
+            parts.append("Open lots without an agent: %s." % ", ".join(
+                "#%d%s" % (i, " \"%s\"" % titles[i] if titles.get(i) else "")
                 for i in lots[:12]) + (" …" if len(lots) > 12 else ""))
         else:
-            parts.append("Aucun lot ouvert sans agent.")
-        parts.append("Confie-leur du travail en le liant à un lot : ameesh mail send <agent> "
-                     "\"…\" --lot <id> (ou --new-lot \"titre\"), ou ameesh work assign <lot> "
+            parts.append("No open lot without an agent.")
+        parts.append("Give them work tied to a lot: ameesh mail send <agent> "
+                     "\"…\" --lot <id> (or --new-lot \"title\"), or ameesh work assign <lot> "
                      "<agent>.")
         out[orch] = " ".join(parts)
     return out
@@ -559,16 +619,16 @@ def host_underused(cfg, db, listing: list, now: float, *,
             continue
         why = []
         if pressured:
-            why.append("%s sous pression (%s)" % (", ".join(h for h, _v in pressured), " ; ".join(
-                "%s %s (seuil %s)" % (b["label"], b["value"], b["limit"])
+            why.append("%s under pressure (%s)" % (", ".join(h for h, _v in pressured), "; ".join(
+                "%s %s (threshold %s)" % (b["label"], b["value"], b["limit"])
                 for _h, v in pressured for b in v["breaches"][:2])))
         if waiting:
-            why.append("agents en attente ailleurs : %s" % ", ".join(waiting))
-        detail = ("hôte %s sous-employé depuis %s (charge au plus %.2f par CPU, %.1f tour(s) en "
-                  "cours en moyenne) alors que %s. Suggestion : y placer des agents admis "
-                  "(ameesh placement check --agent <nom>, décision 0028) — aucun déplacement "
-                  "automatique" % (host, _duration(window_s), float(peak), turns,
-                                   " ; ".join(why)))
+            why.append("agents waiting elsewhere: %s" % ", ".join(waiting))
+        detail = ("host %s underused for %s (load at most %.2f per CPU, %.1f turn(s) "
+                  "running on average) while %s. Suggestion: place admitted agents there "
+                  "(ameesh placement check --agent <name>, decision 0028); nothing is moved "
+                  "automatically" % (host, _duration(window_s), float(peak), turns,
+                                   "; ".join(why)))
         out.append(_alert(
             "host_underused", None, None, round(float(peak), 3), load_max, detail,
             host=host, reason="pression_ailleurs" if pressured else "agents_en_attente",
@@ -629,26 +689,26 @@ def balance_low(db, listing: list, now: float, *,
         if not causes:
             continue
         who = "%s/%s" % (provider, account) if account else provider
-        parts = ["solde %s : %.2f %s (relevé le %s)" % (
+        parts = ["balance %s: %.2f %s (read on %s)" % (
             who, total, currency, _local_time(last["observed_ts"]))]
         if rate is not None:
-            parts.append("rythme réel %.2f %s/h (moyenne sur %s, recharges ignorées)"
+            parts.append("actual rate %.2f %s/h (average over %s, top-ups ignored)"
                          % (rate, currency, _duration(measured[1])))
         else:
-            parts.append("rythme réel inconnu (relevés insuffisants)")
+            parts.append("actual rate unknown (not enough readings)")
         empty_ts = None
         if autonomy_h is not None:
             empty_ts = float(last["observed_ts"]) + autonomy_h * 3600.0
-            parts.append("autonomie ≈ %s, épuisement prévu le %s"
+            parts.append("runway ≈ %s, expected to run out on %s"
                          % (_duration(autonomy_h * 3600.0), _local_time(empty_ts)))
         elif rate == 0:
-            parts.append("aucune dépense constatée sur la fenêtre")
-        parts.append("recharger le compte, ou orienter le travail vers les forfaits")
+            parts.append("no spending seen over the window")
+        parts.append("top up the account, or steer work to the plans")
         urgent = ((autonomy_h is not None and autonomy_h < BALANCE_URGENT_HOURS)
                   or (usd and total < BALANCE_URGENT_USD))
         out.append(_alert(
             "balance_low", None, None, round(total, 4),
-            min_usd if causes == ["solde"] else hours, " ; ".join(parts),
+            min_usd if causes == ["solde"] else hours, "; ".join(parts),
             provider=provider, currency=currency, account=account, causes=causes,
             balance=round(total, 4), rate_per_h=round(rate, 4) if rate is not None else None,
             autonomy_h=round(autonomy_h, 2) if autonomy_h is not None else None,
@@ -682,9 +742,9 @@ def backlog_empty(db, listing: list, now: float, *,
     names = sorted(row["name"] for row in idle)
     return [_alert(
         "backlog_empty", None, None, len(names), idle_s,
-        "%d agent(s) réveillable(s) au repos sans lot depuis plus de %s (%s) et la file "
-        "d'amélioration est vide. Action : ajouter des éléments à valeur attendue "
-        "(ameesh work backlog add), ou confier un lot (ameesh work assign)"
+        "%d wakeable agent(s) idle without a lot for more than %s (%s) and the improvement "
+        "backlog is empty. Action: add items with expected value "
+        "(ameesh work backlog add), or assign a lot (ameesh work assign)"
         % (len(names), _duration(idle_s), ", ".join(names)),
         agents=names, responsible=_common_responsible(idle))]
 
@@ -724,7 +784,10 @@ def alerts(cfg, db, listing: list, now: float | None = None, *,
         # L132 : `plan_underused` part aussi aux orchestrateurs (alert_briefs)
         alert["orchestrators"] = list(orchestras)
     out += orchestrator_held(listing, now, orchestras, held_s=orchestrator_held_s)
-    out += idle_capacity(db, listing, now, orchestras, idle_s=idle_capacity_s, paid=paid)
+    names = {row["name"] for row in listing}
+    designers = sorted(n for n in role_orchestrators(canons, DESIGN_ROLES) if n in names)
+    out += idle_capacity(db, listing, now, orchestras, idle_s=idle_capacity_s, paid=paid,
+                         designers=designers)
     out += host_underused(cfg, db, listing, now, window_s=host_underused_s,
                           load_max=host_underused_load, turns_max=host_underused_turns,
                           idle_mail_s=idle_mail_s, canons=canons)

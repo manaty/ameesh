@@ -196,6 +196,7 @@ def annotate(db, rows: list[dict], *, now: float | None = None,
         row["waiting_for"] = info["waiting"]
         row["last_activity_ts"] = info["last_activity_ts"]
         row["stale"] = info["stale"]
+        row["planned_wait"] = info["planned_wait"]
         # L40 (0030) : délégation à échéance (« délégué par X, échéance dans … »)
         row["delegation"] = work_mod.delegation_view(row, now)
     return rows
@@ -207,4 +208,4 @@ def describe_age(seconds) -> str:
         return "%d min" % (seconds // 60)
     if seconds < 86400:
         return "%d h" % (seconds // 3600)
-    return "%d j %d h" % (seconds // 86400, (seconds % 86400) // 3600)
+    return "%d d %d h" % (seconds // 86400, (seconds % 86400) // 3600)

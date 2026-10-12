@@ -129,15 +129,15 @@ class Store:
     def save_request(self, record: dict, token: str) -> None:
         request_id = record["request_id"]
         if not REQUEST_ID_RE.fullmatch(request_id):
-            raise ValueError("request_id invalide")
+            raise ValueError("invalid request_id")
         digest = token_hash(token)
         record = dict(record, token_hash=digest)
         if not self._write(self._path("requests", request_id + ".json"), self._dump(record),
                            exclusive=True):
-            raise ValueError("request_id déjà utilisé")
+            raise ValueError("request_id already used")
         if not self._write(self._path("links", digest), request_id.encode("ascii"),
                            exclusive=True):
-            raise ValueError("jeton déjà enregistré")
+            raise ValueError("token already recorded")
 
     def get_request(self, request_id: str) -> dict | None:
         if not isinstance(request_id, str) or not REQUEST_ID_RE.fullmatch(request_id):
@@ -180,7 +180,7 @@ class Store:
         record = dict(record, token_hash=digest)
         if not self._write(self._path("enroll", digest + ".json"), self._dump(record),
                            exclusive=True):
-            raise ValueError("jeton d'enrôlement déjà enregistré")
+            raise ValueError("enrollment token already recorded")
 
     def enroll_by_token(self, token: str) -> dict | None:
         if not isinstance(token, str) or not TOKEN_RE.fullmatch(token):

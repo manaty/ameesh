@@ -42,6 +42,8 @@ agent-mail = "ameesh.cli:main"
 agent-runner = "ameesh.runner:main"
 #: service d'approbation humaine (spec §9), lancé sous son propre utilisateur
 ameesh-approve = "ameesh.approve.cli:main"
+# Isolated, one-shot IT execution proof producer; never an agent credential.
+ameesh-it-proof = "ameesh.modules.it.proof_service:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

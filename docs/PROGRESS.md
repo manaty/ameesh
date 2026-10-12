@@ -7,10 +7,17 @@ lot transitions (`work_items`, `work_item_events`), gated actions
 (`actions`), turns and leases from the registry (`agent_registry`, `spend_pending`),
 cost ledger (`turn_costs`). Neither git nor the board is read.
 
+L78 adds `agents[].conversation`: the latest 20 detail entries, the durable
+per-agent cursor and `ameesh-conversation/1` schema. See
+[Conversation log](CONVERSATIONS.md) for producer APIs, retention, the R12
+thread and subscriber cursor recovery. Text requires the explicit content
+supervision role; the raw thread outbox is not exported.
+
 ```
 ameesh progress [--project P] [--since 24h] [--stale-after 6h]   # text, narrow terminal
 ameesh progress --json [--project P] [--since 24h]   # this schema
 ameesh progress --html FICHIER [--project P] [--since 24h]
+ameesh progress --serve [--port 8765] [--project P] [--since 24h]   # local page (L304)
 ameesh progress … --no-gantt                         # without the roadmap (L96)
 ```
 
@@ -33,10 +40,70 @@ ameesh progress … --no-gantt                         # without the roadmap (L9
   embedded data, `default-src 'none'` policy: no network
   request, no font or CDN), readable on a phone. No server:
   open the file, or copy it wherever you want. Atomic write (temporary
-  file then rename); to regenerate, rerun the command.
+  file then rename); to regenerate, rerun the command. Its Refresh button is
+  disabled ("open with --serve to refresh").
+
+**The page** (L304, static or served) shows little per screen: tabs
+**Overview** (one card per project, from `overview`: open lots,
+lots merged in the window, pending decisions, 24 h spend, next milestone
+with its progress bar, two warnings at most; then "Watch": overdue or
+urgent decisions, blocked and stale lots), **Gantt** (the roadmap: tasks
+grouped by epic, or by project when they have none, an epic without any
+task keeping its own group, as does a planned epic whose tasks are all
+finished and hidden, groups folded by default unless they hold a
+late task (in progress alone is not enough), with a summary bar and their open, delivered, blocked and late
+counts; delivered and abandoned tasks hidden unless ticked; week zoom fits
+the window on screen, day zoom gives each day a column and scrolls to
+today, `z=day` in the URL; a milestone can narrow the window to the span of all its dates, planned
+and actual, in calendar days; a task opens
+its lot window),
+**Work items**, **Agents** (tables with a text filter and sortable columns;
+merged and closed lots, stopped agents hidden by default), **Budget** and
+**Decisions**. A project selector sits on top (served: the snapshot is read
+again with `?project=`; static: the page filters lots, agents, cards and
+decisions and Gantt tasks, and says that budget, milestones and epics
+cover all projects). Details open
+in **windows** on click (lot: dated milestones, waiting_for, cost, its
+decisions, thread command; agent; milestone: epics and open lots; decision:
+options, recommendation, answer command). Light, dark or system theme
+(remembered by the browser). Open tab, project and auto-refresh live in
+the URL (`#tab=lots&p=demo&auto=1`, `#tab=gantt&z=day`).
+
+* `--serve [--port 8765]` (L304): serves the same page and this JSON from
+  a local server, **read-only**, until Ctrl-C. See "Local server" below.
 
 Exit codes: 0, 1 (database unreachable, schema missing, SQL error),
-2 (unreadable option).
+2 (unreadable option, `--port` without `--serve`, `--serve` with `--html` or
+`--json`, port unavailable).
+
+## Local server (`--serve`, L304)
+
+| Path | Response |
+|---|---|
+| `/` | the page **without data** (no token needed, nothing to protect): it reads `/api/progress.json` with the token; its **Refresh** button fetches it again without reloading (open tab, filters and detail window kept), optionally every 60 s; "data as of HH:MM" is `generated_ts`; a failed fetch is said and the previous data stay. The served page's policy adds `connect-src 'self'` and nothing else |
+| `/api/progress.json` | this schema, with `Authorization: Bearer <token>` only (401 otherwise); `?project=P` takes a project known to the unfiltered snapshot (400 otherwise), empty = all projects |
+
+* **Bound to `127.0.0.1` only**; no option changes the address. The `Host`
+  header must be `127.0.0.1:<port>` or `localhost:<port>` (403 otherwise:
+  DNS rebinding).
+* **Read-only**: `GET` and `HEAD` only (405 with `Allow: GET, HEAD`
+  otherwise), and every snapshot is read through a database session opened
+  with `default_transaction_read_only=on`.
+* **Token**: the host is shared by several agents and Unix accounts, which
+  `127.0.0.1` does not keep out. Each start draws a random token, printed
+  **only on the command's output**: `http://127.0.0.1:<port>/#t=<token>`.
+  It sits in the URL **fragment**, which the browser never sends; the page
+  moves it to `sessionStorage` (isolated per origin, so per port), removes
+  it from the URL and sends it in an `Authorization: Bearer` header. **No
+  cookie**: browsers share `127.0.0.1` cookies across ports, so any local
+  server another account runs on another port would receive them. The
+  custom header also turns any cross-origin fetch into a preflight, which
+  gets 405. The token is compared in constant time; a restart draws a new
+  one (old links stop working). Request lines are logged on stderr as
+  method and path only, and error pages (malformed request included) never
+  echo the request.
+* A snapshot is kept 5 s per project: an open tab does not hammer the
+  database. Responses carry `Cache-Control: no-store`.
 
 ## Conventions
 
@@ -57,6 +124,8 @@ Exit codes: 0, 1 (database unreachable, schema missing, SQL error),
 | `host` | text | host that produced the snapshot |
 | `project` | text \| null | `--project` filter |
 | `window` | `{from_ts, to_ts}` | timeline window |
+| `overview` | list | (L304) one card per entry of `projects`, same order: `{project, active, lots_open, lots_merged_in_window, agents_active, agents_working, spend_24h_usd, decisions_pending, milestone, warnings}`; `milestone` = the next unreached plan milestone carrying a lot of the project (earliest dated first, undated last) `{id, title, date, progress, lots_merged, lots_total}`, or null |
+| `decisions` | list | (L304) pending decision requests, oldest first, `ameesh-decision/1` items (`ameesh decisions --json`); filtered by `--project` on their `project` |
 | `roadmap` | object \| null | (L96) the roadmap, `ameesh-roadmap/1` schema ([EXPLOITATION.md](EXPLOITATION.md), "Feuille de route" (roadmap) section); `null` with `--no-gantt` |
 | `projects` | list | (L62) the per-project view of `ameesh projects` (item schema: `ameesh-projects/1`, [EXPLOITATION.md](EXPLOITATION.md)); filtered by `--project` on the project name; at the top of the text and the page |
 | `lots` | list | see below, oldest to newest |

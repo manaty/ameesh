@@ -47,9 +47,9 @@ profile_params = _pg_placement.profile_params
 
 def diverged_diagnostic(evaluated: str | None, current: str | None) -> str:
     """Raison lisible : le profil de l'agent n'est plus celui que le verdict a jugé."""
-    return ("profil divergé depuis l'évaluation du placement (évalué : %s ; actuel : %s) : "
-            "non réclamable jusqu'au prochain « ameesh canon sync »" % (
-                evaluated or "aucun", current or "?"))
+    return ("profile diverged since the placement was evaluated (evaluated: %s; current: %s): "
+            "not claimable until the next \"ameesh canon sync\"" % (
+                evaluated or "none", current or "?"))
 
 
 def admitted_hosts(canon: Canon, admission) -> list[str]:
@@ -102,10 +102,10 @@ class Verdict:
 
     def describe(self) -> str:
         if self.ok:
-            return "admis (mode %s)" % (self.credential_mode or "non déclaré")
+            return "admitted (mode %s)" % (self.credential_mode or "not declared")
         if self.ok is None:
-            return "non évalué — %s" % (self.diagnostic or "?")
-        return "REFUSÉ — %s" % (self.diagnostic or "?")
+            return "not evaluated — %s" % (self.diagnostic or "?")
+        return "REFUSED — %s" % (self.diagnostic or "?")
 
 
 def evaluate(canon: Canon, agent: str, host: str) -> Verdict:
@@ -127,33 +127,33 @@ def evaluate(canon: Canon, agent: str, host: str) -> Verdict:
         credential_mode=((admission.credential_mode if admission else None)
                          or (fiche.credential_mode if fiche else None)))
     if fiche is None:
-        verdict.diagnostic = "fiche Agent %s introuvable dans le canon" % agent
+        verdict.diagnostic = "Agent card %s not found in the canon" % agent
         return verdict
     if len(fiches) > 1:
-        verdict.diagnostic = "fiche Agent %s déclarée %d fois : placement ambigu" % (
+        verdict.diagnostic = "Agent card %s declared %d times: ambiguous placement" % (
             agent, len(fiches))
         return verdict
     if len(placements) > 1:
-        verdict.diagnostic = "admission ambiguë : %s admis %d fois" % (agent, len(placements))
+        verdict.diagnostic = "ambiguous admission: %s admitted %d times" % (agent, len(placements))
         return verdict
     if admission is None:
-        verdict.diagnostic = "aucune admission de %s" % agent
+        verdict.diagnostic = "no admission for %s" % agent
         return verdict
     hosts = [h for h in canon.hosts if h.title == host]
     if not hosts:
-        verdict.diagnostic = "hôte %s sans fiche Host : politique inconnue" % host
+        verdict.diagnostic = "host %s has no Host card: unknown policy" % host
         return verdict
     if len(hosts) > 1:
-        verdict.diagnostic = "hôte %s déclaré %d fois : politique ambiguë" % (host, len(hosts))
+        verdict.diagnostic = "host %s declared %d times: ambiguous policy" % (host, len(hosts))
         return verdict
     admis = admitted_hosts(canon, admission)
     if host not in admis:
-        verdict.diagnostic = "hôte %s non admis pour %s (admis : %s)" % (
-            host, agent, ", ".join(admis) or "aucun")
+        verdict.diagnostic = "host %s not admitted for %s (admitted: %s)" % (
+            host, agent, ", ".join(admis) or "none")
         return verdict
     reasons = canon_mod.placement_violations(fiche, hosts[0], admission)
     verdict.ok = not reasons
-    verdict.diagnostic = " ; ".join(reasons)
+    verdict.diagnostic = "; ".join(reasons)
     return verdict
 
 
@@ -198,12 +198,12 @@ def proposals(canon: Canon, agent: str,
         reasons: list[str] = []
         modes: list[str] | None = None
         if admission is None:
-            reasons.append("aucune admission de %s, ou plusieurs (ambiguë)" % agent)
+            reasons.append("no admission for %s, or several (ambiguous)" % agent)
         elif title not in admis:
-            reasons.append("hôte %s non admis pour %s (admis : %s)" % (
-                title, agent, ", ".join(sorted(admis)) or "aucun"))
+            reasons.append("host %s not admitted for %s (admitted: %s)" % (
+                title, agent, ", ".join(sorted(admis)) or "none"))
         if len(hosts) > 1:
-            reasons.append("hôte %s déclaré %d fois : politique ambiguë" % (title, len(hosts)))
+            reasons.append("host %s declared %d times: ambiguous policy" % (title, len(hosts)))
         else:
             policy = hosts[0].policy
             # harnais, fournisseur, modèle : ce que l'admission ne peut pas changer
@@ -212,14 +212,14 @@ def proposals(canon: Canon, agent: str,
                 "models": policy.models}})
             modes = None if policy.credential_modes is None else list(policy.credential_modes)
             if modes == []:
-                reasons.append("aucun mode d'identifiants admis par l'hôte %s" % title)
+                reasons.append("no credential mode admitted by host %s" % title)
             others = [p for p in canon.placements if p.agent != agent
                       and title in admitted_hosts(canon, p)]
             if policy.max_agents is not None and len(others) >= policy.max_agents:
-                reasons.append("hôte %s complet : %d placement(s) pour max_agents = %d"
+                reasons.append("host %s full: %d placement(s) for max_agents = %d"
                                % (title, len(others), policy.max_agents))
         for finding in block.by_host.get(title, []):
-            reasons.append("fiche Host en erreur : %s (%s)" % (finding.code, finding.where()))
+            reasons.append("Host card in error: %s (%s)" % (finding.code, finding.where()))
         if modes is None:
             mode = fiche.credential_mode
         elif fiche.credential_mode in modes:
@@ -290,7 +290,7 @@ def recorded(db: Db, host: str | None = None) -> dict[str, dict]:
             why = diverged_diagnostic(row.get("placement_profile"),
                                       row.get("placement_profile_current"))
             if row.get("placement_ok") is not True and row.get("placement_diagnostic"):
-                why += " ; verdict à l'évaluation : %s" % row["placement_diagnostic"]
+                why += "; verdict at evaluation: %s" % row["placement_diagnostic"]
             entry["placement_diagnostic"] = why
         out[row["name"]] = entry
     return out

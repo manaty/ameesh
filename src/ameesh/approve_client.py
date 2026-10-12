@@ -80,25 +80,25 @@ def endpoint(url: str) -> str:
     text = (url or "").strip()
     if not text:
         raise ApproveClientError(
-            "config", "ameesh-approve non configuré : AMEESH_APPROVE_URL (et "
-            "AMEESH_APPROVE_TOKEN_FILE, le jeton de service en 0600)")
+            "config", "ameesh-approve not configured: AMEESH_APPROVE_URL (and "
+            "AMEESH_APPROVE_TOKEN_FILE, the service token in 0600)")
     try:
         parts = urlsplit(text)
         host = parts.hostname or ""
         parts.port  # noqa: B018 - lève ValueError sur un port illisible
     except ValueError as exc:
-        raise ApproveClientError("config", "AMEESH_APPROVE_URL illisible : %s" % exc) from exc
+        raise ApproveClientError("config", "AMEESH_APPROVE_URL unreadable: %s" % exc) from exc
     if parts.scheme not in ("https", "http") or not host:
-        raise ApproveClientError("config", "AMEESH_APPROVE_URL : https://hôte[:port] attendu")
+        raise ApproveClientError("config", "AMEESH_APPROVE_URL: expected https://host[:port]")
     if parts.username is not None or parts.password is not None or parts.query \
             or parts.fragment:
-        raise ApproveClientError("config", "AMEESH_APPROVE_URL : ni identifiants, ni requête, "
-                                           "ni fragment")
+        raise ApproveClientError("config", "AMEESH_APPROVE_URL: no credentials, query "
+                                           "or fragment")
     if parts.scheme == "http" and not _loopback(host):
         raise ApproveClientError(
-            "config", "AMEESH_APPROVE_URL : http seulement sur la boucle locale (127.0.0.1, "
-                      "::1, localhost) ; sinon https — le jeton de service ne circule jamais "
-                      "en clair")
+            "config", "AMEESH_APPROVE_URL: http only on loopback (127.0.0.1, "
+                      "::1, localhost); https otherwise, the service token never travels "
+                      "in clear text")
     return text.rstrip("/")
 
 
@@ -136,13 +136,13 @@ def tls_name(cfg: Config, url: str) -> str:
     if not name:
         return ""
     if not _TLS_NAME_RE.fullmatch(name):
-        raise ApproveClientError("config", "AMEESH_APPROVE_TLS_NAME : nom d'hôte attendu")
+        raise ApproveClientError("config", "AMEESH_APPROVE_TLS_NAME: host name expected")
     parts = urlsplit(url)
     if parts.scheme != "https" or not _loopback(parts.hostname or ""):
         raise ApproveClientError(
-            "config", "AMEESH_APPROVE_TLS_NAME ne sert qu'avec AMEESH_APPROVE_URL "
-                      "https://127.0.0.1:PORT (TLS local du service) ; ailleurs, le nom "
-                      "vérifié est celui de l'URL")
+            "config", "AMEESH_APPROVE_TLS_NAME only applies with AMEESH_APPROVE_URL "
+                      "https://127.0.0.1:PORT (the service's local TLS); elsewhere, the name "
+                      "checked is the URL's")
     return name
 
 
@@ -156,8 +156,8 @@ def _opener(name: str = "") -> urllib.request.OpenerDirector:
 def _token(cfg: Config) -> str:
     from .approve.config import ApproveConfigError, read_service_token
     if not cfg.approve_token_file:
-        raise ApproveClientError("config", "AMEESH_APPROVE_TOKEN_FILE non configuré (fichier "
-                                           "0600 du jeton de service d'ameesh-approve)")
+        raise ApproveClientError("config", "AMEESH_APPROVE_TOKEN_FILE not configured (0600 "
+                                           "file holding the ameesh-approve service token)")
     try:
         return read_service_token(cfg.approve_token_file)
     except ApproveConfigError as exc:
@@ -181,7 +181,7 @@ def _call(cfg: Config, method: str, path: str, body: dict | None = None, *,
         with _opener(name).open(request, timeout=TIMEOUT) as response:
             payload = response.read(MAX_RESPONSE + 1)
             if len(payload) > MAX_RESPONSE:
-                raise ApproveClientError("too_large", "réponse d'ameesh-approve trop grosse",
+                raise ApproveClientError("too_large", "ameesh-approve response too large",
                                          response.status)
             return response.status, payload
     except urllib.error.HTTPError as exc:
@@ -192,12 +192,12 @@ def _call(cfg: Config, method: str, path: str, body: dict | None = None, *,
         finally:
             exc.close()
         if 300 <= exc.code < 400:
-            raise ApproveClientError("redirect", "ameesh-approve répond par une redirection "
-                                                 "(HTTP %d) : refusée" % exc.code, exc.code)
+            raise ApproveClientError("redirect", "ameesh-approve answered with a redirect "
+                                                 "(HTTP %d): refused" % exc.code, exc.code)
         return exc.code, payload
     except (urllib.error.URLError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
-        raise ApproveClientError("unreachable", "ameesh-approve injoignable (%s)"
+        raise ApproveClientError("unreachable", "ameesh-approve unreachable (%s)"
                                  % " ".join(str(reason).split())[:200]) from exc
 
 
@@ -214,9 +214,9 @@ def _refusal(status: int, payload: bytes) -> ApproveClientError:
     code = str(data.get("error") or "http_%d" % status)[:64]
     message = " ".join(str(data.get("message") or "HTTP %d" % status).split())[:300]
     if status == 421:
-        message += (" — l'API de service n'est pas servie sous cet hôte : AMEESH_APPROVE_URL "
-                    "vise la boucle locale du service, un accès privé, ou l'hôte public "
-                    "seulement si le service l'ouvre (api_via_public dans son JSON)")
+        message += (" (the service API is not served under this host: AMEESH_APPROVE_URL "
+                    "must target the service's loopback, a private access, or the public "
+                    "host only if the service opens it (api_via_public in its JSON))")
     return ApproveClientError(code, message, status)
 
 
@@ -233,7 +233,7 @@ def health(cfg: Config, *, url: str | None = None) -> dict:
     if data.get("service") != "ameesh-approve" or not isinstance(data.get("rp_id"), str) \
             or not isinstance(data.get("origins"), list) \
             or not all(isinstance(o, str) for o in data["origins"]):
-        raise ApproveClientError("format", "réponse /health d'ameesh-approve illisible", status)
+        raise ApproveClientError("format", "unreadable /health response from ameesh-approve", status)
     return {name: data.get(name) for name in HEALTH_FIELDS}
 
 
@@ -248,7 +248,7 @@ def create_request(cfg: Config, *, action_id: str, approver: str, requested_by: 
     data = _json(payload)
     if not REQUEST_ID_RE.fullmatch(str(data.get("request_id") or "")) \
             or not isinstance(data.get("link"), str):
-        raise ApproveClientError("format", "réponse d'ameesh-approve illisible", status)
+        raise ApproveClientError("format", "unreadable response from ameesh-approve", status)
     return data
 
 
@@ -256,7 +256,7 @@ def fetch_receipt(cfg: Config, request_id: str) -> tuple[str, bytes | dict]:
     """`GET /receipts/<id>` : ("signed", octets du reçu) | ("pending", infos) |
     ("expired", infos). Toute autre réponse : ApproveClientError."""
     if not REQUEST_ID_RE.fullmatch(request_id or ""):
-        raise ApproveClientError("format", "identifiant de demande « req_… » attendu")
+        raise ApproveClientError("format", "request id \"req_...\" expected")
     status, payload = _call(cfg, "GET", "/receipts/" + request_id)
     if status == 200:
         return "signed", payload

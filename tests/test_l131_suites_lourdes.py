@@ -3,6 +3,7 @@
 live in a temporary state directory, no database."""
 from __future__ import annotations
 
+import io
 import os
 import signal
 import subprocess
@@ -269,6 +270,133 @@ class RunChildTest(unittest.TestCase):
         self.assertIn(b"got yes", out)
         self.assertIn(b"fg True", out)       # the wrapper took the terminal back
 
+    def test_the_terminal_left_to_the_shell_stays_with_it(self):
+        # L131d (codex r2 of #266): stopped, sent to the background and left
+        # to exit, the command leaves the foreground with the shell — the
+        # wrapper's cleanup must not take it from the shell
+        import pty
+        import termios
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        env = dict(os.environ, PYTHONPATH=SRC, AMEESH_MAX_HEAVY_SUITES="1")
+        child = ("import os, signal, sys; signal.signal(signal.SIGTTOU, signal.SIG_IGN); "
+                 "fd = os.open('/dev/tty', os.O_RDWR); os.tcsetpgrp(fd, int(sys.argv[1]))")
+        # the "shell": a group of its own, not a child of the wrapper (its
+        # cleanup would stop it), reparented to init before heavy.run
+        code = ("import os, signal, sys, time, types; from ameesh import heavy\n"
+                "r, w = os.pipe()\n"
+                "if os.fork() == 0:\n"
+                "    if os.fork() == 0:\n"
+                "        os.setpgid(0, 0); os.write(w, b'%8d' % os.getpid()); time.sleep(30)\n"
+                "    os._exit(0)\n"
+                "os.wait()\n"
+                "shell = int(os.read(r, 8))\n"
+                "cfg = types.SimpleNamespace(state_dir=sys.argv[1], max_heavy_suites=1)\n"
+                "rc = heavy.run(cfg, [sys.executable, '-c', sys.argv[2], str(shell)], nice=0)\n"
+                "print('shell keeps it', os.tcgetpgrp(0) == shell, flush=True)\n"
+                "os.kill(shell, signal.SIGKILL)\n"
+                "raise SystemExit(rc)\n")
+
+        def controlling():
+            import fcntl
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        proc = subprocess.Popen([sys.executable, "-c", code, self.state, child],
+                                stdin=slave, stdout=slave, stderr=slave, env=env,
+                                start_new_session=True, preexec_fn=controlling)
+        os.close(slave)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        out = self._read_until(master, b"shell keeps it ", 20)
+        self.assertEqual(proc.wait(timeout=20), 0, out)
+        self.assertIn(b"shell keeps it True", out + self._read_until(master, b"True", 2))
+
+    def _on_pty(self, child: str, *, stdin_null: bool = False):
+        """The wrapper as a session leader on a new pty (its controlling
+        terminal, wrapper in the foreground): (process, master fd)."""
+        import pty
+        import termios
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        env = dict(os.environ, PYTHONPATH=SRC, AMEESH_MAX_HEAVY_SUITES="1")
+        code = ("import sys, types; from ameesh import heavy; "
+                "cfg = types.SimpleNamespace(state_dir=sys.argv[1], max_heavy_suites=1); "
+                "raise SystemExit(heavy.run(cfg, [sys.executable, '-c', sys.argv[2]], nice=0))")
+
+        def controlling():
+            import fcntl
+            fcntl.ioctl(1, termios.TIOCSCTTY, 0)
+
+        proc = subprocess.Popen([sys.executable, "-c", code, self.state, child],
+                                stdin=subprocess.DEVNULL if stdin_null else slave,
+                                stdout=slave, stderr=slave, env=env,
+                                start_new_session=True, preexec_fn=controlling)
+        os.close(slave)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        return proc, master
+
+    @staticmethod
+    def _read_until(master: int, needle: bytes, timeout: float = 15.0) -> bytes:
+        import select
+        out, deadline = b"", time.monotonic() + timeout
+        while needle not in out and time.monotonic() < deadline:
+            if select.select([master], [], [], 0.2)[0]:
+                try:
+                    out += os.read(master, 4096)
+                except OSError:
+                    break
+        return out
+
+    def test_reads_dev_tty_with_stdin_redirected(self):
+        # L131c (codex r4): stdin is /dev/null, the command opens /dev/tty
+        proc, master = self._on_pty(
+            "import os; fd = os.open('/dev/tty', os.O_RDWR); os.write(fd, b'?'); "
+            "print('got', os.read(fd, 100).decode().strip(), flush=True)", stdin_null=True)
+        self.assertIn(b"?", self._read_until(master, b"?"))
+        os.write(master, b"yes\n")
+        self.assertEqual(proc.wait(timeout=20), 0)
+        self.assertIn(b"got yes", self._read_until(master, b"got yes", 5))
+
+    def test_ctrl_z_suspends_the_wrapper_and_fg_resumes(self):
+        # L131c (codex r4): Ctrl-Z stops the command's group; the wrapper
+        # stops too (the shell gets its prompt), and SIGCONT (`fg`) resumes
+        proc, master = self._on_pty("print('got', input('?'), flush=True)")
+        self.assertIn(b"?", self._read_until(master, b"?"))
+        os.write(master, b"\x1a")                       # Ctrl-Z
+        status, deadline = None, time.monotonic() + 15
+        while status is None and time.monotonic() < deadline:
+            pid, raw = os.waitpid(proc.pid, os.WUNTRACED | os.WNOHANG)
+            status = raw if pid else None
+            time.sleep(0.05)
+        self.assertIsNotNone(status, "the wrapper did not stop with its command")
+        self.assertTrue(os.WIFSTOPPED(status))
+        os.kill(proc.pid, signal.SIGCONT)                # what `fg` sends
+        os.write(master, b"yes\n")
+        self.assertEqual(proc.wait(timeout=20), 0)
+        self.assertIn(b"got yes", self._read_until(master, b"got yes", 5))
+
+    def test_a_fork_chain_and_setsid_cannot_outlive_the_slot(self):
+        # L131c (codex r4): W1 forks W2 and exits, W2 leaves the group
+        # (setsid), forks W3 and exits; W3 runs on — the wrapper, a
+        # subreaper, adopts it and stops it before releasing the slot
+        chain = ("import os, sys, time\n"
+                 "r, w = os.pipe()\n"
+                 "if os.fork() == 0:\n"
+                 "    if os.fork() == 0:\n"
+                 "        os.setsid()\n"
+                 "        if os.fork() == 0:\n"
+                 "            os.write(w, b'%d\\n' % os.getpid()); time.sleep(60)\n"
+                 "        os._exit(0)\n"
+                 "    os._exit(0)\n"
+                 "print(os.getpid(), flush=True)\n"
+                 "print(os.read(r, 100).decode().strip(), flush=True)\n")
+        proc, (command, w3) = self._wrapper(chain, grace=1.0, pids=2)
+        self.assertNotEqual(os.getsid(w3), os.getsid(command))
+        self.assertEqual(proc.wait(timeout=20), 0)
+        self.assertTrue(self._gone(w3))
+        got = heavy.acquire(self.one, max_wait_s=0)
+        self.assertIsNotNone(got)
+        heavy.release(got[1])
+
 
 class DrainTest(unittest.TestCase):
     def test_one_empty_scan_is_not_enough(self):
@@ -301,6 +429,97 @@ class DrainTest(unittest.TestCase):
             self.assertFalse(heavy._group_alive(4242))      # only a zombie left
             table.append({"pid": 3, "pgid": 4242, "zombie": False})
             self.assertTrue(heavy._group_alive(4242))
+
+
+class TreeReviewR1Test(unittest.TestCase):
+    """#266 r1 (codex)."""
+
+    @staticmethod
+    def _clock():
+        t = [0.0]
+
+        def clock():
+            t[0] += 1.0
+            return t[0]
+        return clock
+
+    def test_a_read_that_reaps_a_zombie_is_read_again(self):
+        # a listed child forks a setsid replacement and exits before its
+        # state is read: the zombie is reaped, its replacement must be seen
+        from ameesh import platform
+        reads = iter([[{"pid": 10, "zombie": True}], [{"pid": 11, "zombie": False}],
+                      [], [], [], [], []])
+        killed = []
+        with mock.patch.object(platform, "children", side_effect=lambda: next(reads)), \
+                mock.patch.object(platform, "reap", return_value=0), \
+                mock.patch.object(heavy.os, "kill",
+                                  side_effect=lambda pid, sig: killed.append((pid, sig))):
+            self.assertTrue(heavy._drain_tree(1, grace=5, sleep=lambda s: None,
+                                              clock=self._clock()))
+        self.assertEqual(killed, [(11, signal.SIGTERM)])
+
+    def test_a_leftover_that_may_not_be_signalled_does_not_stop_the_cleanup(self):
+        from ameesh import platform
+        killed = []
+
+        def kill(pid, sig):
+            if pid == 20:
+                raise PermissionError(1, "Operation not permitted")
+            killed.append((pid, sig))
+        rows = [{"pid": 20, "zombie": False}, {"pid": 21, "zombie": False}]
+        err = io.StringIO()
+        with mock.patch.object(platform, "children", return_value=rows), \
+                mock.patch.object(heavy.os, "kill", side_effect=kill), \
+                mock.patch.object(heavy.sys, "stderr", err):
+            self.assertFalse(heavy._drain_tree(1, grace=3, sleep=lambda s: None,
+                                               clock=self._clock()))
+        self.assertEqual(killed, [(21, signal.SIGTERM), (21, signal.SIGKILL)])
+        self.assertEqual(err.getvalue().count("process 20 "), 1)
+
+    def test_a_fork_churn_does_not_delay_the_signals_nor_the_deadline(self):
+        # L131d (codex r2 of #266): every read reaps a zombie — the one that
+        # just forked its replacement — and lists that replacement
+        from ameesh import platform
+        pids = iter(range(100, 10000))
+        reads = []
+
+        def churn():
+            reads.append(1)
+            if len(reads) > 500:
+                raise AssertionError("drain stuck in the churn")
+            return [{"pid": next(pids), "zombie": True}, {"pid": next(pids), "zombie": False}]
+
+        killed = []
+        with mock.patch.object(platform, "children", side_effect=churn), \
+                mock.patch.object(platform, "reap", return_value=0), \
+                mock.patch.object(heavy.os, "kill",
+                                  side_effect=lambda pid, sig: killed.append((pid, sig))):
+            self.assertFalse(heavy._drain_tree(1, grace=3, sleep=lambda s: None,
+                                               clock=self._clock()))
+        self.assertEqual(killed[0], (101, signal.SIGTERM))   # the first read signals
+        self.assertIn(signal.SIGKILL, [sig for _, sig in killed])
+        self.assertLess(len(reads), 30)
+
+    def _suspend(self, owners):
+        owner = iter(owners)
+        moved = []
+        with mock.patch.object(heavy.os, "tcgetpgrp", side_effect=lambda fd: next(owner)), \
+                mock.patch.object(heavy.os, "tcsetpgrp",
+                                  side_effect=lambda fd, pg: moved.append(pg)), \
+                mock.patch.object(heavy.os, "getpgrp", return_value=300), \
+                mock.patch.object(heavy.os, "kill"), \
+                mock.patch.object(heavy, "_killpg", return_value=True) as cont:
+            heavy._suspend(7, 500)
+        cont.assert_called_once_with(500, signal.SIGCONT)
+        return moved
+
+    def test_a_command_stopped_in_the_background_leaves_the_terminal_to_the_shell(self):
+        # `bg` then a read of the terminal (SIGTTIN): the shell (999) holds
+        # the foreground, the wrapper must not take it
+        self.assertEqual(self._suspend([999, 999]), [])
+
+    def test_ctrl_z_then_fg_hands_the_terminal_back_to_the_command(self):
+        self.assertEqual(self._suspend([500, 300]), [300, 500])
 
 
 class NoteTest(unittest.TestCase):

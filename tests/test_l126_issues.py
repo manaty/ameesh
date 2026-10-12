@@ -56,18 +56,18 @@ class SettingsTest(unittest.TestCase):
 
     def test_refus(self):
         for raw, needle in (
-            ([], "objet JSON"),
-            ({"projets": {}}, "clé(s) inconnue(s)"),
-            ({"projects": []}, "attendu"),
+            ([], "JSON object"),
+            ({"projets": {}}, "unknown key(s)"),
+            ({"projects": []}, "expected"),
             ({"projects": {"web": "pas un dépôt"}}, "owner/repo"),
-            ({"projects": {"web": {"repo": PUBLIC, "visibility": "public"}}}, "inconnue"),
-            ({"projects": {"web": PUBLIC, "WEB": PRIVATE}}, "deux fois"),
-            ({"projects": {" ": PUBLIC}}, "vide"),
-            ({"interval": 10}, "au moins"),
-            ({"interval": True}, "secondes"),
-            ({"exclude_terms": "Globex"}, "liste"),
-            ({"exclude_terms": [""]}, "liste"),
-            ({"host": 3}, "hôte"),
+            ({"projects": {"web": {"repo": PUBLIC, "visibility": "public"}}}, "unknown"),
+            ({"projects": {"web": PUBLIC, "WEB": PRIVATE}}, "declared twice"),
+            ({"projects": {" ": PUBLIC}}, "empty"),
+            ({"interval": 10}, "at least"),
+            ({"interval": True}, "seconds"),
+            ({"exclude_terms": "Globex"}, "list"),
+            ({"exclude_terms": [""]}, "list"),
+            ({"host": 3}, "host name"),
         ):
             with self.subTest(raw=raw):
                 with self.assertRaises(plan_github.SettingsError) as ctx:
@@ -98,21 +98,21 @@ class GuardTest(unittest.TestCase):
             for public in (True, False):
                 with self.subTest(text=text[:12], public=public):
                     reasons = self.guard.problems("avant %s après" % text, public=public)
-                    self.assertTrue(any(r.startswith("motif de secret") for r in reasons),
+                    self.assertTrue(any(r.startswith("secret pattern") for r in reasons),
                                     reasons)
                     self.assertNotIn(text, " ".join(reasons))
 
     def test_ce_qu_un_depot_public_ne_recoit_jamais(self):
         for label, text in (
-                ("adresse IP", "joindre 10.20.30.40 en direct"),
-                ("adresse IP", "lien fe80::1 du banc"),
-                ("adresse électronique", "écrire à bob@example.org"),
-                ("chemin local", "fichier /home/bob/notes.txt"),
-                ("chemin local", "dossier ~/development/x"),
-                ("identifiant de compte", "compte 123e4567-e89b-12d3-a456-426614174000"),
-                ("nom d'hôte", "relancer atelier-7"),
-                ("nom d'hôte", "voir https://grafana.acme.internal/d/1"),
-                ("nom d'hôte", "le service nas.lan")):
+                ("IP address", "joindre 10.20.30.40 en direct"),
+                ("IP address", "lien fe80::1 du banc"),
+                ("email address", "écrire à bob@example.org"),
+                ("local path", "fichier /home/bob/notes.txt"),
+                ("local path", "dossier ~/development/x"),
+                ("account identifier", "compte 123e4567-e89b-12d3-a456-426614174000"),
+                ("host name", "relancer atelier-7"),
+                ("host name", "voir https://grafana.acme.internal/d/1"),
+                ("host name", "le service nas.lan")):
             with self.subTest(text=text):
                 self.assertIn(label, self.guard.problems(text, public=True))
                 self.assertEqual(self.guard.problems(text, public=False), [])
@@ -127,7 +127,7 @@ class GuardTest(unittest.TestCase):
         for text in ("lot pour Globex", "GLOBEX-12 à livrer", "suite globex_ci"):
             with self.subTest(text=text):
                 self.assertEqual(self.guard.problems(text, public=False),
-                                 ["terme exclu par l'organisation"])
+                                 ["term excluded by the organization"])
         self.assertEqual(self.guard.problems("globexcorp et autoglobex", public=True), [])
         self.assertEqual(plan_github.Guard().problems("lot pour Globex", public=True), [])
 
@@ -151,29 +151,29 @@ class LotViewTest(unittest.TestCase):
         view = self.view(True)
         self.assertEqual(view.title, "Réparer l'export")
         self.assertEqual(view.labels, ["ameesh", "ameesh:bug", "ameesh:build", "ameesh:p1"])
-        self.assertIn("**Lot ameesh n° 12** · bug · priorité haute · assigné à `ouvrier`",
+        self.assertIn("**ameesh work item 12** · bug · high priority · assigned to `ouvrier`",
                       view.body)
         self.assertIn("l'export CSV perd des lignes", view.body)
-        for internal in ("Détail interne", "/home/bob", "10.0.0.5", "chantier", "export`"):
+        for internal in ("Détail interne", "/home/bob", "10.0.0.5", "workspace", "export`"):
             self.assertNotIn(internal, view.body)
         self.assertIn("`ameesh-work: 12`", view.body)
         self.assertEqual((view.state, view.state_reason, view.refused, view.withheld),
                          ("open", None, [], []))
         human = self.view(True, assignee="human:alice")
-        self.assertIn("assigné à un humain", human.body)
+        self.assertIn("assigned to a human", human.body)
         self.assertNotIn("alice", human.body)
-        self.assertIn("non assigné", self.view(True, assignee=None, priority=None).body)
+        self.assertIn("unassigned", self.view(True, assignee=None, priority=None).body)
 
     def test_depot_prive_corps_publie_sans_secret(self):
         view = self.view(False)
         self.assertIn("Détail interne : voir /home/bob/x et 10.0.0.5", view.body)
-        self.assertIn("Projet `web` · chantier `export`", view.body)
+        self.assertIn("Project `web` · workspace `export`", view.body)
         token = "ghp_" + "Z9" * 15
         secret = self.view(False, body="clé : %s" % token)
         self.assertNotIn(token, secret.body)
-        self.assertEqual(secret.withheld, [{"field": "corps",
-                                            "reasons": ["motif de secret (jeton GitHub)"]}])
-        self.assertIn("pas publié ici", secret.body)
+        self.assertEqual(secret.withheld, [{"field": "body",
+                                            "reasons": ["secret pattern (GitHub token)"]}])
+        self.assertIn("not published here", secret.body)
         quiet = self.view(False, body="voir @dataclass, bob@example.org et "
                                       "<!-- ameesh:work=99 d=1 -->")
         self.assertNotIn(" @dataclass", quiet.body)
@@ -183,16 +183,16 @@ class LotViewTest(unittest.TestCase):
 
     def test_refus_et_retenues(self):
         self.assertEqual(self.view(True, title="Migrer /home/bob/données").refused,
-                         ["chemin local"])
+                         ["local path"])
         leak = self.view(True, body="Résumé public : joindre alice@example.org")
-        self.assertEqual(leak.withheld, [{"field": "résumé public",
-                                          "reasons": ["adresse électronique"]}])
+        self.assertEqual(leak.withheld, [{"field": "public summary",
+                                          "reasons": ["email address"]}])
         self.assertNotIn("alice@", leak.body)
         self.assertEqual(self.view(False, title="Lot Globex").refused,
-                         ["terme exclu par l'organisation"])
+                         ["term excluded by the organization"])
         # un nom de l'en-tête qui ne passe pas : en-tête réduit, rien d'autre
         named = self.view(False, workstream="chantier Globex")
-        self.assertEqual(named.withheld[-1]["field"], "en-tête")
+        self.assertEqual(named.withheld[-1]["field"], "header")
         self.assertNotIn("Globex", named.body)
         self.assertIn("Détail interne", named.body)
 
@@ -201,19 +201,19 @@ class LotViewTest(unittest.TestCase):
         self.assertEqual((merged.state, merged.state_reason), ("closed", "completed"))
         self.assertIn("ameesh:merged", merged.labels)
         self.assertEqual(merged.closing,
-                         "Lot n° 12 fusionné par la PR #7 : issue fermée par ameesh.")
+                         "Work item 12 merged by PR #7: issue closed by ameesh.")
         self.assertEqual(self.view(True, state="merged", pr_ref="acme/prive#4").closing,
-                         "Lot n° 12 fusionné : issue fermée par ameesh.")
+                         "Work item 12 merged: issue closed by ameesh.")
         self.assertIn("acme/prive#4",
                       self.view(False, state="merged", pr_ref="acme/prive#4").closing)
-        self.assertIn("livré", self.view(True, state="promoted").closing)
+        self.assertIn("delivered", self.view(True, state="promoted").closing)
         abandoned = self.view(True, state="closed", close_reason="abandoned")
         self.assertEqual((abandoned.state, abandoned.state_reason), ("closed", "not_planned"))
-        self.assertIn("abandonné", abandoned.closing)
+        self.assertIn("abandoned", abandoned.closing)
         replaced = self.view(True, state="closed", close_reason="superseded", superseded_by=13,
                              issue_of=lambda n: 40 if n == 13 else None)
         self.assertEqual(replaced.closing,
-                         "Lot n° 12 remplacé par le lot n° 13 (#40) : issue fermée par ameesh.")
+                         "Work item 12 superseded by work item 13 (#40): issue closed by ameesh.")
         self.assertIsNone(self.view(True).closing)
 
     def test_projet_d_un_lot(self):
@@ -307,7 +307,7 @@ class LotIssuesTest(_Base):
         self.project()
         self.assertEqual(self.gh.repo(PUBLIC)["issues"], [])
         self.project("app", PRIVATE)
-        self.assertIn("assigné à `ouvrier`", self.issue(PRIVATE, "Sans app")["body"])
+        self.assertIn("assigned to `ouvrier`", self.issue(PRIVATE, "Sans app")["body"])
         # suivi dans le dépôt d'un autre projet configuré : jamais recopié ici
         self.db.execute("UPDATE work_items SET app = 'web' WHERE id = %s", (lot["id"],))
         self.gh.reset_calls()
@@ -325,12 +325,12 @@ class LotIssuesTest(_Base):
         report = self.project()
         row = [r for r in report["issues"] if r["work_item"] == lot["id"]][0]
         self.assertEqual((row["action"], sorted(row["changes"])),
-                         ("update", ["corps", "titre", "étiquettes ameesh"]))
+                         ("update", ["ameesh labels", "body", "title"]))
         issue = self.issue(PUBLIC, "Export v2")
         self.assertEqual(issue["number"], number)
         self.assertEqual(sorted(issue["labels"]), ["ameesh", "ameesh:build", "ameesh:evolution",
                                                    "ameesh:p1"])
-        self.assertIn("priorité haute · assigné à `ouvrier`", issue["body"])
+        self.assertIn("high priority · assigned to `ouvrier`", issue["body"])
         self.gh.reset_calls()
         self.project()
         self.assertEqual(self.gh.writes(), [])
@@ -345,7 +345,7 @@ class LotIssuesTest(_Base):
         self.gh.reset_calls()
         report = self.project()
         self.assertEqual(self.gh.writes(), [])
-        self.assertEqual(report["human_edits"][0]["kept"], ["titre", "corps"])
+        self.assertEqual(report["human_edits"][0]["kept"], ["title", "body"])
         self.assertEqual(work.get(self.db, lot["id"])["title"], "Export")   # jamais réimporté
         # le lot change de titre : seul le titre est réécrit, la note humaine reste
         self.db.execute("UPDATE work_items SET title = 'Export final' WHERE id = %s",
@@ -377,15 +377,15 @@ class LotIssuesTest(_Base):
         self.assertEqual((merged["state"], merged["state_reason"]), ("closed", "completed"))
         self.assertIn("ameesh:merged", merged["labels"])
         self.assertEqual(self.comments(PUBLIC, merged["number"]),
-                         ["Lot n° %d fusionné par la PR #9 : issue fermée par ameesh." % a["id"]])
+                         ["Work item %d merged by PR #9: issue closed by ameesh." % a["id"]])
         replaced = self.issue(PUBLIC, "Remplacé")
         self.assertEqual((replaced["state"], replaced["state_reason"]), ("closed", "not_planned"))
         self.assertEqual(self.comments(PUBLIC, replaced["number"]),
-                         ["Lot n° %d remplacé par le lot n° %d (#%d) : issue fermée par ameesh."
+                         ["Work item %d superseded by work item %d (#%d): issue closed by ameesh."
                           % (b["id"], a["id"], merged["number"])])
         promoted = self.issue(PUBLIC, "Promu")
         self.assertEqual(promoted["state_reason"], "completed")
-        self.assertIn("livré", self.comments(PUBLIC, promoted["number"])[0])
+        self.assertIn("delivered", self.comments(PUBLIC, promoted["number"])[0])
         # une seule fois
         self.gh.reset_calls()
         self.project()
@@ -396,14 +396,14 @@ class LotIssuesTest(_Base):
         a = work.add(self.db, title="Purger /home/bob/cache", app="web")
         report = self.project()
         self.assertEqual(report["refused"][0]["work_item"], a["id"])
-        self.assertEqual(report["refused"][0]["reasons"], ["chemin local"])
+        self.assertEqual(report["refused"][0]["reasons"], ["local path"])
         self.assertEqual(report["counts"]["refused"], 1)
         self.assertEqual(self.gh.repo(PUBLIC)["issues"], [])
         self.assertNotIn("/home/bob", json.dumps(report, ensure_ascii=False))
         b = work.add(self.db, title="Lot pour Globex", app="app")
         private = self.project("app", PRIVATE)
         self.assertEqual([(r["work_item"], r["reasons"]) for r in private["refused"]],
-                         [(b["id"], ["terme exclu par l'organisation"])])
+                         [(b["id"], ["term excluded by the organization"])])
         self.assertEqual(self.gh.repo(PRIVATE)["issues"], [])
         # un chemin local passe dans un dépôt privé
         work.add(self.db, title="Purger /home/bob/cache privé", app="app")
@@ -478,7 +478,7 @@ class LotIssuesTest(_Base):
         mine = self.gh.repo(PUBLIC)["issues"][0]
         self.assertEqual((mine["state"], mine["state_reason"]), ("closed", "not_planned"))
         self.assertNotIn("ameesh:work=", mine["body"])
-        self.assertIn("Doublon de #99", self.comments(PUBLIC, mine["number"])[0])
+        self.assertIn("Duplicate of #99", self.comments(PUBLIC, mine["number"])[0])
         self.assertEqual(work.get(self.db, lot["id"])["issue_ref"], PUBLIC + "#99")
 
     def test_creations_bornees_par_passage(self):
@@ -513,7 +513,7 @@ class SyncGithubCloseTest(_Base):
         self.project()
         self.assertEqual(self.issue(PUBLIC, "Export")["state"], "closed")
         self.assertEqual(self.comments(PUBLIC, number),
-                         ["Lot n° %d fusionné par la PR #5 : issue fermée par ameesh." % lot["id"]])
+                         ["Work item %d merged by PR #5: issue closed by ameesh." % lot["id"]])
 
 
 # ==========================================================================
@@ -532,16 +532,16 @@ class ProjectorTest(_Base):
         self.assertEqual(elsewhere.tick(self.db, now=1000.0), [])
         elsewhere.tick(self.db, now=2000.0)
         self.assertEqual(self.gh.calls(), [])
-        self.assertEqual(logs, ["issues GitHub : la projection est menée par l'hôte ailleurs, "
-                                "pas atelier"])
+        self.assertEqual(logs, ["GitHub issues: the projection is run by host ailleurs, "
+                                "not atelier"])
         logs.clear()
         nobody = dataclasses.replace(self.cfg, github={"projects": {"web": PUBLIC}})
         self.assertEqual(plan_github.Projector(nobody, log=logs.append, gh=self.gh)
                          .tick(self.db, now=1000.0), [])
-        self.assertIn("aucun hôte désigné", logs[0])
+        self.assertIn("no designated host", logs[0])
         broken = dataclasses.replace(self.cfg, github={"projets": {}})
         plan_github.Projector(broken, log=logs.append, gh=self.gh).tick(self.db, now=1000.0)
-        self.assertIn("configuration invalide", logs[-1])
+        self.assertIn("invalid configuration", logs[-1])
         self.assertEqual(self.gh.calls(), [])
 
     def test_cadence_et_lots_nouveaux_des_le_passage_suivant(self):
@@ -551,7 +551,7 @@ class ProjectorTest(_Base):
         first = projector.tick(self.db, now=1000.0)
         self.assertEqual(sorted(r["project"] for r in first), ["app", "web"])
         self.assertEqual(len(self.gh.repo(PUBLIC)["issues"]), 1)
-        self.assertIn("issues GitHub acme/web (web) : 1 créée(s)", logs)
+        self.assertIn("GitHub issues acme/web (web): 1 created", logs)
         self.gh.reset_calls()
         self.assertEqual(projector.tick(self.db, now=1030.0), [])     # rien de nouveau
         self.assertEqual(self.gh.calls(), [])
@@ -568,15 +568,15 @@ class ProjectorTest(_Base):
         logs: list = []
         projector = plan_github.Projector(self.configured(), log=logs.append, gh=self.gh)
         projector.tick(self.db, now=1000.0)
-        refusals = [line for line in logs if "titre refusé (chemin local)" in line]
+        refusals = [line for line in logs if "title refused (local path)" in line]
         self.assertEqual(len(refusals), 1)
-        self.assertIn("non publié", refusals[0])
+        self.assertIn("not published", refusals[0])
         self.assertNotIn("/home/bob", refusals[0])
         self.gh.reset_calls()
         self.assertEqual(projector.tick(self.db, now=1030.0), [])
         self.assertEqual(self.gh.calls(), [])
         projector.tick(self.db, now=1300.0)
-        self.assertEqual(sum("titre refusé" in line for line in logs), 1)
+        self.assertEqual(sum("title refused" in line for line in logs), 1)
 
     def test_panne_de_github_sans_effet_et_attente(self):
         work.add(self.db, title="Export", app="web")
@@ -584,7 +584,7 @@ class ProjectorTest(_Base):
         self.gh.fail = lambda argv: True
         projector = plan_github.Projector(self.configured(), log=logs.append, gh=self.gh)
         self.assertEqual(projector.tick(self.db, now=1000.0), [])
-        self.assertEqual(sum("échec, nouvel essai dans 300 s" in line for line in logs), 2)
+        self.assertEqual(sum("failed, retrying in 300 s" in line for line in logs), 2)
         self.gh.reset_calls()
         projector.tick(self.db, now=1030.0)
         self.assertEqual(self.gh.calls(), [])                  # le projet attend un intervalle
@@ -609,7 +609,7 @@ class ProjectorTest(_Base):
 
         notifier._projector = Boom()
         notifier.run_pass(self.db, current=[])               # jamais fatal au passage
-        self.assertIn("issues GitHub : passage en échec (boum)", logs)
+        self.assertIn("GitHub issues: pass failed (boum)", logs)
         plain = notify.Notifier(self.cfg, notify.parse_config({}), log=logs.append)
         plain.run_pass(self.db, current=[])
         self.assertIsNone(plain._projector)
@@ -637,10 +637,10 @@ class CliTest(_Base):
         env = self.cli_env()
         out = self.mesh("work", "project-github", "--app", "web", "--dry-run", env=env)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("[essai] issues des lots du projet web sur acme/web (dépôt public",
+        self.assertIn("[dry run] work item issues of project web on acme/web (public repository",
                       out.stdout)
-        self.assertIn("lot %-5s" % lot["id"], out.stdout)
-        self.assertIn("à créer", out.stdout)
+        self.assertIn("work item %-5s" % lot["id"], out.stdout)
+        self.assertIn("to create", out.stdout)
         with open(self.state_file, encoding="utf-8") as fh:
             self.assertEqual(json.load(fh)["repos"][PUBLIC]["issues"], [])
         out = self.mesh("work", "project-github", "--app", "WEB", "--json", env=env)
@@ -648,26 +648,26 @@ class CliTest(_Base):
         self.assertEqual(json.loads(out.stdout)["counts"]["created"], 1)
         self.assertEqual(work.get(self.db, lot["id"])["issue_ref"], PUBLIC + "#1")
         out = self.mesh("work", "project-github", "--app", "web", env=env)
-        self.assertIn("1 issue(s) inchangée(s)", out.stdout)
+        self.assertIn("1 issue(s) unchanged", out.stdout)
 
     def test_erreurs(self):
         env = self.cli_env()
         out = self.mesh("work", "project-github", "--app", "inconnu", env=env)
         self.assertEqual(out.returncode, 2)
-        self.assertIn("absent de `github.projects`", out.stderr)
+        self.assertIn("missing from `github.projects`", out.stderr)
         out = self.mesh("work", "project-github", env=env)
         self.assertEqual(out.returncode, 2)
-        self.assertIn("--app <projet>", out.stderr)
+        self.assertIn("--app <project>", out.stderr)
         out = self.mesh("work", "project-github", "--app", "web",
                         env=self.cli_env(github={"projets": {}}))
         self.assertEqual(out.returncode, 1)
-        self.assertIn("clé(s) inconnue(s)", out.stderr)
+        self.assertIn("unknown key(s)", out.stderr)
         # --repo avec --app : le dépôt configuré est remplacé
         work.add(self.db, title="Export", app="autre")
         out = self.mesh("work", "project-github", "--app", "autre", "--repo", PUBLIC,
                         "--dry-run", env=self.cli_env())
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("sur acme/web", out.stdout)
+        self.assertIn("on acme/web", out.stdout)
 
 
 if __name__ == "__main__":

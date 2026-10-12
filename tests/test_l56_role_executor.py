@@ -12,7 +12,9 @@ import unittest
 
 from ameesh import migrations
 
-from ameesh import db as db_mod, mail, registry
+from ameesh import db as db_mod, mail, registry, work, modules
+from ameesh.modules.storage import ModuleStore
+from tests.test_l317_project_modules import federation
 
 from .support import REPO, PgTestCase
 from .test_cluster import TEST_DSN, _dsn_for
@@ -112,6 +114,112 @@ class RoleExecutorTest(PgTestCase):
                              [{"name": "verif-a"}])
         finally:
             db.close()
+
+    def test_executor_cannot_forge_execution_proof_or_rewrite_policy(self):
+        import json
+        ModuleStore(self.db).replace("", modules.declarations(federation()))
+        lot = work.add(self.db, title="Release", type="release", app="acme")["id"]
+        delivery = ModuleStore(self.db).record(lot, "it", "delivery", "a" * 64,
+                                               {"artifact": "/artifact", "sha256": "a" * 64},
+                                               actor="test")
+        payload = db_mod.sql_literal(json.dumps({"artifact": "/artifact", "sha256": "a" * 64,
+                                                 "exit_code": 0, "command": ["true"], "output": "invented"}))
+        sql = ("INSERT INTO work_module_milestones(work_item_id,module,kind,subject,binding_id,payload,actor) "
+               "VALUES (%s,'it','proof','%s',%s,%s::jsonb,'fake')" %
+               (lot, "a" * 64, delivery["id"], payload))
+        result = self.as_host(sql)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("isolated writer role", result.stderr)
+        for sql in ("UPDATE project_modules SET rules = '[]'::jsonb",
+                    "DELETE FROM project_modules",
+                    "INSERT INTO project_modules SELECT 'other',module,canon,types,schemas,rules FROM project_modules"):
+            result = self.as_host(sql)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("permission denied", result.stderr)
+        # Even an accidental grant cannot bypass the canonical writer trigger.
+        self.db.execute("GRANT UPDATE ON project_modules TO %s" % db_mod.quote_ident(self.role))
+        try:
+            result = self.as_host("UPDATE project_modules SET rules = '[]'::jsonb")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("isolated canon sync role", result.stderr)
+        finally:
+            self.db.execute("REVOKE UPDATE ON project_modules FROM %s" % db_mod.quote_ident(self.role))
+        # The trusted policies are unchanged and direct storage still refuses closure.
+        with self.assertRaises(work.WorkError):
+            work.merged(self.db, lot, sha="abcdef1234")
+
+    def test_module_writer_role_contract_and_executor_separation(self):
+        q = db_mod.quote_ident
+        names = ("ameesh_canon_sync", "ameesh_it_proof")
+        existing = {r["rolname"] for r in self.db.query("SELECT rolname FROM pg_roles WHERE rolname IN (%s,%s)", names)}
+        script = os.path.join(REPO, "deploy", "sql", "role-module-writers.sql")
+        try:
+            for _ in range(2):
+                proc = subprocess.run(["psql", self.owner_dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1",
+                                       "-f", script], capture_output=True, text=True, timeout=60,
+                                      env=dict(os.environ, PGOPTIONS="-c search_path=%s" % self.schema))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(self.run_script(self.role).returncode, 0)
+            for name in names:
+                self.assertNotEqual(self.as_host("SET ROLE %s" % q(name)).returncode, 0)
+            with self.db.transaction() as tx:
+                tx.execute("SET LOCAL ROLE ameesh_canon_sync")
+                ModuleStore(tx).replace("", modules.declarations(federation()))
+            # Neither executor nor proof writer is a policy writer.
+            with self.assertRaises(db_mod.DbError), self.db.transaction() as tx:
+                tx.execute("SET LOCAL ROLE ameesh_it_proof")
+                ModuleStore(tx).replace("", [])
+        finally:
+            for name in names:
+                self.db.execute("DROP OWNED BY %s" % q(name))
+                if name not in existing:
+                    self.db.execute("DROP ROLE %s" % q(name))
+
+    def test_isolated_writer_records_observed_execution_without_policy_rights(self):
+        import sys
+        from pathlib import Path
+        from ameesh.modules import it
+        q = db_mod.quote_ident
+        writer = "t_proof_writer_" + uuid.uuid4().hex[:8]
+        self.db.execute("CREATE ROLE %s NOLOGIN" % q(writer))
+        try:
+            self.db.execute("GRANT USAGE ON SCHEMA %s TO %s" % (q(self.schema), q(writer)))
+            self.db.execute("GRANT SELECT ON work_items, project_modules, work_module_milestones TO %s" % q(writer))
+            self.db.execute("GRANT UPDATE(id) ON work_items TO %s" % q(writer))
+            self.db.execute("GRANT INSERT ON work_module_milestones TO %s" % q(writer))
+            self.db.execute("GRANT USAGE ON SEQUENCE work_module_milestones_id_seq TO %s" % q(writer))
+            entries = modules.declarations(federation())
+            entries[0]["schemas"]["proof"]["writer_role"] = writer
+            ModuleStore(self.db).replace("", entries)
+            artifact = Path(self.tmp, "artifact.py")
+            artifact.write_text("print('observed execution')")
+            lot = work.add(self.db, title="Release", type="release", app="acme")["id"]
+            it.declare(self.db, lot, artifact, actor="test")
+            with self.db.transaction() as tx:
+                tx.execute("SET LOCAL ROLE %s" % q(writer))
+                proof = it.prove(tx, lot, artifact, actor="producer", runner=sys.executable)
+            self.assertEqual(proof["payload"]["output"], "observed execution")
+            self.assertFalse(self.db.query("SELECT has_table_privilege(%s, 'project_modules', 'UPDATE') AS allowed",
+                                           (writer,))[0]["allowed"])
+            self.assertEqual(work.merged(self.db, lot, sha="abcdef1234")["result"], "merged")
+        finally:
+            self.db.execute("DROP OWNED BY %s" % q(writer))
+            self.db.execute("DROP ROLE %s" % q(writer))
+
+    def test_inherited_policy_writes_make_executor_audit_fail(self):
+        q = db_mod.quote_ident
+        parent = "t_policy_parent_" + uuid.uuid4().hex[:8]
+        self.db.execute("CREATE ROLE %s NOLOGIN" % q(parent))
+        try:
+            self.db.execute("GRANT UPDATE ON project_modules TO %s" % q(parent))
+            self.db.execute("GRANT %s TO %s" % (q(parent), q(self.role)))
+            result = self.run_script(self.role)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("forbidden UPDATE on project_modules", result.stderr)
+        finally:
+            self.db.execute("REVOKE %s FROM %s" % (q(parent), q(self.role)))
+            self.db.execute("DROP OWNED BY %s" % q(parent))
+            self.db.execute("DROP ROLE %s" % q(parent))
 
     def test_host_cannot_change_schema(self):
         for sql in ("CREATE TABLE intruder (x int)",

@@ -40,6 +40,9 @@ SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %I T
 SELECT format('GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA %I TO %I',
               :'schema', :'role') \gexec
 SELECT format('GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA %I TO %I', :'schema', :'role') \gexec
+-- Module policy writes belong exclusively to isolated canon synchronization.
+SELECT format('REVOKE INSERT, UPDATE, DELETE ON %I.project_modules FROM %I',
+              :'schema', :'role') WHERE to_regclass(format('%I.project_modules', :'schema')) IS NOT NULL \gexec
 -- Future migration objects must be created by this same owner.
 SELECT format('ALTER DEFAULT PRIVILEGES IN SCHEMA %I GRANT SELECT, INSERT, UPDATE, DELETE '
               'ON TABLES TO %I', :'schema', :'role') \gexec
@@ -63,7 +66,7 @@ BEGIN
     -- MEMBER also catches NOINHERIT paths: SET ROLE must not evade the audit.
     FOR parent IN SELECT * FROM pg_roles WHERE pg_has_role(r, oid, 'MEMBER') LOOP
         -- Predefined roles carry capabilities without administrative attributes.
-        IF parent.rolname IN ('pg_read_server_files', 'pg_write_server_files',
+        IF parent.rolname IN ('ameesh_it_proof', 'ameesh_canon_sync', 'pg_read_server_files', 'pg_write_server_files',
                              'pg_execute_server_program', 'pg_signal_backend',
                              'pg_checkpoint', 'pg_maintain', 'pg_create_subscription',
                              'pg_read_all_data', 'pg_write_all_data') THEN
@@ -134,6 +137,15 @@ BEGIN
             FOREACH privilege IN ARRAY ARRAY['USAGE', 'SELECT', 'UPDATE'] LOOP
                 IF NOT has_sequence_privilege(r, item.oid, privilege) THEN
                     violations := violations || format('missing %s on sequence %s', privilege, item.relname);
+                END IF;
+            END LOOP;
+        ELSIF item.relname = 'project_modules' THEN
+            IF NOT has_table_privilege(r, item.oid, 'SELECT') THEN
+                violations := violations || 'missing SELECT on project_modules';
+            END IF;
+            FOREACH privilege IN ARRAY ARRAY['INSERT', 'UPDATE', 'DELETE'] LOOP
+                IF has_table_privilege(r, item.oid, privilege) THEN
+                    violations := violations || format('forbidden %s on project_modules', privilege);
                 END IF;
             END LOOP;
         ELSE

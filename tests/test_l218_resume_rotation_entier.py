@@ -34,17 +34,17 @@ class BorneTest(unittest.TestCase):
         self.assertGreater(len(texte), adapters.SUMMARY_MAX_CHARS)
         borne = adapters.bound_summary(texte)
         self.assertTrue(borne.startswith("## Paragraphe 00\n"))
-        tete, note = borne.split("\n\n[Résumé coupé par l'exécuteur : ")
+        tete, note = borne.split("\n\n[Summary cut by the runner: ")
         self.assertTrue(texte.startswith(tete))
         # la coupe tombe juste avant un paragraphe, jamais au milieu
         self.assertTrue(texte[len(tete):].startswith("\n\n## Paragraphe "))
-        self.assertIn("%d caractères gardés sur %d" % (len(tete), len(texte)), note)
+        self.assertIn("%d characters kept out of %d" % (len(tete), len(texte)), note)
         self.assertLessEqual(len(tete), adapters.SUMMARY_MAX_CHARS)
 
     def test_sans_paragraphe_coupe_sur_une_ligne_puis_net(self):
         lignes = "\n".join("ligne %04d" % i for i in range(100))
         borne = adapters.bound_summary(lignes, limit=200)
-        tete = borne.split("\n\n[Résumé coupé")[0]
+        tete = borne.split("\n\n[Summary cut")[0]
         self.assertTrue(lignes[len(tete):].startswith("\n"))
         bloc = "x" * 500
         net = adapters.bound_summary(bloc, limit=200)
@@ -77,7 +77,7 @@ class BorneTest(unittest.TestCase):
                       "\n".join("ligne %05d" % i for i in range(5000))):
             borne = adapters.bound_summary(texte)
             self.assertLessEqual(len(borne), adapters.SUMMARY_MAX_CHARS)
-            self.assertIn("[Résumé coupé par l'exécuteur : ", borne)
+            self.assertIn("[Summary cut by the runner: ", borne)
         for limit in (200, 300):
             self.assertLessEqual(len(adapters.bound_summary("y" * 1000, limit=limit)), limit)
 
@@ -105,7 +105,7 @@ class RotationResumeEntierTest(PgTestCase):
                 with mock.patch.dict(os.environ, {"AMEESH_TEST_RESULT": resume}):
                     self.assertTrue(worker.maybe_rotate())
                 self.assertEqual(worker.resume_summary, resume)
-                self.assertNotIn("== fin du tour", worker.resume_summary)
+                self.assertNotIn("== end of turn", worker.resume_summary)
                 with open(os.path.join(worker.state_dir, "session-history.jsonl"),
                           encoding="utf-8") as fh:
                     self.assertEqual(json.loads(fh.readline())["resume"], resume)
