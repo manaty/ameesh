@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import time
+from fractions import Fraction
 
 from . import NotAvailable, is_linux
 from .process import PROC, _proc_ok, _psutil
@@ -384,9 +385,6 @@ def btrfs_fs_info(path: str) -> tuple[str, list[tuple[int, int]] | None] | None:
 #: copies of a metadata chunk on distinct devices, per mirrored profile (the
 #: sysfs name of its directory under allocation/<kind>/)
 BTRFS_MIRRORS = {"raid1": 2, "raid1c3": 3, "raid1c4": 4}
-#: the step of the RAID10 simulation where devices tie: a metadata chunk is
-#: 1 GiB at most, so is its stripe on two devices
-BTRFS_RAID10_STEP = 1024 ** 3
 #: parity stripes and minimum devices of a parity profile
 BTRFS_PARITY = {"raid5": (1, 2), "raid6": (2, 3)}
 
@@ -417,27 +415,44 @@ def _striped_parity(free: list[int], parity: int, devs_min: int) -> int:
 
 def _raid10(free: list[int]) -> int:
     """What RAID10 chunks can still take of the per-device `free` space
-    (#311 r1): each chunk spans every device with room, rounded down to an
-    even number (the ones with the most room), its stripes equal — the
-    smallest room among them — half of them copies; with an odd number of
-    devices the one left out changes as the others fill (chunks of
-    `BTRFS_RAID10_STEP` stripes where they tie). Unlike RAID1, a small device fills with the others:
-    [100 GiB, 400 MiB x 3] holds 800 MiB, not 1200."""
-    left = sorted((f for f in free if f > 0), reverse=True)
-    growth = 0
-    while len(left) >= 2:
-        if left[0] - left[-1] <= BTRFS_RAID10_STEP:
-            return growth + sum(left) // 2  # (nearly) even devices: half of it all
-        width = len(left) - len(left) % 2
-        stripe = left[width - 1]
-        if width < len(left):   # one device left out: until it has more room
-            gap = left[width - 1] - left[width]
-            stripe = gap if gap > 0 else min(stripe, BTRFS_RAID10_STEP)
-        growth += stripe * width // 2
-        left = sorted((f - stripe if i < width else f for i, f in enumerate(left)),
-                      reverse=True)
-        left = [f for f in left if f > 0]
-    return growth
+    (#311 r1, r2). The kernel (fs/btrfs/volumes.c, `btrfs_raid_array`:
+    devs_min 2, devs_increment 2 since 5.15) gives each chunk the devices
+    with the most room, as many as there are rounded down to an even number,
+    its stripes equal — the smallest room among them — half of them copies.
+    Unlike RAID1 a small device fills with the others: [100 GiB, 400 MiB x 3]
+    holds 800 MiB, not 1200; and two devices still hold chunks once the
+    others are full.
+
+    Simulated by events, not by chunks (O(n²), however large the devices):
+    with an even number of devices all of them shrink together until the
+    smallest is full; with an odd number the one left out is one of the
+    smallest, those tied at the minimum taking turns (chunk after chunk, a
+    chunk being 1 GiB at most): together they shrink at (t - 1) / t of the
+    others' pace, until a larger device comes down to them or they are full.
+    Exact up to that turn-taking, i.e. to a chunk per device."""
+    above = sorted(f for f in free if f > 0)    # room, before `shift`
+    shift = low = Fraction(0)   # all above shrink alike; the tied smallest: `low`
+    tied = growth = 0
+    while True:
+        if not low:             # the smallest are full: the next ones are
+            tied = 0
+            if above:
+                low = above[0] - shift
+        while above and above[0] - shift == low:
+            above.pop(0)
+            tied += 1
+        n = tied + len(above)
+        if n < 2:
+            return int(growth)
+        if n % 2 == 0:          # every device, until the smallest is full
+            span, pace = low, 1
+        else:                   # the smallest take turns being left out
+            pace = Fraction(tied - 1, tied)
+            span = min(([(above[0] - shift - low) * tied] if above else [])
+                       + ([low / pace] if pace else []))
+        growth += span * (n - n % 2) / 2
+        shift += span
+        low -= span * pace
 
 
 def btrfs_growth(profile: str | None, free: list[int], copies: int) -> int:

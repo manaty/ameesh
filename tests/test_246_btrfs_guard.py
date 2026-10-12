@@ -4,11 +4,13 @@ headroom) from sysfs and closes admission before the floor — offline, on a
 fake /sys tree with the golden values of the 2026-10-11 outage."""
 from __future__ import annotations
 
+import itertools
 import os
 import re
 import shutil
 import struct
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -324,6 +326,16 @@ class ProfileGrowthTest(_Tmp):
         self.assertEqual(platform.host.btrfs_growth("raid10", small, 2), 800 * MIB)
         self.assertEqual(platform.host.btrfs_growth("raid1", small, 2), 1200 * MIB)
         self.assertEqual(platform.host.btrfs_growth("raid10", [100 * GIB], 2), 0)
+        # #311 r2: since 5.15 a RAID10 chunk needs two devices, not four
+        # (volumes.c, btrfs_raid_array: devs_min 2, devs_increment 2): the
+        # pair left with room still holds chunks
+        pairs = [100 * GIB, 100 * GIB, 400 * MIB, 400 * MIB]
+        self.assertEqual(platform.host.btrfs_growth("raid10", pairs, 2), sum(pairs) // 2)
+        self.assertEqual(platform.host.btrfs_growth(
+            "raid10", [768 * MIB, 768 * MIB, 256 * MIB, 256 * MIB], 2), 1024 * MIB)
+        # nearly equal is not equal: two devices hold the smaller one's room
+        self.assertEqual(platform.host.btrfs_growth("raid10", [768 * MIB, 256 * MIB], 2),
+                         256 * MIB)
         # the kernel spreads mirrored chunks: three equal devices hold RAID1 on
         # half of their sum, RAID5 on two thirds
         even = [10 * GIB] * 3
@@ -335,6 +347,30 @@ class ProfileGrowthTest(_Tmp):
         self.assertEqual(platform.host.btrfs_growth(None, [100 * GIB], 2), 50 * GIB)
         self.assertEqual(platform.host.btrfs_growth(None, free, 2), 20 * GIB)
         self.assertEqual(platform.host.btrfs_growth(None, free, 3), 10 * GIB)
+
+    def test_raid10_against_the_allocator_chunk_by_chunk(self):
+        # #311 r2: the simulation by events against the allocator itself, one
+        # chunk of one unit at a time — the devices with the most room, as
+        # many as there are rounded down to an even number — on every small case
+        def by_chunks(free):
+            left, growth = list(free), 0
+            while True:
+                room = sorted((f for f in left if f > 0), reverse=True)
+                width = len(room) - len(room) % 2
+                if width < 2:
+                    return growth
+                left = [f - 1 for f in room[:width]] + room[width:]
+                growth += width // 2
+        for count in range(1, 6):
+            for rooms in itertools.combinations_with_replacement(range(9), count):
+                free = [12 * f for f in rooms]
+                with self.subTest(free=free):
+                    self.assertEqual(platform.host.btrfs_growth("raid10", free, 2),
+                                     by_chunks(free))
+        # by events, not by chunks: 501 devices of 50 TiB at once
+        started = time.monotonic()
+        platform.host.btrfs_growth("raid10", [100 * GIB + i * GIB for i in range(501)], 2)
+        self.assertLess(time.monotonic() - started, 1.0)
 
     def test_degraded_raid1_cannot_grow(self):
         # #311 r1: one of two devices missing (btrfs_fs_info gives it no room):
