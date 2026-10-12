@@ -7,6 +7,12 @@ lot transitions (`work_items`, `work_item_events`), gated actions
 (`actions`), turns and leases from the registry (`agent_registry`, `spend_pending`),
 cost ledger (`turn_costs`). Neither git nor the board is read.
 
+L78 adds `agents[].conversation`: the latest 20 detail entries, the durable
+per-agent cursor and `ameesh-conversation/1` schema. See
+[Conversation log](CONVERSATIONS.md) for producer APIs, retention, the R12
+thread and subscriber cursor recovery. Text requires the explicit content
+supervision role; the raw thread outbox is not exported.
+
 ```
 ameesh progress [--project P] [--since 24h] [--stale-after 6h]   # text, narrow terminal
 ameesh progress --json [--project P] [--since 24h]   # this schema
