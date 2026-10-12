@@ -68,7 +68,8 @@ class VolumeScriptTest(unittest.TestCase):
         # STUB_FAIL=<tool> makes that one fail, its output empty
         fail = '[ "$STUB_FAIL" != %s ] || { echo "%s: I/O error" >&2; exit 1; }\n'
         self.stub("lsblk", '#!/bin/sh\n' + fail % ("lsblk", "lsblk")
-                  + 'case "$*" in *TYPE*) echo disk ;; *) printf "%s" "$STUB_LSBLK" ;; esac\n')
+                  + 'case "$*" in *TYPE*) echo disk ;; *MAJ:MIN*) echo " 8:16" ;;\n'
+                  '  *) printf "%s" "$STUB_LSBLK" ;; esac\n')
         self.stub("blockdev", '#!/bin/sh\n' + fail % ("blockdev", "blockdev") + 'echo "$STUB_SIZE"\n')
         # systemctl list-units: the active guest runners, STUB_RUNNERS
         self.stub("systemctl", '#!/bin/sh\n' + fail % ("systemctl", "systemctl")
@@ -84,11 +85,12 @@ class VolumeScriptTest(unittest.TestCase):
                            '[ -z "$STUB_LABEL" ] || echo "LABEL=$STUB_LABEL"\n'
                            'echo "TYPE=$STUB_TYPE"\n')
         self.stub("wipefs", '#!/bin/sh\nprintf "%s" "$STUB_WIPEFS"\nexit "${STUB_WIPEFS_RC:-0}"\n')
-        # findmnt: the table holds / and, with STUB_SRC, the mount point;
-        # STUB_ELSEWHERE adds lines "SOURCE TARGET" (other mounts)
+        # findmnt: the table holds / and, with STUB_SRC, the mount point
+        # (the volume's number, 8:16); STUB_ELSEWHERE adds lines
+        # "MAJ:MIN SOURCE TARGET" (other mounts)
         self.stub("findmnt", '#!/bin/sh\n' + fail % ("findmnt", "findmnt")
-                             + 'case "$*" in *SOURCE,TARGET*) echo "/dev/vda1 /"; [ -z "$STUB_SRC" ] '
-                             '|| echo "$STUB_SRC /srv/ameesh-guest"; printf "%s" "$STUB_ELSEWHERE"; exit 0 ;;\n'
+                             + 'case "$*" in *MAJ:MIN,SOURCE,TARGET*) echo "252:1 /dev/vda1 /"; [ -z "$STUB_SRC" ] '
+                             '|| echo "8:16 $STUB_SRC /srv/ameesh-guest"; printf "%s" "$STUB_ELSEWHERE"; exit 0 ;;\n'
                              '  *TARGET*) echo /; [ -z "$STUB_SRC" ] '
                              '|| echo /srv/ameesh-guest; exit 0 ;; esac\n'
                              '[ -n "$STUB_SRC" ] || exit 1\n'
@@ -497,15 +499,37 @@ class VolumeScriptTest(unittest.TestCase):
                 fh.write("LABEL=cloudimg-rootfs / ext4 discard,errors=remount-ro 0 1\n")
             line()
             p = self.run_script("mount", "--volume-id", VOL, **ours,
-                                elsewhere="%s /srv/other\n" % self.disk)
+                                elsewhere="8:16 %s /srv/other\n" % self.disk)
             self.assertNotEqual(p.returncode, 0)
             self.assertIn("already mounted on /srv/other", p.stderr)
             self.assertEqual(self.cmds(p), [])
         # mounted on the guest's root alone: kept (idempotent)
         p = self.run_script("mount", "--volume-id", VOL, **ours, src=self.disk, muuid="u",
-                            mlabel="ameesh-guest", elsewhere="/dev/sdc /srv/other\n")
+                            mlabel="ameesh-guest", elsewhere="8:32 /dev/sdc /srv/other\n")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("already mounted", p.stdout)
+
+    def test_mount_sees_the_volume_through_an_alias(self):
+        # codex #436 r4 P2: findmnt names the volume by another path (a dm
+        # alias, a by-uuid link, a bind mount): the same device number, so
+        # the same volume, refused before any adoption
+        self.label_line()
+        self.udev("u")
+        ours = {"type": "ext4", "label": "ameesh-guest", "uuid": "u"}
+        for alias in ("/dev/mapper/volume /srv/other", "/dev/disk/by-uuid/u /srv/other",
+                      "/dev/dm-0 /srv/bind"):
+            p = self.run_script("mount", "--volume-id", VOL, **ours,
+                                elsewhere="8:16 %s\n" % alias)
+            self.assertNotEqual(p.returncode, 0, alias)
+            self.assertIn("already mounted on /srv/", p.stderr)
+            self.assertEqual(self.cmds(p), [], alias)
+        # no device number for the disk: refused, never "mounted nowhere"
+        self.stub("lsblk", '#!/bin/sh\ncase "$*" in *TYPE*) echo disk ;; *MAJ:MIN*) exit 1 ;;'
+                           '  *) printf "%s" "$STUB_LSBLK" ;; esac\n')
+        p = self.run_script("mount", "--volume-id", VOL, **ours)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("lsblk failed: refused", p.stderr)
+        self.assertEqual(self.cmds(p), [])
 
     def test_check_after_mount_reads_the_new_fstab(self):
         # codex #436 r3 P2: the line just added is what check reads next,

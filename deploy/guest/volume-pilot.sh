@@ -286,11 +286,16 @@ mount_of() {
   findmnt -n -o "$1" --mountpoint "$ROOT" || die "findmnt $ROOT failed: refused"
 }
 # dev_mounts DEV: where DEV is mounted, one target a line; empty when
-# nowhere (the whole table read, / always in it)
+# nowhere (the whole table read, / always in it). Compared by the device's
+# number (MAJ:MIN), never by the source's name: an alias (/dev/mapper/…,
+# /dev/disk/by-uuid/…) or a bind mount is the same device (codex #436 r4)
 dev_mounts() {
-  local all
-  all=$(findmnt -rnv -o SOURCE,TARGET) && [ -n "$all" ] || die "findmnt failed: refused"
-  printf '%s\n' "$all" | awk -v d="$1" '$1 == d { print $2 }'
+  local all mm
+  mm=$(lsblk -dno MAJ:MIN "$1") || die "$1: lsblk failed: refused"
+  mm=${mm//[[:space:]]/}
+  [[ "$mm" =~ ^[0-9]+:[0-9]+$ ]] || die "$1: no device number from lsblk ($mm): refused"
+  all=$(findmnt -rn -o MAJ:MIN,SOURCE,TARGET) && [ -n "$all" ] || die "findmnt failed: refused"
+  printf '%s\n' "$all" | awk -v d="$mm" '$1 == d { print $3 }'
 }
 # dir_state DIR: absent, empty or full; not a directory, or a listing that
 # fails (an I/O error, a permission): refused
