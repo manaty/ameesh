@@ -499,23 +499,24 @@ printf 'username=x-access-token\npassword=%s\n' "$GH_TOKEN"
 EOF
 }
 
-# dsh_read list SRC / dsh_read tar SRC FILE… / dsh_read secrets FILE…
+# dsh_read list SRC / dsh_read tar SRC FILE… / dsh_read check DIR
 # A dsh profile read by root once, never through a link (O_NOFOLLOW, each
-# directory opened from its parent): hooks.json and, in each profiles/<name>/,
+# directory opened from its parent, from / down: codex #457 r3), never
+# blocked by a FIFO (O_NONBLOCK, a plain file only): hooks.json and, in each profiles/<name>/,
 # its files of the kinds a profile needs (DSH_KINDS), text only (UTF-8, no
 # NUL, 1 MiB at most). A link, another kind of file, a binary or a file
 # that looks like it holds a secret refuses it all (dot files and
 # subdirectories of a profile are left: sessions, logs, modules).
 # `list` prints what would be copied; `tar` reads it all again, checks it
 # again and writes those FILEs, from the very bytes it checked, as a tar on
-# stdout (what is checked is what is copied: codex #457 r2); `secrets` names
-# the FILEs that look like they hold a secret (--check).
+# stdout (what is checked is what is copied: codex #457 r2); `check` names
+# what the same rules refuse in DIR, one per line (--check: codex #457 r3).
 DSH_KINDS='json yml yaml md txt toml'
 dsh_read() {
-  python3 -I - "$DSH_KINDS" "${PILOT_TEST_STAGE_HOOK:-}" "$DRY" "$@" <<'EOF'
-import io, os, re, stat, subprocess, sys, tarfile, time
-kinds, hook, dry, mode = sys.argv[1].split(), sys.argv[2], sys.argv[3] == "1", sys.argv[4]
-args = sys.argv[5:]
+  python3 -I - "$DSH_KINDS" "${PILOT_TEST_STAGE_HOOK:-}" "${PILOT_TEST_ROOT_HOOK:-}" "$DRY" "$@" <<'EOF'
+import errno, fcntl, io, os, re, stat, subprocess, sys, tarfile, time
+kinds, hook, root_hook = sys.argv[1].split(), sys.argv[2], sys.argv[3]
+dry, mode, args = sys.argv[4] == "1", sys.argv[5], sys.argv[6:]
 SECRET = re.compile(
     rb"sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
     rb"|-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY|PuTTY-User-Key-File"
@@ -527,34 +528,48 @@ MAX = 1 << 20
 def secret(name, data):
     return bool(KEYNAME.fullmatch(name.rsplit("/", 1)[-1]) or SECRET.search(data))
 
-if mode == "secrets":
-    for f in args:
-        try:
-            with open(f, "rb") as fh:
-                data = fh.read(MAX + 1)
-        except OSError:
-            continue
-        if secret(f, data):
-            print(f)
-    sys.exit(0)
-
 src, wanted = args[0], args[1:]
 bad, files = [], {}
-NOFOLLOW = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+NOFOLLOW = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOCTTY
 
 def opened(name, dir_fd, directory):
     try:
         return os.open(name, NOFOLLOW | (os.O_DIRECTORY if directory else 0), dir_fd=dir_fd)
     except OSError as exc:
-        bad.append("%s: %s" % (name, "a link" if exc.errno in (40, 20) else exc.strerror))
+        bad.append("%s: %s" % (name, "a link" if exc.errno in (errno.ELOOP, errno.ENOTDIR)
+                               else exc.strerror))
+
+def walk(path):
+    """PATH opened from / down, one directory at a time, never through a
+    link: no absolute path opened again after it was checked."""
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    for part in [p for p in path.split("/") if p]:
+        try:
+            nfd = os.open(part, NOFOLLOW | os.O_DIRECTORY, dir_fd=fd)
+        except OSError as exc:
+            bad.append("%s: %s" % (path, "goes through a symbolic link"
+                                   if exc.errno in (errno.ELOOP, errno.ENOTDIR) else exc.strerror))
+            os.close(fd)
+            return None
+        os.close(fd)
+        fd = nfd
+    return fd
 
 def read(rel, name, dir_fd):
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError as exc:
+        bad.append("%s: %s" % (rel, exc.strerror)); return
+    if not stat.S_ISREG(st.st_mode):
+        bad.append("%s: not a plain file" % rel); return
     fd = opened(name, dir_fd, False)
     if fd is None:
         return
     with os.fdopen(fd, "rb") as fh:
         if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
             bad.append("%s: not a plain file" % rel); return
+        fcntl.fcntl(fh.fileno(), fcntl.F_SETFL,
+                    fcntl.fcntl(fh.fileno(), fcntl.F_GETFL) & ~os.O_NONBLOCK)
         data = fh.read(MAX + 1)
     if len(data) > MAX:
         bad.append("%s: over 1 MiB" % rel); return
@@ -566,11 +581,16 @@ def read(rel, name, dir_fd):
         bad.append("%s: not text (UTF-8)" % rel); return
     files[rel] = data
 
-if not os.path.isabs(src) or os.path.realpath(src) != os.path.normpath(src):
+if mode != "check" and (not os.path.isabs(src)
+                        or os.path.realpath(src) != os.path.normpath(src)):
     sys.exit("install-pilot.sh: --dsh-from %s goes through a symbolic link: give %s"
              % (src, os.path.realpath(src)))
-root = opened(src, None, True)
+if root_hook and dry and mode == "tar":
+    subprocess.run(root_hook, shell=True, check=True)   # the tests' swap
+root = walk(src)
 if root is None:
+    if mode == "check":
+        print("\n".join(bad)); sys.exit(0)
     sys.exit("install-pilot.sh: %s: not copied: %s" % (src, "; ".join(bad)))
 read("hooks.json", "hooks.json", root)
 prof = opened("profiles", root, True)
@@ -604,6 +624,9 @@ if prof is not None:
     os.close(prof)
 os.close(root)
 secrets = [rel for rel, data in sorted(files.items()) if secret(rel, data)]
+if mode == "check":
+    print("\n".join(bad + ["%s looks like it holds a secret" % rel for rel in secrets]))
+    sys.exit(0)
 if bad:
     sys.exit("install-pilot.sh: %s: not copied:\n  %s" % (src, "\n  ".join(bad)))
 if secrets:
@@ -625,66 +648,68 @@ with tarfile.open(fileobj=out, mode="w", format=tarfile.PAX_FORMAT) as tar:
 sys.stdout.buffer.write(out.getvalue())
 EOF
 }
-looks_secret() { [ $# -eq 0 ] || dsh_read secrets "$@"; }
 
-# the guest's token file (codex #457 r2): a file of the guest's own, 0600,
-# in a private directory it makes (mktemp -d); written through a pipe (the
-# token in no argument, no environment), read by git's helper, removed at
-# exit
-CRED_DIR=
-cred_open() {
-  if [ "$DRY" = 1 ]; then
-    echo "+ runuser -u $GUEST -- mktemp -d"; CRED_DIR=/tmp/ameesh-cred.XXXXXX; return
-  fi
-  CRED_DIR=$(cd / && runuser -u "$GUEST" -- mktemp -d) && [[ "$CRED_DIR" =~ ^/[A-Za-z0-9/._-]+$ ]] \
-    || die "no private directory for the guest's token (mktemp -d)"
-  trap cred_close EXIT
-}
-cred_close() {
-  [ -n "$CRED_DIR" ] && [ "$DRY" = 0 ] || return 0
-  (cd / && runuser -u "$GUEST" -- rm -f -- "$CRED_DIR/token"; runuser -u "$GUEST" -- rmdir -- "$CRED_DIR") || true
-  CRED_DIR=
-}
-# cred_put AGENT: AGENT's GH_TOKEN in the token file, never traced
-cred_put() {
-  if [ "$DRY" = 1 ]; then
-    echo "+ (GH_TOKEN of $ETC/guest-$1.env) | runuser -u $GUEST -- sh -c 'umask 077 && cat > $CRED_DIR/token'"
-    return
-  fi
-  { quiet; } 2>/dev/null
-  local rc=0
-  token_of "$1" | (cd / && runuser -u "$GUEST" -- sh -c 'umask 077 && cat > "$1"' sh "$CRED_DIR/token") || rc=1
-  unquiet
-  [ "$rc" = 0 ] || die "the guest's token file was not written"
-}
-# git_cred CMD…: git as the guest, with the token file's helper alone: the
-# helpers of every config file reset on the command line (read after them
-# all), the config of the environment unset
+# git_cred AGENT CMD…: git as the guest, with an inline helper alone (the
+# helpers of every config file reset on the command line, read after them
+# all; the config of the environment unset). AGENT's GH_TOKEN reaches it
+# through a pipe on fd 3, read once: never in a file, an argument or an
+# environment, gone with the processes (codex #457 r3)
+GIT_CRED_HELPER='!f() { [ "$1" = get ] || return 0; h=; while IFS= read -r l && [ -n "$l" ]; do case "$l" in host=*) h=${l#host=} ;; esac; done; t=$(cat <&3 2>/dev/null); [ "$h" = github.com ] && [ -n "$t" ] && printf "username=x-access-token\npassword=%s\n" "$t"; }; f'
 git_cred() {
-  local helper
-  helper=$(printf '!f() { [ "$1" = get ] || return 0; h=; while IFS= read -r l && [ -n "$l" ]; do case "$l" in host=*) h=${l#host=} ;; esac; done; [ "$h" = github.com ] && [ -s %s ] && printf "username=x-access-token\\npassword=%%s\\n" "$(cat %s)"; }; f' \
-    "$CRED_DIR/token" "$CRED_DIR/token")
-  as_guest env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GH_TOKEN GIT_TERMINAL_PROMPT=0 \
-    git -c credential.helper= -c "credential.helper=$helper" "$@"
+  local a=$1 rc=0
+  shift
+  [ "$DRY" = 0 ] || echo "+ (GH_TOKEN of $ETC/guest-$a.env, through a pipe on fd 3 of)"
+  { quiet; } 2>/dev/null
+  # (a git that never asks closes fd 3 unread: no SIGPIPE taken for a failure)
+  (trap '' PIPE; token_of "$a" 2>/dev/null || true) | as_guest env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GH_TOKEN \
+    GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c "credential.helper=$GIT_CRED_HELPER" "$@" \
+    3<&0 </dev/null || rc=$?
+  unquiet
+  return $rc
 }
-# cred_helpers DIR: the helpers git uses in the clone in DIR, as the guest
-# sees them (its home; every file, includes followed), after the last reset;
-# DIR's own .git only (never a repository above it: an invalid clone reads
-# as no helper, a FAIL)
-# (none set: git says 1, an empty list; another failure: "unreadable")
-cred_helpers() {
-  local out rc=0
-  out=$(env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GIT_CONFIG_GLOBAL \
-          HOME="$(at "$GHOME")" XDG_CONFIG_HOME="$(at "$GHOME")/.config" \
-          git -c "safe.directory=*" --git-dir="$(at "$1")/.git" config --show-origin --get-all \
-          credential.helper 2>&1) || rc=$?
-  case "$rc" in
-    0) ;;
-    1) return 0 ;;
-    *) echo "unreadable (${out%%$'\n'*})"; return 0 ;;
-  esac
-  printf '%s\n' "$out" \
-    | awk -F'\t' '$2 == "" { n = 0; next } { list[++n] = $2 } END { for (i = 1; i <= n; i++) print list[i] }'
+# cred_audit DIR before|after: what in the clone in DIR's config, as git
+# reads it there for the guest (its home; every scope, worktree too, includes
+# followed), is a credential setting not ours, one per line (codex #457 r3).
+# Any credential.* but credential.helper is refused (a helper for one URL
+# would be asked after our reset). `before` --enable writes the clone's
+# .git/config: a credential.helper is only taken there, or in the system's
+# or the guest's global file (both read before it, so reset). `after`: the
+# helpers in use, after the last reset, must be ours alone.
+# Read by the guest itself on a real host (root never follows its includes).
+cred_audit() {
+  local as=()
+  [ -n "$HOSTDIR" ] || [ "$(id -u)" != 0 ] || as=(runuser -u "$GUEST" --)
+  (cd / && "${as[@]}" python3 -I - "$(at "$1")/.git" "$(at "$GHOME")" "$HELPER" "$2" <<'EOF'
+import os, subprocess, sys
+gd, home, ours, when = sys.argv[1:5]
+env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+env.update(HOME=home, XDG_CONFIG_HOME=home + "/.config")
+r = subprocess.run(["git", "-c", "safe.directory=*", "--git-dir=" + gd, "config", "-z",
+                    "--show-scope", "--show-origin", "--get-regexp", r"^credential\."],
+                   capture_output=True, env=env)
+if r.returncode not in (0, 1) or (r.returncode == 1 and r.stdout):
+    print("unreadable (%s)" % (r.stderr.decode(errors="replace").splitlines() or ["?"])[0])
+    sys.exit(0)
+items = r.stdout.decode(errors="replace").split("\0")[:-1]
+own = ("file:" + gd + "/config", "file:.git/config")
+foreign, helpers = [], []
+for scope, origin, kv in zip(items[0::3], items[1::3], items[2::3]):
+    key, nl, value = kv.partition("\n")
+    where = "%s, %s" % (scope, origin)
+    if key.lower() != "credential.helper":
+        foreign.append("%s (%s): not ours" % (key, where))
+    elif when == "before":
+        if not (scope in ("system", "global") or origin in own):
+            foreign.append("credential.helper %s (%s): read after the clone's reset" % (value, where))
+    elif not nl or value:
+        helpers.append(value if nl else "(no value)")
+    else:
+        helpers = []
+if when == "after" and helpers != [ours]:
+    foreign.append("credential helpers in use: %s, not %s alone" % (", ".join(helpers) or "none", ours))
+print("\n".join(foreign))
+EOF
+  ) | sed '/^$/d'
 }
 
 # --------------------------------------------------------------------------
@@ -745,8 +770,10 @@ EOF
   if [ -f "$d/hooks.json" ] && [ -d "$d/profiles" ] && [ ! -L "$d" ] \
      && [ "$(stat -c %u "$d")" = "$guid" ]; then
     ok "$GHOME/.dsh: hooks.json, profiles $(cd "$d/profiles" && ls | tr '\n' ' ')"
-    mapfile -t files < <(find "$d/hooks.json" "$d/profiles" -maxdepth 2 -type f)
-    for f in $(looks_secret "${files[@]}"); do ko "${f#"$HOSTDIR"} looks like it holds a secret"; done
+    # the rules of the copy, read the same way (codex #457 r3)
+    while IFS= read -r line; do
+      [ -z "$line" ] || ko "$GHOME/.dsh/$line"
+    done < <(dsh_read check "$d")
   else ko "$GHOME/.dsh: no hooks.json and profiles of the guest's own (--enable copies them)"; fi
   guests=()
   for f in "$(at "$ETC")"/guest-*.env; do
@@ -773,10 +800,10 @@ EOF
       head=$(head -c 200 "$(at "$dir/.git/HEAD")" 2>/dev/null || true)
       case "$head" in "ref: "*) head=${head#ref: } ;; *) head="detached at ${head:0:12}" ;; esac
       ok "$dir: a clone of $origin, $head"
-      # the helpers git uses there, after the last reset: ours alone
-      helpers=$(cred_helpers "$dir")
-      [ "$helpers" = "$HELPER" ] && ok "$dir: credential.helper $HELPER alone" \
-        || ko "$dir: credential helpers in use: ${helpers:-none}, not $HELPER alone (--enable sets it)"
+      # every credential setting git reads there: our helper alone
+      audit=$(cred_audit "$dir" after)
+      if [ -z "$audit" ]; then ok "$dir: credential.helper $HELPER alone"
+      else while IFS= read -r line; do ko "$dir: $line"; done <<<"$audit"; fi
     else ko "$dir: not a clone of the guest's (--enable makes it)"; fi
   done
   for u in $(runner_units); do
@@ -821,6 +848,9 @@ if [ "$MODE" = enable ] || [ "$MODE" = disable ]; then
         # a clone never checked out (a branch that failed): not kept
         [ -f "$(at "$dir/.git/index")" ] && [ ! -L "$(at "$dir/.git/index")" ] \
           || die "$dir is a clone of $origin never checked out: move it away first"
+        # no credential setting the clone's reset would leave (codex #457 r3)
+        audit=$(cred_audit "$dir" before)
+        [ -z "$audit" ] || die "$dir: credential settings not ours, remove them first:"$'\n'"$audit"
         echo "kept $dir: a clone of $origin (never fetched nor reset here)"
         kept+=("$dir")
         continue
@@ -863,13 +893,10 @@ if [ "$MODE" = enable ] || [ "$MODE" = disable ]; then
       copy=("${keep[@]}")
     fi
     # each branch to clone exists, asked of the forge by the guest before
-    # anything is written (codex #457 r1); the token through the guest's
-    # token file only (codex #457 r2)
-    [ ${#clones[@]} -eq 0 ] || cred_open
+    # anything is written (codex #457 r1)
     for c in "${clones[@]}"; do
       read -r a dir spec <<<"$c"
-      cred_put "$a"
-      git_cred ls-remote --exit-code --heads -- "${spec%%#*}" "refs/heads/${spec#*#}" \
+      git_cred "$a" ls-remote --exit-code --heads -- "${spec%%#*}" "refs/heads/${spec#*#}" \
         || die "${spec%%#*}: no branch ${spec#*#} (or the forge refused): nothing done"
     done
 
@@ -891,19 +918,20 @@ if [ "$MODE" = enable ] || [ "$MODE" = disable ]; then
     for c in "${clones[@]}"; do
       read -r a dir spec <<<"$c"
       say "$a: $dir, a clone of ${spec%%#*} detached on origin/${spec#*#}"
-      cred_put "$a"
-      git_cred -C "$ROOT/work" clone --quiet --no-checkout -- "${spec%%#*}" "$dir" \
+      git_cred "$a" -C "$ROOT/work" clone --quiet --no-checkout -- "${spec%%#*}" "$dir" \
         || die "the clone of ${spec%%#*} failed"
       as_guest git -C "$dir" checkout --quiet --detach "origin/${spec#*#}" \
         || die "origin/${spec#*#} not checked out in $dir: a rerun refuses it, move it away"
       kept+=("$dir")
     done
-    cred_close
     # each clone's helpers: those before reset (an empty one), then ours
-    # alone, in its own .git/config (read after the guest's every file)
+    # alone, in its own .git/config (read after the guest's every file);
+    # then read again, every scope: ours alone, or the runner is not started
     for dir in "${kept[@]}"; do
       as_guest git -C "$dir" config --local --replace-all credential.helper ""
       as_guest git -C "$dir" config --local --add credential.helper "$HELPER"
+      [ "$DRY" = 1 ] || { audit=$(cred_audit "$dir" after) && [ -z "$audit" ]; } \
+        || die "$dir: credential settings not ours alone:"$'\n'"$audit"
     done
 
     for a in "${TARGETS[@]}"; do

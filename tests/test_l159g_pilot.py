@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -497,27 +498,27 @@ class InstallPilotTest(unittest.TestCase):
         cred("approve", got + "\n")
         self.assertFalse(os.path.exists(store))
         # the clone and ls-remote: the environment's config unset, every
-        # file's helpers reset on the command line, the token in a file
+        # file's helpers reset on the command line, the token on fd 3
         for cmd in ("ls-remote --exit-code", "clone --quiet"):
             line = next(l for l in fresh.splitlines() if cmd in l)
             self.assertIn("-- env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS -u GH_TOKEN "
                           "GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c credential.helper=!f()",
                           line)
-        # that inline helper, run: github.com only, from the token file
+        # that inline helper, run: github.com only, from fd 3
         line = next(l for l in fresh.splitlines() if "ls-remote --exit-code" in l)
         inline = line.split(" -c credential.helper=", 2)[2].split(" ls-remote ")[0]
-        tokfile = self.on_host("/tok/token", self.TOKEN)
-        inline = inline.replace("/tmp/ameesh-cred.XXXXXX/token", tokfile)
+        fd3 = ["bash", "-c", 'exec 3< <(printf %s "$PILOT_T"); exec "$@"', "fd3"]
         for extra in ({}, {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper",
                            "GIT_CONFIG_VALUE_0": "store --file " + store}):
-            res = subprocess.run(["env", "-u", "GIT_CONFIG_COUNT", "git", "-c", "credential.helper=",
+            res = subprocess.run([*fd3, "env", "-u", "GIT_CONFIG_COUNT", "git", "-c", "credential.helper=",
                                   "-c", "credential.helper=" + inline, "credential", "fill"],
-                                 input=req, capture_output=True, text=True, env=dict(env, **extra))
+                                 input=req, capture_output=True, text=True,
+                                 env=dict(env, PILOT_T=self.TOKEN, **extra))
             self.assertIn("password=%s" % self.TOKEN, res.stdout)
-        res = subprocess.run(["git", "-c", "credential.helper=", "-c", "credential.helper=" + inline,
+        res = subprocess.run([*fd3, "git", "-c", "credential.helper=", "-c", "credential.helper=" + inline,
                               "credential", "fill"],
                              input=req.replace("github.com", "evil.example"),
-                             capture_output=True, text=True, env=env)
+                             capture_output=True, text=True, env=dict(env, PILOT_T=self.TOKEN))
         self.assertNotIn(self.TOKEN, res.stdout)
         # --check sees a store after the clone's reset (its own include)
         self.on_host("/srv/ameesh-guest/work/deepseek6/.git/store.inc",
@@ -525,22 +526,24 @@ class InstallPilotTest(unittest.TestCase):
         subprocess.run(["git", "-C", clone, "config", "--local", "include.path", "store.inc"], check=True)
         out = self.run_script("--check", "--host", "vm-test").stdout
         self.assertIn("FAIL /srv/ameesh-guest/work/deepseek6: credential helpers in use: "
-                      "%s\nstore, not" % helper, out)
+                      "%s, store, not" % helper, out)
         self.assertFalse(os.path.exists(store))
 
     def test_the_token_is_in_no_environment(self):
-        # codex #457 r2 P2: the token reaches no process's environment: it
-        # goes through a pipe to a 0600 file of the guest's own
+        # codex #457 r2 P2: the token reaches no process's environment;
+        # r3 P2: nor any file (a SIGKILL would leave it): a pipe on fd 3
         with open(self.SCRIPT, encoding="utf-8") as fh:
             script = fh.read()
         self.assertNotRegex(script, r"GH_TOKEN=\$")
+        self.assertNotIn("mktemp", script)
         self.on_host("/etc/ameesh/guest-deepseek6.env", "GH_TOKEN=%s\n" % self.TOKEN)
         out = self.dry("--enable", "deepseek6", *self.workspace_args()).stdout
         self.assertNotIn("GH_TOKEN=", out)
-        self.assertIn("+ runuser -u ameesh-guest -- mktemp -d", out)
-        put = "+ (GH_TOKEN of /etc/ameesh/guest-deepseek6.env) | runuser -u ameesh-guest -- " \
-              "sh -c 'umask 077 && cat > /tmp/ameesh-cred.XXXXXX/token'"
-        self.assertLess(out.index(put), out.index("ls-remote"))
+        self.assertNotIn("/token", out)
+        pipe = "+ (GH_TOKEN of /etc/ameesh/guest-deepseek6.env, through a pipe on fd 3 of)\n" \
+               "+ runuser -u ameesh-guest -- env "
+        self.assertEqual(out.count(pipe), 2)
+        self.assertLess(out.index(pipe), out.index("ls-remote"))
         self.assertNotIn(self.TOKEN, out)
 
     def test_a_profile_swapped_while_read_is_refused(self):
@@ -636,6 +639,113 @@ class InstallPilotTest(unittest.TestCase):
             self.assertIn(next(iter(extra)), res.stderr)
             self.assertNotIn("+ ", res.stdout)
             subprocess.run(["rm", "-rf", source], check=True)
+
+    # --- codex #457 r3 ---
+
+    def test_a_credential_setting_not_ours_is_refused(self):
+        # P1: a helper for one URL (in config.worktree, the guest's global
+        # file) is asked after the clone's reset; a credential.helper read
+        # after .git/config (an include of it) too: a kept clone holding one
+        # is refused before anything, and --check says it
+        self.guest_user()
+        self.on_host("/etc/ameesh/guest-deepseek6.env", "GH_TOKEN=%s\n" % self.TOKEN)
+        clone = self.clone_here()
+        self.on_host("/srv/ameesh-guest/work/deepseek6/.git/index", "DIRC")
+        home = self.on_host("/srv/ameesh-guest/home")
+        git = ["git", "-C", clone, "config"]
+        url_helper = "credential.https://github.com.helper"
+        subprocess.run([*git, "extensions.worktreeConfig", "true"], check=True)
+        subprocess.run([*git, "--worktree", url_helper, "store"], check=True)
+        def refused(why):
+            res = self.dry("--enable", "deepseek6", *self.workspace_args())
+            self.assertNotEqual(res.returncode, 0, why)
+            self.assertIn("credential settings not ours, remove them first", res.stderr)
+            self.assertIn(why, res.stderr)
+            self.assertNotIn("+ ", res.stdout)
+        refused("%s (worktree, file:%s/.git/config.worktree): not ours" % (url_helper, clone))
+        subprocess.run([*git, "--worktree", "--unset", url_helper], check=True)
+        gitconfig = os.path.join(home, ".gitconfig")
+        subprocess.run(["git", "config", "--file", gitconfig, url_helper, "store"], check=True)
+        refused("%s (global, file:%s): not ours" % (url_helper, gitconfig))
+        # a generic helper in the global file: reset by the clone's own
+        os.remove(gitconfig)
+        subprocess.run(["git", "config", "--file", gitconfig, "credential.helper", "store"], check=True)
+        self.on_host("/srv/ameesh-guest/work/deepseek6/.git/store.inc", "[credential]\n\thelper = store\n")
+        subprocess.run([*git, "--local", "include.path", "store.inc"], check=True)
+        refused("credential.helper store (local, file:%s/.git/store.inc): read after the clone's reset"
+                % clone)
+        subprocess.run([*git, "--local", "--unset", "include.path"], check=True)
+        res = self.dry("--enable", "deepseek6", *self.workspace_args())
+        self.assertEqual(res.returncode, 0, res.stderr)
+        # --check: our helper alone in .git/config, a URL's in config.worktree
+        out = res.stdout
+        self.helper_on_host(out)
+        for args in (("--replace-all", "credential.helper", ""),
+                     ("--add", "credential.helper", "/opt/ameesh/git-credential-guest")):
+            subprocess.run([*git, "--local", *args], check=True)
+        check = lambda: self.run_script("--check", "--host", "vm-test").stdout
+        self.assertIn("ok   /srv/ameesh-guest/work/deepseek6: credential.helper "
+                      "/opt/ameesh/git-credential-guest alone", check())
+        subprocess.run([*git, "--worktree", url_helper, "store"], check=True)
+        self.assertIn("FAIL /srv/ameesh-guest/work/deepseek6: %s (worktree, file:%s/.git/config.worktree):"
+                      " not ours" % (url_helper, clone), check())
+
+    def test_the_source_swapped_above_it_is_refused(self):
+        # P1 (TOCTOU): a directory above --dsh-from swapped for a link to
+        # elsewhere once its path was checked: opened from / down, refused
+        os.makedirs(os.path.join(self.host, "a", "b"))
+        source = os.path.join(self.host, "a", "b", "dsh")
+        os.rename(self.dsh(), source)
+        elsewhere = os.path.join(self.host, "elsewhere")
+        shutil.copytree(os.path.join(self.host, "a", "b"), elsewhere)
+        with open(os.path.join(elsewhere, "dsh", "profiles", "agent", "cordis.yml"), "w",
+                  encoding="utf-8") as fh:
+            fh.write("shadow: root\n")
+        b = os.path.join(self.host, "a", "b")
+        swap = "mv %s %s.real && ln -s %s %s" % (b, b, elsewhere, b)
+        res = self.dry("--enable", "deepseek6", *self.workspace_args(dsh=False), "--dsh-from", source,
+                       PILOT_TEST_ROOT_HOOK=swap)
+        self.assertTrue(os.path.islink(b))
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("%s: goes through a symbolic link" % source, res.stderr)
+        self.assertNotIn("dsh_read tar", res.stdout)
+        self.assertNotIn("systemctl enable", res.stdout)
+
+    def test_a_fifo_never_blocks(self):
+        # P2: a FIFO for hooks.json (opened before it was checked) blocked
+        # root; read now without blocking, a plain file only. --check too.
+        source = self.dsh()
+        os.remove(os.path.join(source, "hooks.json"))
+        os.mkfifo(os.path.join(source, "hooks.json"))
+        res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--host", "vm-test", "--enable",
+                              "deepseek6", *self.workspace_args(dsh=False), "--dsh-from", source],
+                             capture_output=True, text=True, env=self.env(), timeout=60)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("hooks.json: not a plain file", res.stderr)
+        self.assertNotIn("+ ", res.stdout)
+        self.guest_user()
+        self.on_host("/srv/ameesh-guest/home/.dsh/hooks.json", "{}")
+        os.mkfifo(self.on_host("/srv/ameesh-guest/home/.dsh/profiles/agent") + "/cordis.yml")
+        res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--check", "--host", "vm-test"],
+                             capture_output=True, text=True, env=self.env(), timeout=60)
+        self.assertIn("FAIL /srv/ameesh-guest/home/.dsh/profiles/agent/cordis.yml: not a file", res.stdout)
+
+    def test_check_holds_the_profile_to_the_copy_rules(self):
+        # P2: --check read the profile for secrets only: a DER key renamed
+        # agent.txt passed. It is read now as --enable reads it.
+        self.guest_user()
+        self.on_host("/srv/ameesh-guest/home/.dsh/hooks.json", "{}")
+        self.on_host("/srv/ameesh-guest/home/.dsh/profiles/agent/cordis.yml", "[]\n")
+        check = lambda: self.run_script("--check", "--host", "vm-test").stdout
+        self.assertNotIn("FAIL /srv/ameesh-guest/home/.dsh/", check())
+        der = "0\x82\x04\xbe\x02\x01\x000\r\x06\t*\x86H\x86\xf7\r\x01\x01\x01\x05\x00"
+        with open(self.host + "/srv/ameesh-guest/home/.dsh/profiles/agent/agent.txt", "wb") as fh:
+            fh.write(der.encode("latin-1"))
+        self.on_host("/srv/ameesh-guest/home/.dsh/profiles/agent/id_work", "x\n")
+        out = check()
+        self.assertIn("FAIL /srv/ameesh-guest/home/.dsh/profiles/agent/agent.txt: not text (UTF-8)", out)
+        self.assertIn("FAIL /srv/ameesh-guest/home/.dsh/profiles/agent/id_work: not a file a profile "
+                      "needs", out)
 
     def test_a_work_root_out_of_the_volume_is_refused(self):
         # P2: $ROOT/work a link to elsewhere: the clone would land there

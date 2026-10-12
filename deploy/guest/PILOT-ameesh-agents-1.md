@@ -171,15 +171,25 @@ runners. Everything is checked before anything is done:
   holding anything but a clone of that repository: refused. A clone already
   there is kept as it is (never fetched nor reset);
 * **its git credential**: `/opt/ameesh/git-credential-guest` (root, 0755),
-  named in the guest's `~/.gitconfig` for `https://github.com`. It hands
-  git the runner's `GH_TOKEN`, which systemd reads in
-  `/etc/ameesh/guest-<agent>.env`: the token is never written anywhere else
-  nor printed, and for the clone it goes in git's environment, never on a
-  command line. A clone without `GH_TOKEN` in the agent's file is refused;
+  named in each clone's own `.git/config`, after an empty
+  `credential.helper` that resets the ones read before it (the system's,
+  the guest's `~/.gitconfig`); nothing is written in `~/.gitconfig`. It
+  hands git the runner's `GH_TOKEN`, which systemd reads in
+  `/etc/ameesh/guest-<agent>.env`, for `https://github.com` only. A kept
+  clone with any other credential setting git would read after that reset
+  (any `credential.*` but `credential.helper`, a `credential.<url>.helper`
+  for one, anywhere, the guest's `~/.gitconfig` included; a
+  `credential.helper` in `config.worktree` or in an include) is refused:
+  remove it first, `--enable` says where it is. For the clone itself (and
+  the branch asked first), the token goes from root to git's helper
+  through a pipe, read once: never in a file, an argument or an
+  environment, never printed. A clone without `GH_TOKEN` in the agent's
+  file is refused;
 * **the dsh profile**: `hooks.json` and the plain files of
   `~/.dsh/profiles/*/` from `--dsh-from` (by default the `sudo` user's
   `~/.dsh`), never its sessions, keys, logs or modules; refused if a file
-  looks like it holds a key, token or password. Kept if the guest has one.
+  looks like it holds a key, token or password. Kept if the guest has one;
+  `--check` reads it by the same rules.
 
 What lands in the guest's home or work is written by the guest
 (`runuser -u ameesh-guest`), never by root. `--check` reports each of them
@@ -202,8 +212,12 @@ systemctl status 'ameesh-guest-runner@*'
 
 On ameesh-agents-1, where bureau made the clones, the credential and the
 profile by hand on 2026-10-12: the clones and the profile are kept (said
-`kept`), the helper replaces bureau's in `~/.gitconfig` (the same
-`GH_TOKEN`, from the same file), and `--check` shows them all.
+`kept`), each clone's `.git/config` names the helper after its reset (the
+same `GH_TOKEN`, from the same file), and `--check` shows them all. A
+helper bureau set for `https://github.com` in the guest's `~/.gitconfig`
+(`credential.https://github.com.helper`) is refused: unset it first
+(`git config --global --unset-all credential.https://github.com.helper`,
+as the guest); a plain `credential.helper` there may stay.
 
 After a day of observation without a missed target
 (`ameesh hosts ameesh-agents-1 --report --days 1`):
