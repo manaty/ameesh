@@ -29,6 +29,12 @@ only, never the query string).
 
 `GET /.well-known/ameesh` (discovery) and `GET /api/v1/openapi.json` need no
 token: they say nothing about the mesh's state.
+
+`GET /ui/` (L88) is the standalone page: the embeddable components
+(`ameesh-ui.js`, built from `ui/` and committed under `ameesh/ui/static/`)
+assembled full screen. Static files of a fixed list, no token (the page asks
+for it and keeps it in memory), under a strict CSP: scripts and styles of
+this origin only, no inline code, Trusted Types, API calls to this origin.
 """
 from __future__ import annotations
 
@@ -68,6 +74,18 @@ _ENTRY_RE = re.compile(r"^[A-Za-z0-9._/#:-]{1,256}$")
 _SINCE_RE = re.compile(r"^[0-9]{1,6}[mhdj]$|^[0-9]{4}-[0-9]{2}-[0-9]{2}[0-9T:+.Z-]{0,20}$")
 _LINE_RE = re.compile(r"^([A-Z]{1,10}) (/[A-Za-z0-9._/@:+-]{0,200})")
 CSP = "default-src 'none'; frame-ancestors 'none'"
+#: the standalone page (L88): its own files and the API, nothing inline
+UI = "/ui"
+UI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "static")
+UI_FILES = {
+    "": ("index.html", "text/html; charset=utf-8"),
+    "ameesh-ui.js": ("ameesh-ui.js", "text/javascript; charset=utf-8"),
+    "ameesh-ui.css": ("ameesh-ui.css", "text/css; charset=utf-8"),
+    "page.css": ("page.css", "text/css; charset=utf-8"),
+}
+UI_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+          "img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; "
+          "require-trusted-types-for 'script'; trusted-types lit-html")
 
 log = logging.getLogger("ameesh.serve")
 
@@ -466,11 +484,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # -- responses ----------------------------------------------------------
 
-    def _send(self, status: int, body: bytes, ctype: str, extra=()) -> None:
+    def _send(self, status: int, body: bytes, ctype: str, extra=(), csp: str = CSP) -> None:
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        for name, value in httpkit.BASE_HEADERS + (("Content-Security-Policy", CSP),) \
+        for name, value in httpkit.BASE_HEADERS + (("Content-Security-Policy", csp),) \
                 + tuple(extra):
             self.send_header(name, value)
         self.end_headers()
@@ -519,6 +537,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if url.path == WELL_KNOWN:
             self._json(200, discovery(self.ctx))
             return
+        if url.path == UI or url.path.startswith(UI + "/"):
+            self._ui(url.path)
+            return
         found = match(url.path)
         if found is None:
             raise ApiError(404, "not_found", "no such route (see %s)" % OPENAPI_PATH)
@@ -544,6 +565,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             data = route.build(self.ctx, None, params, query)
         self._json(200, data)
+
+    def _ui(self, path: str) -> None:
+        """The standalone page and its files: a fixed list, nothing else."""
+        if path == UI:
+            self._send(308, b"", "text/plain; charset=utf-8", (("Location", UI + "/"),))
+            return
+        found = UI_FILES.get(path[len(UI) + 1:])
+        if found is None:
+            raise ApiError(404, "not_found", "no such file")
+        name, ctype = found
+        try:
+            with open(os.path.join(UI_DIR, name), "rb") as fh:
+                body = fh.read()
+        except FileNotFoundError:
+            raise ApiError(404, "not_found", "interface not installed") from None
+        self._send(200, body, ctype, csp=UI_CSP)
 
     def send_error(self, code, message=None, explain=None) -> None:
         # never the request in the error page nor in the log

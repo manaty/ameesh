@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# L88 — the embeddable interface (ui/, docs/design/etudes/ui-integrable.md §5):
+# its build is committed under src/ameesh/ui/static/ so that `pip install`
+# delivers it without Node. This job checks, with Node:
+#   - the client types match docs/api/openapi-v1.json (`npm run gen`);
+#   - the sources type-check;
+#   - the unit and component tests, axe-core on every component (jsdom);
+#   - the committed build is the build of the sources, byte for byte, and the
+#     whole stays under 80 KB compressed (`npm run check`).
+# The Python side (the /ui/ page of `ameesh serve`, its CSP, the components'
+# contract on the sources, the theme's contrasts) is in tests/test_l88_ui.py.
+name: ui
+
+on:
+  push:
+    branches: [main, "release/**"]
+    paths: ["ui/**", "src/ameesh/ui/**", "docs/api/openapi-v1.json", ".github/workflows/ui.yml"]
+  pull_request:
+    paths: ["ui/**", "src/ameesh/ui/**", "docs/api/openapi-v1.json", ".github/workflows/ui.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: ui-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run check
