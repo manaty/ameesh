@@ -69,16 +69,20 @@ class FakeWork:
 
 
 class FakeRoadmap:
+    def __init__(self, plans=()):
+        self.plans = list(plans)
+
     def item_plans(self, ids):
-        return []
+        wanted = {int(i) for i in ids}
+        return [dict(p) for p in self.plans if int(p["id"]) in wanted]
 
 
 class FakeStore:
     """Le peu de `storage.of(db)` que `versions.collect` lit."""
 
-    def __init__(self, rows, packages=None, package_items=None):
+    def __init__(self, rows, packages=None, package_items=None, plans=()):
         self.work = FakeWork(rows)
-        self.roadmap = FakeRoadmap()
+        self.roadmap = FakeRoadmap(plans)
         self._packages = packages or {}
         self._package_items = package_items or []
 
@@ -89,10 +93,10 @@ class FakeStore:
         return list(self._package_items)
 
 
-def rows(*, merged=True, pr=True):
+def rows(*, merged=True, pr=True, branch=None):
     out = [{"id": 1, "title": "Release 0.2.11 : train", "state": "build",
             "app": "nexlink", "issue_ref": "acme/web#10", "updated_ts": NOW - 100,
-            "pr_ref": "acme/web#99" if pr else None}]
+            "branch": branch, "pr_ref": "acme/web#99" if pr else None}]
     if merged:
         out.append({"id": 2, "title": "Corrige le cache", "state": "merged",
                     "app": "nexlink", "issue_ref": "acme/web#11",
@@ -114,7 +118,7 @@ class PureTest(unittest.TestCase):
     def test_tags_et_versions(self):
         self.assertEqual(versions.parse_tag("v1.10.0"),
                          {"tag": "v1.10.0", "prefix": "", "version": "1.10.0",
-                          "key": (1, 10, 0)})
+                          "key": (1, 10, 0, (1,))})
         self.assertEqual(versions.parse_tag("desktop-v0.2.8")["prefix"], "desktop")
         self.assertEqual(versions.parse_tag("desktop-0.2.8")["version"], "0.2.8")
         self.assertIsNone(versions.parse_tag("nightly"))
@@ -123,6 +127,25 @@ class PureTest(unittest.TestCase):
         self.assertIsNone(versions.version_of("Housekeeping"))
         self.assertTrue(versions.is_release_lot("QA-1.10.0"))
         self.assertFalse(versions.is_release_lot("Corrige la QA"))
+
+    def test_pre_versions_semver(self):
+        """P2 codex r1 : `0.2.11-rc.1` n'est ni rejetée ni affichée en 0.2.11."""
+        rc = versions.parse_tag("v0.2.11-rc.1")
+        self.assertEqual(rc["version"], "0.2.11-rc.1")
+        self.assertEqual(rc["prefix"], "")
+        final = versions.parse_tag("v0.2.11")
+        self.assertLess(rc["key"], final["key"])
+        self.assertLess(versions.version_key("0.2.11-rc.1"),
+                        versions.version_key("0.2.11-rc.2"))
+        self.assertLess(versions.version_key("0.2.11-rc.10"),
+                        versions.version_key("0.2.11"))
+        self.assertEqual(versions.parse_tag("desktop-v0.2.11-rc.1")["prefix"], "desktop")
+        self.assertEqual(versions.version_of("Release 0.2.11-rc.1 : train"),
+                         "0.2.11-rc.1")
+        self.assertEqual(versions.version_of("Release 0.2.11 : train"), "0.2.11")
+        self.assertEqual(versions.tag_for("", "0.2.11-rc.1", {"v"}), "v0.2.11-rc.1")
+        self.assertEqual(versions.tag_for("desktop", "0.2.11-rc.1", {"v"}),
+                         "desktop-v0.2.11-rc.1")
 
     def test_flux_et_indices(self):
         known = [versions.parse_tag("v1.9.1"), versions.parse_tag("desktop-v0.2.8"),
@@ -195,6 +218,41 @@ class ReaderTest(unittest.TestCase):
         with self.assertRaises(plan_github.GithubError):
             reader.releases(REPO)
 
+    def test_echec_en_cache_et_donnees_perimees(self):
+        """P3 codex r1 : un échec est gardé 60 s ; les données précédentes
+        restent servies, marquées périmées, jamais une page vide."""
+        path = versions.tags_path(REPO)
+        api = FakeApi({path: [{"name": "v1.0.0"}]})
+        clock = [0.0]
+        reader = versions.Reader(api, ttl=10.0, fail_ttl=60.0,
+                                 clock=lambda: clock[0], wall=lambda: 1000.0)
+        self.assertEqual(reader.tags(REPO), [{"name": "v1.0.0"}])
+        self.assertFalse(reader.stale(path))
+        clock[0] = 20.0                      # cache expiré, GitHub tombe
+        api.routes.pop(path)
+        self.assertEqual(reader.tags(REPO), [{"name": "v1.0.0"}])
+        self.assertTrue(reader.stale(path))
+        self.assertEqual(reader.stamp(path), 1000.0)     # la fraîcheur ne bouge pas
+        calls = len(api.calls)
+        clock[0] = 30.0
+        self.assertEqual(reader.tags(REPO), [{"name": "v1.0.0"}])
+        self.assertEqual(len(api.calls), calls)          # échec en cache 60 s
+        clock[0] = 90.0
+        api.routes[path] = [{"name": "v1.0.1"}]
+        self.assertEqual(reader.tags(REPO), [{"name": "v1.0.1"}])
+        self.assertFalse(reader.stale(path))
+
+    def test_echec_jamais_lu_est_garde(self):
+        api = FakeApi({})
+        clock = [0.0]
+        reader = versions.Reader(api, fail_ttl=60.0, clock=lambda: clock[0])
+        with self.assertRaises(plan_github.GithubError):
+            reader.releases(REPO)
+        calls = len(api.calls)
+        with self.assertRaises(plan_github.GithubError):
+            reader.releases(REPO)            # même échec, aucun appel de plus
+        self.assertEqual(len(api.calls), calls)
+
     def test_vue_perimee(self):
         api = FakeApi({versions.releases_path(REPO): RELEASES})
         reader = versions.Reader(api, ttl=10_000.0, clock=lambda: 0.0,
@@ -261,12 +319,15 @@ class ClientTest(unittest.TestCase):
 
 
 class CollectTest(unittest.TestCase):
-    def test_notes_de_la_branche_de_release(self):
+    def test_notes_lues_sur_la_branche_head_de_la_pr(self):
+        """P2 codex r1 : les notes se lisent sur la branche head de la PR de
+        release, jamais sur `release/vX`, le tag ou la branche par défaut."""
+        head = "lot/0.2.11-notes"
         api = FakeApi(routes(
             tags=TAGS, releases=RELEASES,
-            files={"release/v0.2.11":
-                   "Résumé de la 0.2.11.\n\n**Cache**\n- partagé par le serveur\n"}))
-        view = collect(api)
+            files={head: "Résumé de la 0.2.11.\n\n**Cache**\n- partagé par le serveur\n",
+                   "release/v0.2.11": "Notes d'une autre référence\n"}))
+        view = collect(api, items=rows(branch=head))
         self.assertEqual(view["schema"], versions.SCHEMA)
         self.assertEqual(view["github"]["source"], "github")
         self.assertEqual(view["github"]["age_s"], 0.0)
@@ -282,7 +343,8 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(nxt["state"], "build")
         self.assertEqual(nxt["pr"]["number"], 99)          # la PR vient de la base
         self.assertEqual(nxt["pr"]["source"], "ameesh work items (sync-github)")
-        self.assertEqual(nxt["notes"]["source"], "release/v0.2.11")
+        self.assertEqual(nxt["pr"]["head"], head)          # branche du lot, en base
+        self.assertEqual(nxt["notes"]["source"], "PR #99 head %s" % head)
         self.assertEqual(nxt["notes"]["origin"], "github")
         self.assertEqual(nxt["notes"]["read_ts"], NOW)
         self.assertEqual(nxt["summary"], "Résumé de la 0.2.11.")
@@ -292,8 +354,25 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(nxt["lots"][0]["pr"], "acme/web#99")
         self.assertEqual(nxt["lots"][0]["pr_url"],
                          "https://github.com/acme/web/pull/99")
+        # la branche head seulement : ni release/vX, ni le tag, ni main
+        self.assertIn(versions.file_path(REPO, NOTES, head), api.calls)
+        self.assertNotIn(versions.file_path(REPO, NOTES, "release/v0.2.11"), api.calls)
+        self.assertNotIn(versions.file_path(REPO, NOTES, "main"), api.calls)
         # aucun appel à l'API des PR : elles sont en base
         self.assertFalse([c for c in api.calls if "/pulls" in c])
+
+    def test_notes_absentes_de_la_branche_head_sont_dites(self):
+        """P2 codex r1 : sinon rien, avec la raison — pas de repli."""
+        api = FakeApi(routes(
+            tags=TAGS, releases=RELEASES,
+            files={"release/v0.2.11": "Notes d'une autre référence\n"}))
+        view = collect(api, items=rows(branch="lot/0.2.11-notes"))
+        nxt = view["products"][0]["next"]
+        self.assertIsNone(nxt["notes"])
+        self.assertIn("head branch", nxt["notes_reason"])
+        self.assertTrue(any("notes not read" in m for m in nxt["missing"]))
+        self.assertEqual(nxt["merged_since"], "v0.2.10")   # repli : lots fusionnés
+        self.assertEqual([l["id"] for l in nxt["merged_lots"]], [2])
 
     def test_repli_lots_fusionnes_et_leur_pr(self):
         api = FakeApi(routes(tags=TAGS, releases=RELEASES))
@@ -357,12 +436,149 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(desktop["next"]["version"], "0.2.11")
         self.assertEqual([lot["id"] for lot in desktop["next"]["lots"]], [1, 2])
 
-    def test_aucun_tag_ni_release(self):
+    def test_depot_sans_etiquette_montre_ses_lots_de_release(self):
+        """P3 codex r1 : sans tag ni release, les lots de release ouverts sont
+        quand même montrés ; le manque d'étiquette est dit."""
         api = FakeApi(routes())
         view = collect(api)
-        self.assertIn("no version tag or release known",
-                      view["products"][0]["missing"][0])
-        self.assertIsNone(view["products"][0]["next"])
+        product = view["products"][0]
+        self.assertTrue(any("no version tag or release known" in m
+                            for m in product["missing"]))
+        self.assertIsNone(product["last"])
+        self.assertEqual(product["next"]["version"], "0.2.11")
+        self.assertEqual(product["next"]["tag"], "v0.2.11")
+
+    def test_versions_indexees_par_produit(self):
+        """P2 codex r1 : `v1.0.0` et `desktop-v1.0.0` coexistent, indexés par
+        (flux, version) — aucun produit ne disparaît."""
+        tags = [{"name": "v1.0.0", "commit": {"sha": "s1"}},
+                {"name": "desktop-v1.0.0", "commit": {"sha": "s2"}}]
+        releases = [
+            {"tag_name": "v1.0.0", "draft": False, "prerelease": False,
+             "published_at": "2026-09-01T00:00:00Z"},
+            {"tag_name": "desktop-v1.0.0", "draft": False, "prerelease": False,
+             "published_at": "2026-09-02T00:00:00Z"}]
+        api = FakeApi(routes(tags=tags, releases=releases))
+        view = collect(api, items=rows(merged=False, pr=False), packages={},
+                       package_items=[])
+        labels = {p["label"] for p in view["products"]}
+        self.assertEqual(labels, {"nexlink server/prod", "nexlink desktop"})
+        by_label = {p["label"]: p for p in view["products"]}
+        self.assertEqual(by_label["nexlink server/prod"]["last"]["tag"], "v1.0.0")
+        self.assertEqual(by_label["nexlink desktop"]["last"]["tag"], "desktop-v1.0.0")
+
+    def test_brouillon_ne_releve_pas_la_base(self):
+        """P2 codex r1 : 0.2.10 publiée + 0.2.11 en brouillon → la prochaine
+        release est 0.2.11, « préparée », pas « aucune release annoncée »."""
+        tags = [{"name": "v0.2.10", "commit": {"sha": "s1"}},
+                {"name": "v0.2.11", "commit": {"sha": "s2"}}]
+        releases = [
+            dict(RELEASES[0]),
+            {"tag_name": "v0.2.11", "draft": True, "prerelease": False,
+             "created_at": "2026-09-20T00:00:00Z",
+             "html_url": "https://github.com/acme/web/releases/tag/v0.2.11"}]
+        items = [{"id": 3, "title": "Ménage interne", "state": "build",
+                  "app": "nexlink", "issue_ref": "acme/web#3", "updated_ts": NOW}]
+        api = FakeApi(routes(tags=tags, releases=releases))
+        view = collect(api, items=items, packages={}, package_items=[])
+        product = view["products"][0]
+        self.assertEqual(product["last"]["tag"], "v0.2.10")   # la base : publiée
+        self.assertEqual(product["last_tag"]["tag"], "v0.2.11")
+        self.assertTrue(product["last_tag"]["draft"])
+        nxt = product["next"]
+        self.assertEqual(nxt["version"], "0.2.11")            # le brouillon, préparé
+        self.assertEqual(nxt["state"], "draft")
+        self.assertTrue(nxt["release"]["draft"])
+        self.assertNotIn("no next release announced", " ".join(product["missing"]))
+
+    def test_pre_version_dans_le_train(self):
+        """P2 codex r1 : une pré-version annoncée reste entière, étiquette
+        attendue comprise."""
+        items = [{"id": 1, "title": "Release 0.2.11-rc.1 : train", "state": "build",
+                  "app": "nexlink", "issue_ref": "acme/web#10", "updated_ts": NOW,
+                  "branch": "lot/497", "pr_ref": "acme/web#99"}]
+        api = FakeApi(routes(tags=TAGS, releases=RELEASES))
+        view = collect(api, items=items, packages={}, package_items=[])
+        nxt = view["products"][0]["next"]
+        self.assertEqual(nxt["version"], "0.2.11-rc.1")
+        self.assertEqual(nxt["tag"], "v0.2.11-rc.1")
+
+    def test_lot_fusionne_non_attribue(self):
+        """P2 codex r1 : un lot fusionné dont le titre ne nomme aucun produit
+        n'apparaît sous aucun des deux, mais dans la rubrique « produit non
+        attribué »."""
+        tags = [{"name": "v1.9.1", "commit": {"sha": "s1"}},
+                {"name": "desktop-v0.2.10", "commit": {"sha": "s2"}}]
+        releases = [
+            {"tag_name": "v1.9.1", "draft": False, "prerelease": False,
+             "published_at": "2026-08-01T00:00:00Z"},
+            {"tag_name": "desktop-v0.2.10", "draft": False, "prerelease": False,
+             "published_at": "2026-09-01T00:00:00Z"}]
+        items = [
+            {"id": 1, "title": "Release 1.10.0 serveur : train", "state": "build",
+             "app": "nexlink", "issue_ref": "acme/web#1", "updated_ts": NOW},
+            {"id": 2, "title": "Release desktop 0.2.11 : train", "state": "build",
+             "app": "nexlink", "issue_ref": "acme/web#2", "updated_ts": NOW},
+            {"id": 3, "title": "Correctif desktop : icônes", "state": "merged",
+             "app": "nexlink", "issue_ref": "acme/web#3", "updated_ts": MERGED_TS},
+            {"id": 4, "title": "Corrige le cache", "state": "merged",
+             "app": "nexlink", "issue_ref": "acme/web#4", "updated_ts": MERGED_TS},
+        ]
+        api = FakeApi(routes(tags=tags, releases=releases))
+        view = collect(api, items=items, packages={}, package_items=[])
+        by_label = {p["label"]: p for p in view["products"]}
+        self.assertEqual(set(by_label), {"nexlink server/prod", "nexlink desktop",
+                                         "nexlink (product not assigned)"})
+        server, desktop = by_label["nexlink server/prod"], by_label["nexlink desktop"]
+        self.assertEqual(server["next"]["merged_lots"], [])     # pas de cache ici
+        self.assertEqual([l["id"] for l in desktop["next"]["merged_lots"]], [3])
+        rubric = by_label["nexlink (product not assigned)"]
+        self.assertTrue(rubric["unassigned"])
+        self.assertEqual([l["id"] for l in rubric["next"]["merged_lots"]], [4])
+        self.assertEqual(rubric["next"]["themes"],
+                         [{"theme": "nexlink (product not assigned)",
+                           "items": ["Corrige le cache"]}])
+        self.assertEqual(rubric["next"]["merged_since"], "v1.9.1")
+
+    def test_date_de_train_non_ferme(self):
+        """P2 codex r1 : un lot sans date suffit à ce que la date du train ne
+        soit plus ferme — elle est un manque, la date connue une borne."""
+        items = [
+            {"id": 1, "title": "Release 0.2.11 : lot A", "state": "build",
+             "app": "nexlink", "issue_ref": "acme/web#1", "updated_ts": NOW},
+            {"id": 2, "title": "Release 0.2.11 : lot B", "state": "intake",
+             "app": "nexlink", "issue_ref": "acme/web#2", "updated_ts": NOW},
+        ]
+        store = FakeStore(items, packages={}, package_items=[],
+                          plans=[{"id": 1, "planned_delivery": "2026-10-20",
+                                  "planned_source": "mesh-design"}])
+        api = FakeApi(routes(tags=TAGS, releases=RELEASES))
+        reader = versions.Reader(api, clock=lambda: 0.0, wall=lambda: NOW)
+        view = versions.collect(store, None, None, reader=reader, now=NOW)
+        nxt = view["products"][0]["next"]
+        self.assertIsNone(nxt["date"])
+        self.assertEqual(nxt["date_partial"], "2026-10-20")
+        self.assertTrue(any("1 of 2 lot(s) have no planned date" in m
+                            for m in nxt["missing"]))
+        self.assertIn("not firm, latest 2026-10-20",
+                      "\n".join(versions.format_lines(view)))
+
+    def test_date_ferme_quand_tous_les_lots_sont_dates(self):
+        items = [
+            {"id": 1, "title": "Release 0.2.11 : lot A", "state": "build",
+             "app": "nexlink", "issue_ref": "acme/web#1", "updated_ts": NOW},
+            {"id": 2, "title": "Release 0.2.11 : lot B", "state": "intake",
+             "app": "nexlink", "issue_ref": "acme/web#2", "updated_ts": NOW},
+        ]
+        store = FakeStore(items, packages={}, package_items=[],
+                          plans=[{"id": 1, "planned_delivery": "2026-10-20"},
+                                 {"id": 2, "planned_delivery": "2026-10-25"}])
+        api = FakeApi(routes(tags=TAGS, releases=RELEASES))
+        reader = versions.Reader(api, clock=lambda: 0.0, wall=lambda: NOW)
+        view = versions.collect(store, None, None, reader=reader, now=NOW)
+        nxt = view["products"][0]["next"]
+        self.assertEqual(nxt["date"], "2026-10-25")
+        self.assertIsNone(nxt["date_partial"])
 
 
 class SnapshotTest(PgTestCase):

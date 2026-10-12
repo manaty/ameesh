@@ -12,11 +12,24 @@ grouped by theme). A release lot without a planned date, a product without
 a next release, a tag without a published release: said as `missing`, never
 hidden.
 
+Decisions of the codex r1 review (mesh-design, 2026-10-12):
+products and trains are indexed by `(stream, version)`, never by version
+alone, so `v1.0.0` and `desktop-v1.0.0` both exist; the comparison base of
+the next release is the last **published** (non-draft) version, a draft
+being shown as « prepared » on the next train; semver pre-releases
+(`0.2.11-rc.1`) are kept whole, expected tag included; merged lots are
+attributed to a product only when their title names one surely — otherwise
+they go to a single `<project> (product not assigned)` rubric, never under
+two products; a train with a lot without a date has no firm date, only a
+`missing` (« N lots sans date ») and a lower bound; the release notes are
+read on the **head branch** of the release PR only, otherwise nothing with
+the reason.
+
 Nothing comes from the canon: products are the version-tag streams of the
 repositories the projects already cite (`issue_ref`, or the `github.projects`
 setting of the host), the next version is the smallest one greater than the
-last tag that an open release lot, an open `release/*` PR or a draft release
-announces.
+last published version that an open release lot, an open `release/*` PR or a
+draft release announces.
 
 All GitHub reads go through `Reader`, read-only and cached `CACHE_S` seconds
 (shared by the server): releases, tags, one file, one commit date. The client
@@ -25,8 +38,10 @@ is ameesh's own — the `GH_TOKEN`/`GITHUB_TOKEN` token through
 fallback when no token is set, and never on the server. Merged lots and
 their pull requests come from the database (`sync-github`), not from the
 API. Every datum carries its source and the time it was read, so a stale
-cache is visible. A read that fails (no token, no network, no right) is
-reported in `missing`; the rest of the view keeps working. No write, ever.
+cache is visible; a failed read is cached `FAIL_S` seconds and the previous
+data, when there is some, keeps being served marked stale. A read that fails
+(no token, no network, no right) is reported in `missing`; the rest of the
+view keeps working. No write, ever.
 """
 from __future__ import annotations
 
@@ -50,6 +65,9 @@ SCHEMA = "ameesh-versions/1"
 #: durée de cache d'une lecture GitHub (secondes) : un onglet ouvert ne
 #: martèle pas l'API ; le cache est partagé par le serveur (`Reader`)
 CACHE_S = 300.0
+#: durée de cache d'un échec de lecture (secondes) : une panne (réseau, droit)
+#: ne martèle pas l'API à chaque affichage
+FAIL_S = 60.0
 #: délai d'un appel `gh api` : une lecture lente ne bloque pas la page
 READ_TIMEOUT = 20.0
 #: taille de page des lectures GitHub (une page suffit pour ces dépôts)
@@ -61,12 +79,18 @@ NOTES_DIR = "docs/versions"
 #: ordre d'attention d'un train de release : le premier état présent est dit
 STATE_ORDER = ("blocked", "waiting_human", "qa", "build", "intake")
 
-#: `v1.9.1`, `desktop-v0.2.8`, `desktop-0.2.8`… : préfixe de produit optionnel
-_TAG_RE = re.compile(r"^(?:(?P<prefix>[A-Za-z][A-Za-z0-9._-]*)-)?v?(?P<num>\d+\.\d+(?:\.\d+)?)$")
+#: `v1.9.1`, `desktop-v0.2.8`, `desktop-0.2.8`, `v0.2.11-rc.1`… : préfixe de
+#: produit optionnel, pré-version semver (`-rc.1`, `-beta.2`…) gardée entière
+_TAG_RE = re.compile(
+    r"^(?:(?P<prefix>[A-Za-z][A-Za-z0-9._-]*?)-)?v?"
+    r"(?P<num>\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)$")
 #: un lot de release : titre commençant par Release/REL/QA (`RELEASE-QA-HOLD`)
 _RELEASE_LOT_RE = re.compile(r"(?i)^\s*(?:release|rel|qa)\b")
-#: une version citée dans un titre (`Release 1.10.0: …`, `REL-0.2.11 : …`)
-_TITLE_VERSION_RE = re.compile(r"(?<![\d.])v?(\d+\.\d+(?:\.\d+)?)(?![\d.])")
+#: une version citée dans un titre (`Release 1.10.0: …`, `REL-0.2.11 : …`) ;
+#: `Release 0.2.11-rc.1` cite la pré-version, jamais la 0.2.11 finale
+_TITLE_VERSION_RE = re.compile(
+    r"(?<![\d.])v?(\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)"
+    r"(?![\d.\-])")
 #: `owner/repo#n` d'un lot (`issue_ref`)
 _ISSUE_REF_RE = re.compile(
     r"^([A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100})#([1-9][0-9]{0,17})$")
@@ -82,18 +106,37 @@ _HINT_SERVER_RE = re.compile(r"(?i)\b(?:serveur|server|prod|production)\b")
 # versions et tags : fonctions pures
 # --------------------------------------------------------------------------
 
+def _pre_key(pre: str | None) -> tuple:
+    """Clé de tri semver d'une pré-version : `0.2.11-rc.1 < 0.2.11`.
+
+    Une version finale porte `(1,)`, une pré-version `(0, identifiants)` :
+    les identifiants numériques passent avant les alphanumériques, et un
+    identifiant de plus l'emporte (`rc.1 < rc.1.1`)."""
+    if not pre:
+        return (1,)
+    ids = []
+    for part in str(pre).split("."):
+        if part.isdigit():
+            ids.append((0, int(part)))
+        else:
+            ids.append((1, part))
+    return (0, tuple(ids))
+
+
 def version_key(version: str) -> tuple:
-    """Clé de tri d'une version numérique (`1.10.0` > `1.9.9`)."""
-    parts = [int(part) for part in str(version).split(".") if part.isdigit()]
+    """Clé de tri d'une version (`1.10.0` > `1.9.9`, `1.0.0-rc.1` < `1.0.0`)."""
+    core, _, pre = str(version).partition("-")
+    parts = [int(part) for part in core.split(".") if part.isdigit()]
     while len(parts) < 3:
         parts.append(0)
-    return tuple(parts[:3])
+    return tuple(parts[:3]) + (_pre_key(pre),)
 
 
 def parse_tag(tag: str) -> dict | None:
     """`{tag, prefix, version, key}` d'un tag de version, sinon None.
 
-    `v1.9.1` → préfixe vide ; `desktop-v0.2.8` → préfixe `desktop`."""
+    `v1.9.1` → préfixe vide ; `desktop-v0.2.8` → préfixe `desktop` ;
+    `v0.2.11-rc.1` → version `0.2.11-rc.1` (la pré-version reste entière)."""
     match = _TAG_RE.match(tag or "")
     if not match:
         return None
@@ -143,9 +186,15 @@ def tag_for(prefix: str, version: str, styles=("v",)) -> str:
 def streams_of(versions: list[dict]) -> list[dict]:
     """Les produits d'un dépôt : un flux par préfixe de tag.
 
-    `versions` : `{prefix, version, tag, key}` (un par tag ou release). Rend
-    `{prefix, version, tag, key, styles}` par flux, du plus récent au plus
-    ancien (`styles` sert à deviner le tag d'une prochaine version)."""
+    `versions` : `{prefix, version, tag, key, release}` (un par tag ou
+    release). Rend `{prefix, version, tag, key, base_key, styles}` par flux,
+    du plus récent au plus ancien. `key` est le dernier tag connu, brouillon
+    compris ; `base_key` la dernière version **publiée** (release non draft),
+    seule base de comparaison de la prochaine release — sans quoi un
+    brouillon `0.2.11` ferait dire « aucune release annoncée ». Sans aucune
+    release, le dernier tag en tient lieu ; s'il n'y a qu'un brouillon,
+    `base_key` est None : il devient lui-même le train suivant, « préparé ».
+    `styles` sert à deviner le tag d'une prochaine version."""
     streams: dict = {}
     for item in versions:
         prefix = item.get("prefix") or ""
@@ -153,27 +202,42 @@ def streams_of(versions: list[dict]) -> list[dict]:
         if current is None or item["key"] > current["key"]:
             streams[prefix] = {"prefix": prefix, "version": item["version"],
                                "tag": item["tag"], "key": item["key"],
+                               "base_key": None,
                                "styles": {tag_style(item["tag"], prefix)}}
         else:
             current["styles"].add(tag_style(item["tag"], prefix))
+    for prefix, stream in streams.items():
+        items = [i for i in versions if (i.get("prefix") or "") == prefix]
+        published = [i for i in items
+                     if i.get("release") and not i["release"].get("draft")]
+        if published:
+            stream["base_key"] = max(i["key"] for i in published)
+        elif any(i.get("release") for i in items):
+            stream["base_key"] = None                       # brouillon seulement
+        else:
+            stream["base_key"] = stream["key"]              # tags seuls
     return sorted(streams.values(), key=lambda s: s["key"], reverse=True)
 
 
 def stream_of(version: str, streams: list[dict], hint: str | None = None) -> str | None:
     """Le flux auquel appartient une version : indice explicite, puis
     même `majeur.mineur`, puis même majeur, puis le flux le plus récent
-    sous cette version. None si aucun flux ne peut la porter."""
+    sous cette version. None si aucun flux ne peut la porter. Un dépôt sans
+    aucun tag (un seul flux, sans clé) porte la version annoncée."""
     if not streams:
         return None
     prefixes = {s["prefix"] for s in streams}
     if hint is not None and hint in prefixes:
         return hint
     key = version_key(version)
+    real = [s for s in streams if s.get("key") is not None]
+    if not real:
+        return streams[0]["prefix"] if len(streams) == 1 else None
     for depth in (2, 1):
-        same = [s for s in streams if s["key"][:depth] == key[:depth]]
+        same = [s for s in real if s["key"][:depth] == key[:depth]]
         if same:
             return max(same, key=lambda s: s["key"])["prefix"]
-    lower = [s for s in streams if s["key"] < key]
+    lower = [s for s in real if s["key"] < key]
     if lower:
         return max(lower, key=lambda s: s["key"])["prefix"]
     return None
@@ -229,19 +293,25 @@ class Reader:
     (`plan_github.client`) — le jeton `GH_TOKEN`/`GITHUB_TOKEN`, sinon `gh`
     en repli local (`allow_gh=False` : jamais `gh`, le serveur). Chaque
     lecture réussie garde son instant (`read_ts`, et `stamp(chemin)` par
-    chemin) : un cache servi n'est jamais dit frais."""
+    chemin) : un cache servi n'est jamais dit frais. Un échec est gardé
+    `fail_ttl` secondes ; si le chemin avait déjà été lu, sa valeur
+    précédente reste servie, marquée périmée (`stale(chemin)`), jamais une
+    page vide à cause d'une panne passagère."""
 
     def __init__(self, api=None, *, ttl: float = CACHE_S, clock=time.monotonic,
                  wall=time.time, timeout: float = READ_TIMEOUT,
-                 allow_gh: bool = True):
+                 allow_gh: bool = True, fail_ttl: float = FAIL_S):
         self._api = api
         self._ttl = float(ttl)
         self._clock = clock
         self._wall = wall
         self._timeout = float(timeout)
         self._allow_gh = bool(allow_gh)
+        self._fail_ttl = float(fail_ttl)
         self._cache: dict = {}
         self._stamps: dict = {}
+        self._failures: dict = {}
+        self._stale: set = set()
         self._read_ts: float | None = None
         self._source = "github" if api is not None else plan_github.client_name()
 
@@ -258,6 +328,10 @@ class Reader:
         """L'instant (epoch) où ce chemin a été lu de GitHub, sinon None."""
         return self._stamps.get(path)
 
+    def stale(self, path: str) -> bool:
+        """Vrai si ce chemin est servi par des données antérieures à un échec."""
+        return path in self._stale
+
     def _call(self, path: str):
         if self._api is None:
             client = plan_github.client(timeout=self._timeout, allow_gh=self._allow_gh)
@@ -269,15 +343,33 @@ class Reader:
         return self._api(path)
 
     def get(self, path: str):
-        """Le JSON d'un chemin, gardé `ttl` secondes ; lève GithubError."""
+        """Le JSON d'un chemin, gardé `ttl` secondes ; lève GithubError.
+
+        Un échec est gardé `fail_ttl` secondes ; les données précédentes du
+        chemin, si elles existent, restent servies et marquées périmées."""
         now = self._clock()
         hit = self._cache.get(path)
         if hit is not None and now - hit[1] < self._ttl:
             return hit[0]
-        value = self._call(path)
+        failure = self._failures.get(path)
+        if failure is not None and now - failure[1] < self._fail_ttl:
+            if hit is not None:
+                self._stale.add(path)
+                return hit[0]
+            raise failure[0]
+        try:
+            value = self._call(path)
+        except plan_github.GithubError as exc:
+            self._failures[path] = (exc, now)
+            if hit is not None:
+                self._stale.add(path)       # données précédentes, périmées
+                return hit[0]
+            raise
         stamp = self._wall()
         self._cache[path] = (value, now, stamp)
         self._stamps[path] = stamp
+        self._failures.pop(path, None)
+        self._stale.discard(path)
         self._read_ts = stamp if self._read_ts is None else max(self._read_ts, stamp)
         return value
 
@@ -487,33 +579,40 @@ def _repo_of(name: str, rows: list[dict], settings) -> tuple[str | None, list[st
 def _products(store, db, name: str, repo: str, rows: list[dict], reader: Reader,
               now: float, packages: dict, package_items: list) -> list[dict]:
     """Un produit par flux de tags du dépôt (ameesh ; nexlink desktop ;
-    nexlink server/prod)."""
+    nexlink server/prod), plus la rubrique « (produit non attribué) » des lots
+    fusionnés dont aucun flux n'est connu sûrement (P2 codex r1)."""
     releases = reader.releases(repo)
     tags = reader.tags(repo)
-    known: dict = {}          # version -> {version, key, prefix, tag, release, sha}
+    # P2 (codex r1) : l'index est (flux, version), jamais la version seule —
+    # `v1.0.0` et `desktop-v1.0.0` sont deux produits, aucun ne disparaît
+    known: dict = {}   # (prefix, version) -> {version, key, prefix, tag, release, sha}
     for tag in tags:
         item = parse_tag(str(tag.get("name") or ""))
         if item:
             item["sha"] = ((tag.get("commit") or {}).get("sha")) or None
-            known.setdefault(item["version"], {}).update(item)
+            known.setdefault((item["prefix"], item["version"]), {}).update(item)
     for release in releases:
         item = parse_tag(str(release.get("tag_name") or ""))
         if not item:
             continue
-        entry = known.setdefault(item["version"], {})
+        entry = known.setdefault((item["prefix"], item["version"]), {})
         entry.update({k: item[k] for k in ("version", "key", "prefix", "tag")})
         entry["release"] = release
-    if not known:
-        return [{"project": name, "repo": repo, "product": name, "label": name,
-                 "prefix": "", "last": None, "last_tag": None, "next": None,
-                 "missing": ["%s: no version tag or release known" % repo]}]
+    # P3 (codex r1) : un dépôt sans étiquette montre quand même ses lots de
+    # release ouverts ; le manque de tag est dit, jamais caché
+    no_tag = None if known else "%s: no version tag or release known" % repo
     streams = streams_of(list(known.values()))
+    if not streams:
+        streams = [{"prefix": "", "version": None, "tag": None, "key": None,
+                    "base_key": None, "styles": {"v"}}]
+    prefixes = {s["prefix"] for s in streams}
 
     open_rows = [row for row in rows
                  if row.get("state") not in work_mod.MERGED_STATES
                  and row.get("state") != "closed"
                  and (row.get("app") or row.get("workstream")) == name]
-    candidates: dict = {}
+    candidates: dict = {}            # (prefix, version) -> entry
+    unassigned_versions: dict = {}   # version -> entry, aucun flux ne la porte
     versionless: list[dict] = []
     for row in open_rows:
         if not is_release_lot(row.get("title")):
@@ -522,9 +621,13 @@ def _products(store, db, name: str, repo: str, rows: list[dict], reader: Reader,
         if not version:
             versionless.append(row)
             continue
-        entry = candidates.setdefault(version, _candidate(version))
+        hint = release_hint(row.get("title"), prefixes)
+        prefix = hint if hint is not None else stream_of(version, streams)
+        if prefix is None:
+            entry = unassigned_versions.setdefault(version, _candidate(version))
+        else:
+            entry = candidates.setdefault((prefix, version), _candidate(version, prefix))
         entry["lots"].append(row)
-        hint = release_hint(row.get("title"), {s["prefix"] for s in streams})
         if hint is not None:
             entry["hint"] = hint
         # L160f (mesh-design) : la PR du lot est en base (`sync-github`),
@@ -532,32 +635,31 @@ def _products(store, db, name: str, repo: str, rows: list[dict], reader: Reader,
         pull = _pull_of(row)
         if pull and entry.get("pr") is None:
             entry["pr"] = pull
-    for entry in known.values():
-        release = entry.get("release")
+    for (prefix, version), item in known.items():
+        release = item.get("release")
         if release and release.get("draft"):
-            candidates.setdefault(entry["version"],
-                                  _candidate(entry["version"]))["release"] = release
-    if not streams:
-        streams = [{"prefix": "", "version": None, "tag": None, "key": None,
-                    "styles": {"v"}}]
-    for version, entry in candidates.items():
-        entry["prefix"] = stream_of(version, streams, entry.get("hint"))
+            # P2 (codex r1) : le brouillon se montre comme « préparé » sur le
+            # train suivant, sans relever la base de comparaison
+            entry = candidates.setdefault((prefix, version), _candidate(version, prefix))
+            entry["release"] = release
 
-    # la prochaine version de chaque flux : la plus petite au-dessus de son
-    # dernier tag ; un lot de release sans version rejoint le flux que son
-    # titre désigne, sinon le seul flux qui a une suite — un flux sans
-    # version annoncée garde son lot et dit le manque (serveur prod)
+    # la prochaine version de chaque flux : la plus petite au-dessus de sa
+    # dernière version PUBLIÉE (un brouillon ne relève pas la base) ; un lot
+    # de release sans version rejoint le flux que son titre désigne, sinon le
+    # seul flux qui a une suite — un flux sans version annoncée garde son lot
+    # et dit le manque (serveur prod)
     upcoming: dict = {}
     for stream in streams:
-        versions = [v for v, entry in candidates.items()
-                    if entry["prefix"] == stream["prefix"]
-                    and (stream["key"] is None or version_key(v) > stream["key"])]
+        base = stream["base_key"]
+        versions = [version for (prefix, version) in candidates
+                    if prefix == stream["prefix"]
+                    and (base is None or version_key(version) > base)]
         upcoming[stream["prefix"]] = sorted(versions, key=version_key)[0] if versions else None
     with_next = [prefix for prefix, version in upcoming.items() if version]
     attached: dict = {}
     leftover = []
     for row in versionless:
-        hint = release_hint(row.get("title"), {s["prefix"] for s in streams})
+        hint = release_hint(row.get("title"), prefixes)
         if hint is not None:
             target = hint
         elif len(with_next) == 1:
@@ -570,11 +672,11 @@ def _products(store, db, name: str, repo: str, rows: list[dict], reader: Reader,
             attached.setdefault(target, []).append(row)
 
     products = []
-    for stream in sorted(streams, key=lambda s: (s["key"] is None, s["key"] or (0, 0, 0)),
+    for stream in sorted(streams, key=lambda s: (s["key"] is None, s["key"] or (0, 0, 0, 0)),
                          reverse=True):
         prefix = stream["prefix"]
         label = _label(name, prefix, len(streams) > 1)
-        stream_known = [v for v in known.values() if (v.get("prefix") or "") == prefix]
+        stream_known = [v for (p, _), v in known.items() if p == prefix]
         stream_published = [v for v in stream_known
                             if v.get("release") and not v["release"].get("draft")]
         last = max(stream_published, key=lambda v: v["key"]) if stream_published else None
@@ -584,14 +686,16 @@ def _products(store, db, name: str, repo: str, rows: list[dict], reader: Reader,
         product = {"project": name, "repo": repo, "product": label, "label": label,
                    "prefix": prefix, "last": last_view, "last_tag": last_tag,
                    "next": None, "missing": []}
+        if no_tag:
+            product["missing"].append(no_tag)
         version = upcoming.get(prefix)
         if version:
-            entry = candidates[version]
+            entry = candidates[(prefix, version)]
             entry["lots"] = entry["lots"] + attached.get(prefix, [])
             anchor = _anchor(known, prefix)
             product["next"] = _next_view(store, db, name, repo, version, entry, reader,
                                          now, packages, package_items, anchor,
-                                         stream["styles"], rows)
+                                         stream["styles"], rows, prefixes)
         elif attached.get(prefix):
             product["next"] = _unknown_next_view(store, db, attached[prefix], now)
         else:
@@ -602,34 +706,66 @@ def _products(store, db, name: str, repo: str, rows: list[dict], reader: Reader,
             product["missing"].append(
                 "%s: tag %s has no published release" % (label, last_tag["tag"]))
         products.append(product)
+
+    rubric = _unassigned_product(name, repo, rows, reader, known, streams, packages,
+                                 package_items, now)
+    if rubric:
+        products.append(rubric)
     extras = []
-    unassigned = sorted((v for v, entry in candidates.items() if entry["prefix"] is None),
-                        key=version_key)
-    if unassigned:
+    if unassigned_versions:
         extras.append("%s: version(s) announced by a release lot or a draft release "
-                      "but in no known version stream: %s" % (name, ", ".join(unassigned)))
+                      "but in no known version stream: %s"
+                      % (name, ", ".join(sorted(unassigned_versions, key=version_key))))
     if leftover:
         extras.append("%s: release lot(s) without a version in the title: %s"
                       % (name, ", ".join("#%s" % row.get("id") for row in leftover)))
     if extras:
-        if not products:
-            products.append({"project": name, "repo": repo, "product": name, "label": name,
-                             "prefix": "", "last": None, "last_tag": None, "next": None,
-                             "missing": list(extras)})
-        else:
-            products[0].setdefault("missing", []).extend(extras)
+        products[0].setdefault("missing", []).extend(extras)
     return products
+
+
+def _unassigned_product(name: str, repo: str, rows: list[dict], reader: Reader,
+                        known: dict, streams: list[dict], packages: dict,
+                        package_items: list, now: float) -> dict | None:
+    """La rubrique « projet (produit non attribué) » : les lots fusionnés
+    depuis le dernier tag du projet dont le titre ne nomme aucun produit.
+
+    Un dépôt à un seul flux n'en a jamais besoin (tout lot fusionné en est
+    sûrement) ; les lots attribués ne sont jamais repris ici, ni en double
+    sous deux produits (P2 codex r1)."""
+    prefixes = {s["prefix"] for s in streams}
+    if len(prefixes) < 2:
+        return None
+    anchor = max(known.values(), key=lambda v: v["key"]) if known else None
+    merged = [lot for lot in _merged_since(rows, name,
+                                           _anchor_ts(reader, repo, anchor),
+                                           packages, package_items, now, prefixes)
+              if lot["product"] is None]
+    if not merged:
+        return None
+    label = "%s (product not assigned)" % name
+    rubric = {"project": name, "repo": repo, "product": label, "label": label,
+              "prefix": None, "last": None, "last_tag": None, "next": None,
+              "missing": [], "unassigned": True}
+    rubric["next"] = {
+        "version": None, "tag": None, "state": None, "date": None,
+        "date_source": None, "date_label": None, "date_partial": None,
+        "lots": [], "release": None, "pr": None, "notes": None, "summary": None,
+        "themes": [{"theme": label, "items": [lot["title"] for lot in merged]}],
+        "merged_lots": merged, "merged_since": (anchor or {}).get("tag"),
+        "missing": []}
+    return rubric
 
 
 def _anchor(known: dict, prefix: str) -> dict | None:
     """Le plus récent tag du flux (publié ou non), pour savoir depuis quand
     les lots sont fusionnés."""
-    values = [v for v in known.values() if (v.get("prefix") or "") == prefix]
+    values = [v for (p, _), v in known.items() if p == prefix]
     return max(values, key=lambda v: v["key"]) if values else None
 
 
-def _candidate(version: str) -> dict:
-    return {"version": version, "key": version_key(version), "prefix": None,
+def _candidate(version: str, prefix: str | None = None) -> dict:
+    return {"version": version, "key": version_key(version), "prefix": prefix,
             "hint": None, "lots": [], "pr": None, "release": None}
 
 
@@ -640,12 +776,16 @@ def _pr_parts(ref: str | None) -> tuple[str, str] | None:
 
 
 def _pull_of(row: dict) -> dict | None:
-    """La PR d'un lot, lue en base (`sync-github`) : jamais par l'API."""
+    """La PR d'un lot, lue en base (`sync-github`) : jamais par l'API.
+
+    Sa branche head est celle du lot (`branch`, la même que `sync-github`
+    compare) : c'est là que les notes de release sont lues."""
     parts = _pr_parts(row.get("pr_ref"))
     if not parts:
         return None
     repo, number = parts
-    return {"number": int(number), "title": row.get("title"), "head": None,
+    return {"number": int(number), "title": row.get("title"),
+            "head": row.get("branch") or None,
             "url": "https://github.com/%s/pull/%s" % (repo, number),
             "source": "ameesh work items (sync-github)"}
 
@@ -693,28 +833,36 @@ def _last_tag_view(reader: Reader, repo: str, newest, last, prefix: str) -> dict
 
 def _next_view(store, db, name: str, repo: str, version: str, entry: dict,
                reader: Reader, now: float, packages: dict, package_items: list,
-               anchor: dict | None, styles, rows: list[dict]) -> dict:
+               anchor: dict | None, styles, rows: list[dict], prefixes) -> dict:
     train = entry["lots"]
-    lots, date, source, label, state = _train(store, db, train, now)
+    lots, date, source, label, state, gap, partial = _train(store, db, train, now)
     release = entry.get("release")
     pull = entry.get("pr")
     if state is None and release and release.get("draft"):
         state = "draft"
     if state is None and pull:
         state = "pull request"
-    content = _content(reader, repo, version, pull, release, rows, name,
+    prefix = entry.get("prefix") or ""
+    content = _content(reader, repo, version, pull, rows, name,
                        _anchor_ts(reader, repo, anchor), (anchor or {}).get("tag"),
-                       packages, package_items, now)
-    out = {"version": version, "tag": tag_for(entry.get("prefix") or "", version, styles),
+                       packages, package_items, now, prefixes, prefix)
+    out = {"version": version, "tag": tag_for(prefix, version, styles),
            "state": state, "date": date, "date_source": source, "date_label": label,
-           "lots": lots, "release": _release_view(reader, repo, release),
+           "date_partial": partial, "lots": lots,
+           "release": _release_view(reader, repo, release),
            "pr": _pull_view(pull, now),
-           "notes": content["notes"], "summary": content["summary"],
-           "themes": content["themes"], "merged_lots": content["merged_lots"],
+           "notes": content["notes"], "notes_reason": content["notes_reason"],
+           "summary": content["summary"], "themes": content["themes"],
+           "merged_lots": content["merged_lots"],
            "merged_since": content["merged_since"], "missing": []}
-    if date is None:
+    if gap:
+        out["missing"].append("release %s: %s" % (version, gap))
+    elif date is None:
         out["missing"].append(
             "release %s has no planned date (no plan, no p80 estimate)" % version)
+    if content["notes_reason"] and pull:
+        out["missing"].append(
+            "release %s: notes not read (%s)" % (version, content["notes_reason"]))
     return out
 
 
@@ -722,14 +870,17 @@ def _unknown_next_view(store, db, rows: list[dict], now: float) -> dict:
     """Une prochaine release annoncée par un lot sans version dans le titre :
     le lot, sa date et son état sont dits, le numéro manque (jamais deviné),
     et le contenu n'est pas inventé."""
-    lots, date, source, label, state = _train(store, db, rows, now)
+    lots, date, source, label, state, gap, partial = _train(store, db, rows, now)
     out = {"version": None, "tag": None, "state": state, "date": date,
-           "date_source": source, "date_label": label, "lots": lots,
-           "release": None, "pr": None, "notes": None, "summary": None,
+           "date_source": source, "date_label": label, "date_partial": partial,
+           "lots": lots, "release": None, "pr": None, "notes": None,
+           "notes_reason": None, "summary": None,
            "themes": [], "merged_lots": [], "merged_since": None,
            "missing": ["the release version is not announced (no version in the "
                        "release lot title)"]}
-    if date is None:
+    if gap:
+        out["missing"].append(gap)
+    elif date is None:
         out["missing"].append(
             "release has no planned date (no plan, no p80 estimate)")
     return out
@@ -737,7 +888,7 @@ def _unknown_next_view(store, db, rows: list[dict], now: float) -> dict:
 
 def _train(store, db, rows: list[dict], now: float) -> tuple:
     """Les lots du train : leurs dates (plan, sinon p80), leur état d'ensemble
-    et la date prévue de la release (la plus tardive)."""
+    et la date prévue de la release (la plus tardive des lots datés)."""
     plans = {int(p["id"]): p for p in store.roadmap.item_plans(
         [int(row["id"]) for row in rows])}
     ref = estimates_mod.current_reference(db)
@@ -746,9 +897,9 @@ def _train(store, db, rows: list[dict], now: float) -> tuple:
     lots = [_lot_view(row, plans.get(int(row["id"])), served.get(int(row["id"])), now)
             for row in rows]
     lots.sort(key=lambda l: (l["date"] is None, l["date"] or "", l["id"]))
-    date, source, label = _train_date(lots)
+    date, source, label, gap, partial = _train_date(lots)
     state = next((s for s in STATE_ORDER if s in {l["state"] for l in lots}), None)
-    return lots, date, source, label, state
+    return lots, date, source, label, state, gap, partial
 
 
 def _anchor_ts(reader: Reader, repo: str, anchor: dict | None) -> float | None:
@@ -777,7 +928,7 @@ def _pull_view(pull: dict | None, now: float) -> dict | None:
     if not pull:
         return None
     return {"number": pull.get("number"), "title": pull.get("title"),
-            "head": ((pull.get("head") or {}).get("ref")), "url": pull.get("html_url"),
+            "head": pull.get("head") or None, "url": pull.get("url"),
             "source": pull.get("source") or "ameesh work items (sync-github)",
             "read_ts": now}
 
@@ -808,14 +959,24 @@ def _lot_view(row: dict, plan: dict | None, p80: dict | None, now: float) -> dic
     return out
 
 
-def _train_date(lots: list[dict]) -> tuple[str | None, str | None, str | None]:
-    """La date prévue du train : la plus tardive de ses lots (la release
-    sort quand le dernier est livré)."""
+def _train_date(lots: list[dict]) -> tuple:
+    """La date prévue du train : la plus tardive de ses lots datés.
+
+    P2 (codex r1) : s'il manque la date d'un seul lot, le train n'a plus de
+    date ferme — la date devient un manque (« N lots sans date ») et la plus
+    tardive connue n'est qu'un repère (`partial`, une borne basse). Rend
+    `(date, source, label, gap, partial)`."""
     dated = [l for l in lots if l["date"]]
-    if not dated:
-        return None, None, None
-    last = max(dated, key=lambda l: l["date"])
-    return last["date"], last["date_source"], last["date_label"]
+    undated = [l for l in lots if not l["date"]]
+    last = max(dated, key=lambda l: l["date"]) if dated else None
+    if undated:
+        gap = "%d of %d lot(s) have no planned date" % (len(undated), len(lots))
+        if last is not None:
+            gap += "; %s is only a lower bound" % last["date"]
+        return None, None, None, gap, (last or {}).get("date")
+    if last is None:
+        return None, None, None, None, None
+    return last["date"], last["date_source"], last["date_label"], None, None
 
 
 def _p80(rows: list[dict], body: dict | None, db, now: float) -> dict:
@@ -841,65 +1002,81 @@ def _p80(rows: list[dict], body: dict | None, db, now: float) -> dict:
     return out
 
 
-def _content(reader: Reader, repo: str, version: str, pull, release, rows: list[dict],
+def _content(reader: Reader, repo: str, version: str, pull, rows: list[dict],
              name: str, anchor_ts: float | None, anchor_tag: str | None,
-             packages: dict, package_items: list, now: float) -> dict:
+             packages: dict, package_items: list, now: float, prefixes,
+             prefix: str) -> dict:
     """Le contenu de la prochaine version : les notes brouillon du dépôt
-    quand la branche de la PR de release en a, sinon les lots fusionnés
-    depuis le dernier tag groupés par thème (leur epic, sinon un seul
-    groupe dit)."""
+    quand la branche head de la PR de release en a (P2 codex r1), sinon les
+    lots fusionnés depuis le dernier tag groupés par thème (leur epic, sinon
+    un seul groupe dit) — seuls ceux du produit, jamais ceux d'un autre."""
     path = "%s/%s.md" % (NOTES_DIR, version)
-    notes = _notes(reader, repo, path, version, release)
+    notes, reason = _notes(reader, repo, path, pull)
     if notes is not None:
         parsed = parse_notes(notes["text"])
         return {"notes": {"path": path, "source": notes["source"],
                           "origin": "github", "read_ts": notes["read_ts"]},
-                "summary": parsed["summary"], "themes": parsed["themes"],
+                "notes_reason": None, "summary": parsed["summary"],
+                "themes": parsed["themes"],
                 "merged_lots": [], "merged_since": None}
-    merged = _merged_since(rows, name, anchor_ts, packages, package_items, now)
+    merged = [lot for lot in _merged_since(rows, name, anchor_ts, packages,
+                                           package_items, now, prefixes)
+              if lot["product"] == prefix]
     grouped: dict = {}
     for row in merged:
         package = packages.get(row.get("package_id")) or {}
         theme = package.get("title") or "Merged since the last tag"
         grouped.setdefault(theme, []).append(row)
     ordered = sorted(grouped.items())
-    return {"notes": None, "summary": None,
+    return {"notes": None, "notes_reason": reason, "summary": None,
             "themes": [{"theme": theme, "items": [row["title"] for row in items]}
                        for theme, items in ordered],
             "merged_lots": [row for _, items in ordered for row in items],
             "merged_since": anchor_tag if merged else None}
 
 
-def _notes(reader: Reader, repo: str, path: str, version: str, release) -> dict | None:
-    """Les notes de version : la branche de la PR de release (`release/vX`,
-    `release/X`), sinon le tag, sinon la branche par défaut du dépôt (jamais
-    devinées) ; la source dite est la référence réellement lue."""
-    refs = []
-    if version:
-        refs += [("release/v%s" % version, "release/v%s" % version),
-                 ("release/%s" % version, "release/%s" % version)]
-    if release and release.get("tag_name"):
-        refs.append(("tag %s" % release["tag_name"], release["tag_name"]))
-    try:
-        default = reader.repo_info(repo).get("default_branch") or "main"
-    except plan_github.GithubError:
-        default = "main"
-    refs.append((default, default))
-    for source, ref in refs:
-        text = reader.file(repo, path, ref)
-        if text:
-            return {"text": text, "source": source,
-                    "read_ts": reader.stamp(file_path(repo, path, ref))}
-    return None
+def _notes(reader: Reader, repo: str, path: str, pull) -> tuple[dict | None, str | None]:
+    """Les notes de version, lues sur la branche **head** de la PR de release
+    (P2 codex r1) ; sinon rien, avec la raison.
+
+    Aucun repli sur `release/vX`, le tag ou la branche par défaut : ce serait
+    afficher les notes d'une autre référence comme celles de cette release."""
+    if pull is None:
+        return None, "no release pull request"
+    head = pull.get("head")
+    number = pull.get("number")
+    if not head:
+        return None, "head branch of release PR #%s unknown" % number
+    text = reader.file(repo, path, head)
+    if not text:
+        return None, ("%s not found on head branch %s of release PR #%s"
+                      % (path, head, number))
+    return {"text": text, "source": "PR #%s head %s" % (number, head),
+            "read_ts": reader.stamp(file_path(repo, path, head))}, None
+
+
+def _product_of(row: dict, prefixes, multi: bool) -> str | None:
+    """Le produit d'un lot fusionné, quand il est connu sûrement.
+
+    Règle retenue (P2 codex r1) : un dépôt à un seul flux → ce flux ; un
+    titre qui nomme un préfixe (`desktop`) ou « serveur/prod » pour le flux
+    sans préfixe → ce produit ; sinon None, jamais deviné — le lot ira dans
+    la rubrique « (produit non attribué) », jamais sous deux produits."""
+    if not multi:
+        return next(iter(prefixes), "") if prefixes else ""
+    return release_hint(row.get("title"), prefixes)
 
 
 def _merged_since(rows: list[dict], name: str, anchor_ts: float | None,
-                  packages: dict, package_items: list, now: float) -> list[dict]:
+                  packages: dict, package_items: list, now: float,
+                  prefixes) -> list[dict]:
     """Les lots fusionnés depuis le dernier tag (horodatage de leur dernière
     modification : la fusion, en pratique) et leur PR, lus en base
-    (`sync-github`), pour le repli sans notes."""
+    (`sync-github`), pour le repli sans notes. Chaque lot porte le produit
+    que son titre nomme sûrement (`product`), sinon None."""
     if anchor_ts is None:
         return []
+    multi = len(set(prefixes)) > 1
     by_item = {int(item["id"]): item.get("package_id") for item in package_items}
     out = []
     for row in rows:
@@ -911,6 +1088,7 @@ def _merged_since(rows: list[dict], name: str, anchor_ts: float | None,
             continue
         out.append({"id": int(row["id"]), "title": row.get("title"),
                     "package_id": by_item.get(int(row["id"])) or row.get("package_id"),
+                    "product": _product_of(row, prefixes, multi),
                     "pr": row.get("pr_ref") or None,
                     "pr_url": _pull_url(row.get("pr_ref")),
                     "source": "ameesh work items (sync-github)", "read_ts": now})
@@ -959,9 +1137,12 @@ def format_lines(view: dict, width: int = 80) -> list[str]:
         if not nxt:
             out.append("    next: none announced")
         else:
+            when = nxt.get("date") or (
+                "not firm, latest %s" % nxt["date_partial"]
+                if nxt.get("date_partial") else "no planned date")
             out.append("    next %s: %s — %s%s" % (
-                nxt.get("version"), nxt.get("state") or "?",
-                nxt.get("date") or "no planned date",
+                nxt.get("version") or "?", nxt.get("state") or "?",
+                when,
                 " (%s)" % nxt["date_label"] if nxt.get("date_label") else ""))
             for lot in (nxt.get("lots") or [])[:10]:
                 out.append("      #%s %s — %s" % (
@@ -970,6 +1151,8 @@ def format_lines(view: dict, width: int = 80) -> list[str]:
             if nxt.get("notes"):
                 out.append("      notes: %s (%s)" % (nxt["notes"]["path"],
                                                      nxt["notes"]["source"]))
+            elif nxt.get("notes_reason"):
+                out.append("      notes: none (%s)" % nxt["notes_reason"])
             themes = nxt.get("themes") or []
             for theme in themes[:6]:
                 out.append("      %s: %s" % (theme["theme"],

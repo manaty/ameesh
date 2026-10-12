@@ -849,7 +849,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       var line = el("div", "line vnext");
       line.appendChild(vchip(n.state));
       line.appendChild(el("span", "card-name", " " + (n.version ? "next " + n.version : "next release: version unknown")));
-      line.appendChild(el("span", "meta", " · " + (n.date || "no planned date")
+      line.appendChild(el("span", "meta", " · " + (n.date || (n.date_partial ? "not firm, latest " + n.date_partial : "no planned date"))
         + (n.date_label ? " · " + n.date_label : "") + (n.tag ? " · tag " + n.tag : "")));
       card.appendChild(line);
       (n.lots || []).forEach(function (l) {
