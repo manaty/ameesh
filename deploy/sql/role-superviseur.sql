@@ -77,6 +77,8 @@
 --       project_modules.schemas, .rules
 --       mesh_approvals.meta (et mesh_approvals_status)
 --       ci_test_failures.excerpt (sortie d'un test en échec, L161c)
+--       host_handoffs.plan, .evidence (métadonnées de travail et chemins, L232a)
+--       host_handoff_events.detail (détail du journal, L232a)
 --
 -- Restent lisibles, comme ÉTAT : titres de lots (work_items.title), valeur
 -- attendue des éléments de la file d'amélioration (work_items.expected_value,
@@ -170,6 +172,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'created_by', 'canon_ref', 'capabilities', 'last_event_at',
         'placement_ok', 'placement_diagnostic', 'placement_ref',
         'placement_profile',
+        -- L232a (0371) : clôture de passage entre hôtes
+        'handoff_fenced',
         -- L26 (0027) : réglages et état de session, sans contenu
         'session_policy', 'effort', 'tier', 'session_work_item',
         'status_since', 'restart_requested_at', 'session_reset_at',
@@ -188,7 +192,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- 0051 : délai de grâce du travail de fond d'un tour (un nombre)
         'turn_grace_seconds',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
-        'canon'
+        'canon',
+        -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
+        'projects'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
@@ -275,6 +281,14 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     -- L120 (0065): harness versions per host, a version line, no content
     ('harness_versions', ARRAY[
         'host', 'harness', 'path', 'version', 'raw', 'observed_at'
+    ]),
+    -- L232a (0371) : état et réservations ; plans et preuves dans le rôle contenus
+    ('host_handoffs', ARRAY[
+        'id', 'agent', 'source', 'target', 'state', 'fenced',
+        'memory_bytes', 'disk_bytes', 'reserved_until', 'created_at', 'updated_at'
+    ]),
+    ('host_handoff_events', ARRAY[
+        'id', 'operation', 'state', 'created_at'
     ]),
     -- ressources des hôtes (L31, 0029) : des mesures et l'état des ressources
     -- d'un tour, jamais un contenu

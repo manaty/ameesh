@@ -44,7 +44,9 @@ import uuid
 from . import account_turn, adapters, auth_failure, canon as canon_mod, canon_sync
 from . import cost as cost_mod
 from . import budget as budget_mod, db as db_mod, fil, mail, registry, sentinel, storage
+from . import persona_memory as memory_mod
 from .config import CHANNEL_BUDGET, CHANNEL_LEASE, CHANNEL_MAIL, Config
+from . import accounts as accounts_mod, session_backup as session_backup_mod
 from .config import load as load_config
 
 
@@ -142,9 +144,6 @@ GATE_SETTLE_RETRY_S = 30
 
 #: L147 : lignes orphelines d'avant le démarrage relues par page (pagination par id)
 BOOT_ORPHAN_PAGE = 500
-#: L242b : rôles de conception au canon (agents critiques, avec les
-#: orchestrateurs et les auditeurs)
-DESIGN_ROLES = ("conception", "design")
 #: L147 (#220 r2) : un conteneur relancé par sa politique (unité du
 #: gestionnaire utilisateur, podman-restart) peut démarrer après l'exécuteur —
 #: aucune ligne n'est soldée moins de BOOT_SETTLE_S après le démarrage de
@@ -2438,47 +2437,36 @@ class AgentWorker(threading.Thread):
             self._compta_en_echec = True
 
     def maybe_relocate(self, pressure: dict) -> bool:
-        """Déplace l'agent vers un hôte admis disponible (L31, 0028), si activé.
+        """L232a: reserve a complete handoff; never directly move a worktree.
 
-        Entre deux tours seulement : l'hôte d'exécution change (`relocate`) et
-        le worker s'arrête, ce qui rend le bail ; l'exécuteur de l'hôte
-        d'arrivée réclamera l'agent. Jamais au milieu d'un tour ; ne lève
-        jamais."""
-        if not self.runner.relocate or getattr(self.runner, "mediated", False):
-            # L109 : le déplacement entre hôtes passe au serveur en mode médié
+        The separate L232b controller prepares hosts and drains at a lot
+        boundary. Only a persisted claim fence stops this source worker.
+        """
+        if not getattr(self.runner, "relocate", False) or getattr(self.runner, "mediated", False):
+            # Device relocation is controlled by the mesh server (L109).
             return False
-        from . import relocation as relocation_mod
+        from . import handoffs, storage, work
         try:
-            plan = relocation_mod.plan(
-                self.agent.get("admitted_hosts") or [], self.runner.host, db=self.db,
-                current_limits=(pressure or {}).get("limits"),
-                limits_for=self.runner.host_limits_for,
-                shared_sessions=self.runner.shared_sessions,
-                gate_max_age_s=max(relocation_mod.GATE_MAX_AGE_S,
-                                   5 * float(self.runner.cfg.resource_interval or 0)))
-            if plan is None:
+            active = storage.of(self.db).handoffs.active(self.name)
+            if active:
+                if active["fenced"]:
+                    self.stopping.set()
+                    self.wake.set()
+                    return True
                 return False
-            result = relocation_mod.move(self.db, self.agent, plan,
-                                         current_host=self.runner.host,
-                                         owner=self.runner.runner_id, epoch=self.epoch)
-        except db_mod.DbError as exc:
-            log("[%s] relocation failed (%s)" % (self.name, exc))
-            return False
-        if result is None:
-            return False
-        log("[%s] relocation to %s: %s (session %s)" % (
-            self.name, result["target"], result["reason"],
-            "kept" if result["keep_session"] else "rotated with a summary"))
-        self._fil_note(
-            "Relocation to %s: %s. %s" % (
-                result["target"], result["reason"],
-                "The session is resumed (shared storage)." if result["keep_session"]
-                else "The session is not portable: resuming from a summary at the top "
-                     "of the instruction."),
-            meta={"action": "deplacement", "vers": result["target"]})
-        self.stopping.set()
-        self.wake.set()
-        return True
+            queued = bool(self.agent.get("pending_prompt") or work.open_lots(self.db, self.name))
+            candidate = handoffs.plan(self.db, self.agent,
+                                      limits_for=self.runner.handoff_limits_for, queued=queued)
+            if candidate is None:
+                return False
+            remote = subprocess.run(["git", "-C", self.agent.get("cwd") or "", "remote", "get-url", "origin"],
+                                    check=True, text=True, capture_output=True, timeout=10).stdout.strip()
+            operation = handoffs.request(self.db, candidate, repository=remote)
+            log("[%s] host handoff %s reserved to %s; waits for host preparation and lot boundary"
+                % (self.name, operation["id"], operation["target"]))
+        except (db_mod.DbError, handoffs.HandoffError, OSError, subprocess.SubprocessError):
+            log("[%s] host handoff unavailable; source and worktree retained" % self.name)
+        return False
 
     def _held_by_pressure(self, pressure: dict) -> bool:
         """La pression de l'hôte retient-elle le prochain tour de cet agent ?
@@ -2731,6 +2719,8 @@ class AgentWorker(threading.Thread):
                           % (self.name, self.DB_STATUS))
             self._base_marquee = False
             self.agent = agent = registry.get(self.db, self.name) or agent
+        if self.maybe_relocate({}):
+            return None  # L232a persisted fence: return this worker's source lease
         if not self.budget_ok():
             return None  # garde de budget (L13) : aucun tour, état `paused` posé
         if self.runner.gate_holds():
@@ -2740,8 +2730,6 @@ class AgentWorker(threading.Thread):
         # (auditeur excepté ; orchestrateur sous pression non critique).
         pressure = self.runner.host_pressure()
         if self._held_by_pressure(pressure):
-            if self.maybe_relocate(pressure):
-                return None  # déplacé : le worker s'arrête, le bail sera rendu
             self._host_pressure_note(pressure)
             return None
         self._host_pressure_release()
@@ -3226,6 +3214,25 @@ class AgentWorker(threading.Thread):
         # `service_tier`) ; sans effet sur un harnais qui n'en déclare pas.
         tier = self._state_read("tier") or self.agent.get("tier") or ""
         patch = self._path("model.patch.yml") if (model or effort) else None
+        # Decision 0029: designate neutral files; the harness manages memory.
+        memory_preface = ""
+        if self.agent.get("memory_repository") and not self.runner.dry_run:
+            try:
+                memory_mod.require_isolation(self.cfg, self.db, self.name)
+                activation = not self.__dict__.get("_memory_activated", False)
+                if activation:
+                    path = memory_mod.open_copy(self.agent["memory_repository"],
+                                                self.cfg.state_dir, self.name,
+                                                cfg_raw=self.cfg.persona_memory)
+                    self._memory_activated = True
+                else:
+                    path = memory_mod.copy_dir(self.cfg.state_dir, self.name)
+                if activation or not session:
+                    journal_id = "session-" + uuid.uuid4().hex
+                    memory_preface = memory_mod.preface(path, self.name, journal_id)
+            except (memory_mod.MemoryError, db_mod.DbError, OSError, subprocess.SubprocessError) as exc:
+                log("[%s] persona memory unavailable for this turn: %s" % (self.name, exc))
+        resume += memory_preface
         argv = adapter.command(resume + spec["prompt"], session,
                                model=model or None, effort=effort or None, patch=patch,
                                tier=tier or None)
@@ -3268,6 +3275,8 @@ class AgentWorker(threading.Thread):
 
         env = os.environ.copy()
         env.update(adapter.env())
+        # Decision 0029 disables native account memory for managed sessions.
+        env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         # L31 (0028) : identifiant du tour et étiquettes à poser sur les
         # conteneurs lancés par ses outils, pour repérer les orphelins.
         from . import containers as containers_mod
@@ -3821,8 +3830,10 @@ class AgentWorker(threading.Thread):
             error=error, cost_usd=cost,
         )
         self.last_activity = time.monotonic()
+        self._backup_session(adapter, compte, session_new or session)
         if ok:
             self.session_turns += 1
+        self._sync_memory()
         if spec["kind"] == "idle":
             self.nudged = True
         with self.runner.lock:
@@ -3868,6 +3879,48 @@ class AgentWorker(threading.Thread):
             meta={"action": "courrier-borne", "remis": etat["remis"],
                   "attente": etat["attente"], "tour_s": round(duration, 1)})
 
+    def _backup_session(self, adapter, account, session) -> None:
+        """Back up the completed session in a nonblocking background worker."""
+        if not session or self.runner.dry_run or not self.cfg.session_backup:
+            return
+        try:
+            conf = session_backup_mod.parse(self.cfg.session_backup)
+        except session_backup_mod.BackupError as exc:
+            if not getattr(self, "_backup_config_reported", False):
+                log("[%s] session backup disabled : %s" % (self.name, exc))
+                self._backup_config_reported = True
+            return
+        descriptor = getattr(adapter, "descriptor", None)
+        patterns = getattr(descriptor, "session_files", ()) if descriptor else ()
+        if conf is None or not patterns:
+            return
+        harness = self.agent.get("harness") or ""
+        home = (account.home() if account is not None else os.path.abspath(os.path.expanduser(
+            os.environ.get(accounts_mod.config_env_of(harness))
+            or accounts_mod.default_home_of(harness))))
+        lock = self.__dict__.setdefault("_backup_lock", threading.Lock())
+        if not lock.acquire(blocking=False):
+            return          # A backup for this agent is already running.
+
+        def copy_session() -> None:
+            try:
+                r = session_backup_mod.backup(
+                    conf, host=self.cfg.host, agent=self.name, home=home, patterns=patterns,
+                    session=session, state_dir=self.cfg.state_dir)
+                if r["status"] == "copied":
+                    log_async("[%s] session %s backed up off device (%d file(s), %d bytes)"
+                        % (self.name, session, r["files"], r["bytes"]))
+                elif r["status"] == "not_found":
+                    log_async("[%s] backup: session %s files not found under %s"
+                        % (self.name, session, home))
+            except Exception as exc:  # noqa: BLE001 - backup failure must not fail a turn
+                log_async("[%s] session %s backup failed : %s" % (self.name, session, exc))
+            finally:
+                lock.release()
+
+        threading.Thread(target=copy_session, daemon=True,
+                         name="%s-session-backup" % self.name).start()
+
     def failure_wait(self) -> float:
         """Attente avant le tour suivant après un échec : doublée à chaque échec
         rapide consécutif, bornée par `failure_backoff_max` (L48)."""
@@ -3876,6 +3929,47 @@ class AgentWorker(threading.Thread):
             return base
         return min(self.runner.failure_backoff_max,
                    base * (2 ** (self.fast_failures - 1)))
+
+    def _sync_memory(self) -> None:
+        """Transport the persona session's memory changes at turn end, in the background."""
+        if not self.agent.get("memory_repository") or self.runner.dry_run:
+            return
+        if not self.__dict__.get("_memory_activated", False):
+            return
+        try:
+            memory_mod.require_isolation(self.cfg, self.db, self.name)
+        except (memory_mod.MemoryError, db_mod.DbError) as exc:
+            log_async("[%s] persona memory disabled: %s" % (self.name, exc))
+            return
+        path = memory_mod.copy_dir(self.cfg.state_dir, self.name)
+        if not os.path.isdir(os.path.join(path, ".git")):
+            return
+        lock = self.__dict__.setdefault("_memory_lock", threading.Lock())
+        if not lock.acquire(blocking=False):
+            return
+
+        def push_memory() -> None:
+            try:
+                r = memory_mod.sync(path, "memory for %s: turn end" % self.name,
+                                     cfg_raw=self.cfg.persona_memory,
+                                     repository=self.agent["memory_repository"])
+                if r["status"] == "pushed":
+                    log_async("[%s] persona memory pushed (%s)" % (self.name, r["commit"]))
+                elif r["status"] == "secret":
+                    log_async("[%s] memory alert: likely secret in %s; commit refused"
+                        % (self.name, ", ".join(r["files"])))
+                elif r["status"] == "destructive":
+                    log_async("[%s] memory alert: destructive deletions refused; copy kept" % self.name)
+                elif r["status"] == "push_rejected":
+                    log_async("[%s] memory alert: push rejected; copy kept (%s)"
+                        % (self.name, r["error"]))
+            except Exception as exc:  # noqa: BLE001 - memory failure must not fail a turn
+                log_async("[%s] memory sync failed : %s" % (self.name, exc))
+            finally:
+                lock.release()
+
+        threading.Thread(target=push_memory, daemon=True,
+                         name="%s-memory" % self.name).start()
 
     def stop_after_failures(self) -> None:
         """L48 : trop d'échecs rapides consécutifs (harnais introuvable, qui
@@ -5320,7 +5414,11 @@ class Runner:
         for one in canons:
             for h in one.hosts:
                 if h.title not in par_hote:
-                    par_hote[h.title] = resources_mod.host_limits(canons, h.title)["limits"]
+                    effective = resources_mod.host_limits(canons, h.title)
+                    par_hote[h.title] = effective["limits"]
+                    if not hasattr(self, "_handoff_limits"):
+                        self._handoff_limits = {}
+                    self._handoff_limits[h.title] = dict(effective["limits"], max_agents=effective["max_agents"])
         self._host_max_agents = mine["max_agents"]
         self._host_limits_origin = mine["origin"]
         # L159f : un hôte prêteur (offre `policy.lend`) a une porte fermée
@@ -5395,6 +5493,10 @@ class Runner:
         """Seuils connus d'un hôte (dernier `canon sync`), ou None."""
         return getattr(self, "_all_host_limits", {}).get(host)
 
+    def handoff_limits_for(self, host: str) -> dict | None:
+        """Effective physical limits and max_agents, for reserved host moves."""
+        return getattr(self, "_handoff_limits", {}).get(host)
+
     def container_runtime(self):
         """Le moteur de conteneurs de l'hôte, ou None (L31, 0028)."""
         return getattr(self, "_container_runtime", None)
@@ -5453,41 +5555,21 @@ class Runner:
         self._audit_canons = tuple(canons)
 
     def is_auditor(self, name: str, agent=None) -> bool:
-        """L234 : persona auditeur ou rôle auditeur/auditor au canon."""
-        from . import alert_briefs
-        if name == alert_briefs.AUDITOR_NAME:
-            return True
-        canons = getattr(self, "_audit_canons", ())
-        from . import auditor as auditor_mod, sous_utilisation as su
-        # Ne consulte le registre que pour un nom candidat ; le worker passe
-        # sa ligne fraîche, ce qui évite une requête sur le chemin de lancement.
-        if name not in su.role_orchestrators(
-                canons, alert_briefs.AUDITOR_ROLES):
-            return False
-        row = agent if agent is not None else registry.get(self.db, name)
-        return bool(row and name in auditor_mod.cards([row], canons))
+        """L234 : persona auditeur ou rôle auditeur/auditor au canon
+        (`auditor.is_auditor`). Le worker passe sa ligne fraîche, ce qui évite
+        une requête sur le chemin de lancement."""
+        from . import auditor as auditor_mod
+        return auditor_mod.is_auditor(self.db, name, getattr(self, "_audit_canons", ()),
+                                      agent)
 
     def is_critical(self, name: str, agent=None) -> bool:
         """L242b : agent critique, jamais en pause budget tant qu'un compte a
-        de la marge — déclaré (`critical_agents`, `AMEESH_CRITICAL_AGENTS`),
-        orchestrateur (`AMEESH_ALERT_ORCHESTRATORS`, ou rôle au canon),
-        conception (rôle `conception` ou `design` au canon) ou auditeur
-        (`is_auditor`). Un rôle ne compte que dans le canon propriétaire de
-        l'agent : une fiche en conflit dans un autre canon ne le rend pas
-        critique (#324 r1)."""
-        if name in (getattr(self.cfg, "critical_agents", None) or ()):
-            return True
-        if name in getattr(self, "_orchestrators_declared", ()):
-            return True
-        from . import auditor as auditor_mod, sous_utilisation as su
-        canons = getattr(self, "_audit_canons", ())
-        roles = su.ORCHESTRATOR_ROLES + DESIGN_ROLES
-        # le registre n'est lu que pour un nom candidat, comme `is_auditor`
-        if name in su.role_orchestrators(canons, roles):
-            row = agent if agent is not None else registry.get(self.db, name)
-            if row and auditor_mod.owned_card(row, canons, roles) is not None:
-                return True
-        return self.is_auditor(name, agent)
+        de la marge (`auditor.is_critical`, partagé avec L233b)."""
+        from . import auditor as auditor_mod
+        return auditor_mod.is_critical(self.cfg, self.db, name,
+                                       getattr(self, "_audit_canons", ()),
+                                       declared=getattr(self, "_orchestrators_declared", ()),
+                                       agent=agent)
 
     def audit_command(self, name: str, argv: list, agent=None, *,
                       exempt: bool = False, seconds: float = 300) -> list:
@@ -6335,6 +6417,7 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
                                            permission_mode=_attach_permission_mode(cfg, name))
         env = _attach_env(cfg, name, owner, epoch, agent.get("harness") or "")
         env.update(adapter.env())
+        env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
         env.update(_attach_tmp_env(cfg, name, env, holds))
         cwd = agent.get("cwd") or None
         if cwd and not os.path.isdir(cwd):

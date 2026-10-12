@@ -13,6 +13,7 @@
         explicit binding of an external session to an agent (L41, 0030);
   ameesh run [options]        the machine's runner; `agent-runner` remains
         an alias;
+  ameesh activity <persona> [--since 24h] [--json]   persona activity log (L59);
   ameesh attach <agent> [--wait] [--ttl S]
         an interactive session on the agent's lease, same session (C9);
   ameesh list | show          observability (host, lease, unread, budget, key);
@@ -90,15 +91,19 @@
         the owner's conversation agent: decisions of all projects, answers,
         requests forwarded to orchestrators; never takes another agent's
         session (L123);
+  ameesh session list|backup|restore <agent>   off-device session backups (L53);
   ameesh approve-check [--url U] [--json]
         RP ID/origin agreement between ameesh-approve and this verifier;
   ameesh import-v0 | export-v0          switch from/to the v0 file mailbox;
   ameesh migrate | doctor     schema and diagnostics;
   ameesh canon check|show|sync          OKF canon: validation, cards, registry;
+  ameesh memory status|consolidate|close <persona>   neutral persona memory (L54);
   ameesh module <name> …              installed project module commands;
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
   ameesh hosts [--json] [HOST]          host resources (L31);
+  ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
+        reserved host move at a lot boundary, durable journal (L232a);
   ameesh menage [--apply] [--json]      cleanup of what agents create (L73);
   ameesh deps link|local|unlink|status|entries node_modules shared per lockfile (#248);
   ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);
@@ -132,7 +137,7 @@ import sys
 MESH_COMMANDS = (
     "list", "show", "set", "key", "approve", "approvals", "verify", "work", "cost",
     "migrate", "doctor", "import-v0", "export-v0", "canon", "placement", "agent",
-    "review-class",
+    "review-class", "handoff",
     # L31 : ressources des hôtes (`ameesh hosts`)
     "hosts",
     # L73 : ménage de ce que les agents créent (`ameesh menage [--apply]`)
@@ -223,6 +228,9 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "attach":
         from . import runner
         return runner.attach_main(rest)
+    if command == "activity":
+        from . import activity
+        return activity.main(rest)
     if command == "progress":
         from . import progress
         return progress.main(rest)
@@ -241,6 +249,9 @@ def _dispatch(argv: list[str] | None) -> int:
         # L96 : feuille de route (engagements, propositions, Gantt)
         from . import roadmap
         return roadmap.main(rest)
+    if command == "memory":
+        from . import persona_memory
+        return persona_memory.main(rest)
     if command == "fil":
         from . import fil
         return fil.main(rest)
@@ -260,6 +271,9 @@ def _dispatch(argv: list[str] | None) -> int:
         # L124 : demandes de décision au propriétaire, et ses réponses
         from . import decisions
         return decisions.main(rest)
+    if command == "session":
+        from . import session_backup
+        return session_backup.main(rest)
     if command == "chat":
         # L123 : l'agent de conversation du propriétaire
         from . import chat

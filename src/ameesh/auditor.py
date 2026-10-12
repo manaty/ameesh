@@ -78,3 +78,37 @@ def card_markers(card):
         return ()
     markers = {card.path.casefold(), card.ref.rsplit("@", 1)[0].casefold()}
     return tuple(marker for marker in markers if marker)
+
+
+def is_auditor(db, name, canons, agent=None):
+    """L234 : persona auditeur ou rôle auditeur/auditor dans le canon
+    propriétaire. Le registre n'est lu que pour un nom candidat ; `agent`, la
+    ligne fraîche de l'appelant, évite cette lecture."""
+    from . import registry, sous_utilisation as su
+    if name == AUDITOR_NAME:
+        return True
+    if name not in su.role_orchestrators(canons, AUDITOR_ROLES):
+        return False
+    row = agent if agent is not None else registry.get(db, name)
+    return bool(row and name in cards([row], canons))
+
+
+def is_critical(cfg, db, name, canons, *, declared=(), agent=None):
+    """L242b : agent critique, jamais en pause budget tant qu'un compte a de la
+    marge — déclaré (`critical_agents`, `AMEESH_CRITICAL_AGENTS`),
+    orchestrateur (`declared`, d'`AMEESH_ALERT_ORCHESTRATORS`, ou rôle au
+    canon), conception (rôle `conception` ou `design` au canon) ou auditeur
+    (`is_auditor`). Un rôle ne compte que dans le canon propriétaire de
+    l'agent : une fiche en conflit dans un autre canon ne le rend pas critique
+    (#324 r1). Partagé par l'exécuteur et la reprise sur pause budget (L233b)."""
+    from . import registry, sous_utilisation as su
+    if name in (getattr(cfg, "critical_agents", None) or ()):
+        return True
+    if name in (declared or ()):
+        return True
+    roles = su.ORCHESTRATOR_ROLES + su.DESIGN_ROLES
+    if name in su.role_orchestrators(canons, roles):
+        row = agent if agent is not None else registry.get(db, name)
+        if row and owned_card(row, canons, roles) is not None:
+            return True
+    return is_auditor(db, name, canons, agent)

@@ -171,6 +171,39 @@ def agent_detail(db, name: str) -> dict | None:
     return row
 
 
+def cmd_handoff(cfg: Config, args: argparse.Namespace) -> int:
+    """L232a planner/journal; activation is supplied by the L232b controller."""
+    from . import canon, handoffs, identity, resources, storage
+    db = _open(cfg)
+    try:
+        if args.handoff_command == "show":
+            row = storage.of(db).handoffs.get(args.operation)
+            if row is None:
+                raise ValueError("unknown handoff")
+            print(json.dumps({"operation": row,
+                              "events": storage.of(db).handoffs.events(args.operation)}, ensure_ascii=False))
+            return 0
+        binding = identity.resolve_binding(cfg, db)
+        if not binding.ok or binding.name != args.agent:
+            work.corrector(cfg, db)
+        agent = registry.get(db, args.agent)
+        if agent is None:
+            raise ValueError("unknown agent")
+        canons = canon.load_configured(cfg)
+        def limits(host):
+            effective = resources.host_limits(canons, host)
+            return dict(effective["limits"], max_agents=effective["max_agents"])
+        candidate = handoffs.plan(db, agent, limits_for=limits)
+        if candidate is None:
+            print("no fresh admitted destination with capacity")
+            return 0
+        result = candidate if args.dry_run else handoffs.request(db, candidate, repository=args.repository)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    finally:
+        db.close()
+
+
 def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
     db = _open(cfg)
     # L61 : agents et lots préchargés en un seul aller-retour (db.prefetch) ;
@@ -1958,6 +1991,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_models_discover.add_argument("--notify", help="agent to wake with an event")
     p_models_discover.add_argument("--sender", default=os.environ.get("AMEESH_AGENT") or "catalogue")
     p_models_discover.set_defaults(func=cmd_models_discover)
+
+    p_handoff = sub.add_parser("handoff", help="plan a reserved lot-boundary host move or inspect its journal")
+    handoff_sub = p_handoff.add_subparsers(dest="handoff_command")
+    p_handoff_plan = handoff_sub.add_parser("plan")
+    p_handoff_plan.add_argument("agent")
+    p_handoff_plan.add_argument("--repository", required=True,
+                                help="enrolled Git remote identity, never inferred from a directory name")
+    p_handoff_plan.add_argument("--dry-run", action="store_true")
+    p_handoff_plan.set_defaults(func=cmd_handoff)
+    p_handoff_show = handoff_sub.add_parser("show")
+    p_handoff_show.add_argument("operation")
+    p_handoff_show.set_defaults(func=cmd_handoff)
 
     p_key = sub.add_parser("key", help="owner public keys")
     key_sub = p_key.add_subparsers(dest="key_command")

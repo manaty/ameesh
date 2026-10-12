@@ -39,14 +39,14 @@ AGENT_COLUMNS = """
     extract(epoch from last_seen)::float8         as last_seen_ts,
     extract(epoch from last_turn_at)::float8      as last_turn_ts,
     extract(epoch from last_event_at)::float8     as last_event_ts,
-    responsible, team, provider, credential_mode, capabilities, canon_ref, canon,
+    responsible, team, projects, provider, credential_mode, capabilities, canon_ref, canon,
     ephemeral, created_by, priority, admitted_hosts, admitted_tags, memory_repository,
     extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts,
     session_policy, effort, tier, session_work_item,
     extract(epoch from status_since)::float8         as status_since_ts,
     extract(epoch from restart_requested_at)::float8 as restart_requested_ts,
     extract(epoch from session_reset_at)::float8     as session_reset_ts,
-    mode, stop_reason, session_account, context_max_tokens,
+    canon, handoff_fenced, mode, stop_reason, session_account, context_max_tokens,
     turn_max_seconds, turn_mail_max, turn_grace_seconds
 """
 
@@ -132,14 +132,14 @@ def canon_claim_predicate_sql(alias: str = "agent_registry") -> str:
     # L42 (0031) : l'état est celui du canon DE L'AGENT sur son hôte (colonne
     # `canon` ; NULL = canon par défaut, clé '') — un canon invalide ne ferme
     # que ses propres agents et leurs éphémères (qui portent son canon)
-    return """(NOT %(governed)s
+    return """(NOT ameesh_handoff_fenced(%(a)s.name) AND (NOT %(governed)s
        OR (EXISTS (SELECT 1 FROM canon_state s
                     WHERE s.host = %(a)s.host AND s.canon = coalesce(%(a)s.canon, '')
                       AND s.status = 'ok')
            AND coalesce(%(a)s.placement_ok, false)
            AND %(a)s.placement_profile IS NOT DISTINCT FROM ameesh_placement_profile(
                    %(a)s.host, %(a)s.harness, %(a)s.provider, %(a)s.model,
-                   %(a)s.credential_mode)))""" % {
+                   %(a)s.credential_mode))))""" % {
         "governed": canon_governed_sql(a), "a": a}
 
 
@@ -464,6 +464,7 @@ class Leases(interface.Leases):
                     OR r.lease_expires_at < clock_timestamp())
                AND (NOT r.ephemeral OR r.ephemeral_expires_at > clock_timestamp())
                __RESPONSABLE__
+               AND NOT r.handoff_fenced
                AND __CANON__
             RETURNING r.name, r.lease_owner, r.lease_epoch,
                       extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
@@ -504,6 +505,7 @@ class Leases(interface.Leases):
                         AND r.lease_expires_at > clock_timestamp())
                AND (NOT r.ephemeral OR r.ephemeral_expires_at > clock_timestamp())
                __RESPONSABLE__
+               AND NOT r.handoff_fenced
                AND __CANON__
             RETURNING r.name, r.lease_owner, r.lease_epoch,
                       extract(epoch from r.lease_expires_at)::float8 as lease_expires_ts
@@ -669,7 +671,7 @@ class Leases(interface.Leases):
         rows = self.db.query(
             """
             WITH verrou AS (
-                SELECT name, status, lease_owner, lease_epoch, lease_expires_at
+                SELECT name, status, handoff_fenced, lease_owner, lease_epoch, lease_expires_at
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
@@ -746,7 +748,7 @@ class Leases(interface.Leases):
         rows = self.db.query(
             """
             WITH verrou AS (
-                SELECT name, status, pending_prompt, lease_owner, lease_epoch,
+                SELECT name, status, handoff_fenced, pending_prompt, lease_owner, lease_epoch,
                        lease_expires_at
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
@@ -760,6 +762,7 @@ class Leases(interface.Leases):
              WHERE r.name = verrou.name
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
                AND verrou.pending_prompt IS NOT NULL
+               AND NOT verrou.handoff_fenced
                AND verrou.status <> 'stopped'
                AND verrou.lease_expires_at > clock_timestamp()
             RETURNING verrou.pending_prompt
@@ -772,7 +775,7 @@ class Leases(interface.Leases):
         rows = self.db.query(
             """
             WITH verrou AS (
-                SELECT name, status, lease_owner, lease_epoch, lease_expires_at
+                SELECT name, status, handoff_fenced, lease_owner, lease_epoch, lease_expires_at
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
@@ -781,6 +784,7 @@ class Leases(interface.Leases):
              WHERE r.name = verrou.name
                AND verrou.lease_owner = %s AND verrou.lease_epoch = %s
                AND verrou.lease_expires_at > clock_timestamp()
+               AND NOT verrou.handoff_fenced
                AND verrou.status <> 'stopped'   -- arrêté entre lecture et tour (L35)
             RETURNING r.name
             """,
