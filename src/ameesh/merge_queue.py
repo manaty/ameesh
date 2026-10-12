@@ -185,12 +185,15 @@ def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
     return tips[branch], where
 
 
-def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None) -> dict:
+def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
+              commit_ci=None) -> dict:
     """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
     pr}`; QueueError says what is missing. Commit ids are resolved to full
     ones before being compared; `ci` (`radar.github_ci(..., strict=True)`)
     must report the PR green on the frozen commit itself, and an error
-    reading it refuses the lot."""
+    reading it refuses the lot. A project with `ci_required` (L160g) also
+    needs GitHub's CI green on the frozen commit itself, PR or not
+    (`commit_ci`, `radar.commit_ci` by default)."""
     from . import plan_github, radar
     row = work.get(db, lot)
     if row is None:
@@ -246,16 +249,39 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None) -> 
                                                              tip[:12]))
         if not status.get("green"):
             raise QueueError("the CI of PR #%s is not green" % status.get("number"))
+    if project is not None and getattr(project, "ci_required", False):
+        _required_ci(project, tip, commit_ci)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"], "pr": (status or {}).get("number")}
 
 
+def _required_ci(project, sha: str, commit_ci=None) -> None:
+    """L160g (#473): `ci_required` — GitHub's CI green on the frozen commit
+    `sha` itself; QueueError otherwise (no run, running, red, unreadable)."""
+    from . import plan_github, radar
+    try:
+        runs = (commit_ci or (lambda s: radar.commit_ci(project, s)))(sha)
+    except plan_github.GithubError as exc:
+        raise QueueError("project %s requires CI on the frozen commit (ci_required), "
+                         "unreadable (%s): try again once gh works" % (project.name, exc)) from exc
+    if not runs["runs"]:
+        raise QueueError("project %s requires CI on the frozen commit (ci_required): no run "
+                         "on %s yet (push it, let the workflows run)" % (project.name, sha[:12]))
+    if runs["pending"]:
+        raise QueueError("the CI on the frozen commit %s is still running (%s)"
+                         % (sha[:12], ", ".join(runs["pending"])))
+    if runs["failed"]:
+        raise QueueError("the CI on the frozen commit %s is red (%s)"
+                         % (sha[:12], ", ".join(runs["failed"])))
+
+
 def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None,
-          clone=None) -> dict:
+          clone=None, commit_ci=None) -> dict:
     """Puts `lot` into the queue of its target, once `readiness` passes."""
     if ci == "github":
         from . import radar
         ci = radar.github_ci(project or radar.Project(name="", repo=repo), strict=True)
-    ready = readiness(db, lot, repo, ci=ci, clone=clone, project=project)
+    ready = readiness(db, lot, repo, ci=ci, clone=clone, project=project,
+                      commit_ci=commit_ci)
     row = storage.of(db).work.queue_add(
         lot, target=ready["target"], frozen_sha=ready["frozen_sha"], frozen_id=ready["frozen_id"],
         source=source_of(repo), note="merge queue of %s: queued at %s%s" % (

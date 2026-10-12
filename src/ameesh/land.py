@@ -137,10 +137,22 @@ def merge(replayer, base: str, row: dict, rows: list[dict]) -> dict:
     return {"state": state, "files": files, "sha": sha}
 
 
-def gates(project, path: str, *, timeout: float = GATE_TIMEOUT_S) -> dict:
+def changed(path: str, base: str, sha: str) -> list | None:
+    """L160g (#473): the files the merge `sha` changes on `base`; None if
+    git cannot tell (then every path gate runs)."""
+    from . import resolutions
+    proc = resolutions._run(path, "diff", "--name-only", "--no-renames", base, sha)
+    if proc.returncode != 0:
+        return None
+    return [f for f in resolutions._text(proc).splitlines() if f.strip()]
+
+
+def gates(project, path: str, *, files=None, timeout: float = GATE_TIMEOUT_S) -> dict:
     """Runs the project's gates in `path`: `{ok, gate, output}` (the
-    failed gate and the tail of its output)."""
-    for gate in project.gates:
+    failed gate and the tail of its output); with its path gates (L160g)
+    for the `files` the merge touches (`radar.gates_for`)."""
+    from . import radar
+    for gate in radar.gates_for(project, files):
         try:
             proc = subprocess.run(gate, shell=True, cwd=path, capture_output=True,
                                   timeout=timeout, check=False)
@@ -519,7 +531,7 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
             ", ".join(merged["files"][:6]) or "?", row["target"], base[:12]),
             "Integrate %s into your branch (or prepare the resolution), freeze again, "
             "then ameesh work queue add %d." % (row["target"], lot))
-    checked = gates(project, replayer.path)
+    checked = gates(project, replayer.path, files=changed(replayer.path, base, merged["sha"]))
     if not checked["ok"]:
         return landing.eject("gate `%s` failed on the merged tree" % checked["gate"],
                              "Its output:\n%s\nFix it on your branch, freeze again, then "

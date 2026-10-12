@@ -706,6 +706,52 @@ def github_ci(project: Project, gh=None, *, strict: bool = False):
     return status
 
 
+#: L160g (#473): conclusions of a workflow run that do not block
+CI_PASSING = ("success", "skipped", "neutral")
+
+
+def commit_ci(project: Project, sha: str, gh=None) -> dict:
+    """L160g (#473, `ci_required`): GitHub's CI on the commit `sha` itself
+    (`gh run list --commit`), the latest run of each workflow: `{runs,
+    green, pending: [workflows], failed: [workflows]}`; green needs at least
+    one run, all concluded and passing. Raises `plan_github.GithubError`
+    when it cannot be read (never taken for « no CI »)."""
+    from . import plan_github
+    slug = github_slug(project)
+    if not slug:
+        raise plan_github.GithubError("project %s declares no GitHub repository" % project.name)
+    gh = gh or plan_github.Gh()
+    rows = plan_github._json(gh, ["run", "list", "--repo", slug, "--commit", sha, "--limit",
+                                  "100", "--json",
+                                  "workflowName,name,status,conclusion,createdAt"]) or []
+    if not isinstance(rows, list):
+        raise plan_github.GithubError("gh run list: unexpected output")
+    latest: dict = {}
+    for run in sorted((r for r in rows if isinstance(r, dict)),
+                      key=lambda r: r.get("createdAt") or "", reverse=True):
+        latest.setdefault(run.get("workflowName") or run.get("name") or "?", run)
+    pending = sorted(n for n, r in latest.items() if (r.get("status") or "") != "completed")
+    failed = sorted(n for n, r in latest.items() if (r.get("status") or "") == "completed"
+                    and (r.get("conclusion") or "").lower() not in CI_PASSING)
+    return {"runs": len(latest), "green": bool(latest) and not pending and not failed,
+            "pending": pending, "failed": failed}
+
+
+def gates_for(project, files) -> tuple:
+    """L160g (#473): the gates of a merge that touches `files`: the
+    unconditional ones, then each path gate one of whose globs matches one
+    of them (`fnmatch`: `*` also crosses `/`, so a gate runs at least
+    whenever a workflow `paths` filter would). `files` None (unknown): every
+    path gate runs."""
+    import fnmatch
+    out = list(project.gates)
+    for gate in getattr(project, "path_gates", ()) or ():
+        if files is None or any(fnmatch.fnmatchcase(f, glob)
+                                for f in files for glob in gate.paths):
+            out.append(gate.run)
+    return tuple(out)
+
+
 def conflicts_of(report: dict) -> dict:
     """{clé: conflit} d'un rapport : paires en conflit, lots en conflit avec
     leur cible, numéros de migration en double (mêmes clés que `_states`)."""
