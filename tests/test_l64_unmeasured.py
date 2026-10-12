@@ -2,12 +2,18 @@
 """L64: the host measures this OS cannot give are said, never left silent."""
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import io
+import json
+import os
 import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import cli, config, resources
+from ameesh import cli, config, resources, storage
+
+from .support import PgTestCase
 
 FULL = {"mem_available_bytes": 1, "swap_used_bytes": 0, "load1": 0.5, "cpu_count": 4,
         "disk_free_bytes": 10, "tmp_fstype": "tmpfs", "psi_cpu_some": 0.0,
@@ -74,6 +80,52 @@ class DoctorLineTest(unittest.TestCase):
     def test_a_failed_reading_never_breaks_the_doctor(self):
         with mock.patch.object(resources, "sample", side_effect=OSError("boom")):
             self.assertIn("host not read (boom)", cli.host_measures_line(self.cfg))
+
+
+class CommandsTest(PgTestCase):
+    """Review #392 r1: the doctor line and the hosts output, at command level."""
+
+    def _doctor(self, cfg, **patch) -> tuple[int, str]:
+        out = io.StringIO()
+        with mock.patch.object(resources, "sample", **patch) as sample, \
+                contextlib.redirect_stdout(out):
+            code = cli.cmd_doctor(cfg, notify_test=False)
+        self.calls = sample.call_args_list
+        return code, out.getvalue()
+
+    def test_doctor_samples_the_guard_filesystems(self):
+        racine = tempfile.mkdtemp()
+        self.addCleanup(os.rmdir, racine)
+        cfg = dataclasses.replace(self.cfg, worktree_roots=[racine])
+        btrfs = {"path": racine, "fstype": "btrfs", "btrfs_unallocated_bytes": None,
+                 "btrfs_metadata_headroom_bytes": None}
+        code, text = self._doctor(cfg, return_value=dict(FULL, volumes=[btrfs]))
+        paths = self.calls[0].kwargs["paths"]
+        self.assertIn(racine, paths)       # a work root, not only the state dir
+        self.assertIn(cfg.state_dir, paths)
+        self.assertIn("measures   : not given on this host", text)
+        self.assertIn("btrfs allocation (%s)" % racine, text)
+        # a failed reading: said, and the verdict does not change
+        code_full, _ = self._doctor(cfg, return_value=FULL)
+        code_fail, text_fail = self._doctor(cfg, side_effect=OSError("boom"))
+        self.assertIn("measures   : host not read (boom)", text_fail)
+        self.assertEqual(code_fail, code_full)
+        self.assertEqual(code, code_full)
+
+    def test_hosts_text_and_json(self):
+        self.db.execute("DELETE FROM host_resources")
+        storage.of(self.db).hosts.record(dict(
+            FULL, host="pc-64", load1=None, psi_io_some=None,
+            volumes=[{"path": "/srv", "paths": ["/srv"], "fstype": "btrfs",
+                      "disk_free_bytes": 10, "btrfs_unallocated_bytes": None,
+                      "btrfs_metadata_headroom_bytes": None}]))
+        expected = ["load", "I/O pressure (PSI)", "btrfs allocation (/srv)"]
+        proc = self.mesh("hosts", "pc-64", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(json.loads(proc.stdout.splitlines()[0])["unmeasured"], expected)
+        texte = self.mesh("hosts", "pc-64")
+        self.assertEqual(texte.returncode, 0, texte.stderr)
+        self.assertIn("  unmeasured %s" % ", ".join(expected), texte.stdout)
 
 
 if __name__ == "__main__":

@@ -1338,11 +1338,14 @@ def driver_warnings(driver: str, remote: bool) -> list[str]:
 def host_measures_line(cfg: Config, reading: dict | None = None) -> str:
     """L64: the host measures this OS, or this host, cannot give, read on a
     fresh reading (never the published one, which may come from before an
-    upgrade). Informative: the verdict does not change."""
+    upgrade) of the filesystems the guard watches (work roots, state, caches,
+    tmp, docker, `/`: a btrfs work root is not the state dir's filesystem).
+    Informative: the verdict does not change."""
     from . import resources
     try:
         if reading is None:
-            reading = resources.sample(cfg.host, paths=[cfg.state_dir])
+            reading = resources.sample(cfg.host, paths=resources.disk_paths(cfg),
+                                       tmp=resources.tmp_paths(cfg))
         missing = resources.unmeasured(reading)
     except Exception as exc:  # a reading never breaks the doctor
         return "measures   : host not read (%s)" % (" ".join(str(exc).split())[:120],)
