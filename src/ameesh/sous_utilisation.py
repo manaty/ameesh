@@ -432,37 +432,102 @@ def fully_read(canon) -> bool:
                    for f in getattr(canon, "load_findings", None) or ())
 
 
-def critical_memory(cfg) -> dict:
-    """{agent: dernier verdict lu} (`CRITICAL_MEMORY`) ; {} s'il n'y en a pas."""
-    import json
-    path = os.path.join(getattr(cfg, "state_dir", None) or "", CRITICAL_MEMORY)
-    if not getattr(cfg, "state_dir", None):
-        return {}
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return {}
-    return {str(k): bool(v) for k, v in data.items()} if isinstance(data, dict) else {}
+#: L242c (#424 r3) : verdict perdu (cache illisible, corrompu, valeur invalide,
+#: fichier dont on ne peut pas se fier) — « inconnu » vaut critique
+UNKNOWN = "unknown"
 
 
-def remember_critical(cfg, name: str, verdict: bool) -> None:
-    """Retient le verdict lu de `name` (écriture atomique) ; ne lève jamais."""
-    import json
+def _memory_path(cfg) -> str | None:
     state = getattr(cfg, "state_dir", None)
-    if not state:
-        return
-    known = critical_memory(cfg)
-    if known.get(name) is verdict:
-        return
-    known[name] = verdict
-    path = os.path.join(state, CRITICAL_MEMORY)
+    return os.path.join(state, CRITICAL_MEMORY) if state else None
+
+
+def critical_memory(cfg) -> dict | None:
+    """Les derniers verdicts lus (`CRITICAL_MEMORY`) : {agent: True|False|None},
+    None pour une valeur invalide. {} sans fichier (rien n'a jamais été lu).
+    None (#424 r3, fail-closed) : fichier illisible, corrompu, ou dont on ne
+    peut se fier — lien symbolique (`O_NOFOLLOW`), pas un fichier ordinaire,
+    pas à nous, ou lisible par d'autres que nous."""
+    import json
+    import stat
+    path = _memory_path(cfg)
+    if path is None:
+        return {}
     try:
-        with open(path + ".tmp", "w", encoding="utf-8") as fh:
-            json.dump(known, fh, sort_keys=True)
-        os.replace(path + ".tmp", path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return {}
     except OSError:
-        pass
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() \
+                or st.st_mode & 0o077:
+            return None
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            data = json.loads(fh.read().decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    finally:
+        os.close(fd)
+    if not isinstance(data, dict):
+        return None
+    return {str(k): v if isinstance(v, bool) else None for k, v in data.items()}
+
+
+def remembered(memory: dict | None, name: str):
+    """Le dernier verdict lu de `name` : True, False, None (jamais lu), ou
+    `UNKNOWN` (perdu : vaut critique, `critical_verdict`)."""
+    if memory is None:
+        return UNKNOWN
+    if name not in memory:
+        return None
+    value = memory[name]
+    return value if isinstance(value, bool) else UNKNOWN
+
+
+def remember_critical(cfg, name: str, verdict: bool) -> bool:
+    """Retient le verdict lu de `name` ; vrai une fois écrit. Sous un verrou
+    (`flock`) : relecture, mise à jour, fichier temporaire unique, fsync,
+    renommage, mode 0600 (#424 r3). Ne lève jamais : l'appelant réessaie au
+    sondage suivant (sa mémoire ne suit qu'une écriture réussie)."""
+    import fcntl
+    import json
+    import tempfile
+    path = _memory_path(cfg)
+    if path is None:
+        return False
+    try:
+        lock = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        known = critical_memory(cfg) or {}
+        if known.get(name) is verdict:
+            return True
+        known[name] = verdict
+        fd, tmp = tempfile.mkstemp(prefix=".%s." % CRITICAL_MEMORY,
+                                   dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({k: v for k, v in known.items() if isinstance(v, bool)}, fh,
+                          sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return False
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(lock)
 
 
 def critical_by_role(row, canons) -> bool | None:
@@ -488,17 +553,20 @@ def critical_by_role(row, canons) -> bool | None:
 def critical_verdict(row, canons, *, configured: bool, known=None) -> tuple:
     """L242c : (critique ?, inconnu ?) pour l'agent `row`. Sans canon sur
     l'hôte : la persona auditeur seule (rôles par défaut). Canon propriétaire
-    illisible (#424 r1) : le dernier verdict lu (`known`), sinon
-    `CRITICAL_FALLBACK` — jamais une baisse silencieuse ; la surcharge
-    `critical_agents` se juge avant."""
+    illisible (#424 r1) : le dernier verdict lu (`known`, `remembered`) ;
+    perdu (`UNKNOWN`, #424 r3) : critique ; jamais lu : `CRITICAL_FALLBACK`.
+    Jamais une baisse silencieuse ; la surcharge `critical_agents` se juge
+    avant."""
     from .alert_briefs import AUDITOR_NAME
     if not configured and not canons:
         return row.get("name") == AUDITOR_NAME, False
     verdict = critical_by_role(row, canons)
     if verdict is not None:
         return verdict, False
-    if known is not None:
-        return bool(known), True
+    if known == UNKNOWN:
+        return True, True
+    if isinstance(known, bool):
+        return known, True
     return row.get("name") in CRITICAL_FALLBACK, True
 
 

@@ -618,8 +618,8 @@ def _local_session(cfg: Config, row: dict) -> str | None:
 
 def _critical(cfg: Config, row: dict) -> bool:
     """L242c : comme `Runner.is_critical` — déclaré, ou rôle critique de sa
-    fiche dans son canon propriétaire ; canon illisible : le repli
-    (`sous_utilisation.CRITICAL_FALLBACK`, #424 r1)."""
+    fiche dans son canon propriétaire ; canon lisible, le verdict rafraîchit
+    le cache (#424 r3) ; illisible, le dernier verdict lu, perdu : critique."""
     from . import canon as canon_mod, sous_utilisation as su
     if row["name"] in (getattr(cfg, "critical_agents", None) or ()) \
             or row["name"] in su.declared_orchestrators():
@@ -629,8 +629,12 @@ def _critical(cfg: Config, row: dict) -> bool:
         canons = canon_mod.load_configured(cfg) if configured else []
     except Exception:
         canons = []
-    return su.critical_verdict(row, canons, configured=configured,
-                               known=su.critical_memory(cfg).get(row["name"]))[0]
+    verdict, unknown = su.critical_verdict(
+        row, canons, configured=configured,
+        known=su.remembered(su.critical_memory(cfg), row["name"]))
+    if not unknown and configured:
+        su.remember_critical(cfg, row["name"], verdict)
+    return verdict
 
 
 def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:

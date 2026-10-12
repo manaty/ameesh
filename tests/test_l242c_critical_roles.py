@@ -300,5 +300,102 @@ class Relecture424r2Test(unittest.TestCase):
         self.assertEqual(notify.key_of(un[0]), notify.key_of(deux[0]))
 
 
+class Relecture424r3Test(unittest.TestCase):
+    """#424 r3 : le cache des verdicts, fail-closed (une épreuve par P1)."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+        self.cfg = types.SimpleNamespace(critical_agents=(), canon="home", state_dir=self.tmp)
+        self.path = os.path.join(self.tmp, su.CRITICAL_MEMORY)
+        self.rows = _rows()
+
+    def fake(self, canons):
+        return types.SimpleNamespace(cfg=self.cfg, db=None, _audit_canons=tuple(canons),
+                                     _orchestrators_declared=frozenset(),
+                                     _canon_complete=True)
+
+    def critical(self, fake, name):
+        with mock.patch("ameesh.registry.get", lambda db, n: self.rows.get(n)), \
+                mock.patch("ameesh.runner.log_async"):
+            return runner.Runner.is_critical(fake, name)
+
+    def outage(self, name):
+        """Un exécuteur neuf (redémarré), canon illisible."""
+        return self.critical(self.fake([_Canon("A", {}, readable=False)]), name)
+
+    def resume(self, name, canons):
+        with mock.patch("ameesh.canon.load_configured", **(
+                {"return_value": canons} if canons is not None
+                else {"side_effect": OSError("git")})), \
+                mock.patch.dict(os.environ, {"AMEESH_ALERT_ORCHESTRATORS": ""}):
+            return reprise._critical(self.cfg, self.rows[name])
+
+    def test_resume_rafraichit_le_cache(self):
+        self.assertTrue(su.remember_critical(self.cfg, "codex1", False))
+        self.assertTrue(self.resume("codex1", [_Canon("A", CARTES)]))
+        self.assertTrue(su.critical_memory(self.cfg)["codex1"])
+        self.assertTrue(self.resume("codex1", None))        # panne de canon ensuite
+
+    def test_memoire_apres_ecriture_reussie_seulement(self):
+        self.assertTrue(su.remember_critical(self.cfg, "codex1", False))
+        fake = self.fake([_Canon("A", CARTES)])
+        real = os.replace
+        with mock.patch("os.replace", side_effect=OSError("EIO")):
+            self.assertTrue(self.critical(fake, "codex1"))
+        self.assertFalse(su.critical_memory(self.cfg)["codex1"])   # disque inchangé
+        with mock.patch("os.replace", side_effect=real):
+            self.assertTrue(self.critical(fake, "codex1"))         # nouvel essai
+        self.assertTrue(su.critical_memory(self.cfg)["codex1"])
+        self.assertTrue(self.outage("codex1"))
+
+    def test_cache_corrompu_ou_invalide_vaut_critique(self):
+        for contenu in ("{pas du json", "[1, 2]", ""):
+            with self.subTest(contenu=contenu):
+                with open(self.path, "w") as fh:
+                    fh.write(contenu)
+                os.chmod(self.path, 0o600)
+                self.assertTrue(self.outage("codex1"))
+                self.assertTrue(self.outage("dev7"))
+        with open(self.path, "w") as fh:
+            fh.write('{"codex1": null, "dev7": false}')
+        os.chmod(self.path, 0o600)
+        self.assertTrue(self.outage("codex1"))
+        self.assertFalse(self.outage("dev7"))
+
+    def test_cache_dont_on_ne_peut_se_fier_vaut_critique(self):
+        self.assertTrue(su.remember_critical(self.cfg, "codex1", False))
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+        self.assertFalse(self.outage("codex1"))
+        os.chmod(self.path, 0o644)                        # lisible par d'autres
+        self.assertTrue(self.outage("codex1"))
+        os.chmod(self.path, 0o600)
+        ailleurs = os.path.join(self.tmp, "injecte.json")
+        with open(ailleurs, "w") as fh:
+            fh.write('{"codex1": false}')
+        os.chmod(ailleurs, 0o600)
+        os.unlink(self.path)
+        os.symlink(ailleurs, self.path)                   # lien symbolique
+        self.assertTrue(self.outage("codex1"))
+
+    def test_ecritures_concurrentes_sans_perte(self):
+        import threading
+        noms = ["agent%02d" % i for i in range(24)]
+        depart = threading.Barrier(len(noms))
+
+        def ecrit(nom):
+            depart.wait()
+            self.assertTrue(su.remember_critical(self.cfg, nom, True))
+        fils = [threading.Thread(target=ecrit, args=(n,)) for n in noms]
+        for f in fils:
+            f.start()
+        for f in fils:
+            f.join()
+        self.assertEqual(sorted(su.critical_memory(self.cfg)), noms)
+        self.assertEqual([f for f in os.listdir(self.tmp)
+                          if f not in (su.CRITICAL_MEMORY, su.CRITICAL_MEMORY + ".lock")], [])
+
+
 if __name__ == "__main__":
     unittest.main()

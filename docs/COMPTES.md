@@ -475,7 +475,14 @@ criticality is never lowered silently: the last verdict read is kept, and
 without one, `orchestrateur`, `mesh-design` and the `auditeur` agent stay
 critical (plus `critical_agents`). The last verdicts are kept in the host's
 state (`critical-known.json`), so a restarted runner and `ameesh resume`
-read them too. `ameesh alerts` raises `critical_roles_unreadable` for each
+read them too; `ameesh resume` refreshes them when the canon is readable.
+The file fails closed: unreadable, corrupt, an invalid value, or a file
+that cannot be trusted (a symbolic link, not a regular file, not owned by
+the runner's user, readable by others) means "last verdict unknown", which
+counts as critical. It is written under a lock (`critical-known.json.lock`),
+read-modify-write, through a unique temporary file, fsync, rename, mode
+0600; the runner trusts a verdict only once written, and tries again at the
+next poll otherwise. `ameesh alerts` raises `critical_roles_unreadable` for each
 configured canon that cannot be read in full on the host; it stays one
 alert while the outage lasts.
 

@@ -5204,28 +5204,36 @@ class Runner:
             return True
         from . import canon as canon_mod, sous_utilisation as su
         canons = getattr(self, "_audit_canons", ())
-        known = self.__dict__.get("_critical_known")
-        if known is None:   # #424 r2 : les verdicts lus avant un redémarrage
-            known = self._critical_known = su.critical_memory(self.cfg)
+        if "_critical_memory" not in self.__dict__:
+            # #424 r2 : les verdicts lus avant un redémarrage ; None si le
+            # cache n'est pas digne de confiance (#424 r3 : tout y est inconnu)
+            self._critical_memory = su.critical_memory(self.cfg)
+            self._critical_known = {}
+        known = self._critical_known
+        last = known[name] if name in known else su.remembered(self._critical_memory, name)
         # le registre n'est lu que pour un nom candidat, comme `is_auditor`
         # (tous les canons configurés chargés : un absent ne dit rien)
-        if (getattr(self, "_canon_complete", True) and not known.get(name)
+        if (getattr(self, "_canon_complete", True) and last is not True
+                and last != su.UNKNOWN
                 and all(su.fully_read(c) for c in canons)
                 and name not in su.critical_candidates(canons)):
             return False
         row = agent if agent is not None else registry.get(self.db, name)
         verdict, unknown = su.critical_verdict(
             dict(row or {}, name=name), canons,
-            configured=bool(canon_mod.configured(self.cfg)), known=known.get(name))
+            configured=bool(canon_mod.configured(self.cfg)), known=last)
         if not unknown:
-            if known.get(name) is not verdict:
-                known[name] = verdict
-                su.remember_critical(self.cfg, name, verdict)
+            # #424 r3 : la mémoire ne suit qu'une écriture réussie (sinon
+            # nouvel essai au sondage suivant)
+            if last is not verdict and (su.remember_critical(self.cfg, name, verdict)
+                                        or su._memory_path(self.cfg) is None):
+                known[name] = verdict     # sans dossier d'état : la mémoire seule
         elif self.__dict__.setdefault("_critical_held", {}).get(name) != verdict:
             self._critical_held[name] = verdict
             log_async("[%s] canon of the agent unreadable: criticality held %s (%s)"
                       % (name, "critical" if verdict else "not critical",
-                         "last known" if name in known else "default"))
+                         "last known" if isinstance(last, bool) else
+                         "lost: fail-closed" if last == su.UNKNOWN else "default"))
         return verdict
 
     def audit_command(self, name: str, argv: list, agent=None, *,
