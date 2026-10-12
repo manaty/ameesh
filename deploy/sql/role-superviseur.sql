@@ -293,7 +293,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L60 (0041) : clé du marqueur comptable (agent, index, instant)
         'spend_key',
         -- L95 (0043) : raison d'une ligne écartée des sommes
-        'void_reason'
+        'void_reason',
+        -- L225 (0059) : raison d'un tour facturé au repli prudent
+        'price_fallback',
+        -- L225 (0059) : écritures de cache Claude du tour
+        'cache_write_tokens'
     ]),
     -- corrections du grand livre (L95, 0043) : copie d'une ligne de
     -- turn_costs et valeurs écrites, de l'ÉTAT comptable, aucun contenu
