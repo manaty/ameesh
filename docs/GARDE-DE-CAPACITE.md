@@ -97,7 +97,8 @@ policy:
 - Three `reclaim` keys drive the ameesh guard (L159e): `io_pressure_max`
   (a percentage), `disk_free_min` (a size > 0, with a whole number of
   bytes) and `disk_paths` (a non-empty list of absolute, normalized
-  paths, without `..` or NUL, each filesystem watched once) whose free
+  paths — a trailing slash is stripped, except for the root — without `..`
+  or NUL, each filesystem watched once) whose free
   space is watched. The reader knows and validates them (L479), so they
   are no warning; a reader that does not use them ignores them. An
   explicit null is refused for every `reclaim` key: it is not an absent

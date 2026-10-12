@@ -27,6 +27,7 @@ import re
 import shutil
 import subprocess
 import time
+from decimal import Decimal
 
 from . import platform, storage
 from .db import Db
@@ -129,7 +130,9 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
 
     Rend None si la valeur est absente ou illisible (l'appelant décide du
     défaut ou du constat). Un texte négatif n'est pas un octet valide.
-    """
+    `decimal_ok=False` exige un nombre entier d'octets : « 4.5GiB » (exact)
+    passe, « 0.001KiB » (1.024 octet) est refusé au lieu d'être tronqué à 1
+    (codex #459 r2)."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -137,7 +140,9 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
         return value if value >= 0 and finite_float(value) is not None else None
     if isinstance(value, float):
         # .inf, .nan (YAML): no size, never an unbounded one
-        if not decimal_ok or not math.isfinite(value) or value < 0:
+        if not math.isfinite(value) or value < 0:
+            return None
+        if not decimal_ok and not value.is_integer():
             return None
         return int(value)
     if not isinstance(value, str):
@@ -149,10 +154,17 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
     if unit not in _UNITS:
         return None
     factor = _UNITS[unit]
-    if not decimal_ok and "." in number and factor == 1:
-        return None
     size = float(number) * factor
-    return int(size) if math.isfinite(size) else None
+    if not math.isfinite(size):
+        return None
+    if decimal_ok:
+        return int(size)
+    # arithmétique décimale exacte : le texte doit désigner un nombre entier
+    # d'octets (un « 1.0000000000000001GiB » ne doit pas passer par le float)
+    exact = Decimal(number) * factor
+    if exact != exact.to_integral_value():
+        return None
+    return int(exact)
 
 
 def parse_fraction(value) -> float | None:

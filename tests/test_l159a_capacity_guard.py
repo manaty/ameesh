@@ -246,7 +246,7 @@ class OfferTest(unittest.TestCase):
         # stripped, as for the other keys)
         base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
         for paths in (["../../outside"], ["srv/ameesh"], ["/", "/"],
-                      ["/srv/../etc"], ["/srv/"], ["//srv"], ["/srv//guest"], ["/."]):
+                      ["/srv/../etc"], ["//srv"], ["/srv//guest"], ["/."]):
             with self.subTest(paths=paths):
                 offer, problems, unknown = capacity_guard.parse_lend(
                     dict(base, reclaim={"disk_paths": paths}))
@@ -286,6 +286,61 @@ class OfferTest(unittest.TestCase):
                 dict(base, reclaim={key: "4.5GiB"}))
             self.assertEqual(problems, [])
             self.assertEqual(offer["reclaim"][key], int(4.5 * GIB))
+
+    def test_disk_paths_accept_a_trailing_slash(self):
+        # codex #459 r2: a trailing slash names the same filesystem; it is
+        # normalized before the duplicate check, so an offer valid at r1
+        # (`["/srv/"]`) is accepted as `["/srv"]` instead of exiting 1 at
+        # startup
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
+        offer, problems, _ = capacity_guard.parse_lend(
+            dict(base, reclaim={"disk_paths": ["/srv/", "/var/lib//"]}))
+        self.assertEqual(problems, [])
+        self.assertEqual(offer["reclaim"]["disk_paths"], ["/srv", "/var/lib"])
+        for paths in (["/srv", "/srv/"], ["/srv/", "/srv//"]):
+            with self.subTest(paths=paths):
+                offer, problems, _ = capacity_guard.parse_lend(
+                    dict(base, reclaim={"disk_paths": paths}))
+                self.assertIsNone(offer)
+                self.assertTrue(any("disk_paths" in p for p in problems), problems)
+
+    def test_reclaim_sizes_accept_integral_numbers(self):
+        # codex #459 r2: `memory_available_min: 6442450944.0` (exactly 6 GiB)
+        # was valid at r1 and refused although it is a whole number of bytes;
+        # a fractional float is still refused
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
+        for key in ("disk_free_min", "memory_available_min"):
+            for value, expected in ((6442450944.0, 6442450944),
+                                    (4.5 * GIB, int(4.5 * GIB))):
+                with self.subTest(key=key, value=value):
+                    offer, problems, _ = capacity_guard.parse_lend(
+                        dict(base, reclaim={key: value}))
+                    self.assertEqual(problems, [])
+                    self.assertEqual(offer["reclaim"][key], expected)
+            for value in (6442450944.5, -1.0, float("nan"), float("inf")):
+                with self.subTest(key=key, value=value):
+                    offer, problems, _ = capacity_guard.parse_lend(
+                        dict(base, reclaim={key: value}))
+                    self.assertIsNone(offer)
+                    self.assertTrue(any(key in p for p in problems), problems)
+
+    def test_reclaim_sizes_refuse_a_fractional_byte_count(self):
+        # codex #459 r2: with a unit, a fractional byte count was truncated
+        # ("0.001KiB" -> 1); only exact byte counts pass, "4.5GiB" included
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
+        for key in ("disk_free_min", "memory_available_min"):
+            for value in ("0.001KiB", "0.1KiB", "1.5B", "1.0000000000000001GiB"):
+                with self.subTest(key=key, value=value):
+                    offer, problems, _ = capacity_guard.parse_lend(
+                        dict(base, reclaim={key: value}))
+                    self.assertIsNone(offer)
+                    self.assertTrue(any(key in p for p in problems), problems)
+            for value, expected in (("4.5GiB", int(4.5 * GIB)), ("1.5KiB", 1536)):
+                with self.subTest(key=key, value=value):
+                    offer, problems, _ = capacity_guard.parse_lend(
+                        dict(base, reclaim={key: value}))
+                    self.assertEqual(problems, [])
+                    self.assertEqual(offer["reclaim"][key], expected)
 
     def test_reclaim_explicit_nulls_are_refused(self):
         # codex #459 r1: an explicit null is not an absent key: a null

@@ -248,15 +248,21 @@ def _reclaim_path(value) -> str | None:
     (codex #459 r1). `resources.disk_free` probes it as written, so a
     relative or traversing path would watch another filesystem than the one
     the fiche names, and a NUL raises while measuring. Blanks around it are
-    stripped, as for the other keys."""
+    stripped, as for the other keys. A trailing slash names the same
+    filesystem: it is stripped — except for the root — before the duplicate
+    check, so `/srv/` reads as `/srv` instead of refusing an offer that was
+    valid at r1 (codex #459 r2)."""
     if not isinstance(value, str):
         return None
     path = value.strip()
     if not path.startswith("/") or path.startswith("//") or "\x00" in path:
         return None
-    if os.path.normpath(path) != path:
+    if path == "/":
+        return path
+    normalized = os.path.normpath(path)
+    if normalized != path.rstrip("/"):
         return None
-    return path
+    return normalized
 
 
 def _parse_reclaim(raw) -> tuple[dict, list[str], list[str]]:
