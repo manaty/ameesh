@@ -209,6 +209,10 @@ class Config:
     #: 2026-10-12 : 0.75, soit 15 $ sur 20) ; un critique va jusqu'au plafond
     #: plein. Entre 0 et 1 ; une valeur hors bornes : le défaut.
     noncritical_hourly_share: float = 0.75
+    #: L242b (3) : les harnais vers lesquels un agent critique au seuil sur
+    #: tous les comptes du sien tourne, dans l'ordre (un harnais au forfait,
+    #: puis un harnais à clé d'API), par rotation avec résumé. Vide : aucun.
+    critical_fallback_harnesses: tuple[str, ...] = ("codex", "deepseek")
     #: rotation de session (0018) : taille de contexte et latence des tours
     session_max_tokens: float = 150000.0
     session_max_turn_seconds: float = 900.0
@@ -512,6 +516,11 @@ def load(env: dict | None = None) -> Config:
             n.strip() for n in (cfg.critical_agents.split(",")
                                 if isinstance(cfg.critical_agents, str)
                                 else cfg.critical_agents or ()) if str(n).strip()),
+        critical_fallback_harnesses=_as_names(pick("AMEESH_CRITICAL_FALLBACK_HARNESSES"))
+        or tuple(n.strip() for n in (cfg.critical_fallback_harnesses.split(",")
+                                     if isinstance(cfg.critical_fallback_harnesses, str)
+                                     else cfg.critical_fallback_harnesses or ())
+                 if str(n).strip()),
         noncritical_hourly_share=_as_share(
             pick("AMEESH_NONCRITICAL_HOURLY_SHARE"),
             _as_share(cfg.noncritical_hourly_share, Config.noncritical_hourly_share)),

@@ -417,6 +417,11 @@ class AgentWorker(threading.Thread):
         #: compte imposé au tour de résumé d'une bascule (l'ancien compte)
         self._account = None
         self._account_override = None
+        #: L242b (3) : harnais emprunté par un agent critique au seuil sur le
+        #: sien, `(harnais, compte ou None)`, et harnais imposé au tour de
+        #: résumé d'une rotation de harnais
+        self._borrowed = None
+        self._harness_override = None
         #: dossier de travail absent (L35) : blocage en cours, `cwd` du registre
         #: au dernier échec, attente courante et échéance du prochain essai
         #: complet. Un blocage hérité d'un exécuteur précédent est repris tel
@@ -2067,9 +2072,20 @@ class AgentWorker(threading.Thread):
         critique = account_turn.is_critical(self)
         part = 1.0 if critique else getattr(self.cfg, "noncritical_hourly_share", 0.75)
         if raison is None:
-            return book.over(self.name, reserve=0.0 if critique else accounts_mod.RESERVE,
-                             hourly_share=part)
-        return raison or book.over(self.name, pace=False, hourly_share=part)
+            raison = book.over(self.name, reserve=0.0 if critique else accounts_mod.RESERVE,
+                               hourly_share=part)
+        else:
+            raison = raison or book.over(self.name, pace=False, hourly_share=part)
+        return self._critical_fallback(raison, limites) if critique else raison
+
+    def _critical_fallback(self, raison: str, limites) -> str:
+        """L242b (3) : la pause budget d'un agent critique cède à un autre
+        harnais qui a de la marge (`account_turn.fallback`) ; jamais une
+        configuration ou un état de comptes illisibles."""
+        if not raison or raison.startswith(("invalid account configuration",
+                                            "account state unavailable")):
+            return raison
+        return account_turn.fallback(self, raison, limites)
 
     def budget_ok(self) -> bool:
         """La garde de budget autorise-t-elle un tour ? Pose l'état de pause.
@@ -2084,11 +2100,14 @@ class AgentWorker(threading.Thread):
         aveugle (verdict L13 B1).
         """
         self._account = None
+        self._borrowed = None
         if self.runner.budget_limits(self.db).per_hour <= 0:
             # L30 : bascule sans pause de rythme ; L226b : jamais un compte en
             # overage ou au-dessus d'un plafond fixe, quels que soient les
             # réglages de budget — sans autre compte, pas de tour
             raison = account_turn.choose(self, None, pause=False) or ""
+            if raison and account_turn.is_critical(self):
+                raison = self._critical_fallback(raison, self.runner.budget_limits(self.db))
         else:
             # Réparation d'abord : un travail comptable en attente (marqueur
             # persistant) doit être écrit avant d'autoriser le moindre tour ;

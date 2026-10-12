@@ -276,8 +276,10 @@ class AlerteCritiqueTest(PgTestCase):
 class MarqueDeLExecuteurTest(_L30Base):
     def test_la_pause_d_un_critique_est_marquee(self):
         comptes = self._claude_comptes()
+        # sans harnais de repli (L242b (3), testé à part) : la pause reste
         _runner, worker = self._worker("orch", "claude", {"claude": comptes},
-                                       critical_agents=("orch",))
+                                       critical_agents=("orch",),
+                                       critical_fallback_harnesses=())
         try:
             with mock.patch.object(account_turn, "choose", return_value="pause (x) until 14:20"):
                 self.assertFalse(worker.budget_ok())

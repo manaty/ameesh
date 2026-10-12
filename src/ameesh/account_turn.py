@@ -43,8 +43,22 @@ def _log(message: str) -> None:
     log_async(message)
 
 
-def _harness(worker) -> str:
+def own_harness(worker) -> str:
+    """Le harnais de l'agent (son registre)."""
     return (worker.agent or {}).get("harness") or ""
+
+
+def _harness(worker) -> str:
+    """Le harnais du tour : celui du compte imposé (résumé d'une rotation),
+    sinon le harnais emprunté par un agent critique (L242b (3)), sinon le
+    sien."""
+    override = getattr(worker, "_harness_override", None)
+    if isinstance(override, str) and override:
+        return override
+    borrowed = getattr(worker, "_borrowed", None)
+    if isinstance(borrowed, tuple):
+        return borrowed[0]
+    return own_harness(worker)
 
 
 def choose(worker, book=None, *, pause: bool = True) -> str | None:
@@ -56,7 +70,7 @@ def choose(worker, book=None, *, pause: bool = True) -> str | None:
     en overage ou au-dessus d'un plafond fixe n'est jamais retenu ; s'il n'en
     reste pas d'autre, la raison est rendue et le tour ne part pas.
     """
-    harness = _harness(worker)
+    harness = own_harness(worker)        # L242b (3) : toujours le sien d'abord
     try:
         items = accounts.profiles(worker.cfg, harness)
     except accounts.AccountError as exc:
@@ -90,6 +104,77 @@ def choose(worker, book=None, *, pause: bool = True) -> str | None:
     log_choice(worker, harness, choice)
     worker._account = choice.profile
     return ""
+
+
+def fallback(worker, reason: str, limits=None) -> str:
+    """L242b (3) : un agent critique en pause budget sur son harnais tourne
+    sous un autre, dans l'ordre de `critical_fallback_harnesses` (Codex au
+    forfait, puis DeepSeek à clé d'API). Le premier qui a de la marge est
+    retenu (`worker._borrowed = (harnais, compte ou None)`, `worker._account`)
+    et '' est rendu ; sinon `reason`, inchangée.
+
+    Un harnais retenu doit être installé (`adapters.adapter_for`), avoir un
+    compte sous son seuil (choix propre à l'agent, `critical=True` ; sans
+    compte déclaré, son forfait par défaut sous son rythme) et, s'il est payé
+    au token, tenir dans le plafond du mesh (plein : l'agent est critique ;
+    les non-critiques s'arrêtent avant, L242b (2)). Le changement de harnais
+    se fait par rotation avec résumé (`continuity`)."""
+    for harness in getattr(worker.cfg, "critical_fallback_harnesses", None) or ():
+        if harness == own_harness(worker):
+            continue
+        try:
+            adapters.adapter_for(harness)
+        except Exception:  # noqa: BLE001 - harnais absent de l'hôte : suivant
+            continue
+        try:
+            items = accounts.profiles(worker.cfg, harness)
+        except accounts.AccountError:
+            continue
+        kwargs = limits.book_kwargs() if limits is not None else {}
+        book = cost_mod.CostBook(state_dir=worker.cfg.state_dir, db=worker.db,
+                                 tools={worker.name: harness}, **kwargs)
+        profile = None
+        try:
+            if items:
+                choice = accounts.choose(
+                    worker.db, worker.cfg.host, harness, items, book, agent=worker.name,
+                    critical=True, session_account=session_account(worker, items)
+                    if session_harness(worker) == harness else None)
+                if choice.profile is None or choice.auth_blocked:
+                    continue
+                profile = choice.profile
+            elif book.pace_exceeded(harness):
+                continue
+            if book.over(worker.name, pace=False):
+                continue                    # payé au token : plafond du mesh
+        except db_mod.Unavailable:
+            raise
+        except Exception as exc:  # noqa: BLE001 - état illisible : suivant
+            _log("[%s] fallback harness %s unreadable (%s)" % (worker.name, harness, exc))
+            continue
+        previous = getattr(worker, "_borrowed_seen", None)
+        worker._borrowed = (harness, profile)
+        worker._account = profile
+        label = "%s/%s" % (harness, profile.name if profile else "(default)")
+        if previous != label:
+            worker._borrowed_seen = label
+            texte = ("Critical agent at threshold on every %s account (%s): its turns "
+                     "run under %s until its own account has headroom again (L242b)."
+                     % (own_harness(worker), reason, label))
+            _log("[%s] %s" % (worker.name, texte))
+            worker._fil_note(texte, meta={"action": "harnais", "harnais": harness,
+                                          "compte": profile.name if profile else None})
+        return ""
+    return reason
+
+
+def session_harness(worker) -> str:
+    """Le harnais sous lequel la session courante a tourné (L242b (3)) : noté
+    par l'exécuteur à chaque session (`session_harness` de l'état local),
+    sinon le sien."""
+    read = getattr(worker, "_state_read", None)
+    noted = read("session_harness") if callable(read) else ""
+    return noted if isinstance(noted, str) and noted else own_harness(worker)
 
 
 def is_critical(worker) -> bool:
