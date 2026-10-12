@@ -127,6 +127,16 @@ class ExpiryUnavailable(ThreadError):
     faute d'opération atomique côté serveur (verrou, recomptage, expiration)."""
 
 
+EXPIRY_UNAVAILABLE = ("thread expiry is not available on a mediated executor host"
+                      " (no server-side atomic operation yet)")
+
+
+def expiry_unavailable(cfg: Config, db=None) -> bool:
+    """Hôte d'exécuteur médié : par sa configuration (`backend: mediated`),
+    que sa connexion existe ou non (r7), ou par sa connexion distante."""
+    return getattr(cfg, "backend", "") == "mediated" or storage.is_remote(db)
+
+
 # --------------------------------------------------------------------------
 # modèle
 # --------------------------------------------------------------------------
@@ -1141,9 +1151,8 @@ def expire(cfg: Config, db, *, days: int | None = None, now: float | None = None
         raise ValueError("thread retention must be a whole number of days, >= 0")
     if days == 0:
         return []
-    if db is not None and not dry_run and storage.is_remote(db):
-        raise ExpiryUnavailable("thread expiry is not available on a mediated executor host"
-                                " (no server-side atomic operation yet): nothing expired")
+    if not dry_run and expiry_unavailable(cfg, db):
+        raise ExpiryUnavailable(EXPIRY_UNAVAILABLE + ": nothing expired")
     now = time.time() if now is None else float(now)
     transport = transport or transport_for(cfg)
     host = cfg.host if transport.name == "file" else ""
@@ -1311,6 +1320,10 @@ def cmd_expire(cfg: Config, args: argparse.Namespace) -> int:
     if not days:
         print("thread retention is 0: nothing expires")
         return 0
+    unavailable = expiry_unavailable(cfg)
+    if unavailable and not args.dry_run:
+        # refused before any connection: no local expiry without the index (r7)
+        raise ExpiryUnavailable(EXPIRY_UNAVAILABLE + ": nothing expired")
     db = None
     if not args.dry_run:
         try:
@@ -1337,6 +1350,11 @@ def cmd_expire(cfg: Config, args: argparse.Namespace) -> int:
                 report["kept"]))
     if not any(r["dropped"] for r in reports):
         print("no entry older than %d days in %d thread(s)" % (days, len(reports)))
+    if unavailable:
+        # the candidates above, but the real command refuses: said, and failed
+        print("error: %s: without --dry-run, nothing would expire" % EXPIRY_UNAVAILABLE,
+              file=sys.stderr)
+        return 1
     return 1 if failed else 0
 
 

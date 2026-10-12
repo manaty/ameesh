@@ -5694,6 +5694,9 @@ class Runner:
         if now < getattr(self, "_threads_expire_next", 0.0):
             return None
         self._threads_expire_next = now + 86400.0
+        if getattr(self, "mediated", False):  # no database, no local housekeeping
+            log_async("thread expiry skipped: %s" % fil.EXPIRY_UNAVAILABLE)
+            return None
         try:
             reports = fil.expire(self.cfg, db, now=now, dry_run=self.dry_run)
         except fil.ExpiryUnavailable as exc:  # mediated host: said once per pass
@@ -5803,10 +5806,23 @@ class Runner:
 
         threading.Thread(target=boucle, daemon=True, name="branches").start()
 
+    def _start_thread_expiry_notice(self) -> None:
+        """#421 r7 : un exécuteur médié n'a pas de ménage local ; l'expiration
+        des fils non disponible y est dite au démarrage puis une fois par
+        jour (`expire_threads_once`), quel que soit l'intervalle du ménage."""
+        def boucle() -> None:
+            self.expire_threads_once(None)
+            while not self.stop.wait(3600.0):
+                self.expire_threads_once(None)
+
+        threading.Thread(target=boucle, daemon=True, name="fils-expiration").start()
+
     def start_housekeeping_poll(self) -> None:
         """Passage périodique du ménage (`AMEESH_HOUSEKEEPING_INTERVAL`, défaut
         600 s ; 0 = aucun). En mode `--once`, aucun passage périodique."""
         interval = max(0.0, float(getattr(self.cfg, "housekeeping_interval", 0) or 0))
+        if getattr(self, "mediated", False) and not self.once:
+            self._start_thread_expiry_notice()
         if interval <= 0 or self.once or getattr(self, "mediated", False):
             return  # exécuteur médié : pas de base, pas de ménage local (contrat 1.1)
 

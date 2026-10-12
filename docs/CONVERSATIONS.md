@@ -167,8 +167,11 @@ Shared threads keep **one year** of entries by default (0033 §9):
   `threads.lock` nor `threads.expired`. Indexing there works as before
   L361 (no lock, no recount, every entry counted: `threads.index` with
   `count` left at its default, true). Such a host does not expire its
-  threads yet: `fil expire` answers with an error and changes nothing (a
-  `--dry-run` still reports), and the runner logs it once per daily pass.
+  threads yet, whether its connection to the server works or not
+  (`backend: mediated` is enough): `fil expire` answers with an error and
+  changes nothing; `--dry-run` lists the entries past retention, says that
+  expiry is not available and fails too. The runner, which has no local
+  housekeeping there, logs it at start and then once a day.
   The server-side operation that does lock, recount and expiry in a single
   transaction is the follow-up of #421.
 * **R12 outbox**: an undelivered copy older than thread retention is

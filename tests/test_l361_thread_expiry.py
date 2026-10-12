@@ -362,6 +362,69 @@ class MediatedHostTest(TransportTest):
                                                             now=NOW + 3600))
 
 
+    def mediated_cfg(self):
+        return dataclasses.replace(config_mod.Config(), threads_dir=self.root,
+                                   backend="mediated", exec_url="http://127.0.0.1:1")
+
+    def test_refused_by_the_configuration_without_a_connection(self):
+        # r7: the mediated server unreachable, no token: still refused, the
+        # files untouched and no connection tried by `fil expire`
+        cfg = self.mediated_cfg()
+        self.post(entry("old", 500), entry("kept", 1))
+        before = self.read_bytes()
+        with self.assertRaises(fil.ExpiryUnavailable):
+            fil.expire(cfg, None, now=NOW)
+        args = types.SimpleNamespace(days=None, dry_run=False)
+        from ameesh import db as db_mod
+        with mock.patch.object(fil, "transport_for", return_value=self.transport), \
+                mock.patch.object(db_mod, "connect",
+                                  side_effect=db_mod.Unavailable("no token")) as connect, \
+                self.assertRaises(fil.ExpiryUnavailable):
+            fil.cmd_expire(cfg, args)
+        connect.assert_not_called()
+        self.assertEqual(self.read_bytes(), before)
+
+    def test_dry_run_reports_and_says_unavailable(self):
+        cfg = self.mediated_cfg()
+        self.post(entry("old", 500), entry("kept", 1))
+        before = self.read_bytes()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(fil, "transport_for", return_value=self.transport), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = fil.cmd_expire(cfg, types.SimpleNamespace(days=None, dry_run=True))
+        self.assertEqual(code, 1)
+        self.assertIn("1 entry would expire", out.getvalue())
+        self.assertIn("not available on a mediated executor host", err.getvalue())
+        self.assertIn("nothing would expire", err.getvalue())
+        self.assertEqual(self.read_bytes(), before)
+
+    def test_runner_says_it_without_housekeeping(self):
+        # r7: a mediated runner has no housekeeping pass; the notice has its
+        # own daily schedule, whatever the housekeeping interval
+        for interval in (0, 600):
+            cfg = dataclasses.replace(self.mediated_cfg(), housekeeping_interval=interval)
+            fake = types.SimpleNamespace(cfg=cfg, dry_run=False, once=False, mediated=True,
+                                         stop=threading.Event())
+            fake.expire_threads_once = lambda db, now=None, f=fake: \
+                runner.Runner.expire_threads_once(f, db, now=now)
+            fake._start_thread_expiry_notice = lambda f=fake: \
+                runner.Runner._start_thread_expiry_notice(f)
+            said = threading.Event()
+            with mock.patch.object(runner, "log_async",
+                                   side_effect=lambda msg: said.set()) as logged:
+                runner.Runner.start_housekeeping_poll(fake)
+                self.assertTrue(said.wait(5), interval)
+                fake.stop.set()
+            self.assertEqual(logged.call_count, 1)
+            self.assertIn("thread expiry skipped", logged.call_args.args[0])
+            self.assertIn("mediated", logged.call_args.args[0])
+        # in --once, nothing scheduled
+        fake = types.SimpleNamespace(cfg=cfg, once=True, mediated=True,
+                                     _start_thread_expiry_notice=mock.Mock())
+        runner.Runner.start_housekeeping_poll(fake)
+        fake._start_thread_expiry_notice.assert_not_called()
+
+
 class IndexAndOutboxTest(PgTestCase):
     def setUp(self):
         super().setUp()
