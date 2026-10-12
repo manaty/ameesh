@@ -126,6 +126,53 @@ test("config token-form: a refused token is forgotten and asked again", async ()
   assert.deepEqual(await violations(), []);
 });
 
+test("config token-form: a stream's refusal forgets the token too, not a newer one", async () => {
+  const { config, app, fetch } = await mount(
+    '<ameesh-config token-form><ameesh-app standalone></ameesh-app></ameesh-config>', { token: null });
+  const submit = async (token) => {
+    config.shadowRoot.querySelector("input").value = token;
+    config.shadowRoot.querySelector("form").dispatchEvent(new window.SubmitEvent("submit", { cancelable: true }));
+    await settle(config);
+    await settle(app);
+  };
+  // the stream's answer is held until `release()`: a 401, as the mesh refuses
+  let release;
+  const sent = [];
+  window.fetch = globalThis.fetch = async (url, init) => {
+    if (new URL(url).pathname !== "/api/v1/events") return fetch(url, init);
+    sent.push(new Headers(init.headers).get("Authorization"));
+    await new Promise((r) => { release = r; });
+    return new Response("", { status: 401, statusText: "Unauthorized" });
+  };
+  const errors = [];
+  const read = () => ui.readStream(config.client, "/api/v1/events",
+    { onEvent() {}, onError: (e) => errors.push(e.status) });
+
+  await submit("old-token");
+  let stream = read();
+  await settle(config);
+  config.disconnect();
+  await settle(config);
+  await submit("new-token");
+  release(); // the old token's refusal arrives after the new one was typed
+  await stream;
+  await settle(config);
+  assert.equal(config.connected, true, "a replaced token's refusal changes nothing");
+
+  stream = read();
+  await settle(config);
+  release();
+  await stream;
+  await settle(config);
+  assert.deepEqual(sent, ["Bearer old-token", "Bearer new-token"]);
+  assert.deepEqual(errors, [401, 401]); // one request each: no loop
+  assert.equal(config.connected, false, "the stream's 401 disconnects");
+  assert.ok(config.shadowRoot.querySelector("form"), "form shown again");
+  // the page took the human's language (fr) from /me before the refusal
+  assert.match(config.shadowRoot.querySelector('[role="alert"]').textContent, /Jeton absent ou refusé/);
+  assert.deepEqual(await violations(), []);
+});
+
 test("config: theme passed to the components inside, host tokens honoured", async () => {
   const { config, app } = await mount(
     '<ameesh-config api-base="http://127.0.0.1:8780" theme="dark"><ameesh-app></ameesh-app></ameesh-config>');

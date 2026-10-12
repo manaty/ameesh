@@ -47,7 +47,10 @@ export class AmeeshConfig extends LitElement {
     if (!this.#client) {
       const baseUrl = this.apiBase || (this.tokenForm ? location.origin : "");
       if (!baseUrl) return null;
-      this.#client = createClient({ baseUrl, tokenProvider: () => this.#token() });
+      this.#client = createClient({
+        baseUrl, tokenProvider: () => this.#token(),
+        onUnauthorized: (token) => this.#refusedToken(token),
+      });
     }
     return this.#client;
   }
@@ -64,6 +67,12 @@ export class AmeeshConfig extends LitElement {
     this.refused = true;
     this.disconnect();
   };
+
+  // any 401 of this mesh's client (a stream too, which sends no event): only
+  // if it refused the token kept now, not one already replaced by the form
+  #refusedToken(token: string | null): void {
+    if (token !== null && token === this.#memoryToken) this.#onUnauthorized();
+  }
 
   override connectedCallback(): void {
     super.connectedCallback();

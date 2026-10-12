@@ -77,7 +77,10 @@ _LINE_RE = re.compile(r"^([A-Z]{1,10}) (/[A-Za-z0-9._/@:+-]{0,200})")
 CSP = "default-src 'none'; frame-ancestors 'none'"
 #: the standalone page (L88): its own files and the API, nothing inline
 UI = "/ui"
-UI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "static")
+# the package's directory, then ui/static opened one name at a time from it,
+# never through a link (a directory link included)
+UI_ROOT = os.path.dirname(os.path.abspath(__file__))
+UI_PARTS = ("ui", "static")
 UI_FILES = {
     "": ("index.html", "text/html; charset=utf-8"),
     "ameesh-ui.js": ("ameesh-ui.js", "text/javascript; charset=utf-8"),
@@ -576,18 +579,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if found is None:
             raise ApiError(404, "not_found", "no such file")
         name, ctype = found
-        path = os.path.join(UI_DIR, name)
         # served without a token: never through a link, never out of the package
-        if os.path.commonpath([os.path.realpath(path), os.path.realpath(UI_DIR)]) \
-                != os.path.realpath(UI_DIR):
-            raise ApiError(404, "not_found", "interface not installed")
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
-        except OSError:  # missing, or a link (ELOOP)
+            fd = _ui_open(name)
+        except OSError:  # missing, or a link (ELOOP, ENOTDIR)
             raise ApiError(404, "not_found", "interface not installed") from None
-        with os.fdopen(fd, "rb") as fh:
-            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise ApiError(404, "not_found", "interface not installed")
+            fh = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with fh:
             body = fh.read()
         self._send(200, body, ctype, csp=UI_CSP)
 
@@ -608,6 +612,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             args = ((m.group(1) + " " + m.group(2)) if m else "(malformed request)",) \
                 + tuple(args[1:])
         log.info(fmt, *args)
+
+
+def _ui_open(name: str) -> int:
+    """A descriptor of UI_ROOT/ui/static/<name>, each name opened from its
+    parent's descriptor without following a link: no race, no way out."""
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    nofollow = os.O_RDONLY | os.O_NOFOLLOW | cloexec
+    fd = os.open(UI_ROOT, os.O_RDONLY | os.O_DIRECTORY | cloexec)
+    try:
+        for part in UI_PARTS:
+            parent, fd = fd, -1
+            try:
+                fd = os.open(part, nofollow | os.O_DIRECTORY, dir_fd=parent)
+            finally:
+                os.close(parent)
+        # non-blocking: a FIFO in place of a file must not hold the request
+        return os.open(name, nofollow | os.O_NONBLOCK, dir_fd=fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 class ServeHTTPServer(httpkit.BoundedHTTPServer):

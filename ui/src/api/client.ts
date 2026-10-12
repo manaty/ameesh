@@ -29,6 +29,9 @@ export interface ClientOptions {
   tokenProvider?: TokenProvider;
   /** For tests and hosts that wrap fetch; the global one otherwise. */
   fetch?: typeof fetch;
+  /** Told of every 401, with the token that was refused (null: none was
+   *  sent), whoever made the request: page, component or stream. */
+  onUnauthorized?: (token: string | null) => void;
 }
 
 /** A refused request: the `ameesh-error/1` body when there is one. */
@@ -69,9 +72,11 @@ export function createClient(options: ClientOptions): Client {
     headers.set("Accept", headers.get("Accept") ?? "application/json");
     const token = options.tokenProvider ? await options.tokenProvider() : null;
     if (token) headers.set("Authorization", "Bearer " + token);
-    return doFetch(url, {
+    const response = await doFetch(url, {
       ...init, headers, credentials: "omit", cache: "no-store", redirect: "error",
     });
+    if (response.status === 401) options.onUnauthorized?.(token || null);
+    return response;
   }
 
   async function get(path: string, opts: {

@@ -71,23 +71,67 @@ class StandalonePageTest(ServerMixin, unittest.TestCase):
         status, _, _ = self.get("/ui/", method="HEAD", auth=False)
         self.assertEqual(status, 200)
 
+    def _package(self, name: str) -> tuple[str, str]:
+        """A package root of the test, whose ui/static is built by the caller;
+        its path and a secret out of it."""
+        root = os.path.join(self.tmp, name)
+        os.mkdir(root)
+        secret = os.path.join(self.tmp, name + "-out")
+        os.makedirs(os.path.join(secret, "static"))
+        for d in (secret, os.path.join(secret, "static")):
+            Path(d, "ameesh-ui.js").write_text("import secret")
+            Path(d, "page.css").write_text("secret{}")
+        return root, secret
+
+    def _served(self, root: str, path: str):
+        old = serve.UI_ROOT
+        serve.UI_ROOT = root
+        try:
+            return self.get(path, auth=False)
+        finally:
+            serve.UI_ROOT = old
+
     def test_never_through_a_link(self):
         # a listed file that is a link to a file out of the package: not served
-        static = os.path.join(self.tmp, "static")
-        os.mkdir(static)
-        secret = os.path.join(self.tmp, "secret.txt")
-        Path(secret).write_text("import secret")
-        os.symlink(secret, os.path.join(static, "ameesh-ui.js"))
+        root, secret = self._package("file")
+        static = os.path.join(root, "ui", "static")
+        os.makedirs(static)
+        os.symlink(os.path.join(secret, "ameesh-ui.js"), os.path.join(static, "ameesh-ui.js"))
         Path(static, "page.css").write_text("body{}")
-        old, serve.UI_DIR = serve.UI_DIR, static
-        try:
-            status, _, body = self.get("/ui/ameesh-ui.js", auth=False)
-            self.assertEqual(status, 404)
-            self.assertNotIn(b"secret", body)
-            status, _, body = self.get("/ui/page.css", auth=False)
-            self.assertEqual((status, body), (200, b"body{}"))
-        finally:
-            serve.UI_DIR = old
+        status, _, body = self._served(root, "/ui/ameesh-ui.js")
+        self.assertEqual(status, 404)
+        self.assertNotIn(b"secret", body)
+        status, _, body = self._served(root, "/ui/page.css")
+        self.assertEqual((status, body), (200, b"body{}"))
+
+    def test_never_through_a_directory_link(self):
+        # static, or ui, a link to a directory out of the package: nothing served
+        root, secret = self._package("static")
+        os.mkdir(os.path.join(root, "ui"))
+        os.symlink(secret, os.path.join(root, "ui", "static"))
+        root2, secret2 = self._package("ui")
+        os.symlink(secret2, os.path.join(root2, "ui"))
+        for r in (root, root2):
+            for path in ("/ui/ameesh-ui.js", "/ui/page.css"):
+                status, _, body = self._served(r, path)
+                self.assertEqual(status, 404, (r, path))
+                self.assertNotIn(b"secret", body)
+
+    def test_not_a_file_closes_its_descriptor(self):
+        # a directory or a FIFO in place of a listed file: 404 at once, no
+        # descriptor left open however often it is asked
+        root, _ = self._package("dir")
+        static = os.path.join(root, "ui", "static")
+        os.makedirs(os.path.join(static, "ameesh-ui.js"))
+        os.mkfifo(os.path.join(static, "page.css"))
+        fds = lambda: len(os.listdir("/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"))
+        before = fds()
+        for _ in range(20):
+            for path in ("/ui/ameesh-ui.js", "/ui/page.css"):
+                status, _, _ = self._served(root, path)
+                self.assertEqual(status, 404, path)
+        # a few may still be closing on the server's side; a leak is 20 or more
+        self.assertLess(fds(), before + 5)
 
     def test_guards_still_apply(self):
         status, _, _ = self.get("/ui/", auth=False, host="evil.example:%d" % self.port)

@@ -58,7 +58,9 @@ test("client: token per request, typed path, query, errors", async () => {
     "/api/v1/me": [401, { schema: "ameesh-error/1", error: "unauthorized", message: "refused" }],
   });
   let token = "secret";
-  const client = ui.createClient({ baseUrl: "http://127.0.0.1:8780/", tokenProvider: () => token, fetch });
+  const refused = [];
+  const client = ui.createClient({ baseUrl: "http://127.0.0.1:8780/", tokenProvider: () => token, fetch,
+    onUnauthorized: (t) => refused.push(t) });
   assert.equal((await client.get("/api/v1/lots/{id}", { path: { id: 7 } })).id, 7);
   await client.get("/api/v1/lots", { query: { state: "build", limit: 5, assignee: undefined } });
   assert.equal(fetch.calls[0].headers.get("Authorization"), "Bearer secret");
@@ -67,6 +69,9 @@ test("client: token per request, typed path, query, errors", async () => {
   await assert.rejects(client.get("/api/v1/me"),
     (e) => e instanceof ui.ApiError && e.status === 401 && e.code === "unauthorized");
   assert.equal(fetch.calls[2].headers.get("Authorization"), null);
+  token = "stale";
+  await assert.rejects(client.get("/api/v1/me"), ui.ApiError);
+  assert.deepEqual(refused, [null, "stale"]); // each 401, with the token it refused
   assert.equal(ui.expand("/t/{project}/{lot}", { project: "a/b", lot: "1 2" }), "/t/a%2Fb/1%202");
   assert.throws(() => ui.expand("/t/{project}", {}), TypeError);
 });
