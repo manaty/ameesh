@@ -47,7 +47,10 @@ ameesh progress … --no-gantt                         # without the roadmap (L9
 **Overview** (one card per project, from `overview`: open lots,
 lots merged in the window, pending decisions, 24 h spend, next milestone
 with its progress bar, two warnings at most; then "Watch": overdue or
-urgent decisions, blocked and stale lots), **Gantt** (the roadmap: tasks
+urgent decisions, blocked and stale lots), **Versions** (L160f, #497: per
+product, the last published version and the next release with its lots,
+its planned date, its content and the freshness of the GitHub read),
+**Gantt** (the roadmap: tasks
 grouped by epic, or by project when they have none, an epic without any
 task keeping its own group, as does a planned epic whose tasks are all
 finished and hidden, groups folded by default unless they hold a
@@ -71,6 +74,8 @@ the URL (`#tab=lots&p=demo&auto=1`, `#tab=gantt&z=day`).
 
 * `--serve [--port 8765]` (L304): serves the same page and this JSON from
   a local server, **read-only**, until Ctrl-C. See "Local server" below.
+* `--no-versions` (L160f, #497): read no GitHub at all; the `versions` key
+  stays and says why it is empty.
 
 Exit codes: 0, 1 (database unreachable, schema missing, SQL error),
 2 (unreadable option, `--port` without `--serve`, `--serve` with `--html` or
@@ -126,6 +131,7 @@ Exit codes: 0, 1 (database unreachable, schema missing, SQL error),
 | `window` | `{from_ts, to_ts}` | timeline window |
 | `overview` | list | (L304) one card per entry of `projects`, same order: `{project, active, lots_open, lots_merged_in_window, agents_active, agents_working, spend_24h_usd, decisions_pending, milestone, warnings}`; `milestone` = the next unreached plan milestone carrying a lot of the project (earliest dated first, undated last) `{id, title, date, progress, lots_merged, lots_total}`, or null |
 | `decisions` | list | (L304) pending decision requests, oldest first, `ameesh-decision/1` items (`ameesh decisions --json`); filtered by `--project` on their `project` |
+| `versions` | object | (L160f, #497) the versions of the products and their next releases, `ameesh-versions/1` schema (see below); `null` never: `--no-versions` leaves it saying why it is empty |
 | `roadmap` | object \| null | (L96) the roadmap, `ameesh-roadmap/1` schema ([EXPLOITATION.md](EXPLOITATION.md), "Feuille de route" (roadmap) section); `null` with `--no-gantt` |
 | `projects` | list | (L62) the per-project view of `ameesh projects` (item schema: `ameesh-projects/1`, [EXPLOITATION.md](EXPLOITATION.md)); filtered by `--project` on the project name; at the top of the text and the page |
 | `lots` | list | see below, oldest to newest |
@@ -227,6 +233,55 @@ dates (set in ameesh, otherwise in the canon; `source`:
 `merged`, `abandoned`) and the lots attached directly to the epic
 (`work_items`). `progress` = merged / (total − abandoned), null if
 none; computed over all lots, regardless of the window.
+
+## `versions` (L160f, #497)
+
+`ameesh-versions/1`. One **product** per version-tag stream of the
+repository a project cites (`issue_ref`, else the `github.projects`
+setting) — the same model for `--serve` and `--html`. GitHub is read
+**read-only** with the host token (`GH_TOKEN`/`GITHUB_TOKEN`; `gh` only as
+a local fallback, never on the server) and only for tags, releases, one
+file and one commit date: merged lots and their PRs come from the
+database (`sync-github`). The reader is cached 5 min and shared by the
+whole server; `--no-versions` reads nothing.
+
+| Key | Meaning |
+|---|---|
+| `schema` | `"ameesh-versions/1"` |
+| `github` | `{source, read_ts, age_s, stale}`: how GitHub was read (`api` with the token, `gh` as a local fallback), when it was last read and its age — a cache served keeps the instant it was read, never the snapshot's, so a stale cache shows (`stale`); `null` with `--no-versions` |
+| `products[]` | one entry per product, see below |
+| `read_ts` | the same instant as `github.read_ts`, kept at the root |
+| `missing` | texts: what the view cannot read (no repository known, no GitHub reader…) |
+
+`products[]`:
+
+| Key | Meaning |
+|---|---|
+| `project`, `repo`, `product`, `label`, `prefix` | the project, its repository and the product; one stream per tag prefix; the prefix-less stream is `<project> server/prod` when the repository has several |
+| `last` | last **published** version: `{version, tag, published_ts, date, url, prerelease, source, read_ts}` |
+| `last_tag` | the newest tag when it is ahead of `last` (tag without release, draft release): `{version, tag, date, published_ts, draft, url, source, read_ts}`; a `missing` line says the tag has no published release |
+| `next` | the next release, or `null`: `{version, tag, state, date, date_source, date_label, lots[], release, pr, notes, summary, themes[], merged_lots[], merged_since, missing[]}` |
+| `missing` | texts: what this product lacks |
+
+The next version is the smallest one above the stream's last tag announced
+by an open release lot (`Release x.y.z`, `REL-…`, `QA-…`) or a draft
+release. `next.date` is the planned date of its lots (the latest delivery,
+end or start), otherwise the p80 of the L157 reference table
+(`date_source`: `plan` or `p80`); a release without date is said in
+`next.missing`. `next.state` is the most demanding state of the train
+(`blocked`, `waiting_human`, `qa`, `build`, `intake`), otherwise `draft`
+(draft release) or `pull request` (open release PR).
+
+Content: the notes file `docs/versions/<version>.md` read from the release
+branch (`release/vX.Y.Z`, otherwise the tag, otherwise the default
+branch) — `notes.source` is the reference actually read; `notes` and the
+parsed `summary`/`themes` come from GitHub and carry `origin`/`read_ts`.
+Without that file, the lots merged since the last tag are grouped by their
+epic (`themes[]`), and `merged_lots[]` carries each lot with its `pr` read
+from the database. Every datum read from GitHub (`last`, `last_tag`,
+`release`, `notes`) carries `source` and `read_ts`; those read from the
+database (`lots[]`, `merged_lots[]`, `pr`) say `ameesh work items`.
+The text render adds one line: `GitHub (api): read 3 min ago`.
 
 ## `actions[]`
 
