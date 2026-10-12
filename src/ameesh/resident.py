@@ -366,21 +366,26 @@ class ResidentDriver:
             # (codex r1, #325), the caller serves them again
             self._unconfirmed.update(input_id for input_id, _text in self._followups)
             self._followups.clear()
+
+        def admit():
+            # lock held, at the admission of the request itself: the state
+            # put back is the one seen there, not a snapshot that another
+            # refused interrupt may roll back in between (codex r4, #387)
             previous = (self._interrupting, turn.interrupted)
             self._interrupting = True
             turn.interrupted = True
 
-        def undo() -> None:
-            # never written: the turn goes on, or its next result would end it
-            # before the steers still unread (codex r2, #387); called with the
-            # lock still held from the refusal, so that no result is read in
-            # between (codex r3)
-            with self._lock:
+            def undo() -> None:
+                # never written: the turn goes on, or its next result would end
+                # it before the steers still unread (codex r2); called with the
+                # lock still held from the refusal, so that no result is read
+                # in between (codex r3)
                 if self._turn is turn:
                     self._interrupting, turn.interrupted = previous
+            return undo
 
         try:
-            return self._interrupt(turn, undo)
+            return self._interrupt(turn, admit)
         except InputRefused as exc:
             log("interrupt: %s" % exc)
             return False
@@ -499,10 +504,11 @@ class ResidentDriver:
         """Serve the input in `turn`; another turn if it serves it instead."""
         raise NotImplementedError
 
-    def _interrupt(self, turn: Turn, undo=None) -> bool:
-        """Interrupt `turn`, never the turn after it. `undo` puts the turn back
-        as it was if the request was never written (InputRefused), before the
-        lock is released."""
+    def _interrupt(self, turn: Turn, admit=None) -> bool:
+        """Interrupt `turn`, never the turn after it. `admit()`, called under
+        the lock once the request is admitted for `turn`, marks the turn
+        interrupted; the undo it returns puts the turn back as it was if the
+        request is never written (InputRefused), before the lock is released."""
         raise NotImplementedError
 
 
@@ -680,13 +686,15 @@ class ClaudeStreamJson(ResidentDriver):
             self._release_input(writer=True)
 
     def _control(self, request: dict, timeout: float, *,
-                 turn: Turn | None = None, refused=None) -> dict | None:
+                 turn: Turn | None = None, admit=None) -> dict | None:
         """Send a control request and wait for its answer; with `turn`, only
-        if it is still the running turn (None otherwise). `refused` is called
-        under the lock when the request is never written (InputRefused)."""
+        if it is still the running turn (None otherwise). `admit` is called
+        under the lock before the request is written; the undo it returns is
+        called, still under the lock, if it is never written (InputRefused)."""
         with self._lock:
             if turn is not None and self._turn is not turn:
                 return None
+            refused = admit() if admit is not None else None
             self._control_seq += 1
             request_id = "ameesh-%d" % self._control_seq
             slot = {"event": threading.Event(), "response": None}
@@ -746,10 +754,10 @@ class ClaudeStreamJson(ResidentDriver):
         # once by the writer: the harness reads it at the next safe point
         self._user(text, new_id(), input_id)
 
-    def _interrupt(self, turn: Turn, undo=None) -> bool:
+    def _interrupt(self, turn: Turn, admit=None) -> bool:
         try:
             return self._control({"subtype": "interrupt"}, CONTROL_TIMEOUT,
-                                 turn=turn, refused=undo) is not None
+                                 turn=turn, admit=admit) is not None
         except InputRefused:
             raise  # never written: `interrupt` puts the turn back as it was
         except ResidentError as exc:
@@ -1030,8 +1038,13 @@ class CodexAppServer(ResidentDriver):
         # the turn ended without it (left out of its inputs): a new turn
         return self.send(text, input_id)
 
-    def _interrupt(self, turn: Turn, undo=None) -> bool:
+    def _interrupt(self, turn: Turn, admit=None) -> bool:
         assert self.peer is not None
+        with self._lock:
+            if self._turn is not turn:
+                return False
+            if admit is not None:
+                admit()  # nothing to refuse here: never undone
         deadline = time.monotonic() + CONTROL_TIMEOUT
         while True:
             with self._lock:
@@ -1366,10 +1379,12 @@ class AcpResident(ResidentDriver):
         self._followups.append((input_id, text))
         self._cancel()
 
-    def _interrupt(self, turn: Turn, undo=None) -> bool:
+    def _interrupt(self, turn: Turn, admit=None) -> bool:
         with self._lock:
             if self._turn is not turn:
                 return False  # ended meanwhile: the next turn is not touched
+            if admit is not None:
+                admit()
             return self._cancel()
 
     def probe(self, timeout: float = PROBE_TIMEOUT) -> bool:

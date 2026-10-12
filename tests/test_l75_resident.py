@@ -468,6 +468,45 @@ class ClaudeStreamJsonTest(DriverCase):
         self.assertEqual((result.status, result.inputs, result.final),
                          (resident.COMPLETED, ("a", "b"), "ECHO:late"))
 
+    def test_two_overlapping_refused_interrupts_restore_the_turn(self):
+        # codex r4 (#387): the second interrupt enters while the first is
+        # admitted, the first rolls back, then the second is refused: it must
+        # not restore the flags the first had set — "b" is still served
+        driver = self.driver(env={"FAKE_CLAUDE_QUEUE": "1"})
+        driver.start()
+        turn = driver.send("SLOW first", input_id="a")
+        driver.steer("late", input_id="b")
+        control = driver._control
+        second_entered, first_done = threading.Event(), threading.Event()
+        calls = []
+
+        def overlapping(*args, **kwargs):
+            first = not calls
+            calls.append(1)
+            if first:
+                self.assertTrue(second_entered.wait(10))
+                try:
+                    return control(*args, **kwargs)
+                finally:
+                    first_done.set()
+            second_entered.set()
+            self.assertTrue(first_done.wait(10))
+            return control(*args, **kwargs)
+
+        results = []
+        with mock.patch.object(driver, "_control", overlapping), \
+                mock.patch.object(resident, "MAX_OUTBOX_BYTES", 0):
+            other = threading.Thread(target=lambda: results.append(driver.interrupt()))
+            other.start()
+            self.until(lambda: calls)
+            results.append(driver.interrupt())
+            other.join(10)
+        self.assertEqual(results, [False, False])
+        self.assertFalse(driver._interrupting)
+        result = self.wait(turn)
+        self.assertEqual((result.status, result.inputs, result.final),
+                         (resident.COMPLETED, ("a", "b"), "ECHO:late"))
+
     def test_an_interrupt_leaves_unread_inputs_unserved(self):
         # codex r1 (#325): a steer the harness had not read when the turn was
         # interrupted is not reported as served
