@@ -609,8 +609,13 @@ class Accounts(Domain):
         un autre worker a déjà basculé : rien n'est écrit."""
 
     @abc.abstractmethod
-    def set_auto(self, host: str, harness: str, *, reason: str) -> bool:
-        """Lève le forçage manuel (journalisé `auto`) ; faux si rien n'était forcé."""
+    def set_auto(self, host: str, harness: str, *, reason: str,
+                 expected: str | None = None) -> bool:
+        """Lève le forçage manuel (journalisé `auto`) ; faux si rien n'était forcé.
+
+        #295 : `expected` (None = n'importe lequel) est le compte forcé que
+        l'appelant a lu ; faux sans rien écrire si la ligne a changé de compte
+        entre-temps (un forçage humain concurrent n'est pas défait)."""
 
     @abc.abstractmethod
     def holds(self, host: str, harness: str) -> dict[str, dict]:
@@ -631,7 +636,7 @@ class Accounts(Domain):
 
 
 # --------------------------------------------------------------------------
-# credential health (L226a/L226b, migration 0060)
+# credential health (L226a/L226b, migrations 0060 and 0068)
 # --------------------------------------------------------------------------
 
 class Credentials(Domain):
@@ -641,21 +646,36 @@ class Credentials(Domain):
 
     @abc.abstractmethod
     def report(self, host: str, harness: str, account: str, state: str, *,
-               reason: str = "", source: str, expires_at: float | None = None) -> dict:
+               reason: str = "", source: str, expires_at: float | None = None,
+               fingerprint: str | None = None,
+               expect_failures: int | None = None) -> dict:
         """Records `state` (healthy | failing | unknown) from `source`
         (sentinel | turn | manual); `failing_since` is kept while failing and
         cleared otherwise; `expires_at` (epoch, None = unknown) is the
-        credential's forecast expiry, overwritten on each report. Returns
-        {state, previous} (previous: None if new)."""
+        credential's forecast expiry, overwritten on each report. A `failing`
+        report stamps `last_failure_at`, stores `fingerprint` (of the
+        credential that failed, never the credential) and counts one more
+        failure. Any other report with `expect_failures` lands only if the
+        failure count is still that one (0 for a missing row). Returns
+        {state, previous} (previous: None if new), or {skipped: True}."""
+
+    @abc.abstractmethod
+    def annotate(self, host: str, harness: str, account: str, reason: str, *,
+                 expect_failures: int) -> bool:
+        """#210 r4: replaces the `reason` of a `failing` row (adds the fix
+        command to a failure a turn detected), nothing else, and only if the
+        failure count is still `expect_failures`. True if written."""
 
     @abc.abstractmethod
     def health(self, host: str, harness: str) -> dict[str, dict]:
         """{account: row} for a harness on a host: state, reason, source,
-        checked_ts, failing_since_ts, expires_ts."""
+        checked_ts, failing_since_ts, expires_ts, last_failure_ts,
+        failing_fingerprint, failures."""
 
     @abc.abstractmethod
     def listing(self, host: str | None = None) -> list[dict]:
-        """Every row (of a host, or of all hosts)."""
+        """Every row (of a host, or of all hosts), without
+        `failing_fingerprint`: only columns the supervisor role reads."""
 
 
 # --------------------------------------------------------------------------
@@ -1721,8 +1741,8 @@ class Progress(Domain):
     @abc.abstractmethod
     def package_items(self) -> list[dict]:
         """TOUS les lots rattachés à une fiche (id, package_id, state,
-        close_reason, updated_ts) : la progression d'un epic ne dépend pas de
-        la fenêtre."""
+        close_reason, app, updated_ts) : la progression d'un epic ne dépend
+        pas de la fenêtre ; `app` (L304) rattache un jalon à ses projets."""
 
     @abc.abstractmethod
     def lot_actions(self, item_ids: Sequence[int]) -> list[dict]:
@@ -2239,6 +2259,13 @@ class TurnResources(Domain):
         """L147 : les lignes `orphan` de l'hôte ouvertes avant `before_ts`
         (epoch), d'`id` supérieur à `after_id`, par `id` croissant : une page
         de `limit` lignes au plus (pagination par `id`)."""
+
+    @abc.abstractmethod
+    def running_started_before(self, host: str, before_ts: float, after_id: int = 0,
+                               limit: int = 500) -> list[dict]:
+        """L147b : les lignes `running` de `host` dont le tour a commencé (ou
+        fini, délai de grâce) avant `before_ts`, par id croissant au-delà de
+        `after_id` — la revue d'après démarrage les lit page par page."""
 
     @abc.abstractmethod
     def stale_running(self, older_than_s: float, host: str | None = None) -> list[dict]:

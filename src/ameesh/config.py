@@ -159,6 +159,9 @@ class Config:
     #: au-delà, une requête est annulée par le serveur (0 = pas de limite).
     #: Empêche un renouvellement de bail de bloquer le battement indéfiniment.
     statement_timeout_ms: float = 30000.0
+    #: L304 : session en lecture seule (`default_transaction_read_only`) ;
+    #: jamais lu de l'environnement, posé par `ameesh progress --serve`
+    read_only: bool = False
     lease_ttl: float = 300.0
     idle_nudge: float = 1200.0
     poll: float = 5.0
@@ -331,6 +334,9 @@ class Config:
     #: L131: heavy suites run at once on this host (`ameesh heavy`); 0 = a
     #: quarter of the CPUs, at least 1
     max_heavy_suites: int = 0
+    #: L226a: the `credential_sentinel` key of the host configuration
+    #: (`probes`, `gcloud_session_hours`, `warn_hours`), read by `ameesh.sentinel`
+    credential_sentinel: dict = field(default_factory=dict)
     #: issues GitHub des lots (L126) : la clé `github` du fichier de
     #: configuration de l'HÔTE, telle quelle (`projects` : projet → dépôt,
     #: `host` : hôte désigné pour la projection automatique, `interval`,

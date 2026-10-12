@@ -2,16 +2,21 @@
 """L226b — classification of authentication failures in failed turns."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
+import re
+import shlex
+import sys
 import tempfile
 import time
 import unittest
 from unittest import mock
 
-from ameesh import account_turn, accounts, auth_failure, cost, exploitation, registry, storage
+from ameesh import (account_turn, accounts, auth_failure, cost, exploitation, registry,
+                    sentinel, storage)
 
-from .support import FAKEBIN
+from .support import FAKEBIN, REPO
 from .test_l30_accounts import _Base, _codex_rollout
 
 
@@ -279,6 +284,80 @@ class CredentialsStorageTest(_AuthBase):
         self.assertEqual(auth_failure.failing(self.db, self.cfg.host, "claude"), {})
 
 
+class CredentialsConditionalTest(_AuthBase):
+    """#210 codex r2 (b, c): last failure, fingerprint and conditional write."""
+
+    def test_failure_fields_and_conditional_write(self):
+        creds = storage.of(self.db).credentials
+        creds.report(self.cfg.host, "codex", "a", "failing", source="turn", fingerprint="f1")
+        row = self._health("codex")["a"]
+        self.assertEqual((row["failures"], row["failing_fingerprint"]), (1, "f1"))
+        self.assertIsNotNone(row["last_failure_ts"])
+        # the sentinel read the row (1 failure); a turn records another one
+        creds.report(self.cfg.host, "codex", "a", "failing", source="turn", fingerprint="f2")
+        done = creds.report(self.cfg.host, "codex", "a", "healthy", source="sentinel",
+                            fingerprint="f3", expect_failures=1)
+        self.assertEqual(done, {"skipped": True})
+        row = self._health("codex")["a"]
+        self.assertEqual((row["state"], row["failures"], row["failing_fingerprint"]),
+                         ("failing", 2, "f2"))
+        self.assertGreaterEqual(row["last_failure_ts"], row["failing_since_ts"])
+        # with the count it read, the write lands; a failure always lands
+        done = creds.report(self.cfg.host, "codex", "a", "healthy", source="sentinel",
+                            expect_failures=2)
+        self.assertEqual(done["previous"], "failing")
+        row = self._health("codex")["a"]
+        self.assertEqual((row["state"], row["failing_fingerprint"]), ("healthy", None))
+        self.assertIsNone(row["failing_since_ts"])
+        self.assertIsNotNone(row["last_failure_ts"])
+        # a missing row expected at 0 failures, but a turn inserted one
+        creds.report(self.cfg.host, "codex", "b", "failing", source="turn")
+        self.assertEqual(creds.report(self.cfg.host, "codex", "b", "healthy",
+                                      source="sentinel", expect_failures=0),
+                         {"skipped": True})
+        self.assertEqual(creds.report(self.cfg.host, "codex", "b", "failing",
+                                      source="sentinel", expect_failures=0)["state"],
+                         "failing")
+
+    def test_annotate_only_the_failure_it_read(self):
+        # codex r4 (6): the fix command added to a turn's failure, never over
+        # a newer failure
+        creds = storage.of(self.db).credentials
+        creds.report(self.cfg.host, "codex", "a", "failing", source="turn",
+                     reason="invalid api key", fingerprint="f1")
+        self.assertFalse(creds.annotate(self.cfg.host, "codex", "a", "x; fix: y",
+                                        expect_failures=0))
+        self.assertTrue(creds.annotate(self.cfg.host, "codex", "a",
+                                       "invalid api key; fix: codex login", expect_failures=1))
+        row = self._health("codex")["a"]
+        self.assertEqual((row["state"], row["reason"], row["source"], row["failures"],
+                          row["failing_fingerprint"]),
+                         ("failing", "invalid api key; fix: codex login", "turn", 1, "f1"))
+        creds.report(self.cfg.host, "codex", "a", "healthy", source="manual")
+        self.assertFalse(creds.annotate(self.cfg.host, "codex", "a", "z", expect_failures=1))
+
+    def test_listing_reads_only_what_the_supervisor_is_granted(self):
+        # #210 codex r4: the alerts read `listing()`, the supervisor role is
+        # not granted the fingerprint — selecting it emptied the alerts
+        from ameesh.storage.postgres import credentials as pg_credentials
+        with open(os.path.join(REPO, "deploy", "sql", "role-superviseur.sql"),
+                  encoding="utf-8") as fh:
+            grants = re.search(r"\('credential_health', ARRAY\[(.*?)\]", fh.read(), re.S)
+        granted = set(re.findall(r"'([a-z_]+)'", grants.group(1)))
+        columns = {row["column_name"] for row in self.db.query(
+            "select column_name from information_schema.columns"
+            " where table_name = 'credential_health' and table_schema = current_schema()")}
+        self.assertIn("failing_fingerprint", columns)
+        read = set(re.findall(r"[a-z_]+", pg_credentials._LISTING)) & columns
+        self.assertEqual(read - granted, set())
+        storage.of(self.db).credentials.report(self.cfg.host, "codex", "a", "failing",
+                                               source="turn", fingerprint="f1")
+        rows = storage.of(self.db).credentials.listing(self.cfg.host)
+        self.assertTrue(rows)
+        self.assertNotIn("failing_fingerprint", rows[0])
+        self.assertEqual(self._health("codex")["a"]["failing_fingerprint"], "f1")
+
+
 class ChooseTest(_AuthBase):
     """L30 `choose` restricted to healthy accounts."""
 
@@ -389,6 +468,41 @@ class RunnerTest(_AuthBase):
             fil = self._fil()
             self.assertIn("Turn failed authentication on claude/primaire", fil)
             self.assertIn("Block auth_blocked: claude/primaire lifted", fil)
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_failure_records_the_credential_the_turn_started_with(self):
+        # #210 codex r3: the turn starts with A, the owner logs in with B
+        # during it, A's request fails — A is failing, not B
+        comptes = self._claude_comptes(partage=True)
+        creds = os.path.join(comptes[0]["path"], ".credentials.json")
+
+        def login(token):
+            with open(creds, "w", encoding="utf-8") as fh:
+                json.dump({"claudeAiOauth": {"refreshToken": token}}, fh)
+
+        login("token-A")
+        runner, worker = self._worker("re", "claude", {"claude": comptes})
+        relogin = "%s -c %s" % (sys.executable, shlex.quote(
+            "import json; json.dump({'claudeAiOauth': {'refreshToken': 'token-B'}}, "
+            "open(%r, 'w'))" % creds))
+        try:
+            self.assertIsNotNone(self._tour(worker, AMEESH_TEST_RUN=relogin, **self.LOGIN))
+            self.assertEqual(sentinel.fingerprint("claude", accounts.Profile(
+                "claude", "primaire", path=comptes[0]["path"])), sentinel._digest("token-B"))
+            sante = self._health("claude")["primaire"]
+            self.assertEqual((sante["state"], sante["failing_fingerprint"]),
+                             ("failing", sentinel._digest("token-A")))
+            # codex r4 (1): B, installed BEFORE A's failure, is not the token
+            # that failed — the sentinel's next healthy probe clears it
+            cfg = dataclasses.replace(worker.cfg, credential_sentinel={"probes": ["claude"]})
+            status = json.dumps({"loggedIn": True, "authMethod": "claude.ai"})
+            with mock.patch.object(sentinel.shutil, "which", return_value="/bin/claude"):
+                rows = sentinel.check(cfg, self.db, run=lambda argv, **kw: (0, status))
+            primaire = [r for r in rows if r["account"] == "primaire"]
+            self.assertEqual([(r["state"], r["previous"]) for r in primaire],
+                             [("healthy", "failing")])
+            self.assertEqual(self._health("claude")["primaire"]["state"], "healthy")
         finally:
             worker.watchdog_stop.set()
 

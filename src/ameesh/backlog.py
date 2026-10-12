@@ -342,7 +342,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     listing = st.operations.listing() if listing is None else listing
     from . import auditor as auditor_mod
     try:
-        canons = auditor_mod.load_all(cfg) if cfg is not None else []
+        canons = auditor_mod.load_all(cfg, strict=False) if cfg is not None else []
     except Exception:
         # Pas de prise quand le périmètre des rôles est illisible.
         return []
@@ -401,6 +401,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             if agent is None:
                 continue
             agent = dict(row, **agent)
+            if not auditor_mod.may_take(agent, canons):
+                continue
             auditors = auditor_mod.cards([agent], canons)
             for item in list(lots):
                 if not lot_fits(item, agent, auditor=row["name"] in auditors,
@@ -452,6 +454,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         if agent is None:
             continue
         agent = dict(row, **agent)
+        if not auditor_mod.may_take(agent, canons):
+            continue
         auditors = auditor_mod.cards([agent], canons)
         for item in list(queue):
             if not fits(item, agent, auditor=row["name"] in auditors,
