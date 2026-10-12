@@ -1,7 +1,7 @@
 ---
 type: Study
 title: "Study — autonomous host provisioning and safe agent placement"
-description: "L232 / work item #255: replace the manual VM moves with a durable placement and provisioning controller; reuse poste.sh and vm.sh; deliver API credentials privately; prepare per-host OAuth browser approvals; leave root authority, new spending and Nexlink production to the owner through ameesh decide. Four dated implementation lots."
+description: "L232 / work item #255: replace the manual VM moves with a durable placement and provisioning controller; reuse poste.sh and vm.sh; deliver API credentials privately; prepare per-host OAuth browser approvals; leave root authority, new spending and production of a managed project to the owner through ameesh decide. Four dated implementation lots."
 status: draft
 tags: [hosts, provisioning, placement, ssh, systemd, secrets, oauth, decisions]
 generated: { by: "ameesh-cx2/codex", at: "2026-10-12" }
@@ -29,7 +29,7 @@ The assignment reports the owner's request of 12 October: ameesh should
 prepare and perform the operational work itself. A human should approve an
 OAuth grant or a reserved decision, rather than receive terminal commands.
 This study treats that report as the scope of #255, not as a signed grant to
-perform root operations, spend money or change Nexlink production today.
+perform root operations, spend money or change production of a managed project today.
 There is no infrastructure change in this study.
 
 The baseline is `origin/main` at `b4ae4fd`, inspected on 12 October. The
@@ -48,7 +48,7 @@ from current host cards, repository state and measured capacity.
 | Main deployment plan | Choose the target commit, back up both databases, check/apply additive migrations, reapply SQL roles, edit account limits, restart outside turns, inspect health, arrange rollback | Release manifest, one migration authority per database, explicit configuration diff, health report, automatic bounded rollback |
 | btrfs reclaim | Run a root script for two mountpoints, install tmpfiles configuration, optionally balance the root filesystem | Separate root decision with the exact mount UUIDs, script digest, expected impact and undo; reclaim is not an implicit part of placement |
 
-The work root is not a reliable repository name: one `nexlink-*` directory
+The work root is not a reliable repository name: one `project-*` directory
 contained an ameesh clone. Read `git remote get-url origin`, the common Git
 directory, branch and HEAD on the source. Match the remote to the project's
 allowed repository identities. A directory label is never evidence.
@@ -184,13 +184,30 @@ Generalise these existing steps rather than add another installer:
 
 1. `poste.sh verifier` / `vm.sh verifier`: check actual service mode, user,
    paths, SSH host identity, disk headroom, schema and active turns.
-2. `poste.sh sauvegarder`: back up each database affected by this release,
-   once, record successful completion and the restore location privately.
-3. `poste.sh migrer REF`: elect one migration worker per database identity;
-   hold a database lock, run the dry-run then `--additive-only`. Destination
-   hosts use `vm.sh`'s migration-ready check; they do not migrate the shared
-   database independently. A non-additive migration requires its own plan
-   and decision before installation.
+2. Correct `poste.sh sauvegarder` and its server backup helper before reuse.
+   The workstation currently gives `pg_dump` the configured DSN in argv;
+   a DSN containing a password exposes it to process inspection. The server
+   helper also gives storage credentials to `curl --user`. Replace both
+   with private credential channels: a password-free libpq service reference
+   and a protected passfile for PostgreSQL; a protected curl configuration
+   file or inherited private descriptor for storage authentication. No
+   password-bearing DSN, credential argument or shell trace is permitted.
+   Validate the entire process tree, including subprocesses and failures.
+   Back up each affected database once and apply the backup rules below.
+3. Correct the `poste.sh` dispatcher: it currently invokes `migrer` without
+   forwarding REF, so checkout HEAD B migrates B even if release A was
+   approved. Forward the explicit argument (for example, `migrer "${2:?REF
+   required}"`), resolve the full approved commit once and use its snapshot
+   for the dry-run and execution. Reject a missing or mismatched REF in the
+   controller; no implicit HEAD is allowed. Enforce `--additive-only` on
+   every autonomous dry-run/execution path independently of installed state:
+   `migrer` currently drops this guard when its snapshot is already installed.
+   A non-additive migration always needs its own approved plan and separate
+   explicit path; `MIGRER_APRES` or an installed symlink cannot authorise it.
+   Elect one migration worker per database identity and hold a database lock.
+   Destination hosts use `vm.sh`'s migration-ready check; they do not migrate
+   the shared database independently. Record the approved commit, snapshot
+   identity, migration versions and guard mode in the operation journal.
 4. Reapply executor/supervisor roles where needed and explicitly validate
    grants introduced by new tables. No ad hoc superuser DSN is given to a
    runner.
@@ -209,6 +226,46 @@ Generalise these existing steps rather than add another installer:
    one completed turn. Roll back code, venv and unit/configuration snapshot
    when checks fail; additive schema changes remain. Account-policy edits
    are a separate recorded diff, not a hidden effect of updating code.
+
+## Backup completion, protection and recovery
+
+The current server trigger ends in `|| true`, so a failed backup or upload
+can be reported as success. Remove that suppression. A oneshot service's
+inactive state is not proof of failure or success: inspect the completed
+invocation's exit result, then verify its artifact. An absent optional storage
+configuration must be reported as local-only; if remote storage is required
+by the release policy, its absence or upload failure blocks migration.
+
+Create credential/config files with mode `0600` in `0700` directories owned
+by the authorised backup identity; unlink short-lived credential files on
+success, failure and cancellation. Set `umask 077` before creating dumps,
+restore logs or manifests. Backup directories are `0700`, local artifacts
+`0600`, and access is limited to the backup/restore identities. Databases can
+contain sensitive mail and state: dumps never enter a repository, ordinary
+agent attachments or shared temporary storage. Remote artifacts use private
+access controls and encryption, with the restore key held separately from
+the write-only upload credential. Error reports contain categories and
+artifact references only, not raw connection or storage configuration.
+
+A successful backup means a non-empty finalized artifact for every required
+database, an integrity digest, a readable archive catalogue and a successful
+restore into an isolated disposable database. Verify expected schemas,
+migration versions and representative row counts there; never restore over
+a live mesh as a test. Verify the remote copy can be retrieved using the
+separate restore identity and matches the local artifact before declaring
+remote protection successful. A write-only upload identity cannot prove
+restorability alone. Failed service result, archive inspection, retrieval or
+restore holds the deployment before migration; retain the previous version.
+
+The proposed pilot retention is 14 days for local and remote backups,
+matching the server helper's current local window. The last verified
+pre-release recovery set is pinned until the release is accepted and its
+rollback window has ended, even if it crosses that age. Apply expiry to
+both destinations and verification artifacts, preserve any explicit hold,
+and journal deletion by artifact id. Space budgeting includes pinned backups;
+insufficient space holds deployment rather than deleting its recovery set.
+No automatic retention change is enacted by this study. The owner approves
+the backup destinations/access/retention in the host operation policy.
 
 SSH uses pinned known-host keys, `BatchMode=yes`, deadlines and no agent
 forwarding. Initial host identity enrolment is an owner/admin decision;
@@ -326,7 +383,7 @@ by this study:
 | Initial root delegation, system user, SSH trust, network access | L232b generates a host-bound bootstrap script: exact user, root-owned helper, restricted controller key, directories and unit allowlist; digest, host key proof and undo script | Signed `decide ask` names that host and the bounded delegated operations | Existing authorised admin/controller runs the prepared script; absent root access is a reported prerequisite, never a request to invent credentials |
 | Btrfs reclaim or other root storage tuning | Existing `.vm-plan/btrfs-reclaim.sh`, reviewed mount UUIDs, script digest, `--no-balance` choice; undo removes its tmpfiles entry and resets reclaim; cancellation command for the optional balance | Separate signed choice between no change, dynamic reclaim only, or reclaim plus bounded balance | Approved root executor runs the exact script; placement never starts balance implicitly |
 | New spending, resize or paid API fallback | L232b prepares a provider-specific plan/apply/undo script only when requested; SKU, account, cost ceiling and scope must be known | Signed cost decision with a decline option; no purchase in this pilot | Controller applies once within the receipt's limit; unknown price or missing authority remains held |
-| Nexlink production configuration or deployment | Existing release/deploy entry point for that project, pinned artifact, environment, diff, backup, smoke checks and rollback; identify the real entry point before asking | Separate signed production decision naming environment and artifact | Production executor runs the prepared plan; host provisioning credentials do not imply production authority |
+| production of a managed project configuration or deployment | Existing release/deploy entry point for that project, pinned artifact, environment, diff, backup, smoke checks and rollback; identify the real entry point before asking | Separate signed production decision naming environment and artifact | Production executor runs the prepared plan; host provisioning credentials do not imply production authority |
 | New secret access or expanding its destinations | L232c's install/rotate operation, references only, exact hosts/accounts, storage permissions and revocation plan | Scoped signed decision or verification of an existing signed delegation | Private store-to-host delivery; no secret is requested in mail |
 | Provider login or enabling device login | L232d supervised remote adapter and private challenge page; for an admin setting, exact provider setting and account/workspace | `decide ask` directs the responsible human to the prepared browser view; policy changes require the proper administrator | Human clicks; adapter verifies completion and resumes the held provisioning step |
 
@@ -354,15 +411,20 @@ interaction even when the operation has a signed policy approval.
 
 These are engineering estimates, excluding time waiting for owner/browser
 consent, canon review or unavailable hosts. Suggested assignees remain for
-mesh-design to choose. Total implementation: **16 hours** after this 4-hour
+mesh-design to choose. Total implementation: **18 hours** after this 4-hour
 study. Dates below are Europe/Paris and depend on review of the study.
 
 | Lot | Estimate | Planned start → delivery | Scope and acceptance |
 | --- | --- | --- | --- |
 | #363 / L232a — placement and durable handoff | 6 h | 2026-10-13 → 2026-10-13 | Full/under-used host planning, reservations, hysteresis, lot-boundary fence, remote/commit verification, brief/fresh session before enable, crash journal and single lease; no dirty or unpublished work lost |
-| #364 / L232b — SSH release controller and delegated host helper | 5 h | 2026-10-13 → 2026-10-14 | Reuse poste/vm steps, pinned code/toolchain, root bootstrap script and decision, slices/drop-ins/guard, one migration per DB, independent controller, health and rollback, private on-disk staging |
+| #364 / L232b — SSH release controller and delegated host helper | 7 h | 2026-10-13 → 2026-10-14 | Reuse poste/vm steps, pinned code/toolchain, root bootstrap script and decision, slices/drop-ins/guard, one migration per DB pinned to REF with unconditional additive-only, private backup credentials, verified restore/retention, independent controller, health and rollback, private on-disk staging |
 | #365 / L232c — secret delivery and rotation | 2 h | 2026-10-14 → 2026-10-14 | Inventory the mesh store; private reference-based transfer, policy checks, root store to account-file/credential bridge, atomic rotation/revocation, no values in logs or Git |
 | #366 / L232d — OAuth approval adapters and pilot | 3 h | 2026-10-14 → 2026-10-14 | Private browser challenge and decide queue, pinned Claude/Codex/gh adapters, expiry/cancel/retry, exact clicks, end-to-end pilot and evidence |
+
+R1 review adds two hours to L232b (5 → 7 h) for the credential-channel,
+backup restore and release-pinning corrections. The four-lot split and
+13–14 October dates remain proposed; implementation lots stay unassigned
+until r2 approval.
 
 L232a can build with a fake prepared-host adapter while L232b is implemented.
 Real activation depends on B and C readiness and D login where applicable.
@@ -378,11 +440,17 @@ each journal step. Meaningful checks include two planners competing for one
 slot, stale readings/canon/lease, source turn racing a drain, a dirty worktree,
 unpushed commits, misleading directory names, missing dsh profile, paused
 agent, OAuth expiry, SSH host-key mismatch, changed approved artifact and
-migration concurrency. Inject a synthetic canary secret and assert it is
+migration concurrency. Deployment acceptance must also cover approved release
+A with checkout HEAD B (only A's migrations run), a non-additive migration
+with A already installed (still refused), and a failed server backup/upload
+(no migration starts). Inspect process argv and synthetic credential canaries
+for pg_dump, curl and their descendants; test unreadable/corrupt artifacts,
+failed isolated restores, remote retrieval, permissions and pinned retention.
+Inject a synthetic canary secret and assert it is
 absent from stdout, stderr, mail, journals, Git diff and retained artifacts.
 
 Run host integration on an already admitted test VM, with no new spend and
-no Nexlink production change. First use dry-run, then one completed-lot dsh
+no production of a managed project change. First use dry-run, then one completed-lot dsh
 move, then one Claude or Codex move with browser consent. Verify source unit
 disabled, target session prepared before enable, one live lease, exact
 checkout, real caps, healthy guard, private credential storage and a completed
