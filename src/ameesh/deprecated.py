@@ -25,10 +25,12 @@ class HiddenAliasParser(argparse.ArgumentParser):
     up in an error suggestion.
 
     A prefix that matches hidden aliases only keeps the old spelling usable
-    when it designates exactly one of them (``--pou`` -> ``--pour``). When it
-    designates several, argparse's ambiguity message would name them
-    (``--po could match --pour, --porteur``): the match is dropped instead, so
-    no hidden alias leaks into a suggestion.
+    when it designates exactly one destination (``--pou`` -> ``--pour``), even
+    when several hidden spellings lead there (``--livraison`` and ``--livrer``
+    both store ``livraison``). When it designates several destinations,
+    argparse's ambiguity message would name them (``--po could match --pour,
+    --porteur``): the match is dropped instead, so no hidden alias leaks into
+    a suggestion.
     """
 
     def _get_option_tuples(self, option_string):  # type: ignore[override]
@@ -36,7 +38,11 @@ class HiddenAliasParser(argparse.ArgumentParser):
         visible = [t for t in tuples if t[0].help is not argparse.SUPPRESS]
         if visible:
             return visible
-        return tuples if len(tuples) == 1 else []
+        # Hidden aliases only: the prefix resolves as soon as every match
+        # leads to the same destination, however many spellings lead there
+        # (two hidden aliases of one option, or one action with both).
+        destinations = {t[0].dest for t in tuples}
+        return tuples[:1] if len(destinations) == 1 else []
 
 
 def _append_unique(namespace, dest: str, value) -> None:

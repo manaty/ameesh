@@ -56,6 +56,46 @@ class DeprecatedAliasTest(unittest.TestCase):
         self.assertEqual(err, "--old is deprecated, use --new\n")
         self.assertNotIn("--old", parser.format_help())
 
+    def test_hidden_prefix_resolves_two_spellings_of_one_destination(self):
+        """P3 : deux alias cachés vers la même destination se résolvent."""
+        parser = HiddenAliasParser(prog="t")
+        parser.add_argument("--delivery", dest="livraison", default=None)
+        for alias in ("--livraison", "--livrer"):
+            parser.add_argument(alias, dest="livraison", action=DeprecatedAlias,
+                                canonical="--delivery", default=argparse.SUPPRESS,
+                                help=argparse.SUPPRESS)
+        for argv in (("--liv", "X"), ("--liv=X",)):
+            with self.subTest(argv=argv):
+                namespace, err = parse(parser, *argv)
+                self.assertEqual(namespace.livraison, "X")
+                self.assertIn("is deprecated, use --delivery", err)
+
+    def test_hidden_prefix_resolves_one_action_with_two_spellings(self):
+        """P3 : les deux graphies d'une même action se résolvent aussi."""
+        parser = HiddenAliasParser(prog="t")
+        parser.add_argument("--delivery", dest="livraison", default=None)
+        parser.add_argument("--livraison", "--livrer", dest="livraison",
+                            action=DeprecatedAlias, canonical="--delivery",
+                            default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+        for argv in (("--liv", "X"), ("--liv=X",)):
+            with self.subTest(argv=argv):
+                namespace, err = parse(parser, *argv)
+                self.assertEqual(namespace.livraison, "X")
+                self.assertIn("is deprecated, use --delivery", err)
+
+    def test_hidden_prefix_to_two_destinations_is_dropped(self):
+        """Deux destinations distinctes : aucune graphie cachée n'est résolue."""
+        parser = HiddenAliasParser(prog="t")
+        parser.add_argument("--due", dest="due", default=None)
+        parser.add_argument("--owner", dest="owner", default=None)
+        for alias, dest in (("--pour", "due"), ("--porteur", "owner")):
+            parser.add_argument(alias, dest=dest, action=DeprecatedAlias,
+                                canonical="--due" if dest == "due" else "--owner",
+                                default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as case:
+            parser.parse_args(["--po", "X"])
+        self.assertEqual(case.exception.code, 2)
+
     def test_append_collects_in_the_canonical_list(self):
         parser = argparse.ArgumentParser(prog="t")
         parser.add_argument("--new", dest="items", action="append", default=[])
