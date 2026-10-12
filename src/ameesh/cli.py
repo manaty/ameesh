@@ -1335,6 +1335,23 @@ def driver_warnings(driver: str, remote: bool) -> list[str]:
     ]
 
 
+def host_measures_line(cfg: Config, reading: dict | None = None) -> str:
+    """L64: the host measures this OS, or this host, cannot give, read on a
+    fresh reading (never the published one, which may come from before an
+    upgrade). Informative: the verdict does not change."""
+    from . import resources
+    try:
+        if reading is None:
+            reading = resources.sample(cfg.host, paths=[cfg.state_dir])
+        missing = resources.unmeasured(reading)
+    except Exception as exc:  # a reading never breaks the doctor
+        return "measures   : host not read (%s)" % (" ".join(str(exc).split())[:120],)
+    if not missing:
+        return "measures   : every host measure is read (%s)" % platform.SYSTEM
+    return "measures   : not given on this host (%s): %s" % (platform.SYSTEM,
+                                                             ", ".join(missing))
+
+
 def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
                harness: bool = False) -> int:
     if probe:
@@ -1403,6 +1420,7 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     unread = storage.of(db).mailbox.unread_total()
     print("agents     : %d" % agents)
     print("unread     : %d" % unread)
+    print(host_measures_line(cfg))
     # L106 : un agent mené sans unité d'exécuteur ne repart pas après une
     # coupure de l'hôte (signalé, sans changer le verdict)
     from . import hostcheck

@@ -866,6 +866,34 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
     return out
 
 
+#: L64: the measures a reading carries, and their names for a human. One
+#: missing from a reading (None) is a measure this OS, or this host, cannot
+#: give (PSI before Linux 4.20 or outside Linux, load on Windows, an
+#: unreadable guest cgroup…): `unmeasured` says it instead of publishing
+#: nothing without a word. A share that needs two readings (`app_cpu`) is
+#: not listed: its first reading is always None.
+MEASURES = (
+    ("mem_available_bytes", "available memory"),
+    ("swap_used_bytes", "swap"),
+    ("load1", "load"),
+    ("cpu_count", "CPU count"),
+    ("disk_free_bytes", "free disk"),
+    ("tmp_fstype", "type of /tmp (tmpfs ceiling)"),
+    ("psi_cpu_some", "CPU pressure (PSI)"),
+    ("psi_mem_some", "memory pressure (PSI)"),
+    ("psi_io_some", "I/O pressure (PSI)"),
+    ("guest_mem_bytes", "guest memory (cgroup)"),
+)
+
+
+def unmeasured(reading: dict | None) -> list[str]:
+    """The names of the `MEASURES` that `reading` does not carry (None), in
+    table order; [] without a reading."""
+    if not reading:
+        return []
+    return [label for key, label in MEASURES if reading.get(key) is None]
+
+
 def restart_record(record) -> dict | None:
     """L159e6: a `guard.restart` record ({ts, started, skipped}) checked and
     copied; None when ill-typed."""
