@@ -10,6 +10,10 @@ jalon, action liée, message lié (`agent_mailbox.work_item_id`). Un lot
 (`closed`, L29) sans activité depuis un seuil (défaut 6 h ; `--stale-after`,
 `AMEESH_STALE_AFTER`).
 
+L368: a future planned start or an explicit open commitment/plan dependency
+on another open lot defers stagnation; `planned_waits` resolves those sources
+for all three views, without interpreting notes or changing activity.
+
 **Attente** (`waiting`) : `{what, who, label}`, déduite de l'état, des jalons
 (L10, lus par `progress._jalons_de_lot`) et des actions, jamais inventée
 (`who` est None quand ameesh ne sait pas qui). Ordre :
@@ -282,7 +286,8 @@ def _grouped(st, ids: list[int]) -> tuple[dict, dict, dict, dict]:
 
 
 def describe(db, rows: list[dict], *, now: float | None = None,
-             threshold: float = DEFAULT_THRESHOLD_S) -> dict[int, dict]:
+             threshold: float = DEFAULT_THRESHOLD_S,
+             open_items: list[dict] | None = None) -> dict[int, dict]:
     """Pour chaque lot (lignes de `work_items`) : `{waiting, waiting_for,
     last_activity_ts, stale}`. Une lecture groupée, aucune requête par lot."""
     from . import progress  # import tardif : progress importe ce module
@@ -293,6 +298,8 @@ def describe(db, rows: list[dict], *, now: float | None = None,
     packages = {p["id"]: p for p in st.packages.all(include_absent=True)}
     states, externals = agent_availability(db)
     events, milestones, actions, messages = _grouped(st, ids)
+    from . import planned_waits
+    holds = planned_waits.read(db, rows, now=now, packages=packages, open_items=open_items)
     out: dict[int, dict] = {}
     for row in rows:
         rid = int(row["id"])
@@ -307,7 +314,9 @@ def describe(db, rows: list[dict], *, now: float | None = None,
                              messages.get(rid))
         out[rid] = {"waiting": detail, "waiting_for": legacy(detail),
                     "last_activity_ts": round(last, 3) if last is not None else None,
-                    "stale": stale(row.get("state") or "", last, now, threshold)}
+                    "planned_wait": holds.get(rid),
+                    "stale": None if rid in holds else
+                             stale(row.get("state") or "", last, now, threshold)}
     return out
 
 
@@ -323,15 +332,20 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
     st = storage.of(db)
     # L119 (0037) : un élément de la file d'amélioration qui attend son
     # preneur n'est pas stagnant, il est en file
-    rows = [r for r in st.operations.open_lots_activity(limit)
+    # Read all open lots before filtering: deferred lots must not occupy the
+    # render limit and hide an actionable stale lot or a dependency beyond it.
+    open_items = st.operations.open_lots_activity(None)
+    rows = [r for r in open_items
             if r.get("last_activity_ts") is not None
             and now - float(r["last_activity_ts"]) >= float(threshold_s)
             and not sous_utilisation.is_backlog_item(r)]
-    described = describe(db, rows, now=now, threshold=threshold_s)
+    described = describe(db, rows, now=now, threshold=threshold_s, open_items=open_items)
     out = []
     for row in rows:
         lot = int(row["id"])
         info = described[lot]
+        if info["stale"] is None:
+            continue
         out.append({
             "id": lot,
             "title": row.get("title"),
@@ -342,4 +356,4 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
             "waiting_for": info["waiting_for"],
             "waiting": info["waiting"],
         })
-    return out
+    return out[:max(0, int(limit))]

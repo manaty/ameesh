@@ -1,8 +1,10 @@
 <!doctype html>
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
-<!-- Vue de référence d'ameesh progress (L24, décision 0024 ; feuille de route L96) : page statique
-     autonome, sans ressource réseau. Les données (schéma ameesh-progress/1)
-     sont embarquées plus bas par `ameesh progress --html`. -->
+<!-- Vue de référence d'ameesh progress (L24, décision 0024 ; feuille de route L96 ;
+     onglets, fenêtres de détail et rafraîchissement L304) : page autonome, sans
+     ressource externe. Les données (schéma ameesh-progress/1) sont embarquées plus
+     bas par `ameesh progress --html` ; servie par `ameesh progress --serve`, le
+     bouton Refresh relit /api/progress.json (connect-src 'self' ajouté alors). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -41,7 +43,7 @@ body {
   font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   -webkit-text-size-adjust: 100%;
 }
-main { max-width: 980px; margin: 0 auto; padding: 16px; }
+main { max-width: 1200px; margin: 0 auto; padding: 0 16px 16px; }
 h1 { font-size: 1.25rem; margin: 0 0 2px; }
 h2 { font-size: 1rem; margin: 0 0 10px; letter-spacing: .02em; }
 .sub { color: var(--ink-2); font-size: .85rem; }
@@ -143,105 +145,193 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
 .rm-today { position: absolute; top: -3px; bottom: -3px; width: 0; border-left: 2px solid var(--critical); }
 .rm-detail { color: var(--ink-2); font-size: .76rem; margin-top: 2px; overflow-wrap: anywhere; }
 .rm-detail a { color: inherit; }
+.rm-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 4px 0 8px; font-size: .82rem; }
+.rm-controls .seg button { font: inherit; padding: 2px 10px; border: 1px solid var(--axis); background: var(--surface); color: var(--ink); cursor: pointer; }
+.rm-controls .seg button:first-child { border-radius: 4px 0 0 4px; }
+.rm-controls .seg button:last-child { border-radius: 0 4px 4px 0; border-left: 0; }
+.rm-controls .seg button[aria-pressed="true"] { background: var(--ink); color: var(--page); }
+.rm-scroll { overflow-x: auto; }
+.rm-gr { border-top: 1px solid var(--grid); }
+.rm-gr > summary { cursor: pointer; padding: 6px 0; list-style-position: inside; }
+.rm-gr > summary .rm-label { display: inline-flex; width: calc(100% - 2em); font-weight: 600; }
+.rm-gr > summary .meta { font-weight: 400; }
+.rm-gr .rm-row { padding-left: 14px; }
+/* zoom jour : libellés et détails restent visibles pendant le défilement */
+.rm-inner .rm-label, .rm-inner .rm-detail { position: sticky; left: 0; max-width: calc(100vw - 48px); }
 .st-late { color: var(--critical); } .st-proposed { color: var(--warning); border-style: dashed; }
 .st-done { color: var(--good); }
+/* L304 : en-tête, onglets, cartes de projet, tables, fenêtres de détail */
+header.top { position: sticky; top: 0; z-index: 5; background: var(--page); padding: 10px 0 0;
+  border-bottom: 1px solid var(--grid); }
+.top-row { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; justify-content: space-between; }
+.top-row h1 { margin: 0; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; color: var(--ink-2); font-size: .8rem; }
+.controls select, .controls button { font: inherit; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--axis); border-radius: 6px; padding: 3px 8px; }
+.controls button { cursor: pointer; }
+.controls button:disabled { color: var(--muted); cursor: not-allowed; }
+.tabs { display: flex; gap: 2px; overflow-x: auto; margin-top: 8px; scrollbar-width: thin; }
+.tab { font: inherit; font-size: .9rem; color: var(--ink-2); background: none; border: 0;
+  border-bottom: 2px solid transparent; padding: 6px 12px; cursor: pointer; white-space: nowrap; }
+.tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--phase-build); font-weight: 600; }
+.badge { display: inline-block; margin-left: 6px; min-width: 18px; padding: 0 5px; border-radius: 9px;
+  font-size: .72rem; text-align: center; background: var(--grid); color: var(--ink); }
+.badge.hot { background: var(--warning); color: #000; }
+section.panel { background: none; border: 0; padding: 0; margin-top: 14px; }
+.pcards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.pcard { background: var(--surface); border: 1px solid var(--grid); border-radius: 10px; padding: 12px; min-width: 0; }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin: 10px 0; }
+button.stat { display: flex; flex-direction: column; align-items: flex-start; text-align: left; font: inherit; color: inherit;
+  background: var(--page); border: 1px solid var(--grid); border-radius: 8px; padding: 6px 8px; cursor: pointer; min-width: 0; }
+.stat .v { font-size: 1.3rem; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.stat .l { color: var(--ink-2); font-size: .7rem; line-height: 1.2; }
+.stat.hot { border-color: var(--warning); }
+.stat.hot .v { color: var(--warning); }
+.ms { font-size: .85rem; margin-top: 2px; overflow-wrap: anywhere; }
+.pbar { position: relative; height: 8px; background: var(--grid); border-radius: 4px; margin: 4px 0 6px; overflow: hidden; }
+.pfill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--phase-merge); border-radius: 4px; }
+.watch, .boxed { background: var(--surface); border: 1px solid var(--grid); border-radius: 10px; padding: 12px; margin-top: 12px; }
+.line { padding: 3px 0; font-size: .86rem; overflow-wrap: anywhere; }
+button.link { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer;
+  text-align: left; text-decoration: underline; text-decoration-color: var(--axis); text-underline-offset: 2px; }
+button.link:hover { text-decoration-color: currentColor; }
+.tbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 6px; }
+.tbar input.filter { flex: 1 1 200px; max-width: 360px; font: inherit; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--axis); border-radius: 6px; padding: 4px 8px; }
+table.data { margin-top: 0; background: var(--surface); }
+button.sort { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+th[aria-sort="ascending"] button.sort::after { content: " ▲"; }
+th[aria-sort="descending"] button.sort::after { content: " ▼"; }
+tr.row { cursor: pointer; }
+tr.row:hover, tr.row:focus { background: var(--grid); outline: none; }
+td.wide { max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+dialog#modal { width: min(720px, 94vw); max-height: 88vh; overflow: auto; padding: 0; color: var(--ink);
+  background: var(--surface); border: 1px solid var(--axis); border-radius: 12px; }
+dialog#modal::backdrop { background: rgba(0, 0, 0, .45); }
+.modal-head { position: sticky; top: 0; display: flex; justify-content: space-between; gap: 10px; align-items: baseline;
+  padding: 12px 16px; background: var(--surface); border-bottom: 1px solid var(--grid); }
+.modal-head h2 { margin: 0; overflow-wrap: anywhere; }
+.modal-head button { font: inherit; color: var(--ink-2); background: none; border: 1px solid var(--grid);
+  border-radius: 6px; padding: 1px 8px; cursor: pointer; }
+#modal-body { padding: 8px 16px 16px; }
+#modal-body h3 { font-size: .85rem; color: var(--ink-2); margin: 14px 0 4px; letter-spacing: .02em; }
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 0; font-size: .85rem; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; overflow-wrap: anywhere; }
+code.cmd { display: inline-block; font-size: .8rem; background: var(--page); border: 1px solid var(--grid);
+  border-radius: 6px; padding: 2px 6px; overflow-wrap: anywhere; }
+p.question { font-size: .95rem; margin: 8px 0; overflow-wrap: anywhere; }
+ul.options { margin: 0 0 8px; padding-left: 20px; font-size: .86rem; }
+details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
+.warn { color: var(--warning); }
+#refresh-status.warn { font-size: .8rem; }
+@media (max-width: 520px) { .stats { grid-template-columns: repeat(2, 1fr); } main { padding: 0 10px 10px; } }
 </style>
 </head>
 <body>
 <main>
-  <h1 id="title">Progress</h1>
-  <div class="sub" id="when"></div>
-
-  <section aria-labelledby="h-projects" id="projects-section">
-    <h2 id="h-projects">Projects</h2>
-    <div id="projects"></div>
-  </section>
-
-  <section aria-labelledby="h-roadmap" id="roadmap-section">
-    <div class="rm-head">
-      <h2 id="h-roadmap">Roadmap</h2>
-      <button type="button" class="rm-toggle" id="roadmap-toggle" aria-expanded="true">hide</button>
-    </div>
-    <div id="roadmap-body">
-      <div class="legend" aria-hidden="true">
-        <span><i style="border:1px dashed var(--phase-build);height:10px"></i>planned</span>
-        <span><i style="background:var(--phase-build)"></i>actual, in progress</span>
-        <span><i style="background:var(--phase-merge)"></i>actual, delivered</span>
-        <span><i style="background:var(--critical)"></i>past the planned date</span>
-        <span><i style="background:var(--ink);width:9px;height:9px;transform:rotate(45deg)"></i>planned delivery</span>
-        <span><i style="border:2px solid var(--warning);width:9px;height:9px;transform:rotate(45deg)"></i>commitment due date</span>
-        <span><i style="background:var(--warning);width:9px;height:9px;border-radius:50%"></i>pending decision</span>
-        <span><i style="background:var(--critical);width:2px;height:12px"></i>today</span>
+  <header class="top">
+    <div class="top-row">
+      <h1 id="title">Progress</h1>
+      <div class="controls">
+        <label>project <select id="project" aria-label="project"></select></label>
+        <button type="button" id="refresh">Refresh</button>
+        <label><input type="checkbox" id="auto-refresh"> every 60 s</label>
+        <button type="button" id="theme">theme: auto</button>
       </div>
-      <div class="axis" id="rm-axis" aria-hidden="true"></div>
-      <div id="roadmap"></div>
     </div>
-  </section>
+    <div class="sub"><span id="asof"></span> <span id="refresh-status" role="status"></span></div>
+    <nav class="tabs" id="tabs" role="tablist" aria-label="views"></nav>
+  </header>
 
-  <section aria-labelledby="h-lots">
-    <h2 id="h-lots">Work items</h2>
-    <div class="legend" aria-hidden="true">
-      <span><i style="background:var(--phase-build)"></i>request → freeze</span>
-      <span><i style="background:var(--phase-review)"></i>freeze → verdict (review)</span>
-      <span><i style="background:var(--phase-merge)"></i>verdict → merge</span>
-      <span><i style="background:var(--ink);width:2px;height:12px"></i>milestone</span>
-    </div>
-    <div class="axis" id="axis" aria-hidden="true"></div>
-    <div id="lots"></div>
-  </section>
-
-  <section aria-labelledby="h-epics">
-    <h2 id="h-epics">Epics</h2>
-    <div id="epics"></div>
-  </section>
-
-  <section aria-labelledby="h-agents">
-    <h2 id="h-agents">Agents</h2>
-    <div class="cards" id="agents"></div>
-  </section>
-
-  <section aria-labelledby="h-ms">
-    <h2 id="h-ms">Project milestones</h2>
-    <div id="milestones"></div>
-  </section>
-
-  <section aria-labelledby="h-budget">
-    <h2 id="h-budget">Budget</h2>
-    <div class="tiles" id="spend"></div>
-    <div id="real"></div>
-    <div id="accounts"></div>
-    <div id="plans"></div>
-    <div class="table-wrap" id="byagent"></div>
-  </section>
-
-  <section aria-labelledby="h-missing">
-    <h2 id="h-missing">Missing data</h2>
-    <ul class="missing" id="missing"></ul>
-  </section>
+  <section class="panel" id="panel-overview" role="tabpanel" aria-labelledby="tab-overview"></section>
+  <section class="panel" id="panel-gantt" role="tabpanel" aria-labelledby="tab-gantt" hidden></section>
+  <section class="panel" id="panel-lots" role="tabpanel" aria-labelledby="tab-lots" hidden></section>
+  <section class="panel" id="panel-agents" role="tabpanel" aria-labelledby="tab-agents" hidden></section>
+  <section class="panel" id="panel-budget" role="tabpanel" aria-labelledby="tab-budget" hidden></section>
+  <section class="panel" id="panel-decisions" role="tabpanel" aria-labelledby="tab-decisions" hidden></section>
 
   <footer id="foot"></footer>
 </main>
+
+<dialog id="modal" aria-labelledby="modal-title">
+  <div class="modal-head">
+    <h2 id="modal-title"></h2>
+    <button type="button" id="modal-close" aria-label="close">close ✕</button>
+  </div>
+  <div id="modal-body"></div>
+</dialog>
 
 <script type="application/json" id="data">/*__AMEESH_PROGRESS_DATA__*/null</script>
 <script>
 "use strict";
 (function () {
+  // L304 : "served" sous `ameesh progress --serve` : la page arrive sans
+  // données et lit /api/progress.json avec le jeton (en-tête Authorization),
+  // au chargement puis à chaque Refresh ; "static" pour un fichier --html
+  // (données embarquées, rien à relire)
+  var MODE = /*__AMEESH_PROGRESS_MODE__*/"static";
+  var API = "/api/progress.json", TOKEN_KEY = "ameesh-progress-token", TOKEN = "";
   var D = JSON.parse(document.getElementById("data").textContent || "null");
-  if (!D || D.schema !== "ameesh-progress/1") {
-    document.getElementById("when").textContent = "missing data or unknown schema";
-    return;
-  }
+  var TABS = [["overview", "Overview"], ["gantt", "Gantt"], ["lots", "Work items"],
+              ["agents", "Agents"], ["budget", "Budget"], ["decisions", "Decisions"]];
   var LOT_FR = {active: "active", review: "in review", blocked: "blocked", approved: "approved", merged: "merged", closed: "closed"};
   var LOT_ICON = {active: "▶", review: "◐", blocked: "■", approved: "✓", merged: "●", closed: "✕"};
+  var LOT_ORDER = {blocked: 0, review: 1, approved: 2, active: 3, merged: 4, closed: 5};
   var AG_FR = {working: "working", idle: "idle", paused: "paused", stopped: "stopped"};
   var AG_ICON = {working: "▶", idle: "○", paused: "‖", stopped: "■"};
+  var AG_ORDER = {working: 0, paused: 1, idle: 2, stopped: 3};
+  var PAY_FR = {plan: "plan", token: "token"};
 
+  // -- état de la vue : onglet, projet et rafraîchissement auto dans l'URL
+  //    (#tab=lots&p=demo&auto=1) ; filtres et tris en mémoire ; thème retenu
+  var S = {tab: "overview", p: "", auto: false};
+  var VIEW = {lots: {q: "", all: false, sort: null}, agents: {q: "", all: false, sort: null},
+              decisions: {q: "", sort: null}};
+  // Gantt : zoom (dans l'URL, z=day), jalon choisi, tâches terminées, groupes ouverts
+  var G = {zoom: "week", ms: "", done: false, open: {}};
+  var KNOWN = [];          // projets vus (le sélecteur garde « tous » et les autres)
+  var modalAt = null;      // fenêtre ouverte, rouverte après un rafraîchissement
+  (function () {
+    var h = location.hash.replace(/^#/, "");
+    h.split("&").forEach(function (kv) {
+      var i = kv.indexOf("="), k = i < 0 ? kv : kv.slice(0, i), v = i < 0 ? "" : decodeURIComponent(kv.slice(i + 1));
+      if (k === "tab" && TABS.some(function (t) { return t[0] === v; })) S.tab = v;
+      else if (k === "p") S.p = v;
+      else if (k === "z" && v === "day") G.zoom = "day";
+      else if (k === "auto" || k === "auto=1") S.auto = MODE === "served";
+      else if (k === "t" && MODE === "served") TOKEN = v;
+    });
+    // le jeton quitte l'URL (historique, copie de lien) pour le sessionStorage,
+    // propre à l'origine, donc au port : un autre serveur local ne le lit pas
+    try {
+      if (TOKEN) window.sessionStorage.setItem(TOKEN_KEY, TOKEN);
+      else if (MODE === "served") TOKEN = window.sessionStorage.getItem(TOKEN_KEY) || "";
+    } catch (e) { /* sans stockage : le jeton reste le temps de la page */ }
+  })();
+  function saveHash() {
+    var parts = ["tab=" + S.tab];
+    if (S.p) parts.push("p=" + encodeURIComponent(S.p));
+    if (S.auto) parts.push("auto=1");
+    if (G.zoom === "day") parts.push("z=day");
+    try { history.replaceState(null, "", "#" + parts.join("&")); } catch (e) { location.hash = parts.join("&"); }
+  }
+  function stored(k, v) {
+    try {
+      if (v === undefined) return window.localStorage.getItem(k);
+      window.localStorage.setItem(k, v);
+    } catch (e) { /* sans stockage */ }
+    return null;
+  }
+
+  // -- utilitaires (tout texte passe par textContent : jamais de HTML) -------
   function el(tag, cls, text) {
     var e = document.createElement(tag);
     if (cls) e.className = cls;
     if (text !== undefined && text !== null) e.textContent = String(text);
     return e;
   }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); return node; }
   function pad(n) { return (n < 10 ? "0" : "") + n; }
   function hm(ts) {
     if (!ts) return "—";
@@ -257,222 +347,598 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
     if (s < 86400) { var mn = Math.floor((s % 3600) / 60); return Math.floor(s / 3600) + " h" + (mn ? " " + pad(mn) : ""); }
     return Math.floor(s / 86400) + " d " + Math.floor((s % 86400) / 3600) + " h";
   }
+  function ago(ts) { return ts ? dur(D.generated_ts - ts) + " ago" : "—"; }
   function usd(v) { return "$" + (v || 0).toFixed(2); }
   function chip(state, fr, icon) { return el("span", "chip st-" + state, (icon[state] || "") + " " + (fr[state] || state)); }
-
-  var from = D.window.from_ts, to = D.window.to_ts, span = Math.max(1, to - from);
-  function pct(ts) { return Math.min(100, Math.max(0, (ts - from) / span * 100)); }
-
-  document.getElementById("title").textContent = "Progress" + (D.project ? " — " + D.project : "");
-  document.getElementById("when").textContent =
-    "snapshot " + hm(D.generated_ts) + " · window " + dur(span) + (D.host ? " · host " + D.host : "");
-  document.getElementById("foot").textContent =
-    D.schema + " · generated " + D.generated_at + " · static page, no network resource";
-
-  // Axe : repères à l'heure locale ronde (ou au jour au-delà de 48 h), assez
-  // espacés pour la largeur réelle (téléphone compris) ; une étiquette porte
-  // l'heure, et la date seulement à minuit ou pour un pas d'un jour et plus.
-  var axis = document.getElementById("axis");
-  var maxLabels = Math.max(2, Math.floor((axis.clientWidth || 320) / 64));
-  var steps = [3600, 2 * 3600, 3 * 3600, 6 * 3600, 12 * 3600, 86400, 2 * 86400, 7 * 86400];
-  var step = steps[steps.length - 1];
-  for (var i = 0; i < steps.length; i++) { if (span / steps[i] <= maxLabels) { step = steps[i]; break; } }
-  var ticks = [], c = new Date(from * 1000);
-  c.setMinutes(0, 0, 0);
-  if (step >= 86400) c.setHours(0);
-  while (c.getTime() / 1000 <= to) {
-    var ts = c.getTime() / 1000;
-    var aligned = step >= 86400 ? true : (c.getHours() * 3600) % step === 0;
-    if (ts >= from && aligned) ticks.push(ts);
-    c.setHours(c.getHours() + (step >= 86400 ? 24 * Math.round(step / 86400) : 1));
+  function lotChip(lot) {
+    if (lot.closed) return el("span", "chip st-closed", lot.closed.reason === "abandoned"
+      ? "✕ abandoned" : "✕ superseded by #" + lot.closed.superseded_by);
+    return chip(lot.state, LOT_FR, LOT_ICON);
   }
-  ticks.forEach(function (ts) {
-    var d = new Date(ts * 1000);
-    var txt = (step >= 86400 || (d.getHours() === 0 && d.getMinutes() === 0))
-      ? pad(d.getDate()) + "/" + pad(d.getMonth() + 1) : pad(d.getHours()) + ":00";
-    var s = el("span", null, txt); s.style.left = pct(ts) + "%"; axis.appendChild(s);
-  });
-  function addTicks(track) {
-    ticks.forEach(function (ts) { var g = el("div", "tick"); g.style.left = pct(ts) + "%"; track.appendChild(g); });
+  function link(text, fn) {
+    var a = el("button", "link", text);
+    a.type = "button";
+    a.addEventListener("click", function (ev) { ev.stopPropagation(); fn(); });
+    return a;
   }
-
-  // Lots
-  var lotsBox = document.getElementById("lots");
-  var cutLabels = {lots: "work items", actions: "actions"};
-  Object.keys(D.truncated || {}).forEach(function (k) {
-    var c = D.truncated[k];
-    lotsBox.appendChild(el("p", "trunc", "⚠ Truncated: " + c.shown + " " + (cutLabels[k] || k)
-      + " shown out of " + c.total + " (limit " + c.limit + ")."));
-  });
-  if (!D.lots.length) lotsBox.appendChild(el("p", "empty", "No work item in the window."));
-  D.lots.forEach(function (lot) {
-    var m = lot.milestones, row = el("div", "lot");
-    var head = el("button", "lot-head");
-    head.type = "button";
-    head.setAttribute("aria-expanded", "false");
-    head.appendChild(el("span", "lot-id", "#" + lot.id));
-    head.appendChild(el("span", "lot-title", lot.title + (lot.epic ? " [" + lot.epic + "]" : "")));
-    if (lot.stale) head.appendChild(el("span", "chip st-stale", "‖ stalled " + dur(lot.stale.idle_s)));
-    if (lot.closed) head.appendChild(el("span", "chip st-closed", lot.closed.reason === "abandoned"
-      ? "✕ abandoned" : "✕ superseded by #" + lot.closed.superseded_by));
-    else head.appendChild(chip(lot.state, LOT_FR, LOT_ICON));
-    head.addEventListener("click", function () {
-      row.classList.toggle("open");
-      head.setAttribute("aria-expanded", row.classList.contains("open") ? "true" : "false");
+  function dl(pairs) {
+    var box = el("dl", "kv");
+    pairs.forEach(function (p) {
+      var v = p[1];
+      if (v === null || v === undefined || v === "") return;
+      box.appendChild(el("dt", null, p[0]));
+      var dd = el("dd");
+      if (typeof v === "object" && v.nodeType) dd.appendChild(v); else dd.textContent = String(v);
+      box.appendChild(dd);
     });
-    row.appendChild(head);
-    if (lot.waiting_for) row.appendChild(el("div", "waiting", "waiting for: " + lot.waiting_for.label));
+    return box;
+  }
+  function bar(frac, label) {
+    var b = el("div", "pbar"), f = el("div", "pfill");
+    f.style.width = Math.round(Math.max(0, Math.min(1, frac || 0)) * 100) + "%";
+    b.appendChild(f);
+    b.setAttribute("role", "img");
+    if (label) b.setAttribute("aria-label", label);
+    return b;
+  }
 
-    var track = el("div", "track");
-    addTicks(track);
-    track.setAttribute("role", "img");
-    // un lot stagnant n'est pas dessiné actif jusqu'à maintenant : sa barre
-    // s'arrête à sa dernière activité, puis un pointillé neutre ; un lot fermé
-    // s'arrête à sa fermeture
-    var end = m.merged || (lot.closed && lot.closed.at_ts) || (lot.stale && lot.stale.since_ts) || to;
-    // demande → gel → verdict → fusion ; après un verdict bloquant, le lot
-    // repart en construction jusqu'à la fin de la barre.
+  // -- périmètre : le projet choisi. Servie, la base filtre déjà (budget et
+  //    feuille de route compris) ; statique, la page filtre ce qu'elle peut
+  function inScope(project) { return !S.p || project === S.p; }
+  function scoped() {
+    return {
+      overview: (D.overview || []).filter(function (c) { return inScope(c.project); }),
+      projects: (D.projects || []).filter(function (p) { return inScope(p.name); }),
+      lots: (D.lots || []).filter(function (l) { return inScope(l.project); }),
+      agents: (D.agents || []).filter(function (a) { return inScope(a.project); }),
+      decisions: (D.decisions || []).filter(function (d) { return inScope(d.project); })
+    };
+  }
+  function partialScope() { return S.p && MODE !== "served" && D.project !== S.p; }
+  function learnProjects() {
+    // sans prototype : un projet « __proto__ » ou « constructor » reste dans le sélecteur
+    var seen = Object.create(null);
+    KNOWN.concat((D.overview || []).map(function (c) { return c.project; }))
+      .concat((D.lots || []).map(function (l) { return l.project; }))
+      .concat(D.project ? [D.project] : []).concat(S.p ? [S.p] : [])
+      .forEach(function (n) { if (n) seen[n] = true; });
+    KNOWN = Object.keys(seen).sort();
+  }
+  function lotById(id) { return (D.lots || []).filter(function (l) { return l.id === id; })[0] || null; }
+  function agentView(name) {
+    var a = (D.agents || []).filter(function (x) { return x.name === name; })[0] || null;
+    var p = null;
+    (D.projects || []).forEach(function (pr) {
+      (pr.agents || []).forEach(function (x) { if (x.name === name) p = x; });
+    });
+    if (!a && !p) return null;
+    var out = {};
+    [p || {}, a || {}].forEach(function (src) { Object.keys(src).forEach(function (k) { out[k] = src[k]; }); });
+    // les champs de la vue des projets (lot en cours, dernière avancée, 24 h) priment
+    if (p) ["lot", "last_update", "usd_24h", "turns_24h", "payment", "reason", "on_task_since_ts", "open_lots", "task", "project"]
+      .forEach(function (k) { if (p[k] !== undefined) out[k] = p[k]; });
+    return out;
+  }
+
+  // -- en-tête : titre, projet, onglets, rafraîchissement, thème ------------
+  var tabsBox = document.getElementById("tabs"), select = document.getElementById("project");
+  var btn = document.getElementById("refresh"), autoBox = document.getElementById("auto-refresh");
+  var asof = document.getElementById("asof"), status = document.getElementById("refresh-status");
+  var panels = {};
+  TABS.forEach(function (t) {
+    var b = el("button", "tab", t[1]);
+    b.type = "button"; b.id = "tab-" + t[0];
+    b.setAttribute("role", "tab"); b.setAttribute("aria-controls", "panel-" + t[0]);
+    b.addEventListener("click", function () { S.tab = t[0]; saveHash(); renderAll(); });
+    tabsBox.appendChild(b);
+    panels[t[0]] = document.getElementById("panel-" + t[0]);
+  });
+  select.addEventListener("change", function () {
+    S.p = select.value; saveHash();
+    if (MODE === "served") refresh(); else renderAll();
+  });
+
+  var THEMES = ["auto", "light", "dark"], THEME_FR = {auto: "theme: auto", light: "theme: light", dark: "theme: dark"};
+  var themeBtn = document.getElementById("theme");
+  function applyTheme(t) {
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+    else document.documentElement.removeAttribute("data-theme");
+    themeBtn.textContent = THEME_FR[t] || THEME_FR.auto;
+  }
+  var theme = stored("ameesh-progress-theme") || "auto";
+  applyTheme(theme);
+  themeBtn.addEventListener("click", function () {
+    theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+    stored("ameesh-progress-theme", theme); applyTheme(theme);
+  });
+
+  if (MODE === "served") {
+    autoBox.checked = S.auto;
+    btn.addEventListener("click", refresh);
+    autoBox.addEventListener("change", function () { S.auto = autoBox.checked; saveHash(); });
+    setInterval(function () { if (S.auto && !document.hidden) refresh(); }, 60000);
+  } else {
+    btn.disabled = true; autoBox.disabled = true;
+    btn.title = "open with ameesh progress --serve to refresh";
+  }
+
+  // Une requête à la fois, étiquetée (projet + compteur) : un changement de
+  // projet pendant un chargement est gardé en file et relancé à la fin, et
+  // une réponse qui ne correspond plus à la sélection courante est jetée.
+  var busy = false, queued = false, seq = 0;
+  function refresh() {
+    if (MODE !== "served") return;
+    if (busy) { queued = true; return; }
+    busy = true; queued = false; btn.disabled = true; status.textContent = "loading…"; status.className = "";
+    var tag = {p: S.p || "", n: ++seq};
+    function current() { return tag.n === seq && tag.p === (S.p || ""); }
+    fetch(API + "?project=" + encodeURIComponent(tag.p),
+          {credentials: "omit", cache: "no-store",
+           headers: {"Accept": "application/json", "Authorization": "Bearer " + TOKEN}})
+      .then(function (r) {
+        if (r.status === 401) throw new Error("token refused: open the URL printed at start (a restart draws a new one)");
+        if (!r.ok) return r.text().then(function (t) { throw new Error("HTTP " + r.status + ": " + t.trim()); });
+        return r.json();
+      })
+      .then(function (d) {
+        if (!current()) return;
+        if (!d || d.schema !== "ameesh-progress/1") throw new Error("unknown schema");
+        D = d; status.textContent = ""; renderAll();
+      })
+      .then(null, function (e) {
+        if (!current()) return;
+        status.textContent = D ? "refresh failed: " + e.message + " (previous data kept)" : e.message;
+        status.className = "warn";
+      })
+      .then(function () {
+        busy = false; btn.disabled = false;
+        if (queued || !current()) refresh();
+      });
+  }
+
+  function renderHeader() {
+    document.getElementById("title").textContent = "Progress" + (S.p ? " — " + S.p : "");
+    var g = new Date(D.generated_ts * 1000);
+    asof.textContent = "data as of " + pad(g.getHours()) + ":" + pad(g.getMinutes())
+      + (MODE === "served" ? "" : " · open with --serve to refresh")
+      + (D.host ? " · host " + D.host : "");
+    clear(select);
+    var all = el("option", null, "all projects"); all.value = ""; select.appendChild(all);
+    KNOWN.forEach(function (n) { var o = el("option", null, n); o.value = n; select.appendChild(o); });
+    select.value = S.p;
+    var sc = scoped();
+    var badges = {decisions: sc.decisions.length,
+                  lots: sc.lots.filter(function (l) { return !l.closed && l.state !== "merged"; }).length};
+    TABS.forEach(function (t) {
+      var b = document.getElementById("tab-" + t[0]), on = t[0] === S.tab;
+      b.setAttribute("aria-selected", on ? "true" : "false");
+      b.tabIndex = on ? 0 : -1;
+      b.textContent = t[1];
+      if (badges[t[0]]) b.appendChild(el("span", "badge" + (t[0] === "decisions" ? " hot" : ""), badges[t[0]]));
+      panels[t[0]].hidden = !on;
+    });
+    document.getElementById("foot").textContent = D.schema + " · generated " + D.generated_at
+      + (MODE === "served" ? " · served locally, read-only" : " · static page, no network resource");
+  }
+
+  // -- tables : filtre texte, tri au clic sur l'en-tête, ligne → fenêtre -----
+  function table(box, cfg) {
+    var st = VIEW[cfg.view];
+    var tools = el("div", "tbar"), q = el("input", "filter");
+    q.type = "search"; q.placeholder = "filter…"; q.value = st.q;
+    q.setAttribute("aria-label", "filter " + cfg.label);
+    tools.appendChild(q);
+    var allBox = null;
+    if (cfg.allLabel) {
+      var lab = el("label", "meta"); allBox = el("input"); allBox.type = "checkbox"; allBox.checked = st.all;
+      lab.appendChild(allBox); lab.appendChild(document.createTextNode(" " + cfg.allLabel));
+      tools.appendChild(lab);
+    }
+    var count = el("span", "meta");
+    tools.appendChild(count);
+    box.appendChild(tools);
+    var wrap = el("div", "table-wrap"), tb = el("table", "data"), thead = el("thead"), tr = el("tr"), body = el("tbody");
+    cfg.cols.forEach(function (c, i) {
+      var th = el("th", c.n ? "n" : null), b = el("button", "sort", c.label);
+      b.type = "button";
+      b.addEventListener("click", function () {
+        st.sort = st.sort && st.sort.i === i ? {i: i, dir: -st.sort.dir} : {i: i, dir: c.desc ? -1 : 1};
+        draw();
+      });
+      th.appendChild(b); tr.appendChild(th);
+    });
+    thead.appendChild(tr); tb.appendChild(thead); tb.appendChild(body); wrap.appendChild(tb); box.appendChild(wrap);
+    var empty = el("p", "empty"); box.appendChild(empty);
+    function draw() {
+      var needle = st.q.toLowerCase();
+      var rows = cfg.rows.filter(function (r) {
+        if (cfg.hidden && !st.all && cfg.hidden(r)) return false;
+        return !needle || cfg.text(r).toLowerCase().indexOf(needle) >= 0;
+      });
+      var s = st.sort;
+      rows.sort(function (a, b) {
+        if (s) {
+          var c = cfg.cols[s.i], x = c.key(a), y = c.key(b);
+          if (x === null || x === undefined) x = c.desc ? -Infinity : Infinity;
+          if (y === null || y === undefined) y = c.desc ? -Infinity : Infinity;
+          if (x < y) return -s.dir; if (x > y) return s.dir;
+        }
+        return cfg.order(a, b);
+      });
+      clear(body);
+      rows.forEach(function (r) {
+        var row = el("tr", "row");
+        row.tabIndex = 0;
+        cfg.cols.forEach(function (c) {
+          var td = el("td", c.n ? "n" : c.cls || null), v = c.cell(r);
+          if (v && v.nodeType) td.appendChild(v); else td.textContent = v === null || v === undefined ? "—" : String(v);
+          row.appendChild(td);
+        });
+        row.addEventListener("click", function () { cfg.open(r); });
+        row.addEventListener("keydown", function (ev) { if (ev.key === "Enter") cfg.open(r); });
+        body.appendChild(row);
+      });
+      var hidden = cfg.rows.length - rows.length;
+      count.textContent = rows.length + " shown" + (hidden ? " · " + hidden + " hidden" : "");
+      empty.textContent = rows.length ? "" : cfg.empty;
+      Array.prototype.forEach.call(thead.querySelectorAll("th"), function (th, i) {
+        th.setAttribute("aria-sort", s && s.i === i ? (s.dir > 0 ? "ascending" : "descending") : "none");
+      });
+    }
+    q.addEventListener("input", function () { st.q = q.value; draw(); });
+    if (allBox) allBox.addEventListener("change", function () { st.all = allBox.checked; draw(); });
+    draw();
+  }
+
+  // -- fenêtres de détail (lot, agent, jalon, décision) --------------------
+  var dialog = document.getElementById("modal"), mTitle = document.getElementById("modal-title");
+  var mBody = document.getElementById("modal-body");
+  document.getElementById("modal-close").addEventListener("click", closeModal);
+  dialog.addEventListener("click", function (ev) { if (ev.target === dialog) closeModal(); });
+  dialog.addEventListener("close", function () { modalAt = null; });
+  function closeModal() { modalAt = null; if (dialog.open) { if (dialog.close) dialog.close(); else dialog.removeAttribute("open"); } }
+  function openModal(kind, id) {
+    var build = MODALS[kind];
+    clear(mBody);
+    var title = build(id, mBody);
+    if (title === null) { closeModal(); return; }
+    mTitle.textContent = title;
+    modalAt = {kind: kind, id: id};
+    if (!dialog.open) {
+      if (dialog.showModal) dialog.showModal(); else dialog.setAttribute("open", "");
+    }
+  }
+  function section(box, title) { box.appendChild(el("h3", null, title)); }
+  function lotLine(box, lot) {
+    var line = el("div", "line");
+    line.appendChild(link("#" + lot.id + " " + lot.title, function () { openModal("lot", lot.id); }));
+    line.appendChild(document.createTextNode(" "));
+    line.appendChild(lotChip(lot));
+    if (lot.waiting_for) line.appendChild(el("span", "meta", " waiting for: " + lot.waiting_for.label));
+    box.appendChild(line);
+  }
+  function lotTrack(lot) {
+    var m = lot.milestones || {}, from = D.window.from_ts, to = D.window.to_ts;
+    var start = Math.min(from, m.requested || from), span = Math.max(1, to - start);
+    function pct(ts) { return Math.min(100, Math.max(0, (ts - start) / span * 100)); }
+    var track = el("div", "track"), end = m.merged || (lot.closed && lot.closed.at_ts) || (lot.stale && lot.stale.since_ts) || to;
     var bounds = [
       ["phase-build", m.requested, m.frozen || m.verdict || end],
       ["phase-review", m.frozen, m.verdict || end],
       [lot.verdict === "blocked" ? "phase-build" : "phase-merge", m.verdict, end]
-    ].filter(function (b) { return b[1] && b[2] && b[2] >= b[1] && b[2] > from; });
-    bounds.forEach(function (b, i) {
+    ].filter(function (b) { return b[1] && b[2] && b[2] >= b[1]; });
+    bounds.forEach(function (b) {
       var a = pct(b[1]), z = pct(b[2]);
       if (z - a <= 0) return;
-      var seg = el("div", "seg" + (i === 0 ? " first" : "") + (i === bounds.length - 1 ? " last" : "")
-                         + (!m.merged && !lot.closed && !lot.stale && i === bounds.length - 1 ? " open" : ""));
-      seg.style.left = a + "%"; seg.style.width = (z - a) + "%";
-      seg.style.background = "var(--" + b[0] + ")";
-      track.appendChild(seg);
+      var seg = el("div", "seg"); seg.style.left = a + "%"; seg.style.width = (z - a) + "%";
+      seg.style.background = "var(--" + b[0] + ")"; track.appendChild(seg);
     });
-    if (lot.stale && lot.stale.since_ts < to) {
-      var sa = pct(Math.max(from, lot.stale.since_ts)), sz = pct(to);
-      if (sz > sa) { var ss = el("div", "seg stale"); ss.style.left = sa + "%"; ss.style.width = (sz - sa) + "%"; track.appendChild(ss); }
-    }
-    [m.frozen, m.verdict, m.merged].forEach(function (ts) {
-      if (ts && ts >= from) { var k = el("div", "mark"); k.style.left = "calc(" + pct(ts) + "% - 1px)"; track.appendChild(k); }
+    track.setAttribute("role", "img");
+    track.setAttribute("aria-label", "requested " + hm(m.requested) + ", frozen " + hm(m.frozen)
+      + ", verdict " + hm(m.verdict) + ", merged " + hm(m.merged));
+    var wrap = el("div");
+    wrap.appendChild(track);
+    var legend = el("div", "legend");
+    [["phase-build", "build"], ["phase-review", "review"], ["phase-merge", "approved → merge"]].forEach(function (x) {
+      var s = el("span"), i = el("i"); i.style.background = "var(--" + x[0] + ")"; s.appendChild(i);
+      s.appendChild(document.createTextNode(x[1])); legend.appendChild(s);
     });
-    var nl = el("div", "nowline"); nl.style.left = "100%"; track.appendChild(nl);
-    track.setAttribute("aria-label", "request " + hm(m.requested) + ", freeze " + hm(m.frozen)
-      + ", verdict " + hm(m.verdict) + ", merge " + hm(m.merged));
-    row.appendChild(track);
-
-    var det = el("div", "lot-detail"), dl = el("dl");
-    function add(k, v) { if (v === null || v === undefined || v === "") return; dl.appendChild(el("dt", null, k)); dl.appendChild(el("dd", null, v)); }
-    add("request", hm(m.requested)); add("freeze", hm(m.frozen));
-    add("verdict", hm(m.verdict) + (lot.verdict ? " (" + lot.verdict + ")" : ""));
-    add("merge", hm(m.merged));
-    add("work item state", lot.work_state);
-    if (lot.waiting_for) add("waiting for", lot.waiting_for.label);
-    if (lot.delegation) add("delegation", lot.delegation.label);
-    if (lot.estimate && (lot.estimate.minutes || lot.estimate.actual_minutes !== null)) add("duration", lot.estimate.label);
-    if (lot.stale) add("stalled since", hm(lot.stale.since_ts) + " (" + dur(lot.stale.idle_s) + ")");
-    add("epic", lot.epic); add("package", lot.package); add("PR", lot.pr_ref);
-    add("author", lot.assignee); add("review", lot.reviewer);
-    add("blocking verdicts", lot.blocked_verdicts === null ? "unknown" : lot.blocked_verdicts);
-    add("times put on hold", lot.blocks);
-    add("project", lot.project); add("ticket", lot.issue_ref);
-    if (lot.actions && lot.actions.length) add("actions", lot.actions.join(", "));
-    det.appendChild(dl); row.appendChild(det);
-    lotsBox.appendChild(row);
-  });
-
-  // Epics (L29)
-  var epBox = document.getElementById("epics");
-  var epics = D.epics || [];
-  if (!epics.length) epBox.appendChild(el("p", "empty", "No epic declared in the canon."));
-  epics.forEach(function (e) {
-    var row = el("div", "epic"), counted = e.lots_total - e.lots_abandoned;
-    row.appendChild(el("div", null, e.id + " — " + (e.title || "") + ": " + e.lots_merged + "/" + counted
-      + " work items merged" + (e.lots_abandoned ? " (" + e.lots_abandoned + " abandoned)" : "")));
-    var bar = el("div", "bar"), fill = el("div", "fill");
-    fill.style.width = (counted ? Math.round(e.lots_merged / counted * 100) : 0) + "%";
-    bar.appendChild(fill); row.appendChild(bar);
-    bar.setAttribute("role", "img");
-    bar.setAttribute("aria-label", e.lots_merged + " of " + counted + " work items merged");
-    epBox.appendChild(row);
-  });
-
-  // Projets (L62) : qui travaille sur quoi, lots ouverts sans agent
-  var PAY_FR = {plan: "plan", token: "token"};
-  var pjBox = document.getElementById("projects");
-  if (!D.projects) document.getElementById("projects-section").style.display = "none";
-  else if (!D.projects.length) pjBox.appendChild(el("p", "empty", "No project."));
-  (D.projects || []).forEach(function (p) {
-    var box = el("div", "project" + (p.active ? "" : " idle-project"));
-    var head = el("div");
-    head.appendChild(el("span", "project-name", p.name || "(no project)"));
-    var parts = ["working", "paused", "idle", "stopped"].filter(function (k) { return p.counts[k]; })
-      .map(function (k) { return p.counts[k] + " " + AG_FR[k]; });
-    var meta = [p.agents.length + " agent(s)" + (parts.length ? ": " + parts.join(", ") : "")];
-    if (p.lots_open) meta.push(p.lots_open + " open work item(s)");
-    if (p.unread) meta.push(p.unread + " unread");
-    if (p.usd_24h) meta.push("24 h " + usd(p.usd_24h) + " (token " + usd(p.usd_24h_token) + ")");
-    head.appendChild(el("span", "meta", " — " + meta.join(" · ")));
-    box.appendChild(head);
-    (p.warnings || []).forEach(function (w) { box.appendChild(el("div", "warn", "⚠ " + w)); });
-    if (p.agents.length) {
-      var wrap = el("div", "table-wrap"), tb = el("table"), tr = el("tr");
-      ["agent", "state", "payment", "24 h", "unread", "current work item", "latest progress"].forEach(function (h) { tr.appendChild(el("th", null, h)); });
-      tb.appendChild(tr);
-      p.agents.forEach(function (a) {
-        var x = el("tr"), st = el("td");
-        x.appendChild(el("td", null, a.name + (a.mode === "externe" ? " (ext)" : "")));
-        st.appendChild(chip(a.state, AG_FR, AG_ICON));
-        if (a.since_ts) st.appendChild(el("span", "meta", " " + dur(D.generated_ts - a.since_ts)));
-        if (a.reason) st.appendChild(el("div", "meta", a.reason));
-        x.appendChild(st);
-        x.appendChild(el("td", null, PAY_FR[a.payment] || "?"));
-        x.appendChild(el("td", "n", usd(a.usd_24h)));
-        x.appendChild(el("td", "n", a.unread));
-        x.appendChild(el("td", null, (a.lot ? "#" + a.lot.id + " " + a.lot.title
-          + (a.open_lots > 1 ? " (+" + (a.open_lots - 1) + ")" : "")
-          : (a.task ? "turn: " + a.task : "—"))
-          + (a.lot && a.on_task_since_ts ? " (for " + dur(D.generated_ts - a.on_task_since_ts) + ")" : "")));
-        // L96 : la dernière avancée lue dans le fil (une ligne)
-        x.appendChild(el("td", null, a.last_update ? a.last_update.text + " ("
-          + dur(D.generated_ts - a.last_update.ts) + " ago)" : "—"));
-        tb.appendChild(x);
+    wrap.appendChild(legend);
+    return wrap;
+  }
+  var MODALS = {
+    lot: function (id, box) {
+      var lot = lotById(id);
+      if (!lot) { box.appendChild(el("p", "empty", "Work item #" + id + " is not in this snapshot (outside the window or the project).")); return "Work item #" + id; }
+      var m = lot.milestones || {}, head = el("div", "line");
+      head.appendChild(lotChip(lot));
+      if (lot.stale) head.appendChild(el("span", "chip st-stale", "‖ stale " + dur(lot.stale.idle_s)));
+      if (lot.waiting_for) head.appendChild(el("span", "meta", " waiting for: " + lot.waiting_for.label));
+      box.appendChild(head);
+      section(box, "Dated milestones");
+      box.appendChild(lotTrack(lot));
+      box.appendChild(dl([
+        ["requested", hm(m.requested)], ["frozen", hm(m.frozen)],
+        ["verdict", hm(m.verdict) + (lot.verdict ? " (" + lot.verdict + ")" : "")],
+        ["merged", hm(m.merged)], ["last activity", ago(lot.last_activity_ts)],
+        ["stale since", lot.stale ? hm(lot.stale.since_ts) + " (" + dur(lot.stale.idle_s) + ")" : null],
+        ["duration", lot.estimate && (lot.estimate.minutes || lot.estimate.actual_minutes !== null) ? lot.estimate.label : null]]));
+      section(box, "Who, what");
+      var assignee = lot.assignee ? link(lot.assignee, function () { openModal("agent", lot.assignee); }) : null;
+      box.appendChild(dl([
+        ["attend", lot.waiting_for ? lot.waiting_for.label : null],
+        ["delegation", lot.delegation ? lot.delegation.label : null],
+        ["author", assignee], ["review", lot.reviewer], ["project", lot.project],
+        ["epic", lot.epic], ["package", lot.package], ["type", lot.type],
+        ["work state", lot.work_state], ["PR", lot.pr_ref], ["issue", lot.issue_ref],
+        ["blocking verdicts", lot.blocked_verdicts === null ? "unknown" : lot.blocked_verdicts],
+        ["holds", lot.blocks], ["review loops", lot.qa_loops],
+        ["actions", lot.actions && lot.actions.length ? lot.actions.join(", ") : null]]));
+      section(box, "Cost");
+      box.appendChild(dl([["spent", lot.spent_usd !== null && lot.spent_usd !== undefined ? usd(lot.spent_usd) : "not measured"],
+                          ["budget", lot.budget_usd !== null && lot.budget_usd !== undefined ? usd(lot.budget_usd) : "none"]]));
+      var decs = (D.decisions || []).filter(function (d) { return d.lot === lot.id; });
+      if (decs.length) {
+        section(box, "Pending decisions");
+        decs.forEach(function (d) {
+          var line = el("div", "line");
+          line.appendChild(link("d" + d.id + " " + d.question, function () { openModal("decision", d.id); }));
+          box.appendChild(line);
+        });
+      }
+      section(box, "Thread");
+      box.appendChild(el("code", "cmd", "ameesh fil show " + (lot.project || "<project>") + " " + lot.id));
+      return "#" + lot.id + " " + lot.title;
+    },
+    agent: function (name, box) {
+      var a = agentView(name);
+      if (!a) { box.appendChild(el("p", "empty", "Agent " + name + " is not in this snapshot.")); return name; }
+      var head = el("div", "line");
+      head.appendChild(chip(a.state, AG_FR, AG_ICON));
+      if (a.since_ts) head.appendChild(el("span", "meta", " for " + dur(D.generated_ts - a.since_ts)));
+      box.appendChild(head);
+      var lot = a.lot ? link("#" + a.lot.id + " " + (a.lot.title || ""), function () { openModal("lot", a.lot.id); }) : null;
+      box.appendChild(dl([
+        ["project", a.project], ["harness", a.harness], ["model", a.model || "default"],
+        ["effort", a.effort || "default"], ["host", a.host], ["mode", a.mode],
+        ["payment", PAY_FR[a.payment] || a.payment],
+        ["reason", a.reason || ((a.state === "paused" || a.state === "stopped") ? a.status_text : null)],
+        ["current turn", a.turn ? (a.turn.task || a.turn.label || "turn") : (a.task || null)],
+        ["current work item", lot],
+        ["on its task for", a.on_task_since_ts ? dur(D.generated_ts - a.on_task_since_ts) : null],
+        ["latest progress", a.last_update ? a.last_update.text + " (" + ago(a.last_update.ts) + ")" : null],
+        ["24 h", a.usd_24h !== undefined ? usd(a.usd_24h) + (a.turns_24h !== undefined ? " · " + a.turns_24h + " turn(s)" : "") : null],
+        ["unread", a.unread]]));
+      var mine = (D.lots || []).filter(function (l) { return l.assignee === name && !l.closed && l.state !== "merged"; });
+      if (mine.length) { section(box, "Open work items"); mine.forEach(function (l) { lotLine(box, l); }); }
+      return name;
+    },
+    milestone: function (id, box) {
+      var ms = (D.milestones || []).filter(function (m) { return m.id === id; })[0];
+      if (!ms) { box.appendChild(el("p", "empty", "Milestone " + id + " is not in this snapshot.")); return id; }
+      var counted = (ms.lots_total || 0) - (ms.lots_abandoned || 0);
+      box.appendChild(dl([["date", ms.date || "no date"], ["owner", ms.responsible],
+                          ["state", ms.status], ["canon", ms.canon_ref],
+                          ["progress", ms.lots_merged + "/" + counted + " work item(s) merged"
+                            + (ms.progress !== null && ms.progress !== undefined ? " (" + Math.round(ms.progress * 100) + "%)" : "")]]));
+      box.appendChild(bar(ms.progress, Math.round((ms.progress || 0) * 100) + "% merged"));
+      var epics = (D.epics || []).filter(function (e) { return e.milestone === id; });
+      if (epics.length) section(box, "Epics");
+      epics.forEach(function (e) {
+        var c = e.lots_total - e.lots_abandoned;
+        box.appendChild(el("div", "line", e.id + " — " + (e.title || "") + " : " + e.lots_merged + "/" + c));
+        box.appendChild(bar(e.progress, e.lots_merged + " of " + c));
+        var ids = (e.work_items || []).slice();
+        (e.lots || []).forEach(function (l) { ids = ids.concat(l.work_items || []); });
+        ids.forEach(function (i) { var l = lotById(i); if (l && !l.closed && l.state !== "merged") lotLine(box, l); });
       });
-      wrap.appendChild(tb); box.appendChild(wrap);
+      return (ms.title || ms.id);
+    },
+    decision: function (id, box) {
+      var d = (D.decisions || []).filter(function (x) { return x.id === id; })[0];
+      if (!d) { box.appendChild(el("p", "empty", "Decision d" + id + " is not pending (answered or withdrawn).")); return "d" + id; }
+      var head = el("div", "line");
+      if (d.urgent) head.appendChild(el("span", "chip st-blocked", "urgent"));
+      if (d.overdue) head.appendChild(el("span", "chip st-late", "past due"));
+      box.appendChild(head);
+      box.appendChild(el("p", "question", d.question));
+      var opts = el("ul", "options");
+      (d.options || []).forEach(function (o) {
+        var li = el("li", null, (o.key || o.id || "?") + " : " + (o.label || o.text || ""));
+        if (d.recommend && (o.key === d.recommend || o.id === d.recommend)) li.appendChild(el("span", "chip st-approved", "recommended"));
+        opts.appendChild(li);
+      });
+      box.appendChild(opts);
+      var lot = d.lot ? link("#" + d.lot + (d.lot_title ? " " + d.lot_title : ""), function () { openModal("lot", d.lot); }) : null;
+      box.appendChild(dl([["why", d.why], ["requested by", d.requester], ["for", d.owner || "any human"],
+                          ["project", d.project], ["work item", lot], ["requested", ago(d.created_ts)],
+                          ["due", d.due_ts ? hm(d.due_ts) : "none"],
+                          ["signature", d.needs_signature ? "required" : null]]));
+      section(box, "Answer");
+      box.appendChild(el("code", "cmd", "ameesh decide " + d.id + " <option>"));
+      return "Decision d" + d.id;
     }
-    var WHY = {unassigned: "unassigned", stopped: "assigned to {a}, stopped",
-               unknown: "assigned to {a}, not in the registry", external: "assigned to {a}, external session"};
-    (p.lots_without_agent || []).forEach(function (l) {
-      box.appendChild(el("div", "waiting", "no agent: #" + l.id + " " + l.state + " — " + l.title
-        + " (" + (WHY[l.why] || l.why).replace("{a}", l.assignee || "") + ")"));
-    });
-    pjBox.appendChild(box);
-  });
+  };
 
-  // Agents
-  var agBox = document.getElementById("agents");
-  if (!D.agents.length) agBox.appendChild(el("p", "empty", "No agent."));
-  D.agents.forEach(function (a) {
-    var c = el("div", "card"), h = el("div", "card-head");
-    h.appendChild(el("span", "card-name", a.name));
-    h.appendChild(chip(a.state, AG_FR, AG_ICON));
-    c.appendChild(h);
-    c.appendChild(el("div", "meta", [a.harness || "?", a.model || "default model",
-      "effort " + (a.effort || "default")].join(" · ")));
-    if (a.since_ts) c.appendChild(el("div", "meta", (a.state === "working" ? "turn for " : "for ") + dur(D.generated_ts - a.since_ts)));
-    if (a.turn) c.appendChild(el("div", "task", a.turn.task || a.turn.label || "turn in progress"));
-    else if ((a.state === "paused" || a.state === "stopped") && a.status_text) c.appendChild(el("div", "task", a.status_text));
-    if (a.unread) c.appendChild(el("div", "meta", a.unread + " unread message(s)"));
-    agBox.appendChild(c);
-  });
+  // -- onglets ---------------------------------------------------------------
+  function note(box) {
+    if (partialScope()) box.appendChild(el("p", "meta", "Static page: budget, milestones and epics cover all projects."));
+  }
+  var RENDER = {
+    overview: function (box) {
+      var sc = scoped();
+      var cards = el("div", "pcards");
+      if (!sc.overview.length) cards.appendChild(el("p", "empty", D.overview ? "No active project." : "Snapshot without overview (older than L304)."));
+      sc.overview.forEach(function (c) {
+        var card = el("div", "pcard" + (c.active ? "" : " idle-project")), head = el("div", "card-head");
+        var name = c.project ? link(c.project, function () { S.p = c.project; saveHash(); if (MODE === "served") refresh(); else renderAll(); })
+                             : el("span", null, "(no project)");
+        name.className += " card-name";
+        head.appendChild(name);
+        head.appendChild(el("span", "chip " + (c.agents_working ? "st-working" : c.agents_active ? "st-idle" : "st-stopped"),
+          c.agents_working + "/" + c.agents_active + " agent(s) working"));
+        card.appendChild(head);
+        var stats = el("div", "stats");
+        [[c.lots_open, "open work items", null, "lots"], [c.lots_merged_in_window, "merged (window)", null, "lots"],
+         [c.decisions_pending, "pending decisions", c.decisions_pending ? "hot" : null, "decisions"],
+         [usd(c.spend_24h_usd), "spend 24 h", null, "budget"]].forEach(function (x) {
+          var t = el("button", "stat" + (x[2] ? " " + x[2] : "")); t.type = "button";
+          t.appendChild(el("span", "v", x[0])); t.appendChild(el("span", "l", x[1]));
+          t.addEventListener("click", function () { if (c.project) S.p = c.project; S.tab = x[3]; saveHash(); if (MODE === "served" && D.project !== S.p) refresh(); else renderAll(); });
+          stats.appendChild(t);
+        });
+        card.appendChild(stats);
+        var ms = c.milestone;
+        if (ms) {
+          var mline = el("div", "ms");
+          mline.appendChild(link("◆ " + (ms.title || ms.id), function () { openModal("milestone", ms.id); }));
+          mline.appendChild(el("span", "meta", " · " + (ms.date || "no date") + " · " + (ms.lots_merged || 0) + "/" + (ms.lots_total || 0)
+            + (ms.progress !== null && ms.progress !== undefined ? " (" + Math.round(ms.progress * 100) + "%)" : "")));
+          card.appendChild(mline);
+          card.appendChild(bar(ms.progress, Math.round((ms.progress || 0) * 100) + "% of the milestone"));
+        } else card.appendChild(el("div", "meta", "no current milestone"));
+        (c.warnings || []).slice(0, 2).forEach(function (w) { card.appendChild(el("div", "warn", "⚠ " + w)); });
+        if ((c.warnings || []).length > 2) card.appendChild(el("div", "meta", "+ " + (c.warnings.length - 2) + " warning(s)"));
+        cards.appendChild(card);
+      });
+      box.appendChild(cards);
 
-  // Jalons du projet
-  var msBox = document.getElementById("milestones");
-  if (!D.milestones.length) msBox.appendChild(el("p", "empty", "No milestone declared in the canon."));
-  D.milestones.forEach(function (ms) {
-    var counted = (ms.lots_total || 0) - (ms.lots_abandoned || 0);
-    msBox.appendChild(el("div", null, (ms.at_ts ? hm(ms.at_ts) : "no date") + " — " + (ms.title || "")
-      + (ms.lots_total !== undefined ? ": " + ms.lots_merged + "/" + counted + " work items merged" : "")));
-  });
+      // à regarder : décisions, lots bloqués, stagnants ou en attente d'un humain
+      var watch = [];
+      sc.decisions.forEach(function (d) {
+        watch.push({rank: d.overdue ? 0 : d.urgent ? 1 : 3, text: "decision d" + d.id + ": " + d.question,
+                    tag: d.overdue ? "past due" : d.urgent ? "urgent" : "pending", cls: d.overdue || d.urgent ? "st-late" : "st-review",
+                    open: function () { openModal("decision", d.id); }});
+      });
+      sc.lots.forEach(function (l) {
+        if (l.closed || l.state === "merged") return;
+        if (l.state === "blocked") watch.push({rank: 2, text: "#" + l.id + " " + l.title, tag: "blocked", cls: "st-blocked", open: function () { openModal("lot", l.id); }});
+        else if (l.stale) watch.push({rank: 4, text: "#" + l.id + " " + l.title, tag: "stale " + dur(l.stale.idle_s), cls: "st-stale", open: function () { openModal("lot", l.id); }});
+      });
+      watch.sort(function (a, b) { return a.rank - b.rank; });
+      var wbox = el("div", "watch");
+      wbox.appendChild(el("h2", null, "Watch"));
+      if (!watch.length) wbox.appendChild(el("p", "empty", "Nothing blocked, nothing stale, no pending decision."));
+      watch.slice(0, 6).forEach(function (w) {
+        var line = el("div", "line");
+        line.appendChild(el("span", "chip " + w.cls, w.tag));
+        line.appendChild(document.createTextNode(" "));
+        line.appendChild(link(w.text, w.open));
+        wbox.appendChild(line);
+      });
+      if (watch.length > 6) wbox.appendChild(el("div", "meta", "+ " + (watch.length - 6) + " more: Work items and Decisions tabs"));
+      box.appendChild(wbox);
+    },
+    gantt: function (box) {
+      note(box);
+      renderRoadmap(box);
+    },
+    lots: function (box) {
+      var sc = scoped();
+      var cutLabels = {lots: "work items", actions: "actions"};
+      Object.keys(D.truncated || {}).forEach(function (k) {
+        var c = D.truncated[k];
+        box.appendChild(el("p", "trunc", "⚠ Truncated: " + c.shown + " " + (cutLabels[k] || k)
+          + " shown of " + c.total + " (limit " + c.limit + ")."));
+      });
+      table(box, {
+        view: "lots", label: "work items", rows: sc.lots, allLabel: "merged and closed",
+        empty: "No work item matches.",
+        hidden: function (l) { return !!l.closed || l.state === "merged"; },
+        text: function (l) { return ["#" + l.id, l.title, l.project, l.assignee, l.epic, LOT_FR[l.state], l.waiting_for && l.waiting_for.label].join(" "); },
+        order: function (a, b) {
+          return (LOT_ORDER[a.state] - LOT_ORDER[b.state]) || ((b.last_activity_ts || 0) - (a.last_activity_ts || 0));
+        },
+        open: function (l) { openModal("lot", l.id); },
+        cols: [
+          {label: "#", n: true, key: function (l) { return l.id; }, cell: function (l) { return l.id; }},
+          {label: "titre", cls: "wide", key: function (l) { return l.title.toLowerCase(); }, cell: function (l) { return l.title; }},
+          {label: "project", key: function (l) { return l.project || ""; }, cell: function (l) { return l.project; }},
+          {label: "state", key: function (l) { return LOT_ORDER[l.state]; }, cell: function (l) {
+            var s = el("span"); s.appendChild(lotChip(l));
+            if (l.stale) s.appendChild(el("span", "chip st-stale", "‖ " + dur(l.stale.idle_s)));
+            return s; }},
+          {label: "attend", key: function (l) { return l.waiting_for ? l.waiting_for.label : ""; }, cell: function (l) { return l.waiting_for ? l.waiting_for.label : ""; }},
+          {label: "author", key: function (l) { return l.assignee || ""; }, cell: function (l) { return l.assignee; }},
+          {label: "activity", n: true, desc: true, key: function (l) { return l.last_activity_ts; }, cell: function (l) { return ago(l.last_activity_ts); }}
+        ]
+      });
+    },
+    agents: function (box) {
+      var sc = scoped();
+      var rows = sc.agents.map(function (a) { return agentView(a.name); }).filter(Boolean);
+      table(box, {
+        view: "agents", label: "agents", rows: rows, allLabel: "stopped",
+        empty: "No agent matches.",
+        hidden: function (a) { return a.state === "stopped"; },
+        text: function (a) { return [a.name, a.project, a.harness, AG_FR[a.state], a.lot && a.lot.title, a.last_update && a.last_update.text].join(" "); },
+        order: function (a, b) { return (AG_ORDER[a.state] - AG_ORDER[b.state]) || (a.name < b.name ? -1 : 1); },
+        open: function (a) { openModal("agent", a.name); },
+        cols: [
+          {label: "agent", key: function (a) { return a.name; }, cell: function (a) { return a.name + (a.mode === "externe" ? " (ext)" : ""); }},
+          {label: "project", key: function (a) { return a.project || ""; }, cell: function (a) { return a.project; }},
+          {label: "state", key: function (a) { return AG_ORDER[a.state]; }, cell: function (a) {
+            var s = el("span"); s.appendChild(chip(a.state, AG_FR, AG_ICON));
+            if (a.since_ts) s.appendChild(el("span", "meta", " " + dur(D.generated_ts - a.since_ts)));
+            return s; }},
+          {label: "current work item", cls: "wide", key: function (a) { return a.lot ? a.lot.id : null; },
+           cell: function (a) { return a.lot ? "#" + a.lot.id + " " + (a.lot.title || "") : (a.task || (a.turn && a.turn.task) || "—"); }},
+          {label: "latest progress", key: function (a) { return a.last_update ? a.last_update.ts : null; }, desc: true,
+           cell: function (a) { return a.last_update ? ago(a.last_update.ts) : "—"; }},
+          {label: "24 h", n: true, desc: true, key: function (a) { return a.usd_24h || 0; }, cell: function (a) { return a.usd_24h !== undefined ? usd(a.usd_24h) : "—"; }},
+          {label: "unread", n: true, desc: true, key: function (a) { return a.unread || 0; }, cell: function (a) { return a.unread || 0; }}
+        ]
+      });
+    },
+    budget: function (box) {
+      note(box);
+      ["spend", "real", "accounts", "plans", "byagent"].forEach(function (id) {
+        var d = el("div", id === "spend" ? "tiles" : id === "byagent" ? "table-wrap" : null); d.id = id; box.appendChild(d);
+      });
+      renderBudget();
+    },
+    decisions: function (box) {
+      var sc = scoped();
+      table(box, {
+        view: "decisions", label: "decisions", rows: sc.decisions,
+        empty: "No pending decision.",
+        text: function (d) { return ["d" + d.id, d.question, d.project, d.requester, d.lot_title, d.lot].join(" "); },
+        order: function (a, b) { return (b.overdue - a.overdue) || (b.urgent - a.urgent) || (a.created_ts - b.created_ts); },
+        open: function (d) { openModal("decision", d.id); },
+        cols: [
+          {label: "#", n: true, key: function (d) { return d.id; }, cell: function (d) { return "d" + d.id; }},
+          {label: "question", cls: "wide", key: function (d) { return d.question.toLowerCase(); }, cell: function (d) {
+            var s = el("span");
+            if (d.urgent) s.appendChild(el("span", "chip st-blocked", "urgent"));
+            if (d.overdue) s.appendChild(el("span", "chip st-late", "past due"));
+            s.appendChild(document.createTextNode(" " + d.question)); return s; }},
+          {label: "project", key: function (d) { return d.project || ""; }, cell: function (d) { return d.project; }},
+          {label: "work item", n: true, key: function (d) { return d.lot; }, cell: function (d) { return d.lot ? "#" + d.lot : "—"; }},
+          {label: "requested by", key: function (d) { return d.requester || ""; }, cell: function (d) { return d.requester; }},
+          {label: "waiting", n: true, desc: true, key: function (d) { return d.age_s; }, cell: function (d) { return dur(d.age_s); }},
+          {label: "due", n: true, key: function (d) { return d.due_ts; }, cell: function (d) { return d.due_ts ? hm(d.due_ts) : "—"; }}
+        ]
+      });
+    }
+  };
 
-  // Budget (L95) : dépense payée au token et valeur des forfaits, jamais additionnées
+  function renderAll() {
+    learnProjects();
+    renderHeader();
+    var box = clear(panels[S.tab]);
+    RENDER[S.tab](box);
+    if (S.tab === "overview") {
+      var miss = el("details", "missing-box"), sum = el("summary", null, "Missing data");
+      miss.appendChild(sum);
+      var ul = el("ul", "missing");
+      (D.missing || []).forEach(function (t) { ul.appendChild(el("li", null, t)); });
+      miss.appendChild(ul); box.appendChild(miss);
+    }
+    if (modalAt && dialog.open) openModal(modalAt.kind, modalAt.id);
+  }
+
+  // -- budget (L95) : dépense payée au token et valeur des forfaits, jamais additionnées
+  function renderBudget() {
   var B = D.budget, sp = document.getElementById("spend");
   function pv(b) { return b.plan_value_usd !== undefined ? b.plan_value_usd : 0; }
   [["spent (paid per token), 1 h", B.spend["1h"].paid_usd],
@@ -510,7 +976,7 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
   }
 
   // Comptes déclarés (L74) : toutes les fenêtres, capacité perdue, prochain choix
-  var accBox = document.getElementById("accounts"), covered = {};
+  var accBox = document.getElementById("accounts"), covered = Object.create(null);
   if ((B.accounts || []).length) accBox.appendChild(el("div", "subhead", "Plan accounts (host " + (D.host || "?") + ")"));
   (B.accounts || []).forEach(function (a) {
     covered[a.harness] = true;
@@ -573,26 +1039,15 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
     document.getElementById("byagent").appendChild(tb);
   }
 
-  // Feuille de route (L96) : epics, jalons, tâches, engagements et décisions
-  // attendues sur une frise en jours ; prévu (pointillé) face au réel (plein)
-  (function () {
-    var R = D.roadmap, sec = document.getElementById("roadmap-section");
-    if (!R) { sec.style.display = "none"; return; }
-    var body = document.getElementById("roadmap-body"), tg = document.getElementById("roadmap-toggle");
-    var hidden = false;
-    try { hidden = window.localStorage.getItem("ameesh-roadmap-hidden") === "1"; } catch (e) { hidden = false; }
-    function apply() {
-      body.style.display = hidden ? "none" : "";
-      tg.textContent = hidden ? "show" : "hide";
-      tg.setAttribute("aria-expanded", hidden ? "false" : "true");
-    }
-    tg.addEventListener("click", function () {
-      hidden = !hidden; apply();
-      try { window.localStorage.setItem("ameesh-roadmap-hidden", hidden ? "1" : "0"); } catch (e) { /* sans stockage */ }
-    });
-    apply();
-    var f = R.window.from_ts, t = R.window.to_ts, sp = Math.max(1, t - f);
-    function px(ts) { return Math.min(100, Math.max(0, (ts - f) / sp * 100)); }
+  }
+
+  // -- feuille de route (L96) : epics, jalons, tâches, engagements et décisions
+  //    attendues sur une frise en jours ; prévu (pointillé) face au réel (plein).
+  //    L304 : tâches groupées par epic (à défaut par projet), groupes repliés,
+  //    zoom semaine (la fenêtre tient dans l'écran) ou jour (défilement)
+  function renderRoadmap(panel) {
+    var R = D.roadmap;
+    if (!R) { panel.appendChild(el("p", "empty", "Roadmap left out (--no-gantt).")); return; }
     function dayTs(iso) {
       if (!iso) return null;
       var p = String(iso).split("-");
@@ -605,12 +1060,83 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
                soumise: "submitted", verdict: "verdict", livree: "delivered"};
     var ST = {en_cours: "in progress", a_valider: "to validate", validee: "validated", bloquee: "blocked",
               livree: "delivered", abandonnee: "abandoned"};
-    var axis = document.getElementById("rm-axis"), days = Math.round(sp / 86400);
-    var stepDays = [1, 2, 7, 14, 28].filter(function (k) { return days / k <= Math.max(2, Math.floor((axis.clientWidth || 320) / 56)); })[0] || 28;
+    var ENDED = {livree: true, abandonnee: true};
+
+    // jours calendaires (minuit local) et non 86 400 s : le 25/10 dure 25 h
+    function midnight(ts) { var d = new Date(ts * 1000); d.setHours(0, 0, 0, 0); return d.getTime() / 1000; }
+    function addDays(ts, n) { var d = new Date(ts * 1000); d.setDate(d.getDate() + n); return d.getTime() / 1000; }
+    // fenêtre : celle de l'instantané, ou celle d'un jalon choisi, du jour la
+    // plus tôt au jour le plus tard de toutes ses dates (prévues et réelles),
+    // un jour de marge de chaque côté
+    var ms = (R.milestones || []).filter(function (m) { return m.id === G.ms; })[0] || null;
+    var f = midnight(R.window.from_ts), t = R.window.to_ts;
+    if (ms) {
+      var mts = [dayTs(ms.planned.start), dayTs(ms.planned.end), dayTs(ms.planned.delivery),
+                 ms.real && ms.real.debut, ms.real && ms.real.livree].filter(Boolean);
+      if (mts.length) {
+        f = addDays(midnight(Math.min.apply(null, mts)), -1);
+        t = addDays(midnight(Math.max.apply(null, mts)), 2);
+      }
+    }
+    var sp = Math.max(86400, t - f), days = Math.max(1, Math.round(sp / 86400));
+    function px(ts) { return Math.min(100, Math.max(0, (ts - f) / sp * 100)); }
+
+    var tasks = (R.tasks || []).filter(function (x) { return inScope(x.project); });
+    var nEnded = tasks.filter(function (x) { return ENDED[x.state]; }).length;
+
+    // commandes : zoom, fenêtre de jalon, tâches terminées, tout déplier
+    var bar = el("div", "rm-controls");
+    var zoom = el("span", "seg");
+    zoom.setAttribute("role", "group"); zoom.setAttribute("aria-label", "zoom");
+    [["week", "week"], ["day", "day"]].forEach(function (z) {
+      var b = el("button", null, z[1]); b.type = "button";
+      b.setAttribute("aria-pressed", G.zoom === z[0] ? "true" : "false");
+      b.addEventListener("click", function () { G.zoom = z[0]; saveHash(); renderAll(); });
+      zoom.appendChild(b);
+    });
+    bar.appendChild(zoom);
+    if ((R.milestones || []).length) {
+      var lab = el("label", null, "window "), sel = el("select");
+      var o0 = el("option", null, "whole snapshot"); o0.value = ""; sel.appendChild(o0);
+      R.milestones.forEach(function (m) {
+        var o = el("option", null, m.id + " " + m.title); o.value = m.id; o.selected = m.id === G.ms; sel.appendChild(o);
+      });
+      sel.addEventListener("change", function () { G.ms = sel.value; renderAll(); });
+      lab.appendChild(sel); bar.appendChild(lab);
+    }
+    var dl = el("label"), dc = el("input"); dc.type = "checkbox"; dc.checked = G.done;
+    dc.addEventListener("change", function () { G.done = dc.checked; renderAll(); });
+    dl.appendChild(dc); dl.appendChild(document.createTextNode(" delivered and abandoned (" + nEnded + ")"));
+    bar.appendChild(dl);
+    var all = el("button", null, "expand all"); all.type = "button";
+    bar.appendChild(all);
+    panel.appendChild(bar);
+
+    var legend = el("div", "legend");
+    legend.setAttribute("aria-hidden", "true");
+    [["border:1px dashed var(--phase-build);height:10px", "planned"], ["background:var(--phase-build)", "actual, in progress"],
+     ["background:var(--phase-merge)", "actual, delivered"], ["background:var(--critical)", "past the planned date"],
+     ["background:var(--ink);width:9px;height:9px;transform:rotate(45deg)", "planned delivery"],
+     ["border:2px solid var(--warning);width:9px;height:9px;transform:rotate(45deg)", "commitment due date"],
+     ["background:var(--warning);width:9px;height:9px;border-radius:50%", "pending decision"],
+     ["background:var(--critical);width:2px;height:12px", "today"]].forEach(function (x) {
+      var s = el("span"), i = el("i"); i.setAttribute("style", x[0]); s.appendChild(i);
+      s.appendChild(document.createTextNode(x[1])); legend.appendChild(s);
+    });
+    panel.appendChild(legend);
+
+    // zoom jour : une colonne de 34 px par jour, la frise défile ; semaine : elle tient dans l'écran
+    var scroller = el("div", "rm-scroll"), inner = el("div", "rm-inner");
+    if (G.zoom === "day") inner.style.minWidth = (days * 34) + "px";
+    scroller.appendChild(inner); panel.appendChild(scroller);
+    var axis = el("div", "axis"); axis.setAttribute("aria-hidden", "true"); inner.appendChild(axis);
+    var box = el("div"); box.id = "roadmap"; inner.appendChild(box);
+    var stepDays = G.zoom === "day" ? 1
+      : [1, 2, 7, 14, 28].filter(function (k) { return days / k <= Math.max(2, Math.floor((panel.clientWidth || 320) / 56)); })[0] || 28;
     var ticks = [];
     for (var d = new Date(f * 1000); d.getTime() / 1000 < t; d.setDate(d.getDate() + stepDays)) ticks.push(d.getTime() / 1000);
     ticks.forEach(function (ts) { var s = el("span", null, dmTs(ts)); s.style.left = px(ts) + "%"; axis.appendChild(s); });
-    var box = document.getElementById("roadmap");
+
     function track(parts) {
       var tr = el("div", "rm-track");
       tr.setAttribute("role", "img");
@@ -624,8 +1150,8 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
         }
         if (!p.a || !p.b || p.b < f || p.a > t) return;
         var a = px(p.a), z = px(p.b);
-        var bar = el("div", p.cls); bar.style.left = a + "%"; bar.style.width = Math.max(0.6, z - a) + "%";
-        tr.appendChild(bar);
+        var b = el("div", p.cls); b.style.left = a + "%"; b.style.width = Math.max(0.6, z - a) + "%";
+        tr.appendChild(b);
       });
       var n = el("div", "rm-today"); n.style.left = px(todayTs) + "%"; tr.appendChild(n);
       return tr;
@@ -646,6 +1172,7 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
       head.appendChild(el("span", "chip st-late", l.open ? "⚠ " + l.days + " d late"
         : "delivered " + l.days + " d late"));
     }
+    function hasPlan(p) { return !!(p && (p.start || p.end || p.delivery)); }
     function planBars(p, real, ended) {
       var ps = dayTs(p.start), pe = dayTs(p.end), pd = dayTs(p.delivery);
       var parts = [];
@@ -664,12 +1191,22 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
       if (real && real.livree) parts.push({mark: true, at: real.livree, cls: "done", title: "delivered " + dmTs(real.livree)});
       return parts;
     }
-    function group(title, rows, render) {
-      if (!rows || !rows.length) return;
-      box.appendChild(el("div", "rm-group", title + " (" + rows.length + ")"));
-      rows.forEach(render);
+    // un groupe = <details> ; ouvert ou fermé, il le reste d'un rafraîchissement à l'autre
+    var groups = [];
+    function group(key, title, count, summaryTrack, openByDefault) {
+      var det = el("details", "rm-gr"), sum = el("summary");
+      det.open = G.open[key] !== undefined ? G.open[key] : openByDefault;
+      det.addEventListener("toggle", function () { G.open[key] = det.open; });
+      var head = el("div", "rm-label");
+      head.appendChild(el("span", "t", title));
+      head.appendChild(el("span", "meta", count));
+      sum.appendChild(head);
+      if (summaryTrack) sum.appendChild(summaryTrack);
+      det.appendChild(sum); box.appendChild(det);
+      groups.push({key: key, det: det});
+      return det;
     }
-    function pkgRow(p) {
+    function pkgRow(into, p) {
       var row = el("div", "rm-row"), head = el("div", "rm-label");
       head.appendChild(el("span", "lot-id", p.id));
       head.appendChild(el("span", "t", p.title));
@@ -681,15 +1218,14 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
       row.appendChild(track(planBars(p.planned, pr, false)));
       var det = el("div", "rm-detail", planned(p.planned));
       source(det, p.source);
-      row.appendChild(det); box.appendChild(row);
+      row.appendChild(det); into.appendChild(row);
     }
-    group("Milestones", R.milestones, pkgRow);
-    group("Epics", R.epics, pkgRow);
-    group("Tasks", R.tasks, function (x) {
+    function taskRow(into, x) {
       var row = el("div", "rm-row"), head = el("div", "rm-label");
       head.appendChild(el("span", "lot-id", "#" + x.id));
-      head.appendChild(el("span", "t", x.title + (x.epic ? " [" + x.epic + "]" : "")));
-      head.appendChild(el("span", "chip st-" + (x.state === "livree" ? "done" : "active"), ST[x.state] || x.state));
+      var tt = el("span", "t"); tt.appendChild(link(x.title, function () { openModal("lot", x.id); }));
+      head.appendChild(tt);
+      head.appendChild(el("span", "chip st-" + (x.state === "livree" ? "done" : x.state === "bloquee" ? "blocked" : "active"), ST[x.state] || x.state));
       late(head, x.late);
       row.appendChild(head);
       row.appendChild(track(planBars(x.planned, x.real, x.state === "abandonnee")));
@@ -700,41 +1236,127 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
       source(det, x.source);
       if (x.commitments.length) det.appendChild(document.createTextNode(" · commitment(s) "
         + x.commitments.map(function (i) { return "e" + i; }).join(", ")));
-      row.appendChild(det); box.appendChild(row);
-    });
-    var CST = {proposed: "proposed, to validate", open: "open", done: "kept", cancelled: "cancelled"};
-    group("Commitments", R.commitments, function (c) {
-      var row = el("div", "rm-row"), head = el("div", "rm-label");
-      head.appendChild(el("span", "lot-id", "e" + c.id));
-      head.appendChild(el("span", "t", c.what));
-      head.appendChild(el("span", "chip st-" + (c.fulfilled ? "done" : c.status === "proposed" ? "proposed" : "active"),
-        c.fulfilled ? "kept" : CST[c.status] || c.status));
-      late(head, c.late);
-      row.appendChild(head);
-      row.appendChild(track([{mark: true, at: dayTs(c.due) + 43200, cls: c.fulfilled ? "done" : "due", title: "due " + dm(c.due)}]));
-      var det = el("div", "rm-detail", ["due " + dm(c.due), c.owner || "", c.project ? "project " + c.project : "",
-        c.lot ? "task #" + c.lot : "", c.depends_on.length ? "depends on " + c.depends_on.join(", ") : ""]
-        .filter(Boolean).join(" · "));
-      source(det, c.source);
-      row.appendChild(det); box.appendChild(row);
-    });
-    group("Pending decisions", R.decisions, function (c) {
-      var row = el("div", "rm-row"), head = el("div", "rm-label");
-      head.appendChild(el("span", "lot-id", c.id ? "e" + c.id : "#" + c.lot));
-      head.appendChild(el("span", "t", c.what));
-      if (c.status === "proposed") head.appendChild(el("span", "chip st-proposed", "proposed, to validate"));
-      row.appendChild(head);
-      row.appendChild(track([{mark: true, at: c.due ? dayTs(c.due) + 43200 : todayTs, cls: "decision"}]));
-      var det = el("div", "rm-detail", (c.due ? "due " + dm(c.due) : "no date") + (c.owner ? " · " + c.owner : ""));
-      source(det, c.source);
-      row.appendChild(det); box.appendChild(row);
-    });
-    if (!R.tasks.length && !R.epics.length && !R.milestones.length && !R.commitments.length && !R.decisions.length)
-      box.appendChild(el("p", "empty", "Nothing to plan: no open task, no planned date, no commitment."));
-  })();
+      row.appendChild(det); into.appendChild(row);
+    }
 
-  var miss = document.getElementById("missing");
-  (D.missing || []).forEach(function (t) { miss.appendChild(el("li", null, t)); });
+    if ((R.milestones || []).length) {
+      var gm = group("milestones", "Milestones", R.milestones.length + "", null, true);
+      R.milestones.forEach(function (p) { pkgRow(gm, p); });
+    }
+    // tâches par epic, à défaut par projet ; les groupes les plus chargés d'abord
+    var EPIC = Object.create(null);
+    (R.epics || []).forEach(function (e) { EPIC[e.id] = e; });
+    var byKey = Object.create(null), order = [];
+    // une epic sans aucune tâche a son groupe quand même (sa barre prévue) ;
+    // celle dont les tâches sont toutes hors du projet choisi n'en a pas ;
+    // sans prototype, un identifiant « constructor » ou « toString » compte aussi
+    var hasTask = Object.create(null);
+    (R.tasks || []).forEach(function (x) { if (x.epic) hasTask[x.epic] = true; });
+    (R.epics || []).forEach(function (e) {
+      if (hasTask[e.id]) return;
+      byKey["epic:" + e.id] = {key: "epic:" + e.id, rows: [], epic: e, title: null}; order.push("epic:" + e.id);
+    });
+    tasks.forEach(function (x) {
+      var k = x.epic ? "epic:" + x.epic : x.project ? "project:" + x.project : "none";
+      if (!byKey[k]) { byKey[k] = {key: k, rows: [], epic: x.epic ? EPIC[x.epic] || {id: x.epic, title: x.epic} : null,
+                                   title: x.epic ? null : x.project ? "project " + x.project : "no epic, no project"}; order.push(k); }
+      byKey[k].rows.push(x);
+    });
+    order.map(function (k) { return byKey[k]; }).sort(function (a, b) {
+      var oa = a.rows.filter(function (x) { return !ENDED[x.state]; }).length, ob = b.rows.filter(function (x) { return !ENDED[x.state]; }).length;
+      return (a.key === "none") - (b.key === "none") || (!!b.epic - !!a.epic) || ob - oa;
+    }).forEach(function (g) {
+      var open = g.rows.filter(function (x) { return !ENDED[x.state]; });
+      var shown = G.done ? g.rows : open;
+      // une epic planifiée garde son groupe (ses dates) même si ses tâches finies sont masquées ;
+      // « planned » toujours présent, il faut au moins une date non nulle
+      if (!shown.length && g.rows.length && !(g.epic && hasPlan(g.epic.planned))) return;
+      var nLate = g.rows.filter(function (x) { return x.late && x.late.open; }).length;
+      var nBlocked = g.rows.filter(function (x) { return x.state === "bloquee"; }).length;
+      var nDone = g.rows.filter(function (x) { return x.state === "livree"; }).length;
+      var count = [open.length + " open", nDone + " delivered", nBlocked ? nBlocked + " blocked" : "", nLate ? nLate + " late" : ""]
+        .filter(Boolean).join(" · ");
+      // synthèse : du premier début au dernier terme des tâches affichées
+      var a = null, z = null;
+      var bars = shown.map(function (x) { return planBars(x.planned, x.real, x.state === "abandonnee"); });
+      if (g.epic && g.epic.planned) bars.push(planBars(g.epic.planned, g.epic.real, false));
+      bars.forEach(function (parts) {
+        parts.forEach(function (p) {
+          var lo = p.mark ? p.at : p.a, hi = p.mark ? p.at : p.b;
+          if (lo && (a === null || lo < a)) a = lo;
+          if (hi && (z === null || hi > z)) z = hi;
+        });
+      });
+      var sum = track(a !== null ? [{a: a, b: Math.max(z, a + 3600), cls: "rm-real" + (nLate ? " late" : open.length || !g.rows.length ? "" : " done")}] : []);
+      var title = g.epic ? "epic " + g.epic.id + " " + (g.epic.title || "") : g.title;
+      // déplié d'office seulement s'il porte une tâche en retard, ou si l'epic
+      // l'est (mesh-design, n°9311) : « en cours » ne suffit pas
+      var det = group(g.key, title, count, sum, nLate > 0 || !!(g.epic && g.epic.late && g.epic.late.open));
+      if (g.epic && g.epic.planned) pkgRow(det, g.epic);
+      shown.forEach(function (x) { taskRow(det, x); });
+    });
+
+    var commitments = (R.commitments || []).filter(function (c) { return inScope(c.project); });
+    var CST = {proposed: "proposed, to validate", open: "open", done: "kept", cancelled: "cancelled"};
+    if (commitments.length) {
+      var gc = group("commitments", "Commitments", commitments.length + "", null, true);
+      commitments.forEach(function (c) {
+        var row = el("div", "rm-row"), head = el("div", "rm-label");
+        head.appendChild(el("span", "lot-id", "e" + c.id));
+        head.appendChild(el("span", "t", c.what));
+        head.appendChild(el("span", "chip st-" + (c.fulfilled ? "done" : c.status === "proposed" ? "proposed" : "active"),
+          c.fulfilled ? "kept" : CST[c.status] || c.status));
+        late(head, c.late);
+        row.appendChild(head);
+        row.appendChild(track([{mark: true, at: dayTs(c.due) + 43200, cls: c.fulfilled ? "done" : "due", title: "due " + dm(c.due)}]));
+        var det = el("div", "rm-detail", ["due " + dm(c.due), c.owner || "", c.project ? "project " + c.project : "",
+          c.lot ? "task #" + c.lot : "", c.depends_on.length ? "depends on " + c.depends_on.join(", ") : ""]
+          .filter(Boolean).join(" · "));
+        source(det, c.source);
+        row.appendChild(det); gc.appendChild(row);
+      });
+    }
+    var expected = (R.decisions || []).filter(function (c) { return inScope(c.project); });
+    if (expected.length) {
+      var gd = group("decisions", "Pending decisions", expected.length + "", null, true);
+      expected.forEach(function (c) {
+        var row = el("div", "rm-row"), head = el("div", "rm-label");
+        head.appendChild(el("span", "lot-id", c.id ? "e" + c.id : "#" + c.lot));
+        head.appendChild(el("span", "t", c.what));
+        if (c.status === "proposed") head.appendChild(el("span", "chip st-proposed", "proposed, to validate"));
+        row.appendChild(head);
+        row.appendChild(track([{mark: true, at: c.due ? dayTs(c.due) + 43200 : todayTs, cls: "decision"}]));
+        var det = el("div", "rm-detail", (c.due ? "due " + dm(c.due) : "no date") + (c.owner ? " · " + c.owner : ""));
+        source(det, c.source);
+        row.appendChild(det); gd.appendChild(row);
+      });
+    }
+    if (!groups.length)
+      box.appendChild(el("p", "empty", tasks.length ? "Every task is delivered or abandoned; tick the box above to see them."
+        : "Nothing to plan: no open task, no planned date, no commitment."));
+    var anyClosed = groups.some(function (g) { return !g.det.open; });
+    all.textContent = anyClosed ? "expand all" : "collapse all";
+    all.addEventListener("click", function () {
+      var to = groups.some(function (g) { return !g.det.open; });
+      groups.forEach(function (g) { g.det.open = to; G.open[g.key] = to; });
+      all.textContent = to ? "collapse all" : "expand all";
+    });
+    // zoom jour : la frise s'ouvre sur aujourd'hui
+    if (G.zoom === "day" && scroller.clientWidth)
+      scroller.scrollLeft = Math.max(0, inner.scrollWidth * px(todayTs) / 100 - scroller.clientWidth / 2);
+  }
+
+  if (MODE === "served") {
+    saveHash();  // ôte #t= de l'URL
+    if (!TOKEN) { status.textContent = "token missing: open the URL printed by ameesh progress --serve"; status.className = "warn"; return; }
+    refresh();
+    return;
+  }
+  if (!D || D.schema !== "ameesh-progress/1") {
+    document.getElementById("asof").textContent = "no data or unknown schema";
+    return;
+  }
+  renderAll();
 })();
 </script>
 </body>

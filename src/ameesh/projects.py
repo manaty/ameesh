@@ -209,6 +209,14 @@ def build(board: dict, *, now: float | None = None, project: str | None = None,
     rows = [r for r in board.get("agents") or [] if not is_chat_agent(r)]
     lot_rows = list(board.get("lots") or [])
     agents = [build_agent(r, now, paid_harnesses) for r in rows]
+    # L121 (added key): the agent's watch, None when it has none
+    watches = {w["agent"]: w for w in board.get("watches") or []}
+    for a in agents:
+        w = watches.get(a["name"])
+        a["watch"] = None if w is None else {
+            "every_s": int(w["every_s"]), "host": w["host"],
+            "last_sent_ts": round(float(w["last_sent_ts"]), 3)
+            if w.get("last_sent_ts") is not None else None}
     by_name = {a["name"]: a for a in agents}
     agent_projects = {a["name"]: a["project"] for a in agents}
 
@@ -327,7 +335,7 @@ def snapshot(db, *, project: str | None = None, now: float | None = None,
              paid_harnesses=None, max_lots: int = MAX_LOTS, viewer: str | None = None) -> dict:
     """Lit la base (UNE requête) et rend la vue `ameesh-projects/1`."""
     board = storage.of(db).projects.board(max_lots=max_lots)
-    for key in ("agents", "lots", "dead_letters", "decisions"):
+    for key in ("agents", "lots", "dead_letters", "decisions", "watches"):
         if isinstance(board.get(key), str):      # pilote qui rend le json brut
             board[key] = json.loads(board[key])
     if paid_harnesses is None:
@@ -428,6 +436,16 @@ def _doing(a: dict, now: float | None = None) -> str:
     return "—"
 
 
+def _watch(a: dict, now: float) -> str:
+    """L121: « watch: every 30m on laptop, last sent 12 min ago »."""
+    from .notify import duration
+    from .watch import every_text
+    w = a["watch"]
+    last = ("last sent %s ago" % duration(now - w["last_sent_ts"])
+            if w.get("last_sent_ts") is not None else "never sent")
+    return "watch: every %s on %s, %s" % (every_text(w["every_s"]), w["host"], last)
+
+
 def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = False,
                  indent: str = "") -> list[str]:
     """Les lignes de la vue (sans titre) : un bloc par projet, coupé à `width`.
@@ -475,6 +493,8 @@ def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = 
                     wrap(_last_update(a, now), indent + "    ")
                 if a["reason"]:
                     wrap("reason: " + a["reason"], indent + "    ")
+                if a.get("watch"):
+                    wrap(_watch(a, now), indent + "    ")
                 continue
             head = indent + "  %-*s %-19s %-7s %8.2f %4d %-9s " % (
                 name_w, a["name"][:name_w], state_label(a, now)[:19], pay, a["usd_24h"],
@@ -486,6 +506,9 @@ def format_lines(view: dict, width: int | None = None, *, show_inactive: bool = 
             if a["reason"]:
                 pad = indent + "  " + " " * (name_w + 1)
                 out.append(pad + _short("reason: " + a["reason"], max(20, width - len(pad))))
+            if a.get("watch"):
+                pad = indent + "  " + " " * (name_w + 1)
+                out.append(pad + _short(_watch(a, now), max(20, width - len(pad))))
         for lot in p["lots_without_agent"]:
             why = _FR_WHY.get(lot["why"], lot["why"])
             if "%s" in why:

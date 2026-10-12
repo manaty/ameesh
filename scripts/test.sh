@@ -9,7 +9,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-./scripts/pg-up.sh
+# AMEESH_PG_UP=0 : la base est déjà là (Postgres jetable d'un job déporté, L159b)
+[ "${AMEESH_PG_UP:-1}" = 0 ] || ./scripts/pg-up.sh
 
 #: DSN sans mot de passe : le secret vient de PGPASSWORD ou de ~/.pgpass.
 export AMEESH_TEST_DSN=${AMEESH_TEST_DSN:-${AGENT_MESH_TEST_DSN:-postgresql://agent_mesh@127.0.0.1:55432/agent_mesh}}
@@ -27,7 +28,7 @@ echo
 echo "=== pilote psql ==="
 AMEESH_DRIVER=psql python3 -m unittest discover -s tests -t . -v "${PATTERN[@]}"
 
-VENV=.venv
+VENV=${AMEESH_TEST_VENV:-.venv}  # L159b : venv en cache sur la VM de déport
 if [ ! -x "$VENV/bin/python" ]; then
   echo "=== création de $VENV (pilote psycopg, dépendance du paquet depuis L61) ==="
   python3 -m venv "$VENV" || true

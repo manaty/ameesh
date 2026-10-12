@@ -499,6 +499,144 @@ class ReviewR1Test(unittest.TestCase):
                              [])
 
 
+class ReviewR5RacesTest(unittest.TestCase):
+    """#210 review r5, P2 1 and 2 (L226c): a credential replaced during a
+    probe, a failure recorded during the probes."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-l226c-")
+
+    def _write(self, path: str, content: str):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+
+    def test_p2_1_claude_store_replaced_during_the_probe_is_unknown(self):
+        # A probed, the owner installs B during `claude auth status`, A
+        # answers not logged in: neither A nor B is recorded as failing
+        home = _claude_dir(self.tmp, "a", refreshToken="A")
+        profile = accounts.Profile("claude", "a", path=home)
+        store = os.path.join(home, ".credentials.json")
+
+        def run(argv, env=None, whole=False):
+            if replace:
+                self._write(store, json.dumps({"claudeAiOauth": {"refreshToken": "B"}}))
+            return 1, json.dumps({"loggedIn": False})
+        with mock.patch.object(sentinel.shutil, "which", return_value="/bin/claude"):
+            replace = True
+            v = sentinel.probe_claude(profile, NOW, run=run)
+            self.assertEqual((v.state, v.reason, v.fingerprint),
+                             ("unknown", sentinel.REPLACED, None))
+            # unchanged during the probe: the failure carries B, read before
+            replace = False
+            v = sentinel.probe_claude(profile, NOW, run=run)
+            self.assertEqual((v.state, v.fingerprint), ("failing", sentinel._digest("B")))
+
+    def test_r2_claude_expiry_and_fingerprint_from_one_read(self):
+        # #313 r2: A (refresh token expired) is replaced by a valid B after the
+        # expiry is read — B must never be recorded failing as "expired"
+        home = _claude_dir(self.tmp, "e", refreshToken="A",
+                           refreshTokenExpiresAt=(NOW - 60) * 1000)
+        profile = accounts.Profile("claude", "e", path=home)
+        later = mock.Mock(return_value=sentinel._digest("B"))   # every later read sees B
+        ok = lambda argv, env=None, whole=False: (0, json.dumps({"loggedIn": True}))
+        with mock.patch.object(sentinel.shutil, "which", return_value="/bin/claude"), \
+                mock.patch.object(sentinel, "fingerprint", later):
+            v = sentinel.probe_claude(profile, NOW, run=ok)
+        self.assertEqual((v.state, v.reason, v.fingerprint),
+                         ("unknown", sentinel.REPLACED, None))
+        # unchanged: expired, recorded against A, read with its expiry
+        with mock.patch.object(sentinel.shutil, "which", return_value="/bin/claude"):
+            v = sentinel.probe_claude(profile, NOW, run=ok)
+        self.assertEqual((v.state, v.fingerprint), ("failing", sentinel._digest("A")))
+        self.assertEqual(sentinel.fingerprint("claude", profile), sentinel._digest("A"))
+
+    def test_p2_1_cli_and_gcloud_store_replaced_during_the_probe(self):
+        store = os.path.join(self.tmp, "hosts.yml")
+        self._write(store, "A")
+
+        def run(argv, output=False):
+            self._write(store, "B")
+            return 1, "HTTP 401: Bad credentials"
+        with mock.patch.object(sentinel.shutil, "which", return_value="/bin/gh"):
+            v = sentinel.probe_cli("gh", ["gh", "auth", "status"], "fix", run, store)
+            self.assertEqual((v.state, v.reason), ("unknown", sentinel.REPLACED))
+            # GH_TOKEN overrides the store: its replacement does not matter
+            v = sentinel.probe_cli("gh", ["gh", "auth", "status"], "fix", run, store,
+                                   override=sentinel._digest("T"))
+            self.assertEqual((v.state, v.fingerprint), ("failing", sentinel._digest("T")))
+            # #313 r1: through probe_all, no override — the store is read
+            # once, before the probe: B replacing A during it is unknown,
+            # never B's refusal recorded against A
+            self._write(store, "A")
+            cfg = SimpleNamespace(host="h1", accounts={},
+                                  credential_sentinel={"probes": ["gh"]})
+            found = sentinel.probe_all(cfg, NOW, run, environ={"GH_CONFIG_DIR": self.tmp})
+            self.assertEqual((found[0].state, found[0].reason), ("unknown", sentinel.REPLACED))
+            self._write(store, "A")
+            found = sentinel.probe_all(cfg, NOW, run, environ={"GH_CONFIG_DIR": self.tmp,
+                                                               "GH_TOKEN": "T"})
+            self.assertEqual((found[0].state, found[0].fingerprint),
+                             ("failing", sentinel._digest("T")))
+            # the login lands between two reads before the probe (A, then B):
+            # one read only, so the check after the probe sees the change
+            reads = iter(["A", "B", "B", "B"])
+            with mock.patch.object(sentinel, "file_fingerprint",
+                                   side_effect=lambda path: next(reads)):
+                found = sentinel.probe_all(cfg, NOW, mock.Mock(return_value=(1, "HTTP 401")),
+                                           environ={"GH_CONFIG_DIR": self.tmp})
+            self.assertEqual((found[0].state, found[0].reason), ("unknown", sentinel.REPLACED))
+            # gcloud: credentials.db replaced during print-access-token
+            db = os.path.join(self.tmp, "credentials.db")
+            self._write(db, "A")
+
+            def gcloud(argv, output=False):
+                self._write(db, "B")
+                return 0, "token"
+            v = sentinel.probe_gcloud({"gcloud_session_hours": 16}, NOW, gcloud,
+                                      environ={"CLOUDSDK_CONFIG": self.tmp})
+            self.assertEqual((v.state, v.reason), ("unknown", sentinel.REPLACED))
+
+    def test_p2_1_codex_fingerprint_is_the_file_read(self):
+        home = os.path.join(self.tmp, "c")
+        os.makedirs(home)
+        self._write(os.path.join(home, "auth.json"),
+                    json.dumps({"tokens": {"refresh_token": "A"}}))
+        v = sentinel.probe_codex(accounts.Profile("codex", "c", path=home), NOW)
+        self.assertEqual(v.fingerprint, sentinel._digest("A"))
+        self.assertEqual(v.fingerprint, sentinel.fingerprint(
+            "codex", accounts.Profile("codex", "c", path=home)))
+
+    def test_p2_2_health_is_read_before_the_probes(self):
+        # B probes healthy; meanwhile the owner installs C and C's turn fails:
+        # the stale healthy B must not clear C's failure
+        before = {"a": {"state": "failing", "failures": 1,
+                        "failing_fingerprint": sentinel._digest("A")}}
+        after = {"a": {"state": "failing", "failures": 2,
+                       "failing_fingerprint": sentinel._digest("C")}}
+        creds = mock.Mock()
+        creds.health.return_value = before
+
+        def probes(*args):
+            creds.health.return_value = after      # C's turn fails during the probes
+            return [sentinel.Verdict("codex", "a", "healthy", "ok",
+                                     fingerprint=sentinel._digest("B"))]
+        cfg = SimpleNamespace(host="h1", accounts={},
+                              credential_sentinel={"probes": ["codex", "gh"]})
+        creds.report.return_value = {"skipped": True}
+        with mock.patch.object(sentinel, "probe_all", side_effect=probes), \
+                mock.patch("ameesh.storage.of", return_value=SimpleNamespace(credentials=creds)):
+            rows = sentinel.check(cfg, object(), now=NOW)
+        # the write expects the count read before the probes: the storage skips it
+        self.assertEqual(creds.report.call_args[1]["expect_failures"], 1)
+        self.assertEqual(rows[0]["state"], "failing")
+        self.assertEqual([c[0][1] for c in creds.health.call_args_list], ["codex", "gh"])
+        # dry run: no read at all
+        creds.reset_mock()
+        with mock.patch.object(sentinel, "probe_all", side_effect=probes):
+            sentinel.check(cfg, None, now=NOW, dry_run=True)
+        creds.health.assert_not_called()
+
+
 class AlertsTest(unittest.TestCase):
     def _alerts(self, rows):
         creds = mock.Mock()

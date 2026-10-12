@@ -94,7 +94,6 @@ def status_text(harness: str, account: str) -> str:
     return "%s %s/%s" % (STATUS_PREFIX, harness, account or "(default)")
 
 
-
 def failing(db, host: str, harness: str) -> dict[str, dict]:
     """{account: row} of the credentials reported `failing` for a harness.
 

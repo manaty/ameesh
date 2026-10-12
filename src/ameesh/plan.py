@@ -196,6 +196,7 @@ def annotate(db, rows: list[dict], *, now: float | None = None,
         row["waiting_for"] = info["waiting"]
         row["last_activity_ts"] = info["last_activity_ts"]
         row["stale"] = info["stale"]
+        row["planned_wait"] = info["planned_wait"]
         # L40 (0030) : délégation à échéance (« délégué par X, échéance dans … »)
         row["delegation"] = work_mod.delegation_view(row, now)
     return rows

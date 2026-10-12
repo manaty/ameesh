@@ -63,6 +63,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('mesh_approvals_status', ARRAY[
         'meta'
     ]),
+    -- L78: human/agent messages and the pending readable-thread copy.
+    ('conversation_log', ARRAY['text', 'meta', 'thread_text']),
     ('thread_index', ARRAY[
         'last_excerpt'
     ]),
@@ -72,6 +74,8 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('work_item_milestones', ARRAY[
         'note'
     ]),
+    ('project_modules', ARRAY['schemas', 'rules']),
+    ('work_module_milestones', ARRAY['payload']),
     ('commitments', ARRAY[
         'note'
     ]),

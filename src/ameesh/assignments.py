@@ -55,8 +55,16 @@ def is_orchestrator(cfg, db, name: str, *, roles=None) -> bool:
     except Exception:
         pass
     try:
+        canons = None
+        if roles is not None:
+            # Correction roles are authority from this agent's own canon,
+            # never from a namesake card in another configured canon.
+            from . import canon, registry
+            row = registry.get(db, name)
+            canons = [c for c in (canon.load_configured(cfg) if cfg is not None else [])
+                      if row is not None and c.owns(row.get("canon"))]
         return name in su.orchestrators(cfg, db, [{"name": name}], declared=(),
-                                        roles=roles or su.ORCHESTRATOR_ROLES)
+                                        canons=canons, roles=roles or su.ORCHESTRATOR_ROLES)
     except Exception:
         return False
 
@@ -85,7 +93,7 @@ def resolve_lot(db, ref: str) -> dict | None:
 
 def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None,
                  new_lot: str | None = None, branch: str | None = None,
-                 estimate=None) -> dict:
+                 estimate=None, app: str | None = None) -> dict:
     """Ce que le message `sender` → `recipient` fait aux lots, AVANT son dépôt.
 
     Rend `{lot, work_item_id, assigned, created, branch, warnings, orchestrator}` :
@@ -134,8 +142,11 @@ def link_message(cfg, db, *, sender: str, recipient: str, lot: str | None = None
             minutes = estimates.parse(estimate) if estimate not in (None, "") else None
             warn = estimates.check(db, sender, minutes,
                                    option="--estimate 2h alongside --new-lot")
+            from . import work_projects
+            project = work_projects.mail_project(cfg, db, sender, recipient, app)
             item = work_mod.add(db, title=title, assignee=recipient, actor=sender,
-                                source="mail", cfg=cfg, branch=branch, estimate=minutes)
+                                source="mail", app=project, cfg=cfg, branch=branch,
+                                estimate=minutes)
             out.update(created=True, assigned=True, branch=item.get("branch"))
             if warn:
                 out["warnings"].append(estimates.missing(item["id"]))

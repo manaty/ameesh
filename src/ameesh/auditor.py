@@ -45,20 +45,31 @@ def cards(listing, canons):
         name = row["name"]
         if name == AUDITOR_NAME:
             found[name] = None
-        for canon in canons:
-            if not canon.readable or not canon.owns(row.get("canon")):
-                continue
-            definition = canon.agent(name)
-            if definition is None:
-                continue
-            data = definition.fiche.data
-            roles = data.get("roles") or data.get("role") or []
-            if isinstance(roles, str):
-                roles = [roles]
-            if name == AUDITOR_NAME or any(str(role).strip().lower() in AUDITOR_ROLES
-                                          for role in roles):
-                found[name] = definition.fiche
+        card = owned_card(row, canons, AUDITOR_ROLES, persona=name == AUDITOR_NAME)
+        if card is not None:
+            found[name] = card
     return found
+
+
+def owned_card(row, canons, roles, *, persona=False):
+    """La fiche de l'agent `row` qui nomme l'un des `roles`, prise seulement
+    dans son canon propriétaire (None sinon) ; `persona` : sa fiche, quel que
+    soit son rôle."""
+    wanted = {str(role).strip().lower() for role in roles}
+    card = None
+    for canon in canons:
+        if not canon.readable or not canon.owns(row.get("canon")):
+            continue
+        definition = canon.agent(row["name"])
+        if definition is None:
+            continue
+        data = definition.fiche.data
+        named = data.get("roles") or data.get("role") or []
+        if isinstance(named, str):
+            named = [named]
+        if persona or any(str(role).strip().lower() in wanted for role in named):
+            card = definition.fiche
+    return card
 
 
 def card_markers(card):

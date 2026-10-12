@@ -159,6 +159,9 @@ class Config:
     #: au-delà, une requête est annulée par le serveur (0 = pas de limite).
     #: Empêche un renouvellement de bail de bloquer le battement indéfiniment.
     statement_timeout_ms: float = 30000.0
+    #: L304 : session en lecture seule (`default_transaction_read_only`) ;
+    #: jamais lu de l'environnement, posé par `ameesh progress --serve`
+    read_only: bool = False
     lease_ttl: float = 300.0
     idle_nudge: float = 1200.0
     poll: float = 5.0
@@ -191,6 +194,10 @@ class Config:
     #: expéditeurs autorisés à interrompre un tour (0018, R19) ; sans canon,
     #: c'est la seule autorisation. Vide = personne.
     interrupt_senders: tuple[str, ...] = ()
+    #: L242b : agents critiques déclarés (en plus des rôles orchestrateur,
+    #: conception et auditeur du canon) : jamais en pause budget tant qu'un
+    #: compte a de la marge (voir docs/COMPTES.md § 7)
+    critical_agents: tuple[str, ...] = ()
     #: rotation de session (0018) : taille de contexte et latence des tours
     session_max_tokens: float = 150000.0
     session_max_turn_seconds: float = 900.0
@@ -475,6 +482,10 @@ def load(env: dict | None = None) -> Config:
         interrupt_senders=_as_names(
             pick("AMEESH_INTERRUPT_SENDERS", "AGENT_MESH_INTERRUPT_SENDERS")
         ) or cfg.interrupt_senders,
+        critical_agents=_as_names(pick("AMEESH_CRITICAL_AGENTS")) or tuple(
+            n.strip() for n in (cfg.critical_agents.split(",")
+                                if isinstance(cfg.critical_agents, str)
+                                else cfg.critical_agents or ()) if str(n).strip()),
         session_max_tokens=_as_float(
             pick("AMEESH_SESSION_MAX_TOKENS", "AGENT_MESH_SESSION_MAX_TOKENS"),
             cfg.session_max_tokens),

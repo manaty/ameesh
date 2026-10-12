@@ -31,12 +31,13 @@ Le SQL est dans le stockage (`storage.of(db).work`, spec §10).
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 from typing import Sequence
 
 from . import storage
-from .db import Db
+from .db import Db, DbError
 from .storage.postgres import work as _pg
 
 STATES = ("intake", "build", "qa", "merged", "promoted", "blocked", "waiting_human",
@@ -141,6 +142,12 @@ def corrector(cfg, db, explicit: str | None = None) -> str:
 
     text = (explicit or "").strip()
     binding = identity.resolve_binding(cfg, db)
+    # A rejected runner/session identity must never fall back to the human
+    # terminal path, including a malformed AGENT_MAIL_NAME (no returned name).
+    if not binding.ok and (binding.name or binding.source != "none"
+                           or os.environ.get("AGENT_MAIL_NAME")):
+        raise WorkError("correction refused: invalid session identity (%s)"
+                        % (binding.reason or "unbound identity"))
     refus = ("correction refused: %s is neither a human, an orchestrator nor a design agent "
              "(orchestrator or design role on its Agent card in the canon, "
              "AMEESH_ALERT_ORCHESTRATORS); ask the orchestrator or the owner")
@@ -192,7 +199,9 @@ def add(
     L118 : `branch` (et `branch_target`) nomment la branche du lot, dont la
     fusion le fermera (`plan_git.sync_branches`). L130 : `priority` (1 haute,
     2 normale, 3 basse, comme la file d'amélioration), pour enregistrer une
-    demande d'humain avec sa priorité.
+    demande d'humain avec sa priorité. L317c : un bug de priorité 1 ouvert par
+    un humain ou son chat demande une analyse profonde à l'auditeur
+    (`deep_analysis.on_lot_created`, rendu sous la clé `deep_analysis`).
 
     L157 : `estimate` (« 2h », « 90m », ou des minutes) est la durée estimée,
     posée avec sa source et son auteur (`actor`). La règle « obligatoire pour
@@ -204,7 +213,10 @@ def add(
         from . import estimates
         minutes = estimates.parse(estimate)
     if type not in ("bug", "evolution"):
-        raise WorkError("unknown type: %r (bug or evolution)" % type)
+        from .modules.storage import ModuleStore
+        if not ModuleStore(db).admits(app or workstream or "", type):
+            raise WorkError("unknown type %r for project %r: enable its module in the canon"
+                            % (type, app or workstream or ""))
     if size not in (None, "") and size not in SIZES:
         raise WorkError("unknown size: %r (s, m or l)" % (size,))
     if not (title or "").strip():
@@ -218,7 +230,7 @@ def add(
         raise WorkError("--externe without assignee: nothing to force")
     fiche = _package(db, package) if package else None
     branch, branch_target = _branch_args(branch, branch_target)
-    return storage.of(db).work.add(
+    item = storage.of(db).work.add(
         type=type, source=source, app=app, title=title.strip(), body=body,
         issue_ref=issue_ref, workstream=workstream, assignee=assignee,
         budget_usd=budget_usd, note="created" + (" (plan: %s)" % package if package else "")
@@ -229,6 +241,13 @@ def add(
         estimate_minutes=minutes,
         estimate_source=(" ".join(str(estimate_source or "").split()) or None)
         if minutes else None, change_size=size or None)
+    # L317c : un bug de priorité 1 ouvert par un humain (ou son chat) réveille
+    # l'auditeur pour une analyse profonde, tout de suite
+    from . import deep_analysis
+    analysis = deep_analysis.on_lot_created(db, item, actor=actor, cfg=cfg)
+    if analysis is not None:
+        item["deep_analysis"] = analysis
+    return item
 
 
 # --------------------------------------------------------------------------
@@ -767,9 +786,18 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             "declared" if declared else "seen",
             " by %s" % source if source else "", " — %s" % pr_ref if pr_ref else "",
             " (commit %s)" % sha[:12] if sha else "", " — %s" % extra if extra else "")
-        row = storage.of(db).work.close_merged(
-            item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
-            frozen_id=frozen_id)
+        try:
+            row = storage.of(db).work.close_merged(
+                item_id, current=state, sha=sha, actor=actor, note=note, pr_ref=pr_ref,
+                frozen_id=frozen_id)
+        except DbError as exc:
+            # A refused module requirement is a per-lot result, allowing a
+            # merge sweep to continue with other projects. Other DB errors
+            # remain errors; the storage transaction already rolled back.
+            if "AMEESH_MODULE_RULE:" not in str(exc):
+                raise
+            return {"id": int(item_id), "result": "refused", "item": item,
+                    "detail": str(exc)}
         if row is not None:
             return {"id": int(item_id), "result": "merged", "item": row,
                     "detail": "%s → merged" % state}
@@ -799,6 +827,8 @@ def merged(db: Db, item_id: int, *, sha: str, note: str = "", actor: str = "") -
                         declared=True, extra=(note or "").strip())
     if done["result"] == "refused":
         item = done["item"]
+        if item["state"] != "closed":
+            raise WorkError(done["detail"])
         raise WorkError("lot %s closed (%s): not reopened; see ameesh work show %s"
                         % (item_id, "abandoned" if item.get("close_reason") == "abandoned"
                            else "superseded by #%s" % item.get("superseded_by"), item_id))

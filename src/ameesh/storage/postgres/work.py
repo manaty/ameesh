@@ -21,6 +21,8 @@ ITEM_COLUMNS = """
     superseded_by, delegated_by,
     expected_value, value_score, priority, team, required_capabilities,
     branch, branch_target, branch_head, migration,
+    extract(epoch from branch_head_at)::float8 as branch_head_ts,
+    partial_merge, extract(epoch from partial_seen_at)::float8 as partial_seen_ts,
     estimate_minutes, estimate_source, estimate_by, change_size,
     extract(epoch from estimate_at)::float8 as estimate_ts,
     extract(epoch from started_at)::float8 as started_ts,
@@ -135,6 +137,35 @@ class _Refrozen(Exception):
 
 
 class WorkItems(interface.WorkItems):
+
+    def set_app(self, item_id, app, *, actor, if_empty=False, assignee=None) -> dict | None:
+        with self.db.transaction() as tx:
+            rows = tx.query("SELECT %s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
+                            % ITEM_COLUMNS, (int(item_id),))
+            if not rows:
+                return None
+            item = rows[0]
+            if if_empty and ((item.get("app") or "").strip()
+                             or item["state"] in ("merged", "promoted", "closed")
+                             or item.get("assignee") != assignee):
+                return None
+            if item.get("app") == app:
+                return item
+            rows = tx.query("UPDATE work_items SET app = %%s, updated_at = now()"
+                            " WHERE id = %%s RETURNING %s" % ITEM_COLUMNS,
+                            (app, int(item_id)))
+            WorkItems(tx)._event(int(item_id), item["state"],
+                                 "project %r → %r" % (item.get("app"), app), actor)
+            return rows[0]
+
+    def without_project(self) -> list[dict]:
+        return self.db.query("SELECT %s FROM work_items WHERE btrim(coalesce(app, '')) = ''"
+                             " AND state NOT IN %s ORDER BY id" % (ITEM_COLUMNS, _CLOSED))
+
+    def creator(self, item_id) -> str:
+        rows = self.db.query("SELECT actor FROM work_item_events WHERE work_item_id = %s"
+                             " ORDER BY id LIMIT 1", (int(item_id),))
+        return (rows[0].get("actor") or "") if rows else ""
 
     def add(self, *, type, source, app, title, body, issue_ref, workstream,  # noqa: A002
             assignee, budget_usd, note, actor, package_id=None, package_parent=None,
@@ -413,6 +444,10 @@ class WorkItems(interface.WorkItems):
         self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
                         (int(item_id),))
 
+    def lock_deep_analysis(self, item_id) -> None:
+        self.db.query("SELECT pg_advisory_xact_lock(hashtext(%s || current_schema())::bigint)",
+                      ("ameesh_deep_analysis:%d:" % int(item_id),))
+
     def waiting_episodes(self, item_ids) -> dict:
         ids = [int(i) for i in item_ids]
         if not ids:
@@ -447,6 +482,19 @@ class WorkItems(interface.WorkItems):
              ORDER BY id DESC LIMIT %s
             """,
             (int(item_id), int(limit)),
+        )
+
+    def events_noted(self, prefix, since_ts) -> list[dict]:
+        pattern = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        return self.db.query(
+            """
+            SELECT id, work_item_id, state, note, actor,
+                   extract(epoch from created_at)::float8 as created_ts
+              FROM work_item_events
+             WHERE note LIKE %s AND created_at >= to_timestamp(%s)
+             ORDER BY id
+            """,
+            (pattern, float(since_ts)),
         )
 
     def milestones(self, item_id, limit) -> list[dict]:
@@ -516,10 +564,12 @@ class WorkItems(interface.WorkItems):
                 "UPDATE work_items SET"
                 "       branch_head = CASE WHEN branch IS DISTINCT FROM %%s"
                 "                          THEN NULL ELSE branch_head END,"
+                "       branch_head_at = CASE WHEN branch IS DISTINCT FROM %%s"
+                "                             THEN NULL ELSE branch_head_at END,"
                 "       branch = %%s, branch_target = %%s, updated_at = now()"
                 " WHERE id = %%s AND state NOT IN ('merged', 'promoted', 'closed')"
                 " RETURNING %s" % ITEM_COLUMNS,
-                (branch, branch, target, int(item_id)))
+                (branch, branch, branch, target, int(item_id)))
             if not rows:
                 return None
             WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
@@ -595,11 +645,25 @@ class WorkItems(interface.WorkItems):
     def set_branch_head(self, item_id, branch, head) -> bool:
         """Retient le dernier commit de la branche vu en avance sur sa cible
         (sans journal ni `updated_at` : un relevé n'est pas une activité du
-        lot). Conditionné à la branche lue : rien si elle a changé."""
+        lot), et quand (L118d, 0372, horloge de la base). Une pointe inchangée
+        est relevée de nouveau si son instant précède la dernière fusion
+        partielle vue (#346 r2) : elle est encore là après cette fusion.
+        Conditionné à la branche lue : rien si elle a changé."""
         rows = self.db.query(
-            "UPDATE work_items SET branch_head = %s"
-            " WHERE id = %s AND branch = %s AND branch_head IS DISTINCT FROM %s"
+            "UPDATE work_items SET branch_head = %s, branch_head_at = clock_timestamp()"
+            " WHERE id = %s AND branch = %s AND (branch_head IS DISTINCT FROM %s"
+            "       OR branch_head_at IS NULL OR branch_head_at <= partial_seen_at)"
             " RETURNING id", (head, int(item_id), branch, head))
+        return bool(rows)
+
+    def set_partial_seen(self, item_id, sha) -> bool:
+        """#346 r2 : retient la dernière fusion partielle du lot et l'instant
+        (horloge de la base) où le relevé l'a vue la première fois ; rien si
+        c'est déjà elle (sans journal ni `updated_at`)."""
+        rows = self.db.query(
+            "UPDATE work_items SET partial_merge = %s, partial_seen_at = clock_timestamp()"
+            " WHERE id = %s AND partial_merge IS DISTINCT FROM %s"
+            " RETURNING id", (sha, int(item_id), sha))
         return bool(rows)
 
     def open_for_sweep(self, limit) -> list[dict]:

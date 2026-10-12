@@ -29,7 +29,8 @@ FSID_SYSTEM = "bb" * 16
 
 class _Tmp(unittest.TestCase):
     def setUp(self) -> None:
-        self.tmp = tempfile.mkdtemp(prefix="ameesh-253-")
+        # resolved: the volume readers resolve symlinks (#289 r1)
+        self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="ameesh-253-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         resources._docker_root.clear()
         self.addCleanup(resources._docker_root.clear)
@@ -94,6 +95,114 @@ class DiskPathsTest(_Tmp):
         self.assertEqual(self.paths(self.cfg())[-1], os.sep)
 
 
+class TmpfsRootsTest(_Tmp):
+    """#306 (2): state on a tmpfs and the turns' tmp root on another tmpfs:
+    both are sampled, the fullest one is the reading's tmp measure."""
+
+    def test_fullest_tmpfs_among_the_tmp_roots(self):
+        turn_tmp, system = self.dir("turn-tmp"), self.dir("tmp")
+        cfg = types.SimpleNamespace(worktree_roots=[], state_dir=self.dir("state"))
+        policy = menage.Policy(tmp_root=turn_tmp)
+        sizes = {turn_tmp: (10 * GIB, 9.5 * GIB), system: (12 * GIB, 1 * GIB)}
+
+        def usage(path, **_kw):
+            size, used = sizes[path]
+            return {"tmp_path": path, "tmp_fstype": "tmpfs",
+                    "tmp_size_bytes": int(size), "tmp_used_bytes": int(used)}
+
+        with mock.patch.dict(os.environ, {"AMEESH_SYSTEM_TMP": system}), \
+                mock.patch.object(menage, "in_memory", return_value=True), \
+                mock.patch.object(menage, "_disk_root", side_effect=lambda d, _: d), \
+                mock.patch.object(resources, "docker_root", return_value=None):
+            self.assertEqual(resources.tmp_paths(cfg, policy), [turn_tmp, system])
+            self.assertNotIn(turn_tmp, resources.disk_paths(cfg, policy))
+            with mock.patch.object(resources, "fs_usage", side_effect=usage):
+                reading = resources.sample("pc", paths=[], now=1.0,
+                                           tmp=resources.tmp_paths(cfg, policy))
+        self.assertEqual(reading["tmp_path"], turn_tmp)
+        self.assertEqual(resources.tmpfs_fraction(reading), 0.95)
+        limits = resources.thresholds({})
+        found = {b["key"]: b for b in resources.breaches(reading, limits)}
+        self.assertIn(turn_tmp, found["max_tmpfs_used"]["label"])
+        with mock.patch.object(resources, "fs_usage", side_effect=usage):
+            self.assertEqual(resources.sample("pc", paths=[], now=1.0,
+                                              tmp=system)["tmp_path"], system)
+
+    def test_the_tmp_type_is_the_mount_the_path_resolves_to(self):
+        # #289 r2 (2): a tmpfs at /turn/tmpfs, then an ext4 mounted over
+        # /turn: /turn/tmpfs/managed is on the ext4, never read as a tmpfs
+        managed = self.dir("turn", "tmpfs", "managed")
+        turn = os.path.join(self.tmp, "turn")
+        table = [{"id": 1, "point": os.sep, "dev": 1, "fstype": "ext4", "source": "/dev/a"},
+                 {"id": 7, "point": os.path.join(turn, "tmpfs"), "dev": 7, "fstype": "tmpfs",
+                  "source": "tmpfs"},
+                 {"id": 8, "point": turn, "dev": 8, "fstype": "ext4", "source": "/dev/e"}]
+        for answer in (8, None):    # the kernel's mount id, else the visible mount
+            with mock.patch.object(platform, "is_linux", return_value=True), \
+                    mock.patch.object(platform, "mountinfo", return_value=table), \
+                    mock.patch.object(platform, "mount_id", return_value=answer):
+                reading = resources.fs_usage(managed)
+            self.assertEqual(reading["tmp_fstype"], "ext4")
+            self.assertIsNone(resources.tmpfs_fraction(reading))
+
+    def test_a_tmp_root_not_created_yet_is_read_on_its_tmpfs(self):
+        # #289 r1 (3): the managed tmp root does not exist yet on a 95 % full
+        # tmpfs; the system tmp is at 10 %: the tmpfs it will live on is read
+        turn_tmp, system = self.dir("turn-tmp"), self.dir("tmp")
+        managed = os.path.join(turn_tmp, "ameesh", "tmp")
+        sizes = {turn_tmp: (10 * GIB, 9.5 * GIB), system: (10 * GIB, 1 * GIB)}
+
+        def usage(path, **_kw):
+            if path not in sizes:   # the real fs_usage: no reading off a dir
+                return {"tmp_path": path, "tmp_fstype": None,
+                        "tmp_size_bytes": None, "tmp_used_bytes": None}
+            size, used = sizes[path]
+            return {"tmp_path": path, "tmp_fstype": "tmpfs",
+                    "tmp_size_bytes": int(size), "tmp_used_bytes": int(used)}
+
+        with mock.patch.object(resources, "fs_usage", side_effect=usage):
+            reading = resources.tmp_usage([managed, system])
+        self.assertEqual(reading["tmp_path"], managed)
+        self.assertEqual(resources.tmpfs_fraction(reading), 0.95)
+
+
+class MountinfoTest(_Tmp):
+    """#306: the mount table, read without touching the mount points."""
+
+    def test_parse_and_deepest_covering_mount(self):
+        path = os.path.join(self.tmp, "mountinfo")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("33 2 0:30 /@ / rw,relatime shared:1 - btrfs /dev/mapper/root rw\n"
+                     "60 33 0:30 /@home /home rw shared:2 - btrfs /dev/mapper/root rw\n"
+                     "70 33 259:3 / /data/my\\040disk rw - ext4 /dev/nvme1n1p1 rw\n"
+                     "71 70 0:44 / /data/my\\040disk/private/docker rw shared:9"
+                     " master:3 - btrfs /dev/sdb rw\n"
+                     "garbage\n")
+        table = platform.mountinfo(path)
+        self.assertEqual([m["point"] for m in table],
+                         ["/", "/home", "/data/my disk", "/data/my disk/private/docker"])
+        self.assertEqual(table[2]["dev"], os.makedev(259, 3))
+        self.assertEqual((table[3]["fstype"], table[3]["source"]), ("btrfs", "/dev/sdb"))
+        deep = platform.covering_mount("/data/my disk/private/docker/overlay2", table)
+        self.assertEqual(deep["dev"], os.makedev(0, 44))
+        self.assertEqual(platform.covering_mount("/data/my disk/x", table)["point"],
+                         "/data/my disk")
+        self.assertEqual(platform.covering_mount("/homework", table)["point"], "/")
+        self.assertEqual(platform.mountinfo(os.path.join(self.tmp, "none")), [])
+        self.assertEqual([m["id"] for m in table], [33, 60, 70, 71])
+        # #289 r1: a mount over a parent hides the deeper one
+        table.append({"id": 80, "point": "/data/my disk/private", "dev": 9,
+                      "fstype": "ext4", "source": "/dev/x"})
+        self.assertEqual(platform.covering_mount(
+            "/data/my disk/private/docker/overlay2", table)["id"], 80)
+
+    def test_mount_id_names_the_mount_a_path_resolves_to(self):
+        if not platform.is_linux():
+            self.skipTest("Linux only")
+        self.assertEqual(platform.mount_id(self.tmp), platform.covering_mount(self.tmp)["id"])
+        self.assertIsNone(platform.mount_id(os.path.join(self.tmp, "missing")))
+
+
 class DockerRootTest(_Tmp):
     def run_docker(self, stdout="/var/lib/docker\n", code=0):
         return subprocess.CompletedProcess([], code, stdout=stdout, stderr="")
@@ -128,7 +237,7 @@ class DockerRootTest(_Tmp):
 
 class VolumesTest(_Tmp):
     def fake(self, fsids: dict, free: dict, btrfs: dict):
-        """Patches the readers: btrfs fsid, free space and allocation per path."""
+        """Fake disks and healthy non-disk readings, independent of runner load."""
         def fs_info(path):
             for prefix, fsid in fsids.items():
                 if path.startswith(prefix):
@@ -151,7 +260,21 @@ class VolumesTest(_Tmp):
         return [mock.patch.object(platform, "is_linux", return_value=True),
                 mock.patch.object(platform, "btrfs_fs_info", side_effect=fs_info),
                 mock.patch.object(resources, "btrfs_usage", side_effect=usage),
-                mock.patch.object(resources, "disk_free", side_effect=disk)]
+                mock.patch.object(resources, "disk_free", side_effect=disk),
+                mock.patch.object(resources, "load1", return_value=0.0),
+                mock.patch.object(resources, "cpu_count", return_value=4),
+                mock.patch.object(resources, "_meminfo", return_value={
+                    "mem_total_bytes": 32 * GIB, "mem_available_bytes": 16 * GIB,
+                    "swap_used_bytes": 0}),
+                mock.patch.object(resources, "tmp_usage", return_value={}),
+                mock.patch.object(resources, "power", return_value={}),
+                mock.patch.object(resources, "psi", return_value={
+                    "psi_cpu_some": 0.0, "psi_mem_some": 0.0,
+                    "psi_mem_full": 0.0, "psi_io_some": 0.0}),
+                mock.patch.object(resources, "guest_cgroups", return_value=[]),
+                mock.patch.object(resources, "guest_memory", return_value=0),
+                mock.patch.object(resources._CPU_METER, "read", return_value={
+                    "app_cpu": 0.0, "guest_cpu": 0.0, "cpu_window_s": 1.0})]
 
     def test_dedupe_by_btrfs_fsid(self):
         ssd, state, cache = self.dir("ssd"), self.dir("system", "state"), \
@@ -217,6 +340,131 @@ class VolumesTest(_Tmp):
         vol = resources.volumes([missing])[0]
         self.assertEqual(vol["path"], missing)
         self.assertEqual(vol["disk_free_bytes"], 50 * GIB)
+
+    def test_mount_behind_an_untraversable_dir_never_read_on_its_parent(self):
+        """#306 (1): a btrfs mounted AT /data/private/docker, `private` denying
+        traversal: the docker volume is read through another reachable mount
+        of its filesystem, else unreadable — never on the healthy /data."""
+        data = self.dir("data")
+        docker = self.dir("data", "private", "docker")
+        other = self.dir("dockerfs")
+        private = os.path.dirname(docker)
+        os.chmod(private, 0)
+        self.addCleanup(os.chmod, private, 0o700)
+        try:
+            os.stat(docker)
+            self.skipTest("running as root")
+        except OSError:
+            pass
+        table = [{"id": 1, "point": os.sep, "dev": 1, "fstype": "ext4", "source": "/dev/a"},
+                 {"id": 2, "point": data, "dev": 2, "fstype": "btrfs", "source": "/dev/b"},
+                 {"id": 3, "point": docker, "dev": 3, "fstype": "btrfs", "source": "/dev/c"}]
+        patches = self.fake({data: FSID_SYSTEM, other: FSID_SSD},
+                            {data: 70 * GIB, other: 30 * GIB},
+                            {data: (300 * GIB, 5 * GIB), other: (0, 1 * GIB)})
+        patches.append(mock.patch.object(platform, "mount_id",
+                                         side_effect=lambda p: 4 if p == other else None))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        with mock.patch.object(platform, "mountinfo", return_value=table):
+            self.assertIsNone(resources._anchor(docker))
+            vols = resources.volumes([data, docker])
+        self.assertEqual([v["path"] for v in vols], [data, docker])
+        self.assertTrue(vols[1]["unreadable"])
+        self.assertIsNone(vols[1]["btrfs_unallocated_bytes"])
+        self.assertEqual(vols[0]["btrfs_unallocated_bytes"], 300 * GIB)
+        # the same filesystem also mounted where the executor can reach it
+        table.append({"id": 4, "point": other, "dev": 3, "fstype": "btrfs", "source": "/dev/c"})
+        with mock.patch.object(platform, "mountinfo", return_value=table):
+            self.assertEqual(resources._probe(docker), other)
+            reading = resources.sample("pc", paths=[data, docker], now=1.0)
+        self.assertEqual(reading["btrfs_unallocated_bytes"], 0)
+        limits = resources.thresholds({"resources": {"min_btrfs_unallocated": "10GiB"}})
+        found = {b["key"]: b for b in resources.breaches(reading, limits)}
+        self.assertEqual(found["min_btrfs_unallocated"]["path"], docker)
+
+    def untraversable_docker(self):
+        """(data, docker): /data/private/docker, `private` denying traversal;
+        skipped as root."""
+        data = self.dir("data")
+        docker = self.dir("data", "private", "docker")
+        private = os.path.dirname(docker)
+        os.chmod(private, 0)
+        self.addCleanup(os.chmod, private, 0o700)
+        try:
+            os.stat(docker)
+            self.skipTest("running as root")
+        except OSError:
+            pass
+        for p in self.fake({data: FSID_SYSTEM}, {data: 70 * GIB}, {data: (300 * GIB, 5 * GIB)}):
+            p.start()
+            self.addCleanup(p.stop)
+        return data, docker
+
+    def test_a_mount_hidden_by_a_mount_over_its_parent_is_not_read(self):
+        """#289 r1 (1): the docker filesystem also mounted at /rescue/fs, then
+        /rescue mounted over by a healthy filesystem holding a `fs` dir: the
+        docker volume is not read on that healthy `fs`."""
+        data, docker = self.untraversable_docker()
+        rescue_fs = self.dir("rescue", "fs")
+        rescue = os.path.dirname(rescue_fs)
+        table = [{"id": 1, "point": os.sep, "dev": 1, "fstype": "ext4", "source": "/dev/a"},
+                 {"id": 2, "point": data, "dev": 2, "fstype": "btrfs", "source": "/dev/b"},
+                 {"id": 3, "point": docker, "dev": 3, "fstype": "btrfs", "source": "/dev/c"},
+                 {"id": 4, "point": rescue_fs, "dev": 3, "fstype": "btrfs", "source": "/dev/c"},
+                 {"id": 5, "point": rescue, "dev": 5, "fstype": "ext4", "source": "/dev/e"}]
+        # the kernel resolves /rescue/fs to the mount over /rescue
+        ids = {rescue_fs: 5, rescue: 5}
+        with mock.patch.object(platform, "mountinfo", return_value=table), \
+                mock.patch.object(platform, "mount_id", side_effect=ids.get):
+            self.assertEqual(platform.covering_mount(rescue_fs, table)["id"], 5)
+            self.assertIsNone(resources._anchor(docker))
+            # listed in another order, the mount id alone still tells
+            with mock.patch.object(platform, "mountinfo",
+                                   return_value=[table[i] for i in (0, 1, 2, 4, 3)]):
+                self.assertIsNone(resources._anchor(docker))
+                vols = resources.volumes([data, docker])
+                self.assertTrue(vols[1]["unreadable"])
+                # where the kernel does reach that mount, it is read there
+                ids[rescue_fs] = 4
+                self.assertEqual(resources._anchor(docker), rescue_fs)
+
+    def test_an_alternate_mount_must_open_read_only(self):
+        """#289 r2 (1): O_PATH opens a mode-000 directory; the btrfs ioctls
+        need O_RDONLY. /rescue (mode 000) and /rescue2 (readable) mount the
+        docker filesystem: /rescue2 is read."""
+        data, docker = self.untraversable_docker()
+        rescue, rescue2 = self.dir("rescue"), self.dir("rescue2")
+        os.chmod(rescue, 0)
+        self.addCleanup(os.chmod, rescue, 0o700)
+        table = [{"id": 1, "point": os.sep, "dev": 1, "fstype": "ext4", "source": "/dev/a"},
+                 {"id": 2, "point": data, "dev": 2, "fstype": "btrfs", "source": "/dev/b"},
+                 {"id": 3, "point": docker, "dev": 3, "fstype": "btrfs", "source": "/dev/c"},
+                 {"id": 4, "point": rescue, "dev": 3, "fstype": "btrfs", "source": "/dev/c"},
+                 {"id": 5, "point": rescue2, "dev": 3, "fstype": "btrfs", "source": "/dev/c"}]
+        with mock.patch.object(platform, "mountinfo", return_value=table), \
+                mock.patch.object(platform, "mount_id", side_effect={rescue: 4, rescue2: 5}.get):
+            self.assertEqual(resources._anchor(docker), rescue2)
+            os.chmod(rescue2, 0)
+            self.addCleanup(os.chmod, rescue2, 0o700)
+            self.assertIsNone(resources._anchor(docker))
+
+    def test_a_symlink_to_an_unreachable_mount_is_resolved(self):
+        """#289 r1 (2): /docker -> /data/private/docker, a mount behind an
+        untraversable dir: unreadable, never credited to the link's parent."""
+        data, docker = self.untraversable_docker()
+        link = os.path.join(self.tmp, "docker-link")
+        os.symlink(docker, link)
+        table = [{"id": 1, "point": os.sep, "dev": 1, "fstype": "ext4", "source": "/dev/a"},
+                 {"id": 2, "point": data, "dev": 2, "fstype": "btrfs", "source": "/dev/b"},
+                 {"id": 3, "point": docker, "dev": 3, "fstype": "btrfs", "source": "/dev/c"}]
+        with mock.patch.object(platform, "mountinfo", return_value=table):
+            self.assertIsNone(resources._anchor(link))
+            self.assertEqual(resources.volume_key(link), "mount:3")
+            vols = resources.volumes([data, link])
+        self.assertEqual([v["path"] for v in vols], [data, link])
+        self.assertTrue(vols[1]["unreadable"])
 
     def test_sample_takes_the_worst_reading_per_floor(self):
         ssd, state = self.dir("ssd"), self.dir("system", "state")

@@ -100,6 +100,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    latest_gauges assigners record_balance balances
    session_bindings active bind set_pid revoke listing with_pids
    budgets         limits put events
+   watches         put delete list deliver
    turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
                    stale_running churn
    housekeeping    log recent summary last_measure register_worktree worktrees
@@ -150,6 +151,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    jetable par classe, TRUNCATE) : à rendre propres au pilote.
 """
 from __future__ import annotations
+
+from .conversations import Conversations
 
 import abc
 from typing import Any, Callable, Protocol, Sequence
@@ -549,6 +552,38 @@ class Budgets(Domain):
 
 
 # --------------------------------------------------------------------------
+# watches managed by ameesh (L121, migration 0362)
+# --------------------------------------------------------------------------
+
+class Watches(Domain):
+    """The periodic watches of agents (`ameesh watch`): one row per watched
+    agent, with the host that holds its timer."""
+
+    @abc.abstractmethod
+    def put(self, agent: str, every_s: int, host: str, *, actor: str) -> dict:
+        """Records (or moves) the watch of `agent`; the row written: agent,
+        every_s, host, enabled_by, enabled_ts, last_sent_ts."""
+
+    @abc.abstractmethod
+    def delete(self, agent: str, host: str | None = None) -> dict | None:
+        """Removes the watch of `agent` (only if it is on `host`, when
+        given: a watch moved meanwhile stays); the row removed, None if none."""
+
+    @abc.abstractmethod
+    def list(self, agent: str | None = None) -> list[dict]:
+        """The watches (of `agent` only if given), by agent name."""
+
+    @abc.abstractmethod
+    def deliver(self, agent: str, host: str, send: Callable[[Any], None]) -> dict | None:
+        """One firing, in one transaction: the watch row of `agent` is locked;
+        if it is on `host`, `send(tx)` drops the message in that transaction
+        and `last_sent_ts` is set. A move or
+        a disable from another host waits for the end of the firing. The row
+        read (with `sent` true or false), None if there is no watch; `send`
+        raising rolls the transaction back."""
+
+
+# --------------------------------------------------------------------------
 # comptes multiples par fournisseur (L30, décision 0027, migration 0028)
 # --------------------------------------------------------------------------
 
@@ -902,6 +937,19 @@ class WorkItems(Domain):
     """Lots et journal de leurs transitions (ledger de reprise)."""
 
     @abc.abstractmethod
+    def set_app(self, item_id: int, app: str, *, actor: str,
+                if_empty: bool = False, assignee: str | None = None) -> dict | None:
+        """L118c: journaled project correction, atomically with its old value."""
+
+    @abc.abstractmethod
+    def without_project(self) -> list[dict]:
+        """L118c: open lots with empty app, once per id, including waiting_human."""
+
+    @abc.abstractmethod
+    def creator(self, item_id: int) -> str:
+        """Actor of the first journal entry, without truncating long journals."""
+
+    @abc.abstractmethod
     def add(self, *, type: str, source: str, app: str, title: str, body: str,  # noqa: A002
             issue_ref: str | None, workstream: str | None, assignee: str | None,
             budget_usd: float | None, note: str, actor: str,
@@ -1008,7 +1056,12 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def set_branch_head(self, item_id: int, branch: str, head: str | None) -> bool:
         """L118 : retient le dernier commit de la branche vu en avance sur sa
-        cible, si la branche du lot est toujours `branch`."""
+        cible, si la branche du lot est toujours `branch` (et quand, L118d)."""
+
+    @abc.abstractmethod
+    def set_partial_seen(self, item_id: int, sha: str) -> bool:
+        """#346 r2 : retient la dernière fusion partielle `sha` du lot et
+        l'instant où le relevé l'a vue la première fois."""
 
     @abc.abstractmethod
     def open_for_sweep(self, limit: int) -> list[dict]:
@@ -1055,6 +1108,13 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def note(self, item_id: int, state: str, text: str, actor: str) -> None:
         """Journalise une note et rafraîchit `updated_at`."""
+
+    @abc.abstractmethod
+    def lock_deep_analysis(self, item_id: int) -> None:
+        """L317c : verrou consultatif de transaction propre au lot, pris avant
+        de relire puis d'écrire une demande d'analyse profonde (deux demandes
+        simultanées ne voient pas toutes deux « rien de demandé »). À appeler
+        dans `db.transaction()`."""
 
     @abc.abstractmethod
     def assign(self, item_id: int, assignee: str, *, current: str | None, note: str,
@@ -1107,6 +1167,11 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def events(self, item_id: int, limit: int) -> list[dict]:
         """Journal du lot, du plus récent au plus ancien."""
+
+    @abc.abstractmethod
+    def events_noted(self, prefix: str, since_ts: float) -> list[dict]:
+        """L317c : les lignes de journal, tous lots, dont la note commence par
+        `prefix`, écrites depuis `since_ts` (les plus anciennes d'abord)."""
 
     @abc.abstractmethod
     def milestones(self, item_id: int, limit: int) -> list[dict]:
@@ -1737,8 +1802,8 @@ class Progress(Domain):
     @abc.abstractmethod
     def package_items(self) -> list[dict]:
         """TOUS les lots rattachés à une fiche (id, package_id, state,
-        close_reason, updated_ts) : la progression d'un epic ne dépend pas de
-        la fenêtre."""
+        close_reason, app, updated_ts) : la progression d'un epic ne dépend
+        pas de la fenêtre ; `app` (L304) rattache un jalon à ses projets."""
 
     @abc.abstractmethod
     def lot_actions(self, item_ids: Sequence[int]) -> list[dict]:
@@ -1778,7 +1843,8 @@ class Projects(Domain):
 
     @abc.abstractmethod
     def board(self, *, max_lots: int) -> dict:
-        """`{"agents": [...], "lots": [...], "dead_letters": [...], "decisions": [...]}`.
+        """`{"agents": [...], "lots": [...], "dead_letters": [...], "decisions": [...],
+        "watches": [...]}` (`watches`, L121: agent, every_s, host, last_sent_ts).
 
         `agents` : un élément par agent du registre — name, chantier, team,
         harness, host, provider, credential_mode, status, status_text, mode,
@@ -1979,15 +2045,20 @@ class Operations(Domain):
         epoch, échéance recontrôlée). Faux si le bail n'est plus le nôtre."""
 
     @abc.abstractmethod
-    def listing(self) -> list[dict]:
+    def listing(self, *, today: str | None = None) -> list[dict]:
         """Une ligne par agent : réglages, dossier de travail (`cwd`), statut et
         `status_since_ts`, bail
         (`lease_live`, `lease_expires_ts`), tour en cours (`turn_started_ts`,
         `turn_label` du marqueur comptable), non-lus qui ouvriront un tour
         (`unread`, `oldest_unread_ts` ; L125 : hors courrier passif, compté à
         part dans `passive_unread`), lot de session (`session_work_item`,
-        `session_lot_title`, `session_lot_state`), lot assigné ouvert le plus
+        `session_lot_title`, `session_lot_state`, `session_lot_later` : son
+        début prévu est après aujourd'hui), lot assigné ouvert le plus
         récent (`assigned_lot_id`, `assigned_lot_title`, `assigned_lot_state`),
+        lots qui l'occupent (`active_lots`, L165b : assignés, ouverts, ni en
+        `qa`/`waiting_human`/`blocked`, ni prévus après aujourd'hui ;
+        « aujourd'hui » : `today`, jour ISO, par défaut le jour local de
+        l'hôte, jamais celui du fuseau de la base),
         dernier tour du grand livre (`last_turn_reread_tokens` = entrée +
         entrée en cache, `last_turn_session`, `last_turn_recorded_ts`) et
         demande de redémarrage (`restart_requested_ts`)."""
@@ -2049,11 +2120,12 @@ class Operations(Domain):
         title, state, updated_ts, du plus récemment modifié au plus ancien."""
 
     @abc.abstractmethod
-    def open_lots_activity(self, limit: int) -> list[dict]:
+    def open_lots_activity(self, limit: int | None) -> list[dict]:
         """Lots ouverts avec leur DERNIÈRE activité (`last_activity_ts`) :
         maximum de la ligne du lot, de ses transitions, jalons, actions et
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
-        assignee. Les plus anciennement actifs d'abord."""
+        assignee. Les plus anciennement actifs d'abord. `limit=None` lit
+        toute la vérité avant le filtrage des attentes planifiées (L368)."""
 
     @abc.abstractmethod
     def turns(self, *, agent: str | None, since_s: float, limit: int) -> list[dict]:
@@ -2488,6 +2560,7 @@ class Storage(abc.ABC):
     accounts: Accounts
     credentials: Credentials
     budgets: Budgets
+    watches: Watches
     mailbox: Mailbox
     wakeups: Wakeups
     keys: Keys
@@ -2514,3 +2587,4 @@ class Storage(abc.ABC):
     housekeeping: Housekeeping
     session_bindings: SessionBindings
     ci: CiResults
+    conversations: Conversations

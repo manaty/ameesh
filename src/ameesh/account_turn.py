@@ -69,7 +69,8 @@ def choose(worker, book=None, *, pause: bool = True) -> str | None:
     try:
         choice = accounts.choose(worker.db, worker.cfg.host, harness, items, book,
                                  agent=worker.name, paced=pause,
-                                 session_account=session_account(worker, items))
+                                 session_account=session_account(worker, items),
+                                 critical=is_critical(worker))
     except db_mod.Unavailable:
         # Base injoignable (L72) : ce n'est ni une pause budget ni un problème
         # de migration — l'exécuteur suspend les tours et réessaie, avec son
@@ -89,6 +90,16 @@ def choose(worker, book=None, *, pause: bool = True) -> str | None:
     log_choice(worker, harness, choice)
     worker._account = choice.profile
     return ""
+
+
+def is_critical(worker) -> bool:
+    """L242b : l'agent est-il critique (orchestrateur, conception, auditeur,
+    ou déclaré) ? Son compte est alors choisi pour lui seul (`accounts.choose`)."""
+    check = getattr(getattr(worker, "runner", None), "is_critical", None)
+    try:
+        return bool(check and check(worker.name, worker.agent))
+    except Exception:  # noqa: BLE001 - rôles illisibles : le choix ordinaire
+        return False
 
 
 def session_account(worker, items) -> str | None:
@@ -143,8 +154,23 @@ def journal(worker, harness: str, switched: dict) -> None:
     """Une bascule = une ligne de journal + une entrée dans le fil de l'équipe.
 
     La ligne `account_switches` est déjà écrite (même transaction que le
-    changement de compte) ; ici, la trace lisible.
+    changement de compte) ; ici, la trace lisible. L242b : la bascule propre
+    à un agent critique (`kind` `agent`) n'a pas de ligne en base ; sa trace
+    n'est écrite qu'une fois par changement.
     """
+    if switched["kind"] == "agent":
+        cle = (switched["from"], switched["to"])
+        if getattr(worker, "_agent_switch_logged", None) == cle:
+            return
+        worker._agent_switch_logged = cle
+        texte = ("Account switch %s for this critical agent only: %s → %s (%s). The "
+                 "shared choice and any force stay as they are." % (
+                     harness, switched["from"], switched["to"], switched["reason"]))
+        _log("[%s] %s" % (worker.name, texte))
+        worker._fil_note(texte, meta={"action": "compte", "type": "agent",
+                                      "harnais": harness, "de": switched["from"],
+                                      "vers": switched["to"]})
+        return
     texte = ("Account switch %s: %s → %s (%s). New sessions go to "
              "account %s; a running session keeps its account while it is under "
              "its threshold (0034)." % (harness, switched["from"], switched["to"],
@@ -386,7 +412,6 @@ def rotate(worker, harness: str, old, new, session: str) -> bool:
             possible, raison = False, "state of the old account unreadable (%s)" % exc
         if not possible:
             _log("[%s] no summary under account %s: %s" % (worker.name, nom_ancien, raison))
-
     if possible:
         # le résumé se fait sous l'ANCIEN compte, qui seul peut reprendre la session
         worker._account_override = old

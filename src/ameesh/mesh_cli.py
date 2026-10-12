@@ -349,6 +349,11 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                 # #253: each filesystem the guard watches; the lines above are
                 # the worst of them
                 others = [p for p in volume.get("paths") or [] if p != volume.get("path")]
+                if volume.get("unreadable"):  # #306: mount out of reach
+                    print("  volume     %s: unreadable (mount point out of reach)%s"
+                          % (volume.get("path"),
+                             " (also %s)" % ", ".join(others) if others else ""))
+                    continue
                 print("  volume     %s: free %s%s%s" % (
                     volume.get("path"), _fmt_bytes(volume.get("disk_free_bytes")),
                     "; btrfs unallocated %s, metadata headroom %s" % (
@@ -357,7 +362,6 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                     if volume.get("btrfs_unallocated_bytes") is not None
                     or volume.get("btrfs_metadata_headroom_bytes") is not None else "",
                     " (also %s)" % ", ".join(others) if others else ""))
-
 
             for line in _host_measure_lines(latest, limits.get("lend")):
                 print(line)
@@ -853,6 +857,39 @@ def _print_delays(row: dict) -> None:
     print("delays   : %s" % spans)
 
 
+def _print_deep_analysis(result: dict | None) -> None:
+    """L317c : ce que `work add` a déclenché chez l'auditeur."""
+    from . import deep_analysis
+    if not result:
+        return
+    if result.get("error"):
+        print("warning: deep analysis not requested (%s)" % result["error"], file=sys.stderr)
+    elif not result.get("requested"):
+        print("analysis : not requested again (%s)" % (result.get("reason") or "?"))
+    elif result.get("auditors"):
+        print("analysis : deep analysis requested from %s, first report due within %d min"
+              % (", ".join(result["auditors"]), int(deep_analysis.DEADLINE_S // 60)))
+    else:
+        print("warning: deep analysis requested on the lot, but no auditor is registered "
+              "to receive it", file=sys.stderr)
+
+
+def _deep_analysis_line(found: dict) -> str:
+    """L317c : la demande d'analyse profonde d'un lot et le délai de son
+    premier rapport (« deep analysis (bug_p1) requested … — report after … »)."""
+    from . import deep_analysis
+    head = "deep analysis (%s) requested %s" % (found["trigger"] or "?",
+                                                _fmt_moment(found["requested_ts"]))
+    deadline = int(deep_analysis.DEADLINE_S // 60)
+    if found["report_ts"] is not None:
+        return "%s — first report after %s by %s%s" % (
+            head, _fmt_span(found["delay_s"]), found["reporter"] or "?",
+            " (over the %d min deadline)" % deadline if found["overdue"] else "")
+    return "%s — no report yet, waiting for %s%s" % (
+        head, _fmt_span(found["delay_s"]),
+        " (over the %d min deadline)" % deadline if found["overdue"] else "")
+
+
 def cmd_review_class(cfg: Config, args: argparse.Namespace) -> int:
     """La classe de revue d'un changement (décision 0018 point 1, R19).
 
@@ -946,7 +983,7 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
     if args.work_command == "move" and getattr(args, "correct", None) is not None:
         args.actor = work.corrector(cfg, db, args.actor)
         return
-    if args.work_command in _OWN_ACTOR or getattr(args, "actor", None) is None:
+    if args.work_command in (*_OWN_ACTOR, "set-app", "backfill-app") or getattr(args, "actor", None) is None:
         return
     args.actor, warning = work.resolve_actor(cfg, db, args.actor)
     if warning:
@@ -975,6 +1012,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # L157 : durée estimée, obligatoire pour un agent (refus AVANT la
             # création), avertissement pour un humain
             from . import estimates
+            from . import identity, work_projects
+            binding = identity.resolve_binding(cfg, db)
+            creator = binding.name if binding.ok else args.actor
+            args.app = work_projects.creation_project(cfg, db, creator, args.app)
             minutes = estimates.parse(args.estimate) if args.estimate else None
             warn_estimate = estimates.check(db, args.actor, minutes)
             check = (work.check_assignee(db, args.assignee, externe=args.externe, cfg=cfg)
@@ -1005,6 +1046,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     scheduled["planned_start"], scheduled["planned_end"], scheduled["source"]))
             if warn_estimate:
                 print("warning: %s" % estimates.missing(item["id"]), file=sys.stderr)
+            _print_deep_analysis(item.get("deep_analysis"))
             _print_assignment(check)
             return 0
         if args.work_command == "assign":
@@ -1108,6 +1150,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 return 1
             item["events"] = work.events(db, args.id)
             item["milestones"] = work.milestones(db, args.id)
+            from .modules.storage import ModuleStore
+            item["module_milestones"] = ModuleStore(db).milestones(args.id)
             item["delays"] = work.timeline(db, args.id)
             plan.annotate(db, [item])
             # L96 : dates prévues (feuille de route)
@@ -1131,6 +1175,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # L157c: actual time by phase and merged diff size, once delivered
             from . import lot_measures
             item["measure"] = lot_measures.view(storage.of(db).work.measure(args.id))
+            # L317c: the auditor's automatic deep analysis and its measured delay
+            from . import deep_analysis
+            item["deep_analysis"] = deep_analysis.status(db, args.id, cfg=cfg)
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
                 return 0
@@ -1183,10 +1230,15 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     if item.get("branch_head") else ""))
             if item.get("migration"):
                 print("migration: %04d reserved (L122)" % item["migration"])
+            for mark in item["module_milestones"]:
+                print("module   : %s/%s · %s · by %s" % (
+                    mark["module"], mark["kind"], mark["subject"], mark["actor"]))
             for line in resolutions.show_lines(item["resolutions"], args.id):
                 print("resolut. : %s" % line)
             if item.get("resolutions_error"):
                 print("resolut. : unavailable (%s)" % item["resolutions_error"])
+            if item["deep_analysis"]:
+                print("analysis : %s" % _deep_analysis_line(item["deep_analysis"]))
             if item.get("waiting_for"):
                 print("waiting  : %s" % item["waiting_for"]["label"])
             if item.get("delegation"):
@@ -1243,6 +1295,18 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "note":
             work.note(db, args.id, args.text, actor=args.actor)
             print("note added to lot #%d" % args.id)
+            return 0
+        if args.work_command == "set-app":
+            from . import work_projects
+            item = work_projects.set_app(cfg, db, args.id, args.project, actor=args.actor)
+            print("lot #%d: project %s" % (item["id"], item["app"]))
+            return 0
+        if args.work_command == "backfill-app":
+            from . import work_projects
+            rows = work_projects.backfill_app(cfg, db, actor=args.actor, dry_run=args.dry_run)
+            for row in rows:
+                print("lot #%d: %s — %s" % (row["id"], row["status"],
+                                           row.get("project") or row.get("reason", "changed concurrently")))
             return 0
         if args.work_command == "milestone":
             row = work.milestone(
@@ -1895,11 +1959,12 @@ def build_parser() -> argparse.ArgumentParser:
     work_sub = p_work.add_subparsers(dest="work_command")
     pw_add = work_sub.add_parser("add")
     pw_add.add_argument("--title", required=True)
-    pw_add.add_argument("--type", default="evolution", choices=["bug", "evolution"],
+    pw_add.add_argument("--type", default="evolution",
                         help="an improvement backlog item goes through "
                              "`ameesh work backlog add` (L119)")
     pw_add.add_argument("--source", default="")
-    pw_add.add_argument("--app", default="")
+    pw_add.add_argument("--app", default=None,
+                        help="project; default: the creating agent's registry or own canon")
     pw_add.add_argument("--body", default=None)
     pw_add.add_argument("--issue-ref", default=None)
     pw_add.add_argument("--workstream", default=None)
@@ -2013,6 +2078,17 @@ def build_parser() -> argparse.ArgumentParser:
     pw_note.add_argument("text")
     pw_note.add_argument("--actor", default="")
     pw_note.set_defaults(func=cmd_work)
+
+    pw_app = work_sub.add_parser("set-app", help="correct a lot's project, with a journal entry")
+    pw_app.add_argument("id", type=int)
+    pw_app.add_argument("project")
+    pw_app.add_argument("--actor", default="",
+                        help="human, orchestrator or design agent; default: bound session")
+    pw_app.set_defaults(func=cmd_work)
+    pw_backfill = work_sub.add_parser("backfill-app", help="fill uniquely inferred projects of open lots")
+    pw_backfill.add_argument("--dry-run", action="store_true")
+    pw_backfill.add_argument("--actor", default="")
+    pw_backfill.set_defaults(func=cmd_work)
     pw_ms = work_sub.add_parser(
         "milestone", help="declare a timeline milestone (freeze, verdict) — R19")
     pw_ms.add_argument("id", type=int)
@@ -2352,7 +2428,6 @@ def cmd_accounts(cfg: Config, args) -> int:
             texte = ("Account %s/%s declared healthy on %s by %s: the agents auth_blocked "
                      "on this account resume." % (args.harness, args.account or "(default)",
                                                   cfg.host, qui))
-
             fil.record(cfg, db, sender=qui, recipients=[], text=texte,
                        meta={"action": "compte", "type": "sain", "harnais": args.harness,
                              "compte": args.account, "audit": "accounts"})
