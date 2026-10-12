@@ -15,10 +15,12 @@ The source worktree is retained. Dirty or unpublished work holds the move.
 
 The L232b host adapter drives `ameesh.handoffs.advance`, one bounded step
 per call. Steps are idempotent by operation ID and are serialized against
-other controllers, cancellation and explicit retries. Each journal change
-commits before the next external effect. A controller crash releases its
-lock; its successor inspects existing external effects and resumes the
-checkpoint. Calls must use a dedicated database connection per controller.
+other controllers, cancellation and explicit retries. Each controller
+acquires a durable epoch; journal transactions check that epoch and the
+original lock backend. Before each host call, a CAS commits its effect intent
+under that epoch. An unfinished intent survives lock loss and prevents
+another controller from starting a conflicting effect. Calls must use a
+dedicated database connection per controller.
 
 The adapter must enforce enrolled repository/host identities and approval
 policy. `revalidate` checks current physical capacity including reservations,
@@ -39,7 +41,10 @@ credentials, OAuth caches or private diagnostics in evidence.
 | verified | Close the operation and release the reservation |
 
 Adapter methods are `prepare`, `stop_source`, `publish`, `transfer`,
-`session`, `admit`, `enable`, `verify`, `revalidate` and `restore_source`.
+`session`, `admit`, `enable`, `verify`, `revalidate`, `restore_source` and
+`reconcile_effect`. Each effect receives `controller_epoch`; the host helper
+must durably reject revoked epochs, including requests delayed in transit.
+`revalidate` inspects prerequisites and never starts an executor.
 Proofs are checked by the controller and only allowlisted metadata reaches
 the journal. `verify` may return `{"ok": true, "pending": true}` while the
 first authenticated turn is still running. This leaves the operation active.
@@ -55,6 +60,20 @@ the recorded host and checkpoint and never rolls back over target work.
 restoration. After switching, reconcile the destination and retry forward;
 source restoration is refused because the destination may have new work.
 Source cleanup requires a separate retention decision after verification.
+
+An interrupted host call requires explicit `retry` reconciliation before
+ordinary progress resumes. `reconcile_effect` must durably fence the old
+epoch and quiesce all its host jobs, including delayed calls, then return
+`{"ok": true, "quiesced": true, "epoch": PREVIOUS_EPOCH}`. A missing,
+failed or mismatched proof leaves the intent blocking progress. Replaying
+an uncertain effect without that proof is refused. Cancellation records
+`cancel_requested` before restoring the source; reconciliation preserves
+this decision, and only cancellation may then resume.
+
+Reservation expiry is checked again after admission and immediately before
+enabling a destination. Canon writes compare the lease epoch read during
+synchronization, so a write from before the switch is refused even after
+the handoff reaches `verified`.
 
 L232a is tested with simulated adapters and local Git repositories. It does
 not install a real host adapter, enable production agents, copy secrets,

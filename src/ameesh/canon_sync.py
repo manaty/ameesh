@@ -1277,6 +1277,10 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             "placement_ref": verdict.ref,
             # L42 (0031) : canon déclarant (NULL pour le canon par défaut)
             "canon": None if canon.is_default else ident,
+            # Reject writes based on a pre-handoff read, including after the
+            # handoff is terminal. A missing-row read cannot overwrite a row
+            # inserted concurrently by another synchronizer.
+            "_expected_lease_epoch": row["lease_epoch"] if row is not None else -1,
         }
         if row is None:
             _write_declared(db, name, values)

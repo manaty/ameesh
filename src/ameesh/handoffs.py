@@ -17,6 +17,7 @@ import uuid
 from urllib.parse import urlsplit
 
 from . import projects, resources, storage
+from .db import DbError
 
 GIB = 1024 ** 3
 MAX_AGE = 60
@@ -234,11 +235,26 @@ def _adapter_call(adapter, step, op):
 def _serialized(function):
     @wraps(function)
     def step(db, operation, adapter, **kwargs):
-        with storage.of(db).handoffs.controller(operation) as tx:
-            if tx is None:
-                raise HandoffError("another controller is processing this handoff")
-            return function(tx, operation, adapter, **kwargs)
+        try:
+            with storage.of(db).handoffs.controller(operation, reconcile=function.__name__ == "retry") as tx:
+                if tx is None:
+                    raise HandoffError("another controller or unfinished host effect is processing this handoff")
+                return function(tx, operation, adapter, **kwargs)
+        except DbError:
+            raise HandoffError("handoff controller ownership lost; explicit reconciliation required") from None
     return step
+
+
+def _effect(api, adapter, step, op):
+    intent = api.begin_effect(op["id"], op["state"], step)
+    if intent is None:
+        raise HandoffError("host effect refused: reservation or controller intent changed")
+    intent["controller_epoch"] = intent["evidence"]["controller_epoch"]
+    result = _adapter_call(adapter, step, intent)
+    # An exception or lock loss leaves the durable intent in place: nobody
+    # can overtake an external effect whose completion is unknown.
+    api.finish_effect(op["id"], intent["controller_epoch"])
+    return result
 
 
 @_serialized
@@ -257,10 +273,12 @@ def advance(db, operation, adapter):
     state = op["state"]
     if state in ("verified", "cancelled", "held"):
         return op
+    if op["evidence"].get("cancel_requested"):
+        raise HandoffError("source restoration requested; only cancellation may resume")
     try:
         if op["reserved_until_ts"] <= time.time():
             raise HandoffError("reservation expired; explicit replan required")
-        if _adapter_call(adapter, "revalidate", op) is not True:
+        if _effect(api, adapter, "revalidate", op) is not True:
             raise HandoffError("host policy, capacity or credentials changed")
         if state == "prepared":
             return api.drain(operation) or op  # active lot/turn keeps running
@@ -270,16 +288,16 @@ def advance(db, operation, adapter):
                 raise HandoffError("source identity or destination admission changed before switch")
             return switched
         if state == "drained":
-            if _adapter_call(adapter, "stop_source", op) is not True:
+            if _effect(api, adapter, "stop_source", op) is not True:
                 raise HandoffError("source executor not stopped")
         if state == "activated":
             op = api.unfence(operation, state, state)
             if op is None:
                 raise HandoffError("destination admission changed before enable")
-            if _adapter_call(adapter, "enable", op) is not True:
+            if _effect(api, adapter, "enable", op) is not True:
                 raise HandoffError("destination executor not enabled")
         step, next_state = STEPS[state]
-        result = _adapter_call(adapter, step, op)
+        result = _effect(api, adapter, step, op)
         if step == "verify" and isinstance(result, dict) and result.get("ok") is True and result.get("pending") is True:
             return op  # destination's first authenticated turn is still running
         proof = _proof(step, result, op)
@@ -307,7 +325,7 @@ def cancel(db, operation, adapter):
         return op
     if state in ("switched", "activated", "verified"):
         raise HandoffError("destination may have new work; recovery requires reconciliation")
-    if _adapter_call(adapter, "restore_source", op) is not True:
+    if _effect(api, adapter, "restore_source", op) is not True:
         raise HandoffError("source recovery not verified")
     return api.unfence(operation, op["state"], "cancelled") or api.get(operation)
 
@@ -323,8 +341,27 @@ def retry(db, operation, adapter, *, renew_ttl=None):
     api = storage.of(db).handoffs
     op = api.get(operation)
     if not op or op["state"] != "held":
-        raise HandoffError("only a held operation can be retried")
-    if _adapter_call(adapter, "revalidate", op) is not True:
+        # Lock loss can leave an intent before a checkpoint was held.
+        if not op or not op["evidence"].get("pending_effect"):
+            raise HandoffError("only a held or unfinished operation can be retried")
+    pending = op["evidence"].get("pending_effect")
+    if pending:
+        # This adapter operation MUST fence and quiesce the exact former
+        # epoch on the hosts, including delayed jobs, before returning proof.
+        # No replay or forward progress is allowed on a missing/false proof.
+        op = api.prepare_reconcile(operation, pending["epoch"])
+        op["controller_epoch"] = op["evidence"]["controller_epoch"]
+        proof = _adapter_call(adapter, "reconcile_effect", op)
+        if (not isinstance(proof, dict) or proof.get("ok") is not True
+                or proof.get("quiesced") is not True or isinstance(proof.get("epoch"), bool)
+                or proof.get("epoch") != pending["epoch"]):
+            raise HandoffError("unfinished host effect not quiesced")
+        op = api.finish_effect(operation, pending["epoch"])
+        if op["state"] != "held":
+            op = api.hold(operation, op["state"])
+        if op["evidence"].get("cancel_requested"):
+            return op  # explicit cancellation may now restore the source
+    if _effect(api, adapter, "revalidate", op) is not True:
         raise HandoffError("host reconciliation or prerequisites changed")
     if renew_ttl is not None:
         if isinstance(renew_ttl, bool) or not isinstance(renew_ttl, int) or not 30 <= renew_ttl <= 7200:

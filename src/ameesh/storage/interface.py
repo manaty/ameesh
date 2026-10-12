@@ -2577,7 +2577,7 @@ class Handoffs(Domain):
     """L232a: destination reservations and durable lot-boundary handoffs."""
 
     @abc.abstractmethod
-    def controller(self, operation: str):
+    def controller(self, operation: str, *, reconcile: bool = False):
         """Lock context yielding the journal DB, or None if another controller owns it.
 
         Serialize bounded, idempotent adapter steps with cancel/retry. Journal
@@ -2585,6 +2585,18 @@ class Handoffs(Domain):
         after activation. Adapters must impose timeouts; no agent-row lock
         spans an external call.
         """
+
+    @abc.abstractmethod
+    def begin_effect(self, operation: str, expected: str, effect: str) -> dict | None:
+        """Commit effect intent under the controller epoch before invoking a host."""
+
+    @abc.abstractmethod
+    def finish_effect(self, operation: str, epoch: int) -> dict:
+        """Clear a completed or explicitly quiesced intent under the current controller."""
+
+    @abc.abstractmethod
+    def prepare_reconcile(self, operation: str, epoch: int) -> dict:
+        """CAS the unfinished intent under the current epoch before host reconciliation."""
 
     @abc.abstractmethod
     def get(self, operation: str) -> dict | None: ...

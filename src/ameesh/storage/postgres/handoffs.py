@@ -11,9 +11,41 @@ COLUMNS = "*, extract(epoch from reserved_until)::float8 AS reserved_until_ts"
 TERMINAL = ("verified", "cancelled")
 
 
+class ControllerLost(db_mod.DbError):
+    """The controller no longer owns its journal epoch and lock backend."""
+
+
+class ControllerDb:
+    """Carry the controller epoch through every nested journal transaction.
+
+    The row lock makes epoch validation and writes atomic. A durable pending
+    effect blocks a successor even if the independent lock connection dies.
+    """
+    def __init__(self, db, operation, epoch, pid):
+        self.db, self.operation, self.epoch, self.pid = db, operation, epoch, pid
+
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+    @contextmanager
+    def transaction(self):
+        with self.db.transaction() as tx:
+            row = tx.query("SELECT evidence FROM host_handoffs WHERE id=%s FOR UPDATE",
+                           (self.operation,))
+            key = "handoff-operation:" + self.operation
+            live = tx.query("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid=%s"
+                            " AND locktype='advisory' AND granted AND objsubid=1"
+                            " AND classid=((hashtextextended(%s,0)>>32)&4294967295)::oid"
+                            " AND objid=(hashtextextended(%s,0)&4294967295)::oid) AS live",
+                            (self.pid, key, key))[0]["live"]
+            if not row or row[0]["evidence"].get("controller_epoch") != self.epoch or not live:
+                raise ControllerLost("handoff controller ownership lost")
+            yield ControllerDb(tx, self.operation, self.epoch, self.pid)
+
+
 class Handoffs(interface.Handoffs):
     @contextmanager
-    def controller(self, operation):
+    def controller(self, operation, *, reconcile=False):
         # Independent lock connection: each journal/fence change must commit
         # before the next external effect, especially before enabling a turn.
         lock_db = db_mod.connect(self.db.cfg)
@@ -21,9 +53,61 @@ class Handoffs(interface.Handoffs):
             with lock_db.transaction() as tx:
                 rows = tx.query("SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0)) AS acquired",
                                 ("handoff-operation:" + operation,))
-                yield self.db if rows[0]["acquired"] else None
+                if not rows[0]["acquired"]:
+                    yield None
+                    return
+                pid = tx.query("SELECT pg_backend_pid() AS pid")[0]["pid"]
+                with self.db.transaction() as journal:
+                    rows = journal.query(
+                        "UPDATE host_handoffs SET evidence=jsonb_set(evidence,'{controller_epoch}',"
+                        " to_jsonb(coalesce((evidence->>'controller_epoch')::bigint,0)+1))"
+                        " WHERE id=%s AND (%s OR NOT evidence ? 'pending_effect') RETURNING evidence",
+                        (operation, reconcile))
+                if not rows:
+                    # An unknown operation is diagnosed by the caller; an
+                    # unfinished effect requires explicit quiescence proof.
+                    yield None if self.get(operation) else self.db
+                    return
+                yield ControllerDb(self.db, operation, rows[0]["evidence"]["controller_epoch"], pid)
+        except db_mod.DbError:
+            raise ControllerLost("handoff controller lock connection lost") from None
         finally:
             lock_db.close()
+
+    def begin_effect(self, operation, expected, effect):
+        if not isinstance(self.db, ControllerDb):
+            raise ControllerLost("host effects require a controller epoch")
+        with self.db.transaction() as tx:
+            pending = {"name": effect, "epoch": self.db.epoch, "state": expected}
+            fields = {"pending_effect": pending}
+            if effect == "restore_source":
+                fields["cancel_requested"] = True
+            rows = tx.query(
+                "UPDATE host_handoffs SET evidence=evidence || %s::jsonb, updated_at=clock_timestamp()"
+                " WHERE id=%s AND state=%s AND NOT evidence ? 'pending_effect'"
+                " AND (%s OR reserved_until > clock_timestamp())"
+                " AND (%s OR NOT coalesce((evidence->>'cancel_requested')::boolean,false)) RETURNING id",
+                (json.dumps(fields), operation, expected, effect in ("restore_source", "revalidate"), effect == "restore_source"))
+            return Handoffs(tx).get(operation) if rows else None
+
+    def finish_effect(self, operation, epoch):
+        with self.db.transaction() as tx:
+            rows = tx.query("UPDATE host_handoffs SET evidence=evidence-'pending_effect'-'reconcile_epoch'"
+                            " WHERE id=%s AND (evidence->'pending_effect'->>'epoch')::bigint=%s RETURNING id",
+                            (operation, epoch))
+            if not rows:
+                raise ControllerLost("host effect intent changed")
+            return Handoffs(tx).get(operation)
+
+    def prepare_reconcile(self, operation, epoch):
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "UPDATE host_handoffs SET evidence=evidence || %s::jsonb"
+                " WHERE id=%s AND (evidence->'pending_effect'->>'epoch')::bigint=%s RETURNING id",
+                (json.dumps({"reconcile_epoch": self.db.epoch}), operation, epoch))
+            if not rows:
+                raise ControllerLost("host effect intent changed before reconciliation")
+            return Handoffs(tx).get(operation)
 
     def get(self, operation):
         rows = self.db.query("SELECT " + COLUMNS + " FROM host_handoffs WHERE id = %s", (operation,))
@@ -241,6 +325,9 @@ class Handoffs(interface.Handoffs):
             if op["state"] != expected:
                 return None
             if state in ("activated", "verified"):
+                if not tx.query("SELECT id FROM host_handoffs WHERE id=%s"
+                                " AND reserved_until > clock_timestamp()", (operation,)):
+                    return None
                 allowed = tx.query("SELECT name FROM agent_registry r WHERE name=%s AND host=%s"
                                    " AND mode='execute' AND status NOT IN ('paused','stopped')"
                                    " AND coalesce(canon,'')=%s AND harness=%s AND cwd=%s"

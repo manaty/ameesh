@@ -36,6 +36,12 @@ class HostAdapter:
         self.calls.append("restore_source")
         return True
 
+    def reconcile_effect(self, op):
+        # Fake hosts have no surviving async job; a real helper must fence
+        # and quiesce this epoch before providing the same proof.
+        self.calls.append("reconcile_effect")
+        return {"ok": True, "quiesced": True, "epoch": op["evidence"]["pending_effect"]["epoch"]}
+
     def result(self, op, step, **fields):
         self.calls.append(step)
         return {"ok": self.fail != step, **fields}
@@ -260,6 +266,52 @@ class HandoffTest(PgTestCase):
                 handoffs.cancel(self.db, op["id"], self.adapter)
         self.assertEqual(self.advance(op)["state"], "published")
 
+    def test_lost_lock_during_restore_blocks_activation_until_quiesced(self):
+        op = self.drain()
+        def restore(intent):
+            self.assertTrue(intent["evidence"]["cancel_requested"])
+            self.assertEqual(intent["evidence"]["pending_effect"]["name"], "restore_source")
+            # Lose only the independent advisory-lock backend while the
+            # controller's journal connection is still usable.
+            pid = self.db.query(
+                "SELECT pid FROM pg_locks WHERE locktype='advisory' AND granted"
+                " AND classid=((hashtextextended(%s,0)>>32)&4294967295)::oid"
+                " AND objid=(hashtextextended(%s,0)&4294967295)::oid AND objsubid=1",
+                ("handoff-operation:"+op["id"],)*2)[0]["pid"]
+            self.db.query("SELECT pg_terminate_backend(%s)", (pid,))
+            with self.assertRaisesRegex(handoffs.HandoffError, "unfinished host effect"):
+                self.advance(op)
+            self.assertNotIn("enable", self.adapter.calls)
+            return True
+        with mock.patch.object(self.adapter, "restore_source", side_effect=restore):
+            with self.assertRaisesRegex(handoffs.HandoffError, "ownership lost"):
+                handoffs.cancel(self.db, op["id"], self.adapter)
+        pending = self.api.handoffs.get(op["id"])
+        self.assertEqual(pending["state"], "drained")
+        self.assertTrue(pending["fenced"])
+        self.assertEqual(pending["evidence"]["pending_effect"]["name"], "restore_source")
+        with mock.patch.object(self.adapter, "reconcile_effect", return_value={"ok": True, "quiesced": False}):
+            with self.assertRaisesRegex(handoffs.HandoffError, "not quiesced"):
+                handoffs.retry(self.db, op["id"], self.adapter)
+        reconciled = handoffs.retry(self.db, op["id"], self.adapter)
+        self.assertEqual(reconciled["state"], "held")
+        self.assertNotIn("pending_effect", reconciled["evidence"])
+        # Quiescing the old effect must not change cancellation into a move.
+        self.advance(op)
+        self.assertNotIn("enable", self.adapter.calls)
+        self.assertEqual(handoffs.cancel(self.db, op["id"], self.adapter)["state"], "cancelled")
+        self.assertEqual(registry.get(self.db, "dev")["host"], "source")
+
+    def test_stale_controller_epoch_cannot_write_journal(self):
+        from ameesh.db import DbError
+        op = self.request()
+        with self.api.handoffs.controller(op["id"]) as old:
+            stale = storage.of(old).handoffs
+        with self.api.handoffs.controller(op["id"]):
+            with self.assertRaises(DbError):
+                stale.transition(op["id"], "planned", "prepared")
+        self.assertEqual(self.api.handoffs.get(op["id"])["state"], "planned")
+
     def test_admission_changed_during_admit_cannot_release_fence(self):
         op = self.request()
         for _ in range(6): op = self.advance(op)
@@ -272,6 +324,32 @@ class HandoffTest(PgTestCase):
         self.assertEqual((held["state"], held["fenced"]), ("held", True))
         self.assertNotIn("enable", self.adapter.calls)
         self.assertIsNone(registry.claim(self.db, "dev", "other", ttl_seconds=300))
+
+    def test_reservation_expiring_during_admit_cannot_release_fence(self):
+        op = self.request()
+        for _ in range(6): op = self.advance(op)
+        def admit(intent):
+            self.db.execute("UPDATE host_handoffs SET reserved_until=now()-interval '1 second' WHERE id=%s", (op["id"],))
+            return self.adapter.prepare(intent)
+        with mock.patch.object(self.adapter, "admit", side_effect=admit):
+            held = self.advance(op)
+        self.assertEqual((held["state"], held["fenced"]), ("held", True))
+        self.assertNotIn("enable", self.adapter.calls)
+
+    def test_reservation_expiring_after_unfence_never_enables(self):
+        from ameesh.storage.postgres.handoffs import Handoffs
+        op = self.request()
+        for _ in range(7): op = self.advance(op)
+        original = Handoffs.unfence
+        def expire(api, operation, expected, state):
+            result = original(api, operation, expected, state)
+            if result is not None:
+                self.db.execute("UPDATE host_handoffs SET reserved_until=now()-interval '1 second' WHERE id=%s", (op["id"],))
+            return result
+        with mock.patch.object(Handoffs, "unfence", new=expire):
+            held = self.advance(op)
+        self.assertEqual((held["state"], held["fenced"]), ("held", True))
+        self.assertNotIn("enable", self.adapter.calls)
 
     def test_changed_canon_or_pause_refuses_destination_retry(self):
         op = self.request()
@@ -378,6 +456,20 @@ class HandoffTest(PgTestCase):
         self.api.canon.write_declared("dev", values)
         self.assertEqual(registry.get(self.db, "dev")["host"], "target")
         self.assertEqual(registry.get(self.db, "dev")["cwd"], "/work/agent")
+
+    def test_stale_canon_writer_cannot_restore_source_after_verified(self):
+        values = dict(registry.get(self.db, "dev"))
+        values.update(placement_ok=True, placement_diagnostic="", placement_ref="placement", canon_ref="card")
+        op = self.request()
+        for _ in range(8): op = self.advance(op)
+        self.assertEqual(op["state"], "verified")
+        self.api.canon.write_declared("dev", values)
+        self.assertEqual(registry.get(self.db, "dev")["host"], "target")
+        self.assertEqual(registry.get(self.db, "dev")["cwd"], "/work/agent")
+        # The epoch also closes an ABA placement race on the same host.
+        self.db.execute("UPDATE agent_registry SET host='source',cwd='/work/new' WHERE name='dev'")
+        self.api.canon.write_declared("dev", values)
+        self.assertEqual(registry.get(self.db, "dev")["cwd"], "/work/new")
 
     def test_changed_release_and_unauthenticated_turn_hold_operation(self):
         op = self.request()

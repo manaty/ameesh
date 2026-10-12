@@ -184,7 +184,7 @@ class Canon(interface.Canon):
                    provider, credential_mode, capabilities, canon_ref, canon, ephemeral, priority,
                    admitted_hosts, admitted_tags, memory_repository,
                    visibility_ok, visibility_diagnostic,
-                   status, status_text,
+                   status, status_text, lease_epoch,
                    placement_ok, placement_diagnostic, placement_ref,
                    placement_profile IS NOT DISTINCT FROM __PROFILE__ AS profile_fresh,
                    (status = 'running' AND lease_expires_at > now()) AS in_turn
@@ -248,9 +248,10 @@ class Canon(interface.Canon):
                 placement_profile = excluded.placement_profile,
                 canon           = excluded.canon,
                 updated_at      = now()
-            WHERE excluded.host = agent_registry.host
-               OR NOT EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=agent_registry.name
-                              AND h.state NOT IN ('verified','cancelled'))
+            WHERE agent_registry.lease_epoch = %s
+              AND (excluded.host = agent_registry.host
+                   OR NOT EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=agent_registry.name
+                                  AND h.state NOT IN ('verified','cancelled')))
             RETURNING name
             """.replace("__CAPS__", _CAPS_SQL)
                .replace("__AHOSTS__", _CAPS_SQL)
@@ -264,7 +265,8 @@ class Canon(interface.Canon):
              values.get("memory_repository"),
              values.get("visibility_ok"), values.get("visibility_diagnostic") or "",
              values["placement_ok"], values["placement_diagnostic"], values["placement_ref"])
-            + profile_params(values) + (values.get("canon"), projects, projects),
+            + profile_params(values) + (values.get("canon"), projects, projects,
+                                       values.get("_expected_lease_epoch", values.get("lease_epoch", -1))),
         )
 
     def clear_responsible(self, name, host, owner=None) -> None:
