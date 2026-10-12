@@ -264,7 +264,9 @@ def _enable_capacity(function):
     @wraps(function)
     def step(db, operation, adapter, **kwargs):
         op = storage.of(db).handoffs.get(operation)
-        if not op or op["state"] in ("verified", "cancelled", "held"):
+        # Held is recoverable: retry may reactivate it before the controller
+        # lock is acquired. Reserve a permit even for that preflight state.
+        if not op or op["state"] in ("verified", "cancelled"):
             return function(db, operation, adapter, **kwargs)
         pool = _ENABLE_WORKERS
         if not pool.acquire(blocking=False):

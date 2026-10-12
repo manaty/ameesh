@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L232a: durable moves against simulated hosts; never SSH or real credentials."""
+from contextlib import contextmanager
 import os
 import subprocess
 import tempfile
@@ -280,6 +281,65 @@ class HandoffTest(PgTestCase):
             release.set()
             for done in finished:
                 done.wait(5)
+
+    def test_retry_between_capacity_read_and_controller_reserves_enable_slot(self):
+        op = self.request()
+        for _ in range(7):
+            op = self.advance(op)
+        self.assertEqual(op["state"], "activated")
+        held = self.api.handoffs.hold(op["id"], "activated")
+        self.assertEqual((held["state"], held["fenced"]), ("held", True))
+        pool = threading.BoundedSemaphore(1)
+        api_type = type(self.api.handoffs)
+        controller = api_type.controller
+        retried = False
+
+        @contextmanager
+        def retry_before_controller(api, operation, **kwargs):
+            nonlocal retried
+            if not retried:
+                retried = True
+                resumed = handoffs.retry(self.db, operation, self.adapter)
+                self.assertEqual(resumed["state"], "activated")
+            with controller(api, operation, **kwargs) as tx:
+                yield tx
+
+        def enable(intent):
+            self.assertFalse(pool.acquire(blocking=False))
+            return HostAdapter.enable(self.adapter, intent)
+
+        with mock.patch.object(handoffs, "_ENABLE_WORKERS", pool), mock.patch.object(
+                api_type, "controller", retry_before_controller), mock.patch.object(
+                self.adapter, "enable", side_effect=enable):
+            result = self.advance(held)
+        self.assertTrue(retried)
+        self.assertEqual((result["state"], result["fenced"]), ("verified", False))
+        self.assertNotIn("pending_effect", result["evidence"])
+        self.assertEqual(self.adapter.calls.count("enable"), 1)
+        self.assertTrue(pool.acquire(timeout=2))
+        pool.release()
+
+    def test_held_handoff_capacity_deferral_does_not_acquire_controller(self):
+        op = self.request()
+        for _ in range(7):
+            op = self.advance(op)
+        held = self.api.handoffs.hold(op["id"], "activated")
+        events = self.api.handoffs.events(op["id"])
+        pool = threading.BoundedSemaphore(1)
+        self.assertTrue(pool.acquire(blocking=False))
+        calls = list(self.adapter.calls)
+        try:
+            with mock.patch.object(handoffs, "_ENABLE_WORKERS", pool):
+                with self.assertLogs("ameesh.handoffs", level="WARNING") as alerts:
+                    deferred = self.advance(held)
+            self.assertIn("handoff-enable-capacity-exhausted", alerts.output[0])
+            self.assertEqual(deferred, held)
+            self.assertEqual(self.api.handoffs.get(op["id"]), held)
+            self.assertEqual(self.api.handoffs.events(op["id"]), events)
+            self.assertEqual(self.adapter.calls, calls)
+            self.assertFalse(pool.acquire(blocking=False))
+        finally:
+            pool.release()
 
     def candidate(self, name="dev"):
         return handoffs.plan(self.db, registry.get(self.db, name), limits_for=lambda host:self.limits)
