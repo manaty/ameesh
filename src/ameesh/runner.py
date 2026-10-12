@@ -3681,7 +3681,8 @@ class AgentWorker(threading.Thread):
         RESIDENT_RETRY_MAX_S). Les tours, eux, restent comptés par la série
         d'échecs rapides de L48, qui arrête l'agent si eux aussi échouent."""
         self._resident_failures += 1
-        attente = min(RESIDENT_RETRY_MIN_S * 2 ** (self._resident_failures - 1),
+        # l'exposant borné : 2 ** 1024 ne tient pas dans un flottant (codex r1, #422)
+        attente = min(RESIDENT_RETRY_MIN_S * 2 ** min(self._resident_failures - 1, 32),
                       RESIDENT_RETRY_MAX_S)
         self._resident_refused_until = time.monotonic() + attente
         log("[%s] resident %s (failure %d in a row): one turn per event for %ds"
@@ -3690,12 +3691,13 @@ class AgentWorker(threading.Thread):
     def _note_dormant(self, raison: str) -> None:
         """T2 : l'agent est `dormant` — bail gardé, processus arrêté, réveil
         au prochain tour sur sa session. Dit dans son statut s'il est `idle`
-        (un `blocked` reste lisible tel quel)."""
+        (un `blocked`, un `stopped` restent tels quels), bail tenu."""
         try:
-            agent = registry.get(self.db, self.name)
-            if agent is not None and agent.get("status") == "idle":
-                registry.set_status(self.db, self.name, "idle",
-                                    status_text="dormant: %s; woken by its next turn" % raison)
+            # une seule écriture, conditionnelle (codex r1, #422) : un agent
+            # arrêté ou mis en pause entre-temps n'est jamais remis `idle`
+            storage.of(self.db).operations.set_dormant(
+                self.name, self.runner.runner_id, self.epoch,
+                "dormant: %s; woken by its next turn" % raison)
         except db_mod.DbError as exc:
             log_async("[%s] dormant status not written (%s)" % (self.name, db_mod.explain(exc)))
 
