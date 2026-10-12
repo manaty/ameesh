@@ -323,6 +323,13 @@ class AgentWorker(threading.Thread):
     chacun avec son battement de bail.
     """
 
+    #: L76 : le processus résident de l'agent entre ses tours, ou None.
+    #: Défaut de classe : les constructions partielles (`__new__` sans
+    #: `__init__`, chemin `--once` et tests de la porte d'hôte) doivent
+    #: pouvoir passer par `release_lease` -> `_close_resident` sans
+    #: AttributeError (CI #417).
+    resident = None
+
     def __init__(self, runner: "Runner", agent: dict, lease: dict):
         super().__init__(name=agent["name"], daemon=True)
         self.runner = runner
