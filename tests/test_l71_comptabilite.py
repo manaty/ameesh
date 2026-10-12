@@ -161,8 +161,9 @@ class SessionRepriseTest(Sandbox, PgTestCase):
             "input_tokens": 6, "cache_creation_input_tokens": 1000,
             "cache_read_input_tokens": 100_000, "output_tokens": 892})
         usage = self.book().record("claude1", start=start)
-        # (6 + 1000) × 5 + 100 000 × 0,5 + 892 × 25 = 77 330 µ$ ≈ 0,0773 $
-        self.assertAlmostEqual(usage.usd, 0.07733, places=5)
+        # 6 × 5 + 1000 × 5 × 1,25 (écriture de cache, L225) + 100 000 × 0,5
+        # + 892 × 25 = 78 580 µ$ ≈ 0,0786 $
+        self.assertAlmostEqual(usage.usd, 0.07858, places=5)
         # le cumul est gardé comme repère : le tour suivant est la différence
         start = self._tour_claude("claude1", self.SESSION, 67.16, {"output_tokens": 303})
         self.assertAlmostEqual(self.book().record("claude1", start=start).usd, 0.18, places=6)

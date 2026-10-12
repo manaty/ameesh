@@ -63,8 +63,17 @@ BINARY_TARGETS = ("darwin-aarch64", "darwin-x86_64", "linux-aarch64", "linux-x86
 AUTH_TYPES = ("agent", "terminal")
 #: clés connues sous `ameesh`
 AMEESH_KEYS = ("protocol", "binary", "binary_env", "launcher", "command", "interactive",
-               "session", "stream", "env", "model", "effort", "tier", "hooks",
+               "interactive_permission", "session", "stream", "env", "model", "effort", "tier", "hooks",
                "cost", "permissions", "acp", "accounts", "install")
+#: known keys of `ameesh.interactive_permission` (L223: permission mode of an
+#: interactive session, `ameesh attach` and `ameesh chat`)
+INTERACTIVE_PERMISSION_KEYS = ("flag", "default", "env", "fallback", "choices", "explicit_only")
+#: a permission mode passed to the harness: a short identifier
+PERMISSION_MODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+#: modes that switch every permission check off: reserved for the agent setting
+#: whatever the descriptor declares (codex r4, #182: a descriptor omitting
+#: `explicit_only` must not make them a default nor a fallback)
+ALWAYS_EXPLICIT_PERMISSION_MODES = ("bypassPermissions",)
 #: clés connues de `ameesh.accounts` (L30 : comptes multiples par fournisseur)
 ACCOUNT_KEYS = ("config_env", "default_home", "session_store", "credentials", "key_env")
 #: clés connues au premier niveau du manifeste
@@ -138,6 +147,9 @@ class HarnessDescriptor:
     launcher: tuple[str, ...] = ()
     command: tuple[str, ...] = ()
     interactive: tuple[str, ...] | None = None
+    #: L223: permission mode of the interactive session (see
+    #: `INTERACTIVE_PERMISSION_KEYS`); empty = no mode passed
+    interactive_permission: Mapping[str, Any] = field(default_factory=dict)
     session_flag: tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
     stream: str = "text"
@@ -737,6 +749,7 @@ def validate(document: Any, *, path: str = "") -> list[Finding]:
             if "paid_per_token" in cost and not isinstance(cost["paid_per_token"], bool):
                 findings.append(Finding("harness-cost-invalid", ERROR,
                                         "`ameesh.cost.paid_per_token`: boolean expected", path))
+    findings.extend(_check_interactive_permission(ameesh.get("interactive_permission"), path))
     permissions = ameesh.get("permissions")
     if permissions is not None:
         if not isinstance(permissions, dict):
@@ -835,6 +848,92 @@ def _setting(value: Any) -> Setting:
                    default=default)
 
 
+def _check_interactive_permission(value: Any, path: str) -> list[Finding]:
+    """`ameesh.interactive_permission` (L223): flag with a `{mode}` template,
+    default mode, override variables, fallback mode, allowlist of modes
+    (`choices`) and the modes only an explicit agent setting may set
+    (`explicit_only`)."""
+    if value is None:
+        return []
+    if not isinstance(value, dict):
+        return [Finding("harness-permission-mode-invalid", ERROR,
+                        "`ameesh.interactive_permission`: object expected", path)]
+    findings = []
+    for key in value:
+        if key not in INTERACTIVE_PERMISSION_KEYS:
+            findings.append(Finding("harness-key-unknown", WARNING,
+                                    "`ameesh.interactive_permission.%s`: unknown key (ignored)"
+                                    % key, path))
+    flag = _strings(value.get("flag"))
+    if not flag or not any("{mode}" in part for part in flag):
+        findings.append(Finding("harness-permission-mode-invalid", ERROR,
+                                "`ameesh.interactive_permission.flag`: list of strings "
+                                "containing `{mode}` expected", path))
+    for key in ("default", "fallback"):
+        mode = value.get(key)
+        if mode is not None and not (isinstance(mode, str) and PERMISSION_MODE_RE.match(mode)):
+            findings.append(Finding("harness-permission-mode-invalid", ERROR,
+                                    "`ameesh.interactive_permission.%s`: mode expected "
+                                    "(short identifier)" % key, path))
+    names = value.get("env")
+    if names is not None and not (_strings(names) is not None
+                                  and all(ENV_RE.match(n) for n in _strings(names))):
+        findings.append(Finding("harness-permission-mode-invalid", ERROR,
+                                "`ameesh.interactive_permission.env`: variable names "
+                                "expected", path))
+    for key in ("choices", "explicit_only"):
+        modes = value.get(key)
+        if modes is not None and not (_strings(modes) is not None
+                                      and all(PERMISSION_MODE_RE.match(m) for m in _strings(modes))):
+            findings.append(Finding("harness-permission-mode-invalid", ERROR,
+                                    "`ameesh.interactive_permission.%s`: list of modes "
+                                    "expected" % key, path))
+    choices = [m for m in (_strings(value.get("choices")) or []) if PERMISSION_MODE_RE.match(m)]
+    if choices:
+        for key in ("default", "fallback"):
+            mode = value.get(key)
+            if isinstance(mode, str) and mode and mode not in choices:
+                findings.append(Finding("harness-permission-mode-invalid", ERROR,
+                                        "`ameesh.interactive_permission.%s`: %r not in "
+                                        "`choices`" % (key, mode), path))
+    # codex r3 (#182): a reserved mode is never a default nor a fallback
+    reserved = set(m for m in (_strings(value.get("explicit_only")) or []))
+    reserved.update(ALWAYS_EXPLICIT_PERMISSION_MODES)
+    for key in ("default", "fallback"):
+        mode = value.get(key)
+        if isinstance(mode, str) and mode in reserved:
+            findings.append(Finding("harness-permission-mode-invalid", ERROR,
+                                    "`ameesh.interactive_permission.%s`: %r is reserved "
+                                    "for the agent setting (`explicit_only`)" % (key, mode),
+                                    path))
+    return findings
+
+
+def _interactive_permission(value: Any) -> dict:
+    """The normalized form of `ameesh.interactive_permission` ({} if invalid)."""
+    if not isinstance(value, dict):
+        return {}
+    flag = _strings(value.get("flag")) or []
+    if not any("{mode}" in part for part in flag):
+        return {}
+
+    def mode(key: str) -> str:
+        text = value.get(key)
+        return text if isinstance(text, str) and PERMISSION_MODE_RE.match(text) else ""
+
+    def modes(key: str) -> tuple[str, ...]:
+        return tuple(m for m in (_strings(value.get(key)) or []) if PERMISSION_MODE_RE.match(m))
+    reserved = modes("explicit_only")
+    reserved += tuple(m for m in ALWAYS_EXPLICIT_PERMISSION_MODES if m not in reserved)
+
+    def unreserved(key: str) -> str:
+        return "" if mode(key) in reserved else mode(key)
+    return {"flag": tuple(flag), "default": unreserved("default"),
+            "fallback": unreserved("fallback"),
+            "env": tuple(n for n in (_strings(value.get("env")) or []) if ENV_RE.match(n)),
+            "choices": modes("choices"), "explicit_only": reserved}
+
+
 def _build(document: dict, path: str, source: str) -> HarnessDescriptor:
     ameesh = document["ameesh"]
     protocol = ameesh.get("protocol")
@@ -880,6 +979,7 @@ def _build(document: dict, path: str, source: str) -> HarnessDescriptor:
         launcher=tuple(_strings(ameesh.get("launcher")) or ()),
         command=tuple(_strings(ameesh.get("command")) or ()),
         interactive=interactive,
+        interactive_permission=_interactive_permission(ameesh.get("interactive_permission")),
         session_flag=tuple(_strings(session.get("flag")) or []),
         env=env,
         stream=stream if stream in STREAM_FORMATS else "text",

@@ -45,6 +45,22 @@ human `Member` is **not claimable**. When a canon is configured,
 **No agent approves.** A card with `approve` in `capabilities` is a blocking
 error: authority belongs to humans, and is proven by a receipt.
 
+**Capabilities.** Known values (anything else raises the warning
+`agent-capability-unknown`):
+
+| capability | allows |
+|---|---|
+| `read` | read the canon, the threads and the repositories |
+| `report-drift` | report a gap between the canon and reality |
+| `propose` | propose a change (branch, PR, action proposal) |
+| `integrate` | assemble others' work: rebase PRs, resolve conflicts, build an integration or release branch; never merges into the base branch |
+| `merge` | merge an approved PR into the base branch once its required reviews and CI are green |
+| `release` | tag, publish and deploy a release once the owner's go is recorded, following the release procedure |
+
+None of them carries a decision: `merge` and `release` *execute* an approval
+already given by a human (approved review, recorded go). They never replace
+it. An ephemeral agent still gets only `read` and `propose`.
+
 ## `Host`: a machine or a cluster
 
 ```yaml

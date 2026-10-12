@@ -322,6 +322,19 @@ class ValidationTest(_TmpMixin, unittest.TestCase):
             provider="deepseek", credential_mode="api-key", capabilities=["read", "Approve"]))
         self.assertFinding(self.check(root)[1], "agent-approve-capability", agent="ouvrier")
 
+    def test_capacites_integrate_merge_release_connues(self):
+        # L150 : plus d'avertissement `agent-capability-unknown` pour elles
+        root = self.example_copy()
+        write(root, "agents/ouvrier.md", fiche(
+            type="Agent", title="ouvrier", responsible="human:bruno", harness="deepseek",
+            provider="deepseek", credential_mode="api-key",
+            capabilities=["read", "integrate", "merge", "release", "deploy-anything"]))
+        findings = [f for f in self.check(root)[1] if f.code == "agent-capability-unknown"]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("deploy-anything", findings[0].message)
+        self.assertNotIn("merge", findings[0].message)
+        self.assertEqual(set(canon.CAPABILITY_MEANINGS), set(canon.KNOWN_CAPABILITIES))
+
     def test_responsable_non_resolu(self):
         for valeur in ("human:inconnu", "bruno", "agent:orchestre", "human:orchestre"):
             with self.subTest(responsible=valeur):

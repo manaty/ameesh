@@ -356,7 +356,7 @@ class PlanCorrectionTest(unittest.TestCase):
         s = "8fbfa9b3"
         rows = [_ligne(514, "claude1", "claude", 66.982122, NOW, session=s,
                        model="claude-x", input_tokens=6, cached_input_tokens=1_555_487,
-                       output_tokens=892, cum_usd=66.982122),
+                       output_tokens=892, cum_usd=66.982122, cache_write_tokens=0),
                 _ligne(518, "claude1", "claude", 0.181149, NOW + 60, session=s,
                        model="claude-x", input_tokens=2, cached_input_tokens=773_527,
                        output_tokens=303, cum_usd=67.163271)]
@@ -457,10 +457,10 @@ class CorrectionPgTest(PgTestCase):
         self._insert()                                   # doublon de réparation
         self._insert(agent="claude1", harness="claude", model="claude-x", session="s1",
                      usd=66.98, input_tokens=6, cached_input_tokens=1_555_487,
-                     output_tokens=892, cum_usd=66.98)
+                     output_tokens=892, cum_usd=66.98, cache_write_tokens=0)
         self._insert(agent="claude1", harness="claude", model="claude-x", session="s1",
                      usd=0.18, input_tokens=2, cached_input_tokens=773_527,
-                     output_tokens=303, cum_usd=67.16)
+                     output_tokens=303, cum_usd=67.16, cache_write_tokens=0)
         prices = os.path.join(tempfile.mkdtemp(prefix="ameesh-l95-"), "prices.json")
         with open(prices, "w", encoding="utf-8") as fh:
             json.dump(PRICES, fh)

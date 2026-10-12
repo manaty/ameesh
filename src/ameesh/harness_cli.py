@@ -85,6 +85,17 @@ def _show_text(descriptor: harnesses.HarnessDescriptor) -> None:
     print("command        : %s" % (" ".join(descriptor.command) or "—"))
     if descriptor.attach:
         print("interactive    : %s" % (" ".join(descriptor.interactive) or "—"))
+        rule = descriptor.interactive_permission
+        if rule:
+            print("permission     : %s (default %s%s%s)" % (
+                " ".join(rule["flag"]), rule["default"] or "—",
+                ", env: %s" % ", ".join(rule["env"]) if rule["env"] else "",
+                ", fallback: %s" % rule["fallback"] if rule["fallback"] else ""))
+            if rule.get("choices"):
+                print("allowed modes  : %s%s" % (
+                    ", ".join(rule["choices"]),
+                    " (%s: agent setting only)" % ", ".join(rule["explicit_only"])
+                    if rule.get("explicit_only") else ""))
     else:
         print("interactive    : not declared (attach unavailable)")
     print("session        : %s" % (" ".join(descriptor.session_flag) or "— (ACP)"))

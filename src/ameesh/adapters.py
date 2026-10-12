@@ -1048,21 +1048,80 @@ class HarnessAdapter:
         argv += ["--prompt", text]
         return argv
 
-    def interactive_command(self, session_id: str | None = None) -> list[str]:
+    def interactive_command(self, session_id: str | None = None, *,
+                            permission_mode: str | None = None) -> list[str]:
         """Commande d'une session **interactive** sur la même session (attach, C9).
 
         Elle ne passe ni par `-p`/`exec` ni par `--json` : le harnais garde son
         terminal et sa session, l'humain est devant. Un descripteur qui ne
         déclare pas `ameesh.interactive` (typiquement un agent ACP) refuse.
+        L223: the permission mode (`permission_mode()`) follows `interactive`.
         """
         if not self.spec.attach:
             raise HarnessMissing(
                 "descriptor %s declares no interactive command: "
                 "`ameesh attach` is not available for this harness" % self.key)
         argv = [self.binary, *self.spec.launcher, *self.spec.interactive]
+        mode = self.permission_mode(permission_mode)
+        if mode:
+            rule = self.descriptor.interactive_permission
+            argv += [part.replace("{mode}", mode) for part in rule["flag"]]
         if session_id:
             argv += [*self.spec.session_flag, session_id]
         return argv
+
+    def permission_mode(self, explicit: str | None = None) -> str:
+        """The permission mode of an interactive session (L223), '' if none.
+
+        Order: the explicit value (agent setting, `ameesh set <agent>
+        permission_mode=…`), then the descriptor's variables
+        (`AMEESH_CLAUDE_PERMISSION_MODE`), then its default (`auto` for Claude:
+        the classifier keeps the guardrails on secrets, persistent configuration
+        and production). Only modes in the descriptor's allowlist (`choices`)
+        are kept, and those in `explicit_only` (`bypassPermissions`) only from
+        the agent setting: any other is dropped with a warning. The chosen mode
+        is passed only if the installed binary's help lists it among the
+        option's choices; otherwise (older version, unreadable or timed-out
+        help) the descriptor's fallback (`acceptEdits`) replaces it.
+        """
+        rule = self.descriptor.interactive_permission
+        if not rule:
+            return ""
+        allowed = rule.get("choices") or ()
+        reserved = (*(rule.get("explicit_only") or ()), *harnesses.ALWAYS_EXPLICIT_PERMISSION_MODES)
+        mode, by_agent = "", False
+        sources = [("agent setting", explicit)]
+        sources += [(n, os.environ.get(n)) for n in rule["env"]]
+        for rank, (origin, value) in enumerate(sources):
+            value = (value or "").strip()
+            if not value:
+                continue
+            refusal = ""
+            if not harnesses.PERMISSION_MODE_RE.match(value) \
+                    or (allowed and value not in allowed):
+                refusal = "unknown mode"
+            elif value in reserved and rank > 0:
+                refusal = "reserved for the agent setting (ameesh set)"
+            if refusal:
+                print("ameesh: permission mode %r ignored (%s: %s), using the default"
+                      % (value, origin, refusal), file=sys.stderr)
+                continue
+            mode, by_agent = value, rank == 0
+            break
+        mode = mode or rule["default"]
+        # codex r3 (#182): a reserved mode only ever comes from the agent
+        # setting, never from the default nor the fallback
+        if mode in reserved and not by_agent:
+            mode = ""
+        fallback = "" if rule["fallback"] in reserved else rule["fallback"]
+        if mode and fallback and mode != fallback:
+            try:
+                known = _help_choices(self.binary, _flag_name(rule["flag"]))
+            except Exception:  # noqa: BLE001 — reading the help must never fail the attach
+                known = None
+            if known is None or mode not in known:
+                return fallback
+        return mode
 
     def env(self) -> dict[str, str]:
         """Environnement du harnais (l'agent ACP le reçoit du pont, pas d'ici)."""
@@ -1081,6 +1140,59 @@ class HarnessAdapter:
     def parse(self, line: str) -> dict:
         """Renvoie {session, display:[…], cost, final, usage, error} pour une ligne."""
         return self.reader.parse(line)
+
+
+#: choices read from the binaries' help (L223): one `--help` per binary and per
+#: process; None = unreadable, timed-out help or no list of choices
+_HELP_CACHE: dict[tuple[str, str], frozenset[str] | None] = {}
+
+
+def _flag_name(flag: Sequence[str]) -> str:
+    """The option carrying the mode (`--permission-mode`) in the flag template."""
+    for i, part in enumerate(flag):
+        if "{mode}" in part:
+            before = part.split("{mode}")[0].rstrip("=")
+            return before if before else (flag[i - 1] if i else "")
+    return ""
+
+
+def _help_choices(binary: str, option: str) -> frozenset[str] | None:
+    """The choices the binary's help gives for `option` (the "choices: …"
+    block of that option only), None if the help is unreadable, timed out or
+    silent. An interrupted read (Ctrl-C) is not cached."""
+    key = (binary, option)
+    if key not in _HELP_CACHE:
+        try:
+            proc = subprocess.run([binary, "--help"], capture_output=True,
+                                  timeout=10, stdin=subprocess.DEVNULL)
+        except Exception:  # noqa: BLE001 — OSError, timeout, etc.
+            proc = None
+        choices = None
+        if proc is not None and proc.returncode == 0 and option:
+            text = (proc.stdout + proc.stderr).decode("utf-8", errors="replace")
+            choices = _option_choices(text, option)
+        _HELP_CACHE[key] = choices
+    return _HELP_CACHE[key]
+
+
+def _option_choices(text: str, option: str) -> frozenset[str] | None:
+    """The quoted choices of the "(choices: …)" block of `option`, searched
+    from the option's line up to the next one (a line starting with `-`)."""
+    lines = text.splitlines()
+    pattern = re.compile(r"^\s*(?:-\w,\s*)?%s(?![A-Za-z0-9_-])" % re.escape(option))
+    for i, line in enumerate(lines):
+        if not pattern.match(line):
+            continue
+        block = [line]
+        for following in lines[i + 1:]:
+            if re.match(r"^\s*-", following):
+                break
+            block.append(following)
+        found = re.search(r"choices:\s*([^)]*)\)", " ".join(block))
+        if not found:
+            return None
+        return frozenset(re.findall(r'"([^"]+)"', found.group(1))) or None
+    return None
 
 
 def supports_tier(harness: str, host_dir: str | None = None) -> bool:
