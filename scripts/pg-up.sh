@@ -26,10 +26,42 @@ else
 fi
 
 # deux postgres sur un même répertoire de données le corrompent : chaque
-# montage est comparé par sa source sur l'hôte (.Source : chemin d'un bind
-# mount, ou _data d'un volume nommé) ; toute inspection en échec refuse
+# montage est comparé par le répertoire qu'il désigne sur l'hôte ; toute
+# inspection en échec refuse
 refus() { echo "$1 — refus de $ACTION $NAME" >&2; exit 1; }
-sources() { docker inspect -f '{{range .Mounts}}{{println .Source}}{{end}}' "$1"; }
+# le répertoire d'un volume nommé ($1, monté en $2) : son `device` quand le
+# pilote local le monte en bind (`-o o=bind,device=/srv/…`), car .Mountpoint
+# n'en dit que le _data ; sinon $2
+source_du_volume() {
+  local opts o device
+  opts=$(docker volume inspect -f '{{index .Options "o"}}{{"\x1f"}}{{index .Options "device"}}' "$1") \
+    || return 1
+  IFS=$'\x1f' read -r o device <<<"$opts"
+  case ",$o," in
+    *,bind,*|*,rbind,*) [ -z "$device" ] || { printf '%s\n' "$device"; return 0; } ;;
+  esac
+  printf '%s\n' "$2"
+}
+# les répertoires montés par un conteneur, un par ligne : la source d'un bind
+# mount, celle d'un volume nommé résolue par `source_du_volume`
+sources() {
+  local lignes type nom src
+  lignes=$(docker inspect -f '{{range .Mounts}}{{.Type}}{{"\x1f"}}{{.Name}}{{"\x1f"}}{{.Source}}{{"\n"}}{{end}}' "$1") \
+    || return 1
+  while IFS=$'\x1f' read -r type nom src; do
+    [ -n "$src" ] || continue
+    if [ "$type" = volume ] && [ -n "$nom" ]; then
+      src=$(source_du_volume "$nom" "$src") || return 1
+    fi
+    printf '%s\n' "$src"
+  done <<<"$lignes"
+}
+# deux répertoires se recouvrent : le même, ou l'un contient l'autre
+# (/srv et /srv/pg-data), dans un sens comme dans l'autre
+recouvre() {
+  [ "$1" = "$2" ] || [ "$1" = / ] || [ "$2" = / ] \
+    || [ "${1#"$2"/}" != "$1" ] || [ "${2#"$1"/}" != "$2" ]
+}
 # forme canonique d'une source (`/srv/pg-data/` ou un lien vers ce dossier
 # désignent le même répertoire) ; telle quelle si realpath échoue
 canon() {
@@ -39,10 +71,10 @@ canon() {
     realpath -m -- "$src" 2>/dev/null || printf '%s\n' "$src"
   done <<<"$1"
 }
-# refus si un autre conteneur (ceux que liste `docker ps $1`) monte l'une des
-# sources de $2
+# refus si un autre conteneur (ceux que liste `docker ps $1`) monte un
+# répertoire qui recouvre l'une des sources de $2
 garde_sources() {
-  local conteneurs autre leurs src miennes
+  local conteneurs autre leurs src miennes leur
   miennes=$(canon "$2")
   conteneurs=$(docker ps $1 --format '{{.Names}}') || refus "docker ps en échec"
   while IFS= read -r autre; do
@@ -51,9 +83,12 @@ garde_sources() {
     leurs=$(canon "$leurs")
     while IFS= read -r src; do
       [ -n "$src" ] || continue
-      if grep -qxF -- "$src" <<<"$leurs"; then
-        refus "$src (données de $NAME) est monté par le conteneur $autre"
-      fi
+      while IFS= read -r leur; do
+        [ -n "$leur" ] || continue
+        if recouvre "$src" "$leur"; then
+          refus "$src (données de $NAME) recouvre $leur, monté par le conteneur $autre"
+        fi
+      done <<<"$leurs"
     done <<<"$miennes"
   done <<<"$conteneurs"
 }
@@ -93,7 +128,8 @@ else
       volumes=$(docker volume ls -q) || refus "docker volume ls en échec"
       source_voulue=
       if grep -qxF -- "$VOLUME" <<<"$volumes"; then
-        source_voulue=$(docker volume inspect -f '{{.Mountpoint}}' "$VOLUME") \
+        point=$(docker volume inspect -f '{{.Mountpoint}}' "$VOLUME") \
+          && source_voulue=$(source_du_volume "$VOLUME" "$point") \
           || refus "inspection du volume $VOLUME en échec"
       fi ;;
   esac
