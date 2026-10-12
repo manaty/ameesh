@@ -271,40 +271,38 @@ class PlatformTest(unittest.TestCase):
                     process._settle(doutes, again)
 
     def test_gestionnaire_de_services_par_pid(self):
-        """Le MainPID de user@<uid>.service (demandé à systemd) et son enfant
-        démarré le premier, s'il s'appelle (sd-pam) ; un autre enfant nommé
-        (sd-pam) ou systemd ne l'est pas."""
+        """Le MainPID de user@<uid>.service (demandé à systemd) et ses
+        enfants directs aux groupes supplémentaires VIDES quand ceux du
+        gestionnaire ne le sont pas ((sd-pam), forké root). Ni le nom ni
+        l'heure de démarrage ne comptent (revue #377 r2-r4)."""
+        import shutil
         import tempfile
         racine = tempfile.mkdtemp()
-        self.addCleanup(subprocess.run, ["rm", "-rf", racine])
+        self.addCleanup(shutil.rmtree, racine)
 
-        def proc(pid, comm, ppid, start):
+        def proc(pid, comm, ppid, groupes):
             os.makedirs(os.path.join(racine, str(pid)))
-            with open(os.path.join(racine, str(pid), "comm"), "w") as fh:
-                fh.write(comm + "\n")
-            champs = ["S", str(ppid)] + ["0"] * 17 + [str(start)] + ["0"] * 10
+            champs = ["S", str(ppid)] + ["0"] * 28
             with open(os.path.join(racine, str(pid), "stat"), "w") as fh:
                 fh.write("%d (%s) %s\n" % (pid, comm, " ".join(champs)))
+            with open(os.path.join(racine, str(pid), "status"), "w") as fh:
+                fh.write("Name:\t%s\nGroups:\t%s\n" % (comm, groupes))
 
-        proc(100, "systemd", 1, 10)
-        proc(102, "systemd", 100, 30)
-        proc(103, "(sd-pam)", 100, 40)
         os.makedirs(os.path.join(racine, "self"))
+        proc(100, "systemd", 1, "966 1000 ")
+        proc(102, "(sd-pam)", 100, "966 1000 ")    # nom emprunté, groupes du gestionnaire
+        proc(103, "node", 7, "")                    # groupes vides, pas son enfant
         fait = subprocess.CompletedProcess([], 0, stdout="100\n", stderr="")
         process = platform.process
         with mock.patch.object(process, "PROC", racine), \
                 mock.patch.object(platform, "SYSTEM", "linux"), \
                 mock.patch("subprocess.run", return_value=fait):
-            # le premier enfant n'est pas (sd-pam) : seul le gestionnaire
             self.assertEqual(process.service_managers(1000), frozenset({100}))
-            proc(101, "(sd-pam)", 100, 11)
+            proc(101, "(sd-pam)", 100, "")
             self.assertEqual(process.service_managers(1000), frozenset({100, 101}))
-            # revue #377 r3 : le vrai (sd-pam) parti, le plus ancien enfant
-            # restant prend son nom : démarré trop tard, pas exempté
-            import shutil
-            shutil.rmtree(os.path.join(racine, "101"))
-            shutil.rmtree(os.path.join(racine, "102"))
-            proc(102, "(sd-pam)", 100, 10 + int(process.SD_PAM_DELAY_S * os.sysconf("SC_CLK_TCK")) + 1)
+            # un gestionnaire sans groupe n'exempte aucun enfant
+            with open(os.path.join(racine, "100", "status"), "w") as fh:
+                fh.write("Name:\tsystemd\nGroups:\t\n")
             self.assertEqual(process.service_managers(1000), frozenset({100}))
         sans = subprocess.CompletedProcess([], 1, stdout="", stderr="")
         with mock.patch.object(process, "PROC", racine), \

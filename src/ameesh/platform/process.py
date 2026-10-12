@@ -607,12 +607,6 @@ def holders(path: str | None, needle: str | None = None, exclude=(), *,
 DOUBT_RETRIES = 5
 DOUBT_RETRY_S = 0.1
 
-#: L63b: `(sd-pam)` is forked by the user's service manager during PAM
-#: setup, before any unit: 30 ms after it on the reference host, the first
-#: user service 440 ms. Exempt only within this delay of the manager's own
-#: start (start times from /proc/<pid>/stat, which no process can change)
-SD_PAM_DELAY_S = 0.25
-
 #: L63b, off Linux: system executables no user can write (SIP), e.g. macOS's
 #: ContextStoreAgent, which runs as the user and denies its open files. Not
 #: /usr/bin: a harness can run under Apple's python.
@@ -639,12 +633,14 @@ def _proc_status(pid) -> dict | None:
 
 def service_managers(uid: int | None = None) -> frozenset:
     """L63b: the PIDs of the user's service manager and of its `(sd-pam)`,
-    whose open files are never readable. Told by PID, never by name or
-    command line, which any process can borrow (review #377 r2): the
-    MainPID of user@<uid>.service, asked of PID 1 (`systemctl`), and its
-    earliest-started direct child if it is named `(sd-pam)` AND started
-    within `SD_PAM_DELAY_S` of the manager (r3: if the real helper is gone,
-    a later child taking its name is not exempt). Empty without systemd or
+    whose open files are never readable. Told by PID and credentials, never
+    by name, command line or start time, which a process can borrow (review
+    #377 r2-r4): the MainPID of user@<uid>.service, asked of PID 1
+    (`systemctl`), and its direct children whose supplementary groups are
+    EMPTY while the manager's are not. `(sd-pam)` is forked as root and
+    takes the uid without initgroups; a user process cannot empty its groups
+    (setgroups needs CAP_SETGID; denied in an unprivileged user namespace).
+    A manager without groups exempts no child. Empty without systemd or
     /proc."""
     import subprocess
     uid = os.getuid() if uid is None else uid
@@ -660,12 +656,13 @@ def service_managers(uid: int | None = None) -> frozenset:
     if done.returncode != 0 or not main.isdigit() or int(main) <= 1:
         return frozenset()
     main = int(main)
+    out = {main}
     try:
-        fields = _stat_fields(main)
-        main_start = int(fields[19])
-    except (OSError, ValueError, IndexError):
-        return frozenset({main})
-    first = None
+        status = _proc_status(main)
+    except OSError:
+        status = None
+    if not status or not status.get("Groups"):
+        return frozenset(out)
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
     except OSError:
@@ -673,20 +670,11 @@ def service_managers(uid: int | None = None) -> frozenset:
     for pid in pids:
         try:
             fields = _stat_fields(int(pid))
+            child = _proc_status(pid) if len(fields) > 1 and fields[1] == str(main) else None
         except (OSError, ValueError):
             continue
-        if len(fields) > 19 and fields[1] == str(main) and fields[19].isdigit():
-            start = int(fields[19])
-            if first is None or start < first[0]:
-                first = (start, int(pid))
-    out = {main}
-    try:
-        tick = os.sysconf("SC_CLK_TCK")
-    except (ValueError, OSError, AttributeError):
-        tick = 100
-    if first is not None and first[0] - main_start <= SD_PAM_DELAY_S * tick and \
-            _read_text(os.path.join(PROC, str(first[1]), "comm")).strip() == "(sd-pam)":
-        out.add(first[1])
+        if child is not None and "Groups" in child and not child["Groups"]:
+            out.add(int(pid))
     return frozenset(out)
 
 
