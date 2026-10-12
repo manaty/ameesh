@@ -285,6 +285,29 @@ class StateTest(unittest.TestCase):
             self.assertEqual((restored.decision.level, restored.decision.since_ts,
                               restored.seq), (0, 100.0, 7), saved)
 
+    def test_restart_takes_back_a_reset_calm_timer(self):
+        # codex #211 r2: level 1 at t=0, calm from t=5, pressure again at
+        # t=35 resets the timer; a restart at t=40 must not take back t=5
+        clock = [0.0]
+        # caps unchanged between the two: only the decision moves
+        warn = dict(self.reading, psi_cpu_60=15.0)    # over half of 20 %
+        calm = dict(self.reading)
+        readings = [warn]
+        g = self._guard(clock, readings)
+        self.assertEqual(g.step()["level"], 1)
+        for t, reading in ((5.0, calm), (30.0, calm), (35.0, warn)):
+            clock[0], readings[0] = t, reading
+            g.step()
+        with open(self.cfg.state_path) as fh:
+            self.assertIsNone(json.load(fh)["guard"]["decision"]["calm_since_ts"])
+        clock[0], readings[0] = 40.0, calm
+        g = self._guard(clock, readings)
+        self.assertEqual(g.step()["level"], 1)
+        clock[0] = 40.0 + self.cfg.offer.calm_seconds - 5
+        self.assertEqual(g.step()["level"], 1)
+        clock[0] = 40.0 + self.cfg.offer.calm_seconds
+        self.assertEqual(g.step()["level"], 0)
+
     def test_ill_typed_ack_counts_as_none(self):
         # codex #211 r1: the guest writes the acknowledgement; `"in_turn": 1`
         # used to raise a TypeError that killed the guard

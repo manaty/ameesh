@@ -643,6 +643,7 @@ class Guard:
         self.state: dict | None = None
         self.written_ts = 0.0
         self.last_key = None
+        self.written_decision = None
 
     def step(self) -> dict:
         """One evaluation: measure, decide, write when changed or due."""
@@ -668,12 +669,14 @@ class Guard:
         elif self.drain_seq is None or previous.level != 3 \
                 or previous.since_ts != self.decision.since_ts:
             self.drain_seq = self.seq
-        state["guard"]["decision"] = dict(dataclasses.asdict(self.decision),
-                                          drain_seq=self.drain_seq)
+        decision = dict(dataclasses.asdict(self.decision), drain_seq=self.drain_seq)
+        state["guard"]["decision"] = decision
+        # a decision that changed (a calm timer started or reset) is written
+        # at once: a restart must not take back a stale one
         due = now - self.written_ts >= STATE_TTL_S / 3
-        if key != self.last_key or due:
+        if key != self.last_key or due or decision != self.written_decision:
             write_state(self.cfg.state_path, state)
-            self.written_ts = now
+            self.written_ts, self.written_decision = now, decision
         self.last_key, self.state = key, state
         return state
 
