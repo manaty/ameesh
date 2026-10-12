@@ -43,15 +43,18 @@ READING_COLUMNS = (
     # #253 (0359): every filesystem the host writes to
     "volumes, "
     # L159e6 (0361): the guard's last restart, decoded by `_reading`
-    "guard_restart::text AS guard_restart"
+    "guard_restart::text AS guard_restart, "
+    # L159f (0069): host gate the executor obeys
+    "gate_state, gate_seq, gate_reason"
 )
 
-#: L159d (and #246) columns written by `record`, in this order
+#: L159d (and #246, L159f) columns written by `record`, in this order
 MEASURE_COLUMNS = (
     "mem_total_bytes", "psi_cpu_some", "psi_mem_some", "psi_mem_full", "psi_io_some",
     "app_cpu", "guest_cpu", "cpu_window_s", "guest_mem_bytes",
     "lendable_cpu", "lendable_memory_bytes", "lendable_disk_bytes",
     "btrfs_unallocated_bytes", "btrfs_metadata_headroom_bytes",
+    "gate_state", "gate_seq", "gate_reason",
 )
 
 def _volumes_param(volumes) -> str | None:
@@ -268,6 +271,23 @@ class TurnResources(interface.TurnResources):
             " WHERE turn_id = ANY(" + _ARRAY_SQL + ") AND status <> 'done' RETURNING id",
             (_array(turn_ids),)))
 
+    def settle_unchanged(self, rows) -> list[str]:
+        if not rows:
+            return []
+        import json
+        seen = json.dumps([{"turn_id": r["turn_id"], "status": r.get("status"),
+                            "ended_ts": r.get("ended_ts"), "pgid": r.get("pgid"),
+                            "containers": r.get("containers")} for r in rows])
+        return [row["turn_id"] for row in self.db.query(
+            "UPDATE turn_resources t SET status = 'done', ended_at = coalesce(t.ended_at, now())"
+            " FROM jsonb_to_recordset(%s::jsonb) AS v(turn_id text, status text,"
+            "   ended_ts float8, pgid integer, containers jsonb)"
+            " WHERE t.turn_id = v.turn_id AND t.status <> 'done' AND t.status = v.status"
+            "   AND extract(epoch from t.ended_at)::float8 IS NOT DISTINCT FROM v.ended_ts"
+            "   AND t.pgid IS NOT DISTINCT FROM v.pgid"
+            "   AND coalesce(to_jsonb(t.containers), 'null') = coalesce(v.containers, 'null')"
+            " RETURNING t.turn_id", (seen,))]
+
     def mark_orphan_many(self, turn_ids) -> int:
         if not turn_ids:
             return 0
@@ -298,6 +318,16 @@ class TurnResources(interface.TurnResources):
             "SELECT " + TURN_COLUMNS + " FROM turn_resources" + where +
             (" AND" if where else " WHERE") + " status = 'orphan'"
             " ORDER BY started_at DESC, id DESC LIMIT %s", tuple(params))
+
+    def to_review(self, host, idle_s, after_id=0, limit=500) -> list[dict]:
+        # comme `stale_running` : une ligne en délai de grâce se juge sur la
+        # fin de son tour
+        return self.db.query(
+            "SELECT " + TURN_COLUMNS + " FROM turn_resources"
+            " WHERE host = %s AND id > %s AND (status = 'orphan' OR (status = 'running'"
+            "   AND coalesce(ended_at, started_at) < now() - make_interval(secs => %s)))"
+            " ORDER BY id LIMIT %s",
+            (host, int(after_id), float(idle_s), int(limit)))
 
     def orphans_started_before(self, host, before_ts, after_id=0, limit=500) -> list[dict]:
         return self.db.query(

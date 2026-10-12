@@ -463,9 +463,12 @@ def volumes(paths) -> list[dict]:
     of `paths`: `path` (the first that names it), `paths`, `disk_free_bytes`,
     `btrfs_unallocated_bytes`, `btrfs_metadata_headroom_bytes` (None when
     unreadable or not btrfs); `unreadable` when the filesystem cannot be
-    reached at all (#306)."""
+    reached at all (#306); `fstype` from the mount table (L64: a btrfs whose
+    allocation is not read is told apart from a filesystem that has none),
+    None without one."""
     out: list[dict] = []
     seen: dict[str, dict] = {}
+    mounts = platform.mountinfo() if platform.is_linux() else []
     for path in paths or ():
         if not path:
             continue
@@ -475,7 +478,9 @@ def volumes(paths) -> list[dict]:
             if path not in seen[key]["paths"]:
                 seen[key]["paths"].append(path)
             continue
-        volume = {"path": path, "paths": [path]}
+        mount = platform.covering_mount(os.path.realpath(path), mounts) if mounts else None
+        volume = {"path": path, "paths": [path],
+                  "fstype": mount["fstype"] if mount is not None else None}
         if _anchor(path) is None:  # #306: out of reach, read as unknown
             volume.update(dict.fromkeys(f for _floor, f in VOLUME_FLOORS), unreadable=True)
         else:
@@ -866,6 +871,41 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
     return out
 
 
+#: L64: the measures a reading carries, and their names for a human. One
+#: missing from a reading (None) is a measure this OS, or this host, cannot
+#: give (PSI before Linux 4.20 or outside Linux, load on Windows, an
+#: unreadable guest cgroup…): `unmeasured` says it instead of publishing
+#: nothing without a word. A share that needs two readings (`app_cpu`) is
+#: not listed: its first reading is always None.
+MEASURES = (
+    ("mem_available_bytes", "available memory"),
+    ("swap_used_bytes", "swap"),
+    ("load1", "load"),
+    ("cpu_count", "CPU count"),
+    ("disk_free_bytes", "free disk"),
+    ("tmp_fstype", "type of /tmp (tmpfs ceiling)"),
+    ("psi_cpu_some", "CPU pressure (PSI)"),
+    ("psi_mem_some", "memory pressure (PSI)"),
+    ("psi_io_some", "I/O pressure (PSI)"),
+    ("guest_mem_bytes", "guest memory (cgroup)"),
+)
+
+
+def unmeasured(reading: dict | None) -> list[str]:
+    """The names of the `MEASURES` that `reading` does not carry (None), in
+    table order, then each btrfs volume whose allocation is not read (#246:
+    the floors that `disk_free` cannot replace); [] without a reading."""
+    if not reading:
+        return []
+    out = [label for key, label in MEASURES if reading.get(key) is None]
+    for volume in reading.get("volumes") or ():
+        if (isinstance(volume, dict) and volume.get("fstype") == "btrfs"
+                and any(volume.get(f) is None for f in ("btrfs_unallocated_bytes",
+                                                        "btrfs_metadata_headroom_bytes"))):
+            out.append("btrfs allocation (%s)" % volume.get("path"))
+    return out
+
+
 def restart_record(record) -> dict | None:
     """L159e6: a `guard.restart` record ({ts, started, skipped}) checked and
     copied; None when ill-typed."""
@@ -902,13 +942,16 @@ def guard_restart(path: str | None = None, *, now: float | None = None) -> dict 
     return record
 
 
-def collect(cfg, db: Db, *, now: float | None = None, policy=None) -> dict:
+def collect(cfg, db: Db, *, now: float | None = None, policy=None,
+            gate: dict | None = None) -> dict:
     """Relève l'hôte de cet exécuteur et publie le relevé ; rend le relevé.
 
     Le nombre de tours en cours vient de la base (agents de l'hôte au bail
     vivant et en tour) : c'est un état, pas une mesure locale. `policy` : la
     politique de ménage de l'hôte, pour la racine du cache des dépendances
-    (#253).
+    (#253). L159f : `gate` est l'état de la porte d'hôte que l'exécuteur suit
+    (`gate_state`, `gate_seq`, `gate_reason`), None sans porte ; le
+    déplacement le lit.
     """
     host = cfg.host or ""
     try:
@@ -925,8 +968,13 @@ def collect(cfg, db: Db, *, now: float | None = None, policy=None) -> dict:
         basis = None
     reading.update(lendable(reading, basis))
     reading["guard_restart"] = guard_restart(now=now)
+    reading.update({key: (gate or {}).get(key) for key in GATE_KEYS})
     storage.of(db).hosts.record(reading)
     return reading
+
+
+#: L159f: the host gate in a reading (`host_gate.GateController.snapshot`)
+GATE_KEYS = ("gate_state", "gate_seq", "gate_reason")
 
 
 # --------------------------------------------------------------------------

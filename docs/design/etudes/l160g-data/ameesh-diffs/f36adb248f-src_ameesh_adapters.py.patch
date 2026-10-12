@@ -1,0 +1,34 @@
+# merge f36adb248f1b85f490bdd260c061c613ceffd481 src/ameesh/adapters.py (resolved)
+# --- mergiraf  +++ committed
+diff --git a/933deba56e4dce9257cbf33f60f50b41c5e1bb75 b/bde594dd7d9f830b62068ababccd90627543feca
+index 933deba..bde594d 100644
+--- a/933deba56e4dce9257cbf33f60f50b41c5e1bb75
++++ b/bde594dd7d9f830b62068ababccd90627543feca
+@@ -69,6 +69,13 @@ SUMMARY_PROMPT = (
+     "décisions prises, fichiers touchés, prochaine action. Sois concis et factuel, "
+     "sans outils : ce résumé sera le seul contexte de la session suivante."
+ )
++#: L105 : tour suivant un tour clos par un plafond (contexte, durée) — le
++#: travail en cours reprend là où il s'est arrêté
++SUITE_PROMPT = (
++    "Suite : ton tour précédent a été clos par l'exécuteur à un point sûr (%s). "
++    "Reprends le travail en cours là où il s'est arrêté, sans refaire ce qui est "
++    "fait. Avance par étapes courtes et rends la main dès qu'une étape est stable."
++)
+ #: L106 : reprise par l'exécuteur d'une session `attach` morte sans rendre son
+ #: bail (coupure de l'hôte, terminal tué) — la MÊME session, une fois
+ ATTACH_RESUME_PROMPT = (
+@@ -79,13 +86,6 @@ ATTACH_RESUME_PROMPT = (
+     "cours, puis continue ton lot. Si tu attendais une décision humaine, dis-le "
+     "par agent-mail send à ton responsable et arrête-toi."
+ )
+-#: L105 : tour suivant un tour clos par un plafond (contexte, durée) — le
+-#: travail en cours reprend là où il s'est arrêté
+-SUITE_PROMPT = (
+-    "Suite : ton tour précédent a été clos par l'exécuteur à un point sûr (%s). "
+-    "Reprends le travail en cours là où il s'est arrêté, sans refaire ce qui est "
+-    "fait. Avance par étapes courtes et rends la main dès qu'une étape est stable."
+-)
+ IDLE_PROMPT = (
+     "Reprise : si ton lot n'est ni gelé ni fusionné, continue-le ; sinon prends "
+     "la suite de ton affectation (board, workstream). Si tu n'as rien à faire, "

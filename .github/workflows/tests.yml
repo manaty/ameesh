@@ -337,14 +337,30 @@ jobs:
           path: leaks.json
           retention-days: 90
 
+  # L158: a PR that changes the version number carries the number its content
+  # needs (CONTRIBUTING.md, "Numérotation des versions"): scripts/version-level.py
+  # compares it with the content since the last tag. Any other PR: nothing to check.
+  version:
+    name: version number
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the tags, and the range since the last one
+      - name: number against content
+        run: python3 scripts/version-level.py pr HEAD^1 HEAD
+
   # nom de vérification stable : vert seulement si toutes les parts le sont
   # (L157 : ou si la PR ne change que le numéro de version, parts sautées ;
   # L161a : ou que de la documentation, et ses lecteurs sont verts ;
-  # L161f : une part que le plan n'a pas prévue est sautée)
+  # L161f : une part que le plan n'a pas prévue est sautée ;
+  # L158: on a PR, the version number check must pass)
   tests:
     name: tests
     if: always()
-    needs: [plan, psycopg, psql, platform-macos, doc-readers]
+    needs: [plan, version, psycopg, psql, platform-macos, doc-readers]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -355,7 +371,10 @@ jobs:
           echo "psycopg : ${{ needs.psycopg.result }} (parts ${{ needs.plan.outputs.psycopg }})"
           echo "psql    : ${{ needs.psql.result }} (parts ${{ needs.plan.outputs.psql }})"
           echo "macOS   : ${{ needs.platform-macos.result }}"
+          echo "version : ${{ needs.version.result }}"
           test "${{ needs.plan.result }}" = success
+          # L158: on a PR, the version number check passes (skipped elsewhere)
+          test "${{ needs.version.result }}" = success || { test "${{ github.event_name }}" != pull_request && test "${{ needs.version.result }}" = skipped; }
           if [ "${{ needs.plan.outputs.version_only }}" = "true" ]; then
             echo "PR de version seule : suite déjà validée sur main, parts sautées"
             exit 0

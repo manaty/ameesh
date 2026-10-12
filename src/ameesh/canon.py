@@ -786,10 +786,21 @@ class Agent:
     #: L51 (0032): roles held by the persona, as declared (the role model
     #: belongs to lot L58).
     roles: list[str] | None = None
+    #: L243 (#435): the projects the agent works on, as declared
+    #: (`projects:`), the first one being its primary project; `team` is then
+    #: that first project.
+    projects: list[str] | None = None
 
     @property
     def is_persona(self) -> bool:
         return self.fiche.type == "Persona"
+
+    @property
+    def effective_projects(self) -> list[str]:
+        """L243: `projects:` when declared, else `[team]`, else []."""
+        if self.projects is not None:
+            return list(self.projects)
+        return [self.team] if self.team else []
 
 
 @dataclass
@@ -1137,7 +1148,7 @@ class Canon:
                       for h in self.hosts],
             "agents": [dict(title=a.title, type=a.fiche.type, responsible=a.responsible, team=a.team,
                             capabilities=a.capabilities, harness=a.harness, model=a.model,
-                            harnesses=a.harnesses, roles=a.roles,
+                            harnesses=a.harnesses, roles=a.roles, projects=a.projects,
                             provider=a.provider, credential_mode=a.credential_mode,
                             budget_usd_per_day=a.budget_usd_per_day, tools=a.tools,
                             reviewers=a.reviewers, priority=a.priority,
@@ -2114,10 +2125,28 @@ class _Loader:
                 memory_repository = _text(memory.get("repository"))
         harnesses = self._list(fiche, "harnesses", where, "agent-harnesses-invalid", **subject)
         harness = _text(fiche.data.get("harness")) or (harnesses[0] if harnesses else None)
+        # L243 (#435): `projects:` wins over `team:`, which becomes its first;
+        # a list only — `projects: a, b` is one string, never two projects
+        if fiche.data.get("projects") is not None \
+                and not isinstance(fiche.data.get("projects"), list):
+            self.add("agent-projects-invalid", ERROR,
+                     "`projects`: list expected (`projects: [a, b]`), not %r"
+                     % (fiche.data.get("projects"),), **where, **subject)
+            projects = None
+        else:
+            projects = self._list(fiche, "projects", where, "agent-projects-invalid",
+                                  **subject)
+        if projects is not None and not all(projects):
+            self.add("agent-projects-invalid", ERROR, "`projects`: empty project name",
+                     **where, **subject)
+            projects = [p for p in projects if p]
+        team = _text(fiche.data.get("team"))
+        if projects is not None:
+            team = projects[0] if projects else None
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
-            team=_text(fiche.data.get("team")),
+            team=team,
             capabilities=self._list(fiche, "capabilities", where, "agent-capabilities-invalid",
                                     **subject),
             harness=harness,
@@ -2132,6 +2161,7 @@ class _Loader:
             fiche=fiche,
             harnesses=harnesses,
             roles=self._list(fiche, "roles", where, "agent-roles-invalid", **subject),
+            projects=projects,
         ))
 
     def _build_persona(self, fiche: Fiche, where: dict) -> None:
@@ -2620,8 +2650,12 @@ def _relationship_cycles(graph):
                 stack.append((target, iter(graph.get(target, ()))))
 
 
-def validate(canon: Canon) -> list[Finding]:
-    """Constats de lecture + constats du profil. Une erreur est bloquante."""
+def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[Finding]:
+    """Constats de lecture + constats du profil. Une erreur est bloquante.
+
+    `known_projects` (L243) : les projets connus hors du canon (`github.projects`
+    de l'hôte, `app` des lots) ; None, sans base : `agent-project-unknown`
+    n'est pas vérifié."""
     findings: list[Finding] = list(canon.load_findings)
     untrusted = canon.untrusted
 
@@ -2663,6 +2697,8 @@ def validate(canon: Canon) -> list[Finding]:
     # inconnu est une ERREUR : l'agent ne serait réclamable nulle part, et le
     # silence ferait croire à un harnais supporté.
     known_harnesses = set(harnesses.known_ids())
+    known = None if known_projects is None else (
+        set(known_projects) | {p.team for p in canon.packages if p.team})
     for agent in canon.agents:
         f = agent.fiche
         if not NAME_RE.match(agent.title):
@@ -2708,6 +2744,26 @@ def validate(canon: Canon) -> list[Finding]:
                 "`harness` %r of %s is absent from `harnesses` (%s)"
                 % (agent.harness, agent.title, ", ".join(agent.harnesses)),
                 f, agent=agent.title)
+        # L243 (#435): one truth per card — `team`, when kept beside
+        # `projects`, is its first project
+        if agent.projects is not None:
+            twice = sorted({p for p in agent.projects if agent.projects.count(p) > 1})
+            if twice:
+                add("agent-project-duplicate", ERROR,
+                    "`projects` of %s lists %s more than once" % (agent.title, ", ".join(twice)),
+                    f, agent=agent.title)
+            team = _text(f.data.get("team"))
+            if team is not None and team != agent.team:
+                add("agent-team-mismatch", ERROR,
+                    "`team` %r of %s is not its primary project (first of `projects`: %s)"
+                    % (team, agent.title, agent.team or "none"), f, agent=agent.title)
+            if known is not None:
+                unknown = [p for p in dict.fromkeys(agent.projects) if p not in known]
+                if unknown:
+                    add("agent-project-unknown", WARNING,
+                        "unknown projects for %s: %s (neither a work package's team, "
+                        "`github.projects` nor a lot's project)"
+                        % (agent.title, ", ".join(unknown)), f, agent=agent.title)
 
     # -- human deputies and superiors (L51, 0032 §2, 0033 §7) --------------------
     for member in canon.members:

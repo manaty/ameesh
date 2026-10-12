@@ -652,7 +652,9 @@ def plan(cfg: Config, db, row: dict, *, fresh: bool = False) -> dict:
     legacy = account_turn.legacy_profile(harness, items)
     origine = previous or (legacy.name if legacy in items else None)
     choice = accounts.choose(db, cfg.host, harness, items, book, agent=row["name"],
-                             simulate=True, session_account=origine)
+                             simulate=True, session_account=origine,
+                             critical=row["name"] in (getattr(cfg, "critical_agents", None)
+                                                      or ()))
     nxt = choice.profile or choice.active or items[0]
     if choice.profile is None:
         out["warnings"].append("all %s accounts are at their threshold (%s): the agent will "

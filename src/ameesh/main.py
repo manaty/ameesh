@@ -51,6 +51,9 @@
   ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since 24h]
         progress: work items, agents, milestones, budget (schema ameesh-progress/1);
         --serve: the page served locally, read-only, with a Refresh button (L304);
+  ameesh serve [--port 8780] [--token-file F] [--human human:ID] | --openapi
+        the read API /api/v1 on 127.0.0.1, Bearer token in a 0600 file (L84,
+        docs/api/openapi-v1.json);
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
@@ -230,6 +233,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "projects":
         from . import projects
         return projects.main(rest)
+    if command == "serve":
+        # L84: read API, local mode
+        from . import serve
+        return serve.main(rest)
     if command == "plan":
         # L96 : feuille de route (engagements, propositions, Gantt)
         from . import roadmap

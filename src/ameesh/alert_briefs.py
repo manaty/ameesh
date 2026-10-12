@@ -20,7 +20,8 @@ from . import sous_utilisation
 
 #: types adressés aux agents (en plus de l'humain, s'ils sont dans `notify.types`)
 BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias",
-                 "waiting_without_question", "module_deviation")
+                 "waiting_without_question", "module_deviation",
+                 "critical_budget_pause")
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
@@ -110,6 +111,14 @@ def _waiting_without_question(alert: dict) -> str:
                 lot, " « %s »" % title if title else "", lot, lot))
 
 
+def _critical_budget_pause(alert: dict) -> str:
+    """L242b (5) : aux orchestrateurs de l'équipe et aux auditeurs (urgent)."""
+    return ("Critical agent paused on budget: %s. Expected action: check the accounts "
+            "(ameesh accounts list) and the mesh caps (ameesh budget); free an account or "
+            "raise a cap with the owner, or hand its urgent work to another agent."
+            % (alert.get("detail") or "?"))
+
+
 def _for_auditor(alert: dict) -> str:
     """`idle_capacity` à l'auditeur : le constat et l'action de l'alerte ; avec
     des lots ouverts sans agent, l'écart est le sien (L165b, niveau 1)."""
@@ -163,6 +172,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "waiting_without_question":
             text = _waiting_without_question(alert)
             teams = {_team(by_name, alert.get("agent"))} - {""}
+        elif kind == "critical_budget_pause":
+            text = _critical_budget_pause(alert)
+            teams = {_team(by_name, alert.get("agent"))} - {""}
         else:
             text = _plan_underused(alert)
             teams = {_team(by_name, n) for n in alert.get("idle_agents") or ()} - {""}
@@ -173,6 +185,8 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         audit_text = text
     for name in auditor_names or ():
         out.setdefault(name, audit_text)
+    if kind == "critical_budget_pause":
+        out.pop(alert.get("agent"), None)       # en pause : il ne le lirait pas
     return out
 
 

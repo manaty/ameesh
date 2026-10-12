@@ -156,7 +156,7 @@ DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "
                "provider", "credential_mode", "capabilities", "canon_ref", "ephemeral",
                "priority", "admitted_hosts", "admitted_tags", "memory_repository",
                "visibility_ok", "visibility_diagnostic",
-               "placement_ok", "placement_diagnostic", "placement_ref")
+               "placement_ok", "placement_diagnostic", "placement_ref", "projects")
 
 #: statuts de `canon_state` (0008)
 CANON_OK = "ok"
@@ -347,6 +347,17 @@ def assess(canon: Canon, host: str,
         return CANON_OK, ("errors specific to agents (not claimable) or to the plan: "
                           + _describe(others))
     return CANON_OK, ""
+
+
+def known_projects(db: Db) -> set[str]:
+    """L243 (#435) : les projets connus hors du canon — `github.projects` de
+    l'hôte et les projets des lots (`agent-project-unknown`)."""
+    from . import plan_github
+    try:
+        declared = set(plan_github.settings_of(db.cfg).projects)
+    except plan_github.SettingsError:
+        declared = set()
+    return declared | set(storage.of(db).canon.lot_projects())
 
 
 def state_key(db: Db, canon: Canon, host: str) -> str:
@@ -1109,7 +1120,7 @@ def _same(row: dict, values: dict) -> bool:
         if key == "budget_usd":
             old = None if old is None else float(old)
             new = None if new is None else float(new)
-        if key == "capabilities":
+        if key in ("capabilities", "projects"):
             old = None if old is None else list(old)
         if old != new:
             return False
@@ -1235,7 +1246,10 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             "model": agent.model,
             "budget_usd": agent.budget_usd_per_day,
             "responsible": responsible,
+            # L243 (#435): every project of the card, the primary first; `team`
+            # stays the primary one for the readers of a single project
             "team": agent.team,
+            "projects": agent.effective_projects,
             "provider": agent.provider,
             "credential_mode": admission.credential_mode or agent.credential_mode,
             # `approve` n'entre jamais au registre (R8) ; la fiche est de toute

@@ -182,7 +182,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- 0051 : délai de grâce du travail de fond d'un tour (un nombre)
         'turn_grace_seconds',
         -- L42 (0032) : canon déclarant (identifiant de fédération, pas de contenu)
-        'canon'
+        'canon',
+        -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
+        'projects'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
@@ -288,7 +290,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #253 (0359): every filesystem the host writes to, paths and numbers
         'volumes',
         -- L159e6 (0361): the guard's last restart (unit names and reasons)
-        'guard_restart'
+        'guard_restart',
+        -- L159f (0069): host gate state, seq and the guard's short reason
+        'gate_state', 'gate_seq', 'gate_reason'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',
@@ -453,6 +457,15 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'agent_minutes', 'ci_minutes', 'review_minutes', 'human_minutes', 'ci_runs',
         'merge_sha', 'diff_files', 'diff_insertions', 'diff_deletions',
         'measured_size', 'declared_size'
+    ]),
+    -- L160e (0058): merge queue per target (lot, frozen commit, rank, state:
+    -- STATE, no content) and the per-target merge lease
+    ('merge_queue', ARRAY[
+        'work_item_id', 'target', 'frozen_sha', 'state', 'rank', 'landing_sha', 'reason',
+        'queued_by', 'queued_at', 'updated_at', 'source'
+    ]),
+    ('merge_locks', ARRAY[
+        'target', 'owner', 'epoch', 'expires_at'
     ]),
     -- L40 (0031) : registre des délégations et de leur issue (de l'ÉTAT)
     ('work_item_delegations', ARRAY[

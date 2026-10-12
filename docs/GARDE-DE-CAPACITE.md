@@ -195,7 +195,10 @@ Free text is admitted. The following values have a fixed meaning:
 - `/run/ameesh-gate/state/state.json`: the state. Its directory is
   read-only for the guest;
 - `/run/ameesh-gate/ack/ack.json`: the acknowledgement. Its directory is
-  writable by the guest.
+  writable by the guest. The guard reads `ack.json` only: the guest may
+  keep its own files there (the classic executor keeps `slots/`, which
+  counts `caps.max_concurrent` across all its executors on the host, and
+  `parts/`, one part of the ack per executor, merged into `ack.json`).
 
 Both files are written to a temporary file, then renamed.
 
@@ -287,6 +290,24 @@ The device reader that admitted only `schema`, `seq`, `drained` and
 shapes, so the readers converge. Offloaded jobs do not acknowledge. The
 guard sees them as scopes in the guest's slice and stops them itself at the
 deadline.
+
+### 8.1 The ameesh guest
+
+The classic ameesh executor obeys the gate (`ameesh/host_gate.py`, L159f;
+settings in [EXPLOITATION.md](EXPLOITATION.md#host-gate-l159f)):
+
+- its freshness rule is `capacity_guard.state_problem`, the rule of
+  section 5.3, checked against `freshness.json`;
+- a lending host (Host fiche with `policy.lend`) has a gate by default,
+  closed when the state is absent, unreadable or stale;
+- in `draining`, a turn stops at its next safe point, and at the latest at
+  `drain_deadline_ts`; the background work of finished turns stops at that
+  deadline too, and `drained` is `true` only once no lease and no such work
+  is left;
+- `freeze` is read as an interval: the guard should keep it in the state
+  until its next change, since the executor may only read it once thawed;
+- each resource reading records the state obeyed, and relocation never
+  chooses a destination that is not `available`.
 
 ## 9. Golden sets, and changing the contract
 

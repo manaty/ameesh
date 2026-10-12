@@ -496,6 +496,13 @@ class TurnCosts(Domain):
         intervalle."""
 
     @abc.abstractmethod
+    def paid_lines(self, from_ts: float, *, harnesses: Sequence[str]) -> list[dict]:
+        """L242b : les lignes de ces harnais écrites après `from_ts` (epoch),
+        hors lignes écartées : `{harness, account, ts, usd}`. Sert à
+        rapprocher l'estimation des baisses de solde compte par compte et
+        intervalle par intervalle (`CostBook.paid_hour`)."""
+
+    @abc.abstractmethod
     def unpriced(self, since_ts: float, prefix: str) -> list[dict]:
         """L225 : tours écrits depuis `since_ts` (epoch) facturés au repli
         prudent (`price_fallback`) ou écartés faute de barème (`void_reason`
@@ -1035,6 +1042,33 @@ class WorkItems(Domain):
         `item_ids`, newest first."""
 
     @abc.abstractmethod
+    def queue_add(self, item_id: int, *, target: str, frozen_sha: str, note: str,
+                  actor: str, source: str = "") -> dict | None:
+        """L160e (0058): puts (or puts back) the lot in the merge queue of
+        `target`, state `queued`, with a journal line; `source`: the
+        repository it was queued from (`merge_queue.source_of`). None if the
+        lot is no longer open."""
+
+    @abc.abstractmethod
+    def queue_update(self, item_id: int, *, state: str | None = None,
+                     rank: int | None = None, reason: str | None = None,
+                     landing_sha: str | None = None, note: str = "",
+                     actor: str = "", clear_rank: bool = False) -> dict | None:
+        """L160e (0058): changes the state, rank, reason or landing commit of
+        a queued lot (`queued` and `ejected` clear the landing commit;
+        `ejected` or `clear_rank` clear the rank); a journal line when
+        `note` is given. None if the lot is not queued."""
+
+    @abc.abstractmethod
+    def queue_remove(self, item_id: int, *, note: str, actor: str) -> bool:
+        """L160e (0058): takes the lot out of the queue, with a journal line."""
+
+    @abc.abstractmethod
+    def queue(self, target: str | None = None) -> list[dict]:
+        """L160e (0058): the queue rows (of `target`, else every target),
+        ranked first, then by arrival."""
+
+    @abc.abstractmethod
     def set_branch_head(self, item_id: int, branch: str, head: str | None) -> bool:
         """L118 : retient le dernier commit de la branche vu en avance sur sa
         cible, si la branche du lot est toujours `branch` (et quand, L118d)."""
@@ -1104,7 +1138,20 @@ class WorkItems(Domain):
         fusionné ni fermé, et journalise, en UNE transaction ; None sinon.
         L40 : efface la délégation en cours (issue `annulee`)."""
 
-    # -- délégation à échéance (L40, décision 0030 point 5) -------------------
+    @abc.abstractmethod
+    def handoff(self, item_id: int, assignee: str, *, current: str, state: str,
+                paused_prefix: str, note_prefix: str, window_s: float,
+                max_per_window: int, note: str, actor: str) -> dict | None:
+        """L233b : `current`, en pause budget, cède le lot à `assignee`, en UNE
+        transaction sous verrou consultatif (une reprise à la fois pour tout
+        le mesh), journalisée comme `assign` ; None si l'une des conditions
+        ne tient plus au moment d'écrire : le lot a encore l'assigné `current`
+        et l'état `state` (celui contrôlé) ; `current` est encore en pause
+        (`blocked`, `status_text` commençant par `paused_prefix`, ligne
+        verrouillée jusqu'à la fin) ; `assignee` n'a aucun lot ouvert ; moins
+        de `max_per_window` notes commençant par `note_prefix` dans les
+        `window_s` dernières secondes."""
+
     @abc.abstractmethod
     def delegate(self, item_id: int, delegate: str, *, current: str | None,
                  delegated_by: str, within_s: float, note: str, actor: str) -> dict | None:
@@ -1244,6 +1291,22 @@ class WorkItems(Domain):
         fiche ou de la fiche parente, sinon son application),
         `pending_decision` (une demande de décision attend sur le lot) et
         `decision_milestone` (un jalon de décision ouvert y est rattaché)."""
+
+    @abc.abstractmethod
+    def assignment_events(self, item_id: int, prefixes: Sequence[str]) -> list[dict]:
+        """L233b : la dernière ligne de journal du lot dont la note commence
+        par l'un des `prefixes` (une attribution), puis sa ligne la plus
+        ancienne (la création), du plus récent au plus ancien — quelle que
+        soit la longueur du journal."""
+
+    @abc.abstractmethod
+    def handoff_lots(self, assignee: str, limit: int) -> list[dict]:
+        """L233b : les lots `intake` et `build` de `assignee`, hors file
+        d'amélioration, dans l'ordre de `unassigned_lots`. Chaque ligne ajoute
+        `lot_team`, `pending_decision`, `decision_milestone` (comme
+        `unassigned_lots`), `package_team` (équipe de la fiche, pour
+        `projects.lot_project`) et `frozen_ts` (dernier jalon de gel, None
+        sans gel)."""
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     @abc.abstractmethod
@@ -1476,6 +1539,10 @@ class Canon(Domain):
     def host_rows(self, host: str, names: Sequence[str]) -> list[dict]:
         """Agents de l'hôte (et ceux nommés) avec colonnes déclaratives, statut,
         `profile_fresh` et `in_turn`."""
+
+    @abc.abstractmethod
+    def lot_projects(self) -> list[str]:
+        """L243 : les projets des lots (`app`), distincts."""
 
     @abc.abstractmethod
     def write_declared(self, name: str, values: dict) -> None:
@@ -2285,6 +2352,13 @@ class TurnResources(Domain):
         de lignes soldées."""
 
     @abc.abstractmethod
+    def settle_unchanged(self, rows: Sequence[dict]) -> list[str]:
+        """#339 r2 : `settle` des lignes lues (`to_review`) qui n'ont pas
+        changé depuis — même statut, fin, groupe et conteneurs ; une ligne
+        qu'un tour a fermée, marquée ou prolongée entre-temps reste. Les
+        `turn_id` soldés."""
+
+    @abc.abstractmethod
     def mark_orphan_many(self, turn_ids: Sequence[str]) -> int:
         """#220 r3 : `mark_orphan` (sans conteneurs) de plusieurs lignes en une
         écriture ; seules celles qui n'étaient pas encore `orphan` changent."""
@@ -2300,6 +2374,14 @@ class TurnResources(Domain):
     @abc.abstractmethod
     def orphans(self, host: str | None = None, limit: int = 50) -> list[dict]:
         """Les lignes `orphan` (de l'hôte si donné), les plus récentes d'abord."""
+
+    @abc.abstractmethod
+    def to_review(self, host: str, idle_s: float, after_id: int = 0,
+                  limit: int = 500) -> list[dict]:
+        """#339: the rows of `host` that may have outlived their resources:
+        `orphan` ones, and `running` ones whose turn (or grace period) ended
+        or started more than `idle_s` ago, of `id` above `after_id`, by
+        increasing `id`: a page of `limit` rows at most."""
 
     @abc.abstractmethod
     def orphans_started_before(self, host: str, before_ts: float, after_id: int = 0,

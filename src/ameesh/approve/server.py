@@ -46,9 +46,9 @@ import re
 import socket
 import sys
 import threading
-import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 
+from ..httpkit import BoundedHTTPServer, RateLimiter  # noqa: F401 — RateLimiter: re-exported
 from . import render
 from .service import ApproveError, ApproveService, load_json_body
 from .store import REQUEST_ID_RE, TOKEN_RE
@@ -97,40 +97,8 @@ def redact(text: str) -> str:
     return _SECRET_RE.sub("<redacted>", text)
 
 
-class RateLimiter:
-    """Seaux à jetons : `per_minute` requêtes par minute, rafale = per_minute."""
-
-    MAX_KEYS = 10000
-
-    def __init__(self, per_minute: int):
-        self.capacity = float(per_minute)
-        self.rate = per_minute / 60.0
-        self._buckets: dict = {}
-        self._lock = threading.Lock()
-
-    def allow(self, key: str) -> bool:
-        now = time.monotonic()
-        with self._lock:
-            tokens, last = self._buckets.get(key, (self.capacity, now))
-            tokens = min(self.capacity, tokens + (now - last) * self.rate)
-            allowed = tokens >= 1.0
-            if allowed:
-                tokens -= 1.0
-            self._buckets[key] = (tokens, now)
-            if len(self._buckets) > self.MAX_KEYS:
-                # les seaux pleins n'apprennent rien : on les oublie
-                for stale in [k for k, (t, l) in self._buckets.items()
-                              if t + (now - l) * self.rate >= self.capacity]:
-                    del self._buckets[stale]
-                if len(self._buckets) > self.MAX_KEYS:
-                    self._buckets.clear()
-            return allowed
-
-
-class ApproveHTTPServer(ThreadingHTTPServer):
-    daemon_threads = True
-    allow_reuse_address = True
-    request_queue_size = 64
+class ApproveHTTPServer(BoundedHTTPServer):
+    log = log
 
     def __init__(self, service: ApproveService, address: tuple[str, int], tls=None):
         if ":" in address[0]:
@@ -141,8 +109,7 @@ class ApproveHTTPServer(ThreadingHTTPServer):
         cfg = service.cfg
         self.ip_limiter = RateLimiter(cfg.rate_ip_per_minute)
         self.token_limiter = RateLimiter(cfg.rate_token_per_minute)
-        self._slots = threading.BoundedSemaphore(cfg.max_connections)
-        super().__init__(address, ApproveHandler)
+        super().__init__(address, ApproveHandler, max_connections=cfg.max_connections)
         port = self.server_address[1]
         self.local_hosts = frozenset(
             "%s:%d" % (host, port) for host in ("127.0.0.1", "localhost", "[::1]"))
@@ -161,27 +128,6 @@ class ApproveHTTPServer(ThreadingHTTPServer):
                 sock.close()
                 raise
         return sock, address
-
-    def process_request(self, request, client_address):
-        if not self._slots.acquire(blocking=False):
-            log.warning("too many simultaneous connections: connection closed")
-            self.shutdown_request(request)
-            return
-        try:
-            super().process_request(request, client_address)
-        except Exception:
-            self._slots.release()
-            raise
-
-    def process_request_thread(self, request, client_address):
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self._slots.release()
-
-    def handle_error(self, request, client_address) -> None:
-        # pas de trace complète sur stderr : une ligne, sans donnée de requête
-        log.warning("connection interrupted: %s", sys.exc_info()[0].__name__)
 
 
 class ApproveHandler(BaseHTTPRequestHandler):
