@@ -22,6 +22,7 @@
   agent-mesh work merged <id> --sha S [--note …]   merge done outside a PR: any open state → merged
   agent-mesh work migration <id> [--number N | --release]   reserve the work item's migration number (L122)
   agent-mesh work resolve <id> --with <other> [--done | --abort]   prepared conflict resolution (L160d)
+  agent-mesh work queue add|remove <id> | show [--target T]   merge queue per target (L160e)
   agent-mesh work move <id> merged --correct "reason"   correct a promoted state set by mistake
                                                 (the actor of work commands: --actor, otherwise
                                                 the session's bound identity, otherwise "inconnu")
@@ -968,6 +969,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "dependencies":
             from . import work_dependencies
             return work_dependencies.run(db, args)
+        if args.work_command == "queue":   # merge queue per target (L160e)
+            from . import merge_queue
+            return merge_queue.run(cfg, db, args)
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
@@ -1137,6 +1141,12 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             item["resolutions"], error = resolutions.of_lot_or_error(db, args.id)
             if error:  # e.g. a database without migration 0057
                 item["resolutions_error"] = error
+            # L160e : place du lot dans la file de fusion de sa cible
+            try:
+                item["queue"] = next((r for r in storage.of(db).work.queue()
+                                      if int(r["work_item_id"]) == args.id), None)
+            except Exception:  # noqa: BLE001 - e.g. a database without migration 0058
+                item["queue"] = None
             # L157c: actual time by phase and merged diff size, once delivered
             from . import lot_measures
             item["measure"] = lot_measures.view(storage.of(db).work.measure(args.id))
@@ -1211,6 +1221,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("depends  : #%d (%s, %s)" % (
                     edge["blocker_id"], edge["blocker_state"],
                     "blocking" if edge["blocking"] else "satisfied"))
+            if item.get("queue"):
+                q = item["queue"]
+                print("queue    : %s to %s, rank %s, frozen %s%s" % (
+                    q["state"], q["target"], q.get("rank") or "—", q["frozen_sha"][:12],
+                    " (%s)" % q["reason"] if q.get("reason") else ""))
             if item.get("waiting_for"):
                 print("waiting  : %s" % item["waiting_for"]["label"])
             if item.get("delegation"):
@@ -2073,6 +2088,8 @@ def build_parser() -> argparse.ArgumentParser:
     unrecorded.add_parser(work_sub, cmd_work)  # demandes d'humains sans lot (L130)
     from . import resolutions
     resolutions.add_parser(work_sub, cmd_work)  # prepared conflict resolutions (L160d)
+    from . import merge_queue
+    merge_queue.add_parser(work_sub, cmd_work)  # merge queue per target (L160e)
 
     p_cost = sub.add_parser("cost", help="turn costs and plan gauges (L12)")
     cost_sub = p_cost.add_subparsers(dest="cost_command")

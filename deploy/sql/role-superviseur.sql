@@ -450,6 +450,15 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'merge_sha', 'diff_files', 'diff_insertions', 'diff_deletions',
         'measured_size', 'declared_size'
     ]),
+    -- L160e (0058): merge queue per target (lot, frozen commit, rank, state:
+    -- STATE, no content) and the per-target merge lease
+    ('merge_queue', ARRAY[
+        'work_item_id', 'target', 'frozen_sha', 'state', 'rank', 'landing_sha', 'reason',
+        'queued_by', 'queued_at', 'updated_at', 'source'
+    ]),
+    ('merge_locks', ARRAY[
+        'target', 'owner', 'epoch', 'expires_at'
+    ]),
     -- L40 (0031) : registre des délégations et de leur issue (de l'ÉTAT)
     ('work_item_delegations', ARRAY[
         'id', 'work_item_id', 'delegate', 'delegated_by', 'delegated_at', 'due_at',
