@@ -38,7 +38,7 @@ AGENT_COLUMNS = """
     extract(epoch from last_seen)::float8         as last_seen_ts,
     extract(epoch from last_turn_at)::float8      as last_turn_ts,
     extract(epoch from last_event_at)::float8     as last_event_ts,
-    responsible, team, provider, credential_mode, capabilities, canon_ref, canon,
+    responsible, team, projects, provider, credential_mode, capabilities, canon_ref, canon,
     ephemeral, created_by, priority, admitted_hosts, admitted_tags, memory_repository,
     extract(epoch from ephemeral_expires_at)::float8 as ephemeral_expires_ts,
     session_policy, effort, tier, session_work_item,

@@ -155,7 +155,12 @@ def _recorded(cfg: Config, host: str, canon: canon_mod.Canon | None = None) -> d
     except db_mod.DbError:
         return None
     try:
-        out = {"state": canon_sync.state(db, host, canon), "placements": None}
+        out = {"state": canon_sync.state(db, host, canon), "placements": None,
+               "projects": None}
+        try:
+            out["projects"] = canon_sync.known_projects(db)
+        except db_mod.DbError:
+            pass                        # base pas encore migrée
         try:
             rows = placement_mod.recorded(db, host)
             # L43 (0031) : dans le bloc d'un canon, seuls SES agents (colonne
@@ -222,10 +227,11 @@ def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
 def _check_one(cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
                sink: list | None = None) -> int:
     host = getattr(args, "host", None) or cfg.host
-    findings = canon_mod.validate(canon)
+    recorded = _recorded(cfg, host, canon)
+    # L243 : les projets inconnus ne se vérifient qu'avec la base (lots)
+    findings = canon_mod.validate(canon, (recorded or {}).get("projects"))
     errors = canon_mod.errors(findings)
     status, diagnostic = canon_sync.assess(canon, host, findings)
-    recorded = _recorded(cfg, host, canon)
     placements = placement_mod.verdicts(canon) if canon.readable else []
     if args.json:
         data = {
