@@ -62,6 +62,9 @@ PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merg
                 "lease_ref")
 #: #194 r6: where the lease of a target lives on the remote (local mode)
 LEASE_REF_DEFAULT = "refs/ameesh/land/"
+#: #194 r8: the only namespaces a lease ref may live in — never a branch that
+#: ameesh lands on
+LEASE_NAMESPACES = ("refs/ameesh/", "refs/heads/ameesh-land/")
 #: L160e2: who merges the head of the queue — nobody (`off`: the agent or the
 #: orchestrator), ameesh by a local merge pushed to the target, or ameesh
 #: through the PR (target merged into the lot branch, CI, PR merged by the API)
@@ -171,6 +174,12 @@ def parse_settings(raw) -> Settings:
         lease_ref = lease_ref.strip()
         if not lease_ref.startswith("refs/"):
             lease_ref = "refs/heads/" + lease_ref
+        if not lease_ref.startswith(LEASE_NAMESPACES):
+            raise SettingsError("%s.lease_ref: %s is not a lease namespace (%s, or a prefix "
+                                "under them)" % (where, lease_ref, " or ".join(LEASE_NAMESPACES)))
+        if texts["target"] and lease_collides(lease_ref, texts["target"]):
+            raise SettingsError("%s.lease_ref: %s collides with the target %s"
+                                % (where, lease_ref, texts["target"]))
         try:
             plan_git.check_ref(lease_ref + "main", "lease_ref")
         except ValueError as exc:
@@ -181,6 +190,19 @@ def parse_settings(raw) -> Settings:
                                  gates=tuple(g.strip() for g in gates), merge_method=method,
                                  lease_ref=lease_ref)
     return Settings(projects=projects)
+
+
+def lease_collides(prefix: str, target: str) -> bool:
+    """#194 r8: the lease ref of `target` under `prefix` would be the target
+    branch itself, or one holds the other (a target inside the lease
+    namespace, a lease ref under the target's name)."""
+    branch = target
+    for head in ("origin/", "refs/heads/"):
+        branch = branch[len(head):] if branch.startswith(head) else branch
+    target_ref, lease = "refs/heads/" + branch, prefix + branch
+    return (lease == target_ref or target_ref.startswith(prefix)
+            or prefix.startswith(target_ref + "/") or lease.startswith(target_ref + "/")
+            or target_ref.startswith(lease + "/"))
 
 
 def settings_of(cfg) -> Settings:

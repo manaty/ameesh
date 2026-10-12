@@ -709,8 +709,10 @@ class WorkItems(interface.WorkItems):
             return self._queue_row(tx, item_id)
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
-                     note="", actor="", clear_rank=False, lease=None) -> dict | None:
+                     note="", actor="", clear_rank=False, lease=None,
+                     freeze=None) -> dict | None:
         key, owner, epoch = lease if lease is not None else (None, None, None)
+        frozen, landing = freeze if freeze is not None else (None, None)
         with self.db.transaction() as tx:
             # #194 r6: the lease row is locked by the same statement (an
             # acquisition waits for this write, or this write sees its new
@@ -726,9 +728,14 @@ class WorkItems(interface.WorkItems):
                 "   reason = coalesce(%s, reason), updated_at = now()"
                 " WHERE work_item_id = %s"
                 "   AND (%s::text IS NULL OR EXISTS (SELECT 1 FROM lease))"
+                # #194 r8: or under the freeze — still `landing`, same freeze
+                # and same landing commit (a new freeze is never overwritten)
+                "   AND (%s::text IS NULL OR (state = 'landing' AND frozen_sha = %s"
+                "        AND landing_sha IS NOT DISTINCT FROM %s))"
                 " RETURNING work_item_id",
                 (key, owner, epoch, state, state == "ejected" or bool(clear_rank), rank,
-                 state or "", landing_sha, reason, int(item_id), key))
+                 state or "", landing_sha, reason, int(item_id), key, frozen, frozen,
+                 landing))
             if not rows:
                 return None
             if note:

@@ -626,15 +626,12 @@ class RemoteLockTest(_Land):
     def test_first_to_the_server_wins_the_next_epoch_agrees(self):
         # runner-2 takes the database lease but has not published yet: the
         # remote lock is still runner-1's, whose landing is then the valid one
+        # — and (#194 r8) reported as such, recorded under its freeze
         self.queued(4)
         self.pause_after_renewal(lambda: self.locks.land_lock("p:main", "runner-2", 600))
         out = self.land(4)
-        self.assertEqual(out["result"], "busy", out)          # its writes are stale
+        self.assertEqual(out["result"], "landed", out)
         self.assertIn("ameesh-work: 4", self.origin_log())
-        self.fake.land_lock = self.locks.land_lock
-        cfg2 = dataclasses.make_dataclass("Cfg", ["state_dir"])(self.tmp + "/state2")
-        again = land.land_head(cfg2, None, self.project, self.fake._row(4), owner="runner-2")
-        self.assertEqual(again["result"], "landed", again)
         self.assertEqual(self.fake.queue_rows[4]["state"], "landed")
 
     def test_unreadable_base_after_the_merge_is_uncertain(self):
@@ -662,6 +659,7 @@ class RemoteLockTest(_Land):
         store = mock.Mock()
         store.work.queue.return_value = [dict(self.fake.queue_rows[4], assignee="a4",
                                               updated_ts=1.0)]
+        store.work.events_noted.return_value = []
         with mock.patch.object(storage, "of", return_value=store):
             from ameesh import exploitation, notify
             alerts = exploitation._land_uncertain(None)
@@ -688,6 +686,173 @@ class RemoteLockTest(_Land):
         self.assertEqual(done["wrong_base"], "develop", done)
         self.assertTrue(any("merged into develop, not main" in body for _, body, _ in self.sent))
         self.assertTrue(self.fake.queue_rows[4]["reason"].startswith(land.WRONG_BASE))
+
+
+class Review194r8Test(_Land):
+    """#194 r7 verdict: a stale doubt never overwrites a newer freeze; a lease
+    ref never collides with a target; a merge that happened is reported as
+    one (malformed read-back, lease lost, timeout); the alerts reach a human
+    assignee."""
+    LAND = "pr"
+
+    def landing(self):
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        locks: dict = {}
+        out = self.land(4, gh=gh, locks=locks)
+        gh.head, gh.ci = out["sha"], "green"
+        return gh, locks, out["sha"]
+
+    def lose_lease(self):
+        held = self.locks.held["p:main"]
+        self.locks.held["p:main"] = (held[0], held[1], 0)
+        self.locks.land_lock("p:main", "runner-2", 600)
+
+    def test_stale_doubt_never_overwrites_a_new_freeze(self):
+        gh, locks, sha = self.landing()
+        merged = []
+
+        def refrozen_meanwhile(args, timeout=60.0):
+            if args[:2] == ["pr", "merge"]:
+                merged.append(True)
+                # runner-1 suspended: runner-2 refreezes and requeues the lot
+                self.lose_lease()
+                self.fake.queue_rows[4].update(state="queued", frozen_sha="b" * 40,
+                                               landing_sha=None, reason="")
+            elif args[:2] == ["pr", "view"] and merged:
+                return subprocess.CompletedProcess(args, 1, "", "HTTP 502")
+            return gh(args, timeout=timeout)
+        done = self.land(4, gh=refrozen_meanwhile, locks=locks)
+        self.assertEqual((done["result"], done["recorded"]), ("uncertain", "history"), done)
+        row = self.fake.queue_rows[4]
+        self.assertEqual((row["state"], row["frozen_sha"], row["reason"]),
+                         ("queued", "b" * 40, ""))
+        self.assertTrue(any(n.startswith(land.UNCERTAIN) for _, n, _ in self.fake.notes))
+        self.assertEqual([r["work_item_id"] for r in land.uncertain(None)], [4])
+
+    def test_lease_ref_colliding_with_a_target_refused(self):
+        def settings(lease_ref, target="main"):
+            return radar.parse_settings({"projects": {"p": {
+                "repo": self.repo, "land": "local", "gates": ["true"], "target": target,
+                "lease_ref": lease_ref}}})
+        for bad, target in (("refs/heads/", "main"), ("refs/tags/x/", "main"),
+                            ("ameesh-land/", "ameesh-land/main"), ("ameesh-land/", "ameesh-land"),
+                            ("refs/heads/feature/", "main")):
+            with self.subTest(bad=bad, target=target):
+                with self.assertRaises(radar.SettingsError):
+                    settings(bad, target)
+        self.assertEqual(settings("refs/ameesh/land/").projects["p"].lease_ref,
+                         "refs/ameesh/land/")
+        self.assertEqual(settings("ameesh-land/").projects["p"].lease_ref,
+                         "refs/heads/ameesh-land/")
+        # declared without the settings: refused at landing, nothing written
+        self.project = dataclasses.replace(self.project, land="local", lease_ref="refs/heads/")
+        self.queued(4)
+        before = _git(self.origin, "rev-parse", "main")
+        out = self.land(4)
+        self.assertEqual(out["result"], "error", out)
+        self.assertIn("collides with the target main", out["error"])
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "queued")
+
+    def test_malformed_read_back_after_the_merge_is_uncertain(self):
+        gh, locks, sha = self.landing()
+        merged = []
+
+        def garbled(args, timeout=60.0):
+            if args[:2] == ["pr", "merge"]:
+                merged.append(True)
+            elif args[:2] == ["pr", "view"] and merged:
+                return subprocess.CompletedProcess(args, 0, "<html>502</html>", "")
+            return gh(args, timeout=timeout)
+        done = self.land(4, gh=garbled, locks=locks)
+        self.assertEqual(done["result"], "uncertain", done)
+        self.assertTrue(self.fake.queue_rows[4]["reason"].startswith(land.UNCERTAIN))
+        self.assertEqual(self.fake.queue_rows[4]["state"], "landed")
+
+    def test_lease_lost_after_a_successful_merge_is_still_landed(self):
+        gh, locks, sha = self.landing()
+
+        def expire_on_merge(args, timeout=60.0):
+            if args[:2] == ["pr", "merge"]:
+                self.lose_lease()
+            return gh(args, timeout=timeout)
+        done = self.land(4, gh=expire_on_merge, locks=locks)
+        self.assertEqual(done["result"], "landed", done)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "landed")
+
+    def merging(self, gh, *, merges: bool, readable: bool):
+        """`pr merge` times out; GitHub merged it (`merges`) or not."""
+        state = {"merged": False, "called": False}
+
+        def timeout(args, timeout=60.0):
+            if args[:2] == ["pr", "merge"]:
+                state.update(merged=merges, called=True)
+                return subprocess.CompletedProcess(args, land.GH_TIMEOUT, "",
+                                                   "timed out after 120 seconds")
+            if args[:2] == ["pr", "view"]:
+                if not readable and state["called"]:
+                    return subprocess.CompletedProcess(args, 1, "", "HTTP 502")
+                out = {"baseRefName": gh.base, "headRefOid": gh.head,
+                       "state": "MERGED" if state["merged"] else "OPEN"}
+                return subprocess.CompletedProcess(args, 0, json.dumps(out), "")
+            if args[:2] == ["pr", "list"] and state["merged"]:
+                rows = [{"number": 9, "headRefOid": gh.head, "baseRefName": gh.base}] \
+                    if "merged" in args else []
+                return subprocess.CompletedProcess(args, 0, json.dumps(rows), "")
+            return gh(args, timeout=timeout)
+        return timeout, state
+
+    def test_merge_timeout_read_back_merged(self):
+        gh, locks, sha = self.landing()
+        fake, _ = self.merging(gh, merges=True, readable=True)
+        done = self.land(4, gh=fake, locks=locks)
+        self.assertEqual(done["result"], "landed", done)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "landed")
+
+    def test_merge_timeout_unreadable_is_uncertain_then_found_merged(self):
+        gh, locks, sha = self.landing()
+        fake, state = self.merging(gh, merges=True, readable=False)
+        done = self.land(4, gh=fake, locks=locks)
+        self.assertEqual(done["result"], "uncertain", done)
+        row = self.fake.queue_rows[4]
+        self.assertEqual(row["state"], "landing")
+        self.assertTrue(row["reason"].startswith(land.UNCERTAIN))
+        self.assertTrue(locks, "the lease is kept")
+        # next pass: the PR is no longer open, found merged at the landing commit
+        fake, state = self.merging(gh, merges=True, readable=True)
+        state["merged"] = True
+        again = self.land(4, gh=lambda a, timeout=60.0: fake(a, timeout) if a[:2] != [
+            "pr", "merge"] else self.fail("merged twice"), locks=locks)
+        self.assertEqual(again["result"], "landed", again)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "landed")
+
+    def test_merge_timeout_not_merged_is_retried(self):
+        gh, locks, sha = self.landing()
+        fake, _ = self.merging(gh, merges=False, readable=True)
+        done = self.land(4, gh=fake, locks=locks)
+        self.assertEqual(done["result"], "retry", done)
+        self.assertEqual(self.fake.queue_rows[4]["state"], "landing")
+
+    def test_alerts_reach_a_human_assignee(self):
+        from ameesh import exploitation, notify
+        store = mock.Mock()
+        store.work.queue.return_value = [{
+            "work_item_id": 4, "target": "main", "state": "landed", "rank": None,
+            "reason": land.UNCERTAIN + "x", "updated_ts": 1.0, "assignee": "human:alice"}]
+        store.work.events_noted.return_value = []
+        with mock.patch.object(storage, "of", return_value=store):
+            alert = exploitation._land_uncertain(None)[0]
+        self.assertEqual((alert["agent"], alert["responsible"]), (None, "human:alice"))
+        router = notify.Router.__new__(notify.Router)
+        self.assertEqual(router.resolve(alert), ("human:alice", "alerte"))
+        store.work.queue.return_value = [{
+            "work_item_id": 5, "target": "main", "state": "queued", "rank": 1,
+            "updated_ts": time.time() - 7200, "assignee": "human:alice", "title": "t"}]
+        with mock.patch.object(storage, "of", return_value=store):
+            blocked = exploitation._merge_blocked(None, time.time())[0]
+        self.assertEqual((blocked["agent"], blocked["responsible"]), (None, "human:alice"))
 
 
 class SettingsAndAlertTest(unittest.TestCase):
@@ -763,6 +928,20 @@ class LeaseDbTest(PgTestCase):
         self.assertEqual(ops.queue()[0]["state"], "landed")
         self.assertIsNotNone(ops.queue_update(lot, reason="radar"))   # no lease: unchanged
 
+
+    def test_queue_write_fenced_by_the_freeze(self):
+        """#194 r8: a merge recorded without its lease writes only over the
+        same freeze still `landing` on the same landing commit."""
+        ops = storage.of(self.db).work
+        lot = work.add(self.db, title="frozen")["id"]
+        ops.queue_add(lot, target="main", frozen_sha="a" * 40, note="queued", actor="t")
+        self.assertIsNone(ops.queue_update(lot, state="landed", freeze=("a" * 40, None)))
+        ops.queue_update(lot, state="landing", landing_sha="c" * 40)
+        for other in (("b" * 40, "c" * 40), ("a" * 40, "d" * 40), ("a" * 40, None)):
+            self.assertIsNone(ops.queue_update(lot, state="landed", freeze=other))
+        self.assertIsNotNone(ops.queue_update(lot, state="landed",
+                                              freeze=("a" * 40, "c" * 40)))
+        self.assertEqual(ops.queue()[0]["state"], "landed")
 
     def test_queue_write_waits_for_the_lease_row(self):
         """#194 r6: the guarded write locks the lease row: an acquisition in

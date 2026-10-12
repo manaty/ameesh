@@ -157,12 +157,30 @@ def gates(project, path: str, *, timeout: float = GATE_TIMEOUT_S) -> dict:
 # GitHub (land: pr)
 # --------------------------------------------------------------------------
 
+#: #194 r8: the exit status of a `gh` call that timed out — its effect unknown
+GH_TIMEOUT = 124
+
+
 def _gh(args: list[str], *, timeout: float = 60.0) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(["gh", *args], capture_output=True, text=True,
                               timeout=timeout, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(["gh", *args], GH_TIMEOUT, "", str(exc))
+    except OSError as exc:
         return subprocess.CompletedProcess(["gh", *args], 1, "", str(exc))
+
+
+def _json(proc, what: str, kind):
+    """#194 r8: the output of `gh … --json`, of the type expected, or LandError."""
+    try:
+        data = json.loads(proc.stdout or ("[]" if kind is list else "{}"))
+    except ValueError as exc:
+        raise LandError("%s: unreadable output (%s)" % (what, exc)) from exc
+    if not isinstance(data, kind) or (kind is list and not all(
+            isinstance(r, dict) for r in data)):
+        raise LandError("%s: unexpected output %s" % (what, (proc.stdout or "")[:100]))
+    return data
 
 
 def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
@@ -172,7 +190,7 @@ def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
                "number,headRefOid,baseRefName,statusCheckRollup"])
     if proc.returncode != 0:
         raise LandError("gh pr list: %s" % (proc.stderr or proc.stdout).strip()[:300])
-    rows = json.loads(proc.stdout or "[]")
+    rows = _json(proc, "gh pr list", list)
     if not rows:
         return None
     rollup = rows[0].get("statusCheckRollup") or []
@@ -184,13 +202,33 @@ def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
 
 
 def pr_merge(slug: str, number, sha: str, method: str, gh=_gh) -> str | None:
-    """Merges the PR by the API at that very commit; the error, or None."""
+    """Merges the PR by the API at that very commit; the error, or None. A
+    timeout starts with `TIMED_OUT`: GitHub may have merged it all the same."""
     proc = gh(["pr", "merge", str(number), "--repo", slug, "--%s" % method,
                "--match-head-commit", sha], timeout=120.0)
     if proc.returncode == 0:
         return None
     # #194 r3: a failure without output is still a failure
-    return (proc.stderr or proc.stdout or "").strip()[:300] or "exit %d" % proc.returncode
+    error = (proc.stderr or proc.stdout or "").strip()[:300] or "exit %d" % proc.returncode
+    return TIMED_OUT + error if proc.returncode == GH_TIMEOUT else error
+
+
+TIMED_OUT = "timed out: "
+
+
+def pr_merged(slug: str, branch: str, sha: str, gh=_gh) -> dict | None:
+    """#194 r8: the merged PR of `branch` whose head is `sha` (`{number,
+    base}`), None if there is none — a merge that completed after its call
+    timed out, or between two passes. Raises when GitHub cannot be read."""
+    proc = gh(["pr", "list", "--repo", slug, "--head", branch, "--state", "merged",
+               "--json", "number,headRefOid,baseRefName"])
+    if proc.returncode != 0:
+        raise LandError("gh pr list --state merged: %s"
+                        % (proc.stderr or proc.stdout).strip()[:300])
+    for row in _json(proc, "gh pr list --state merged", list):
+        if merge_queue._same(row.get("headRefOid"), sha):
+            return {"number": row.get("number"), "base": row.get("baseRefName")}
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -321,15 +359,30 @@ class _Landing:
         return dict({"lot": self.lot, "to": row.get("assignee"), "kind": "ejected",
                      "message_id": sent, "result": "ejected"}, **extra)
 
+    def record(self, reason: str, note: str, *, state: str = "landed") -> str:
+        """#194 r8: a merge that happened is a fact, recorded whatever became
+        of the lease: under the lease; else under the freeze (the lot still
+        `landing` on the same freeze and landing commit); else — a newer
+        freeze or entry is there, never overwritten — as history only, a
+        line in the lot's journal. Returns `lease`, `freeze` or `history`."""
+        row = self.row
+        if self.write(state=state, reason=reason, note=note, actor=work.SYSTEM_SENDER):
+            return "lease"
+        if self.ops.queue_update(self.lot, state=state, reason=reason, note=note,
+                                 actor=work.SYSTEM_SENDER,
+                                 freeze=(row["frozen_sha"], row.get("landing_sha"))) is not None:
+            return "freeze"
+        self.ops.note(self.lot, row.get("item_state") or "", "%s (history: %s)" % (reason, note),
+                      work.SYSTEM_SENDER)
+        return "history"
+
     def landed(self, merged: dict, base, *, pr=None) -> dict:
         self.release = True
         row, project = self.row, self.project
         reason = "merged by ameesh (%s)" % merged["sha"][:12]
-        if not self.write(state="landed", reason=reason,
-                          note="merge queue of %s: landed by ameesh, %s%s" % (
-                              row["target"], merged["sha"][:12],
-                              ", PR #%s" % pr if pr else ""), actor=work.SYSTEM_SENDER):
-            return self.busy("lease on %s lost: landing not written" % self.key)
+        # #194 r8: pushed or merged — the lease lost since changes nothing to it
+        how = self.record(reason, "merge queue of %s: landed by ameesh, %s%s" % (
+            row["target"], merged["sha"][:12], ", PR #%s" % pr if pr else ""))
         gates_text = ", ".join("`%s`" % g for g in project.gates)
         _passive(self.db, row.get("assignee"), self.lot, (
             "Merge queue of %s, lot #%d « %s »: merged by ameesh (%s%s)%s. Gates passed on "
@@ -339,7 +392,9 @@ class _Landing:
                "; resolutions replayed by rerere on %s" % ", ".join(merged["files"][:6])
                if merged.get("state") == "replayed" else "", gates_text)),
             {"project": project.name, "target": row["target"], "commit": merged["sha"]})
-        return {"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr}
+        return dict({"lot": self.lot, "result": "landed", "sha": merged["sha"], "pr": pr},
+                    **({"warning": "lease lost: recorded as history only (a newer entry is "
+                        "queued)"} if how == "history" else {}))
 
 
 def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=None,
@@ -382,7 +437,7 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
 
 
 def _land(landing: _Landing, replayer, slug, gh) -> dict:
-    from . import resolutions
+    from . import radar, resolutions
     project, row, lot = landing.project, landing.row, landing.lot
     if row["state"] == "landing" and project.land == "pr":
         return _follow_pr(landing, slug, gh=gh, replayer=replayer)
@@ -391,6 +446,14 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     branch = _branch_of(row["target"])
     lease_ref = (getattr(project, "lease_ref", "") or LEASE_REF) + branch
     mine = None
+    if project.land == "local" and radar.lease_collides(
+            getattr(project, "lease_ref", "") or LEASE_REF, branch):
+        # #194 r8: the lease ref would move the target itself, before the gates
+        landing.release = True
+        return {"lot": lot, "result": "error", "error": (
+            "lease ref %s collides with the target %s: nothing written; set "
+            "radar.projects.%s.lease_ref under %s" % (
+                lease_ref, branch, project.name, " or ".join(radar.LEASE_NAMESPACES)))}
     if project.land == "local":
         # #194 r6: the remote lease ref is the lock itself, taken (compare and
         # swap) BEFORE any write of this holder; the database expiry only
@@ -526,7 +589,7 @@ def pr_view(slug: str, number, gh=_gh) -> dict:
                "baseRefName,headRefOid,state"])
     if proc.returncode != 0:
         raise LandError("gh pr view: %s" % (proc.stderr or proc.stdout or "").strip()[:300])
-    data = json.loads(proc.stdout or "{}")
+    data = _json(proc, "gh pr view", dict)
     return {"base": data.get("baseRefName"), "head": data.get("headRefOid"),
             "state": data.get("state")}
 
@@ -535,6 +598,12 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
     project, row, lot = landing.project, landing.row, landing.lot
     branch = _branch_of(row["target"])
     status = pr_status(slug, row["branch"], gh=gh) if slug else None
+    if status is None and slug and row.get("landing_sha"):
+        # #194 r8: merged since (a merge call that timed out, or between two
+        # passes): checked like any merge of ameesh's, never ejected
+        merged = pr_merged(slug, row["branch"], row["landing_sha"], gh=gh)
+        if merged is not None:
+            return _after_merge(landing, merged["number"], merged["base"], None)
     if status is None:
         if row.get("item_state") in work.MERGED_STATES:
             landing.release = True
@@ -580,19 +649,38 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
             status["number"], now["base"] or "?", (now["head"] or "?")[:12]),
             "Check the PR, freeze again, then ameesh work queue add %d." % lot)
     error = pr_merge(slug, status["number"], row["landing_sha"], project.merge_method, gh=gh)
-    if error is not None:
-        # #194 r3: the branch holds the merge commit; the lot stays `landing`
-        # with it (and the lease: a lasting refusal raises `merge_blocked`)
-        landing.write(reason="PR merge refused (%s): retried" % error[:200])
-        return {"lot": lot, "result": "retry", "error": error}
+    # #194 r8: past this call, the PR may be merged: nothing raises any more,
+    # and every outcome is read back from GitHub
     try:
-        after, unread = pr_view(slug, status["number"], gh=gh)["base"], None
-    except LandError as exc:
-        after, unread = None, str(exc)[:200]
-    if after != branch:
-        return _merged_in_doubt(landing, status["number"], after, unread)
-    return landing.landed({"sha": row["landing_sha"], "state": "pr", "files": []}, None,
-                          pr=status["number"])
+        now = pr_view(slug, status["number"], gh=gh)
+        after, unread = now["base"], None
+    except Exception as exc:  # noqa: BLE001 - the merge may have happened
+        now, after, unread = None, None, "%s: %s" % (type(exc).__name__, str(exc)[:200])
+    if error is not None:
+        if now is not None and now["state"] != "MERGED":
+            # #194 r3: the branch holds the merge commit; the lot stays
+            # `landing` with it (and the lease: a lasting refusal raises
+            # `merge_blocked`); a merge completed later is found by `pr_merged`
+            landing.write(reason="PR merge refused (%s): retried" % error[:200])
+            return {"lot": lot, "result": "retry", "error": error}
+        if now is None and not error.startswith(TIMED_OUT):
+            landing.write(reason="PR merge refused (%s), PR unreadable (%s): retried"
+                          % (error[:200], unread))
+            return {"lot": lot, "result": "retry", "error": error}
+        if now is None:
+            # timed out, and unreadable: merged or not, nobody knows yet
+            return _merged_in_doubt(landing, status["number"], None, "%s; %s" % (
+                error[:200], unread), pending=True)
+    return _after_merge(landing, status["number"], after, unread)
+
+
+def _after_merge(landing: _Landing, pr, after, unread) -> dict:
+    """#194 r8: PR `pr` is merged (by this call or found merged): landed if
+    into its target, otherwise reported."""
+    if after != _branch_of(landing.row["target"]):
+        return _merged_in_doubt(landing, pr, after, unread)
+    return landing.landed({"sha": landing.row["landing_sha"], "state": "pr", "files": []},
+                          None, pr=pr)
 
 
 #: #194 r6: reasons of a PR merged where it should not have been, or that
@@ -601,35 +689,62 @@ WRONG_BASE = "WRONG BASE: "
 UNCERTAIN = "UNCERTAIN: "
 
 
-def _merged_in_doubt(landing: _Landing, pr, after, unread) -> dict:
+def _merged_in_doubt(landing: _Landing, pr, after, unread, *, pending=False) -> dict:
     """The PR is merged, but into another base (retargeted inside the last
-    window) or its base cannot be read back. The warning goes first, whatever
-    happens to the lease; the merge is a fact, written even by a stale holder
-    (`land_uncertain` alerts on it)."""
+    window) or its base cannot be read back; `pending`: its merge call timed
+    out and nothing can be read (merged or not). The warning goes first,
+    whatever happens to the lease; then the fact, under the lease or the
+    freeze, else as history only — never over a newer freeze (#194 r8).
+    `land_uncertain` alerts on it. Pending, the lot stays `landing` (the next
+    pass reads it again: `pr_merged`)."""
     row, lot, branch = landing.row, landing.lot, _branch_of(landing.row["target"])
     reason = (WRONG_BASE + "PR #%s merged into %s, not %s: check it by hand"
               % (pr, after, branch)) if after else (
+        UNCERTAIN + "PR #%s merge timed out, its state unreadable (%s): read again at the "
+        "next pass, check it by hand" % (pr, unread)) if pending else (
         UNCERTAIN + "PR #%s merged, base unreadable after the merge (%s): check it by hand"
         % (pr, unread))
     merge_queue._wake(landing.db, row.get("assignee"), lot, (
         "Merge queue of %s, lot #%d: %s." % (row["target"], lot, reason)),
         {"project": landing.project.name, "target": row["target"], "kind": "land",
          "lot": lot, "reason": reason})
-    landing.release = True
-    landing.ops.queue_update(lot, state="landed", reason=reason,
-                             note="merge queue of %s: %s" % (row["target"], reason),
-                             actor=work.SYSTEM_SENDER)
+    landing.release = not pending
+    how = landing.record(reason, "merge queue of %s: %s" % (row["target"], reason),
+                         state="landing" if pending else "landed")
     return {"lot": lot, "result": "uncertain" if after is None else "landed",
-            "wrong_base": after, "pr": pr, "reason": reason}
+            "wrong_base": after, "pr": pr, "reason": reason, "recorded": how}
 
 
-def uncertain(db) -> list[dict]:
-    """#194 r6: lots merged by ameesh into a wrong base, or not checked."""
+#: #194 r8: how long a doubt recorded as history only (a newer freeze queued
+#: over it) stays an alert
+UNCERTAIN_HISTORY_S = float(os.environ.get("AMEESH_LAND_UNCERTAIN_H", "24")) * 3600
+
+
+def uncertain(db, now: float | None = None) -> list[dict]:
+    """#194 r6: lots merged by ameesh into a wrong base, or not checked: in
+    the queue, or (#194 r8) as history only, for `UNCERTAIN_HISTORY_S`."""
+    now = time.time() if now is None else now
+    ops = storage.of(db).work
     try:
-        rows = storage.of(db).work.queue()
+        rows = ops.queue()
     except Exception:  # noqa: BLE001 - database without 0058
         return []
-    return [r for r in rows if (r.get("reason") or "").startswith((WRONG_BASE, UNCERTAIN))]
+    out = [r for r in rows if (r.get("reason") or "").startswith((WRONG_BASE, UNCERTAIN))]
+    seen = {int(r["work_item_id"]) for r in out}
+    queued = {int(r["work_item_id"]): r for r in rows}
+    for prefix in (WRONG_BASE, UNCERTAIN):
+        try:
+            noted = ops.events_noted(prefix, now - UNCERTAIN_HISTORY_S)
+        except Exception:  # noqa: BLE001 - read again at the next pass
+            noted = []
+        for event in noted:
+            lot = int(event["work_item_id"])
+            if lot in seen or "(history: " not in (event.get("note") or ""):
+                continue
+            seen.add(lot)
+            out.append(dict(queued.get(lot) or {}, work_item_id=lot,
+                            reason=event["note"], updated_ts=event.get("created_ts")))
+    return out
 
 
 def run_pass(cfg, db, project, report: dict, *, owner: str, locks=None, gh=_gh) -> list[dict]:

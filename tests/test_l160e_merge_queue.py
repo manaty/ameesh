@@ -54,11 +54,14 @@ class FakeQueue(FakeWork):
         return self._row(item_id)
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
-                     note="", actor="", clear_rank=False, lease=None):
+                     note="", actor="", clear_rank=False, lease=None, freeze=None):
         q = self.queue_rows.get(item_id)
         if q is None:
             return None
         if lease is not None and not getattr(self, "lease_ok", lambda lease: True)(lease):
+            return None
+        if freeze is not None and (q["state"], q["frozen_sha"], q.get("landing_sha")) != (
+                "landing", *freeze):
             return None
         if state:
             q["state"] = state
@@ -73,6 +76,13 @@ class FakeQueue(FakeWork):
         if note:
             self.notes.append((item_id, note, actor))
         return self._row(item_id)
+
+    def note(self, item_id, state, text, actor):
+        self.notes.append((item_id, text, actor))
+
+    def events_noted(self, prefix, since_ts):
+        return [{"work_item_id": i, "note": n, "actor": a, "created_ts": self.clock}
+                for i, n, a in self.notes if n.startswith(prefix)]
 
     def queue_remove(self, item_id, *, note, actor):
         self.notes.append((item_id, note, actor))
