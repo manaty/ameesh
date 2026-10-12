@@ -438,6 +438,30 @@ class ShellTest(OffloadBase):
                           if e["outcome"] == "error"],
                          [("20200101-000000-abcdef", "orphan job killed and removed")])
 
+    def test_a_reused_pid_does_not_hide_an_orphan(self):
+        # the dead shell's PID now belongs to another process: same PID, other
+        # start time; the job is an orphan, and cancel never signals that process
+        other = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        name = "20200101-000000-fedcba"
+        orphan = os.path.join(self.vm, "jobs", name)
+        os.makedirs(orphan)
+        meta = {"job": name, "state": "running", "shell_pid": other.pid,
+                "shell_start": "%s:1" % offload_shell._proc_identity(other.pid).split(":")[0]}
+        with open(os.path.join(orphan, "meta.json"), "w") as fh:
+            json.dump(meta, fh)
+        status = [json.loads(line) for line in self.offload("status").stdout.splitlines()]
+        self.assertEqual([j["state"] for j in status if j.get("job") == name], ["orphan"])
+        self.assertEqual(self.offload("cancel", name).returncode, 0)
+        self.assertIsNone(other.poll())  # not signalled
+        self.assertEqual(self.offload("run", "--", "true").returncode, 0)
+        self.assertFalse(os.path.exists(orphan))
+        self.assertIsNone(other.poll())
+        # the shell's own identity is recorded and recognised as alive
+        me = {"shell_pid": os.getpid(), "shell_start": offload_shell._proc_identity(os.getpid())}
+        self.assertTrue(offload_shell._shell_alive(me))
+
     def test_emit_survives_a_closed_session(self):
         class Gone:
             def write(self, _text):

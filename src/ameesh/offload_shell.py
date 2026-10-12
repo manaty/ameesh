@@ -258,6 +258,30 @@ def _read_meta(job_dir: str) -> dict | None:
         return None
 
 
+def _proc_identity(pid: int) -> str | None:
+    """`boot_id:start time` of a process (Linux /proc), None if unknown: a PID
+    alone can be reused by an unrelated process, after a reboot too."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as fh:
+            boot = fh.read().strip()
+        with open("/proc/%d/stat" % pid, encoding="utf-8", errors="replace") as fh:
+            # the name may hold spaces and parentheses: the fields follow the last ')'
+            start = fh.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+    return "%s:%s" % (boot, start)
+
+
+def _shell_alive(meta: dict) -> bool:
+    """The job's shell still runs: its PID exists and, when its identity was
+    recorded, is still the same process (not a reused PID)."""
+    pid = meta.get("shell_pid")
+    if not _alive(pid):
+        return False
+    recorded = meta.get("shell_start")
+    return recorded is None or _proc_identity(pid) == recorded
+
+
 def _alive(pid: object) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
@@ -624,7 +648,7 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
     meta_path = os.path.join(job_dir, "meta.json")
     meta = {"job": job_id, "state": "waiting", "repo": req["repo"], "commit": req["commit"],
             "profile": req["profile"], "argv": req["argv"], "created_ts": int(started),
-            "shell_pid": os.getpid()}
+            "shell_pid": os.getpid(), "shell_start": _proc_identity(os.getpid())}
     _write_meta(meta_path, meta)
     emit("job", job_id)
     job = Job(cfg, job_id, job_dir)
@@ -733,7 +757,7 @@ def prune_orphans(cfg: dict) -> None:
     jobs = _dir(cfg, "jobs")
     for name in os.listdir(jobs):
         meta = _read_meta(os.path.join(jobs, name))
-        if meta is None or _alive(meta.get("shell_pid")):
+        if meta is None or _shell_alive(meta):
             continue
         job_id = str(meta.get("job") or name)
         if cfg.get("scope"):
@@ -762,7 +786,7 @@ def prune_orphans(cfg: dict) -> None:
 
 def _journal(cfg: dict, entry: dict) -> None:
     """One line per job in `jobs.jsonl`: the usage measure of the study (4.4)."""
-    entry = {k: v for k, v in entry.items() if k not in ("shell_pid", "pid")}
+    entry = {k: v for k, v in entry.items() if k not in ("shell_pid", "shell_start", "pid")}
     entry["ended_ts"] = int(time.time())
     try:
         with open(os.path.join(cfg["root"], "jobs.jsonl"), "a", encoding="utf-8") as fh:
@@ -785,9 +809,10 @@ def cmd_status(cfg: dict, args: list[str]) -> int:
         meta = _read_meta(os.path.join(jobs, name))
         if meta is None:
             continue
-        if not _alive(meta.get("shell_pid")):
+        if not _shell_alive(meta):
             meta["state"] = "orphan"
         meta.pop("shell_pid", None)
+        meta.pop("shell_start", None)
         sys.stdout.write(json.dumps(meta, sort_keys=True) + "\n")
     return 0
 
@@ -800,9 +825,8 @@ def cmd_cancel(cfg: dict, args: list[str]) -> int:
     if meta is None:
         raise Refused("no job %s" % args[0])
     open(os.path.join(job_dir, "cancel"), "w").close()
-    pid = meta.get("shell_pid")
-    if _alive(pid):
-        os.kill(pid, signal.SIGTERM)
+    if _shell_alive(meta):  # never a process that reused the PID
+        os.kill(meta["shell_pid"], signal.SIGTERM)
     sys.stdout.write("cancelled %s\n" % args[0])
     return 0
 
