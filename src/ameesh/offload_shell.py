@@ -59,6 +59,14 @@ where ameesh itself is not installed.
 """
 from __future__ import annotations
 
+if __name__ == "__main__":
+    # first thing (r5): until then /proc/<pid>/fd of this shell, its session's
+    # streams, can be opened by any process of the same UID. The interpreter's
+    # own start stays a window: only another UID for the jobs closes it
+    import ctypes as _ctypes
+    if _ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
+        raise SystemExit("ameesh-offload: prctl(PR_SET_DUMPABLE, 0) failed")
+
 import fcntl
 import hashlib
 import hmac
@@ -96,6 +104,33 @@ DRAIN_S = 2.0
 HAVE_DEPTH = 32
 #: the `after` hook (teardown) runs even after a stop, within this delay
 AFTER_HOOK_S = 120
+
+
+#: every git of the shell: no global or system config, and the keys of a
+#: repository config that run a command off: a job (same UID) can write the
+#: mirrors' config or ~/.gitconfig, its hooks would run outside the slice
+GIT_SAFE = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+            "-c", "core.sshCommand=false", "-c", "core.pager=cat",
+            "-c", "core.alternateRefsCommand=", "-c", "gc.auto=0"]
+GIT_ENV = {"GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_TERMINAL_PROMPT": "0", "GIT_ATTR_NOSYSTEM": "1"}
+
+
+def _helper(argv: list[str], *, stdin=None, input: bytes | None = None,
+            check: bool = False) -> subprocess.CompletedProcess:
+    """A helper of the shell (git, systemctl): never a fd of the session —
+    stdin closed (or the given pipe / bytes), stdout and stderr captured —
+    and, for git, the isolated config above. `check` raises with its stderr."""
+    if argv[0] == "git":
+        argv = GIT_SAFE + argv[1:]
+    env = dict(os.environ, **GIT_ENV)
+    if input is None and stdin is None:
+        stdin = subprocess.DEVNULL
+    res = subprocess.run(argv, input=input, stdin=stdin if input is None else None,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+    if check and res.returncode != 0:
+        raise subprocess.CalledProcessError(res.returncode, argv, res.stdout, res.stderr)
+    return res
 
 
 class Refused(Exception):
@@ -279,8 +314,8 @@ def mirror_path(cfg: dict, repo: str) -> str:
         raise Refused("invalid repository name %r" % repo)
     path = os.path.join(_dir(cfg, "mirrors"), repo + ".git")
     if not os.path.isdir(path):
-        subprocess.run(["git", "init", "-q", "--bare", path], check=True)
-        subprocess.run(["git", "-C", path, "config", "gc.auto", "0"], check=True)
+        _helper(["git", "init", "-q", "--bare", path], check=True)
+        _helper(["git", "-C", path, "config", "gc.auto", "0"], check=True)
     return path
 
 
@@ -295,23 +330,52 @@ def cmd_put(cfg: dict, args: list[str]) -> int:
             if os.path.isdir(stamps) else []
         names.sort(key=lambda n: os.path.getmtime(os.path.join(stamps, n)), reverse=True)
         for name in names[:HAVE_DEPTH]:
-            if subprocess.run(["git", "-C", mirror, "cat-file", "-e", name + "^{commit}"],
-                              stderr=subprocess.DEVNULL).returncode == 0:
+            if _helper(["git", "-C", mirror, "cat-file", "-e", name + "^{commit}"]
+                       ).returncode == 0:
                 sys.stdout.write(name + "\n")
         return 0
     commit = args[1]
     if not SHA_RE.match(commit):
         raise Refused("invalid commit id %r" % commit)
-    subprocess.run(["git", "-C", mirror, "index-pack", "--stdin", "--fix-thin"],
-                   stdin=sys.stdin.buffer, stdout=subprocess.DEVNULL, check=True)
-    if subprocess.run(["git", "-C", mirror, "cat-file", "-e", commit + "^{commit}"]
-                      ).returncode != 0:
+    index_pack(mirror)
+    if _helper(["git", "-C", mirror, "cat-file", "-e", commit + "^{commit}"]
+               ).returncode != 0:
         raise Refused("commit %s missing after the pack" % commit)
-    subprocess.run(["git", "-C", mirror, "update-ref", "refs/offload/" + commit, commit],
-                   check=True)
+    _helper(["git", "-C", mirror, "update-ref", "refs/offload/" + commit, commit],
+            check=True)
     touch_snapshot(mirror, commit)
     prune_mirror(cfg, mirror)
     return 0
+
+
+def index_pack(mirror: str) -> None:
+    """Stores the pack read on the session's stdin. The shell copies it into a
+    pipe: git never holds a fd of the session."""
+    read_fd, write_fd = os.pipe()
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            with os.fdopen(read_fd, "rb") as pipe:
+                box["res"] = _helper(["git", "-C", mirror, "index-pack", "--stdin",
+                                      "--fix-thin"], stdin=pipe)
+        except BaseException as exc:  # given back to the caller
+            box["exc"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        with os.fdopen(write_fd, "wb") as pipe:
+            shutil.copyfileobj(sys.stdin.buffer, pipe, 1 << 16)
+    except BrokenPipeError:
+        pass  # git stopped reading: its exit code says why
+    thread.join()
+    if "exc" in box:
+        raise box["exc"]
+    res = box["res"]
+    if res.returncode != 0:
+        raise subprocess.CalledProcessError(res.returncode, ["git", "index-pack"],
+                                            res.stdout, res.stderr)
 
 
 def touch_snapshot(mirror: str, commit: str) -> None:
@@ -328,22 +392,19 @@ def prune_mirror(cfg: dict, mirror: str) -> None:
     """Drops snapshots unused for `keep_days`, then lets git repack."""
     limit = time.time() - float(cfg["keep_days"]) * 86400
     stamps = os.path.join(mirror, "offload-stamps")
-    out = subprocess.run(
-        ["git", "-C", mirror, "for-each-ref", "--format=%(refname)", "refs/offload/"],
-        capture_output=True, text=True, check=True)
+    out = _helper(["git", "-C", mirror, "for-each-ref", "--format=%(refname)",
+                   "refs/offload/"], check=True)
     old = []
-    for ref in out.stdout.split():
+    for ref in out.stdout.decode().split():
         stamp = os.path.join(stamps, ref.rsplit("/", 1)[-1])
         if not os.path.exists(stamp) or os.path.getmtime(stamp) < limit:
             old.append(ref)
             if os.path.exists(stamp):
                 os.unlink(stamp)
     if old:
-        subprocess.run(["git", "-C", mirror, "update-ref", "--stdin"],
-                       input="".join("delete %s\n" % ref for ref in old),
-                       text=True, check=True)
-    subprocess.run(["git", "-C", mirror, "-c", "gc.auto=50", "gc", "--auto", "--quiet"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _helper(["git", "-C", mirror, "update-ref", "--stdin"],
+                input="".join("delete %s\n" % ref for ref in old).encode(), check=True)
+    _helper(["git", "-C", mirror, "-c", "gc.auto=50", "gc", "--auto", "--quiet"])
     # dependency caches unused for as long (their mtime is touched on use)
     caches = _dir(cfg, "cache")
     for profile in os.listdir(caches):
@@ -476,8 +537,7 @@ def unit_names(job_id: str) -> tuple[str, str]:
 
 
 def _systemctl(*args: str) -> None:
-    subprocess.run(["systemctl", "--user", *args],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _helper(["systemctl", "--user", *args])
 
 
 def open_slice(cfg: dict, job_id: str) -> None:
@@ -487,10 +547,10 @@ def open_slice(cfg: dict, job_id: str) -> None:
     props = ["MemoryMax=%s" % cfg["agent_memory_max"], "MemorySwapMax=0"] \
         if cfg.get("agent_memory_max") else []
     if props:
-        res = subprocess.run(["systemctl", "--user", "set-property", "--runtime",
-                              slice_name, *props], capture_output=True, text=True)
+        res = _helper(["systemctl", "--user", "set-property", "--runtime", slice_name, *props])
         if res.returncode != 0:
-            raise Refused("cannot cap the job slice: %s" % res.stderr.strip())
+            raise Refused("cannot cap the job slice: %s"
+                          % res.stderr.decode(errors="replace").strip())
 
 
 def close_slice(job_id: str) -> None:
@@ -705,11 +765,11 @@ def prepare_cache(job: Job, profile_name: str, profile: dict, work: str,
 def checkout(mirror: str, work: str, commit: str) -> None:
     """A throwaway work tree of `commit`, borrowing the mirror's objects
     (a clone of a mirror without branches would warn, and copy refs)."""
-    subprocess.run(["git", "init", "-q", work], check=True)
+    _helper(["git", "init", "-q", work], check=True)
     with open(os.path.join(work, ".git", "objects", "info", "alternates"), "w",
               encoding="utf-8") as fh:
         fh.write(os.path.join(mirror, "objects") + "\n")
-    subprocess.run(["git", "-C", work, "checkout", "-q", "--detach", commit], check=True)
+    _helper(["git", "-C", work, "checkout", "-q", "--detach", commit], check=True)
 
 
 def check_user_manager(env: dict) -> None:
@@ -782,8 +842,8 @@ def cmd_run(cfg: dict, args: list[str]) -> int:
         emit_result(result)
         return 75
     mirror = mirror_path(cfg, req["repo"])
-    if subprocess.run(["git", "-C", mirror, "cat-file", "-e", req["commit"] + "^{commit}"],
-                      stderr=subprocess.DEVNULL).returncode != 0:
+    if _helper(["git", "-C", mirror, "cat-file", "-e", req["commit"] + "^{commit}"]
+               ).returncode != 0:
         result.update(outcome="refused", reason="unknown commit %s (put it first)" % req["commit"])
         emit_result(result)
         return 2
@@ -928,7 +988,8 @@ def prune_orphans(cfg: dict) -> None:
                 env["OFFLOAD_SLICE"] = unit_names(job_id)[0]
             try:
                 subprocess.run(["/bin/sh", "-ec", profile["after"]], env=env,
-                               cwd=cfg["root"], stdout=subprocess.DEVNULL,
+                               cwd=cfg["root"], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, timeout=AFTER_HOOK_S)
             except subprocess.TimeoutExpired:
                 pass

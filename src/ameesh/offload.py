@@ -45,6 +45,12 @@ from .offload_shell import NONCE_RE, PREFIX, result_mac
 
 #: exit code when the VM refused or stopped the job and no fallback is allowed
 EX_TEMPFAIL = 75
+#: once the result is in, how long the session may take to end (then closed)
+RESULT_GRACE_S = 10.0
+#: bounds of the short calls (`put --have`, `cancel`, `status`) and of the
+#: snapshot's upload
+CALL_TIMEOUT_S = 60.0
+PUT_TIMEOUT_S = 1800.0
 #: snapshot identity: fixed, so that the same tree gives the same commit id
 SNAP_ENV = {"GIT_AUTHOR_NAME": "ameesh offload", "GIT_AUTHOR_EMAIL": "offload@ameesh",
             "GIT_COMMITTER_NAME": "ameesh offload", "GIT_COMMITTER_EMAIL": "offload@ameesh"}
@@ -130,9 +136,22 @@ class Remote:
                 "-o", "ServerAliveInterval=30", self.host, shlex.join(words)]
 
     def call(self, *words: str, input: bytes | None = None, stdin=None,
-             capture: bool = True) -> subprocess.CompletedProcess:
-        return subprocess.run(self.argv(*words), input=input, stdin=stdin,
-                              capture_output=capture)
+             capture: bool = True, timeout: float = CALL_TIMEOUT_S
+             ) -> subprocess.CompletedProcess:
+        """One bounded ssh call: OffloadError when it outlasts `timeout`."""
+        try:
+            return subprocess.run(self.argv(*words), input=input, stdin=stdin,
+                                  capture_output=capture, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise OffloadError("%s: `%s` got no answer within %ds"
+                               % (self.host, words[0], int(timeout))) from None
+
+    def cancel(self, job: str) -> None:
+        """Asks the VM to cancel `job`, once; never raises."""
+        try:
+            self.call("cancel", job)
+        except OffloadError as exc:
+            _note(str(exc))
 
 
 def push(remote: Remote, top: str, repo: str, snap: str) -> None:
@@ -154,7 +173,11 @@ def push(remote: Remote, top: str, repo: str, snap: str) -> None:
     writer = threading.Thread(target=lambda: (pack.stdin.write(revs.encode()),
                                               pack.stdin.close()))
     writer.start()
-    sent = remote.call("put", repo, snap, stdin=pack.stdout)
+    try:
+        sent = remote.call("put", repo, snap, stdin=pack.stdout, timeout=PUT_TIMEOUT_S)
+    except OffloadError:
+        pack.kill()
+        raise
     pack.stdout.close()
     writer.join()
     if pack.wait() != 0:
@@ -215,14 +238,38 @@ def run_remote(remote: Remote, words: list[str]) -> tuple[int, dict | None, str 
 
     reader = threading.Thread(target=relay, daemon=True)
     reader.start()
+
+    def finish(grace: float) -> int:
+        try:
+            return proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return proc.wait()
+
+    def wait() -> int:
+        # the result says how the job ended: a session that lingers after it
+        # (a helper holding the stream, a stuck sshd) is closed, bounded
+        while True:
+            try:
+                return proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass
+            if state["result"] is not None:
+                try:
+                    return proc.wait(timeout=RESULT_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    _note("the session to %s did not end after the result: closed"
+                          % remote.host)
+                    return finish(0)
+
     try:
-        rc = proc.wait()
+        rc = wait()
     except KeyboardInterrupt:
         if state["job"]:
             _note("cancelling job %s" % state["job"])
-            remote.call("cancel", state["job"])
+            remote.cancel(state["job"])
         proc.send_signal(signal.SIGTERM)
-        rc = proc.wait()
+        rc = finish(RESULT_GRACE_S)
         reader.join(timeout=5)
         return rc, state["result"] or {"outcome": "cancelled", "job": state["job"]}, state["job"]
     reader.join(timeout=5)
@@ -273,12 +320,17 @@ def cmd_run(opts: dict, argv: list[str]) -> int:
         # (two heavy suites at once); the VM side cancels a job whose session
         # is gone, and we ask it too, once.
         if job:
-            remote.call("cancel", job)
+            remote.cancel(job)
         _note("lost the connection to %s (ssh exit %d)%s; not rerun on this machine"
               % (host, rc, ", job %s cancelled" % job if job else ""))
         return EX_TEMPFAIL
     outcome = result.get("outcome")
     if outcome == "done":
+        # from the result (authenticated), not from ssh: a session closed
+        # after the result has no exit code of its own
+        code = result.get("exit")
+        if isinstance(code, int):
+            return code if 0 <= code < 256 else 128 + (-code)
         return rc
     reason = result.get("reason") or outcome
     if outcome in ("refused", "stopped"):
@@ -289,15 +341,22 @@ def cmd_run(opts: dict, argv: list[str]) -> int:
 
 
 def cmd_status(host: str, args: list[str]) -> int:
-    res = Remote(host).call("status", *args, capture=False)
-    return res.returncode
+    try:
+        return Remote(host).call("status", *args, capture=False).returncode
+    except OffloadError as exc:
+        _note(str(exc))
+        return EX_TEMPFAIL
 
 
 def cmd_cancel(host: str, args: list[str]) -> int:
     if len(args) != 1:
         print(__doc__)
         return 2
-    return Remote(host).call("cancel", args[0], capture=False).returncode
+    try:
+        return Remote(host).call("cancel", args[0], capture=False).returncode
+    except OffloadError as exc:
+        _note(str(exc))
+        return EX_TEMPFAIL
 
 
 def parse(args: list[str]) -> tuple[dict, list[str]]:

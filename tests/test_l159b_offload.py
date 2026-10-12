@@ -509,6 +509,109 @@ class FallbackTest(OffloadBase):
             self.assertEqual(tail[:5] == ["/usr/bin/env", "-u", "XDG_RUNTIME_DIR",
                                           "-u", "DBUS_SESSION_BUS_ADDRESS"], dropped, phase)
 
+    def test_a_job_cannot_plant_git_hooks_for_the_shell(self):
+        # r5 on #213: the shell's git read ~/.gitconfig and the mirror's
+        # config, both writable by a job (same UID): a core.hooksPath planted
+        # there ran its hooks outside the slice, with the session's stderr
+        home = os.path.join(self.tmp, "home")
+        hooks = os.path.join(self.tmp, "hooks")
+        os.makedirs(home)
+        os.makedirs(hooks)
+        marker = os.path.join(self.tmp, "hook-ran")
+        for hook in ("post-checkout", "reference-transaction", "pre-auto-gc"):
+            path = os.path.join(hooks, hook)
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\necho %s >> %s\n" % (hook, marker))
+            os.chmod(path, 0o755)
+        mirror = os.path.join(self.vm, "mirrors", "acme-widget.git")
+        env = dict(self.env(), HOME=home)
+        plant = ('printf "[core]\\n\\thooksPath = %s\\n" > "$HOME/.gitconfig"; '
+                 'git config -f %s/config core.hooksPath %s' % (hooks, mirror, hooks))
+        res = subprocess.run([AMEESH, "offload", "run", "--", "sh", "-c", plant],
+                             cwd=self.repo, env=env, capture_output=True, text=True,
+                             timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(os.path.exists(os.path.join(home, ".gitconfig")))
+        with open(os.path.join(self.repo, "tracked.txt"), "w") as fh:
+            fh.write("v2\n")  # a new snapshot: put, update-ref, checkout
+        res = subprocess.run([AMEESH, "offload", "run", "--", "true"], cwd=self.repo,
+                             env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_the_shell_helpers_hold_no_stream_of_the_session(self):
+        # r5 on #213: a concurrent job opened /proc/<git>/fd/2 of the shell's
+        # git, which held the session's stderr. A `git` first on PATH records,
+        # for each call, the pipes it shares with the session (fake ssh)
+        bin_dir = os.path.join(self.tmp, "bin")
+        os.makedirs(bin_dir)
+        report = os.path.join(self.tmp, "git-fds.jsonl")
+        real_git = shutil.which("git")
+        with open(os.path.join(bin_dir, "git"), "w") as fh:
+            fh.write(textwrap.dedent('''\
+                #!%s
+                import json, os, sys
+                mine = set()
+                for n in (0, 1, 2):
+                    try:
+                        mine.add(os.readlink("/proc/self/fd/%%d" %% n))
+                    except OSError:
+                        pass
+                shared, pid = set(), os.getppid()
+                while pid > 1:
+                    try:
+                        for fd in os.listdir("/proc/%%d/fd" %% pid):
+                            link = os.readlink("/proc/%%d/fd/%%s" %% (pid, fd))
+                            if link in mine and link.startswith("pipe:"):
+                                shared.add(link)
+                    except OSError:
+                        pass
+                    with open("/proc/%%d/stat" %% pid) as st:
+                        pid = int(st.read().rsplit(")", 1)[1].split()[1])
+                with open(%r, "a") as out:
+                    out.write(json.dumps({"argv": sys.argv[1:], "shared": sorted(shared)}) + "\\n")
+                os.execv(%r, [%r] + sys.argv[1:])
+                ''' % (sys.executable, report, real_git, real_git)))
+        os.chmod(os.path.join(bin_dir, "git"), 0o755)
+        env = dict(self.env())
+        env["PATH"] = bin_dir + os.pathsep + env["PATH"]
+        # the client's own git (snapshot) runs on the workstation: only the
+        # shell's calls matter, found by their mirror or checkout paths
+        res = subprocess.run([AMEESH, "offload", "run", "--", "true"], cwd=self.repo,
+                             env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        with open(report) as fh:
+            calls = [json.loads(line) for line in fh]
+        shell_calls = [c for c in calls if any(self.vm in a for a in c["argv"])]
+        self.assertTrue(any("index-pack" in c["argv"] for c in shell_calls), shell_calls)
+        self.assertTrue(any("checkout" in c["argv"] for c in shell_calls), shell_calls)
+        self.assertEqual([c for c in shell_calls if c["shared"]], [])
+
+    def test_a_session_lingering_after_the_result_is_closed(self):
+        # r5 on #213: the client waited for ssh without bound after the result
+        nonce = "cd" * 16
+        result = {"job": "j", "outcome": "done", "exit": 3}
+        result["mac"] = offload_shell.result_mac(nonce, result)
+        fake = os.path.join(self.tmp, "fake-vm")
+        with open(fake, "w") as fh:
+            fh.write(textwrap.dedent('''\
+                #!/bin/sh
+                cat >/dev/null
+                case "$*" in *"run "*)
+                  printf '%%s\\n' '%s%s session' '%s%s result %s' >&2
+                  exec sleep 300;;
+                esac
+                ''' % (offload_shell.PREFIX, nonce, offload_shell.PREFIX, nonce,
+                       json.dumps(result))))
+        os.chmod(fake, 0o755)
+        env = dict(self.env(), AMEESH_OFFLOAD_SSH=fake)
+        started = time.time()
+        res = subprocess.run([AMEESH, "offload", "run", "--", "true"], cwd=self.repo,
+                             env=env, capture_output=True, text=True, timeout=60)
+        self.assertLess(time.time() - started, offload.RESULT_GRACE_S + 15)
+        self.assertEqual(res.returncode, 3, res.stderr)  # the result's exit code
+        self.assertIn("did not end after the result", res.stderr)
+
     def test_lost_connection_during_the_job_is_never_rerun_locally(self):
         marker = os.path.join(self.tmp, "local-run")
         client = subprocess.Popen(
