@@ -519,13 +519,17 @@ warnings = []
 offer, problems, unknown = capacity_guard.parse_lend(lend, warnings)
 for warning in warnings:
     print("warning: " + warning, file=sys.stderr)
-# mesh-design #459 r4b: a refused `disk_paths` (relative, `..`, NUL) drops the
-# offer; the guard must still start and lend nothing, and `canon check`
-# reports the fiche. Any other problem refuses the installation.
-if problems and not capacity_guard.refused_paths_only(problems):
+# mesh-design #459 r4c: the family "main accepted it" — a refused
+# `disk_paths` (relative, `..`, NUL) and a size the previous reader truncated
+# to <= 0 (`0`, `-0`, `"0.5B"`) — drops the offer; the guard must still start
+# closed and lend nothing, and `canon check` reports the fiche. The
+# classification reads the codes of `parse_lend`, never a substring of a
+# message that quotes the value the operator wrote. Any other problem refuses
+# the installation.
+if problems and not capacity_guard.tolerated_only(problems):
     sys.exit("invalid offer: " + "; ".join(problems))
 if problems:
-    print("warning: offer dropped (the guard starts and lends nothing): "
+    print("warning: offer dropped (the guard starts closed and lends nothing): "
           + "; ".join(problems), file=sys.stderr)
     lend, offer = None, None
 if offer is not None:

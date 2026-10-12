@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 
 from . import platform, storage
@@ -166,11 +167,28 @@ def parse_bytes(value, *, decimal_ok: bool = True) -> int | None:
     # (codex #459 r3). On multiplie donc le nombre entier de chiffres par le
     # facteur, puis on exige que l'échelle décimale divise exactement.
     whole, _, fraction = number.partition(".")
-    exact = int(whole + fraction) * factor
+    try:
+        exact = int(whole + fraction) * factor
+    except ValueError:
+        # plus de chiffres que la limite de conversion des entiers de Python
+        # (4300 par défaut) : aucune taille, jamais une exception (codex #459
+        # r4 : `1.` suivi de 4300 zéros levait un ValueError non rattrapé)
+        return None
     scale = 10 ** len(fraction)
     if exact % scale:
         return None
     return exact // scale
+
+
+def bytes_digit_limit() -> int:
+    """The digit count beyond which Python refuses to convert a text to an
+    integer (`sys.get_int_max_str_digits()`, 4300 by default); 0 when the
+    running interpreter has no such limit (before 3.11).
+
+    A size written with more digits cannot be checked by the exact reader of
+    `parse_bytes(decimal_ok=False)`: the caller refuses it rather than reading
+    it through the float path (codex #459 r4)."""
+    return getattr(sys, "get_int_max_str_digits", lambda: 0)()
 
 
 def parse_fraction(value) -> float | None:

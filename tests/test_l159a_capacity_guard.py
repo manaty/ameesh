@@ -330,7 +330,7 @@ class OfferTest(unittest.TestCase):
             dict(base, reclaim={"disk_paths": ["/srv/", "/var/lib//"]}))
         self.assertEqual(problems, [])
         self.assertEqual(offer["reclaim"]["disk_paths"], ["/srv", "/var/lib"])
-        # r3: the same filesystem named twice is collapsed, not refused
+        # r3: the same path named twice is collapsed, not refused
         for paths in (["/srv", "/srv/"], ["/srv/", "/srv//"]):
             with self.subTest(paths=paths):
                 warnings: list[str] = []
@@ -339,6 +339,106 @@ class OfferTest(unittest.TestCase):
                 self.assertEqual(problems, [])
                 self.assertEqual(offer["reclaim"]["disk_paths"], ["/srv"])
                 self.assertTrue(any("duplicate" in w for w in warnings), warnings)
+
+    def test_disk_paths_trailing_slash_is_normalized_with_a_warning(self):
+        # codex #459 r4 (P3): "/srv/" and "/srv//" were normalized without the
+        # warning the doc announces (`host-lend-legacy`): the comparison
+        # stripped the trailing slash before comparing
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
+        for paths, expected in ((["/srv/"], ["/srv"]),
+                                (["/srv//"], ["/srv"]),
+                                (["/srv//guest/"], ["/srv/guest"]),
+                                (["/."], ["/"])):
+            with self.subTest(paths=paths):
+                warnings: list[str] = []
+                offer, problems, _ = capacity_guard.parse_lend(
+                    dict(base, reclaim={"disk_paths": paths}), warnings)
+                self.assertEqual(problems, [])
+                self.assertEqual(offer["reclaim"]["disk_paths"], expected)
+                self.assertTrue(any("normalized" in w for w in warnings), warnings)
+        warnings = []
+        offer, problems, _ = capacity_guard.parse_lend(
+            dict(base, reclaim={"disk_paths": ["/", "/srv"]}), warnings)
+        self.assertEqual(problems, [])
+        self.assertEqual(warnings, [], "a clean fiche says nothing")
+
+    def test_les_codes_classent_sans_lire_le_message(self):
+        # mesh-design #459 r4c: the tolerated family ("main accepted it") is
+        # read from `LendProblem.code`, never from the message — a message
+        # quotes the value the operator wrote, which can copy the wording
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
+        for reclaim, code in (({"disk_paths": ["../etc"]},
+                               capacity_guard.PROBLEM_DISK_PATHS),
+                              ({"disk_paths": ["/\x00"]},
+                               capacity_guard.PROBLEM_DISK_PATHS),
+                              ({"disk_paths": ["rel/x", "/srv"]},
+                               capacity_guard.PROBLEM_DISK_PATHS),
+                              ({"disk_free_min": 0}, capacity_guard.PROBLEM_SIZE_ZERO),
+                              ({"disk_free_min": -0.0}, capacity_guard.PROBLEM_SIZE_ZERO),
+                              ({"disk_free_min": "0.5B"},
+                               capacity_guard.PROBLEM_SIZE_ZERO),
+                              ({"memory_available_min": "0.0001KiB"},
+                               capacity_guard.PROBLEM_SIZE_ZERO)):
+            with self.subTest(reclaim=reclaim):
+                offer, problems, _ = capacity_guard.parse_lend(dict(base, reclaim=reclaim))
+                self.assertIsNone(offer)
+                self.assertTrue(problems)
+                self.assertEqual([p.code for p in problems], [code])
+                self.assertTrue(capacity_guard.tolerated_only(problems))
+        # several tolerated problems together: still the family
+        offer, problems, _ = capacity_guard.parse_lend(dict(
+            base, reclaim={"disk_paths": ["../etc"], "disk_free_min": 0}))
+        self.assertEqual({p.code for p in problems},
+                         {capacity_guard.PROBLEM_DISK_PATHS,
+                          capacity_guard.PROBLEM_SIZE_ZERO})
+        self.assertTrue(capacity_guard.tolerated_only(problems))
+        # anything else is refused, even next to a tolerated problem
+        for lend in ({"cpu_max": 1, "memory_max": "1GiB",
+                      "reclaim": {"disk_paths": ["../etc"]}},
+                     dict(base, reclaim={"disk_paths": "/"}),
+                     dict(base, reclaim={"disk_free_min": -1}),
+                     dict(base, reclaim={"disk_free_min": "lots"}),
+                     dict(base, reclaim={"io_pressure_max": None}),
+                     dict(base, cpu_max="three")):
+            with self.subTest(lend=lend):
+                offer, problems, _ = capacity_guard.parse_lend(lend)
+                self.assertTrue(problems)
+                self.assertFalse(capacity_guard.tolerated_only(problems))
+        # the value that copied the wording of a refused path is not one: the
+        # old substring test ("disk_paths`" + "refused path") tolerated it
+        _, problems, _ = capacity_guard.parse_lend(
+            dict(base, windows=["mon 10:00-11:00 disk_paths` refused path"]))
+        self.assertIn("disk_paths`", problems[0])
+        self.assertIn("refused path", problems[0])
+        self.assertEqual([p.code for p in problems], [capacity_guard.PROBLEM_INVALID])
+        self.assertFalse(capacity_guard.tolerated_only(problems))
+
+    def test_une_taille_au_dela_des_chiffres_de_python_est_refusee(self):
+        # codex #459 r4 (P3): `disk_free_min: "1." + "0"*4300 + "GiB"` raised
+        # an uncaught ValueError (Python's integer conversion limit) in the
+        # exact reader; it is refused, with a problem naming the key
+        if not resources.bytes_digit_limit():
+            self.skipTest("this interpreter converts any number of digits")
+        huge = "1." + "0" * 4300 + "GiB"
+        base = {"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1GiB"}
+        self.assertIsNone(resources.parse_bytes(huge, decimal_ok=False))
+        # the caps go through the truncating reader only: no exact path, so no
+        # ValueError, and main's reading (1 GiB) is kept
+        self.assertEqual(resources.parse_bytes(huge), 1 * GIB)
+        for key in ("memory_max", "agent_memory_max", "disk_max"):
+            with self.subTest(key=key):
+                offer, problems, _ = capacity_guard.parse_lend(dict(base, **{key: huge}))
+                self.assertEqual(problems, [])
+                self.assertEqual(offer[key], 1 * GIB)
+        for key in ("disk_free_min", "memory_available_min"):
+            with self.subTest(key=key):
+                offer, problems, _ = capacity_guard.parse_lend(
+                    dict(base, reclaim={key: huge}))
+                self.assertIsNone(offer)
+                self.assertEqual([p.code for p in problems],
+                                 [capacity_guard.PROBLEM_INVALID])
+                self.assertTrue(any(key in p for p in problems), problems)
+                self.assertFalse(capacity_guard.tolerated_only(problems))
 
     def test_reclaim_sizes_accept_integral_numbers(self):
         # codex #459 r2: `memory_available_min: 6442450944.0` (exactly 6 GiB)

@@ -92,13 +92,18 @@ policy:
 - **Fail closed.** Any unreadable key, or one of the three caps
   missing, is a `host-policy-invalid` error, and the whole offer is
   dropped. A number counts as unreadable if it is `.inf`, `.nan` or has
-  more digits than a float holds, `reclaim` included: the host lends nothing until its fiche is fixed. An unknown key
+  more digits than a float holds, `reclaim` included: the host lends
+  nothing until its fiche is fixed. The guard still starts: with no
+  readable offer it starts CLOSED — level 3, reason `no_offer` for an
+  absent `lend`, `offer_invalid` for a refused one — publishes an empty
+  offer, lends nothing (`caps.max_concurrent` 0) and answers a manual
+  drain. An unknown key
   is a `host-lend-unknown` warning, and the key is ignored.
 - Three `reclaim` keys drive the ameesh guard (L159e): `io_pressure_max`
   (a percentage), `disk_free_min` (a size > 0, with a whole number of
   bytes) and `disk_paths` (a non-empty list of absolute, normalized
   paths — a trailing slash is stripped, except for the root — without `..`
-  or NUL, each filesystem watched once) whose free
+  or NUL, each path watched once) whose free
   space is watched. The reader knows and validates them (L479), so they
   are no warning; a reader that does not use them ignores them. An
   explicit null is refused for every `reclaim` key: it is not an absent
@@ -113,15 +118,17 @@ policy:
   la garde démarre, et l'opérateur corrige la fiche. Une taille que le
   lecteur précédent tronquait est tronquée de la même façon et signalée
   aussi (`"0.001KiB"` vaut 1 octet, `6442450944.5` vaut 6442450944) :
-  l'offre que main acceptait reste valide. Un `disk_paths` refusé fait
-  tomber l'offre de l'hôte : la garde démarre quand même et ne prête rien,
-  et le message nomme la clé — chemin relatif (sondé depuis le dossier de
-  la garde), `..` (à travers un lien symbolique, `/srv/../etc` n'est pas
-  `/etc`), NUL. Une taille qui n'est pas > 0 (`0`, `"0.5B"`, ou ce qui
-  tronque à 0 octet : le lecteur précédent lisait `0` comme « pas de
-  reclaim disque », ce qui désactivait le seuil en silence) doit être
-  corrigée **avant** la mise à jour : elle laisse l'offre illisible et la
-  garde sort au démarrage.
+  l'offre que main acceptait reste valide. Un `disk_paths` refusé et une
+  taille qui n'est pas > 0 (`0`, `-0`, `"0.5B"`, ou ce qui tronque à
+  0 octet : le lecteur précédent lisait `0` comme « pas de reclaim
+  disque », ce qui désactivait le seuil en silence) font tomber l'offre de
+  l'hôte : la garde démarre quand même, fermée, et ne prête rien, et le
+  message nomme la clé — chemin relatif (sondé depuis le dossier de la
+  garde), `..` (à travers un lien symbolique, `/srv/../etc` n'est pas
+  `/etc`), NUL. Ces deux familles sont celles que main acceptait : elles
+  sont classées par le code structuré du problème, jamais par une recherche
+  dans le message (qui cite la valeur saisie), `install-pilot.sh` les
+  accepte, et `canon check` signale la fiche.
 - With several fiches for one host (several canons), the lowest cap of
   each key applies.
 
@@ -219,7 +226,9 @@ Free text is admitted. The following values have a fixed meaning:
   `owner_pause`, `lease_lost`, `shutdown`. The last three replace a
   misleading `revoked`;
 - VMs: `app_memory`, `app_cpu`, `app_busy` (CI jobs), `disk_low`,
-  `maintenance`, `guard_stopping`.
+  `maintenance`, `guard_stopping`. Two more say the guard is closed for
+  lack of a readable offer: `no_offer` (no `lend`) and `offer_invalid`
+  (the reader refused it) — level 3, nothing lent, the state published.
 
 ### 5.2 Paths
 
