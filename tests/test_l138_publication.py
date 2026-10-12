@@ -205,6 +205,20 @@ class PublicationTest(unittest.TestCase):
         self.assertIn("illisible", done.stderr)
         self.assertEqual(self.gh()["releases"], {})
 
+    def test_p3_body_with_only_the_tool_line_fails(self):
+        # #309 r2 P3: notes must remain once the tool's footer line is removed
+        for body in ("", "  \n", "🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+                     "\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n"):
+            self.pr(5, self.v100, body=body)
+            done = self.run_script("publier", self.v100)
+            self.assertNotEqual(done.returncode, 0, repr(body))
+            self.assertIn("sans notes", done.stderr)
+            self.assertEqual(self.gh()["releases"], {})
+        self.pr(5, self.v100, body="Real notes.\n\n🤖 Generated with [Claude Code](x)\n")
+        done = self.run_script("publier", self.v100)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.gh()["releases"]["v1.0.0"]["notes"], "Real notes.\n\nPR : #5")
+
     def test_latest_only_on_the_highest_version(self):
         self.pr(5, self.v100)
         self.pr(6, self.v110)

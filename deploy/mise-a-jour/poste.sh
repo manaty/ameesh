@@ -418,11 +418,12 @@ notes_de() {  # notes de la version $1 (commit $2), sur la sortie standard
   n=$(pr_de "$2") || { echo "notes introuvables pour $1 : ni docs/versions/$1.md dans $DISTANT/main, ni PR qui a fusionné ${2:0:7}" >&2; return 1; }
   corps=$(gh pr view "$n" -R "$(depot_github)" --json body --jq .body) \
     || { echo "description de la PR #$n illisible : pas de release $1" >&2; return 1; }
-  [ -n "$corps" ] || { echo "PR #$n sans description : pas de release $1" >&2; return 1; }
-  # la ligne d'outil en pied de description n'est pas une note de version
-  tr -d '\r' <<<"$corps" | { grep -v '^🤖 Generated with' || true; } \
-    | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}'
-  printf '\nPR : #%s\n' "$n"
+  # la ligne d'outil en pied de description n'est pas une note de version ;
+  # il doit rester des notes une fois retirée
+  corps=$(tr -d '\r' <<<"$corps" | { grep -v '^🤖 Generated with' || true; } \
+    | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+  [ -n "${corps//[[:space:]]/}" ] || { echo "PR #$n sans notes (description vide, ou la seule ligne de l'outil) : pas de release $1" >&2; return 1; }
+  printf '%s\n\nPR : #%s\n' "$corps" "$n"
 }
 derniere_version() {  # la plus haute version étiquetée sur le distant (v1.2.3 → 1.2.3)
   awk '{ print $2 }' <<<"$DISTANTES" | sed -n 's/^v\([0-9].*\)$/\1/p' | sort -V | tail -1
