@@ -332,6 +332,7 @@ install -d -m 0700 $ETAT
 if [ ! -e $ETAT/$p.unite ]; then
   rm -f $ETAT/$p.remise
   printf '%s %s\n' "\$(systemctl is-enabled \$u 2>/dev/null || true)" "\$(systemctl is-active \$u || true)" > $ETAT/$p.unite
+$(etat_lisible "\$u" "$p")
   echo "état d'avant de \$u gardé : \$(cat $ETAT/$p.unite)"
 fi
 if systemctl is-active --quiet \$u || systemctl is-enabled --quiet \$u 2>/dev/null; then
@@ -346,6 +347,7 @@ install -d -m 0700 $ETAT
 if [ ! -e $ETAT/$p.unite ]; then
   rm -f $ETAT/$p.remise
   printf '%s %s\n' "\$(utilisateur systemctl --user is-enabled \$u 2>/dev/null || true)" "\$(utilisateur systemctl --user is-active \$u || true)" > $ETAT/$p.unite
+$(etat_lisible "\$u" "$p")
   echo "état d'avant de \$u gardé : \$(cat $ETAT/$p.unite)"
 fi
 if [ -e '$dossier/.git' ]; then echo "dossier de travail déjà présent, propre : $dossier"
@@ -361,6 +363,22 @@ echo "\$u actif"
 EOF
   sleep 20
   echo "registre : hôte $(champ "$p" host), statut $(champ "$p" status), bail $(champ "$p" lease_owner)"
+}
+
+# Bloc distant : vérifie l'état d'avant que le bloc vient de garder pour
+# l'unité $1 (persona $2). Une activité autre que active, inactive ou failed
+# (systemctl en échec : bus absent, réponse vide…) n'est pas un état : le
+# fichier est retiré, l'unité n'est pas touchée.
+etat_lisible() {
+  cat <<EOF
+read -r activation activite < $ETAT/$2.unite || true
+case "\$activite" in
+  active|inactive|failed) ;;
+  *) rm -f $ETAT/$2.unite
+     echo "$1 : activité illisible (« \$activite »), systemctl en échec ? rien n'est touché" >&2; exit 1 ;;
+esac
+[ -n "\$activation" ] || { rm -f $ETAT/$2.unite; echo "$1 : activation illisible : rien n'est touché" >&2; exit 1; }
+EOF
 }
 
 # Remet une unité dans l'état gardé ($ETAT/<persona>.unite : « activation
@@ -383,13 +401,20 @@ case "\$activation" in
 esac
 relue=\$($1 systemctl $2 is-enabled $3 2>/dev/null || true)
 [ "\$relue" = "\$activation" ] || { echo "$3 : activation \$relue après remise, \$activation attendu : état d'avant gardé, relancer le retour" >&2; exit 1; }
-if [ "\$activite" = active ]; then
-  $1 systemctl $2 start $3; sleep 10
-  $1 systemctl $2 is-active --quiet $3 || { echo "$3 ne démarre pas : état d'avant gardé" >&2; exit 1; }
-else
-  $1 systemctl $2 stop $3
-  ! $1 systemctl $2 is-active --quiet $3 || { echo "$3 toujours active après l'arrêt : état d'avant gardé" >&2; exit 1; }
-fi
+case "\$activite" in
+  active)
+    $1 systemctl $2 start $3; sleep 10
+    $1 systemctl $2 is-active --quiet $3 || { echo "$3 ne démarre pas : état d'avant gardé" >&2; exit 1; } ;;
+  inactive|failed)
+    $1 systemctl $2 stop $3
+    # relue telle quelle : un systemctl en échec (bus absent…) n'est pas « arrêtée »
+    relue=\$($1 systemctl $2 is-active $3 || true)
+    case "\$relue" in
+      inactive|failed) ;;
+      *) echo "$3 : « \$relue » après l'arrêt, inactive attendu : état d'avant gardé" >&2; exit 1 ;;
+    esac ;;
+  *) echo "activité d'avant de $3 non prise en charge (« \$activite ») : rien n'est touché, à remettre à la main" >&2; exit 1 ;;
+esac
 mv \$f $ETAT/$4.remise  # une relance du retour ne refuse pas
 echo "$3 remise dans son état d'avant : \$activation, \$activite"
 EOF
