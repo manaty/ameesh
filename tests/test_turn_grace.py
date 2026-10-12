@@ -208,6 +208,35 @@ class PgidRecycleTest(unittest.TestCase):
         self._tick_with_recycled_group(10000.0, [self._p(self.PGID, 1, self.PGID, "unrelated")])
 
 
+class KillVerdictTest(unittest.TestCase):
+    """#458 r3 (codex) : un signal refusé (EPERM) n'est pas un groupe
+    disparu ; le survivant garde la ressource orpheline. Sans Postgres."""
+
+    def _expire(self, error):
+        runner = mock.Mock()
+        runner.container_runtime.return_value = None
+        tracker = background.Tracker(runner, log=lambda *a: None)
+        entry = background.Entry(agent="a", turn_id="t" * 32, pgid=4242, ended=0.0,
+                                 deadline=1.0, grace_s=1, lineage={4242})
+        tracker.entries = [entry]
+        vivant = [{"pid": 4242, "ppid": 1, "pgid": 4242, "name": "x", "start": 0.0,
+                   "zombie": False}]
+        with mock.patch.object(background.platform, "process_table", return_value=vivant), \
+                mock.patch.object(background.os, "killpg", side_effect=error), \
+                mock.patch.object(background.storage, "of") as of:
+            tracker.tick(now=10.0)
+        self.assertEqual(entry.state, "expired")
+        return of.return_value.turn_resources.close_turn
+
+    def test_signal_refuse_le_groupe_vivant_reste_orphelin(self):
+        self._expire(PermissionError(1, "EPERM")).assert_called_once_with(
+            "t" * 32, orphan=True, containers=None)
+
+    def test_groupe_disparu_ferme_non_orphelin(self):
+        self._expire(ProcessLookupError(3, "ESRCH")).assert_called_once_with(
+            "t" * 32, orphan=False, containers=None)
+
+
 class PlatformTest(unittest.TestCase):
     def test_moisson_d_un_enfant_et_table_des_processus(self):
         proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(3)"])

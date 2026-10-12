@@ -399,8 +399,12 @@ class Tracker:
         for sig, delai in ((signal.SIGTERM, self.TERM_GRACE_S), (signal.SIGKILL, 2.0)):
             try:
                 os.killpg(entry.pgid, sig)
+            except ProcessLookupError:
+                return False  # ESRCH : groupe disparu
             except OSError:
-                return False  # groupe disparu
+                # EPERM & co : le signal n'est pas passé, le groupe vit encore
+                # (#458 r3) — un survivant, donc ressource orpheline
+                return True
             fin = time.monotonic() + delai
             while time.monotonic() < fin:
                 try:
