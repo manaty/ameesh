@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -168,6 +170,67 @@ class FileGateTest(unittest.TestCase):
         # the contract's closed acknowledgement
         valid = [c["doc"] for c in _golden("ack.json")["valid"]]
         self.assertTrue(any(sorted(v) == sorted(ack) for v in valid))
+
+
+class SlotPoolTest(unittest.TestCase):
+    """`caps.max_concurrent` per host: two runners share the cap."""
+
+    def setUp(self):
+        self.dir = os.path.join(tempfile.mkdtemp(), "ack", "slots")
+
+    def hold_in_another_process(self):
+        # another runner of the same host, holding one slot until killed
+        code = ("import sys, time; sys.path.insert(0, %r)\n"
+                "from ameesh import host_gate\n"
+                "slot = host_gate.SlotPool(%r).acquire(1)\n"
+                "print('held' if slot is not None else 'refused', flush=True)\n"
+                "time.sleep(60)\n" % (os.path.join(REPO, "src"), self.dir))
+        proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        self.assertEqual(proc.stdout.readline().strip(), "held")
+        return proc
+
+    def test_two_runners_share_the_cap(self):
+        other = self.hold_in_another_process()
+        pool = host_gate.SlotPool(self.dir)
+        self.assertIsNone(pool.acquire(1))  # the other runner's agent counts
+        mine = pool.acquire(2)
+        self.assertIsNotNone(mine)
+        self.assertIsNone(pool.acquire(2))
+        host_gate.SlotPool.release(mine)
+        # the other runner dies: its slot is free again
+        other.kill()
+        other.wait()
+        self.assertIsNotNone(pool.acquire(1))
+
+    def test_two_runners_capped_at_one_admit_one_agent(self):
+        # codex r1 #279: each runner counted only its own workers
+        from ameesh.runner import Runner
+        ack = os.path.join(os.path.dirname(self.dir), "ack.json")
+
+        def runner():
+            gate = types.SimpleNamespace(max_concurrent=lambda: 1,
+                                         gate=types.SimpleNamespace(ack_path=ack))
+            return types.SimpleNamespace(host_gate=gate, lock=threading.Lock(),
+                                         workers={}, _gate_slots={})
+
+        first, second = runner(), runner()
+        admitted, slot = Runner._gate_slot(first, {"name": "a"})
+        self.assertTrue(admitted)
+        first._gate_slots["a"] = slot
+        self.assertEqual(Runner._gate_slot(second, {"name": "b"}), (False, None))
+        Runner._release_slot(first, "a")  # a's worker ended
+        admitted, slot = Runner._gate_slot(second, {"name": "b"})
+        self.assertTrue(admitted)
+        host_gate.SlotPool.release(slot)
+
+    def test_a_lower_cap_counts_every_held_slot(self):
+        pool = host_gate.SlotPool(self.dir)
+        held = [pool.acquire(3) for _ in range(3)]
+        host_gate.SlotPool.release(held[0])  # slot-0 free, slot-1 and slot-2 held
+        self.assertIsNone(pool.acquire(2))
+        self.assertIsNotNone(pool.acquire(3))
 
 
 class FakeWorker:

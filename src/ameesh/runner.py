@@ -3830,6 +3830,8 @@ class Runner:
         self._host_gate_lock = threading.Lock()
         self._gate_running = False
         self._gate_settled = threading.Event()
+        #: L159f : places de `caps.max_concurrent` tenues (agent → fd verrouillé)
+        self._gate_slots: dict[str, int] = {}
         if once or not cfg.canon:
             self._gate_settled.set()
         self._sync_host_gate(False, None)
@@ -3887,17 +3889,34 @@ class Runner:
         gate = self.host_gate
         return gate.frozen_between(start, end) if gate is not None else 0.0
 
-    def _gate_admits(self, agent: dict) -> bool:
+    def _gate_slot(self, agent: dict) -> tuple[bool, int | None]:
         """L159f : `caps.max_concurrent` de la porte — agents à la fois sur
-        l'hôte, éphémères compris (la garde compte des processus)."""
+        l'HÔTE, tous exécuteurs confondus, éphémères compris (la garde compte
+        des processus). Rend (admis, place) : la place (`host_gate.SlotPool`)
+        est tenue tant que le worker vit, rendue par `_release_slot`."""
         gate = self.host_gate
         cap = gate.max_concurrent() if gate is not None else None
         if cap is None:
-            return True
-        with self.lock:
-            running = sum(1 for name, worker in self.workers.items()
-                          if name != (agent or {}).get("name") and worker.is_alive())
-        return running < cap
+            return True, None
+        from . import host_gate as host_gate_mod
+        directory = os.path.join(os.path.dirname(gate.gate.ack_path) or ".", "slots")
+        try:
+            slot = host_gate_mod.SlotPool(directory).acquire(cap)
+        except OSError as exc:
+            # dossier partagé inutilisable : au moins le plafond de cet exécuteur
+            if not getattr(self, "_slot_error_logged", False):
+                self._slot_error_logged = True
+                log_async("porte d'hôte : places %s inutilisables (%s), plafond compté "
+                          "pour cet exécuteur seul" % (directory, exc))
+            with self.lock:
+                running = sum(1 for name, worker in self.workers.items()
+                              if name != (agent or {}).get("name") and worker.is_alive())
+            return running < cap, None
+        return slot is not None, slot
+
+    def _release_slot(self, name: str) -> None:
+        from . import host_gate as host_gate_mod
+        host_gate_mod.SlotPool.release(self._gate_slots.pop(name, None))
 
     # -- réclamation -------------------------------------------------------
     def expire_delegations_once(self) -> list[dict]:
@@ -3945,6 +3964,7 @@ class Runner:
                 if not worker.is_alive():
                     log("worker %s finished" % name)
                     del self.workers[name]
+                    self._release_slot(name)  # L159f : place de la porte rendue
         if self.power_hold.is_set():
             return  # L106 : arrêt sur batterie — aucun bail repris avant le secteur
         if self.draining.is_set():
@@ -3957,9 +3977,14 @@ class Runner:
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
                     continue
-            if self.host_gate is not None and not self._gate_admits(agent):
-                continue  # L159f : `caps.max_concurrent` de la porte
+            admitted, slot = self._gate_slot(agent) if self.host_gate is not None \
+                else (True, None)
+            if not admitted:
+                continue  # L159f : `caps.max_concurrent` de la porte, par hôte
+            if slot is not None:
+                self._gate_slots[agent["name"]] = slot
             if not self.once and not self.admits_new_worker(agent):
+                self._release_slot(agent["name"])
                 # L43 (0031) : hôte plein (max_agents physique) — l'agent reste
                 # réclamable, il le sera quand une place se libère
                 if getattr(self, "_cap_logged", None) != self._host_max_agents:
@@ -3972,6 +3997,7 @@ class Runner:
                 continue
             lease = registry.claim(self.db, agent["name"], self.runner_id, self.lease_ttl)
             if not lease:
+                self._release_slot(agent["name"])
                 continue  # un autre exécuteur a gagné la course
             log("lease acquired: %s (epoch %s, host %s)"
                 % (agent["name"], lease["lease_epoch"], self.host))
@@ -3991,6 +4017,7 @@ class Runner:
                 ran = worker.process_once(self.wait)
                 self.did_turn = self.did_turn or ran
                 worker.release_lease()
+                self._release_slot(agent["name"])
             else:
                 with self.lock:
                     self.workers[agent["name"]] = worker
