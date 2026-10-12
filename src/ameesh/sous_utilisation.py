@@ -141,12 +141,22 @@ def paid_harnesses(host: str | None = None) -> tuple | None:
         return None
 
 
-def _paid_spend(db, paid, seconds: float = 86400.0) -> float | None:
+def _paid_spend(db, paid, seconds: float = 86400.0) -> tuple | None:
+    """`(paid, estimated)` per token over `seconds` (#325): `paid`, the fall of
+    the provider balances in USD (`balance.compare`, L95) for the paid harnesses
+    that have readings, else None; `estimated`, ameesh's ledger for the others."""
     if not paid:
         return None
+    from . import balance
     try:
-        return float(storage.of(db).turn_costs.spent(seconds, agent="all",
-                                                     harnesses=list(paid)))
+        now = time.time()
+        real = [entry for entry in balance.compare(db, paid, now - seconds, now)
+                if entry["provider"] in paid and entry["currency"] == "USD"]
+        rest = [h for h in paid if h not in {entry["provider"] for entry in real}]
+        estimated = (float(storage.of(db).turn_costs.spent(seconds, agent="all",
+                                                           harnesses=rest))
+                     if rest else 0.0)
+        return (sum(entry["real_spent"] for entry in real) if real else None), estimated
     except Exception:
         return None
 
@@ -261,8 +271,15 @@ def plan_underused(db, listing: list, now: float, *,
             if paid and harness not in paid:
                 if not spend_read:
                     spend, spend_read = _paid_spend(db, paid), True
-                if spend:
-                    detail += "; meanwhile, $%.2f paid per token over 24 h" % spend
+                real, estimated = spend or (None, 0.0)
+                parts = []
+                if real:
+                    parts.append("$%.2f paid per token over 24 h (provider balances)" % real)
+                if estimated:
+                    parts.append("about $%.2f estimated per token over 24 h (no balance "
+                                 "reading)" % estimated)
+                if parts:
+                    detail += "; meanwhile, " + ", plus ".join(parts)
             responsible = _common_responsible(
                 [row for row in listing if row.get("harness") == harness])
             out.append(_alert(
