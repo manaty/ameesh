@@ -5,10 +5,10 @@ from __future__ import annotations
 import io
 import json
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from unittest import mock
 
-from ameesh import activity, mail, registry, work
+from ameesh import activity, identity, mail, registry, work
 
 from .support import PgTestCase
 
@@ -62,6 +62,8 @@ class ActivityDatabaseTest(PgTestCase):
         out = io.StringIO()
         with mock.patch("ameesh.config.load", return_value=self.cfg), \
                 mock.patch("ameesh.db.connect", return_value=_KeepOpen(self.db)), \
+                mock.patch.object(identity, "resolve_binding", return_value=identity.Binding(
+                    name="worker", source="session", ok=True)), \
                 redirect_stdout(out):
             code = activity.main(["worker", "--json"])
         self.assertEqual(code, 0)
@@ -72,6 +74,28 @@ class ActivityDatabaseTest(PgTestCase):
                 mock.patch("ameesh.db.connect", return_value=_KeepOpen(self.db)), \
                 redirect_stdout(io.StringIO()):
             self.assertEqual(activity.main(["unknown"]), 2)
+
+    def test_cli_verifies_live_lease_and_refuses_other_personas(self):
+        mail.send(self.db, "coord", "worker", "api_key=TEST_PRIVATE_VALUE hello")
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'test-runner', lease_epoch = 7, "
+                        "lease_expires_at = now() + interval '5 minutes' WHERE name = 'worker'")
+        env = self.env(AGENT_MAIL_NAME="worker", AMEESH_RUNNER_ID="test-runner",
+                       AMEESH_LEASE_EPOCH="7")
+        for suffix in ([], ["--json"]):
+            allowed = self.cli("activity", "worker", *suffix, env=env)
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+            self.assertNotIn("TEST_PRIVATE_VALUE", allowed.stdout)
+            self.assertIn("[redacted]", allowed.stdout)
+            denied = self.cli("activity", "coord", *suffix, env=env)
+            self.assertEqual(denied.returncode, 2)
+            self.assertEqual(denied.stdout, "")
+        expired = self.cli("activity", "worker", "--json", env=self.env(
+            AGENT_MAIL_NAME="worker", AMEESH_RUNNER_ID="test-runner", AMEESH_LEASE_EPOCH="6"))
+        self.assertEqual(expired.returncode, 2)
+        self.assertEqual(expired.stdout, "")
+        explicit = self.cli("activity", "worker", "--json", env=self.env(AGENT_MAIL_NAME="worker"))
+        self.assertEqual(explicit.returncode, 2)
+        self.assertEqual(explicit.stdout, "")
 
     def test_current_milestones_and_delegation_resolution(self):
         item = work.add(self.db, title="milestone test", assignee="worker", actor="coord")
@@ -100,6 +124,45 @@ class ActivityDatabaseTest(PgTestCase):
 
 
 class OfflineActivityTest(unittest.TestCase):
+    def test_unverified_or_cross_persona_callers_do_not_read_activity(self):
+        for binding in (identity.Binding(),
+                        identity.Binding(name="worker", source="runner", ok=False),
+                        identity.Binding(name="attacker", source="session", ok=True),
+                        identity.Binding(name="worker", source="explicit", ok=True)):
+            for suffix in ([], ["--json"]):
+                db = mock.Mock()
+                with self.subTest(binding=binding, suffix=suffix), \
+                        mock.patch("ameesh.config.load"), \
+                        mock.patch("ameesh.db.connect", return_value=db), \
+                        mock.patch.object(identity, "resolve_binding", return_value=binding), \
+                        redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                    self.assertEqual(activity.main(["worker", *suffix]), 2)
+                db.query.assert_not_called()
+                db.close.assert_called_once()
+                self.assertEqual(out.getvalue(), "")
+
+    def test_secret_redaction_precedes_excerpt_and_covers_json_present(self):
+        secrets = ("api_key=TEST_PRIVATE_VALUE", '"token": "PRIVATE VALUE"',
+                   "password='PRIVATE VALUE'", "Authorization: Bearer PRIVATE_VALUE",
+                   "sk-" + "a" * 30, "-----BEGIN PRIVATE KEY-----\nPRIVATE VALUE\n-----END PRIVATE KEY-----")
+        for secret in secrets:
+            with self.subTest(secret=secret):
+                self.assertIn("[redacted", activity._excerpt(secret, 160))
+                self.assertNotIn("PRIVATE", activity._excerpt(secret, 160))
+        self.assertEqual(activity._excerpt("api_key=" + "x" * 500), "api_key=[redacted]")
+        binding = identity.Binding(name="worker", source="session", ok=True)
+        for suffix in ([], ["--json"]):
+            with mock.patch("ameesh.config.load"), mock.patch("ameesh.db.connect"), \
+                    mock.patch.object(identity, "resolve_binding", return_value=binding), \
+                    mock.patch.object(activity, "present", return_value={
+                        "name": "worker", "status_text": "api_key=TEST_PRIVATE_VALUE",
+                        "last_error": "token=TEST_PRIVATE_VALUE"}), \
+                    mock.patch.object(activity, "events", return_value=[]), \
+                    redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(activity.main(["worker", *suffix]), 0)
+            self.assertNotIn("TEST_PRIVATE_VALUE", out.getvalue())
+            self.assertIn("[redacted]", out.getvalue())
+
     def test_recent_delegation_resolution_and_order(self):
         class FakeDatabase:
             def query(self, sql, params):

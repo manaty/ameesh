@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Read a persona's current state and bounded activity timeline (L59).
 
-Read existing tables with the caller's database privileges. Responsibility-based
-human authorization is separate; this command adds no authorization boundary.
+The CLI requires a verified runner or external session binding to the requested
+persona. Unbound callers and cross-persona reads are refused by default.
 Session transcripts remain in the session backup component.
 """
 from __future__ import annotations
@@ -18,6 +18,15 @@ from datetime import datetime, timezone
 DEFAULT_SINCE = "24h"
 DEFAULT_LIMIT = 200
 _DURATION = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhd])$")
+_SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(\b[\w-]*(?:pass(?:word)?|secret|token|api[_-]?key|authorization|credential)"
+    r"[\w-]*[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)")
+_SECRET_TOKEN = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|"
+    r"github_pat_[A-Za-z0-9_]{30,}|AKIA[0-9A-Z]{16}|xox[abpr]-[A-Za-z0-9-]{10,})")
+_PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z0-9 -]*PRIVATE KEY-----.*?(?:"
+                          r"-----END [A-Z0-9 -]*PRIVATE KEY-----|$)", re.S)
+_BEARER = re.compile(r"(?i)\bBearer\s+[^\s,;}]+")
 _DELEGATION_OUTCOMES = {
     "soldee": "settled", "rendue": "returned", "remplacee": "replaced", "annulee": "cancelled",
 }
@@ -48,8 +57,15 @@ def _timestamp(value) -> float | None:
         return None
 
 
+def redact(text: str) -> str:
+    text = _PRIVATE_KEY.sub("[redacted private key]", str(text))
+    text = _BEARER.sub("Bearer [redacted]", text)
+    text = _SECRET_ASSIGNMENT.sub(lambda match: match[1] + "[redacted]", text)
+    return _SECRET_TOKEN.sub("[redacted]", text)
+
+
 def _excerpt(text, limit: int = 160) -> str:
-    text = " ".join(str(text or "").split())
+    text = " ".join(redact(str(text or "")).split())
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
@@ -167,7 +183,7 @@ def render(agent: str, current: dict | None, items: list[dict], since: str) -> s
 
 
 def main(argv) -> int:
-    from . import db as db_mod
+    from . import db as db_mod, identity
     from .config import load as load_config
     parser = argparse.ArgumentParser(prog="ameesh activity", description="Persona activity log (L59).")
     parser.add_argument("agent")
@@ -188,10 +204,18 @@ def main(argv) -> int:
     cfg = load_config()
     db = db_mod.connect(cfg)
     try:
+        binding = identity.resolve_binding(cfg, db)
+        if (not binding.ok or binding.source not in ("runner", "session")
+                or binding.name != args.agent):
+            print("ameesh activity: a verified session bound to the requested persona is required",
+                  file=sys.stderr)
+            return 2
         row = present(db, args.agent)
         if row is None:
             print("ameesh activity: unknown persona %s" % args.agent, file=sys.stderr)
             return 2
+        row = {key: redact(value) if isinstance(value, str) else value
+               for key, value in row.items()}
         items = events(db, args.agent, since_s, limit=args.limit)
     finally:
         db.close()
