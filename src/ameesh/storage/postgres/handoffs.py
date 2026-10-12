@@ -155,6 +155,10 @@ class Handoffs(interface.Handoffs):
 
     def reserve(self, operation, plan, *, ttl):
         with self.db.transaction() as tx:
+            loss = plan.get("reason") == "host_loss"
+            if loss:
+                from .hosts import Hosts
+                Hosts._lock_gate(tx, plan["source"])
             # Physical host lock, shared by all canons and competing planners.
             tx.query("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
                      ("handoff-host:" + plan["target"],))
@@ -168,20 +172,30 @@ class Handoffs(interface.Handoffs):
             api = Handoffs(tx)
             if api.active(plan["agent"]):
                 return api.active(plan["agent"])
-            if plan.get("reason") in ("host_drain", "host_return"):
-                mode = "draining" if plan["reason"] == "host_drain" else "returning"
+            if plan.get("reason") in ("host_drain", "host_return", "host_loss"):
+                mode = {"host_drain": "draining", "host_return": "returning", "host_loss": "lost"}[plan["reason"]]
                 controls = tx.query("SELECT c.host FROM host_lifecycle c "
                                     "JOIN host_lifecycle_agents a ON a.host=c.host AND a.generation=c.generation "
                                     "WHERE c.host=%s AND c.generation=%s AND c.mode=%s AND a.agent=%s",
                                     (plan.get("lifecycle_host"), plan.get("lifecycle_generation"), mode, plan["agent"]))
-                direction = plan["source"] if mode == "draining" else plan["target"]
+                direction = plan["target"] if mode == "returning" else plan["source"]
                 if not controls or direction != plan.get("lifecycle_host"):
                     return None
-            if (not agent["live"] or (agent["canon"] or "") != plan["canon"]
+            if (bool(agent["live"]) == loss or (agent["canon"] or "") != plan["canon"]
                     or agent["host"] != plan["source"] or plan["target"] not in (agent["admitted_hosts"] or [])
                     or agent["status"] == "stopped" or agent["mode"] != "execute"
                     or agent["lease_owner"] != plan["owner"] or agent["lease_epoch"] != plan["epoch"]):
                 return None
+            if loss:
+                origins = tx.query("SELECT critical FROM host_lifecycle_agents "
+                                   "WHERE host=%s AND generation=%s AND agent=%s",
+                                   (plan["source"], plan["lifecycle_generation"], plan["agent"]))
+                threshold = 180 if origins[0]["critical"] else 900
+                if plan.get("loss_after") != threshold or not tx.query(
+                    "SELECT host FROM host_resources WHERE host=%s GROUP BY host "
+                    "HAVING max(sampled_at)<clock_timestamp()-make_interval(secs=>%s)",
+                    (plan["source"], threshold)):
+                    return None
             states = tx.query("SELECT host FROM canon_state WHERE host IN (%s,%s) AND canon=%s"
                               " AND status='ok' AND last_good_commit=%s",
                               (plan["source"], plan["target"], plan["canon"], plan["canon_revision"]))
@@ -209,7 +223,48 @@ class Handoffs(interface.Handoffs):
                        (operation, plan["agent"], plan["source"], plan["target"], json.dumps(plan),
                         plan["memory_bytes"], plan["disk_bytes"], ttl))
             api._event(operation, "planned", "destination capacity reserved")
+            if loss:
+                tx.execute("UPDATE agent_registry SET handoff_fenced=true,updated_at=now() WHERE name=%s",
+                           (plan["agent"],))
+                tx.execute("UPDATE host_handoffs SET fenced=true WHERE id=%s", (operation,))
             return api.get(operation)
+
+    def recover_source(self, operation, *, proof):
+        if not isinstance(self.db, ControllerDb):
+            raise ControllerLost("source recovery requires a controller epoch")
+        with self.db.transaction() as tx:
+            op = Handoffs(tx).get(operation)
+            if not op or op["state"] != "prepared" or op["plan"].get("reason") != "host_loss":
+                return None
+            from .hosts import Hosts
+            Hosts._lock_gate(tx, op["source"])
+            rows = tx.query("SELECT *, (lease_expires_at>clock_timestamp()) AS live "
+                            "FROM agent_registry WHERE name=%s FOR UPDATE", (op["agent"],))
+            if not rows:
+                return None
+            agent, plan = rows[0], op["plan"]
+            controls = tx.query("SELECT host FROM host_lifecycle WHERE host=%s "
+                                "AND generation=%s AND mode='lost'",
+                                (op["source"], plan["lifecycle_generation"]))
+            if (not controls or agent["live"] or not agent["handoff_fenced"]
+                    or agent["host"] != op["source"] or agent["lease_epoch"] != plan["epoch"]
+                    or agent["lease_owner"] != plan["owner"] or agent["mode"] != "execute"
+                    or agent["status"] in ("paused", "stopped")
+                    or proof.get("source_recovered") is not True):
+                return None
+            if not tx.query("SELECT id FROM host_handoffs WHERE id=%s AND state='prepared' "
+                            "AND reserved_until>clock_timestamp() FOR UPDATE", (operation,)):
+                return None
+            updated = Handoffs(tx).transition(operation, "prepared", "published", evidence=proof,
+                                             detail="lost source quiesced; published checkpoint verified")
+            if not updated:
+                return None
+            # Revoke all source writes before changing placement. Physical
+            # quiescence is independently proved by the enrolled helper.
+            tx.execute("UPDATE agent_registry SET lease_epoch=lease_epoch+1,lease_owner=NULL, "
+                       "lease_expires_at=NULL,status='queued',updated_at=now() WHERE name=%s",
+                       (op["agent"],))
+            return updated
 
     def renew(self, operation, *, ttl):
         with self.db.transaction() as tx:

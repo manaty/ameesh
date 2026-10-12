@@ -102,6 +102,8 @@
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh placement check [--agent A]    allowed or refused placements, and eligible ones;
   ameesh hosts [--json] [HOST]          host resources (L31);
+  ameesh host drain HOST [--for 8h] | undrain HOST | status [HOST]
+        durable withdrawal, return and lost-host recovery (L232e);
   ameesh handoff plan AGENT --repository R [--dry-run] | show OPERATION
         reserved host move at a lot boundary, durable journal (L232a);
   ameesh menage [--apply] [--json]      cleanup of what agents create (L73);

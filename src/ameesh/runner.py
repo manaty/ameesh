@@ -4823,7 +4823,7 @@ class Runner:
                               critical=host_lifecycle.critical_names(self.cfg, db))
             api.expire_returns()
             for control in api.listing():
-                if control["mode"] in ("draining", "returning"):
+                if control["mode"] in ("draining", "returning", "lost"):
                     host_lifecycle.advance_host(
                         db, control["host"], limits_for=self.handoff_limits_for,
                         adapter=getattr(self, "_lifecycle_adapter", None),

@@ -113,6 +113,12 @@ class HostLifecycle(interface.HostLifecycle):
         source = self.get(current_host)
         if source and source["mode"] == "draining":
             return dict(source, reason="host_drain", target=None)
+        if source and source["mode"] == "lost":
+            origins = self.agents(current_host, source["generation"])
+            origin = next((row for row in origins if row["agent"] == agent), None)
+            if origin:
+                return dict(source, reason="host_loss", target=None,
+                            loss_after=180 if origin["critical"] else 900)
         rows = self.db.query(
             "SELECT c.host,c.generation FROM host_lifecycle c "
             "JOIN host_lifecycle_agents a ON a.host=c.host AND a.generation=c.generation "

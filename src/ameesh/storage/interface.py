@@ -2685,6 +2685,10 @@ class Handoffs(Domain):
     def drain(self, operation: str) -> dict | None: ...
 
     @abc.abstractmethod
+    def recover_source(self, operation: str, *, proof: dict) -> dict | None:
+        """Fence the expired source epoch after scoped quiescence and publication proof."""
+
+    @abc.abstractmethod
     def switch(self, operation: str, *, cwd: str, brief: str) -> dict | None: ...
 
     @abc.abstractmethod

@@ -2,6 +2,7 @@
 """L232e: persistent drain/return requests; host effects use the handoff helper."""
 import argparse
 import json
+import time
 
 from . import config, db as db_mod, estimates, handoffs, host_preflight, registry, storage, work
 from .config import NAME_RE
@@ -73,8 +74,10 @@ class _ReadyAdapter:
         checkpoint = op["evidence"].get("held_at", op["state"]) if op["state"] == "held" else op["state"]
         if checkpoint not in ("switched", "activated", "verified"):
             plan = op["plan"]
+            if "lifecycle_host" not in plan:
+                return False
             control = storage.of(self.db).host_lifecycle.get(plan["lifecycle_host"])
-            expected = "draining" if plan["reason"] == "host_drain" else "returning"
+            expected = {"host_drain": "draining", "host_return": "returning", "host_loss": "lost"}[plan["reason"]]
             if not control or control["mode"] != expected or control["generation"] != plan["lifecycle_generation"]:
                 return False
         return self.adapter.revalidate(op)
@@ -85,7 +88,7 @@ def advance_host(db, host, *, limits_for, adapter=None, requirements_for=None):
     api = storage.of(db)
     api.host_lifecycle.expire_returns()
     control = api.host_lifecycle.get(host)
-    if not control or control["mode"] not in ("draining", "returning"):
+    if not control or control["mode"] not in ("draining", "returning", "lost"):
         return []
     outcomes = []
     for origin in api.host_lifecycle.agents(host, control["generation"]):
@@ -121,9 +124,16 @@ def advance_host(db, host, *, limits_for, adapter=None, requirements_for=None):
                 except (handoffs.HandoffError, AttributeError):
                     missing.append("source_lease_or_repository:" + agent["name"])
             elif not missing:
-                missing = ["fresh_admitted_capacity"]
+                reading = api.hosts.latest(host)
+                if (demand["reason"] == "host_loss" and reading
+                        and time.time()-reading["sampled_ts"] < demand["loss_after"]):
+                    missing = ["source_loss_grace"]
+                else:
+                    missing = ["fresh_admitted_capacity"]
         if op and op["state"] == "held":
             missing.append("handoff_requires_reconciliation")
+            if op["plan"].get("reason") == "host_loss" and not op["evidence"].get("source_recovered"):
+                missing.append("source_quiescence_and_published_checkpoint")
         if not op and origin.get("operation"):
             op = api.handoffs.get(origin["operation"])
         api.host_lifecycle.progress(host, control["generation"], agent["name"],

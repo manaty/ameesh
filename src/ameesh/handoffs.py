@@ -94,21 +94,24 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
         return None
     api = storage.of(db)
     forced = demand is not None
-    if forced and demand.get("reason") not in ("host_drain", "host_return"):
+    if forced and demand.get("reason") not in ("host_drain", "host_return", "host_loss"):
         raise HandoffError("invalid host lifecycle request")
     if api.handoffs.active(agent["name"]) or (not forced and api.handoffs.cooling(agent["name"], COOLDOWN)):
         return None
     history = api.hosts.history(agent["host"], SAMPLES)
-    if not _readings_ready(history, now):
+    loss = forced and demand["reason"] == "host_loss"
+    if loss and (not history or now-history[-1]["sampled_ts"] < demand["loss_after"]):
+        return None
+    if not loss and not _readings_ready(history, now):
         return None
     limits = limits_for(agent["host"])
-    if not limits:
+    if not loss and not limits:
         return None
-    current_pressure = all(resources.pressure(r, limits=limits)["blocked"] for r in history)
-    cap = limits.get("max_agents")
+    current_pressure = not loss and all(resources.pressure(r, limits=limits)["blocked"] for r in history)
+    cap = (limits or {}).get("max_agents")
     if isinstance(cap,int) and cap > 0 and api.handoffs.occupancy(agent["host"]) >= cap:
         current_pressure = True
-    current_mem, _ = _capacity(history[-1], limits)
+    current_mem = 0 if loss else _capacity(history[-1], limits)[0]
     found = []
     for target in agent.get("admitted_hosts") or []:
         if target == agent["host"] or (forced and demand.get("target") and target != demand["target"]):
@@ -145,6 +148,7 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
                       "reason": demand["reason"] if forced else ("source_pressure" if current_pressure else "spare_capacity"),
                       **({"lifecycle_host": demand["host"], "lifecycle_generation": demand["generation"]}
                          if forced else {}),
+                      **({"loss_after": demand["loss_after"]} if loss else {}),
                       "source_cwd": agent.get("cwd") or "",
                       "checkpoint_lot": agent.get("session_work_item"),
                       "project": projects.agent_project(agent) or ""})
@@ -154,7 +158,8 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
 def request(db, candidate, *, repository, ttl=900, now=None):
     """Reserve an admitted target; repository is an enrolled identity, never a directory label."""
     now = time.time() if now is None else now
-    if not candidate or not _fresh(candidate, now) or not repository or not candidate.get("owner"):
+    if (not candidate or not _fresh(candidate, now) or not repository
+            or (not candidate.get("owner") and candidate.get("reason") != "host_loss")):
         raise HandoffError("fresh plan, source lease and enrolled repository required")
     if not 30 <= ttl <= 7200:
         raise HandoffError("reservation TTL outside 30..7200 seconds")
@@ -203,6 +208,16 @@ def _proof(step, result, op):
     plan, evidence = op["plan"], op["evidence"]
     if not isinstance(result, dict) or result.get("ok") is not True:
         raise HandoffError("host step not ready: "+step)
+    if step == "recover_source":
+        if (result.get("source") != op["source"] or result.get("agent") != op["agent"]
+                or isinstance(result.get("lease_epoch"), bool) or isinstance(result.get("generation"), bool)
+                or result.get("lease_epoch") != plan["epoch"]
+                or result.get("generation") != plan["lifecycle_generation"]
+                or result.get("source_fenced") is not True or result.get("quiesced") is not True
+                or result.get("unpublished_work") is not False):
+            raise HandoffError("source loss requires scoped durable fencing and quiescence")
+        published = _proof("publish", result, op)
+        return dict(published, source_recovered=True)
     if step in ("prepare", "admit"):
         if (result.get("canon_revision") != plan["canon_revision"]
                 or not all(result.get(k) is True for k in ("credentials_ready", "caps_ready", "tooling_ready"))):
@@ -396,6 +411,12 @@ def advance(db, operation, adapter, *, enable_slot=None):
         if _effect(api, adapter, "revalidate", op) is not True:
             raise HandoffError("host policy, capacity or credentials changed")
         if state == "prepared":
+            if op["plan"].get("reason") == "host_loss":
+                proof = _proof("recover_source", _effect(api, adapter, "recover_source", op), op)
+                recovered = api.recover_source(operation, proof=proof)
+                if not recovered:
+                    raise HandoffError("lost source identity changed before recovery")
+                return recovered
             return api.drain(operation) or op  # active lot/turn keeps running
         if state == "session_ready":
             switched = api.switch(operation, cwd=op["evidence"]["cwd"], brief=brief(op))
@@ -438,6 +459,8 @@ def cancel(db, operation, adapter):
     state = op["evidence"].get("held_at") if op["state"] == "held" else op["state"]
     if op["state"] == "cancelled":
         return op
+    if op["plan"].get("reason") == "host_loss":
+        raise HandoffError("lost source cannot be restored by ordinary cancellation")
     if state in ("switched", "activated", "verified"):
         raise HandoffError("destination may have new work; recovery requires reconciliation")
     if _effect(api, adapter, "restore_source", op) is not True:

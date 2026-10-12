@@ -117,7 +117,7 @@ not install a real host adapter, enable production agents, copy secrets,
 perform root operations or authorise spending. L232b/c and provider login
 readiness supply those separate integrations.
 
-## L232e lifecycle checkpoint
+## Host drain, return and loss recovery (L232e)
 
 `ameesh host drain HOST [--for 8h]` closes new claims, turns and prompt
 consumption while preserving the current turn and lease. The persistent
@@ -135,11 +135,37 @@ locking the host gate and agent rows. An unobserved host is not classified
 as lost. An existing drain retains its generation and agent origins, but
 its automatic return timer is removed. A new heartbeat does not reopen
 claims on a lost host.
-`undrain` also refuses a lost host until verified recovery is implemented;
-the planned-return path cannot bypass the recovery proof.
+`undrain` refuses a lost host; the planned-return path cannot bypass the
+recovery proof. A returning machine stays withdrawn until it is independently
+reconciled. Lost-host recovery moves agents forward rather than restoring an
+uncertain source executor.
 
 Detection preserves agent placement, expired leases and running-turn state;
-it is not proof that an executor has stopped. Automatic loss recovery is
-still pending: before enabling another executor it requires independent
-source fencing/quiescence and a verified published checkpoint. Heartbeat
-absence alone must never enable a second executor.
+it is not proof that an executor has stopped. Critical agents become eligible
+for recovery after 180 seconds without a resource sample; other agents wait
+900 seconds. The detector's longer threshold still applies if three resource
+intervals exceed these delays. A fresh, admitted receiving host with matching
+canon, capacity and readiness remains mandatory.
+
+Recovery reserves capacity and fences source claims, then prepares the target.
+The enrolled adapter's `recover_source` receives the operation and controller
+epoch. It must durably disable the source executor (including delayed calls)
+and attest physical quiescence, absence of unpublished work and the exact
+clean Git checkpoint on the enrolled remote. Its result names `source`,
+`agent`, `lease_epoch` and lifecycle `generation`, with `source_fenced=true`,
+`quiesced=true`, `unpublished_work=false`, plus the ordinary publication
+fields (`repository`, `branch`, `commit`, `remote_commit`, `clean`). A stale
+epoch, mismatched scope or missing proof holds the operation. Unreachable
+source files are not evidence of cleanliness; an older remote checkpoint
+alone does not prove that the most recent work was published.
+
+After this proof, a transaction revokes the expired source epoch and records
+the published checkpoint before transfer/session/switch/admission/enable.
+The old runner cannot renew, finish a turn or reclaim the agent when the
+source returns. A helper timeout leaves a pending effect requiring explicit
+reconciliation; ordinary cancellation cannot restore a lost source.
+Heartbeat absence alone never enables a second executor.
+
+All L232e host effects are currently tested with simulated adapters. The
+runner records `helper:L232b` when no enrolled implementation is supplied;
+real SSH, secret delivery and provider login integration depend on L232b/c/d.
