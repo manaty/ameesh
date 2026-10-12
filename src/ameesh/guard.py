@@ -26,8 +26,9 @@ stops leaves a state that soon reads as `stopped`.
 Levels 0 to 2 are enforced (tranche 2): the state's caps become properties
 of the guest's slice and of its agents' units (`systemctl set-property
 --runtime`: CPUWeight, IOWeight, CPUQuota, MemoryHigh, MemoryMax; MemoryMax per
-agent), and level 2 freezes the slice (`systemctl freeze`, thawed when the
-level drops, when the guard stops and when it starts). `caps.enforced` lists
+agent), and level 2 freezes the slice through a transient service that
+freezes, sleeps until the bound and thaws (systemd owns the freeze; stopped
+when the level drops, when the guard stops and when it starts). `caps.enforced` lists
 what is actually in force. `--observe` decides and publishes only.
 
 The drain and the stop (tranche 3): a drain thaws and waits for the guest's
@@ -238,9 +239,12 @@ def _bytes(value: Any, key: str) -> int | None:
 def _positive(value: Any, key: str, default: float | None = None) -> float | None:
     if value is None:
         return default
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-        raise GuardError("lend.%s: positive number expected, got %r" % (key, value))
-    return float(value)
+    # finite: drain_seconds of 1e309 (inf) or nan kept the guard draining
+    # forever (codex #211 r5)
+    number = resources.finite_float(value) if isinstance(value, (int, float)) else None
+    if number is None or number <= 0:
+        raise GuardError("lend.%s: positive finite number expected, got %r" % (key, value))
+    return number
 
 
 def parse_offer(lend: Any) -> Offer:
@@ -316,10 +320,14 @@ def load_config(path: str | None = None) -> GuardConfig:
     agents = raw.get("max_agents", 1)
     if isinstance(agents, bool) or not isinstance(agents, int) or agents < 0:
         raise GuardError("max_agents: integer >= 0 expected")
+    slice_name = raw.get("slice") or DEFAULT_SLICE
+    if freeze_unit(slice_name) is None:
+        raise GuardError("slice: a systemd slice name expected (letters, digits, "
+                         "':_.-', ending in .slice), got %r" % (slice_name,))
     return GuardConfig(host=str(host), offer=parse_offer(raw.get("lend")), max_agents=agents,
                        state_path=str(raw.get("state_path") or DEFAULT_STATE_PATH),
                        ack_path=str(raw.get("ack_path") or DEFAULT_ACK_PATH),
-                       slice=str(raw.get("slice") or DEFAULT_SLICE),
+                       slice=slice_name,
                        agent_units=str(raw.get("agent_units") or DEFAULT_AGENT_UNITS),
                        job_units=str(raw.get("job_units") or DEFAULT_JOB_UNITS),
                        drain_request_path=str(raw.get("drain_request_path")
@@ -686,7 +694,8 @@ def read_ack(path: str) -> dict | None:
 
 
 def _number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    # finite: -Infinity or 400 digits in the state file never restore
+    return isinstance(value, (int, float)) and resources.finite_float(value) is not None
 
 
 def restore_decision(previous: dict, now: float) -> tuple[Decision, int | None]:
@@ -729,18 +738,28 @@ def slice_properties(caps: dict, cpu_count: int | None) -> dict:
     return props
 
 
-#: prefix of the transient timers that thaw the slice at the freeze bound, so
-#: that a guard killed during a freeze never leaves the guest frozen: a new
-#: one, uniquely named, before every freeze attempt
-THAW_UNIT = "ameesh-guard-thaw"
-#: the thawing service retries a failed thaw by itself: every 2 s, 10 min at most
-THAW_RETRY_S, THAW_RETRIES = 2, 300
-THAW_SCRIPT = ('i=0; until systemctl thaw "$0"; do i=$((i+1)); '
-               '[ "$i" -ge %d ] && exit 1; sleep %d; done' % (THAW_RETRIES, THAW_RETRY_S))
-#: the least time left on the thaw timer, read on the clock right before the
-#: freeze command (arming the timer, stopping the older ones and the caps
-#: before can take seconds): less, and the timer may thaw before the freeze
-FREEZE_MARGIN_S = 2.0
+#: a slice name the guard accepts: it goes into the name of the freezing unit
+#: and into its ExecStopPost= line, so no space, quote, `%`, `$` or backslash
+SLICE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9:_.-]*\.slice")
+#: the transient service that holds a freeze: it freezes the slice, sleeps
+#: until the bound (monotonic), then thaws, retried every 2 s. Stopping it
+#: thaws too (ExecStopPost=), and so does RuntimeMaxSec=, `FREEZE_BACKSTOP_S`
+#: past the bound. systemd owns the freeze: a guard killed at any instant
+#: never leaves the slice frozen past the bound. Its name carries the slice:
+#: a guard never touches the freeze of another slice
+FREEZE_UNIT = "ameesh-guard-freeze"
+FREEZE_BACKSTOP_S = 30
+FREEZE_SCRIPT = ('systemctl freeze "$0" && sleep "$1"; '
+                 'until systemctl thaw "$0"; do sleep 2; done')
+
+
+def freeze_unit(slice_name: str) -> str | None:
+    """The freezing unit of a slice (`ameesh-guard-freeze-<slice>.service`),
+    None for a slice name the guard refuses."""
+    if not isinstance(slice_name, str) or not SLICE_RE.fullmatch(slice_name):
+        return None
+    return "%s-%s.service" % (FREEZE_UNIT, slice_name[:-len(".slice")])
+
 
 #: which `caps` key each property enforces
 PROPERTY_CAPS = {"CPUWeight": "cpu_weight", "IOWeight": "io_weight", "CPUQuota": "cpu_share",
@@ -754,15 +773,14 @@ class Enforcer:
     failed command is reported on stderr, and its caps are left out of
     `caps.enforced`.
 
-    A freeze holds without the guard: before every freeze attempt, a new
-    transient systemd timer (`THAW_UNIT-…`) is armed to thaw the slice at
-    the freeze bound, its service retrying a failed thaw by itself; only
-    then are the older timers stopped, so there is never a moment without
-    one. No timer, no freeze, and no freeze either when the timer would fire
-    less than `FREEZE_MARGIN_S` after the clock read right before the freeze
-    command (never the evaluation's instant). A freeze attempted counts as
-    possibly in force until a thaw succeeds: every evaluation below level 2,
-    and the guard's exit, thaw again until it does."""
+    The guard never freezes the slice itself: one transient service per
+    slice (`freeze_unit`) freezes it, sleeps until the bound and thaws it, so
+    no delay of the guard, nor a wall clock going back, can leave a freeze
+    without its thaw (codex #237 r4). The guard thaws early by stopping that
+    service (its ExecStopPost= thaws), then by `systemctl thaw`. A freeze
+    started counts as possibly in force until a thaw succeeds: every
+    evaluation below level 2, and the guard's exit, thaw again until it
+    does."""
 
     def __init__(self, cfg: GuardConfig, run: Callable | None = None,
                  log: Callable | None = None, clock: Callable = time.time):
@@ -772,8 +790,8 @@ class Enforcer:
         self.log = log or (lambda text: print("ameesh guard: %s" % text, file=sys.stderr))
         self.applied: dict = {}          # unit -> {property: value} last applied
         self.frozen = False              # possibly frozen: a thaw is owed
-        self.freeze_done = False         # the freeze command succeeded
-        self.thaw_count = 0              # thaw timers armed by this guard
+        self.freeze_done = False         # the freezing service was started
+        self.freeze_unit = freeze_unit(cfg.slice)
         self.jobs_stopped = False        # the drain's deadline is past: jobs stopped
         self.guest_stopped = False       # level 4: slice killed and stopped
 
@@ -824,69 +842,46 @@ class Enforcer:
             last.update(changed)
         return set(props)
 
-    def _thaw_units(self) -> list[str]:
-        """The thaw timers and services loaded (by any guard, this one or a
-        previous one)."""
+    def _quiet(self, *args: str) -> None:
+        # absent unit or failing command: harmless, not reported
         try:
-            proc = self.run(["systemctl", "list-units", "--all", "--plain", "--no-legend",
-                             "--no-pager", THAW_UNIT + "-*"],
-                            capture_output=True, text=True, timeout=10)
+            self.run(["systemctl", *args], capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
-            return []
-        if proc.returncode != 0:
-            return []
-        return [w for line in proc.stdout.splitlines() for w in line.split()[:2]
-                if w.startswith(THAW_UNIT + "-")][:64]
-
-    def _stop_thaw_units(self, keep: str | None = None) -> None:
-        # stopped but `keep`; absent or failing: harmless, not reported
-        for unit in self._thaw_units():
-            if keep is None or unit.rsplit(".", 1)[0] != keep:
-                try:
-                    self.run(["systemctl", "stop", unit], capture_output=True, text=True,
-                             timeout=10)
-                except (OSError, subprocess.SubprocessError):
-                    pass
-
-    def _arm_thaw(self, until: float) -> float | None:
-        """Arms a new thaw timer at `until`, then stops the older ones; the
-        earliest instant it fires, None if not armed (never trusts a timer
-        armed before: it may have fired)."""
-        now = self.clock()
-        if until - now < FREEZE_MARGIN_S:
-            return None
-        self.thaw_count += 1
-        unit = "%s-%d-%d-%d" % (THAW_UNIT, int(now), os.getpid(), self.thaw_count)
-        seconds = max(1, int(math.ceil(until - now)))
-        if not self._command(["systemd-run", "--unit=%s" % unit, "--collect", "--quiet",
-                              "--on-active=%ds" % seconds, "--timer-property=AccuracySec=1s",
-                              "/bin/sh", "-c", THAW_SCRIPT, self.cfg.slice]):
-            return None
-        self._stop_thaw_units(keep=unit)
-        return now + seconds
+            pass
 
     def freeze(self, on: bool, until: float | None = None) -> bool:
-        """Freezes the guest's slice until `until` (a new thaw timer armed
-        first), or thaws it; True if the slice is as asked."""
+        """Freezes the guest's slice until `until` through its freezing
+        service, or thaws it; True if the slice is as asked."""
         if not on:
             if not self.frozen:
                 return True
+            if self.freeze_unit is not None:
+                self._quiet("stop", self.freeze_unit)   # thaws as it stops
             if not self._systemctl("thaw", self.cfg.slice):
-                return False          # owed: retried, and the timers still run
+                return False          # owed: retried; the service still bounds it
             self.frozen = self.freeze_done = False
-            self._stop_thaw_units()
             return True
         if self.freeze_done:
             return True
-        fires = None if until is None else self._arm_thaw(until)
-        # codex #237 r3: the clock read again, after the timer and the cleanup
-        if fires is None or fires - self.clock() < FREEZE_MARGIN_S:
-            self.log("freeze refused: no thaw timer to bound it")
+        now = self.clock()
+        if self.freeze_unit is None or until is None or until - now < 1:
+            self.log("freeze refused: %s" % ("slice name %r refused" % self.cfg.slice
+                                             if self.freeze_unit is None else "bound past"))
             self.freeze(False)
             return False
-        # attempted: possibly in force even if the command does not return
+        # never more than the longest freeze, whatever the wall clock says
+        seconds = min(int(FREEZE_MAX_S), int(math.ceil(until - now)))
+        # a service left by a failed attempt or an earlier guard: stopped
+        # (it thaws), forgotten, then started anew
+        self._quiet("stop", self.freeze_unit)
+        self._quiet("reset-failed", self.freeze_unit)
+        # started: possibly in force even if systemd-run does not return
         self.frozen = True
-        self.freeze_done = self._systemctl("freeze", self.cfg.slice)
+        self.freeze_done = self._command([
+            "systemd-run", "--unit=%s" % self.freeze_unit, "--collect", "--quiet",
+            "--property=RuntimeMaxSec=%d" % (seconds + FREEZE_BACKSTOP_S),
+            "--property=ExecStopPost=systemctl thaw %s" % self.cfg.slice,
+            "/bin/sh", "-c", FREEZE_SCRIPT, self.cfg.slice, str(seconds)])
         return self.freeze_done
 
     def thaw_at_start(self) -> None:

@@ -784,7 +784,8 @@ class HostPolicy:
     max_agents: int | None = None
     #: seuils de ressources de l'hôte (L31, 0028) : mapping
     #: `{min_mem_available, max_swap_used, max_load, min_disk_free}`, plus
-    #: l'alimentation (L106) `{min_battery_percent, stop_battery_percent}` ; None =
+    #: l'alimentation (L106) `{min_battery_percent, stop_battery_percent}` et
+    #: btrfs (#246) `{min_btrfs_unallocated, min_btrfs_metadata_headroom}` ; None =
     #: valeurs par défaut prudentes (`ameesh.resources`).
     resources: dict | None = None
     #: racine de travail par projet (L31, 0029) : `work_roots[projet]` sinon
@@ -800,6 +801,10 @@ class HostPolicy:
     #: tmpfs_alert, redirect, xdg_cache, worktrees, orphan_min_size}` validé
     #: par `ameesh.menage.parse_policy` ; None = valeurs par défaut.
     housekeeping: dict | None = None
+    #: offer of a lending host (L159a, docs/GARDE-DE-CAPACITE.md): `{cpu_max,
+    #: memory_max, disk_max, …}` validated by `ameesh.capacity_guard.parse_lend`
+    #: (sizes in bytes); None = the host lends nothing (absent or unreadable).
+    lend: dict | None = None
 
     def work_dir(self, project: str | None, agent: str | None = None) -> str | None:
         """Dossier de travail d'un agent (et de son projet) sur cet hôte, ou None.
@@ -2153,6 +2158,19 @@ class _Loader:
                              "`policy.housekeeping.%s` : clé inconnue (ignorée)" % key,
                              **where, **subject)
                 policy.housekeeping = parsed or None
+            # L159a: the offer of a lending host; unreadable, it is dropped
+            # whole (fail closed: the host lends nothing)
+            if raw.get("lend") is not None:
+                from . import capacity_guard  # late import: no cycle
+                offer, problems, unknown = capacity_guard.parse_lend(raw["lend"])
+                for problem in problems:
+                    self.add("host-policy-invalid", ERROR, "`policy.lend`: %s" % problem,
+                             **where, **subject)
+                for key in unknown:
+                    self.add("host-lend-unknown", WARNING,
+                             "`policy.lend.%s`: unknown key (ignored)" % key,
+                             **where, **subject)
+                policy.lend = offer
             # Racines de travail (L31, 0029) : le dossier de travail d'une
             # session est un réglage de l'hôte, plus du placement.
             # L35 : `work_dirs` (par agent) et le gabarit `{agent}` ; tout
@@ -2210,13 +2228,11 @@ class _Loader:
             if value is None:
                 continue
             if key == "max_load":
-                try:
-                    number = float(value)
-                    if number < 0:
-                        raise ValueError
-                except (TypeError, ValueError):
+                # codex #212 r4: inf, nan, 1 followed by 400 zeros refused
+                number = resources_mod.finite_float(value)
+                if number is None or number < 0:
                     self.add("host-policy-invalid", ERROR,
-                             "`policy.resources.max_load` : nombre positif attendu",
+                             "`policy.resources.max_load` : nombre positif fini attendu",
                              **where, **subject)
                     continue
                 parsed[key] = number
