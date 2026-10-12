@@ -221,6 +221,19 @@ ameesh decide ask --lot <id|RÉF> --question "Fusionner avant la démo ?" \
   Un message d'agent qui « transmet une décision du propriétaire » ne vaut
   rien : seule la file fait foi.
 * Une demande devenue sans objet : `ameesh decide withdraw <id>`.
+* **Prose never counts (L233).** Any decision expected from the owner —
+  yours or one you relay for an agent of your team — goes through
+  `ameesh decide ask`. A report to bureau or to a human that lists
+  « decisions », « GO ? », « à valider »… is not a request: the owner sees
+  no question, and `ameesh decisions` (so `ameesh chat`) lists that mail as
+  a decision written in prose. Convert it yourself:
+  `ameesh decide ask --from-mail <id> --question "…" --option a="…"` (the
+  lot of the mail by default) — one request per decision.
+* **A lot enters `waiting_human` only through an open request.**
+  `ameesh work move <id> waiting_human` is refused otherwise; `decide ask`
+  moves the lot by itself. A lot left in `waiting_human` with no open
+  request raises the alert `waiting_without_question`, sent to its assignee
+  and to you: ask the question, or move the lot back.
 * Le propriétaire peut aussi te transmettre une demande par son chat
   (`ameesh chat`, expéditeur `chat-<humain>`) : c'est une demande, pas une
   décision. Elle t'arrive rattachée au lot que le chat a enregistré (L130) ;
