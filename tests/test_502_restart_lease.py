@@ -24,7 +24,7 @@ state = os.environ["FAKE_STATE"]
 if args[0] == "list-units":
     print("ameesh-runner-agent@dev9.service loaded active running runner")
 elif args[0] == "show":
-    print("{ path=/x ; argv[]=/x run --agents dev9 ; }")
+    print("{ path=/x ; argv[]=/x run --agents dev9 --runner-id runner-dev9@host ; }")
 elif args[0] == "restart":
     with open(os.path.join(state, "restarted"), "w") as fh:
         fh.write(str(time.time()))
@@ -32,19 +32,44 @@ elif args[0] == "is-active":
     print("active")
 '''
 
-# Before the restart the old runner holds epoch 7. Afterwards: "lease" =
-# released (8) then claimed (9); "no-lease" = released, never claimed (dev3 on
-# 2026-10-12); "stale-lease" = never released nor claimed again.
+# Before the restart the unit's runner (runner-dev9@host, its --runner-id)
+# holds epoch 7; the database clock reads 1000 (fake ssh). Afterwards: "lease" =
+# released (8) then claimed again (9); "no-lease" = released, never claimed
+# (dev3 on 2026-10-12); "stale-lease" = never released nor claimed again;
+# "other-owner" = epoch 9 taken by someone else; "expired" = claimed again but
+# already expired at the database clock; "not-held" = no lease before nor after
+# (a persona at rest, not eligible): not checked.
 FAKE_AMEESH = r'''#!/bin/sh
 [ "$1 $2" = "show dev9" ] || exit 0
-owner='"runner-dev9@host"' epoch=7
+scenario=$(cat "$FAKE_STATE/scenario")
+owner='"runner-dev9@host"' epoch=7 expires=1300
+[ "$scenario" = not-held ] && owner=null
 if [ -e "$FAKE_STATE/restarted" ]; then
-  case $(cat "$FAKE_STATE/scenario") in
+  case $scenario in
     lease) epoch=9 ;;
     no-lease) owner=null epoch=8 ;;
+    other-owner) owner='"attach-dev9@elsewhere"' epoch=9 ;;
+    expired) epoch=9 expires=900 ;;
   esac
 fi
-printf '{"name": "dev9", "status": "idle", "lease_owner": %s, "lease_epoch": %s}\n' "$owner" "$epoch"
+printf '{"name": "dev9", "status": "idle", "lease_owner": %s, "lease_epoch": %s, "lease_expires_ts": %s}\n' \
+  "$owner" "$epoch" "$expires"
+'''
+
+
+# The database clock reads 1000: poste.sh asks psql with the mesh's DSN, vm.sh
+# asks the server over ssh. The fake ssh also answers vm.sh's migration check
+# (one migration, applied), the unit's ExecStart and its restart.
+FAKE_SSH = r'''#!/bin/sh
+for last; do :; done
+case $last in
+  *clock_timestamp*) echo 1000 ;;
+  *"rev-parse HEAD"*) echo abc123 ;;
+  *ls-tree*) echo src/ameesh/migrations/0001_init.sql ;;
+  *psql*) echo 1 ;;
+  *"systemctl show"*) echo "{ path=/x ; argv[]=/x run --agents dev9 --runner-id runner-dev9@host ; }" ;;
+  *"systemctl restart"*) : > "$FAKE_STATE/restarted" ;;
+esac
 '''
 
 
@@ -61,8 +86,12 @@ class RestartLeaseTest(unittest.TestCase):
             os.makedirs(path)
         with open(os.path.join(conf, "bascule.env"), "w", encoding="utf-8") as fh:
             fh.write("VM=vm.invalid\n")
+        with open(os.path.join(conf, "config.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"dsn": "postgresql://mesh.invalid/ameesh"}\n')
         for path, text in ((os.path.join(bin_dir, "systemctl"), FAKE_SYSTEMCTL),
                            (os.path.join(bin_dir, "sleep"), "#!/bin/sh\nexit 0\n"),
+                           (os.path.join(bin_dir, "ssh"), FAKE_SSH),
+                           (os.path.join(bin_dir, "psql"), "#!/bin/sh\necho 1000\n"),
                            (os.path.join(venv_bin, "ameesh"), FAKE_AMEESH)):
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(text)
@@ -82,38 +111,28 @@ class RestartLeaseTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("dev9 : redémarré", proc.stdout)
 
+    def test_persona_without_a_lease_before_is_not_checked(self):
+        proc = self.restart("not-held")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("dev9 : redémarré", proc.stdout)
+        self.assertIn("no lease before the restart", proc.stdout)
+
     def test_active_unit_without_its_lease_fails_the_restart(self):
-        for scenario in ("no-lease", "stale-lease"):
+        for scenario in ("no-lease", "stale-lease", "other-owner", "expired"):
             with self.subTest(scenario=scenario):
-                os.makedirs(self.state, exist_ok=True)
+                restarted = os.path.join(self.state, "restarted")
+                if os.path.exists(restarted):   # a failed subtest leaves it behind
+                    os.remove(restarted)
                 proc = self.restart(scenario)
                 self.assertNotEqual(proc.returncode, 0, proc.stdout)
                 self.assertIn("dev9", proc.stderr)
                 self.assertIn("retour", proc.stderr)
                 self.assertNotIn("dev9 : redémarré", proc.stdout)
-                os.remove(os.path.join(self.state, "restarted"))
-
-
-# vm.sh restarts the server's system units over ssh: the fake ssh answers the
-# migration check (one migration, applied) and the restart itself.
-FAKE_SSH = r'''#!/bin/sh
-for last; do :; done
-case $last in
-  *"rev-parse HEAD"*) echo abc123 ;;
-  *ls-tree*) echo src/ameesh/migrations/0001_init.sql ;;
-  *psql*) echo 1 ;;
-  *"systemctl restart"*) : > "$FAKE_STATE/restarted" ;;
-esac
-'''
 
 
 class VmRestartLeaseTest(RestartLeaseTest):
     def setUp(self):
         super().setUp()
-        bin_dir = self.env["PATH"].split(os.pathsep)[0]
-        with open(os.path.join(bin_dir, "ssh"), "w", encoding="utf-8") as fh:
-            fh.write(FAKE_SSH)
-        os.chmod(os.path.join(bin_dir, "ssh"), 0o755)
         conf = os.path.join(self.env["HOME"], ".config", "ameesh", "bascule.env")
         with open(conf, "a", encoding="utf-8") as fh:
             fh.write("PERSONAS_VM=dev9\n")

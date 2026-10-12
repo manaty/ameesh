@@ -67,22 +67,16 @@ statut() {
   "$AMEESH" show "$1" --json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status") or "")'
 }
-epoque_bail() {  # lease epoch of persona $1
-  "$AMEESH" show "$1" --json \
-    | python3 -c 'import json,sys; print(int(json.loads(sys.stdin.read() or "{}").get("lease_epoch") or 0))'
+lire_bail() { "$AMEESH" show "$1" --json; }  # persona → its registry row
+heure_base() {  # the clock of the mesh's database (the server's), epoch seconds
+  ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c 'SELECT extract(epoch FROM clock_timestamp())'"
 }
-# #502: an active unit does not prove that its runner works (poste.sh, same
-# check): the restarted runner must take its persona's lease again, an owner
-# and an epoch past the one read before the restart, within 24 tries 5 s apart.
-bail_repris() {  # persona epoch-before-restart
-  for _ in $(seq 24); do
-    "$AMEESH" show "$1" --json | python3 -c 'import json, sys
-a = json.loads(sys.stdin.read() or "{}")
-sys.exit(0 if a.get("status") == "stopped" or (a.get("lease_owner")
-         and int(a.get("lease_epoch") or 0) > int(sys.argv[1])) else 1)' "$2" && return 0
-    sleep 5
-  done
-  return 1
+proprietaire_de() {  # persona → the lease owner of ameesh-runner@<p>: --runner-id, else :<MainPID>
+  local id
+  id=$(ssh_vm "systemctl show -p ExecStart --value ameesh-runner@$1" \
+    | grep -o -- '--runner-id [^ ;]*' | head -1 | awk '{print $2}')
+  if [ -n "$id" ]; then echo "$id"
+  else echo ":$(ssh_vm "systemctl show -p MainPID --value ameesh-runner@$1")"; fi
 }
 
 verifier() {
@@ -129,7 +123,10 @@ installer() {
 }
 
 redemarrer() {
-  local restantes suivantes debut=$SECONDS st avant
+  # shellcheck source=bail.sh
+  . "$ICI/bail.sh"
+  local restantes suivantes debut=$SECONDS st avant ligne heure tenu
+  non_verifiees=()
   # le code écrit ses nouvelles colonnes (relevé de l'hôte, tours) : sans
   # elles, l'exécuteur redémarré échouerait
   exiger_migrations "$(ssh_vm "git -C $SRC rev-parse HEAD")" redemarrer
@@ -141,11 +138,21 @@ redemarrer() {
     for p in "${restantes[@]}"; do
       st=$(statut "$p")
       if [ "$st" = running ]; then suivantes+=("$p"); continue; fi
-      avant=$(epoque_bail "$p")
+      # #502: only a runner that held its lease must take it again (bail.sh)
+      ligne=$(lire_bail "$p") && heure=$(heure_base) \
+        || { echo "$p: registry or database clock unreadable — nothing restarted" >&2; exit 1; }
+      avant=$(bail_epoque <<<"$ligne")
+      tenu=0
+      bail_valide -1 "$(proprietaire_de "$p")" "$heure" <<<"$ligne" && tenu=1
       ssh_vm "systemctl restart ameesh-runner@$p; sleep 10; systemctl is-active --quiet ameesh-runner@$p" \
         || { echo "$p : ne redémarre pas — journalctl -u ameesh-runner@$p -n 50 ; puis « $0 retour »" >&2; exit 1; }
-      bail_repris "$p" "$avant" \
-        || { echo "$p: active, but did not take its lease again — journalctl -u ameesh-runner@$p -n 50; then « $0 retour »" >&2; exit 1; }
+      if [ "$tenu" = 0 ]; then
+        echo "WARNING $p: not checked: no lease before the restart, no sign of life"
+        non_verifiees+=("$p")
+      elif ! attendre_bail "$avant" "$(proprietaire_de "$p")" "$p"; then
+        echo "$p: active, but did not take its lease again — journalctl -u ameesh-runner@$p -n 50; then « $0 retour »" >&2
+        exit 1
+      fi
       echo "$p : redémarré (était $st)"
     done
     restantes=("${suivantes[@]+"${suivantes[@]}"}")
@@ -157,6 +164,9 @@ redemarrer() {
       sleep 15
     fi
   done
+  if [ ${#non_verifiees[@]} -gt 0 ]; then
+    etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
+  fi
 }
 
 controler() {

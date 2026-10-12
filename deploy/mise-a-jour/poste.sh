@@ -271,31 +271,21 @@ role() {
   fi
 }
 
-epoque_bail() {  # lease epoch of persona $2 as seen by configuration $1
-  local sortie
-  if [ "$1" = ancienne ]; then sortie=$(ameesh_ancienne show "$2" --json)
-  else sortie=$("$AMEESH" show "$2" --json); fi
-  python3 -c 'import json,sys; print(int(json.loads(sys.stdin.read() or "{}").get("lease_epoch") or 0))' \
-    <<<"$sortie"
+lire_bail() {  # base persona → its registry row (`ameesh show --json`)
+  if [ "$1" = ancienne ]; then ameesh_ancienne show "$2" --json
+  else "$AMEESH" show "$2" --json; fi
 }
-
-# #502: an active unit does not prove that its runner works. The restarted
-# runner must take its persona's lease again: an owner, and an epoch past the
-# one read before the restart (claim and release both advance it; no clock is
-# compared), within 24 tries 5 s apart. A stopped persona is not expected to.
-bail_repris() {  # base persona epoch-before-restart
-  local sortie
-  for _ in $(seq 24); do
-    if [ "$1" = ancienne ]; then sortie=$(ameesh_ancienne show "$2" --json)
-    else sortie=$("$AMEESH" show "$2" --json); fi
-    python3 -c 'import json, sys
-a = json.loads(sys.stdin.read() or "{}")
-sys.exit(0 if a.get("status") == "stopped" or (a.get("lease_owner")
-         and int(a.get("lease_epoch") or 0) > int(sys.argv[1])) else 1)' "$3" \
-      <<<"$sortie" && return 0
-    sleep 5
-  done
-  return 1
+heure_base() {  # base … → the clock of that base's database, epoch seconds
+  local config=$CONFIG
+  if [ "$1" = ancienne ]; then config=$CONFIG_RESTE; fi
+  psql -X -At -d "$(dsn_de "$config")" -c 'SELECT extract(epoch FROM clock_timestamp())'
+}
+proprietaire_de() {  # unit → the lease owner its runner takes: --runner-id, else :<MainPID>
+  local id
+  id=$(systemctl --user show -p ExecStart --value "$1" \
+    | grep -o -- '--runner-id [^ ;]*' | head -1 | awk '{print $2}')
+  if [ -n "$id" ]; then echo "$id"
+  else echo ":$(systemctl --user show -p MainPID --value "$1")"; fi
 }
 
 # Redémarre les unités $2… (base $1 : mesh | ancienne) une par une, chacune
@@ -303,7 +293,7 @@ sys.exit(0 if a.get("status") == "stopped" or (a.get("lease_owner")
 # tour ne bloque pas les autres : on repasse sur la liste jusqu'au bout.
 redemarrer_liste() {
   local base=$1; shift
-  local restantes=("$@") suivantes debut=$SECONDS u p st avant
+  local restantes=("$@") suivantes debut=$SECONDS u p st avant ligne heure tenu
   while [ ${#restantes[@]} -gt 0 ]; do
     suivantes=()
     for u in "${restantes[@]}"; do
@@ -311,14 +301,22 @@ redemarrer_liste() {
       [ -n "$p" ] || { echo "$u : persona introuvable dans ExecStart" >&2; exit 1; }
       st=$(statut "$base" "$p")
       if [ "$st" = running ]; then suivantes+=("$u"); continue; fi
-      avant=$(epoque_bail "$base" "$p")
+      # #502: only a runner that held its lease must take it again (bail.sh)
+      ligne=$(lire_bail "$base" "$p") && heure=$(heure_base "$base") \
+        || { echo "$u: registry or database clock unreadable — nothing restarted" >&2; exit 1; }
+      avant=$(bail_epoque <<<"$ligne")
+      tenu=0
+      bail_valide -1 "$(proprietaire_de "$u")" "$heure" <<<"$ligne" && tenu=1
       systemctl --user restart "$u"
       sleep 10
       if ! systemctl --user is-active --quiet "$u"; then
         echo "$u : ne redémarre pas — journalctl --user -u $u -n 50 ; puis « $0 retour »" >&2
         exit 1
       fi
-      if ! bail_repris "$base" "$p" "$avant"; then
+      if [ "$tenu" = 0 ]; then
+        echo "WARNING $p: not checked: no lease before the restart, no sign of life"
+        non_verifiees+=("$p")
+      elif ! attendre_bail "$avant" "$(proprietaire_de "$u")" "$base" "$p"; then
         echo "$u: active, but $p did not take its lease again — journalctl --user -u $u -n 50; then « $0 retour »" >&2
         exit 1
       fi
@@ -336,7 +334,10 @@ redemarrer_liste() {
 }
 
 redemarrer() {
+  # shellcheck source=bail.sh
+  . "$ICI/bail.sh"
   local unites
+  non_verifiees=()
   mapfile -t unites < <(unites_mesh)
   etape "exécuteurs du poste, base du mesh (${#unites[@]}), un par un hors tour"
   [ ${#unites[@]} -gt 0 ] && redemarrer_liste mesh "${unites[@]}"
@@ -349,6 +350,9 @@ redemarrer() {
     etape "exécuteurs de l'ancienne base (${#unites[@]}), un par un hors tour"
     ancienne || { echo "$CONFIG_RESTE absent : ces unités ne savent pas quelle base lire" >&2; exit 1; }
     redemarrer_liste ancienne "${unites[@]}"
+  fi
+  if [ ${#non_verifiees[@]} -gt 0 ]; then
+    etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
   fi
 }
 
