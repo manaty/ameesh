@@ -369,6 +369,8 @@ class Config:
     exec_token_file: str = ""
     #: L109: mediated host, provider/DB credentials remain on the server.
     host_mediated: bool = False
+    #: Off-device session backup; storage credentials come from the environment.
+    session_backup: dict = field(default_factory=dict)
     #: L131: heavy suites run at once on this host (`ameesh heavy`); 0 = a
     #: quarter of the CPUs, at least 1
     max_heavy_suites: int = 0
@@ -385,6 +387,8 @@ class Config:
     #: configuration de l'HÔTE désigné (`projects` : projet → dépôt et dossier
     #: des migrations), validée par `ameesh.radar`.
     radar: dict = field(default_factory=dict)
+    #: Neutral memory transport settings; ssh_key names a host-managed key file.
+    persona_memory: dict = field(default_factory=dict)
 
     @property
     def responsible_required(self) -> bool:

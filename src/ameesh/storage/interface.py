@@ -1146,7 +1146,20 @@ class WorkItems(Domain):
         fusionné ni fermé, et journalise, en UNE transaction ; None sinon.
         L40 : efface la délégation en cours (issue `annulee`)."""
 
-    # -- délégation à échéance (L40, décision 0030 point 5) -------------------
+    @abc.abstractmethod
+    def handoff(self, item_id: int, assignee: str, *, current: str, state: str,
+                paused_prefix: str, note_prefix: str, window_s: float,
+                max_per_window: int, note: str, actor: str) -> dict | None:
+        """L233b : `current`, en pause budget, cède le lot à `assignee`, en UNE
+        transaction sous verrou consultatif (une reprise à la fois pour tout
+        le mesh), journalisée comme `assign` ; None si l'une des conditions
+        ne tient plus au moment d'écrire : le lot a encore l'assigné `current`
+        et l'état `state` (celui contrôlé) ; `current` est encore en pause
+        (`blocked`, `status_text` commençant par `paused_prefix`, ligne
+        verrouillée jusqu'à la fin) ; `assignee` n'a aucun lot ouvert ; moins
+        de `max_per_window` notes commençant par `note_prefix` dans les
+        `window_s` dernières secondes."""
+
     @abc.abstractmethod
     def delegate(self, item_id: int, delegate: str, *, current: str | None,
                  delegated_by: str, within_s: float, note: str, actor: str) -> dict | None:
@@ -1286,6 +1299,22 @@ class WorkItems(Domain):
         fiche ou de la fiche parente, sinon son application),
         `pending_decision` (une demande de décision attend sur le lot) et
         `decision_milestone` (un jalon de décision ouvert y est rattaché)."""
+
+    @abc.abstractmethod
+    def assignment_events(self, item_id: int, prefixes: Sequence[str]) -> list[dict]:
+        """L233b : la dernière ligne de journal du lot dont la note commence
+        par l'un des `prefixes` (une attribution), puis sa ligne la plus
+        ancienne (la création), du plus récent au plus ancien — quelle que
+        soit la longueur du journal."""
+
+    @abc.abstractmethod
+    def handoff_lots(self, assignee: str, limit: int) -> list[dict]:
+        """L233b : les lots `intake` et `build` de `assignee`, hors file
+        d'amélioration, dans l'ordre de `unassigned_lots`. Chaque ligne ajoute
+        `lot_team`, `pending_decision`, `decision_milestone` (comme
+        `unassigned_lots`), `package_team` (équipe de la fiche, pour
+        `projects.lot_project`) et `frozen_ts` (dernier jalon de gel, None
+        sans gel)."""
 
     # -- issues GitHub des lots (L126) ------------------------------------------
     @abc.abstractmethod
@@ -1517,12 +1546,17 @@ class Canon(Domain):
     @abc.abstractmethod
     def host_rows(self, host: str, names: Sequence[str]) -> list[dict]:
         """Agents de l'hôte (et ceux nommés) avec colonnes déclaratives, statut,
-        `profile_fresh` et `in_turn`."""
+        `lease_epoch`, `profile_fresh` et `in_turn`."""
 
     @abc.abstractmethod
-    def write_declared(self, name: str, values: dict) -> None:
+    def lot_projects(self) -> list[str]:
+        """L243 : les projets des lots (`app`), distincts."""
+
+    @abc.abstractmethod
+    def write_declared(self, name: str, values: dict) -> bool:
         """Écrit les colonnes déclaratives (crée l'agent au besoin) et le profil
-        évalué des valeurs écrites, dans la même instruction."""
+        évalué des valeurs écrites, dans la même instruction. Retourne False
+        si le CAS refuse une lecture périmée : la politique n'est pas appliquée."""
 
     @abc.abstractmethod
     def clear_responsible(self, name: str, host: str,
@@ -2225,6 +2259,12 @@ class HostResources(Domain):
     """
 
     @abc.abstractmethod
+    def gate_guard(self, host: str):
+        """Context manager yielding host storage under a gate publication lock.
+        All record() calls for this host share the lock. Read latest() inside
+        the context and complete synchronous enable before releasing it."""
+
+    @abc.abstractmethod
     def record(self, reading: dict) -> dict:
         """Ajoute un relevé (heure de la base) et élague les plus anciens que
         l'horizon de conservation ; rend la ligne écrite."""
@@ -2577,6 +2617,70 @@ class CiResults(Domain):
         conclue verte ou rouge."""
 
 
+class Handoffs(Domain):
+    """L232a: destination reservations and durable lot-boundary handoffs."""
+
+    @abc.abstractmethod
+    def controller(self, operation: str, *, reconcile: bool = False):
+        """Lock context yielding the journal DB, or None if another controller owns it.
+
+        Serialize bounded, idempotent adapter steps with cancel/retry. Journal
+        changes commit independently of this lock so the destination can claim
+        after activation. Adapters must impose timeouts; no agent-row lock
+        spans an external call.
+        """
+
+    @abc.abstractmethod
+    def begin_effect(self, operation: str, expected: str, effect: str) -> dict | None:
+        """Commit effect intent under the controller epoch before invoking a host."""
+
+    @abc.abstractmethod
+    def finish_effect(self, operation: str, epoch: int) -> dict:
+        """Clear a completed or explicitly quiesced intent under the current controller."""
+
+    @abc.abstractmethod
+    def prepare_reconcile(self, operation: str, epoch: int) -> dict:
+        """CAS the unfinished intent under the current epoch before host reconciliation."""
+
+    @abc.abstractmethod
+    def get(self, operation: str) -> dict | None: ...
+
+    @abc.abstractmethod
+    def active(self, agent: str) -> dict | None: ...
+
+    @abc.abstractmethod
+    def cooling(self, agent: str, seconds: int) -> bool: ...
+
+    @abc.abstractmethod
+    def occupancy(self, host: str) -> int: ...
+
+    @abc.abstractmethod
+    def hold(self, operation: str, expected: str) -> dict | None: ...
+
+    @abc.abstractmethod
+    def events(self, operation: str) -> list[dict]: ...
+
+    @abc.abstractmethod
+    def reserve(self, operation: str, plan: dict, *, ttl: int) -> dict | None: ...
+
+    @abc.abstractmethod
+    def renew(self, operation: str, *, ttl: int) -> dict | None:
+        """Renew a held reservation after explicit adapter reconciliation and fresh readings."""
+
+    @abc.abstractmethod
+    def transition(self, operation: str, expected: str, state: str,
+                   *, evidence: dict | None = None, detail: str = "") -> dict | None: ...
+
+    @abc.abstractmethod
+    def drain(self, operation: str) -> dict | None: ...
+
+    @abc.abstractmethod
+    def switch(self, operation: str, *, cwd: str, brief: str) -> dict | None: ...
+
+    @abc.abstractmethod
+    def unfence(self, operation: str, expected: str, state: str) -> dict | None: ...
+
+
 # --------------------------------------------------------------------------
 # le stockage d'une connexion
 # --------------------------------------------------------------------------
@@ -2627,3 +2731,4 @@ class Storage(abc.ABC):
     session_bindings: SessionBindings
     ci: CiResults
     conversations: Conversations
+    handoffs: Handoffs
