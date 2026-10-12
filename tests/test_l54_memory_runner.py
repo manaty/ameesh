@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import dataclasses
+import io
+import types
 import os
 import subprocess
 import threading
 from unittest import mock
 
-from ameesh import persona_memory as pm, registry
+from ameesh import persona_memory as pm, registry, identity, db as db_mod, mail
 from ameesh.runner import AgentWorker, Runner
 from .support import FAKEBIN, PgTestCase
 
@@ -85,6 +87,38 @@ class MemoryRunnerTest(PgTestCase):
                 mock.patch.object(pm, "sync") as sync:
             self._turn()
         sync.assert_not_called()
+
+    def test_active_consolidation_preserves_uncommitted_and_rejected_journals(self):
+        path = pm.open_copy(self.bare, self.cfg.state_dir, "memory-a")
+        os.makedirs(os.path.join(path, "journal"))
+        committed = os.path.join(path, "journal", "rejected.md")
+        with open(committed, "w") as stream:
+            stream.write("sk-abcdefghijklmnopqrstuvwxyz0123")
+        for args in (("add", "-A"), ("commit", "-qm", "rejected secret")):
+            subprocess.run(["git", "-C", path, *args], check=True)
+        uncommitted = os.path.join(path, "journal", "current.md")
+        with open(uncommitted, "w") as stream:
+            stream.write("current turn's unsynced journal")
+        head = subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"], text=True)
+        binding = identity.Binding(name="memory-a", source="runner", ok=True)
+        connection = types.SimpleNamespace(query=self.db.query, close=lambda: None)
+        with mock.patch("ameesh.config.load", return_value=self.runner.cfg), \
+                mock.patch.object(db_mod, "connect", return_value=connection), \
+                mock.patch.object(identity, "resolve_binding", return_value=binding), \
+                mock.patch.object(pm, "open_copy", wraps=pm.open_copy) as opened, \
+                mock.patch.object(mail, "send") as sent, mock.patch('sys.stdout', io.StringIO()):
+            self.assertEqual(pm.main(["consolidate", "memory-a"]), 0)
+        self.assertTrue(os.path.exists(uncommitted), "consolidation lost the current journal")
+        self.assertTrue(os.path.exists(committed), "consolidation lost the rejected commit")
+        sent.assert_called_once()
+        self.assertIn(path, sent.call_args.args[3])
+        self.assertEqual(subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"], text=True), head)
+        with open(uncommitted) as stream:
+            self.assertIn("current turn", stream.read())
+        with open(committed) as stream:
+            self.assertIn("sk-", stream.read())
+        opened.assert_not_called()
+        self.assertEqual(pm.sync(path, "later", repository=self.bare)["status"], "secret")
 
     def test_active_peer_disables_designation_and_sync(self):
         registry.upsert(self.db, "memory-b", harness="codex", host=self.cfg.host, mode="execute")

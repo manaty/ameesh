@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import dataclasses
 import io
 import shutil
@@ -222,6 +223,67 @@ class WorkingCopyTest(_Repository):
                 self.assertIn("discarded local state", logger.return_value.warning.call_args.args[0])
                 self.assertEqual(pm.sync(path, "resume")["status"], "unchanged")
                 self.assertEqual(git(path, "rev-parse", "HEAD"), git(self.bare, "rev-parse", "main"))
+
+    def test_inactive_fsmonitor_never_runs_or_poison_staging(self):
+        path = self.open_copy()
+        marker = os.path.join(self.tmp, "fsmonitor-ran")
+        hook = os.path.join(self.tmp, "poison-fsmonitor")
+        with open(hook, "w") as stream:
+            stream.write("#!" + sys.executable + "\nimport glob, os, tempfile\n")
+            stream.write("open(%r, 'w').write('executed')\n" % marker)
+            stream.write("for p in glob.glob(os.path.join(tempfile.gettempdir(), "
+                         "'ameesh-memory-activation-*', 'copy', 'MEMORY.md')):\n"
+                         "    open(p, 'w').write('forged by inactive fsmonitor')\n")
+            stream.write("print('token')\n")
+        os.chmod(hook, 0o755)
+        git(path, "config", "core.fsmonitor", hook)
+        with mock.patch.object(pm, "_git", wraps=pm._git) as calls:
+            self.open_copy()
+        self.assertFalse(any(call.args[0] == path for call in calls.call_args_list))
+        self.assertFalse(os.path.exists(marker))
+        self.assertNotIn("forged", pm.index_text(path))
+        self.assertEqual(pm.sync(path, "resume", repository=self.bare)["status"], "unchanged")
+        self.assertNotIn("forged", git(self.bare, "show", "main:MEMORY.md"))
+
+    def test_active_git_commands_disable_local_fsmonitor_and_commit_hooks(self):
+        path = self.open_copy()
+        marker = os.path.join(self.tmp, "hook-ran")
+        hooks = os.path.join(self.tmp, "hooks")
+        os.makedirs(hooks)
+        hook = os.path.join(hooks, "pre-commit")
+        with open(hook, "w") as stream:
+            stream.write("#!" + sys.executable + "\nopen(%r, 'w').write('executed')\n" % marker)
+        os.chmod(hook, 0o755)
+        git(path, "config", "core.fsmonitor", hook)
+        git(path, "config", "core.hooksPath", hooks)
+        with open(os.path.join(path, "note.md"), "w") as stream:
+            stream.write("durable fact")
+        self.assertEqual(pm.sync(path, "turn", repository=self.bare)["status"], "pushed")
+        self.assertFalse(os.path.exists(marker))
+
+    def test_push_instead_of_local_and_global_cannot_redirect_transport(self):
+        other = os.path.join(self.tmp, "other.git")
+        subprocess.run(["git", "clone", "-q", "--bare", self.bare, other], check=True)
+        before = git(other, "rev-parse", "main")
+        for mode in ("local-push", "local-fetch", "global"):
+            with self.subTest(mode=mode):
+                path = self.open_copy()
+                env = {}
+                rule = "url." + other + (".insteadOf" if mode == "local-fetch" else ".pushInsteadOf")
+                if mode == "global":
+                    global_config = os.path.join(self.tmp, "global-git-config")
+                    subprocess.run(["git", "config", "--file", global_config, rule, self.bare], check=True)
+                    env["GIT_CONFIG_GLOBAL"] = global_config
+                else:
+                    git(path, "config", rule, self.bare)
+                with open(os.path.join(path, "note-" + mode + ".md"), "w") as stream:
+                    stream.write("durable fact")
+                with mock.patch.dict(os.environ, env), mock.patch.object(pm, "_git", wraps=pm._git) as calls:
+                    self.assertEqual(pm.sync(path, "turn", repository=self.bare)["status"], "pushed")
+                self.assertFalse(any(call.args[0] == path and call.args[1] in ("push", "fetch")
+                                     for call in calls.call_args_list))
+                self.assertEqual(git(other, "rev-parse", "main"), before)
+                self.assertIn("note-" + mode + ".md", git(self.bare, "ls-tree", "-r", "--name-only", "main"))
 
     def test_push_ignores_pushurl_and_pushremote(self):
         path = self.open_copy()
