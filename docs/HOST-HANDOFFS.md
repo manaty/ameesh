@@ -31,11 +31,21 @@ The destination host gate must be open when planning and before host effects;
 a lending host without a fresh available gate holds the operation.
 After committing the enable intent, the controller takes the destination
 gate publication lock, rereads the latest gate, and holds the lock until
-`enable` returns. Host reading publication uses the same lock, so a closure
+`enable` returns or the controller’s 60-second enable deadline expires.
+Host reading publication uses the same lock, so a closure
 published during intent creation is observed and a concurrent publication
 cannot interleave with enable. The adapter must complete enable synchronously
 inside this boundary; queued or delayed host jobs must enforce the current
 local gate themselves before starting an executor.
+
+The deadline releases the publication lock even if the Python adapter is
+stalled. It leaves the durable enable intent unfinished and holds/fences the
+handoff for explicit reconciliation, without restoring the source. The
+daemon worker cannot change the journal, and its late return is discarded.
+A timeout does not stop an external effect: reconciliation must revoke and
+quiesce the old epoch, including the outstanding enable request, before a
+retry can proceed. The adapter must not use the controller’s database
+connection from its enable worker.
 
 | State | Next action and proof |
 | --- | --- |

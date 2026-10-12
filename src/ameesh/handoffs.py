@@ -10,8 +10,10 @@ from __future__ import annotations
 import math
 from functools import wraps
 import os
+import queue
 import re
 import subprocess
+import threading
 import time
 import uuid
 from urllib.parse import urlsplit
@@ -23,6 +25,7 @@ GIB = 1024 ** 3
 MAX_AGE = 60
 SAMPLES = 3
 COOLDOWN = 1800
+ENABLE_TIMEOUT = 60.0
 SHA = re.compile(r"^[0-9a-f]{40,64}$")
 STEPS = {"planned": ("prepare", "prepared"), "drained": ("publish", "published"),
          "published": ("transfer", "transferred"), "transferred": ("session", "session_ready"),
@@ -234,6 +237,31 @@ def _adapter_call(adapter, step, op):
         raise HandoffError("host adapter failed: " + step) from None
 
 
+def _enable_bounded(adapter, intent):
+    """Bound the gate critical section even if the adapter never returns.
+
+    The worker has no journal access. A late result cannot clear the intent
+    or advance the handoff; host epoch fencing/quiescence remains mandatory.
+    """
+    outcome = queue.Queue(maxsize=1)
+
+    def run():
+        try:
+            outcome.put((True, _adapter_call(adapter, "enable", intent)))
+        except HandoffError as exc:
+            outcome.put((False, exc))
+
+    worker = threading.Thread(target=run, name="handoff-enable", daemon=True)
+    worker.start()
+    try:
+        ok, result = outcome.get(timeout=ENABLE_TIMEOUT)
+    except queue.Empty:
+        raise HandoffError("destination enable timed out; effect completion uncertain") from None
+    if not ok:
+        raise result
+    return result
+
+
 def _serialized(function):
     @wraps(function)
     def step(db, operation, adapter, **kwargs):
@@ -268,7 +296,13 @@ def _effect(api, adapter, step, op):
                 # No host call happened; this intent is safe to clear.
                 api.finish_effect(op["id"], intent["controller_epoch"])
                 raise HandoffError("destination host gate closed, stale or reservation expired")
-            result = _adapter_call(adapter, step, intent)
+            try:
+                result = _enable_bounded(adapter, intent)
+            except HandoffError:
+                # Fence uncertain execution before withdrawal publication
+                # is allowed past the boundary. Keep pending_effect intact.
+                api.hold(op["id"], op["state"])
+                raise
     else:
         result = _adapter_call(adapter, step, intent)
     # An exception or lock loss leaves the durable intent in place: nobody

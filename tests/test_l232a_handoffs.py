@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import threading
 import json
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -153,6 +154,70 @@ class HandoffTest(PgTestCase):
             storage.of(other).hosts.record(reading)
             self.assertEqual(self.api.hosts.latest("target")["gate_state"], "draining")
         finally:
+            other.close()
+
+    def test_stalled_enable_releases_gate_and_keeps_uncertain_intent(self):
+        from ameesh import db as db_mod
+        op = self.request()
+        for _ in range(7): op = self.advance(op)
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+        published = threading.Event()
+        errors, elapsed = [], []
+        other = db_mod.connect(self.cfg)
+        timeout = 0.2
+
+        def enable(intent):
+            started.set()
+            try:
+                release.wait(5)  # finite fallback also lets the parent fail safely
+                return True
+            finally:
+                finished.set()
+
+        def withdraw():
+            try:
+                if not started.wait(5):
+                    raise AssertionError("enable did not start")
+                before = time.monotonic()
+                storage.of(other).hosts.record({"host": "target", "gate_state": "draining"})
+                elapsed.append(time.monotonic() - before)
+                published.set()
+            except Exception as exc:
+                errors.append(exc)
+
+        publisher = threading.Thread(target=withdraw, daemon=True)
+        publisher.start()
+        try:
+            with mock.patch.object(self.adapter, "enable", side_effect=enable), mock.patch.object(
+                    handoffs, "ENABLE_TIMEOUT", timeout):
+                held = self.advance(op)
+            self.assertEqual((held["state"], held["fenced"]), ("held", True))
+            self.assertIn("pending_effect", held["evidence"])
+            self.assertEqual(held["evidence"]["pending_effect"]["name"], "enable")
+            self.assertFalse(finished.is_set())
+            self.assertTrue(published.wait(2), "withdrawal blocked beyond enable deadline")
+            self.assertFalse(errors)
+            self.assertLess(elapsed[0], timeout + 2)
+            self.assertEqual(self.api.hosts.latest("target")["gate_state"], "draining")
+            with self.assertRaises(handoffs.HandoffError):
+                self.advance(held)
+            # Even a successful late result cannot settle the uncertain intent.
+            release.set()
+            self.assertTrue(finished.wait(2))
+            current = self.api.handoffs.get(op["id"])
+            self.assertEqual((current["state"], current["fenced"]), ("held", True))
+            self.assertEqual(current["evidence"]["pending_effect"], held["evidence"]["pending_effect"])
+            with mock.patch.object(self.adapter, "reconcile_effect", return_value={
+                    "ok": True, "quiesced": False}):
+                with self.assertRaises(handoffs.HandoffError):
+                    handoffs.retry(self.db, op["id"], self.adapter)
+            self.assertEqual(self.api.handoffs.get(op["id"])["evidence"]["pending_effect"],
+                             held["evidence"]["pending_effect"])
+            self.assertNotIn("restore_source", self.adapter.calls)
+        finally:
+            release.set()
+            publisher.join(5)
+            finished.wait(5)
             other.close()
 
     def candidate(self, name="dev"):
