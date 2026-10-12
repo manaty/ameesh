@@ -894,12 +894,12 @@
         "operationId": "events",
         "parameters": [
           {
-            "description": "resume strictly after this position (the last `id:` received, \"tx-id\"); without it, the new events only",
+            "description": "resume strictly after this position (the last `id:` received, \"tx-id-cluster\"); without it, the new events only",
             "in": "header",
             "name": "Last-Event-ID",
             "required": false,
             "schema": {
-              "pattern": "^[0-9]{1,20}-[0-9]{1,19}$",
+              "pattern": "^[0-9]{1,20}-[0-9]{1,19}-[0-9a-f]{1,16}$",
               "type": "string"
             }
           }
@@ -916,7 +916,7 @@
                 }
               }
             },
-            "description": "text/event-stream: `id: <tx-id>` (the event's position, in commit order), `event: <type>`, `data:` an ameesh-event/1 object; `event: reset` (events lost: reload), `event: error` (stream ended), `event: delayed` (events wait for an open transaction); a comment every 20 s"
+            "description": "text/event-stream: `id: <tx-id-cluster>` (the event's position, in commit order), `event: <type>`, `data:` an ameesh-event/1 object; `event: reset` (events lost: reload), `event: error` (stream ended), `event: delayed` (events wait for an open transaction); a comment every 20 s"
           },
           "400": {
             "content": {

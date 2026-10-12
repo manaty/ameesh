@@ -31,10 +31,17 @@ event 10 of a long transaction can become visible after the event 11. A
 reader therefore follows a **position** (tx, id): it reads only the events
 whose transaction `tx` is below the snapshot's xmin (over for good: committed
 or rolled back, no event can come before them any more), by (tx, id), after
-its position. Each event has its own position (`format_position`, "tx-id"),
-the SSE `id`: resuming after it gives exactly the events that follow, none
-twice, none lost. An open transaction (any one, on the base) holds the
-delivery back until it ends; it never loses an event.
+its position. Each event has its own position (`format_position`,
+"tx-id-cluster"), the SSE `id`: resuming after it gives exactly the events
+that follow, none twice, none lost. An open transaction (any one, on the
+base) holds the delivery back until it ends; it never loses an event.
+`tx` only orders within ONE Postgres cluster: the position carries the
+cluster's `system_identifier` (hex), and a position of another cluster (a
+logical restore, a rebuilt base) is a reset, never a silent skip.
+
+The retention deletes a **prefix** in (tx, id) order (it stops at the first
+event still kept, and waits for a locked row rather than skipping it): the
+oldest event kept says exactly what was lost.
 
 **Retention** (0033 §9): one year by default, `AMEESH_EVENTS_RETENTION_DAYS`
 on the host that prunes (at least 30: the table refuses to delete younger
@@ -66,23 +73,26 @@ PRUNE_BATCH = 10000
 PRUNE_MAX_BATCHES = 10
 PRUNE_MAX_S = 5.0
 _TYPE_RE = re.compile(r"^[a-z]+\.[a-z_]+$")
-_POSITION_RE = re.compile(r"^([0-9]{1,20})-([0-9]{1,19})$")
+_POSITION_RE = re.compile(r"^([0-9]{1,20})-([0-9]{1,19})-([0-9a-f]{1,16})$")
 _XID8_MAX = 2 ** 64 - 1
 _BIGINT_MAX = 2 ** 63 - 1
 
 
-def format_position(position: tuple) -> str:
-    """A reader's position (tx, id) as an SSE id: "tx-id"."""
-    return "%d-%d" % (int(position[0]), int(position[1]))
+def format_position(position: tuple, cluster: str) -> str:
+    """A reader's position (tx, id) in `cluster` (`bounds()["cluster"]`) as
+    an SSE id: "tx-id-cluster"."""
+    return "%d-%d-%s" % (int(position[0]), int(position[1]), cluster)
 
 
 def parse_position(text: str) -> tuple | None:
-    """The position of a `Last-Event-ID`, None if it is not one."""
+    """The ((tx, id), cluster) of a `Last-Event-ID`, None if it is not one."""
     match = _POSITION_RE.match(text.strip())
     if not match:
         return None
     tx, last_id = int(match.group(1)), int(match.group(2))
-    return (tx, last_id) if tx <= _XID8_MAX and last_id <= _BIGINT_MAX else None
+    if tx > _XID8_MAX or last_id > _BIGINT_MAX:
+        return None
+    return (tx, last_id), match.group(3)
 
 
 def record(db, type: str, object: str, *, project: str | None = None, **data) -> int:
@@ -113,8 +123,9 @@ def prune(db, *, days: int | None = None, now: float | None = None,
           max_s: float | None = None, clock=time.monotonic) -> int:
     """Deletes the events older than `days` (default `retention_days()`), by
     batches, `max_batches` batches and `max_s` seconds at most (None: until
-    done); the number deleted. A deletion that would outlast `max_s` (a lock,
-    a slow statement) fails with DbError: the batches before it stay done."""
+    done); the number deleted. A prefix in (tx, id) order: it stops at the
+    first event still kept. A deletion that would outlast `max_s` (a lock, a
+    slow statement) fails with DbError: the batches before it stay done."""
     days = retention_days() if days is None else int(days)
     if days < MIN_RETENTION_DAYS:
         raise ValueError("retention: at least %d days" % MIN_RETENTION_DAYS)

@@ -35,16 +35,17 @@ def _types(rows):
 
 class PositionTest(unittest.TestCase):
     def test_format_and_parse(self):
-        self.assertEqual(events.format_position((70001, 12)), "70001-12")
-        self.assertEqual(events.parse_position(" 70001-12 "), (70001, 12))
-        for bad in ("12", "a-1", "1-", "-1", "1-2-3", ""):
+        self.assertEqual(events.format_position((70001, 12), "6f3a"), "70001-12-6f3a")
+        self.assertEqual(events.parse_position(" 70001-12-6f3a "), ((70001, 12), "6f3a"))
+        for bad in ("12", "a-1", "1-", "-1", "70001-12", "1-2-x", "1-2-3-4", "1-2-",
+                    "1-2-%s" % ("f" * 17), ""):
             self.assertIsNone(events.parse_position(bad), bad)
 
     def test_out_of_range_is_refused(self):
         """Codex P3 r2: the digit counts allow values beyond xid8 and bigint."""
-        top = "%d-%d" % (2 ** 64 - 1, 2 ** 63 - 1)
-        self.assertEqual(events.parse_position(top), (2 ** 64 - 1, 2 ** 63 - 1))
-        for bad in ("%d-1" % 2 ** 64, "1-%d" % 2 ** 63, "99999999999999999999-1"):
+        top = "%d-%d-a" % (2 ** 64 - 1, 2 ** 63 - 1)
+        self.assertEqual(events.parse_position(top), ((2 ** 64 - 1, 2 ** 63 - 1), "a"))
+        for bad in ("%d-1-a" % 2 ** 64, "1-%d-a" % 2 ** 63, "99999999999999999999-1-a"):
             self.assertIsNone(events.parse_position(bad), bad)
 
 
@@ -172,18 +173,24 @@ class EventLogPgTest(PgTestCase):
                 raise Boom()
         self.assertEqual(_rows(self.db, start), [])
 
+    def _empty(self):
+        # the retention deletes a prefix in (tx, id) order: the fixture's
+        # recent events, written first, would stop it at once
+        self.db.execute("TRUNCATE ameesh_events")
+
     def test_append_only_and_retention(self):
-        old = storage.of(self.db).events.record("alert.raised", "alert:x", None, {})
-        with self.assertRaises(db_mod.DbError):
-            self.db.execute("UPDATE ameesh_events SET type = 'x.y' WHERE id = %s", (old,))
-        with self.assertRaises(db_mod.DbError):
-            self.db.execute("DELETE FROM ameesh_events WHERE id = %s", (old,))
+        self._empty()
         ancient = self.db.query(
             "INSERT INTO ameesh_events (type, object, created_at)"
             " VALUES ('alert.resolved', 'alert:x', now() - interval '400 days') RETURNING id")
         recent = self.db.query(
             "INSERT INTO ameesh_events (type, object, created_at)"
             " VALUES ('alert.resolved', 'alert:x', now() - interval '100 days') RETURNING id")
+        old = storage.of(self.db).events.record("alert.raised", "alert:x", None, {})
+        with self.assertRaises(db_mod.DbError):
+            self.db.execute("UPDATE ameesh_events SET type = 'x.y' WHERE id = %s", (old,))
+        with self.assertRaises(db_mod.DbError):
+            self.db.execute("DELETE FROM ameesh_events WHERE id = %s", (old,))
         self.assertEqual(events.prune(self.db, days=365), 1)
         ids = {r["id"] for r in _rows(self.db)}
         self.assertNotIn(ancient[0]["id"], ids)
@@ -193,6 +200,7 @@ class EventLogPgTest(PgTestCase):
             events.prune(self.db, days=10)
 
     def test_prune_is_bounded(self):
+        self._empty()
         for _ in range(5):
             self.db.execute("INSERT INTO ameesh_events (type, object, created_at)"
                             " VALUES ('alert.resolved', 'alert:b', now() - interval '400 days')")
@@ -213,26 +221,54 @@ class EventLogPgTest(PgTestCase):
                                           clock=lambda: next(ticks)), 2)
         self.assertEqual([c.args[2] for c in store.prune.call_args_list], [4.0, 0.5])
 
-    def test_prune_skips_locked_rows_and_never_outlasts_its_budget(self):
-        for name in ("alert:l", "alert:m"):
-            self.db.execute("INSERT INTO ameesh_events (type, object, created_at)"
-                            " VALUES ('alert.resolved', %s, now() - interval '400 days')",
-                            (name,))
+    def _old_event(self, name, days=400):
+        self.db.execute("INSERT INTO ameesh_events (type, object, created_at)"
+                        " VALUES ('alert.resolved', %s, now() - make_interval(days => %s))",
+                        (name, days))
+
+    def _kept(self):
+        return [r["object"] for r in self.db.query(
+            "select object from ameesh_events where object like 'alert:p%%'"
+            " order by tx, id")]
+
+    def test_prune_waits_for_a_locked_row_instead_of_leaving_a_gap(self):
+        """Codex P2 r4: with SKIP LOCKED, a locked A survives while B goes;
+        A, still the oldest, hid the gap: a resume from A lost B silently."""
+        self._empty()
+        for name in ("alert:pa", "alert:pb"):
+            self._old_event(name)
+        self._old_event("alert:pc", days=0)
         other = db_mod.connect(self.cfg)
         self.addCleanup(other.close)
-        with other.transaction() as tx:
-            # a competing pruner holds one row: the other one goes, no wait
-            tx.query("select id from ameesh_events where object = 'alert:l' for update")
-            start = time.monotonic()
-            self.assertEqual(events.prune(self.db, days=365, max_s=30.0), 1)
-            self.assertLess(time.monotonic() - start, 5.0)
-        self.assertEqual(events.prune(self.db, days=365), 1)
+        try:
+            with other.transaction() as tx:
+                tx.query("select id from ameesh_events where object = 'alert:pa' for update")
+                start = time.monotonic()
+                with self.assertRaises(db_mod.DbError):      # lock_timeout: the budget
+                    events.prune(self.db, days=365, max_s=1.0)
+                self.assertLess(time.monotonic() - start, 5.0)
+                self.assertEqual(self._kept(), ["alert:pa", "alert:pb", "alert:pc"])
+                raise KeyError("the locker rolls back")
+        except KeyError:
+            pass
+        self.assertEqual(events.prune(self.db, days=365), 2)
+        self.assertEqual(self._kept(), ["alert:pc"])
         with other.transaction() as tx:
             tx.execute("lock table ameesh_events in access exclusive mode")
             start = time.monotonic()
             with self.assertRaises(db_mod.DbError):
                 events.prune(self.db, days=365, max_s=1.0)
             self.assertLess(time.monotonic() - start, 5.0)
+
+    def test_prune_deletes_a_prefix_in_commit_order(self):
+        """An expired event after a kept one, in (tx, id) order, stays: the
+        oldest kept event bounds exactly what the retention took."""
+        self._empty()
+        self._old_event("alert:pa")
+        self._old_event("alert:pk", days=0)
+        self._old_event("alert:pz")
+        self.assertEqual(events.prune(self.db, days=365), 1)
+        self.assertEqual(self._kept(), ["alert:pk", "alert:pz"])
 
     def test_a_long_project_name_never_refuses_the_thread_write(self):
         project = "p" * 301
@@ -404,7 +440,8 @@ class StreamPgTest(ServerMixin, PgTestCase):
         self.assertEqual(data[0]["object"], "lot:%d" % lot["id"])
         # codex P1 r1: each message carries ITS position, never a later one
         self.assertNotEqual(got[0]["id"], got[1]["id"])
-        self.assertTrue(got[0]["id"].endswith("-%d" % data[0]["id"]))
+        cluster = storage.of(self.db).events.bounds()["cluster"]
+        self.assertTrue(got[0]["id"].endswith("-%d-%s" % (data[0]["id"], cluster)))
         # resume after the first: exactly the second, then nothing again
         resp2 = self.open_stream({"Last-Event-ID": got[0]["id"]})
         again = self.read_messages(resp2, 1, kind="lot.updated")
@@ -461,15 +498,38 @@ class StreamPgTest(ServerMixin, PgTestCase):
         events.record(self.db, "alert.raised", "alert:x")
         bounds = storage.of(self.db).events.bounds()
         top = bounds["top"]
-        resp = self.open_stream({"Last-Event-ID": "%d-%d" % (top[0] + 1000, top[1])})
+        cluster = bounds["cluster"]
+        resp = self.open_stream({"Last-Event-ID": events.format_position(
+            (top[0] + 1000, top[1]), cluster)})
         got = self.read_messages(resp, 1, kind="reset")
         self.assertEqual(json.loads(got[0]["data"])["reason"], "unknown position")
-        self.assertEqual(got[0]["id"], events.format_position(bounds["head"]))
+        self.assertEqual(got[0]["id"], events.format_position(bounds["head"], cluster))
         # a position older than the oldest kept event: lost to the retention
         oldest = bounds["oldest"]
-        resp = self.open_stream({"Last-Event-ID": "%d-%d" % (oldest[0], oldest[1] - 1)})
+        resp = self.open_stream({"Last-Event-ID": events.format_position(
+            (oldest[0], oldest[1] - 1), cluster)})
         got = self.read_messages(resp, 1, kind="reset")
         self.assertEqual(json.loads(got[0]["data"])["reason"], "events lost (retention)")
+
+    def test_reset_for_a_position_of_another_cluster(self):
+        """Codex P2 r3: after a logical restore, `tx` starts again lower. A
+        position 70001-12 of the old cluster passes the bounds of the new
+        one, and an event at (1000, 13) sorts below it: lost for good.
+        The cluster in the position makes it a reset."""
+        self.serve()
+        events.record(self.db, "alert.raised", "alert:old")
+        bounds = storage.of(self.db).events.bounds()
+        self.assertRegex(bounds["cluster"], "^[0-9a-f]{1,16}$")
+        other = "0" if bounds["cluster"] != "0" else "1"
+        head = bounds["head"]
+        resp = self.open_stream({"Last-Event-ID": events.format_position(
+            (head[0] - 1, head[1] - 1), other)})              # within the bounds
+        got = self.read_messages(resp, 1, kind="reset")
+        self.assertEqual(json.loads(got[0]["data"])["reason"], "another cluster")
+        self.assertEqual(got[0]["id"], events.format_position(head, bounds["cluster"]))
+        events.record(self.db, "alert.raised", "alert:new")
+        got = self.read_messages(resp, 1, kind="alert.raised")
+        self.assertEqual(json.loads(got[0]["data"])["object"], "alert:new")
 
     def test_heartbeat(self):
         with mock.patch.object(serve, "HEARTBEAT_S", 0.3):
@@ -483,8 +543,10 @@ class StreamPgTest(ServerMixin, PgTestCase):
     def test_refusals(self):
         self.serve(max_streams=1)
         self.assertEqual(self.open_stream(auth=False).status, 401)
-        bad = self.open_stream({"Last-Event-ID": "abc"})
-        self.assertEqual(bad.status, 400)
+        for value in ("abc", "70001-12"):     # the cluster is required
+            bad = self.open_stream({"Last-Event-ID": value})
+            self.assertEqual(bad.status, 400, value)
+            bad.read()
         first = self.open_stream()
         self.assertEqual(first.status, 200)
         second = self.open_stream()

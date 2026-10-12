@@ -35,10 +35,10 @@ as Server-Sent Events, read through `fetch` (the client carries the
 `Authorization` header). One `LISTEN ameesh_events` connection per process
 (`Hub`) wakes the streams; each stream rereads the log after its own
 position (tx, id) in commit order (`events`), keeps what its human may see
-(`Context.sees`), and sends `id: <tx-id>` (the position of THAT event),
+(`Context.sees`), and sends `id: <tx-id-cluster>` (the position of THAT event),
 `event: <type>`, `data: <json>`. `Last-Event-ID` resumes strictly after it
 (replay from the table, exactly once); `event: reset` says that events were
-lost (retention, or a rebuilt base): the client reloads its views;
+lost (retention, a rebuilt base, another cluster): the client reloads its views;
 `event: delayed`, in place of the heartbeat, that events wait for an open
 transaction of the base (xmin) — nothing is lost, they come once it ends. A comment every 20 s keeps the connection
 alive; a stream ends after an hour (the client resumes); at most
@@ -276,14 +276,14 @@ def _openapi(ctx: Context, db, params, query) -> dict:
     return openapi()
 
 
-def event_message(event: dict) -> str:
-    """One SSE message: `id` is the event's position "tx-id", where a resume
-    starts (strictly after it)."""
+def event_message(event: dict, cluster: str) -> str:
+    """One SSE message: `id` is the event's position "tx-id-cluster", where a
+    resume starts (strictly after it)."""
     data = {"id": int(event["id"]), "type": event["type"], "object": event["object"],
             "project": event.get("project"), "ts": event.get("ts"),
             "data": event.get("data") or {}}
     return "id: %s\nevent: %s\ndata: %s\n\n" % (
-        events.format_position((event["tx"], event["id"])), event["type"],
+        events.format_position((event["tx"], event["id"]), cluster), event["type"],
         json.dumps(data, ensure_ascii=False, sort_keys=True, default=str))
 
 
@@ -455,7 +455,7 @@ def openapi() -> dict:
             responses["404"] = _response("not found", "ameesh-error/1")
         if route.stream:
             responses["200"] = {
-                "description": "text/event-stream: `id: <tx-id>` (the event's position, "
+                "description": "text/event-stream: `id: <tx-id-cluster>` (the event's position, "
                                "in commit order), `event: <type>`, "
                                "`data:` an ameesh-event/1 object; `event: reset` (events "
                                "lost: reload), `event: error` (stream ended), `event: "
@@ -467,9 +467,9 @@ def openapi() -> dict:
                                          "(Retry-After)", "ameesh-error/1")
             params.append({"name": "Last-Event-ID", "in": "header", "required": False,
                            "schema": {"type": "string",
-                                      "pattern": "^[0-9]{1,20}-[0-9]{1,19}$"},
+                                      "pattern": "^[0-9]{1,20}-[0-9]{1,19}-[0-9a-f]{1,16}$"},
                            "description": "resume strictly after this position (the last "
-                                          "`id:` received, \"tx-id\"); without it, the "
+                                          "`id:` received, \"tx-id-cluster\"); without it, the "
                                           "new events only"})
         operation = {"operationId": re.sub(r"[^A-Za-z0-9]+", "_",
                                            route.path[len(API) + 1:]).strip("_"),
@@ -718,7 +718,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         last = self.headers.get_all("Last-Event-ID") or []
         resume = events.parse_position(last[0]) if len(last) == 1 else None
         if len(last) > 1 or (last and resume is None):
-            raise ApiError(400, "bad_header", "Last-Event-ID: a position tx-id expected")
+            raise ApiError(400, "bad_header",
+                           "Last-Event-ID: a position tx-id-cluster expected")
         if self.hub is None:
             raise ApiError(503, "unavailable", "event stream unavailable")
         if not self.server.streams.acquire(blocking=False):
@@ -727,17 +728,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         try:
             bounds = self.read(lambda db: storage.of(db).events.bounds())
+            self._cluster = cluster = bounds["cluster"]
             reset = None
             if resume is None:
                 position = bounds["head"]
-            elif resume > bounds["top"]:
+            elif resume[1] != cluster:
+                # `tx` orders within one cluster only: a logical restore
+                # starts again lower, below a position of the old one
+                position, reset = bounds["head"], "another cluster"
+            elif resume[0] > bounds["top"]:
                 # a position this base never gave: rebuilt, or another mesh
                 position, reset = bounds["head"], "unknown position"
             else:
-                position = resume
-                # every position given is an event's: older than the oldest
-                # kept one, that event (and maybe others) went with the retention
-                if resume != (0, 0) and resume < bounds["oldest"]:
+                position = resume[0]
+                # every position given is an event's, and the retention
+                # deletes a prefix: older than the oldest kept one, that
+                # event (and maybe others) went with the retention
+                if position != (0, 0) and position < bounds["oldest"]:
                     reset = "events lost (retention)"
             self.close_connection = True
             self.send_response(200)
@@ -751,7 +758,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             head = "retry: %d\n\n" % RETRY_MS
             if reset:
                 head += "id: %s\nevent: reset\ndata: %s\n\n" % (
-                    events.format_position(position),
+                    events.format_position(position, cluster),
                     json.dumps({"reason": reset, "first": bounds["first"],
                                 "last": bounds["last"]}))
             try:
@@ -775,7 +782,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 lambda db: storage.of(db).events.readable(position, EVENTS_BATCH))
             for row in rows:
                 row["tx"] = int(row["tx"])
-            out = "".join(event_message(row) for row in rows if self.ctx.sees(row))
+            out = "".join(event_message(row, self._cluster) for row in rows
+                          if self.ctx.sees(row))
             if out:
                 self._write(out)
                 wrote = True

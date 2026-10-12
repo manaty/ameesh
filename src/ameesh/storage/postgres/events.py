@@ -51,13 +51,15 @@ class Events(interface.Events):
             " (select tx::text || ':' || id from ameesh_events"
             "   order by tx desc, id desc limit 1) as top,"
             " (select tx::text || ':' || id from ameesh_events"
-            "   order by tx, id limit 1) as oldest")[0]
+            "   order by tx, id limit 1) as oldest,"
+            " (select to_hex(system_identifier) from pg_control_system()) as cluster")[0]
 
         def position(text):
             return (0, 0) if not text else tuple(int(part) for part in text.split(":"))
         return {"first": None if row["first"] is None else int(row["first"]),
                 "last": int(row["last"]), "head": position(row["head"]),
-                "top": position(row["top"]), "oldest": position(row["oldest"])}
+                "top": position(row["top"]), "oldest": position(row["oldest"]),
+                "cluster": row["cluster"]}
 
     def count_before(self, before_ts) -> int:
         return int(self.db.query("select count(*) as n from ameesh_events"
@@ -65,10 +67,19 @@ class Events(interface.Events):
                                  (float(before_ts),))[0]["n"])
 
     def prune(self, before_ts, limit, timeout_s=None) -> int:
-        sql = ("delete from ameesh_events where id in ("
-               " select id from ameesh_events where created_at < to_timestamp(%s)"
-               " order by id limit %s for update skip locked) returning id")
-        params = (float(before_ts), int(limit))
+        # a prefix in (tx, id) order, up to the first event kept; no SKIP
+        # LOCKED: a skipped row that survives would hide the gap after it
+        # from `bounds()["oldest"]` (a reader resuming there loses events
+        # without a reset); the lock waits, bounded by `timeout_s`
+        sql = ("with head as (select id, tx, created_at from ameesh_events"
+               "   order by tx, id limit %s),"
+               " stop as (select tx, id from head where created_at >= to_timestamp(%s)"
+               "   order by tx, id limit 1)"
+               " delete from ameesh_events where id in (select h.id from head h"
+               "   where h.created_at < to_timestamp(%s) and not exists"
+               "   (select 1 from stop where (h.tx, h.id) > (stop.tx, stop.id)))"
+               " returning id")
+        params = (int(limit), float(before_ts), float(before_ts))
         if timeout_s is None:
             return len(self.db.query(sql, params))
         ms = "%dms" % max(1, int(timeout_s * 1000))

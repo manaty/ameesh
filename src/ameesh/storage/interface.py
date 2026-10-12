@@ -635,7 +635,8 @@ class Events(Domain):
         """`first`, `last`: the smallest and largest ids kept (None and 0 when
         empty); `head`: the position (tx, id) of the last readable event,
         `top`: of the last event written, `oldest`: of the first one kept
-        ((0, 0) when none)."""
+        ((0, 0) when none); `cluster`: the Postgres cluster's identity
+        (`system_identifier`, hex), outside which a position means nothing."""
 
     @abc.abstractmethod
     def count_before(self, before_ts: float) -> int:
@@ -643,8 +644,8 @@ class Events(Domain):
 
     @abc.abstractmethod
     def prune(self, before_ts: float, limit: int, timeout_s: float | None = None) -> int:
-        """Deletes at most `limit` events older than `before_ts` (the oldest
-        first, skipping the rows another pruner holds); the number deleted.
+        """Deletes at most `limit` events older than `before_ts`: a prefix in
+        (tx, id) order, up to the first event kept; the number deleted.
         `timeout_s`: lock and statement timeout of the deletion (DbError past
         it). The table refuses an event younger than 30 days."""
 
