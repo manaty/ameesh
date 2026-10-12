@@ -244,7 +244,14 @@ class VersionLevelTest(unittest.TestCase):
                  ("INSERT INTO notes VALUES (E'it\\'s rename');", "minor"),
                  ("INSERT INTO notes VALUES (E'a\\\\'); DELETE FROM a;", "major"),
                  ("/* nested /* drop table a; */ still a comment */ create table c (y int);",
-                  "minor"))
+                  "minor"),
+                 # r5: a body in a plain string, a quoted language, a dollar
+                 # string run by EXECUTE
+                 ("DO 'BEGIN ALTER TABLE a DROP COLUMN x; END';", "major"),
+                 ("DO 'BEGIN RAISE NOTICE ''rename later''; END';", "minor"),
+                 ('DO LANGUAGE "plpgsql" $$ BEGIN DELETE FROM a; END $$;', "major"),
+                 ("DO $do$ BEGIN EXECUTE $$DELETE FROM a$$; END $do$;", "major"),
+                 ("DO $do$ BEGIN RAISE NOTICE '%', $$DELETE FROM a$$; END $do$;", "minor"))
         for sql, expected in cases:
             with self.subTest(sql):
                 self.assertEqual(self._migration_level(sql), expected)
@@ -282,6 +289,42 @@ class VersionLevelTest(unittest.TestCase):
             "plan_cli.add_parsers", "add_parsers"))
         self._commit("1.2.3", "by name")
         self.assertEqual(vl.level("case-base", "HEAD")[0], "patch")
+
+    def test_modules_reached_by_dotted_name_reexport_or_local_import(self):
+        # r5: `import ameesh.plan_cli` then its full name; a helper a module
+        # imports and hands on; an import inside a function binds only there
+        self._git("checkout", "-q", "-B", "case", "v1.2.3")
+        self._write("src/ameesh/plan_cli.py",
+                    'def add_parsers(work_sub, func):\n'
+                    '    p = work_sub.add_parser("link")\n    p.add_argument("--none")\n')
+        self._write("src/ameesh/queue_cli.py",
+                    'def add_parsers(queue_sub, func):\n'
+                    '    p = queue_sub.add_parser("drain")\n    p.add_argument("--now")\n')
+        self._write("src/ameesh/bridge.py", "from .plan_cli import add_parsers as fill\n")
+        cases = {
+            "dotted": ('import ameesh.plan_cli\n\n\ndef build(sub):\n'
+                       '    work_sub = sub.add_parser("work").add_subparsers()\n'
+                       '    ameesh.plan_cli.add_parsers(work_sub, None)\n'),
+            "re-exported": ('from . import bridge\n\n\ndef build(sub):\n'
+                            '    work_sub = sub.add_parser("work").add_subparsers()\n'
+                            '    bridge.fill(work_sub, None)\n'),
+            "local": ('def build(sub):\n    from . import plan_cli as helpers\n'
+                      '    work_sub = sub.add_parser("work").add_subparsers()\n'
+                      '    helpers.add_parsers(work_sub, None)\n\n\n'
+                      'def other(sub):\n    from . import queue_cli as helpers\n'
+                      '    queue_sub = sub.add_parser("queue").add_subparsers()\n'
+                      '    helpers.add_parsers(queue_sub, None)\n'),
+        }
+        for name, cli in cases.items():
+            with self.subTest(name):
+                self._write("src/ameesh/cli.py", cli)
+                self._commit("1.2.3", name)
+                options = vl.surface("HEAD")["option"]
+                self.assertIn("work link --none", options)
+                self.assertNotIn("link --none", options)
+        self.assertIn("queue drain --now", options)
+        self.assertNotIn("queue link --none", options)
+        self.assertNotIn("work drain --now", options)
 
     def test_loop_over_literals(self):
         cli = ('def build(sub):\n    for action in ("approve", "retry"):\n'

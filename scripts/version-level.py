@@ -35,7 +35,18 @@ reordering the aliases of an option changes nothing. A parser handed to a
 function, of the same module or another, by position or by name, fills the
 caller's command; a loop over literal strings counts each of them. In a new
 migration, comments, strings and function bodies are not statements; the
-body of a `DO` block is, with the strings it `EXECUTE`s.
+body of a `DO` block is (in dollars or in a plain string), with the strings,
+plain or in dollars, it hands to `EXECUTE` or `format(…)`. A package module
+is reached by alias, by its full name (`ameesh.plan_cli.add_parsers`) or
+through a module that imports a helper and hands it on; an import inside a
+function binds only in that function.
+
+Known limits (the script helps the CI and the auditor, it does not replace
+the review): strings are read with `standard_conforming_strings` on; the
+escapes of an `E''` string are not decoded (`E'\x44ROP'` is not seen as
+`DROP`); a dollar tag is ASCII; a `U&"…"` identifier is not decoded; a
+function body is not a statement even when the migration runs it later
+(`SELECT f()`).
 
 The number must be the next one at its own level (1.9.0 → 1.9.1, 1.10.0 or
 2.0.0), and that level must not be below the floor. A level above the floor
@@ -106,7 +117,7 @@ def last_tag(ref: str) -> str:
 
 _DOLLAR = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
 #: what precedes the body of an anonymous block, executed by the migration
-_DO = re.compile(r"^\s*do(?:\s+language\s+\w+)?\s*$", re.I)
+_DO = re.compile(r'^\s*do(?:\s+language\s+(?:\w+|"q"))?\s*$', re.I)
 #: in an anonymous block: a string run as a statement
 _DYNAMIC = re.compile(r"(?:\bexecute|\bformat\s*\()\s*$", re.I)
 
@@ -161,7 +172,9 @@ def _sql(text: str, block: bool = False) -> str:
                 else:
                     body.append(text[i])
                     i += 1
-            if block and _DYNAMIC.search(statement):
+            if _DO.match(statement):  # `DO 'BEGIN … END'`
+                keep(" %s " % _sql("".join(body), block=True))
+            elif block and _DYNAMIC.search(statement):
                 keep(" %s " % _sql("".join(body)))
             else:
                 keep("''")
@@ -182,6 +195,8 @@ def _sql(text: str, block: bool = False) -> str:
             i = n if end < 0 else end + len(tag)
             if _DO.match(statement):
                 keep(" %s " % _sql(body, block=True))
+            elif block and _DYNAMIC.search(statement):  # `EXECUTE $$…$$`
+                keep(" %s " % _sql(body))
             else:
                 keep("''")
         elif c == ";":
@@ -194,15 +209,17 @@ def _sql(text: str, block: bool = False) -> str:
     return "".join(out)
 
 
-def _imports(tree: ast.Module, module: str, init: bool = False,
+def _imports(nodes, module: str, init: bool = False,
              ) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
-    """The package modules a file imports, anywhere in it: {alias: module}
-    (`from . import budget as budget_mod`), and the functions it imports by
-    name: {alias: (module, function)} (`from .plan_cli import add_parsers`)."""
+    """The package modules imported in `nodes` (one scope: a module without
+    its functions, or a function): {alias: module} (`from . import budget as
+    budget_mod`; `import ameesh.plan_cli` binds `ameesh` to the package,
+    ""), and the functions imported by name: {alias: (module, function)}
+    (`from .plan_cli import add_parsers`)."""
     package = (module.split(".") if module else []) if init else module.split(".")[:-1]
     modules: dict[str, str] = {}
     functions: dict[str, tuple[str, str]] = {}
-    for node in ast.walk(tree):
+    for node in (one for top in nodes for one in ast.walk(top)):
         if isinstance(node, ast.ImportFrom):
             if node.level:
                 base = package[:len(package) - (node.level - 1)] if node.level > 1 else package
@@ -225,6 +242,8 @@ def _imports(tree: ast.Module, module: str, init: bool = False,
                 words = name.name.split(".")
                 if words[0] == PROGRAMS[0] and len(words) > 1 and name.asname:
                     modules[name.asname] = ".".join(words[1:])
+                elif words[0] == PROGRAMS[0] and not name.asname:
+                    modules[words[0]] = ""  # `ameesh.plan_cli.add_parsers(…)`
     return modules, functions
 
 
@@ -243,14 +262,29 @@ class _Package:
         #: functions called somewhere in the package: their callers say
         #: which parser they fill, so they are never also read as filling the
         #: top level (inlining such a helper, or moving it, changes nothing)
-        self.called = {callee for parsers in self.files.values()
-                       for node in ast.walk(parsers.tree) if isinstance(node, ast.Call)
-                       for callee in [parsers.callee(node.func)] if callee}
+        self.called = {self.resolve(callee) for parsers in self.files.values()
+                       for callee in parsers.calls()} - {None}
+
+    def resolve(self, callee: tuple[str, str]) -> tuple[str, str] | None:
+        """Where a function is defined: a module may import it from another
+        and hand it on (`bridge.fill`, imported in `bridge` from `plan_cli`)."""
+        seen = set()
+        while callee is not None and callee not in seen:
+            seen.add(callee)
+            parsers = self.files.get(callee[0])
+            if parsers is None:
+                return None
+            if callee[1] in parsers.functions:
+                return callee
+            callee = parsers.top[1].get(callee[1])
+        return None
 
     def function(self, callee: tuple[str, str]):
-        parsers = self.files.get(callee[0])
-        found = parsers.functions.get(callee[1]) if parsers else None
-        return (parsers, found) if found else (None, None)
+        callee = self.resolve(callee)
+        if callee is None:
+            return None, None
+        parsers = self.files[callee[0]]
+        return parsers, parsers.functions[callee[1]]
 
     def walk(self) -> None:
         for parsers in self.files.values():
@@ -275,7 +309,16 @@ class _Parsers(ast.NodeVisitor):
         self.package = package
         self.functions = {n.name: n for n in tree.body
                           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-        self.modules, self.imported = _imports(tree, module, init)
+        #: imports per scope: the module (without its functions), and each
+        #: function, which sees the module's and its own (`import` in a
+        #: function binds nothing elsewhere)
+        self.top = _imports([n for n in tree.body if n not in self.functions.values()],
+                            module, init)
+        self.scopes = {}
+        for name, function in self.functions.items():
+            modules, imported = _imports(function.body, module, init)
+            self.scopes[name] = (dict(self.top[0], **modules), dict(self.top[1], **imported))
+        self.modules, self.imported = self.top
         self.env: dict[str, tuple[str, ...]] = {}
         #: names bound to a literal string (a loop over literals, `x = "y"`)
         self.consts: dict[str, str] = {}
@@ -290,15 +333,35 @@ class _Parsers(ast.NodeVisitor):
     def options(self) -> set[str]:
         return self.package.options
 
+    def calls(self):
+        """The callees of every call of the file, each read in its scope."""
+        scopes = [(None, [n for n in self.tree.body if n not in self.functions.values()])]
+        scopes += [(name, function.body) for name, function in self.functions.items()]
+        saved = self.modules, self.imported
+        try:
+            for name, nodes in scopes:
+                self.modules, self.imported = self.scopes.get(name, self.top)
+                for node in (one for top in nodes for one in ast.walk(top)):
+                    if isinstance(node, ast.Call) and self.callee(node.func):
+                        yield self.callee(node.func)
+        finally:
+            self.modules, self.imported = saved
+
     def callee(self, func) -> tuple[str, str] | None:
-        """The (module, function) of the package a call targets, if known."""
+        """The (module, function) of the package a call targets, if known
+        (`plan_cli.add_parsers`, `ameesh.plan_cli.add_parsers`)."""
         if isinstance(func, ast.Name):
             if func.id in self.functions:
                 return self.module, func.id
             return self.imported.get(func.id)
-        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) \
-                and func.value.id in self.modules:
-            return self.modules[func.value.id], func.attr
+        if not isinstance(func, ast.Attribute):
+            return None
+        words, value = [], func.value
+        while isinstance(value, ast.Attribute):
+            words.insert(0, value.attr)
+            value = value.value
+        if isinstance(value, ast.Name) and value.id in self.modules:
+            return ".".join(filter(None, [self.modules[value.id]] + words)), func.attr
         return None
 
     def text(self, node) -> str | None:
@@ -398,7 +461,8 @@ class _Parsers(ast.NodeVisitor):
         func = node.func
         callee = self.callee(func)
         if callee is not None and self.package is not None:
-            parsers, function = self.package.function(callee)
+            callee = self.package.resolve(callee)
+            parsers, function = self.package.function(callee) if callee else (None, None)
             if function is None or callee in self.package.stack:
                 return
             arguments = function.args
@@ -436,15 +500,16 @@ class _Parsers(ast.NodeVisitor):
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def run(self, function, bound: dict[str, tuple[str, ...]], unbound: bool = True):
-        saved = self.env, self.consts, self.unbound
+        saved = self.env, self.consts, self.unbound, self.modules, self.imported
         self.env, self.consts, self.unbound = dict(bound), {}, unbound
+        self.modules, self.imported = self.scopes[function.name]
         self.package.stack.append((self.module, function.name))
         try:
             for statement in function.body:
                 self.visit(statement)
         finally:
             self.package.stack.pop()
-            self.env, self.consts, self.unbound = saved
+            self.env, self.consts, self.unbound, self.modules, self.imported = saved
 
     def walk(self):
         for statement in self.tree.body:

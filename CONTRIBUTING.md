@@ -79,7 +79,7 @@ Une version porte le numéro de son changement le plus fort. Chaque version est
 étiquetée `v<numéro>` sur le commit de `main` déployé et publiée sur GitHub.
 The CI checks the number of every PR that changes it (job `version number`,
 required through `tests`; lot L158), and the internal auditor checks each
-published version ([AUDITEUR](docs/AUDITEUR.md), check 12). Both run
+published version ([AUDITEUR](docs/AUDITEUR.md), check 13). Both run
 `scripts/version-level.py`, which compares the number with the content since
 the previous `v*` tag. What it sees sets a floor:
 
@@ -99,6 +99,13 @@ the previous `v*` tag. What it sees sets a floor:
 The number must be the next one at its level (from 1.9.0: 1.9.1, 1.10.0 or
 2.0.0), and that level must not be below the floor. A level above the floor
 passes: a new function without a new command or setting is a minor that no
-script sees. The release notes then say why. To see the level of what is on
+script sees. The release notes then say why.
+
+The script reads the SQL and the syntax tree, it does not run them; it helps
+the review without replacing it. Known limits: SQL strings are read with
+`standard_conforming_strings` on, the escapes of an `E''` string are not
+decoded (`E'\x44ROP'`), dollar tags are ASCII, `U&"…"` identifiers are not
+decoded, and a function body is never a statement, even when the migration
+runs it later (`SELECT f()`). To see the level of what is on
 `main` before preparing a version:
 `python3 scripts/version-level.py level $(git describe --tags --abbrev=0) origin/main`.
