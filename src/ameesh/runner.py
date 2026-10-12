@@ -33,6 +33,7 @@ import getpass
 import json
 import os
 import queue
+import shutil
 import signal
 import subprocess
 import sys
@@ -2181,8 +2182,12 @@ class AgentWorker(threading.Thread):
         orchestrateur sous une pression NON critique et hors batterie basse :
         ses tours sont courts, et c'est lui qui distribue le travail des autres
         (2026-10-10 : charge jusqu'à 43 pour 12 CPU, plus aucun tour, pas même
-        le sien, et personne pour répartir)."""
+        le sien, et personne pour répartir). L234 exempte les auditeurs,
+        y compris sous pression critique ; leur harnais a une priorité réduite."""
         if not pressure.get("blocked"):
+            return False
+        # L234 : la surveillance reste active, même sous pression critique.
+        if self.runner.is_auditor(self.name):
             return False
         if pressure.get("critical") or not self.runner.is_orchestrator(self.name):
             return True
@@ -2318,7 +2323,7 @@ class AgentWorker(threading.Thread):
             return None  # garde de budget (L13) : aucun tour, état `paused` posé
         # Contre-pression de l'hôte (L31, 0028) : au-dessus d'un seuil, aucun
         # NOUVEAU tour ne démarre ; la consigne en attente n'est pas consommée
-        # (l'orchestrateur excepté, sous une pression non critique).
+        # (auditeur excepté ; orchestrateur sous pression non critique).
         pressure = self.runner.host_pressure()
         if self._held_by_pressure(pressure):
             if self.maybe_relocate(pressure):
@@ -2567,7 +2572,7 @@ class AgentWorker(threading.Thread):
             self._host_pressure_note(pression)
             return False
         if pression.get("blocked"):
-            self.runner.pressure_bypassed(self.name)  # orchestrateur, non critique
+            self.runner.pressure_bypassed(self.name)  # orchestrateur ou auditeur
         if not candidats or self.runner.dry_run:
             return self._run_turn(spec)
         kind = spec["kind"]
@@ -2944,7 +2949,8 @@ class AgentWorker(threading.Thread):
                     # même pas pendant son lancement (voir `background`).
                     with self.runner.launch_lock:
                         proc = subprocess.Popen(
-                            argv, cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
+                            self.runner.audit_command(self.name, argv),
+                            cwd=cwd, stdout=subprocess.PIPE, stderr=stderr,
                             text=True, bufsize=1, env=env,
                             start_new_session=True,  # son groupe : on peut le tuer en entier
                         )
@@ -4363,9 +4369,35 @@ class Runner:
                 or name in getattr(self, "_orchestrators_roles", ()))
 
     def refresh_orchestrators(self, *canons) -> None:
-        """Après chaque `canon sync` : les agents au rôle d'orchestrateur."""
+        """Après chaque `canon sync` : les rôles orchestrateur et auditeur."""
         from . import sous_utilisation as su
         self._orchestrators_roles = frozenset(su.role_orchestrators(canons))
+        from . import alert_briefs
+        self._auditors_roles = frozenset(su.role_orchestrators(
+            canons, alert_briefs.AUDITOR_ROLES))
+
+    def is_auditor(self, name: str) -> bool:
+        """L234 : persona auditeur ou rôle auditeur/auditor au canon."""
+        from . import alert_briefs
+        return (name == alert_briefs.AUDITOR_NAME
+                or name in getattr(self, "_auditors_roles", ()))
+
+    def audit_command(self, name: str, argv: list) -> list:
+        """L234 : faible priorité CPU et I/O, héritée par les sous-processus.
+
+        Les wrappers sont facultatifs sur les plateformes qui ne les ont pas.
+        Aucun preexec_fn dans cet exécuteur multithreadé.
+        """
+        if not self.is_auditor(name):
+            return argv
+        prefix = []
+        ionice = shutil.which("ionice")
+        nice = shutil.which("nice")
+        if ionice:
+            prefix.extend([ionice, "-t", "-c", "3"])
+        if nice:
+            prefix.extend([nice, "-n", "10"])
+        return prefix + list(argv)
 
     def _pressure_episode_update(self, verdict: dict) -> None:
         """À chaque verdict FRAIS, sous `_pressure_lock` : une ligne de journal
@@ -4379,9 +4411,10 @@ class Runner:
                 self._pressure_episode = episode = {
                     "since": time.time(), "critical": bool(verdict.get("critical")),
                     "delayed": set(), "rotations": set(), "orchestrator_turns": 0,
+                    "auditor_turns": 0,
                     "tmpfs": False}
                 batterie = any(b.get("power") for b in verdict.get("breaches") or ())
-                log_async("pression de l'hôte %s : début — %s ; plus de nouveau tour%s"
+                log_async("pression de l'hôte %s : début — %s ; sauf auditeurs, plus de nouveau tour%s"
                           % (self.host, resources_mod.describe(verdict.get("breaches"))
                              or "seuil",
                              " (pression critique)" if verdict.get("critical") else
@@ -4412,7 +4445,9 @@ class Runner:
                       " ; rotation de session reportée : %s"
                       % ", ".join(sorted(episode["rotations"])) if episode["rotations"] else "",
                       " ; %d tour(s) d'orchestrateur passé(s)" % episode["orchestrator_turns"]
-                      if episode["orchestrator_turns"] else ""))
+                      if episode["orchestrator_turns"] else "")
+                  + (" ; %d tour(s) d'auditeur passé(s)" % episode.get("auditor_turns", 0)
+                     if episode.get("auditor_turns") else ""))
 
     def pressure_delayed(self, agent: str, *, rotation: bool = False) -> None:
         """Un tour (ou une rotation de session) de `agent` attend la fin de
@@ -4423,11 +4458,12 @@ class Runner:
                 episode["rotations" if rotation else "delayed"].add(agent)
 
     def pressure_bypassed(self, agent: str) -> None:
-        """Un tour d'orchestrateur part malgré la pression (non critique)."""
+        """Un tour d'orchestrateur ou d'auditeur part malgré la pression."""
         with self._pressure_lock:
             episode = getattr(self, "_pressure_episode", None)
             if episode is not None:
-                episode["orchestrator_turns"] += 1
+                key = "auditor_turns" if self.is_auditor(agent) else "orchestrator_turns"
+                episode[key] = episode.get(key, 0) + 1
 
     def power_reading(self) -> dict:
         """Alimentation de l'hôte (L106) ; surchargée par les tests."""

@@ -306,3 +306,31 @@ capabilities in the canon; never `approve`.
   and post-delivery monitoring. For ameesh bug fixes only, in its own mesh,
   delivery goes all the way to deployment without a human; the production of
   projects remains human.
+
+# Amendement du 2026-10-12 : conformité aux procédures (L234)
+
+Lot #260, affecté par mesh-design à ameesh-cx2 (courrier #8168 du
+2026-10-12 à 06:07), après la question du propriétaire relayée par bureau
+et le constat de l'auditeur du même jour à 05:50. L'évolution est soumise
+au circuit de relecture et de décision du projet.
+
+La consigne ajoute le point 12 : contrôler la conformité des agents à leur
+procédure, y compris les faits sans alerte — attente humaine sans demande
+`ameesh decide`, décision attendue par courrier libre, intervention manuelle
+d'un humain ou de bureau, annonce qui ne correspond pas au registre et aux
+journaux. Chaque écart confirmé porte la règle, les preuves, la cause, le lot
+et le correctif ; le passage suivant vérifie ce qui a été corrigé. Les
+interventions de bureau sont consignées dans le fil avec leur lot pour
+permettre cette remontée vers la cause racine.
+
+Le passage court est exempt des pauses et attentes de charge de l'hôte,
+y compris sous pression critique et batterie basse. Le harnais tourne à
+faible priorité CPU et I/O quand les outils du poste le permettent ; les
+gardes de budget et de sécurité restent inchangées. L'analyse profonde
+attend toujours sous pression critique.
+
+La prise automatique ne confie à l'auditeur que des bugs dans son périmètre,
+jamais des évolutions ou améliorations, ni un lot qui mentionne ses
+instructions protégées (consigne, décision 0036, fiche, capacités,
+permissions). Une attribution explicite ne l'autorise pas davantage à les
+modifier : le lot est rendu à l'orchestrateur pour un autre agent.

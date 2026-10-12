@@ -30,6 +30,17 @@ class _Lots(_Base):
 
 
 class PriseDeLotTest(_Lots):
+    def test_auditeur_ne_prend_que_les_bugs_hors_instructions_protegees(self):
+        self.agent("auditeur", team="ameesh")
+        evolution = self.lot("Évolution de la surveillance", app="ameesh", type="evolution")
+        protected = self.lot("Bug de docs/AUDITEUR.md", app="ameesh", type="bug")
+        bug = self.lot("Crash du runner", app="ameesh", type="bug")
+        out = self.take(orchestras=[])
+        self.assertEqual([(t["agent"], t["item"]["id"]) for t in out],
+                         [("auditeur", bug["id"])])
+        self.assertIsNone(work.get(self.db, evolution["id"])["assignee"])
+        self.assertIsNone(work.get(self.db, protected["id"])["assignee"])
+
     def test_lot_de_l_equipe_pris_et_orchestrateur_prevenu(self):
         self.agent("orchestrateur", team="nexlink", status="running")
         self.agent("deepseek7", "deepseek", team="nexlink")

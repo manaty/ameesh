@@ -73,6 +73,7 @@ celui du projet de l'agent.
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from . import storage
@@ -161,8 +162,31 @@ def items(db: Db, *, open_only: bool = True, limit: int = 100) -> list:
     return storage.of(db).work.backlog(open_only=open_only, limit=limit)
 
 
-def fits(item: dict, agent: dict) -> bool:
+def auditor_may_take(item: dict, name: str) -> bool:
+    """L234 : bugs seulement, hors consigne, décision et fiche de l'auditeur.
+
+    Un lot ne déclare pas les fichiers qu'il changera : les références dans
+    son titre/corps/fiche/branche sont une garde conservatrice ; l'agent doit
+    aussi rendre un lot dont le périmètre protégé apparaît en travaillant.
+    """
+    if item.get("type") != "bug":
+        return False
+    text = " ".join(str(item.get(k) or "") for k in
+                    ("title", "body", "package_id", "package_parent", "branch")).casefold()
+    protected = ("auditeur.md", "0036", "agents/auditeur", "agents/%s" % name.casefold(),
+                 "capabilities", "capacités", "permissions")
+    if any(marker in text for marker in protected):
+        return False
+    # La fiche d'un autre agent n'est pas celle de l'auditeur.
+    names = r"(?:auditeur|auditor|%s)" % re.escape(name.casefold())
+    return not re.search(r"(?:fiche|card)[^.;\n]{0,80}" + names
+                         + r"|(?:sa|ses|own)\s+(?:fiche|card)", text)
+
+
+def fits(item: dict, agent: dict, *, auditor: bool = False) -> bool:
     """L'élément correspond-il à l'équipe et aux capacités de l'agent ?"""
+    if auditor and not auditor_may_take(item, agent["name"]):
+        return False
     team = (item.get("team") or "").strip()
     if team and team != (agent.get("team") or "").strip():
         return False
@@ -257,9 +281,11 @@ def lot_takeable(item: dict, today: str | None = None) -> bool:
     return bool((item.get("lot_team") or "").strip())
 
 
-def lot_fits(item: dict, agent: dict) -> bool:
+def lot_fits(item: dict, agent: dict, *, auditor: bool = False) -> bool:
     """Le lot est-il de l'équipe de l'agent, et l'agent sait-il le faire ?
     Une capacité exigée `harness:<nom>` désigne le harnais de l'agent."""
+    if auditor and not auditor_may_take(item, agent["name"]):
+        return False
     team = (agent.get("team") or "").strip()
     if not team or (item.get("lot_team") or "").strip() != team:
         return False
@@ -313,6 +339,13 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     if not lots and not queue:
         return []
     listing = st.operations.listing() if listing is None else listing
+    from . import alert_briefs, canon as canon_mod
+    try:
+        canons = canon_mod.load_configured(cfg) if cfg is not None else []
+    except Exception:
+        # Pas de prise quand le périmètre des rôles est illisible.
+        return []
+    auditors = set(alert_briefs.auditors(listing, canons))
     # un agent du mesh en pause budget : le plafond est atteint, on ne charge pas
     if any(row.get("status") == "blocked"
            and (row.get("status_text") or "").startswith(budget_mod.PAUSE_PREFIX)
@@ -367,7 +400,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             agent = registry.get(db, row["name"]) or {}
             agent = dict(row, capabilities=agent.get("capabilities"))
             for item in list(lots):
-                if not lot_fits(item, agent):
+                if not lot_fits(item, agent, auditor=row["name"] in auditors):
                     continue
                 notified = _team_orchestrators(cfg, db, listing, item["lot_team"],
                                                orchestras)
@@ -414,7 +447,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         agent = registry.get(db, row["name"]) or {}
         agent = dict(row, capabilities=agent.get("capabilities"))
         for item in list(queue):
-            if not fits(item, agent):
+            if not fits(item, agent, auditor=row["name"] in auditors):
                 continue
             if dry_run:
                 taken.append({"item": item, "agent": row["name"], "message_id": None,
