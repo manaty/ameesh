@@ -39,8 +39,8 @@ body of a `DO` block is (in dollars or in a plain string), with the strings,
 plain or in dollars, it hands to `EXECUTE` or `format(…)`. A package module
 is reached by alias, by its full name (`ameesh.plan_cli.add_parsers`) or
 through a module that imports a helper and hands it on; an import inside a
-function binds only in that function (not in the functions it nests, nor
-around it), and hides a module function of the same name.
+function or a class body binds only there (not in the functions or methods
+it nests, nor around it), and hides a module function of the same name.
 
 Known limits (the script helps the CI and the auditor, it does not replace
 the review): strings are read with `standard_conforming_strings` on; the
@@ -323,6 +323,7 @@ class _Parsers(ast.NodeVisitor):
                  init: bool = False):
         self.tree = tree
         self.module = module
+        self.init = init
         self.package = package
         self.functions = {n.name: n for n in tree.body
                           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
@@ -359,15 +360,48 @@ class _Parsers(ast.NodeVisitor):
         scopes = [(None, [n for n in self.tree.body if n not in self.functions.values()])]
         scopes += [(name, function.body) for name, function in self.functions.items()]
         saved = self.modules, self.imported, self.local
+        found: list[tuple[str, str]] = []
         try:
             for name, nodes in scopes:
                 self.modules, self.imported = self.scopes.get(name, self.top)
                 self.local = self.own.get(name, set())
-                for node in (one for top in nodes for one in ast.walk(top)):
-                    if isinstance(node, ast.Call) and self.callee(node.func):
-                        yield self.callee(node.func)
+                self._calls(nodes, found)
         finally:
             self.modules, self.imported, self.local = saved
+        return found
+
+    def _calls(self, nodes, found: list, outer=None) -> None:
+        """The callees of the calls in `nodes`; a class body is read with its
+        own imports, its methods with the scope around the class (`outer`)."""
+        for node in nodes:
+            if isinstance(node, ast.ClassDef):
+                self._calls(node.decorator_list + node.bases + node.keywords, found, outer)
+                around = self.modules, self.imported, self.local
+                self._enter_class(node)
+                try:
+                    self._calls(node.body, found, outer or around)
+                finally:
+                    self.modules, self.imported, self.local = around
+                continue
+            if outer and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                inside = self.modules, self.imported, self.local
+                self.modules, self.imported, self.local = outer
+                try:
+                    self._calls(ast.iter_child_nodes(node), found)
+                finally:
+                    self.modules, self.imported, self.local = inside
+                continue
+            if isinstance(node, ast.Call) and self.callee(node.func):
+                found.append(self.callee(node.func))
+            self._calls(ast.iter_child_nodes(node), found, outer)
+
+    def _enter_class(self, node) -> None:
+        """The scope of a class body: the one around it, with its own imports
+        on top (they hide a module function of the same name)."""
+        modules, imported = _imports(node.body, self.module, self.init)
+        self.modules = dict(self.modules, **modules)
+        self.imported = dict(self.imported, **imported)
+        self.local = self.local | set(modules) | set(imported)
 
     def callee(self, func) -> tuple[str, str] | None:
         """The (module, function) of the package a call targets, if known
@@ -520,6 +554,20 @@ class _Parsers(ast.NodeVisitor):
         pass  # run from `walk` (top level) or from a call, never in passing
 
     visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        """A class body runs where it stands, in its own scope: its imports
+        and names stay in it (its methods are not run)."""
+        for one in node.decorator_list + node.bases + node.keywords:
+            self.visit(one)
+        saved = (self.env, self.consts, self.modules, self.imported, self.local)
+        self.env, self.consts = dict(self.env), dict(self.consts)
+        self._enter_class(node)
+        try:
+            for statement in node.body:
+                self.visit(statement)
+        finally:
+            self.env, self.consts, self.modules, self.imported, self.local = saved
 
     def run(self, function, bound: dict[str, tuple[str, ...]], unbound: bool = True):
         saved = (self.env, self.consts, self.unbound, self.modules, self.imported,

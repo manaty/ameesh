@@ -342,7 +342,19 @@ class VersionLevelTest(unittest.TestCase):
         hidden = ('def fill(sub):\n    pass\n\n\ndef build(sub):\n'
                   '    from .plan_cli import fill\n'
                   '    work = sub.add_parser("work").add_subparsers()\n    fill(work)\n')
-        for name, cli in (("nested", nested), ("hidden", hidden)):
+        # codex #195 r7: a class body is a scope of its own, its imports
+        # apply to its calls
+        in_class = ('import argparse\n\n\nclass Cli:\n'
+                    '    from . import plan_cli as helper\n'
+                    '    sub = argparse.ArgumentParser(prog="ameesh").add_subparsers()\n'
+                    '    work = sub.add_parser("work").add_subparsers()\n'
+                    '    helper.fill(work)\n')
+        class_hidden = ('import argparse\n\n\ndef fill(sub):\n    pass\n\n\nclass Cli:\n'
+                        '    from .plan_cli import fill\n'
+                        '    sub = argparse.ArgumentParser(prog="ameesh").add_subparsers()\n'
+                        '    work = sub.add_parser("work").add_subparsers()\n    fill(work)\n')
+        for name, cli in (("nested", nested), ("hidden", hidden), ("class", in_class),
+                          ("class-hidden", class_hidden)):
             with self.subTest(name):
                 self._git("checkout", "-q", "-B", "case-" + name, "case")
                 self._write("src/ameesh/cli.py", cli)
