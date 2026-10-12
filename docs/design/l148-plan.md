@@ -542,6 +542,11 @@ Zero-downtime recipe, no applied migration touched:
    `alter table agent_registry add column if not exists workstream text not null default '';`
    backfill from `chantier`, then a `before insert or update` trigger keeping both columns in
    sync in both directions (last write wins on the pair). Old code keeps working unchanged.
+   **A (2026-10-12, #147)**: `src/ameesh/migrations/0410_rename_chantier_workstream.sql`
+   (number reserved by `ameesh work migration 147`) adds the column, backfills it, and
+   installs `agent_registry_workstream_sync`: whichever column is written is copied onto the
+   other, and the new name wins when one statement writes both differently. Tested by
+   `tests/test_l148_stage3_workstream.py` (both drivers).
 2. **PR B** — switch readers/writers to `workstream` in the free files first (`identity.py`,
    `projects.py`, `plan_github.py`, `stagnation.py`), and emit both `workstream` and `chantier`
    in the JSON listing (duplicate key, deprecated) so the progress page keeps working.
