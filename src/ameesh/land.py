@@ -173,10 +173,10 @@ def _gh(args: list[str], *, timeout: float = 60.0) -> subprocess.CompletedProces
 
 
 def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
-    """The open PR of `branch`: `{number, head, ci: green|red|pending}`."""
+    """The open PR of `branch`: `{number, head, base, ci: green|red|pending}`."""
     from . import radar
     proc = gh(["pr", "list", "--repo", slug, "--head", branch, "--state", "open", "--json",
-               "number,headRefOid,statusCheckRollup"])
+               "number,headRefOid,baseRefName,statusCheckRollup"])
     if proc.returncode != 0:
         raise LandError("gh pr list: %s" % (proc.stderr or proc.stdout).strip()[:300])
     rows = json.loads(proc.stdout or "[]")
@@ -186,14 +186,18 @@ def pr_status(slug: str, branch: str, gh=_gh) -> dict | None:
     pending = any((c.get("status") or "COMPLETED") != "COMPLETED"
                   or (c.get("state") or "") == "PENDING" for c in rollup)
     ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"
-    return {"number": rows[0]["number"], "head": rows[0].get("headRefOid"), "ci": ci}
+    return {"number": rows[0]["number"], "head": rows[0].get("headRefOid"),
+            "base": rows[0].get("baseRefName"), "ci": ci}
 
 
 def pr_merge(slug: str, number, sha: str, method: str, gh=_gh) -> str | None:
     """Merges the PR by the API at that very commit; the error, or None."""
     proc = gh(["pr", "merge", str(number), "--repo", slug, "--%s" % method,
                "--match-head-commit", sha], timeout=120.0)
-    return None if proc.returncode == 0 else (proc.stderr or proc.stdout).strip()[:300]
+    if proc.returncode == 0:
+        return None
+    # #194 r3: a failure without output is still a failure
+    return (proc.stderr or proc.stdout or "").strip()[:300] or "exit %d" % proc.returncode
 
 
 # --------------------------------------------------------------------------
@@ -222,12 +226,24 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         ops.land_unlock(key, owner, epoch)
         locks.pop(key, None)
 
+    def held() -> bool:
+        """#194 r3: the lease is still ours, renewed, right before a push or
+        a merge (gates may outlive it, and another runner take it)."""
+        if ops.land_lock(key, owner, LOCK_TTL_S, epoch=epoch) is not None:
+            return True
+        locks.pop(key, None)
+        return False
+
+    lost = {"lot": lot, "result": "busy", "error": "lease on %s lost before pushing" % key}
+
     if replayer is None:
         replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
     slug = radar.github_slug(project) if project.land == "pr" else None
     try:
-        if row["state"] == "landing":
-            return _follow_pr(db, project, row, slug, unlock, gh=gh)
+        if row["state"] == "landing" and project.land == "pr":
+            return _follow_pr(db, project, row, slug, unlock, held, gh=gh)
+        # land: local — a lot left `landing` (lease lost or runner gone) is
+        # landed again from the start: the push to the target is never forced
         replayer.ensure()
         ops.queue_update(lot, state="landing", note="merge queue of %s: landing (%s)"
                          % (row["target"], project.land), actor=work.SYSTEM_SENDER)
@@ -251,6 +267,8 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
             return dict(out, result="ejected", output=checked["output"])
         url = _origin(project) or project.repo
         if project.land == "local":
+            if not held():
+                return lost
             proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify", url,
                                     "%s:refs/heads/%s" % (merged["sha"],
                                                           _branch_of(row["target"])),
@@ -271,6 +289,13 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
             out = _eject(db, row, project, "no open PR for %s" % row["branch"],
                          "Open the PR, then ameesh work queue add %d." % lot)
             return dict(out, result="ejected")
+        if status.get("base") != _branch_of(row["target"]):
+            unlock()
+            out = _eject(db, row, project, "PR #%s targets %s, not %s" % (
+                status["number"], status.get("base") or "?", _branch_of(row["target"])),
+                "Point the PR at %s (or queue the lot for its target), then ameesh work "
+                "queue add %d." % (_branch_of(row["target"]), lot))
+            return dict(out, result="ejected")
         if not merge_queue._same(status["head"], row["frozen_sha"]):
             unlock()
             out = _eject(db, row, project, "PR #%s is at %s, not at the freeze %s" % (
@@ -278,6 +303,8 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
                 "Something pushed to the branch after its freeze: freeze again, then "
                 "ameesh work queue add %d." % lot)
             return dict(out, result="ejected")
+        if not held():
+            return lost
         proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify", url,
                                 "%s:refs/heads/%s" % (merged["sha"], row["branch"]),
                                 timeout=FETCH_TIMEOUT)
@@ -310,7 +337,7 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         return error
 
 
-def _follow_pr(db, project, row: dict, slug, unlock, *, gh) -> dict:
+def _follow_pr(db, project, row: dict, slug, unlock, held, *, gh) -> dict:
     lot = int(row["work_item_id"])
     ops = storage.of(db).work
     status = pr_status(slug, row["branch"], gh=gh) if slug else None
@@ -323,6 +350,12 @@ def _follow_pr(db, project, row: dict, slug, unlock, *, gh) -> dict:
             return {"lot": lot, "result": "landed"}
         return dict(_eject(db, row, project, "its PR is no longer open",
                            "Reopen it, then ameesh work queue add %d." % lot), result="ejected")
+    if status.get("base") != _branch_of(row["target"]):
+        unlock()
+        return dict(_eject(db, row, project, "PR #%s targets %s, not %s" % (
+            status["number"], status.get("base") or "?", _branch_of(row["target"])),
+            "Point the PR at %s, freeze again, then ameesh work queue add %d."
+            % (_branch_of(row["target"]), lot)), result="ejected")
     if not merge_queue._same(status["head"], row.get("landing_sha")):
         unlock()
         return dict(_eject(db, row, project, "its branch moved while ameesh was landing it "
@@ -338,12 +371,16 @@ def _follow_pr(db, project, row: dict, slug, unlock, *, gh) -> dict:
                            "Fix it on your branch (it already holds the merge of %s), freeze "
                            "again, then ameesh work queue add %d." % (row["target"], lot)),
                     result="ejected")
+    if not held():
+        return {"lot": lot, "result": "busy",
+                "error": "lease lost before merging PR #%s" % status["number"]}
     error = pr_merge(slug, status["number"], row["landing_sha"], project.merge_method, gh=gh)
-    unlock()
-    if error:
-        ops.queue_update(lot, state="queued", reason="PR merge refused (%s): retried"
-                         % error[:200])
+    if error is not None:
+        # #194 r3: the branch holds the merge commit; the lot stays `landing`
+        # with it (and the lease: a lasting refusal raises `merge_blocked`)
+        ops.queue_update(lot, reason="PR merge refused (%s): retried" % error[:200])
         return {"lot": lot, "result": "retry", "error": error}
+    unlock()
     return _landed(db, project, row, {"sha": row["landing_sha"], "state": "pr",
                                       "files": []}, None, pr=status["number"])
 

@@ -165,8 +165,10 @@ class LocalLandTest(_Land):
 class FakeGh:
     def __init__(self):
         self.head = None
+        self.base = "main"
         self.ci = "pending"
         self.fail = False
+        self.merge_result = (0, "", "")
         self.calls: list = []
 
     def __call__(self, args, timeout=60.0):
@@ -177,8 +179,11 @@ class FakeGh:
             check = {"pending": {"status": "IN_PROGRESS", "conclusion": None},
                      "green": {"status": "COMPLETED", "conclusion": "SUCCESS"},
                      "red": {"status": "COMPLETED", "conclusion": "FAILURE"}}[self.ci]
-            out = [{"number": 9, "headRefOid": self.head, "statusCheckRollup": [check]}]
+            out = [{"number": 9, "headRefOid": self.head, "baseRefName": self.base,
+                    "statusCheckRollup": [check]}]
             return subprocess.CompletedProcess(args, 0, json.dumps(out), "")
+        if args[:2] == ["pr", "merge"]:
+            return subprocess.CompletedProcess(args, *self.merge_result)
         return subprocess.CompletedProcess(args, 0, "", "")
 
 
@@ -258,6 +263,100 @@ class PrLandTest(_Land):
         gh = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "[]", ""))
         self.assertEqual(self.land(4, gh=gh)["result"], "ejected")
         self.assertIn("no open PR", self.fake.queue_rows[4]["reason"])
+
+
+def _steal_after_gates(test, key="p:main"):
+    """Gates that outlive the lease: it expires, runner-2 takes it (epoch 2)."""
+    real = land.gates
+
+    def gates(project, path, **kw):
+        out = real(project, path, **kw)
+        owner, epoch, _ = test.locks.held[key]
+        test.locks.held[key] = (owner, epoch, 0)          # expired
+        test.assertIsNotNone(test.locks.land_lock(key, "runner-2", 600))
+        return out
+    return mock.patch.object(land, "gates", side_effect=gates)
+
+
+class Review194Test(_Land):
+    """#194 r3: the two P1 and the two P2."""
+
+    def test_lease_lost_during_the_gates_nothing_pushed_local(self):
+        self.queued(4)
+        before = _git(self.origin, "rev-parse", "main")
+        with _steal_after_gates(self):
+            out = self.land(4)
+        self.assertEqual(out["result"], "busy", out)
+        self.assertEqual(_git(self.origin, "rev-parse", "main"), before)
+        self.assertNotEqual(self.fake.queue_rows[4]["state"], "landed")
+        self.assertEqual(self.locks.held["p:main"][0], "runner-2")
+        # runner-2 lands it from the start (a `landing` lot, in local mode)
+        out = land.land_head(self.cfg, None, self.project, self.fake._row(4),
+                             owner="runner-2")
+        self.assertEqual(out["result"], "landed", out)
+
+    def test_lease_lost_during_the_gates_nothing_pushed_pr(self):
+        self.project = dataclasses.replace(self.project, land="pr")
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        before = _git(self.origin, "rev-parse", "lot/4-d")
+        with _steal_after_gates(self):
+            out = self.land(4, gh=gh)
+        self.assertEqual(out["result"], "busy", out)
+        self.assertEqual(_git(self.origin, "rev-parse", "lot/4-d"), before)
+
+    def test_pr_on_another_base_is_ejected_before_any_push(self):
+        self.project = dataclasses.replace(self.project, land="pr")
+        gh = FakeGh()
+        self.queued(4)
+        gh.head, gh.base, gh.ci = self.tip(4), "develop", "green"
+        before = _git(self.origin, "rev-parse", "lot/4-d")
+        self.assertEqual(self.land(4, gh=gh)["result"], "ejected")
+        self.assertIn("targets develop, not main", self.fake.queue_rows[4]["reason"])
+        self.assertEqual(_git(self.origin, "rev-parse", "lot/4-d"), before)
+        self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls))
+
+    def test_pr_retargeted_while_landing_is_ejected(self):
+        self.project = dataclasses.replace(self.project, land="pr")
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        out = self.land(4, gh=gh)
+        gh.head, gh.base, gh.ci = out["sha"], "develop", "green"
+        self.assertEqual(self.land(4, gh=gh)["result"], "ejected")
+        self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls))
+
+    def _landing(self):
+        self.project = dataclasses.replace(self.project, land="pr")
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        locks: dict = {}
+        out = self.land(4, gh=gh, locks=locks)
+        gh.head, gh.ci = out["sha"], "green"
+        return gh, locks, out["sha"]
+
+    def test_transient_merge_refusal_keeps_it_landing(self):
+        gh, locks, sha = self._landing()
+        gh.merge_result = (1, "", "GraphQL: Base branch was modified")
+        out = self.land(4, gh=gh, locks=locks)
+        self.assertEqual(out["result"], "retry", out)
+        row = self.fake.queue_rows[4]
+        self.assertEqual((row["state"], row["landing_sha"]), ("landing", sha))
+        self.assertTrue(locks, "the lease is kept")
+        gh.merge_result = (0, "", "")
+        self.assertEqual(self.land(4, gh=gh, locks=locks)["result"], "landed")
+
+    def test_merge_failure_without_output_is_a_failure(self):
+        gh, locks, sha = self._landing()
+        gh.merge_result = (1, "", "")
+        out = self.land(4, gh=gh, locks=locks)
+        self.assertEqual((out["result"], out["error"]), ("retry", "exit 1"))
+        self.assertEqual(self.fake.queue_rows[4]["state"], "landing")
+        self.assertEqual(land.pr_merge("o/r", 9, sha, "merge",
+                                       gh=lambda a, timeout=0: subprocess.CompletedProcess(
+                                           a, 1, "", "")), "exit 1")
 
 
 class SettingsAndAlertTest(unittest.TestCase):
