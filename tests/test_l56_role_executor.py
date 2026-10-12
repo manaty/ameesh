@@ -234,13 +234,12 @@ class RoleExecutorTest(PgTestCase):
         try:
             self.db.execute('ALTER DATABASE %s OWNER TO %s' % (q(self.database), q(creator)))
             self.db.execute('CREATE SCHEMA %s AUTHORIZATION pg_database_owner' % q(schema))
-            self.db.execute('SET ROLE %s' % q(creator))
-            try:
-                self.db.execute('CREATE TABLE %s.agent_registry (id serial PRIMARY KEY)' % q(schema))
-                self.db.execute('CREATE TABLE %s.ci_runs (id int)' % q(schema))
-                self.db.execute('CREATE SEQUENCE %s.estimate_references_id_seq' % q(schema))
-            finally:
-                self.db.execute('RESET ROLE')
+            # One session: the psql driver runs each bare execute() in its own process.
+            with self.db.transaction() as tx:
+                tx.execute('SET LOCAL ROLE %s' % q(creator))
+                tx.execute('CREATE TABLE %s.agent_registry (id serial PRIMARY KEY)' % q(schema))
+                tx.execute('CREATE TABLE %s.ci_runs (id int)' % q(schema))
+                tx.execute('CREATE SEQUENCE %s.estimate_references_id_seq' % q(schema))
             result = self.run_script(executor, schema=schema, applying_role=creator)
             self.assertEqual(result.returncode, 0, result.stderr)
             rows = self.db.query('SELECT pg_get_userbyid(defaclrole) AS name FROM pg_default_acl '
@@ -264,7 +263,6 @@ class RoleExecutorTest(PgTestCase):
                     result = self.run_script(executor, schema=schema, applying_role=creator)
                     self.assertEqual(result.returncode, 0, result.stderr)
         finally:
-            self.db.execute('RESET ROLE')
             self.db.execute('ALTER DATABASE %s OWNER TO %s' % (q(self.database), q(old_owner)))
             self.db.execute('DROP SCHEMA IF EXISTS %s CASCADE' % q(schema))
             for role in (executor, other, creator):
