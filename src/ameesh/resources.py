@@ -783,13 +783,16 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
     return out
 
 
-def collect(cfg, db: Db, *, now: float | None = None, policy=None) -> dict:
+def collect(cfg, db: Db, *, now: float | None = None, policy=None,
+            gate: dict | None = None) -> dict:
     """Relève l'hôte de cet exécuteur et publie le relevé ; rend le relevé.
 
     Le nombre de tours en cours vient de la base (agents de l'hôte au bail
     vivant et en tour) : c'est un état, pas une mesure locale. `policy` : la
     politique de ménage de l'hôte, pour la racine du cache des dépendances
-    (#253).
+    (#253). L159f : `gate` est l'état de la porte d'hôte que l'exécuteur suit
+    (`gate_state`, `gate_seq`, `gate_reason`), None sans porte ; le
+    déplacement le lit.
     """
     host = cfg.host or ""
     try:
@@ -804,8 +807,13 @@ def collect(cfg, db: Db, *, now: float | None = None, policy=None) -> dict:
     except Exception:  # un relevé ne doit jamais faire tomber la boucle
         basis = None
     reading.update(lendable(reading, basis))
+    reading.update({key: (gate or {}).get(key) for key in GATE_KEYS})
     storage.of(db).hosts.record(reading)
     return reading
+
+
+#: L159f: the host gate in a reading (`host_gate.GateController.snapshot`)
+GATE_KEYS = ("gate_state", "gate_seq", "gate_reason")
 
 
 # --------------------------------------------------------------------------

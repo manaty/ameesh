@@ -41,15 +41,18 @@ READING_COLUMNS = (
     # #246 (0067): btrfs allocation
     "btrfs_unallocated_bytes, btrfs_metadata_headroom_bytes, "
     # #253 (0359): every filesystem the host writes to
-    "volumes"
+    "volumes, "
+    # L159f (0069): host gate the executor obeys
+    "gate_state, gate_seq, gate_reason"
 )
 
-#: L159d (and #246) columns written by `record`, in this order
+#: L159d (and #246, L159f) columns written by `record`, in this order
 MEASURE_COLUMNS = (
     "mem_total_bytes", "psi_cpu_some", "psi_mem_some", "psi_mem_full", "psi_io_some",
     "app_cpu", "guest_cpu", "cpu_window_s", "guest_mem_bytes",
     "lendable_cpu", "lendable_memory_bytes", "lendable_disk_bytes",
     "btrfs_unallocated_bytes", "btrfs_metadata_headroom_bytes",
+    "gate_state", "gate_seq", "gate_reason",
 )
 
 def _volumes_param(volumes) -> str | None:

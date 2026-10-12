@@ -274,7 +274,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #246 (0067): btrfs allocation, numbers only
         'btrfs_unallocated_bytes', 'btrfs_metadata_headroom_bytes',
         -- #253 (0359): every filesystem the host writes to, paths and numbers
-        'volumes'
+        'volumes',
+        -- L159f (0069): host gate state, seq and the guard's short reason
+        'gate_state', 'gate_seq', 'gate_reason'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',

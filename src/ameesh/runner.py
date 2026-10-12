@@ -392,6 +392,9 @@ class AgentWorker(threading.Thread):
         self.last_turn_closed: str | None = None
         #: `ameesh restart` (L26) : arrêt du tour en cours, puis session neuve
         self.restarting = threading.Event()
+        #: L159f : porte d'hôte — raison de l'arrêt du tour en cours parce que
+        #: l'hôte se retire (`HOST_SAFE_POINT`, échéance, arrêt), None sinon
+        self.host_yield: str | None = None
         #: comptes multiples (L30, 0027) : compte choisi pour le prochain tour, et
         #: compte imposé au tour de résumé d'une bascule (l'ancien compte)
         self._account = None
@@ -955,6 +958,46 @@ class AgentWorker(threading.Thread):
         self._audit_guard_error = "hard cap of the auditor turn reached"
         self.stop_group_now(self._audit_guard_error, grace=0, hard=True)
 
+    #: L159f : le tour s'arrête au point sûr (le harnais seul, son travail de
+    #: fond garde le délai de grâce, borné par l'échéance du retrait)
+    HOST_SAFE_POINT = "point sûr"
+
+    def yield_to_host(self, reason: str) -> None:
+        """L159f : l'échéance du retrait est atteinte, ou l'hôte s'arrête —
+        le tour en cours s'arrête, groupe compris (grâce brève) ; sa consigne
+        repartira en attente, la session est gardée. Appelé par le fil de la
+        porte : l'arrêt part dans son propre fil."""
+        self.host_yield = reason
+        self.wake.set()
+        threading.Thread(target=self.stop_group_now, args=("l'hôte se retire : %s" % reason,),
+                         kwargs={"grace": 1.0}, daemon=True,
+                         name="%s-retrait" % self.name).start()
+
+    def _leave_for_host(self) -> None:
+        """L159f : porte d'hôte fermée — plus aucun tour ici. Session écrite,
+        consigne éventuelle remise en attente, statut dit ; le bail est rendu
+        par `run()` en sortant, et l'agent sera réclamé de nouveau au retour
+        de l'hôte (ici, ou ailleurs). Écritures au mieux : en échec, le bail
+        échoit seul."""
+        gate = getattr(self.runner, "host_gate", None)
+        etat = gate.current if gate is not None else None
+        texte = "hôte indisponible (%s, %s) : reprise au retour de l'hôte" % (
+            etat.state if etat else "?", etat.reason if etat else "?")
+        log_async("[%s] l'hôte se retire : bail rendu (%s)" % (self.name, texte))
+        if self.lease_lost.is_set():
+            return
+        try:
+            if self._session_en_attente is not None:
+                self._enregistre_session()
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            row = registry.get(self.db, self.name) or {}
+            if row.get("status") in ("running", "idle", "queued"):
+                registry.set_status(self.db, self.name,
+                                    "queued" if row.get("pending_prompt") else "idle",
+                                    status_text=texte)
+        except db_mod.DbError as exc:
+            log_async("[%s] état de retrait non écrit (%s)" % (self.name, db_mod.explain(exc)))
+
     def request_restart(self) -> None:
         """`ameesh restart` (L26) : arrêter le tour en cours, puis appliquer."""
         self.restarting.set()
@@ -1057,6 +1100,8 @@ class AgentWorker(threading.Thread):
             return "preemption"
         if self.restarting.is_set():
             return "restart requested"
+        if self.host_yield is not None and self.host_yield != self.HOST_SAFE_POINT:
+            return "the host is withdrawing (%s)" % self.host_yield
         if self._power_texte:
             return "critical battery"
         if self.runner.stop.is_set():
@@ -1075,7 +1120,9 @@ class AgentWorker(threading.Thread):
             return "context cap: %d tokens reread in the turn (cap %d)" % (
                 reread, plafond)
         duree_max = self.turn_max_seconds()
-        ecoule = (time.time() if now is None else now) - started
+        now = time.time() if now is None else now
+        # L159f : le temps gelé par la garde de l'hôte ne compte pas
+        ecoule = now - started - self.runner.gate_frozen_between(started, now)
         if duree_max > 0 and ecoule >= duree_max:
             return "maximum turn duration: %ds (cap %ds)" % (int(ecoule), duree_max)
         return None
@@ -2462,6 +2509,8 @@ class AgentWorker(threading.Thread):
             self.agent = agent = registry.get(self.db, self.name) or agent
         if not self.budget_ok():
             return None  # garde de budget (L13) : aucun tour, état `paused` posé
+        if self.runner.gate_holds():
+            return None  # L159f : porte d'hôte fermée, rien n'est consommé
         # Contre-pression de l'hôte (L31, 0028) : au-dessus d'un seuil, aucun
         # NOUVEAU tour ne démarre ; la consigne en attente n'est pas consommée
         # (auditeur excepté ; orchestrateur sous pression non critique).
@@ -2709,6 +2758,11 @@ class AgentWorker(threading.Thread):
                 registry.set_status(self.db, self.name, "queued",
                                     status_text="runner shutting down: instruction put back "
                                                 "in the queue")
+            return False
+        if self.runner.gate_holds():
+            # L159f : l'hôte se retire entre le choix du tour et son lancement —
+            # une consigne déjà prise repart en attente, rien n'est lancé.
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             return False
         # Dernier contrôle avant de consommer quoi que ce soit (L31, 0028) :
         # couvre les tours ouverts directement (résumé de rotation de compte).
@@ -3081,6 +3135,7 @@ class AgentWorker(threading.Thread):
         # que la course du tour précédent, et les autres déclencheurs (bail,
         # arrêt, préemption) sont revérifiés à la publication (verdict B5).
         self.stop_requested.clear()
+        self.host_yield = None
         if spec["kind"] == "urgent":
             # Ce tour sert justement le message prioritaire : le signal est consommé.
             self.preempting.clear()
@@ -3195,6 +3250,16 @@ class AgentWorker(threading.Thread):
                             self.summary_display.append(text)
                     if "final" in parsed:
                         self.last_final = str(parsed["final"] or "")
+                    if parsed.get("safe_point") and not clos and self.host_yield is None \
+                            and self.runner.gate_holds():
+                        # L159f : l'hôte se retire (tout tour, résumé compris) —
+                        # point sûr, l'appel d'outil en cours est fini et son
+                        # résultat est dans la session. Le harnais SEUL, comme
+                        # une clôture : le travail de fond garde sa grâce,
+                        # bornée par l'échéance du retrait.
+                        self.host_yield = self.HOST_SAFE_POINT
+                        self.stop_group_now("l'hôte se retire : tour arrêté au point sûr",
+                                            group=False)
                     if plafonne:
                         # L217b : le flux se lit jusqu'au bout, même après la
                         # clôture — un appel déjà en tampon compte encore.
@@ -3219,7 +3284,8 @@ class AgentWorker(threading.Thread):
                             if cloture:
                                 log_async("[%s] %s: turn closed at the next safe point"
                                           % (self.name, cloture))
-                        if cloture and not clos and parsed.get("safe_point"):
+                        if cloture and not clos and parsed.get("safe_point") \
+                                and self.host_yield is None:
                             # Point sûr : l'appel d'outil en cours est fini et son
                             # résultat est dans la session. Aucun harnais mené
                             # n'offre d'interruption propre en mode non
@@ -3326,6 +3392,25 @@ class AgentWorker(threading.Thread):
             self._avec_reprise("end-of-turn status", registry.set_status,
                                self.db, self.name, "queued",
                                status_text="turn stopped: restart requested")
+            return False
+        if self.host_yield is not None and not preempte:
+            # L159f : l'hôte se retire — comme une préemption : la consigne
+            # repart en attente, la session est gardée ; le worker rend son
+            # bail au passage suivant (`_leave_for_host`).
+            raison = self.host_yield
+            if self._session_en_attente is not None:
+                self._avec_reprise("session du tour", self._enregistre_session)
+            self._avec_reprise("consigne remise en attente", registry.restore_prompt,
+                               self.db, self.name, self.runner.runner_id, self.epoch)
+            self._avec_reprise("statut de fin de tour", registry.set_status,
+                               self.db, self.name, "queued",
+                               status_text="tour interrompu : l'hôte se retire (%s)" % raison)
+            self._fil_note(
+                "Tour interrompu après %ds : l'hôte se retire (%s). La consigne repart "
+                "en attente ; le travail reprendra dans la même session au retour de "
+                "l'hôte." % (int(duration), raison),
+                meta={"action": "retrait-hote", "raison": raison,
+                      "tour_s": round(duration, 1)})
             return False
         if preempte:
             # Message prioritaire reçu pendant le tour (0018) : la consigne
@@ -3533,6 +3618,10 @@ class AgentWorker(threading.Thread):
             while not self.stopping.is_set() and not self.runner.stop.is_set():
                 if self.runner.draining.is_set():
                     break  # drainage : le tour d'avant est fini, aucun autre ne part
+                if self.runner.gate_holds():
+                    # L159f : porte d'hôte fermée — le bail est rendu (finally)
+                    self._leave_for_host()
+                    break
                 if not self.renew():
                     break
                 # L72 : une base injoignable n'arrête plus le worker (son fil
@@ -3580,6 +3669,8 @@ class AgentWorker(threading.Thread):
                     if self.fast_failures >= self.runner.max_fast_failures:
                         self.stop_after_failures()
                         break
+                if self.host_yield is not None or self.runner.gate_holds():
+                    continue  # L159f : retrait de l'hôte, pas un échec de tour
                 if self.stopping.is_set() or self.runner.draining.is_set():
                     break  # arrêt demandé (L106 : batterie ; drainage) — bail rendu sans attendre
                 # Un message non remis ou un harnais en échec ne doit pas
@@ -3725,6 +3816,83 @@ class Runner:
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
         self._delegation_error: str | None = None
         self._delegation_dry_seen: set = set()
+        #: L159f : porte d'hôte — None sans porte (hôte classique : rien ne
+        #: change). Celle de la configuration dès maintenant ; celle d'un hôte
+        #: prêteur (fiche Host avec `policy.lend`) au premier `canon sync`,
+        #: avant lequel le mode service ne réclame rien (`_gate_settled`).
+        self.host_gate = None
+        self._host_gate_key: tuple | None = None
+        self._host_gate_lock = threading.Lock()
+        self._gate_running = False
+        self._gate_settled = threading.Event()
+        if once or not cfg.canon:
+            self._gate_settled.set()
+        self._sync_host_gate(False, None)
+
+    # -- porte d'hôte (L159f) ------------------------------------------------
+    def _sync_host_gate(self, lending: bool, offer: dict | None) -> None:
+        """Met la porte d'hôte en accord avec la configuration et la fiche
+        Host (prêteur ou non, `drain_seconds` de l'offre) ; ne lève jamais."""
+        from . import host_gate as host_gate_mod
+        try:
+            kind = host_gate_mod.gate_kind(self.cfg, lending)
+            key = (kind, bool(lending), host_gate_mod.drain_seconds(self.cfg, offer)) \
+                if kind else None
+        except ValueError as exc:
+            log_async("porte d'hôte : %s" % exc)
+            return
+        with self._host_gate_lock:
+            if key == self._host_gate_key:
+                return
+            old, self.host_gate = self.host_gate, None
+            if key is not None:
+                self.host_gate = host_gate_mod.controller_from_config(
+                    self, lending=lending, offer=offer, log=log_async)
+            self._host_gate_key = key
+            new, running = self.host_gate, self._gate_running
+        if old is not None:
+            old.stop()
+        if new is None:
+            if old is not None:
+                log_async("porte d'hôte retirée (hôte %s)" % self.host)
+            return
+        log_async("porte d'hôte %s : %s (hôte %s, retrait en %ds, porte illisible = %s) : %s"
+                  % (key[0], new.gate.path, "prêteur" if lending else "classique",
+                     int(new.drain_s), new.gate.fallback, new.describe()))
+        if lending and str(getattr(self.cfg, "host_gate", "") or "") == "none":
+            log_async("porte d'hôte : `host_gate: none` sur un hôte prêteur")
+        if running:
+            new.start()
+
+    def _start_host_gate(self) -> None:
+        with self._host_gate_lock:
+            self._gate_running = True
+            gate = self.host_gate
+        if gate is not None:
+            gate.start()
+
+    def gate_holds(self) -> bool:
+        """L159f : porte d'hôte fermée (`draining` ou `stopped`) — aucune
+        réclamation, aucun nouveau tour. Toujours faux sans porte."""
+        gate = self.host_gate
+        return gate is not None and gate.holds_turns()
+
+    def gate_frozen_between(self, start: float, end: float) -> float:
+        """L159f : secondes de `[start, end]` gelées par la garde de l'hôte."""
+        gate = self.host_gate
+        return gate.frozen_between(start, end) if gate is not None else 0.0
+
+    def _gate_admits(self, agent: dict) -> bool:
+        """L159f : `caps.max_concurrent` de la porte — agents à la fois sur
+        l'hôte, éphémères compris (la garde compte des processus)."""
+        gate = self.host_gate
+        cap = gate.max_concurrent() if gate is not None else None
+        if cap is None:
+            return True
+        with self.lock:
+            running = sum(1 for name, worker in self.workers.items()
+                          if name != (agent or {}).get("name") and worker.is_alive())
+        return running < cap
 
     # -- réclamation -------------------------------------------------------
     def expire_delegations_once(self) -> list[dict]:
@@ -3776,10 +3944,16 @@ class Runner:
             return  # L106 : arrêt sur batterie — aucun bail repris avant le secteur
         if self.draining.is_set():
             return  # drainage : aucun nouvel agent, aucun nouveau tour
+        if not self._gate_settled.is_set():
+            return  # L159f : hôte prêteur ou non, su au premier `canon sync`
+        if self.gate_holds():
+            return  # L159f : porte d'hôte fermée — aucune réclamation
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
                     continue
+            if self.host_gate is not None and not self._gate_admits(agent):
+                continue  # L159f : `caps.max_concurrent` de la porte
             if not self.once and not self.admits_new_worker(agent):
                 # L43 (0031) : hôte plein (max_agents physique) — l'agent reste
                 # réclamable, il le sera quand une place se libère
@@ -4017,6 +4191,12 @@ class Runner:
         # Travail de fond encore en délai de grâce : le nettoyage habituel,
         # tout de suite (rien ne survit à l'exécuteur qui le suit).
         self.background.stop_all("runner shutdown")
+        gate = getattr(self, "host_gate", None)
+        if gate is not None:
+            try:
+                gate.tick()  # L159f : dernier acquittement, plus aucun bail
+            finally:
+                gate.stop()
         # L'écouteur (fil démon) ne doit plus écrire quand l'interpréteur se
         # finalise : sa connexion est fermée ci-dessus, on l'attend, borné.
         if self.listener_thread is not None:
@@ -4119,6 +4299,8 @@ class Runner:
     def _canon_sync_loop(self) -> None:
         while not self.stop.is_set():
             self.canon_sync_once()
+            # L159f : réussi ou non, la porte d'hôte est fixée pour ce passage
+            self._gate_settled.set()
             if self.stop.wait(self.canon_sync_interval):
                 return
 
@@ -4132,6 +4314,7 @@ class Runner:
         if not self.cfg.canon or self.canon_sync_interval <= 0:
             if self.cfg.canon:
                 self.canon_sync_once()  # seulement au démarrage
+            self._gate_settled.set()
             return
         if self.once:
             self.canon_sync_once()
@@ -4211,7 +4394,9 @@ class Runner:
         db = None
         try:
             db = db_mod.connect(self.cfg)
-            return resources_mod.collect(self.cfg, db, policy=self.housekeeping_policy())
+            gate = self.host_gate
+            return resources_mod.collect(self.cfg, db, policy=self.housekeeping_policy(),
+                                         gate=gate.snapshot() if gate is not None else None)
         except Exception as exc:  # jamais fatal pour l'exécuteur
             log_async("resources: reading failed (%s)" % type(exc).__name__)
             return None
@@ -4492,6 +4677,12 @@ class Runner:
                     par_hote[h.title] = resources_mod.host_limits(canons, h.title)["limits"]
         self._host_max_agents = mine["max_agents"]
         self._host_limits_origin = mine["origin"]
+        # L159f : un hôte prêteur (offre `policy.lend`) a une porte fermée
+        # par défaut
+        sync_gate = getattr(self, "_sync_host_gate", None)
+        if sync_gate is not None:
+            offer = limits.get("lend")
+            sync_gate(bool(offer), offer)
         from . import menage as menage_mod
         self._housekeeping = menage_mod.effective(canons, self.host)
         lock = getattr(self, "_pressure_lock", None)
@@ -4950,6 +5141,8 @@ class Runner:
             "batch %ds (L125)" % (self.host, self.runner_id, self.db.name,
                                      self.cfg.schema, int(self.mail_batch)))
         self.start_canon_sync()
+        if not self.once:
+            self._start_host_gate()  # L159f : suivi de la porte et acquittements
         self.start_balance_poll()
         self.start_resource_poll()
         self.start_version_poll()
