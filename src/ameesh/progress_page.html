@@ -2,7 +2,8 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Vue de référence d'ameesh progress (L24, décision 0024 ; feuille de route L96) : page statique
      autonome, sans ressource réseau. Les données (schéma ameesh-progress/1)
-     sont embarquées plus bas par `ameesh progress --html`. -->
+     sont embarquées plus bas par `ameesh progress --html` ; servie par
+     `ameesh progress --serve` (L304), le bouton Refresh recharge la page. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -45,6 +46,11 @@ main { max-width: 980px; margin: 0 auto; padding: 16px; }
 h1 { font-size: 1.25rem; margin: 0 0 2px; }
 h2 { font-size: 1rem; margin: 0 0 10px; letter-spacing: .02em; }
 .sub { color: var(--ink-2); font-size: .85rem; }
+.refresh { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0 2px;
+  color: var(--ink-2); font-size: .8rem; }
+.refresh button { font: inherit; color: var(--ink); background: var(--surface);
+  border: 1px solid var(--axis); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+.refresh button:disabled { color: var(--muted); cursor: not-allowed; }
 section { background: var(--surface); border: 1px solid var(--grid); border-radius: 10px;
           padding: 14px; margin-top: 14px; }
 .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: .8rem; color: var(--ink-2);
@@ -151,6 +157,11 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
 <main>
   <h1 id="title">Progress</h1>
   <div class="sub" id="when"></div>
+  <div class="refresh">
+    <button type="button" id="refresh">Refresh</button>
+    <label><input type="checkbox" id="auto-refresh"> every 60 s</label>
+    <span id="asof"></span>
+  </div>
 
   <section aria-labelledby="h-projects" id="projects-section">
     <h2 id="h-projects">Projects</h2>
@@ -226,7 +237,72 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
 <script>
 "use strict";
 (function () {
-  var D = JSON.parse(document.getElementById("data").textContent || "null");
+  // L304 : "served" sous `ameesh progress --serve` : la page arrive sans
+  // données et lit /api/progress.json avec le jeton (en-tête Authorization) ;
+  // "static" pour un fichier --html : données embarquées, rien à relire
+  var MODE = /*__AMEESH_PROGRESS_MODE__*/"static";
+  var API = "/api/progress.json", TOKEN_KEY = "ameesh-progress-token";
+  var btn = document.getElementById("refresh"), auto = document.getElementById("auto-refresh");
+  var asof = document.getElementById("asof");
+  // le fragment porte le jeton (#t=…) et le rafraîchissement auto (#auto)
+  function hashParams() {
+    var out = {};
+    location.hash.replace(/^#/, "").split("&").forEach(function (kv) {
+      if (!kv) return;
+      var i = kv.indexOf("=");
+      out[i < 0 ? kv : kv.slice(0, i)] = i < 0 ? "" : decodeURIComponent(kv.slice(i + 1));
+    });
+    return out;
+  }
+  function setHash(h) {
+    var parts = Object.keys(h).map(function (k) { return h[k] === "" ? k : k + "=" + encodeURIComponent(h[k]); });
+    // ?project= reste : seul le fragment change
+    history.replaceState(null, "", location.pathname + location.search + (parts.length ? "#" + parts.join("&") : ""));
+  }
+  function store(v) {
+    try {
+      if (v === undefined) return window.sessionStorage.getItem(TOKEN_KEY) || "";
+      window.sessionStorage.setItem(TOKEN_KEY, v);
+    } catch (e) { /* sans stockage : le jeton reste le temps de la page */ }
+    return "";
+  }
+  if (MODE !== "served") {
+    btn.disabled = true; auto.disabled = true;
+    btn.title = "open with ameesh progress --serve to refresh";
+    render(JSON.parse(document.getElementById("data").textContent || "null"), " · open with --serve to refresh");
+    return;
+  }
+  // le jeton quitte l'URL (historique, copie de lien) pour le sessionStorage,
+  // propre à l'origine, donc au port : un autre serveur local ne le lit pas
+  var h = hashParams(), token = h.t || store();
+  if (h.t) { store(h.t); delete h.t; setHash(h); }
+  auto.checked = "auto" in h;
+  btn.addEventListener("click", function () { location.reload(); });
+  auto.addEventListener("change", function () {
+    var x = hashParams();
+    if (auto.checked) x.auto = ""; else delete x.auto;
+    setHash(x);
+  });
+  setInterval(function () { if (auto.checked && !document.hidden) location.reload(); }, 60000);
+  if (!token) { asof.textContent = "token missing: open the URL printed by ameesh progress --serve"; return; }
+  var project = new URLSearchParams(location.search).get("project");
+  asof.textContent = "loading…";
+  fetch(API + (project !== null ? "?project=" + encodeURIComponent(project) : ""),
+        {credentials: "omit", cache: "no-store",
+         headers: {"Accept": "application/json", "Authorization": "Bearer " + token}})
+    .then(function (r) {
+      if (r.status === 401) throw new Error("token refused: open the URL printed at start (a restart draws a new one)");
+      if (!r.ok) return r.text().then(function (t) { throw new Error("HTTP " + r.status + ": " + t.trim()); });
+      return r.json();
+    })
+    .then(function (d) { render(d, ""); }, function (e) { asof.textContent = e.message; });
+
+  function render(D, note) {
+  if (D && D.generated_ts) {
+    var g = new Date(D.generated_ts * 1000);
+    asof.textContent = "data as of " +
+      (g.getHours() < 10 ? "0" : "") + g.getHours() + ":" + (g.getMinutes() < 10 ? "0" : "") + g.getMinutes() + note;
+  }
   if (!D || D.schema !== "ameesh-progress/1") {
     document.getElementById("when").textContent = "missing data or unknown schema";
     return;
@@ -267,7 +343,8 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
   document.getElementById("when").textContent =
     "snapshot " + hm(D.generated_ts) + " · window " + dur(span) + (D.host ? " · host " + D.host : "");
   document.getElementById("foot").textContent =
-    D.schema + " · generated " + D.generated_at + " · static page, no network resource";
+    D.schema + " · generated " + D.generated_at +
+    (MODE === "served" ? " · served locally, read-only" : " · static page, no network resource");
 
   // Axe : repères à l'heure locale ronde (ou au jour au-delà de 48 h), assez
   // espacés pour la largeur réelle (téléphone compris) ; une étiquette porte
@@ -735,6 +812,7 @@ footer { color: var(--muted); font-size: .75rem; margin: 16px 0 8px; }
 
   var miss = document.getElementById("missing");
   (D.missing || []).forEach(function (t) { miss.appendChild(el("li", null, t)); });
+  }
 })();
 </script>
 </body>
