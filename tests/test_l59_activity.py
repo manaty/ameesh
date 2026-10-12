@@ -76,7 +76,9 @@ class ActivityDatabaseTest(PgTestCase):
             self.assertEqual(activity.main(["unknown"]), 2)
 
     def test_cli_verifies_live_lease_and_refuses_other_personas(self):
-        mail.send(self.db, "coord", "worker", "api_key=TEST_PRIVATE_VALUE hello")
+        mail.send(self.db, "coord", "worker", "Authorization: Basic dXNlcjpURVNUX1BSSVZBVEVfVkFMVUU=")
+        self.db.execute("UPDATE agent_registry SET last_error = %s WHERE name = 'worker'",
+                        ("Authorization: Basic dXNlcjpURVNUX1BSSVZBVEVfVkFMVUU=",))
         self.db.execute("UPDATE agent_registry SET lease_owner = 'test-runner', lease_epoch = 7, "
                         "lease_expires_at = now() + interval '5 minutes' WHERE name = 'worker'")
         env = self.env(AGENT_MAIL_NAME="worker", AMEESH_RUNNER_ID="test-runner",
@@ -85,6 +87,7 @@ class ActivityDatabaseTest(PgTestCase):
             allowed = self.mesh("activity", "worker", *suffix, env=env)
             self.assertEqual(allowed.returncode, 0, allowed.stderr)
             self.assertNotIn("TEST_PRIVATE_VALUE", allowed.stdout)
+            self.assertNotIn("dXNlcj", allowed.stdout)
             self.assertIn("[redacted]", allowed.stdout)
             denied = self.mesh("activity", "coord", *suffix, env=env)
             self.assertEqual(denied.returncode, 2)
@@ -144,11 +147,15 @@ class OfflineActivityTest(unittest.TestCase):
     def test_secret_redaction_precedes_excerpt_and_covers_json_present(self):
         secrets = ("api_key=TEST_PRIVATE_VALUE", '"token": "PRIVATE VALUE"',
                    "password='PRIVATE VALUE'", "Authorization: Bearer PRIVATE_VALUE",
+                   "Authorization: Basic dXNlcjpURVNUX1BSSVZBVEVfVkFMVUU=",
+                   'Authorization: Digest username="PRIVATE", response="PRIVATE"',
+                   '"Authorization": "Basic dXNlcjpURVNUX1BSSVZBVEVfVkFMVUU="',
                    "sk-" + "a" * 30, "-----BEGIN PRIVATE KEY-----\nPRIVATE VALUE\n-----END PRIVATE KEY-----")
         for secret in secrets:
             with self.subTest(secret=secret):
                 self.assertIn("[redacted", activity._excerpt(secret, 160))
                 self.assertNotIn("PRIVATE", activity._excerpt(secret, 160))
+                self.assertNotIn("dXNlcj", activity._excerpt(secret, 160))
         self.assertEqual(activity._excerpt("api_key=" + "x" * 500), "api_key=[redacted]")
         binding = identity.Binding(name="worker", source="session", ok=True)
         for suffix in ([], ["--json"]):
@@ -156,11 +163,12 @@ class OfflineActivityTest(unittest.TestCase):
                     mock.patch.object(identity, "resolve_binding", return_value=binding), \
                     mock.patch.object(activity, "present", return_value={
                         "name": "worker", "status_text": "api_key=TEST_PRIVATE_VALUE",
-                        "last_error": "token=TEST_PRIVATE_VALUE"}), \
+                        "last_error": "Authorization: Basic dXNlcjpURVNUX1BSSVZBVEVfVkFMVUU="}), \
                     mock.patch.object(activity, "events", return_value=[]), \
                     redirect_stdout(io.StringIO()) as out:
                 self.assertEqual(activity.main(["worker", *suffix]), 0)
             self.assertNotIn("TEST_PRIVATE_VALUE", out.getvalue())
+            self.assertNotIn("dXNlcj", out.getvalue())
             self.assertIn("[redacted]", out.getvalue())
 
     def test_recent_delegation_resolution_and_order(self):

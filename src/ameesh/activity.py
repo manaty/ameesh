@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 DEFAULT_SINCE = "24h"
 DEFAULT_LIMIT = 200
 _DURATION = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhd])$")
+_AUTHORIZATION = re.compile(
+    r"(?i)(\bauthorization[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\r\n]+)")
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)(\b[\w-]*(?:pass(?:word)?|secret|token|api[_-]?key|authorization|credential)"
     r"[\w-]*[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}]+)")
@@ -59,6 +61,7 @@ def _timestamp(value) -> float | None:
 
 def redact(text: str) -> str:
     text = _PRIVATE_KEY.sub("[redacted private key]", str(text))
+    text = _AUTHORIZATION.sub(lambda match: match[1] + "[redacted]", text)
     text = _BEARER.sub("Bearer [redacted]", text)
     text = _SECRET_ASSIGNMENT.sub(lambda match: match[1] + "[redacted]", text)
     return _SECRET_TOKEN.sub("[redacted]", text)
