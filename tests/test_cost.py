@@ -501,10 +501,12 @@ class TurnAccountingTest(Sandbox, PgTestCase):
         # seuls les tarifs valides comptent : le majorant est celui des défauts et de `deepseek-ok`
         self.assertEqual(cost.max_price_of(prix, "deepseek"), [2.0, 1.0, 3.0])
 
-    def test_famille_sans_tarif_connu_prend_le_pire_de_tout_le_bareme(self):
+    def test_famille_sans_tarif_connu_n_a_pas_de_majorant(self):
+        """L225 : le pire de tout le barème n'est pas un majorant sûr d'une famille
+        qui n'y figure pas (un tour opus aux tarifs codex) : None."""
         prix = {"gpt-x": [3, 1, 30], "default-claude": [0.1, 0.1, 0.1], "default-deepseek": [0.2, 0.2, 0.2]}
-        self.assertEqual(cost.max_price_of(prix, "claude"), [3.0, 1.0, 30.0])
-        self.assertEqual(cost.max_price_of({"default-claude": [1, 2, 3]}, "claude"), [1, 2, 3])
+        self.assertIsNone(cost.max_price_of(prix, "claude"))
+        self.assertIsNone(cost.max_price_of({"default-claude": [1, 2, 3]}, "claude"))
 
     def test_bareme_surchargeable_par_l_environnement(self):
         # La variable d'environnement évite d'avoir à connaître le chemin par
