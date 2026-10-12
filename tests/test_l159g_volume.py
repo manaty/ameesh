@@ -68,7 +68,7 @@ class VolumeScriptTest(unittest.TestCase):
         # STUB_FAIL=<tool> makes that one fail, its output empty
         fail = '[ "$STUB_FAIL" != %s ] || { echo "%s: I/O error" >&2; exit 1; }\n'
         self.stub("lsblk", '#!/bin/sh\n' + fail % ("lsblk", "lsblk")
-                  + 'case "$*" in *TYPE*) echo disk ;; *MAJ:MIN*) echo " 8:16" ;;\n'
+                  + 'case "$*" in *TYPE*) echo disk ;; *MAJ:MIN*) printf "%s\\n" "$STUB_MAJMIN" ;;\n'
                   '  *) printf "%s" "$STUB_LSBLK" ;; esac\n')
         self.stub("blockdev", '#!/bin/sh\n' + fail % ("blockdev", "blockdev") + 'echo "$STUB_SIZE"\n')
         # systemctl list-units: the active guest runners, STUB_RUNNERS
@@ -127,7 +127,7 @@ class VolumeScriptTest(unittest.TestCase):
                    STUB_LSBLK="sdb\n", STUB_SIZE=str(40 * 10 ** 9), STUB_TYPE="",
                    STUB_LABEL="", STUB_UUID="", STUB_WIPEFS="", STUB_WIPEFS_RC="0",
                    STUB_BLKID_RC="", STUB_SRC="", STUB_MUUID="", STUB_MLABEL="",
-                   STUB_LABELDEVS=self.disk + "\n", STUB_FAIL="", STUB_RUNNERS="", STUB_ELSEWHERE="",
+                   STUB_LABELDEVS=self.disk + "\n", STUB_FAIL="", STUB_RUNNERS="", STUB_ELSEWHERE="", STUB_MAJMIN="  8:16 ",
                    VOLUME_TEST_DIR=self.root)
         env.update({"STUB_" + k.upper(): v for k, v in disk.items()})
         if args[0] in ("create", "detach") and project and "--project-id" not in args:
@@ -530,6 +530,36 @@ class VolumeScriptTest(unittest.TestCase):
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("lsblk failed: refused", p.stderr)
         self.assertEqual(self.cmds(p), [])
+
+    def test_a_findmnt_row_out_of_shape_refuses(self):
+        # codex #436 r5 P2: a row that is not MAJ:MIN SOURCE TARGET is never
+        # read as "mounted nowhere": neither adopted nor formatted
+        self.label_line()
+        self.udev("u")
+        ours = {"type": "ext4", "label": "ameesh-guest", "uuid": "u"}
+        for row in ("garbage\n", "/dev/mapper/volume /srv/other\n", "8:16 /dev/mapper/volume\n",
+                    "8:16 /dev/mapper/volume /srv/other extra\n", "8:x /dev/sdb /srv/other\n"):
+            for disk in (ours, {}):
+                p = self.run_script("mount", "--volume-id", VOL, **disk, elsewhere=row)
+                self.assertNotEqual(p.returncode, 0, (row, disk))
+                self.assertIn("findmnt: a row not MAJ:MIN SOURCE TARGET: refused", p.stderr)
+                self.assertEqual(self.cmds(p), [], (row, disk))
+                self.assertNotIn("--- " + self.fstab, p.stdout)
+        # an escaped blank (findmnt -r) is one field: read
+        p = self.run_script("mount", "--volume-id", VOL, **ours,
+                            elsewhere="8:32 /dev/sdc /srv/my\\x20data\n")
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_an_lsblk_number_out_of_shape_refuses(self):
+        # codex #436 r5 P2: one line, a number alone; "8:\n16" is not 8:16
+        self.label_line()
+        self.udev("u")
+        ours = {"type": "ext4", "label": "ameesh-guest", "uuid": "u"}
+        for bad in ("8:\n16", "8:16\n8:16", "8 :16", "", "8:16x"):
+            p = self.run_script("mount", "--volume-id", VOL, **ours, majmin=bad)
+            self.assertNotEqual(p.returncode, 0, bad)
+            self.assertIn("no device number from lsblk", p.stderr)
+            self.assertEqual(self.cmds(p), [], bad)
 
     def test_check_after_mount_reads_the_new_fstab(self):
         # codex #436 r3 P2: the line just added is what check reads next,

@@ -289,13 +289,19 @@ mount_of() {
 # nowhere (the whole table read, / always in it). Compared by the device's
 # number (MAJ:MIN), never by the source's name: an alias (/dev/mapper/…,
 # /dev/disk/by-uuid/…) or a bind mount is the same device (codex #436 r4)
+# Both outputs parsed strictly (codex #436 r5): lsblk one line, a number
+# alone (blanks around it trimmed); findmnt each row "MAJ:MIN SOURCE TARGET"
+# (-r escapes the blanks within a field), or nothing is read at all
 dev_mounts() {
   local all mm
   mm=$(lsblk -dno MAJ:MIN "$1") || die "$1: lsblk failed: refused"
-  mm=${mm//[[:space:]]/}
+  mm=${mm#"${mm%%[![:blank:]]*}"}; mm=${mm%"${mm##*[![:blank:]]}"}
   [[ "$mm" =~ ^[0-9]+:[0-9]+$ ]] || die "$1: no device number from lsblk ($mm): refused"
   all=$(findmnt -rn -o MAJ:MIN,SOURCE,TARGET) && [ -n "$all" ] || die "findmnt failed: refused"
-  printf '%s\n' "$all" | awk -v d="$mm" '$1 == d { print $3 }'
+  printf '%s\n' "$all" | awk -v d="$mm" '
+    NF != 3 || $1 !~ /^[0-9]+:[0-9]+$/ { bad = 1; exit }
+    $1 == d { print $3 }
+    END { exit bad }' || die "findmnt: a row not MAJ:MIN SOURCE TARGET: refused"
 }
 # dir_state DIR: absent, empty or full; not a directory, or a listing that
 # fails (an I/O error, a permission): refused
