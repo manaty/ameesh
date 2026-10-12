@@ -291,15 +291,17 @@ mount_of() {
 # /dev/disk/by-uuid/…) or a bind mount is the same device (codex #436 r4)
 # Both outputs parsed strictly (codex #436 r5): lsblk one line, a number
 # alone (blanks around it trimmed); findmnt each row "MAJ:MIN SOURCE TARGET"
-# (-r escapes the blanks within a field), or nothing is read at all
+# (-r escapes the blanks within a field), or nothing is read at all. A
+# number is written without leading zeros (as the tools print it), so that
+# two numbers are equal as strings only when they are the same (r6)
 dev_mounts() {
   local all mm
   mm=$(lsblk -dno MAJ:MIN "$1") || die "$1: lsblk failed: refused"
   mm=${mm#"${mm%%[![:blank:]]*}"}; mm=${mm%"${mm##*[![:blank:]]}"}
-  [[ "$mm" =~ ^[0-9]+:[0-9]+$ ]] || die "$1: no device number from lsblk ($mm): refused"
+  [[ "$mm" =~ ^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$ ]] || die "$1: no device number from lsblk ($mm): refused"
   all=$(findmnt -rn -o MAJ:MIN,SOURCE,TARGET) && [ -n "$all" ] || die "findmnt failed: refused"
   printf '%s\n' "$all" | awk -v d="$mm" '
-    NF != 3 || $1 !~ /^[0-9]+:[0-9]+$/ { bad = 1; exit }
+    NF != 3 || $1 !~ /^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$/ { bad = 1; exit }
     $1 == d { print $3 }
     END { exit bad }' || die "findmnt: a row not MAJ:MIN SOURCE TARGET: refused"
 }

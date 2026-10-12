@@ -550,12 +550,34 @@ class VolumeScriptTest(unittest.TestCase):
                             elsewhere="8:32 /dev/sdc /srv/my\\x20data\n")
         self.assertEqual(p.returncode, 0, p.stderr)
 
+    def test_a_number_with_leading_zeros_refuses(self):
+        # codex #436 r6 P2: "08:016" and "8:16" are one device; compared as
+        # strings they would not be, so a leading zero refuses, either side
+        self.label_line()
+        self.udev("u")
+        ours = {"type": "ext4", "label": "ameesh-guest", "uuid": "u"}
+        for majmin, row, why in (("08:016", "8:16 /dev/mapper/volume /srv/other\n", "lsblk"),
+                                 ("8:16", "08:016 /dev/mapper/volume /srv/other\n", "findmnt"),
+                                 ("8:16", "8:016 /dev/mapper/volume /srv/other\n", "findmnt"),
+                                 ("8:16", "0:00 tmpfs /run\n", "findmnt")):
+            for disk in (ours, {}):
+                p = self.run_script("mount", "--volume-id", VOL, **disk, majmin=majmin,
+                                    elsewhere=row)
+                self.assertNotEqual(p.returncode, 0, (majmin, row, disk))
+                self.assertIn(why, p.stderr)
+                self.assertIn("refused", p.stderr)
+                self.assertEqual(self.cmds(p), [], (majmin, row, disk))
+                self.assertNotIn("--- " + self.fstab, p.stdout)
+        # 0:… (a virtual filesystem) is a number of its own: read
+        p = self.run_script("mount", "--volume-id", VOL, **ours, elsewhere="0:27 tmpfs /run\n")
+        self.assertEqual(p.returncode, 0, p.stderr)
+
     def test_an_lsblk_number_out_of_shape_refuses(self):
         # codex #436 r5 P2: one line, a number alone; "8:\n16" is not 8:16
         self.label_line()
         self.udev("u")
         ours = {"type": "ext4", "label": "ameesh-guest", "uuid": "u"}
-        for bad in ("8:\n16", "8:16\n8:16", "8 :16", "", "8:16x"):
+        for bad in ("8:\n16", "8:16\n8:16", "8 :16", "", "8:16x", "08:16", "8:016", "08:016"):
             p = self.run_script("mount", "--volume-id", VOL, **ours, majmin=bad)
             self.assertNotEqual(p.returncode, 0, bad)
             self.assertIn("no device number from lsblk", p.stderr)
