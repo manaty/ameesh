@@ -229,7 +229,8 @@ class AllRuntimesTest(unittest.TestCase):
             engines, silent = containers.all_runtimes(self.cfg, run=run)
         self.assertEqual(silent, [])
         self.assertEqual([e._argv("ps") for e in engines],
-                         [[docker, "--context", "default", "ps"],
+                         [[docker, "ps"],               # DOCKER_HOST, codex r2
+                          [docker, "--context", "default", "ps"],
                           [docker, "--context", "remote", "ps"],
                           [podman, "ps"],
                           [podman, "--connection", "machine", "ps"]])
@@ -240,7 +241,7 @@ class AllRuntimesTest(unittest.TestCase):
         run, _ = self._run({"docker": ["default"]})
         with mock.patch.dict(os.environ, {"PATH": self.dir}):
             engines, silent = containers.all_runtimes(self.cfg, run=run)
-        self.assertEqual(len(engines), 1)
+        self.assertEqual([e.context for e in engines], ["", "default"])
         self.assertEqual(silent, [podman])
 
     def test_shims_skipped_disabled_engine_none(self):
@@ -253,6 +254,6 @@ class AllRuntimesTest(unittest.TestCase):
         run, _ = self._run({"docker": ["default"]})
         with mock.patch.dict(os.environ, {"PATH": shims + os.pathsep + self.dir}):
             engines, _ = containers.all_runtimes(self.cfg, run=run)
-            self.assertEqual([e.binary for e in engines], [docker])
+            self.assertEqual({e.binary for e in engines}, {docker})
             self.cfg.container_runtime = "none"
             self.assertEqual(containers.all_runtimes(self.cfg, run=run), ([], []))

@@ -239,7 +239,8 @@ def all_runtimes(cfg, run=None) -> tuple[list[Runtime], list[str]]:
     chaque moteur de CANDIDATES présent (les scripts d'étiquetage d'un tour
     les couvrent tous) et celui que nomme la configuration, avec chacun de
     leurs contextes (docker) ou connexions (podman). Rend (moteurs, muets) :
-    `muets`, les moteurs qui n'ont pas listé leurs contextes. Aucun si le
+    `muets`, les moteurs qui n'ont pas listé leurs contextes. Le point
+    d'accès courant de chaque moteur est toujours interrogé (codex r2). Aucun si le
     moteur est désactivé (`none` : aucune étiquette n'est posée)."""
     import os
     configured = runtime_binary(getattr(cfg, "container_runtime", "") or "")
@@ -259,8 +260,9 @@ def all_runtimes(cfg, run=None) -> tuple[list[Runtime], list[str]]:
         if contexts is None:
             silent.append(binary)
             continue
-        if _engine(binary) == "podman" or not contexts:
-            out.append(base)        # podman : le moteur local, puis ses connexions
+        # le point d'accès courant d'abord (DOCKER_HOST, CONTAINER_HOST hérités
+        # passent avant tout contexte nommé), puis chaque contexte ou connexion
+        out.append(base)
         out += [Runtime(binary=binary, timeout=timeout, run=base.run, context=c)
                 for c in contexts]
     return out, silent
