@@ -242,7 +242,13 @@ class PageBuilderTest(unittest.TestCase):
         self.assertIn('[["week", "week"], ["day", "day"]]', html)
         self.assertIn("delivered and abandoned (", html)
         # replié sauf s'il porte une tâche en retard (« en cours » ne suffit pas)
-        self.assertIn("group(g.key, title, count, sum, nLate > 0)", html)
+        self.assertIn("group(g.key, title, count, sum, nLate > 0 ||", html)
+        # r1 : une epic sans tâche garde son groupe ; fenêtre de jalon du min au
+        # max de ses dates, en jours calendaires (changement d'heure)
+        self.assertIn("if (hasTask[e.id]) return;", html)
+        self.assertIn("if (!shown.length && g.rows.length) return;", html)
+        self.assertIn("f = addDays(midnight(Math.min.apply(null, mts)), -1);", html)
+        self.assertIn("t = addDays(midnight(Math.max.apply(null, mts)), 2);", html)
         self.assertNotIn('x.state === "en_cours"; });', html)
 
     def test_onglets_et_fenetre(self):

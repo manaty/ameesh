@@ -42,11 +42,13 @@ ameesh progress … --no-gantt                         # without the roadmap (L9
 lots merged in the window, pending decisions, 24 h spend, next milestone
 with its progress bar, two warnings at most; then "Watch": overdue or
 urgent decisions, blocked and stale lots), **Gantt** (the roadmap: tasks
-grouped by epic, or by project when they have none, groups folded by
-default unless they hold a late task (in progress alone is not enough), with a summary bar and their open, delivered, blocked and late
+grouped by epic, or by project when they have none, an epic without any
+task keeping its own group, groups folded by default unless they hold a
+late task (in progress alone is not enough), with a summary bar and their open, delivered, blocked and late
 counts; delivered and abandoned tasks hidden unless ticked; week zoom fits
 the window on screen, day zoom gives each day a column and scrolls to
-today, `z=day` in the URL; a milestone can narrow the window; a task opens
+today, `z=day` in the URL; a milestone can narrow the window to the span of all its dates, planned
+and actual, in calendar days; a task opens
 its lot window),
 **Work items**, **Agents** (tables with a text filter and sortable columns;
 merged and closed lots, stopped agents hidden by default), **Budget** and

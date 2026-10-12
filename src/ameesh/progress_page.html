@@ -1061,13 +1061,21 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
               livree: "delivered", abandonnee: "abandoned"};
     var ENDED = {livree: true, abandonnee: true};
 
-    // fenêtre : celle de l'instantané, ou celle d'un jalon choisi
+    // jours calendaires (minuit local) et non 86 400 s : le 25/10 dure 25 h
+    function midnight(ts) { var d = new Date(ts * 1000); d.setHours(0, 0, 0, 0); return d.getTime() / 1000; }
+    function addDays(ts, n) { var d = new Date(ts * 1000); d.setDate(d.getDate() + n); return d.getTime() / 1000; }
+    // fenêtre : celle de l'instantané, ou celle d'un jalon choisi, du jour la
+    // plus tôt au jour le plus tard de toutes ses dates (prévues et réelles),
+    // un jour de marge de chaque côté
     var ms = (R.milestones || []).filter(function (m) { return m.id === G.ms; })[0] || null;
-    var f = R.window.from_ts, t = R.window.to_ts;
+    var f = midnight(R.window.from_ts), t = R.window.to_ts;
     if (ms) {
-      var ma = dayTs(ms.planned.start) || (ms.real && ms.real.debut) || f;
-      var mz = dayTs(ms.planned.delivery || ms.planned.end);
-      f = ma - 86400; t = (mz ? mz + 86400 : t) + 86400;
+      var mts = [dayTs(ms.planned.start), dayTs(ms.planned.end), dayTs(ms.planned.delivery),
+                 ms.real && ms.real.debut, ms.real && ms.real.livree].filter(Boolean);
+      if (mts.length) {
+        f = addDays(midnight(Math.min.apply(null, mts)), -1);
+        t = addDays(midnight(Math.max.apply(null, mts)), 2);
+      }
     }
     var sp = Math.max(86400, t - f), days = Math.max(1, Math.round(sp / 86400));
     function px(ts) { return Math.min(100, Math.max(0, (ts - f) / sp * 100)); }
@@ -1237,6 +1245,14 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
     var EPIC = {};
     (R.epics || []).forEach(function (e) { EPIC[e.id] = e; });
     var byKey = {}, order = [];
+    // une epic sans aucune tâche a son groupe quand même (sa barre prévue) ;
+    // celle dont les tâches sont toutes hors du projet choisi n'en a pas
+    var hasTask = {};
+    (R.tasks || []).forEach(function (x) { if (x.epic) hasTask[x.epic] = true; });
+    (R.epics || []).forEach(function (e) {
+      if (hasTask[e.id]) return;
+      byKey["epic:" + e.id] = {key: "epic:" + e.id, rows: [], epic: e, title: null}; order.push("epic:" + e.id);
+    });
     tasks.forEach(function (x) {
       var k = x.epic ? "epic:" + x.epic : x.project ? "project:" + x.project : "none";
       if (!byKey[k]) { byKey[k] = {key: k, rows: [], epic: x.epic ? EPIC[x.epic] || {id: x.epic, title: x.epic} : null,
@@ -1249,7 +1265,7 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
     }).forEach(function (g) {
       var open = g.rows.filter(function (x) { return !ENDED[x.state]; });
       var shown = G.done ? g.rows : open;
-      if (!shown.length) return;
+      if (!shown.length && g.rows.length) return;
       var nLate = g.rows.filter(function (x) { return x.late && x.late.open; }).length;
       var nBlocked = g.rows.filter(function (x) { return x.state === "bloquee"; }).length;
       var nDone = g.rows.filter(function (x) { return x.state === "livree"; }).length;
@@ -1257,8 +1273,10 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
         .filter(Boolean).join(" · ");
       // synthèse : du premier début au dernier terme des tâches affichées
       var a = null, z = null;
-      shown.forEach(function (x) {
-        planBars(x.planned, x.real, x.state === "abandonnee").forEach(function (p) {
+      var bars = shown.map(function (x) { return planBars(x.planned, x.real, x.state === "abandonnee"); });
+      if (g.epic && g.epic.planned) bars.push(planBars(g.epic.planned, g.epic.real, false));
+      bars.forEach(function (parts) {
+        parts.forEach(function (p) {
           var lo = p.mark ? p.at : p.a, hi = p.mark ? p.at : p.b;
           if (lo && (a === null || lo < a)) a = lo;
           if (hi && (z === null || hi > z)) z = hi;
@@ -1266,9 +1284,9 @@ details.missing-box { margin-top: 14px; color: var(--ink-2); font-size: .8rem; }
       });
       var sum = track(a !== null ? [{a: a, b: Math.max(z, a + 3600), cls: "rm-real" + (nLate ? " late" : open.length ? "" : " done")}] : []);
       var title = g.epic ? "epic " + g.epic.id + " " + (g.epic.title || "") : g.title;
-      // déplié d'office seulement s'il porte une tâche en retard (mesh-design,
-      // n°9311) : « en cours » ne suffit pas, presque tout groupe en a une
-      var det = group(g.key, title, count, sum, nLate > 0);
+      // déplié d'office seulement s'il porte une tâche en retard, ou si l'epic
+      // l'est (mesh-design, n°9311) : « en cours » ne suffit pas
+      var det = group(g.key, title, count, sum, nLate > 0 || !!(g.epic && g.epic.late && g.epic.late.open));
       if (g.epic && g.epic.planned) pkgRow(det, g.epic);
       shown.forEach(function (x) { taskRow(det, x); });
     });
