@@ -56,7 +56,7 @@ class MailProjectTests(_Base):
     # -- #515 : le fil d'un message lié à un lot est celui du projet du lot ---
 
     def thread_path(self, project, lot):
-        return os.path.join(self.cfg.threads_root, project, "%d.md" % lot)
+        return os.path.join(self.cfg.threads_root, project, "%s.md" % lot)
 
     def lot_message(self, lot, dest="dev1"):
         return self.cli("send", dest, "Message lié au lot.", "--from", "orch",
@@ -83,6 +83,16 @@ class MailProjectTests(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(os.path.exists(self.thread_path("A", lot["id"])))
         self.assertFalse(os.path.exists(self.thread_path("B", lot["id"])))
+
+    def test_free_label_keeps_the_sender_thread_without_warning(self):
+        self.project("orch", chantier="A")
+        self.project("dev1", chantier="A")
+        proc = self.lot_message("SUJET-LIBRE")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("project unreadable", proc.stderr)
+        with open(self.thread_path("A", "SUJET-LIBRE"), encoding="utf-8") as fh:
+            self.assertIn("Message lié au lot.", fh.read())
+        self.assertFalse(os.path.exists(self.thread_path("B", "SUJET-LIBRE")))
 
     def test_all_broadcast_of_a_lot_is_grouped_in_the_lot_project(self):
         self.project("orch", team="", chantier="")
