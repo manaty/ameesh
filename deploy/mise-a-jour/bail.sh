@@ -15,6 +15,24 @@ bail_proprietaire() {  # stdin: show JSON → lease owner (empty when none)
   python3 -c 'import json,sys; print(json.loads(sys.stdin.read() or "{}").get("lease_owner") or "")'
 }
 
+# The --runner-id of a unit, from `systemctl show -p ExecStart --value` on stdin,
+# read as argparse reads it: "--runner-id ID", "--runner-id=ID" or an
+# abbreviation (no other runner option starts with --r), the last one winning;
+# nothing when absent. Fails when no argv can be read: the caller then stops,
+# rather than take the lease for not held.
+bail_runner_id() {
+  python3 -c 'import re, sys
+found = re.search(r"argv\[\]=(.*?) ;", sys.stdin.read())
+if not found:
+    sys.exit(1)
+args, value = found.group(1).split(), ""
+for i, arg in enumerate(args):
+    name, eq, rest = arg.partition("=")
+    if len(name) > 2 and "--runner-id".startswith(name):
+        value = rest if eq else (args[i + 1] if i + 1 < len(args) else "")
+print(value)'
+}
+
 # Passes when the persona is stopped, or when its lease is held by the expected
 # owner, at an epoch past epoch-before (claim and release both advance it), and
 # is still valid at the database clock. The expected owner is the unit's

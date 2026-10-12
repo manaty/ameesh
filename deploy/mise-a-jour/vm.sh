@@ -72,9 +72,10 @@ heure_base() {  # the clock of the mesh's database (the server's), epoch seconds
   ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c 'SELECT extract(epoch FROM clock_timestamp())'"
 }
 proprietaire_de() {  # persona → the lease owner of ameesh-runner@<p>: --runner-id, else :<MainPID>
-  local id
-  id=$(ssh_vm "systemctl show -p ExecStart --value ameesh-runner@$1" \
-    | grep -o -- '--runner-id [^ ;]*' | head -1 | awk '{print $2}')
+  local sortie id
+  sortie=$(ssh_vm "systemctl show -p ExecStart --value ameesh-runner@$1") \
+    && id=$(bail_runner_id <<<"$sortie") \
+    || { echo "ameesh-runner@$1: ExecStart unreadable" >&2; return 1; }
   if [ -n "$id" ]; then echo "$id"
   else echo ":$(ssh_vm "systemctl show -p MainPID --value ameesh-runner@$1")"; fi
 }
@@ -125,7 +126,7 @@ installer() {
 redemarrer() {
   # shellcheck source=bail.sh
   . "$ICI/bail.sh"
-  local restantes suivantes debut=$SECONDS st avant ligne heure tenu
+  local restantes suivantes debut=$SECONDS st avant ligne heure tenu attendu
   non_verifiees=()
   # le code écrit ses nouvelles colonnes (relevé de l'hôte, tours) : sans
   # elles, l'exécuteur redémarré échouerait
@@ -139,17 +140,17 @@ redemarrer() {
       st=$(statut "$p")
       if [ "$st" = running ]; then suivantes+=("$p"); continue; fi
       # #502: only a runner that held its lease must take it again (bail.sh)
-      ligne=$(lire_bail "$p") && heure=$(heure_base) \
-        || { echo "$p: registry or database clock unreadable — nothing restarted" >&2; exit 1; }
+      ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
+        || { echo "$p: registry, database clock or ExecStart unreadable — nothing restarted" >&2; exit 1; }
       avant=$(bail_epoque <<<"$ligne")
       tenu=0
-      bail_valide -1 "$(proprietaire_de "$p")" "$heure" <<<"$ligne" && tenu=1
+      bail_valide -1 "$attendu" "$heure" <<<"$ligne" && tenu=1
       ssh_vm "systemctl restart ameesh-runner@$p; sleep 10; systemctl is-active --quiet ameesh-runner@$p" \
         || { echo "$p : ne redémarre pas — journalctl -u ameesh-runner@$p -n 50 ; puis « $0 retour »" >&2; exit 1; }
       if [ "$tenu" = 0 ]; then
         echo "WARNING $p: not checked: no lease before the restart, no sign of life"
         non_verifiees+=("$p")
-      elif ! attendre_bail "$avant" "$(proprietaire_de "$p")" "$p"; then
+      elif ! attendu=$(proprietaire_de "$p") || ! attendre_bail "$avant" "$attendu" "$p"; then
         echo "$p: active, but did not take its lease again — journalctl -u ameesh-runner@$p -n 50; then « $0 retour »" >&2
         exit 1
       fi

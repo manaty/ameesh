@@ -17,14 +17,22 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "deploy", "mise-a-jour", "poste.sh")
 
+PASSWORD = "s3cret-pw"
+
 FAKE_SYSTEMCTL = r'''#!/usr/bin/env python3
 import os, sys, time
 args = [a for a in sys.argv[1:] if a not in ("--user", "--quiet", "--plain", "--no-legend")]
 state = os.environ["FAKE_STATE"]
+with open(os.path.join(state, "argv.log"), "a") as fh:
+    fh.write(" ".join(sys.argv) + "\n")
 if args[0] == "list-units":
     print("ameesh-runner-agent@dev9.service loaded active running runner")
 elif args[0] == "show":
-    print("{ path=/x ; argv[]=/x run --agents dev9 --runner-id runner-dev9@host ; }")
+    path = os.path.join(state, "execstart")
+    argv = (open(path).read().strip() if os.path.exists(path)
+            else "/x run --agents dev9 --runner-id runner-dev9@host")
+    if argv != "-":   # "-": ExecStart unreadable
+        print("{ path=/x ; argv[]=%s ; }" % argv)
 elif args[0] == "restart":
     with open(os.path.join(state, "restarted"), "w") as fh:
         fh.write(str(time.time()))
@@ -40,6 +48,7 @@ elif args[0] == "is-active":
 # already expired at the database clock; "not-held" = no lease before nor after
 # (a persona at rest, not eligible): not checked.
 FAKE_AMEESH = r'''#!/bin/sh
+echo "$0 $*" >> "$FAKE_STATE/argv.log"
 [ "$1 $2" = "show dev9" ] || exit 0
 scenario=$(cat "$FAKE_STATE/scenario")
 owner='"runner-dev9@host"' epoch=7 expires=1300
@@ -61,16 +70,24 @@ printf '{"name": "dev9", "status": "idle", "lease_owner": %s, "lease_epoch": %s,
 # asks the server over ssh. The fake ssh also answers vm.sh's migration check
 # (one migration, applied), the unit's ExecStart and its restart.
 FAKE_SSH = r'''#!/bin/sh
+echo "$0 $*" >> "$FAKE_STATE/argv.log"
 for last; do :; done
 case $last in
   *clock_timestamp*) echo 1000 ;;
   *"rev-parse HEAD"*) echo abc123 ;;
   *ls-tree*) echo src/ameesh/migrations/0001_init.sql ;;
   *psql*) echo 1 ;;
-  *"systemctl show"*) echo "{ path=/x ; argv[]=/x run --agents dev9 --runner-id runner-dev9@host ; }" ;;
+  *"systemctl show"*)
+    argv="/x run --agents dev9 --runner-id runner-dev9@host"
+    [ -e "$FAKE_STATE/execstart" ] && argv=$(cat "$FAKE_STATE/execstart")
+    [ "$argv" = - ] || echo "{ path=/x ; argv[]=$argv ; }" ;;
   *"systemctl restart"*) : > "$FAKE_STATE/restarted" ;;
 esac
 '''
+
+# The database clock read on the workstation: through ameesh's own connection
+# (the venv's python), never psql with the DSN; both are logged.
+FAKE_LOGGED_CLOCK = '#!/bin/sh\necho "$0 $*" >> "$FAKE_STATE/argv.log"\necho 1000\n'
 
 
 class RestartLeaseTest(unittest.TestCase):
@@ -87,11 +104,12 @@ class RestartLeaseTest(unittest.TestCase):
         with open(os.path.join(conf, "bascule.env"), "w", encoding="utf-8") as fh:
             fh.write("VM=vm.invalid\n")
         with open(os.path.join(conf, "config.json"), "w", encoding="utf-8") as fh:
-            fh.write('{"dsn": "postgresql://mesh.invalid/ameesh"}\n')
+            fh.write('{"dsn": "postgresql://ameesh:%s@mesh.invalid/ameesh"}\n' % PASSWORD)
         for path, text in ((os.path.join(bin_dir, "systemctl"), FAKE_SYSTEMCTL),
                            (os.path.join(bin_dir, "sleep"), "#!/bin/sh\nexit 0\n"),
                            (os.path.join(bin_dir, "ssh"), FAKE_SSH),
-                           (os.path.join(bin_dir, "psql"), "#!/bin/sh\necho 1000\n"),
+                           (os.path.join(bin_dir, "psql"), FAKE_LOGGED_CLOCK),
+                           (os.path.join(venv_bin, "python"), FAKE_LOGGED_CLOCK),
                            (os.path.join(venv_bin, "ameesh"), FAKE_AMEESH)):
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(text)
@@ -105,6 +123,40 @@ class RestartLeaseTest(unittest.TestCase):
             fh.write(scenario)
         return subprocess.run(["bash", SCRIPT, "redemarrer"], env=self.env,
                               capture_output=True, text=True, timeout=300)
+
+    def execstart(self, argv):
+        with open(os.path.join(self.state, "execstart"), "w", encoding="utf-8") as fh:
+            fh.write(argv)
+
+    def test_runner_id_is_read_as_argparse_reads_it(self):
+        # the equals form, the last of repeated options, an abbreviation: the
+        # lease held before is recognised, so a runner that does not take it
+        # again fails the restart instead of passing with a WARNING
+        for argv in ("/x run --agents dev9 --runner-id=runner-dev9@host",
+                     "/x run --agents dev9 --runner-id other@x --runner-id runner-dev9@host",
+                     "/x run --agents dev9 --runner runner-dev9@host"):
+            with self.subTest(argv=argv):
+                restarted = os.path.join(self.state, "restarted")
+                if os.path.exists(restarted):
+                    os.remove(restarted)
+                self.execstart(argv)
+                proc = self.restart("no-lease")
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                self.assertIn("did not take its lease again", proc.stderr)
+
+    def test_unreadable_execstart_stops_before_any_restart(self):
+        self.execstart("-")
+        proc = self.restart("lease")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertFalse(os.path.exists(os.path.join(self.state, "restarted")))
+
+    def test_no_password_on_a_command_line(self):
+        proc = self.restart("lease")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(os.path.join(self.state, "argv.log"), encoding="utf-8") as fh:
+            log = fh.read()
+        self.assertIn("dev9", log)
+        self.assertNotIn(PASSWORD, log)
 
     def test_runner_that_takes_its_lease_again_passes(self):
         proc = self.restart("lease")
