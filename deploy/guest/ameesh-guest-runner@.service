@@ -29,6 +29,8 @@
 Description=ameesh — guest runner of agent %i
 After=network-online.target wg-quick@wg0.service
 Wants=network-online.target
+# its volume, if /etc/fstab mounts one there: never the root disk instead
+RequiresMountsFor=/srv/ameesh-guest
 
 [Service]
 User=ameesh-guest

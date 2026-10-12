@@ -156,6 +156,16 @@ BOOT_REVIEW_EVERY_S = 60.0
 BOOT_REVIEW_MAX_ROWS = 2000
 #: L147b : le curseur de la revue — (phase `running` puis `orphan`, dernier id)
 BOOT_REVIEW_START = ("running", 0)
+#: #339: this host's rows whose group is gone are settled at start and then
+#: every LIVE_REVIEW_EVERY_S (L147's rule, with a liveness check in place of
+#: the boot time); a `running` row only once its turn (or grace period) is
+#: LIVE_REVIEW_IDLE_S old, so a turn that is closing is never raced
+LIVE_REVIEW_EVERY_S = 300.0
+LIVE_REVIEW_IDLE_S = 600.0
+#: #339 r2: a process of this user whose environment cannot be read keeps a
+#: row if it started after the row, less this margin (the harness starts
+#: just before its row is opened; the base's clock may drift from the host's)
+LIVE_REVIEW_START_SLACK_S = 300.0
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:
@@ -333,6 +343,16 @@ class AgentWorker(threading.Thread):
         self.state_dir = self.cfg.agent_dir(self.name)
         self.renew_failures = 0
         self.lease_deadline = float(lease.get("lease_expires_ts") or 0.0)
+        #: L159f4 r1 : borne du bail sur l'horloge monotone de cet hôte, prise
+        #: après la réponse de la base (prise ou renouvellement + ttl) : jamais
+        #: avant l'échéance de la base, quel que soit l'écart des horloges
+        self.lease_held_until = self._held_until()
+        #: L159f4 r2 : le fil de renouvellement du tour (son renouvellement en
+        #: cours peut encore prolonger `lease_held_until` après la fin du tour)
+        self.heartbeat_thread: threading.Thread | None = None
+        #: r3 : les appels de renouvellement détachés (sans réponse dans
+        #: `call_budget()`) : l'un d'eux peut encore prolonger le bail en base
+        self.renewals: list[threading.Thread] = []
         self.pgid: int | None = None  # groupe du harnais en cours
         #: dernier descripteur de harnais journalisé (chemin, empreinte) — L16
         self.descriptor_seen: tuple[str, str] = ("", "")
@@ -537,8 +557,15 @@ class AgentWorker(threading.Thread):
                     self.runner.lease_ttl)
             except Exception as exc:  # DbError, mais aussi tout imprévu
                 result["error"] = exc
+            if result.get("expires") is not None or "error" in result:
+                # L159f4 r3/r4 : même arrivée après `call_budget()` (appel
+                # détaché), et même en erreur (la base a pu valider avant
+                # que la réponse se perde), la borne locale du bail va
+                # jusqu'à ce moment + ttl ; seul « bail perdu » ne prolonge rien
+                self.lease_held_until = max(self.lease_held_until, self._held_until())
 
         thread = threading.Thread(target=call, daemon=True)
+        self.renewals = [t for t in self.renewals if t.is_alive()] + [thread]
         thread.start()
         thread.join(timeout=self.call_budget())
         if thread.is_alive():
@@ -610,16 +637,25 @@ class AgentWorker(threading.Thread):
                       "%d failure(s)" % (self.name, self.renew_failures))
         self.renew_failures = 0
         self.lease_deadline = float(expires)
+        self.lease_held_until = self._held_until()
         return True
 
-    def release_lease(self) -> None:
+    def _held_until(self) -> float:
+        return time.monotonic() + float(self.runner.lease_ttl)
+
+    def release_lease(self) -> bool:
+        """Rend le bail ; False quand la base ne l'a pas pris (DbError) : le
+        bail reste tenu jusqu'à son échéance (`lease_held_until`, plus
+        renouvelé). Perdu ou déjà repris par un autre : True, il n'est plus
+        à nous. Le retour est tenté même `lease_lost` posé (r1) : des pannes
+        au renouvellement le posent sans que la base ait repris le bail ; le
+        retour, gardé par l'epoch, ne touche pas celui d'un autre."""
         self.watchdog_stop.set()  # le veilleur n'a plus de bail à défendre
-        if self.lease_lost.is_set():
-            return
         try:
             registry.release(self.db, self.name, self.runner.runner_id, self.epoch)
         except db_mod.DbError:
-            pass
+            return False
+        return True
 
     #: délai laissé au harnais entre SIGTERM et SIGKILL
     TERMINATE_GRACE = 3.0
@@ -2110,9 +2146,16 @@ class AgentWorker(threading.Thread):
         # L30 (0027) : avec des comptes déclarés, le rythme se juge compte par
         # compte et la garde bascule au lieu de mettre en pause.
         raison = account_turn.choose(self, book)
+        # L242b : un non-critique s'arrête plus tôt — sous le rythme (réserve,
+        # sans comptes déclarés ; avec, `accounts.choose` la prend) et à une
+        # part du plafond horaire payé au token du mesh
+        from . import accounts as accounts_mod
+        critique = account_turn.is_critical(self)
+        part = 1.0 if critique else getattr(self.cfg, "noncritical_hourly_share", 0.75)
         if raison is None:
-            return book.over(self.name)
-        return raison or book.over(self.name, pace=False)
+            return book.over(self.name, reserve=0.0 if critique else accounts_mod.RESERVE,
+                             hourly_share=part)
+        return raison or book.over(self.name, pace=False, hourly_share=part)
 
     def budget_ok(self) -> bool:
         """La garde de budget autorise-t-elle un tour ? Pose l'état de pause.
@@ -2149,8 +2192,12 @@ class AgentWorker(threading.Thread):
             self._budget_next_check = maintenant + self.runner.budget_check_interval
             # `paused` n'est pas dans la contrainte de statut (L13 n'a pas de
             # migration) : la pause se lit `blocked` + raison dans `status_text`.
+            # L242b (5) : la pause d'un agent critique est marquée — alerte
+            # urgente `critical_budget_pause`
+            marque = budget_mod.CRITICAL_MARK if account_turn.is_critical(self) else ""
             registry.set_status(self.db, self.name, "blocked",
-                                status_text="budget : %s" % raison)
+                                status_text="%s%s%s" % (budget_mod.PAUSE_PREFIX, marque,
+                                                        raison))
             if raison != self._budget_reason:
                 self._budget_reason = raison
                 self._fil_note("Budget pause: %s. No turn until the gauge goes back "
@@ -3334,7 +3381,9 @@ class AgentWorker(threading.Thread):
             return False
 
         heartbeat_done = threading.Event()
-        threading.Thread(target=self._heartbeat, args=(heartbeat_done,), daemon=True).start()
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat, args=(heartbeat_done,),
+                                                 daemon=True)
+        self.heartbeat_thread.start()
         preempt_done = threading.Event()
         # Un nouveau tour remet à zéro le latch de publication : il ne concerne
         # que la course du tour précédent, et les autres déclencheurs (bail,
@@ -4049,6 +4098,10 @@ class Runner:
         self.boot_review_at: float | None = None
         #: et où reprend la revue suivante (phase, dernier id)
         self._boot_review_after = BOOT_REVIEW_START
+        #: #339 : prochaine revue des lignes dont le groupe est mort (horloge
+        #: monotone) et le dernier id revu
+        self.live_review_at: float = 0.0
+        self._live_review_after = 0
         #: dernière erreur de traitement des délégations échues (L40), dite une fois
         self._delegation_error: str | None = None
         self._delegation_dry_seen: set = set()
@@ -4315,8 +4368,12 @@ class Runner:
                             ran = worker.process_once(self.wait)
                     finally:
                         try:
-                            worker.release_lease()
+                            released = worker.release_lease()
                             self._release_slot(agent["name"])
+                            if not released and gate is not None:
+                                # L159f4 : la part dit le bail tenu tant
+                                # qu'il l'est (nouvel essai, ou échéance)
+                                self._await_release(worker, gate)
                         finally:
                             # r4 : compté jusqu'à la libération faite, sinon
                             # le contrôleur dirait l'hôte vidé, bail tenu
@@ -4333,6 +4390,41 @@ class Runner:
                 if not registered:
                     self._release_slot(agent["name"])
                 raise
+
+    #: `--once` : intervalle des nouveaux essais d'un bail non rendu
+    RELEASE_RETRY_S = 5.0
+
+    def _await_release(self, worker, gate) -> None:
+        """`--once`, la base n'a pas pris le retour du bail : le worker reste
+        compté (`gate_foreground`) et la part le dit tenu, jusqu'à un retour
+        réussi ou l'échéance du bail (il n'est plus renouvelé) ; jamais
+        « vidé » bail tenu (L159f4). Un arrêt de l'exécuteur coupe l'attente :
+        sa part disparaît avec lui."""
+        # r1 : l'échéance lue en base n'est pas comparée à l'horloge murale
+        # de cet hôte (en avance, elle dirait la part libre bail tenu).
+        # r2-r4 : un renouvellement encore en cours (fil du battement, appel
+        # détaché) peut toujours aboutir en base : tant qu'il court, le bail
+        # est tenu, et sa fin (réponse ou erreur) repousse la borne ; elle
+        # est donc relue à chaque tour. Les nouveaux essais du retour ne
+        # l'attendent jamais : un retour réussi met fin à tout.
+        heartbeat = worker.heartbeat_thread
+
+        def renewing() -> bool:
+            pending = [heartbeat] if heartbeat is not None else []
+            return any(t.is_alive() for t in pending + list(worker.renewals))
+
+        log_async("[%s] lease not returned (base): counted as held until it is, "
+                  "or until it expires (%ds)"
+                  % (worker.name, max(0, worker.lease_held_until - time.monotonic())))
+        while renewing() or time.monotonic() < worker.lease_held_until:
+            gate.tick()
+            left = worker.lease_held_until - time.monotonic()
+            wait = self.RELEASE_RETRY_S if renewing() else min(self.RELEASE_RETRY_S,
+                                                                 max(0.0, left))
+            if self.stop.wait(wait):
+                return
+            if worker.release_lease():
+                return
 
     def budget_limits(self, db) -> "budget_mod.Limits":
         """Les plafonds en vigueur (L70) : base (cache court) > config > défaut."""
@@ -5512,6 +5604,101 @@ class Runner:
             self.boot_review_at = time.monotonic() + BOOT_REVIEW_EVERY_S
             return []
 
+    def settle_dead_turns(self) -> list[dict]:
+        """#339 : les lignes de CET hôte `orphan`, ou `running` depuis plus de
+        LIVE_REVIEW_IDLE_S (laissées par un exécuteur mort ou relancé), dont
+        plus rien ne survit sont soldées (`done`) — sans attendre un
+        redémarrage de l'hôte (L147). Plus rien : ni le groupe de processus,
+        ni un processus de l'utilisateur qui porte l'identifiant du tour
+        (`AMEESH_TURN_ID`, hérité même après `setsid`), ni un conteneur
+        étiqueté par le tour sur l'un des moteurs (`containers.all_runtimes`).
+        Dans le doute, la ligne reste : sans groupe noté, groupe vivant (même
+        réutilisé), processus à l'environnement illisible lancé après la
+        ligne, moteur muet, table des processus ou démarrage de l'hôte
+        inconnus. Pas avant le feu vert du démarrage (`_boot_settle_ready` :
+        un conteneur relancé par sa politique peut manquer encore). Une ligne
+        n'est soldée que si elle n'a pas changé depuis sa lecture
+        (`settle_unchanged`). Rien n'est supprimé ; au plus
+        BOOT_REVIEW_MAX_ROWS lignes par passage, la suite au passage suivant.
+        Rend les lignes soldées. Ne lève jamais."""
+        from . import containers as containers_mod, platform as os_layer
+        from . import resources as resources_mod
+        self.live_review_at = time.monotonic() + LIVE_REVIEW_EVERY_S
+        boot = resources_mod.boot_time()
+        if not boot or not self._boot_settle_ready(time.time() - boot):
+            return []
+        try:
+            turns = storage.of(self.db).turn_resources
+            rows: list = []
+            after = self._live_review_after
+            more = False
+            while True:
+                room = BOOT_REVIEW_MAX_ROWS - len(rows)
+                if room <= 0:
+                    more = True
+                    break
+                size = min(BOOT_ORPHAN_PAGE, room)
+                page = turns.to_review(self.host, LIVE_REVIEW_IDLE_S, after, size)
+                rows += page
+                if len(page) < size:
+                    break
+                after = int(page[-1]["id"])
+            self._live_review_after = after if more else 0
+            if more:
+                self.live_review_at = time.monotonic()  # la suite sans attendre
+            candidates = [row for row in rows
+                          if row.get("pgid") and not AgentWorker._group_alive(int(row["pgid"]))]
+            if not candidates:
+                return []
+            try:
+                scan = os_layer.env_values("AMEESH_TURN_ID")
+            except os_layer.NotAvailable as exc:
+                log("turn resources not settled: %s; next review in %ds"
+                    % (exc, int(LIVE_REVIEW_EVERY_S)))
+                return []
+            unread = scan["unread"]
+            if None in unread:
+                log("turn resources not settled: a process with an unreadable "
+                    "environment and no start time; next review in %ds"
+                    % int(LIVE_REVIEW_EVERY_S))
+                return []
+            latest = max(unread, default=None)
+            candidates = [row for row in candidates
+                          if row["turn_id"] not in scan["values"]
+                          and (latest is None or row.get("started_ts") is None
+                               or latest < float(row["started_ts"]) - LIVE_REVIEW_START_SLACK_S)]
+            if not candidates:
+                return []
+            engines, silent = containers_mod.all_runtimes(self.cfg)
+            running: dict = {}
+            for engine in engines:
+                part = self._running_containers(engine)
+                if part is None:
+                    silent.append(engine.binary + (" (%s)" % engine.context
+                                                   if engine.context else ""))
+                    continue
+                for turn, ids in part.items():
+                    running.setdefault(turn, []).extend(ids)
+            if silent:
+                log("turn resources not settled: container engine %s not "
+                    "answering; next review in %ds"
+                    % (", ".join(silent), int(LIVE_REVIEW_EVERY_S)))
+                return []
+            # sans moteur, une ligne qui note des conteneurs reste
+            dead = [row for row in candidates
+                    if self._containers_alive(running, engines or None, row) == []]
+            settled = set(turns.settle_unchanged(dead))
+            dead = [row for row in dead if row["turn_id"] in settled]
+            for row in dead:
+                log("turn %s of %s (%s): group %s gone, no process nor container "
+                    "left — settled" % (row["turn_id"], row.get("agent"),
+                                        row.get("status"), row["pgid"]))
+            return dead
+        except db_mod.DbError as exc:
+            log_async("turn resources not reviewed (%s); next review in %ds"
+                      % (db_mod.explain(exc), int(LIVE_REVIEW_EVERY_S)))
+            return []
+
     def _boot_settle_ready(self, uptime: float) -> bool:
         """#220 r2 : les conteneurs relancés au démarrage ont-ils eu le temps
         de l'être ? Pas avant BOOT_SETTLE_S de fonctionnement, ni tant que le
@@ -5594,6 +5781,7 @@ class Runner:
         # L106 : après l'écoute (un réveil n'attend pas ces vérifications)
         self.log_harnesses()
         self.report_boot_orphans()
+        self.settle_dead_turns()
         reprise = Reprise(self.db_retry_max)
         try:
             while not self.stop.is_set():
@@ -5605,6 +5793,8 @@ class Runner:
                     log_async("power guard failed (%s)" % type(exc).__name__)
                 if self.boot_review_at is not None and time.monotonic() >= self.boot_review_at:
                     self.report_boot_orphans()      # #220 r2 : solde différé
+                if time.monotonic() >= self.live_review_at:
+                    self.settle_dead_turns()        # #339
                 try:
                     self.sweep()
                 except db_mod.DbError as exc:
@@ -5837,6 +6027,13 @@ def run_attach(cfg: Config, db: db_mod.Db, name: str, *, wait: bool = False,
     if agent.get("status") == "stopped":
         print("agent %s stopped: nothing to attach" % name, file=sys.stderr)
         return 1
+    from . import budget as budget_pause
+    texte = agent.get("status_text") or ""
+    if agent.get("status") == "blocked" and texte.startswith(budget_pause.PAUSE_PREFIX):
+        # L242b (4) : dire la pause budget, pas un arrêt ; la session
+        # interactive reste possible (elle prend le compte actif du harnais)
+        print("agent %s in budget %s" % (name, texte[len(budget_pause.PAUSE_PREFIX):]),
+              file=sys.stderr)
     if (agent.get("host") or "") != cfg.host:
         print("agent %s pinned to %s, not to %s" % (name, agent.get("host") or "?", cfg.host),
               file=sys.stderr)

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...persona_sessions import track_change
 from .. import interface
 from .mailbox import PASSIVE_SQL
 
@@ -163,6 +164,7 @@ class Operations(interface.Operations):
         )
         return rows[0] if rows else None
 
+    @track_change("restart")
     def apply_restart(self, name, owner=None, epoch=None) -> dict | None:
         if owner is None:
             fence = ("(verrou.lease_owner IS NULL"
@@ -210,6 +212,7 @@ class Operations(interface.Operations):
         return rows[0] if rows else None
 
     # -- adoption et reprise (L39, 0030) --------------------------------------
+    @track_change("adopt")
     def adopt(self, name, *, harness, host, cwd, session_id, session_account, prompt,
               status_text) -> dict | None:
         rows = self.db.query(
@@ -248,6 +251,7 @@ class Operations(interface.Operations):
         )
         return rows[0] if rows else None
 
+    @track_change("fresh resume")
     def resume(self, name, *, prompt, forget, status_text) -> dict | None:
         # paramètres positionnels : `oubli` (booléen) répété là où il sert
         oubli = bool(forget)

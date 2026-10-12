@@ -120,6 +120,17 @@ class TurnCosts(interface.TurnCosts):
             tuple([float(from_ts), float(to_ts)] + names))
         return float(rows[0]["usd"]) if rows else 0.0
 
+    def paid_lines(self, from_ts, *, harnesses) -> list[dict]:
+        names = list(harnesses)
+        if not names:
+            return []
+        return self.db.query(
+            "select harness, account, extract(epoch from recorded_at)::float8 as ts,"
+            " usd::float8 as usd from turn_costs"
+            " where recorded_at > to_timestamp(%s) and void_reason is null"
+            " and harness in (" + ", ".join(["%s"] * len(names)) + ")",
+            tuple([float(from_ts)] + names))
+
     def unpriced(self, since_ts, prefix) -> list[dict]:
         return self.db.query(
             "SELECT agent, harness, coalesce(model, '') AS model, count(*) AS turns,"

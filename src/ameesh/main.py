@@ -50,6 +50,9 @@
   ameesh progress [--json] [--html FILE | --serve [--port 8765]] [--project P] [--since 24h]
         progress: work items, agents, milestones, budget (schema ameesh-progress/1);
         --serve: the page served locally, read-only, with a Refresh button (L304);
+  ameesh serve [--port 8780] [--token-file F] [--human human:ID] | --openapi
+        the read API /api/v1 on 127.0.0.1, Bearer token in a 0600 file (L84,
+        docs/api/openapi-v1.json);
   ameesh projects [--json] [--project P] [--all]
         active projects: agents, state, current work item, unread, 24 h spend,
         plan or token, work items without an agent (schema ameesh-projects/1, L62);
@@ -104,6 +107,7 @@
         | status [<job>] | cancel <job>
         heavy suites run on a lending VM over SSH (L159b, AMEESH_OFFLOAD_HOST);
         same output and exit code, local fallback;
+  ameesh sessions <persona> [--limit N] [--json]  current and past sessions (L52);
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent.
 
 The human approval service (spec §9) is a separate command,
@@ -223,6 +227,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "projects":
         from . import projects
         return projects.main(rest)
+    if command == "serve":
+        # L84: read API, local mode
+        from . import serve
+        return serve.main(rest)
     if command == "plan":
         # L96 : feuille de route (engagements, propositions, Gantt)
         from . import roadmap
@@ -230,6 +238,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "fil":
         from . import fil
         return fil.main(rest)
+    if command == "sessions":
+        # L52 (0032 §2): current and past persona sessions.
+        from . import persona_sessions
+        return persona_sessions.main(rest)
     if command == "watch":
         # L121: the watch of an agent (timer + versioned instruction)
         from . import watch

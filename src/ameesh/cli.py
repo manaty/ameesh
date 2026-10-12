@@ -78,7 +78,7 @@ from . import authority
 from . import backend as backend_mod
 from . import config as config_mod
 from . import db as db_mod
-from . import fil, identity, mail, migrations, platform, signing, storage
+from . import fil, identity, mail, migrations, platform, registry, signing, storage
 from . import session_bindings as sb
 from .config import NAME_RE, Config
 
@@ -915,6 +915,11 @@ def cmd_hook(cfg: Config, tool: str) -> int:
             bk.register(name, tool, data.get("cwd"), session_id,
                         leased=binding.bound_to_lease)
             if bk.kind == "pg":
+                # L52: record only after L133/L166 have filtered child IDs.
+                # Under a runner lease, session_id is None; stream parsing
+                # and registry.set_session own the authoritative session.
+                if session_id:
+                    registry.record_session_history(bk.db, name, str(session_id))
                 _register_done(cfg, name, inscription)
         if binding.source == "explicit" and bk.kind == "pg":
             # L46 : AGENT_MAIL_NAME sans bail (pont local, shell qui en a
@@ -1345,6 +1350,35 @@ def driver_warnings(driver: str, remote: bool) -> list[str]:
     ]
 
 
+def host_measures_line(cfg: Config, reading: dict | None = None) -> str:
+    """L64: the host measures this OS, or this host, cannot give, read on a
+    fresh reading (never the published one, which may come from before an
+    upgrade) of the filesystems the guard watches (work roots, state, caches,
+    tmp, docker, `/`: a btrfs work root is not the state dir's filesystem),
+    under the guard's effective housekeeping policy (the canons' Host card:
+    a cache root of its own); the default one, said, when the canons cannot
+    be read. Informative: the verdict does not change."""
+    from . import canon as canon_mod
+    from . import menage as menage_mod
+    from . import resources
+    note = ""
+    try:
+        if reading is None:
+            try:
+                policy = menage_mod.effective(canon_mod.load_configured(cfg), cfg.host or "")
+            except Exception:
+                policy, note = menage_mod.Policy(), " [default policy: canon unreadable]"
+            reading = resources.sample(cfg.host, paths=resources.disk_paths(cfg, policy),
+                                       tmp=resources.tmp_paths(cfg, policy))
+        missing = resources.unmeasured(reading)
+    except Exception as exc:  # a reading never breaks the doctor
+        return "measures   : host not read (%s)" % (" ".join(str(exc).split())[:120],)
+    if not missing:
+        return "measures   : every host measure is read (%s)%s" % (platform.SYSTEM, note)
+    return "measures   : not given on this host (%s): %s%s" % (platform.SYSTEM,
+                                                               ", ".join(missing), note)
+
+
 def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
                harness: bool = False) -> int:
     if probe:
@@ -1413,6 +1447,7 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     unread = storage.of(db).mailbox.unread_total()
     print("agents     : %d" % agents)
     print("unread     : %d" % unread)
+    print(host_measures_line(cfg))
     # L106 : un agent mené sans unité d'exécuteur ne repart pas après une
     # coupure de l'hôte (signalé, sans changer le verdict)
     from . import hostcheck

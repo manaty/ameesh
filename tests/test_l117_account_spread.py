@@ -48,6 +48,14 @@ def _codex_weekly(home: str, used_percent: float, resets_at: float,
 class RepartitionTest(_Base):
     """`accounts.choose` : le compte le plus en retard sur son rythme."""
 
+    def setUp(self) -> None:
+        super().setUp()
+        # L242b : ces tests portent sur le classement ; la réserve des
+        # non-critiques a les siens (test_l242b2_budget)
+        reserve = mock.patch.object(accounts, "RESERVE", 0.0)
+        reserve.start()
+        self.addCleanup(reserve.stop)
+
     def _items(self):
         declared = self._codex_comptes()
         declared.append({"name": "tertiaire", "path": _dossier(

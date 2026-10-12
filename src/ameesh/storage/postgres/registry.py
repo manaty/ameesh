@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 from typing import Any, Sequence
 
+from ...persona_sessions import track_change
 from ...config import NAME_RE
 from .. import interface
 
@@ -311,6 +312,7 @@ class Agents(interface.Agents):
             (name,),
         )
 
+    @track_change("replaced", returns_none=True)
     def set_session(self, name, session_id, account=None) -> None:
         # L39 (0033) : la session ET le compte sous lequel elle tourne, en une
         # écriture (NULL : hôte sans comptes déclarés)
@@ -588,6 +590,7 @@ class Leases(interface.Leases):
         sql += " RETURNING name, lease_owner, lease_epoch"
         return self.db.query(sql, params)
 
+    @track_change("rotation")
     def clear_session(self, name, owner, epoch) -> bool:
         """Fencé par un bail valide : verrou pris d'abord, échéance
         recontrôlée avec `clock_timestamp()` dans l'écriture."""

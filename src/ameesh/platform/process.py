@@ -218,6 +218,67 @@ def environ(pid: int | None = None) -> dict | None:
     return out
 
 
+def env_values(name: str) -> dict:
+    """#339 : la valeur de la variable `name` dans l'environnement INITIAL de
+    chaque processus de CET utilisateur (uid réel), zombies exclus :
+    {"values": {valeur: [pid, …]}, "unread": [début, …]}. `unread` : les
+    débuts (secondes epoch, None si inconnu) des processus de l'utilisateur
+    dont l'environnement est illisible (non « dumpable ») — l'appelant les
+    tient pour inconnus, jamais pour absents. Un processus disparu pendant
+    la lecture est omis. `NotAvailable` si l'OS ne permet pas de lister les
+    processus ni de lire leur environnement."""
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    values: dict = {}
+    unread: list = []
+    ps = _psutil()
+    if ps is not None:
+        for proc in ps.process_iter(["pid", "uids", "status", "create_time"]):
+            info = proc.info
+            if info.get("status") == ps.STATUS_ZOMBIE:
+                continue
+            uids = info.get("uids")
+            if uid is not None and (uids is None or uids.real != uid):
+                continue
+            try:
+                value = proc.environ().get(name)
+            except ps.NoSuchProcess:
+                continue
+            except Exception:
+                unread.append(info.get("create_time"))
+                continue
+            if value:
+                values.setdefault(value, []).append(int(info["pid"]))
+        return {"values": values, "unread": unread}
+    if not _proc_ok():
+        raise NotAvailable("process environment",
+                           "neither psutil nor /proc to read a process's environment")
+    key = name.encode("utf-8") + b"="
+    starts = {p["pid"]: p["start"] for p in process_table() if not p["zombie"]}
+    for pid, start in starts.items():
+        try:
+            with open(os.path.join(PROC, str(pid), "status"), encoding="utf-8",
+                      errors="replace") as fh:
+                real = next((int(line.split()[1]) for line in fh
+                             if line.startswith("Uid:")), None)
+        except (OSError, ValueError, IndexError):
+            continue                # disparu
+        if uid is not None and real != uid:
+            continue
+        try:
+            with open(os.path.join(PROC, str(pid), "environ"), "rb") as fh:
+                data = fh.read()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unread.append(start)
+            continue
+        for chunk in data.split(b"\0"):
+            if chunk.startswith(key) and len(chunk) > len(key):
+                values.setdefault(chunk[len(key):].decode("utf-8", "replace"), []).append(pid)
+                break
+    return {"values": values, "unread": unread}
+
+
 def open_fd_count() -> int:
     """Nombre de descripteurs ouverts par ce processus (POSIX)."""
     ps = _psutil()

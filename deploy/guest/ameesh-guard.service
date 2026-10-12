@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# ameesh — capacity guard of a lending host (lot L159e, study L159 §1.6;
+# installed for the pilot (a1) by install-pilot.sh, lot L159g). It measures
+# the host every 5 s and writes the gate state the guest runners obey
+# (/run/ameesh-gate/state/state.json); out of observation it sets the caps of
+# `ameesh-guest.slice`, freezes it, drains and stops the guest. It runs as
+# root (systemctl set-property, freeze, kill) and touches no database.
+#
+# Mode: `AMEESH_GUARD_ARGS=--observe` in /etc/ameesh/guard.env (decides and
+# publishes only); empty, the guard enforces. Offer: /etc/ameesh/guard.json.
+#
+# Installed by the owner, as root (an agent never changes the units of a
+# host):
+#
+#   install -m 0644 ameesh-guard.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now ameesh-guard
+#
+# Rollback (study §4.3): `systemctl disable --now ameesh-guard`; the guard
+# thaws the slice when it stops, and its last caps stay on the slice until
+# it is stopped or its runtime properties reset.
+
+[Unit]
+Description=ameesh — capacity guard of the guest
+After=local-fs.target systemd-tmpfiles-setup.service
+
+[Service]
+Type=simple
+Environment=AMEESH_GUARD_ARGS=--observe
+EnvironmentFile=-/etc/ameesh/guard.env
+Environment=AMEESH_GUARD_CONFIG=/etc/ameesh/guard.json
+ExecStart=/opt/ameesh/venv/bin/ameesh guard run $AMEESH_GUARD_ARGS
+Restart=always
+RestartSec=5
+# the guard stays out of the guest's slice it caps, and is never the OOM's
+# first pick
+Slice=system.slice
+OOMScoreAdjust=-500
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

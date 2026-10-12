@@ -396,6 +396,12 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'repo', 'run_id', 'part', 'test', 'module', 'status', 'inherited', 'replay',
         'duration_s', 'failed_at', 'message_id', 'recorded_at'
     ]),
+    -- Session history (L52, 0032 §2): which sessions, when and where;
+    -- no content (transcripts stay in harness storage).
+    ('persona_sessions', ARRAY[
+        'id', 'persona', 'session_id', 'harness', 'host', 'account', 'work_item',
+        'started_at', 'ended_at', 'end_reason'
+    ]),
     ('work_item_events', ARRAY[
         'id', 'work_item_id', 'state', 'actor', 'created_at'
     ]),
@@ -457,6 +463,15 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'agent_minutes', 'ci_minutes', 'review_minutes', 'human_minutes', 'ci_runs',
         'merge_sha', 'diff_files', 'diff_insertions', 'diff_deletions',
         'measured_size', 'declared_size'
+    ]),
+    -- L160e (0058): merge queue per target (lot, frozen commit, rank, state:
+    -- STATE, no content) and the per-target merge lease
+    ('merge_queue', ARRAY[
+        'work_item_id', 'target', 'frozen_sha', 'state', 'rank', 'landing_sha', 'reason',
+        'queued_by', 'queued_at', 'updated_at', 'source'
+    ]),
+    ('merge_locks', ARRAY[
+        'target', 'owner', 'epoch', 'expires_at'
     ]),
     -- L40 (0031) : registre des délégations et de leur issue (de l'ÉTAT)
     ('work_item_delegations', ARRAY[

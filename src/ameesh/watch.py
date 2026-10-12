@@ -344,6 +344,10 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None) -> s
     host = cfg.host or ""
     text = consigne(agent)
     rows = storage.of(db).watches.list(agent)
+    # the project of the thread, read BEFORE the delivery (codex #303 r3): once
+    # the message is committed, nothing may fail the firing (the timer would
+    # retry, and send it twice)
+    agent_row = registry.get(db, agent)
     if rows and rows[0]["host"] == host:
         # the checks of `agent-mail send`, before the transaction (read only)
         try:
@@ -369,7 +373,7 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None) -> s
     if not row["sent"]:
         return "the watch of %s is on %s: nothing sent from here" % (agent, row["host"])
     # committed: the readable thread, as `agent-mail send` writes it
-    agent_row = registry.get(db, agent)
+    # (fil.record never raises)
     fil.record(cfg, db, sender=SENDER, recipients=[agent], text=text,
                project=fil.agent_project(agent_row) if agent_row else None,
                mailbox_ids=[int(m) for m in sent if isinstance(m, int)],

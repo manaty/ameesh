@@ -27,6 +27,12 @@ qu'il ne fait jamais, et comment il en rend compte.
   est retirée (module IT, L317a) : analyse profonde ciblée sur ce lot, premier
   rapport dans les 30 min (voir « Sur un bug de priorité 1 ou une release
   retirée ») ;
+* le courrier `event` urgent « Critical agent paused on budget: … »
+  d'`ameesh` (L242b) : un agent critique est en pause budget. Passage court
+  centré sur ce point : quel compte, jusqu'à quand (`ameesh accounts list`,
+  `ameesh budget --json`) ; le geste revient à l'orchestrateur ou à l'humain
+  (libérer un compte, relever un plafond, confier le travail urgent à un
+  autre agent). S'il le fait lui-même, c'est au niveau 3 : il propose ;
 * le courrier `event` d'`ameesh` sur une alerte que l'orchestrateur doit
   traiter (L132) : « Stale lot: … », « Underused plan: … »,
   « Idle capacity: … », et leur « Reminder, alert still active … » 6 h plus
@@ -64,7 +70,7 @@ le JSON plutôt que le texte.
 
 | # | Point | Commandes | Signe d'un problème |
 |---|---|---|---|
-| 1 | Agents bloqués, arrêtés ou à vide | `ameesh list`, `ameesh show <agent>`, `ameesh alerts --json` | `stopped_with_mail`, `idle_with_mail`, `dead_runner`, `host_not_ready` ; agent au repos avec un lot actionnable (`idle_actionable_lot`, niveau 1 : il relance) |
+| 1 | Agents bloqués, arrêtés ou à vide | `ameesh list`, `ameesh show <agent>`, `ameesh alerts --json` | `stopped_with_mail`, `idle_with_mail`, `dead_runner`, `host_not_ready` ; agent au repos avec un lot actionnable (`idle_actionable_lot`, niveau 1 : il relance) ; `critical_budget_pause` (urgent, L242b) : un orchestrateur, l'agent de conception ou un auditeur en pause budget |
 | 2 | Tours longs, sessions qui grossissent | `ameesh alerts --json`, `ameesh cost turns` | `long_turn`, `session_too_big`, `stale_lot` |
 | 3 | Forfaits | `ameesh accounts list` | capacité perdue à la prochaine remise à zéro (`plan_underused`), compte au seuil de rythme, compte forcé depuis longtemps |
 | 4 | Dépense et solde | `ameesh budget --json`, `ameesh cost balance`, `ameesh cost gauges` | dépense réelle au-dessus de l'estimation, plafond proche, `balance_low` |
@@ -76,6 +82,7 @@ le JSON plutôt que le texte.
 | 10 | Demandes d'humains sans lot (L130) | `ameesh work unrecorded --since 2h --json` (`--since 24h` en analyse profonde) | message d'un humain, réponse à une décision ou demande transmise par son chat qui n'est rattachée à aucun lot, n'en cite aucun et dont aucun lot ne reprend la phrase ; le rapport la nomme (numéro du message, expéditeur, destinataire, extrait) à l'orchestrateur du projet, qui l'enregistre ([ORCHESTRATEUR.md](ORCHESTRATEUR.md), « Toute demande d'un humain devient un lot ») |
 | 11 | Estimations (L157, L157b, L157c) | `ameesh alerts --json` (`estimate_bias`), `ameesh work estimates --json`, `ameesh projects --json` (`lot_estimate` de chaque agent), `ameesh work list --json` (`estimate_minutes`), `ameesh work show <id> --json` (`measure`), `ameesh work schedule --json` | lot ouvert sans durée estimée ; lot en cours au-delà de son estimation (`overrun`) ; médiane réel/estimé d'un type de lot ou d'un auteur hors de ×0,7–×1,5, ou p80 au-delà de ×2 ; estimations tardives (posées après le début) ou ré-estimations nombreuses ; lots livrés sans début mesuré ; L157c: delivered lots without a measure (`measure` null) or with CI unknown; measured size differing from the declared size (`size_match` false) for one estimator again and again; the phase that carries the gap (agent, CI, review, human); open lots left unplanned by `work schedule` |
 | 12 | Conformité aux procédures (L234) | `ameesh work list --json`, `ameesh decisions --json`, `ameesh fil show <projet> --last 200`, `ameesh work show <id> --json`, requêtes 10–12, journaux et forge | attente humaine sans demande ouverte ; question hors `ameesh decide` ; réparation manuelle par humain/bureau ; annonce sans fait correspondant — suivre la méthode ci-dessous |
+| 13 | Version numbers (L158) | `gh release list -L 5`, then for each version published since the last pass `python3 ameesh/scripts/version-level.py release v<n>` (after `git -C ameesh fetch --tags`) | `WRONG NUMBER`: the number is below what its content needs (a minor shipped as a patch, a break without a major) or skips a number; a level above the floor found with no reason in the release notes; a published version without its `v<n>` tag. Level 3: it reports it to the owner, who decides whether to publish a corrected number |
 
 ### Contrôles apportés par les modules (point 12, L317b)
 
@@ -706,6 +713,7 @@ d'un serveur, `vm.sh verifier` l'affiche), puis
 écart porte autre chose que des corrections de bugs (une évolution fusionnée
 mais pas encore déployée, une migration qui n'est pas additive), il ne déploie
 pas : il le signale au propriétaire, et sa correction attend avec le reste.
+`python3 ameesh/scripts/version-level.py level <installé> <sha>` (L158) gives the same answer from the content: it deploys only on `patch`.
 
 ```sh
 git -C ameesh fetch -q origin && git -C ameesh checkout -q --detach <sha>

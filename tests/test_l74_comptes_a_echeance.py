@@ -43,6 +43,14 @@ class ChoixParEcheanceTest(_Base):
     """`accounts.choose` : échéance, égalité, rythme, relevé échu, forçage,
     continuité, pause."""
 
+    def setUp(self) -> None:
+        super().setUp()
+        # L242b : ces tests portent sur le classement ; la réserve des
+        # non-critiques a les siens (test_l242b2_budget)
+        reserve = mock.patch.object(accounts, "RESERVE", 0.0)
+        reserve.start()
+        self.addCleanup(reserve.stop)
+
     def _items(self, n: int = 2):
         comptes = self._codex_comptes()
         if n == 3:
@@ -226,6 +234,14 @@ class RapportTest(_Base):
 
 class ExecuteurTest(_Base):
     """Dans l'exécuteur : continuité de session, choix à l'ouverture, journal."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # L242b : ces tests portent sur le classement ; la réserve des
+        # non-critiques a les siens (test_l242b2_budget)
+        reserve = mock.patch.object(accounts, "RESERVE", 0.0)
+        reserve.start()
+        self.addCleanup(reserve.stop)
 
     def test_session_en_cours_reste_nouvelle_session_va_au_plus_en_retard(self):
         comptes = self._codex_comptes()

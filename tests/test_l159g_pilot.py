@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import tempfile
 import time
 import unittest
 
@@ -37,6 +39,8 @@ class UnitsTest(unittest.TestCase):
         self.assertEqual(u["Slice"], ["ameesh-guest.slice"])
         self.assertEqual(u["OOMScoreAdjust"], ["500"])
         self.assertEqual(u["TimeoutStopSec"], ["180"])
+        # a volume in /etc/fstab that did not mount: no start on the root disk
+        self.assertEqual(u["RequiresMountsFor"], ["/srv/ameesh-guest"])
         self.assertTrue(u["MemoryHigh"] and u["MemoryMax"])
         self.assertLess(resources.parse_bytes(u["MemoryHigh"][0]),
                         resources.parse_bytes(u["MemoryMax"][0]))
@@ -84,6 +88,362 @@ class UnitsTest(unittest.TestCase):
 
     def test_guest_slice_is_measured(self):
         self.assertIn("ameesh-guest.slice", resources.GUEST_SLICES)
+
+
+class InstallPilotTest(unittest.TestCase):
+    """deploy/guest/install-pilot.sh: what the owner runs on the host (dry
+    runs only: nothing is installed by the tests)."""
+    SCRIPT = os.path.join(GUEST, "install-pilot.sh")
+
+    def dry(self, *args, stdin=None):
+        return subprocess.run(["bash", self.SCRIPT, "--dry-run", "--host", "vm-test", *args],
+                              capture_output=True, text=True, input=stdin)
+
+    def test_guard_unit(self):
+        u = unit("ameesh-guard.service")
+        self.assertNotIn("User", u)                      # root: set-property, freeze, kill
+        self.assertEqual(u["Slice"], ["system.slice"])   # never inside the slice it caps
+        self.assertIn("guard run $AMEESH_GUARD_ARGS", u["ExecStart"][0])
+        env = dict(v.partition("=")[::2] for v in u["Environment"])
+        self.assertEqual(env["AMEESH_GUARD_ARGS"], "--observe")
+        self.assertEqual(env["AMEESH_GUARD_CONFIG"], "/etc/ameesh/guard.json")
+
+    def test_gate_directories(self):
+        with open(os.path.join(GUEST, "ameesh-gate.tmpfiles.conf"), encoding="utf-8") as fh:
+            lines = [l.split() for l in fh if l.strip() and not l.startswith("#")]
+        dirs = {l[1]: l[2:5] for l in lines}
+        self.assertEqual(dirs["/run/ameesh-gate/state"], ["0755", "root", "root"])
+        self.assertEqual(dirs["/run/ameesh-gate/ack"][1:], ["ameesh-guest", "ameesh-guest"])
+        # the runner's ReadWritePaths needs the ack directory to exist
+        runner = unit("ameesh-guest-runner@.service")
+        self.assertIn("/run/ameesh-gate/ack", runner["ReadWritePaths"][0])
+
+    def test_install_dry_run(self):
+        subprocess.run(["bash", "-n", self.SCRIPT], check=True)
+        res = self.dry("--allow-rootfs", "--agent", "deepseek5")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        self.assertIn("useradd --system", out)
+        self.assertIn('"host": "vm-test"', out)
+        self.assertIn("AMEESH_GUARD_ARGS=--observe", out)
+        self.assertIn("/etc/ameesh/guest-deepseek5.env (0640 root:ameesh-guest)", out)
+        # the offer is checked by the installed guard before it is enabled
+        self.assertLess(out.index("guard check --config /etc/ameesh/guard.json"),
+                        out.index("systemctl enable --now ameesh-guard.service"))
+        # no guest runner is started by the install
+        self.assertNotIn("+ systemctl enable --now ameesh-guest-runner@", out)
+
+    def test_an_invalid_offer_is_refused(self):
+        res = self.dry("--allow-rootfs", "--lend", "/dev/stdin", stdin='{"cpu_max": 2}')
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("`memory_max` required", res.stderr)
+
+    def test_arguments_are_checked(self):
+        for args in (["--enable", "x;rm"], ["--purge"], ["--set-guard-mode"],
+                     ["--set-guard-mode", "on"], ["--root", "srv"]):
+            res = self.dry(*args)
+            self.assertNotEqual(res.returncode, 0, args)
+
+    def test_enable_and_guard_mode(self):
+        res = self.dry("--enable", "deepseek5", "deepseek6")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("systemctl enable --now ameesh-guest-runner@deepseek6.service", res.stdout)
+        res = self.dry("--set-guard-mode", "enforce")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("AMEESH_GUARD_ARGS=\n", res.stdout)
+        self.assertIn("systemctl restart ameesh-guard.service", res.stdout)
+
+    def test_uninstall_follows_the_study_order(self):
+        res = self.dry("--uninstall", "--purge")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        # runners and guard stop before their units are removed
+        self.assertLess(out.index("disable --now ameesh-guard.service"),
+                        out.index("rm -f /etc/systemd/system/ameesh-guest-runner@.service"))
+        self.assertIn("rm -f /etc/tmpfiles.d/ameesh-gate.conf", out)
+        self.assertIn("+ rm -f /etc/ameesh/guard.json\n", out)
+        # secrets the script did not record as its own stay (codex #383 r2)
+        self.assertNotIn("guest.env", out)
+        # only what the script recorded as its own goes (none here)
+        self.assertNotIn("userdel", out)
+        self.assertNotIn("rm -rf /opt/ameesh/venv", out)
+
+    def test_root_moves_the_runner(self):
+        # codex #383 r1 P2: the runner's unit follows --root, all its paths
+        res = self.dry("--allow-rootfs", "--root", "/mnt/guest")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        self.assertNotIn("/srv/ameesh-guest", out)
+        for line in ("RequiresMountsFor=/mnt/guest", "WorkingDirectory=/mnt/guest",
+                     "Environment=HOME=/mnt/guest/home", "Environment=TMPDIR=/mnt/guest/tmp",
+                     "ReadWritePaths=/mnt/guest /run/ameesh-gate/ack"):
+            self.assertIn(line + "\n", out)
+        # disk_max: no volume, no limit
+        self.assertIn("disk_max is indicative only", res.stderr)
+        for root in ("/", "/home", "/srv/", "/srv/a b", "/srv/../etc", "/srv/x#y"):
+            self.assertNotEqual(self.dry("--allow-rootfs", "--root", root).returncode, 0, root)
+
+    def test_install_records_each_path_before_creating_it(self):
+        # codex #383 r1 P1, P2: one record per directory the script creates,
+        # written before it; a directory that is there is not recorded
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "guest")
+            os.makedirs(os.path.join(root, "home"))
+            res = self.dry("--allow-rootfs", "--root", root)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            out = res.stdout
+            self.assertNotIn("guest-dir %s'" % root, out)
+            self.assertNotIn("guest-tree %s/home'" % root, out)
+            for d in ("tmp", "work"):
+                rec = out.index("record 'guest-tree %s/%s'" % (root, d))
+                self.assertLess(rec, out.index("install -d -m 0700 -o ameesh-guest -g ameesh-guest %s/%s"
+                                               % (root, d)))
+            if not os.path.isdir("/opt/ameesh/venv"):
+                self.assertLess(out.index("record 'venv-tree /opt/ameesh/venv'"),
+                                out.index("python3 -m venv /opt/ameesh/venv"))
+
+    def test_purge_removes_only_the_recorded_paths(self):
+        # codex #383 r1 P1: the absolute paths recorded, never /home, /tmp,
+        # /work nor the --root of the command line; the last created first
+        with tempfile.TemporaryDirectory() as tmp:
+            made = os.path.join(tmp, "guest")
+            for d in ("work", "tmp", "home"):
+                os.makedirs(os.path.join(made, d))
+            state = os.path.join(tmp, "pilot-install.state")
+            with open(state, "w", encoding="utf-8") as fh:
+                fh.write("user\nguest-dir %s\nguest-tree %s/work\nguest-tree /home\n"
+                         "guest-tree /tmp\nguest-tree %s/gone\nroot-content\n"
+                         "secret /etc/ameesh/guest-deepseek5.env\nsecret /etc/passwd\n"
+                         % (made, made, made))
+            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--uninstall", "--purge",
+                                  "--root", "/srv/elsewhere"],
+                                 capture_output=True, text=True,
+                                 env=dict(os.environ, PILOT_TEST_STATE=state))
+            self.assertEqual(res.returncode, 0, res.stderr)
+            out = res.stdout
+            removed = [l for l in out.splitlines() if l.startswith("+ rm") and made in l]
+            self.assertEqual(removed, ["+ rm -rf --one-file-system %s/work" % made,
+                                           "+ rmdir --ignore-fail-on-non-empty %s" % made])
+            self.assertIn("not removed: /home", out)
+            self.assertIn("not removed: /tmp", out)
+            for path in ("/home", "/tmp", "/srv/elsewhere", made + "/tmp", made + "/home"):
+                self.assertNotIn("rm -rf --one-file-system %s\n" % path, out)
+            self.assertIn("+ userdel ameesh-guest", out)
+            # secrets: only those recorded, only the script's own files
+            self.assertIn("+ rm -f /etc/ameesh/guest-deepseek5.env\n", out)
+            self.assertNotIn("rm -f /etc/passwd", out)
+            self.assertNotIn("guest-deepseek6", out)
+
+    def test_an_existing_file_is_never_taken_for_a_directory(self):
+        # codex #383 r2 P1: a file where a directory goes is refused before
+        # any record (a purge would delete it)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "guest")
+            os.makedirs(root)
+            with open(os.path.join(root, "work"), "w") as fh:
+                fh.write("not ours")
+            res = self.dry("--allow-rootfs", "--root", root)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("%s/work exists and is not a directory" % root, res.stderr)
+            self.assertNotIn("record 'guest-tree", res.stdout)
+
+    def test_mounts_beneath_a_tree_are_seen(self):
+        # codex #383 r2 P1: a bind mount under a recorded tree stops its purge
+        with open(self.SCRIPT, encoding="utf-8") as fh:
+            text = fh.read()
+        func = text[text.index("mounts_under() {"):]
+        func = func[:func.index("\n}\n") + 3]
+        def under(path):
+            return subprocess.run(["bash", "-c", "MOUNTINFO=/proc/self/mountinfo\n" + func
+                                   + 'mounts_under "$1"', "-", path],
+                                  stdin=subprocess.DEVNULL, timeout=30).returncode
+        self.assertEqual(under("/proc"), 0)          # /proc itself
+        if os.path.ismount("/dev/shm"):
+            self.assertEqual(under("/dev"), 0)       # /dev/shm beneath
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(under(tmp), 1)
+        self.assertEqual(under("/pro"), 1)           # a prefix is not a parent
+
+    def test_a_volume_bigger_than_disk_max_is_refused(self):
+        # codex #383 r2 P2: nothing but the volume's size holds disk_max
+        if not os.path.ismount("/dev/shm"):
+            self.skipTest("no /dev/shm mount")
+        lend = json.dumps({"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1MiB"})
+        res = self.dry("--root", "/dev/shm", "--lend", "/dev/stdin", stdin=lend)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("refused for real", res.stderr)
+        res = self.dry("--root", "/dev/shm", "--accept-larger-volume", "--lend", "/dev/stdin",
+                       stdin=lend)
+        self.assertNotIn("refused", res.stderr)
+        self.assertIn("(accepted)", res.stderr)
+
+    @staticmethod
+    def mountinfo(tmp, *points):
+        # a mountinfo of the test's own: "/" and the given mount points
+        path = os.path.join(tmp, "mountinfo")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n")
+            for i, point in enumerate(points):
+                fh.write("%d 22 8:1 /data/x %s rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+                         % (40 + i, point))
+        return path
+
+    def test_a_root_through_a_symbolic_link_is_refused(self):
+        # codex #383 r3 P1: mounts and records are compared as resolved paths
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            os.makedirs(os.path.join(tmp, "data"))
+            os.symlink(os.path.join(tmp, "data"), os.path.join(tmp, "link"))
+            res = self.dry("--allow-rootfs", "--root", os.path.join(tmp, "link", "guest"))
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("goes through a symbolic link: give %s/data/guest" % tmp, res.stderr)
+
+    def test_purge_keeps_a_tree_with_a_bind_mount_beneath(self):
+        # codex #383 r3 P1: a bind of the same filesystem, from mountinfo;
+        # what stays keeps its record
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            work = os.path.join(tmp, "guest", "work")
+            os.makedirs(os.path.join(work, "shared"))
+            os.makedirs(os.path.join(tmp, "data"))
+            os.symlink(os.path.join(tmp, "data"), os.path.join(tmp, "link"))
+            linked = os.path.join(tmp, "link")
+            state = os.path.join(tmp, "state")
+            with open(state, "w", encoding="utf-8") as fh:
+                fh.write("guest-tree %s\nguest-tree %s\n" % (work, linked))
+            env = dict(os.environ, PILOT_TEST_STATE=state,
+                       PILOT_TEST_MOUNTINFO=self.mountinfo(tmp, work + "/shared"))
+            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--uninstall", "--purge"],
+                                 capture_output=True, text=True, env=env)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            out = res.stdout
+            self.assertNotIn("rm -rf --one-file-system %s" % work, out)
+            self.assertNotIn("rm -rf --one-file-system %s" % linked, out)
+            self.assertIn("kept %s: a mount point is there or beneath" % work, out)
+            self.assertIn("kept %s: it goes through a symbolic link" % linked, out)
+            self.assertIn("kept in %s: guest-tree %s guest-tree %s" % (state, linked, work), out)
+            self.assertNotIn("+ rm -f %s" % state, out)
+
+    def test_a_broken_venv_is_never_removed_across_a_mount(self):
+        # codex #383 r4 P1: the venv's recovery goes through the purge's own
+        # protected removal (a bind of a user's home under share)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            venv = os.path.join(tmp, "opt", "venv")
+            os.makedirs(os.path.join(venv, "share"))       # no bin/pip: broken
+            state = os.path.join(tmp, "state")
+            with open(state, "w", encoding="utf-8") as fh:
+                fh.write("venv-tree %s\n" % venv)
+            env = dict(os.environ, PILOT_TEST_STATE=state, PILOT_TEST_VENV=venv,
+                       PILOT_TEST_MOUNTINFO=self.mountinfo(tmp, venv + "/share"))
+            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--host", "vm-test",
+                                  "--allow-rootfs", "--root", os.path.join(tmp, "guest")],
+                                 capture_output=True, text=True, env=env)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("kept %s: a mount point is there or beneath" % venv, res.stdout)
+            self.assertIn("%s not made again" % venv, res.stderr)
+            self.assertNotIn("rm -rf", res.stdout)
+            # without the bind: removed, then made again
+            env["PILOT_TEST_MOUNTINFO"] = self.mountinfo(tmp)
+            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--host", "vm-test",
+                                  "--allow-rootfs", "--root", os.path.join(tmp, "guest")],
+                                 capture_output=True, text=True, env=env)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertLess(res.stdout.index("+ rm -rf --one-file-system %s\n" % venv),
+                            res.stdout.index("+ python3 -m venv %s" % venv))
+
+    def test_every_recursive_removal_is_the_protected_one(self):
+        # codex #383 r4: one removal path for the whole script
+        with open(self.SCRIPT, encoding="utf-8") as fh:
+            lines = [l for l in fh if "rm -r" in l and not l.lstrip().startswith("#")]
+        self.assertEqual([l.strip() for l in lines], ['run rm -rf --one-file-system "$path"'])
+
+    def test_a_failed_userdel_keeps_its_record(self):
+        # codex #383 r3 P3: the guest still has processes; a later purge retries
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "state")
+            with open(state, "w", encoding="utf-8") as fh:
+                fh.write("user\n")
+            env = dict(os.environ, PILOT_TEST_STATE=state, PILOT_TEST_FAIL="userdel",
+                       PILOT_TEST_MOUNTINFO=self.mountinfo(tmp))
+            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--uninstall", "--purge"],
+                                 capture_output=True, text=True, env=env)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("+ userdel ameesh-guest", res.stdout)
+            self.assertIn("kept user ameesh-guest: userdel failed", res.stdout)
+            self.assertIn("kept in %s: user" % state, res.stdout)
+            self.assertNotIn("+ rm -f %s" % state, res.stdout)
+            env.pop("PILOT_TEST_FAIL")
+            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--uninstall", "--purge"],
+                                 capture_output=True, text=True, env=env)
+            self.assertIn("+ rm -f %s" % state, res.stdout)
+
+    def test_a_bind_mounted_root_is_held_to_disk_max(self):
+        # codex #383 r3 P2: a directory bind is a mount (mountinfo), and its
+        # filesystem's size is held to disk_max
+        lend = json.dumps({"cpu_max": 1, "memory_max": "1GiB", "disk_max": "1MiB"})
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = os.path.realpath(tmp)
+            root = os.path.join(tmp, "pilot")
+            os.makedirs(root)
+            env = dict(os.environ, PILOT_TEST_MOUNTINFO=self.mountinfo(tmp, root))
+            run = lambda *a: subprocess.run(
+                ["bash", self.SCRIPT, "--dry-run", "--host", "vm-test", "--root", root,
+                 "--lend", "/dev/stdin", *a], capture_output=True, text=True, input=lend, env=env)
+            res = run()
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertNotIn("not a mount point", res.stdout)
+            self.assertIn("refused for real", res.stderr)
+            self.assertIn("(accepted)", run("--accept-larger-volume").stderr)
+            # not in mountinfo: not a volume, whatever the directory
+            env["PILOT_TEST_MOUNTINFO"] = self.mountinfo(tmp)
+            res = run()
+            self.assertIn("is not a mount point", res.stdout)
+            self.assertIn("not a volume of its own", res.stderr)
+
+    def test_observe_takes_the_caps_off(self):
+        # codex #383 r1 P2: a stopped guard leaves its caps; observe removes them
+        res = self.dry("--set-guard-mode", "observe")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        stop = out.index("+ systemctl stop ameesh-guard.service")
+        reset = out.index("+ rm -rf --one-file-system /run/systemd/system.control/ameesh-guest.slice.d")
+        start = out.index("+ systemctl start ameesh-guard.service")
+        self.assertLess(stop, reset)
+        self.assertLess(reset, start)
+
+    def test_reinstall_restarts_the_guard(self):
+        # codex #383 r1 P2: a new offer or mode reaches a running guard
+        res = self.dry("--allow-rootfs", "--guard-mode", "enforce")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = res.stdout
+        self.assertIn("AMEESH_GUARD_ARGS=\n", out)
+        self.assertLess(out.index("+ systemctl stop ameesh-guard.service"),
+                        out.index("+ systemctl enable --now ameesh-guard.service"))
+        self.assertIn("the guard runs in enforce", out)
+
+    def test_owner_runbook_commands_run(self):
+        # PILOT-ameesh-agents-1.md: each of its script commands, dry run
+        import re
+        import shlex
+        with open(os.path.join(GUEST, "PILOT-ameesh-agents-1.md"), encoding="utf-8") as fh:
+            text = re.sub(r"\\\n\s*", "", fh.read())
+        commands = []
+        for line in text.splitlines():
+            m = re.search(r"sudo deploy/guest/install-pilot\.sh([^`#|]*)", line)
+            if m:
+                commands.append(shlex.split(m.group(1)))
+        self.assertGreaterEqual(len(commands), 8)
+        for args in commands:
+            args = [a for a in args if a != "--dry-run"]
+            if "--host" not in args:
+                args = ["--host", "vm-test", *args]   # --enable takes the rest
+            res = subprocess.run(["bash", self.SCRIPT, "--dry-run", *args],
+                                 capture_output=True, text=True)
+            if "--check" in args:   # read only: it fails here, nothing being installed
+                self.assertNotIn("install-pilot.sh:", res.stderr, args)
+            else:
+                self.assertEqual(res.returncode, 0, (args, res.stderr))
 
 
 def reading(ts, **over):

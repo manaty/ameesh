@@ -318,6 +318,27 @@ Autres fermetures : `ameesh work close <id> --abandoned | --superseded-by
 --correct "raison"` (humains, orchestrateurs et agents de conception
 seulement ; tracé au journal).
 
+## File de fusion par cible (L160e)
+
+Un lot prêt entre dans la file de sa cible, au lieu d'un « feu de fusion »
+donné à la main :
+
+```
+ameesh work milestone <id> frozen --sha <commit>               le gel
+ameesh work milestone <id> verdict --verdict ok --sha <commit>  le GO de revue, sur ce commit
+ameesh work queue add <id>                                      dans la file
+```
+
+ameesh range la file à chaque passage du radar : priorité, puis les lots
+sans conflit, puis ceux dont les conflits sont préparés (`ameesh work
+resolve`), puis l'arrivée. Il la rejoue empilée (la cible, plus les lots qui
+précèdent, plus celui-ci) et en sort un lot dont un conflit n'est couvert par
+aucune résolution, ou dont la branche a bougé après le gel ; son agent est
+prévenu. On fusionne le lot de rang 1 (`ameesh work queue show`), puis le
+suivant. Un lot en file ne reçoit plus de commit : `ameesh work queue remove
+<id>` d'abord. La fusion par ameesh elle-même (`ameesh work land`) vient
+avec L160e2.
+
 ## Le lot en cours
 
 `ameesh projects` montre comme lot en cours d'un agent le dernier lot

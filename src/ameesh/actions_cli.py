@@ -472,31 +472,42 @@ def cmd_recover(cfg: Config, args: argparse.Namespace) -> int:
 # decisions
 # --------------------------------------------------------------------------
 
-def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
+def decisions_view(db, *, human: str | None = None, include_closed: bool = False,
+                   now: float | None = None, viewer: str | None = None) -> dict:
+    """The object of `ameesh decisions --json` (also `GET /api/v1/decisions`,
+    L84): the queue of `human` (all when None); `viewer`, when given, only
+    sees the prose decisions addressed to the mesh or to them."""
     from . import decisions as decisions_mod
-    now = time.time()
-    db = _open(cfg)
-    try:
-        queue = actions.decisions(db, human=args.for_human)
-        # L124 : les demandes de décision des agents, tous projets confondus
-        requests = decisions_mod.queue(db, human=args.for_human, include_closed=args.all,
-                                       now=now)
-        # L233: decisions written in prose in mail, not filed as requests
-        prose = decisions_mod.prose_decisions(db, now)
-    finally:
-        db.close()
-    # whose mail may be shown: --for, and in the owner's chat (L123) its human
-    # by default — a chat never shows excerpts of mail addressed to another
-    viewer = args.for_human or (decisions_mod.current_human()
-                                if os.environ.get(decisions_mod.CHAT_ENV) else None)
+    now = time.time() if now is None else now
+    queue = actions.decisions(db, human=human)
+    # L124 : les demandes de décision des agents, tous projets confondus
+    requests = decisions_mod.queue(db, human=human, include_closed=include_closed, now=now)
+    # L233: decisions written in prose in mail, not filed as requests
+    prose = decisions_mod.prose_decisions(db, now)
     if viewer:
         prose = [p for p in prose
                  if p["recipient"] in decisions_mod.PROSE_RECIPIENTS
                  + (viewer, decisions_mod.OWNER_ANY)]
     queue["requests"] = requests["pending"]
     queue["prose"] = prose
-    if args.all:
+    if include_closed:
         queue["requests_closed"] = requests["closed"]
+    return queue
+
+
+def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
+    from . import decisions as decisions_mod
+    now = time.time()
+    # whose mail may be shown: --for, and in the owner's chat (L123) its human
+    # by default — a chat never shows excerpts of mail addressed to another
+    viewer = args.for_human or (decisions_mod.current_human()
+                                if os.environ.get(decisions_mod.CHAT_ENV) else None)
+    db = _open(cfg)
+    try:
+        queue = decisions_view(db, human=args.for_human, include_closed=args.all, now=now,
+                               viewer=viewer)
+    finally:
+        db.close()
     if args.json:
         _dump(queue)
         return 0
@@ -518,7 +529,7 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
             for line in decisions_mod.format_view(view, now):
                 print("  " + line)
     if not total:
-        _prose_and_unasked(prose, waiting, now)
+        _prose_and_unasked(queue["prose"], waiting, now)
         _closed_requests(queue.get("requests_closed") or [], now)
         return 0
     if queue["approvals"]:
@@ -531,7 +542,7 @@ def cmd_decisions(cfg: Config, args: argparse.Namespace) -> int:
         for row in queue["unknown"] + queue["interrupted"]:
             print("  " + _line(row))
             print("      %s" % row["hint"])
-    _prose_and_unasked(prose, waiting, now)
+    _prose_and_unasked(queue["prose"], waiting, now)
     _closed_requests(queue.get("requests_closed") or [], now)
     return 0
 
