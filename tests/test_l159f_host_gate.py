@@ -869,12 +869,14 @@ class OnceTurnTest(PgTestCase):
         from ameesh import db as db_mod, runner as runner_mod
         worker = types.SimpleNamespace(
             watchdog_stop=threading.Event(), lease_lost=threading.Event(),
-            db=None, name="a1", epoch=7, runner=types.SimpleNamespace(runner_id="r1"))
+            db=None, name="a1", epoch=7, runner=types.SimpleNamespace(runner_id="r1"),
+            _close_resident=mock.Mock())   # L76: nothing outlives the lease
         worker.lease_lost.set()
         with mock.patch.object(runner_mod.registry, "release",
                                side_effect=db_mod.DbError("down")) as release:
             self.assertFalse(runner_mod.AgentWorker.release_lease(worker))
         release.assert_called_once_with(None, "a1", "r1", 7)
+        worker._close_resident.assert_called_once_with("lease released")
         with mock.patch.object(runner_mod.registry, "release", return_value=False):
             self.assertTrue(runner_mod.AgentWorker.release_lease(worker))  # not ours
 
