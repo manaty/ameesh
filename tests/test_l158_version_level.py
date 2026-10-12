@@ -227,6 +227,72 @@ class VersionLevelTest(unittest.TestCase):
         self._commit("1.2.3", "migration")
         self.assertEqual(vl.level("v1.2.3", "HEAD")[0], "major")
 
+    def _migration_level(self, sql):
+        self._git("checkout", "-q", "-B", "case", "v1.2.3")
+        self._write("src/ameesh/migrations/0002_b.sql", sql + "\n")
+        self._commit("1.2.3", "migration")
+        return vl.level("v1.2.3", "HEAD")[0]
+
+    def test_sql_bodies_and_escapes(self):
+        # r3/r4: a DO block runs at migration time; a dollar body closes on
+        # its own tag only; E'' strings take backslash escapes
+        cases = (("DO $$ BEGIN ALTER TABLE a DROP COLUMN x; END $$;", "major"),
+                 ("do language plpgsql $x$ begin execute 'alter table a drop column y'; "
+                  "end $x$;", "major"),
+                 ("DO $$ BEGIN RAISE NOTICE 'rename later'; END $$;", "minor"),
+                 ("SELECT $body$ safe $$; DELETE FROM a; $body$;", "minor"),
+                 ("INSERT INTO notes VALUES (E'it\\'s rename');", "minor"),
+                 ("INSERT INTO notes VALUES (E'a\\\\'); DELETE FROM a;", "major"),
+                 ("/* nested /* drop table a; */ still a comment */ create table c (y int);",
+                  "minor"))
+        for sql, expected in cases:
+            with self.subTest(sql):
+                self.assertEqual(self._migration_level(sql), expected)
+
+    def test_helper_called_by_name(self):
+        positional = ('def _options(p):\n    p.add_argument("--custom")\n\n\n'
+                      'def build(sub):\n    p = sub.add_parser("show")\n    _options(p)\n')
+        named = positional.replace("_options(p)\n", "_options(p=p)\n")
+        self.assertEqual(self._floor(positional, named)[0], "patch")
+        floor, reasons = self._floor(named, named.replace('"--custom"', '"--other"'))
+        self.assertEqual((floor, reasons[0]), ("major", "option show --custom removed"))
+
+    def test_parsers_filled_in_another_module(self):
+        # r3/r4: `plan_cli.add_parsers(work_sub, …)` fills `work`, not the top
+        self._git("checkout", "-q", "-B", "case", "v1.2.3")
+        self._write("src/ameesh/plan_cli.py",
+                    'def add_parsers(work_sub, func):\n'
+                    '    p = work_sub.add_parser("link")\n    p.add_argument("--none")\n')
+        cli = ('def build(sub):\n    from . import plan_cli\n'
+               '    work_sub = sub.add_parser("work").add_subparsers()\n'
+               '    plan_cli.add_parsers(work_sub, None)\n')
+        self._write("src/ameesh/cli.py", cli)
+        self._commit("1.2.3", "cli")
+        self._git("tag", "-f", "case-base")
+        self.assertIn("work link --none", vl.surface("case-base")["option"])
+        self.assertNotIn("link --none", vl.surface("case-base")["option"])
+        self._write("src/ameesh/cli.py", cli.replace("add_parsers(work_sub,", "add_parsers(sub,"))
+        self._commit("1.2.3", "moved")
+        floor, reasons = vl.level("case-base", "HEAD")
+        self.assertEqual(floor, "major")
+        self.assertIn("command work link removed", reasons)
+        # imported by name, the same
+        self._write("src/ameesh/cli.py", cli.replace("from . import plan_cli", "from .plan_cli "
+                                                     "import add_parsers").replace(
+            "plan_cli.add_parsers", "add_parsers"))
+        self._commit("1.2.3", "by name")
+        self.assertEqual(vl.level("case-base", "HEAD")[0], "patch")
+
+    def test_loop_over_literals(self):
+        cli = ('def build(sub):\n    for action in ("approve", "retry"):\n'
+               '        p = sub.add_parser(action)\n        p.add_argument("--by")\n'
+               '    for name, flag in (("show", "--json"), ("list", "--all")):\n'
+               '        sub.add_parser(name).add_argument(flag)\n')
+        floor, reasons = self._floor(cli, cli.replace('("approve", "retry")', '("retry",)'))
+        self.assertEqual((floor, reasons), ("major", ["command approve removed"]))
+        floor, reasons = self._floor(cli, cli.replace('("list", "--all")', '("list", "--a")'))
+        self.assertEqual((floor, reasons[0]), ("major", "option list --all removed"))
+
     def test_breaking_trailer(self):
         self._write("src/ameesh/cli.py", CLI + "# mail payload v2\n")
         self._commit("1.2.3", "mail payload v2\n\nameesh-breaking: payload key renamed")

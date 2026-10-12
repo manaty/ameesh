@@ -31,7 +31,11 @@ The level found in the range is a floor, from what a script can see:
 
 The CLI is read from the syntax tree of each module (`add_parser` with its
 `aliases`, every option string of `add_argument`), not from the text:
-reordering the aliases of an option changes nothing.
+reordering the aliases of an option changes nothing. A parser handed to a
+function, of the same module or another, by position or by name, fills the
+caller's command; a loop over literal strings counts each of them. In a new
+migration, comments, strings and function bodies are not statements; the
+body of a `DO` block is, with the strings it `EXECUTE`s.
 
 The number must be the next one at its own level (1.9.0 → 1.9.1, 1.10.0 or
 2.0.0), and that level must not be below the floor. A level above the floor
@@ -100,60 +104,224 @@ def last_tag(ref: str) -> str:
     return git("describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", ref).strip()
 
 
-_SQL_TOKENS = re.compile(
-    r"(?P<comment>--[^\n]*|/\*.*?\*/)"
-    r"|(?P<dollar>\$(?P<tag>[A-Za-z_]\w*)?\$.*?\$(?P=tag)?\$)"
-    r"|(?P<string>'(?:[^']|'')*')"
-    r"|(?P<ident>\"(?:[^\"]|\"\")*\")", re.S)
+_DOLLAR = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+#: what precedes the body of an anonymous block, executed by the migration
+_DO = re.compile(r"^\s*do(?:\s+language\s+\w+)?\s*$", re.I)
+#: in an anonymous block: a string run as a statement
+_DYNAMIC = re.compile(r"(?:\bexecute|\bformat\s*\()\s*$", re.I)
 
 
-def _sql(text: str) -> str:
-    """The SQL without what is not a statement: comments, string literals and
-    dollar-quoted bodies (`DEFAULT 'rename'`, a function's `DELETE FROM`),
-    quoted identifiers kept as a neutral `"q"` (a column named "rename")."""
-    def neutral(found):
-        return '"q"' if found.group("ident") else (" " if found.group("comment") else "''")
-    return _SQL_TOKENS.sub(neutral, text)
+def _sql(text: str, block: bool = False) -> str:
+    """The SQL without what is not a statement: comments, string literals
+    (`E'it\\'s'` included) and dollar-quoted bodies (`DEFAULT 'rename'`, a
+    function's `DELETE FROM`), quoted identifiers kept as a neutral `"q"` (a
+    column named "rename"). A dollar body closes on its own tag only. The
+    body of a `DO` block runs at migration time: it is read as SQL, and so
+    are the strings it `EXECUTE`s (`block`)."""
+    out: list[str] = []
+    statement = ""  # the current statement, as kept so far
+    i, n = 0, len(text)
+
+    def keep(piece: str) -> None:
+        nonlocal statement
+        out.append(piece)
+        statement += piece
+
+    while i < n:
+        c = text[i]
+        if text.startswith("--", i):
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+            keep(" ")
+        elif text.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+            keep(" ")
+        elif c == "'" or c in "Ee" and text.startswith("'", i + 1) \
+                and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "_$")):
+            escapes = c != "'"
+            i += 2 if escapes else 1
+            body = []
+            while i < n:
+                if escapes and text[i] == "\\" and i + 1 < n:
+                    body.append(text[i + 1])
+                    i += 2
+                elif text.startswith("''", i):
+                    body.append("'")
+                    i += 2
+                elif text[i] == "'":
+                    i += 1
+                    break
+                else:
+                    body.append(text[i])
+                    i += 1
+            if block and _DYNAMIC.search(statement):
+                keep(" %s " % _sql("".join(body)))
+            else:
+                keep("''")
+        elif c == '"':
+            end = i + 1
+            while True:
+                end = text.find('"', end)
+                if end < 0 or not text.startswith('""', end):
+                    break
+                end += 2
+            i = n if end < 0 else end + 1
+            keep('"q"')
+        elif c == "$" and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] in "_$")) \
+                and _DOLLAR.match(text, i):
+            tag = _DOLLAR.match(text, i).group(0)
+            end = text.find(tag, i + len(tag))
+            body = text[i + len(tag):n if end < 0 else end]
+            i = n if end < 0 else end + len(tag)
+            if _DO.match(statement):
+                keep(" %s " % _sql(body, block=True))
+            else:
+                keep("''")
+        elif c == ";":
+            out.append(c)
+            statement = ""
+            i += 1
+        else:
+            keep(c)
+            i += 1
+    return "".join(out)
 
 
-def _strings(node) -> list[str]:
-    """The string literals of a list or tuple node (nothing else)."""
-    if isinstance(node, (ast.List, ast.Tuple)):
-        return [e.value for e in node.elts
-                if isinstance(e, ast.Constant) and isinstance(e.value, str)]
-    return []
+def _imports(tree: ast.Module, module: str, init: bool = False,
+             ) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
+    """The package modules a file imports, anywhere in it: {alias: module}
+    (`from . import budget as budget_mod`), and the functions it imports by
+    name: {alias: (module, function)} (`from .plan_cli import add_parsers`)."""
+    package = (module.split(".") if module else []) if init else module.split(".")[:-1]
+    modules: dict[str, str] = {}
+    functions: dict[str, tuple[str, str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = package[:len(package) - (node.level - 1)] if node.level > 1 else package
+                if node.level - 1 > len(package):
+                    continue
+            elif (node.module or "").split(".")[0] in PROGRAMS[:1]:
+                base = []
+            else:
+                continue
+            words = (node.module or "").split(".") if node.module else []
+            if not node.level:
+                words = words[1:]  # `from ameesh.x import y`
+            for name in node.names:
+                alias = name.asname or name.name
+                modules[alias] = ".".join(base + words + [name.name])
+                if words or base:
+                    functions[alias] = (".".join(base + words), name.name)
+        elif isinstance(node, ast.Import):
+            for name in node.names:
+                words = name.name.split(".")
+                if words[0] == PROGRAMS[0] and len(words) > 1 and name.asname:
+                    modules[name.asname] = ".".join(words[1:])
+    return modules, functions
+
+
+class _Package:
+    """Every module of the package at one ref: a parser handed to a function
+    of another module (`plan_cli.add_parsers(work_sub, cmd_work)`) fills the
+    caller's command, not the top level."""
+
+    def __init__(self, trees: dict[str, tuple[ast.Module, bool]]):
+        self.commands: set[str] = set()
+        self.options: set[str] = set()
+        self.files = {module: _Parsers(tree, module, self, init)
+                      for module, (tree, init) in trees.items()}
+        #: (module, function) running, against recursion across modules
+        self.stack: list[tuple[str, str]] = []
+        #: functions called somewhere in the package: their callers say
+        #: which parser they fill, so they are never also read as filling the
+        #: top level (inlining such a helper, or moving it, changes nothing)
+        self.called = {callee for parsers in self.files.values()
+                       for node in ast.walk(parsers.tree) if isinstance(node, ast.Call)
+                       for callee in [parsers.callee(node.func)] if callee}
+
+    def function(self, callee: tuple[str, str]):
+        parsers = self.files.get(callee[0])
+        found = parsers.functions.get(callee[1]) if parsers else None
+        return (parsers, found) if found else (None, None)
+
+    def walk(self) -> None:
+        for parsers in self.files.values():
+            parsers.walk()
 
 
 class _Parsers(ast.NodeVisitor):
     """The argparse tree of one file, statement after statement: a variable
     bound to `add_parser("x")` is the command path `… x`; `add_subparsers()`
-    and argument groups keep the path of their parser; a local function
-    called with a parser runs with its parameter bound to that path. A
-    variable the file does not bind (a parameter) is the top level. Every
-    option string of `add_argument` is kept with its command, so `show
-    --json` and `list --json` are two entries."""
+    and argument groups keep the path of their parser; a function of the
+    package called with a parser (by position or by name, from this file or
+    another) runs with its parameter bound to that path; a loop over literal
+    strings runs once per string. A variable the file does not bind (a
+    parameter) is the top level. Every option string of `add_argument` is
+    kept with its command, so `show --json` and `list --json` are two
+    entries."""
 
-    def __init__(self, tree: ast.Module, module: str = "?"):
+    def __init__(self, tree: ast.Module, module: str = "?", package: "_Package | None" = None,
+                 init: bool = False):
+        self.tree = tree
         self.module = module
-        self.commands: set[str] = set()
-        self.options: set[str] = set()
+        self.package = package
         self.functions = {n.name: n for n in tree.body
                           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        self.modules, self.imported = _imports(tree, module, init)
         self.env: dict[str, tuple[str, ...]] = {}
-        self.stack: list[str] = []
-        #: local functions called within the file: their callers say which
-        #: parser they fill, so they are never also read as filling the top
-        #: level (inlining such a helper changes nothing)
-        self.called = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call)
-                       and isinstance(n.func, ast.Name) and n.func.id in self.functions}
+        #: names bound to a literal string (a loop over literals, `x = "y"`)
+        self.consts: dict[str, str] = {}
         #: may an unbound name (a parameter) stand for the top level?
         self.unbound = True
+
+    @property
+    def commands(self) -> set[str]:
+        return self.package.commands
+
+    @property
+    def options(self) -> set[str]:
+        return self.package.options
+
+    def callee(self, func) -> tuple[str, str] | None:
+        """The (module, function) of the package a call targets, if known."""
+        if isinstance(func, ast.Name):
+            if func.id in self.functions:
+                return self.module, func.id
+            return self.imported.get(func.id)
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) \
+                and func.value.id in self.modules:
+            return self.modules[func.value.id], func.attr
+        return None
+
+    def text(self, node) -> str | None:
+        """A literal string, or a name bound to one."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            return self.consts.get(node.id)
+        return None
+
+    def strings(self, node) -> list[str]:
+        """The strings of a list or tuple node (nothing else)."""
+        if isinstance(node, (ast.List, ast.Tuple)):
+            return [t for t in map(self.text, node.elts) if t is not None]
+        return []
 
     def path(self, node) -> tuple[str, ...] | None:
         """The command path of a parser expression: a known variable, a call
         that builds a parser, else the top level (an unknown name or
         attribute); None for anything else."""
         if isinstance(node, ast.Name):
+            if node.id in self.consts:
+                return None
             return self.env.get(node.id, () if self.unbound else None)
         if isinstance(node, ast.Attribute):
             return () if self.unbound else None
@@ -165,11 +333,11 @@ class _Parsers(ast.NodeVisitor):
         the function that builds it. `ameesh run --wait` and `ameesh attach
         --wait` are then two options, not one global `--wait`."""
         for keyword in node.keywords:
-            if keyword.arg == "prog" and isinstance(keyword.value, ast.Constant) \
-                    and isinstance(keyword.value.value, str):
-                words = keyword.value.value.split()
+            if keyword.arg == "prog" and self.text(keyword.value) is not None:
+                words = self.text(keyword.value).split()
                 return tuple(words[1:] if words and words[0] in PROGRAMS else words)
-        return ("%s:%s" % (self.module, self.stack[-1] if self.stack else "<module>"),)
+        stack = self.package.stack if self.package else []
+        return ("%s:%s" % (self.module, stack[-1][1] if stack else "<module>"),)
 
     def parser_of(self, node) -> tuple[str, ...] | None:
         """The path a call returns when it builds a parser, None otherwise."""
@@ -182,9 +350,8 @@ class _Parsers(ast.NodeVisitor):
         base = self.path(node.func.value)
         if base is None:
             return None
-        if node.func.attr == "add_parser" and node.args and isinstance(
-                node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
-            return base + (node.args[0].value,)
+        if node.func.attr == "add_parser" and node.args and self.text(node.args[0]) is not None:
+            return base + (self.text(node.args[0]),)
         if node.func.attr in ("add_subparsers", "add_argument_group",
                               "add_mutually_exclusive_group"):
             return base
@@ -193,41 +360,75 @@ class _Parsers(ast.NodeVisitor):
     def visit_Assign(self, node):
         self.visit(node.value)
         built = self.parser_of(node.value)
+        value = self.text(node.value)
         for target in node.targets:
             if isinstance(target, ast.Name):
-                if built is None:
-                    self.env.pop(target.id, None)
-                else:
+                self.env.pop(target.id, None)
+                self.consts.pop(target.id, None)
+                if built is not None:
                     self.env[target.id] = built
+                elif value is not None:
+                    self.consts[target.id] = value
+
+    def _bind(self, target, node, consts: dict[str, str]) -> None:
+        if isinstance(target, ast.Name) and self.text(node) is not None:
+            consts[target.id] = self.text(node)
+        elif isinstance(target, (ast.Tuple, ast.List)) and isinstance(node, (ast.Tuple, ast.List)) \
+                and len(target.elts) == len(node.elts):
+            for one, value in zip(target.elts, node.elts):
+                self._bind(one, value, consts)
+
+    def visit_For(self, node):
+        if not isinstance(node.iter, (ast.List, ast.Tuple)):
+            self.generic_visit(node)
+            return
+        saved = dict(self.consts)
+        for element in node.iter.elts:  # a loop over literals: once per value
+            consts: dict[str, str] = {}
+            self._bind(node.target, element, consts)
+            self.consts = dict(saved, **consts)
+            for statement in node.body:
+                self.visit(statement)
+        self.consts = saved
+        for statement in node.orelse:
+            self.visit(statement)
 
     def visit_Call(self, node):
         self.generic_visit(node)
         func = node.func
+        callee = self.callee(func)
+        if callee is not None and self.package is not None:
+            parsers, function = self.package.function(callee)
+            if function is None or callee in self.package.stack:
+                return
+            arguments = function.args
+            params = [a.arg for a in arguments.posonlyargs + arguments.args]
+            named = set(params) | {a.arg for a in arguments.kwonlyargs}
+            bound = {}
+            for param, arg in zip(params, node.args):
+                if not isinstance(arg, ast.Starred) and self.path(arg) is not None:
+                    bound[param] = self.path(arg)
+            for keyword in node.keywords:
+                if keyword.arg in named and self.path(keyword.value) is not None:
+                    bound[keyword.arg] = self.path(keyword.value)
+            if bound:
+                parsers.run(function, bound, unbound=False)
+            return
         if isinstance(func, ast.Attribute):
             base = self.path(func.value)
             if base is None:
                 return
-            if func.attr == "add_parser" and node.args and isinstance(
-                    node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
-                names = [node.args[0].value]
+            if func.attr == "add_parser" and node.args and self.text(node.args[0]) is not None:
+                names = [self.text(node.args[0])]
                 for keyword in node.keywords:
                     if keyword.arg == "aliases":
-                        names += _strings(keyword.value)
+                        names += self.strings(keyword.value)
                 self.commands.update(" ".join(base + (n,)) for n in names)
             elif func.attr == "add_argument":
                 for arg in node.args:
-                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str) \
-                            and arg.value.startswith("-"):
-                        self.options.add(" ".join(base + (arg.value,)))
-        elif isinstance(func, ast.Name) and func.id in self.functions \
-                and func.id not in self.stack:
-            bound = {}
-            params = self.functions[func.id].args.args
-            for param, arg in zip(params, node.args):
-                if isinstance(arg, ast.Name) and arg.id in self.env:
-                    bound[param.arg] = self.env[arg.id]
-            if bound:
-                self.run(self.functions[func.id], bound, unbound=False)
+                    option = self.text(arg)
+                    if option is not None and option.startswith("-"):
+                        self.options.add(" ".join(base + (option,)))
 
     def visit_FunctionDef(self, node):
         pass  # run from `walk` (top level) or from a call, never in passing
@@ -235,19 +436,22 @@ class _Parsers(ast.NodeVisitor):
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def run(self, function, bound: dict[str, tuple[str, ...]], unbound: bool = True):
-        saved = self.env, self.unbound
-        self.env, self.unbound = dict(bound), unbound
-        self.stack.append(function.name)
-        for statement in function.body:
-            self.visit(statement)
-        self.stack.pop()
-        self.env, self.unbound = saved
+        saved = self.env, self.consts, self.unbound
+        self.env, self.consts, self.unbound = dict(bound), {}, unbound
+        self.package.stack.append((self.module, function.name))
+        try:
+            for statement in function.body:
+                self.visit(statement)
+        finally:
+            self.package.stack.pop()
+            self.env, self.consts, self.unbound = saved
 
-    def walk(self, tree: ast.Module):
-        for statement in tree.body:
+    def walk(self):
+        for statement in self.tree.body:
             self.visit(statement)
         for function in self.functions.values():
-            self.run(function, {}, unbound=function.name not in self.called)
+            self.run(function, {},
+                     unbound=(self.module, function.name) not in self.package.called)
 
 
 def surface(ref: str) -> dict[str, set[str]]:
@@ -256,21 +460,25 @@ def surface(ref: str) -> dict[str, set[str]]:
     out: dict[str, set[str]] = {"command": set(), "option": set(), "setting": set()}
     names = [n for n in git("ls-tree", "-r", "--name-only", ref, "--", SOURCES).split()
              if n.endswith(".py")]
+    trees = {}
     for name in names:
         text = git("show", "%s:%s" % (ref, name))
         try:
             tree = ast.parse(text, filename=name)
         except SyntaxError as exc:
             raise Error("%s at %s: %s" % (name, ref, exc))
-        parsers = _Parsers(tree, name[len(SOURCES):-3].replace("/", "."))
-        parsers.walk(tree)
-        out["command"].update(parsers.commands)
-        out["option"].update(parsers.options)
+        module = name[len(SOURCES):-3].replace("/", ".")
+        init = module == "__init__" or module.endswith(".__init__")
+        trees[module[:-len("__init__")].rstrip(".") if init else module] = (tree, init)
         if name == SOURCES + "main.py":
             for one, several in _MAIN_COMMAND.findall(text):
                 out["command"].update([one] if one else re.findall(r"""["']([\w-]+)["']""",
                                                                     several))
         out["setting"].update(_SETTING.findall(text))
+    package = _Package(trees)
+    package.walk()
+    out["command"].update(package.commands)
+    out["option"].update(package.options)
     return out
 
 
