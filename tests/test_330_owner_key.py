@@ -134,6 +134,35 @@ class OwnerKeyTest(_Keys):
             authority.register_human_key(self.db, "human:bob", signing.read_public(public))
         self.assertIn("bob", self.registry_names())
 
+    def test_stopgap_cleanup_only_clears_the_key(self):
+        # #326 r5 P2: the stopgap's owner key copied to its holder, the row
+        # may lose its key — never get another one nor an agent key in its place
+        registry.upsert(self.db, "smichea", harness="none", host=self.cfg.host)
+        self.db.execute("UPDATE agent_registry SET mode = 'externe', status = 'stopped', "
+                        "responsible = 'human:smichea' WHERE name = 'smichea'")
+        _private, public = self.keypair("smichea")
+        authority.register_key(self.db, "smichea", signing.read_public(public), role="owner")
+        with open(MIGRATION, encoding="utf-8") as fh:
+            self.db.script(fh.read())
+        copied = authority.key_info(self.db, "smichea")["public_key_fingerprint"]
+        for sql in ("UPDATE agent_registry SET public_key = 'K', "
+                    "public_key_fingerprint = 'F', key_role = 'agent' WHERE name = 'smichea'",
+                    "UPDATE agent_registry SET public_key = 'K', "
+                    "public_key_fingerprint = 'F' WHERE name = 'smichea'",
+                    "UPDATE agent_registry SET key_role = 'agent' WHERE name = 'smichea'",
+                    "UPDATE agent_registry SET public_key = NULL, "
+                    "public_key_fingerprint = NULL, key_role = 'agent' WHERE name = 'smichea'"):
+            with self.assertRaises(DbError, msg=sql) as ctx:
+                self.db.execute(sql)
+            self.assertIn("own gesture", str(ctx.exception))
+        info = authority.key_info(self.db, "smichea")
+        self.assertEqual((info["holder"], info["public_key_fingerprint"]), ("human", copied))
+        # clearing it is the cleanup: the holder's key stays the one read
+        self.db.execute("UPDATE agent_registry SET public_key = NULL, "
+                        "public_key_fingerprint = NULL WHERE name = 'smichea'")
+        info = authority.key_info(self.db, "smichea")
+        self.assertEqual((info["holder"], info["public_key_fingerprint"]), ("human", copied))
+
     def test_stopgap_with_a_session_is_not_the_stopgap(self):
         registry.upsert(self.db, "smichea", harness="none", host=self.cfg.host)
         self.db.execute("UPDATE agent_registry SET mode = 'externe', status = 'stopped', "
@@ -383,6 +412,56 @@ class OwnerKeyGuardTest(_Keys):
         self.assertIn("key_holders_one_owner", outcome["second"])
         self.assertEqual([r["name"] for r in self.db.query(
             "SELECT name FROM key_holders WHERE key_role = 'owner'")], ["bootstrap"])
+
+    def _race(self, first_sql, second_sql):
+        """`first_sql` in a transaction left open while another connection
+        runs `second_sql`; what became of the second."""
+        opened = self.db.transaction()
+        first = opened.__enter__()
+        first.execute(first_sql)
+        outcome = {}
+        other = self.connect()      # its own connection: really concurrent
+
+        def second():
+            try:
+                with other.transaction() as tx:
+                    tx.execute(second_sql)
+                outcome["second"] = "committed"
+            except DbError as exc:
+                outcome["second"] = str(exc)
+
+        thread = threading.Thread(target=second)
+        thread.start()
+        thread.join(2)
+        blocked = thread.is_alive()     # held back by the lock on the name
+        opened.__exit__(None, None, None)
+        thread.join(30)
+        other.close()
+        self.assertTrue(blocked)
+        return outcome["second"]
+
+    def test_a_name_is_never_both_at_once(self):
+        # #326 r5 P2: an agent inserted, not yet committed, while a first
+        # owner key holder of that name is registered
+        self.no_key_yet()
+        second = self._race(
+            "INSERT INTO agent_registry (name, public_key, public_key_fingerprint, key_role) "
+            "VALUES ('carol', 'ka', 'fa', 'agent')",
+            "INSERT INTO key_holders (name, human, public_key, public_key_fingerprint, "
+            "key_role) VALUES ('carol', 'human:carol', 'ko', 'fo', 'owner')")
+        self.assertIn("an agent is named carol", second)
+        self.assertEqual(self.db.query("SELECT 1 FROM key_holders WHERE name = 'carol'"), [])
+        self.assertEqual(authority.key_info(self.db, "carol")["holder"], "agent")
+        # the other way round: the holder first, an agent of that name then
+        second = self._race(
+            "INSERT INTO key_holders (name, human, public_key, public_key_fingerprint, "
+            "key_role) VALUES ('dave', 'human:dave', 'kd', 'fd', 'owner')",
+            "INSERT INTO agent_registry (name, public_key, public_key_fingerprint, key_role) "
+            "VALUES ('dave', 'kx', 'fx', 'agent')")
+        self.assertIn("holds a human's key", second)
+        self.assertEqual(self.db.query("SELECT 1 FROM agent_registry WHERE name = 'dave'"), [])
+        info = authority.key_info(self.db, "dave")
+        self.assertEqual((info["holder"], info["key_role"]), ("human", "owner"))
 
     def test_taking_an_owner_key_away_never_reopens_the_bootstrap(self):
         # #326 r4 P1: an agent with an owner key, no owner key holder

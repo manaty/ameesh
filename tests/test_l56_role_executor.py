@@ -319,6 +319,16 @@ class RoleExecutorTest(PgTestCase):
                                        "WHERE name = 'l56-alice'"),
                          [{"holder": "human", "public_key_fingerprint": "fa"}])
 
+    def test_host_checks_names_at_read_committed_only(self):
+        """#326 r5: a name is checked against the other table under a lock
+        on it, which a snapshot taken before the wait would not see."""
+        proc = self.as_host("BEGIN ISOLATION LEVEL REPEATABLE READ; "
+                            "INSERT INTO agent_registry (name) VALUES ('l56-rr'); COMMIT")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("read committed only", proc.stderr)
+        proc = self.as_host("INSERT INTO agent_registry (name) VALUES ('l56-rr')")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
     def test_public_schema_create_rolls_back(self):
         """PUBLIC schema CREATE makes the script roll back the new role."""
         q = db_mod.quote_ident

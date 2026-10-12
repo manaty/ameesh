@@ -96,6 +96,27 @@ language sql stable as $$
                        'MEMBER')
 $$;
 
+-- a name is a key holder's or an agent's, never both (#326 r5): the check of
+-- one table against the other is made under a lock on the name, taken by
+-- both triggers, so a transaction still open with that name in one table
+-- holds back the other's insert until it ends, and the check then sees it.
+-- It sees it only at read committed, where each statement reads what was
+-- committed when it starts: outside it, the snapshot predates the wait, and
+-- the check is refused to any role but the tables' owner.
+create or replace function key_name_lock(n text) returns void
+language plpgsql as $$
+begin
+    perform pg_advisory_xact_lock(hashtext('ameesh-key-name:' || current_schema() || ':' || n));
+    if current_setting('transaction_isolation') <> 'read committed'
+            and not pg_has_role(current_user,
+                                (select relowner from pg_class where oid = 'key_holders'::regclass),
+                                'MEMBER') then
+        raise exception 'a key holder''s or an agent''s name is checked at read committed only (here %)', current_setting('transaction_isolation')
+            using errcode = 'serialization_failure';
+    end if;
+end
+$$;
+
 create or replace function key_events_guard() returns trigger
 language plpgsql as $$
 begin
@@ -174,6 +195,7 @@ begin
         return coalesce(new, old);
     end if;
     if tg_op = 'INSERT' then
+        perform key_name_lock(new.name);
         if exists (select 1 from agent_registry where name = new.name) then
             raise exception 'an agent is named %: a human''s key never sits on an agent''s identity (the owner''s own gesture)', new.name
                 using errcode = 'insufficient_privilege';
@@ -225,6 +247,7 @@ begin
     if tg_op = 'UPDATE' and new.name = old.name then
         return new;
     end if;
+    perform key_name_lock(new.name);
     if exists (select 1 from key_holders where name = new.name) then
         raise exception '% holds a human''s key: no agent is created under that name, nor renamed to it', new.name
             using errcode = 'unique_violation';
@@ -243,8 +266,9 @@ create trigger agent_registry_not_a_key_holder
 -- from a revocation by the owner's own gesture only; so is taking it away
 -- (#326 r4: cleared, made an agent key, its row deleted — revoked or not),
 -- unless the key holder of that name holds the very same key (the stopgap
--- row of 0364, `key register --human`). An agent key and a revocation stay
--- free. The key's date is the server's.
+-- row of 0364, `key register --human`) and the row is deleted or only its
+-- key cleared — never given another key nor made an agent key (#326 r5).
+-- An agent key and a revocation stay free. The key's date is the server's.
 create or replace function agent_registry_key_guard() returns trigger
 language plpgsql as $$
 declare
@@ -256,9 +280,12 @@ begin
                  or new.public_key is distinct from old.public_key
                  or new.public_key_fingerprint is distinct from old.public_key_fingerprint
                  or new.key_role is distinct from old.key_role)
-            and not exists (select 1 from key_holders h
-                             where h.name = old.name and h.key_role = 'owner'
-                               and h.public_key_fingerprint = old.public_key_fingerprint) then
+            and not ((tg_op = 'DELETE'
+                      or (new.public_key is null and new.public_key_fingerprint is null
+                          and new.key_role = old.key_role and new.name = old.name))
+                     and exists (select 1 from key_holders h
+                                  where h.name = old.name and h.key_role = 'owner'
+                                    and h.public_key_fingerprint = old.public_key_fingerprint)) then
         raise exception 'the owner key on agent % is only removed by the owner''s own gesture (with the owner''s database role); a revocation is free (key revoke %)', old.name, old.name
             using errcode = 'insufficient_privilege';
     end if;

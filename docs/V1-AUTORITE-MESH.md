@@ -156,6 +156,9 @@ base64 of the 32-byte seed or key). Rules:
     changing, renaming or un-revoking it is refused outside the owner's
     role, and so is taking it away, revoked or not (#326 r4): clearing it,
     turning it into an agent key, deleting its row. Revoking it stays free.
+    The only exception is the stopgap row whose key a holder of that name
+    holds as its owner key: that row may be deleted or have its key cleared,
+    but it never gets another key and never becomes an agent key (#326 r5).
     An `agent` key stays free;
   * no agent is created under a key holder's name or renamed to it, nor a
     key holder created under an agent's (triggers on both tables, #326 r3,
@@ -163,8 +166,13 @@ base64 of the 32-byte seed or key). Rules:
     never blocked by an agent that took its name meanwhile, and a holder
     never shadows an agent's key. A first owner key holder also counts the
     agents' owner keys. Should a name still be both with two different live
-    keys (a race), `mesh_keys` gives it no key at all, until the agent's key
-    is revoked;
+    keys (a row that slipped past the triggers), `mesh_keys` gives it no key
+    at all until the agent's key is revoked. Both triggers check the name
+    under a transaction lock on it (`pg_advisory_xact_lock`, #326 r5). An
+    insert still open in one table therefore holds back the other table's
+    insert until it ends, and the check then sees it. The check only sees
+    it at read committed, so any other isolation level is refused to every
+    role except the tables' owner;
   * dates are the server's clock at the event: `key_updated_at`,
     `created_at` and `key_revoked_at` are set by the triggers to
     `clock_timestamp()` (not the transaction's start), whatever the writer
