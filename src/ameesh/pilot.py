@@ -65,7 +65,9 @@ def _intervals(readings: list[dict]) -> list[tuple[str, dict, float, float]]:
     """The time each reading stands for, cut by day: (day, row, held,
     window) seconds — `held`, its state up to the next reading; `window`,
     its averages (`guest_cpu`) over the window before it, at most the gap
-    to the previous reading (the earlier time is that reading's)."""
+    to the previous reading (the earlier time is that reading's). A window
+    longer than `MAX_GAP_S` spans a hole in the measure: it counts for
+    nothing, as the gap itself does."""
     out = []
     for i, row in enumerate(readings):
         ts = float(row["sampled_ts"])
@@ -76,11 +78,10 @@ def _intervals(readings: list[dict]) -> list[tuple[str, dict, float, float]]:
         window = row.get("cpu_window_s")
         before = ts - float(readings[i - 1]["sampled_ts"]) if i else None
         if window is None:
-            window = before if before is not None and before <= MAX_GAP_S else 0.0
+            window = before if before is not None else 0.0
         elif before is not None:
             window = min(float(window), before)
-        window = min(max(float(window), 0.0), MAX_GAP_S)
-        if window > 0:
+        if 0 < float(window) <= MAX_GAP_S:
             out += [(day, row, 0.0, secs) for day, secs in _by_day(ts - window, ts)]
     return out
 
@@ -121,6 +122,7 @@ def _summary(readings: list[dict], intervals, episodes: int, limits: dict) -> di
         "samples": len(readings),
         "measured_s": round(measured_s, 1),
         "pressure_min": round(pressure_s / 60.0, 1),
+        "pressure_s": round(pressure_s, 3),
         "critical_episodes": episodes,
         "cpu_count": max(cpus) if cpus else None,
         "load_p95": _round(percentile(values("load1"), 0.95)),
@@ -175,10 +177,12 @@ def report(host: str, readings: list[dict], limits: dict, *, days: float) -> dic
         checks.append({"key": key, "value": value, "target": target,
                        "ok": None if value is None else ok})
 
-    # the target holds for each day, not on average: the worst measured day
-    worst = max((d["pressure_min"] for d in by_day if d["measured_s"] > 0), default=None)
-    check("pressure_min_per_day", worst, TARGET_PRESSURE_MIN_PER_DAY,
-          worst is not None and worst < TARGET_PRESSURE_MIN_PER_DAY)
+    # the target holds for each day, not on average: the worst measured day,
+    # judged on its seconds (599 s shows 10.0 min yet meets the target)
+    worst = max((d["pressure_s"] for d in by_day if d["measured_s"] > 0), default=None)
+    check("pressure_min_per_day", None if worst is None else round(worst / 60.0, 1),
+          TARGET_PRESSURE_MIN_PER_DAY,
+          worst is not None and worst < TARGET_PRESSURE_MIN_PER_DAY * 60.0)
     load_target = TARGET_LOAD_P95_PER_CPU * cpus if cpus else None
     check("load_p95", total["load_p95"], load_target,
           load_target is not None and total["load_p95"] is not None

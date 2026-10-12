@@ -209,6 +209,46 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(rep["total"]["measured_s"], 180.0)
         self.assertEqual(rep["total"]["guest_cpu_hours"], 3.0)
 
+    def test_a_critical_episode_across_midnight_counts_once(self):
+        # L159g2: the episode counts on the day it starts, not again after
+        # midnight
+        midnight = time.mktime((2027, 1, 16, 0, 0, 0, 0, 0, -1))
+        rows = [reading(midnight + dt, mem_available_bytes=1) for dt in (-120, -60, 60)]
+        rows.append(reading(midnight + 120))
+        rep = pilot.report("vm", rows, self.limits(), days=2)
+        self.assertEqual([d["critical_episodes"] for d in rep["by_day"]], [1, 0])
+        self.assertEqual(rep["total"]["critical_episodes"], 1)
+
+    def test_a_cpu_window_over_the_gap_limit_counts_for_nothing(self):
+        # L159g2: readings 1 h apart, each the average of that hour: a hole
+        # in the measure, not 300 s of guest CPU each
+        t0 = 1_800_000_000.0
+        rows = [reading(t0 + 3600 * i, guest_cpu=2.0, cpu_window_s=3600.0)
+                for i in range(3)]
+        total = pilot.report("vm", rows, self.limits(), days=1)["total"]
+        self.assertEqual((total["measured_s"], total["guest_cpu_hours"]), (0.0, 0.0))
+        # the same without a measured window: the gap to the previous reading
+        for row in rows:
+            del row["cpu_window_s"]
+        self.assertEqual(pilot.report("vm", rows, self.limits(), days=1)
+                         ["total"]["guest_cpu_hours"], 0.0)
+
+    def test_pressure_target_is_judged_unrounded(self):
+        # L159g2: 599 s shows as 10.0 min but is under the 10 min target
+        t0 = 1_800_000_000.0
+        blocked = int(0.9 * GIB)
+        rows = [reading(t0, mem_available_bytes=blocked),
+                reading(t0 + 300, mem_available_bytes=blocked),
+                reading(t0 + 599), reading(t0 + 660)]
+        rep = pilot.report("vm", rows, self.limits(), days=1)
+        self.assertEqual(rep["total"]["pressure_s"], 599.0)
+        check = {c["key"]: c for c in rep["checks"]}["pressure_min_per_day"]
+        self.assertEqual((check["value"], check["ok"]), (10.0, True))
+        rows[2]["sampled_ts"] = t0 + 600
+        check = {c["key"]: c for c in pilot.report("vm", rows, self.limits(),
+                                                     days=1)["checks"]}["pressure_min_per_day"]
+        self.assertEqual((check["value"], check["ok"]), (10.0, False))
+
     def test_no_reading(self):
         rep = pilot.report("vm", [], self.limits(), days=7)
         self.assertEqual(rep["total"]["samples"], 0)
