@@ -59,7 +59,7 @@ from .canon import GIT_TIMEOUT, GitError, _git, _git_env
 SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
 PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
-                "lease_ref")
+                "lease_ref", "generated", "ci_required", "protected")
 #: #194 r6: where the lease of a target lives on the remote (local mode)
 LEASE_REF_DEFAULT = "refs/ameesh/land/"
 #: #194 r8: the only namespaces a lease ref may live in — never a branch that
@@ -87,6 +87,24 @@ class SettingsError(ValueError):
 
 
 @dataclass(frozen=True)
+class Generated:
+    """L160g (#473): a file produced by a script. A merge never resolves it
+    (no rerere): it is regenerated on the merged tree by `regen`, then
+    `check` must pass."""
+    path: str
+    regen: str
+    check: str = ""
+
+
+@dataclass(frozen=True)
+class Gate:
+    """L160g (#473): a gate run on the merged tree only when the merge
+    touches one of `paths` (globs, as the paths filters of a workflow)."""
+    run: str
+    paths: tuple = ()
+
+
+@dataclass(frozen=True)
 class Project:
     name: str
     repo: str
@@ -102,6 +120,14 @@ class Project:
     #: a branch prefix such as `ameesh-land/` when the remote refuses custom
     #: namespaces) — the lease of target T is `<prefix>T`
     lease_ref: str = LEASE_REF_DEFAULT
+    #: L160g (#473): files regenerated, never resolved (`Generated`); gates
+    #: chosen by the paths the merge touches (`Gate`); GitHub CI green on the
+    #: frozen commit before entering the queue; targets (globs) the queue and
+    #: `land` refuse (main, release branches, tags: an orchestrator's gesture)
+    generated: tuple = ()
+    path_gates: tuple = ()
+    ci_required: bool = False
+    protected: tuple = ()
 
 
 @dataclass
@@ -160,10 +186,47 @@ def parse_settings(raw) -> Settings:
         gates = value.get("gates") or ()
         if isinstance(gates, str):
             gates = (gates,)
-        if not isinstance(gates, (list, tuple)) or not all(
-                isinstance(g, str) and g.strip() for g in gates):
+        if not isinstance(gates, (list, tuple)):
             raise SettingsError("%s.gates: a list of commands expected" % where)
-        if land != "off" and not gates:
+        always, by_path = [], []
+        for gate in gates:
+            if isinstance(gate, str) and gate.strip():
+                always.append(gate.strip())
+                continue
+            run = gate.get("run") if isinstance(gate, dict) else None
+            paths = gate.get("paths", ()) if isinstance(gate, dict) else None
+            if isinstance(paths, str):
+                paths = [paths]
+            if not isinstance(run, str) or not run.strip() \
+                    or set(gate) - {"run", "paths"} or not isinstance(paths, (list, tuple)) \
+                    or not all(isinstance(p, str) and p.strip() for p in paths):
+                raise SettingsError("%s.gates: a command, or {\"run\": command, \"paths\": "
+                                    "[globs]} expected" % where)
+            if paths:
+                by_path.append(Gate(run.strip(), tuple(p.strip() for p in paths)))
+            else:
+                always.append(run.strip())
+        generated = []
+        for item in value.get("generated") or ():
+            if not isinstance(item, dict) or set(item) - {"path", "regen", "check"} \
+                    or not all(isinstance(item.get(k), str) and item[k].strip()
+                               for k in ("path", "regen")) \
+                    or not isinstance(item.get("check", ""), str):
+                raise SettingsError("%s.generated: [{\"path\": file, \"regen\": command, "
+                                    "\"check\": command}] expected" % where)
+            generated.append(Generated(item["path"].strip().strip("/"), item["regen"].strip(),
+                                       (item.get("check") or "").strip()))
+        ci_required = value.get("ci_required", False)
+        if not isinstance(ci_required, bool):
+            raise SettingsError("%s.ci_required: true or false expected" % where)
+        protected = value.get("protected") or ()
+        if isinstance(protected, str):
+            protected = (protected,)
+        if not isinstance(protected, (list, tuple)) or not all(
+                isinstance(p, str) and p.strip() for p in protected):
+            raise SettingsError("%s.protected: a list of target globs expected" % where)
+        gates = always
+        if land != "off" and not (gates or by_path):
             raise SettingsError("%s.gates: a project that ameesh lands (land %s) declares "
                                 "its gates, run on the merged tree" % (where, land))
         lease_ref = value.get("lease_ref") or LEASE_REF_DEFAULT
@@ -187,8 +250,11 @@ def parse_settings(raw) -> Settings:
         projects[name] = Project(name=name, repo=os.path.expanduser(repo.strip()),
                                  migrations=texts["migrations"], target=texts["target"],
                                  github=texts["github"], land=land,
-                                 gates=tuple(g.strip() for g in gates), merge_method=method,
-                                 lease_ref=lease_ref)
+                                 gates=tuple(gates), merge_method=method,
+                                 lease_ref=lease_ref,
+                                 generated=tuple(generated), path_gates=tuple(by_path),
+                                 ci_required=ci_required,
+                                 protected=tuple(p.strip() for p in protected))
     # Lease namespaces are reserved across the whole configuration. Checkout
     # paths and remote aliases must not let one project's lease overwrite
     # another project's target, including projects whose landing is off.
@@ -199,6 +265,7 @@ def parse_settings(raw) -> Settings:
             if other.target and lease_collides(holder.lease_ref, other.target):
                 raise SettingsError("`radar.projects.%s.lease_ref`: %s collides with the target %s of %s"
                                     % (holder.name, holder.lease_ref, other.target, other.name))
+
     return Settings(projects=projects)
 
 
@@ -213,6 +280,21 @@ def lease_collides(prefix: str, target: str) -> bool:
     return (lease == target_ref or target_ref.startswith(prefix)
             or prefix.startswith(target_ref + "/") or lease.startswith(target_ref + "/")
             or target_ref.startswith(lease + "/"))
+
+
+def protected_target(project, target: str) -> str | None:
+    """L160g (#473): the `protected` glob that `target` matches, or None.
+    Matched against the target as written, its branch (`origin/develop` →
+    `develop`) and its full ref (`refs/heads/…`, or `refs/tags/…` as is)."""
+    import fnmatch
+    if not target or not getattr(project, "protected", ()):
+        return None
+    branch = target.split("/", 1)[1] if target.startswith("origin/") else target
+    names = {target, branch, branch if branch.startswith("refs/") else "refs/heads/" + branch}
+    for glob in project.protected:
+        if any(fnmatch.fnmatchcase(name, glob) for name in names):
+            return glob
+    return None
 
 
 def settings_of(cfg) -> Settings:

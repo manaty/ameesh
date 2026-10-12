@@ -439,6 +439,13 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
     slug = radar.github_slug(project) if project.land == "pr" else None
     try:
+        glob = radar.protected_target(project, row["target"])
+        if glob:
+            # L160g (#473): queued before the target was protected — never
+            # landed; ejected under the lease, like any ejection
+            return landing.eject("%s is a protected target (%s)" % (row["target"], glob),
+                                 "Merging into %s is the orchestrator's gesture: ask it."
+                                 % row["target"])
         return _land(landing, replayer, slug, gh)
     except (GitError, LandError, OSError, ValueError) as exc:
         error = {"lot": lot, "result": "error", "error": "%s: %s" % (type(exc).__name__, exc)}

@@ -185,16 +185,23 @@ def branch_tip(repo: str, branch: str, clone=None) -> tuple[str | None, str]:
     return tips[branch], where
 
 
-def readiness(db, lot: int, repo: str, *, ci=None, clone=None) -> dict:
+def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None) -> dict:
     """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
     pr}`; QueueError says what is missing. Commit ids are resolved to full
     ones before being compared; `ci` (`radar.github_ci(..., strict=True)`)
     must report the PR green on the frozen commit itself, and an error
     reading it refuses the lot."""
-    from . import plan_github
+    from . import plan_github, radar
     row = work.get(db, lot)
     if row is None:
         raise QueueError("lot #%d not found" % lot)
+    target = row.get("branch_target") or plan_git.default_target(repo)
+    glob = radar.protected_target(project, target)
+    if glob:
+        # L160g (#473): main, release branches and tags stay an orchestrator's gesture
+        raise QueueError("%s is a protected target of project %s (%s): the merge queue "
+                         "never merges there; it is the orchestrator's gesture"
+                         % (target, project.name, glob))
     if row.get("state") in work.MERGED_STATES or row.get("state") == "closed":
         raise QueueError("lot #%d is %s: nothing to merge" % (lot, row["state"]))
     if not row.get("branch"):
@@ -239,7 +246,6 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None) -> dict:
                                                              tip[:12]))
         if not status.get("green"):
             raise QueueError("the CI of PR #%s is not green" % status.get("number"))
-    target = row.get("branch_target") or plan_git.default_target(repo)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"], "pr": (status or {}).get("number")}
 
 
@@ -249,7 +255,7 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
     if ci == "github":
         from . import radar
         ci = radar.github_ci(project or radar.Project(name="", repo=repo), strict=True)
-    ready = readiness(db, lot, repo, ci=ci, clone=clone)
+    ready = readiness(db, lot, repo, ci=ci, clone=clone, project=project)
     row = storage.of(db).work.queue_add(
         lot, target=ready["target"], frozen_sha=ready["frozen_sha"], frozen_id=ready["frozen_id"],
         source=source_of(repo), note="merge queue of %s: queued at %s%s" % (
