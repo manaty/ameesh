@@ -349,28 +349,45 @@ class ProfileGrowthTest(_Tmp):
         self.assertEqual(platform.host.btrfs_growth(None, free, 3), 10 * GIB)
 
     def test_raid10_against_the_allocator_chunk_by_chunk(self):
-        # #311 r2: the simulation by events against the allocator itself, one
-        # chunk of one unit at a time — the devices with the most room, as
-        # many as there are rounded down to an even number — on every small case
-        def by_chunks(free):
+        # #311 r2, L229e: the simulation by events against the allocator
+        # itself — chunks of `cap` stripes at most, on the devices with the
+        # most room, as many as there are rounded down to an even number — on
+        # every small case, in whole stripes and unscaled: the turn-taking of
+        # the tied smallest is continuous in the model, chunk by chunk in the
+        # kernel (documented in `_raid10`)
+        stripe = platform.host.BTRFS_STRIPE_LEN
+
+        def by_chunks(free, cap):
             left, growth = list(free), 0
             while True:
                 room = sorted((f for f in left if f > 0), reverse=True)
                 width = len(room) - len(room) % 2
                 if width < 2:
                     return growth
-                left = [f - 1 for f in room[:width]] + room[width:]
-                growth += width // 2
-        for count in range(1, 6):
+                step = min(room[width - 1], cap)
+                left = [f - step for f in room[:width]] + room[width:]
+                growth += step * width // 2
+
+        def model(rooms):
+            return platform.host.btrfs_growth("raid10", [r * stripe for r in rooms], 2) \
+                // stripe
+
+        for count in range(1, 7):
             for rooms in itertools.combinations_with_replacement(range(9), count):
-                free = [12 * f for f in rooms]
-                with self.subTest(free=free):
-                    self.assertEqual(platform.host.btrfs_growth("raid10", free, 2),
-                                     by_chunks(free))
-        # by events, not by chunks: 501 devices of 50 TiB at once
+                with self.subTest(rooms=rooms):
+                    # one-stripe chunks: never above, at most one stripe below
+                    self.assertIn(by_chunks(rooms, 1) - model(rooms), (0, 1))
+                    # chunks of 4 stripes: within -2 and +4 stripes
+                    self.assertTrue(-2 <= by_chunks(rooms, 4) - model(rooms) <= 4)
+        self.assertEqual((model([1, 1, 1, 1, 2]), by_chunks([1, 1, 1, 1, 2], 1)), (2, 3))
+        # less than a stripe holds no chunk
+        self.assertEqual(platform.host.btrfs_growth("raid10", [stripe - 1] * 2, 2), 0)
+        self.assertEqual(platform.host.btrfs_growth("raid1", [stripe - 1] * 2, 2), 0)
+        self.assertEqual(platform.host.btrfs_growth("raid10", [stripe + 1] * 2, 2), stripe)
+        # by events, not by chunks: 5001 devices of 500 TiB at once
         started = time.monotonic()
-        platform.host.btrfs_growth("raid10", [100 * GIB + i * GIB for i in range(501)], 2)
-        self.assertLess(time.monotonic() - started, 1.0)
+        platform.host.btrfs_growth("raid10", [100 * GIB + i * GIB for i in range(5001)], 2)
+        self.assertLess(time.monotonic() - started, 2.0)
 
     def test_degraded_raid1_cannot_grow(self):
         # #311 r1: one of two devices missing (btrfs_fs_info gives it no room):
