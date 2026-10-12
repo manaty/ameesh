@@ -194,6 +194,42 @@ assert.equal(ordinary.stdout.trim(),'ordinary');
                     self.assertEqual(result.stdout, "")
                     self.assertRegex(result.stderr, r"provider (already loaded|declared as a Node preload)")
 
+    def test_async_loader_and_vm_options_are_refused_at_installation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            loader = Path(tmp) / "loader.mjs"
+            loader.write_text("export {};\n")
+            code = ("require(" + json.dumps(str(deepseek_cgroup.PRELOAD)) +
+                    ").installLoader(); console.log('COMMAND RAN');")
+            for flag in ("--loader", "--experimental-loader", "--experimental-vm-modules"):
+                values = [flag] if flag.endswith("vm-modules") else [flag, str(loader)]
+                for channel in ("NODE_OPTIONS", "execArgv"):
+                    for joined in (False, True) if len(values) == 2 else (False,):
+                        argv = ["=".join(values)] if joined else values
+                        with self.subTest(flag=flag, channel=channel, joined=joined):
+                            options = " ".join(json.dumps(token) for token in argv)
+                            result = subprocess.run(
+                                [NODE, *(argv if channel == "execArgv" else []), "-e", code],
+                                env=dict(os.environ, NODE_OPTIONS=options if channel == "NODE_OPTIONS" else ""),
+                                capture_output=True, text=True, timeout=10)
+                            self.assertNotEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(result.stdout, "")
+                            self.assertIn("unsupported Node option for the cgroup guard: " + flag, result.stderr)
+
+    def test_module_register_commonjs_and_esm_bindings_are_blocked(self):
+        code = """
+import {createRequire, register} from 'node:module';
+import assert from 'node:assert/strict';
+const require = createRequire(import.meta.url);
+require(PRELOAD).installLoader();
+const target = 'data:text/javascript,console.log("UNGUARDED LOADER RAN")';
+for (const registerLoader of [require('node:module').register, register]) {
+  assert.throws(() => registerLoader(target), /module.register is unsupported by the cgroup guard/);
+}
+console.log('REGISTER BLOCKED');
+""".replace("PRELOAD", json.dumps(str(deepseek_cgroup.PRELOAD)))
+        result = self.run_node(code, dict(os.environ, NODE_OPTIONS=""))
+        self.assertEqual(result.stdout.strip(), "REGISTER BLOCKED")
+
     def test_explicit_worker_guard_refuses_provider_without_vendor_dependency(self):
         with tempfile.TemporaryDirectory() as tmp:
             provider = Path(tmp) / "node_modules/@deepseek-ai/dsh-subprocess-local"

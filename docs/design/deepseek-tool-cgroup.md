@@ -55,6 +55,22 @@ including when repositioning an existing guard option.
 The guard itself must use `--require`, not the later ESM `--import` phase,
 which could already have populated Node's separate ESM cache.
 
+At installation the guard refuses `--loader`, `--experimental-loader` and
+`--experimental-vm-modules` in both `NODE_OPTIONS` and `execArgv` (including
+`--flag=value` forms). It also replaces `node:module.register()` with a
+throwing function and synchronizes its named ESM binding. Asynchronous loaders
+otherwise evaluate modules in an internal loader thread outside the public
+`Worker` wrapper and the thread-local synchronous hooks. Worker options are
+checked against the same restrictions before construction.
+
+Deliberate evaluation of provider source through `vm.SourceTextModule` inside
+the harness process bypasses the module load hook. This remains outside the
+threat model: agent tool commands execute in separate processes, whereas this
+path requires code deliberately evaluating the provider inside the harness.
+Refusing `--experimental-vm-modules` is a low-cost mitigation on the supported
+Node runtime, not a general sandbox against arbitrary in-process evaluation
+or retained privileged Node bindings.
+
 Node's synchronous module hooks belong to one thread. The guard therefore
 wraps `worker_threads.Worker`, updates its ESM binding, and injects its preload
 explicitly into worker `execArgv`, even for **`execArgv: []`**, file workers,

@@ -7,7 +7,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { fileURLToPath } = require('node:url');
-const { createRequire, registerHooks, syncBuiltinESMExports } = require('node:module');
+const nodeModule = require('node:module');
+const { createRequire, registerHooks, syncBuiltinESMExports } = nodeModule;
 const threads = require('node:worker_threads');
 
 const PROVIDER = '@deepseek-ai/dsh-subprocess-local';
@@ -87,7 +88,17 @@ function resolvePreload(target) {
   return createRequire(path.join(process.cwd(), '__ameesh_preloads__.cjs')).resolve(target);
 }
 
+function assertSupportedOptions(nodeOptions, argv) {
+  for (const token of [...optionTokens(nodeOptions), ...argv]) {
+    const flag = token.split('=', 1)[0];
+    if (['--loader', '--experimental-loader', '--experimental-vm-modules'].includes(flag)) {
+      throw new Error(`unsupported Node option for the cgroup guard: ${flag}`);
+    }
+  }
+}
+
 function assertNoProviderPreloads(nodeOptions = process.env.NODE_OPTIONS || '', argv = process.execArgv, checkCache = true) {
+  assertSupportedOptions(nodeOptions, argv);
   if (checkCache) for (const filename of Object.keys(require.cache)) {
     if (providerFile(filename)) throw new Error(`provider already loaded before the cgroup guard: ${filename}`);
   }
@@ -184,6 +195,12 @@ function installLoader(rejectProvider = false) {
   if (typeof registerHooks !== 'function') {
     throw new Error('Node synchronous module hooks are unavailable (requires Node >=22.15)');
   }
+  // Asynchronous loaders run in a separate internal thread that is outside
+  // the public Worker wrapper and cannot inherit our synchronous hooks.
+  nodeModule.register = function () {
+    throw new Error('module.register is unsupported by the cgroup guard');
+  };
+  syncBuiltinESMExports();
   const entryURLs = new Set();
   return registerHooks({
     resolve(specifier, context, nextResolve) {
