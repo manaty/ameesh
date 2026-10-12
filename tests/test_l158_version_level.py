@@ -353,8 +353,16 @@ class VersionLevelTest(unittest.TestCase):
                         '    from .plan_cli import fill\n'
                         '    sub = argparse.ArgumentParser(prog="ameesh").add_subparsers()\n'
                         '    work = sub.add_parser("work").add_subparsers()\n    fill(work)\n')
+        # codex #195 r8: an inner class does not see its enclosing class's
+        # imports, it starts again from the module's
+        nested_class = ('import argparse\nfrom . import plan_cli as helper\n\n\nclass Outer:\n'
+                        '    from . import other_cli as helper\n\n'
+                        '    class Inner:\n'
+                        '        sub = argparse.ArgumentParser(prog="ameesh").add_subparsers()\n'
+                        '        work = sub.add_parser("work").add_subparsers()\n'
+                        '        helper.fill(work)\n')
         for name, cli in (("nested", nested), ("hidden", hidden), ("class", in_class),
-                          ("class-hidden", class_hidden)):
+                          ("class-hidden", class_hidden), ("nested-class", nested_class)):
             with self.subTest(name):
                 self._git("checkout", "-q", "-B", "case-" + name, "case")
                 self._write("src/ameesh/cli.py", cli)

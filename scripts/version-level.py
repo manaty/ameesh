@@ -346,6 +346,10 @@ class _Parsers(ast.NodeVisitor):
         self.consts: dict[str, str] = {}
         #: may an unbound name (a parameter) stand for the top level?
         self.unbound = True
+        #: in a class body, the scope around the outermost class (env, consts,
+        #: modules, imported, local): a class's names are seen by no scope it
+        #: nests, neither method, lambda nor inner class
+        self.outer = None
 
     @property
     def commands(self) -> set[str]:
@@ -372,14 +376,17 @@ class _Parsers(ast.NodeVisitor):
 
     def _calls(self, nodes, found: list, outer=None) -> None:
         """The callees of the calls in `nodes`; a class body is read with its
-        own imports, its methods with the scope around the class (`outer`)."""
+        own imports, its methods, lambdas and inner classes with the scope
+        around the outermost class (`outer`)."""
         for node in nodes:
             if isinstance(node, ast.ClassDef):
                 self._calls(node.decorator_list + node.bases + node.keywords, found, outer)
                 around = self.modules, self.imported, self.local
+                outer = outer or around
+                self.modules, self.imported, self.local = outer
                 self._enter_class(node)
                 try:
-                    self._calls(node.body, found, outer or around)
+                    self._calls(node.body, found, outer)
                 finally:
                     self.modules, self.imported, self.local = around
                 continue
@@ -557,22 +564,40 @@ class _Parsers(ast.NodeVisitor):
 
     def visit_ClassDef(self, node):
         """A class body runs where it stands, in its own scope: its imports
-        and names stay in it (its methods are not run)."""
+        and names stay in it, an inner class starts again from the scope
+        around the outermost class (its methods are not run)."""
         for one in node.decorator_list + node.bases + node.keywords:
             self.visit(one)
-        saved = (self.env, self.consts, self.modules, self.imported, self.local)
-        self.env, self.consts = dict(self.env), dict(self.consts)
+        saved = (self.env, self.consts, self.modules, self.imported, self.local, self.outer)
+        self.outer = self.outer or saved[:5]
+        env, consts, self.modules, self.imported, self.local = self.outer
+        self.env, self.consts = dict(env), dict(consts)
         self._enter_class(node)
         try:
             for statement in node.body:
                 self.visit(statement)
         finally:
-            self.env, self.consts, self.modules, self.imported, self.local = saved
+            (self.env, self.consts, self.modules, self.imported, self.local,
+             self.outer) = saved
+
+    def visit_Lambda(self, node):
+        """A lambda in a class body sees the scope around the class."""
+        if self.outer is None:
+            self.generic_visit(node)
+            return
+        saved = (self.env, self.consts, self.modules, self.imported, self.local, self.outer)
+        self.env, self.consts, self.modules, self.imported, self.local = self.outer
+        self.outer = None
+        try:
+            self.generic_visit(node)
+        finally:
+            (self.env, self.consts, self.modules, self.imported, self.local,
+             self.outer) = saved
 
     def run(self, function, bound: dict[str, tuple[str, ...]], unbound: bool = True):
         saved = (self.env, self.consts, self.unbound, self.modules, self.imported,
-                 self.local)
-        self.env, self.consts, self.unbound = dict(bound), {}, unbound
+                 self.local, self.outer)
+        self.env, self.consts, self.unbound, self.outer = dict(bound), {}, unbound, None
         self.modules, self.imported = self.scopes[function.name]
         self.local = self.own[function.name]
         self.package.stack.append((self.module, function.name))
@@ -582,7 +607,7 @@ class _Parsers(ast.NodeVisitor):
         finally:
             self.package.stack.pop()
             (self.env, self.consts, self.unbound, self.modules, self.imported,
-             self.local) = saved
+             self.local, self.outer) = saved
 
     def walk(self):
         for statement in self.tree.body:
