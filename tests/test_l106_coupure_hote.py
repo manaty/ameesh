@@ -618,7 +618,7 @@ class CoupureTest(PgTestCase):
         self.assertTrue(runner2.did_turn)
         consigne = self.turns()[-1]["argv"][-1]
         self.assertIn("message en vol", consigne)
-        self.assertIn("re-livré", consigne)
+        self.assertIn("re-delivered", consigne)
         self.assertIsNotNone(mail.get(self.db, mid)["delivered_ts"])
 
     def test_ressources_d_avant_le_redemarrage_signalees(self):

@@ -105,7 +105,7 @@ class DelegationTest(_Base):
         self.assertEqual(len(boite), 1)
         self.assertEqual((boite[0]["sender"], boite[0]["kind"], boite[0]["work_item_id"]),
                          ("orch", "event", str(self.lot["id"])))
-        self.assertIn("revient à orch", boite[0]["body"])
+        self.assertIn("returns to orch", boite[0]["body"])
         self.assertEqual([(d["delegate"], d["delegated_by"], d["outcome"])
                           for d in self._delegations()], [("relais", "orch", None)])
 
@@ -123,15 +123,15 @@ class DelegationTest(_Base):
     def test_refus(self):
         ident = str(self.lot["id"])
         cas = [
-            (["fantome"], "agent inconnu"),
-            (["human:proprio"], "humain"),
-            (["orch"], "lui-même"),
-            (["relais", "--actor", "inconnu"], "délégant inconnu"),
+            (["fantome"], "unknown agent"),
+            (["human:proprio"], "is a human"),
+            (["orch"], "to itself"),
+            (["relais", "--actor", "inconnu"], "delegator inconnu is not in the registry"),
         ]
         registry.upsert(self.db, "coord", harness="codex", mode="externe")
         self.db.execute("UPDATE agent_registry SET responsible = 'human:proprio'"
                         " WHERE name = 'coord'")
-        cas.append((["coord"], "externe"))
+        cas.append((["coord"], "external agent"))
         for extra, attendu in cas:
             proc = self.mesh("work", "delegate", ident, *extra, "--within", "30m")
             self.assertEqual(proc.returncode, 1, (extra, proc.stdout, proc.stderr))
@@ -155,7 +155,7 @@ class DelegationTest(_Base):
                             stop_reason="manuel")
         proc = self.mesh("work", "delegate", str(self.lot["id"]), "relais", "--within", "30m")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("arrêté", proc.stderr)
+        self.assertIn("relais is stopped", proc.stderr)
 
     def test_nouvelle_delegation_remplace_l_echeance(self):
         work.delegate(self.db, self.lot["id"], "relais", within="30m")
@@ -181,7 +181,7 @@ class DelegationTest(_Base):
         self.assertEqual((item["assignee"], item["delegated_by"], item["delegated_ts"],
                           item["due_ts"]), ("second", None, None, None))
         self.assertEqual([d["outcome"] for d in self._delegations()], ["annulee"])
-        self.assertTrue(any("délégation de orch annulée" in e["note"]
+        self.assertTrue(any("delegation from orch cancelled" in e["note"]
                             for e in work.events(self.db, self.lot["id"])))
         # plus rien à échoir
         self.assertEqual(work.expire_delegations(self.db, self._plus_tard()), [])
@@ -235,7 +235,7 @@ class EcheanceTest(_Base):
         # une seule fois par délégation ; un autre agent ne compte pas
         self.assertEqual(work.mark_delegate_turn(self.db, "relais", [self.lot["id"]]), [])
         self.assertEqual(work.mark_delegate_turn(self.db, "orch", [str(self.lot["id"])]), [])
-        self.assertTrue(any(e["note"] == "délégation : tour de relais sur le lot"
+        self.assertTrue(any(e["note"] == "delegation: turn of relais on the lot"
                             and e["actor"] == "relais"
                             for e in work.events(self.db, self.lot["id"])))
         out = work.expire_delegations(self.db, self._plus_tard())
@@ -323,7 +323,7 @@ class EcheanceTest(_Base):
         self.assertEqual([r["outcome"] for r in resultats], ["rendue"])
         self.assertEqual(len(self._boite("orch")), 1)
         echues = [e for e in work.events(self.db, self.lot["id"])
-                  if e["note"].startswith("délégation échue")]
+                  if e["note"].startswith("delegation expired")]
         self.assertEqual(len(echues), 1)
         # et la même délégation relue après coup : rien
         st = storage.of(self.db).work

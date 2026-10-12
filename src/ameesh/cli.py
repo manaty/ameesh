@@ -163,7 +163,7 @@ def render(msgs: list[dict], verdicts: dict | None = None) -> str:
             suffixe += "  [re-delivered after an outage: may already have been handled]"
         suffixe += mail.forwarded_note(msg)
         # L125 : un message passif (copie, accusé, diffusion) le dit ; un
-        # message ordinaire garde la ligne de la v0, à l'octet près
+        # message ordinaire garde la ligne de la v0, traduite (L156c)
         passif = mail.passive_label(msg)
         lines.append("— from %s at %s%s: %s%s" % (
             msg.get("from", "?"), moment, " (%s)" % passif if passif else "",

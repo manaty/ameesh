@@ -998,7 +998,7 @@ class ActionsUnknownTest(ActionsBase):
         self.assertEqual((retried["state"], retried["action_id"]), ("approved", action["action_id"]))
         result = self.execute(action)
         self.assertEqual((result["state"], result["attempt"]), ("confirmed", 2))
-        self.assertIn("déjà fait", result["detail"])
+        self.assertIn("already done", result["detail"])
         self.assertEqual([c[1] for c in self.noop.calls], [action["action_id"]] * 2)
         self.assertEqual(self.files(), [action["action_id"] + ".json"])  # un seul effet
         self.assertEqual([a["state"] for a in actions.attempts(self.db, action["action_id"])],
@@ -1233,7 +1233,7 @@ class ActionsUnknownTest(ActionsBase):
         # PR ouverte : la demande perdue est peut-être en file de fusion, rien de certain
         result = actions.reconcile(self.db, action["action_id"], self.gh(), by=ALICE)
         self.assertEqual((result["found"], result["state"]), (False, "unknown"))
-        self.assertIn("ouverte", result["detail"])
+        self.assertIn("open", result["detail"])
         self.assertEqual(self.get(action)["state"], "unknown")
         self.refused(actions.DEDUPE, actions.retry, self.db, action["action_id"],
                      self.receipt(action), connector=self.gh(), policy=POLICY)
@@ -1241,7 +1241,7 @@ class ActionsUnknownTest(ActionsBase):
         self.set_pr(state="CLOSED")
         result = actions.reconcile(self.db, action["action_id"], self.gh(), by=ALICE)
         self.assertEqual((result["found"], result["state"]), (True, "failed"))
-        self.assertIn("fermée sans fusion", result["detail"])
+        self.assertIn("closed without merge", result["detail"])
         self.assertEqual(self.merge_calls(), 1)
 
     def test_git_merge_file_de_fusion_reste_inconnue_jusqu_a_la_fusion(self):
@@ -1251,7 +1251,7 @@ class ActionsUnknownTest(ActionsBase):
         self.approve(action)
         result = self.execute(action, queued)
         self.assertEqual((result["state"], result["external_ref"]), ("unknown", None), result)
-        self.assertIn("file de fusion", result["detail"])
+        self.assertIn("merge queue", result["detail"])
         self.assertEqual(self.pr()["state"], "OPEN")
         # toujours en file : la réconciliation ne tranche pas, aucune nouvelle soumission
         result = actions.reconcile(self.db, action["action_id"], self.gh(), by=ALICE)
@@ -1293,7 +1293,7 @@ class ActionsUnknownTest(ActionsBase):
         self.approve(action)
         result = self.execute(action, refused)
         self.assertEqual(result["state"], "failed", result)
-        self.assertIn("refus explicite", result["detail"])
+        self.assertIn("explicit refusal", result["detail"])
         ok = self.gh()
         actions.retry(self.db, action["action_id"], self.receipt(action), connector=ok,
                       policy=POLICY, by=ALICE)
@@ -1306,7 +1306,7 @@ class ActionsUnknownTest(ActionsBase):
         self.approve(closed)
         result = self.execute(closed, ok)
         self.assertEqual(result["state"], "failed", result)
-        self.assertIn("fermée sans fusion", result["detail"])
+        self.assertIn("closed without merge", result["detail"])
         # code 0 mais PR illisible : pas de preuve, l'issue reste inconnue
         self.set_pr("o/r#14")
         blind = self.gh(view="absent")
@@ -1369,17 +1369,17 @@ class ActionsThreadTest(ActionsBase):
         proposed, approved, launched, confirmed = entries
         self.assertEqual((proposed.author, proposed.recipient), (AGENT, ALICE))
         self.assertEqual((approved.author, launched.author), (ALICE, "ameesh:porte"))
-        self.assertIn("Action %s proposée par %s : shell-noop send sur client:42 (projet demo, "
-                      "classe irreversible)" % (action_id, AGENT), proposed.text)
-        self.assertIn("approbation humaine (reçu) requise ; approbateurs : human:alice",
+        self.assertIn("Action %s proposed by %s: shell-noop send on client:42 (project demo, "
+                      "class irreversible)" % (action_id, AGENT), proposed.text)
+        self.assertIn("human approval (receipt) required; approvers: human:alice",
                       proposed.text)
-        self.assertIn("api_token=<masqué>", proposed.text)
-        self.assertIn("blob=<masqué, 64 caractères>", proposed.text)
-        self.assertIn("lignes=[3 élément(s)]", proposed.text)
+        self.assertIn("api_token=<masked>", proposed.text)
+        self.assertIn("blob=<masked, 64 characters>", proposed.text)
+        self.assertIn("lignes=[3 item(s)]", proposed.text)
         self.assertIn("subject=facture de mars", proposed.text)
-        self.assertIn("approuvée par human:alice (webauthn", approved.text)
-        self.assertIn("lancée", launched.text)
-        self.assertIn("confirmée", confirmed.text)
+        self.assertIn("approved by human:alice (webauthn", approved.text)
+        self.assertIn("launched", launched.text)
+        self.assertIn("confirmed", confirmed.text)
         everything = "\n".join(e.text + json.dumps(e.meta) for e in entries)
         request = receipt["request"]
         for leak in (secret, opaque, request["nonce"], receipt["proof"]["signature"]):
@@ -1401,9 +1401,9 @@ class ActionsThreadTest(ActionsBase):
         thread = self.entries("demo", str(item["id"]))
         self.assertEqual([e.meta["event"] for e in thread],
                          ["proposed", "approved", "launched", "unknown", "confirmed"])
-        self.assertIn("Aucune nouvelle tentative automatique : ameesh action reconcile %s"
+        self.assertIn("No automatic retry: ameesh action reconcile %s"
                       % action["action_id"], thread[3].text)
-        self.assertIn("réconciliation", thread[4].text)
+        self.assertIn("reconciliation", thread[4].text)
         self.assertEqual(self.entries(), [])                # le fil du lot, pas celui du projet
 
         cancelled = self.propose()
@@ -1421,9 +1421,9 @@ class ActionsThreadTest(ActionsBase):
         self.assertEqual(self.events()[-2:], [(dropped["action_id"], "replaced"),
                                               (new["action_id"], "proposed")])
         replaced, proposed = self.entries()[-2:]
-        self.assertIn("remplacée par %s (doublon assumé par human:alice)" % new["action_id"],
+        self.assertIn("replaced by %s (duplicate assumed by human:alice)" % new["action_id"],
                       replaced.text)
-        self.assertIn("Elle remplace %s" % dropped["action_id"], proposed.text)
+        self.assertIn("It replaces %s" % dropped["action_id"], proposed.text)
 
     def test_fil_inaccessible_ne_bloque_rien(self):
         broken = os.path.join(self.tmp, "pas-un-dossier")
@@ -1441,10 +1441,10 @@ class ActionsThreadTest(ActionsBase):
         self.assertIn("thread write failed", err.getvalue())
 
     def test_resume_des_arguments(self):
-        self.assertEqual(actions.args_summary({}), "aucun")
+        self.assertEqual(actions.args_summary({}), "none")
         self.assertEqual(actions.args_summary({"password": "x", "n": None, "ok": True,
                                                "o": {"a": 1}}),
-                         "n=null, o={1 clé(s)}, ok=true, password=<masqué>")
+                         "n=null, o={1 key(s)}, ok=true, password=<masked>")
         self.assertTrue(actions.args_summary({"t": "mot " * 30}).endswith("…"))
         self.assertLessEqual(len(actions.args_summary({"k%d" % i: i for i in range(100)})), 200)
 

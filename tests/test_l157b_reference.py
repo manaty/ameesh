@@ -102,7 +102,7 @@ class BriefTest(unittest.TestCase):
         listing = [{"name": "dev1"}, {"name": "orch"}, {"name": "auditeur"}]
         out = alert_briefs.briefs(alert, listing, {}, ["auditeur"])
         self.assertEqual(set(out), {"dev1", "orch", "auditeur"})
-        self.assertIn("surestime", out["dev1"])
+        self.assertIn("overestimates", out["dev1"])
         self.assertIn("phases", out["orch"])
         self.assertIn("estimate_bias", exploitation.ALERT_TYPES)
 

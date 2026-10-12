@@ -55,7 +55,7 @@ class L36CliTest(PgTestCase):
         lines = {line.split()[0]: line for line in proc.stdout.splitlines()
                  if line.startswith(("alpha", "beta"))}
         header = proc.stdout.splitlines()[0]
-        col = header.index("LOTS")
+        col = header.index("ITEMS")
         self.assertEqual(lines["alpha"][col:col + 5].strip(), "2")
         self.assertEqual(lines["beta"][col:col + 5].strip(), "1")
 

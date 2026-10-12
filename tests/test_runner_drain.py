@@ -90,7 +90,7 @@ class DrainageTest(PgTestCase):
         sortie, _ = proc.communicate(timeout=60)
         self.assertLess(time.monotonic() - debut, 30, sortie)
         self.assertEqual(proc.returncode, 0, sortie)
-        self.assertIn("borne", sortie)
+        self.assertIn("limit reached", sortie)
         # tour arrêté (comme avant le drainage) : sa consigne repart en attente
         self.assertEqual(registry.get(self.db, "borne")["pending_prompt"], "consigne du tour")
 
@@ -121,7 +121,7 @@ class DrainageTest(PgTestCase):
         self.assertEqual(proc.returncode, 0, sortie)
         self.assertGreater(time.monotonic() - debut, 1.0, sortie)
         self.assertIn("draining finished", sortie)
-        self.assertRegex(sortie, r"travail de fond du tour \w+ : terminé")
+        self.assertRegex(sortie, r"background work of turn \w+: finished")
 
 
 if __name__ == "__main__":

@@ -48,7 +48,7 @@ class RunnerTest(PgTestCase):
                 self.assertEqual(row["session_id"], attendu["session"])
                 self.assertEqual(int(row["turns"]), 1)
                 self.assertEqual(row["status"], "idle")
-                self.assertIn("consigne", row["status_text"])
+                self.assertIn("instruction", row["status_text"])
                 # l'événement brut du harnais est journalisé sur disque
                 events = os.path.join(self.state, name, "events.jsonl")
                 self.assertTrue(os.path.exists(events))
@@ -91,9 +91,9 @@ class RunnerTest(PgTestCase):
         self.assertEqual(proc.returncode, 0)
         row = registry.get(self.db, "sansharnais")
         self.assertEqual(row["status"], "blocked")
-        self.assertIn("introuvable", row["last_error"])
+        self.assertIn("not found", row["last_error"])
         self.assertEqual(self.turns(), [])
-        self.assertEqual(proc.stdout.count("introuvable"), 1)
+        self.assertEqual(proc.stdout.count("not found"), 1)
 
     def test_consigne_restauree_apres_echec_au_demarrage(self):
         """Sonde codex3 (6) : un tour qui ne démarre pas ne perd pas sa consigne."""

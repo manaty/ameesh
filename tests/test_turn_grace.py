@@ -331,7 +331,7 @@ class CourrierEtTravailTest(_Base):
             mail.send(self.db, "pair", "orch-fond", "message n°%d" % i)
         sortie = self._hook(worker, "tour-fond", borne=2)
         self.assertIn("message n°1", sortie)
-        self.assertIn("2 message(s) en attente", sortie)
+        self.assertIn("2 pending message(s)", sortie)
         self.assertIn("do not wrap up before it ends", sortie)
         self.assertIn("sleep 60", sortie)
         self.assertNotIn("Wrap up this turn", sortie)
@@ -392,7 +392,7 @@ class SousMoissonneurTest(_Base):
         finally:
             proc.terminate()
             sortie, _ = proc.communicate(timeout=60)
-        self.assertIn("code de sortie 3", self.turns()[1]["argv"][-1], sortie)
+        self.assertIn("exit code 3", self.turns()[1]["argv"][-1], sortie)
 
 
 if __name__ == "__main__":

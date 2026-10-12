@@ -91,11 +91,11 @@ class PolitiqueTest(_Canon, unittest.TestCase):
 
     def test_validation_gabarit_inconnu_et_chemin_vide(self):
         for work, attendu in (
-                ("  work_roots: {acme-web: '/srv/{projet}'}", "gabarit inconnu"),
-                ("  work_dirs: {ouvrier: '/srv/{agnet}'}", "gabarit inconnu"),
-                ("  work_root: '/srv/{agent'", "accolade orpheline"),
-                ("  work_root: ''", "chemin vide"),
-                ("  work_dirs: {ouvrier: ''}", "chemin vide"),
+                ("  work_roots: {acme-web: '/srv/{projet}'}", "unknown template"),
+                ("  work_dirs: {ouvrier: '/srv/{agnet}'}", "unknown template"),
+                ("  work_root: '/srv/{agent'", "unmatched brace"),
+                ("  work_root: ''", "empty path"),
+                ("  work_dirs: {ouvrier: ''}", "empty path"),
                 ("  work_dirs: [ouvrier]", "mapping"),
         ):
             with self.subTest(work=work):
@@ -115,7 +115,7 @@ class PolitiqueTest(_Canon, unittest.TestCase):
         herites = self.findings("admission-cwd-inherited")
         self.assertEqual(len(herites), 1)
         self.assertEqual(herites[0].severity, canon.WARNING)
-        self.assertIn("cwd hérité de la fiche Placement", herites[0].message)
+        self.assertIn("cwd inherited from the Placement card", herites[0].message)
         self.assertIn("work_dirs", herites[0].message)
         self.assertEqual(self.findings("admission-cwd-ignored"), [])
 
@@ -145,7 +145,7 @@ class SyncTest(_Canon, test_canon._CanonDbCase):
         self.admission("cwd: ~/wt/ouvrier")
         action = self.action(self.sync("banc"))
         self.assertEqual(self.row("ouvrier")["cwd"], os.path.expanduser("~/wt/ouvrier"))
-        self.assertIn("cwd hérité de la fiche Placement", action.detail)
+        self.assertIn("cwd inherited from the Placement card", action.detail)
         self.assertIn("work_dirs", action.detail)
 
     def test_politique_prioritaire_sur_placement(self):
@@ -153,7 +153,7 @@ class SyncTest(_Canon, test_canon._CanonDbCase):
         self.admission("cwd: ~/wt/ouvrier")
         action = self.action(self.sync("banc"))
         self.assertEqual(self.row("ouvrier")["cwd"], "/srv/acme/acme-web")
-        self.assertNotIn("hérité", action.detail)
+        self.assertNotIn("inherited", action.detail)
 
     def test_work_dirs_et_gabarit_dans_le_registre(self):
         self.host("  work_dirs: {ouvrier: ~/wt/perso}")
@@ -167,7 +167,7 @@ class SyncTest(_Canon, test_canon._CanonDbCase):
         self.host("")
         action = self.action(self.sync("banc"))
         self.assertIsNone(self.row("ouvrier")["cwd"])
-        self.assertIn("aucun dossier de travail", action.detail)
+        self.assertIn("no working directory", action.detail)
 
 
 class BoucleTest(PgTestCase):
@@ -233,7 +233,7 @@ class BoucleTest(PgTestCase):
         spec = w.pick()
         self.assertIsNotNone(spec)
         self.assertEqual(spec["kind"], "prompt")
-        self.assertTrue(any("retrouvé" in m for m in self.logs))
+        self.assertTrue(any("working directory found again" in m for m in self.logs))
         self.assertFalse(w._wd_blocked)
 
     def test_statut_leve_sans_travail_en_attente(self):

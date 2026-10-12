@@ -766,15 +766,15 @@ class TlsLocalTest(PgTestCase):
                     TlsReloader(self.cert, self.key)
         os.chmod(self.key, 0o600)
         os.chmod(self.cert, 0o644)
-        with self.assertRaisesRegex(approve_config.ApproveConfigError, "certificat"):
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "certificate"):
             TlsReloader(self.cert, self.key)
         os.chmod(self.cert, 0o600)
         link = os.path.join(self.certs, "lien.key")
         os.symlink(self.key, link)
-        with self.assertRaisesRegex(approve_config.ApproveConfigError, "pas un lien"):
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "not a link"):
             TlsReloader(self.cert, link)
         other_cert, other_key = _openssl_cert(self.certs, H_A, "autre")
-        with self.assertRaisesRegex(approve_config.ApproveConfigError, "inutilisable"):
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "unusable"):
             TlsReloader(self.cert, other_key)
         self.assertEqual(TlsReloader(other_cert, other_key).loads, 1)
         with self.assertRaisesRegex(approve_config.ApproveConfigError, "go together"):
@@ -826,7 +826,7 @@ class TlsLocalTest(PgTestCase):
         os.rename(self.key, self.key + ".vrai")
         os.symlink(alt_key, self.key)
         self.assertEqual(self.peer(inst), served)
-        with self.assertRaisesRegex(approve_config.ApproveConfigError, "lien"):
+        with self.assertRaisesRegex(approve_config.ApproveConfigError, "link"):
             TlsReloader(self.cert, self.key)
 
     def test_cli_refuse_une_cle_lisible_par_d_autres(self):

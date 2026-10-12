@@ -79,7 +79,7 @@ class BudgetSepareTest(unittest.TestCase):
         text = progress.format_text(_snap_avec(b), width=100)
         self.assertIn("spent (pay-per-token, estimated): 1 h 2.00", text)
         self.assertIn("value consumed on plans", text)
-        self.assertNotIn("total estimé", text)
+        self.assertNotIn("estimated total", text)
 
     def test_tours_en_echec_et_jetons(self):
         rows = [_row("codex1", "codex", 0.0, turns=5, failed_turns=5),
@@ -104,11 +104,11 @@ class BudgetSepareTest(unittest.TestCase):
         b = progress.build_budget([_row("d1", "deepseek", 1.0)], [], NOW,
                                   paid_harnesses=["deepseek"])
         html = progress.render_html(_snap_avec(b))
-        for text in ("valeur consommée sur les forfaits", "dépensé (payé au token)",
-                     '"cache relu"', '"entrée"', '"en échec"', "prochain choix",
-                     "perdu à la remise à zéro"):
+        for text in ("value consumed on plans", "spent (paid per token)",
+                     '"cache read"', '"input"', '"failed"', "next choice",
+                     "lost at reset"):
             self.assertIn(text, html)
-        self.assertNotIn("total estimé", html)
+        self.assertNotIn("estimated total", html)
 
     def test_comptes_toutes_fenetres(self):
         compte = {"harness": "claude", "account": "tertiaire", "active": False,

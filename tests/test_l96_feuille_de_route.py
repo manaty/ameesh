@@ -270,7 +270,7 @@ class RoadmapPgTest(PgTestCase):
                         "2026-10-11", "--livraison", "2026-10-12", "--source",
                         "conversation du 2026-10-10")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("livraison 2026-10-12", out.stdout)
+        self.assertIn("delivery 2026-10-12", out.stdout)
         row = storage.of(self.db).roadmap.item_plans([lot["id"]])[0]
         self.assertEqual((row["planned_start"], row["planned_end"], row["planned_delivery"],
                           row["planned_source"]),

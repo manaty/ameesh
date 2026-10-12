@@ -434,7 +434,7 @@ class ConfianceParCanonTest(_Authentificateurs):
         self.runner_pass(cfg)
         self.assertEqual(self.auth_states(), {"": "ok", ID_B: "skipped"})
         self.assertEqual({k[0] for k in self.live()}, {""})
-        self.assertIn("NON APPROUVÉ", canon_sync.state(self.db, HOST, ID_B)["auth_diagnostic"])
+        self.assertIn("NOT APPROVED", canon_sync.state(self.db, HOST, ID_B)["auth_diagnostic"])
         # le même canon, approuvé (git, `ref` configurée) : synchronisé
         self.assertTrue(self.runner_pass(self.cfg2()))
         self.assertEqual(self.auth_states(), {"": "ok", ID_B: "ok"})

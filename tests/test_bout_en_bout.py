@@ -219,10 +219,10 @@ class BoutEnBoutTest(PgTestCase):
         self.commit = git(self.clone, "rev-parse", "origin/main")
 
         proc = self.run_mesh("canon", "check")
-        self.assertIn("canon valide — 0 erreur(s)", proc.stdout)
-        self.assertIn("état du canon pour %s : ok" % HOST, proc.stdout)
+        self.assertIn("canon valid — 0 error(s)", proc.stdout)
+        self.assertIn("canon state for %s: ok" % HOST, proc.stdout)
         self.assertIn(self.commit[:12], proc.stdout)            # lu au commit canonique
-        self.assertNotIn("NON APPROUVÉ", proc.stdout)
+        self.assertNotIn("NOT APPROVED", proc.stdout)
 
     # 2 ----------------------------------------------------------------------
     def etape_2_canon_sync(self) -> None:
@@ -253,7 +253,7 @@ class BoutEnBoutTest(PgTestCase):
             self.assertEqual({n: r["placement_ok"] for n, r in rows.items()},
                              {"orchestre": True, "relecteur": True})
         proc = self.run_mesh("canon", "check")
-        self.assertIn("registre  : ok pour %s" % HOST, proc.stdout)
+        self.assertIn("registry  : ok for %s" % HOST, proc.stdout)
 
     # 3 ----------------------------------------------------------------------
     def etape_3_executeur(self) -> None:
@@ -344,7 +344,7 @@ class BoutEnBoutTest(PgTestCase):
         alice = next(m for m in loaded.members if m.title == "alice")
         self.assertEqual([a["credential_id"] for a in alice.authenticators],
                          [soft.credential_id])
-        self.assertIn("canon valide — 0 erreur(s)", self.run_mesh("canon", "check").stdout)
+        self.assertIn("canon valid — 0 error(s)", self.run_mesh("canon", "check").stdout)
         report = json.loads(self.run_mesh("canon", "sync", "--json").stdout)
         self.assertEqual((report["canon_status"], report["errors"]), ("ok", 0))
         # canon sync recopie Member.authenticators dans le registre de confiance (§8.2)
@@ -390,7 +390,7 @@ class BoutEnBoutTest(PgTestCase):
         self.assertIn("receipt VALID: approve by %s (webauthn" % ALICE, proc.stdout)
         # le lien est dans le fil du projet ; le jeton de service nulle part
         thread = self.run_mesh("fil", "show", PROJECT).stdout
-        self.assertIn("Demande d'approbation de l'action %s" % action_id, thread)
+        self.assertIn("Approval request for action %s" % action_id, thread)
         self.assertIn(data["link"], thread)
         self.assertNotIn(self.service_token, thread)
         return receipt_path
@@ -437,11 +437,11 @@ class BoutEnBoutTest(PgTestCase):
                       self.run_mesh("decisions", "--for", ALICE).stdout)
         # chaque transition est lisible dans le fil du projet (§7.1)
         thread = self.run_mesh("fil", "show", PROJECT).stdout
-        for text in ("Action %s proposée par %s : git-merge merge sur %s" % (
+        for text in ("Action %s proposed by %s: git-merge merge on %s" % (
                          action_id, ORCHESTRE, PR),
-                     "Action %s approuvée" % action_id, "Action %s lancée" % action_id,
-                     "Action %s — issue INCONNUE" % action_id,
-                     "Action %s confirmée" % action_id):
+                     "Action %s approved" % action_id, "Action %s launched" % action_id,
+                     "Action %s — outcome UNKNOWN" % action_id,
+                     "Action %s confirmed" % action_id):
             self.assertIn(text, thread)
         self.assertRegex(thread, r"(?m)^### \S+ — agent:orchestre → human:alice$")
 

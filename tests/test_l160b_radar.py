@@ -192,7 +192,7 @@ class ConflictsCommandTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("1 in conflict", done.stdout)
         self.assertIn("conflict #1 #2  shared.py", done.stdout)
-        self.assertNotIn("overlap", done.stdout)
+        self.assertNotIn("overlap  #", done.stdout)
         self.assertIn("migration 0002", done.stdout)
         self.assertIn("overlap  #1 #3", self.conflicts("--all").stdout)
         data = json.loads(self.conflicts("--json").stdout)

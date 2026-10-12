@@ -226,7 +226,7 @@ class CourrierBorneTest(_Base):
         sortie = self._hook(worker, "tour-1")
         self.assertIn("message n°4", sortie)
         self.assertNotIn("message n°5", sortie)
-        self.assertIn("2 message(s) en attente", sortie)
+        self.assertIn("2 pending message(s)", sortie)
         self.assertIn("Wrap up this turn", sortie)
         self.assertEqual(self._livres(ids), 5)
         # borne atteinte : plus rien de remis ni de réservé, et le Stop ne
@@ -251,7 +251,7 @@ class CourrierBorneTest(_Base):
         sortie = self._hook(worker, "tour-2", borne=5)
         self.assertIn("message n°5", sortie)
         self.assertIn("message n°6", sortie)
-        self.assertNotIn("en attente", sortie)
+        self.assertNotIn("pending message(s)", sortie)
         self.assertEqual(self._livres(ids), 7)
 
     def test_stop_bloque_dans_la_borne(self):
@@ -259,7 +259,7 @@ class CourrierBorneTest(_Base):
         ids = [mail.send(self.db, "pair", "orch-stop", "message n°%d" % i) for i in range(3)]
         sortie = json.loads(self._hook(worker, "tour-1", event="Stop", borne=2))
         self.assertEqual(sortie["decision"], "block")
-        self.assertIn("1 message(s) en attente", sortie["reason"])
+        self.assertIn("1 pending message(s)", sortie["reason"])
         self.assertEqual(self._livres(ids), 2)
 
     def test_borne_zero_ou_hors_tour_mene_sans_borne(self):

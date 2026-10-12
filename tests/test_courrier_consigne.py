@@ -95,8 +95,8 @@ class CourrierDansLaConsigneTest(PgTestCase):
             ligne["created_ts"]).astimezone().isoformat(timespec="seconds")
         self.assertIn(attendu, consigne)
         self.assertIn(adapters.AUTHORITY_NOTE, consigne)
-        self.assertIn("jamais l'autorité du propriétaire", consigne)
-        self.assertNotIn("lance agent-mail inbox", consigne)
+        self.assertIn("never carries the owner's authority", consigne)
+        self.assertNotIn("run agent-mail inbox", consigne)
         self.assertIsNotNone(ligne["delivered_ts"])
         self.assertEqual(mail.unread(self.db, "lecteur"), [])
 
@@ -370,7 +370,7 @@ class CourrierDansLaConsigneTest(PgTestCase):
                 mock.patch.object(runner_mod, "log") as journal:
             worker.run_turn(spec)
         self.assertIsNone(self._ligne(mid)["delivered_ts"])
-        self.assertTrue(any("remise incertaine" in str(c) for c in journal.call_args_list))
+        self.assertTrue(any("uncertain delivery" in str(c) for c in journal.call_args_list))
 
     def test_panne_apres_reservation_re_livre_en_le_signalant(self):
         _runner, worker = self._worker("panne")
@@ -537,7 +537,7 @@ class CourrierDansLaConsigneTest(PgTestCase):
         consigne = self._consigne()
         self.assertIn(adapters.PRIORITY_HEADER % 1, consigne)
         self.assertIn("> arrête tout et relance la CI", consigne)
-        self.assertIn("de orch", consigne)
+        self.assertIn("from orch", consigne)
         self.assertIn(adapters.AUTHORITY_NOTE, consigne)
         self.assertIn("urgent", consigne)
         self.assertIsNotNone(self._ligne(mid)["delivered_ts"])

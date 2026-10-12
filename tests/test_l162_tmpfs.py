@@ -627,7 +627,7 @@ class TextesApres222Test(_Systeme, unittest.TestCase):
             running=set(), now=time.time() + 3 * HEURE)
         self.assertEqual(sort, "garde")
         self.assertIn("never deleted by ameesh: %s" % menage.UNATTRIBUTED, raison)
-        self.assertNotIn("absent du registre", raison)
+        self.assertNotIn("not in the registry", raison)
 
     def test_l_en_tete_de_ameesh_menage(self):
         connue = {"path": self.entree, "bytes": 5000, "agent": None, "status": "garde",

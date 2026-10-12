@@ -57,17 +57,17 @@ class MailLinksLotsTest(_Base):
         self.assertEqual(len(self.unread("dev1")), 1)      # le message part quand même
         # un autre expéditeur n'est pas averti ; un destinataire avec un lot non plus
         proc = self.send("dev1", "Une question sur ta revue.", "--from", "dev2")
-        self.assertNotIn("aucun lot ouvert", proc.stderr)
+        self.assertNotIn("has no open lot", proc.stderr)
         work.add(self.db, title="relecture", assignee="dev1")
         proc = self.send("dev1", "Autre chose à regarder.", "--from", "orch")
-        self.assertNotIn("aucun lot ouvert", proc.stderr)
+        self.assertNotIn("has no open lot", proc.stderr)
 
     def test_lot_rattache_assigne_et_branche_citee(self):
         lot = work.add(self.db, title="RT-9 : cercle de confiance")
         proc = self.send("dev1", "À toi : travaille sur agent/dev1-rt-9 puis gèle.", "--from",
                          "orch", "--lot", "RT-9")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertNotIn("aucun lot ouvert", proc.stderr)
+        self.assertNotIn("has no open lot", proc.stderr)
         self.assertIn("lot #%d assigned to dev1" % lot["id"], proc.stdout)
         item = work.get(self.db, lot["id"])
         self.assertEqual((item["assignee"], item["branch"]), ("dev1", "agent/dev1-rt-9"))
@@ -238,7 +238,7 @@ class BranchMergeTest(_Base):
         _git(self.repo, "merge", "-q", "--no-ff", "-m", "m", "agent/dev1-cli")
         proc = self.mesh("work", "sync-branches")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("FERMÉ", proc.stdout)
+        self.assertIn("CLOSED", proc.stdout)
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 
     def test_noms_refuses(self):
@@ -293,7 +293,7 @@ class IdleCapacityToOrchestratorTest(_Base):
         rows = self.unread("orch")
         self.assertEqual(len(rows), 1, rows)
         self.assertEqual(rows[0]["kind"], "event")
-        self.assertIn("sans lot", rows[0]["body"])
+        self.assertIn("without a lot", rows[0]["body"])
         notifier.run_pass(self.db, thresholds=seuils)       # même alerte : pas de doublon
         self.assertEqual(len(self.unread("orch")), 1)
 

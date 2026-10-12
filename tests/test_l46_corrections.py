@@ -150,7 +150,7 @@ class CanonParDefautRejoueTest(_DeuxCanons):
         b_defaut, a_second = canon.load(self.b), canon.load(self.a, default=False)
         with self.assertRaises(canon_sync.DefaultCanonError) as ctx:
             canon_sync.adopt_default(self.db, HOST, [b_defaut, a_second])
-        self.assertIn("pas d'identifiant enregistré", str(ctx.exception))
+        self.assertIn("no recorded identifier", str(ctx.exception))
         # rien n'est donné à B ; le canon par défaut est fermé (non réclamable)
         self.assertEqual(self._canons(), {"a1": None, "a2": None, "b1": ID_B, "b2": ID_B})
         self.assertEqual(self._defaut()["status"], canon_sync.CANON_INVALID)
@@ -239,7 +239,7 @@ class AttributionTest(PgTestCase):
     def test_nom_inconnu_refuse_avec_la_marche_a_suivre(self):
         proc = self.mesh("work", "add", "--title", "x", "--assignee", "fantome")
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("agent inconnu", proc.stderr)
+        self.assertIn("unknown agent", proc.stderr)
         self.assertIn("agent-runner register", proc.stderr)
         self.assertIn("--externe", proc.stderr)
 
@@ -345,7 +345,7 @@ class AdoptRevoqueLesLiaisonsTest(_BaseL39):
         self.assertEqual(session_bindings.listing(self.db), [])
         self.assertTrue(any("session binding(s) revoked: claude:s-ext" in n
                             for n in out["notes"]))
-        self.assertIn("révoquée(s) par human:proprio (adoption)", self._fil())
+        self.assertIn("revoked by human:proprio (adoption)", self._fil())
 
 
 class OrphanLotTest(PgTestCase):

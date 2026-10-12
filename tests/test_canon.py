@@ -1055,12 +1055,12 @@ class SpawnTest(_CanonDbCase):
     def test_refus(self):
         registry.upsert(self.db, "sansresp", harness="codex", host="atelier")
         cas = [
-            ("aide", "inconnu", 600, "inconnu"),
-            ("aide", "sansresp", 600, "responsable"),
-            ("orchestre", "relecteur", 600, "fiche dans le canon"),
-            ("sansresp", "orchestre", 600, "existe déjà"),
-            ("orchestre", "orchestre", 600, "lui-même"),
-            ("nom invalide", "orchestre", 600, "invalide"),
+            ("aide", "inconnu", 600, "unknown"),
+            ("aide", "sansresp", 600, "responsible"),
+            ("orchestre", "relecteur", 600, "card in the canon"),
+            ("sansresp", "orchestre", 600, "already exists"),
+            ("orchestre", "orchestre", 600, "itself"),
+            ("nom invalide", "orchestre", 600, "invalid agent"),
         ]
         loaded = self.load()
         for name, creator, ttl, attendu in cas:
@@ -1260,8 +1260,8 @@ class CanonCliTest(_CanonDbCase):
     def test_check(self):
         proc = self.mesh("canon", "check", env=self.cli_env())
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("canon valide", proc.stdout)
-        self.assertIn("[NON APPROUVÉ]", proc.stdout)
+        self.assertIn("canon valid", proc.stdout)
+        self.assertIn("[NOT APPROVED]", proc.stdout)
         write(self.root, "agents/ouvrier.md", fiche(type="Agent", title="ouvrier"))
         proc = self.mesh("canon", "check", "--json", env=self.cli_env())
         self.assertEqual(proc.returncode, 1)
@@ -1302,7 +1302,7 @@ class CanonCliTest(_CanonDbCase):
         # --diff REF : dépôt git requis…
         proc = self.mesh("review-class", "--diff", "HEAD", env=env)
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("dépôt git", proc.stderr)
+        self.assertIn("git repository", proc.stderr)
         # …puis les fichiers changés sont classés
         git(self.tmp, "init", "-q")
         write(self.tmp, "db/x.sql", "select 0;\n")
@@ -1389,13 +1389,13 @@ class CanonCliTest(_CanonDbCase):
     def test_canon_illisible_diagnostic(self):
         proc = self.mesh("canon", "sync", "--host", "atelier", env=self.cli_env())
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("état du canon pour atelier : ok", proc.stdout)
+        self.assertIn("canon state for atelier: ok", proc.stdout)
         registry.upsert(self.db, "manuel", harness="codex", host="atelier")
         shutil.rmtree(self.root)
         proc = self.mesh("canon", "sync", "--host", "atelier", env=self.cli_env())
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        for attendu in ("ILLISIBLE", "registre inchangé", "canon-missing",
-                        "état du canon pour atelier : unreadable", "NON réclamables"):
+        for attendu in ("UNREADABLE", "registry unchanged", "canon-missing",
+                        "canon state for atelier: unreadable", "NOT claimable"):
             self.assertIn(attendu, proc.stdout)
         data = json.loads(self.mesh("canon", "sync", "--host", "atelier", "--json",
                                     env=self.cli_env()).stdout)
@@ -1403,8 +1403,8 @@ class CanonCliTest(_CanonDbCase):
         self.assertIn("canon-missing", data["diagnostic"])
         proc = self.mesh("canon", "check", "--host", "atelier", env=self.cli_env())
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("état du canon pour atelier : unreadable", proc.stdout)
-        self.assertIn("registre  : unreadable pour atelier", proc.stdout)
+        self.assertIn("canon state for atelier: unreadable", proc.stdout)
+        self.assertIn("registry  : unreadable for atelier", proc.stdout)
         data = json.loads(self.mesh("canon", "check", "--host", "atelier", "--json",
                                     env=self.cli_env()).stdout)
         self.assertEqual((data["canon_status"], data["registry_state"]["status"]),
@@ -1423,7 +1423,7 @@ class CanonCliTest(_CanonDbCase):
         proc = self.mesh("agent", "spawn", "aide", "--by", "orchestre", "--ttl", "1h",
                          "--prompt", "premier tour")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("responsable human:alice", proc.stdout)
+        self.assertIn("responsible human:alice", proc.stdout)
         self.assertEqual(self.row("aide")["pending_prompt"], "premier tour")
         proc = self.mesh("agent", "spawn", "aide2", "--by", "orchestre")
         self.assertEqual(proc.returncode, 2)                    # --ttl obligatoire

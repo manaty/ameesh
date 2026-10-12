@@ -51,7 +51,7 @@ class ProviderListingTest(unittest.TestCase):
     def test_a_first_page_is_not_a_complete_list(self):
         result = anthropic.parse_listing(ANTHROPIC_PARTIAL)
         self.assertFalse(result.complete, "pagination non suivie = liste partielle")
-        self.assertIn("partielle", result.detail)
+        self.assertIn("partial", result.detail)
         # Les modèles vus sont quand même rapportés : ils seront rafraîchis, pas retirés.
         self.assertEqual([m.model_id for m in result.models], ["claude-opus-5-5"])
 
@@ -60,7 +60,7 @@ class ProviderListingTest(unittest.TestCase):
             result = module.parse_listing(None, status_ok=False)
             self.assertFalse(result.complete, module.PROVIDER)
             self.assertEqual(result.models, (), "une erreur ne rapporte aucun modèle")
-            self.assertNotIn("vide", result.detail)
+            self.assertNotIn("empty", result.detail)
 
     def test_a_broken_body_reports_nothing_rather_than_a_list(self):
         result = openai.parse_listing("pas un objet", status_ok=True)
@@ -83,7 +83,7 @@ class ProviderListingTest(unittest.TestCase):
                 result = module.listing()
                 self.assertFalse(result.complete, module.PROVIDER)
                 self.assertEqual(result.models, ())
-                self.assertIn("clé", result.detail)
+                self.assertIn("key", result.detail)
         finally:
             for name, value in saved.items():
                 if value is not None:

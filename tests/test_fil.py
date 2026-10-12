@@ -24,7 +24,7 @@ from ameesh import db as db_mod
 from ameesh import fil, mail, registry
 from ameesh.backend import FileBackend, PgBackend
 
-from .support import REPO, SRC, PgTestCase
+from .support import REPO, SRC, PgTestCase, v0_in_english
 
 HEADING = re.compile(r"^### (\S+) — (.+?) → (.*)$", re.M)
 UNREACHABLE = "postgresql://ameesh:ameesh@127.0.0.1:5599/ameesh"
@@ -829,7 +829,7 @@ class FilPgTest(PgTestCase):
         finally:
             casse.close()
         self.assertIn("thread write failed", err.getvalue())
-        self.assertIn("message conservé dans la boîte (id %d)" % message_id, err.getvalue())
+        self.assertIn("message kept in the mailbox (id %d)" % message_id, err.getvalue())
         self.assertEqual([m["body"] for m in mail.unread(self.db, "beta")],
                          ["message à ne pas perdre"])
         self.assertEqual(self.db.query("SELECT count(*)::int AS n FROM thread_index")[0]["n"], 0)
@@ -886,7 +886,7 @@ class FilPgTest(PgTestCase):
         proc = self.cli("send", "beta", "repli et fil cassé", env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("thread write failed", proc.stderr)
-        self.assertIn("boîte fichier", proc.stderr)
+        self.assertIn("file mailbox", proc.stderr)
         self.assertEqual(len(os.listdir(os.path.join(self.v0state, "inbox", "beta"))), 1)
 
     def test_import_v0_sans_doublon(self):
@@ -941,7 +941,7 @@ class FilPgTest(PgTestCase):
         mail.send(self.db, "alpha", "beta", '{"a": 1}', allow_structured=True)
         self.assertEqual(self.unread_count("beta"), 1)
 
-    # -- hooks : JSON strictement v0, même fil cassé ------------------------
+    # -- hooks : JSON de la v0 (en anglais, L156c), même fil cassé ------------------------
     def _seed(self, name: str, sender: str, text: str) -> None:
         shutil.rmtree(os.path.join(self.state, "hooks"), ignore_errors=True)
         inbox = os.path.join(self.v0state, "inbox", name)
@@ -967,8 +967,7 @@ class FilPgTest(PgTestCase):
                     input=payload, capture_output=True, text=True, env=env)
                 v1 = self.cli("hook", "claude", env=env, stdin=payload)
                 self.assertEqual(v1.returncode, 0)
-                self.assertEqual(v1.stdout, v0.stdout)
-                self.assertEqual(json.loads(v1.stdout), json.loads(v0.stdout))
+                self.assertEqual(v1.stdout, v0_in_english(v0.stdout))
 
     def test_hook_livre_un_message_dont_le_fil_a_echoue(self):
         casse = self.broken_threads()
@@ -998,7 +997,7 @@ class FilPgTest(PgTestCase):
         proc = self.mesh("fil", "list")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         lignes = proc.stdout.splitlines()
-        self.assertTrue(lignes[0].startswith("PROJET"))
+        self.assertTrue(lignes[0].startswith("PROJECT"))
         self.assertTrue(any(re.match(r"^nexlink\s+—\s+3\s", l) for l in lignes), lignes)
         self.assertTrue(any(re.match(r"^nexlink\s+12\s+1\s", l) for l in lignes), lignes)
 

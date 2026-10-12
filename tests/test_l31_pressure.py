@@ -121,7 +121,7 @@ class PressureDbTest(test_canon._CanonDbCase):
         self.assertEqual(self.turns(), [])  # aucun harnais lancé
         row = registry.get(self.db, "orchestre")
         self.assertEqual(row["status"], "blocked")
-        self.assertIn("pression", row["status_text"])
+        self.assertIn("pressure", row["status_text"])
         # la consigne n'a pas été consommée
         self.assertTrue(row.get("pending_prompt"))
 
@@ -160,7 +160,7 @@ class PressureDbTest(test_canon._CanonDbCase):
             AMEESH_CANON=self.root, AMEESH_CANON_UNTRUSTED="1",
             AMEESH_HOST="atelier", AMEESH_RESOURCE_INTERVAL="30"))
         row = registry.get(self.db, "orchestre")
-        self.assertNotIn("pression", row.get("status_text") or "")
+        self.assertNotIn("pressure", row.get("status_text") or "")
 
     def _bail(self, nom):
         self.sync()

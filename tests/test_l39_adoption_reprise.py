@@ -144,9 +144,9 @@ class AdoptTest(_Base):
             reprise.adopt(self._cfg(comptes), self.db, "coord", session_id=SID,
                           harness="codex")
         texte = str(ctx.exception)
-        self.assertIn("introuvable", texte)
+        self.assertIn("not found", texte)
         self.assertIn(os.path.join(comptes["codex"][0]["path"], "sessions"), texte)
-        self.assertIn("comptes déclarés : primaire, secondaire", texte)
+        self.assertIn("declared accounts: primaire, secondaire", texte)
         # présente sous un AUTRE compte que celui visé : on dit lequel
         _rollout(comptes["codex"][1]["path"], SID, self.travail)
         with self.assertRaises(reprise.RepriseError) as ctx:
@@ -169,7 +169,7 @@ class AdoptTest(_Base):
             with self.assertRaises(reprise.RepriseError) as ctx:
                 reprise.adopt(self._cfg(comptes), self.db, "coord", session_id=SID,
                               harness="codex")
-            self.assertIn("fermez d'abord la session interactive", str(ctx.exception))
+            self.assertIn("close the interactive session first", str(ctx.exception))
             self.assertIn("pid %d" % os.getpid(), str(ctx.exception))
             self.assertEqual(registry.get(self.db, "coord")["mode"], "externe")
             avertissements: list[str] = []
@@ -188,7 +188,7 @@ class AdoptTest(_Base):
         with self.assertRaises(reprise.RepriseError) as ctx:
             reprise.adopt(self._cfg(comptes), self.db, "vivant", session_id=SID,
                           harness="codex")
-        self.assertIn("bail vivant", str(ctx.exception))
+        self.assertIn("live lease", str(ctx.exception))
         self.assertNotEqual(registry.get(self.db, "vivant")["session_id"], SID)
 
     def test_claude_et_deepseek_sans_compte_declare(self):
@@ -233,7 +233,7 @@ class AdoptTest(_Base):
         proc = self.mesh("adopt", "coord", "--session", "absente", "--harness", "codex",
                          env=self.env(AMEESH_CONFIG=config))
         self.assertEqual(proc.returncode, 1)
-        self.assertIn("introuvable", proc.stderr)
+        self.assertIn("not found", proc.stderr)
 
 
 # --------------------------------------------------------------------------
@@ -292,7 +292,7 @@ class ResumeTest(_Base):
         self.assertFalse(out["kept"])
         self.assertTrue(out["deterministic"])
         self.assertEqual(out["forgotten_session"], "sess-b")
-        self.assertIn("inutilisable", out["why"])
+        self.assertIn("unusable", out["why"])
         row = registry.get(self.db, "coord")
         self.assertIsNone(row["session_id"])
         self.assertIsNone(row["session_account"])
@@ -324,7 +324,7 @@ class ResumeTest(_Base):
         out = reprise.resume(self._cfg(comptes), self.db, "rot")
         self.assertTrue(out["kept"])
         self.assertEqual(out["next_account"], "secondaire")
-        self.assertIn("résumera", out["why"])
+        self.assertIn("will summarize", out["why"])
         self.assertEqual(registry.get(self.db, "rot")["session_id"], "sess-p")
         self.assertEqual(self.db.query("SELECT count(*)::int AS n FROM account_switches")[0]
                          ["n"], 0)
@@ -333,7 +333,7 @@ class ResumeTest(_Base):
         self.runner("stop", "rot")
         out = reprise.resume(self._cfg(comptes), self.db, "rot")
         self.assertFalse(out["kept"])
-        self.assertIn("saturé", out["why"])
+        self.assertIn("saturated", out["why"])
 
     def test_fresh_oublie_la_session_et_le_fichier_local(self):
         self._arrete("fr", "sess-f", None)
@@ -379,7 +379,7 @@ class ResumeTest(_Base):
         self.db.execute("UPDATE agent_registry SET status = 'running' WHERE name = 'repos'")
         with self.assertRaises(reprise.RepriseError) as ctx:
             reprise.resume(self.cfg, self.db, "repos")
-        self.assertIn("tour en cours", str(ctx.exception))
+        self.assertIn("turn in progress", str(ctx.exception))
 
 
 # --------------------------------------------------------------------------
@@ -468,7 +468,7 @@ class SessionAccountTest(_Base):
         self.assertIn('author="ameesh, deterministic brief" authority="none"',
                       dernier["argv"][-1])
         self.assertNotIn("you wrote yourself", dernier["argv"][-1])
-        self.assertIn("brief déterministe (L39)", self._fil())
+        self.assertIn("deterministic brief (L39)", self._fil())
 
 
 if __name__ == "__main__":

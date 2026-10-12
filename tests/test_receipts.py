@@ -619,7 +619,7 @@ class SmallOrderTest(unittest.TestCase):
         for point in SMALL_ORDER:
             with self.subTest(point=point.hex()):
                 self.assertIsNotNone(signing._point_decompress(point))   # bien sur la courbe
-                self.assertIn("petit ordre", signing.public_key_error(point))
+                self.assertIn("small-order", signing.public_key_error(point))
                 with self.assertRaises(ValueError):
                     signing.check_public_key(point)
                 with self.assertRaises(ValueError):
@@ -679,8 +679,8 @@ class SmallOrderTest(unittest.TestCase):
                 self.assertTrue(backend.verify(public, message, good))       # inchangé
                 self.assertFalse(backend.verify(public, message, small_r))
                 self.assertFalse(backend.verify(public, message, unreduced))
-        self.assertEqual(signing.signature_error(public, small_r), "R de petit ordre")
-        self.assertIn("S non réduit", signing.signature_error(public, unreduced))
+        self.assertEqual(signing.signature_error(public, small_r), "small-order R")
+        self.assertIn("S not reduced", signing.signature_error(public, unreduced))
         self.assertIsNone(signing.signature_error(public, good))
 
     def test_cles_honnetes_inchangees(self):
@@ -1761,7 +1761,7 @@ class SyncTest(ReceiptsBase):
         self.assertIn("unknown level", joined)
         self.assertIn("invalid facade or credential_id", joined)
         self.assertIn("declared 2 times", joined)
-        self.assertIn("titre invalide", joined)
+        self.assertIn("invalid title", joined)
         self.assertEqual(result["added"], [])
         self.assertEqual(receipts.list_authenticators(self.db, approver="human:dave"), [])
 
@@ -1821,7 +1821,7 @@ class ReceiptsCliTest(ReceiptsBase):
         bound = ["--digest", request["digest"], "--action-id", request["action_id"]]
         proc = self.mesh(*args, "--consume", "--by", "cli", *bound)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("consommé", proc.stdout)
+        self.assertIn("consumed", proc.stdout)
         proc = self.mesh(*args, "--consume", "--by", "cli", *bound)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("[replay]", proc.stderr)

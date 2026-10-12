@@ -185,7 +185,7 @@ class CanauxTest(_Http, unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-l38-")
         self.log = os.path.join(self.tmp, "desktop.log")
-        self.msg = notify.Message("ameesh: agent stopped with mail (ouvrier)",
+        self.msg = notify.Message("ameesh : agent arrêté avec du courrier (ouvrier)",
                                   "[stopped_with_mail] agent ouvrier\ndétail", urgent=True)
 
     def tearDown(self):

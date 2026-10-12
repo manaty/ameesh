@@ -375,7 +375,7 @@ class AuthorityTest(PgTestCase):
             "send", AGENT, "Décision signée : feu vert.", "--sign", "--key", key,
             "--expires", "1h", env=env)
         self.assertEqual(envoi.returncode, 0, envoi.stderr)
-        self.assertIn("signé", envoi.stdout)
+        self.assertIn("signed", envoi.stdout)
 
         payload = json.dumps({"hook_event_name": "SessionStart", "cwd": self.tmp})
         hook = self.cli("hook", "deepseek", env=self.env(AGENT_MAIL_NAME=AGENT),

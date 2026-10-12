@@ -615,7 +615,7 @@ class ApproveFlowTest(ApproveBase):
         self.assertEqual(render.summary_digest(summary), data["summary_digest"])
         # sosie : cible avec un « о » cyrillique signalée
         _a, _d, path = self.create(make_action(target="exemple/dep\u043et#42"))
-        self.assertIn("non ASCII", self.page(path)[2])
+        self.assertIn("non-ASCII", self.page(path)[2])
 
     def test_journal_sans_secret(self):
         _action, data, path = self.create()
@@ -692,7 +692,7 @@ class ApproveRetryTest(ApproveBase):
         self.assertEqual(status, 200, text)
         self.assertIn("New attempt of the SAME action", text)
         self.assertIn("definitely failed", text)
-        self.assertNotIn("DOUBLON", text)
+        self.assertNotIn("DUPLICATE", text)
         page = self.page_data(text)
         self.assertEqual(page["kind"], "approve")
         self.assertEqual(self.submit(path, self.sign(self.alice, page))[0], 200)
@@ -707,7 +707,7 @@ class ApproveRetryTest(ApproveBase):
         guaranteed = make_action(state="unknown", dedupe="guaranteed")
         _a, data, path = self.create(guaranteed)
         self.assertEqual(data["digest"], digest_of(guaranteed))
-        self.assertIn("garantit la", self.page(path)[2])
+        self.assertIn("guarantees deduplication", self.page(path)[2])
         # source sans l'information : L5 tranchera à la liaison (retry)
         self.create(make_action(state="unknown"))
         # sans déduplication garantie : aucune nouvelle tentative, seulement
@@ -1353,7 +1353,7 @@ class ApproveClientTest(ApproveBase):
         # le lien est dans le fil (pas le jeton de service) ; la demande au journal
         thread = self.thread_text()
         self.assertIn(link, thread)
-        self.assertIn("Demande d'approbation de l'action %s" % self.action_id, thread)
+        self.assertIn("Approval request for action %s" % self.action_id, thread)
         self.assertNotIn(self.service_token, thread)
         self.assertEqual(actions.last_approval_request(self.db, self.action_id), request_id)
         notes = [e["note"] for e in actions.events(self.db, self.action_id)
@@ -1405,7 +1405,7 @@ class ApproveClientTest(ApproveBase):
         proc = self.cli("request", self.action_id, "--approver", ALICE, rc=1,
                         AMEESH_APPROVE_URL="http://approve.example.test")
         self.assertIn("http only on loopback", proc.stderr)
-        self.assertNotIn("demande req_", self.log.getvalue())
+        self.assertNotIn("request req_", self.log.getvalue())
         # sans service : la demande brute reste disponible (--local)
         proc = self.cli("request", self.action_id, "--approver", ALICE, "--local")
         self.assertEqual(json.loads(proc.stdout)["digest"], self.action["digest"])

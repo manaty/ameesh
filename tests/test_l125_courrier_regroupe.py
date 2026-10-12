@@ -301,7 +301,7 @@ class EnvoiTest(_Base):
             registry.upsert(self.db, name, harness="claude")
         proc = self._envoi("orch", "Bien reçu, merci !")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("accusé de réception", proc.stdout)
+        self.assertIn("acknowledgement", proc.stdout)
         self.assertTrue(self._payload("orch").get("ack"))
         proc = self._envoi("orch", "ok")  # une réponse, peut-être un feu vert
         self.assertEqual(proc.stdout.strip(), "dropped for: orch")
@@ -333,7 +333,7 @@ class EnvoiTest(_Base):
         avant = len(mail.unread(self.db, "dev2"))
         proc = self._envoi("dev2", "x", "--cc", "inconnu")
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("agent inconnu", proc.stderr)
+        self.assertIn("unknown agent", proc.stderr)
         self.assertEqual(len(mail.unread(self.db, "dev2")), avant)
         proc = self._envoi("dev2,orch", "x")
         self.assertEqual(proc.returncode, 2)
@@ -345,7 +345,7 @@ class EnvoiTest(_Base):
             registry.upsert(self.db, name, harness="claude")
         proc = self._envoi("all", "Revue à 15 h", sender="orch")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("annonce", proc.stdout)
+        self.assertIn("announcement", proc.stdout)
         for name in ("dev1", "dev2"):
             self.assertEqual(mail.passive_reason(mail.unread(self.db, name)[-1]), "broadcast")
         proc = self._envoi("all", "Arrêtez de pousser sur main", "--urgent", sender="orch")
