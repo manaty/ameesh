@@ -41,7 +41,9 @@ READING_COLUMNS = (
     # #246 (0067): btrfs allocation
     "btrfs_unallocated_bytes, btrfs_metadata_headroom_bytes, "
     # #253 (0359): every filesystem the host writes to
-    "volumes"
+    "volumes, "
+    # L159e6 (0361): the guard's last restart, decoded by `_reading`
+    "guard_restart::text AS guard_restart"
 )
 
 #: L159d (and #246) columns written by `record`, in this order
@@ -67,6 +69,9 @@ def _reading(row: dict) -> dict:
         except ValueError:
             value = None
     row["volumes"] = value if isinstance(value, list) else []
+    # L159e6 (0361): `guard_restart` read as text (whatever the driver)
+    if isinstance(row.get("guard_restart"), str):
+        row["guard_restart"] = json.loads(row["guard_restart"])
     return row
 
 
@@ -87,8 +92,9 @@ class Hosts(interface.HostResources):
                 (host, mem_available_bytes, swap_used_bytes, load1, cpu_count,
                  disk_free_bytes, disk_path, turns_in_progress,
                  tmp_path, tmp_fstype, tmp_size_bytes, tmp_used_bytes,
-                 on_ac, battery_percent, volumes, """ + ", ".join(MEASURE_COLUMNS) + """)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, """
+                 on_ac, battery_percent, volumes, guard_restart, """ + ", ".join(MEASURE_COLUMNS) + """)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+                    %s::jsonb, """
             + ", ".join(["%s"] * len(MEASURE_COLUMNS)) + """)
             RETURNING """ + READING_COLUMNS,
             (reading.get("host") or "", reading.get("mem_available_bytes"),
@@ -99,6 +105,8 @@ class Hosts(interface.HostResources):
              reading.get("tmp_size_bytes"), reading.get("tmp_used_bytes"),
              reading.get("on_ac"), reading.get("battery_percent"),
              _volumes_param(reading.get("volumes")),
+             None if reading.get("guard_restart") is None
+             else json.dumps(reading["guard_restart"]),
              *(reading.get(column) for column in MEASURE_COLUMNS)),
         )
         # Historique court : au-delà de sept jours, la ligne n'a plus d'usage
@@ -147,10 +155,10 @@ class Hosts(interface.HostResources):
         return rows[0] if rows else {"samples": 0}
 
     def since(self, host, since_s) -> list[dict]:
-        return self.db.query(
+        return [_reading(row) for row in self.db.query(
             "SELECT " + READING_COLUMNS + " FROM host_resources WHERE host = %s"
             " AND sampled_at >= now() - make_interval(secs => %s)"
-            " ORDER BY sampled_at, id", (host, float(since_s)))
+            " ORDER BY sampled_at, id", (host, float(since_s)))]
 
     def record_harness_version(self, host, harness, *, path, version, raw) -> None:
         self.db.execute(

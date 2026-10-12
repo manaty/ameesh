@@ -20,6 +20,7 @@ minute. `min_mem_available`, `min_disk_free`, `min_btrfs_unallocated` et
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -783,6 +784,42 @@ def sample(host: str, *, path: str | None = None, now: float | None = None,
     return out
 
 
+def restart_record(record) -> dict | None:
+    """L159e6: a `guard.restart` record ({ts, started, skipped}) checked and
+    copied; None when ill-typed."""
+    if not isinstance(record, dict) or isinstance(record.get("ts"), bool) \
+            or not isinstance(record.get("ts"), (int, float)) \
+            or finite_float(record["ts"]) is None:
+        return None
+    started, skipped = record.get("started"), record.get("skipped")
+    if not isinstance(started, list) or not all(isinstance(u, str) for u in started) \
+            or not isinstance(skipped, dict) \
+            or not all(isinstance(r, str) for r in skipped.values()):
+        return None
+    return {"ts": float(record["ts"]), "started": list(started), "skipped": dict(skipped)}
+
+
+def guard_restart(path: str | None = None, *, now: float | None = None) -> dict | None:
+    """L159e6: the last restart the capacity guard of this host published
+    (`guard.restart` of its state, `path`: `guard.DEFAULT_STATE_PATH`), as
+    {ts, started, skipped, age_s}; None without a guard, an unreadable state
+    or an ill-typed record. `age_s`: its age on this host's clock at `now`,
+    so the reader never compares two clocks (codex #288 r1)."""
+    from . import guard
+    try:
+        with open(path or guard.DEFAULT_STATE_PATH, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    block = state.get("guard") if isinstance(state, dict) else None
+    record = restart_record(block.get("restart") if isinstance(block, dict) else None)
+    if record is None:
+        return None
+    now = time.time() if now is None else float(now)
+    record["age_s"] = max(0.0, now - record["ts"])
+    return record
+
+
 def collect(cfg, db: Db, *, now: float | None = None, policy=None) -> dict:
     """Relève l'hôte de cet exécuteur et publie le relevé ; rend le relevé.
 
@@ -804,6 +841,7 @@ def collect(cfg, db: Db, *, now: float | None = None, policy=None) -> dict:
     except Exception:  # un relevé ne doit jamais faire tomber la boucle
         basis = None
     reading.update(lendable(reading, basis))
+    reading["guard_restart"] = guard_restart(now=now)
     storage.of(db).hosts.record(reading)
     return reading
 
