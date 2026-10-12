@@ -39,7 +39,7 @@ def known_projects(cfg, db):
     (`github.projects`, lots' projects), plus the configured canons' work
     package teams and agent projects."""
     from . import canon_sync
-    names = set(canon_sync.known_projects(db))
+    names = set(canon_sync.known_projects(db, cfg))
     for canon in work.configured_canons(cfg):
         names.update(p.team for p in canon.packages if p.team)
         for agent in canon.agents:

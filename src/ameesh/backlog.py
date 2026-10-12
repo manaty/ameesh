@@ -570,7 +570,7 @@ def run(db: Db, args, cfg=None) -> int:
         from . import identity
         cfg = cfg if cfg is not None else getattr(db, "cfg", None)
         # L118c: the creator is this session, whatever `--actor` says (`work add`)
-        binding = identity.resolve_binding(cfg, db)
+        binding = identity.resolve_binding(cfg, db) if cfg is not None else None
         try:
             item = add(db, title=args.title, expected_value=args.expected_value,
                        value_score=args.value_score, priority=args.priority,
@@ -578,7 +578,8 @@ def run(db: Db, args, cfg=None) -> int:
                        required_capabilities=args.requires, body=args.body,
                        package=args.package, actor=args.actor,
                        app=getattr(args, "app", None),
-                       creator=binding.name if binding.ok else args.actor, cfg=cfg)
+                       creator=binding.name if binding is not None and binding.ok
+                       else args.actor, cfg=cfg)
         except BacklogError as exc:
             print("error: %s" % exc, file=sys.stderr)
             return 2
