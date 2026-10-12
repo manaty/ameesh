@@ -93,6 +93,10 @@ class ResidentError(RuntimeError):
     """The resident harness cannot do what was asked (start, protocol, dead)."""
 
 
+class InputRefused(ResidentError):
+    """The line was never queued: the outbox is full (#387)."""
+
+
 class ResidentBusy(ResidentError):
     """A turn is running: the input waits for its end (or is steered)."""
 
@@ -362,9 +366,19 @@ class ResidentDriver:
             # (codex r1, #325), the caller serves them again
             self._unconfirmed.update(input_id for input_id, _text in self._followups)
             self._followups.clear()
+            previous = (self._interrupting, turn.interrupted)
             self._interrupting = True
             turn.interrupted = True
-        return self._interrupt(turn)
+        try:
+            return self._interrupt(turn)
+        except InputRefused as exc:
+            # never written: the turn goes on, or its next result would end it
+            # before the steers still unread (codex r2, #387)
+            log("interrupt: %s" % exc)
+            with self._lock:
+                if self._turn is turn:
+                    self._interrupting, turn.interrupted = previous
+            return False
 
     def probe(self, timeout: float = PROBE_TIMEOUT) -> bool:
         """Does the harness answer? (process alive at least)"""
@@ -614,7 +628,7 @@ class ClaudeStreamJson(ResidentDriver):
         data = (json.dumps(message, ensure_ascii=False) + "\n").encode("utf-8")
         with self._input_lock:
             if self._outbox_bytes + len(data) > MAX_OUTBOX_BYTES:
-                raise ResidentError("input refused: %d bytes not yet read by the harness "
+                raise InputRefused("input refused: %d bytes not yet read by the harness "
                                     "(at most %d)" % (self._outbox_bytes, MAX_OUTBOX_BYTES))
             self._outbox_bytes += len(data)
         self._outbox.put(data)
@@ -726,6 +740,8 @@ class ClaudeStreamJson(ResidentDriver):
         try:
             return self._control({"subtype": "interrupt"}, CONTROL_TIMEOUT,
                                  turn=turn) is not None
+        except InputRefused:
+            raise  # never written: `interrupt` puts the turn back as it was
         except ResidentError as exc:
             log("interrupt: %s" % exc)
             return False

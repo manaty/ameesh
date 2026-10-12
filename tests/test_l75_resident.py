@@ -427,6 +427,20 @@ class ClaudeStreamJsonTest(DriverCase):
         self.assertEqual((result.status, result.inputs), (resident.COMPLETED, ("a",)))
         self.assertEqual(self.wait(driver.send("next")).final, "ECHO:next")
 
+    def test_a_refused_interrupt_does_not_end_the_turn(self):
+        # codex r2 (#387): an interrupt refused by the outbox leaves the turn
+        # uninterrupted: the result of "a" does not end it before "b"
+        driver = self.driver(env={"FAKE_CLAUDE_QUEUE": "1"})
+        driver.start()
+        turn = driver.send("SLOW first", input_id="a")
+        driver.steer("late", input_id="b")
+        with mock.patch.object(resident, "MAX_OUTBOX_BYTES", 0):
+            self.assertFalse(driver.interrupt())
+        result = self.wait(turn)
+        self.assertEqual((result.status, result.inputs, result.final),
+                         (resident.COMPLETED, ("a", "b"), "ECHO:late"))
+        self.assertNotIn({"control": "interrupt"}, self.trace())
+
     def test_an_interrupt_leaves_unread_inputs_unserved(self):
         # codex r1 (#325): a steer the harness had not read when the turn was
         # interrupted is not reported as served
