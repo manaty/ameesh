@@ -241,6 +241,8 @@ class PageBuilderTest(unittest.TestCase):
         self.assertIn('"z=day"', html)
         self.assertIn('[["week", "week"], ["day", "day"]]', html)
         self.assertIn("delivered and abandoned (", html)
+        # replié sauf s'il porte une tâche en retard ou en cours
+        self.assertIn('(x.late && x.late.open) || x.state === "en_cours"', html)
 
     def test_onglets_et_fenetre(self):
         html = progress.render_html(_snap())
