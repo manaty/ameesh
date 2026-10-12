@@ -5,8 +5,9 @@ from __future__ import annotations
 import os
 import select
 import signal
+import time
 
-from .process import start_time
+from .process import start_time, _stat_fields
 
 
 class ProcessHandle:
@@ -53,13 +54,28 @@ class ProcessHandle:
             return None
         return (group, session) if self.live() else None
 
-    def send(self, signum: int) -> None:
+    def freeze(self, timeout: float = .5) -> bool:
+        """Stop this identity and confirm delivery before checking ownership."""
+        if not self.send(signal.SIGSTOP):
+            return False
+        end = time.monotonic() + timeout
+        while self.live() and time.monotonic() < end:
+            try:
+                if _stat_fields(self.pid)[0] == "T" and self.live():
+                    return True
+            except (OSError, ValueError, IndexError):
+                return False
+            time.sleep(.005)
+        return False
+
+    def send(self, signum: int) -> bool:
         if self.fd is None:
-            return
+            return False
         try:
             signal.pidfd_send_signal(self.fd, signum)
+            return True
         except (OSError, ValueError):
-            pass
+            return False
 
     def close(self) -> None:
         if self.fd is not None:

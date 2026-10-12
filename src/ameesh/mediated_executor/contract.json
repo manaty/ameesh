@@ -2660,6 +2660,70 @@
    ]
   },
   {
+   "name": "turn_resources.running_started_before",
+   "write": false,
+   "transport": "op",
+   "scope": [
+    "H"
+   ],
+   "fence": false,
+   "param_agent": null,
+   "forced": {
+    "host": "executor_host"
+   },
+   "params": [
+    {
+     "name": "host",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "before_ts",
+     "kind": "positional",
+     "schema": {
+      "type": "number"
+     },
+     "required": true
+    },
+    {
+     "name": "after_id",
+     "kind": "positional",
+     "schema": {
+      "type": "integer"
+     },
+     "required": false,
+     "default": 0
+    },
+    {
+     "name": "limit",
+     "kind": "positional",
+     "schema": {
+      "type": "integer"
+     },
+     "required": false,
+     "default": 500
+    }
+   ],
+   "result": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
+   },
+   "rules": [
+    "admitted_agents",
+    "host forced; only admitted agents, including invitation allowlist and credential modes; filter before pagination; limit capped at 200"
+   ]
+  },
+  {
    "name": "hosts.record",
    "write": true,
    "transport": "op",
@@ -4003,7 +4067,6 @@
     "open_by_agent",
     "orphans",
     "orphans_started_before",
-    "running_started_before",
     "settle",
     "settle_many",
     "settle_unchanged",

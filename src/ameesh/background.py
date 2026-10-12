@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from . import containers as containers_mod
 from . import platform, storage
 from .platform.signals import ProcessHandle
+from .mediated_executor.contract import NotSupportedRemotely
 
 #: noms de processus tenus pour des shells (tâche de fond d'un harnais)
 SHELLS = ("bash", "sh", "dash", "zsh", "ksh", "mksh", "fish")
@@ -212,6 +213,7 @@ class Tracker:
     CONTAINERS_EVERY_S = 30.0
     #: zombies adoptés hors des tours suivis (démons détachés) : moissonnés
     STRAYS_EVERY_S = 60.0
+    UNKNOWN_ZOMBIES_WARN = 32
     #: fin de tour : délai laissé aux processus qui se ferment avec le
     #: harnais (serveurs MCP) avant de parler de travail de fond
     SETTLE_S = 2.0
@@ -230,6 +232,10 @@ class Tracker:
         self.subreaper = platform.become_subreaper()
         self._strays_at = 0.0
         self.thread: threading.Thread | None = None
+        self.observed_children: dict[int, float] = {}
+        self.observed_lock = threading.Lock()
+        self.unknown_zombies = 0
+        self._zombies_warned = False
 
     # -- fil de suivi -------------------------------------------------------
     def start_monitor(self, stop: threading.Event) -> None:
@@ -494,7 +500,6 @@ class Tracker:
             if not self.subreaper and any(h.live() for h in entry.handles.values()):
                 entry.unverified = True
             self._signal_handles(entry, signal.SIGTERM)
-            self._signal_handles(entry, signal.SIGCONT)
             end = time.monotonic() + self.TERM_GRACE_S
             while time.monotonic() < end:
                 if not any(h.live() for h in entry.handles.values()):
@@ -527,12 +532,23 @@ class Tracker:
             after = 0
             while True:
                 rows = resources.running_started_before(
-                    self.runner.host, time.time() + 1, after_id=after, limit=500)
+                    self.runner.host, time.time() + 1, after_id=after, limit=200)
                 groups.update(int(r["pgid"]) for r in rows
                               if r.get("pgid") and r["turn_id"] != entry.turn_id)
-                if len(rows) < 500:
+                if len(rows) < 200:
                     return groups
                 after = int(rows[-1]["id"])
+        except NotSupportedRemotely as exc:
+            if not getattr(self.runner, "mediated", False):
+                self.log("[%s] background ownership registry unavailable (%s)"
+                         % (entry.agent, exc))
+                return None
+            # Old mediated contracts cannot expose ownership. Keep the local
+            # harness protection and explicitly retain the uncertain verdict.
+            entry.unverified = True
+            self.log("[%s] background ownership registry unsupported; "
+                     "harness groups only, cleanup uncertain (%s)" % (entry.agent, exc))
+            return groups
         except Exception as exc:
             self.log("[%s] background ownership registry unavailable (%s)"
                      % (entry.agent, exc))
@@ -549,7 +565,29 @@ class Tracker:
                 self.log("[%s] background pid %s: ownership changed or unknown; no signal"
                          % (entry.agent, handle.pid))
                 continue
-            handle.send(signum)
+            delivered = False
+            try:
+                # A group check alone races with setsid/setpgid in the target.
+                # Confirm SIGSTOP before checking both ownership sources again.
+                if not handle.freeze():
+                    entry.unverified |= handle.live()
+                    self.log("[%s] background pid %s: stop not confirmed; no termination signal"
+                             % (entry.agent, handle.pid))
+                    continue
+                current_foreign = self._foreign_groups(entry)
+                location = handle.location()
+                if current_foreign is None or location is None or any(
+                        g in current_foreign for g in location):
+                    entry.unverified = True
+                    self.log("[%s] background pid %s: ownership changed while stopping; no termination signal"
+                             % (entry.agent, handle.pid))
+                    continue
+                delivered = handle.send(signum)
+            finally:
+                # TERM handlers need to run; a refused signal or ownership
+                # change must not leave our temporary stop in effect.
+                if (signum != signal.SIGKILL or not delivered) and handle.live():
+                    handle.send(signal.SIGCONT)
 
     def _remember_groups(self, entry: Entry, table: list[dict]) -> None:
         for p in table:
@@ -581,7 +619,10 @@ class Tracker:
                     entry.unverified = True
                     return True
                 for p in adopted:
-                    if p["pid"] in roots or p["pgid"] in groups:
+                    with self.observed_lock:
+                        observed = self.observed_children.get(p["pid"])
+                    if observed is not None and observed == p.get("start") \
+                            and platform.exited_child(p["pid"]):
                         platform.reap(p["pid"])
             descendants = set(roots)
             while True:
@@ -623,6 +664,9 @@ class Tracker:
                          % (entry.agent, p["pid"]))
         if eligible:
             entry.unverified = any(p["pid"] not in entry.handles for p in eligible)
+            with self.observed_lock:
+                self.observed_children.update({p["pid"]: p["start"] for p in eligible
+                    if p["pid"] in entry.handles and p.get("start") is not None})
 
     @staticmethod
     def _drop_handles(entry: Entry) -> None:
@@ -679,26 +723,35 @@ class Tracker:
                      % (entry.agent, entry.turn_id[:8], exc))
 
     def _reap_strays(self, table: list[dict], suivis: list[Entry]) -> None:
-        """Zombies adoptés hors des tours (démons détachés de leur groupe) :
-        moissonnés, sans quoi ils s'accumulent sous l'exécuteur. Jamais un
-        harnais (ni en cours de lancement), ni un enfant du groupe de
-        l'exécuteur (git, psql, docker attendus par leur `subprocess`), ni un
-        membre d'un tour en cours ou suivi."""
+        """Reap only observed turn descendants, never an arbitrary Popen child."""
         moi = os.getpid()
-        try:
-            mon_groupe = os.getpgid(0)
-        except OSError:
-            return
+        with self.observed_lock:
+            known = dict(self.observed_children)
         suivis_pgid = {e.pgid for e in suivis if e.pgid}
+        unknown = 0
         with self.runner.launch_lock:
             proteges = set(self.runner.harness_pids)
             for p in table:
-                if p["ppid"] != moi or not p["zombie"] or p["pgid"] == mon_groupe:
+                if p["ppid"] != moi or not p["zombie"]:
                     continue
                 if p["pid"] in proteges or p["pgid"] in proteges \
                         or p["pgid"] in suivis_pgid:
                     continue
-                platform.reap(p["pid"])
+                if known.get(p["pid"]) != p.get("start") or p.get("start") is None:
+                    unknown += 1
+                    continue
+                if platform.exited_child(p["pid"]):
+                    platform.reap(p["pid"])
+        self.unknown_zombies = unknown
+        if unknown >= self.UNKNOWN_ZOMBIES_WARN and not self._zombies_warned:
+            self.log("background alert: %s unattributed zombie children; wait statuses preserved"
+                     % unknown)
+        self._zombies_warned = unknown >= self.UNKNOWN_ZOMBIES_WARN
+        current = {p["pid"]: p.get("start") for p in table}
+        with self.observed_lock:
+            for pid, start in known.items():
+                if current.get(pid) != start and self.observed_children.get(pid) == start:
+                    del self.observed_children[pid]
 
     # -- l'agent, au tour suivant --------------------------------------------
     def cap_deadline(self, deadline: float, reason: str) -> int:
