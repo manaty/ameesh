@@ -41,6 +41,22 @@ class ChatOptionTest(unittest.TestCase):
         self.assertNotIn("--consigne", text)
 
 
+class ChatDocumentationTest(unittest.TestCase):
+    """P3 : l'aide générale et la consigne versionnée ne recommandent plus
+    l'ancienne graphie."""
+
+    def test_main_help_advertises_the_canonical_flag(self):
+        from ameesh import main
+        self.assertIn("ameesh chat [--harness claude|codex] [--instruction]",
+                      main.__doc__)
+        self.assertNotIn("--consigne", main.__doc__)
+
+    def test_versioned_instruction_uses_the_canonical_flag(self):
+        text = chat.instruction("human:alice", "chat-alice")
+        self.assertIn("ameesh chat --instruction", text)
+        self.assertNotIn("--consigne", text)
+
+
 class RenamedFunctionsTest(unittest.TestCase):
     """The English definition, the French name as a plain alias."""
 

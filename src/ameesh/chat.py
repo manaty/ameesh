@@ -196,7 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
-    """`ameesh chat` (sans `--consigne`) : contrôles, inscription, lancement."""
+    """`ameesh chat` (sans `--instruction`) : contrôles, inscription, lancement."""
     from . import account_turn, adapters, decisions, storage
     from . import db as db_mod
     if os.environ.get(decisions.CHAT_ENV):
