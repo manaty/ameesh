@@ -20,7 +20,9 @@ turn), `ASK` (the harness asks the client for a permission and reports the
 answer), `FLOOD` (Claude: writes `FAKE_CLAUDE_FLOOD` bytes of output before
 reading its input again), `ORPHAN` (a child leaves the group with `setsid`
 and keeps the output open; its pid is traced). The answer of a turn is
-`ECHO:<text>` per input served.
+`ECHO:<text>` per input served. `DEAF` (Claude): the input is never read
+again; `ORPHAN_IN`: the orphan also keeps the input; `FAKE_CODEX_STEER_HOLD=1`:
+the answer to `turn/steer` waits for the next `turn/interrupt`, then refuses.
 
 Environment: `FAKE_RESIDENT_LOG` (JSONL trace of argv and of what was
 received), `FAKE_CLAUDE_QUEUE=1` (an input written during a turn is not
@@ -109,6 +111,8 @@ class Claude:
             self.inbox.put(message)
             if message.get("type") == "user" and "FLOOD" in json.dumps(message):
                 self.resume.wait(30)
+            if message.get("type") == "user" and "DEAF" in json.dumps(message):
+                time.sleep(60)  # never reads its input again
         self.inbox.put(None)
 
     def run(self) -> None:
@@ -130,7 +134,7 @@ class Claude:
         texts = [self.replay(first)]
         trace({"user": texts[0]})
         if "ORPHAN" in texts[0]:
-            orphan()
+            orphan(keep_input="ORPHAN_IN" in texts[0])
         if "FLOOD" in texts[0]:
             # the reader is paused: the input is not read while the output
             # is written (a harness busy with its tool output)
@@ -204,6 +208,7 @@ class Codex:
         self.turn_seq = 0
         self.active: dict | None = None
         self.next_id = 1000
+        self.held_steer = None
 
     def reply(self, mid, result=None, error=None) -> None:
         out({"id": mid, "error": error} if error else {"id": mid, "result": result})
@@ -285,6 +290,8 @@ class Codex:
             self.notify("turn/started", {"turn": {"id": turn["id"], "status": "inProgress"}})
             if "CRASH" in text:
                 sys.exit(3)
+            if "ORPHAN" in text:
+                orphan()
             self.active = turn
             if "ERROR" in text:
                 self.notify("error", {"turnId": turn["id"], "willRetry": False,
@@ -298,6 +305,9 @@ class Codex:
                      "params": {"threadId": self.thread, "turnId": turn["id"],
                                 "itemId": "i0", "command": "rm -rf /"}})
         elif method == "turn/steer":
+            if os.environ.get("FAKE_CODEX_STEER_HOLD") == "1" and self.active is not None:
+                self.held_steer = mid  # refused after the next interrupt
+                return
             if os.environ.get("FAKE_CODEX_STEER_REFUSE") == "1" or self.active is None \
                     or params.get("expectedTurnId") != self.active["id"]:
                 self.reply(mid, error={"code": -32600, "message": "no active turn to steer"})
@@ -308,15 +318,21 @@ class Codex:
             self.reply(mid, {})
             if self.active is not None and self.active["id"] == params.get("turnId"):
                 self.complete("interrupted")
+            if self.held_steer is not None:
+                self.reply(self.held_steer,
+                           error={"code": -32600, "message": "no active turn to steer"})
+                self.held_steer = None
         else:
             self.reply(mid, error={"code": -32601, "message": "unknown method %s" % method})
 
 
-def orphan() -> None:
-    """A child that leaves the group (setsid) and keeps the output open."""
+def orphan(keep_input: bool = False) -> None:
+    """A child that leaves the group (setsid) and keeps the output open (and
+    the input, never read, with `keep_input`)."""
     import subprocess
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
-                             start_new_session=True, stdin=subprocess.DEVNULL)
+                             start_new_session=True,
+                             stdin=None if keep_input else subprocess.DEVNULL)
     trace({"orphan": child.pid})
 
 

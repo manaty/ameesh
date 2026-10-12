@@ -156,6 +156,43 @@ def _validate_message(message: dict, *, header: bool = True) -> None:
             raise AcpError("invalid JSON-RPC `error` object")
 
 
+def stoppable_lines(fd: int, max_chars: int, stop: threading.Event,
+                    poll: float = 0.2):
+    """The lines read on `fd` (with their newline), until EOF or `stop`.
+
+    L75 (codex r2, #325): a resident harness may leave a child that keeps its
+    output open after it is stopped; a blocking `readline` would then never
+    return, and closing the stream under it waits for its lock. Here the
+    reader waits with `select` and checks `stop` at each `poll`: the owner
+    sets it, the reader returns, and the stream can be closed. A line longer
+    than `max_chars` bytes is yielded as it stands (the caller refuses it).
+    POSIX only (the resident processes)."""
+    import select
+    buffer = b""
+    while not stop.is_set():
+        ready, _, _ = select.select([fd], [], [], poll)
+        if not ready:
+            continue
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            if buffer:
+                yield buffer.decode("utf-8")
+            return
+        searched = len(buffer)
+        buffer += chunk
+        start = 0
+        while True:
+            end = buffer.find(b"\n", max(start, searched))
+            if end < 0:
+                break
+            yield buffer[start:end + 1].decode("utf-8")
+            start = end + 1
+        buffer = buffer[start:]
+        if len(buffer) > max_chars:
+            yield buffer.decode("utf-8", "replace")
+            return
+
+
 class JsonRpcPeer:
     """Un agent ACP lancé en sous-processus, et le JSON-RPC qui l'accompagne.
 
@@ -169,11 +206,14 @@ class JsonRpcPeer:
     def __init__(self, argv: Sequence[str], *, cwd: str | None = None,
                  env: Mapping[str, str] | None = None,
                  max_message: int = MAX_MESSAGE_CHARS, header: bool = True,
-                 new_session: bool = False, stderr: Any = None):
+                 new_session: bool = False, stderr: Any = None, stoppable: bool = False):
         self.argv = list(argv)
         #: L75: Codex app-server speaks JSON-RPC 2.0 without the `jsonrpc`
         #: member; ACP requires it, both ways
         self.header = header
+        #: L75: read with `stoppable_lines`, ended by `stop_reading()`
+        self.stoppable = stoppable
+        self._stop = threading.Event()
         self.max_message = max(1024, int(max_message))
         self._lock = threading.Lock()
         self._write_lock = threading.Lock()
@@ -288,13 +328,21 @@ class JsonRpcPeer:
                                      "message": "the ACP agent stopped"}
                     pending.event.set()
 
+    def stop_reading(self) -> None:
+        """L75: end a stoppable reader (EOF may never come)."""
+        self._stop.set()
+
     def _read_messages(self) -> None:
         stream = self.proc.stdout
         if stream is None:
             return
+        if self.stoppable:
+            lines = stoppable_lines(stream.fileno(), self.max_message, self._stop)
+        else:
+            lines = iter(lambda: stream.readline(self.max_message + 1), "")
         while True:
             try:
-                line = stream.readline(self.max_message + 1)
+                line = next(lines, "")
                 if line == "":
                     return
                 self.last_message = time.monotonic()

@@ -298,6 +298,42 @@ class ClaudeStreamJsonTest(DriverCase):
         self.bounded(lambda: driver.close(0.3))
         self.assertLess(time.monotonic() - started, 5)
         self.assertFalse(driver.alive)
+        # codex r2 (#325): the reader stopped and our end of the output is
+        # closed, though the child still holds the pipe
+        self.assertTrue(_alive(pid))
+        self.assertFalse(driver._reader.is_alive())
+        self.assertTrue(driver.proc.stdout.closed)
+
+    def orphan_pid(self) -> int:
+        [pid] = [t["orphan"] for t in self.trace() if "orphan" in t]
+        self.addCleanup(lambda: os.kill(pid, signal.SIGKILL) if _alive(pid) else None)
+        return pid
+
+    def test_the_input_is_closed_only_once_the_writer_is_gone(self):
+        # codex r2 (#325): a write blocked on a harness that no longer reads;
+        # the descriptor is closed after the writer ends (EPIPE once the group
+        # is killed), never under it
+        driver = self.driver()
+        driver.start()
+        self.wait(driver.send("DEAF"))
+        driver.send("z" * 2_000_000)  # more than the pipe holds
+        self.until(lambda: not driver._outbox.qsize())
+        self.bounded(lambda: driver.close(0.5))
+        self.assertFalse(driver._writer.is_alive())
+        self.assertTrue(driver.proc.stdin.closed)
+
+    def test_an_input_held_by_an_escaped_child_is_left_open(self):
+        driver = self.driver()
+        driver.start()
+        self.wait(driver.send("ORPHAN_IN DEAF"))
+        self.orphan_pid()
+        driver.send("z" * 2_000_000)
+        self.until(lambda: not driver._outbox.qsize())
+        self.bounded(lambda: driver.close(0.3))
+        # the writer is still blocked in its write: its descriptor stays ours
+        self.assertTrue(driver._writer.is_alive())
+        self.assertFalse(driver.proc.stdin.closed)
+        os.fstat(driver.proc.stdin.fileno())
 
     def test_an_interrupt_leaves_unread_inputs_unserved(self):
         # codex r1 (#325): a steer the harness had not read when the turn was
@@ -498,6 +534,36 @@ class CodexAppServerTest(DriverCase):
         self.assertTrue(accepted)
         self.assertEqual(turn.result.inputs, ("a", "b"))
         self.assertIn("ECHO:steered", turn.result.final)
+
+    def test_a_steer_refused_after_the_interrupt_never_opens_a_turn(self):
+        # codex r2 (#325): the interrupted end is recorded before the steer's
+        # refusal comes back: the steered input is not served, no new turn
+        driver = self.driver(env={"FAKE_CODEX_STEER_HOLD": "1"})
+        driver.start()
+        turn = driver.send("SLOW long", input_id="a")
+        steered: list = []
+        steering = threading.Thread(target=lambda: steered.append(
+            driver.steer("held", input_id="b")))
+        steering.start()
+        self.until(lambda: self.methods("turn/steer"))
+        self.assertTrue(driver.interrupt())
+        result = self.wait(turn)
+        steering.join(10)
+        self.assertEqual((result.status, result.inputs), (resident.INTERRUPTED, ("a",)))
+        self.assertIs(steered[0], turn)
+        time.sleep(0.2)
+        self.assertEqual(len(self.methods("turn/start")), 1)
+        self.assertFalse(driver.busy)
+
+    def test_close_stops_the_reader_despite_an_escaped_child(self):
+        driver = self.driver()
+        driver.start()
+        self.wait(driver.send("ORPHAN"))
+        [pid] = [t["orphan"] for t in self.trace() if "orphan" in t]
+        self.addCleanup(lambda: os.kill(pid, signal.SIGKILL) if _alive(pid) else None)
+        self.bounded(lambda: driver.close(0.3))
+        self.assertFalse(driver.peer._reader.is_alive())
+        self.assertTrue(driver.proc.stdout.closed)
 
     def test_a_late_turn_start_answer_never_overwrites_the_next_turn(self):
         # codex r1 (#325): the answer to turn/start A arrives after follow-up

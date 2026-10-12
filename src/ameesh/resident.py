@@ -131,6 +131,9 @@ class Turn:
     def __init__(self, input_id: str):
         self.id = new_id()
         self.inputs: list[str] = [input_id]
+        #: interrupted by the caller: an input refused later is never served
+        #: by a new turn in its name (codex r2, #325)
+        self.interrupted = False
         self.started = time.monotonic()
         self.result: TurnResult | None = None
         self._done = threading.Event()
@@ -175,10 +178,11 @@ def _number(value: Any) -> int:
     return 0
 
 
-def _kill_group(proc: subprocess.Popen, grace: float) -> None:
-    """Close standard input, then SIGTERM and SIGKILL to the harness group."""
+def _kill_group(proc: subprocess.Popen, grace: float, *, close_input: bool = True) -> None:
+    """Close standard input (unless a writer may still use it), then SIGTERM
+    and SIGKILL to the harness group."""
     try:
-        if proc.stdin is not None:
+        if close_input and proc.stdin is not None:
             proc.stdin.close()
     except (OSError, ValueError):
         pass
@@ -353,6 +357,7 @@ class ResidentDriver:
             self._unconfirmed.update(input_id for input_id, _text in self._followups)
             self._followups.clear()
             self._interrupting = True
+            turn.interrupted = True
         return self._interrupt(turn)
 
     def probe(self, timeout: float = PROBE_TIMEOUT) -> bool:
@@ -364,8 +369,25 @@ class ResidentDriver:
         self._closed = True
         proc = self.proc
         if proc is not None:
-            _kill_group(proc, grace)
+            input_free = self._stop_writer(grace)
+            _kill_group(proc, grace, close_input=input_free)
+            if not input_free:
+                self._close_input_late(grace)
+            # the reader stops even if a child that left the group keeps the
+            # output open (codex r2, #325); it closes the output itself
+            self._stop_reader(grace)
         self._finish(FAILED, "resident harness closed")
+
+    def _stop_writer(self, grace: float) -> bool:
+        """Stop what writes on the harness's input: True once nothing does,
+        so that its descriptor can be closed (never under a writer)."""
+        return True
+
+    def _close_input_late(self, grace: float) -> None:
+        """After the group is killed: close the input once its writer is gone."""
+
+    def _stop_reader(self, grace: float) -> None:
+        """Stop the reader of the harness's output, waiting at most `grace`."""
 
     # -- for the drivers ---------------------------------------------------
     def _usable(self) -> None:
@@ -479,6 +501,8 @@ class ClaudeStreamJson(ResidentDriver):
         #: pipes, codex r1, #325); None stops it
         self._outbox: queue.Queue = queue.Queue()
         self._writer: threading.Thread | None = None
+        #: ends the reader after close (EOF may never come)
+        self._stop_read = threading.Event()
         #: wire uuid → input id, for the inputs not read when a turn ends
         self._wire_inputs: dict[str, str] = {}
         self._controls: dict[str, dict] = {}
@@ -523,10 +547,39 @@ class ClaudeStreamJson(ResidentDriver):
         self._control({"subtype": "initialize"}, self.init_timeout)
         return self.session_id or ""
 
-    def close(self, grace: float = CLOSE_GRACE) -> None:
-        self._closed = True
+    def _stop_writer(self, grace: float) -> bool:
         self._outbox.put(None)
-        super().close(grace)
+        writer = self._writer
+        if writer is not None:
+            writer.join(grace)
+            if writer.is_alive():
+                return False  # blocked in a write: the input stays open for now
+        return True
+
+    def _close_input_late(self, grace: float) -> None:
+        # the group is killed: a write blocked on it fails (EPIPE) and the
+        # writer ends; only then is the descriptor closed, never under it
+        writer, proc = self._writer, self._proc
+        if writer is not None:
+            writer.join(grace)
+        if writer is not None and writer.is_alive():
+            log("writer still blocked (a child that left the group holds the input): "
+                "the input is left open")
+            return
+        try:
+            if proc is not None and proc.stdin is not None:
+                proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+    def _stop_reader(self, grace: float) -> None:
+        self._stop_read.set()
+        if self._reader is not None:
+            self._reader.join(grace)
+
+    def _died(self, reason: str) -> None:
+        super()._died(reason)
+        self._outbox.put(None)  # the writer never waits for a line that cannot come
 
     # -- writing -----------------------------------------------------------
     def _write(self, message: dict) -> None:
@@ -551,7 +604,7 @@ class ClaudeStreamJson(ResidentDriver):
                 return
             try:
                 view = memoryview(data)
-                while view:
+                while view and not self._closed:
                     view = view[os.write(fd, view):]
             except (OSError, ValueError) as exc:
                 self._died("cannot write to the harness: %s" % exc)
@@ -625,10 +678,8 @@ class ClaudeStreamJson(ResidentDriver):
         proc = self._proc
         assert proc is not None and proc.stdout is not None
         try:
-            while True:
-                line = proc.stdout.readline(MAX_LINE_CHARS + 1)
-                if line == "":
-                    break
+            for line in acp.stoppable_lines(proc.stdout.fileno(), MAX_LINE_CHARS,
+                                            self._stop_read):
                 if len(line) > MAX_LINE_CHARS:
                     self._died("harness line too large (> %d characters)" % MAX_LINE_CHARS)
                     break
@@ -644,9 +695,13 @@ class ClaudeStreamJson(ResidentDriver):
                     self._on_event(event, line)
         except Exception as exc:  # noqa: BLE001 — never a silent dead reader
             self._died("resident reader failed: %r" % (exc,))
-        code = proc.wait()
-        _close_output(proc)
-        self._died("resident harness exited (code %s)" % code)
+        if self._stop_read.is_set():
+            _close_output(proc)  # stopped by close(): the group was killed
+            self._died("resident harness closed")
+        else:
+            code = proc.wait()
+            _close_output(proc)
+            self._died("resident harness exited (code %s)" % code)
         with self._lock:
             slots = list(self._controls.values())
         for slot in slots:
@@ -773,7 +828,8 @@ class CodexAppServer(ResidentDriver):
     def start(self) -> str:
         try:
             self.peer = acp.JsonRpcPeer(self.argv(), cwd=self.cwd, env=self._env(),
-                                        header=False, new_session=True, stderr=self.stderr)
+                                        header=False, new_session=True, stderr=self.stderr,
+                                        stoppable=True)
         except OSError as exc:
             raise ResidentError("cannot start %s: %s" % (self.descriptor.id, exc))
         self.peer.set_handlers(self._on_request, self._on_notification)
@@ -804,6 +860,14 @@ class CodexAppServer(ResidentDriver):
             parsed["model"] = str(result["model"])
         self._emit({"method": "thread/opened", "params": {"threadId": self.session_id}}, parsed)
         return self.session_id
+
+    def _stop_reader(self, grace: float) -> None:
+        peer = self.peer
+        if peer is not None:
+            peer.stop_reading()
+            peer._reader.join(grace)
+        if self._watch is not None:
+            self._watch.join(grace)
 
     def _watch_exit(self) -> None:
         peer = self.peer
@@ -871,8 +935,10 @@ class CodexAppServer(ResidentDriver):
                         result.inputs = (*result.inputs, input_id)
                 return
         with self._lock:
-            if self._turn is turn and self._interrupting:
-                return None  # interrupted meanwhile: not served (left unconfirmed)
+            if turn.interrupted:
+                # interrupted meanwhile, even if its end was already recorded:
+                # not served, never a new turn in its name (left unconfirmed)
+                return None
             self._unconfirmed.discard(input_id)
             if self._turn is turn:
                 # served by a new harness turn when the current one completes
@@ -1035,7 +1101,8 @@ class _AcpClient(acp.AcpTurn):
         argv = [self.agent_binary, *driver.block["launcher"], *driver.block["command"]]
         try:
             self.peer = acp.JsonRpcPeer(argv, cwd=self.cwd, env=driver._env(),
-                                        new_session=True, stderr=driver.stderr)
+                                        new_session=True, stderr=driver.stderr,
+                                        stoppable=True)
         except OSError as exc:
             raise acp.AcpError("cannot start the ACP agent: %s" % exc)
         self.peer.set_handlers(self._on_request, self._on_notification)
@@ -1087,6 +1154,14 @@ class AcpResident(ResidentDriver):
             raise ResidentError("ACP agent: %s" % exc)
         self.session_id = client.session_id
         return self.session_id or ""
+
+    def _stop_reader(self, grace: float) -> None:
+        peer = self.client.peer if self.client is not None else None
+        if peer is not None:
+            peer.stop_reading()
+            peer._reader.join(grace)
+        if self._watch is not None:
+            self._watch.join(grace)
 
     def _watch_exit(self) -> None:
         peer = self.client.peer if self.client is not None else None
