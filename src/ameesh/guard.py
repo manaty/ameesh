@@ -709,6 +709,10 @@ THAW_UNIT = "ameesh-guard-thaw"
 THAW_RETRY_S, THAW_RETRIES = 2, 300
 THAW_SCRIPT = ('i=0; until systemctl thaw "$0"; do i=$((i+1)); '
                '[ "$i" -ge %d ] && exit 1; sleep %d; done' % (THAW_RETRIES, THAW_RETRY_S))
+#: the least time left on the thaw timer, read on the clock right before the
+#: freeze command (arming the timer, stopping the older ones and the caps
+#: before can take seconds): less, and the timer may thaw before the freeze
+FREEZE_MARGIN_S = 2.0
 
 #: which `caps` key each property enforces
 PROPERTY_CAPS = {"CPUWeight": "cpu_weight", "IOWeight": "io_weight", "CPUQuota": "cpu_share",
@@ -726,14 +730,17 @@ class Enforcer:
     transient systemd timer (`THAW_UNIT-…`) is armed to thaw the slice at
     the freeze bound, its service retrying a failed thaw by itself; only
     then are the older timers stopped, so there is never a moment without
-    one. No timer, no freeze. A freeze attempted counts as possibly in force
-    until a thaw succeeds: every evaluation below level 2, and the guard's
-    exit, thaw again until it does."""
+    one. No timer, no freeze, and no freeze either when the timer would fire
+    less than `FREEZE_MARGIN_S` after the clock read right before the freeze
+    command (never the evaluation's instant). A freeze attempted counts as
+    possibly in force until a thaw succeeds: every evaluation below level 2,
+    and the guard's exit, thaw again until it does."""
 
     def __init__(self, cfg: GuardConfig, run: Callable | None = None,
-                 log: Callable | None = None):
+                 log: Callable | None = None, clock: Callable = time.time):
         self.cfg = cfg
         self.run = run or subprocess.run
+        self.clock = clock
         self.log = log or (lambda text: print("ameesh guard: %s" % text, file=sys.stderr))
         self.applied: dict = {}          # unit -> {property: value} last applied
         self.frozen = False              # possibly frozen: a thaw is owed
@@ -811,20 +818,24 @@ class Enforcer:
                 except (OSError, subprocess.SubprocessError):
                     pass
 
-    def _arm_thaw(self, until: float, now: float) -> bool:
-        """Arms a new thaw timer at `until`, then stops the older ones; True
-        if armed (never trusts a timer armed before: it may have fired)."""
+    def _arm_thaw(self, until: float) -> float | None:
+        """Arms a new thaw timer at `until`, then stops the older ones; the
+        earliest instant it fires, None if not armed (never trusts a timer
+        armed before: it may have fired)."""
+        now = self.clock()
+        if until - now < FREEZE_MARGIN_S:
+            return None
         self.thaw_count += 1
         unit = "%s-%d-%d-%d" % (THAW_UNIT, int(now), os.getpid(), self.thaw_count)
         seconds = max(1, int(math.ceil(until - now)))
         if not self._command(["systemd-run", "--unit=%s" % unit, "--collect", "--quiet",
                               "--on-active=%ds" % seconds, "--timer-property=AccuracySec=1s",
                               "/bin/sh", "-c", THAW_SCRIPT, self.cfg.slice]):
-            return False
+            return None
         self._stop_thaw_units(keep=unit)
-        return True
+        return now + seconds
 
-    def freeze(self, on: bool, until: float | None = None, now: float | None = None) -> bool:
+    def freeze(self, on: bool, until: float | None = None) -> bool:
         """Freezes the guest's slice until `until` (a new thaw timer armed
         first), or thaws it; True if the slice is as asked."""
         if not on:
@@ -837,8 +848,9 @@ class Enforcer:
             return True
         if self.freeze_done:
             return True
-        now = time.time() if now is None else now
-        if until is None or now >= until or not self._arm_thaw(until, now):
+        fires = None if until is None else self._arm_thaw(until)
+        # codex #237 r3: the clock read again, after the timer and the cleanup
+        if fires is None or fires - self.clock() < FREEZE_MARGIN_S:
             self.log("freeze refused: no thaw timer to bound it")
             self.freeze(False)
             return False
@@ -854,7 +866,7 @@ class Enforcer:
         self.frozen = True
         self.freeze(False)
 
-    def apply(self, state: dict, cpu_count: int | None, now: float | None = None) -> list[str]:
+    def apply(self, state: dict, cpu_count: int | None) -> list[str]:
         """Enforces `state` (levels 0 to 2; a drain or a stop thaws and keeps
         the caps); the `caps` keys actually enforced."""
         caps = state.get("caps") or {}
@@ -869,7 +881,7 @@ class Enforcer:
                 enforced.add("agent_memory_mb")
         freeze = state.get("freeze")
         if freeze:
-            if self.freeze(True, freeze.get("until_ts"), now):
+            if self.freeze(True, freeze.get("until_ts")):
                 enforced.add("freeze")
         else:
             self.freeze(False)
@@ -888,7 +900,7 @@ class Guard:
                  enforcer: Enforcer | None = None):
         self.cfg = cfg
         self.observe = observe
-        self.enforcer = None if observe else (enforcer or Enforcer(cfg))
+        self.enforcer = None if observe else (enforcer or Enforcer(cfg, clock=clock))
         if self.enforcer is not None:
             self.enforcer.thaw_at_start()
         self.clock = clock
@@ -924,8 +936,7 @@ class Guard:
         state = build_state(self.cfg, self.decision, self.seq, now, reading=reading,
                             in_turn=in_turn, observe=self.observe)
         if self.enforcer is not None:
-            state["caps"]["enforced"] = self.enforcer.apply(state, reading.get("cpu_count"),
-                                                            now)
+            state["caps"]["enforced"] = self.enforcer.apply(state, reading.get("cpu_count"))
         key = _key(state)
         if key != self.last_key:
             self.seq += 1
